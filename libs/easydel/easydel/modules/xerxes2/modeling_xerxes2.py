@@ -66,6 +66,7 @@ from easydel.layers import (
     RMSNorm,
     RowParallelLinear,
     RowParallelMoELinear,
+    dense_gate_up_layout,
     moe_gate_up_fusion_reform_param,
     split_fused_gate_up_projection,
 )
@@ -348,13 +349,14 @@ class Xerxes2MLP(spx.Module):
         self.act = jax.nn.silu
         self.gate_up_proj = ColumnParallelLinear(
             config.hidden_size,
-            2 * config.intermediate_size,
+            (config.intermediate_size, config.intermediate_size),
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             rngs=rngs,
+            layout=dense_gate_up_layout(config.intermediate_size),
         )
         self.down_proj = RowParallelLinear(
             config.intermediate_size,
@@ -384,7 +386,7 @@ class Xerxes2MLP(spx.Module):
             partition_manager=self.config.runtime_sharding_resolver,
         )
         up_states = self.gate_up_proj(hidden_states)
-        gate, up_states = jnp.split(up_states, 2, axis=-1)
+        gate, up_states = split_fused_gate_up_projection(up_states, config=self.config)
         hidden_states = checkpoint_name(self.down_proj(up_states * jax.nn.silu(gate)), "mlp_output")
         hidden_states = apply_logical_sharding(
             hidden_states,

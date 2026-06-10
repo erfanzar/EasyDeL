@@ -328,6 +328,8 @@ class OpenELMConfig(EasyDeLBaseConfig):
                 f"QKV multipliers should be a single number or a list containing exactly two numbers."
                 f" Got: {qkv_multipliers}."
             )
+        if isinstance(self.qkv_multipliers, list | tuple):
+            self.qkv_multipliers = [float(multiplier) for multiplier in self.qkv_multipliers]
 
         self.num_query_heads = [int(compute_heads(q_dim, self.head_dim)) for q_dim in query_dims]
         self.num_kv_heads = [q_heads // self.num_gqa_groups for q_heads in self.num_query_heads]
@@ -351,14 +353,15 @@ class OpenELMConfig(EasyDeLBaseConfig):
                     )
                 ]
             else:
-                assert len(self.ffn_multipliers) == self.num_transformer_layers, (
-                    f"{len(self.ffn_multipliers)=}!={self.num_transformer_layers=}"
-                )
+                assert (
+                    len(self.ffn_multipliers) == self.num_transformer_layers
+                ), f"{len(self.ffn_multipliers)=}!={self.num_transformer_layers=}"
         else:
             raise NotImplementedError(
                 f"FFN multipliers should be a single number or a list containing exactly two numbers. "
                 f"Got: {self.ffn_multipliers}."
             )
+        self.ffn_multipliers = [float(multiplier) for multiplier in self.ffn_multipliers]
 
         # check num_query_heads divisible by num_kv_heads for every layer
         for layer_idx in range(len(query_dims)):

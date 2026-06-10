@@ -59,7 +59,7 @@ from easydel.layers import (
     RowParallelLinear,
     dense_gate_up_layout,
     split_fused_gate_up_projection,
-    split_interleaved_segments_last_axis,
+    split_fused_qkv_projection,
 )
 from easydel.layers.attention import UnifiedAttention
 from easydel.layers.norms import LayerNorm
@@ -376,14 +376,12 @@ class StableLmAttention(UnifiedAttention):
         q_size = self.config.num_attention_heads * self.head_dim
         kv_size = self.config.num_key_value_heads * self.head_dim
         qkv_states = checkpoint_name(self.qkv_proj(hidden_states), "attn_qkv")
-        qkv_parts = split_interleaved_segments_last_axis(
+        query_states, key_states, value_states = split_fused_qkv_projection(
             qkv_states,
-            (q_size, kv_size, kv_size),
+            q_size=q_size,
+            kv_size=kv_size,
             config=self.config,
         )
-        if qkv_parts is None:
-            qkv_parts = jnp.split(qkv_states, (q_size, q_size + kv_size), axis=-1)
-        query_states, key_states, value_states = qkv_parts
 
         query_states = query_states.reshape(
             batch_size,

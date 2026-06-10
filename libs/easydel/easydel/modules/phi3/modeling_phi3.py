@@ -54,7 +54,15 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, CausalLMOutput, DecoderLayerOutput
 from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
-from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers import (
+    ColumnParallelLinear,
+    Embed,
+    RowParallelLinear,
+    dense_gate_up_layout,
+    dense_qkv_layout,
+    split_fused_gate_up_projection,
+    split_fused_qkv_projection,
+)
 from easydel.layers import RMSNorm as RMSNorm
 from easydel.layers.attention import UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule
@@ -97,13 +105,14 @@ class Phi3MLP(spx.Module):
         self.precision = precision
         self.gate_up_proj = ColumnParallelLinear(
             config.hidden_size,
-            2 * config.intermediate_size,
+            (config.intermediate_size, config.intermediate_size),
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
+            layout=dense_gate_up_layout(config.intermediate_size),
         )
         self.down_proj = RowParallelLinear(
             config.intermediate_size,
@@ -134,7 +143,7 @@ class Phi3MLP(spx.Module):
             partition_manager=self.config.runtime_sharding_resolver,
         )
         up_states = self.gate_up_proj(hidden_states)
-        gate, up_states = jnp.split(up_states, 2, axis=-1)
+        gate, up_states = split_fused_gate_up_projection(up_states, config=self.config)
         gate = checkpoint_name(self.activation_fn(gate), "mlp_gate")
         up_states = checkpoint_name(up_states * gate, "mlp_up")
         hidden_states = checkpoint_name(self.down_proj(up_states), "mlp_down")
@@ -214,17 +223,19 @@ class Phi3Attention(UnifiedAttention):
             precision: JAX precision setting for matrix operations.
             rngs: Random number generator state.
         """
-        qkv_size = config.num_attention_heads * self.head_dim + 2 * config.num_key_value_heads * self.head_dim
+        q_size = config.num_attention_heads * self.head_dim
+        kv_size = config.num_key_value_heads * self.head_dim
 
         self.qkv_proj = ColumnParallelLinear(
             config.hidden_size,
-            qkv_size,
+            (q_size, kv_size, kv_size),
             rngs=rngs,
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
+            layout=dense_qkv_layout(q_size, kv_size),
         )
         self.o_proj = self._create_o_proj(config, dtype, param_dtype, precision, rngs)
         self.attention_performer = self._create_attention_performer(config, rngs)
@@ -291,9 +302,12 @@ class Phi3Attention(UnifiedAttention):
         qkv = checkpoint_name(self.qkv_proj(hidden_states), "attn_qkv")
         q_size = self.config.num_attention_heads * self.head_dim
         kv_size = self.config.num_key_value_heads * self.head_dim
-        query_states = qkv[..., :q_size]
-        key_states = qkv[..., q_size : q_size + kv_size]
-        value_states = qkv[..., q_size + kv_size :]
+        query_states, key_states, value_states = split_fused_qkv_projection(
+            qkv,
+            q_size=q_size,
+            kv_size=kv_size,
+            config=self.config,
+        )
 
         query_states = query_states.reshape(
             batch_size,

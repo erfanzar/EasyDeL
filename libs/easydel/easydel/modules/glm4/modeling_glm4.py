@@ -53,7 +53,14 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput, DecoderLayerOutput
 from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
-from easydel.layers import ColumnParallelLinear, Embed, RMSNorm, RowParallelLinear
+from easydel.layers import (
+    ColumnParallelLinear,
+    Embed,
+    RMSNorm,
+    RowParallelLinear,
+    dense_gate_up_layout,
+    split_fused_gate_up_projection,
+)
 from easydel.layers.attention import UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
 
@@ -97,13 +104,14 @@ class Glm4MLP(spx.Module):
         self.precision = precision
         self.gate_up_proj = ColumnParallelLinear(
             config.hidden_size,
-            2 * config.intermediate_size,
+            (config.intermediate_size, config.intermediate_size),
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
+            layout=dense_gate_up_layout(config.intermediate_size),
         )
         self.down_proj = RowParallelLinear(
             config.intermediate_size,
@@ -134,7 +142,7 @@ class Glm4MLP(spx.Module):
             partition_manager=self.config.runtime_sharding_resolver,
         )
         gate_up_states = checkpoint_name(self.gate_up_proj(hidden_states), name="mlp_gate_up")
-        gate, up_states = jnp.split(gate_up_states, 2, axis=-1)
+        gate, up_states = split_fused_gate_up_projection(gate_up_states, config=self.config)
         hidden_states = checkpoint_name(self.down_proj(up_states * self.act_fn(gate)), name="mlp_down")
         hidden_states = apply_logical_sharding(
             hidden_states,

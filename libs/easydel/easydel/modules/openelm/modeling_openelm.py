@@ -55,7 +55,14 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, DecoderLayerOutput
 from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
-from easydel.layers import ColumnParallelLinear, Embed, RMSNorm, RowParallelLinear
+from easydel.layers import (
+    ColumnParallelLinear,
+    Embed,
+    RMSNorm,
+    RowParallelLinear,
+    dense_qkv_layout,
+    split_fused_qkv_projection,
+)
 from easydel.layers.attention import UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule
 
@@ -223,13 +230,21 @@ class OpenELMMultiHeadCausalAttention(UnifiedAttention):
         """
         self.qkv_proj = ColumnParallelLinear(
             config.model_dim,
-            (self.num_q_heads + self.num_k_heads + self.num_v_heads) * self.head_dim,
+            (
+                self.num_q_heads * self.head_dim,
+                self.num_k_heads * self.head_dim,
+                self.num_v_heads * self.head_dim,
+            ),
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
+            layout=dense_qkv_layout(
+                self.num_q_heads * self.head_dim,
+                self.num_k_heads * self.head_dim,
+            ),
         )
 
         self.out_proj = RowParallelLinear(
@@ -339,15 +354,20 @@ class OpenELMMultiHeadCausalAttention(UnifiedAttention):
         batch_size, sequence_length = hidden_states.shape[:2]
 
         qkv = checkpoint_name(self.query_key_value_projection(hidden_states), "attn_qkv")
-        qkv = qkv.reshape(
+        query_states, key_states, value_states = split_fused_qkv_projection(
+            qkv,
+            q_size=self.num_q_heads * self.head_dim,
+            kv_size=self.num_k_heads * self.head_dim,
+            config=self.config,
+        )
+        query_states = query_states.reshape(
             batch_size,
             sequence_length,
-            self.num_q_heads + self.num_k_heads + self.num_v_heads,
+            self.num_q_heads,
             self.head_dim,
         )
-        query_states = qkv[:, :, : self.num_q_heads, :]
-        key_states = qkv[:, :, self.num_q_heads : self.num_q_heads + self.num_k_heads, :]
-        value_states = qkv[:, :, self.num_q_heads + self.num_k_heads :, :]
+        key_states = key_states.reshape(batch_size, sequence_length, self.num_k_heads, self.head_dim)
+        value_states = value_states.reshape(batch_size, sequence_length, self.num_v_heads, self.head_dim)
 
         query_states, key_states, value_states = self._postprocess_qkv(query_states, key_states, value_states)
         query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
@@ -863,9 +883,9 @@ class OpenELMModel(EasyDeLBaseModule):
             raise ValueError("you should specify inputs_embeds or input_ids one of them")
         sequence_length = inputs_embeds.shape[1]
 
-        assert sequence_length <= self.config.max_context_length, (
-            f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_context_length} got {sequence_length})"
-        )
+        assert (
+            sequence_length <= self.config.max_context_length
+        ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_context_length} got {sequence_length})"
         mask_info = MaskInfo.dynamic_init(
             mask_info=mask_info,
             input_ids=input_ids,

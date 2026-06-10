@@ -71,7 +71,10 @@ from easydel.layers import (
     RMSNorm,
     RowParallelLinear,
     RowParallelMoELinear,
+    dense_qkv_layout,
     moe_fused_gate_up_reform_param,
+    split_fused_gate_up_projection,
+    split_fused_qkv_projection,
 )
 from easydel.layers.attention import UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule
@@ -154,13 +157,21 @@ class MiniMaxLightningAttention(spx.Module):
 
         self.qkv_proj = ColumnParallelLinear(
             config.hidden_size,
-            self.num_attention_heads * self.head_dim * 3,
+            (
+                self.num_attention_heads * self.head_dim,
+                self.num_attention_heads * self.head_dim,
+                self.num_attention_heads * self.head_dim,
+            ),
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            layout=dense_qkv_layout(
+                self.num_attention_heads * self.head_dim,
+                self.num_attention_heads * self.head_dim,
+            ),
         )
         self.out_proj = RowParallelLinear(
             self.num_attention_heads * self.head_dim,
@@ -294,8 +305,16 @@ class MiniMaxLightningAttention(spx.Module):
         query_decay, key_decay, diagonal_decay = self._decay_factors(slope_rate)
 
         qkv_states = self.act_fn(checkpoint_name(self.qkv_proj(hidden_states), "attn_qkv"))
-        qkv_states = qkv_states.reshape(batch_size, seq_len, self.num_attention_heads, 3 * self.head_dim)
-        query_states, key_states, value_states = jnp.split(qkv_states, 3, axis=-1)
+        q_size = self.num_attention_heads * self.head_dim
+        query_states, key_states, value_states = split_fused_qkv_projection(
+            qkv_states,
+            q_size=q_size,
+            kv_size=q_size,
+            config=self.config,
+        )
+        query_states = query_states.reshape(batch_size, seq_len, self.num_attention_heads, self.head_dim)
+        key_states = key_states.reshape(batch_size, seq_len, self.num_attention_heads, self.head_dim)
+        value_states = value_states.reshape(batch_size, seq_len, self.num_attention_heads, self.head_dim)
         query_states = apply_logical_sharding(
             query_states,
             dynamic_axes=common_types.AttnQSharding,
@@ -531,7 +550,9 @@ class MiniMaxExperts(spx.Module):
             Array: Output tensor of shape (tokens, hidden_dim).
         """
         gate_up = self.gate_up_proj(hidden_states, group_sizes, sorted_experts)
-        gate, up = jnp.split(gate_up, 2, axis=-1)
+        # The fused expert kernel is TP-interleaved (FusedExpertLayout); a
+        # contiguous split would mix gate and up columns whenever tp > 1.
+        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
         return self.w2(self.act_fn(gate) * up, group_sizes, sorted_experts)
 
 

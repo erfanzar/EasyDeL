@@ -41,6 +41,15 @@ from ._builders import (
     split_fused_gate_up_projection,
     split_fused_qkv_projection,
 )
+from ._canonical import (
+    canonicalize_fused_optimizer_state,
+    canonicalize_fused_state,
+    fused_layout_param_specs,
+    read_fused_layout_marker,
+    runtimeize_fused_optimizer_state,
+    runtimeize_fused_state,
+    write_fused_layout_marker,
+)
 from ._dense import FusedColumnLayout, FusedSegment, dense_gate_up_layout, dense_qkv_layout
 from ._moe import FusedExpertLayout
 from ._reform import (
@@ -78,6 +87,8 @@ __all__ = [
     "ReformRule",
     "build_fused_gate_up_projection",
     "build_fused_qkv_projection",
+    "canonicalize_fused_optimizer_state",
+    "canonicalize_fused_state",
     "dense_gate_up_layout",
     "dense_qkv_layout",
     "gate_up_fusion_reform_param",
@@ -89,6 +100,9 @@ __all__ = [
     "moe_gate_up_fusion_reform_param",
     "normalize_segment_sizes",
     "qkv_fusion_reform_param",
+    "read_fused_layout_marker",
+    "runtimeize_fused_optimizer_state",
+    "runtimeize_fused_state",
     "split_contiguous_segments_last_axis",
     "split_fused_gate_up_projection",
     "split_fused_qkv_projection",
@@ -101,4 +115,5 @@ __all__ = [
     "torch_interleave_axis_segments_for_tp",
     "torch_interleave_segments_for_tp",
     "with_tp_last_axis_sharding",
+    "write_fused_layout_marker",
 ]

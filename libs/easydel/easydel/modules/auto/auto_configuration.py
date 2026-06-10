@@ -387,12 +387,36 @@ class AutoEasyDeLConfig:
         config = cls_main.from_pretrained(pretrained_model_name_or_path)
         model_type: str = config.model_type
 
-        try:
-            config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True)
-            ovo_model_type: str = config.model_type
+        def _registered(candidate: str) -> bool:
+            return bool(candidate) and any(candidate in models for models in registry.task_registry.values())
 
-            if model_type != ovo_model_type:
+        if not _registered(model_type):
+            # Generic base-class loads can lose the concrete model_type
+            # (nested-config models like dbrx serialize sub-configs whose
+            # model_type is empty); the raw config.json field is
+            # authoritative for natively-saved checkpoints.
+            try:
+                from transformers import PretrainedConfig
+
+                config_dict, _ = PretrainedConfig.get_config_dict(pretrained_model_name_or_path)
+                raw_model_type = config_dict.get("model_type", "")
+                if _registered(raw_model_type):
+                    model_type = raw_model_type
+            except Exception:
+                ...
+
+        try:
+            hf_config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True)
+            ovo_model_type: str = hf_config.model_type
+
+            if model_type != ovo_model_type and not _registered(model_type):
+                # Trust the transformers resolution only when the native
+                # lookup would fail anyway: transformers can remap types
+                # EasyDeL supports natively (e.g. v5.5 resolves a saved
+                # "mistral" config to MinistralConfig/"ministral", which
+                # would break the registry lookup below).
                 model_type = ovo_model_type
+                config = hf_config
         except Exception:
             ...
 

@@ -254,7 +254,7 @@ def _normalize_checkpoint_leaf_to_jax(
         Any: The original value, or a JAX array on the requested CPU device
         when the input was NumPy-backed.
     """
-    if not isinstance(value, (np.ndarray, np.generic)):
+    if not isinstance(value, np.ndarray | np.generic):
         return value
     if cpu_device is not None:
         return jax.device_put(value, cpu_device)
@@ -754,6 +754,18 @@ class EasyBridgeMixin(PushToHubMixin):
 
         state = spx.export(self)[1]
         state_dict = state.raw()
+        # Fused projections are TP-interleaved in memory; serialize them in the
+        # canonical (contiguous) order so the checkpoint loads correctly under
+        # ANY tensor-parallel size, and stamp the layout marker.
+        from easydel.layers.layouts import canonicalize_fused_state, write_fused_layout_marker
+        from easydel.utils.traversals import flatten_dict as _cf_flatten
+        from easydel.utils.traversals import unflatten_dict as _cf_unflatten
+
+        _cf_flat = _cf_flatten(state_dict)
+        _cf_flat = canonicalize_fused_state(self, _cf_flat, self.config)
+        state_dict = _cf_unflatten(_cf_flat)
+        if not is_remote_path(save_directory) or jax.process_index() == 0:
+            write_fused_layout_marker(save_directory)
         cpu_device = _checkpoint_cpu_device()
         numpy_leaf_paths: list[str] = []
         state_dict = jax.tree_util.tree_map_with_path(
@@ -762,7 +774,7 @@ class EasyBridgeMixin(PushToHubMixin):
                     numpy_leaf_paths.append(tree_path_to_string(path, sep=".")),
                     _normalize_checkpoint_leaf_to_jax(x, cpu_device=cpu_device),
                 )[-1]
-                if isinstance(x, (np.ndarray, np.generic))
+                if isinstance(x, np.ndarray | np.generic)
                 else x
             ),
             state_dict,
@@ -1286,6 +1298,30 @@ class EasyBridgeMixin(PushToHubMixin):
                         "Skipping %d saved RNG-state leaf(s) during load; using freshly-seeded uint32 rngs instead.",
                         len(rng_state_keys),
                     )
+                # Mesh-portability: canonical checkpoints store fused params
+                # contiguously; re-interleave them for the runtime tp. Legacy
+                # checkpoints (no marker) are loaded verbatim — only correct
+                # when the load tp matches the save tp.
+                from easydel.layers.layouts import (
+                    fused_layout_param_specs,
+                    read_fused_layout_marker,
+                    runtimeize_fused_state,
+                )
+                from easydel.layers.layouts._runtime import tensor_parallel_size as _cf_tp_size
+
+                _cf_marker = read_fused_layout_marker(resolved_archive_file)
+                if _cf_marker == "canonical":
+                    state = runtimeize_fused_state(model, state, model.config)
+                else:
+                    _cf_tp = _cf_tp_size(getattr(model, "config", None))
+                    if _cf_tp > 1 and fused_layout_param_specs(model):
+                        logger.warning(
+                            "Legacy native checkpoint without a fused-layout marker loaded under "
+                            f"tp={_cf_tp}: fused projections are assumed to already carry this exact "
+                            "interleave. If the checkpoint was saved under a different tensor-parallel "
+                            "size, Q/K/V and gate/up weights will be silently scrambled — re-save it "
+                            "with the current code to make it mesh-portable."
+                        )
                 model = _rebuild_lora_modules_from_checkpoint(model=model, flat_state=state)
 
             has_quantized_keys = any(

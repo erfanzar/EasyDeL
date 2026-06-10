@@ -76,6 +76,7 @@ from easydel.layers import (
     RMSNorm,
     RowParallelMoELinear,
     moe_gate_up_fusion_reform_param,
+    split_fused_gate_up_projection,
 )
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
@@ -357,7 +358,9 @@ class ArcticMLPMoE(spx.Module):
             partition_manager=self.config.runtime_sharding_resolver,
         )
         gate_up = self.gate_up_proj(hidden_states, group_sizes, sorted_experts)
-        gate, up = jnp.split(gate_up, 2, axis=-1)
+        # The fused expert kernel is TP-interleaved (FusedExpertLayout); a
+        # contiguous split would mix gate and up columns whenever tp > 1.
+        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
         return apply_logical_sharding(
             self.w2(self.act_fn(gate) * up, group_sizes, sorted_experts),
             dynamic_axes=common_types.HiddenStateSharding,

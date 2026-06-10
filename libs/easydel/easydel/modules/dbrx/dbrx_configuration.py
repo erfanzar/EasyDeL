@@ -82,17 +82,14 @@ class DbrxAttentionConfig(EasyDeLBaseConfig):
             ValueError: If ``kwargs`` contains unknown keys other than
                 ``model_type``.
         """
+        # Extra kwargs are absorbed as attributes by EasyDeLBaseConfig, like
+        # every other EasyDeL config; a strict reject here breaks reloading
+        # our own checkpoints, whose serialized sub-configs carry base attrs.
         super().__init__(**kwargs)
         self.attn_pdrop = attn_pdrop
         self.clip_qkv = clip_qkv
         self.kv_n_heads = kv_n_heads
         self.rope_theta = rope_theta
-
-        for k in ["model_type"]:
-            if k in kwargs:
-                kwargs.pop(k)
-        if len(kwargs) != 0:
-            raise ValueError(f"Found unknown {kwargs=}")
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs: tp.Any) -> "PretrainedConfig":  # type: ignore[misc] # noqa: F821
@@ -201,12 +198,8 @@ class DbrxFFNConfig(EasyDeLBaseConfig):
         self.moe_loss_weight = moe_loss_weight
         self.moe_normalize_expert_weights = moe_normalize_expert_weights
         self.uniform_expert_assignment = uniform_expert_assignment
-
-        for k in ["model_type"]:
-            if k in kwargs:
-                kwargs.pop(k)
-        if len(kwargs) != 0:
-            raise ValueError(f"Found unknown {kwargs=}")
+        # See DbrxAttentionConfig: extra kwargs must be tolerated so saved
+        # checkpoints (whose sub-configs carry EasyDeL base attrs) reload.
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs: tp.Any) -> "EasyDeLBaseConfig":

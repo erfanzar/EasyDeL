@@ -2057,7 +2057,9 @@ class Qwen3NextMLPStack(spx.Module):
             Transformed hidden states [batch, seq_len, hidden_dim].
         """
         gate_up = self.gate_up_proj(hidden_states, group_sizes, sorted_experts)
-        gate, up = jnp.split(gate_up, 2, axis=-1)
+        # The fused kernel is TP-interleaved (see moe_fused_gate_up_reform_param);
+        # a contiguous split would mix gate and up columns whenever tp > 1.
+        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
         return self.down_proj(self.act_fn(gate) * up, group_sizes, sorted_experts)
 
 

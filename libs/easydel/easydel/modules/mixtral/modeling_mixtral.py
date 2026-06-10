@@ -68,6 +68,7 @@ from easydel.layers import (
     RMSNorm,
     RowParallelMoELinear,
     moe_fused_gate_up_reform_param,
+    split_fused_gate_up_projection,
 )
 from easydel.layers.attention import UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
@@ -234,7 +235,9 @@ class MixtralMoEMlp(spx.Module):
             Array: Transformed hidden states after expert MLP processing.
         """
         gate_up = checkpoint_name(self.gate_up_proj(x, group_sizes, sorted_experts), "mlp_gate_up")
-        gate, up = jnp.split(gate_up, 2, axis=-1)
+        # The fused expert kernel is TP-interleaved (FusedExpertLayout); a
+        # contiguous split would mix gate and up columns whenever tp > 1.
+        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
         hidden_states = checkpoint_name(self.act_fn(gate) * up, "mlp_up")
         outputs = checkpoint_name(self.w2(hidden_states, group_sizes, sorted_experts), "mlp_down")
         return checkpoint_name(outputs, "mlp_output")
