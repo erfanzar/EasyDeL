@@ -230,9 +230,16 @@ def looks_tpu_metric(metric: dict[str, Any]) -> bool:
 
 
 def collect_tpu_quota_metrics(
-    session: AuthorizedSession, project_number: str, try_all_services: bool = False, verbose: bool = False
+    session: AuthorizedSession,
+    project_number: str,
+    try_all_services: bool = False,
+    verbose: bool = False,
 ) -> list[dict[str, Any]]:
-    candidates = ["tpu.googleapis.com", "cloudtpu.googleapis.com", "compute.googleapis.com"]
+    candidates = [
+        "tpu.googleapis.com",
+        "cloudtpu.googleapis.com",
+        "compute.googleapis.com",
+    ]
     metrics = []
     for svc in candidates:
         try:
@@ -512,9 +519,18 @@ def main():
         description="Discover Cloud TPU zones/types and generate one cluster config per zone with all TPU families."
     )
     parser.add_argument("--project-id", help="Override GCP project ID")
-    parser.add_argument("--output-dir", type=Path, default=this_path, help="Output directory for generated configs")
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=this_path,
+        help="Output directory for generated configs",
+    )
     parser.add_argument("--print-summary", action="store_true", help="Print a human-readable summary")
-    parser.add_argument("--try-all-services", action="store_true", help="Scrape TPU quotas from all enabled services")
+    parser.add_argument(
+        "--try-all-services",
+        action="store_true",
+        help="Scrape TPU quotas from all enabled services",
+    )
     parser.add_argument("--verbose", action="store_true", help="Verbose logging")
     parser.add_argument(
         "--families",
@@ -531,7 +547,10 @@ def main():
     global project_id
     project_id = args.project_id or get_default_project_id()
     if not project_id:
-        print("Could not determine project ID. Set GCP_PROJECT_ID or pass --project-id.", file=sys.stderr)
+        print(
+            "Could not determine project ID. Set GCP_PROJECT_ID or pass --project-id.",
+            file=sys.stderr,
+        )
         sys.exit(1)
     logger.info(f"Using project ID: {project_id}")
 
@@ -583,7 +602,12 @@ def main():
             z = zone_from_dims(r.get("dimensions", {}))
             if not z:
                 continue
-            texts = [r.get("metric"), r.get("displayName"), r.get("limit_name"), r.get("unit")]
+            texts = [
+                r.get("metric"),
+                r.get("displayName"),
+                r.get("limit_name"),
+                r.get("unit"),
+            ]
             fam = safe_classify_tpu_type(texts, r.get("dimensions", {}))
             pre = is_preemptible(texts, r.get("dimensions", {}))
             eff = int(r.get("effectiveLimit", 0) or 0)
@@ -644,7 +668,10 @@ def main():
                 print(f"  {z:>15} -> {fam_sizes}")
         if tpu_quota_rows:
             print("\nTPU quotas (zone-specific, cores):")
-            for row in sorted(tpu_quota_rows, key=lambda r: (r["zone"], r["tpu_family"], r["preemptible"])):
+            for row in sorted(
+                tpu_quota_rows,
+                key=lambda r: (r["zone"], r["tpu_family"], r["preemptible"]),
+            ):
                 print(
                     f"  zone={row['zone']:>15} family={row['tpu_family']:<4} "
                     f"preemptible={str(row['preemptible']).lower():<5} cores={row['effective_limit_cores']}"

@@ -119,8 +119,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-overlap", action="store_true")
     parser.add_argument("--use-aot-forward", action="store_true")
     parser.add_argument("--verbose-runner", action="store_true")
-    parser.add_argument("--xprof-dir", default=None, help="Optional JAX profiler output directory for one timed trial.")
-    parser.add_argument("--xprof-trial", type=int, default=1, help="1-based timed trial index to profile.")
+    parser.add_argument(
+        "--xprof-dir",
+        default=None,
+        help="Optional JAX profiler output directory for one timed trial.",
+    )
+    parser.add_argument(
+        "--xprof-trial",
+        type=int,
+        default=1,
+        help="1-based timed trial index to profile.",
+    )
     parser.add_argument("--xprof-host-level", type=int, default=1)
     parser.add_argument("--xprof-python-level", type=int, default=0)
     return parser.parse_args()
@@ -370,7 +379,10 @@ def run_batch(runner, prompts: list[list[int]], output_len: int, max_num_batched
                 if scheduler_output.total_num_scheduled_tokens > 0:
                     next_pending = None
                     if runner.can_dispatch_next_before_async_drain(scheduler_output):
-                        next_pending = runner.execute_model_async(scheduler_output), scheduler_output
+                        next_pending = (
+                            runner.execute_model_async(scheduler_output),
+                            scheduler_output,
+                        )
                     drain((future, prev_scheduler_output))
                     if next_pending is None:
                         next_pending = execute_positive(scheduler_output)

@@ -89,6 +89,7 @@ def _constrain_distillation_input_batch(
         dict(with_sharding_constraint(batch, partition_spec, mesh=mesh, ignore_mpmd=True)),
     )
 
+
 def _per_token_xent(
     teacher_logits: Array,
     student_logits: Array,
@@ -1647,6 +1648,7 @@ def distillation_step(
     else:
         _, metrics = loss_fn(tree=student_state.graphstate, minibatch=batch)
         return metrics
+
 
 def _prepare_distillation_scheduled_batch(call) -> dict[str, tp.Any]:
     """Return the scheduled batch unchanged.

@@ -156,7 +156,16 @@ def main() -> None:
     dtype = jnp.bfloat16 if args.dtype == "bf16" else jnp.float32
 
     @jax.jit
-    def legacy_full_sampler(logits, token_history, seq_lens, active_mask, presence, frequency, repetition, rng):
+    def legacy_full_sampler(
+        logits,
+        token_history,
+        seq_lens,
+        active_mask,
+        presence,
+        frequency,
+        repetition,
+        rng,
+    ):
         """Legacy sampler: rebuild token counts from ``token_history`` per call.
 
         Args:
@@ -196,7 +205,14 @@ def main() -> None:
 
     @jax.jit
     def optimized_full_sampler(
-        logits, token_counts_full, row_indices, active_mask, presence, frequency, repetition, rng
+        logits,
+        token_counts_full,
+        row_indices,
+        active_mask,
+        presence,
+        frequency,
+        repetition,
+        rng,
     ):
         """Optimized sampler: gather precomputed token counts and update in place.
 
@@ -357,7 +373,11 @@ def main() -> None:
                 full_valid = jnp.zeros((args.padded_reqs + spill,), dtype=jnp.bool_)
                 full_tokens_local = full_tokens.at[scatter_positions].set(jnp.where(active_mask, sampled, -1))
                 full_valid_local = full_valid.at[scatter_positions].set(active_mask)
-                return full_tokens_local[: args.padded_reqs], full_valid_local[: args.padded_reqs], updated_counts
+                return (
+                    full_tokens_local[: args.padded_reqs],
+                    full_valid_local[: args.padded_reqs],
+                    updated_counts,
+                )
 
             return lax.cond(identity_layout, _identity_output, _scatter_output, operand=None)
 
@@ -365,7 +385,11 @@ def main() -> None:
         full_valid = jnp.zeros((args.padded_reqs + spill,), dtype=jnp.bool_)
         full_tokens = full_tokens.at[scatter_positions].set(jnp.where(active_mask, sampled, -1))
         full_valid = full_valid.at[scatter_positions].set(active_mask)
-        return full_tokens[: args.padded_reqs], full_valid[: args.padded_reqs], updated_counts
+        return (
+            full_tokens[: args.padded_reqs],
+            full_valid[: args.padded_reqs],
+            updated_counts,
+        )
 
     key = jax.random.PRNGKey(0)
     logits = jax.random.normal(key, (args.padded_reqs, args.vocab_size), dtype=dtype)
@@ -413,16 +437,48 @@ def main() -> None:
     compact_repetition_active128 = jnp.full((compact_active128_padded,), args.repetition_penalty, dtype=dtype)
 
     legacy_full_sampler(
-        logits, token_history, seq_lens_active_128, active_mask_128, presence, frequency, repetition, key
+        logits,
+        token_history,
+        seq_lens_active_128,
+        active_mask_128,
+        presence,
+        frequency,
+        repetition,
+        key,
     ).block_until_ready()
     legacy_full_sampler(
-        logits, token_history, seq_lens_active_1, active_mask_1, presence, frequency, repetition, key
+        logits,
+        token_history,
+        seq_lens_active_1,
+        active_mask_1,
+        presence,
+        frequency,
+        repetition,
+        key,
     ).block_until_ready()
     jax.block_until_ready(
-        optimized_full_sampler(logits, token_counts, row_indices, active_mask_128, presence, frequency, repetition, key)
+        optimized_full_sampler(
+            logits,
+            token_counts,
+            row_indices,
+            active_mask_128,
+            presence,
+            frequency,
+            repetition,
+            key,
+        )
     )
     jax.block_until_ready(
-        optimized_full_sampler(logits, token_counts, row_indices, active_mask_1, presence, frequency, repetition, key)
+        optimized_full_sampler(
+            logits,
+            token_counts,
+            row_indices,
+            active_mask_1,
+            presence,
+            frequency,
+            repetition,
+            key,
+        )
     )
     jax.block_until_ready(
         compacted_full_sampler(

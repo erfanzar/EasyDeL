@@ -138,7 +138,11 @@ def _infer_task_from_hf_config(config) -> TaskType:
 
     if model_type in {"clip", "siglip"}:
         return "zero_shot_image_classification"
-    if "forspeechseq2seq" in joined or model_type in {"whisper", "speech_to_text", "speech-to-text"}:
+    if "forspeechseq2seq" in joined or model_type in {
+        "whisper",
+        "speech_to_text",
+        "speech-to-text",
+    }:
         return "speech_seq2seq"
     if "forimagetexttotext" in joined or "vision2seq" in joined or model_type in IMAGE_TEXT_TO_TEXT_MODEL_TYPES:
         return "image_text_to_text"
@@ -338,7 +342,8 @@ class ConvertArgs:
     auto_shard_model: bool = field(default=True, metadata={"help": "Enable/disable automatic sharding"})
 
     cache_dir: str | None = field(
-        default=None, metadata={"help": "HF cache directory (point this at your GCSFuse mount)"}
+        default=None,
+        metadata={"help": "HF cache directory (point this at your GCSFuse mount)"},
     )
     revision: str | None = field(default=None, metadata={"help": "HF revision/branch/tag/commit"})
     token: str | None = field(

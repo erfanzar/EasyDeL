@@ -152,7 +152,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN"),
         help="HF token (defaults to HF_TOKEN / HUGGING_FACE_HUB_TOKEN).",
     )
-    parser.add_argument("--revision", default="main", help="Repo revision/branch to read from and push to.")
+    parser.add_argument(
+        "--revision",
+        default="main",
+        help="Repo revision/branch to read from and push to.",
+    )
     parser.add_argument(
         "--commit-message",
         default="Update README.md (EasyDeL auto-generated)",
@@ -162,7 +166,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", help="Optional directory to write generated READMEs for review.")
     parser.add_argument("--template-dir", help="Optional custom Jinja template directory.")
     parser.add_argument("--template-name", help="Optional template filename inside template_dir.")
-    parser.add_argument("--git-user-name", default="EasyDeL README Bot", help="Git author name for pushes.")
+    parser.add_argument(
+        "--git-user-name",
+        default="EasyDeL README Bot",
+        help="Git author name for pushes.",
+    )
     parser.add_argument(
         "--git-user-email",
         default="easydel-readme-bot@users.noreply.huggingface.co",
@@ -390,7 +398,11 @@ def _infer_task_from_config(config: dict[str, Any]) -> str:
 
     if model_type in {"clip", "siglip"}:
         return "zero-shot-image-classification"
-    if "forspeechseq2seq" in joined or model_type in {"whisper", "speech_to_text", "speech-to-text"}:
+    if "forspeechseq2seq" in joined or model_type in {
+        "whisper",
+        "speech_to_text",
+        "speech-to-text",
+    }:
         return "speech-sequence-to-sequence"
     if (
         "forimagetexttotext" in joined
@@ -771,7 +783,14 @@ def _upload_readme_via_sparse_git(
         repo_dir = tmpdir / "repo"
         remote_url = f"{HF_BASE_URL}/{repo_id}"
 
-        clone_command = ["git", "clone", "--depth", "1", "--filter=blob:none", "--sparse"]
+        clone_command = [
+            "git",
+            "clone",
+            "--depth",
+            "1",
+            "--filter=blob:none",
+            "--sparse",
+        ]
         if revision:
             clone_command.extend(["--branch", revision])
         clone_command.extend([remote_url, str(repo_dir)])

@@ -26,7 +26,10 @@ from __future__ import annotations
 import argparse
 import time
 
-from easydel.inference.esurge.config import eSurgeCacheRuntimeConfig, eSurgeRuntimeConfig
+from easydel.inference.esurge.config import (
+    eSurgeCacheRuntimeConfig,
+    eSurgeRuntimeConfig,
+)
 from easydel.inference.esurge.esurge_engine import eSurge
 from easydel.inference.sampling_params import SamplingParams
 

@@ -333,7 +333,10 @@ def format_code(lib: Lib, fix: bool = True) -> bool:
             success = False
 
     print(f"[{lib.name}] Running ruff format...")
-    result = run_command(["ruff", "format", "--config", config] + [str(f) for f in python_files], check=False)
+    result = run_command(
+        ["ruff", "format", "--config", config] + [str(f) for f in python_files],
+        check=False,
+    )
     if result.returncode != 0:
         print(f"[{lib.name}] Ruff format failed (exit code: {result.returncode})")
         success = False

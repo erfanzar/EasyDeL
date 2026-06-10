@@ -183,8 +183,20 @@ def _build_model(args: argparse.Namespace, *, scan_layers: bool) -> ed.LlamaForC
     cfg = _build_config(args, scan_layers=scan_layers)
     dtype = _dtype(args.dtype)
     if args.base_only:
-        return ed.LlamaModel(cfg, dtype=dtype, param_dtype=dtype, precision=args.precision, rngs=ed.Rngs(args.seed))
-    return ed.LlamaForCausalLM(cfg, dtype=dtype, param_dtype=dtype, precision=args.precision, rngs=ed.Rngs(args.seed))
+        return ed.LlamaModel(
+            cfg,
+            dtype=dtype,
+            param_dtype=dtype,
+            precision=args.precision,
+            rngs=ed.Rngs(args.seed),
+        )
+    return ed.LlamaForCausalLM(
+        cfg,
+        dtype=dtype,
+        param_dtype=dtype,
+        precision=args.precision,
+        rngs=ed.Rngs(args.seed),
+    )
 
 
 def _forward(model: ed.LlamaForCausalLM | ed.LlamaModel, input_ids: jax.Array) -> jax.Array:
@@ -242,7 +254,9 @@ def _trace_values(model: ed.LlamaForCausalLM | ed.LlamaModel, input_ids: jax.Arr
     return tuple(calls)
 
 
-def _parameter_summary(model: ed.LlamaForCausalLM | ed.LlamaModel) -> tuple[int, tuple[str, ...]]:
+def _parameter_summary(
+    model: ed.LlamaForCausalLM | ed.LlamaModel,
+) -> tuple[int, tuple[str, ...]]:
     """Compute total parameter count and the set of unique parameter shardings.
 
     Args:
@@ -387,7 +401,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--case", choices=("trace_off", "trace_on", "both"), default="trace_off")
     parser.add_argument(
-        "--base-only", action="store_true", help="Benchmark LlamaModel only instead of full ForCausalLM."
+        "--base-only",
+        action="store_true",
+        help="Benchmark LlamaModel only instead of full ForCausalLM.",
     )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--seq-len", type=int, default=128)

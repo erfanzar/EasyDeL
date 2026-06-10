@@ -1,9 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
-name = "easydel-stack"
+name = "easydel-foundation"
 version = "0.1.0"
-description = "EasyDeL stack workspace: easydel + spectrax + ejkernel + eformer developed in one repo"
+description = "EasyDeL foundation workspace: easydel + spectrax + ejkernel + eformer developed in one repo"
 requires-python = ">=3.11,<3.14"
 dependencies = ["easydel"]
+
+# Root extras forward to the easydel member so the whole foundation installs with
+# one selector, e.g. `uv sync --extra tpu --extra dev` (workspace-aware: the
+# four packages come editable from libs/). Note: the pip-style
+# `uv pip install -e .[tpu]` also works but resolves easydel & friends from
+# PyPI, NOT from libs/ — use `uv sync` for development environments.
+[project.optional-dependencies]
+torch = ["easydel[torch]"]
+cuda = ["easydel[cuda]"]
+tpu = ["easydel[tpu]"]
+tensorflow = ["easydel[tensorflow]"]
+lm-eval = ["easydel[lm_eval]"]
+profile = ["easydel[profile]"]
+podutils = ["easydel[podutils]"]
+mm = ["easydel[mm]"]
+dev = ["import-linter>=2.0", "ruff", "pytest", "pre-commit", "basedpyright"]
 
 [dependency-groups]
 dev = ["import-linter>=2.0", "ruff", "pytest", "pre-commit", "basedpyright"]
@@ -16,9 +36,12 @@ profile = ["easydel[profile]"]
 podutils = ["easydel[podutils]"]
 mm = ["easydel[mm]"]
 
+# The root wheel is an empty meta-package: it exists so `-e .` style installs
+# have a build backend (legacy setuptools chokes on the flat repo layout).
+[tool.hatch.build.targets.wheel]
+bypass-selection = true
+
 [tool.uv]
-# The root is a workspace anchor, not an installable package.
-package = false
 prerelease = "if-necessary-or-explicit"
 conflicts = [
     [
@@ -32,6 +55,18 @@ conflicts = [
     [
         { group = "profile" },
         { group = "tensorflow" },
+    ],
+    [
+        { extra = "cuda" },
+        { extra = "tpu" },
+    ],
+    [
+        { extra = "cuda" },
+        { extra = "torch" },
+    ],
+    [
+        { extra = "profile" },
+        { extra = "tensorflow" },
     ],
 ]
 
@@ -63,3 +98,12 @@ forbidden_modules = ["easydel"]
 name = "foundation libs stay independent of each other"
 type = "independence"
 modules = ["spectrax", "ejkernel", "eformer"]
+
+[tool.black]
+line-length = 121
+target-version = ["py311"]
+preview = true
+
+[tool.ruff]
+line-length = 121
+target-version = "py311"

@@ -126,10 +126,16 @@ class ChunkedDownloadArgs:
         metadata={"help": "Destination root: a local path (including gcsfuse mount) or a gs://bucket/prefix URI."}
     )
 
-    repo_id: str = field(default_factory=list, metadata={"action": "append", "help": "HF repo id (repeatable)."})
+    repo_id: str = field(
+        default_factory=list,
+        metadata={"action": "append", "help": "HF repo id (repeatable)."},
+    )
     repos_file: str | None = field(default=None, metadata={"help": "File with one repo id per line."})
     repo_type: str = field(default="model", metadata={"help": "HF repo type (model|dataset|space)."})
-    revision: str | None = field(default=None, metadata={"help": "HF revision/branch/tag/commit (default: main)."})
+    revision: str | None = field(
+        default=None,
+        metadata={"help": "HF revision/branch/tag/commit (default: main)."},
+    )
     token: str | None = field(
         default=None,
         metadata={"help": "HF token (or use HF_TOKEN env / `huggingface-cli login`)."},
@@ -152,21 +158,35 @@ class ChunkedDownloadArgs:
         default=False,
         metadata={"help": "Only download files under '*.zarr/' directories (matches paths containing '.zarr/')."},
     )
-    include: str = field(default_factory=list, metadata={"action": "append", "help": "Glob to include (repeatable)."})
-    exclude: str = field(default_factory=list, metadata={"action": "append", "help": "Glob to exclude (repeatable)."})
+    include: str = field(
+        default_factory=list,
+        metadata={"action": "append", "help": "Glob to include (repeatable)."},
+    )
+    exclude: str = field(
+        default_factory=list,
+        metadata={"action": "append", "help": "Glob to exclude (repeatable)."},
+    )
 
-    skip_existing: bool = field(default=False, metadata={"help": "Skip files that already exist (local out only)."})
+    skip_existing: bool = field(
+        default=False,
+        metadata={"help": "Skip files that already exist (local out only)."},
+    )
     force_download: bool = field(default=False, metadata={"help": "Re-download even if staging file exists."})
     local_files_only: bool = field(default=False, metadata={"help": "Do not download from HF Hub."})
     dry_run: bool = field(default=False, metadata={"help": "Print actions but do nothing."})
     continue_on_error: bool = field(
-        default=False, metadata={"help": "Continue with remaining files if one download fails."}
+        default=False,
+        metadata={"help": "Continue with remaining files if one download fails."},
     )
     keep_staging: bool = field(
-        default=False, metadata={"help": "Do not delete staging payload after each sync (useful for debugging)."}
+        default=False,
+        metadata={"help": "Do not delete staging payload after each sync (useful for debugging)."},
     )
 
-    gsutil_parallel: bool = field(default=True, metadata={"help": "Use `gsutil -m` when syncing to gs:// destinations."})
+    gsutil_parallel: bool = field(
+        default=True,
+        metadata={"help": "Use `gsutil -m` when syncing to gs:// destinations."},
+    )
     enable_hf_transfer: bool = field(
         default=False,
         metadata={"help": "Enable hf_transfer accelerated HF downloads (requires `pip install hf_transfer`)."},
@@ -514,7 +534,10 @@ def main(argv: list[str] | None = None) -> int:
         try:
             import hf_transfer  # noqa: F401 #type:ignore
         except Exception:
-            print("warning: `hf_transfer` is not installed. Run: pip install -U hf_transfer", file=sys.stderr)
+            print(
+                "warning: `hf_transfer` is not installed. Run: pip install -U hf_transfer",
+                file=sys.stderr,
+            )
 
     repo_ids: list[str] = []
     repo_ids.extend([rid for rid in args.repo_id if rid])
@@ -613,7 +636,12 @@ def main(argv: list[str] | None = None) -> int:
             repo_failed += failed
             total_failed += failed
 
-            _sync_payload(_payload_dir, _dest_repo_root, dry_run=args.dry_run, gsutil_parallel=args.gsutil_parallel)
+            _sync_payload(
+                _payload_dir,
+                _dest_repo_root,
+                dry_run=args.dry_run,
+                gsutil_parallel=args.gsutil_parallel,
+            )
 
             if not args.keep_staging and _payload_dir.exists():
                 shutil.rmtree(_payload_dir)

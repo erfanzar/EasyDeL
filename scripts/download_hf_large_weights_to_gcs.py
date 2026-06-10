@@ -128,7 +128,10 @@ class LargeWeightsArgs:
 
     out_root: str = field(metadata={"help": "Output root directory (e.g. /mnt/gcs/weights)."})
 
-    repo_id: str = field(default_factory=list, metadata={"action": "append", "help": "Model repo id (repeatable)."})
+    repo_id: str = field(
+        default_factory=list,
+        metadata={"action": "append", "help": "Model repo id (repeatable)."},
+    )
     repos_file: str | None = field(default=None, metadata={"help": "File with one repo id per line."})
     collection: str = field(
         default_factory=list,
@@ -140,8 +143,14 @@ class LargeWeightsArgs:
         },
     )
 
-    revision: str | None = field(default=None, metadata={"help": "Repo revision to download from (default: main)."})
-    token: str | None = field(default=None, metadata={"help": "HF token (or use HF_TOKEN env / hf auth login)."})
+    revision: str | None = field(
+        default=None,
+        metadata={"help": "Repo revision to download from (default: main)."},
+    )
+    token: str | None = field(
+        default=None,
+        metadata={"help": "HF token (or use HF_TOKEN env / hf auth login)."},
+    )
     cache_dir: str | None = field(
         default=None,
         metadata={
@@ -159,7 +168,10 @@ class LargeWeightsArgs:
     )
     exclude: str = field(
         default_factory=list,
-        metadata={"action": "append", "help": "Glob to exclude (repeatable). Example: --exclude '*.json'."},
+        metadata={
+            "action": "append",
+            "help": "Glob to exclude (repeatable). Example: --exclude '*.json'.",
+        },
     )
     include_pytorch: bool = field(
         default=False,
@@ -167,12 +179,19 @@ class LargeWeightsArgs:
     )
     match_repo: str = field(
         default_factory=list,
-        metadata={"action": "append", "help": "Only process repos whose id contains this substring (repeatable)."},
+        metadata={
+            "action": "append",
+            "help": "Only process repos whose id contains this substring (repeatable).",
+        },
     )
 
-    dry_run: bool = field(default=False, metadata={"help": "Print what would be downloaded, but do nothing."})
+    dry_run: bool = field(
+        default=False,
+        metadata={"help": "Print what would be downloaded, but do nothing."},
+    )
     continue_on_error: bool = field(
-        default=False, metadata={"help": "Continue with remaining repos even if one download fails."}
+        default=False,
+        metadata={"help": "Continue with remaining repos even if one download fails."},
     )
     enable_hf_transfer: bool = field(
         default=False,
@@ -348,7 +367,10 @@ def main(argv: list[str] | None = None) -> int:
         try:
             import hf_transfer  # noqa: F401 #type:ignore
         except Exception:
-            print("Warning: `hf_transfer` is not installed. Run: pip install -U hf_transfer", file=sys.stderr)
+            print(
+                "Warning: `hf_transfer` is not installed. Run: pip install -U hf_transfer",
+                file=sys.stderr,
+            )
 
     out_root = Path(args.out_root).expanduser().resolve()
     out_root.mkdir(parents=True, exist_ok=True)
