@@ -32,7 +32,7 @@ dependencies = [
 	"jax>=0.10.0",
 	"jaxlib>=0.10.0",
 	"eformer==0.0.101",
-	"ejkernel==0.0.80.3",
+	"ejkernel==0.0.82",
 	"spectrax-lib==0.1.5",
 	"ray[default]==2.54.0",
 	"einops~=0.8.0",
@@ -83,9 +83,9 @@ torch = ["torch==2.8.0"]
 cuda = [
 	"jax[cuda13]>=0.10.0",
 	"torch==2.8.0",
-	"ejkernel[cuda,triton]==0.0.80.3",
+	"ejkernel[cuda,triton]==0.0.82",
 ]
-tpu = ["jax[tpu]>=0.10.0", "ejkernel[tpu]==0.0.80.3"]
+tpu = ["jax[tpu]>=0.10.0", "ejkernel[tpu]==0.0.82"]
 tensorflow = ["tensorflow~=2.19.0", "tensorflow-datasets~=4.9.9"]
 lm_eval = ["lm_eval~=0.4.11"]
 profile = [
