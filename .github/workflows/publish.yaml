@@ -1,0 +1,55 @@
+name: Publish package
+
+# Tag-driven per-package PyPI release: pushing a tag created by
+# scripts/release.sh (e.g. ejkernel-v0.0.81) builds and publishes ONLY that
+# package. Uses PyPI trusted publishing (configure each project on PyPI:
+# Publishing -> add GitHub publisher for this repo + this workflow); set the
+# PYPI_API_TOKEN secret instead if you prefer token auth.
+
+on:
+  push:
+    tags:
+      - "easydel-v*"
+      - "spectrax-v*"
+      - "ejkernel-v*"
+      - "eformer-v*"
+
+permissions:
+  id-token: write # PyPI trusted publishing
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Resolve package from tag
+        id: pkg
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          LIB="${TAG%-v*}"
+          case "$LIB" in
+            easydel)  DIST=easydel ;;
+            spectrax) DIST=spectrax-lib ;;
+            ejkernel) DIST=ejkernel ;;
+            eformer)  DIST=eformer ;;
+            *) echo "unknown tag prefix: $TAG" >&2; exit 1 ;;
+          esac
+          echo "dist=$DIST" >> "$GITHUB_OUTPUT"
+          echo "releasing $DIST from $TAG"
+
+      - name: Build
+        run: uv build --package "${{ steps.pkg.outputs.dist }}" --out-dir dist/
+
+      - name: Publish to PyPI
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          if [ -n "$UV_PUBLISH_TOKEN" ]; then
+            uv publish dist/*
+          else
+            uv publish --trusted-publishing always dist/*
+          fi

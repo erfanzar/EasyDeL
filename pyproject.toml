@@ -6,6 +6,7 @@ requires-python = ">=3.11,<3.14"
 dependencies = ["easydel"]
 
 [dependency-groups]
+dev = ["import-linter>=2.0"]
 torch = ["easydel[torch]"]
 cuda = ["easydel[cuda]"]
 tpu = ["easydel[tpu]"]
@@ -44,3 +45,21 @@ easydel = { workspace = true }
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true
+
+# Layering contract for the workspace: easydel sits on top of the three
+# foundation libraries; the foundation libraries must stay independent of
+# easydel AND of each other (ejkernel's eformer dep is a dev/test extra only).
+# Enforced in CI via `lint-imports`.
+[tool.importlinter]
+root_packages = ["easydel", "spectrax", "ejkernel", "eformer"]
+
+[[tool.importlinter.contracts]]
+name = "foundation libs must not import easydel"
+type = "forbidden"
+source_modules = ["spectrax", "ejkernel", "eformer"]
+forbidden_modules = ["easydel"]
+
+[[tool.importlinter.contracts]]
+name = "foundation libs stay independent of each other"
+type = "independence"
+modules = ["spectrax", "ejkernel", "eformer"]
