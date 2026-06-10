@@ -9,17 +9,27 @@ repos:
     rev: v4.5.0
     hooks:
       - id: trailing-whitespace
+        stages: [pre-commit]
       - id: end-of-file-fixer
+        stages: [pre-commit]
       - id: check-yaml
+        stages: [pre-commit]
         exclude: autoscale/easydel-cluster-template.yaml
       - id: check-json
+        stages: [pre-commit]
       - id: check-toml
+        stages: [pre-commit]
       - id: check-added-large-files
+        stages: [pre-commit]
         args: ["--maxkb=1000"]
       - id: check-case-conflict
+        stages: [pre-commit]
       - id: check-merge-conflict
+        stages: [pre-commit]
       - id: detect-private-key
+        stages: [pre-commit]
       - id: mixed-line-ending
+        stages: [pre-commit]
         args: ["--fix=lf"]
 
   # Python code formatting with ruff
@@ -28,9 +38,11 @@ repos:
     hooks:
       # Run the linter
       - id: ruff
+        stages: [pre-commit]
         args: ["--fix"]
       # Run the formatter
       - id: ruff-format
+        stages: [pre-commit]
 
   # Type checking with mypy (optional, can be slow)
   # - repo: https://github.com/pre-commit/mirrors-mypy
@@ -82,6 +94,7 @@ repos:
       #   always_run: true
 
       - id: check-easydel-imports
+        stages: [pre-commit]
         name: Check EasyDeL imports
         entry: .venv/bin/python -c "import easydel as ed;import jax;print(jax.devices())" # Placeholder - can add actual import checks
         language: python
