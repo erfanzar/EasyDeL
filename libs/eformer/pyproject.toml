@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "eformer"
-version = "0.0.101"
+version = "0.1.0"
 authors = [{ name = "Erfan Zare Chavoshi", email = "Erfanzare810@gmail.com" }]
 description = "(EasyDel Former) is a utility library designed to simplify and enhance the development in JAX"
 readme = "README.md"

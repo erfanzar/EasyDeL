@@ -965,7 +965,7 @@ tpu = [{ name = "easydel", extras = ["tpu"], editable = "libs/easydel" }]
 
 [[package]]
 name = "eformer"
-version = "0.0.101"
+version = "0.1.0"
 source = { editable = "libs/eformer" }
 dependencies = [
     { name = "braceexpand" },
