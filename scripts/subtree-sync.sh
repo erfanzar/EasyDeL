@@ -25,9 +25,22 @@ shift || true
 libs=("$@")
 [ ${#libs[@]} -eq 0 ] && libs=(spectrax ejkernel eformer)
 
-if [ "$cmd" = "auto" ] && [ -n "${SUBTREE_SYNC_SKIP:-}" ]; then
-    echo "subtree-sync: skipped (SUBTREE_SYNC_SKIP set)"
-    exit 0
+if [ "$cmd" = "auto" ]; then
+    # bypass requested
+    if [ -n "${SUBTREE_SYNC_SKIP:-}" ]; then
+        echo "subtree-sync: skipped (SUBTREE_SYNC_SKIP set)"
+        exit 0
+    fi
+    # `git subtree push` runs `git push` inside this same repo, which fires
+    # this pre-push hook again -> guard against infinite recursion, and only
+    # sync when the push target is the monorepo itself (not a mirror).
+    if [ -n "${SUBTREE_SYNC_RUNNING:-}" ]; then
+        exit 0
+    fi
+    if [ -n "${PRE_COMMIT_REMOTE_URL:-}" ] && [[ "${PRE_COMMIT_REMOTE_URL}" != *EasyDeL* ]]; then
+        exit 0
+    fi
+    export SUBTREE_SYNC_RUNNING=1
 fi
 
 for lib in "${libs[@]}"; do
