@@ -9,8 +9,14 @@
 #
 # `auto` runs from the pre-push hook so mirrors update whenever you `git push`
 # and a library actually changed. CI (.github/workflows/sync-subtrees.yaml)
-# remains the server-side backstop. Pushed mirror commits keep per-commit
-# messages; pulls are squashed so the monorepo history stays compact.
+# remains the server-side backstop.
+#
+# Every commit pushed to a mirror has its message prefixed with ${MONO_SYNC_PREFIX}
+# (default "easydel(mono-sync): ") so mirror history is clearly attributable to the
+# monorepo sync. Per-commit granularity, author, committer and dates are preserved;
+# only NEW commits (those not already on the mirror) are replayed, so existing mirror
+# history is untouched and the push stays a fast-forward. Pulls are squashed so the
+# monorepo history stays compact.
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
@@ -19,6 +25,8 @@ declare -A REPOS=(
     [ejkernel]="https://github.com/erfanzar/ejkernel"
     [eformer]="https://github.com/erfanzar/eformer"
 )
+
+MONO_SYNC_PREFIX="${MONO_SYNC_PREFIX:-easydel(mono-sync): }"
 
 cmd="${1:-push}"
 shift || true
@@ -31,9 +39,8 @@ if [ "$cmd" = "auto" ]; then
         echo "subtree-sync: skipped (SUBTREE_SYNC_SKIP set)"
         exit 0
     fi
-    # `git subtree push` runs `git push` inside this same repo, which fires
-    # this pre-push hook again -> guard against infinite recursion, and only
-    # sync when the push target is the monorepo itself (not a mirror).
+    # `git push` to a mirror fires this pre-push hook again -> guard against
+    # infinite recursion, and only sync when the push target is the monorepo.
     if [ -n "${SUBTREE_SYNC_RUNNING:-}" ]; then
         exit 0
     fi
@@ -43,12 +50,86 @@ if [ "$cmd" = "auto" ]; then
     export SUBTREE_SYNC_RUNNING=1
 fi
 
+# Replay libs/$lib's subtree onto the mirror's current main, prefixing each NEW commit's
+# message with ${MONO_SYNC_PREFIX} (idempotent: skips commits already prefixed). Preserves
+# author/committer identity and dates. Echoes the head SHA to push, or "INSYNC" / "DIVERGED".
+build_prefixed_head() {
+    local lib="$1" remote_head="$2"
+    local split_head split_tree remote_tree boundary new_parent c tree msg range
+    split_head=$(git subtree split --prefix="libs/$lib" HEAD)
+    split_tree=$(git rev-parse "${split_head}^{tree}")
+
+    if [ -n "$remote_head" ]; then
+        remote_tree=$(git rev-parse "${remote_head}^{tree}" 2>/dev/null || true)
+        if [ "$split_tree" = "$remote_tree" ]; then echo INSYNC; return 0; fi
+        # Boundary = newest split commit whose tree matches the mirror's current content.
+        # Tree-based (not SHA-based) so it survives the message rewriting we apply below.
+        boundary=""
+        for c in $(git rev-list "$split_head"); do
+            if [ "$(git rev-parse "${c}^{tree}")" = "$remote_tree" ]; then boundary="$c"; break; fi
+        done
+        if [ -z "$boundary" ]; then echo DIVERGED; return 0; fi
+        range="${boundary}..${split_head}"
+        new_parent="$remote_head"
+    else
+        range="$split_head"      # fresh mirror: replay the whole subtree history
+        new_parent=""
+    fi
+
+    for c in $(git rev-list --reverse "$range"); do
+        tree=$(git rev-parse "${c}^{tree}")
+        msg=$(git log -1 --format=%B "$c")
+        case "$msg" in "${MONO_SYNC_PREFIX}"*) : ;; *) msg="${MONO_SYNC_PREFIX}${msg}" ;; esac
+        local pargs=()
+        [ -n "$new_parent" ] && pargs=(-p "$new_parent")
+        new_parent=$(
+            GIT_AUTHOR_NAME="$(git log -1 --format=%an "$c")" \
+            GIT_AUTHOR_EMAIL="$(git log -1 --format=%ae "$c")" \
+            GIT_AUTHOR_DATE="$(git log -1 --format=%aI "$c")" \
+            GIT_COMMITTER_NAME="$(git log -1 --format=%cn "$c")" \
+            GIT_COMMITTER_EMAIL="$(git log -1 --format=%ce "$c")" \
+            GIT_COMMITTER_DATE="$(git log -1 --format=%cI "$c")" \
+            git commit-tree "$tree" "${pargs[@]}" -F - <<<"$msg"
+        )
+    done
+    echo "$new_parent"
+}
+
+push_prefixed() {
+    local lib="$1" repo="$2"
+    local lsout remote_head head
+    if ! lsout=$(git ls-remote "$repo" main 2>/dev/null); then
+        echo ">>> $lib: mirror unreachable, skipping (retry: scripts/subtree-sync.sh push $lib)"
+        return 0
+    fi
+    remote_head=$(printf '%s' "$lsout" | cut -f1)
+    head=$(build_prefixed_head "$lib" "$remote_head")
+    case "$head" in
+        INSYNC) echo ">>> $lib: mirror up to date"; return 0 ;;
+        DIVERGED)
+            echo ">>> $lib: mirror history diverged from the monorepo subtree;" >&2
+            echo "    reconcile with: scripts/subtree-sync.sh pull $lib" >&2
+            return 1 ;;
+    esac
+    if [ -n "${DRY_RUN:-}" ]; then
+        echo ">>> $lib: WOULD push ${head} -> $repo (main); new commit subjects:"
+        if [ -n "$remote_head" ]; then
+            git log --format='      %s' "${remote_head}..${head}"
+        else
+            git log --format='      %s' "$head"
+        fi
+        return 0
+    fi
+    echo ">>> $lib: pushing prefixed update -> $repo (main)"
+    git push "$repo" "${head}:main"
+}
+
 for lib in "${libs[@]}"; do
     repo="${REPOS[$lib]:?unknown lib: $lib}"
     case "$cmd" in
     push)
         echo ">>> libs/$lib -> $repo (main)"
-        git subtree push --prefix="libs/$lib" "$repo" main
+        push_prefixed "$lib" "$repo"
         ;;
     pull)
         echo ">>> $repo (main) -> libs/$lib"
@@ -56,25 +137,7 @@ for lib in "${libs[@]}"; do
             -m "deps: sync libs/$lib from $repo"
         ;;
     auto)
-        # mirror unreachable -> warn and continue (never block a push on a
-        # mirror outage); mirror up to date -> skip; otherwise push (a real
-        # divergence makes `git subtree push` fail loudly -> reconcile with
-        # `scripts/subtree-sync.sh pull <lib>`)
-        if ! remote_head=$(git ls-remote "$repo" main 2>/dev/null | cut -f1) || [ -z "$remote_head" ]; then
-            echo ">>> $lib: mirror unreachable, skipping (sync later with: scripts/subtree-sync.sh push $lib)"
-            continue
-        fi
-        split_head=$(git subtree split --prefix="libs/$lib" HEAD 2>/dev/null)
-        if [ "$split_head" = "$remote_head" ]; then
-            echo ">>> $lib: mirror up to date"
-            continue
-        fi
-        if [ -n "${DRY_RUN:-}" ]; then
-            echo ">>> $lib: WOULD push (local $split_head != mirror $remote_head)"
-            continue
-        fi
-        echo ">>> $lib: pushing update -> $repo (main)"
-        git subtree push --prefix="libs/$lib" "$repo" main
+        push_prefixed "$lib" "$repo"
         ;;
     *)
         echo "usage: $0 {push|pull|auto} [lib...]" >&2

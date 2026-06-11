@@ -8,4 +8,4 @@ The version number is used by :mod:`spectrax.__init__` via
 ``from ._version import __version__`` and by packaging tooling.
 """
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
