@@ -52,6 +52,21 @@ _PYARROW_NESTED_CHUNKED_ARRAY_ERROR = "Nested data conversions not implemented f
 _PARQUET_SLOW_NESTED_COLUMNS = frozenset({"image_embeds"})
 _PARQUET_NESTED_FALLBACK_BATCH_SIZE = 256
 _PARQUET_NESTED_FALLBACK_BATCH_SIZES = (256, 64, 16, 1)
+# Per-batch byte budget for streaming embed-heavy row groups, and the projected
+# row-group size above which whole-row-group reads are not even attempted
+# (Arrow cannot represent >2 GiB of nested binary as a single array, so such
+# reads are guaranteed to fail after wasting the full decode).
+_PARQUET_NESTED_TARGET_BATCH_BYTES = 256 * 2**20
+_PARQUET_NESTED_CHUNK_SAFE_BYTES = 1_500_000_000
+# Hard per-row-group memory guard. PyArrow decodes a row group's column chunk
+# atomically, so a reader's peak RSS is bounded below by the row group's
+# compressed+decoded size regardless of batch size. Row groups whose projected
+# payload exceeds this are SKIPPED with a loud warning instead of decoded:
+# attempting them does not raise a catchable error — it kills the host (native
+# allocator abort inside Arrow, or the kernel OOM-killer). Skipping is the only
+# graceful in-process option until such files are re-sharded into small row
+# groups. Override via EASYDEL_PARQUET_MAX_ROW_GROUP_BYTES (0 disables the guard).
+_PARQUET_MAX_SAFE_ROW_GROUP_BYTES = int(os.environ.get("EASYDEL_PARQUET_MAX_ROW_GROUP_BYTES", 24 * 2**30))
 
 
 def _is_pathlike(s: str) -> bool:
@@ -434,22 +449,72 @@ class ParquetShardedSource(ShardedDataSource[dict]):
         for batch in pf.iter_batches(**kwargs):
             yield from self._table_to_rows(batch)
 
+    def _projected_row_group_bytes(self, pf: tp.Any, rg_idx: int) -> tuple[int, int]:
+        """Return ``(uncompressed_bytes, num_rows)`` for the projected columns of one row group.
+
+        Uses only footer metadata (no data reads). When no projection is set,
+        counts every column.
+        """
+        rg = pf.metadata.row_group(rg_idx)
+        roots: set[str] | None = None
+        if self._columns is not None:
+            roots = {self._column_output_key(c) for c in self._columns}
+        total = 0
+        for c in range(rg.num_columns):
+            col = rg.column(c)
+            if roots is None or col.path_in_schema.split(".", 1)[0] in roots:
+                total += col.total_uncompressed_size
+        return total, rg.num_rows
+
+    def _nested_batch_ladder(self, pf: tp.Any, rg_idx: int) -> tuple[int, ...]:
+        """Return descending batch sizes targeting a bounded per-batch byte budget.
+
+        A row-count ladder alone is unsafe for embed-heavy rows (tens of MiB per
+        row): 256 rows of `area_bucket=1536` VL data is a multi-GiB batch. Sizing
+        from the row group's own metadata keeps every attempt near
+        ``_PARQUET_NESTED_TARGET_BATCH_BYTES`` regardless of row weight.
+        """
+        proj_bytes, n_rows = self._projected_row_group_bytes(pf, rg_idx)
+        if n_rows <= 0 or proj_bytes <= 0:
+            return _PARQUET_NESTED_FALLBACK_BATCH_SIZES
+        per_row = max(proj_bytes // n_rows, 1)
+        first = int(_PARQUET_NESTED_TARGET_BATCH_BYTES // per_row)
+        first = max(1, min(first, _PARQUET_NESTED_FALLBACK_BATCH_SIZE))
+        sizes: list[int] = []
+        while True:
+            sizes.append(max(first, 1))
+            if first <= 1:
+                break
+            first //= 4
+        return tuple(sizes)
+
     def _iter_row_group_batches_with_fallback(
         self,
         pf: tp.Any,
         rg_idx: int,
         columns: list[str] | None,
+        *,
+        batch_sizes: tuple[int, ...] | None = None,
     ) -> "Iterator[dict]":
-        """Yield row-group batches, reducing batch size for nested Arrow bugs."""
+        """Yield row-group batches, reducing batch size for nested Arrow bugs.
+
+        Retries are resume-safe: rows already delivered by a partial attempt are
+        skipped (never re-yielded) when a smaller batch size is retried, so a
+        mid-stream Arrow failure cannot silently duplicate rows downstream.
+        """
         last_nested_error: Exception | None = None
-        for batch_size in _PARQUET_NESTED_FALLBACK_BATCH_SIZES:
+        emitted = 0
+        for batch_size in batch_sizes or _PARQUET_NESTED_FALLBACK_BATCH_SIZES:
             try:
-                yield from self._iter_row_group_batches(
+                row_iter = self._iter_row_group_batches(
                     pf,
                     rg_idx,
                     columns,
                     batch_size=batch_size,
                 )
+                for row in itertools.islice(row_iter, emitted, None):
+                    emitted += 1
+                    yield row
                 return
             except Exception as exc:
                 if not self._is_nested_projection_error(exc):
@@ -504,10 +569,29 @@ class ParquetShardedSource(ShardedDataSource[dict]):
                 yield {key: values[i] for _parquet_column, key, values in chunks}
 
     def _iter_row_group_rows(self, pf: tp.Any, rg_idx: int) -> "Iterator[dict]":
-        """Yield rows from one row group, avoiding PyArrow's nested table bug."""
+        """Yield rows from one row group, avoiding PyArrow's nested table bug.
+
+        Row groups whose projected payload cannot form a single Arrow array
+        (> ``_PARQUET_NESTED_CHUNK_SAFE_BYTES``, e.g. packed VL ``image_embeds``
+        data at tens of MiB per row) are routed directly to byte-budgeted
+        streaming batches: whole-row-group reads of such groups are guaranteed
+        to fail with the nested-chunked-array error only after paying the full
+        decode, and row-count-based batches can transiently allocate many GiB.
+        """
         skip_projected_read = self._uses_slow_nested_projection(self._columns)
+        proj_bytes, _n_rows = self._projected_row_group_bytes(pf, rg_idx)
+        if 0 < _PARQUET_MAX_SAFE_ROW_GROUP_BYTES < proj_bytes:
+            logger.warning(
+                f"SKIPPING parquet row group {rg_idx} ({_n_rows} rows): projected payload "
+                f"{proj_bytes / 2**30:.1f} GiB exceeds the {_PARQUET_MAX_SAFE_ROW_GROUP_BYTES / 2**30:.1f} GiB "
+                "decode-memory guard (PyArrow decodes row groups atomically; attempting this would risk "
+                "killing the host). Re-shard this file with a small row_group_size, or raise "
+                "EASYDEL_PARQUET_MAX_ROW_GROUP_BYTES to override."
+            )
+            return
+        heavy = skip_projected_read or proj_bytes > _PARQUET_NESTED_CHUNK_SAFE_BYTES
         use_threads = not self._force_single_threaded_reads
-        if not skip_projected_read:
+        if not heavy:
             try:
                 table = pf.read_row_group(
                     rg_idx,
@@ -520,50 +604,37 @@ class ParquetShardedSource(ShardedDataSource[dict]):
                 if not self._is_nested_projection_error(exc):
                     raise
 
-        self._warn_projection_fallback_once()
-        self._force_single_threaded_reads = True
+            self._warn_projection_fallback_once()
+            self._force_single_threaded_reads = True
 
-        if use_threads and not skip_projected_read:
-            try:
-                table = pf.read_row_group(rg_idx, columns=self._columns, use_threads=False)
-                yield from self._table_to_rows(table)
-                return
-            except Exception as exc:
-                if not self._is_nested_projection_error(exc):
-                    raise
+            if use_threads:
+                try:
+                    table = pf.read_row_group(rg_idx, columns=self._columns, use_threads=False)
+                    yield from self._table_to_rows(table)
+                    return
+                except Exception as exc:
+                    if not self._is_nested_projection_error(exc):
+                        raise
+        else:
+            self._warn_projection_fallback_once()
 
+        last_nested_error: Exception | None = None
         try:
-            for row in self._iter_row_group_batches(pf, rg_idx, self._columns):
-                yield row
+            yield from self._iter_row_group_batches_with_fallback(
+                pf,
+                rg_idx,
+                self._columns,
+                batch_sizes=self._nested_batch_ladder(pf, rg_idx),
+            )
             return
         except Exception as exc:
             if not self._is_nested_projection_error(exc):
                 raise
+            last_nested_error = exc
 
-        try:
-            yield from self._iter_row_group_batches_with_fallback(pf, rg_idx, self._columns)
-            return
-        except Exception as exc:
-            if not self._is_nested_projection_error(exc):
-                raise
-
-        if self._columns is not None:
-            try:
-                yield from self._iter_row_group_columns(pf, rg_idx, self._columns)
-                return
-            except Exception as exc:
-                if not self._is_nested_projection_error(exc):
-                    raise
-
-        for row in self._iter_row_group_batches(
-            pf,
-            rg_idx,
-            None,
-            batch_size=_PARQUET_NESTED_FALLBACK_BATCH_SIZE,
-        ):
-            projected = self._project_row(row)
-            if projected:
-                yield projected
+        if self._columns is None:
+            raise last_nested_error
+        yield from self._iter_row_group_columns(pf, rg_idx, self._columns)
 
     @with_retry(max_retries=3, initial_delay=1.0)  # pyright: ignore[reportUntypedFunctionDecorator]
     def get_shard_info(self, shard_name: str) -> ParquetShardInfo:
