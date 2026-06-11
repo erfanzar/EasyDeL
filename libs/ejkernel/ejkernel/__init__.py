@@ -65,7 +65,7 @@ import os as _os
 _os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
 _os.environ.setdefault("CUTE_DSL_ENABLE_TVM_FFI", "1")
 
-__version__ = "0.0.80.3"
+__version__ = "0.0.82"
 
 from . import errors, kernels, modules, types, utils, xla_utils
 from .errors import EjkernelRuntimeError
