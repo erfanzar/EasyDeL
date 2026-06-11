@@ -67,6 +67,11 @@ _PARQUET_NESTED_CHUNK_SAFE_BYTES = 1_500_000_000
 # graceful in-process option until such files are re-sharded into small row
 # groups. Override via EASYDEL_PARQUET_MAX_ROW_GROUP_BYTES (0 disables the guard).
 _PARQUET_MAX_SAFE_ROW_GROUP_BYTES = int(os.environ.get("EASYDEL_PARQUET_MAX_ROW_GROUP_BYTES", 24 * 2**30))
+# Mid-stream resilience for long-lived shard streams: exceptions treated as
+# transient (PyArrow's ArrowIO errors subclass OSError), and how many times a
+# stream may be reopened with NO forward progress before giving up.
+_PARQUET_TRANSIENT_IO_ERRORS = (IOError, OSError, TimeoutError, ConnectionError)
+_PARQUET_STREAM_MAX_REOPENS = 4
 
 
 def _is_pathlike(s: str) -> bool:
@@ -664,11 +669,14 @@ class ParquetShardedSource(ShardedDataSource[dict]):
             self._shard_info_cache[shard_name] = info
             return info
 
-    @with_retry(max_retries=3, initial_delay=1.0)  # pyright: ignore[reportUntypedFunctionDecorator]
     def open_shard(self, shard_name: str) -> "Iterator[dict]":
         """Open a Parquet shard and iterate over rows.
 
         Reads row groups sequentially and yields individual rows as dictionaries.
+        Transient I/O failures mid-stream resume at the next unread row (a
+        ``with_retry`` decorator is inert on generator functions — calling one
+        only creates the generator, so the old decorator never actually
+        retried anything here).
 
         Args:
             shard_name: Path or URL to the Parquet file.
@@ -676,18 +684,14 @@ class ParquetShardedSource(ShardedDataSource[dict]):
         Yields:
             Individual rows as dictionaries.
         """
-        import pyarrow.parquet as pq  # pyright: ignore[reportMissingTypeStubs]
-
-        with self._open_file(shard_name) as fh:
-            pf = pq.ParquetFile(fh)
-            for rg_idx in range(pf.num_row_groups):
-                yield from self._iter_row_group_rows(pf, rg_idx)
+        yield from self._open_shard_resumable(shard_name, 0)
 
     def open_shard_at_row(self, shard_name: str, row: int) -> "Iterator[dict]":
         """Open a Parquet shard starting at a specific row.
 
         Uses row group metadata to skip directly to the relevant row group,
-        avoiding sequential scanning of earlier rows.
+        avoiding sequential scanning of earlier rows. Transient I/O failures
+        mid-stream resume at the next unread row.
 
         Args:
             shard_name: Path or URL to the Parquet file.
@@ -696,6 +700,45 @@ class ParquetShardedSource(ShardedDataSource[dict]):
         Yields:
             Rows starting from the specified position.
         """
+        yield from self._open_shard_resumable(shard_name, row)
+
+    def _open_shard_resumable(self, shard_name: str, start_row: int) -> "Iterator[dict]":
+        """Stream rows from ``start_row``, reopening at the next unread row on transient I/O errors.
+
+        Long-running streaming jobs hold shard file handles open for minutes to
+        hours; a single dropped connection mid-read must not kill the consumer
+        (the trainer's prefetch thread). Each retryable failure reopens the
+        shard at the first row not yet delivered, so the consumer sees no
+        duplicates and no gaps. Successful progress resets the retry budget;
+        repeated failures with no progress propagate.
+        """
+        import time as _time
+
+        position = int(start_row)
+        failures_without_progress = 0
+        while True:
+            made_progress = False
+            try:
+                for example in self._iter_shard_rows(shard_name, position):
+                    position += 1
+                    made_progress = True
+                    failures_without_progress = 0
+                    yield example
+                return
+            except _PARQUET_TRANSIENT_IO_ERRORS as exc:
+                failures_without_progress = 0 if made_progress else failures_without_progress + 1
+                if failures_without_progress > _PARQUET_STREAM_MAX_REOPENS:
+                    raise
+                delay = min(1.0 * (2**failures_without_progress), 30.0)
+                logger.warning(
+                    f"Transient I/O error streaming {shard_name!r} at row {position} "
+                    f"({type(exc).__name__}: {str(exc)[:120]}); reopening at that row in {delay:.0f}s "
+                    f"(attempt {failures_without_progress}/{_PARQUET_STREAM_MAX_REOPENS})."
+                )
+                _time.sleep(delay)
+
+    def _iter_shard_rows(self, shard_name: str, row: int) -> "Iterator[dict]":
+        """Single-pass row stream starting at ``row`` (no resume semantics)."""
         import pyarrow.parquet as pq  # pyright: ignore[reportMissingTypeStubs]
 
         with self._open_file(shard_name) as fh:
