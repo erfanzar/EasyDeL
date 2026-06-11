@@ -18,7 +18,6 @@ import jax
 import jax.numpy as jnp
 import optax  # pyright: ignore[reportMissingTypeStubs]
 import pytest
-
 from easydel.trainers.distillation_trainer._fn import chunked_distillation_loss, distillation_loss
 
 
@@ -276,6 +275,59 @@ def test_distillation_beta_uses_generalized_jsd():
     expected = jnp.sum(per_token * mask) / jnp.sum(mask) * (1.5**2)
 
     assert jnp.allclose(metrics["kl_loss"], expected, atol=1e-6)
+
+
+def test_distillation_beta_endpoints_match_gkd_convention():
+    """beta=0 -> forward KL(p_t || p_s); beta=1 -> reverse KL(p_s || p_t) (GKD-paper / TRL)."""
+    student_logits = jnp.array([[[1.0, 0.0, -0.5], [0.2, 0.5, -0.3]]], dtype=jnp.float32)
+    teacher_logits = jnp.array([[[0.1, 0.6, -0.2], [0.4, -0.1, 0.3]]], dtype=jnp.float32)
+    mask = jnp.array([[1, 1]], dtype=jnp.int32)
+    temperature = 2.0
+
+    student_log_probs = jax.nn.log_softmax(student_logits / temperature, axis=-1)
+    teacher_log_probs = jax.nn.log_softmax(teacher_logits / temperature, axis=-1)
+    forward_kl = jnp.sum(jnp.exp(teacher_log_probs) * (teacher_log_probs - student_log_probs), axis=-1)
+    reverse_kl = jnp.sum(jnp.exp(student_log_probs) * (student_log_probs - teacher_log_probs), axis=-1)
+    t_sq = temperature**2
+
+    _, metrics_fwd = distillation_loss(
+        student_logits=student_logits,
+        teacher_logits=teacher_logits,
+        loss_mask=mask,
+        temperature=temperature,
+        alpha=1.0,
+        beta=0.0,
+    )
+    assert jnp.allclose(metrics_fwd["kl_loss"], jnp.mean(forward_kl) * t_sq, atol=1e-5)
+
+    _, metrics_rev = distillation_loss(
+        student_logits=student_logits,
+        teacher_logits=teacher_logits,
+        loss_mask=mask,
+        temperature=temperature,
+        alpha=1.0,
+        beta=1.0,
+    )
+    assert jnp.allclose(metrics_rev["kl_loss"], jnp.mean(reverse_kl) * t_sq, atol=1e-5)
+
+
+def test_gkd_jsd_beta_endpoints_match_trl_convention():
+    """GKD generalized_jsd_loss: beta=0 -> forward KL, beta=1 -> reverse KL (TRL parity, no T^2)."""
+    from easydel.trainers.generalized_knowledge_distillation_trainer._fn import generalized_jsd_loss
+
+    student_logits = jnp.array([[[1.0, 0.0, -0.5], [0.2, 0.5, -0.3]]], dtype=jnp.float32)
+    teacher_logits = jnp.array([[[0.1, 0.6, -0.2], [0.4, -0.1, 0.3]]], dtype=jnp.float32)
+    temperature = 1.5
+
+    student_log_probs = jax.nn.log_softmax(student_logits / temperature, axis=-1)
+    teacher_log_probs = jax.nn.log_softmax(teacher_logits / temperature, axis=-1)
+    forward_kl = jnp.mean(jnp.sum(jnp.exp(teacher_log_probs) * (teacher_log_probs - student_log_probs), axis=-1))
+    reverse_kl = jnp.mean(jnp.sum(jnp.exp(student_log_probs) * (student_log_probs - teacher_log_probs), axis=-1))
+
+    got_fwd = generalized_jsd_loss(student_logits, teacher_logits, beta=0.0, temperature=temperature)
+    got_rev = generalized_jsd_loss(student_logits, teacher_logits, beta=1.0, temperature=temperature)
+    assert jnp.allclose(got_fwd, forward_kl, atol=1e-5)
+    assert jnp.allclose(got_rev, reverse_kl, atol=1e-5)
 
 
 def test_distillation_topk_tail_matches_bucketed_loss():

@@ -502,7 +502,7 @@ def fused_kl_divergence(
 
       * ``"forward"`` (default): ``KL(softmax(t/T) ‖ softmax(s/T))``.
         EasyDeL ``distillation_loss`` gradient-equivalent.
-      * ``"reverse"``: ``KL(softmax(s/T) ‖ softmax(t/T))``. GKD ``β=0``.
+      * ``"reverse"``: ``KL(softmax(s/T) ‖ softmax(t/T))``. GKD ``β→1`` limit.
       * ``"jsd"``: ``β·KL(p_t‖m) + (1-β)·KL(p_s‖m)`` with mixture
         ``m = β·p_t + (1-β)·p_s``. GKD intermediate ``β``.
 

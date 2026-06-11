@@ -38,9 +38,10 @@ class GKDConfig(SFTConfig):
 
     1. Replacing the standard forward KL with the *generalized
        Jensen-Shannon divergence* ``JSD_beta``, which interpolates
-       between ``KL(student || teacher)`` (``beta == 0``) and
-       ``KL(teacher || student)`` (``beta == 1``) through the
-       ``beta``-mixed midpoint distribution.
+       between forward ``KL(teacher || student)`` (``beta == 0``) and
+       reverse ``KL(student || teacher)`` (``beta == 1``) through the
+       ``beta``-mixed midpoint distribution (GKD-paper / TRL
+       convention).
     2. Optionally training on student-generated on-policy rollouts at
        a per-batch probability ``lmbda``, mitigating the
        distribution-shift problem of offline distillation.
@@ -62,9 +63,9 @@ class GKDConfig(SFTConfig):
             on-policy student samples. ``None`` (or ``<= 0``) disables
             on-policy sampling. Validated in ``[0, 1]``. Default ``0.5``.
         beta: Mixing weight inside the generalised JSD loss. ``0.0``
-            recovers ``KL(student || teacher)``; ``1.0`` recovers
-            ``KL(teacher || student)``. Validated in ``[0, 1]``.
-            Default ``0.5``.
+            recovers forward ``KL(teacher || student)``; ``1.0``
+            recovers reverse ``KL(student || teacher)`` (GKD-paper /
+            TRL convention). Validated in ``[0, 1]``. Default ``0.5``.
         max_new_tokens: Maximum number of tokens generated per prompt
             during on-policy rollouts. Default ``128``.
         disable_dropout: When ``True``, dropout is disabled on both

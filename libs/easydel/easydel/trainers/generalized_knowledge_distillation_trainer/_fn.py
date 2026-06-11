@@ -95,9 +95,11 @@ def _ejkernel_gjsd_loss(
     ``[..., V]`` log-softmax and supplies an analytic gradient w.r.t. the student
     (teacher detached), matching :func:`generalized_jsd_loss` numerically.
 
-    Direction mapping (EasyDeL ``beta`` knob -> ejkernel ``direction``):
-      * ``beta <= 0`` -> ``"reverse"`` == ``KL(p_student || p_teacher)``
-      * ``beta >= 1`` -> ``"forward"`` == ``KL(p_teacher || p_student)``
+    Direction mapping (EasyDeL ``beta`` knob -> ejkernel ``direction``), matching the
+    GKD paper / TRL convention and the ``beta -> 0/1`` limits of the JSD mixture
+    ``m = beta * p_t + (1 - beta) * p_s`` itself:
+      * ``beta <= 0`` -> ``"forward"`` == ``KL(p_teacher || p_student)``
+      * ``beta >= 1`` -> ``"reverse"`` == ``KL(p_student || p_teacher)``
       * ``0 < beta < 1`` -> ``"jsd"`` (same convex JSD; symmetric at ``beta == 0.5``)
 
     ejkernel applies the Hinton ``T**2`` factor; ``generalized_jsd_loss`` does not, so the
@@ -113,9 +115,9 @@ def _ejkernel_gjsd_loss(
         weights = None
 
     if beta <= 0.0:
-        direction = "reverse"
-    elif beta >= 1.0:
         direction = "forward"
+    elif beta >= 1.0:
+        direction = "reverse"
     else:
         direction = "jsd"
 
@@ -153,9 +155,10 @@ def generalized_jsd_loss(
     combination
     ``beta * KL(p_t || m) + (1 - beta) * KL(p_s || m)``.
     The ``beta`` knob therefore interpolates the GKD objective between
-    ``KL(student || teacher)`` (``beta == 0``) and
-    ``KL(teacher || student)`` (``beta == 1``); the canonical JSD
-    corresponds to ``beta == 0.5``.
+    forward KL ``KL(p_teacher || p_student)`` (``beta == 0``) and
+    reverse KL ``KL(p_student || p_teacher)`` (``beta == 1``) — the
+    GKD-paper / TRL convention and the rescaled limits of the mixture
+    itself; the canonical JSD corresponds to ``beta == 0.5``.
 
     This is computed by the ejkernel fused KL kernel, which streams both
     softmaxes over the vocabulary without ever materializing a ``[..., V]``

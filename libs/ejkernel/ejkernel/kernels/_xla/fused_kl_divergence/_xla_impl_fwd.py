@@ -104,8 +104,10 @@ def _kl_per_row(student_logits, teacher_logits, weights, direction, temperature,
     # Accumulate in float32 for numerical stability (bf16/fp16 logits lose precision in the
     # softmax / log-mixture, and the 1/T scaling amplifies it). The gradient is still taken
     # w.r.t. the original student dtype. Matches the fp32 accumulation of reference KL losses.
+    # The teacher is detached to honor the operation contract (grad w.r.t. teacher_logits is
+    # zero on every path, matching the forward-KL custom_vjp cores).
     s = student_logits.astype(jnp.float32) * inv_T
-    t = teacher_logits.astype(jnp.float32) * inv_T
+    t = jax.lax.stop_gradient(teacher_logits.astype(jnp.float32)) * inv_T
     log_p_s = jax.nn.log_softmax(s, axis=-1)
     log_p_t = jax.nn.log_softmax(t, axis=-1)
     p_s = jnp.exp(log_p_s)
@@ -148,7 +150,8 @@ def _kl_per_row_tp(student_logits, teacher_logits, weights, direction, temperatu
     """
     inv_T = 1.0 / float(temperature)
     s = student_logits.astype(jnp.float32) * inv_T
-    t = teacher_logits.astype(jnp.float32) * inv_T
+    # Teacher detached: the operation contract guarantees zero teacher cotangent on every path.
+    t = jax.lax.stop_gradient(teacher_logits.astype(jnp.float32)) * inv_T
 
     def _log_softmax_tp(z):
         global_max = jax.lax.pmax(jax.lax.stop_gradient(jnp.max(z, axis=-1)), vocab_axis)

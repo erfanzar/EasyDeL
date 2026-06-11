@@ -94,7 +94,6 @@ def _per_token_xent(
     teacher_logits: Array,
     student_logits: Array,
     temperature: float,
-    dtype: jnp.dtype,
 ) -> tuple[Array, Array]:
     """Compute per-token distillation cross-entropy and teacher entropy.
 
@@ -106,6 +105,16 @@ def _per_token_xent(
     student distributions. The KL contribution at token ``i`` is
     then ``H(p_t, p_s)_i - H(p_t)_i``.
 
+    All vocab-sized math (logsumexp, probabilities, reductions) runs in
+    float32 regardless of the logits dtype, and the per-token outputs
+    stay float32. With bf16 logits at a 248K vocab the lse carries an
+    ulp of ~0.125 at lse~20; computing the xent / entropy pipeline in
+    bf16 floors the reported KL at a few 1e-2 — far above late-
+    distillation KL values — and lets the ``xent - entropy`` difference
+    go negative. Under TP this also keeps the vocab-sharded lse / sum
+    all-reduces in float32. The float32 vocab-sized intermediates are
+    transient (recomputed in the backward under ``jax.checkpoint``).
+
     Teacher logits are processed first so their scaled intermediates can be
     freed before student intermediates are materialised -- peak vocab-sized
     float32 tensors drops from 3x to 2x ``[..., V]``.
@@ -115,35 +124,30 @@ def _per_token_xent(
             is applied internally.
         student_logits: Student logits ``[..., vocab]``.
         temperature: Softmax temperature.
-        dtype: Output dtype for the per-token tensors.
 
     Returns:
         ``(per_token_distill_xent, per_token_teacher_entropy)``: two
-        tensors of shape ``[...]`` (i.e. without the vocab axis).
+        float32 tensors of shape ``[...]`` (i.e. without the vocab axis).
     """
-    compute_dtype = jnp.dtype(dtype)
-    temp = jnp.asarray(temperature, dtype=compute_dtype)
+    temp = jnp.asarray(temperature, dtype=jnp.float32)
 
-    teacher_scaled = jax.lax.stop_gradient(teacher_logits.astype(compute_dtype) / temp)
-    teacher_logsumexp = jax.nn.logsumexp(teacher_scaled, axis=-1, keepdims=True).astype(compute_dtype)
+    teacher_scaled = jax.lax.stop_gradient(teacher_logits.astype(jnp.float32) / temp)
+    teacher_logsumexp = jax.nn.logsumexp(teacher_scaled, axis=-1, keepdims=True)
     teacher_log_probs = teacher_scaled - teacher_logsumexp
-    teacher_probs = jnp.exp(teacher_log_probs).astype(compute_dtype)
+    teacher_probs = jnp.exp(teacher_log_probs)
     per_token_teacher_entropy = -jnp.sum(
         teacher_probs * teacher_log_probs,
         axis=-1,
-        dtype=compute_dtype,
-    ).astype(dtype)
+        dtype=jnp.float32,
+    )
 
-    student_scaled = student_logits.astype(compute_dtype) / temp
-    student_logsumexp = jax.nn.logsumexp(student_scaled, axis=-1).astype(compute_dtype)
-    per_token_distill_xent = (
-        student_logsumexp
-        - jnp.sum(
-            teacher_probs * student_scaled,
-            axis=-1,
-            dtype=compute_dtype,
-        )
-    ).astype(dtype)
+    student_scaled = student_logits.astype(jnp.float32) / temp
+    student_logsumexp = jax.nn.logsumexp(student_scaled, axis=-1)
+    per_token_distill_xent = student_logsumexp - jnp.sum(
+        teacher_probs * student_scaled,
+        axis=-1,
+        dtype=jnp.float32,
+    )
     return per_token_distill_xent, per_token_teacher_entropy
 
 
@@ -171,9 +175,11 @@ def _per_token_generalized_jsd(
         jax.nn.log_softmax(teacher_logits.astype(jnp.float32) / temperature, axis=-1)
     )
     if beta <= 0.0:
-        return _kl_div_from_log_probs(student_log_probs, teacher_log_probs).astype(dtype)
-    if beta >= 1.0:
+        # GKD/TRL beta->0 limit: forward KL(p_teacher || p_student).
         return _kl_div_from_log_probs(teacher_log_probs, student_log_probs).astype(dtype)
+    if beta >= 1.0:
+        # GKD/TRL beta->1 limit: reverse KL(p_student || p_teacher).
+        return _kl_div_from_log_probs(student_log_probs, teacher_log_probs).astype(dtype)
     beta_val = jnp.asarray(beta, dtype=jnp.float32)
     mixture_log_probs = jax.scipy.special.logsumexp(
         jnp.stack(
@@ -196,13 +202,14 @@ def _per_token_topk_xent(
     temperature: float,
     top_k: int,
     add_tail: bool,
-    dtype: jnp.dtype,
 ) -> tuple[Array, Array]:
     """Compute teacher-top-k distillation cross-entropy and entropy.
 
     When ``add_tail`` is enabled, all non-top-k mass is represented by one
     extra bucket. Otherwise both teacher and student distributions are
     re-normalized over the selected support, matching TRL's top-k KD surface.
+    Per-token outputs are float32 (downstream reductions stay float32 so the
+    ``xent - entropy`` KL difference is not bf16-floored).
     """
     vocab_size = int(teacher_logits.shape[-1])
     k = min(max(int(top_k), 1), vocab_size)
@@ -225,14 +232,14 @@ def _per_token_topk_xent(
         entropy = -(
             jnp.sum(top_teacher_probs * top_teacher_log_probs, axis=-1) + teacher_tail_prob * teacher_tail_log_prob
         )
-        return xent.astype(dtype), entropy.astype(dtype)
+        return xent, entropy
 
     teacher_support_log_probs = jax.nn.log_softmax(top_teacher_log_probs, axis=-1)
     student_support_log_probs = jax.nn.log_softmax(top_student_log_probs, axis=-1)
     teacher_support_probs = jnp.exp(teacher_support_log_probs)
     xent = -jnp.sum(teacher_support_probs * student_support_log_probs, axis=-1)
     entropy = -jnp.sum(teacher_support_probs * teacher_support_log_probs, axis=-1)
-    return xent.astype(dtype), entropy.astype(dtype)
+    return xent, entropy
 
 
 def _compute_kl_and_ce(
@@ -242,13 +249,13 @@ def _compute_kl_and_ce(
     safe_labels: Array,
     use_hard_labels: bool,
     temperature: float,
-    dtype: jnp.dtype,
 ) -> tuple[Array, Array, Array, Array]:
     """Reduce per-token KL/CE contributions over one chunk of logits.
 
     Wraps :func:`_per_token_xent` with mask-weighted summation and the
     optional hard-label cross-entropy on the student logits. Returns
-    scalars so chunked callers can accumulate cheaply without carrying
+    float32 scalars so chunked callers can accumulate cheaply (and
+    without bf16 rounding of the running sums) while never carrying
     per-token logits.
 
     Args:
@@ -264,30 +271,30 @@ def _compute_kl_and_ce(
             CE term against ``safe_labels``.
         temperature: Softmax temperature forwarded to
             :func:`_per_token_xent`.
-        dtype: Output dtype.
 
     Returns:
-        ``(distill_xent_sum, teacher_entropy_sum, ce_sum, mask_sum)``;
-        ``ce_sum`` is zero when ``use_hard_labels`` is ``False``.
+        ``(distill_xent_sum, teacher_entropy_sum, ce_sum, mask_sum)``
+        float32 scalars; ``ce_sum`` is zero when ``use_hard_labels``
+        is ``False``.
     """
     per_token_distill_xent, per_token_teacher_entropy = _per_token_xent(
         teacher_logits,
         student_logits,
         temperature,
-        dtype,
     )
 
-    distill_xent_sum = jnp.sum(per_token_distill_xent * mask)
-    teacher_entropy_sum = jnp.sum(per_token_teacher_entropy * mask)
-    mask_sum = jnp.sum(mask)
+    mask_f32 = mask.astype(jnp.float32)
+    distill_xent_sum = jnp.sum(per_token_distill_xent * mask_f32)
+    teacher_entropy_sum = jnp.sum(per_token_teacher_entropy * mask_f32)
+    mask_sum = jnp.sum(mask_f32)
 
-    ce_sum = jnp.zeros((), dtype=dtype)
+    ce_sum = jnp.zeros((), dtype=jnp.float32)
     if use_hard_labels:
         per_token_ce = optax.softmax_cross_entropy_with_integer_labels(
             student_logits.astype(jnp.float32),
             safe_labels,
-        ).astype(dtype)
-        ce_sum = jnp.sum(per_token_ce * mask)
+        )
+        ce_sum = jnp.sum(per_token_ce * mask_f32)
 
     return distill_xent_sum, teacher_entropy_sum, ce_sum, mask_sum
 
@@ -300,20 +307,22 @@ def _finalize_distillation_metrics(
     temperature: float,
     alpha: float,
     use_hard_labels: bool,
-    dtype: jnp.dtype,
 ) -> tuple[Array, dict[str, Array]]:
     """Normalise accumulated distillation/CE sums into the final loss and metrics.
 
     Divides the scan-accumulated sums by the total mask weight,
     multiplies the distillation half by ``temperature**2`` (the
     canonical Hinton rescaling), and mixes the soft-target term with
-    the supervised CE via ``alpha``.
+    the supervised CE via ``alpha``. All math runs in float32 — the
+    ``kl_loss = xent - entropy`` difference of two large accumulated
+    sums is exactly where bf16 rounding used to push the reported KL
+    negative.
 
     Args:
         distill_xent_sum: Accumulated masked sum of per-token
-            distillation cross-entropy.
+            distillation cross-entropy (float32).
         teacher_entropy_sum: Accumulated masked sum of per-token
-            teacher entropy.
+            teacher entropy (float32).
         ce_sum: Accumulated masked sum of supervised CE
             (``0`` when ``use_hard_labels`` is ``False``).
         mask_sum: Total mask weight across all processed tokens.
@@ -322,32 +331,31 @@ def _finalize_distillation_metrics(
         alpha: KL / CE mixing weight; ``1.0`` is pure distillation.
         use_hard_labels: Whether the CE term should be folded into the
             total loss.
-        dtype: Output dtype.
 
     Returns:
-        ``(total_loss, metrics)`` where ``metrics`` is a dict carrying
+        ``(total_loss, metrics)`` float32 scalars; ``metrics`` carries
         ``kl_loss``, ``distill_xent_loss``, ``teacher_entropy_loss``,
-        and ``ce_loss`` as scalar arrays.
+        and ``ce_loss``.
     """
-    alpha_s = jnp.array(alpha, dtype=dtype)
-    temp_sq = jnp.array(temperature * temperature, dtype=dtype)
-    normalizer = jnp.maximum(mask_sum, jnp.ones((), dtype=dtype))
+    alpha_s = jnp.float32(alpha)
+    temp_sq = jnp.float32(temperature * temperature)
+    normalizer = jnp.maximum(mask_sum.astype(jnp.float32), jnp.float32(1.0))
 
-    distill_xent_loss = (distill_xent_sum / normalizer) * temp_sq
-    teacher_entropy_loss = (teacher_entropy_sum / normalizer) * temp_sq
+    distill_xent_loss = (distill_xent_sum.astype(jnp.float32) / normalizer) * temp_sq
+    teacher_entropy_loss = (teacher_entropy_sum.astype(jnp.float32) / normalizer) * temp_sq
     kl_loss = distill_xent_loss - teacher_entropy_loss
     total_loss = alpha_s * kl_loss
 
-    ce_loss = jnp.zeros((), dtype=dtype)
+    ce_loss = jnp.zeros((), dtype=jnp.float32)
     if use_hard_labels:
-        ce_loss = ce_sum / normalizer
-        total_loss = total_loss + (jnp.ones((), dtype=dtype) - alpha_s) * ce_loss
+        ce_loss = ce_sum.astype(jnp.float32) / normalizer
+        total_loss = total_loss + (jnp.float32(1.0) - alpha_s) * ce_loss
 
     metrics = {
-        "kl_loss": jnp.asarray(kl_loss, dtype=dtype),
-        "distill_xent_loss": jnp.asarray(distill_xent_loss, dtype=dtype),
-        "teacher_entropy_loss": jnp.asarray(teacher_entropy_loss, dtype=dtype),
-        "ce_loss": jnp.asarray(ce_loss, dtype=dtype),
+        "kl_loss": kl_loss,
+        "distill_xent_loss": distill_xent_loss,
+        "teacher_entropy_loss": teacher_entropy_loss,
+        "ce_loss": ce_loss,
     }
     return total_loss, metrics
 
@@ -539,14 +547,14 @@ def distillation_loss(
             temperature=temperature,
             top_k=loss_top_k,
             add_tail=loss_add_tail,
-            dtype=dtype,
         )
         per_token_divergence = per_token_distill_xent - per_token_teacher_entropy
         if mask is not None:
-            normalizer = jnp.maximum(jnp.sum(mask), jnp.array(1.0, dtype=dtype))
-            distill_xent_loss = jnp.sum(per_token_distill_xent * mask) / normalizer
-            teacher_entropy_loss = jnp.sum(per_token_teacher_entropy * mask) / normalizer
-            divergence_loss = jnp.sum(per_token_divergence * mask) / normalizer
+            mask_f32 = mask.astype(jnp.float32)
+            normalizer = jnp.maximum(jnp.sum(mask_f32), jnp.float32(1.0))
+            distill_xent_loss = jnp.sum(per_token_distill_xent * mask_f32) / normalizer
+            teacher_entropy_loss = jnp.sum(per_token_teacher_entropy * mask_f32) / normalizer
+            divergence_loss = jnp.sum(per_token_divergence * mask_f32) / normalizer
         else:
             distill_xent_loss = jnp.mean(per_token_distill_xent)
             teacher_entropy_loss = jnp.mean(per_token_teacher_entropy)
@@ -562,9 +570,9 @@ def distillation_loss(
         if beta is None:
             direction, want_entropy = "forward", True  # KL(p_t || p_s), report entropy split
         elif beta <= 0.0:
-            direction, want_entropy = "reverse", False  # KL(p_s || p_t)
+            direction, want_entropy = "forward", False  # KL(p_t || p_s): GKD/TRL beta->0 limit
         elif beta >= 1.0:
-            direction, want_entropy = "forward", False  # KL(p_t || p_s)
+            direction, want_entropy = "reverse", False  # KL(p_s || p_t): GKD/TRL beta->1 limit
         else:
             direction, want_entropy = "jsd", False
 
@@ -609,12 +617,12 @@ def distillation_loss(
                 in_specs=(_vp_logit_spec, _vp_logit_spec, _vp_token_spec),
                 out_specs=PartitionSpec(),
             )
-            kl_loss = out.loss.astype(dtype)
+            kl_loss = out.loss.astype(jnp.float32)
             if want_entropy:
-                teacher_entropy_loss = out.teacher_entropy.astype(dtype)
+                teacher_entropy_loss = out.teacher_entropy.astype(jnp.float32)
                 distill_xent_loss = kl_loss + teacher_entropy_loss
             else:
-                teacher_entropy_loss = jnp.zeros((), dtype=dtype)
+                teacher_entropy_loss = jnp.zeros((), dtype=jnp.float32)
                 distill_xent_loss = kl_loss
         else:
             out = _fused_kl(
@@ -628,12 +636,12 @@ def distillation_loss(
                 return_teacher_entropy=want_entropy,
                 platform="xla",  # XLA is the bandwidth-optimal KL backend on TPU (Pallas loses)
             )
-            kl_loss = out.loss.astype(dtype)
+            kl_loss = out.loss.astype(jnp.float32)
             if want_entropy:
-                teacher_entropy_loss = out.teacher_entropy.astype(dtype)
+                teacher_entropy_loss = out.teacher_entropy.astype(jnp.float32)
                 distill_xent_loss = kl_loss + teacher_entropy_loss
             else:
-                teacher_entropy_loss = jnp.zeros((), dtype=dtype)
+                teacher_entropy_loss = jnp.zeros((), dtype=jnp.float32)
                 distill_xent_loss = kl_loss
 
     total_loss = alpha_s * kl_loss
@@ -697,10 +705,10 @@ def distillation_loss(
         total_loss = total_loss + (jnp.array(1.0, dtype=dtype) - alpha_s) * ce_loss
 
     metrics = {
-        "kl_loss": jnp.asarray(kl_loss, dtype=dtype),
-        "distill_xent_loss": jnp.asarray(distill_xent_loss, dtype=dtype),
-        "teacher_entropy_loss": jnp.asarray(teacher_entropy_loss, dtype=dtype),
-        "ce_loss": jnp.asarray(ce_loss, dtype=dtype),
+        "kl_loss": jnp.asarray(kl_loss, dtype=jnp.float32),
+        "distill_xent_loss": jnp.asarray(distill_xent_loss, dtype=jnp.float32),
+        "teacher_entropy_loss": jnp.asarray(teacher_entropy_loss, dtype=jnp.float32),
+        "ce_loss": jnp.asarray(ce_loss, dtype=jnp.float32),
     }
     return total_loss, metrics
 
@@ -749,10 +757,10 @@ def mtp_distillation_loss(
     else:
         mtp_mask = None
 
-    if beta is None or beta >= 1.0:
-        direction = "forward"
-    elif beta <= 0.0:
-        direction = "reverse"
+    if beta is None or beta <= 0.0:
+        direction = "forward"  # GKD/TRL beta->0 limit (and the classic-KD default)
+    elif beta >= 1.0:
+        direction = "reverse"  # GKD/TRL beta->1 limit
     else:
         direction = "jsd"
 
@@ -834,10 +842,10 @@ def mtp_chain_distillation_loss(
     n_steps, b, s, _ = chain_logits.shape
     base = loss_mask if loss_mask is not None else attention_mask
     base = base.astype(dtype) if base is not None else None
-    if beta is None or beta >= 1.0:
-        direction = "forward"
-    elif beta <= 0.0:
-        direction = "reverse"
+    if beta is None or beta <= 0.0:
+        direction = "forward"  # GKD/TRL beta->0 limit (and the classic-KD default)
+    elif beta >= 1.0:
+        direction = "reverse"  # GKD/TRL beta->1 limit
     else:
         direction = "jsd"
 
@@ -1012,7 +1020,6 @@ def chunked_distillation_loss(
             safe_labels=sl,
             use_hard_labels=_use_hard,
             temperature=temperature,
-            dtype=dtype,
         )
 
     if checkpoint_chunks:
@@ -1023,7 +1030,9 @@ def chunked_distillation_loss(
         distill_xent, teacher_entropy, ce, ms = _chunk_kl_ce(s_h, t_h, m, sl)
         return (carry[0] + distill_xent, carry[1] + teacher_entropy, carry[2] + ce, carry[3] + ms), None
 
-    _zero = jnp.zeros((), dtype=dtype)
+    # float32 carry: the running sums reach ~1e4-1e5 where bf16 ulp is 64-512 — accumulating
+    # them in the model dtype is one of the things that used to floor / flip the KL metric.
+    _zero = jnp.zeros((), dtype=jnp.float32)
     (distill_xent_sum, teacher_entropy_sum, ce_sum, mask_sum), _ = jax.lax.scan(
         _scan_body,
         (_zero, _zero, _zero, _zero),
@@ -1038,7 +1047,6 @@ def chunked_distillation_loss(
         temperature=temperature,
         alpha=alpha,
         use_hard_labels=_use_hard,
-        dtype=dtype,
     )
 
 

@@ -12,6 +12,9 @@ log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 log_error()   { echo -e "${RED}[ERROR]${NC} $1"; }
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
+
 # ---------- Argument parsing ----------
 EASYDEL_BRANCH=""
 
@@ -20,9 +23,8 @@ usage() {
 Usage: $(basename "$0") [--branch <branch-or-tag-or-sha>]
 
 Options:
-  --branch <ref>   Install easydel from the given git ref (branch, tag, or
-                   commit SHA) on https://github.com/erfanzar/easydel.git.
-                   When omitted, installs from the default branch.
+  --branch <ref>   Accepted for compatibility, but package installation uses
+                   this checkout's local libs/ workspace.
   -h, --help       Show this help message.
 EOF
 }
@@ -54,6 +56,10 @@ while (( "$#" )); do
       ;;
   esac
 done
+
+if [ -n "${EASYDEL_BRANCH:-}" ]; then
+  log_warning "--branch ${EASYDEL_BRANCH} was provided, but TPU setup installs from local libs/: ${REPO_ROOT}/libs"
+fi
 
 metadata_value() {
   local path="$1"
@@ -231,22 +237,103 @@ log_success "eopod configured successfully"
 log_warning "IMPORTANT: Press Enter during first execution to accept terms (terms may not be displayed)"
 echo ""
 
+emit_eopod_payload_output() {
+  awk '
+    /^Output:$/ { in_output = 1; next }
+    /^Duration:/ { in_output = 0; next }
+    in_output {
+      if ($0 ~ /^__EASYDEL_REMOTE_EXIT_STATUS__:/) next
+      if ($0 == "") next
+      print
+    }
+  '
+}
+
+emit_ray_config_output() {
+  awk '
+    /Using current machine as head:/ { print; next }
+    /Found internal IPs:/ { print; next }
+    /Auto-detecting TPU configuration/ { print; next }
+    /Auto-detected TPU version:/ { print; next }
+    /Auto-detected TPU slice size:/ { print; next }
+    /Ray runtime started/ { print "Ray runtime started."; next }
+    /Ray cluster configuration completed successfully/ { print; next }
+  '
+}
+
+run_checked_output() {
+  local description="$1"
+  shift
+  local output
+  local status
+  set +e
+  output="$("$@" 2>&1)"
+  status=$?
+  set -e
+  if (( status != 0 )) || grep -Eq "Command failed|ModuleNotFoundError|Traceback \\(most recent call last\\)" <<< "$output"; then
+    printf '%s\n' "$output"
+    log_error "Failed to ${description}"
+    return 1
+  fi
+  printf '%s\n' "$output" | emit_ray_config_output
+}
+
+run_on_tpu() {
+  local command="$1"
+  local description="$2"
+  local payload
+  local quoted_payload
+  local output
+  local status
+  local remote_status
+
+  payload="set -o pipefail; ${command}; status=\$?; echo __EASYDEL_REMOTE_EXIT_STATUS__:\${status}; exit \${status}"
+  printf -v quoted_payload '%q' "$payload"
+
+  set +e
+  output="$("$LOCAL_EOPOD_PATH" run --no-stream "bash -lc ${quoted_payload}" 2>&1)"
+  status=$?
+  set -e
+
+  remote_status="$(sed -n 's/.*__EASYDEL_REMOTE_EXIT_STATUS__:\([0-9][0-9]*\).*/\1/p' <<< "$output" | tail -n1)"
+  if (( status != 0 )) || [ -z "${remote_status:-}" ] || (( remote_status != 0 )); then
+    printf '%s\n' "$output"
+    log_error "Failed to ${description}"
+    return 1
+  fi
+  printf '%s\n' "$output" | emit_eopod_payload_output
+}
+
+run_python_on_tpu() {
+  local code="$1"
+  local description="$2"
+  local encoded_code
+  encoded_code="$(printf '%s' "$code" | base64 -w 0)"
+  run_on_tpu "printf %s ${encoded_code} | base64 -d | ${REMOTE_VENV_PATH}/bin/python -" "$description"
+}
+
+install_workspace_on_tpu() {
+  local remote_python="${REMOTE_VENV_PATH}/bin/python"
+
+  run_on_tpu "test -f '${REPO_ROOT}/pyproject.toml' && test -f '${REPO_ROOT}/libs/easydel/pyproject.toml' && test -f '${REPO_ROOT}/libs/eformer/pyproject.toml' && test -f '${REPO_ROOT}/libs/ejkernel/pyproject.toml' && test -f '${REPO_ROOT}/libs/spectrax/pyproject.toml' && ~/.local/bin/uv pip install --python '${remote_python}' --editable '${REPO_ROOT}/libs/eformer' --editable '${REPO_ROOT}/libs/spectrax[tpu]' --editable '${REPO_ROOT}/libs/ejkernel[tpu]' --editable '${REPO_ROOT}/libs/easydel[tpu,torch,lm_eval]' --quiet" "install local EasyDeL workspace packages from libs/ on TPU hosts"
+}
+
 log_info "Installing uv on TPU hosts..."
-if ! "$LOCAL_EOPOD_PATH" run "pip install uv --quiet -U"; then
+if ! run_on_tpu "pip install uv --quiet -U" "install uv on TPU hosts"; then
   log_error "Failed to install uv on TPU hosts"
   exit 1
 fi
 log_success "uv installed on TPU hosts"
 
 log_info "Creating virtual environment on TPU hosts at $REMOTE_VENV_PATH..."
-if ! "$LOCAL_EOPOD_PATH" run "~/.local/bin/uv venv $REMOTE_VENV_PATH --clear --python 3.13.5"; then
+if ! run_on_tpu "~/.local/bin/uv venv $REMOTE_VENV_PATH --clear --python 3.13.5" "create virtual environment on TPU hosts"; then
   log_error "Failed to create virtual environment on TPU hosts"
   exit 1
 fi
 log_success "Virtual environment created on TPU hosts"
 
 log_info "Installing eopod on TPU hosts..."
-if ! "$LOCAL_EOPOD_PATH" run "~/.local/bin/uv pip install --python ${REMOTE_VENV_PATH}/bin/python -U eopod --quiet"; then
+if ! run_on_tpu "~/.local/bin/uv pip install --python ${REMOTE_VENV_PATH}/bin/python -U eopod --quiet" "install eopod on TPU hosts"; then
   log_error "Failed to install eopod on TPU hosts"
   exit 1
 fi
@@ -255,8 +342,10 @@ log_success "eopod installed on TPU hosts"
 # Helper to install packages remotely into the TPU venv
 install_package_on_tpu() {
   local spec="$1"
+  local quoted_spec
+  quoted_spec="'${spec}'"
   log_info "Installing ${spec} on TPU hosts..."
-  if ! "$LOCAL_EOPOD_PATH" run "~/.local/bin/uv pip install --python ${REMOTE_VENV_PATH}/bin/python ${spec} --quiet"; then
+  if ! run_on_tpu "~/.local/bin/uv pip install --python ${REMOTE_VENV_PATH}/bin/python ${quoted_spec} --quiet" "install ${spec} on TPU hosts"; then
     log_error "Failed to install ${spec} on TPU hosts"
     return 1
   fi
@@ -267,23 +356,44 @@ echo ""
 log_info "Starting package installations on TPU hosts..."
 
 log_info "Uninstalling existing easydel on TPU hosts (if any)..."
-"$LOCAL_EOPOD_PATH" run "~/.local/bin/uv pip uninstall --python ${REMOTE_VENV_PATH}/bin/python easydel" || true
+run_on_tpu "~/.local/bin/uv pip uninstall --python ${REMOTE_VENV_PATH}/bin/python easydel easydel-foundation eformer ejkernel spectrax-lib || true" "uninstall existing EasyDeL packages on TPU hosts" || true
 
-# Use PEP 508 direct URL so extras are preserved:
-# 'easydel[extras] @ git+https://...[@ref]'
-EASYDEL_GIT_URL="git+https://github.com/erfanzar/easydel.git"
-if [ -n "${EASYDEL_BRANCH:-}" ]; then
-  EASYDEL_GIT_URL="${EASYDEL_GIT_URL}@${EASYDEL_BRANCH}"
-  log_info "Installing easydel from branch/ref: ${EASYDEL_BRANCH}"
-else
-  log_info "Installing easydel from the default branch."
-fi
-install_package_on_tpu "'easydel[tpu,torch,lm_eval] @ ${EASYDEL_GIT_URL}'"
+log_info "Installing EasyDeL workspace from local libs/: ${REPO_ROOT}/libs"
+install_workspace_on_tpu
+run_python_on_tpu "
+from importlib import metadata
+
+import easydel as ed
+import eformer
+import ejkernel
+import spectrax
+from eformer.executor.ray import TpuAcceleratorConfig, execute
+
+
+def version_text(label, dist_name, module):
+    dist_version = metadata.version(dist_name)
+    module_version = getattr(module, '__version__', dist_version)
+    if module_version == dist_version:
+        return f'{label} {dist_version}'
+    return f'{label} {dist_version} (__version__ {module_version})'
+
+
+print(
+    '; '.join(
+        [
+            version_text('easydel', 'easydel', ed),
+            version_text('eformer', 'eformer', eformer),
+            version_text('ejkernel', 'ejkernel', ejkernel),
+            version_text('spectrax', 'spectrax-lib', spectrax),
+        ]
+    )
+)
+" "verify EasyDeL foundation imports on TPU hosts"
 install_package_on_tpu "ray[default]==2.54.0"
 # Configure Ray (use the actual eopod binary we installed locally, not uv run)
 log_info "Configuring Ray..."
 export RAY_EXECUTABLE_PATH="${REMOTE_VENV_PATH}/bin/ray"
-if ! "$LOCAL_EOPOD_PATH" auto-config-ray --self-job --python-path "${REMOTE_VENV_PATH}/bin/python"; then
+if ! run_checked_output "configure Ray" "$LOCAL_EOPOD_PATH" auto-config-ray --self-job --python-path "${REMOTE_VENV_PATH}/bin/python"; then
   log_error "Failed to configure Ray"
   exit 1
 fi
@@ -296,13 +406,13 @@ log_info "Project: $PROJECT_ID"
 log_info "TPU Name: $TPU_NAME"
 log_info "TPU Type: $TPU_TYPE"
 log_info "Zone: $ZONE"
-log_info "EasyDeL ref: ${EASYDEL_BRANCH:-<default branch>}"
+log_info "EasyDeL source: ${REPO_ROOT}/libs"
 echo ""
 log_info "Final TPU status:"
 gcloud compute tpus tpu-vm list --project="$PROJECT_ID" --zone="$ZONE" --filter="name:$TPU_NAME" --format="table(name,state,health,acceleratorType)" || true
 
 
-"${REMOTE_VENV_PATH}/bin/python" -c "
+run_python_on_tpu "
 from eformer.executor.ray import TpuAcceleratorConfig, execute
 import ray
 
@@ -310,19 +420,50 @@ import ray
 @execute(TpuAcceleratorConfig('$TPU_TYPE'))
 @ray.remote
 def health_check():
+    from importlib import metadata
+
     import easydel as ed
     import eformer
+    import ejkernel
     import jax
+    import spectrax
 
-    print(f'EasyDel version: {ed.__version__} | eformer version {eformer.__version__} | JAX version {jax.__version__}')
-    print(f'JAX devices: {[dev.coords for dev in jax.local_devices()]}')
-    print(f'Device count: {jax.device_count()}')
-    print(f'Local device count: {jax.local_device_count()}')
+    def version_text(label, dist_name, module):
+        dist_version = metadata.version(dist_name)
+        module_version = getattr(module, '__version__', dist_version)
+        if module_version == dist_version:
+            return f'{label} version: {dist_version}'
+        return f'{label} version: {dist_version} (__version__ {module_version})'
+
+    version_line = (
+        ' | '.join(
+            [
+                version_text('EasyDeL', 'easydel', ed),
+                version_text('eformer', 'eformer', eformer),
+                version_text('ejkernel', 'ejkernel', ejkernel),
+                version_text('spectrax', 'spectrax-lib', spectrax),
+                f'JAX version: {jax.__version__}',
+            ]
+        )
+    )
+    return [
+        version_line,
+        f'JAX devices: {[dev.coords for dev in jax.local_devices()]}',
+        f'Device count: {jax.device_count()}',
+        f'Local device count: {jax.local_device_count()}',
+    ]
 
 
 if __name__ == '__main__':
-    health_check()
-"
+    status = health_check()
+    if not hasattr(status, 'result'):
+        raise RuntimeError(status)
+    lines = status.result
+    if len(lines) == 1 and isinstance(lines[0], list):
+        lines = lines[0]
+    for line in lines:
+        print(line)
+" "run runtime health check on TPU hosts"
 
 log_success "🎉 Runtime health check completed!"
 echo ""
