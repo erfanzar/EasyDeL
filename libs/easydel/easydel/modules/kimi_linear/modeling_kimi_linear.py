@@ -28,7 +28,7 @@ References:
 """
 
 import typing
-from functools import partial
+from functools import cached_property, partial
 from typing import ClassVar
 
 import jax
@@ -500,6 +500,11 @@ class KimiSparseMoeBlock(BaseMoeModule):
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
             rngs (spx.Rngs): Random number generator state.
         """
+        # Upstream KimiLinearConfig defaults both to None (MoE disabled); fail
+        # here with a clear message instead of an AttributeError deeper in the
+        # shared MoE module (mirrors the KimiMoEGate asserts).
+        assert config.num_experts is not None, "num_experts must not be None"
+        assert config.num_experts_per_token is not None, "num_experts_per_token must not be None"
         super().__init__(
             config=config,
             n_routed_experts=config.num_experts,
@@ -1498,6 +1503,24 @@ class KimiLinearModel(EasyDeLBaseModule):
                 param_dtype=param_dtype,
                 rngs=rngs,
             )
+
+    @cached_property
+    def frequencies(self):
+        """RoPE frequencies for the MLA attention layers.
+
+        Upstream Kimi MLA is strictly NoPE when ``mla_use_nope`` is set: no
+        rotary is applied, so no frequencies are built. Otherwise the
+        RoPE-carrying Q/K slice is ``qk_rope_head_dim`` wide (deepseek_v2
+        pattern) — the base module's ``head_dim``-wide frequencies mismatch
+        the packed MLA head layout.
+        """
+        if getattr(self.config, "mla_use_nope", False):
+            return None
+        return self.config.get_basic_frequencies(
+            head_size=self.config.qk_rope_head_dim,
+            rotary_dim=self.config.qk_rope_head_dim,
+            base=self.config.rope_theta,
+        )
 
     def forward(
         self,

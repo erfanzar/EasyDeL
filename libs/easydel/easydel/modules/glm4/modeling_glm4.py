@@ -111,7 +111,8 @@ class Glm4MLP(spx.Module):
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
-            layout=dense_gate_up_layout(config.intermediate_size),
+            # HF GLM-4 checkpoints store gate_up_proj pre-fused (one tensor).
+            layout=dense_gate_up_layout(config.intermediate_size, source_is_fused=True),
         )
         self.down_proj = RowParallelLinear(
             config.intermediate_size,
@@ -124,6 +125,11 @@ class Glm4MLP(spx.Module):
             rngs=rngs,
         )
         self.act_fn = ACT2FN[self.config.hidden_act]
+
+    @property
+    def reform_param(self) -> dict:
+        """Checkpoint rules for the pre-fused HF ``gate_up_proj`` tensor."""
+        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config, include_bias=False)
 
     def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
@@ -191,6 +197,23 @@ class Glm4Attention(UnifiedAttention):
             precision=precision,
             rngs=rngs,
             layer_idx=layer_idx,
+        )
+
+    def _create_rotary(self, config: Glm4Config, dtype: jnp.dtype):
+        """GLM-4 rotates adjacent channel pairs (GPT-J interleaved), not Neox halves.
+
+        HF's ``Glm4Attention.apply_rotary_pos_emb`` expands cos/sin with
+        ``repeat_interleave(2)`` and pairs even/odd lanes, so the partial
+        RoPE (``partial_rotary_factor`` of each head) must use the GPT-J
+        layout. ``get_basic_rope`` shrinks ``rotary_dim`` by
+        ``config.partial_rotary_factor`` internally.
+        """
+        return config.get_basic_rope(
+            dtype=dtype,
+            head_size=self.head_dim,
+            rotary_dim=self.head_dim,
+            base=getattr(config, "rope_theta", 10000.0),
+            is_neox_style=False,
         )
 
     def _create_o_proj(

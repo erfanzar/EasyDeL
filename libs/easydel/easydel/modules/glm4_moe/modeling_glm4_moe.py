@@ -292,7 +292,7 @@ class Glm4MoeTopKRouter(spx.Module):
     ``routed_scaling_factor`` before consumption.
 
     The router projection itself is a single fp32 matmul against
-    ``self.weight`` of shape ``(n_routed_experts, hidden_size)`` — kept in
+    ``self.weight`` of shape ``(hidden_size, n_routed_experts)`` — kept in
     fp32 regardless of the activation dtype because tiny gating logit
     differences can otherwise be lost in bf16.
     """
@@ -328,7 +328,7 @@ class Glm4MoeTopKRouter(spx.Module):
         self.norm_topk_prob = config.norm_topk_prob
 
         self.weight = ArrayParam.bound(
-            shape=(self.n_routed_experts, config.hidden_size),
+            shape=(config.hidden_size, self.n_routed_experts),
             dtype=param_dtype,
             init_method="normal",
             init_kwargs={"stddev": config.initializer_range},

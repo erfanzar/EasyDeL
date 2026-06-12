@@ -746,6 +746,14 @@ class EasyBridgeMixin(PushToHubMixin):
             config_to_save.__dict__.pop("attn_dtype", None)
             config_to_save.__dict__.pop("attn_softmax_dtype", None)
             config_to_save.architectures = [self.__class__.__name__]
+            # Weights are serialized verbatim in the live mesh's interleave;
+            # record that tp in config.json (recursively — sub-configs too) so
+            # any later mesh can re-interleave. config.json is required for any
+            # load, so this field survives partial copies that drop the marker.
+            from easydel.layers.layouts import stamp_fused_tp_config
+            from easydel.layers.layouts._runtime import tensor_parallel_size as _fused_tp_size
+
+            stamp_fused_tp_config(config_to_save, _fused_tp_size(self.config))
             config_to_save.save_pretrained(str(save_directory))
 
             if self.can_generate() and hasattr(self, "generation_config"):
@@ -754,18 +762,14 @@ class EasyBridgeMixin(PushToHubMixin):
 
         state = spx.export(self)[1]
         state_dict = state.raw()
-        # Fused projections are TP-interleaved in memory; serialize them in the
-        # canonical (contiguous) order so the checkpoint loads correctly under
-        # ANY tensor-parallel size, and stamp the layout marker.
-        from easydel.layers.layouts import canonicalize_fused_state, write_fused_layout_marker
-        from easydel.utils.traversals import flatten_dict as _cf_flatten
-        from easydel.utils.traversals import unflatten_dict as _cf_unflatten
+        # Fused projections are serialized verbatim (the live mesh's
+        # interleave); the tp recorded in config.json + the sidecar marker
+        # lets any later mesh re-interleave them on load.
+        from easydel.layers.layouts import write_fused_layout_marker
+        from easydel.layers.layouts._runtime import tensor_parallel_size as _fused_tp_size
 
-        _cf_flat = _cf_flatten(state_dict)
-        _cf_flat = canonicalize_fused_state(self, _cf_flat, self.config)
-        state_dict = _cf_unflatten(_cf_flat)
         if not is_remote_path(save_directory) or jax.process_index() == 0:
-            write_fused_layout_marker(save_directory)
+            write_fused_layout_marker(save_directory, _fused_tp_size(self.config))
         cpu_device = _checkpoint_cpu_device()
         numpy_leaf_paths: list[str] = []
         state_dict = jax.tree_util.tree_map_with_path(
@@ -1298,30 +1302,36 @@ class EasyBridgeMixin(PushToHubMixin):
                         "Skipping %d saved RNG-state leaf(s) during load; using freshly-seeded uint32 rngs instead.",
                         len(rng_state_keys),
                     )
-                # Mesh-portability: canonical checkpoints store fused params
-                # contiguously; re-interleave them for the runtime tp. Legacy
-                # checkpoints (no marker) are loaded verbatim — only correct
-                # when the load tp matches the save tp.
+                # Mesh-portability: fused params are stored in the save mesh's
+                # interleave with that tp recorded in config.json / the sidecar
+                # marker. Re-interleave from the recorded tp to the live tp,
+                # then overwrite the live config so it always describes the
+                # layout the weights actually carry. Legacy checkpoints (no
+                # recorded tp) are loaded verbatim — only correct when the
+                # load tp matches the save tp.
                 from easydel.layers.layouts import (
                     fused_layout_param_specs,
-                    read_fused_layout_marker,
-                    runtimeize_fused_state,
+                    read_fused_checkpoint_tp,
+                    retp_fused_state,
+                    stamp_fused_tp_config,
                 )
                 from easydel.layers.layouts._runtime import tensor_parallel_size as _cf_tp_size
 
-                _cf_marker = read_fused_layout_marker(resolved_archive_file)
-                if _cf_marker == "canonical":
-                    state = runtimeize_fused_state(model, state, model.config)
-                else:
-                    _cf_tp = _cf_tp_size(getattr(model, "config", None))
-                    if _cf_tp > 1 and fused_layout_param_specs(model):
-                        logger.warning(
-                            "Legacy native checkpoint without a fused-layout marker loaded under "
-                            f"tp={_cf_tp}: fused projections are assumed to already carry this exact "
-                            "interleave. If the checkpoint was saved under a different tensor-parallel "
-                            "size, Q/K/V and gate/up weights will be silently scrambled — re-save it "
-                            "with the current code to make it mesh-portable."
-                        )
+                _cf_saved_tp = read_fused_checkpoint_tp(resolved_archive_file, getattr(model, "config", None))
+                _cf_live_tp = _cf_tp_size(getattr(model, "config", None))
+                if _cf_saved_tp is not None:
+                    state = retp_fused_state(model, state, saved_tp=_cf_saved_tp, target_tp=_cf_live_tp)
+                elif _cf_live_tp > 1 and fused_layout_param_specs(model):
+                    logger.warning(
+                        "Legacy native checkpoint without a recorded fused-param tp loaded under "
+                        f"tp={_cf_live_tp}: fused projections are assumed to already carry this exact "
+                        "interleave. If the checkpoint was saved under a different tensor-parallel "
+                        "size, Q/K/V and gate/up weights will be silently scrambled. If the save tp "
+                        "is known, stamp `fused_param_tp` into the checkpoint's config.json to make "
+                        "it mesh-portable — no weight rewrite needed."
+                    )
+                if hasattr(model, "config") and _cf_saved_tp is not None:
+                    stamp_fused_tp_config(model.config, _cf_live_tp)
                 model = _rebuild_lora_modules_from_checkpoint(model=model, flat_state=state)
 
             has_quantized_keys = any(

@@ -100,15 +100,15 @@ SSM_MODELS = ["mamba", "mamba2", "falcon_mamba", "rwkv"]
 # Known conversion gaps (each a distinct, architecture-specific issue), xfail-marked so
 # the suite stays green while keeping the gap visible. Map: model_type -> reason.
 KNOWN_GAPS = {
-    # GPT-family fused projections (Conv1D ``c_attn``/``c_fc``, phi fused ``qkv``) are not
-    # split on EasyDeL->HF export: HF receives a [3*hidden] tensor where it wants [hidden].
+    # GPT-family fused projections (Conv1D ``c_attn``/``c_fc``) are not split on
+    # EasyDeL->HF export: HF receives a [3*hidden] tensor where it wants [hidden].
     "gpt2": "fused Conv1D c_attn/c_fc not split on export",
-    "phi": "fused qkv projection not split on export",
     "opt": "fc1/fc2 MLP weights not transposed on export",
     # FalconConfig.head_dim is a read-only property; config round-trip can't set it.
     "falcon": "FalconConfig.head_dim is read-only on the HF side",
-    # roberta ties the LM-head decoder; import hits IllegalMutationError on decoder.weight.
-    "roberta": "tied LM-head decoder not declared mutable on import",
+    # roberta export maps ``embeddings.*`` to ``weights.*`` and drops lm_head.decoder.bias,
+    # so the HF state_dict fails to load on import.
+    "roberta": "embeddings exported under 'weights.*' and lm_head.decoder.bias missing on export",
     # qwen3_next 3-D linear-attn conv1d kernel is not re-oriented on export ([4,1,8192]
     # exported where HF wants [8192,1,4]); 3-D axis mapping is ambiguous from shape alone.
     "qwen3_next": "linear-attn conv1d 3-D kernel orientation not handled on export",
@@ -216,9 +216,9 @@ def test_hf_easydel_roundtrip(model_type, request):
     # 4./5. Round-trip fidelity: ed2 (loaded from hf1) must match hf1.
     assert ed2_logits.shape == hf1_logits.shape, f"{model_type}: import logits shape mismatch"
     roundtrip_diff = float(np.max(np.abs(ed2_logits - hf1_logits)))
-    assert roundtrip_diff < ROUNDTRIP_ATOL, (
-        f"{model_type}: HF->EasyDeL import diverged after round-trip, max|Δ|={roundtrip_diff:.2e}"
-    )
+    assert (
+        roundtrip_diff < ROUNDTRIP_ATOL
+    ), f"{model_type}: HF->EasyDeL import diverged after round-trip, max|Δ|={roundtrip_diff:.2e}"
 
 
 if __name__ == "__main__":

@@ -235,7 +235,9 @@ class Mamba2Config(EasyDeLBaseConfig):
         self.rms_norm = rms_norm
         self.state_size = state_size
         self.chunk_size = chunk_size
-        self.time_step_limit = time_step_limit if time_step_limit is not None else (0.0, float("inf"))
+        if time_step_limit is None:
+            time_step_limit = (0.0, float("inf"))
+        self.time_step_limit = tuple(float(v) for v in time_step_limit)
         self.tie_word_embeddings = tie_word_embeddings
         self.gradient_checkpointing = gradient_checkpointing
         self.intermediate_size = int(expand * hidden_size)

@@ -256,6 +256,11 @@ class Gemma3TextConfig(EasyDeLBaseConfig):
         self.gradient_checkpointing = gradient_checkpointing
         self.bits = bits
 
+        # ``rope_parameters`` is derived state (rebuilt below from rope_theta /
+        # rope_local_base_freq / rope_scaling, all of which serialize). On
+        # reload the serialized dict lands in **kwargs and trips transformers'
+        # flat-dict rope validation — consume it before super().__init__.
+        kwargs.pop("rope_parameters", None)
         super().__init__(
             bos_token_id=bos_token_id,
             scan_layers=scan_layers,

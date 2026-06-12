@@ -2726,7 +2726,10 @@ class EasyDeLBaseConfig(PretrainedConfig):
             UnicodeDecodeError: If the file encoding is not UTF-8.
             FileNotFoundError: If the specified file does not exist.
         """
-        return json.loads(ePath(json_file).read_text(encoding="utf-8"))
+        # Mirror of the special-float encoding applied in to_json_string:
+        # without the decode, inf/nan fields (e.g. mamba2/falcon_h1
+        # time_step_limit) reload as `{"__float__": "Infinity"}` dicts.
+        return cls._decode_special_floats(json.loads(ePath(json_file).read_text(encoding="utf-8")))
 
     @classmethod
     def _get_config_dict(

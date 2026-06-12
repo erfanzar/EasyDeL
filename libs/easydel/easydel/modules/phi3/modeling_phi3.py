@@ -112,7 +112,8 @@ class Phi3MLP(spx.Module):
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
-            layout=dense_gate_up_layout(config.intermediate_size),
+            # HF Phi-3 checkpoints store gate_up_proj pre-fused (one tensor).
+            layout=dense_gate_up_layout(config.intermediate_size, source_is_fused=True),
         )
         self.down_proj = RowParallelLinear(
             config.intermediate_size,
@@ -125,6 +126,11 @@ class Phi3MLP(spx.Module):
             rngs=rngs,
         )
         self.activation_fn = ACT2FN[self.config.hidden_act]
+
+    @property
+    def reform_param(self) -> dict:
+        """Checkpoint rules for the pre-fused HF ``gate_up_proj`` tensor."""
+        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config, include_bias=False)
 
     def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
@@ -235,7 +241,8 @@ class Phi3Attention(UnifiedAttention):
             param_dtype=param_dtype,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
-            layout=dense_qkv_layout(q_size, kv_size),
+            # HF Phi-3 checkpoints store qkv_proj pre-fused (one tensor).
+            layout=dense_qkv_layout(q_size, kv_size, source_is_fused=True),
         )
         self.o_proj = self._create_o_proj(config, dtype, param_dtype, precision, rngs)
         self.attention_performer = self._create_attention_performer(config, rngs)

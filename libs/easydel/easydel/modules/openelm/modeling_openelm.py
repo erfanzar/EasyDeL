@@ -241,9 +241,11 @@ class OpenELMMultiHeadCausalAttention(UnifiedAttention):
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
+            # HF OpenELM checkpoints store qkv_proj pre-fused (one tensor).
             layout=dense_qkv_layout(
                 self.num_q_heads * self.head_dim,
                 self.num_k_heads * self.head_dim,
+                source_is_fused=True,
             ),
         )
 

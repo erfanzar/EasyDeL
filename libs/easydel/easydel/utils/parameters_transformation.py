@@ -1215,6 +1215,36 @@ class StateDictConverter:
                     potential_key = f"{block_path}.experts.{moe_name}.weight"
                     if potential_key in model_parameters:
                         stacked_moe_keys.add(potential_key)
+
+        # Mirror of the load path's ``_reform_processed`` skip: a splits rule's
+        # spliter receives the raw HF tensor and produces the complete EasyDeL
+        # layout (the generic transpose is skipped for its children), so on
+        # export its ``inverse_spliter`` must receive the raw EasyDeL tensor
+        # and own the complete inverse. Applying the generic permute first
+        # double-transforms (e.g. conv1d weights exported in runtime layout).
+        inverse_split_names: list[tuple[str, bool]] = []
+        for rule_key, rule in (kwargs.get("reform_param", None) or {}).items():
+            if "splits" in rule and rule.get("inverse_spliter") is not None:
+                anchored = rule_key.endswith("$")
+                for split in rule["splits"]:
+                    inverse_split_names.append((split["name"], anchored))
+
+        def _consumed_by_inverse_spliter(key: str) -> bool:
+            for split_name, anchored in inverse_split_names:
+                match_index = key.find(split_name)
+                if match_index == -1:
+                    continue
+                after_match = key[match_index + len(split_name) :]
+                if anchored and after_match:
+                    continue
+                if after_match and not after_match.startswith("."):
+                    continue
+                before_match = key[:match_index]
+                if before_match and not before_match.endswith("."):
+                    continue
+                return True
+            return False
+
         torch_state_dict = {}
         with tqdm(model_parameters.items(), desc=f"Converting {module.__class__.__name__} to torch") as pbar:
             for key, tensor in pbar:
@@ -1229,12 +1259,21 @@ class StateDictConverter:
                 tensor = TensorConverter.jax_to_pytorch(jax.block_until_ready(tensor))
                 is_stacked_moe = key in stacked_moe_keys
                 is_embedding = any(emb in key for emb in embedding_names)
+                key = key.replace(".kernel", ".weight").replace(".embedding", ".weight").replace(".scale", ".weight")
 
                 # Transpose dense weights JAX [in, out] -> torch [out, in] (higher-rank
                 # analogues). Skip embeddings (kept [vocab, hidden]); 1D layernorm scales hit
                 # no permute branch. Keyed on module type, not the (now uniform) ".weight" name.
+                # Dense tensors consumed by a splits rule's inverse_spliter are left in raw
+                # EasyDeL layout — the rule owns the complete inverse transform. Stacked MoE
+                # weights are NOT exempt: apply_moe_transformations_reverse un-stacks them
+                # (deleting the stacked key) before the splits-inverse pass runs, so their
+                # inverse_spliter never fires and the stacked permute must still apply.
                 if not is_embedding:
-                    if not is_stacked_moe:
+                    if is_stacked_moe:
+                        if tensor.ndim == 3:
+                            tensor = tensor.permute(0, 2, 1)
+                    elif not _consumed_by_inverse_spliter(key):
                         if tensor.ndim == 2:
                             tensor = tensor.permute(1, 0)
                         elif tensor.ndim == 3:
@@ -1245,11 +1284,7 @@ class StateDictConverter:
                             tensor = tensor.permute(4, 3, 0, 1, 2)
                         elif tensor.ndim == 6:
                             tensor = tensor.permute(5, 4, 3, 2, 0, 1)
-                    else:
-                        if tensor.ndim == 3:
-                            tensor = tensor.permute(0, 2, 1)
 
-                key = key.replace(".kernel", ".weight").replace(".embedding", ".weight").replace(".scale", ".weight")
                 torch_state_dict[key] = tensor
 
         if moe_block_names and moe_names and moe_block_path and moe_path:
@@ -1447,12 +1482,18 @@ class ModelConverter:
                     f"converted state_dict has {len(state_dict)} keys, HF model expects {len(target_shapes)}.",
                     stacklevel=1,
                 )
-            for key, shape in target_shapes.items():
-                if key in state_dict and tuple(state_dict[key].shape) != shape:
-                    warnings.warn(
-                        f"Shape conflict at {key}: have {tuple(state_dict[key].shape)}, expected {shape}.",
-                        stacklevel=1,
-                    )
+            shape_conflicts = [
+                f"{key}: have {tuple(state_dict[key].shape)}, expected {shape}"
+                for key, shape in target_shapes.items()
+                if key in state_dict and tuple(state_dict[key].shape) != shape
+            ]
+            if shape_conflicts:
+                # ``load_state_dict(assign=True)`` is keys-only strict: wrong-shaped
+                # tensors would be assigned silently and ship a broken HF artifact.
+                raise RuntimeError(
+                    "EasyDeL -> HF export produced wrong-shaped tensors (layout transform bug, "
+                    "not a data problem):\n  " + "\n  ".join(shape_conflicts)
+                )
             model.load_state_dict(state_dict, assign=True, strict=True)
 
         return model
