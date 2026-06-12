@@ -28,6 +28,12 @@ jobs:
       root: ${{ steps.filter.outputs.root }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # paths-filter diffs push events against the main...vnext merge-base,
+          # which sits ~900 commits back: its deepen-by-200 loop on a shallow
+          # clone is slow and races ("shallow file has changed since we read
+          # it"). A full clone resolves the merge-base immediately.
+          fetch-depth: 0
       - uses: dorny/paths-filter@v3
         id: filter
         with:
