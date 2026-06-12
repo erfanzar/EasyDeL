@@ -56,11 +56,17 @@ fi
 build_prefixed_head() {
     local lib="$1" remote_head="$2"
     local split_head split_tree remote_tree boundary new_parent c tree msg range
-    split_head=$(git subtree split --prefix="libs/$lib" HEAD)
+    if ! split_head=$(git subtree split --ignore-joins --prefix="libs/$lib" HEAD 2>/dev/null); then
+        echo "failed to split libs/$lib from monorepo history" >&2
+        return 1
+    fi
     split_tree=$(git rev-parse "${split_head}^{tree}")
 
     if [ -n "$remote_head" ]; then
-        remote_tree=$(git rev-parse "${remote_head}^{tree}" 2>/dev/null || true)
+        if ! remote_tree=$(git rev-parse "${remote_head}^{tree}" 2>/dev/null); then
+            echo "failed to read fetched mirror head for $lib: $remote_head" >&2
+            return 1
+        fi
         if [ "$split_tree" = "$remote_tree" ]; then echo INSYNC; return 0; fi
         # Boundary = newest split commit whose tree matches the mirror's current content.
         # Tree-based (not SHA-based) so it survives the message rewriting we apply below.
@@ -97,13 +103,25 @@ build_prefixed_head() {
 
 push_prefixed() {
     local lib="$1" repo="$2"
-    local lsout remote_head head
+    local lsout remote_head remote_ref head
     if ! lsout=$(git ls-remote "$repo" main 2>/dev/null); then
         echo ">>> $lib: mirror unreachable, skipping (retry: scripts/subtree-sync.sh push $lib)"
         return 0
     fi
     remote_head=$(printf '%s' "$lsout" | cut -f1)
-    head=$(build_prefixed_head "$lib" "$remote_head")
+    if [ -n "$remote_head" ]; then
+        remote_ref="refs/subtree-sync/$lib/main"
+        if ! git fetch --quiet --no-tags --depth=1 "$repo" "+main:$remote_ref"; then
+            echo ">>> $lib: failed to fetch mirror main from $repo" >&2
+            return 1
+        fi
+        remote_head=$(git rev-parse "$remote_ref")
+        git update-ref -d "$remote_ref" || true
+    fi
+    if ! head=$(build_prefixed_head "$lib" "$remote_head"); then
+        echo ">>> $lib: failed to build mirror update" >&2
+        return 1
+    fi
     case "$head" in
         INSYNC) echo ">>> $lib: mirror up to date"; return 0 ;;
         DIVERGED)
