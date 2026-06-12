@@ -39,12 +39,13 @@ os.environ.setdefault("ENABLE_DISTRIBUTED_INIT", "0")
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
 
-import easydel as ed
 import jax
 import numpy as np
 import optax
 import pytest
 from jax import numpy as jnp
+
+import easydel as ed
 
 if jax.device_count() < 4:
     pytest.skip(
@@ -476,6 +477,212 @@ def test_fused_checkpoint_is_tp_portable(tmp_path, load_tp, family):
         )
 
 
+@pytest.mark.parametrize("save_tp", [1, 2, 4])
+@pytest.mark.parametrize("load_tp", [1, 2, 4])
+def test_fused_checkpoint_save_load_tp_matrix(tmp_path, save_tp, load_tp):
+    """The full workflow: weights are saved verbatim in the save mesh's
+    interleave with that tp recorded in config.json; any other mesh
+    re-interleaves on load and overwrites the recorded tp with its own."""
+    import json as _json
+
+    model = _llama(save_tp)
+    reference = _logits(model)
+    ckpt = tmp_path / "ckpt"
+    model.save_pretrained(str(ckpt))
+
+    config_payload = _json.loads((ckpt / "config.json").read_text())
+    assert config_payload.get("fused_param_tp") == save_tp
+
+    loaded = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+        pretrained_model_name_or_path=str(ckpt),
+        dtype=jnp.float32,
+        param_dtype=jnp.float32,
+        sharding_axis_dims=(1, 1, -1, 1, load_tp, 1),
+        auto_shard_model=True,
+    )
+    restored = _logits(loaded)
+    err = float(np.max(np.abs(reference - restored)))
+    assert err < _model_logit_tolerance(
+        "llama"
+    ), f"save_tp={save_tp} -> load_tp={load_tp} changed the model (max|Δlogits|={err})"
+    # the live config is overwritten to describe the layout now in memory
+    assert getattr(loaded.config, "fused_param_tp", None) == load_tp
+
+
+def test_fused_tp_survives_lost_marker(tmp_path):
+    """The tp is stamped into config.json, so a checkpoint whose sidecar
+    marker is lost (partial copy, failed best-effort write) still
+    re-interleaves correctly instead of being misread as legacy."""
+    save_tp, load_tp = 2, 4
+    model = _llama(save_tp)
+    reference = _logits(model)
+    ckpt = tmp_path / "ckpt"
+    model.save_pretrained(str(ckpt))
+
+    (ckpt / "fused_param_layout.json").unlink()
+    from easydel.layers.layouts import read_fused_checkpoint_tp
+
+    assert read_fused_checkpoint_tp(ckpt) == save_tp
+
+    loaded = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+        pretrained_model_name_or_path=str(ckpt),
+        dtype=jnp.float32,
+        param_dtype=jnp.float32,
+        sharding_axis_dims=(1, 1, -1, 1, load_tp, 1),
+        auto_shard_model=True,
+    )
+    restored = _logits(loaded)
+    err = float(np.max(np.abs(reference - restored)))
+    assert err < _model_logit_tolerance(
+        "llama"
+    ), f"markerless checkpoint was not re-interleaved via the config.json tp (max|Δlogits|={err})"
+
+
+def test_fused_tp_backcompat_canonical_format(tmp_path):
+    """Checkpoints written by the previous format (canonical contiguous
+    weights + `fused_param_layout: "canonical"`) must keep loading: canonical
+    is exactly tp=1."""
+    import json as _json
+
+    model = _llama(1)  # tp=1 save: weights on disk are canonical contiguous
+    reference = _logits(model)
+    ckpt = tmp_path / "ckpt"
+    model.save_pretrained(str(ckpt))
+
+    # rewrite marker + config.json into the previous format
+    (ckpt / "fused_param_layout.json").write_text(_json.dumps({"fused_param_layout": "canonical"}))
+    config_payload = _json.loads((ckpt / "config.json").read_text())
+    config_payload.pop("fused_param_tp", None)
+    config_payload["fused_param_layout"] = "canonical"
+    (ckpt / "config.json").write_text(_json.dumps(config_payload))
+
+    from easydel.layers.layouts import read_fused_checkpoint_tp
+
+    assert read_fused_checkpoint_tp(ckpt) == 1
+
+    loaded = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+        pretrained_model_name_or_path=str(ckpt),
+        dtype=jnp.float32,
+        param_dtype=jnp.float32,
+        sharding_axis_dims=(1, 1, -1, 1, 2, 1),
+        auto_shard_model=True,
+    )
+    restored = _logits(loaded)
+    err = float(np.max(np.abs(reference - restored)))
+    assert err < _model_logit_tolerance(
+        "llama"
+    ), f"previous-format canonical checkpoint failed to load at tp=2 (max|Δlogits|={err})"
+    assert getattr(loaded.config, "fused_param_tp", None) == 2
+    assert "fused_param_layout" not in loaded.config.__dict__
+
+
+def test_stamp_and_strip_fused_tp_config_recurse_into_sub_configs():
+    from easydel.layers.layouts import stamp_fused_tp_config, strip_fused_tp_config
+
+    cfg = ed.LlamaConfig(vocab_size=64, hidden_size=32, num_hidden_layers=1)
+    sub = ed.LlamaConfig(vocab_size=64, hidden_size=32, num_hidden_layers=1)
+    cfg.text_config = sub
+    cfg.fused_param_layout = "canonical"  # retired tag must be dropped
+
+    stamp_fused_tp_config(cfg, 4)
+    assert cfg.fused_param_tp == 4
+    assert sub.fused_param_tp == 4
+    assert "fused_param_layout" not in cfg.__dict__
+
+    strip_fused_tp_config(cfg)
+    assert "fused_param_tp" not in cfg.__dict__
+    assert "fused_param_tp" not in sub.__dict__
+
+
+def test_fused_params_registry_matches_walker():
+    from easydel.layers.layouts import fused_layout_param_specs
+
+    model = _llama(tp=2)
+    registry = model.fused_params
+    assert registry, "llama exposes fused qkv/gate_up projections"
+    assert registry == dict(fused_layout_param_specs(model))
+    for path, sizes in registry.items():
+        assert isinstance(path, str)
+        assert all(isinstance(s, int) and s > 0 for s in sizes)
+    assert any(path.endswith("gate_up_proj") for path in registry)
+    assert any(path.endswith("qkv_proj") for path in registry)
+
+
+def test_to_torch_refuses_mismatched_fused_tp():
+    model = _llama(tp=2)
+    model.config.fused_param_tp = 4  # weights claim tp=4 interleave, mesh says 2
+    with pytest.raises(RuntimeError, match="fused_param_tp"):
+        model.to_torch()
+
+
+def test_to_torch_after_cross_tp_load_matches(tmp_path):
+    """The full user workflow, export leg: save at tp=1, re-load at tp=2
+    (retp re-interleaves), then to_torch from the tp=2 mesh. The HF tensors
+    must be bit-identical to exporting the original tp=1 model — i.e. the
+    exporter de-interleaves with the LOADED tp, not some stale one."""
+    pytest.importorskip("torch")
+    import torch
+
+    model = _llama(1)
+    hf_reference = model.to_torch().state_dict()
+    ckpt = tmp_path / "ckpt"
+    model.save_pretrained(str(ckpt))
+
+    loaded = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+        pretrained_model_name_or_path=str(ckpt),
+        dtype=jnp.float32,
+        param_dtype=jnp.float32,
+        sharding_axis_dims=(1, 1, -1, 1, 2, 1),
+        auto_shard_model=True,
+    )
+    assert getattr(loaded.config, "fused_param_tp", None) == 2
+    hf_exported = loaded.to_torch().state_dict()
+
+    assert hf_exported.keys() == hf_reference.keys()
+    for key, reference in hf_reference.items():
+        assert torch.equal(reference, hf_exported[key]), (
+            f"{key} differs between tp=1 export and export after tp=2 re-load; "
+            "the exporter did not de-interleave with the loaded tp"
+        )
+
+
+def test_prefused_hf_checkpoint_roundtrips_at_tp2():
+    """Phi-3-style HF checkpoints store qkv_proj/gate_up_proj pre-fused
+    (contiguous). At tp>1 the loader must interleave them and the exporter
+    must de-interleave back; at tp=1 both transforms are the identity, so
+    only a tp>1 run catches this corruption class (same shapes, scrambled
+    columns)."""
+    pytest.importorskip("torch")
+    import torch
+
+    reference = _phi3(1)
+    # Phi3's default pad_token_id (32000) exceeds the tiny test vocab; the HF
+    # torch constructor asserts padding_idx < num_embeddings.
+    reference.config.pad_token_id = 0
+    reference_logits = _logits(reference)
+    hf_reference = reference.to_torch()
+    hf_state = hf_reference.state_dict()
+
+    loaded = _phi3(2)
+    loaded.config.pad_token_id = 0
+    loaded = ed.traversals.merge_model_and_tree(loaded, tree=loaded.transform_fn(hf_state))
+    loaded.eval()
+    err = float(np.max(np.abs(reference_logits - _logits(loaded))))
+    assert err < _model_logit_tolerance("phi3"), (
+        f"pre-fused HF checkpoint loaded at tp=2 diverged (max|Δlogits|={err}); "
+        "fused qkv/gate_up were not TP-interleaved on load"
+    )
+
+    hf_exported = loaded.to_torch().state_dict()
+    fused_keys = [k for k in hf_state if "qkv_proj" in k or "gate_up_proj" in k]
+    assert fused_keys, "phi3 HF state dict should contain pre-fused projections"
+    for key in fused_keys:
+        assert torch.equal(hf_state[key], hf_exported[key]), (
+            f"{key} changed across the tp=2 import/export round-trip; "
+            "the exporter did not de-interleave the pre-fused tensor"
+        )
+
+
 def _canonical_fused_optimizer_leaves(state):
     from easydel.layers.layouts import canonicalize_fused_optimizer_state, fused_layout_param_specs
     from easydel.utils.traversals import flatten_tree
@@ -626,7 +833,7 @@ def test_custom_optimizer_slots_are_layout_portable():
 
 
 def test_custom_optimizer_state_checkpoint_is_tp_portable(tmp_path):
-    from easydel.layers.layouts import canonicalize_fused_optimizer_state, read_fused_layout_marker
+    from easydel.layers.layouts import canonicalize_fused_optimizer_state, read_fused_checkpoint_tp
 
     save_model = _llama(tp=2)
     custom_optimizer_state, canonical_leaves, _, unrelated = _custom_optimizer_state(save_model)
@@ -634,7 +841,7 @@ def test_custom_optimizer_state_checkpoint_is_tp_portable(tmp_path):
 
     ckpt = tmp_path / "custom-optimizer-ckpt"
     state.save_state(ckpt, float_dtype=None, save_optimizer=True)
-    assert read_fused_layout_marker(ckpt) == "canonical"
+    assert read_fused_checkpoint_tp(ckpt) == 2
 
     loaded = ed.EasyDeLState.load_state(
         load_directory=str(ckpt),
@@ -656,7 +863,7 @@ def _train_state_next_logit_tolerance(family: str) -> float:
 @pytest.mark.parametrize("family", list(TRAIN_STATE_FAMILIES))
 @pytest.mark.parametrize("load_tp", [1, 2, 4])
 def test_fused_train_state_checkpoint_is_tp_portable(tmp_path, load_tp, family):
-    from easydel.layers.layouts import read_fused_layout_marker
+    from easydel.layers.layouts import read_fused_checkpoint_tp
 
     save_tp = 2
     state, tx = _train_state(family, save_tp)
@@ -665,7 +872,7 @@ def test_fused_train_state_checkpoint_is_tp_portable(tmp_path, load_tp, family):
 
     ckpt = tmp_path / "trainer-ckpt"
     state.save_state(ckpt, float_dtype=None, save_optimizer=True)
-    assert read_fused_layout_marker(ckpt) == "canonical"
+    assert read_fused_checkpoint_tp(ckpt) == save_tp
 
     loaded = ed.EasyDeLState.load_state(
         load_directory=str(ckpt),

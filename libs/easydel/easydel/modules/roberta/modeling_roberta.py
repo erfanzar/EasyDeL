@@ -1254,9 +1254,13 @@ class RobertaLMHead(spx.Module):
         hidden_states = ACT2FN["gelu"](hidden_states)
         hidden_states = self.layer_norm(hidden_states)
 
-        if shared_embedding is not None:
-            self.decoder.weight.value = shared_embedding.T
-        hidden_states = self.decoder(hidden_states)
+        # Tied weights are passed read-only as the kernel override: assigning
+        # decoder.weight.value here mutates parameters under a transform
+        # (IllegalMutationError), matching the apply_lm_head tied-head pattern.
+        hidden_states = self.decoder(
+            hidden_states,
+            w=shared_embedding.T if shared_embedding is not None else None,
+        )
 
         bias = self.bias.astype(self.dtype)
         hidden_states += bias

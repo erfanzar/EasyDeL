@@ -79,10 +79,10 @@ class Conv1D(spx.Module):
     Attributes:
         weight: Bound :class:`ArrayParam` of shape ``(out_features,
             in_features)`` initialised from ``Normal(0, 0.02)``.
-        bias: Bound :class:`ArrayParam` of shape ``(in_features,)`` initialised
-            to zeros, or ``None`` when ``use_bias=False``. Note the bias
-            shape matches *in_features* — that is GPT-2's convention; it is
-            broadcast over all positions of the input dim before the matmul.
+        bias: Bound :class:`ArrayParam` of shape ``(out_features,)`` initialised
+            to zeros, or ``None`` when ``use_bias=False``. As in HuggingFace's
+            ``Conv1D`` the bias matches *out_features* and is added to the
+            matmul output, broadcast across all leading axes.
         use_bias: Whether the bias term is allocated and applied.
         dtype: Compute dtype the inputs are cast to.
         param_dtype: Storage dtype for the weight/bias parameters.
@@ -129,7 +129,7 @@ class Conv1D(spx.Module):
 
         self.bias = (
             ArrayParam.bound(
-                shape=(in_features,),
+                shape=(out_features,),
                 dtype=param_dtype,
                 init_method="zeros",
                 key=rngs.parameters,

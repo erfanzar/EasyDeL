@@ -1358,25 +1358,27 @@ class EasyDeLState(_PyTreeNode):
             raise
         from easydel.layers.layouts import (
             fused_layout_param_specs,
-            read_fused_layout_marker,
-            runtimeize_fused_optimizer_state,
+            read_fused_checkpoint_tp,
+            retp_fused_optimizer_state,
         )
         from easydel.layers.layouts._runtime import tensor_parallel_size as _fused_layout_tp_size
 
-        marker = read_fused_layout_marker(load_directory)
         model = self.model
-        if marker == "canonical":
-            opt_state = runtimeize_fused_optimizer_state(model, opt_state, model.config)
-        else:
-            tp_size = _fused_layout_tp_size(getattr(model, "config", None))
-            if tp_size > 1 and fused_layout_param_specs(model):
-                logger.warning(
-                    "Legacy optimizer checkpoint without a fused-layout marker loaded under "
-                    f"tp={tp_size}: fused optimizer moments are assumed to already carry this exact "
-                    "interleave. If the checkpoint was saved under a different tensor-parallel size, "
-                    "Adam/optimizer moments for Q/K/V and gate/up weights will be silently scrambled; "
-                    "re-save it with the current code to make trainer resumes mesh-portable."
-                )
+        # Resolve from the checkpoint directory only (marker file, then the
+        # directory's own config.json): the in-memory model config may have
+        # been loaded from a newer checkpoint than this tx state.
+        saved_tp = read_fused_checkpoint_tp(load_directory)
+        live_tp = _fused_layout_tp_size(getattr(model, "config", None))
+        if saved_tp is not None:
+            opt_state = retp_fused_optimizer_state(model, opt_state, saved_tp=saved_tp, target_tp=live_tp)
+        elif live_tp > 1 and fused_layout_param_specs(model):
+            logger.warning(
+                "Legacy optimizer checkpoint without a recorded fused-param tp loaded under "
+                f"tp={live_tp}: fused optimizer moments are assumed to already carry this exact "
+                "interleave. If the checkpoint was saved under a different tensor-parallel size, "
+                "Adam/optimizer moments for Q/K/V and gate/up weights will be silently scrambled; "
+                "re-save it with the current code to make trainer resumes mesh-portable."
+            )
         step = metadata.get("step", 0)
         logger.info(f"Optimizer state loaded from {load_directory} (step {step}).")
         return self.replace(opt_state=opt_state, step=jnp.asarray(step))
@@ -1461,18 +1463,18 @@ class EasyDeLState(_PyTreeNode):
             try:
                 model = self.model
                 with model.mesh:
-                    from easydel.layers.layouts import canonicalize_fused_optimizer_state, write_fused_layout_marker
+                    from easydel.layers.layouts import write_fused_layout_marker
+                    from easydel.layers.layouts._runtime import tensor_parallel_size as _fused_tp_size
 
-                    opt_state = canonicalize_fused_optimizer_state(model, self.opt_state, model.config)
                     checkpointer.save_pytree(
-                        tree=opt_state,
+                        tree=self.opt_state,
                         dtype=float_dtype,
                         prefix="tx",
                         # Don't pass step here - save_directory is already the checkpoint directory
                         # Passing step would create duplicate run-{step}/run-{step} structure
                     )
                 if not is_remote_path(save_directory) or jax.process_index() == 0:
-                    write_fused_layout_marker(save_directory)
+                    write_fused_layout_marker(save_directory, _fused_tp_size(model.config))
             except Exception as e:
                 logger.error(f"Optimizer save failed: {e!s}")
                 raise

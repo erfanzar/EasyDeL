@@ -107,6 +107,12 @@ class FusedColumnLayout:
         torch_dim (int): Axis index along which fusion happens in source
             (torch / HF) tensors. ``0`` for ``nn.Linear`` weight matrices
             (output axis), nonzero for transposed / 3-D MoE weights.
+        source_is_fused (bool): When ``True`` the HF checkpoint already
+            stores the projection as ONE fused contiguous tensor (e.g.
+            Phi-3's ``qkv_proj`` / ``gate_up_proj``); reform rules then
+            re-interleave that single tensor for TP instead of fusing
+            separate per-segment sources, and export de-interleaves it
+            back to one contiguous tensor.
         log_label (str | None): Optional human-friendly label used in
             checkpoint reform logs; falls back to a per-segment default.
     """
@@ -114,6 +120,7 @@ class FusedColumnLayout:
     segments: tuple[FusedSegment, ...]
     interleave_for_tp: bool = True
     torch_dim: int = 0
+    source_is_fused: bool = False
     log_label: str | None = None
 
     def __post_init__(self) -> None:
@@ -235,6 +242,14 @@ class FusedColumnLayout:
             :type:`ReformParam` dict suitable for merging into a module's
             ``reform_param``.
         """
+        if self.source_is_fused:
+            return self._prefused_reform_param(
+                target_prefix,
+                config=config,
+                include_bias=include_bias,
+                weight_log_label=weight_log_label,
+                bias_log_label=bias_log_label,
+            )
         reform_param = interleaved_fusion_reform_param(
             f"{target_prefix}.weight",
             tuple(segment.tensor_name("weight") for segment in self.segments),
@@ -256,12 +271,74 @@ class FusedColumnLayout:
             )
         return reform_param
 
+    def _prefused_reform_param(
+        self,
+        target_prefix: str,
+        *,
+        config: EasyDeLBaseConfig | None = None,
+        include_bias: bool = False,
+        weight_log_label: str | None = None,
+        bias_log_label: str | None = None,
+    ) -> ReformParam:
+        """Reform rules for HF checkpoints that already store the fused tensor.
+
+        Contract (mirroring the loader/exporter pipeline for splits rules):
+        the ``spliter`` maps the raw HF tensor to the complete EasyDeL layout
+        (the generic transpose is skipped for splits children), and the
+        ``inverse_spliter`` maps the raw EasyDeL tensor back to the complete
+        HF layout (the export-side generic permute is skipped for tensors an
+        ``inverse_spliter`` consumes).
+        """
+        from ._torch_packing import (
+            torch_deinterleave_axis_segments_for_tp,
+            torch_interleave_axis_segments_for_tp,
+        )
+
+        sizes = self.segment_sizes
+        dim = self.torch_dim
+        interleave = self.interleave_for_tp
+
+        def _make(suffix: str, transpose: bool, log_label: str) -> ReformParam:
+            name = f"{target_prefix}.{suffix}"
+
+            def _spliter(tensor):
+                import torch
+
+                tp_size = tensor_parallel_size(config)
+                if interleave and tp_size > 1:
+                    tensor = torch_interleave_axis_segments_for_tp(torch, tensor, sizes, tp_size=tp_size, dim=dim)
+                if transpose and tensor.ndim == 2:
+                    tensor = tensor.permute(1, 0)
+                return tensor.contiguous()
+
+            def _inverse_spliter(torch, tensor):
+                if transpose and tensor.ndim == 2:
+                    tensor = tensor.permute(1, 0)
+                tp_size = tensor_parallel_size(config)
+                if interleave and tp_size > 1:
+                    tensor = torch_deinterleave_axis_segments_for_tp(torch, tensor, sizes, tp_size=tp_size, dim=dim)
+                return tensor.contiguous()
+
+            return {
+                f"{name}$": {
+                    "splits": [{"name": name, "spliter": _spliter}],
+                    "inverse_spliter": _inverse_spliter,
+                    "log_label": log_label,
+                }
+            }
+
+        reform = _make("weight", True, weight_log_label or self.log_label or f"{target_prefix} prefused weight")
+        if include_bias:
+            reform.update(_make("bias", False, bias_log_label or self.log_label or f"{target_prefix} prefused bias"))
+        return reform
+
 
 def dense_gate_up_layout(
     intermediate_size: int,
     *,
     gate_prefix: str = "gate_proj",
     up_prefix: str = "up_proj",
+    source_is_fused: bool = False,
 ) -> FusedColumnLayout:
     """Construct the canonical dense MLP ``[gate | up]`` fused layout.
 
@@ -273,6 +350,8 @@ def dense_gate_up_layout(
         intermediate_size: Width of each branch (gate and up are equal).
         gate_prefix: HF source-tensor prefix for the gate half.
         up_prefix: HF source-tensor prefix for the up half.
+        source_is_fused: Set when the HF checkpoint already stores one
+            fused ``gate_up_proj`` tensor instead of separate gate/up.
 
     Returns:
         :class:`FusedColumnLayout` with two equal-sized segments and
@@ -283,6 +362,7 @@ def dense_gate_up_layout(
             FusedSegment("gate", int(intermediate_size), gate_prefix),
             FusedSegment("up", int(intermediate_size), up_prefix),
         ),
+        source_is_fused=source_is_fused,
         log_label="dense-MLP gate/up groups",
     )
 
@@ -294,6 +374,7 @@ def dense_qkv_layout(
     query_prefix: str = "q_proj",
     key_prefix: str = "k_proj",
     value_prefix: str = "v_proj",
+    source_is_fused: bool = False,
 ) -> FusedColumnLayout:
     """Construct the canonical dense attention ``[Q | K | V]`` fused layout.
 
@@ -308,6 +389,8 @@ def dense_qkv_layout(
         query_prefix: HF source-tensor prefix for the Q half.
         key_prefix: HF source-tensor prefix for the K half.
         value_prefix: HF source-tensor prefix for the V half.
+        source_is_fused: Set when the HF checkpoint already stores one
+            fused ``qkv_proj`` tensor instead of separate q/k/v.
 
     Returns:
         :class:`FusedColumnLayout` with three segments and
@@ -319,5 +402,6 @@ def dense_qkv_layout(
             FusedSegment("k", int(kv_size), key_prefix),
             FusedSegment("v", int(kv_size), value_prefix),
         ),
+        source_is_fused=source_is_fused,
         log_label="dense-attention Q/K/V groups",
     )

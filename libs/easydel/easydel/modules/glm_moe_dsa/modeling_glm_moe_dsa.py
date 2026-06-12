@@ -1267,7 +1267,7 @@ class GlmMoeDsaAttention(UnifiedAttention):
                 topk_mask = jnp.any(jax.nn.one_hot(topk_indices, kv_len, dtype=jnp.bool_), axis=-2)
                 attention_mask = pairwise_attention_mask_from_mask_info(mask_info, q_len, kv_len)
                 if attention_mask is not None:
-                    mask_info = mask_info.replace(attention_mask=attention_mask & topk_mask)
+                    mask_info = mask_info.replace(attention_mask=(attention_mask & topk_mask)[:, None, :, :])
 
         softmax_aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
         softmax_aux = getattr(softmax_aux, "value", softmax_aux)

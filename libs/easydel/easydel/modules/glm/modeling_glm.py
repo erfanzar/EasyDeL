@@ -116,7 +116,8 @@ class GlmMLP(spx.Module):
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
-            layout=dense_gate_up_layout(config.intermediate_size),
+            # HF GLM checkpoints store gate_up_proj pre-fused (one tensor).
+            layout=dense_gate_up_layout(config.intermediate_size, source_is_fused=True),
         )
         self.down_proj = RowParallelLinear(
             config.intermediate_size,
@@ -129,6 +130,11 @@ class GlmMLP(spx.Module):
             rngs=rngs,
         )
         self.act_fn = ACT2FN[self.config.hidden_act]
+
+    @property
+    def reform_param(self) -> dict:
+        """Checkpoint rules for the pre-fused HF ``gate_up_proj`` tensor."""
+        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config, include_bias=False)
 
     def forward(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
@@ -163,8 +169,9 @@ class GlmAttention(UnifiedAttention):
     Standard :class:`UnifiedAttention` specialisation: causal grouped-query
     attention with rotary position embeddings (the GLM family uses
     *partial* RoPE — only the first ``partial_rotary_factor * head_dim``
-    channels are rotated, controlled by the config). The single override
-    here is :meth:`_create_o_proj`, which forces the output projection to
+    channels are rotated, with GPT-J-style interleaved even/odd pairing).
+    Two overrides: :meth:`_create_rotary` selects the non-NeoX rotary
+    layout, and :meth:`_create_o_proj` forces the output projection to
     be biasless even though Q/K/V allow biases — this matches the HF GLM
     weight layout where ``o_proj`` is the only attention linear without a
     bias parameter.
@@ -198,6 +205,28 @@ class GlmAttention(UnifiedAttention):
             precision=precision,
             rngs=rngs,
             layer_idx=layer_idx,
+        )
+
+    def _create_rotary(self, config: GlmConfig, dtype: jnp.dtype):
+        """Create GLM rotary embedding with partial, GPT-J-style RoPE.
+
+        HF GLM applies rotary embeddings to the first
+        ``partial_rotary_factor * head_dim`` channels using interleaved
+        even/odd pairing (GPT-J style), not the NeoX half-split layout.
+
+        Args:
+            config (GlmConfig): Model configuration with rope parameters.
+            dtype (jnp.dtype): Data type for the rotary embeddings.
+
+        Returns:
+            Rotary position embedding module.
+        """
+        return config.get_basic_rope(
+            dtype=dtype,
+            head_size=self.head_dim,
+            rotary_dim=self.head_dim,
+            base=getattr(config, "rope_theta", 10000.0),
+            is_neox_style=False,
         )
 
     def _create_o_proj(

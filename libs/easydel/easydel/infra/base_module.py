@@ -1892,7 +1892,26 @@ class EasyDeLBaseModule(
             installed. The conversion handles parameter name mapping and
             tensor transposition automatically.
         """
+        from easydel.layers.layouts import strip_fused_tp_config
+        from easydel.layers.layouts._runtime import tensor_parallel_size
         from easydel.utils.parameters_transformation import ModelConverter
+
+        # Fused params are interleaved for config.fused_param_tp; the export
+        # de-interleaves with the mesh-resolved tp. A mismatch (e.g. a tp=4
+        # state handed to a no-mesh CPU process, which resolves tp=1) would
+        # silently scramble every fused projection in the HF artifact.
+        mesh_tp = tensor_parallel_size(self.config)
+        recorded_tp = getattr(self.config, "fused_param_tp", None)
+        if recorded_tp is not None and int(recorded_tp) != mesh_tp:
+            raise RuntimeError(
+                f"to_torch: fused params carry the tp={int(recorded_tp)} interleave "
+                f"(config.fused_param_tp) but the resolved mesh tp is {mesh_tp}; exporting now would "
+                "scramble fused projections in the HF artifact. Re-load the checkpoint with "
+                "from_pretrained under the current mesh (which re-interleaves), or export under a "
+                "mesh whose tensor-parallel size matches."
+            )
+        config_for_export = deepcopy(self.config)
+        strip_fused_tp_config(config_for_export)
 
         # Build the torch model on a real device by default so non-persistent buffers
         # (e.g. rope ``inv_freq``) are computed and the returned model is immediately
@@ -1903,7 +1922,7 @@ class EasyDeLBaseModule(
         return ModelConverter.easydel_to_huggingface(
             module=self,
             base_huggingface_module=self.get_torch_loader()._model_mapping[type(self.config)],
-            config=self.config,
+            config=config_for_export,
             dtype=self.param_dtype,
             reform_param=self._get_reform_param(),
             **kwargs,
@@ -2614,6 +2633,23 @@ class EasyDeLBaseModule(
                     reform_param[full_key] = new_value
         StateDictConverter.validate_reform_param_schema(reform_param)
         return reform_param
+
+    @property
+    def fused_params(self) -> dict[str, tuple[int, ...]]:
+        """Dynamic registry of fused (TP-interleaved) parameters.
+
+        The fused analogue of :meth:`_get_reform_param`: maps each fused
+        module's dotted path (owning ``<path>.weight`` and, when present,
+        ``<path>.bias``) to the logical segment sizes packed on its last
+        axis — e.g. ``(q, k, v)`` for ``qkv_proj`` or ``(gate, up)`` for
+        ``gate_up_proj``. Discovered dynamically from the live module tree;
+        models may override to extend or correct the mapping. Consumed by
+        the checkpoint layout machinery (save/load re-interleaving) in
+        :mod:`easydel.layers.layouts`.
+        """
+        from easydel.layers.layouts import fused_layout_param_specs
+
+        return dict(fused_layout_param_specs(self))
 
     def _build_transform_fn(self, shard_fns=None):
         """Build a HuggingFace-to-EasyDeL transformation function.

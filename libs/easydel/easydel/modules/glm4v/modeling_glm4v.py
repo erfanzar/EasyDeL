@@ -1072,7 +1072,8 @@ class Glm4vTextMLP(spx.Module):
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
-            layout=dense_gate_up_layout(config.intermediate_size),
+            # HF GLM-4V checkpoints store gate_up_proj pre-fused (one tensor).
+            layout=dense_gate_up_layout(config.intermediate_size, source_is_fused=True),
         )
         self.down_proj = RowParallelLinear(
             config.intermediate_size,
@@ -1085,6 +1086,11 @@ class Glm4vTextMLP(spx.Module):
             rngs=rngs,
         )
         self.act_fn = ACT2FN[config.hidden_act]
+
+    @property
+    def reform_param(self) -> dict:
+        """Checkpoint rules for the pre-fused HF ``gate_up_proj`` tensor."""
+        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config, include_bias=False)
 
     def forward(self, hidden_states: Array) -> Array:
         """Apply gated feedforward transformation.

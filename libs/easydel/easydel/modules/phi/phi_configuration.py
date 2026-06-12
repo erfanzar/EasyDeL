@@ -169,6 +169,7 @@ class PhiConfig(EasyDeLBaseConfig):
         self.qk_layernorm = qk_layernorm
         self.bits = bits
         self.gradient_checkpointing = gradient_checkpointing
+        self.head_dim = hidden_size // num_attention_heads
         self.layer_types = layer_types
         if self.layer_types is None:
             self.layer_types = ["full_attention"] * self.num_hidden_layers

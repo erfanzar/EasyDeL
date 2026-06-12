@@ -25,18 +25,26 @@ gate/up and turns the model into a near-uniform sampler. This is exactly what
 happened to the qwen3.6-27b checkpoints converted at ``tp=4`` and served at
 ``tp∈{1,2}``.
 
-This module makes native checkpoints mesh-portable:
+This module makes native checkpoints mesh-portable by *recording* the
+interleave instead of normalizing it: weights are saved verbatim (the runtime
+layout of the save mesh) and the save-time tp is stamped into ``config.json``
+as ``fused_param_tp`` (recursively, sub-configs included) plus a sidecar
+marker. Loading under a different mesh re-interleaves from the recorded tp to
+the live tp and overwrites the field — the config always describes the layout
+the weights actually carry. Canonical contiguous order is simply ``tp=1``.
 
-* :func:`canonicalize_fused_state` — de-interleave every fused parameter to
-  the canonical contiguous ``[A | B | C]`` order before saving.
-* :func:`runtimeize_fused_state` — re-interleave canonical parameters for the
-  *current* runtime ``tp`` after loading.
+* :func:`retp_fused_state` — re-interleave fused params saved at one tp for
+  another (de-interleave from ``saved_tp``, interleave for ``target_tp``).
+* :func:`canonicalize_fused_state` / :func:`runtimeize_fused_state` — the
+  two legs of that transform against the live mesh.
 * :func:`fused_layout_param_specs` — discover the fused parameters and their
-  segment layouts by walking the module's linears.
+  segment layouts by walking the module's linears (models expose this as the
+  dynamic ``fused_params`` registry).
 
-Checkpoints carry a ``fused_param_layout.json`` marker; legacy checkpoints
-without it are loaded verbatim (correct only when load-``tp`` equals
-save-``tp``) and a warning is emitted when that cannot be verified.
+A practical consequence: a legacy verbatim checkpoint whose save-tp is known
+can be made portable by stamping ``fused_param_tp`` into its ``config.json``
+— no weight rewrite needed. Checkpoints with neither field nor marker load
+verbatim (correct only when load-``tp`` equals save-``tp``) with a warning.
 """
 
 from __future__ import annotations
@@ -61,6 +69,7 @@ if tp.TYPE_CHECKING:
 logger = get_logger(__name__)
 
 FUSED_LAYOUT_MARKER = "fused_param_layout.json"
+FUSED_TP_FIELD = "fused_param_tp"
 CANONICAL = "canonical"
 
 
@@ -231,10 +240,23 @@ def _match_keys(flat_state: dict, module_path: str) -> list[tp.Any]:
     return hits
 
 
+def _module_fused_specs(module) -> list[tuple[str, tuple[int, ...]]]:
+    """Return the module's fused-param registry as ``(path, sizes)`` pairs.
+
+    Prefers the model-level ``fused_params`` dict (the dynamic registry,
+    overridable per model — the fused analogue of ``_get_reform_param``);
+    falls back to walking the module tree directly.
+    """
+    registry = getattr(module, "fused_params", None)
+    if registry:
+        return [(path, tuple(int(s) for s in sizes)) for path, sizes in registry.items()]
+    return fused_layout_param_specs(module)
+
+
 def _apply(module, flat_state: dict, tp_size: int, *, to_canonical: bool, log_label: str) -> dict:
     if tp_size <= 1:
         return flat_state
-    specs = fused_layout_param_specs(module)
+    specs = _module_fused_specs(module)
     if not specs:
         return flat_state
     touched = 0
@@ -280,7 +302,7 @@ def runtimeize_fused_state(module, flat_state: dict, config: EasyDeLBaseConfig |
 def _apply_pytree(module, tree: tp.Any, tp_size: int, *, to_canonical: bool, log_label: str) -> tp.Any:
     if tree is None or tp_size <= 1:
         return tree
-    specs = fused_layout_param_specs(module)
+    specs = _module_fused_specs(module)
     if not specs:
         return tree
 
@@ -321,20 +343,146 @@ def runtimeize_fused_optimizer_state(module, opt_state: tp.Any, config: EasyDeLB
     return _apply_pytree(module, opt_state, tp_size, to_canonical=False, log_label="Re-interleaved")
 
 
-def write_fused_layout_marker(save_directory) -> None:
-    """Record that this checkpoint stores fused params in canonical order."""
+def retp_fused_state(module, flat_state: dict, *, saved_tp: int, target_tp: int) -> dict:
+    """Re-interleave fused params from one tensor-parallel size to another.
+
+    The on-disk layout is the runtime interleave of the save-time mesh
+    (``saved_tp``, recorded in the checkpoint's config). De-interleave from
+    ``saved_tp`` to the canonical contiguous order, then interleave for the
+    live mesh's ``target_tp``. ``canonical`` is simply ``tp=1`` — both legs
+    no-op at 1.
+    """
+    saved_tp, target_tp = int(saved_tp), int(target_tp)
+    if saved_tp == target_tp:
+        return flat_state
+    flat_state = _apply(module, flat_state, saved_tp, to_canonical=True, log_label=f"De-interleaved (tp={saved_tp})")
+    return _apply(module, flat_state, target_tp, to_canonical=False, log_label="Re-interleaved")
+
+
+def retp_fused_optimizer_state(module, opt_state: tp.Any, *, saved_tp: int, target_tp: int) -> tp.Any:
+    """Re-interleave fused optimizer moments from ``saved_tp`` to ``target_tp``."""
+    saved_tp, target_tp = int(saved_tp), int(target_tp)
+    if saved_tp == target_tp:
+        return opt_state
+    opt_state = _apply_pytree(
+        module, opt_state, saved_tp, to_canonical=True, log_label=f"De-interleaved (tp={saved_tp})"
+    )
+    return _apply_pytree(module, opt_state, target_tp, to_canonical=False, log_label="Re-interleaved")
+
+
+def write_fused_layout_marker(save_directory, tp_size: int = 1) -> None:
+    """Record the tensor-parallel size whose interleave the checkpoint stores."""
     try:
-        (ePath(str(save_directory)) / FUSED_LAYOUT_MARKER).write_text(json.dumps({"fused_param_layout": CANONICAL}))
-    except Exception as exc:  # pragma: no cover - marker is best-effort
+        (ePath(str(save_directory)) / FUSED_LAYOUT_MARKER).write_text(json.dumps({FUSED_TP_FIELD: int(tp_size)}))
+    except Exception as exc:  # pragma: no cover - marker is best-effort; config.json carries the same field
         logger.warning(f"Could not write {FUSED_LAYOUT_MARKER}: {exc}")
 
 
-def read_fused_layout_marker(load_directory) -> str | None:
-    """Return the checkpoint's fused-layout tag (``None`` for legacy)."""
-    try:
-        path = ePath(str(load_directory)) / FUSED_LAYOUT_MARKER
-        if path.exists():
-            return json.loads(path.read_text()).get("fused_param_layout")
-    except Exception:  # pragma: no cover
-        return None
+def _tp_from_payload(payload: dict) -> int | None:
+    """Extract the fused tp from a marker/config JSON payload.
+
+    The previous format tagged canonical (contiguous) checkpoints with
+    ``fused_param_layout: "canonical"`` — canonical is exactly ``tp=1``.
+    """
+    tp_value = payload.get(FUSED_TP_FIELD)
+    if tp_value is not None:
+        return int(tp_value)
+    if payload.get("fused_param_layout") == CANONICAL:
+        return 1
     return None
+
+
+def read_fused_checkpoint_tp(load_directory, config: EasyDeLBaseConfig | None = None) -> int | None:
+    """Return the tp whose interleave the checkpoint's fused params carry.
+
+    Resolution order: sidecar marker file, then the ``config.json`` in the
+    same directory, then the in-memory ``config`` (last resort — it may
+    describe a different checkpoint than the one being loaded). ``None``
+    means a legacy checkpoint with no recorded layout: only loadable
+    verbatim at the exact tp it was saved with.
+    """
+    try:
+        marker_path = ePath(str(load_directory)) / FUSED_LAYOUT_MARKER
+        if marker_path.exists():
+            tp_value = _tp_from_payload(json.loads(marker_path.read_text()))
+            if tp_value is not None:
+                return tp_value
+    except Exception:  # pragma: no cover
+        pass
+    try:
+        config_path = ePath(str(load_directory)) / "config.json"
+        if config_path.exists():
+            tp_value = _tp_from_payload(json.loads(config_path.read_text()))
+            if tp_value is not None:
+                return tp_value
+    except Exception:  # pragma: no cover
+        pass
+    if config is not None:
+        tp_value = getattr(config, FUSED_TP_FIELD, None)
+        if tp_value is not None:
+            return int(tp_value)
+        if getattr(config, "fused_param_layout", None) == CANONICAL:
+            return 1
+    return None
+
+
+def _iter_sub_configs(value: tp.Any, config_cls: type) -> tp.Iterator[tp.Any]:
+    """Yield config instances found in ``value`` (directly or in containers)."""
+    if isinstance(value, config_cls):
+        yield value
+    elif isinstance(value, (list, tuple, set)):
+        for item in value:
+            yield from _iter_sub_configs(item, config_cls)
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _iter_sub_configs(item, config_cls)
+
+
+def stamp_fused_tp_config(config: EasyDeLBaseConfig, tp_size: int) -> None:
+    """Record the fused-interleave tp on a config, recursively.
+
+    ``config.json`` is required for any load to succeed, so this field —
+    unlike the sidecar marker — cannot be separated from a loadable
+    checkpoint. Sub-configs (``text_config``, ``vision_config``, ...) are
+    stamped too so a sub-config extracted and saved on its own stays
+    self-describing. The retired ``fused_param_layout`` string tag is
+    dropped wherever found.
+    """
+    from transformers import PretrainedConfig
+
+    seen: set[int] = set()
+
+    def _stamp(cfg: tp.Any) -> None:
+        if id(cfg) in seen:
+            return
+        seen.add(id(cfg))
+        cfg.__dict__.pop("fused_param_layout", None)
+        setattr(cfg, FUSED_TP_FIELD, int(tp_size))
+        for value in vars(cfg).values():
+            for sub in _iter_sub_configs(value, PretrainedConfig):
+                _stamp(sub)
+
+    _stamp(config)
+
+
+def strip_fused_tp_config(config: EasyDeLBaseConfig) -> None:
+    """Remove the fused-layout bookkeeping fields from a config, recursively.
+
+    Use on config copies handed to HuggingFace exports — the field describes
+    EasyDeL's native checkpoint layout and must not leak into HF artifacts.
+    """
+    from transformers import PretrainedConfig
+
+    seen: set[int] = set()
+
+    def _strip(cfg: tp.Any) -> None:
+        if id(cfg) in seen:
+            return
+        seen.add(id(cfg))
+        cfg.__dict__.pop("fused_param_layout", None)
+        cfg.__dict__.pop(FUSED_TP_FIELD, None)
+        for value in vars(cfg).values():
+            for sub in _iter_sub_configs(value, PretrainedConfig):
+                _strip(sub)
+
+    _strip(config)

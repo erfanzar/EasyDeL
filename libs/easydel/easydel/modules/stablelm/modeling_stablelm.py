@@ -333,10 +333,13 @@ class StableLmAttention(UnifiedAttention):
         Returns:
             Rotary position embedding module with partial rotation.
         """
+        # Pass the FULL head dim: get_basic_rope/get_rope already shrink
+        # rotary_dim by config.partial_rotary_factor internally — pre-scaling
+        # here applied the factor twice (rotary dim prf^2 * head_dim: wrong
+        # rotation at every size, odd-split crash at small head dims).
         return config.get_basic_rope(
             dtype,
-            head_size=int(config.partial_rotary_factor * (config.hidden_size // config.num_attention_heads)),
-            rotary_dim=self.rotary_emb_dim,
+            head_size=config.hidden_size // config.num_attention_heads,
             base=config.rope_theta,
         )
 
@@ -685,12 +688,13 @@ class StableLmModel(EasyDeLBaseModule):
         Returns:
             Frequency tensor for partial RoPE with dimension based on partial_rotary_factor.
         """
-        rotary_emb_dim = int(
-            self.config.partial_rotary_factor * (self.config.hidden_size // self.config.num_attention_heads)
-        )
-        self._frequencies = self.config.get_basic_frequencies(
-            head_size=rotary_emb_dim,
-            rotary_dim=rotary_emb_dim,
+        # Full head dim here too: get_basic_frequencies applies
+        # partial_rotary_factor internally (see _create_rotary). Also fixes
+        # the missing return (the assignment alone yielded None frequencies).
+        head_dim = self.config.hidden_size // self.config.num_attention_heads
+        return self.config.get_basic_frequencies(
+            head_size=head_dim,
+            rotary_dim=head_dim,
         )
 
     def forward(
