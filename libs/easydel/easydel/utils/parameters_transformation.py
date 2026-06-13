@@ -45,6 +45,7 @@ from collections.abc import Mapping
 
 import jax
 import jax.extend
+import ml_dtypes
 import numpy as np
 from eformer.loggings import get_logger
 from jax import dlpack
@@ -236,11 +237,18 @@ class TensorConverter:
             A PyTorch tensor view of the array.
         """
         if check_bool_flag("EASY_SAFE_TRANSFER", True):
+            torch = TensorConverter.get_torch()
             x = jax.device_get(x)
             x = np.asarray(x)
             if not x.flags.c_contiguous:
                 x = np.ascontiguousarray(x)
-            return TensorConverter.get_torch().from_numpy(x)
+            if x.dtype == ml_dtypes.bfloat16:
+                # ``torch.from_numpy`` cannot ingest ``ml_dtypes.bfloat16`` arrays (NumPy has
+                # no native bfloat16), so the NumPy bridge raised TypeError for bf16 models.
+                # Reinterpret the bits as uint16 and view back as torch bfloat16 --
+                # bit-exact, no upcast, no extra copy.
+                return torch.from_numpy(x.view(np.uint16)).view(torch.bfloat16)
+            return torch.from_numpy(x)
         else:
             from torch import cuda
             from torch.utils import dlpack as dlpack_pt

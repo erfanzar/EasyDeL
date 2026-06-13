@@ -29,6 +29,7 @@ All functions are designed for JAX/spectrax models and support distributed train
 
 import collections.abc
 import functools
+import os
 import typing as tp
 
 import jax
@@ -61,6 +62,11 @@ from ..training_utils import (
     update_metrics,
     update_state_respectfully,
 )
+
+# Flag-gated student/teacher top-1 agreement metric (see _compute_kl_and_ce). Read once at
+# import time so it is static under jit (the disabled branch compiles to nothing); set
+# EASYDEL_LOG_TOP1_AGREEMENT=1 in the job environment to enable.
+_LOG_TOP1_AGREEMENT = os.environ.get("EASYDEL_LOG_TOP1_AGREEMENT", "0") == "1"
 
 
 def _constrain_distillation_input_batch(
@@ -273,9 +279,10 @@ def _compute_kl_and_ce(
             :func:`_per_token_xent`.
 
     Returns:
-        ``(distill_xent_sum, teacher_entropy_sum, ce_sum, mask_sum)``
+        ``(distill_xent_sum, teacher_entropy_sum, ce_sum, mask_sum, top1_sum)``
         float32 scalars; ``ce_sum`` is zero when ``use_hard_labels``
-        is ``False``.
+        is ``False``; ``top1_sum`` is the masked count of student/teacher
+        argmax agreements (zero when ``EASYDEL_LOG_TOP1_AGREEMENT`` is off).
     """
     per_token_distill_xent, per_token_teacher_entropy = _per_token_xent(
         teacher_logits,
@@ -288,6 +295,19 @@ def _compute_kl_and_ce(
     teacher_entropy_sum = jnp.sum(per_token_teacher_entropy * mask_f32)
     mask_sum = jnp.sum(mask_f32)
 
+    # Top-1 agreement (flag-gated): masked count of tokens where the student's argmax token
+    # matches the teacher's. A hard student/teacher agreement signal that involves no
+    # near-equal subtraction, so it is insensitive to softmax-normalizer precision and
+    # complements ``kl_loss``. Two extra vocab reductions over logits already in hand
+    # (fused by XLA; no materialized buffer). Enable with ``EASYDEL_LOG_TOP1_AGREEMENT=1``.
+    if _LOG_TOP1_AGREEMENT:
+        top1_sum = jnp.sum(
+            (jnp.argmax(student_logits, axis=-1) == jnp.argmax(teacher_logits, axis=-1)).astype(jnp.float32)
+            * mask_f32
+        )
+    else:
+        top1_sum = jnp.zeros((), dtype=jnp.float32)
+
     ce_sum = jnp.zeros((), dtype=jnp.float32)
     if use_hard_labels:
         per_token_ce = optax.softmax_cross_entropy_with_integer_labels(
@@ -296,7 +316,7 @@ def _compute_kl_and_ce(
         )
         ce_sum = jnp.sum(per_token_ce * mask_f32)
 
-    return distill_xent_sum, teacher_entropy_sum, ce_sum, mask_sum
+    return distill_xent_sum, teacher_entropy_sum, ce_sum, mask_sum, top1_sum
 
 
 def _finalize_distillation_metrics(
@@ -304,6 +324,7 @@ def _finalize_distillation_metrics(
     teacher_entropy_sum: Array,
     ce_sum: Array,
     mask_sum: Array,
+    top1_sum: Array,
     temperature: float,
     alpha: float,
     use_hard_labels: bool,
@@ -357,6 +378,8 @@ def _finalize_distillation_metrics(
         "teacher_entropy_loss": teacher_entropy_loss,
         "ce_loss": ce_loss,
     }
+    if _LOG_TOP1_AGREEMENT:
+        metrics["top1_agreement"] = top1_sum.astype(jnp.float32) / normalizer
     return total_loss, metrics
 
 
@@ -1027,15 +1050,21 @@ def chunked_distillation_loss(
 
     def _scan_body(carry, xs):
         s_h, t_h, m, sl = xs
-        distill_xent, teacher_entropy, ce, ms = _chunk_kl_ce(s_h, t_h, m, sl)
-        return (carry[0] + distill_xent, carry[1] + teacher_entropy, carry[2] + ce, carry[3] + ms), None
+        distill_xent, teacher_entropy, ce, ms, top1 = _chunk_kl_ce(s_h, t_h, m, sl)
+        return (
+            carry[0] + distill_xent,
+            carry[1] + teacher_entropy,
+            carry[2] + ce,
+            carry[3] + ms,
+            carry[4] + top1,
+        ), None
 
     # float32 carry: the running sums reach ~1e4-1e5 where bf16 ulp is 64-512 — accumulating
     # them in the model dtype is one of the things that used to floor / flip the KL metric.
     _zero = jnp.zeros((), dtype=jnp.float32)
-    (distill_xent_sum, teacher_entropy_sum, ce_sum, mask_sum), _ = jax.lax.scan(
+    (distill_xent_sum, teacher_entropy_sum, ce_sum, mask_sum, top1_sum), _ = jax.lax.scan(
         _scan_body,
-        (_zero, _zero, _zero, _zero),
+        (_zero, _zero, _zero, _zero, _zero),
         (s_chunks, t_chunks, m_chunks, l_chunks),
     )
 
@@ -1044,6 +1073,7 @@ def chunked_distillation_loss(
         teacher_entropy_sum=teacher_entropy_sum,
         ce_sum=ce_sum,
         mask_sum=mask_sum,
+        top1_sum=top1_sum,
         temperature=temperature,
         alpha=alpha,
         use_hard_labels=_use_hard,
