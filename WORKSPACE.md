@@ -16,8 +16,6 @@ read-only mirrors kept in sync automatically — do not merge changes there
 directly (a direct push makes the sync fail until reconciled with
 `scripts/subtree-sync.sh pull <lib>`).
 
-
-
 ## What each package owns
 
 The stack splits along one line: the three foundation libs know nothing
