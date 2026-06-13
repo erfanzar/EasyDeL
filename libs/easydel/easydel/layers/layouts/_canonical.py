@@ -66,7 +66,7 @@ from ._runtime import tensor_parallel_size
 if tp.TYPE_CHECKING:
     from easydel.infra.base_config import EasyDeLBaseConfig
 
-logger = get_logger(__name__)
+logger = get_logger("easydel-layout-canonical")
 
 FUSED_LAYOUT_MARKER = "fused_param_layout.json"
 FUSED_TP_FIELD = "fused_param_tp"
