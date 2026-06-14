@@ -50,7 +50,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from . import gdn_compute_schedule_v2 as compute_schedule_table_v2
+from . import _gdn_compute_schedule_v2 as compute_schedule_table_v2
 
 
 def invert_triangular_matrix(A, block_size=16):
@@ -67,6 +67,20 @@ def invert_triangular_matrix(A, block_size=16):
     num_blocks = N // block_size
 
     def local_forward_sub(A_mat, b_mat):
+        """Solve ``A_mat @ x = b_mat`` for a unit lower triangular diagonal block.
+
+        Performs dense forward substitution one row at a time over the
+        ``block_size`` rows of a single diagonal block, batched over ``B``.
+
+        Args:
+            A_mat: Unit lower triangular diagonal block, shape
+                ``(B, block_size, block_size)``.
+            b_mat: Right-hand side, shape ``(B, block_size, N)``.
+
+        Returns:
+            jax.Array: Solution ``x`` of shape ``(B, block_size, N)`` such
+            that ``A_mat @ x == b_mat``.
+        """
         x_list = []
         for i in range(block_size):
             b_i = b_mat[:, i, :]
@@ -213,6 +227,17 @@ def inner_kernel(
     is_first_chunk = schedule_table[step, 9][...]
 
     def l2_normalize(x, eps=1e-6):
+        """L2-normalize ``x`` along its last axis.
+
+        Args:
+            x: Input array; normalization is applied over ``axis=-1``.
+            eps: Small constant added inside the square root for numerical
+                stability. Defaults to ``1e-6``.
+
+        Returns:
+            jax.Array: ``x`` divided by its (eps-stabilized) L2 norm, same
+            shape as ``x``.
+        """
         norm = jnp.sqrt(jnp.sum(x * x, axis=-1, keepdims=True) + eps)
         return x / norm
 
@@ -220,16 +245,54 @@ def inner_kernel(
 
         @pl.when(decode_valid > 0)
         def decode_wrapper():
+            """Process the decode batch for the current grid step.
+
+            Zeros the decode output scratch, runs the per-token recurrent
+            update for all ``BT`` lanes via ``fori_loop``, and DMA-stores the
+            assembled decode outputs back to ``decode_output_ref``. Guarded
+            by ``decode_valid > 0`` from the schedule table.
+            """
 
             def get_target_idx(b):
+                """Resolve the state-pool slot for decode lane ``b``.
+
+                Args:
+                    b: Lane index within the decode batch (``0 <= b < BT``).
+
+                Returns:
+                    State-pool slot index for request ``decode_req_id + b``,
+                    clamped to the last valid ``state_indices`` entry.
+                """
                 safe_req_id = jnp.minimum(decode_req_id + b, state_indices.shape[0] - 1)
                 return state_indices[safe_req_id][...]
 
             def process_decode(b, _):
+                """``fori_loop`` body running one decode token's recurrent update.
+
+                Args:
+                    b: Loop / lane index (``0 <= b < BT``).
+                    _: Unused loop carry (the loop carries ``None``).
+
+                Returns:
+                    ``None`` (the loop carry).
+                """
                 is_valid = b < decode_count
 
                 @pl.when(is_valid)
                 def do_work():
+                    """Run the single-token GDR update for valid lane ``b``.
+
+                    Loads the request's recurrent state from HBM, extracts and
+                    activates this lane's Q/K/V (with optional QK norm and GQA
+                    head repeat), computes the gated-delta decay/beta gates,
+                    performs the per-head recurrent state update and output
+                    emission, writes the lane output into
+                    ``decode_output_scratch``, and DMA-stores the updated state
+                    back to ``recurrent_state_out``.
+
+                    Returns:
+                        ``None``.
+                    """
                     target_idx = get_target_idx(b)
 
                     copy_op = pltpu.make_async_copy(
@@ -356,15 +419,51 @@ def inner_kernel(
 
     @pl.when(prefill_valid > 0)
     def process_prefill():
+        """Process the prefill work for the current grid step.
 
+        Picks the double-buffer slot for this request and dispatches (via
+        :func:`process_prefill_dispatch`) to either chunkwise WY-form prefill
+        (:func:`process_regular_prefill`) or token-by-token boundary handling
+        (:func:`process_transition_prefill`) depending on the transition flag.
+        Guarded by ``prefill_valid > 0`` from the schedule table.
+        """
         prefill_slot = prefill_req_id % 2
 
         def process_regular_prefill():
+            """Chunkwise WY-form GDR reduction for one chunk-aligned prefill block.
+
+            Loads/initializes the request's recurrent state on the first
+            chunk, activates and masks the QKV chunk, computes the gated
+            decay cumsum, forms the strictly-/lower-triangular interaction
+            matrices, inverts ``I + S`` block-wise, derives the corrected
+            value updates, accumulates the chunk output and the new recurrent
+            state, and stores the state back to HBM on the last chunk. Writes
+            the masked chunk output to ``prefill_output_ref``.
+
+            Returns:
+                ``None``.
+            """
+
             @pl.when(is_first_chunk > 0)
             def init_state():
+                """Initialize the prefill recurrent state for the first chunk.
+
+                Branches on the request's ``has_initial_state`` flag: loads the
+                existing state from HBM (:func:`load_from_hbm`) when set, or
+                zeroes the scratch state (:func:`zero_state`) otherwise.
+
+                Returns:
+                    ``None``.
+                """
                 has_init = has_initial_state[prefill_req_id][...]
 
                 def load_from_hbm():
+                    """DMA-load this request's recurrent state from HBM into scratch.
+
+                    Copies ``recurrent_state_in`` at the request's state slot
+                    into ``state_commit_scratch`` and casts it into the active
+                    ``prefill_scratch`` double-buffer slot.
+                    """
                     state_idx = state_indices[prefill_req_id][...]
                     copy_op = pltpu.make_async_copy(
                         src_ref=recurrent_state_in.at[pl.ds(state_idx, 1)],
@@ -376,6 +475,7 @@ def inner_kernel(
                     prefill_scratch[prefill_slot] = state_commit_scratch[0].astype(prefill_scratch.dtype)
 
                 def zero_state():
+                    """Zero-initialize the active prefill scratch state (cold start)."""
                     prefill_scratch[prefill_slot] = jnp.zeros((n_v, d_k, d_v), dtype=prefill_scratch.dtype)
 
                 jax.lax.cond(has_init > 0, load_from_hbm, zero_state)
@@ -506,6 +606,15 @@ def inner_kernel(
 
             @pl.when(is_last_chunk > 0)
             def store_state():
+                """DMA-store the final prefill state to HBM on the last chunk.
+
+                Casts the active ``prefill_scratch`` slot into
+                ``state_commit_scratch`` and copies it to
+                ``recurrent_state_out`` at the request's state slot.
+
+                Returns:
+                    ``None``.
+                """
                 state_commit_scratch[0] = prefill_scratch[prefill_slot].astype(state_commit_scratch.dtype)
                 state_idx = state_indices[prefill_req_id][...]
                 copy_op = pltpu.make_async_copy(
@@ -527,6 +636,21 @@ def inner_kernel(
             return None
 
         def process_transition_prefill():
+            """Token-by-token GDR scan for a sublane block straddling boundaries.
+
+            Handles the ``sublanesize`` rows of a transition block, where the
+            rows may span across one or more sequence (or decode/prefill)
+            boundaries. Activates and reshapes the QKV rows, then iterates one
+            row at a time: switching the live state between double-buffer slots
+            on sequence changes, loading/zeroing per-request initial state,
+            writing out completed-request states, applying the single-step
+            recurrent update gated by ``sequence_valid``, and emitting each
+            row's output to ``prefill_output_ref``. Finally DMA-stores the
+            last in-flight prefill request's state.
+
+            Returns:
+                ``None``.
+            """
             C_trans = sublanesize
             key_dim = n_kq * d_k
 
@@ -576,6 +700,12 @@ def inner_kernel(
 
             @pl.when((first_is_first > 0) & (first_has_init > 0))
             def load_first_state():
+                """DMA-load the initial state for the block's first request.
+
+                Runs only when the first row begins a sequence that has a
+                pre-existing recurrent state in HBM; copies it into the first
+                request's double-buffer slot.
+                """
                 state_idx = state_indices[first_req_id][...]
                 copy_op = pltpu.make_async_copy(
                     src_ref=recurrent_state_in.at[pl.ds(state_idx, 1)],
@@ -613,6 +743,18 @@ def inner_kernel(
                 state_commit_scratch[0] = prefill_scratch[c_slot].astype(state_commit_scratch.dtype)
 
                 def do_write(current_r=current_r, c_slot=c_slot):
+                    """DMA-store the finished request's state back to HBM.
+
+                    Args:
+                        current_r: Request id whose recurrent state is being
+                            committed (captured by default to freeze the loop
+                            value).
+                        c_slot: Double-buffer slot (``0`` or ``1``) holding
+                            ``current_r``'s state (captured by default).
+
+                    Returns:
+                        ``None``.
+                    """
                     state_idx = state_indices[current_r][...]
                     copy_op = pltpu.make_async_copy(
                         src_ref=state_commit_scratch,
@@ -631,6 +773,14 @@ def inner_kernel(
                 t_has_init = has_initial_state[t_req][...]
 
                 def load_t_state(t_req=t_req, t_slot=t_slot):
+                    """DMA-load the incoming request's initial state into its slot.
+
+                    Args:
+                        t_req: Request id of the row being processed (captured
+                            by default to freeze the loop value).
+                        t_slot: Double-buffer slot (``0`` or ``1``) for
+                            ``t_req`` (captured by default).
+                    """
                     state_idx = state_indices[t_req][...]
                     copy_op = pltpu.make_async_copy(
                         src_ref=recurrent_state_in.at[pl.ds(state_idx, 1)],
@@ -689,6 +839,15 @@ def inner_kernel(
 
             @pl.when(is_current_r_prefill)
             def do_final_write():
+                """DMA-store the trailing prefill request's state after the loop.
+
+                Runs only when the last in-flight request in the block is a
+                prefill request (id ``>= decode_tokens``); commits its
+                accumulated state to ``recurrent_state_out``.
+
+                Returns:
+                    ``None``.
+                """
                 state_idx = state_indices[current_r][...]
                 copy_op = pltpu.make_async_copy(
                     src_ref=state_commit_scratch,
@@ -704,6 +863,15 @@ def inner_kernel(
         is_transition = schedule_table[step, 10][...]
 
         def process_prefill_dispatch():
+            """Dispatch to transition or regular prefill based on the step flag.
+
+            Uses ``jax.lax.cond`` on the schedule table's ``is_transition``
+            flag to call :func:`process_transition_prefill` for boundary
+            blocks or :func:`process_regular_prefill` for chunk-aligned blocks.
+
+            Returns:
+                ``None`` (both branches return ``None``).
+            """
             return jax.lax.cond(
                 is_transition > 0,
                 lambda _: process_transition_prefill(),
@@ -715,6 +883,18 @@ def inner_kernel(
         return None
 
     def do_stitch():
+        """Merge overlapping decode and prefill outputs at the decode boundary.
+
+        When the first grid block is a transition that overlaps the decode
+        region, the same sublane window is written by both the decode and the
+        prefill paths. This selects decode rows for token positions below the
+        decode/prefill split and prefill rows otherwise, then writes the merged
+        window back to both ``decode_output_ref`` and ``prefill_output_ref`` so
+        the two streams agree on the shared rows.
+
+        Returns:
+            ``None``.
+        """
         local_start = prefill_offset - decode_offset
         local_split = decode_tokens - prefill_offset
 
@@ -977,7 +1157,27 @@ def fused_kernel(
         decode_write_sem,
         prefill_sem,
     ):
+        """Build and run the pipelined inner kernel with allocated scratch.
 
+        Callback invoked by ``pl.run_scoped`` once the VMEM scratch buffers
+        and DMA semaphores have been allocated. Emits the pipeline over the
+        ``(total_blocks,)`` grid with :func:`inner_kernel` as the body and the
+        block specs from :func:`create_block_specs`, then runs it on the
+        QKV / a / b / output refs with the SMEM tables passed as scratches.
+
+        Args:
+            scratch_ref: Double-buffered prefill state VMEM scratch, shape
+                ``(2, n_v, d_k, d_v)``.
+            decode_state_scratch_ref: Decode state VMEM scratch, shape
+                ``(1, n_v, d_k, d_v)``.
+            state_commit_scratch_ref: State-commit VMEM scratch in the
+                recurrent-state dtype, shape ``(1, n_v, d_k, d_v)``.
+            decode_output_scratch_ref: Decode output VMEM scratch, shape
+                ``(BT, n_v * d_v)``.
+            decode_read_sems: DMA semaphore(s) for decode state loads.
+            decode_write_sem: DMA semaphore for decode state stores.
+            prefill_sem: DMA semaphore(s) for prefill state I/O.
+        """
         pipeline_func = pltpu.emit_pipeline(
             body=functools.partial(
                 inner_kernel,

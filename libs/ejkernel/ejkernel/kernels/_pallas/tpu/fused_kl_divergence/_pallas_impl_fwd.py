@@ -56,6 +56,30 @@ def _default_block_m() -> int:
     return 256
 
 
+def _pallas_out_shape(shape: tuple[int, ...], dtype: jnp.dtype) -> jax.ShapeDtypeStruct:
+    """Build a Pallas output spec tagged as varying over the current manual axes.
+
+    Pallas kernels invoked under ``shard_map`` must declare which mesh axes their
+    outputs vary over so the compiler keeps them sharded. This reads the manual
+    axes from the active abstract mesh and attaches a matching ``ManualAxisType``.
+
+    Args:
+        shape: Logical shape of the kernel output (typically ``(n_rows_pad,)``).
+        dtype: Output element dtype.
+
+    Returns:
+        jax.ShapeDtypeStruct: A shape/dtype struct whose ``manual_axis_type``
+        marks it as varying across all manual axes of the current abstract mesh,
+        suitable for passing to ``pl.pallas_call``'s ``out_shape``.
+    """
+    manual_axes = frozenset(jax.sharding.get_abstract_mesh().manual_axes)
+    return jax.ShapeDtypeStruct(
+        shape,
+        dtype,
+        manual_axis_type=jax.sharding.ManualAxisType(varying=manual_axes),
+    )
+
+
 def _pad_rows_2d(x: jax.Array, pad_rows: int, pad_value: float = 0.0) -> jax.Array:
     """Pad a rank-2 tensor along rows so Pallas grid blocks are rectangular."""
     if pad_rows == 0:
@@ -88,7 +112,27 @@ def _copy_two_tiles(
     block_m: int,
     size: int,
 ):
-    """DMA-copy matching student and teacher vocab tiles into VMEM scratch."""
+    """DMA-copy matching student and teacher vocab tiles into VMEM scratch.
+
+    Both copies are issued (teacher on semaphore 0, student on semaphore 1) and
+    then waited on, so the function returns only after both ``block_m x size``
+    tiles are resident in VMEM.
+
+    Args:
+        student_ref: HBM ref of the full student logits, shape ``(rows, vocab)``.
+        teacher_ref: HBM ref of the full teacher logits, shape ``(rows, vocab)``.
+        s_tile_ref: VMEM scratch ref receiving the student tile, shape
+            ``(block_m, block_v)``; only the top-left ``block_m x size`` is filled.
+        t_tile_ref: VMEM scratch ref receiving the teacher tile, same shape and
+            fill region as ``s_tile_ref``.
+        sem_ref: DMA semaphore ref with at least two entries; index 0 guards the
+            teacher copy and index 1 guards the student copy.
+        row_start: First row of the current row block in the HBM source.
+        col_start: First vocab column of the current tile in the HBM source.
+        block_m: Number of rows copied per tile.
+        size: Number of valid vocab columns to copy (``<= block_v``); the tail of
+            the scratch tile is left untouched.
+    """
     t_copy = pltpu.make_async_copy(
         src_ref=teacher_ref.at[pl.ds(row_start, block_m), pl.ds(col_start, size)],
         dst_ref=t_tile_ref.at[pl.ds(0, block_m), pl.ds(0, size)],
@@ -106,7 +150,18 @@ def _copy_two_tiles(
 
 
 def _copy_rows_hbm_to_vmem(src_ref, dst_ref, sem_ref, row_start, block_m: int):
-    """DMA-copy one row-vector block from HBM into VMEM scratch."""
+    """DMA-copy one row-vector block from HBM into VMEM scratch.
+
+    Issues a single blocking DMA: it starts the copy and waits before returning,
+    so the ``block_m`` rows are resident in VMEM on exit.
+
+    Args:
+        src_ref: HBM ref of a rank-1 per-row vector (e.g. weights or an LSE).
+        dst_ref: VMEM scratch ref of shape ``(block_m,)`` receiving the block.
+        sem_ref: DMA semaphore ref; entry 0 guards the copy.
+        row_start: First row index of the block in the HBM source.
+        block_m: Number of rows to copy.
+    """
     copy = pltpu.make_async_copy(
         src_ref=src_ref.at[pl.ds(row_start, block_m)],
         dst_ref=dst_ref.at[pl.ds(0, block_m)],
@@ -136,9 +191,39 @@ def _kl_fwd_kernel(
 ):
     """Replicated-vocab KL forward kernel for one row block.
 
-    The kernel scans teacher and student logits to compute local/global LSEs,
-    then streams the vocab again to accumulate KL contribution. Rows with zero
-    weight are skipped before any vocab DMA.
+    Runs once per grid step (one row block). It performs three vocab passes per
+    block: a max pass, a sum-exp pass to form ``lse_t``/``lse_s``, and a KL
+    accumulation pass. Rows with zero weight (and padded rows past the true row
+    count) are masked out, and the entire vocab streaming is skipped via
+    ``pl.when`` when no row in the block is active. All math is done in float32.
+
+    Args:
+        student_ref: HBM input ref of student logits, shape ``(rows, vocab)``.
+        teacher_ref: HBM input ref of teacher logits, shape ``(rows, vocab)``.
+        weights_ref: HBM input ref of per-row weights, shape ``(rows,)``.
+        loss_ref: VMEM output ref of shape ``(block_m,)`` receiving the
+            ``abs(weight) * per_row_kl`` for active rows (0 elsewhere).
+        lse_t_ref: VMEM output ref of shape ``(block_m,)`` receiving the teacher
+            log-sum-exp for in-range rows (0 for padded rows).
+        lse_s_ref: VMEM output ref of shape ``(block_m,)`` receiving the student
+            log-sum-exp for in-range rows (0 for padded rows).
+        acc_ref: VMEM output ref of shape ``(block_m,)`` receiving the unweighted
+            cross-term KL accumulator for in-range rows (saved for backward).
+        student_tile_ref: VMEM scratch ref ``(block_m, block_v)`` for student
+            tiles.
+        teacher_tile_ref: VMEM scratch ref ``(block_m, block_v)`` for teacher
+            tiles.
+        weight_ref: VMEM scratch ref ``(block_m,)`` holding the copied weights.
+        dma_sem_ref: DMA semaphore ref (2 entries) used by the tile copies.
+        direction: Either ``"forward"`` (KL(teacher||student)) or ``"reverse"``
+            (KL(student||teacher)); selects the per-element contribution sign.
+        temperature: Softmax temperature; logits are scaled by ``1/temperature``.
+        block_v: Vocab tile width in columns.
+        block_m: Number of rows processed per grid step.
+
+    Returns:
+        None: Results are written in place to ``loss_ref``, ``lse_t_ref``,
+        ``lse_s_ref``, and ``acc_ref``.
     """
     row_start = pl.program_id(0) * block_m
     _, vocab_size = student_ref.shape
@@ -245,7 +330,28 @@ def _kl_fwd_kernel(
 
 
 def _kl_fwd_pallas(student_2d, teacher_2d, weights_1d, *, direction, temperature, block_v, block_m):
-    """Launch replicated-vocab TPU Pallas KL forward and trim padded rows."""
+    """Launch replicated-vocab TPU Pallas KL forward and trim padded rows.
+
+    Pads rows up to a multiple of ``block_m`` (so grid blocks are rectangular),
+    runs ``_kl_fwd_kernel`` over the row grid, then slices each output back to the
+    true row count.
+
+    Args:
+        student_2d: Student logits, shape ``(n_rows, vocab)``.
+        teacher_2d: Teacher logits, shape ``(n_rows, vocab)``.
+        weights_1d: Per-row weights, shape ``(n_rows,)``; cast to float32 for the
+            kernel.
+        direction: ``"forward"`` or ``"reverse"`` KL direction.
+        temperature: Softmax temperature (positive).
+        block_v: Vocab tile width in columns.
+        block_m: Row tile size.
+
+    Returns:
+        tuple[jax.Array, jax.Array, jax.Array, jax.Array]: ``(loss, lse_t, lse_s,
+        acc)``, each shape ``(n_rows,)`` float32: the weighted per-row KL loss, the
+        teacher and student log-sum-exps, and the unweighted KL cross-term
+        accumulator (the latter three are residuals for backward).
+    """
     n_rows = student_2d.shape[0]
     n_rows_pad = pl.cdiv(n_rows, int(block_m)) * int(block_m)
     pad_rows = n_rows_pad - n_rows
@@ -283,10 +389,10 @@ def _kl_fwd_pallas(student_2d, teacher_2d, weights_1d, *, direction, temperature
         ),
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
         out_shape=[
-            jax.ShapeDtypeStruct((n_rows_pad,), jnp.float32),
-            jax.ShapeDtypeStruct((n_rows_pad,), jnp.float32),
-            jax.ShapeDtypeStruct((n_rows_pad,), jnp.float32),
-            jax.ShapeDtypeStruct((n_rows_pad,), jnp.float32),
+            _pallas_out_shape((n_rows_pad,), jnp.float32),
+            _pallas_out_shape((n_rows_pad,), jnp.float32),
+            _pallas_out_shape((n_rows_pad,), jnp.float32),
+            _pallas_out_shape((n_rows_pad,), jnp.float32),
         ],
     )(student_pad, teacher_pad, weights_pad.astype(jnp.float32))
     return loss[:n_rows], lse_t[:n_rows], lse_s[:n_rows], acc[:n_rows]
@@ -311,9 +417,36 @@ def _kl_tp_lse_stats_kernel(
 ):
     """Compute local teacher/student softmax stats for a TP vocab shard.
 
-    This kernel only sees the local vocabulary slice. It returns per-row local
-    max and sum-exp values for teacher and student logits; the caller rescales
-    and merges them across ``tp`` to form global ``lse_t`` and ``lse_s``.
+    First of the two TP-vocab Pallas phases. The kernel only sees the local
+    vocabulary slice (``vocab`` here is the shard width). For each row block it
+    does a max pass and a sum-exp pass and writes per-row local max and sum-exp
+    for both teacher and student. The caller rescales and merges these across the
+    ``tp`` axis (pmax of maxes, psum of rescaled sums) to form global ``lse_t``
+    and ``lse_s``. Inactive rows are marked with ``-inf`` max and ``0`` sum.
+
+    Args:
+        student_ref: HBM input ref of local student logits, shape ``(rows, vocab)``.
+        teacher_ref: HBM input ref of local teacher logits, shape ``(rows, vocab)``.
+        weights_ref: HBM input ref of per-row weights, shape ``(rows,)``.
+        max_t_ref: VMEM output ref ``(block_m,)`` of local teacher max (``-inf``
+            for inactive rows).
+        max_s_ref: VMEM output ref ``(block_m,)`` of local student max (``-inf``
+            for inactive rows).
+        sum_t_ref: VMEM output ref ``(block_m,)`` of local teacher sum-exp,
+            computed relative to ``max_t`` (``0`` for inactive rows).
+        sum_s_ref: VMEM output ref ``(block_m,)`` of local student sum-exp,
+            computed relative to ``max_s`` (``0`` for inactive rows).
+        student_tile_ref: VMEM scratch ref ``(block_m, block_v)`` for student tiles.
+        teacher_tile_ref: VMEM scratch ref ``(block_m, block_v)`` for teacher tiles.
+        weight_ref: VMEM scratch ref ``(block_m,)`` holding the copied weights.
+        dma_sem_ref: DMA semaphore ref (2 entries) used by the tile copies.
+        temperature: Softmax temperature; logits are scaled by ``1/temperature``.
+        block_v: Vocab tile width in columns.
+        block_m: Number of rows processed per grid step.
+
+    Returns:
+        None: Results are written in place to ``max_t_ref``, ``max_s_ref``,
+        ``sum_t_ref``, and ``sum_s_ref``.
     """
     row_start = pl.program_id(0) * block_m
     _, vocab_size = student_ref.shape
@@ -405,9 +538,36 @@ def _kl_tp_acc_kernel(
 ):
     """Compute the local KL contribution using global teacher/student LSEs.
 
-    The ``lse_t_ref`` and ``lse_s_ref`` inputs are already merged across the
-    vocab-parallel axis. This kernel streams the local vocab shard once more and
-    accumulates the shard-local KL term; the caller ``psum``s it over ``tp``.
+    Second of the two TP-vocab Pallas phases. The per-row ``lse_t``/``lse_s``
+    inputs are already merged across the vocab-parallel axis by the caller. This
+    kernel streams the local vocab shard once more, forms ``p_t``/``p_s`` against
+    the global LSEs, and accumulates the shard-local cross-term KL mass. The
+    caller ``psum``s the result over the ``tp`` axis. Inactive rows write ``0``.
+
+    Args:
+        student_ref: HBM input ref of local student logits, shape ``(rows, vocab)``.
+        teacher_ref: HBM input ref of local teacher logits, shape ``(rows, vocab)``.
+        weights_ref: HBM input ref of per-row weights, shape ``(rows,)``.
+        lse_t_ref: HBM input ref ``(rows,)`` of global teacher log-sum-exp.
+        lse_s_ref: HBM input ref ``(rows,)`` of global student log-sum-exp.
+        acc_ref: VMEM output ref ``(block_m,)`` receiving the shard-local
+            unweighted KL cross-term accumulator (``0`` for inactive rows).
+        student_tile_ref: VMEM scratch ref ``(block_m, block_v)`` for student tiles.
+        teacher_tile_ref: VMEM scratch ref ``(block_m, block_v)`` for teacher tiles.
+        weight_ref: VMEM scratch ref ``(block_m,)`` holding the copied weights.
+        lse_t_scalar_ref: VMEM scratch ref ``(block_m,)`` holding the copied global
+            teacher LSE block.
+        lse_s_scalar_ref: VMEM scratch ref ``(block_m,)`` holding the copied global
+            student LSE block.
+        dma_sem_ref: DMA semaphore ref (2 entries) used by the copies.
+        direction: Either ``"forward"`` or ``"reverse"``; selects the per-element
+            contribution sign.
+        temperature: Softmax temperature; logits are scaled by ``1/temperature``.
+        block_v: Vocab tile width in columns.
+        block_m: Number of rows processed per grid step.
+
+    Returns:
+        None: The shard-local accumulator is written in place to ``acc_ref``.
     """
     row_start = pl.program_id(0) * block_m
     _, vocab_size = student_ref.shape
@@ -455,7 +615,25 @@ def _kl_tp_acc_kernel(
 
 
 def _kl_tp_lse_stats_pallas(student_2d, teacher_2d, weights_1d, *, temperature, block_v, block_m):
-    """Launch the first TP-vocab KL phase that computes local LSE stats."""
+    """Launch the first TP-vocab KL phase that computes local LSE stats.
+
+    Pads rows to a multiple of ``block_m``, runs ``_kl_tp_lse_stats_kernel`` over
+    the local vocab shard, then trims the padded rows.
+
+    Args:
+        student_2d: Local student logit shard, shape ``(n_rows, local_vocab)``.
+        teacher_2d: Local teacher logit shard, shape ``(n_rows, local_vocab)``.
+        weights_1d: Per-row weights, shape ``(n_rows,)``; cast to float32.
+        temperature: Softmax temperature (positive).
+        block_v: Vocab tile width in columns.
+        block_m: Row tile size.
+
+    Returns:
+        tuple[jax.Array, jax.Array, jax.Array, jax.Array]: ``(max_t, max_s, sum_t,
+        sum_s)``, each shape ``(n_rows,)`` float32: the local teacher/student maxes
+        (``-inf`` for inactive rows) and local sum-exps relative to those maxes
+        (``0`` for inactive rows), ready for cross-shard merging.
+    """
     n_rows = student_2d.shape[0]
     n_rows_pad = pl.cdiv(n_rows, int(block_m)) * int(block_m)
     pad_rows = n_rows_pad - n_rows
@@ -492,17 +670,37 @@ def _kl_tp_lse_stats_pallas(student_2d, teacher_2d, weights_1d, *, temperature, 
         ),
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
         out_shape=[
-            jax.ShapeDtypeStruct((n_rows_pad,), jnp.float32),
-            jax.ShapeDtypeStruct((n_rows_pad,), jnp.float32),
-            jax.ShapeDtypeStruct((n_rows_pad,), jnp.float32),
-            jax.ShapeDtypeStruct((n_rows_pad,), jnp.float32),
+            _pallas_out_shape((n_rows_pad,), jnp.float32),
+            _pallas_out_shape((n_rows_pad,), jnp.float32),
+            _pallas_out_shape((n_rows_pad,), jnp.float32),
+            _pallas_out_shape((n_rows_pad,), jnp.float32),
         ],
     )(student_pad, teacher_pad, weights_pad.astype(jnp.float32))
     return max_t[:n_rows], max_s[:n_rows], sum_t[:n_rows], sum_s[:n_rows]
 
 
 def _kl_tp_acc_pallas(student_2d, teacher_2d, weights_1d, lse_t, lse_s, *, direction, temperature, block_v, block_m):
-    """Launch the second TP-vocab KL phase that computes local KL mass."""
+    """Launch the second TP-vocab KL phase that computes local KL mass.
+
+    Pads rows to a multiple of ``block_m``, runs ``_kl_tp_acc_kernel`` with the
+    already-merged global LSEs, then trims the padded rows. The returned value is
+    still shard-local; the caller ``psum``s it across the vocab-parallel axis.
+
+    Args:
+        student_2d: Local student logit shard, shape ``(n_rows, local_vocab)``.
+        teacher_2d: Local teacher logit shard, shape ``(n_rows, local_vocab)``.
+        weights_1d: Per-row weights, shape ``(n_rows,)``; cast to float32.
+        lse_t: Global teacher log-sum-exp per row, shape ``(n_rows,)``.
+        lse_s: Global student log-sum-exp per row, shape ``(n_rows,)``.
+        direction: ``"forward"`` or ``"reverse"`` KL direction.
+        temperature: Softmax temperature (positive).
+        block_v: Vocab tile width in columns.
+        block_m: Row tile size.
+
+    Returns:
+        jax.Array: The shard-local unweighted KL cross-term accumulator, shape
+        ``(n_rows,)`` float32.
+    """
     n_rows = student_2d.shape[0]
     n_rows_pad = pl.cdiv(n_rows, int(block_m)) * int(block_m)
     pad_rows = n_rows_pad - n_rows
@@ -540,7 +738,7 @@ def _kl_tp_acc_pallas(student_2d, teacher_2d, weights_1d, lse_t, lse_s, *, direc
             grid=(n_rows_pad // int(block_m),),
         ),
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
-        out_shape=jax.ShapeDtypeStruct((n_rows_pad,), jnp.float32),
+        out_shape=_pallas_out_shape((n_rows_pad,), jnp.float32),
     )(
         student_pad,
         teacher_pad,
@@ -553,7 +751,25 @@ def _kl_tp_acc_pallas(student_2d, teacher_2d, weights_1d, lse_t, lse_s, *, direc
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6))
 def _fused_kl_core_pallas(student_2d, teacher_2d, weights_1d, direction, temperature, block_v, block_m):
-    """Differentiable replicated-vocab KL loss wrapper."""
+    """Differentiable replicated-vocab KL loss wrapper.
+
+    ``custom_vjp`` entry point. ``direction``, ``temperature``, ``block_v`` and
+    ``block_m`` are non-differentiable (``nondiff_argnums=(3, 4, 5, 6)``). Only
+    the weighted per-row loss is returned; LSE/acc residuals are kept by the
+    forward rule for backward.
+
+    Args:
+        student_2d: Student logits, shape ``(n_rows, vocab)``.
+        teacher_2d: Teacher logits, shape ``(n_rows, vocab)``.
+        weights_1d: Per-row weights, shape ``(n_rows,)``.
+        direction: ``"forward"`` or ``"reverse"`` KL direction.
+        temperature: Softmax temperature (positive).
+        block_v: Vocab tile width in columns.
+        block_m: Row tile size.
+
+    Returns:
+        jax.Array: The weighted per-row KL loss, shape ``(n_rows,)`` float32.
+    """
     loss, _lse_t, _lse_s, _acc = _kl_fwd_pallas(
         student_2d,
         teacher_2d,
@@ -567,7 +783,24 @@ def _fused_kl_core_pallas(student_2d, teacher_2d, weights_1d, direction, tempera
 
 
 def _kl_core_fwd(student_2d, teacher_2d, weights_1d, direction, temperature, block_v, block_m):
-    """Forward rule for replicated-vocab KL, saving LSEs and KL aux."""
+    """Forward rule for replicated-vocab KL, saving LSEs and KL aux.
+
+    ``custom_vjp`` forward rule for ``_fused_kl_core_pallas``.
+
+    Args:
+        student_2d: Student logits, shape ``(n_rows, vocab)``.
+        teacher_2d: Teacher logits, shape ``(n_rows, vocab)``.
+        weights_1d: Per-row weights, shape ``(n_rows,)``.
+        direction: ``"forward"`` or ``"reverse"`` KL direction.
+        temperature: Softmax temperature (positive).
+        block_v: Vocab tile width in columns.
+        block_m: Row tile size.
+
+    Returns:
+        tuple: ``(loss, residual)`` where ``loss`` is the weighted per-row KL,
+        shape ``(n_rows,)``, and ``residual`` is the tuple ``(student_2d,
+        teacher_2d, lse_t, lse_s, acc, weights_1d)`` consumed by the backward rule.
+    """
     loss, lse_t, lse_s, acc = _kl_fwd_pallas(
         student_2d,
         teacher_2d,
@@ -581,7 +814,26 @@ def _kl_core_fwd(student_2d, teacher_2d, weights_1d, direction, temperature, blo
 
 
 def _kl_core_bwd(direction, temperature, block_v, block_m, residual, dy):
-    """Backward rule for replicated-vocab KL using saved softmax stats."""
+    """Backward rule for replicated-vocab KL using saved softmax stats.
+
+    ``custom_vjp`` backward rule for ``_fused_kl_core_pallas``. Computes the
+    student-logit gradient via the Pallas backward kernel; teacher logits get a
+    zero cotangent (detached targets) and the ``weights_1d`` cotangent is ``None``.
+
+    Args:
+        direction: ``"forward"`` or ``"reverse"`` KL direction (nondiff).
+        temperature: Softmax temperature (nondiff, positive).
+        block_v: Vocab tile width in columns (nondiff).
+        block_m: Row tile size (nondiff).
+        residual: The tuple saved by ``_kl_core_fwd``: ``(student_2d, teacher_2d,
+            lse_t, lse_s, acc, weights_1d)``.
+        dy: Upstream cotangent of the per-row loss, shape ``(n_rows,)``.
+
+    Returns:
+        tuple: ``(dstudent, dteacher, dweights)`` matching the differentiable
+        inputs: the student gradient shape ``(n_rows, vocab)``, a zeros-like
+        teacher gradient, and ``None`` for the weights.
+    """
     student_2d, teacher_2d, lse_t, lse_s, acc, weights_1d = residual
     dstudent = _kl_bwd_pallas(
         student_2d,
@@ -616,9 +868,28 @@ def _kl_tp_loss_and_aux(
     """Build TP-vocab KL loss from local Pallas phases and TP collectives.
 
     The first Pallas phase computes local teacher/student softmax stats, JAX
-    collectives merge them into global LSEs, and the second Pallas phase
-    computes the local KL contribution. A final ``psum`` gives the full per-row
-    KL while preserving the global LSEs for backward.
+    collectives merge them into global LSEs (``pmax`` of maxes, then ``psum`` of
+    max-rescaled sums), and the second Pallas phase computes the shard-local KL
+    contribution. A final ``psum`` over the vocab-parallel axis gives the full
+    per-row KL mass while preserving the global LSEs for backward. Must be called
+    inside a ``shard_map`` whose mesh has ``vocab_parallel_axis``.
+
+    Args:
+        student_2d: Local student logit shard, shape ``(n_rows, local_vocab)``.
+        teacher_2d: Local teacher logit shard, shape ``(n_rows, local_vocab)``.
+        weights_1d: Per-row weights, shape ``(n_rows,)``.
+        direction: ``"forward"`` or ``"reverse"`` KL direction.
+        temperature: Softmax temperature (positive).
+        block_v: Vocab tile width in columns.
+        block_m: Row tile size.
+        vocab_parallel_axis: Mesh axis name over which the vocab is sharded; used
+            for the ``pmax``/``psum`` collectives.
+
+    Returns:
+        tuple[jax.Array, jax.Array, jax.Array, jax.Array]: ``(loss, lse_t, lse_s,
+        acc)``, each shape ``(n_rows,)`` float32: the weighted per-row KL loss, the
+        global teacher and student log-sum-exps, and the global (psummed) KL
+        cross-term accumulator (the latter three are backward residuals).
     """
     local_max_t, local_max_s, local_sum_t, local_sum_s = _kl_tp_lse_stats_pallas(
         student_2d,
@@ -673,7 +944,26 @@ def _fused_kl_core_pallas_tp(
     block_m,
     vocab_parallel_axis,
 ):
-    """Differentiable TP-vocab KL wrapper backed by Pallas kernels."""
+    """Differentiable TP-vocab KL wrapper backed by Pallas kernels.
+
+    ``custom_vjp`` entry point for the vocab-parallel path. ``direction``,
+    ``temperature``, ``block_v``, ``block_m`` and ``vocab_parallel_axis`` are
+    non-differentiable (``nondiff_argnums=(3, 4, 5, 6, 7)``). Must be called
+    inside a ``shard_map`` over ``vocab_parallel_axis``.
+
+    Args:
+        student_2d: Local student logit shard, shape ``(n_rows, local_vocab)``.
+        teacher_2d: Local teacher logit shard, shape ``(n_rows, local_vocab)``.
+        weights_1d: Per-row weights, shape ``(n_rows,)``.
+        direction: ``"forward"`` or ``"reverse"`` KL direction.
+        temperature: Softmax temperature (positive).
+        block_v: Vocab tile width in columns.
+        block_m: Row tile size.
+        vocab_parallel_axis: Mesh axis name over which the vocab is sharded.
+
+    Returns:
+        jax.Array: The weighted per-row KL loss, shape ``(n_rows,)`` float32.
+    """
     loss, _lse_t, _lse_s, _acc = _kl_tp_loss_and_aux(
         student_2d,
         teacher_2d,
@@ -688,7 +978,26 @@ def _fused_kl_core_pallas_tp(
 
 
 def _kl_core_tp_fwd(student_2d, teacher_2d, weights_1d, direction, temperature, block_v, block_m, vocab_parallel_axis):
-    """Forward rule for TP-vocab KL, saving global LSEs and full-row KL aux."""
+    """Forward rule for TP-vocab KL, saving global LSEs and full-row KL aux.
+
+    ``custom_vjp`` forward rule for ``_fused_kl_core_pallas_tp``.
+
+    Args:
+        student_2d: Local student logit shard, shape ``(n_rows, local_vocab)``.
+        teacher_2d: Local teacher logit shard, shape ``(n_rows, local_vocab)``.
+        weights_1d: Per-row weights, shape ``(n_rows,)``.
+        direction: ``"forward"`` or ``"reverse"`` KL direction.
+        temperature: Softmax temperature (positive).
+        block_v: Vocab tile width in columns.
+        block_m: Row tile size.
+        vocab_parallel_axis: Mesh axis name over which the vocab is sharded.
+
+    Returns:
+        tuple: ``(loss, residual)`` where ``loss`` is the weighted per-row KL,
+        shape ``(n_rows,)``, and ``residual`` is ``(student_2d, teacher_2d, lse_t,
+        lse_s, acc, weights_1d)`` with global LSEs/acc, consumed by the backward
+        rule.
+    """
     loss, lse_t, lse_s, acc = _kl_tp_loss_and_aux(
         student_2d,
         teacher_2d,
@@ -705,12 +1014,29 @@ def _kl_core_tp_fwd(student_2d, teacher_2d, weights_1d, direction, temperature, 
 def _kl_core_tp_bwd(direction, temperature, block_v, block_m, vocab_parallel_axis, residual, dy):
     """Backward rule for TP-vocab KL.
 
-    The local Pallas backward uses global ``lse_t`` / ``lse_s`` but writes only
-    this shard's student-gradient slice. The returned gradient is scaled by the
-    TP axis size to undo the cotangent splitting from ``shard_map``.
+    ``custom_vjp`` backward rule for ``_fused_kl_core_pallas_tp``. The local
+    Pallas backward uses global ``lse_t`` / ``lse_s`` but writes only this shard's
+    student-gradient slice. VMA-aware ``shard_map`` keeps the scalar cotangent
+    replicated across TP shards, so no TP compensation scale is needed here.
+
+    Args:
+        direction: ``"forward"`` or ``"reverse"`` KL direction (nondiff).
+        temperature: Softmax temperature (nondiff, positive).
+        block_v: Vocab tile width in columns (nondiff).
+        block_m: Row tile size (nondiff).
+        vocab_parallel_axis: Mesh axis name over which the vocab is sharded
+            (nondiff).
+        residual: The tuple saved by ``_kl_core_tp_fwd``: ``(student_2d,
+            teacher_2d, lse_t, lse_s, acc, weights_1d)`` with global LSEs/acc.
+        dy: Upstream cotangent of the per-row loss, shape ``(n_rows,)``.
+
+    Returns:
+        tuple: ``(dstudent, dteacher, dweights)`` matching the differentiable
+        inputs: this shard's student gradient slice, shape ``(n_rows,
+        local_vocab)``; a zeros-like teacher gradient; and ``None`` for the
+        weights.
     """
     student_2d, teacher_2d, lse_t, lse_s, acc, weights_1d = residual
-    axis_size = jax.lax.psum(jnp.array(1, dtype=jnp.float32), vocab_parallel_axis)
     dstudent = _kl_bwd_pallas(
         student_2d,
         teacher_2d,
@@ -724,7 +1050,7 @@ def _kl_core_tp_bwd(direction, temperature, block_v, block_m, vocab_parallel_axi
         block_v=block_v,
         block_m=block_m,
     )
-    return dstudent * axis_size, jnp.zeros_like(teacher_2d), None
+    return dstudent, jnp.zeros_like(teacher_2d), None
 
 
 _fused_kl_core_pallas_tp.defvjp(_kl_core_tp_fwd, _kl_core_tp_bwd)
@@ -743,12 +1069,62 @@ def fused_kl_divergence_pallas(
     block_v: int = 0,
     block_m: int = 0,
 ):
-    """Run TPU Pallas fused KL divergence.
+    """Run TPU Pallas fused KL divergence between student and teacher logits.
 
-    ``direction="forward"`` and ``"reverse"`` are implemented by Pallas.
-    ``direction="jsd"`` falls back to XLA. With ``vocab_parallel_axis`` set,
-    inputs are local vocab shards inside ``shard_map``; TP collectives merge
-    teacher/student softmax statistics and KL mass across the full vocabulary.
+    ``direction="forward"`` and ``"reverse"`` are implemented by Pallas. The
+    kernel streams logits through VMEM and never materializes a softmax in HBM.
+    ``direction="jsd"`` is not implemented in Pallas and falls back to the XLA
+    reference. With ``vocab_parallel_axis`` set, the inputs are local vocab shards
+    inside a ``shard_map``; TP collectives merge teacher/student softmax
+    statistics and KL mass across the full vocabulary. Gradients flow only to
+    ``student_logits``; ``teacher_logits`` are treated as detached targets.
+
+    The per-row KL is scaled by ``abs(weights)`` and, when ``temperature != 1.0``,
+    by ``temperature**2`` (the standard distillation temperature correction).
+
+    Args:
+        student_logits: Student logits of shape ``(..., vocab)`` with rank >= 2.
+            Leading dims are flattened to rows. ``float16`` is rejected; use
+            ``bfloat16`` or ``float32``.
+        teacher_logits: Teacher logits, same shape as ``student_logits``. Cast to
+            the student dtype before the kernel runs.
+        weights: Optional per-row weights of shape ``logits.shape[:-1]``. Rows with
+            zero weight are skipped. Defaults to all-ones (every row contributes).
+            The KL contribution uses ``abs(weights)``; ``mean`` reduction divides
+            by ``sum(weights)``.
+        reduction: How to reduce the per-row loss. ``"none"`` returns per-row loss
+            reshaped to ``logits.shape[:-1]``; ``"sum"`` returns the scalar sum;
+            ``"mean"`` returns the sum divided by ``max(sum(weights), 1e-8)``.
+            Defaults to ``"mean"``.
+        direction: KL direction. ``"forward"`` computes ``KL(teacher || student)``,
+            ``"reverse"`` computes ``KL(student || teacher)``, and ``"jsd"`` defers
+            to the XLA implementation. Defaults to ``"forward"``.
+        temperature: Softmax temperature applied to both logits; must be positive.
+            Defaults to ``1.0``.
+        beta: JSD interpolation weight, forwarded to the XLA path only when
+            ``direction == "jsd"``. Ignored by the Pallas forward/reverse paths.
+            Defaults to ``0.5``.
+        vocab_parallel_axis: Optional mesh axis name over which the vocabulary is
+            sharded. When set, inputs are local shards and TP collectives merge
+            statistics across the axis. When ``None``, the vocab is replicated.
+            Defaults to ``None``.
+        block_v: Vocab tile width hint. Values <= 0 select a size-based default;
+            otherwise the effective tile is ``max(default, block_v)``. Defaults to
+            ``0``.
+        block_m: Row tile size hint. The current implementation always uses the
+            fixed default row tile and this value is not consumed. Defaults to
+            ``0``.
+
+    Returns:
+        jax.Array: The reduced KL divergence. Shape ``logits.shape[:-1]`` for
+        ``reduction="none"``, otherwise a float32 scalar.
+
+    Raises:
+        ValueError: If ``reduction`` is not one of ``none``/``sum``/``mean``, if
+            ``direction`` is not one of ``forward``/``reverse``/``jsd``, if
+            ``temperature`` is not positive, if student/teacher shapes differ, if
+            either input is ``float16``, if ``student_logits`` has rank < 2, or if
+            ``weights.shape`` does not equal ``logits.shape[:-1]``.
     """
     if reduction not in ("none", "sum", "mean"):
         raise ValueError(f"Invalid reduction '{reduction}'; expected one of none/sum/mean.")

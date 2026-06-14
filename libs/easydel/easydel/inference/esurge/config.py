@@ -37,9 +37,9 @@ from collections.abc import Mapping
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypeAlias, TypedDict, Unpack
 
+from ejkernel.modules.operations import KernelTilePolicy, normalize_kernel_tile_policy
 from spectrax.common_types import NOT_GIVEN, _Empty
 
-from easydel.operations.kernels._gdn_policy import KernelTilePolicy, normalize_kernel_tile_policy
 from easydel.typings import typed_config
 
 if TYPE_CHECKING:
@@ -796,7 +796,25 @@ class eSurgeDistributedConfig(TypedDict, total=False):
 
 
 def _validate_esurge_drafter_config(self):
-    """Validate and normalize an :class:`eSurgeDrafterConfig`."""
+    """Validate and normalize an :class:`eSurgeDrafterConfig` after construction.
+
+    Wired via ``post_init`` of the ``@typed_config`` decorator. Mutates ``self``
+    in place: canonicalizes ``method`` to a slug (lowercase, non-alphanumeric
+    runs collapsed to underscores), reconciles ``enabled`` with ``method``
+    (a recognized disable-token clears the method and disables drafting, while
+    an enabled config with no method defaults ``method`` to ``"auto"``), coerces
+    ``layer_mapping`` entries to ``int``, and normalizes ``kwargs`` to a plain
+    ``dict`` (``None`` becomes ``{}``).
+
+    Args:
+        self: The newly-built ``eSurgeDrafterConfig`` (a dict subclass) whose
+            ``enabled``, ``method``, ``num_draft_tokens``, ``layer_mapping``, and
+            ``kwargs`` fields are validated and normalized in place.
+
+    Raises:
+        ValueError: If ``num_draft_tokens`` is not positive.
+        TypeError: If ``kwargs`` is neither ``None`` nor a mapping.
+    """
     method = self.method
     enabled = bool(self.enabled)
     if method is not None:

@@ -194,6 +194,18 @@ def _decode_kernel_main(
     bounded_bt = pl.BoundedSlice(bt)
 
     def token_map(i):
+        """Map a pipeline block index to its dynamic token slice into HBM activation refs.
+
+        Used as the index map for the q/k/v/g/b/o ``BlockSpec``s of the inner pipeline. Each block covers up to
+        ``bt`` decode tokens starting at ``i * bt``, clamped so it never reads past ``decode_end``.
+
+        Args:
+            i: Pipeline block index along the token grid (``program_id(0)`` of the inner pipeline).
+
+        Returns:
+            tuple: Block index tuple ``(token_slice, 0, 0)`` selecting ``[i*bt : i*bt+t_size]`` along the leading
+            token axis and the full head/feature extent.
+        """
         t_start = i * bt
         t_size = jnp.minimum(bt, decode_end - t_start)
         return (pl.ds(t_start, t_size), 0, 0)
@@ -206,6 +218,16 @@ def _decode_kernel_main(
 
         @pl.when(i_t < decode_end)
         def _first_load(i_t=i_t):
+            """Kick off the asynchronous HBM-to-VMEM load of the first pipeline block's recurrent state.
+
+            Runs once per token position ``i_t`` of the first block (guarded by ``i_t < decode_end``) before the
+            pipeline starts. Looks up the per-token state pool index and starts a DMA copying that state slab from
+            ``state_hbm`` into buffer ``0`` of the double-buffered ``h_bufs`` scratch, so the first inner-kernel
+            invocation finds its state already in flight.
+
+            Args:
+                i_t: Token position within the first block, captured per Python-unrolled iteration as a default arg.
+            """
             si = state_indices_ref[i_t]
             pltpu.make_async_copy(
                 state_hbm.at[pl.ds(si, 1), :, :, :],
@@ -225,6 +247,26 @@ def _decode_kernel_main(
         h_load_sems_s,
         h_store_sems_s,
     ):
+        """Run one ``emit_pipeline`` step over a block of decode tokens with software-pipelined state DMAs.
+
+        Body of the ``pltpu.emit_pipeline`` grid (one invocation per token block). It prefetches the next block's
+        state into the alternate double buffer, waits for this block's state load, performs the per-token gated
+        delta-rule recurrent update in VMEM (writing outputs to ``o_ref`` and the new state back into ``h_bufs_s``),
+        waits on the store of two-blocks-ago to free its buffer, then starts asynchronous stores of this block's
+        updated state slabs back to ``state_hbm``.
+
+        Args:
+            q_ref: VMEM ref for this block's queries, shape ``(bt, h, k_dim)``.
+            k_ref: VMEM ref for this block's keys, shape ``(bt, h, k_dim)``.
+            v_ref: VMEM ref for this block's values, shape ``(bt, h, v_dim)``.
+            g_ref: VMEM ref for this block's log-decay, shape ``(bt, h, k_dim)``.
+            b_ref: VMEM ref for this block's beta lanes, shape ``(bt, h, num_lanes)``.
+            o_ref: VMEM output ref for this block's decode result, shape ``(bt, h, v_dim)``.
+            h_bufs_s: VMEM double-buffer scratch holding live state slabs, shape ``(2, bt, h, k_dim, v_dim)``.
+            state_indices_s: SMEM ref of per-token state pool indices.
+            h_load_sems_s: Per-buffer DMA semaphores for asynchronous state loads.
+            h_store_sems_s: Per-buffer DMA semaphores for asynchronous state stores.
+        """
         block_id = pl.program_id(0)
         t_start = block_id * bt
         block_len = jnp.minimum(bt, decode_end - t_start)
@@ -237,6 +279,15 @@ def _decode_kernel_main(
 
             @pl.when(i_t < next_block_len)
             def _prefetch(i_t=i_t):
+                """Start the asynchronous load of one token's state slab for the next pipeline block.
+
+                Guarded by ``i_t < next_block_len`` so it only fires for tokens that exist in the next block. Reads
+                that token's state pool index and starts a DMA from ``state_hbm`` into the alternate
+                (``next_buf_idx``) double buffer, overlapping the next block's state fetch with this block's compute.
+
+                Args:
+                    i_t: Token position within the next block, captured per Python-unrolled iteration as a default arg.
+                """
                 next_si = state_indices_s[next_t_start + i_t]
                 pltpu.make_async_copy(
                     state_hbm.at[pl.ds(next_si, 1), :, :, :],
@@ -254,6 +305,18 @@ def _decode_kernel_main(
 
             @pl.when(i_t < block_len)
             def _process_token(i_t=i_t):
+                """Apply the gated delta-rule recurrent update for a single decode token in VMEM.
+
+                Guarded by ``i_t < block_len``. Loads the token's current state from buffer ``buf_idx`` of
+                ``h_bufs_s`` and the matching q/k/v/g rows plus the sigmoid-gated beta, decays the state by
+                ``exp(g)``, computes the delta-rule correction ``beta * (v - k @ h_pre)``, forms the decode output
+                ``o = q @ h_pre + (q . k) * beta * v_diff``, and writes the rank-1 updated state ``h_pre + k (x) b_v``
+                back. Results are written into ``o_ref[i_t]`` and ``h_bufs_s[buf_idx, i_t]``.
+
+                Args:
+                    i_t: Token position within the current block, captured per Python-unrolled iteration as a default
+                        arg.
+                """
                 h0 = h_bufs_s[buf_idx, i_t].astype(jnp.float32)
                 q_t = q_ref[i_t].astype(jnp.float32)
                 k_t = k_ref[i_t].astype(jnp.float32)
@@ -289,6 +352,12 @@ def _decode_kernel_main(
 
         @pl.when(prev_block_len > 0)
         def _wait_prev_store():
+            """Wait for the state store issued two blocks earlier to complete before reusing this double buffer.
+
+            Guarded by ``prev_block_len > 0`` (i.e. ``block_id >= 2``). The current block reuses double buffer
+            ``buf_idx``, which was last used by the block two steps back; this blocks on that block's outstanding
+            store DMA so its slabs are safe to overwrite. Returns nothing.
+            """
             pltpu.make_async_copy(
                 h_bufs_s.at[buf_idx, pl.ds(0, prev_block_len), :, :, :],
                 state_hbm.at[pl.ds(0, prev_block_len), :, :, :],
@@ -299,6 +368,16 @@ def _decode_kernel_main(
 
             @pl.when(i_t < block_len)
             def _start_store(i_t=i_t):
+                """Start the asynchronous store of one token's updated state slab back to the HBM state pool.
+
+                Guarded by ``i_t < block_len``. Reads the token's state pool index and starts a DMA copying the
+                freshly computed state from buffer ``buf_idx`` of ``h_bufs_s`` back to its slot in ``state_hbm``,
+                so the in-place recurrent state pool reflects this decode step.
+
+                Args:
+                    i_t: Token position within the current block, captured per Python-unrolled iteration as a default
+                        arg.
+                """
                 si = state_indices_s[t_start + i_t]
                 pltpu.make_async_copy(
                     h_bufs_s.at[buf_idx, pl.ds(i_t, 1), :, :, :],
@@ -334,6 +413,12 @@ def _decode_kernel_main(
 
     @pl.when(other_block_len > 0)
     def _drain_other():
+        """Drain the second-to-last block's outstanding state store after the pipeline finishes.
+
+        After the pipeline completes, the last block's store is waited on unconditionally; this guarded helper
+        (``other_block_len > 0``, i.e. ``nb_t >= 2``) waits on the store DMA for the next-to-last block held in the
+        alternate buffer, ensuring all updated state has landed in ``state_hbm`` before the kernel returns.
+        """
         pltpu.make_async_copy(
             h_bufs.at[other_buf_idx, pl.ds(0, other_block_len), :, :, :],
             state_hbm.at[pl.ds(0, other_block_len), :, :, :],

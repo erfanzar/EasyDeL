@@ -47,20 +47,25 @@ def gated_delta_rule(
 ]:
     """Gated Delta Rule linear attention using TPU Pallas kernels.
 
-    Dispatches to one of three implementations based on the input shape and
-    ``use_chunked`` flag:
+    Inputs are accepted in the public ``(batch, seq_len, num_heads, head_dim)`` layout and
+    transposed internally to the heads-first ``(batch, num_heads, seq_len, head_dim)`` layout
+    expected by the underlying implementations; the output is transposed back before being
+    returned. Dispatch selects one of four implementations based on ``seg_ids``, the input
+    shape, and the ``use_chunked`` flag, in this priority order:
 
-    * **Single-step** (``seq_len == 1`` with ``initial_state``): a Pallas
+    * **Segment-packed recurrent** (``seg_ids is not None``): delegates to the XLA chunked
+      recurrent implementation with segment ids so that the recurrent state is reset at
+      document boundaries (sequence packing). Takes precedence over all other branches.
+    * **Single-step** (``seq_len == 1`` with ``initial_state`` provided): a Pallas
       single-step kernel for autoregressive decoding.
-    * **Chunked** (``use_chunked=True``, default): a vectorized Pallas
-      kernel that uses parallel Neumann-series matmuls mapped to MXU,
-      with the scan body keeping data in VMEM.
-    * **Recurrent fallback** (``use_chunked=False``): falls back to the XLA
-      step-by-step recurrent implementation.
+    * **Chunked** (``use_chunked=True``, default): a vectorized Pallas kernel that uses
+      parallel Neumann-series matmuls mapped to the MXU, with the scan body keeping data in
+      VMEM.
+    * **Recurrent fallback** (``use_chunked=False``): falls back to the XLA step-by-step
+      recurrent implementation.
 
-    All paths optionally apply L2 normalisation to queries and keys when
-    ``use_qk_l2norm`` is ``True`` (the default) and scale queries by
-    ``1 / sqrt(qk_head_dim)``.
+    All paths optionally apply L2 normalisation to queries and keys when ``use_qk_l2norm`` is
+    ``True`` (the default) and scale queries by ``1 / sqrt(qk_head_dim)``.
 
     Args:
         query: Query tensor of shape ``(batch, seq_len, num_heads, qk_head_dim)``.
@@ -74,13 +79,20 @@ def gated_delta_rule(
             at each step before the delta update. ``None`` means no decay
             (equivalent to all-zeros).
         chunk_size: Number of tokens per chunk for the blocked-recurrent kernel.
-            Must be a positive integer; padded up to a multiple of 8 internally.
+            Must be a positive integer; the sequence length is padded up to a
+            multiple of ``chunk_size`` internally.
         initial_state: Optional initial recurrent state of shape
             ``(batch, num_heads, qk_head_dim, v_head_dim)``. Defaults to zeros.
         use_qk_l2norm: If ``True``, L2-normalise queries and keys before
             computing attention.
         use_chunked: If ``True`` (default), use the chunked Pallas kernel.
-            Set to ``False`` to use the XLA recurrent fallback.
+            Set to ``False`` to use the XLA recurrent fallback. Ignored when
+            ``seg_ids`` is provided or when the single-step path is taken.
+        seg_ids: Optional per-token segment (document) ids of shape
+            ``(batch, seq_len)``. When provided, dispatch is forced to the XLA
+            recurrent path, which uses these ids to reset the recurrent state at
+            segment boundaries so that packed sequences do not leak state across
+            documents. ``None`` (default) treats the whole sequence as one segment.
 
     Returns:
         A tuple ``(output, final_state)`` where:
@@ -92,22 +104,25 @@ def gated_delta_rule(
           be fed as ``initial_state`` to a subsequent call.
     """
 
-    # ``seg_ids`` (sequence packing) is accepted for signature parity with the XLA backend
-    # (the kernel registry validates matching signatures across platforms). This Pallas path
-    # does not implement segment-aware recurrence; packed training routes through the XLA
-    # chunked path instead, so seg_ids should never be non-None here.
-    if seg_ids is not None:
-        raise NotImplementedError(
-            "Pallas GDR does not support sequence packing (seg_ids); the packed path uses the XLA backend."
-        )
-
     q = query.transpose(0, 2, 1, 3)
     k = key.transpose(0, 2, 1, 3)
     v = value.transpose(0, 2, 1, 3)
     b = beta.transpose(0, 2, 1)
     d = decay.transpose(0, 2, 1) if decay is not None else None
 
-    if query.shape[1] == 1 and initial_state is not None:
+    if seg_ids is not None:
+        out, final_state = _recurrent_gdr_fwd(
+            query=q,
+            key=k,
+            value=v,
+            beta=b,
+            decay=d,
+            initial_state=initial_state,
+            use_qk_l2norm=use_qk_l2norm,
+            chunk_size=chunk_size,
+            seg_ids=seg_ids,
+        )
+    elif query.shape[1] == 1 and initial_state is not None:
         out, final_state = _single_step_gdr_fwd(
             query=q,
             key=k,

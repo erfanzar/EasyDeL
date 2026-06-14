@@ -53,10 +53,21 @@ Available Operations:
     Linear / Recurrent Attention:
         - recurrent_gla: Gated linear attention (recurrent form)
         - gated_delta_rule: Gated delta rule linear attention
+        - gated_delta_rule_grouped_decode: Grouped-head single-step GDR decode
         - ragged_gated_delta_rule: Ragged-batch gated delta rule
+        - ragged_gated_delta_rule_v2: Packed continuous-batch GDN v2 (mixed prefill+decode)
         - lightning_attn: Lightning attention with exponential decay
         - recurrent: General recurrent state-space attention
         - kernel_delta_attention (kda / kda_decay): Delta-rule linear attention
+
+    GDN / Conv-State Inference Helpers:
+        - compute_schedule_table_v2: Build the GDN v2 packed-batch schedule table
+        - ragged_causal_conv1d: Short causal depthwise conv1d over a packed token buffer
+        - fused_conv_decode: Single-token conv-state shift + depthwise conv + activation
+
+    Losses:
+        - fused_cross_entropy: Fused cross-entropy loss
+        - fused_kl_divergence: Fused KL-divergence loss
 
     State Space Models:
         - state_space_v1: Mamba1-style SSM
@@ -87,9 +98,12 @@ from .decode_attention import decode_attention
 from .deepseek_attn import deepseek_attn
 from .flash_attention import flash_attention
 from .flash_mla import flash_mla
+from .fused_conv_decode import fused_conv_decode
 from .fused_cross_entropy import fused_cross_entropy
 from .fused_kl_divergence import fused_kl_divergence
 from .gated_delta_rule import gated_delta_rule
+from .gated_delta_rule_grouped_decode import gated_delta_rule_grouped_decode
+from .gdn_compute_schedule_v2 import compute_schedule_table_v2
 from .gla import recurrent_gla
 from .grouped_matmul import grouped_matmul
 from .grouped_matmulv3 import grouped_matmulv3
@@ -102,8 +116,10 @@ from .native_sparse_attention import apply_native_sparse_attention
 from .page_attention import page_attention
 from .prefill_page_attention import prefill_page_attention
 from .quantized_matmul import quantized_matmul
+from .ragged_causal_conv1d import ragged_causal_conv1d
 from .ragged_decode_attention import ragged_decode_attention
 from .ragged_gated_delta_rule import ragged_gated_delta_rule as ragged_gated_delta_rule
+from .ragged_gated_delta_rule_v2 import ragged_gated_delta_rule_v2
 from .ragged_page_attention_v2 import ragged_page_attention_v2
 from .ragged_page_attention_v2_turboquant import ragged_page_attention_v2_turboquant
 from .ragged_page_attention_v3 import ragged_page_attention_v3
@@ -125,13 +141,16 @@ __all__ = [
     "attention",
     "blocksparse_attention",
     "chunked_prefill_paged_decode",
+    "compute_schedule_table_v2",
     "decode_attention",
     "deepseek_attn",
     "flash_attention",
     "flash_mla",
+    "fused_conv_decode",
     "fused_cross_entropy",
     "fused_kl_divergence",
     "gated_delta_rule",
+    "gated_delta_rule_grouped_decode",
     "grouped_matmul",
     "grouped_matmulv3",
     "kda",
@@ -144,8 +163,10 @@ __all__ = [
     "page_attention",
     "prefill_page_attention",
     "quantized_matmul",
+    "ragged_causal_conv1d",
     "ragged_decode_attention",
     "ragged_gated_delta_rule",
+    "ragged_gated_delta_rule_v2",
     "ragged_page_attention_v2",
     "ragged_page_attention_v2_turboquant",
     "ragged_page_attention_v3",

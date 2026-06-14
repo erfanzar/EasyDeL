@@ -78,6 +78,7 @@ def detect_platform(
             - "pallas": Pallas kernels (TPU/GPU)
             - "cuda": CUDA-specific implementations
             - "cute": CUTLASS CuTe DSL implementations
+            - "tilelang": TileLang GPU implementations
             - "xla": XLA compiler-based implementations
             - "auto" or None: Automatic selection (default)
         prefer_pallas: Prefer Pallas when available (GPU or TPU).
@@ -185,8 +186,8 @@ class KernelConfig:
         block_d: Head dimension block size (if applicable)
         num_warps: Number of warps for GPU kernels
         num_stages: Number of pipeline stages for overlapping compute/memory
-        platform: Implementation platform (triton, pallas, cuda, cute, xla, auto)
-        backend: Target hardware backend (gpu, tpu, cpu, any)
+        platform: Implementation platform (triton, pallas, cuda, cute, tilelang, xla, auto)
+        backend: Target hardware backend (gpu, mps, tpu, cpu, any)
         algorithm: Specific algorithm variant if multiple exist
         priority: Selection priority when multiple configs match
     """
@@ -277,3 +278,24 @@ def create_default_executor(
             persistent=PersistentCache(persistent_cache_path) if persistent_cache_path else None,
         )
     )
+
+
+def mesh_to_jax_mesh(mesh: object) -> object:
+    """Return a ``jax.sharding.Mesh`` compatible object from *mesh*.
+
+    SpectraX wraps JAX meshes in ``SpxMesh``; ``jax.shard_map`` and other JAX
+    APIs require the underlying ``jax.sharding.Mesh`` directly. This helper
+    extracts ``mesh.jax_mesh`` when available and otherwise returns *mesh*
+    unchanged.
+
+    Args:
+        mesh: A JAX mesh or a SpectraX mesh wrapping one.
+
+    Returns:
+        A value that can be passed to ``jax.shard_map`` as its ``mesh``
+        argument.
+    """
+    if mesh is None:
+        return None
+    jax_mesh = getattr(mesh, "jax_mesh", None)
+    return jax_mesh if jax_mesh is not None else mesh

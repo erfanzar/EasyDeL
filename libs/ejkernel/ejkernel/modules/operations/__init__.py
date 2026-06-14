@@ -64,7 +64,31 @@ Available Operations:
         - KernelDeltaAttention / kernel_delta_attention / kda_attention: Delta-rule LA.
         - RecurrentAttention / recurrent_attention: Stateful recurrent attention.
         - GatedDeltaRule / gated_delta_rule / gdr_attention: Gated delta rule (O(N)).
+        - GatedDeltaRuleGroupedDecode / gated_delta_rule_grouped_decode: Grouped-head
+            single-step GDR decode (XLA reference + TPU Pallas for head sharding);
+            ``gated_delta_rule_grouped_decode_op`` is a back-compat alias of the functional op.
         - RaggedGatedDeltaRule / ragged_gated_delta_rule: GDR for ragged sequences.
+        - RaggedGatedDeltaRuleV2 / ragged_gated_delta_rule_v2: Packed continuous-batch
+            GDN v2 (mixed prefill+decode); consumes a packed mixed-QKV buffer plus
+            per-token gates and a recurrent state pool, returns the updated state pool
+            and packed output.  ``ragged_gated_delta_rule_decode_only`` and
+            ``ragged_gated_delta_rule_mixed_prefill`` are the specialised TPU Pallas
+            entry points; ``ragged_gated_delta_rule_v2_op`` is a back-compat alias
+            of the functional op.
+
+    GDN / Conv-State Inference Helpers:
+        - GDNComputeScheduleV2 / gdn_compute_schedule_v2: Build the GDN v2 schedule
+            table splitting a packed batch into decode work, regular prefill chunks,
+            and transition rows; ``compute_schedule_table_v2`` is the underlying
+            host/XLA reference builder.
+        - RaggedCausalConv1D / ragged_causal_conv1d: Short causal depthwise conv1d over
+            a packed token buffer with per-request rolling state
+            (``query_start_loc``/``state_indices``); ``ragged_causal_conv1d_head_sharded``
+            adds the feature-axis ``shard_map`` path and ``ragged_causal_conv1d_op``
+            is a back-compat alias of the functional op.
+        - FusedConvDecode / fused_conv_decode: Single-token conv-state shift + depthwise
+            convolution + activation for GDR/GDN decode; ``fused_conv_decode_op`` is a
+            back-compat alias of the functional op.
 
     Linear Recurrent Models:
         - RWKV4 / rwkv4: WKV recurrence with fixed time-decay.
@@ -82,6 +106,16 @@ Available Operations:
         - ReduceScatterMatmul / reduce_scatter_matmul: Fused matmul + reduce-scatter.
         - QuantizedMatmul / quantized_matmul: Packed uint32 symmetric quantized matmul.
 
+    Fused Training Losses:
+        - FusedCrossEntropy / fused_cross_entropy: Per-row cross-entropy fused with its
+            analytic gradient, never materialising the ``[..., V]`` softmax in HBM;
+            supports label smoothing, z-loss, and dense soft targets, with optional
+            ``jax.shard_map`` vocab-parallel reduction.  Returns a ``CrossEntropyOutput``.
+        - FusedKLDivergence / fused_kl_divergence: Per-row forward KL
+            ``KL(softmax(teacher) || softmax(student))`` fused with the analytic student
+            gradient (teacher detached); same HBM-free + vocab-parallel behaviour.
+            Returns a ``KLDivergenceOutput``.
+
     Miscellaneous:
         - MeanPooling / mean_pooling: Sequence mean pooling.
 
@@ -89,6 +123,17 @@ Configuration classes (imported from ``configs``):
     Each operation has a corresponding ``*Config`` dataclass documented in
     ``ejkernel.modules.operations.configs``.  All configs inherit ``platform``
     and ``backend`` from ``BaseOperationConfig``.
+
+GDN Tile-Policy Controls:
+    Re-exported from the TPU ragged GDN v2 backend for tuning the packed-token
+    block size used by ``ragged_gated_delta_rule_v2``:
+
+    - ``KernelTilePolicy``: literal type alias of valid policy names.
+    - ``KERNEL_TILE_POLICIES``: frozenset of valid policy strings
+      (``"auto"``, ``"b16"``, ``"b8"``, ``"b4"``, ``"b2"``, ``"b1"``).
+    - ``normalize_kernel_tile_policy``: validate/lower-case a policy string
+      (``None`` -> ``"auto"``); raises ``ValueError`` on an unknown value.
+    - ``set_gdn_kernel_tile_policy``: install the active global tile policy.
 
 Aliases:
     ``gdr_attention`` is an alias for ``gated_delta_rule`` (module-level
@@ -132,9 +177,12 @@ from .configs import (
     DeepSeekAttentionConfig,
     FlashAttentionConfig,
     FlashMLAConfig,
+    FusedConvDecodeConfig,
     FusedCrossEntropyConfig,
     FusedKLDivergenceConfig,
     GatedDeltaRuleConfig,
+    GatedDeltaRuleGroupedDecodeConfig,
+    GDNComputeScheduleV2Config,
     GLAttentionConfig,
     GroupedMatmulConfig,
     KernelDeltaAttentionConfig,
@@ -146,8 +194,10 @@ from .configs import (
     PageAttentionConfig,
     PrefillPageAttentionConfig,
     QuantizedMatmulConfig,
+    RaggedCausalConv1DConfig,
     RaggedDecodeAttentionConfig,
     RaggedGatedDeltaRuleConfig,
+    RaggedGatedDeltaRuleV2Config,
     RaggedPageAttentionv2Config,
     RaggedPageAttentionv2TurboQuantConfig,
     RaggedPageAttentionv3Config,
@@ -167,10 +217,17 @@ from .configs import (
 from .decode_attention import DecodeAttention, decode_attention
 from .deepseek_attn import DeepSeekAttention, deepseek_attn
 from .flash_attention import FlashAttention, flash_attention
+from .fused_conv_decode import FusedConvDecode, fused_conv_decode, fused_conv_decode_op
 from .fused_cross_entropy import CrossEntropyOutput, FusedCrossEntropy, fused_cross_entropy
 from .fused_kl_divergence import FusedKLDivergence, KLDivergenceOutput, fused_kl_divergence
 from .gated_delta_rule import GatedDeltaRule, gated_delta_rule
+from .gated_delta_rule_grouped_decode import (
+    GatedDeltaRuleGroupedDecode,
+    gated_delta_rule_grouped_decode,
+    gated_delta_rule_grouped_decode_op,
+)
 from .gated_linear_attention import GLAttention, gla_attention
+from .gdn_compute_schedule_v2 import GDNComputeScheduleV2, compute_schedule_table_v2, gdn_compute_schedule_v2
 from .grouped_matmul import GroupedMatmul, grouped_matmul
 from .kernel_delta_attention import KernelDeltaAttention, kda_attention, kernel_delta_attention
 from .lightning_attention import LightningAttention, lightning_attention
@@ -188,8 +245,25 @@ from .page_attention import PageAttention, page_attention
 from .pooling import MeanPooling, mean_pooling
 from .prefill_page_attention import PrefillPageAttention, prefill_page_attention
 from .quantized_matmul import QuantizedMatmul, quantized_matmul
+from .ragged_causal_conv1d import (
+    RaggedCausalConv1D,
+    ragged_causal_conv1d,
+    ragged_causal_conv1d_head_sharded,
+    ragged_causal_conv1d_op,
+)
 from .ragged_decode_attention import RaggedDecodeAttention, ragged_decode_attention
 from .ragged_gated_delta_rule import RaggedGatedDeltaRule, ragged_gated_delta_rule
+from .ragged_gated_delta_rule_v2 import (
+    KERNEL_TILE_POLICIES,
+    KernelTilePolicy,
+    RaggedGatedDeltaRuleV2,
+    normalize_kernel_tile_policy,
+    ragged_gated_delta_rule_decode_only,
+    ragged_gated_delta_rule_mixed_prefill,
+    ragged_gated_delta_rule_v2,
+    ragged_gated_delta_rule_v2_op,
+    set_gdn_kernel_tile_policy,
+)
 from .ragged_page_attention_v2 import RaggedPageAttentionv2, ragged_page_attention_v2
 from .ragged_page_attention_v2_turboquant import (
     RaggedPageAttentionv2TurboQuant,
@@ -214,6 +288,7 @@ from .unified_attention import UnifiedAttention, unified_attention
 gdr_attention = gated_delta_rule
 
 __all__ = (
+    "KERNEL_TILE_POLICIES",
     "RWKV4",
     "RWKV6",
     "RWKV7",
@@ -234,19 +309,26 @@ __all__ = (
     "FlashAttentionConfig",
     "FlashMLA",
     "FlashMLAConfig",
+    "FusedConvDecode",
+    "FusedConvDecodeConfig",
     "FusedCrossEntropy",
     "FusedCrossEntropyConfig",
     "FusedKLDivergence",
     "FusedKLDivergenceConfig",
+    "GDNComputeScheduleV2",
+    "GDNComputeScheduleV2Config",
     "GLAttention",
     "GLAttentionConfig",
     "GatedDeltaRule",
     "GatedDeltaRuleConfig",
+    "GatedDeltaRuleGroupedDecode",
+    "GatedDeltaRuleGroupedDecodeConfig",
     "GroupedMatmul",
     "GroupedMatmulConfig",
     "KLDivergenceOutput",
     "KernelDeltaAttention",
     "KernelDeltaAttentionConfig",
+    "KernelTilePolicy",
     "LightningAttention",
     "LightningAttentionConfig",
     "MeanPooling",
@@ -268,10 +350,14 @@ __all__ = (
     "RWKV7Config",
     "RWKV7Mul",
     "RWKV7MulConfig",
+    "RaggedCausalConv1D",
+    "RaggedCausalConv1DConfig",
     "RaggedDecodeAttention",
     "RaggedDecodeAttentionConfig",
     "RaggedGatedDeltaRule",
     "RaggedGatedDeltaRuleConfig",
+    "RaggedGatedDeltaRuleV2",
+    "RaggedGatedDeltaRuleV2Config",
     "RaggedPageAttentionv2",
     "RaggedPageAttentionv2Config",
     "RaggedPageAttentionv2TurboQuant",
@@ -298,13 +384,19 @@ __all__ = (
     "attention",
     "blocksparse_attention",
     "chunked_prefill_paged_decode",
+    "compute_schedule_table_v2",
     "decode_attention",
     "deepseek_attn",
     "flash_attention",
     "flash_mla",
+    "fused_conv_decode",
+    "fused_conv_decode_op",
     "fused_cross_entropy",
     "fused_kl_divergence",
     "gated_delta_rule",
+    "gated_delta_rule_grouped_decode",
+    "gated_delta_rule_grouped_decode_op",
+    "gdn_compute_schedule_v2",
     "gdr_attention",
     "gla_attention",
     "grouped_matmul",
@@ -315,11 +407,19 @@ __all__ = (
     "multi_latent_ragged_page_attention",
     "multi_latent_ragged_page_attention_v2",
     "native_sparse_attention",
+    "normalize_kernel_tile_policy",
     "page_attention",
     "prefill_page_attention",
     "quantized_matmul",
+    "ragged_causal_conv1d",
+    "ragged_causal_conv1d_head_sharded",
+    "ragged_causal_conv1d_op",
     "ragged_decode_attention",
     "ragged_gated_delta_rule",
+    "ragged_gated_delta_rule_decode_only",
+    "ragged_gated_delta_rule_mixed_prefill",
+    "ragged_gated_delta_rule_v2",
+    "ragged_gated_delta_rule_v2_op",
     "ragged_page_attention_v2",
     "ragged_page_attention_v2_turboquant",
     "ragged_page_attention_v3",
@@ -332,6 +432,7 @@ __all__ = (
     "rwkv7",
     "rwkv7_mul",
     "scaled_dot_product_attention",
+    "set_gdn_kernel_tile_policy",
     "state_space_v1",
     "state_space_v2",
     "unified_attention",

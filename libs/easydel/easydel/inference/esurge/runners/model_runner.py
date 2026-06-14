@@ -71,6 +71,7 @@ import jax
 import numpy as np
 import spectrax as spx
 from eformer.loggings import get_logger
+from ejkernel.modules.operations import set_gdn_kernel_tile_policy
 from jax import numpy as jnp
 from jax.experimental import multihost_utils
 
@@ -81,7 +82,6 @@ from easydel.inference.esurge.config import (
 from easydel.inference.speculative import DrafterProtocol, accept_or_reject, resample_rejected
 from easydel.infra.sharding import replicated_named_sharding
 from easydel.layers.quantization import TurboQuantConfig
-from easydel.operations.kernels.inference_gdn import set_gdn_kernel_tile_policy
 
 from ..core.binary_search import apply_topk_mask, apply_topp_mask
 from ..core.dp_sharding import dp_shard_for_page_id, dp_shard_page_bounds, pages_per_dp_shard
@@ -587,6 +587,17 @@ class eSurgeRunner:
         return int(getattr(self.metadata, "data_parallel_size", 1) or 1) > 1
 
     def _recurrent_rows_per_dp_rank(self) -> int:
+        """Return the number of recurrent-state rows owned by each DP rank.
+
+        Splits the runner's ``max_num_reqs`` recurrent slots evenly across the
+        data-parallel cache axis so each rank gets a contiguous block of rows.
+
+        Returns:
+            ``max_num_reqs // data_parallel_size`` as an int.
+
+        Raises:
+            ValueError: If ``max_num_reqs`` is not divisible by the DP size.
+        """
         dp_size = max(1, int(getattr(self.metadata, "data_parallel_size", 1) or 1))
         if int(self.max_num_reqs) % dp_size != 0:
             raise ValueError(
@@ -609,7 +620,27 @@ class eSurgeRunner:
         ]
 
     def _assign_recurrent_slot(self, req_id: str, dp_rank: int | None) -> int | None:
-        """Assign or return the stable physical recurrent-state slot for a request."""
+        """Assign or return the stable physical recurrent-state slot for a request.
+
+        Under rank-major SPMD DP, each request must keep a fixed recurrent-state
+        row within its DP rank's contiguous slot block. If the request already
+        owns a slot, that slot is returned unchanged; otherwise a free slot in
+        the target rank is allocated and recorded.
+
+        Args:
+            req_id: Request identifier to assign a slot for.
+            dp_rank: Target DP rank for the request, or ``None`` to default to
+                rank ``0``.
+
+        Returns:
+            The physical recurrent-state slot index, or ``None`` when the runner
+            is not using SPMD DP (no per-rank slot pools exist).
+
+        Raises:
+            RuntimeError: If an existing slot's inferred rank disagrees with the
+                provided ``dp_rank``, if ``dp_rank`` is out of range, or if no
+                free slot remains in the target rank.
+        """
         if not self._uses_spmd_dp():
             return None
         existing = self._recurrent_slot_by_req.get(req_id)
@@ -636,7 +667,20 @@ class eSurgeRunner:
         return slot
 
     def _release_recurrent_slot(self, req_id: str, *, forget_rank: bool) -> int | None:
-        """Release a request's physical recurrent-state slot and return it for clearing."""
+        """Release a request's physical recurrent-state slot and return it for clearing.
+
+        Pops the request's slot mapping and, under SPMD DP, returns the slot to
+        its owning rank's free list (kept sorted). The returned slot index lets
+        the caller schedule a state clear for the freed row.
+
+        Args:
+            req_id: Request identifier whose slot should be released.
+            forget_rank: When True, also drop the request's recorded DP rank
+                (used for finished requests; preemptions keep the rank).
+
+        Returns:
+            The released slot index, or ``None`` when the request held no slot.
+        """
         slot = self._recurrent_slot_by_req.pop(req_id, None)
         if forget_rank:
             self._request_dp_rank_by_req.pop(req_id, None)
@@ -2689,7 +2733,26 @@ class eSurgeRunner:
         top_k: jax.Array,
         min_p: jax.Array,
     ) -> jax.Array:
-        """Apply the runner's supported sampling filters before log-softmax."""
+        """Apply the runner's supported sampling filters before log-softmax.
+
+        Conditionally applies top-k masking, top-p (nucleus) masking, temperature
+        scaling, and min-p masking using ``jax.lax.cond`` so the function stays
+        jit-traceable with scalar gate values. Filters that are at their no-op
+        value (``top_k <= 0``, ``top_p >= 1``, ``temperature <= 0``,
+        ``min_p <= 0``) are skipped.
+
+        Args:
+            logits_or_log_probs: Logits (or log probabilities) with shape
+                ``[..., vocab_size]``; cast to float32 internally.
+            temperature: Scalar device array temperature divisor.
+            top_p: Scalar device array nucleus probability threshold.
+            top_k: Scalar device array top-k count.
+            min_p: Scalar device array min-p relative threshold.
+
+        Returns:
+            Filtered logits (float32) with masked entries set to a large
+            negative value, ready for ``log_softmax``.
+        """
         logits = logits_or_log_probs.astype(jnp.float32)
         min_val = -1e10
 
@@ -2753,7 +2816,21 @@ class eSurgeRunner:
         logits_or_log_probs: jax.Array,
         req_state: CachedRequestState,
     ) -> tuple[jax.Array, jax.Array]:
-        """Return sampled token IDs and filtered log-probs using one cached JIT."""
+        """Return sampled token IDs and filtered log-probs using one cached JIT.
+
+        Looks up (or compiles and caches, keyed by shape+dtype) a jitted filter +
+        categorical sampler, then runs it with the request's sampling scalars and
+        a freshly split RNG key.
+
+        Args:
+            logits_or_log_probs: Per-row logits (or log probabilities) with shape
+                ``[..., vocab_size]``.
+            req_state: Request state providing the sampling parameters.
+
+        Returns:
+            Tuple ``(token_ids, log_probs)`` where ``token_ids`` are the sampled
+            int32 ids and ``log_probs`` are the filtered log-softmax values.
+        """
         key = (tuple(logits_or_log_probs.shape), str(logits_or_log_probs.dtype))
         fn = self._spec_filter_sample_fns.get(key)
         if fn is None:
@@ -2793,7 +2870,26 @@ class eSurgeRunner:
         draft_tokens: list[int],
         req_state: CachedRequestState,
     ) -> tuple[int, int]:
-        """Compiled rejection sampler for one non-greedy spec window."""
+        """Compiled rejection sampler for one non-greedy spec window.
+
+        Looks up (or compiles and caches by shape) a jitted speculative
+        rejection sampler that verifies each draft token against the target
+        distribution, drawing a residual-distribution replacement on the first
+        rejection and a bonus token if all drafts are accepted.
+
+        Args:
+            target_logits: Target-model logits for the draft + bonus positions,
+                shape ``[num_drafts + 1, vocab_size]``.
+            draft_log_probs: Draft-model log probabilities for the draft
+                positions, shape ``[num_drafts, vocab_size]``.
+            draft_tokens: The drafted token ids being verified.
+            req_state: Request state providing the sampling parameters.
+
+        Returns:
+            Tuple ``(accepted, corrected)`` where ``accepted`` is the number of
+            leading accepted draft tokens and ``corrected`` is the replacement
+            or bonus token id (both Python ints).
+        """
         draft_token_arr = jnp.asarray(draft_tokens, dtype=jnp.int32)
         key = (
             tuple(target_logits.shape),
@@ -2897,6 +2993,23 @@ class eSurgeRunner:
         followed by ``N`` drafts, target rows are the local rows for
         ``start + real_count - 1 + i`` and draft tokens are read from the
         materialized input buffer at ``start + real_count + i``.
+
+        Args:
+            request_id: Identifier of the request being verified.
+            row_pos: Window-local row index of the request.
+            req_idx: Sequence-buffer row index of the request.
+            start_pos: Absolute sequence position of the first scheduled token.
+            real_count: Number of confirmed real tokens before the drafts.
+            scheduled_draft_tokens: Draft token ids the scheduler provided.
+            token_ids_window_cpu: CPU token buffer for the active window, indexed
+                by ``row_pos`` to recover the materialized draft tokens.
+            token_offset: Flattened token offset of this row within the window
+                (start of its hidden/logit rows).
+
+        Returns:
+            A :class:`_SpecVerifyMetadata` capturing the target/bonus local
+            indices, draft token positions, and both the scheduled and the
+            buffer-materialized draft tokens.
         """
         num_drafts = len(scheduled_draft_tokens)
         target_start = int(token_offset) + int(real_count) - 1
@@ -2935,7 +3048,24 @@ class eSurgeRunner:
         greedy: bool,
         source: str,
     ) -> None:
-        """Record a small host trace for speculative acceptance diagnosis."""
+        """Record a small host trace for speculative acceptance diagnosis.
+
+        No-op unless ``spec_decode_debug_max_traces`` is positive and the trace
+        budget is not yet exhausted. Builds a per-draft diagnostic record
+        (scheduler-vs-buffer token match, target argmax, and the draft token's
+        rank under the target distribution) and appends it to
+        ``spec_decode_debug_traces`` while logging it at WARNING.
+
+        Args:
+            meta: Verification metadata describing the window's draft tokens.
+            logits_rows: Per-draft target logits (jax/numpy) used to compute
+                argmax/rank diagnostics, or ``None`` to skip those fields.
+            accepted: Number of accepted draft tokens for this window.
+            corrected_token: Replacement or bonus token id chosen by verify.
+            greedy: Whether the request used the greedy spec path.
+            source: Tag identifying the verify code path (e.g. ``"full-hidden"``
+                or ``"replay"``).
+        """
         if self.spec_decode_debug_max_traces <= 0:
             return
         if len(self.spec_decode_debug_traces) >= self.spec_decode_debug_max_traces:
@@ -3065,7 +3195,16 @@ class eSurgeRunner:
         return lm_head_fn(graphstate_arg, graphother_arg, hidden_rows)
 
     def _spec_cache_group_index_for_layer(self, layer_idx: int) -> int | None:
-        """Resolve the eSurge page-table group that owns a target layer's K/V."""
+        """Resolve the eSurge page-table group that owns a target layer's K/V.
+
+        Args:
+            layer_idx: Zero-based transformer layer index to look up.
+
+        Returns:
+            The cache-group index whose ``layer_names`` contains
+            ``"layer.{layer_idx}"`` (or ``0`` when there are no groups / a single
+            unnamed group), or ``None`` when no group claims the layer.
+        """
         if not self.kv_cache_groups:
             return 0
         target = f"layer.{int(layer_idx)}"
@@ -3134,7 +3273,26 @@ class eSurgeRunner:
         req_id: str,
         seed_position: int,
     ) -> tuple[list[tuple[jax.Array, jax.Array] | None], jax.Array] | None:
-        """Build target K/V pairs + static attention mask for Gemma4 assistant."""
+        """Build target K/V pairs + static attention mask for an assistant drafter.
+
+        Used by drafters that cross-attend to the target model's cache (e.g. the
+        Gemma4 assistant). Maps each drafter layer to a target layer, gathers
+        that layer's K/V (either directly from the view or by paging in from
+        ragged storage), and builds a causal-style mask covering positions up to
+        ``seed_position``.
+
+        Args:
+            req_id: Request identifier whose target K/V cache should be read.
+            seed_position: Absolute position of the spec window's seed token,
+                used to bound the visible context length.
+
+        Returns:
+            Tuple ``(pairs, attention_mask)`` where ``pairs`` is one
+            ``(keys, values)`` tuple (or ``None``) per drafter layer and
+            ``attention_mask`` is a ``[1, 1, 1, kv_len]`` additive float mask, or
+            ``None`` when the drafter does not require a target K/V cache, the
+            request is unknown, the cache has no views, or no layer yielded K/V.
+        """
         if self.drafter is None or not bool(getattr(self.drafter, "requires_target_kv_cache", False)):
             return None
 
@@ -3318,6 +3476,11 @@ class eSurgeRunner:
         This small gate is intentionally drafter-only: after a full rejection,
         skip a configurable number of future drafter calls and let normal
         eSurge decode advance the sequence.
+
+        Args:
+            req_id: Request identifier the verify window belonged to.
+            accepted: Number of draft tokens accepted this window.
+            num_drafts: Number of draft tokens that were verified.
         """
         if self.spec_decode_reject_backoff_steps <= 0 or num_drafts <= 0:
             return
@@ -3385,7 +3548,25 @@ class eSurgeRunner:
         return self._recurrent_candidate_count() <= 0
 
     def _commit_speculative_recurrent_candidate_state(self, row_pos: int, prefix_len: int) -> bool:
-        """Copy a speculative recurrent candidate row into the live row."""
+        """Copy a speculative recurrent candidate row into the live recurrent row.
+
+        Hybrid recurrent caches keep extra candidate rows holding the per-step
+        prefix states produced during a fused speculative window. After
+        verification settles on an accepted ``prefix_len``, this copies the
+        matching candidate row (conv and recurrent state) into the request's
+        live row via a cached JIT so the next decode step continues from the
+        same state as non-speculative generation.
+
+        Args:
+            row_pos: Live recurrent row index of the request.
+            prefix_len: Number of accepted prefix tokens (1-based selector into
+                the candidate rows); must be in ``[1, candidate_count]``.
+
+        Returns:
+            ``True`` if the commit was performed; ``False`` when there are no
+            candidate rows, ``prefix_len`` is out of range, the cache is not a
+            ``HybridCache``, or ``row_pos`` is out of bounds.
+        """
         candidate_count = self._recurrent_candidate_count()
         if candidate_count <= 0 or prefix_len <= 0 or prefix_len > candidate_count:
             return False
@@ -3474,6 +3655,19 @@ class eSurgeRunner:
         single-step prefix states; commit one after every verify window, not
         only on rejection, so the next decode step starts from the same state
         as non-speculative generation.
+
+        Args:
+            req_id: Request identifier the commit applies to.
+            row_pos: Live recurrent row index of the request.
+            prefix_len: Number of accepted prefix tokens (1-based candidate-row
+                selector); must be in ``[1, candidate_count]``.
+            defer: When True, queue the commit (applied inside the next compiled
+                step via ``spec_recurrent_commit_cpu``); when False, commit
+                immediately on the host.
+
+        Returns:
+            ``True`` if the commit was queued or performed; ``False`` when there
+            are no candidate rows or ``prefix_len`` is out of range.
         """
         candidate_count = self._recurrent_candidate_count()
         prefix_len = int(prefix_len)

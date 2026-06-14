@@ -43,21 +43,23 @@ References:
     - Qwen3Next: https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_next/
 """
 
+from collections.abc import Callable
+
 import jax
 import jax.numpy as jnp
 from eformer.pytree import auto_pytree
-from ejkernel.kernels._pallas.tpu.ragged_gated_delta_rule._interface import _decode_path
-from ejkernel.kernels._xla.ragged_gated_delta_rule._xla_impl_fwd import _ragged_gdr_chunked_prefill
 from ejkernel.modules import gated_delta_rule, ragged_gated_delta_rule
+from ejkernel.modules.operations import (
+    fused_conv_decode as _ejkernel_fused_conv_decode,
+)
+from ejkernel.modules.operations import (
+    gated_delta_rule_grouped_decode as _ejkernel_gated_delta_rule_grouped_decode,
+)
 from ejkernel.modules.operations.configs import GatedDeltaRuleConfig
-from jax.experimental import pallas as pl
-from jax.experimental.pallas import tpu as pltpu
-from jax.sharding import PartitionSpec
 from jaxtyping import Array, Float
 from spectrax import with_sharding_constraint
 
 from easydel.caching import RecurrentCacheView
-from easydel.layers.linear_attention._conv_state import apply_manual_depthwise_conv, shift_conv_state_left
 from easydel.utils import is_inference_mode
 from easydel.utils.helpers import check_bool_flag
 
@@ -70,126 +72,6 @@ from ..requirements import (
     OperationRequirements,
     RequirementsBuilder,
 )
-
-
-def _gdr_grouped_decode_kernel(
-    query_ref,
-    key_ref,
-    value_ref,
-    beta_ref,
-    decay_ref,
-    state_ref,
-    output_ref,
-    state_out_ref,
-):
-    """Pallas kernel body for a single grouped GDR (Gated Delta Rule) decode step.
-
-    This kernel runs on TPU inside a ``pallas_call`` with grid ``(batch,)``.
-    Each program instance processes one batch element entirely in VMEM,
-    iterating over all ``num_k_heads`` key heads and, for each key head,
-    over its ``expand_ratio`` value-head groups. For every (key-head,
-    value-group) pair the kernel:
-
-    1. Applies exponential decay to the recurrent state:
-       ``s = s * exp(decay)``.
-    2. Retrieves the key-value memory via contraction with the key:
-       ``kv_mem = sum(k[:, None] * s, axis=0)``.
-    3. Computes the gated delta update:
-       ``delta = (v - kv_mem) * beta``; ``s = s + k[:, None] * delta[None, :]``.
-    4. Produces the output by contracting the updated state with the query:
-       ``out = sum(q[:, None] * s, axis=0)``.
-
-    The query is pre-scaled by ``head_dim ** -0.5`` inside the kernel.
-
-    All arithmetic is performed in the recurrent-state/runtime dtype so the
-    grouped decode path matches the dtype policy of the standard GDR kernels.
-
-    Args:
-        query_ref: Query tensor ref, shape ``[1, num_k_heads, head_dim]``.
-        key_ref: Key tensor ref, shape ``[1, num_k_heads, head_dim]``.
-        value_ref: Value tensor ref, shape ``[1, num_k_heads, expand_ratio, value_dim]``.
-        beta_ref: Gating coefficient ref, shape ``[1, num_k_heads, expand_ratio]``.
-        decay_ref: Log-space decay ref, shape ``[1, num_k_heads, expand_ratio]``.
-        state_ref: Input recurrent state ref,
-            shape ``[1, num_v_heads, head_dim, value_dim]``.
-        output_ref: Output tensor ref, shape ``[1, num_v_heads, value_dim]``.
-        state_out_ref: Updated recurrent state ref,
-            shape ``[1, num_v_heads, head_dim, value_dim]``.
-    """
-    num_k_heads = query_ref.shape[1]
-    head_dim = query_ref.shape[2]
-    expand_ratio = value_ref.shape[2]
-    compute_dtype = state_ref.dtype
-    scale = jnp.asarray(head_dim**-0.5, dtype=compute_dtype)
-
-    for kh in range(num_k_heads):
-        q = query_ref[0, kh, :].astype(compute_dtype) * scale  # [head_dim]
-        k = key_ref[0, kh, :].astype(compute_dtype)  # [head_dim]
-
-        vh_start = kh * expand_ratio
-        # Load all expand_ratio value heads for this key head at once.
-        s_all = state_ref[0, vh_start : vh_start + expand_ratio, :, :].astype(compute_dtype)
-        d_all = decay_ref[0, kh, :].astype(jnp.float32)
-        beta_all = beta_ref[0, kh, :].astype(jnp.float32)
-        v_all = value_ref[0, kh, :, :].astype(compute_dtype)
-
-        # Decay, kv_mem contraction, delta update, output contraction.
-        s_all = s_all * jnp.exp(d_all)[:, None, None].astype(compute_dtype)
-        kv_mem_all = jnp.sum(k[None, :, None] * s_all, axis=1)
-        delta_all = (v_all - kv_mem_all) * beta_all[:, None].astype(compute_dtype)
-        s_all = s_all + k[None, :, None] * delta_all[:, None, :]
-        out_all = jnp.sum(q[None, :, None] * s_all, axis=1)
-
-        state_out_ref[0, vh_start : vh_start + expand_ratio, :, :] = s_all.astype(state_out_ref.dtype)
-        output_ref[0, vh_start : vh_start + expand_ratio, :] = out_all.astype(output_ref.dtype)
-
-
-def _fused_conv_decode_kernel(
-    conv_state_ref,
-    new_tokens_ref,
-    kernel_ref,
-    updated_state_ref,
-    conv_output_ref,
-):
-    """Pallas kernel that fuses conv-state shift, depthwise convolution, and SiLU activation.
-
-    This kernel is designed for TPU execution inside a ``pallas_call`` with
-    grid ``(conv_dim_tiles,)``. It tiles over the ``conv_dim`` axis (in chunks
-    determined by the caller's ``CONV_TILE`` parameter), processing all slots
-    within each tile. This tiling strategy avoids the TPU block-alignment
-    constraint that arises when tiling over ``num_slots`` (which may not be
-    divisible by 8).
-
-    For each tile the kernel performs three fused operations:
-
-    1. **Shift**: Drops the oldest token from the conv state and appends the
-       new token: ``new_state = concat(state[:, :, 1:], token[:, :, None], axis=2)``.
-    2. **Depthwise conv**: Computes the dot product of the updated state with
-       the per-channel kernel: ``conv_out = sum(new_state * kernel, axis=-1)``.
-    3. **SiLU activation**: Applies the SiLU (Swish) non-linearity:
-       ``conv_out = conv_out * sigmoid(conv_out)``.
-
-    All computation is done in float32; results are cast to the output ref dtypes.
-
-    Args:
-        conv_state_ref: Current conv state ref, shape ``[num_slots, tile, d_conv]``.
-        new_tokens_ref: New token embeddings ref, shape ``[num_slots, tile]``.
-        kernel_ref: Depthwise conv kernel ref, shape ``[tile, d_conv]``.
-        updated_state_ref: Output updated conv state ref,
-            shape ``[num_slots, tile, d_conv]``.
-        conv_output_ref: Output conv result ref, shape ``[num_slots, tile]``.
-    """
-    _tile_idx = pl.program_id(0)
-    state = conv_state_ref[:, :, :].astype(jnp.float32)
-    token = new_tokens_ref[:, :].astype(jnp.float32)
-    kern = kernel_ref[:, :].astype(jnp.float32)
-
-    new_state = jnp.concatenate([state[:, :, 1:], token[:, :, None]], axis=2)
-    conv_out = jnp.sum(new_state * kern[None, :, :], axis=-1)
-    conv_out = conv_out * jax.nn.sigmoid(conv_out)
-
-    updated_state_ref[:, :, :] = new_state.astype(updated_state_ref.dtype)
-    conv_output_ref[:, :] = conv_out.astype(conv_output_ref.dtype)
 
 
 @auto_pytree
@@ -257,20 +139,11 @@ class GatedDeltaRuleOp(OperationImpl):
     ]:
         """Perform a single grouped GDR decode step with pre-reshaped inputs.
 
-        This is the production entry point for grouped decode. It accepts
-        tensors that have already been reshaped from the standard ``[batch, 1,
-        num_heads, dim]`` layout into the grouped layout where key/query heads
-        are separated from the value-head expansion factor.
-
-        The method currently dispatches to the pure-JAX implementation
-        (``grouped_gdr_decode_jax``), which XLA fuses effectively on all
-        backends. A separate ``grouped_gdr_decode_shard_map_pallas`` path is
-        available for TPU benchmarking via ``shard_map`` + Pallas but is not
-        used in production due to equivalent or worse latency.
+        This is the production entry point for grouped decode. It delegates to
+        the eJKernel ``gated_delta_rule_grouped_decode`` public operation.
 
         Args:
             query: Query tensor, shape ``[batch, num_k_heads, head_dim]``.
-                Already squeezed from the seq_len=1 dimension.
             key: Key tensor, shape ``[batch, num_k_heads, head_dim]``.
             value: Value tensor reshaped to group layout,
                 shape ``[batch, num_k_heads, expand_ratio, value_dim]``.
@@ -289,141 +162,15 @@ class GatedDeltaRuleOp(OperationImpl):
               shape ``[batch, num_v_heads, head_dim, value_dim]``.
         """
         runtime_dtype = self.metadata.runtime_dtype
-        return GatedDeltaRuleOp.grouped_gdr_decode_jax(
+        return _ejkernel_gated_delta_rule_grouped_decode(
             query.astype(runtime_dtype),
             key.astype(runtime_dtype),
             value.astype(runtime_dtype),
             beta.astype(runtime_dtype),
             decay.astype(runtime_dtype) if decay is not None else None,
             recurrent_state.astype(runtime_dtype),
+            platform="xla",
         )
-
-    def grouped_gdr_decode_shard_map_pallas(
-        self,
-        query: Float[Array, "batch num_k_heads head_dim"],
-        key: Float[Array, "batch num_k_heads head_dim"],
-        value: Float[Array, "batch num_k_heads expand_ratio value_dim"],
-        beta: Float[Array, "batch num_k_heads expand_ratio"],
-        decay: Float[Array, "batch num_k_heads expand_ratio"] | None,
-        recurrent_state: Float[Array, "batch num_v_heads head_dim value_dim"],
-    ) -> tuple[
-        Float[Array, "batch num_v_heads value_dim"],
-        Float[Array, "batch num_v_heads head_dim value_dim"],
-    ]:
-        """Reference TPU path that wraps the Pallas grouped decode kernel with ``shard_map``.
-
-        This method is intended for benchmarking and reference rather than
-        production use. It inspects the operation metadata to determine the
-        tensor-parallel (TP) axis from the mesh and sharding specifications.
-        If TP sharding is available (``tp_size > 1``), it invokes
-        ``grouped_gdr_decode_pallas`` under ``jax.shard_map`` so each device
-        shard runs the Pallas kernel independently on its local slice.
-
-        Falls back to ``grouped_gdr_decode_jax`` when any of the following
-        conditions hold:
-        - The backend is not TPU.
-        - ``decay`` is ``None`` (the Pallas kernel requires explicit decay).
-        - No mesh is configured in the operation metadata.
-        - TP size is 1 (no benefit from shard_map wrapping).
-        - The grouped decode tensors are not float32 (the reference Pallas
-          kernel currently only lowers reliably in float32).
-
-        Args:
-            query: Query tensor, shape ``[batch, num_k_heads, head_dim]``.
-            key: Key tensor, shape ``[batch, num_k_heads, head_dim]``.
-            value: Value tensor in group layout,
-                shape ``[batch, num_k_heads, expand_ratio, value_dim]``.
-            beta: Gating coefficients,
-                shape ``[batch, num_k_heads, expand_ratio]``.
-            decay: Log-space decay factors,
-                shape ``[batch, num_k_heads, expand_ratio]``. Must not be
-                ``None`` for the Pallas path to activate.
-            recurrent_state: Current recurrent state,
-                shape ``[batch, num_v_heads, head_dim, value_dim]``.
-
-        Returns:
-            A tuple of (output, new_state) with the same shapes as
-            ``grouped_gdr_decode``.
-        """
-        mesh = self.metadata.mesh
-        if (
-            jax.default_backend() != "tpu"
-            or decay is None
-            or mesh is None
-            or query.dtype != jnp.float32
-            or key.dtype != jnp.float32
-            or value.dtype != jnp.float32
-            or beta.dtype != jnp.float32
-            or recurrent_state.dtype != jnp.float32
-        ):
-            runtime_dtype = self.metadata.runtime_dtype
-            return GatedDeltaRuleOp.grouped_gdr_decode_jax(
-                query.astype(runtime_dtype),
-                key.astype(runtime_dtype),
-                value.astype(runtime_dtype),
-                beta.astype(runtime_dtype),
-                decay.astype(runtime_dtype) if decay is not None else None,
-                recurrent_state.astype(runtime_dtype),
-            )
-
-        mode = self.get_mode(query=jnp.expand_dims(query, 1), BTHD=True)
-        shardings_bthd = self.metadata.get_shardings(mode, layout="bthd")
-        tp_axis = shardings_bthd.query[2] if shardings_bthd.query is not None else None
-
-        tp_size = 1
-        if tp_axis is not None:
-            axes = (tp_axis,) if isinstance(tp_axis, str) else tp_axis
-            for ax in axes:
-                tp_size *= mesh.shape.get(ax, 1) if isinstance(mesh.shape, dict) else 1
-
-        if tp_size <= 1 or tp_axis is None:
-            runtime_dtype = self.metadata.runtime_dtype
-            return GatedDeltaRuleOp.grouped_gdr_decode_jax(
-                query.astype(runtime_dtype),
-                key.astype(runtime_dtype),
-                value.astype(runtime_dtype),
-                beta.astype(runtime_dtype),
-                decay.astype(runtime_dtype) if decay is not None else None,
-                recurrent_state.astype(runtime_dtype),
-            )
-
-        qk_spec = PartitionSpec(None, tp_axis, None)
-        v_spec = PartitionSpec(None, tp_axis, None, None)
-        bd_spec = PartitionSpec(None, tp_axis, None)
-        state_spec = PartitionSpec(None, tp_axis, None, None)
-        out_spec = PartitionSpec(None, tp_axis, None)
-
-        @jax.named_scope("grouped_gdr_decode_pallas")
-        def _run(q, k, v, b, d, s):
-            """Execute the Pallas-backed grouped GDR decode on a single shard.
-
-            This thin wrapper is used as the per-shard function for
-            ``jax.shard_map``, delegating to the static Pallas kernel
-            while keeping the named scope for profiling.
-
-            Args:
-                q: Query tensor shard.
-                k: Key tensor shard.
-                v: Value tensor shard.
-                b: Beta tensor shard.
-                d: Decay tensor shard.
-                s: Recurrent state tensor shard.
-
-            Returns:
-                A tuple of (output, new_state) produced by the Pallas
-                grouped GDR decode kernel.
-            """
-            return GatedDeltaRuleOp.grouped_gdr_decode_pallas(q, k, v, b, d, s)
-
-        output, new_state = jax.shard_map(
-            _run,
-            mesh=mesh,
-            in_specs=(qk_spec, qk_spec, v_spec, bd_spec, bd_spec, state_spec),
-            out_specs=(out_spec, state_spec),
-            check_vma=False,
-        )(query, key, value, beta, decay, recurrent_state)
-
-        return output, new_state
 
     @staticmethod
     def grouped_gdr_decode_jax(
@@ -439,28 +186,10 @@ class GatedDeltaRuleOp(OperationImpl):
     ]:
         """Pure JAX implementation of the grouped GDR decode step.
 
-        This is the default backend for ``grouped_gdr_decode`` and works on all
-        JAX platforms (CPU, GPU, TPU). It operates on pre-reshaped inputs where
-        the key/query head dimension is separated from the value-head expansion
-        factor.
-
-        Algorithm:
-            1. Scale the query by ``head_dim ** -0.5``.
-            2. Reshape the flat recurrent state into grouped layout:
-               ``[batch, num_k_heads, expand_ratio, head_dim, value_dim]``.
-            3. If decay is provided, apply exponential decay:
-               ``state *= exp(decay)``.
-            4. Compute the key-value memory by contracting the state with the
-               key along the ``head_dim`` axis.
-            5. Compute the gated delta: ``delta = (value - kv_mem) * beta``.
-            6. Update the state: ``state += key * delta`` (outer product).
-            7. Produce the output by contracting the updated state with the
-               query along the ``head_dim`` axis.
-            8. Reshape outputs back to the flat ``num_v_heads`` layout.
-
-        All internal computation is performed in the dtype of
-        ``recurrent_state`` so grouped decode tracks the runtime/cache dtype
-        used by the rest of the GDR implementation.
+        This static helper is retained for backward compatibility and
+        direct call sites that expect the grouped-head layout. It delegates
+        to the eJKernel XLA reference implementation, which matches the
+        original pure-JAX semantics exactly.
 
         Args:
             query: Query tensor, shape ``[batch, num_k_heads, head_dim]``.
@@ -479,123 +208,15 @@ class GatedDeltaRuleOp(OperationImpl):
             - output: shape ``[batch, num_v_heads, value_dim]``.
             - new_state: shape ``[batch, num_v_heads, head_dim, value_dim]``.
         """
-        batch, num_k_heads, head_dim = query.shape
-        expand_ratio = value.shape[2]
-
-        compute_dtype = recurrent_state.dtype
-        query = query.astype(compute_dtype)
-        key = key.astype(compute_dtype)
-
-        scale = jnp.asarray(head_dim**-0.5, dtype=compute_dtype)
-        query = query * scale
-
-        value_dim = value.shape[-1]
-        num_v_heads = num_k_heads * expand_ratio
-
-        # Reshape state to grouped 5D layout (free view, no copy).
-        # key/query stay at [batch, num_k_heads, head_dim] — no repeat needed.
-        gs = recurrent_state.astype(compute_dtype).reshape(batch, num_k_heads, expand_ratio, head_dim, value_dim)
-        value_c = value.astype(compute_dtype)
-        beta_c = beta.astype(compute_dtype)
-
-        # Decay: broadcast [batch, num_k_heads, expand_ratio] over [head_dim, value_dim].
-        if decay is not None:
-            gs = gs * jnp.exp(decay.astype(compute_dtype))[:, :, :, None, None]
-
-        # kv_mem: contract grouped_state with key over head_dim.
-        # einsum avoids materialising the broadcast product.
-        kv_mem = jnp.einsum("bkehv,bkh->bkev", gs, key)
-
-        # Gated delta update.
-        delta = (value_c - kv_mem) * beta_c[:, :, :, None]
-
-        # State update: rank-1 outer-product per (key-head, expand-group).
-        gs = gs + jnp.einsum("bkh,bkev->bkehv", key, delta)
-
-        # Output: contract updated state with query over head_dim.
-        output = jnp.einsum("bkehv,bkh->bkev", gs, query)
-
-        return (
-            output.reshape(batch, num_v_heads, value_dim).astype(recurrent_state.dtype),
-            gs.reshape(batch, num_v_heads, head_dim, value_dim).astype(recurrent_state.dtype),
+        return _ejkernel_gated_delta_rule_grouped_decode(
+            query,
+            key,
+            value,
+            beta,
+            decay,
+            recurrent_state,
+            platform="xla",
         )
-
-    @staticmethod
-    def grouped_gdr_decode_pallas(
-        query: Float[Array, "batch num_k_heads head_dim"],
-        key: Float[Array, "batch num_k_heads head_dim"],
-        value: Float[Array, "batch num_k_heads expand_ratio value_dim"],
-        beta: Float[Array, "batch num_k_heads expand_ratio"],
-        decay: Float[Array, "batch num_k_heads expand_ratio"],
-        recurrent_state: Float[Array, "batch num_v_heads head_dim value_dim"],
-    ) -> tuple[
-        Float[Array, "batch num_v_heads value_dim"],
-        Float[Array, "batch num_v_heads head_dim value_dim"],
-    ]:
-        """Pallas-accelerated grouped GDR decode step targeting TPU.
-
-        This static method wraps ``_gdr_grouped_decode_kernel`` in a
-        ``pallas_call`` with a ``(batch,)`` grid, where each program instance
-        handles one batch element. The entire grouped state update runs in
-        TPU VMEM, avoiding materialization of the 5D intermediate tensor
-        ``[batch, num_k_heads, expand_ratio, head_dim, value_dim]`` that the
-        JAX path requires.
-
-        For multi-device (tensor-parallel) execution, this method must be
-        wrapped in ``jax.shard_map`` so that each device processes its local
-        head shard. See ``grouped_gdr_decode_shard_map_pallas`` for an
-        example of such wrapping.
-
-        Note:
-            Unlike ``grouped_gdr_decode_jax``, this method requires ``decay``
-            to be non-None (the Pallas kernel always applies decay) and is
-            intended for float32 benchmarking inputs.
-
-        Args:
-            query: Query tensor, shape ``[batch, num_k_heads, head_dim]``.
-            key: Key tensor, shape ``[batch, num_k_heads, head_dim]``.
-            value: Value tensor in group layout,
-                shape ``[batch, num_k_heads, expand_ratio, value_dim]``.
-            beta: Gating coefficients,
-                shape ``[batch, num_k_heads, expand_ratio]``.
-            decay: Log-space decay factors (required),
-                shape ``[batch, num_k_heads, expand_ratio]``.
-            recurrent_state: Current recurrent state,
-                shape ``[batch, num_v_heads, head_dim, value_dim]``.
-
-        Returns:
-            A tuple of:
-            - output: shape ``[batch, num_v_heads, value_dim]``.
-            - new_state: shape ``[batch, num_v_heads, head_dim, value_dim]``.
-        """
-        batch, num_k_heads, head_dim = query.shape
-        expand_ratio = value.shape[2]
-        value_dim = value.shape[3]
-        num_v_heads = num_k_heads * expand_ratio
-
-        out_output = jax.ShapeDtypeStruct((batch, num_v_heads, value_dim), dtype=recurrent_state.dtype)
-        out_state = jax.ShapeDtypeStruct((batch, num_v_heads, head_dim, value_dim), dtype=recurrent_state.dtype)
-
-        output, new_state = pl.pallas_call(
-            _gdr_grouped_decode_kernel,
-            grid=(batch,),
-            in_specs=[
-                pl.BlockSpec((1, num_k_heads, head_dim), lambda b: (b, 0, 0)),
-                pl.BlockSpec((1, num_k_heads, head_dim), lambda b: (b, 0, 0)),
-                pl.BlockSpec((1, num_k_heads, expand_ratio, value_dim), lambda b: (b, 0, 0, 0)),
-                pl.BlockSpec((1, num_k_heads, expand_ratio), lambda b: (b, 0, 0)),
-                pl.BlockSpec((1, num_k_heads, expand_ratio), lambda b: (b, 0, 0)),
-                pl.BlockSpec((1, num_v_heads, head_dim, value_dim), lambda b: (b, 0, 0, 0)),
-            ],
-            out_specs=[
-                pl.BlockSpec((1, num_v_heads, value_dim), lambda b: (b, 0, 0)),
-                pl.BlockSpec((1, num_v_heads, head_dim, value_dim), lambda b: (b, 0, 0, 0)),
-            ],
-            out_shape=[out_output, out_state],
-            compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
-        )(query, key, value, beta, decay, recurrent_state)
-
-        return output, new_state
 
     @staticmethod
     def fused_conv_decode(
@@ -611,19 +232,8 @@ class GatedDeltaRuleOp(OperationImpl):
         """Fused conv-state shift, depthwise convolution, and SiLU activation.
 
         This is the production entry point for the fused convolution decode
-        step used during single-token generation. It performs three operations
-        in sequence:
-
-        1. **Shift**: Slides the conv state window left by one position,
-           discarding the oldest token and appending ``new_tokens`` at the end.
-        2. **Depthwise conv**: Applies a per-channel 1-D convolution of the
-           updated state against ``kernel`` to produce the conv output.
-        3. **SiLU**: Applies the SiLU (Swish) activation element-wise.
-
-        Dispatches to the pure-JAX implementation (``fused_conv_decode_jax``)
-        because XLA fuses the shift + conv + SiLU chain effectively, making
-        the Pallas variant (``fused_conv_decode_pallas``) slower in practice.
-        The Pallas variant is retained for reference and TPU microbenchmarking.
+        step used during single-token generation. It delegates to the eJKernel
+        ``fused_conv_decode`` public operation.
 
         Args:
             conv_state: Current conv state for each slot,
@@ -641,11 +251,12 @@ class GatedDeltaRuleOp(OperationImpl):
             - conv_output: The activated convolution result,
               shape ``[num_slots, conv_dim]``.
         """
-        return GatedDeltaRuleOp.fused_conv_decode_jax(
+        return _ejkernel_fused_conv_decode(
             conv_state,
             new_tokens,
             kernel,
             output_dtype=output_dtype,
+            platform="xla",
         )
 
     @staticmethod
@@ -655,21 +266,15 @@ class GatedDeltaRuleOp(OperationImpl):
         kernel: Float[Array, "conv_dim d_conv"],
         *,
         output_dtype: jnp.dtype,
-        activation: callable = jax.nn.silu,
+        activation: Callable[[jax.Array], jax.Array] | None = jax.nn.silu,
     ) -> tuple[
         Float[Array, "num_slots conv_dim d_conv"],
         Float[Array, "num_slots conv_dim"],
     ]:
         """Pure JAX implementation of fused conv-state shift, depthwise conv, and activation.
 
-        Performs the same three-step operation as ``fused_conv_decode`` using
-        standard JAX primitives, allowing XLA to fuse and optimize the
-        computation graph on any backend.
-
-        The shift is performed by ``shift_conv_state_left`` which concatenates
-        the state's trailing ``d_conv - 1`` columns with the new token column.
-        The depthwise conv and activation are handled by
-        ``apply_manual_depthwise_conv``.
+        This static helper is retained for backward compatibility. It delegates
+        to the eJKernel XLA reference implementation.
 
         Args:
             conv_state: Current conv state, shape ``[num_slots, conv_dim, d_conv]``.
@@ -686,78 +291,14 @@ class GatedDeltaRuleOp(OperationImpl):
             - conv_output: Activated convolution output,
               shape ``[num_slots, conv_dim]``.
         """
-        updated_state = shift_conv_state_left(conv_state, new_tokens)
-        conv_output = apply_manual_depthwise_conv(
-            updated_state,
+        return _ejkernel_fused_conv_decode(
+            conv_state,
+            new_tokens,
             kernel,
             output_dtype=output_dtype,
             activation=activation,
+            platform="xla",
         )
-        return updated_state, conv_output
-
-    @staticmethod
-    def fused_conv_decode_pallas(
-        conv_state: Float[Array, "num_slots conv_dim d_conv"],
-        new_tokens: Float[Array, "num_slots conv_dim"],
-        kernel: Float[Array, "conv_dim d_conv"],
-        *,
-        output_dtype: jnp.dtype,
-    ) -> tuple[
-        Float[Array, "num_slots conv_dim d_conv"],
-        Float[Array, "num_slots conv_dim"],
-    ]:
-        """Pallas-accelerated fused conv-state update targeting TPU.
-
-        This static method wraps ``_fused_conv_decode_kernel`` in a
-        ``pallas_call`` that tiles over the ``conv_dim`` axis in chunks of
-        ``CONV_TILE`` (default 128, must divide ``conv_dim``). All slots are
-        processed within each tile, which satisfies TPU block-alignment
-        constraints (the slot axis is not tiled, avoiding issues when
-        ``num_slots`` is not divisible by 8).
-
-        In practice, XLA's fusion of the JAX-based implementation
-        (``fused_conv_decode_jax``) matches or exceeds this kernel's
-        performance, so this variant is kept for reference and
-        microbenchmarking rather than production use.
-
-        Args:
-            conv_state: Current conv state, shape ``[num_slots, conv_dim, d_conv]``.
-            new_tokens: New token embeddings, shape ``[num_slots, conv_dim]``.
-            kernel: Depthwise conv kernel, shape ``[conv_dim, d_conv]``.
-            output_dtype: Desired dtype for the convolution output.
-
-        Returns:
-            A tuple of:
-            - updated_state: Shifted conv state,
-              shape ``[num_slots, conv_dim, d_conv]``.
-            - conv_output: Activated convolution output,
-              shape ``[num_slots, conv_dim]``.
-        """
-        num_slots, conv_dim, d_conv = conv_state.shape
-        CONV_TILE = min(conv_dim, 128)
-        assert conv_dim % CONV_TILE == 0, f"conv_dim={conv_dim} not divisible by {CONV_TILE}"
-        num_tiles = conv_dim // CONV_TILE
-
-        out_state_shape = jax.ShapeDtypeStruct((num_slots, conv_dim, d_conv), dtype=conv_state.dtype)
-        out_conv_shape = jax.ShapeDtypeStruct((num_slots, conv_dim), dtype=output_dtype)
-
-        updated_state, conv_output = pl.pallas_call(
-            _fused_conv_decode_kernel,
-            grid=(num_tiles,),
-            in_specs=[
-                pl.BlockSpec((num_slots, CONV_TILE, d_conv), lambda t: (0, t, 0)),
-                pl.BlockSpec((num_slots, CONV_TILE), lambda t: (0, t)),
-                pl.BlockSpec((CONV_TILE, d_conv), lambda t: (t, 0)),
-            ],
-            out_specs=[
-                pl.BlockSpec((num_slots, CONV_TILE, d_conv), lambda t: (0, t, 0)),
-                pl.BlockSpec((num_slots, CONV_TILE), lambda t: (0, t)),
-            ],
-            out_shape=[out_state_shape, out_conv_shape],
-            compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
-        )(conv_state, new_tokens, kernel)
-
-        return updated_state, conv_output
 
     @classmethod
     def get_impl_name(cls) -> str | tuple[str, ...]:
@@ -815,25 +356,46 @@ class GatedDeltaRuleOp(OperationImpl):
             value: Value tensor [batch, seq_len, num_heads, d_state]
             beta: Gating tensor [batch, seq_len, num_heads, head_dim]
             decay: Optional decay factors [num_heads, head_dim]
-            conv_state: Optional convolution state (passed through, not used here)
+            conv_state: Optional convolution state (passed through unchanged into the
+                returned output, not consumed by this method)
             recurrent_state: Optional recurrent state for inference
-            chunk_size: Chunk size for training mode (default: 64)
-            **kwargs:
+            use_qk_l2norm: Whether to L2-normalize queries and keys before the
+                recurrence. Defaults to True.
+            **kwargs: Additional keyword arguments. Recognized keys:
+
+                - seg_ids: Optional segment ids used to pack multiple sequences
+                  per row; disables the Pallas chunked path when present.
                 - autotune_chunk_size: Optional bool kept for API compatibility.
                   ejkernel module integration handles autotune policy internally.
                 - autotune_chunk_candidates: Optional list/tuple kept for API
                   compatibility; currently ignored in the ejkernel module path.
 
+                The chunk size is selected internally (adaptive for the XLA path,
+                fixed at 128 for the TPU/Pallas chunked path); it is not a
+                parameter of this method.
+
         Returns:
-            GatedDeltaRuleOutput containing attention outputs and updated states
+            GatedDeltaRuleOutput containing attention outputs and updated states.
+            The ``conv_state`` field echoes the ``conv_state`` argument; the
+            ``recurrent_state`` field holds the newly computed recurrent state.
         """
         seq_len = query.shape[1]
         is_inference = seq_len == 1
         kernel_cfg = self.metadata.get_operation_config("gated_delta_rule")
+        seg_ids = kwargs.get("seg_ids", None)
+        use_chunked_gdr = check_bool_flag("EASYDEL_GDR_CHUNKED", False) and not is_inference_mode()
         if kernel_cfg is None and not is_inference:
-            adaptive_chunk = min(max(16, seq_len), 64)
-            adaptive_chunk = 1 << (adaptive_chunk.bit_length() - 1) if isinstance(adaptive_chunk, int) else 64
-            kernel_cfg = GatedDeltaRuleConfig(platform="xla", chunk_size=adaptive_chunk)
+            if (
+                jax.default_backend() == "tpu"
+                and use_chunked_gdr
+                and seg_ids is None
+                and not check_bool_flag("EASYDEL_GDR_XLA", False)
+            ):
+                kernel_cfg = GatedDeltaRuleConfig(platform="pallas", backend="tpu", chunk_size=128)
+            else:
+                adaptive_chunk = min(max(16, seq_len), 64)
+                adaptive_chunk = 1 << (adaptive_chunk.bit_length() - 1) if isinstance(adaptive_chunk, int) else 64
+                kernel_cfg = GatedDeltaRuleConfig(platform="xla", chunk_size=adaptive_chunk)
 
         mode = self.get_mode(query=query, BTHD=True)
         shardings_bthd = self.metadata.get_shardings(mode, layout="bthd")
@@ -870,7 +432,7 @@ class GatedDeltaRuleOp(OperationImpl):
             tensor=value,
             preserved_indices=[0, 2],
         )
-        beta_source = PartitionSpec(
+        beta_source = jax.sharding.PartitionSpec(
             shardings_bthd.query[0],
             shardings_bthd.query[1],
             shardings_bthd.query[2],
@@ -888,7 +450,7 @@ class GatedDeltaRuleOp(OperationImpl):
         )
         state_source = None
         if query_sharding is not None:
-            state_source = PartitionSpec(
+            state_source = jax.sharding.PartitionSpec(
                 query_sharding[0],
                 query_sharding[2],
                 None,
@@ -909,11 +471,9 @@ class GatedDeltaRuleOp(OperationImpl):
             preserved_indices=[0, 2],
         )
 
-        seg_ids = kwargs.get("seg_ids", None)
-
         seg_source = None
         if query_sharding is not None:
-            seg_source = PartitionSpec(query_sharding[0], None)
+            seg_source = jax.sharding.PartitionSpec(query_sharding[0], None)
         seg_sharding = self.create_stable_sharding(
             seg_source,
             dep=seg_ids,
@@ -946,7 +506,6 @@ class GatedDeltaRuleOp(OperationImpl):
             else:
                 platform = "pallas"
 
-        use_chunked_gdr = check_bool_flag("EASYDEL_GDR_CHUNKED", False) and not is_inference_mode()
         # ``seg_ids`` is positional-only (between ``decay`` and ``initial_state``) on the op.
         outputs, new_recurrent_state = gated_delta_rule(
             query,
@@ -1036,118 +595,47 @@ class GatedDeltaRuleOp(OperationImpl):
         recurrent_state = recurrent_state.astype(runtime_dtype)
 
         mesh = self.metadata.mesh
+        platform = None
+        in_specs = None
+        out_specs = None
         if mesh is not None and jax.default_backend() == "tpu":
             mode = self.get_mode(query=jnp.expand_dims(query, 0), BTHD=False)
             shardings_bthd = self.metadata.get_shardings(mode, layout="bthd")
             head_axis = shardings_bthd.query[2] if shardings_bthd.query is not None else None
 
-            token_head_spec = PartitionSpec(None, head_axis, None)
-            beta_spec = PartitionSpec(None, head_axis)
-            state_spec = PartitionSpec(None, head_axis, None, None)
-            Ps = PartitionSpec
-
-            @jax.named_scope("ragged_gdr_decode_shard_map")
-            def _decode_shard(q, k, v, b, d, s, si):
-                return _decode_path(q, k, v, b, d, s, si, use_qk_l2norm)
-
-            decode_shard_fn = jax.shard_map(
-                _decode_shard,
-                mesh=mesh,
-                in_specs=(token_head_spec, token_head_spec, token_head_spec, beta_spec, beta_spec, state_spec, Ps()),
-                out_specs=(token_head_spec, state_spec),
-                check_vma=False,
+            token_head_spec = jax.sharding.PartitionSpec(None, head_axis, None)
+            beta_spec = jax.sharding.PartitionSpec(None, head_axis)
+            state_spec = jax.sharding.PartitionSpec(None, head_axis, None, None)
+            Ps = jax.sharding.PartitionSpec
+            in_specs = (
+                token_head_spec,
+                token_head_spec,
+                token_head_spec,
+                beta_spec,
+                beta_spec,
+                state_spec,
+                Ps(),
+                Ps(),
             )
+            out_specs = (token_head_spec, state_spec)
+            platform = "pallas"
 
-            _chunk_size = chunk_size
-            _use_l2norm = use_qk_l2norm
-
-            @jax.named_scope("ragged_gdr_prefill_shard_map")
-            def _prefill_shard(q, k, v, b, d, s, qsl, si):
-                new_s, out = _ragged_gdr_chunked_prefill(
-                    q,
-                    k,
-                    v,
-                    b,
-                    d,
-                    s,
-                    qsl,
-                    si,
-                    _chunk_size,
-                    _use_l2norm,
-                )
-                return out, new_s
-
-            prefill_shard_fn = jax.shard_map(
-                _prefill_shard,
-                mesh=mesh,
-                in_specs=(
-                    token_head_spec,
-                    token_head_spec,
-                    token_head_spec,
-                    beta_spec,
-                    beta_spec,
-                    state_spec,
-                    Ps(),
-                    Ps(),
-                ),
-                out_specs=(token_head_spec, state_spec),
-                check_vma=False,
-            )
-
-            seq_lengths = query_start_loc[1:] - query_start_loc[:-1]
-            is_all_decode = jnp.all(seq_lengths <= 1)
-
-            num_tokens = query.shape[0]
-            num_si = state_indices.shape[0]
-            if num_tokens > num_si:
-                decode_state_indices = jnp.pad(state_indices, (0, num_tokens - num_si))
-            elif num_tokens < num_si:
-                decode_state_indices = state_indices[:num_tokens]
-            else:
-                decode_state_indices = state_indices
-
-            def _run_decode(_):
-                return decode_shard_fn(
-                    query,
-                    key,
-                    value,
-                    beta,
-                    decay,
-                    recurrent_state,
-                    decode_state_indices,
-                )
-
-            def _run_prefill(_):
-                return prefill_shard_fn(
-                    query,
-                    key,
-                    value,
-                    beta,
-                    decay,
-                    recurrent_state,
-                    query_start_loc,
-                    state_indices,
-                )
-
-            output, new_state = jax.lax.cond(
-                is_all_decode,
-                _run_decode,
-                _run_prefill,
-                operand=None,
-            )
-        else:
-            output, new_state = ragged_gated_delta_rule(
-                query=query,
-                key=key,
-                value=value,
-                beta=beta,
-                decay=decay,
-                recurrent_state=recurrent_state,
-                query_start_loc=query_start_loc,
-                state_indices=state_indices,
-                chunk_size=chunk_size,
-                use_qk_l2norm=use_qk_l2norm,
-            )
+        output, new_state = ragged_gated_delta_rule(
+            query=query,
+            key=key,
+            value=value,
+            beta=beta,
+            decay=decay,
+            recurrent_state=recurrent_state,
+            query_start_loc=query_start_loc,
+            state_indices=state_indices,
+            chunk_size=chunk_size,
+            use_qk_l2norm=use_qk_l2norm,
+            platform=platform,
+            mesh=mesh,
+            in_specs=in_specs,
+            out_specs=out_specs,
+        )
 
         return GatedDeltaRuleOutput(
             attention_outputs=output,
@@ -1200,8 +688,11 @@ class GatedDeltaRuleOp(OperationImpl):
             decay: Optional decay factors [num_heads, head_dim]
             conv_state: Optional convolution state
             recurrent_state: Optional recurrent state
-            chunk_size: Chunk size for training mode
-            **kwargs:
+            use_qk_l2norm: Whether to L2-normalize queries and keys. Defaults to True.
+            **kwargs: Additional keyword arguments forwarded to the backend
+                ``forward_*`` method. Recognized keys:
+
+                - seg_ids: Optional segment ids for packed multi-sequence rows.
                 - autotune_chunk_size: API-compatible flag (ejkernel handles
                   autotune policy internally in this integration).
                 - autotune_chunk_candidates: API-compatible argument,

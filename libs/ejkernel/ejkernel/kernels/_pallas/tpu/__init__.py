@@ -53,9 +53,11 @@ from .blocksparse_attention import blocksparse_attention as blocksparse_attentio
 from .deepseek_attn import deepseek_attn
 from .flash_attention import flash_attention
 from .flash_mla import flash_mla
+from .fused_conv_decode import fused_conv_decode
 from .fused_cross_entropy import fused_cross_entropy
 from .fused_kl_divergence import fused_kl_divergence
 from .gated_delta_rule import gated_delta_rule
+from .gated_delta_rule_grouped_decode import gated_delta_rule_grouped_decode
 from .grouped_matmul import grouped_matmul
 from .grouped_matmulv2 import grouped_matmulv2
 from .grouped_matmulv3 import grouped_matmulv3
@@ -66,6 +68,7 @@ from .prefill_page_attention import prefill_page_attention
 from .quantized_matmul import quantized_matmul
 from .ragged_decode_attention import ragged_decode_attention
 from .ragged_gated_delta_rule import ragged_gated_delta_rule as ragged_gated_delta_rule
+from .ragged_gated_delta_rule_v2 import ragged_gated_delta_rule_v2
 from .ragged_page_attention_v2 import ragged_page_attention_v2
 from .ragged_page_attention_v3 import ragged_page_attention_v3
 from .reduce_scatter_matmul import reduce_scatter_matmul
@@ -77,9 +80,11 @@ __all__ = (
     "deepseek_attn",
     "flash_attention",
     "flash_mla",
+    "fused_conv_decode",
     "fused_cross_entropy",
     "fused_kl_divergence",
     "gated_delta_rule",
+    "gated_delta_rule_grouped_decode",
     "grouped_matmul",
     "grouped_matmulv2",
     "grouped_matmulv3",
@@ -90,6 +95,7 @@ __all__ = (
     "quantized_matmul",
     "ragged_decode_attention",
     "ragged_gated_delta_rule",
+    "ragged_gated_delta_rule_v2",
     "ragged_page_attention_v2",
     "ragged_page_attention_v3",
     "reduce_scatter_matmul",

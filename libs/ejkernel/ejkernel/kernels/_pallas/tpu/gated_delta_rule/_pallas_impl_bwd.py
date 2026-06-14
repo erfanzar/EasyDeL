@@ -79,6 +79,16 @@ def _bwd_one_chunk(q, k, v, beta, decay, d_out, state_pre, d_state_next, C):
     g_diff_state_exp = jnp.exp(jnp.clip(g_end - g_cumsum, -20.0, 20.0))
 
     def _s(x):
+        """Sanitize an intermediate tensor by replacing NaN/Inf with zero.
+
+        Shorthand used throughout the backward chain-rule computation to keep matmul outputs finite.
+
+        Args:
+            x: Tensor to sanitize.
+
+        Returns:
+            ``x`` with NaN, +Inf and -Inf entries all replaced by ``0.0``.
+        """
         return jnp.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
 
     k_beta_scaled = k_beta * g_cumsum_exp
@@ -172,49 +182,53 @@ def _gdr_bwd_grad_kernel(
     d_beta_ref,
     d_decay_ref,
 ):
-    """Pallas kernel for one reverse-scan step, processing ``_N_FUSE`` chunks.
+    """Pallas kernel for one reverse-scan step, processing ``num_fused`` chunks.
 
-    Iterates ``_N_FUSE`` chunks in reverse order.  For chunk ``i > 0`` it
-    re-runs the forward pass for chunks ``0 … i-1`` to recover the
-    intermediate state (since only the state *before* the fused group is
-    saved).
+    Here ``num_fused`` is the per-block group size (``q_ref.shape[2]``) and ``C``
+    is the chunk size (``q_ref.shape[3]``). The kernel iterates the chunks of the
+    group in reverse order, threading the state gradient ``d_state_next`` from
+    the last chunk back to the first. For chunk ``i > 0`` it re-runs the forward
+    pass (``_process_one_chunk``) for chunks ``0 … i-1`` to recover the
+    intermediate pre-chunk state, since only the state *before* the fused group
+    is saved in ``state_pre_ref``. All ref reads/writes are sanitized with
+    ``nan_to_num``.
 
-    Grid: ``(batch, num_heads)``; both axes are "parallel".
-
-    BlockSpec shape: ``(1, 1, total_rows, dim)`` for Q/K/V/dO;
-    ``(1, 1, K, V)`` for states; ``(1, 1, 1, total_beta)`` for beta/decay.
+    Grid: ``(batch, num_heads)``; both axes are "parallel". Refs are per-block
+    slices (leading batch/head dims already indexed to size 1 by the BlockSpec).
 
     Args:
-        state_pre_ref: [1,1,K,V] — recurrent state before the fused group.
-        q_ref: [1,1,N_FUSE*C,K].
-        k_ref: [1,1,N_FUSE*C,K].
-        v_ref: [1,1,N_FUSE*C,V].
-        beta_ref: [1,1,1,N_FUSE*C].
-        decay_ref: [1,1,1,N_FUSE*C].
-        d_out_ref: [1,1,N_FUSE*C,V] — upstream gradient.
-        d_state_next_ref: [1,1,K,V] — gradient arriving from the next group.
+        state_pre_ref: [1, 1, K, V] — recurrent state before the fused group.
+        q_ref: [1, 1, num_fused, C, K] — queries for the group.
+        k_ref: [1, 1, num_fused, C, K] — keys for the group.
+        v_ref: [1, 1, num_fused, C, V] — values for the group.
+        beta_ref: [1, 1, 1, num_fused, C] — gate per token.
+        decay_ref: [1, 1, 1, num_fused, C] — log-decay per token.
+        d_out_ref: [1, 1, num_fused, C, V] — upstream output gradient.
+        d_state_next_ref: [1, 1, K, V] — gradient arriving from the next group.
+        d_state_ref: [1, 1, K, V] — output ref for the gradient of the state
+            before this group.
+        d_q_ref: [1, 1, num_fused, C, K] — output ref for the query gradient.
+        d_k_ref: [1, 1, num_fused, C, K] — output ref for the key gradient.
+        d_v_ref: [1, 1, num_fused, C, V] — output ref for the value gradient.
+        d_beta_ref: [1, 1, num_fused, C, 1] — output ref for the beta gradient.
+        d_decay_ref: [1, 1, num_fused, C, 1] — output ref for the decay gradient.
 
-    Outputs written:
-        d_state_ref: [1,1,K,V] — gradient for state before this group.
-        d_q_ref, d_k_ref: [1,1,N_FUSE*C,K].
-        d_v_ref: [1,1,N_FUSE*C,V].
-        d_beta_ref: [1,1,N_FUSE*C,1].
-        d_decay_ref: [1,1,N_FUSE*C,1].
+    Returns:
+        None. All results are written in place into the output refs listed above.
     """
-    total_rows = q_ref.shape[2]
-    C = total_rows // _N_FUSE
+    num_fused = q_ref.shape[2]
+    C = q_ref.shape[3]
 
     d_state_next = d_state_next_ref[0, 0].astype(jnp.float32)
     d_state_next = jnp.nan_to_num(d_state_next, nan=0.0, posinf=0.0, neginf=0.0)
 
-    for i in range(_N_FUSE - 1, -1, -1):
-        s = i * C
-        q = q_ref[0, 0, s : s + C].astype(jnp.float32)
-        k = k_ref[0, 0, s : s + C].astype(jnp.float32)
-        v = v_ref[0, 0, s : s + C].astype(jnp.float32)
-        beta = beta_ref[0, 0, 0, i * C : (i + 1) * C]
-        decay = decay_ref[0, 0, 0, i * C : (i + 1) * C]
-        d_out = d_out_ref[0, 0, s : s + C].astype(jnp.float32)
+    for i in range(num_fused - 1, -1, -1):
+        q = q_ref[0, 0, i].astype(jnp.float32)
+        k = k_ref[0, 0, i].astype(jnp.float32)
+        v = v_ref[0, 0, i].astype(jnp.float32)
+        beta = beta_ref[0, 0, 0, i]
+        decay = decay_ref[0, 0, 0, i]
+        d_out = d_out_ref[0, 0, i].astype(jnp.float32)
         if i == 0:
             state_pre = state_pre_ref[0, 0].astype(jnp.float32)
             state_pre = jnp.nan_to_num(state_pre, nan=0.0, posinf=0.0, neginf=0.0)
@@ -224,12 +238,11 @@ def _gdr_bwd_grad_kernel(
             sp = state_pre_ref[0, 0].astype(jnp.float32)
             sp = jnp.nan_to_num(sp, nan=0.0, posinf=0.0, neginf=0.0)
             for j in range(i):
-                sj = j * C
-                qj = q_ref[0, 0, sj : sj + C].astype(jnp.float32)
-                kj = k_ref[0, 0, sj : sj + C].astype(jnp.float32)
-                vj = v_ref[0, 0, sj : sj + C].astype(jnp.float32)
-                bj = beta_ref[0, 0, 0, j * C : (j + 1) * C]
-                dj = decay_ref[0, 0, 0, j * C : (j + 1) * C]
+                qj = q_ref[0, 0, j].astype(jnp.float32)
+                kj = k_ref[0, 0, j].astype(jnp.float32)
+                vj = v_ref[0, 0, j].astype(jnp.float32)
+                bj = beta_ref[0, 0, 0, j]
+                dj = decay_ref[0, 0, 0, j]
                 _, sp = _process_one_chunk(qj, kj, vj, bj, dj, sp, C)
             state_pre = sp
 
@@ -246,15 +259,11 @@ def _gdr_bwd_grad_kernel(
         )
         d_state_next = jnp.nan_to_num(d_st, nan=0.0, posinf=0.0, neginf=0.0)
 
-        d_q_ref[0, 0, s : s + C] = jnp.nan_to_num(d_q_c, nan=0.0, posinf=0.0, neginf=0.0).astype(d_q_ref.dtype)
-        d_k_ref[0, 0, s : s + C] = jnp.nan_to_num(d_k_c, nan=0.0, posinf=0.0, neginf=0.0).astype(d_k_ref.dtype)
-        d_v_ref[0, 0, s : s + C] = jnp.nan_to_num(d_v_c, nan=0.0, posinf=0.0, neginf=0.0).astype(d_v_ref.dtype)
-        d_beta_ref[0, 0, s : s + C, :] = jnp.nan_to_num(d_beta_c, nan=0.0, posinf=0.0, neginf=0.0).astype(
-            d_beta_ref.dtype
-        )
-        d_decay_ref[0, 0, s : s + C, :] = jnp.nan_to_num(d_decay_c, nan=0.0, posinf=0.0, neginf=0.0).astype(
-            d_decay_ref.dtype
-        )
+        d_q_ref[0, 0, i] = jnp.nan_to_num(d_q_c, nan=0.0, posinf=0.0, neginf=0.0).astype(d_q_ref.dtype)
+        d_k_ref[0, 0, i] = jnp.nan_to_num(d_k_c, nan=0.0, posinf=0.0, neginf=0.0).astype(d_k_ref.dtype)
+        d_v_ref[0, 0, i] = jnp.nan_to_num(d_v_c, nan=0.0, posinf=0.0, neginf=0.0).astype(d_v_ref.dtype)
+        d_beta_ref[0, 0, i, :, :] = jnp.nan_to_num(d_beta_c, nan=0.0, posinf=0.0, neginf=0.0).astype(d_beta_ref.dtype)
+        d_decay_ref[0, 0, i, :, :] = jnp.nan_to_num(d_decay_c, nan=0.0, posinf=0.0, neginf=0.0).astype(d_decay_ref.dtype)
 
     d_state_ref[0, 0] = d_state_next.astype(d_state_ref.dtype)
 
@@ -271,23 +280,30 @@ def _run_bwd_grad_step(
 ):
     """Launch the backward gradient Pallas kernel for one fused chunk group.
 
+    Wraps ``_gdr_bwd_grad_kernel`` in a ``pl.pallas_call`` with a
+    ``(batch, num_heads)`` grid, where ``num_fused`` is the group size and
+    ``chunk_size`` is the per-chunk token count.
+
     Args:
         state_pre: [B, H, K, V] — recurrent state before this fused group.
-        q_i: [B, H, N_FUSE*C, K].
-        k_i: [B, H, N_FUSE*C, K].
-        v_i: [B, H, N_FUSE*C, V].
-        beta_i: [B, H, 1, N_FUSE*C] float32.
-        decay_i: [B, H, 1, N_FUSE*C] float32.
-        d_out_i: [B, H, N_FUSE*C, V] — upstream gradient.
+        q_i: [B, H, num_fused, chunk_size, K] — queries for the group.
+        k_i: [B, H, num_fused, chunk_size, K] — keys for the group.
+        v_i: [B, H, num_fused, chunk_size, V] — values for the group.
+        beta_i: [B, H, 1, num_fused, chunk_size] float32 — gate per token.
+        decay_i: [B, H, 1, num_fused, chunk_size] float32 — log-decay per token.
+        d_out_i: [B, H, num_fused, chunk_size, V] — upstream output gradient.
         d_state_next: [B, H, K, V] — gradient from the following group.
 
     Returns:
-        Six-element tuple: ``(d_state_prev, d_q, d_k, d_v, d_beta, d_decay)``
-        all as float32 arrays with matching leading dimensions.
+        Six-element tuple ``(d_state_prev, d_q, d_k, d_v, d_beta, d_decay)``
+        as float32 arrays:
+        ``d_state_prev`` [B, H, K, V]; ``d_q``/``d_k``
+        [B, H, num_fused, chunk_size, K]; ``d_v``
+        [B, H, num_fused, chunk_size, V]; ``d_beta``/``d_decay``
+        [B, H, num_fused, chunk_size, 1].
     """
-    bsz, num_heads, total_rows, qk_dim = q_i.shape
+    bsz, num_heads, num_fused, chunk_size, qk_dim = q_i.shape
     v_dim = v_i.shape[-1]
-    total_beta = beta_i.shape[-1]
 
     call = pl.pallas_call(
         _gdr_bwd_grad_kernel,
@@ -295,31 +311,31 @@ def _run_bwd_grad_step(
             num_scalar_prefetch=0,
             in_specs=[
                 _chunk_blockspec((1, 1, qk_dim, v_dim)),
-                _chunk_blockspec((1, 1, total_rows, qk_dim)),
-                _chunk_blockspec((1, 1, total_rows, qk_dim)),
-                _chunk_blockspec((1, 1, total_rows, v_dim)),
-                _chunk_blockspec((1, 1, 1, total_beta)),
-                _chunk_blockspec((1, 1, 1, total_beta)),
-                _chunk_blockspec((1, 1, total_rows, v_dim)),
+                _chunk_blockspec((1, 1, num_fused, chunk_size, qk_dim)),
+                _chunk_blockspec((1, 1, num_fused, chunk_size, qk_dim)),
+                _chunk_blockspec((1, 1, num_fused, chunk_size, v_dim)),
+                _chunk_blockspec((1, 1, 1, num_fused, chunk_size)),
+                _chunk_blockspec((1, 1, 1, num_fused, chunk_size)),
+                _chunk_blockspec((1, 1, num_fused, chunk_size, v_dim)),
                 _chunk_blockspec((1, 1, qk_dim, v_dim)),
             ],
             out_specs=[
                 _chunk_blockspec((1, 1, qk_dim, v_dim)),
-                _chunk_blockspec((1, 1, total_rows, qk_dim)),
-                _chunk_blockspec((1, 1, total_rows, qk_dim)),
-                _chunk_blockspec((1, 1, total_rows, v_dim)),
-                _chunk_blockspec((1, 1, total_rows, 1)),
-                _chunk_blockspec((1, 1, total_rows, 1)),
+                _chunk_blockspec((1, 1, num_fused, chunk_size, qk_dim)),
+                _chunk_blockspec((1, 1, num_fused, chunk_size, qk_dim)),
+                _chunk_blockspec((1, 1, num_fused, chunk_size, v_dim)),
+                _chunk_blockspec((1, 1, num_fused, chunk_size, 1)),
+                _chunk_blockspec((1, 1, num_fused, chunk_size, 1)),
             ],
             grid=(bsz, num_heads),
         ),
         out_shape=[
             jax.ShapeDtypeStruct((bsz, num_heads, qk_dim, v_dim), jnp.float32),
-            jax.ShapeDtypeStruct((bsz, num_heads, total_rows, qk_dim), jnp.float32),
-            jax.ShapeDtypeStruct((bsz, num_heads, total_rows, qk_dim), jnp.float32),
-            jax.ShapeDtypeStruct((bsz, num_heads, total_rows, v_dim), jnp.float32),
-            jax.ShapeDtypeStruct((bsz, num_heads, total_rows, 1), jnp.float32),
-            jax.ShapeDtypeStruct((bsz, num_heads, total_rows, 1), jnp.float32),
+            jax.ShapeDtypeStruct((bsz, num_heads, num_fused, chunk_size, qk_dim), jnp.float32),
+            jax.ShapeDtypeStruct((bsz, num_heads, num_fused, chunk_size, qk_dim), jnp.float32),
+            jax.ShapeDtypeStruct((bsz, num_heads, num_fused, chunk_size, v_dim), jnp.float32),
+            jax.ShapeDtypeStruct((bsz, num_heads, num_fused, chunk_size, 1), jnp.float32),
+            jax.ShapeDtypeStruct((bsz, num_heads, num_fused, chunk_size, 1), jnp.float32),
         ],
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel")),
     )
@@ -336,7 +352,16 @@ def _run_bwd_grad_step(
 
 
 def _cast_grad(x, dtype):
-    """Cast a gradient array to ``dtype``, passing ``None`` through unchanged."""
+    """Cast a gradient array to ``dtype``, passing ``None`` through unchanged.
+
+    Args:
+        x: Gradient array, or ``None`` for a non-differentiated / absent grad.
+        dtype: Target dtype to cast to.
+
+    Returns:
+        ``None`` if ``x`` is ``None``; otherwise ``x`` cast to ``dtype`` (returned
+        unchanged when it already has that dtype).
+    """
     if x is None:
         return None
     return x.astype(dtype) if x.dtype != dtype else x
@@ -401,20 +426,34 @@ def _chunk_gdr_bwd(
         d_out = jnp.pad(d_out, ((0, 0), (0, 0), (0, pad_size), (0, 0)))
     d_out = d_out.reshape(B, H, num_chunks, chunk_size, V_dim)
 
-    beta_k = beta[:, :, :, None, :]
-    decay_k = decay[:, :, :, None, :]
+    group_size = _N_FUSE if _N_FUSE > 1 and num_chunks % _N_FUSE == 0 else 1
+    num_groups = num_chunks // group_size
 
-    q_tm = query.transpose(2, 0, 1, 3, 4)
-    k_tm = key.transpose(2, 0, 1, 3, 4)
-    v_tm = value.transpose(2, 0, 1, 3, 4)
-    beta_tm = beta_k.transpose(2, 0, 1, 3, 4)
-    decay_tm = decay_k.transpose(2, 0, 1, 3, 4)
-    state_pre_tm = state_pre_all.transpose(2, 0, 1, 3, 4)
-    d_out_tm = d_out.transpose(2, 0, 1, 3, 4)
+    q_tm = query.reshape(B, H, num_groups, group_size, chunk_size, K_dim).transpose(2, 0, 1, 3, 4, 5)
+    k_tm = key.reshape(B, H, num_groups, group_size, chunk_size, K_dim).transpose(2, 0, 1, 3, 4, 5)
+    v_tm = value.reshape(B, H, num_groups, group_size, chunk_size, V_dim).transpose(2, 0, 1, 3, 4, 5)
+    beta_tm = beta.reshape(B, H, num_groups, group_size, chunk_size)[:, :, :, None, :, :].transpose(2, 0, 1, 3, 4, 5)
+    decay_tm = decay.reshape(B, H, num_groups, group_size, chunk_size)[:, :, :, None, :, :].transpose(2, 0, 1, 3, 4, 5)
+    state_pre_tm = state_pre_all[:, :, ::group_size].transpose(2, 0, 1, 3, 4)
+    d_out_tm = d_out.reshape(B, H, num_groups, group_size, chunk_size, V_dim).transpose(2, 0, 1, 3, 4, 5)
 
     d_final_state = d_final_state.astype(jnp.float32)
 
     def grad_step(d_state_next, inputs):
+        """Reverse-scan step computing one chunk group's gradients.
+
+        Body of the ``lax.scan`` (run with ``reverse=True``) over chunk groups. Unpacks the per-group slices,
+        invokes ``_run_bwd_grad_step`` (a Pallas kernel launch) to backprop through the group, and threads the
+        state gradient backward to the previous group.
+
+        Args:
+            d_state_next: Carry — gradient of the recurrent state flowing in from the next (later) group, [K, V].
+            inputs: Per-group scan slice ``(state_pre, q, k, v, beta, decay, d_out)`` for the current group.
+
+        Returns:
+            Two-tuple ``(d_state_prev, per_group_grads)`` where ``d_state_prev`` is the carry passed to the
+            previous group and ``per_group_grads`` is ``(d_q, d_k, d_v, d_beta, d_decay)`` stacked by the scan.
+        """
         sp_i, q_i, k_i, v_i, b_i, dc_i, do_i = inputs
         d_state_i, d_q_i, d_k_i, d_v_i, d_beta_i, d_decay_i = _run_bwd_grad_step(
             sp_i,
@@ -434,7 +473,12 @@ def _chunk_gdr_bwd(
         (state_pre_tm, q_tm, k_tm, v_tm, beta_tm, decay_tm, d_out_tm),
         reverse=True,
     )
-    d_q_tm, d_k_tm, d_v_tm, d_beta_tm, d_decay_tm = grads_tm
+    d_q_group, d_k_group, d_v_group, d_beta_group, d_decay_group = grads_tm
+    d_q_tm = d_q_group.transpose(0, 3, 1, 2, 4, 5).reshape(num_chunks, B, H, chunk_size, K_dim)
+    d_k_tm = d_k_group.transpose(0, 3, 1, 2, 4, 5).reshape(num_chunks, B, H, chunk_size, K_dim)
+    d_v_tm = d_v_group.transpose(0, 3, 1, 2, 4, 5).reshape(num_chunks, B, H, chunk_size, V_dim)
+    d_beta_tm = d_beta_group.transpose(0, 3, 1, 2, 4, 5).reshape(num_chunks, B, H, chunk_size, 1)
+    d_decay_tm = d_decay_group.transpose(0, 3, 1, 2, 4, 5).reshape(num_chunks, B, H, chunk_size, 1)
 
     total_len = seq_len + pad_size
     d_query = d_q_tm.transpose(1, 2, 0, 3, 4).reshape(B, H, total_len, K_dim)[:, :, :seq_len, :]
@@ -456,6 +500,18 @@ def _chunk_gdr_bwd(
         d_initial_state = None
 
     def _safe_cast(x, dtype):
+        """Sanitize a gradient and cast it to the input dtype.
+
+        Used to finalize each returned gradient: replaces NaN/Inf with zero, clips to the representable range for
+        low-precision targets (bf16/fp16) to avoid overflow on cast, and casts only when the dtype differs.
+
+        Args:
+            x: Gradient tensor to finalize, or ``None`` (e.g. an absent ``d_decay``/``d_initial_state``).
+            dtype: Target dtype, typically the original input dtype.
+
+        Returns:
+            ``None`` if ``x`` is ``None``; otherwise the sanitized, optionally clipped tensor cast to ``dtype``.
+        """
         if x is None:
             return None
         x = jnp.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
@@ -492,25 +548,30 @@ def _gdr_single_step_bwd_kernel(
     """Pallas kernel for single-step GDR backward pass.
 
     Recomputes the forward pass inline to recover ``state_decayed``,
-    ``kv_mem``, ``delta``, and ``state_new``, then applies the chain rule.
+    ``kv_mem``, ``delta``, and ``state`` (the new state), then applies the chain
+    rule. Refs are per-grid-block slices (leading batch/head dims already
+    indexed to size 1 by the BlockSpec).
 
     Grid: ``(batch, num_heads)``; both axes are "parallel".
 
-    Inputs (BlockSpec ``(1, 1, 1, dim)`` or ``(1, 1, K, V)``):
-        q_ref, k_ref: [B, H, 1, 1, K].
-        v_ref: [B, H, 1, 1, V].
-        beta_ref: [B, H, 1, 1] — scalar gate.
-        decay_ref: [B, H, 1, 1] — scalar log decay.
-        state_prev_ref: [B, H, 1, K, V] — state before the step.
-        d_out_ref: [B, H, 1, 1, V] — output gradient.
-        d_state_next_ref: [B, H, 1, K, V] — state gradient from downstream.
+    Args:
+        q_ref: [1, 1, 1, K] — query for this step.
+        k_ref: [1, 1, 1, K] — key for this step.
+        v_ref: [1, 1, 1, V] — value for this step.
+        beta_ref: [1, 1, 1, 1] — scalar gate.
+        decay_ref: [1, 1, 1, 1] — scalar log decay.
+        state_prev_ref: [1, 1, K, V] — state before the step.
+        d_out_ref: [1, 1, 1, V] — output gradient.
+        d_state_next_ref: [1, 1, K, V] — state gradient from downstream.
+        d_q_ref: [1, 1, 1, K] — output ref for the query gradient.
+        d_k_ref: [1, 1, 1, K] — output ref for the key gradient.
+        d_v_ref: [1, 1, 1, V] — output ref for the value gradient.
+        d_beta_ref: [1, 1, 1, 1] — output ref for the scalar beta gradient.
+        d_decay_ref: [1, 1, 1, 1] — output ref for the scalar decay gradient.
+        d_state_ref: [1, 1, K, V] — output ref for the gradient w.r.t. ``state_prev``.
 
-    Outputs written:
-        d_q_ref, d_k_ref: [B, H, 1, 1, K].
-        d_v_ref: [B, H, 1, 1, V].
-        d_beta_ref: [B, H, 1, 1] scalar.
-        d_decay_ref: [B, H, 1, 1] scalar.
-        d_state_ref: [B, H, 1, K, V] — gradient w.r.t. ``state_prev``.
+    Returns:
+        None. All results are written in place into the output refs listed above.
     """
     q_t = q_ref[0, 0, 0].astype(jnp.float32)
     k_t = k_ref[0, 0, 0].astype(jnp.float32)
@@ -569,9 +630,37 @@ def _gdr_single_step_bwd_dma_kernel(
 ):
     """DMA-backed Pallas kernel for single-step GDR backward.
 
-    DMA is used only for the state matrices that can amortize the semaphore
-    cost. The per-token vectors and scalar beta/decay inputs stay as direct
-    loads because they are consumed once and are small relative to the state.
+    Same math as :func:`_gdr_single_step_bwd_kernel`: it recomputes the forward
+    pass inline (``state_decayed``, ``kv_mem``, ``delta``, ``state``) and then
+    applies the chain rule. The only difference is that the two ``[K, V]`` state
+    matrices are streamed in via asynchronous DMA copies into VMEM scratch so the
+    semaphore cost is amortized; the per-token vectors and scalar beta/decay
+    inputs stay as direct loads because they are consumed once and are small
+    relative to the state.
+
+    Grid: ``(batch, num_heads)``; both axes are "parallel".
+
+    Args:
+        q_ref: [1, 1, 1, K] — query for this step (loaded directly, late).
+        k_ref: [1, 1, 1, K] — key for this step.
+        v_ref: [1, 1, 1, V] — value for this step.
+        beta_ref: [1, 1, 1, 1] — scalar gate.
+        decay_ref: [1, 1, 1, 1] — scalar log decay.
+        state_prev_ref: [1, 1, K, V] — state before the step (DMA source).
+        d_out_ref: [1, 1, 1, V] — output gradient (loaded directly, late).
+        d_state_next_ref: [1, 1, K, V] — state gradient from downstream (DMA source).
+        d_q_ref: [1, 1, 1, K] — output ref for the query gradient.
+        d_k_ref: [1, 1, 1, K] — output ref for the key gradient.
+        d_v_ref: [1, 1, 1, V] — output ref for the value gradient.
+        d_beta_ref: [1, 1, 1, 1] — output ref for the scalar beta gradient.
+        d_decay_ref: [1, 1, 1, 1] — output ref for the scalar decay gradient.
+        d_state_ref: [1, 1, K, V] — output ref for the gradient w.r.t. ``state_prev``.
+        state_tile_ref: [1, 1, K, V] VMEM scratch — DMA destination for ``state_prev``.
+        d_state_next_tile_ref: [1, 1, K, V] VMEM scratch — DMA destination for ``d_state_next``.
+        dma_sem_ref: DMA semaphore array of length 2, one per in-flight copy.
+
+    Returns:
+        None. All results are written in place into the output refs listed above.
     """
     qk_dim = q_ref.shape[3]
     v_dim = v_ref.shape[3]
