@@ -18,11 +18,13 @@
 Times two implementations of the Qwen3Next packed-update kernel against each
 other on a synthetic packed-prefill workload:
 
-* :func:`_apply_qwen3_next_packed_updates_legacy` — the original
-  per-request loop that calls the gated delta-rule decode kernel inside a
-  Python-level scan.
-* :func:`_apply_qwen3_next_packed_updates` — the refactored single-call path
-  that does the same work using packed tensor ops.
+* :func:`_apply_qwen3_next_packed_updates_unified` — the unified packed-update
+  implementation (single-token fast lane plus ``jax.lax.scan``-based prefill).
+  Timed as the baseline and printed in the ``legacy_ms`` column.
+* :func:`_apply_qwen3_next_packed_updates` — the public dispatcher that, in
+  inference mode, selects the rank-major ragged conv + ragged-GDR fast path
+  (falling back to the unified implementation otherwise). Timed as the candidate
+  and printed in the ``unified_ms`` column.
 
 For each combination of synthetic schedule shape (``decode_like``, ``mixed``,
 ``prefill_heavy``) and token bucket (``512``, ``2048``), the script measures
@@ -46,9 +48,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from ejkernel.modules.operations import gated_delta_rule_grouped_decode
 from easydel.modules.qwen3_next.modeling_qwen3_next import (
     _apply_qwen3_next_packed_updates,
-    _apply_qwen3_next_packed_updates_legacy,
+    _apply_qwen3_next_packed_updates_unified,
 )
 from easydel.modules.qwen3_next.qwen3_next_configuration import Qwen3NextConfig
 from easydel.operations import OperationMetadata
@@ -88,11 +91,15 @@ def _grouped_gdr_decode_jax_only(self, query, key, value, beta, decay, recurrent
     )
 
 
-def _grouped_gdr_decode_pallas_only(self, query, key, value, beta, decay, recurrent_state):
-    """Force :class:`GatedDeltaRuleOp` to use the Pallas grouped decode path.
+def _grouped_gdr_decode_ejkernel_pallas(self, query, key, value, beta, decay, recurrent_state):
+    """Force :class:`GatedDeltaRuleOp` to use the eJKernel Pallas grouped decode path.
 
     Bound via ``MethodType`` to override ``GatedDeltaRuleOp.grouped_gdr_decode``
-    when ``--gdr-backend pallas`` is selected.
+    when ``--gdr-backend pallas`` is selected. The eJKernel
+    ``gated_delta_rule_grouped_decode`` operation is only invoked with the
+    tensor-parallel ``shard_map`` / Pallas path when running on a TPU backend with
+    a tensor-parallel size greater than 1; otherwise (CPU/GPU, or ``tp_size <= 1``)
+    the call falls back to ``GatedDeltaRuleOp.grouped_gdr_decode_jax``.
 
     Args:
         self: The :class:`GatedDeltaRuleOp` instance.
@@ -104,15 +111,59 @@ def _grouped_gdr_decode_pallas_only(self, query, key, value, beta, decay, recurr
         recurrent_state: Carried recurrent state.
 
     Returns:
-        Result of :meth:`GatedDeltaRuleOp.grouped_gdr_decode_shard_map_pallas`.
+        Result of the eJKernel grouped GDR decode operation.
     """
-    return self.grouped_gdr_decode_shard_map_pallas(
+    mesh = self.metadata.mesh
+    if mesh is None or jax.default_backend() != "tpu":
+        return GatedDeltaRuleOp.grouped_gdr_decode_jax(
+            query,
+            key,
+            value,
+            beta,
+            decay,
+            recurrent_state,
+        )
+
+    mode = self.get_mode(query=jnp.expand_dims(query, 1), BTHD=True)
+    shardings_bthd = self.metadata.get_shardings(mode, layout="bthd")
+    tp_axis = shardings_bthd.query[2] if shardings_bthd.query is not None else None
+
+    tp_size = 1
+    if tp_axis is not None:
+        axes = (tp_axis,) if isinstance(tp_axis, str) else tp_axis
+        for ax in axes:
+            tp_size *= mesh.shape.get(ax, 1) if isinstance(mesh.shape, dict) else 1
+
+    if tp_size <= 1 or tp_axis is None:
+        return GatedDeltaRuleOp.grouped_gdr_decode_jax(
+            query,
+            key,
+            value,
+            beta,
+            decay,
+            recurrent_state,
+        )
+
+    from jax.sharding import PartitionSpec
+
+    qk_spec = PartitionSpec(None, tp_axis, None)
+    v_spec = PartitionSpec(None, tp_axis, None, None)
+    bd_spec = PartitionSpec(None, tp_axis, None)
+    state_spec = PartitionSpec(None, tp_axis, None, None)
+    out_spec = PartitionSpec(None, tp_axis, None)
+
+    return gated_delta_rule_grouped_decode(
         query,
         key,
         value,
         beta,
         decay,
         recurrent_state,
+        platform="pallas",
+        mesh=mesh,
+        in_specs=(qk_spec, qk_spec, v_spec, bd_spec, bd_spec, state_spec),
+        out_specs=(out_spec, state_spec),
+        check_vma=False,
     )
 
 
@@ -151,7 +202,7 @@ def _make_gdr_op(layout: str, runtime_dtype=jnp.bfloat16, grouped_decode_backend
     if grouped_decode_backend == "jax":
         gdr_op.grouped_gdr_decode = MethodType(_grouped_gdr_decode_jax_only, gdr_op)
     elif grouped_decode_backend == "pallas":
-        gdr_op.grouped_gdr_decode = MethodType(_grouped_gdr_decode_pallas_only, gdr_op)
+        gdr_op.grouped_gdr_decode = MethodType(_grouped_gdr_decode_ejkernel_pallas, gdr_op)
     return gdr_op
 
 
@@ -214,7 +265,7 @@ def _make_inputs(case: str, bucket: int, num_slots: int, dtype: jnp.dtype) -> di
 
     Allocates conv / recurrent state tensors per slot, conv input / beta /
     decay tensors over the packed bucket, and a conv kernel; together these
-    feed both ``_apply_qwen3_next_packed_updates_legacy`` and the unified
+    feed both ``_apply_qwen3_next_packed_updates_unified`` and the unified
     helper without further reshaping.
 
     Args:
@@ -391,7 +442,7 @@ def main() -> None:
                 inputs = _make_inputs(case, bucket, args.num_slots, dtype)
 
                 legacy_fn = jax.jit(
-                    lambda: _apply_qwen3_next_packed_updates_legacy(
+                    lambda: _apply_qwen3_next_packed_updates_unified(
                         **inputs,  # noqa
                         gdr_op=gdr_op,
                     )

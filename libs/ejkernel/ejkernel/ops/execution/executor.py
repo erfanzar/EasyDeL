@@ -42,10 +42,10 @@ Execution Flow:
 
 Environment Variables:
     EJKERNEL_OPS_RECORD: Set to "1" to enable invocation recording
-    EJKERNEL_OPS_STAMP: Controls profiling metadata format:
-        - "hash": Use operation hash for labeling (default)
-        - "json": Use full JSON payload for labeling
-        - "none": Disable profiling metadata
+    EJKERNEL_OPS_STAMP: Controls profiling metadata format (read only when stamp=True):
+        - "none": Disable profiling metadata (default)
+        - "hash": Use a compact operation hash label
+        - "json": Use a full JSON payload for labeling
 
 Example Usage:
     >>> cache = ConfigCache()
@@ -415,11 +415,11 @@ class Executor(Generic[Cfg, Out]):
                 ``Invocation.override_cfg``).  Can also be passed as the
                 keyword argument ``_cfg`` for legacy call-sites.
             stamp: Whether to inject profiling metadata into the compiled graph.
-                The format is controlled by the ``EJKERNEL_OPS_STAMP``
-                environment variable:
-                ``'hash'`` (default when stamp=True) — compact ``op_id:call_key`` label;
-                ``'json'`` — full JSON payload with args/kwargs/cfg details;
-                ``'none'`` — no label (same as stamp=False).
+                When True, the label format is controlled by the
+                ``EJKERNEL_OPS_STAMP`` environment variable:
+                ``'none'`` (the default) — no label (same effect as stamp=False);
+                ``'hash'`` — compact ``op_id:call_key`` label;
+                ``'json'`` — full JSON payload with args/kwargs/cfg details.
             method: Execution mode.  ``'shard_map'`` wraps the call with
                 ``jax.shard_map`` using the provided ``mesh``/``in_specs``/
                 ``out_specs``.  ``None`` (default) uses standard execution.
@@ -687,6 +687,13 @@ class Executor(Generic[Cfg, Out]):
         dev = device_fingerprint()
         op_id_v = f"{kernel.op_id}@v{getattr(kernel, 'version', '0')}"
         call_key = inv.make_key(kernel.key_builder)
+
+        if inv.override_cfg is not None:
+            cfg = inv.override_cfg
+            self.chooser.cache.put(dev, op_id_v, call_key, cfg)
+            if self.chooser.persistent is not None and self.chooser.persist_autotune:
+                self.chooser.persistent.put(dev, op_id_v, call_key, cfg)
+            return cfg
 
         for overlay in reversed(_cache_overlay.get()):
             if (cfg := overlay.get((dev, op_id_v, call_key))) is not None:

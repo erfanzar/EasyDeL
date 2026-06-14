@@ -102,7 +102,10 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
     ensures only novel information is added, improving memory efficiency.
 
     Attributes:
-        op_id: Operation identifier for registry lookup ("gated_delta_rule")
+        op_id: Operation identifier for registry lookup ("gated_delta_rule"),
+            set in ``__init__``.
+        version: Schema version string ("2") used for configuration-cache
+            compatibility.
     """
 
     version = "2"
@@ -136,10 +139,52 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
         seg_ids: Int[Array, "batch seq_len"] | None = None,
         **_,
     ):
-        """Create a shard_map wrapper for GDR execution.
+        """Create a ``jax.shard_map`` wrapper for distributed GDR execution.
 
-        The wrapped function keeps the public BTHD layout and delegates to
-        ``self.run`` inside each shard.
+        Builds a closure that keeps the public ``[batch, seq_len, num_heads, dim]``
+        (BTHD) layout and delegates to ``self.run`` inside each device shard, then
+        wraps it with ``jax.shard_map`` using the supplied mesh and partition specs.
+
+        The positional argument tuple passed to the wrapped function is
+        ``(query, key, value, beta, decay, initial_state)``, with ``seg_ids``
+        appended as a final entry only when it is not ``None``. ``in_specs`` must
+        have exactly the same length as that tuple.
+
+        Args:
+            query: Query tensor, shape ``[batch, seq_len, num_heads, qk_head_dim]``.
+            key: Key tensor, shape ``[batch, seq_len, num_heads, qk_head_dim]``.
+            value: Value tensor, shape ``[batch, seq_len, num_heads, v_head_dim]``.
+            beta: Per-token delta-update gate, shape ``[batch, seq_len, num_heads]``.
+            decay: Optional per-token log-space decay,
+                shape ``[batch, seq_len, num_heads]``, or ``None``.
+            initial_state: Optional initial memory state,
+                shape ``[batch, num_heads, qk_head_dim, v_head_dim]``, or ``None``.
+            use_qk_l2norm: If True, L2-normalize queries and keys before attention.
+            use_chunked: If True, use the chunked algorithm; if False, the
+                recurrent scan.
+            return_state: If True, the wrapped call returns ``(output, state)``.
+            platform: Optional platform override forwarded to ``self.run``.
+            cfg: Optional configuration; defaults inside the closure to
+                ``GatedDeltaRuleConfig(chunk_size=64, platform="auto", backend="any")``.
+            mesh: JAX device mesh used to shard the computation. Must not be None.
+            in_specs: Per-input ``PartitionSpec`` tuple; length must equal the
+                number of positional arguments described above. Must not be None.
+            out_specs: Output ``PartitionSpec`` (or tuple of specs when
+                ``return_state=True``). Must not be None.
+            check_vma: Forwarded to ``jax.shard_map`` (varying-manual-axis check).
+            seg_ids: Optional packed-sequence segment ids,
+                shape ``[batch, seq_len]``; when provided it is appended to the
+                call arguments and its spec must be the last entry of ``in_specs``.
+            **_: Additional keyword arguments are accepted and ignored.
+
+        Returns:
+            A tuple ``(shard_map_fn, call_args)`` where ``shard_map_fn`` is the
+            sharded callable and ``call_args`` is the positional argument tuple to
+            invoke it with.
+
+        Raises:
+            AssertionError: If ``mesh``, ``in_specs`` or ``out_specs`` is None, or
+                if ``len(in_specs)`` does not match the number of call arguments.
         """
         assert mesh is not None, "mesh must be provided for shard_map execution"
         assert in_specs is not None, "in_specs must be provided for shard_map execution"
@@ -154,6 +199,30 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
             initial_state: Float[Array, "batch num_heads qk_head_dim v_head_dim"] | None,
             seg_ids: Int[Array, "batch seq_len"] | None = None,
         ):
+            """Run GDR on a single shard by delegating to ``self.run``.
+
+            Captures ``use_qk_l2norm``, ``use_chunked``, ``return_state``,
+            ``platform`` and ``cfg`` from the enclosing scope and forwards the
+            per-shard tensors to ``self.run``.
+
+            Args:
+                query: Per-shard query tensor,
+                    shape ``[batch, seq_len, num_heads, qk_head_dim]``.
+                key: Per-shard key tensor,
+                    shape ``[batch, seq_len, num_heads, qk_head_dim]``.
+                value: Per-shard value tensor,
+                    shape ``[batch, seq_len, num_heads, v_head_dim]``.
+                beta: Per-shard gate, shape ``[batch, seq_len, num_heads]``.
+                decay: Per-shard log-space decay,
+                    shape ``[batch, seq_len, num_heads]``, or ``None``.
+                initial_state: Per-shard initial memory state,
+                    shape ``[batch, num_heads, qk_head_dim, v_head_dim]``, or ``None``.
+                seg_ids: Optional per-shard segment ids, shape ``[batch, seq_len]``.
+
+            Returns:
+                The output of ``self.run``: either the output array or, when
+                ``return_state`` is True, an ``(output, final_state)`` tuple.
+            """
             return self.run(
                 query=query,
                 key=key,
@@ -294,43 +363,63 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
         return out
 
     def heuristic_cfg(self, inv: Invocation[GatedDeltaRuleConfig, Array]) -> GatedDeltaRuleConfig:
-        """Provide default configuration derived from invocation kwargs.
+        """Provide the default (non-autotuned) configuration for GDR.
 
-        Extracts ``chunk_size`` from the caller's keyword arguments so
-        that the heuristic matches the user's intent.
+        Returns a fixed heuristic config with ``chunk_size=256``,
+        ``platform="auto"`` and ``backend="any"``. Used when autotuning is
+        skipped or as the cache-miss fallback.
 
         Args:
-            inv: Invocation object with call metadata.
+            inv: Invocation object carrying the call's arrays and keyword
+                arguments. Accepted for API compatibility; it is not inspected
+                by this implementation.
 
         Returns:
-            Configuration matching the caller's chunk_size.
+            A ``GatedDeltaRuleConfig`` with ``chunk_size=256``.
         """
         return GatedDeltaRuleConfig(chunk_size=256, platform="auto", backend="any")
 
     def candidate_cfgs(self, inv: Invocation[GatedDeltaRuleConfig, Array]):
-        """Generate candidate configurations for chunk-size autotuning.
+        """Generate the platform-agnostic candidate configurations for chunk-size autotuning.
 
-        Produces configs with ``[chunk_size/2, chunk_size, chunk_size*2]``
-        (or an explicit list from ``autotune_chunk_candidates`` kwarg /
-        the ``EASYDEL_GDR_AUTOTUNE_CHUNK_CANDIDATES`` env var).
+        Returns a fixed set of two candidates with chunk sizes ``128`` and
+        ``256``, both targeting ``platform="auto"`` / ``backend="any"``. This is
+        the fallback used when no device-specific candidate generator
+        (``candidate_cfgs_gpu`` / ``candidate_cfgs_tpu``) applies.
 
         Args:
-            inv: Invocation object with call metadata.
+            inv: Invocation object carrying the call's arrays and keyword
+                arguments. Accepted for API compatibility; it is not inspected
+                by this implementation.
 
         Returns:
-            List of GatedDeltaRuleConfig candidates to benchmark.
+            A two-element list of ``GatedDeltaRuleConfig`` candidates to benchmark.
         """
 
         cands = [128, 256]
         return [GatedDeltaRuleConfig(chunk_size=c, platform="auto", backend="any") for c in cands]
 
     def candidate_cfgs_gpu(self, inv: Invocation[GatedDeltaRuleConfig, Array]):
-        """Generate GPU candidates for GDR across TileLang and XLA.
+        """Generate GPU autotuning candidates for GDR across TileLang and XLA.
 
         ``chunk_size`` is the dominant tuning knob: smaller chunks raise
-        inter-chunk state-propagation cost; larger chunks raise intra-chunk
-        attention-matrix memory. Sweep {32, 64, 128, 256, 512} — the
-        tilelang chunked path additionally tries a wider set on H100.
+        inter-chunk state-propagation cost while larger chunks raise intra-chunk
+        attention-matrix memory. The XLA path sweeps ``{32, 64, 128, 256, 512}``;
+        the TileLang chunked path adds candidates for ``{64, 128, 256, 512}`` but
+        only when ``use_chunked`` is True.
+
+        The set of platforms considered is derived from the invocation's
+        ``platform`` keyword: ``("tilelang", "xla")`` when it is ``None`` or
+        ``"auto"``, otherwise just the explicitly requested platform.
+
+        Args:
+            inv: Invocation object whose ``kwargs`` are read for ``"platform"``
+                (default ``None``) and ``"use_chunked"`` (default ``True``).
+
+        Returns:
+            A list of ``GatedDeltaRuleConfig`` candidates. Falls back to
+            ``self.candidate_cfgs(inv)`` if no GPU-specific candidate matches the
+            requested platform.
         """
         requested = inv.kwargs.get("platform", None)
         use_chunked = bool(inv.kwargs.get("use_chunked", True))
@@ -345,7 +434,20 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
         return candidates or self.candidate_cfgs(inv)
 
     def candidate_cfgs_tpu(self, inv: Invocation[GatedDeltaRuleConfig, Array]):
-        """Generate TPU candidates for the Pallas and XLA GDR paths."""
+        """Generate TPU autotuning candidates for the Pallas and XLA GDR paths.
+
+        Produces the cross product of chunk sizes ``{128, 256}`` with the two TPU
+        execution paths: ``(platform="pallas", backend="tpu")`` and
+        ``(platform="xla", backend="any")`` — four candidates total.
+
+        Args:
+            inv: Invocation object carrying the call's arrays and keyword
+                arguments. Accepted for API compatibility; it is not inspected
+                by this implementation.
+
+        Returns:
+            A four-element list of ``GatedDeltaRuleConfig`` candidates to benchmark.
+        """
         cands = [128, 256]
         return [
             GatedDeltaRuleConfig(chunk_size=c, platform=platform, backend=backend)
@@ -422,12 +524,20 @@ def gated_delta_rule(
         decay: Per-token decay for memory retention (values should be <= 0).
             Shape: [batch, seq_len, num_heads].
             If None, defaults to zeros (no decay, full memory retention).
+        seg_ids: Optional packed-sequence segment ids,
+            shape [batch, seq_len], used to reset the recurrence at sequence
+            boundaries within a packed batch. As a backward-compatibility
+            convenience, if ``initial_state`` is None and a 4-D array is passed
+            here, it is reinterpreted as ``initial_state`` and ``seg_ids`` is set
+            to None.
         initial_state: Optional initial memory state for incremental inference
             Shape: [batch, num_heads, qk_head_dim, v_head_dim]
-        autotune_chunk_candidates: Optional list/tuple of chunk sizes to
-            benchmark during autotuning, overriding ``candidate_cfgs``.
-            When None, ``GatedDeltaRule.candidate_cfgs`` provides ``[128, 256]``
-            unless the ``EASYDEL_GDR_AUTOTUNE_CHUNK_CANDIDATES`` env var is set.
+        autotune_chunk_candidates: Optional list/tuple of chunk sizes intended
+            to be benchmarked during autotuning. It is forwarded to the executor
+            as a keyword argument; the candidate generators defined in this
+            module (``candidate_cfgs``/``candidate_cfgs_gpu``/``candidate_cfgs_tpu``)
+            return fixed chunk-size sets and do not read this value, so it has no
+            effect on the candidates produced here.
         use_qk_l2norm: If True, apply L2 normalisation to queries and keys
             before attention (improves numerical stability; default: True).
         use_chunked: If True, use the chunked intra-chunk parallel algorithm
@@ -494,6 +604,10 @@ def gated_delta_rule(
         ...     initial_state=state, return_state=True,
         ... )
     """
+    if initial_state is None and seg_ids is not None and getattr(seg_ids, "ndim", None) == 4:
+        initial_state = seg_ids
+        seg_ids = None
+
     if query.shape[1] == 1 and initial_state is not None:
         from ejkernel.kernels._xla.gated_delta_rule._xla_impl_fwd import (
             _single_step_gdr_fwd,

@@ -868,6 +868,89 @@ class RaggedGatedDeltaRuleConfig(BaseOperationConfig):
 
 
 @dataclass
+class RaggedCausalConv1DConfig(BaseOperationConfig):
+    """Configuration for ragged causal depthwise conv1d.
+
+    Args:
+        d_conv: Static convolution window size.
+        apply_silu: Whether to fuse SiLU into the convolution output.
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    d_conv: int = 4
+    apply_silu: bool = True
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class FusedConvDecodeConfig(BaseOperationConfig):
+    """Configuration for fused conv-state shift + depthwise conv decode.
+
+    Args:
+        d_conv: Static convolution window size.
+        activation: Activation applied after convolution (default: "silu").
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    d_conv: int = 4
+    activation: Literal["silu", "swish", "none"] = "silu"
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class GatedDeltaRuleGroupedDecodeConfig(BaseOperationConfig):
+    """Configuration for grouped GDR single-step decode.
+
+    Args:
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    pass
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class RaggedGatedDeltaRuleV2Config(BaseOperationConfig):
+    """Configuration for the Qwen3-Next packed-inference ragged GDN op.
+
+    This is the mixed-QKV/raw-gate operation used by continuous batching. It
+    wraps decode-only, mixed-prefill, optional TPU fused decode, and optional
+    recurrent-scan prefill paths.
+
+    Attributes:
+        chunk_size: Chunk size for the chunked prefill/scan paths (default: 64).
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    chunk_size: int = 64
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class GDNComputeScheduleV2Config(BaseOperationConfig):
+    """Configuration for GDN v2 schedule-table construction.
+
+    The schedule builder is pure JAX/XLA helper logic used by the ragged GDN v2
+    TPU kernels before launching Pallas compute. It has no tunable kernel tile
+    parameters; the config only controls registry dispatch.
+
+    Attributes:
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    __hash__ = hash_fn
+
+
+@dataclass
 class RWKV4Config(BaseOperationConfig):
     """Configuration for RWKV-4 recurrence operation.
 

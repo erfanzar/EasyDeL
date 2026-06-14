@@ -66,6 +66,29 @@ def _default_block_m() -> int:
     return 256
 
 
+def _pallas_out_shape(shape: tuple[int, ...], dtype: jnp.dtype) -> jax.ShapeDtypeStruct:
+    """Build a Pallas ``out_shape`` entry that varies over the active manual mesh axes.
+
+    The returned ``ShapeDtypeStruct`` is annotated with the manual axes of the current abstract
+    mesh so the value is treated as varying (rather than replicated) under ``shard_map``, which the
+    vocab-parallel CE path relies on for correct per-shard outputs.
+
+    Args:
+        shape: Logical shape of the Pallas output array.
+        dtype: Element dtype of the Pallas output array.
+
+    Returns:
+        A ``jax.ShapeDtypeStruct`` carrying ``shape``/``dtype`` plus a ``ManualAxisType`` whose
+        ``varying`` set equals the current abstract mesh's manual axes.
+    """
+    manual_axes = frozenset(jax.sharding.get_abstract_mesh().manual_axes)
+    return jax.ShapeDtypeStruct(
+        shape,
+        dtype,
+        manual_axis_type=jax.sharding.ManualAxisType(varying=manual_axes),
+    )
+
+
 def _pad_rows_2d(x: jax.Array, pad_rows: int, pad_value: float = 0.0) -> jax.Array:
     """Pad a rank-2 tensor along rows so Pallas grid blocks are rectangular."""
     if pad_rows == 0:
@@ -250,8 +273,8 @@ def _ce_fwd_pallas(logits_2d, targets_1d, weights_1d, *, ignore_index, label_smo
         ),
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
         out_shape=[
-            jax.ShapeDtypeStruct((n_rows_pad,), jnp.float32),
-            jax.ShapeDtypeStruct((n_rows_pad,), jnp.float32),
+            _pallas_out_shape((n_rows_pad,), jnp.float32),
+            _pallas_out_shape((n_rows_pad,), jnp.float32),
         ],
     )(logits_pad, targets_pad.astype(jnp.int32), weights_pad.astype(jnp.float32))
     return loss[:n_rows], lse[:n_rows]
@@ -383,10 +406,10 @@ def _ce_tp_stats_pallas(logits_2d, targets_1d, weights_1d, *, ignore_index, bloc
         ),
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
         out_shape=[
-            jax.ShapeDtypeStruct((n_rows_pad,), jnp.float32),
-            jax.ShapeDtypeStruct((n_rows_pad,), jnp.float32),
-            jax.ShapeDtypeStruct((n_rows_pad,), jnp.float32),
-            jax.ShapeDtypeStruct((n_rows_pad,), jnp.float32),
+            _pallas_out_shape((n_rows_pad,), jnp.float32),
+            _pallas_out_shape((n_rows_pad,), jnp.float32),
+            _pallas_out_shape((n_rows_pad,), jnp.float32),
+            _pallas_out_shape((n_rows_pad,), jnp.float32),
         ],
     )(logits_pad, targets_pad.astype(jnp.int32), weights_pad.astype(jnp.float32))
     return max_val[:n_rows], sum_exp[:n_rows], target_logit[:n_rows], sum_logits[:n_rows]
@@ -552,12 +575,10 @@ def _ce_loss_tp_fwd(
 def _ce_loss_tp_bwd(ignore_index, label_smoothing, z_loss, block_v, block_m, vocab_parallel_axis, residual, dy):
     """Backward rule for TP-vocab CE.
 
-    ``shard_map(check_vma=False)`` distributes the replicated scalar cotangent
-    across TP shards, so the local Pallas gradient is multiplied by the TP axis
-    size before returning.
+    VMA-aware ``shard_map`` keeps the scalar cotangent replicated across TP
+    shards, so the local Pallas gradient can be returned directly.
     """
     logits_2d, lse, local_targets, weights_1d = residual
-    axis_size = jax.lax.psum(jnp.array(1, dtype=jnp.float32), vocab_parallel_axis)
     dlogits = _ce_bwd_pallas(
         logits_2d,
         lse,
@@ -570,7 +591,7 @@ def _ce_loss_tp_bwd(ignore_index, label_smoothing, z_loss, block_v, block_m, voc
         block_v=block_v,
         block_m=block_m,
     )
-    return dlogits * axis_size, None, None
+    return dlogits, None, None
 
 
 _fused_ce_loss_pallas_tp.defvjp(_ce_loss_tp_fwd, _ce_loss_tp_bwd)

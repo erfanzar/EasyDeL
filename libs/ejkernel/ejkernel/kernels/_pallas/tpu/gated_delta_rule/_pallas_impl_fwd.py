@@ -34,7 +34,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jaxtyping import Array, Float
 
-from ...._xla.gated_delta_rule._xla_impl_fwd import _l2norm_with_inv, _recurrent_gdr_fwd
+from ...._xla.gated_delta_rule._xla_impl_fwd import _l2norm_with_inv
 
 _P = lax.Precision.DEFAULT
 _N_FUSE = 1
@@ -153,18 +153,23 @@ def _phase1_kernel_infer(
     k_scaled_ref,
     g_end_exp_ref,
 ):
-    """Phase 1 Pallas kernel — inference mode (precomputed decay masks).
+    """Phase 1 Pallas kernel — inference mode that consumes precomputed decay masks.
 
     Accepts precomputed ``decay_mask`` and ``g_cumsum`` as inputs to avoid
-    recomputing them per-chunk.  Does **not** save ``attn_inv`` in the output
+    recomputing them per-chunk. Does not save ``attn_inv`` in the output
     (not needed at inference time).
 
-    Grid: ``(batch, num_heads, num_chunks)``; all axes are "arbitrary"
-    (processed sequentially by the scan in Phase 2).
+    Note: this kernel is currently unreferenced — ``_run_phase1(inference=True)``
+    dispatches ``_phase1_kernel_fwd`` instead, which recomputes the decay mask
+    in-kernel rather than reading it across the custom-call boundary.
 
-    BlockSpec shape convention: ``(1, 1, 1, chunk_dim)`` for every array.
+    Grid: ``(batch, num_heads, num_chunks)``; the chunk axis is "arbitrary"
+    (threaded sequentially by the scan in Phase 2).
 
-    Inputs:
+    BlockSpec shape convention: ``(1, 1, 1, chunk_dim)`` for every array; leading
+    singleton axes are dropped via ``[0, 0, 0]`` indexing before computation.
+
+    Args:
         q_ref: [1,1,1,C,K] query block.
         k_ref: [1,1,1,C,K] key block.
         v_ref: [1,1,1,C,V] value block.
@@ -173,14 +178,15 @@ def _phase1_kernel_infer(
             g_cumsum are read).
         decay_mask_ref: [1,1,1,C,C] precomputed decay mask.
         g_cumsum_ref: [1,1,1,1,C] cumulative log decay.
+        value_local_ref: [1,1,1,C,V] output — intra-chunk corrected value.
+        k_cumdecay_ref: [1,1,1,C,K] output — decay-weighted key accumulation.
+        attn_qk_ref: [1,1,1,C,C] output — query-key attention matrix.
+        q_scaled_ref: [1,1,1,C,K] output — query scaled by cumulative decay.
+        k_scaled_ref: [1,1,1,C,K] output — key scaled by state-to-end decay.
+        g_end_exp_ref: [1,1,1,1,1] output — exp of the last cumulative decay value.
 
-    Outputs written:
-        value_local_ref: [1,1,1,C,V] intra-chunk corrected value.
-        k_cumdecay_ref: [1,1,1,C,K] decay-weighted key accumulation.
-        attn_qk_ref: [1,1,1,C,C] query-key attention matrix.
-        q_scaled_ref: [1,1,1,C,K] query scaled by cumulative decay.
-        k_scaled_ref: [1,1,1,C,K] key scaled by state-to-end decay.
-        g_end_exp_ref: [1,1,1,1,1] exp of the last cumulative decay value.
+    Returns:
+        None. Results are written in place to the output refs listed above.
     """
     C = q_ref.shape[3]
     q = q_ref[0, 0, 0].astype(jnp.float32)
@@ -224,6 +230,98 @@ def _phase1_kernel_infer(
     g_end_exp_ref[0, 0, 0] = g_end_exp.astype(g_end_exp_ref.dtype)
 
 
+def _phase1_kernel_fwd(
+    q_ref,
+    k_ref,
+    v_ref,
+    beta_ref,
+    decay_ref,
+    value_local_ref,
+    k_cumdecay_ref,
+    attn_qk_ref,
+    q_scaled_ref,
+    k_scaled_ref,
+    g_end_exp_ref,
+):
+    """Phase 1 Pallas kernel for forward-only (inference) calls.
+
+    Computes the decay mask inside the Pallas kernel and writes only the
+    intermediates consumed by phase 2. This avoids feeding a materialized
+    ``[chunk, chunk]`` decay mask across the custom-call boundary when the
+    backward-only ``attn_inv`` residual is not needed. This is the kernel
+    actually dispatched by ``_run_phase1(..., inference=True)``.
+
+    Grid: ``(batch, num_heads, num_chunks)``; the chunk axis is "arbitrary".
+
+    BlockSpec shape convention: ``(1, 1, 1, chunk_dim)`` for every array, so
+    each ref carries a single ``(batch, head, chunk)`` cell. Leading singleton
+    axes are dropped via ``[0, 0, 0]`` indexing before computation.
+
+    Args:
+        q_ref: [1,1,1,C,K] query block (float input dtype).
+        k_ref: [1,1,1,C,K] key block.
+        v_ref: [1,1,1,C,V] value block.
+        beta_ref: [1,1,1,1,C] per-token gate vector.
+        decay_ref: [1,1,1,1,C] per-token log decay vector.
+        value_local_ref: [1,1,1,C,V] output — intra-chunk corrected value.
+        k_cumdecay_ref: [1,1,1,C,K] output — decay-weighted key accumulation.
+        attn_qk_ref: [1,1,1,C,C] output — query-key attention matrix.
+        q_scaled_ref: [1,1,1,C,K] output — query scaled by cumulative decay.
+        k_scaled_ref: [1,1,1,C,K] output — key scaled by state-to-end decay.
+        g_end_exp_ref: [1,1,1,1,1] output — exp of the last cumulative decay value.
+
+    Returns:
+        None. Results are written in place to the output refs listed above.
+    """
+    C = q_ref.shape[3]
+    q = q_ref[0, 0, 0].astype(jnp.float32)
+    k = k_ref[0, 0, 0].astype(jnp.float32)
+    v = v_ref[0, 0, 0].astype(jnp.float32)
+    beta = beta_ref[0, 0, 0, 0]
+    decay = decay_ref[0, 0, 0, 0]
+
+    lower_mask = jnp.tril(jnp.ones((C, C), dtype=jnp.float32))
+    strict_lower = lower_mask - jnp.eye(C, dtype=jnp.float32)
+
+    v_beta = v * beta[:, None]
+    k_beta = k * beta[:, None]
+
+    g_cumsum = jnp.sum(lower_mask * decay[None, :], axis=1, keepdims=True)
+    g_diff = g_cumsum - g_cumsum.T
+    decay_mask = jnp.exp(jnp.clip(g_diff * lower_mask, -20.0, 20.0)) * lower_mask
+
+    attn_neg = -(_dot(k_beta, k.T) * decay_mask) * strict_lower
+    attn_neg = jnp.nan_to_num(attn_neg, nan=0.0, posinf=0.0, neginf=0.0)
+    attn_inv = _neumann_inv(attn_neg, C, strict_lower=strict_lower, lower_mask=lower_mask)
+
+    g_cumsum_exp = jnp.exp(jnp.clip(g_cumsum, -20.0, 20.0))
+    g_end = g_cumsum[C - 1 : C, :]
+    g_end_exp = jnp.exp(jnp.clip(g_end, -20.0, 20.0))
+    g_diff_state_exp = jnp.exp(jnp.clip(g_end - g_cumsum, -20.0, 20.0))
+
+    k_beta_scaled = k_beta * g_cumsum_exp
+    combined_rhs = jnp.concatenate([v_beta, k_beta_scaled], axis=-1)
+    combined_out = _dot(attn_inv, combined_rhs)
+    V = v_beta.shape[-1]
+    value_local = combined_out[:, :V]
+    k_cumdecay = combined_out[:, V:]
+
+    attn_qk = _dot(q, k.T) * decay_mask
+    q_scaled = q * g_cumsum_exp
+    k_scaled = k * g_diff_state_exp
+
+    def _s(x):
+        """Replace NaN/+Inf/-Inf entries in ``x`` with 0.0 before it is written out."""
+        return jnp.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+
+    value_local_ref[0, 0, 0] = _s(value_local).astype(value_local_ref.dtype)
+    k_cumdecay_ref[0, 0, 0] = _s(k_cumdecay).astype(k_cumdecay_ref.dtype)
+    attn_qk_ref[0, 0, 0] = _s(attn_qk).astype(attn_qk_ref.dtype)
+    q_scaled_ref[0, 0, 0] = q_scaled.astype(q_scaled_ref.dtype)
+    k_scaled_ref[0, 0, 0] = k_scaled.astype(k_scaled_ref.dtype)
+    g_end_exp_ref[0, 0, 0] = jnp.broadcast_to(g_end_exp, (1, 1)).astype(g_end_exp_ref.dtype)
+
+
 def _phase1_kernel_train(
     q_ref,
     k_ref,
@@ -238,31 +336,34 @@ def _phase1_kernel_train(
     g_end_exp_ref,
     attn_inv_ref,
 ):
-    """Phase 1 Pallas kernel — training mode (computes and saves attn_inv).
+    """Phase 1 Pallas kernel — training mode that also saves ``attn_inv``.
 
-    Computes all chunk-local intermediates from scratch and writes
-    ``attn_inv`` to an output ref so the backward pass can use it without
-    re-running the Neumann series.
+    Computes all chunk-local intermediates from scratch (including the in-kernel
+    decay mask) and additionally writes ``attn_inv`` to an output ref so the
+    backward pass can reuse it without re-running the Neumann series. Dispatched
+    by ``_run_phase1(inference=False)``.
 
     Grid: ``(batch, num_heads, num_chunks)``; the chunk axis is "arbitrary".
 
-    BlockSpec shape convention: ``(1, 1, 1, chunk_dim)`` for every array.
+    BlockSpec shape convention: ``(1, 1, 1, chunk_dim)`` for every array; leading
+    singleton axes are dropped via ``[0, 0, 0]`` indexing before computation.
 
-    Inputs:
+    Args:
         q_ref: [1,1,1,C,K] query block.
         k_ref: [1,1,1,C,K] key block.
         v_ref: [1,1,1,C,V] value block.
         beta_ref: [1,1,1,1,C] gate vector.
         decay_ref: [1,1,1,1,C] log decay vector.
+        value_local_ref: [1,1,1,C,V] output — intra-chunk corrected value.
+        k_cumdecay_ref: [1,1,1,C,K] output — decay-weighted key accumulation.
+        attn_qk_ref: [1,1,1,C,C] output — query-key attention matrix.
+        q_scaled_ref: [1,1,1,C,K] output — query scaled by cumulative decay.
+        k_scaled_ref: [1,1,1,C,K] output — key scaled by state-to-end decay.
+        g_end_exp_ref: [1,1,1,1,1] output — exp of the last cumulative decay value.
+        attn_inv_ref: [1,1,1,C,C] output — ``(I - A)^{-1}`` saved for backward.
 
-    Outputs written (same layout as inference kernel plus):
-        value_local_ref: [1,1,1,C,V].
-        k_cumdecay_ref: [1,1,1,C,K].
-        attn_qk_ref: [1,1,1,C,C].
-        q_scaled_ref: [1,1,1,C,K].
-        k_scaled_ref: [1,1,1,C,K].
-        g_end_exp_ref: [1,1,1,1,1].
-        attn_inv_ref: [1,1,1,C,C] — ``(I - A)^{-1}`` saved for backward.
+    Returns:
+        None. Results are written in place to the output refs listed above.
     """
     C = q_ref.shape[3]
     q = q_ref[0, 0, 0].astype(jnp.float32)
@@ -297,6 +398,7 @@ def _phase1_kernel_train(
     k_scaled = k * g_diff_state_exp
 
     def _s(x):
+        """Replace NaN/+Inf/-Inf entries in ``x`` with 0.0 before it is written out."""
         return jnp.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
 
     value_local_ref[0, 0, 0] = _s(value_local).astype(value_local_ref.dtype)
@@ -311,8 +413,9 @@ def _phase1_kernel_train(
 def _run_phase1(query_c, key_c, value_c, beta_c, decay_c, *, inference=False):
     """Launch the Phase 1 Pallas kernel over ALL chunks simultaneously.
 
-    Dispatches to either ``_phase1_kernel_infer`` (faster, no ``attn_inv``
-    saved) or ``_phase1_kernel_train`` (saves ``attn_inv`` for backward).
+    Dispatches to either ``_phase1_kernel_fwd`` (forward-only, no
+    ``attn_inv`` saved) or ``_phase1_kernel_train`` (saves ``attn_inv`` for
+    backward).
 
     Args:
         query_c: Reshaped query [B, H, NC, C, K].
@@ -333,18 +436,23 @@ def _run_phase1(query_c, key_c, value_c, beta_c, decay_c, *, inference=False):
     V = value_c.shape[-1]
 
     def bs3(shape):
+        """Build a per-chunk BlockSpec of block shape ``(1, 1, 1, *shape)``.
+
+        The index map selects the ``(b, h, c)`` cell for grid coordinates
+        ``(batch, head, chunk)`` and zero for the remaining (within-block) axes.
+
+        Args:
+            shape: Trailing block dimensions appended after the three leading
+                singleton ``(batch, head, chunk)`` axes.
+
+        Returns:
+            A ``pl.BlockSpec`` indexed by ``(b, h, c)``.
+        """
         return pl.BlockSpec((1, 1, 1, *shape), lambda b, h, c: (b, h, c, *([0] * len(shape))))
 
     if inference:
-        decay_flat = decay_c.squeeze(-2)
-        g_cumsum = jnp.cumsum(decay_flat, axis=-1)
-        g_cs = g_cumsum[..., None]
-        lower_mask = jnp.tril(jnp.ones((C, C), dtype=jnp.float32))
-        decay_mask = jnp.exp(jnp.clip((g_cs - g_cs.transpose(0, 1, 2, 4, 3)) * lower_mask, -20.0, 20.0)) * lower_mask
-        g_cumsum_input = g_cumsum.reshape(B, H, NC, 1, C).astype(jnp.float32)
-
         call = pl.pallas_call(
-            _phase1_kernel_infer,
+            _phase1_kernel_fwd,
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=0,
                 in_specs=[
@@ -352,8 +460,6 @@ def _run_phase1(query_c, key_c, value_c, beta_c, decay_c, *, inference=False):
                     bs3((C, K)),
                     bs3((C, V)),
                     bs3((1, C)),
-                    bs3((1, C)),
-                    bs3((C, C)),
                     bs3((1, C)),
                 ],
                 out_specs=[
@@ -378,7 +484,7 @@ def _run_phase1(query_c, key_c, value_c, beta_c, decay_c, *, inference=False):
                 dimension_semantics=("parallel", "parallel", "arbitrary"),
             ),
         )
-        results = call(query_c, key_c, value_c, beta_c, decay_c, decay_mask, g_cumsum_input)
+        results = call(query_c, key_c, value_c, beta_c, decay_c)
         return (*results, None)
     else:
         call = pl.pallas_call(
@@ -440,6 +546,7 @@ def _phase2_scan_body(state, inputs):
     value_local, k_cumdecay, attn_qk, q_scaled, k_scaled, g_end_exp = inputs
 
     def _s(x):
+        """Replace NaN/+Inf/-Inf entries in ``x`` with 0.0 for stable scan gradients."""
         return jnp.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
 
     v_prime = _s(jnp.einsum("bhck,bhkv->bhcv", k_cumdecay, state))
@@ -520,8 +627,8 @@ def _chunk_gdr_fwd_core(
         use_qk_l2norm: Apply L2 normalisation to Q and K before computation.
         save_residual: If True, package and return the residual tuple needed
             by the backward pass.
-        inference: If True, use the faster inference kernel (precomputed
-            decay masks, no ``attn_inv`` saved, fewer NaN guards).
+        inference: If True, use the forward-only kernel (no ``attn_inv``
+            residual saved).
 
     Returns:
         Three-element tuple ``(output, final_state, residual)`` where
@@ -699,12 +806,11 @@ def _chunk_gdr_fwd(
     Float[Array, "batch num_heads seq_len d_state"],
     Float[Array, "batch num_heads head_dim d_state"],
 ]:
-    """Exact multi-token chunked GDR forward path.
+    """Multi-token chunked GDR forward path.
 
-    Multi-token training/prefill is routed through the XLA recurrent
-    implementation (``_recurrent_gdr_fwd``) for numerical stability, while
-    the optimised Pallas single-token decode kernel remains active for
-    ``seq_len == 1`` decoding.
+    Dense training uses the TPU Pallas chunked custom-VJP implementation. Packed
+    training is intercepted by the public interface before this helper because
+    the hand-written Pallas backward is segment-blind.
 
     Args:
         query: [B, H, L, K].
@@ -712,48 +818,59 @@ def _chunk_gdr_fwd(
         value: [B, H, L, V].
         beta: [B, H, L].
         decay: [B, H, L] or None.
-        chunk_size: Passed through to ``_recurrent_gdr_fwd``.
+        chunk_size: Number of tokens per chunk.
         initial_state: [B, H, K, V] or None.
         use_qk_l2norm: Apply L2 normalisation to Q/K.
 
     Returns:
         ``(output [B, H, L, V], final_state [B, H, K, V])``.
     """
-    return _recurrent_gdr_fwd(
-        query=query,
-        key=key,
-        value=value,
-        beta=beta,
-        decay=decay,
-        initial_state=initial_state,
-        use_qk_l2norm=use_qk_l2norm,
-        chunk_size=chunk_size,
+    return _chunk_gdr_fwd_pallas_chunk(
+        query,
+        key,
+        value,
+        beta,
+        decay,
+        chunk_size,
+        initial_state,
+        use_qk_l2norm,
     )
 
 
 def _gdr_single_step_fwd_kernel(q_ref, k_ref, v_ref, beta_ref, decay_ref, state_ref, out_ref, final_state_ref):
-    """Pallas kernel for one GDR decode step (seq_len == 1).
+    """Pallas kernel for one GDR decode step (seq_len == 1), non-DMA variant.
 
-    Grid: ``(batch, num_heads)``; both axes are "parallel".
+    Reads the recurrent state directly from its input ref (no async copy). This
+    is the simpler counterpart to ``_gdr_single_step_fwd_dma_kernel`` and is
+    currently unreferenced — ``_run_single_step_forward`` dispatches the DMA
+    variant instead.
 
-    Inputs (all with BlockSpec ``(1, 1, ..., dim)``):
-        q_ref: [B, H, 1, 1, K] — query for the current token.
-        k_ref: [B, H, 1, 1, K] — key for the current token.
-        v_ref: [B, H, 1, 1, V] — value for the current token.
-        beta_ref: [B, H, 1, 1] — gate scalar.
-        decay_ref: [B, H, 1, 1] — log decay scalar.
-        state_ref: [B, H, 1, K, V] — previous recurrent state.
+    Grid: ``(batch, num_heads)``; both axes are "parallel". Each ref carries one
+    ``(batch, head)`` cell with singleton block axes that are dropped by indexing.
 
-    Outputs written:
-        out_ref: [B, H, 1, 1, V] — attention output for the token.
-        final_state_ref: [B, H, 1, K, V] — updated recurrent state.
+    Args:
+        q_ref: query ref for the current token; ``q_ref[0, 0, 0]`` yields [K].
+        k_ref: key ref for the current token; ``k_ref[0, 0, 0]`` yields [K].
+        v_ref: value ref for the current token; ``v_ref[0, 0, 0]`` yields [V].
+        beta_ref: gate ref; ``beta_ref[0, 0]`` reshaped to a scalar.
+        decay_ref: log decay ref; ``decay_ref[0, 0]`` reshaped to a scalar.
+        state_ref: previous recurrent state ref; ``state_ref[0, 0]`` yields [K, V].
+        out_ref: output ref; ``out_ref[0, 0, 0]`` receives the [V] token output.
+        final_state_ref: output ref; ``final_state_ref[0, 0]`` receives the
+            updated [K, V] recurrent state.
 
-    Computation:
-        state_decayed = state_prev * exp(decay_t)
-        kv_mem        = state_decayed @ k_t         (K -> V projection)
-        delta         = (v_t - kv_mem) * beta_t
-        state_new     = state_decayed + k_t[:, None] * delta[None, :]
-        out_t         = state_new @ q_t
+    Returns:
+        None. The token output and updated state are written in place to
+        ``out_ref`` and ``final_state_ref``.
+
+    Notes:
+        The update implements the GDR decode recurrence::
+
+            state_decayed = state_prev * exp(clip(decay_t))
+            kv_mem        = sum(state_decayed * k_t[:, None], axis=0)   # K -> V
+            delta         = (v_t - kv_mem) * beta_t
+            state_new     = state_decayed + k_t[:, None] * delta[None, :]
+            out_t         = sum(state_new * q_t[:, None], axis=0)       # K -> V
     """
     q_t = q_ref[0, 0, 0].astype(jnp.float32)
     k_t = k_ref[0, 0, 0].astype(jnp.float32)
@@ -782,11 +899,36 @@ def _gdr_single_step_fwd_dma_kernel(
     state_tile_ref,
     dma_sem_ref,
 ):
-    """DMA-backed Pallas kernel for one GDR decode step.
+    """DMA-backed Pallas kernel for one GDR decode step (seq_len == 1).
 
     The recurrent state is the only operand large enough to amortize DMA
-    setup. It is copied asynchronously while the per-token q/k/v vectors and
-    scalar gate/decay values are loaded directly.
+    setup, so it is copied asynchronously from its input ref into a VMEM scratch
+    tile while the per-token q/k/v vectors and scalar gate/decay values are read
+    directly. The copy is started, the cheap reads happen, then the copy is
+    awaited before the state is consumed. This is the kernel actually dispatched
+    by ``_run_single_step_forward``.
+
+    Grid: ``(batch, num_heads)``; both axes are "parallel". Each ref carries one
+    ``(batch, head)`` cell with singleton block axes dropped by indexing.
+
+    Args:
+        q_ref: query ref; ``q_ref[0, 0, 0]`` yields [qk_dim].
+        k_ref: key ref; ``k_ref[0, 0, 0]`` yields [qk_dim].
+        v_ref: value ref; ``v_ref[0, 0, 0]`` yields [v_dim].
+        beta_ref: gate ref; ``beta_ref[0, 0, 0, 0]`` is the scalar gate.
+        decay_ref: log decay ref; ``decay_ref[0, 0, 0, 0]`` is the scalar decay.
+        state_ref: previous recurrent state ref, shape [1, 1, qk_dim, v_dim];
+            DMA source.
+        out_ref: output ref; ``out_ref[0, 0, 0]`` receives the [v_dim] output.
+        final_state_ref: output ref; ``final_state_ref[0, 0]`` receives the
+            updated [qk_dim, v_dim] recurrent state.
+        state_tile_ref: VMEM scratch ref, shape [1, 1, qk_dim, v_dim]; DMA
+            destination holding the prefetched state.
+        dma_sem_ref: DMA semaphore ref used to synchronise the async copy.
+
+    Returns:
+        None. The token output and updated state are written in place to
+        ``out_ref`` and ``final_state_ref``.
     """
     qk_dim = q_ref.shape[3]
     v_dim = v_ref.shape[3]

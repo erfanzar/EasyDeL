@@ -1,5 +1,26 @@
 #!/usr/bin/env python3
-"""Shared benchmark helpers for ejkernel operations."""
+"""Shared benchmark helpers and registry for ejkernel operations.
+
+This module backs the per-operation benchmark CLIs.  It defines:
+
+- ``OpBenchmarkSpec``: a dataclass capturing everything needed to benchmark one
+  kernel operation (the callable, input generator, config sweep, and wrappers).
+- ``_cfgs_*`` factories: each returns the list of configuration dicts (the
+  parameter sweep) for one operation, optionally truncated by an environment
+  variable.
+- ``_gen_*`` / ``_make_*`` factories: each turns a single config dict into the
+  positional input tuple passed to the operation under test.
+- ``_*_wrapper`` factories: each adapts an operation's calling convention
+  (injecting ``platform``, marking static kwargs, unwrapping tuple outputs, or
+  adding surrounding producer/consumer work) for the benchmark harness.
+- ``SPECS``: the registry mapping operation names to their ``OpBenchmarkSpec``.
+- ``run_benchmark``: the entry point that resolves a spec, builds the
+  platform-specific callables, runs the timing loop, and saves a plot.
+
+It fits into the package as the single source of truth for how each ejkernel
+operation is exercised in benchmarks, so individual benchmark scripts only need
+to call ``run_benchmark(<op_name>)``.
+"""
 
 from __future__ import annotations
 
@@ -13,7 +34,6 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
-
 from ejkernel.benchmarks import Benchmark
 from ejkernel.kernels._registry import Backend, kernel_registry
 from ejkernel.modules import operations as ops
@@ -149,6 +169,14 @@ def _wrap_op(op_fn: Callable[..., Any], platform: str) -> Callable[..., Any]:
     """
 
     def _fn(*args):
+        """Call the captured ``op_fn`` with ``platform`` and unwrap tuple results.
+
+        Args:
+            *args: Positional inputs forwarded unchanged to ``op_fn``.
+
+        Returns:
+            The first element when ``op_fn`` returns a tuple, otherwise the result itself.
+        """
         out = op_fn(*args, platform=platform)
         return out[0] if isinstance(out, tuple) else out
 
@@ -169,6 +197,14 @@ def _wrap_op_with_kwargs(op_fn: Callable[..., Any], platform: str, **fixed_kwarg
     """
 
     def _fn(*args):
+        """Call the captured ``op_fn`` with ``platform`` plus the fixed kwargs and unwrap tuples.
+
+        Args:
+            *args: Positional inputs forwarded unchanged to ``op_fn``.
+
+        Returns:
+            The first element when ``op_fn`` returns a tuple, otherwise the result itself.
+        """
         out = op_fn(*args, platform=platform, **fixed_kwargs)
         return out[0] if isinstance(out, tuple) else out
 
@@ -186,6 +222,14 @@ def _wrap_op_no_platform(op_fn: Callable[..., Any]) -> Callable[..., Any]:
     """
 
     def _fn(*args):
+        """Call the captured ``op_fn`` without a platform argument and unwrap tuple results.
+
+        Args:
+            *args: Positional inputs forwarded unchanged to ``op_fn``.
+
+        Returns:
+            The first element when ``op_fn`` returns a tuple, otherwise the result itself.
+        """
         out = op_fn(*args)
         return out[0] if isinstance(out, tuple) else out
 
@@ -205,6 +249,18 @@ def _wrap_attention_like(op_fn: Callable[..., Any], platform: str) -> Callable[.
     """
 
     def _fn(q, k, v, causal, sliding_window):
+        """Forward positional attention inputs to ``op_fn`` as kwargs and unwrap tuple results.
+
+        Args:
+            q: Query tensor.
+            k: Key tensor.
+            v: Value tensor.
+            causal: Whether to apply a causal mask, passed as a keyword argument.
+            sliding_window: Sliding-window span, passed as a keyword argument.
+
+        Returns:
+            The first element when ``op_fn`` returns a tuple, otherwise the attention output.
+        """
         out = op_fn(q, k, v, causal=causal, sliding_window=sliding_window, platform=platform)
         return out[0] if isinstance(out, tuple) else out
 
@@ -212,7 +268,23 @@ def _wrap_attention_like(op_fn: Callable[..., Any], platform: str) -> Callable[.
 
 
 def _attention_registry_op(q, k, v, causal, sliding_window, *, platform: str):
-    """Dispatch attention through the registry because the public wrapper has no platform argument."""
+    """Dispatch plain attention through the registry, bypassing the public wrapper.
+
+    The public ``attention`` module operation does not accept a ``platform``
+    argument, so this helper resolves the implementation directly from the
+    kernel registry to force a specific platform during benchmarking.
+
+    Args:
+        q: Query tensor of shape ``(batch, seq, qheads, dim)``.
+        k: Key tensor of shape ``(batch, seq, kvheads, dim)``.
+        v: Value tensor of shape ``(batch, seq, kvheads, dim)``.
+        causal: Whether to apply a causal mask.
+        sliding_window: Optional ``(left, right)`` sliding-window span, or ``None``.
+        platform: Platform name used to resolve the implementation in the registry.
+
+    Returns:
+        The attention output produced by the resolved kernel implementation.
+    """
     backend = Backend(jax.default_backend())
     impl = kernel_registry.get("attention", platform=platform, backend=backend)
     return impl(q, k, v, causal=causal, sliding_window=sliding_window)
@@ -699,6 +771,42 @@ def _cfgs_ragged_gdr():
         tokens_per_request=[1, 4, 16],
         heads=[2, 4],
         dim=[16, 32, 64],
+    )
+    return _limit_configs(configs)
+
+
+def _cfgs_gdr_high_padding():
+    """Generate a high-T, mostly-padding GDR config."""
+    configs = _grid(
+        batch=[1],
+        seq=[16384],
+        valid=[128],
+        heads=[1],
+        dim=[8],
+        chunk_size=[256],
+        dtype=["bf16"],
+    )
+    return _limit_configs(configs)
+
+
+def _cfgs_gdr_decode_fused():
+    """Generate decode-like GDR configs with surrounding producer/consumer work."""
+    configs = _grid(
+        batch=[1],
+        heads=[16],
+        dim=[128],
+        dtype=["bf16"],
+    )
+    return _limit_configs(configs)
+
+
+def _cfgs_ragged_gdr_decode_fused():
+    """Generate ragged decode-like GDR configs with surrounding work."""
+    configs = _grid(
+        num_tokens=[64],
+        heads=[16],
+        dim=[128],
+        dtype=["bf16"],
     )
     return _limit_configs(configs)
 
@@ -1400,6 +1508,85 @@ def _gen_ragged_gdr_inputs(config: dict[str, Any]):
     )
 
 
+def _gen_gdr_high_padding_inputs(config: dict[str, Any]):
+    """Generate dense GDR inputs with a long padding tail marked by ``seg_ids=-1``."""
+    batch = config.get("batch", 1)
+    seq = config.get("seq", 16384)
+    valid = config.get("valid", 128)
+    heads = config.get("heads", 1)
+    dim = config.get("dim", 8)
+    dtype = _as_jax_dtype(config.get("dtype", _default_dtype()))
+    key = jax.random.PRNGKey(config.get("seed", 0))
+    k1, k2, k3, k4, k5 = jax.random.split(key, 5)
+    q = jax.random.normal(k1, (batch, seq, heads, dim), dtype=dtype)
+    k = jax.random.normal(k2, (batch, seq, heads, dim), dtype=dtype)
+    v = jax.random.normal(k3, (batch, seq, heads, dim), dtype=dtype)
+    beta = jax.nn.sigmoid(jax.random.normal(k4, (batch, seq, heads), dtype=jnp.float32)).astype(dtype)
+    decay = (jax.random.normal(k5, (batch, seq, heads), dtype=jnp.float32) * -0.01).astype(dtype)
+    seg_ids = jnp.concatenate(
+        [
+            jnp.zeros((batch, valid), dtype=jnp.int32),
+            -jnp.ones((batch, seq - valid), dtype=jnp.int32),
+        ],
+        axis=1,
+    )
+    chunk_size = int(config.get("chunk_size", 256))
+    use_chunked = True
+    return q, k, v, beta, decay, seg_ids, chunk_size, use_chunked
+
+
+def _gen_gdr_decode_fused_inputs(config: dict[str, Any]):
+    """Generate single-step GDR decode inputs plus surrounding-work operands."""
+    batch = config.get("batch", 1)
+    heads = config.get("heads", 16)
+    dim = config.get("dim", 128)
+    dtype = _as_jax_dtype(config.get("dtype", _default_dtype()))
+    key = jax.random.PRNGKey(config.get("seed", 0))
+    keys = jax.random.split(key, 7)
+    q = jax.random.normal(keys[0], (batch, 1, heads, dim), dtype=dtype)
+    k = jax.random.normal(keys[1], (batch, 1, heads, dim), dtype=dtype)
+    v = jax.random.normal(keys[2], (batch, 1, heads, dim), dtype=dtype)
+    beta_logits = jax.random.normal(keys[3], (batch, 1, heads), dtype=dtype)
+    decay_raw = jax.random.normal(keys[4], (batch, 1, heads), dtype=dtype)
+    state = (jax.random.normal(keys[5], (batch, heads, dim, dim), dtype=jnp.float32) * 0.01).astype(dtype)
+    gate = jax.random.normal(keys[6], (batch, 1, heads, dim), dtype=dtype)
+    return q, k, v, beta_logits, decay_raw, state, gate
+
+
+def _gen_ragged_gdr_decode_fused_inputs(config: dict[str, Any]):
+    """Generate ragged decode inputs plus surrounding-work operands."""
+    num_tokens = config.get("num_tokens", 64)
+    heads = config.get("heads", 16)
+    dim = config.get("dim", 128)
+    dtype = _as_jax_dtype(config.get("dtype", _default_dtype()))
+    key = jax.random.PRNGKey(config.get("seed", 0))
+    keys = jax.random.split(key, 7)
+    q = jax.random.normal(keys[0], (num_tokens, heads, dim), dtype=dtype)
+    k = jax.random.normal(keys[1], (num_tokens, heads, dim), dtype=dtype)
+    v = jax.random.normal(keys[2], (num_tokens, heads, dim), dtype=dtype)
+    beta_logits = jax.random.normal(keys[3], (num_tokens, heads), dtype=dtype)
+    decay_raw = jax.random.normal(keys[4], (num_tokens, heads), dtype=dtype)
+    recurrent_state = (jax.random.normal(keys[5], (num_tokens, heads, dim, dim), dtype=jnp.float32) * 0.01).astype(dtype)
+    gate = jax.random.normal(keys[6], (num_tokens, heads, dim), dtype=dtype)
+    query_start_loc = jnp.arange(num_tokens + 1, dtype=jnp.int32)
+    state_indices = jnp.arange(num_tokens, dtype=jnp.int32)
+    chunk_size = 1
+    use_qk_l2norm = True
+    return (
+        q,
+        k,
+        v,
+        beta_logits,
+        decay_raw,
+        recurrent_state,
+        query_start_loc,
+        state_indices,
+        gate,
+        chunk_size,
+        use_qk_l2norm,
+    )
+
+
 def _gen_all_gather_matmul_inputs(config: dict[str, Any]):
     """Generate inputs for all-gather matmul."""
     m = config.get("m", 128)
@@ -1614,6 +1801,18 @@ def _quantized_wrapper(op_fn: Callable[..., Any], platform: str):
     """Wrap a quantized matmul op to accept ``mode`` positionally and inject ``platform``."""
 
     def _fn(x, w, scales, biases, mode):
+        """Call the quantized matmul ``op_fn`` with ``mode`` and ``platform`` kwargs and unwrap tuples.
+
+        Args:
+            x: Activation tensor.
+            w: Quantized weight tensor.
+            scales: Per-group dequantization scales.
+            biases: Per-group dequantization biases.
+            mode: Quantization mode, passed as a keyword argument.
+
+        Returns:
+            The first element when ``op_fn`` returns a tuple, otherwise the matmul result.
+        """
         out = op_fn(x, w, scales, biases, mode=mode, platform=platform)
         return out[0] if isinstance(out, tuple) else out
 
@@ -1624,6 +1823,18 @@ def _lightning_wrapper(op_fn: Callable[..., Any], platform: str):
     """Wrap a lightning attention op to pass ``layer_idx``, ``num_layers``, and ``platform`` as kwargs."""
 
     def _fn(q, k, v, layer_idx, num_layers):
+        """Call the lightning attention ``op_fn`` with layer metadata and ``platform`` kwargs, unwrapping tuples.
+
+        Args:
+            q: Query tensor.
+            k: Key tensor.
+            v: Value tensor.
+            layer_idx: Index of the current layer, passed as a keyword argument.
+            num_layers: Total number of layers, passed as a keyword argument.
+
+        Returns:
+            The first element when ``op_fn`` returns a tuple, otherwise the attention output.
+        """
         out = op_fn(q, k, v, layer_idx=layer_idx, num_layers=num_layers, platform=platform)
         return out[0] if isinstance(out, tuple) else out
 
@@ -1634,6 +1845,16 @@ def _grouped_matmul_v2_wrapper(op_fn: Callable[..., Any], platform: str):
     """Wrap a grouped matmul op to enable v2 mode and inject ``platform``."""
 
     def _fn(lhs, rhs, group_sizes):
+        """Call the grouped matmul ``op_fn`` with ``use_v2=True`` and ``platform`` kwargs, unwrapping tuples.
+
+        Args:
+            lhs: Left-hand operand tensor.
+            rhs: Right-hand operand tensor.
+            group_sizes: Per-group row counts defining the ragged grouping.
+
+        Returns:
+            The first element when ``op_fn`` returns a tuple, otherwise the matmul result.
+        """
         out = op_fn(lhs, rhs, group_sizes, use_v2=True, platform=platform)
         return out[0] if isinstance(out, tuple) else out
 
@@ -1644,6 +1865,19 @@ def _apply_native_sparse_wrapper(op_fn: Callable[..., Any], platform: str):
     """Wrap selected-block sparse attention with a static block size."""
 
     def _fn(query, key, value, block_indices, block_counts, block_size):
+        """Forward all selected-block sparse attention inputs to ``op_fn`` and unwrap tuple results.
+
+        Args:
+            query: Query tensor.
+            key: Key tensor.
+            value: Value tensor.
+            block_indices: Per-query indices of the selected key/value blocks.
+            block_counts: Number of selected blocks per query.
+            block_size: Static block size for the selected-attention kernel.
+
+        Returns:
+            The first element when ``op_fn`` returns a tuple, otherwise the attention output.
+        """
         out = op_fn(query, key, value, block_indices, block_counts, block_size, platform=platform)
         return out[0] if isinstance(out, tuple) else out
 
@@ -1654,6 +1888,21 @@ def _native_sparse_wrapper(op_fn: Callable[..., Any], platform: str):
     """Wrap native sparse attention with explicit block indices and platform."""
 
     def _fn(query, key, value, block_indices, block_counts):
+        """Call native sparse attention with a computed softmax scale and platform-specific block counts.
+
+        Derives the softmax scale from the head dimension, and on the ``triton`` platform replaces the
+        per-query ``block_counts`` tensor with a static block count read from ``block_indices``.
+
+        Args:
+            query: Query tensor whose last dimension sets the softmax scale.
+            key: Key tensor.
+            value: Value tensor.
+            block_indices: Per-query indices of the selected key/value blocks.
+            block_counts: Number of selected blocks per query (overridden on triton).
+
+        Returns:
+            The first element when ``op_fn`` returns a tuple, otherwise the attention output.
+        """
         softmax_scale = 1.0 / math.sqrt(query.shape[-1])
         block_counts_arg = int(block_indices.shape[-1]) if platform == "triton" else block_counts
         out = op_fn(
@@ -1676,6 +1925,21 @@ def _page_attention_wrapper(op_fn: Callable[..., Any], platform: str):
     """Wrap page attention with a static maximum context length."""
 
     def _fn(query, key_cache, value_cache, context_lens, block_tables):
+        """Call paged attention, supplying a static ``max_context_len`` on the triton platform.
+
+        On ``triton`` the maximum context length is derived from the paged KV-cache block size times the
+        number of blocks per sequence; other platforms infer it internally.
+
+        Args:
+            query: Decode query tensor.
+            key_cache: Paged key cache.
+            value_cache: Paged value cache.
+            context_lens: Per-sequence context lengths.
+            block_tables: Per-sequence page tables mapping logical to physical blocks.
+
+        Returns:
+            The first element when ``op_fn`` returns a tuple, otherwise the attention output.
+        """
         kwargs = {"platform": platform}
         if platform == "triton":
             kwargs["max_context_len"] = key_cache.shape[2] * block_tables.shape[1]
@@ -1689,7 +1953,28 @@ def _registry_wrapper(algorithm: str):
     """Build a wrapper factory that dispatches directly through the registry."""
 
     def _factory(_op_fn: Callable[..., Any], platform: str):
+        """Build a benchmark callable that resolves ``algorithm`` from the registry for ``platform``.
+
+        The public ``_op_fn`` is ignored; the implementation is fetched directly from the registry so a
+        specific platform can be forced during benchmarking.
+
+        Args:
+            _op_fn: Unused public operation callable (kept for the wrapper-factory signature).
+            platform: Platform name used to resolve the implementation in the registry.
+
+        Returns:
+            A callable that dispatches positional inputs through the resolved registry implementation.
+        """
+
         def _fn(*args):
+            """Resolve the registry implementation for the current backend and call it, unwrapping tuples.
+
+            Args:
+                *args: Positional inputs forwarded to the resolved implementation.
+
+            Returns:
+                The first element when the implementation returns a tuple, otherwise the result itself.
+            """
             backend = Backend(jax.default_backend())
             impl = kernel_registry.get(algorithm, platform=platform, backend=backend)
             out = impl(*args)
@@ -1704,6 +1989,22 @@ def _deepseek_wrapper(op_fn: Callable[..., Any], platform: str):
     """Wrap DeepSeek attention with static top-k and causal arguments."""
 
     def _fn(query, key_value, w_kc, w_vc, query_index, key_index, index_weights, index_topk, causal):
+        """Call DeepSeek attention forwarding ``index_topk``, ``causal``, and ``platform`` as kwargs.
+
+        Args:
+            query: Query tensor.
+            key_value: Joint key/value latent tensor.
+            w_kc: Key up-projection (decompression) weight.
+            w_vc: Value up-projection (decompression) weight.
+            query_index: Per-query sparse index tensor.
+            key_index: Per-key sparse index tensor.
+            index_weights: Weights applied to the sparse indices.
+            index_topk: Static number of selected indices per query.
+            causal: Whether to apply a causal mask.
+
+        Returns:
+            The first element when ``op_fn`` returns a tuple, otherwise the attention output.
+        """
         out = op_fn(
             query,
             key_value,
@@ -1725,6 +2026,19 @@ def _flash_mla_wrapper(op_fn: Callable[..., Any], platform: str):
     """Wrap flash MLA with static causal and sliding-window knobs."""
 
     def _fn(query, key_value, w_kc, w_vc, causal, sliding_window):
+        """Call flash MLA forwarding ``causal``, ``sliding_window``, and ``platform`` as kwargs.
+
+        Args:
+            query: Query tensor.
+            key_value: Joint key/value latent tensor.
+            w_kc: Key up-projection (decompression) weight.
+            w_vc: Value up-projection (decompression) weight.
+            causal: Whether to apply a causal mask.
+            sliding_window: Sliding-window span, or ``None`` for full attention.
+
+        Returns:
+            The first element when ``op_fn`` returns a tuple, otherwise the attention output.
+        """
         out = op_fn(
             query,
             key_value,
@@ -1756,6 +2070,25 @@ def _mla_ragged_wrapper(op_fn: Callable[..., Any], platform: str):
         sliding_window,
         logits_soft_cap,
     ):
+        """Call MLA ragged paged attention, forwarding scalar knobs and ``platform`` as kwargs.
+
+        Args:
+            queries_nope: Non-positional (NoPE) query component.
+            queries_pe: Positional (RoPE) query component.
+            keys_values: Compressed key/value latent tensor.
+            keys_pe: Positional (RoPE) key component.
+            kv_cache: Paged KV cache.
+            kv_lens: Per-sequence KV lengths.
+            block_tables: Per-sequence page tables.
+            query_start_loc: Ragged query start offsets.
+            distribution: Sequence distribution metadata for the ragged layout.
+            softmax_scale: Attention softmax scale, passed as a keyword argument.
+            sliding_window: Sliding-window span, passed as a keyword argument.
+            logits_soft_cap: Logit soft-cap value, passed as a keyword argument.
+
+        Returns:
+            The first element when ``op_fn`` returns a tuple, otherwise the attention output.
+        """
         out = op_fn(
             queries_nope,
             queries_pe,
@@ -1797,6 +2130,29 @@ def _rpa_v2_turboquant_wrapper(op_fn: Callable[..., Any], platform: str):
         softmax_aux,
         qjl_dim,
     ):
+        """Call TurboQuant RPA v2, forwarding the static ``qjl_dim`` and ``platform`` as kwargs.
+
+        Args:
+            queries: Decode query tensor.
+            key_indices: Quantized key codebook indices.
+            key_signs: Sign bits for the quantized keys.
+            key_norms: Per-block key norms for dequantization.
+            value_indices: Quantized value codebook indices.
+            value_norms: Per-block value norms for dequantization.
+            context_lens: Per-sequence context lengths.
+            block_tables: Per-sequence page tables.
+            query_start_loc: Ragged query start offsets.
+            num_seqs: Number of sequences in the batch.
+            rotation: TurboQuant rotation matrix.
+            qjl_projection: QJL projection matrix.
+            key_codebook: Codebook used to reconstruct keys.
+            value_codebook: Codebook used to reconstruct values.
+            softmax_aux: Auxiliary softmax state.
+            qjl_dim: Static QJL projection dimension, passed as a keyword argument.
+
+        Returns:
+            The first element when ``op_fn`` returns a tuple, otherwise the attention output.
+        """
         out = op_fn(
             queries,
             key_indices,
@@ -1844,6 +2200,31 @@ def _rpa_v3_turboquant_wrapper(op_fn: Callable[..., Any], platform: str):
         softmax_aux,
         qjl_dim,
     ):
+        """Call TurboQuant RPA v3, forwarding the static ``qjl_dim`` and ``platform`` as kwargs.
+
+        Args:
+            queries: Decode query tensor.
+            keys: Newly written key tensor for the current step.
+            values: Newly written value tensor for the current step.
+            key_indices: Quantized key codebook indices.
+            key_signs: Sign bits for the quantized keys.
+            key_norms: Per-block key norms for dequantization.
+            value_indices: Quantized value codebook indices.
+            value_norms: Per-block value norms for dequantization.
+            kv_lens: Per-sequence KV lengths.
+            block_tables: Per-sequence page tables.
+            query_start_loc: Ragged query start offsets.
+            distribution: Sequence distribution metadata for the ragged layout.
+            rotation: TurboQuant rotation matrix.
+            qjl_projection: QJL projection matrix.
+            key_codebook: Codebook used to reconstruct keys.
+            value_codebook: Codebook used to reconstruct values.
+            softmax_aux: Auxiliary softmax state.
+            qjl_dim: Static QJL projection dimension, passed as a keyword argument.
+
+        Returns:
+            The first element when ``op_fn`` returns a tuple, otherwise the attention output.
+        """
         out = op_fn(
             queries,
             keys,
@@ -1885,6 +2266,23 @@ def _ragged_gdr_wrapper(op_fn: Callable[..., Any], platform: str):
         chunk_size,
         use_qk_l2norm,
     ):
+        """Call ragged gated delta rule, forwarding ``chunk_size``, ``use_qk_l2norm``, and ``platform``.
+
+        Args:
+            query: Ragged-packed query tensor.
+            key: Ragged-packed key tensor.
+            value: Ragged-packed value tensor.
+            beta: Per-step beta gating tensor.
+            decay: Per-step decay tensor.
+            recurrent_state: Carried recurrent state across sequences.
+            query_start_loc: Ragged query start offsets.
+            state_indices: Per-sequence indices into the recurrent state.
+            chunk_size: Static chunk size for the chunked recurrence.
+            use_qk_l2norm: Whether to L2-normalize queries and keys.
+
+        Returns:
+            The first element when ``op_fn`` returns a tuple, otherwise the operation output.
+        """
         out = op_fn(
             query,
             key,
@@ -1903,10 +2301,165 @@ def _ragged_gdr_wrapper(op_fn: Callable[..., Any], platform: str):
     return _fn
 
 
+def _gdr_high_padding_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Wrap GDR with segment ids and static chunking for high-padding cases."""
+
+    def _fn(query, key, value, beta, decay, seg_ids, chunk_size, use_chunked):
+        """Call gated delta rule with a per-call config carrying the chunk size and platform.
+
+        Builds a ``GatedDeltaRuleConfig`` from ``chunk_size`` and ``platform`` and forwards the segment
+        ids and ``use_chunked`` flag to exercise the high-padding (segmented) code path.
+
+        Args:
+            query: Query tensor.
+            key: Key tensor.
+            value: Value tensor.
+            beta: Per-step beta gating tensor.
+            decay: Per-step decay tensor.
+            seg_ids: Segment ids delimiting sequences within the padded batch.
+            chunk_size: Static chunk size placed into the config.
+            use_chunked: Whether to use the chunked (vs. recurrent) implementation.
+
+        Returns:
+            The first element when ``op_fn`` returns a tuple, otherwise the operation output.
+        """
+        cfg = ops.GatedDeltaRuleConfig(chunk_size=chunk_size, platform=platform, backend="any")
+        out = op_fn(
+            query,
+            key,
+            value,
+            beta,
+            decay,
+            seg_ids,
+            use_chunked=use_chunked,
+            cfg=cfg,
+            platform=platform,
+        )
+        return out[0] if isinstance(out, tuple) else out
+
+    return _fn
+
+
+def _gdr_decode_fused_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Wrap single-step GDR with producer and consumer work around the op."""
+    del op_fn
+
+    def _fn(query, key, value, beta_logits, decay_raw, recurrent_state, gate):
+        """Run single-step GDR decode with surrounding producer and consumer work.
+
+        Reconstructs ``beta``/``decay`` from raw logits, applies tanh/sigmoid projections to the inputs
+        (producer work), dispatches the ``gated_delta_rule`` registry implementation, then gates the
+        output and adds a state summary (consumer work) so the benchmark captures end-to-end cost.
+
+        Args:
+            query: Raw query tensor (tanh-projected before the op).
+            key: Raw key tensor (tanh-projected before the op).
+            value: Raw value tensor (gated before the op).
+            beta_logits: Logits mapped through sigmoid to produce ``beta``.
+            decay_raw: Raw decay mapped through softplus to produce ``decay``.
+            recurrent_state: Initial recurrent state passed to the op.
+            gate: Gate tensor applied to value and output.
+
+        Returns:
+            The gated decode output plus a broadcast summary of the updated recurrent state.
+        """
+        beta = jax.nn.sigmoid(beta_logits)
+        decay = -jax.nn.softplus(decay_raw) * jnp.asarray(0.01, dtype=decay_raw.dtype)
+        projected_query = jnp.tanh(query)
+        projected_key = jnp.tanh(key)
+        projected_value = value * jax.nn.sigmoid(gate)
+        backend = Backend(jax.default_backend())
+        impl = kernel_registry.get("gated_delta_rule", platform=platform, backend=backend)
+        out, new_state = impl(
+            projected_query,
+            projected_key,
+            projected_value,
+            beta,
+            decay,
+            initial_state=recurrent_state,
+        )
+        state_summary = jnp.mean(new_state, axis=2)[:, None, :, :]
+        return out * jax.nn.sigmoid(gate) + state_summary
+
+    return _fn
+
+
+def _ragged_gdr_decode_fused_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Wrap ragged decode GDR with producer and consumer work around the op."""
+
+    def _fn(
+        query,
+        key,
+        value,
+        beta_logits,
+        decay_raw,
+        recurrent_state,
+        query_start_loc,
+        state_indices,
+        gate,
+        chunk_size,
+        use_qk_l2norm,
+    ):
+        """Run ragged decode GDR with surrounding producer and consumer work.
+
+        Reconstructs ``beta``/``decay`` from raw logits, applies tanh/sigmoid projections to the inputs
+        (producer work), calls the ragged decode ``op_fn``, then gates the output and adds a per-sequence
+        state summary (consumer work) so the benchmark captures end-to-end cost.
+
+        Args:
+            query: Raw query tensor (tanh-projected before the op).
+            key: Raw key tensor (tanh-projected before the op).
+            value: Raw value tensor (gated before the op).
+            beta_logits: Logits mapped through sigmoid to produce ``beta``.
+            decay_raw: Raw decay mapped through softplus to produce ``decay``.
+            recurrent_state: Carried recurrent state across sequences.
+            query_start_loc: Ragged query start offsets.
+            state_indices: Per-sequence indices into the recurrent state.
+            gate: Gate tensor applied to value and output.
+            chunk_size: Static chunk size for the chunked recurrence.
+            use_qk_l2norm: Whether to L2-normalize queries and keys.
+
+        Returns:
+            The gated decode output plus a per-sequence summary of the updated recurrent state.
+        """
+        beta = jax.nn.sigmoid(beta_logits)
+        decay = -jax.nn.softplus(decay_raw) * jnp.asarray(0.01, dtype=decay_raw.dtype)
+        projected_query = jnp.tanh(query)
+        projected_key = jnp.tanh(key)
+        projected_value = value * jax.nn.sigmoid(gate)
+        output, new_state = op_fn(
+            projected_query,
+            projected_key,
+            projected_value,
+            beta,
+            decay,
+            recurrent_state,
+            query_start_loc,
+            state_indices,
+            chunk_size=chunk_size,
+            use_qk_l2norm=use_qk_l2norm,
+            platform=platform,
+        )
+        state_summary = jnp.mean(new_state[state_indices], axis=2)
+        return output * jax.nn.sigmoid(gate) + state_summary
+
+    return _fn
+
+
 def _all_gather_matmul_wrapper(op_fn: Callable[..., Any], platform: str):
     """Wrap all-gather matmul with a static dummy axis."""
 
     def _fn(x, y, axis_name):
+        """Call the all-gather matmul ``op_fn`` with a static ``axis_name`` and ``platform``.
+
+        Args:
+            x: Left-hand operand sharded along the collective axis.
+            y: Right-hand operand tensor.
+            axis_name: Static mesh axis name over which to all-gather.
+
+        Returns:
+            The first element when ``op_fn`` returns a tuple, otherwise the matmul result.
+        """
         out = op_fn(x, y, axis_name, platform=platform)
         return out[0] if isinstance(out, tuple) else out
 
@@ -1917,6 +2470,16 @@ def _reduce_scatter_matmul_wrapper(op_fn: Callable[..., Any], platform: str):
     """Wrap reduce-scatter matmul with a static dummy axis."""
 
     def _fn(x, y, axis_name):
+        """Call the reduce-scatter matmul ``op_fn`` with a static ``axis_name`` and ``platform``.
+
+        Args:
+            x: Left-hand operand tensor.
+            y: Right-hand operand tensor.
+            axis_name: Static mesh axis name over which to reduce-scatter.
+
+        Returns:
+            The first element when ``op_fn`` returns a tuple, otherwise the matmul result.
+        """
         out = op_fn(x, y, axis_name, platform=platform)
         return out[0] if isinstance(out, tuple) else out
 
@@ -1927,6 +2490,20 @@ def _grouped_matmul_v3_wrapper(op_fn: Callable[..., Any], platform: str):
     """Wrap grouped matmul v3 with scale, bias, residual, and transpose inputs."""
 
     def _fn(lhs, rhs, group_sizes, existing_out, rhs_scale, rhs_bias, transpose_rhs):
+        """Call grouped matmul v3, forwarding accumulation, quantization, and transpose options.
+
+        Args:
+            lhs: Left-hand operand tensor.
+            rhs: Right-hand operand tensor.
+            group_sizes: Per-group row counts defining the ragged grouping.
+            existing_out: Output tensor to accumulate into.
+            rhs_scale: Per-group dequantization scale for ``rhs``.
+            rhs_bias: Per-group dequantization bias for ``rhs``.
+            transpose_rhs: Whether ``rhs`` is provided transposed.
+
+        Returns:
+            The first element when ``op_fn`` returns a tuple, otherwise the matmul result.
+        """
         out = op_fn(
             lhs,
             rhs,
@@ -1947,6 +2524,17 @@ def _fused_cross_entropy_wrapper(op_fn: Callable[..., Any], platform: str):
     """Wrap fused CE with static reduction and platform."""
 
     def _fn(logits, targets, weights, reduction):
+        """Call fused cross-entropy with a static ``reduction`` and ``platform`` and return the loss.
+
+        Args:
+            logits: Unnormalized prediction logits.
+            targets: Integer target labels.
+            weights: Per-token loss weights / mask.
+            reduction: Static reduction mode, passed as a keyword argument.
+
+        Returns:
+            The ``loss`` attribute of the result when present, otherwise its first tuple element.
+        """
         out = op_fn(logits, targets, weights, reduction=reduction, platform=platform)
         return out.loss if hasattr(out, "loss") else out[0]
 
@@ -1957,6 +2545,18 @@ def _fused_kl_divergence_wrapper(op_fn: Callable[..., Any], platform: str):
     """Wrap fused KL with static reduction/direction and platform."""
 
     def _fn(student, teacher, weights, reduction, direction):
+        """Call fused KL divergence with a static ``reduction``/``direction`` and ``platform``.
+
+        Args:
+            student: Student logits or log-probabilities.
+            teacher: Teacher logits or log-probabilities.
+            weights: Per-token loss weights / mask.
+            reduction: Static reduction mode, passed as a keyword argument.
+            direction: Static KL direction (forward/reverse), passed as a keyword argument.
+
+        Returns:
+            The ``loss`` attribute of the result when present, otherwise the result itself.
+        """
         out = op_fn(student, teacher, weights, reduction=reduction, direction=direction, platform=platform)
         return out.loss if hasattr(out, "loss") else out
 
@@ -2176,6 +2776,23 @@ SPECS: dict[str, OpBenchmarkSpec] = {
         configs=_cfgs_gdr(),
         bench_bwd=True,
     ),
+    "gated_delta_rule_high_padding": OpBenchmarkSpec(
+        op_name="gated_delta_rule_high_padding",
+        algorithm="gated_delta_rule",
+        op_fn=ops.gated_delta_rule,
+        input_generator=_gen_gdr_high_padding_inputs,
+        configs=_cfgs_gdr_high_padding(),
+        wrapper_factory=_gdr_high_padding_wrapper,
+        static_kwargs=["chunk_size", "use_chunked"],
+    ),
+    "gated_delta_rule_decode_fused": OpBenchmarkSpec(
+        op_name="gated_delta_rule_decode_fused",
+        algorithm="gated_delta_rule",
+        op_fn=ops.gated_delta_rule,
+        input_generator=_gen_gdr_decode_fused_inputs,
+        configs=_cfgs_gdr_decode_fused(),
+        wrapper_factory=_gdr_decode_fused_wrapper,
+    ),
     "lightning_attention": OpBenchmarkSpec(
         op_name="lightning_attention",
         algorithm="lightning_attn",
@@ -2291,7 +2908,15 @@ SPECS: dict[str, OpBenchmarkSpec] = {
         configs=_cfgs_ragged_gdr(),
         wrapper_factory=_ragged_gdr_wrapper,
         static_kwargs=["chunk_size", "use_qk_l2norm"],
-        bench_bwd=True,
+    ),
+    "ragged_gated_delta_rule_decode_fused": OpBenchmarkSpec(
+        op_name="ragged_gated_delta_rule_decode_fused",
+        algorithm="ragged_gated_delta_rule",
+        op_fn=ops.ragged_gated_delta_rule,
+        input_generator=_gen_ragged_gdr_decode_fused_inputs,
+        configs=_cfgs_ragged_gdr_decode_fused(),
+        wrapper_factory=_ragged_gdr_decode_fused_wrapper,
+        static_kwargs=["chunk_size", "use_qk_l2norm"],
     ),
     "reduce_scatter_matmul": OpBenchmarkSpec(
         op_name="reduce_scatter_matmul",

@@ -43,6 +43,17 @@ Attention Operations:
     RaggedPageAttnV2, RaggedPageAttnV3: Paged attention variants.
         Memory-efficient attention with page-based KV-cache management.
 
+    PagedFlashAttn: Flash attention over a paged KV-cache.
+        Combines flash-attention compute with page-based cache addressing.
+
+    MultiLatentRaggedPageAttn: Paged ragged attention for multi-latent (MLA)
+        models. Handles the compressed latent KV layout under continuous
+        batching.
+
+    GlmMoeDsaIndexerOp: GLM MoE deep-sparse-attention (DSA) sparse indexer.
+        Selects the sparse key/value indices consumed by the DSA attention
+        path.
+
 State Space Model Operations:
     SSM1Op: Mamba/S4 style selective state space layer.
         Linear-time sequence modeling with selective gating.
@@ -55,6 +66,32 @@ State Space Model Operations:
 
     KernelDeltaAttnOp: Kernel Delta Attention (KDA).
         Linear attention variant used in Kimi Linear models.
+
+Continuous-Batching / Inference Operations:
+    RaggedCausalConv1D: Packed ragged causal depthwise conv1d operation.
+        Short causal convolution preceding the GDR recurrence in linear-attention
+        hybrids. Re-exports ``ragged_causal_conv1d`` and
+        ``ragged_causal_conv1d_head_sharded`` from eJKernel.
+
+    RaggedGatedDeltaRule: Packed ragged GDN v2 operation.
+        Mixed prefill/decode gated-delta recurrence over a flat token stream for
+        eSurge serving.
+
+    GDNComputeScheduleV2 / GDNComputeScheduleV2Config / compute_schedule_table_v2:
+        Grid-schedule construction for the ragged GDN Pallas kernels under
+        continuous batching.
+
+Output Containers:
+    GatedDeltaRuleOutput, SSM1Output, SSM2Output, KDAOutput,
+    GlmMoeDsaIndexerOutput: ``AttentionOutput`` subclasses carrying the
+    operation-specific results (e.g. updated recurrent/convolution state).
+
+Note:
+    Several of the linear-attention / state-space operations
+    (``GatedDeltaRuleOp``, ``RaggedCausalConv1D``, ``RaggedGatedDeltaRule`` and
+    the GDN schedule helpers) are thin EasyDeL adapter layers that declare
+    requirements and participate in ``OperationRegistry`` while delegating the
+    actual computation and backend selection to eJKernel.
 
 Example:
     >>> from easydel.operations import OperationRegistry, OperationMetadata
@@ -73,6 +110,7 @@ from .blocksparse_attention import BlockSparseAttn
 from .decode_attention import AutoRegressiveDecodeAttn
 from .flash_attention import FlashAttn
 from .gated_delta_rule import GatedDeltaRuleOp, GatedDeltaRuleOutput
+from .gdn_compute_schedule_v2 import GDNComputeScheduleV2, GDNComputeScheduleV2Config, compute_schedule_table_v2
 from .glm_moe_dsa_indexer import GlmMoeDsaIndexerOp, GlmMoeDsaIndexerOutput
 from .inference_conv1d import RaggedCausalConv1D, ragged_causal_conv1d, ragged_causal_conv1d_head_sharded
 from .inference_gdn import RaggedGatedDeltaRule
@@ -91,6 +129,8 @@ __all__ = (
     "AutoRegressiveDecodeAttn",
     "BlockSparseAttn",
     "FlashAttn",
+    "GDNComputeScheduleV2",
+    "GDNComputeScheduleV2Config",
     "GatedDeltaRuleOp",
     "GatedDeltaRuleOutput",
     "GlmMoeDsaIndexerOp",
@@ -111,6 +151,7 @@ __all__ = (
     "ScaledDotProductAttn",
     "UnifiedAttn",
     "VanillaAttn",
+    "compute_schedule_table_v2",
     "fused_kda_gate",
     "ragged_causal_conv1d",
     "ragged_causal_conv1d_head_sharded",

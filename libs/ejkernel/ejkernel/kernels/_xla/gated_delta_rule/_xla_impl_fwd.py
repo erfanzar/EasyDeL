@@ -120,6 +120,17 @@ def _strict_lower_inverse(matrix_strict_lower: jax.Array) -> jax.Array:
     flat = matrix_strict_lower.reshape((-1, n, n))
 
     def _solve_one(lhs):
+        """Invert one unit-lower-triangular matrix ``(I + L)`` via a single triangular solve.
+
+        Captures the identity matrix ``eye`` ([n, n]) from the enclosing scope and is
+        ``vmap``-ped over the leading (flattened batch) axis of the strict-lower-triangular input.
+
+        Args:
+            lhs: A single ``[n, n]`` matrix equal to ``(I + L)`` (unit diagonal, strict lower triangle ``L``).
+
+        Returns:
+            The ``[n, n]`` inverse of ``lhs``, computed by solving ``lhs @ X = eye``.
+        """
         return lax.linalg.triangular_solve(
             lhs,
             eye,
@@ -180,6 +191,15 @@ def _recurrent_gdr_fwd(
             the attention computation.  Strongly recommended for stability.
         chunk_size: Number of tokens per chunk.  The sequence is padded to
             a multiple of this value before processing.
+        seg_ids: Optional per-token document/segment ids [batch, seq_len] for
+            sequence packing.  When provided, intra-chunk attention and the
+            recurrent state are confined to a single document: tokens only
+            attend within their own segment, padding (encoded as -1 after
+            broadcasting/padding) is masked out, and recurrent state is only
+            carried across a chunk boundary when the chunk's last valid token
+            continues the same document.  When None, the whole sequence is
+            treated as one segment.  This path uses plain JAX autodiff, so
+            segment boundaries are also honored in the backward pass.
 
     Returns:
         Tuple of (outputs, final_state) where:
@@ -214,6 +234,9 @@ def _recurrent_gdr_fwd(
         decay = decay.astype(input_dtype)
 
     seg_hc = None
+    valid_hc = None
+    chunk_has_valid = None
+    seg_last = None
     if seg_ids is not None:
         seg_full = jnp.broadcast_to(seg_ids.astype(jnp.int32)[:, None, :], (B, H, L))
 
@@ -237,11 +260,15 @@ def _recurrent_gdr_fwd(
 
     if seg_ids is not None:
         seg_hc = seg_full.reshape(B, H, NC, C)  # [B, H, NC, C] document id per token
+        valid_hc = seg_hc >= 0
         is_start = jnp.concatenate(
-            [jnp.ones((B, H, NC, 1), dtype=jnp.bool_), seg_hc[..., 1:] != seg_hc[..., :-1]],
+            [
+                valid_hc[..., :1],
+                valid_hc[..., 1:] & ((seg_hc[..., 1:] != seg_hc[..., :-1]) | ~valid_hc[..., :-1]),
+            ],
             axis=-1,
         )
-        raw_cumsum = jnp.cumsum(g_c, axis=-1)
+        raw_cumsum = jnp.cumsum(jnp.where(valid_hc, g_c, 0), axis=-1)
         idx = jnp.arange(C)
         start_idx = jax.lax.cummax(jnp.where(is_start, idx[None, None, None, :], 0), axis=3)
         cumsum_at_start = jnp.take_along_axis(
@@ -250,13 +277,22 @@ def _recurrent_gdr_fwd(
             axis=-1,
         )
         g_cumsum = raw_cumsum - cumsum_at_start
-        same_seg_pair = seg_hc[..., :, None] == seg_hc[..., None, :]  # [B, H, NC, C, C]
+        same_seg_pair = (
+            (seg_hc[..., :, None] == seg_hc[..., None, :]) & valid_hc[..., :, None] & valid_hc[..., None, :]
+        )  # [B, H, NC, C, C]
+        chunk_has_valid = jnp.any(valid_hc, axis=-1)
+        last_valid_idx = jnp.max(jnp.where(valid_hc, idx[None, None, None, :], 0), axis=-1)
+        seg_last = jnp.take_along_axis(seg_hc, last_valid_idx[..., None], axis=-1)[..., 0]
     else:
         g_cumsum = jnp.cumsum(g_c, axis=-1)
         same_seg_pair = None
 
     k_beta = k_c * beta_c[..., None]
     v_beta = v_c * beta_c[..., None]
+    if valid_hc is not None:
+        valid_scale = valid_hc.astype(k_beta.dtype)[..., None]
+        k_beta = k_beta * valid_scale
+        v_beta = v_beta * valid_scale
 
     S = jnp.einsum("bhcik,bhcjk->bhcij", k_beta, k_c, precision=_MATMUL_PRECISION).astype(jnp.float32)
 
@@ -277,6 +313,17 @@ def _recurrent_gdr_fwd(
     jnp.broadcast_to(eye, lhs_flat.shape)
 
     def _solve_one(m):
+        """Invert one ``[C, C]`` unit-lower-triangular intra-chunk system via ``solve_triangular``.
+
+        Captures the ``[C, C]`` identity ``eye`` from the enclosing scope and is ``vmap``-ped over the
+        flattened ``B * H * num_chunks`` batch of per-chunk matrices ``m = (I + S)``.
+
+        Args:
+            m: A single ``[C, C]`` unit-lower-triangular matrix ``(I + S)`` for one chunk.
+
+        Returns:
+            The ``[C, C]`` inverse ``(I + S)^{-1}`` obtained by solving ``m @ X = eye``.
+        """
         return jax.scipy.linalg.solve_triangular(m, eye, lower=True, unit_diagonal=True)
 
     A_flat = jax.vmap(_solve_one)(lhs_flat)
@@ -295,17 +342,21 @@ def _recurrent_gdr_fwd(
     attn_i = jnp.where(lower_mask, attn_qk * jnp.exp(jnp.clip(g_diff_intra, -20.0, 20.0)), 0.0).astype(input_dtype)
 
     q_g = (q_c.astype(jnp.float32) * jnp.exp(jnp.clip(g_cumsum, -20.0, 20.0))[..., None]).astype(input_dtype)
-    g_end_exp = jnp.exp(jnp.clip(g_cumsum[..., -1], -20.0, 20.0))[..., None, None]
-    g_diff_state = jnp.exp(jnp.clip(g_cumsum[..., -1, None] - g_cumsum, -20.0, 20.0))[..., None]
+    if valid_hc is not None:
+        q_g = q_g * valid_hc.astype(q_g.dtype)[..., None]
+        g_last = jnp.take_along_axis(g_cumsum, last_valid_idx[..., None], axis=-1)[..., 0]
+        g_last = jnp.where(chunk_has_valid, g_last, 0)
+    else:
+        g_last = g_cumsum[..., -1]
+    g_end_exp = jnp.exp(jnp.clip(g_last, -20.0, 20.0))[..., None, None]
+    g_diff_state = jnp.exp(jnp.clip(g_last[..., None] - g_cumsum, -20.0, 20.0))[..., None]
     k_g_diff = (k_c.astype(jnp.float32) * g_diff_state).astype(input_dtype)
 
     if seg_hc is not None:
-        # Only the LAST segment of a chunk carries recurrent state OUT of the chunk; mask the
-        # state-update so only last-segment keys are folded in. (The inter-chunk READ mask
-        # and the old-state survival are segment-dependent on the *incoming* state and are
-        # applied inside the scan, where ``state_seg`` is known.)
-        seg_last = seg_hc[..., -1]  # [B, H, NC]
-        same_as_last = (seg_hc == seg_last[..., None]).astype(k_g_diff.dtype)  # [B, H, NC, C]
+        # Only the last VALID segment of a chunk carries recurrent state out.
+        # Padding is encoded as -1 and must not create outputs or replace the
+        # carried state during long padded tails.
+        same_as_last = ((seg_hc == seg_last[..., None]) & valid_hc & chunk_has_valid[..., None]).astype(k_g_diff.dtype)
         k_g_diff = k_g_diff * same_as_last[..., None]
 
     xs = (
@@ -351,23 +402,33 @@ def _recurrent_gdr_fwd(
         same document. The outgoing state always represents the chunk's last token's segment.
         """
         state, state_seg = carry
-        u, w, q_scaled, attn_intra, g_last_exp, k_scaled, seg_c, seg_last_c = inputs
+        u, w, q_scaled, attn_intra, g_last_exp, k_scaled, seg_c, valid_c, has_valid_c, seg_last_c = inputs
 
-        read = (seg_c == state_seg[..., None]).astype(state.dtype)[..., None]  # [B, H, C, 1]
+        read = ((seg_c == state_seg[..., None]) & valid_c).astype(state.dtype)[..., None]  # [B, H, C, 1]
         v_prime = jnp.einsum("bhck,bhkv->bhcv", w, state, precision=_MATMUL_PRECISION) * read
         attn_inter = jnp.einsum("bhck,bhkv->bhcv", q_scaled, state, precision=_MATMUL_PRECISION) * read
         v_new = u.astype(jnp.float32) - v_prime
         core_out = attn_inter + jnp.einsum("bhcr,bhrv->bhcv", attn_intra, v_new, precision=_MATMUL_PRECISION)
+        core_out = core_out * valid_c.astype(core_out.dtype)[..., None]
 
         state_update = jnp.einsum("bhkc,bhcv->bhkv", k_scaled.transpose(0, 1, 3, 2), v_new, precision=_MATMUL_PRECISION)
         survive = (seg_last_c == state_seg).astype(state.dtype)[..., None, None]
-        new_state = jnp.nan_to_num(state * g_last_exp * survive + state_update, nan=0.0, posinf=0.0, neginf=0.0)
-        return (new_state, seg_last_c), core_out
+        candidate_state = jnp.nan_to_num(state * g_last_exp * survive + state_update, nan=0.0, posinf=0.0, neginf=0.0)
+        has_valid_bc = has_valid_c[..., None, None]
+        new_state = jnp.where(has_valid_bc, candidate_state, state)
+        new_seg = jnp.where(has_valid_c, seg_last_c, state_seg)
+        return (new_state, new_seg), core_out
 
     if seg_hc is None:
         final_state, core_out_tm = lax.scan(scan_body, initial_state, xs)
     else:
-        xs_seg = (*xs, seg_hc.transpose(2, 0, 1, 3), seg_last.transpose(2, 0, 1))
+        xs_seg = (
+            *xs,
+            seg_hc.transpose(2, 0, 1, 3),
+            valid_hc.transpose(2, 0, 1, 3),
+            chunk_has_valid.transpose(2, 0, 1),
+            seg_last.transpose(2, 0, 1),
+        )
         state_seg0 = seg_hc[:, :, 0, 0]  # segment the (zero) initial state nominally belongs to
         (final_state, _), core_out_tm = lax.scan(scan_body_seg, (initial_state, state_seg0), xs_seg)
 
@@ -528,6 +589,25 @@ def _chunk_gdr_fwd_core(
     )
 
     def chunk_step(state, inputs):
+        """Process one chunk in the inter-chunk ``lax.scan``: emit its output and update the recurrent state.
+
+        Combines the carried recurrent ``state`` with the chunk's pre-computed (Neumann-series) intra-chunk
+        tensors to produce the chunk's attention output and the decayed next state. ``mask_triu_inner`` and
+        ``input_dtype`` are captured from the enclosing scope. The chunk axis was moved to the leading
+        position before the scan, so every input here is for a single chunk across all batch/head positions.
+
+        Args:
+            state: Loop-carried recurrent state ``[batch, num_heads, head_dim, d_state]``.
+            inputs: Per-chunk tuple ``(q_i, k_i, v_i, k_cumdecay_i, g_exp_i, g_end_exp_i, g_diff_exp_i,
+                decay_mask_i)`` sliced from the scanned ``xs``: scaled query, key, locally-solved value,
+                cumulative-decay-weighted key, per-token decay factors, the chunk-end decay scalar, the
+                state-readout decay factors, and the intra-chunk decay mask.
+
+        Returns:
+            Tuple ``(new_state, core_out)`` where ``new_state`` is the decayed and updated recurrent state
+            (carry for the next chunk) and ``core_out`` is this chunk's output
+            ``[batch, num_heads, chunk_size, d_state]`` cast to ``input_dtype``.
+        """
         q_i, k_i, v_i, k_cumdecay_i, g_exp_i, g_end_exp_i, g_diff_exp_i, decay_mask_i = inputs
 
         attn_qk = jnp.einsum("bhik,bhjk->bhij", q_i, k_i, precision=_MATMUL_PRECISION)
@@ -732,6 +812,10 @@ def _chunk_gdr_fwd(
         initial_state: Optional initial recurrent state
             [batch, num_heads, head_dim, d_state].
         use_qk_l2norm: Whether to L2-normalize queries and keys.
+        seg_ids: Optional per-token document/segment ids [batch, seq_len] for
+            sequence packing, forwarded to ``_recurrent_gdr_fwd``.  When set,
+            attention and recurrent state are confined to each document and the
+            (autodiff) backward pass also respects segment boundaries.
 
     Returns:
         Tuple of (outputs, final_state) — see ``_recurrent_gdr_fwd`` for details.
