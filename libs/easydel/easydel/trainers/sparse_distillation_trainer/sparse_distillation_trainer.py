@@ -34,6 +34,7 @@ from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
 from easydel.utils.helpers import capture_time
 
+from ..metrics import _host_mean_float
 from ..prompt_transforms import GRPOPreprocessTransform
 from ..trainer import Trainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
@@ -510,7 +511,7 @@ class SparseDistillationTrainer(Trainer):
 
         completion_length = jnp.sum(completion_mask, -1)
         metrics_dict: dict[str, float | int | str] = {
-            "completion_length": float(jnp.mean(completion_length)),
+            "completion_length": _host_mean_float(completion_length),
             "generation_time": generation_time,
             "scoring_time": scoring_time,
             "preprocessing_time": preprocessing_time,

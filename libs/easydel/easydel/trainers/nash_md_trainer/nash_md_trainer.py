@@ -46,6 +46,7 @@ from easydel.utils.helpers import capture_time
 
 from ..group_relative_policy_optimization._fn import get_per_token_logps
 from ..group_relative_policy_optimization.grpo_trainer import GRPOTrainer
+from ..metrics import _host_mean_float
 from ..trainer_protocol import TrainerConfigureFunctionOutput
 from ..training_utils import compile_trainer_step, resolve_straight_through_emulator
 from ._fn import nash_md_step
@@ -693,11 +694,11 @@ class NashMDTrainer(GRPOTrainer):
         completion_lengths = completion_mask.sum(axis=1)
 
         metrics_dict: dict[str, float | int | str] = {
-            "rewards/chosen": float(jnp.mean(model_scores)),
-            "rewards/rejected": float(jnp.mean(mixture_scores)),
-            "rewards/margins": float(jnp.mean(model_scores - mixture_scores)),
-            "rewards/probabilities": float(jnp.mean(probabilities)),
-            "completion_length": float(jnp.mean(completion_lengths)),
+            "rewards/chosen": _host_mean_float(model_scores),
+            "rewards/rejected": _host_mean_float(mixture_scores),
+            "rewards/margins": _host_mean_float(model_scores - mixture_scores),
+            "rewards/probabilities": _host_mean_float(probabilities),
+            "completion_length": _host_mean_float(completion_lengths),
             "generation_time": generation_time,
             "mixture_generation_time": mixture_generation_time,
             "reference_logps_time": ref_logps_time,
@@ -706,7 +707,7 @@ class NashMDTrainer(GRPOTrainer):
             "beta": float(self._current_beta_value()),
         }
         for name, values in model_breakdown.items():
-            metrics_dict[f"reward/{name}"] = float(jnp.mean(values))
+            metrics_dict[f"reward/{name}"] = _host_mean_float(values)
         self._log_training_generations_to_wandb(
             state=state,
             prompts=prompts_text,

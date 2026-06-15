@@ -28,6 +28,7 @@ from easydel.utils.helpers import capture_time
 
 from ..base_trainer import TrainerConfigureFunctionOutput
 from ..group_relative_policy_optimization import GRPOTrainer
+from ..metrics import _host_mean_float, _host_scalar_float
 from ..sdft_trainer import _zero_reward_func
 from ..training_utils import (
     compile_trainer_step,
@@ -213,10 +214,10 @@ class SSDTrainer(GRPOTrainer):
         metrics_dict: dict[str, float | int | str] = {
             "generation_time": generation_time,
             "preprocessing_time": preprocessing_time,
-            "completions/mean_length": float(jnp.mean(completion_lengths)),
-            "completions/min_length": float(jnp.min(completion_lengths)),
-            "completions/max_length": float(jnp.max(completion_lengths)),
-            "ssd/active_sample_ratio": float(jnp.mean((completion_lengths > 0).astype(jnp.float32))),
+            "completions/mean_length": _host_mean_float(completion_lengths),
+            "completions/min_length": _host_scalar_float(jnp.min(completion_lengths)),
+            "completions/max_length": _host_scalar_float(jnp.max(completion_lengths)),
+            "ssd/active_sample_ratio": _host_mean_float((completion_lengths > 0).astype(jnp.float32)),
         }
         model_batch = {
             "prompt_ids": prompt_ids,

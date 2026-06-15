@@ -25,6 +25,7 @@ from easydel.infra.base_state import EasyDeLState
 from easydel.utils import Registry
 
 from ..group_relative_policy_optimization import GRPOTrainer
+from ..metrics import _host_mean_float, _host_scalar_float
 from .papo_config import PAPOConfig
 
 
@@ -155,7 +156,7 @@ class PAPOTrainer(GRPOTrainer):
                 metrics[f"papo/{name}_reward_skipped_shape_mismatch"] = 1
                 continue
             reward_delta = reward_delta + float(weight) * rewards[:, None]
-            metrics[f"papo/{name}_reward_mean"] = float(jnp.mean(rewards))
+            metrics[f"papo/{name}_reward_mean"] = _host_mean_float(rewards)
             metrics["papo/reward_columns"] += 1
         if metrics["papo/reward_columns"] == 0:
             return model_batch, metrics
@@ -187,7 +188,7 @@ class PAPOTrainer(GRPOTrainer):
         kept_tokens = jnp.sum(shaped_mask)
         return model_batch, {
             "papo/mask_ratio": float(self.arguments.mask_ratio),
-            "papo/kept_token_fraction": float(kept_tokens / original_tokens),
+            "papo/kept_token_fraction": _host_scalar_float(kept_tokens / original_tokens),
             **reward_metrics,
         }
 

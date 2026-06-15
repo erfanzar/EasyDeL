@@ -54,6 +54,7 @@ from .._logprob_utils import (
     compute_token_logps_and_entropies_chunked,
     resolve_lmhead_chunksize,
 )
+from ..metrics import _host_mean_float, _host_scalar_float
 from ..model_loading import reject_string_model_id
 from ..prompt_transforms import GRPOPreprocessTransform
 from ..prompt_utils import apply_chat_template
@@ -1207,10 +1208,10 @@ class PPOTrainer(Trainer):
 
         token_count = jnp.maximum(jnp.sum(completion_mask), 1.0)
         metrics_dict: dict[str, float | int | str] = {
-            "score_mean": float(jnp.nanmean(scores)),
-            "reward_mean": float(jnp.sum(rewards) / token_count),
-            "mean_kl": float(jnp.sum(kl * completion_mask) / token_count),
-            "completion_length": float(jnp.mean(jnp.sum(completion_mask, axis=1))),
+            "score_mean": _host_scalar_float(jnp.nanmean(scores)),
+            "reward_mean": _host_scalar_float(jnp.sum(rewards) / token_count),
+            "mean_kl": _host_scalar_float(jnp.sum(kl * completion_mask) / token_count),
+            "completion_length": _host_mean_float(jnp.sum(completion_mask, axis=1)),
             "rewarding_time": rewarding_time,
             "rollout_stats_time": rollout_stats_time,
             "ref_logps_time": ref_logps_time,
@@ -1218,7 +1219,7 @@ class PPOTrainer(Trainer):
             "preprocessing_time": preprocessing_time,
         }
         for i, reward_func_name in enumerate(self.reward_func_names):
-            metrics_dict[reward_func_name] = float(jnp.nanmean(rewards_per_func[:, i]))
+            metrics_dict[reward_func_name] = _host_scalar_float(jnp.nanmean(rewards_per_func[:, i]))
         self._log_training_generations_to_wandb(
             state=state,
             prompts=completion_prompts,

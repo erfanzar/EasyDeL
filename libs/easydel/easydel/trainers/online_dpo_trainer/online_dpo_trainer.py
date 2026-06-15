@@ -28,6 +28,7 @@ from easydel.utils import Registry
 from easydel.utils.helpers import capture_time
 
 from ..direct_preference_optimization_trainer import DPOTrainer
+from ..metrics import _host_mean_float, _host_scalar_float
 from ..trainer import Trainer
 from .online_dpo_config import OnlineDPOConfig
 
@@ -350,11 +351,11 @@ class OnlineDPOTrainer(DPOTrainer):
             ),
         }
         metrics = {
-            "online_dpo/reward_margin": float(jnp.nanmean(score_margin)),
-            "online_dpo/chosen_reward": float(jnp.nanmean(adjusted_rewards[chosen_indices])),
-            "online_dpo/rejected_reward": float(jnp.nanmean(adjusted_rewards[rejected_indices])),
-            "online_dpo/chosen_contains_eos": float(jnp.mean(chosen_has_eos.astype(jnp.float32))),
-            "online_dpo/rejected_contains_eos": float(jnp.mean(rejected_has_eos.astype(jnp.float32))),
+            "online_dpo/reward_margin": _host_scalar_float(jnp.nanmean(score_margin)),
+            "online_dpo/chosen_reward": _host_scalar_float(jnp.nanmean(adjusted_rewards[chosen_indices])),
+            "online_dpo/rejected_reward": _host_scalar_float(jnp.nanmean(adjusted_rewards[rejected_indices])),
+            "online_dpo/chosen_contains_eos": _host_mean_float(chosen_has_eos.astype(jnp.float32)),
+            "online_dpo/rejected_contains_eos": _host_mean_float(rejected_has_eos.astype(jnp.float32)),
         }
         return batch, metrics
 

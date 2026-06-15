@@ -41,6 +41,7 @@ from easydel.utils.helpers import capture_time
 from easydel.utils.traversals import deepcopy_model
 
 from ..group_relative_policy_optimization.grpo_trainer import GRPOTrainer
+from ..metrics import _host_mean_float
 from ..trainer_protocol import TrainerConfigureFunctionOutput
 from ..training_configurations import MetricsType
 from ..training_utils import compile_trainer_step, resolve_straight_through_emulator
@@ -647,9 +648,9 @@ class XPOTrainer(GRPOTrainer):
         chosen_mask = policy_scores >= ref_scores
 
         metrics_dict: dict[str, float | int | str] = {
-            "rewards/chosen": float(jnp.mean(policy_scores)),
-            "rewards/rejected": float(jnp.mean(ref_scores)),
-            "rewards/margins": float(jnp.mean(policy_scores - ref_scores)),
+            "rewards/chosen": _host_mean_float(policy_scores),
+            "rewards/rejected": _host_mean_float(ref_scores),
+            "rewards/margins": _host_mean_float(policy_scores - ref_scores),
             "policy_generation_time": policy_generation_time,
             "reference_generation_time": ref_generation_time,
             "preprocessing_time": preprocessing_time,
@@ -657,7 +658,7 @@ class XPOTrainer(GRPOTrainer):
             "alpha": alpha_value,
         }
         for name, value in reward_breakdown.items():
-            metrics_dict[f"reward/{name}"] = float(jnp.mean(value))
+            metrics_dict[f"reward/{name}"] = _host_mean_float(value)
         self._log_training_generations_to_wandb(
             state=state,
             prompts=prompt_texts if prompt_texts is not None else prompt_ids,
