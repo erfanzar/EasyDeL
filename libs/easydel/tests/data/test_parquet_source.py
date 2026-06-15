@@ -131,7 +131,10 @@ def test_parquet_source_projection_fallback_respects_start_row(tmp_path, monkeyp
     assert rows == [{"messages": ["world"]}, {"messages": ["again"]}]
 
 
-def test_parquet_source_falls_back_to_unprojected_batches(tmp_path, monkeypatch):
+def test_parquet_source_never_falls_back_to_unprojected_batches(tmp_path, monkeypatch):
+    # Unprojected full-row-group decodes are the memory bomb for embed-heavy
+    # files: if even single-column projected reads fail, the error must
+    # propagate instead of silently decoding every column.
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
 
@@ -144,6 +147,7 @@ def test_parquet_source_falls_back_to_unprojected_batches(tmp_path, monkeypatch)
     )
     pq.write_table(table, data_path, row_group_size=1)
 
+    unprojected_calls: list[tuple] = []
     original_iter_batches = pq.ParquetFile.iter_batches
 
     def failing_read_row_group(self, i, columns=None, *args, **kwargs):
@@ -152,6 +156,7 @@ def test_parquet_source_falls_back_to_unprojected_batches(tmp_path, monkeypatch)
     def flaky_iter_batches(self, *args, **kwargs):
         if kwargs.get("columns") is not None:
             raise pa.ArrowNotImplementedError("Nested data conversions not implemented for chunked array outputs")
+        unprojected_calls.append((args, kwargs))
         return original_iter_batches(self, *args, **kwargs)
 
     monkeypatch.setattr(pq.ParquetFile, "read_row_group", failing_read_row_group)
@@ -159,9 +164,10 @@ def test_parquet_source_falls_back_to_unprojected_batches(tmp_path, monkeypatch)
 
     source = ParquetShardedSource(str(data_path), columns=["messages"])
 
-    rows = list(source.open_shard(source.shard_names[0]))
+    with pytest.raises(pa.ArrowNotImplementedError):
+        list(source.open_shard(source.shard_names[0]))
 
-    assert rows == [{"messages": ["hello"]}, {"messages": ["world"]}]
+    assert unprojected_calls == []
 
 
 def test_parquet_source_falls_back_to_projected_column_batches(tmp_path, monkeypatch):
@@ -202,9 +208,14 @@ def test_parquet_source_falls_back_to_projected_column_batches(tmp_path, monkeyp
         {"messages": ["hello"], "tools": ["search"]},
         {"messages": ["world"], "tools": ["calc"]},
     ]
+    # The byte-budgeted ladder retries the multi-column projection at
+    # descending batch sizes before resorting to per-column reads.
     assert batch_calls == [
-        (("messages", "tools"), None),
+        (("messages", "tools"), 256),
+        (("messages", "tools"), 64),
+        (("messages", "tools"), 16),
+        (("messages", "tools"), 4),
         (("messages", "tools"), 1),
-        (("messages",), 1),
-        (("tools",), 1),
+        (("messages",), 256),
+        (("tools",), 256),
     ]
