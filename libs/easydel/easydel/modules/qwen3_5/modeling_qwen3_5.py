@@ -88,7 +88,8 @@ def _get_rope_index_from_mm_token_types(
     video_grid_thw: jax.Array | None = None,
     attention_mask: jax.Array | None = None,
     spatial_merge_size: int = 1,
-) -> tuple[jax.Array, jax.Array]:
+    return_jax_arrays: bool = True,
+) -> tuple[jax.Array | np.ndarray, jax.Array | np.ndarray]:
     """Compute 3D mRoPE position ids from modality token-type ids.
 
     Groups consecutive tokens by modality (0 = text, 1 = image, 2 = video)
@@ -102,6 +103,8 @@ def _get_rope_index_from_mm_token_types(
         video_grid_thw: Grid dimensions ``(T, H, W)`` for each video.
         attention_mask: Boolean attention mask of shape ``(batch, seq_len)``.
         spatial_merge_size: Spatial merge factor from the vision config.
+        return_jax_arrays: When ``False``, return NumPy arrays without touching
+            JAX dispatch. Host-side data collators should use this mode.
 
     Returns:
         Tuple of ``(position_ids, mrope_position_deltas)`` where ``position_ids``
@@ -173,7 +176,10 @@ def _get_rope_index_from_mm_token_types(
         delta = int(llm_positions.max() + 1 - len(current_input_ids)) if llm_positions.shape[1] > 0 else 0
         mrope_position_deltas.append(delta)
 
-    return jnp.asarray(position_ids, dtype=jnp.int32), jnp.asarray(mrope_position_deltas, dtype=jnp.int32).reshape(-1, 1)
+    mrope_position_deltas = np.asarray(mrope_position_deltas, dtype=np.int32).reshape(-1, 1)
+    if not return_jax_arrays:
+        return position_ids, mrope_position_deltas
+    return jnp.asarray(position_ids, dtype=jnp.int32), jnp.asarray(mrope_position_deltas, dtype=jnp.int32)
 
 
 def _maybe_flatten_position_ids_for_text(config: Qwen3_5TextConfig, position_ids: jax.Array) -> jax.Array:

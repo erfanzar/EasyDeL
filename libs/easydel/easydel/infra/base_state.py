@@ -365,6 +365,25 @@ def _materialize_replicated_setup_scalars(tree: tp.Any, shardings: tp.Any) -> tp
     )
 
 
+def _scalar_step_value(value: tp.Any) -> int:
+    """Return a Python int from checkpoint/training-step scalar metadata."""
+    arr = jnp.asarray(value)
+    if arr.size > 1:
+        arr = arr.reshape(-1)[0]
+    return int(device_get(arr))
+
+
+def _step_array_like(value: tp.Any, reference: tp.Any) -> jax.Array:
+    """Materialize ``value`` with the dtype/sharding contract of ``reference``."""
+    dtype = getattr(reference, "dtype", jnp.int32)
+    step = jnp.asarray(_scalar_step_value(value), dtype=dtype)
+    if isinstance(reference, jax.Array):
+        sharding = getattr(reference, "sharding", None)
+        if isinstance(sharding, jax.sharding.Sharding):
+            return jax.device_put(device_get(step), sharding)
+    return step
+
+
 def _read_checkpoint_metadata(load_directory: str | os.PathLike | ePathLike) -> dict[str, tp.Any]:
     """Best-effort read of the checkpoint discovery metadata.
 
@@ -1379,9 +1398,20 @@ class EasyDeLState(_PyTreeNode):
                 "Adam/optimizer moments for Q/K/V and gate/up weights will be silently scrambled; "
                 "re-save it with the current code to make trainer resumes mesh-portable."
             )
-        step = metadata.get("step", 0)
-        logger.info(f"Optimizer state loaded from {load_directory} (step {step}).")
-        return self.replace(opt_state=opt_state, step=jnp.asarray(step))
+        checkpoint_meta = _read_checkpoint_metadata(load_directory)
+        step = checkpoint_meta.get("step", None)
+        if step is None:
+            step = metadata.get("step", 0)
+
+        step_value = _scalar_step_value(step)
+        current_step_value = _scalar_step_value(self.step)
+        if isinstance(self.step, jax.Array) and current_step_value == step_value:
+            step = self.step
+        else:
+            step = _step_array_like(step_value, self.step)
+
+        logger.info(f"Optimizer state loaded from {load_directory} (step {step_value}).")
+        return self.replace(opt_state=opt_state, step=step)
 
     def save_optimizer(
         self,

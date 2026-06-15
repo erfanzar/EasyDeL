@@ -123,8 +123,8 @@ checkpoint*/
 checkpoints/
 models/
 model-files/
-data/
-datasets/
+/data/
+/datasets/
 *.ckpt
 *.safetensors
 *.pt

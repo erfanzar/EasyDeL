@@ -457,12 +457,18 @@ def collate_packed_embeds(
                 if position_id_fn is None:
                     raise ValueError("position_id_fn is required for packed rows containing image placeholders")
                 mm_token_type_ids = (ids == image_token_id).astype(np.int32).reshape(1, -1)
-                example_positions, _ = position_id_fn(
-                    input_ids=ids.reshape(1, -1),
-                    mm_token_type_ids=mm_token_type_ids,
-                    image_grid_thw=grid if grid.shape[0] else None,
-                    attention_mask=None,
-                )
+                position_kwargs = {
+                    "input_ids": ids.reshape(1, -1),
+                    "mm_token_type_ids": mm_token_type_ids,
+                    "image_grid_thw": grid if grid.shape[0] else None,
+                    "attention_mask": None,
+                }
+                try:
+                    example_positions, _ = position_id_fn(**position_kwargs, return_jax_arrays=False)
+                except TypeError as exc:
+                    if "return_jax_arrays" not in str(exc):
+                        raise
+                    example_positions, _ = position_id_fn(**position_kwargs)
             else:
                 example_positions = np.arange(length, dtype=np.int32).reshape(1, 1, -1).repeat(3, axis=0)
             position_ids[:, wi, window_slice] = np.asarray(example_positions)[:, 0, :]

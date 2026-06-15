@@ -740,12 +740,13 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         ...
 
     @abstractmethod
-    def apply_training_hooks(self, metrics: LossMetrics) -> LossMetrics:
+    def apply_training_hooks(self, metrics: LossMetrics, loss_value: float | None = None) -> LossMetrics:
         """
         Apply training hooks to check for issues and enforce limits.
 
         Args:
             metrics: Current training metrics including loss.
+            loss_value: Optional already-hosted scalar loss value.
 
         Returns:
             LossMetrics: Potentially modified metrics.

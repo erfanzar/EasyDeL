@@ -826,12 +826,13 @@ class Trainer(BaseTrainer):
                 self._maybe_start_profiler(current_step)
                 try:
                     self._runtime_trace("train_step.host_metrics.begin", epoch=epoch, current_step=current_step)
+                    loss_value = self._metric_scalar_to_float(metrics.loss)
                     mean_loss, mean_accuracy = metrics_tracker.update(
-                        loss=metrics.loss,
+                        loss=loss_value,
                         accuracy=metrics.accuracy,
                         step=current_step,
                     )
-                    metrics = self.apply_training_hooks(metrics=metrics)
+                    metrics = self.apply_training_hooks(metrics=metrics, loss_value=loss_value)
                     train_metrics = step_metrics.calculate(
                         metrics=metrics,
                         current_step=current_step,

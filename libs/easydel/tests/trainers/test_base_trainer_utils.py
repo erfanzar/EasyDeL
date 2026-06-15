@@ -25,7 +25,8 @@ import numpy as np
 import pytest
 
 from easydel.data.core.protocols import ShardedDataSource, ShardInfo
-from easydel.infra.errors import EasyDeLPreemptionSignal
+from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLPreemptionSignal
+from easydel.infra.loss_utils import LossMetrics
 from easydel.trainers.base_trainer import BaseTrainer, GenerationResults
 from easydel.trainers.proximal_policy_optimization_trainer.modeling_value_head import CausalLMWithValueHead
 from easydel.trainers.trainer.trainer import Trainer
@@ -161,6 +162,24 @@ class _CountState(NamedTuple):
     payload: dict[str, object]
 
 
+class _NoCountState(NamedTuple):
+    payload: object
+
+
+@jax.tree_util.register_pytree_node_class
+class _IndexedCountState(NamedTuple):
+    count: object
+    payload: object
+
+    def tree_flatten(self):
+        return (self.payload, self.count), None
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        payload, count = children
+        return cls(count=count, payload=payload)
+
+
 class _StateStub:
     def __init__(self, *, opt_state, tx, step=0):
         self.opt_state = opt_state
@@ -234,6 +253,40 @@ def test_configure_state_initializes_tx_then_shards_via_state_api():
     assert trainer.model_state.shard_state_calls == [{"mesh": trainer.model.mesh}]
     assert trainer.state_shardings == "state-shardings"
     assert trainer.timer.logged == ["configure sharded state"]
+
+
+def test_apply_training_hooks_uses_host_loss_value_for_nan_guard(monkeypatch):
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.arguments = SimpleNamespace(
+        loss_config=SimpleNamespace(break_on_nan=True),
+        training_time_seconds=None,
+    )
+    metrics = LossMetrics(loss=jnp.asarray(1.0, dtype=jnp.float32))
+
+    def _unexpected_jnp_isnan(_value):
+        raise AssertionError("apply_training_hooks should not call jnp.isnan for host-side NaN checks")
+
+    monkeypatch.setattr("easydel.trainers.base_trainer.jnp.isnan", _unexpected_jnp_isnan)
+
+    assert BaseTrainer.apply_training_hooks(trainer, metrics, loss_value=1.0) is metrics
+    with pytest.raises(EasyDeLBreakRequest):
+        BaseTrainer.apply_training_hooks(trainer, metrics, loss_value=float("nan"))
+
+
+def test_apply_training_hooks_fallback_nan_guard_avoids_jnp_isnan(monkeypatch):
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.arguments = SimpleNamespace(
+        loss_config=SimpleNamespace(break_on_nan=True),
+        training_time_seconds=None,
+    )
+    metrics = LossMetrics(loss=np.asarray(1.0, dtype=np.float32))
+
+    def _unexpected_jnp_isnan(_value):
+        raise AssertionError("apply_training_hooks should not call jnp.isnan for host-side NaN checks")
+
+    monkeypatch.setattr("easydel.trainers.base_trainer.jnp.isnan", _unexpected_jnp_isnan)
+
+    assert BaseTrainer.apply_training_hooks(trainer, metrics) is metrics
 
 
 def test_configure_state_resume_keeps_step_and_sets_runtime_tx_before_sharding():
@@ -462,6 +515,33 @@ def test_configure_state_resume_seeds_opt_state_counts_from_step_start_point():
     assert opt_state is not None
     assert int(opt_state[0].count) == 13
     assert int(opt_state[1]["count"]) == 13
+
+
+def test_configure_state_seeds_custom_pytree_opt_state_counts_from_step_start_point():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.timer = _NoopTimer()
+    trainer.arguments = SimpleNamespace(init_tx=True, step_start_point=13, force_step_start_point=False)
+    trainer._resumed_from_checkpoint = True
+    trainer.tx = "new-tx"
+    trainer.model_state = _StateStub(
+        opt_state=(
+            _NoCountState(payload=jnp.asarray(3.0)),
+            _IndexedCountState(count=jnp.asarray(4, dtype=jnp.int32), payload=jnp.asarray(2.0)),
+            {"count": jnp.asarray(4, dtype=jnp.int32)},
+        ),
+        tx="old-tx",
+        step=jnp.asarray(13, dtype=jnp.int32),
+    )
+    trainer._model = _ModelStub()
+
+    BaseTrainer._configure_state(trainer)
+
+    opt_state = trainer.model_state.opt_state
+    assert opt_state is not None
+    assert float(opt_state[0].payload) == 3.0
+    assert int(opt_state[1].count) == 13
+    assert float(opt_state[1].payload) == 2.0
+    assert int(opt_state[2]["count"]) == 13
 
 
 def test_configure_state_force_seeds_opt_state_counts_from_loaded_nonzero_step():

@@ -613,6 +613,10 @@ class BaseTrainer(BaseTrainerProtocol):
         current_step = int(jax.device_get(self.model_state.step))
         step_dtype = getattr(self.model_state.step, "dtype", jnp.int32)
         normalized_step = jnp.asarray(requested_step, dtype=step_dtype)
+        if isinstance(self.model_state.step, jax.Array):
+            step_sharding = getattr(self.model_state.step, "sharding", None)
+            if isinstance(step_sharding, jax.sharding.Sharding):
+                normalized_step = jax.device_put(jax.device_get(normalized_step), step_sharding)
         if current_step == requested_step:
             if not isinstance(self.model_state.step, jax.Array):
                 self.model_state = self.model_state.replace(step=normalized_step)
@@ -653,6 +657,46 @@ class BaseTrainer(BaseTrainerProtocol):
 
         updated = {"changed": False}
 
+        def _count_value_like(leaf):
+            leaf_dtype = getattr(leaf, "dtype", getattr(self.model_state.step, "dtype", jnp.int32))
+            value = jnp.asarray(requested_step, dtype=leaf_dtype)
+            leaf_shape = tuple(getattr(leaf, "shape", ()))
+            if leaf_shape != ():
+                value = jnp.full(leaf_shape, requested_step, dtype=leaf_dtype)
+            if isinstance(leaf, jax.Array):
+                leaf_sharding = getattr(leaf, "sharding", None)
+                if isinstance(leaf_sharding, jax.sharding.Sharding):
+                    value = jax.device_put(jax.device_get(value), leaf_sharding)
+            return value
+
+        def _has_named_count(node) -> bool:
+            return hasattr(node, "_replace") and "count" in getattr(node, "_fields", ())
+
+        def _has_replaceable_count(node) -> bool:
+            if node is None:
+                return False
+            if _has_named_count(node):
+                return True
+            inner_state = getattr(node, "inner_state", None)
+            return (
+                inner_state is not None
+                and _has_named_count(inner_state)
+            )
+
+        def _seed_count_object(node):
+            if not _has_replaceable_count(node):
+                return node
+            replacements = {}
+            if _has_named_count(node):
+                replacements["count"] = _count_value_like(node.count)
+            inner_state = getattr(node, "inner_state", None)
+            if inner_state is not None and _has_named_count(inner_state):
+                replacements["inner_state"] = inner_state._replace(count=_count_value_like(inner_state.count))
+            if not replacements:
+                return node
+            updated["changed"] = True
+            return node._replace(**replacements)
+
         def _seed_count(path, leaf):
             """Replace optimizer 'count' leaves with the requested step value.
 
@@ -676,10 +720,14 @@ class BaseTrainer(BaseTrainerProtocol):
             if key_name != "count":
                 return leaf
             updated["changed"] = True
-            leaf_dtype = getattr(leaf, "dtype", getattr(self.model_state.step, "dtype", jnp.int32))
-            return jnp.asarray(requested_step, dtype=leaf_dtype)
+            return _count_value_like(leaf)
 
-        opt_state = jax.tree_util.tree_map_with_path(_seed_count, self.model_state.opt_state)
+        opt_state = jax.tree_util.tree_map(
+            _seed_count_object,
+            self.model_state.opt_state,
+            is_leaf=_has_replaceable_count,
+        )
+        opt_state = jax.tree_util.tree_map_with_path(_seed_count, opt_state)
         if updated["changed"]:
             self.model_state = self.model_state.replace(opt_state=opt_state)
             logger.info(f"Aligned optimizer/scheduler counters to step_start_point={requested_step}.")
@@ -2353,7 +2401,9 @@ class BaseTrainer(BaseTrainerProtocol):
 
     def _apply_user_data_collator(self, batch: tp.Any) -> tp.Any:
         """Apply an explicitly supplied data collator to raw list batches."""
-        if self._user_data_collator and self.data_collator is not None and isinstance(batch, (list, tuple)):
+        if getattr(self, "_user_data_collator", False) and self.data_collator is not None and isinstance(
+            batch, (list, tuple)
+        ):
             return self.data_collator(batch)
         return batch
 
@@ -5787,7 +5837,14 @@ class BaseTrainer(BaseTrainerProtocol):
         """
         return sum(n.size for n in jax.tree_util.tree_flatten(prm)[0])
 
-    def apply_training_hooks(self, metrics: LossMetrics) -> LossMetrics:
+    @staticmethod
+    def _metric_scalar_to_float(value: tp.Any) -> float:
+        """Convert a scalar metric leaf to a Python float through a controlled host read."""
+        if isinstance(value, jax.Array):
+            value = jax.device_get(value)
+        return float(np.asarray(value).reshape(()).item())
+
+    def apply_training_hooks(self, metrics: LossMetrics, loss_value: float | None = None) -> LossMetrics:
         """Apply training hooks to check for stopping conditions.
 
         Checks for NaN loss (if configured) and time limits, raising appropriate
@@ -5795,6 +5852,8 @@ class BaseTrainer(BaseTrainerProtocol):
 
         Args:
             metrics: The loss metrics from the current training step.
+            loss_value: Optional already-hosted scalar loss value. Passing this avoids
+                a second device read in the host-side NaN guard.
 
         Returns:
             LossMetrics: The unmodified metrics if no stopping condition is triggered.
@@ -5804,7 +5863,9 @@ class BaseTrainer(BaseTrainerProtocol):
             EasyDeLTimerError: If training has exceeded the configured time limit.
         """
         if self.arguments.loss_config is not None and self.arguments.loss_config.break_on_nan:
-            if jnp.isnan(metrics.loss):
+            if loss_value is None:
+                loss_value = self._metric_scalar_to_float(metrics.loss)
+            if np.isnan(loss_value):
                 info = "Prevent Running Model Due to NaN Loss"
                 logger.info(info)
                 raise EasyDeLBreakRequest(info)
