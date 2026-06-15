@@ -58,6 +58,49 @@ _ANSI_CYAN = "\033[96m"
 _ANSI_RESET = "\033[0m"
 
 
+def _host_scalar_float(value: tp.Any) -> float:
+    """Convert a scalar metric value to a Python float with one controlled host read."""
+    if isinstance(value, jax.Array):
+        value = jax.device_get(value)
+    return float(np.asarray(value).reshape(()).item())
+
+
+def _host_metric_value(value: tp.Any) -> tp.Any:
+    """Convert scalar metric leaves to plain Python values for logging."""
+    if value is None or isinstance(value, bool | int | float | str):
+        return value
+    if isinstance(value, jax.Array):
+        if value.shape != ():
+            return value
+        value = jax.device_get(value)
+    try:
+        array = np.asarray(value)
+    except (TypeError, ValueError):
+        return value
+    if array.ndim != 0:
+        return value
+    scalar = array.item()
+    if isinstance(scalar, bool | int | float | str):
+        return scalar
+    try:
+        return float(scalar)
+    except (TypeError, ValueError):
+        return scalar
+
+
+def _host_mean_float(value: tp.Any) -> float:
+    """Mean-reduce a metric on the host without invoking JAX logging work."""
+    if isinstance(value, jax.Array):
+        value = jax.device_get(value)
+    return float(np.asarray(value).mean().item())
+
+
+def _host_perplexity(loss_value: float) -> float:
+    """Mirror scalar JAX float32 perplexity semantics without calling JAX."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        return float(np.exp(np.asarray(loss_value, dtype=np.float32)).item())
+
+
 def _format_metrics_log(metrics: dict[str, tp.Any]) -> str:
     """Return a dict-like metrics log with the performance block highlighted."""
     items: list[str] = []
@@ -188,30 +231,32 @@ class StepMetrics:
             f"{perf_key}/total_tokens": total_tokens,
         }
 
-        loss = metrics.loss
+        loss_value = _host_scalar_float(metrics.loss)
         z_loss = metrics.z_loss
+        z_loss_value = _host_scalar_float(z_loss) if z_loss is not None else None
         epoch_value = float(epoch) if epoch_progress is None else float(epoch) + float(epoch_progress)
+        logged_extras = {key: _host_metric_value(value) for key, value in extras.items()}
 
         basic_metrics = {
             "epoch": epoch_value,
             "epoch_index": int(epoch),
             "learning_rate": float(np.array(learning_rate).item()),
-            "loss": float(loss),
-            "perplexity": float(jnp.exp(loss)),
+            "loss": loss_value,
+            "perplexity": _host_perplexity(loss_value),
             f"{mode}_step": int(current_step),
             "visited_tokens": visited_tokens,
-            "z_loss": float(z_loss) if z_loss is not None else None,
-            **extras,
+            "z_loss": z_loss_value,
+            **logged_extras,
         }
 
         if metrics.accuracy is not None:
-            basic_metrics["accuracy"] = float(metrics.accuracy)
+            basic_metrics["accuracy"] = _host_scalar_float(metrics.accuracy)
         if metrics.chosen_rewards is not None:
-            basic_metrics["chosen_rewards"] = float(jnp.mean(metrics.chosen_rewards).item())
+            basic_metrics["chosen_rewards"] = _host_mean_float(metrics.chosen_rewards)
         if metrics.rejected_rewards is not None:
-            basic_metrics["rejected_rewards"] = float(jnp.mean(metrics.rejected_rewards).item())
+            basic_metrics["rejected_rewards"] = _host_mean_float(metrics.rejected_rewards)
         if other_metrics is not None:
-            basic_metrics.update(other_metrics)
+            basic_metrics.update({key: _host_metric_value(value) for key, value in other_metrics.items()})
         if not self.arguments.performance_mode and (mode == "train" or mode is None):
             detailed_metrics = self._calculate_detailed_metrics(metrics)
             basic_metrics.update(detailed_metrics)
@@ -237,6 +282,10 @@ class StepMetrics:
         if metric_value is None or isinstance(metric_value, bool):
             return None
         try:
+            if isinstance(metric_value, jax.Array):
+                if metric_value.shape != ():
+                    return None
+                metric_value = jax.device_get(metric_value)
             scalar_array = np.asarray(metric_value)
         except (TypeError, ValueError):
             return None
@@ -373,7 +422,7 @@ class StepMetrics:
                 ) / 1e12
             if summary_metrics.get("eval/mean_loss") is not None:
                 summary_metrics["eval/loss"] = summary_metrics["eval/mean_loss"]
-                summary_metrics["eval/perplexity"] = float(jnp.exp(summary_metrics["eval/mean_loss"]))
+                summary_metrics["eval/perplexity"] = _host_perplexity(float(summary_metrics["eval/mean_loss"]))
             if summary_metrics.get("eval/mean_accuracy") is not None:
                 summary_metrics["eval/accuracy"] = summary_metrics["eval/mean_accuracy"]
 
@@ -468,14 +517,14 @@ class MetricsTracker:
         """
         del step
 
-        loss_value = float(np.asarray(loss).item())
+        loss_value = _host_scalar_float(loss)
         self.loss_sum = loss_value if self.loss_sum is None else self.loss_sum + loss_value
         self.loss_count += 1
         mean_loss = self.loss_sum / max(self.loss_count, 1)
 
         mean_accuracy = None
         if accuracy is not None:
-            accuracy_value = float(np.asarray(accuracy).item())
+            accuracy_value = _host_scalar_float(accuracy)
             if np.isfinite(accuracy_value):
                 self.accuracy_sum = accuracy_value if self.accuracy_sum is None else self.accuracy_sum + accuracy_value
                 self.accuracy_count += 1

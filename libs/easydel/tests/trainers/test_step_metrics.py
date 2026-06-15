@@ -14,6 +14,10 @@
 
 from types import SimpleNamespace
 
+import jax.numpy as jnp
+import numpy as np
+import pytest
+
 from easydel.infra.loss_utils import LossMetrics
 from easydel.trainers.metrics import JSONProgressBar, MetricsTracker, StepMetrics
 
@@ -79,6 +83,50 @@ def test_step_metrics_offsets_fractional_progress_by_epoch_index(monkeypatch):
     assert results["train/epoch_index"] == 1
 
 
+def test_step_metrics_host_converts_jax_scalars_without_jax_exp(monkeypatch):
+    def fail_jax_exp(_):
+        raise AssertionError("host metrics must not call jnp.exp")
+
+    monkeypatch.setattr("easydel.trainers.metrics.jnp.exp", fail_jax_exp)
+    step_metrics = StepMetrics(arguments=SimpleNamespace(performance_mode=True))
+    step_metrics.start_time = 0.0
+    step_metrics.step_start_time = 10.0
+    monkeypatch.setattr("easydel.trainers.metrics.time.time", lambda: 12.0)
+
+    metrics = LossMetrics(
+        loss=jnp.asarray(0.5, dtype=jnp.float32),
+        z_loss=jnp.asarray(0.25, dtype=jnp.float32),
+        accuracy=jnp.asarray(0.75, dtype=jnp.float32),
+        chosen_rewards=jnp.asarray([1.0, 3.0], dtype=jnp.float32),
+        rejected_rewards=jnp.asarray([0.0, 2.0], dtype=jnp.float32),
+        other_metrics={"kl_loss": jnp.asarray(0.125, dtype=jnp.float32)},
+        execution_time=2.0,
+    )
+
+    results = step_metrics.calculate(
+        metrics=metrics,
+        current_step=3,
+        epoch=0,
+        epoch_progress=None,
+        flops_per_token=1.0,
+        extra_flops_per_token=0.0,
+        batch_size=2,
+        seq_length=4,
+        learning_rate=jnp.asarray(1e-4, dtype=jnp.float32),
+        mode="train",
+        mean_loss=jnp.asarray(0.5, dtype=jnp.float32),
+    )
+
+    assert results["train/loss"] == pytest.approx(0.5)
+    assert results["train/perplexity"] == pytest.approx(float(np.exp(np.asarray(0.5, dtype=np.float32))))
+    assert results["train/z_loss"] == pytest.approx(0.25)
+    assert results["train/accuracy"] == pytest.approx(0.75)
+    assert results["train/chosen_rewards"] == pytest.approx(2.0)
+    assert results["train/rejected_rewards"] == pytest.approx(1.0)
+    assert results["train/kl_loss"] == pytest.approx(0.125)
+    assert results["train/mean_loss"] == pytest.approx(0.5)
+
+
 def test_metrics_tracker_counts_updates_and_ignores_missing_accuracy():
     tracker = MetricsTracker()
 
@@ -91,6 +139,19 @@ def test_metrics_tracker_counts_updates_and_ignores_missing_accuracy():
 
     assert mean_loss == 3.0
     assert mean_accuracy == 0.5
+
+
+def test_metrics_tracker_update_accepts_jax_scalars():
+    tracker = MetricsTracker()
+
+    mean_loss, mean_accuracy = tracker.update(
+        loss=jnp.asarray(1.5, dtype=jnp.float32),
+        accuracy=jnp.asarray(0.25, dtype=jnp.float32),
+        step=1,
+    )
+
+    assert mean_loss == pytest.approx(1.5)
+    assert mean_accuracy == pytest.approx(0.25)
 
 
 def test_metrics_tracker_ignores_non_finite_accuracy():
