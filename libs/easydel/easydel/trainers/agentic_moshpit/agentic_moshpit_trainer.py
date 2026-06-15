@@ -54,6 +54,7 @@ except ImportError:
     wandb = None
 
 from ..group_relative_policy_optimization.grpo_trainer import GRPOTrainer
+from ..metrics import _host_mean_float, _host_scalar_float
 from ..prompt_utils import apply_chat_template
 from ..reward_protocol import RewardProtocol
 from ..training_utils import (
@@ -828,15 +829,15 @@ class AgenticMoshPitTrainer(GRPOTrainer):
         avg_steps = float(np.mean([t.num_steps for t in trajectories]))
 
         metrics_dict: dict[str, float | int | str] = {
-            "reward_mean": float(jnp.nanmean(env_rewards)),
-            "reward_std": float(jnp.nanstd(env_rewards)),
-            "completion_length": float(jnp.mean(completion_length)),
+            "reward_mean": _host_scalar_float(jnp.nanmean(env_rewards)),
+            "reward_std": _host_scalar_float(jnp.nanstd(env_rewards)),
+            "completion_length": _host_mean_float(completion_length),
             "rollout_time": rollout_time,
             "advantage_time": advantage_time,
             "ref_logps_time": ref_logps_time,
             "preprocessing_time": total_time,
             "avg_episode_steps": avg_steps,
-            "frac_reward_zero_std": float(jnp.mean(jnp.isclose(std_rewards, 0.0).astype(jnp.float32))),
+            "frac_reward_zero_std": _host_mean_float(jnp.isclose(std_rewards, 0.0).astype(jnp.float32)),
         }
         if aux_reward_breakdown:
             metrics_dict["aux_reward_mean"] = float(np.nanmean(aux_rewards))
@@ -907,7 +908,7 @@ class AgenticMoshPitTrainer(GRPOTrainer):
                     i,
                     traj.episode_reward,
                     traj.num_steps,
-                    float(jnp.sum(traj.response_mask)),
+                    _host_scalar_float(jnp.sum(traj.response_mask)),
                     traj.info.get("question", ""),
                     traj.info.get("topic", ""),
                     _json.dumps(turns, ensure_ascii=False),

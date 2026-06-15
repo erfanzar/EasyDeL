@@ -50,6 +50,7 @@ from easydel.utils.traversals import deepcopy_model
 
 from ..agentic_moshpit.environment import ToolEnvWrapper, create_tool_call_parser
 from ..agentic_moshpit.tools import function_to_json, make_tool
+from ..metrics import _host_mean_float, _host_scalar_float
 from ..model_loading import disable_state_dropout, reject_string_model_id
 from ..prompt_transforms import GRPOPreprocessTransform
 from ..prompt_utils import apply_chat_template
@@ -1914,23 +1915,23 @@ class GRPOTrainer(Trainer):
         preprocessing_time = preprocessing_time_fn()
         completion_length = jnp.sum(completion_mask, -1)
         metrics_dict: dict[str, float | int | str] = {
-            "reward_mean": float(jnp.nanmean(rewards, -1)),
-            "reward_std": float(jnp.nanmean(std_rewards)),
-            "completion_length": float(jnp.mean(completion_length)),
+            "reward_mean": _host_mean_float(jnp.nanmean(rewards, -1)),
+            "reward_std": _host_scalar_float(jnp.nanmean(std_rewards)),
+            "completion_length": _host_mean_float(completion_length),
             "grouped_comp_time": grouped_comp_time,
             "rewarding_time": rewarding_time,
             "token_logps_time": token_logps_time,
             "old_token_logps_time": old_token_logps_time,
             "generation_time": generation_time,
             "preprocessing_time": preprocessing_time,
-            "frac_reward_zero_std": float(jnp.mean(is_std_zero.astype(jnp.float32))),
+            "frac_reward_zero_std": _host_mean_float(is_std_zero.astype(jnp.float32)),
         }
         for i, reward_func_name in enumerate(self.reward_func_names):
-            metrics_dict[reward_func_name] = float(jnp.nanmean(rewards_per_func[:, i]))
+            metrics_dict[reward_func_name] = _host_scalar_float(jnp.nanmean(rewards_per_func[:, i]))
         if environment_feedback is not None:
-            metrics_dict["environment_reward"] = float(jnp.nanmean(rewards_per_func[:, -1]))
+            metrics_dict["environment_reward"] = _host_scalar_float(jnp.nanmean(rewards_per_func[:, -1]))
         if difficulty_weights is not None:
-            metrics_dict["difficulty_weight_mean"] = float(jnp.mean(difficulty_weights))
+            metrics_dict["difficulty_weight_mean"] = _host_mean_float(difficulty_weights)
         self._maybe_log_grpo_completions(
             prompts=completion_prompts,
             completions=clean_completions_text,

@@ -26,6 +26,7 @@ from easydel.utils import Registry
 from easydel.utils.helpers import capture_time
 
 from ..group_relative_policy_optimization import GRPOTrainer
+from ..metrics import _host_scalar_float
 from ..model_loading import disable_state_dropout, reject_string_model_id
 from ..sdft_trainer import _zero_reward_func
 from .minillm_config import MiniLLMConfig
@@ -196,7 +197,7 @@ class MiniLLMTrainer(GRPOTrainer):
         }
         metrics = {
             **metrics,
-            "minillm/rkl_advantage": float(jnp.mean(rkl_advantage * completion_mask)),
+            "minillm/rkl_advantage": _host_scalar_float(jnp.mean(rkl_advantage * completion_mask)),
             "minillm/teacher_logps_time": minillm_teacher_time_fn(),
             "minillm/student_logps_time": minillm_student_time_fn(),
         }

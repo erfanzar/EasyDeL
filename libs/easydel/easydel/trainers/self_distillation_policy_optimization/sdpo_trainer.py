@@ -59,6 +59,7 @@ from easydel.utils.traversals import deepcopy_model
 
 from ..group_relative_policy_optimization._fn import get_per_token_logps
 from ..group_relative_policy_optimization.grpo_trainer import GRPOTrainer
+from ..metrics import _host_mean_float, _host_scalar_float
 from ..prompt_utils import apply_chat_template
 from ..reward_protocol import RewardProtocol
 from ..trainer_protocol import TrainerConfigureFunctionOutput
@@ -934,9 +935,9 @@ class SDPOTrainer(GRPOTrainer):
         completion_length = jnp.sum(completion_mask, -1)
 
         metrics_dict: dict[str, float | int | str] = {
-            "reward_mean": float(jnp.nanmean(rewards)),
-            "reward_std": float(jnp.nanstd(rewards)),
-            "completion_length": float(jnp.mean(completion_length)),
+            "reward_mean": _host_scalar_float(jnp.nanmean(rewards)),
+            "reward_std": _host_scalar_float(jnp.nanstd(rewards)),
+            "completion_length": _host_mean_float(completion_length),
             "generation_time": generation_time,
             "rewarding_time": rewarding_time,
             "teacher_build_time": teacher_build_time,
@@ -944,7 +945,7 @@ class SDPOTrainer(GRPOTrainer):
             "preprocessing_time": preprocessing_time,
         }
         for i, name in enumerate(self.reward_func_names):
-            metrics_dict[name] = float(jnp.nanmean(rewards_per_func[:, i]))
+            metrics_dict[name] = _host_scalar_float(jnp.nanmean(rewards_per_func[:, i]))
         self._log_training_generations_to_wandb(
             state=state,
             prompts=completion_prompts,

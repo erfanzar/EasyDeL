@@ -34,6 +34,7 @@ from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
 from easydel.utils.helpers import capture_time
 
+from ..metrics import _host_mean_float
 from ..prompt_transforms import GRPOPreprocessTransform
 from ..trainer import Trainer
 from .seq_kd_config import SeqKDConfig
@@ -414,7 +415,7 @@ class SeqKDTrainer(Trainer):
         preprocessing_time = preprocessing_time_fn()
 
         metrics_dict: dict[str, float | int | str] = {
-            "completion_length": float(jnp.mean(jnp.sum(completion_mask, -1))),
+            "completion_length": _host_mean_float(jnp.sum(completion_mask, -1)),
             "generation_time": generation_time,
             "preprocessing_time": preprocessing_time,
         }
