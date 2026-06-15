@@ -15,6 +15,7 @@
 from types import SimpleNamespace
 
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from easydel.infra.errors import EasyDeLPreemptionSignal
@@ -182,7 +183,7 @@ def test_train_epoch_uses_preemption_checkpoint_path_before_regular_checkpointin
     trainer.train_tracker = SimpleNamespace(trace_compilation=lambda: _MeshCtx())
     trainer.on_step_start = lambda state, step: state
     trainer.on_step_end = lambda state, metrics, step: (state, metrics)
-    trainer.apply_training_hooks = lambda metrics: metrics
+    trainer.apply_training_hooks = lambda metrics, **_: metrics
     logged_calls: list[dict[str, object]] = []
     trainer.log_metrics = lambda **kwargs: logged_calls.append(kwargs)
     trainer.log_weight_distribution = lambda **kwargs: None
@@ -242,7 +243,7 @@ def test_train_epoch_forwards_merge_lora_before_save_to_regular_checkpoint(monke
     trainer.train_tracker = SimpleNamespace(trace_compilation=lambda: _MeshCtx())
     trainer.on_step_start = lambda state, step: state
     trainer.on_step_end = lambda state, metrics, step: (state, metrics)
-    trainer.apply_training_hooks = lambda metrics: metrics
+    trainer.apply_training_hooks = lambda metrics, **_: metrics
     trainer.log_metrics = lambda **kwargs: None
     trainer.log_weight_distribution = lambda **kwargs: None
     trainer.log_watchers = lambda **kwargs: None
@@ -318,7 +319,7 @@ def test_train_epoch_blocks_until_ready_when_profiler_is_active(monkeypatch):
     trainer.train_tracker = SimpleNamespace(trace_compilation=lambda: _MeshCtx())
     trainer.on_step_start = lambda state, step: state
     trainer.on_step_end = lambda state, metrics, step: (state, metrics)
-    trainer.apply_training_hooks = lambda metrics: metrics
+    trainer.apply_training_hooks = lambda metrics, **_: metrics
     trainer.log_metrics = lambda **kwargs: None
     trainer.log_weight_distribution = lambda **kwargs: None
     trainer.log_watchers = lambda **kwargs: None
@@ -443,4 +444,6 @@ def test_eval_epoch_summary_matches_step_perplexity_behavior_for_large_losses():
 
     assert len(metrics) == 2
     assert logged_calls[-1]["metrics"]["eval/loss"] == 100.0
-    assert logged_calls[-1]["metrics"]["eval/perplexity"] == float(jnp.exp(100.0))
+    with np.errstate(over="ignore"):
+        expected_perplexity = float(np.exp(np.asarray(100.0, dtype=np.float32)))
+    assert logged_calls[-1]["metrics"]["eval/perplexity"] == expected_perplexity
