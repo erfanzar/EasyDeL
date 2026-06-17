@@ -23,6 +23,7 @@ This module provides:
 
 from __future__ import annotations
 
+import itertools
 import logging
 import math
 import typing as tp
@@ -338,6 +339,61 @@ class MixedShardedSource(ShardedDataSource[dict]):
 
         return {name: int(counts_arr[i]) for i, name in enumerate(self._names)}
 
+    def _block_source_ids(self, block_idx: int, examples_emitted: int) -> list[str]:
+        """Build the deterministic per-row source order for one mixer block."""
+        weights = self._get_weights_for_step(examples_emitted)
+        counts = self._compute_counts(weights)
+
+        ids = []
+        for name, count in counts.items():
+            ids.extend([name] * count)
+
+        block_seed = self._seed + block_idx if self._seed is not None else None
+        block_rng = np.random.default_rng(block_seed)
+        block_rng.shuffle(ids)
+        return ids
+
+    def _source_offsets_for_row(self, row: int) -> dict[str, int]:
+        """Return per-source rows consumed before virtual mixed row ``row``."""
+        row = max(int(row), 0)
+        offsets = {name: 0 for name in self._names}
+        full_blocks, partial = divmod(row, self._block_size)
+
+        for block_idx in range(full_blocks):
+            block_start = block_idx * self._block_size
+            counts = self._compute_counts(self._get_weights_for_step(block_start))
+            for name, count in counts.items():
+                offsets[name] += count
+
+        if partial:
+            block_start = full_blocks * self._block_size
+            for name in self._block_source_ids(full_blocks, block_start)[:partial]:
+                offsets[name] += 1
+
+        return offsets
+
+    def _known_shard_rows(self, source: ShardedDataSource, shard_name: str) -> int | None:
+        """Best-effort exact row count for one constituent shard."""
+        try:
+            info = source.get_shard_info(shard_name)
+        except Exception:
+            return None
+        if info is None or info.num_rows is None:
+            return None
+        return max(int(info.num_rows), 0)
+
+    def _known_source_rows(self, source: ShardedDataSource, shard_names: list[str]) -> tuple[list[tuple[str, int]], int] | None:
+        """Return exact per-shard and total row counts when all are known."""
+        rows_by_shard = []
+        total = 0
+        for shard_name in shard_names:
+            rows = self._known_shard_rows(source, shard_name)
+            if rows is None:
+                return None
+            rows_by_shard.append((shard_name, rows))
+            total += rows
+        return rows_by_shard, total
+
     def open_shard(self, _shard_name: str) -> "Iterator[dict]":
         """Drive the block-mixer until either ``stop_strategy`` halts it or all sources die.
 
@@ -370,18 +426,7 @@ class MixedShardedSource(ShardedDataSource[dict]):
             # iterator with no knowledge of batch size, so the schedule is driven by the cumulative count of
             # EMITTED EXAMPLES -- not optimizer steps. To target an optimizer step N, set the schedule point
             # at ``N * global_batch_size`` examples.
-            weights = self._get_weights_for_step(examples_emitted)
-            counts = self._compute_counts(weights)
-
-            # Create deterministic RNG per block
-            block_seed = self._seed + block_idx if self._seed is not None else None
-            block_rng = np.random.default_rng(block_seed)
-
-            # Build block indices
-            ids = []
-            for name, count in counts.items():
-                ids.extend([name] * count)
-            block_rng.shuffle(ids)
+            ids = self._block_source_ids(block_idx, examples_emitted)
 
             # Yield examples from the block
             exhausted_count = 0
@@ -414,6 +459,58 @@ class MixedShardedSource(ShardedDataSource[dict]):
 
             block_idx += 1
 
+    def open_shard_at_row(self, _shard_name: str, row: int) -> "Iterator[dict]":
+        """Open the virtual mixed shard after ``row`` emitted examples."""
+        row = max(int(row), 0)
+        if row == 0:
+            yield from self.open_shard(_shard_name)
+            return
+
+        if self._stop_strategy != "restart":
+            logger.warning(
+                "Seeked resume for MixedShardedSource is only exact for stop_strategy='restart'; "
+                "falling back to sequential skip of %d mixed examples.",
+                row,
+            )
+            yield from itertools.islice(self.open_shard(_shard_name), row, None)
+            return
+
+        offsets = self._source_offsets_for_row(row)
+        iters = {
+            name: self._chain_shards_at_row(self._sources[name], offsets[name])
+            for name in self._names
+        }
+
+        block_idx, partial = divmod(row, self._block_size)
+
+        while True:
+            block_start = block_idx * self._block_size
+            ids = self._block_source_ids(block_idx, block_start)
+            if partial:
+                ids = ids[partial:]
+                partial = 0
+
+            exhausted_count = 0
+            for name in ids:
+                try:
+                    example = next(iters[name])
+                    example["__source__"] = name
+                    yield example
+                except StopIteration:
+                    iters[name] = self._chain_shards(self._sources[name])
+                    try:
+                        example = next(iters[name])
+                        example["__source__"] = name
+                        yield example
+                    except StopIteration:
+                        logger.warning(f"Dataset '{name}' is empty")
+                        exhausted_count += 1
+
+            if exhausted_count == len(self._names):
+                return
+
+            block_idx += 1
+
     def _chain_shards(self, source: ShardedDataSource) -> "Iterator[dict]":
         """Chain every shard of ``source`` into one continuous iterator.
 
@@ -425,6 +522,43 @@ class MixedShardedSource(ShardedDataSource[dict]):
             order.
         """
         for shard_name in source.shard_names:
+            yield from source.open_shard(shard_name)
+
+    def _chain_shards_at_row(self, source: ShardedDataSource, row: int) -> "Iterator[dict]":
+        """Chain ``source`` shards starting at a global row offset."""
+        row = max(int(row), 0)
+        shard_names = list(source.shard_names)
+        if row == 0:
+            yield from self._chain_shards(source)
+            return
+
+        known_rows = self._known_source_rows(source, shard_names)
+        if known_rows is None:
+            logger.warning(
+                "Cannot seek mixed constituent %s by metadata; falling back to sequential skip of %d rows.",
+                type(source).__name__,
+                row,
+            )
+            yield from itertools.islice(self._chain_shards(source), row, None)
+            return
+
+        rows_by_shard, total_rows = known_rows
+        if total_rows <= 0:
+            return
+
+        if self._stop_strategy == "restart":
+            row %= total_rows
+
+        remaining = row
+        started = False
+        for shard_name, rows in rows_by_shard:
+            if not started:
+                if remaining >= rows:
+                    remaining -= rows
+                    continue
+                yield from source.open_shard_at_row(shard_name, remaining)
+                started = True
+                continue
             yield from source.open_shard(shard_name)
 
     def __len__(self) -> int:

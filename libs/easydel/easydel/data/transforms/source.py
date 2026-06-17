@@ -23,6 +23,7 @@ This module provides:
 from __future__ import annotations
 
 import itertools
+import logging
 import random
 import typing as tp
 from collections.abc import Iterator, Sequence
@@ -30,6 +31,8 @@ from dataclasses import replace
 
 from ..core.protocols import ShardedDataSource, ShardInfo
 from .base import ExpandTransform, Transform
+
+logger = logging.getLogger(__name__)
 
 
 class TransformedShardedSource(ShardedDataSource[dict]):
@@ -240,6 +243,81 @@ class ShuffledShardedSource(ShardedDataSource[dict]):
         """
         return 1
 
+    def _ordered_shard_names(self, rng: random.Random) -> list[str]:
+        """Return the deterministic shard visitation order for one iteration."""
+        shard_names = list(self._source.shard_names)
+        if self._shuffle_shards and len(shard_names) > 1:
+            rng.shuffle(shard_names)
+        return shard_names
+
+    def _underlying_stream_from_order(self, shard_names: Sequence[str]) -> Iterator[dict]:
+        """Chain underlying shards in a precomputed order."""
+        for shard_name in shard_names:
+            yield from self._source.open_shard(shard_name)
+
+    def _underlying_stream_at_row(self, shard_names: Sequence[str], row: int) -> Iterator[dict]:
+        """Chain underlying shards from a global row offset."""
+        row = max(int(row), 0)
+        if row == 0:
+            yield from self._underlying_stream_from_order(shard_names)
+            return
+
+        if len(shard_names) == 1:
+            yield from self._source.open_shard_at_row(shard_names[0], row)
+            return
+
+        rows_by_shard: list[tuple[str, int]] = []
+        for shard_name in shard_names:
+            try:
+                info = self._source.get_shard_info(shard_name)
+            except Exception:
+                info = None
+            if info is None or info.num_rows is None:
+                logger.warning(
+                    "Cannot seek shuffled source through %s because shard %r has no row metadata; "
+                    "falling back to sequential skip of %d rows.",
+                    type(self._source).__name__,
+                    shard_name,
+                    row,
+                )
+                yield from itertools.islice(self._underlying_stream_from_order(shard_names), row, None)
+                return
+            rows_by_shard.append((shard_name, int(info.num_rows)))
+
+        remaining = row
+        started = False
+        for shard_name, rows in rows_by_shard:
+            if not started:
+                if remaining >= rows:
+                    remaining -= rows
+                    continue
+                yield from self._source.open_shard_at_row(shard_name, remaining)
+                started = True
+                continue
+            yield from self._source.open_shard(shard_name)
+
+    def _underlying_rows_at_positions(self, shard_names: Sequence[str], positions: Sequence[int]) -> dict[int, dict]:
+        """Fetch selected underlying stream rows by absolute position."""
+        unique_positions = sorted(set(int(position) for position in positions))
+        if not unique_positions:
+            return {}
+
+        span = unique_positions[-1] - unique_positions[0] + 1
+        max_sequential_span = max(self._buffer_size * 64, 8192)
+        rows_by_position: dict[int, dict] = {}
+        if span <= max_sequential_span:
+            wanted = set(unique_positions)
+            stream = self._underlying_stream_at_row(shard_names, unique_positions[0])
+            for position in range(unique_positions[0], unique_positions[-1] + 1):
+                item = next(stream)
+                if position in wanted:
+                    rows_by_position[position] = item
+            return rows_by_position
+
+        for position in unique_positions:
+            rows_by_position[position] = next(self._underlying_stream_at_row(shard_names, position))
+        return rows_by_position
+
     def _underlying_stream(self, rng: random.Random) -> Iterator[dict]:
         """Chain every underlying shard into one stream, optionally shuffling shard order.
 
@@ -251,11 +329,7 @@ class ShuffledShardedSource(ShardedDataSource[dict]):
             shard-shuffled) concatenation order, before the reservoir
             is applied.
         """
-        shard_names = list(self._source.shard_names)
-        if self._shuffle_shards and len(shard_names) > 1:
-            rng.shuffle(shard_names)
-        for shard_name in shard_names:
-            yield from self._source.open_shard(shard_name)
+        yield from self._underlying_stream_from_order(self._ordered_shard_names(rng))
 
     def _shuffled_iter(self, skip: int = 0) -> Iterator[dict]:
         """Reservoir-shuffle the chained upstream, dropping the first ``skip`` emitted rows.
@@ -292,6 +366,42 @@ class ShuffledShardedSource(ShardedDataSource[dict]):
                 yield out
             emitted += 1
 
+    def _shuffled_iter_at_row(self, row: int) -> Iterator[dict]:
+        """Resume reservoir shuffle at an emitted-row offset without replaying all rows."""
+        row = max(int(row), 0)
+        if row == 0:
+            yield from self._shuffled_iter(skip=0)
+            return
+
+        rng = random.Random(self._seed)
+        shard_names = self._ordered_shard_names(rng)
+        slot_positions = list(range(self._buffer_size))
+        for emitted in range(row):
+            idx = rng.randrange(self._buffer_size)
+            slot_positions[idx] = self._buffer_size + emitted
+
+        try:
+            rows_by_position = self._underlying_rows_at_positions(shard_names, slot_positions)
+            buffer = [rows_by_position[position] for position in slot_positions]
+            upstream = self._underlying_stream_at_row(shard_names, self._buffer_size + row)
+        except (KeyError, StopIteration, IndexError) as exc:
+            logger.warning(
+                "Could not reconstruct shuffled resume state at row %d (%s); falling back to sequential skip.",
+                row,
+                type(exc).__name__,
+            )
+            yield from self._shuffled_iter(skip=row)
+            return
+
+        for item in upstream:
+            idx = rng.randrange(self._buffer_size)
+            out = buffer[idx]
+            buffer[idx] = item
+            yield out
+
+        rng.shuffle(buffer)
+        yield from buffer
+
     def open_shard(self, _shard_name: str) -> Iterator[dict]:
         """Open the synthetic shard and stream reservoir-shuffled rows.
 
@@ -314,7 +424,7 @@ class ShuffledShardedSource(ShardedDataSource[dict]):
             Iterator[dict]: Rows in pseudo-random order, starting after
             ``row`` items.
         """
-        return self._shuffled_iter(skip=row)
+        return self._shuffled_iter_at_row(row)
 
     def get_shard_info(self, shard_name: str) -> tp.Any:
         """Synthetic shards carry no metadata.

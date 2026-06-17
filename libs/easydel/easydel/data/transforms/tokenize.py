@@ -355,6 +355,10 @@ class TokenizedShardedSource(ShardedDataSource[dict]):
         for example in self._source.open_shard_at_row(shard_name, row):
             yield self._tokenize_example(example)
 
+    def get_shard_info(self, shard_name: str) -> tp.Any:
+        """Return shard metadata from the underlying source."""
+        return self._source.get_shard_info(shard_name)
+
     def __len__(self) -> int:
         """Return length of the underlying source.
 
