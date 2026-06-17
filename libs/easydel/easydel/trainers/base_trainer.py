@@ -126,6 +126,58 @@ log_debug_maybe = logger.debug
 DEFAULT_ARGS_JSON_NAME = "easydel-training-arguments.json"
 
 
+def _iter_sharded_source_from_start(source: ShardedDataSource) -> collections.abc.Iterator:
+    """Yield all rows from a source in shard order."""
+    for shard_name in source.shard_names:
+        yield from source.open_shard(shard_name)
+
+
+def _iter_sharded_source_from_example_offset(
+    source: ShardedDataSource,
+    start_row: int,
+) -> collections.abc.Iterator:
+    """Yield source rows from a global row offset, using shard metadata when available."""
+    start_row = max(int(start_row), 0)
+    if start_row == 0:
+        yield from _iter_sharded_source_from_start(source)
+        return
+
+    shard_names = list(source.shard_names)
+    if len(shard_names) == 1:
+        yield from source.open_shard_at_row(shard_names[0], start_row)
+        return
+
+    shard_rows: list[tuple[str, int]] = []
+    for shard_name in shard_names:
+        try:
+            info = source.get_shard_info(shard_name)
+        except Exception:
+            info = None
+        if info is None or info.num_rows is None:
+            logger.warning(
+                "Cannot seek dataloader resume through %s because shard %r has no row metadata; "
+                "falling back to sequential skip of %d examples.",
+                type(source).__name__,
+                shard_name,
+                start_row,
+            )
+            yield from itertools.islice(_iter_sharded_source_from_start(source), start_row, None)
+            return
+        shard_rows.append((shard_name, int(info.num_rows)))
+
+    remaining = start_row
+    started = False
+    for shard_name, rows in shard_rows:
+        if not started:
+            if remaining >= rows:
+                remaining -= rows
+                continue
+            yield from source.open_shard_at_row(shard_name, remaining)
+            started = True
+            continue
+        yield from source.open_shard(shard_name)
+
+
 class _ReiterableDataLoader:
     """Small wrapper that recreates a fresh iterator on every ``iter(...)`` call.
 
@@ -139,15 +191,23 @@ class _ReiterableDataLoader:
             length is unknown and ``len(...)`` will raise ``TypeError``.
     """
 
-    def __init__(self, factory: tp.Callable[[], collections.abc.Iterator], length: int | None = None):
+    def __init__(
+        self,
+        factory: tp.Callable[[], collections.abc.Iterator],
+        length: int | None = None,
+        skip_factory: tp.Callable[[int], collections.abc.Iterator] | None = None,
+    ):
         """Store the iterator factory and optional length.
 
         Args:
             factory: Callable returning a fresh iterator on each call.
             length: Optional known length of the sequence; ``None`` if unknown.
+            skip_factory: Optional callable returning an iterator positioned at
+                a batch offset without materializing skipped batches.
         """
         self._factory = factory
         self._length = length
+        self._skip_factory = skip_factory
 
     def __iter__(self):
         """Return a freshly constructed iterator from the stored factory."""
@@ -162,6 +222,12 @@ class _ReiterableDataLoader:
         if self._length is None:
             raise TypeError(f"{type(self).__name__} has no len()")
         return self._length
+
+    def iter_from_batch(self, num_batches: int):
+        """Return an iterator positioned at ``num_batches`` from the start."""
+        if self._skip_factory is None:
+            raise NotImplementedError(f"{type(self).__name__} does not support seeked iteration")
+        return self._skip_factory(max(int(num_batches), 0))
 
 
 class _ResolvedStepCount(NamedTuple):
@@ -4874,6 +4940,7 @@ class BaseTrainer(BaseTrainerProtocol):
         shuffle: bool = False,
         num_epochs: int = 1,
         drop_remainder: bool = True,
+        skip_batches: int = 0,
     ) -> collections.abc.Iterator:
         """Create dataloader iterator from ShardedDataSource.
 
@@ -4888,21 +4955,25 @@ class BaseTrainer(BaseTrainerProtocol):
             shuffle: Whether to shuffle (currently not implemented for sources).
             num_epochs: Number of epochs to iterate.
             drop_remainder: Whether to drop the last incomplete batch.
+            skip_batches: Number of complete batches to skip before yielding.
+                When supported by the source stack, this seeks instead of
+                materializing skipped rows during checkpoint resume.
 
         Yields:
             Lists of examples (pre-tokenized dicts) to be collated.
         """
+        skip_examples = max(int(skip_batches), 0) * int(batch_size)
         for _ in range(num_epochs):
             batch = []
-            for shard_name in source.shard_names:
-                for example in source.open_shard(shard_name):
-                    batch.append(example)
-                    if len(batch) >= batch_size:
-                        yield batch
-                        batch = []
+            for example in _iter_sharded_source_from_example_offset(source, skip_examples):
+                batch.append(example)
+                if len(batch) >= batch_size:
+                    yield batch
+                    batch = []
             # Handle remainder
             if batch and not drop_remainder:
                 yield batch
+            skip_examples = 0
 
     def _configure_grain_dataloader(self):
         """Configure Grain dataloaders for training and evaluation.
@@ -4996,6 +5067,15 @@ class BaseTrainer(BaseTrainerProtocol):
                     shuffle=self.arguments.shuffle_train_dataset,
                     num_epochs=self.arguments.num_train_epochs,
                     drop_remainder=True,
+                ),
+                skip_factory=lambda num_batches: self._create_dataloader_from_source(
+                    source=self._train_source,
+                    batch_size=self.training_batch_size,
+                    is_train=True,
+                    shuffle=self.arguments.shuffle_train_dataset,
+                    num_epochs=self.arguments.num_train_epochs,
+                    drop_remainder=True,
+                    skip_batches=num_batches,
                 ),
                 length=max_training_steps,
             )
@@ -5179,6 +5259,15 @@ class BaseTrainer(BaseTrainerProtocol):
                     shuffle=self.arguments.shuffle_train_dataset,
                     num_epochs=self.arguments.num_train_epochs,
                     drop_remainder=True,
+                ),
+                skip_factory=lambda num_batches: self._create_dataloader_from_source(
+                    source=self._train_source,
+                    batch_size=self.training_batch_size,
+                    is_train=True,
+                    shuffle=self.arguments.shuffle_train_dataset,
+                    num_epochs=self.arguments.num_train_epochs,
+                    drop_remainder=True,
+                    skip_batches=num_batches,
                 ),
                 length=max_training_steps,
             )
@@ -6216,6 +6305,16 @@ class BaseTrainer(BaseTrainerProtocol):
             )
         if num_batches == 0:
             return data_iter
+        iter_from_batch = getattr(dataloader, "iter_from_batch", None)
+        if callable(iter_from_batch):
+            logger.info(
+                f"Seeking dataloader to resume at batch offset {num_batches}; "
+                "skipped batches will not be materialized."
+            )
+            try:
+                return iter_from_batch(num_batches)
+            except NotImplementedError:
+                pass
         builtin_sequence_iterators = (type(iter([])), type(iter(())), type(iter(range(0))))
         if isinstance(dataloader, collections.abc.Sequence) and isinstance(data_iter, builtin_sequence_iterators):
             total_batches = len(dataloader)
