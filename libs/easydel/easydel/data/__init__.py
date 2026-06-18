@@ -131,6 +131,11 @@ from .execution import (
     save_iterator,
     tokenize_and_save,
 )
+from .profiling import (
+    DatasetProfile,
+    DatasetProfiler,
+    profile_dataset,
+)
 from .sources import (
     ArrowShardedSource,
     CompositeShardedSource,
@@ -169,6 +174,7 @@ from .transforms import (
     MixStage,
     PackedSequence,
     PackedShardedSource,
+    PackingStats,
     PackStage,
     PoolPacker,
     RenameFields,
@@ -184,6 +190,7 @@ from .transforms import (
     collate_packed_embeds,
     pack_constant_length,
     pack_pre_tokenized,
+    report_packing_stats,
     tokenize_dataset_config,
 )
 
@@ -224,6 +231,8 @@ __all__ = [
     "DatasetConfig",
     "DatasetLoadError",
     "DatasetMixture",
+    "DatasetProfile",
+    "DatasetProfiler",
     "DatasetType",
     "DiskCache",
     "DropFields",
@@ -257,6 +266,7 @@ __all__ = [
     "PackStageConfig",
     "PackedSequence",
     "PackedShardedSource",
+    "PackingStats",
     "ParquetShardedSource",
     "ParquetWriter",
     "Pipeline",
@@ -308,6 +318,8 @@ __all__ = [
     "pack_pre_tokenized",
     "preshard_batch",
     "pretokenize",
+    "profile_dataset",
+    "report_packing_stats",
     "save_dataset",
     "save_iterator",
     "sources",

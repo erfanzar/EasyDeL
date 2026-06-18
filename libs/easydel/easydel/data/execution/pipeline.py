@@ -56,6 +56,8 @@ if tp.TYPE_CHECKING:
     from datasets import Dataset as DS  # pyright: ignore[reportMissingTypeStubs]
     from datasets import IterableDataset as IDS  # pyright: ignore[reportMissingTypeStubs]
 
+    from ..profiling import DatasetProfile
+
 
 logger = logging.getLogger(__name__)
 PipelineDataValue = ShardedDataSource | AsyncDataLoader
@@ -292,6 +294,52 @@ class Pipeline:
         self._data = stage.process(data, self._context)
         self._stages.append("save")
         return self
+
+    def profile(
+        self,
+        max_rows: int = 10_000,
+        seq_length: int | None = None,
+        length_fields: tp.Sequence[str] | None = None,
+    ) -> dict[str, "DatasetProfile"]:
+        """Run the dataset profiler on every current source without mutating the pipeline.
+
+        This is a diagnostic stage: it samples up to ``max_rows`` rows from
+        each rolling source and returns a mapping from dataset name to a
+        :class:`~easydel.data.profiling.DatasetProfile`. It can be called at
+        any point before :meth:`load`, e.g. ``source().tokenize().pack().profile()``.
+
+        Args:
+            max_rows: Maximum rows to sample per source.
+            seq_length: If provided, estimate packing efficiency for this
+                window length using the configured packer simulators.
+            length_fields: Fields for which to collect length histograms.
+
+        Returns:
+            dict[str, DatasetProfile]: Mapping from dataset name to profile.
+
+        Raises:
+            RuntimeError: When called before :meth:`source` or after
+                :meth:`load` (profiling requires a :class:`ShardedDataSource`).
+        """
+        self._ensure_data()
+        data = tp.cast(dict[str, ShardedDataSource], self._data)
+
+        from ..profiling import DatasetProfiler
+
+        profiler = DatasetProfiler(
+            max_rows=max_rows,
+            seq_length=seq_length,
+            length_fields=length_fields,
+        )
+        results: dict[str, tp.Any] = {}
+        for name, value in data.items():
+            if not isinstance(value, ShardedDataSource):
+                raise RuntimeError(
+                    f"Cannot profile dataset '{name}': expected ShardedDataSource, "
+                    f"got {type(value).__name__}. Call profile() before load()."
+                )
+            results[name] = profiler.profile(value)
+        return results
 
     def load(self, config: LoadStageConfig | None = None) -> "Pipeline":
         """Wrap the rolling sources into :class:`AsyncDataLoader` batches via :class:`LoadStage`.

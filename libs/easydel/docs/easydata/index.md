@@ -53,6 +53,7 @@ easydel/data/
 | [Streaming](streaming.md)                     | Streaming from HF and GCS               |
 | [Pipeline API](pipeline.md)                   | Fluent pipeline DSL reference           |
 | [Caching](caching.md)                         | Multi-layer caching system              |
+| [Profiling](profiling.md)                     | Dataset health checks & packing stats   |
 | [Trainer Integration](trainer_integration.md) | Using with EasyDeL trainers             |
 
 ## Two APIs

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import typing as tp
+import warnings
 from collections.abc import Iterator
 from contextlib import contextmanager
 
@@ -37,6 +38,7 @@ from .prompt_utils import (
     resolve_example_tools,
 )
 
+_DEFAULT_SFT_PADDING = object()
 _TOKENIZED_FIELDS = {
     "input_ids",
     "attention_mask",
@@ -1103,9 +1105,10 @@ class SFTPreprocessTransform(Transform):
         add_eos: bool = True,
         truncation: bool = True,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_start",
-        padding: bool | str = "max_length",
+        padding: bool | str | object = _DEFAULT_SFT_PADDING,
         pad_to_multiple_of: int | None = None,
         formatting_func: tp.Callable | None = None,
+        packing_mode: bool = False,
     ):
         """Cache the tokenizer and configuration for SFT preprocessing.
 
@@ -1130,6 +1133,11 @@ class SFTPreprocessTransform(Transform):
                 behavior for tokenizers that do not implement it.
             formatting_func: Optional callable that turns a raw example
                 into a formatted dict or string before tokenization.
+            packing_mode: When ``True``, override ``padding`` to ``False``
+                so rows stay unpadded and can be efficiently packed by a
+                downstream :class:`~easydel.data.transforms.pack.PackStage`.
+                This is the recommended setting when training with
+                sequence packing.
         """
         self._tokenizer = tokenizer
         self._max_length = max_length
@@ -1139,9 +1147,33 @@ class SFTPreprocessTransform(Transform):
         self._add_eos = add_eos
         self._truncation = truncation
         self._truncation_mode = truncation_mode
-        self._padding = padding
         self._pad_to_multiple_of = pad_to_multiple_of
         self._formatting_func = formatting_func
+
+        if packing_mode:
+            self._padding = False
+            self._padding_explicitly_set = False
+            if padding is not _DEFAULT_SFT_PADDING and padding not in (False, "do_not_pad"):
+                warnings.warn(
+                    "SFTPreprocessTransform: packing_mode=True overrides padding to False. "
+                    f"Ignoring requested padding={padding!r}.",
+                    stacklevel=2,
+                )
+        elif padding is _DEFAULT_SFT_PADDING:
+            self._padding = "max_length"
+            self._padding_explicitly_set = False
+        else:
+            self._padding = tp.cast(bool | str, padding)
+            self._padding_explicitly_set = True
+            if self._padding in ("max_length", True) and self._max_length:
+                warnings.warn(
+                    "SFTPreprocessTransform: padding='max_length' pads every row to max_length, "
+                    "which makes downstream sequence packing inefficient. "
+                    "Use packing_mode=True or pass padding=False when packing.",
+                    stacklevel=2,
+                )
+
+        self._packing_mode = packing_mode
         chat_template = getattr(tokenizer, "chat_template", None)
         self._return_assistant_tokens_mask = bool(
             mask_prompt and isinstance(chat_template, str) and "{% generation %}" in chat_template

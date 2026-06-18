@@ -52,10 +52,12 @@ from .pack import (
     GreedyPacker,
     PackedSequence,
     PackedShardedSource,
+    PackingStats,
     PackStage,
     PoolPacker,
     pack_constant_length,
     pack_pre_tokenized,
+    report_packing_stats,
 )
 from .packer import EmbedsWindowPacker
 from .source import LimitedShardedSource, ShuffledShardedSource, TransformedShardedSource
@@ -148,6 +150,7 @@ __all__ = [
     "PackStage",
     "PackedSequence",
     "PackedShardedSource",
+    "PackingStats",
     "PoolPacker",
     "RenameFields",
     "RewardPreprocessTransform",
@@ -166,5 +169,6 @@ __all__ = [
     "compute_tokenizer_hash",
     "pack_constant_length",
     "pack_pre_tokenized",
+    "report_packing_stats",
     "tokenize_dataset_config",
 ]
