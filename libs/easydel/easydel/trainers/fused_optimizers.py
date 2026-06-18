@@ -474,6 +474,7 @@ def fused_novograd(
     mars_gamma: float = 0.0,
     mars_beta: float | None = None,
     mars_prev_grad_dtype: tp.Any = jnp.bfloat16,
+    grad_averaging: bool = True,
 ) -> optax.GradientTransformation:
     if norm_mode not in ("sum", "mean"):
         raise ValueError(f"Unsupported NovoGrad norm_mode: {norm_mode!r}.")
@@ -538,7 +539,7 @@ def fused_novograd(
                 normalized = normalized + jnp.asarray(wd_t, dtype=normalized.dtype) * param.astype(normalized.dtype)
 
             momentum_work = momentum.astype(_compute_dtype(grad))
-            momentum_new = jnp.where(is_first_step, normalized, b1 * momentum_work + normalized)
+            momentum_new = jnp.where(is_first_step, normalized, b1 * momentum_work + (normalized if not grad_averaging else (1.0 - b1) * normalized))
             direction = normalized + b1 * momentum_new if nesterov else momentum_new
             if has_weight_decay and decoupled_weight_decay:
                 direction = direction + jnp.asarray(wd_t, dtype=direction.dtype) * param.astype(direction.dtype)
@@ -1891,6 +1892,7 @@ class NovoGradConfig(SerializationMixin):
     mars_gamma: float = 0.0
     mars_beta: float | None = None
     mars_prev_grad_dtype: jnp.dtype = jnp.bfloat16
+    grad_averaging: bool = True
 
 
 @dataclasses.dataclass
@@ -2111,6 +2113,7 @@ class NovoGradOptimizer(OptimizerBuilder):
             mars_gamma=self.config.mars_gamma,
             mars_beta=self.config.mars_beta,
             mars_prev_grad_dtype=self.config.mars_prev_grad_dtype,
+            grad_averaging=self.config.grad_averaging,
         )
 
     def build_mpmd(self, scheduler, *, optimizer=None, **tx_kwargs):

@@ -167,7 +167,7 @@ def test_novograd_and_yogi_match_optax_when_extras_disabled():
     novograd_scheduler = optax.constant_schedule(0.003)
     novograd_params = {"w": jnp.array([[0.2, -0.7], [1.3, 0.4]], dtype=jnp.float32)}
     novograd_grads = {"w": jnp.sin(novograd_params["w"]) + 0.1}
-    novograd_config = module.NovoGradConfig(b1=0.83, b2=0.91, eps=1e-7, eps_root=1e-12)
+    novograd_config = module.NovoGradConfig(b1=0.83, b2=0.91, eps=1e-7, eps_root=1e-12, grad_averaging=False)
     novograd_ref = optax.novograd(
         learning_rate=novograd_scheduler,
         b1=novograd_config.b1,
@@ -667,3 +667,42 @@ def test_hyperball_variants_converge_on_scale_invariant_direction_loss(optimizer
 
     assert loss_fn(params) < 1e-3
     assert jnp.allclose(jnp.linalg.norm(params["matrix"]), jnp.linalg.norm(initial_weight), rtol=1e-6)
+
+
+@pytest.mark.parametrize("b1", [0.9, 0.5])
+def test_novograd_grad_averaging_changes_updates(b1):
+    """grad_averaging=True (paper/Ginsburg) must differ from False (optax default)."""
+    module = sys.modules["easydel.trainers.fused_optimizers"]
+    scheduler = optax.constant_schedule(0.01)
+    params = {"w": jnp.array([[0.2, -0.7], [1.3, 0.4]], dtype=jnp.float32)}
+    grads = {"w": jnp.sin(params["w"]) + 0.1}
+
+    cfg_off = module.NovoGradConfig(b1=b1, b2=0.25, eps=1e-6, grad_averaging=False)
+    cfg_on = module.NovoGradConfig(b1=b1, b2=0.25, eps=1e-6, grad_averaging=True)
+
+    tx_off = module.NovoGradOptimizer(config=cfg_off).build(scheduler)
+    tx_on = module.NovoGradOptimizer(config=cfg_on).build(scheduler)
+
+    state_off = tx_off.init(params)
+    state_on = tx_on.init(params)
+
+    updates_off, state_off2 = tx_off.update(grads, state_off, params)
+    updates_on, state_on2 = tx_on.update(grads, state_on, params)
+
+    # updates must diverge on the 2nd step (first step is identical for both)
+    updates_off2, _ = tx_off.update(grads, state_off2, params)
+    updates_on2, _ = tx_on.update(grads, state_on2, params)
+
+    assert not jnp.allclose(updates_off2["w"], updates_on2["w"]), (
+        f"grad_averaging=True/False should diverge at step 2 for b1={b1}"
+    )
+
+    # Also verify that grad_averaging=True is exactly (1-b1) times the normalized
+    # grad on the first step (since step 1 momentum == normalized for both)
+    # At step 2, the momentum in the grad_averaging=True case should be
+    # b1 * normalized + (1-b1) * normalized = normalized, so after step 1
+    # both have momentum == normalized. But step 2 onwards diverges because
+    # the new normalized input is scaled differently.
+    # Let's just verify the first step explicitly is identical:
+    assert jnp.allclose(updates_off["w"], updates_on["w"]), "step 1 must be identical"
+
