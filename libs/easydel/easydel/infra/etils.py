@@ -108,6 +108,12 @@ class EasyDeLOptimizers(StrEnum):
             Designed for efficient training with adaptive learning rates.
         MUON: Muon optimizer, an experimental optimizer variant.
             Provides alternative optimization dynamics.
+        NORMUON: Muon with consistent RMS scaling.
+        NOVOGRAD: NovoGrad optimizer with scalar per-leaf second moments.
+        YOGI: Yogi adaptive optimizer.
+        PRISM: NorMuon-style optimizer with single-sided PRISM preconditioning.
+        SCHEDULE_FREE_PLUS: AdamC + Schedule-Free averaging optimizer for anytime training.
+        HYPERBALL: Generic Hyperball wrapper over a configurable base optimizer.
         RMSPROP: RMSprop optimizer with adaptive learning rates.
             Divides gradient by running average of recent gradient magnitudes.
         LION: Lion (EvoLved Sign Momentum) optimizer.
@@ -137,6 +143,20 @@ class EasyDeLOptimizers(StrEnum):
     ADAMW = "adamw"
     MARS = "mars"
     MUON = "muon"
+    NORMUON = "normuon"
+    NOVOGRAD = "novograd"
+    YOGI = "yogi"
+    PRISM = "prism"
+    SCHEDULE_FREE_PLUS = "schedule_free_plus"
+    HYPERBALL = "hyperball"
+    ADAMW_HYPERBALL = "adamw_hyperball"
+    MUON_HYPERBALL = "muon_hyperball"
+    NORMUON_HYPERBALL = "normuon_hyperball"
+    NOVOGRAD_HYPERBALL = "novograd_hyperball"
+    YOGI_HYPERBALL = "yogi_hyperball"
+    MARS_HYPERBALL = "mars_hyperball"
+    PRISM_HYPERBALL = "prism_hyperball"
+    SCHEDULE_FREE_PLUS_HYPERBALL = "schedule_free_plus_hyperball"
     RMSPROP = "rmsprop"
     LION = "lion"
     SKEW = "skew"
@@ -351,7 +371,33 @@ AVAILABLE_SCHEDULERS = tp.Literal["linear", "cosine", "none"]
 
 # Type alias for valid optimizer options.
 # Maps to the values in EasyDeLOptimizers enum.
-AVAILABLE_OPTIMIZERS = tp.Literal["adafactor", "adamw", "mars", "muon", "rmsprop", "lion", "skew", "quad"]
+AVAILABLE_OPTIMIZERS = tp.Literal[
+    "adafactor",
+    "adamw",
+    "mars",
+    "muon",
+    "normuon",
+    "novograd",
+    "yogi",
+    "prism",
+    "schedule_free_plus",
+    "hyperball",
+    "adamw_hyperball",
+    "muon_hyperball",
+    "normuon_hyperball",
+    "novograd_hyperball",
+    "yogi_hyperball",
+    "mars_hyperball",
+    "prism_hyperball",
+    "schedule_free_plus_hyperball",
+    "rmsprop",
+    "lion",
+    "skew",
+    "quad",
+    "fused_adamw",
+    "fused_lion",
+    "fused_rmsprop",
+]
 
 # Type alias for mixture-of-experts implementation methods.
 # fused_moe: Uses fused kernels for efficiency

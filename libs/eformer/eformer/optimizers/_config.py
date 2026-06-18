@@ -259,6 +259,11 @@ class MuonConfig(SerializationMixin):
             Defaults to 0.999.
         adam_eps_root (float): Small constant for root calculations in Adam. Defaults to 0.0.
         adam_weight_decay (float): Weight decay for Adam optimizer (for non-2D params). Defaults to 0.0.
+        adam_learning_rate (float | None): Optional separate Adam fallback learning rate. Defaults to None.
+        preconditioning (Literal): Muon Newton-Schulz preconditioning mode. Defaults to "frobenius".
+        muon_weight_dimension_numbers (Any | None): Optional dimension-number rules for Muon routing.
+            Defaults to None.
+        consistent_rms (float | None): Optional consistent RMS scaling for Muon updates. Defaults to None.
     """
 
     ns_coeffs: tuple[float, float, float] = (3.4445, -4.775, 2.0315)
@@ -274,6 +279,10 @@ class MuonConfig(SerializationMixin):
     adam_b2: float = 0.999
     adam_eps_root: float = 0.0
     adam_weight_decay: float = 0.0
+    adam_learning_rate: float | None = None
+    preconditioning: tp.Literal["frobenius", "spectral", "aol", "schatten"] = "frobenius"
+    muon_weight_dimension_numbers: tp.Any | None = None
+    consistent_rms: float | None = None
 
 
 @dataclass
@@ -349,7 +358,6 @@ class MarsConfig(SerializationMixin):
     gamma: float = 0.025
     epsilon: float = 1e-8
     max_grad_norm: float | None = 1.0
-
 
 @dataclass
 class KronConfig(SerializationMixin):

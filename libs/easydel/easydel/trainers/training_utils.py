@@ -2514,8 +2514,9 @@ def update_state_respectfully(
     Returns:
             EasyDeLState: The updated state of the model.
     """
+    optimizer_extra_args = {"loss": metrics.loss}
     if FAST_COMPILE:
-        return state.apply_gradients(grads=gradients)
+        return state.apply_gradients(grads=gradients, optimizer_extra_args=optimizer_extra_args)
     else:
 
         def update_fn(args):
@@ -2528,7 +2529,7 @@ def update_state_respectfully(
                 The updated state.
             """
             state, gradients = args
-            return state.apply_gradients(grads=gradients)
+            return state.apply_gradients(grads=gradients, optimizer_extra_args=optimizer_extra_args)
 
         def skip_fn(args):
             """Return ``state`` unchanged (used when the gradient step is skipped).

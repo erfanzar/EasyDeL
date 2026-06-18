@@ -620,9 +620,14 @@ class MuonOptimizer(OptimizerBuilder):
             mu_dtype=self.config.mu_dtype,
             nesterov=self.config.nesterov,
             adaptive=self.config.adaptive,
+            preconditioning=self.config.preconditioning,
             adam_b1=self.config.adam_b1,
             adam_b2=self.config.adam_b2,
             adam_eps_root=self.config.adam_eps_root,
+            adam_weight_decay=self.config.adam_weight_decay,
+            adam_learning_rate=self.config.adam_learning_rate,
+            muon_weight_dimension_numbers=self.config.muon_weight_dimension_numbers,
+            consistent_rms=self.config.consistent_rms,
         )
 
     def build_mpmd(

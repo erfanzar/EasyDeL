@@ -388,7 +388,7 @@ class OptimizerFactory:
         chain.append(base_optimizer)
 
         # Add weight decay if specified
-        if weight_decay != 0.0:
+        if weight_decay != 0.0 and not getattr(builder, "skip_external_weight_decay", False):
             chain.append(
                 optax_add_scheduled_weight_decay(
                     lambda step: -scheduler(step) * weight_decay,

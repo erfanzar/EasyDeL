@@ -136,7 +136,7 @@ def scale_by_mars(
         if max_grad_norm:
             g_norm = optax.global_norm(c)
             scale = jnp.minimum(1.0, max_grad_norm / (g_norm + 1e-6))
-            c = jax.tree_map(lambda g: None if g is None else g * scale, c, is_leaf=lambda x: x is None)
+            c = jax.tree.map(lambda g: None if g is None else g * scale, c, is_leaf=lambda x: x is None)
         mu = otu.tree_update_moment(c, state.mu, b1, 1)
         nu = otu.tree_update_moment_per_elem_norm(c, state.nu, b2, 2)
         count_inc = optax.safe_increment(state.count)

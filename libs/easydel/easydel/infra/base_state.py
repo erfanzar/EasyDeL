@@ -77,6 +77,7 @@ import collections.abc
 import contextlib
 import dataclasses
 import datetime as dt
+import inspect
 import json
 import os
 import typing as tp
@@ -215,6 +216,18 @@ def _field(pytree_node=True, default=dataclasses.MISSING, default_factory=datacl
     if default_factory is not dataclasses.MISSING:
         return dataclasses.field(default_factory=default_factory, metadata=metadata, **kwargs)
     return dataclasses.field(default=default, metadata=metadata, **kwargs)
+
+
+def _tx_update_accepts_extra_args(update_fn: tp.Callable[..., tp.Any], extra_args: tp.Mapping[str, tp.Any]) -> bool:
+    if not extra_args:
+        return False
+    try:
+        parameters = inspect.signature(update_fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+        return True
+    return all(key in parameters for key in extra_args)
 
 
 if tp.TYPE_CHECKING:
@@ -584,7 +597,12 @@ class EasyDeLState(_PyTreeNode):
         default_factory=lambda: f"state-{uuid.uuid4().hex}",
     )
 
-    def apply_gradients(self: Self, *, grads) -> Self:
+    def apply_gradients(
+        self: Self,
+        *,
+        grads,
+        optimizer_extra_args: tp.Mapping[str, tp.Any] | None = None,
+    ) -> Self:
         """Apply gradients to update parameters and optimizer state.
 
         Performs a single optimization step using the provided gradients. This method
@@ -599,6 +617,10 @@ class EasyDeLState(_PyTreeNode):
             grads: Gradient pytree matching the structure of `graphstate`. Must have
                 the same tree structure and array shapes as the model parameters.
                 Typically computed using `jax.grad` or similar.
+            optimizer_extra_args: Optional extra keyword arguments for Optax
+                transformations that support them, such as ScheduleFree+ `loss`
+                values. Ignored for transforms whose update function has no
+                matching extra-args support.
 
         Returns:
             Self: A new EasyDeLState instance with:
@@ -643,7 +665,16 @@ class EasyDeLState(_PyTreeNode):
         if self.tx is None:
             raise RuntimeError("Optimizer (tx) is not set. Call `init_tx()` first.")
 
-        updates, new_opt_state = self.tx.update(updates=grads, state=self.opt_state, params=self.graphstate)
+        optimizer_extra_args = {} if optimizer_extra_args is None else dict(optimizer_extra_args)
+        if _tx_update_accepts_extra_args(self.tx.update, optimizer_extra_args):
+            updates, new_opt_state = self.tx.update(
+                updates=grads,
+                state=self.opt_state,
+                params=self.graphstate,
+                **optimizer_extra_args,
+            )
+        else:
+            updates, new_opt_state = self.tx.update(updates=grads, state=self.opt_state, params=self.graphstate)
 
         if hasattr(self.tx, "apply_updates_hook"):
             graphstate = self.tx.apply_updates_hook(self.graphstate, updates)

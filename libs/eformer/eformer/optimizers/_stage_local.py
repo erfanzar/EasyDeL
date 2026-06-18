@@ -334,8 +334,9 @@ def make_stage_local_gradient_transformation(
         updates: optax.Updates,
         state: optax.OptState,
         params: optax.Params | None = None,
+        **extra_args: tp.Any,
     ) -> tuple[optax.Updates, optax.OptState]:
-        return tx.update(updates, state, params)
+        return tx.update(updates, state, params, **extra_args)
 
     update_fn._eformer_stage_local_metadata = metadata  # type: ignore[attr-defined]
     update_fn._eformer_stage_local_apply = apply_fn  # type: ignore[attr-defined]
@@ -2483,7 +2484,13 @@ def _make_batched_stage_local_muon_2d(
                 ) * _bias_correction(grad, beta, muon_count_inc)
             else:
                 mu_hat = _bias_correction(mu_next, beta, muon_count_inc)
-            update = orthogonalize_via_newton_schulz(mu_hat, ns_coeffs, ns_steps, eps)
+            update = orthogonalize_via_newton_schulz(
+                mu_hat,
+                ns_coeffs,
+                ns_steps=ns_steps,
+                preconditioning="frobenius",
+                eps=eps,
+            )
             if adaptive:
                 update = jnp.einsum("ij,ij,ab->ab", mu_hat, update, update)
             update = jnp.sqrt(jnp.maximum(1.0, update.shape[-1] / update.shape[-2])).astype(update.dtype) * update
@@ -2600,8 +2607,14 @@ def _apply_muon_stage_local(
         inner_states = dict(partition_state.inner_states)
         muon_masked_state = inner_states["muon"]
         adam_masked_state = inner_states["adam"]
-        muon_state, muon_empty_state, muon_schedule_state = muon_masked_state.inner_state
-        adam_state, adam_empty_state, adam_schedule_state = adam_masked_state.inner_state
+        muon_inner_state = muon_masked_state.inner_state
+        adam_inner_state = adam_masked_state.inner_state
+        muon_state = muon_inner_state[0]
+        muon_middle_states = tuple(muon_inner_state[1:-1])
+        muon_schedule_state = muon_inner_state[-1]
+        adam_state = adam_inner_state[0]
+        adam_middle_states = tuple(adam_inner_state[1:-1])
+        adam_schedule_state = adam_inner_state[-1]
 
         wd_state = states[weight_decay_index] if weight_decay_index is not None else None
         external_wd_count = wd_state.count if wd_state is not None else muon_schedule_state.count
@@ -2737,14 +2750,14 @@ def _apply_muon_stage_local(
         inner_states["muon"] = muon_masked_state._replace(
             inner_state=(
                 muon_state._replace(count=muon_count_inc, mu=new_muon_mu),
-                muon_empty_state,
+                *muon_middle_states,
                 muon_schedule_state._replace(count=_safe_increment(muon_schedule_state.count)),
             )
         )
         inner_states["adam"] = adam_masked_state._replace(
             inner_state=(
                 adam_state._replace(count=adam_count_inc, mu=new_adam_mu, nu=new_adam_nu),
-                adam_empty_state,
+                *adam_middle_states,
                 adam_schedule_state._replace(count=_safe_increment(adam_schedule_state.count)),
             )
         )
@@ -2797,8 +2810,14 @@ def _apply_muon_stage_local_per_leaf(
         inner_states = dict(partition_state.inner_states)
         muon_masked_state = inner_states["muon"]
         adam_masked_state = inner_states["adam"]
-        muon_state, muon_empty_state, muon_schedule_state = muon_masked_state.inner_state
-        adam_state, adam_empty_state, adam_schedule_state = adam_masked_state.inner_state
+        muon_inner_state = muon_masked_state.inner_state
+        adam_inner_state = adam_masked_state.inner_state
+        muon_state = muon_inner_state[0]
+        muon_middle_states = tuple(muon_inner_state[1:-1])
+        muon_schedule_state = muon_inner_state[-1]
+        adam_state = adam_inner_state[0]
+        adam_middle_states = tuple(adam_inner_state[1:-1])
+        adam_schedule_state = adam_inner_state[-1]
     except (TypeError, ValueError, KeyError, AttributeError) as exc:
         raise NotImplementedError("eFormer stage-local Muon requires the standard optax.contrib.muon state.") from exc
 
@@ -2835,8 +2854,9 @@ def _apply_muon_stage_local_per_leaf(
             update = orthogonalize_via_newton_schulz(
                 mu_hat,
                 _place_array_like(muon_state.ns_coeffs, grad),
-                int(config.ns_steps),
-                float(config.eps),
+                ns_steps=int(config.ns_steps),
+                preconditioning="frobenius",
+                eps=float(config.eps),
             )
             if bool(config.adaptive):
                 update = jnp.einsum("ij,ij,ab->ab", mu_hat, update, update)
@@ -2918,14 +2938,14 @@ def _apply_muon_stage_local_per_leaf(
     inner_states["muon"] = muon_masked_state._replace(
         inner_state=(
             muon_state._replace(count=muon_count_inc, mu=new_muon_mu),
-            muon_empty_state,
+            *muon_middle_states,
             muon_schedule_state._replace(count=_safe_increment(muon_schedule_state.count)),
         )
     )
     inner_states["adam"] = adam_masked_state._replace(
         inner_state=(
             adam_state._replace(count=adam_count_inc, mu=new_adam_mu, nu=new_adam_nu),
-            adam_empty_state,
+            *adam_middle_states,
             adam_schedule_state._replace(count=_safe_increment(adam_schedule_state.count)),
         )
     )

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+import typing as tp
 
 import jax
 import jax.numpy as jnp
@@ -172,6 +173,10 @@ class TestOptimizerConfigs:
         assert config.ns_steps == 5
         assert config.beta == 0.95
         assert config.nesterov is True
+        assert config.adam_learning_rate is None
+        assert config.preconditioning == "frobenius"
+        assert config.muon_weight_dimension_numbers is None
+        assert config.consistent_rms is None
 
     def test_mars_config_defaults(self):
         config = MarsConfig()
@@ -334,6 +339,38 @@ class TestOptimizerFactory:
         optimizer, _scheduler = OptimizerFactory.create("adamw", scheduler_config, optimizer_config, clip_grad=1.0)
 
         assert isinstance(optimizer, optax.GradientTransformation)
+
+    def test_create_optimizer_can_skip_external_weight_decay(self):
+        import dataclasses
+
+        @dataclasses.dataclass
+        class SkipExternalWeightDecayConfig:
+            pass
+
+        @register_optimizer("test_skip_external_wd")
+        @dataclasses.dataclass
+        class SkipExternalWeightDecayOptimizer(OptimizerBuilder):
+            config: SkipExternalWeightDecayConfig
+            skip_external_weight_decay: tp.ClassVar[bool] = True
+
+            def build(self, scheduler: optax.Schedule) -> optax.GradientTransformation:
+                return optax.sgd(learning_rate=scheduler)
+
+        try:
+            params = {"w": jnp.array([1.0], dtype=jnp.float32)}
+            zero_grads = {"w": jnp.array([0.0], dtype=jnp.float32)}
+            tx, _scheduler = OptimizerFactory.create(
+                "test_skip_external_wd",
+                SchedulerConfig(learning_rate=1.0),
+                SkipExternalWeightDecayConfig(),
+                weight_decay=0.5,
+            )
+            state = tx.init(params)
+            updates, _state = tx.update(zero_grads, state, params)
+
+            assert jnp.allclose(updates["w"], jnp.array([0.0], dtype=jnp.float32))
+        finally:
+            del _OPTIMIZER_BUILDER_REGISTRY["test_skip_external_wd"]
 
     def test_create_optimizer_with_gradient_accumulation(self):
         scheduler_config = SchedulerConfig(learning_rate=0.001)
@@ -627,6 +664,30 @@ class TestBuilderPattern:
         assert metadata.weight_decay == 0.01
         assert metadata.extra_kwargs == {"custom_mpmd_option": "enabled"}
 
+    def test_stage_local_update_forwards_extra_args_to_wrapped_optimizer(self):
+        class ExtraArgsState(tuple):
+            pass
+
+        def init_fn(params):
+            del params
+            return ExtraArgsState()
+
+        def update_fn(updates, state, params=None, *, scale=1.0):
+            del params
+            return jax.tree_util.tree_map(lambda update: scale * update, updates), state
+
+        base_tx = optax.GradientTransformationExtraArgs(init_fn, update_fn)
+        tx = make_stage_local_gradient_transformation(
+            base_tx,
+            apply_fn=lambda *, params, grads, opt_state, **_: (params, opt_state),
+        )
+        grads = {"w": jnp.array([0.25], dtype=jnp.float32)}
+        state = tx.init({"w": jnp.array([1.0], dtype=jnp.float32)})
+
+        updates, _state = tx.update(grads, state, {"w": jnp.array([1.0], dtype=jnp.float32)}, scale=4.0)
+
+        assert jnp.allclose(updates["w"], jnp.array([1.0], dtype=jnp.float32))
+
     def test_registered_optimizer_build_mpmd_hook_is_used(self):
         """Custom registered optimizers can provide their own PP-safe apply path."""
         import dataclasses
@@ -758,6 +819,32 @@ class TestBuilderPattern:
 
         tx = builder.build(scheduler)
         assert isinstance(tx, optax.GradientTransformation)
+
+    def test_muon_builder_forwards_extended_config(self, monkeypatch):
+        captured_kwargs = {}
+
+        def fake_muon(**kwargs):
+            captured_kwargs.update(kwargs)
+            return optax.identity()
+
+        monkeypatch.setattr(optax.contrib, "muon", fake_muon)
+        config = MuonConfig(
+            adam_learning_rate=0.25,
+            adam_weight_decay=0.1,
+            preconditioning="spectral",
+            muon_weight_dimension_numbers=lambda path, param: param.ndim == 2,
+            consistent_rms=0.2,
+        )
+        builder = MuonOptimizer(config=config)
+
+        tx = builder.build(optax.constant_schedule(0.001))
+
+        assert isinstance(tx, optax.GradientTransformation)
+        assert captured_kwargs["adam_learning_rate"] == 0.25
+        assert captured_kwargs["adam_weight_decay"] == 0.1
+        assert captured_kwargs["preconditioning"] == "spectral"
+        assert captured_kwargs["muon_weight_dimension_numbers"] is config.muon_weight_dimension_numbers
+        assert captured_kwargs["consistent_rms"] == 0.2
 
     def test_mars_builder_build(self):
         """Test MarsOptimizer builder builds correct transformation."""
