@@ -456,6 +456,20 @@ class PackStageConfig:
         shuffle_buffer_factor (int): Multiplier on ``seq_length`` (or the
             stream's natural batch) defining the shuffle buffer size; bigger
             buffers improve mixing at the cost of memory.
+        return_stats (bool): When ``True``, the packer tracks per-window
+            statistics (efficiency, segment counts, EOS separators). The
+            overhead is negligible; set ``False`` only when every microsecond
+            matters.
+        record_context_stats (bool): When ``True`` and ``return_stats`` is
+            ``True``, the pack stage registers a callback on each packed
+            source so that packing statistics are recorded into
+            :class:`PipelineContext` metrics the first time the source is
+            fully iterated. This keeps ``process()`` lazy; the recording
+            happens during downstream consumption, not during stage setup.
+        warn_on_padded_input (bool): When ``True``, emit a warning if
+            the first few upstream rows all have length exactly
+            ``seq_length``, which strongly suggests they were already
+            padded to max length before packing.
     """
 
     enabled: bool = False
@@ -467,6 +481,9 @@ class PackStageConfig:
     include_segment_ids: bool = True
     shuffle_packed: bool = True
     shuffle_buffer_factor: int = 10
+    return_stats: bool = True
+    record_context_stats: bool = True
+    warn_on_padded_input: bool = True
 
 
 @dataclass

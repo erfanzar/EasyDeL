@@ -104,6 +104,78 @@ class PackedSequence:
         return result
 
 
+@dataclass
+class PackingStats:
+    """Aggregated packing statistics for one packer run.
+
+    Tracks how efficiently a packer fills fixed-length windows so
+    users can compare strategies and diagnose padding waste. All
+    counters are accumulated as rows are added and windows are
+    emitted; the :attr:`efficiency` property computes the fraction
+    of emitted token positions that are real (non-padding) data.
+
+    Attributes:
+        seq_length (int): Target window length; stored for the
+            efficiency denominator.
+        total_input_tokens (int): Sum of token lengths of every
+            upstream example handed to the packer.
+        total_packed_tokens (int): Number of non-padding token
+            positions emitted across all windows.
+        total_emitted_windows (int): Number of packed windows
+            produced, including the final padded partial window.
+        total_eos_separators (int): Number of EOS separators
+            inserted between packed examples.
+        perfect_fills (int): Number of emitted windows that contain
+            no padding at all.
+    """
+
+    seq_length: int
+    total_input_tokens: int = 0
+    total_packed_tokens: int = 0
+    total_emitted_windows: int = 0
+    total_eos_separators: int = 0
+    perfect_fills: int = 0
+    total_segments: int = 0
+
+    @property
+    def efficiency(self) -> float:
+        """Fraction of emitted token positions that are non-padding.
+
+        Returns:
+            float: Ratio in ``[0.0, 1.0]``. Returns ``0.0`` when no
+            windows have been emitted.
+        """
+        denom = self.total_emitted_windows * self.seq_length
+        return self.total_packed_tokens / denom if denom > 0 else 0.0
+
+    @property
+    def avg_segments_per_window(self) -> float:
+        """Average number of original examples packed into each window.
+
+        This is a rough indicator of packing density independent of
+        sequence length.
+
+        Returns:
+            float: Segments per window, or ``0.0`` when no windows
+            have been emitted.
+        """
+        return self.total_segments / self.total_emitted_windows if self.total_emitted_windows > 0 else 0.0
+
+    def to_dict(self) -> dict[str, tp.Any]:
+        """Render stats as a JSON-friendly dict."""
+        return {
+            "seq_length": self.seq_length,
+            "total_input_tokens": self.total_input_tokens,
+            "total_packed_tokens": self.total_packed_tokens,
+            "total_emitted_windows": self.total_emitted_windows,
+            "total_eos_separators": self.total_eos_separators,
+            "perfect_fills": self.perfect_fills,
+            "total_segments": self.total_segments,
+            "efficiency": self.efficiency,
+            "avg_segments_per_window": self.avg_segments_per_window,
+        }
+
+
 class GreedyPacker:
     """Streaming first-come-first-served packer that fills one window at a time.
 
@@ -163,6 +235,12 @@ class GreedyPacker:
         self._extra_buffers: dict[str, list[int]] = {key: [] for key in self.extra_field_pad_values}
         self._current_segment = 0
         self._source_ids: list[str] = []
+        self._stats = PackingStats(seq_length=seq_length)
+
+    @property
+    def stats(self) -> PackingStats:
+        """Return the accumulated packing statistics for this packer."""
+        return self._stats
 
     def add(
         self,
@@ -193,6 +271,7 @@ class GreedyPacker:
             call).
         """
         result = None
+        self._stats.total_input_tokens += len(tokens)
 
         aligned_extra_fields = self._normalize_extra_fields(tokens, extra_fields)
 
@@ -211,6 +290,7 @@ class GreedyPacker:
         # Add EOS and update segment
         if len(self._buffer) > 0:
             self._buffer.append(self.eos_token_id)
+            self._stats.total_eos_separators += 1
             if self.include_segment_ids:
                 self._segment_ids.append(self._current_segment)
             for field_name, separator_value in self.extra_field_separator_values.items():
@@ -243,6 +323,11 @@ class GreedyPacker:
             field_name: np.array(values[: self.seq_length], dtype=np.int32)
             for field_name, values in self._extra_buffers.items()
         } or None
+
+        self._stats.total_packed_tokens += self.seq_length
+        self._stats.total_emitted_windows += 1
+        self._stats.perfect_fills += 1
+        self._stats.total_segments += self._current_segment
 
         result = PackedSequence(
             input_ids=input_ids,
@@ -298,6 +383,12 @@ class GreedyPacker:
             )
             for field_name, values in self._extra_buffers.items()
         } or None
+
+        self._stats.total_packed_tokens += len(self._buffer)
+        self._stats.total_emitted_windows += 1
+        if len(self._buffer) == self.seq_length:
+            self._stats.perfect_fills += 1
+        self._stats.total_segments += self._current_segment + 1
 
         result = PackedSequence(
             input_ids=input_ids,
@@ -449,6 +540,20 @@ class PoolPacker:
                 results.append(result)
         return results
 
+    @property
+    def stats(self) -> PackingStats:
+        """Aggregate packing stats across all inner packers."""
+        aggregated = PackingStats(seq_length=self.seq_length)
+        for packer in self._packers:
+            s = packer.stats
+            aggregated.total_input_tokens += s.total_input_tokens
+            aggregated.total_packed_tokens += s.total_packed_tokens
+            aggregated.total_emitted_windows += s.total_emitted_windows
+            aggregated.total_eos_separators += s.total_eos_separators
+            aggregated.perfect_fills += s.perfect_fills
+            aggregated.total_segments += s.total_segments
+        return aggregated
+
 
 class FirstFitPacker:
     """Buffered first-fit-decreasing bin packer for higher packing density.
@@ -504,6 +609,12 @@ class FirstFitPacker:
             self.extra_field_separator_values.update(extra_field_separator_values)
 
         self._pending: list[tuple[list[int], str | None, dict[str, list[int]]]] = []
+        self._stats = PackingStats(seq_length=seq_length)
+
+    @property
+    def stats(self) -> PackingStats:
+        """Return the accumulated packing statistics for this packer."""
+        return self._stats
 
     def add(
         self,
@@ -527,6 +638,7 @@ class FirstFitPacker:
             tipped the buffer over ``buffer_size`` and triggered
             :meth:`_pack_buffer`; an empty list otherwise.
         """
+        self._stats.total_input_tokens += len(tokens)
         self._pending.append((tokens, source_id, self._normalize_extra_fields(tokens, extra_fields)))
 
         if len(self._pending) >= self.buffer_size:
@@ -565,6 +677,7 @@ class FirstFitPacker:
                     bin_tokens.extend(tokens)
                     if append_eos:
                         bin_tokens.append(self.eos_token_id)
+                        self._stats.total_eos_separators += 1
                     bin_segments.extend([segment_id] * token_len)
                     for field_name, values in extra_fields.items():
                         bin_extra_fields[field_name].extend(values)
@@ -580,6 +693,7 @@ class FirstFitPacker:
                 new_tokens = [*tokens]
                 if append_eos:
                     new_tokens.append(self.eos_token_id)
+                    self._stats.total_eos_separators += 1
                 new_segments = [0] * len(new_tokens)
                 new_sources = [source_id] if source_id else []
                 new_extra_fields = {}
@@ -613,6 +727,13 @@ class FirstFitPacker:
                 for field_name, values in bin_extra_fields.items()
             } or None
 
+            num_segments = max(bin_segments) + 1 if bin_segments else 0
+            self._stats.total_packed_tokens += len(bin_tokens)
+            self._stats.total_emitted_windows += 1
+            self._stats.total_segments += num_segments
+            if len(bin_tokens) == self.seq_length:
+                self._stats.perfect_fills += 1
+
             results.append(
                 PackedSequence(
                     input_ids=input_ids,
@@ -620,7 +741,7 @@ class FirstFitPacker:
                     segment_ids=segment_ids,
                     extra_fields=extra_fields,
                     source_ids=bin_sources if bin_sources else None,
-                    num_segments=max(bin_segments) + 1 if bin_segments else 0,
+                    num_segments=num_segments,
                 )
             )
 
@@ -682,6 +803,9 @@ class PackedShardedSource(ShardedDataSource[dict]):
         shuffle: bool = True,
         shuffle_buffer_factor: int = 10,
         seed: int | None = None,
+        return_stats: bool = True,
+        warn_on_padded_input: bool = True,
+        on_iteration_end: tp.Callable[[PackingStats], None] | None = None,
     ):
         """Capture packer selection and shuffle settings without iterating.
 
@@ -712,6 +836,16 @@ class PackedShardedSource(ShardedDataSource[dict]):
                 size (currently 100) controlling the shuffle
                 reservoir capacity.
             seed: Optional RNG seed for the shuffle reservoir.
+            return_stats: When ``True``, statistics from the most
+                recent pack run are exposed via
+                :attr:`packing_stats`.
+            warn_on_padded_input: When ``True``, emit a warning if the
+                first few upstream rows all have length exactly
+                ``seq_length``, suggesting they were pre-padded.
+            on_iteration_end: Optional callback invoked once after a
+                complete iteration through this source finishes. Receives
+                the final :class:`PackingStats` so callers (e.g. pipeline
+                stages) can record metrics without breaking laziness.
         """
         self._source = source
         self._seq_length = seq_length
@@ -730,6 +864,21 @@ class PackedShardedSource(ShardedDataSource[dict]):
         self._shuffle = shuffle
         self._shuffle_buffer_factor = shuffle_buffer_factor
         self._seed = seed
+        self._return_stats = return_stats
+        self._warn_on_padded_input = warn_on_padded_input
+        self._on_iteration_end = on_iteration_end
+        self._last_packing_stats: PackingStats | None = None
+
+    @property
+    def packing_stats(self) -> PackingStats | None:
+        """Statistics from the most recent complete pack run.
+
+        Returns:
+            PackingStats | None: Aggregated stats after the source has
+            been iterated, or ``None`` if the source has not been
+            consumed yet (or if ``return_stats=False``).
+        """
+        return self._last_packing_stats if self._return_stats else None
 
     @property
     def shard_names(self) -> "Sequence[str]":
@@ -846,46 +995,77 @@ class PackedShardedSource(ShardedDataSource[dict]):
                     return out
             return result
 
-        # Iterate through source
-        for source_shard in self._source.shard_names:
-            for example in self._source.open_shard(source_shard):
-                tokens = example.get(self._input_field, [])
-                if len(tokens) == 0:
-                    continue
+        def _run() -> "Iterator[dict]":
+            """Inner generator that drives the packer over the source."""
+            padded_check_budget = 5
+            padded_check_seen = 0
+            padded_check_full = 0
 
-                source_id = example.get("__source__")
-                extra_fields = self._extract_extra_fields(example, len(tokens))
+            # Iterate through source
+            for source_shard in self._source.shard_names:
+                for example in self._source.open_shard(source_shard):
+                    tokens = example.get(self._input_field, [])
+                    if len(tokens) == 0:
+                        continue
 
-                if isinstance(packer, (PoolPacker, FirstFitPacker)):
-                    results = packer.add(list(tokens), source_id, extra_fields)
-                    for packed in results:
-                        out = emit(packed)
-                        if out is not None:
-                            yield out
-                else:
-                    result = packer.add(list(tokens), source_id, extra_fields)
-                    if result is not None:
-                        out = emit(result)
-                        if out is not None:
-                            yield out
+                    if self._warn_on_padded_input and padded_check_seen < padded_check_budget:
+                        padded_check_seen += 1
+                        if len(tokens) == self._seq_length:
+                            padded_check_full += 1
+                        else:
+                            # Saw a non-max-length row; no need to keep checking.
+                            padded_check_seen = padded_check_budget
 
-        # Flush packer
-        if isinstance(packer, (PoolPacker, FirstFitPacker)):
-            for packed in packer.flush_all():
-                out = emit(packed)
-                if out is not None:
-                    yield out
-        else:
-            final = packer.flush_final()
-            if final is not None:
-                out = emit(final)
-                if out is not None:
-                    yield out
+                    source_id = example.get("__source__")
+                    extra_fields = self._extract_extra_fields(example, len(tokens))
 
-        # Emit remaining shuffle buffer
-        if self._shuffle:
-            random.shuffle(shuffle_buffer)
-            yield from shuffle_buffer
+                    if isinstance(packer, (PoolPacker, FirstFitPacker)):
+                        results = packer.add(list(tokens), source_id, extra_fields)
+                        for packed in results:
+                            out = emit(packed)
+                            if out is not None:
+                                yield out
+                    else:
+                        result = packer.add(list(tokens), source_id, extra_fields)
+                        if result is not None:
+                            out = emit(result)
+                            if out is not None:
+                                yield out
+
+            if self._warn_on_padded_input and padded_check_seen > 0 and padded_check_full == padded_check_seen:
+                logger.warning(
+                    "PackedShardedSource: first %d non-empty upstream rows all have length == seq_length (%d). "
+                    "Inputs appear pre-padded, which makes packing inefficient. "
+                    "Use SFTPreprocessTransform(packing_mode=True) or pass padding=False.",
+                    padded_check_seen,
+                    self._seq_length,
+                )
+
+            # Flush packer
+            if isinstance(packer, (PoolPacker, FirstFitPacker)):
+                for packed in packer.flush_all():
+                    out = emit(packed)
+                    if out is not None:
+                        yield out
+            else:
+                final = packer.flush_final()
+                if final is not None:
+                    out = emit(final)
+                    if out is not None:
+                        yield out
+
+            # Emit remaining shuffle buffer
+            if self._shuffle:
+                random.shuffle(shuffle_buffer)
+                yield from shuffle_buffer
+
+        try:
+            yield from _run()
+        finally:
+            if self._return_stats:
+                self._last_packing_stats = packer.stats
+                if self._on_iteration_end is not None:
+                    self._on_iteration_end(packer.stats)
 
     def __len__(self) -> int:
         """Coarse estimate of the packed-row count, derived from upstream length.
@@ -995,6 +1175,14 @@ class PackStage(BaseStage):
 
         result = {}
         for ds_name, source in data.items():
+            on_iteration_end = None
+            if self._stage_config.return_stats and self._stage_config.record_context_stats:
+
+                def _record(stats: PackingStats, ds: str = ds_name) -> None:
+                    context.record_metric(self.name, f"{ds}_packing_stats", stats.to_dict())
+
+                on_iteration_end = _record
+
             packed = PackedShardedSource(
                 source=source,
                 seq_length=self._stage_config.seq_length,
@@ -1006,11 +1194,68 @@ class PackStage(BaseStage):
                 shuffle=self._stage_config.shuffle_packed,
                 shuffle_buffer_factor=self._stage_config.shuffle_buffer_factor,
                 seed=context.seed,
+                return_stats=self._stage_config.return_stats,
+                warn_on_padded_input=self._stage_config.warn_on_padded_input,
+                on_iteration_end=on_iteration_end,
             )
             result[ds_name] = packed
             logger.info(f"Packed dataset '{ds_name}' with strategy={self._stage_config.strategy}")
 
         return result
+
+
+def report_packing_stats(
+    source: ShardedDataSource[dict],
+    seq_length: int,
+    eos_token_id: int = 2,
+    pad_token_id: int = 0,
+    strategy: str = "greedy",
+    num_packers: int = 4,
+    input_field: str = "input_ids",
+    max_rows: int = 10000,
+) -> PackingStats:
+    """Pack a sample of ``source`` and return efficiency statistics.
+
+    This helper is useful for diagnosing padding waste before a long
+    training run. It creates a fresh temporary packer, consumes at most
+    ``max_rows`` upstream rows, flushes the residual buffer, and returns
+    the aggregated :class:`PackingStats`. The original ``source`` is not
+    mutated.
+
+    Args:
+        source: Upstream tokenized :class:`ShardedDataSource` whose rows
+            carry token ids in ``input_field``.
+        seq_length: Target packed window length.
+        eos_token_id: EOS separator token id.
+        pad_token_id: Padding token id.
+        strategy: Packing strategy — ``"greedy"``, ``"pool"``, or
+            ``"first_fit"``.
+        num_packers: Pool size when ``strategy == "pool"``.
+        input_field: Row key containing token ids.
+        max_rows: Maximum upstream rows to sample.
+
+    Returns:
+        PackingStats: Aggregated statistics after packing the sample.
+    """
+    from .source import LimitedShardedSource
+
+    limited = LimitedShardedSource(source, max_rows=max_rows)
+    packed = PackedShardedSource(
+        source=limited,
+        seq_length=seq_length,
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+        strategy=strategy,
+        num_packers=num_packers,
+        input_field=input_field,
+        shuffle=False,
+        return_stats=True,
+    )
+
+    for _ in packed.open_shard(packed.shard_names[0]):
+        pass
+
+    return packed.packing_stats or PackingStats(seq_length=seq_length)
 
 
 def pack_pre_tokenized(stream, seq_length: int, eos_token_id: int, batch_size: int, shuffle: bool, buffer_factor: int):
