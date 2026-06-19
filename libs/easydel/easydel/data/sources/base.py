@@ -146,7 +146,7 @@ def _detect_format(files: list[str]) -> str:
         or ``"arrow"`` — the same vocabulary recognised by
         :func:`create_source`.
     """
-    exts_priority = [".arrow", ".parquet", ".jsonl", ".json", ".csv", ".pq", ".txt"]
+    exts_priority = [".arrow", ".parquet", ".array_record", ".jsonl", ".json", ".csv", ".pq", ".txt"]
 
     for f in files:
         f_lower = f.lower()
@@ -228,7 +228,7 @@ def expand_data_files(data_files: str | os.PathLike | list[str | os.PathLike]) -
         FileNotFoundError: When the expansion produces no matches at
             all — e.g. typo'd glob, empty directory, missing file.
     """
-    exts_priority = [".arrow", ".parquet", ".jsonl", ".json", ".csv", ".pq", ".txt"]
+    exts_priority = [".arrow", ".parquet", ".array_record", ".jsonl", ".json", ".csv", ".pq", ".txt"]
 
     def expand_one(p: str) -> list[str]:
         """Expand a single path / pattern argument into concrete file paths.

@@ -876,6 +876,47 @@ class TrainingArguments:
         default=True,
         metadata={"help": "Whether to use grain instead of `tensorflow-datasets`."},
     )
+    arrayrecord_train_files: str | list[str] | None = field(
+        default=None,
+        metadata={
+            "help": "Path / glob / list of ``.array_record`` files for the VL pack. When set, the "
+            "trainer builds a grain ArrayRecord dataloader (true global IndexSampler shuffle + "
+            "per-host sharding + random access) and uses ``data_collator`` as the per-batch "
+            "``grain.Batch`` ``batch_fn`` — bypassing the sequential ShardedDataSource path."
+        },
+    )
+    arrayrecord_eval_files: str | list[str] | None = field(
+        default=None,
+        metadata={"help": "Optional ``.array_record`` files for evaluation (same pipeline as train)."},
+    )
+    arrayrecord_train_datasets: dict[str, str | list[str]] | None = field(
+        default=None,
+        metadata={
+            "help": "Per-dataset ArrayRecord sets for WEIGHTED mixing: ``{name: path/glob/list}``. Each "
+            "dataset is loaded + shuffled independently, then combined with ``grain.MapDataset.mix`` using "
+            "``arrayrecord_mixture_weights`` -> weighted AND globally shuffled (controllable weights, NOT "
+            "size-proportional). Takes precedence over ``arrayrecord_train_files``."
+        },
+    )
+    arrayrecord_eval_datasets: dict[str, str | list[str]] | None = field(
+        default=None,
+        metadata={"help": "Per-dataset ArrayRecord sets for evaluation weighted mixing (same as train)."},
+    )
+    arrayrecord_mixture_weights: dict[str, float] | None = field(
+        default=None,
+        metadata={
+            "help": "Mixing weights ``{name: weight}`` for ``arrayrecord_train_datasets`` "
+            "(grain.MapDataset.mix). None -> weight by dataset size (size-proportional)."
+        },
+    )
+    arrayrecord_num_threads: int = field(
+        default=16,
+        metadata={"help": "grain ReadOptions.num_threads for ArrayRecord reads (parallel prefetch)."},
+    )
+    arrayrecord_prefetch_buffer: int = field(
+        default=64,
+        metadata={"help": "grain ReadOptions.prefetch_buffer_size for the ArrayRecord dataloader."},
+    )
     use_wandb: bool = field(
         default=True,
         metadata={"help": "Whether to use Weights & Biases for logging."},
