@@ -390,6 +390,11 @@ class LossConfig:
             size. Alternative memory optimization strategy (default=None).
         compute_dtype: Data type for computation. One of "fp32" or "bf16".
             If None, uses the input dtype.
+        mtp_only: If True, model wrappers that expose ``outputs.mtp_loss``
+            can skip the ordinary task loss and train only against the MTP
+            objective. This is intended for MTP-head-only fine-tunes where the
+            base model parameters are frozen and the main causal-LM CE would
+            only be a misleading diagnostic.
         sparse_loss: If True, the chunked LM-head (FLCE) loss skips fully-masked
             token chunks (all ``ignore_index`` / zero-weight) -- it stops the
             ``fori_loop`` after the last chunk containing a real token, so the
@@ -432,6 +437,7 @@ class LossConfig:
     chunk_token_size: int | None = None
     chunk_block_size: int | None = None
     compute_dtype: tp.Literal["fp32", "bf16"] | None = None
+    mtp_only: bool = False
     sparse_loss: bool = False
 
     def __repr__(self):
@@ -1623,6 +1629,8 @@ class CausalLMLossStrategy(BaseLossStrategy):
         the model runs normally.
         """
         del batch
+        if bool(getattr(loss_config, "mtp_only", False)) and _supports_chunked_causal_lm_forward(module):
+            return LossForwardPlan(forward_kwargs={"apply_lm_head": False})
         token_chunk_size = loss_kwargs.get("token_chunk_size")
         if token_chunk_size is None:
             token_chunk_size = module.config.lmhead_chunksize

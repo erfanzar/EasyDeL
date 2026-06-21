@@ -1413,6 +1413,8 @@ class MoeCausalLMOutput(MaskedLMOutput):
     shape ``(batch, seq_len, vocab)``. Set by models with an MTP head (e.g. Qwen3.5)
     when the head is active; ``None`` otherwise. Exposed so distillation/training can
     supervise the MTP head without recomputing the (large-vocab) projection."""
+    mtp_loss: Array | None = None
+    """Scaled MTP training loss before it is folded into ``aux_loss``."""
 
 
 @auto_pytree
@@ -1471,6 +1473,8 @@ class VLMCausalLMOutput(ModelOutput):
     """Multi-Token-Prediction logits (predicting ``input_ids[t+2]``), set by VLM models
     with an MTP head (e.g. multimodal Qwen3.5) when active; ``None`` otherwise. Mirrors
     the field on :class:`MoeCausalLMOutput` so the shared MTP code path is uniform."""
+    mtp_loss: Array | None = None
+    """Scaled MTP training loss before it is folded into ``aux_loss``."""
 
 
 @auto_pytree

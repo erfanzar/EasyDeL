@@ -168,6 +168,8 @@ class LossConfig(TypedDict, total=False):
             Controls granularity of memory-efficient computation.
         compute_dtype: Data type for loss computation. Use "fp32" for
             numerical stability or "bf16" for faster computation.
+        mtp_only: Train only on ``outputs.mtp_loss`` and skip the ordinary
+            task loss. Intended for MTP-head-only fine-tunes.
 
     Example:
         >>> loss_config: LossConfig = {
@@ -208,6 +210,7 @@ class LossConfig(TypedDict, total=False):
     chunk_token_size: NotRequired[int | None]
     chunk_block_size: NotRequired[int | None]
     compute_dtype: NotRequired[Literal["fp32", "bf16"] | None]
+    mtp_only: NotRequired[bool]
     sparse_loss: NotRequired[bool]
 
 

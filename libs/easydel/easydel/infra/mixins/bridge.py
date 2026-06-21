@@ -103,6 +103,7 @@ from easydel.utils.traversals import (
     flatten_dict,
     get_module_from_path,
     is_flatten,
+    iter_module_search,
     merge_model_and_tree,
     set_module_from_path,
     string_key_to_int,
@@ -1968,6 +1969,10 @@ class EasyBridgeMixin(PushToHubMixin):
                 - torch_load_mode (str): "full" or "streaming". Defaults to "streaming".
                 - torch_streaming_cache (str): "hf_cache" or "temp". Defaults to "hf_cache".
                 - torch_streaming_tmp_dir (str): Temporary directory for streaming.
+                - allow_missing_mtp_init (bool): If True, missing MTP-only
+                  parameters are initialized from their module initializers after
+                  checkpoint conversion. Any non-MTP missing parameter still
+                  raises. Defaults to False.
                 - trust_remote_code (bool): Whether to trust remote code. Defaults to False.
                 - cache_dir, revision, token, local_files_only, force_download, subfolder, proxies.
 
@@ -2000,6 +2005,7 @@ class EasyBridgeMixin(PushToHubMixin):
             ) from er
 
         load_options = _parse_torch_load_options(kwargs)
+        allow_missing_mtp_init = bool(kwargs.pop("allow_missing_mtp_init", False))
         trust_remote_code = kwargs.get("trust_remote_code", False)
 
         logger.debug(f"Downloading model config from {pretrained_model_name_or_path}")
@@ -2133,6 +2139,8 @@ class EasyBridgeMixin(PushToHubMixin):
 
         logger.debug("merging model and parameters pytree.")
         model = merge_model_and_tree(model=model, tree=params)
+        if allow_missing_mtp_init:
+            model = cls._materialize_missing_mtp_parameters(model)
         model.assert_parameters_materialized(context=f"converting torch checkpoint {pretrained_model_name_or_path}")
         # lazy_init builds spx.Rngs under jax.eval_shape, so the rng PRNG-key leaves return
         # abstract and merge_model_and_tree (parameters only) never fills them. Concretize the
@@ -2147,6 +2155,168 @@ class EasyBridgeMixin(PushToHubMixin):
         )
 
         logger.debug("returning model.")
+        return model
+
+    @staticmethod
+    def _parameter_path_to_string(path: str | tuple[tp.Any, ...]) -> str:
+        """Normalize SpectraX tuple paths and state dotted paths."""
+        if isinstance(path, tuple):
+            return ".".join(str(part) for part in path)
+        return str(path)
+
+    @classmethod
+    def _is_mtp_parameter_path(cls, path: str | tuple[tp.Any, ...]) -> bool:
+        """Return True when a dotted parameter path belongs to the MTP head."""
+        path = cls._parameter_path_to_string(path)
+        return path == "mtp" or path.startswith("mtp.") or ".mtp." in path
+
+    @classmethod
+    def _materialize_missing_mtp_parameters(cls, model):
+        """Initialize missing MTP parameters while keeping normal strict loading.
+
+        Some checkpoints are base-model-only but their config enables a new MTP
+        head. This helper permits exactly that case: every missing parameter must
+        live under an ``mtp`` path, and those leaves are initialized with the
+        owning module's initializer before the standard materialization assertion
+        runs.
+        """
+        missing = model.abstract_parameter_leaves()
+        if not missing:
+            return model
+
+        non_mtp = [
+            (collection, path, shape, dtype)
+            for collection, path, shape, dtype in missing
+            if not cls._is_mtp_parameter_path(path)
+        ]
+        if non_mtp:
+            return model
+
+        missing_paths = {path for _collection, path, _shape, _dtype in missing}
+        initialized: set[str] = set()
+        rng = spx.Rngs(0)
+        resolver = getattr(model, "runtime_sharding_resolver", None)
+        mesh = getattr(model, "mesh", None)
+        fallback_spec = jax.sharding.PartitionSpec()
+
+        def _leaf(var):
+            return var.value if hasattr(var, "value") else var
+
+        def _named_sharding_for(var, shape):
+            if resolver is not None and mesh is not None and var is not None and hasattr(var, "metadata"):
+                named_sharding = resolver.named_sharding_for_variable(var, shape=shape, mesh=mesh)
+                if named_sharding is not None:
+                    return named_sharding
+            if mesh is not None and shape is not None:
+                return spx.get_corrected_named_sharding(shape, fallback_spec, raise_mesh_error=False)
+            return None
+
+        def _place(arr, var):
+            sharding = _named_sharding_for(var, tuple(arr.shape))
+            return jax.device_put(arr, sharding) if sharding is not None else arr
+
+        def _init_array_param(param, key):
+            direct_initializers = {"zeros", "ones"}
+            if param.init_method in direct_initializers:
+                init_fn = getattr(jax.nn.initializers, param.init_method)
+            else:
+                init_fn = getattr(jax.nn.initializers, param.init_method, jax.nn.initializers.normal)(
+                    **(param.init_kwargs or {})
+                )
+            return init_fn(key, param.value.shape, param.value.dtype)
+
+        def _set_if_missing(path: str, var, init_fn) -> None:
+            if path not in missing_paths or var is None:
+                return
+            value = _leaf(var)
+            if not isinstance(value, jax.ShapeDtypeStruct):
+                initialized.add(path)
+                return
+            arr = init_fn(rng.parameters, value.shape, value.dtype)
+            arr = _place(arr, var)
+            if hasattr(var, "value"):
+                var.value = arr
+            else:
+                raise TypeError(f"Cannot initialize missing MTP parameter {path!r}: leaf has no value attribute.")
+            initialized.add(path)
+
+        for module_path, module in iter_module_search(model, spx.Module):
+            module_path = cls._parameter_path_to_string(module_path)
+            if not module_path or not cls._is_mtp_parameter_path(module_path):
+                continue
+
+            weight = getattr(module, "weight", None)
+            if weight is not None:
+                weight_path = f"{module_path}.weight"
+                if hasattr(module, "kernel_init"):
+                    _set_if_missing(
+                        weight_path,
+                        weight,
+                        lambda key, shape, dtype, m=module: m.kernel_init(key=key, shape=shape, dtype=dtype),
+                    )
+                elif hasattr(module, "embedding_init"):
+                    _set_if_missing(
+                        weight_path,
+                        weight,
+                        lambda key, shape, dtype, m=module: m.embedding_init(key=key, shape=shape, dtype=dtype),
+                    )
+                elif hasattr(module, "scale_init"):
+                    _set_if_missing(
+                        weight_path, weight, lambda key, shape, dtype, m=module: m.scale_init(key, shape, dtype)
+                    )
+                elif hasattr(weight, "init_method"):
+                    _set_if_missing(weight_path, weight, lambda key, _shape, _dtype, p=weight: _init_array_param(p, key))
+                else:
+                    _set_if_missing(
+                        weight_path, weight, lambda key, shape, dtype: jax.nn.initializers.ones(key, shape, dtype)
+                    )
+
+            bias = getattr(module, "bias", None)
+            if bias is not None:
+                bias_path = f"{module_path}.bias"
+                if hasattr(module, "bias_init"):
+                    _set_if_missing(
+                        bias_path,
+                        bias,
+                        lambda key, shape, dtype, m=module: m.bias_init(key=key, shape=shape, dtype=dtype),
+                    )
+                elif hasattr(bias, "init_method"):
+                    _set_if_missing(bias_path, bias, lambda key, _shape, _dtype, p=bias: _init_array_param(p, key))
+                else:
+                    _set_if_missing(
+                        bias_path, bias, lambda key, shape, dtype: jax.nn.initializers.zeros(key, shape, dtype)
+                    )
+
+        for path, var in spx.iter_variables(model, select="parameters"):
+            path = cls._parameter_path_to_string(path)
+            if path not in missing_paths or path in initialized:
+                continue
+            value = _leaf(var)
+            if not isinstance(value, jax.ShapeDtypeStruct):
+                initialized.add(path)
+                continue
+            if hasattr(var, "init_method"):
+                arr = _init_array_param(var, rng.parameters)
+            elif path.endswith(".bias"):
+                arr = jax.nn.initializers.zeros(rng.parameters, value.shape, value.dtype)
+            elif path.endswith(".weight") and len(value.shape) == 1:
+                arr = jax.nn.initializers.ones(rng.parameters, value.shape, value.dtype)
+            else:
+                arr = jax.nn.initializers.normal(0.02)(rng.parameters, value.shape, value.dtype)
+            var.value = _place(arr, var)
+            initialized.add(path)
+
+        still_missing = sorted(missing_paths - initialized)
+        if still_missing:
+            preview = ", ".join(still_missing[:8])
+            if len(still_missing) > 8:
+                preview = f"{preview}, ... +{len(still_missing) - 8} more"
+            raise ValueError(f"Unable to initialize missing MTP parameters: {preview}")
+
+        logger.warning(
+            f"Initialized {len(initialized)} missing MTP parameter leaf/leaves from module initializers; "
+            "all non-MTP checkpoint parameters remain strictly required."
+        )
         return model
 
     @classmethod

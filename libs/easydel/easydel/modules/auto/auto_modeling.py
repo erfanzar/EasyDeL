@@ -163,6 +163,10 @@ class PreTrainedLoading(TypedDict, total=False):
     checkpoint_load_tensorstore_metadata_workers: NotRequired[int]
     checkpoint_load_progress: NotRequired[bool | None]
     from_torch: NotRequired[bool | None]
+    torch_load_mode: NotRequired[str]
+    torch_streaming_cache: NotRequired[str]
+    torch_streaming_tmp_dir: NotRequired[str | os.PathLike | None]
+    allow_missing_mtp_init: NotRequired[bool]
     # Hugging Face Hub options forwarded to ``EasyDeLBaseModule.from_pretrained``.
     trust_remote_code: NotRequired[bool]
     cache_dir: NotRequired[str | os.PathLike | None]

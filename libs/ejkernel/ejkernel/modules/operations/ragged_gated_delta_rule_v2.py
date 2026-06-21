@@ -310,9 +310,9 @@ class RaggedGatedDeltaRuleV2(Kernel[RaggedGatedDeltaRuleV2Config, tuple[Array, A
                 distribution,
                 has_initial_state,
             )
-            assert len(in_specs) == len(
-                call_args
-            ), f"in_specs length {len(in_specs)} != call_args length {len(call_args)}"
+            assert len(in_specs) == len(call_args), (
+                f"in_specs length {len(in_specs)} != call_args length {len(call_args)}"
+            )
 
             def _wrapped_split(
                 local_query,

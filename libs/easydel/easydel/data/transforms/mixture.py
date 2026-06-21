@@ -382,7 +382,9 @@ class MixedShardedSource(ShardedDataSource[dict]):
             return None
         return max(int(info.num_rows), 0)
 
-    def _known_source_rows(self, source: ShardedDataSource, shard_names: list[str]) -> tuple[list[tuple[str, int]], int] | None:
+    def _known_source_rows(
+        self, source: ShardedDataSource, shard_names: list[str]
+    ) -> tuple[list[tuple[str, int]], int] | None:
         """Return exact per-shard and total row counts when all are known."""
         rows_by_shard = []
         total = 0
@@ -476,10 +478,7 @@ class MixedShardedSource(ShardedDataSource[dict]):
             return
 
         offsets = self._source_offsets_for_row(row)
-        iters = {
-            name: self._chain_shards_at_row(self._sources[name], offsets[name])
-            for name in self._names
-        }
+        iters = {name: self._chain_shards_at_row(self._sources[name], offsets[name]) for name in self._names}
 
         block_idx, partial = divmod(row, self._block_size)
 
