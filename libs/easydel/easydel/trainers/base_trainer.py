@@ -744,10 +744,7 @@ class BaseTrainer(BaseTrainerProtocol):
             if _has_named_count(node):
                 return True
             inner_state = getattr(node, "inner_state", None)
-            return (
-                inner_state is not None
-                and _has_named_count(inner_state)
-            )
+            return inner_state is not None and _has_named_count(inner_state)
 
         def _seed_count_object(node):
             if not _has_replaceable_count(node):
@@ -2467,8 +2464,10 @@ class BaseTrainer(BaseTrainerProtocol):
 
     def _apply_user_data_collator(self, batch: tp.Any) -> tp.Any:
         """Apply an explicitly supplied data collator to raw list batches."""
-        if getattr(self, "_user_data_collator", False) and self.data_collator is not None and isinstance(
-            batch, (list, tuple)
+        if (
+            getattr(self, "_user_data_collator", False)
+            and self.data_collator is not None
+            and isinstance(batch, (list, tuple))
         ):
             return self.data_collator(batch)
         return batch
@@ -6308,8 +6307,7 @@ class BaseTrainer(BaseTrainerProtocol):
         iter_from_batch = getattr(dataloader, "iter_from_batch", None)
         if callable(iter_from_batch):
             logger.info(
-                f"Seeking dataloader to resume at batch offset {num_batches}; "
-                "skipped batches will not be materialized."
+                f"Seeking dataloader to resume at batch offset {num_batches}; skipped batches will not be materialized."
             )
             try:
                 return iter_from_batch(num_batches)

@@ -529,9 +529,7 @@ class DistributedConfig:
                 if coordinator_address is None:
                     coordinator_address = eSlurmCluster.get_coordinator_address()
 
-            initialization_timeout = int(
-                os.getenv("EFORMER_JAX_INIT_TIMEOUT_S", str(60 * 60))
-            )
+            initialization_timeout = int(os.getenv("EFORMER_JAX_INIT_TIMEOUT_S", str(60 * 60)))
             jax.distributed.initialize(
                 coordinator_address,
                 self.num_processes,

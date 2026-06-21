@@ -502,9 +502,9 @@ def test_fused_checkpoint_save_load_tp_matrix(tmp_path, save_tp, load_tp):
     )
     restored = _logits(loaded)
     err = float(np.max(np.abs(reference - restored)))
-    assert err < _model_logit_tolerance(
-        "llama"
-    ), f"save_tp={save_tp} -> load_tp={load_tp} changed the model (max|Δlogits|={err})"
+    assert err < _model_logit_tolerance("llama"), (
+        f"save_tp={save_tp} -> load_tp={load_tp} changed the model (max|Δlogits|={err})"
+    )
     # the live config is overwritten to describe the layout now in memory
     assert getattr(loaded.config, "fused_param_tp", None) == load_tp
 
@@ -533,9 +533,9 @@ def test_fused_tp_survives_lost_marker(tmp_path):
     )
     restored = _logits(loaded)
     err = float(np.max(np.abs(reference - restored)))
-    assert err < _model_logit_tolerance(
-        "llama"
-    ), f"markerless checkpoint was not re-interleaved via the config.json tp (max|Δlogits|={err})"
+    assert err < _model_logit_tolerance("llama"), (
+        f"markerless checkpoint was not re-interleaved via the config.json tp (max|Δlogits|={err})"
+    )
 
 
 def test_fused_tp_backcompat_canonical_format(tmp_path):
@@ -569,9 +569,9 @@ def test_fused_tp_backcompat_canonical_format(tmp_path):
     )
     restored = _logits(loaded)
     err = float(np.max(np.abs(reference - restored)))
-    assert err < _model_logit_tolerance(
-        "llama"
-    ), f"previous-format canonical checkpoint failed to load at tp=2 (max|Δlogits|={err})"
+    assert err < _model_logit_tolerance("llama"), (
+        f"previous-format canonical checkpoint failed to load at tp=2 (max|Δlogits|={err})"
+    )
     assert getattr(loaded.config, "fused_param_tp", None) == 2
     assert "fused_param_layout" not in loaded.config.__dict__
 

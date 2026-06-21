@@ -3164,6 +3164,22 @@ class EasyDeLBaseModule(
 
         outputs = self(**forward_batch)
 
+        if bool(getattr(loss_config, "mtp_only", False)):
+            mtp_loss = getattr(outputs, "mtp_loss", None)
+            if mtp_loss is None:
+                raise ValueError("loss_config.mtp_only=True requires the model output to expose `mtp_loss`.")
+            aux_loss = getattr(outputs, "aux_loss", None)
+            other_metrics = {"mtp_loss": mtp_loss}
+            if aux_loss is not None:
+                other_metrics["aux_loss"] = aux_loss
+            loss_output = LossMetrics(
+                loss=mtp_loss,
+                z_loss=jnp.zeros_like(mtp_loss),
+                other_metrics=other_metrics,
+            )
+            outputs = outputs.replace(loss=loss_output.loss)
+            return outputs, loss_output
+
         config_mesh = getattr(self.config, "_hidden_mesh", None) or getattr(self.config, "mesh", None)
         config_mesh_shape = getattr(config_mesh, "shape", {})
         axis_names = tuple(getattr(self.config, "sharding_axis_names", ()))
@@ -3193,6 +3209,12 @@ class EasyDeLBaseModule(
         )
         if hasattr(outputs, "aux_loss"):
             if outputs.aux_loss is not None:
+                other_metrics = dict(loss_output.other_metrics or {})
+                other_metrics.setdefault("aux_loss", outputs.aux_loss)
+                mtp_loss = getattr(outputs, "mtp_loss", None)
+                if mtp_loss is not None:
+                    other_metrics.setdefault("mtp_loss", mtp_loss)
+                loss_output = loss_output.replace(other_metrics=other_metrics)
                 loss_output.loss = loss_output.loss + outputs.aux_loss
         outputs = outputs.replace(loss=loss_output.loss)
         return outputs, loss_output

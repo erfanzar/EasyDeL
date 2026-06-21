@@ -858,7 +858,7 @@ class Qwen3_5ForCausalLM(Qwen3NextForCausalLM):
         # Expose the MTP logits (already computed here) so a distillation/training step
         # can supervise the MTP head with a teacher distribution without recomputing the
         # large-vocab projection. Reused by the offline DistillationTrainer.
-        return outputs.replace(aux_loss=new_aux, mtp_logits=mtp_logits)
+        return outputs.replace(aux_loss=new_aux, mtp_logits=mtp_logits, mtp_loss=mtp_loss)
 
     def forward(
         self,
@@ -1425,7 +1425,7 @@ class Qwen3_5ForConditionalGeneration(BaseVisionLanguageModule[Qwen3_5Model, Qwe
         # Expose the MTP logits (already computed here) so a distillation/training step
         # can supervise the MTP head with a teacher distribution without recomputing the
         # large-vocab projection. Reused by the offline DistillationTrainer.
-        return outputs.replace(aux_loss=new_aux, mtp_logits=mtp_logits)
+        return outputs.replace(aux_loss=new_aux, mtp_logits=mtp_logits, mtp_loss=mtp_loss)
 
     def forward(self, *args, **kwargs):
         """Vision-language forward with the MTP auxiliary loss folded in.

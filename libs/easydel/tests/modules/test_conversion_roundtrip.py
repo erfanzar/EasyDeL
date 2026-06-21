@@ -216,9 +216,9 @@ def test_hf_easydel_roundtrip(model_type, request):
     # 4./5. Round-trip fidelity: ed2 (loaded from hf1) must match hf1.
     assert ed2_logits.shape == hf1_logits.shape, f"{model_type}: import logits shape mismatch"
     roundtrip_diff = float(np.max(np.abs(ed2_logits - hf1_logits)))
-    assert (
-        roundtrip_diff < ROUNDTRIP_ATOL
-    ), f"{model_type}: HF->EasyDeL import diverged after round-trip, max|Δ|={roundtrip_diff:.2e}"
+    assert roundtrip_diff < ROUNDTRIP_ATOL, (
+        f"{model_type}: HF->EasyDeL import diverged after round-trip, max|Δ|={roundtrip_diff:.2e}"
+    )
 
 
 if __name__ == "__main__":
