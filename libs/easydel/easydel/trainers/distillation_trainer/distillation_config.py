@@ -108,6 +108,11 @@ class DistillationConfig(TrainingArguments):
             live. Set ``False`` for a faster backward at the cost of
             holding every chunk's logits simultaneously -- only viable
             for small effective batch / chunk_size.
+        log_top1_agreement: When ``True``, additionally logs
+            ``top1_agreement`` -- the masked fraction of tokens where the
+            student and teacher argmax agree. A precision-robust hard
+            agreement signal that complements ``kl_loss``; computed only
+            on the chunked KL path. Default ``False``.
     """
 
     trainer_prefix: str | None = field(
@@ -277,6 +282,20 @@ class DistillationConfig(TrainingArguments):
             )
         },
     )
+    log_top1_agreement: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "When True, additionally log `top1_agreement`: the masked fraction of tokens where "
+                "argmax(student_logits) == argmax(teacher_logits). An argmax comparison involves no "
+                "near-equal subtraction, so the metric is insensitive to softmax-normalizer precision "
+                "and complements `kl_loss` as a hard agreement signal (useful when the student is "
+                "heavily compressed and per-token distribution metrics sit near their numeric floor). "
+                "Computed only on the chunked KL path (`logits_chunk_size` set); costs two extra "
+                "vocab-axis reductions per chunk over logits already in hand (fused by XLA, ~zero memory)."
+            )
+        },
+    )
     mtp_distillation: bool = field(
         default=False,
         metadata={
@@ -377,6 +396,7 @@ class DistillationConfig(TrainingArguments):
         if self.logits_chunk_size is not None:
             normalized_logits_chunk_size = int(self.logits_chunk_size)
             self.logits_chunk_size = normalized_logits_chunk_size if normalized_logits_chunk_size > 0 else None
+        self.log_top1_agreement = bool(self.log_top1_agreement)
         self.mtp_distillation = bool(self.mtp_distillation)
         self.mtp_kd_weight = float(self.mtp_kd_weight)
         if self.mtp_kd_weight < 0.0:

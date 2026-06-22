@@ -249,7 +249,8 @@ def _compute_kl_and_ce(
     safe_labels: Array,
     use_hard_labels: bool,
     temperature: float,
-) -> tuple[Array, Array, Array, Array]:
+    log_top1_agreement: bool = False,
+) -> tuple[Array, Array, Array, Array, Array]:
     """Reduce per-token KL/CE contributions over one chunk of logits.
 
     Wraps :func:`_per_token_xent` with mask-weighted summation and the
@@ -271,11 +272,14 @@ def _compute_kl_and_ce(
             CE term against ``safe_labels``.
         temperature: Softmax temperature forwarded to
             :func:`_per_token_xent`.
+        log_top1_agreement: When ``True``, also accumulate the masked
+            count of tokens where the student and teacher argmax agree.
 
     Returns:
-        ``(distill_xent_sum, teacher_entropy_sum, ce_sum, mask_sum)``
+        ``(distill_xent_sum, teacher_entropy_sum, ce_sum, mask_sum, top1_sum)``
         float32 scalars; ``ce_sum`` is zero when ``use_hard_labels``
-        is ``False``.
+        is ``False``; ``top1_sum`` is the masked count of student/teacher
+        argmax agreements (zero when ``log_top1_agreement`` is ``False``).
     """
     per_token_distill_xent, per_token_teacher_entropy = _per_token_xent(
         teacher_logits,
@@ -288,6 +292,18 @@ def _compute_kl_and_ce(
     teacher_entropy_sum = jnp.sum(per_token_teacher_entropy * mask_f32)
     mask_sum = jnp.sum(mask_f32)
 
+    # Top-1 agreement (opt-in): masked count of tokens where the student's argmax token
+    # matches the teacher's. A hard student/teacher agreement signal that involves no
+    # near-equal subtraction, so it is insensitive to softmax-normalizer precision and
+    # complements ``kl_loss``. Two extra vocab reductions over logits already in hand
+    # (fused by XLA; no materialized buffer). Enable via ``DistillationConfig.log_top1_agreement``.
+    if log_top1_agreement:
+        top1_sum = jnp.sum(
+            (jnp.argmax(student_logits, axis=-1) == jnp.argmax(teacher_logits, axis=-1)).astype(jnp.float32) * mask_f32
+        )
+    else:
+        top1_sum = jnp.zeros((), dtype=jnp.float32)
+
     ce_sum = jnp.zeros((), dtype=jnp.float32)
     if use_hard_labels:
         per_token_ce = optax.softmax_cross_entropy_with_integer_labels(
@@ -296,7 +312,7 @@ def _compute_kl_and_ce(
         )
         ce_sum = jnp.sum(per_token_ce * mask_f32)
 
-    return distill_xent_sum, teacher_entropy_sum, ce_sum, mask_sum
+    return distill_xent_sum, teacher_entropy_sum, ce_sum, mask_sum, top1_sum
 
 
 def _finalize_distillation_metrics(
@@ -304,9 +320,11 @@ def _finalize_distillation_metrics(
     teacher_entropy_sum: Array,
     ce_sum: Array,
     mask_sum: Array,
+    top1_sum: Array,
     temperature: float,
     alpha: float,
     use_hard_labels: bool,
+    log_top1_agreement: bool = False,
 ) -> tuple[Array, dict[str, Array]]:
     """Normalise accumulated distillation/CE sums into the final loss and metrics.
 
@@ -326,16 +344,20 @@ def _finalize_distillation_metrics(
         ce_sum: Accumulated masked sum of supervised CE
             (``0`` when ``use_hard_labels`` is ``False``).
         mask_sum: Total mask weight across all processed tokens.
+        top1_sum: Accumulated masked count of student/teacher argmax
+            agreements (only meaningful when ``log_top1_agreement``).
         temperature: Softmax temperature (used to rescale the KL term
             by ``T^2``).
         alpha: KL / CE mixing weight; ``1.0`` is pure distillation.
         use_hard_labels: Whether the CE term should be folded into the
             total loss.
+        log_top1_agreement: When ``True``, add the normalised
+            ``top1_agreement`` fraction to the returned metrics.
 
     Returns:
         ``(total_loss, metrics)`` float32 scalars; ``metrics`` carries
         ``kl_loss``, ``distill_xent_loss``, ``teacher_entropy_loss``,
-        and ``ce_loss``.
+        and ``ce_loss`` (plus ``top1_agreement`` when enabled).
     """
     alpha_s = jnp.float32(alpha)
     temp_sq = jnp.float32(temperature * temperature)
@@ -357,6 +379,8 @@ def _finalize_distillation_metrics(
         "teacher_entropy_loss": teacher_entropy_loss,
         "ce_loss": ce_loss,
     }
+    if log_top1_agreement:
+        metrics["top1_agreement"] = top1_sum.astype(jnp.float32) / normalizer
     return total_loss, metrics
 
 
@@ -920,6 +944,7 @@ def chunked_distillation_loss(
     alpha: float = 0.9,
     chunk_size: int = 128,
     checkpoint_chunks: bool = True,
+    log_top1_agreement: bool = False,
 ) -> tuple[Array, dict[str, Array]]:
     """Memory-efficient distillation loss that avoids materialising full logits.
 
@@ -964,11 +989,16 @@ def chunked_distillation_loss(
         checkpoint_chunks: When ``True``, ``jax.checkpoint`` the
             per-chunk body so vocab-sized logits are recomputed in
             the backward pass.
+        log_top1_agreement: When ``True``, also report ``top1_agreement``:
+            the masked fraction of tokens where the student and teacher
+            argmax agree. Costs two extra vocab reductions per chunk over
+            logits already in hand (fused by XLA; no materialised buffer).
 
     Returns:
         ``(total_loss, metrics)`` where ``metrics`` is a dict with
         ``kl_loss``, ``distill_xent_loss``, ``teacher_entropy_loss``,
-        and ``ce_loss``.
+        and ``ce_loss`` (plus ``top1_agreement`` when
+        ``log_top1_agreement`` is set).
     """
     dtype = student_hidden.dtype
     B, L = student_hidden.shape[:2]
@@ -1020,6 +1050,7 @@ def chunked_distillation_loss(
             safe_labels=sl,
             use_hard_labels=_use_hard,
             temperature=temperature,
+            log_top1_agreement=log_top1_agreement,
         )
 
     if checkpoint_chunks:
@@ -1027,15 +1058,21 @@ def chunked_distillation_loss(
 
     def _scan_body(carry, xs):
         s_h, t_h, m, sl = xs
-        distill_xent, teacher_entropy, ce, ms = _chunk_kl_ce(s_h, t_h, m, sl)
-        return (carry[0] + distill_xent, carry[1] + teacher_entropy, carry[2] + ce, carry[3] + ms), None
+        distill_xent, teacher_entropy, ce, ms, top1 = _chunk_kl_ce(s_h, t_h, m, sl)
+        return (
+            carry[0] + distill_xent,
+            carry[1] + teacher_entropy,
+            carry[2] + ce,
+            carry[3] + ms,
+            carry[4] + top1,
+        ), None
 
     # float32 carry: the running sums reach ~1e4-1e5 where bf16 ulp is 64-512 — accumulating
     # them in the model dtype is one of the things that used to floor / flip the KL metric.
     _zero = jnp.zeros((), dtype=jnp.float32)
-    (distill_xent_sum, teacher_entropy_sum, ce_sum, mask_sum), _ = jax.lax.scan(
+    (distill_xent_sum, teacher_entropy_sum, ce_sum, mask_sum, top1_sum), _ = jax.lax.scan(
         _scan_body,
-        (_zero, _zero, _zero, _zero),
+        (_zero, _zero, _zero, _zero, _zero),
         (s_chunks, t_chunks, m_chunks, l_chunks),
     )
 
@@ -1044,9 +1081,11 @@ def chunked_distillation_loss(
         teacher_entropy_sum=teacher_entropy_sum,
         ce_sum=ce_sum,
         mask_sum=mask_sum,
+        top1_sum=top1_sum,
         temperature=temperature,
         alpha=alpha,
         use_hard_labels=_use_hard,
+        log_top1_agreement=log_top1_agreement,
     )
 
 
@@ -1269,6 +1308,7 @@ def distillation_step(
     mtp_distillation: bool = False,
     mtp_kd_weight: float = 0.3,
     mtp_draft_tokens: int = 1,
+    log_top1_agreement: bool = False,
 ) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
     """Perform a single knowledge-distillation training or evaluation step.
 
@@ -1317,6 +1357,8 @@ def distillation_step(
         checkpoint_kl_loss: When ``True`` (default) and the chunked path is active, wrap each
             chunk's KL/CE body in ``jax.checkpoint`` so its vocab-sized logits are recomputed in
             the backward pass instead of stored. Set ``False`` to skip the recompute.
+        log_top1_agreement: When ``True``, also report ``top1_agreement`` (the masked fraction of
+            tokens where the student and teacher argmax agree) on the chunked KL path.
 
     Returns:
         tuple[EasyDeLState, LossMetrics] | LossMetrics: When ``is_training``
@@ -1496,6 +1538,7 @@ def distillation_step(
                 alpha=alpha,
                 chunk_size=int(logits_chunk_size),
                 checkpoint_chunks=checkpoint_kl_loss,
+                log_top1_agreement=log_top1_agreement,
             )
         else:
             # If the vocabulary is tensor-parallel-sharded, route the KL/CE through the vocab-parallel
@@ -1702,6 +1745,7 @@ def _distillation_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
             "attention_normalize",
             "logits_chunk_size",
             "checkpoint_kl_loss",
+            "log_top1_agreement",
             "beta",
             "loss_top_k",
             "loss_add_tail",
@@ -1735,6 +1779,7 @@ def _make_distillation_scheduled_loss(call):
     attention_normalize = call.get("attention_normalize", False)
     logits_chunk_size = call.get("logits_chunk_size")
     checkpoint_kl_loss = bool(call.get("checkpoint_kl_loss", True))
+    log_top1_agreement = bool(call.get("log_top1_agreement", False))
     beta = call.get("beta")
     loss_top_k = int(call.get("loss_top_k", 0) or 0)
     loss_add_tail = bool(call.get("loss_add_tail", False))
@@ -1814,6 +1859,7 @@ def _make_distillation_scheduled_loss(call):
                     alpha=alpha,
                     chunk_size=int(logits_chunk_size),
                     checkpoint_chunks=checkpoint_kl_loss,
+                    log_top1_agreement=log_top1_agreement,
                 )
             else:
                 total_loss, _loss_components = distillation_loss(
