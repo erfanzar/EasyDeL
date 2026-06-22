@@ -18,6 +18,7 @@ on:
       - "libs/spectrax/**"
       - "libs/ejkernel/**"
       - "libs/eformer/**"
+      - "libs/eray/**"
 
 concurrency:
   group: subtree-sync
@@ -36,6 +37,8 @@ jobs:
             repo: erfanzar/ejkernel
           - lib: eformer
             repo: erfanzar/eformer
+          - lib: eray
+            repo: erfanzar/eray
     steps:
       - name: Checkout (full history — subtree split walks it)
         uses: actions/checkout@v4

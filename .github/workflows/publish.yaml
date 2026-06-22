@@ -13,6 +13,7 @@ on:
       - "spectrax-v*"
       - "ejkernel-v*"
       - "eformer-v*"
+      - "eray-v*"
 
 permissions:
   id-token: write # PyPI trusted publishing
@@ -36,6 +37,7 @@ jobs:
             spectrax) DIST=spectrax-lib ;;
             ejkernel) DIST=ejkernel ;;
             eformer)  DIST=eformer ;;
+            eray)     DIST=eray ;;
             *) echo "unknown tag prefix: $TAG" >&2; exit 1 ;;
           esac
           echo "dist=$DIST" >> "$GITHUB_OUTPUT"
