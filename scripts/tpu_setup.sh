@@ -760,6 +760,7 @@ install_workspace_on_tpu() {
       --editable \"\${src_dir}/libs/spectrax[tpu,dev]\" \
       --editable \"\${src_dir}/libs/ejkernel[tpu,profile,dev]\" \
       --editable \"\${src_dir}/libs/easydel[tpu,torch,lm_eval,profile]\" \
+      --editable \"\${src_dir}/libs/eray[dev]\" \
       \"import-linter>=2.0\" \
       ruff \
       pytest \
@@ -825,6 +826,7 @@ packages = [
     ('eformer', 'eformer'),
     ('ejkernel', 'ejkernel'),
     ('spectrax-lib', 'spectrax'),
+    ('eray', 'eray'),
 ]
 versions = []
 for dist_name, module_name in packages:

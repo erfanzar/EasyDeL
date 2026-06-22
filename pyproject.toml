@@ -5,9 +5,9 @@ build-backend = "hatchling.build"
 [project]
 name = "easydel-foundation"
 version = "0.1.0"
-description = "EasyDeL foundation workspace: easydel + spectrax + ejkernel + eformer developed in one repo"
+description = "EasyDeL foundation workspace: easydel + spectrax + ejkernel + eformer + eray developed in one repo"
 requires-python = ">=3.11,<3.14"
-dependencies = ["easydel"]
+dependencies = ["easydel", "eray"]
 
 # Root extras forward to the easydel member so the whole foundation installs with
 # one selector, e.g. `uv sync --extra tpu --extra dev` (workspace-aware: the
@@ -71,10 +71,11 @@ conflicts = [
 ]
 
 [tool.uv.workspace]
-members = ["libs/easydel", "libs/spectrax", "libs/ejkernel", "libs/eformer"]
+members = ["libs/easydel", "libs/spectrax", "libs/ejkernel", "libs/eformer", "libs/eray"]
 
 [tool.uv.sources]
 easydel = { workspace = true }
+eray = { workspace = true }
 
 [[tool.uv.index]]
 name = "pytorch-cpu"
@@ -86,18 +87,18 @@ explicit = true
 # easydel AND of each other (ejkernel's eformer dep is a dev/test extra only).
 # Enforced in CI via `lint-imports`.
 [tool.importlinter]
-root_packages = ["easydel", "spectrax", "ejkernel", "eformer"]
+root_packages = ["easydel", "spectrax", "ejkernel", "eformer", "eray"]
 
 [[tool.importlinter.contracts]]
 name = "foundation libs must not import easydel"
 type = "forbidden"
-source_modules = ["spectrax", "ejkernel", "eformer"]
+source_modules = ["spectrax", "ejkernel", "eformer", "eray"]
 forbidden_modules = ["easydel"]
 
 [[tool.importlinter.contracts]]
 name = "foundation libs stay independent of each other"
 type = "independence"
-modules = ["spectrax", "ejkernel", "eformer"]
+modules = ["spectrax", "ejkernel", "eformer", "eray"]
 
 [tool.black]
 line-length = 121
