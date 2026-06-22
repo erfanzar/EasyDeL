@@ -62,6 +62,7 @@ from easydel.infra.etils import (
     MpMdSchedulers,
 )
 from easydel.infra.loss_utils import LossConfig
+from easydel.trainers.pose import PoSEConfig
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import hash_fn
 
@@ -246,6 +247,10 @@ class TrainingArguments:
     aux_loss_enabled: bool = field(
         default=False,
         metadata={"help": "Whether to enable the auxiliary loss."},
+    )
+    pose: PoSEConfig = field(
+        default_factory=PoSEConfig,
+        metadata={"help": "PoSE (positional skip-wise) position_ids augmentation; disabled by default."},
     )
     backend: str | None = field(
         default=None,

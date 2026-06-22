@@ -783,6 +783,9 @@ class Trainer(BaseTrainer):
                             batch=self._runtime_batch_summary(batch),
                             prefetch=prefetcher is not None,
                         )
+                        # PoSE (text-only): host-side position_ids skip, once per microbatch
+                        # before the forward (no-op unless arguments.pose.enabled).
+                        batch = self._apply_pose_to_batch(batch, current_step)
                     step_metrics.start_step()
                     self._runtime_trace("train_step.on_step_start.begin", epoch=epoch, current_step=current_step)
                     state = self.on_step_start(state=state, step=current_step)
