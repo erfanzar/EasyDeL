@@ -140,7 +140,10 @@ push_prefixed() {
         return 0
     fi
     echo ">>> $lib: pushing prefixed update -> $repo (main)"
-    git push "$repo" "${head}:main"
+    # Fully-qualify the destination: when the mirror is empty (fresh repo)
+    # Git won't infer that `main` means refs/heads/main because the src is a
+    # bare commit SHA, not a ref name. refs/heads/main works in both cases.
+    git push "$repo" "${head}:refs/heads/main"
 }
 
 for lib in "${libs[@]}"; do
