@@ -18,6 +18,7 @@ import jax
 import jax.numpy as jnp
 import optax  # pyright: ignore[reportMissingTypeStubs]
 import pytest
+
 from easydel.trainers.distillation_trainer._fn import chunked_distillation_loss, distillation_loss
 
 
@@ -309,6 +310,45 @@ def test_distillation_beta_endpoints_match_gkd_convention():
         beta=1.0,
     )
     assert jnp.allclose(metrics_rev["kl_loss"], jnp.mean(reverse_kl) * t_sq, atol=1e-5)
+
+
+def test_distillation_cakld_blends_forward_and_reverse_kl():
+    student_logits = jnp.array([[[1.0, 0.0, -0.5], [0.2, 0.5, -0.3]]], dtype=jnp.float32)
+    teacher_logits = jnp.array([[[0.1, 0.6, -0.2], [0.4, -0.1, 0.3]]], dtype=jnp.float32)
+    mask = jnp.array([[1, 0]], dtype=jnp.int32)
+    temperature = 1.5
+    gamma = 0.7
+
+    _, metrics = distillation_loss(
+        student_logits=student_logits,
+        teacher_logits=teacher_logits,
+        loss_mask=mask,
+        temperature=temperature,
+        alpha=1.0,
+        cakld_gamma=gamma,
+    )
+
+    student_log_probs = jax.nn.log_softmax(student_logits / temperature, axis=-1)
+    teacher_log_probs = jax.nn.log_softmax(teacher_logits / temperature, axis=-1)
+    forward_kl = jnp.sum(jnp.exp(teacher_log_probs) * (teacher_log_probs - student_log_probs), axis=-1)
+    reverse_kl = jnp.sum(jnp.exp(student_log_probs) * (student_log_probs - teacher_log_probs), axis=-1)
+    per_token = gamma * reverse_kl + (1.0 - gamma) * forward_kl
+    expected = jnp.sum(per_token * mask) / jnp.sum(mask) * (temperature**2)
+
+    assert jnp.allclose(metrics["kl_loss"], expected, atol=1e-6)
+    assert jnp.allclose(metrics["distill_xent_loss"], expected, atol=1e-6)
+    assert jnp.allclose(metrics["teacher_entropy_loss"], 0.0, atol=1e-6)
+
+
+def test_distillation_cakld_rejects_beta():
+    logits = jnp.array([[[1.0, 0.0, -0.5]]], dtype=jnp.float32)
+    with pytest.raises(ValueError, match="cakld_gamma"):
+        distillation_loss(
+            student_logits=logits,
+            teacher_logits=logits,
+            beta=0.5,
+            cakld_gamma=0.5,
+        )
 
 
 def test_gkd_jsd_beta_endpoints_match_trl_convention():
