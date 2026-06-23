@@ -3,7 +3,7 @@ name: Workspace CI
 # Affected-only verification: each push/PR runs (a) the import-layering
 # contract and (b) a fast functional smoke for every workspace package whose
 # files changed (a foundation-lib change also smokes easydel, which sits on
-# top of all three). The deep per-package test suites are too large/hardware-
+# top of the foundation libraries). The deep per-package test suites are too large/hardware-
 # bound for per-PR CI and run locally / on dedicated runners — see WORKSPACE.md.
 
 on:
@@ -24,6 +24,7 @@ jobs:
       spectrax: ${{ steps.filter.outputs.spectrax }}
       ejkernel: ${{ steps.filter.outputs.ejkernel }}
       eformer: ${{ steps.filter.outputs.eformer }}
+      eray: ${{ steps.filter.outputs.eray }}
       easydel: ${{ steps.filter.outputs.easydel }}
       root: ${{ steps.filter.outputs.root }}
     steps:
@@ -41,6 +42,7 @@ jobs:
             spectrax: ['libs/spectrax/**']
             ejkernel: ['libs/ejkernel/**']
             eformer: ['libs/eformer/**']
+            eray: ['libs/eray/**']
             easydel: ['libs/easydel/**']
             root: ['pyproject.toml', 'uv.lock']
 
@@ -70,6 +72,8 @@ jobs:
             module: ejkernel
           - lib: eformer
             module: eformer
+          - lib: eray
+            module: eray
           - lib: easydel
             module: easydel
     steps:
@@ -84,6 +88,7 @@ jobs:
             [ "${{ needs.changes.outputs.spectrax }}" = "true" ] && ANYLIB=true
             [ "${{ needs.changes.outputs.ejkernel }}" = "true" ] && ANYLIB=true
             [ "${{ needs.changes.outputs.eformer }}" = "true" ] && ANYLIB=true
+            [ "${{ needs.changes.outputs.eray }}" = "true" ] && ANYLIB=true
           fi
           if [ "$AFFECTED" = "true" ] || [ "$ROOT" = "true" ] || [ "$ANYLIB" = "true" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"

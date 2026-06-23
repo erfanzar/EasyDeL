@@ -3,7 +3,7 @@
 # Keeps easydel's pins on the sibling libraries in sync and refreshes the lock.
 # Publishing to GitHub/PyPI is a separate, explicit step: scripts/publish.sh.
 #
-#   scripts/release.sh <easydel|spectrax|ejkernel|eformer> <new-version> [--dry-run]
+#   scripts/release.sh <easydel|spectrax|ejkernel|eformer|eray> <new-version> [--dry-run]
 #
 # Examples:
 #   scripts/release.sh ejkernel 0.0.82          # bump + sync easydel pins + commit
@@ -15,8 +15,8 @@ lib="${1:?usage: release.sh <lib> <version> [--dry-run]}"
 version="${2:?usage: release.sh <lib> <version> [--dry-run]}"
 dry="${3:-}"
 
-declare -A DIST=([easydel]=easydel [spectrax]=spectrax-lib [ejkernel]=ejkernel [eformer]=eformer)
-dist="${DIST[$lib]:?unknown lib: $lib (easydel|spectrax|ejkernel|eformer)}"
+declare -A DIST=([easydel]=easydel [spectrax]=spectrax-lib [ejkernel]=ejkernel [eformer]=eformer [eray]=eray)
+dist="${DIST[$lib]:?unknown lib: $lib (easydel|spectrax|ejkernel|eformer|eray)}"
 pp="libs/$lib/pyproject.toml"
 [ -f "$pp" ] || { echo "missing $pp" >&2; exit 1; }
 
