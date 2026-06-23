@@ -30,12 +30,11 @@ import traceback
 
 os.environ.setdefault("ENABLE_DISTRIBUTED_INIT", "0")
 
+import easydel
+import easydel.trainers  # noqa: F401
 import jax
 import jax.numpy as jnp
 import spectrax as spx
-
-import easydel
-import easydel.trainers  # noqa: F401
 from easydel.modules.qwen3_5 import Qwen3_5ForCausalLM
 from easydel.modules.qwen3_5.qwen3_5_configuration import Qwen3_5TextConfig
 from easydel.trainers import DistillationConfig
@@ -137,6 +136,60 @@ def test_mtp_kd_mask():
     assert jnp.isfinite(loss), "masked loss must be finite"
 
 
+@_case("mtp_distillation_loss: CAKLD blends shifted forward/reverse KL")
+def test_mtp_kd_cakld_blend():
+    teacher = jnp.array(
+        [[[0.2, 0.5, -0.1], [0.7, -0.3, 0.1], [0.0, 0.4, 0.8], [-0.2, 0.3, 0.6]]],
+        dtype=jnp.float32,
+    )
+    student = jnp.array(
+        [[[0.1, 0.6, -0.2], [0.4, 0.0, 0.5], [0.3, -0.1, 0.2], [0.9, 0.2, -0.4]]],
+        dtype=jnp.float32,
+    )
+    temperature = 1.25
+    gamma = 0.35
+    loss = mtp_distillation_loss(
+        student,
+        teacher,
+        attention_mask=jnp.ones((1, 4), dtype=jnp.float32),
+        temperature=temperature,
+        cakld_gamma=gamma,
+    )
+
+    teacher_target = jnp.concatenate([teacher[:, 1:], teacher[:, -1:]], axis=1)
+    mtp_mask = jnp.array([[1.0, 1.0, 0.0, 0.0]], dtype=jnp.float32)
+    student_log_probs = jax.nn.log_softmax(student / temperature, axis=-1)
+    teacher_log_probs = jax.nn.log_softmax(teacher_target / temperature, axis=-1)
+    forward_kl = jnp.sum(jnp.exp(teacher_log_probs) * (teacher_log_probs - student_log_probs), axis=-1)
+    reverse_kl = jnp.sum(jnp.exp(student_log_probs) * (student_log_probs - teacher_log_probs), axis=-1)
+    expected = jnp.sum((gamma * reverse_kl + (1.0 - gamma) * forward_kl) * mtp_mask) / jnp.sum(mtp_mask)
+    expected = expected * (temperature**2)
+
+    assert jnp.allclose(loss, expected, atol=1e-6), f"CAKLD MTP loss mismatch: got={loss}, expected={expected}"
+
+
+@_case("mtp_chain_distillation_loss: CAKLD blends per-step forward/reverse KL")
+def test_mtp_chain_cakld_blend():
+    b, s, v, n_steps = 1, 6, 8, 3
+    teacher = jax.random.normal(jax.random.PRNGKey(7), (b, s, v), dtype=jnp.float32) * 0.5
+    chain = jax.random.normal(jax.random.PRNGKey(8), (n_steps, b, s, v), dtype=jnp.float32) * 0.5
+    am = jnp.ones((b, s), dtype=jnp.float32)
+    temperature, gamma = 1.5, 0.35
+
+    mean_cakld, per_cakld = mtp_chain_distillation_loss(
+        chain, teacher, attention_mask=am, temperature=temperature, cakld_gamma=gamma
+    )
+    # beta=None -> forward, beta=1.0 -> reverse (GKD/TRL convention).
+    mean_fwd, per_fwd = mtp_chain_distillation_loss(chain, teacher, attention_mask=am, temperature=temperature)
+    mean_rev, per_rev = mtp_chain_distillation_loss(chain, teacher, attention_mask=am, temperature=temperature, beta=1.0)
+
+    assert len(per_cakld) == n_steps
+    for j in range(n_steps):
+        expected = gamma * per_rev[j] + (1.0 - gamma) * per_fwd[j]
+        assert jnp.allclose(per_cakld[j], expected, atol=1e-6), f"chain step {j} CAKLD blend mismatch"
+    assert jnp.allclose(mean_cakld, gamma * mean_rev + (1.0 - gamma) * mean_fwd, atol=1e-6), "chain mean blend mismatch"
+
+
 @_case("compute_mtp_chain: shape + step-1 matches the single-step path")
 def test_mtp_chain_shape_and_consistency():
     b, s, v, k = 2, 32, 128, 6
@@ -201,6 +254,8 @@ ALL_TESTS = [
     test_mtp_kd_nonnegative,
     test_mtp_kd_perfect_match,
     test_mtp_kd_mask,
+    test_mtp_kd_cakld_blend,
+    test_mtp_chain_cakld_blend,
     test_mtp_chain_shape_and_consistency,
     test_mtp_chain_perfect_alignment,
     test_config_validation,

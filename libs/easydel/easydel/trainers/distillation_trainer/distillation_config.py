@@ -71,6 +71,10 @@ class DistillationConfig(TrainingArguments):
         alpha: Mixing weight on the distillation term. ``1.0`` is pure
             distillation; ``0.0`` is pure supervised CE. Must be in
             ``[0, 1]`` (validated in ``__post_init__``). Default ``0.9``.
+        cakld_gamma: Optional Confidence-Aware KL coefficient. When set,
+            enables ``gamma * KL(student || teacher) + (1 - gamma) *
+            KL(teacher || student)``. This should be the precomputed
+            averaged teacher-token confidence from the CAKLD paper.
         dataset_text_field: Field name read by the SFT-style
             tokenization fallback when the dataset is plain text.
             Default ``"text"``.
@@ -138,6 +142,16 @@ class DistillationConfig(TrainingArguments):
     beta: float | None = field(
         default=None,
         metadata={"help": "Optional generalized Jensen-Shannon interpolation coefficient in [0, 1]."},
+    )
+    cakld_gamma: float | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional Confidence-Aware KL gamma in [0, 1]. When set, the soft distillation term is "
+                "gamma * KL(student || teacher) + (1 - gamma) * KL(teacher || student). This value is "
+                "normally precomputed as the averaged teacher-token probability on a calibration subset."
+            )
+        },
     )
     reverse_kl_top_1_mode: tp.Literal["sampled", "argmax"] = field(
         default="sampled",
@@ -342,6 +356,12 @@ class DistillationConfig(TrainingArguments):
             raise ValueError("EasyDeL `DistillationTrainer` is offline-only; set `lmbda=0.0`.")
         if self.beta is not None and not 0.0 <= float(self.beta) <= 1.0:
             raise ValueError("`beta` must be within [0, 1] when set.")
+        if self.cakld_gamma is not None:
+            self.cakld_gamma = float(self.cakld_gamma)
+            if not 0.0 <= self.cakld_gamma <= 1.0:
+                raise ValueError("`cakld_gamma` must be within [0, 1] when set.")
+            if self.beta is not None:
+                raise ValueError("`cakld_gamma` is mutually exclusive with GJSD `beta`.")
         if self.reverse_kl_top_1_mode != "sampled":
             raise ValueError("`reverse_kl_top_1_mode` is only meaningful for TRL GJSD distillation.")
         self.loss_top_k = int(self.loss_top_k)
@@ -349,6 +369,8 @@ class DistillationConfig(TrainingArguments):
             raise ValueError("`loss_top_k` must be non-negative.")
         if self.loss_add_tail and self.loss_top_k <= 0:
             raise ValueError("`loss_add_tail=True` requires `loss_top_k > 0`.")
+        if self.cakld_gamma is not None and self.loss_top_k > 0:
+            raise ValueError("`cakld_gamma` is not supported with `loss_top_k` / `loss_add_tail`.")
         if self.max_prompt_length is not None:
             raise ValueError("`max_prompt_length` is not used by EasyDeL offline distillation; use `max_length`.")
         if self.max_completion_length is not None:

@@ -286,6 +286,7 @@ class DistillationTrainer(Trainer):
         if _tp_size > 1:
             _adv_vocab = (
                 self.arguments.beta is not None
+                or self.arguments.cakld_gamma is not None
                 or int(self.arguments.loss_top_k or 0) > 0
                 or bool(self.arguments.loss_add_tail)
             )
@@ -347,6 +348,7 @@ class DistillationTrainer(Trainer):
             self.arguments.logits_chunk_size,
             bool(self.arguments.checkpoint_kl_loss),
             self.arguments.beta,
+            self.arguments.cakld_gamma,
             int(self.arguments.loss_top_k),
             bool(self.arguments.loss_add_tail),
             bool(self.arguments.mtp_distillation),
@@ -354,7 +356,7 @@ class DistillationTrainer(Trainer):
             int(self.arguments.mtp_draft_tokens),
         )
 
-        static_argnums = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24)
+        static_argnums = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25)
         self._runtime_trace("train.compile_wrapper.begin")
         if self.arguments.mpmd_scheduler is None:
             sharded_training_step_function = spx.jit(
@@ -394,6 +396,7 @@ class DistillationTrainer(Trainer):
             self.arguments.logits_chunk_size,
             bool(self.arguments.checkpoint_kl_loss),
             self.arguments.beta,
+            self.arguments.cakld_gamma,
             int(self.arguments.loss_top_k),
             bool(self.arguments.loss_add_tail),
             bool(self.arguments.mtp_distillation),

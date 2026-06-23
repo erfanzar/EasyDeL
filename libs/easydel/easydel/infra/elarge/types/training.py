@@ -279,6 +279,7 @@ class BaseTrainerCfg(TypedDict, total=False):
         train_on_inputs: Whether to compute loss on input tokens in addition
             to target tokens.
         aux_loss_enabled: Whether to enable auxiliary losses (e.g., for MoE).
+        pose: Optional PoSE position-augmentation configuration.
         training_time_limit: Maximum training time as string (e.g., "2h30m").
         step_start_point: Step number to resume training from.
         force_step_start_point: Whether to force ``step_start_point`` onto a
@@ -486,6 +487,7 @@ class BaseTrainerCfg(TypedDict, total=False):
     init_tx: NotRequired[bool]
     train_on_inputs: NotRequired[bool]
     aux_loss_enabled: NotRequired[bool]
+    pose: NotRequired[dict[str, Any] | None]
     training_time_limit: NotRequired[str | None]
     step_start_point: NotRequired[int | None]
     force_step_start_point: NotRequired[bool]
@@ -1329,6 +1331,8 @@ class DistillationTrainerCfg(BaseTrainerCfg):
             information about class relationships.
         alpha: Weight for distillation loss relative to task loss.
             alpha * distillation_loss + (1 - alpha) * task_loss.
+        cakld_gamma: Optional Confidence-Aware KL coefficient for
+            CAKLD-style blending of reverse and forward KL.
         logits_chunk_size: Optional sequence-axis chunk size used when
             running the LM head chunk-by-chunk to bound peak memory.
             ``None`` materialises the full ``[B, L, V]`` logit tensor.
@@ -1383,6 +1387,7 @@ class DistillationTrainerCfg(BaseTrainerCfg):
     attention_layers: NotRequired[tuple[int, ...] | None]
     attention_normalize: NotRequired[bool]
     beta: NotRequired[float | None]
+    cakld_gamma: NotRequired[float | None]
     disable_dropout: NotRequired[bool]
     generation_batch_size: NotRequired[int | None]
     lmbda: NotRequired[float]
@@ -2354,6 +2359,7 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "trainer_prefix": "Distillation",
         "temperature": 2.0,
         "alpha": 0.9,
+        "cakld_gamma": None,
         "logits_chunk_size": None,
     },
     "on_policy_distillation": {
