@@ -62,6 +62,7 @@ from easydel.infra.etils import (
     MpMdSchedulers,
 )
 from easydel.infra.loss_utils import LossConfig
+from easydel.trainers.pose import PoSEConfig
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import hash_fn
 
@@ -246,6 +247,10 @@ class TrainingArguments:
     aux_loss_enabled: bool = field(
         default=False,
         metadata={"help": "Whether to enable the auxiliary loss."},
+    )
+    pose: PoSEConfig = field(
+        default_factory=PoSEConfig,
+        metadata={"help": "PoSE (positional skip-wise) position_ids augmentation; disabled by default."},
     )
     backend: str | None = field(
         default=None,
@@ -2077,7 +2082,9 @@ class TrainingArguments:
             value = data[field_name]
             field_type = type_hints.get(field_name)
 
-            if (
+            if field_name == "pose" and isinstance(value, dict):
+                processed_data[field_name] = PoSEConfig.from_dict(value)
+            elif (
                 value is not None
                 and isinstance(value, list)
                 and field_type is not None
@@ -2145,7 +2152,7 @@ class TrainingArguments:
             cls = getattr(ed, config_dict.pop("trainer_config_class"))
             if cls is None:
                 raise ValueError("We couldn't clarify the trainer config class from provided json.")
-        return cls(**config_dict)
+        return cls.from_dict(config_dict)
 
     def save_arguments(self, json_file_path: str | os.PathLike | ePathLike):
         """
