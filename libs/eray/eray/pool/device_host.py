@@ -28,6 +28,7 @@ from ..core.cluster import HostInfo
 
 logger = logging.getLogger("ray")
 
+
 @ray.remote
 class DeviceHostActor:
     """Ray actor for managing a single TPU host within a slice.
@@ -113,14 +114,14 @@ class DeviceHostActor:
         """Quietly kill processes holding /dev/vfio/*.
 
         Controlled by:
-        - EFORMER_KILL_VFIO=1 to enable (default 0 = disabled)
-        - EFORMER_INSTALL_LSOF=1 to attempt quiet, noninteractive lsof install (optional)
+        - ERAY_KILL_VFIO=1 to enable (default 0 = disabled)
+        - ERAY_INSTALL_LSOF=1 to attempt quiet, noninteractive lsof install (optional)
 
         All command outputs are suppressed; never prompts for sudo.
         """
         import os
 
-        if os.getenv("EFORMER_KILL_VFIO", "1") != "1":
+        if os.getenv("ERAY_KILL_VFIO", "1") != "1":
             return
         try:
             import shutil
@@ -128,6 +129,15 @@ class DeviceHostActor:
             import subprocess
 
             def run_quiet(cmd: str, capture: bool = False) -> subprocess.CompletedProcess:
+                """Run a shell command quietly, suppressing output.
+
+                Args:
+                    cmd: Shell command to execute.
+                    capture: If True, capture stdout instead of suppressing it.
+
+                Returns:
+                    CompletedProcess from subprocess.run.
+                """
                 return subprocess.run(
                     ["bash", "-lc", cmd],
                     check=False,
@@ -137,7 +147,7 @@ class DeviceHostActor:
                     env=dict(os.environ, DEBIAN_FRONTEND="noninteractive"),
                 )
 
-            if shutil.which("lsof") is None and os.getenv("EFORMER_INSTALL_LSOF", "0") == "1":
+            if shutil.which("lsof") is None and os.getenv("ERAY_INSTALL_LSOF", "0") == "1":
                 run_quiet("sudo -n apt-get -qq update || true")
                 run_quiet("sudo -n apt-get -qq -y install lsof || true")
 
@@ -243,10 +253,12 @@ class DeviceHostActor:
         Args:
             remote_fn: Ray remote function or callable to execute. If not already
                 a remote function, will be wrapped with @ray.remote(max_calls=1).
+            f_args: Positional arguments to pass to the remote function.
+            f_kwargs: Keyword arguments to pass to the remote function.
             runtime_env: Optional Ray runtime environment configuration for
                 dependency management and environment setup.
             env: Additional environment variables to merge with host environment.
-            num_cpus: Number of CPUs to reserve for the task (default: 8.0).
+            num_cpus: Number of CPUs to reserve for the task (default: 0.0).
             memory_bytes: Memory to reserve in bytes (default: 20GB).
             extra_resources: Additional custom resources to request.
 
@@ -256,7 +268,6 @@ class DeviceHostActor:
 
         Raises:
             RuntimeError: If host is unhealthy or being preempted.
-            ValueError: If remote_fn doesn't have max_calls=1 set.
 
         Note:
             - Task runs with strict node affinity to this host's node.
@@ -294,6 +305,16 @@ class DeviceHostActor:
 
         @ray.remote(max_calls=1)
         def _runner(fn, args, kwargs):
+            """Run a function with JAX distributed shutdown on exit.
+
+            Args:
+                fn: The function to execute.
+                args: Positional arguments for the function.
+                kwargs: Keyword arguments for the function.
+
+            Returns:
+                The result of fn(*args, **kwargs).
+            """
             try:
                 return fn(*args, **kwargs)
             finally:

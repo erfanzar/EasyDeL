@@ -49,7 +49,17 @@ RAY_READINESS_POLL_S = 5
 
 
 def _wait_for_port(ip: str, port: int, *, attempts: int = 30, interval: float = 2.0) -> bool:
-    """Poll a TCP port until it accepts connections or attempts run out."""
+    """Poll a TCP port until it accepts connections or attempts run out.
+
+    Args:
+        ip: IP address to connect to.
+        port: TCP port number to poll.
+        attempts: Maximum number of connection attempts.
+        interval: Seconds to wait between attempts.
+
+    Returns:
+        True if the port accepts a connection before attempts run out, False otherwise.
+    """
     for _ in range(attempts):
         try:
             with socket.create_connection((ip, port), timeout=1):
@@ -120,7 +130,7 @@ def connect_tpus(
     head_cmd = (
         f"export TMPDIR={ray_tmp_dir} RAY_TMPDIR={ray_tmp_dir}/ray && "
         f"mkdir -p $TMPDIR $RAY_TMPDIR && "
-        f'{ray_bin} stop --force >/dev/null 2>&1 || true && '
+        f"{ray_bin} stop --force >/dev/null 2>&1 || true && "
         f"{ray_bin} start --head "
         f"--port={RAY_HEAD_PORT} "
         f"--resources='{head_resources}' "
@@ -150,7 +160,7 @@ def connect_tpus(
         worker_cmd = (
             f"export TMPDIR={ray_tmp_dir} RAY_TMPDIR={ray_tmp_dir}/ray && "
             f"mkdir -p $TMPDIR $RAY_TMPDIR && "
-            f'{ray_bin} stop --force >/dev/null 2>&1 || true && '
+            f"{ray_bin} stop --force >/dev/null 2>&1 || true && "
             f"{ray_bin} start "
             f"--address={ray_address} "
             f"--resources='{worker_resources}' "
@@ -192,6 +202,15 @@ def disconnect_tpus(
 
     Runs `ray stop --force` on every worker and kills stale Ray processes.
     Works with both gcloud and direct-IP modes.
+
+    Args:
+        tpu: TPU info (gcloud-discovered or built from IPs).
+        ray_bin: Path to the ray binary on TPU hosts.
+        user: SSH user for direct-IP mode (ignored in gcloud mode).
+        ssh_key: SSH key path for direct-IP mode (ignored in gcloud mode).
+
+    Returns:
+        None
     """
     info("Stopping Ray on all hosts...")
     _cleanup_ray(tpu, ray_bin=ray_bin, user=user, ssh_key=ssh_key)
@@ -205,7 +224,20 @@ def _cleanup_ray(
     user: str | None = None,
     ssh_key: str | None = None,
 ) -> None:
-    """Clean Ray processes on all hosts in parallel."""
+    """Clean Ray processes on all hosts in parallel.
+
+    Stops Ray gracefully, kills any remaining Ray-related processes, and
+    checks for lingering ports.
+
+    Args:
+        tpu: TPU info containing host IPs.
+        ray_bin: Path to the ray binary on TPU hosts.
+        user: SSH user for direct-IP mode (ignored in gcloud mode).
+        ssh_key: SSH key path for direct-IP mode (ignored in gcloud mode).
+
+    Returns:
+        None
+    """
     cleanup_cmd = (
         f"timeout 60 {ray_bin} stop --force >/tmp/eray-ray-stop.log 2>&1 || true; "
         "pids=$(ps -eo pid=,args= | awk "
@@ -231,6 +263,14 @@ def _wait_for_cluster(ray_address: str, expected_nodes: int, *, timeout: int = 3
 
     Uses ray.init() + ray.nodes() to check cluster topology. Expects
     `expected_nodes` alive nodes, each with TPU resources.
+
+    Args:
+        ray_address: Ray cluster address (ip:port).
+        expected_nodes: Number of nodes expected to be alive.
+        timeout: Maximum time to wait in seconds.
+
+    Returns:
+        True if all expected nodes are registered before the timeout, False otherwise.
     """
     import ray
 
@@ -266,8 +306,12 @@ def _wait_for_cluster(ray_address: str, expected_nodes: int, *, timeout: int = 3
 def cluster_status(ray_address: str) -> dict:
     """Get cluster status summary.
 
-    Returns a dict with keys: alive_nodes, total_nodes, resources,
-    node_ips, dashboard_url.
+    Args:
+        ray_address: Ray cluster address (ip:port).
+
+    Returns:
+        A dict with keys: alive_nodes, total_nodes, resources, node_ips,
+        dashboard_url.
     """
     import ray
 
@@ -300,7 +344,12 @@ def health_check(ray_address: str, tpu_type: str | None = None) -> list[dict]:
     Uses a Ray remote function to run a check on every host, reporting
     JAX devices and host info.
 
-    Returns a list of per-host health reports.
+    Args:
+        ray_address: Ray cluster address (ip:port).
+        tpu_type: Optional TPU type (e.g. "v4-32") for scheduling.
+
+    Returns:
+        A list of per-host health report dicts.
     """
     import ray
 

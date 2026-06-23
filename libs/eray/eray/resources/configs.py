@@ -80,6 +80,7 @@ def _safe_tpu_runtime_name() -> str:
         name = None
     return name or str(uuid.uuid4())
 
+
 class ComputeResourceConfig(Protocol):
     """Protocol defining the interface for hardware resource configurations.
 
@@ -209,7 +210,7 @@ class ComputeResourceConfig(Protocol):
         Args:
             env_vars (dict[str, str] | None): Dictionary of environment variables
                 to add or override. If None, only kwargs are used.
-            **kwargs: Additional environment variables as keyword arguments.
+            **kwargs (str): Additional environment variables as keyword arguments.
                 These are merged with env_vars if provided.
 
         Returns:
@@ -227,6 +228,7 @@ class ComputeResourceConfig(Protocol):
         new_env_vars = {**current_env_vars, **(env_vars or {}), **kwargs}
         updated_env = RuntimeEnv(**{**self.execution_env, "env_vars": new_env_vars})
         return replace(self, execution_env=updated_env)
+
 
 @dataclass(frozen=True)
 class CpuAcceleratorConfig(ComputeResourceConfig):
@@ -332,8 +334,8 @@ class CpuAcceleratorConfig(ComputeResourceConfig):
         in a separate process for isolation.
 
         Args:
-            remote_fn: The remote function or callable to configure.
-            **extra_envs: Additional environment variables to merge into
+            remote_fn (RemoteFunction | tp.Callable): The remote function or callable to configure.
+            **extra_envs (str): Additional environment variables to merge into
                 the runtime environment.
 
         Returns:
@@ -351,6 +353,7 @@ class CpuAcceleratorConfig(ComputeResourceConfig):
         )
 
         return remote_fn.options(num_cpus=self.core_count, runtime_env=runtime_env)
+
 
 @dataclass(frozen=True)
 class GpuAcceleratorConfig(ComputeResourceConfig):
@@ -482,8 +485,8 @@ class GpuAcceleratorConfig(ComputeResourceConfig):
         in a separate process for isolation.
 
         Args:
-            remote_fn: The remote function or callable to configure.
-            **extra_envs: Additional environment variables to merge into
+            remote_fn (RemoteFunction | tp.Callable): The remote function or callable to configure.
+            **extra_envs (str): Additional environment variables to merge into
                 the runtime environment.
 
         Returns:
@@ -509,6 +512,7 @@ class GpuAcceleratorConfig(ComputeResourceConfig):
             remote_options["accelerator_type"] = self.gpu_model
 
         return remote_fn.options(**remote_options)
+
 
 @dataclass(frozen=True)
 class TpuAcceleratorConfig(ComputeResourceConfig):
@@ -635,7 +639,7 @@ class TpuAcceleratorConfig(ComputeResourceConfig):
         Args:
             remote_fn (RemoteFunction | tp.Callable): The remote function or callable
                 to be configured for TPU execution.
-            **extra_envs: Additional environment variables to merge into the
+            **extra_envs (str): Additional environment variables to merge into the
                 runtime environment.
 
         Returns:
@@ -667,5 +671,6 @@ class TpuAcceleratorConfig(ComputeResourceConfig):
             resources={tpu_name: 1, self.resource_name: self.chips_per_host},
         )
         return remote_fn
+
 
 AcceleratorConfigType: tp.TypeAlias = TpuAcceleratorConfig | GpuAcceleratorConfig | CpuAcceleratorConfig

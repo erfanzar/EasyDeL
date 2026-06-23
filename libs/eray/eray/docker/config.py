@@ -13,7 +13,13 @@
 # limitations under the License.
 
 
-"""Docker container configuration."""
+"""Docker container configuration.
+
+Provides :class:`DockerConfig`, a dataclass that captures all settings needed
+to run a Docker container in a distributed environment, and
+:func:`make_docker_run_command`, which translates that configuration into a
+``docker run`` command-line argument list.
+"""
 
 from __future__ import annotations
 

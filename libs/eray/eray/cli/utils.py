@@ -33,21 +33,41 @@ NC = "\033[0m"
 
 
 def info(msg: str) -> None:
+    """Log an INFO-level message and print to stderr.
+
+    Args:
+        msg: Message text to log and print.
+    """
     logger.info(msg)
     print(f"{BLUE}[INFO]{NC} {msg}", file=sys.stderr)
 
 
 def success(msg: str) -> None:
+    """Log a SUCCESS-level message and print to stderr.
+
+    Args:
+        msg: Message text to log and print.
+    """
     logger.info(msg)
     print(f"{GREEN}[SUCCESS]{NC} {msg}", file=sys.stderr)
 
 
 def warning(msg: str) -> None:
+    """Log a WARNING-level message and print to stderr.
+
+    Args:
+        msg: Message text to log and print.
+    """
     logger.warning(msg)
     print(f"{YELLOW}[WARNING]{NC} {msg}", file=sys.stderr)
 
 
 def error(msg: str) -> None:
+    """Log an ERROR-level message and print to stderr.
+
+    Args:
+        msg: Message text to log and print.
+    """
     logger.error(msg)
     print(f"{RED}[ERROR]{NC} {msg}", file=sys.stderr)
 
@@ -62,7 +82,21 @@ def run_command(
     check: bool = True,
     capture: bool = True,
 ) -> subprocess.CompletedProcess:
-    """Run a subprocess command and return the result."""
+    """Run a subprocess command and return the result.
+
+    Args:
+        cmd: Command and arguments as a list of strings.
+        timeout: Maximum time to wait for the command in seconds.
+        check: If True, raise CalledProcessError on non-zero exit.
+        capture: If True, capture stdout and stderr.
+
+    Returns:
+        A subprocess.CompletedProcess with returncode, stdout, and stderr.
+
+    Raises:
+        subprocess.CalledProcessError: If check is True and the command exits with a non-zero code.
+        subprocess.TimeoutExpired: If the command exceeds the timeout.
+    """
     logger.debug(f"Running: {' '.join(cmd)}")
     return subprocess.run(
         cmd,
@@ -77,19 +111,47 @@ def run_command(
 
 
 def gcloud(args: list[str], *, timeout: int = 300, check: bool = True) -> str:
-    """Run a gcloud command and return stdout."""
+    """Run a gcloud command and return stdout.
+
+    Args:
+        args: gcloud subcommand and arguments as a list of strings.
+        timeout: Maximum time to wait for the command in seconds.
+        check: If True, raise CalledProcessError on non-zero exit.
+
+    Returns:
+        The stripped stdout output from the command.
+
+    Raises:
+        subprocess.CalledProcessError: If check is True and gcloud exits with a non-zero code.
+    """
     result = run_command(["gcloud", *args], timeout=timeout, check=check)
     return result.stdout.strip()
 
 
 def gcloud_json(args: list[str], *, timeout: int = 300) -> dict | list:
-    """Run a gcloud command and parse JSON output."""
+    """Run a gcloud command and parse JSON output.
+
+    Args:
+        args: gcloud subcommand and arguments as a list of strings.
+        timeout: Maximum time to wait for the command in seconds.
+
+    Returns:
+        Parsed JSON output as a dict or list.
+
+    Raises:
+        subprocess.CalledProcessError: If gcloud exits with a non-zero code.
+        json.JSONDecodeError: If the output is not valid JSON.
+    """
     result = run_command(["gcloud", *args, "--format=json"], timeout=timeout, check=True)
     return json.loads(result.stdout)
 
 
 def check_gcloud() -> bool:
-    """Verify gcloud CLI is installed and authenticated."""
+    """Verify gcloud CLI is installed and authenticated.
+
+    Returns:
+        True if gcloud is available and responds to --version, False otherwise.
+    """
     try:
         run_command(["gcloud", "--version"], timeout=10, capture=True)
     except (FileNotFoundError, subprocess.CalledProcessError):
@@ -98,7 +160,11 @@ def check_gcloud() -> bool:
 
 
 def get_active_account() -> str | None:
-    """Get the currently active gcloud account."""
+    """Get the currently active gcloud account.
+
+    Returns:
+        The active gcloud account email, or None if not set.
+    """
     try:
         result = gcloud(["config", "get-value", "account"], check=False)
         if result and result != "(unset)":
@@ -109,7 +175,14 @@ def get_active_account() -> str | None:
 
 
 def _metadata_value(path: str) -> str | None:
-    """Query GCE metadata server (works inside TPU/VM instances)."""
+    """Query GCE metadata server (works inside TPU/VM instances).
+
+    Args:
+        path: Metadata path to query (e.g. "project/project-id").
+
+    Returns:
+        The metadata value as a string, or None if unavailable.
+    """
     try:
         result = run_command(
             [
@@ -129,7 +202,11 @@ def _metadata_value(path: str) -> str | None:
 
 
 def detect_project() -> str | None:
-    """Detect GCP project from metadata server, then gcloud config."""
+    """Detect GCP project from metadata server, then gcloud config.
+
+    Returns:
+        The GCP project ID, or None if it cannot be determined.
+    """
     proj = _metadata_value("project/project-id")
     if proj:
         return proj
@@ -143,7 +220,11 @@ def detect_project() -> str | None:
 
 
 def detect_zone() -> str | None:
-    """Detect GCP zone from metadata server, then gcloud config."""
+    """Detect GCP zone from metadata server, then gcloud config.
+
+    Returns:
+        The GCP zone name, or None if it cannot be determined.
+    """
     zone_raw = _metadata_value("instance/zone")
     if zone_raw:
         return zone_raw.split("/")[-1]
@@ -240,6 +321,17 @@ def discover_tpu(name: str, project: str, zone: str) -> TpuInfo:
 
     Uses `gcloud compute tpus tpu-vm describe` to get the accelerator
     type, internal IPs, and worker count.
+
+    Args:
+        name: TPU resource name.
+        project: GCP project ID.
+        zone: GCP zone.
+
+    Returns:
+        A TpuInfo populated from the gcloud response.
+
+    Raises:
+        ValueError: If the gcloud response is malformed or no internal IPs are found.
     """
     info(f"Describing TPU {name} in {project}/{zone}...")
     raw = gcloud_json(
@@ -283,6 +375,13 @@ def list_tpus_in_zone(project: str, zone: str) -> list[dict]:
 
     Returns raw gcloud dicts with keys: name, state, acceleratorType,
     health, networkEndpoints, etc.
+
+    Args:
+        project: GCP project ID.
+        zone: GCP zone.
+
+    Returns:
+        A list of raw gcloud dicts describing each TPU.
     """
     raw = gcloud_json(
         [
@@ -306,6 +405,12 @@ def list_tpus_in_project(project: str) -> list[dict]:
 
     Adds a "zone" key to each TPU dict since gcloud --filter doesn't
     include zone by default when listing all zones.
+
+    Args:
+        project: GCP project ID.
+
+    Returns:
+        A list of enriched TPU dicts, each with a "zone" key.
     """
     raw = gcloud_json(
         [
@@ -349,6 +454,15 @@ def ssh_tpu_worker(
     """Run a command on a specific TPU worker via gcloud ssh.
 
     Only works when tpu.is_gcloud_managed is True.
+
+    Args:
+        tpu: TpuInfo with gcloud-managed metadata.
+        worker: Worker index to run the command on.
+        command: Shell command to execute.
+        timeout: Command timeout in seconds.
+
+    Returns:
+        A subprocess.CompletedProcess with the command result.
     """
     cmd = [
         "gcloud",
@@ -388,6 +502,9 @@ def ssh_to_ip(
         user: SSH user (default: current user).
         ssh_key: Path to SSH private key.
         port: SSH port (default 22).
+
+    Returns:
+        A subprocess.CompletedProcess with the command result.
     """
     target = f"{user}@{ip}" if user else ip
     cmd = ["ssh", "-o", "StrictHostKeyChecking=accept-new", "-p", str(port)]
@@ -409,6 +526,17 @@ def run_on_host(
     """Run a command on a specific host.
 
     Dispatches to gcloud SSH or direct SSH depending on tpu.is_gcloud_managed.
+
+    Args:
+        tpu: TpuInfo with host metadata.
+        host_index: Index of the host in tpu.internal_ips.
+        command: Shell command to execute.
+        timeout: Command timeout in seconds.
+        user: SSH user for direct-IP mode.
+        ssh_key: SSH key path for direct-IP mode.
+
+    Returns:
+        A subprocess.CompletedProcess with the command result.
     """
     if tpu.is_gcloud_managed:
         return ssh_tpu_worker(tpu, host_index, command, timeout=timeout)
@@ -433,7 +561,16 @@ def run_on_all_hosts(
     """Run a command on ALL hosts in parallel.
 
     Dispatches to gcloud SSH or direct SSH per host.
-    Returns a list of (host_index, result) tuples sorted by index.
+
+    Args:
+        tpu: TpuInfo with host metadata.
+        command: Shell command to execute.
+        timeout: Command timeout in seconds.
+        user: SSH user for direct-IP mode.
+        ssh_key: SSH key path for direct-IP mode.
+
+    Returns:
+        A list of (host_index, subprocess.CompletedProcess) tuples sorted by index.
     """
     import concurrent.futures
 
@@ -460,6 +597,13 @@ def build_ray_resource_flags(tpu: TpuInfo, is_head: bool) -> str:
     Mirrors the resource allocation from tpu_setup.sh:
       Head:  TPU, TPU-{version}, TPU-{version}-{slice}-head, accelerator_type:TPU-{VERSION}, head-node
       Worker: TPU, TPU-{version}, accelerator_type:TPU-{VERSION}
+
+    Args:
+        tpu: TpuInfo with accelerator metadata.
+        is_head: True if building resources for the head node.
+
+    Returns:
+        A JSON string of resource flags for the Ray --resources argument.
     """
     version = tpu.tpu_version
     slice_size = tpu.slice_size

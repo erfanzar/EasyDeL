@@ -13,7 +13,18 @@
 # limitations under the License.
 
 
-"""Docker execution on Ray-managed resources."""
+"""Docker execution on Ray-managed resources.
+
+This module provides helpers for running Docker containers on Ray-managed
+accelerator pods and slices. Functions include single-pod execution,
+multi-slice orchestration, asynchronous remote tasks, and image build/push.
+
+Contents:
+    run_docker_on_pod: Run a Docker container on a single TPU/GPU pod.
+    run_docker_multislice: Run Docker containers across multiple slices.
+    build_and_push_docker_image: Build a Docker image and optionally push it.
+    run_docker_async: Ray remote task for asynchronous container execution.
+"""
 
 from __future__ import annotations
 
@@ -30,6 +41,7 @@ from ..resources.configs import AcceleratorConfigType
 from .config import DockerConfig, make_docker_run_command
 
 logger = logging.getLogger("ray")
+
 
 def run_docker_on_pod(
     docker_config: DockerConfig,
@@ -59,9 +71,9 @@ def run_docker_on_pod(
         RuntimeError: If the Docker container exits with a non-zero status.
 
     Example:
-        >>> from eformer.executor.ray import GpuAcceleratorConfig
+        >>> from eray import GpuAcceleratorConfig
         >>>
-        >>> gpu_config = GpuAcceleratorConfig(count=2, type="v100")
+        >>> gpu_config = GpuAcceleratorConfig(count=2, gpu_model="v100")
         >>> output = run_docker_on_pod(
         ...     docker_config,
         ...     gpu_config,
@@ -70,7 +82,11 @@ def run_docker_on_pod(
     """
 
     def run_docker() -> tuple[int, str, str]:
-        """Internal function to run Docker container.
+        """Run the Docker container using the enclosing configuration.
+
+        Closes over `docker_config` and `capture_output` from the outer scope.
+        Builds the ``docker run`` command via :func:`make_docker_run_command`,
+        executes it with ``subprocess.run``, and returns the process result.
 
         Returns:
             tuple[int, str, str]: Tuple of (return_code, stdout, stderr).
@@ -141,9 +157,9 @@ def run_docker_multislice(
         RuntimeError: If any Docker container exits with a non-zero status.
 
     Example:
-        >>> from eformer.executor.ray import TpuAcceleratorConfig
+        >>> from eray import TpuAcceleratorConfig
         >>>
-        >>> tpu_config = TpuAcceleratorConfig(type="v4-32", num_slices=4)
+        >>> tpu_config = TpuAcceleratorConfig(tpu_version="v4-32", pod_count=4)
         >>> outputs = run_docker_multislice(
         ...     docker_config,
         ...     tpu_config,
@@ -154,7 +170,18 @@ def run_docker_multislice(
     executor_kwargs.setdefault("flatten", True)
 
     def run_docker_with_slice_env() -> tuple[int, str, str]:
-        """Run Docker with slice-specific environment variables."""
+        """Run Docker with slice-specific environment variables.
+
+        Closes over `docker_config` and `capture_output` from the outer scope.
+        Reads ``EXECUTOR_CALL_SLICE`` and ``EXECUTOR_CALL_INDEX`` from the
+        process environment, creates a copy of ``docker_config`` with those
+        values injected into the container environment, builds the
+        ``docker run`` command, executes it with ``subprocess.run``, and
+        returns the process result.
+
+        Returns:
+            tuple[int, str, str]: Tuple of (return_code, stdout, stderr).
+        """
         slice_id = os.environ.get("EXECUTOR_CALL_SLICE", "0")
         host_id = os.environ.get("EXECUTOR_CALL_INDEX", "0")
         slice_config = DockerConfig(
@@ -242,7 +269,9 @@ def build_and_push_docker_image(
             (e.g., "gcr.io/my-project/my-app:v1.0").
 
     Raises:
-        RuntimeError: If Docker build or push fails.
+        subprocess.CalledProcessError: If the Docker build or push command
+            exits with a non-zero status. ``subprocess.run`` is called with
+            ``check=True``, which raises this exception on failure.
 
     Example:
         >>> image = build_and_push_docker_image(

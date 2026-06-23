@@ -13,7 +13,14 @@
 # limitations under the License.
 
 
-"""Sentinel types and reference wrappers."""
+"""Sentinel types and reference wrappers.
+
+This module provides a wrapper around Ray ObjectRefs to prevent automatic
+dereferencing, and a sentinel class for signaling completion states.
+
+Attributes:
+    DONE: Global singleton instance of DoneSentinel used to signal completion.
+"""
 
 from __future__ import annotations
 
@@ -88,18 +95,3 @@ class DoneSentinel:
 
 
 DONE = DoneSentinel()
-"""Global instance of DoneSentinel for signaling completion.
-
-This singleton instance should be used throughout the codebase to maintain
-consistency when checking for completion states.
-
-Example:
-    >>> queue.put(result)
-    >>> queue.put(DONE)
-    >>>
-    >>> while True:
-    ...     item = queue.get()
-    ...     if item is DONE:
-    ...         break
-    ...     process(item)
-"""

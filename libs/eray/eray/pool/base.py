@@ -32,9 +32,10 @@ logger = logging.getLogger("ray")
 
 HEALTH_CHECK_TIMEOUT_S = 60
 SLICE_ACTOR_START_TIMEOUT_S = 4 * 60 * 60
-SCALE_POLL_S = int(os.getenv("EFORMER_SCALE_POLL_S", "30"))
-SCALE_ADD_TIMEOUT_S = int(os.getenv("EFORMER_SCALE_ADD_TIMEOUT_S", "604800"))
+SCALE_POLL_S = int(os.getenv("ERAY_SCALE_POLL", "30"))
+SCALE_ADD_TIMEOUT_S = int(os.getenv("ERAY_SCALE_ADD_TIMEOUT", "604800"))
 ActorInfoT = TypeVar("ActorInfoT")
+
 
 class InsufficientSlicesError(RuntimeError):
     """Raised when the requested number of TPU slices cannot be allocated.
@@ -58,6 +59,7 @@ class InsufficientSlicesError(RuntimeError):
 
     pass
 
+
 @dataclass(frozen=True)
 class ActorPoolMember(Generic[ActorInfoT]):
     """Container for an actor handle and its associated metadata.
@@ -69,6 +71,7 @@ class ActorPoolMember(Generic[ActorInfoT]):
 
     actor: ActorHandle
     actor_info: ActorInfoT
+
 
 class ResourcePoolManager(Generic[ActorInfoT]):
     """Abstract base class for managing pools of Ray actors.

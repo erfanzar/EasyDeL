@@ -357,7 +357,7 @@ def _patch_transformers_init_weights_tie_signature() -> None:
 def _patch_eformer_exception_serialization() -> None:
     """Replace non-picklable remote exceptions with a safe fallback."""
     try:
-        from eformer.executor.ray.types import ExceptionInfo as _ExceptionInfo
+        from eray import ExceptionInfo as _ExceptionInfo
     except Exception:
         return
 

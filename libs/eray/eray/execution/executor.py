@@ -67,6 +67,7 @@ def resolve_maybe_refs(items):
         return ray.get(items)
     return items
 
+
 class RayExecutor:
     """Core executor for Ray-based distributed workloads.
 
@@ -115,7 +116,7 @@ class RayExecutor:
             **kwargs: Additional keyword arguments passed to the remote function.
 
         Returns:
-            ray.JobStatus: actual result.
+            JobStatus: The execution result status.
 
         Raises:
             ValueError: If pod_count in accelerator_config is not 1,
@@ -281,7 +282,7 @@ class RayExecutor:
             coord_ip = slice_infos[0].ip_address
             if not coord_ip:
                 raise RuntimeError("Could not determine coordinator IP.")
-            port = int(os.getenv("COORD_PORT", str(MEGASCALE_DEFAULT_PORT)))
+            port = int(os.getenv("ERAY_COORD_PORT", str(MEGASCALE_DEFAULT_PORT)))
             base_env = dict(
                 TPU_NAME=os.getenv("TPU_NAME", "EMPTY"),
                 TPU_VERSION=accelerator_config.tpu_version,
@@ -611,7 +612,7 @@ class RayExecutor:
                     f"Not enough TPU slices (likely preemption/capacity). "
                     f"Preemption count: {num_preemptions}. Error: {e}"
                 )
-                time.sleep(int(os.getenv("EFORMER_SCALE_RETRY_SLEEP_S", "60")))
+                time.sleep(int(os.getenv("ERAY_SCALE_RETRY_SLEEP", "60")))
                 continue
             except Exception as e:
                 problem = e
@@ -682,6 +683,7 @@ class RayExecutor:
 
     autoscale_execute = autoscale_execute
     autoscale_execute_resumable = autoscale_execute_resumable
+
 
 def _build_multislice_envs(
     slice_infos: list[SliceInfo],

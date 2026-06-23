@@ -56,8 +56,26 @@ def execute_resumable(accelerator_config: AcceleratorConfigType):
     """
 
     def decorator(remote_fn: RemoteFunction):
+        """Wrap a Ray remote function for fault-tolerant single-pod execution.
+
+        Args:
+            remote_fn (RemoteFunction): The Ray remote function to wrap.
+
+        Returns:
+            Callable: A wrapper function that delegates to RayExecutor.execute_resumable.
+        """
+
         @functools.wraps(remote_fn)
         def wrapper(**kwargs):
+            """Execute the wrapped remote function with automatic retry.
+
+            Args:
+                **kwargs: Keyword arguments passed through to the remote function
+                    and to RayExecutor.execute_resumable.
+
+            Returns:
+                Any: The result from the remote function execution.
+            """
             return RayExecutor.execute_resumable(
                 remote_fn=remote_fn,
                 accelerator_config=accelerator_config,
@@ -103,8 +121,26 @@ def execute(accelerator_config: AcceleratorConfigType):
     """
 
     def decorator(remote_fn: RemoteFunction):
+        """Wrap a Ray remote function for single-pod execution.
+
+        Args:
+            remote_fn (RemoteFunction): The Ray remote function to wrap.
+
+        Returns:
+            Callable: A wrapper function that delegates to RayExecutor.execute.
+        """
+
         @functools.wraps(remote_fn)
         def wrapper(**kwargs):
+            """Execute the wrapped remote function without retry.
+
+            Args:
+                **kwargs: Keyword arguments passed through to the remote function
+                    and to RayExecutor.execute.
+
+            Returns:
+                Any: The result from the remote function execution.
+            """
             return RayExecutor.execute(
                 remote_fn=remote_fn,
                 accelerator_config=accelerator_config,
@@ -149,8 +185,26 @@ def autoscale_execute(accelerator_config: AcceleratorConfigType):
     """
 
     def decorator(remote_fn: RemoteFunction):
+        """Wrap a Ray remote function for multi-slice execution.
+
+        Args:
+            remote_fn (RemoteFunction): The Ray remote function to wrap.
+
+        Returns:
+            Callable: A wrapper function that delegates to RayExecutor.autoscale_execute.
+        """
+
         @functools.wraps(remote_fn)
         def wrapper(**kwargs):
+            """Execute the wrapped remote function across multiple slices.
+
+            Args:
+                **kwargs: Keyword arguments passed through to the remote function
+                    and to RayExecutor.autoscale_execute.
+
+            Returns:
+                list[Any]: Results from all slices.
+            """
             return RayExecutor.autoscale_execute(
                 remote_fn=remote_fn,
                 accelerator_config=accelerator_config,
@@ -196,8 +250,26 @@ def autoscale_execute_resumable(accelerator_config: AcceleratorConfigType):
     """
 
     def decorator(remote_fn: RemoteFunction):
+        """Wrap a Ray remote function for fault-tolerant multi-slice execution.
+
+        Args:
+            remote_fn (RemoteFunction): The Ray remote function to wrap.
+
+        Returns:
+            Callable: A wrapper function that delegates to RayExecutor.autoscale_execute_resumable.
+        """
+
         @functools.wraps(remote_fn)
         def wrapper(**kwargs):
+            """Execute the wrapped remote function across multiple slices with retry.
+
+            Args:
+                **kwargs: Keyword arguments passed through to the remote function
+                    and to RayExecutor.autoscale_execute_resumable.
+
+            Returns:
+                list[Any]: Results from all slices.
+            """
             return RayExecutor.autoscale_execute_resumable(
                 remote_fn=remote_fn,
                 accelerator_config=accelerator_config,

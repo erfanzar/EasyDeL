@@ -67,6 +67,17 @@ class TpuRemoteManager:
         runtime_env: dict | None = None,
         coord_port: int = 8081,
     ):
+        """Initialize a TpuRemoteManager.
+
+        Args:
+            tpu_version (str): TPU version string (e.g., 'v4', 'v5p').
+            pod_count (int): Number of TPU pods/slices to use.
+            base_env (dict[str, str] | None): Base environment variables for all workers.
+                Defaults to None.
+            runtime_env (dict | None): Ray runtime environment configuration.
+                Defaults to None.
+            coord_port (int): Port for MegaScale coordinator. Defaults to 8081.
+        """
         self.tpu_version = tpu_version
         self.pod_count = int(pod_count)
         self.base_env = dict(base_env or {})
@@ -251,6 +262,19 @@ class TpuRemoteManager:
         self.ensure()
 
         def _class_method_entry(cls_obj, i_args, i_kwargs, mname, c_args, c_kwargs):
+            """Instantiate a class and call a method on it.
+
+            Args:
+                cls_obj (type): The class to instantiate.
+                i_args (tuple): Positional arguments for class initialization.
+                i_kwargs (dict): Keyword arguments for class initialization.
+                mname (str): Name of the method to call.
+                c_args (tuple): Positional arguments for the method call.
+                c_kwargs (dict): Keyword arguments for the method call.
+
+            Returns:
+                Any: The result of the method call.
+            """
             obj = cls_obj(*i_args, **i_kwargs)
             return getattr(obj, mname)(*c_args, **c_kwargs)
 
@@ -285,7 +309,7 @@ class _BoundRemoteClass:
     both synchronous execution (returning values) and asynchronous execution
     (returning Ray ObjectRefs).
 
-    This class is created by the tpu_remote decorator when applied to classes.
+    This class is created by the device_remote decorator when applied to classes.
 
     Attributes:
         _manager: TpuRemoteManager instance for resource management
@@ -296,6 +320,15 @@ class _BoundRemoteClass:
     """
 
     def __init__(self, manager: TpuRemoteManager, cls: type, init_args: tuple, init_kwargs: dict, flatten: bool):
+        """Initialize a bound remote class handle.
+
+        Args:
+            manager (TpuRemoteManager): Manager for TPU resource management.
+            cls (type): The class object to instantiate on remote hosts.
+            init_args (tuple): Positional arguments for class initialization.
+            init_kwargs (dict): Keyword arguments for class initialization.
+            flatten (bool): Whether to flatten results from multiple hosts.
+        """
         self._manager = manager
         self._cls = cls
         self._init_args = init_args
@@ -303,7 +336,27 @@ class _BoundRemoteClass:
         self._flatten = flatten
 
     def __getattr__(self, name: str):
+        """Return a callable proxy for the named method.
+
+        Args:
+            name (str): Name of the method to proxy.
+
+        Returns:
+            Callable: A function that forwards calls to the named method on
+                remote hosts, with a `.remote` attribute for async execution.
+        """
+
         def _call_method(*args, **kwargs):
+            """Execute the named method on remote hosts and return results.
+
+            Args:
+                *args: Positional arguments for the method call.
+                **kwargs: Keyword arguments for the method call.
+
+            Returns:
+                Any: Results from the method execution, flattened or nested
+                    depending on the _flatten setting.
+            """
             return self._manager.run_class_method(
                 self._cls,
                 self._init_args,
@@ -318,8 +371,40 @@ class _BoundRemoteClass:
         return _call_method
 
     def _remote(self, name: str):
+        """Return an async remote implementation for the named method.
+
+        Args:
+            name (str): Name of the method to execute remotely.
+
+        Returns:
+            Callable: A function that returns Ray ObjectRefs when called.
+        """
+
         def _remote_impl(*args, **kwargs):
+            """Execute the named method remotely and return ObjectRefs.
+
+            Args:
+                *args: Positional arguments for the method call.
+                **kwargs: Keyword arguments for the method call.
+
+            Returns:
+                list: Ray ObjectRefs or nested lists of ObjectRefs.
+            """
+
             def _class_method_entry(cls_obj, i_args, i_kwargs, mname, c_args, c_kwargs):
+                """Instantiate a class and call a method on it.
+
+                Args:
+                    cls_obj (type): The class to instantiate.
+                    i_args (tuple): Positional arguments for class initialization.
+                    i_kwargs (dict): Keyword arguments for class initialization.
+                    mname (str): Name of the method to call.
+                    c_args (tuple): Positional arguments for the method call.
+                    c_kwargs (dict): Keyword arguments for the method call.
+
+                Returns:
+                    Any: The result of the method call.
+                """
                 obj = cls_obj(*i_args, **i_kwargs)
                 return getattr(obj, mname)(*c_args, **c_kwargs)
 
@@ -359,7 +444,7 @@ class _BoundRemoteClass:
 class _RemoteClassWrapper:
     """Wrapper that converts a regular class into a TPU-remote class.
 
-    Internal class used by the tpu_remote decorator to wrap classes for
+    Internal class used by the device_remote decorator to wrap classes for
     remote execution. When the wrapped class is instantiated, it returns
     a _BoundRemoteClass that broadcasts method calls to TPU hosts.
 
@@ -369,12 +454,36 @@ class _RemoteClassWrapper:
     """
 
     def __init__(self, manager: TpuRemoteManager, flatten: bool):
+        """Initialize a remote class wrapper.
+
+        Args:
+            manager (TpuRemoteManager): Manager for TPU resource management.
+            flatten (bool): Whether to flatten results from multiple hosts.
+        """
         self._manager = manager
         self._flatten = flatten
 
     def __call__(self, cls: type):
+        """Wrap a class for TPU-remote execution.
+
+        Args:
+            cls (type): The class to wrap.
+
+        Returns:
+            Callable: A constructor function that returns a _BoundRemoteClass.
+        """
+
         @functools.wraps(cls)
         def ctor(*args, **kwargs):
+            """Create a _BoundRemoteClass instance.
+
+            Args:
+                *args: Positional arguments for class initialization.
+                **kwargs: Keyword arguments for class initialization.
+
+            Returns:
+                _BoundRemoteClass: Bound remote class handle for method execution.
+            """
             return _BoundRemoteClass(self._manager, cls, args, kwargs, self._flatten)
 
         return ctor
@@ -383,7 +492,7 @@ class _RemoteClassWrapper:
 class _RemoteFunctionWrapper:
     """Wrapper that converts a regular function into a TPU-remote function.
 
-    Internal class used by the tpu_remote decorator to wrap functions for
+    Internal class used by the device_remote decorator to wrap functions for
     remote execution. The wrapped function broadcasts calls to all TPU hosts
     and supports both synchronous and asynchronous execution modes.
 
@@ -393,15 +502,50 @@ class _RemoteFunctionWrapper:
     """
 
     def __init__(self, manager: TpuRemoteManager, flatten: bool):
+        """Initialize a remote function wrapper.
+
+        Args:
+            manager (TpuRemoteManager): Manager for TPU resource management.
+            flatten (bool): Whether to flatten results from multiple hosts.
+        """
         self._manager = manager
         self._flatten = flatten
 
     def __call__(self, fn: Callable):
+        """Wrap a function for TPU-remote execution.
+
+        Args:
+            fn (Callable): The function to wrap.
+
+        Returns:
+            Callable: A wrapped function that executes on TPU hosts,
+                with a `.remote` attribute for async execution.
+        """
+
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
+            """Execute the wrapped function on remote hosts and return results.
+
+            Args:
+                *args: Positional arguments for the function.
+                **kwargs: Keyword arguments for the function.
+
+            Returns:
+                Any: Results from function execution, flattened or nested
+                    depending on the _flatten setting.
+            """
             return self._manager.run_function(fn, *args, flatten=self._flatten, **kwargs)
 
         def _remote(*args, **kwargs):
+            """Execute the wrapped function remotely and return ObjectRefs.
+
+            Args:
+                *args: Positional arguments for the function.
+                **kwargs: Keyword arguments for the function.
+
+            Returns:
+                list: Ray ObjectRefs or nested lists of ObjectRefs.
+            """
             self._manager.ensure()
             outer_refs_per_slice = []
             for sl, hosts in enumerate(self._manager._host_handles_by_slice):
@@ -458,7 +602,7 @@ def device_remote(*, accelerator_config: TpuAcceleratorConfig, flatten: bool = T
         >>> results = ray.get(refs)
 
     Example for classes:
-        >>> @tpu_remote(accelerator_config=tpu_config)
+        >>> @device_remote(accelerator_config=tpu_config)
         >>> class Model:
         ...     def __init__(self, config):
         ...         self.config = config
@@ -490,6 +634,17 @@ def device_remote(*, accelerator_config: TpuAcceleratorConfig, flatten: bool = T
     )
 
     def decorator(obj: Callable | type):
+        """Wrap a function or class for TPU-remote execution.
+
+        Args:
+            obj (Callable | type): The function or class to wrap.
+
+        Returns:
+            _BoundRemoteClass | Callable: Wrapped remote function or class.
+
+        Raises:
+            TypeError: If obj is not a function or class.
+        """
         if isinstance(obj, type):
             return _RemoteClassWrapper(mgr, flatten)(obj)
         elif callable(obj):
