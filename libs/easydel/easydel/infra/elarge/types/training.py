@@ -1329,6 +1329,8 @@ class DistillationTrainerCfg(BaseTrainerCfg):
             information about class relationships.
         alpha: Weight for distillation loss relative to task loss.
             alpha * distillation_loss + (1 - alpha) * task_loss.
+        cakld_gamma: Optional Confidence-Aware KL coefficient for
+            CAKLD-style blending of reverse and forward KL.
         logits_chunk_size: Optional sequence-axis chunk size used when
             running the LM head chunk-by-chunk to bound peak memory.
             ``None`` materialises the full ``[B, L, V]`` logit tensor.
@@ -1383,6 +1385,7 @@ class DistillationTrainerCfg(BaseTrainerCfg):
     attention_layers: NotRequired[tuple[int, ...] | None]
     attention_normalize: NotRequired[bool]
     beta: NotRequired[float | None]
+    cakld_gamma: NotRequired[float | None]
     disable_dropout: NotRequired[bool]
     generation_batch_size: NotRequired[int | None]
     lmbda: NotRequired[float]
@@ -2354,6 +2357,7 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "trainer_prefix": "Distillation",
         "temperature": 2.0,
         "alpha": 0.9,
+        "cakld_gamma": None,
         "logits_chunk_size": None,
     },
     "on_policy_distillation": {
