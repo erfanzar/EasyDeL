@@ -37,7 +37,8 @@ The caller creates one generator per microbatch (e.g. ``np.random.default_rng(se
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from itertools import pairwise
 
 import numpy as np
 
@@ -89,13 +90,21 @@ class PoSEConfig:
             raise ValueError(f"pose.max_chunk_frac must be in [0, 1], got {self.max_chunk_frac}.")
         if self.min_chunk_frac > self.max_chunk_frac:
             raise ValueError(
-                f"pose.min_chunk_frac must be <= pose.max_chunk_frac, "
-                f"got {self.min_chunk_frac} > {self.max_chunk_frac}."
+                f"pose.min_chunk_frac must be <= pose.max_chunk_frac, got {self.min_chunk_frac} > {self.max_chunk_frac}."
             )
         if self.enabled and self.target_max_pos <= 1:
-            raise ValueError(
-                f"pose.target_max_pos must be > 1 when pose.enabled=true, got {self.target_max_pos}."
-            )
+            raise ValueError(f"pose.target_max_pos must be > 1 when pose.enabled=true, got {self.target_max_pos}.")
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-serializable representation for TrainingArguments persistence."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, object] | "PoSEConfig") -> "PoSEConfig":
+        """Build a PoSE config from a serialized dictionary."""
+        if isinstance(data, cls):
+            return data
+        return cls(**data)
 
 
 def current_pose_probability(config: PoSEConfig, step: int) -> float:
@@ -206,7 +215,7 @@ def _sample_segment_ranges(
         reset_points = (np.flatnonzero(positions[sample_idx, 1:valid_end] == 0) + 1).tolist()
         boundaries = [0, *reset_points, valid_end]
 
-    return list(zip(boundaries[:-1], boundaries[1:], strict=False))
+    return list(pairwise(boundaries))
 
 
 def apply_pose_to_positions(
@@ -264,8 +273,10 @@ def apply_pose_to_positions(
                 continue
             # text-only PoSE: skip documents that contain image placeholder tokens (their
             # positions are multimodal/non-contiguous) — before drawing, so RNG stays aligned.
-            if image_token_id is not None and tokens is not None and bool(
-                np.any(tokens[sample_idx, start:end] == image_token_id)
+            if (
+                image_token_id is not None
+                and tokens is not None
+                and bool(np.any(tokens[sample_idx, start:end] == image_token_id))
             ):
                 continue
             if rng.random() >= p_pose:  # per-document Bernoulli(p)
@@ -357,8 +368,15 @@ def apply_pose_to_batch(
         seq_lens, seq_lens_num = _seq_lens_from_segment_ids(np.asarray(batch["segment_ids"]))
 
     common = dict(
-        config=config, step=step, tokens=tokens, labels=labels, pad_id=pad_id, ignore_index=ignore_index,
-        seq_lens=seq_lens, seq_lens_num=seq_lens_num, image_token_id=image_token_id,
+        config=config,
+        step=step,
+        tokens=tokens,
+        labels=labels,
+        pad_id=pad_id,
+        ignore_index=ignore_index,
+        seq_lens=seq_lens,
+        seq_lens_num=seq_lens_num,
+        image_token_id=image_token_id,
     )
     if positions.ndim == 3:  # mRoPE [axes, B, S] — identical skip on every axis
         for axis in range(positions.shape[0]):

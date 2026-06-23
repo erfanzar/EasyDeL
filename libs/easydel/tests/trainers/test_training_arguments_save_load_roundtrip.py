@@ -35,6 +35,7 @@ from jax.sharding import PartitionSpec
 from easydel.infra.etils import EasyDeLOptimizers, EasyDeLSchedulers
 from easydel.infra.loss_utils import LossConfig
 from easydel.trainers.metrics import LogWatcher
+from easydel.trainers.pose import PoSEConfig
 from easydel.trainers.training_configurations import TrainingArguments
 
 
@@ -92,6 +93,7 @@ def _full_training_arguments_kwargs() -> dict[str, Any]:
         "init_tx": False,
         "train_on_inputs": False,
         "aux_loss_enabled": True,
+        "pose": PoSEConfig(enabled=True, p_pose=0.1, max_p_pose=0.5, warmup_steps=100, target_max_pos=16384),
         "training_time_limit": "2h30m",
         "step_start_point": 100,
         "force_step_start_point": True,
@@ -258,6 +260,16 @@ def test_save_load_preserves_loss_config(tmp_path, full_args):
     # reconstructed loss_config is also a LossConfig (re-wrapped in __post_init__).
     assert isinstance(loaded.loss_config, LossConfig)
     assert loaded.loss_config.to_dict() == full_args.loss_config.to_dict()
+
+
+def test_save_load_preserves_pose_config(tmp_path, full_args):
+    """``pose`` (PoSEConfig) survives the save/load cycle as a real config object."""
+    json_path = tmp_path / "pose.json"
+    full_args.save_arguments(json_path)
+    loaded = TrainingArguments.load_arguments(json_path)
+
+    assert isinstance(loaded.pose, PoSEConfig)
+    assert loaded.pose.to_dict() == full_args.pose.to_dict()
 
 
 def test_save_load_preserves_benchmarks_list(tmp_path, full_args):
