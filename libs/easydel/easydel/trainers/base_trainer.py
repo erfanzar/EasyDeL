@@ -84,6 +84,7 @@ from easydel.infra.factory import TaskType
 from easydel.infra.loss_utils import LossMetrics
 from easydel.infra.sharding import replicated_named_sharding
 from easydel.infra.utils import CompilationTracker
+from easydel.trainers.pose import apply_pose_to_batch, validate_pose_target_max_pos
 from easydel.utils import Timers, is_remote_path, readme_generator
 from easydel.utils.lazy_import import is_package_available
 from easydel.utils.traversals import specs_to_name_sharding
@@ -516,6 +517,7 @@ class BaseTrainer(BaseTrainerProtocol):
         self.data_collator = data_collator
         self.finetune = finetune
         self.processing_class = processing_class
+        self._pose_image_token_id, self._pose_pad_id = self._setup_pose()
 
         if self.data_collator is None and getattr(self.arguments, "use_data_collator", True):
             base_collator = self.create_collect_function(
@@ -2471,6 +2473,55 @@ class BaseTrainer(BaseTrainerProtocol):
         ):
             return self.data_collator(batch)
         return batch
+
+    def _setup_pose(self) -> tuple[int | None, int | None]:
+        """Validate PoSE config against the model RoPE table and resolve image/pad ids (once, at init).
+
+        Returns ``(image_token_id, pad_id)`` for the per-microbatch hook. ``pad_id`` is the
+        tokenizer pad id used to strip the padded tail. Fails loud if ``target_max_pos`` exceeds
+        the model's RoPE frequency-table length, or if a multimodal model (``vision_config``
+        present) exposes no ``image_token_id`` to protect image docs from PoSE.
+        """
+        pose = self.arguments.pose
+        if not pose.enabled:
+            return None, None
+        who = type(self._model).__name__
+        config = self._model.config
+        validate_pose_target_max_pos(pose, model_max_freq_pos=config.granted_freq_max_position_embedding, who=who)
+        # Resolve the image placeholder id so image docs can be excluded (Option A). Use
+        # vision_config as the multimodal discriminator: a VL model with no image_token_id would
+        # otherwise silently PoSE its image docs and corrupt mRoPE — fail loud instead.
+        if hasattr(config, "image_token_id"):
+            image_token_id = config.image_token_id
+        elif hasattr(config, "vision_config"):
+            raise ValueError(
+                f"pose.enabled on multimodal {who} but its config exposes no image_token_id to "
+                "exclude image documents from PoSE (would corrupt mRoPE)."
+            )
+        else:
+            image_token_id = None  # genuinely text-only model
+        processor = self.processing_class
+        tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        pad_id = tokenizer.pad_token_id  # tokenizers/processors define this (value may be None = no pad)
+        return image_token_id, pad_id
+
+    def _apply_pose_to_batch(self, batch: tp.Any, step: int) -> tp.Any:
+        """Host-side, pre-forward PoSE on a collated batch's ``position_ids`` (text-only; no-op if disabled).
+
+        Runs once per microbatch before the jitted step so a KD teacher+student share the mutated
+        positions. Documents containing image tokens are left untouched (Option A).
+        """
+        pose = self.arguments.pose
+        if not pose.enabled or not isinstance(batch, dict):
+            return batch
+        return apply_pose_to_batch(
+            batch,
+            config=pose,
+            step=step,
+            seed=self.arguments.shuffle_seed_train,
+            image_token_id=self._pose_image_token_id,
+            pad_id=self._pose_pad_id,
+        )
 
     def _purify_batch(self, batch: dict) -> dict:
         """Remove non-JAX-compatible fields from a batch.
