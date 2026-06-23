@@ -1,7 +1,7 @@
 # EasyDeL Stack — workspace guide
 
 This repository is a [uv workspace](https://docs.astral.sh/uv/concepts/projects/workspaces/)
-monorepo containing four packages that are developed together and released
+monorepo containing five packages that are developed together and released
 independently:
 
 | package  | path            | import     | PyPI           | mirror repo         |
@@ -10,6 +10,7 @@ independently:
 | Spectrax | `libs/spectrax` | `spectrax` | `spectrax-lib` | `erfanzar/Spectrax` |
 | eJKernel | `libs/ejkernel` | `ejkernel` | `ejkernel`     | `erfanzar/ejkernel` |
 | eFormer  | `libs/eformer`  | `eformer`  | `eformer`      | `erfanzar/eformer`  |
+| eRay     | `libs/eray`     | `eray`     | `eray`         | `erfanzar/eray`     |
 
 **This monorepo is the source of truth.** The standalone repositories are
 read-only mirrors kept in sync automatically — do not merge changes there
@@ -18,9 +19,10 @@ directly (a direct push makes the sync fail until reconciled with
 
 ## What each package owns
 
-The stack splits along one line: the three foundation libs know nothing
+The stack splits along one line: the foundation libs know nothing
 about language models; easydel knows nothing about how to write a kernel,
-shard an array, or split a pipeline — it composes the other three.
+shard an array, split a pipeline, or manage Ray pods — it composes the
+foundation packages.
 
 ### spectrax — the module system *and* the pipeline runtime
 
@@ -65,16 +67,30 @@ Everything about *running* JAX at scale that is neither a model nor a kernel:
 | area                                            | owns                                                                                         |
 | ----------------------------------------------- | -------------------------------------------------------------------------------------------- |
 | `escale`                                        | mesh creation, `PartitionAxis`/`PartitionManager`, auto partition specs for DP/FSDP/TP/EP/SP |
-| `executor`                                      | Ray-based TPU/GPU pod orchestration, SLURM integration                                       |
+| `executor`                                      | Legacy execution compatibility and SLURM integration                                         |
 | `optimizers`                                    | optimizer + scheduler factories (AdamW, Adafactor, Lion, Muon, fused variants)               |
 | `serialization`, `paths`                        | TensorStore sharded checkpointing without all-gathers; `ePath` local/GCS path abstraction    |
 | `mpric`                                         | mixed-precision policies and dynamic loss scaling                                            |
 | `jaximus`, `ops`                                | implicit/lazy arrays for quantization (NF4/INT8/binary) via JAX primitive registration       |
 | `aparser`, `pytree`, `loggings`, `common_types` | dataclass CLI/YAML parsing, pytree utilities, logging/profiling, semantic axis constants     |
 
+### eray — Ray orchestration and remote execution
+
+Ray-based distributed execution, resource pools, TPU/GPU pod orchestration,
+Docker helpers, and CLI workflows that used to live under the eformer executor
+surface.
+
+| area                    | owns                                                                 |
+| ----------------------- | -------------------------------------------------------------------- |
+| `cli`                   | TPU connect/disconnect/status/health/list commands                   |
+| `execution`             | `execute`, `execute_resumable`, autoscale execution, remote wrappers |
+| `pool`                  | Ray actor pools for slices and device hosts                          |
+| `resources`             | CPU/GPU/TPU accelerator configs and Ray resource helpers             |
+| `docker`, `core`, `utils` | container execution, cluster models, exception helpers, sentinels  |
+
 ### easydel — the LLM framework
 
-The only package allowed to import the other three. By subsystem:
+The only package allowed to import the foundation packages. By subsystem:
 
 | subsystem                        | owns                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -114,9 +130,9 @@ versions declared in `libs/easydel/pyproject.toml`.
 ## Layering contract (CI-enforced)
 
 ```md
-spectrax    ejkernel    eformer      <- independent of each other and of easydel
-       \        |        /
-              easydel                <- the only package that may import the others
+spectrax    ejkernel    eformer    eray  <- independent of each other and of easydel
+       \        |        |       /
+                  easydel              <- the only package that may import the others
 ```
 
 `uv run lint-imports` checks this locally; Workspace CI runs it on every PR.
@@ -133,6 +149,7 @@ XLA_FLAGS=--xla_force_host_platform_device_count=8 \
   uv run pytest libs/easydel/tests -m "not slow"
 uv run pytest libs/spectrax/tests
 uv run pytest libs/eformer/tests
+uv run pytest libs/eray/tests
 uv run pytest libs/ejkernel/test        # kernels: most need GPU/TPU
 ```
 
@@ -153,15 +170,15 @@ package (PyPI trusted publishing, or the `PYPI_API_TOKEN` secret).
 ## Mirror sync
 
 Mirrors update automatically when you `git push`: the pre-push hook
-(`scripts/subtree-sync.sh auto`) detects which of spectrax/ejkernel/eformer
+(`scripts/subtree-sync.sh auto`) detects which of spectrax/ejkernel/eformer/eray
 changed and subtree-pushes just those to their standalone repos
 (`SUBTREE_SYNC_SKIP=1 git push` to bypass; mirror outages never block the
 push). `.github/workflows/sync-subtrees.yaml` is the server-side backstop
 (requires the `SUBTREE_SYNC_TOKEN` secret: fine-grained PAT, Contents
-read/write on the three mirrors). Manual fallback:
+read/write on the four mirrors). Manual fallback:
 
 ```bash
-scripts/subtree-sync.sh push            # all three
+scripts/subtree-sync.sh push            # all mirrors
 scripts/subtree-sync.sh pull ejkernel   # reconcile a diverged mirror
 ```
 

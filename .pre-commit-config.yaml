@@ -140,6 +140,15 @@ repos:
         types: [python]
         files: ^libs/eformer/
         stages: [pre-commit]
+      - id: ruff-eray
+        name: ruff lint+fix (libs/eray)
+        description: Lints and auto-fixes libs/eray with its own ruff config
+        entry: ruff check --fix --config libs/eray/pyproject.toml
+        language: python
+        additional_dependencies: ["ruff==0.15.16"]
+        types: [python]
+        files: ^libs/eray/
+        stages: [pre-commit]
       - id: uv-lock-easydel
         name: uv.lock fresh for libs/easydel
         description: Pushing changes to libs/easydel/pyproject.toml requires a refreshed workspace uv.lock
@@ -172,9 +181,17 @@ repos:
         files: ^libs/eformer/pyproject\.toml$
         pass_filenames: false
         stages: [pre-push]
+      - id: uv-lock-eray
+        name: uv.lock fresh for libs/eray
+        description: Pushing changes to libs/eray/pyproject.toml requires a refreshed workspace uv.lock
+        entry: uv lock --check
+        language: system
+        files: ^libs/eray/pyproject\.toml$
+        pass_filenames: false
+        stages: [pre-push]
       - id: subtree-mirror-sync
         name: Push libs/* updates to standalone mirrors
-        description: Pushes spectrax/ejkernel/eformer subtrees to their mirror repos when they changed (SUBTREE_SYNC_SKIP=1 to bypass)
+        description: Pushes spectrax/ejkernel/eformer/eray subtrees to their mirror repos when they changed (SUBTREE_SYNC_SKIP=1 to bypass)
         entry: scripts/subtree-sync.sh auto
         language: system
         pass_filenames: false
