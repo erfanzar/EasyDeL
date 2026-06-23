@@ -466,6 +466,7 @@ def distillation_loss(
     temperature: float = 4.0,
     alpha: float = 0.9,
     beta: float | None = None,
+    cakld_gamma: float | None = None,
     loss_top_k: int = 0,
     loss_add_tail: bool = False,
     partition_manager: tp.Any = None,
@@ -495,6 +496,12 @@ def distillation_loss(
             Higher values create softer distributions. Default: 4.0
         alpha (float): Weight for distillation loss vs supervised loss.
             1.0 means pure distillation, 0.0 means pure supervised. Default: 0.9
+        beta: Optional generalized Jensen-Shannon interpolation coefficient.
+            Mutually exclusive with ``cakld_gamma``.
+        cakld_gamma: Optional Confidence-Aware KL coefficient. When set,
+            computes ``gamma * KL(p_student || p_teacher) + (1 - gamma) *
+            KL(p_teacher || p_student)``. The scalar is intended to be the
+            precomputed averaged teacher-token confidence described by CAKLD.
 
     Returns:
         tuple[Array, dict[str, Array]]: Scalar loss value combining distillation
@@ -526,6 +533,8 @@ def distillation_loss(
     if labels is not None:
         valid_label_mask = (labels != -100).astype(dtype)
         mask = valid_label_mask if mask is None else mask * valid_label_mask
+    if cakld_gamma is not None and (loss_top_k > 0 or loss_add_tail):
+        raise ValueError("`cakld_gamma` is not supported with `loss_top_k` / `loss_add_tail`.")
 
     # Vocab-parallel reduction. When a ``PartitionManager`` is supplied (and the in-context mesh has a
     # real >1 ``tp`` axis), resolve the semantic ``[BATCH, LENGTH, VOCAB]`` / ``[BATCH, LENGTH]`` specs
@@ -564,77 +573,85 @@ def distillation_loss(
         kl_loss = divergence_loss * temp_sq
     else:
         # ejkernel fused KL: forward KL by default (beta is None), or the generalized
-        # JSD when beta is set. The kernel streams both softmaxes over the vocabulary
-        # without materializing a [..., V] log-softmax and supplies the analytic student
-        # gradient (teacher detached). The loss is already masked-mean * T^2.
-        if beta is None:
-            direction, want_entropy = "forward", True  # KL(p_t || p_s), report entropy split
-        elif beta <= 0.0:
-            direction, want_entropy = "forward", False  # KL(p_t || p_s): GKD/TRL beta->0 limit
-        elif beta >= 1.0:
-            direction, want_entropy = "reverse", False  # KL(p_s || p_t): GKD/TRL beta->1 limit
-        else:
-            direction, want_entropy = "jsd", False
+        # JSD when beta is set, or CAKLD when gamma is set. The kernel streams both
+        # softmaxes over the vocabulary without materializing a [..., V] log-softmax
+        # and supplies the student gradient with the teacher detached. The loss is
+        # already masked-mean * T^2.
+        #
+        # Vocab-parallel KL keeps the full [B, S, V] logits sharded. The XLA backend
+        # supports forward, reverse, and JSD in this mode; TileLang's TP path is
+        # narrower, so EasyDeL forces platform="xla".
+        use_vocab_parallel = _vp_mesh is not None
 
-        # Vocab-parallel KL only applies to forward KL (the kernel's vocab-parallel direction); the
-        # all-reduce it removes -- two ~60GB ``[B, S, V]`` tensors for a 248K vocab -- is the large-vocab
-        # distillation OOM cause.
-        use_vocab_parallel = _vp_mesh is not None and direction == "forward"
-        if use_vocab_parallel:
-            # Vocab-parallel KL via the module op: passing mesh/in_specs/out_specs makes the op wrap the
-            # XLA kernel in ``jax.shard_map`` and reduce the softmax normalizer with a ``psum`` over the TP
-            # axis, so the full unsharded ``[B, S, V]`` logits are NEVER all-reduced. The op infers the vocab
-            # axis from ``in_specs[0]`` (the resolved ``[BATCH, LENGTH, VOCAB]`` spec) and forces
-            # ``check_vma=True``, which the vocab-parallel custom backward needs for an exact gradient
-            # (verified value+grad parity vs dense for T=1/2/4). ``return_teacher_entropy`` is honored even
-            # here: the op computes H(p_t) on the vocab-sharded ``teacher_logits`` outside shard_map, where
-            # ``log_softmax`` keeps the tensor sharded and only the cheap ``[B, S]`` normalizer all-reduces
-            # -- so the metric split (``distill_xent_loss``/``teacher_entropy_loss``) matches the dense path
-            # without re-gathering the full ``[B, S, V]``. ``mask`` is passed straight through (``None`` when
-            # there is none -- the op then needs no weights operand, and a non-None mask drives the kernel's
-            # per-row sparse early-exit so masked rows are skipped).
-            # Pad the leading [batch, seq] dims up to the meshed-axis product so shard_map never hits a
-            # non-divisible micro-batch / sp-indivisible sequence; padded rows carry zero weight so they
-            # drop out of the masked mean (and the teacher-entropy reduction).
-            _kl_pads = _vp_leading_pads(student_logits.shape[:-1], _vp_token_spec, _vp_mesh)
-            _kl_s, _kl_t, _kl_w = student_logits, teacher_logits, mask
-            if any(_kl_pads):
-                if _kl_w is None:
-                    _kl_w = jnp.ones(student_logits.shape[:-1], dtype=jnp.float32)
-                _kl_s = _pad_leading(student_logits, _kl_pads)
-                _kl_t = _pad_leading(teacher_logits, _kl_pads)
-                _kl_w = _pad_leading(_kl_w, _kl_pads, fill=0.0)
-            out = _fused_kl(
-                _kl_s,
-                _kl_t,
-                _kl_w,
-                reduction="mean",
-                direction="forward",
-                temperature=temperature,
-                return_teacher_entropy=want_entropy,
-                platform="xla",
-                mesh=_vp_mesh,
-                in_specs=(_vp_logit_spec, _vp_logit_spec, _vp_token_spec),
-                out_specs=PartitionSpec(),
-            )
-            kl_loss = out.loss.astype(jnp.float32)
-            if want_entropy:
-                teacher_entropy_loss = out.teacher_entropy.astype(jnp.float32)
-                distill_xent_loss = kl_loss + teacher_entropy_loss
-            else:
-                teacher_entropy_loss = jnp.zeros((), dtype=jnp.float32)
-                distill_xent_loss = kl_loss
-        else:
-            out = _fused_kl(
+        def _run_fused_kl(
+            direction: str,
+            *,
+            beta_value: float = 0.5,
+            want_entropy: bool = False,
+        ):
+            if use_vocab_parallel:
+                # Passing mesh/in_specs/out_specs wraps the XLA kernel in shard_map and reduces the softmax
+                # normalizer with psum over TP, so the full unsharded [B, S, V] logits are never all-reduced.
+                # Pad leading [batch, seq] dims up to meshed-axis divisibility; padded rows carry zero weight.
+                _kl_pads = _vp_leading_pads(student_logits.shape[:-1], _vp_token_spec, _vp_mesh)
+                _kl_s, _kl_t, _kl_w = student_logits, teacher_logits, mask
+                if any(_kl_pads):
+                    if _kl_w is None:
+                        _kl_w = jnp.ones(student_logits.shape[:-1], dtype=jnp.float32)
+                    _kl_s = _pad_leading(student_logits, _kl_pads)
+                    _kl_t = _pad_leading(teacher_logits, _kl_pads)
+                    _kl_w = _pad_leading(_kl_w, _kl_pads, fill=0.0)
+                return _fused_kl(
+                    _kl_s,
+                    _kl_t,
+                    _kl_w,
+                    reduction="mean",
+                    direction=direction,
+                    temperature=temperature,
+                    beta=float(beta_value),
+                    return_teacher_entropy=want_entropy,
+                    platform="xla",
+                    mesh=_vp_mesh,
+                    in_specs=(_vp_logit_spec, _vp_logit_spec, _vp_token_spec),
+                    out_specs=PartitionSpec(),
+                )
+            return _fused_kl(
                 student_logits,
                 teacher_logits,
                 mask,
                 reduction="mean",
                 direction=direction,
                 temperature=temperature,
-                beta=(0.5 if beta is None else float(beta)),
+                beta=float(beta_value),
                 return_teacher_entropy=want_entropy,
                 platform="xla",  # XLA is the bandwidth-optimal KL backend on TPU (Pallas loses)
+            )
+
+        if cakld_gamma is not None:
+            gamma = float(cakld_gamma)
+            if not 0.0 <= gamma <= 1.0:
+                raise ValueError("`cakld_gamma` must be within [0, 1] when set.")
+            if beta is not None:
+                raise ValueError("`cakld_gamma` is mutually exclusive with GJSD `beta`.")
+            forward_kl = _run_fused_kl("forward").loss.astype(jnp.float32)
+            reverse_kl = _run_fused_kl("reverse").loss.astype(jnp.float32)
+            gamma_s = jnp.asarray(gamma, dtype=jnp.float32)
+            kl_loss = gamma_s * reverse_kl + (jnp.asarray(1.0, dtype=jnp.float32) - gamma_s) * forward_kl
+            distill_xent_loss = kl_loss
+            teacher_entropy_loss = jnp.zeros((), dtype=jnp.float32)
+        else:
+            if beta is None:
+                direction, want_entropy = "forward", True  # KL(p_t || p_s), report entropy split
+            elif beta <= 0.0:
+                direction, want_entropy = "forward", False  # KL(p_t || p_s): GKD/TRL beta->0 limit
+            elif beta >= 1.0:
+                direction, want_entropy = "reverse", False  # KL(p_s || p_t): GKD/TRL beta->1 limit
+            else:
+                direction, want_entropy = "jsd", False
+            out = _run_fused_kl(
+                direction,
+                beta_value=(0.5 if beta is None else float(beta)),
+                want_entropy=want_entropy,
             )
             kl_loss = out.loss.astype(jnp.float32)
             if want_entropy:
@@ -720,6 +737,7 @@ def mtp_distillation_loss(
     loss_mask: Array | None = None,
     temperature: float = 4.0,
     beta: float | None = None,
+    cakld_gamma: float | None = None,
     partition_manager: tp.Any = None,
 ) -> Array:
     """Soft KD for a Multi-Token-Prediction head.
@@ -739,7 +757,8 @@ def mtp_distillation_loss(
         loss_mask: ``(B, S)`` completion/assistant mask (takes priority).
         temperature: Softmax temperature, shared with the main KD term.
         beta: Same divergence selector as :func:`distillation_loss` (``None`` ->
-            forward KL, ``<=0`` -> reverse, ``>=1`` -> forward, else generalized JSD).
+            forward KL, ``<=0`` -> forward, ``>=1`` -> reverse, else generalized JSD).
+        cakld_gamma: Optional CAKLD coefficient. Mutually exclusive with ``beta``.
 
     Returns:
         Scalar masked-mean divergence (already scaled by ``T**2`` by the kernel).
@@ -757,55 +776,70 @@ def mtp_distillation_loss(
     else:
         mtp_mask = None
 
-    if beta is None or beta <= 0.0:
+    if cakld_gamma is not None:
+        gamma = float(cakld_gamma)
+        if not 0.0 <= gamma <= 1.0:
+            raise ValueError("`cakld_gamma` must be within [0, 1] when set.")
+        if beta is not None:
+            raise ValueError("`cakld_gamma` is mutually exclusive with GJSD `beta`.")
+    elif beta is None or beta <= 0.0:
         direction = "forward"  # GKD/TRL beta->0 limit (and the classic-KD default)
     elif beta >= 1.0:
         direction = "reverse"  # GKD/TRL beta->1 limit
     else:
         direction = "jsd"
 
-    # Vocab-parallel forward KL via shard_map (same mechanism as ``distillation_loss``): keeps the
-    # vocab TP-sharded so the full [B, S, V] MTP logits are never all-reduced. Forward direction only
-    # (the kernel's vocab-parallel direction); reverse/JSD fall through to the dense path below.
-    vp_mesh = _resolve_vocab_parallel_mesh(partition_manager) if direction == "forward" else None
-    if vp_mesh is not None:
-        kl_weights = mtp_mask if mtp_mask is not None else jnp.ones(student_mtp_logits.shape[:-1], dtype=jnp.float32)
-        logit_spec = partition_manager.resolve([BATCH, LENGTH, VOCAB], MODE_TRAIN)
-        token_spec = partition_manager.resolve([BATCH, LENGTH], MODE_TRAIN)
-        # Pad leading [batch, seq] for shard_map divisibility; padded rows carry zero weight (masked mean).
-        _pads = _vp_leading_pads(student_mtp_logits.shape[:-1], token_spec, vp_mesh)
-        _s = student_mtp_logits
-        _t = jax.lax.stop_gradient(teacher_target)
-        if any(_pads):
-            _s = _pad_leading(student_mtp_logits, _pads)
-            _t = _pad_leading(_t, _pads)
-            kl_weights = _pad_leading(kl_weights, _pads, fill=0.0)
-        out = _fused_kl(
-            _s,
-            _t,
-            kl_weights,
-            reduction="mean",
-            direction="forward",
-            temperature=temperature,
-            platform="xla",
-            mesh=vp_mesh,
-            in_specs=(logit_spec, logit_spec, token_spec),
-            out_specs=PartitionSpec(),
-        )
+    # Vocab-parallel KL via shard_map (same mechanism as ``distillation_loss``): keeps the vocab
+    # TP-sharded so the full [B, S, V] MTP logits are never all-reduced.
+    vp_mesh = _resolve_vocab_parallel_mesh(partition_manager)
+
+    def _run_mtp_kl(direction: str, beta_value: float = 0.5) -> Array:
+        if vp_mesh is not None:
+            kl_weights = mtp_mask if mtp_mask is not None else jnp.ones(student_mtp_logits.shape[:-1], dtype=jnp.float32)
+            logit_spec = partition_manager.resolve([BATCH, LENGTH, VOCAB], MODE_TRAIN)
+            token_spec = partition_manager.resolve([BATCH, LENGTH], MODE_TRAIN)
+            # Pad leading [batch, seq] for shard_map divisibility; padded rows carry zero weight.
+            _pads = _vp_leading_pads(student_mtp_logits.shape[:-1], token_spec, vp_mesh)
+            _s = student_mtp_logits
+            _t = jax.lax.stop_gradient(teacher_target)
+            if any(_pads):
+                _s = _pad_leading(student_mtp_logits, _pads)
+                _t = _pad_leading(_t, _pads)
+                kl_weights = _pad_leading(kl_weights, _pads, fill=0.0)
+            out = _fused_kl(
+                _s,
+                _t,
+                kl_weights,
+                reduction="mean",
+                direction=direction,
+                temperature=temperature,
+                beta=float(beta_value),
+                platform="xla",
+                mesh=vp_mesh,
+                in_specs=(logit_spec, logit_spec, token_spec),
+                out_specs=PartitionSpec(),
+            )
+        else:
+            out = _fused_kl(
+                student_mtp_logits,
+                jax.lax.stop_gradient(teacher_target),
+                mtp_mask,
+                reduction="mean",
+                direction=direction,
+                temperature=temperature,
+                beta=float(beta_value),
+                return_teacher_entropy=False,
+                platform="xla",
+            )
         return out.loss.astype(dtype)
 
-    out = _fused_kl(
-        student_mtp_logits,
-        jax.lax.stop_gradient(teacher_target),
-        mtp_mask,
-        reduction="mean",
-        direction=direction,
-        temperature=temperature,
-        beta=(0.5 if beta is None else float(beta)),
-        return_teacher_entropy=False,
-        platform="xla",
-    )
-    return out.loss.astype(dtype)
+    if cakld_gamma is not None:
+        gamma_s = jnp.asarray(float(cakld_gamma), dtype=jnp.float32)
+        forward_kl = _run_mtp_kl("forward")
+        reverse_kl = _run_mtp_kl("reverse")
+        return (gamma_s * reverse_kl + (jnp.asarray(1.0, dtype=jnp.float32) - gamma_s) * forward_kl).astype(dtype)
+
+    return _run_mtp_kl(direction, 0.5 if beta is None else float(beta))
 
 
 def mtp_chain_distillation_loss(
@@ -815,6 +849,7 @@ def mtp_chain_distillation_loss(
     loss_mask: Array | None = None,
     temperature: float = 4.0,
     beta: float | None = None,
+    cakld_gamma: float | None = None,
     partition_manager: tp.Any = None,
 ) -> tuple[Array, list[Array]]:
     """Multi-step soft KD for a recursively-applied MTP head (FastMTP-style).
@@ -834,6 +869,7 @@ def mtp_chain_distillation_loss(
         attention_mask / loss_mask: ``(B, S)`` masks (loss_mask takes priority).
         temperature: Shared softmax temperature.
         beta: Divergence selector (see :func:`distillation_loss`).
+        cakld_gamma: Optional CAKLD coefficient. Mutually exclusive with ``beta``.
 
     Returns:
         ``(mean_kd_over_steps, [per_step_kd, ...])``.
@@ -842,22 +878,70 @@ def mtp_chain_distillation_loss(
     n_steps, b, s, _ = chain_logits.shape
     base = loss_mask if loss_mask is not None else attention_mask
     base = base.astype(dtype) if base is not None else None
-    if beta is None or beta <= 0.0:
+    if cakld_gamma is not None:
+        gamma = float(cakld_gamma)
+        if not 0.0 <= gamma <= 1.0:
+            raise ValueError("`cakld_gamma` must be within [0, 1] when set.")
+        if beta is not None:
+            raise ValueError("`cakld_gamma` is mutually exclusive with GJSD `beta`.")
+    elif beta is None or beta <= 0.0:
         direction = "forward"  # GKD/TRL beta->0 limit (and the classic-KD default)
     elif beta >= 1.0:
         direction = "reverse"  # GKD/TRL beta->1 limit
     else:
         direction = "jsd"
 
-    # Vocab-parallel forward KL via shard_map (forward direction only -- the kernel's vocab-parallel
-    # direction); keeps each step's [B, S, V] logits TP-sharded with no all-reduce. Same mesh/specs for
-    # every step. reverse/JSD fall through to the dense path.
-    vp_mesh = _resolve_vocab_parallel_mesh(partition_manager) if direction == "forward" else None
+    # Vocab-parallel KL via shard_map keeps each step's [B, S, V] logits TP-sharded with no all-reduce.
+    vp_mesh = _resolve_vocab_parallel_mesh(partition_manager)
     vp_logit_spec = partition_manager.resolve([BATCH, LENGTH, VOCAB], MODE_TRAIN) if vp_mesh is not None else None
     vp_token_spec = partition_manager.resolve([BATCH, LENGTH], MODE_TRAIN) if vp_mesh is not None else None
 
     per_step: list[Array] = []
     total = jnp.zeros((), dtype)
+
+    def _run_chain_kl(
+        step_logits: Array,
+        target_logits: Array,
+        mask: Array | None,
+        direction: str,
+        beta_value: float = 0.5,
+    ) -> Array:
+        if vp_mesh is not None:
+            kl_weights = mask if mask is not None else jnp.ones(step_logits.shape[:-1], dtype=jnp.float32)
+            _pads = _vp_leading_pads(step_logits.shape[:-1], vp_token_spec, vp_mesh)
+            _cs = step_logits
+            _ct = jax.lax.stop_gradient(target_logits)
+            if any(_pads):
+                _cs = _pad_leading(step_logits, _pads)
+                _ct = _pad_leading(_ct, _pads)
+                kl_weights = _pad_leading(kl_weights, _pads, fill=0.0)
+            out = _fused_kl(
+                _cs,
+                _ct,
+                kl_weights,
+                reduction="mean",
+                direction=direction,
+                temperature=temperature,
+                beta=float(beta_value),
+                platform="xla",
+                mesh=vp_mesh,
+                in_specs=(vp_logit_spec, vp_logit_spec, vp_token_spec),
+                out_specs=PartitionSpec(),
+            )
+        else:
+            out = _fused_kl(
+                step_logits,
+                jax.lax.stop_gradient(target_logits),
+                mask,
+                reduction="mean",
+                direction=direction,
+                temperature=temperature,
+                beta=float(beta_value),
+                return_teacher_entropy=False,
+                platform="xla",
+            )
+        return out.loss.astype(dtype)
+
     for j in range(int(n_steps)):
         k = j + 1
         # teacher target for step k = teacher_logits shifted left by k (pad tail, masked).
@@ -867,41 +951,15 @@ def mtp_chain_distillation_loss(
             mask = jnp.concatenate([base[:, k + 1 :], jnp.zeros((b, k + 1), dtype=dtype)], axis=1)[:, :s]
         else:
             mask = None
-        if vp_mesh is not None:
-            kl_weights = mask if mask is not None else jnp.ones(chain_logits[j].shape[:-1], dtype=jnp.float32)
-            # Pad leading [batch, seq] for shard_map divisibility; padded rows carry zero weight (masked mean).
-            _pads = _vp_leading_pads(chain_logits[j].shape[:-1], vp_token_spec, vp_mesh)
-            _cs = chain_logits[j]
-            _ct = jax.lax.stop_gradient(teacher_target)
-            if any(_pads):
-                _cs = _pad_leading(chain_logits[j], _pads)
-                _ct = _pad_leading(_ct, _pads)
-                kl_weights = _pad_leading(kl_weights, _pads, fill=0.0)
-            out = _fused_kl(
-                _cs,
-                _ct,
-                kl_weights,
-                reduction="mean",
-                direction="forward",
-                temperature=temperature,
-                platform="xla",
-                mesh=vp_mesh,
-                in_specs=(vp_logit_spec, vp_logit_spec, vp_token_spec),
-                out_specs=PartitionSpec(),
+        if cakld_gamma is not None:
+            gamma_s = jnp.asarray(float(cakld_gamma), dtype=jnp.float32)
+            forward_kl = _run_chain_kl(chain_logits[j], teacher_target, mask, "forward")
+            reverse_kl = _run_chain_kl(chain_logits[j], teacher_target, mask, "reverse")
+            step_loss = (gamma_s * reverse_kl + (jnp.asarray(1.0, dtype=jnp.float32) - gamma_s) * forward_kl).astype(
+                dtype
             )
         else:
-            out = _fused_kl(
-                chain_logits[j],
-                jax.lax.stop_gradient(teacher_target),
-                mask,
-                reduction="mean",
-                direction=direction,
-                temperature=temperature,
-                beta=(0.5 if beta is None else float(beta)),
-                return_teacher_entropy=False,
-                platform="xla",
-            )
-        step_loss = out.loss.astype(dtype)
+            step_loss = _run_chain_kl(chain_logits[j], teacher_target, mask, direction, 0.5 if beta is None else beta)
         per_step.append(step_loss)
         total = total + step_loss
     return total / jnp.asarray(n_steps, dtype), per_step
@@ -1264,6 +1322,7 @@ def distillation_step(
     logits_chunk_size: int | None = None,
     checkpoint_kl_loss: bool = True,
     beta: float | None = None,
+    cakld_gamma: float | None = None,
     loss_top_k: int = 0,
     loss_add_tail: bool = False,
     mtp_distillation: bool = False,
@@ -1335,7 +1394,7 @@ def distillation_step(
 
     request_hidden_states = hidden_state_weight != 0.0
     request_attentions = attention_weight != 0.0
-    use_advanced_vocab_loss = beta is not None or loss_top_k > 0 or loss_add_tail
+    use_advanced_vocab_loss = beta is not None or cakld_gamma is not None or loss_top_k > 0 or loss_add_tail
     use_chunked = logits_chunk_size is not None and logits_chunk_size > 0 and not use_advanced_vocab_loss
 
     _stage_mesh = spx.get_current_stage_mesh(
@@ -1518,6 +1577,7 @@ def distillation_step(
                 temperature=temperature,
                 alpha=alpha,
                 beta=beta,
+                cakld_gamma=cakld_gamma,
                 loss_top_k=loss_top_k,
                 loss_add_tail=loss_add_tail,
                 partition_manager=partition_manager,
@@ -1554,6 +1614,7 @@ def distillation_step(
                         loss_mask=completion_mask,
                         temperature=temperature,
                         beta=beta,
+                        cakld_gamma=cakld_gamma,
                         partition_manager=spx.PartitionManager(paxis=module.config.partition_axis),
                     )
                     mtp_kd_value = mtp_kd_value.astype(total_loss.dtype)
@@ -1571,6 +1632,7 @@ def distillation_step(
                         loss_mask=completion_mask,
                         temperature=temperature,
                         beta=beta,
+                        cakld_gamma=cakld_gamma,
                         partition_manager=spx.PartitionManager(paxis=module.config.partition_axis),
                     )
                     mtp_kd_value = mtp_kd_value.astype(total_loss.dtype)
@@ -1703,6 +1765,7 @@ def _distillation_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
             "logits_chunk_size",
             "checkpoint_kl_loss",
             "beta",
+            "cakld_gamma",
             "loss_top_k",
             "loss_add_tail",
         ),
@@ -1736,9 +1799,10 @@ def _make_distillation_scheduled_loss(call):
     logits_chunk_size = call.get("logits_chunk_size")
     checkpoint_kl_loss = bool(call.get("checkpoint_kl_loss", True))
     beta = call.get("beta")
+    cakld_gamma = call.get("cakld_gamma")
     loss_top_k = int(call.get("loss_top_k", 0) or 0)
     loss_add_tail = bool(call.get("loss_add_tail", False))
-    use_advanced_vocab_loss = beta is not None or loss_top_k > 0 or loss_add_tail
+    use_advanced_vocab_loss = beta is not None or cakld_gamma is not None or loss_top_k > 0 or loss_add_tail
     use_chunked = logits_chunk_size is not None and logits_chunk_size > 0 and not use_advanced_vocab_loss
     request_hidden_states = hidden_state_weight != 0.0
     request_attentions = attention_weight != 0.0
@@ -1816,6 +1880,10 @@ def _make_distillation_scheduled_loss(call):
                     checkpoint_chunks=checkpoint_kl_loss,
                 )
             else:
+                partition_manager = None
+                stage_mesh = spx.get_current_stage_mesh(getattr(module, "mesh", None), raise_error=False)
+                if stage_mesh is not None and "tp" in stage_mesh.axis_names and stage_mesh.shape["tp"] > 1:
+                    partition_manager = spx.PartitionManager(paxis=module.config.partition_axis)
                 total_loss, _loss_components = distillation_loss(
                     student_logits=student_outputs["logits"],
                     teacher_logits=teacher_outputs["logits"],
@@ -1826,8 +1894,10 @@ def _make_distillation_scheduled_loss(call):
                     temperature=temperature,
                     alpha=alpha,
                     beta=beta,
+                    cakld_gamma=cakld_gamma,
                     loss_top_k=loss_top_k,
                     loss_add_tail=loss_add_tail,
+                    partition_manager=partition_manager,
                 )
 
         if request_hidden_states:

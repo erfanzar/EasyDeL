@@ -1328,6 +1328,10 @@ class TrainingArguments:
         self.step_partition_spec = _parse_partition_spec(self.step_partition_spec)
 
         self.eval_batch_size = self.eval_batch_size if self.eval_batch_size is not None else self.total_batch_size
+        if self.pose is None:
+            self.pose = PoSEConfig()
+        elif isinstance(self.pose, dict):
+            self.pose = PoSEConfig.from_dict(self.pose)
         if self.loss_config is None:
             self.loss_config = LossConfig()
         if isinstance(self.loss_config, dict):

@@ -18,7 +18,6 @@ import inspect
 from dataclasses import fields
 
 import pytest
-
 from easydel.infra.elarge.model import eLargeModel
 from easydel.infra.elarge.types import (
     BASE_TRAINER_DEFAULTS,
@@ -53,6 +52,7 @@ def test_normalized_configs_construct_every_training_arguments_class():
                 "esurge_enable_prefix_caching": False,
                 "esurge_data_parallelism_axis": "dp",
                 "esurge_max_num_seq_buckets": [1, 2, 4, 8],
+                "pose": {"enabled": False, "p_pose": 0.0},
             }
         )
         args_cls = get_training_arguments_class(trainer_type)
@@ -76,6 +76,7 @@ def test_normalized_configs_construct_every_training_arguments_class():
         assert args.esurge_enable_prefix_caching is False
         assert args.esurge_data_parallelism_axis == "dp"
         assert args.esurge_max_num_seq_buckets == [1, 2, 4, 8]
+        assert args.pose.to_dict()["enabled"] is False
 
 
 def test_base_defaults_do_not_include_unknown_training_arguments_keys():
