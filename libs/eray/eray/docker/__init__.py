@@ -12,7 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Docker container configuration and execution on Ray resources."""
+"""Docker container configuration and execution on Ray resources.
+
+This module exposes the main public API for running Docker containers on
+Ray-managed accelerator resources. It re-exports configuration helpers from
+:mod:`eray.docker.config` and execution utilities from :mod:`eray.docker.runner`.
+
+Contents:
+    DockerConfig: Dataclass describing container image, command, volumes,
+        environment variables, GPU settings, and other runtime options.
+    make_docker_run_command: Converts a ``DockerConfig`` into a ``docker run``
+        argument list.
+    run_docker_on_pod: Executes a single container on a TPU/GPU pod.
+    run_docker_multislice: Executes containers across multiple slices.
+    run_docker_async: Ray remote task for asynchronous container execution.
+    build_and_push_docker_image: Builds a Docker image and optionally pushes
+        it to a registry.
+"""
 
 from .config import DockerConfig, make_docker_run_command
 from .runner import (

@@ -34,6 +34,7 @@ from ..core.exceptions import ExceptionInfo
 
 logger = logging.getLogger("ray")
 
+
 @dataclass
 class RayResources:
     """A representation of resource requirements for Ray tasks and actors.
@@ -197,6 +198,15 @@ class RayResources:
 
             @functools.wraps(fn)
             def wrapped_fn(*args, **kwargs):
+                """Execute the original function in a separate process.
+
+                Args:
+                    *args (Any): Positional arguments to pass to the original function.
+                    **kwargs (Any): Keyword arguments to pass to the original function.
+
+                Returns:
+                    Any: The return value from the separate process execution.
+                """
                 return RayResources.separate_process_fn(fn, args, kwargs)
 
             remote_fn = RemoteFunction(
@@ -237,6 +247,13 @@ class RayResources:
         """
 
         def target_fn(queue, args, kwargs):
+            """Execute the underlying function and send the result to a queue.
+
+            Args:
+                queue (multiprocessing.Queue): Queue to send the result or exception info.
+                args (tuple): Positional arguments to pass to the underlying function.
+                kwargs (dict): Keyword arguments to pass to the underlying function.
+            """
             try:
                 result = underlying_function(*args, **kwargs)
                 queue.put((True, result))
@@ -246,7 +263,7 @@ class RayResources:
 
         queue = multiprocessing.Queue()
         process = multiprocessing.Process(target=target_fn, args=(queue, args, kwargs))
-        timeout_s = float(os.getenv("EFORMER_SUBPROCESS_TIMEOUT_S", "1000000"))
+        timeout_s = float(os.getenv("ERAY_SUBPROCESS_TIMEOUT", "1000000"))
         process.start()
         process.join(timeout=timeout_s)
         if process.is_alive():
@@ -286,10 +303,10 @@ class RayResources:
                 runtime environment will be updated.
             runtime_env (dict[str, str] | dict[str, dict[str, str]]): Runtime
                 environment configuration to merge.
-            **extra_env: Additional environment variables as keyword arguments.
+            **extra_env (str): Additional environment variables as keyword arguments.
 
         Returns:
-            dict: Merged runtime environment configuration.
+            dict[str, Any]: Merged runtime environment configuration.
 
         Example:
             >>> @ray.remote
@@ -329,6 +346,7 @@ class RayResources:
                 ray.cancel(future)
             except Exception:
                 logger.exception("Failed to kill job after primary failure")
+
 
 def available_cpu_cores() -> int:
     """Determine the number of logical CPU cores available on the current system.

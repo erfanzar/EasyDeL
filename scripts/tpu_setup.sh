@@ -884,7 +884,7 @@ gcloud compute tpus tpu-vm list --project="$PROJECT_ID" --zone="$ZONE" --filter=
 
 log_info "Running runtime health check from Ray head..."
 run_python_local "
-from eformer.executor.ray import TpuAcceleratorConfig, execute
+from eray import TpuAcceleratorConfig, execute
 import logging
 import ray
 import warnings

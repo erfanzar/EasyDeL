@@ -77,6 +77,7 @@ def handle_ray_error(job_info: JobInfo, e: RayError) -> JobStatus:
         logger.exception("Unknown error", exc_info=e)
         return JobError(job_info, e)
 
+
 @dataclass
 class ExceptionInfo:
     """Serializable container for exception information across process boundaries.
@@ -182,6 +183,7 @@ class ExceptionInfo:
             tb = tblib.Traceback(tb)
             return ExceptionInfo(exception, tb)
 
+
 def print_remote_raise(ray_error) -> None:
     """Print the traceback from a Ray remote task error.
 
@@ -190,8 +192,9 @@ def print_remote_raise(ray_error) -> None:
     failures in distributed Ray computations.
 
     Args:
-        ray_error: The .error attribute from a Ray task output,
-                   containing a pickled exception with tblib.Traceback.
+        ray_error: A Ray exception object (e.g., RayTaskError) whose
+            ``.cause.args[0]`` is an ExceptionInfo containing a serialized
+            traceback.
 
     Example:
         >>> future = some_remote_task.remote()

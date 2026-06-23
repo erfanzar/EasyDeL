@@ -33,6 +33,7 @@ dependencies = [
 	"jaxlib>=0.10.0",
 	"eformer==0.1.0",
 	"ejkernel==0.0.82",
+	"eray==0.1.0",
 	"spectrax-lib==0.1.5",
 	"ray[default]==2.54.0",
 	"einops~=0.8.0",
@@ -77,9 +78,6 @@ where = ["."]
 
 [project.optional-dependencies]
 torch = ["torch==2.8.0"]
-# CUDA is Linux-only: jax[cuda13] self-gates its nvidia deps, but ejkernel[cuda] pulls
-# nvidia-cutlass-dsl[cu13], which only ships manylinux wheels. Gate the whole extra to linux
-# so win32/darwin resolution forks see an empty cuda extra instead of an unsatisfiable one.
 cuda = [
 	"jax[cuda13]>=0.10.0",
 	"torch==2.8.0",
@@ -237,3 +235,4 @@ torch = { index = "pytorch-cpu", marker = "extra == 'torch'" }
 spectrax-lib = { workspace = true }
 ejkernel = { workspace = true }
 eformer = { workspace = true }
+eray = { workspace = true }

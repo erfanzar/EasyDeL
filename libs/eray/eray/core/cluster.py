@@ -63,6 +63,8 @@ class SliceInfo:
         num_hosts: Number of host machines in this slice.
         ip_address: IP address of the slice head node.
         num_accelerators_per_host: Number of accelerators (TPUs/GPUs) per host machine.
+        node_ids: Optional list of node identifiers within the slice.
+        host_infos: Optional list of host information dictionaries.
 
     Example:
         >>> slice_config = SliceInfo(
@@ -93,6 +95,7 @@ class HostInfo:
         num_devices: Number of TPU devices available on this host.
         healthy: Whether the host is currently healthy and operational.
         failed: Whether the host has encountered a failure.
+        node_id: Optional node identifier string, or None if not assigned.
     """
 
     host_id: int

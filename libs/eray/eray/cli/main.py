@@ -60,7 +60,13 @@ CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"]}
 
 
 def _validate_gcloud() -> None:
-    """Check that gcloud is available and authenticated."""
+    """Check that gcloud is available and authenticated.
+
+    Verifies the gcloud CLI is installed and the user has an active account.
+
+    Raises:
+        click.ClickException: If gcloud is not installed or no account is authenticated.
+    """
     if not check_gcloud():
         error("gcloud CLI not found. Install Google Cloud SDK first.")
         raise click.ClickException("gcloud not installed")
@@ -81,7 +87,27 @@ def _resolve_tpu(
 ) -> tuple[TpuInfo, str | None, str | None]:
     """Resolve a TpuInfo from either --tpu-name or --ips.
 
-    Returns (tpu_info, user, ssh_key) — user/ssh_key are set for direct-IP mode.
+    Validates mutual exclusivity of the two modes and required fields for each.
+    In gcloud mode, the TPU is discovered via gcloud. In direct-IP mode, a
+    TpuInfo is constructed from the provided IPs.
+
+    Args:
+        tpu_name: TPU resource name for gcloud mode, or None.
+        project: GCP project ID for gcloud mode, or None.
+        zone: GCP zone for gcloud mode, or None.
+        ips: Comma-separated host IPs for direct-IP mode, or None.
+        tpu_type: Accelerator type (e.g. "v4-32") for direct-IP mode, or None.
+        user: SSH user for direct-IP mode, or None.
+        ssh_key: SSH key path for direct-IP mode, or None.
+
+    Returns:
+        A tuple of (tpu_info, user, ssh_key). user and ssh_key are set only in
+        direct-IP mode (gcloud mode returns None for both).
+
+    Raises:
+        click.ClickException: If both --tpu-name and --ips are provided, if
+            required options are missing for the chosen mode, or if no valid
+            IPs are found in --ips.
     """
     if tpu_name and ips:
         raise click.ClickException("--tpu-name and --ips are mutually exclusive. Pick one.")
@@ -125,6 +151,12 @@ def cli(verbose: bool) -> None:
 
       2. By IPs directly (no gcloud needed):
          eray tpu connect --ips 10.0.0.1,10.0.0.2 --tpu-type v4-16
+
+    Args:
+        verbose: Enable debug logging when True.
+
+    Returns:
+        None
     """
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(level=level, format="%(message)s", stream=sys.stderr)
@@ -178,10 +210,27 @@ def connect(tpu_name, project, zone, ips, tpu_type, user, ssh_key, ray_bin, ray_
     \b
     For direct-IP mode you can also specify SSH credentials:
         eray tpu connect --ips 10.0.0.1,10.0.0.2 --tpu-type v4-16 --user myuser --ssh-key ~/.ssh/id_rsa
+
+    Args:
+        tpu_name: TPU resource name (gcloud mode).
+        project: GCP project ID (gcloud mode).
+        zone: GCP zone (gcloud mode).
+        ips: Comma-separated host IPs (direct mode).
+        tpu_type: Accelerator type e.g. v4-32 (direct mode).
+        user: SSH user for direct-IP mode.
+        ssh_key: SSH key path for direct-IP mode.
+        ray_bin: Path to ray binary on hosts.
+        ray_tmp_dir: Temp dir for Ray on hosts.
+        timeout: Cluster readiness timeout in seconds.
+        as_json: Output result as JSON.
+
+    Returns:
+        None
+
+    Raises:
+        click.ClickException: If the connection fails.
     """
-    tpu, ssh_user, ssh_key_resolved = _resolve_tpu(
-        tpu_name, project, zone, ips, tpu_type, user, ssh_key
-    )
+    tpu, ssh_user, ssh_key_resolved = _resolve_tpu(tpu_name, project, zone, ips, tpu_type, user, ssh_key)
 
     mode = "gcloud" if tpu.is_gcloud_managed else "direct-IP"
     info(f"TPU: type={tpu.accelerator_type} | hosts={tpu.num_hosts} | mode={mode}")
@@ -245,10 +294,24 @@ def disconnect(tpu_name, project, zone, ips, tpu_type, user, ssh_key, ray_bin):
     \b
     Example (direct-IP):
         eray tpu disconnect --ips 10.0.0.1,10.0.0.2 --tpu-type v4-16
+
+    Args:
+        tpu_name: TPU resource name (gcloud mode).
+        project: GCP project ID (gcloud mode).
+        zone: GCP zone (gcloud mode).
+        ips: Comma-separated host IPs (direct mode).
+        tpu_type: Accelerator type e.g. v4-32 (direct mode).
+        user: SSH user for direct-IP mode.
+        ssh_key: SSH key path for direct-IP mode.
+        ray_bin: Path to ray binary on hosts.
+
+    Returns:
+        None
+
+    Raises:
+        click.ClickException: If the disconnect fails.
     """
-    tpu, ssh_user, ssh_key_resolved = _resolve_tpu(
-        tpu_name, project, zone, ips, tpu_type, user, ssh_key
-    )
+    tpu, ssh_user, ssh_key_resolved = _resolve_tpu(tpu_name, project, zone, ips, tpu_type, user, ssh_key)
 
     info(f"Stopping Ray on {tpu.num_hosts} hosts...")
 
@@ -270,6 +333,16 @@ def status(address, as_json):
     \b
     Example:
         eray tpu status -a 10.0.0.1:6379
+
+    Args:
+        address: Ray cluster address (ip:port).
+        as_json: Output as JSON.
+
+    Returns:
+        None
+
+    Raises:
+        click.ClickException: If the status check fails.
     """
     try:
         result = cluster_status(address)
@@ -300,6 +373,17 @@ def health(address, tpu_type, as_json):
     \b
     Example:
         eray tpu health -a 10.0.0.1:6379
+
+    Args:
+        address: Ray cluster address (ip:port).
+        tpu_type: TPU type (e.g. v4-32) for scheduling.
+        as_json: Output as JSON.
+
+    Returns:
+        None
+
+    Raises:
+        click.ClickException: If the health check fails.
     """
     try:
         reports = health_check(address, tpu_type=tpu_type)
@@ -342,6 +426,17 @@ def list_tpus(project, zone, as_json):
         eray tpu list                          # all zones (auto-detected project)
         eray tpu list -z us-central2-b         # one zone
         eray tpu list -p my-project -z us-central2-b
+
+    Args:
+        project: GCP project ID (auto-detected if omitted).
+        zone: Narrow to a specific GCP zone (default: scan all zones).
+        as_json: Output as JSON.
+
+    Returns:
+        None
+
+    Raises:
+        click.ClickException: If listing fails.
     """
     _validate_gcloud()
 

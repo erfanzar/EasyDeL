@@ -133,13 +133,15 @@ from eray import (
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `EFORMER_SCALE_RETRY_SLEEP_S` | `60` | Sleep between retry attempts when slices are unavailable |
-| `EFORMER_SUBPROCESS_TIMEOUT_S` | — | Timeout for forked subprocess execution |
-| `EFORMER_SAFE_GATHER` | — | Use safe gather (prune dead actors) in slice preparation |
-| `EFORMER_MODERATE` | — | Adjust num_hosts/num_devices discovery |
-| `EFORMER_KILL_VFIO` | — | Kill VFIO holders on TPU hosts |
-| `SCALE_POLL_S` | `30` | Poll interval for actor pool scaling |
-| `SCALE_ADD_TIMEOUT_S` | `604800` | Timeout for adding actors to pool (7 days) |
+| `ERAY_SCALE_RETRY_SLEEP` | `60` | Sleep between retry attempts when slices are unavailable |
+| `ERAY_SUBPROCESS_TIMEOUT` | — | Timeout for forked subprocess execution |
+| `ERAY_SAFE_GATHER` | — | Use safe gather (prune dead actors) in slice preparation |
+| `ERAY_MODERATE` | — | Adjust num_hosts/num_devices discovery |
+| `ERAY_KILL_VFIO` | — | Kill VFIO holders on TPU hosts |
+| `ERAY_INSTALL_LSOF` | — | Attempt quiet lsof install for VFIO holder detection |
+| `ERAY_HOST_HEALTH_WAIT` | `60` | Timeout for waiting on all hosts to become healthy |
+| `ERAY_SCALE_POLL` | `30` | Poll interval for actor pool scaling |
+| `ERAY_SCALE_ADD_TIMEOUT` | `604800` | Timeout for adding actors to pool (7 days) |
 
 ## CLI — TPU Cluster Management
 

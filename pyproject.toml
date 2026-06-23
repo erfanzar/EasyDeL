@@ -11,7 +11,7 @@ dependencies = ["easydel", "eray"]
 
 # Root extras forward to the easydel member so the whole foundation installs with
 # one selector, e.g. `uv sync --extra tpu --extra dev` (workspace-aware: the
-# four packages come editable from libs/). Note: the pip-style
+# workspace packages come editable from libs/). Note: the pip-style
 # `uv pip install -e .[tpu]` also works but resolves easydel & friends from
 # PyPI, NOT from libs/ — use `uv sync` for development environments.
 [project.optional-dependencies]
@@ -27,14 +27,6 @@ dev = ["import-linter>=2.0", "ruff", "pytest", "pre-commit", "basedpyright"]
 
 [dependency-groups]
 dev = ["import-linter>=2.0", "ruff", "pytest", "pre-commit", "basedpyright"]
-torch = ["easydel[torch]"]
-cuda = ["easydel[cuda]"]
-tpu = ["easydel[tpu]"]
-tensorflow = ["easydel[tensorflow]"]
-lm-eval = ["easydel[lm_eval]"]
-profile = ["easydel[profile]"]
-podutils = ["easydel[podutils]"]
-mm = ["easydel[mm]"]
 
 # The root wheel is an empty meta-package: it exists so `-e .` style installs
 # have a build backend (legacy setuptools chokes on the flat repo layout).
@@ -43,31 +35,11 @@ bypass-selection = true
 
 [tool.uv]
 prerelease = "if-necessary-or-explicit"
-conflicts = [
-    [
-        { group = "cuda" },
-        { group = "tpu" },
-    ],
-    [
-        { group = "cuda" },
-        { group = "torch" },
-    ],
-    [
-        { group = "profile" },
-        { group = "tensorflow" },
-    ],
-    [
-        { extra = "cuda" },
-        { extra = "tpu" },
-    ],
-    [
-        { extra = "cuda" },
-        { extra = "torch" },
-    ],
-    [
-        { extra = "profile" },
-        { extra = "tensorflow" },
-    ],
+# Keep the workspace lock Linux-only. CUDA/TPU extras pull hardware packages
+# that do not publish wheels for every platform, so universal macOS/Windows
+# locking is not useful for this repo.
+environments = [
+    "sys_platform == 'linux'",
 ]
 
 [tool.uv.workspace]

@@ -26,7 +26,7 @@ def test_import_easydel_makes_eformer_exceptioninfo_safe_for_retryerror():
 import pickle
 
 import easydel
-from eformer.executor.ray.types import ExceptionInfo
+from eray import ExceptionInfo
 from google.api_core.exceptions import RetryError
 
 try:

@@ -44,6 +44,7 @@ from .device_host import DeviceHostActor
 
 logger = logging.getLogger("ray")
 
+
 @ray.remote
 class SliceActor:
     """Ray actor for managing a TPU slice with multiple hosts.
@@ -117,7 +118,7 @@ class SliceActor:
                 num_hosts = int(ray_tpu.get_current_pod_worker_count())
             except Exception:
                 num_hosts = 1
-        if os.getenv("EFORMER_MODERATE", "1") == "1" and pod_name:
+        if os.getenv("ERAY_MODERATE", "1") == "1" and pod_name:
             available_hosts = ray.cluster_resources().get(pod_name, None)
             if available_hosts is not None and num_hosts > available_hosts:
                 available_hosts = int(available_hosts)
@@ -186,7 +187,7 @@ class SliceActor:
                 pass
             slice_name = ray_tpu.get_current_pod_name()
             num_hosts = int(ray_tpu.get_current_pod_worker_count())
-            if os.getenv("EFORMER_MODERATE", "1") == "1":
+            if os.getenv("ERAY_MODERATE", "1") == "1":
                 available_hosts = ray.cluster_resources().get(slice_name, None)
                 if available_hosts is not None and num_hosts > available_hosts:
                     available_hosts = int(available_hosts)
@@ -586,6 +587,8 @@ class SliceActor:
             runtime_env: Optional Ray runtime environment configuration for
                 dependencies and environment setup.
             env: Optional environment variables to set on all hosts.
+            f_args: Positional arguments to pass to the remote function.
+            f_kwargs: Keyword arguments to pass to the remote function.
 
         Returns:
             List[ray.ObjectRef]: One ObjectRef per host in the slice,
@@ -605,7 +608,7 @@ class SliceActor:
         self.ensure_host_pool(self._slice_info.num_hosts)
 
         try:
-            self._await_all_hosts_healthy(timeout_s=int(os.getenv("EFORMER_HOST_HEALTH_WAIT_S", "60")))
+            self._await_all_hosts_healthy(timeout_s=int(os.getenv("ERAY_HOST_HEALTH_WAIT", "60")))
         except Exception:
             pass
 
@@ -776,7 +779,7 @@ class SlicePoolManager(ResourcePoolManager[SliceInfo]):
             Essential for proper multi-host coordination within each slice.
         """
 
-        if os.getenv("EFORMER_SAFE_GATHER", "1") == "1":
+        if os.getenv("ERAY_SAFE_GATHER", "1") == "1":
             slice_infos = []
             good_members = []
             for m in self._actor_pool:
@@ -885,13 +888,18 @@ class SlicePoolManager(ResourcePoolManager[SliceInfo]):
             **kwargs: Keyword arguments for fn.
 
         Returns:
-            Nested list of results (outer list for slices, inner for hosts).
+            Nested list of ObjectRefs (outer list for slices, inner for hosts).
         """
         self.prepare_all_slices()
         ray.get([member.actor.ensure_host_pool.remote() for member in self._actor_pool])
 
         @ray.remote(max_calls=1)
         def _runner():
+            """Run the user function with provided arguments.
+
+            Returns:
+                The result of fn(*args, **kwargs).
+            """
             return fn(*args, **kwargs)
 
         return ray.get([member.actor.run_remote_fn.remote(_runner, env=env) for member in self._actor_pool])
@@ -941,8 +949,8 @@ class SlicePoolManager(ResourcePoolManager[SliceInfo]):
             5. Kills actors that don't start within SCALE_ADD_TIMEOUT_S
 
         Environment Variables:
-            EFORMER_SCALE_POLL_S: Poll interval in seconds (default: 30)
-            EFORMER_SCALE_ADD_TIMEOUT_S: Total timeout in seconds (default: 604800/7 days)
+            ERAY_SCALE_POLL: Poll interval in seconds (default: 30)
+            ERAY_SCALE_ADD_TIMEOUT: Total timeout in seconds (default: 604800/7 days)
 
         Note:
             - Actors are added to pool as soon as they're ready
@@ -968,6 +976,14 @@ class SlicePoolManager(ResourcePoolManager[SliceInfo]):
         slot_to_info_ref: dict[int, ray.ObjectRef] = {}
 
         def _start_for_slot(slot: int):
+            """Create and start a SliceActor for a placement group slot.
+
+            Args:
+                slot: Placement group bundle index to schedule the actor on.
+
+            Side Effects:
+                Populates slot_to_actor and slot_to_info_ref.
+            """
             actor = SliceActor.options(
                 num_cpus=0,
                 scheduling_strategy=PlacementGroupSchedulingStrategy(

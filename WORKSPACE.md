@@ -101,10 +101,10 @@ eSurge; checkpoints flow through the TensorStore serialization stack.
 ## Development
 
 ```bash
-uv sync                              # all four packages editable in .venv
-uv sync --group tpu                  # + TPU extras        (jax[tpu], ejkernel[tpu])
-uv sync --group cuda                 # + CUDA extras
-uv sync --group torch --group profile
+uv sync                              # all workspace packages editable in .venv
+uv sync --extra tpu                  # + TPU extras        (jax[tpu], ejkernel[tpu])
+uv sync --extra cuda                 # + CUDA extras
+uv sync --extra torch --extra profile
 ```
 
 During development the packages resolve against each other from `libs/`
