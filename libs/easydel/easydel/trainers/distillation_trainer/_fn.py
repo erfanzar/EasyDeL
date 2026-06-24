@@ -727,6 +727,9 @@ def distillation_loss(
         "teacher_entropy_loss": jnp.asarray(teacher_entropy_loss, dtype=jnp.float32),
         "ce_loss": jnp.asarray(ce_loss, dtype=jnp.float32),
     }
+    if cakld_gamma is not None:  # log the CAKLD KL components (kl_loss = gamma*reverse + (1-gamma)*forward)
+        metrics["forward_kl"] = jnp.asarray(forward_kl, dtype=jnp.float32)
+        metrics["reverse_kl"] = jnp.asarray(reverse_kl, dtype=jnp.float32)
     return total_loss, metrics
 
 

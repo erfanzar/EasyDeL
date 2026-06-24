@@ -179,6 +179,21 @@ def _iter_sharded_source_from_example_offset(
         yield from source.open_shard(shard_name)
 
 
+class MsgpackDecode(grain.MapTransform):
+    """Grain transform decoding one ``msgpack``-packed ``.array_record`` row (bytes -> dict).
+
+    ``msgpack`` is imported lazily so importing this module never requires it.
+    """
+
+    def __post_init__(self):
+        import msgpack
+
+        self._unpackb = msgpack.unpackb
+
+    def map(self, record: bytes):
+        return self._unpackb(record, raw=False)
+
+
 class _ReiterableDataLoader:
     """Small wrapper that recreates a fresh iterator on every ``iter(...)`` call.
 
@@ -5370,10 +5385,204 @@ class BaseTrainer(BaseTrainerProtocol):
             TrainerConfigureDataloaderOutput: An object containing the configured dataloaders and the
                                             maximum number of training and evaluation steps.
         """
+        if self.arguments.arrayrecord_train_files or self.arguments.arrayrecord_train_datasets:
+            return self._configure_arrayrecord_dataloader()
         if self.arguments.use_grain:
             return self._configure_grain_dataloader()
         else:
             return self._configure_tfds_dataloader()
+
+    def _configure_arrayrecord_dataloader(self) -> TrainerConfigureDataloaderOutput:
+        """Configure a grain ArrayRecord dataloader for the precomputed VL pack.
+
+        Architecture (grain best practice for a weighted, globally-shuffled mixture):
+        each dataset is its OWN ArrayRecord set, loaded as a ``MapDataset`` and shuffled
+        independently, then combined with ``grain.MapDataset.mix(weights)`` so the
+        mixture weights are preserved and CONTROLLABLE (not merely size-proportional).
+        The mixed stream is sharded per host (``slice(shard_index, None, shard_count)``,
+        deterministic + disjoint), ``MsgpackDecode``-d, and grouped by ``batch`` into a
+        LIST of ``batch_size`` row dicts (``batch_fn=list``, uncollated). The trainer's
+        prefetcher applies ``self._data_collator`` (the VL packed-embeds collator) to that
+        list — same contract as the ShardedDataSource path — so collation happens exactly
+        once. ``.to_iter_dataset(read_options=...)`` drives native ``gs://`` random-access
+        reads with parallel prefetch.
+
+        A single ``arrayrecord_train_files`` source is handled as a one-dataset mixture
+        (uniform / size-proportional). ``mix`` length is ``min_i(size_i / weight_i)`` —
+        one epoch ends when the most-constrained dataset would be exhausted; ``repeat``
+        cycles for ``num_train_epochs``.
+
+        Empirically the loader sustains far above the step rate (no data-starved steps).
+        """
+        from easydel.data.sources.base import expand_data_files
+
+        # Build grain.ArrayRecordDataSource from precomputed FileInstructions (filename/skip/take/
+        # examples_in_shard, from each set's _MANIFEST.tsv) so array_record SKIPS its per-shard footer-count
+        # reads at init -- else it opens every shard (the thread/fork storm that crashed init). len() is instant too.
+        import dataclasses
+
+        import fsspec
+
+        @dataclasses.dataclass
+        class _ArrayRecordFI:
+            filename: str
+            skip: int
+            take: int
+            examples_in_shard: int
+
+        def _file_instructions(spec):
+            """array_record FileInstructions for one set, from its _MANIFEST.tsv. Fail-loud: a missing or
+            malformed manifest raises (never silently falls back to the footer-count burst)."""
+            globs = [spec] if isinstance(spec, str) else list(spec)
+            if not globs:
+                raise ValueError("arrayrecord_train_datasets entry is empty; expected a gs:// glob.")
+            set_dir = str(globs[0]).rsplit("/", 1)[0]  # gs://.../data_grain/<set>
+            root = set_dir.rsplit("/", 1)[0]  # gs://.../data_grain   (manifest paths are root-relative)
+            manifest = f"{set_dir}/_MANIFEST.tsv"
+            try:
+                with fsspec.open(manifest, "r") as fh:
+                    raw = fh.read()
+            except Exception as exc:
+                raise ValueError(
+                    f"arrayrecord FileInstruction build: cannot read manifest {manifest} "
+                    f"(required to skip the footer-count burst): {exc}"
+                ) from exc
+            instructions = []
+            for line in raw.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split("\t")
+                # manifest rows are `<relpath>\t<bytes>\t<rows>`; skip any header / non-shard line.
+                if len(parts) != 3 or not parts[0].endswith(".array_record"):
+                    continue
+                relpath, _nbytes, nrows = parts
+                n = int(nrows)  # fail-loud on a malformed shard-row count (the manifest is machine-written)
+                instructions.append(_ArrayRecordFI(filename=f"{root}/{relpath}", skip=0, take=n, examples_in_shard=n))
+            if not instructions:
+                raise ValueError(
+                    f"arrayrecord FileInstruction build: manifest {manifest} yielded 0 valid shards "
+                    "(expected `<relpath>\\t<bytes>\\t<rows>` lines)."
+                )
+            return instructions
+
+        if self.data_collator is None:
+            raise ValueError(
+                "arrayrecord_train_files/_datasets requires an explicit `data_collator` (the VL "
+                "packed-embeds collator) — the trainer applies it to each list batch the loader yields."
+            )
+
+        shard_index = (
+            self.arguments.grain_shard_index if self.arguments.grain_shard_index is not None else jax.process_index()
+        )
+        shard_count = (
+            self.arguments.grain_shard_count if self.arguments.grain_shard_count is not None else jax.process_count()
+        )
+
+        def _build(datasets: dict, weights: dict | None, batch_size, *, is_train, manifest_backed):
+            seed = self.arguments.shuffle_seed_train if is_train else 0
+            do_shuffle = self.arguments.shuffle_train_dataset if is_train else False
+            num_epochs = self.arguments.num_train_epochs if is_train else 1
+
+            # Batch PER SOURCE before mixing: the VLM packed collator requires one (source x area_bucket)
+            # partition per batch (collate_packed_embeds asserts it) and each data_grain source is a single
+            # area_bucket, so per-source batches are homogeneous. Mixing the BATCHED streams preserves the
+            # row-level mixture proportions (uniform batch size => batch-weight is proportional to rows).
+            per_ds, ws = [], []
+            for i, name in enumerate(sorted(datasets)):
+                # data_grain sets carry a _MANIFEST.tsv -> FileInstructions (skip footer burst);
+                # the generic arrayrecord_train_files path has no manifest -> expand globs as before.
+                source = grain.ArrayRecordDataSource(
+                    _file_instructions(datasets[name]) if manifest_backed else expand_data_files(datasets[name])
+                )
+                ds = grain.MapDataset.source(source)
+                if do_shuffle:
+                    ds = ds.shuffle(seed=seed + i)
+                # Decode per record, then batch WITHIN this source -> homogeneous batches. batch_fn=list
+                # yields a LIST of row dicts (uncollated); the trainer's prefetcher applies
+                # self._data_collator to it (collating here would double-collate).
+                ds = ds.map(MsgpackDecode()).batch(batch_size=batch_size, drop_remainder=True, batch_fn=list)
+                per_ds.append(ds)
+                ws.append(float(weights[name]) if (weights and name in weights) else float(len(source)))
+
+            is_mixture = len(per_ds) > 1
+            mixed = grain.MapDataset.mix(per_ds, weights=ws) if is_mixture else per_ds[0]
+
+            # grain weighted-mix __len__ reports the exhaustion length (min_i N_i/(w_i/Sum_w)), not the total
+            # -- honor the explicit max_training_steps and REPEAT enough to supply that many batches/host.
+            explicit_steps = self.arguments.max_training_steps if is_train else None
+            target_steps = int(explicit_steps) if (explicit_steps and explicit_steps > 0) else None
+
+            if is_train and target_steps is None and is_mixture:
+                # no-silent-fallback: never train for grain's misleading weighted-mixture length.
+                raise ValueError(
+                    "arrayrecord weighted-mixture training requires an explicit max_training_steps "
+                    "(grain MapDataset.mix __len__ under-reports the total); set the trainer's "
+                    "max_training_steps to the intended step count."
+                )
+
+            if target_steps is not None:
+                base_batches = len(mixed)  # batches produced per mixture pass (units: BATCHES)
+                if base_batches <= 0:
+                    raise ValueError(f"arrayrecord mixture reported {base_batches} batches; cannot build the loader.")
+                # Repeat to supply >= target_steps batches/host after the shard slice (+2 margin; repeats are lazy).
+                needed_batches = target_steps * max(shard_count, 1)
+                num_repeats = -(-needed_batches // base_batches) + 2  # ceil(needed/base) + margin
+                mixed = mixed.repeat(num_repeats)
+            elif num_epochs and num_epochs > 1:
+                mixed = mixed.repeat(num_epochs)
+
+            # Shard whole BATCHES across hosts (deterministic + disjoint); each element is already one
+            # homogeneous batch (list of batch_size row dicts).
+            if shard_count > 1:
+                mixed = mixed.slice(slice(shard_index, None, shard_count))
+
+            # Step count = the explicit target when set (the repeated/sharded stream supplies >= this
+            # many batches); otherwise the true per-host batch count (single set / eval).
+            steps = target_steps if target_steps is not None else len(mixed)
+            iterable = mixed.to_iter_dataset(
+                read_options=grain.ReadOptions(
+                    num_threads=self.arguments.arrayrecord_num_threads,
+                    prefetch_buffer_size=self.arguments.arrayrecord_prefetch_buffer,
+                )
+            )
+            return _ReiterableDataLoader(factory=lambda: iter(iterable), length=steps), steps
+
+        def _resolve(datasets, files):
+            # 3rd value = manifest_backed: data_grain `*_datasets` have per-set _MANIFEST.tsv (use
+            # FileInstructions); generic `*_files` globs do not (fall back to footer-counting).
+            if datasets:
+                return dict(datasets), self.arguments.arrayrecord_mixture_weights, True
+            if files:
+                return {"_default": files}, None, False
+            return None, None, False
+
+        train_datasets, train_weights, train_manifest_backed = _resolve(
+            self.arguments.arrayrecord_train_datasets, self.arguments.arrayrecord_train_files
+        )
+        dataloader_train, max_training_steps = _build(
+            train_datasets, train_weights, self.training_batch_size, is_train=True, manifest_backed=train_manifest_backed
+        )
+        self._set_dataset_size_metadata(
+            is_train=True, resolution=_ResolvedStepCount(max_training_steps, None, False, "arrayrecord", True, False)
+        )
+
+        dataloader_eval, max_evaluation_steps = None, 0
+        eval_datasets, eval_weights, eval_manifest_backed = _resolve(
+            self.arguments.arrayrecord_eval_datasets, self.arguments.arrayrecord_eval_files
+        )
+        if eval_datasets and self.arguments.do_eval:
+            dataloader_eval, max_evaluation_steps = _build(
+                eval_datasets, eval_weights, self.evaluation_batch_size, is_train=False,
+                manifest_backed=eval_manifest_backed,
+            )
+
+        return TrainerConfigureDataloaderOutput(
+            dataloader_train=dataloader_train,
+            max_training_steps=max_training_steps,
+            dataloader_eval=dataloader_eval,
+            max_evaluation_steps=max_evaluation_steps,
+        )
 
     def configure_model(self) -> TrainerConfigureModelOutput:
         """
