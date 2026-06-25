@@ -347,6 +347,14 @@ class TrainingArguments:
         default=64,
         metadata={"help": "grain ReadOptions.prefetch_buffer_size for the ArrayRecord dataloader."},
     )
+    arrayrecord_read_rate_limit_mb_per_sec: float | None = field(
+        default=70.0,
+        metadata={"help": "Per-HOST read-bandwidth cap (MB/s) for the ArrayRecord loader, enforced by a "
+                  "process-wide byte token bucket shared across the read threads (caps the host aggregate, "
+                  "not per-thread). Paces gs:// pulls so the fleet stays under the per-project egress quota "
+                  "(e.g. 256 hosts x 70 MB/s ~= 18 GB/s < 25 GB/s = 200 Gbps). None or 0 DISABLES the limiter "
+                  "(explicit; no silent throttle)."},
+    )
     gradient_accumulation_steps: int = field(
         default=1,
         metadata={"help": "The number of steps to accumulate gradients over."},

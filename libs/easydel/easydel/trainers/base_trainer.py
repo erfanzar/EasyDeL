@@ -45,6 +45,7 @@ import operator
 import os
 import pprint
 import sys
+import threading
 import time
 import typing as tp
 from abc import abstractmethod
@@ -192,6 +193,98 @@ class MsgpackDecode(grain.MapTransform):
 
     def map(self, record: bytes):
         return self._unpackb(record, raw=False)
+
+
+class _ArrayRecordReadRateLimiter:
+    """Process-wide byte token bucket shared by Grain ArrayRecord read threads."""
+
+    def __init__(self, bytes_per_second: float):
+        self._lock = threading.Lock()
+        self._tokens = float(bytes_per_second)
+        self._updated_at = time.monotonic()
+        self.configure(bytes_per_second)
+
+    @property
+    def bytes_per_second(self) -> float:
+        return self._bytes_per_second
+
+    def configure(self, bytes_per_second: float) -> None:
+        bytes_per_second = float(bytes_per_second)
+        if bytes_per_second <= 0:
+            raise ValueError("ArrayRecord read rate limiter requires a positive byte/sec rate.")
+        with self._lock:
+            self._bytes_per_second = bytes_per_second
+            self._capacity = max(bytes_per_second, 1.0)  # one second of burst, still below quota at 70 MB/s.
+            self._tokens = min(getattr(self, "_tokens", self._capacity), self._capacity)
+            self._updated_at = time.monotonic()
+
+    def acquire(self, num_bytes: int) -> None:
+        num_bytes = int(num_bytes)
+        if num_bytes <= 0:
+            return
+
+        with self._lock:
+            now = time.monotonic()
+            elapsed = max(now - self._updated_at, 0.0)
+            self._tokens = min(self._capacity, self._tokens + elapsed * self._bytes_per_second)
+            self._updated_at = now
+            self._tokens -= float(num_bytes)
+            wait_seconds = max(-self._tokens / self._bytes_per_second, 0.0)
+
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+
+
+_ARRAYRECORD_READ_RATE_LIMITER: _ArrayRecordReadRateLimiter | None = None
+_ARRAYRECORD_READ_RATE_LIMITER_LOCK = threading.Lock()
+
+
+def _get_arrayrecord_read_rate_limiter(bytes_per_second: float) -> _ArrayRecordReadRateLimiter:
+    """Return the one process/host token bucket used by all ArrayRecord decode transforms."""
+    global _ARRAYRECORD_READ_RATE_LIMITER
+    with _ARRAYRECORD_READ_RATE_LIMITER_LOCK:
+        if _ARRAYRECORD_READ_RATE_LIMITER is None:
+            _ARRAYRECORD_READ_RATE_LIMITER = _ArrayRecordReadRateLimiter(bytes_per_second)
+        elif _ARRAYRECORD_READ_RATE_LIMITER.bytes_per_second != float(bytes_per_second):
+            _ARRAYRECORD_READ_RATE_LIMITER.configure(bytes_per_second)
+        return _ARRAYRECORD_READ_RATE_LIMITER
+
+
+def _arrayrecord_read_rate_limit_bytes_per_second(mb_per_second: float | int | None) -> float | None:
+    """Convert the explicit ArrayRecord MB/s cap to bytes/sec; None or 0 disables it."""
+    if mb_per_second is None:
+        return None
+    if isinstance(mb_per_second, bool):
+        raise ValueError("`arrayrecord_read_rate_limit_mb_per_sec` must be a number, None, or 0; bool is invalid.")
+    try:
+        rate_mb_per_second = float(mb_per_second)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "`arrayrecord_read_rate_limit_mb_per_sec` must be a positive number, None, or 0."
+        ) from exc
+    if rate_mb_per_second == 0:
+        return None
+    if rate_mb_per_second < 0 or not np.isfinite(rate_mb_per_second):
+        raise ValueError("`arrayrecord_read_rate_limit_mb_per_sec` must be finite and non-negative.")
+    return rate_mb_per_second * 1_000_000.0
+
+
+class _ArrayRecordReadRateLimit(grain.MapTransform):
+    """Meter raw ArrayRecord payload bytes before msgpack decode."""
+
+    def __init__(self, bytes_per_second: float):
+        bytes_per_second = float(bytes_per_second)
+        if bytes_per_second <= 0:
+            raise ValueError("ArrayRecord read-rate transform requires a positive byte/sec rate.")
+        self._bytes_per_second = bytes_per_second
+
+    def map(self, record: bytes):
+        try:
+            num_bytes = len(record)
+        except TypeError as exc:
+            raise TypeError("ArrayRecord read-rate limiter expected a bytes-like record with len().") from exc
+        _get_arrayrecord_read_rate_limiter(self._bytes_per_second).acquire(num_bytes)
+        return record
 
 
 class _ReiterableDataLoader:
@@ -5478,6 +5571,19 @@ class BaseTrainer(BaseTrainerProtocol):
         shard_count = (
             self.arguments.grain_shard_count if self.arguments.grain_shard_count is not None else jax.process_count()
         )
+        read_rate_limit_bytes_per_second = _arrayrecord_read_rate_limit_bytes_per_second(
+            self.arguments.arrayrecord_read_rate_limit_mb_per_sec
+        )
+        if read_rate_limit_bytes_per_second is None:
+            logger.warning(
+                "arrayrecord read rate limiter is disabled because "
+                "`arrayrecord_read_rate_limit_mb_per_sec` is None or 0."
+            )
+        else:
+            logger.info(
+                "arrayrecord read rate limiter enabled at %.2f MB/s per process/host.",
+                read_rate_limit_bytes_per_second / 1_000_000.0,
+            )
 
         def _build(datasets: dict, weights: dict | None, batch_size, *, is_train, manifest_backed):
             seed = self.arguments.shuffle_seed_train if is_train else 0
@@ -5498,6 +5604,11 @@ class BaseTrainer(BaseTrainerProtocol):
                 ds = grain.MapDataset.source(source)
                 if do_shuffle:
                     ds = ds.shuffle(seed=seed + i)
+                # Meter raw record bytes before msgpack decode so all Grain read threads share one
+                # per-process/host token bucket. Steady consumption is far below the default cap; this
+                # only flattens prefetch refill bursts that can exceed the project aggregate GCS quota.
+                if read_rate_limit_bytes_per_second is not None:
+                    ds = ds.map(_ArrayRecordReadRateLimit(read_rate_limit_bytes_per_second))
                 # Decode per record, then batch WITHIN this source -> homogeneous batches. batch_fn=list
                 # yields a LIST of row dicts (uncollated); the trainer's prefetcher applies
                 # self._data_collator to it (collating here would double-collate).
@@ -6557,6 +6668,15 @@ class BaseTrainer(BaseTrainerProtocol):
         This mirrors the normal training-time iterator semantics, including
         automatic reinitialization when a finite dataloader is exhausted.
         """
+        # The grain ArrayRecord loader is globally shuffled, so resuming with a FRESH dataloader
+        # position is statistically equivalent — and fast-forwarding would re-pull num_batches over
+        # GCS (minutes-to-hours, the abort-prone read path). Skip it for the arrayrecord path.
+        if self.arguments.arrayrecord_train_datasets or self.arguments.arrayrecord_train_files:
+            logger.info(
+                f"arrayrecord loader: skipping dataloader fast-forward of {int(num_batches)} batches "
+                "(global shuffle makes exact batch position irrelevant); resuming with a fresh position."
+            )
+            return data_iter
         num_batches = max(int(num_batches), 0)
         if num_batches > 10_000:
             logger.warning(
