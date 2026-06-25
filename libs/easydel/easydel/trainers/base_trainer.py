@@ -198,23 +198,35 @@ class MsgpackDecode(grain.MapTransform):
 class _ArrayRecordReadRateLimiter:
     """Process-wide byte token bucket shared by Grain ArrayRecord read threads."""
 
-    def __init__(self, bytes_per_second: float):
+    def __init__(self, bytes_per_second: float, burst_seconds: float):
         self._lock = threading.Lock()
-        self._tokens = float(bytes_per_second)
-        self._updated_at = time.monotonic()
-        self.configure(bytes_per_second)
+        self._tokens = 0.0  # start EMPTY: at job start all 256 hosts are also synchronized, so don't
+        self._updated_at = time.monotonic()  # let each release a full bucket on the first read.
+        self.configure(bytes_per_second, burst_seconds)
 
     @property
     def bytes_per_second(self) -> float:
         return self._bytes_per_second
 
-    def configure(self, bytes_per_second: float) -> None:
+    @property
+    def burst_seconds(self) -> float:
+        return self._burst_seconds
+
+    def configure(self, bytes_per_second: float, burst_seconds: float) -> None:
         bytes_per_second = float(bytes_per_second)
+        burst_seconds = float(burst_seconds)
         if bytes_per_second <= 0:
             raise ValueError("ArrayRecord read rate limiter requires a positive byte/sec rate.")
+        if burst_seconds <= 0:
+            raise ValueError("ArrayRecord read rate limiter requires a positive burst window (seconds).")
         with self._lock:
             self._bytes_per_second = bytes_per_second
-            self._capacity = max(bytes_per_second, 1.0)  # one second of burst, still below quota at 70 MB/s.
+            self._burst_seconds = burst_seconds
+            # Burst capacity = rate * burst_seconds: the MOST one host can release in a single instant.
+            # A SMALL window bounds the SYNCHRONIZED fleet-wide spike -- after a slow step all 256 hosts
+            # refill prefetch in lockstep, so 256 * capacity hits the shared egress quota at once. At
+            # 50 MB/s * 0.25s = 12.5 MB/host -> ~3.2 GB fleet burst over 0.25s = 12.8 GB/s (< 25 GB/s).
+            self._capacity = max(bytes_per_second * burst_seconds, 1.0)
             self._tokens = min(getattr(self, "_tokens", self._capacity), self._capacity)
             self._updated_at = time.monotonic()
 
@@ -239,14 +251,17 @@ _ARRAYRECORD_READ_RATE_LIMITER: _ArrayRecordReadRateLimiter | None = None
 _ARRAYRECORD_READ_RATE_LIMITER_LOCK = threading.Lock()
 
 
-def _get_arrayrecord_read_rate_limiter(bytes_per_second: float) -> _ArrayRecordReadRateLimiter:
+def _get_arrayrecord_read_rate_limiter(bytes_per_second: float, burst_seconds: float) -> _ArrayRecordReadRateLimiter:
     """Return the one process/host token bucket used by all ArrayRecord decode transforms."""
     global _ARRAYRECORD_READ_RATE_LIMITER
     with _ARRAYRECORD_READ_RATE_LIMITER_LOCK:
         if _ARRAYRECORD_READ_RATE_LIMITER is None:
-            _ARRAYRECORD_READ_RATE_LIMITER = _ArrayRecordReadRateLimiter(bytes_per_second)
-        elif _ARRAYRECORD_READ_RATE_LIMITER.bytes_per_second != float(bytes_per_second):
-            _ARRAYRECORD_READ_RATE_LIMITER.configure(bytes_per_second)
+            _ARRAYRECORD_READ_RATE_LIMITER = _ArrayRecordReadRateLimiter(bytes_per_second, burst_seconds)
+        elif (
+            _ARRAYRECORD_READ_RATE_LIMITER.bytes_per_second != float(bytes_per_second)
+            or _ARRAYRECORD_READ_RATE_LIMITER.burst_seconds != float(burst_seconds)
+        ):
+            _ARRAYRECORD_READ_RATE_LIMITER.configure(bytes_per_second, burst_seconds)
         return _ARRAYRECORD_READ_RATE_LIMITER
 
 
@@ -272,18 +287,22 @@ def _arrayrecord_read_rate_limit_bytes_per_second(mb_per_second: float | int | N
 class _ArrayRecordReadRateLimit(grain.MapTransform):
     """Meter raw ArrayRecord payload bytes before msgpack decode."""
 
-    def __init__(self, bytes_per_second: float):
+    def __init__(self, bytes_per_second: float, burst_seconds: float):
         bytes_per_second = float(bytes_per_second)
+        burst_seconds = float(burst_seconds)
         if bytes_per_second <= 0:
             raise ValueError("ArrayRecord read-rate transform requires a positive byte/sec rate.")
+        if burst_seconds <= 0:
+            raise ValueError("ArrayRecord read-rate transform requires a positive burst window (seconds).")
         self._bytes_per_second = bytes_per_second
+        self._burst_seconds = burst_seconds
 
     def map(self, record: bytes):
         try:
             num_bytes = len(record)
         except TypeError as exc:
             raise TypeError("ArrayRecord read-rate limiter expected a bytes-like record with len().") from exc
-        _get_arrayrecord_read_rate_limiter(self._bytes_per_second).acquire(num_bytes)
+        _get_arrayrecord_read_rate_limiter(self._bytes_per_second, self._burst_seconds).acquire(num_bytes)
         return record
 
 
@@ -5574,6 +5593,12 @@ class BaseTrainer(BaseTrainerProtocol):
         read_rate_limit_bytes_per_second = _arrayrecord_read_rate_limit_bytes_per_second(
             self.arguments.arrayrecord_read_rate_limit_mb_per_sec
         )
+        read_rate_burst_seconds = float(self.arguments.arrayrecord_read_rate_burst_seconds)
+        if read_rate_limit_bytes_per_second is not None and read_rate_burst_seconds <= 0:
+            raise ValueError(
+                "`arrayrecord_read_rate_burst_seconds` must be > 0 when the read rate limiter is enabled; "
+                f"got {self.arguments.arrayrecord_read_rate_burst_seconds!r}."
+            )
         if read_rate_limit_bytes_per_second is None:
             logger.warning(
                 "arrayrecord read rate limiter is disabled because "
@@ -5581,8 +5606,11 @@ class BaseTrainer(BaseTrainerProtocol):
             )
         else:
             logger.info(
-                "arrayrecord read rate limiter enabled at %.2f MB/s per process/host.",
+                "arrayrecord read rate limiter enabled at %.2f MB/s per process/host "
+                "(burst window %.3fs, capacity %.2f MB).",
                 read_rate_limit_bytes_per_second / 1_000_000.0,
+                read_rate_burst_seconds,
+                read_rate_limit_bytes_per_second * read_rate_burst_seconds / 1_000_000.0,
             )
 
         def _build(datasets: dict, weights: dict | None, batch_size, *, is_train, manifest_backed):
@@ -5608,7 +5636,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 # per-process/host token bucket. Steady consumption is far below the default cap; this
                 # only flattens prefetch refill bursts that can exceed the project aggregate GCS quota.
                 if read_rate_limit_bytes_per_second is not None:
-                    ds = ds.map(_ArrayRecordReadRateLimit(read_rate_limit_bytes_per_second))
+                    ds = ds.map(_ArrayRecordReadRateLimit(read_rate_limit_bytes_per_second, read_rate_burst_seconds))
                 # Decode per record, then batch WITHIN this source -> homogeneous batches. batch_fn=list
                 # yields a LIST of row dicts (uncollated); the trainer's prefetcher applies
                 # self._data_collator to it (collating here would double-collate).
