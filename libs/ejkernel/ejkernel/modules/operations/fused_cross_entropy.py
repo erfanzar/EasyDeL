@@ -45,7 +45,7 @@ from jax import shard_map
 from jax.sharding import Mesh, PartitionSpec
 from jaxtyping import Array, Float, Int
 
-from ejkernel.kernels._registry import Backend, kernel_registry
+from ejkernel.kernels._registry import Backend, Platform, kernel_registry
 from ejkernel.ops import (
     AutotunePolicy,
     ConfigCache,
@@ -618,15 +618,57 @@ def _fused_linear_cross_entropy_dispatch(
     token_chunk_size,
     compute_dtype,
     checkpoint=True,
+    platform: PlatformName | None = None,
+    cfg: FusedCrossEntropyConfig | None = None,
     sparse_skip=False,
 ):
-    """Route an FLCE call to the token-chunked XLA fused-linear kernel."""
+    """Route an FLCE call to the token-chunked fused-linear kernel.
+
+    The projection/chunk loop remains the XLA FLCE implementation. When a
+    non-XLA ``platform`` is explicitly requested, each projected logits chunk is
+    sent through that registered CE backend with ``reduction="none"``. This
+    gives TPU callers a config-level way to try Pallas CE inside FLCE without
+    silently changing the established XLA default.
+    """
     from ejkernel.kernels._xla.fused_cross_entropy._xla_impl_linear import fused_linear_cross_entropy
 
     if targets is None:
         raise ValueError("FLCE mode requires integer `targets`.")
     cdtype = jnp.dtype(compute_dtype) if compute_dtype is not None else hidden.dtype
     eff_weights = _combine_weights(targets, weights, attention_mask, ignore_index, cdtype)
+    per_chunk_ce_fn = None
+    if platform is not None:
+        resolved_platform = detect_platform("fused_cross_entropy", platform)
+        if resolved_platform != Platform.XLA:
+            cfg_block_v = int(getattr(cfg, "block_v", 0) or 0)
+            cfg_block_m = int(getattr(cfg, "block_m", 0) or 0)
+            cfg_backend = getattr(cfg, "backend", Backend.ANY) if cfg is not None else Backend.ANY
+            inner_impl = kernel_registry.get(
+                "fused_cross_entropy",
+                platform=resolved_platform,
+                backend=cfg_backend,
+            )
+
+            def per_chunk_ce_fn(logits, chunk_targets, chunk_weights):
+                per_row_loss, per_row_correct = inner_impl(
+                    logits,
+                    chunk_targets.astype(jnp.int32),
+                    chunk_weights.astype(jnp.float32),
+                    ignore_index=ignore_index,
+                    label_smoothing=label_smoothing,
+                    z_loss=z_loss,
+                    soft_targets=None,
+                    reduction="none",
+                    vocab_parallel_axis=None,
+                    block_v=cfg_block_v,
+                    block_m=cfg_block_m,
+                )
+                if z_loss > 0.0:
+                    lse = jax.scipy.special.logsumexp(logits.astype(jnp.float32), axis=-1)
+                    per_row_z_loss = z_loss * lse * lse * chunk_weights.astype(jnp.float32)
+                else:
+                    per_row_z_loss = jnp.zeros((), dtype=jnp.float32)
+                return per_row_loss, per_row_z_loss, per_row_correct
 
     loss, zl, wsum, acc = fused_linear_cross_entropy(
         hidden,
@@ -643,6 +685,7 @@ def _fused_linear_cross_entropy_dispatch(
         token_chunk_size=int(token_chunk_size),
         compute_dtype=cdtype,
         checkpoint=checkpoint,
+        per_chunk_ce_fn=per_chunk_ce_fn,
         sparse_skip=sparse_skip,
     )
     return CrossEntropyOutput(
@@ -962,6 +1005,8 @@ def fused_cross_entropy(
             token_chunk_size=chunk_size,
             compute_dtype=compute_dtype,
             checkpoint=checkpoint,
+            platform=platform,
+            cfg=cfg,
             sparse_skip=sparse_skip,
         )
 

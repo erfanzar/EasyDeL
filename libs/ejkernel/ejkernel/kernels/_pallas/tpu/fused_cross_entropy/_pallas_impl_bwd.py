@@ -66,6 +66,16 @@ def _pallas_out_shape(shape: tuple[int, ...], dtype: jnp.dtype) -> jax.ShapeDtyp
     )
 
 
+def _pallas_out_shape_like(shape: tuple[int, ...], dtype: jnp.dtype, like: jax.Array) -> jax.ShapeDtypeStruct:
+    """Build an output struct preserving an input value's manual-axis type."""
+    manual_axis_type = getattr(like, "manual_axis_type", None)
+    if manual_axis_type is None:
+        manual_axis_type = getattr(getattr(like, "aval", None), "manual_axis_type", None)
+    if manual_axis_type is not None:
+        return jax.ShapeDtypeStruct(shape, dtype, manual_axis_type=manual_axis_type)
+    return _pallas_out_shape(shape, dtype)
+
+
 def _pad_rows_2d(x: jax.Array, pad_rows: int, pad_value: float = 0.0) -> jax.Array:
     """Pad a row-major logits/gradient matrix to a whole Pallas row block.
 
@@ -330,7 +340,7 @@ def _ce_bwd_pallas(
             grid=(n_rows_pad // int(block_m), n_blocks),
         ),
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel")),
-        out_shape=_pallas_out_shape(logits_pad.shape, logits_2d.dtype),
+        out_shape=_pallas_out_shape_like(logits_pad.shape, logits_2d.dtype, logits_2d),
     )(
         logits_pad,
         lse_pad.astype(jnp.float32),
