@@ -1335,6 +1335,15 @@ class EasyBridgeMixin(PushToHubMixin):
                     stamp_fused_tp_config(model.config, _cf_live_tp)
                 model = _rebuild_lora_modules_from_checkpoint(model=model, flat_state=state)
 
+                from easydel.utils.parameters_transformation import StateDictConverter
+
+                native_fused_counts = StateDictConverter.apply_native_reform_param_fusions(
+                    state,
+                    getattr(model.pure_transform_fn, "keywords", {}).get("reform_param"),
+                )
+                for label, count in native_fused_counts.items():
+                    logger.info("Fused %d native checkpoint %s into runtime merged weights.", count, label)
+
             has_quantized_keys = any(
                 isinstance(k, tuple) and k and str(k[-1]).startswith("quant_") for k in state.keys()
             )

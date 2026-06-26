@@ -14,7 +14,6 @@
 
 import numpy as np
 import pytest
-
 from easydel.inference.esurge.runners.execution_manager import ExecutionManager
 
 
@@ -182,8 +181,9 @@ def test_runtime_bucket_validation_rejects_missing_spmd_bucket():
 
     class _SamplerExecutor:
         @staticmethod
-        def cache_key(*, padded_num_reqs: int) -> tuple[int, int, str, str]:
-            return (0, int(padded_num_reqs), "sampler", "jit")
+        def cache_key(*, padded_num_reqs: int, greedy: bool = False) -> tuple[int, int, str, str]:
+            variant = "sampler_greedy" if greedy else "sampler"
+            return (0, int(padded_num_reqs), variant, "jit")
 
         @staticmethod
         def has(key: tuple[int, int, str, str]) -> bool:
@@ -221,12 +221,16 @@ def test_runtime_bucket_validation_accepts_precompiled_mpmd_split_bucket():
 
     class _SamplerExecutor:
         @staticmethod
-        def cache_key(*, padded_num_reqs: int) -> tuple[int, int, str, str]:
-            return (0, int(padded_num_reqs), "sampler", "jit")
+        def cache_key(*, padded_num_reqs: int, greedy: bool = False) -> tuple[int, int, str, str]:
+            variant = "sampler_greedy" if greedy else "sampler"
+            return (0, int(padded_num_reqs), variant, "jit")
 
         @staticmethod
         def has(key: tuple[int, int, str, str]) -> bool:
-            return key == (0, 4, "sampler", "jit")
+            return key in {
+                (0, 4, "sampler", "jit"),
+                (0, 4, "sampler_greedy", "jit"),
+            }
 
     manager._model_executor = _ModelExecutor()
     manager._sampler_executor = _SamplerExecutor()

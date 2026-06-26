@@ -37,6 +37,7 @@ mRoPE indices and bridge between 1-D text-only position IDs and the
 3-D layout expected by the decoder.
 """
 
+import copy
 import itertools
 from dataclasses import dataclass
 
@@ -250,8 +251,11 @@ class Qwen3_5MTPLayer(spx.Module):
         self.param_dtype = param_dtype
         self.precision = precision
 
+        mtp_attn_config = copy.copy(config)
+        mtp_attn_config.attn_mechanism = "vanilla"
+        mtp_attn_config.decode_attn_mechanism = None
         self.self_attn = Qwen3NextFullAttention(
-            config=config,
+            config=mtp_attn_config,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,

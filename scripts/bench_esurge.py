@@ -427,6 +427,25 @@ def run_batch(runner, prompts: list[list[int]], output_len: int, max_num_batched
     generated = sum(len(req.output_token_ids) for req in requests)
     profile_records = [dict(r) for r in list(getattr(runner, "_perf_phase_history", []))[profile_start:]]
     profile_by_tokens: dict[str, dict] = {}
+    summed_profile_fields = (
+        ("runner_s", "runner_time"),
+        ("step_s", "step_time"),
+        ("step_gap_s", "step_gap_time"),
+        ("sync_s", "sync_time"),
+        ("misc_s", "misc_time"),
+        ("metrics_s", "metrics_time"),
+        ("copy_enqueue_s", "copy_enqueue_time"),
+        ("token_materialize_s", "token_materialize_time"),
+        ("execute_overhead_s", "execute_overhead_time"),
+        ("model_enqueue_s", "model_enqueue_time"),
+        ("sampler_enqueue_s", "sampler_enqueue_time"),
+        ("greedy_argmax_s", "greedy_argmax_time"),
+        ("logits_wait_s", "logits_wait_time"),
+        ("exec_enqueue_s", "exec_enqueue_time"),
+        ("exec_wait_s", "exec_wait_time"),
+        ("sampler_wait_s", "sampler_wait_time"),
+        ("prev_async_s", "prev_async_time"),
+    )
     for record in profile_records:
         key = str(int(record.get("total_tokens", 0) or 0))
         bucket = profile_by_tokens.setdefault(
@@ -443,6 +462,7 @@ def run_batch(runner, prompts: list[list[int]], output_len: int, max_num_batched
                 "cached_reqs": {},
                 "token_buckets": {},
                 "req_buckets": {},
+                **{summary_key: 0.0 for summary_key, _record_key in summed_profile_fields},
             },
         )
         bucket["steps"] += 1
@@ -451,6 +471,11 @@ def run_batch(runner, prompts: list[list[int]], output_len: int, max_num_batched
         bucket["prep_s"] += float(record.get("prep_time", 0.0) or 0.0)
         bucket["sample_s"] += float(record.get("sample_time", 0.0) or 0.0)
         bucket["post_s"] += float(record.get("post_time", 0.0) or 0.0)
+        for summary_key, record_key in summed_profile_fields:
+            bucket[summary_key] += float(record.get(record_key, 0.0) or 0.0)
+        bucket["greedy_argmax_fastpath"] = bucket.get("greedy_argmax_fastpath", 0) + int(
+            record.get("greedy_argmax_fastpath", 0) or 0
+        )
         scheduled_req_key = str(int(record.get("num_scheduled_reqs", 0) or 0))
         new_req_key = str(int(record.get("num_new", 0) or 0))
         cached_req_key = str(int(record.get("num_cached", 0) or 0))

@@ -541,6 +541,83 @@ class StateDictConverter:
         return fused_counts
 
     @staticmethod
+    def _reform_key_to_tuple(key: str) -> tuple[tp.Any, ...]:
+        """Convert a dotted reform-param key into a native checkpoint tuple path."""
+        if key.endswith("$"):
+            key = key[:-1]
+        parts: list[tp.Any] = []
+        for part in key.split("."):
+            if not part:
+                continue
+            parts.append(int(part) if part.isdigit() else part)
+        return tuple(parts)
+
+    @staticmethod
+    def _call_native_reform_fuser(rule: dict[str, tp.Any], tensors: list[tp.Any]) -> tp.Any:
+        """Apply a native EasyDeL checkpoint fusion rule."""
+        native_fuser = rule["native_fuser"]
+        return native_fuser(*tensors)
+
+    @staticmethod
+    def apply_native_reform_param_fusions(
+        state_dict: dict[tuple, tp.Any] | None,
+        reform_param: dict | None,
+        *,
+        collection_prefixes: tuple[tuple[tp.Any, ...], ...] = (("parameters",), ()),
+    ) -> dict[str, int]:
+        """Materialize fusion rules against EasyDeL-native tuple-key state.
+
+        The regular ``reform_param`` fusion path handles HuggingFace-style flat
+        keys and torch ``[out, in]`` tensors. Native TensorStore checkpoints
+        already carry EasyDeL tuple paths and JAX-friendly ``[in, out]``
+        leaves, so rules that want to support native split-to-merged loading
+        can provide a ``native_fuser`` callable.
+
+        Args:
+            state_dict: Flat native checkpoint tree keyed by tuples.
+            reform_param: Collected model reform rules.
+            collection_prefixes: Collection prefixes to try before the dotted
+                reform path. ``("parameters",)`` matches normal trainable
+                leaves; ``()`` keeps legacy collection-less checkpoints usable.
+
+        Returns:
+            Mapping of log label to the number of native groups fused.
+        """
+        if not state_dict or not reform_param:
+            return {}
+        StateDictConverter.validate_reform_param_schema(reform_param)
+
+        fused_counts: dict[str, int] = {}
+        sorted_items = sorted(reform_param.items(), key=lambda x: len(x[0]), reverse=True)
+
+        for key_check, rule in sorted_items:
+            if "native_fuser" not in rule or "sources" not in rule:
+                continue
+            target_path = StateDictConverter._reform_key_to_tuple(key_check)
+            source_paths = tuple(StateDictConverter._reform_key_to_tuple(source) for source in rule["sources"])
+            if not source_paths:
+                continue
+
+            for prefix in collection_prefixes:
+                target_key = (*prefix, *target_path)
+                source_keys = tuple((*prefix, *source_path) for source_path in source_paths)
+                if target_key in state_dict:
+                    break
+                if not all(source_key in state_dict for source_key in source_keys):
+                    continue
+
+                tensors = [state_dict[source_key] for source_key in source_keys]
+                state_dict[target_key] = StateDictConverter._call_native_reform_fuser(rule, tensors)
+                for source_key in source_keys:
+                    state_dict.pop(source_key, None)
+
+                label = str(rule.get("log_label", target_key))
+                fused_counts[label] = fused_counts.get(label, 0) + 1
+                break
+
+        return fused_counts
+
+    @staticmethod
     def process_tensor(key: str, tensor: tp.Any, config: dict[str, tp.Any]) -> list[tuple[tuple, jnp.ndarray]] | None:
         """Process a single PyTorch tensor into EasyDeL format.
 

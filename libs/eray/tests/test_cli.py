@@ -19,7 +19,6 @@ from unittest import mock
 
 import pytest
 from click.testing import CliRunner
-
 from eray.cli.main import _resolve_tpu, cli
 from eray.cli.tpu import ConnectResult
 from eray.cli.utils import TpuInfo, build_ray_resource_flags, list_tpus_in_project, list_tpus_in_zone
@@ -130,9 +129,13 @@ class TestResolveTpu:
 
     def test_ips_returns_direct_tpuinfo(self):
         tpu, user, key = _resolve_tpu(
-            None, None, None,
+            None,
+            None,
+            None,
             "10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4",
-            "v4-32", None, None,
+            "v4-32",
+            None,
+            None,
         )
         assert tpu.is_gcloud_managed is False
         assert tpu.num_hosts == 4
@@ -142,10 +145,13 @@ class TestResolveTpu:
 
     def test_ips_with_ssh_user(self):
         _tpu, user, key = _resolve_tpu(
-            None, None, None,
+            None,
+            None,
+            None,
             "10.0.0.1",
             "v4-8",
-            "myuser", "/home/user/.ssh/id_rsa",
+            "myuser",
+            "/home/user/.ssh/id_rsa",
         )
         assert user == "myuser"
         assert key == "/home/user/.ssh/id_rsa"
@@ -194,29 +200,49 @@ class TestTpuConnect:
 
     def test_connect_both_modes_rejected(self):
         runner = CliRunner()
-        result = runner.invoke(cli, [
-            "tpu", "connect",
-            "--tpu-name", "x", "--project", "p", "--zone", "z",
-            "--ips", "10.0.0.1",
-        ])
+        result = runner.invoke(
+            cli,
+            [
+                "tpu",
+                "connect",
+                "--tpu-name",
+                "x",
+                "--project",
+                "p",
+                "--zone",
+                "z",
+                "--ips",
+                "10.0.0.1",
+            ],
+        )
         assert result.exit_code != 0
         assert "mutually exclusive" in result.output
 
     def test_connect_ips_without_type_rejected(self):
         runner = CliRunner()
-        result = runner.invoke(cli, [
-            "tpu", "connect",
-            "--ips", "10.0.0.1,10.0.0.2",
-        ])
+        result = runner.invoke(
+            cli,
+            [
+                "tpu",
+                "connect",
+                "--ips",
+                "10.0.0.1,10.0.0.2",
+            ],
+        )
         assert result.exit_code != 0
         assert "tpu-type" in result.output.lower()
 
     def test_connect_ips_without_type_rejected_message(self):
         runner = CliRunner()
-        result = runner.invoke(cli, [
-            "tpu", "connect",
-            "--ips", "10.0.0.1",
-        ])
+        result = runner.invoke(
+            cli,
+            [
+                "tpu",
+                "connect",
+                "--ips",
+                "10.0.0.1",
+            ],
+        )
         assert result.exit_code != 0
 
 

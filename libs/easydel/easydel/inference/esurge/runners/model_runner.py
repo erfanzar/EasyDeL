@@ -309,6 +309,8 @@ class eSurgeRunner:
         kernel_tile_policy: KernelTilePolicy = "auto",
         max_model_len: int = 2**13,
         max_num_batched_tokens: int | None = None,
+        compile_vision_encoder: bool = True,
+        vision_patch_buckets: list[int] | None = None,
         min_input_pad: int = 256,
         min_token_pad: int | None = None,
         max_num_seqs: int = 16,
@@ -333,6 +335,10 @@ class eSurgeRunner:
             max_model_len: Maximum sequence length.
             max_num_batched_tokens: Maximum scheduler token budget used for
                 window-aware runtime-cap estimation.
+            compile_vision_encoder: Whether to precompile and use a bucketed
+                JIT helper for VLM vision features.
+            vision_patch_buckets: Optional raw patch-count buckets used by the
+                VLM vision precompile helper.
             min_input_pad: Minimum request-count bucket.
             min_token_pad: Optional minimum token bucket size.
             max_num_seqs: Maximum concurrent sequences.
@@ -383,6 +389,13 @@ class eSurgeRunner:
         self._spec_verify_sample_fns: dict[tuple, typing.Callable] = {}
         self._spec_recurrent_commit_fn: typing.Callable | None = None
         self._spec_recurrent_commit_candidate_count: int = 0
+        self.compile_vision_encoder = bool(compile_vision_encoder)
+        self.vision_patch_buckets = (
+            [int(bucket) for bucket in vision_patch_buckets] if vision_patch_buckets is not None else None
+        )
+        self._vlm_image_features_jit: typing.Callable | None = None
+        self._vlm_video_features_jit: typing.Callable | None = None
+        self._vlm_vision_jit_disabled = False
         self.spec_decode_reject_backoff_steps = 0
         self._spec_decode_backoff_by_req: dict[str, int] = {}
         logger.debug(f"Initializing eSurgeRunner with {max_model_len=}, {max_num_seqs=}")
@@ -1587,6 +1600,8 @@ class eSurgeRunner:
             prune_infeasible_pairs=self._allow_sparse_window_packing,
         )
 
+        self._precompile_vlm_vision_helpers(max_num_batched_tokens=num_tokens_paddings[-1])
+
         helper_prompt_buckets = [min(n, self.max_model_len) for n in num_tokens_paddings]
         if self.pipeline_plan.is_enabled:
             helper_prompt_buckets = sorted({helper_prompt_buckets[0], helper_prompt_buckets[-1]})
@@ -1636,6 +1651,9 @@ class eSurgeRunner:
         model = model.esurge_compatible_model
         graphdef = model.graphdef
         self.model = model
+        self._vlm_image_features_jit = None
+        self._vlm_video_features_jit = None
+        self._vlm_vision_jit_disabled = False
 
         self.executor_manager.update_graphs(
             model=model,
@@ -1669,6 +1687,9 @@ class eSurgeRunner:
 
         # Drop strong references to model and device-resident graph trees.
         self.model = None
+        self._vlm_image_features_jit = None
+        self._vlm_video_features_jit = None
+        self._vlm_vision_jit_disabled = False
         self.executor_manager.model = None
         self.executor_manager.graphstate = None
         self.executor_manager.graphother = None
@@ -1724,6 +1745,262 @@ class eSurgeRunner:
         )
         return
 
+    @staticmethod
+    def _static_grid_thw(grid: np.ndarray | jax.Array | tuple | list | None) -> tuple[tuple[int, int, int], ...] | None:
+        """Convert a processor grid into a hashable static JIT argument."""
+        if grid is None:
+            return None
+        arr = np.asarray(grid, dtype=np.int64)
+        if arr.size == 0:
+            return None
+        if arr.ndim == 1:
+            if arr.shape[0] != 3:
+                return None
+            arr = arr.reshape(1, 3)
+        if arr.ndim != 2 or arr.shape[-1] != 3:
+            return None
+        return tuple(tuple(int(v) for v in row) for row in arr.tolist())
+
+    @staticmethod
+    def _max_grid_size(grid: tuple[tuple[int, int, int], ...] | None) -> int | None:
+        """Return the static max spatial grid size used by Qwen-style vision towers."""
+        if not grid:
+            return None
+        return max(max(int(row[1]), int(row[2])) for row in grid)
+
+    @staticmethod
+    def _block_tree_until_ready(value: typing.Any) -> None:
+        for leaf in jax.tree_util.tree_leaves(value):
+            if hasattr(leaf, "block_until_ready"):
+                leaf.block_until_ready()
+
+    def _vlm_uses_deepstack_visuals(self) -> bool:
+        vision_config = getattr(getattr(self.model, "config", None), "vision_config", None)
+        deepstack_indexes = getattr(vision_config, "deepstack_visual_indexes", None)
+        return bool(deepstack_indexes)
+
+    def _vision_patch_input_dim(self) -> int | None:
+        vision_config = getattr(getattr(self.model, "config", None), "vision_config", None)
+        if vision_config is None:
+            return None
+        try:
+            in_channels = int(vision_config.in_channels)
+            temporal_patch_size = int(vision_config.temporal_patch_size)
+            patch_size = int(vision_config.patch_size)
+        except (TypeError, ValueError, AttributeError):
+            return None
+        return in_channels * temporal_patch_size * patch_size * patch_size
+
+    def _vision_spatial_merge_size(self) -> int:
+        vision_config = getattr(getattr(self.model, "config", None), "vision_config", None)
+        try:
+            return max(1, int(getattr(vision_config, "spatial_merge_size", 1) or 1))
+        except (TypeError, ValueError):
+            return 1
+
+    def _vision_dtype(self) -> jnp.dtype:
+        base_model = getattr(self.model, "base_model", self.model)
+        visual = getattr(base_model, "visual", getattr(self.model, "visual", None))
+        if visual is not None and callable(getattr(visual, "get_dtype", None)):
+            dtype = visual.get_dtype()
+        else:
+            dtype = getattr(self.model, "dtype", jnp.bfloat16)
+        try:
+            return jnp.dtype(dtype)
+        except TypeError:
+            return jnp.bfloat16
+
+    def _vision_grid_for_patch_bucket(self, raw_patches: int) -> tuple[int, tuple[int, int, int]]:
+        spatial_merge = self._vision_spatial_merge_size()
+        merge_unit = spatial_merge * spatial_merge
+        raw_patches = max(merge_unit, int(raw_patches))
+        if raw_patches % merge_unit:
+            raw_patches = ((raw_patches + merge_unit - 1) // merge_unit) * merge_unit
+
+        merged_tokens = max(1, raw_patches // merge_unit)
+        h_merged = max(1, int(np.sqrt(merged_tokens)))
+        while h_merged > 1 and merged_tokens % h_merged:
+            h_merged -= 1
+        w_merged = max(1, merged_tokens // h_merged)
+        return raw_patches, (1, h_merged * spatial_merge, w_merged * spatial_merge)
+
+    def _vision_patch_buckets_for_compile(self, *, max_num_batched_tokens: int | None) -> list[int]:
+        if self.vision_patch_buckets is not None:
+            return sorted({max(1, int(bucket)) for bucket in self.vision_patch_buckets})
+
+        spatial_merge = self._vision_spatial_merge_size()
+        merge_unit = spatial_merge * spatial_merge
+        token_budget = max(1, int(max_num_batched_tokens or self.max_num_batched_tokens or self.max_num_tokens))
+        max_patches = max(16, token_budget // merge_unit)
+        min_shift = 4
+        max_shift = max(min_shift, (max_patches - 1).bit_length())
+        return [1 << shift for shift in range(min_shift, max_shift + 1)]
+
+    def _get_vlm_image_features_jit(self) -> typing.Callable:
+        if self._vlm_image_features_jit is None:
+            model = self.model
+
+            @partial(jax.jit, static_argnames=("image_grid_thw", "image_max_grid_size"))
+            def _image_features(
+                pixel_values: jax.Array,
+                *,
+                image_grid_thw: tuple[tuple[int, int, int], ...],
+                image_max_grid_size: int | None,
+            ):
+                image_embeds_tuple, deepstack_image_embeds = model.get_image_features(
+                    pixel_values,
+                    image_grid_thw,
+                    image_max_grid_size,
+                )
+                deepstack = () if deepstack_image_embeds is None else tuple(deepstack_image_embeds)
+                return jnp.concatenate(image_embeds_tuple, axis=0), deepstack
+
+            self._vlm_image_features_jit = _image_features
+        return self._vlm_image_features_jit
+
+    def _get_vlm_video_features_jit(self) -> typing.Callable:
+        if self._vlm_video_features_jit is None:
+            model = self.model
+
+            @partial(jax.jit, static_argnames=("video_grid_thw", "video_max_grid_size"))
+            def _video_features(
+                pixel_values_videos: jax.Array,
+                *,
+                video_grid_thw: tuple[tuple[int, int, int], ...],
+                video_max_grid_size: int | None,
+            ):
+                video_embeds_tuple, deepstack_video_embeds = model.get_video_features(
+                    pixel_values_videos,
+                    video_grid_thw,
+                    video_max_grid_size,
+                )
+                deepstack = () if deepstack_video_embeds is None else tuple(deepstack_video_embeds)
+                return jnp.concatenate(video_embeds_tuple, axis=0), deepstack
+
+            self._vlm_video_features_jit = _video_features
+        return self._vlm_video_features_jit
+
+    def _compute_embedding_with_info_single_pass(
+        self,
+        input_ids: jax.Array,
+        embed_kwargs: dict[str, typing.Any],
+    ) -> tuple[jax.Array, typing.Any]:
+        """Compute VLM embeddings while avoiding wrapper-level duplicate vision work."""
+        base_model = getattr(self.model, "base_model", None)
+        base_fn = getattr(base_model, "compute_embedding_with_info", None) if base_model is not None else None
+        if callable(base_fn):
+            try:
+                return base_fn(input_ids, **embed_kwargs)
+            except TypeError:
+                pass
+        return self.model.compute_embedding_with_info(input_ids, **embed_kwargs)
+
+    def _compiled_vision_embed_kwargs(self, req_state: CachedRequestState) -> dict[str, typing.Any] | None:
+        if (
+            not self.compile_vision_encoder
+            or self._vlm_vision_jit_disabled
+            or self._vlm_uses_deepstack_visuals()
+            or self.model is None
+        ):
+            return None
+        if int(getattr(self.metadata, "data_parallel_size", 1) or 1) > 1:
+            return None
+
+        embed_kwargs: dict[str, typing.Any] = {}
+        try:
+            if req_state.pixel_values is not None:
+                image_grid = self._static_grid_thw(req_state.image_grid_thw)
+                if image_grid is None:
+                    return None
+                image_embeds, deepstack_image_embeds = self._get_vlm_image_features_jit()(
+                    jnp.asarray(req_state.pixel_values),
+                    image_grid_thw=image_grid,
+                    image_max_grid_size=self._max_grid_size(image_grid),
+                )
+                if deepstack_image_embeds:
+                    return None
+                embed_kwargs["image_embeds"] = image_embeds
+                embed_kwargs["image_grid_thw"] = image_grid
+
+            if req_state.pixel_values_videos is not None:
+                video_grid = self._static_grid_thw(req_state.video_grid_thw)
+                if video_grid is None:
+                    return None
+                video_embeds, deepstack_video_embeds = self._get_vlm_video_features_jit()(
+                    jnp.asarray(req_state.pixel_values_videos),
+                    video_grid_thw=video_grid,
+                    video_max_grid_size=self._max_grid_size(video_grid),
+                )
+                if deepstack_video_embeds:
+                    return None
+                embed_kwargs["video_embeds"] = video_embeds
+                embed_kwargs["video_grid_thw"] = video_grid
+        except Exception as exc:
+            self._vlm_vision_jit_disabled = True
+            logger.warning(
+                "VLM vision JIT helper failed; falling back to eager vision precompute: %s",
+                exc,
+            )
+            return None
+
+        return embed_kwargs or None
+
+    def _compute_vlm_prefill_with_compiled_vision(
+        self,
+        req_state: CachedRequestState,
+        input_ids: jax.Array,
+        attention_mask: jax.Array,
+    ) -> tuple[jax.Array, typing.Any] | None:
+        vision_kwargs = self._compiled_vision_embed_kwargs(req_state)
+        if vision_kwargs is None:
+            return None
+        embed_kwargs: dict[str, typing.Any] = {"attention_mask": attention_mask}
+        embed_kwargs.update(vision_kwargs)
+        return self._compute_embedding_with_info_single_pass(input_ids, embed_kwargs)
+
+    def _precompile_vlm_vision_helpers(self, *, max_num_batched_tokens: int | None) -> None:
+        if (
+            not self.compile_vision_encoder
+            or self._vlm_vision_jit_disabled
+            or self._vlm_uses_deepstack_visuals()
+            or self.model is None
+            or not callable(getattr(self.model, "get_image_features", None))
+        ):
+            return
+        if int(getattr(self.metadata, "data_parallel_size", 1) or 1) > 1:
+            return
+
+        patch_input_dim = self._vision_patch_input_dim()
+        if patch_input_dim is None:
+            return
+
+        buckets = self._vision_patch_buckets_for_compile(max_num_batched_tokens=max_num_batched_tokens)
+        if not buckets:
+            return
+
+        image_features = self._get_vlm_image_features_jit()
+        dtype = self._vision_dtype()
+        logger.info("Precompiling VLM vision feature buckets: %s raw patches", buckets)
+        for bucket in buckets:
+            raw_patches, grid = self._vision_grid_for_patch_bucket(bucket)
+            dummy_pixels = jnp.ones((raw_patches, patch_input_dim), dtype=dtype)
+            try:
+                out = image_features(
+                    dummy_pixels,
+                    image_grid_thw=(grid,),
+                    image_max_grid_size=self._max_grid_size((grid,)),
+                )
+                self._block_tree_until_ready(out)
+            except Exception as exc:
+                self._vlm_vision_jit_disabled = True
+                logger.warning(
+                    "VLM vision JIT precompile failed at raw_patches=%d; falling back to eager vision precompute: %s",
+                    raw_patches,
+                    exc,
+                )
+                return
+        logger.info("VLM vision feature precompilation finished")
+
     def _precompute_vlm_prefill(self, req_state: CachedRequestState) -> None:
         """Precompute prompt embeddings (+ optional mRoPE indices) for VLM requests.
 
@@ -1763,7 +2040,15 @@ class eSurgeRunner:
                 if req_state.video_grid_thw is not None:
                     embed_kwargs["video_grid_thw"] = req_state.video_grid_thw
 
-            inputs_embeds, info = self.model.compute_embedding_with_info(input_ids, **embed_kwargs)
+            compiled_result = self._compute_vlm_prefill_with_compiled_vision(
+                req_state=req_state,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            )
+            if compiled_result is None:
+                inputs_embeds, info = self._compute_embedding_with_info_single_pass(input_ids, embed_kwargs)
+            else:
+                inputs_embeds, info = compiled_result
         except Exception as exc:
             logger.warning(f"VLM precompute failed for req_id={req_state.req_id}: {exc}")
             return
@@ -3913,6 +4198,8 @@ class eSurgeRunner:
         total_execute_overhead_time = 0.0
         total_model_enqueue_time = 0.0
         total_sampler_enqueue_time = 0.0
+        total_greedy_argmax_time = 0.0
+        total_greedy_argmax_fastpath = 0
         total_logits_wait_time = 0.0
         total_exec_enqueue_time = 0.0
         total_exec_wait_time = 0.0
@@ -4382,6 +4669,8 @@ class eSurgeRunner:
             total_execute_overhead_time += float(window_metrics.get("execute_overhead_time", 0.0))
             total_model_enqueue_time += float(window_metrics.get("model_enqueue_time", 0.0))
             total_sampler_enqueue_time += float(window_metrics.get("sampler_enqueue_time", 0.0))
+            total_greedy_argmax_time += float(window_metrics.get("greedy_argmax_time", 0.0))
+            total_greedy_argmax_fastpath += int(window_metrics.get("greedy_argmax_fastpath", 0))
             total_logits_wait_time += float(window_metrics.get("logits_wait_time", 0.0))
             total_exec_enqueue_time += float(window_metrics.get("exec_enqueue_time", 0.0))
             total_exec_wait_time += float(window_metrics.get("exec_wait_time", 0.0))
@@ -5445,6 +5734,8 @@ class eSurgeRunner:
                 "forward_time": total_exec_time,
                 "model_enqueue_time": total_model_enqueue_time,
                 "sampler_enqueue_time": total_sampler_enqueue_time,
+                "greedy_argmax_time": total_greedy_argmax_time,
+                "greedy_argmax_fastpath": total_greedy_argmax_fastpath,
                 "logits_wait_time": total_logits_wait_time,
                 "exec_enqueue_time": total_exec_enqueue_time,
                 "exec_wait_time": total_exec_wait_time,

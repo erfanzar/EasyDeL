@@ -230,7 +230,10 @@ class OperationMetadata:
         self.set_attrs_carefully("backend", jax.default_backend(), "backend")
         self.set_attrs_carefully("platform", NOT_GIVEN, "platform")
         self.set_attrs_carefully("_stored_mesh", NOT_GIVEN, "mesh")
-        self.set_attrs_carefully("operation_configs", None, "operation_configs")
+        if self.operation_configs is None and self.base_config is not None:
+            self.operation_configs = getattr(self.base_config, "operation_configs", None)
+        else:
+            self.set_attrs_carefully("operation_configs", None, "operation_configs")
         # fmt:on
         if self._stored_mesh is NOT_GIVEN and self.base_config is None:
             mesh: MeshLike | None = spx.get_incontext_mesh(raise_error=False)

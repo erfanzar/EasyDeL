@@ -16,9 +16,6 @@ import jax
 import numpy as np
 import pytest
 import torch
-from jax import numpy as jnp
-from transformers import TopPLogitsWarper
-
 from easydel.inference.esurge.core.binary_search import apply_topp_mask
 from easydel.inference.esurge.core.sampler import (
     apply_history_penalties,
@@ -33,6 +30,8 @@ from easydel.inference.esurge.runners.execution_types import BatchMetadata
 from easydel.inference.oai_proxies import InferenceApiRouter
 from easydel.inference.openai_api_modules import ChatCompletionRequest, CompletionRequest
 from easydel.inference.sampling_params import SamplingParams
+from jax import numpy as jnp
+from transformers import TopPLogitsWarper
 
 
 def test_apply_history_penalties_supports_presence_and_repetition():
@@ -174,8 +173,8 @@ def test_execution_manager_sample_tokens_forwards_incremental_penalty_state():
         )
 
     class _StubSamplerExecutor:
-        def get_compiled(self, *, num_tokens: int, padded_num_reqs: int):
-            calls["compile_key"] = (num_tokens, padded_num_reqs)
+        def get_compiled(self, *, num_tokens: int, padded_num_reqs: int, greedy: bool = False):
+            calls["compile_key"] = (num_tokens, padded_num_reqs, greedy)
             return compiled
 
     manager = object.__new__(ExecutionManager)
@@ -229,7 +228,7 @@ def test_execution_manager_sample_tokens_forwards_incremental_penalty_state():
         need_penalties=True,
     )
 
-    assert calls["compile_key"] == (2, 2)
+    assert calls["compile_key"] == (2, 2, False)
     assert calls["rebuilt"] is True
 
     args = calls["args"]

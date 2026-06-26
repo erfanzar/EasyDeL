@@ -23,8 +23,8 @@ reference implementations across the schedules that arise during inference. Spec
 * ``_apply_qwen3_next_packed_updates`` / ``_apply_qwen3_next_packed_updates_unified`` (the packed,
   per-request fused conv1d + GDR state update used by the eSurge runner) versus a straight-line Python
   reference loop (``_reference_packed_updates``) that processes each request slot independently.
-* The unified-vs-ragged dispatch decision driven by the ``EASYDEL_RAGGED_GDR`` environment variable and
-  inference mode, and the sharding-preservation helper ``_preserve_array_sharding``.
+* The unified-vs-ragged dispatch decision driven by explicit config-style arguments and inference mode,
+  and the sharding-preservation helper ``_preserve_array_sharding``.
 
 The helpers prefixed with ``_make_*`` build randomized but reproducible input fixtures for the various
 schedules (decode-like one-token-per-request, mixed prefill+decode, many short prefills, large padded
@@ -798,23 +798,18 @@ def test_packed_updates_match_reference_loop_for_large_bucket_decode_like_schedu
     assert jnp.allclose(unified_out.astype(jnp.float32), ref_out.astype(jnp.float32), rtol=0.02, atol=0.05)
 
 
-def test_packed_updates_use_unified_when_ragged_disabled_for_partial_prefill_bucket(monkeypatch):
-    """Assert the dispatcher falls back to the unified path when ragged GDR is disabled via env var.
+def test_packed_updates_use_unified_when_ragged_disabled_for_partial_prefill_bucket():
+    """Assert the dispatcher falls back to the unified path when ragged GDR is disabled.
 
-    Sets ``EASYDEL_RAGGED_GDR=0`` and, under inference mode, runs the public dispatcher
+    Passes ``use_ragged_gdr=False`` and, under inference mode, runs the public dispatcher
     ``_apply_qwen3_next_packed_updates`` alongside the unified implementation
     ``_apply_qwen3_next_packed_updates_unified`` and the Python reference on a partial 512-bucket prefill
     (454 real tokens). Verifies the dispatched output equals the unified output (proving it took the unified
     branch), both match the reference within a slightly looser ``rtol=0.03, atol=0.06``, and that token output
     past the 454th position is exactly zero.
-
-    Args:
-        monkeypatch: Pytest fixture used to set the ``EASYDEL_RAGGED_GDR`` environment variable for the test.
     """
     packed_inputs = _make_partial_bucket_prefill_inputs(bucket=512, actual_tokens=454)
     mesh = _make_runtime_mesh()
-
-    monkeypatch.setenv("EASYDEL_RAGGED_GDR", "0")
 
     with mesh, set_inference_mode(True):
         gdr_op = _make_gdr_op(mesh)
@@ -822,6 +817,7 @@ def test_packed_updates_use_unified_when_ragged_disabled_for_partial_prefill_buc
             **packed_inputs,
             gdr_op=gdr_op,
             ragged_gdr_op=object(),
+            use_ragged_gdr=False,
         )
         unified_conv, unified_rec, unified_out = _apply_qwen3_next_packed_updates_unified(
             **packed_inputs,
@@ -848,18 +844,16 @@ def test_packed_updates_use_unified_when_ragged_disabled_for_partial_prefill_buc
 def test_packed_updates_keep_ragged_for_partial_decode_bucket(monkeypatch):
     """Assert the dispatcher selects the ragged path when ragged GDR is enabled for a decode bucket.
 
-    Sets ``EASYDEL_RAGGED_GDR=1`` and monkeypatches both the unified and ragged packed-update implementations
+    Monkeypatches both the unified and ragged packed-update implementations
     with sentinel functions returning distinguishable marker tuples (all-1s vs all-2s). Under inference mode it
     calls the dispatcher and asserts the returned marker is the ragged one (value 2), proving the ragged branch
     was taken for a large padded decode bucket.
 
     Args:
-        monkeypatch: Pytest fixture used to set ``EASYDEL_RAGGED_GDR`` and replace the unified/ragged
+        monkeypatch: Pytest fixture used to replace the unified/ragged
             implementation functions on the modeling module with sentinels.
     """
     packed_inputs = _make_large_bucket_decode_inputs(bucket=512)
-
-    monkeypatch.setenv("EASYDEL_RAGGED_GDR", "1")
 
     unified_marker = (
         jnp.array([1], dtype=jnp.int32),

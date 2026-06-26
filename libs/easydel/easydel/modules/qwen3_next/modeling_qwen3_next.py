@@ -53,7 +53,6 @@ Public surface:
       computes the routed-MoE auxiliary load-balancing loss.
 """
 
-import os
 import typing
 from dataclasses import dataclass
 
@@ -114,12 +113,14 @@ from easydel.layers import (
     RowParallelLinear,
     RowParallelMoELinear,
     build_fused_gate_up_projection,
+    interleave_segments_last_axis,
     interleaved_fusion_reform_param,
     keep_interleaved_segments_last_axis,
     moe_down_projection_reform_param,
     moe_fused_gate_up_reform_param,
     split_fused_gate_up_projection,
     split_interleaved_segments_last_axis,
+    tensor_parallel_axis,
     tensor_parallel_size,
     torch_deinterleave_segments_for_tp,
     torch_interleave_segments_for_tp,
@@ -190,6 +191,124 @@ def _apply_tp_last_axis_sharding(x: Array, config: Qwen3NextConfig) -> Array:
 def _qwen3_next_tp_size(config: Qwen3NextConfig) -> int:
     """Return the tensor-parallel mesh size from the Qwen3-Next config."""
     return tensor_parallel_size(config)
+
+
+def _qwen3_next_tp_ring_column_matmul(
+    hidden_states: Array,
+    kernel: Array,
+    *,
+    config: Qwen3NextConfig,
+    precision: jax.lax.PrecisionLike,
+) -> Array | None:
+    """Column matmul that streams TP hidden shards without changing weight layout."""
+    tp_axis = tensor_parallel_axis(config)
+    if tp_axis is None or hidden_states.ndim != 3 or kernel.ndim != 2:
+        return None
+
+    stage_mesh = resolve_stage_mesh(config.mesh, arr=hidden_states)
+    if stage_mesh is None:
+        return None
+
+    tp_size = int(mesh_axis_size(stage_mesh, tp_axis))
+    if (
+        tp_size <= 1
+        or int(hidden_states.shape[-1]) != int(kernel.shape[0])
+        or int(hidden_states.shape[-1]) % tp_size != 0
+        or int(kernel.shape[-1]) % tp_size != 0
+    ):
+        return None
+
+    hidden_spec = config.runtime_sharding_resolver.resolve(
+        dynamic_axes=common_types.HiddenStateSharding,
+        shape=tuple(int(dim) for dim in hidden_states.shape),
+    )
+    if len(hidden_spec) != hidden_states.ndim or tuple(hidden_spec)[-1] != tp_axis:
+        return None
+
+    kernel_spec = PartitionSpec(None, tp_axis)
+    out_spec = PartitionSpec(*tuple(hidden_spec[:-1]), tp_axis)
+    perm = tuple((idx, (idx + 1) % tp_size) for idx in range(tp_size))
+
+    def _ring_body(x_local: Array, w_local: Array) -> Array:
+        axis_index = jax.lax.axis_index(tp_axis)
+        k_shard = int(x_local.shape[-1])
+        out_shape = (*x_local.shape[:-1], int(w_local.shape[-1]))
+        out = jnp.zeros(out_shape, dtype=x_local.dtype)
+        x_step = x_local
+        for step in range(tp_size):
+            source_index = (axis_index - step) % tp_size
+            w_start = source_index * k_shard
+            w_slice = jax.lax.dynamic_slice_in_dim(w_local, w_start, k_shard, axis=0)
+            out = out + jnp.einsum(
+                "...i,io->...o",
+                x_step,
+                w_slice,
+                precision=precision,
+            )
+            if step != tp_size - 1:
+                x_step = jax.lax.ppermute(x_step, tp_axis, perm=perm)
+        return out
+
+    mapped = jax.shard_map(
+        _ring_body,
+        mesh=stage_mesh,
+        in_specs=(hidden_spec, kernel_spec),
+        out_specs=out_spec,
+        check_vma=False,
+    )
+    return mapped(hidden_states, kernel)
+
+
+def _qwen3_next_tp_ring_column_linear(
+    layer: ColumnParallelLinear,
+    hidden_states: Array,
+    kernel: Array | None = None,
+    *,
+    config: Qwen3NextConfig,
+    precision: jax.lax.PrecisionLike,
+    min_output_size: int = 0,
+) -> Array | None:
+    """Run a ColumnParallelLinear with TP-ring K streaming when supported."""
+    if kernel is None and layer.bias is not None:
+        return None
+    if kernel is None:
+        kernel = layer.weight.value
+    if kernel.ndim != 2 or int(kernel.shape[-1]) < int(min_output_size):
+        return None
+    if layer.dtype is not None:
+        hidden_states = jnp.asarray(hidden_states, dtype=layer.dtype)
+        kernel = jnp.asarray(kernel, dtype=layer.dtype)
+    out_features = int(kernel.shape[-1])
+    with jax.named_scope(f"easydel/linear/{type(layer).__name__}/in{layer.in_features}/out{out_features}"):
+        y = _qwen3_next_tp_ring_column_matmul(
+            hidden_states,
+            kernel,
+            config=config,
+            precision=precision,
+        )
+    if y is None:
+        return None
+    return layer._scale_operator(y)
+
+
+def _qwen3_next_local_head_count(heads: int, config: Qwen3NextConfig) -> int:
+    """Return the static local head count after sanitized TP head sharding."""
+    tp_size = _qwen3_next_tp_size(config)
+    if tp_size <= 1 or heads % tp_size != 0:
+        return heads
+    return heads // tp_size
+
+
+def _qwen3_next_grouped_gdr_prefill_is_local_valid(
+    *,
+    num_k_heads: int,
+    num_v_heads: int,
+    config: Qwen3NextConfig,
+) -> bool:
+    """Whether grouped-GDR prefill remains valid after local TP head sharding."""
+    local_k_heads = _qwen3_next_local_head_count(num_k_heads, config)
+    local_v_heads = _qwen3_next_local_head_count(num_v_heads, config)
+    return local_k_heads > 0 and local_v_heads % local_k_heads == 0
 
 
 def _qwen3_next_full_attention_layout(*, q_size: int, kv_size: int) -> FusedColumnLayout:
@@ -342,11 +461,27 @@ class Qwen3NextLinearAttentionLayout:
             )
             return torch.cat((q, k, v), dim=0).contiguous(), z
 
+        def _qkvz_native(qkv, z):
+            """Fuse native EasyDeL split QKV/Z leaves into runtime QKVZ layout."""
+            q, k, v = jnp.split(qkv, [self.key_dim, self.key_dim * 2], axis=-1)
+            return interleave_segments_last_axis(
+                (q, k, v, z),
+                tp_size=_qwen3_next_tp_size(self.config),
+            )
+
+        def _ba_native(beta, alpha):
+            """Fuse native EasyDeL split beta/alpha leaves into runtime BA layout."""
+            return interleave_segments_last_axis(
+                (beta, alpha),
+                tp_size=_qwen3_next_tp_size(self.config),
+            )
+
         reform_param = {
             "in_proj_qkvz.weight$": {
                 "sources": ("in_proj_qkv.weight", "in_proj_z.weight"),
                 "fuser": _qkvz,
                 "inverse_fuser": _qkvz_inverse,
+                "native_fuser": _qkvz_native,
                 "log_label": "linear-attention qkv/z weight groups",
             },
         }
@@ -358,6 +493,7 @@ class Qwen3NextLinearAttentionLayout:
                 log_label="linear-attention beta/alpha weight groups",
             )
         )
+        reform_param["in_proj_ba.weight$"]["native_fuser"] = _ba_native
         return reform_param
 
 
@@ -1450,6 +1586,9 @@ def _apply_qwen3_next_packed_updates_ragged(
     context_lens: Int[Array, "num_slots"] | None = None,
     spec_recurrent_commit: Int[Array, "2 num_slots"] | None = None,
     disable_recurrent_scan_prefill: bool = False,
+    ragged_gdr_chunk_size: int = 16,
+    force_recurrent_scan_prefill: bool = False,
+    recurrent_scan_prefill_max_seq_len: int = 64,
 ) -> tuple[
     Float[Array, "num_slots conv_dim d_conv"],
     Float[Array, "num_slots num_v_heads head_dim value_dim"],
@@ -1589,13 +1728,11 @@ def _apply_qwen3_next_packed_updates_ragged(
     use_head_sharded_conv = (
         mesh is not None and head_axis is not None and tp_size > 1 and all(size % tp_size == 0 for size in split_sizes)
     )
-    force_recurrent_scan_prefill = os.environ.get("EASYDEL_QWEN3_NEXT_RECURRENT_SCAN_PREFILL", "0") == "1"
-    recurrent_scan_max_prefill = int(os.environ.get("EASYDEL_QWEN3_NEXT_RECURRENT_SCAN_MAX_PREFILL", "64"))
     use_recurrent_scan_prefill = (
         jax.default_backend() == "tpu"
         and seq_len >= 128
         and not bool(disable_recurrent_scan_prefill)
-        and (force_recurrent_scan_prefill or seq_len <= recurrent_scan_max_prefill)
+        and (force_recurrent_scan_prefill or seq_len <= recurrent_scan_prefill_max_seq_len)
     )
     candidate_conv_states, candidate_recurrent_states = _write_qwen3_next_spec_candidate_states(
         conv_states=conv_states,
@@ -1660,9 +1797,10 @@ def _apply_qwen3_next_packed_updates_ragged(
             use_qk_norm_in_gdn=True,
             pre_sharded_mixed_qkv=use_head_sharded_conv,
             flat_tp_shard=use_head_sharded_conv,
-            chunk_size=16,
+            chunk_size=ragged_gdr_chunk_size,
             apply_silu_in_gdr=use_recurrent_scan_prefill,
             use_recurrent_scan_prefill=use_recurrent_scan_prefill,
+            mask_initial_state=context_lens is not None,
         )
         token_outputs_i = token_outputs_i.reshape(seq_len, num_v_heads, head_v_dim)
         if conv_states.shape[0] > num_slots:
@@ -1703,6 +1841,10 @@ def _apply_qwen3_next_packed_updates(
     context_lens: Int[Array, "num_slots"] | None = None,
     spec_recurrent_commit: Int[Array, "2 num_slots"] | None = None,
     disable_recurrent_scan_prefill: bool = False,
+    use_ragged_gdr: bool = True,
+    ragged_gdr_chunk_size: int = 16,
+    force_recurrent_scan_prefill: bool = False,
+    recurrent_scan_prefill_max_seq_len: int = 64,
 ) -> tuple[
     Float[Array, "num_slots conv_dim d_conv"],
     Float[Array, "num_slots num_v_heads head_dim value_dim"],
@@ -1740,12 +1882,7 @@ def _apply_qwen3_next_packed_updates(
         token_outputs of shape ``[seq_len, num_v_heads, head_v_dim]``).
     """
 
-    use_ragged = is_inference_mode() and os.environ.get("EASYDEL_RAGGED_GDR", "1").lower() not in {
-        "0",
-        "false",
-        "no",
-        "off",
-    }
+    use_ragged = is_inference_mode() and bool(use_ragged_gdr)
     if not use_ragged:
         return _apply_qwen3_next_packed_updates_unified(
             conv_states=conv_states,
@@ -1792,6 +1929,9 @@ def _apply_qwen3_next_packed_updates(
         context_lens=context_lens,
         spec_recurrent_commit=spec_recurrent_commit,
         disable_recurrent_scan_prefill=disable_recurrent_scan_prefill,
+        ragged_gdr_chunk_size=ragged_gdr_chunk_size,
+        force_recurrent_scan_prefill=force_recurrent_scan_prefill,
+        recurrent_scan_prefill_max_seq_len=recurrent_scan_prefill_max_seq_len,
     )
 
 
@@ -1939,6 +2079,59 @@ class Qwen3NextMLP(spx.Module):
         """
         return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
 
+    def _separate_gate_up_projection(self, hidden_states: Array) -> tuple[Array, Array]:
+        """Project gate/up halves with two matmuls using the fused checkpoint weight."""
+        if self.gate_up_proj.bias is not None:
+            raise ValueError("separate_mlp_gate_up_proj does not support biased fused gate/up projections.")
+
+        gate_kernel, up_kernel = split_fused_gate_up_projection(self.gate_up_proj.weight.value, config=self.config)
+        if self.gate_up_proj.dtype is not None:
+            hidden_states = jnp.asarray(hidden_states, dtype=self.gate_up_proj.dtype)
+            gate_kernel = jnp.asarray(gate_kernel, dtype=self.gate_up_proj.dtype)
+            up_kernel = jnp.asarray(up_kernel, dtype=self.gate_up_proj.dtype)
+        gate_out = int(gate_kernel.shape[-1])
+        up_out = int(up_kernel.shape[-1])
+        with jax.named_scope(f"easydel/linear/ColumnParallelLinear/in{self.gate_up_proj.in_features}/out{gate_out}"):
+            gate_raw = None
+            if self.config.use_tp_ring_mlp_column_matmul:
+                gate_raw = _qwen3_next_tp_ring_column_linear(
+                    self.gate_up_proj,
+                    hidden_states,
+                    gate_kernel,
+                    config=self.config,
+                    precision=self.precision,
+                )
+            if gate_raw is None:
+                gate_raw = jnp.einsum(
+                    "...i,io->...o",
+                    hidden_states,
+                    gate_kernel,
+                    precision=self.precision,
+                )
+        with jax.named_scope(f"easydel/linear/ColumnParallelLinear/in{self.gate_up_proj.in_features}/out{up_out}"):
+            up = None
+            if self.config.use_tp_ring_mlp_column_matmul:
+                up = _qwen3_next_tp_ring_column_linear(
+                    self.gate_up_proj,
+                    hidden_states,
+                    up_kernel,
+                    config=self.config,
+                    precision=self.precision,
+                )
+            if up is None:
+                up = jnp.einsum(
+                    "...i,io->...o",
+                    hidden_states,
+                    up_kernel,
+                    precision=self.precision,
+                )
+
+        assert gate_raw is not None
+        assert up is not None
+        gate_raw = self.gate_up_proj._scale_operator(gate_raw)
+        up = self.gate_up_proj._scale_operator(up)
+        return with_tp_last_axis_sharding(gate_raw, self.config), with_tp_last_axis_sharding(up, self.config)
+
     def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jnp.ndarray:
         """Apply SwiGLU feedforward transformation.
 
@@ -1953,8 +2146,13 @@ class Qwen3NextMLP(spx.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
-        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
-        gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        if self.config.separate_mlp_gate_up_proj:
+            gate_raw, up = self._separate_gate_up_projection(hidden_states)
+            gate_raw = checkpoint_name(gate_raw, "mlp_gate_raw")
+            up = checkpoint_name(up, "mlp_up")
+        else:
+            gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
+            gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
         gate = checkpoint_name(self.act_fn(gate_raw), "mlp_gate")
         hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
         hidden_states = apply_logical_sharding(
@@ -2446,7 +2644,17 @@ class Qwen3NextFullAttention(UnifiedAttention):
         sequence_length = hidden_states.shape[1]
 
         q_multiplier = self._q_proj_multiplier()
-        qkv_output = checkpoint_name(self.qkv_proj(hidden_states), "attn_qkv")
+        qkv_output = None
+        if bool(getattr(self.config, "use_tp_ring_full_attention_qkv_matmul", False)):
+            qkv_output = _qwen3_next_tp_ring_column_linear(
+                self.qkv_proj,
+                hidden_states,
+                config=self.config,
+                precision=self.precision,
+            )
+        if qkv_output is None:
+            qkv_output = self.qkv_proj(hidden_states)
+        qkv_output = checkpoint_name(qkv_output, "attn_qkv")
         qkv_output = _apply_tp_last_axis_sharding(qkv_output, self.config)
         q_proj_output, key_states, value_states = self.qkv_proj.split(qkv_output, config=self.config)
 
@@ -2603,10 +2811,15 @@ class Qwen3NextLinearAttention(spx.Module):
             config=config,
         )
 
-        self.uses_split_proj = bool(config.linear_attention_separate_proj)
-        self.uses_merged_split_proj = bool(config.linear_attention_merged_split_proj)
-        if self.uses_split_proj and self.uses_merged_split_proj:
+        requested_split_proj = bool(config.linear_attention_separate_proj)
+        requested_merged_split_proj = bool(config.linear_attention_merged_split_proj)
+        if requested_split_proj and requested_merged_split_proj:
             raise ValueError("linear_attention_separate_proj and linear_attention_merged_split_proj are exclusive")
+        active_tp_size = _qwen3_next_tp_size(config)
+        # The merged QKV/Z activation layout is only validated for unsharded TP.
+        # On TP>1, keep the checkpoint contract split so Q/K/V/Z order stays local.
+        self.uses_merged_split_proj = requested_merged_split_proj and active_tp_size <= 1
+        self.uses_split_proj = requested_split_proj or (requested_merged_split_proj and not self.uses_merged_split_proj)
         if self.uses_merged_split_proj:
             self.in_proj_qkvz = ColumnParallelLinear(
                 config.hidden_size,
@@ -2703,7 +2916,6 @@ class Qwen3NextLinearAttention(spx.Module):
             rngs=rngs,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
         )
-
         self.norm = RMSNormGated(
             self.head_v_dim,
             eps=config.rms_norm_eps,
@@ -2931,7 +3143,6 @@ class Qwen3NextLinearAttention(spx.Module):
         batch_size, seq_len, _ = hidden_states.shape
         is_inference = seq_len == 1 and cache_view is not None
         expand_ratio = self.num_v_heads // self.num_k_heads
-
         if self.uses_merged_split_proj:
             projected_qkvz = self.in_proj_qkvz(hidden_states)
             conv_input, z_flat = self.linear_attention_layout.split_projected_qkvz(projected_qkvz)
@@ -2961,11 +3172,12 @@ class Qwen3NextLinearAttention(spx.Module):
         decay = A[None, None, :] * jax.nn.softplus(alpha_biased)
         beta = jax.nn.sigmoid(beta)
 
-        # Sequence packing: per-token document ids (from ``mask_info.q_segment_ids``, built by
-        # the model forward). Threaded into the segment-aware conv and the GDR kernel so a
-        # packed document never mixes conv taps or carries recurrent state across a boundary.
-        # ``None`` (no packing) keeps every path on its original code.
-        seg_ids = getattr(mask_info, "q_segment_ids", None) if mask_info is not None else None
+        # Sequence packing: only explicit segment ids from packed batches should reach
+        # GDR. Accessing ``mask_info.q_segment_ids`` would lazily materialize padding-style
+        # ids from an ordinary attention mask and force the slower segment-aware XLA path.
+        seg_ids = None
+        if mask_info is not None and getattr(mask_info, "_attention_mask", None) is None:
+            seg_ids = getattr(mask_info, "_q_segment_ids", None)
         if seg_ids is not None:
             seg_ids = _normalize_packed_segment_ids(seg_ids, seq_len)
 
@@ -3002,12 +3214,8 @@ class Qwen3NextLinearAttention(spx.Module):
             kernel = jnp.squeeze(kernel, axis=1).T  # [conv_dim, kernel_size]
 
             if rank_major_packed:
-                force_dp_recurrent_scan_prefill = (
-                    os.environ.get("EASYDEL_QWEN3_NEXT_DP_RECURRENT_SCAN_PREFILL", "0") == "1"
-                )
-                dp_recurrent_scan_max_prefill = int(
-                    os.environ.get("EASYDEL_QWEN3_NEXT_DP_RECURRENT_SCAN_MAX_PREFILL", "64")
-                )
+                force_dp_recurrent_scan_prefill = bool(self.config.force_dp_recurrent_scan_prefill)
+                dp_recurrent_scan_max_prefill = int(self.config.dp_recurrent_scan_prefill_max_seq_len)
                 seq_len_static = int(conv_input.shape[1])
                 use_dp_recurrent_scan_prefill = (
                     jax.default_backend() == "tpu"
@@ -3095,6 +3303,10 @@ class Qwen3NextLinearAttention(spx.Module):
                         context_lens=ctx_i if use_context_lens else None,
                         spec_recurrent_commit=None,
                         disable_recurrent_scan_prefill=not use_dp_recurrent_scan_prefill,
+                        use_ragged_gdr=bool(self.config.use_ragged_gdr),
+                        ragged_gdr_chunk_size=int(self.config.ragged_gdr_chunk_size),
+                        force_recurrent_scan_prefill=bool(self.config.force_recurrent_scan_prefill),
+                        recurrent_scan_prefill_max_seq_len=int(self.config.recurrent_scan_prefill_max_seq_len),
                     )
                     scatter_idx = jnp.where(active_rows, safe_state_idx, rows_per_rank)
                     conv_state_i = conv_state_i.at[scatter_idx].set(updated_conv_state, mode="drop")
@@ -3176,6 +3388,10 @@ class Qwen3NextLinearAttention(spx.Module):
                     dt_bias=self.dt_bias.value,
                     context_lens=packed_context_lens,
                     spec_recurrent_commit=packed_spec_recurrent_commit,
+                    use_ragged_gdr=bool(self.config.use_ragged_gdr),
+                    ragged_gdr_chunk_size=int(self.config.ragged_gdr_chunk_size),
+                    force_recurrent_scan_prefill=bool(self.config.force_recurrent_scan_prefill),
+                    recurrent_scan_prefill_max_seq_len=int(self.config.recurrent_scan_prefill_max_seq_len),
                 )
                 output = token_outputs[None, ...]
 
@@ -3218,7 +3434,7 @@ class Qwen3NextLinearAttention(spx.Module):
             conv_output = jax.nn.silu(self._segment_aware_depthwise_conv(conv_input, seg_ids))
         else:
             # Training/prefill without cache: use the full convolution directly.
-            if self.uses_split_proj:
+            if self.uses_split_proj or self.uses_merged_split_proj:
                 conv_output = jax.nn.silu(self.conv1d(conv_input))
             else:
                 conv_output = jax.nn.silu(self._stage_replicated_depthwise_conv(conv_input))
@@ -3256,9 +3472,25 @@ class Qwen3NextLinearAttention(spx.Module):
         else:
             grouped_decode = False
 
-        if expand_ratio > 1 and not grouped_decode:
+        use_grouped_gdr_prefill = bool(getattr(self.config, "use_grouped_gdr_prefill", True))
+        use_grouped_gdr_prefill = use_grouped_gdr_prefill and _qwen3_next_grouped_gdr_prefill_is_local_valid(
+            num_k_heads=self.num_k_heads,
+            num_v_heads=self.num_v_heads,
+            config=self.config,
+        )
+        if expand_ratio > 1 and not grouped_decode and not use_grouped_gdr_prefill:
             query = jnp.repeat(query, expand_ratio, axis=2)
             key = jnp.repeat(key, expand_ratio, axis=2)
+            query = apply_logical_sharding(
+                query,
+                dynamic_axes=common_types.AttnQSharding,
+                partition_manager=self.config.runtime_sharding_resolver,
+            )
+            key = apply_logical_sharding(
+                key,
+                dynamic_axes=common_types.AttnKVSharding,
+                partition_manager=self.config.runtime_sharding_resolver,
+            )
 
         if grouped_decode:
             output, new_recurrent_state = apply_grouped_single_step_gdr(
@@ -3695,6 +3927,8 @@ class Qwen3NextModel(EasyDeLBaseModule):
         )
         cache_views = views if trace_layers else None
 
+        frequencies = self.frequencies
+
         def _layer_loop(block, carry):
             """Apply a single Qwen3Next decoder layer inside the layer-stack scan.
 
@@ -3718,7 +3952,7 @@ class Qwen3NextModel(EasyDeLBaseModule):
                     cache_metadata=cache_metadata,
                     output_attentions=output_attentions,
                     output_router_logits=output_router_logits,
-                    frequencies=self.frequencies,
+                    frequencies=frequencies,
                 )
             hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
             if output_attentions:

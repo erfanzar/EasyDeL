@@ -653,6 +653,8 @@ class eSurgeParsingConfig(TypedDict, total=False):
     defaults={
         "resolution_buckets": None,
         "vision_cache_capacity_mb": 1024,
+        "compile_vision_encoder": True,
+        "vision_patch_buckets": None,
     },
 )
 class eSurgeVisionConfig(TypedDict, total=False):
@@ -673,10 +675,19 @@ class eSurgeVisionConfig(TypedDict, total=False):
             in megabytes. The cache is LRU-evicted; setting this to ``0``
             effectively disables caching, which can help when the working
             set of images is much larger than HBM can hold.
+        compile_vision_encoder: When ``True``, eSurge precompiles a bucketed
+            JIT helper for the VLM vision tower / projector and uses it during
+            multimodal prefill. Models with non-JIT-safe vision paths fall back
+            to the eager path.
+        vision_patch_buckets: Optional raw patch-count buckets for the vision
+            precompile helper. ``None`` derives powers-of-two buckets from the
+            runtime token budget and the model's spatial merge size.
     """
 
     resolution_buckets: NotRequired[list[tuple[int, int]] | None]
     vision_cache_capacity_mb: NotRequired[int]
+    compile_vision_encoder: NotRequired[bool]
+    vision_patch_buckets: NotRequired[list[int] | None]
 
     @classmethod
     def from_dict(

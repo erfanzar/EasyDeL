@@ -53,6 +53,9 @@ def ragged_gated_delta_rule_v2(
     use_qk_norm_in_gdn: bool = True,
     apply_silu_in_gdr: bool = False,
     use_recurrent_scan_prefill: bool = False,
+    mask_initial_state: bool = False,
+    kernel_tile_policy: str = "auto",
+    use_fused_gdn_decode: bool = False,
     runtime_dtype: object | None = None,
 ) -> tuple[
     Float[Array, "num_slots num_value_heads qk_head_dim v_head_dim"],
@@ -112,6 +115,12 @@ def ragged_gated_delta_rule_v2(
         use_recurrent_scan_prefill: Static flag accepted for API/signature
             compatibility; not consumed by the wrapped implementation. Defaults
             to False.
+        mask_initial_state: If ``True``, use ``has_initial_state`` to zero stale
+            recurrent slots for fresh prefill requests. Defaults to ``False``.
+        kernel_tile_policy: Accepted for API compatibility with TPU Pallas;
+            ignored by the XLA implementation.
+        use_fused_gdn_decode: Accepted for API compatibility with TPU Pallas;
+            ignored by the XLA implementation.
         runtime_dtype: Optional dtype that all float inputs are cast to before
             the recurrence. When ``None``, ``mixed_qkv.dtype`` is used.
 
@@ -123,6 +132,7 @@ def ragged_gated_delta_rule_v2(
         ``out_dim == n_v * d_v``. Rows/slots for tokens or requests beyond
         ``distribution[2]`` are left zeroed / unchanged.
     """
+    _ = kernel_tile_policy, use_fused_gdn_decode
     return _ragged_gated_delta_rule_v2_xla(
         mixed_qkv=mixed_qkv,
         b=b,
@@ -142,5 +152,6 @@ def ragged_gated_delta_rule_v2(
         use_qk_norm_in_gdn=use_qk_norm_in_gdn,
         apply_silu_in_gdr=apply_silu_in_gdr,
         use_recurrent_scan_prefill=use_recurrent_scan_prefill,
+        mask_initial_state=mask_initial_state,
         runtime_dtype=runtime_dtype,
     )

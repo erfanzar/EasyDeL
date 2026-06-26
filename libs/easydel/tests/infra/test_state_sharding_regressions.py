@@ -14,17 +14,16 @@
 
 import re
 
+import easydel as ed
+import easydel.infra.base_state as base_state_module
 import jax
 import jax.numpy as jnp
 import optax
 import pytest
 import spectrax as spx
-from jax.sharding import NamedSharding, PartitionSpec
-
-import easydel as ed
-import easydel.infra.base_state as base_state_module
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.sharding import sharding_matches
+from jax.sharding import NamedSharding, PartitionSpec
 
 
 @pytest.fixture(scope="module")
@@ -115,9 +114,25 @@ def test_init_tx_places_optimizer_value_slots_with_named_sharding(tiny_sharded_l
         slot_shardings.append(sharding)
 
     assert slot_shardings, "Expected Adam optimizer slot shardings."
-    assert any(_has_sharded_axis(sharding.spec) for sharding in slot_shardings), (
-        "Optimizer value slots unexpectedly collapsed to replicated-only shardings."
-    )
+    assert any(
+        _has_sharded_axis(sharding.spec) for sharding in slot_shardings
+    ), "Optimizer value slots unexpectedly collapsed to replicated-only shardings."
+
+
+def test_init_tx_sanitizes_factored_optimizer_slot_shardings(tiny_sharded_llama):
+    state = EasyDeLState.create(model=tiny_sharded_llama).init_tx(optax.adafactor(learning_rate=1e-3))
+
+    factored_slots = 0
+    for path, leaf in jax.tree_util.tree_leaves_with_path(state.opt_state):
+        path_names = {getattr(key, "name", None) for key in path}
+        if not ({"v_row", "v_col"} & path_names) or not hasattr(leaf, "shape"):
+            continue
+        sharding = getattr(leaf, "sharding", None)
+        assert isinstance(sharding, NamedSharding)
+        assert len(tuple(sharding.spec)) <= len(tuple(leaf.shape))
+        factored_slots += 1
+
+    assert factored_slots, "Expected Adafactor factored optimizer slots."
 
 
 def test_partition_rules_are_open_ended_for_state_suffixes(tiny_sharded_llama):
