@@ -122,6 +122,7 @@ class RaggedGatedDeltaRule(OperationImpl):
         flat_tp_shard: bool = False,
         apply_silu_in_gdr: bool = False,
         use_recurrent_scan_prefill: bool = False,
+        mask_initial_state: bool = False,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
         """Run ragged GDN v2 through the public eJKernel operation.
 
@@ -148,6 +149,8 @@ class RaggedGatedDeltaRule(OperationImpl):
             apply_silu_in_gdr: Whether to apply SiLU inside GDR.
             use_recurrent_scan_prefill: Enable recurrent-scan prefill when the
                 selected backend supports it.
+            mask_initial_state: Whether to use ``has_initial_state`` to zero
+                stale recurrent slots for fresh prefill requests.
 
         Returns:
             ``(updated_recurrent_state, output)``.
@@ -155,6 +158,7 @@ class RaggedGatedDeltaRule(OperationImpl):
         mode = self.get_mode(query=jnp.expand_dims(mixed_qkv, 0), BTHD=False)
         shardings_bthd = self.metadata.get_shardings(mode, layout="bthd")
         head_axis = shardings_bthd.query[2] if shardings_bthd.query is not None else None
+        cfg = self.metadata.get_operation_config("ragged_gated_delta_rule_v2")
 
         return _ejkernel_ragged_gated_delta_rule_v2(
             mixed_qkv=mixed_qkv,
@@ -177,9 +181,11 @@ class RaggedGatedDeltaRule(OperationImpl):
             flat_tp_shard=flat_tp_shard,
             apply_silu_in_gdr=apply_silu_in_gdr,
             use_recurrent_scan_prefill=use_recurrent_scan_prefill,
+            mask_initial_state=mask_initial_state,
             runtime_dtype=self.metadata.runtime_dtype,
             mesh=self.metadata.mesh,
             head_axis=head_axis,
+            cfg=cfg,
         )
 
     def forward_tpu(self, *args, **kwargs) -> tuple[jnp.ndarray, jnp.ndarray]:

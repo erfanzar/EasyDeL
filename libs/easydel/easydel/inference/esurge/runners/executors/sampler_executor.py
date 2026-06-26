@@ -154,6 +154,7 @@ class SamplerExecutor:
         del cache_capacity
 
         self._sampling_fn = self._build_sampling_fn()
+        self._greedy_sampling_fn = self._build_greedy_sampling_fn()
         self._cache: OrderedDict[tuple[int, int, str, str], tp.Any] = OrderedDict()
 
     def clear_cache(self) -> None:
@@ -204,7 +205,7 @@ class SamplerExecutor:
         """
         return list(self._cache.keys())
 
-    def cache_key(self, *, padded_num_reqs: int) -> tuple[int, int, str, str]:
+    def cache_key(self, *, padded_num_reqs: int, greedy: bool = False) -> tuple[int, int, str, str]:
         """Return the sampler cache key.
 
         Sampler executable shapes are independent of the model token bucket:
@@ -213,7 +214,8 @@ class SamplerExecutor:
         redundant compiles during startup.
         """
         mode = "aot" if self.use_aot_forward else "jit"
-        return (0, int(padded_num_reqs), "sampler", mode)
+        variant = "sampler_greedy" if greedy else "sampler"
+        return (0, int(padded_num_reqs), variant, mode)
 
     def has(self, key: tuple[int, int, str, str]) -> bool:
         """Check if a key exists in the cache.
@@ -226,7 +228,7 @@ class SamplerExecutor:
         """
         return key in self._cache
 
-    def get_compiled(self, *, num_tokens: int, padded_num_reqs: int) -> tp.Any:
+    def get_compiled(self, *, num_tokens: int, padded_num_reqs: int, greedy: bool = False) -> tp.Any:
         """Retrieve a pre-compiled sampler function for given dimensions.
 
         Args:
@@ -241,7 +243,7 @@ class SamplerExecutor:
                 Call compile() first to create the cached entry.
         """
         del num_tokens
-        key = self.cache_key(padded_num_reqs=padded_num_reqs)
+        key = self.cache_key(padded_num_reqs=padded_num_reqs, greedy=greedy)
         return self._cache_get(key)
 
     def compile(
@@ -251,6 +253,7 @@ class SamplerExecutor:
         padded_num_reqs: int,
         inputs: StepFunctionInputs,
         metadata,
+        greedy: bool = False,
     ) -> None:
         """Compile and cache a sampler function for specific dimensions.
 
@@ -269,7 +272,7 @@ class SamplerExecutor:
             compiled XLA executable. For JIT compilation, performs a warmup
             call to trigger tracing and compilation.
         """
-        key = self.cache_key(padded_num_reqs=padded_num_reqs)
+        key = self.cache_key(padded_num_reqs=padded_num_reqs, greedy=greedy)
         if key in self._cache:
             return
 
@@ -293,13 +296,52 @@ class SamplerExecutor:
             ),
         )
 
+        sampling_fn = self._greedy_sampling_fn if greedy else self._sampling_fn
         if self.use_aot_forward:
-            compiled = self._sampling_fn.lower(*sampler_args).compile()  # pyright: ignore[reportFunctionMemberAccess]
+            compiled = sampling_fn.lower(*sampler_args).compile()  # pyright: ignore[reportFunctionMemberAccess]
             self._cache_put(key, compiled)
             return
 
-        _ = self._sampling_fn(*sampler_args)
-        self._cache_put(key, self._sampling_fn)
+        _ = sampling_fn(*sampler_args)
+        self._cache_put(key, sampling_fn)
+
+    def _build_greedy_sampling_fn(self) -> tp.Callable[..., tp.Any]:
+        """Build an argmax-only sampler for all-greedy/no-penalty windows."""
+
+        @ejit
+        def _greedy_sampling_fn(
+            packed_f32: jax.Array,
+            packed_i32: jax.Array,
+            packed_misc_i32: jax.Array,
+            logits: jax.Array,
+            rng_key: jax.Array,
+            token_counts_full: jax.Array,
+        ):
+            del packed_f32
+            with jax.named_scope("easydel/esurge/greedy_sampler_step"):
+                batch_size = logits.shape[0]
+                i_reqs = jnp.arange(batch_size, dtype=jnp.int32)
+
+                scheduled = packed_i32[1]
+                seq_lens = packed_i32[2]
+                active_mask = packed_i32[4].astype(jnp.bool_)
+                req_num_tokens = packed_i32[6]
+                num_requests = packed_misc_i32[0]
+                total_tokens = packed_misc_i32[1]
+
+                active_mask = (i_reqs < num_requests) & active_mask[:batch_size]
+                sampled_flat = jnp.argmax(logits, axis=-1).astype(jnp.int32)
+
+                scheduled_slice = scheduled[:batch_size]
+                seq_lens_now = seq_lens[:batch_size]
+                req_num_tokens_slice = req_num_tokens[:batch_size]
+                emits_next_token = seq_lens_now >= req_num_tokens_slice
+                valid_mask = (i_reqs < num_requests) & active_mask & (scheduled_slice > 0) & emits_next_token
+                out_tokens = jnp.where(valid_mask, sampled_flat, -1)
+                rng_key = jax.random.fold_in(rng_key, jnp.int32(total_tokens))
+                return rng_key, out_tokens, valid_mask, token_counts_full
+
+        return _greedy_sampling_fn
 
     def _build_sampling_fn(self) -> tp.Callable[..., tp.Any]:
         """Build the JIT-compiled sampling function.

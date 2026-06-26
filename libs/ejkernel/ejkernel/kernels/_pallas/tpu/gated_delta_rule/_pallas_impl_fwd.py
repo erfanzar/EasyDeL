@@ -15,8 +15,8 @@
 """Forward TPU Pallas kernels for Gated Delta Rule (GDR).
 
 Two-phase architecture for high MXU utilization on TPU v4:
-  Phase 1 (parallel): Neumann inverse + state-independent quantities for ALL
-           chunks simultaneously via a single pallas_call.
+  Phase 1 (parallel): exact unit-lower inverse + state-independent quantities
+           for ALL chunks simultaneously via a single pallas_call.
   Phase 2 (sequential): Lightweight lax.scan with only 4 matmuls per chunk.
 
 Supports inference=True mode for faster forward-only execution.
@@ -50,42 +50,84 @@ def _chunk_blockspec(shape: tuple[int, ...]) -> pl.BlockSpec:
     return pl.BlockSpec(shape, lambda b, h: (b, h, *([0] * (len(shape) - 2))))
 
 
-def _neumann_inv(A, C, strict_lower=None, lower_mask=None):
-    """Compute ``(I - A)^{-1}`` via repeated squaring (Neumann series).
+def _exact_strict_lower_inv_rows(A, C, strict_lower=None, lower_mask=None):
+    """Compute ``(I - A)^{-1}`` for small strict-lower matrices row by row."""
+    if strict_lower is None:
+        strict_lower = jnp.tril(jnp.ones((C, C), dtype=jnp.float32), k=-1)
+    if lower_mask is None:
+        lower_mask = strict_lower + jnp.eye(C, dtype=jnp.float32)
+    A = jnp.where(strict_lower, A.astype(jnp.float32), 0.0)
+    eye = jnp.eye(C, dtype=jnp.float32)
+    zero_row = jnp.zeros((C,), dtype=jnp.float32)
+    rows = []
+    for i in range(C):
+        row = eye[i]
+        if i > 0:
+            acc = zero_row
+            for j in range(i):
+                acc = acc + A[i, j] * rows[j]
+            row = row + acc
+        rows.append(row)
+    inv = jnp.stack(rows, axis=0)
+    inv = jnp.where(lower_mask, inv, 0.0)
+    return jnp.nan_to_num(inv, nan=0.0, posinf=0.0, neginf=0.0)
 
-    ``A`` must be strictly lower-triangular so the series terminates exactly
-    after ``C - 1`` terms.  Repeated squaring needs ``ceil(log2(C))``
-    iterations to accumulate all terms up to ``A^{C-1}``.
 
-    The computation runs at ``HIGHEST`` precision to minimise rounding error
-    in the inverse.  Both ``A`` and the output are clamped with
-    ``nan_to_num`` to guard against overflow in extreme inputs.
+def _exact_strict_lower_inv_block(A, C):
+    """Recursively invert ``I - A`` for strict-lower ``A`` using block matmuls."""
+    if C <= 16 or C % 2:
+        return _exact_strict_lower_inv_rows(A, C)
+    h = C // 2
+    top_inv = _exact_strict_lower_inv_block(A[:h, :h], h)
+    bottom_inv = _exact_strict_lower_inv_block(A[h:, h:], C - h)
+    lower_left = lax.dot(
+        lax.dot(bottom_inv, A[h:, :h].astype(jnp.float32), precision=lax.Precision.HIGHEST),
+        top_inv,
+        precision=lax.Precision.HIGHEST,
+    )
+    top = jnp.concatenate([top_inv, jnp.zeros((h, C - h), dtype=jnp.float32)], axis=1)
+    bottom = jnp.concatenate([lower_left, bottom_inv], axis=1)
+    return jnp.concatenate([top, bottom], axis=0)
+
+
+def _exact_strict_lower_inv(A, C, strict_lower=None, lower_mask=None):
+    """Compute ``(I - A)^{-1}`` for strict-lower ``A`` exactly.
+
+    Mosaic does not lower ``lax.linalg.triangular_solve`` inside a Pallas
+    kernel, so this uses recursive block inversion and falls back to explicit
+    row construction only for small base blocks.
 
     Args:
         A: Strict lower-triangular matrix [C, C], float32. Must already be
             sanitized (NaN/Inf replaced with 0).
-        C: Chunk size — determines the number of Neumann iterations needed.
+        C: Chunk size for the strict-lower inverse.
         strict_lower: Optional precomputed strict-lower mask [C, C] (1 below
             diagonal, 0 on/above). Computed internally if not provided.
         lower_mask: Optional precomputed lower-triangular mask [C, C]
             (1 on diagonal and below). Computed internally if not provided.
 
     Returns:
-        Approximation to ``(I - A)^{-1}`` as a float32 [C, C] matrix, with
-        NaN/Inf entries replaced by 0.
+        Exact ``(I - A)^{-1}`` as a float32 [C, C] matrix, with NaN/Inf
+        entries replaced by 0.
     """
-    _hp = lax.Precision.HIGHEST
-    num_iters = math.ceil(math.log2(C)) if C > 1 else 0
     if strict_lower is None:
         strict_lower = jnp.tril(jnp.ones((C, C), dtype=jnp.float32), k=-1)
     if lower_mask is None:
         lower_mask = strict_lower + jnp.eye(C, dtype=jnp.float32)
-    S = jnp.eye(C, dtype=jnp.float32)
-    P = jnp.where(strict_lower, A, 0.0)
-    for _ in range(num_iters):
-        S = jnp.where(lower_mask, S + lax.dot(P, S, precision=_hp), 0.0)
-        P = jnp.where(strict_lower, lax.dot(P, P, precision=_hp), 0.0)
-    return jnp.nan_to_num(S, nan=0.0, posinf=0.0, neginf=0.0)
+    A = jnp.where(strict_lower, A.astype(jnp.float32), 0.0)
+    inv = _exact_strict_lower_inv_block(A, C)
+    inv = jnp.where(lower_mask, inv, 0.0)
+    return jnp.nan_to_num(inv, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _neumann_inv(A, C, strict_lower=None, lower_mask=None):
+    """Compatibility wrapper for the exact strict-lower inverse.
+
+    The historical Neumann-series implementation is fast but numerically unsafe
+    on the full Qwen3.6 training-forward workload. Keep this public helper name
+    because the backward kernel imports it directly.
+    """
+    return _exact_strict_lower_inv(A, C, strict_lower=strict_lower, lower_mask=lower_mask)
 
 
 def _process_one_chunk(q, k, v, beta, decay, state, C):
@@ -138,13 +180,11 @@ def _process_one_chunk(q, k, v, beta, decay, state, C):
     return core_out, new_state
 
 
-def _phase1_kernel_infer(
+def _phase1_kernel_fwd_cumsum(
     q_ref,
     k_ref,
     v_ref,
     beta_ref,
-    decay_ref,
-    decay_mask_ref,
     g_cumsum_ref,
     value_local_ref,
     k_cumdecay_ref,
@@ -153,47 +193,12 @@ def _phase1_kernel_infer(
     k_scaled_ref,
     g_end_exp_ref,
 ):
-    """Phase 1 Pallas kernel — inference mode that consumes precomputed decay masks.
-
-    Accepts precomputed ``decay_mask`` and ``g_cumsum`` as inputs to avoid
-    recomputing them per-chunk. Does not save ``attn_inv`` in the output
-    (not needed at inference time).
-
-    Note: this kernel is currently unreferenced — ``_run_phase1(inference=True)``
-    dispatches ``_phase1_kernel_fwd`` instead, which recomputes the decay mask
-    in-kernel rather than reading it across the custom-call boundary.
-
-    Grid: ``(batch, num_heads, num_chunks)``; the chunk axis is "arbitrary"
-    (threaded sequentially by the scan in Phase 2).
-
-    BlockSpec shape convention: ``(1, 1, 1, chunk_dim)`` for every array; leading
-    singleton axes are dropped via ``[0, 0, 0]`` indexing before computation.
-
-    Args:
-        q_ref: [1,1,1,C,K] query block.
-        k_ref: [1,1,1,C,K] key block.
-        v_ref: [1,1,1,C,V] value block.
-        beta_ref: [1,1,1,1,C] gate vector.
-        decay_ref: [1,1,1,1,C] log decay vector (unused — only decay_mask/
-            g_cumsum are read).
-        decay_mask_ref: [1,1,1,C,C] precomputed decay mask.
-        g_cumsum_ref: [1,1,1,1,C] cumulative log decay.
-        value_local_ref: [1,1,1,C,V] output — intra-chunk corrected value.
-        k_cumdecay_ref: [1,1,1,C,K] output — decay-weighted key accumulation.
-        attn_qk_ref: [1,1,1,C,C] output — query-key attention matrix.
-        q_scaled_ref: [1,1,1,C,K] output — query scaled by cumulative decay.
-        k_scaled_ref: [1,1,1,C,K] output — key scaled by state-to-end decay.
-        g_end_exp_ref: [1,1,1,1,1] output — exp of the last cumulative decay value.
-
-    Returns:
-        None. Results are written in place to the output refs listed above.
-    """
+    """Phase 1 forward kernel that consumes precomputed cumulative decay."""
     C = q_ref.shape[3]
     q = q_ref[0, 0, 0].astype(jnp.float32)
     k = k_ref[0, 0, 0].astype(jnp.float32)
     v = v_ref[0, 0, 0].astype(jnp.float32)
     beta = beta_ref[0, 0, 0, 0]
-    decay_mask = decay_mask_ref[0, 0, 0].astype(jnp.float32)
     g_cumsum = g_cumsum_ref[0, 0, 0, 0]
 
     lower_mask = jnp.tril(jnp.ones((C, C), dtype=jnp.float32))
@@ -202,14 +207,17 @@ def _phase1_kernel_infer(
     v_beta = v * beta[:, None]
     k_beta = k * beta[:, None]
 
+    g_diff = g_cumsum[:, None] - g_cumsum[None, :]
+    decay_mask = jnp.exp(jnp.clip(g_diff * lower_mask, -20.0, 20.0)) * lower_mask
+
     attn_neg = -(_dot(k_beta, k.T) * decay_mask) * strict_lower
     attn_neg = jnp.nan_to_num(attn_neg, nan=0.0, posinf=0.0, neginf=0.0)
     attn_inv = _neumann_inv(attn_neg, C, strict_lower=strict_lower, lower_mask=lower_mask)
 
     g_cumsum_exp = jnp.exp(jnp.clip(g_cumsum[:, None], -20.0, 20.0))
-    g_end_val = g_cumsum[-1:]
-    g_end_exp = jnp.exp(jnp.clip(g_end_val, -20.0, 20.0)).reshape(1, 1)
-    g_diff_state_exp = jnp.exp(jnp.clip(g_end_val[:, None] - g_cumsum[:, None], -20.0, 20.0))
+    g_end = g_cumsum[C - 1 : C, None]
+    g_end_exp = jnp.exp(jnp.clip(g_end, -20.0, 20.0))
+    g_diff_state_exp = jnp.exp(jnp.clip(g_end - g_cumsum[:, None], -20.0, 20.0))
 
     k_beta_scaled = k_beta * g_cumsum_exp
     combined_rhs = jnp.concatenate([v_beta, k_beta_scaled], axis=-1)
@@ -217,7 +225,6 @@ def _phase1_kernel_infer(
     V = v_beta.shape[-1]
     value_local = combined_out[:, :V]
     k_cumdecay = combined_out[:, V:]
-
     attn_qk = _dot(q, k.T) * decay_mask
     q_scaled = q * g_cumsum_exp
     k_scaled = k * g_diff_state_exp
@@ -227,107 +234,15 @@ def _phase1_kernel_infer(
     attn_qk_ref[0, 0, 0] = attn_qk.astype(attn_qk_ref.dtype)
     q_scaled_ref[0, 0, 0] = q_scaled.astype(q_scaled_ref.dtype)
     k_scaled_ref[0, 0, 0] = k_scaled.astype(k_scaled_ref.dtype)
-    g_end_exp_ref[0, 0, 0] = g_end_exp.astype(g_end_exp_ref.dtype)
-
-
-def _phase1_kernel_fwd(
-    q_ref,
-    k_ref,
-    v_ref,
-    beta_ref,
-    decay_ref,
-    value_local_ref,
-    k_cumdecay_ref,
-    attn_qk_ref,
-    q_scaled_ref,
-    k_scaled_ref,
-    g_end_exp_ref,
-):
-    """Phase 1 Pallas kernel for forward-only (inference) calls.
-
-    Computes the decay mask inside the Pallas kernel and writes only the
-    intermediates consumed by phase 2. This avoids feeding a materialized
-    ``[chunk, chunk]`` decay mask across the custom-call boundary when the
-    backward-only ``attn_inv`` residual is not needed. This is the kernel
-    actually dispatched by ``_run_phase1(..., inference=True)``.
-
-    Grid: ``(batch, num_heads, num_chunks)``; the chunk axis is "arbitrary".
-
-    BlockSpec shape convention: ``(1, 1, 1, chunk_dim)`` for every array, so
-    each ref carries a single ``(batch, head, chunk)`` cell. Leading singleton
-    axes are dropped via ``[0, 0, 0]`` indexing before computation.
-
-    Args:
-        q_ref: [1,1,1,C,K] query block (float input dtype).
-        k_ref: [1,1,1,C,K] key block.
-        v_ref: [1,1,1,C,V] value block.
-        beta_ref: [1,1,1,1,C] per-token gate vector.
-        decay_ref: [1,1,1,1,C] per-token log decay vector.
-        value_local_ref: [1,1,1,C,V] output — intra-chunk corrected value.
-        k_cumdecay_ref: [1,1,1,C,K] output — decay-weighted key accumulation.
-        attn_qk_ref: [1,1,1,C,C] output — query-key attention matrix.
-        q_scaled_ref: [1,1,1,C,K] output — query scaled by cumulative decay.
-        k_scaled_ref: [1,1,1,C,K] output — key scaled by state-to-end decay.
-        g_end_exp_ref: [1,1,1,1,1] output — exp of the last cumulative decay value.
-
-    Returns:
-        None. Results are written in place to the output refs listed above.
-    """
-    C = q_ref.shape[3]
-    q = q_ref[0, 0, 0].astype(jnp.float32)
-    k = k_ref[0, 0, 0].astype(jnp.float32)
-    v = v_ref[0, 0, 0].astype(jnp.float32)
-    beta = beta_ref[0, 0, 0, 0]
-    decay = decay_ref[0, 0, 0, 0]
-
-    lower_mask = jnp.tril(jnp.ones((C, C), dtype=jnp.float32))
-    strict_lower = lower_mask - jnp.eye(C, dtype=jnp.float32)
-
-    v_beta = v * beta[:, None]
-    k_beta = k * beta[:, None]
-
-    g_cumsum = jnp.sum(lower_mask * decay[None, :], axis=1, keepdims=True)
-    g_diff = g_cumsum - g_cumsum.T
-    decay_mask = jnp.exp(jnp.clip(g_diff * lower_mask, -20.0, 20.0)) * lower_mask
-
-    attn_neg = -(_dot(k_beta, k.T) * decay_mask) * strict_lower
-    attn_neg = jnp.nan_to_num(attn_neg, nan=0.0, posinf=0.0, neginf=0.0)
-    attn_inv = _neumann_inv(attn_neg, C, strict_lower=strict_lower, lower_mask=lower_mask)
-
-    g_cumsum_exp = jnp.exp(jnp.clip(g_cumsum, -20.0, 20.0))
-    g_end = g_cumsum[C - 1 : C, :]
-    g_end_exp = jnp.exp(jnp.clip(g_end, -20.0, 20.0))
-    g_diff_state_exp = jnp.exp(jnp.clip(g_end - g_cumsum, -20.0, 20.0))
-
-    k_beta_scaled = k_beta * g_cumsum_exp
-    combined_rhs = jnp.concatenate([v_beta, k_beta_scaled], axis=-1)
-    combined_out = _dot(attn_inv, combined_rhs)
-    V = v_beta.shape[-1]
-    value_local = combined_out[:, :V]
-    k_cumdecay = combined_out[:, V:]
-
-    attn_qk = _dot(q, k.T) * decay_mask
-    q_scaled = q * g_cumsum_exp
-    k_scaled = k * g_diff_state_exp
-
-    def _s(x):
-        """Replace NaN/+Inf/-Inf entries in ``x`` with 0.0 before it is written out."""
-        return jnp.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-
-    value_local_ref[0, 0, 0] = _s(value_local).astype(value_local_ref.dtype)
-    k_cumdecay_ref[0, 0, 0] = _s(k_cumdecay).astype(k_cumdecay_ref.dtype)
-    attn_qk_ref[0, 0, 0] = _s(attn_qk).astype(attn_qk_ref.dtype)
-    q_scaled_ref[0, 0, 0] = q_scaled.astype(q_scaled_ref.dtype)
-    k_scaled_ref[0, 0, 0] = k_scaled.astype(k_scaled_ref.dtype)
     g_end_exp_ref[0, 0, 0] = jnp.broadcast_to(g_end_exp, (1, 1)).astype(g_end_exp_ref.dtype)
 
 
-def _phase1_kernel_train(
+def _phase1_kernel_train_cumsum(
     q_ref,
     k_ref,
     v_ref,
     beta_ref,
-    decay_ref,
+    g_cumsum_ref,
     value_local_ref,
     k_cumdecay_ref,
     attn_qk_ref,
@@ -336,41 +251,13 @@ def _phase1_kernel_train(
     g_end_exp_ref,
     attn_inv_ref,
 ):
-    """Phase 1 Pallas kernel — training mode that also saves ``attn_inv``.
-
-    Computes all chunk-local intermediates from scratch (including the in-kernel
-    decay mask) and additionally writes ``attn_inv`` to an output ref so the
-    backward pass can reuse it without re-running the Neumann series. Dispatched
-    by ``_run_phase1(inference=False)``.
-
-    Grid: ``(batch, num_heads, num_chunks)``; the chunk axis is "arbitrary".
-
-    BlockSpec shape convention: ``(1, 1, 1, chunk_dim)`` for every array; leading
-    singleton axes are dropped via ``[0, 0, 0]`` indexing before computation.
-
-    Args:
-        q_ref: [1,1,1,C,K] query block.
-        k_ref: [1,1,1,C,K] key block.
-        v_ref: [1,1,1,C,V] value block.
-        beta_ref: [1,1,1,1,C] gate vector.
-        decay_ref: [1,1,1,1,C] log decay vector.
-        value_local_ref: [1,1,1,C,V] output — intra-chunk corrected value.
-        k_cumdecay_ref: [1,1,1,C,K] output — decay-weighted key accumulation.
-        attn_qk_ref: [1,1,1,C,C] output — query-key attention matrix.
-        q_scaled_ref: [1,1,1,C,K] output — query scaled by cumulative decay.
-        k_scaled_ref: [1,1,1,C,K] output — key scaled by state-to-end decay.
-        g_end_exp_ref: [1,1,1,1,1] output — exp of the last cumulative decay value.
-        attn_inv_ref: [1,1,1,C,C] output — ``(I - A)^{-1}`` saved for backward.
-
-    Returns:
-        None. Results are written in place to the output refs listed above.
-    """
+    """Training Phase 1 kernel that consumes precomputed cumulative decay."""
     C = q_ref.shape[3]
     q = q_ref[0, 0, 0].astype(jnp.float32)
     k = k_ref[0, 0, 0].astype(jnp.float32)
     v = v_ref[0, 0, 0].astype(jnp.float32)
     beta = beta_ref[0, 0, 0, 0]
-    decay = decay_ref[0, 0, 0, 0]
+    g_cumsum = g_cumsum_ref[0, 0, 0, 0]
 
     lower_mask = jnp.tril(jnp.ones((C, C), dtype=jnp.float32))
     strict_lower = lower_mask - jnp.eye(C, dtype=jnp.float32)
@@ -378,18 +265,17 @@ def _phase1_kernel_train(
     v_beta = v * beta[:, None]
     k_beta = k * beta[:, None]
 
-    g_cumsum = jnp.sum(lower_mask * decay[None, :], axis=1, keepdims=True)
-    g_diff = g_cumsum - g_cumsum.T
+    g_diff = g_cumsum[:, None] - g_cumsum[None, :]
     decay_mask = jnp.exp(jnp.clip(g_diff * lower_mask, -20.0, 20.0)) * lower_mask
 
     attn_neg = -(_dot(k_beta, k.T) * decay_mask) * strict_lower
     attn_neg = jnp.nan_to_num(attn_neg, nan=0.0, posinf=0.0, neginf=0.0)
     attn_inv = _neumann_inv(attn_neg, C, strict_lower=strict_lower, lower_mask=lower_mask)
 
-    g_cumsum_exp = jnp.exp(jnp.clip(g_cumsum, -20.0, 20.0))
-    g_end = g_cumsum[C - 1 : C, :]
+    g_cumsum_exp = jnp.exp(jnp.clip(g_cumsum[:, None], -20.0, 20.0))
+    g_end = g_cumsum[C - 1 : C, None]
     g_end_exp = jnp.exp(jnp.clip(g_end, -20.0, 20.0))
-    g_diff_state_exp = jnp.exp(jnp.clip(g_end - g_cumsum, -20.0, 20.0))
+    g_diff_state_exp = jnp.exp(jnp.clip(g_end - g_cumsum[:, None], -20.0, 20.0))
 
     value_local = _dot(attn_inv, v_beta)
     k_cumdecay = _dot(attn_inv, k_beta * g_cumsum_exp)
@@ -410,12 +296,21 @@ def _phase1_kernel_train(
     attn_inv_ref[0, 0, 0] = attn_inv.astype(attn_inv_ref.dtype)
 
 
-def _run_phase1(query_c, key_c, value_c, beta_c, decay_c, *, inference=False):
+def _run_phase1(
+    query_c,
+    key_c,
+    value_c,
+    beta_c,
+    decay_c,
+    *,
+    inference=False,
+    use_input_dtype_outputs: bool = False,
+):
     """Launch the Phase 1 Pallas kernel over ALL chunks simultaneously.
 
-    Dispatches to either ``_phase1_kernel_fwd`` (forward-only, no
-    ``attn_inv`` saved) or ``_phase1_kernel_train`` (saves ``attn_inv`` for
-    backward).
+    Dispatches to either ``_phase1_kernel_fwd_cumsum`` (forward-only, no
+    ``attn_inv`` saved) or ``_phase1_kernel_train_cumsum`` (saves ``attn_inv``
+    for backward).
 
     Args:
         query_c: Reshaped query [B, H, NC, C, K].
@@ -423,17 +318,22 @@ def _run_phase1(query_c, key_c, value_c, beta_c, decay_c, *, inference=False):
         value_c: Reshaped value [B, H, NC, C, V].
         beta_c: Reshaped gate [B, H, NC, 1, C].
         decay_c: Reshaped log decay [B, H, NC, 1, C].
-        inference: If True, precomputes decay masks in XLA before the Pallas
-            call and uses the faster inference kernel.
+        inference: If True, precomputes cumulative decay in XLA before the
+            Pallas call and uses the forward-only Phase 1 kernel.
 
     Returns:
+        use_input_dtype_outputs: When ``True``, the large phase-1 handoff
+            tensors are written in ``query_c.dtype`` instead of fp32. The
+            residual-saving branch still keeps recurrent state in fp32.
+
         Seven-element tuple:
         ``(value_local, k_cumdecay, attn_qk, q_scaled, k_scaled, g_end_exp,
-        attn_inv)`` each of shape ``[B, H, NC, ...]``.  ``attn_inv`` is
+        attn_inv)`` each of shape ``[B, H, NC, ...]``. ``attn_inv`` is
         ``None`` in inference mode.
     """
     B, H, NC, C, K = query_c.shape
     V = value_c.shape[-1]
+    phase1_dtype = query_c.dtype if use_input_dtype_outputs else jnp.float32
 
     def bs3(shape):
         """Build a per-chunk BlockSpec of block shape ``(1, 1, 1, *shape)``.
@@ -451,8 +351,9 @@ def _run_phase1(query_c, key_c, value_c, beta_c, decay_c, *, inference=False):
         return pl.BlockSpec((1, 1, 1, *shape), lambda b, h, c: (b, h, c, *([0] * len(shape))))
 
     if inference:
+        g_cumsum_c = jnp.cumsum(decay_c, axis=-1).astype(jnp.float32)
         call = pl.pallas_call(
-            _phase1_kernel_fwd,
+            _phase1_kernel_fwd_cumsum,
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=0,
                 in_specs=[
@@ -473,22 +374,22 @@ def _run_phase1(query_c, key_c, value_c, beta_c, decay_c, *, inference=False):
                 grid=(B, H, NC),
             ),
             out_shape=[
-                jax.ShapeDtypeStruct((B, H, NC, C, V), jnp.float32),
-                jax.ShapeDtypeStruct((B, H, NC, C, K), jnp.float32),
-                jax.ShapeDtypeStruct((B, H, NC, C, C), jnp.float32),
-                jax.ShapeDtypeStruct((B, H, NC, C, K), jnp.float32),
-                jax.ShapeDtypeStruct((B, H, NC, C, K), jnp.float32),
+                jax.ShapeDtypeStruct((B, H, NC, C, V), phase1_dtype),
+                jax.ShapeDtypeStruct((B, H, NC, C, K), phase1_dtype),
+                jax.ShapeDtypeStruct((B, H, NC, C, C), phase1_dtype),
+                jax.ShapeDtypeStruct((B, H, NC, C, K), phase1_dtype),
+                jax.ShapeDtypeStruct((B, H, NC, C, K), phase1_dtype),
                 jax.ShapeDtypeStruct((B, H, NC, 1, 1), jnp.float32),
             ],
             compiler_params=pltpu.CompilerParams(
                 dimension_semantics=("parallel", "parallel", "arbitrary"),
             ),
         )
-        results = call(query_c, key_c, value_c, beta_c, decay_c)
-        return (*results, None)
+        return (*call(query_c, key_c, value_c, beta_c, g_cumsum_c), None)
     else:
+        g_cumsum_c = jnp.cumsum(decay_c, axis=-1).astype(jnp.float32)
         call = pl.pallas_call(
-            _phase1_kernel_train,
+            _phase1_kernel_train_cumsum,
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=0,
                 in_specs=[
@@ -510,11 +411,11 @@ def _run_phase1(query_c, key_c, value_c, beta_c, decay_c, *, inference=False):
                 grid=(B, H, NC),
             ),
             out_shape=[
-                jax.ShapeDtypeStruct((B, H, NC, C, V), jnp.float32),
-                jax.ShapeDtypeStruct((B, H, NC, C, K), jnp.float32),
-                jax.ShapeDtypeStruct((B, H, NC, C, C), jnp.float32),
-                jax.ShapeDtypeStruct((B, H, NC, C, K), jnp.float32),
-                jax.ShapeDtypeStruct((B, H, NC, C, K), jnp.float32),
+                jax.ShapeDtypeStruct((B, H, NC, C, V), phase1_dtype),
+                jax.ShapeDtypeStruct((B, H, NC, C, K), phase1_dtype),
+                jax.ShapeDtypeStruct((B, H, NC, C, C), phase1_dtype),
+                jax.ShapeDtypeStruct((B, H, NC, C, K), phase1_dtype),
+                jax.ShapeDtypeStruct((B, H, NC, C, K), phase1_dtype),
                 jax.ShapeDtypeStruct((B, H, NC, 1, 1), jnp.float32),
                 jax.ShapeDtypeStruct((B, H, NC, C, C), jnp.float32),
             ],
@@ -522,7 +423,75 @@ def _run_phase1(query_c, key_c, value_c, beta_c, decay_c, *, inference=False):
                 dimension_semantics=("parallel", "parallel", "arbitrary"),
             ),
         )
-        return call(query_c, key_c, value_c, beta_c, decay_c)
+        return call(query_c, key_c, value_c, beta_c, g_cumsum_c)
+
+
+def _run_phase1_indexed_grouped(
+    query_c,
+    key_c,
+    value_c,
+    beta_c,
+    decay_c,
+    *,
+    expand_ratio: int,
+    use_input_dtype_outputs: bool = False,
+):
+    """Launch Phase 1 with value-head parallelism and grouped Q/K indexing.
+
+    This keeps the original ``(batch, value_head, chunk)`` grid shape, but the
+    Q/K input BlockSpecs map each value head to ``value_head // expand_ratio``.
+    It avoids materializing repeated Q/K while preserving the parallelism of
+    the established per-value-head kernel.
+    """
+    B, _Hq, NC, C, K = query_c.shape
+    Hv = value_c.shape[1]
+    V = value_c.shape[-1]
+    phase1_dtype = query_c.dtype if use_input_dtype_outputs else jnp.float32
+    g_cumsum_c = jnp.cumsum(decay_c, axis=-1).astype(jnp.float32)
+
+    def bs_qk(shape):
+        return pl.BlockSpec(
+            (1, 1, 1, *shape),
+            lambda b, h, c: (b, h // expand_ratio, c, *([0] * len(shape))),
+        )
+
+    def bs_v(shape):
+        return pl.BlockSpec((1, 1, 1, *shape), lambda b, h, c: (b, h, c, *([0] * len(shape))))
+
+    call = pl.pallas_call(
+        _phase1_kernel_fwd_cumsum,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=0,
+            in_specs=[
+                bs_qk((C, K)),
+                bs_qk((C, K)),
+                bs_v((C, V)),
+                bs_v((1, C)),
+                bs_v((1, C)),
+            ],
+            out_specs=[
+                bs_v((C, V)),
+                bs_v((C, K)),
+                bs_v((C, C)),
+                bs_v((C, K)),
+                bs_v((C, K)),
+                bs_v((1, 1)),
+            ],
+            grid=(B, Hv, NC),
+        ),
+        out_shape=[
+            jax.ShapeDtypeStruct((B, Hv, NC, C, V), phase1_dtype),
+            jax.ShapeDtypeStruct((B, Hv, NC, C, K), phase1_dtype),
+            jax.ShapeDtypeStruct((B, Hv, NC, C, C), phase1_dtype),
+            jax.ShapeDtypeStruct((B, Hv, NC, C, K), phase1_dtype),
+            jax.ShapeDtypeStruct((B, Hv, NC, C, K), phase1_dtype),
+            jax.ShapeDtypeStruct((B, Hv, NC, 1, 1), jnp.float32),
+        ],
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel", "arbitrary"),
+        ),
+    )
+    return call(query_c, key_c, value_c, beta_c, g_cumsum_c)
 
 
 def _phase2_scan_body(state, inputs):
@@ -576,6 +545,8 @@ def _phase2_scan_body_infer(state, inputs):
         Tuple ``(new_state, (core_out, state))`` for ``jax.lax.scan``.
     """
     value_local, k_cumdecay, attn_qk, q_scaled, k_scaled, g_end_exp = inputs
+    if g_end_exp.dtype != state.dtype:
+        g_end_exp = g_end_exp.astype(state.dtype)
 
     v_prime = jnp.einsum("bhck,bhkv->bhcv", k_cumdecay, state)
     attn_inter = jnp.einsum("bhck,bhkv->bhcv", q_scaled, state)
@@ -584,8 +555,9 @@ def _phase2_scan_body_infer(state, inputs):
 
     state_update = jnp.einsum("bhkc,bhcv->bhkv", k_scaled.transpose(0, 1, 3, 2), v_new)
     new_state = jnp.nan_to_num(state * g_end_exp + state_update, nan=0.0, posinf=0.0, neginf=0.0)
+    new_state = new_state.astype(state.dtype)
 
-    return new_state, (core_out, state)
+    return new_state, core_out
 
 
 def _chunk_gdr_fwd_core(
@@ -600,6 +572,8 @@ def _chunk_gdr_fwd_core(
     *,
     save_residual: bool,
     inference: bool = False,
+    use_input_dtype_phase1_outputs: bool = False,
+    use_input_dtype_state: bool = False,
 ):
     """Two-phase chunked GDR forward pass (shared by training and inference).
 
@@ -629,7 +603,12 @@ def _chunk_gdr_fwd_core(
             by the backward pass.
         inference: If True, use the forward-only kernel (no ``attn_inv``
             residual saved).
-
+        use_input_dtype_phase1_outputs: If True, the Pallas Phase 1 writes
+            large handoff tensors in the input dtype while keeping recurrent
+            state and residual-only tensors in fp32.
+        use_input_dtype_state: If True, the forward-only Pallas phase2 scan
+            carries recurrent state in the input dtype. Ignored when
+            ``save_residual`` is true.
     Returns:
         Three-element tuple ``(output, final_state, residual)`` where
         ``residual`` is the backward-residual tuple when ``save_residual``
@@ -669,10 +648,11 @@ def _chunk_gdr_fwd_core(
     beta_c = beta.reshape(B, H, num_chunks, 1, chunk_size).astype(jnp.float32)
     decay_c = decay.reshape(B, H, num_chunks, 1, chunk_size).astype(jnp.float32)
 
+    state_dtype = input_dtype if inference and not save_residual and use_input_dtype_state else jnp.float32
     if initial_state is None:
-        initial_state = jnp.zeros((B, H, K_dim, V_dim), dtype=jnp.float32)
+        initial_state = jnp.zeros((B, H, K_dim, V_dim), dtype=state_dtype)
     else:
-        initial_state = initial_state.astype(jnp.float32)
+        initial_state = initial_state.astype(state_dtype)
 
     value_local, k_cumdecay, attn_qk, q_scaled, k_scaled, g_end_exp, _attn_inv = _run_phase1(
         query_c,
@@ -681,6 +661,7 @@ def _chunk_gdr_fwd_core(
         beta_c,
         decay_c,
         inference=inference,
+        use_input_dtype_outputs=use_input_dtype_phase1_outputs,
     )
 
     scan_inputs = (
@@ -693,11 +674,19 @@ def _chunk_gdr_fwd_core(
     )
 
     scan_fn = _phase2_scan_body_infer if inference else _phase2_scan_body
-    final_state, (core_out_tm, state_pre_tm) = lax.scan(
-        scan_fn,
-        initial_state,
-        scan_inputs,
-    )
+    if inference:
+        final_state, core_out_tm = lax.scan(
+            scan_fn,
+            initial_state,
+            scan_inputs,
+        )
+        state_pre_tm = None
+    else:
+        final_state, (core_out_tm, state_pre_tm) = lax.scan(
+            scan_fn,
+            initial_state,
+            scan_inputs,
+        )
 
     core_attn_out = core_out_tm.transpose(1, 2, 0, 3, 4)
     core_attn_out = core_attn_out.reshape(B, H, -1, V_dim)[:, :, :L, :]
@@ -706,6 +695,8 @@ def _chunk_gdr_fwd_core(
     if not save_residual:
         return core_attn_out, final_state_out, None
 
+    if state_pre_tm is None:
+        raise RuntimeError("Training GDR residual path did not return pre-update states.")
     state_pre_all = state_pre_tm.transpose(1, 2, 0, 3, 4)
     residual = (
         query_c,
@@ -726,7 +717,294 @@ def _chunk_gdr_fwd_core(
     return core_attn_out, final_state_out, residual
 
 
-def _chunk_gdr_fwd_impl(query, key, value, beta, decay, chunk_size, initial_state, use_qk_l2norm):
+def _repeat_grouped_heads(x, repeats: int):
+    """Repeat grouped key/query heads to match value-head layout."""
+    return jnp.repeat(x, repeats, axis=1)
+
+
+def _sum_grouped_head_grads(x, num_key_heads: int, expand_ratio: int):
+    """Collapse repeated-head Q/K gradients back to grouped-head layout."""
+    if x is None:
+        return None
+    return x.reshape(x.shape[0], num_key_heads, expand_ratio, *x.shape[2:]).sum(axis=2)
+
+
+def _cast_custom_vjp_primal_output(output, input_dtype, use_input_dtype_phase1_outputs, use_input_dtype_state):
+    """Match the custom-VJP fwd-rule output dtype to the decorated primal."""
+    if use_input_dtype_phase1_outputs and use_input_dtype_state:
+        return output.astype(input_dtype)
+    return output
+
+
+def _chunk_gdr_grouped_fwd_core(
+    query,
+    key,
+    value,
+    beta,
+    decay,
+    chunk_size,
+    initial_state,
+    use_qk_l2norm,
+    *,
+    use_input_dtype_phase1_outputs: bool = False,
+    use_input_dtype_state: bool = False,
+):
+    """Forward-only grouped-head chunked GDR.
+
+    ``query``/``key`` use fewer heads than ``value``/``beta``/``decay``. Each
+    key/query head is shared by ``expand_ratio`` value heads. The grouped
+    Phase 1 avoids repeating Q/K into HBM and shares the QK/KK products across
+    the expansion axis, then flattens back to the standard value-head layout for
+    the existing Phase 2 scan.
+    """
+    B, Hq, L, K_dim = query.shape
+    Hv = value.shape[1]
+    V_dim = value.shape[-1]
+    if Hv % Hq != 0:
+        raise ValueError(f"grouped GDR requires value heads ({Hv}) to be a multiple of query heads ({Hq})")
+    expand_ratio = Hv // Hq
+    input_dtype = query.dtype
+
+    if use_qk_l2norm:
+        query, _ = _l2norm_with_inv(query, axis=-1, eps=1e-6)
+        key, _ = _l2norm_with_inv(key, axis=-1, eps=1e-6)
+
+    if decay is None:
+        decay = jnp.zeros((B, Hv, L), dtype=input_dtype)
+    else:
+        decay = decay.astype(input_dtype)
+
+    pad_size = (chunk_size - L % chunk_size) % chunk_size
+    if pad_size > 0:
+        query = jnp.pad(query, ((0, 0), (0, 0), (0, pad_size), (0, 0)))
+        key = jnp.pad(key, ((0, 0), (0, 0), (0, pad_size), (0, 0)))
+        value = jnp.pad(value, ((0, 0), (0, 0), (0, pad_size), (0, 0)))
+        beta = jnp.pad(beta, ((0, 0), (0, 0), (0, pad_size)))
+        decay = jnp.pad(decay, ((0, 0), (0, 0), (0, pad_size)))
+
+    total_len = L + pad_size
+    num_chunks = total_len // chunk_size
+    scale = 1.0 / math.sqrt(K_dim)
+    query = query * scale
+
+    query_c = query.reshape(B, Hq, num_chunks, chunk_size, K_dim)
+    key_c = key.reshape(B, Hq, num_chunks, chunk_size, K_dim)
+
+    value_c = value.reshape(B, Hv, num_chunks, chunk_size, V_dim)
+    beta_c = beta.reshape(B, Hv, num_chunks, 1, chunk_size).astype(jnp.float32)
+    decay_c = decay.reshape(B, Hv, num_chunks, 1, chunk_size).astype(jnp.float32)
+
+    state_dtype = input_dtype if use_input_dtype_state else jnp.float32
+    if initial_state is None:
+        initial_state = jnp.zeros((B, Hv, K_dim, V_dim), dtype=state_dtype)
+    else:
+        initial_state = initial_state.astype(state_dtype)
+
+    value_local, k_cumdecay, attn_qk, q_scaled, k_scaled, g_end_exp = _run_phase1_indexed_grouped(
+        query_c,
+        key_c,
+        value_c,
+        beta_c,
+        decay_c,
+        expand_ratio=expand_ratio,
+        use_input_dtype_outputs=use_input_dtype_phase1_outputs,
+    )
+
+    scan_inputs = (
+        value_local.transpose(2, 0, 1, 3, 4),
+        k_cumdecay.transpose(2, 0, 1, 3, 4),
+        attn_qk.transpose(2, 0, 1, 3, 4),
+        q_scaled.transpose(2, 0, 1, 3, 4),
+        k_scaled.transpose(2, 0, 1, 3, 4),
+        g_end_exp.transpose(2, 0, 1, 3, 4),
+    )
+    final_state, core_out_tm = lax.scan(
+        _phase2_scan_body_infer,
+        initial_state,
+        scan_inputs,
+    )
+
+    core_attn_out = core_out_tm.transpose(1, 2, 0, 3, 4)
+    core_attn_out = core_attn_out.reshape(B, Hv, -1, V_dim)[:, :, :L, :]
+    return core_attn_out, final_state.astype(input_dtype)
+
+
+def _chunk_gdr_grouped_fwd_impl(
+    query,
+    key,
+    value,
+    beta,
+    decay,
+    chunk_size,
+    initial_state,
+    use_qk_l2norm,
+    use_input_dtype_phase1_outputs,
+    use_input_dtype_state,
+):
+    """Inference-only grouped wrapper: grouped Phase 1 + existing Phase 2."""
+    return _chunk_gdr_grouped_fwd_core(
+        query,
+        key,
+        value,
+        beta,
+        decay,
+        chunk_size,
+        initial_state,
+        use_qk_l2norm,
+        use_input_dtype_phase1_outputs=use_input_dtype_phase1_outputs,
+        use_input_dtype_state=use_input_dtype_state,
+    )
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(5, 7, 8, 9))
+def _chunk_gdr_grouped_fwd_pallas_chunk(
+    query: Float[Array, "batch num_key_heads seq_len head_dim"],
+    key: Float[Array, "batch num_key_heads seq_len head_dim"],
+    value: Float[Array, "batch num_value_heads seq_len d_state"],
+    beta: Float[Array, "batch num_value_heads seq_len"],
+    decay: Float[Array, "batch num_value_heads seq_len"] | None,
+    chunk_size: int = 64,
+    initial_state: Float[Array, "batch num_value_heads head_dim d_state"] | None = None,
+    use_qk_l2norm: bool = True,
+    use_input_dtype_phase1_outputs: bool = False,
+    use_input_dtype_state: bool = False,
+) -> tuple[
+    Float[Array, "batch num_value_heads seq_len d_state"],
+    Float[Array, "batch num_value_heads head_dim d_state"],
+]:
+    """Grouped-head chunked forward pass for GDR on TPU."""
+    return _chunk_gdr_grouped_fwd_impl(
+        query,
+        key,
+        value,
+        beta,
+        decay,
+        chunk_size,
+        initial_state,
+        use_qk_l2norm,
+        use_input_dtype_phase1_outputs,
+        use_input_dtype_state,
+    )
+
+
+def _chunk_gdr_grouped_fwd_rule(
+    query,
+    key,
+    value,
+    beta,
+    decay,
+    chunk_size,
+    initial_state,
+    use_qk_l2norm,
+    use_input_dtype_phase1_outputs,
+    use_input_dtype_state,
+):
+    """Custom-VJP forward rule using the existing repeated-head residual path."""
+    num_key_heads = query.shape[1]
+    num_value_heads = value.shape[1]
+    if num_value_heads % num_key_heads != 0:
+        raise ValueError(
+            f"grouped GDR requires value heads ({num_value_heads}) to be a multiple of query heads ({num_key_heads})"
+        )
+    expand_ratio = num_value_heads // num_key_heads
+    query_rep = _repeat_grouped_heads(query, expand_ratio)
+    key_rep = _repeat_grouped_heads(key, expand_ratio)
+    output, final_state, residual = _chunk_gdr_fwd_core(
+        query_rep,
+        key_rep,
+        value,
+        beta,
+        decay,
+        chunk_size,
+        initial_state,
+        use_qk_l2norm,
+        save_residual=True,
+        inference=False,
+        use_input_dtype_phase1_outputs=use_input_dtype_phase1_outputs,
+        use_input_dtype_state=False,
+    )
+    output = _cast_custom_vjp_primal_output(
+        output,
+        query.dtype,
+        use_input_dtype_phase1_outputs,
+        use_input_dtype_state,
+    )
+    return (output, final_state), (residual, num_key_heads, expand_ratio)
+
+
+def _chunk_gdr_grouped_bwd_rule(
+    chunk_size,
+    use_qk_l2norm,
+    use_input_dtype_phase1_outputs,
+    use_input_dtype_state,
+    res,
+    g,
+):
+    """Custom-VJP backward rule: repeated-head backward, then reduce Q/K grads."""
+    from ._pallas_impl_bwd import _chunk_gdr_bwd
+
+    residual, num_key_heads, expand_ratio = res
+    d_query, d_key, d_value, d_beta, d_decay, d_initial_state = _chunk_gdr_bwd(
+        chunk_size,
+        use_qk_l2norm,
+        residual,
+        g,
+    )
+    return (
+        _sum_grouped_head_grads(d_query, num_key_heads, expand_ratio),
+        _sum_grouped_head_grads(d_key, num_key_heads, expand_ratio),
+        d_value,
+        d_beta,
+        d_decay,
+        d_initial_state,
+    )
+
+
+_chunk_gdr_grouped_fwd_pallas_chunk.defvjp(_chunk_gdr_grouped_fwd_rule, _chunk_gdr_grouped_bwd_rule)
+
+
+def _chunk_gdr_grouped_fwd(
+    query: Float[Array, "batch num_key_heads seq_len head_dim"],
+    key: Float[Array, "batch num_key_heads seq_len head_dim"],
+    value: Float[Array, "batch num_value_heads seq_len d_state"],
+    beta: Float[Array, "batch num_value_heads seq_len"],
+    decay: Float[Array, "batch num_value_heads seq_len"] | None,
+    chunk_size: int = 64,
+    initial_state: Float[Array, "batch num_value_heads head_dim d_state"] | None = None,
+    use_qk_l2norm: bool = True,
+    use_input_dtype_phase1_outputs: bool = False,
+    use_input_dtype_state: bool = False,
+) -> tuple[
+    Float[Array, "batch num_value_heads seq_len d_state"],
+    Float[Array, "batch num_value_heads head_dim d_state"],
+]:
+    """Multi-token grouped-head chunked GDR forward path."""
+    return _chunk_gdr_grouped_fwd_pallas_chunk(
+        query,
+        key,
+        value,
+        beta,
+        decay,
+        chunk_size,
+        initial_state,
+        use_qk_l2norm,
+        use_input_dtype_phase1_outputs,
+        use_input_dtype_state,
+    )
+
+
+def _chunk_gdr_fwd_impl(
+    query,
+    key,
+    value,
+    beta,
+    decay,
+    chunk_size,
+    initial_state,
+    use_qk_l2norm,
+    use_input_dtype_phase1_outputs,
+    use_input_dtype_state,
+):
     """Inference-only wrapper: calls ``_chunk_gdr_fwd_core`` without saving residuals."""
     output, final_state, _ = _chunk_gdr_fwd_core(
         query,
@@ -739,11 +1017,13 @@ def _chunk_gdr_fwd_impl(query, key, value, beta, decay, chunk_size, initial_stat
         use_qk_l2norm,
         save_residual=False,
         inference=True,
+        use_input_dtype_phase1_outputs=use_input_dtype_phase1_outputs,
+        use_input_dtype_state=use_input_dtype_state,
     )
     return output, final_state
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(5, 7))
+@functools.partial(jax.custom_vjp, nondiff_argnums=(5, 7, 8, 9))
 def _chunk_gdr_fwd_pallas_chunk(
     query: Float[Array, "batch num_heads seq_len head_dim"],
     key: Float[Array, "batch num_heads seq_len head_dim"],
@@ -753,15 +1033,39 @@ def _chunk_gdr_fwd_pallas_chunk(
     chunk_size: int = 64,
     initial_state: Float[Array, "batch num_heads head_dim d_state"] | None = None,
     use_qk_l2norm: bool = True,
+    use_input_dtype_phase1_outputs: bool = False,
+    use_input_dtype_state: bool = False,
 ) -> tuple[
     Float[Array, "batch num_heads seq_len d_state"],
     Float[Array, "batch num_heads head_dim d_state"],
 ]:
     """Chunked forward pass for GDR on TPU via 2-phase Pallas kernel."""
-    return _chunk_gdr_fwd_impl(query, key, value, beta, decay, chunk_size, initial_state, use_qk_l2norm)
+    return _chunk_gdr_fwd_impl(
+        query,
+        key,
+        value,
+        beta,
+        decay,
+        chunk_size,
+        initial_state,
+        use_qk_l2norm,
+        use_input_dtype_phase1_outputs,
+        use_input_dtype_state,
+    )
 
 
-def _chunk_gdr_fwd_rule(query, key, value, beta, decay, chunk_size, initial_state, use_qk_l2norm):
+def _chunk_gdr_fwd_rule(
+    query,
+    key,
+    value,
+    beta,
+    decay,
+    chunk_size,
+    initial_state,
+    use_qk_l2norm,
+    use_input_dtype_phase1_outputs,
+    use_input_dtype_state,
+):
     """Custom-VJP forward rule: training mode — runs Phase 1+2 and saves residuals.
 
     Returns:
@@ -779,11 +1083,19 @@ def _chunk_gdr_fwd_rule(query, key, value, beta, decay, chunk_size, initial_stat
         use_qk_l2norm,
         save_residual=True,
         inference=False,
+        use_input_dtype_phase1_outputs=use_input_dtype_phase1_outputs,
+        use_input_dtype_state=False,
+    )
+    output = _cast_custom_vjp_primal_output(
+        output,
+        query.dtype,
+        use_input_dtype_phase1_outputs,
+        use_input_dtype_state,
     )
     return (output, final_state), residual
 
 
-def _chunk_gdr_bwd_rule(chunk_size, use_qk_l2norm, res, g):
+def _chunk_gdr_bwd_rule(chunk_size, use_qk_l2norm, use_input_dtype_phase1_outputs, use_input_dtype_state, res, g):
     """Custom-VJP backward rule: delegates to ``_chunk_gdr_bwd`` in ``_pallas_impl_bwd``."""
     from ._pallas_impl_bwd import _chunk_gdr_bwd
 
@@ -802,6 +1114,8 @@ def _chunk_gdr_fwd(
     chunk_size: int = 64,
     initial_state: Float[Array, "batch num_heads head_dim d_state"] | None = None,
     use_qk_l2norm: bool = True,
+    use_input_dtype_phase1_outputs: bool = False,
+    use_input_dtype_state: bool = False,
 ) -> tuple[
     Float[Array, "batch num_heads seq_len d_state"],
     Float[Array, "batch num_heads head_dim d_state"],
@@ -821,6 +1135,13 @@ def _chunk_gdr_fwd(
         chunk_size: Number of tokens per chunk.
         initial_state: [B, H, K, V] or None.
         use_qk_l2norm: Apply L2 normalisation to Q/K.
+        use_input_dtype_phase1_outputs: If True, the forward-only path writes
+            phase-1 handoff tensors in the input dtype instead of fp32. The
+            custom-VJP forward rule used for gradients still keeps fp32
+            residuals.
+        use_input_dtype_state: If True, the forward-only path carries recurrent
+            state in the input dtype. The custom-VJP forward rule still keeps
+            fp32 state for residuals.
 
     Returns:
         ``(output [B, H, L, V], final_state [B, H, K, V])``.
@@ -834,6 +1155,8 @@ def _chunk_gdr_fwd(
         chunk_size,
         initial_state,
         use_qk_l2norm,
+        use_input_dtype_phase1_outputs,
+        use_input_dtype_state,
     )
 
 

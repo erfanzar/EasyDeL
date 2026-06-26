@@ -1182,7 +1182,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.use_expert_tensor_mode = getattr(self, "use_expert_tensor_mode", use_expert_tensor_mode)
         self.fsdp_is_ep_bound = getattr(self, "fsdp_is_ep_bound", fsdp_is_ep_bound)
         self.sp_is_ep_bound = getattr(self, "sp_is_ep_bound", sp_is_ep_bound)
-        self.operation_configs = getattr(self, "operation_configs", operation_configs)
+        self.operation_configs = (
+            operation_configs if operation_configs is not None else getattr(self, "operation_configs", None)
+        )
         self.pretraining_tp = 1  # it's for pytorch models.
 
         # Keep legacy HF-compatible config fields available even when subclasses

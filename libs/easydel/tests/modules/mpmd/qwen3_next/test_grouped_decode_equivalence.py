@@ -28,8 +28,8 @@ The tests cover three layers of the Qwen3-Next linear-attention decode stack:
   the packed multi-request conv1d + GDR state update that consumes a packed token
   buffer described by ``query_start_loc``, checked against ``_reference_packed_updates``
   (a Python for-loop over requests).
-* ``_apply_qwen3_next_packed_updates`` dispatch logic (unified vs ragged) and the
-  ``gated_delta_rule_grouped_decode`` Pallas/JAX equivalence on a tensor-parallel mesh.
+* ``_apply_qwen3_next_packed_updates`` dispatch logic (unified vs ragged) driven by explicit config-style
+  arguments, and the ``gated_delta_rule_grouped_decode`` Pallas/JAX equivalence on a tensor-parallel mesh.
 
 The ``_make_*`` helpers build deterministic random inputs for each scenario (plain
 decode, packed decode-like, mixed prefill/decode, many short prefills, large padded
@@ -797,21 +797,16 @@ def test_packed_updates_match_reference_loop_for_large_bucket_decode_like_schedu
     assert jnp.allclose(unified_out.astype(jnp.float32), ref_out.astype(jnp.float32), rtol=0.02, atol=0.05)
 
 
-def test_packed_updates_use_unified_when_ragged_disabled_for_partial_prefill_bucket(monkeypatch):
+def test_packed_updates_use_unified_when_ragged_disabled_for_partial_prefill_bucket():
     """With ragged GDR disabled, packed updates fall back to the unified path and match it.
 
-    Sets ``EASYDEL_RAGGED_GDR=0`` and, on a partial-bucket prefill (454 of 512 tokens used), asserts
+    Passes ``use_ragged_gdr=False`` and, on a partial-bucket prefill (454 of 512 tokens used), asserts
     the dispatched ``_apply_qwen3_next_packed_updates`` output equals the directly-called
     ``_apply_qwen3_next_packed_updates_unified`` output, that both match the reference conv/recurrent
     states within tolerance, and that token outputs past the 454th position are exactly zero.
-
-    Args:
-        monkeypatch: Pytest fixture used to set the ``EASYDEL_RAGGED_GDR`` environment variable.
     """
     packed_inputs = _make_partial_bucket_prefill_inputs(bucket=512, actual_tokens=454)
     mesh = _make_runtime_mesh()
-
-    monkeypatch.setenv("EASYDEL_RAGGED_GDR", "0")
 
     with mesh, set_inference_mode(True):
         gdr_op = _make_gdr_op(mesh)
@@ -819,6 +814,7 @@ def test_packed_updates_use_unified_when_ragged_disabled_for_partial_prefill_buc
             **packed_inputs,
             gdr_op=gdr_op,
             ragged_gdr_op=object(),
+            use_ragged_gdr=False,
         )
         unified_conv, unified_rec, unified_out = _apply_qwen3_next_packed_updates_unified(
             **packed_inputs,
@@ -845,18 +841,16 @@ def test_packed_updates_use_unified_when_ragged_disabled_for_partial_prefill_buc
 def test_packed_updates_keep_ragged_for_partial_decode_bucket(monkeypatch):
     """With ragged GDR enabled, packed updates dispatch to the ragged path.
 
-    Sets ``EASYDEL_RAGGED_GDR=1`` and monkeypatches the unified and ragged packed-update functions
+    Monkeypatches the unified and ragged packed-update functions
     with distinct sentinel markers (1 vs 2). It then calls ``_apply_qwen3_next_packed_updates`` and
     asserts the result carries the ragged marker (``2``), proving the dispatcher chose the ragged
     implementation for this partial-decode bucket.
 
     Args:
-        monkeypatch: Pytest fixture used to set ``EASYDEL_RAGGED_GDR`` and swap the unified/ragged
+        monkeypatch: Pytest fixture used to swap the unified/ragged
             packed-update functions for sentinel-returning stubs.
     """
     packed_inputs = _make_large_bucket_decode_inputs(bucket=512)
-
-    monkeypatch.setenv("EASYDEL_RAGGED_GDR", "1")
 
     unified_marker = (
         jnp.array([1], dtype=jnp.int32),

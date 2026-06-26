@@ -413,18 +413,23 @@ class EasyDeLLayerStackMixin:
 
         Returns:
             int: Total logical pipeline width derived from
-            ``config.mesh.shape['pp']`` multiplied by
+            ``config.mesh.shape['pp']`` (or 1 when no PP axis exists) multiplied by
             ``config.pipeline_virtual_stages``.
         """
-        return int(self.config.mesh.shape["pp"]) * int(self.config.pipeline_virtual_stages)
+        return self._pipeline_physical_stage_count() * int(getattr(self.config, "pipeline_virtual_stages", 1) or 1)
 
     def _pipeline_physical_stage_count(self: Self) -> int:
         """Return the number of physical pipeline ranks.
 
         Returns:
-            int: ``config.mesh.shape['pp']`` cast to ``int``.
+            int: ``config.mesh.shape['pp']`` cast to ``int``; 1 when the
+            active mesh has no pipeline axis.
         """
-        return int(self.config.mesh.shape["pp"])
+        mesh_shape = getattr(getattr(self.config, "mesh", None), "shape", None)
+        try:
+            return int(mesh_shape["pp"])
+        except (KeyError, TypeError, AttributeError):
+            return 1
 
     def _pipeline_stage_regions_enabled(self: Self) -> bool:
         """Return whether this module should emit SpectraX stage-region markers.

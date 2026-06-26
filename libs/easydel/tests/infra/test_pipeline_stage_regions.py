@@ -16,13 +16,16 @@
 
 from __future__ import annotations
 
-import jax
-import spectrax as spx
-from jax import numpy as jnp
-from spectrax.runtime.mpmd.markers import stage_region_specs
+from types import SimpleNamespace
 
+import jax
+import numpy as np
+import spectrax as spx
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.modules.llama.llama_configuration import LlamaConfig
+from jax import numpy as jnp
+from jax.sharding import Mesh
+from spectrax.runtime.mpmd.markers import stage_region_specs
 
 
 class _DummyRegionModule(EasyDeLBaseModule):
@@ -67,3 +70,12 @@ def test_base_module_does_not_emit_sxstage_region_markers_by_default():
     assert "sxstage_region_enter" not in primitive_names
     assert "sxstage_region_exit" not in primitive_names
     assert not stage_region_specs(jaxpr)
+
+
+def test_pipeline_stage_count_defaults_to_one_without_pp_axis():
+    mesh = Mesh(np.asarray(jax.devices()).reshape(1, 1, 1, jax.device_count(), 1), ("dp", "fsdp", "ep", "tp", "sp"))
+    module = SimpleNamespace(config=SimpleNamespace(mesh=mesh, pipeline_virtual_stages=1))
+    module._pipeline_physical_stage_count = lambda: EasyDeLBaseModule._pipeline_physical_stage_count(module)
+
+    assert EasyDeLBaseModule._pipeline_physical_stage_count(module) == 1
+    assert EasyDeLBaseModule._pipeline_stage_count(module) == 1

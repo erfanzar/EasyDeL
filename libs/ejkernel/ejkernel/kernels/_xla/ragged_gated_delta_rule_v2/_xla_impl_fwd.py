@@ -372,8 +372,10 @@ def ragged_gated_delta_rule_mixed_prefill(
     recurrent_state: jnp.ndarray,
     state_indices: jnp.ndarray,
     distribution: jnp.ndarray,
+    has_initial_state: jnp.ndarray,
     chunk_size: int = 64,
     use_qk_norm_in_gdn: bool = False,
+    mask_initial_state: bool = False,
     compute_dtype: jnp.dtype = jnp.bfloat16,
     precision: jax.lax.Precision = jax.lax.Precision.HIGHEST,
     preferred_element_type: jnp.dtype = jnp.float32,
@@ -408,10 +410,17 @@ def ragged_gated_delta_rule_mixed_prefill(
             shape ``(num_requests,)``.
         distribution: Triple ``[decode_end, prefill_end, total]``; the
             third entry gates which slots have outputs to write.
+        has_initial_state: Boolean tensor marking requests whose recurrent
+            state slot should be used as the initial prefill state. Requests
+            without initial state start from zeros even if the slot contains
+            stale state from a previous sequence.
         chunk_size: Padding and chunking granularity for the parallel
             intra-chunk attention.
         use_qk_norm_in_gdn: Whether to L2-normalize Q and K before the
             chunked attention.
+        mask_initial_state: When ``True``, gate the loaded recurrent state with
+            ``has_initial_state``. Keep ``False`` for the common all-valid path
+            so the compiled prefill stays on the cheaper state-load lowering.
         compute_dtype: Dtype for the chunked Q/K/V/beta tensors.
         precision: ``lax.Precision`` for the matmul calls; defaults to
             ``HIGHEST`` to keep numerical stability across long
@@ -571,7 +580,14 @@ def ragged_gated_delta_rule_mixed_prefill(
     # Prepare init_h_per_chunk
     init_h_per_chunk = jnp.zeros((num_chunks, H, K_dim, V_dim), dtype=recurrent_state.dtype)
     start_chunk_indices = new_query_start_loc[:-1] // chunk_size
-    init_h_per_chunk = init_h_per_chunk.at[start_chunk_indices].set(recurrent_state[state_indices])
+    init_states_for_seqs = recurrent_state[state_indices]
+    if mask_initial_state:
+        init_states_for_seqs = jnp.where(
+            has_initial_state[:, None, None, None],
+            init_states_for_seqs,
+            jnp.zeros_like(init_states_for_seqs),
+        )
+    init_h_per_chunk = init_h_per_chunk.at[start_chunk_indices].set(init_states_for_seqs)
 
     h_init = jnp.zeros((H, K_dim, V_dim), dtype=jnp.float32)
 
@@ -833,6 +849,7 @@ def ragged_gated_delta_rule_decode_only(
         "use_qk_norm_in_gdn",
         "apply_silu_in_gdr",
         "use_recurrent_scan_prefill",
+        "mask_initial_state",
     ),
 )
 @jax.named_scope("ragged_gated_delta_rule_chunked")
@@ -856,6 +873,7 @@ def ragged_gated_delta_rule(
     use_qk_norm_in_gdn: bool = True,
     apply_silu_in_gdr: bool = False,
     use_recurrent_scan_prefill: bool = False,
+    mask_initial_state: bool = False,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Applies the gated delta rule over ragged seq lengths
 
@@ -900,6 +918,9 @@ def ragged_gated_delta_rule(
         use_recurrent_scan_prefill: Static flag accepted for API/signature
             compatibility; not consumed by this implementation. Defaults to
             False.
+        mask_initial_state: When True, use ``has_initial_state`` to zero stale
+            recurrent slots for fresh prefill requests. Static; defaults to
+            False to keep the all-valid prefill path fast.
 
     Returns:
         tuple: ``(updated_recurrent_state, output)`` with state of shape
@@ -983,8 +1004,10 @@ def ragged_gated_delta_rule(
             recurrent_state=recurrent_state,
             state_indices=state_indices,
             distribution=distribution,
+            has_initial_state=has_initial_state,
             chunk_size=chunk_size,
             use_qk_norm_in_gdn=use_qk_norm_in_gdn,
+            mask_initial_state=mask_initial_state,
         )
 
     is_decode_only = distribution[0] == distribution[2]
@@ -1012,6 +1035,7 @@ def ragged_gated_delta_rule_v2(
     use_qk_norm_in_gdn: bool = True,
     apply_silu_in_gdr: bool = False,
     use_recurrent_scan_prefill: bool = False,
+    mask_initial_state: bool = False,
     runtime_dtype: jnp.dtype | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Run the unsharded packed-inference GDN v2 XLA kernel.
@@ -1050,6 +1074,8 @@ def ragged_gated_delta_rule_v2(
             the Q/K/V split. Defaults to False.
         use_recurrent_scan_prefill: Static compatibility flag forwarded
             unchanged; not consumed by the implementation. Defaults to False.
+        mask_initial_state: When True, use ``has_initial_state`` to zero stale
+            recurrent slots for fresh prefill requests. Defaults to False.
         runtime_dtype: Common dtype to cast all floating inputs into before
             running the kernel. Defaults to ``mixed_qkv.dtype`` when ``None``.
 
@@ -1088,4 +1114,5 @@ def ragged_gated_delta_rule_v2(
         use_qk_norm_in_gdn=use_qk_norm_in_gdn,
         apply_silu_in_gdr=apply_silu_in_gdr,
         use_recurrent_scan_prefill=use_recurrent_scan_prefill,
+        mask_initial_state=mask_initial_state,
     )

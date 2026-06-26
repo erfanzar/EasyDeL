@@ -215,6 +215,24 @@ class Qwen3NextConfig(EasyDeLBaseConfig):
         linear_value_head_dim: Value head dimension for linear attention.
         linear_num_key_heads: Number of key heads for linear attention.
         linear_num_value_heads: Number of value heads for linear attention.
+        separate_mlp_gate_up_proj: Whether dense MLPs compute gate/up with
+            two split-weight projections instead of one fused gate_up projection.
+        use_tp_ring_mlp_column_matmul: Whether the separate dense MLP gate/up
+            projections use a TP ring over hidden-axis activation shards instead
+            of materializing the gathered hidden state before each column matmul.
+        use_ragged_gdr: Whether packed inference uses the ragged GDR path.
+        ragged_gdr_chunk_size: Chunk size for ragged GDR packed prefill.
+        force_recurrent_scan_prefill: Force recurrent-scan ragged prefill for
+            eligible TPU packed inference calls.
+        recurrent_scan_prefill_max_seq_len: Maximum sequence length eligible
+            for recurrent-scan ragged prefill when it is not forced.
+        force_dp_recurrent_scan_prefill: Force the DP rank-major
+            recurrent-scan packed inference path.
+        dp_recurrent_scan_prefill_max_seq_len: Maximum sequence length eligible
+            for DP recurrent-scan packed inference when it is not forced.
+        use_grouped_gdr_prefill: Keep Q/K in grouped-head layout for dense
+            multi-token GDR prefill/training forward. The ejkernel GDR op
+            expands internally only on unsupported backends.
         decoder_sparse_step: Step interval for MoE layers.
         moe_intermediate_size: Intermediate size for routed experts.
         shared_expert_intermediate_size: Intermediate size for shared expert.
@@ -257,6 +275,16 @@ class Qwen3NextConfig(EasyDeLBaseConfig):
         linear_num_value_heads: int = 32,
         linear_attention_separate_proj: bool = False,
         linear_attention_merged_split_proj: bool = False,
+        separate_mlp_gate_up_proj: bool = False,
+        use_tp_ring_mlp_column_matmul: bool = False,
+        use_tp_ring_full_attention_qkv_matmul: bool = False,
+        use_grouped_gdr_prefill: bool = True,
+        use_ragged_gdr: bool = True,
+        ragged_gdr_chunk_size: int = 16,
+        force_recurrent_scan_prefill: bool = False,
+        recurrent_scan_prefill_max_seq_len: int = 64,
+        force_dp_recurrent_scan_prefill: bool = False,
+        dp_recurrent_scan_prefill_max_seq_len: int = 64,
         decoder_sparse_step: int = 1,
         moe_intermediate_size: int = 512,
         shared_expert_intermediate_size: int = 512,
@@ -310,6 +338,16 @@ class Qwen3NextConfig(EasyDeLBaseConfig):
             )
         self.linear_attention_separate_proj = linear_attention_separate_proj
         self.linear_attention_merged_split_proj = linear_attention_merged_split_proj
+        self.separate_mlp_gate_up_proj = bool(separate_mlp_gate_up_proj)
+        self.use_tp_ring_mlp_column_matmul = bool(use_tp_ring_mlp_column_matmul)
+        self.use_tp_ring_full_attention_qkv_matmul = bool(use_tp_ring_full_attention_qkv_matmul)
+        self.use_grouped_gdr_prefill = bool(use_grouped_gdr_prefill)
+        self.use_ragged_gdr = use_ragged_gdr
+        self.ragged_gdr_chunk_size = ragged_gdr_chunk_size
+        self.force_recurrent_scan_prefill = force_recurrent_scan_prefill
+        self.recurrent_scan_prefill_max_seq_len = recurrent_scan_prefill_max_seq_len
+        self.force_dp_recurrent_scan_prefill = force_dp_recurrent_scan_prefill
+        self.dp_recurrent_scan_prefill_max_seq_len = dp_recurrent_scan_prefill_max_seq_len
 
         self.decoder_sparse_step = decoder_sparse_step
         self.moe_intermediate_size = moe_intermediate_size

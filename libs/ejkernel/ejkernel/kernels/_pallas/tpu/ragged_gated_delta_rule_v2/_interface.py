@@ -46,6 +46,9 @@ def ragged_gated_delta_rule_v2(
     use_qk_norm_in_gdn: bool = True,
     apply_silu_in_gdr: bool = False,
     use_recurrent_scan_prefill: bool = False,
+    mask_initial_state: bool = False,
+    kernel_tile_policy: str = "auto",
+    use_fused_gdn_decode: bool = False,
     runtime_dtype: object | None = None,
 ) -> tuple[
     Float[Array, "num_slots num_value_heads qk_head_dim v_head_dim"],
@@ -91,6 +94,11 @@ def ragged_gated_delta_rule_v2(
             Defaults to ``False``.
         use_recurrent_scan_prefill: If ``True``, run prefill through the recurrent scan path instead of the
             chunked path. Defaults to ``False``.
+        mask_initial_state: If ``True``, use ``has_initial_state`` to zero stale
+            recurrent slots for fresh prefill requests. Defaults to ``False``.
+        kernel_tile_policy: TPU Pallas token tile policy for decode.
+        use_fused_gdn_decode: Whether to use the fused TPU decode kernel when
+            the shape is supported.
         runtime_dtype: Optional dtype to which the floating-point inputs are cast before computation. When
             ``None``, the dtype of ``mixed_qkv`` is used. Defaults to ``None``.
 
@@ -119,5 +127,8 @@ def ragged_gated_delta_rule_v2(
         use_qk_norm_in_gdn=use_qk_norm_in_gdn,
         apply_silu_in_gdr=apply_silu_in_gdr,
         use_recurrent_scan_prefill=use_recurrent_scan_prefill,
+        mask_initial_state=mask_initial_state,
+        kernel_tile_policy=kernel_tile_policy,
+        use_fused_gdn_decode=use_fused_gdn_decode,
         runtime_dtype=runtime_dtype,
     )

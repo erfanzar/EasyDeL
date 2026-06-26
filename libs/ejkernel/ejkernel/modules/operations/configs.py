@@ -832,19 +832,36 @@ class KernelDeltaAttentionConfig(BaseOperationConfig):
 class GatedDeltaRuleConfig(BaseOperationConfig):
     """Configuration for Gated Delta Rule (GDR) operation.
 
-    The primary tunable parameter is ``chunk_size``, which controls the
-    trade-off between intra-chunk parallelism and inter-chunk state
-    propagation overhead.
+    ``chunk_size`` controls the trade-off between intra-chunk parallelism and
+    inter-chunk state propagation overhead. ``use_chunked`` selects the
+    chunked training/prefill algorithm; setting it to ``False`` forces the
+    recurrent XLA path. ``use_input_dtype_phase1_outputs`` is a TPU/Pallas
+    optimization knob for forward-only chunked prefill: it stores the large
+    phase-1 handoff tensors in the input dtype instead of fp32. The custom-VJP
+    training residual path still stores fp32 intermediates for backward
+    stability. ``use_input_dtype_state`` is a separate forward-only TPU/Pallas
+    knob for callers that do not need an fp32 recurrent state from the prefill.
 
     Args:
         platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
         chunk_size: Chunk size for the chunked forward pass (default: 64).
             Larger chunks increase parallelism but also increase memory for
-            intra-chunk attention matrices. Typical values: 32, 64, 128.
+            intra-chunk attention matrices. Typical values: 32, 64, 128, 256.
+        use_chunked: Whether to use the chunked algorithm when the caller does
+            not explicitly disable it. ``False`` forces recurrent XLA.
+        use_input_dtype_phase1_outputs: Whether the TPU/Pallas forward-only
+            chunked path should write large phase-1 outputs in the input dtype.
+            Ignored by XLA and by the Pallas custom-VJP training residual path.
+        use_input_dtype_state: Whether the TPU/Pallas forward-only chunked path
+            should carry recurrent state in the input dtype. Leave this disabled
+            for stateful prefill/decode paths that need fp32 cache state.
     """
 
     chunk_size: int = 64
+    use_chunked: bool = True
+    use_input_dtype_phase1_outputs: bool = False
+    use_input_dtype_state: bool = False
 
     __hash__ = hash_fn
 
@@ -925,11 +942,18 @@ class RaggedGatedDeltaRuleV2Config(BaseOperationConfig):
 
     Attributes:
         chunk_size: Chunk size for the chunked prefill/scan paths (default: 64).
+        kernel_tile_policy: TPU Pallas decode tile policy. ``"auto"`` uses
+            VMEM-aware tile selection; ``"b16"``, ``"b8"``, ``"b4"``,
+            ``"b2"`` and ``"b1"`` force a token tile size.
+        use_fused_gdn_decode: Whether to route supported decode-only TPU calls
+            through the fused GDN decode kernel.
         platform: Target platform (triton/pallas/cuda/cute/xla/auto).
         backend: Backend specification (default: "any").
     """
 
     chunk_size: int = 64
+    kernel_tile_policy: Literal["auto", "b16", "b8", "b4", "b2", "b1"] = "auto"
+    use_fused_gdn_decode: bool = False
 
     __hash__ = hash_fn
 

@@ -23,7 +23,6 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import pytest
-
 from ejkernel.kernels._pallas.tpu.gated_delta_rule import gated_delta_rule as gdr_pallas
 from ejkernel.kernels._xla.gated_delta_rule import gated_delta_rule as gdr_xla
 
@@ -109,11 +108,28 @@ class TestChunkedPrefill:
         assert jnp.all(jnp.isfinite(out))
         assert jnp.all(jnp.isfinite(state))
 
-    def test_chunked_unaligned_seqlen(self):
+    @pytest.mark.parametrize("chunk_size", [64, 128, 256])
+    def test_chunked_unaligned_seqlen(self, chunk_size):
         q, k, v, beta, decay = _make(1, 137, **QWEN3_NEXT_SMALL_DIMS, seed=16)
-        out, _state = gdr_pallas(q, k, v, beta, decay, chunk_size=64)
+        init = (
+            jax.random.normal(
+                jax.random.PRNGKey(17),
+                (
+                    1,
+                    QWEN3_NEXT_SMALL_DIMS["heads"],
+                    QWEN3_NEXT_SMALL_DIMS["qk_dim"],
+                    QWEN3_NEXT_SMALL_DIMS["v_dim"],
+                ),
+                dtype=jnp.float32,
+            )
+            * 0.01
+        )
+        out, state = gdr_pallas(q, k, v, beta, decay, chunk_size=chunk_size, initial_state=init)
+        out_x, state_x = gdr_xla(q, k, v, beta, decay, chunk_size=chunk_size, initial_state=init, use_chunked=False)
         assert out.shape == v.shape
         assert jnp.all(jnp.isfinite(out))
+        assert jnp.allclose(out, out_x, atol=5e-2, rtol=0), f"Output diff: {jnp.max(jnp.abs(out - out_x))}"
+        assert jnp.allclose(state, state_x, atol=5e-2, rtol=0), f"State diff: {jnp.max(jnp.abs(state - state_x))}"
 
 
 class TestSingleStepDecode:
@@ -252,9 +268,9 @@ class TestPrefillThenDecode:
 
         decode_cat = jnp.concatenate(decode_outs, axis=1)
         expected = out_full[:, prefill_len:]
-        assert jnp.allclose(decode_cat, expected, atol=5e-2, rtol=0), (
-            f"Prefill+decode vs full recurrent max diff: {jnp.max(jnp.abs(decode_cat - expected))}"
-        )
+        assert jnp.allclose(
+            decode_cat, expected, atol=5e-2, rtol=0
+        ), f"Prefill+decode vs full recurrent max diff: {jnp.max(jnp.abs(decode_cat - expected))}"
 
 
 class TestRecurrentFallback:

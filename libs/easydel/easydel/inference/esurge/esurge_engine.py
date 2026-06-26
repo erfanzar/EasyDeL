@@ -619,6 +619,10 @@ class eSurge(
                 - ``resolution_buckets`` (list[tuple[int, int]] | None): Discrete
                   vision resolutions for caching/precompilation.
                 - ``vision_cache_capacity_mb`` (int): Vision encoder cache size.
+                - ``compile_vision_encoder`` (bool): Precompile/use a bucketed
+                  JIT helper for multimodal vision features when supported.
+                - ``vision_patch_buckets`` (list[int] | None): Optional raw
+                  patch-count buckets for vision precompile.
 
                 Consumed via ``Unpack[eSurgeVisionConfig]``.
             distributed (eSurgeDistributedConfig | Mapping[str, Any] | None):
@@ -1161,6 +1165,8 @@ class eSurge(
             mpmd_scheduler=self.runtime_config.mpmd_scheduler,
             pp_microbatch_count=self.runtime_config.pp_microbatch_count,
             pp_microbatch_size=self.runtime_config.pp_microbatch_size,
+            compile_vision_encoder=self.vision_config.compile_vision_encoder,
+            vision_patch_buckets=self.vision_config.vision_patch_buckets,
             drafter=drafter,
         )
 

@@ -262,6 +262,7 @@ class Qwen3_5MTPDrafter:
         self.supports_prefix_draft = True
         self.uses_mtp_cache = bool(use_cache)
         self._mtp_cache: TransformerCache | None = None
+        self._mtp_cache_batch_size: int | None = None
         self._mtp_cache_max_length: int | None = max(1, int(cache_length)) if cache_length is not None else None
         self.num_draft_tokens = max(1, int(num_draft_tokens))
         self._jit_mtp: dict[tuple, typing.Callable] = {}
@@ -283,8 +284,11 @@ class Qwen3_5MTPDrafter:
         """
         if not self.uses_mtp_cache:
             self._mtp_cache = None
+            self._mtp_cache_batch_size = None
             return
-        self._mtp_cache = self._init_mtp_cache(int(batch_size))
+        batch_size = int(batch_size)
+        self._mtp_cache = self._init_mtp_cache(batch_size)
+        self._mtp_cache_batch_size = batch_size if self._mtp_cache is not None else None
 
     def _init_mtp_cache(self, batch_size: int) -> TransformerCache | None:
         """Allocate a full-attention cache for the inline MTP block.
@@ -354,8 +358,10 @@ class Qwen3_5MTPDrafter:
         """
         if not self.uses_mtp_cache:
             return None
-        if self._mtp_cache is None:
+        batch_size = int(batch_size)
+        if self._mtp_cache is None or self._mtp_cache_batch_size != batch_size:
             self._mtp_cache = self._init_mtp_cache(batch_size)
+            self._mtp_cache_batch_size = batch_size if self._mtp_cache is not None else None
         return self._mtp_cache
 
     def _mtp_hidden_and_logits(
@@ -510,6 +516,7 @@ class Qwen3_5MTPDrafter:
         )
         if new_cache is not None:
             self._mtp_cache = new_cache
+            self._mtp_cache_batch_size = int(input_ids.shape[0])
         last = logits[:, -1, :].astype(jnp.float32)
         if sample:
             if rng_key is None:

@@ -222,6 +222,43 @@ def normalize_segment_sizes(segment_sizes: tp.Sequence[int]) -> tuple[int, ...]:
     return tuple(int(size) for size in segment_sizes)
 
 
+def interleave_segments_last_axis(
+    segments: tp.Sequence[Array],
+    *,
+    tp_size: int | None = None,
+    config: EasyDeLBaseConfig | None = None,
+) -> Array:
+    """Pack logical segment tensors into TP-interleaved order on the last axis.
+
+    This is the JAX/native-state counterpart of
+    :func:`torch_interleave_segments_for_tp`: for segments ``(A, B, C)``
+    and ``tp_size=2`` it produces ``[A_0, B_0, C_0, A_1, B_1, C_1]``.
+    If TP packing is not applicable, the segments are concatenated in
+    their original order.
+
+    Args:
+        segments: Tensors with compatible shapes except for the last axis.
+        tp_size: Optional explicit TP size; resolved from ``config`` and
+            the first segment when ``None``.
+        config: Owning model config used to resolve the TP size.
+
+    Returns:
+        A single tensor concatenating ``segments`` along the last axis,
+        using TP-interleaved order when each segment can be evenly split.
+    """
+    segments = tuple(segments)
+    if not segments:
+        raise ValueError("segments must not be empty")
+    if tp_size is None:
+        tp_size = tensor_parallel_size(config, arr=segments[0])
+    if tp_size <= 1 or any(int(segment.shape[-1]) % tp_size != 0 for segment in segments):
+        return jnp.concatenate(segments, axis=-1)
+
+    chunks_by_segment = [jnp.split(segment, tp_size, axis=-1) for segment in segments]
+    chunks = [segment_chunks[rank_idx] for rank_idx in range(tp_size) for segment_chunks in chunks_by_segment]
+    return jnp.concatenate(chunks, axis=-1)
+
+
 def split_interleaved_segments_last_axis(
     x: Array,
     segment_sizes: tp.Sequence[int],

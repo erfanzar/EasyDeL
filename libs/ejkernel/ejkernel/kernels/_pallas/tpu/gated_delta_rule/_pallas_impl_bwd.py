@@ -15,7 +15,7 @@
 """Backward TPU Pallas kernels for Gated Delta Rule (GDR).
 
 Pure Pallas backward with a single reverse-scan kernel that recomputes
-all forward intermediates (Neumann series, decay masks) from raw inputs
+all forward intermediates (strict-lower inverse, decay masks) from raw inputs
 + saved per-chunk states, then computes all gradients in one fused pass.
 """
 
@@ -37,7 +37,7 @@ from ._pallas_impl_fwd import _N_FUSE, _chunk_blockspec, _dot, _neumann_inv
 def _bwd_one_chunk(q, k, v, beta, decay, d_out, state_pre, d_state_next, C):
     """Compute gradients for a single GDR chunk via full re-materialisation.
 
-    Recomputes all forward intermediates (Neumann inverse, decay masks,
+    Recomputes all forward intermediates (strict-lower inverse, decay masks,
     scaled keys/queries, etc.) from the raw inputs and the saved pre-chunk
     state, then applies the chain rule to obtain per-token gradients.
     All intermediate tensors are sanitized with ``nan_to_num``.

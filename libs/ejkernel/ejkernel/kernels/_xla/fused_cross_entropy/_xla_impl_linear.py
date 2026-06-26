@@ -104,7 +104,6 @@ def fused_linear_cross_entropy(
             makes FLCE worthwhile. Set ``False`` to keep the per-chunk logits
             live for the backward (faster, no recompute) when the ``[chunk, V]``
             residuals comfortably fit in memory.
-
     Returns:
         ``(total_loss, total_z_loss, weight_sum, accuracy)``. ``total_loss`` /
         ``total_z_loss`` follow ``reduction`` (the global normalizing factor is

@@ -102,6 +102,7 @@ from easydel.utils.traversals import deepcopy_model
 from .sharding import (
     MeshLike,
     replicated_named_sharding,
+    sanitize_partition_spec_for_shape,
     sanitize_partition_specs_for_shape_tree,
 )
 from .utils import device_put_or_shard_abstract, materialize_meta_leaves
@@ -288,9 +289,39 @@ def _optimizer_state_shardings_from_params(
         is_leaf=_is_sharding_leaf,
     )
 
+    def _sanitize_slot_shardings(slot_shardings: tp.Any) -> tp.Any:
+        """Trim mirrored param shardings to each optimizer slot's real shape."""
+        adjusted = {"count": 0}
+
+        def _sanitize(slot: tp.Any, sharding: tp.Any) -> tp.Any:
+            if not isinstance(sharding, jax.sharding.NamedSharding) or not hasattr(slot, "shape"):
+                return sharding
+            spec = getattr(sharding, "spec", None)
+            if not isinstance(spec, PartitionSpec):
+                return sharding
+            safe_spec = sanitize_partition_spec_for_shape(
+                spec=spec,
+                shape=tuple(slot.shape),
+                mesh=sharding.mesh,
+            )
+            if safe_spec == spec:
+                return sharding
+            adjusted["count"] += 1
+            return jax.sharding.NamedSharding(sharding.mesh, safe_spec, memory_kind=sharding.memory_kind)
+
+        sanitized = jax.tree_util.tree_map(
+            _sanitize,
+            opt_state,
+            slot_shardings,
+            is_leaf=_is_sharding_leaf,
+        )
+        if adjusted["count"]:
+            logger.warning("Adjusted %d optimizer-state shardings to match slot shapes.", adjusted["count"])
+        return sanitized
+
     if hasattr(optax, "tree_map_params"):
         try:
-            return optax.tree_map_params(
+            slot_shardings = optax.tree_map_params(
                 tx,
                 lambda _param, ns: ns if isinstance(ns, jax.sharding.NamedSharding) else replicated,
                 opt_state,
@@ -298,6 +329,7 @@ def _optimizer_state_shardings_from_params(
                 transform_non_params=lambda _: replicated,
                 is_leaf=_is_sharding_leaf,
             )
+            return _sanitize_slot_shardings(slot_shardings)
         except ValueError as exc:
             if "Mismatch custom node data" not in str(exc):
                 raise
@@ -317,11 +349,12 @@ def _optimizer_state_shardings_from_params(
             return param_slot_shardings
         return replicated
 
-    return jax.tree_util.tree_map(
+    slot_shardings = jax.tree_util.tree_map(
         _state_sharding,
         opt_state,
         is_leaf=_matches_param_tree,
     )
+    return _sanitize_slot_shardings(slot_shardings)
 
 
 def _materialize_replicated_setup_scalars(tree: tp.Any, shardings: tp.Any) -> tp.Any:

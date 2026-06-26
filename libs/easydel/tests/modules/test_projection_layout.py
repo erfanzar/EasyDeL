@@ -11,10 +11,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 import spectrax as spx
-
 from easydel.layers import ColumnParallelLinear, eLoRA
 from easydel.layers.layouts import (
     FusedColumnLayout,
@@ -23,6 +24,12 @@ from easydel.layers.layouts import (
     dense_gate_up_layout,
     dense_qkv_layout,
 )
+from easydel.modules.qwen3_next.modeling_qwen3_next import (
+    Qwen3NextFullAttention,
+    Qwen3NextMLP,
+    _qwen3_next_tp_ring_column_linear,
+)
+from easydel.modules.qwen3_next.qwen3_next_configuration import Qwen3NextConfig
 from easydel.utils.parameters_transformation import StateDictConverter
 
 
@@ -58,6 +65,168 @@ def test_dense_layouts_generate_bidirectional_reform_rules():
             assert "sources" in rule
             assert callable(rule["fuser"])
             assert callable(rule["inverse_fuser"])
+            assert callable(rule["native_fuser"])
+
+
+def _prefix_reform_param(rules, prefix):
+    prefixed = {}
+    for key, rule in rules.items():
+        full_rule = rule.copy()
+        full_rule["sources"] = tuple(f"{prefix}.{source}" for source in rule["sources"])
+        prefixed[f"{prefix}.{key}"] = full_rule
+    return prefixed
+
+
+def test_dense_fused_layout_fuses_native_tuple_state_with_tp_interleave(monkeypatch):
+    from easydel.layers.layouts import _reform as reform_module
+
+    monkeypatch.setattr(reform_module, "tensor_parallel_size", lambda config, arr=None: 2)
+    mlp_prefix = "model.language_model.layers.0.mlp"
+    attn_prefix = "model.language_model.layers.0.self_attn"
+    reform_param = {
+        **_prefix_reform_param(dense_gate_up_layout(4).reform_param("gate_up_proj"), mlp_prefix),
+        **_prefix_reform_param(dense_qkv_layout(4, 2).reform_param("qkv_proj"), attn_prefix),
+    }
+
+    gate = np.arange(2 * 4, dtype=np.float32).reshape(2, 4)
+    up = np.arange(2 * 4, dtype=np.float32).reshape(2, 4) + 100
+    q = np.arange(2 * 4, dtype=np.float32).reshape(2, 4) + 200
+    k = np.arange(2 * 2, dtype=np.float32).reshape(2, 2) + 300
+    v = np.arange(2 * 2, dtype=np.float32).reshape(2, 2) + 400
+    state = {
+        ("parameters", "model", "language_model", "layers", 0, "mlp", "gate_proj", "weight"): gate,
+        ("parameters", "model", "language_model", "layers", 0, "mlp", "up_proj", "weight"): up,
+        ("parameters", "model", "language_model", "layers", 0, "self_attn", "q_proj", "weight"): q,
+        ("parameters", "model", "language_model", "layers", 0, "self_attn", "k_proj", "weight"): k,
+        ("parameters", "model", "language_model", "layers", 0, "self_attn", "v_proj", "weight"): v,
+    }
+
+    counts = StateDictConverter.apply_native_reform_param_fusions(state, reform_param)
+
+    gate_up_key = ("parameters", "model", "language_model", "layers", 0, "mlp", "gate_up_proj", "weight")
+    qkv_key = ("parameters", "model", "language_model", "layers", 0, "self_attn", "qkv_proj", "weight")
+    expected_gate_up = np.concatenate((gate[:, :2], up[:, :2], gate[:, 2:], up[:, 2:]), axis=-1)
+    expected_qkv = np.concatenate((q[:, :2], k[:, :1], v[:, :1], q[:, 2:], k[:, 1:], v[:, 1:]), axis=-1)
+
+    assert counts["dense-MLP gate/up groups"] == 1
+    assert counts["dense-attention Q/K/V groups"] == 1
+    assert gate_up_key in state
+    assert qkv_key in state
+    assert ("parameters", "model", "language_model", "layers", 0, "mlp", "gate_proj", "weight") not in state
+    assert ("parameters", "model", "language_model", "layers", 0, "self_attn", "q_proj", "weight") not in state
+    assert np.array_equal(np.asarray(state[gate_up_key]), expected_gate_up)
+    assert np.array_equal(np.asarray(state[qkv_key]), expected_qkv)
+
+
+def test_qwen3_next_separate_mlp_gate_up_matches_fused_projection():
+    base_kwargs = dict(
+        vocab_size=128,
+        hidden_size=32,
+        intermediate_size=48,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+    )
+    fused_config = Qwen3NextConfig(**base_kwargs, separate_mlp_gate_up_proj=False)
+    separate_config = Qwen3NextConfig(**base_kwargs, separate_mlp_gate_up_proj=True)
+    fused_mlp = Qwen3NextMLP(
+        config=fused_config,
+        dtype=jnp.float32,
+        param_dtype=jnp.float32,
+        rngs=spx.Rngs(0),
+    )
+    separate_mlp = Qwen3NextMLP(
+        config=separate_config,
+        dtype=jnp.float32,
+        param_dtype=jnp.float32,
+        rngs=spx.Rngs(0),
+    )
+    x = jax.random.normal(jax.random.PRNGKey(1), (2, 5, base_kwargs["hidden_size"]), dtype=jnp.float32)
+
+    fused = fused_mlp(x)
+    separate = separate_mlp(x)
+
+    np.testing.assert_allclose(np.asarray(separate), np.asarray(fused), rtol=1e-5, atol=1e-5)
+
+
+def test_qwen3_next_tp_ring_mlp_gate_up_matches_separate_projection():
+    if len(jax.devices()) < 2:
+        pytest.skip("requires at least two local devices for TP ring sharding")
+
+    base_kwargs = dict(
+        vocab_size=128,
+        hidden_size=32,
+        intermediate_size=48,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        sharding_axis_dims=(1, 1, -1, 1, 2, 1),
+    )
+    separate_config = Qwen3NextConfig(**base_kwargs, separate_mlp_gate_up_proj=True)
+    ring_config = Qwen3NextConfig(
+        **base_kwargs,
+        separate_mlp_gate_up_proj=True,
+        use_tp_ring_mlp_column_matmul=True,
+    )
+    separate_mlp = Qwen3NextMLP(
+        config=separate_config,
+        dtype=jnp.float32,
+        param_dtype=jnp.float32,
+        rngs=spx.Rngs(0),
+    )
+    ring_mlp = Qwen3NextMLP(
+        config=ring_config,
+        dtype=jnp.float32,
+        param_dtype=jnp.float32,
+        rngs=spx.Rngs(0),
+    )
+    x = jax.random.normal(jax.random.PRNGKey(1), (2, 5, base_kwargs["hidden_size"]), dtype=jnp.float32)
+
+    with separate_config.mesh:
+        separate = separate_mlp(x)
+    with ring_config.mesh:
+        ring = ring_mlp(x)
+
+    np.testing.assert_allclose(np.asarray(ring), np.asarray(separate), rtol=1e-5, atol=1e-5)
+
+
+def test_qwen3_next_tp_ring_full_attention_qkv_matches_projection():
+    if len(jax.devices()) < 2:
+        pytest.skip("requires at least two local devices for TP ring sharding")
+
+    config = Qwen3NextConfig(
+        vocab_size=128,
+        hidden_size=32,
+        intermediate_size=48,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        sharding_axis_dims=(1, 1, -1, 1, 2, 1),
+        use_tp_ring_full_attention_qkv_matmul=True,
+    )
+    attn = Qwen3NextFullAttention(
+        config=config,
+        dtype=jnp.float32,
+        param_dtype=jnp.float32,
+        rngs=spx.Rngs(0),
+        layer_idx=0,
+    )
+    x = jax.random.normal(jax.random.PRNGKey(1), (2, 5, config.hidden_size), dtype=jnp.float32)
+
+    with config.mesh:
+        reference = attn.qkv_proj(x)
+        ring = _qwen3_next_tp_ring_column_linear(
+            attn.qkv_proj,
+            x,
+            config=config,
+            precision=None,
+        )
+
+    assert ring is not None
+    np.testing.assert_allclose(np.asarray(ring), np.asarray(reference), rtol=1e-5, atol=1e-5)
 
 
 def test_moe_expert_layouts_generate_bidirectional_reform_rules():
@@ -131,6 +300,52 @@ def test_qwen3_next_linear_attention_layout_round_trips_torch_tensors():
     assert torch.equal(z_rt, z)
 
 
+def test_qwen3_next_linear_attention_layout_fuses_native_tuple_state():
+    from easydel.modules.qwen3_next.modeling_qwen3_next import Qwen3NextLinearAttentionLayout
+    from easydel.modules.qwen3_next.qwen3_next_configuration import Qwen3NextConfig
+
+    layout = Qwen3NextLinearAttentionLayout(
+        key_dim=4,
+        value_dim=6,
+        config=Qwen3NextConfig(),
+    )
+    local_rules = layout.reform_param()
+    reform_param = {}
+    for key, rule in local_rules.items():
+        full_key = f"model.layers.0.linear_attn.{key}"
+        full_rule = rule.copy()
+        full_rule["sources"] = tuple(f"model.layers.0.linear_attn.{source}" for source in rule["sources"])
+        reform_param[full_key] = full_rule
+
+    qkv = np.arange(3 * 14, dtype=np.float32).reshape(3, 14)
+    z = np.arange(3 * 6, dtype=np.float32).reshape(3, 6) + 100
+    beta = np.arange(3 * 2, dtype=np.float32).reshape(3, 2) + 200
+    alpha = np.arange(3 * 2, dtype=np.float32).reshape(3, 2) + 300
+    state = {
+        ("parameters", "model", "layers", 0, "linear_attn", "in_proj_qkv", "weight"): qkv,
+        ("parameters", "model", "layers", 0, "linear_attn", "in_proj_z", "weight"): z,
+        ("parameters", "model", "layers", 0, "linear_attn", "in_proj_b", "weight"): beta,
+        ("parameters", "model", "layers", 0, "linear_attn", "in_proj_a", "weight"): alpha,
+    }
+
+    counts = StateDictConverter.apply_native_reform_param_fusions(state, reform_param)
+
+    q, k, v = np.split(qkv, [4, 8], axis=-1)
+    expected_qkvz = np.concatenate((q, k, v, z), axis=-1)
+    expected_ba = np.concatenate((beta, alpha), axis=-1)
+    qkvz_key = ("parameters", "model", "layers", 0, "linear_attn", "in_proj_qkvz", "weight")
+    ba_key = ("parameters", "model", "layers", 0, "linear_attn", "in_proj_ba", "weight")
+
+    assert counts["linear-attention qkv/z weight groups"] == 1
+    assert counts["linear-attention beta/alpha weight groups"] == 1
+    assert qkvz_key in state
+    assert ba_key in state
+    assert ("parameters", "model", "layers", 0, "linear_attn", "in_proj_qkv", "weight") not in state
+    assert ("parameters", "model", "layers", 0, "linear_attn", "in_proj_z", "weight") not in state
+    assert np.array_equal(np.asarray(state[qkvz_key]), expected_qkvz)
+    assert np.array_equal(np.asarray(state[ba_key]), expected_ba)
+
+
 @pytest.mark.parametrize(
     ("separate_proj", "merged_split_proj", "expects_fused_rules"),
     [(False, False, False), (True, False, False), (False, True, True)],
@@ -167,6 +382,42 @@ def test_qwen3_next_linear_attention_reform_rules_match_projection_layout(
     assert hasattr(layer, "in_proj_qkvz") is not separate_proj
     assert ("in_proj_qkvz.weight$" in layer.reform_param) is expects_fused_rules
     assert ("in_proj_ba.weight$" in layer.reform_param) is expects_fused_rules
+    StateDictConverter.validate_reform_param_schema(layer.reform_param)
+
+
+def test_qwen3_next_linear_attention_merged_split_falls_back_to_split_under_tp(monkeypatch):
+    import easydel.modules.qwen3_next.modeling_qwen3_next as qwen3_next_modeling
+
+    monkeypatch.setattr(qwen3_next_modeling, "_qwen3_next_tp_size", lambda config: 4)
+    config = Qwen3NextConfig(
+        vocab_size=32,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        max_position_embeddings=16,
+        linear_key_head_dim=2,
+        linear_value_head_dim=2,
+        linear_num_key_heads=1,
+        linear_num_value_heads=2,
+        linear_conv_kernel_dim=3,
+        linear_attention_separate_proj=False,
+        linear_attention_merged_split_proj=True,
+    )
+
+    layer = qwen3_next_modeling.Qwen3NextLinearAttention(config, rngs=spx.Rngs(0), layer_idx=0)
+
+    assert layer.uses_merged_split_proj is False
+    assert layer.uses_split_proj is True
+    assert hasattr(layer, "in_proj_qkv") is True
+    assert hasattr(layer, "in_proj_z") is True
+    assert hasattr(layer, "in_proj_qkvz") is False
+    assert hasattr(layer, "in_proj_b") is True
+    assert hasattr(layer, "in_proj_a") is True
+    assert "in_proj_qkvz.weight$" not in layer.reform_param
+    assert "in_proj_ba.weight$" not in layer.reform_param
     StateDictConverter.validate_reform_param_schema(layer.reform_param)
 
 

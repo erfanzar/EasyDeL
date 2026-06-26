@@ -61,7 +61,6 @@ from spectrax import with_sharding_constraint
 
 from easydel.caching import RecurrentCacheView
 from easydel.utils import is_inference_mode
-from easydel.utils.helpers import check_bool_flag
 
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationRegistry
@@ -370,9 +369,11 @@ class GatedDeltaRuleOp(OperationImpl):
                 - autotune_chunk_candidates: Optional list/tuple kept for API
                   compatibility; currently ignored in the ejkernel module path.
 
-                The chunk size is selected internally (adaptive for the XLA path,
-                fixed at 128 for the TPU/Pallas chunked path); it is not a
-                parameter of this method.
+                Backend and chunk-size selection come from the
+                ``gated_delta_rule`` operation config when one is provided.
+                Without an explicit config, dense TPU training prefill uses
+                the measured Pallas chunked path; non-TPU and segmented inputs
+                use the exact XLA chunked path with an adaptive chunk size.
 
         Returns:
             GatedDeltaRuleOutput containing attention outputs and updated states.
@@ -383,19 +384,26 @@ class GatedDeltaRuleOp(OperationImpl):
         is_inference = seq_len == 1
         kernel_cfg = self.metadata.get_operation_config("gated_delta_rule")
         seg_ids = kwargs.get("seg_ids", None)
-        use_chunked_gdr = check_bool_flag("EASYDEL_GDR_CHUNKED", False) and not is_inference_mode()
         if kernel_cfg is None and not is_inference:
-            if (
-                jax.default_backend() == "tpu"
-                and use_chunked_gdr
-                and seg_ids is None
-                and not check_bool_flag("EASYDEL_GDR_XLA", False)
-            ):
-                kernel_cfg = GatedDeltaRuleConfig(platform="pallas", backend="tpu", chunk_size=128)
+            if jax.default_backend() == "tpu" and seg_ids is None:
+                kernel_cfg = GatedDeltaRuleConfig(
+                    platform="pallas",
+                    backend="tpu",
+                    chunk_size=256,
+                    use_chunked=True,
+                    use_input_dtype_phase1_outputs=True,
+                    use_input_dtype_state=recurrent_state is None,
+                )
             else:
                 adaptive_chunk = min(max(16, seq_len), 64)
                 adaptive_chunk = 1 << (adaptive_chunk.bit_length() - 1) if isinstance(adaptive_chunk, int) else 64
-                kernel_cfg = GatedDeltaRuleConfig(platform="xla", chunk_size=adaptive_chunk)
+                kernel_cfg = GatedDeltaRuleConfig(
+                    platform="xla",
+                    backend="any",
+                    chunk_size=adaptive_chunk,
+                    use_chunked=True,
+                )
+        use_chunked_gdr = bool(getattr(kernel_cfg, "use_chunked", True)) and not is_inference_mode()
 
         mode = self.get_mode(query=query, BTHD=True)
         shardings_bthd = self.metadata.get_shardings(mode, layout="bthd")
@@ -433,9 +441,9 @@ class GatedDeltaRuleOp(OperationImpl):
             preserved_indices=[0, 2],
         )
         beta_source = jax.sharding.PartitionSpec(
-            shardings_bthd.query[0],
-            shardings_bthd.query[1],
-            shardings_bthd.query[2],
+            shardings_bthd.value[0],
+            shardings_bthd.value[1],
+            shardings_bthd.value[2],
         )
         beta_sharding = self.create_stable_sharding(
             beta_source,
@@ -449,10 +457,10 @@ class GatedDeltaRuleOp(OperationImpl):
             preserved_indices=[0, 2],
         )
         state_source = None
-        if query_sharding is not None:
+        if value_sharding is not None:
             state_source = jax.sharding.PartitionSpec(
-                query_sharding[0],
-                query_sharding[2],
+                value_sharding[0],
+                value_sharding[2],
                 None,
                 None,
             )
@@ -467,7 +475,7 @@ class GatedDeltaRuleOp(OperationImpl):
         )
         output_sharding = self.create_stable_sharding(
             shardings_bthd.output,
-            tensor=query,
+            tensor=value,
             preserved_indices=[0, 2],
         )
 
@@ -499,13 +507,6 @@ class GatedDeltaRuleOp(OperationImpl):
                 in_specs = (*in_specs, seg_sharding)
             out_specs = (output_sharding, state_out_sharding)
 
-        platform = None
-        if jax.default_backend() == "tpu" and kernel_cfg is None:
-            if check_bool_flag("EASYDEL_GDR_XLA", False):
-                platform = "xla"
-            else:
-                platform = "pallas"
-
         # ``seg_ids`` is positional-only (between ``decay`` and ``initial_state``) on the op.
         outputs, new_recurrent_state = gated_delta_rule(
             query,
@@ -522,7 +523,7 @@ class GatedDeltaRuleOp(OperationImpl):
             mesh=mesh,
             in_specs=in_specs,
             out_specs=out_specs,
-            platform=platform,
+            platform=None,
         )
 
         if output_constraint_mesh is not None:

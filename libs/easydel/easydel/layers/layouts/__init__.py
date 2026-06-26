@@ -66,6 +66,7 @@ from ._reform import (
     qkv_fusion_reform_param,
 )
 from ._runtime import (
+    interleave_segments_last_axis,
     keep_interleaved_segments_last_axis,
     normalize_segment_sizes,
     split_contiguous_segments_last_axis,
@@ -97,6 +98,7 @@ __all__ = [
     "dense_qkv_layout",
     "gate_up_fusion_reform_param",
     "hf_per_expert_swiglu_reform_param",
+    "interleave_segments_last_axis",
     "interleaved_fusion_reform_param",
     "keep_interleaved_segments_last_axis",
     "moe_down_projection_reform_param",

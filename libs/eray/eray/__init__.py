@@ -111,6 +111,7 @@ from .resources import (
     available_cpu_cores,
 )
 
+__version__ = "0.1.0"
 __all__ = (
     "DONE",
     "ENV_CALL_INDEX",

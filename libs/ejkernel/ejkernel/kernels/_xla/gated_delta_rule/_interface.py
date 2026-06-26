@@ -37,6 +37,7 @@ Supported computation modes (dispatched by ``gated_delta_rule``):
 
 from __future__ import annotations
 
+import jax.numpy as jnp
 import jaxtyping
 from beartype import beartype
 from jaxtyping import Array, Float, Int
@@ -48,20 +49,22 @@ from ._xla_impl_fwd import _chunk_gdr_fwd, _recurrent_gdr_fwd, _single_step_gdr_
 @kernel_registry.register("gated_delta_rule", Platform.XLA, Backend.ANY)
 @jaxtyping.jaxtyped(typechecker=beartype)
 def gated_delta_rule(
-    query: Float[Array, "batch seq_len num_heads qk_head_dim"],
-    key: Float[Array, "batch seq_len num_heads qk_head_dim"],
-    value: Float[Array, "batch seq_len num_heads v_head_dim"],
-    beta: Float[Array, "batch seq_len num_heads"],
-    decay: Float[Array, "batch seq_len num_heads"] | None = None,
+    query: Float[Array, "batch seq_len num_qk_heads qk_head_dim"],
+    key: Float[Array, "batch seq_len num_qk_heads qk_head_dim"],
+    value: Float[Array, "batch seq_len num_value_heads v_head_dim"],
+    beta: Float[Array, "batch seq_len num_value_heads"],
+    decay: Float[Array, "batch seq_len num_value_heads"] | None = None,
     *,
     chunk_size: int = 256,
-    initial_state: Float[Array, "batch num_heads qk_head_dim v_head_dim"] | None = None,
+    initial_state: Float[Array, "batch num_value_heads qk_head_dim v_head_dim"] | None = None,
     use_qk_l2norm: bool = True,
     use_chunked: bool = True,
+    use_input_dtype_phase1_outputs: bool = False,
+    use_input_dtype_state: bool = False,
     seg_ids: Int[Array, "batch seq_len"] | None = None,
 ) -> tuple[
-    Float[Array, "batch seq_len num_heads v_head_dim"],
-    Float[Array, "batch num_heads qk_head_dim v_head_dim"],
+    Float[Array, "batch seq_len num_value_heads v_head_dim"],
+    Float[Array, "batch num_value_heads qk_head_dim v_head_dim"],
 ]:
     """Gated Delta Rule (GDR) linear attention using XLA backend.
 
@@ -104,6 +107,12 @@ def gated_delta_rule(
             before attention. Improves numerical stability (default: True)
         use_chunked: If True, use chunked algorithm; else use recurrent scan.
             Chunked is faster for training, recurrent for long inference
+        use_input_dtype_phase1_outputs: Accepted for config parity with the
+            TPU/Pallas implementation. XLA does not have a separate phase-1
+            handoff buffer and ignores this value.
+        use_input_dtype_state: Accepted for config parity with the TPU/Pallas
+            implementation. XLA keeps its existing state dtype behavior and
+            ignores this value.
 
     Returns:
         Tuple of:
@@ -137,6 +146,14 @@ def gated_delta_rule(
 
     b = beta.transpose(0, 2, 1)
     d = decay.transpose(0, 2, 1) if decay is not None else None
+    if q.shape[1] != v.shape[1]:
+        if v.shape[1] % q.shape[1] != 0:
+            raise ValueError(
+                f"grouped GDR requires value heads ({v.shape[1]}) to be a multiple of query heads ({q.shape[1]})"
+            )
+        expand_ratio = v.shape[1] // q.shape[1]
+        q = jnp.repeat(q, expand_ratio, axis=1)
+        k = jnp.repeat(k, expand_ratio, axis=1)
 
     if query.shape[1] == 1 and initial_state is not None:
         out, final_state = _single_step_gdr_fwd(

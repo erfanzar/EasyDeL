@@ -21,7 +21,6 @@ import importlib
 import jax
 import jax.numpy as jnp
 import pytest
-
 from ejkernel import modules
 from ejkernel.kernels._xla.gated_delta_rule import gated_delta_rule as gated_delta_rule_xla
 from ejkernel.modules import operations
@@ -52,18 +51,29 @@ def test_gdr_attention_alias():
 
 
 def test_gdr_config_serialization():
-    cfg = GatedDeltaRuleConfig(chunk_size=128, platform="xla", backend="any")
+    cfg = GatedDeltaRuleConfig(
+        chunk_size=128,
+        platform="xla",
+        backend="any",
+        use_input_dtype_phase1_outputs=True,
+        use_input_dtype_state=True,
+    )
     d = cfg.to_dict()
     assert d["chunk_size"] == 128
     assert d["platform"] == "xla"
+    assert d["use_input_dtype_phase1_outputs"] is True
+    assert d["use_input_dtype_state"] is True
 
     cfg2 = GatedDeltaRuleConfig.from_dict(d)
     assert cfg2.chunk_size == cfg.chunk_size
     assert cfg2.platform == cfg.platform
+    assert cfg2.use_input_dtype_phase1_outputs is True
+    assert cfg2.use_input_dtype_state is True
 
     j = cfg.to_json()
     cfg3 = GatedDeltaRuleConfig.from_json(j)
     assert cfg3.chunk_size == cfg.chunk_size
+    assert cfg3.use_input_dtype_state is True
 
 
 def _make_inputs(batch=1, seq_len=8, heads=2, qk_dim=8, v_dim=8, dtype=jnp.bfloat16, seed=0):
@@ -91,6 +101,41 @@ def test_gdr_chunked_and_recurrent_match_and_return_state():
     assert state.shape == (batch, heads, qk_dim, v_dim)
 
     assert_allclose(out_chunked, out_recurrent, atol=0.25)
+
+
+def test_gdr_grouped_xla_matches_repeated_heads():
+    batch, seq_len, q_heads, expand_ratio, qk_dim, v_dim = 1, 8, 2, 2, 8, 8
+    v_heads = q_heads * expand_ratio
+    q, k, _, _, _ = _make_inputs(batch, seq_len, q_heads, qk_dim, v_dim, dtype=jnp.float32, seed=31)
+    _, _, v, beta, decay = _make_inputs(batch, seq_len, v_heads, qk_dim, v_dim, dtype=jnp.float32, seed=32)
+
+    out_grouped, state_grouped = gated_delta_rule(
+        q,
+        k,
+        v,
+        beta,
+        decay,
+        return_state=True,
+        use_chunked=True,
+        platform="xla",
+        cfg=GatedDeltaRuleConfig(chunk_size=8, platform="xla", backend="any"),
+    )
+    out_repeated, state_repeated = gated_delta_rule(
+        jnp.repeat(q, expand_ratio, axis=2),
+        jnp.repeat(k, expand_ratio, axis=2),
+        v,
+        beta,
+        decay,
+        return_state=True,
+        use_chunked=True,
+        platform="xla",
+        cfg=GatedDeltaRuleConfig(chunk_size=8, platform="xla", backend="any"),
+    )
+
+    assert out_grouped.shape == v.shape
+    assert state_grouped.shape == (batch, v_heads, qk_dim, v_dim)
+    assert_allclose(out_grouped, out_repeated, atol=1e-5)
+    assert_allclose(state_grouped, state_repeated, atol=1e-5)
 
 
 def test_gdr_single_step_with_state():
@@ -155,6 +200,36 @@ def test_gdr_class_api():
 
     out = op.run(q, k, v, beta, decay, use_chunked=True, cfg=cfg)
     assert out.shape == (batch, seq_len, heads, v_dim)
+
+
+def test_gdr_auto_pallas_forwards_forward_only_dtype_config(monkeypatch):
+    batch, seq_len, heads, qk_dim, v_dim = 1, 8, 2, 8, 8
+    q, k, v, beta, decay = _make_inputs(batch, seq_len, heads, qk_dim, v_dim)
+    cfg = GatedDeltaRuleConfig(
+        chunk_size=8,
+        platform="auto",
+        backend="any",
+        use_input_dtype_phase1_outputs=True,
+        use_input_dtype_state=True,
+    )
+    module_impl = importlib.import_module("ejkernel.modules.operations.gated_delta_rule")
+    op = GatedDeltaRule()
+    captured_kwargs = {}
+
+    def _fake_impl(**kwargs):
+        captured_kwargs.update(kwargs)
+        state = jnp.zeros((batch, heads, qk_dim, v_dim), dtype=v.dtype)
+        return jnp.zeros_like(v), state
+
+    monkeypatch.setattr(op, "resolve_platform", lambda _cfg: module_impl.Platform.PALLAS)
+    monkeypatch.setattr(module_impl.kernel_registry, "get", lambda *_, **__: _fake_impl)
+
+    out = op.run(q, k, v, beta, decay, use_chunked=True, cfg=cfg)
+
+    assert out.shape == v.shape
+    assert captured_kwargs["chunk_size"] == 8
+    assert captured_kwargs["use_input_dtype_phase1_outputs"] is True
+    assert captured_kwargs["use_input_dtype_state"] is True
 
 
 def test_gdr_no_decay():

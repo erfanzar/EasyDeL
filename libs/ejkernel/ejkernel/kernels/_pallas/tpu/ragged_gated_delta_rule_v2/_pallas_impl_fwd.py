@@ -48,7 +48,6 @@ Algorithmic notes:
 
 import enum
 import functools
-import os
 
 import jax
 import jax.numpy as jnp
@@ -57,7 +56,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from ._fused_gdn_decode import fused_gdn_decode
-from ._gdn_policy import normalize_kernel_tile_policy
+from ._gdn_policy import KernelTilePolicy, normalize_kernel_tile_policy
 from ._gdn_recurrent_scan_v2 import recurrent_scan
 
 
@@ -579,8 +578,10 @@ def ragged_gated_delta_rule_mixed_prefill(
     recurrent_state: jnp.ndarray,
     state_indices: jnp.ndarray,
     distribution: jnp.ndarray,
+    has_initial_state: jnp.ndarray,
     chunk_size: int = 64,
     use_qk_norm_in_gdn: bool = False,
+    mask_initial_state: bool = False,
     compute_dtype: jnp.dtype = jnp.bfloat16,
     precision: jax.lax.Precision = jax.lax.Precision.HIGHEST,
     preferred_element_type: jnp.dtype = jnp.float32,
@@ -615,10 +616,17 @@ def ragged_gated_delta_rule_mixed_prefill(
             shape ``(num_requests,)``.
         distribution: Triple ``[decode_end, prefill_end, total]``; the
             third entry gates which slots have outputs to write.
+        has_initial_state: Boolean tensor marking requests whose recurrent
+            state slot should be used as the initial prefill state. Requests
+            without initial state start from zeros even if the slot contains
+            stale state from a previous sequence.
         chunk_size: Padding and chunking granularity for the parallel
             intra-chunk attention.
         use_qk_norm_in_gdn: Whether to L2-normalize Q and K before the
             chunked attention.
+        mask_initial_state: When ``True``, gate the loaded recurrent state with
+            ``has_initial_state``. Keep ``False`` for the common all-valid path
+            so the compiled prefill stays on the cheaper state-load lowering.
         compute_dtype: Dtype for the chunked Q/K/V/beta tensors.
         precision: ``lax.Precision`` for the matmul calls; defaults to
             ``HIGHEST`` to keep numerical stability across long
@@ -779,7 +787,14 @@ def ragged_gated_delta_rule_mixed_prefill(
     # Prepare init_h_per_chunk
     init_h_per_chunk = jnp.zeros((num_chunks, H, K_dim, V_dim), dtype=recurrent_state.dtype)
     start_chunk_indices = new_query_start_loc[:-1] // chunk_size
-    init_h_per_chunk = init_h_per_chunk.at[start_chunk_indices].set(recurrent_state[state_indices])
+    init_states_for_seqs = recurrent_state[state_indices]
+    if mask_initial_state:
+        init_states_for_seqs = jnp.where(
+            has_initial_state[:, None, None, None],
+            init_states_for_seqs,
+            jnp.zeros_like(init_states_for_seqs),
+        )
+    init_h_per_chunk = init_h_per_chunk.at[start_chunk_indices].set(init_states_for_seqs)
 
     h_init = jnp.zeros((H, K_dim, V_dim), dtype=jnp.float32)
 
@@ -959,7 +974,7 @@ def _pallas_gdn_decode_kernel(
         new_state_ref[b_idx] = new_state_masked
 
 
-_PALLAS_GDN_TILE_POLICY = normalize_kernel_tile_policy(os.environ.get("EASYDEL_GDN_TILE_POLICY", "auto"))
+_PALLAS_GDN_TILE_POLICY = normalize_kernel_tile_policy("auto")
 _PALLAS_GDN_BTOK_CANDIDATES = (16, 8, 4)
 
 
@@ -967,9 +982,7 @@ def set_gdn_kernel_tile_policy(policy: str) -> None:
     """Set the TPU Pallas GDN decode tile policy for future traces.
 
     Updates the module-level ``_PALLAS_GDN_TILE_POLICY`` consulted by
-    :func:`_select_pallas_gdn_btok` when the operation is next traced. Also
-    invoked indirectly via the ``EASYDEL_GDN_TILE_POLICY`` environment
-    variable.
+    :func:`_select_pallas_gdn_btok` when no per-call tile policy is supplied.
 
     Args:
         policy: One of ``"auto"``, ``"b16"``, ``"b8"``, ``"b4"``,
@@ -984,12 +997,20 @@ def set_gdn_kernel_tile_policy(policy: str) -> None:
     _PALLAS_GDN_TILE_POLICY = normalize_kernel_tile_policy(policy)
 
 
-def _select_pallas_gdn_btok(num_tokens: int, n_v: int, d_k: int, d_v: int, dtype) -> int | None:
+def _select_pallas_gdn_btok(
+    num_tokens: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+    dtype,
+    kernel_tile_policy: KernelTilePolicy | str | None = None,
+) -> int | None:
     """Choose a TPU tile that keeps Mosaic VMEM windows under control.
 
-    Honours the ``_PALLAS_GDN_TILE_POLICY`` global. In ``"auto"`` mode it
-    iterates over ``(16, 8, 4)`` candidates and returns the first that both
-    divides ``num_tokens`` and keeps ``2 * b_tok * n_v * d_k * d_v *
+    Honours the per-call ``kernel_tile_policy`` when supplied, otherwise the
+    module default set by :func:`set_gdn_kernel_tile_policy`. In ``"auto"``
+    mode it iterates over ``(16, 8, 4)`` candidates and returns the first that
+    both divides ``num_tokens`` and keeps ``2 * b_tok * n_v * d_k * d_v *
     bytes_per`` under a 14 MiB cap (input + output state windows).
 
     Args:
@@ -1004,7 +1025,7 @@ def _select_pallas_gdn_btok(num_tokens: int, n_v: int, d_k: int, d_v: int, dtype
         fits the constraints (in which case the JAX fallback is used).
     """
 
-    policy = _PALLAS_GDN_TILE_POLICY
+    policy = normalize_kernel_tile_policy(kernel_tile_policy or _PALLAS_GDN_TILE_POLICY)
     if policy != "auto":
         b_tok = int(policy[1:])
         return b_tok if num_tokens >= b_tok and num_tokens % b_tok == 0 else None
@@ -1156,6 +1177,8 @@ def ragged_gated_delta_rule_decode_only(
     state_indices: jnp.ndarray,
     distribution: jnp.ndarray,
     use_qk_norm_in_gdn: bool,
+    kernel_tile_policy: KernelTilePolicy | str = "auto",
+    use_fused_gdn_decode: bool = False,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Applies gated delta rule for decode-only case (sequence lengths = 1).
 
@@ -1179,6 +1202,10 @@ def ragged_gated_delta_rule_decode_only(
             tokens.
         use_qk_norm_in_gdn: Whether to L2-normalize Q and K before the
             decode update.
+        kernel_tile_policy: TPU Pallas token tile policy for the decode fast
+            path. ``"auto"`` picks the largest VMEM-compatible tile.
+        use_fused_gdn_decode: Whether to use the fused TPU decode kernel when
+            the shape is supported.
 
     Returns:
         tuple: ``(updated_recurrent_state, output)`` where the state has
@@ -1210,7 +1237,6 @@ def ragged_gated_delta_rule_decode_only(
         a_reshaped.astype(jnp.float32) + dt_bias.astype(jnp.float32)[None, :]
     )
 
-    use_fused_gdn_decode = os.environ.get("EASYDEL_FUSED_GDN_DECODE", "0").lower() in {"1", "true", "yes"}
     if use_fused_gdn_decode and jax.default_backend() == "tpu" and d_k == 128 and d_v == 128 and num_tokens <= max_reqs:
         num_lanes = pltpu.get_tpu_info().num_lanes
         g_tiled = jnp.broadcast_to(g[..., None], (num_tokens, n_v, d_k)).astype(jnp.float32)
@@ -1238,7 +1264,7 @@ def ragged_gated_delta_rule_decode_only(
     # `[num_tokens, max_reqs)` untouched (they hold stale state for idle
     # requests not scheduled in this step).
     pallas_btok = (
-        _select_pallas_gdn_btok(num_tokens, n_v, d_k, d_v, query.dtype)
+        _select_pallas_gdn_btok(num_tokens, n_v, d_k, d_v, query.dtype, kernel_tile_policy)
         if jax.default_backend() == "tpu" and d_k == 128 and d_v == 128 and num_tokens <= max_reqs
         else None
     )
@@ -1303,6 +1329,9 @@ def ragged_gated_delta_rule_decode_only(
         "use_qk_norm_in_gdn",
         "apply_silu_in_gdr",
         "use_recurrent_scan_prefill",
+        "mask_initial_state",
+        "kernel_tile_policy",
+        "use_fused_gdn_decode",
     ),
 )
 @jax.named_scope("ragged_gated_delta_rule_chunked")
@@ -1326,6 +1355,9 @@ def ragged_gated_delta_rule(
     use_qk_norm_in_gdn: bool = True,
     apply_silu_in_gdr: bool = False,
     use_recurrent_scan_prefill: bool = False,
+    mask_initial_state: bool = False,
+    kernel_tile_policy: KernelTilePolicy | str = "auto",
+    use_fused_gdn_decode: bool = False,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Applies the gated delta rule over ragged seq lengths
 
@@ -1371,6 +1403,12 @@ def ragged_gated_delta_rule(
             mixed-prefill branch uses the recurrent-scan kernel for the
             pure-prefill case (``distribution[0] == 0``) instead of the
             chunked algorithm. Static; defaults to False.
+        mask_initial_state: When True, use ``has_initial_state`` to zero stale
+            recurrent slots for fresh prefill requests. Static; defaults to
+            False to keep the all-valid prefill path fast.
+        kernel_tile_policy: TPU Pallas decode token tile policy.
+        use_fused_gdn_decode: Whether to use the fused TPU decode kernel when
+            the shape is supported.
 
     Returns:
         tuple: ``(updated_recurrent_state, output)`` with state of shape
@@ -1425,6 +1463,8 @@ def ragged_gated_delta_rule(
             state_indices=state_indices,
             distribution=distribution,
             use_qk_norm_in_gdn=use_qk_norm_in_gdn,
+            kernel_tile_policy=kernel_tile_policy,
+            use_fused_gdn_decode=use_fused_gdn_decode,
         )
         return new_state, output.astype(mixed_qkv.dtype)
 
@@ -1505,8 +1545,10 @@ def ragged_gated_delta_rule(
                     recurrent_state=recurrent_state,
                     state_indices=state_indices,
                     distribution=distribution,
+                    has_initial_state=has_initial_state,
                     chunk_size=chunk_size,
                     use_qk_norm_in_gdn=use_qk_norm_in_gdn,
+                    mask_initial_state=mask_initial_state,
                 )
 
             return jax.lax.cond(distribution[0] == 0, recurrent_prefill_only, jax_mixed_prefill, operand=None)
@@ -1523,8 +1565,10 @@ def ragged_gated_delta_rule(
                 recurrent_state=recurrent_state,
                 state_indices=state_indices,
                 distribution=distribution,
+                has_initial_state=has_initial_state,
                 chunk_size=chunk_size,
                 use_qk_norm_in_gdn=use_qk_norm_in_gdn,
+                mask_initial_state=mask_initial_state,
             )
 
     is_decode_only = distribution[0] == distribution[2]
@@ -1552,6 +1596,9 @@ def ragged_gated_delta_rule_v2(
     use_qk_norm_in_gdn: bool = True,
     apply_silu_in_gdr: bool = False,
     use_recurrent_scan_prefill: bool = False,
+    mask_initial_state: bool = False,
+    kernel_tile_policy: KernelTilePolicy | str = "auto",
+    use_fused_gdn_decode: bool = False,
     runtime_dtype: jnp.dtype | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Run the unsharded packed-inference GDN v2 kernel with dtype coercion.
@@ -1590,6 +1637,11 @@ def ragged_gated_delta_rule_v2(
             splitting it into Q/K/V. Defaults to False.
         use_recurrent_scan_prefill: When True (and on TPU), use the
             recurrent-scan kernel for the pure-prefill case. Defaults to False.
+        mask_initial_state: When True, use ``has_initial_state`` to zero stale
+            recurrent slots for fresh prefill requests. Defaults to False.
+        kernel_tile_policy: TPU Pallas token tile policy for decode.
+        use_fused_gdn_decode: Whether to use the fused TPU decode kernel when
+            the shape is supported.
         runtime_dtype: Dtype all floating-point inputs are cast to before the
             kernel runs. Defaults to ``mixed_qkv.dtype`` when ``None``.
 
@@ -1628,4 +1680,7 @@ def ragged_gated_delta_rule_v2(
         use_qk_norm_in_gdn=use_qk_norm_in_gdn,
         apply_silu_in_gdr=apply_silu_in_gdr,
         use_recurrent_scan_prefill=use_recurrent_scan_prefill,
+        mask_initial_state=mask_initial_state,
+        kernel_tile_policy=kernel_tile_policy,
+        use_fused_gdn_decode=use_fused_gdn_decode,
     )

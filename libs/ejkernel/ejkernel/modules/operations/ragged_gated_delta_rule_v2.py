@@ -28,7 +28,6 @@ portable reference implementation.
 
 from __future__ import annotations
 
-import os
 from typing import Literal
 
 import jax
@@ -113,6 +112,100 @@ def mesh_axis_size(mesh: object | None, axis_name: object | None) -> int:
         return int(shape[axis_name])
     except Exception:
         return 1
+
+
+def _mesh_axis_items(mesh: object | None) -> tuple[tuple[object, int], ...]:
+    """Return mesh axis names and sizes for JAX/SpectraX-like meshes."""
+    if mesh is None:
+        return ()
+    try:
+        jax_mesh = mesh_to_jax_mesh(mesh)
+        shape = getattr(jax_mesh, "shape", None)
+    except Exception:
+        shape = getattr(mesh, "shape", None)
+    if shape is None:
+        return ()
+    if hasattr(shape, "items"):
+        return tuple((name, int(size)) for name, size in shape.items())
+    return ()
+
+
+def _has_nontrivial_mesh_axis(mesh: object | None) -> bool:
+    """Whether ``mesh`` has at least one axis with more than one device."""
+    return any(size > 1 for _, size in _mesh_axis_items(mesh))
+
+
+def _supports_head_shard(
+    mesh: object | None,
+    *,
+    axis_name: object | None,
+    n_kq: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+) -> bool:
+    """Whether ``axis_name`` can shard the GDN value-head work."""
+    axis_size = mesh_axis_size(mesh, axis_name)
+    if axis_size <= 1:
+        return False
+    key_dim = int(n_kq * d_k)
+    value_dim = int(n_v * d_v)
+    return n_kq % axis_size == 0 and n_v % axis_size == 0 and key_dim % axis_size == 0 and value_dim % axis_size == 0
+
+
+def _select_head_shard_axis(
+    mesh: object | None,
+    head_axis: object | None,
+    *,
+    n_kq: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+) -> object | None:
+    """Pick a real mesh axis for GDN head sharding.
+
+    Prefer the model's configured head axis. If it is size 1, use another
+    non-pipeline mesh axis that cleanly divides the GDN head geometry.
+    """
+    if _supports_head_shard(mesh, axis_name=head_axis, n_kq=n_kq, n_v=n_v, d_k=d_k, d_v=d_v):
+        return head_axis
+    axis_items = _mesh_axis_items(mesh)
+    axis_by_name = {str(name): name for name, size in axis_items if int(size) > 1}
+    preferred = (str(head_axis), "tp", "fsdp", "dp", "sp", "ep")
+    for name in preferred:
+        axis_name = axis_by_name.get(name)
+        if axis_name is not None and _supports_head_shard(
+            mesh,
+            axis_name=axis_name,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+        ):
+            return axis_name
+    for axis_name, size in axis_items:
+        if str(axis_name) == "pp" or int(size) <= 1:
+            continue
+        if _supports_head_shard(mesh, axis_name=axis_name, n_kq=n_kq, n_v=n_v, d_k=d_k, d_v=d_v):
+            return axis_name
+    return head_axis
+
+
+def _is_tpu_pallas_request(
+    *,
+    platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None,
+    cfg: RaggedGatedDeltaRuleV2Config | None,
+) -> bool:
+    try:
+        if jax.default_backend() != "tpu":
+            return False
+    except Exception:
+        return False
+    requested = platform
+    if requested is None and cfg is not None:
+        requested = cfg.platform
+    requested_key = str(getattr(requested, "value", requested or "auto")).lower()
+    return requested_key in {"auto", "pallas"}
 
 
 def _reorder_concatenated_tensor_for_sharding(
@@ -217,6 +310,7 @@ class RaggedGatedDeltaRuleV2(Kernel[RaggedGatedDeltaRuleV2Config, tuple[Array, A
         use_qk_norm_in_gdn: bool = True,
         apply_silu_in_gdr: bool = False,
         use_recurrent_scan_prefill: bool = False,
+        mask_initial_state: bool = False,
         runtime_dtype: object | None = None,
         platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         split_qkv_for_head_shard: bool = False,
@@ -253,6 +347,8 @@ class RaggedGatedDeltaRuleV2(Kernel[RaggedGatedDeltaRuleV2Config, tuple[Array, A
             apply_silu_in_gdr: Whether to apply SiLU to the mixed QKV input.
             use_recurrent_scan_prefill: Whether to route prefill through the
                 TPU recurrent-scan implementation when selected by backend.
+            mask_initial_state: Whether to use ``has_initial_state`` to zero
+                stale recurrent slots for fresh prefill requests.
             runtime_dtype: Optional runtime dtype override.
             platform: Optional implementation family override.
             split_qkv_for_head_shard: If true, split the mixed projection into
@@ -310,9 +406,9 @@ class RaggedGatedDeltaRuleV2(Kernel[RaggedGatedDeltaRuleV2Config, tuple[Array, A
                 distribution,
                 has_initial_state,
             )
-            assert len(in_specs) == len(call_args), (
-                f"in_specs length {len(in_specs)} != call_args length {len(call_args)}"
-            )
+            assert len(in_specs) == len(
+                call_args
+            ), f"in_specs length {len(in_specs)} != call_args length {len(call_args)}"
 
             def _wrapped_split(
                 local_query,
@@ -387,6 +483,7 @@ class RaggedGatedDeltaRuleV2(Kernel[RaggedGatedDeltaRuleV2Config, tuple[Array, A
                     use_qk_norm_in_gdn=use_qk_norm_in_gdn,
                     apply_silu_in_gdr=apply_silu_in_gdr,
                     use_recurrent_scan_prefill=use_recurrent_scan_prefill,
+                    mask_initial_state=mask_initial_state,
                     runtime_dtype=runtime_dtype,
                     platform=platform,
                     cfg=run_cfg,
@@ -453,8 +550,8 @@ class RaggedGatedDeltaRuleV2(Kernel[RaggedGatedDeltaRuleV2Config, tuple[Array, A
             Used as the ``jax.shard_map`` body for the default (non-split) path. Each shard receives its slice of
             the packed query/key/value buffer and recurrent state and dispatches directly to :meth:`run`, forwarding
             the captured head geometry (``n_kq``, ``n_v``, ``d_k``, ``d_v``) and runtime options (``run_chunk_size``,
-            ``use_qk_norm_in_gdn``, ``apply_silu_in_gdr``, ``use_recurrent_scan_prefill``, ``runtime_dtype``,
-            ``platform``, ``run_cfg``).
+                ``use_qk_norm_in_gdn``, ``apply_silu_in_gdr``, ``use_recurrent_scan_prefill``, ``runtime_dtype``,
+                ``platform``, ``run_cfg``).
 
             Args:
                 local_mixed_qkv: This shard's packed query/key/value token buffer.
@@ -490,6 +587,7 @@ class RaggedGatedDeltaRuleV2(Kernel[RaggedGatedDeltaRuleV2Config, tuple[Array, A
                 use_qk_norm_in_gdn=use_qk_norm_in_gdn,
                 apply_silu_in_gdr=apply_silu_in_gdr,
                 use_recurrent_scan_prefill=use_recurrent_scan_prefill,
+                mask_initial_state=mask_initial_state,
                 runtime_dtype=runtime_dtype,
                 platform=platform,
                 cfg=run_cfg,
@@ -525,6 +623,7 @@ class RaggedGatedDeltaRuleV2(Kernel[RaggedGatedDeltaRuleV2Config, tuple[Array, A
         use_qk_norm_in_gdn: bool = True,
         apply_silu_in_gdr: bool = False,
         use_recurrent_scan_prefill: bool = False,
+        mask_initial_state: bool = False,
         runtime_dtype: object | None = None,
         platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         cfg: RaggedGatedDeltaRuleV2Config,
@@ -553,6 +652,8 @@ class RaggedGatedDeltaRuleV2(Kernel[RaggedGatedDeltaRuleV2Config, tuple[Array, A
             apply_silu_in_gdr: Whether to apply SiLU to mixed QKV.
             use_recurrent_scan_prefill: Whether to enable recurrent-scan
                 prefill in backends that support it.
+            mask_initial_state: Whether to use ``has_initial_state`` to zero
+                stale recurrent slots for fresh prefill requests.
             runtime_dtype: Optional dtype override applied by the backend.
             platform: Optional implementation family override.
             cfg: Required operation config selected by the executor.
@@ -564,6 +665,8 @@ class RaggedGatedDeltaRuleV2(Kernel[RaggedGatedDeltaRuleV2Config, tuple[Array, A
         if platform is not None:
             cfg = RaggedGatedDeltaRuleV2Config(
                 chunk_size=cfg.chunk_size,
+                kernel_tile_policy=cfg.kernel_tile_policy,
+                use_fused_gdn_decode=cfg.use_fused_gdn_decode,
                 platform=platform,
                 backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
@@ -587,6 +690,9 @@ class RaggedGatedDeltaRuleV2(Kernel[RaggedGatedDeltaRuleV2Config, tuple[Array, A
             use_qk_norm_in_gdn=use_qk_norm_in_gdn,
             apply_silu_in_gdr=apply_silu_in_gdr,
             use_recurrent_scan_prefill=use_recurrent_scan_prefill,
+            mask_initial_state=mask_initial_state,
+            kernel_tile_policy=cfg.kernel_tile_policy,
+            use_fused_gdn_decode=cfg.use_fused_gdn_decode,
             runtime_dtype=runtime_dtype,
         )
 
@@ -611,6 +717,7 @@ class RaggedGatedDeltaRuleV2(Kernel[RaggedGatedDeltaRuleV2Config, tuple[Array, A
         use_qk_norm_in_gdn: bool,
         apply_silu_in_gdr: bool,
         use_recurrent_scan_prefill: bool,
+        mask_initial_state: bool,
         runtime_dtype: object | None,
         platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None,
         cfg: RaggedGatedDeltaRuleV2Config | None,
@@ -644,6 +751,8 @@ class RaggedGatedDeltaRuleV2(Kernel[RaggedGatedDeltaRuleV2Config, tuple[Array, A
             apply_silu_in_gdr: Whether to apply SiLU to the mixed QKV input.
             use_recurrent_scan_prefill: Whether to enable recurrent-scan prefill
                 in backends that support it.
+            mask_initial_state: Whether to use ``has_initial_state`` to zero
+                stale recurrent slots for fresh prefill requests.
             runtime_dtype: Optional dtype override applied by the backend.
             platform: Optional implementation family override.
             cfg: Optional operation config; a default is built when ``None``.
@@ -651,6 +760,7 @@ class RaggedGatedDeltaRuleV2(Kernel[RaggedGatedDeltaRuleV2Config, tuple[Array, A
         Returns:
             ``(updated_recurrent_state, output)``.
         """
+        run_cfg = cfg or RaggedGatedDeltaRuleV2Config(chunk_size=chunk_size, platform=platform or "auto")
         return _executor(
             self,
             mixed_qkv=mixed_qkv,
@@ -671,9 +781,10 @@ class RaggedGatedDeltaRuleV2(Kernel[RaggedGatedDeltaRuleV2Config, tuple[Array, A
             use_qk_norm_in_gdn=use_qk_norm_in_gdn,
             apply_silu_in_gdr=apply_silu_in_gdr,
             use_recurrent_scan_prefill=use_recurrent_scan_prefill,
+            mask_initial_state=mask_initial_state,
             runtime_dtype=runtime_dtype,
             platform=platform,
-            _cfg=cfg or RaggedGatedDeltaRuleV2Config(chunk_size=chunk_size, platform=platform or "auto"),
+            _cfg=run_cfg,
         )
 
     def heuristic_cfg(self, inv: Invocation[RaggedGatedDeltaRuleV2Config, tuple[Array, Array]]):
@@ -760,7 +871,7 @@ _executor: Executor[RaggedGatedDeltaRuleV2Config, tuple[Array, Array]] = Executo
         cache=ConfigCache(),
         policy=AutotunePolicy(
             allow_autotune=False,
-            cache_miss_fallback=os.getenv("EJKERNEL_AUTOTUNE_POLICY", "heuristics"),
+            cache_miss_fallback="heuristics",
             validate_backward=False,
         ),
         tuner=Tuner(warmup=1, iters=1),
@@ -791,6 +902,7 @@ def ragged_gated_delta_rule_v2(
     flat_tp_shard: bool = False,
     apply_silu_in_gdr: bool = False,
     use_recurrent_scan_prefill: bool = False,
+    mask_initial_state: bool = False,
     runtime_dtype: object | None = None,
     mesh: object | None = None,
     head_axis: object | None = None,
@@ -827,6 +939,8 @@ def ragged_gated_delta_rule_v2(
         apply_silu_in_gdr: Whether to apply SiLU to the mixed QKV input.
         use_recurrent_scan_prefill: Enable recurrent-scan prefill in supported
             backends.
+        mask_initial_state: Whether to use ``has_initial_state`` to zero stale
+            recurrent slots for fresh prefill requests.
         runtime_dtype: Runtime dtype override.
         mesh: Optional mesh for tensor-parallel ``shard_map`` execution.
         head_axis: Logical mesh axis used for head sharding.
@@ -841,6 +955,14 @@ def ragged_gated_delta_rule_v2(
         has_initial_state = jnp.ones(state_indices.shape[0], dtype=jnp.bool_)
 
     op = RaggedGatedDeltaRuleV2()
+    head_axis = _select_head_shard_axis(
+        mesh,
+        head_axis,
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+    )
     tp_size = mesh_axis_size(mesh, head_axis)
     key_dim = int(n_kq * d_k)
     value_dim = int(n_v * d_v)
@@ -858,6 +980,13 @@ def ragged_gated_delta_rule_v2(
     )
 
     if not (flat_tp_shard and can_flat_shard) and not can_split_shard:
+        run_cfg = cfg or RaggedGatedDeltaRuleV2Config(chunk_size=chunk_size, platform=platform or "auto")
+        if _is_tpu_pallas_request(platform=platform, cfg=run_cfg) and _has_nontrivial_mesh_axis(mesh):
+            raise ValueError(
+                "TPU Pallas ragged GDN requires a non-replicated shard_map axis on multi-device meshes. "
+                f"No mesh axis divides n_kq={n_kq}, n_v={n_v}, d_k={d_k}, d_v={d_v}; "
+                f"mesh axes={_mesh_axis_items(mesh)}."
+            )
         return op._run_unsharded(
             mixed_qkv,
             b,
@@ -877,9 +1006,10 @@ def ragged_gated_delta_rule_v2(
             use_qk_norm_in_gdn=use_qk_norm_in_gdn,
             apply_silu_in_gdr=apply_silu_in_gdr,
             use_recurrent_scan_prefill=use_recurrent_scan_prefill,
+            mask_initial_state=mask_initial_state,
             runtime_dtype=runtime_dtype,
             platform=platform,
-            cfg=cfg,
+            cfg=run_cfg,
         )
 
     if pre_sharded_mixed_qkv and not (flat_tp_shard and can_flat_shard):
@@ -927,6 +1057,7 @@ def ragged_gated_delta_rule_v2(
             use_qk_norm_in_gdn=use_qk_norm_in_gdn,
             apply_silu_in_gdr=apply_silu_in_gdr,
             use_recurrent_scan_prefill=use_recurrent_scan_prefill,
+            mask_initial_state=mask_initial_state,
             runtime_dtype=runtime_dtype,
             platform=platform,
             method="shard_map",
@@ -969,6 +1100,7 @@ def ragged_gated_delta_rule_v2(
         use_qk_norm_in_gdn=use_qk_norm_in_gdn,
         apply_silu_in_gdr=apply_silu_in_gdr,
         use_recurrent_scan_prefill=use_recurrent_scan_prefill,
+        mask_initial_state=mask_initial_state,
         runtime_dtype=runtime_dtype,
         platform=platform,
         split_qkv_for_head_shard=True,

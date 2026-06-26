@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import typing as tp
 
-from ._runtime import normalize_segment_sizes, tensor_parallel_size
+from ._runtime import interleave_segments_last_axis, normalize_segment_sizes, tensor_parallel_size
 from ._torch_packing import torch_deinterleave_segments_for_tp, torch_interleave_segments_for_tp
 from ._types import EasyDeLBaseConfig
 
@@ -178,11 +178,26 @@ def interleaved_fusion_reform_param(
             )
         return outputs
 
+    def _native_fuser(*tensors: tp.Any) -> tp.Any:
+        """Fuse native EasyDeL tuple-key tensors along their output axis.
+
+        Native checkpoints have already been converted to EasyDeL tensor
+        orientation, so dense column projections store the fused output on
+        the last axis rather than HF torch's first axis.
+        """
+        if transforms:
+            tensors = tuple(
+                transform(tensor) if transform is not None else tensor
+                for tensor, transform in zip(tensors, transforms, strict=True)
+            )
+        return interleave_segments_last_axis(tensors, tp_size=_tp_size(tensors[0] if tensors else None))
+
     return {
         f"{target_name}$": {
             "sources": source_names,
             "fuser": _fuser,
             "inverse_fuser": _inverse_fuser,
+            "native_fuser": _native_fuser,
             "log_label": log_label or f"{target_name} interleaved fusion groups",
         }
     }

@@ -29,7 +29,7 @@ The core recurrence:
     o_t = h_t @ q_t
 
 Algorithm modes:
-    - Chunked (default): Parallel within chunks using Neumann series
+    - Chunked (default): Parallel exact solve within chunks
     - Recurrent: Pure sequential scan for memory efficiency
     - Single-step: Optimized path for autoregressive generation
 
@@ -66,7 +66,6 @@ References:
 
 from __future__ import annotations
 
-import os
 import typing
 from typing import Literal
 
@@ -74,7 +73,7 @@ from jax import shard_map
 from jax.sharding import Mesh, PartitionSpec
 from jaxtyping import Array, Float, Int
 
-from ejkernel.kernels._registry import Backend, kernel_registry
+from ejkernel.kernels._registry import Backend, Platform, kernel_registry
 from ejkernel.ops import (
     AutotunePolicy,
     ConfigCache,
@@ -120,12 +119,12 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
 
     def create_shard_map_wrapper(
         self,
-        query: Float[Array, "batch seq_len num_heads qk_head_dim"],
-        key: Float[Array, "batch seq_len num_heads qk_head_dim"],
-        value: Float[Array, "batch seq_len num_heads v_head_dim"],
-        beta: Float[Array, "batch seq_len num_heads"],
-        decay: Float[Array, "batch seq_len num_heads"] | None = None,
-        initial_state: Float[Array, "batch num_heads qk_head_dim v_head_dim"] | None = None,
+        query: Float[Array, "batch seq_len num_qk_heads qk_head_dim"],
+        key: Float[Array, "batch seq_len num_qk_heads qk_head_dim"],
+        value: Float[Array, "batch seq_len num_value_heads v_head_dim"],
+        beta: Float[Array, "batch seq_len num_value_heads"],
+        decay: Float[Array, "batch seq_len num_value_heads"] | None = None,
+        initial_state: Float[Array, "batch num_value_heads qk_head_dim v_head_dim"] | None = None,
         *,
         use_qk_l2norm: bool = True,
         use_chunked: bool = True,
@@ -279,14 +278,18 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
         platform = detect_platform("gated_delta_rule", cfg.platform)
         return kernel_registry.get("gated_delta_rule", platform=platform, backend=cfg.backend)
 
+    def resolve_platform(self, cfg: GatedDeltaRuleConfig):
+        """Resolve ``auto`` to the concrete registered GDR platform."""
+        return detect_platform("gated_delta_rule", cfg.platform)
+
     def run(
         self,
-        query: Float[Array, "batch seq_len num_heads qk_head_dim"],
-        key: Float[Array, "batch seq_len num_heads qk_head_dim"],
-        value: Float[Array, "batch seq_len num_heads v_head_dim"],
-        beta: Float[Array, "batch seq_len num_heads"],
-        decay: Float[Array, "batch seq_len num_heads"] | None = None,
-        initial_state: Float[Array, "batch num_heads qk_head_dim v_head_dim"] | None = None,
+        query: Float[Array, "batch seq_len num_qk_heads qk_head_dim"],
+        key: Float[Array, "batch seq_len num_qk_heads qk_head_dim"],
+        value: Float[Array, "batch seq_len num_value_heads v_head_dim"],
+        beta: Float[Array, "batch seq_len num_value_heads"],
+        decay: Float[Array, "batch seq_len num_value_heads"] | None = None,
+        initial_state: Float[Array, "batch num_value_heads qk_head_dim v_head_dim"] | None = None,
         seg_ids: Int[Array, "batch seq_len"] | None = None,
         *,
         use_qk_l2norm: bool = True,
@@ -334,18 +337,47 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
                 Tuple of (output, final_state) where final_state has shape
                 [batch, num_heads, qk_head_dim, v_head_dim]
         """
+        cfg_use_chunked = bool(getattr(cfg, "use_chunked", True))
+        use_input_dtype_phase1_outputs = bool(getattr(cfg, "use_input_dtype_phase1_outputs", False))
+        use_input_dtype_state = bool(getattr(cfg, "use_input_dtype_state", False))
+        use_chunked = bool(use_chunked) and cfg_use_chunked
         if platform is not None:
             cfg = GatedDeltaRuleConfig(
                 chunk_size=cfg.chunk_size,
+                use_chunked=cfg_use_chunked,
+                use_input_dtype_phase1_outputs=use_input_dtype_phase1_outputs,
+                use_input_dtype_state=use_input_dtype_state,
                 platform=platform,
                 backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
         if not use_chunked:
-            cfg.backend = Backend.ANY
-            cfg.platform = "xla"
+            cfg = GatedDeltaRuleConfig(
+                chunk_size=cfg.chunk_size,
+                use_chunked=False,
+                use_input_dtype_phase1_outputs=use_input_dtype_phase1_outputs,
+                use_input_dtype_state=use_input_dtype_state,
+                platform="xla",
+                backend=Backend.ANY,
+            )
 
-        impl = self.get_impl(cfg)
-        out, final_state = impl(
+        resolved_platform = self.resolve_platform(cfg)
+        grouped_heads = query.shape[2] != value.shape[2]
+        if grouped_heads and value.shape[2] % query.shape[2] != 0:
+            raise ValueError(
+                f"grouped GDR requires value heads ({value.shape[2]}) to be a multiple of query heads ({query.shape[2]})"
+            )
+        if grouped_heads and resolved_platform not in (Platform.PALLAS, Platform.XLA):
+            cfg = GatedDeltaRuleConfig(
+                chunk_size=cfg.chunk_size,
+                use_chunked=cfg_use_chunked,
+                use_input_dtype_phase1_outputs=use_input_dtype_phase1_outputs,
+                use_input_dtype_state=use_input_dtype_state,
+                platform="xla",
+                backend=Backend.ANY,
+            )
+            resolved_platform = Platform.XLA
+        impl = kernel_registry.get("gated_delta_rule", platform=resolved_platform, backend=cfg.backend)
+        impl_kwargs = dict(
             query=query,
             key=key,
             value=value,
@@ -357,6 +389,10 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
             use_qk_l2norm=bool(use_qk_l2norm),
             use_chunked=use_chunked,
         )
+        if resolved_platform == Platform.PALLAS:
+            impl_kwargs["use_input_dtype_phase1_outputs"] = use_input_dtype_phase1_outputs
+            impl_kwargs["use_input_dtype_state"] = use_input_dtype_state
+        out, final_state = impl(**impl_kwargs)
 
         if return_state:
             return out, final_state
@@ -450,7 +486,12 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
         """
         cands = [128, 256]
         return [
-            GatedDeltaRuleConfig(chunk_size=c, platform=platform, backend=backend)
+            GatedDeltaRuleConfig(
+                chunk_size=c,
+                platform=platform,
+                backend=backend,
+                use_input_dtype_phase1_outputs=(platform == "pallas"),
+            )
             for platform, backend in (("pallas", "tpu"), ("xla", "any"))
             for c in cands
         ]
@@ -467,7 +508,7 @@ _executor: Executor[GatedDeltaRuleConfig, Array] = Executor(
         cache=ConfigCache(),
         policy=AutotunePolicy(
             allow_autotune=True,
-            cache_miss_fallback=os.getenv("EJKERNEL_AUTOTUNE_POLICY", "autotune"),
+            cache_miss_fallback="autotune",
             validate_backward=True,
         ),
         tuner=Tuner(warmup=10, iters=40),
@@ -477,13 +518,13 @@ _executor: Executor[GatedDeltaRuleConfig, Array] = Executor(
 
 
 def gated_delta_rule(
-    query: Float[Array, "batch seq_len num_heads qk_head_dim"],
-    key: Float[Array, "batch seq_len num_heads qk_head_dim"],
-    value: Float[Array, "batch seq_len num_heads v_head_dim"],
-    beta: Float[Array, "batch seq_len num_heads"],
-    decay: Float[Array, "batch seq_len num_heads"] | None = None,
+    query: Float[Array, "batch seq_len num_qk_heads qk_head_dim"],
+    key: Float[Array, "batch seq_len num_qk_heads qk_head_dim"],
+    value: Float[Array, "batch seq_len num_value_heads v_head_dim"],
+    beta: Float[Array, "batch seq_len num_value_heads"],
+    decay: Float[Array, "batch seq_len num_value_heads"] | None = None,
     seg_ids: Int[Array, "batch seq_len"] | None = None,
-    initial_state: Float[Array, "batch num_heads qk_head_dim v_head_dim"] | None = None,
+    initial_state: Float[Array, "batch num_value_heads qk_head_dim v_head_dim"] | None = None,
     /,
     *,
     autotune_chunk_candidates: tuple[int, ...] | list[int] | None = None,
@@ -618,6 +659,14 @@ def gated_delta_rule(
         v = value.transpose(0, 2, 1, 3)
         b = beta.transpose(0, 2, 1)
         d = decay.transpose(0, 2, 1) if decay is not None else None
+        if q.shape[1] != v.shape[1]:
+            if v.shape[1] % q.shape[1] != 0:
+                raise ValueError(
+                    f"grouped GDR requires value heads ({v.shape[1]}) to be a multiple of query heads ({q.shape[1]})"
+                )
+            expand_ratio = v.shape[1] // q.shape[1]
+            q = jnp.repeat(q, expand_ratio, axis=1)
+            k = jnp.repeat(k, expand_ratio, axis=1)
         out, final_state = _single_step_gdr_fwd(
             query=q,
             key=k,

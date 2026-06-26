@@ -14,7 +14,6 @@
 
 """Tests for eray.execution — executor, decorators, remote."""
 
-
 from eray.execution.decorators import (
     autoscale_execute,
     autoscale_execute_resumable,

@@ -39,13 +39,12 @@ os.environ.setdefault("ENABLE_DISTRIBUTED_INIT", "0")
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
 
+import easydel as ed
 import jax
 import numpy as np
 import optax
 import pytest
 from jax import numpy as jnp
-
-import easydel as ed
 
 if jax.device_count() < 4:
     pytest.skip(
@@ -433,6 +432,31 @@ def _qwen3_next(tp):
     return ed.Qwen3NextForCausalLM(config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
 
 
+def _qwen3_next_dense(tp):
+    """Dense-MLP Qwen3-Next path used by non-MoE checkpoint round-trip tests."""
+    import spectrax as spx
+
+    cfg = ed.Qwen3NextConfig(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        max_position_embeddings=64,
+        linear_num_key_heads=2,
+        linear_num_value_heads=4,
+        linear_key_head_dim=16,
+        linear_value_head_dim=16,
+        linear_conv_kernel_dim=4,
+        attn_mechanism=ed.AttentionMechanisms.VANILLA,
+        mlp_only_layers=[0, 1],
+    )
+    cfg.sharding_axis_dims = (1, 1, -1, 1, tp, 1)
+    return ed.Qwen3NextForCausalLM(config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
+
+
 FAMILIES = {
     "llama": _llama,
     "phi3": _phi3,
@@ -502,9 +526,9 @@ def test_fused_checkpoint_save_load_tp_matrix(tmp_path, save_tp, load_tp):
     )
     restored = _logits(loaded)
     err = float(np.max(np.abs(reference - restored)))
-    assert err < _model_logit_tolerance("llama"), (
-        f"save_tp={save_tp} -> load_tp={load_tp} changed the model (max|Δlogits|={err})"
-    )
+    assert err < _model_logit_tolerance(
+        "llama"
+    ), f"save_tp={save_tp} -> load_tp={load_tp} changed the model (max|Δlogits|={err})"
     # the live config is overwritten to describe the layout now in memory
     assert getattr(loaded.config, "fused_param_tp", None) == load_tp
 
@@ -533,9 +557,9 @@ def test_fused_tp_survives_lost_marker(tmp_path):
     )
     restored = _logits(loaded)
     err = float(np.max(np.abs(reference - restored)))
-    assert err < _model_logit_tolerance("llama"), (
-        f"markerless checkpoint was not re-interleaved via the config.json tp (max|Δlogits|={err})"
-    )
+    assert err < _model_logit_tolerance(
+        "llama"
+    ), f"markerless checkpoint was not re-interleaved via the config.json tp (max|Δlogits|={err})"
 
 
 def test_fused_tp_backcompat_canonical_format(tmp_path):
@@ -569,9 +593,9 @@ def test_fused_tp_backcompat_canonical_format(tmp_path):
     )
     restored = _logits(loaded)
     err = float(np.max(np.abs(reference - restored)))
-    assert err < _model_logit_tolerance("llama"), (
-        f"previous-format canonical checkpoint failed to load at tp=2 (max|Δlogits|={err})"
-    )
+    assert err < _model_logit_tolerance(
+        "llama"
+    ), f"previous-format canonical checkpoint failed to load at tp=2 (max|Δlogits|={err})"
     assert getattr(loaded.config, "fused_param_tp", None) == 2
     assert "fused_param_layout" not in loaded.config.__dict__
 
@@ -616,14 +640,14 @@ def test_to_torch_refuses_mismatched_fused_tp():
 
 
 def test_to_torch_after_cross_tp_load_matches(tmp_path):
-    """The full user workflow, export leg: save at tp=1, re-load at tp=2
-    (retp re-interleaves), then to_torch from the tp=2 mesh. The HF tensors
-    must be bit-identical to exporting the original tp=1 model — i.e. the
+    """The full user workflow, export leg: save at tp=2, re-load at tp=4
+    (retp re-interleaves), then to_torch from the tp=4 mesh. The HF tensors
+    must be bit-identical to exporting the original tp=2 model — i.e. the
     exporter de-interleaves with the LOADED tp, not some stale one."""
     pytest.importorskip("torch")
     import torch
 
-    model = _llama(1)
+    model = _llama(2)
     hf_reference = model.to_torch().state_dict()
     ckpt = tmp_path / "ckpt"
     model.save_pretrained(str(ckpt))
@@ -632,16 +656,16 @@ def test_to_torch_after_cross_tp_load_matches(tmp_path):
         pretrained_model_name_or_path=str(ckpt),
         dtype=jnp.float32,
         param_dtype=jnp.float32,
-        sharding_axis_dims=(1, 1, -1, 1, 2, 1),
+        sharding_axis_dims=(1, 1, -1, 1, 4, 1),
         auto_shard_model=True,
     )
-    assert getattr(loaded.config, "fused_param_tp", None) == 2
+    assert getattr(loaded.config, "fused_param_tp", None) == 4
     hf_exported = loaded.to_torch().state_dict()
 
     assert hf_exported.keys() == hf_reference.keys()
     for key, reference in hf_reference.items():
         assert torch.equal(reference, hf_exported[key]), (
-            f"{key} differs between tp=1 export and export after tp=2 re-load; "
+            f"{key} differs between tp=2 export and export after tp=4 re-load; "
             "the exporter did not de-interleave with the loaded tp"
         )
 
@@ -681,6 +705,71 @@ def test_prefused_hf_checkpoint_roundtrips_at_tp2():
             f"{key} changed across the tp=2 import/export round-trip; "
             "the exporter did not de-interleave the pre-fused tensor"
         )
+
+
+def test_prefused_hf_checkpoint_tp2_save_tp4_load_exports_to_torch(tmp_path):
+    """Exact torch -> EasyDeL tp2 save -> EasyDeL tp4 load -> torch workflow."""
+    pytest.importorskip("torch")
+    import torch
+
+    reference = _phi3(1)
+    reference.config.pad_token_id = 0
+    hf_state = reference.to_torch().state_dict()
+
+    loaded_tp2 = _phi3(2)
+    loaded_tp2.config.pad_token_id = 0
+    loaded_tp2 = ed.traversals.merge_model_and_tree(loaded_tp2, tree=loaded_tp2.transform_fn(hf_state))
+    loaded_tp2.eval()
+    ckpt = tmp_path / "ckpt"
+    loaded_tp2.save_pretrained(str(ckpt))
+
+    loaded_tp4 = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+        pretrained_model_name_or_path=str(ckpt),
+        dtype=jnp.float32,
+        param_dtype=jnp.float32,
+        sharding_axis_dims=(1, 1, -1, 1, 4, 1),
+        auto_shard_model=True,
+    )
+    assert getattr(loaded_tp4.config, "fused_param_tp", None) == 4
+    hf_exported = loaded_tp4.to_torch().state_dict()
+
+    assert hf_exported.keys() == hf_state.keys()
+    for key, reference_tensor in hf_state.items():
+        assert torch.equal(
+            reference_tensor, hf_exported[key]
+        ), f"{key} changed across torch -> EasyDeL tp2 save -> EasyDeL tp4 load -> torch"
+
+
+def test_qwen3_next_dense_torch_tp2_save_tp4_load_exports_to_torch(tmp_path):
+    """Dense Qwen3-Next torch -> EasyDeL tp2 save -> EasyDeL tp4 load -> torch."""
+    pytest.importorskip("torch")
+    import torch
+
+    reference = _qwen3_next_dense(1)
+    hf_state = reference.to_torch().state_dict()
+    hf_reference = {key: value.detach().clone() for key, value in hf_state.items()}
+
+    loaded_tp2 = _qwen3_next_dense(2)
+    loaded_tp2 = ed.traversals.merge_model_and_tree(loaded_tp2, tree=loaded_tp2.transform_fn(dict(hf_state)))
+    loaded_tp2.eval()
+    ckpt = tmp_path / "ckpt"
+    loaded_tp2.save_pretrained(str(ckpt))
+
+    loaded_tp4 = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+        pretrained_model_name_or_path=str(ckpt),
+        dtype=jnp.float32,
+        param_dtype=jnp.float32,
+        sharding_axis_dims=(1, 1, -1, 1, 4, 1),
+        auto_shard_model=True,
+    )
+    assert getattr(loaded_tp4.config, "fused_param_tp", None) == 4
+    hf_exported = loaded_tp4.to_torch().state_dict()
+
+    assert hf_exported.keys() == hf_reference.keys()
+    for key, reference_tensor in hf_reference.items():
+        assert torch.equal(
+            reference_tensor, hf_exported[key]
+        ), f"{key} changed across dense Qwen3-Next torch -> EasyDeL tp2 save -> EasyDeL tp4 load -> torch"
 
 
 def _canonical_fused_optimizer_leaves(state):

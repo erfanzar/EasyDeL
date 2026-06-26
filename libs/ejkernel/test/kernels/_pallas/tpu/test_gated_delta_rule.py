@@ -33,6 +33,7 @@ import jax.numpy as jnp
 import pytest
 from ejkernel.kernels._pallas.tpu.gated_delta_rule import gated_delta_rule as gated_delta_rule_pallas
 from ejkernel.kernels._xla.gated_delta_rule import gated_delta_rule as gated_delta_rule_xla
+from ejkernel.kernels._xla.gated_delta_rule._xla_impl_fwd import _l2norm_with_inv
 
 
 def _has_tpu() -> bool:
@@ -143,7 +144,7 @@ def test_pallas_single_step_continuation():
     single-step output matches the corresponding slice of the full forward (atol ``2e-2``).
     """
     q, k, v, beta, decay = _make_inputs(seq_len=9, dtype=jnp.float32, seed=3)
-    out_full, _ = gated_delta_rule_pallas(q, k, v, beta, decay, chunk_size=8, use_chunked=True)
+    out_full, state_full = gated_delta_rule_pallas(q, k, v, beta, decay, chunk_size=8, use_chunked=True)
     _, state = gated_delta_rule_pallas(q[:, :8], k[:, :8], v[:, :8], beta[:, :8], decay[:, :8], chunk_size=8)
     out_last, state_last = gated_delta_rule_pallas(
         q[:, 8:],
@@ -156,6 +157,7 @@ def test_pallas_single_step_continuation():
     assert out_last.shape == (q.shape[0], 1, q.shape[2], v.shape[3])
     assert state_last.shape == state.shape
     assert jnp.allclose(out_last, out_full[:, 8:], atol=2e-2, rtol=0)
+    assert jnp.allclose(state_last, state_full, atol=2e-2, rtol=0)
 
 
 @pytest.mark.parametrize(("dtype", "seed"), ((jnp.float32, 13), (jnp.bfloat16, 33)))
@@ -197,6 +199,214 @@ def test_pallas_bfloat16_inputs():
     assert state.dtype in (jnp.bfloat16, jnp.float32)
     assert jnp.all(jnp.isfinite(out))
     assert jnp.all(jnp.isfinite(state))
+
+
+def test_pallas_bfloat16_input_dtype_phase1_matches_xla():
+    """Verify the lower-HBM forward-only phase-1 dtype option stays numerically close to XLA."""
+    q, k, v, beta, decay = _make_inputs(
+        batch=1,
+        seq_len=256,
+        heads=4,
+        qk_dim=128,
+        v_dim=128,
+        dtype=jnp.bfloat16,
+        seed=41,
+    )
+    out_p, state_p = gated_delta_rule_pallas(
+        q,
+        k,
+        v,
+        beta,
+        decay,
+        chunk_size=256,
+        use_chunked=True,
+        use_input_dtype_phase1_outputs=True,
+    )
+    out_x, state_x = gated_delta_rule_xla(q, k, v, beta, decay, chunk_size=256, use_chunked=False)
+
+    out_diff = jnp.max(jnp.abs(out_p.astype(jnp.float32) - out_x.astype(jnp.float32)))
+    state_diff = jnp.max(jnp.abs(state_p.astype(jnp.float32) - state_x.astype(jnp.float32)))
+    assert jnp.all(jnp.isfinite(out_p))
+    assert jnp.all(jnp.isfinite(state_p))
+    assert jnp.allclose(out_p, out_x, atol=5e-2, rtol=0), f"Output max diff: {out_diff}"
+    assert jnp.allclose(state_p, state_x, atol=5e-2, rtol=0), f"State max diff: {state_diff}"
+
+
+def test_pallas_forward_only_in_kernel_qk_norm_matches_external_norm():
+    """Forward-only Pallas Q/K norm fusion should match the old external-normalize path."""
+    q, k, v, beta, decay = _make_inputs(
+        batch=1,
+        seq_len=256,
+        heads=4,
+        qk_dim=128,
+        v_dim=128,
+        dtype=jnp.bfloat16,
+        seed=42,
+    )
+    out_fused, state_fused = gated_delta_rule_pallas(
+        q,
+        k,
+        v,
+        beta,
+        decay,
+        chunk_size=256,
+        use_chunked=True,
+        use_qk_l2norm=True,
+        use_input_dtype_phase1_outputs=True,
+        use_input_dtype_state=True,
+    )
+    q_norm, _ = _l2norm_with_inv(q, axis=-1, eps=1e-6)
+    k_norm, _ = _l2norm_with_inv(k, axis=-1, eps=1e-6)
+    out_external, state_external = gated_delta_rule_pallas(
+        q_norm,
+        k_norm,
+        v,
+        beta,
+        decay,
+        chunk_size=256,
+        use_chunked=True,
+        use_qk_l2norm=False,
+        use_input_dtype_phase1_outputs=True,
+        use_input_dtype_state=True,
+    )
+
+    assert jnp.allclose(out_fused, out_external, atol=5e-2, rtol=0)
+    assert jnp.allclose(state_fused, state_external, atol=5e-2, rtol=0)
+
+
+def test_pallas_grouped_prefill_matches_repeated_heads():
+    """Grouped Pallas prefill should match the old materialized Q/K repeat path."""
+    batch, seq_len, q_heads, expand_ratio, qk_dim, v_dim = 1, 64, 2, 2, 64, 64
+    v_heads = q_heads * expand_ratio
+    q, k, _, _, _ = _make_inputs(
+        batch=batch,
+        seq_len=seq_len,
+        heads=q_heads,
+        qk_dim=qk_dim,
+        v_dim=v_dim,
+        dtype=jnp.bfloat16,
+        seed=43,
+    )
+    _, _, v, beta, decay = _make_inputs(
+        batch=batch,
+        seq_len=seq_len,
+        heads=v_heads,
+        qk_dim=qk_dim,
+        v_dim=v_dim,
+        dtype=jnp.bfloat16,
+        seed=44,
+    )
+
+    out_grouped, state_grouped = gated_delta_rule_pallas(
+        q,
+        k,
+        v,
+        beta,
+        decay,
+        chunk_size=64,
+        use_chunked=True,
+        use_input_dtype_phase1_outputs=True,
+        use_input_dtype_state=True,
+    )
+    out_repeated, state_repeated = gated_delta_rule_pallas(
+        jnp.repeat(q, expand_ratio, axis=2),
+        jnp.repeat(k, expand_ratio, axis=2),
+        v,
+        beta,
+        decay,
+        chunk_size=64,
+        use_chunked=True,
+        use_input_dtype_phase1_outputs=True,
+        use_input_dtype_state=True,
+    )
+
+    assert out_grouped.shape == v.shape
+    assert state_grouped.shape == (batch, v_heads, qk_dim, v_dim)
+    assert jnp.allclose(out_grouped.astype(jnp.float32), out_repeated.astype(jnp.float32), atol=5e-2, rtol=0)
+    assert jnp.allclose(state_grouped.astype(jnp.float32), state_repeated.astype(jnp.float32), atol=5e-2, rtol=0)
+
+
+def test_pallas_grouped_bfloat16_input_dtype_flags_backward_compiles():
+    """Grouped bf16 low-HBM dtype flags must keep the custom-VJP primal dtype contract."""
+    batch, seq_len, q_heads, expand_ratio, qk_dim, v_dim = 1, 64, 2, 2, 64, 64
+    v_heads = q_heads * expand_ratio
+    q, k, _, _, _ = _make_inputs(
+        batch=batch,
+        seq_len=seq_len,
+        heads=q_heads,
+        qk_dim=qk_dim,
+        v_dim=v_dim,
+        dtype=jnp.bfloat16,
+        seed=45,
+    )
+    _, _, v, beta, decay = _make_inputs(
+        batch=batch,
+        seq_len=seq_len,
+        heads=v_heads,
+        qk_dim=qk_dim,
+        v_dim=v_dim,
+        dtype=jnp.bfloat16,
+        seed=46,
+    )
+
+    def loss_fn(q_in, k_in, v_in, beta_in, decay_in):
+        out, state = gated_delta_rule_pallas(
+            q_in,
+            k_in,
+            v_in,
+            beta_in,
+            decay_in,
+            chunk_size=64,
+            use_chunked=True,
+            use_input_dtype_phase1_outputs=True,
+            use_input_dtype_state=True,
+        )
+        assert out.dtype == jnp.bfloat16
+        assert state.dtype == jnp.bfloat16
+        return jnp.sum(out.astype(jnp.float32)) + 0.1 * jnp.sum(state.astype(jnp.float32))
+
+    value, grads = jax.value_and_grad(loss_fn, argnums=(0, 1, 2, 3, 4))(q, k, v, beta, decay)
+
+    assert jnp.isfinite(value)
+    for grad, reference in zip(grads, (q, k, v, beta, decay), strict=True):
+        assert grad.shape == reference.shape
+        assert jnp.all(jnp.isfinite(grad))
+
+
+def test_pallas_bfloat16_input_dtype_flags_backward_compiles():
+    """Non-grouped bf16 low-HBM dtype flags must keep the custom-VJP primal dtype contract."""
+    q, k, v, beta, decay = _make_inputs(
+        batch=1,
+        seq_len=64,
+        heads=4,
+        qk_dim=64,
+        v_dim=64,
+        dtype=jnp.bfloat16,
+        seed=47,
+    )
+
+    def loss_fn(q_in, k_in, v_in, beta_in, decay_in):
+        out, state = gated_delta_rule_pallas(
+            q_in,
+            k_in,
+            v_in,
+            beta_in,
+            decay_in,
+            chunk_size=64,
+            use_chunked=True,
+            use_input_dtype_phase1_outputs=True,
+            use_input_dtype_state=True,
+        )
+        assert out.dtype == jnp.bfloat16
+        assert state.dtype == jnp.bfloat16
+        return jnp.sum(out.astype(jnp.float32)) + 0.1 * jnp.sum(state.astype(jnp.float32))
+
+    value, grads = jax.value_and_grad(loss_fn, argnums=(0, 1, 2, 3, 4))(q, k, v, beta, decay)
+
+    assert jnp.isfinite(value)
+    for grad, reference in zip(grads, (q, k, v, beta, decay), strict=True):
+        assert grad.shape == reference.shape
+        assert jnp.all(jnp.isfinite(grad))
 
 
 def test_pallas_backward_matches_xla_recurrent():

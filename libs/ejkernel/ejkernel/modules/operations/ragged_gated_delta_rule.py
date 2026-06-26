@@ -39,7 +39,6 @@ Example:
 
 from __future__ import annotations
 
-import os
 from typing import Literal
 
 import jax
@@ -540,7 +539,7 @@ _executor: Executor[RaggedGatedDeltaRuleConfig, Array] = Executor(
         cache=ConfigCache(),
         policy=AutotunePolicy(
             allow_autotune=True,
-            cache_miss_fallback=os.getenv("EJKERNEL_AUTOTUNE_POLICY", "heuristics"),
+            cache_miss_fallback="heuristics",
             validate_backward=False,
         ),
         tuner=Tuner(warmup=3, iters=10),
@@ -639,10 +638,8 @@ def ragged_gated_delta_rule(
     Note:
         The module executor enables autotuning (``allow_autotune=True``) with a
         light tuner (3 warmup / 10 timed iterations) and a persistent cache, but
-        backward validation is disabled. The cache-miss fallback defaults to the
-        heuristic config (chunk_size 64) unless overridden by the
-        ``EJKERNEL_AUTOTUNE_POLICY`` env var. When ``cfg`` is None, a config is
-        built from the ``chunk_size``/``platform`` arguments before dispatch.
+        backward validation is disabled. Cache misses use the heuristic config
+        unless the caller provides an explicit ``cfg`` override.
     """
     if cfg is None:
         cfg = RaggedGatedDeltaRuleConfig(

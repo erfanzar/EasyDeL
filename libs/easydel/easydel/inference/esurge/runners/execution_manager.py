@@ -159,6 +159,24 @@ _PipelineExecuteResult = tuple[
 ]
 
 
+@partial(jax.jit, static_argnames=("padded_num_reqs",))
+def _greedy_argmax_tokens(
+    logits: jax.Array,
+    valid_mask: jax.Array,
+    rng_key: jax.Array,
+    total_tokens: jax.Array,
+    *,
+    padded_num_reqs: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Return greedy sampled tokens for prefix-layout decode windows."""
+    with jax.named_scope("easydel/esurge/greedy_argmax_tokens"):
+        tokens = jnp.argmax(logits[:padded_num_reqs], axis=-1).astype(jnp.int32)
+        valid_mask = valid_mask[:padded_num_reqs].astype(jnp.bool_)
+        tokens = jnp.where(valid_mask, tokens, jnp.full_like(tokens, -1))
+        rng_key = jax.random.fold_in(rng_key, jnp.asarray(total_tokens, dtype=jnp.int32))
+        return rng_key, tokens, valid_mask
+
+
 def _get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int, min_input_pad: int) -> int:
     """Calculate padded request count for compilation efficiency.
 
@@ -1571,11 +1589,11 @@ class ExecutionManager:
         )
         prep_sampler_window_took = time.time() - prep_phase_start
         model_logits_padded_num_reqs = int(padded_num_reqs)
+        sampler_prefix = self._sampler_prefix_cpu_by_reqs.get(int(sampler_padded_num_reqs))
+        if sampler_prefix is None:
+            sampler_prefix = numpy.arange(int(sampler_padded_num_reqs), dtype=numpy.int32)
+            self._sampler_prefix_cpu_by_reqs[int(sampler_padded_num_reqs)] = sampler_prefix
         if self.model.mesh.is_mpmd and self._model_executor.supports_pipeline_model_step:
-            sampler_prefix = self._sampler_prefix_cpu_by_reqs.get(int(sampler_padded_num_reqs))
-            if sampler_prefix is None:
-                sampler_prefix = numpy.arange(int(sampler_padded_num_reqs), dtype=numpy.int32)
-                self._sampler_prefix_cpu_by_reqs[int(sampler_padded_num_reqs)] = sampler_prefix
             if numpy.array_equal(
                 self._sampler_gather_positions_cpu[: int(sampler_padded_num_reqs)],
                 sampler_prefix,
@@ -1621,6 +1639,44 @@ class ExecutionManager:
             model_hash_baseline = self._debug_baselines[f"{num_tokens}_hash_in_backbone"]
             _tree_hash_diff(model_hash_baseline, model_hash)
 
+        need_penalties = bool(
+            numpy.any(frequency_penalties_cpu != 0.0)
+            or numpy.any(presence_penalties_cpu != 0.0)
+            or numpy.any(repetition_penalties_cpu != 1.0)
+        )
+        sampler_active_cpu = self._sampler_active_mask_cpu[: int(sampler_padded_num_reqs)].astype(
+            numpy.bool_,
+            copy=False,
+        )
+        req_num_tokens_for_sampler = numpy.zeros((int(sampler_padded_num_reqs),), dtype=numpy.int32)
+        if int(sampler_num_reqs) > 0:
+            live_gather_positions = self._sampler_gather_positions_cpu[: int(sampler_num_reqs)]
+            req_num_tokens_for_sampler[: int(sampler_num_reqs)] = req_num_tokens_full_cpu[live_gather_positions]
+        valid_mask_cpu = (
+            sampler_active_cpu
+            & (self._sampler_scheduled_cpu[: int(sampler_padded_num_reqs)] > 0)
+            & (self._sampler_seq_lens_cpu[: int(sampler_padded_num_reqs)] >= req_num_tokens_for_sampler)
+        )
+        use_greedy_argmax_fastpath = bool(
+            not need_penalties
+            and int(sampler_padded_num_reqs) == int(padded_num_reqs)
+            and int(model_logits_padded_num_reqs) == int(padded_num_reqs)
+            and numpy.array_equal(
+                self._sampler_gather_positions_cpu[: int(sampler_padded_num_reqs)],
+                sampler_prefix,
+            )
+            and numpy.array_equal(
+                self._sampler_scatter_positions_cpu[: int(sampler_padded_num_reqs)],
+                sampler_prefix,
+            )
+            and numpy.all(
+                numpy.where(
+                    sampler_active_cpu,
+                    self._sampler_temperature_cpu[: int(sampler_padded_num_reqs)] <= 0.0,
+                    True,
+                )
+            )
+        )
         start_exec = time.time()
         if self._verbose and num_tokens > 0:
             logger.info("[esurge-prof-exec] launching model tok=%d", int(num_tokens))
@@ -1660,44 +1716,56 @@ class ExecutionManager:
             sampler_hash_baseline = self._debug_baselines[f"{num_tokens}_{sampler_padded_num_reqs}_hash_in_sampler"]
             _tree_hash_diff(sampler_hash_baseline, sampler_hash)
 
-        need_penalties = bool(
-            numpy.any(frequency_penalties_cpu != 0.0)
-            or numpy.any(presence_penalties_cpu != 0.0)
-            or numpy.any(repetition_penalties_cpu != 1.0)
-        )
         # Enqueue sampling immediately (it will run after the forward pass),
         # then synchronize on logits to measure forward time without an extra
         # host-side dispatch gap between the two computations.
-        sampler_enqueue_start = time.time()
-        sampler_out = self.sample_tokens(
-            num_tokens=num_tokens,
-            padded_num_reqs=padded_num_reqs,
-            sampler_padded_num_reqs=sampler_padded_num_reqs,
-            sampler_num_reqs=sampler_num_reqs,
-            sampler_total_tokens=sampler_total_tokens,
-            req_num_tokens_full_cpu=req_num_tokens_full_cpu,
-            logits=model_outputs.logits,
-            rng_key=self.rng_key,
-            gather_positions_cpu=self._sampler_gather_positions_cpu,
-            sampling_seeds_cpu=self._sampler_sampling_seeds_cpu,
-            scatter_positions_cpu=self._sampler_scatter_positions_cpu,
-            compact_window_row_indices_cpu=self._sampler_window_row_indices_cpu,
-            compact_scheduled_cpu=self._sampler_scheduled_cpu,
-            compact_seq_lens_cpu=self._sampler_seq_lens_cpu,
-            compact_active_mask_cpu=self._sampler_active_mask_cpu,
-            compact_temperature_cpu=self._sampler_temperature_cpu,
-            compact_top_p_cpu=self._sampler_top_p_cpu,
-            compact_top_k_cpu=self._sampler_top_k_cpu,
-            compact_min_p_cpu=self._sampler_min_p_cpu,
-            compact_frequency_penalties_cpu=self._sampler_frequency_penalties_cpu,
-            compact_presence_penalties_cpu=self._sampler_presence_penalties_cpu,
-            compact_repetition_penalties_cpu=self._sampler_repetition_penalties_cpu,
-            need_penalties=need_penalties,
-        )
-        sampler_enqueue_took = time.time() - sampler_enqueue_start
-        if self._verbose and num_tokens > 0:
-            logger.info("[esurge-prof-exec] sampler launched tok=%d", int(num_tokens))
-        rng_key_out, out_tokens_full, valid_mask_full, token_counts_out = sampler_out
+        greedy_argmax_took = 0.0
+        if use_greedy_argmax_fastpath:
+            sampler_enqueue_took = 0.0
+            greedy_argmax_start = time.time()
+            valid_mask_dev = jax.device_put(valid_mask_cpu, self._empty_sharding)
+            rng_key_out, out_tokens_full, valid_mask_full = _greedy_argmax_tokens(
+                model_outputs.logits,
+                valid_mask_dev,
+                self.rng_key,
+                jnp.asarray(sampler_total_tokens, dtype=jnp.int32),
+                padded_num_reqs=int(padded_num_reqs),
+            )
+            token_counts_out = self._sampler_token_counts
+            greedy_argmax_took = time.time() - greedy_argmax_start
+            if self._verbose and num_tokens > 0:
+                logger.info("[esurge-prof-exec] greedy argmax launched tok=%d", int(num_tokens))
+        else:
+            sampler_enqueue_start = time.time()
+            sampler_out = self.sample_tokens(
+                num_tokens=num_tokens,
+                padded_num_reqs=padded_num_reqs,
+                sampler_padded_num_reqs=sampler_padded_num_reqs,
+                sampler_num_reqs=sampler_num_reqs,
+                sampler_total_tokens=sampler_total_tokens,
+                req_num_tokens_full_cpu=req_num_tokens_full_cpu,
+                logits=model_outputs.logits,
+                rng_key=self.rng_key,
+                gather_positions_cpu=self._sampler_gather_positions_cpu,
+                sampling_seeds_cpu=self._sampler_sampling_seeds_cpu,
+                scatter_positions_cpu=self._sampler_scatter_positions_cpu,
+                compact_window_row_indices_cpu=self._sampler_window_row_indices_cpu,
+                compact_scheduled_cpu=self._sampler_scheduled_cpu,
+                compact_seq_lens_cpu=self._sampler_seq_lens_cpu,
+                compact_active_mask_cpu=self._sampler_active_mask_cpu,
+                compact_temperature_cpu=self._sampler_temperature_cpu,
+                compact_top_p_cpu=self._sampler_top_p_cpu,
+                compact_top_k_cpu=self._sampler_top_k_cpu,
+                compact_min_p_cpu=self._sampler_min_p_cpu,
+                compact_frequency_penalties_cpu=self._sampler_frequency_penalties_cpu,
+                compact_presence_penalties_cpu=self._sampler_presence_penalties_cpu,
+                compact_repetition_penalties_cpu=self._sampler_repetition_penalties_cpu,
+                need_penalties=need_penalties,
+            )
+            sampler_enqueue_took = time.time() - sampler_enqueue_start
+            if self._verbose and num_tokens > 0:
+                logger.info("[esurge-prof-exec] sampler launched tok=%d", int(num_tokens))
+            rng_key_out, out_tokens_full, valid_mask_full, token_counts_out = sampler_out
         self.rng_key = rng_key_out
         self._sampler_token_counts = token_counts_out
         logits_wait_took = 0.0
@@ -1743,6 +1811,8 @@ class ExecutionManager:
             "padded_num_reqs": int(padded_num_reqs),
             "sampler_padded_num_reqs": int(sampler_padded_num_reqs),
             "sampler_num_reqs": int(sampler_num_reqs),
+            "greedy_argmax_time": greedy_argmax_took,
+            "greedy_argmax_fastpath": int(use_greedy_argmax_fastpath),
         }
         metrics.update(self._model_executor.last_pipeline_stats())
         metrics.update(self._batch_preparer.last_prep_stats)
@@ -2748,9 +2818,21 @@ class ExecutionManager:
             overlap host work while the device executes. The caller should
             synchronize on the returned arrays when ready to use them.
         """
+        sampler_active = compact_active_mask_cpu[:sampler_padded_num_reqs].astype(numpy.bool_, copy=False)
+        use_greedy_sampler = bool(
+            not need_penalties
+            and numpy.all(
+                numpy.where(
+                    sampler_active,
+                    compact_temperature_cpu[:sampler_padded_num_reqs] <= 0.0,
+                    True,
+                )
+            )
+        )
         sampler_fn = self._sampler_executor.get_compiled(
             num_tokens=num_tokens,
             padded_num_reqs=sampler_padded_num_reqs,
+            greedy=use_greedy_sampler,
         )
         sampler_sharding = getattr(self, "_sampler_sharding", self._empty_sharding)
         if need_penalties:
@@ -3082,6 +3164,12 @@ class ExecutionManager:
         sampler_key = self._sampler_executor.cache_key(padded_num_reqs=int(sampler_padded_num_reqs))
         if not self._sampler_executor.has(sampler_key):
             missing.append(f"sampler({int(sampler_padded_num_reqs)})")
+        greedy_sampler_key = self._sampler_executor.cache_key(
+            padded_num_reqs=int(sampler_padded_num_reqs),
+            greedy=True,
+        )
+        if not self._sampler_executor.has(greedy_sampler_key):
+            missing.append(f"greedy_sampler({int(sampler_padded_num_reqs)})")
         if missing:
             raise RuntimeError(
                 "Missing precompiled eSurge bucket(s): "
@@ -3270,7 +3358,8 @@ class ExecutionManager:
     ) -> None:
         """Compile a sampler variant without requiring a matching model variant."""
         sampler_key = self._sampler_executor.cache_key(padded_num_reqs=padded_num_reqs)
-        if self._sampler_executor.has(sampler_key):
+        greedy_sampler_key = self._sampler_executor.cache_key(padded_num_reqs=padded_num_reqs, greedy=True)
+        if self._sampler_executor.has(sampler_key) and self._sampler_executor.has(greedy_sampler_key):
             return
         if inputs is None:
             _, _, _, inputs = self.get_compile_configurations(
@@ -3281,12 +3370,21 @@ class ExecutionManager:
                 padded_num_reqs,
                 metadata,
             )
-        self._sampler_executor.compile(
-            num_tokens=num_tokens,
-            padded_num_reqs=padded_num_reqs,
-            inputs=inputs,
-            metadata=inputs.batch_metadata,
-        )
+        if not self._sampler_executor.has(sampler_key):
+            self._sampler_executor.compile(
+                num_tokens=num_tokens,
+                padded_num_reqs=padded_num_reqs,
+                inputs=inputs,
+                metadata=inputs.batch_metadata,
+            )
+        if not self._sampler_executor.has(greedy_sampler_key):
+            self._sampler_executor.compile(
+                num_tokens=num_tokens,
+                padded_num_reqs=padded_num_reqs,
+                inputs=inputs,
+                metadata=inputs.batch_metadata,
+                greedy=True,
+            )
         if self.use_aot_forward:
             vocab_size = self.model.config.get_text_config().vocab_size
             dummy_logits = jnp.zeros(
