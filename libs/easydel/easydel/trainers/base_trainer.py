@@ -284,24 +284,72 @@ def _arrayrecord_read_rate_limit_bytes_per_second(mb_per_second: float | int | N
     return rate_mb_per_second * 1_000_000.0
 
 
-class _ArrayRecordReadRateLimit(grain.MapTransform):
-    """Meter raw ArrayRecord payload bytes before msgpack decode."""
+def _arrayrecord_avg_compressed_bytes_per_row(
+    rows: list[dict[str, tp.Any]],
+    *,
+    source_name: str | None = None,
+) -> float:
+    """Compute source-average compressed/on-disk bytes per row from manifest rows."""
+    label = f" for source {source_name!r}" if source_name else ""
+    total_bytes = 0
+    total_rows = 0
+    for row in rows:
+        try:
+            nbytes = int(row["nbytes"])
+            nrows = int(row["nrows"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"arrayrecord read-rate compressed metering requires manifest `nbytes` and `nrows`{label}; "
+                f"bad row={row!r}."
+            ) from exc
+        if nbytes <= 0 or nrows <= 0:
+            raise ValueError(
+                f"arrayrecord read-rate compressed metering requires positive manifest `nbytes` and `nrows`{label}; "
+                f"got nbytes={nbytes}, nrows={nrows}, row={row!r}."
+            )
+        total_bytes += nbytes
+        total_rows += nrows
+    if total_rows <= 0:
+        raise ValueError(f"arrayrecord read-rate compressed metering found zero manifest rows{label}.")
+    return total_bytes / total_rows
 
-    def __init__(self, bytes_per_second: float, burst_seconds: float):
+
+class _ArrayRecordReadRateLimit(grain.MapTransform):
+    """Meter ArrayRecord compressed wire bytes before msgpack decode."""
+
+    def __init__(
+        self,
+        bytes_per_second: float,
+        burst_seconds: float,
+        *,
+        compressed_bytes_per_record: float | int | None = None,
+    ):
         bytes_per_second = float(bytes_per_second)
         burst_seconds = float(burst_seconds)
         if bytes_per_second <= 0:
             raise ValueError("ArrayRecord read-rate transform requires a positive byte/sec rate.")
         if burst_seconds <= 0:
             raise ValueError("ArrayRecord read-rate transform requires a positive burst window (seconds).")
+        if compressed_bytes_per_record is not None:
+            compressed_bytes_per_record = float(compressed_bytes_per_record)
+            if compressed_bytes_per_record <= 0 or not np.isfinite(compressed_bytes_per_record):
+                raise ValueError(
+                    "ArrayRecord read-rate transform requires a positive finite compressed byte weight "
+                    f"when provided; got {compressed_bytes_per_record!r}."
+                )
+            compressed_bytes_per_record = int(np.ceil(compressed_bytes_per_record))
         self._bytes_per_second = bytes_per_second
         self._burst_seconds = burst_seconds
+        self._compressed_bytes_per_record = compressed_bytes_per_record
 
     def map(self, record: bytes):
-        try:
-            num_bytes = len(record)
-        except TypeError as exc:
-            raise TypeError("ArrayRecord read-rate limiter expected a bytes-like record with len().") from exc
+        if self._compressed_bytes_per_record is None:
+            try:
+                num_bytes = len(record)
+            except TypeError as exc:
+                raise TypeError("ArrayRecord read-rate limiter expected a bytes-like record with len().") from exc
+        else:
+            num_bytes = self._compressed_bytes_per_record
         _get_arrayrecord_read_rate_limiter(self._bytes_per_second, self._burst_seconds).acquire(num_bytes)
         return record
 
@@ -5542,7 +5590,7 @@ class BaseTrainer(BaseTrainerProtocol):
             take: int
             examples_in_shard: int
 
-        def _file_instructions(spec):
+        def _file_instructions(spec, *, source_name: str):
             """array_record FileInstructions for one set, from its _MANIFEST.tsv. Fail-loud: a missing or
             malformed manifest raises (never silently falls back to the footer-count burst)."""
             globs = [spec] if isinstance(spec, str) else list(spec)
@@ -5560,6 +5608,7 @@ class BaseTrainer(BaseTrainerProtocol):
                     f"(required to skip the footer-count burst): {exc}"
                 ) from exc
             instructions = []
+            manifest_rows = []
             for line in raw.splitlines():
                 line = line.strip()
                 if not line:
@@ -5569,14 +5618,27 @@ class BaseTrainer(BaseTrainerProtocol):
                 if len(parts) != 3 or not parts[0].endswith(".array_record"):
                     continue
                 relpath, _nbytes, nrows = parts
-                n = int(nrows)  # fail-loud on a malformed shard-row count (the manifest is machine-written)
+                try:
+                    nbytes = int(_nbytes)
+                    n = int(nrows)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"arrayrecord FileInstruction build: invalid byte/row counts in {manifest}: {line!r} "
+                        "(expected positive integers)."
+                    ) from exc
+                if nbytes <= 0 or n <= 0:
+                    raise ValueError(
+                        f"arrayrecord FileInstruction build: non-positive byte/row counts in {manifest}: {line!r} "
+                        "(expected positive integers)."
+                    )
+                manifest_rows.append({"nbytes": nbytes, "nrows": n})
                 instructions.append(_ArrayRecordFI(filename=f"{root}/{relpath}", skip=0, take=n, examples_in_shard=n))
             if not instructions:
                 raise ValueError(
                     f"arrayrecord FileInstruction build: manifest {manifest} yielded 0 valid shards "
                     "(expected `<relpath>\\t<bytes>\\t<rows>` lines)."
                 )
-            return instructions
+            return instructions, _arrayrecord_avg_compressed_bytes_per_row(manifest_rows, source_name=source_name)
 
         if self.data_collator is None:
             raise ValueError(
@@ -5626,17 +5688,26 @@ class BaseTrainer(BaseTrainerProtocol):
             for i, name in enumerate(sorted(datasets)):
                 # data_grain sets carry a _MANIFEST.tsv -> FileInstructions (skip footer burst);
                 # the generic arrayrecord_train_files path has no manifest -> expand globs as before.
-                source = grain.ArrayRecordDataSource(
-                    _file_instructions(datasets[name]) if manifest_backed else expand_data_files(datasets[name])
-                )
+                compressed_bytes_per_record = None
+                if manifest_backed:
+                    source_files, compressed_bytes_per_record = _file_instructions(datasets[name], source_name=name)
+                else:
+                    source_files = expand_data_files(datasets[name])
+                source = grain.ArrayRecordDataSource(source_files)
                 ds = grain.MapDataset.source(source)
                 if do_shuffle:
                     ds = ds.shuffle(seed=seed + i)
-                # Meter raw record bytes before msgpack decode so all Grain read threads share one
-                # per-process/host token bucket. Steady consumption is far below the default cap; this
-                # only flattens prefetch refill bursts that can exceed the project aggregate GCS quota.
+                # Meter compressed/on-disk wire bytes before msgpack decode so all Grain read threads
+                # share one per-process/host token bucket. ArrayRecord yields decompressed records here,
+                # so manifest-backed sources use source-average nbytes/nrows rather than len(record).
                 if read_rate_limit_bytes_per_second is not None:
-                    ds = ds.map(_ArrayRecordReadRateLimit(read_rate_limit_bytes_per_second, read_rate_burst_seconds))
+                    ds = ds.map(
+                        _ArrayRecordReadRateLimit(
+                            read_rate_limit_bytes_per_second,
+                            read_rate_burst_seconds,
+                            compressed_bytes_per_record=compressed_bytes_per_record,
+                        )
+                    )
                 # Decode per record, then batch WITHIN this source -> homogeneous batches. batch_fn=list
                 # yields a LIST of row dicts (uncollated); the trainer's prefetcher applies
                 # self._data_collator to it (collating here would double-collate).
