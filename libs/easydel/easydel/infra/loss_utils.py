@@ -390,6 +390,10 @@ class LossConfig:
             size. Alternative memory optimization strategy (default=None).
         compute_dtype: Data type for computation. One of "fp32" or "bf16".
             If None, uses the input dtype.
+        cross_entropy_platform: Optional ejkernel backend override for sparse
+            cross entropy. ``None`` preserves the current XLA default; set to
+            ``"pallas"`` or ``"auto"`` to opt into registered alternatives via
+            config instead of environment flags.
         mtp_only: If True, model wrappers that expose ``outputs.mtp_loss``
             can skip the ordinary task loss and train only against the MTP
             objective. This is intended for MTP-head-only fine-tunes where the
@@ -437,6 +441,7 @@ class LossConfig:
     chunk_token_size: int | None = None
     chunk_block_size: int | None = None
     compute_dtype: tp.Literal["fp32", "bf16"] | None = None
+    cross_entropy_platform: tp.Literal["auto", "xla", "pallas", "tilelang", "triton", "cuda", "cute"] | None = None
     mtp_only: bool = False
     sparse_loss: bool = False
 
@@ -1190,7 +1195,7 @@ def fixed_cross_entropy(
             mask.astype(compute_dtype),
             config,
             compute_dtype,
-            "xla",  # XLA is the bandwidth-optimal CE backend on TPU (Pallas loses; TileLang wins only on GPU)
+            config.cross_entropy_platform or "xla",
             reduction=config.reduction,
             paxis=paxis,
         )
@@ -1245,7 +1250,7 @@ def fixed_cross_entropy(
         # (chunk_token_size still sizes the distinct LM-head chunking). The kernel returns a
         # SUM-reduced loss, so divide by the normalizing factor here.
         total_loss, total_z_loss, weight_sum, accuracy = _ejkernel_cross_entropy(
-            source, target, loss_weights, config, compute_dtype, "xla", paxis=paxis
+            source, target, loss_weights, config, compute_dtype, config.cross_entropy_platform or "xla", paxis=paxis
         )
         if loss_normalizing_factor is not None:
             total_loss = total_loss / loss_normalizing_factor
@@ -1483,6 +1488,7 @@ def causal_lm_loss_chunked_lm_head(
         chunk_size=int(chunk_size),
         compute_dtype=compute_dtype,
         checkpoint=checkpoint,
+        platform=config.cross_entropy_platform,
         sparse_skip=config.sparse_loss,
     )
     total_loss = flce_out.loss

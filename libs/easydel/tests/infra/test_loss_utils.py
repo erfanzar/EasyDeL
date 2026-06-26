@@ -15,10 +15,9 @@
 import functools
 import types
 
+import easydel.infra.loss_utils as loss_utils_module
 import jax
 import jax.numpy as jnp
-
-import easydel.infra.loss_utils as loss_utils_module
 from easydel.infra.loss_utils import (
     ForCausalLMLoss,
     ForSequenceClassificationLoss,
@@ -778,3 +777,34 @@ def test_resolve_causal_lm_chunk_token_size_respects_budget():
 
     assert chunk == 256
     assert fp32_chunk == 128
+
+
+def test_chunked_lm_head_loss_threads_cross_entropy_platform(monkeypatch):
+    seen = []
+
+    def fake_fused_ce(**kwargs):
+        seen.append(kwargs.get("platform"))
+        return types.SimpleNamespace(
+            loss=jnp.array(6.0, dtype=jnp.float32),
+            z_loss=jnp.array(0.0, dtype=jnp.float32),
+            weight_sum=jnp.array(3.0, dtype=jnp.float32),
+            accuracy=jnp.array(1.0, dtype=jnp.float32),
+        )
+
+    monkeypatch.setattr(loss_utils_module, "_fused_ce", fake_fused_ce)
+    hidden = jnp.ones((1, 4, 8), dtype=jnp.float32)
+    labels = jnp.array([[1, 2, 3, 4]], dtype=jnp.int32)
+
+    def lm_head_fn(x):
+        return jnp.zeros((*x.shape[:-1], 16), dtype=x.dtype)
+
+    metrics = causal_lm_loss_chunked_lm_head(
+        hidden,
+        labels,
+        lm_head_fn,
+        vocab_size=16,
+        config=LossConfig(chunk_token_size=2, cross_entropy_platform="pallas"),
+    )
+
+    assert seen == ["pallas"]
+    assert jnp.allclose(metrics.loss, jnp.array(2.0, dtype=jnp.float32))

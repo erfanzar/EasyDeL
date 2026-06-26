@@ -168,6 +168,9 @@ class LossConfig(TypedDict, total=False):
             Controls granularity of memory-efficient computation.
         compute_dtype: Data type for loss computation. Use "fp32" for
             numerical stability or "bf16" for faster computation.
+        cross_entropy_platform: Optional ejkernel sparse cross-entropy backend
+            override. ``None`` keeps the default XLA path; set ``"pallas"`` or
+            ``"auto"`` to opt into registered alternatives through config.
         mtp_only: Train only on ``outputs.mtp_loss`` and skip the ordinary
             task loss. Intended for MTP-head-only fine-tunes.
 
@@ -210,6 +213,7 @@ class LossConfig(TypedDict, total=False):
     chunk_token_size: NotRequired[int | None]
     chunk_block_size: NotRequired[int | None]
     compute_dtype: NotRequired[Literal["fp32", "bf16"] | None]
+    cross_entropy_platform: NotRequired[Literal["auto", "xla", "pallas", "tilelang", "triton", "cuda", "cute"] | None]
     mtp_only: NotRequired[bool]
     sparse_loss: NotRequired[bool]
 

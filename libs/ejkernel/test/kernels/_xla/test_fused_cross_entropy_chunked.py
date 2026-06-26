@@ -23,11 +23,12 @@ reference, plus the public ``fused_cross_entropy`` dispatch.
 
 from __future__ import annotations
 
+import importlib
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from ejkernel.kernels._xla.fused_cross_entropy._xla_impl_chunked import (
     blockwise_cross_entropy,
     chunked_token_cross_entropy,
@@ -179,6 +180,75 @@ def test_public_dispatch_chunked_and_flce():
     out_f = fused_cross_entropy(hidden=hidden, targets=tgt, lm_head_weight=W, chunk_size=8, reduction="mean")
     assert out_f.loss.shape == ()
     assert jnp.isfinite(out_f.loss)
+
+
+def test_public_flce_threads_non_xla_platform_to_inner_ce(monkeypatch):
+    fce_mod = importlib.import_module("ejkernel.modules.operations.fused_cross_entropy")
+    B, T, H, V = 2, 12, 32, 128
+    k = jax.random.split(jax.random.PRNGKey(17), 3)
+    hidden = jax.random.normal(k[0], (B, T, H), jnp.float32) * 0.5
+    W = jax.random.normal(k[1], (H, V), jnp.float32) * 0.05
+    targets = jax.random.randint(k[2], (B, T), 0, V)
+    calls = []
+    real_get = fce_mod.kernel_registry.get
+
+    def fake_impl(
+        logits,
+        chunk_targets,
+        chunk_weights,
+        *,
+        ignore_index=-100,
+        label_smoothing=0.0,
+        z_loss=0.0,
+        soft_targets=None,
+        reduction="mean",
+        vocab_parallel_axis=None,
+        block_v=0,
+        block_m=0,
+    ):
+        del label_smoothing, z_loss, soft_targets, vocab_parallel_axis, block_v, block_m
+        assert reduction == "none"
+        lg = logits.astype(jnp.float32)
+        valid = chunk_targets != ignore_index
+        safe = jnp.where(valid, chunk_targets, 0).astype(jnp.int32)
+        w = chunk_weights.astype(jnp.float32) * valid.astype(jnp.float32)
+        lse = jax.scipy.special.logsumexp(lg, axis=-1)
+        target_logit = jnp.take_along_axis(lg, safe[..., None], axis=-1)[..., 0]
+        per_row = (lse - target_logit) * w
+        correct = (jnp.argmax(lg, axis=-1) == chunk_targets).astype(jnp.float32)
+        return per_row, correct
+
+    def fake_get(algorithm, platform=None, backend=None):
+        if algorithm == "fused_cross_entropy" and str(platform) == "pallas":
+            calls.append((platform, backend))
+            return fake_impl
+        return real_get(algorithm, platform=platform, backend=backend)
+
+    monkeypatch.setattr(fce_mod.kernel_registry, "get", fake_get)
+
+    def pallas_flce(h):
+        return fce_mod.fused_cross_entropy(
+            hidden=h,
+            targets=targets,
+            lm_head_weight=W,
+            chunk_size=4,
+            reduction="mean",
+            platform="pallas",
+        ).loss
+
+    def xla_flce(h):
+        return fce_mod.fused_cross_entropy(
+            hidden=h,
+            targets=targets,
+            lm_head_weight=W,
+            chunk_size=4,
+            reduction="mean",
+            platform="xla",
+        ).loss
+
+    assert jnp.allclose(pallas_flce(hidden), xla_flce(hidden), atol=1e-6)
+    assert jnp.allclose(jax.grad(pallas_flce)(hidden), jax.grad(xla_flce)(hidden), atol=1e-6)
+    assert calls
 
 
 def _has_remat(jaxpr_str: str) -> bool:

@@ -45,6 +45,11 @@ from jax import lax
 
 from ._xla_impl_fwd import _fused_ce_core, _fused_ce_core_tp, _label_smoothing_correction
 
+PerChunkCEFn = Callable[
+    [jnp.ndarray, jnp.ndarray, jnp.ndarray],
+    tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray | None],
+]
+
 
 def _default_token_chunk_size(seq_len: int, vocab_size: int | None, dtype_bytes: int) -> int:
     """Pick a token chunk that keeps the transient ``[chunk, V]`` logits ~<=1 GiB."""
@@ -73,6 +78,7 @@ def fused_linear_cross_entropy(
     token_chunk_size: int = 0,
     compute_dtype: jnp.dtype | None = None,
     checkpoint: bool = True,
+    per_chunk_ce_fn: PerChunkCEFn | None = None,
     vocab_parallel_axis: str | None = None,
     sparse_skip: bool = False,
     sparse_reduce_axes: tuple[str, ...] = (),
@@ -104,6 +110,10 @@ def fused_linear_cross_entropy(
             makes FLCE worthwhile. Set ``False`` to keep the per-chunk logits
             live for the backward (faster, no recompute) when the ``[chunk, V]``
             residuals comfortably fit in memory.
+        per_chunk_ce_fn: Internal operation-layer hook for dispatching each
+            projected logits chunk to a non-XLA CE backend. The callable returns
+            ``(per_row_loss, per_row_z_loss, per_row_correct)`` with
+            ``reduction="none"`` semantics. ``None`` uses the native XLA CE core.
     Returns:
         ``(total_loss, total_z_loss, weight_sum, accuracy)``. ``total_loss`` /
         ``total_z_loss`` follow ``reduction`` (the global normalizing factor is
@@ -145,7 +155,14 @@ def fused_linear_cross_entropy(
         valid = chunk_targets != ignore_index
         safe = jnp.where(valid, chunk_targets, 0).astype(jnp.int32)
         w = valid.astype(compute_dtype) if chunk_weights is None else valid.astype(compute_dtype) * chunk_weights
-        if vocab_parallel_axis is not None:
+        if per_chunk_ce_fn is not None and vocab_parallel_axis is None:
+            per_row, z_row, per_row_correct = per_chunk_ce_fn(logits, chunk_targets, w)
+            if z_row.shape == ():
+                z_row = jnp.zeros_like(per_row, dtype=per_row.dtype) + z_row.astype(per_row.dtype)
+            if per_row_correct is None:
+                per_row_correct = (jnp.argmax(logits, axis=-1) == chunk_targets).astype(compute_dtype)
+            correct = jnp.sum(per_row_correct.astype(compute_dtype) * jax.lax.stop_gradient(w))
+        elif vocab_parallel_axis is not None:
             # Vocab-parallel FLCE: each ``_project`` produced the per-shard ``[chunk, V_local]`` slice
             # (column-parallel LM head); the TP core merges the softmax normalizer + gathers the (possibly
             # cross-shard) target logit via psum, so the per-row loss is globally correct without ever

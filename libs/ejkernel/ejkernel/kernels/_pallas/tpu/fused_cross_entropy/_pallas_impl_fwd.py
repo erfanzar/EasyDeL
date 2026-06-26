@@ -81,7 +81,10 @@ def _pallas_out_shape(shape: tuple[int, ...], dtype: jnp.dtype) -> jax.ShapeDtyp
         A ``jax.ShapeDtypeStruct`` carrying ``shape``/``dtype`` plus a ``ManualAxisType`` whose
         ``varying`` set equals the current abstract mesh's manual axes.
     """
-    manual_axes = frozenset(jax.sharding.get_abstract_mesh().manual_axes)
+    abstract_mesh = jax.sharding.get_abstract_mesh()
+    axis_sizes = getattr(abstract_mesh, "axis_sizes", None) or getattr(abstract_mesh, "shape", {})
+    axis_size = getattr(axis_sizes, "get", lambda _axis, default: default)
+    manual_axes = frozenset(axis for axis in abstract_mesh.manual_axes if int(axis_size(axis, 1)) > 1)
     return jax.ShapeDtypeStruct(
         shape,
         dtype,
