@@ -5679,6 +5679,14 @@ class BaseTrainer(BaseTrainerProtocol):
             seed = self.arguments.shuffle_seed_train if is_train else 0
             do_shuffle = self.arguments.shuffle_train_dataset if is_train else False
             num_epochs = self.arguments.num_train_epochs if is_train else 1
+            if weights is not None:
+                missing = set(datasets) - set(weights)
+                extra = set(weights) - set(datasets)
+                if missing or extra:
+                    raise ValueError(
+                        "arrayrecord_mixture_weights keys must exactly match the dataset names; "
+                        f"missing weights for {sorted(missing)}, unknown weight keys {sorted(extra)}."
+                    )
 
             # Batch PER SOURCE before mixing: the VLM packed collator requires one (source x area_bucket)
             # partition per batch (collate_packed_embeds asserts it) and each data_grain source is a single
@@ -5713,7 +5721,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 # self._data_collator to it (collating here would double-collate).
                 ds = ds.map(MsgpackDecode()).batch(batch_size=batch_size, drop_remainder=True, batch_fn=list)
                 per_ds.append(ds)
-                ws.append(float(weights[name]) if (weights and name in weights) else float(len(source)))
+                ws.append(float(weights[name]) if weights else float(len(source)))
 
             is_mixture = len(per_ds) > 1
             mixed = grain.MapDataset.mix(per_ds, weights=ws) if is_mixture else per_ds[0]
