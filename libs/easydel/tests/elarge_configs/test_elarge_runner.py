@@ -166,12 +166,69 @@ class TestElargeDryRun:
             "nash_md.yaml",
             "seq_kd.yaml",
             "sparse_distillation.yaml",
+            "speculative_decoding.yaml",
         ],
     )
     def test_dry_run(self, config_name: str):
         """Validate config parsing without execution."""
         result = run_elarge_config(config_name, dry_run=True)
         assert result.returncode == 0, f"Dry-run failed for {config_name}:\n{result.stderr}"
+
+    def test_speculative_decoding_registry_resolution(self):
+        """Ensure eLarge resolves speculative decoding to the trainer config class."""
+        import easydel.trainers  # noqa: F401
+        from easydel.infra.elarge.types.training import (
+            get_training_arguments_class,
+            normalize_trainer_config,
+        )
+        from easydel.trainers import SpeculativeDecodingConfig
+
+        cfg = normalize_trainer_config({"trainer_type": "spec-decoding"})
+        assert cfg["trainer_type"] == "speculative_decoding"
+        assert cfg["metrics_to_show_in_rich_pbar"] == [
+            "loss",
+            "draft_accept_rate",
+            "tau_probabilistic",
+            "deepspec_block_ce_loss",
+            "deepspec_block_l1_loss",
+        ]
+        assert get_training_arguments_class("speculative_decoding") is SpeculativeDecodingConfig
+
+    def test_speculative_decoding_build_trainer_kwargs(self, tmp_path, monkeypatch):
+        """Ensure eLarge constructs speculative trainers with drafter/target kwargs."""
+        from easydel.infra import eLargeModel
+        from easydel.trainers import SpeculativeDecodingConfig
+
+        captured = {}
+
+        class CapturingTrainer:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        drafter_model = object()
+        target_model = object()
+        tokenizer = object()
+        elm = eLargeModel(
+            {
+                "model": {"name_or_path": "drafter"},
+                "target_model": {"name_or_path": "target"},
+                "trainer": {
+                    "trainer_type": "speculative_decoding",
+                    "save_directory": str(tmp_path / "spec"),
+                },
+            }
+        )
+        elm._model = drafter_model
+        elm._tokenizer = tokenizer
+        monkeypatch.setattr(elm, "build_target_model", lambda: target_model)
+
+        trainer = elm.build_trainer(trainer_class=CapturingTrainer)
+
+        assert isinstance(trainer, CapturingTrainer)
+        assert isinstance(captured["arguments"], SpeculativeDecodingConfig)
+        assert captured["drafter_model"] is drafter_model
+        assert captured["target_model"] is target_model
+        assert captured["processing_class"] is tokenizer
 
 
 class TestElargeTraining:

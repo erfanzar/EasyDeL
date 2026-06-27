@@ -60,6 +60,28 @@ actions:
   - train
 ```
 
+### Speculative Drafter Training
+
+For speculative decoding, `model` is the trainable drafter and `target_model`
+is the frozen verifier/target model:
+
+```yaml
+model:
+  name_or_path: path-or-id-of-drafter
+  tokenizer: path-or-id-of-target-tokenizer
+
+target_model:
+  name_or_path: path-or-id-of-target
+
+trainer:
+  trainer_type: speculative_decoding
+  target_output_hidden_states: true
+  pass_target_outputs: true
+```
+
+`model.tokenizer` drives dataset preprocessing, so set it to the target
+tokenizer if the drafter path does not carry tokenizer files.
+
 ## Available Actions
 
 | Action                | Description                        |

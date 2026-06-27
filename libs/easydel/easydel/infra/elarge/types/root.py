@@ -40,6 +40,8 @@ class eLMConfig(TypedDict, total=False):
 
     Attributes:
         model: Model identification and source configuration (required).
+        target_model: Frozen target/verifier model config for
+            speculative-decoding drafter training.
         teacher_model: Teacher model config for knowledge distillation
             workflows.
         reference_model: Reference model config for preference optimization
@@ -57,6 +59,7 @@ class eLMConfig(TypedDict, total=False):
     """
 
     model: Required[ModelCfg]
+    target_model: NotRequired[ModelCfg]
     teacher_model: NotRequired[ModelCfg]
     reference_model: NotRequired[ModelCfg]
     loader: NotRequired[LoaderCfg]

@@ -85,6 +85,10 @@ _TRAINER_TYPE_ALIASES: dict[str, str] = {
     "online-dpo": "online_dpo",
     "rlvr_trainer": "rlvr",
     "self_distillation": "sdft",
+    "spec": "speculative_decoding",
+    "spec-decoding": "speculative_decoding",
+    "spec_decoding": "speculative_decoding",
+    "speculative-decoding": "speculative_decoding",
 }
 
 
@@ -429,6 +433,11 @@ class BaseTrainerCfg(TypedDict, total=False):
             "on_policy_distillation",
             "seq_kd",
             "sparse_distillation",
+            "spec",
+            "spec-decoding",
+            "spec_decoding",
+            "speculative-decoding",
+            "speculative_decoding",
             "agentic-moshpit",
             "agentic_moshpit",
             "async_grpo",
@@ -1414,6 +1423,34 @@ class DistillationTrainerCfg(BaseTrainerCfg):
     wandb_run_group: NotRequired[str | None]
 
 
+class SpeculativeDecodingTrainerCfg(BaseTrainerCfg):
+    """Configuration for speculative-decoding drafter training.
+
+    The eLarge ``model`` section is the trainable drafter.  The frozen target
+    model can be supplied through the ``target_model`` section, or through
+    ``teacher_model`` for compatibility with other distillation-style configs.
+    Target logits always supervise the drafter; hidden states are optionally
+    passed through for EAGLE3, DSpark, and DFlash-style drafters.
+    """
+
+    temperature: NotRequired[float]
+    alpha: NotRequired[float]
+    num_draft_tokens: NotRequired[int]
+    draft_target_offset: NotRequired[int]
+    target_logits_attr: NotRequired[str]
+    draft_logits_attr: NotRequired[str | None]
+    draft_chain_method: NotRequired[str | None]
+    drafter_forward_method: NotRequired[str | None]
+    target_forward_method: NotRequired[str | None]
+    target_output_hidden_states: NotRequired[bool]
+    pass_target_outputs: NotRequired[bool]
+    target_model_revision: NotRequired[str | None]
+    disable_dropout: NotRequired[bool]
+    dataset_text_field: NotRequired[str | None]
+    assistant_only_loss: NotRequired[bool]
+    completion_only_loss: NotRequired[bool | None]
+
+
 class OnPolicyDistillationTrainerCfg(DistillationTrainerCfg):
     """Configuration for On-Policy Knowledge Distillation trainer.
 
@@ -1979,6 +2016,7 @@ class TrainerConfig(
     SFTTrainerCfg,
     RewardTrainerCfg,
     DistillationTrainerCfg,
+    SpeculativeDecodingTrainerCfg,
     OnPolicyDistillationTrainerCfg,
     SeqKDTrainerCfg,
     SparseDistillationTrainerCfg,
@@ -2365,6 +2403,32 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "alpha": 0.9,
         "cakld_gamma": None,
         "logits_chunk_size": None,
+    },
+    "speculative_decoding": {
+        "trainer_prefix": "SpeculativeDecoding",
+        "temperature": 1.0,
+        "alpha": 1.0,
+        "num_draft_tokens": 1,
+        "draft_target_offset": 0,
+        "target_logits_attr": "logits",
+        "draft_logits_attr": None,
+        "draft_chain_method": "auto",
+        "drafter_forward_method": None,
+        "target_forward_method": None,
+        "target_output_hidden_states": True,
+        "pass_target_outputs": True,
+        "target_model_revision": None,
+        "disable_dropout": True,
+        "dataset_text_field": "text",
+        "assistant_only_loss": False,
+        "completion_only_loss": None,
+        "metrics_to_show_in_rich_pbar": [
+            "loss",
+            "draft_accept_rate",
+            "tau_probabilistic",
+            "deepspec_block_ce_loss",
+            "deepspec_block_l1_loss",
+        ],
     },
     "on_policy_distillation": {
         "trainer_prefix": "OnPolicyDistillation",

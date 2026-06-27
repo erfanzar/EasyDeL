@@ -102,6 +102,27 @@ reference_model:
   name_or_path: "meta-llama/Llama-2-7b-hf"
 ```
 
+For speculative-decoding drafter training, use `target_model` for the frozen
+verifier model:
+
+```yaml
+model:
+  name_or_path: "path-or-id-of-drafter"
+  tokenizer: "path-or-id-of-target-tokenizer"
+
+target_model:
+  name_or_path: "path-or-id-of-target"
+
+trainer:
+  trainer_type: speculative_decoding
+  target_output_hidden_states: true
+  pass_target_outputs: true
+```
+
+`model.tokenizer` is used for preprocessing even when `target_model` supplies
+the frozen verifier weights, so point it at the target tokenizer when the
+drafter checkpoint does not include one.
+
 ### Loader Configuration (`loader`)
 
 ```yaml
