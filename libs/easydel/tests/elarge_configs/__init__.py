@@ -28,6 +28,7 @@ Configs:
     - on_policy_distillation.yaml: On-Policy Knowledge Distillation
     - seq_kd.yaml: Sequence-level Knowledge Distillation (SeqKD)
     - sparse_distillation.yaml: Sparse (Gray-Box) Distillation
+    - speculative_decoding.yaml: Speculative-decoding drafter training
     - sdpo.yaml: Self-Distillation Policy Optimization
 
 Usage:

@@ -93,6 +93,8 @@ if typing.TYPE_CHECKING:
     from easydel.inference.reasoning.abstract_reasoning import ReasoningParserName
     from easydel.inference.tools.abstract_tool import ToolParserName
     from easydel.trainers import LogWatcher, Trainer
+    from easydel.trainers.prm_trainer import PRMPreprocessTransform
+    from easydel.trainers.tpo_trainer import TPOPreprocessTransform
     from easydel.trainers.training_configurations import TrainingArguments
 
     from .types import TextDatasetInformCfg, VisualDatasetInformCfg
@@ -136,6 +138,9 @@ class BuildTrainerKws(typing.TypedDict, total=False):
         reward_model: Trained scalar :class:`EasyDeLBaseModule` whose forward
             produces a per-sequence reward used by PPO and GRPO-style trainers.
             Only consumed when no ``reward_funcs`` list is provided.
+        target_model: Frozen verifier :class:`EasyDeLBaseModule` used by the
+            speculative-decoding trainer to produce target logits and optional
+            hidden states for drafter supervision.
         teacher_model: :class:`EasyDeLBaseModule` whose logits drive the
             distillation losses in distillation/on-policy-distillation/SeqKD
             and sparse distillation trainers.
@@ -172,6 +177,7 @@ class BuildTrainerKws(typing.TypedDict, total=False):
     data_tokenize_fn: NotRequired[typing.Callable]
     reference_model: NotRequired[EasyDeLBaseModule | None]
     reward_model: NotRequired[EasyDeLBaseModule | None]
+    target_model: NotRequired[EasyDeLBaseModule | None]
     teacher_model: NotRequired[EasyDeLBaseModule | None]
     reward_funcs: NotRequired[Any | None]
     external_reward_funcs: NotRequired[Any | None]
@@ -447,6 +453,11 @@ class eLargeModel:
         return self._config.get("teacher_model", {}).get("name_or_path")
 
     @property
+    def target_model_name(self) -> str | None:
+        """Get the frozen target model name or path for speculative decoding."""
+        return self._config.get("target_model", {}).get("name_or_path")
+
+    @property
     def reference_model_name(self) -> str | None:
         """Get the reference model name or path for DPO/ORPO.
 
@@ -522,6 +533,18 @@ class eLargeModel:
         if "teacher_model" not in self._config:
             self._config["teacher_model"] = {}
         self._config["teacher_model"]["name_or_path"] = model_name_or_path
+        return self
+
+    def set_target_model(self, model_name_or_path: str) -> eLargeModel:
+        """Set the frozen verifier model used for speculative drafter training.
+
+        The primary ``model`` remains the trainable drafter.  The target model
+        is loaded separately and passed to ``SpeculativeDecodingTrainer`` as a
+        frozen state.
+        """
+        if "target_model" not in self._config:
+            self._config["target_model"] = {}
+        self._config["target_model"]["name_or_path"] = model_name_or_path
         return self
 
     def set_reference_model(self, model_name_or_path: str) -> eLargeModel:
@@ -1352,6 +1375,22 @@ class eLargeModel:
         teacher_config["model"] = self._config["teacher_model"]
         return build_model(teacher_config)
 
+    def build_target_model(self) -> EasyDeLBaseModule | None:
+        """Build the frozen target/verifier model for speculative decoding.
+
+        ``target_model`` is the canonical eLarge section for speculative
+        drafter training.  If it is absent, ``teacher_model`` is accepted as a
+        distillation-style fallback so existing configs can still express the
+        target model without a second auxiliary-model schema.
+        """
+        target_section = self._config.get("target_model", self._config.get("teacher_model"))
+        if target_section is None:
+            return None
+
+        target_config = dict(self._config)
+        target_config["model"] = target_section
+        return build_model(target_config)
+
     def build_reference_model(self) -> EasyDeLBaseModule | None:
         """Build the reference model for preference optimization (DPO, etc.).
 
@@ -1483,7 +1522,7 @@ class eLargeModel:
         self,
         trainer_type: str | None = None,
         formatting_func: typing.Callable | None = None,
-    ) -> "Transform | ExpandTransform":
+    ) -> "Transform | ExpandTransform | PRMPreprocessTransform | TPOPreprocessTransform":
         """Resolve the trainer-flavor-specific preprocessing transform.
 
         Mirrors the per-trainer-type tokenization that each :class:`Trainer`
@@ -1526,7 +1565,7 @@ class eLargeModel:
         tokenizer = self.build_tokenizer()
         mixture_cfg = self._config.get("mixture", {})
 
-        if trainer_type in {"sft", "gkd", "distillation", "gold"}:
+        if trainer_type in {"sft", "gkd", "distillation", "gold", "speculative_decoding"}:
             text_field = getattr(arguments, "dataset_text_field", None) or mixture_cfg.get("text_target_field", "text")
             mask_prompt = bool(getattr(arguments, "assistant_only_loss", False))
             completion_only_loss = getattr(arguments, "completion_only_loss", None)
@@ -1873,7 +1912,12 @@ class eLargeModel:
         tokenizer = self.build_tokenizer()
         transform = self._build_pre_tokenize_transform(trainer_type, formatting_func=formatting_func)
         resolved_drop_fields = drop_fields if drop_fields is not None else save_cfg.get("drop_fields")
-        if resolved_drop_fields is None and trainer_cfg.get("trainer_type") in {"sft", "gkd", "distillation"}:
+        if resolved_drop_fields is None and trainer_cfg.get("trainer_type") in {
+            "sft",
+            "gkd",
+            "distillation",
+            "speculative_decoding",
+        }:
             resolved_drop_fields = ("tools",)
         common_kwargs = {
             "output_format": resolved_format,
@@ -2135,6 +2179,8 @@ class eLargeModel:
                     for DPO/preference optimization.
                 reward_model (EasyDeLBaseModule | None): Reward model for
                     GRPO training.
+                target_model (EasyDeLBaseModule | None): Frozen verifier model
+                    for speculative-decoding drafter training.
                 teacher_model (EasyDeLBaseModule | None): Teacher model for
                     distillation training.
                 reward_funcs (Any | None): Custom reward functions for
@@ -2233,6 +2279,7 @@ class eLargeModel:
         eval_dataset: Dataset | IterableDataset | ShardedDataSource | None = None,
         reference_model: EasyDeLBaseModule | None = None,
         reward_model: EasyDeLBaseModule | None = None,
+        target_model: EasyDeLBaseModule | None = None,
         teacher_model: EasyDeLBaseModule | None = None,
         reward_funcs: Any | None = None,
         base_state_class: type[EasyDeLState] | None = None,
@@ -2253,6 +2300,8 @@ class eLargeModel:
                 reference_model configuration if present.
             reward_model: Reward model for GRPO/SDPO/PPO-style trainers.
                 If None, builds from config.
+            target_model: Frozen target/verifier model for speculative decoding.
+                If None, builds from target_model or teacher_model config.
             teacher_model: Teacher model for distillation. If None, builds from
                 teacher_model configuration if present.
             reward_funcs: Custom reward functions for GRPO/SDPO/PPO-style trainers.
@@ -2595,6 +2644,24 @@ class eLargeModel:
             trainer_kwargs["arguments"] = training_args
             trainer_kwargs["student_model"] = model
             trainer_kwargs["teacher_model"] = teacher_model
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["data_collator"] = kwargs.get("data_collator", None)
+
+        elif trainer_type == "speculative_decoding":
+            if target_model is None:
+                target_model = self.build_target_model()
+
+            if target_model is not None and base_state_class is not None:
+                target_model = target_model.to_state(base_state_class)
+
+            if target_model is None:
+                raise ValueError("speculative_decoding training requires `target_model` (config key or runtime kwarg).")
+
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["drafter_model"] = model
+            trainer_kwargs["target_model"] = target_model
             trainer_kwargs["processing_class"] = self._tokenizer
             trainer_kwargs["train_dataset"] = train_dataset
             trainer_kwargs["eval_dataset"] = eval_dataset

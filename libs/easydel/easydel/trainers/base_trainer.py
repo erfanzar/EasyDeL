@@ -6461,7 +6461,7 @@ class BaseTrainer(BaseTrainerProtocol):
             else:
                 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeRemainingColumn
 
-                from .trainer_protocol import MetricsColumn
+                from .metrics import MetricsColumn
 
                 progress = Progress(
                     SpinnerColumn(),

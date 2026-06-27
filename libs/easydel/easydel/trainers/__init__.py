@@ -91,6 +91,7 @@ from .sdft_trainer import SDFTConfig, SDFTTrainer, SelfDistillationConfig, SelfD
 from .self_distillation_policy_optimization import SDPOConfig, SDPOTrainer
 from .seq_kd_trainer import SeqKDConfig, SeqKDTrainer
 from .sparse_distillation_trainer import SparseDistillationConfig, SparseDistillationTrainer
+from .speculative_decoding_trainer import SpeculativeDecodingConfig, SpeculativeDecodingTrainer
 from .ssd_trainer import SSDConfig, SSDTrainer
 from .supervised_fine_tuning_trainer import SFTConfig, SFTTrainer
 from .tpo_trainer import TPOConfig, TPOTrainer
@@ -191,6 +192,8 @@ __all__ = (
     "SeqKDTrainer",
     "SparseDistillationConfig",
     "SparseDistillationTrainer",
+    "SpeculativeDecodingConfig",
+    "SpeculativeDecodingTrainer",
     "TPOConfig",
     "TPOTrainer",
     "Trainer",

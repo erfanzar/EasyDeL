@@ -237,6 +237,13 @@ _import_structure = {
         "DbrxForSequenceClassification",
         "DbrxModel",
     ],
+    "modules.dflash": [
+        "DFlashAttention",
+        "DFlashConfig",
+        "DFlashDecoderLayer",
+        "DFlashForwardOutput",
+        "DFlashModel",
+    ],
     "modules.deepseek_v2": [
         "DeepseekV2Config",
         "DeepseekV2ForCausalLM",
@@ -246,6 +253,20 @@ _import_structure = {
         "DeepseekV3Config",
         "DeepseekV3ForCausalLM",
         "DeepseekV3Model",
+    ],
+    "modules.dspark": [
+        "DSparkAttention",
+        "DSparkConfig",
+        "DSparkDecoderLayer",
+        "DSparkForwardOutput",
+        "DSparkModel",
+    ],
+    "modules.eagle3": [
+        "Eagle3Attention",
+        "Eagle3Config",
+        "Eagle3DecoderLayer",
+        "Eagle3ForwardOutput",
+        "Eagle3Model",
     ],
     "modules.exaone": [
         "ExaoneConfig",
@@ -760,6 +781,8 @@ _import_structure = {
         "SeqKDTrainer",
         "SparseDistillationConfig",
         "SparseDistillationTrainer",
+        "SpeculativeDecodingConfig",
+        "SpeculativeDecodingTrainer",
         "Trainer",
         "TrainingArguments",
         "TPOConfig",
@@ -878,6 +901,9 @@ if _tp.TYPE_CHECKING:
     )
     from .modules.deepseek_v2 import DeepseekV2Config, DeepseekV2ForCausalLM, DeepseekV2Model
     from .modules.deepseek_v3 import DeepseekV3Config, DeepseekV3ForCausalLM, DeepseekV3Model
+    from .modules.dflash import DFlashAttention, DFlashConfig, DFlashDecoderLayer, DFlashForwardOutput, DFlashModel
+    from .modules.dspark import DSparkAttention, DSparkConfig, DSparkDecoderLayer, DSparkForwardOutput, DSparkModel
+    from .modules.eagle3 import Eagle3Attention, Eagle3Config, Eagle3DecoderLayer, Eagle3ForwardOutput, Eagle3Model
     from .modules.exaone import ExaoneConfig, ExaoneForCausalLM, ExaoneForSequenceClassification, ExaoneModel
     from .modules.exaone4 import Exaone4Config, Exaone4ForCausalLM, Exaone4ForSequenceClassification, Exaone4Model
     from .modules.falcon import FalconConfig, FalconForCausalLM, FalconModel
@@ -1206,6 +1232,8 @@ if _tp.TYPE_CHECKING:
         SFTTrainer,
         SparseDistillationConfig,
         SparseDistillationTrainer,
+        SpeculativeDecodingConfig,
+        SpeculativeDecodingTrainer,
         SSDConfig,
         SSDTrainer,
         TPOConfig,

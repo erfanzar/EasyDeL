@@ -3977,6 +3977,8 @@ class Qwen3NextModel(EasyDeLBaseModule):
         )
         hidden_states = self.norm(hidden_states)
         hidden_states = checkpoint_name(hidden_states, "model_output")
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
 
         return MoeModelOutput(
             last_hidden_state=hidden_states,
