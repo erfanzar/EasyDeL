@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import pytest
-
 from spectrax.runtime.schedules import (
     Action,
     DualPipeV,
@@ -183,9 +182,9 @@ class TestZeroBubbleH1:
         for t, row in enumerate(g):
             for s, cell in enumerate(row):
                 if cell is not None and cell.phase == Phase.BWD_W:
-                    assert per_stage_bwd_i[(s, cell.microbatch)] < t, (
-                        f"BWD_W at (t={t}, s={s}, mb={cell.microbatch}) precedes its BWD_I"
-                    )
+                    assert (
+                        per_stage_bwd_i[(s, cell.microbatch)] < t
+                    ), f"BWD_W at (t={t}, s={s}, mb={cell.microbatch}) precedes its BWD_I"
 
     def test_peak_activations(self):
         """Peak activations equal ``n_stages`` in ZB-H1."""
@@ -245,6 +244,24 @@ class TestScheduleValidation:
             Std1F1B(microbatches=0)
         with pytest.raises(ValueError):
             ZeroBubbleH1(microbatches=0)
+
+    def test_terminal_backward_mode_validation(self):
+        """Terminal backward placement is a schedule-owned config."""
+        assert Std1F1B(microbatches=4, terminal_backward_mode="scheduled").terminal_backward_mode == "scheduled"
+        with pytest.raises(ValueError, match="terminal_backward_mode"):
+            Std1F1B(microbatches=4, terminal_backward_mode="invalid")
+
+    def test_schedule_dispatcher_validation(self):
+        """MPMD schedule dispatch policy is a schedule-owned config."""
+        assert (
+            Std1F1B(microbatches=4, schedule_dispatcher="deterministic_nonblocking").schedule_dispatcher
+            == "deterministic_nonblocking"
+        )
+        assert Std1F1B(microbatches=4, schedule_dispatcher="auto").schedule_dispatcher == "auto"
+        with pytest.raises(ValueError, match="schedule_dispatcher"):
+            Std1F1B(microbatches=4, schedule_dispatcher="threaded")
+        with pytest.raises(ValueError, match="schedule_dispatcher"):
+            Std1F1B(microbatches=4, schedule_dispatcher="invalid")
 
 
 class TestActionMetadata:

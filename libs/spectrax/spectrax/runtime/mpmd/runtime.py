@@ -159,6 +159,7 @@ from .schedule_units import (
     _build_schedule_unit_dependencies,
     _build_schedule_units_from_plan,
     _dependency_topological_schedule_units,
+    _get_schedule_direct_fused_fwd_bwd_jit,
 )
 from .stage_callables import _build_stage_callables
 from .transport.inspection import (
@@ -406,16 +407,12 @@ def _abstract_with_sharding(x: object, sharding: object) -> object:
         return jax.tree.map(lambda value: leaf(value, None), x, is_leaf=_is_leaf)
 
 
-def _abstract_signature_key(x: object) -> object:
-    """Small hashable signature for deciding whether a warm compile is stale."""
+def _shape_dtype_signature_key(x: object) -> object:
+    """Shape/dtype-only component for plan-local warm-compile signatures."""
 
     def leaf(value: object) -> object:
         if hasattr(value, "shape") and hasattr(value, "dtype"):
-            return (
-                tuple(int(dim) for dim in getattr(value, "shape", ())),
-                str(getattr(value, "dtype", None)),
-                _sharding_cache_key(getattr(value, "sharding", None)),
-            )
+            return (tuple(int(dim) for dim in getattr(value, "shape", ())), str(getattr(value, "dtype", None)))
         return type(value).__name__
 
     return jax.tree.map(leaf, x, is_leaf=_is_leaf)
@@ -772,6 +769,20 @@ def _rank_for_exact_submesh_device_set(value: object, rank_submeshes: list[objec
     return None
 
 
+def _rank_for_explicit_submesh_device_set(value: object, rank_submeshes: list[object]) -> int | None:
+    """Return the owning rank only for explicitly mesh-sharded values.
+
+    Fresh JAX arrays commonly start life on device 0 with a single-device
+    sharding.  On a one-device-per-PP-rank mesh that device set happens to
+    equal rank 0's submesh, but it is not a pipeline ownership hint.  Only
+    treat an exact device-set match as ownership when the leaf carries a
+    ``NamedSharding`` supplied by the caller or by prior MPMD placement.
+    """
+    if not isinstance(_value_sharding(value), jax.sharding.NamedSharding):
+        return None
+    return _rank_for_exact_submesh_device_set(value, rank_submeshes)
+
+
 def _collect_graphdefs_from_object(
     value: object,
     out: list[GraphDef],
@@ -875,7 +886,7 @@ def _infer_forward_virtual_mapping_from_static_placements(
             logical = resolve_stage_rank(assignment, n_logical)
             if logical is None:
                 continue
-            rank = _rank_for_exact_submesh_device_set(flat_init[flat_idx], rank_submeshes)
+            rank = _rank_for_explicit_submesh_device_set(flat_init[flat_idx], rank_submeshes)
             if rank is not None:
                 votes[logical].add(rank)
     placement_mapping: list[int | None] = [None] * n_logical
@@ -3545,6 +3556,35 @@ def _build_schedule_plan(
             vbwd_jits[stage_key] = vbwd
 
     grid = _build_schedule_grid(schedule, n)
+    terminal_backward_mode = str(getattr(schedule, "terminal_backward_mode", "eager"))
+    if terminal_backward_mode not in ("eager", "scheduled"):
+        raise ValueError(
+            "Schedule.terminal_backward_mode must be 'eager' or 'scheduled', " f"got {terminal_backward_mode!r}."
+        )
+    terminal_split_phases: set[str] = set()
+    for row in grid:
+        for rank, cell in enumerate(row):
+            if cell is None:
+                continue
+            actions = cell.split() if isinstance(cell, FusedTask) else (cell,)
+            for action in actions:
+                if (rank, action.virtual_stage) == terminal_loc and action.phase in (Phase.BWD_I, Phase.BWD_W):
+                    terminal_split_phases.add(action.phase.name)
+    if terminal_backward_mode == "scheduled" and terminal_split_phases:
+        phases = ", ".join(sorted(terminal_split_phases))
+        raise NotImplementedError(
+            "terminal_backward_mode='scheduled' currently requires a full terminal BWD schedule cell; "
+            f"the terminal stage emits split phases ({phases}). Use terminal_backward_mode='eager' "
+            "or a schedule configuration that emits full BWD at the terminal stage."
+        )
+    eager_terminal_bwd = terminal_backward_mode == "eager"
+    cache_terminal_grads = eager_terminal_bwd
+    schedule_dispatcher = str(getattr(schedule, "schedule_dispatcher", "auto"))
+    if schedule_dispatcher not in ("auto", "deterministic_nonblocking"):
+        raise ValueError(
+            "Schedule.schedule_dispatcher must be 'auto' or "
+            f"'deterministic_nonblocking', got {schedule_dispatcher!r}."
+        )
 
     return {
         "n": n,
@@ -3568,6 +3608,10 @@ def _build_schedule_plan(
         "bwd_i_jits": bwd_i_jits,
         "bwd_w_jits": bwd_w_jits,
         "terminal_jit": terminal_jit,
+        "terminal_backward_mode": terminal_backward_mode,
+        "cache_terminal_grads": cache_terminal_grads,
+        "eager_terminal_bwd": eager_terminal_bwd,
+        "schedule_dispatcher": schedule_dispatcher,
         "vbwd_jits": vbwd_jits,
         "grid": grid,
         "stage_shardings": stage_shardings,
@@ -4729,6 +4773,8 @@ def _dispatch_schedule_faithful_serial(
                     if flat_idx is None:
                         continue
                     grad = g_invars[invar_idx]
+                    if grad is None:
+                        continue
                     if microbatch_mask[flat_idx]:
                         if flat_idx not in grad_accums:
                             grad_accums[flat_idx] = [None] * m
@@ -4746,7 +4792,10 @@ def _dispatch_schedule_faithful_serial(
                     producer_loc = loc_for_logical[producer_logical]
                     for idx, mb in enumerate(mbs):
                         p_key = _runtime_key(producer_logical, mb)
-                        cot = g_invars[invar_idx][idx]
+                        grad = g_invars[invar_idx]
+                        if grad is None:
+                            continue
+                        cot = grad[idx]
                         cot = _cast_cotangent_like(cot, saved_outputs[p_key][producer_out_idx])
                         if producer_loc[0] != rank:
                             cot = _transport(
@@ -4900,8 +4949,15 @@ def _dispatch_schedule_fused_async(
     leaf_stage_owners = plan["leaf_stage_owners"]
     const_indices_per_loc = plan["const_indices_per_loc"]
     plan["n_invars_per_loc"]
-    cache_terminal_grads = False
-    eager_terminal_bwd = False
+    eager_terminal_bwd = bool(plan.get("eager_terminal_bwd", True))
+    cache_terminal_grads = bool(plan.get("cache_terminal_grads", eager_terminal_bwd))
+    terminal_backward_mode = str(plan.get("terminal_backward_mode", "eager" if eager_terminal_bwd else "scheduled"))
+    schedule_dispatcher = str(plan.get("schedule_dispatcher", "auto"))
+    if schedule_dispatcher not in ("auto", "deterministic_nonblocking"):
+        raise ValueError(
+            "Schedule.schedule_dispatcher must be 'auto' or "
+            f"'deterministic_nonblocking', got {schedule_dispatcher!r}."
+        )
     serial_region_plan = bool(plan.get("serial_region_plan", False))
 
     def _stage_key(logical: int) -> _ScheduleStageKey:
@@ -7135,11 +7191,6 @@ def _dispatch_schedule_fused_async(
                     )
                     if focused_terminal_bwd:
                         _focused_terminal_bwd_debug("run-bwd-after-terminal-call")
-                if focused_terminal_bwd:
-                    _focused_terminal_bwd_debug("run-bwd-before-terminal-ready")
-                cached_terminal_grads = jax.block_until_ready(cached_terminal_grads)
-                if focused_terminal_bwd:
-                    _focused_terminal_bwd_debug("run-bwd-after-terminal-ready")
                 g_consts, g_invars = cached_terminal_grads
                 scale = 1.0 / jnp.asarray(m, dtype=jnp.float32)
                 if focused_terminal_bwd:
@@ -7310,10 +7361,13 @@ def _dispatch_schedule_fused_async(
         _progress("run-bwd-exit", logical=logical, rank=rank, virt=virt, mb=mb, phase=phase.name)
 
     def _run_fused(fwd_logical: int, bwd_logical: int, rank: int, fused: FusedTask) -> None:
-        """Execute a paired schedule cell as scheduler-ordered FWD then BWD.
+        """Execute a paired schedule cell, using one fused JIT when valid.
 
-        The schedule still owns the row/unit ordering, but the runtime no
-        longer hides a second fused executable behind an environment flag.
+        Same-logical non-terminal FWD+BWD pairs share a const tuple and
+        compiled stage functions, so they can be launched as one jitted
+        function.  Mixed-logical cells (for example DualPipe-V virtual-stage
+        pairs) still route each half through its own logical stage because the
+        two halves may have different jaxprs, consts, and input arity.
 
         Args:
             fwd_logical: Logical stage for the forward half.
@@ -7338,33 +7392,115 @@ def _dispatch_schedule_fused_async(
             bwd_mb=bwd_mb,
             bwd_phase=bwd_action.phase.name,
         )
-        if fwd_logical != bwd_logical:
-            if _ORDERED_SCHEDULE_TRANSPORT_GATE.get() is not None:
-                _run_fwd(fwd_logical, rank, fwd_virt, fwd_action)
-                _run_bwd(bwd_logical, rank, bwd_virt, bwd_action)
-            else:
+
+        can_use_single_stage_fused_jit = (
+            fwd_logical == bwd_logical
+            and bwd_logical != terminal_logical
+            and bwd_action.phase is Phase.BWD
+            and bwd_jits.get(_stage_key(bwd_logical)) is not None
+        )
+        if not can_use_single_stage_fused_jit:
+            parallel_mixed_pair = (
+                fwd_logical != bwd_logical
+                and fused_pair_executor is not None
+                and _ORDERED_SCHEDULE_TRANSPORT_GATE.get() is None
+            )
+            if stats_collector is not None and fwd_logical != bwd_logical:
+                stats_collector.record_mixed_fused_pair(parallel=parallel_mixed_pair)
+            if parallel_mixed_pair:
                 fwd_ctx = contextvars.copy_context()
                 bwd_ctx = contextvars.copy_context()
-                if fused_pair_executor is not None:
-                    futures = (
-                        fused_pair_executor.submit(fwd_ctx.run, _run_fwd, fwd_logical, rank, fwd_virt, fwd_action),
-                        fused_pair_executor.submit(bwd_ctx.run, _run_bwd, bwd_logical, rank, bwd_virt, bwd_action),
-                    )
-                    for future in concurrent.futures.as_completed(futures):
-                        future.result()
-                else:
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as local_executor:
-                        futures = (
-                            local_executor.submit(fwd_ctx.run, _run_fwd, fwd_logical, rank, fwd_virt, fwd_action),
-                            local_executor.submit(bwd_ctx.run, _run_bwd, bwd_logical, rank, bwd_virt, bwd_action),
-                        )
-                        for future in concurrent.futures.as_completed(futures):
-                            future.result()
-        else:
+                futures = (
+                    fused_pair_executor.submit(fwd_ctx.run, _run_fwd, fwd_logical, rank, fwd_virt, fwd_action),
+                    fused_pair_executor.submit(bwd_ctx.run, _run_bwd, bwd_logical, rank, bwd_virt, bwd_action),
+                )
+                for future in concurrent.futures.as_completed(futures):
+                    future.result()
+            else:
+                _run_fwd(fwd_logical, rank, fwd_virt, fwd_action)
+                _run_bwd(bwd_logical, rank, bwd_virt, bwd_action)
+            _progress(
+                "run-fused-split-exit",
+                fwd_logical=fwd_logical,
+                bwd_logical=bwd_logical,
+                rank=rank,
+                fwd_virt=fwd_virt,
+                bwd_virt=bwd_virt,
+                fwd_mb=fwd_mb,
+                bwd_mb=bwd_mb,
+                bwd_phase=bwd_action.phase.name,
+            )
+            return
+
+        logical = fwd_logical
+        stage_key = _stage_key(logical)
+        fwd_key = _runtime_key(logical, fwd_mb)
+        bwd_key = _runtime_key(logical, bwd_mb)
+        if bwd_key not in saved_inputs or bwd_key not in saved_outputs:
             _run_fwd(fwd_logical, rank, fwd_virt, fwd_action)
             _run_bwd(bwd_logical, rank, bwd_virt, bwd_action)
+            _progress(
+                "run-fused-missing-state-split-exit",
+                fwd_logical=fwd_logical,
+                bwd_logical=bwd_logical,
+                rank=rank,
+                fwd_virt=fwd_virt,
+                bwd_virt=bwd_virt,
+                fwd_mb=fwd_mb,
+                bwd_mb=bwd_mb,
+                bwd_phase=bwd_action.phase.name,
+            )
+            return
+
+        consts = per_loc_consts[stage_key]
+        fwd_invars = _collect_fwd_invars(logical, rank, fwd_mb)
+        bwd_invars = saved_inputs[bwd_key]
+        cotangents = _materialize_cotangents(recv_cots.get(bwd_key), saved_outputs[bwd_key])
+        n_invars = int(plan["n_invars_per_loc"][stage_key])
+        fused_jit = _get_schedule_direct_fused_fwd_bwd_jit(
+            plan["cluster_jaxprs_per_loc"][stage_key],
+            n_invars,
+        )
+        with rank_submeshes[rank]:
+            fwd_out, g_consts, g_invars = _stage_call(
+                rank,
+                f"stage{logical}_fused_fwd_mb{fwd_mb}_bwd_mb{bwd_mb}",
+                fused_jit,
+                consts,
+                *fwd_invars,
+                *bwd_invars,
+                *cotangents,
+            )
+
+        with state_lock:
+            saved_inputs[fwd_key] = tuple(fwd_invars)
+            saved_outputs[fwd_key] = fwd_out
+            use_count = producer_output_use_counts.get(logical, 0)
+            if use_count > 0:
+                remaining_output_uses[fwd_key] = use_count
+            _progress(
+                "run-fused-saved-fwd",
+                logical=logical,
+                rank=rank,
+                virt=fwd_virt,
+                mb=fwd_mb,
+                saved_inputs=len(saved_inputs),
+                saved_outputs=len(saved_outputs),
+                remaining_output_uses=len(remaining_output_uses),
+            )
+        _pretransfer_fwd_outputs(logical, rank, fwd_virt, fwd_mb, fwd_out)
+        _accumulate_bwd_result(
+            loc=(rank, bwd_virt),
+            logical=logical,
+            rank=rank,
+            mb=bwd_mb,
+            phase=bwd_action.phase,
+            g_consts=g_consts,
+            g_invars=g_invars,
+        )
+        _release_consumed_backward_state(logical, bwd_mb, bwd_action.phase)
         _progress(
-            "run-fused-split-exit",
+            "run-fused-jit-exit",
             fwd_logical=fwd_logical,
             bwd_logical=bwd_logical,
             rank=rank,
@@ -8142,7 +8278,43 @@ def _dispatch_schedule_fused_async(
         scheduler starts launching real data. It never executes pair-mesh
         collectives or synthesizes payload data.
         """
-        signature = repr((m, _abstract_signature_key(tuple(flat_args_live))))
+
+        def unit_key(unit: _ScheduleUnit) -> tuple[object, ...]:
+            return (
+                unit.kind,
+                int(unit.rank),
+                int(unit.virt),
+                None if unit.fwd_logical is None else int(unit.fwd_logical),
+                None if unit.fwd_mb is None else int(unit.fwd_mb),
+                None if unit.bwd_logical is None else int(unit.bwd_logical),
+                None if unit.bwd_mb is None else int(unit.bwd_mb),
+                None if unit.bwd_phase is None else unit.bwd_phase.name,
+            )
+
+        cluster_signature = tuple(
+            (
+                tuple(int(part) for part in stage_key),
+                id(cluster_jaxpr),
+                int(plan["n_invars_per_loc"][stage_key]),
+            )
+            for stage_key, cluster_jaxpr in sorted(plan["cluster_jaxprs_per_loc"].items())
+        )
+        schedule_obj = plan["schedule"]
+        signature = repr(
+            (
+                int(n_logical),
+                len(rank_submeshes),
+                int(m),
+                type(schedule_obj).__module__,
+                type(schedule_obj).__qualname__,
+                repr(schedule_obj),
+                terminal_backward_mode,
+                schedule_dispatcher,
+                tuple(unit_key(unit) for unit in units),
+                cluster_signature,
+                _shape_dtype_signature_key(tuple(flat_args_live)),
+            )
+        )
         warm_keys = plan.setdefault("_warm_compile_signatures", set())
         if signature in warm_keys:
             return
@@ -8808,8 +8980,11 @@ def _dispatch_schedule_fused_async(
             pass
         stats = {
             "transport_mode": "auto",
+            "schedule_dispatcher": schedule_dispatcher,
             "ordered_async_dispatch": bool(use_ordered_deterministic_async or use_ordered_threaded_async),
             "deterministic_nonblocking_dispatch": bool(use_ordered_deterministic_async),
+            "terminal_backward_mode": terminal_backward_mode,
+            "eager_terminal_bwd": eager_terminal_bwd,
             "microbatches": int(m),
             "physical_stages": physical_stages,
             "logical_stages": int(n_logical),
@@ -8858,9 +9033,12 @@ def _dispatch_schedule_fused_async(
             _SCHEDULE_TRANSPORT_DIAGNOSTICS.get("ordered_dispatch_logged", 0) + 1
         )
 
-    use_threaded_async = _active_profiler() is None
-    use_ordered_threaded_async = _active_profiler() is None and ordered_collective_transport
-    use_ordered_deterministic_async = False
+    force_deterministic_nonblocking = schedule_dispatcher == "deterministic_nonblocking"
+    use_threaded_async = _active_profiler() is None and not force_deterministic_nonblocking
+    use_ordered_threaded_async = (
+        _active_profiler() is None and ordered_collective_transport and not force_deterministic_nonblocking
+    )
+    use_ordered_deterministic_async = force_deterministic_nonblocking
     action_count = sum(2 if unit.kind == "fused" else 1 for unit in units)
     fused_count = sum(1 for unit in units if unit.kind == "fused")
     stats_collector = _ScheduleStatsCollector(
@@ -8879,6 +9057,7 @@ def _dispatch_schedule_fused_async(
         window_count=None,
         fallback_reason=plan.get("last_schedule_runtime_stats", {}).get("fallback_reason"),
         terminal_logical=terminal_logical,
+        terminal_backward_mode=terminal_backward_mode,
         eager_terminal_bwd=eager_terminal_bwd,
     )
     preflight_stats = _schedule_preflight_stats(units, deps)
@@ -8919,7 +9098,12 @@ def _dispatch_schedule_fused_async(
         _SCHEDULE_TRANSPORT_DIAGNOSTICS["preflight_logged"] = (
             _SCHEDULE_TRANSPORT_DIAGNOSTICS.get("preflight_logged", 0) + 1
         )
+    phase_timings_ms: dict[str, float] = {}
+    dispatch_wall_start_ns = time.perf_counter_ns()
+    phase_start_ns = time.perf_counter_ns()
     _warm_compile_schedule(units)
+    phase_timings_ms["warm_compile_ms"] = (time.perf_counter_ns() - phase_start_ns) / 1e6
+    phase_start_ns = time.perf_counter_ns()
     if use_ordered_deterministic_async:
         _run_units_deterministic_nonblocking(
             units,
@@ -8949,9 +9133,13 @@ def _dispatch_schedule_fused_async(
     else:
         for unit in units:
             _run_unit(unit)
+    phase_timings_ms["run_units_ms"] = (time.perf_counter_ns() - phase_start_ns) / 1e6
 
     final_grads: list[object] = []
+    phase_start_ns = time.perf_counter_ns()
     _fold_stage_local_flat_grad_accums()
+    phase_timings_ms["fold_stage_local_grad_ms"] = (time.perf_counter_ns() - phase_start_ns) / 1e6
+    phase_start_ns = time.perf_counter_ns()
     terminal_const_scale = 1.0 / jnp.asarray(m, dtype=jnp.float32)
     for loc, g_consts in const_tuple_accums.items():
         for local_idx, const_idx in enumerate(const_indices_per_loc[loc]):
@@ -8968,8 +9156,13 @@ def _dispatch_schedule_fused_async(
                 continue
             grad = scaled_consts[local_idx]
             _accumulate_flat_grad_claimed(flat_idx, grad)
+    phase_timings_ms["submit_const_grads_ms"] = (time.perf_counter_ns() - phase_start_ns) / 1e6
+    phase_start_ns = time.perf_counter_ns()
     _fold_deferred_flat_grad_updates()
+    phase_timings_ms["fold_deferred_grad_ms"] = (time.perf_counter_ns() - phase_start_ns) / 1e6
+    phase_start_ns = time.perf_counter_ns()
     grad_reduce_executor.shutdown(wait=True)
+    phase_timings_ms["grad_reduce_shutdown_ms"] = (time.perf_counter_ns() - phase_start_ns) / 1e6
     _progress(
         "final-grads-enter",
         grad_accums=len(grad_accums),
@@ -8978,6 +9171,7 @@ def _dispatch_schedule_fused_async(
     )
     symbolic_zero_count = 0
     concatenated_grad_count = 0
+    phase_start_ns = time.perf_counter_ns()
     for i in range(n_flat):
         if i not in requested_grad_flat_indices:
             final_grads.append(None)
@@ -8999,14 +9193,19 @@ def _dispatch_schedule_fused_async(
         else:
             final_grads.append(None)
             symbolic_zero_count += 1
+    phase_timings_ms["final_grad_pack_ms"] = (time.perf_counter_ns() - phase_start_ns) / 1e6
 
+    phase_start_ns = time.perf_counter_ns()
     if loss_terms:
         loss_acc = loss_terms[0]
         for loss_term in loss_terms[1:]:
             loss_acc = loss_acc + loss_term
     mean_loss = loss_acc / jnp.asarray(m, dtype=loss_acc.dtype)
+    phase_timings_ms["loss_reduce_ms"] = (time.perf_counter_ns() - phase_start_ns) / 1e6
     schedule_stats = stats_collector.as_dict(deps, units)
+    schedule_stats["schedule_dispatcher"] = schedule_dispatcher
     schedule_stats["preflight"] = plan.get("last_schedule_preflight_stats")
+    schedule_stats["phase_ms"] = {key: round(value, 3) for key, value in phase_timings_ms.items()}
     plan["last_schedule_runtime_stats"] = schedule_stats
     if _SCHEDULE_TRANSPORT_DIAGNOSTICS.get("runtime_stats_logged", 0) < 8:
         try:
@@ -9019,7 +9218,7 @@ def _dispatch_schedule_fused_async(
                 "transfers=%s skipped=%s cache_hits=%s transfer_gib=%.3f total_launch_ms=%s "
                 "total_unit_ms=%s critical_path_ms=%s total_gate_wait_ms=%s gate_wait_kind_ms=%s "
                 "per_rank_gate_wait_ms=%s top_gate_wait_ms=%s transport_methods=%s boundary_shared=%s "
-                "boundary_saved=%s per_phase_ms=%s per_rank_ms=%s top_units=%s.",
+                "boundary_saved=%s per_phase_ms=%s per_rank_ms=%s phase_ms=%s top_units=%s.",
                 schedule_stats.get("dispatcher"),
                 schedule_stats.get("unit_count"),
                 schedule_stats.get("action_count"),
@@ -9040,6 +9239,7 @@ def _dispatch_schedule_fused_async(
                 schedule_stats.get("boundary_share_saved_count"),
                 schedule_stats.get("per_phase_enqueue_ms"),
                 schedule_stats.get("per_rank_enqueue_ms"),
+                schedule_stats.get("phase_ms"),
                 schedule_stats.get("top_unit_enqueue_ms"),
             )
         _SCHEDULE_TRANSPORT_DIAGNOSTICS["runtime_stats_logged"] = (
@@ -9053,7 +9253,25 @@ def _dispatch_schedule_fused_async(
     )
     try:
         _progress("drain-enter")
+        phase_start_ns = time.perf_counter_ns()
         jax.block_until_ready((mean_loss, tuple(final_grads)))
+        phase_timings_ms["drain_ms"] = (time.perf_counter_ns() - phase_start_ns) / 1e6
+        schedule_stats["phase_ms"] = {key: round(value, 3) for key, value in phase_timings_ms.items()}
+        schedule_stats["dispatch_wall_ms"] = round((time.perf_counter_ns() - dispatch_wall_start_ns) / 1e6, 3)
+        if _SCHEDULE_TRANSPORT_DIAGNOSTICS.get("finalize_stats_logged", 0) < 8:
+            try:
+                process_index = jax.process_index()
+            except Exception:
+                process_index = -1
+            if process_index == 0:
+                logger.info(
+                    "SpectraX MPMD schedule finalize stats; dispatch_wall_ms=%s phase_ms=%s.",
+                    schedule_stats.get("dispatch_wall_ms"),
+                    schedule_stats.get("phase_ms"),
+                )
+            _SCHEDULE_TRANSPORT_DIAGNOSTICS["finalize_stats_logged"] = (
+                _SCHEDULE_TRANSPORT_DIAGNOSTICS.get("finalize_stats_logged", 0) + 1
+            )
         _progress("drain-block-exit")
         if jax.process_count() > 1:
             _progress("drain-sync-enter")
@@ -10641,7 +10859,7 @@ def _infer_leaf_shardings(
                     _STATIC_ARG_PATHS.setdefault(flat_idx, f"{col}/{path}")
                     owner = graph_stage_owners.get((col, path))
                     leaf = leaves[li]
-                    exact_owner = _rank_for_exact_submesh_device_set(leaf, rank_submeshes)
+                    exact_owner = _rank_for_explicit_submesh_device_set(leaf, rank_submeshes)
                     if exact_owner is not None:
                         owner = exact_owner
                     if owner is not None:
@@ -10653,7 +10871,7 @@ def _infer_leaf_shardings(
 
         for li, leaf in enumerate(jax.tree.leaves(arg)):
             flat_idx = arg_offset + li
-            owner = _rank_for_exact_submesh_device_set(leaf, rank_submeshes)
+            owner = _rank_for_explicit_submesh_device_set(leaf, rank_submeshes)
             if owner is None or flat_idx in leaf_stage_owners:
                 continue
             leaf_stage_owners[flat_idx] = owner
@@ -10691,7 +10909,7 @@ def _infer_leaf_shardings(
                 stage_rank_resolver(assignment) if stage_rank_resolver is not None else resolve_stage_rank(assignment, n)
             )
             if flat_idx < len(flat_init):
-                exact_owner = _rank_for_exact_submesh_device_set(flat_init[flat_idx], rank_submeshes)
+                exact_owner = _rank_for_explicit_submesh_device_set(flat_init[flat_idx], rank_submeshes)
                 if exact_owner is not None:
                     owner = exact_owner
             if owner is not None:

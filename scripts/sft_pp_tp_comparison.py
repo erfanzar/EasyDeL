@@ -52,6 +52,7 @@ class _RunResult:
     compile_time: float
     peak_rss_mb: float
     error: str | None = None
+    metadata: dict[str, tp.Any] = dataclasses.field(default_factory=dict)
 
 
 class _FakeTokenizer:
@@ -106,9 +107,10 @@ def _make_dummy_3b_config(
     gradient_checkpointing: ed.EasyDeLGradientCheckPointers = ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
     lmhead_chunksize: int | None = None,
     stage_layout: str = "loop",
+    terminal_stage_layer_reserve: int = 0,
 ) -> ed.LlamaConfig:
     """Build a Llama-style config sized close to 3B params (vocab=1024)."""
-    if scheduler_kind == "kimik2":
+    if scheduler_kind in {"kimik2", "dualpipev"}:
         pipeline_stage_layout = stage_layout
         pipeline_virtual_stages = max(1, virtual_stages)
     else:
@@ -141,6 +143,7 @@ def _make_dummy_3b_config(
         pipeline_stage_regions=pipeline_stage_regions,
         pipeline_stage_layout=pipeline_stage_layout,
         pipeline_virtual_stages=pipeline_virtual_stages,
+        pipeline_terminal_stage_layer_reserve=terminal_stage_layer_reserve,
         # Mesh / sharding
         sharding_axis_dims=sharding_axis_dims,
         sharding_axis_names=_AXIS_NAMES,
@@ -171,10 +174,14 @@ def _make_small_config(
     virtual_stages: int = 1,
     attn_mechanism: str = "vanilla",
     gradient_checkpointing: ed.EasyDeLGradientCheckPointers = ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
+    lmhead_chunksize: int | None = None,
+    stage_layout: str = "loop",
+    terminal_stage_layer_reserve: int = 0,
 ) -> ed.LlamaConfig:
     """Tiny proxy config for fast smoke tests."""
-    if scheduler_kind == "kimik2":
-        pipeline_stage_layout = "loop"
+    del lmhead_chunksize
+    if scheduler_kind in {"kimik2", "dualpipev"}:
+        pipeline_stage_layout = stage_layout
         pipeline_virtual_stages = max(1, virtual_stages)
     else:
         pipeline_stage_layout = "contiguous"
@@ -205,6 +212,7 @@ def _make_small_config(
         pipeline_stage_regions=pipeline_stage_regions,
         pipeline_stage_layout=pipeline_stage_layout,
         pipeline_virtual_stages=pipeline_virtual_stages,
+        pipeline_terminal_stage_layer_reserve=terminal_stage_layer_reserve,
         sharding_axis_dims=sharding_axis_dims,
         sharding_axis_names=_AXIS_NAMES,
         partition_axis=ed.PartitionAxis(
@@ -277,10 +285,28 @@ def _run_experiment(
     lmhead_chunksize: int | None = None,
     gradient_accumulation_steps: int = 1,
     stage_layout: str = "loop",
+    terminal_stage_layer_reserve: int = 0,
 ) -> _RunResult:
     """Build model + trainer and run a short SFT loop, collecting metrics."""
     logger.info("\n=== Starting run: %s ===", name)
     logger.info("sharding_axis_dims=%s schedule=%s", sharding_axis_dims, schedule)
+    terminal_backward_mode = getattr(schedule, "terminal_backward_mode", None) if schedule is not None else None
+    schedule_dispatcher = getattr(schedule, "schedule_dispatcher", None) if schedule is not None else None
+    metadata = {
+        "scheduler_kind": scheduler_kind,
+        "terminal_backward_mode": terminal_backward_mode,
+        "schedule_dispatcher": schedule_dispatcher,
+        "microbatches": microbatches,
+        "seq_len": seq_len,
+        "total_batch_size": total_batch_size,
+        "dummy_3b": dummy_3b,
+        "dtype": str(dtype),
+        "virtual_stages": virtual_stages,
+        "attn_mechanism": attn_mechanism,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "stage_layout": stage_layout,
+        "terminal_stage_layer_reserve": terminal_stage_layer_reserve,
+    }
 
     pipeline_stage_regions = sharding_axis_dims[0] > 1
     config_factory = _make_dummy_3b_config if dummy_3b else _make_small_config
@@ -294,6 +320,7 @@ def _run_experiment(
         gradient_checkpointing=gradient_checkpointing,
         lmhead_chunksize=lmhead_chunksize,
         stage_layout=stage_layout,
+        terminal_stage_layer_reserve=terminal_stage_layer_reserve,
     )
 
     vocab_size = config.vocab_size
@@ -372,6 +399,7 @@ def _run_experiment(
             compile_time=0.0,
             peak_rss_mb=_memory_mb() - rss_before,
             error=f"{type(exc).__name__}: {exc}",
+            metadata=metadata,
         )
 
     logger.info("Captured %d training metric records.", len(_captured_records))
@@ -402,6 +430,7 @@ def _run_experiment(
         compile_time=compile_time,
         peak_rss_mb=peak_rss_mb,
         error=None,
+        metadata=metadata,
     )
 
 
@@ -470,7 +499,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--scheduler",
-        choices=["std1f1b", "kimik2"],
+        choices=["std1f1b", "kimik2", "dualpipev"],
         default="std1f1b",
         help="Pipeline scheduler to use for the PP=2/TP=2 run.",
     )
@@ -524,6 +553,24 @@ def main(argv: list[str] | None = None) -> int:
         help="Virtual stage layout for KimiK2 (loop or contiguous).",
     )
     parser.add_argument(
+        "--terminal-stage-layer-reserve",
+        type=int,
+        default=0,
+        help="Logical transformer-layer slots reserved for terminal-stage norm/head/loss.",
+    )
+    parser.add_argument(
+        "--terminal-backward-mode",
+        choices=["eager", "scheduled"],
+        default="eager",
+        help="Where the MPMD terminal loss VJP runs: eager terminal FWD or scheduled terminal BWD.",
+    )
+    parser.add_argument(
+        "--schedule-dispatcher",
+        choices=["auto", "deterministic_nonblocking"],
+        default="auto",
+        help="MPMD host enqueue policy carried by the schedule config.",
+    )
+    parser.add_argument(
         "--pp-degree",
         type=int,
         choices=[2, 4],
@@ -562,10 +609,23 @@ def main(argv: list[str] | None = None) -> int:
         pp_schedule = spx.KimiK2(
             microbatches=args.microbatches,
             virtual_stages=args.virtual_stages,
-            stage_layout="loop",
+            stage_layout=args.stage_layout,
+            terminal_backward_mode=args.terminal_backward_mode,
+            schedule_dispatcher=args.schedule_dispatcher,
+        )
+    elif args.scheduler == "dualpipev":
+        args.virtual_stages = 2
+        pp_schedule = spx.DualPipeV(
+            microbatches=args.microbatches,
+            terminal_backward_mode=args.terminal_backward_mode,
+            schedule_dispatcher=args.schedule_dispatcher,
         )
     else:
-        pp_schedule = spx.Std1F1B(microbatches=args.microbatches)
+        pp_schedule = spx.Std1F1B(
+            microbatches=args.microbatches,
+            terminal_backward_mode=args.terminal_backward_mode,
+            schedule_dispatcher=args.schedule_dispatcher,
+        )
 
     # PP + TP
     if args.pp_degree == 4:
@@ -591,6 +651,7 @@ def main(argv: list[str] | None = None) -> int:
         lmhead_chunksize=args.lmhead_chunksize,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         stage_layout=args.stage_layout,
+        terminal_stage_layer_reserve=args.terminal_stage_layer_reserve,
     )
 
     # Pure TP=4
@@ -611,6 +672,7 @@ def main(argv: list[str] | None = None) -> int:
         lmhead_chunksize=args.lmhead_chunksize,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         stage_layout=args.stage_layout,
+        terminal_stage_layer_reserve=args.terminal_stage_layer_reserve,
     )
 
     results = [pp_tp_result, tp_only_result]
@@ -629,6 +691,7 @@ def main(argv: list[str] | None = None) -> int:
                     "compile_time": r.compile_time,
                     "peak_rss_mb": r.peak_rss_mb,
                     "error": r.error,
+                    "metadata": r.metadata,
                 }
                 for r in results
             ],

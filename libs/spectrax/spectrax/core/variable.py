@@ -1349,7 +1349,7 @@ def _initialize_value(
     if existing is not None and not explicit_sharding and PIPELINE_STAGE_METADATA_KEY not in metadata:
         return arr
 
-    sharding = named_sharding_for_metadata(metadata, mesh)
+    sharding = named_sharding_for_metadata(metadata, mesh, shape=tuple(arr.shape))
     if sharding is None:
         return arr
     if existing is not None and existing == sharding:

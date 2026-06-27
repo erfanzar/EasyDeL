@@ -39,7 +39,7 @@ class _DummyRegionModule(EasyDeLBaseModule):
         return x + 1
 
 
-def _config(*, pipeline_stage_regions: bool) -> LlamaConfig:
+def _config(*, pipeline_stage_regions: bool, pipeline_terminal_stage_layer_reserve: int = 0) -> LlamaConfig:
     return LlamaConfig(
         vocab_size=8,
         hidden_size=4,
@@ -47,6 +47,7 @@ def _config(*, pipeline_stage_regions: bool) -> LlamaConfig:
         num_hidden_layers=1,
         num_attention_heads=1,
         pipeline_stage_regions=pipeline_stage_regions,
+        pipeline_terminal_stage_layer_reserve=pipeline_terminal_stage_layer_reserve,
     )
 
 
@@ -79,3 +80,16 @@ def test_pipeline_stage_count_defaults_to_one_without_pp_axis():
 
     assert EasyDeLBaseModule._pipeline_physical_stage_count(module) == 1
     assert EasyDeLBaseModule._pipeline_stage_count(module) == 1
+
+
+def test_terminal_stage_layer_reserve_biases_transformer_layers_away_from_last_stage():
+    module = _DummyRegionModule(
+        _config(pipeline_stage_regions=True, pipeline_terminal_stage_layer_reserve=2),
+        jnp.float32,
+        jnp.float32,
+        None,
+        spx.Rngs(0),
+    )
+
+    assert [module._pipeline_logical_stage(i, total_layers=4) for i in range(4)] == [0, 0, 0, 1]
+    assert module._pipeline_layer_position(3, total_layers=4) == (3, 6)

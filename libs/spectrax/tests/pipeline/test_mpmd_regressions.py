@@ -13,7 +13,6 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import pytest
-
 import spectrax as spx
 from spectrax.runtime.mpmd.compiler import compile_ranked_executables, run_ranked_pipeline
 from spectrax.runtime.mpmd.pscan_compiler import PscanPlan, _pack_grad_tree
@@ -317,7 +316,7 @@ def test_dualpipev_build_units_preserves_mixed_fused_logicals():
         and unit.payload.bwd.phase is Phase.BWD
         for unit in fused_units
     )
-    assert not any(unit.bwd_logical == 3 for unit in units)
+    assert any(unit.bwd_logical == 3 for unit in units)
 
 
 @pytest.mark.parametrize(
@@ -358,8 +357,6 @@ def test_schedule_unit_lowering_preserves_scheduler_work(schedule, n_stages):
             actions = cell.split() if isinstance(cell, FusedTask) else (() if cell is None else (cell,))
             for action in actions:
                 logical = logical_for_loc[(rank, action.virtual_stage)]
-                if logical == terminal_logical and action.phase in (Phase.BWD, Phase.BWD_I, Phase.BWD_W):
-                    continue
                 key = (logical, action.phase, action.microbatch)
                 expected[key] = expected.get(key, 0) + 1
 

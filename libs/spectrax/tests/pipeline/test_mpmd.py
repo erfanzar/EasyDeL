@@ -25,9 +25,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.sharding import Mesh, NamedSharding, PartitionSpec
-
 import spectrax as spx
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from spectrax import nn
 from spectrax.nn import PipelineSequential
 from spectrax.runtime.mpmd import collect_task_times_ms, sxcall, sxgrad, sxjit, sxstage_iter, sxvalue_and_grad
@@ -323,9 +322,9 @@ def test_mpmd_interleaved_virtual_stages_match_single_device(xy, mpmd_mesh):
             if c != "parameters":
                 continue
             ref_leaf = ref_full.get("parameters", prefix + path)
-            assert jnp.allclose(pipe_leaf, ref_leaf, atol=1e-3, rtol=1e-3), (
-                f"Grad mismatch at logical stage {i}, path {path!r}"
-            )
+            assert jnp.allclose(
+                pipe_leaf, ref_leaf, atol=1e-3, rtol=1e-3
+            ), f"Grad mismatch at logical stage {i}, path {path!r}"
 
 
 def test_mpmd_profiler_records_per_task_times(hom_model, xy, mpmd_mesh):
@@ -948,6 +947,44 @@ def test_mpmd_schedule_default_uses_fused_async(mpmd_mesh, pipe_args):
     assert stats["critical_path_ms"] >= 0.0
 
 
+def test_mpmd_schedule_terminal_backward_mode_scheduled_runs_bwd_slot(mpmd_mesh, pipe_args):
+    """Scheduled terminal mode moves terminal VJP work from FWD into the BWD slot."""
+    pipe_forward = _make_pipe_forward(
+        mpmd_mesh,
+        Std1F1B,
+        microbatches=4,
+        terminal_backward_mode="scheduled",
+    )
+    ref_loss, ref_grads = jax.value_and_grad(_ref_forward, argnums=(0, 1, 2, 3))(*pipe_args)
+
+    with collect_task_times_ms() as times:
+        loss, grads = sxvalue_and_grad(pipe_forward, argnums=(0, 1, 2, 3))(*pipe_args)
+        jax.block_until_ready((loss, grads))
+
+    assert jnp.allclose(loss, ref_loss, atol=1e-4, rtol=1e-4)
+    for grad, ref_grad in zip(grads, ref_grads, strict=True):
+        assert jnp.allclose(grad, ref_grad, atol=1e-4, rtol=1e-4)
+    stats = pipe_forward._mpmd_state["schedule_plan"]["last_schedule_runtime_stats"]
+    assert stats["terminal_backward_mode"] == "scheduled"
+    assert stats["eager_terminal_bwd"] is False
+    assert any("terminal_loss" in name for name in times)
+    assert any("terminal_bwd" in name for name in times)
+    assert not any("terminal_fwd" in name for name in times)
+
+
+def test_mpmd_schedule_terminal_backward_mode_scheduled_rejects_split_terminal(mpmd_mesh, pipe_args):
+    """Generic scheduled terminal VJP is invalid for terminal BWD_I/BWD_W splits."""
+    pipe_forward = _make_pipe_forward(
+        mpmd_mesh,
+        ZeroBubbleH1,
+        microbatches=4,
+        terminal_backward_mode="scheduled",
+    )
+
+    with pytest.raises(NotImplementedError, match=r"terminal_backward_mode='scheduled'.*split"):
+        sxvalue_and_grad(pipe_forward, argnums=(0, 1, 2, 3))(*pipe_args)
+
+
 @pytest.mark.parametrize(
     ("schedule_cls", "kwargs"),
     [
@@ -1035,6 +1072,10 @@ def test_mpmd_sxjit_true_dispatch_for_all_schedulers(
     for grad, ref_grad in zip(grads, ref_grads, strict=True):
         assert jnp.allclose(grad, ref_grad, atol=atol, rtol=rtol)
     _assert_true_fused_async_mpmd(pipe_forward, n_ranks=mpmd_mesh.mpmd_dim)
+    if schedule_cls is DualPipeV:
+        stats = pipe_forward._mpmd_state["schedule_plan"]["last_schedule_runtime_stats"]
+        assert stats["mixed_fused_parallel_count"] > 0
+        assert stats["mixed_fused_serial_count"] == 0
 
 
 @pytest.mark.parametrize("schedule_cls", [GPipe, Std1F1B, Eager1F1B])

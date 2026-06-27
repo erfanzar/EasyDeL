@@ -480,9 +480,9 @@ def _build_schedule_units_from_plan(plan: dict[str, object]) -> list[_ScheduleUn
     Schedules that want split backward must explicitly emit ``BWD_I`` and
     ``BWD_W`` actions. A plain ``BWD`` action is kept as one full backward
     unit; automatically splitting it here duplicates VJP work and changes the
-    scheduler's intended critical path. The terminal-rank backward action is
-    omitted when ``eager_terminal_bwd`` is set (the terminal backward is fired
-    eagerly inside the forward stub).
+    scheduler's intended critical path. Terminal backward actions are kept as
+    schedule/order markers even when the runtime has already accumulated
+    terminal gradients eagerly from the terminal forward action.
 
     Args:
         plan: Dispatch plan from :func:`_build_schedule_plan`.

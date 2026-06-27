@@ -28,6 +28,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
+from typing import Literal
 
 
 class Phase(Enum):
@@ -157,10 +158,24 @@ class Schedule(ABC):
             Python->XLA round-trips) at the cost of higher peak
             activation memory because all saved inputs/outputs must be
             retained until the final batched backward. Default ``False``.
+        terminal_backward_mode: MPMD training placement for the terminal
+            loss VJP. ``"eager"`` preserves the historic path: the terminal
+            forward computes loss + gradients and the terminal BWD schedule
+            cell becomes a marker. ``"scheduled"`` computes only the scalar
+            loss during terminal FWD and runs the terminal VJP in the
+            schedule's terminal BWD slot. Split terminal BWD phases are not
+            supported by the generic scheduled path yet.
+        schedule_dispatcher: MPMD host enqueue policy. ``"auto"`` keeps the
+            runtime-selected policy (threaded DAG dispatch when profiling and
+            transport ordering permit it), and ``"deterministic_nonblocking"``
+            uses a single host loop to enqueue a dependency-compatible order
+            without waiting for device completion between units.
     """
 
     microbatches: int
     lazy_bwd_batching: bool = False
+    terminal_backward_mode: Literal["eager", "scheduled"] = "eager"
+    schedule_dispatcher: Literal["auto", "deterministic_nonblocking"] = "auto"
 
     def __post_init__(self) -> None:
         """Validate that :attr:`microbatches` is at least 1.
@@ -174,6 +189,16 @@ class Schedule(ABC):
         """
         if self.microbatches < 1:
             raise ValueError(f"Schedule.microbatches must be >= 1, got {self.microbatches}.")
+        if self.terminal_backward_mode not in ("eager", "scheduled"):
+            raise ValueError(
+                "Schedule.terminal_backward_mode must be 'eager' or 'scheduled', "
+                f"got {self.terminal_backward_mode!r}."
+            )
+        if self.schedule_dispatcher not in ("auto", "deterministic_nonblocking"):
+            raise ValueError(
+                "Schedule.schedule_dispatcher must be 'auto' or "
+                f"'deterministic_nonblocking', got {self.schedule_dispatcher!r}."
+            )
 
     @abstractmethod
     def build(self, n_stages: int) -> list[list[Action | None]]:

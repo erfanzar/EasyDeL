@@ -112,6 +112,7 @@ class _ScheduleStatsCollector:
         window_count: int | None = None,
         fallback_reason: str | None = None,
         terminal_logical: int | None = None,
+        terminal_backward_mode: str = "eager",
         eager_terminal_bwd: bool = False,
     ) -> None:
         """Initialize an empty stats collector for one ``sxcall`` invocation.
@@ -139,6 +140,7 @@ class _ScheduleStatsCollector:
         self.window_count = window_count
         self.fallback_reason = fallback_reason
         self.terminal_logical = terminal_logical
+        self.terminal_backward_mode = terminal_backward_mode
         self.eager_terminal_bwd = bool(eager_terminal_bwd)
         self.transfer_count = 0
         self.transfer_skipped_count = 0
@@ -148,6 +150,8 @@ class _ScheduleStatsCollector:
         self.transport_methods: dict[str, int] = {}
         self.boundary_shared_count = 0
         self.boundary_share_saved_count = 0
+        self.mixed_fused_parallel_count = 0
+        self.mixed_fused_serial_count = 0
         self.per_rank_launch_count: dict[int, int] = {}
         self.per_rank_launch_enqueue_ms: dict[int, float] = {}
         self.per_rank_enqueue_ms: dict[int, float] = {}
@@ -248,6 +252,14 @@ class _ScheduleStatsCollector:
         with self.lock:
             self.boundary_shared_count += 1
             self.boundary_share_saved_count += max(0, int(saved))
+
+    def record_mixed_fused_pair(self, *, parallel: bool) -> None:
+        """Record how a mixed-logical fused schedule cell was dispatched."""
+        with self.lock:
+            if parallel:
+                self.mixed_fused_parallel_count += 1
+            else:
+                self.mixed_fused_serial_count += 1
 
     def as_dict(
         self, deps: dict[int, set[int]] | None = None, units: list[_ScheduleUnit] | None = None
@@ -407,6 +419,8 @@ class _ScheduleStatsCollector:
             "fused_count": self.fused_count,
             "window_count": self.window_count,
             "fallback_reason": self.fallback_reason,
+            "terminal_backward_mode": self.terminal_backward_mode,
+            "eager_terminal_bwd": self.eager_terminal_bwd,
             "transfer_count": self.transfer_count,
             "transfer_skipped_count": self.transfer_skipped_count,
             "transfer_cache_hit_count": self.transfer_cache_hit_count,
@@ -415,6 +429,8 @@ class _ScheduleStatsCollector:
             "transport_methods": dict(sorted(self.transport_methods.items())),
             "boundary_shared_count": self.boundary_shared_count,
             "boundary_share_saved_count": self.boundary_share_saved_count,
+            "mixed_fused_parallel_count": self.mixed_fused_parallel_count,
+            "mixed_fused_serial_count": self.mixed_fused_serial_count,
             "total_launch_enqueue_ms": round(total_launch_enqueue_ms, 3),
             "total_unit_enqueue_ms": round(total_unit_enqueue_ms, 3),
             "total_gate_wait_ms": round(total_gate_wait_ms, 3),
