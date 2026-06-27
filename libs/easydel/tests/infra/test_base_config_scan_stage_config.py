@@ -2,11 +2,10 @@ import jax
 import jax.numpy as jnp
 import pytest
 import spectrax as spx
-from jax.sharding import PartitionSpec
-from spectrax import nn
-
 from easydel.infra.base_config import EasyDeLBaseConfig
 from easydel.infra.elarge.processing import materialize_base_config
+from jax.sharding import PartitionSpec
+from spectrax import nn
 
 
 class _Block(spx.Module):
@@ -26,6 +25,17 @@ def _build_staged_layers(num_layers: int) -> nn.ModuleList:
     return layers
 
 
+def _resolved_stage_from_config(cfg: EasyDeLBaseConfig, var: spx.Variable) -> int | None:
+    assignment = var.stage_assignment
+    mpmd_mesh = cfg.mesh.mpmd_mesh if cfg.mesh.is_mpmd else None
+    if mpmd_mesh is None:
+        return None
+    resolver = cfg.runtime_sharding_resolver.stage_rank_resolver
+    if resolver is not None:
+        return resolver(assignment, mpmd_mesh.mpmd_dim)
+    return var.resolved_stage_index(cfg.mesh)
+
+
 def test_base_config_scan_layers_and_removed_fields():
     cfg = EasyDeLBaseConfig(
         scan_layers=True,
@@ -40,7 +50,9 @@ def test_base_config_scan_layers_and_removed_fields():
     assert cfg.scan_layers is True
     assert cfg.pipeline_virtual_stages == 2
     assert cfg.pipeline_stage_layout == "loop"
+    assert cfg.pipeline_terminal_stage_layer_reserve == 0
     assert cfg.to_dict()["pipeline_stage_layout"] == "loop"
+    assert cfg.to_dict()["pipeline_terminal_stage_layer_reserve"] == 0
     for key in ("hardware_abstraction", "pallas_m_block_size", "pallas_k_block_size", "pallas_n_block_size"):
         assert not hasattr(cfg, key)
         assert key not in cfg.to_dict()
@@ -109,7 +121,7 @@ def test_pipeline_stage_layout_is_explicit_not_env(monkeypatch):
     model = ed.LlamaForCausalLM(cfg, rngs=ed.Rngs(0))
 
     assignments = [
-        var.resolved_stage_index(cfg.mesh)
+        _resolved_stage_from_config(cfg, var)
         for path, var in spx.iter_variables(model.model.layers)
         if path.endswith("input_layernorm.weight")
     ]
@@ -146,9 +158,8 @@ def test_modulelist_scan_trace_path_matches_scan():
 
 
 def test_llama_empty_cache_prefill_uses_real_scan_when_enabled(monkeypatch):
-    from spectrax.core.containers import ModuleList, StackedModuleList
-
     import easydel as ed
+    from spectrax.core.containers import ModuleList, StackedModuleList
 
     calls = []
     original_module_scan = ModuleList.scan
@@ -185,9 +196,8 @@ def test_llama_pp_mesh_forces_trace_path_for_stage_markers(monkeypatch):
         pytest.skip("requires at least two devices for a pp>1 mesh")
 
     del monkeypatch
-    from spectrax.core.containers import ModuleList
-
     import easydel as ed
+    from spectrax.core.containers import ModuleList
 
     cfg = ed.LlamaConfig(
         vocab_size=64,
@@ -216,4 +226,4 @@ def test_llama_pp_mesh_forces_trace_path_for_stage_markers(monkeypatch):
     assert model.model._layer_scan_trace(False) is True
     markers = [eqn for eqn in jaxpr.jaxpr.eqns if eqn.primitive.name == "sxstage_iter"]
     assert markers
-    assert markers[0].params["sharding"] == PartitionSpec(None, "sp", "tp")
+    assert markers[0].params["sharding"] == PartitionSpec(("fsdp", "dp"), "sp", "tp")

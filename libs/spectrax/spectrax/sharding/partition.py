@@ -54,7 +54,7 @@ from typing import TYPE_CHECKING, cast
 
 import jax
 import numpy as np
-from jax.sharding import NamedSharding, PartitionSpec
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from ..common_types import MODE_TRAIN, NOT_GIVEN
 from ..core._typing import Array, ArrayLike, Initializer
@@ -1612,7 +1612,93 @@ def _axis_rules_for_mesh(base_mesh: "Mesh", mpmd_mesh: "MpMdMesh | None") -> dic
     return rules
 
 
-def named_sharding_for_metadata(metadata: dict[str, object], mesh: "Mesh | SpxMesh | MpMdMesh") -> NamedSharding | None:
+def _named_sharding_with_shape_sanitized(sharding: NamedSharding, shape: tuple[int, ...] | None) -> NamedSharding:
+    """Return ``sharding`` with a shape-divisible spec when ``shape`` is known."""
+    if shape is None:
+        return sharding
+    try:
+        sharding.shard_shape(shape)
+        return sharding
+    except Exception:
+        pass
+
+    narrowed = _narrow_named_sharding_mesh_for_shape(sharding, shape)
+    if narrowed is not None:
+        return narrowed
+
+    spec = sanitize_partition_spec_for_mesh_and_shape(sharding.spec, mesh=sharding.mesh, shape=shape)
+    named = NamedSharding(sharding.mesh, spec)
+    memory_kind = getattr(sharding, "memory_kind", None)
+    if memory_kind is not None and hasattr(named, "with_memory_kind"):
+        return named.with_memory_kind(memory_kind)
+    return named
+
+
+def _largest_positive_divisor_at_most(value: int, limit: int) -> int:
+    """Return the largest positive divisor of ``value`` no larger than ``limit``."""
+    for candidate in range(min(value, limit), 0, -1):
+        if value % candidate == 0:
+            return candidate
+    return 1
+
+
+def _narrow_named_sharding_mesh_for_shape(
+    sharding: NamedSharding,
+    shape: tuple[int, ...],
+) -> NamedSharding | None:
+    """Try to preserve a spec by narrowing oversized mesh axes to a device subset."""
+    mesh = sharding.mesh
+    axis_names = tuple(getattr(mesh, "axis_names", ()) or ())
+    if not axis_names or len(sharding.spec) > len(shape):
+        return None
+
+    axis_sizes = {axis: int(mesh.shape[axis]) for axis in axis_names}
+    new_axis_sizes = dict(axis_sizes)
+    spec_parts = list(tuple(sharding.spec))
+    changed = False
+
+    for dim, axis_part in enumerate(spec_parts):
+        product = _axis_partition_product(axis_part, mesh)
+        if product <= 1 or int(shape[dim]) % product == 0:
+            continue
+        axes = (axis_part,) if isinstance(axis_part, str) else tuple(axis_part) if isinstance(axis_part, tuple) else ()
+        if len(axes) != 1:
+            return None
+        axis = axes[0]
+        if axis not in new_axis_sizes:
+            return None
+        narrowed_size = _largest_positive_divisor_at_most(int(shape[dim]), new_axis_sizes[axis])
+        if narrowed_size <= 1:
+            return None
+        new_axis_sizes[axis] = narrowed_size
+        changed = True
+
+    if not changed:
+        return None
+
+    device_grid = np.asarray(mesh.devices)
+    slices = tuple(slice(0, new_axis_sizes[axis]) for axis in axis_names)
+    try:
+        narrowed_mesh = Mesh(device_grid[slices], axis_names, axis_types=getattr(mesh, "axis_types", None))
+    except Exception:
+        return None
+    narrowed = NamedSharding(narrowed_mesh, sharding.spec)
+    memory_kind = getattr(sharding, "memory_kind", None)
+    if memory_kind is not None and hasattr(narrowed, "with_memory_kind"):
+        narrowed = narrowed.with_memory_kind(memory_kind)
+    try:
+        narrowed.shard_shape(shape)
+    except Exception:
+        return None
+    return narrowed
+
+
+def named_sharding_for_metadata(
+    metadata: dict[str, object],
+    mesh: "Mesh | SpxMesh | MpMdMesh",
+    *,
+    shape: tuple[int, ...] | None = None,
+) -> NamedSharding | None:
     """Resolve raw variable-style ``metadata`` to a :class:`NamedSharding`.
 
     Reads a ``Variable``-style metadata dict (the kind returned from
@@ -1636,6 +1722,8 @@ def named_sharding_for_metadata(metadata: dict[str, object], mesh: "Mesh | SpxMe
     Args:
         metadata: A variable's metadata dict (or equivalent).
         mesh: The mesh to bind against (any SpectraX or JAX flavor).
+        shape: Optional value shape used to drop partition axes that do
+            not evenly divide the value.
 
     Returns:
         A :class:`NamedSharding` or ``None`` if the metadata declares
@@ -1653,8 +1741,8 @@ def named_sharding_for_metadata(metadata: dict[str, object], mesh: "Mesh | SpxMe
     if mpmd_mesh is not None:
         owner = resolve_stage_rank(metadata_stage_assignment(metadata), mpmd_mesh.mpmd_dim)
         if owner is not None:
-            return mpmd_mesh.sub_sharding(owner, spec)
-    return NamedSharding(base_mesh, spec)
+            return _named_sharding_with_shape_sanitized(mpmd_mesh.sub_sharding(owner, spec), shape)
+    return _named_sharding_with_shape_sanitized(NamedSharding(base_mesh, spec), shape)
 
 
 def named_sharding_for_variable(var: Variable, mesh: "Mesh | SpxMesh | MpMdMesh") -> NamedSharding:
@@ -1672,12 +1760,13 @@ def named_sharding_for_variable(var: Variable, mesh: "Mesh | SpxMesh | MpMdMesh"
     Returns:
         Result described by this helper.
     """
-    resolved = named_sharding_for_metadata(var.metadata, mesh)
+    value = var._raw_get() if hasattr(var, "_raw_get") else var.value
+    shape = tuple(getattr(value, "shape", ())) if hasattr(value, "shape") else None
+    resolved = named_sharding_for_metadata(var.metadata, mesh, shape=shape)
     if resolved is not None:
         return resolved
 
     base_mesh, _ = _resolve_named_sharding_mesh(mesh)
-    value = var._raw_get() if hasattr(var, "_raw_get") else var.value
     existing = getattr(value, "sharding", None)
     if isinstance(existing, NamedSharding) and hasattr(value, "shape"):
         spec = sanitize_partition_spec_for_mesh_and_shape(

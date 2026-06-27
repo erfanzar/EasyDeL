@@ -470,6 +470,24 @@ class EasyDeLLayerStackMixin:
         """
         return spx.sxstage_region(self._pipeline_stage_region_name())
 
+    def _pipeline_effective_layer_total(self: Self, total_layers: int) -> int:
+        """Return the logical PP denominator used for layer assignment.
+
+        ``pipeline_terminal_stage_layer_reserve`` reserves virtual layer slots
+        at the end of the stack for terminal work that is not represented by a
+        decoder block (final norm, LM head, and loss). The reserve is clamped
+        so the final real transformer layer still maps to the terminal stage.
+        """
+        total = max(1, int(total_layers))
+        logical_pp = self._pipeline_stage_count()
+        if logical_pp <= 1 or total <= 1:
+            return total
+        reserve = max(0, int(getattr(self.config, "pipeline_terminal_stage_layer_reserve", 0) or 0))
+        if reserve <= 0:
+            return total
+        max_effective_total = ((total - 1) * logical_pp) // max(1, logical_pp - 1)
+        return min(total + reserve, max(total, max_effective_total))
+
     def _pipeline_layer_position(self: Self, layer_idx: int, total_layers: int) -> tuple[int, int]:
         """Map a stack-local layer index into the model-wide PP layer order.
 
@@ -478,13 +496,13 @@ class EasyDeLLayerStackMixin:
             total_layers: Default total layer count for the model.
 
         Returns:
-            tuple[int, int]: ``(global_layer_index, global_total_layers)``,
+            tuple[int, int]: ``(global_layer_index, logical_total_layers)``,
             using ``pipeline_layer_offset`` / ``pipeline_layer_total`` when
-            set on the config.
+            set on the config, then applying any terminal-stage reserve.
         """
         offset = int(getattr(self.config, "pipeline_layer_offset", 0) or 0)
         total = int(getattr(self.config, "pipeline_layer_total", total_layers) or total_layers)
-        return offset + int(layer_idx), max(1, total)
+        return offset + int(layer_idx), self._pipeline_effective_layer_total(total)
 
     def _pipeline_logical_stage(self: Self, layer_idx: int, total_layers: int) -> int:
         """Resolve a stack-local layer index to a model-wide logical PP stage.
@@ -661,8 +679,8 @@ class EasyDeLLayerStackMixin:
         global_idx, global_total = self._pipeline_layer_position(idx, total)
         if pp <= 1 or global_idx + 1 >= global_total:
             return hidden_states
-        current = min(pp - 1, (global_idx * pp) // global_total)
-        nxt = min(pp - 1, ((global_idx + 1) * pp) // global_total)
+        current = self._pipeline_logical_stage(idx, total)
+        nxt = self._pipeline_logical_stage(idx + 1, total)
         if current != nxt:
             edge_sharding = self._layer_stage_boundary_sharding(hidden_states)
             return spx.sxstage_iter(hidden_states, stage=current, sharding=edge_sharding)

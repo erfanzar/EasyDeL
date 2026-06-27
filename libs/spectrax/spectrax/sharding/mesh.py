@@ -624,6 +624,35 @@ def _cached_mesh(
     )
 
 
+def _resolve_axis_dims_for_devices(axis_dims: Sequence[int], total_devices: int) -> tuple[tuple[int, ...], int]:
+    """Resolve mesh axis dimensions and the number of devices they require.
+
+    A single ``-1`` consumes all remaining visible devices, preserving the
+    traditional "use everything" meaning.  Fully explicit positive dimensions
+    may request a subset of visible devices; this is useful for tests and for
+    leaving spare devices idle without changing global JAX flags.
+    """
+    dims = [int(dim) for dim in axis_dims]
+    minus = [i for i, dim in enumerate(dims) if dim == -1]
+    if len(minus) > 1:
+        raise ValueError("Only one -1 is supported in axis_dims.")
+    known_product = 1
+    for dim in dims:
+        if dim == -1:
+            continue
+        if dim <= 0:
+            raise ValueError(f"axis_dims entries must be > 0 or -1, got {dim}.")
+        known_product *= dim
+    if minus:
+        if total_devices % known_product != 0:
+            raise ValueError(f"axis_dims product ({known_product}) does not divide device count ({total_devices}).")
+        dims[minus[0]] = total_devices // known_product
+        return tuple(dims), total_devices
+    if known_product > total_devices:
+        raise ValueError(f"axis_dims product {known_product} exceeds available device count {total_devices}.")
+    return tuple(dims), known_product
+
+
 @functools.cache
 def _cached_mesh_impl(
     axis_dims: tuple[int, ...],
@@ -662,9 +691,14 @@ def _cached_mesh_impl(
     total_devices = jax.device_count(backend)
     local_devices = jax.local_device_count(backend)
     process_count = jax.process_count()
-    global_mesh_shape = np.arange(total_devices).reshape(axis_dims).shape
+    global_mesh_shape, mesh_device_count = _resolve_axis_dims_for_devices(axis_dims, total_devices)
 
     num_slices = _get_num_slices(devices)
+    if mesh_device_count != total_devices and (num_slices > 1 or process_count > 1):
+        raise ValueError(
+            "axis_dims that use fewer than all visible devices are only supported for "
+            "single-process, single-slice meshes."
+        )
 
     def fill_minus_one(shape: tuple[int, ...], target: int) -> tuple[int, ...]:
         """Replace a single ``-1`` entry with the value needed to reach ``target`` product.
@@ -749,7 +783,7 @@ def _cached_mesh_impl(
     else:
         ndarray = create_device_mesh(
             mesh_shape=global_mesh_shape,
-            devices=devices,
+            devices=devices[:mesh_device_count],
             allow_split_physical_axes=allow_split_physical_axes,
         )
 
@@ -845,12 +879,12 @@ def create_mesh(
         process_count = jax.process_count()
         if num_slices == 1 and process_count == 1 and dcn_mesh_dims is None:
             total_devices = len(devices)
-            axis_dims = np.arange(total_devices).reshape(axis_dims).shape
+            axis_dims, mesh_device_count = _resolve_axis_dims_for_devices(axis_dims, total_devices)
             jm = jax.make_mesh(
                 axis_shapes=axis_dims,
                 axis_names=axis_names,
                 axis_types=axis_types_norm,
-                devices=devices,
+                devices=devices[:mesh_device_count],
             )
             return _wrap_spx(jm, mpmd_axis)
     jm = _cached_mesh(

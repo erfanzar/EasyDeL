@@ -482,6 +482,9 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
             physical stage (interleaved 1F1B / loop schedules).
         pipeline_stage_layout: Layout strategy for assigning layers to
             pipeline stages (``"contiguous"``, ``"interleaved"``, ``"loop"``).
+        pipeline_terminal_stage_layer_reserve: Extra logical layer slots reserved
+            for the terminal stage's non-transformer work (norm, LM head, loss)
+            when assigning transformer layers to PP stages.
         use_scan_mlp: Apply ``jax.lax.scan`` over MLP rows to save memory.
         scan_mlp_chunk_size: Chunk size used when scanning MLPs.
         sequence_axis_name: Logical mesh axis name treated as the sequence /
@@ -570,6 +573,7 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     pipeline_stage_regions: NotRequired[bool]
     pipeline_virtual_stages: NotRequired[int]
     pipeline_stage_layout: NotRequired[tp.Literal["contiguous", "interleaved", "loop"]]
+    pipeline_terminal_stage_layer_reserve: NotRequired[int]
     use_scan_mlp: NotRequired[bool]
     scan_mlp_chunk_size: NotRequired[int]
     sequence_axis_name: NotRequired[str]
@@ -1027,6 +1031,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         pipeline_stage_regions: bool = False,
         pipeline_virtual_stages: int = 1,
         pipeline_stage_layout: tp.Literal["contiguous", "interleaved", "loop"] = "loop",
+        pipeline_terminal_stage_layer_reserve: int = 0,
         use_scan_mlp: bool = False,
         scan_mlp_chunk_size: int = 1024,
         sequence_axis_name: str = "sp",
@@ -1123,6 +1128,10 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.pipeline_stage_regions = getattr(self, "pipeline_stage_regions", pipeline_stage_regions)
         self.pipeline_virtual_stages = getattr(self, "pipeline_virtual_stages", pipeline_virtual_stages)
         self.pipeline_stage_layout = getattr(self, "pipeline_stage_layout", pipeline_stage_layout)
+        self.pipeline_terminal_stage_layer_reserve = max(
+            0,
+            int(getattr(self, "pipeline_terminal_stage_layer_reserve", pipeline_terminal_stage_layer_reserve) or 0),
+        )
         if self.pipeline_stage_layout not in {"contiguous", "interleaved", "loop"}:
             raise ValueError(
                 "`pipeline_stage_layout` must be one of 'contiguous', 'interleaved', or 'loop'. "
@@ -1765,6 +1774,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             "pipeline_stage_regions",
             "pipeline_virtual_stages",
             "pipeline_stage_layout",
+            "pipeline_terminal_stage_layer_reserve",
             "use_sharding_constraint",
             "use_scan_mlp",
             "scan_mlp_chunk_size",
@@ -1824,6 +1834,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         pipeline_stage_regions: bool = NOT_GIVEN,
         pipeline_virtual_stages: int = NOT_GIVEN,
         pipeline_stage_layout: tp.Literal["contiguous", "interleaved", "loop"] = NOT_GIVEN,
+        pipeline_terminal_stage_layer_reserve: int = NOT_GIVEN,
         use_sharding_constraint: bool = NOT_GIVEN,
         use_scan_mlp: bool = NOT_GIVEN,
         scan_mlp_chunk_size: int = NOT_GIVEN,
@@ -1890,6 +1901,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             pipeline_stage_regions: Emit SpectraX ``sxstage_region`` markers around EasyDeL module calls.
             pipeline_virtual_stages: Logical virtual pipeline stages per physical pipeline rank.
             pipeline_stage_layout: Virtual-stage to physical PP-rank layout.
+            pipeline_terminal_stage_layer_reserve: Extra logical layer slots reserved for terminal-stage norm/head/loss.
             use_sharding_constraint: Insert sharding constraints (default ``False``).
             use_scan_mlp: Enable scan for MLPs (default ``False``).
             scan_mlp_chunk_size: Chunk size for scanned MLPs (default ``1024``).
@@ -1954,6 +1966,13 @@ class EasyDeLBaseConfig(PretrainedConfig):
         set_attrs_smartly(self, "pipeline_stage_regions", False, pipeline_stage_regions)
         set_attrs_smartly(self, "pipeline_virtual_stages", 1, pipeline_virtual_stages)
         set_attrs_smartly(self, "pipeline_stage_layout", "loop", pipeline_stage_layout)
+        set_attrs_smartly(
+            self,
+            "pipeline_terminal_stage_layer_reserve",
+            0,
+            pipeline_terminal_stage_layer_reserve,
+        )
+        self.pipeline_terminal_stage_layer_reserve = max(0, int(self.pipeline_terminal_stage_layer_reserve or 0))
         if self.pipeline_stage_layout not in {"contiguous", "interleaved", "loop"}:
             raise ValueError(
                 "`pipeline_stage_layout` must be one of 'contiguous', 'interleaved', or 'loop'. "
@@ -2031,6 +2050,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         "pipeline_stage_regions",
         "pipeline_virtual_stages",
         "pipeline_stage_layout",
+        "pipeline_terminal_stage_layer_reserve",
         "use_scan_mlp",
         "scan_mlp_chunk_size",
         "sequence_axis_name",
