@@ -12,6 +12,14 @@ log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 log_error()   { echo -e "${RED}[ERROR]${NC} $1"; }
 
+if [ -z "${TPU_SETUP_RUNNING_FROM_TMP:-}" ] && [ -f "$0" ]; then
+  TMP_SETUP_SCRIPT="$(mktemp /tmp/tpu_setup.XXXXXX.sh)"
+  cp "$0" "$TMP_SETUP_SCRIPT"
+  chmod +x "$TMP_SETUP_SCRIPT"
+  export TPU_SETUP_RUNNING_FROM_TMP=1
+  exec bash "$TMP_SETUP_SCRIPT" "$@"
+fi
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
 
@@ -684,18 +692,10 @@ PY
   fi
 }
 
-# Fetch the EasyDeL monorepo on EVERY TPU host, from scratch, directly from git.
-# This is intentionally self-contained: the script may be run on its own (e.g. downloaded
-# via a link) with NO local checkout, and each TPU worker is a separate host that does not
-# share a filesystem with the orchestrator. So every host clones the repo itself rather than
-# depending on any local files. The clone goes to a dedicated ${EASYDEL_SRC_DIR} so it never
-# touches a developer's working checkout that may live at ${HOME}/EasyDeL.
+# Fetch or update the EasyDeL monorepo on EVERY TPU host. The canonical path is
+# ${EASYDEL_SRC_DIR}; if it already exists as a git checkout, update it in place
+# instead of deleting it while this setup script may be running from that tree.
 clone_workspace_on_tpu() {
-  # Clone EasyDeL on each TPU host with eopod. The clone is shallow (~13MB pack,
-  # ~1s), so doing it per-host is cheap. git's progress bar is redirected to a log
-  # file, while concise per-worker status lines keep this step visibly alive.
-  # One retry covers a transient network hiccup; the final `test -f` is the
-  # success gate the hook reports on.
   local branch_q
   local repo_url_q
   local src_dir_q
@@ -703,30 +703,34 @@ clone_workspace_on_tpu() {
   printf -v repo_url_q '%q' "$EASYDEL_REPO_URL"
   printf -v src_dir_q '%q' "$EASYDEL_SRC_DIR"
 
-  log_info "Cloning EasyDeL ${EASYDEL_BRANCH} from ${EASYDEL_REPO_URL} on all TPU hosts -> ${EASYDEL_SRC_DIR} (via eopod)..."
+  log_info "Preparing EasyDeL ${EASYDEL_BRANCH} from ${EASYDEL_REPO_URL} on all TPU hosts -> ${EASYDEL_SRC_DIR} (via eopod)..."
   run_on_tpu_stream "
     branch=${branch_q}
     repo_url=${repo_url_q}
     src_dir=${src_dir_q}
     clone_log=/tmp/easydel-clone.log
     host=\$(hostname)
-    echo \"[\${host}] cloning \${repo_url}@\${branch} -> \${src_dir}\"
-    rm -rf \"\${src_dir}\"
-    if git clone --depth 1 --branch \"\${branch}\" \"\${repo_url}\" \"\${src_dir}\" >\"\${clone_log}\" 2>&1; then
-      :
-    else
-      echo \"[\${host}] first clone attempt failed; retrying once\"
-      tail -n 40 \"\${clone_log}\" || true
-      rm -rf \"\${src_dir}\"
-      sleep 3
-      if git clone --depth 1 --branch \"\${branch}\" \"\${repo_url}\" \"\${src_dir}\" >>\"\${clone_log}\" 2>&1; then
-        :
+    echo \"[\${host}] preparing \${repo_url}@\${branch} -> \${src_dir}\"
+    if [ -d \"\${src_dir}/.git\" ]; then
+      git -C \"\${src_dir}\" remote set-url origin \"\${repo_url}\" || true
+      git -C \"\${src_dir}\" fetch --depth 1 origin \"\${branch}\" >\"\${clone_log}\" 2>&1
+      current_rev=\$(git -C \"\${src_dir}\" rev-parse HEAD 2>/dev/null || true)
+      target_rev=\$(git -C \"\${src_dir}\" rev-parse FETCH_HEAD)
+      if [ \"\${current_rev}\" != \"\${target_rev}\" ]; then
+        if [ -n \"\$(git -C \"\${src_dir}\" status --porcelain)\" ]; then
+          echo \"[\${host}] \${src_dir} has local changes; refusing to switch to \${branch} automatically\"
+          echo \"[\${host}] commit/stash them yourself or rerun with EASYDEL_SRC_DIR pointing to another checkout\"
+          exit 1
+        fi
+        git -C \"\${src_dir}\" checkout -B \"\${branch}\" FETCH_HEAD >>\"\${clone_log}\" 2>&1
       else
-        status=\$?
-        echo \"[\${host}] clone failed; log tail follows\"
-        tail -n 120 \"\${clone_log}\" || true
-        exit \${status}
+        echo \"[\${host}] checkout already at requested commit\"
       fi
+    elif [ -e \"\${src_dir}\" ]; then
+      echo \"[\${host}] \${src_dir} exists but is not a git checkout\"
+      exit 1
+    else
+      git clone --depth 1 --branch \"\${branch}\" \"\${repo_url}\" \"\${src_dir}\" >\"\${clone_log}\" 2>&1
     fi
     test -f \"\${src_dir}/libs/easydel/pyproject.toml\" || {
       echo \"[\${host}] clone completed but libs/easydel/pyproject.toml is missing\"
@@ -744,31 +748,51 @@ install_workspace_on_tpu() {
   printf -v remote_python_q '%q' "$remote_python"
   printf -v src_dir_q '%q' "$EASYDEL_SRC_DIR"
 
-  log_info "Installing EasyDeL editable workspace packages from ${EASYDEL_SRC_DIR}/libs on TPU hosts..."
+  log_info "Installing EasyDeL foundation workspace from ${EASYDEL_SRC_DIR} on TPU hosts..."
   run_on_tpu_stream "
     src_dir=${src_dir_q}
     remote_python=${remote_python_q}
     host=\$(hostname)
-    test -f \"\${src_dir}/libs/eformer/pyproject.toml\" || {
-      echo \"[\${host}] missing \${src_dir}/libs/eformer/pyproject.toml\"
+    test -f \"\${src_dir}/pyproject.toml\" || {
+      echo \"[\${host}] missing \${src_dir}/pyproject.toml\"
       exit 1
     }
-    echo \"[\${host}] installing EasyDeL editable workspace packages with TPU, profile, and dev extras...\"
-    ~/.local/bin/uv pip install \
-      --python \"\${remote_python}\" \
-      --editable \"\${src_dir}/libs/eformer[dev]\" \
-      --editable \"\${src_dir}/libs/spectrax[tpu,dev]\" \
-      --editable \"\${src_dir}/libs/ejkernel[tpu,profile,dev]\" \
-      --editable \"\${src_dir}/libs/easydel[tpu,torch,lm_eval,profile]\" \
-      --editable \"\${src_dir}/libs/eray[dev]\" \
-      \"import-linter>=2.0\" \
-      ruff \
-      pytest \
-      pre-commit \
-      basedpyright \
-      --quiet
-    echo \"[\${host}] workspace install complete\"
-  " "install EasyDeL workspace packages on TPU hosts" "$EOPOD_INSTALL_TIMEOUT"
+    echo \"[\${host}] syncing full EasyDeL foundation workspace...\"
+    cd \"\${src_dir}\"
+    VIRTUAL_ENV=${REMOTE_VENV_PATH} PATH=${REMOTE_VENV_PATH}/bin:\$PATH \"\${remote_python}\" - <<'PY'
+import os
+import subprocess
+import tomllib
+
+with open('pyproject.toml', 'rb') as f:
+    data = tomllib.load(f)
+
+extras = data.get('project', {}).get('optional-dependencies', {})
+lm_extra = 'lm_eval' if 'lm_eval' in extras else 'lm-eval'
+cmd = [
+    os.path.expanduser('~/.local/bin/uv'),
+    'sync',
+    '--active',
+    '--inexact',
+    '--extra',
+    'tpu',
+    '--extra',
+    'torch',
+    '--extra',
+    lm_extra,
+    '--extra',
+    'profile',
+    '--group',
+    'dev',
+    '--quiet',
+]
+if data.get('tool', {}).get('uv', {}).get('workspace'):
+    cmd.insert(2, '--all-packages')
+print(' '.join(cmd), flush=True)
+subprocess.check_call(cmd)
+PY
+    echo \"[\${host}] foundation workspace sync complete\"
+  " "install EasyDeL foundation workspace on TPU hosts" "$EOPOD_INSTALL_TIMEOUT"
 }
 
 log_info "Installing uv on TPU hosts..."
