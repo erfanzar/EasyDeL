@@ -58,6 +58,10 @@ def _patch_hf_glm4v_moe_router_logits_output() -> None:
     module is unavailable or already up-to-date.
     """
     try:
+        from transformers.utils import is_torch_available
+
+        if not is_torch_available():
+            return
         from transformers.models.glm4v_moe import modeling_glm4v_moe as hf_glm4v_moe
     except Exception:
         return

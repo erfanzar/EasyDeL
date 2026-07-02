@@ -52,6 +52,10 @@ def _patch_hf_llama4_pooler_output() -> None:
         None: The function patches the HF class in-place.
     """
     try:
+        from transformers.utils import is_torch_available
+
+        if not is_torch_available():
+            return
         from transformers.modeling_outputs import BaseModelOutputWithPooling
         from transformers.models.llama4 import modeling_llama4 as hf_llama4
     except Exception:

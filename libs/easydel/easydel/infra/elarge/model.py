@@ -2003,6 +2003,13 @@ class eLargeModel:
         """
         mixture_cfg = self._config.get("mixture", {})
         if mixture_cfg.get("use_sharded_source", True):
+            if mixture_cfg.get("pack_tokens") or mixture_cfg.get("pack_on_the_fly"):
+                raise ValueError(
+                    "mixture sets pack_tokens/pack_on_the_fly but use_sharded_source=True (the default) routes "
+                    "through build_sharded_source(), which ignores all packing settings — the trainer would "
+                    "silently receive raw, unpacked rows. Set use_sharded_source=False in the mixture config "
+                    "to build a packed dataset, or remove the pack keys."
+                )
             return self.build_sharded_source()
         return self.build_dataset()
 
@@ -2380,7 +2387,7 @@ class eLargeModel:
             bucket_rule = BucketRule.from_dict(bucket_rule_dict)
             bucket_datasets = []
             original_mixture = self._config.get("mixture")
-            for i, mc in enumerate(bucket_mixture_cfgs or []):
+            for mc in bucket_mixture_cfgs or []:
                 self._config["mixture"] = mc
                 try:
                     bucket_datasets.append(self.get_train_source())

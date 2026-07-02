@@ -363,7 +363,8 @@ class GatedDeltaRuleOp(OperationImpl):
             **kwargs: Additional keyword arguments. Recognized keys:
 
                 - seg_ids: Optional segment ids used to pack multiple sequences
-                  per row; disables the Pallas chunked path when present.
+                  per row; routed through the segment-aware Pallas chunked path
+                  on TPU.
                 - autotune_chunk_size: Optional bool kept for API compatibility.
                   ejkernel module integration handles autotune policy internally.
                 - autotune_chunk_candidates: Optional list/tuple kept for API
@@ -371,9 +372,10 @@ class GatedDeltaRuleOp(OperationImpl):
 
                 Backend and chunk-size selection come from the
                 ``gated_delta_rule`` operation config when one is provided.
-                Without an explicit config, dense TPU training prefill uses
-                the measured Pallas chunked path; non-TPU and segmented inputs
-                use the exact XLA chunked path with an adaptive chunk size.
+                Without an explicit config, TPU training prefill (dense or
+                packed via ``seg_ids``) defaults to the segment-aware Pallas
+                chunked path with chunk_size 128; non-TPU inputs use the
+                exact XLA chunked path with an adaptive chunk size.
 
         Returns:
             GatedDeltaRuleOutput containing attention outputs and updated states.
@@ -385,11 +387,11 @@ class GatedDeltaRuleOp(OperationImpl):
         kernel_cfg = self.metadata.get_operation_config("gated_delta_rule")
         seg_ids = kwargs.get("seg_ids", None)
         if kernel_cfg is None and not is_inference:
-            if jax.default_backend() == "tpu" and seg_ids is None:
+            if jax.default_backend() == "tpu":
                 kernel_cfg = GatedDeltaRuleConfig(
                     platform="pallas",
                     backend="tpu",
-                    chunk_size=256,
+                    chunk_size=128,
                     use_chunked=True,
                     use_input_dtype_phase1_outputs=True,
                     use_input_dtype_state=recurrent_state is None,

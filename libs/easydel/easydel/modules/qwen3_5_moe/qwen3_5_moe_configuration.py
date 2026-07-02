@@ -83,6 +83,10 @@ def _patch_hf_qwen3_5_moe_load_balancing_loss() -> None:
     ``_easydel_qwen3_5_moe_lb_patch`` flag and skips if already applied.
     """
     try:
+        from transformers.utils import is_torch_available
+
+        if not is_torch_available():
+            return
         from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as hf_qwen3_5_moe
     except Exception:
         return

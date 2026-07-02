@@ -1,12 +1,16 @@
 name: Sync subtree mirrors
 
-# Pushes that touch a library under libs/ are automatically re-split and
-# pushed to that library's standalone repository, so the mirrors
-# (erfanzar/Spectrax, erfanzar/ejkernel, erfanzar/eformer, erfanzar/eray) always track the
-# monorepo. Requires the SUBTREE_SYNC_TOKEN secret: a fine-grained PAT with
-# Contents read/write on the four mirror repositories.
+# Pushes that touch a library under libs/ are automatically synced to that
+# library's standalone repository via scripts/subtree-sync.sh push, so the
+# mirrors (erfanzar/Spectrax, erfanzar/ejkernel, erfanzar/eformer,
+# erfanzar/eray) always track the monorepo. The script replays only NEW
+# commits onto the mirror's current main (message-prefixed, fast-forward) and
+# tolerates the squashed `subtree pull` commits in monorepo history that a
+# plain `git subtree split` chokes on. Requires the SUBTREE_SYNC_TOKEN
+# secret: a fine-grained PAT with Contents read/write on the four mirror
+# repositories.
 #
-# If a mirror has diverged (someone pushed to it directly), the push here
+# If a mirror has diverged (someone pushed to it directly), the sync here
 # fails loudly. Reconcile from the monorepo with:
 #   scripts/subtree-sync.sh pull <lib>
 # then push again.
@@ -19,6 +23,7 @@ on:
       - "libs/ejkernel/**"
       - "libs/eformer/**"
       - "libs/eray/**"
+  workflow_dispatch:
 
 concurrency:
   group: subtree-sync
@@ -44,17 +49,22 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # Don't persist the GITHUB_TOKEN extraheader: it applies to every
+          # github.com URL and would shadow the PAT on pushes to the mirrors.
+          persist-credentials: false
 
       - name: Configure git identity
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Split libs/${{ matrix.lib }} subtree
-        run: git subtree split --prefix="libs/${{ matrix.lib }}" -b subtree-split
-
-      - name: Push to ${{ matrix.repo }}
+      - name: Sync libs/${{ matrix.lib }} -> ${{ matrix.repo }}
+        env:
+          SUBTREE_SYNC_TOKEN: ${{ secrets.SUBTREE_SYNC_TOKEN }}
         run: |
-          git push \
-            "https://x-access-token:${{ secrets.SUBTREE_SYNC_TOKEN }}@github.com/${{ matrix.repo }}.git" \
-            subtree-split:main
+          if [ -z "$SUBTREE_SYNC_TOKEN" ]; then
+            echo "::error::SUBTREE_SYNC_TOKEN secret is not set. Create a fine-grained PAT with Contents read/write on the mirror repositories and add it as a repo secret."
+            exit 1
+          fi
+          git config --global url."https://x-access-token:${SUBTREE_SYNC_TOKEN}@github.com/".insteadOf "https://github.com/"
+          scripts/subtree-sync.sh push "${{ matrix.lib }}"

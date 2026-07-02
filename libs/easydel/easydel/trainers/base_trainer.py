@@ -91,11 +91,12 @@ from easydel.utils.traversals import specs_to_name_sharding
 
 from . import fused_optimizers as _fused_optimizers  # noqa: F401  registers fused_adamw/fused_lion/fused_rmsprop
 from .buckets import (
-	BucketRule,
-	ModBucketRule,
-	StepThresholdRule,
-	TrainingBucket,
-	resolve_bucket_config,
+    BucketRule,
+    CycleBucketRule,
+    ModBucketRule,
+    StepThresholdRule,
+    TrainingBucket,
+    resolve_bucket_config,
 )
 from .metrics import BaseProgressBar, JSONProgressBar, NullProgressBar, RichProgressBar, TqdmProgressBar
 from .trainer_protocol import (
@@ -4951,6 +4952,8 @@ class BaseTrainer(BaseTrainerProtocol):
             probe_steps.update(t + 1 for t in rule.thresholds)
         elif isinstance(rule, ModBucketRule):
             probe_steps.update(range(rule.mod))
+        elif isinstance(rule, CycleBucketRule):
+            probe_steps.update(range(rule.period * rule.num_buckets))
         probe_steps.add(max(probe_steps) + 1)  # one step past the last probed
         probe_steps.add(10**9)  # a definitely-"high" step for StepThresholdRule
         for probe_step in sorted(probe_steps):
@@ -5069,10 +5072,19 @@ class BaseTrainer(BaseTrainerProtocol):
         ``in_shardings``/``out_shardings``.
         """
         empty_sharding = replicated_named_sharding(self.model.mesh)
+        # The state passed at runtime carries the bucket's graphdef (swapped in by
+        # _execute_train_step), and graphdef is a static pytree field — so the
+        # sharding trees must be built with the same graphdef or pjit sees a
+        # treedef mismatch (whose prefix-error rendering is quadratic in leaves
+        # and effectively hangs large models before the error ever raises).
+        state_shardings = self.state_shardings
+        bucket_graphdef = self._bucket_graphdefs.get(i)
+        if bucket_graphdef is not None and hasattr(state_shardings, "replace"):
+            state_shardings = state_shardings.replace(graphdef=bucket_graphdef)
         return {
             "static_argnums": self._bucket_static_argnums,
-            "in_shardings": (self.state_shardings, empty_sharding),
-            "out_shardings": (self.state_shardings, empty_sharding),
+            "in_shardings": (state_shardings, empty_sharding),
+            "out_shardings": (state_shardings, empty_sharding),
             "donate_argnums": (0,),
             "schedule": self.arguments.mpmd_scheduler,
             "mesh": self.mesh,
@@ -5130,12 +5142,60 @@ class BaseTrainer(BaseTrainerProtocol):
             (loader, collator) where collator applies the bucket's max_length.
         """
         sharded = self._to_sharded_source(source) if not isinstance(source, ShardedDataSource) else source
-        batch_size = self.training_batch_size
+        batch_size = bucket.total_batch_size if bucket.total_batch_size is not None else self.training_batch_size
 
-        bucket_collator = self.create_grain_collect_function(
+        inner_collator = self.create_grain_collect_function(
             max_sequence_length=bucket.max_length,
             truncation_mode=self.arguments.truncation_mode,
         )
+        expected_len = int(bucket.max_length)
+        bucket_name = bucket.name
+
+        def _stacked(value):
+            # HF IterableDataset round-trips array rows into python lists; the
+            # identity collator forwards them verbatim and the train step then
+            # sees no array leaves. Stack numeric lists back into arrays.
+            if isinstance(value, (list, tuple)):
+                try:
+                    arr = np.asarray(value)
+                except Exception:
+                    return value
+                if arr.dtype != object:
+                    return arr
+            return value
+
+        def bucket_collator(rows):
+            batch = inner_collator(rows)
+            if isinstance(batch, (list, tuple)) and not batch:
+                raise ValueError(
+                    f"Bucket {bucket_name!r}: dataloader produced an empty batch — the bucket's data "
+                    "source yielded no rows (exhausted, or its row iteration is failing upstream)."
+                )
+            if isinstance(batch, (list, tuple)) and batch and isinstance(batch[0], dict) and not batch[0]:
+                raise ValueError(
+                    f"Bucket {bucket_name!r}: dataloader rows are EMPTY dicts — the source's columns were "
+                    f"stripped upstream. raw rows sample: {repr(rows[:2])[:500]!s}"
+                )
+            if isinstance(batch, (list, tuple)) and batch and isinstance(batch[0], dict):
+                batch = {key: [row[key] for row in batch] for key in batch[0]}
+            if isinstance(batch, dict):
+                batch = {key: _stacked(value) for key, value in batch.items()}
+            # Some flavors' grain collators ignore max_sequence_length (identity
+            # collation); a bucket then silently trains at the dataset's native
+            # length instead of the bucket's. Refuse instead of diverging.
+            ids = batch.get("input_ids") if isinstance(batch, dict) else None
+            if isinstance(batch, dict) and ids is None:
+                raise ValueError(
+                    f"Bucket {bucket_name!r}: collated batch has no 'input_ids' (keys={sorted(batch.keys())[:8]}) — "
+                    f"the bucket's dataset is not tokenized/packed. raw rows sample: {repr(rows[:1])[:600]!s}"
+                )
+            if ids is not None and hasattr(ids, "shape") and len(ids.shape) >= 2 and int(ids.shape[-1]) != expected_len:
+                raise ValueError(
+                    f"Bucket {bucket_name!r}: collated sequence length {int(ids.shape[-1])} != bucket "
+                    f"max_length {expected_len}. This trainer flavor's collator does not repack to the "
+                    "bucket length — provide a bucket dataset pre-packed/padded to the bucket's max_length."
+                )
+            return batch
 
         # Match the primary sharded-source loader's iteration knobs (see
         # _configure_grain_dataloader) so the bucket does not silently diverge
