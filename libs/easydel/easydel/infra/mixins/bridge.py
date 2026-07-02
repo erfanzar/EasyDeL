@@ -1321,17 +1321,24 @@ class EasyBridgeMixin(PushToHubMixin):
 
                 _cf_saved_tp = read_fused_checkpoint_tp(resolved_archive_file, getattr(model, "config", None))
                 _cf_live_tp = _cf_tp_size(getattr(model, "config", None))
+                if _cf_saved_tp is None and fused_layout_param_specs(model):
+                    # No recorded fused-param tp: assume the canonical (tp=1)
+                    # layout. Conversions write canonical order and trainer
+                    # saves stamp their tp, so canonical is the common case
+                    # for unstamped checkpoints — assuming the live tp instead
+                    # silently scrambles Q/K/V and gate/up (observed: a tp=1
+                    # conversion loaded verbatim under tp=4 read KL ~ ln(vocab)).
+                    _cf_saved_tp = 1
+                    if _cf_live_tp > 1:
+                        logger.warning(
+                            "Native checkpoint has no recorded fused-param tp; assuming canonical tp=1 "
+                            f"and re-interleaving fused projections for tp={_cf_live_tp}. If this "
+                            "checkpoint was actually saved under a different tensor-parallel size, "
+                            "stamp its real `fused_param_tp` into the checkpoint's config.json "
+                            "(metadata only, no weight rewrite)."
+                        )
                 if _cf_saved_tp is not None:
                     state = retp_fused_state(model, state, saved_tp=_cf_saved_tp, target_tp=_cf_live_tp)
-                elif _cf_live_tp > 1 and fused_layout_param_specs(model):
-                    logger.warning(
-                        "Legacy native checkpoint without a recorded fused-param tp loaded under "
-                        f"tp={_cf_live_tp}: fused projections are assumed to already carry this exact "
-                        "interleave. If the checkpoint was saved under a different tensor-parallel "
-                        "size, Q/K/V and gate/up weights will be silently scrambled. If the save tp "
-                        "is known, stamp `fused_param_tp` into the checkpoint's config.json to make "
-                        "it mesh-portable — no weight rewrite needed."
-                    )
                 if hasattr(model, "config") and _cf_saved_tp is not None:
                     stamp_fused_tp_config(model.config, _cf_live_tp)
                 model = _rebuild_lora_modules_from_checkpoint(model=model, flat_state=state)

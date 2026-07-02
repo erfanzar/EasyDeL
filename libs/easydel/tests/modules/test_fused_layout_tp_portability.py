@@ -603,6 +603,43 @@ def test_fused_tp_backcompat_canonical_format(tmp_path):
     assert "fused_param_layout" not in loaded.config.__dict__
 
 
+def test_unstamped_checkpoint_assumed_canonical(tmp_path):
+    """A checkpoint with no fused-tp record anywhere (no marker, no config
+    field) loads as canonical tp=1 and re-interleaves for the live mesh.
+    The previous verbatim default silently scrambled tp=1 conversions loaded
+    under tp>1 (production distill read KL ~ ln(vocab) from exactly this)."""
+    import json as _json
+
+    model = _llama(1)  # tp=1 save: weights on disk are canonical contiguous
+    reference = _logits(model)
+    ckpt = tmp_path / "ckpt"
+    model.save_pretrained(str(ckpt))
+
+    (ckpt / "fused_param_layout.json").unlink()
+    config_payload = _json.loads((ckpt / "config.json").read_text())
+    config_payload.pop("fused_param_tp", None)
+    config_payload.pop("fused_param_layout", None)
+    (ckpt / "config.json").write_text(_json.dumps(config_payload))
+
+    from easydel.layers.layouts import read_fused_checkpoint_tp
+
+    assert read_fused_checkpoint_tp(ckpt) is None
+
+    loaded = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+        pretrained_model_name_or_path=str(ckpt),
+        dtype=jnp.float32,
+        param_dtype=jnp.float32,
+        sharding_axis_dims=(1, 1, -1, 1, 2, 1),
+        auto_shard_model=True,
+    )
+    restored = _logits(loaded)
+    err = float(np.max(np.abs(reference - restored)))
+    assert err < _model_logit_tolerance("llama"), (
+        f"unstamped canonical checkpoint failed to load at tp=2 (max|Δlogits|={err})"
+    )
+    assert getattr(loaded.config, "fused_param_tp", None) == 2
+
+
 def test_stamp_and_strip_fused_tp_config_recurse_into_sub_configs():
     from easydel.layers.layouts import stamp_fused_tp_config, strip_fused_tp_config
 

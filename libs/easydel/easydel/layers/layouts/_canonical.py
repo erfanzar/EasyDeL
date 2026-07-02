@@ -43,8 +43,9 @@ the weights actually carry. Canonical contiguous order is simply ``tp=1``.
 
 A practical consequence: a legacy verbatim checkpoint whose save-tp is known
 can be made portable by stamping ``fused_param_tp`` into its ``config.json``
-— no weight rewrite needed. Checkpoints with neither field nor marker load
-verbatim (correct only when load-``tp`` equals save-``tp``) with a warning.
+— no weight rewrite needed. Checkpoints with neither field nor marker are
+assumed canonical (``tp=1``) and re-interleaved for the live mesh with a
+warning; stamp the real save-tp when that assumption is wrong.
 """
 
 from __future__ import annotations
