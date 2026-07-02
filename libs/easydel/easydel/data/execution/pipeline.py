@@ -1536,6 +1536,7 @@ def build_dataset(mixture: DatasetMixture) -> "DS | IDS":
                 batch_size=mixture.batch_size,
                 shuffle=mixture.pack_shuffle,
                 buffer_factor=mixture.pack_shuffle_buffer_factor,
+                tokenize_batch_size=getattr(mixture, "pack_tokenize_batch_size", None),
             )()
 
         return IterableDataset.from_generator(_packed_otf_gen)

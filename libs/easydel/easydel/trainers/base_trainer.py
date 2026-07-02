@@ -5204,7 +5204,7 @@ class BaseTrainer(BaseTrainerProtocol):
         shuffle = self.arguments.shuffle_train_dataset
 
         def _factory():
-            return self._create_dataloader_from_source(
+            loader = self._create_dataloader_from_source(
                 source=sharded,
                 batch_size=batch_size,
                 is_train=True,
@@ -5212,6 +5212,14 @@ class BaseTrainer(BaseTrainerProtocol):
                 num_epochs=num_epochs,
                 drop_remainder=True,
             )
+            if bool(getattr(self.arguments, "dataloader_prefetch", False)):
+                from easydel.data.execution.loader import PrefetchIterator
+
+                # Source iteration (including on-the-fly tokenize/pack work)
+                # runs on the prefetch thread, pipelined ahead of the
+                # trainer-level per-bucket batch prefetcher.
+                return PrefetchIterator(loader, buffer_size=2)
+            return loader
 
         return _ReiterableDataLoader(factory=_factory, length=self.max_training_steps), bucket_collator
 
