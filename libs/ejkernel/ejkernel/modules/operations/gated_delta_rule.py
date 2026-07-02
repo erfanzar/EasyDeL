@@ -228,7 +228,7 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
             _seq_axis_size = int(dict(getattr(mesh, "shape", {})).get(sequence_axis_name, 1))
         use_sequence_parallel = _seq_axis_size > 1 and _spec_uses_sequence_axis(in_specs[0], sequence_axis_name)
 
-        if not use_sequence_parallel and len(in_specs[0]) > 1:
+        if not use_sequence_parallel and in_specs[0] is not None and len(in_specs[0]) > 1:
             # The GDR scan carries state serially across the sequence; a shard_map
             # over a sequence-sharded input without the SP decomposition computes
             # per-shard results from a zero state — silently wrong (check_vma is
