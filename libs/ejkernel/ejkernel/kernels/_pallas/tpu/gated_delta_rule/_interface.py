@@ -41,8 +41,8 @@ def gated_delta_rule(
     initial_state: Float[Array, "batch num_value_heads qk_head_dim v_head_dim"] | None = None,
     use_qk_l2norm: bool = True,
     use_chunked: bool = True,
-    use_input_dtype_phase1_outputs: bool = True,
-    use_input_dtype_state: bool = True,
+    use_input_dtype_phase1_outputs: bool = False,
+    use_input_dtype_state: bool = False,
     seg_ids: Int[Array, "batch seq_len"] | None = None,
 ) -> tuple[
     Float[Array, "batch seq_len num_value_heads v_head_dim"],

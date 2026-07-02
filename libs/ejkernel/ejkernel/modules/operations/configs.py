@@ -872,8 +872,8 @@ class GatedDeltaRuleConfig(BaseOperationConfig):
 
     chunk_size: int = 64
     use_chunked: bool = True
-    use_input_dtype_phase1_outputs: bool = True
-    use_input_dtype_state: bool = True
+    use_input_dtype_phase1_outputs: bool = False
+    use_input_dtype_state: bool = False
     sequence_parallel_truncate_state_gradient: bool = False
     sequence_parallel_forward_only: bool = False
 
