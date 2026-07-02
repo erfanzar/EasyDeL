@@ -23,6 +23,7 @@ that need target logits or hidden states as extra inputs.
 
 from __future__ import annotations
 
+import dataclasses
 import typing as tp
 
 import numpy as np
@@ -139,6 +140,15 @@ class SpeculativeDecodingTrainer(Trainer):
             target_model=target_model,
             target_model_revision=arguments.target_model_revision,
         )
+
+        # When the caller does not pass an explicit trainable_selector, defer to
+        # the drafter model's own property so that e.g. DSpark's
+        # freeze_embeddings_and_lm_head is honoured automatically. Reassign the
+        # local `arguments` (not self.arguments) so the SAME instance reaches
+        # super().__init__ — otherwise the base trainer re-binds the original
+        # and every arguments-derived re-split disagrees with the drafter state.
+        if arguments.trainable_selector is None and hasattr(drafter_model, "trainable_selector"):
+            arguments = dataclasses.replace(arguments, trainable_selector=drafter_model.trainable_selector)
 
         if not isinstance(drafter_model, EasyDeLState):
             drafter_model = drafter_model.to_state(trainable_selector=arguments.trainable_selector)

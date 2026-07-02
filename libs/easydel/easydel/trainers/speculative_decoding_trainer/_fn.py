@@ -234,6 +234,51 @@ def _module_accepts_block_loss_kwargs(module: tp.Any, method_name: str | None) -
     return has_var_kwargs and getattr(getattr(module, "config", None), "block_size", None) is not None
 
 
+def _deepspec_block_loss_requires_target_distribution(config: tp.Any) -> bool:
+    """Return whether the native block loss needs target logits/probabilities."""
+    if config is None:
+        return True
+    return (
+        float(getattr(config, "l1_loss_alpha", 0.0)) > 0.0 or float(getattr(config, "confidence_head_alpha", 0.0)) > 0.0
+    )
+
+
+def _select_target_context_hidden_states(hidden_states: tp.Any, layer_ids: tp.Sequence[int] | None) -> tp.Any:
+    """Keep only the target layers consumed by DSpark-style context projectors."""
+    if hidden_states is None or layer_ids is None or not isinstance(hidden_states, list | tuple):
+        return hidden_states
+    selected = [hidden_states[0 if int(layer_id) == -1 else int(layer_id) + 1] for layer_id in layer_ids]
+    return jnp.concatenate(selected, axis=-1)
+
+
+def _target_num_hidden_layers(target_module: tp.Any) -> int | None:
+    """Resolve a target module's decoder depth from text or multimodal config."""
+    config = getattr(target_module, "config", None)
+    if config is None:
+        return None
+    for candidate in (config, getattr(config, "text_config", None)):
+        value = getattr(candidate, "num_hidden_layers", None)
+        if value is not None:
+            return int(value)
+    return None
+
+
+def _target_layer_ids_are_final(
+    target_module: tp.Any,
+    layer_ids: tp.Sequence[int] | None,
+    target_num_hidden_layers: int | None = None,
+) -> bool:
+    """Return whether requested DSpark context is exactly the final decoder output."""
+    if layer_ids is None or len(tuple(layer_ids)) != 1:
+        return False
+    num_hidden_layers = target_num_hidden_layers
+    if num_hidden_layers is None:
+        num_hidden_layers = _target_num_hidden_layers(target_module)
+    if num_hidden_layers is None:
+        return False
+    return int(next(iter(layer_ids))) == num_hidden_layers - 1
+
+
 def _chain_method_name(module: tp.Any, method_name: str | None, num_draft_tokens: int) -> str | None:
     """Resolve whether to use a multi-token draft-chain method.
 
@@ -630,7 +675,7 @@ def _deepspec_block_loss(output: tp.Any, config: tp.Any) -> tuple[jax.Array, Los
     confidence_loss = jnp.asarray(0.0, dtype=jnp.float32)
     confidence_head_alpha = float(getattr(config, "confidence_head_alpha", 0.0))
     confidence_metrics: dict[str, jax.Array] = {}
-    if confidence_logits is not None:
+    if confidence_logits is not None and confidence_head_alpha > 0.0:
         if aligned_target_logits is None:
             raise ValueError("DeepSpec confidence loss requires `aligned_target_logits`.")
         confidence_targets = jax.lax.stop_gradient(accept_rate)
@@ -802,6 +847,9 @@ def _target_forward_bundle_from_module(
     target_forward_method: str | None,
     target_output_hidden_states: bool,
     pass_target_outputs: bool,
+    require_logits: bool = True,
+    target_layer_ids: tp.Sequence[int] | None = None,
+    target_num_hidden_layers: int | None = None,
 ) -> dict[str, tp.Any]:
     """Build the frozen target-output bundle for one minibatch.
 
@@ -828,32 +876,47 @@ def _target_forward_bundle_from_module(
         result: dict[str, tp.Any] = {"logits": jax.lax.stop_gradient(cached_logits)}
         hidden_states = batch.get("_target_hidden_states", batch.get("target_hidden_states"))
         last_hidden_state = batch.get("_target_last_hidden_state", batch.get("target_last_hidden_state"))
+        use_last_hidden_as_context = _target_layer_ids_are_final(
+            target_module, target_layer_ids, target_num_hidden_layers
+        )
         if last_hidden_state is None and isinstance(hidden_states, list | tuple) and hidden_states:
             last_hidden_state = hidden_states[-1]
         if hidden_states is not None:
-            result["hidden_states"] = stop_gradient_tree(hidden_states)
-        if last_hidden_state is not None:
+            result["hidden_states"] = stop_gradient_tree(
+                _select_target_context_hidden_states(hidden_states, target_layer_ids)
+            )
+        elif use_last_hidden_as_context and last_hidden_state is not None:
+            result["hidden_states"] = jax.lax.stop_gradient(last_hidden_state)
+        if last_hidden_state is not None and require_logits:
             result["last_hidden_state"] = jax.lax.stop_gradient(last_hidden_state)
         return result
 
+    use_last_hidden_as_context = _target_layer_ids_are_final(target_module, target_layer_ids, target_num_hidden_layers)
+    target_extra_kwargs = {"apply_lm_head": False} if not require_logits else None
     outputs = _call_module_or_method(
         target_module,
         batch,
         method_name=target_forward_method,
-        output_hidden_states=target_output_hidden_states,
+        output_hidden_states=target_output_hidden_states and not use_last_hidden_as_context,
+        extra_kwargs=target_extra_kwargs,
     )
-    outputs = stop_gradient_tree(outputs)
-    result = {"logits": _extract_logits(outputs, attr=target_logits_attr, role="target")}
+    result = {}
+    if require_logits:
+        result["logits"] = stop_gradient_tree(_extract_logits(outputs, attr=target_logits_attr, role="target"))
     hidden_states = _lookup_output_path(outputs, "hidden_states")
     last_hidden_state = _lookup_output_path(outputs, "last_hidden_state")
     if last_hidden_state is None and isinstance(hidden_states, list | tuple) and hidden_states:
         last_hidden_state = hidden_states[-1]
     if hidden_states is not None:
-        result["hidden_states"] = hidden_states
-    if last_hidden_state is not None:
-        result["last_hidden_state"] = last_hidden_state
-    if pass_target_outputs:
-        result["outputs"] = outputs
+        result["hidden_states"] = stop_gradient_tree(
+            _select_target_context_hidden_states(hidden_states, target_layer_ids)
+        )
+    elif use_last_hidden_as_context and last_hidden_state is not None:
+        result["hidden_states"] = jax.lax.stop_gradient(last_hidden_state)
+    if last_hidden_state is not None and require_logits:
+        result["last_hidden_state"] = jax.lax.stop_gradient(last_hidden_state)
+    if pass_target_outputs and require_logits:
+        result["outputs"] = stop_gradient_tree(outputs)
     return result
 
 
@@ -865,6 +928,9 @@ def _target_forward_bundle(
     target_forward_method: str | None,
     target_output_hidden_states: bool,
     pass_target_outputs: bool,
+    require_logits: bool = True,
+    target_layer_ids: tp.Sequence[int] | None = None,
+    target_num_hidden_layers: int | None = None,
 ) -> dict[str, tp.Any]:
     """Merge the frozen target state and collect stop-gradiented outputs.
 
@@ -889,6 +955,9 @@ def _target_forward_bundle(
         target_forward_method=target_forward_method,
         target_output_hidden_states=target_output_hidden_states,
         pass_target_outputs=pass_target_outputs,
+        require_logits=require_logits,
+        target_layer_ids=target_layer_ids,
+        target_num_hidden_layers=target_num_hidden_layers,
     )
 
 
@@ -937,15 +1006,16 @@ def _speculative_loss_for_module(
             shapes are incompatible.
     """
     del target_logits_attr
-    target_logits = target_bundle["logits"]
+    target_logits = target_bundle.get("logits")
     module_config = getattr(module, "config", None)
     if int(num_draft_tokens) == 1 and getattr(module_config, "ttt_length", None) is not None:
         num_draft_tokens = int(module_config.ttt_length)
     extra_kwargs: dict[str, tp.Any] = {}
+    if "hidden_states" in target_bundle:
+        extra_kwargs["target_hidden_states"] = target_bundle["hidden_states"]
     if pass_target_outputs:
-        extra_kwargs["target_logits"] = target_logits
-        if "hidden_states" in target_bundle:
-            extra_kwargs["target_hidden_states"] = target_bundle["hidden_states"]
+        if target_logits is not None:
+            extra_kwargs["target_logits"] = target_logits
         if "last_hidden_state" in target_bundle:
             extra_kwargs["target_last_hidden_state"] = target_bundle["last_hidden_state"]
         if "outputs" in target_bundle:
@@ -964,6 +1034,8 @@ def _speculative_loss_for_module(
     block_loss = _deepspec_block_loss(drafter_outputs, getattr(module, "config", None))
     if block_loss is not None:
         return block_loss
+    if target_logits is None:
+        raise ValueError("Speculative fallback loss requires target logits; enable target logits for this path.")
     draft_logits = _resolve_draft_logits(
         module,
         drafter_outputs,
@@ -1074,6 +1146,15 @@ def speculative_decoding_step(
         if is_training and straight_through_emulator is not None:
             tree = straight_through_emulator(tree)
         module = drafter_state.merge(tree)
+        loss_mask = _loss_mask_from_batch(minibatch)
+        use_native_block_loss = loss_mask is not None and _module_accepts_block_loss_kwargs(
+            module, drafter_forward_method
+        )
+        require_target_logits = (not use_native_block_loss) or _deepspec_block_loss_requires_target_distribution(
+            getattr(module, "config", None)
+        )
+        target_layer_ids = getattr(getattr(module, "config", None), "target_layer_ids", None)
+        target_num_hidden_layers = getattr(getattr(module, "config", None), "target_num_hidden_layers", None)
         target_bundle = _target_forward_bundle(
             target_state,
             minibatch,
@@ -1081,6 +1162,9 @@ def speculative_decoding_step(
             target_forward_method=target_forward_method,
             target_output_hidden_states=target_output_hidden_states,
             pass_target_outputs=pass_target_outputs,
+            require_logits=require_target_logits,
+            target_layer_ids=target_layer_ids,
+            target_num_hidden_layers=target_num_hidden_layers,
         )
         return _speculative_loss_for_module(
             module,
@@ -1210,6 +1294,15 @@ def _make_speculative_scheduled_loss(call):
         call_batch = constrain_scheduled_batch(module, batch, partition_spec)
         target_module = target_state.merge(target_state.graphstate)
         sync_module_schedule_config(target_module, call.schedule)
+        loss_mask = _loss_mask_from_batch(call_batch)
+        use_native_block_loss = loss_mask is not None and _module_accepts_block_loss_kwargs(
+            module, drafter_forward_method
+        )
+        require_target_logits = (not use_native_block_loss) or _deepspec_block_loss_requires_target_distribution(
+            getattr(module, "config", None)
+        )
+        target_layer_ids = getattr(getattr(module, "config", None), "target_layer_ids", None)
+        target_num_hidden_layers = getattr(getattr(module, "config", None), "target_num_hidden_layers", None)
         target_bundle = _target_forward_bundle_from_module(
             target_module,
             call_batch,
@@ -1217,6 +1310,9 @@ def _make_speculative_scheduled_loss(call):
             target_forward_method=target_forward_method,
             target_output_hidden_states=target_output_hidden_states,
             pass_target_outputs=pass_target_outputs,
+            require_logits=require_target_logits,
+            target_layer_ids=target_layer_ids,
+            target_num_hidden_layers=target_num_hidden_layers,
         )
         loss, _metrics = _speculative_loss_for_module(
             module,

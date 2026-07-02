@@ -58,6 +58,7 @@ class DSparkConfig(EasyDeLBaseConfig):
         rope_theta: float = 10000.0,
         rope_scaling: dict | None = None,
         target_layer_ids: tuple[int, ...] | list[int] = (1, 9, 17, 25, 33),
+        target_num_hidden_layers: int | None = None,
         block_size: int = 7,
         mask_token_id: int | None = None,
         num_anchors: int = 512,
@@ -68,6 +69,7 @@ class DSparkConfig(EasyDeLBaseConfig):
         loss_decay_gamma: float = 4.0,
         ce_loss_alpha: float = 0.1,
         l1_loss_alpha: float = 0.9,
+        freeze_embeddings_and_lm_head: bool = False,
         tie_word_embeddings: bool = False,
         **kwargs,
     ):
@@ -98,6 +100,8 @@ class DSparkConfig(EasyDeLBaseConfig):
             target_layer_ids: Target hidden-state layer indices to concatenate as
                 drafter context. ``-1`` means embedding output; non-negative ``n``
                 maps to hidden-state output index ``n + 1``.
+            target_num_hidden_layers: Decoder depth of the target model. Used to
+                detect when ``target_layer_ids`` points at the final hidden state.
             block_size: Number of future positions predicted per anchor.
             mask_token_id: Token ID used for masked (non-anchor) draft positions.
                 ``None`` defaults to ``vocab_size - 1``.
@@ -112,6 +116,8 @@ class DSparkConfig(EasyDeLBaseConfig):
             loss_decay_gamma: Exponential decay factor for position-wise loss weights.
             ce_loss_alpha: Weight of the cross-entropy component in the total loss.
             l1_loss_alpha: Weight of the L1 component in the total loss.
+            freeze_embeddings_and_lm_head: When ``True``, exclude the token
+                embedding table and LM head from the drafter trainable state.
             tie_word_embeddings: Whether input and output embeddings share weights.
             **kwargs: Unpacked[EasyDeLBaseConfig]. Forwarded to
                 ``EasyDeLBaseConfig.__init__``. Includes sharding, attention,
@@ -172,6 +178,7 @@ class DSparkConfig(EasyDeLBaseConfig):
         self.rope_theta = float(rope_theta)
         self.rope_scaling = rope_scaling
         self.target_layer_ids = validate_target_layer_ids(target_layer_ids, allow_embedding=True)
+        self.target_num_hidden_layers = int(target_num_hidden_layers) if target_num_hidden_layers is not None else None
         self.block_size = int(block_size)
         self.mask_token_id = int(mask_token_id) if mask_token_id is not None else self.vocab_size - 1
         self.num_anchors = int(num_anchors)
@@ -183,6 +190,7 @@ class DSparkConfig(EasyDeLBaseConfig):
         self.loss_decay_gamma = float(loss_decay_gamma)
         self.ce_loss_alpha = float(ce_loss_alpha)
         self.l1_loss_alpha = float(l1_loss_alpha)
+        self.freeze_embeddings_and_lm_head = bool(freeze_embeddings_and_lm_head)
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
 

@@ -290,6 +290,48 @@ class DSparkModel(EasyDeLBaseModule):
                 rngs=rngs,
             )
 
+    @property
+    def trainable_selector(self) -> spx.SelectorSugar:
+        """Return the DSpark trainable selector, optionally freezing copied IO weights."""
+        selector = spx.select().variables("parameters")
+        if bool(getattr(self.config, "freeze_embeddings_and_lm_head", False)):
+            frozen = spx.select().variables("parameters").at_path("embed_tokens.**", "lm_head.**")
+            selector = selector - frozen
+        return selector
+
+    @staticmethod
+    def _copy_parameter_value(dst: tp.Any, src: tp.Any, *, name: str) -> None:
+        """Copy a SpectraX parameter value with an early shape check."""
+        if not hasattr(dst, "value") or not hasattr(src, "value"):
+            raise TypeError(f"{name} must be a SpectraX-style parameter with a `.value` attribute.")
+        dst_shape = tuple(dst.value.shape)
+        src_shape = tuple(src.value.shape)
+        if dst_shape != src_shape:
+            raise ValueError(f"{name} shape mismatch: DSpark has {dst_shape}, target has {src_shape}.")
+        dst.value = src.value.astype(dst.value.dtype)
+
+    def initialize_embeddings_and_head_from_target(self, target_model: tp.Any) -> None:
+        """Initialize DSpark token embeddings and LM head from a target model.
+
+        DeepSpec initializes these two modules from the frozen target and then
+        leaves them out of the optimized drafter state.  This helper performs the
+        same copy for EasyDeL target modules that expose the conventional
+        ``get_input_embeddings`` and ``get_lm_head`` accessors.
+        """
+        get_embeddings = getattr(target_model, "get_input_embeddings", None)
+        if not callable(get_embeddings):
+            get_embeddings = getattr(target_model, "get_embedding", None)
+        get_lm_head = getattr(target_model, "get_lm_head", None)
+        if not callable(get_embeddings) or not callable(get_lm_head):
+            raise TypeError("Target model must expose `get_input_embeddings`/`get_embedding` and `get_lm_head`.")
+
+        target_embeddings = get_embeddings()
+        target_lm_head = get_lm_head()
+        self._copy_parameter_value(self.embed_tokens.weight, target_embeddings.weight, name="embed_tokens.weight")
+        if bool(self.config.tie_word_embeddings):
+            return
+        self._copy_parameter_value(self.lm_head.weight, target_lm_head.weight, name="lm_head.weight")
+
     def project_target_hidden_states(self, target_hidden_states: tp.Any) -> jax.Array:
         """Extract configured target layers and project them into DSpark hidden space.
 
