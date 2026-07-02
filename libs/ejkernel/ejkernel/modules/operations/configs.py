@@ -841,6 +841,15 @@ class GatedDeltaRuleConfig(BaseOperationConfig):
     training residual path still stores fp32 intermediates for backward
     stability. ``use_input_dtype_state`` is a separate forward-only TPU/Pallas
     knob for callers that do not need an fp32 recurrent state from the prefill.
+
+    Both ``use_input_dtype_*`` knobs default to ``False`` and should stay
+    ``False`` whenever forward values are compared or mixed across grad and
+    no-grad contexts (e.g. a frozen distillation teacher vs a trained student):
+    the custom-VJP training core ignores them, so enabling them makes a no-grad
+    forward numerically diverge from the grad-path forward of the same weights
+    (~4e-3 per layer in bf16, compounding with depth). Enable them only for
+    pure-inference pipelines where that trade is understood.
+
     ``sequence_parallel_truncate_state_gradient`` keeps sequence-parallel
     forward state propagation exact but treats the affine cross-shard state
     correction as forward-only. ``sequence_parallel_forward_only`` makes the
@@ -855,14 +864,16 @@ class GatedDeltaRuleConfig(BaseOperationConfig):
         use_chunked: Whether to use the chunked algorithm when the caller does
             not explicitly disable it. ``False`` forces recurrent XLA.
         use_input_dtype_phase1_outputs: Whether the TPU/Pallas forward-only
-            chunked path should write large phase-1 outputs in the input dtype.
-            Ignored by XLA and by the Pallas custom-VJP training residual path.
+            chunked path should write large phase-1 outputs in the input dtype
+            (default ``False``). Ignored by XLA and by the Pallas custom-VJP
+            training residual path — see the divergence note above before
+            enabling.
         use_input_dtype_state: Whether the TPU/Pallas forward-only chunked path
-            should carry recurrent state in the input dtype (default ``True``;
-            the public final state was already cast to the input dtype before
-            this knob existed). Set ``False`` for stateful prefill/decode
-            callers that need the internal carry kept in fp32 — the easydel
-            adapter does this automatically whenever a cache state is passed in.
+            should carry recurrent state in the input dtype (default ``False``).
+            Keep ``False`` for stateful prefill/decode callers that need the
+            internal carry kept in fp32 — the easydel adapter forces this
+            whenever a cache state is passed in — and see the divergence note
+            above before enabling.
         sequence_parallel_truncate_state_gradient: Whether sequence-parallel
             GDR should stop gradients through the affine summary/cross-shard
             state correction path while preserving exact forward propagation.

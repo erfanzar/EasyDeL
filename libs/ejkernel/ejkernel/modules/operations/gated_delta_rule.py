@@ -66,6 +66,7 @@ References:
 
 from __future__ import annotations
 
+import dataclasses
 import typing
 from typing import Literal
 
@@ -750,6 +751,11 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
         execution paths: ``(platform="pallas", backend="tpu")`` and
         ``(platform="xla", backend="any")`` — four candidates total.
 
+        Candidates deliberately leave ``use_input_dtype_phase1_outputs`` /
+        ``use_input_dtype_state`` at their ``False`` defaults: the custom-VJP
+        training core ignores them, so a ``True`` candidate would make no-grad
+        forwards diverge from grad-path forwards of the same weights.
+
         Args:
             inv: Invocation object carrying the call's arrays and keyword
                 arguments. Accepted for API compatibility; it is not inspected
@@ -760,12 +766,7 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
         """
         cands = [128, 256]
         return [
-            GatedDeltaRuleConfig(
-                chunk_size=c,
-                platform=platform,
-                backend=backend,
-                use_input_dtype_phase1_outputs=(platform == "pallas"),
-            )
+            GatedDeltaRuleConfig(chunk_size=c, platform=platform, backend=backend)
             for platform, backend in (("pallas", "tpu"), ("xla", "any"))
             for c in cands
         ]
@@ -777,6 +778,23 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
     candidate_cfgs_shard_map_tpu = candidate_cfgs_tpu
 
 
+def _sanitize_persistent_gdr_cfg(raw):
+    """Deserialize a persisted GDR config, dropping stale divergent dtype flags.
+
+    Autotune candidates never set ``use_input_dtype_phase1_outputs`` /
+    ``use_input_dtype_state`` (the custom-VJP training core ignores them, so a
+    ``True`` value makes no-grad forwards diverge from grad-path forwards);
+    any ``True`` in a persisted entry predates that change and is discarded.
+    Unknown keys from older schema versions are dropped as well.
+    """
+    if isinstance(raw, dict):
+        known = {f.name for f in dataclasses.fields(GatedDeltaRuleConfig)}
+        raw = {k: v for k, v in raw.items() if k in known}
+        raw["use_input_dtype_phase1_outputs"] = False
+        raw["use_input_dtype_state"] = False
+    return raw
+
+
 _executor: Executor[GatedDeltaRuleConfig, Array] = Executor(
     ConfigSelectorChain(
         cache=ConfigCache(),
@@ -786,7 +804,11 @@ _executor: Executor[GatedDeltaRuleConfig, Array] = Executor(
             validate_backward=True,
         ),
         tuner=Tuner(warmup=10, iters=40),
-        persistent=PersistentCache("gated_delta_rule"),
+        persistent=PersistentCache(
+            "gated_delta_rule",
+            loader=_sanitize_persistent_gdr_cfg,
+            cfg_type=GatedDeltaRuleConfig,
+        ),
     )
 )
 
