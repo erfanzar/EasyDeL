@@ -354,9 +354,10 @@ class DistillationTrainer(Trainer):
             bool(self.arguments.mtp_distillation),
             float(self.arguments.mtp_kd_weight),
             int(self.arguments.mtp_draft_tokens),
+            bool(self.arguments.teacher_matched_compilation),
         )
 
-        static_argnums = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25)
+        static_argnums = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26)
         self._runtime_trace("train.compile_wrapper.begin")
         if self.arguments.mpmd_scheduler is None:
             sharded_training_step_function = spx.jit(
@@ -402,6 +403,7 @@ class DistillationTrainer(Trainer):
             bool(self.arguments.mtp_distillation),
             float(self.arguments.mtp_kd_weight),
             int(self.arguments.mtp_draft_tokens),
+            bool(self.arguments.teacher_matched_compilation),
         )
 
         self._runtime_trace("eval.compile_wrapper.begin")

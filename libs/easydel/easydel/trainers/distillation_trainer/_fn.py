@@ -1328,6 +1328,7 @@ def distillation_step(
     mtp_distillation: bool = False,
     mtp_kd_weight: float = 0.3,
     mtp_draft_tokens: int = 1,
+    teacher_matched_compilation: bool = True,
 ) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
     """Perform a single knowledge-distillation training or evaluation step.
 
@@ -1376,6 +1377,14 @@ def distillation_step(
         checkpoint_kl_loss: When ``True`` (default) and the chunked path is active, wrap each
             chunk's KL/CE body in ``jax.checkpoint`` so its vocab-sized logits are recomputed in
             the backward pass instead of stored. Set ``False`` to skip the recompute.
+        teacher_matched_compilation: When ``True`` (default), run the teacher
+            forward as the primal of ``jax.vjp`` so XLA compiles it with the
+            same structure as the student's differentiated forward. A plain
+            no-grad teacher forward compiles to different bf16 fusions and
+            reads a spurious KL floor (~0.5 nats at 60 layers / 131k tokens
+            for identical weights, measured 2026-07-02). Set ``False`` to use
+            the ``jax.checkpoint(nothing_saveable)`` no-grad teacher forward
+            if the matched path regresses memory or step time.
 
     Returns:
         tuple[EasyDeLState, LossMetrics] | LossMetrics: When ``is_training``
@@ -1468,6 +1477,42 @@ def distillation_step(
             if not hasattr(teacher_call_kwargs[key], "shape")
         }
 
+        def _collect(teacher_outputs) -> dict[str, tp.Any]:
+            """Pick the teacher outputs the loss consumes (no detach here)."""
+            result: dict[str, tp.Any] = {}
+            if use_chunked:
+                result["hidden_for_kl"] = teacher_outputs.last_hidden_state
+            else:
+                result["logits"] = teacher_outputs.logits
+            if request_hidden_states:
+                teacher_hidden = getattr(teacher_outputs, "hidden_states", None)
+                if teacher_hidden is not None:
+                    result["hidden_states"] = tuple(teacher_hidden)
+            if request_attentions:
+                teacher_attns = getattr(teacher_outputs, "attentions", None)
+                if teacher_attns is not None:
+                    result["attentions"] = tuple(teacher_attns)
+            return result
+
+        if teacher_matched_compilation:
+            # Run the teacher forward as a VJP primal: XLA then compiles it
+            # with the same fusion/residual structure as the student's
+            # differentiated forward (custom-VJP kernels take their train
+            # cores, matmul fusions match), so identical weights produce
+            # bitwise-identical logits instead of a ~0.5-nat spurious KL
+            # floor. The pullback is discarded, so the teacher backward and
+            # unused residuals are dead code to the compiler.
+            def _teacher_primal(t_graphstate):
+                teacher_module = teacher_state.merge(t_graphstate)
+                return _collect(teacher_module(**teacher_call_kwargs, **teacher_static_kwargs))
+
+            primal, _unused_pullback = jax.vjp(
+                _teacher_primal,
+                jax.lax.stop_gradient(teacher_state.graphstate),
+            )
+            del _unused_pullback
+            return _stop_gradient_tree(primal)
+
         @functools.partial(
             jax.checkpoint,
             prevent_cse=True,
@@ -1476,21 +1521,7 @@ def distillation_step(
         def _teacher_fwd(kw, t_graphstate):
             """Run the frozen teacher forward pass and stop-gradient outputs."""
             teacher_module = teacher_state.merge(t_graphstate)
-            teacher_outputs = teacher_module(**kw, **teacher_static_kwargs)
-            result: dict[str, tp.Any] = {}
-            if use_chunked:
-                result["hidden_for_kl"] = jax.lax.stop_gradient(teacher_outputs.last_hidden_state)
-            else:
-                result["logits"] = jax.lax.stop_gradient(teacher_outputs.logits)
-            if request_hidden_states:
-                teacher_hidden = getattr(teacher_outputs, "hidden_states", None)
-                if teacher_hidden is not None:
-                    result["hidden_states"] = _stop_gradient_tree(tuple(teacher_hidden))
-            if request_attentions:
-                teacher_attns = getattr(teacher_outputs, "attentions", None)
-                if teacher_attns is not None:
-                    result["attentions"] = _stop_gradient_tree(tuple(teacher_attns))
-            return result
+            return _stop_gradient_tree(_collect(teacher_module(**kw, **teacher_static_kwargs)))
 
         return _teacher_fwd(
             teacher_call_kwargs,
