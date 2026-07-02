@@ -3727,6 +3727,16 @@ class EasyBridgeMixin(PushToHubMixin):
             config_to_save.__dict__.pop("attn_dtype", None)
             config_to_save.__dict__.pop("attn_softmax_dtype", None)
             config_to_save.architectures = [module.__name__]
+            # Fused projections are written in the conversion mesh's interleave
+            # (tp=1 on a single-device conversion = canonical order). Record it
+            # so loading under any tp re-interleaves instead of assuming the
+            # live layout — an unstamped checkpoint scrambles Q/K/V and
+            # gate/up when the load tp differs.
+            from easydel.layers.layouts import stamp_fused_tp_config, write_fused_layout_marker
+            from easydel.layers.layouts._runtime import tensor_parallel_size as _fused_tp_size
+
+            stamp_fused_tp_config(config_to_save, _fused_tp_size(ed_config))
+            write_fused_layout_marker(save_root, _fused_tp_size(ed_config))
             if str(save_root).startswith("gs://"):
                 (save_root / CONFIG_NAME).write_text(config_to_save.to_json_string(use_diff=True))
             else:
