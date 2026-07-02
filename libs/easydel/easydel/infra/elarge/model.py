@@ -1353,16 +1353,73 @@ class eLargeModel:
             with phase_timer("build_esurge.engine", tag="eLargeModel"):
                 return build_esurge(self._config, self._model)
 
+    def _build_auxiliary_model(
+        self,
+        role: str,
+        model_section: Mapping[str, Any] | None = None,
+    ) -> EasyDeLBaseModule | None:
+        """Build a non-primary model (teacher/target/reference/reward).
+
+        Every auxiliary role shares one contract: the role's model section
+        (``<role>_model``) replaces the primary ``model`` section, and the
+        optional ``<role>_loader`` / ``<role>_sharding`` top-level sections
+        override the shared ``loader`` / ``sharding`` sections, falling back
+        to them when absent.
+
+        Auxiliary models run inside the primary model's compiled step
+        (distillation, preference, reward scoring), so an override may change
+        *how* tensors are partitioned (e.g. a ``partition_axis`` that
+        replicates a frozen teacher's weights over ``fsdp``) but must stay on
+        the same mesh: differing ``axis_dims`` / ``axis_names`` are rejected.
+
+        Args:
+            role: Role prefix (``"teacher"``, ``"target"``, ``"reference"``,
+                ``"reward"``).
+            model_section: Explicit model section to use. Defaults to
+                ``self._config["<role>_model"]``.
+
+        Returns:
+            The built module, or ``None`` when no model section is configured.
+
+        Raises:
+            ValueError: If ``<role>_sharding`` defines a different mesh than
+                the shared ``sharding`` section.
+        """
+        section = model_section if model_section is not None else self._config.get(f"{role}_model")
+        if section is None:
+            return None
+
+        aux_config = dict(self._config)
+        aux_config["model"] = section
+        if self._config.get(f"{role}_loader"):
+            aux_config["loader"] = self._config[f"{role}_loader"]
+        override_sharding = self._config.get(f"{role}_sharding")
+        if override_sharding:
+            base_sharding = self._config.get("sharding", {})
+            for mesh_key in ("axis_dims", "axis_names"):
+                base_val = base_sharding.get(mesh_key)
+                override_val = override_sharding.get(mesh_key)
+                if base_val is not None and override_val is not None and tuple(override_val) != tuple(base_val):
+                    raise ValueError(
+                        f"{role}_sharding.{mesh_key}={tuple(override_val)} differs from "
+                        f"sharding.{mesh_key}={tuple(base_val)}. Auxiliary models run inside the primary "
+                        "model's compiled step and must share its mesh; to lay the "
+                        f"{role} out differently, keep the mesh and override "
+                        f"{role}_sharding.partition_axis instead (e.g. PartitionAxis("
+                        'fully_sharded_data_parallel_axis=None, batch_axis=("fsdp", "dp")) '
+                        "replicates its weights over fsdp)."
+                    )
+            aux_config["sharding"] = override_sharding
+        return build_model(aux_config)
+
     def build_teacher_model(self) -> EasyDeLBaseModule | None:
         """Build the teacher model for distillation training.
 
-        Loads the teacher model with the teacher model path. Loader and
-        sharding configuration come from the optional top-level
-        ``teacher_loader`` / ``teacher_sharding`` sections when present,
-        falling back to the student's ``loader`` / ``sharding`` sections
-        otherwise — so a frozen teacher can e.g. keep its weights
-        tp-sharded-but-fsdp-replicated while the student trains fully
-        sharded.
+        Loads the ``teacher_model`` section with the shared ``loader`` /
+        ``sharding`` configuration, unless the optional ``teacher_loader`` /
+        ``teacher_sharding`` sections override them — so a frozen teacher can
+        e.g. keep its weights tp-sharded-but-fsdp-replicated while the
+        student trains fully sharded (see :meth:`_build_auxiliary_model`).
 
         Returns:
             EasyDeLBaseModule instance for the teacher model, or None if no
@@ -1373,16 +1430,7 @@ class eLargeModel:
             >>> teacher = elm.build_teacher_model()
             >>> # Teacher model will be used automatically in distillation training
         """
-        if "teacher_model" not in self._config:
-            return None
-
-        teacher_config = dict(self._config)
-        teacher_config["model"] = self._config["teacher_model"]
-        if self._config.get("teacher_loader"):
-            teacher_config["loader"] = self._config["teacher_loader"]
-        if self._config.get("teacher_sharding"):
-            teacher_config["sharding"] = self._config["teacher_sharding"]
-        return build_model(teacher_config)
+        return self._build_auxiliary_model("teacher")
 
     def build_target_model(self) -> EasyDeLBaseModule | None:
         """Build the frozen target/verifier model for speculative decoding.
@@ -1392,13 +1440,11 @@ class eLargeModel:
         distillation-style fallback so existing configs can still express the
         target model without a second auxiliary-model schema.
         """
-        target_section = self._config.get("target_model", self._config.get("teacher_model"))
-        if target_section is None:
-            return None
-
-        target_config = dict(self._config)
-        target_config["model"] = target_section
-        return build_model(target_config)
+        if "target_model" in self._config:
+            return self._build_auxiliary_model("target")
+        # Distillation-style fallback: reuse the teacher section (and any
+        # teacher loader/sharding overrides) as the speculative target.
+        return self._build_auxiliary_model("teacher")
 
     def build_reference_model(self) -> EasyDeLBaseModule | None:
         """Build the reference model for preference optimization (DPO, etc.).
@@ -1416,12 +1462,7 @@ class eLargeModel:
             >>> reference = elm.build_reference_model()
             >>> # Reference model will be used automatically in DPO training
         """
-        if "reference_model" not in self._config:
-            return None
-
-        reference_config = dict(self._config)
-        reference_config["model"] = self._config["reference_model"]
-        return build_model(reference_config)
+        return self._build_auxiliary_model("reference")
 
     def build_reward_model(self) -> EasyDeLBaseModule | None:
         """Build the reward model for RLHF trainers (GRPO/GFPO/GSPO/XPO/Nash-MD).
@@ -1442,12 +1483,7 @@ class eLargeModel:
                   extra_kwargs:
                     num_labels: 1
         """
-        if "reward_model" not in self._config:
-            return None
-
-        reward_config = dict(self._config)
-        reward_config["model"] = self._config["reward_model"]
-        return build_model(reward_config)
+        return self._build_auxiliary_model("reward")
 
     def build_dataset(self) -> "Dataset | IterableDataset | None":
         """Build dataset from mixture configuration.

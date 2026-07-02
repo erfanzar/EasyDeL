@@ -85,7 +85,14 @@ from easydel.modules.auto import (
     AutoEasyDeLModelForZeroShotImageClassification,
 )
 
-from .processing import coerce_dtype, coerce_precision, materialize_base_config, normalize, resolve_task
+from .processing import (
+    coerce_dtype,
+    coerce_partition_axis,
+    coerce_precision,
+    materialize_base_config,
+    normalize,
+    resolve_task,
+)
 from .types import eLMConfig
 
 logger = get_logger(__name__)
@@ -414,7 +421,7 @@ def to_from_pretrained_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[s
         sharding_axis_dims=tuple(sharding.get("axis_dims", (1, 1, 1, 1, -1, 1))),
         sharding_dcn_axis_dims=tuple(dcn_axis_dims) if dcn_axis_dims else None,
         sharding_axis_names=tuple(sharding.get("axis_names", ("pp", "dp", "fsdp", "ep", "tp", "sp"))),
-        partition_axis=sharding.get("partition_axis"),
+        partition_axis=coerce_partition_axis(sharding.get("partition_axis")),
         shard_fns=sharding.get("shard_fns"),
         backend=platform.get("backend"),
         platform=platform.get("platform"),
@@ -530,7 +537,7 @@ def to_load_state_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[str, A
         sharding_axis_dims=tuple(sharding.get("axis_dims", (1, 1, 1, 1, -1, 1))),
         sharding_dcn_axis_dims=tuple(dcn_axis_dims) if dcn_axis_dims else None,
         sharding_axis_names=tuple(sharding.get("axis_names", ("pp", "dp", "fsdp", "ep", "tp", "sp"))),
-        partition_axis=sharding.get("partition_axis"),
+        partition_axis=coerce_partition_axis(sharding.get("partition_axis")),
         shard_fns=sharding.get("shard_fns"),
         backend=platform.get("backend"),
         platform=platform.get("platform"),
