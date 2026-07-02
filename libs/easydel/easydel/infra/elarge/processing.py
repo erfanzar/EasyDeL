@@ -346,6 +346,32 @@ def coerce_precision(p: PrecisionLike) -> jax.lax.Precision | None:
     }.get(str(p).upper(), jax.lax.Precision.DEFAULT)
 
 
+def coerce_partition_axis(value: tp.Any) -> tp.Any:
+    """Convert a partition-axis specification into a ``PartitionAxis``.
+
+    Accepts a ready ``PartitionAxis`` (returned as-is), ``None`` (kept as
+    ``None`` so loader defaults apply), or a mapping — the YAML/dict form —
+    whose values are passed to the ``PartitionAxis`` constructor with lists
+    converted to tuples (axis entries like ``["fsdp", "dp"]`` mean a
+    multi-axis sharding tuple, and JSON/YAML cannot express tuples).
+
+    Args:
+        value: ``PartitionAxis`` | ``Mapping`` | ``None``.
+
+    Returns:
+        The coerced ``PartitionAxis`` or ``None``.
+    """
+    if value is None:
+        return None
+    from eformer.escale import PartitionAxis
+
+    if isinstance(value, PartitionAxis):
+        return value
+    if isinstance(value, tp.Mapping):
+        return PartitionAxis(**{k: tuple(v) if isinstance(v, list) else v for k, v in value.items()})
+    return value
+
+
 # Mapping of task type string aliases to TaskType enum values.
 #
 # This dictionary provides case-insensitive lookup for common task type

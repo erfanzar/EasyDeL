@@ -51,7 +51,11 @@ class eLMConfig(TypedDict, total=False):
             teacher; falls back to ``loader`` when absent.
         sharding: Distributed sharding and mesh configuration.
         teacher_sharding: Optional sharding overrides for the distillation
-            teacher; falls back to ``sharding`` when absent.
+            teacher; falls back to ``sharding`` when absent. The same
+            ``<role>_loader`` / ``<role>_sharding`` pattern applies to the
+            target, reference, and reward auxiliary models. Overrides may
+            change partitioning (``partition_axis``) but must keep the
+            primary mesh (same ``axis_dims`` / ``axis_names``).
         platform: Hardware backend and platform selection.
         quantization: Weight and KV cache quantization settings.
         base_config: Base model configuration values and operation overrides.
@@ -70,6 +74,12 @@ class eLMConfig(TypedDict, total=False):
     sharding: NotRequired[ShardingCfg]
     teacher_loader: NotRequired[LoaderCfg]
     teacher_sharding: NotRequired[ShardingCfg]
+    target_loader: NotRequired[LoaderCfg]
+    target_sharding: NotRequired[ShardingCfg]
+    reference_loader: NotRequired[LoaderCfg]
+    reference_sharding: NotRequired[ShardingCfg]
+    reward_loader: NotRequired[LoaderCfg]
+    reward_sharding: NotRequired[ShardingCfg]
     platform: NotRequired[PlatformCfg]
     quantization: NotRequired[QuantizationCfg]
     base_config: NotRequired[BaseCfg]
