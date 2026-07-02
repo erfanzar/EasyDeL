@@ -135,6 +135,18 @@ class DistillationConfig(TrainingArguments):
         default=None,
         metadata={"help": "Reserved teacher revision metadata for externally loaded teacher modules."},
     )
+    teacher_matched_compilation: bool = field(
+        default=False,
+        metadata={
+            "help": "Run the teacher forward as a jax.vjp primal so it compiles with the same "
+            "structure as the student's differentiated forward, removing the bf16 grad-vs-nograd "
+            "KL floor (~0.5 nats at 60 layers; identical weights then match bitwise). Costly at "
+            "long context: custom-VJP kernels take their train cores, whose fused Pallas kernels "
+            "always materialize backward residuals (not DCE-able), which can spill HBM and slow "
+            "steps by an order of magnitude at 131k tokens. Enable only when the exact KL "
+            "reading is worth it or at scales where the residuals fit."
+        },
+    )
     lmbda: float = field(
         default=0.0,
         metadata={"help": "TRL on-policy sampling probability. EasyDeL offline distillation requires 0.0."},

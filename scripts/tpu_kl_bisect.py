@@ -45,6 +45,12 @@ def main(argv=None):
     p.add_argument("--layers", type=int, default=8)
     p.add_argument("--packed", action="store_true", help="packed segments instead of padded tail")
     p.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float32"])
+    p.add_argument(
+        "--teacher-vjp",
+        action="store_true",
+        help="run the teacher as a jax.vjp primal (teacher_matched_compilation path) instead of "
+        "checkpoint(nothing_saveable); expected KL: exactly 0",
+    )
     args = p.parse_args(argv)
 
     import jax
@@ -107,13 +113,25 @@ def main(argv=None):
     t_kwargs = sanitize_model_call_kwargs(t_kwargs)
     t_static = {k: t_kwargs.pop(k) for k in list(t_kwargs) if not hasattr(t_kwargs[k], "shape")}
 
-    @functools.partial(jax.checkpoint, prevent_cse=True, policy=jax.checkpoint_policies.nothing_saveable)
-    def teacher_fwd(kw, tree):
-        module = model.merge_module(gdef, tree, gother)
-        out = module(**kw, **t_static)
-        return jax.lax.stop_gradient(out.logits), jax.lax.stop_gradient(tuple(out.hidden_states))
+    if args.teacher_vjp:
+        # mirrors distillation_step's teacher_matched_compilation=True path
+        def teacher_primal(tree):
+            module = model.merge_module(gdef, tree, gother)
+            out = module(**t_kwargs, **t_static)
+            return out.logits, tuple(out.hidden_states)
 
-    t_logits, t_hidden = teacher_fwd(t_kwargs, jax.lax.stop_gradient(gstate))
+        (t_logits, t_hidden), _ = jax.vjp(teacher_primal, jax.lax.stop_gradient(gstate))
+        t_logits = jax.lax.stop_gradient(t_logits)
+        t_hidden = jax.lax.stop_gradient(t_hidden)
+    else:
+
+        @functools.partial(jax.checkpoint, prevent_cse=True, policy=jax.checkpoint_policies.nothing_saveable)
+        def teacher_fwd(kw, tree):
+            module = model.merge_module(gdef, tree, gother)
+            out = module(**kw, **t_static)
+            return jax.lax.stop_gradient(out.logits), jax.lax.stop_gradient(tuple(out.hidden_states))
+
+        t_logits, t_hidden = teacher_fwd(t_kwargs, jax.lax.stop_gradient(gstate))
 
     def maxrel(a, b):
         a32, b32 = a.astype(jnp.float32), b.astype(jnp.float32)
