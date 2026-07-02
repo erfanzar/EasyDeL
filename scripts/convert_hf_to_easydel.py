@@ -66,6 +66,8 @@ Disk usage tips
 from __future__ import annotations
 
 import os
+import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -359,6 +361,37 @@ class ConvertArgs:
     )
 
 
+_WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth", ".h5", ".msgpack", ".gguf")
+
+
+def _stage_gcs_metadata(source: str, dest_dir: str) -> str:
+    """Copy every non-weight file of a ``gs://`` checkpoint into *dest_dir*.
+
+    transformers' ``Auto*`` loaders cannot read ``gs://`` URIs, so the small
+    metadata files (config/tokenizer/processor assets) are staged to local
+    disk while the weight shards stay remote for the streaming converter
+    (which gsutil-copies them one at a time itself).
+
+    Args:
+        source: ``gs://bucket/path`` of the HF-format checkpoint.
+        dest_dir: Local directory to copy metadata files into.
+
+    Returns:
+        ``dest_dir``, usable as a local model path for HF ``from_pretrained``.
+    """
+    listing = subprocess.run(
+        ["gsutil", "ls", source.rstrip("/") + "/"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    uris = [u for u in listing if u and not u.endswith("/") and not u.lower().endswith(_WEIGHT_SUFFIXES)]
+    if not uris:
+        raise FileNotFoundError(f"No metadata files found under {source!r}")
+    subprocess.run(["gsutil", "-q", "-m", "cp", *uris, dest_dir], check=True)
+    return dest_dir
+
+
 def main(argv: list[str] | None = None) -> None:
     """CLI entry point for the single-checkpoint converter.
 
@@ -389,8 +422,26 @@ def main(argv: list[str] | None = None) -> None:
         except Exception:
             logger.warning("`hf_transfer` is not installed. Run: pip install -U hf_transfer")
 
-    out_dir = Path(args.out).expanduser().resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
+    gcs_out = str(args.out).startswith("gs://")
+    if gcs_out:
+        # ePath/TensorStore write gs:// directly; Path.resolve() would mangle
+        # the URI into a local "./gs:/..." directory.
+        out_dir: str | Path = str(args.out).rstrip("/")
+        if args.repo_id and args.push_to_hub:
+            raise SystemExit("--push-to-hub requires a local --out (the upload reads a local folder).")
+    else:
+        out_dir = Path(args.out).expanduser().resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+    gcs_source = str(args.source).startswith("gs://")
+    meta_tmp: tempfile.TemporaryDirectory[str] | None = None
+    hf_source = args.source
+    if gcs_source:
+        if args.convert_mode != "sequential":
+            raise SystemExit("gs:// sources are only supported with --convert-mode sequential.")
+        meta_tmp = tempfile.TemporaryDirectory(prefix="hf-gcs-meta-")
+        hf_source = _stage_gcs_metadata(args.source, meta_tmp.name)
+        logger.info(f"Staged gs:// metadata files to {hf_source}")
 
     # Keep this import after arg parsing so `--help` is fast.
     from transformers import AutoConfig
@@ -412,7 +463,7 @@ def main(argv: list[str] | None = None) -> None:
     }
     hf_kwargs = {k: v for k, v in hf_kwargs.items() if v is not None}
 
-    config = AutoConfig.from_pretrained(args.source, **hf_kwargs)
+    config = AutoConfig.from_pretrained(hf_source, **hf_kwargs)
 
     task = _infer_task_from_hf_config(config) if args.task == "auto" else args.task
     logger.info(f"Task: {task}")
@@ -433,34 +484,40 @@ def main(argv: list[str] | None = None) -> None:
     model_cls = task_to_cls[task]
 
     # Save tokenizer/processor too so `save_pretrained(..., push_to_hub=True)` uploads a complete repo.
+    # transformers save_pretrained cannot write gs://; stage locally and rsync up.
+    asset_tmp = tempfile.TemporaryDirectory(prefix="hf-assets-") if gcs_out else None
+    asset_dir = asset_tmp.name if asset_tmp is not None else str(out_dir)
     try:
         from transformers import AutoProcessor
 
-        processor = AutoProcessor.from_pretrained(args.source, **hf_kwargs)
-        processor.save_pretrained(str(out_dir))
+        processor = AutoProcessor.from_pretrained(hf_source, **hf_kwargs)
+        processor.save_pretrained(asset_dir)
     except Exception:
         pass
     try:
         from transformers import AutoTokenizer
 
-        tokenizer = AutoTokenizer.from_pretrained(args.source, **hf_kwargs)
-        tokenizer.save_pretrained(str(out_dir))
+        tokenizer = AutoTokenizer.from_pretrained(hf_source, **hf_kwargs)
+        tokenizer.save_pretrained(asset_dir)
     except Exception:
         pass
     try:
         from transformers import AutoImageProcessor
 
-        image_processor = AutoImageProcessor.from_pretrained(args.source, **hf_kwargs)
-        image_processor.save_pretrained(str(out_dir))
+        image_processor = AutoImageProcessor.from_pretrained(hf_source, **hf_kwargs)
+        image_processor.save_pretrained(asset_dir)
     except Exception:
         pass
     try:
         from transformers import AutoFeatureExtractor
 
-        feature_extractor = AutoFeatureExtractor.from_pretrained(args.source, **hf_kwargs)
-        feature_extractor.save_pretrained(str(out_dir))
+        feature_extractor = AutoFeatureExtractor.from_pretrained(hf_source, **hf_kwargs)
+        feature_extractor.save_pretrained(asset_dir)
     except Exception:
         pass
+    if asset_tmp is not None and os.listdir(asset_dir):
+        subprocess.run(["gsutil", "-q", "-m", "rsync", "-r", asset_dir, str(out_dir)], check=True)
+        logger.info(f"Uploaded tokenizer/processor assets to {out_dir}")
 
     if args.convert_mode == "sequential":
         from easydel.infra.base_module import EasyDeLBaseModule

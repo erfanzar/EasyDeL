@@ -3334,7 +3334,6 @@ class EasyBridgeMixin(PushToHubMixin):
             rngs=spx.Rngs(0),
         )
 
-        required_params = set(flatten_dict(model.graphtree_parameters_shape))
         parameters_shape = getattr(model, "graphtree_parameters_shape", None)
         if parameters_shape is None:
             parameters_shape = model.parameters_shape
