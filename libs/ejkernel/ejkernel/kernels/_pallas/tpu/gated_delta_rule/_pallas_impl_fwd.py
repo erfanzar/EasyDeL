@@ -1244,15 +1244,15 @@ def _chunk_gdr_fwd_core(
 
     if seg_c is not None:
         step_output_dtype = input_dtype if use_input_dtype_phase1_outputs else jnp.float32
-        group_size = _N_FUSE if _N_FUSE > 1 and num_chunks % _N_FUSE == 0 else 1
+        # segmented backward consumes a pre-state per chunk; group-boundary states
+        # are only valid at group starts, so fused groups must stay at size 1 here
+        group_size = 1
         num_groups = num_chunks // group_size
         q_groups = query_c.reshape(B, H, num_groups, group_size, chunk_size, K_dim).transpose(2, 3, 0, 1, 4, 5)
         k_groups = key_c.reshape(B, H, num_groups, group_size, chunk_size, K_dim).transpose(2, 3, 0, 1, 4, 5)
         v_groups = value_c.reshape(B, H, num_groups, group_size, chunk_size, V_dim).transpose(2, 3, 0, 1, 4, 5)
         beta_groups = beta_c.squeeze(-2).reshape(B, H, num_groups, group_size, chunk_size).transpose(2, 3, 0, 1, 4)
-        g_groups = (
-            g_cumsum_c.squeeze(-2).reshape(B, H, num_groups, group_size, chunk_size).transpose(2, 3, 0, 1, 4)
-        )
+        g_groups = g_cumsum_c.squeeze(-2).reshape(B, H, num_groups, group_size, chunk_size).transpose(2, 3, 0, 1, 4)
         seg_groups = seg_c.reshape(B, H, num_groups, group_size, chunk_size).transpose(2, 3, 0, 1, 4)
         valid_groups = chunk_has_valid.reshape(B, H, num_groups, group_size).transpose(2, 3, 0, 1)
         seg_last_groups = seg_last.reshape(B, H, num_groups, group_size).transpose(2, 3, 0, 1)
@@ -1702,7 +1702,7 @@ def _chunk_gdr_grouped_segmented_fwd_train_core(
 
     total_len = L + pad_size
     num_chunks = total_len // chunk_size
-    group_size = _N_FUSE if _N_FUSE > 1 and num_chunks % _N_FUSE == 0 else 1
+    group_size = 1  # segmented backward consumes per-chunk pre-states; fused groups must stay at size 1 here
     num_groups = num_chunks // group_size
     scale = 1.0 / math.sqrt(K_dim)
     query = query * scale

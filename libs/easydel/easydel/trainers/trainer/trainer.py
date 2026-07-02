@@ -163,6 +163,16 @@ class _TrainBatchPrefetcher:
             self._submit()
         return batch, wait_seconds, data_time
 
+    def ensure_scheduled(self) -> None:
+        """Submit a fetch if none is pending.
+
+        Used by the bucket-aware training loop to warm the *next* step's
+        bucket (known ahead of time from the deterministic bucket rule)
+        while the device is busy with the current step.
+        """
+        if self._future is None:
+            self._submit()
+
     @property
     def data_iter(self) -> collections.abc.Iterator[tp.Any]:
         """The current dataloader iterator (advanced after each fetch)."""
@@ -734,6 +744,7 @@ class Trainer(BaseTrainer):
             epoch_total_steps=epoch_total_steps,
         )
         prefetcher: _TrainBatchPrefetcher | None = None
+        bucket_prefetchers: dict[int, _TrainBatchPrefetcher] = {}
 
         def close_prefetcher() -> collections.abc.Iterator[tp.Any]:
             nonlocal prefetcher, train_iter
@@ -741,19 +752,38 @@ class Trainer(BaseTrainer):
                 train_iter = prefetcher.data_iter
                 prefetcher.close()
                 prefetcher = None
+            for i, bucket_prefetcher in bucket_prefetchers.items():
+                # Persist each bucket's advanced iterator so training can
+                # resume from the right data position after the prefetchers die.
+                self._bucket_iters[i] = bucket_prefetcher.data_iter
+                bucket_prefetcher.close()
+            bucket_prefetchers.clear()
             return train_iter
 
-        if bool(getattr(self.arguments, "dataloader_prefetch", False)) and not self._has_buckets:
-            # Prefetcher is disabled when buckets are active (v1 uses synchronous
-            # fetch so the per-step loader/collator swap is exact); skip creating
-            # it here to avoid building-then-immediately-closing it each epoch.
-            prefetcher = _TrainBatchPrefetcher(
-                trainer=self,
-                data_iter=train_iter,
-                dataloader=train_dataset,
-                data_collator=data_collator,
-            )
-            self._runtime_trace("train_epoch.prefetch.enabled", epoch=epoch, buffer_size=1)
+        if bool(getattr(self.arguments, "dataloader_prefetch", False)):
+            if self._has_buckets:
+                # One prefetcher per bucket keeps the per-step loader/collator
+                # swap exact while still overlapping host-side fetch+collate
+                # with device work: each step consumes its own bucket's pending
+                # batch and warms the rule's next bucket (see the fetch path).
+                for i in sorted(self._bucket_loaders):
+                    bucket_prefetchers[i] = _TrainBatchPrefetcher(
+                        trainer=self,
+                        data_iter=self._bucket_iters[i],
+                        dataloader=self._bucket_loaders[i],
+                        data_collator=self._bucket_collators[i],
+                    )
+                self._runtime_trace(
+                    "train_epoch.prefetch.buckets_enabled", epoch=epoch, num_buckets=len(bucket_prefetchers)
+                )
+            else:
+                prefetcher = _TrainBatchPrefetcher(
+                    trainer=self,
+                    data_iter=train_iter,
+                    dataloader=train_dataset,
+                    data_collator=data_collator,
+                )
+                self._runtime_trace("train_epoch.prefetch.enabled", epoch=epoch, buffer_size=1)
 
         while True:
             with capture_time() as iteration_time:
@@ -769,9 +799,10 @@ class Trainer(BaseTrainer):
                     break
                 # Per-step bucket selection: pick the active bucket's dataloader
                 # and compiled fn for this step. `self._bucket_for_step` is read
-                # by `_execute_train_step` to choose the graphdef + fn. The
-                # prefetcher is never built when buckets are active (see setup
-                # above), so the synchronous fetch path is used.
+                # by `_execute_train_step` to choose the graphdef + fn. With
+                # prefetch enabled, each bucket owns its own prefetcher so the
+                # per-step loader/collator swap stays exact.
+                step_prefetcher = prefetcher
                 if self._has_buckets:
                     bi = self._bucket_rule.select(current_step)
                     self._bucket_for_step = bi
@@ -779,12 +810,13 @@ class Trainer(BaseTrainer):
                     train_iter = self._bucket_iters[bi]
                     # Use the bucket's own collator (applies its max_length).
                     data_collator = self._bucket_collators[bi]
+                    step_prefetcher = bucket_prefetchers.get(bi)
                 try:
                     self._runtime_trace("train_step.batch_fetch.begin", epoch=epoch, current_step=current_step)
                     prefetch_wait_time: float | None = None
                     prefetch_producer_time: float | None = None
                     with capture_time() as data_collection_time:
-                        if prefetcher is None:
+                        if step_prefetcher is None:
                             batch, train_iter = self._get_next_batch(train_iter, train_dataset)
                             self._runtime_trace(
                                 "train_step.batch_fetch.end",
@@ -799,10 +831,21 @@ class Trainer(BaseTrainer):
                             schedule_next = (
                                 current_step + 1 < self.max_training_steps and current_step + 1 < epoch_end_step
                             )
-                            batch, prefetch_wait_time, prefetch_producer_time = prefetcher.next(
-                                schedule_next=schedule_next
-                            )
-                            train_iter = prefetcher.data_iter
+                            if bucket_prefetchers:
+                                # Consume this bucket's pending batch, then warm
+                                # the bucket the rule selects for the NEXT step
+                                # (which may be a different bucket than this one).
+                                batch, prefetch_wait_time, prefetch_producer_time = step_prefetcher.next(
+                                    schedule_next=False
+                                )
+                                if schedule_next:
+                                    next_bucket = self._bucket_rule.select(current_step + 1)
+                                    bucket_prefetchers[next_bucket].ensure_scheduled()
+                            else:
+                                batch, prefetch_wait_time, prefetch_producer_time = step_prefetcher.next(
+                                    schedule_next=schedule_next
+                                )
+                            train_iter = step_prefetcher.data_iter
                             self._runtime_trace(
                                 "train_step.batch_fetch.end",
                                 epoch=epoch,
@@ -818,7 +861,7 @@ class Trainer(BaseTrainer):
                             epoch=epoch,
                             current_step=current_step,
                             batch=self._runtime_batch_summary(batch),
-                            prefetch=prefetcher is not None,
+                            prefetch=step_prefetcher is not None,
                         )
                         # PoSE (text-only): host-side position_ids skip, once per microbatch
                         # before the forward (no-op unless arguments.pose.enabled).
@@ -1229,12 +1272,14 @@ class Trainer(BaseTrainer):
             self._runtime_trace("execute_train_step.compiled_call.begin")
             if self._has_buckets:
                 # Swap the bucket's graphdef (carrying its attn kernel) into the
-                # state before calling the bucket's compiled fn, then restore a
-                # canonical graphdef (bucket 0) so post-step host work (metrics,
-                # checkpointing) sees a consistent model. graphdef is
+                # state before calling the bucket's compiled fn, then restore the
+                # state's own (base-config) graphdef so post-step host work
+                # (metrics, checkpointing) sees the user's model config rather
+                # than a bucket variant's overrides. graphdef is
                 # pytree_node=False, so this is a cheap static swap — the shared
                 # graphstate/opt_state buffers are updated in place by the fn.
                 bi = self._bucket_for_step
+                base_graphdef = state.graphdef
                 bucket_state = state.replace(graphdef=self._bucket_graphdefs[bi])
                 state, metrics = jax.block_until_ready(
                     self._bucket_step_fns[bi](
@@ -1244,7 +1289,7 @@ class Trainer(BaseTrainer):
                         *self._bucket_static_args[bi],
                     )
                 )
-                state = state.replace(graphdef=self._bucket_graphdefs[0])
+                state = state.replace(graphdef=base_graphdef)
             else:
                 state, metrics = jax.block_until_ready(
                     self.sharded_training_step_function(

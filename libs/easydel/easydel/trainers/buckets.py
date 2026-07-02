@@ -39,199 +39,237 @@ from __future__ import annotations
 import abc
 import copy
 import typing as tp
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 if tp.TYPE_CHECKING:
-	from jax.sharding import PartitionSpec
+    from jax.sharding import PartitionSpec
 
-	from easydel.infra.base_config import EasyDeLBaseConfig
-	from easydel.infra.loss_utils import LossConfig
+    from easydel.infra.base_config import EasyDeLBaseConfig
+    from easydel.infra.loss_utils import LossConfig
 
 
 class BucketRule(abc.ABC):
-	"""Maps an optimizer step to a bucket index in ``[0, len(buckets))``.
+    """Maps an optimizer step to a bucket index in ``[0, len(buckets))``.
 
-	Subclasses implement :meth:`select`. Concrete rules are serializable via
-	:meth:`to_dict` / :meth:`from_dict` so they can live in an eLarge config.
-	"""
+    Subclasses implement :meth:`select`. Concrete rules are serializable via
+    :meth:`to_dict` / :meth:`from_dict` so they can live in an eLarge config.
+    """
 
-	@abc.abstractmethod
-	def select(self, step: int) -> int:
-		"""Return the bucket index for ``step``."""
-		raise NotImplementedError
+    @abc.abstractmethod
+    def select(self, step: int) -> int:
+        """Return the bucket index for ``step``."""
+        raise NotImplementedError
 
-	@abc.abstractmethod
-	def to_dict(self) -> dict[str, tp.Any]:
-		"""Serialize to a discriminator-tagged dict (``{"kind": ...}``)."""
-		raise NotImplementedError
+    @abc.abstractmethod
+    def to_dict(self) -> dict[str, tp.Any]:
+        """Serialize to a discriminator-tagged dict (``{"kind": ...}``)."""
+        raise NotImplementedError
 
-	@classmethod
-	def from_dict(cls, d: dict[str, tp.Any]) -> "BucketRule":
-		"""Reconstruct a rule from its serialized form.
+    @classmethod
+    def from_dict(cls, d: dict[str, tp.Any]) -> "BucketRule":
+        """Reconstruct a rule from its serialized form.
 
-		Raises:
-			ValueError: if the ``"kind"`` discriminator is unknown.
-		"""
-		kind = d.get("kind")
-		if kind == "mod":
-			return ModBucketRule(
-				mod=int(d["mod"]),
-				offset=int(d.get("offset", 0)),
-				on_bucket=int(d.get("on_bucket", 0)),
-				off_bucket=int(d.get("off_bucket", 1)),
-			)
-		if kind == "step":
-			return StepThresholdRule(thresholds=[int(t) for t in d["thresholds"]])
-		raise ValueError(f"Unknown BucketRule kind: {kind!r}")
+        Raises:
+                ValueError: if the ``"kind"`` discriminator is unknown.
+        """
+        kind = d.get("kind")
+        if kind == "mod":
+            return ModBucketRule(
+                mod=int(d["mod"]),
+                offset=int(d.get("offset", 0)),
+                on_bucket=int(d.get("on_bucket", 0)),
+                off_bucket=int(d.get("off_bucket", 1)),
+            )
+        if kind == "step":
+            return StepThresholdRule(thresholds=[int(t) for t in d["thresholds"]])
+        if kind == "cycle":
+            return CycleBucketRule(
+                period=int(d["period"]),
+                num_buckets=int(d.get("num_buckets", 2)),
+            )
+        raise ValueError(f"Unknown BucketRule kind: {kind!r}")
 
 
 @dataclass
 class ModBucketRule(BucketRule):
-	"""Two-bucket modulo rule.
+    """Two-bucket modulo rule.
 
-	``select(step) == on_bucket`` iff ``(step - offset) % mod == 0``, else
-	``off_bucket``. The distillation case (vanilla every 5th step) is::
+    ``select(step) == on_bucket`` iff ``(step - offset) % mod == 0``, else
+    ``off_bucket``. The distillation case (vanilla every 5th step) is::
 
-	    ModBucketRule(mod=5, on_bucket=0, off_bucket=1)
+        ModBucketRule(mod=5, on_bucket=0, off_bucket=1)
 
-	Attributes:
-		mod: Modulus.
-		offset: Step offset; ``offset=0`` means step 0 falls in ``on_bucket``.
-		on_bucket: Bucket index returned on the modulus match.
-		off_bucket: Bucket index returned otherwise.
-	"""
+    Attributes:
+            mod: Modulus.
+            offset: Step offset; ``offset=0`` means step 0 falls in ``on_bucket``.
+            on_bucket: Bucket index returned on the modulus match.
+            off_bucket: Bucket index returned otherwise.
+    """
 
-	mod: int
-	offset: int = 0
-	on_bucket: int = 0
-	off_bucket: int = 1
+    mod: int
+    offset: int = 0
+    on_bucket: int = 0
+    off_bucket: int = 1
 
-	def __post_init__(self) -> None:
-		if self.mod <= 0:
-			raise ValueError(f"ModBucketRule.mod must be > 0, got {self.mod}.")
+    def __post_init__(self) -> None:
+        if self.mod <= 0:
+            raise ValueError(f"ModBucketRule.mod must be > 0, got {self.mod}.")
 
-	def select(self, step: int) -> int:
-		return self.on_bucket if ((step - self.offset) % self.mod) == 0 else self.off_bucket
+    def select(self, step: int) -> int:
+        return self.on_bucket if ((step - self.offset) % self.mod) == 0 else self.off_bucket
 
-	def to_dict(self) -> dict[str, tp.Any]:
-		return {
-			"kind": "mod",
-			"mod": self.mod,
-			"offset": self.offset,
-			"on_bucket": self.on_bucket,
-			"off_bucket": self.off_bucket,
-		}
+    def to_dict(self) -> dict[str, tp.Any]:
+        return {
+            "kind": "mod",
+            "mod": self.mod,
+            "offset": self.offset,
+            "on_bucket": self.on_bucket,
+            "off_bucket": self.off_bucket,
+        }
 
 
 @dataclass
 class StepThresholdRule(BucketRule):
-	"""N-bucket curriculum by sorted step thresholds.
+    """N-bucket curriculum by sorted step thresholds.
 
-	``thresholds=[100, 500]`` -> bucket 0 for ``step < 100``, 1 for
-	``100 <= step < 500``, 2 for ``step >= 500``.
+    ``thresholds=[100, 500]`` -> bucket 0 for ``step < 100``, 1 for
+    ``100 <= step < 500``, 2 for ``step >= 500``.
 
-	Attributes:
-		thresholds: Ascending step cutoffs. ``len(thresholds) + 1`` buckets.
-	"""
+    Attributes:
+            thresholds: Ascending step cutoffs. ``len(thresholds) + 1`` buckets.
+    """
 
-	thresholds: list[int]
+    thresholds: list[int]
 
-	def __post_init__(self) -> None:
-		self.thresholds = sorted(self.thresholds)
-		if any(b <= a for a, b in zip(self.thresholds[:-1], self.thresholds[1:], strict=False)):
-			raise ValueError(f"StepThresholdRule.thresholds must be strictly increasing, got {self.thresholds}.")
+    def __post_init__(self) -> None:
+        self.thresholds = sorted(self.thresholds)
+        if any(b <= a for a, b in zip(self.thresholds[:-1], self.thresholds[1:], strict=False)):
+            raise ValueError(f"StepThresholdRule.thresholds must be strictly increasing, got {self.thresholds}.")
 
-	def select(self, step: int) -> int:
-		idx = 0
-		for t in self.thresholds:
-			if step >= t:
-				idx += 1
-			else:
-				break
-		return idx
+    def select(self, step: int) -> int:
+        idx = 0
+        for t in self.thresholds:
+            if step >= t:
+                idx += 1
+            else:
+                break
+        return idx
 
-	def to_dict(self) -> dict[str, tp.Any]:
-		return {"kind": "step", "thresholds": list(self.thresholds)}
+    def to_dict(self) -> dict[str, tp.Any]:
+        return {"kind": "step", "thresholds": list(self.thresholds)}
+
+
+@dataclass
+class CycleBucketRule(BucketRule):
+    """Round-robin blocks of ``period`` steps across ``num_buckets`` buckets.
+
+    ``select(step) == (step // period) % num_buckets``: steps 0..period-1 run
+    bucket 0, the next ``period`` steps bucket 1, and so on, wrapping around.
+    The alternating case (5 steps of bucket 0, then 5 of bucket 1, repeat) is::
+
+        CycleBucketRule(period=5, num_buckets=2)
+
+    Attributes:
+            period: Consecutive steps spent in each bucket before advancing.
+            num_buckets: Number of buckets cycled through.
+    """
+
+    period: int
+    num_buckets: int = 2
+
+    def __post_init__(self) -> None:
+        if self.period <= 0:
+            raise ValueError(f"CycleBucketRule.period must be > 0, got {self.period}.")
+        if self.num_buckets <= 0:
+            raise ValueError(f"CycleBucketRule.num_buckets must be > 0, got {self.num_buckets}.")
+
+    def select(self, step: int) -> int:
+        return (step // self.period) % self.num_buckets
+
+    def to_dict(self) -> dict[str, tp.Any]:
+        return {"kind": "cycle", "period": self.period, "num_buckets": self.num_buckets}
 
 
 @dataclass
 class CallableBucketRule(BucketRule):
-	"""Escape hatch wrapping any ``(int) -> int`` callable.
+    """Escape hatch wrapping any ``(int) -> int`` callable.
 
-	Not serializable for eLarge configs; :meth:`to_dict` raises ``TypeError``.
-	"""
+    Not serializable for eLarge configs; :meth:`to_dict` raises ``TypeError``.
+    """
 
-	fn: tp.Callable[[int], int]
+    fn: tp.Callable[[int], int]
 
-	def select(self, step: int) -> int:
-		return int(self.fn(step))
+    def select(self, step: int) -> int:
+        return int(self.fn(step))
 
-	def to_dict(self) -> dict[str, tp.Any]:
-		raise TypeError("CallableBucketRule is not serializable; use ModBucketRule or StepThresholdRule for eLarge.")
+    def to_dict(self) -> dict[str, tp.Any]:
+        raise TypeError("CallableBucketRule is not serializable; use ModBucketRule or StepThresholdRule for eLarge.")
 
 
 @dataclass
 class TrainingBucket:
-	"""One per-step training configuration variant.
+    """One per-step training configuration variant.
 
-	The model config is *not* an attention field; it is a general override of
-	the base model config. ``attn_mechanism`` is just one of the knobs you can
-	put in ``config``.
+    The model config is *not* an attention field; it is a general override of
+    the base model config. ``attn_mechanism`` is just one of the knobs you can
+    put in ``config``.
 
-	Attributes:
-		name: Human-readable identifier (used in logs/metrics).
-		max_length: Packing/collation target for this bucket's data.
-		config: Model-config variant.
+    Attributes:
+            name: Human-readable identifier (used in logs/metrics).
+            max_length: Packing/collation target for this bucket's data.
+            config: Model-config variant.
 
-			* ``None`` -> inherit the trainer's base model config unchanged.
-			* ``dict`` -> deep-copy the base config and ``setattr`` each key.
-			* ``EasyDeLBaseConfig`` -> used as-is (caller must keep it
-			  structure-compatible with the base config).
-		gradient_accumulation_steps: Per-bucket grad-accum; ``None`` inherits
-			from ``TrainingArguments``.
-		loss_config: Per-bucket loss config; ``None`` inherits.
-		step_partition_spec: Per-bucket batch sharding spec; ``None`` inherits.
-	"""
+                    * ``None`` -> inherit the trainer's base model config unchanged.
+                    * ``dict`` -> deep-copy the base config and ``setattr`` each key.
+                    * ``EasyDeLBaseConfig`` -> used as-is (caller must keep it
+                      structure-compatible with the base config).
+            gradient_accumulation_steps: Per-bucket grad-accum; ``None`` inherits
+                    from ``TrainingArguments``.
+            loss_config: Per-bucket loss config; ``None`` inherits.
+            step_partition_spec: Per-bucket batch sharding spec; ``None`` inherits.
+            total_batch_size: Per-bucket global batch size for this bucket's
+                    dataloader and compiled step; ``None`` inherits the trainer's
+                    ``training_batch_size``.
+    """
 
-	name: str
-	max_length: int
-	config: "EasyDeLBaseConfig | dict[str, tp.Any] | None" = None
-	gradient_accumulation_steps: int | None = None
-	loss_config: "LossConfig | None" = None
-	step_partition_spec: PartitionSpec | None = None
-	# dataset is attached separately on the trainer (one source per bucket),
-	# not on this dataclass, to keep it free of dataset/dataloader imports.
+    name: str
+    max_length: int
+    config: "EasyDeLBaseConfig | dict[str, tp.Any] | None" = None
+    gradient_accumulation_steps: int | None = None
+    loss_config: "LossConfig | None" = None
+    step_partition_spec: PartitionSpec | None = None
+    total_batch_size: int | None = None
+    # dataset is attached separately on the trainer (one source per bucket),
+    # not on this dataclass, to keep it free of dataset/dataloader imports.
 
 
 def resolve_bucket_config(
-	base_config: "EasyDeLBaseConfig",
-	bucket: TrainingBucket,
+    base_config: "EasyDeLBaseConfig",
+    bucket: TrainingBucket,
 ) -> "EasyDeLBaseConfig":
-	"""Resolve a bucket's model config against a base config.
+    """Resolve a bucket's model config against a base config.
 
-	Args:
-		base_config: The trainer's base model config.
-		bucket: The bucket whose ``config`` field is resolved.
+    Args:
+            base_config: The trainer's base model config.
+            bucket: The bucket whose ``config`` field is resolved.
 
-	Returns:
-		The resolved :class:`EasyDeLBaseConfig`. When ``bucket.config`` is a
-		dict, a deep copy of ``base_config`` is returned with each key applied
-		via ``setattr``; the base config is never mutated.
+    Returns:
+            The resolved :class:`EasyDeLBaseConfig`. When ``bucket.config`` is a
+            dict, a deep copy of ``base_config`` is returned with each key applied
+            via ``setattr``; the base config is never mutated.
 
-	Raises:
-		AttributeError: if a dict override key is not a field of the base
-			config.
-	"""
-	if bucket.config is None:
-		return base_config
-	if isinstance(bucket.config, dict):
-		cfg = copy.deepcopy(base_config)
-		for key, value in bucket.config.items():
-			if not hasattr(cfg, key):
-				raise AttributeError(
-					f"Bucket {bucket.name!r}: base config has no field {key!r} to override."
-				)
-			setattr(cfg, key, value)
-		return cfg
-	# Already an EasyDeLBaseConfig (or compatible): use as-is.
-	return bucket.config
+    Raises:
+            AttributeError: if a dict override key is not a field of the base
+                    config.
+    """
+    if bucket.config is None:
+        return base_config
+    if isinstance(bucket.config, dict):
+        cfg = copy.deepcopy(base_config)
+        for key, value in bucket.config.items():
+            if not hasattr(cfg, key):
+                raise AttributeError(f"Bucket {bucket.name!r}: base config has no field {key!r} to override.")
+            setattr(cfg, key, value)
+        return cfg
+    # Already an EasyDeLBaseConfig (or compatible): use as-is.
+    return bucket.config

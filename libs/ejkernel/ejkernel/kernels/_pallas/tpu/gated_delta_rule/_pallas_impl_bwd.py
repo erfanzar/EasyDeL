@@ -756,7 +756,9 @@ def _chunk_gdr_bwd(
     d_out = d_out.reshape(B, H, num_chunks, chunk_size, V_dim)
 
     segmented = seg_c is not None
-    group_size = _N_FUSE if _N_FUSE > 1 and num_chunks % _N_FUSE == 0 else 1
+    # the segmented grad kernel does not recompute intra-group pre-states, so it
+    # must see exactly one chunk per group (matches the segmented fwd cores)
+    group_size = 1 if segmented else (_N_FUSE if _N_FUSE > 1 and num_chunks % _N_FUSE == 0 else 1)
     num_groups = num_chunks // group_size
 
     q_tm = query.reshape(B, H, num_groups, group_size, chunk_size, K_dim).transpose(2, 0, 1, 3, 4, 5)
@@ -999,12 +1001,8 @@ def _chunk_gdr_grouped_bwd(
     q_tm = query.reshape(B, Hq, num_groups, group_size, chunk_size, K_dim).transpose(2, 0, 1, 3, 4, 5)
     k_tm = key.reshape(B, Hq, num_groups, group_size, chunk_size, K_dim).transpose(2, 0, 1, 3, 4, 5)
     v_tm = value.reshape(B, Hv, num_groups, group_size, chunk_size, V_dim).transpose(2, 0, 1, 3, 4, 5)
-    beta_tm = beta.reshape(B, Hv, num_groups, group_size, chunk_size)[:, :, :, None, :, :].transpose(
-        2, 0, 1, 3, 4, 5
-    )
-    decay_tm = decay.reshape(B, Hv, num_groups, group_size, chunk_size)[:, :, :, None, :, :].transpose(
-        2, 0, 1, 3, 4, 5
-    )
+    beta_tm = beta.reshape(B, Hv, num_groups, group_size, chunk_size)[:, :, :, None, :, :].transpose(2, 0, 1, 3, 4, 5)
+    decay_tm = decay.reshape(B, Hv, num_groups, group_size, chunk_size)[:, :, :, None, :, :].transpose(2, 0, 1, 3, 4, 5)
     state_pre_tm = state_group_pre.transpose(2, 0, 1, 3, 4)
     d_out_tm = d_out.transpose(2, 0, 1, 3, 4, 5)
     if segmented:

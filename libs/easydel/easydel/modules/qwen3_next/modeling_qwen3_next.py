@@ -3178,7 +3178,11 @@ class Qwen3NextLinearAttention(spx.Module):
         # reading ``_q_segment_ids`` also survives earlier attention layers that may
         # have materialized ``_attention_mask`` on the same MaskInfo object.
         seg_ids = None
-        if mask_info is not None:
+        if mask_info is not None and seq_len > 1:
+            # seq_len == 1 is autoregressive decode: slicing packed ids to one
+            # position would keep position 0's id (-1 under left padding),
+            # mismarking the live token; the decode paths carry state via the
+            # cache and need no segment reset.
             seg_ids = getattr(mask_info, "_q_segment_ids", None)
         if seg_ids is not None:
             seg_ids = _normalize_packed_segment_ids(seg_ids, seq_len)

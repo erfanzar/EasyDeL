@@ -2454,14 +2454,18 @@ def _infer_batch_size(batch: tp.Any) -> int:
         ValueError: If no array-typed leaf exposes a leading dimension.
     """
 
+    leaves = tu.tree_leaves(batch)
     leading_dims = [
-        int(leaf.shape[0])
-        for leaf in tu.tree_leaves(batch)
-        if hasattr(leaf, "shape") and len(getattr(leaf, "shape", ())) >= 1
+        int(leaf.shape[0]) for leaf in leaves if hasattr(leaf, "shape") and len(getattr(leaf, "shape", ())) >= 1
     ]
     if not leading_dims:
+        keys = list(batch.keys())[:8] if isinstance(batch, dict) else "n/a"
+        leaf_types = sorted({type(leaf).__name__ for leaf in leaves[:64]})
         raise ValueError(
-            "Unable to infer batch size from `batch`; expected at least one array leaf with a leading batch dimension."
+            "Unable to infer batch size from `batch`; expected at least one array leaf with a leading batch "
+            f"dimension. Got batch type={type(batch).__name__}, keys={keys}, num_leaves={len(leaves)}, "
+            f"leaf types={leaf_types} — non-array leaves usually mean the dataloader/collator emitted python "
+            "lists or raw (untokenized) rows instead of stacked arrays."
         )
     return collections.Counter(leading_dims).most_common(1)[0][0]
 

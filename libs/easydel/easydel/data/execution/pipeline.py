@@ -1468,7 +1468,14 @@ def build_dataset(mixture: DatasetMixture) -> "DS | IDS":
 
         per_ds.append(ds)
         dataset_name = getattr(inform, "name", None) or getattr(inform, "data_files", None) or f"dataset_{index}"
-        per_ds_by_name[str(dataset_name)] = ds
+        key = str(dataset_name)
+        if key in per_ds_by_name:
+            raise ValueError(
+                f"Duplicate dataset key {key!r} in mixture informs (name or data_files repeats). "
+                "Give each inform a unique `name` so block mixture and mixture_weights can "
+                "address every dataset; otherwise one of them would be silently dropped."
+            )
+        per_ds_by_name[key] = ds
 
     if mixture.streaming:
         if getattr(mixture, "block_mixture", False):
@@ -1499,31 +1506,39 @@ def build_dataset(mixture: DatasetMixture) -> "DS | IDS":
     if getattr(mixture, "pack_tokens", False):
         from datasets import IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 
-        gen = pack_pre_tokenized(
-            iter(mixed),
-            seq_length=mixture.pack_seq_length or 1024,
-            eos_token_id=mixture.pack_eos_token_id,
-            batch_size=mixture.batch_size,
-            shuffle=mixture.pack_shuffle,
-            buffer_factor=mixture.pack_shuffle_buffer_factor,
-        )
-        return IterableDataset.from_generator(gen)
+        def _packed_gen(mixed=mixed, mixture=mixture):
+            # iter(mixed) must be created lazily: from_generator pickles the
+            # callable (fingerprint hashing), and live generator objects in the
+            # closure make that raise TypeError.
+            yield from pack_pre_tokenized(
+                iter(mixed),
+                seq_length=mixture.pack_seq_length or 1024,
+                eos_token_id=mixture.pack_eos_token_id,
+                batch_size=mixture.batch_size,
+                shuffle=mixture.pack_shuffle,
+                buffer_factor=mixture.pack_shuffle_buffer_factor,
+            )()
+
+        return IterableDataset.from_generator(_packed_gen)
 
     if getattr(mixture, "pack_on_the_fly", False):
         if mixture.tokenize_callback is None:
             raise ValueError("pack_on_the_fly=True requires mixture.tokenize_callback")
         from datasets import IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 
-        gen = pack_constant_length(
-            iter(mixed),
-            tokenize_fn=mixture.tokenize_callback,
-            seq_length=mixture.pack_seq_length or 1024,
-            eos_token_id=mixture.pack_eos_token_id,
-            batch_size=mixture.batch_size,
-            shuffle=mixture.pack_shuffle,
-            buffer_factor=mixture.pack_shuffle_buffer_factor,
-        )
-        return IterableDataset.from_generator(gen)
+        def _packed_otf_gen(mixed=mixed, mixture=mixture):
+            # See _packed_gen: defer iter(mixed) so the callable stays picklable.
+            yield from pack_constant_length(
+                iter(mixed),
+                tokenize_fn=mixture.tokenize_callback,
+                seq_length=mixture.pack_seq_length or 1024,
+                eos_token_id=mixture.pack_eos_token_id,
+                batch_size=mixture.batch_size,
+                shuffle=mixture.pack_shuffle,
+                buffer_factor=mixture.pack_shuffle_buffer_factor,
+            )()
+
+        return IterableDataset.from_generator(_packed_otf_gen)
 
     if mixture.batch_size and mixture.batch_size > 1 and is_streaming(mixed):
         mixed = mixed.batch(mixture.batch_size)

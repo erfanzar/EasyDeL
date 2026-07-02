@@ -59,19 +59,23 @@ def _parse_args(argv):
     p.add_argument("--dtype", default=None, choices=["float32", "bfloat16"])
     p.add_argument("--grad", action="store_true", help="also run value_and_grad")
     p.add_argument("--iters", type=int, default=3)
-    p.add_argument("--no-shard", action="store_true", help="run on a single device instead of shard_map over the local mesh")
+    p.add_argument(
+        "--no-shard", action="store_true", help="run on a single device instead of shard_map over the local mesh"
+    )
     return p.parse_args(argv)
 
 
 def _defaults(args):
     if args.mode == "interp":
         args.batch = args.batch or 2
-        args.seqlen = args.seqlen or 512
+        # >= _N_FUSE chunks with mid-chunk segment boundaries: discriminates the
+        # fused-group segmented backward (stale intra-group states) from correct code
+        args.seqlen = args.seqlen or 1024
         args.hq = args.hq or 2
         args.hv = args.hv or 6
         args.dimk = min(args.dimk, 32) if args.dimk == 128 else args.dimk
         args.dimv = min(args.dimv, 32) if args.dimv == 128 else args.dimv
-        args.seg_period = 128 if args.seg_period is None else args.seg_period
+        args.seg_period = 320 if args.seg_period is None else args.seg_period
         args.dtype = args.dtype or "float32"
         args.grad = True
     elif args.mode == "tiny":
@@ -141,7 +145,9 @@ def main(argv=None):
 
         ndev = jax.local_device_count()
         if B % ndev:
-            raise SystemExit(f"batch {B} does not divide {ndev} local devices; pick a shardable batch or pass --no-shard")
+            raise SystemExit(
+                f"batch {B} does not divide {ndev} local devices; pick a shardable batch or pass --no-shard"
+            )
         mesh = Mesh(np.asarray(jax.local_devices()), ("dp",))
         in_specs = tuple(P("dp") for _ in ops)
         out_specs = (P("dp"), P("dp"))
@@ -192,7 +198,9 @@ def main(argv=None):
     out, st = jax.block_until_ready(fwd_j(*ops))
     t_compile = time.perf_counter() - t0
     print(f"[{args.mode}] fwd compile+run {t_compile:.2f}s out={out.shape} state={st.shape}")
-    print(f"[{args.mode}] fwd finite: out={bool(jnp.all(jnp.isfinite(out.astype(jnp.float32))))} state={bool(jnp.all(jnp.isfinite(st.astype(jnp.float32))))}")
+    print(
+        f"[{args.mode}] fwd finite: out={bool(jnp.all(jnp.isfinite(out.astype(jnp.float32))))} state={bool(jnp.all(jnp.isfinite(st.astype(jnp.float32))))}"
+    )
     times = []
     for _ in range(args.iters):
         t0 = time.perf_counter()

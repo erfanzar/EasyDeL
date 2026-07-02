@@ -1296,7 +1296,9 @@ def pack_pre_tokenized(stream, seq_length: int, eos_token_id: int, batch_size: i
         buf = np.array([], dtype=np.int32)
         eos = np.array([eos_token_id], dtype=np.int32)
         shuffle_buf = []
-        max_buf = batch_size * buffer_factor
+        # batch_size may be None (unbatched row stream); it only scales the
+        # reservoir used when shuffle is enabled, so fall back to 1.
+        max_buf = (batch_size or 1) * buffer_factor
 
         for sample in stream:
             toks = sample["tokens"]

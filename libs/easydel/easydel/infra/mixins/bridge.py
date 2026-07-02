@@ -3728,7 +3728,6 @@ class EasyBridgeMixin(PushToHubMixin):
             config_to_save.__dict__.pop("attn_dtype", None)
             config_to_save.__dict__.pop("attn_softmax_dtype", None)
             config_to_save.architectures = [module.__name__]
-            config_to_save.save_pretrained(str(save_root))
             if str(save_root).startswith("gs://"):
                 (save_root / CONFIG_NAME).write_text(config_to_save.to_json_string(use_diff=True))
             else:

@@ -858,8 +858,11 @@ class GatedDeltaRuleConfig(BaseOperationConfig):
             chunked path should write large phase-1 outputs in the input dtype.
             Ignored by XLA and by the Pallas custom-VJP training residual path.
         use_input_dtype_state: Whether the TPU/Pallas forward-only chunked path
-            should carry recurrent state in the input dtype. Leave this disabled
-            for stateful prefill/decode paths that need fp32 cache state.
+            should carry recurrent state in the input dtype (default ``True``;
+            the public final state was already cast to the input dtype before
+            this knob existed). Set ``False`` for stateful prefill/decode
+            callers that need the internal carry kept in fp32 — the easydel
+            adapter does this automatically whenever a cache state is passed in.
         sequence_parallel_truncate_state_gradient: Whether sequence-parallel
             GDR should stop gradients through the affine summary/cross-shard
             state correction path while preserving exact forward propagation.

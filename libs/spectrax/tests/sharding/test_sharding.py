@@ -12,7 +12,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 import spectrax as spx
 from spectrax import common_types as ct
 from spectrax.nn.linear import Linear
@@ -213,7 +212,7 @@ def test_mesh_query_helpers_exclude_mpmd_axis_from_spmd_axes():
 def test_mpmd_with_sharding_constraint_uses_explicit_stage_mesh():
     """Mpmd with sharding constraint uses explicit stage mesh."""
     mesh = create_mesh(axis_dims=(1, -1), axis_names=("pp", "tp"), mpmd_axis="pp")
-    x = jnp.ones((2, 4), dtype=jnp.float32)
+    x = jnp.ones((2, 2 * jax.device_count()), dtype=jnp.float32)
 
     y = spx.with_sharding_constraint(x, jax.sharding.PartitionSpec("pp", "tp"), mesh=mesh, stage=0)
 
@@ -225,7 +224,7 @@ def test_mpmd_with_sharding_constraint_uses_explicit_stage_mesh():
 def test_mpmd_with_sharding_constraint_promotes_active_raw_mesh():
     """Mpmd with sharding constraint promotes active raw mesh."""
     mesh = create_mesh(axis_dims=(1, -1), axis_names=("pp", "tp"), mpmd_axis="pp")
-    x = jnp.ones((2, 4), dtype=jnp.float32)
+    x = jnp.ones((2, 2 * jax.device_count()), dtype=jnp.float32)
 
     with mesh, spx.assign_stage(total=1, current=0):
         y = spx.with_sharding_constraint(
@@ -256,7 +255,7 @@ def test_mpmd_with_sharding_constraint_can_be_ignored():
 def test_with_sharding_constraint_handles_pytrees():
     """With sharding constraint handles pytrees."""
     mesh = create_mesh(axis_dims=(1, -1), axis_names=("pp", "tp"), mpmd_axis="pp")
-    batch = {"x": jnp.ones((2, 4), dtype=jnp.float32)}
+    batch = {"x": jnp.ones((2, 2 * jax.device_count()), dtype=jnp.float32)}
 
     y = spx.with_sharding_constraint(
         batch,
@@ -294,7 +293,7 @@ def test_mpmd_with_sharding_constraint_uses_requested_stage_rank():
 def test_lax_reshard_and_sharding_structure_are_mpmd_aware():
     """Lax reshard and sharding structure are mpmd aware."""
     mesh = create_mesh(axis_dims=(1, -1), axis_names=("pp", "tp"), mpmd_axis="pp")
-    tree = {"x": jnp.ones((2, 4), dtype=jnp.float32), "meta": 1}
+    tree = {"x": jnp.ones((2, 2 * jax.device_count()), dtype=jnp.float32), "meta": 1}
 
     out = spx.lax_reshard(tree, {"x": jax.sharding.PartitionSpec("pp", "tp"), "meta": None}, mesh=mesh, stage=0)
     sharding_tree = spx.extract_sharding_structure(out, mesh=mesh, stage=0)
@@ -310,7 +309,7 @@ def test_lax_reshard_and_sharding_structure_are_mpmd_aware():
 def test_lax_reshard_uses_active_spxmesh_context():
     """Lax reshard uses active spxmesh context."""
     mesh = create_mesh(axis_dims=(1, -1), axis_names=("pp", "tp"), mpmd_axis="pp")
-    x = jnp.ones((2, 4), dtype=jnp.float32)
+    x = jnp.ones((2, 2 * jax.device_count()), dtype=jnp.float32)
 
     with mesh:
         y = spx.lax_reshard(x, jax.sharding.PartitionSpec("pp", "tp"), stage=0)

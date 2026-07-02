@@ -51,6 +51,10 @@ def _patch_hf_phimoe_rotary_mscale() -> None:
       patched ``__init__`` so the patch only runs once per process.
     """
     try:
+        from transformers.utils import is_torch_available
+
+        if not is_torch_available():
+            return
         from transformers.models.phimoe import modeling_phimoe as hf_phimoe
     except Exception:
         return

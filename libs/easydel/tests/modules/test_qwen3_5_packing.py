@@ -43,7 +43,6 @@ ATOL = 2e-3
 
 def _build(layer_types):
     import spectrax as spx
-
     from easydel.modules.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
     from easydel.modules.qwen3_5.qwen3_5_configuration import Qwen3_5TextConfig
 
@@ -84,6 +83,10 @@ def _packed_logits(model, packed, seg):
     [
         pytest.param(["full_attention", "full_attention"], id="full_attention"),
         pytest.param(["linear_attention", "full_attention"], id="hybrid_gdr_full"),
+        # full-attention BEFORE linear: the full layer materializes/caches the
+        # attention mask on MaskInfo, which must not strip packed segment ids
+        # from later linear layers (regression: silent cross-document recurrence)
+        pytest.param(["full_attention", "linear_attention"], id="hybrid_full_gdr"),
         pytest.param(["linear_attention", "linear_attention"], id="linear_only"),
     ],
 )

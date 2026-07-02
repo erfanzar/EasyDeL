@@ -220,7 +220,30 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
         assert mesh is not None, "mesh must be provided for shard_map execution"
         assert in_specs is not None, "in_specs must be provided for shard_map execution"
         assert out_specs is not None, "out_specs must be provided for shard_map execution"
-        use_sequence_parallel = _spec_uses_sequence_axis(in_specs[0], sequence_axis_name)
+        # A spec can name the sequence axis while the mesh axis has size 1 (e.g.
+        # sp=1 meshes); the SP decomposition would then run its two-pass affine
+        # path for nothing, doubling kernel cost. Gate on the actual axis size.
+        _seq_axis_size = 1
+        if sequence_axis_name is not None:
+            _seq_axis_size = int(dict(getattr(mesh, "shape", {})).get(sequence_axis_name, 1))
+        use_sequence_parallel = _seq_axis_size > 1 and _spec_uses_sequence_axis(in_specs[0], sequence_axis_name)
+
+        if not use_sequence_parallel and len(in_specs[0]) > 1:
+            # The GDR scan carries state serially across the sequence; a shard_map
+            # over a sequence-sharded input without the SP decomposition computes
+            # per-shard results from a zero state — silently wrong (check_vma is
+            # disabled). Refuse instead of returning garbage.
+            _seq_entry = in_specs[0][1]
+            _parts = _seq_entry if isinstance(_seq_entry, tuple) else (_seq_entry,) if _seq_entry is not None else ()
+            _mesh_shape = dict(getattr(mesh, "shape", {}))
+            _bad = [p for p in _parts if int(_mesh_shape.get(p, 1)) > 1]
+            if _bad:
+                raise ValueError(
+                    f"gated_delta_rule received sequence-sharded inputs (seq dim sharded on {_bad} with sizes "
+                    f"{[int(_mesh_shape[p]) for p in _bad]}) but the sequence-parallel path is inactive "
+                    f"(sequence_axis_name={sequence_axis_name!r}). Set sequence_axis_name to the mesh axis the "
+                    "sequence is sharded on, or replicate the sequence dimension."
+                )
         run_cfg = _normalize_gdr_config(cfg)
         truncate_sp_state_grad = bool(getattr(run_cfg, "sequence_parallel_truncate_state_gradient", False))
         sp_forward_only = bool(getattr(run_cfg, "sequence_parallel_forward_only", False))
@@ -333,9 +356,7 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
                 for i in range(num_sequence_shards):
                     prefix_state = lax.cond(
                         i < shard_index,
-                        lambda state, i=i: _finite_state(
-                            _apply_affine_summary(summaries_a[i], state) + summaries_b[i]
-                        ),
+                        lambda state, i=i: _finite_state(_apply_affine_summary(summaries_a[i], state) + summaries_b[i]),
                         lambda state: state,
                         prefix_state,
                     )

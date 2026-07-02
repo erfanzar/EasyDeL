@@ -94,6 +94,10 @@ def _patch_hf_qwen3_next_load_balancing_loss() -> None:
     sentinel) and silently no-ops when ``transformers`` is missing.
     """
     try:
+        from transformers.utils import is_torch_available
+
+        if not is_torch_available():
+            return
         from transformers.models.qwen3_next import modeling_qwen3_next as hf_qwen3_next
     except Exception:
         return
