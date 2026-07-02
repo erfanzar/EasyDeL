@@ -3172,11 +3172,13 @@ class Qwen3NextLinearAttention(spx.Module):
         decay = A[None, None, :] * jax.nn.softplus(alpha_biased)
         beta = jax.nn.sigmoid(beta)
 
-        # Sequence packing: only explicit segment ids from packed batches should reach
-        # GDR. Accessing ``mask_info.q_segment_ids`` would lazily materialize padding-style
-        # ids from an ordinary attention mask and force the slower segment-aware XLA path.
+        # Sequence packing: use stored segment ids when they are already present.
+        # Do not access ``mask_info.q_segment_ids`` here; that property can lazily
+        # materialize padding-style ids from an ordinary attention mask. Directly
+        # reading ``_q_segment_ids`` also survives earlier attention layers that may
+        # have materialized ``_attention_mask`` on the same MaskInfo object.
         seg_ids = None
-        if mask_info is not None and getattr(mask_info, "_attention_mask", None) is None:
+        if mask_info is not None:
             seg_ids = getattr(mask_info, "_q_segment_ids", None)
         if seg_ids is not None:
             seg_ids = _normalize_packed_segment_ids(seg_ids, seq_len)

@@ -276,9 +276,11 @@ class RayResources:
         try:
             success, value = queue.get(timeout=5)
         except QueueEmpty as e:
-            logger.error("Process timed out")
-            process.terminate()
-            raise RuntimeError("Process timed out") from e
+            if process.exitcode == 0:
+                logger.warning("Process finished with exit code 0 but returned no queue payload")
+                return None
+            logger.error("Process finished without result (exitcode=%s)", process.exitcode)
+            raise RuntimeError(f"Process finished without result (exitcode={process.exitcode})") from e
 
         if success:
             return value

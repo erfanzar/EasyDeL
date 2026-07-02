@@ -191,8 +191,7 @@ class Schedule(ABC):
             raise ValueError(f"Schedule.microbatches must be >= 1, got {self.microbatches}.")
         if self.terminal_backward_mode not in ("eager", "scheduled"):
             raise ValueError(
-                "Schedule.terminal_backward_mode must be 'eager' or 'scheduled', "
-                f"got {self.terminal_backward_mode!r}."
+                f"Schedule.terminal_backward_mode must be 'eager' or 'scheduled', got {self.terminal_backward_mode!r}."
             )
         if self.schedule_dispatcher not in ("auto", "deterministic_nonblocking"):
             raise ValueError(

@@ -39,12 +39,13 @@ os.environ.setdefault("ENABLE_DISTRIBUTED_INIT", "0")
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
 
-import easydel as ed
 import jax
 import numpy as np
 import optax
 import pytest
 from jax import numpy as jnp
+
+import easydel as ed
 
 if jax.device_count() < 4:
     pytest.skip(
@@ -256,6 +257,7 @@ def _path_matches_fused_param(path: str, module_path: str) -> bool:
 
 def _canonical_fused_parameter_leaves(model):
     import spectrax as spx
+
     from easydel.layers.layouts import canonicalize_fused_state, fused_layout_param_specs
     from easydel.utils.traversals import flatten_dict
 
@@ -275,6 +277,7 @@ def _canonical_fused_parameter_leaves(model):
 
 def _runtime_fused_parameter_leaves(model):
     import spectrax as spx
+
     from easydel.layers.layouts import fused_layout_param_specs
     from easydel.utils.traversals import flatten_dict
 
@@ -526,9 +529,9 @@ def test_fused_checkpoint_save_load_tp_matrix(tmp_path, save_tp, load_tp):
     )
     restored = _logits(loaded)
     err = float(np.max(np.abs(reference - restored)))
-    assert err < _model_logit_tolerance(
-        "llama"
-    ), f"save_tp={save_tp} -> load_tp={load_tp} changed the model (max|Δlogits|={err})"
+    assert err < _model_logit_tolerance("llama"), (
+        f"save_tp={save_tp} -> load_tp={load_tp} changed the model (max|Δlogits|={err})"
+    )
     # the live config is overwritten to describe the layout now in memory
     assert getattr(loaded.config, "fused_param_tp", None) == load_tp
 
@@ -557,9 +560,9 @@ def test_fused_tp_survives_lost_marker(tmp_path):
     )
     restored = _logits(loaded)
     err = float(np.max(np.abs(reference - restored)))
-    assert err < _model_logit_tolerance(
-        "llama"
-    ), f"markerless checkpoint was not re-interleaved via the config.json tp (max|Δlogits|={err})"
+    assert err < _model_logit_tolerance("llama"), (
+        f"markerless checkpoint was not re-interleaved via the config.json tp (max|Δlogits|={err})"
+    )
 
 
 def test_fused_tp_backcompat_canonical_format(tmp_path):
@@ -593,9 +596,9 @@ def test_fused_tp_backcompat_canonical_format(tmp_path):
     )
     restored = _logits(loaded)
     err = float(np.max(np.abs(reference - restored)))
-    assert err < _model_logit_tolerance(
-        "llama"
-    ), f"previous-format canonical checkpoint failed to load at tp=2 (max|Δlogits|={err})"
+    assert err < _model_logit_tolerance("llama"), (
+        f"previous-format canonical checkpoint failed to load at tp=2 (max|Δlogits|={err})"
+    )
     assert getattr(loaded.config, "fused_param_tp", None) == 2
     assert "fused_param_layout" not in loaded.config.__dict__
 
@@ -735,9 +738,9 @@ def test_prefused_hf_checkpoint_tp2_save_tp4_load_exports_to_torch(tmp_path):
 
     assert hf_exported.keys() == hf_state.keys()
     for key, reference_tensor in hf_state.items():
-        assert torch.equal(
-            reference_tensor, hf_exported[key]
-        ), f"{key} changed across torch -> EasyDeL tp2 save -> EasyDeL tp4 load -> torch"
+        assert torch.equal(reference_tensor, hf_exported[key]), (
+            f"{key} changed across torch -> EasyDeL tp2 save -> EasyDeL tp4 load -> torch"
+        )
 
 
 def test_qwen3_next_dense_torch_tp2_save_tp4_load_exports_to_torch(tmp_path):
@@ -767,9 +770,9 @@ def test_qwen3_next_dense_torch_tp2_save_tp4_load_exports_to_torch(tmp_path):
 
     assert hf_exported.keys() == hf_reference.keys()
     for key, reference_tensor in hf_reference.items():
-        assert torch.equal(
-            reference_tensor, hf_exported[key]
-        ), f"{key} changed across dense Qwen3-Next torch -> EasyDeL tp2 save -> EasyDeL tp4 load -> torch"
+        assert torch.equal(reference_tensor, hf_exported[key]), (
+            f"{key} changed across dense Qwen3-Next torch -> EasyDeL tp2 save -> EasyDeL tp4 load -> torch"
+        )
 
 
 def _canonical_fused_optimizer_leaves(state):

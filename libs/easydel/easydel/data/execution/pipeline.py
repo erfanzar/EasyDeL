@@ -1346,9 +1346,10 @@ def build_dataset(mixture: DatasetMixture) -> "DS | IDS":
         >>> dataset = build_dataset(mixture)
     """
     per_ds = []
+    per_ds_by_name = {}
     content_target = mixture.text_target_field
 
-    for inform in mixture.informs:
+    for index, inform in enumerate(mixture.informs):
         ds = load_for_inform(inform, mixture)
 
         if getattr(inform, "format_fields", None):
@@ -1466,14 +1467,16 @@ def build_dataset(mixture: DatasetMixture) -> "DS | IDS":
                 pass
 
         per_ds.append(ds)
+        dataset_name = getattr(inform, "name", None) or getattr(inform, "data_files", None) or f"dataset_{index}"
+        per_ds_by_name[str(dataset_name)] = ds
 
     if mixture.streaming:
         if getattr(mixture, "block_mixture", False):
             weights = None
-            if mixture.mixture_weights and len(mixture.mixture_weights) == len(per_ds):
+            if mixture.mixture_weights and len(mixture.mixture_weights) == len(per_ds_by_name):
                 weights = mixture.mixture_weights
             mixed = block_mixture_interleave(
-                per_ds,
+                per_ds_by_name,
                 weights=weights,
                 block_size=getattr(mixture, "mixture_block_size", 2048),
                 seed=mixture.seed or 0,

@@ -22,6 +22,7 @@ autoscale/cluster.yaml
 autoscale/easydel-*.yaml
 !autoscale/easydel-cluster-template.yaml
 memory_log_dir/
+.ray_adc/
 wandb
 .ruff_cache/*
 launch_test.py

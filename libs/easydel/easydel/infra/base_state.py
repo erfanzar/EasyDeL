@@ -1699,6 +1699,7 @@ class EasyDeLState(_PyTreeNode):
         checkpoint_load_tensorstore_assume_metadata: bool = True,
         checkpoint_load_tensorstore_metadata_workers: int = 256,
         checkpoint_load_progress: bool | None = None,
+        skip_optimizer_state: bool = False,
         **kwargs,
     ) -> Self:
         """Load an EasyDeLState from a saved checkpoint directory.
@@ -1753,6 +1754,8 @@ class EasyDeLState(_PyTreeNode):
                 Defaults to True.
             tx_template (optax.GradientTransformation | None): Template optimizer for
                 inferring optimizer state structure when loading. Defaults to None.
+            skip_optimizer_state (bool): If true, load the checkpoint model weights
+                without restoring saved optimizer/tx state.
             **kwargs: Additional keyword arguments passed to the underlying
                 `EasyDeLBaseModule.from_pretrained` method.
 
@@ -1827,6 +1830,9 @@ class EasyDeLState(_PyTreeNode):
         load_directory = ePath(load_directory)
         checkpoint_step = _get_checkpoint_step(load_directory)
         has_optimizer_state = _has_saved_optimizer_state(load_directory)
+        if skip_optimizer_state and has_optimizer_state:
+            logger.info("Checkpoint %s contains optimizer state; skipping optimizer restore by request.", load_directory)
+            has_optimizer_state = False
         has_resume_model = _has_resume_model(load_directory)
         model_load_directory = load_directory
         resume_model_directory = load_directory / RESUME_MODEL_SUBDIR

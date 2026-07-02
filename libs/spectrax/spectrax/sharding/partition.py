@@ -56,6 +56,7 @@ import jax
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
+from .._internal.logging import get_logger
 from ..common_types import MODE_TRAIN, NOT_GIVEN
 from ..core._typing import Array, ArrayLike, Initializer
 from ..core.module import Module
@@ -70,6 +71,8 @@ if TYPE_CHECKING:
     from jax.sharding import Mesh
 
     from ..runtime.types.mesh import MpMdMesh
+
+logger = get_logger("spectrax-sharding")
 
 __all__ = [
     "apply_logical_sharding",
@@ -591,6 +594,90 @@ def _axis_partition_product(axis: object, mesh: "Mesh | SpxMesh | MpMdMesh | Non
     return _mesh_axis_size(mesh, axis)
 
 
+def _canonical_axis(axis: object) -> object:
+    """Collapse structurally-distinct but semantically-equal axis entries.
+
+    ``("dp",)`` and ``"dp"`` partition identically; an empty tuple is
+    replicated. Used so change-detection in
+    :func:`sanitize_partition_spec_for_mesh_and_shape` doesn't report a
+    tuple-to-scalar rewrite as a semantic sharding change.
+
+    Args:
+        axis: A single ``PartitionSpec`` entry.
+
+    Returns:
+        The canonical form of the entry.
+    """
+    if isinstance(axis, tuple):
+        if len(axis) == 0:
+            return None
+        if len(axis) == 1:
+            return axis[0]
+    return axis
+
+
+def _specs_equivalent(a: PartitionSpec, b: PartitionSpec) -> bool:
+    """Report whether two specs partition identically (up to canonical form).
+
+    Args:
+        a: First spec.
+        b: Second spec.
+
+    Returns:
+        ``True`` if both specs place every dimension on the same mesh axes.
+    """
+    return tuple(_canonical_axis(x) for x in a) == tuple(_canonical_axis(x) for x in b)
+
+
+def _describe_mesh(mesh: "Mesh | SpxMesh | MpMdMesh | None") -> str:
+    """Render a mesh as an ``{axis: size}`` string for log messages.
+
+    Args:
+        mesh: Any SpectraX or JAX mesh flavor, or ``None``.
+
+    Returns:
+        A compact human-readable description of the mesh axes.
+    """
+    names = _mesh_axis_names(mesh)
+    if not names:
+        return repr(mesh)
+    try:
+        return "{" + ", ".join(f"{n}: {_mesh_axis_size(mesh, n)}" for n in sorted(names)) + "}"
+    except Exception:
+        return repr(mesh)
+
+
+def _brag_spec_change(
+    requested: PartitionSpec,
+    applied: PartitionSpec,
+    shape: tuple[int, ...] | None,
+    mesh: "Mesh | SpxMesh | MpMdMesh | None",
+    reasons: list[str],
+) -> None:
+    """Announce (once per unique case) that a sharding request was rewritten.
+
+    Emits a single deduplicated ``WARNING`` describing the requested spec,
+    what was actually applied, the value shape, the mesh, and why each
+    rewrite happened. Deduplication is keyed on the full message so every
+    distinct (spec, shape, mesh, reason) combination warns exactly once.
+
+    Args:
+        requested: The spec the caller asked for.
+        applied: The spec that will actually be used.
+        shape: The value shape used for divisibility checks, if any.
+        mesh: The target mesh.
+        reasons: Human-readable explanations collected during sanitization.
+    """
+    logger.warn_once(
+        "sharding changed: requested %s -> applied %s (shape=%s, mesh=%s): %s",
+        requested,
+        applied,
+        shape,
+        _describe_mesh(mesh),
+        "; ".join(reasons),
+    )
+
+
 def sanitize_partition_spec_for_mesh_and_shape(
     spec: PartitionSpec | None,
     *,
@@ -627,13 +714,31 @@ def sanitize_partition_spec_for_mesh_and_shape(
     elif not isinstance(spec, PartitionSpec):
         spec = PartitionSpec(*tuple(spec))
 
+    requested = spec
+    reasons: list[str] = []
+
     mpmd_axis = _mpmd_axis_name(mesh)
     if mpmd_axis is not None:
-        spec = PartitionSpec(*(_drop_axis_name(axis, mpmd_axis) for axis in spec))
+        dropped = PartitionSpec(*(_drop_axis_name(axis, mpmd_axis) for axis in spec))
+        if not _specs_equivalent(dropped, spec):
+            # By-design on MPMD meshes (tensors are never constrained along
+            # the rank axis), so this stays at debug rather than warning.
+            logger.debug_once(
+                "sharding changed: dropped MPMD pipeline axis %r from %s -> %s",
+                mpmd_axis,
+                spec,
+                dropped,
+            )
+        spec = dropped
 
-    spec = PartitionSpec(*(_sanitize_axis_for_mesh(axis, mesh) for axis in spec))
+    filtered = PartitionSpec(*(_sanitize_axis_for_mesh(axis, mesh) for axis in spec))
+    if not _specs_equivalent(filtered, spec):
+        reasons.append(f"axis names absent from the mesh were removed ({spec} -> {filtered})")
+    spec = filtered
 
     if shape is not None and len(spec) > len(shape):
+        reasons.append(f"spec rank {len(spec)} exceeds value rank {len(shape)}; collapsed to fully replicated")
+        _brag_spec_change(requested, PartitionSpec(), shape, mesh, reasons)
         return PartitionSpec()
     if shape is not None:
         axes = list(tuple(spec))
@@ -641,10 +746,18 @@ def sanitize_partition_spec_for_mesh_and_shape(
         for dim, axis in enumerate(axes):
             product = _axis_partition_product(axis, mesh)
             if product > 1 and int(shape[dim]) % product != 0:
+                reasons.append(
+                    f"dim {dim} (size {shape[dim]}) is not divisible by axes {axis!r} "
+                    f"(product {product}); that dim is now replicated"
+                )
                 axes[dim] = None
                 changed = True
         if changed:
-            return PartitionSpec(*axes)
+            result = PartitionSpec(*axes)
+            _brag_spec_change(requested, result, shape, mesh, reasons)
+            return result
+    if reasons:
+        _brag_spec_change(requested, spec, shape, mesh, reasons)
     return spec
 
 

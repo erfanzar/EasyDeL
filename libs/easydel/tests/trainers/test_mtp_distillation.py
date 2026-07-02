@@ -30,11 +30,12 @@ import traceback
 
 os.environ.setdefault("ENABLE_DISTRIBUTED_INIT", "0")
 
-import easydel
-import easydel.trainers  # noqa: F401
 import jax
 import jax.numpy as jnp
 import spectrax as spx
+
+import easydel
+import easydel.trainers  # noqa: F401
 from easydel.modules.qwen3_5 import Qwen3_5ForCausalLM
 from easydel.modules.qwen3_5.qwen3_5_configuration import Qwen3_5TextConfig
 from easydel.trainers import DistillationConfig

@@ -153,6 +153,7 @@ def _recurrent_gdr_fwd(
     use_qk_l2norm: bool = True,
     chunk_size: int = 64,
     seg_ids: Int[Array, "batch seq_len"] | None = None,
+    use_input_dtype_state: bool = True,
 ) -> tuple[
     Float[Array, "batch num_heads seq_len d_state"],
     Float[Array, "batch num_heads head_dim d_state"],
@@ -435,7 +436,8 @@ def _recurrent_gdr_fwd(
     core_out = core_out_tm.transpose(1, 2, 0, 3, 4)
     outputs = core_out.reshape(B, H, -1, V_dim)[:, :, :L, :].astype(input_dtype)
 
-    return outputs, final_state.astype(input_dtype)
+    state_dtype = input_dtype if use_input_dtype_state else jnp.float32
+    return outputs, final_state.astype(state_dtype)
 
 
 def _chunk_gdr_fwd_impl(
@@ -788,6 +790,7 @@ def _chunk_gdr_fwd(
     initial_state: Float[Array, "batch num_heads head_dim d_state"] | None = None,
     use_qk_l2norm: bool = True,
     seg_ids: Int[Array, "batch seq_len"] | None = None,
+    use_input_dtype_state: bool = True,
 ) -> tuple[
     Float[Array, "batch num_heads seq_len d_state"],
     Float[Array, "batch num_heads head_dim d_state"],
@@ -836,6 +839,7 @@ def _chunk_gdr_fwd(
         use_qk_l2norm=use_qk_l2norm,
         chunk_size=chunk_size,
         seg_ids=seg_ids,
+        use_input_dtype_state=use_input_dtype_state,
     )
 
 

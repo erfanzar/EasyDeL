@@ -252,6 +252,39 @@ class TrainingArguments:
         default_factory=PoSEConfig,
         metadata={"help": "PoSE (positional skip-wise) position_ids augmentation; disabled by default."},
     )
+    buckets: tp.Any = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional list of easydel.trainers.buckets.TrainingBucket configs. When set together with "
+                "`bucket_rule`, the trainer builds one compiled step function and one dataloader per "
+                "bucket and selects which to use each step via `bucket_rule.select(step)`. "
+                "Each bucket is a model-config variant (e.g. attn_mechanism override) plus its own "
+                "max_length/dataloader; all buckets share one parameter/optimizer tree. "
+                "None (default) disables bucketing and the trainer behaves exactly as before."
+            )
+        },
+    )
+    bucket_rule: tp.Any = field(
+        default=None,
+        metadata={
+            "help": (
+                "easydel.trainers.buckets.BucketRule selecting the active bucket index per optimizer "
+                "step (e.g. ModBucketRule(mod=5, on_bucket=0, off_bucket=1)). Required when `buckets` "
+                "is set; ignored otherwise."
+            )
+        },
+    )
+    bucket_datasets: tp.Any = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional list of datasets/ShardedDataSource, one per bucket in `buckets`, used to "
+                "build each bucket's dataloader. Length must match `buckets`. When None and `buckets` "
+                "is set, all buckets fall back to the primary `dataset_train`."
+            )
+        },
+    )
     backend: str | None = field(
         default=None,
         metadata={"help": "The JAX backend to use (e.g., 'cpu', 'gpu', 'tpu').  If None, JAX will choose."},
@@ -681,7 +714,27 @@ class TrainingArguments:
                 "`jax.profiler.start_trace(profiler_path)` immediately after the first training step "
                 "completes (so the trace excludes the initial JIT-compile of step 1) and "
                 "`jax.profiler.stop_trace()` when training finishes. Only rank 0 records the trace "
-                "unless `log_all_workers` is True. Set to None to disable profiling."
+                "unless `profiler_log_all_workers` is True. Set to None to disable profiling."
+            )
+        },
+    )
+    profiler_log_all_workers: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether all distributed workers should record JAX profiler traces. This is separate "
+                "from `log_all_workers` so profiling TPU workers does not enable per-worker metrics, "
+                "W&B, progress bars, or checkpoint logging."
+            )
+        },
+    )
+    profiler_include_compile: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to start the JAX profiler before the first training step. This captures "
+                "the initial compile/HLO data needed by xprof op views, at the cost of including "
+                "compile time in the trace."
             )
         },
     )
@@ -2042,12 +2095,19 @@ class TrainingArguments:
         Returns:
             dict[str, tp.Any]: A dictionary containing all serializable fields.
         """
+        # Runtime-only fields that are not reconstructable from JSON: the
+        # resolved bucket objects/dataloaders are rebuilt by the trainer/eLarge
+        # from `bucket_rule` + `bucket_configs` (dicts), so they must not leak
+        # into the saved projection.
+        _runtime_only_fields = {"buckets", "bucket_datasets"}
         result = {}
         for field_obj in fields(self):
             value = getattr(self, field_obj.name)
             if value is Ellipsis:
                 continue
             if field_obj.name.startswith("_"):
+                continue
+            if field_obj.name in _runtime_only_fields:
                 continue
             if isinstance(value, tuple):
                 result[field_obj.name] = list(value)
@@ -2088,6 +2148,12 @@ class TrainingArguments:
 
             if field_name == "pose" and isinstance(value, dict):
                 processed_data[field_name] = PoSEConfig.from_dict(value)
+            elif field_name == "bucket_rule" and isinstance(value, dict):
+                # Reconstruct the BucketRule from its discriminator-tagged dict
+                # ({"kind": "mod", ...}). Deferred import avoids a cycle.
+                from easydel.trainers.buckets import BucketRule
+
+                processed_data[field_name] = BucketRule.from_dict(value)
             elif (
                 value is not None
                 and isinstance(value, list)

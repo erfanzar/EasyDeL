@@ -14,10 +14,11 @@
 
 """Tests for DeepSpec-style speculative drafter modules."""
 
-import easydel as ed
 import jax
 import jax.numpy as jnp
 import spectrax as spx
+
+import easydel as ed
 from easydel.infra.factory import TaskType, registry
 
 

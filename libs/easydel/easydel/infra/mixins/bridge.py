@@ -64,6 +64,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import time
 import typing as tp
@@ -3242,6 +3243,8 @@ class EasyBridgeMixin(PushToHubMixin):
 
         save_root = ePath(save_directory)
         save_root.mkdir(parents=True, exist_ok=True)
+        if not str(save_directory).startswith("gs://"):
+            save_root.mkdir(parents=True, exist_ok=True)
 
         hub_kwargs = {
             k: kwargs[k] for k in ("cache_dir", "revision", "token", "local_files_only", "force_download") if k in kwargs
@@ -3251,8 +3254,36 @@ class EasyBridgeMixin(PushToHubMixin):
         if "proxies" in kwargs:
             hub_kwargs["proxies"] = kwargs["proxies"]
 
+        gcs_source = str(pretrained_model_name_or_path).startswith("gs://")
+        gcs_meta_tmp: tempfile.TemporaryDirectory[str] | None = None
+        config_source = pretrained_model_name_or_path
+
+        def _gcs_object_uri(filename: str) -> str:
+            effective_subfolder = str(kwargs.get("subfolder", "") or "").strip("/").replace("\\", "/")
+            if effective_subfolder and filename.startswith(effective_subfolder + "/"):
+                filename = filename[len(effective_subfolder) + 1 :]
+            base = str(pretrained_model_name_or_path).rstrip("/")
+            if effective_subfolder:
+                base = f"{base}/{effective_subfolder}"
+            return f"{base}/{filename}"
+
+        def _copy_gcs_file(filename: str, dest_dir: str) -> str:
+            os.makedirs(dest_dir, exist_ok=True)
+            local_path = os.path.join(dest_dir, os.path.basename(filename))
+            subprocess.run(["gsutil", "-q", "cp", _gcs_object_uri(filename), local_path], check=True)
+            return local_path
+
+        if gcs_source:
+            gcs_meta_tmp = tempfile.TemporaryDirectory()
+            _copy_gcs_file(CONFIG_NAME, gcs_meta_tmp.name)
+            try:
+                _copy_gcs_file(GENERATION_CONFIG_NAME, gcs_meta_tmp.name)
+            except subprocess.CalledProcessError:
+                pass
+            config_source = gcs_meta_tmp.name
+
         hf_config = AutoConfig.from_pretrained(
-            pretrained_model_name_or_path,
+            config_source,
             trust_remote_code=trust_remote_code,
             **hub_kwargs,
         )
@@ -3260,13 +3291,13 @@ class EasyBridgeMixin(PushToHubMixin):
         ed_config_cls, module = get_modules_by_type(model_type, task_type=cls._model_task)
 
         generation_config = _load_generation_config(
-            pretrained_model_name_or_path,
+            config_source,
             trust_remote_code=trust_remote_code,
             **hub_kwargs,
         )
 
         ed_config: EasyDeLBaseConfig = ed_config_cls.from_pretrained(
-            pretrained_model_name_or_path,
+            config_source,
             trust_remote_code=trust_remote_code,
             **hub_kwargs,
         )
@@ -3304,6 +3335,22 @@ class EasyBridgeMixin(PushToHubMixin):
         )
 
         required_params = set(flatten_dict(model.graphtree_parameters_shape))
+        parameters_shape = getattr(model, "graphtree_parameters_shape", None)
+        if parameters_shape is None:
+            parameters_shape = model.parameters_shape
+        if not isinstance(parameters_shape, dict) and hasattr(parameters_shape, "flatten"):
+            parameters_shape = parameters_shape.flatten()
+        required_params = set(flatten_dict(parameters_shape))
+        normalized_required_params: set[tuple] = set()
+        for key_tuple in required_params:
+            if len(key_tuple) == 1 and isinstance(key_tuple[0], str):
+                key = key_tuple[0]
+                if key.startswith("parameters/"):
+                    key = key[len("parameters/") :]
+                normalized_required_params.add(tuple(int(n) if n.isdigit() else n for n in key.split(".")))
+            else:
+                normalized_required_params.add(key_tuple)
+        required_params = normalized_required_params
         # spec_map: dict[tuple, PartitionSpec] = {}
         # if partition_rules is not None:
         #     try:
@@ -3429,6 +3476,8 @@ class EasyBridgeMixin(PushToHubMixin):
                 str | None: Absolute local path when the file exists, else
                 ``None``.
             """
+            if gcs_source:
+                return None
             if not os.path.isdir(pretrained_model_name_or_path):
                 return None
             filename, effective_subfolder = _strip_or_keep_subfolder(filename)
@@ -3453,7 +3502,36 @@ class EasyBridgeMixin(PushToHubMixin):
         resolved_index_file: str | None = None
         resolved_single_file: str | None = None
 
-        if os.path.isdir(pretrained_model_name_or_path):
+        if gcs_source:
+            if gcs_meta_tmp is None:
+                raise RuntimeError("GCS metadata temporary directory was not initialized.")
+            try:
+                resolved_index_file = _copy_gcs_file(SAFE_WEIGHTS_INDEX_NAME, gcs_meta_tmp.name)
+                ckpt_weight_format = "safetensors"
+            except subprocess.CalledProcessError:
+                resolved_index_file = None
+
+            if resolved_index_file is None:
+                try:
+                    resolved_index_file = _copy_gcs_file(WEIGHTS_INDEX_NAME, gcs_meta_tmp.name)
+                    ckpt_weight_format = "bin"
+                except subprocess.CalledProcessError:
+                    resolved_index_file = None
+
+            if resolved_index_file is None:
+                try:
+                    resolved_single_file = _copy_gcs_file(SAFE_WEIGHTS_NAME, gcs_meta_tmp.name)
+                    ckpt_weight_format = "safetensors"
+                except subprocess.CalledProcessError:
+                    resolved_single_file = None
+
+            if resolved_single_file is None:
+                try:
+                    resolved_single_file = _copy_gcs_file(WEIGHTS_NAME, gcs_meta_tmp.name)
+                    ckpt_weight_format = "bin"
+                except subprocess.CalledProcessError:
+                    resolved_single_file = None
+        elif os.path.isdir(pretrained_model_name_or_path):
             resolved_index_file = _find_local(SAFE_WEIGHTS_INDEX_NAME)
             if resolved_index_file is not None:
                 ckpt_weight_format = "safetensors"
@@ -3651,12 +3729,14 @@ class EasyBridgeMixin(PushToHubMixin):
             config_to_save.__dict__.pop("attn_softmax_dtype", None)
             config_to_save.architectures = [module.__name__]
             config_to_save.save_pretrained(str(save_root))
+            if str(save_root).startswith("gs://"):
+                (save_root / CONFIG_NAME).write_text(config_to_save.to_json_string(use_diff=True))
+            else:
+                config_to_save.save_pretrained(str(save_root))
             if generation_config is not None:
                 _save_generation_config(generation_config, save_root)
 
         _save_configs()
-
-        import tempfile
 
         @contextlib.contextmanager
         def _with_resolved_shard(fname: str):
@@ -3684,6 +3764,17 @@ class EasyBridgeMixin(PushToHubMixin):
                     raise FileNotFoundError(f"Missing shard file {fname!r} under {pretrained_model_name_or_path!r}")
                 ckpt_filename_to_path[fname] = resolved
                 yield resolved
+                return
+
+            if gcs_source:
+                if torch_streaming_tmp_dir is not None:
+                    if os.path.isfile(torch_streaming_tmp_dir):
+                        raise NotADirectoryError(
+                            f"torch_streaming_tmp_dir points to a file: {torch_streaming_tmp_dir!r}"
+                        )
+                    os.makedirs(torch_streaming_tmp_dir, exist_ok=True)
+                with tempfile.TemporaryDirectory(dir=torch_streaming_tmp_dir) as tmpdir:
+                    yield _copy_gcs_file(fname, tmpdir)
                 return
 
             if torch_streaming_cache == "hf_cache":
@@ -3740,6 +3831,20 @@ class EasyBridgeMixin(PushToHubMixin):
         file_to_keys: dict[str, list[str]] = {}
         for k, fname in ckpt_key_to_filename.items():
             file_to_keys.setdefault(fname, []).append(k)
+
+        fusion_groups, fusion_rules_by_target = StateDictConverter.collect_reform_param_fusion_groups(
+            ckpt_key_to_filename.keys(),
+            reform_param,
+        )
+        fusion_source_to_targets: dict[str, list[str]] = {}
+        for fused_key, source_keys in fusion_groups.items():
+            key_tuple = tuple(int(n) if n.isdigit() else n for n in fused_key.split("."))
+            if key_tuple not in required_params:
+                continue
+            for source_key in source_keys:
+                fusion_source_to_targets.setdefault(source_key, []).append(fused_key)
+        fusion_pending: dict[str, dict[str, tp.Any]] = {fused_key: {} for fused_key in fusion_groups}
+        fusion_counts: dict[str, int] = {}
 
         moe_expected: dict[str, int] = {tp: len(expert_key_by_idx) for tp, expert_key_by_idx in moe_groups.items()}
         moe_remaining: dict[str, int] = dict(moe_expected)
@@ -3837,6 +3942,32 @@ class EasyBridgeMixin(PushToHubMixin):
             for key_tuple, jax_array in results:
                 _write_tensor(key_tuple, jax_array)
 
+        def _process_fusion_source(key: str, tensor) -> bool:
+            """Accumulate reform_param source tensors and write fused targets."""
+            fused_targets = fusion_source_to_targets.get(key)
+            if not fused_targets:
+                return False
+
+            for fused_key in fused_targets:
+                rule = fusion_rules_by_target[fused_key]
+                pending = fusion_pending.setdefault(fused_key, {})
+                pending[key] = tensor
+                source_keys = tuple(rule["sources"])
+                if not all(source_key in pending for source_key in source_keys):
+                    continue
+
+                source_tensors = [pending.pop(source_key) for source_key in source_keys]
+                with convert_ctx:
+                    fused_tensor = StateDictConverter.fuse_reform_param_tensors(rule, source_tensors)
+                _process_and_write(fused_key, fused_tensor)
+                label = str(rule.get("log_label", fused_key))
+                fusion_counts[label] = fusion_counts.get(label, 0) + 1
+
+                del source_tensors
+                del fused_tensor
+
+            return True
+
         import torch
         from safetensors.torch import safe_open
 
@@ -3855,6 +3986,10 @@ class EasyBridgeMixin(PushToHubMixin):
                 if ckpt_weight_format == "safetensors":
                     with safe_open(resolved_path, framework="pt", device="cpu") as f:
                         for k in keys:
+                            if k in fusion_source_to_targets:
+                                _process_fusion_source(k, f.get_tensor(k))
+                                continue
+
                             if k in expert_key_to_group:
                                 target_path, expert_idx = expert_key_to_group[k]
                                 expert_tensor = f.get_tensor(k)
@@ -3882,6 +4017,10 @@ class EasyBridgeMixin(PushToHubMixin):
                         shard = torch.load(resolved_path, map_location="cpu")
 
                     for k in keys:
+                        if k in fusion_source_to_targets:
+                            _process_fusion_source(k, shard[k])
+                            continue
+
                         if k in expert_key_to_group:
                             target_path, expert_idx = expert_key_to_group[k]
                             expert_tensor = shard[k]
@@ -3904,12 +4043,28 @@ class EasyBridgeMixin(PushToHubMixin):
 
             gc.collect()
 
+        # At this point any remaining pending source means a declared group was split
+        # incompletely across the checkpoint index and could not be materialized.
+        incomplete_fusions = {
+            fused_key: sorted(set(rule["sources"]) - set(fusion_pending.get(fused_key, {})))
+            for fused_key, rule in fusion_rules_by_target.items()
+            if fusion_pending.get(fused_key)
+        }
+        if incomplete_fusions:
+            raise RuntimeError(
+                "Some reform_param fusion groups were incomplete after processing all shards: "
+                + ", ".join([f"{k} missing={missing}" for k, missing in sorted(incomplete_fusions.items())[:10]])
+            )
+
         incomplete = {k: v for k, v in moe_remaining.items() if v > 0}
         if incomplete:
             raise RuntimeError(
                 "Some MoE expert groups were incomplete after processing all shards: "
                 + ", ".join([f"{k} missing={v}" for k, v in sorted(incomplete.items())][:10])
             )
+        if verbose and fusion_counts:
+            for label, count in sorted(fusion_counts.items()):
+                logger.info("Fused %d reform_param %s during sequential conversion.", count, label)
 
         _write_checkpoint_index()
         try:

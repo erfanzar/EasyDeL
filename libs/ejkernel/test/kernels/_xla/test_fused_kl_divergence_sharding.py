@@ -39,10 +39,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from ejkernel.modules.operations import fused_kl_divergence
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
+
+from ejkernel.modules.operations import fused_kl_divergence
 
 if jax.device_count() < 2:
     pytest.skip(

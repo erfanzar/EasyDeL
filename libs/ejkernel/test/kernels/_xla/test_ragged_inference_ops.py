@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+
 from ejkernel.kernels._registry import kernel_registry
 from ejkernel.kernels._xla.fused_conv_decode import fused_conv_decode
 from ejkernel.kernels._xla.gated_delta_rule_grouped_decode import (

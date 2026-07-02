@@ -14,16 +14,17 @@
 
 import re
 
-import easydel as ed
-import easydel.infra.base_state as base_state_module
 import jax
 import jax.numpy as jnp
 import optax
 import pytest
 import spectrax as spx
+from jax.sharding import NamedSharding, PartitionSpec
+
+import easydel as ed
+import easydel.infra.base_state as base_state_module
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.sharding import sharding_matches
-from jax.sharding import NamedSharding, PartitionSpec
 
 
 @pytest.fixture(scope="module")
@@ -114,9 +115,9 @@ def test_init_tx_places_optimizer_value_slots_with_named_sharding(tiny_sharded_l
         slot_shardings.append(sharding)
 
     assert slot_shardings, "Expected Adam optimizer slot shardings."
-    assert any(
-        _has_sharded_axis(sharding.spec) for sharding in slot_shardings
-    ), "Optimizer value slots unexpectedly collapsed to replicated-only shardings."
+    assert any(_has_sharded_axis(sharding.spec) for sharding in slot_shardings), (
+        "Optimizer value slots unexpectedly collapsed to replicated-only shardings."
+    )
 
 
 def test_init_tx_sanitizes_factored_optimizer_slot_shardings(tiny_sharded_llama):

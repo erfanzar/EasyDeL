@@ -18,6 +18,7 @@ import inspect
 from dataclasses import fields
 
 import pytest
+
 from easydel.infra.elarge.model import eLargeModel
 from easydel.infra.elarge.types import (
     BASE_TRAINER_DEFAULTS,

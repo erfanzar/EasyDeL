@@ -486,6 +486,10 @@ def _coerce_seed(s: int | ArrayLike) -> Array:
         Result described by this helper.
     """
     if isinstance(s, int):
+        cpu_devices = jax.local_devices(backend="cpu")
+        if cpu_devices:
+            with jax.default_device(cpu_devices[0]):
+                return jax.random.PRNGKey(s)
         return jax.random.PRNGKey(s)
     return _to_typed_key(s)
 

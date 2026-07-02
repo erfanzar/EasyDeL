@@ -125,6 +125,8 @@ class BaseDatasetInform:
     compatibility with existing :class:`DatasetMixture` users.
 
     Attributes:
+        name (str | None): Optional stable identifier for this
+            constituent. Used by named mixture weights and diagnostics.
         type (DatasetType | str | None): Container format tag. When
             ``None`` the format is inferred from the file extension in
             ``__post_init__`` and the constructor raises if inference
@@ -148,6 +150,7 @@ class BaseDatasetInform:
             rename map applied to each row.
     """
 
+    name: str | None = None
     type: DatasetType | str | None = None
     data_files: os.PathLike | str | list[os.PathLike | str] | None = None
     num_rows: int | None = None

@@ -69,7 +69,9 @@ from __future__ import annotations
 import typing
 from typing import Literal
 
-from jax import shard_map
+import jax
+import jax.numpy as jnp
+from jax import lax, shard_map
 from jax.sharding import Mesh, PartitionSpec
 from jaxtyping import Array, Float, Int
 
@@ -87,6 +89,35 @@ from ejkernel.ops.config.persistent import PersistentCache
 
 from ..base import detect_platform
 from .configs import GatedDeltaRuleConfig
+
+_GDR_CONFIG_FIELDS = frozenset(getattr(GatedDeltaRuleConfig, "__dataclass_fields__", ()))
+
+
+def _axis_part_uses(part: object, axis_name: str | None) -> bool:
+    """Return whether one PartitionSpec entry contains ``axis_name``."""
+    if axis_name is None or part is None:
+        return False
+    if isinstance(part, str):
+        return part == axis_name
+    if isinstance(part, tuple):
+        return axis_name in part
+    return False
+
+
+def _spec_uses_sequence_axis(spec: PartitionSpec | None, axis_name: str | None) -> bool:
+    """Return whether a BTHD PartitionSpec shards the time axis over ``axis_name``."""
+    if spec is None or axis_name is None or len(spec) < 2:
+        return False
+    return _axis_part_uses(spec[1], axis_name)
+
+
+def _normalize_gdr_config(cfg: GatedDeltaRuleConfig | dict | None) -> GatedDeltaRuleConfig:
+    """Restore executor-serialized GDR configs before calling ``run``."""
+    if cfg is None:
+        return GatedDeltaRuleConfig(chunk_size=64, platform="auto", backend="any")
+    if isinstance(cfg, dict):
+        return GatedDeltaRuleConfig.from_dict({key: value for key, value in cfg.items() if key in _GDR_CONFIG_FIELDS})
+    return cfg
 
 
 class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
@@ -136,6 +167,7 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
         out_specs: PartitionSpec | tuple[PartitionSpec | None, ...] | None = None,
         check_vma: bool = False,
         seg_ids: Int[Array, "batch seq_len"] | None = None,
+        sequence_axis_name: str | None = None,
         **_,
     ):
         """Create a ``jax.shard_map`` wrapper for distributed GDR execution.
@@ -188,6 +220,203 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
         assert mesh is not None, "mesh must be provided for shard_map execution"
         assert in_specs is not None, "in_specs must be provided for shard_map execution"
         assert out_specs is not None, "out_specs must be provided for shard_map execution"
+        use_sequence_parallel = _spec_uses_sequence_axis(in_specs[0], sequence_axis_name)
+        run_cfg = _normalize_gdr_config(cfg)
+        truncate_sp_state_grad = bool(getattr(run_cfg, "sequence_parallel_truncate_state_gradient", False))
+        sp_forward_only = bool(getattr(run_cfg, "sequence_parallel_forward_only", False))
+
+        def _apply_affine_summary(
+            summary_a: Float[Array, "batch num_heads qk_head_dim qk_head_dim"],
+            state: Float[Array, "batch num_heads qk_head_dim v_head_dim"],
+        ) -> Float[Array, "batch num_heads qk_head_dim v_head_dim"]:
+            out = jnp.einsum(
+                "bhkl,bhlv->bhkv",
+                summary_a.astype(jnp.float32),
+                state.astype(jnp.float32),
+                precision=jax.lax.Precision.HIGHEST,
+            )
+            return jnp.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+
+        def _finite_state(state: Array) -> Array:
+            return jnp.nan_to_num(state.astype(jnp.float32), nan=0.0, posinf=0.0, neginf=0.0)
+
+        def _segment_bounds(
+            seg_ids: Int[Array, "batch seq_len"],
+            num_heads: int,
+        ) -> tuple[Int[Array, "batch num_heads"], Int[Array, "batch num_heads"], Array]:
+            valid = seg_ids >= 0
+            has_valid = jnp.any(valid, axis=1)
+            positions = jnp.arange(seg_ids.shape[1], dtype=jnp.int32)
+            first_idx = jnp.argmax(valid.astype(jnp.int32), axis=1)
+            last_idx = jnp.max(jnp.where(valid, positions[None, :], 0), axis=1)
+            first = jnp.take_along_axis(seg_ids, first_idx[:, None], axis=1)[:, 0]
+            last = jnp.take_along_axis(seg_ids, last_idx[:, None], axis=1)[:, 0]
+            return (
+                jnp.broadcast_to(first[:, None], (seg_ids.shape[0], num_heads)),
+                jnp.broadcast_to(last[:, None], (seg_ids.shape[0], num_heads)),
+                jnp.broadcast_to(has_valid[:, None], (seg_ids.shape[0], num_heads)),
+            )
+
+        def _sequence_parallel_gdr(
+            query: Float[Array, "batch seq_len num_qk_heads qk_head_dim"],
+            key: Float[Array, "batch seq_len num_qk_heads qk_head_dim"],
+            value: Float[Array, "batch seq_len num_value_heads v_head_dim"],
+            beta: Float[Array, "batch seq_len num_value_heads"],
+            decay: Float[Array, "batch seq_len num_value_heads"] | None,
+            initial_state: Float[Array, "batch num_heads qk_head_dim v_head_dim"] | None,
+            seg_ids: Int[Array, "batch seq_len"] | None = None,
+        ):
+            """Run exact sequence-parallel GDR on one sequence shard.
+
+            Each shard computes the affine transform ``state_out = A @ state_in + B``
+            for its local token span.  The transforms are gathered over the
+            sequence axis, composed to form the exclusive prefix state for the
+            current shard, then applied to the zero-state outputs.  For packed
+            batches, the prefix state is read only when the shard's first valid
+            segment continues the previous shard's final segment.
+            """
+            batch, _seq, _q_heads, qk_dim = query.shape
+            num_value_heads = value.shape[2]
+            value_dim = value.shape[3]
+
+            zero_out, summary_b = self.run(
+                query=query,
+                key=key,
+                value=value,
+                beta=beta,
+                decay=decay,
+                seg_ids=seg_ids,
+                initial_state=None,
+                use_qk_l2norm=use_qk_l2norm,
+                use_chunked=use_chunked,
+                return_state=True,
+                platform=platform,
+                cfg=run_cfg,
+            )
+            summary_b = _finite_state(summary_b)
+
+            eye = jnp.eye(qk_dim, dtype=jnp.float32)
+            identity_state = jnp.broadcast_to(eye[None, None, :, :], (batch, num_value_heads, qk_dim, qk_dim))
+            zero_value = jnp.zeros((batch, query.shape[1], num_value_heads, qk_dim), dtype=value.dtype)
+            affine_out, summary_a = self.run(
+                query=query,
+                key=key,
+                value=zero_value,
+                beta=beta,
+                decay=decay,
+                seg_ids=seg_ids,
+                initial_state=identity_state,
+                use_qk_l2norm=use_qk_l2norm,
+                use_chunked=use_chunked,
+                return_state=True,
+                platform=platform,
+                cfg=run_cfg,
+            )
+            affine_out = jnp.nan_to_num(affine_out.astype(jnp.float32), nan=0.0, posinf=0.0, neginf=0.0)
+            summary_a = _finite_state(summary_a)
+            if truncate_sp_state_grad:
+                affine_out = lax.stop_gradient(affine_out)
+                summary_a = lax.stop_gradient(summary_a)
+
+            if initial_state is None:
+                initial_state = jnp.zeros((batch, num_value_heads, qk_dim, value_dim), dtype=jnp.float32)
+            else:
+                initial_state = _finite_state(initial_state)
+
+            summaries_a = lax.all_gather(summary_a, sequence_axis_name, axis=0, tiled=False)
+            summaries_b = lax.all_gather(summary_b, sequence_axis_name, axis=0, tiled=False)
+            shard_index = lax.axis_index(sequence_axis_name)
+            num_sequence_shards = summaries_a.shape[0]
+
+            if seg_ids is None:
+                prefix_state = initial_state
+                for i in range(num_sequence_shards):
+                    prefix_state = lax.cond(
+                        i < shard_index,
+                        lambda state, i=i: _finite_state(
+                            _apply_affine_summary(summaries_a[i], state) + summaries_b[i]
+                        ),
+                        lambda state: state,
+                        prefix_state,
+                    )
+
+                final_state = initial_state
+                for i in range(num_sequence_shards):
+                    final_state = _finite_state(_apply_affine_summary(summaries_a[i], final_state) + summaries_b[i])
+
+                correction_state = lax.stop_gradient(prefix_state) if truncate_sp_state_grad else prefix_state
+                correction = jnp.einsum(
+                    "bthk,bhkv->bthv",
+                    affine_out,
+                    correction_state,
+                    precision=jax.lax.Precision.HIGHEST,
+                )
+            else:
+                first_seg, last_seg, has_valid = _segment_bounds(seg_ids, num_value_heads)
+                first_all = lax.all_gather(first_seg, sequence_axis_name, axis=0, tiled=False)
+                last_all = lax.all_gather(last_seg, sequence_axis_name, axis=0, tiled=False)
+                has_all = lax.all_gather(has_valid, sequence_axis_name, axis=0, tiled=False)
+
+                prefix_state = initial_state
+                prefix_seg = first_all[0]
+                for i in range(num_sequence_shards):
+
+                    def _update_prefix(carry, i=i):
+                        state, state_seg = carry
+                        same_segment = state_seg == first_all[i]
+                        carried = jnp.where(
+                            same_segment[:, :, None, None],
+                            _apply_affine_summary(summaries_a[i], state),
+                            0,
+                        )
+                        candidate_state = _finite_state(carried + summaries_b[i])
+                        state = jnp.where(has_all[i][:, :, None, None], candidate_state, state)
+                        state_seg = jnp.where(has_all[i], last_all[i], state_seg)
+                        return state, state_seg
+
+                    prefix_state, prefix_seg = lax.cond(
+                        i < shard_index,
+                        _update_prefix,
+                        lambda carry: carry,
+                        (prefix_state, prefix_seg),
+                    )
+
+                final_state = initial_state
+                final_seg = first_all[0]
+                for i in range(num_sequence_shards):
+                    same_segment = final_seg == first_all[i]
+                    carried = jnp.where(
+                        same_segment[:, :, None, None],
+                        _apply_affine_summary(summaries_a[i], final_state),
+                        0,
+                    )
+                    candidate_state = _finite_state(carried + summaries_b[i])
+                    final_state = jnp.where(has_all[i][:, :, None, None], candidate_state, final_state)
+                    final_seg = jnp.where(has_all[i], last_all[i], final_seg)
+
+                reads_prefix = (prefix_seg == first_seg) & has_valid
+                correction_state = lax.stop_gradient(prefix_state) if truncate_sp_state_grad else prefix_state
+                correction = jnp.einsum(
+                    "bthk,bhkv->bthv",
+                    affine_out,
+                    correction_state,
+                    precision=jax.lax.Precision.HIGHEST,
+                )
+                correction = correction * reads_prefix[:, None, :, None].astype(correction.dtype)
+
+            output = jnp.nan_to_num(
+                zero_out.astype(jnp.float32) + correction.astype(jnp.float32),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).astype(value.dtype)
+            final_state = _finite_state(final_state)
+            if sp_forward_only:
+                output = lax.stop_gradient(output)
+                final_state = lax.stop_gradient(final_state)
+            if return_state:
+                return output, final_state
+            return output
 
         def _wrapped_gdr(
             query: Float[Array, "batch seq_len num_heads qk_head_dim"],
@@ -222,6 +451,16 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
                 The output of ``self.run``: either the output array or, when
                 ``return_state`` is True, an ``(output, final_state)`` tuple.
             """
+            if use_sequence_parallel:
+                return _sequence_parallel_gdr(
+                    query=query,
+                    key=key,
+                    value=value,
+                    beta=beta,
+                    decay=decay,
+                    initial_state=initial_state,
+                    seg_ids=seg_ids,
+                )
             return self.run(
                 query=query,
                 key=key,
@@ -234,7 +473,7 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
                 use_chunked=use_chunked,
                 return_state=return_state,
                 platform=platform,
-                cfg=cfg or GatedDeltaRuleConfig(chunk_size=64, platform="auto", backend="any"),
+                cfg=run_cfg,
             )
 
         call_args = (
@@ -275,11 +514,13 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
         Raises:
             ValueError: If no matching implementation is found.
         """
+        cfg = _normalize_gdr_config(cfg)
         platform = detect_platform("gated_delta_rule", cfg.platform)
         return kernel_registry.get("gated_delta_rule", platform=platform, backend=cfg.backend)
 
     def resolve_platform(self, cfg: GatedDeltaRuleConfig):
         """Resolve ``auto`` to the concrete registered GDR platform."""
+        cfg = _normalize_gdr_config(cfg)
         return detect_platform("gated_delta_rule", cfg.platform)
 
     def run(
@@ -337,9 +578,14 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
                 Tuple of (output, final_state) where final_state has shape
                 [batch, num_heads, qk_head_dim, v_head_dim]
         """
+        cfg = _normalize_gdr_config(cfg)
         cfg_use_chunked = bool(getattr(cfg, "use_chunked", True))
         use_input_dtype_phase1_outputs = bool(getattr(cfg, "use_input_dtype_phase1_outputs", False))
         use_input_dtype_state = bool(getattr(cfg, "use_input_dtype_state", False))
+        sequence_parallel_truncate_state_gradient = bool(
+            getattr(cfg, "sequence_parallel_truncate_state_gradient", False)
+        )
+        sequence_parallel_forward_only = bool(getattr(cfg, "sequence_parallel_forward_only", False))
         use_chunked = bool(use_chunked) and cfg_use_chunked
         if platform is not None:
             cfg = GatedDeltaRuleConfig(
@@ -347,6 +593,8 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
                 use_chunked=cfg_use_chunked,
                 use_input_dtype_phase1_outputs=use_input_dtype_phase1_outputs,
                 use_input_dtype_state=use_input_dtype_state,
+                sequence_parallel_truncate_state_gradient=sequence_parallel_truncate_state_gradient,
+                sequence_parallel_forward_only=sequence_parallel_forward_only,
                 platform=platform,
                 backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
@@ -356,6 +604,8 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
                 use_chunked=False,
                 use_input_dtype_phase1_outputs=use_input_dtype_phase1_outputs,
                 use_input_dtype_state=use_input_dtype_state,
+                sequence_parallel_truncate_state_gradient=sequence_parallel_truncate_state_gradient,
+                sequence_parallel_forward_only=sequence_parallel_forward_only,
                 platform="xla",
                 backend=Backend.ANY,
             )
@@ -372,6 +622,8 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
                 use_chunked=cfg_use_chunked,
                 use_input_dtype_phase1_outputs=use_input_dtype_phase1_outputs,
                 use_input_dtype_state=use_input_dtype_state,
+                sequence_parallel_truncate_state_gradient=sequence_parallel_truncate_state_gradient,
+                sequence_parallel_forward_only=sequence_parallel_forward_only,
                 platform="xla",
                 backend=Backend.ANY,
             )
@@ -389,9 +641,10 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
             use_qk_l2norm=bool(use_qk_l2norm),
             use_chunked=use_chunked,
         )
+        if resolved_platform in (Platform.XLA, Platform.PALLAS):
+            impl_kwargs["use_input_dtype_state"] = use_input_dtype_state
         if resolved_platform == Platform.PALLAS:
             impl_kwargs["use_input_dtype_phase1_outputs"] = use_input_dtype_phase1_outputs
-            impl_kwargs["use_input_dtype_state"] = use_input_dtype_state
         out, final_state = impl(**impl_kwargs)
 
         if return_state:
@@ -536,6 +789,7 @@ def gated_delta_rule(
     mesh: Mesh | None = None,
     in_specs: tuple[PartitionSpec | None, ...] | None = None,
     out_specs: PartitionSpec | tuple[PartitionSpec | None, ...] | None = None,
+    sequence_axis_name: str | None = None,
 ) -> (
     Float[Array, "batch seq_len num_heads v_head_dim"]
     | tuple[
@@ -597,6 +851,11 @@ def gated_delta_rule(
             initial_state).
         out_specs: Output partition spec for ``shard_map``; use a tuple when
             ``return_state=True``.
+        sequence_axis_name: Optional mesh axis used for exact sequence-parallel
+            state propagation.  When this axis appears on the sequence dimension
+            of ``in_specs[0]``, shard-map execution gathers and composes per-shard
+            affine GDR summaries so every shard receives the same recurrent state
+            it would have seen in an unsharded full-sequence scan.
 
     Returns:
         If return_state is False:
@@ -703,5 +962,6 @@ def gated_delta_rule(
         mesh=mesh,
         in_specs=in_specs,
         out_specs=out_specs,
+        sequence_axis_name=sequence_axis_name,
         _cfg=cfg,
     )

@@ -25,8 +25,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import spectrax as spx
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+import spectrax as spx
 from spectrax import nn
 from spectrax.nn import PipelineSequential
 from spectrax.runtime.mpmd import collect_task_times_ms, sxcall, sxgrad, sxjit, sxstage_iter, sxvalue_and_grad
@@ -322,9 +323,9 @@ def test_mpmd_interleaved_virtual_stages_match_single_device(xy, mpmd_mesh):
             if c != "parameters":
                 continue
             ref_leaf = ref_full.get("parameters", prefix + path)
-            assert jnp.allclose(
-                pipe_leaf, ref_leaf, atol=1e-3, rtol=1e-3
-            ), f"Grad mismatch at logical stage {i}, path {path!r}"
+            assert jnp.allclose(pipe_leaf, ref_leaf, atol=1e-3, rtol=1e-3), (
+                f"Grad mismatch at logical stage {i}, path {path!r}"
+            )
 
 
 def test_mpmd_profiler_records_per_task_times(hom_model, xy, mpmd_mesh):

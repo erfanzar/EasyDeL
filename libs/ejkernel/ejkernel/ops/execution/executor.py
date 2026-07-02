@@ -238,6 +238,35 @@ class Executor(Generic[Cfg, Out]):
             return False
         return any(spec.platform == Platform.CUTE and spec.backend in (Backend.GPU, Backend.ANY) for spec in specs)
 
+    def _coerce_cfg(self, cfg: Cfg, kernel: Kernel[Cfg, Out], inv: Invocation[Cfg, Out]) -> Cfg:
+        """Restore dict-serialized configs to the kernel's config dataclass."""
+        if not isinstance(cfg, dict):
+            return cfg
+
+        cfg_cls = None
+        for probe_inv in (inv, None):
+            try:
+                sample = kernel.heuristic_cfg(probe_inv)
+            except Exception:
+                continue
+            if sample is not None and not isinstance(sample, dict):
+                cfg_cls = type(sample)
+                break
+
+        if cfg_cls is None:
+            return cfg
+        try:
+            if dataclasses.is_dataclass(cfg_cls):
+                fields = {field.name for field in dataclasses.fields(cfg_cls)}
+                cfg = {key: value for key, value in cfg.items() if key in fields}
+            if hasattr(cfg_cls, "from_dict"):
+                return cfg_cls.from_dict(cfg)
+            if dataclasses.is_dataclass(cfg_cls):
+                return cfg_cls(**cfg)
+        except Exception:
+            return cfg
+        return cfg
+
     def _prefer_cuda_cfg(self, cfg: Cfg, kernel: Kernel[Cfg, Out], inv: Invocation[Cfg, Out]) -> Cfg:
         """Upgrade configuration to prefer CUTE/CUDA when conditions are met.
 
@@ -481,6 +510,7 @@ class Executor(Generic[Cfg, Out]):
             chosen = self._choose_heuristics_only(inv, kernel)
         else:
             chosen = self.chooser.choose(inv, kernel)
+        chosen = self._coerce_cfg(chosen, kernel, inv)
         chosen = self._prefer_cuda_cfg(chosen, kernel, inv)
 
         platform = get_device_platform()
@@ -657,6 +687,7 @@ class Executor(Generic[Cfg, Out]):
             cfg = self._choose_heuristics_only(inv, kernel)
         else:
             cfg = self.chooser.choose(inv, kernel)
+        cfg = self._coerce_cfg(cfg, kernel, inv)
         return self._prefer_cuda_cfg(cfg, kernel, inv)
 
     def _choose_heuristics_only(self, inv: Invocation[Cfg, Out], kernel: Kernel[Cfg, Out]) -> Cfg:
@@ -689,7 +720,7 @@ class Executor(Generic[Cfg, Out]):
         call_key = inv.make_key(kernel.key_builder)
 
         if inv.override_cfg is not None:
-            cfg = inv.override_cfg
+            cfg = self._coerce_cfg(inv.override_cfg, kernel, inv)
             self.chooser.cache.put(dev, op_id_v, call_key, cfg)
             if self.chooser.persistent is not None and self.chooser.persist_autotune:
                 self.chooser.persistent.put(dev, op_id_v, call_key, cfg)

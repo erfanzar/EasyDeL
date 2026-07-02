@@ -39,11 +39,16 @@ to drive the kernels under a realistic sharding configuration. TPU/multi-device-
 tests are guarded with ``pytest.mark.skipif``.
 """
 
-import easydel.modules.qwen3_next.modeling_qwen3_next as qwen3_next_modeling
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from ejkernel.kernels._xla.gated_delta_rule._xla_impl_fwd import _single_step_gdr_fwd
+from ejkernel.modules.operations import gated_delta_rule_grouped_decode
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from spectrax import PartitionAxis, PartitionManager, SpxMesh
+
+import easydel.modules.qwen3_next.modeling_qwen3_next as qwen3_next_modeling
 from easydel.modules.qwen3_next.modeling_qwen3_next import (
     _apply_qwen3_next_depthwise_conv_sequence,
     _apply_qwen3_next_packed_updates,
@@ -56,10 +61,6 @@ from easydel.modules.qwen3_next.qwen3_next_configuration import Qwen3NextConfig
 from easydel.operations import OperationMetadata
 from easydel.operations.kernels import GatedDeltaRuleOp
 from easydel.utils.inference_mode import set_inference_mode
-from ejkernel.kernels._xla.gated_delta_rule._xla_impl_fwd import _single_step_gdr_fwd
-from ejkernel.modules.operations import gated_delta_rule_grouped_decode
-from jax.sharding import Mesh, NamedSharding, PartitionSpec
-from spectrax import PartitionAxis, PartitionManager, SpxMesh
 
 
 def _make_decode_inputs(dtype=jnp.bfloat16):

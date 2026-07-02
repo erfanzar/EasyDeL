@@ -47,6 +47,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.sharding import Mesh, PartitionSpec
+
 from ejkernel import modules
 from ejkernel.modules import operations
 from ejkernel.modules.operations import (
@@ -72,7 +74,6 @@ from ejkernel.modules.operations import (
     ragged_gated_delta_rule_v2,
     ragged_gated_delta_rule_v2_op,
 )
-from jax.sharding import Mesh, PartitionSpec
 
 from ._utils import assert_allclose
 

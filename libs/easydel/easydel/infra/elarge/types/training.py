@@ -67,6 +67,8 @@ from .eval import BenchmarkConfig
 if TYPE_CHECKING:
     from easydel.infra.etils import MpMdSchedulers
 
+    from .data import DatasetMixtureCfg
+
 # Mapping of trainer type aliases to their canonical forms.
 #
 # This dictionary allows alternative naming conventions (e.g., underscore vs
@@ -338,6 +340,10 @@ class BaseTrainerCfg(TypedDict, total=False):
             after the first training step completes (so the trace excludes the initial
             JIT-compile of step 1) and ``jax.profiler.stop_trace()`` when training
             finishes. Set to None to disable.
+        profiler_log_all_workers: Whether all distributed workers should record JAX
+            profiler traces without enabling all-worker metrics/logging.
+        profiler_include_compile: Whether to start the profiler before the first
+            training step so compile/HLO data is included in the trace.
         profiler_host_tracer_level: Optional ``ProfileOptions().host_tracer_level``
             override (1-4) for the trace; higher values capture more host-side detail.
         profiler_python_tracer_level: Optional ``ProfileOptions().python_tracer_level``
@@ -399,6 +405,17 @@ class BaseTrainerCfg(TypedDict, total=False):
         esurge_async_scheduling: Enable/disable asynchronous eSurge scheduling.
         esurge_overlap_execution: Enable/disable overlapped eSurge execution.
         esurge_max_num_seq_buckets: Optional explicit sequence-capacity buckets for eSurge runner compilation.
+        bucket_configs: Optional list of training-bucket dicts. Each entry becomes a
+            ``easydel.trainers.buckets.TrainingBucket`` (model-config variant, e.g.
+            ``{"attn_mechanism": "vanilla"}``, plus its own ``max_length``). When set
+            with ``bucket_rule``, the trainer builds one compiled step function and one
+            dataloader per bucket and selects which to use each step. All buckets share
+            one parameter/optimizer tree. None (default) disables bucketing.
+        bucket_rule: Serialized ``BucketRule`` selecting the active bucket per optimizer
+            step, e.g. ``{"kind": "mod", "mod": 5, "on_bucket": 0, "off_bucket": 1}``
+            runs the vanilla bucket every 5th step. Required when ``bucket_configs`` is set.
+        bucket_datasets: Optional list of ``DatasetMixtureCfg``, one per bucket, used to
+            build each bucket's dataloader. Length must match ``bucket_configs``.
 
     Example:
         >>> config: BaseTrainerCfg = {
@@ -543,6 +560,8 @@ class BaseTrainerCfg(TypedDict, total=False):
     auto_shard_states: NotRequired[bool]
     performance_mode: NotRequired[bool]
     profiler_path: NotRequired[str | None]
+    profiler_log_all_workers: NotRequired[bool]
+    profiler_include_compile: NotRequired[bool]
     profiler_host_tracer_level: NotRequired[int | None]
     profiler_python_tracer_level: NotRequired[int | None]
     track_memory: NotRequired[bool | float]
@@ -611,6 +630,9 @@ class BaseTrainerCfg(TypedDict, total=False):
     esurge_overlap_execution: NotRequired[bool | None]
     esurge_max_num_seq_buckets: NotRequired[list[int] | None]
     sequence_packing: NotRequired[bool]
+    bucket_configs: NotRequired[list[dict[str, Any]] | None]
+    bucket_rule: NotRequired[dict[str, Any] | None]
+    bucket_datasets: NotRequired[list[DatasetMixtureCfg] | None]
 
 
 class DPOTrainerCfg(BaseTrainerCfg):
@@ -2124,6 +2146,8 @@ BASE_TRAINER_DEFAULTS: BaseTrainerCfg = {
     "auto_shard_states": True,
     "performance_mode": False,
     "profiler_path": None,
+    "profiler_log_all_workers": False,
+    "profiler_include_compile": False,
     "profiler_host_tracer_level": None,
     "profiler_python_tracer_level": None,
     "track_memory": False,
@@ -2159,6 +2183,9 @@ BASE_TRAINER_DEFAULTS: BaseTrainerCfg = {
     "esurge_async_scheduling": None,
     "esurge_overlap_execution": None,
     "esurge_max_num_seq_buckets": None,
+    "bucket_configs": None,
+    "bucket_rule": None,
+    "bucket_datasets": None,
 }
 # BASE_TRAINER_DEFAULTS: Default configuration values shared across all
 # trainer types.
