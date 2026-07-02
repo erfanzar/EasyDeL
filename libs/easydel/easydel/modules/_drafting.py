@@ -257,9 +257,9 @@ def sample_anchor_positions(
 ) -> tuple[jax.Array, jax.Array]:
     """Select DSpark/DFlash anchor positions from supervised token spans.
 
-    DeepSpec samples anchors randomly during training.  This EasyDeL helper is
-    deterministic so tests and jit traces are stable; it takes the first valid
-    anchors where both the anchor token and first target token are supervised.
+    DeepSpec samples anchors randomly during training.  This EasyDeL helper uses
+    a deterministic hash order so tests and jit traces are stable while anchors
+    still cover the full valid span instead of always taking the earliest tokens.
 
     Args:
         loss_mask: Float supervision mask shaped ``[batch, seq]`` (values > 0.5 are supervised).
@@ -278,12 +278,24 @@ def sample_anchor_positions(
 
     valid = (loss_mask[:, :num_candidates] > 0.5) & (loss_mask[:, 1 : num_candidates + 1] > 0.5)
     candidate_ids = jnp.broadcast_to(jnp.arange(num_candidates, dtype=jnp.int32)[None, :], (batch_size, num_candidates))
-    sentinel = jnp.full_like(candidate_ids, seq_len + 1)
-    sorted_candidates = jnp.sort(jnp.where(valid, candidate_ids, sentinel), axis=1)
+    batch_ids = jnp.arange(batch_size, dtype=jnp.uint32)[:, None]
+    candidate_hash = candidate_ids.astype(jnp.uint32)
+    scores = (candidate_hash ^ jnp.uint32(0x9E3779B9)) * jnp.uint32(0x85EBCA6B)
+    scores = (scores ^ (scores >> jnp.uint32(13))) * jnp.uint32(0xC2B2AE35)
+    scores = scores ^ (scores >> jnp.uint32(16)) ^ (batch_ids * jnp.uint32(0x27D4EB2D))
+    invalid_score = jnp.array(jnp.iinfo(jnp.uint32).max, dtype=jnp.uint32)
+    sorted_order = jnp.argsort(jnp.where(valid, scores, invalid_score), axis=1)
+    sorted_candidates = jnp.take_along_axis(candidate_ids, sorted_order, axis=1)
+    sorted_keep = jnp.take_along_axis(valid, sorted_order, axis=1)
     if num_candidates < int(num_anchors):
         pad = jnp.full((batch_size, int(num_anchors) - num_candidates), seq_len + 1, dtype=jnp.int32)
+        keep_pad = jnp.zeros((batch_size, int(num_anchors) - num_candidates), dtype=bool)
         sorted_candidates = jnp.concatenate((sorted_candidates, pad), axis=1)
+        sorted_keep = jnp.concatenate((sorted_keep, keep_pad), axis=1)
     anchors = sorted_candidates[:, : int(num_anchors)]
+    keep = sorted_keep[:, : int(num_anchors)]
+    anchor_sentinel = jnp.full_like(anchors, seq_len + 1)
+    anchors = jnp.sort(jnp.where(keep, anchors, anchor_sentinel), axis=1)
     keep = anchors < seq_len
     return jnp.where(keep, anchors, 0), keep
 
