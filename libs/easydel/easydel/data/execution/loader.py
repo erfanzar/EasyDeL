@@ -212,31 +212,40 @@ class PrefetchIterator:
         return self
 
     def __next__(self):
-        """Pop the next item from the prefetch queue, blocking briefly if empty.
+        """Pop the next item from the prefetch queue, blocking while the producer lives.
 
-        Lazily starts the producer thread on the first call and uses a
-        60-second blocking ``get`` to pull from the queue. The
-        sentinel object signals end-of-stream; an :class:`Exception`
-        instance signals the producer hit an error and the same
-        exception is re-raised here.
+        Lazily starts the producer thread on the first call. Waits in
+        60-second slices, but a quiet queue is only treated as
+        end-of-stream once the producer thread has actually died —
+        a slow source (cold GCS stream, shuffle-buffer fill, large
+        on-the-fly tokenization) must block the consumer, not silently
+        truncate the epoch. The sentinel object signals true
+        end-of-stream; an :class:`Exception` instance signals the
+        producer hit an error and the same exception is re-raised here.
 
         Returns:
             Any: The next item produced by the upstream source.
 
         Raises:
             StopIteration: When the source is exhausted (sentinel
-                received) or the queue blocks for longer than 60s
-                without any activity (treated as end-of-stream rather
-                than a hang).
+                received), or the producer thread died without leaving
+                items or a sentinel behind.
             Exception: Whatever exception type the upstream source
                 raised; transparently propagated through the queue.
         """
         self._start()
 
-        try:
-            item = self._buffer.get(timeout=60.0)
-        except Empty:
-            raise StopIteration from None
+        while True:
+            try:
+                item = self._buffer.get(timeout=60.0)
+                break
+            except Empty:
+                if self._worker is not None and not self._worker.is_alive():
+                    # Producer is gone and left nothing (not even the
+                    # sentinel, which the finally block should push):
+                    # nothing more will ever arrive.
+                    raise StopIteration from None
+                continue
 
         if item is self._sentinel:
             raise StopIteration
