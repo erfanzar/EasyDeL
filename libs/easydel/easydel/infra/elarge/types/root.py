@@ -47,7 +47,11 @@ class eLMConfig(TypedDict, total=False):
         reference_model: Reference model config for preference optimization
             (DPO, ORPO, etc.).
         loader: Data type, precision, and device settings for model loading.
+        teacher_loader: Optional loader overrides for the distillation
+            teacher; falls back to ``loader`` when absent.
         sharding: Distributed sharding and mesh configuration.
+        teacher_sharding: Optional sharding overrides for the distillation
+            teacher; falls back to ``sharding`` when absent.
         platform: Hardware backend and platform selection.
         quantization: Weight and KV cache quantization settings.
         base_config: Base model configuration values and operation overrides.
@@ -64,6 +68,8 @@ class eLMConfig(TypedDict, total=False):
     reference_model: NotRequired[ModelCfg]
     loader: NotRequired[LoaderCfg]
     sharding: NotRequired[ShardingCfg]
+    teacher_loader: NotRequired[LoaderCfg]
+    teacher_sharding: NotRequired[ShardingCfg]
     platform: NotRequired[PlatformCfg]
     quantization: NotRequired[QuantizationCfg]
     base_config: NotRequired[BaseCfg]

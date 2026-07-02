@@ -1356,8 +1356,13 @@ class eLargeModel:
     def build_teacher_model(self) -> EasyDeLBaseModule | None:
         """Build the teacher model for distillation training.
 
-        Loads the teacher model using the same loader configuration as the
-        student model (dtype, sharding, etc.) but with the teacher model path.
+        Loads the teacher model with the teacher model path. Loader and
+        sharding configuration come from the optional top-level
+        ``teacher_loader`` / ``teacher_sharding`` sections when present,
+        falling back to the student's ``loader`` / ``sharding`` sections
+        otherwise — so a frozen teacher can e.g. keep its weights
+        tp-sharded-but-fsdp-replicated while the student trains fully
+        sharded.
 
         Returns:
             EasyDeLBaseModule instance for the teacher model, or None if no
@@ -1373,6 +1378,10 @@ class eLargeModel:
 
         teacher_config = dict(self._config)
         teacher_config["model"] = self._config["teacher_model"]
+        if self._config.get("teacher_loader"):
+            teacher_config["loader"] = self._config["teacher_loader"]
+        if self._config.get("teacher_sharding"):
+            teacher_config["sharding"] = self._config["teacher_sharding"]
         return build_model(teacher_config)
 
     def build_target_model(self) -> EasyDeLBaseModule | None:
