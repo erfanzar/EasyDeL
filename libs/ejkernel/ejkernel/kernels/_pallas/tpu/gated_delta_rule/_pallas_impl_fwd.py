@@ -1146,8 +1146,8 @@ def _chunk_gdr_fwd_core(
     *,
     save_residual: bool,
     inference: bool = False,
-    use_input_dtype_phase1_outputs: bool = True,
-    use_input_dtype_state: bool = True,
+    use_input_dtype_phase1_outputs: bool = False,
+    use_input_dtype_state: bool = False,
     seg_ids=None,
 ):
     """Two-phase chunked GDR forward pass (shared by training and inference).
@@ -1451,8 +1451,8 @@ def _chunk_gdr_grouped_fwd_core(
     initial_state,
     use_qk_l2norm,
     *,
-    use_input_dtype_phase1_outputs: bool = True,
-    use_input_dtype_state: bool = True,
+    use_input_dtype_phase1_outputs: bool = False,
+    use_input_dtype_state: bool = False,
 ):
     """Forward-only grouped-head chunked GDR.
 
@@ -1544,8 +1544,8 @@ def _chunk_gdr_grouped_fwd_train_core(
     initial_state,
     use_qk_l2norm,
     *,
-    use_input_dtype_phase1_outputs: bool = True,
-    use_input_dtype_state: bool = True,
+    use_input_dtype_phase1_outputs: bool = False,
+    use_input_dtype_state: bool = False,
 ):
     """Streaming grouped-head GDR forward that saves only group boundary states."""
     B, Hq, L, K_dim = query.shape
@@ -1668,8 +1668,8 @@ def _chunk_gdr_grouped_segmented_fwd_train_core(
     initial_state,
     use_qk_l2norm,
     *,
-    use_input_dtype_phase1_outputs: bool = True,
-    use_input_dtype_state: bool = True,
+    use_input_dtype_phase1_outputs: bool = False,
+    use_input_dtype_state: bool = False,
 ):
     """Streaming packed grouped-head GDR forward without full Q/K repetition."""
     B, Hq, L, K_dim = query.shape
@@ -1873,8 +1873,8 @@ def _chunk_gdr_grouped_fwd_pallas_chunk(
     chunk_size: int = 64,
     initial_state: Float[Array, "batch num_value_heads head_dim d_state"] | None = None,
     use_qk_l2norm: bool = True,
-    use_input_dtype_phase1_outputs: bool = True,
-    use_input_dtype_state: bool = True,
+    use_input_dtype_phase1_outputs: bool = False,
+    use_input_dtype_state: bool = False,
 ) -> tuple[
     Float[Array, "batch num_value_heads seq_len d_state"],
     Float[Array, "batch num_value_heads head_dim d_state"],
@@ -2004,8 +2004,8 @@ def _chunk_gdr_grouped_fwd(
     chunk_size: int = 64,
     initial_state: Float[Array, "batch num_value_heads head_dim d_state"] | None = None,
     use_qk_l2norm: bool = True,
-    use_input_dtype_phase1_outputs: bool = True,
-    use_input_dtype_state: bool = True,
+    use_input_dtype_phase1_outputs: bool = False,
+    use_input_dtype_state: bool = False,
 ) -> tuple[
     Float[Array, "batch num_value_heads seq_len d_state"],
     Float[Array, "batch num_value_heads head_dim d_state"],
@@ -2069,8 +2069,8 @@ def _chunk_gdr_fwd_pallas_chunk(
     chunk_size: int = 64,
     initial_state: Float[Array, "batch num_heads head_dim d_state"] | None = None,
     use_qk_l2norm: bool = True,
-    use_input_dtype_phase1_outputs: bool = True,
-    use_input_dtype_state: bool = True,
+    use_input_dtype_phase1_outputs: bool = False,
+    use_input_dtype_state: bool = False,
 ) -> tuple[
     Float[Array, "batch num_heads seq_len d_state"],
     Float[Array, "batch num_heads head_dim d_state"],
@@ -2155,8 +2155,8 @@ def _chunk_gdr_fwd(
     chunk_size: int = 64,
     initial_state: Float[Array, "batch num_heads head_dim d_state"] | None = None,
     use_qk_l2norm: bool = True,
-    use_input_dtype_phase1_outputs: bool = True,
-    use_input_dtype_state: bool = True,
+    use_input_dtype_phase1_outputs: bool = False,
+    use_input_dtype_state: bool = False,
 ) -> tuple[
     Float[Array, "batch num_heads seq_len d_state"],
     Float[Array, "batch num_heads head_dim d_state"],

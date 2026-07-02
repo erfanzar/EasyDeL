@@ -153,7 +153,7 @@ def _recurrent_gdr_fwd(
     use_qk_l2norm: bool = True,
     chunk_size: int = 64,
     seg_ids: Int[Array, "batch seq_len"] | None = None,
-    use_input_dtype_state: bool = True,
+    use_input_dtype_state: bool = False,
 ) -> tuple[
     Float[Array, "batch num_heads seq_len d_state"],
     Float[Array, "batch num_heads head_dim d_state"],
@@ -790,7 +790,7 @@ def _chunk_gdr_fwd(
     initial_state: Float[Array, "batch num_heads head_dim d_state"] | None = None,
     use_qk_l2norm: bool = True,
     seg_ids: Int[Array, "batch seq_len"] | None = None,
-    use_input_dtype_state: bool = True,
+    use_input_dtype_state: bool = False,
 ) -> tuple[
     Float[Array, "batch num_heads seq_len d_state"],
     Float[Array, "batch num_heads head_dim d_state"],

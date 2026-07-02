@@ -393,8 +393,14 @@ class GatedDeltaRuleOp(OperationImpl):
                     backend="tpu",
                     chunk_size=128,
                     use_chunked=True,
-                    use_input_dtype_phase1_outputs=True,
-                    use_input_dtype_state=recurrent_state is None,
+                    # Keep fp32 phase-1/state on the no-grad (inference-core)
+                    # path: the custom-VJP training core always computes fp32,
+                    # so bf16 handoffs here make a frozen model's forward
+                    # diverge from the same weights' grad-path forward
+                    # (~4e-3/layer — inflated distillation KL between
+                    # identical teacher and student to ~0.5 nats at depth).
+                    use_input_dtype_phase1_outputs=False,
+                    use_input_dtype_state=False,
                 )
             else:
                 adaptive_chunk = min(max(16, seq_len), 64)
