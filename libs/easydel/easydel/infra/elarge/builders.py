@@ -880,6 +880,7 @@ def to_data_mixture_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[str,
         if "pixel_field" in inform_cfg:
             image_size = inform_cfg.get("image_size")
             inform = VisualDatasetInform(
+                name=inform_cfg.get("name"),
                 type=source_type,
                 data_files=data_files,
                 dataset_split_name=inform_cfg.get("dataset_split_name", None),
@@ -894,6 +895,7 @@ def to_data_mixture_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[str,
             )
         else:
             inform = TextDatasetInform(
+                name=inform_cfg.get("name"),
                 type=source_type,
                 data_files=data_files,
                 dataset_split_name=inform_cfg.get("dataset_split_name", None),

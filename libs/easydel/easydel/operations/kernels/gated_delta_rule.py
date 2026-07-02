@@ -428,17 +428,17 @@ class GatedDeltaRuleOp(OperationImpl):
         query_sharding = self.create_stable_sharding(
             shardings_bthd.query,
             tensor=query,
-            preserved_indices=[0, 2],
+            preserved_indices=[0, 1, 2],
         )
         key_sharding = self.create_stable_sharding(
             shardings_bthd.key,
             tensor=key,
-            preserved_indices=[0, 2],
+            preserved_indices=[0, 1, 2],
         )
         value_sharding = self.create_stable_sharding(
             shardings_bthd.value,
             tensor=value,
-            preserved_indices=[0, 2],
+            preserved_indices=[0, 1, 2],
         )
         beta_source = jax.sharding.PartitionSpec(
             shardings_bthd.value[0],
@@ -448,13 +448,13 @@ class GatedDeltaRuleOp(OperationImpl):
         beta_sharding = self.create_stable_sharding(
             beta_source,
             tensor=beta,
-            preserved_indices=[0, 2],
+            preserved_indices=[0, 1, 2],
         )
         decay_sharding = self.create_stable_sharding(
             beta_source,
             dep=decay,
             tensor=decay,
-            preserved_indices=[0, 2],
+            preserved_indices=[0, 1, 2],
         )
         state_source = None
         if value_sharding is not None:
@@ -476,12 +476,12 @@ class GatedDeltaRuleOp(OperationImpl):
         output_sharding = self.create_stable_sharding(
             shardings_bthd.output,
             tensor=value,
-            preserved_indices=[0, 2],
+            preserved_indices=[0, 1, 2],
         )
 
         seg_source = None
         if query_sharding is not None:
-            seg_source = jax.sharding.PartitionSpec(query_sharding[0], None)
+            seg_source = jax.sharding.PartitionSpec(query_sharding[0], query_sharding[1])
         seg_sharding = self.create_stable_sharding(
             seg_source,
             dep=seg_ids,
@@ -523,6 +523,7 @@ class GatedDeltaRuleOp(OperationImpl):
             mesh=mesh,
             in_specs=in_specs,
             out_specs=out_specs,
+            sequence_axis_name=self.metadata.sequence_axis_name,
             platform=None,
         )
 

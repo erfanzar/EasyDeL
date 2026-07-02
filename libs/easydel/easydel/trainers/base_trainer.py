@@ -90,6 +90,13 @@ from easydel.utils.lazy_import import is_package_available
 from easydel.utils.traversals import specs_to_name_sharding
 
 from . import fused_optimizers as _fused_optimizers  # noqa: F401  registers fused_adamw/fused_lion/fused_rmsprop
+from .buckets import (
+	BucketRule,
+	ModBucketRule,
+	StepThresholdRule,
+	TrainingBucket,
+	resolve_bucket_config,
+)
 from .metrics import BaseProgressBar, JSONProgressBar, NullProgressBar, RichProgressBar, TqdmProgressBar
 from .trainer_protocol import (
     BaseTrainerProtocol,
@@ -425,6 +432,9 @@ class BaseTrainer(BaseTrainerProtocol):
         data_collator: tp.Callable | None = None,
         finetune: bool = True,
         processing_class: PreTrainedTokenizerBase | None = None,
+        buckets: list[TrainingBucket] | None = None,
+        bucket_rule: BucketRule | None = None,
+        bucket_datasets: list | None = None,
         **deprecated_kwargs,
     ):
         """
@@ -439,6 +449,16 @@ class BaseTrainer(BaseTrainerProtocol):
             data_collator: Function to collate batches of data
             finetune: Whether this is a fine-tuning run (affects initialization)
             processing_class: Tokenizer or processor for handling text encoding/decoding
+            buckets: Optional list of :class:`~easydel.trainers.buckets.TrainingBucket`
+                configs. When set with ``bucket_rule``, the trainer builds one compiled
+                step function and one dataloader per bucket and selects which to use
+                each step. ``None`` (default) disables bucketing. Falls back to
+                ``arguments.buckets`` when not passed.
+            bucket_rule: Optional :class:`~easydel.trainers.buckets.BucketRule` selecting
+                the active bucket per step. Falls back to ``arguments.bucket_rule``.
+            bucket_datasets: Optional list of datasets/Sources, one per bucket, used to
+                build each bucket's dataloader. Falls back to
+                ``arguments.bucket_datasets`` (and then to ``dataset_train``).
             **deprecated_kwargs: Deprecated keyword arguments for backward compatibility
 
         Raises:
@@ -595,6 +615,49 @@ class BaseTrainer(BaseTrainerProtocol):
         # Convert datasets to ShardedDataSource for unified internal handling
         self._train_source = self._to_sharded_source(dataset_train)
         self._eval_source = self._to_sharded_source(dataset_eval)
+
+        # --- Training buckets (optional) -------------------------------------
+        # Constructor kwargs take precedence over TrainingArguments fields.
+        # buckets / bucket_datasets may each be None independently; bucket_rule
+        # is required when buckets are set.
+        buckets = buckets if buckets is not None else getattr(arguments, "buckets", None)
+        bucket_rule = bucket_rule if bucket_rule is not None else getattr(arguments, "bucket_rule", None)
+        bucket_datasets = bucket_datasets if bucket_datasets is not None else getattr(arguments, "bucket_datasets", None)
+        self._buckets: list[TrainingBucket] = list(buckets) if buckets else []
+        self._bucket_rule: BucketRule | None = bucket_rule
+        # Per-bucket registries populated lazily by `_configure_buckets` /
+        # `_configure_bucket_dataloaders`; kept as dicts keyed by bucket index.
+        self._has_buckets: bool = bool(self._buckets)
+        self._bucket_graphdefs: dict[int, tp.Any] = {}
+        self._bucket_step_fns: dict[int, tp.Any] = {}
+        self._bucket_extra_args: dict[int, tuple] = {}
+        self._bucket_static_args: dict[int, tuple] = {}
+        self._bucket_loaders: dict[int, _ReiterableDataLoader] = {}
+        self._bucket_iters: dict[int, collections.abc.Iterator] = {}
+        self._bucket_collators: dict[int, tp.Callable] = {}
+        self._bucket_sources: list = list(bucket_datasets) if bucket_datasets else []
+        # static_argnums tuple for the compiled step fn; set by each flavor's
+        # configure_functions (defaults to the base Trainer's shape below).
+        self._bucket_static_argnums: tuple = (2, 3, 4, 5, 6)
+        # Active bucket index for the current step; read by _execute_train_step
+        # and set per-step in _train_epoch. Default 0 (also the only value when
+        # buckets are disabled, in which case _has_buckets short-circuits).
+        self._bucket_for_step: int = 0
+        if self._has_buckets:
+            if bucket_rule is None:
+                raise ValueError(
+                    "`bucket_rule` must be provided when `buckets` is set; "
+                    "pass a BucketRule (e.g. ModBucketRule) selecting the active bucket per step."
+                )
+            n = len(self._buckets)
+            # max bucket index the rule can return; we can't validate select() bounds
+            # statically for CallableBucketRule, but Mod/Step rules are bounded.
+            logger.info(
+                "Training buckets enabled: %d bucket(s) %s with rule %r.",
+                n,
+                [b.name for b in self._buckets],
+                bucket_rule,
+            )
 
         # Apply trainer-specific preprocessing transform if available
         self._apply_preprocess_transforms()
@@ -4752,6 +4815,7 @@ class BaseTrainer(BaseTrainerProtocol):
             ("configure_dataloaders", self._configure_dataloaders),
             ("configure_model", self._configure_model),
             ("configure_state", self._configure_state),
+            ("configure_buckets", self._configure_buckets),
             ("configure_functions", self._configure_functions),
         ):
             self._runtime_trace(f"{name}.begin")
@@ -4840,6 +4904,257 @@ class BaseTrainer(BaseTrainerProtocol):
             scheduler=type(self.scheduler).__name__ if self.scheduler is not None else None,
         )
 
+    def _configure_buckets(self):
+        """Build per-bucket model variants (graphdefs) and dataloaders.
+
+        Only runs when ``self._has_buckets``. For each bucket:
+
+        1. Resolves the bucket's model config against the base config
+           (``resolve_bucket_config``), then constructs a structure-only variant
+           module via ``lazy_init`` so the bucket's ``attn_mechanism`` (or any
+           other config override) is baked into its own ``graphdef``.
+        2. Asserts the variant's ``graphstate`` structure matches the base —
+           only structure-preserving overrides are allowed, so all buckets
+           share one parameter/optimizer tree.
+        3. Resolves per-bucket static args (grad-accum / loss config /
+           partition spec), inheriting from ``arguments`` when the bucket
+           leaves them as ``None``.
+        4. Builds a per-bucket dataloader from ``self._bucket_sources[i]``
+           (falling back to the primary ``self._train_source``).
+
+        No-op (and fast path) when buckets are disabled.
+        """
+        if not self._has_buckets:
+            self._runtime_trace("_configure_buckets.skipped", reason="no buckets")
+            return
+        import spectrax as spx
+
+        if self._resumed_from_checkpoint:
+            logger.warning(
+                "Training buckets are enabled and training is resuming from a checkpoint. "
+                "Per-bucket dataloaders restart from batch 0 on resume (the global step "
+                "counter and optimizer state are restored correctly, but each bucket's "
+                "data position is not). This is a known v1 limitation."
+            )
+
+        # Validate the rule's output range against the bucket count so an
+        # out-of-bounds select() fails loudly here rather than as a KeyError
+        # deep inside _train_epoch / _execute_train_step. Probe a small set of
+        # steps that covers the structured rules' discontinuities (modulo wrap,
+        # each StepThresholdRule cutoff, and a high step) in addition to step 0.
+        n_buckets = len(self._buckets)
+        probe_steps = {0}
+        rule = self._bucket_rule
+        if isinstance(rule, StepThresholdRule):
+            probe_steps.update(rule.thresholds)
+            probe_steps.update(t - 1 for t in rule.thresholds)
+            probe_steps.update(t + 1 for t in rule.thresholds)
+        elif isinstance(rule, ModBucketRule):
+            probe_steps.update(range(rule.mod))
+        probe_steps.add(max(probe_steps) + 1)  # one step past the last probed
+        probe_steps.add(10**9)  # a definitely-"high" step for StepThresholdRule
+        for probe_step in sorted(probe_steps):
+            sel = rule.select(probe_step)
+            if not (0 <= sel < n_buckets):
+                raise ValueError(
+                    f"bucket_rule.select({probe_step}) returned {sel}, which is out of "
+                    f"range for {n_buckets} bucket(s) [0, {n_buckets - 1}]."
+                )
+
+        with self.timer("configure buckets"):
+            base_model = self.model_state.model
+            base_gstate = self.model_state.graphstate
+            base_struct = jax.tree_util.tree_structure(base_gstate)
+            module_cls = type(base_model)
+            for i, bucket in enumerate(self._buckets):
+                cfg_i = resolve_bucket_config(base_model.config, bucket)
+                module_i = module_cls.lazy_init(
+                    config=cfg_i,
+                    dtype=base_model.dtype,
+                    param_dtype=base_model.param_dtype,
+                    precision=base_model.precision,
+                    rngs=spx.Rngs(0),
+                )
+                gdef_i, gstate_i, _ = module_i.split_module(
+                    trainable_selector=self.arguments.trainable_selector,
+                )
+                struct_i = jax.tree_util.tree_structure(gstate_i)
+                if struct_i != base_struct:
+                    raise ValueError(
+                        f"Bucket {bucket.name!r} (index {i}) changes the parameter structure; "
+                        "only structure-preserving config overrides (e.g. attn_mechanism) are "
+                        "allowed per bucket."
+                    )
+                self._bucket_graphdefs[i] = gdef_i
+
+                # Per-bucket dataloader (flavor-agnostic). Use the bucket's own
+                # source when provided; otherwise fall back to the (already
+                # transform-prepared) primary train source. Only apply the
+                # preprocess transform to *raw* bucket sources, not the fallback,
+                # so we don't double-transform.
+                if i < len(self._bucket_sources):
+                    source = self._prepare_bucket_source(self._bucket_sources[i])
+                else:
+                    source = self._train_source
+                loader, collator_i = self._build_bucket_loader(bucket=bucket, source=source)
+                self._bucket_loaders[i] = loader
+                self._bucket_collators[i] = collator_i
+                self._bucket_iters[i] = iter(loader)
+                logger.info(
+                    "Configured bucket %d %r: max_length=%d, dataloader=%s.",
+                    i,
+                    bucket.name,
+                    bucket.max_length,
+                    type(loader).__name__,
+                )
+        self.timer.log("configure buckets")
+        self._runtime_trace("_configure_buckets.done", num_buckets=len(self._buckets))
+
+    def _prepare_bucket_source(self, source: "ShardedDataSource | None") -> "ShardedDataSource | None":
+        """Wrap a bucket's raw source with the trainer's preprocess transform.
+
+        Mirrors ``_apply_preprocess_transforms`` for the primary source: convert
+        to a ShardedDataSource and apply the flavor-specific tokenization
+        transform (e.g. DPO pairing) if one is configured.
+        """
+        sharded = self._to_sharded_source(source) if not isinstance(source, ShardedDataSource) else source
+        if sharded is None:
+            return None
+        transform = self._get_preprocess_transform()
+        if transform is not None:
+            sharded = sharded.transform(transform)
+        return sharded
+
+    def _resolve_bucket_step_args(self, i: int) -> tuple[tuple, tuple]:
+        """Resolve the (extra_args, static_args) for bucket ``i``'s compiled step.
+
+        This is the flavor-specific hook that pairs with
+        :meth:`_compile_bucket_step_functions`. Each trainer flavor overrides it
+        to return the static/extra args matching its own compiled step signature
+        (the base ``Trainer`` uses the 5-tuple
+        ``(loss_config, scheduler, partition_spec, grad_accum, ste)``;
+        distillation adds teacher-state and KD knobs, etc.).
+
+        The default implementation resolves per-bucket overrides
+        (``gradient_accumulation_steps`` / ``loss_config`` /
+        ``step_partition_spec``), inheriting from ``arguments`` on ``None``,
+        and returns ``((), (loss_i, scheduler, pspec_i, gacc_i))`` — matching the
+        base ``Trainer.training_step`` static-arg shape. Flavors with a different
+        compiled signature MUST override this.
+
+        Args:
+            i: Bucket index.
+
+        Returns:
+            ``(extra_args, static_args)`` tuples unpacked into the compiled call.
+        """
+        bucket = self._buckets[i]
+        gacc_i = bucket.gradient_accumulation_steps
+        if gacc_i is None:
+            gacc_i = self.arguments.gradient_accumulation_steps
+        loss_i = bucket.loss_config
+        if loss_i is None:
+            loss_i = self.arguments.loss_config
+        pspec_i = bucket.step_partition_spec
+        if pspec_i is None:
+            pspec_i = self.arguments.step_partition_spec
+        return (), (loss_i, self.scheduler, pspec_i, gacc_i)
+
+    def _bucket_step_compile_kwargs(self, i: int) -> dict[str, tp.Any]:
+        """Return the ``compile_trainer_step`` kwargs for bucket ``i``.
+
+        Defaults mirror the primary training-step compile (same shardings, mesh,
+        donation, schedule). Flavors whose step takes extra array inputs (e.g.
+        distillation's ``teacher_state``) override this to extend
+        ``in_shardings``/``out_shardings``.
+        """
+        empty_sharding = replicated_named_sharding(self.model.mesh)
+        return {
+            "static_argnums": self._bucket_static_argnums,
+            "in_shardings": (self.state_shardings, empty_sharding),
+            "out_shardings": (self.state_shardings, empty_sharding),
+            "donate_argnums": (0,),
+            "schedule": self.arguments.mpmd_scheduler,
+            "mesh": self.mesh,
+        }
+
+    def _compile_bucket_step_functions(self):
+        """Compile one training-step function per bucket.
+
+        Called from :meth:`_configure_functions` *after* the flavor's
+        :meth:`configure_functions` has run, so flavor-specific state (step fn,
+        static-arg shape, shardings) is already set up. For each bucket it:
+
+        1. Resolves ``(extra_args, static_args)`` via :meth:`_resolve_bucket_step_args`.
+        2. Compiles a dedicated step function closed over those args via
+           :meth:`_bucket_step_compile_kwargs`.
+
+        No-op when buckets are disabled.
+        """
+        if not self._has_buckets:
+            return
+        for i in range(len(self._buckets)):
+            extra_i, static_i = self._resolve_bucket_step_args(i)
+            self._bucket_extra_args[i] = extra_i
+            self._bucket_static_args[i] = static_i
+            self._bucket_step_fns[i] = self._compile_one_bucket_step(i)
+        self._runtime_trace("_compile_bucket_step_functions.done", num_buckets=len(self._buckets))
+
+    def _compile_one_bucket_step(self, i: int):
+        """Compile a single bucket's step function. Override per flavor.
+
+        The default uses :func:`compile_trainer_step` on the primary
+        ``sharded_training_step_function``'s underlying fn. Flavors that compile
+        a different fn (e.g. distillation_step) override this to bind their own
+        fn while reusing :meth:`_bucket_step_compile_kwargs`.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} must override _compile_one_bucket_step to support training buckets; "
+            "the base implementation does not know which step function to compile."
+        )
+
+    def _build_bucket_loader(
+        self,
+        bucket: TrainingBucket,
+        source: "ShardedDataSource | Dataset | IterableDataset | None",
+    ) -> tuple[_ReiterableDataLoader, tp.Callable]:
+        """Build a reusable dataloader + collator for one bucket.
+
+        Wraps the bucket's data source in a ``_ReiterableDataLoader`` and builds
+        a collator whose truncation/padding target is the bucket's
+        ``max_length``. The factory matches the primary train loader's iteration
+        parameters (``num_epochs``, ``shuffle``, ``batch_size``) so a bucket
+        loader behaves like the real one rather than silently diverging.
+
+        Returns:
+            (loader, collator) where collator applies the bucket's max_length.
+        """
+        sharded = self._to_sharded_source(source) if not isinstance(source, ShardedDataSource) else source
+        batch_size = self.training_batch_size
+
+        bucket_collator = self.create_grain_collect_function(
+            max_sequence_length=bucket.max_length,
+            truncation_mode=self.arguments.truncation_mode,
+        )
+
+        # Match the primary sharded-source loader's iteration knobs (see
+        # _configure_grain_dataloader) so the bucket does not silently diverge
+        # on epoch count or shuffling.
+        num_epochs = self.arguments.num_train_epochs
+        shuffle = self.arguments.shuffle_train_dataset
+
+        def _factory():
+            return self._create_dataloader_from_source(
+                source=sharded,
+                batch_size=batch_size,
+                is_train=True,
+                shuffle=shuffle,
+                num_epochs=num_epochs,
+                drop_remainder=True,
+            )
+
+        return _ReiterableDataLoader(factory=_factory, length=self.max_training_steps), bucket_collator
+
     def _configure_functions(self):
         """
         Configures and JIT-compiles the training and evaluation step functions.
@@ -4858,6 +5173,9 @@ class BaseTrainer(BaseTrainerProtocol):
             self.mesh = functions.mesh
             self.checkpoint_manager = functions.checkpoint_manager
             self.checkpointer = self._create_checkpointer()
+            # Compile per-bucket step fns now that the flavor's configure_functions
+            # has set up its compiled-fn signature / static-arg shape.
+            self._compile_bucket_step_functions()
         self.timer.log("configure functions and sharding them")
         self._runtime_trace("_configure_functions.compiled")
         self._runtime_trace("_configure_generation_function.begin")
@@ -6121,12 +6439,13 @@ class BaseTrainer(BaseTrainerProtocol):
         profiler_path = getattr(self.arguments, "profiler_path", None)
         if profiler_path is None:
             return
-        if current_step < 1:
+        include_compile = bool(getattr(self.arguments, "profiler_include_compile", False))
+        if current_step < 1 and not include_compile:
             return
-        # Only rank 0 records the trace by default; multi-host traces would
-        # otherwise step on each other's output files. Users that want
-        # per-worker traces can set `log_all_workers=True`.
-        if jax.process_index() != 0 and not self.arguments.log_all_workers:
+        # Only rank 0 records the trace by default. Use a profiler-specific
+        # all-worker flag so TPU profiling does not enable per-worker metrics,
+        # W&B, progress bars, or checkpoint logging.
+        if jax.process_index() != 0 and not getattr(self.arguments, "profiler_log_all_workers", False):
             self._profiler_started = True
             return
         try:

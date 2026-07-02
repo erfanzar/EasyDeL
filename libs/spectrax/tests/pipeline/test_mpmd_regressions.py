@@ -13,6 +13,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import pytest
+
 import spectrax as spx
 from spectrax.runtime.mpmd.compiler import compile_ranked_executables, run_ranked_pipeline
 from spectrax.runtime.mpmd.pscan_compiler import PscanPlan, _pack_grad_tree

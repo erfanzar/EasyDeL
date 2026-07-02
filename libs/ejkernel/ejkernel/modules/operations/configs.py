@@ -841,6 +841,10 @@ class GatedDeltaRuleConfig(BaseOperationConfig):
     training residual path still stores fp32 intermediates for backward
     stability. ``use_input_dtype_state`` is a separate forward-only TPU/Pallas
     knob for callers that do not need an fp32 recurrent state from the prefill.
+    ``sequence_parallel_truncate_state_gradient`` keeps sequence-parallel
+    forward state propagation exact but treats the affine cross-shard state
+    correction as forward-only. ``sequence_parallel_forward_only`` makes the
+    whole sequence-parallel GDR output forward-only.
 
     Args:
         platform: Target platform (triton/pallas/cuda/cute/xla/auto)
@@ -856,12 +860,19 @@ class GatedDeltaRuleConfig(BaseOperationConfig):
         use_input_dtype_state: Whether the TPU/Pallas forward-only chunked path
             should carry recurrent state in the input dtype. Leave this disabled
             for stateful prefill/decode paths that need fp32 cache state.
+        sequence_parallel_truncate_state_gradient: Whether sequence-parallel
+            GDR should stop gradients through the affine summary/cross-shard
+            state correction path while preserving exact forward propagation.
+        sequence_parallel_forward_only: Whether sequence-parallel GDR should
+            stop gradients at its output while preserving exact forward values.
     """
 
     chunk_size: int = 64
     use_chunked: bool = True
-    use_input_dtype_phase1_outputs: bool = False
-    use_input_dtype_state: bool = False
+    use_input_dtype_phase1_outputs: bool = True
+    use_input_dtype_state: bool = True
+    sequence_parallel_truncate_state_gradient: bool = False
+    sequence_parallel_forward_only: bool = False
 
     __hash__ = hash_fn
 

@@ -41,8 +41,8 @@ def gated_delta_rule(
     initial_state: Float[Array, "batch num_value_heads qk_head_dim v_head_dim"] | None = None,
     use_qk_l2norm: bool = True,
     use_chunked: bool = True,
-    use_input_dtype_phase1_outputs: bool = False,
-    use_input_dtype_state: bool = False,
+    use_input_dtype_phase1_outputs: bool = True,
+    use_input_dtype_state: bool = True,
     seg_ids: Int[Array, "batch seq_len"] | None = None,
 ) -> tuple[
     Float[Array, "batch seq_len num_value_heads v_head_dim"],
@@ -56,16 +56,13 @@ def gated_delta_rule(
     returned. Dispatch selects one of four implementations based on ``seg_ids``, the input
     shape, and the ``use_chunked`` flag, in this priority order:
 
-    * **Segment-packed recurrent** (``seg_ids is not None``): delegates to the XLA chunked
-      recurrent implementation with segment ids so that the recurrent state is reset at
-      document boundaries (sequence packing). Takes precedence over all other branches.
     * **Single-step** (``seq_len == 1`` with ``initial_state`` provided): a Pallas
       single-step kernel for autoregressive decoding.
     * **Chunked** (``use_chunked=True``, default): a vectorized Pallas kernel that uses
-      a parallel exact strict-lower solve mapped to MXU-heavy matmuls, with the scan body
-      keeping data in VMEM.
+      a parallel exact strict-lower solve mapped to MXU-heavy matmuls, with segment-aware
+      masking when ``seg_ids`` is provided.
     * **Recurrent fallback** (``use_chunked=False``): falls back to the XLA step-by-step
-      recurrent implementation.
+      recurrent implementation, including packed segments.
 
     All paths optionally apply L2 normalisation to queries and keys when ``use_qk_l2norm`` is
     ``True`` (the default) and scale queries by ``1 / sqrt(qk_head_dim)``.
@@ -89,8 +86,8 @@ def gated_delta_rule(
         use_qk_l2norm: If ``True``, L2-normalise queries and keys before
             computing attention.
         use_chunked: If ``True`` (default), use the chunked Pallas kernel.
-            Set to ``False`` to use the XLA recurrent fallback. Ignored when
-            ``seg_ids`` is provided or when the single-step path is taken.
+            Set to ``False`` to use the XLA recurrent fallback. Ignored only
+            when the single-step path is taken.
         use_input_dtype_phase1_outputs: If ``True``, the forward-only chunked
             Pallas path writes its large phase-1 handoff tensors in the input
             dtype instead of fp32. This is ignored by the segmented, single-step,
@@ -99,10 +96,9 @@ def gated_delta_rule(
             path carries the recurrent state in the input dtype instead of fp32.
             Leave disabled for callers that consume the returned state as cache.
         seg_ids: Optional per-token segment (document) ids of shape
-            ``(batch, seq_len)``. When provided, dispatch is forced to the XLA
-            recurrent path, which uses these ids to reset the recurrent state at
-            segment boundaries so that packed sequences do not leak state across
-            documents. ``None`` (default) treats the whole sequence as one segment.
+            ``(batch, seq_len)``. When provided, the chunked Pallas path masks
+            intra-chunk attention and recurrent state flow at segment boundaries.
+            ``None`` (default) treats the whole sequence as one segment.
 
     Returns:
         A tuple ``(output, final_state)`` where:
@@ -125,23 +121,7 @@ def gated_delta_rule(
             f"grouped GDR requires value heads ({v.shape[1]}) to be a multiple of query heads ({q.shape[1]})"
         )
 
-    if seg_ids is not None:
-        if grouped_heads:
-            expand_ratio = v.shape[1] // q.shape[1]
-            q = jnp.repeat(q, expand_ratio, axis=1)
-            k = jnp.repeat(k, expand_ratio, axis=1)
-        out, final_state = _recurrent_gdr_fwd(
-            query=q,
-            key=k,
-            value=v,
-            beta=b,
-            decay=d,
-            initial_state=initial_state,
-            use_qk_l2norm=use_qk_l2norm,
-            chunk_size=chunk_size,
-            seg_ids=seg_ids,
-        )
-    elif query.shape[1] == 1 and initial_state is not None:
+    if query.shape[1] == 1 and initial_state is not None:
         if grouped_heads:
             expand_ratio = v.shape[1] // q.shape[1]
             q = jnp.repeat(q, expand_ratio, axis=1)
@@ -162,6 +142,7 @@ def gated_delta_rule(
             value=v,
             beta=b,
             decay=d,
+            seg_ids=seg_ids,
             chunk_size=chunk_size,
             initial_state=initial_state,
             use_qk_l2norm=use_qk_l2norm,
@@ -175,6 +156,7 @@ def gated_delta_rule(
             value=v,
             beta=b,
             decay=d,
+            seg_ids=seg_ids,
             chunk_size=chunk_size,
             initial_state=initial_state,
             use_qk_l2norm=use_qk_l2norm,
@@ -194,6 +176,8 @@ def gated_delta_rule(
             decay=d,
             initial_state=initial_state,
             use_qk_l2norm=use_qk_l2norm,
+            chunk_size=chunk_size,
+            seg_ids=seg_ids,
         )
 
     return out.transpose(0, 2, 1, 3), final_state

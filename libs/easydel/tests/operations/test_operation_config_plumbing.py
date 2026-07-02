@@ -1,7 +1,8 @@
 import jax.numpy as jnp
+from ejkernel.modules.operations.configs import GatedDeltaRuleConfig, RaggedGatedDeltaRuleV2Config
+
 from easydel.infra import EasyDeLBaseConfig
 from easydel.operations import OperationMetadata
-from ejkernel.modules.operations.configs import GatedDeltaRuleConfig, RaggedGatedDeltaRuleV2Config
 
 
 def test_base_config_explicit_operation_configs_override_checkpoint_default():

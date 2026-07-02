@@ -34,6 +34,7 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+
 from ejkernel.benchmarks import Benchmark
 from ejkernel.kernels._registry import Backend, kernel_registry
 from ejkernel.modules import operations as ops

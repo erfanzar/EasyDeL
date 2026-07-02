@@ -2,10 +2,11 @@ import jax
 import jax.numpy as jnp
 import pytest
 import spectrax as spx
-from easydel.infra.base_config import EasyDeLBaseConfig
-from easydel.infra.elarge.processing import materialize_base_config
 from jax.sharding import PartitionSpec
 from spectrax import nn
+
+from easydel.infra.base_config import EasyDeLBaseConfig
+from easydel.infra.elarge.processing import materialize_base_config
 
 
 class _Block(spx.Module):
@@ -158,8 +159,9 @@ def test_modulelist_scan_trace_path_matches_scan():
 
 
 def test_llama_empty_cache_prefill_uses_real_scan_when_enabled(monkeypatch):
-    import easydel as ed
     from spectrax.core.containers import ModuleList, StackedModuleList
+
+    import easydel as ed
 
     calls = []
     original_module_scan = ModuleList.scan
@@ -196,8 +198,9 @@ def test_llama_pp_mesh_forces_trace_path_for_stage_markers(monkeypatch):
         pytest.skip("requires at least two devices for a pp>1 mesh")
 
     del monkeypatch
-    import easydel as ed
     from spectrax.core.containers import ModuleList
+
+    import easydel as ed
 
     cfg = ed.LlamaConfig(
         vocab_size=64,

@@ -2262,6 +2262,12 @@ class eLargeModel:
             args_class = get_training_arguments_class(trainer_type)
 
         config_for_args = {k: v for k, v in trainer_cfg.items() if k != "trainer_type"}
+        # Training buckets are passed as explicit trainer kwargs from
+        # build_trainer (TrainingBucket objects + resolved BucketRule + built
+        # sources), not through TrainingArguments. Strip the raw eLarge keys so
+        # they don't leak into the dataclass (which uses different field names).
+        for _bk in ("bucket_configs", "bucket_rule", "bucket_datasets"):
+            config_for_args.pop(_bk, None)
 
         try:
             return args_class(**config_for_args)
@@ -2352,6 +2358,38 @@ class eLargeModel:
             # Use new get_train_source() which auto-selects based on use_sharded_source
             with phase_timer("build_trainer.get_train_source", tag="eLargeModel"):
                 train_dataset = self.get_train_source()
+
+        # --- Optional training buckets ----------------------------------------
+        # Build per-bucket TrainingBucket configs, a BucketRule, and one data
+        # source per bucket from `bucket_datasets`. The model *variants* (one
+        # graphdef per bucket, differing e.g. in attn_mechanism) are constructed
+        # inside the trainer, not here; eLarge only hands over the configs + data.
+        bucket_cfgs = trainer_cfg.get("bucket_configs")
+        bucket_rule_dict = trainer_cfg.get("bucket_rule")
+        bucket_mixture_cfgs = trainer_cfg.get("bucket_datasets")
+        buckets = bucket_rule = bucket_datasets = None
+        if bucket_cfgs:
+            if not bucket_rule_dict:
+                raise ValueError(
+                    "`bucket_rule` must be set in the trainer config when `bucket_configs` is set; "
+                    "e.g. {'kind': 'mod', 'mod': 5, 'on_bucket': 0, 'off_bucket': 1}."
+                )
+            from easydel.trainers.buckets import BucketRule, TrainingBucket
+
+            buckets = [TrainingBucket(**bc) for bc in bucket_cfgs]
+            bucket_rule = BucketRule.from_dict(bucket_rule_dict)
+            bucket_datasets = []
+            original_mixture = self._config.get("mixture")
+            for i, mc in enumerate(bucket_mixture_cfgs or []):
+                self._config["mixture"] = mc
+                try:
+                    bucket_datasets.append(self.get_train_source())
+                finally:
+                    # Restore so the base mixture is untouched for the primary loader.
+                    if original_mixture is None:
+                        self._config.pop("mixture", None)
+                    else:
+                        self._config["mixture"] = original_mixture
 
         trainer_kwargs = {}
         model = self._state if self._state is not None else self._model
@@ -2766,6 +2804,12 @@ class eLargeModel:
 
         if kwargs.get("bema_callback", None) is not None and trainer_class.__name__ == "BEMADPOTrainer":
             trainer_kwargs["bema_callback"] = kwargs["bema_callback"]
+
+        # Attach training buckets (None values are stripped below for non-bucket runs).
+        if buckets is not None:
+            trainer_kwargs["buckets"] = buckets
+            trainer_kwargs["bucket_rule"] = bucket_rule
+            trainer_kwargs["bucket_datasets"] = bucket_datasets
 
         trainer_kwargs = {k: v for k, v in trainer_kwargs.items() if v is not None}
 

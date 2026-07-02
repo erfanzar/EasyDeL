@@ -14,6 +14,7 @@
 
 import numpy as np
 import pytest
+
 from easydel.inference.esurge.runners.execution_manager import ExecutionManager
 
 

@@ -31,6 +31,7 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import pytest
+
 from ejkernel.kernels._pallas.tpu.gated_delta_rule import gated_delta_rule as gated_delta_rule_pallas
 from ejkernel.kernels._xla.gated_delta_rule import gated_delta_rule as gated_delta_rule_xla
 from ejkernel.kernels._xla.gated_delta_rule._xla_impl_fwd import _l2norm_with_inv

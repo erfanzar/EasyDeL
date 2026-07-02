@@ -26,10 +26,11 @@ from types import SimpleNamespace
 
 os.environ.setdefault("ENABLE_DISTRIBUTED_INIT", "0")
 
-import easydel.trainers  # noqa: F401
 import jax
 import jax.numpy as jnp
 import pytest
+
+import easydel.trainers  # noqa: F401
 from easydel.trainers import SpeculativeDecodingConfig, SpeculativeDecodingTrainer
 from easydel.trainers.speculative_decoding_trainer._fn import (
     _deepspec_block_loss,

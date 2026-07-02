@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
+from jax.sharding import Mesh, PartitionSpec
 
-from ejkernel.modules.operations import ring_attention
+from ejkernel.modules.operations import RingAttentionConfig, ring_attention
 
 from ._utils import assert_allclose, dense_attention_reference, device_platform, rand_qkv
 
@@ -42,6 +44,32 @@ def test_ring_attention_axis_name_none_matches_dense_reference_xla():
 
     assert out.shape == (1, 16, 4, 32)
     assert_allclose(out, ref_out, atol=0.2)
+
+
+@pytest.mark.skipif(jax.local_device_count() < 4, reason="requires at least 4 local devices for sequence sharding")
+def test_ring_attention_shard_map_accepts_dict_config():
+    key = jax.random.PRNGKey(3)
+    q, k, v = rand_qkv(key, batch=1, q_len=16, kv_len=16, q_heads=4, kv_heads=4, head_dim=16, dtype=jnp.float32)
+    cfg = RingAttentionConfig(platform="xla", backend="any")
+    seq_spec = PartitionSpec(None, "sp", None, None)
+
+    mesh = Mesh(np.array(jax.devices()[:4]).reshape(4), ("sp",))
+    with mesh:
+        out = ring_attention(
+            q,
+            k,
+            v,
+            axis_name="sp",
+            causal=True,
+            platform="xla",
+            cfg=cfg.to_dict(),
+            mesh=mesh,
+            in_specs=(seq_spec, seq_spec, seq_spec, None, None),
+            out_specs=seq_spec,
+        )
+
+    ref_out, _ = dense_attention_reference(q, k, v, causal=True)
+    assert_allclose(out, ref_out, atol=2e-4)
 
 
 @pytest.mark.skipif(device_platform() != "tpu", reason="TPU-only cross-backend comparison (pallas vs xla)")

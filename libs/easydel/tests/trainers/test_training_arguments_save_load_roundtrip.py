@@ -30,12 +30,13 @@ from typing import Any
 
 import jax.numpy as jnp
 import pytest
+from jax.sharding import PartitionSpec
+
 from easydel.infra.etils import EasyDeLOptimizers, EasyDeLSchedulers
 from easydel.infra.loss_utils import LossConfig
 from easydel.trainers.metrics import LogWatcher
 from easydel.trainers.pose import PoSEConfig
 from easydel.trainers.training_configurations import TrainingArguments
-from jax.sharding import PartitionSpec
 
 
 def _full_training_arguments_kwargs() -> dict[str, Any]:
@@ -189,6 +190,11 @@ def _full_training_arguments_kwargs() -> dict[str, Any]:
         "esurge_max_num_batched_tokens": 4096,
         "esurge_enable_prefix_caching": True,
         "esurge_data_parallelism_axis": "dp",
+        # ---- Training buckets (runtime-only objects excluded from to_dict;
+        # bucket_rule survives as a reconstructed BucketRule) ----
+        "buckets": None,
+        "bucket_datasets": None,
+        "bucket_rule": {"kind": "mod", "mod": 5, "offset": 0, "on_bucket": 0, "off_bucket": 1},
     }
 
 
@@ -278,6 +284,36 @@ def test_save_load_preserves_benchmarks_list(tmp_path, full_args):
     loaded = TrainingArguments.load_arguments(json_path)
 
     assert loaded.benchmarks == full_args.benchmarks
+
+
+def test_save_load_reconstructs_bucket_rule(tmp_path):
+    """``bucket_rule`` roundtrips from a BucketRule object back to a BucketRule.
+
+    Mirrors the pose/loss_config pattern: to_dict serializes via the rule's own
+    to_dict(); from_dict rebuilds it via BucketRule.from_dict().
+    """
+    from easydel.trainers.buckets import BucketRule, ModBucketRule
+
+    args = TrainingArguments(
+        bucket_rule=ModBucketRule(mod=5, on_bucket=0, off_bucket=1),
+        save_directory="/tmp/bucket-rule-roundtrip",
+    )
+    json_path = tmp_path / "bucket_rule.json"
+    args.save_arguments(json_path)
+    loaded = TrainingArguments.load_arguments(json_path)
+
+    assert isinstance(loaded.bucket_rule, BucketRule)
+    assert isinstance(loaded.bucket_rule, ModBucketRule)
+    assert loaded.bucket_rule.to_dict() == args.bucket_rule.to_dict()
+
+
+def test_to_dict_excludes_runtime_only_bucket_fields(full_args):
+    """``buckets`` and ``bucket_datasets`` are runtime-only and excluded from to_dict."""
+    d = full_args.to_dict()
+    assert "buckets" not in d
+    assert "bucket_datasets" not in d
+    # bucket_rule is serializable and stays.
+    assert "bucket_rule" in d
 
 
 def test_to_json_string_includes_class_marker(full_args):

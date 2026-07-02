@@ -19,6 +19,7 @@ from unittest import mock
 
 import pytest
 from click.testing import CliRunner
+
 from eray.cli.main import _resolve_tpu, cli
 from eray.cli.tpu import ConnectResult
 from eray.cli.utils import TpuInfo, build_ray_resource_flags, list_tpus_in_project, list_tpus_in_zone

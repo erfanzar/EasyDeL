@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import pytest
+
 from spectrax.runtime.schedules import (
     Action,
     DualPipeV,
@@ -182,9 +183,9 @@ class TestZeroBubbleH1:
         for t, row in enumerate(g):
             for s, cell in enumerate(row):
                 if cell is not None and cell.phase == Phase.BWD_W:
-                    assert (
-                        per_stage_bwd_i[(s, cell.microbatch)] < t
-                    ), f"BWD_W at (t={t}, s={s}, mb={cell.microbatch}) precedes its BWD_I"
+                    assert per_stage_bwd_i[(s, cell.microbatch)] < t, (
+                        f"BWD_W at (t={t}, s={s}, mb={cell.microbatch}) precedes its BWD_I"
+                    )
 
     def test_peak_activations(self):
         """Peak activations equal ``n_stages`` in ZB-H1."""

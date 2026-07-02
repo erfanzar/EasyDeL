@@ -21,11 +21,12 @@ from types import SimpleNamespace
 import jax
 import numpy as np
 import spectrax as spx
-from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.modules.llama.llama_configuration import LlamaConfig
 from jax import numpy as jnp
 from jax.sharding import Mesh
 from spectrax.runtime.mpmd.markers import stage_region_specs
+
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.modules.llama.llama_configuration import LlamaConfig
 
 
 class _DummyRegionModule(EasyDeLBaseModule):

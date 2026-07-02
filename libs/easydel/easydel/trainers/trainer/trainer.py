@@ -398,6 +398,8 @@ class Trainer(BaseTrainer):
             tensor_straight_through=self.arguments.tensor_straight_through,
             straight_through_emulator=self.arguments.straight_through_emulator,
         )
+        # Stash so the per-bucket hook (_resolve_bucket_step_args) can reuse it.
+        self._straight_through_emulator = straight_through_emulator
         self._train_shared_fn_static_args = (
             self.arguments.loss_config,
             self.scheduler,
@@ -414,6 +416,10 @@ class Trainer(BaseTrainer):
             schedule=self.arguments.mpmd_scheduler,
             mesh=self.mesh,
         )
+        # Per-bucket compilation is driven by BaseTrainer._compile_bucket_step_functions,
+        # which calls _resolve_bucket_step_args / _compile_one_bucket_step below. This
+        # avoids hardcoding the bucket compile here and lets every flavor opt in by
+        # overriding those hooks (distillation etc. have a different step signature).
 
         self._eval_shared_fn_static_args = (
             self.arguments.loss_config,
@@ -438,6 +444,22 @@ class Trainer(BaseTrainer):
             mesh=mesh,
             checkpoint_manager=checkpoint_manager,
         )
+
+    # -- Training-bucket hooks (see BaseTrainer._compile_bucket_step_functions) --
+    # The base Trainer compiles `training_step` with the 5 static args
+    # (loss_config, scheduler, partition_spec, grad_accum, ste). Flavors with a
+    # different step signature override these two methods.
+
+    def _resolve_bucket_step_args(self, i: int) -> tuple[tuple, tuple]:
+        """Trainer flavor: append the STE to the base 4-tuple static args."""
+        extra, static = super()._resolve_bucket_step_args(i)
+        # static == (loss_i, scheduler, pspec_i, gacc_i) from the base; add the STE.
+        ste = getattr(self, "_straight_through_emulator", None)
+        return extra, (*static, ste)
+
+    def _compile_one_bucket_step(self, i: int):
+        """Compile bucket ``i``'s ``training_step`` with the base Trainer kwargs."""
+        return compile_trainer_step(training_step, **self._bucket_step_compile_kwargs(i))
 
     def _get_epoch_step_bounds(self, epoch: int) -> tuple[int, int]:
         """Return the global step range assigned to an epoch."""
@@ -721,7 +743,10 @@ class Trainer(BaseTrainer):
                 prefetcher = None
             return train_iter
 
-        if bool(getattr(self.arguments, "dataloader_prefetch", False)):
+        if bool(getattr(self.arguments, "dataloader_prefetch", False)) and not self._has_buckets:
+            # Prefetcher is disabled when buckets are active (v1 uses synchronous
+            # fetch so the per-step loader/collator swap is exact); skip creating
+            # it here to avoid building-then-immediately-closing it each epoch.
             prefetcher = _TrainBatchPrefetcher(
                 trainer=self,
                 data_iter=train_iter,
@@ -742,6 +767,18 @@ class Trainer(BaseTrainer):
                         epoch_end_step=epoch_end_step,
                     )
                     break
+                # Per-step bucket selection: pick the active bucket's dataloader
+                # and compiled fn for this step. `self._bucket_for_step` is read
+                # by `_execute_train_step` to choose the graphdef + fn. The
+                # prefetcher is never built when buckets are active (see setup
+                # above), so the synchronous fetch path is used.
+                if self._has_buckets:
+                    bi = self._bucket_rule.select(current_step)
+                    self._bucket_for_step = bi
+                    train_dataset = self._bucket_loaders[bi]
+                    train_iter = self._bucket_iters[bi]
+                    # Use the bucket's own collator (applies its max_length).
+                    data_collator = self._bucket_collators[bi]
                 try:
                     self._runtime_trace("train_step.batch_fetch.begin", epoch=epoch, current_step=current_step)
                     prefetch_wait_time: float | None = None
@@ -786,6 +823,9 @@ class Trainer(BaseTrainer):
                         # PoSE (text-only): host-side position_ids skip, once per microbatch
                         # before the forward (no-op unless arguments.pose.enabled).
                         batch = self._apply_pose_to_batch(batch, current_step)
+                    # Persist the (possibly re-created on exhaustion) bucket iterator.
+                    if self._has_buckets:
+                        self._bucket_iters[self._bucket_for_step] = train_iter
                     step_metrics.start_step()
                     self._runtime_trace("train_step.on_step_start.begin", epoch=epoch, current_step=current_step)
                     state = self.on_step_start(state=state, step=current_step)
@@ -802,11 +842,14 @@ class Trainer(BaseTrainer):
 
                 # Execute training step
                 self._runtime_trace("train_step.execute.begin", epoch=epoch, current_step=current_step)
-                with self.train_tracker.trace_compilation():
-                    with capture_time() as execution_time:
-                        state, metrics, run_exception = self._execute_train_step(state=state, batch=batch)
-                        metrics.execution_time = execution_time()
-                        current_step = int(jax.device_get(state.step))
+                if getattr(self.arguments, "profiler_include_compile", False):
+                    self._maybe_start_profiler(current_step)
+                with jax.profiler.StepTraceAnnotation("train", step_num=current_step + 1):
+                    with self.train_tracker.trace_compilation():
+                        with capture_time() as execution_time:
+                            state, metrics, run_exception = self._execute_train_step(state=state, batch=batch)
+                            metrics.execution_time = execution_time()
+                            current_step = int(jax.device_get(state.step))
                 self._runtime_trace(
                     "train_step.execute.end",
                     epoch=epoch,
@@ -1184,14 +1227,33 @@ class Trainer(BaseTrainer):
             )
 
             self._runtime_trace("execute_train_step.compiled_call.begin")
-            state, metrics = jax.block_until_ready(
-                self.sharded_training_step_function(
-                    state,
-                    batch,
-                    *self._train_shared_fn_extra_args,
-                    *self._train_shared_fn_static_args,
+            if self._has_buckets:
+                # Swap the bucket's graphdef (carrying its attn kernel) into the
+                # state before calling the bucket's compiled fn, then restore a
+                # canonical graphdef (bucket 0) so post-step host work (metrics,
+                # checkpointing) sees a consistent model. graphdef is
+                # pytree_node=False, so this is a cheap static swap — the shared
+                # graphstate/opt_state buffers are updated in place by the fn.
+                bi = self._bucket_for_step
+                bucket_state = state.replace(graphdef=self._bucket_graphdefs[bi])
+                state, metrics = jax.block_until_ready(
+                    self._bucket_step_fns[bi](
+                        bucket_state,
+                        batch,
+                        *self._bucket_extra_args[bi],
+                        *self._bucket_static_args[bi],
+                    )
                 )
-            )
+                state = state.replace(graphdef=self._bucket_graphdefs[0])
+            else:
+                state, metrics = jax.block_until_ready(
+                    self.sharded_training_step_function(
+                        state,
+                        batch,
+                        *self._train_shared_fn_extra_args,
+                        *self._train_shared_fn_static_args,
+                    )
+                )
             self._runtime_trace(
                 "execute_train_step.compiled_call.end",
                 step=int(jax.device_get(state.step)),

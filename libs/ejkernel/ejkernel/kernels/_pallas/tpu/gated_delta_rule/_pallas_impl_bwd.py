@@ -31,7 +31,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jaxtyping import Array, Float
 
 from ...._xla.gated_delta_rule._xla_impl_fwd import _l2norm_bwd
-from ._pallas_impl_fwd import _N_FUSE, _chunk_blockspec, _dot, _neumann_inv
+from ._pallas_impl_fwd import _N_FUSE, _chunk_blockspec, _dot, _neumann_inv, _segmented_chunk_cumsum
 
 
 def _bwd_one_chunk(q, k, v, beta, decay, d_out, state_pre, d_state_next, C):
@@ -166,6 +166,150 @@ def _bwd_one_chunk(q, k, v, beta, decay, d_out, state_pre, d_state_next, C):
     return d_state, d_q, d_k, d_v, d_beta, d_decay_final
 
 
+def _segmented_cumsum_1d(decay, seg, valid_bool, C):
+    """Segment-local cumulative decay for one chunk, reset at packed boundaries."""
+    values = []
+    running = jnp.array(0.0, dtype=jnp.float32)
+    for i in range(C):
+        if i == 0:
+            is_start = valid_bool[i]
+        else:
+            is_start = valid_bool[i] & ((seg[i] != seg[i - 1]) | ~valid_bool[i - 1])
+        running = jnp.where(is_start, decay[i], jnp.where(valid_bool[i], running + decay[i], 0.0))
+        values.append(running)
+    return jnp.stack(values, axis=0)[:, None]
+
+
+def _bwd_one_chunk_segmented(
+    q,
+    k,
+    v,
+    beta,
+    decay,
+    g_cumsum,
+    d_out,
+    state_pre,
+    d_state_next,
+    seg,
+    state_seg,
+    has_valid,
+    seg_last,
+    g_end_value,
+    C,
+):
+    """Compute gradients for one packed GDR chunk with explicit segment masks."""
+    lower_base = jnp.tril(jnp.ones((C, C), dtype=jnp.float32))
+    strict_base = lower_base - jnp.eye(C, dtype=jnp.float32)
+    future_base = jnp.triu(jnp.ones((C, C), dtype=jnp.float32))
+
+    valid_bool = seg >= 0
+    valid = valid_bool.astype(jnp.float32)
+    active = has_valid.astype(jnp.float32)
+    same_segment = (seg[:, None] == seg[None, :]).astype(jnp.float32) * valid[:, None] * valid[None, :]
+    lower_mask = lower_base * same_segment
+    strict_lower = strict_base * same_segment
+    future_same = future_base * same_segment
+    same_as_last = (seg == seg_last).astype(jnp.float32)[:, None] * valid[:, None] * active
+    read = (seg == state_seg).astype(jnp.float32)[:, None] * valid[:, None]
+
+    v_beta = v * beta[:, None] * valid[:, None]
+    k_beta = k * beta[:, None] * valid[:, None]
+    g_cumsum = g_cumsum[:, None]
+    g_diff = g_cumsum - g_cumsum.T
+    decay_mask = jnp.exp(jnp.clip(g_diff * lower_mask, -20.0, 20.0)) * lower_mask
+
+    attn_neg = -(_dot(k_beta, k.T) * decay_mask) * strict_lower
+    attn_neg = jnp.nan_to_num(attn_neg, nan=0.0, posinf=0.0, neginf=0.0)
+    attn = _neumann_inv(attn_neg, C, strict_lower=strict_lower, lower_mask=lower_mask)
+
+    g_cumsum_exp = jnp.exp(jnp.clip(g_cumsum, -20.0, 20.0))
+    g_end = g_end_value.astype(jnp.float32).reshape(1, 1) * active
+    g_end_exp = jnp.exp(jnp.clip(g_end, -20.0, 20.0))
+    g_diff_state_exp = jnp.exp(jnp.clip(g_end - g_cumsum, -20.0, 20.0))
+
+    def _s(x):
+        return jnp.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+
+    k_beta_scaled = k_beta * g_cumsum_exp
+    value_local = _s(_dot(attn, v_beta))
+    k_cumdecay = _s(_dot(attn, k_beta_scaled))
+
+    attn_qk_base = _dot(q, k.T)
+    attn_qk = _s(attn_qk_base * decay_mask)
+    q_scaled = q * g_cumsum_exp * valid[:, None]
+    read_state = read.astype(state_pre.dtype)
+    v_prime = _s(_dot(k_cumdecay, state_pre)) * read_state
+    v_new = _s(value_local - v_prime)
+    k_scaled = k * g_diff_state_exp * same_as_last
+
+    d_out = d_out * valid[:, None]
+    survive = (seg_last == state_seg).astype(jnp.float32) * active
+    d_state_update = d_state_next * active
+    d_state = _s(d_state_next * (1.0 - active) + d_state_update * g_end_exp * survive)
+    d_g_end = jnp.sum(d_state_update * state_pre) * survive
+
+    d_k_scaled = _s(_dot(v_new, d_state_update.T))
+    d_v_new = _s(_dot(k_scaled, d_state_update))
+    d_attn_qk = _s(_dot(d_out, v_new.T))
+    d_v_new = _s(d_v_new + _dot(attn_qk.T, d_out))
+
+    d_value_local = d_v_new
+    d_v_prime = -d_v_new
+
+    d_v_prime_state = d_v_prime * read_state
+    d_k_cumdecay = _s(_dot(d_v_prime_state, state_pre.T))
+    d_state = _s(d_state + _dot(k_cumdecay.T, d_v_prime_state))
+    d_attn_inter = d_out * read_state
+    d_q_scaled = _s(_dot(d_attn_inter, state_pre.T))
+    d_state = _s(d_state + _dot(q_scaled.T, d_attn_inter))
+
+    d_q = d_q_scaled * g_cumsum_exp * valid[:, None]
+    d_g_exp = jnp.sum(d_q_scaled * q * valid[:, None], axis=-1, keepdims=True)
+    d_k = d_k_scaled * g_diff_state_exp * same_as_last
+    d_g_diff = jnp.sum(d_k_scaled * k * same_as_last, axis=-1, keepdims=True)
+
+    d_attn_qk_base = _s(d_attn_qk * decay_mask)
+    d_decay_mask_from_qk = d_attn_qk * attn_qk_base
+    d_q = d_q + _dot(d_attn_qk_base, k)
+    d_k = d_k + _dot(d_attn_qk_base.T, q)
+
+    d_attn = _s(_dot(d_value_local, v_beta.T) + _dot(d_k_cumdecay, k_beta_scaled.T))
+    d_value_beta = _s(_dot(attn.T, d_value_local))
+    d_key_beta_scaled = _s(_dot(attn.T, d_k_cumdecay))
+
+    d_key_beta = d_key_beta_scaled * g_cumsum_exp
+    d_g_exp = d_g_exp + jnp.sum(d_key_beta_scaled * k_beta, axis=-1, keepdims=True)
+
+    tmp = _dot(attn.T, d_attn)
+    d_k_attn = _s(-_dot(tmp, attn.T)) * strict_lower
+
+    kk = _dot(k_beta, k.T)
+    d_kk = d_k_attn * decay_mask
+    d_decay_mask = _s((d_decay_mask_from_qk + d_k_attn * kk) * lower_mask)
+
+    d_key_beta = d_key_beta + _dot(d_kk, k)
+    d_k = d_k + _dot(d_kk.T, k_beta)
+
+    d_v = d_value_beta * beta[:, None]
+    d_beta = jnp.sum(d_value_beta * v, axis=-1, keepdims=True)
+    d_k = d_k + d_key_beta * beta[:, None]
+    d_beta = d_beta + jnp.sum(d_key_beta * k, axis=-1, keepdims=True)
+
+    d_decay_f = _s(d_decay_mask * decay_mask)
+    d_g_row = jnp.sum(d_decay_f, axis=-1, keepdims=True)
+    d_g_col = jnp.sum(d_decay_f.T, axis=1, keepdims=True)
+    d_g = d_g_row - d_g_col
+    d_g = d_g + d_g_exp * g_cumsum_exp
+
+    d_g_diff_term = d_g_diff * g_diff_state_exp * same_as_last
+    d_g_end_total = jnp.sum(d_g_diff_term) + d_g_end * g_end_exp.reshape(())
+    d_g = d_g - d_g_diff_term
+    d_decay_final = _dot(future_same, d_g) + same_as_last * d_g_end_total
+
+    d_state = _s(d_state)
+    return d_state, d_q, d_k, d_v, d_beta, d_decay_final
+
+
 def _gdr_bwd_grad_kernel(
     state_pre_ref,
     q_ref,
@@ -268,6 +412,79 @@ def _gdr_bwd_grad_kernel(
     d_state_ref[0, 0] = d_state_next.astype(d_state_ref.dtype)
 
 
+def _gdr_bwd_grad_segmented_kernel(
+    state_pre_ref,
+    state_seg_pre_ref,
+    q_ref,
+    k_ref,
+    v_ref,
+    beta_ref,
+    decay_ref,
+    g_cumsum_ref,
+    d_out_ref,
+    seg_ref,
+    has_valid_ref,
+    seg_last_ref,
+    g_end_ref,
+    d_state_next_ref,
+    d_state_ref,
+    d_q_ref,
+    d_k_ref,
+    d_v_ref,
+    d_beta_ref,
+    d_decay_ref,
+):
+    """Pallas backward kernel for packed chunks with segment-aware state flow."""
+    num_fused = q_ref.shape[2]
+    C = q_ref.shape[3]
+
+    d_state_next = d_state_next_ref[0, 0].astype(jnp.float32)
+    d_state_next = jnp.nan_to_num(d_state_next, nan=0.0, posinf=0.0, neginf=0.0)
+    state_pre = state_pre_ref[0, 0].astype(jnp.float32)
+    state_pre = jnp.nan_to_num(state_pre, nan=0.0, posinf=0.0, neginf=0.0)
+    state_seg = state_seg_pre_ref[0, 0, 0, 0]
+
+    for i in range(num_fused - 1, -1, -1):
+        q = q_ref[0, 0, i].astype(jnp.float32)
+        k = k_ref[0, 0, i].astype(jnp.float32)
+        v = v_ref[0, 0, i].astype(jnp.float32)
+        beta = beta_ref[0, 0, 0, i]
+        decay = decay_ref[0, 0, 0, i]
+        g_cumsum = g_cumsum_ref[0, 0, i].astype(jnp.float32)
+        d_out = d_out_ref[0, 0, i].astype(jnp.float32)
+        seg = seg_ref[0, 0, i]
+        has_valid = has_valid_ref[0, 0, i, 0].astype(jnp.float32)
+        seg_last = seg_last_ref[0, 0, i, 0]
+        g_end_value = g_end_ref[0, 0, i, 0].astype(jnp.float32)
+
+        d_st, d_q_c, d_k_c, d_v_c, d_beta_c, d_decay_c = _bwd_one_chunk_segmented(
+            q,
+            k,
+            v,
+            beta,
+            decay,
+            g_cumsum,
+            d_out,
+            state_pre,
+            d_state_next,
+            seg,
+            state_seg,
+            has_valid,
+            seg_last,
+            g_end_value,
+            C,
+        )
+        d_state_next = jnp.nan_to_num(d_st, nan=0.0, posinf=0.0, neginf=0.0)
+
+        d_q_ref[0, 0, i] = jnp.nan_to_num(d_q_c, nan=0.0, posinf=0.0, neginf=0.0).astype(d_q_ref.dtype)
+        d_k_ref[0, 0, i] = jnp.nan_to_num(d_k_c, nan=0.0, posinf=0.0, neginf=0.0).astype(d_k_ref.dtype)
+        d_v_ref[0, 0, i] = jnp.nan_to_num(d_v_c, nan=0.0, posinf=0.0, neginf=0.0).astype(d_v_ref.dtype)
+        d_beta_ref[0, 0, i, :, :] = jnp.nan_to_num(d_beta_c, nan=0.0, posinf=0.0, neginf=0.0).astype(d_beta_ref.dtype)
+        d_decay_ref[0, 0, i, :, :] = jnp.nan_to_num(d_decay_c, nan=0.0, posinf=0.0, neginf=0.0).astype(d_decay_ref.dtype)
+
+    d_state_ref[0, 0] = d_state_next.astype(d_state_ref.dtype)
+
+
 def _run_bwd_grad_step(
     state_pre,
     q_i,
@@ -277,6 +494,8 @@ def _run_bwd_grad_step(
     decay_i,
     d_out_i,
     d_state_next,
+    *,
+    grad_dtype=jnp.float32,
 ):
     """Launch the backward gradient Pallas kernel for one fused chunk group.
 
@@ -331,11 +550,11 @@ def _run_bwd_grad_step(
         ),
         out_shape=[
             jax.ShapeDtypeStruct((bsz, num_heads, qk_dim, v_dim), jnp.float32),
-            jax.ShapeDtypeStruct((bsz, num_heads, num_fused, chunk_size, qk_dim), jnp.float32),
-            jax.ShapeDtypeStruct((bsz, num_heads, num_fused, chunk_size, qk_dim), jnp.float32),
-            jax.ShapeDtypeStruct((bsz, num_heads, num_fused, chunk_size, v_dim), jnp.float32),
-            jax.ShapeDtypeStruct((bsz, num_heads, num_fused, chunk_size, 1), jnp.float32),
-            jax.ShapeDtypeStruct((bsz, num_heads, num_fused, chunk_size, 1), jnp.float32),
+            jax.ShapeDtypeStruct((bsz, num_heads, num_fused, chunk_size, qk_dim), grad_dtype),
+            jax.ShapeDtypeStruct((bsz, num_heads, num_fused, chunk_size, qk_dim), grad_dtype),
+            jax.ShapeDtypeStruct((bsz, num_heads, num_fused, chunk_size, v_dim), grad_dtype),
+            jax.ShapeDtypeStruct((bsz, num_heads, num_fused, chunk_size, 1), grad_dtype),
+            jax.ShapeDtypeStruct((bsz, num_heads, num_fused, chunk_size, 1), grad_dtype),
         ],
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel")),
     )
@@ -347,6 +566,90 @@ def _run_bwd_grad_step(
         beta_i,
         decay_i,
         d_out_i,
+        d_state_next,
+    )
+
+
+def _run_bwd_grad_step_segmented(
+    state_pre,
+    state_seg_pre,
+    q_i,
+    k_i,
+    v_i,
+    beta_i,
+    decay_i,
+    g_cumsum_i,
+    d_out_i,
+    seg_i,
+    has_valid_i,
+    seg_last_i,
+    g_end_i,
+    d_state_next,
+    *,
+    grad_dtype=jnp.float32,
+):
+    """Launch one packed, segment-aware backward gradient Pallas step."""
+    bsz, num_heads, num_fused, chunk_size, qk_dim = q_i.shape
+    v_dim = v_i.shape[-1]
+    state_seg_pre_ref = state_seg_pre[:, :, None, None]
+    has_valid_ref = has_valid_i.astype(jnp.float32)[..., None]
+    seg_last_ref = seg_last_i[..., None]
+    g_end_ref = g_end_i.astype(jnp.float32)[..., None]
+
+    call = pl.pallas_call(
+        _gdr_bwd_grad_segmented_kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=0,
+            in_specs=[
+                _chunk_blockspec((1, 1, qk_dim, v_dim)),
+                _chunk_blockspec((1, 1, 1, 1)),
+                _chunk_blockspec((1, 1, num_fused, chunk_size, qk_dim)),
+                _chunk_blockspec((1, 1, num_fused, chunk_size, qk_dim)),
+                _chunk_blockspec((1, 1, num_fused, chunk_size, v_dim)),
+                _chunk_blockspec((1, 1, 1, num_fused, chunk_size)),
+                _chunk_blockspec((1, 1, 1, num_fused, chunk_size)),
+                _chunk_blockspec((1, 1, num_fused, chunk_size)),
+                _chunk_blockspec((1, 1, num_fused, chunk_size, v_dim)),
+                _chunk_blockspec((1, 1, num_fused, chunk_size)),
+                _chunk_blockspec((1, 1, num_fused, 1)),
+                _chunk_blockspec((1, 1, num_fused, 1)),
+                _chunk_blockspec((1, 1, num_fused, 1)),
+                _chunk_blockspec((1, 1, qk_dim, v_dim)),
+            ],
+            out_specs=[
+                _chunk_blockspec((1, 1, qk_dim, v_dim)),
+                _chunk_blockspec((1, 1, num_fused, chunk_size, qk_dim)),
+                _chunk_blockspec((1, 1, num_fused, chunk_size, qk_dim)),
+                _chunk_blockspec((1, 1, num_fused, chunk_size, v_dim)),
+                _chunk_blockspec((1, 1, num_fused, chunk_size, 1)),
+                _chunk_blockspec((1, 1, num_fused, chunk_size, 1)),
+            ],
+            grid=(bsz, num_heads),
+        ),
+        out_shape=[
+            jax.ShapeDtypeStruct((bsz, num_heads, qk_dim, v_dim), jnp.float32),
+            jax.ShapeDtypeStruct((bsz, num_heads, num_fused, chunk_size, qk_dim), grad_dtype),
+            jax.ShapeDtypeStruct((bsz, num_heads, num_fused, chunk_size, qk_dim), grad_dtype),
+            jax.ShapeDtypeStruct((bsz, num_heads, num_fused, chunk_size, v_dim), grad_dtype),
+            jax.ShapeDtypeStruct((bsz, num_heads, num_fused, chunk_size, 1), grad_dtype),
+            jax.ShapeDtypeStruct((bsz, num_heads, num_fused, chunk_size, 1), grad_dtype),
+        ],
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel")),
+    )
+    return call(
+        state_pre,
+        state_seg_pre_ref,
+        q_i,
+        k_i,
+        v_i,
+        beta_i,
+        decay_i,
+        g_cumsum_i,
+        d_out_i,
+        seg_i,
+        has_valid_ref,
+        seg_last_ref,
+        g_end_ref,
         d_state_next,
     )
 
@@ -399,22 +702,48 @@ def _chunk_gdr_bwd(
         ``None`` in the forward call; ``d_initial_state`` is ``None`` if no
         initial state was provided.
     """
-    (
-        query,
-        key,
-        value,
-        beta,
-        decay,
-        state_pre_all,
-        _initial_state,
-        q_inv_norm,
-        k_inv_norm,
-        seq_len,
-        pad_size,
-        decay_was_none,
-        initial_state_was_none,
-        effective_chunk_size,
-    ) = res
+    if len(res) == 19:
+        (
+            query,
+            key,
+            value,
+            beta,
+            decay,
+            state_pre_all,
+            _initial_state,
+            q_inv_norm,
+            k_inv_norm,
+            seq_len,
+            pad_size,
+            decay_was_none,
+            initial_state_was_none,
+            effective_chunk_size,
+            seg_c,
+            valid_c,
+            chunk_has_valid,
+            seg_last,
+            state_seg_pre_all,
+        ) = res
+    elif len(res) == 14:
+        (
+            query,
+            key,
+            value,
+            beta,
+            decay,
+            state_pre_all,
+            _initial_state,
+            q_inv_norm,
+            k_inv_norm,
+            seq_len,
+            pad_size,
+            decay_was_none,
+            initial_state_was_none,
+            effective_chunk_size,
+        ) = res
+        seg_c = valid_c = chunk_has_valid = seg_last = state_seg_pre_all = None
+    else:
+        raise ValueError(f"Unexpected GDR backward residual length: {len(res)}")
     chunk_size = effective_chunk_size
     d_out, d_final_state = g
     input_dtype = query.dtype
@@ -426,6 +755,7 @@ def _chunk_gdr_bwd(
         d_out = jnp.pad(d_out, ((0, 0), (0, 0), (0, pad_size), (0, 0)))
     d_out = d_out.reshape(B, H, num_chunks, chunk_size, V_dim)
 
+    segmented = seg_c is not None
     group_size = _N_FUSE if _N_FUSE > 1 and num_chunks % _N_FUSE == 0 else 1
     num_groups = num_chunks // group_size
 
@@ -434,8 +764,36 @@ def _chunk_gdr_bwd(
     v_tm = value.reshape(B, H, num_groups, group_size, chunk_size, V_dim).transpose(2, 0, 1, 3, 4, 5)
     beta_tm = beta.reshape(B, H, num_groups, group_size, chunk_size)[:, :, :, None, :, :].transpose(2, 0, 1, 3, 4, 5)
     decay_tm = decay.reshape(B, H, num_groups, group_size, chunk_size)[:, :, :, None, :, :].transpose(2, 0, 1, 3, 4, 5)
-    state_pre_tm = state_pre_all[:, :, ::group_size].transpose(2, 0, 1, 3, 4)
+    if int(state_pre_all.shape[2]) == num_groups:
+        state_pre_tm = state_pre_all.transpose(2, 0, 1, 3, 4)
+    elif int(state_pre_all.shape[2]) == num_chunks:
+        state_pre_tm = state_pre_all[:, :, ::group_size].transpose(2, 0, 1, 3, 4)
+    else:
+        raise ValueError(
+            f"Unexpected GDR state residual chunks: got {state_pre_all.shape[2]}, "
+            f"expected {num_groups} grouped or {num_chunks} per-chunk states."
+        )
     d_out_tm = d_out.reshape(B, H, num_groups, group_size, chunk_size, V_dim).transpose(2, 0, 1, 3, 4, 5)
+    if segmented:
+        g_cumsum_c = _segmented_chunk_cumsum(decay[:, :, :, None, :], seg_c, valid_c)
+        positions = jnp.arange(chunk_size, dtype=jnp.int32)
+        last_valid_idx = jnp.max(jnp.where(valid_c, positions[None, None, None, :], 0), axis=-1)
+        g_end_c = jnp.take_along_axis(g_cumsum_c, last_valid_idx[..., None], axis=-1)[..., 0]
+        g_end_c = g_end_c * chunk_has_valid.astype(jnp.float32)
+        g_cumsum_tm = g_cumsum_c.reshape(B, H, num_groups, group_size, chunk_size).transpose(2, 0, 1, 3, 4)
+        seg_tm = seg_c.reshape(B, H, num_groups, group_size, chunk_size).transpose(2, 0, 1, 3, 4)
+        chunk_has_valid_tm = chunk_has_valid.reshape(B, H, num_groups, group_size).transpose(2, 0, 1, 3)
+        seg_last_tm = seg_last.reshape(B, H, num_groups, group_size).transpose(2, 0, 1, 3)
+        g_end_tm = g_end_c.reshape(B, H, num_groups, group_size).transpose(2, 0, 1, 3)
+        if int(state_seg_pre_all.shape[2]) == num_groups:
+            state_seg_pre_tm = state_seg_pre_all.transpose(2, 0, 1)
+        elif int(state_seg_pre_all.shape[2]) == num_chunks:
+            state_seg_pre_tm = state_seg_pre_all[:, :, ::group_size].transpose(2, 0, 1)
+        else:
+            raise ValueError(
+                f"Unexpected GDR segment-state residual chunks: got {state_seg_pre_all.shape[2]}, "
+                f"expected {num_groups} grouped or {num_chunks} per-chunk states."
+            )
 
     d_final_state = d_final_state.astype(jnp.float32)
 
@@ -454,23 +812,62 @@ def _chunk_gdr_bwd(
             Two-tuple ``(d_state_prev, per_group_grads)`` where ``d_state_prev`` is the carry passed to the
             previous group and ``per_group_grads`` is ``(d_q, d_k, d_v, d_beta, d_decay)`` stacked by the scan.
         """
-        sp_i, q_i, k_i, v_i, b_i, dc_i, do_i = inputs
-        d_state_i, d_q_i, d_k_i, d_v_i, d_beta_i, d_decay_i = _run_bwd_grad_step(
-            sp_i,
-            q_i,
-            k_i,
-            v_i,
-            b_i,
-            dc_i,
-            do_i,
-            d_state_next,
-        )
+        if segmented:
+            sp_i, ss_i, q_i, k_i, v_i, b_i, dc_i, gc_i, do_i, seg_i, has_i, last_i, ge_i = inputs
+            d_state_i, d_q_i, d_k_i, d_v_i, d_beta_i, d_decay_i = _run_bwd_grad_step_segmented(
+                sp_i,
+                ss_i,
+                q_i,
+                k_i,
+                v_i,
+                b_i,
+                dc_i,
+                gc_i,
+                do_i,
+                seg_i,
+                has_i,
+                last_i,
+                ge_i,
+                d_state_next,
+                grad_dtype=input_dtype,
+            )
+        else:
+            sp_i, q_i, k_i, v_i, b_i, dc_i, do_i = inputs
+            d_state_i, d_q_i, d_k_i, d_v_i, d_beta_i, d_decay_i = _run_bwd_grad_step(
+                sp_i,
+                q_i,
+                k_i,
+                v_i,
+                b_i,
+                dc_i,
+                do_i,
+                d_state_next,
+                grad_dtype=input_dtype,
+            )
         return d_state_i, (d_q_i, d_k_i, d_v_i, d_beta_i, d_decay_i)
+
+    scan_inputs = (state_pre_tm, q_tm, k_tm, v_tm, beta_tm, decay_tm, d_out_tm)
+    if segmented:
+        scan_inputs = (
+            state_pre_tm,
+            state_seg_pre_tm,
+            q_tm,
+            k_tm,
+            v_tm,
+            beta_tm,
+            decay_tm,
+            g_cumsum_tm,
+            d_out_tm,
+            seg_tm,
+            chunk_has_valid_tm,
+            seg_last_tm,
+            g_end_tm,
+        )
 
     d_initial_state, grads_tm = lax.scan(
         grad_step,
         d_final_state,
-        (state_pre_tm, q_tm, k_tm, v_tm, beta_tm, decay_tm, d_out_tm),
+        scan_inputs,
         reverse=True,
     )
     d_q_group, d_k_group, d_v_group, d_beta_group, d_decay_group = grads_tm
@@ -512,6 +909,208 @@ def _chunk_gdr_bwd(
         Returns:
             ``None`` if ``x`` is ``None``; otherwise the sanitized, optionally clipped tensor cast to ``dtype``.
         """
+        if x is None:
+            return None
+        x = jnp.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        if dtype == jnp.bfloat16 or dtype == jnp.float16:
+            x = jnp.clip(x, -65000.0, 65000.0)
+        return x.astype(dtype) if x.dtype != dtype else x
+
+    return (
+        _safe_cast(d_query, input_dtype),
+        _safe_cast(d_key, input_dtype),
+        _safe_cast(d_value, input_dtype),
+        _safe_cast(d_beta, input_dtype),
+        _safe_cast(d_decay, input_dtype),
+        _safe_cast(d_initial_state, input_dtype),
+    )
+
+
+def _chunk_gdr_grouped_bwd(
+    chunk_size: int,
+    use_qk_l2norm: bool,
+    res: tuple,
+    g: tuple[Float[Array, "..."], Float[Array, "..."]],
+) -> tuple:
+    """Grouped-head backward without materializing repeated Q/K over the full sequence."""
+    if len(res) == 20:
+        (
+            query,
+            key,
+            value,
+            beta,
+            decay,
+            state_group_pre,
+            _initial_state,
+            q_inv_norm,
+            k_inv_norm,
+            seq_len,
+            pad_size,
+            decay_was_none,
+            initial_state_was_none,
+            effective_chunk_size,
+            group_size,
+            seg_c,
+            valid_c,
+            chunk_has_valid,
+            seg_last,
+            state_seg_group_pre,
+        ) = res
+        segmented = True
+    elif len(res) == 15:
+        (
+            query,
+            key,
+            value,
+            beta,
+            decay,
+            state_group_pre,
+            _initial_state,
+            q_inv_norm,
+            k_inv_norm,
+            seq_len,
+            pad_size,
+            decay_was_none,
+            initial_state_was_none,
+            effective_chunk_size,
+            group_size,
+        ) = res
+        seg_c = valid_c = chunk_has_valid = seg_last = state_seg_group_pre = None
+        segmented = False
+    else:
+        raise ValueError(f"Unexpected grouped GDR backward residual length: {len(res)}")
+    chunk_size = effective_chunk_size
+    d_out, d_final_state = g
+    input_dtype = query.dtype
+    B, Hq, num_chunks, _C, K_dim = query.shape
+    Hv = value.shape[1]
+    V_dim = value.shape[-1]
+    if Hv % Hq != 0:
+        raise ValueError(f"grouped GDR requires value heads ({Hv}) to be a multiple of query heads ({Hq})")
+    expand_ratio = Hv // Hq
+    group_size = int(group_size)
+    num_groups = num_chunks // group_size
+    scale = 1.0 / math.sqrt(K_dim)
+
+    if pad_size > 0:
+        d_out = jnp.pad(d_out, ((0, 0), (0, 0), (0, pad_size), (0, 0)))
+    d_out = d_out.reshape(B, Hv, num_groups, group_size, chunk_size, V_dim)
+
+    q_tm = query.reshape(B, Hq, num_groups, group_size, chunk_size, K_dim).transpose(2, 0, 1, 3, 4, 5)
+    k_tm = key.reshape(B, Hq, num_groups, group_size, chunk_size, K_dim).transpose(2, 0, 1, 3, 4, 5)
+    v_tm = value.reshape(B, Hv, num_groups, group_size, chunk_size, V_dim).transpose(2, 0, 1, 3, 4, 5)
+    beta_tm = beta.reshape(B, Hv, num_groups, group_size, chunk_size)[:, :, :, None, :, :].transpose(
+        2, 0, 1, 3, 4, 5
+    )
+    decay_tm = decay.reshape(B, Hv, num_groups, group_size, chunk_size)[:, :, :, None, :, :].transpose(
+        2, 0, 1, 3, 4, 5
+    )
+    state_pre_tm = state_group_pre.transpose(2, 0, 1, 3, 4)
+    d_out_tm = d_out.transpose(2, 0, 1, 3, 4, 5)
+    if segmented:
+        g_cumsum_c = _segmented_chunk_cumsum(decay[:, :, :, None, :], seg_c, valid_c)
+        positions = jnp.arange(chunk_size, dtype=jnp.int32)
+        last_valid_idx = jnp.max(jnp.where(valid_c, positions[None, None, None, :], 0), axis=-1)
+        g_end_c = jnp.take_along_axis(g_cumsum_c, last_valid_idx[..., None], axis=-1)[..., 0]
+        g_end_c = g_end_c * chunk_has_valid.astype(jnp.float32)
+        g_cumsum_tm = g_cumsum_c.reshape(B, Hv, num_groups, group_size, chunk_size).transpose(2, 0, 1, 3, 4)
+        seg_tm = seg_c.reshape(B, Hv, num_groups, group_size, chunk_size).transpose(2, 0, 1, 3, 4)
+        chunk_has_valid_tm = chunk_has_valid.reshape(B, Hv, num_groups, group_size).transpose(2, 0, 1, 3)
+        seg_last_tm = seg_last.reshape(B, Hv, num_groups, group_size).transpose(2, 0, 1, 3)
+        g_end_tm = g_end_c.reshape(B, Hv, num_groups, group_size).transpose(2, 0, 1, 3)
+        state_seg_pre_tm = state_seg_group_pre.transpose(2, 0, 1)
+    d_final_state = d_final_state.astype(jnp.float32)
+
+    def _sum_value_head_grads(x):
+        return x.reshape(x.shape[0], Hq, expand_ratio, *x.shape[2:]).sum(axis=2)
+
+    def grad_step(d_state_next, inputs):
+        if segmented:
+            sp_i, ss_i, q_i, k_i, v_i, b_i, dc_i, gc_i, do_i, seg_i, has_i, last_i, ge_i = inputs
+        else:
+            sp_i, q_i, k_i, v_i, b_i, dc_i, do_i = inputs
+        q_rep_i = jnp.repeat(q_i, expand_ratio, axis=1)
+        k_rep_i = jnp.repeat(k_i, expand_ratio, axis=1)
+        if segmented:
+            d_state_i, d_q_rep_i, d_k_rep_i, d_v_i, d_beta_i, d_decay_i = _run_bwd_grad_step_segmented(
+                sp_i,
+                ss_i,
+                q_rep_i,
+                k_rep_i,
+                v_i,
+                b_i,
+                dc_i,
+                gc_i,
+                do_i,
+                seg_i,
+                has_i,
+                last_i,
+                ge_i,
+                d_state_next,
+                grad_dtype=input_dtype,
+            )
+        else:
+            d_state_i, d_q_rep_i, d_k_rep_i, d_v_i, d_beta_i, d_decay_i = _run_bwd_grad_step(
+                sp_i,
+                q_rep_i,
+                k_rep_i,
+                v_i,
+                b_i,
+                dc_i,
+                do_i,
+                d_state_next,
+                grad_dtype=input_dtype,
+            )
+        d_q_i = _sum_value_head_grads(d_q_rep_i)
+        d_k_i = _sum_value_head_grads(d_k_rep_i)
+        return d_state_i, (d_q_i, d_k_i, d_v_i, d_beta_i, d_decay_i)
+
+    scan_inputs = (state_pre_tm, q_tm, k_tm, v_tm, beta_tm, decay_tm, d_out_tm)
+    if segmented:
+        scan_inputs = (
+            state_pre_tm,
+            state_seg_pre_tm,
+            q_tm,
+            k_tm,
+            v_tm,
+            beta_tm,
+            decay_tm,
+            g_cumsum_tm,
+            d_out_tm,
+            seg_tm,
+            chunk_has_valid_tm,
+            seg_last_tm,
+            g_end_tm,
+        )
+
+    d_initial_state, grads_tm = lax.scan(
+        grad_step,
+        d_final_state,
+        scan_inputs,
+        reverse=True,
+    )
+    d_q_group, d_k_group, d_v_group, d_beta_group, d_decay_group = grads_tm
+
+    total_len = seq_len + pad_size
+    d_query = d_q_group.transpose(1, 2, 0, 3, 4, 5).reshape(B, Hq, total_len, K_dim)[:, :, :seq_len, :]
+    d_key = d_k_group.transpose(1, 2, 0, 3, 4, 5).reshape(B, Hq, total_len, K_dim)[:, :, :seq_len, :]
+    d_value = d_v_group.transpose(1, 2, 0, 3, 4, 5).reshape(B, Hv, total_len, V_dim)[:, :, :seq_len, :]
+    d_beta = d_beta_group.transpose(1, 2, 0, 3, 4, 5).squeeze(-1).reshape(B, Hv, total_len)[:, :, :seq_len]
+    d_decay = d_decay_group.transpose(1, 2, 0, 3, 4, 5).squeeze(-1).reshape(B, Hv, total_len)[:, :, :seq_len]
+
+    d_query = d_query * scale
+    if use_qk_l2norm:
+        q_norm = query.reshape(B, Hq, total_len, K_dim)[:, :, :seq_len, :] / scale
+        k_norm = key.reshape(B, Hq, total_len, K_dim)[:, :, :seq_len, :]
+        d_query = _l2norm_bwd(d_query, q_norm, q_inv_norm.astype(jnp.float32))
+        d_key = _l2norm_bwd(d_key, k_norm, k_inv_norm.astype(jnp.float32))
+
+    if decay_was_none:
+        d_decay = None
+    if initial_state_was_none:
+        d_initial_state = None
+
+    def _safe_cast(x, dtype):
         if x is None:
             return None
         x = jnp.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)

@@ -16,6 +16,9 @@ import jax
 import numpy as np
 import pytest
 import torch
+from jax import numpy as jnp
+from transformers import TopPLogitsWarper
+
 from easydel.inference.esurge.core.binary_search import apply_topp_mask
 from easydel.inference.esurge.core.sampler import (
     apply_history_penalties,
@@ -30,8 +33,6 @@ from easydel.inference.esurge.runners.execution_types import BatchMetadata
 from easydel.inference.oai_proxies import InferenceApiRouter
 from easydel.inference.openai_api_modules import ChatCompletionRequest, CompletionRequest
 from easydel.inference.sampling_params import SamplingParams
-from jax import numpy as jnp
-from transformers import TopPLogitsWarper
 
 
 def test_apply_history_penalties_supports_presence_and_repetition():

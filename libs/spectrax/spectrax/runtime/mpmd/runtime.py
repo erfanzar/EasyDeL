@@ -3559,7 +3559,7 @@ def _build_schedule_plan(
     terminal_backward_mode = str(getattr(schedule, "terminal_backward_mode", "eager"))
     if terminal_backward_mode not in ("eager", "scheduled"):
         raise ValueError(
-            "Schedule.terminal_backward_mode must be 'eager' or 'scheduled', " f"got {terminal_backward_mode!r}."
+            f"Schedule.terminal_backward_mode must be 'eager' or 'scheduled', got {terminal_backward_mode!r}."
         )
     terminal_split_phases: set[str] = set()
     for row in grid:
@@ -3582,8 +3582,7 @@ def _build_schedule_plan(
     schedule_dispatcher = str(getattr(schedule, "schedule_dispatcher", "auto"))
     if schedule_dispatcher not in ("auto", "deterministic_nonblocking"):
         raise ValueError(
-            "Schedule.schedule_dispatcher must be 'auto' or "
-            f"'deterministic_nonblocking', got {schedule_dispatcher!r}."
+            f"Schedule.schedule_dispatcher must be 'auto' or 'deterministic_nonblocking', got {schedule_dispatcher!r}."
         )
 
     return {
@@ -4955,8 +4954,7 @@ def _dispatch_schedule_fused_async(
     schedule_dispatcher = str(plan.get("schedule_dispatcher", "auto"))
     if schedule_dispatcher not in ("auto", "deterministic_nonblocking"):
         raise ValueError(
-            "Schedule.schedule_dispatcher must be 'auto' or "
-            f"'deterministic_nonblocking', got {schedule_dispatcher!r}."
+            f"Schedule.schedule_dispatcher must be 'auto' or 'deterministic_nonblocking', got {schedule_dispatcher!r}."
         )
     serial_region_plan = bool(plan.get("serial_region_plan", False))
 

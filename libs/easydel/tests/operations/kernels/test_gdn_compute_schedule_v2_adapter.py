@@ -20,12 +20,6 @@ import inspect
 from pathlib import Path
 
 import jax.numpy as jnp
-from easydel.inference.esurge import config as esurge_config
-from easydel.operations._operation_impl import OperationImpl
-from easydel.operations.kernels import gated_delta_rule as easydel_gdr
-from easydel.operations.kernels import gdn_compute_schedule_v2 as easydel_schedule
-from easydel.operations.kernels import inference_gdn as easydel_gdn
-from easydel.operations.kernels.gated_delta_rule import GatedDeltaRuleOp
 from ejkernel.modules.operations import (
     KERNEL_TILE_POLICIES,
     GDNComputeScheduleV2,
@@ -33,6 +27,13 @@ from ejkernel.modules.operations import (
     compute_schedule_table_v2,
     normalize_kernel_tile_policy,
 )
+
+from easydel.inference.esurge import config as esurge_config
+from easydel.operations._operation_impl import OperationImpl
+from easydel.operations.kernels import gated_delta_rule as easydel_gdr
+from easydel.operations.kernels import gdn_compute_schedule_v2 as easydel_schedule
+from easydel.operations.kernels import inference_gdn as easydel_gdn
+from easydel.operations.kernels.gated_delta_rule import GatedDeltaRuleOp
 
 
 def test_gdn_schedule_adapter_delegates_to_ejkernel_operation():

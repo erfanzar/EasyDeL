@@ -650,7 +650,7 @@ def build_report(
   </section>
   <section class="section">
     <h2>Timelines</h2>
-    {''.join(detail_sections)}
+    {"".join(detail_sections)}
   </section>
 </main>
 </body>

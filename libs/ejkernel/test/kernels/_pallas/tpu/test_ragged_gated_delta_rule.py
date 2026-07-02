@@ -9,11 +9,12 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import pytest
+from jax.sharding import Mesh
+from jax.sharding import PartitionSpec as P
+
 from ejkernel.kernels._pallas.tpu.ragged_gated_delta_rule import ragged_gated_delta_rule as ragged_gdr_pallas
 from ejkernel.kernels._xla.ragged_gated_delta_rule import ragged_gated_delta_rule as ragged_gdr_xla
 from ejkernel.modules import ragged_gated_delta_rule as ragged_gdr_module
-from jax.sharding import Mesh
-from jax.sharding import PartitionSpec as P
 
 
 def _has_tpu() -> bool:

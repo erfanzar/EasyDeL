@@ -23,6 +23,7 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import pytest
+
 from ejkernel.kernels._pallas.tpu.gated_delta_rule import gated_delta_rule as gdr_pallas
 from ejkernel.kernels._xla.gated_delta_rule import gated_delta_rule as gdr_xla
 
@@ -268,9 +269,9 @@ class TestPrefillThenDecode:
 
         decode_cat = jnp.concatenate(decode_outs, axis=1)
         expected = out_full[:, prefill_len:]
-        assert jnp.allclose(
-            decode_cat, expected, atol=5e-2, rtol=0
-        ), f"Prefill+decode vs full recurrent max diff: {jnp.max(jnp.abs(decode_cat - expected))}"
+        assert jnp.allclose(decode_cat, expected, atol=5e-2, rtol=0), (
+            f"Prefill+decode vs full recurrent max diff: {jnp.max(jnp.abs(decode_cat - expected))}"
+        )
 
 
 class TestRecurrentFallback:

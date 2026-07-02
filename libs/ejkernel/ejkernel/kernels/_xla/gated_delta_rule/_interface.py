@@ -59,8 +59,8 @@ def gated_delta_rule(
     initial_state: Float[Array, "batch num_value_heads qk_head_dim v_head_dim"] | None = None,
     use_qk_l2norm: bool = True,
     use_chunked: bool = True,
-    use_input_dtype_phase1_outputs: bool = False,
-    use_input_dtype_state: bool = False,
+    use_input_dtype_phase1_outputs: bool = True,
+    use_input_dtype_state: bool = True,
     seg_ids: Int[Array, "batch seq_len"] | None = None,
 ) -> tuple[
     Float[Array, "batch seq_len num_value_heads v_head_dim"],
@@ -110,9 +110,10 @@ def gated_delta_rule(
         use_input_dtype_phase1_outputs: Accepted for config parity with the
             TPU/Pallas implementation. XLA does not have a separate phase-1
             handoff buffer and ignores this value.
-        use_input_dtype_state: Accepted for config parity with the TPU/Pallas
-            implementation. XLA keeps its existing state dtype behavior and
-            ignores this value.
+        use_input_dtype_state: If True, cast the returned recurrent state to
+            the input dtype. If False, keep the recurrent state in fp32. XLA
+            always carries the internal scan state in fp32; this only controls
+            the public return dtype.
 
     Returns:
         Tuple of:
@@ -176,6 +177,7 @@ def gated_delta_rule(
             initial_state=initial_state,
             use_qk_l2norm=use_qk_l2norm,
             seg_ids=seg_ids,
+            use_input_dtype_state=use_input_dtype_state,
         )
     else:
         out, final_state = _recurrent_gdr_fwd(
@@ -187,6 +189,7 @@ def gated_delta_rule(
             seg_ids=seg_ids,
             initial_state=initial_state,
             use_qk_l2norm=use_qk_l2norm,
+            use_input_dtype_state=use_input_dtype_state,
         )
 
     out = out.transpose(0, 2, 1, 3)
