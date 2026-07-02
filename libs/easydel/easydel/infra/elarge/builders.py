@@ -938,6 +938,8 @@ def to_data_mixture_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[str,
         kwargs["pack_shuffle"] = mixture_cfg["pack_shuffle"]
     if "pack_shuffle_buffer_factor" in mixture_cfg:
         kwargs["pack_shuffle_buffer_factor"] = mixture_cfg["pack_shuffle_buffer_factor"]
+    if "pack_tokenize_batch_size" in mixture_cfg:
+        kwargs["pack_tokenize_batch_size"] = mixture_cfg["pack_tokenize_batch_size"]
     if "dask_storage_options" in mixture_cfg:
         kwargs["dask_storage_options"] = mixture_cfg["dask_storage_options"]
 

@@ -1334,6 +1334,7 @@ def pack_constant_length(
     batch_size: int,
     shuffle: bool,
     buffer_factor: int,
+    tokenize_batch_size: int | None = None,
 ):
     """Pack sequences with on-the-fly tokenization into constant-length chunks.
 
@@ -1344,11 +1345,20 @@ def pack_constant_length(
     Args:
         stream: Iterator of raw examples to tokenize.
         tokenize_fn: Function that takes an example and returns token IDs.
+            When ``tokenize_batch_size`` is set, it instead receives a LIST of
+            examples and must return a list of token-id sequences (one per
+            example, same order) — this is what lets HF fast tokenizers use
+            their internal (rayon) parallelism, which only engages on batch
+            encodes; per-string calls stay single-threaded regardless of
+            ``TOKENIZERS_PARALLELISM``.
         seq_length: Target length for packed sequences.
         eos_token_id: Token ID to use for padding/separation.
         batch_size: Batch size (used for shuffle buffer calculation).
         shuffle: Whether to shuffle the packed sequences.
         buffer_factor: Multiplier for shuffle buffer size (batch_size * buffer_factor).
+        tokenize_batch_size: When set (> 1), buffer this many raw examples and
+            call ``tokenize_fn`` once per buffer with the list. ``None`` keeps
+            the per-example calling convention.
 
     Returns:
         Generator yielding dictionaries with 'input_ids' as JAX arrays.
@@ -1357,17 +1367,28 @@ def pack_constant_length(
     def token_iter():
         """Inline closure: lazily tokenise the upstream stream into a ``tokens`` shape.
 
-        Captures ``stream`` and ``tokenize_fn`` from
-        :func:`pack_constant_length`. Each upstream example is
-        passed through ``tokenize_fn`` and re-emitted as
-        ``{"tokens": <ids>}`` so :func:`pack_pre_tokenized` can
-        consume it.
+        Captures ``stream``, ``tokenize_fn`` and ``tokenize_batch_size`` from
+        :func:`pack_constant_length`. Examples pass through ``tokenize_fn``
+        one-by-one (default) or in lists of ``tokenize_batch_size`` and are
+        re-emitted as ``{"tokens": <ids>}`` so :func:`pack_pre_tokenized`
+        can consume them.
 
         Yields:
             dict: One ``{"tokens": list[int]}`` per upstream example.
         """
-        for ex in stream:
-            toks = tokenize_fn(ex)
-            yield {"tokens": toks}
+        if tokenize_batch_size and tokenize_batch_size > 1:
+            buf = []
+            for ex in stream:
+                buf.append(ex)
+                if len(buf) >= tokenize_batch_size:
+                    for toks in tokenize_fn(buf):
+                        yield {"tokens": toks}
+                    buf = []
+            if buf:
+                for toks in tokenize_fn(buf):
+                    yield {"tokens": toks}
+        else:
+            for ex in stream:
+                yield {"tokens": tokenize_fn(ex)}
 
     return pack_pre_tokenized(token_iter(), seq_length, eos_token_id, batch_size, shuffle, buffer_factor)

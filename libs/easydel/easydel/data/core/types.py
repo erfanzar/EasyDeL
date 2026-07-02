@@ -416,6 +416,7 @@ class DatasetMixture:
     pack_eos_token_id: int = 0
     pack_shuffle: bool = True
     pack_shuffle_buffer_factor: int = 16
+    pack_tokenize_batch_size: int | None = None
     dask_storage_options: dict[str, tp.Any] | None = None
 
     pack_on_the_fly: bool = False

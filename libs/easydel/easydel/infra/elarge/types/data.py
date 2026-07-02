@@ -234,6 +234,7 @@ class DatasetMixtureCfg(TypedDict, total=False):
     pack_eos_token_id: NotRequired[int]
     pack_shuffle: NotRequired[bool]
     pack_shuffle_buffer_factor: NotRequired[int]
+    pack_tokenize_batch_size: NotRequired[int | None]
     dask_storage_options: NotRequired[dict[str, Any] | None]
 
     # On-the-fly tokenization and packing
