@@ -21,7 +21,9 @@ Modes:
   interp   CPU-only numerical check (Pallas interpret mode) against the XLA
            recurrent fallback. Safe to run on a busy TPU host.
   tiny     Level-1 TPU probe: B=8 L=1024 Hq=4 Hv=12 K=V=128 chunk=128,
-           fwd + value_and_grad, plus on-device check vs recurrent fallback.
+           fwd + value_and_grad, plus on-device check vs the fp32 recurrent
+           ground truth (the bf16 recurrent reference is noisier than the
+           chunked kernel and would fail on its own drift).
   compile  Level-2 TPU probe: per-TP-shard head shapes (dp2/fsdp64/tp4 shard
            of Qwen3.5: Hq=16/4=4, Hv=48/4=12), fwd or grad, reports compile
            time, step time, and HBM.
@@ -224,10 +226,15 @@ def main(argv=None):
         print(f"[{args.mode}] grad step {min(times) * 1e3:.1f}ms (best of {args.iters})")
 
     if args.mode == "tiny":
-        out_r, st_r = jax.jit(fwd_recurrent)(*ops)
+        # Ground truth is the fp32 recurrent path. A same-dtype bf16 comparison
+        # fails on reference noise, not kernel error: the bf16 recurrent carry
+        # rounds once per token (~1e-1 drift over 1024 tokens) while the chunked
+        # path carries fp32 state and rounds once (measured ~6e-3 vs fp32 truth).
+        ops_ref = tuple(x.astype(jnp.float32) for x in ops[:5]) + ops[5:]
+        out_r, st_r = jax.jit(fwd_recurrent)(*ops_ref)
         d_out, d_st = maxdiff(out, out_r), maxdiff(st, st_r)
-        tol = 1e-2 if dtype == jnp.float32 else 6e-2
-        print(f"[tiny] vs recurrent: max|out-ref|={d_out:.3e} max|state-ref|={d_st:.3e} tol={tol:.0e}")
+        tol = 1e-2 if dtype == jnp.float32 else 2.5e-2
+        print(f"[tiny] vs fp32 recurrent: max|out-ref|={d_out:.3e} max|state-ref|={d_st:.3e} tol={tol:.0e}")
         failed |= not (d_out < tol and d_st < tol)
 
     stats = jax.local_devices()[0].memory_stats() or {}

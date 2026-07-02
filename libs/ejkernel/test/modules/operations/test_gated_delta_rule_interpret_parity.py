@@ -12,17 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU (interpret-mode) parity lock for the packed grouped chunked GDR Pallas path.
+"""CPU (interpret-mode) parity lock for the grouped chunked GDR Pallas paths.
 
 Runs the real Pallas TPU kernels under ``force_tpu_interpret_mode`` against the
-XLA recurrent reference. The shapes are chosen to be discriminating, not small:
+XLA recurrent reference, for both the packed (``seg_ids`` set) and non-packed
+(``seg_ids=None``) paths. The shapes are chosen to be discriminating, not small:
 
 * ``num_chunks == 8`` so the fused-group scheduling (``_N_FUSE``) is active —
-  a segmented backward that consumes stale intra-group states passes at
-  ``num_chunks < _N_FUSE`` and only fails here;
+  the packed path forces ``group_size=1`` (its backward consumes per-chunk
+  pre-states) while the non-packed path keeps fused groups, so this shape
+  crosses both regimes; a segmented backward that consumes stale intra-group
+  states passes at ``num_chunks < _N_FUSE`` and only fails here;
 * grouped heads (``Hq != Hv``) so the grouped streaming path is exercised;
-* segment boundaries that do NOT align with chunk boundaries, plus a ``-1``
-  padding tail, so intra-chunk masking and tail handling are both crossed.
+* packed cases use segment boundaries that do NOT align with chunk boundaries,
+  plus a ``-1`` padding tail, so intra-chunk masking and tail handling are
+  both crossed.
 
 Forward-only checks cannot catch the stale-state class of bug (the forward is
 exact either way); the gradient comparison is the load-bearing assertion.
@@ -59,10 +63,15 @@ def _make_packed_grouped_inputs(seg_period: int, batch=2, seq_len=1024, hq=2, hv
         pytest.param(512, id="docs_span_chunks_in_group"),
         # boundaries fall mid-chunk (320 % 128 != 0): intra-chunk masking
         pytest.param(320, id="misaligned_boundaries"),
+        # seg_ids=None: the non-packed train core, which keeps fused-group
+        # scheduling (group_size == _N_FUSE at num_chunks == 8)
+        pytest.param(None, id="nonpacked_fused_groups"),
     ],
 )
-def test_packed_grouped_chunked_matches_recurrent_fwd_and_grad(seg_period):
-    q, k, v, beta, decay, seg_ids = _make_packed_grouped_inputs(seg_period)
+def test_grouped_chunked_matches_recurrent_fwd_and_grad(seg_period):
+    q, k, v, beta, decay, seg_ids = _make_packed_grouped_inputs(seg_period or 512)
+    if seg_period is None:
+        seg_ids = None
     chunk_size = 128
 
     def run(use_chunked, q, k, v, beta, decay):
