@@ -76,9 +76,14 @@ PYTHONPATH=libs/easydel:libs/ejkernel:libs/eformer:libs/spectrax:libs/eray \
     --convert-mode sequential \
     --dtype fp32 --param-dtype fp32 \
     --torch-streaming-cache temp \
-    --torch-streaming-tmp-dir <dir-with-a-few-GB-free> \
+    --torch-streaming-tmp-dir /dev/shm/hf-shards \
     --sharding-axis-dims 1,1,1,1,1
 ```
+
+Stage shards on `/dev/shm` (tmpfs) when the host has RAM to spare: shard
+downloads then survive root-disk pressure (e.g. the raylet.out log-spam
+flare-ups on pod heads, which killed a disk-staged conversion mid-`gsutil cp`
+on 2026-07-02). Only one shard lives there at a time.
 
 Rules that make this work:
 
