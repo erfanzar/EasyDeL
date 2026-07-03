@@ -25,6 +25,7 @@ from ray.remote_function import RemoteFunction
 
 from ..core.cluster import SliceInfo
 from ..core.exceptions import handle_ray_error
+from ..core.monitoring import start_raylet_log_guard
 from ..core.status import JobError, JobFailed, JobInfo, JobPreempted, JobStatus, JobSucceeded
 from ..pool.base import InsufficientSlicesError
 from ..pool.slice import SlicePoolManager
@@ -132,6 +133,10 @@ class RayExecutor:
         """
         if getattr(accelerator_config, "pod_count", 1) != 1:
             raise ValueError("Multi-slice workloads on TPUs should use 'autoscale_execute'.")
+
+        # Keep this driver's node (usually the Ray head, where a spamming
+        # raylet accumulates fastest) from filling its disk mid-job.
+        start_raylet_log_guard()
 
         def do_run(
             remote_fn,

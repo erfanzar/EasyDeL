@@ -71,6 +71,8 @@ from .core import (
     handle_ray_error,
     log_failures_to,
     print_remote_raise,
+    start_raylet_log_guard,
+    sweep_raylet_logs,
 )
 from .docker import (
     DockerConfig,
@@ -162,4 +164,6 @@ __all__ = (
     "run_docker_async",
     "run_docker_multislice",
     "run_docker_on_pod",
+    "start_raylet_log_guard",
+    "sweep_raylet_logs",
 )
