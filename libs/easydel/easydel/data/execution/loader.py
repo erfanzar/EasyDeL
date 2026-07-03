@@ -178,13 +178,30 @@ class PrefetchIterator:
         """
         try:
             for item in self._source:
-                if self._stop_event.is_set():
-                    break
-                self._buffer.put(item)
+                if not self._put_interruptible(item):
+                    return  # consumer closed us; skip the sentinel too
         except Exception as e:
-            self._buffer.put(e)
+            self._put_interruptible(e)
         finally:
-            self._buffer.put(self._sentinel)
+            self._put_interruptible(self._sentinel)
+
+    def _put_interruptible(self, item) -> bool:
+        """Blocking queue put that gives up once :meth:`close` was requested.
+
+        Returns:
+            bool: ``True`` when the item was enqueued; ``False`` when the
+            stop event fired first (the consumer is gone, nobody will drain
+            the queue, and blocking forever would leak this thread).
+        """
+        from queue import Full
+
+        while not self._stop_event.is_set():
+            try:
+                self._buffer.put(item, timeout=0.5)
+                return True
+            except Full:
+                continue
+        return False
 
     def _start(self):
         """Lazily spawn the producer thread on the first call to :meth:`__next__`.
@@ -437,6 +454,7 @@ class AsyncDataLoader(AsyncDataset[dict]):
         self._seed = seed
         self._collate_fn = collate_fn
         self._exhausted = False
+        self._epoch_counter = 0
 
     async def aget(self, _index: int) -> dict:
         """Random access is not supported by this streaming loader.
@@ -578,19 +596,24 @@ class AsyncDataLoader(AsyncDataset[dict]):
         """
         import random
 
-        if self._seed is not None:
-            random.seed(self._seed)
+        # Per-iteration RNG instance: seeding the global `random` module
+        # polluted unrelated consumers and replayed the identical shuffle
+        # order every epoch. The epoch counter keeps runs reproducible while
+        # varying the order across passes.
+        epoch = self._epoch_counter
+        self._epoch_counter += 1
+        rng = random.Random(self._seed + epoch) if self._seed is not None else random.Random()
 
         buffer = []
         for item in stream:
             if len(buffer) < buffer_size:
                 buffer.append(item)
             else:
-                idx = random.randrange(0, buffer_size)
+                idx = rng.randrange(0, buffer_size)
                 yield buffer[idx]
                 buffer[idx] = item
 
-        random.shuffle(buffer)
+        rng.shuffle(buffer)
         yield from buffer
 
     def get_output_sharding(self) -> "Mapping[str, NamedSharding] | None":
@@ -826,7 +849,6 @@ def create_data_iterator(
             args=(it, buffer, stop_event),
             daemon=True,
         )
-        worker.start()
 
         def _gen():
             """Inline generator that drains the prefetch queue and re-raises errors.
@@ -846,11 +868,16 @@ def create_data_iterator(
                 Exception: Whatever exception the source raised,
                     transparently forwarded.
             """
+            worker.start()
             try:
                 while True:
                     try:
                         item = buffer.get(timeout=60.0)
                     except Empty:
+                        if not worker.is_alive():
+                            # Producer died without leaving a sentinel:
+                            # nothing more will ever arrive.
+                            break
                         continue
 
                     if item is _SENTINEL:

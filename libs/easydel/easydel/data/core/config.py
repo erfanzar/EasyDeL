@@ -847,17 +847,23 @@ def merge_tokenizer_config(
         for the dataset, or ``None`` when no tokenizer is configured at
         any level (a legitimate state for purely text-export pipelines).
     """
-    # Check dataset-level tokenizer
+    # Check dataset-level tokenizer. A full TokenizerConfig object carries
+    # its own max_length; a bare-string tokenizer only names the model, so
+    # the stage-level max_length applies (the old code silently used the
+    # dataclass default 2048 and ignored TokenizeStageConfig.max_length —
+    # tokenize_and_save(max_length=...) was a no-op).
+    if isinstance(ds_cfg.tokenizer, str):
+        return TokenizerConfig(name_or_path=ds_cfg.tokenizer, max_length=stage_cfg.max_length)
     tok_cfg = ds_cfg.get_tokenizer_config()
     if tok_cfg is not None:
         return tok_cfg
 
     # Check stage default
     if stage_cfg.default_tokenizer:
-        return TokenizerConfig(name_or_path=stage_cfg.default_tokenizer)
+        return TokenizerConfig(name_or_path=stage_cfg.default_tokenizer, max_length=stage_cfg.max_length)
 
     # Check global default
     if global_tokenizer:
-        return TokenizerConfig(name_or_path=global_tokenizer)
+        return TokenizerConfig(name_or_path=global_tokenizer, max_length=stage_cfg.max_length)
 
     return None

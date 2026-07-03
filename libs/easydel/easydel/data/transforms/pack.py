@@ -265,12 +265,13 @@ class GreedyPacker:
                 ``tokens`` for configured extra fields.
 
         Returns:
-            PackedSequence | None: A packed window when this call
-            filled the buffer to ``seq_length``; otherwise ``None``
-            (the tokens were absorbed into the buffer for the next
-            call).
+            list[PackedSequence]: Every window this call completed —
+            an example longer than ``seq_length`` can complete several
+            in one call, and returning only the last one silently
+            dropped the others (a confirmed data-loss bug). Empty when
+            the tokens were absorbed into the buffer for a later call.
         """
-        result = None
+        results: list[PackedSequence] = []
         self._stats.total_input_tokens += len(tokens)
 
         aligned_extra_fields = self._normalize_extra_fields(tokens, extra_fields)
@@ -285,7 +286,7 @@ class GreedyPacker:
 
             # Check if we have a full sequence
             if len(self._buffer) >= self.seq_length:
-                result = self._flush()
+                results.append(self._flush())
 
         # Add EOS and update segment
         if len(self._buffer) > 0:
@@ -301,9 +302,9 @@ class GreedyPacker:
 
         # Check if we hit the target length
         if len(self._buffer) >= self.seq_length:
-            result = self._flush()
+            results.append(self._flush())
 
-        return result
+        return results
 
     def _flush(self) -> PackedSequence:
         """Emit a packed sequence and retain any leftover tokens.
@@ -499,7 +500,6 @@ class PoolPacker:
             list[PackedSequence]: Completed packed windows produced
             by this call. Empty when no packer rolled over.
         """
-        results = []
         token_len = len(tokens)
 
         # Find the packer with the best fit (least remaining space after adding)
@@ -515,11 +515,7 @@ class PoolPacker:
                 best_idx = i
 
         # Add to best packer
-        result = self._packers[best_idx].add(tokens, source_id, extra_fields)
-        if result is not None:
-            results.append(result)
-
-        return results
+        return self._packers[best_idx].add(tokens, source_id, extra_fields)
 
     def flush_all(self) -> list[PackedSequence]:
         """Drain trailing partial windows from every inner packer.
@@ -639,7 +635,14 @@ class FirstFitPacker:
             :meth:`_pack_buffer`; an empty list otherwise.
         """
         self._stats.total_input_tokens += len(tokens)
-        self._pending.append((tokens, source_id, self._normalize_extra_fields(tokens, extra_fields)))
+        aligned = self._normalize_extra_fields(tokens, extra_fields)
+        # Split oversized examples into window-sized chunks instead of
+        # truncating them: the old `tokens[:seq_length]` in _pack_buffer
+        # silently discarded every token past the first window.
+        for start in range(0, len(tokens), self.seq_length):
+            chunk = tokens[start : start + self.seq_length]
+            chunk_fields = {name: values[start : start + self.seq_length] for name, values in aligned.items()}
+            self._pending.append((chunk, source_id, chunk_fields))
 
         if len(self._pending) >= self.buffer_size:
             return self._pack_buffer()
@@ -663,8 +666,6 @@ class FirstFitPacker:
         bins: list[tuple[list[int], list[int], list[str], dict[str, list[int]]]] = []
 
         for tokens, source_id, extra_fields in sorted_pending:
-            tokens = tokens[: self.seq_length]
-            extra_fields = {field_name: values[: len(tokens)] for field_name, values in extra_fields.items()}
             append_eos = len(tokens) < self.seq_length
             token_len = len(tokens) + int(append_eos)
             placed = False
@@ -868,6 +869,7 @@ class PackedShardedSource(ShardedDataSource[dict]):
         self._warn_on_padded_input = warn_on_padded_input
         self._on_iteration_end = on_iteration_end
         self._last_packing_stats: PackingStats | None = None
+        self._epoch_counter = 0
 
     @property
     def packing_stats(self) -> PackingStats | None:
@@ -956,8 +958,14 @@ class PackedShardedSource(ShardedDataSource[dict]):
             ``"attention_mask"`` / ``"segment_ids"`` depending on
             packer state.
         """
-        if self._seed is not None:
-            random.seed(self._seed)
+        # Per-iteration RNG instance: seeding the global `random` module here
+        # polluted every other consumer of `random` in the process and made
+        # each epoch replay the identical shuffle order. Deriving the seed
+        # from an epoch counter keeps runs reproducible while giving each
+        # pass over the source a fresh order.
+        epoch = self._epoch_counter
+        self._epoch_counter += 1
+        rng = random.Random(self._seed + epoch) if self._seed is not None else random.Random()
 
         packer = self._create_packer()
         shuffle_buffer = []
@@ -989,7 +997,7 @@ class PackedShardedSource(ShardedDataSource[dict]):
                     shuffle_buffer.append(result)
                     return None
                 else:
-                    idx = random.randrange(0, max_buffer)
+                    idx = rng.randrange(0, max_buffer)
                     out = shuffle_buffer[idx]
                     shuffle_buffer[idx] = result
                     return out
@@ -1019,18 +1027,10 @@ class PackedShardedSource(ShardedDataSource[dict]):
                     source_id = example.get("__source__")
                     extra_fields = self._extract_extra_fields(example, len(tokens))
 
-                    if isinstance(packer, (PoolPacker, FirstFitPacker)):
-                        results = packer.add(list(tokens), source_id, extra_fields)
-                        for packed in results:
-                            out = emit(packed)
-                            if out is not None:
-                                yield out
-                    else:
-                        result = packer.add(list(tokens), source_id, extra_fields)
-                        if result is not None:
-                            out = emit(result)
-                            if out is not None:
-                                yield out
+                    for packed in packer.add(list(tokens), source_id, extra_fields):
+                        out = emit(packed)
+                        if out is not None:
+                            yield out
 
             if self._warn_on_padded_input and padded_check_seen > 0 and padded_check_full == padded_check_seen:
                 logger.warning(
@@ -1056,7 +1056,7 @@ class PackedShardedSource(ShardedDataSource[dict]):
 
             # Emit remaining shuffle buffer
             if self._shuffle:
-                random.shuffle(shuffle_buffer)
+                rng.shuffle(shuffle_buffer)
                 yield from shuffle_buffer
 
         try:
@@ -1258,7 +1258,16 @@ def report_packing_stats(
     return packed.packing_stats or PackingStats(seq_length=seq_length)
 
 
-def pack_pre_tokenized(stream, seq_length: int, eos_token_id: int, batch_size: int, shuffle: bool, buffer_factor: int):
+def pack_pre_tokenized(
+    stream,
+    seq_length: int,
+    eos_token_id: int,
+    batch_size: int,
+    shuffle: bool,
+    buffer_factor: int,
+    tokens_field: str = "tokens",
+    seed: int | None = None,
+):
     """Pack pre-tokenized sequences into constant-length chunks.
 
     Takes a stream of pre-tokenized examples and packs them into fixed-length
@@ -1296,12 +1305,16 @@ def pack_pre_tokenized(stream, seq_length: int, eos_token_id: int, batch_size: i
         buf = np.array([], dtype=np.int32)
         eos = np.array([eos_token_id], dtype=np.int32)
         shuffle_buf = []
+        # Instance RNG: the module-global `random` polluted other consumers
+        # and made the packed order irreproducible despite mixture.seed.
+        rng = random.Random(seed) if seed is not None else random.Random()
         # batch_size may be None (unbatched row stream); it only scales the
         # reservoir used when shuffle is enabled, so fall back to 1.
         max_buf = (batch_size or 1) * buffer_factor
+        dropped_tail = 0
 
         for sample in stream:
-            toks = sample["tokens"]
+            toks = sample[tokens_field]
             # Use asarray to avoid unnecessary copy if already int32 ndarray
             toks = np.asarray(toks, dtype=np.int32)
             buf = np.concatenate([buf, toks], axis=0)
@@ -1314,12 +1327,18 @@ def pack_pre_tokenized(stream, seq_length: int, eos_token_id: int, batch_size: i
                     if len(shuffle_buf) < max_buf:
                         shuffle_buf.append(ex)
                     else:
-                        i = random.randrange(0, max_buf)
+                        i = rng.randrange(0, max_buf)
                         yield shuffle_buf[i]
                         shuffle_buf[i] = ex
                 else:
                     yield ex
-        random.shuffle(shuffle_buf)
+        dropped_tail = len(buf)
+        if dropped_tail:
+            logger.info(
+                f"pack_pre_tokenized: dropping trailing partial window of {dropped_tail} tokens "
+                f"(< seq_length={seq_length}); constant-length packing has no padded tail."
+            )
+        rng.shuffle(shuffle_buf)
         for ex in shuffle_buf:
             yield ex
 
@@ -1335,6 +1354,7 @@ def pack_constant_length(
     shuffle: bool,
     buffer_factor: int,
     tokenize_batch_size: int | None = None,
+    seed: int | None = None,
 ):
     """Pack sequences with on-the-fly tokenization into constant-length chunks.
 
@@ -1391,4 +1411,4 @@ def pack_constant_length(
             for ex in stream:
                 yield {"tokens": tokenize_fn(ex)}
 
-    return pack_pre_tokenized(token_iter(), seq_length, eos_token_id, batch_size, shuffle, buffer_factor)
+    return pack_pre_tokenized(token_iter(), seq_length, eos_token_id, batch_size, shuffle, buffer_factor, seed=seed)

@@ -66,7 +66,18 @@ _PARQUET_NESTED_CHUNK_SAFE_BYTES = 1_500_000_000
 # allocator abort inside Arrow, or the kernel OOM-killer). Skipping is the only
 # graceful in-process option until such files are re-sharded into small row
 # groups. Override via EASYDEL_PARQUET_MAX_ROW_GROUP_BYTES (0 disables the guard).
-_PARQUET_MAX_SAFE_ROW_GROUP_BYTES = int(os.environ.get("EASYDEL_PARQUET_MAX_ROW_GROUP_BYTES", 24 * 2**30))
+_PARQUET_MAX_SAFE_ROW_GROUP_BYTES_DEFAULT = 24 * 2**30
+
+
+def _parquet_max_safe_row_group_bytes() -> int:
+    """Decode-memory guard threshold; env-overridable at call time.
+
+    Read lazily so the documented ``EASYDEL_PARQUET_MAX_ROW_GROUP_BYTES``
+    override works even when set after ``import easydel``.
+    """
+    return int(os.environ.get("EASYDEL_PARQUET_MAX_ROW_GROUP_BYTES", _PARQUET_MAX_SAFE_ROW_GROUP_BYTES_DEFAULT))
+
+
 # Mid-stream resilience for long-lived shard streams: exceptions treated as
 # transient (PyArrow's ArrowIO errors subclass OSError), and how many times a
 # stream may be reopened with NO forward progress before giving up.
@@ -146,7 +157,7 @@ def _detect_format(files: list[str]) -> str:
         or ``"arrow"`` — the same vocabulary recognised by
         :func:`create_source`.
     """
-    exts_priority = [".arrow", ".parquet", ".jsonl", ".json", ".csv", ".pq", ".txt"]
+    exts_priority = [".arrow", ".parquet", ".jsonl", ".json", ".csv", ".tsv", ".pq", ".txt"]
 
     for f in files:
         f_lower = f.lower()
@@ -156,7 +167,7 @@ def _detect_format(files: list[str]) -> str:
                     return "json"
                 elif ext in (".parquet", ".pq"):
                     return "parquet"
-                elif ext == ".csv":
+                elif ext in (".csv", ".tsv"):
                     return "csv"
                 elif ext == ".txt":
                     return "txt"
@@ -228,7 +239,7 @@ def expand_data_files(data_files: str | os.PathLike | list[str | os.PathLike]) -
         FileNotFoundError: When the expansion produces no matches at
             all — e.g. typo'd glob, empty directory, missing file.
     """
-    exts_priority = [".arrow", ".parquet", ".jsonl", ".json", ".csv", ".pq", ".txt"]
+    exts_priority = [".arrow", ".parquet", ".jsonl", ".json", ".csv", ".tsv", ".pq", ".txt"]
 
     def expand_one(p: str) -> list[str]:
         """Expand a single path / pattern argument into concrete file paths.
@@ -585,10 +596,11 @@ class ParquetShardedSource(ShardedDataSource[dict]):
         """
         skip_projected_read = self._uses_slow_nested_projection(self._columns)
         proj_bytes, _n_rows = self._projected_row_group_bytes(pf, rg_idx)
-        if 0 < _PARQUET_MAX_SAFE_ROW_GROUP_BYTES < proj_bytes:
+        _max_safe_bytes = _parquet_max_safe_row_group_bytes()
+        if 0 < _max_safe_bytes < proj_bytes:
             logger.warning(
                 f"SKIPPING parquet row group {rg_idx} ({_n_rows} rows): projected payload "
-                f"{proj_bytes / 2**30:.1f} GiB exceeds the {_PARQUET_MAX_SAFE_ROW_GROUP_BYTES / 2**30:.1f} GiB "
+                f"{proj_bytes / 2**30:.1f} GiB exceeds the {_max_safe_bytes / 2**30:.1f} GiB "
                 "decode-memory guard (PyArrow decodes row groups atomically; attempting this would risk "
                 "killing the host). Re-shard this file with a small row_group_size, or raise "
                 "EASYDEL_PARQUET_MAX_ROW_GROUP_BYTES to override."
@@ -719,8 +731,12 @@ class ParquetShardedSource(ShardedDataSource[dict]):
         while True:
             made_progress = False
             try:
-                for example in self._iter_shard_rows(shard_name, position):
-                    position += 1
+                for abs_row, example in self._iter_shard_rows(shard_name, position):
+                    # Track the PHYSICAL row index, not the delivered count:
+                    # the decode-memory guard can skip whole row groups, and a
+                    # delivered-count position would make the post-error
+                    # reopen land too early and re-deliver rows.
+                    position = abs_row + 1
                     made_progress = True
                     failures_without_progress = 0
                     yield example
@@ -737,31 +753,43 @@ class ParquetShardedSource(ShardedDataSource[dict]):
                 )
                 _time.sleep(delay)
 
-    def _iter_shard_rows(self, shard_name: str, row: int) -> "Iterator[dict]":
-        """Single-pass row stream starting at ``row`` (no resume semantics)."""
+    def _iter_shard_rows(self, shard_name: str, row: int) -> "Iterator[tuple[int, dict]]":
+        """Single-pass ``(absolute_row_index, row)`` stream starting at ``row``.
+
+        Yields the file-physical row index alongside each row so callers can
+        resume by position even when the decode-memory guard skips whole row
+        groups. A ``row`` at or past the end of the file yields nothing (the
+        old code applied the skip only to row group 0 and then replayed every
+        later row group in full — silent duplication on resume-at-end).
+        """
         import pyarrow.parquet as pq  # pyright: ignore[reportMissingTypeStubs]
 
+        row = max(int(row), 0)
         with self._open_file(shard_name) as fh:
             pf = pq.ParquetFile(fh)
+            rg_starts: list[int] = []
             cumulative_rows = 0
+            for rg_idx in range(pf.num_row_groups):
+                rg_starts.append(cumulative_rows)
+                cumulative_rows += pf.metadata.row_group(rg_idx).num_rows
+            if row >= cumulative_rows:
+                return
+
             start_rg = 0
             skip_in_rg = row
-
-            # Find the row group containing the target row
-            for rg_idx in range(pf.num_row_groups):
-                rg_rows = pf.metadata.row_group(rg_idx).num_rows
-                if cumulative_rows + rg_rows > row:
+            for rg_idx in range(pf.num_row_groups - 1, -1, -1):
+                if rg_starts[rg_idx] <= row:
                     start_rg = rg_idx
-                    skip_in_rg = row - cumulative_rows
+                    skip_in_rg = row - rg_starts[rg_idx]
                     break
-                cumulative_rows += rg_rows
 
             # Iterate from the target row group
             for rg_idx in range(start_rg, pf.num_row_groups):
                 start_i = skip_in_rg if rg_idx == start_rg else 0
+                base = rg_starts[rg_idx]
                 for i, example in enumerate(self._iter_row_group_rows(pf, rg_idx)):
                     if i >= start_i:
-                        yield example
+                        yield base + i, example
 
     def __len__(self) -> int:
         """Return total number of rows across all parquet files.
@@ -847,7 +875,6 @@ class JsonShardedSource(ShardedDataSource[dict]):
 
         return fsspec.open(path, "r", **self._storage_options)
 
-    @with_retry(max_retries=3, initial_delay=1.0)  # pyright: ignore[reportUntypedFunctionDecorator]
     def open_shard(self, shard_name: str) -> "Iterator[dict]":
         """Open a JSON/JSONL shard and iterate over records.
 
@@ -973,7 +1000,6 @@ class ArrowShardedSource(ShardedDataSource[dict]):
         """
         return len(self._files)
 
-    @with_retry(max_retries=3, initial_delay=1.0)  # pyright: ignore[reportUntypedFunctionDecorator]
     def open_shard(self, shard_name: str) -> "Iterator[dict]":
         """Open an Arrow IPC shard and iterate over rows.
 
@@ -1071,7 +1097,6 @@ class CsvShardedSource(ShardedDataSource[dict]):
         """
         return len(self._files)
 
-    @with_retry(max_retries=3, initial_delay=1.0)  # pyright: ignore[reportUntypedFunctionDecorator]
     def open_shard(self, shard_name: str) -> "Iterator[dict]":
         """Open a CSV shard and iterate over rows.
 
@@ -1257,7 +1282,11 @@ class HuggingFaceShardedSource(ShardedDataSource[dict]):
         Returns:
             One-element list of ``"{dataset_name}:{split}"``.
         """
-        # HuggingFace datasets are treated as a single shard
+        # HuggingFace datasets are treated as a single shard. The subset is
+        # part of the identity: omitting it made two subsets of one dataset
+        # collide inside CompositeShardedSource.
+        if self._subset:
+            return [f"{self._dataset_name}:{self._subset}:{self._split}"]
         return [f"{self._dataset_name}:{self._split}"]
 
     def num_shards(self) -> int:
@@ -1378,8 +1407,17 @@ class CompositeShardedSource(ShardedDataSource[dict]):
         self._shard_map: list[tuple[int, int]] = []  # (source_idx, shard_idx)
         self._shard_names: list[str] = []
 
+        seen: dict[str, int] = {}
         for src_idx, source in enumerate(sources):
             for shard_idx, shard_name in enumerate(source.shard_names):
+                if shard_name in seen:
+                    raise ValueError(
+                        f"CompositeShardedSource shard name collision: {shard_name!r} is exposed by both "
+                        f"source {seen[shard_name]} and source {src_idx}. Name-based dispatch would read "
+                        "the first owner twice and the second never; give the sources distinct shard "
+                        "names (e.g. distinct HF subsets/paths)."
+                    )
+                seen[shard_name] = src_idx
                 self._shard_map.append((src_idx, shard_idx))
                 self._shard_names.append(shard_name)
 
@@ -1504,7 +1542,7 @@ def create_source(config: "DatasetConfig") -> ShardedDataSource:
         fmt = "json"
     elif source_type == "parquet":
         fmt = "parquet"
-    elif source_type == "csv":
+    elif source_type in ("csv", "tsv"):
         fmt = "csv"
     elif source_type == "arrow":
         fmt = "arrow"
@@ -1520,7 +1558,8 @@ def create_source(config: "DatasetConfig") -> ShardedDataSource:
         jsonl = any(f.endswith(".jsonl") for f in files)
         return JsonShardedSource(files, storage_options, jsonl=jsonl)
     elif fmt == "csv":
-        return CsvShardedSource(files, storage_options)
+        delimiter = "\t" if any(str(f).lower().endswith(".tsv") for f in files) else ","
+        return CsvShardedSource(files, storage_options, delimiter=delimiter)
     elif fmt == "txt":
         return TextShardedSource(files, storage_options, text_field=config.content_field)
     else:
@@ -1686,6 +1725,14 @@ def load_for_inform(inform, mixture):
     except ValueError as e:
         msg = str(e)
         if builder == "parquet" and ("Feature type 'List' not found" in msg or "from_dict" in msg):
-            dataset = IterableDataset.from_generator(lambda: _iter_parquet_rows(files))
+            if mixture.streaming:
+                dataset = IterableDataset.from_generator(lambda: _iter_parquet_rows(files))
+            else:
+                # Every other non-streaming path returns a map-style Dataset;
+                # substituting an IterableDataset here broke len()/select()
+                # consumers far from the cause.
+                from datasets import Dataset  # pyright: ignore[reportMissingTypeStubs]
+
+                dataset = Dataset.from_generator(lambda: _iter_parquet_rows(files))
             return _apply_num_rows_limit(dataset)
         raise

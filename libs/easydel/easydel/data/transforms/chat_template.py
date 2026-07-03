@@ -22,9 +22,12 @@ This module provides:
 
 from __future__ import annotations
 
+import logging
 import typing as tp
 
 from .base import Example, Transform
+
+logger = logging.getLogger(__name__)
 
 
 def is_conversational(example: dict) -> bool:
@@ -46,7 +49,12 @@ def is_conversational(example: dict) -> bool:
         bool: ``True`` if the row's shape matches a chat-style
         schema, ``False`` for plain-text and other schemas.
     """
-    supported_keys = ["prompt", "chosen", "rejected", "completion", "messages", "conversations"]
+    # Only keys ChatTemplateTransform actually renders. The TRL preference
+    # keys (prompt/chosen/rejected/completion) were previously claimed here,
+    # detected rows as conversational, and then returned them unchanged —
+    # a silent no-op. "conversation" (singular) IS read by the transform but
+    # was missing here, so Capybara-style rows skipped templating entirely.
+    supported_keys = ["messages", "conversations", "conversation"]
 
     for key in supported_keys:
         value = example.get(key)
@@ -231,7 +239,11 @@ class ChatTemplateTransform(Transform):
 
         result[self._output_field] = formatted_text
 
-        if self._drop_messages and source_field:
+        # Guard the in-place config (output_field == messages field): the
+        # sibling converters have this check; without it the rendered text
+        # was written and then immediately popped — conversation AND output
+        # both gone.
+        if self._drop_messages and source_field and source_field != self._output_field:
             result.pop(source_field, None)
 
         return result
@@ -413,6 +425,16 @@ class ConvertInputOutputToChatML(Transform):
             if "output" in turn:
                 messages.append({"role": self._assistant_role, "content": turn["output"]})
 
+        if not messages:
+            # Schema mismatch (e.g. role/content turns): converting would pop
+            # the source field and write an EMPTY messages list — destroying
+            # the conversation with no diagnostics. Leave the row untouched.
+            logger.warning(
+                "ConvertInputOutputToChatML: field %r has no input/output turns; row left unchanged.",
+                source_field,
+            )
+            return result
+
         # Remove old field if different from output
         if source_field and source_field != self._output_field:
             result.pop(source_field, None)
@@ -547,10 +569,13 @@ class ConvertToChatML(Transform):
         if messages is None:
             return result
 
-        # Convert messages
+        # Convert messages. Preserve every key beyond the from/value ->
+        # role/content normalization: rebuilding only role+content silently
+        # deleted tool_calls / tool_call_id / name from tool-use datasets,
+        # rendering empty assistant turns downstream.
         converted = []
         for msg in messages:
-            new_msg = {}
+            new_msg = {k: v for k, v in msg.items() if k not in ("from", "value", "role", "content")}
 
             # Handle role/from
             if "from" in msg:
@@ -561,8 +586,7 @@ class ConvertToChatML(Transform):
                 role = "user"  # Default to user if unknown
 
             # Apply role mapping (normalize to ChatML standard roles)
-            role = self._role_mapping.get(role, role)
-            new_msg["role"] = role
+            new_msg["role"] = self._role_mapping.get(role, role)
 
             # Handle content/value
             if "value" in msg:
@@ -570,7 +594,7 @@ class ConvertToChatML(Transform):
             elif "content" in msg:
                 new_msg["content"] = msg["content"]
             else:
-                new_msg["content"] = ""
+                new_msg["content"] = None if new_msg.get("tool_calls") else ""
 
             converted.append(new_msg)
 

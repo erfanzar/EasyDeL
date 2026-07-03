@@ -366,6 +366,47 @@ class DatasetWriter:
     fields are configuration storage.
     """
 
+    def _prepare_output_dir(self, fs, path: str, suffix: str) -> None:
+        """Enforce the ``overwrite`` contract before any shard is written.
+
+        Pre-existing ``shard-*{suffix}`` files in the target are fatal when
+        ``overwrite`` is False (the documented behavior, previously
+        unimplemented) and are DELETED when ``overwrite`` is True — leaving
+        them in place mixed shards from different runs into one directory
+        (a re-run producing fewer shards silently kept the old tail).
+        """
+        try:
+            existing = [
+                p for p in fs.ls(path) if str(p).rsplit("/", 1)[-1].startswith("shard-") and str(p).endswith(suffix)
+            ]
+        except FileNotFoundError:
+            return
+        if not existing:
+            return
+        if not getattr(self, "overwrite", False):
+            raise FileExistsError(
+                f"{len(existing)} existing {suffix} shard(s) found under {self.output_path!r} and "
+                "overwrite=False. Delete them or pass overwrite=True (stale shards from a previous "
+                "run would otherwise be read alongside the new ones)."
+            )
+        for stale in existing:
+            fs.rm(stale)
+        logger.warning(f"overwrite=True: removed {len(existing)} pre-existing shard(s) under {self.output_path!r}")
+
+    def _shard_uri(self, path_in_fs: str) -> str:
+        """Map a filesystem-internal shard path back to a caller-facing URI.
+
+        ``fsspec.core.url_to_fs`` strips the scheme (``gs://bucket/x`` ->
+        ``bucket/x``); recorded output paths (and the Hub push) need the
+        real URI.
+        """
+        _fs, root = __import__("fsspec").core.url_to_fs(self.output_path)
+        root = str(root).rstrip("/")
+        rel = str(path_in_fs)
+        if rel.startswith(root):
+            rel = rel[len(root) :].lstrip("/")
+        return f"{self.output_path.rstrip('/')}/{rel}"
+
     def __init__(
         self,
         output_path: str,
@@ -396,6 +437,11 @@ class DatasetWriter:
         self.output_path = output_path
         self.max_shard_size = max_shard_size
         self.num_shards = num_shards
+        if num_shards is not None:
+            logger.warning(
+                "num_shards is advisory only: streaming writers rotate by max_shard_size and cannot "
+                "target an exact shard count without knowing the total size up front."
+            )
         self.compression = compression
         self.overwrite = overwrite
 
@@ -450,6 +496,7 @@ class ParquetWriter(DatasetWriter):
         # Create output directory
         fs, path = fsspec.core.url_to_fs(self.output_path)
         fs.makedirs(path, exist_ok=True)
+        self._prepare_output_dir(fs, path, ".parquet")
 
         stats = WriteStats()
         current_shard = 0
@@ -484,7 +531,7 @@ class ParquetWriter(DatasetWriter):
 
                 shard_info = fs.info(shard_path)
                 stats.total_bytes += shard_info.get("size", 0)
-                stats.output_paths.append(shard_path)
+                stats.output_paths.append(self._shard_uri(shard_path))
                 stats.num_shards += 1
 
             current_rows = []
@@ -534,6 +581,7 @@ class ArrowWriter(DatasetWriter):
 
         fs, path = fsspec.core.url_to_fs(self.output_path)
         fs.makedirs(path, exist_ok=True)
+        self._prepare_output_dir(fs, path, ".arrow")
 
         stats = WriteStats()
         current_shard = 0
@@ -567,7 +615,7 @@ class ArrowWriter(DatasetWriter):
 
             shard_info = fs.info(shard_path)
             stats.total_bytes += shard_info.get("size", 0)
-            stats.output_paths.append(shard_path)
+            stats.output_paths.append(self._shard_uri(shard_path))
             stats.num_shards += 1
 
             current_rows = []
@@ -616,6 +664,7 @@ class JsonlWriter(DatasetWriter):
 
         fs, path = fsspec.core.url_to_fs(self.output_path)
         fs.makedirs(path, exist_ok=True)
+        self._prepare_output_dir(fs, path, ".jsonl")
 
         stats = WriteStats()
         current_shard = 0
@@ -652,7 +701,7 @@ class JsonlWriter(DatasetWriter):
 
             shard_info = fs.info(shard_path)
             stats.total_bytes += shard_info.get("size", 0)
-            stats.output_paths.append(shard_path)
+            stats.output_paths.append(self._shard_uri(shard_path))
             stats.num_shards += 1
 
             current_lines = []
@@ -881,12 +930,26 @@ class SaveStage(BaseStage):
                 logger.warning("No output paths to upload")
                 return
             for file_path in stats.output_paths:
-                api.upload_file(
-                    path_or_fileobj=file_path,
-                    path_in_repo=f"{ds_name}/{Path(file_path).name}",
-                    repo_id=repo_id,
-                    repo_type="dataset",
-                )
+                if "://" in str(file_path):
+                    # Remote shard (gs://, s3://, ...): upload_file would treat
+                    # the URI as a local path and FileNotFoundError; stream it
+                    # through fsspec instead.
+                    import fsspec  # pyright: ignore[reportMissingTypeStubs]
+
+                    with fsspec.open(file_path, "rb") as fobj:
+                        api.upload_file(
+                            path_or_fileobj=fobj,
+                            path_in_repo=f"{ds_name}/{Path(file_path).name}",
+                            repo_id=repo_id,
+                            repo_type="dataset",
+                        )
+                else:
+                    api.upload_file(
+                        path_or_fileobj=file_path,
+                        path_in_repo=f"{ds_name}/{Path(file_path).name}",
+                        repo_id=repo_id,
+                        repo_type="dataset",
+                    )
 
             logger.info(f"Pushed dataset '{ds_name}' to Hub: {repo_id}")
 

@@ -953,9 +953,13 @@ class BaseStage(ABC):
             when no entry matches (callers can treat empty as "use
             defaults").
         """
-        datasets = context.config.get("datasets", [])
+        config = context.config
+        datasets = config.get("datasets", []) if isinstance(config, dict) else getattr(config, "datasets", []) or []
         for i, ds_cfg in enumerate(datasets):
-            ds_name = ds_cfg.get("name", f"dataset_{i}")
+            if isinstance(ds_cfg, dict):
+                ds_name = ds_cfg.get("name") or f"dataset_{i}"
+            else:
+                ds_name = getattr(ds_cfg, "name", None) or f"dataset_{i}"
             if ds_name == dataset_id:
                 return ds_cfg
         return {}
@@ -1096,8 +1100,15 @@ class PipelineContext:
         if self._cache_manager is None:
             from ..execution.cache import TreeCacheManager
 
-            cache_config = self.config.get("cache", {})
-            cache_dir = cache_config.get("cache_dir", ".cache/easydel_pipeline")
+            config = self.config
+            if isinstance(config, dict):
+                cache_config = config.get("cache") or {}
+                cache_dir = cache_config.get("cache_dir", ".cache/easydel_pipeline")
+            else:
+                # PipelineConfig dataclass (the normal case since the typed
+                # pipeline landed); the old dict-era `.get` crashed here.
+                cache_config = getattr(config, "cache", None)
+                cache_dir = getattr(cache_config, "cache_dir", None) or ".cache/easydel_pipeline"
             self._cache_manager = TreeCacheManager(cache_dir=cache_dir)
         return self._cache_manager
 

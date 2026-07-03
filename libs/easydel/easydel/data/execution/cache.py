@@ -387,6 +387,11 @@ class DiskCache(CacheLayer):
             expiry_seconds: TTL in seconds. ``None`` disables expiry —
                 entries live until manually invalidated.
         """
+        if "://" in str(cache_dir):
+            raise ValueError(
+                f"cache_dir {cache_dir!r} looks like a remote URI; pathlib would silently collapse "
+                "it into a local './gs:/...' directory. The data cache only supports local paths."
+            )
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.compression = compression
@@ -624,6 +629,11 @@ class TreeCacheManager:
             compression: Codec for the disk layer payloads —
                 ``"none"``, ``"gzip"``, ``"lz4"`` or ``"zstd"``.
         """
+        if "://" in str(cache_dir):
+            raise ValueError(
+                f"cache_dir {cache_dir!r} looks like a remote URI; pathlib would silently collapse "
+                "it into a local './gs:/...' directory. The data cache only supports local paths."
+            )
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -824,6 +834,11 @@ class DatasetCache:
                 stored as a subdirectory named after the SHA-256 of its
                 key. Created if missing.
         """
+        if "://" in str(cache_dir):
+            raise ValueError(
+                f"cache_dir {cache_dir!r} looks like a remote URI; pathlib would silently collapse "
+                "it into a local './gs:/...' directory. The data cache only supports local paths."
+            )
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 

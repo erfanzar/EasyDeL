@@ -332,10 +332,16 @@ class MixedShardedSource(ShardedDataSource[dict]):
         ws = np.array([weights.get(name, 0) for name in self._names], dtype=np.float64)
         ws = ws / ws.sum()
 
-        counts_arr = np.floor(ws * self._block_size).astype(int)
-        remainder = self._block_size - counts_arr.sum()
+        exact = ws * self._block_size
+        counts_arr = np.floor(exact).astype(int)
+        remainder = int(self._block_size - counts_arr.sum())
         if remainder > 0:
-            counts_arr[np.argmax(ws)] += remainder
+            # Largest-remainder rounding: hand the leftover slots to the
+            # largest fractional parts (stable ties by index). Dumping the
+            # whole remainder on argmax(ws) systematically over-sampled the
+            # heaviest dataset by up to len(sources)-1 rows per block.
+            order = np.argsort(-(exact - counts_arr), kind="stable")
+            counts_arr[order[:remainder]] += 1
 
         return {name: int(counts_arr[i]) for i, name in enumerate(self._names)}
 
@@ -422,6 +428,7 @@ class MixedShardedSource(ShardedDataSource[dict]):
 
         block_idx = 0
         examples_emitted = 0
+        dead: set[str] = set()
 
         while True:
             # Resolve the mixing weights for the current schedule position. NOTE: the mixer is a pure data
@@ -430,9 +437,16 @@ class MixedShardedSource(ShardedDataSource[dict]):
             # at ``N * global_batch_size`` examples.
             ids = self._block_source_ids(block_idx, examples_emitted)
 
-            # Yield examples from the block
-            exhausted_count = 0
+            # Yield examples from the block. `dead` tracks DISTINCT exhausted
+            # sources across blocks: the old per-block event counter compared
+            # against len(sources), which (a) killed the whole mix when one
+            # empty source was merely drawn len(sources) times in a block and
+            # (b) under all_exhausted never terminated at all whenever
+            # block_size != len(sources) (all-dead blocks counted block_size
+            # events, not len(sources)).
             for name in ids:
+                if name in dead:
+                    continue
                 try:
                     example = next(iters[name])
                     # Add source metadata
@@ -450,13 +464,13 @@ class MixedShardedSource(ShardedDataSource[dict]):
                         except StopIteration:
                             # Empty dataset
                             logger.warning(f"Dataset '{name}' is empty")
-                            exhausted_count += 1
+                            dead.add(name)
                     elif self._stop_strategy == "first_exhausted":
                         return
                     else:  # all_exhausted
-                        exhausted_count += 1
+                        dead.add(name)
 
-            if exhausted_count == len(self._names):
+            if len(dead) == len(self._names):
                 return
 
             block_idx += 1
@@ -481,6 +495,7 @@ class MixedShardedSource(ShardedDataSource[dict]):
         iters = {name: self._chain_shards_at_row(self._sources[name], offsets[name]) for name in self._names}
 
         block_idx, partial = divmod(row, self._block_size)
+        dead: set[str] = set()
 
         while True:
             block_start = block_idx * self._block_size
@@ -489,8 +504,9 @@ class MixedShardedSource(ShardedDataSource[dict]):
                 ids = ids[partial:]
                 partial = 0
 
-            exhausted_count = 0
             for name in ids:
+                if name in dead:
+                    continue
                 try:
                     example = next(iters[name])
                     example["__source__"] = name
@@ -503,9 +519,9 @@ class MixedShardedSource(ShardedDataSource[dict]):
                         yield example
                     except StopIteration:
                         logger.warning(f"Dataset '{name}' is empty")
-                        exhausted_count += 1
+                        dead.add(name)
 
-            if exhausted_count == len(self._names):
+            if len(dead) == len(self._names):
                 return
 
             block_idx += 1
@@ -750,10 +766,13 @@ def block_mixture_interleave(
     else:
         ws = np.ones(n, dtype=np.float64) / n
 
-    counts = np.floor(ws * block_size).astype(int)
-    remainder = block_size - counts.sum()
+    exact = ws * block_size
+    counts = np.floor(exact).astype(int)
+    remainder = int(block_size - counts.sum())
     if remainder > 0:
-        counts[np.argmax(ws)] += remainder
+        # Largest-remainder rounding (see MixedShardedSource._compute_counts).
+        order = np.argsort(-(exact - counts), kind="stable")
+        counts[order[:remainder]] += 1
 
     def gen():
         """Inline closure that drives the deterministic block-based interleaver.
