@@ -6566,14 +6566,20 @@ class BaseTrainer(BaseTrainerProtocol):
             logger.warning(f"Could not create profiler_path={profiler_path!r}: {exc}")
         host_level = getattr(self.arguments, "profiler_host_tracer_level", None)
         python_level = getattr(self.arguments, "profiler_python_tracer_level", None)
+        duration_ms = getattr(self.arguments, "profiler_duration_ms", None)
+        enable_hlo_proto = getattr(self.arguments, "profiler_enable_hlo_proto", None)
         try:
             profile_options = None
-            if host_level is not None or python_level is not None:
+            if any(value is not None for value in (host_level, python_level, duration_ms, enable_hlo_proto)):
                 profile_options = jax.profiler.ProfileOptions()
                 if host_level is not None:
                     profile_options.host_tracer_level = int(host_level)
                 if python_level is not None:
                     profile_options.python_tracer_level = int(python_level)
+                if duration_ms is not None:
+                    profile_options.duration_ms = int(duration_ms)
+                if enable_hlo_proto is not None:
+                    profile_options.enable_hlo_proto = bool(enable_hlo_proto)
             if profile_options is not None:
                 jax.profiler.start_trace(str(profiler_path), profiler_options=profile_options)
             else:

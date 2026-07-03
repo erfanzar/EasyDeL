@@ -741,6 +741,28 @@ class TrainingArguments:
             )
         },
     )
+    profiler_duration_ms: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Bound the JAX profiler collection window to this many milliseconds after the "
+                "trace starts. Large programs (e.g. chunked-scan layers) emit millions of device "
+                "op events per step and can overflow the profiler's 2GB XSpace protobuf cap when "
+                "tracing whole steps; a bounded time slice keeps the trace valid. None traces "
+                "until `profiler_stop_step`/end of training."
+            )
+        },
+    )
+    profiler_enable_hlo_proto: bool | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Override ProfileOptions.enable_hlo_proto (embedding compiled HLO protos in the "
+                "trace). Set False to shrink traces for very large programs. None keeps the "
+                "library default."
+            )
+        },
+    )
     profiler_stop_step: int | None = field(
         default=None,
         metadata={
