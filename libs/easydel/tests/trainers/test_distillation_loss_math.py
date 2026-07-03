@@ -18,7 +18,6 @@ import jax
 import jax.numpy as jnp
 import optax  # pyright: ignore[reportMissingTypeStubs]
 import pytest
-
 from easydel.trainers.distillation_trainer._fn import chunked_distillation_loss, distillation_loss
 
 
@@ -425,3 +424,65 @@ def test_teacher_branch_is_stop_gradient():
 
     teacher_grad = jax.grad(_loss_for_teacher)(teacher_logits)
     assert jnp.allclose(teacher_grad, jnp.zeros_like(teacher_grad), atol=1e-7)
+
+
+def test_chunked_z_loss_matches_manual_reference():
+    """z_loss = coef * mean over valid tokens of logsumexp(raw student logits)^2,
+    folded into the chunked total and reported as a component."""
+    key = jax.random.PRNGKey(7)
+    ks, kt = jax.random.split(key)
+    B, L, V = 2, 8, 16
+    student_hidden = jax.random.normal(ks, (B, L, V), jnp.float32)
+    teacher_hidden = jax.random.normal(kt, (B, L, V), jnp.float32)
+    attention_mask = jnp.asarray([[1] * 8, [1] * 5 + [0] * 3], jnp.int32)
+    coef = 1e-2
+
+    base_total, base_components = chunked_distillation_loss(
+        student_hidden=student_hidden,
+        teacher_hidden=teacher_hidden,
+        student_lm_head_fn=_identity_lm_head,
+        teacher_lm_head_fn=_identity_lm_head,
+        attention_mask=attention_mask,
+        temperature=1.0,
+        alpha=1.0,
+        chunk_size=4,
+    )
+    total, components = chunked_distillation_loss(
+        student_hidden=student_hidden,
+        teacher_hidden=teacher_hidden,
+        student_lm_head_fn=_identity_lm_head,
+        teacher_lm_head_fn=_identity_lm_head,
+        attention_mask=attention_mask,
+        temperature=1.0,
+        alpha=1.0,
+        chunk_size=4,
+        z_loss=coef,
+    )
+
+    mask = attention_mask.astype(jnp.float32)
+    lse = jax.nn.logsumexp(student_hidden.astype(jnp.float32), axis=-1)
+    expected_z = coef * jnp.sum(jnp.square(lse) * mask) / jnp.sum(mask)
+
+    assert "z_loss" not in base_components
+    assert jnp.allclose(components["z_loss"], expected_z, rtol=1e-5)
+    assert jnp.allclose(total, base_total + expected_z, rtol=1e-5)
+    # KL terms untouched by the regularizer
+    assert jnp.allclose(components["kl_loss"], base_components["kl_loss"], rtol=1e-6)
+
+
+def test_chunked_z_loss_zero_coefficient_is_identity():
+    key = jax.random.PRNGKey(3)
+    hidden = jax.random.normal(key, (1, 8, 8), jnp.float32)
+    kwargs = dict(
+        student_hidden=hidden,
+        teacher_hidden=hidden,
+        student_lm_head_fn=_identity_lm_head,
+        teacher_lm_head_fn=_identity_lm_head,
+        temperature=1.0,
+        alpha=1.0,
+        chunk_size=4,
+    )
+    total_off, comps_off = chunked_distillation_loss(**kwargs)
+    total_default, comps_default = chunked_distillation_loss(**kwargs, z_loss=0.0)
+    assert jnp.allclose(total_off, total_default)
+    assert "z_loss" not in comps_off and "z_loss" not in comps_default

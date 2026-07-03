@@ -978,6 +978,7 @@ def chunked_distillation_loss(
     alpha: float = 0.9,
     chunk_size: int = 128,
     checkpoint_chunks: bool = True,
+    z_loss: float = 0.0,
 ) -> tuple[Array, dict[str, Array]]:
     """Memory-efficient distillation loss that avoids materialising full logits.
 
@@ -987,6 +988,10 @@ def chunked_distillation_loss(
     projecting each chunk to vocab logits on-the-fly and immediately reducing
     to scalar KL / CE contributions. Peak logit memory drops from
     ``O(B * L * V)`` to ``O(B * chunk_size * V)``.
+
+    ``z_loss`` (LossConfig semantics: ``coef * logsumexp(logits)**2`` on the
+    raw student logits, averaged over valid tokens) is folded into the total
+    and reported as the ``z_loss`` component when the coefficient is nonzero.
 
     When ``checkpoint_chunks`` is ``True`` (default) the per-chunk body is
     wrapped in ``jax.checkpoint`` so that during the backward pass each chunk's
@@ -1071,7 +1076,7 @@ def chunked_distillation_loss(
                 jax.lax.stop_gradient(teacher_lm_head_fn(t_h)),
                 "distill_teacher_lm_head_logits",
             )
-        return _compute_kl_and_ce(
+        distill_xent, teacher_entropy, ce, ms = _compute_kl_and_ce(
             student_logits=s_logits,
             teacher_logits=t_logits,
             mask=m,
@@ -1079,25 +1084,39 @@ def chunked_distillation_loss(
             use_hard_labels=_use_hard,
             temperature=temperature,
         )
+        # z-loss on the raw (T=1) student logits: sum over valid tokens of
+        # logsumexp^2, normalized once at the end alongside the KL terms.
+        if z_loss:
+            lse = jax.nn.logsumexp(s_logits.astype(jnp.float32), axis=-1)
+            z_sq = jnp.sum(jnp.square(lse) * m.astype(jnp.float32))
+        else:
+            z_sq = jnp.zeros((), dtype=jnp.float32)
+        return distill_xent, teacher_entropy, ce, ms, z_sq
 
     if checkpoint_chunks:
         _chunk_kl_ce = jax.checkpoint(_chunk_kl_ce)
 
     def _scan_body(carry, xs):
         s_h, t_h, m, sl = xs
-        distill_xent, teacher_entropy, ce, ms = _chunk_kl_ce(s_h, t_h, m, sl)
-        return (carry[0] + distill_xent, carry[1] + teacher_entropy, carry[2] + ce, carry[3] + ms), None
+        distill_xent, teacher_entropy, ce, ms, z_sq = _chunk_kl_ce(s_h, t_h, m, sl)
+        return (
+            carry[0] + distill_xent,
+            carry[1] + teacher_entropy,
+            carry[2] + ce,
+            carry[3] + ms,
+            carry[4] + z_sq,
+        ), None
 
     # float32 carry: the running sums reach ~1e4-1e5 where bf16 ulp is 64-512 — accumulating
     # them in the model dtype is one of the things that used to floor / flip the KL metric.
     _zero = jnp.zeros((), dtype=jnp.float32)
-    (distill_xent_sum, teacher_entropy_sum, ce_sum, mask_sum), _ = jax.lax.scan(
+    (distill_xent_sum, teacher_entropy_sum, ce_sum, mask_sum, z_sq_sum), _ = jax.lax.scan(
         _scan_body,
-        (_zero, _zero, _zero, _zero),
+        (_zero, _zero, _zero, _zero, _zero),
         (s_chunks, t_chunks, m_chunks, l_chunks),
     )
 
-    return _finalize_distillation_metrics(
+    total_loss, components = _finalize_distillation_metrics(
         distill_xent_sum=distill_xent_sum,
         teacher_entropy_sum=teacher_entropy_sum,
         ce_sum=ce_sum,
@@ -1106,6 +1125,11 @@ def chunked_distillation_loss(
         alpha=alpha,
         use_hard_labels=_use_hard,
     )
+    if z_loss:
+        z_value = (jnp.asarray(z_loss, jnp.float32) * z_sq_sum / jnp.maximum(mask_sum, 1.0)).astype(total_loss.dtype)
+        total_loss = total_loss + z_value
+        components = {**components, "z_loss": z_value}
+    return total_loss, components
 
 
 def _resolve_indices(
@@ -1410,6 +1434,7 @@ def distillation_step(
         getattr(getattr(student_state, "model", None), "mesh", None), raise_error=False
     )
     _tp_parallel = _stage_mesh is not None and "tp" in _stage_mesh.axis_names and _stage_mesh.shape["tp"] > 1
+    _z_loss_coef = float(getattr(loss_config, "z_loss", 0.0) or 0.0) if loss_config is not None else 0.0
 
     def teacher_forward(input_batch: collections.abc.Mapping[str, jax.Array]) -> dict[str, tp.Any]:
         """Run the teacher in stop-gradient mode for one minibatch.
@@ -1586,6 +1611,7 @@ def distillation_step(
                 alpha=alpha,
                 chunk_size=int(logits_chunk_size),
                 checkpoint_chunks=checkpoint_kl_loss,
+                z_loss=_z_loss_coef,
             )
         else:
             # If the vocabulary is tensor-parallel-sharded, route the KL/CE through the vocab-parallel
@@ -1614,6 +1640,24 @@ def distillation_step(
                 partition_manager=partition_manager,
             )
         metrics_map: dict[str, jax.Array] = dict(loss_components)
+
+        if _z_loss_coef and not use_chunked:
+            # z-loss (coef * logsumexp(logits)^2, LossConfig.z_loss semantics)
+            # on the raw student logits, averaged over the same valid tokens
+            # the KL uses (attention_mask AND completion_mask).
+            z_mask = jnp.ones(student_outputs.logits.shape[:2], dtype=jnp.float32)
+            if attention_mask is not None:
+                z_mask = z_mask * attention_mask.astype(jnp.float32)
+            if completion_mask is not None:
+                z_mask = z_mask * completion_mask.astype(jnp.float32)
+            lse = jax.nn.logsumexp(student_outputs.logits.astype(jnp.float32), axis=-1)
+            z_value = (
+                jnp.asarray(_z_loss_coef, jnp.float32)
+                * jnp.sum(jnp.square(lse) * z_mask)
+                / jnp.maximum(jnp.sum(z_mask), 1.0)
+            ).astype(total_loss.dtype)
+            total_loss = total_loss + z_value
+            metrics_map["z_loss"] = z_value
 
         # Include the student's auxiliary loss (Qwen3.5 self-supervised MTP CE folded in via
         # `mtp_loss_coef`, and/or MoE router losses) which the distillation loss otherwise drops.
@@ -1722,6 +1766,7 @@ def distillation_step(
 
         metrics = LossMetrics(
             loss=total_loss,
+            z_loss=metrics_map.get("z_loss"),
             other_metrics={key: jnp.asarray(value) for key, value in metrics_map.items()},
         )
         return total_loss, metrics
