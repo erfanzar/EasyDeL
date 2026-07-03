@@ -24,6 +24,7 @@ Requires: ray (optional dependency)
 
 from __future__ import annotations
 
+import itertools
 import logging
 import typing as tp
 from dataclasses import dataclass
@@ -273,7 +274,7 @@ class RayPreprocessor:
         if self._config.resources_per_worker:
             worker_options["num_cpus"] = self._config.resources_per_worker.get("CPU", 1)
         if self._config.use_gpu:
-            worker_options["num_gpus"] = self._config.resources_per_worker.get("GPU", 1)
+            worker_options["num_gpus"] = (self._config.resources_per_worker or {}).get("GPU", 1)
 
         self._workers = [
             RayTokenizeWorker.options(**worker_options).remote(
@@ -313,31 +314,29 @@ class RayPreprocessor:
         """
         self._create_workers()
 
-        # Distribute shards across workers
+        # Distribute shards across workers with a bounded in-flight window:
+        # the old submit-everything loop materialized EVERY shard into the
+        # driver's object store before the first row was yielded, which
+        # fills plasma / spills to disk on real corpora.
         shard_names = list(source.shard_names)
         num_workers = len(self._workers)
+        max_in_flight = max(2 * num_workers, 1)
 
-        # Create futures for each shard
-        futures = []
-        for i, shard_name in enumerate(shard_names):
-            worker_idx = i % num_workers
-
-            # Load shard data
+        def _submit(index: int, shard_name: str):
             shard_data = list(source.open_shard(shard_name))
-
-            # Submit to worker
-            future = self._workers[worker_idx].tokenize_shard.remote(
+            return self._workers[index % num_workers].tokenize_shard.remote(
                 shard_data,
                 content_field=content_field,
             )
-            futures.append(future)
 
-        # Collect results as they complete
+        pending = iter(enumerate(shard_names))
+        futures = [_submit(i, name) for i, name in itertools.islice(pending, max_in_flight)]
+
         while futures:
             ready, futures = ray.wait(futures, num_returns=1)
+            futures.extend(_submit(i, name) for i, name in itertools.islice(pending, len(ready)))
             for future in ready:
-                results = ray.get(future)
-                yield from results
+                yield from ray.get(future)
 
     def shutdown(self):
         """Kill any active workers and reset the actor pool.
@@ -448,15 +447,16 @@ def parallel_process_shards(
         return process_fn(shard_data)
 
     shard_names = list(source.shard_names)
-    futures = []
+    max_in_flight = max(2 * int(num_workers), 1)
 
-    for shard_name in shard_names:
-        shard_data = list(source.open_shard(shard_name))
-        future = process_shard.remote(shard_data)
-        futures.append(future)
+    def _submit(shard_name: str):
+        return process_shard.remote(list(source.open_shard(shard_name)))
+
+    pending = iter(shard_names)
+    futures = [_submit(name) for name in itertools.islice(pending, max_in_flight)]
 
     while futures:
         ready, futures = ray.wait(futures, num_returns=1)
+        futures.extend(_submit(name) for name in itertools.islice(pending, len(ready)))
         for future in ready:
-            results = ray.get(future)
-            yield from results
+            yield from ray.get(future)

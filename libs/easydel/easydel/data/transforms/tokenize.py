@@ -98,7 +98,7 @@ class TokenizerManager:
             PreTrainedTokenizer: The cached or freshly loaded
             tokenizer.
         """
-        cache_key = self._make_cache_key(config)
+        cache_key = self._make_cache_key(config, extra_kwargs)
         if cache_key in self._cache:
             return self._cache[cache_key]
 
@@ -112,7 +112,7 @@ class TokenizerManager:
         self._cache[cache_key] = tokenizer
         return tokenizer
 
-    def _make_cache_key(self, config: TokenizerConfig) -> str:
+    def _make_cache_key(self, config: TokenizerConfig, extra_kwargs: dict | None = None) -> str:
         """Reduce a :class:`TokenizerConfig` to the parts that affect tokenizer construction.
 
         Only ``name_or_path`` and ``trust_remote_code`` change the
@@ -132,6 +132,11 @@ class TokenizerManager:
             config.name_or_path,
             str(config.trust_remote_code),
         ]
+        if extra_kwargs:
+            # from_pretrained overrides (revision, token, ...) load different
+            # tokenizer objects; omitting them served dataset B with dataset
+            # A's tokenizer whenever only the overrides differed.
+            key_parts.append(repr(sorted(extra_kwargs.items())))
         return ":".join(key_parts)
 
     def tokenize_text(
@@ -139,6 +144,7 @@ class TokenizerManager:
         tokenizer: "PreTrainedTokenizer",
         text: str,
         config: TokenizerConfig,
+        call_kwargs: dict | None = None,
     ) -> dict[str, list[int]]:
         """Tokenize a single string with call-time settings drawn from ``config``.
 
@@ -167,6 +173,7 @@ class TokenizerManager:
             padding=config.padding,
             add_special_tokens=config.add_special_tokens,
             return_attention_mask=config.return_attention_mask,
+            **(call_kwargs or {}),
         )
         return tp.cast(dict[str, list[int]], dict(result))
 
@@ -228,6 +235,7 @@ class TokenizedShardedSource(ShardedDataSource[dict]):
         additional_fields: list[str] | None = None,
         format_callback: "Callable[[dict], dict] | None" = None,
         format_fields: dict[str, str] | None = None,
+        tokenizer_call_kwargs: dict | None = None,
     ):
         """Capture the upstream source, tokenizer, and per-dataset transform settings.
 
@@ -254,6 +262,7 @@ class TokenizedShardedSource(ShardedDataSource[dict]):
         self._additional_fields = additional_fields or []
         self._format_callback = format_callback
         self._format_fields = format_fields or {}
+        self._tokenizer_call_kwargs = tokenizer_call_kwargs or None
         self._manager = TokenizerManager()
 
     @property
@@ -287,11 +296,16 @@ class TokenizedShardedSource(ShardedDataSource[dict]):
         if self._format_callback is not None:
             example = self._format_callback(example)
 
-        # Apply field renaming
+        # Apply field renaming. Simultaneous semantics on a copy: the old
+        # sequential pop-and-assign cascaded ({"a": "b", "b": "c"} moved a's
+        # value THROUGH b into c, destroying b's value) and mutated the row
+        # object yielded by the upstream source.
         if self._format_fields:
+            snapshot = {old: example[old] for old in self._format_fields if old in example}
+            example = {k: v for k, v in example.items() if k not in snapshot}
             for old_name, new_name in self._format_fields.items():
-                if old_name in example:
-                    example[new_name] = example.pop(old_name)
+                if old_name in snapshot:
+                    example[new_name] = snapshot[old_name]
 
         return example
 
@@ -310,6 +324,12 @@ class TokenizedShardedSource(ShardedDataSource[dict]):
 
         # Get text content
         text = example.get(self._content_field, "")
+        if isinstance(text, (list, tuple)):
+            raise TypeError(
+                f"Content field '{self._content_field}' holds a {type(text).__name__}, not a string. "
+                "A list here silently tokenized as a BATCH, producing list-of-list input_ids that "
+                "corrupt downstream packing. Join or explode the field before tokenization."
+            )
         if not text:
             logger.warning(f"Empty content field '{self._content_field}' in example")
             text = ""
@@ -319,6 +339,7 @@ class TokenizedShardedSource(ShardedDataSource[dict]):
             self._tokenizer,
             text,
             self._tokenizer_config,
+            call_kwargs=self._tokenizer_call_kwargs,
         )
 
         # Build result with tokenized data and additional fields
@@ -546,9 +567,12 @@ class TokenizeStage(BaseStage):
                 result[ds_name] = source
                 continue
 
-            # Get tokenizer
-            extra_kwargs = ds_config.tokenizer_kwargs or {}
-            tokenizer = self._tokenizer_manager.get_tokenizer(tok_config, **extra_kwargs)
+            # Get tokenizer. DatasetConfig.tokenizer_kwargs are documented as
+            # CALL-time kwargs (e.g. add_generation_prompt); they were being
+            # sent to from_pretrained, where transformers stashes unknown
+            # kwargs and they silently did nothing.
+            call_kwargs = ds_config.tokenizer_kwargs or None
+            tokenizer = self._tokenizer_manager.get_tokenizer(tok_config)
 
             # Create tokenized source
             tokenized = TokenizedShardedSource(
@@ -556,6 +580,7 @@ class TokenizeStage(BaseStage):
                 tokenizer=tokenizer,
                 tokenizer_config=tok_config,
                 content_field=ds_config.content_field,
+                tokenizer_call_kwargs=call_kwargs,
                 additional_fields=ds_config.additional_fields,
                 format_callback=ds_config.format_callback,
                 format_fields=ds_config.format_fields,

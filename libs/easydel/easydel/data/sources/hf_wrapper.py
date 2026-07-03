@@ -118,10 +118,14 @@ class HFDatasetShardedSource(ShardedDataSource[dict]):
         try:
             from datasets import IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 
-            return isinstance(dataset, IterableDataset)
+            if isinstance(dataset, IterableDataset):
+                return True
         except ImportError:
-            # Fallback: check if it has __len__
-            return not hasattr(dataset, "__len__")
+            pass
+        # Index access needs BOTH __len__ and __getitem__; anything else is
+        # treated as a plain iterable (a sized iterable without __getitem__
+        # used to be classified indexable and crashed at the first batch).
+        return not (hasattr(dataset, "__len__") and hasattr(dataset, "__getitem__"))
 
     @staticmethod
     def _to_example(value: tp.Any) -> dict[str, tp.Any]:
@@ -306,8 +310,10 @@ def wrap_hf_dataset(
     except ImportError:
         pass
 
-    # Check if it looks like a Dataset (duck typing)
-    if hasattr(dataset, "__iter__") and (hasattr(dataset, "__len__") or hasattr(dataset, "__getitem__")):
+    # Check if it looks like a Dataset (duck typing): either iterable, or
+    # fully indexable (__len__ AND __getitem__). Accepting len-or-getitem
+    # admitted objects the shard iterator could not actually consume.
+    if hasattr(dataset, "__iter__") or (hasattr(dataset, "__len__") and hasattr(dataset, "__getitem__")):
         return HFDatasetShardedSource(dataset)
 
     raise TypeError(

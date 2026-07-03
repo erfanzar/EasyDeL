@@ -175,7 +175,16 @@ class Pipeline:
         self._data = {}
         for i, ds_config in enumerate(self._config.datasets):
             name = ds_config.name or f"dataset_{i}"
+            if name in self._data:
+                raise ValueError(
+                    f"Duplicate dataset name {name!r}: a second dataset with the same name would "
+                    "silently replace the first in the pipeline. Give each DatasetConfig a unique name."
+                )
             source = create_source(ds_config)
+            if ds_config.num_rows is not None:
+                from ..transforms.source import LimitedShardedSource
+
+                source = LimitedShardedSource(source, max_rows=int(ds_config.num_rows))
             self._data[name] = source
             logger.info(f"Loaded source for dataset '{name}'")
 
@@ -263,6 +272,11 @@ class Pipeline:
         data = tp.cast(dict[str, ShardedDataSource], self._data)
 
         stage_config = config or self._config.pack
+        if stage_config is not None and not stage_config.enabled:
+            logger.warning(
+                "Pipeline.pack() invoked but PackStageConfig.enabled is False — the stage is a "
+                "no-op. Pass PackStageConfig(enabled=True, ...) if you meant to pack."
+            )
         stage = PackStage(stage_config)
         self._data = stage.process(data, self._context)
         self._stages.append("pack")
@@ -290,6 +304,12 @@ class Pipeline:
         data = tp.cast(dict[str, ShardedDataSource], self._data)
 
         stage_config = config or self._config.save
+        if stage_config is not None and not stage_config.enabled:
+            logger.warning(
+                "Pipeline.save() invoked but SaveStageConfig.enabled is False — the stage is a "
+                "no-op and nothing will be written. Pass SaveStageConfig(enabled=True, ...) if you "
+                "meant to save."
+            )
         stage = SaveStage(stage_config)
         self._data = stage.process(data, self._context)
         self._stages.append("save")
@@ -1478,21 +1498,48 @@ def build_dataset(mixture: DatasetMixture) -> "DS | IDS":
         per_ds_by_name[key] = ds
 
     if mixture.streaming:
+        if mixture.mixture_weights and set(mixture.mixture_weights) != set(per_ds_by_name):
+            raise ValueError(
+                "mixture_weights keys do not match the mixture datasets: "
+                f"weights={sorted(mixture.mixture_weights)} vs datasets={sorted(per_ds_by_name)}. "
+                "A partial/typo'd weight map used to silently fall back to uniform mixing."
+            )
         if getattr(mixture, "block_mixture", False):
-            weights = None
-            if mixture.mixture_weights and len(mixture.mixture_weights) == len(per_ds_by_name):
-                weights = mixture.mixture_weights
             mixed = block_mixture_interleave(
                 per_ds_by_name,
-                weights=weights,
+                weights=mixture.mixture_weights or None,
                 block_size=getattr(mixture, "mixture_block_size", 2048),
                 seed=mixture.seed or 0,
                 stop=getattr(mixture, "stop_strategy", "restart"),
             )
+            # The block mixer interleaves deterministically but does not
+            # decorrelate rows inside each constituent; the configured
+            # shuffle buffer must apply here too (it was silently dropped
+            # on this — the default — path).
+            if mixture.shuffle_buffer_size:
+                mixed = mixed.shuffle(buffer_size=mixture.shuffle_buffer_size, seed=mixture.seed)
         else:
             from datasets import interleave_datasets  # pyright: ignore[reportMissingTypeStubs]
 
-            mixed = interleave_datasets(per_ds, seed=mixture.seed, stopping_strategy="first_exhausted")
+            probabilities = None
+            if mixture.mixture_weights:
+                ordered = [float(mixture.mixture_weights[name]) for name in per_ds_by_name]
+                total = sum(ordered)
+                probabilities = [w / total for w in ordered]
+            stop_strategy = getattr(mixture, "stop_strategy", "first_exhausted")
+            if stop_strategy == "restart":
+                logger.warning(
+                    "stop_strategy='restart' is not supported by datasets.interleave_datasets; "
+                    "using 'all_exhausted' (each dataset is cycled until the largest finishes). "
+                    "Use block_mixture=True for true restart semantics."
+                )
+            hf_stop = "first_exhausted" if stop_strategy == "first_exhausted" else "all_exhausted"
+            mixed = interleave_datasets(
+                per_ds,
+                probabilities=probabilities,
+                seed=mixture.seed,
+                stopping_strategy=hf_stop,
+            )
             if mixture.shuffle_buffer_size:
                 mixed = mixed.shuffle(buffer_size=mixture.shuffle_buffer_size, seed=mixture.seed)
     else:
@@ -1502,6 +1549,12 @@ def build_dataset(mixture: DatasetMixture) -> "DS | IDS":
         mixed = concatenate_datasets(per_ds)
         if mixture.shuffle_buffer_size:
             mixed = mixed.shuffle(seed=mixture.seed)
+        if mixture.mixture_weights:
+            logger.warning(
+                "mixture_weights are ignored in non-streaming mode: datasets are concatenated "
+                "(and only shuffled when shuffle_buffer_size is set). Use streaming=True for "
+                "weighted mixing."
+            )
 
     if getattr(mixture, "pack_tokens", False):
         from datasets import IterableDataset  # pyright: ignore[reportMissingTypeStubs]
@@ -1517,6 +1570,8 @@ def build_dataset(mixture: DatasetMixture) -> "DS | IDS":
                 batch_size=mixture.batch_size,
                 shuffle=mixture.pack_shuffle,
                 buffer_factor=mixture.pack_shuffle_buffer_factor,
+                tokens_field=getattr(mixture, "tokens_field_name", None) or "tokens",
+                seed=mixture.seed,
             )()
 
         return IterableDataset.from_generator(_packed_gen)
@@ -1537,11 +1592,18 @@ def build_dataset(mixture: DatasetMixture) -> "DS | IDS":
                 shuffle=mixture.pack_shuffle,
                 buffer_factor=mixture.pack_shuffle_buffer_factor,
                 tokenize_batch_size=getattr(mixture, "pack_tokenize_batch_size", None),
+                seed=mixture.seed,
             )()
 
         return IterableDataset.from_generator(_packed_otf_gen)
 
-    if mixture.batch_size and mixture.batch_size > 1 and is_streaming(mixed):
-        mixed = mixed.batch(mixture.batch_size)
+    if mixture.batch_size and mixture.batch_size > 1:
+        if hasattr(mixed, "batch"):
+            mixed = mixed.batch(mixture.batch_size)
+        else:
+            logger.warning(
+                f"batch_size={mixture.batch_size} requested but {type(mixed).__name__} has no "
+                ".batch(); rows are yielded unbatched."
+            )
 
     return mixed
