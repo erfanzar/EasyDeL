@@ -39,6 +39,7 @@ from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 
 from ..training_utils import (
+    constrain_batch_sharding,
     ScheduledLossAdapter,
     bind_scheduled_module,
     constrain_scheduled_batch,
@@ -110,7 +111,7 @@ def base_step(
             gradient_accumulation_steps=gradient_accumulation_steps,
             batch_partition_spec=partition_spec,
         )
-        batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
+        batch = constrain_batch_sharding(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
     def loss_fn(tree, minibatch):
         """Compute the base-trainer scalar loss and metrics for one microbatch.
