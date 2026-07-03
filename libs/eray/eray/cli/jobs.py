@@ -87,30 +87,64 @@ _PACKAGE_SKIP_DIRS = frozenset(
 PACKAGE_WARN_BYTES = 500 * 1024**2
 PACKAGE_ABORT_BYTES = 2 * 1024**3
 
-# Ordered error signatures: first match wins the verdict suffix.
-_ERROR_SIGNATURES: tuple[tuple[str, str], ...] = (
-    ("Failed to merge the Job's runtime env", "env-conflict"),
-    ("CompileTimeHbmOom", "oom-compile"),
-    ("RESOURCE_EXHAUSTED", "oom"),
-    ("abstract trainable parameter", "load-incomplete"),
-    ("Traceback (most recent call last)", "remote-raise"),
-)
+# Log-scanning patterns. NOTHING here is baked in: these are the shipped
+# defaults, and every list is overridable (replaced wholesale, not appended)
+# via JSON at ``~/.eray/patterns.json``, ``$ERAY_PATTERNS``, or a
+# project-local ``./.eray-patterns.json`` — later files win. Schema mirrors
+# this dict: errors/phases are ordered [needle, name] pairs (first error hit
+# wins; the *last* phase marker present wins), step_metric/progress_metrics
+# name the ``'metric': value`` fields to surface, spam is a list of regexes
+# filtered out of ``eray logs`` output.
+DEFAULT_PATTERNS: dict = {
+    "errors": [
+        ["Failed to merge the Job's runtime env", "env-conflict"],
+        ["CompileTimeHbmOom", "oom-compile"],
+        ["RESOURCE_EXHAUSTED", "oom"],
+        ["abstract trainable parameter", "load-incomplete"],
+        ["Traceback (most recent call last)", "remote-raise"],
+    ],
+    "phases": [
+        ["Uploading package", "packaging"],
+        ["Loading:", "loading"],
+        ["loaded state step", "loaded"],
+        ["Compiling", "compiling"],
+        ["time took for configure shard", "compiling"],
+        ["Converting shard", "converting"],
+    ],
+    "step_metric": "train_step",
+    "progress_metrics": ["kl_loss", "loss"],
+    "spam": ["tensor/s", "\\.\\.\\.\\s*\\d+%", "\\d+/\\d+ \\[\\d+:\\d+<"],
+}
 
-# Ordered phase markers: the *last* one present in the log tail wins.
-_PHASE_MARKERS: tuple[tuple[str, str], ...] = (
-    ("Uploading package", "packaging"),
-    ("Loading:", "loading"),
-    ("loaded state step", "loaded"),
-    ("Compiling", "compiling"),
-    ("time took for configure shard", "compiling"),
-    ("Converting shard", "converting"),
-)
+PATTERNS_ENV = "ERAY_PATTERNS"
+_PATTERN_FILES = (str(Path.home() / ".eray" / "patterns.json"), "./.eray-patterns.json")
 
-_STEP_RE = re.compile(r"'train_step': (\d+)")
-_KL_RE = re.compile(r"'kl_loss': ([0-9.]+)")
-_LOSS_RE = re.compile(r"'loss': ([0-9.]+)")
 
-_PROGRESS_SPAM_RE = re.compile(r"tensor/s|\.\.\.\s*\d+%|\d+/\d+ \[\d+:\d+<")
+def load_patterns() -> dict:
+    """Merge the default log-scanning patterns with user/project overrides.
+
+    Sources, later wins per top-level key: built-in defaults, then
+    ``~/.eray/patterns.json``, then ``$ERAY_PATTERNS`` (a path), then
+    ``./.eray-patterns.json``.
+    """
+    merged = {k: (list(v) if isinstance(v, list) else v) for k, v in DEFAULT_PATTERNS.items()}
+    paths = [_PATTERN_FILES[0], os.environ.get(PATTERNS_ENV) or "", _PATTERN_FILES[1]]
+    for path in paths:
+        if not path or not os.path.isfile(path):
+            continue
+        try:
+            overrides = json.loads(Path(path).read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            warning(f"ignoring unreadable patterns file {path}: {exc}")
+            continue
+        for key, value in overrides.items():
+            merged[key] = value
+    return merged
+
+
+def _spam_re(patterns: dict) -> re.Pattern:
+    """Compiled alternation of the spam-filter regexes."""
+    return re.compile("|".join(patterns.get("spam") or ["(?!x)x"]))
 
 
 def resolve_address(explicit: str | None) -> str:
@@ -220,7 +254,7 @@ def git_metadata(cwd: str | Path = ".") -> dict[str, str]:
     return meta
 
 
-def scan_log_tail(text: str) -> tuple[str | None, str | None]:
+def scan_log_tail(text: str, patterns: dict | None = None) -> tuple[str | None, str | None]:
     """Extract an error signature and a phase description from a log tail.
 
     Args:
@@ -231,28 +265,31 @@ def scan_log_tail(text: str) -> tuple[str | None, str | None]:
         ``None`` when no failure marker is present) and ``phase`` is the most
         advanced progress marker seen (``step N (kl X)`` once metrics flow).
     """
+    patterns = load_patterns() if patterns is None else patterns
+
     err = None
-    for needle, name in _ERROR_SIGNATURES:
+    for needle, name in patterns.get("errors", ()):
         if needle in text:
             err = name
             break
 
     phase = None
     best_pos = -1
-    for needle, name in _PHASE_MARKERS:
+    for needle, name in patterns.get("phases", ()):
         pos = text.rfind(needle)
         if pos > best_pos:
             best_pos = pos
             phase = name
-    steps = _STEP_RE.findall(text)
-    if steps:
-        phase = f"step {steps[-1]}"
-        kls = _KL_RE.findall(text)
-        losses = _LOSS_RE.findall(text)
-        if kls:
-            phase += f" (kl {kls[-1]})"
-        elif losses:
-            phase += f" (loss {losses[-1]})"
+    step_metric = patterns.get("step_metric")
+    step = latest_metric(text, step_metric) if step_metric else None
+    if step is not None:
+        phase = f"step {int(step)}"
+        for metric in patterns.get("progress_metrics", ()):
+            value = latest_metric(text, metric)
+            if value is not None:
+                short = metric.removesuffix("_loss") or metric
+                phase += f" ({short} {value:g})"
+                break
     return err, phase
 
 
@@ -384,6 +421,7 @@ def _parse_env_file(path: str) -> dict[str, str]:
 @click.option("--id", "submission_id", default=None, help="Submission id (default: derived from script+user+time).")
 @click.option("--force-package", is_flag=True, default=False, help="Skip the working-dir size guard.")
 @click.option("--follow", "-f", is_flag=True, default=False, help="Tail driver logs after submitting.")
+@click.option("--queue", is_flag=True, default=False, help="Wait until no job is running before submitting.")
 def run(
     entrypoint,
     address,
@@ -395,6 +433,7 @@ def run(
     submission_id,
     force_package,
     follow,
+    queue,
 ):
     """Submit a job: eray run [opts] -- <command...>.
 
@@ -437,6 +476,17 @@ def run(
     metadata = {"cwd": os.getcwd(), "user": getpass.getuser(), **git_metadata()}
 
     client = make_client(address)
+    if queue:
+        while True:
+            busy = [
+                j.submission_id
+                for j in client.list_jobs()
+                if str(getattr(j.status, "value", j.status)).upper() in ("RUNNING", "PENDING")
+            ]
+            if not busy:
+                break
+            info(f"queued behind {busy[0]}" + (f" (+{len(busy) - 1} more)" if len(busy) > 1 else "") + " …")
+            time.sleep(30)
     submitted = client.submit_job(
         entrypoint=" ".join(shlex.quote(t) for t in entrypoint),
         submission_id=sid,
@@ -553,13 +603,15 @@ def logs(job_id, address, errors, pattern, raw, follow):
         return
 
     text = client.get_job_logs(job_id) or ""
+    patterns = load_patterns()
+    spam_re = _spam_re(patterns)
     matcher = re.compile(pattern) if pattern else None
     in_traceback = False
     for line in text.splitlines():
         if errors:
             if "Traceback (most recent call last)" in line:
                 in_traceback = True
-            sig_hit = any(needle in line for needle, _ in _ERROR_SIGNATURES)
+            sig_hit = any(needle in line for needle, _ in patterns.get("errors", ()))
             if in_traceback or sig_hit:
                 print(line)
                 if in_traceback and line and not line.startswith((" ", "\t")) and "Traceback" not in line:
@@ -567,7 +619,7 @@ def logs(job_id, address, errors, pattern, raw, follow):
             continue
         if matcher and not matcher.search(line):
             continue
-        if not raw and _PROGRESS_SPAM_RE.search(line):
+        if not raw and spam_re.search(line):
             continue
         print(line)
 
@@ -594,3 +646,349 @@ def register(cli_group: click.Group) -> None:
     cli_group.add_command(status, name="ps")
     cli_group.add_command(logs)
     cli_group.add_command(stop)
+    cli_group.add_command(watch)
+    cli_group.add_command(doctor)
+    cli_group.add_command(clean)
+    cli_group.add_command(nodes)
+    cli_group.add_command(rerun)
+    cli_group.add_command(diff)
+
+
+# ── P2/P3: watch, doctor, clean, nodes, rerun, diff ──────────────
+
+_ALERT_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(>=|<=|>|<)\s*([0-9.]+)\s*$")
+
+
+def latest_metric(text: str, name: str) -> float | None:
+    """Latest value of ``'name': X`` style metric in a log tail."""
+    values = re.findall(rf"'{re.escape(name)}': ([0-9.]+)", text)
+    return float(values[-1]) if values else None
+
+
+def evaluate_alerts(text: str, exprs: tuple[str, ...]) -> list[str]:
+    """Evaluate ``metric>threshold`` style alert expressions against a log tail.
+
+    Args:
+        text: Driver-log tail.
+        exprs: Expressions like ``kl_loss>5`` or ``train_step_time>=120``.
+
+    Returns:
+        Human-readable violation strings for every alert that fires.
+
+    Raises:
+        click.UsageError: On a malformed expression.
+    """
+    ops = {">": float.__gt__, "<": float.__lt__, ">=": float.__ge__, "<=": float.__le__}
+    fired = []
+    for expr in exprs:
+        m = _ALERT_RE.match(expr)
+        if not m:
+            raise click.UsageError(f"bad --alert {expr!r}; expected e.g. kl_loss>5")
+        name, op, threshold = m.group(1), m.group(2), float(m.group(3))
+        value = latest_metric(text, name)
+        if value is not None and ops[op](value, threshold):
+            fired.append(f"{name}={value} {op} {threshold}")
+    return fired
+
+
+@click.command()
+@click.argument("job_id", default="last")
+@click.option("--address", "-a", default=None, help="Ray dashboard address.")
+@click.option("--interval", default=30, show_default=True, help="Poll interval seconds.")
+@click.option("--until-step", default=None, type=int, help="Exit 0 once this train_step is reached.")
+@click.option("--alert", "alerts", multiple=True, help="Fire on metric threshold, e.g. 'kl_loss>5' (repeatable).")
+@click.option("--timeout-min", default=120, show_default=True, help="Give up after this many minutes.")
+def watch(job_id, address, interval, until_step, alerts, timeout_min):
+    """Watch a job: phase transitions, metric alerts, error signatures.
+
+    Exit codes: 0 until-step reached or job succeeded; 1 error signature or
+    job failed; 2 an --alert fired; 3 watch timeout.
+    """
+    client = make_client(address)
+    if job_id == "last":
+        job_id = _resolve_last(client)
+        if job_id is None:
+            error("no jobs found.")
+            raise SystemExit(1)
+        info(f"watching {job_id}")
+
+    deadline = time.time() + timeout_min * 60
+    last_phase = None
+    while time.time() < deadline:
+        tail = get_log_tail(client, job_id, max_bytes=131072)
+        err_sig, phase = scan_log_tail(tail)
+        if phase and phase != last_phase:
+            info(f"phase: {phase}")
+            last_phase = phase
+        if err_sig:
+            error(f"error signature: {err_sig}")
+            raise SystemExit(1)
+        fired = evaluate_alerts(tail, alerts)
+        if fired:
+            for f in fired:
+                error(f"alert: {f}")
+            raise SystemExit(2)
+        if until_step is not None:
+            step = latest_metric(tail, "train_step")
+            if step is not None and step >= until_step:
+                info(f"reached step {int(step)}")
+                raise SystemExit(0)
+        try:
+            state = str(getattr(client.get_job_status(job_id), "value", ""))
+            if state in ("SUCCEEDED", "FAILED", "STOPPED"):
+                info(f"job ended: {state} — verdict {verdict_for(state, err_sig)}")
+                raise SystemExit(0 if state == "SUCCEEDED" and not err_sig else 1)
+        except SystemExit:
+            raise
+        except Exception:
+            pass
+        time.sleep(interval)
+    error("watch timeout.")
+    raise SystemExit(3)
+
+
+def component_log_report(max_bytes: int) -> list[dict]:
+    """Sizes of Ray component logs on this host, flagged when oversized."""
+    from ..core.monitoring import _RAYLET_LOG_GUARD_FILES, _ray_session_log_dirs
+
+    rows = []
+    for logs_dir in _ray_session_log_dirs():
+        for name in _RAYLET_LOG_GUARD_FILES:
+            path = os.path.join(logs_dir, name)
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            rows.append({"path": path, "bytes": size, "flagged": size > max_bytes})
+    return rows
+
+
+def referenced_packages(jobs_list) -> set[str]:
+    """Package basenames referenced by live jobs' runtime envs."""
+    keep: set[str] = set()
+    for job in jobs_list:
+        state = str(getattr(job.status, "value", job.status)).upper()
+        if state not in ("RUNNING", "PENDING"):
+            continue
+        env = getattr(job, "runtime_env", None) or {}
+        wd = str(env.get("working_dir", ""))
+        if "_ray_pkg_" in wd:
+            keep.add(os.path.basename(wd).replace(".zip", ""))
+    return keep
+
+
+def find_stale_packages(session_dir: str, referenced: set[str]) -> list[tuple[str, int]]:
+    """Unreferenced ``_ray_pkg_*`` working-dir snapshots under a session dir."""
+    stale: list[tuple[str, int]] = []
+    root = os.path.join(session_dir, "runtime_resources", "working_dir_files")
+    if not os.path.isdir(root):
+        return stale
+    for entry in os.listdir(root):
+        if not entry.startswith("_ray_pkg_") or entry.replace(".zip", "") in referenced:
+            continue
+        path = os.path.join(root, entry)
+        size = package_size_bytes(path) if os.path.isdir(path) else os.path.getsize(path)
+        stale.append((path, size))
+    return stale
+
+
+@click.command()
+@click.option("--address", "-a", default=None, help="Ray dashboard address.")
+@click.option("--log-max-gb", default=5.0, show_default=True, help="Component-log size flag threshold.")
+def doctor(address, log_max_gb):
+    """Host + cluster health: disk, raylet-log spam, packages, nodes, jobs API."""
+    import shutil
+
+    exit_code = 0
+
+    for mount in dict.fromkeys(["/", os.environ.get("RAY_TMPDIR") or "/tmp"]):
+        try:
+            usage = shutil.disk_usage(mount)
+        except OSError:
+            continue
+        pct = usage.used / usage.total * 100
+        line = f"disk {mount}: {usage.free / 1024**3:.1f} GB free ({pct:.0f}% used)"
+        if pct > 90:
+            error(line + "  ← CRITICAL")
+            exit_code = 1
+        elif pct > 80:
+            warning(line)
+        else:
+            info(line)
+
+    max_bytes = int(log_max_gb * 1024**3)
+    for row in component_log_report(max_bytes):
+        line = f"log {row['path']}: {row['bytes'] / 1024**3:.2f} GB"
+        if row["flagged"]:
+            error(line + "  ← oversized, run: eray clean raylet")
+            exit_code = 1
+        elif row["bytes"] > max_bytes // 4:
+            warning(line)
+
+    client = None
+    try:
+        client = make_client(address)
+        jobs_list = client.list_jobs()
+        running = sum(1 for j in jobs_list if str(getattr(j.status, "value", j.status)).upper() == "RUNNING")
+        info(f"jobs API reachable: {len(jobs_list)} jobs known, {running} running")
+    except Exception as exc:
+        error(f"jobs API unreachable: {exc}")
+        exit_code = 1
+
+    if client is not None:
+        try:
+            from ..core.monitoring import _ray_session_log_dirs
+
+            for logs_dir in _ray_session_log_dirs():
+                session_dir = os.path.dirname(logs_dir)
+                stale = find_stale_packages(session_dir, referenced_packages(client.list_jobs()))
+                if stale:
+                    total = sum(s for _, s in stale)
+                    warning(
+                        f"{len(stale)} stale working-dir package(s), {total / 1024**3:.1f} GB "
+                        f"under {session_dir} — run: eray clean packages"
+                    )
+        except Exception:
+            pass
+
+    try:
+        from ray.util.state import list_nodes
+
+        nodes_list = list_nodes(address=resolve_address(address), limit=1000)
+        alive = sum(1 for n in nodes_list if str(getattr(n, "state", "")).upper() == "ALIVE")
+        line = f"nodes: {alive}/{len(nodes_list)} alive"
+        (info if alive == len(nodes_list) else warning)(line)
+    except Exception as exc:
+        warning(f"node state API unavailable: {exc}")
+
+    raise SystemExit(exit_code)
+
+
+@click.group()
+def clean() -> None:
+    """Reclaim disk: oversized Ray logs, stale working-dir packages."""
+
+
+@clean.command("raylet")
+@click.option("--max-gb", default=5.0, show_default=True, help="Truncate component logs above this size.")
+def clean_raylet(max_gb):
+    """Truncate oversized raylet/GCS logs in place (safe on the live daemon)."""
+    from ..core.monitoring import sweep_raylet_logs
+
+    truncated = sweep_raylet_logs(max_bytes=int(max_gb * 1024**3))
+    if not truncated:
+        info("nothing to truncate.")
+        return
+    for path, size in truncated:
+        info(f"truncated {path} (was {size / 1024**3:.1f} GB)")
+
+
+@clean.command("packages")
+@click.option("--address", "-a", default=None, help="Ray dashboard address.")
+@click.option("--yes", is_flag=True, default=False, help="Actually delete (default: dry run).")
+def clean_packages(address, yes):
+    """Delete _ray_pkg_* snapshots not referenced by any live job."""
+    import shutil
+
+    from ..core.monitoring import _ray_session_log_dirs
+
+    try:
+        referenced = referenced_packages(make_client(address).list_jobs())
+    except Exception:
+        warning("jobs API unreachable — refusing to guess which packages are live.")
+        raise SystemExit(1) from None
+
+    found = False
+    for logs_dir in _ray_session_log_dirs():
+        for path, size in find_stale_packages(os.path.dirname(logs_dir), referenced):
+            found = True
+            if yes:
+                shutil.rmtree(path, ignore_errors=True) if os.path.isdir(path) else os.unlink(path)
+                info(f"deleted {path} ({size / 1024**2:.0f} MB)")
+            else:
+                info(f"stale: {path} ({size / 1024**2:.0f} MB)  [dry run — pass --yes to delete]")
+    if not found:
+        info("no stale packages.")
+
+
+@click.command()
+@click.option("--address", "-a", default=None, help="Ray dashboard address.")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Output as JSON.")
+def nodes(address, as_json):
+    """Cluster nodes: alive/dead and TPU resource totals."""
+    from ray.util.state import list_nodes
+
+    nodes_list = list_nodes(address=resolve_address(address), limit=1000)
+    rows = []
+    for n in nodes_list:
+        resources = getattr(n, "resources_total", None) or {}
+        rows.append(
+            {
+                "ip": getattr(n, "node_ip", "?"),
+                "state": str(getattr(n, "state", "?")),
+                "tpu": int(resources.get("TPU", 0)),
+                "head": bool(resources.get("head-node", 0)),
+            }
+        )
+    alive = sum(1 for r in rows if r["state"].upper() == "ALIVE")
+    tpus = sum(r["tpu"] for r in rows if r["state"].upper() == "ALIVE")
+    if as_json:
+        print(json.dumps({"alive": alive, "total": len(rows), "tpu_total": tpus, "nodes": rows}, indent=2))
+        return
+    info(f"{alive}/{len(rows)} nodes alive, {tpus} TPU chips")
+    for r in sorted(rows, key=lambda r: (not r["head"], r["ip"])):
+        marker = " (head)" if r["head"] else ""
+        line = f"  {r['ip']:<16} {r['state']:<6} TPU={r['tpu']}{marker}"
+        print(line if r["state"].upper() == "ALIVE" else f"{RED}{line}{NC}")
+
+
+@click.command()
+@click.argument("job_id", default="last")
+@click.option("--address", "-a", default=None, help="Ray dashboard address.")
+@click.option("--id", "new_id", default=None, help="Submission id for the rerun.")
+def rerun(job_id, address, new_id):
+    """Resubmit a previous job with its recorded entrypoint and runtime env."""
+    client = make_client(address)
+    if job_id == "last":
+        job_id = _resolve_last(client)
+        if job_id is None:
+            error("no jobs found.")
+            raise SystemExit(1)
+    job = client.get_job_info(job_id)
+    sid = new_id or f"{job_id}-r{datetime.now(UTC).strftime('%H%M%S')}"
+    submitted = client.submit_job(
+        entrypoint=job.entrypoint,
+        submission_id=sid,
+        runtime_env=getattr(job, "runtime_env", None),
+        metadata={**(getattr(job, "metadata", None) or {}), "rerun_of": job_id},
+    )
+    info(f"resubmitted {job_id} as {submitted}")
+
+
+@click.command()
+@click.argument("job_a")
+@click.argument("job_b")
+@click.option("--address", "-a", default=None, help="Ray dashboard address.")
+def diff(job_a, job_b, address):
+    """Compare two jobs: entrypoint, git provenance, env-var deltas."""
+    client = make_client(address)
+    infos = {jid: client.get_job_info(jid) for jid in (job_a, job_b)}
+
+    def _field(jid, name):
+        return (getattr(infos[jid], "metadata", None) or {}).get(name, "-")
+
+    for name in ("git_sha", "git_dirty", "cwd", "user"):
+        va, vb = _field(job_a, name), _field(job_b, name)
+        print(f"{name:<10} {va:<24} {'==' if va == vb else '!='} {vb}")
+    ea, eb = infos[job_a].entrypoint or "", infos[job_b].entrypoint or ""
+    print(f"{'entrypoint':<10} {'==' if ea == eb else '!='}  {ea!r}  vs  {eb!r}")
+
+    env_a = ((getattr(infos[job_a], "runtime_env", None) or {}).get("env_vars")) or {}
+    env_b = ((getattr(infos[job_b], "runtime_env", None) or {}).get("env_vars")) or {}
+    for key in sorted(set(env_a) | set(env_b)):
+        va, vb = env_a.get(key), env_b.get(key)
+        if va == vb:
+            continue
+        fa = "<unset>" if va is None else mask_value(key, va)
+        fb = "<unset>" if vb is None else mask_value(key, vb)
+        print(f"env {key}: {fa} -> {fb}")

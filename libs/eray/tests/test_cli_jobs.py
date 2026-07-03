@@ -18,6 +18,7 @@ import time
 from types import SimpleNamespace
 
 from click.testing import CliRunner
+
 from eray.cli import jobs
 
 
@@ -208,3 +209,103 @@ class TestStopCommand:
         runner = CliRunner()
         result = runner.invoke(jobs.stop, [])
         assert result.exit_code != 0
+
+
+class TestPatternsConfig:
+    def test_defaults_used_without_override(self):
+        err, phase = jobs.scan_log_tail("Traceback (most recent call last):\n{'train_step': 4, 'kl_loss': 1.5}")
+        assert err == "remote-raise"
+        assert phase == "step 4 (kl 1.5)"
+
+    def test_project_override_replaces_patterns(self, monkeypatch, tmp_path):
+        override = tmp_path / "patterns.json"
+        override.write_text(
+            '{"errors": [["MY_FATAL", "custom-fatal"]], "step_metric": "iter", "progress_metrics": ["ppl"]}'
+        )
+        monkeypatch.setenv(jobs.PATTERNS_ENV, str(override))
+        patterns = jobs.load_patterns()
+        err, phase = jobs.scan_log_tail("MY_FATAL happened\n{'iter': 12, 'ppl': 3.5}", patterns)
+        assert err == "custom-fatal"
+        assert phase == "step 12 (ppl 3.5)"
+        # default errors were replaced wholesale, not appended
+        err2, _ = jobs.scan_log_tail("Traceback (most recent call last):", patterns)
+        assert err2 is None
+
+    def test_unreadable_override_is_ignored(self, monkeypatch, tmp_path):
+        bad = tmp_path / "bad.json"
+        bad.write_text("{not json")
+        monkeypatch.setenv(jobs.PATTERNS_ENV, str(bad))
+        patterns = jobs.load_patterns()
+        assert patterns["step_metric"] == "train_step"
+
+
+class TestAlerts:
+    def test_alert_fires_on_latest_value(self):
+        text = "{'kl_loss': 1.0}\n{'kl_loss': 9.2}"
+        assert jobs.evaluate_alerts(text, ("kl_loss>5",)) == ["kl_loss=9.2 > 5.0"]
+
+    def test_alert_quiet_below_threshold_or_missing(self):
+        assert jobs.evaluate_alerts("{'kl_loss': 1.0}", ("kl_loss>5", "step_time>120")) == []
+
+    def test_bad_expression_raises(self):
+        import click as _click
+        import pytest as _pytest
+
+        with _pytest.raises(_click.UsageError):
+            jobs.evaluate_alerts("", ("kl_loss !! 5",))
+
+
+class TestPackagesCleanup:
+    def test_stale_detection_respects_referenced(self, tmp_path):
+        wdf = tmp_path / "runtime_resources" / "working_dir_files"
+        wdf.mkdir(parents=True)
+        (wdf / "_ray_pkg_live").mkdir()
+        (wdf / "_ray_pkg_live" / "f").write_bytes(b"x" * 10)
+        (wdf / "_ray_pkg_stale").mkdir()
+        (wdf / "_ray_pkg_stale" / "f").write_bytes(b"y" * 20)
+        (wdf / "unrelated").mkdir()
+
+        stale = jobs.find_stale_packages(str(tmp_path), {"_ray_pkg_live"})
+        assert [(p.rsplit("/", 1)[-1], s) for p, s in stale] == [("_ray_pkg_stale", 20)]
+
+    def test_referenced_packages_from_live_jobs(self):
+        running = _job("a", "RUNNING")
+        running.runtime_env = {"working_dir": "gcs://_ray_pkg_live.zip"}
+        done = _job("b", "SUCCEEDED", ended=True)
+        done.runtime_env = {"working_dir": "gcs://_ray_pkg_old.zip"}
+        assert jobs.referenced_packages([running, done]) == {"_ray_pkg_live"}
+
+
+class TestRerun:
+    def test_rerun_resubmits_recorded_env(self, monkeypatch):
+        class FakeInfoClient(FakeClient):
+            def get_job_info(self, sid):
+                return SimpleNamespace(
+                    submission_id=sid,
+                    entrypoint="python launch.py",
+                    runtime_env={"env_vars": {"HF_TOKEN": "x"}},
+                    metadata={"git_sha": "abc"},
+                    status="STOPPED",
+                    start_time=0,
+                    end_time=1,
+                )
+
+        fake = FakeInfoClient()
+        monkeypatch.setattr(jobs, "make_client", lambda address: fake)
+        runner = CliRunner()
+        result = runner.invoke(jobs.rerun, ["old-job"])
+        assert result.exit_code == 0, result.output
+        assert fake.submitted["entrypoint"] == "python launch.py"
+        assert fake.submitted["runtime_env"] == {"env_vars": {"HF_TOKEN": "x"}}
+        assert fake.submitted["metadata"]["rerun_of"] == "old-job"
+        assert fake.submitted["submission_id"].startswith("old-job-r")
+
+
+class TestBounceGate:
+    def test_bounce_requires_confirmation(self):
+        from eray.cli.main import cli
+
+        runner = CliRunner()
+        result = runner.invoke(cli, ["tpu", "bounce", "--ips", "10.0.0.1", "--tpu-type", "v4-8"])
+        assert result.exit_code != 0
+        assert "yes-kill-jobs" in result.output

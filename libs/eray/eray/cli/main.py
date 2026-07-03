@@ -196,6 +196,50 @@ _ssh_key_opt = click.option("--ssh-key", default=None, help="SSH key path for di
 @_user_opt
 @_ssh_key_opt
 @click.option("--ray-bin", default="ray", help="Path to ray binary on hosts.")
+@click.option("--ray-tmp-dir", default=None, help="Temp dir for Ray on hosts (default: keep tpu.py default).")
+@click.option("--timeout", "-t", default=300, help="Cluster readiness timeout (seconds).")
+@click.option(
+    "--yes-kill-jobs", is_flag=True, default=False, help="Confirm: this restarts Ray and kills every running job."
+)
+def bounce(tpu_name, project, zone, ips, tpu_type, user, ssh_key, ray_bin, ray_tmp_dir, timeout, yes_kill_jobs):
+    """Restart Ray on every host: stop --force, then reconnect the cluster.
+
+    The permanent fix for a raylet stuck spamming its component log (Ray does
+    not rotate raylet/GCS logs): a fresh raylet has no dead-driver retry
+    state. Kills all running jobs — hence the explicit confirmation flag.
+    """
+    if not yes_kill_jobs:
+        raise click.UsageError("eray tpu bounce restarts the cluster and kills every running job; pass --yes-kill-jobs.")
+    from .tpu import RAY_TMP_DIR
+
+    resolved, direct_user, direct_key = _resolve_tpu(tpu_name, project, zone, ips, tpu_type, user, ssh_key)
+    disconnect_tpus(resolved, ray_bin=ray_bin, user=direct_user, ssh_key=direct_key)
+    try:
+        result = connect_tpus(
+            resolved,
+            ray_bin=ray_bin,
+            ray_tmp_dir=ray_tmp_dir or RAY_TMP_DIR,
+            timeout=timeout,
+            user=direct_user,
+            ssh_key=direct_key,
+        )
+    except RuntimeError as exc:
+        error(str(exc))
+        raise click.ClickException(str(exc)) from exc
+    success("cluster bounced.")
+    info(f"  Ray address:  {result.ray_address}")
+    info(f"  Dashboard:    {result.dashboard_url}")
+
+
+@tpu.command()
+@_tpu_name_opt
+@_project_opt
+@_zone_opt
+@_ips_opt
+@_tpu_type_opt
+@_user_opt
+@_ssh_key_opt
+@click.option("--ray-bin", default="ray", help="Path to ray binary on hosts.")
 @click.option("--ray-tmp-dir", default="/tmp/eray_tmp", help="Temp dir for Ray on hosts.")
 @click.option("--timeout", "-t", default=300, help="Cluster readiness timeout (seconds).")
 @click.option("--json", "as_json", is_flag=True, default=False, help="Output result as JSON.")
