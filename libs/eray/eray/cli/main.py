@@ -162,6 +162,13 @@ def cli(verbose: bool) -> None:
     logging.basicConfig(level=level, format="%(message)s", stream=sys.stderr)
 
 
+# ── Job subcommands (run / status / logs / stop) ─────────────────
+
+from .jobs import register as _register_job_commands  # noqa: E402
+
+_register_job_commands(cli)
+
+
 # ── TPU subcommands ──────────────────────────────────────────────
 
 
