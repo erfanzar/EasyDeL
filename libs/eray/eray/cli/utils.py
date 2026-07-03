@@ -484,7 +484,6 @@ def ssh_tpu_worker(
         tpu.zone,
         "--command",
         command,
-        "--no-tty-through-ssh",
     ]
     return run_command(cmd, timeout=timeout, check=False)
 
