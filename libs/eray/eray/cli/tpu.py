@@ -23,6 +23,7 @@ Both modes produce the same Ray cluster with TPU custom resources.
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import socket
 import time
@@ -146,34 +147,43 @@ def connect_tpus(
         raise RuntimeError("Ray head failed to start")
     success("Ray head started")
 
-    # --- Step 3: Start Ray workers ---
+    # --- Step 3: Start Ray workers (parallel fan-out) ---
     worker_resources = build_ray_resource_flags(tpu, is_head=False)
-    for host_idx in range(1, tpu.num_hosts):
-        worker_ip = tpu.internal_ips[host_idx]
-        info(f"Starting Ray worker {host_idx} ({worker_ip}) → {ray_address}...")
-
-        # Wait for head port to be reachable
+    if tpu.num_hosts > 1:
+        # One reachability check for the head port; per-worker checks would
+        # serialize the join for no benefit.
         if not _wait_for_port(head_ip, RAY_HEAD_PORT):
-            error(f"Ray head port {RAY_HEAD_PORT} not reachable from worker {host_idx}")
+            error(f"Ray head port {RAY_HEAD_PORT} not reachable")
             raise RuntimeError(f"Cannot reach head at {ray_address}")
 
-        worker_cmd = (
-            f"export TMPDIR={ray_tmp_dir} RAY_TMPDIR={ray_tmp_dir}/ray && "
-            f"mkdir -p $TMPDIR $RAY_TMPDIR && "
-            f"{ray_bin} stop --force >/dev/null 2>&1 || true && "
-            f"{ray_bin} start "
-            f"--address={ray_address} "
-            f"--resources='{worker_resources}' "
-            f"--node-ip-address={worker_ip} "
-            f"--disable-usage-stats"
-        )
-        result = run_on_host(tpu, host_idx, worker_cmd, timeout=120, user=user, ssh_key=ssh_key)
-        if result.returncode != 0:
-            error(f"Ray worker {host_idx} failed to start")
-            if result.stderr:
-                error(result.stderr.strip())
-            raise RuntimeError(f"Ray worker {host_idx} failed")
-        success(f"Ray worker {host_idx} started")
+        def _start_worker(host_idx: int):
+            worker_ip = tpu.internal_ips[host_idx]
+            worker_cmd = (
+                f"export TMPDIR={ray_tmp_dir} RAY_TMPDIR={ray_tmp_dir}/ray && "
+                f"mkdir -p $TMPDIR $RAY_TMPDIR && "
+                f"{ray_bin} stop --force >/dev/null 2>&1 || true && "
+                f"{ray_bin} start "
+                f"--address={ray_address} "
+                f"--resources='{worker_resources}' "
+                f"--node-ip-address={worker_ip} "
+                f"--disable-usage-stats"
+            )
+            return host_idx, run_on_host(tpu, host_idx, worker_cmd, timeout=120, user=user, ssh_key=ssh_key)
+
+        info(f"Starting {tpu.num_hosts - 1} Ray workers in parallel → {ray_address}...")
+        failed_workers: list[int] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=tpu.num_hosts - 1) as pool:
+            for host_idx, result in pool.map(_start_worker, range(1, tpu.num_hosts)):
+                if result.returncode != 0:
+                    error(f"Ray worker {host_idx} failed to start")
+                    if result.stderr:
+                        error(result.stderr.strip())
+                    failed_workers.append(host_idx)
+        if failed_workers:
+            raise RuntimeError(
+                f"{len(failed_workers)} Ray workers failed to start (e.g. {failed_workers[:8]})"
+            )
+        success(f"All {tpu.num_hosts - 1} Ray workers started")
 
     # --- Step 4: Wait for cluster readiness ---
     info(f"Waiting for cluster readiness ({tpu.num_hosts} nodes, {ray_address})...")
