@@ -6589,6 +6589,62 @@ class BaseTrainer(BaseTrainerProtocol):
             f" (host_tracer_level={host_level}, python_tracer_level={python_level})."
         )
 
+    def _maybe_stop_profiler(self, current_step: int) -> None:
+        """Stop the profiler trace early when ``profiler_stop_step`` is reached.
+
+        Called from the inner training loop after each step. No-ops unless a
+        trace is active and ``arguments.profiler_stop_step`` is set. This lets
+        a production-config run record a bounded few-step trace and keep
+        training instead of tracing until the run ends.
+
+        Args:
+            current_step: Global training step after the most recent
+                optimizer apply.
+        """
+        if not getattr(self, "_profiler_active", False):
+            return
+        stop_step = getattr(self.arguments, "profiler_stop_step", None)
+        if stop_step is None or current_step < int(stop_step):
+            return
+        logger.info(f"profiler_stop_step={stop_step} reached at step {current_step}; closing trace.")
+        self._stop_profiler()
+
+    def _log_mesh_topology(self) -> None:
+        """Log the physical TPU coords backing each mesh axis (rank 0, once).
+
+        For every mesh axis of size > 1, prints the ``device.coords`` of the
+        devices along that axis at the origin of the other axes. This makes
+        the logical-axis -> physical-torus mapping visible in the run log, so
+        collective-bandwidth hypotheses (e.g. "is fsdp a wrapped 2D subgrid or
+        a strided line?") can be checked from evidence. No-op on non-TPU
+        backends (no ``coords``) and on non-zero ranks.
+        """
+        if jax.process_index() != 0:
+            return
+        mesh = getattr(getattr(self, "model", None), "mesh", None)
+        devices = getattr(mesh, "devices", None)
+        if devices is None or not hasattr(devices, "ndim"):
+            return
+        sample = next((d for d in devices.flat if d is not None), None)
+        if sample is None or not hasattr(sample, "coords"):
+            return
+        try:
+            lines = []
+            for axis_index, name in enumerate(mesh.axis_names):
+                axis_size = int(devices.shape[axis_index])
+                if axis_size == 1:
+                    continue
+                index: list = [0] * devices.ndim
+                index[axis_index] = slice(None)
+                coords = [tuple(d.coords) for d in np.asarray(devices[tuple(index)]).flat]
+                head = ", ".join(map(str, coords[:8]))
+                tail = "" if len(coords) <= 8 else f", ... ({len(coords)} total)"
+                lines.append(f"  {name}[{axis_size}]: {head}{tail}")
+            if lines:
+                logger.info("Mesh axis -> physical TPU coords (origin line):\n" + "\n".join(lines))
+        except Exception as exc:  # pragma: no cover - diagnostics only
+            logger.debug(f"mesh topology log skipped: {exc}")
+
     def _stop_profiler(self) -> None:
         """Stop the JAX profiler trace if one is active. Idempotent / safe to call.
 

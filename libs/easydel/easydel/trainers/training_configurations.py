@@ -741,6 +741,17 @@ class TrainingArguments:
             )
         },
     )
+    profiler_stop_step: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Stop the JAX profiler trace once the global step reaches this value, so a "
+                "production run can capture a bounded few-step trace instead of tracing to the "
+                "end of training. The trace starts after step 1 (see `profiler_path`); e.g. "
+                "profiler_stop_step=6 captures steps 2-6. None traces until training finishes."
+            )
+        },
+    )
     profiler_log_all_workers: bool = field(
         default=False,
         metadata={

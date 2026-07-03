@@ -604,6 +604,7 @@ class Trainer(BaseTrainer):
             epoch_end_step=epoch_end_step,
             epoch_total_steps=epoch_total_steps,
         )
+        self._log_mesh_topology()
         prefetcher: TrainBatchPrefetcher | None = None
         bucket_prefetchers: dict[int, TrainBatchPrefetcher] = {}
         prefetch_workers = max(int(getattr(self.arguments, "dataloader_prefetch_workers", 1) or 1), 1)
@@ -785,6 +786,7 @@ class Trainer(BaseTrainer):
                 # The first step's wall-time is dominated by JIT compile;
                 # skipping it gives a profile of steady-state training.
                 self._maybe_start_profiler(current_step)
+                self._maybe_stop_profiler(current_step)
                 try:
                     self._runtime_trace("train_step.host_metrics.begin", epoch=epoch, current_step=current_step)
                     loss_value = self._metric_scalar_to_float(metrics.loss)
