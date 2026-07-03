@@ -321,3 +321,41 @@ class TestProgressMetricsDisplay:
         text = "{'kl_loss': 1.5, 'loss': 2.0, 'train_step': 9, 'train_step_time': 81.2}"
         _, phase = jobs.scan_log_tail(text)
         assert phase == "step 9 (kl 1.5, loss 2, s/step 81.2)"
+
+
+class TestMetricsTable:
+    def test_extract_metric_rows(self):
+        text = (
+            "{'loss': 3.0, 'train_step': 1, 'kl_loss': 3.0, 'train_step_time': 992.2}\n"
+            "noise line\n"
+            "{'loss': 2.9, 'train_step': 2, 'kl_loss': 2.9, 'train_step_time': 79.8}\n"
+            "{'loss': 2.9, 'train_step': 2, 'kl_loss': 2.9, 'train_step_time': 79.8}\n"  # dup step
+        )
+        rows = jobs.extract_metric_rows(text)
+        assert [r["step"] for r in rows] == [1, 2]
+        assert rows[1]["kl"] == "2.9"
+        assert rows[1]["s/step"] == "79.8"
+
+
+class TestDeadSessions:
+    def test_dead_session_detection(self, tmp_path, monkeypatch):
+        root = tmp_path / "ray"
+        live = root / "session_2026-07-03_live"
+        dead = root / "session_2026-06-01_old"
+        for d in (live / "logs", dead / "logs"):
+            d.mkdir(parents=True)
+        (dead / "logs" / "raylet.out").write_bytes(b"x" * 100)
+        (root / "session_latest").symlink_to(live)
+        import eray.core.monitoring as monitoring
+
+        monkeypatch.setattr(monitoring, "_ray_session_log_dirs", lambda: [str(live / "logs")])
+        found = jobs.find_dead_sessions()
+        assert [(p.rsplit("/", 1)[-1], s) for p, s in found] == [("session_2026-06-01_old", 100)]
+
+
+class TestTpuDeviceHolders:
+    def test_returns_list_without_error(self):
+        holders = jobs.tpu_device_holders()
+        assert isinstance(holders, list)
+        for h in holders:
+            assert {"pid", "device", "cmd"} <= set(h)

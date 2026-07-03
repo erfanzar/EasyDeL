@@ -19,11 +19,20 @@ eray
 ├── status    last N runs, truthful verdicts (alias: ps)         [P1 ✅]
 ├── logs      driver logs: follow / errors-only / grep           [P1 ✅]
 ├── stop      stop by id / --last                                [P1 ✅]
-├── watch     live watcher: phases, first metrics, alerts        [P2]
-├── doctor    disk, raylet-log sizes, nodes alive, TPU locks     [P2]
-├── clean     raylet logs (sweep_raylet_logs), stale _ray_pkg    [P2]
-├── nodes     alive nodes + resource totals                      [P2]
-└── tpu       (pre-existing) connect/disconnect/… + bounce       [P3]
+├── watch     live watcher: phases, --until-step, --alert       [✅]
+├── doctor    disk, raylet logs, TPU locks, pkgs, nodes, --json  [✅]
+├── clean     raylet | packages | sessions | all                 [✅]
+├── nodes     alive nodes + TPU chip totals                      [✅]
+├── rerun     resubmit recorded entrypoint+env                   [✅]
+├── diff      git/env/entrypoint delta between two jobs          [✅]
+└── tpu       connect/disconnect/… + bounce (--yes-kill-jobs)    [✅]
+
+Everything above is implemented and unit-tested; status --watch refreshes,
+logs --metrics renders a per-step metric table, run/--queue waits for idle,
+run/doctor take --json. All log-scanning patterns are config-driven
+(~/.eray/patterns.json / $ERAY_PATTERNS / ./.eray-patterns.json).
+Deliberately dropped: watch --notify (headless pods have no notification
+channel; exit codes + wandb serve that role).
 ```
 
 ## P1 behaviors (implemented in `eray/cli/jobs.py`)
