@@ -5221,7 +5221,8 @@ class BaseTrainer(BaseTrainerProtocol):
                 return PrefetchIterator(loader, buffer_size=2)
             return loader
 
-        return _ReiterableDataLoader(factory=_factory, length=self.max_training_steps), bucket_collator
+        chosen_collator = bucket.data_collator if bucket.data_collator is not None else bucket_collator
+        return _ReiterableDataLoader(factory=_factory, length=self.max_training_steps), chosen_collator
 
     def _configure_functions(self):
         """

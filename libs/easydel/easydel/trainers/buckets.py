@@ -230,6 +230,13 @@ class TrainingBucket:
             total_batch_size: Per-bucket global batch size for this bucket's
                     dataloader and compiled step; ``None`` inherits the trainer's
                     ``training_batch_size``.
+            data_collator: Per-bucket batch collator. ``None`` uses the
+                    trainer-built default (stack + bucket max_length checks).
+                    When set, it REPLACES the default and receives the raw list
+                    of rows the bucket dataloader produced — the same contract
+                    as the trainer-level ``data_collator`` (e.g. a packed-embeds
+                    VLM collator for one bucket while another bucket streams
+                    plain packed text).
     """
 
     name: str
@@ -239,6 +246,7 @@ class TrainingBucket:
     loss_config: "LossConfig | None" = None
     step_partition_spec: PartitionSpec | None = None
     total_batch_size: int | None = None
+    data_collator: tp.Callable | None = None
     # dataset is attached separately on the trainer (one source per bucket),
     # not on this dataclass, to keep it free of dataset/dataloader imports.
 
