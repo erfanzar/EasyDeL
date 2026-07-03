@@ -358,6 +358,9 @@ class DistillationTrainer(Trainer):
         )
 
         static_argnums = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26)
+        # Bucketed training compiles one distillation step per bucket via the
+        # BaseTrainer hooks below; they need this flavor's static-arg layout.
+        self._bucket_static_argnums = static_argnums
         self._runtime_trace("train.compile_wrapper.begin")
         if self.arguments.mpmd_scheduler is None:
             sharded_training_step_function = spx.jit(
@@ -598,3 +601,38 @@ class DistillationTrainer(Trainer):
         the same compiled function with ``is_train=False`` in its static args.
         """
         return (self.teacher_state,)
+
+    # -- Training-bucket hooks (see BaseTrainer._compile_bucket_step_functions) --
+    # Without these overrides, buckets compiled the BASE Trainer's
+    # `training_step` (plain LM loss) — a bucketed distillation run would
+    # silently train without the teacher.
+
+    def _resolve_bucket_step_args(self, i: int) -> tuple[tuple, tuple]:
+        """Per-bucket ``(extra, static)`` args for the compiled distillation step.
+
+        ``extra`` carries ``teacher_state`` (positional arg 2 of
+        :func:`distillation_step`); ``static`` is this trainer's shared
+        static-arg tuple with the bucket's ``loss_config`` /
+        ``step_partition_spec`` / ``gradient_accumulation_steps`` overrides
+        applied at their positional slots.
+        """
+        bucket = self._buckets[i]
+        static = list(self._train_shared_fn_static_args)
+        if bucket.loss_config is not None:
+            static[0] = bucket.loss_config
+        if bucket.step_partition_spec is not None:
+            static[2] = bucket.step_partition_spec
+        if bucket.gradient_accumulation_steps is not None:
+            static[3] = bucket.gradient_accumulation_steps
+        return (self.teacher_state,), tuple(static)
+
+    def _bucket_step_compile_kwargs(self, i: int) -> dict:
+        """Extend the base compile kwargs with the teacher-state input sharding."""
+        kwargs = super()._bucket_step_compile_kwargs(i)
+        state_shardings, empty_sharding = kwargs["in_shardings"]
+        kwargs["in_shardings"] = (state_shardings, empty_sharding, self.teacher_state.shardings)
+        return kwargs
+
+    def _compile_one_bucket_step(self, i: int):
+        """Compile bucket ``i``'s :func:`distillation_step` with teacher wiring."""
+        return compile_trainer_step(distillation_step, **self._bucket_step_compile_kwargs(i))
