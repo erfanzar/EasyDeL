@@ -18,8 +18,12 @@
 from __future__ import annotations
 
 import contextlib
+import glob
 import logging
 import logging as pylogging
+import os
+import threading
+import time
 
 import ray
 
@@ -248,3 +252,134 @@ class StopwatchActor:
             >>> print(f"Average inference time: {avg_time:.3f}s")
         """
         return self._times_per.get(name, 0) / self._counts_per.get(name, 1)
+
+
+# ---------------------------------------------------------------------------
+# Raylet / GCS log-spam guard
+# ---------------------------------------------------------------------------
+# Ray (<= 2.54) does not rotate the raylet/GCS component logs: a raylet stuck
+# in a retry loop (e.g. "Caller of RequestWorkerLease is dead" after killed
+# drivers) appends to ``raylet.out`` at tens of GB per hour until the node's
+# disk fills and object spilling fails, taking live jobs down with it.
+# Truncating the file in place is safe on the live daemon (its logger appends;
+# observed repeatedly in production) and is the only mitigation short of a
+# raylet restart, which kills running jobs.
+
+RAYLET_LOG_GUARD_ENV = "ERAY_RAYLET_LOG_GUARD"
+RAYLET_LOG_GUARD_MAX_GB_ENV = "ERAY_RAYLET_LOG_GUARD_MAX_GB"
+RAYLET_LOG_GUARD_INTERVAL_ENV = "ERAY_RAYLET_LOG_GUARD_INTERVAL_S"
+
+_RAYLET_LOG_GUARD_FILES = ("raylet.out", "raylet.err", "gcs_server.out", "gcs_server.err")
+_DEFAULT_RAYLET_LOG_MAX_BYTES = 5 * 1024**3
+_DEFAULT_RAYLET_LOG_INTERVAL_S = 300.0
+
+_raylet_guard_lock = threading.Lock()
+_raylet_guard_thread: threading.Thread | None = None
+
+_raylet_guard_logger = pylogging.getLogger("eray.raylet-log-guard")
+
+
+def _ray_session_log_dirs() -> list[str]:
+    """Best-effort discovery of Ray session ``logs`` directories on this host.
+
+    Prefers the live Ray node's session directory when Ray is initialized in
+    this process; otherwise globs the usual temp roots (``RAY_TMPDIR``,
+    ``TMPDIR``, ``/tmp/ray``), which covers guard processes that run beside
+    Ray rather than inside it.
+    """
+    with contextlib.suppress(Exception):
+        node = ray._private.worker._global_node
+        if node is not None:
+            logs = os.path.join(node.get_session_dir_path(), "logs")
+            if os.path.isdir(logs):
+                return [logs]
+
+    found: list[str] = []
+    seen: set[str] = set()
+    roots = [os.environ.get("RAY_TMPDIR"), os.environ.get("TMPDIR"), "/tmp/ray"]
+    for root in roots:
+        if not root:
+            continue
+        for pattern in (
+            os.path.join(root, "session_*", "logs"),
+            os.path.join(root, "ray", "session_*", "logs"),
+            os.path.join(root, "ray", "ray", "session_*", "logs"),
+        ):
+            for logs in glob.glob(pattern):
+                real = os.path.realpath(logs)
+                if real not in seen and os.path.isdir(real):
+                    seen.add(real)
+                    found.append(real)
+    return found
+
+
+def sweep_raylet_logs(
+    log_dirs: list[str] | None = None,
+    max_bytes: int = _DEFAULT_RAYLET_LOG_MAX_BYTES,
+) -> list[tuple[str, int]]:
+    """Truncate oversized Ray component logs in place; returns what was cut.
+
+    Args:
+        log_dirs: Session ``logs`` directories to sweep. ``None`` auto-discovers
+            via the live Ray node or the usual temp-root globs.
+        max_bytes: Size threshold above which a component log is truncated.
+
+    Returns:
+        ``[(path, size_before_bytes), ...]`` for every file truncated.
+    """
+    truncated: list[tuple[str, int]] = []
+    for logs_dir in log_dirs if log_dirs is not None else _ray_session_log_dirs():
+        for name in _RAYLET_LOG_GUARD_FILES:
+            path = os.path.join(logs_dir, name)
+            with contextlib.suppress(OSError):
+                size = os.path.getsize(path)
+                if size > max_bytes:
+                    with open(path, "r+") as f:
+                        f.truncate(0)
+                    truncated.append((path, size))
+                    _raylet_guard_logger.warning(
+                        "Truncated %s (%.1f GB): Ray does not rotate component logs and a spamming "
+                        "raylet can fill the disk under live jobs.",
+                        path,
+                        size / 1024**3,
+                    )
+    return truncated
+
+
+def start_raylet_log_guard(
+    interval_s: float | None = None,
+    max_bytes: int | None = None,
+    log_dirs: list[str] | None = None,
+) -> threading.Thread | None:
+    """Start the per-process daemon that keeps Ray component logs bounded.
+
+    Idempotent (one guard per process) and gated by ``ERAY_RAYLET_LOG_GUARD``
+    (set ``0`` to disable). Threshold and cadence come from
+    ``ERAY_RAYLET_LOG_GUARD_MAX_GB`` (default 5) and
+    ``ERAY_RAYLET_LOG_GUARD_INTERVAL_S`` (default 300) unless given explicitly.
+
+    Returns:
+        The guard thread, or ``None`` when disabled by env.
+    """
+    if os.environ.get(RAYLET_LOG_GUARD_ENV, "1").strip().lower() in ("0", "false", "off"):
+        return None
+
+    global _raylet_guard_thread
+    with _raylet_guard_lock:
+        if _raylet_guard_thread is not None and _raylet_guard_thread.is_alive():
+            return _raylet_guard_thread
+
+        if max_bytes is None:
+            max_bytes = int(float(os.environ.get(RAYLET_LOG_GUARD_MAX_GB_ENV, "5")) * 1024**3)
+        if interval_s is None:
+            interval_s = float(os.environ.get(RAYLET_LOG_GUARD_INTERVAL_ENV, str(_DEFAULT_RAYLET_LOG_INTERVAL_S)))
+
+        def _loop():
+            while True:
+                with contextlib.suppress(Exception):
+                    sweep_raylet_logs(log_dirs=log_dirs, max_bytes=max_bytes)
+                time.sleep(interval_s)
+
+        _raylet_guard_thread = threading.Thread(target=_loop, name="eray-raylet-log-guard", daemon=True)
+        _raylet_guard_thread.start()
+        return _raylet_guard_thread

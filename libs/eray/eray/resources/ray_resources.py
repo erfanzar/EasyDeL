@@ -245,6 +245,11 @@ class RayResources:
             >>> result = RayResources.separate_process_fn(add, (2, 3), {})
             >>> print(result)
         """
+        from ..core.monitoring import start_raylet_log_guard
+
+        # Runs inside the Ray worker on every host that executes a task:
+        # keeps each host's raylet/GCS logs bounded for the task's lifetime.
+        start_raylet_log_guard()
 
         def target_fn(queue, args, kwargs):
             """Execute the underlying function and send the result to a queue.

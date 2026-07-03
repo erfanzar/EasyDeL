@@ -23,6 +23,8 @@ from .monitoring import (
     StopwatchActor,
     current_actor_handle,
     log_failures_to,
+    start_raylet_log_guard,
+    sweep_raylet_logs,
 )
 from .sentinels import DONE, DoneSentinel, RefBox
 from .status import (
@@ -56,4 +58,6 @@ __all__ = (
     "handle_ray_error",
     "log_failures_to",
     "print_remote_raise",
+    "start_raylet_log_guard",
+    "sweep_raylet_logs",
 )
