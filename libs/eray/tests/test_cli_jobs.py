@@ -18,7 +18,6 @@ import time
 from types import SimpleNamespace
 
 from click.testing import CliRunner
-
 from eray.cli import jobs
 
 
@@ -309,3 +308,16 @@ class TestBounceGate:
         result = runner.invoke(cli, ["tpu", "bounce", "--ips", "10.0.0.1", "--tpu-type", "v4-8"])
         assert result.exit_code != 0
         assert "yes-kill-jobs" in result.output
+
+
+class TestProgressMetricsDisplay:
+    def test_all_present_metrics_shown_with_step_time(self):
+        text = "{'loss': 2.964, 'train_step': 2, 'kl_loss': 2.964, 'train_step_time': 79.844}"
+        _, phase = jobs.scan_log_tail(text)
+        # loss == kl_loss in distill logs: deduped; step time always shown
+        assert phase == "step 2 (kl 2.964, s/step 79.844)"
+
+    def test_distinct_metrics_all_listed(self):
+        text = "{'kl_loss': 1.5, 'loss': 2.0, 'train_step': 9, 'train_step_time': 81.2}"
+        _, phase = jobs.scan_log_tail(text)
+        assert phase == "step 9 (kl 1.5, loss 2, s/step 81.2)"

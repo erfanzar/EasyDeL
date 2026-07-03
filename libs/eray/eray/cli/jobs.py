@@ -112,7 +112,7 @@ DEFAULT_PATTERNS: dict = {
         ["Converting shard", "converting"],
     ],
     "step_metric": "train_step",
-    "progress_metrics": ["kl_loss", "loss"],
+    "progress_metrics": [["kl_loss", "kl"], ["loss", "loss"], ["train_step_time", "s/step"]],
     "spam": ["tensor/s", "\\.\\.\\.\\s*\\d+%", "\\d+/\\d+ \\[\\d+:\\d+<"],
 }
 
@@ -284,12 +284,19 @@ def scan_log_tail(text: str, patterns: dict | None = None) -> tuple[str | None, 
     step = latest_metric(text, step_metric) if step_metric else None
     if step is not None:
         phase = f"step {int(step)}"
-        for metric in patterns.get("progress_metrics", ()):
+        parts = []
+        seen_values = set()
+        for entry in patterns.get("progress_metrics", ()):
+            metric, label = entry if isinstance(entry, (list, tuple)) else (entry, entry)
             value = latest_metric(text, metric)
-            if value is not None:
-                short = metric.removesuffix("_loss") or metric
-                phase += f" ({short} {value:g})"
-                break
+            # skip aliases that resolve to the same number (distill logs
+            # report loss == kl_loss; showing both is noise)
+            if value is None or value in seen_values:
+                continue
+            seen_values.add(value)
+            parts.append(f"{label} {value:g}")
+        if parts:
+            phase += f" ({', '.join(parts)})"
     return err, phase
 
 

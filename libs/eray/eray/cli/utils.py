@@ -23,6 +23,11 @@ import sys
 from dataclasses import dataclass
 
 logger = logging.getLogger("eray.cli")
+# The colored print() in info()/success()/warning()/error() is the user-facing
+# channel; without this, cli()'s logging.basicConfig echoes every message a
+# second time through the root handler (bare, uncolored — observed as
+# double-printed output on every command).
+logger.propagate = False
 
 # ANSI colors
 RED = "\033[0;31m"
