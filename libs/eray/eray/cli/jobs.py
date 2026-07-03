@@ -24,6 +24,7 @@ log so that class of silent failure is visible in the table.
 from __future__ import annotations
 
 import getpass
+import glob
 import json
 import os
 import re
@@ -404,6 +405,30 @@ def _parse_env_file(path: str) -> dict[str, str]:
     return out
 
 
+def extract_metric_rows(text: str, patterns: dict | None = None) -> list[dict]:
+    """One row per step from metric log lines, columns from the patterns config."""
+    patterns = load_patterns() if patterns is None else patterns
+    step_metric = patterns.get("step_metric") or "train_step"
+    columns = [e if isinstance(e, (list, tuple)) else (e, e) for e in patterns.get("progress_metrics", ())]
+    rows: list[dict] = []
+    seen_steps: set[int] = set()
+    for line in text.splitlines():
+        step_vals = re.findall(rf"'{re.escape(step_metric)}': ([0-9]+)", line)
+        if not step_vals:
+            continue
+        step = int(step_vals[-1])
+        if step in seen_steps:
+            continue
+        seen_steps.add(step)
+        row = {"step": step}
+        for metric, label in columns:
+            value = latest_metric(line, metric)
+            if value is not None:
+                row[label] = f"{value:g}"
+        rows.append(row)
+    return rows
+
+
 # ── commands ──────────────────────────────────────────────────────
 
 
@@ -429,6 +454,7 @@ def _parse_env_file(path: str) -> dict[str, str]:
 @click.option("--force-package", is_flag=True, default=False, help="Skip the working-dir size guard.")
 @click.option("--follow", "-f", is_flag=True, default=False, help="Tail driver logs after submitting.")
 @click.option("--queue", is_flag=True, default=False, help="Wait until no job is running before submitting.")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Print the submission record as JSON.")
 def run(
     entrypoint,
     address,
@@ -441,6 +467,7 @@ def run(
     force_package,
     follow,
     queue,
+    as_json,
 ):
     """Submit a job: eray run [opts] -- <command...>.
 
@@ -509,6 +536,21 @@ def run(
         }
     )
 
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "submission_id": submitted,
+                    "entrypoint": list(entrypoint),
+                    "working_dir": runtime_env.get("working_dir"),
+                    "env_vars": {k: mask_value(k, v) for k, v in env_vars.items()},
+                    **metadata,
+                }
+            )
+        )
+        if follow:
+            _follow_logs(client, submitted)
+        return
     info(f"submitted: {submitted}")
     if "working_dir" in runtime_env:
         info(f"working dir: {runtime_env['working_dir']}")
@@ -539,9 +581,22 @@ def _follow_logs(client, submission_id: str) -> None:
 @click.option("--address", "-a", default=None, help="Ray dashboard address.")
 @click.option("-n", "limit", default=10, show_default=True, help="How many recent jobs to show.")
 @click.option("--json", "as_json", is_flag=True, default=False, help="Output as JSON.")
-def status(address, limit, as_json):
+@click.option("--watch", "refresh_s", default=0, show_default=True, help="Redraw every N seconds (0 = once).")
+def status(address, limit, as_json, refresh_s):
     """Recent jobs with truthful verdicts (log-derived, not just Ray's word)."""
     client = make_client(address)
+    while refresh_s > 0:
+        click.clear()
+        try:
+            _status_once(client, limit, as_json)
+        except SystemExit:
+            pass
+        time.sleep(refresh_s)
+    _status_once(client, limit, as_json)
+
+
+def _status_once(client, limit, as_json):
+    """Render the status table once (nonzero SystemExit on failing verdicts)."""
     jobs = [j for j in client.list_jobs() if j.submission_id]
     jobs.sort(key=lambda j: j.start_time or 0, reverse=True)
     jobs = jobs[:limit]
@@ -594,8 +649,9 @@ def status(address, limit, as_json):
 @click.option("--errors", is_flag=True, default=False, help="Show only tracebacks and error-signature lines.")
 @click.option("--grep", "pattern", default=None, help="Only lines matching this regex.")
 @click.option("--raw", is_flag=True, default=False, help="Do not filter progress-bar spam.")
+@click.option("--metrics", "metrics_only", is_flag=True, default=False, help="Compact per-step metrics table.")
 @click.option("--follow", "-f", is_flag=True, default=False, help="Stream logs until the job ends.")
-def logs(job_id, address, errors, pattern, raw, follow):
+def logs(job_id, address, errors, pattern, raw, metrics_only, follow):
     """Driver logs for a job (default: the most recent one)."""
     client = make_client(address)
     if job_id == "last":
@@ -611,6 +667,17 @@ def logs(job_id, address, errors, pattern, raw, follow):
 
     text = client.get_job_logs(job_id) or ""
     patterns = load_patterns()
+    if metrics_only:
+        rows = extract_metric_rows(text, patterns)
+        if not rows:
+            info("no metric lines found.")
+            return
+        headers = list(rows[0])
+        widths = {h: max(len(h), *(len(str(r.get(h, ""))) for r in rows)) for h in headers}
+        print("  ".join(h.upper().ljust(widths[h]) for h in headers))
+        for r in rows:
+            print("  ".join(str(r.get(h, "-")).ljust(widths[h]) for h in headers))
+        return
     spam_re = _spam_re(patterns)
     matcher = re.compile(pattern) if pattern else None
     in_traceback = False
@@ -799,14 +866,45 @@ def find_stale_packages(session_dir: str, referenced: set[str]) -> list[tuple[st
     return stale
 
 
+def tpu_device_holders() -> list[dict]:
+    """Processes holding TPU device files open (/dev/accel*, /dev/vfio/*)."""
+    holders: list[dict] = []
+    device_prefixes = ("/dev/accel", "/dev/vfio")
+    for pid_dir in glob.glob("/proc/[0-9]*"):
+        try:
+            fds = os.listdir(os.path.join(pid_dir, "fd"))
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                target = os.readlink(os.path.join(pid_dir, "fd", fd))
+            except OSError:
+                continue
+            if target.startswith(device_prefixes):
+                try:
+                    cmd = Path(pid_dir, "cmdline").read_bytes().replace(b"\0", b" ").decode()[:120].strip()
+                except OSError:
+                    cmd = "?"
+                holders.append({"pid": int(os.path.basename(pid_dir)), "device": target, "cmd": cmd})
+                break
+    return holders
+
+
 @click.command()
 @click.option("--address", "-a", default=None, help="Ray dashboard address.")
 @click.option("--log-max-gb", default=5.0, show_default=True, help="Component-log size flag threshold.")
-def doctor(address, log_max_gb):
-    """Host + cluster health: disk, raylet-log spam, packages, nodes, jobs API."""
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit findings as JSON.")
+def doctor(address, log_max_gb, as_json):
+    """Host + cluster health: disk, raylet-log spam, TPU locks, packages, nodes."""
     import shutil
 
     exit_code = 0
+    findings: list[dict] = []
+
+    def _emit(level, kind, line, **extra):
+        findings.append({"level": level, "kind": kind, "detail": line, **extra})
+        if not as_json:
+            {"info": info, "warn": warning, "error": error}[level](line)
 
     for mount in dict.fromkeys(["/", os.environ.get("RAY_TMPDIR") or "/tmp"]):
         try:
@@ -816,30 +914,37 @@ def doctor(address, log_max_gb):
         pct = usage.used / usage.total * 100
         line = f"disk {mount}: {usage.free / 1024**3:.1f} GB free ({pct:.0f}% used)"
         if pct > 90:
-            error(line + "  ← CRITICAL")
+            _emit("error", "disk", line + "  ← CRITICAL")
             exit_code = 1
         elif pct > 80:
-            warning(line)
+            _emit("warn", "disk", line)
         else:
-            info(line)
+            _emit("info", "disk", line)
 
     max_bytes = int(log_max_gb * 1024**3)
     for row in component_log_report(max_bytes):
         line = f"log {row['path']}: {row['bytes'] / 1024**3:.2f} GB"
         if row["flagged"]:
-            error(line + "  ← oversized, run: eray clean raylet")
+            _emit("error", "component-log", line + "  ← oversized, run: eray clean raylet")
             exit_code = 1
         elif row["bytes"] > max_bytes // 4:
-            warning(line)
+            _emit("warn", "component-log", line)
+
+    holders = tpu_device_holders()
+    if holders:
+        for h in holders[:8]:
+            _emit("info", "tpu-lock", f"TPU device {h['device']} held by pid {h['pid']}: {h['cmd']}", **h)
+    else:
+        _emit("info", "tpu-lock", "no process holds a TPU device on this host")
 
     client = None
     try:
         client = make_client(address)
         jobs_list = client.list_jobs()
         running = sum(1 for j in jobs_list if str(getattr(j.status, "value", j.status)).upper() == "RUNNING")
-        info(f"jobs API reachable: {len(jobs_list)} jobs known, {running} running")
+        _emit("info", "jobs-api", f"jobs API reachable: {len(jobs_list)} jobs known, {running} running")
     except Exception as exc:
-        error(f"jobs API unreachable: {exc}")
+        _emit("error", "jobs-api", f"jobs API unreachable: {exc}")
         exit_code = 1
 
     if client is not None:
@@ -851,9 +956,11 @@ def doctor(address, log_max_gb):
                 stale = find_stale_packages(session_dir, referenced_packages(client.list_jobs()))
                 if stale:
                     total = sum(s for _, s in stale)
-                    warning(
+                    _emit(
+                        "warn",
+                        "stale-packages",
                         f"{len(stale)} stale working-dir package(s), {total / 1024**3:.1f} GB "
-                        f"under {session_dir} — run: eray clean packages"
+                        f"under {session_dir} — run: eray clean packages",
                     )
         except Exception:
             pass
@@ -864,10 +971,12 @@ def doctor(address, log_max_gb):
         nodes_list = list_nodes(address=resolve_address(address), limit=1000)
         alive = sum(1 for n in nodes_list if str(getattr(n, "state", "")).upper() == "ALIVE")
         line = f"nodes: {alive}/{len(nodes_list)} alive"
-        (info if alive == len(nodes_list) else warning)(line)
+        _emit("info" if alive == len(nodes_list) else "warn", "nodes", line)
     except Exception as exc:
-        warning(f"node state API unavailable: {exc}")
+        _emit("warn", "nodes", f"node state API unavailable: {exc}")
 
+    if as_json:
+        print(json.dumps({"ok": exit_code == 0, "findings": findings}, indent=2))
     raise SystemExit(exit_code)
 
 
@@ -916,6 +1025,56 @@ def clean_packages(address, yes):
                 info(f"stale: {path} ({size / 1024**2:.0f} MB)  [dry run — pass --yes to delete]")
     if not found:
         info("no stale packages.")
+
+
+def find_dead_sessions() -> list[tuple[str, int]]:
+    """Ray session dirs on this host other than the live one (by session_latest)."""
+    from ..core.monitoring import _ray_session_log_dirs
+
+    dead: list[tuple[str, int]] = []
+    seen_roots: set[str] = set()
+    for logs_dir in _ray_session_log_dirs():
+        root = os.path.dirname(os.path.dirname(logs_dir))  # …/ray containing session_*
+        if root in seen_roots:
+            continue
+        seen_roots.add(root)
+        latest = os.path.realpath(os.path.join(root, "session_latest"))
+        for entry in glob.glob(os.path.join(root, "session_*")):
+            real = os.path.realpath(entry)
+            if real == latest or os.path.islink(entry):
+                continue
+            dead.append((real, package_size_bytes(real)))
+    return dead
+
+
+@clean.command("sessions")
+@click.option("--yes", is_flag=True, default=False, help="Actually delete (default: dry run).")
+def clean_sessions(yes):
+    """Delete dead Ray session directories (everything but session_latest)."""
+    import shutil
+
+    dead = find_dead_sessions()
+    if not dead:
+        info("no dead sessions.")
+        return
+    for path, size in dead:
+        if yes:
+            shutil.rmtree(path, ignore_errors=True)
+            info(f"deleted {path} ({size / 1024**3:.1f} GB)")
+        else:
+            info(f"dead session: {path} ({size / 1024**3:.1f} GB)  [dry run — pass --yes to delete]")
+
+
+@clean.command("all")
+@click.option("--address", "-a", default=None, help="Ray dashboard address.")
+@click.option("--max-gb", default=5.0, show_default=True, help="Component-log truncation threshold.")
+@click.option("--yes", is_flag=True, default=False, help="Actually delete packages/sessions (default: dry run).")
+@click.pass_context
+def clean_all(ctx, address, max_gb, yes):
+    """Everything: truncate oversized logs, then packages and dead sessions."""
+    ctx.invoke(clean_raylet, max_gb=max_gb)
+    ctx.invoke(clean_packages, address=address, yes=yes)
+    ctx.invoke(clean_sessions, yes=yes)
 
 
 @click.command()
