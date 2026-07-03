@@ -660,6 +660,22 @@ class BaseTrainer(BaseTrainerProtocol):
                 bucket_rule,
             )
 
+        # pose.only_buckets references bucket indices — validate against the
+        # resolved bucket list (pose itself is validated earlier, before buckets
+        # exist). Fail loud on a restriction that could never apply.
+        pose = getattr(self.arguments, "pose", None)
+        if pose is not None and pose.enabled and pose.only_buckets is not None:
+            if not self._has_buckets:
+                raise ValueError(
+                    "pose.only_buckets is set but the trainer has no training buckets configured; "
+                    "either configure `buckets`/`bucket_rule` or drop pose.only_buckets."
+                )
+            out_of_range = [b for b in pose.only_buckets if b >= len(self._buckets)]
+            if out_of_range:
+                raise ValueError(
+                    f"pose.only_buckets {out_of_range} out of range for {len(self._buckets)} configured bucket(s)."
+                )
+
         # Apply trainer-specific preprocessing transform if available
         self._apply_preprocess_transforms()
 
@@ -2573,10 +2589,13 @@ class BaseTrainer(BaseTrainerProtocol):
         """Host-side, pre-forward PoSE on a collated batch's ``position_ids`` (text-only; no-op if disabled).
 
         Runs once per microbatch before the jitted step so a KD teacher+student share the mutated
-        positions. Documents containing image tokens are left untouched (Option A).
+        positions. Documents containing image tokens are left untouched (Option A). When
+        ``pose.only_buckets`` is set, steps routed to any other training bucket are untouched.
         """
         pose = self.arguments.pose
         if not pose.enabled or not isinstance(batch, dict):
+            return batch
+        if not pose.applies_to_bucket(self._bucket_for_step if self._has_buckets else None):
             return batch
         return apply_pose_to_batch(
             batch,
@@ -4996,7 +5015,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 # preprocess transform to *raw* bucket sources, not the fallback,
                 # so we don't double-transform.
                 if i < len(self._bucket_sources):
-                    source = self._prepare_bucket_source(self._bucket_sources[i])
+                    source = self._prepare_bucket_source(self._bucket_sources[i], bucket=bucket)
                 else:
                     source = self._train_source
                 loader, collator_i = self._build_bucket_loader(bucket=bucket, source=source)
@@ -5013,20 +5032,44 @@ class BaseTrainer(BaseTrainerProtocol):
         self.timer.log("configure buckets")
         self._runtime_trace("_configure_buckets.done", num_buckets=len(self._buckets))
 
-    def _prepare_bucket_source(self, source: "ShardedDataSource | None") -> "ShardedDataSource | None":
+    def _prepare_bucket_source(
+        self,
+        source: "ShardedDataSource | None",
+        bucket: "TrainingBucket | None" = None,
+    ) -> "ShardedDataSource | None":
         """Wrap a bucket's raw source with the trainer's preprocess transform.
 
         Mirrors ``_apply_preprocess_transforms`` for the primary source: convert
         to a ShardedDataSource and apply the flavor-specific tokenization
-        transform (e.g. DPO pairing) if one is configured.
+        transform (e.g. DPO pairing) if one is configured. The transform is
+        resolved via :meth:`_get_bucket_preprocess_transform`, which flavors may
+        override to gate on the bucket source's own schema (a bucket can be raw
+        text while the primary source is pretokenized, or vice versa) and to
+        honour the bucket's own ``max_length`` / collator.
         """
         sharded = self._to_sharded_source(source) if not isinstance(source, ShardedDataSource) else source
         if sharded is None:
             return None
-        transform = self._get_preprocess_transform()
+        transform = self._get_bucket_preprocess_transform(sharded, bucket)
         if transform is not None:
             sharded = sharded.transform(transform)
         return sharded
+
+    def _get_bucket_preprocess_transform(
+        self,
+        source: "ShardedDataSource",
+        bucket: "TrainingBucket | None" = None,
+    ) -> "Transform | None":
+        """Resolve the preprocess transform for a single bucket source.
+
+        The base implementation defers to :meth:`_get_preprocess_transform`,
+        which gates on the *primary* train source — backward-compatible for
+        homogeneous setups. Flavors whose buckets can differ from the primary in
+        tokenization state or sequence length (e.g. distillation mixing a
+        pretokenized long-context bucket with a raw-text SFT bucket) override
+        this to gate on ``source`` itself and build a bucket-sized transform.
+        """
+        return self._get_preprocess_transform()
 
     def _resolve_bucket_step_args(self, i: int) -> tuple[tuple, tuple]:
         """Resolve the (extra_args, static_args) for bucket ``i``'s compiled step.
