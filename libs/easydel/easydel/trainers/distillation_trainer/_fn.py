@@ -48,6 +48,7 @@ from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 
 from ..training_utils import (
+    constrain_batch_sharding,
     ScheduledLossAdapter,
     bind_scheduled_module,
     filter_kwargs_for_callable,
@@ -86,7 +87,7 @@ def _constrain_distillation_input_batch(
     """
     return tp.cast(
         dict[str, tp.Any],
-        dict(with_sharding_constraint(batch, partition_spec, mesh=mesh, ignore_mpmd=True)),
+        dict(constrain_batch_sharding(batch, partition_spec, mesh=mesh, ignore_mpmd=True)),
     )
 
 
@@ -1420,7 +1421,7 @@ def distillation_step(
         gradient_accumulation_steps=gradient_accumulation_steps,
         batch_partition_spec=partition_spec,
     )
-    batch = with_sharding_constraint(batch, partition_spec)
+    batch = constrain_batch_sharding(batch, partition_spec, mesh=student_state.model.mesh)
 
     if hidden_state_loss != "mse":
         raise ValueError(f"Unsupported hidden state loss '{hidden_state_loss}'. Only 'mse' is available.")

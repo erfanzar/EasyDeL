@@ -1884,6 +1884,105 @@ def resolve_total_steps(
     return int(steps)
 
 
+def _leaf_batch_partition_spec(
+    shape: tuple[int, ...],
+    partition_spec: PartitionSpec,
+    axis_sizes: dict[str, int],
+) -> PartitionSpec:
+    """Pick a rank-aware placement of a trainer (batch, seq, ...) spec for one leaf shape.
+
+    Tries the spec anchored at dim 0; if the batch axes do not divide dim 0,
+    tries dim 1 with a leading ``None`` (covers ``(K, batch, seq)`` leaves like
+    multimodal rope position ids). Entries whose mesh ways do not divide the
+    target dim are dropped to ``None`` instead of degrading the whole leaf.
+    Returns a fully-replicated spec only when nothing fits.
+    """
+    if not shape:
+        return PartitionSpec()
+
+    def _names(entry) -> tuple:
+        if entry is None:
+            return ()
+        if isinstance(entry, (tuple, list)):
+            return tuple(entry)
+        return (entry,)
+
+    def _ways(entry) -> int:
+        ways = 1
+        for name in _names(entry):
+            ways *= int(axis_sizes.get(name, 1))
+        return ways
+
+    entries = tuple(partition_spec)
+    if not entries:
+        return PartitionSpec()
+    batch_ways = _ways(entries[0])
+
+    def _fit(offset: int) -> PartitionSpec | None:
+        placed: list = [None] * offset
+        for i in range(len(shape) - offset):
+            entry = entries[i] if i < len(entries) else None
+            dim = int(shape[offset + i])
+            placed.append(entry if entry is not None and dim % _ways(entry) == 0 else None)
+        if all(entry is None for entry in placed):
+            return None
+        return PartitionSpec(*placed)
+
+    if batch_ways and int(shape[0]) % batch_ways == 0:
+        spec = _fit(0)
+        if spec is not None:
+            return spec
+    if batch_ways and len(shape) >= 2 and int(shape[1]) % batch_ways == 0:
+        spec = _fit(1)
+        if spec is not None:
+            return spec
+    return PartitionSpec()
+
+
+def constrain_batch_sharding(
+    batch: tp.Any,
+    partition_spec: PartitionSpec | None,
+    *,
+    mesh: tp.Any,
+    ignore_mpmd: bool = True,
+) -> tp.Any:
+    """Apply a trainer batch spec leaf-by-leaf with rank-aware placement.
+
+    A trainer's ``batch_partition_spec`` (e.g. ``P(("dp","fsdp"), "sp")``)
+    describes a ``(batch, sequence)`` layout, but collated batches also carry
+    leaves it does not fit: rank-1 row tables from packed-embed collation,
+    rank-3 ``(K, batch, seq)`` position ids, scalars. Constraining the whole
+    tree with one spec makes the sharding fallback silently replicate those
+    leaves on every device (a ``(3, B, S)`` position-id tensor lands fully
+    replicated on all devices instead of batch-sharded). This helper places
+    the spec per leaf via :func:`_leaf_batch_partition_spec` so batch axes
+    land on the dimension they actually divide.
+
+    Args:
+        batch: Batch pytree (typically a flat dict of arrays).
+        partition_spec: Trainer batch partition spec; ``None`` is a no-op.
+        mesh: Mesh whose axis sizes decide divisibility.
+        ignore_mpmd: Forwarded to ``spx.with_sharding_constraint``.
+
+    Returns:
+        The batch with per-leaf sharding constraints applied.
+    """
+    if partition_spec is None:
+        return batch
+    axis_sizes = {str(name): int(size) for name, size in dict(getattr(mesh, "shape", {}) or {}).items()}
+
+    def _constrain(leaf: tp.Any) -> tp.Any:
+        shape = getattr(leaf, "shape", None)
+        if shape is None:
+            return leaf
+        spec = _leaf_batch_partition_spec(tuple(int(d) for d in shape), partition_spec, axis_sizes)
+        return spx.with_sharding_constraint(leaf, spec, mesh=mesh, ignore_mpmd=ignore_mpmd)
+
+    if isinstance(batch, dict):
+        return {key: _constrain(value) for key, value in batch.items()}
+    return jax.tree_util.tree_map(_constrain, batch)
+
+
 def make_assertions_and_get_sizes(
     batch: dict,
     gradient_accumulation_steps: int,
