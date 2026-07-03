@@ -32,7 +32,6 @@ and multimodal architectures.
 """
 
 import collections.abc
-import concurrent.futures
 import typing as tp
 
 import jax
@@ -45,151 +44,13 @@ from easydel.utils import Registry
 from easydel.utils.helpers import capture_time, get_logger  # pyright: ignore[reportPrivateLocalImportUsage]
 
 from ..base_trainer import BaseTrainer, TrainerConfigureFunctionOutput  # pyright: ignore[reportPrivateLocalImportUsage]
+from ..batch_prefetcher import TrainBatchPrefetcher
 from ..metrics import BaseProgressBar, MetricsTracker, StepMetrics
 from ..trainer_protocol import TrainerOutput
 from ..training_utils import compile_trainer_step, resolve_straight_through_emulator
 from ._fn import evaluation_step, training_step
 
 logger = get_logger(__name__)
-
-
-class _TrainBatchPrefetcher:
-    """One-batch lookahead for host-side dataloader fetch and collation.
-
-    Hides the latency of fetching and collating the *next* training
-    batch by running it on a background thread while the device is busy
-    with the current step. Maintains a single pending future at a time
-    so memory usage stays bounded; callers explicitly opt in to
-    scheduling the next batch via ``schedule_next``.
-
-    Attributes:
-        _trainer: Owning :class:`Trainer` (used to call
-            ``_get_next_batch``).
-        _data_iter: Active dataloader iterator; replaced after each
-            successful fetch so the iterator can advance.
-        _dataloader: Source dataloader (Grain or TFDS), kept for
-            iterator re-creation when an iterator is exhausted.
-        _data_collator: Callable applied to the raw batch before
-            returning it to the trainer.
-        _executor: Single-worker thread pool that runs ``_load``.
-        _future: Pending fetch future or ``None`` between submissions.
-        _closed: Sticky flag that suppresses further submissions after
-            :meth:`close` is called.
-    """
-
-    def __init__(
-        self,
-        trainer: "Trainer",
-        data_iter: collections.abc.Iterator[tp.Any],
-        dataloader: collections.abc.Iterable[tp.Any],
-        data_collator: tp.Callable[[tp.Any], tp.Any],
-    ) -> None:
-        """Initialize the prefetcher and submit the first fetch.
-
-        Args:
-            trainer: Owning :class:`Trainer` instance.
-            data_iter: Active dataloader iterator to read the next batch
-                from.
-            dataloader: Source dataloader; used to re-create the
-                iterator when needed.
-            data_collator: Callable applied to each raw batch to produce
-                the collated batch returned by :meth:`next`.
-        """
-        self._trainer = trainer
-        self._data_iter = data_iter
-        self._dataloader = dataloader
-        self._data_collator = data_collator
-        self._executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="easydel-train-batch-prefetch",
-        )
-        self._future: concurrent.futures.Future[tuple[tp.Any, collections.abc.Iterator[tp.Any], float]] | None = None
-        self._closed = False
-        self._submit()
-
-    def _load(
-        self,
-        data_iter: collections.abc.Iterator[tp.Any],
-    ) -> tuple[tp.Any, collections.abc.Iterator[tp.Any], float]:
-        """Fetch and collate one batch on the background thread.
-
-        Args:
-            data_iter: Iterator to pull the next batch from.
-
-        Returns:
-            Tuple ``(batch, data_iter, elapsed_seconds)`` containing the
-            collated batch, the (possibly updated) iterator, and the
-            wall time of the fetch + collate.
-        """
-        with capture_time() as data_collection_time:
-            batch, data_iter = self._trainer._get_next_batch(data_iter, self._dataloader)
-            batch = self._data_collator(batch)
-        return batch, data_iter, float(data_collection_time())
-
-    def _submit(self) -> None:
-        """Submit a new fetch future if the prefetcher is still open."""
-        if self._closed:
-            return
-        self._future = self._executor.submit(self._load, self._data_iter)
-
-    def next(self, *, schedule_next: bool) -> tuple[tp.Any, float, float]:
-        """Return the prefetched batch, optionally scheduling the next fetch.
-
-        Args:
-            schedule_next: When ``True``, submit a new fetch future
-                immediately after retrieving the current one so the
-                next call overlaps with device work.
-
-        Returns:
-            Tuple ``(batch, wait_seconds, data_time)`` where
-            ``wait_seconds`` is the wall time spent blocking on the
-            future result and ``data_time`` is the producer-side time
-            spent inside :meth:`_load`.
-
-        Raises:
-            RuntimeError: If the prefetcher has been closed before a
-                batch was made available.
-        """
-        if self._future is None:
-            self._submit()
-        if self._future is None:
-            raise RuntimeError("Batch prefetcher was closed before a batch was available.")
-
-        with capture_time() as wait_time:
-            batch, self._data_iter, data_time = self._future.result()
-        wait_seconds = float(wait_time())
-        self._future = None
-        if schedule_next:
-            self._submit()
-        return batch, wait_seconds, data_time
-
-    def ensure_scheduled(self) -> None:
-        """Submit a fetch if none is pending.
-
-        Used by the bucket-aware training loop to warm the *next* step's
-        bucket (known ahead of time from the deterministic bucket rule)
-        while the device is busy with the current step.
-        """
-        if self._future is None:
-            self._submit()
-
-    @property
-    def data_iter(self) -> collections.abc.Iterator[tp.Any]:
-        """The current dataloader iterator (advanced after each fetch)."""
-        return self._data_iter
-
-    def close(self) -> None:
-        """Cancel any pending fetch and shut down the background executor.
-
-        Idempotent; subsequent calls are no-ops. The captured iterator
-        remains accessible through :attr:`data_iter` so callers can
-        resume reading from it after closing the prefetcher.
-        """
-        self._closed = True
-        if self._future is not None:
-            self._future.cancel()
-            self._future = None
-        self._executor.shutdown(wait=False, cancel_futures=True)
 
 
 @Registry.register("trainer", "base")
@@ -743,8 +604,10 @@ class Trainer(BaseTrainer):
             epoch_end_step=epoch_end_step,
             epoch_total_steps=epoch_total_steps,
         )
-        prefetcher: _TrainBatchPrefetcher | None = None
-        bucket_prefetchers: dict[int, _TrainBatchPrefetcher] = {}
+        prefetcher: TrainBatchPrefetcher | None = None
+        bucket_prefetchers: dict[int, TrainBatchPrefetcher] = {}
+        prefetch_workers = max(int(getattr(self.arguments, "dataloader_prefetch_workers", 1) or 1), 1)
+        prefetch_buffer = getattr(self.arguments, "dataloader_prefetch_buffer_size", None)
 
         def close_prefetcher() -> collections.abc.Iterator[tp.Any]:
             nonlocal prefetcher, train_iter
@@ -767,23 +630,32 @@ class Trainer(BaseTrainer):
                 # with device work: each step consumes its own bucket's pending
                 # batch and warms the rule's next bucket (see the fetch path).
                 for i in sorted(self._bucket_loaders):
-                    bucket_prefetchers[i] = _TrainBatchPrefetcher(
-                        trainer=self,
+                    bucket_prefetchers[i] = TrainBatchPrefetcher(
+                        fetch_fn=self._get_next_batch,
                         data_iter=self._bucket_iters[i],
                         dataloader=self._bucket_loaders[i],
                         data_collator=self._bucket_collators[i],
+                        worker_count=prefetch_workers,
+                        buffer_size=prefetch_buffer,
                     )
                 self._runtime_trace(
                     "train_epoch.prefetch.buckets_enabled", epoch=epoch, num_buckets=len(bucket_prefetchers)
                 )
             else:
-                prefetcher = _TrainBatchPrefetcher(
-                    trainer=self,
+                prefetcher = TrainBatchPrefetcher(
+                    fetch_fn=self._get_next_batch,
                     data_iter=train_iter,
                     dataloader=train_dataset,
                     data_collator=data_collator,
+                    worker_count=prefetch_workers,
+                    buffer_size=prefetch_buffer,
                 )
-                self._runtime_trace("train_epoch.prefetch.enabled", epoch=epoch, buffer_size=1)
+                self._runtime_trace(
+                    "train_epoch.prefetch.enabled",
+                    epoch=epoch,
+                    worker_count=prefetch_workers,
+                    buffer_size=prefetch_buffer if prefetch_buffer is not None else prefetch_workers,
+                )
 
         while True:
             with capture_time() as iteration_time:
@@ -943,6 +815,11 @@ class Trainer(BaseTrainer):
                         train_metrics["performance/data_prefetch_wait_time"] = float(prefetch_wait_time)
                     if prefetch_producer_time is not None:
                         train_metrics["performance/data_prefetch_producer_time"] = float(prefetch_producer_time)
+                    if step_prefetcher is not None:
+                        if step_prefetcher.last_fetch_seconds is not None:
+                            train_metrics["performance/data_fetch_time"] = float(step_prefetcher.last_fetch_seconds)
+                        if step_prefetcher.last_collate_seconds is not None:
+                            train_metrics["performance/data_collate_time"] = float(step_prefetcher.last_collate_seconds)
                     train_step_time = train_metrics.get("performance/train_step_time")
                     if train_step_time is not None:
                         remaining_steps = max(self.max_training_steps - current_step, 0)
