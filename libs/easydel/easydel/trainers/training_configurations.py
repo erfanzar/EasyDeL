@@ -310,8 +310,31 @@ class TrainingArguments:
         metadata={
             "help": (
                 "Whether to overlap trainer-level batch fetching and collation with the current "
-                "compiled train step using a single host worker. JAX preprocessing and execution "
+                "compiled train step using background host workers. JAX preprocessing and execution "
                 "remain on the main training thread."
+            )
+        },
+    )
+    dataloader_prefetch_workers: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Parallel host producer threads for the trainer-level batch prefetcher (requires "
+                "`dataloader_prefetch`). Fetching from the dataloader iterator stays serialized so "
+                "the stream order is deterministic; collation fans out across workers. Raise this "
+                "when producing one batch (fetch + collate) takes longer than the device step — "
+                "e.g. large global batches or heavy collators. The data collator must be "
+                "thread-safe when set > 1."
+            )
+        },
+    )
+    dataloader_prefetch_buffer_size: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Maximum collated batches queued ahead by the batch prefetcher (per bucket when "
+                "training buckets are enabled). Defaults to `dataloader_prefetch_workers`. Each "
+                "queued batch holds one full global batch in host memory."
             )
         },
     )

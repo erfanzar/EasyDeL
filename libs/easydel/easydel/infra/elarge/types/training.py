@@ -269,6 +269,14 @@ class BaseTrainerCfg(TypedDict, total=False):
             GPU transfer.
         dataloader_prefetch: Whether to overlap host-side batch fetching with
             the compiled training step.
+        dataloader_prefetch_workers: Parallel host producer threads for the batch
+            prefetcher. Fetch stays serialized (deterministic stream order);
+            collation fans out. Raise when producing one batch takes longer than
+            the device step. Collator must be thread-safe when > 1.
+        dataloader_prefetch_buffer_size: Max collated batches queued ahead by the
+            prefetcher (per bucket when buckets are enabled). Defaults to
+            ``dataloader_prefetch_workers``; each queued batch holds one full
+            global batch in host memory.
         remove_unused_columns: Whether to remove columns not used by the model
             from the dataset.
         ids_to_pop_from_dataset: List of column names to explicitly remove from dataset.
@@ -498,6 +506,8 @@ class BaseTrainerCfg(TypedDict, total=False):
     dataloader_num_workers: NotRequired[int | None]
     dataloader_pin_memory: NotRequired[bool | None]
     dataloader_prefetch: NotRequired[bool]
+    dataloader_prefetch_workers: NotRequired[int]
+    dataloader_prefetch_buffer_size: NotRequired[int | None]
     remove_unused_columns: NotRequired[bool]
     ids_to_pop_from_dataset: NotRequired[list[str] | None]
     shuffle_train_dataset: NotRequired[bool]
