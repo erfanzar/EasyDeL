@@ -59,6 +59,8 @@ from .distillation_config import DistillationConfig
 if tp.TYPE_CHECKING:
     from datasets import Dataset  # pyright: ignore[reportMissingTypeStubs]
 
+    from ..buckets import BucketRule, TrainingBucket
+
 logger = get_logger(__name__)
 
 
@@ -117,6 +119,9 @@ class DistillationTrainer(Trainer):
         train_dataset: Dataset | None = None,
         eval_dataset: Dataset | dict[str, Dataset] | None = None,
         data_collator: DataCollatorForCompletionOnlyLM | None = None,
+        buckets: list[TrainingBucket] | None = None,
+        bucket_rule: BucketRule | None = None,
+        bucket_datasets: list | None = None,
     ):
         """Initialize the offline distillation trainer.
 
@@ -144,6 +149,12 @@ class DistillationTrainer(Trainer):
             eval_dataset: Optional evaluation dataset (single or named-split dict).
             data_collator: Optional custom collator; otherwise the default
                 completion-only collator is used.
+            buckets: Optional list of :class:`~easydel.trainers.buckets.TrainingBucket`
+                configs; forwarded to :class:`BaseTrainer` (one compiled distillation
+                step + dataloader per bucket). Falls back to ``arguments.buckets``.
+            bucket_rule: :class:`~easydel.trainers.buckets.BucketRule` selecting the
+                active bucket per step; required when ``buckets`` is set.
+            bucket_datasets: Optional per-bucket datasets/sources, one per bucket.
 
         Raises:
             TypeError: If ``arguments`` is not a :class:`DistillationConfig`.
@@ -184,6 +195,9 @@ class DistillationTrainer(Trainer):
             model_state=student_model,
             data_collator=data_collator,
             processing_class=processing_class,
+            buckets=buckets,
+            bucket_rule=bucket_rule,
+            bucket_datasets=bucket_datasets,
         )
 
     @staticmethod
@@ -462,39 +476,79 @@ class DistillationTrainer(Trainer):
         """
         if self._is_pretokenized():
             return None
+        return self._build_sft_preprocess_transform(
+            max_length=self.arguments.max_length,
+            padding_free=self._user_data_collator,
+        )
+
+    def _build_sft_preprocess_transform(self, *, max_length: int, padding_free: bool) -> SFTPreprocessTransform:
+        """Construct the SFT tokenisation transform at a given length / padding mode.
+
+        Shared by the primary-source path (:meth:`_get_preprocess_transform`) and
+        the per-bucket path (:meth:`_get_bucket_preprocess_transform`) so both
+        honour the same ``dataset_text_field`` / prompt-masking policy while
+        differing only in ``max_length`` and whether rows are padded (a bucket
+        with its own packing collator wants unpadded rows).
+        """
         text_field = getattr(self.arguments, "dataset_text_field", None) or "text"
         mask_prompt = bool(getattr(self.arguments, "assistant_only_loss", False))
         completion_only_loss = getattr(self.arguments, "completion_only_loss", None)
         if completion_only_loss is not None:
             mask_prompt = bool(completion_only_loss)
+        packing = bool(getattr(self.arguments, "sequence_packing", False))
         return SFTPreprocessTransform(
             tokenizer=self.processing_class,
-            max_length=self.arguments.max_length,
+            max_length=max_length,
             text_field=text_field,
             mask_prompt=mask_prompt,
-            padding=False
-            if getattr(self.arguments, "sequence_packing", False) or self._user_data_collator
-            else "max_length",
+            padding=False if (packing or padding_free) else "max_length",
             truncation_mode=self.arguments.truncation_mode,
         )
 
+    def _get_bucket_preprocess_transform(self, source, bucket=None):
+        """Per-bucket SFT tokenisation, gated on the bucket source's own schema.
+
+        Unlike the base implementation (which gates on the primary train source),
+        this inspects ``source`` directly: a distillation run can mix a
+        pretokenized long-context bucket with a raw-text SFT/VLM bucket. Returns
+        ``None`` when the bucket source is already tokenised; otherwise builds a
+        transform sized to the bucket's ``max_length`` and emitting unpadded rows
+        when the bucket carries its own collator (which packs/pads itself).
+        """
+        if self._source_is_pretokenized(source):
+            return None
+        max_length = self.arguments.max_length
+        if bucket is not None and getattr(bucket, "max_length", None):
+            max_length = bucket.max_length
+        padding_free = self._user_data_collator or (bucket is not None and bucket.data_collator is not None)
+        return self._build_sft_preprocess_transform(max_length=max_length, padding_free=padding_free)
+
+    def _source_is_pretokenized(self, source) -> bool:
+        """Whether ``source`` already yields tokenised rows (exposes ``input_ids``).
+
+        Heterogeneous wrappers (mixed / shuffled sources) always report ``False``
+        so their raw rows still flow through the transform (which passes
+        already-tokenised rows through untouched).
+        """
+        if source is None:
+            return False
+        if self._source_requires_row_preprocessing(source):
+            return False
+        try:
+            sample = next(iter(source.open_shard(source.shard_names[0])))
+            return "input_ids" in sample
+        except (StopIteration, IndexError):
+            return False
+
     def _is_pretokenized(self) -> bool:
-        """Detect whether the training source already yields tokenised samples.
+        """Detect whether the primary training source already yields tokenised samples.
 
         Returns:
             ``True`` when the first sample of the first shard exposes
             an ``input_ids`` column; ``False`` when the source is
             absent or the shard is empty.
         """
-        if self._train_source is None:
-            return False
-        if self._source_requires_row_preprocessing(self._train_source):
-            return False
-        try:
-            sample = next(iter(self._train_source.open_shard(self._train_source.shard_names[0])))
-            return "input_ids" in sample
-        except (StopIteration, IndexError):
-            return False
+        return self._source_is_pretokenized(self._train_source)
 
     @staticmethod
     def _source_requires_row_preprocessing(source: tp.Any) -> bool:

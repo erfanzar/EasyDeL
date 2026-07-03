@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-
 from easydel.trainers.pose import (
     PoSEConfig,
     _seq_lens_from_segment_ids,
@@ -160,6 +159,29 @@ def test_config_validation():
     with pytest.raises(ValueError, match="target_max_pos must be > 1"):
         PoSEConfig(enabled=True, p_pose=0.5, target_max_pos=1)
     assert PoSEConfig(p_pose=0.3).max_p_pose == 0.3  # defaults to p_pose
+
+
+def test_only_buckets_validation_and_gating():
+    with pytest.raises(ValueError, match="only_buckets"):
+        PoSEConfig(only_buckets=[])
+    with pytest.raises(ValueError, match="only_buckets"):
+        PoSEConfig(only_buckets=[-1])
+    with pytest.raises(ValueError, match="only_buckets"):
+        PoSEConfig(only_buckets=[True])
+
+    unrestricted = PoSEConfig(enabled=True, p_pose=0.5, target_max_pos=16)
+    assert unrestricted.applies_to_bucket(None)  # no buckets configured
+    assert unrestricted.applies_to_bucket(3)
+
+    restricted = PoSEConfig(enabled=True, p_pose=0.5, target_max_pos=16, only_buckets=[0])
+    assert restricted.applies_to_bucket(0)
+    assert not restricted.applies_to_bucket(1)
+    assert not restricted.applies_to_bucket(None)  # restriction never matches bucketless steps
+
+    # JSON persistence roundtrip (TrainingArguments serializes pose via to_dict/from_dict)
+    roundtrip = PoSEConfig.from_dict(restricted.to_dict())
+    assert roundtrip.only_buckets == [0]
+    assert PoSEConfig.from_dict(unrestricted.to_dict()).only_buckets is None
 
 
 def test_positions_stay_below_target_real_rng():

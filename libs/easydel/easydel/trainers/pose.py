@@ -64,6 +64,10 @@ class PoSEConfig:
         max_chunk_frac: Upper bound of the split point (``max_chunk = floor(L * max_chunk_frac)``).
         bias_large_gap: When ``True`` warp the uniform gap draw toward large gaps via
             ``g = 1 - (1 - u)**2``; otherwise draw the gap uniformly.
+        only_buckets: Optional list of training-bucket indices (see
+            ``TrainingArguments.buckets``) PoSE applies to; steps routed to any other
+            bucket are left untouched. ``None`` (default) applies PoSE on every step.
+            Requires the trainer to have training buckets configured (validated there).
     """
 
     enabled: bool = False
@@ -74,6 +78,7 @@ class PoSEConfig:
     min_chunk_frac: float = 0.25
     max_chunk_frac: float = 0.75
     bias_large_gap: bool = True
+    only_buckets: list[int] | None = None
 
     def __post_init__(self) -> None:
         if self.max_p_pose is None:
@@ -94,6 +99,24 @@ class PoSEConfig:
             )
         if self.enabled and self.target_max_pos <= 1:
             raise ValueError(f"pose.target_max_pos must be > 1 when pose.enabled=true, got {self.target_max_pos}.")
+        if self.only_buckets is not None:
+            buckets = list(self.only_buckets)
+            if not buckets:
+                raise ValueError("pose.only_buckets must be None or a non-empty list of bucket indices, got [].")
+            if any(not isinstance(b, int) or isinstance(b, bool) or b < 0 for b in buckets):
+                raise ValueError(f"pose.only_buckets entries must be non-negative ints, got {self.only_buckets}.")
+            self.only_buckets = buckets
+
+    def applies_to_bucket(self, bucket_index: int | None) -> bool:
+        """Whether PoSE should run on a step routed to ``bucket_index``.
+
+        ``None`` ``only_buckets`` matches every step. When restricted, a step matches
+        only if the trainer reports a bucket index in the list (``bucket_index=None``
+        — no buckets configured — never matches a restricted config).
+        """
+        if self.only_buckets is None:
+            return True
+        return bucket_index is not None and bucket_index in self.only_buckets
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation for TrainingArguments persistence."""

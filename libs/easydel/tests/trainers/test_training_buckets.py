@@ -277,3 +277,98 @@ class TestBucketGraphdefStructure:
         assert jax.tree_util.tree_structure(gstate_base) == jax.tree_util.tree_structure(
             gstate_alt
         ), "vanilla and blocksparse variants must share graphstate structure"
+
+
+class _FakeShardedSource:
+    """Minimal ShardedDataSource stand-in yielding one scripted first row."""
+
+    def __init__(self, first_row: dict, *, wrapper_name: str | None = None):
+        self._first_row = first_row
+        self._wrapper_name = wrapper_name
+        if wrapper_name is not None:
+            # Emulate a heterogeneous wrapper (MixedShardedSource/ShuffledShardedSource)
+            # by presenting that type name while delegating rows through ``_source``.
+            self.__class__ = type(wrapper_name, (_FakeShardedSource,), {})
+            self._source = _FakeShardedSource(first_row)
+
+    @property
+    def shard_names(self):
+        return ["shard-0"]
+
+    def open_shard(self, _name):
+        return iter([self._first_row])
+
+
+class _StubDistillTrainer:
+    """Bare attribute holder to exercise DistillationTrainer's per-bucket transform
+    resolution without constructing a full trainer (no model / tokenizer download)."""
+
+    def __init__(self, *, max_length: int, user_data_collator: bool):
+        from types import SimpleNamespace
+
+        from easydel.trainers.distillation_trainer.distillation_trainer import DistillationTrainer
+
+        self.processing_class = SimpleNamespace(chat_template=None)
+        self.arguments = SimpleNamespace(
+            max_length=max_length,
+            dataset_text_field=None,
+            assistant_only_loss=False,
+            completion_only_loss=None,
+            sequence_packing=False,
+            truncation_mode="keep_start",
+        )
+        self._user_data_collator = user_data_collator
+        # Bind the real methods under test (and their helpers) onto this stub so
+        # internal ``self.`` calls resolve, without constructing a full trainer.
+        self._source_requires_row_preprocessing = DistillationTrainer._source_requires_row_preprocessing
+        for name in (
+            "_source_is_pretokenized",
+            "_build_sft_preprocess_transform",
+            "_get_bucket_preprocess_transform",
+        ):
+            setattr(self, name, getattr(DistillationTrainer, name).__get__(self, type(self)))
+
+
+class TestDistillationBucketPreprocess:
+    """DistillationTrainer resolves the per-bucket SFT transform from the BUCKET
+    source's own schema and sizes it to the bucket — not the primary train source.
+
+    Regression: a pretokenized long-context primary previously gated the transform
+    off globally, so a raw-text bucket reached its collator without ``input_ids``
+    (KeyError); and when it did tokenize, it padded to the global ``max_length``.
+    """
+
+    def test_pretokenized_bucket_source_skips_transform(self):
+        stub = _StubDistillTrainer(max_length=131072, user_data_collator=False)
+        src = _FakeShardedSource({"input_ids": [1, 2, 3], "attention_mask": [1, 1, 1]})
+        assert stub._source_is_pretokenized(src) is True
+        assert stub._get_bucket_preprocess_transform(src, TrainingBucket(name="b", max_length=131072)) is None
+
+    def test_raw_bucket_source_tokenizes_at_bucket_length_unpadded(self):
+        from easydel.trainers.prompt_transforms import SFTPreprocessTransform
+
+        stub = _StubDistillTrainer(max_length=131072, user_data_collator=False)
+        raw = _FakeShardedSource({"messages": [{"role": "user", "content": "hi"}]})
+        assert stub._source_is_pretokenized(raw) is False
+        bucket = TrainingBucket(name="a", max_length=8192, data_collator=lambda rows: rows)
+        transform = stub._get_bucket_preprocess_transform(raw, bucket)
+        assert isinstance(transform, SFTPreprocessTransform)
+        # sized to the BUCKET (8192), not the global 131072
+        assert transform._max_length == 8192
+        # a bucket with its own packing collator wants unpadded rows
+        assert transform._padding is False
+
+    def test_raw_bucket_without_collator_pads_to_bucket_length(self):
+        stub = _StubDistillTrainer(max_length=131072, user_data_collator=False)
+        raw = _FakeShardedSource({"messages": [{"role": "user", "content": "hi"}]})
+        transform = stub._get_bucket_preprocess_transform(raw, TrainingBucket(name="a", max_length=4096))
+        assert transform._max_length == 4096
+        assert transform._padding == "max_length"
+
+    def test_mixed_source_treated_as_raw(self):
+        # A heterogeneous mixture (pretokenized VLM rows + raw text rows) must not
+        # be judged pretokenized off its first row — the transform passes already
+        # tokenized rows through and tokenizes the rest.
+        stub = _StubDistillTrainer(max_length=131072, user_data_collator=False)
+        mixed = _FakeShardedSource({"input_ids": [1, 2, 3]}, wrapper_name="MixedShardedSource")
+        assert stub._source_is_pretokenized(mixed) is False
