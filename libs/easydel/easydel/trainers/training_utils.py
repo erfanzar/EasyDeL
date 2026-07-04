@@ -1932,7 +1932,14 @@ def _leaf_batch_partition_spec(
         spec = _fit(0)
         if spec is not None:
             return spec
-    if batch_ways and len(shape) >= 2 and int(shape[1]) % batch_ways == 0:
+    # The offset=1 fallback is for genuinely rank>=3 (K, batch, seq) leaves
+    # (e.g. multimodal rope position ids) where dim 0 is a non-batch leading
+    # axis. It must not fire for an ordinary rank-2 (batch, seq) leaf whose
+    # batch dim happens to be uneven (a partial/ragged batch): that would
+    # silently place the BATCH spec onto the sequence axis and leave the
+    # batch axis unsharded, instead of correctly falling through to a fully
+    # replicated spec for that leaf.
+    if batch_ways and len(shape) >= 3 and int(shape[1]) % batch_ways == 0:
         spec = _fit(1)
         if spec is not None:
             return spec

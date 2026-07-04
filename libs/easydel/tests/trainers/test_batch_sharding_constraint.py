@@ -50,6 +50,11 @@ def test_batch_leaves_get_rank_aware_specs():
         "position_ids": np.zeros((3, 8, 16), dtype=np.int32),  # (K, batch, seq)
         "embed_rows": np.zeros((32,), dtype=np.int32),  # rank-1, divisible by dp*fsdp=4
         "odd_meta": np.zeros((5,), dtype=np.int32),  # fits nothing -> replicated
+        # rank-2 (batch, seq) with an UNEVEN batch dim (5 % 4 != 0) whose seq dim
+        # (16) happens to divide dp*fsdp=4. The rank>=3-only offset=1 fallback
+        # must not fire here: this leaf must fully replicate, not get the batch
+        # spec silently placed onto its sequence axis.
+        "ragged_tail_batch": np.zeros((5, 16), dtype=np.int32),
     }
     out = _apply(batch, spec, mesh)
 
@@ -63,6 +68,7 @@ def test_batch_leaves_get_rank_aware_specs():
     assert_sharded_as("position_ids", PartitionSpec(None, ("dp", "fsdp"), "sp"))
     assert_sharded_as("embed_rows", PartitionSpec(("dp", "fsdp")))
     assert_sharded_as("odd_meta", PartitionSpec())
+    assert_sharded_as("ragged_tail_batch", PartitionSpec())
 
     # Sharded values must round-trip unchanged.
     np.testing.assert_array_equal(np.asarray(out["position_ids"]), batch["position_ids"])
