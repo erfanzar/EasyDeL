@@ -327,6 +327,9 @@ class ShardedDataSource(ABC, Generic[T_co]):
             transform: A transform implementing the
                 :class:`~easydel.data.transforms.base.Transform` protocol
                 (per-row callable with ``__call__`` taking a row dict).
+                Transforms that additionally expose a ``map_batch``
+                method (the trainer preprocess transforms) are applied
+                in small row chunks so tokenization is batched.
 
         Returns:
             ShardedDataSource: A new sharded source applying

@@ -1290,6 +1290,16 @@ class SFTPreprocessTransform(Transform):
             outputs[index] = result
 
         for _, (tools, jobs) in conversational_jobs.items():
+            if len(jobs) == 1:
+                # Singleton tool-schema group: agentic mixtures commonly carry a
+                # distinct `tools` list per row, which would degrade this loop to
+                # one template+encode call per row. Render the template per row
+                # instead (cheap, GIL-bound either way) and queue the rendered
+                # text so the shared batched tokenizer call below encodes it
+                # together with every other row of the chunk.
+                example_index, result, messages = jobs[0]
+                self._prepare_rendered_conversational(example_index, result, messages, tools, tokenization_jobs)
+                continue
             try:
                 with self._temporary_truncation_side():
                     tokens = self._tokenizer.apply_chat_template(
@@ -1307,9 +1317,11 @@ class SFTPreprocessTransform(Transform):
                 input_ids_rows = self._as_int32_rows(tokens["input_ids"])
                 attention_mask_rows = self._as_int32_rows(tokens["attention_mask"])
                 for row_index, (example_index, result, _) in enumerate(jobs):
-                    result["input_ids"] = input_ids_rows[row_index]
-                    result["attention_mask"] = attention_mask_rows[row_index]
-                    outputs[example_index] = purify_example(result)
+                    outputs[example_index] = self._finalize_batched_row(
+                        result,
+                        input_ids_rows[row_index],
+                        attention_mask_rows[row_index],
+                    )
             except Exception:
                 for example_index, result, messages in jobs:
                     self._prepare_rendered_conversational(
@@ -1337,11 +1349,40 @@ class SFTPreprocessTransform(Transform):
             input_ids_rows = self._as_int32_rows(tokens["input_ids"])
             attention_mask_rows = self._as_int32_rows(tokens["attention_mask"])
             for row_index, (example_index, result, _) in enumerate(jobs):
-                result["input_ids"] = input_ids_rows[row_index]
-                result["attention_mask"] = attention_mask_rows[row_index]
-                outputs[example_index] = purify_example(result)
+                outputs[example_index] = self._finalize_batched_row(
+                    result,
+                    input_ids_rows[row_index],
+                    attention_mask_rows[row_index],
+                )
 
         return [tp.cast(Example, output) for output in outputs if output is not None]
+
+    def _finalize_batched_row(self, result: dict, input_ids: tp.Any, attention_mask: tp.Any) -> Example:
+        """Attach one batched-tokenization row to its example, matching per-row output.
+
+        Mirrors the tail of the per-row tokenization paths
+        (:meth:`_tokenize_conversational` / :meth:`_tokenize_text`): when
+        ``pad_to_multiple_of`` is configured, rows are converted to plain int
+        lists first so :meth:`_pad_row_to_multiple` applies the same
+        safety-net padding the per-row path applies (tokenizers ignore
+        ``pad_to_multiple_of`` when padding is disabled).
+
+        Args:
+            result: Example dict the token rows belong to (mutated in place).
+            input_ids: This example's row from the batched tokenizer output.
+            attention_mask: This example's attention-mask row.
+
+        Returns:
+            The purified example, exactly as the per-row path would emit it.
+        """
+        if self._pad_to_multiple_of is not None:
+            if not isinstance(input_ids, list):
+                input_ids = [int(token) for token in input_ids]
+            if not isinstance(attention_mask, list):
+                attention_mask = [int(value) for value in attention_mask]
+        result["input_ids"] = input_ids
+        result["attention_mask"] = attention_mask
+        return purify_example(self._pad_row_to_multiple(result))
 
     def _prepare_batched_conversational(
         self,
