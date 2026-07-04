@@ -194,6 +194,27 @@ def _transform_last_axis(x: tp.Any, segment_sizes: tuple[int, ...], tp_size: int
     return xp.concatenate(per_rank, axis=-1)
 
 
+def _reshard_like_source(new_value: tp.Any, source: tp.Any) -> tp.Any:
+    """Re-apply the source leaf's sharding after a shape-preserving layout transform.
+
+    ``_transform_last_axis`` rebuilds the fused last axis with eager ``jnp``
+    ops on arrays that were already placed on their target ``NamedSharding``;
+    GSPMD's inferred output sharding does not preserve the tensor-parallel
+    axis of the fused output dim (the interleave slices cross shard
+    boundaries), silently downgrading e.g. ``P(('fsdp','sp'), 'tp')`` to
+    ``P(('fsdp','sp'), None)``. The transform preserves shape, so the source
+    array's sharding is the correct placement for the result by construction.
+    Non-JAX values (numpy leaves) and sharding-less sources pass through
+    unchanged.
+    """
+    if not isinstance(new_value, jax.Array):
+        return new_value
+    src_sharding = getattr(source, "sharding", None)
+    if src_sharding is None or getattr(new_value, "sharding", None) == src_sharding:
+        return new_value
+    return jax.device_put(new_value, src_sharding)
+
+
 def _key_to_string(key: tp.Any) -> str:
     return ".".join(str(part) for part in key) if isinstance(key, tuple) else str(key)
 
@@ -270,6 +291,7 @@ def _apply(module, flat_state: dict, tp_size: int, *, to_canonical: bool, log_la
                 inner = value.value
             new_inner = _transform_last_axis(inner, sizes, tp_size, to_canonical=to_canonical)
             if new_inner is not inner:
+                new_inner = _reshard_like_source(new_inner, inner)
                 touched += 1
                 if is_param:
                     value.value = new_inner
@@ -316,6 +338,7 @@ def _apply_pytree(module, tree: tp.Any, tp_size: int, *, to_canonical: bool, log
             if _matches_fused_optimizer_leaf(key_str, module_path):
                 new_value = _transform_last_axis(value, sizes, tp_size, to_canonical=to_canonical)
                 if new_value is not value:
+                    new_value = _reshard_like_source(new_value, value)
                     touched += 1
                 return new_value
         return value
