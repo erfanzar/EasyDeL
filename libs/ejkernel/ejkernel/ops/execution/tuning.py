@@ -74,6 +74,7 @@ from jax.sharding import PartitionSpec, Sharding, SingleDeviceSharding
 from ejkernel.loggings import get_logger
 
 from ..config.cache import overlay_cache
+from ..config.persistent import PROVENANCE_AUTOTUNE
 from ..config.selection import _is_autotune_progress_enabled
 from ..utils.fingerprint import device_fingerprint
 from .profiler import Profiler
@@ -426,7 +427,7 @@ def autotune_recorded(hyperparameter_selector, *, show_progress=False, repetitio
 
             hyperparameter_selector.cache.put(dev, op_id_v, call_key, best_cfg)
             if hyperparameter_selector.persistent and hyperparameter_selector.persist_autotune:
-                hyperparameter_selector.persistent.put(dev, op_id_v, call_key, best_cfg)
+                hyperparameter_selector.persistent.put(dev, op_id_v, call_key, best_cfg, provenance=PROVENANCE_AUTOTUNE)
             entries.append(Entry(op_id_v, call_key, best_cfg))
     return AutotuningResult(dev, tuple(entries))
 
