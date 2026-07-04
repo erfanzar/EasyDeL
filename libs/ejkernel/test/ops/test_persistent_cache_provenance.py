@@ -37,6 +37,7 @@ from dataclasses import asdict, dataclass
 
 import jax
 import jax.numpy as jnp
+import pytest
 from ejkernel.ops import (
     AutotunePolicy,
     ConfigCache,
@@ -198,7 +199,7 @@ def test_untrusted_provenance_entry_is_ignored_on_get(tmp_path):
     cache.put("dev", "op@v0", "key", DummyConfig(algorithm="explicit", block_size=512), provenance="override")
     assert cache.get("dev", "op@v0", "key") is None
 
-    cache.put("dev", "op@v0", "key2", DummyConfig(algorithm="tuned", block_size=64))
+    cache.put("dev", "op@v0", "key2", DummyConfig(algorithm="tuned", block_size=64), provenance=PROVENANCE_AUTOTUNE)
     assert cache.get("dev", "op@v0", "key2") == DummyConfig(algorithm="tuned", block_size=64)
 
     # both survive a reload; only the trusted one is served
@@ -214,10 +215,37 @@ def test_corrupt_or_non_dict_cache_file_degrades_to_miss(tmp_path):
     cache = PersistentCache("test-provenance-op", path=str(path), cfg_type=DummyConfig)
     assert cache.get("dev", "op@v0", "key") is None
     # writes still work after a corrupt load and round-trip cleanly
-    cache.put("dev", "op@v0", "key", DummyConfig(algorithm="tuned", block_size=64))
+    cache.put("dev", "op@v0", "key", DummyConfig(algorithm="tuned", block_size=64), provenance=PROVENANCE_AUTOTUNE)
     reloaded = PersistentCache("test-provenance-op", path=str(path), cfg_type=DummyConfig)
     assert reloaded.get("dev", "op@v0", "key") == DummyConfig(algorithm="tuned", block_size=64)
 
     path.write_text(json.dumps(["not", "a", "mapping"]))
+    cache = PersistentCache("test-provenance-op", path=str(path), cfg_type=DummyConfig)
+    assert cache.get("dev", "op@v0", "key") is None
+
+
+def test_put_requires_explicit_provenance(tmp_path):
+    """No default: every call site must make an explicit, reviewable choice.
+
+    This is the safety property itself -- if `put` ever regains a default
+    (e.g. back to `PROVENANCE_AUTOTUNE`), a caller that forgets `provenance=`
+    silently writes a trusted entry, reproducing the original incident one
+    layer down from the ConfigSelectorChain call sites this module guards.
+    """
+    path = tmp_path / "test-provenance-op.json"
+    cache = PersistentCache("test-provenance-op", path=str(path), cfg_type=DummyConfig)
+    with pytest.raises(TypeError):
+        cache.put("dev", "op@v0", "key", DummyConfig(algorithm="tuned", block_size=64))
+
+
+def test_non_hashable_provenance_value_degrades_to_miss_not_crash(tmp_path):
+    """A malformed entry (foreign process, disk corruption) must never crash a reader.
+
+    `provenance` is checked via a set-membership test; a list/dict value there
+    would raise TypeError on `in` if not guarded, crashing every reader of that
+    key instead of degrading to a cache miss as the class docstring promises.
+    """
+    path = tmp_path / "test-provenance-op.json"
+    path.write_text(json.dumps({"dev|op@v0|key": {PROVENANCE_KEY: ["autotune"], "cfg": {"block_size": 999}}}))
     cache = PersistentCache("test-provenance-op", path=str(path), cfg_type=DummyConfig)
     assert cache.get("dev", "op@v0", "key") is None

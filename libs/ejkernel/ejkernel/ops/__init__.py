@@ -60,6 +60,9 @@ Example Usage:
 """
 
 from .config import (
+    PROVENANCE_AUTOTUNE,
+    PROVENANCE_KEY,
+    TRUSTED_PROVENANCE,
     AutotunePolicy,
     ConfigCache,
     ConfigSelectorChain,
@@ -106,6 +109,9 @@ from .utils import (
 )
 
 __all__ = (
+    "PROVENANCE_AUTOTUNE",
+    "PROVENANCE_KEY",
+    "TRUSTED_PROVENANCE",
     "AutotuneData",
     "AutotunePolicy",
     "Autotuner",

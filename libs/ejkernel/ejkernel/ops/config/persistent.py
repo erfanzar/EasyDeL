@@ -36,8 +36,9 @@ The persistent cache complements the in-memory cache by providing:
 
 Example Usage:
     >>>
+    >>> from ejkernel.ops.config.persistent import PROVENANCE_AUTOTUNE
     >>> cache = PersistentCache('/path/to/cache.json')
-    >>> cache.put('gpu:0', 'matmul_v1', 'key123', my_config)
+    >>> cache.put('gpu:0', 'matmul_v1', 'key123', my_config, provenance=PROVENANCE_AUTOTUNE)
     >>> config = cache.get('gpu:0', 'matmul_v1', 'key123')
     >>>
     >>>
@@ -236,7 +237,13 @@ class PersistentCache(Generic[Cfg]):
             return None
         if not isinstance(raw, dict) or PROVENANCE_KEY not in raw:
             return None
-        if raw.get(PROVENANCE_KEY) not in TRUSTED_PROVENANCE:
+        provenance = raw.get(PROVENANCE_KEY)
+        # `provenance` comes from a file this process doesn't fully control (shared
+        # across other processes/hosts); a foreign or malformed entry can carry a
+        # non-hashable value (list/dict) here, which would raise on the `in`
+        # membership check below. Reject anything that isn't a plain trusted string
+        # instead of letting a malformed entry crash every reader of this key.
+        if not isinstance(provenance, str) or provenance not in TRUSTED_PROVENANCE:
             return None
         raw = raw.get("cfg")
         out = None if raw is None else (self.loader(raw) if self.loader else raw)
@@ -247,7 +254,7 @@ class PersistentCache(Generic[Cfg]):
                 out = self.cfg_type(**out)
         return out
 
-    def put(self, device: str, op_id: str, call_key: str, cfg: Cfg, provenance: str = PROVENANCE_AUTOTUNE):
+    def put(self, device: str, op_id: str, call_key: str, cfg: Cfg, *, provenance: str):
         """Store configuration in the cache with atomic file update.
 
         Args:
@@ -256,12 +263,15 @@ class PersistentCache(Generic[Cfg]):
             call_key: Function call signature hash
             cfg: Configuration to store
             provenance: Origin of the configuration, recorded in the entry's
-                envelope (default: :data:`PROVENANCE_AUTOTUNE`). Only
-                autotune-measured winners belong in this cache — the file is
-                shared across processes, and :meth:`get` ignores entries whose
-                provenance is not in :data:`TRUSTED_PROVENANCE`. Explicit
-                caller-provided configs and heuristic fallbacks must stay in
-                per-process in-memory caches instead.
+                envelope. Required (no default) so every call site makes an
+                explicit, reviewable choice — the file is shared across
+                processes, and :meth:`get` trusts entries whose provenance is
+                in :data:`TRUSTED_PROVENANCE`. Only pass
+                :data:`PROVENANCE_AUTOTUNE` for winners that were actually
+                measured by the autotuner. Explicit caller-provided configs
+                and heuristic fallbacks must stay in per-process in-memory
+                caches instead — never persist them here under any
+                provenance value.
 
         Note:
             Uses atomic file operations (write to temporary file, then replace)
