@@ -410,7 +410,22 @@ class ParquetShardedSource(ShardedDataSource[dict]):
 
     @staticmethod
     def _table_to_rows(table: tp.Any) -> "Iterator[dict]":
-        """Yield row dictionaries from an Arrow table."""
+        """Yield row dictionaries from an Arrow table.
+
+        Numeric columns (primitives and list-of-primitive) are materialized as
+        numpy views sliced zero-copy from the Arrow buffers instead of Python
+        object lists: ``to_pydict`` on token/embedding columns creates millions
+        of Python ints/floats per batch, and that allocation churn holds the
+        GIL on dataloader threads long enough to stall step dispatch
+        fleet-wide (measured 13-25s put-phase stalls on v5p-2048, 2026-07-04).
+        Strings, structs (e.g. ``messages``), and anything unexpected keep the
+        original Python materialization.
+        """
+        try:
+            yield from ParquetShardedSource._table_to_rows_numpy(table)
+            return
+        except Exception:  # noqa: BLE001 - any surprise reverts to the legacy path
+            pass
         try:
             cols = table.to_pydict()
         except Exception as exc:
@@ -425,6 +440,46 @@ class ParquetShardedSource(ShardedDataSource[dict]):
         n = len(next(iter(cols.values()), []))
         for i in range(n):
             yield {k: v[i] for k, v in cols.items()}
+
+    @staticmethod
+    def _table_to_rows_numpy(table: tp.Any) -> "Iterator[dict]":
+        """Numpy-first row materialization (see ``_table_to_rows``)."""
+        import numpy as np
+        import pyarrow as pa  # pyright: ignore[reportMissingTypeStubs]
+
+        n = int(table.num_rows)
+        if n == 0:
+            return
+        fast_list: dict[str, tuple[tp.Any, tp.Any]] = {}
+        fast_flat: dict[str, tp.Any] = {}
+        slow: dict[str, list] = {}
+        for name in table.column_names:
+            column = table.column(name)
+            arr = column.combine_chunks() if hasattr(column, "combine_chunks") else column
+            atype = arr.type
+            if (
+                (pa.types.is_list(atype) or pa.types.is_large_list(atype))
+                and pa.types.is_primitive(atype.value_type)
+                and not pa.types.is_boolean(atype.value_type)
+                and arr.null_count == 0
+            ):
+                values = arr.values.to_numpy(zero_copy_only=False)
+                offsets = arr.offsets.to_numpy(zero_copy_only=False)
+                fast_list[name] = (offsets, values)
+            elif pa.types.is_primitive(atype) and not pa.types.is_boolean(atype) and arr.null_count == 0:
+                fast_flat[name] = arr.to_numpy(zero_copy_only=False)
+            else:
+                slow[name] = arr.to_pylist()
+        del table
+        for i in range(n):
+            row: dict[str, tp.Any] = {}
+            for name, (offsets, values) in fast_list.items():
+                row[name] = values[offsets[i] : offsets[i + 1]]
+            for name, flat in fast_flat.items():
+                row[name] = flat[i]
+            for name, pylist in slow.items():
+                row[name] = pylist[i]
+            yield row
 
     @staticmethod
     def _column_output_key(column: str) -> str:
