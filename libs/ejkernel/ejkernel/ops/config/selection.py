@@ -76,7 +76,7 @@ from ejkernel.loggings import get_logger
 from ..core import Invocation, Kernel, _get_platform_method
 from ..utils.fingerprint import device_fingerprint, get_device_platform
 from .cache import ConfigCache, _cache_overlay
-from .persistent import PersistentCache
+from .persistent import PROVENANCE_AUTOTUNE, PersistentCache
 
 Cfg = TypeVar("Cfg")
 Out = TypeVar("Out")
@@ -583,6 +583,15 @@ class ConfigSelectorChain(Generic[Cfg, Out]):
         persist_autotune: Whether to save autotuned configs to persistent storage
         on_event: Optional callback for selection events
         forbid_reautotune: Prevent re-autotuning the same operation
+
+    Note:
+        Only autotune-measured winners are written to the persistent cache
+        (with ``provenance='autotune'``). Explicit override configs and
+        heuristic fallbacks are cached in memory for the current process only:
+        the persistent file is shared by every process on the host with the
+        same device fingerprint, and persisting unmeasured configs would let
+        one process (e.g. a benchmark) silently impose them on another
+        (e.g. production training) at the same shapes.
     """
 
     def __init__(
@@ -647,8 +656,6 @@ class ConfigSelectorChain(Generic[Cfg, Out]):
             cfg = inv.override_cfg
             self._emit("override", device=dev, op_id=op_id, call_key=call_key, cfg=cfg)
             self.cache.put(dev, op_id, call_key, cfg)
-            if self.persistent is not None:
-                self.persistent.put(dev, op_id, call_key, cfg)
             return cfg
 
         for overlay in reversed(_cache_overlay.get()):
@@ -771,7 +778,7 @@ class ConfigSelectorChain(Generic[Cfg, Out]):
                 self._autotuned_keys.add((dev, op_id, call_key))
                 self.cache.put(dev, op_id, call_key, best)
                 if self.persistent is not None and self.persist_autotune:
-                    self.persistent.put(dev, op_id, call_key, best)
+                    self.persistent.put(dev, op_id, call_key, best, provenance=PROVENANCE_AUTOTUNE)
                 self._emit(
                     "autotune_finish",
                     device=dev,
@@ -803,8 +810,6 @@ class ConfigSelectorChain(Generic[Cfg, Out]):
             )
 
             self.cache.put(dev, op_id, call_key, cfg)
-            if self.persistent is not None and self.persist_autotune:
-                self.persistent.put(dev, op_id, call_key, cfg)
             return cfg
 
         self._emit("error", device=dev, op_id=op_id, call_key=call_key, reason="no_config")

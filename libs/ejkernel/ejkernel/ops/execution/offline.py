@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import jax
 
+from ..config.persistent import PROVENANCE_AUTOTUNE
 from ..config.selection import ConfigSelectorChain
 from ..core import _get_platform_method
 from ..registry import get_invocations
@@ -157,7 +158,7 @@ def autotune_lowered(selector: ConfigSelectorChain, lowered) -> AutotuningResult
             best = selector.tuner.autotune(mk, inv_args, dyn_kwargs, candidates)
         selector.cache.put(dev, op_id_v, call_key, best)
         if selector.persistent is not None and selector.persist_autotune:
-            selector.persistent.put(dev, op_id_v, call_key, best)
+            selector.persistent.put(dev, op_id_v, call_key, best, provenance=PROVENANCE_AUTOTUNE)
         entries.append(Entry(op_id_v, call_key, best))
 
     return AutotuningResult(dev, tuple(entries))

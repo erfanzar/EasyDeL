@@ -37,7 +37,7 @@ Classes:
 """
 
 from .cache import ConfigCache, overlay_cache
-from .persistent import PersistentCache
+from .persistent import PROVENANCE_AUTOTUNE, PROVENANCE_KEY, TRUSTED_PROVENANCE, PersistentCache
 from .selection import (
     AutotunePolicy,
     ConfigSelectorChain,
@@ -49,6 +49,9 @@ from .selection import (
 )
 
 __all__ = (
+    "PROVENANCE_AUTOTUNE",
+    "PROVENANCE_KEY",
+    "TRUSTED_PROVENANCE",
     "AutotunePolicy",
     "ConfigCache",
     "ConfigSelectorChain",

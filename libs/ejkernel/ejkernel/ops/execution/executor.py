@@ -712,8 +712,11 @@ class Executor(Generic[Cfg, Out]):
 
         Note:
             Unlike the full selector.choose path, this method never triggers
-            autotuning. Selected configurations are written back to caches
-            for future use.
+            autotuning. Selected configurations are written back to the
+            in-memory cache only: neither explicit overrides nor heuristic
+            fallbacks are autotune-measured, so they are never persisted to
+            the shared on-disk cache (which other processes on the same
+            device would otherwise inherit).
         """
         dev = device_fingerprint()
         op_id_v = f"{kernel.op_id}@v{getattr(kernel, 'version', '0')}"
@@ -722,8 +725,6 @@ class Executor(Generic[Cfg, Out]):
         if inv.override_cfg is not None:
             cfg = self._coerce_cfg(inv.override_cfg, kernel, inv)
             self.chooser.cache.put(dev, op_id_v, call_key, cfg)
-            if self.chooser.persistent is not None and self.chooser.persist_autotune:
-                self.chooser.persistent.put(dev, op_id_v, call_key, cfg)
             return cfg
 
         for overlay in reversed(_cache_overlay.get()):
@@ -744,8 +745,6 @@ class Executor(Generic[Cfg, Out]):
         cfg = heuristic_cfg_method(inv)
 
         self.chooser.cache.put(dev, op_id_v, call_key, cfg)
-        if self.chooser.persistent is not None and self.chooser.persist_autotune:
-            self.chooser.persistent.put(dev, op_id_v, call_key, cfg)
         return cfg
 
     def compile(self, kernel: Kernel[Cfg, Out], *example_args, cfg: Cfg | None = None, **example_kwargs):

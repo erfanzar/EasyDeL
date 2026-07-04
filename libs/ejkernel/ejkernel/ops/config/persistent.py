@@ -25,6 +25,8 @@ Key Features:
     - Custom loader/dumper support for complex types
     - Device and operation-specific configuration storage
     - Thread-safe atomic updates using temporary files
+    - Provenance envelopes: only autotune-measured entries are trusted on
+      read; legacy or foreign-origin entries are ignored, not loaded
 
 The persistent cache complements the in-memory cache by providing:
     - Long-term storage of optimization results
@@ -57,6 +59,24 @@ from typing import Any, Generic, TypeVar
 
 Cfg = TypeVar("Cfg")
 
+PROVENANCE_KEY = "__ejk_provenance__"
+"""Envelope key marking a persisted entry's origin (e.g. ``'autotune'``)."""
+
+PROVENANCE_AUTOTUNE = "autotune"
+"""Provenance recorded for configurations measured by the autotuner."""
+
+TRUSTED_PROVENANCE: frozenset[str] = frozenset({PROVENANCE_AUTOTUNE})
+"""Provenance values that :meth:`PersistentCache.get` will return.
+
+The on-disk cache file is shared between processes on the same host (keys are
+``device_fingerprint|op_id|call_key``), so any process — a benchmark, a
+notebook, a stray script — running the same op at the same shapes writes into
+the same entry a production run would read. Only autotune-measured winners are
+trustworthy across processes; anything else (explicit caller-provided configs,
+heuristic fallbacks, legacy entries written before provenance existed) is
+ignored on read and re-tuned instead.
+"""
+
 
 class PersistentCache(Generic[Cfg]):
     """Disk-backed JSON cache for kernel configurations.
@@ -64,6 +84,14 @@ class PersistentCache(Generic[Cfg]):
     Stores and retrieves optimisation results across Python process restarts.
     Uses atomic file operations (write to a temp file, then ``os.replace``) to
     prevent data corruption during concurrent writes.
+
+    Every entry written by :meth:`put` is wrapped in a provenance envelope
+    ``{"__ejk_provenance__": <origin>, "cfg": <serialized config>}``.
+    :meth:`get` only returns entries whose provenance is in
+    :data:`TRUSTED_PROVENANCE`; legacy entries written without an envelope
+    (pre-provenance files) are treated as cache misses rather than errors, so
+    an old or polluted cache file degrades to re-tuning instead of silently
+    poisoning a run.
 
     The cache is *best-effort*: if the backing file cannot be created or written
     (e.g. due to permission errors or a read-only filesystem), the instance
@@ -160,8 +188,9 @@ class PersistentCache(Generic[Cfg]):
             return
         try:
             with open(self.path, "r") as f:
-                self._data = json.load(f)
-        except (FileNotFoundError, PermissionError, OSError):
+                loaded = json.load(f)
+            self._data = loaded if isinstance(loaded, dict) else {}
+        except (FileNotFoundError, PermissionError, OSError, ValueError):
             self._data = {}
 
     def _key(self, device: str, op_id: str, call_key: str) -> str:
@@ -186,15 +215,30 @@ class PersistentCache(Generic[Cfg]):
             call_key: Function call signature hash
 
         Returns:
-            Cached configuration if found, None otherwise
+            Cached configuration if found and its provenance is trusted,
+            None otherwise.
 
         Note:
-            If a custom loader was provided, it will be used to deserialize
-            the stored data. Otherwise, the raw JSON data is returned.
+            Only entries carrying a trusted provenance envelope (see
+            :data:`TRUSTED_PROVENANCE`) are returned. Legacy entries written
+            before provenance existed, and entries with untrusted provenance,
+            are treated as cache misses so callers re-tune instead of
+            inheriting configurations of unknown origin from other processes.
+
+            If a custom loader was provided, it is applied to the unwrapped
+            config payload. Otherwise, the raw payload is returned (dicts are
+            reconstructed via ``cfg_type`` or wrapped in a ``Namespace``).
         """
         if self._disabled:
             return None
         raw = self._data.get(self._key(device, op_id, call_key))
+        if raw is None:
+            return None
+        if not isinstance(raw, dict) or PROVENANCE_KEY not in raw:
+            return None
+        if raw.get(PROVENANCE_KEY) not in TRUSTED_PROVENANCE:
+            return None
+        raw = raw.get("cfg")
         out = None if raw is None else (self.loader(raw) if self.loader else raw)
         if out is not None and isinstance(out, dict):
             if self.cfg_type is None:
@@ -203,7 +247,7 @@ class PersistentCache(Generic[Cfg]):
                 out = self.cfg_type(**out)
         return out
 
-    def put(self, device: str, op_id: str, call_key: str, cfg: Cfg):
+    def put(self, device: str, op_id: str, call_key: str, cfg: Cfg, provenance: str = PROVENANCE_AUTOTUNE):
         """Store configuration in the cache with atomic file update.
 
         Args:
@@ -211,6 +255,13 @@ class PersistentCache(Generic[Cfg]):
             op_id: Operation identifier
             call_key: Function call signature hash
             cfg: Configuration to store
+            provenance: Origin of the configuration, recorded in the entry's
+                envelope (default: :data:`PROVENANCE_AUTOTUNE`). Only
+                autotune-measured winners belong in this cache — the file is
+                shared across processes, and :meth:`get` ignores entries whose
+                provenance is not in :data:`TRUSTED_PROVENANCE`. Explicit
+                caller-provided configs and heuristic fallbacks must stay in
+                per-process in-memory caches instead.
 
         Note:
             Uses atomic file operations (write to temporary file, then replace)
@@ -236,7 +287,7 @@ class PersistentCache(Generic[Cfg]):
             else:
                 val = cfg
 
-        self._data[self._key(device, op_id, call_key)] = val
+        self._data[self._key(device, op_id, call_key)] = {PROVENANCE_KEY: provenance, "cfg": val}
 
         try:
             dir_name = os.path.dirname(os.path.abspath(self.path)) or "."
