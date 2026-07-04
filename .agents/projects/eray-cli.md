@@ -19,7 +19,7 @@ eray
 ├── status    last N runs, truthful verdicts (alias: ps)         [P1 ✅]
 ├── logs      driver logs: follow / errors-only / grep           [P1 ✅]
 ├── stop      stop by id / --last                                [P1 ✅]
-├── watch     live watcher: phases, --until-step, --alert       [✅]
+├── watch     full log stream + phases, --until-step, --alert    [✅]
 ├── doctor    disk, raylet logs, TPU locks, pkgs, nodes, --json  [✅]
 ├── clean     raylet | packages | sessions | all                 [✅]
 ├── nodes     alive nodes + TPU chip totals                      [✅]
@@ -85,10 +85,22 @@ lines; `--grep PATTERN` filters; `-f/--follow` streams.
 
 `eray stop <id>` or `eray stop --last`. No bare stop-everything.
 
+### eray watch
+
+`eray watch [id|last]` — streams the job's full driver log to stdout live
+(the same websocket tail as `eray logs -f`, via `client.tail_job_logs`),
+so the operator sees real output, not just a summary. On top of the raw
+stream it scans the accumulated text for phase transitions (prints an
+`[INFO] phase: ...` banner on change), `--alert 'kl_loss>5'`-style metric
+thresholds, error signatures, and `--until-step N`. `tail_job_logs` always
+replays the log from byte 0 on (re)connect, so a `seen` cursor de-dupes
+replayed content — a dropped websocket doesn't re-print history. Exit codes:
+0 (until-step reached or job succeeded), 1 (error signature or job failed),
+2 (an alert fired), 3 (`--timeout-min` elapsed). Fails fast (exit 1) if
+`job_id` doesn't exist, instead of looping silently until the timeout.
+
 ## P2/P3 sketches
 
-- `watch`: `--until-step N`, `--alert 'kl_loss>5'`, `--alert 'step_time>120'`,
-  phase-transition + first-metrics + error-signature events.
 - `doctor`: df per mount, raylet/gcs log sizes (>5 GB flagged, suggests
   `eray clean raylet`), alive nodes vs expected, dashboard reachability,
   TPU device lock holders, stale `_ray_pkg` bytes.
