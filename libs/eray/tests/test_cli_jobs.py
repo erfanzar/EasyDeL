@@ -14,6 +14,7 @@
 
 """Tests for eray.cli.jobs — run/status/logs/stop."""
 
+import threading
 import time
 from types import SimpleNamespace
 
@@ -359,3 +360,105 @@ class TestTpuDeviceHolders:
         assert isinstance(holders, list)
         for h in holders:
             assert {"pid", "device", "cmd"} <= set(h)
+
+
+class _WatchClient(FakeClient):
+    """FakeClient extended with the tail/status surface `watch` uses.
+
+    ``log_scripts`` is a list of per-connection scripts; each script is a list
+    of chunks that connection yields before closing (StopAsyncIteration). An
+    entry of ``ConnectionError`` raises it mid-stream to force a reconnect.
+    """
+
+    def __init__(self, jobs_list=None, log_scripts=None, status="SUCCEEDED"):
+        super().__init__(jobs_list=jobs_list)
+        self.log_scripts = list(log_scripts or [])
+        self.status = status
+
+    def get_job_status(self, submission_id):
+        return SimpleNamespace(value=self.status)
+
+    def tail_job_logs(self, submission_id):
+        script = self.log_scripts.pop(0) if self.log_scripts else []
+
+        async def _gen():
+            for chunk in script:
+                if isinstance(chunk, type) and issubclass(chunk, BaseException):
+                    raise chunk("stream dropped")
+                yield chunk
+
+        return _gen()
+
+
+class TestWatchPreflight:
+    def test_missing_job_exits_1_with_not_found(self, monkeypatch):
+        fake = _WatchClient(jobs_list=[_job("raysubmit_other", "RUNNING")])
+        monkeypatch.setattr(jobs, "make_client", lambda address: fake)
+        result = CliRunner().invoke(jobs.watch, ["raysubmit_missing"])
+        assert result.exit_code == 1
+        assert "not found" in result.output
+
+    def test_dashboard_error_is_not_reported_as_not_found(self, monkeypatch):
+        fake = _WatchClient()
+        fake.list_jobs = lambda: (_ for _ in ()).throw(ConnectionError("dashboard 502"))
+        monkeypatch.setattr(jobs, "make_client", lambda address: fake)
+        result = CliRunner().invoke(jobs.watch, ["raysubmit_x"])
+        assert result.exit_code == 1
+        assert "could not reach" in result.output
+        assert "not found" not in result.output
+
+    def test_hung_dashboard_probe_exits_promptly(self, monkeypatch):
+        """A black-holed list_jobs (no HTTP timeout in Ray's SDK) must not hang
+        the pre-flight past its bound -- the probe thread is a daemon precisely
+        so neither the join, a pool shutdown, nor interpreter exit waits on it."""
+        hang = threading.Event()
+        fake = _WatchClient()
+        fake.list_jobs = lambda: hang.wait(30)
+        monkeypatch.setattr(jobs, "make_client", lambda address: fake)
+        monkeypatch.setattr(jobs, "_PREFLIGHT_TIMEOUT_S", 0.3)
+        start = time.monotonic()
+        result = CliRunner().invoke(jobs.watch, ["raysubmit_x"])
+        elapsed = time.monotonic() - start
+        hang.set()  # release the probe thread promptly after the assertion window
+        assert result.exit_code == 1
+        assert "could not reach" in result.output and "within" in result.output
+        assert elapsed < 5, f"pre-flight was supposed to give up in ~0.3s, took {elapsed:.1f}s"
+
+    def test_interval_flag_is_accepted_and_ignored(self, monkeypatch):
+        fake = _WatchClient(jobs_list=[_job("raysubmit_a", "SUCCEEDED")], log_scripts=[["done\n"]])
+        monkeypatch.setattr(jobs, "make_client", lambda address: fake)
+        result = CliRunner().invoke(jobs.watch, ["raysubmit_a", "--interval", "30"])
+        assert result.exit_code == 0, result.output
+        assert "deprecated" in result.output
+
+
+class TestWatchStream:
+    def test_succeeded_job_streams_log_and_exits_0(self, monkeypatch):
+        fake = _WatchClient(jobs_list=[_job("raysubmit_a", "SUCCEEDED")], log_scripts=[["hello\n", "world\n"]])
+        monkeypatch.setattr(jobs, "make_client", lambda address: fake)
+        result = CliRunner().invoke(jobs.watch, ["raysubmit_a"])
+        assert result.exit_code == 0, result.output
+        assert "hello\nworld\n" in result.output
+        assert "SUCCEEDED" in result.output
+
+    def test_reconnect_replay_is_deduped_not_reprinted_or_dropped(self, monkeypatch):
+        """tail_job_logs replays the whole log from byte 0 on every (re)connect
+        (Ray's file_tail_iterator opens the file at the start); the seen/replayed
+        cursor must print replayed content exactly once and never skip the new
+        tail that follows it."""
+        fake = _WatchClient(
+            jobs_list=[_job("raysubmit_a", "SUCCEEDED")],
+            log_scripts=[
+                ["AAAA", "BBBB", ConnectionError],  # drops mid-stream after 8 chars
+                ["AAAABB", "BBCCCC"],  # replay from byte 0, then 4 genuinely new chars
+            ],
+        )
+        monkeypatch.setattr(jobs, "make_client", lambda address: fake)
+        result = CliRunner().invoke(jobs.watch, ["raysubmit_a"])
+        assert result.exit_code == 0, result.output
+        # Each stream segment exactly once (replay deduped, nothing dropped),
+        # in order. Contiguity is not asserted: info()/warning() stderr lines
+        # interleave with the stdout stream in CliRunner's mixed capture.
+        for segment in ("AAAA", "BBBB", "CCCC"):
+            assert result.output.count(segment) == 1, result.output
+        assert result.output.index("BBBB") < result.output.index("CCCC")
