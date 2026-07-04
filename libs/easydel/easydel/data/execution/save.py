@@ -966,6 +966,7 @@ def save_dataset(
     max_shard_size: str | int = "500MB",
     num_shards: int | None = None,
     compression: str | None = None,
+    overwrite: bool = False,
 ) -> WriteStats:
     """One-call helper: write a sharded source to disk without setting up a pipeline.
 
@@ -996,6 +997,7 @@ def save_dataset(
         max_shard_size=max_shard_size,
         num_shards=num_shards,
         compression=compression,
+        overwrite=overwrite,
     )
     return writer.write(source)
 
@@ -1006,6 +1008,7 @@ def save_iterator(
     format: str = "parquet",  # noqa:A002
     max_shard_size: str | int = "500MB",
     compression: str | None = None,
+    overwrite: bool = False,
 ) -> WriteStats:
     """Persist an arbitrary iterator-of-rows by adapting it as a single-shard source.
 
@@ -1085,4 +1088,4 @@ def save_iterator(
             return self._it
 
     source = IteratorSource(iterator)
-    return save_dataset(source, output_path, format, max_shard_size, compression=compression)
+    return save_dataset(source, output_path, format, max_shard_size, compression=compression, overwrite=overwrite)
