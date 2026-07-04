@@ -822,6 +822,14 @@ class Trainer(BaseTrainer):
                             train_metrics["performance/data_fetch_time"] = float(step_prefetcher.last_fetch_seconds)
                         if step_prefetcher.last_collate_seconds is not None:
                             train_metrics["performance/data_collate_time"] = float(step_prefetcher.last_collate_seconds)
+                    for attr, metric in (
+                        ("_last_step_preprocess_seconds", "performance/step_preprocess_time"),
+                        ("_last_step_put_dispatch_seconds", "performance/step_put_dispatch_time"),
+                        ("_last_step_device_sync_seconds", "performance/step_device_sync_time"),
+                    ):
+                        value = getattr(self, attr, None)
+                        if value is not None:
+                            train_metrics[metric] = float(value)
                     train_step_time = train_metrics.get("performance/train_step_time")
                     if train_step_time is not None:
                         remaining_steps = max(self.max_training_steps - current_step, 0)
@@ -1137,11 +1145,13 @@ class Trainer(BaseTrainer):
         metrics = LossMetrics()
         try:
             self._runtime_trace("execute_train_step.preprocess.begin", batch=self._runtime_batch_summary(batch))
-            batch, informations = self._preprocess_batch_input(
-                state=state,
-                batch=batch,
-                is_train=True,
-            )
+            with capture_time() as _preprocess_time:
+                batch, informations = self._preprocess_batch_input(
+                    state=state,
+                    batch=batch,
+                    is_train=True,
+                )
+            self._last_step_preprocess_seconds = float(_preprocess_time())
             self._runtime_trace(
                 "execute_train_step.preprocess.end",
                 batch=self._runtime_batch_summary(batch),
@@ -1160,24 +1170,34 @@ class Trainer(BaseTrainer):
                 bi = self._bucket_for_step
                 base_graphdef = state.graphdef
                 bucket_state = state.replace(graphdef=self._bucket_graphdefs[bi])
-                state, metrics = jax.block_until_ready(
-                    self._bucket_step_fns[bi](
+                # Split "collated batch in hand -> outputs on host" into the
+                # host put/dispatch phase (arg transfer + enqueue; returns
+                # async) and the device+fleet-sync phase (execution, all-host
+                # collectives, retirement).
+                with capture_time() as _put_dispatch_time:
+                    _result = self._bucket_step_fns[bi](
                         bucket_state,
                         batch,
                         *self._bucket_extra_args[bi],
                         *self._bucket_static_args[bi],
                     )
-                )
+                self._last_step_put_dispatch_seconds = float(_put_dispatch_time())
+                with capture_time() as _device_sync_time:
+                    state, metrics = jax.block_until_ready(_result)
+                self._last_step_device_sync_seconds = float(_device_sync_time())
                 state = state.replace(graphdef=base_graphdef)
             else:
-                state, metrics = jax.block_until_ready(
-                    self.sharded_training_step_function(
+                with capture_time() as _put_dispatch_time:
+                    _result = self.sharded_training_step_function(
                         state,
                         batch,
                         *self._train_shared_fn_extra_args,
                         *self._train_shared_fn_static_args,
                     )
-                )
+                self._last_step_put_dispatch_seconds = float(_put_dispatch_time())
+                with capture_time() as _device_sync_time:
+                    state, metrics = jax.block_until_ready(_result)
+                self._last_step_device_sync_seconds = float(_device_sync_time())
             self._runtime_trace(
                 "execute_train_step.compiled_call.end",
                 step=int(jax.device_get(state.step)),
