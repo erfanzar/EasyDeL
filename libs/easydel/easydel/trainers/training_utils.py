@@ -2108,6 +2108,10 @@ def compile_trainer_step(
         "keep_unused": keep_unused,
         **jit_kwargs,
     }
+    if arguments is not None:
+        _compiler_options = getattr(arguments, "xla_compiler_options", None)
+        if _compiler_options:
+            kwargs.setdefault("compiler_options", dict(_compiler_options))
     if mesh is not None:
         kwargs["mesh"] = mesh
     if in_shardings is not _UNSPECIFIED:
