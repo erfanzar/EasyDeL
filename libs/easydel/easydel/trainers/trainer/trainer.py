@@ -32,6 +32,9 @@ and multimodal architectures.
 """
 
 import collections.abc
+import json as _json
+import os
+import time as _time
 import typing as tp
 
 import jax
@@ -1098,6 +1101,33 @@ class Trainer(BaseTrainer):
             metrics = metrics.replace(other_metrics=informations)
         return metrics
 
+    def _append_host_phase_log(self) -> None:
+        """Append this host's step-phase timings to a local jsonl (fleet debug).
+
+        Enabled via EASYDEL_HOST_PHASE_LOG=<path>. Each process writes its own
+        local file; collecting them across hosts lets the per-step fleet max be
+        attributed to a specific host (rank-0 metrics cannot see stragglers).
+        """
+        path = os.environ.get("EASYDEL_HOST_PHASE_LOG")
+        if not path:
+            return
+        try:
+            with open(path, "a") as fh:
+                fh.write(
+                    _json.dumps(
+                        {
+                            "t": round(_time.time(), 3),
+                            "proc": int(jax.process_index()),
+                            "put": round(getattr(self, "_last_step_put_dispatch_seconds", -1.0), 3),
+                            "dev": round(getattr(self, "_last_step_device_sync_seconds", -1.0), 3),
+                            "pre": round(getattr(self, "_last_step_preprocess_seconds", -1.0), 3),
+                        }
+                    )
+                    + "\n"
+                )
+        except Exception as _e:
+            pass
+
     def _execute_train_step(
         self,
         state,
@@ -1185,6 +1215,7 @@ class Trainer(BaseTrainer):
                 with capture_time() as _device_sync_time:
                     state, metrics = jax.block_until_ready(_result)
                 self._last_step_device_sync_seconds = float(_device_sync_time())
+                self._append_host_phase_log()
                 state = state.replace(graphdef=base_graphdef)
             else:
                 with capture_time() as _put_dispatch_time:
