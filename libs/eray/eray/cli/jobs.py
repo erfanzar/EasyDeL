@@ -23,6 +23,8 @@ log so that class of silent failure is visible in the table.
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import getpass
 import glob
 import json
@@ -565,7 +567,6 @@ def run(
 
 def _follow_logs(client, submission_id: str) -> None:
     """Stream driver logs for *submission_id* until the job ends."""
-    import asyncio
 
     async def _tail():
         async for chunk in client.tail_job_logs(submission_id):
@@ -765,60 +766,142 @@ def evaluate_alerts(text: str, exprs: tuple[str, ...]) -> list[str]:
     return fired
 
 
+async def _stream_and_scan(client, job_id: str, alerts: tuple[str, ...], until_step: int | None, deadline: float) -> int:
+    """Stream *job_id*'s full driver log to stdout, scanning it live.
+
+    Reuses the same websocket tail Ray exposes for ``eray logs -f`` (see
+    ``_follow_logs``), so the operator sees real output instead of a
+    phase-only summary. ``tail_job_logs`` always replays the driver log from
+    byte 0 on (re)connect, so a running ``seen`` cursor de-dupes replayed
+    content across reconnects instead of re-printing the whole log.
+
+    Returns:
+        The process exit code ``watch`` should raise: 0 (until-step reached
+        or job succeeded), 1 (error signature or job failed), 2 (alert
+        fired), or 3 (the overall deadline elapsed).
+    """
+    seen = 0
+    scan_buf = ""
+    last_phase = None
+
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return 3
+        replayed = 0
+        try:
+            stream = client.tail_job_logs(job_id).__aiter__()
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return 3
+                chunk = await asyncio.wait_for(stream.__anext__(), timeout=remaining)
+
+                new_text = chunk[seen - replayed :] if replayed < seen else chunk
+                replayed += len(chunk)
+                if not new_text:
+                    continue
+
+                print(new_text, end="", flush=True)
+                seen += len(new_text)
+                scan_buf = (scan_buf + new_text)[-131072:]
+
+                err_sig, phase = scan_log_tail(scan_buf)
+                if phase and phase != last_phase:
+                    info(f"phase: {phase}")
+                    last_phase = phase
+                if err_sig:
+                    error(f"error signature: {err_sig}")
+                    return 1
+                fired = evaluate_alerts(scan_buf, alerts)
+                if fired:
+                    for f in fired:
+                        error(f"alert: {f}")
+                    return 2
+                if until_step is not None:
+                    step = latest_metric(scan_buf, "train_step")
+                    if step is not None and step >= until_step:
+                        info(f"reached step {int(step)}")
+                        return 0
+        except StopAsyncIteration:
+            pass  # server closed the stream — check below whether the job actually ended
+        except TimeoutError:
+            return 3
+        except Exception as exc:
+            warning(f"log stream interrupted ({exc}); reconnecting...")
+            await asyncio.sleep(2)
+            continue
+
+        try:
+            state = str(getattr(client.get_job_status(job_id), "value", ""))
+        except Exception:
+            state = ""
+        if state in ("SUCCEEDED", "FAILED", "STOPPED"):
+            err_sig, _ = scan_log_tail(scan_buf)
+            info(f"job ended: {state} — verdict {verdict_for(state, err_sig)}")
+            return 0 if state == "SUCCEEDED" and not err_sig else 1
+        await asyncio.sleep(2)  # stream closed but job still running — reconnect
+
+
 @click.command()
 @click.argument("job_id", default="last")
 @click.option("--address", "-a", default=None, help="Ray dashboard address.")
-@click.option("--interval", default=30, show_default=True, help="Poll interval seconds.")
 @click.option("--until-step", default=None, type=int, help="Exit 0 once this train_step is reached.")
 @click.option("--alert", "alerts", multiple=True, help="Fire on metric threshold, e.g. 'kl_loss>5' (repeatable).")
 @click.option("--timeout-min", default=120, show_default=True, help="Give up after this many minutes.")
-def watch(job_id, address, interval, until_step, alerts, timeout_min):
-    """Watch a job: phase transitions, metric alerts, error signatures.
+@click.option(
+    "--interval",
+    default=None,
+    type=int,
+    hidden=True,
+    help="Deprecated, ignored: watch now streams live instead of polling.",
+)
+def watch(job_id, address, until_step, alerts, timeout_min, interval):
+    """Stream a job's full driver log live, watching for phases/alerts/errors.
 
     Exit codes: 0 until-step reached or job succeeded; 1 error signature or
     job failed; 2 an --alert fired; 3 watch timeout.
     """
+    if interval is not None:
+        warning("--interval is deprecated and ignored: watch now streams live instead of polling.")
     client = make_client(address)
     if job_id == "last":
         job_id = _resolve_last(client)
         if job_id is None:
             error("no jobs found.")
             raise SystemExit(1)
-        info(f"watching {job_id}")
+    # Check existence via list_jobs() rather than get_job_status(): Ray's SDK
+    # raises the same generic error for "job doesn't exist" and "dashboard
+    # unreachable", so a bare except-and-report-not-found here would tell the
+    # operator monitoring a live run that their job vanished when the real
+    # problem is a transient dashboard blip. A short, explicit timeout also
+    # keeps a black-holed connection from hanging this pre-flight check
+    # forever (unbounded by --timeout-min, which only starts after this
+    # returns).
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            known_ids = pool.submit(lambda: {j.submission_id for j in client.list_jobs()}).result(timeout=15)
+    except concurrent.futures.TimeoutError:
+        error(f"could not reach the Ray dashboard within 15s to check job {job_id}.")
+        raise SystemExit(1) from None
+    except Exception as exc:
+        error(f"could not reach the Ray dashboard to check job {job_id}: {exc}")
+        raise SystemExit(1) from None
+    if job_id not in known_ids:
+        error(f"job {job_id} not found.")
+        raise SystemExit(1)
+    info(f"watching {job_id}")
 
     deadline = time.time() + timeout_min * 60
-    last_phase = None
-    while time.time() < deadline:
-        tail = get_log_tail(client, job_id, max_bytes=131072)
-        err_sig, phase = scan_log_tail(tail)
-        if phase and phase != last_phase:
-            info(f"phase: {phase}")
-            last_phase = phase
-        if err_sig:
-            error(f"error signature: {err_sig}")
-            raise SystemExit(1)
-        fired = evaluate_alerts(tail, alerts)
-        if fired:
-            for f in fired:
-                error(f"alert: {f}")
-            raise SystemExit(2)
-        if until_step is not None:
-            step = latest_metric(tail, "train_step")
-            if step is not None and step >= until_step:
-                info(f"reached step {int(step)}")
-                raise SystemExit(0)
-        try:
-            state = str(getattr(client.get_job_status(job_id), "value", ""))
-            if state in ("SUCCEEDED", "FAILED", "STOPPED"):
-                info(f"job ended: {state} — verdict {verdict_for(state, err_sig)}")
-                raise SystemExit(0 if state == "SUCCEEDED" and not err_sig else 1)
-        except SystemExit:
-            raise
-        except Exception:
-            pass
-        time.sleep(interval)
-    error("watch timeout.")
-    raise SystemExit(3)
+    try:
+        code = asyncio.run(_stream_and_scan(client, job_id, alerts, until_step, deadline))
+    except KeyboardInterrupt:
+        warning("stopped watching (job keeps running).")
+        raise SystemExit(130) from None
+
+    if code == 3:
+        error("watch timeout.")
+    raise SystemExit(code)
 
 
 def component_log_report(max_bytes: int) -> list[dict]:
