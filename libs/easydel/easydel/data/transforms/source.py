@@ -34,18 +34,34 @@ from .base import ExpandTransform, Transform
 
 logger = logging.getLogger(__name__)
 
+#: Default row-chunk size used when a transform exposes ``map_batch``.
+#: Modest on purpose: large enough to amortize per-call tokenizer overhead
+#: (one batched encode releases the GIL across many rows instead of holding
+#: it per row), small enough that streaming latency and peak row buffering
+#: stay negligible relative to trainer batch sizes.
+DEFAULT_MAP_BATCH_SIZE = 32
+
 
 class TransformedShardedSource(ShardedDataSource[dict]):
     """:class:`ShardedDataSource` wrapper that applies a transform lazily on iteration.
 
     Pass-through for shard discovery, metadata, and resumption — only
     iteration is intercepted so the wrapped source's distributed/
-    checkpointable properties survive. Distinguishes the two
-    transform shapes at call time: regular :class:`Transform` instances
+    checkpointable properties survive. Distinguishes the transform
+    shapes at call time: regular :class:`Transform` instances
     have their single result forwarded (or dropped on ``None``), while
     :class:`ExpandTransform` instances have every yielded item
     forwarded individually so a 1-to-many transform integrates
     transparently.
+
+    Transforms exposing a ``map_batch`` method (the trainer preprocess
+    transforms, e.g.
+    :class:`~easydel.trainers.prompt_transforms.SFTPreprocessTransform`)
+    are routed through it in small row chunks instead of per row: up to
+    ``map_batch_size`` rows are buffered and handed to ``map_batch`` in a
+    single call, so expensive per-row work such as tokenization is batched.
+    Row order and ``None``-filtering semantics are identical to the
+    per-row path.
 
     Built by :meth:`ShardedDataSource.transform` /
     :meth:`ShardedDataSource.filter` and friends.
@@ -58,7 +74,12 @@ class TransformedShardedSource(ShardedDataSource[dict]):
         ...     process(example)
     """
 
-    def __init__(self, source: ShardedDataSource[dict], transform: Transform | ExpandTransform):
+    def __init__(
+        self,
+        source: ShardedDataSource[dict],
+        transform: Transform | ExpandTransform,
+        map_batch_size: int | None = None,
+    ):
         """Capture the underlying source and the transform to apply on iteration.
 
         Args:
@@ -69,9 +90,60 @@ class TransformedShardedSource(ShardedDataSource[dict]):
                 or filter) or an :class:`ExpandTransform` (one-in /
                 many-out). The shape is detected at iteration time
                 via ``isinstance``.
+            map_batch_size: Row-chunk size used when ``transform``
+                exposes a ``map_batch`` method. Defaults to
+                :data:`DEFAULT_MAP_BATCH_SIZE`; ignored for per-row
+                transforms.
         """
         self._source = source
         self._transform = transform
+        self._map_batch_size = DEFAULT_MAP_BATCH_SIZE if map_batch_size is None else max(int(map_batch_size), 1)
+
+    def _iter_transformed(self, rows: Iterator[dict]) -> Iterator[dict]:
+        """Apply the transform to a row stream, batching when supported.
+
+        :class:`ExpandTransform` instances yield per input row; transforms
+        with a ``map_batch`` method receive rows in chunks of
+        ``map_batch_size`` (order-preserving, ``None`` results dropped —
+        the same contract as the per-row path); everything else is applied
+        one row at a time.
+
+        Args:
+            rows: Underlying source row iterator.
+
+        Yields:
+            Transformed examples (filtered examples are skipped).
+        """
+        transform = self._transform
+        if isinstance(transform, ExpandTransform):
+            # ExpandTransform: yields multiple examples per input row
+            for example in rows:
+                yield from transform(example)
+            return
+
+        map_batch = getattr(transform, "map_batch", None)
+        if callable(map_batch):
+            # Batched fast path: one map_batch call per row chunk so the
+            # transform can batch tokenizer work instead of encoding per row.
+            chunk: list[dict] = []
+            for example in rows:
+                chunk.append(example)
+                if len(chunk) >= self._map_batch_size:
+                    for result in map_batch(chunk):
+                        if result is not None:
+                            yield result
+                    chunk = []
+            if chunk:
+                for result in map_batch(chunk):
+                    if result is not None:
+                        yield result
+            return
+
+        # Regular Transform: yields single example or None
+        for example in rows:
+            result = transform(example)
+            if result is not None:  # Handle filter transforms
+                yield result
 
     @property
     def shard_names(self) -> Sequence[str]:
@@ -99,15 +171,7 @@ class TransformedShardedSource(ShardedDataSource[dict]):
         Yields:
             Transformed examples (filtered examples are skipped).
         """
-        for example in self._source.open_shard(shard_name):
-            if isinstance(self._transform, ExpandTransform):
-                # ExpandTransform: yields multiple examples
-                yield from self._transform(example)
-            else:
-                # Regular Transform: yields single example or None
-                result = self._transform(example)
-                if result is not None:  # Handle filter transforms
-                    yield result
+        return self._iter_transformed(self._source.open_shard(shard_name))
 
     def open_shard_at_row(self, shard_name: str, row: int) -> Iterator[dict]:
         """Open a shard at a specific row and apply transforms.
@@ -122,15 +186,7 @@ class TransformedShardedSource(ShardedDataSource[dict]):
         Yields:
             Transformed examples (filtered examples are skipped).
         """
-        for example in self._source.open_shard_at_row(shard_name, row):
-            if isinstance(self._transform, ExpandTransform):
-                # ExpandTransform: yields multiple examples
-                yield from self._transform(example)
-            else:
-                # Regular Transform: yields single example or None
-                result = self._transform(example)
-                if result is not None:
-                    yield result
+        return self._iter_transformed(self._source.open_shard_at_row(shard_name, row))
 
     def get_shard_info(self, shard_name: str) -> tp.Any:
         """Pass through ``ShardInfo`` from the underlying source.

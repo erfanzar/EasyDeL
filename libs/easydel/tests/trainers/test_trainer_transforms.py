@@ -409,6 +409,8 @@ class TestSFTPreprocessTransform:
         assert tokenizer.calls[-1]["tools"] == [{"type": "function", "function": {"name": "lookup"}}]
 
     def test_map_batch_batches_sft_tokenizer_calls_and_preserves_tools(self):
+        """Multi-row tool groups template-batch; singleton groups render per row
+        and share one batched tokenizer call, so no row is encoded alone."""
         tokenizer = CountingBatchTokenizer()
         transform = SFTPreprocessTransform(
             tokenizer=tokenizer,
@@ -416,6 +418,7 @@ class TestSFTPreprocessTransform:
         )
 
         tools = [{"type": "function", "function": {"name": "lookup"}}]
+        other_tools = [{"type": "function", "function": {"name": "search"}}]
         results = transform.map_batch(
             [
                 {
@@ -427,6 +430,20 @@ class TestSFTPreprocessTransform:
                 },
                 {
                     "messages": [
+                        {"role": "user", "content": "Howdy"},
+                        {"role": "assistant", "content": "Hello to you!"},
+                    ],
+                    "tools": tools,
+                },
+                {
+                    "messages": [
+                        {"role": "user", "content": "Find it"},
+                        {"role": "assistant", "content": "Searching."},
+                    ],
+                    "tools": other_tools,
+                },
+                {
+                    "messages": [
                         {"role": "user", "content": "Ping"},
                         {"role": "assistant", "content": "Pong"},
                     ],
@@ -434,13 +451,18 @@ class TestSFTPreprocessTransform:
             ]
         )
 
-        assert len(results) == 2
+        assert len(results) == 4
         assert all("input_ids" in result and "attention_mask" in result for result in results)
         assert results[0]["tools"] == tools
-        assert tokenizer.batch_chat_template_calls == 2
-        assert tokenizer.batch_tokenizer_calls == 0
+        assert results[1]["tools"] == tools
+        assert results[2]["tools"] == other_tools
+        # The two rows sharing a tool schema go through one batched
+        # apply_chat_template call; the two singleton groups are rendered per
+        # row and encoded together in a single batched tokenizer call.
+        assert tokenizer.batch_chat_template_calls == 1
+        assert tokenizer.batch_tokenizer_calls == 1
         assert tokenizer.single_tokenizer_calls == 0
-        assert tokenizer.template_tools == [tools, None]
+        assert tokenizer.template_tools == [tools, other_tools, None]
 
     def test_messages_in_text_field(self):
         tokenizer = MockTokenizer()
