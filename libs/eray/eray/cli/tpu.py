@@ -26,6 +26,7 @@ from __future__ import annotations
 import concurrent.futures
 import logging
 import socket
+import subprocess
 import time
 import warnings
 from dataclasses import dataclass
@@ -168,7 +169,16 @@ def connect_tpus(
                 f"--node-ip-address={worker_ip} "
                 f"--disable-usage-stats"
             )
-            return host_idx, run_on_host(tpu, host_idx, worker_cmd, timeout=120, user=user, ssh_key=ssh_key)
+            try:
+                result = run_on_host(tpu, host_idx, worker_cmd, timeout=120, user=user, ssh_key=ssh_key)
+            except Exception as exc:
+                # A single bad/unreachable host (e.g. a hung SSH connection raising
+                # subprocess.TimeoutExpired) must not escape the pool: an exception
+                # here would propagate out of pool.map() and abort the whole join
+                # loop before the other hosts' results are collected, losing
+                # aggregated failure visibility instead of reporting it.
+                result = subprocess.CompletedProcess(args=worker_cmd, returncode=1, stdout="", stderr=str(exc))
+            return host_idx, result
 
         info(f"Starting {tpu.num_hosts - 1} Ray workers in parallel → {ray_address}...")
         failed_workers: list[int] = []
