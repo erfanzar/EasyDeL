@@ -24,7 +24,6 @@ log so that class of silent failure is visible in the table.
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import getpass
 import glob
 import json
@@ -32,6 +31,7 @@ import os
 import re
 import shlex
 import subprocess
+import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -41,6 +41,11 @@ import click
 from .utils import NC, RED, YELLOW, error, info, warning
 
 DEFAULT_DASHBOARD = "http://127.0.0.1:8265"
+
+# Bound on the `watch` pre-flight job-existence probe. Module-level so tests
+# can shrink it; see the probe in `watch` for why a daemon thread (not an HTTP
+# timeout or a thread pool) is what actually enforces it.
+_PREFLIGHT_TIMEOUT_S = 15.0
 
 # Host-machine state that must not leak into a job's runtime env.
 ENV_DENY_EXACT = frozenset(
@@ -874,20 +879,31 @@ def watch(job_id, address, until_step, alerts, timeout_min, interval):
     # raises the same generic error for "job doesn't exist" and "dashboard
     # unreachable", so a bare except-and-report-not-found here would tell the
     # operator monitoring a live run that their job vanished when the real
-    # problem is a transient dashboard blip. A short, explicit timeout also
-    # keeps a black-holed connection from hanging this pre-flight check
-    # forever (unbounded by --timeout-min, which only starts after this
-    # returns).
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            known_ids = pool.submit(lambda: {j.submission_id for j in client.list_jobs()}).result(timeout=15)
-    except concurrent.futures.TimeoutError:
-        error(f"could not reach the Ray dashboard within 15s to check job {job_id}.")
-        raise SystemExit(1) from None
-    except Exception as exc:
-        error(f"could not reach the Ray dashboard to check job {job_id}: {exc}")
-        raise SystemExit(1) from None
-    if job_id not in known_ids:
+    # problem is a transient dashboard blip. The probe runs on a DAEMON thread
+    # with a bounded join: list_jobs() carries no HTTP timeout of its own
+    # (Ray's _do_request passes none to requests), so a black-holed connection
+    # would otherwise hang this pre-flight forever — and a thread pool can't
+    # enforce the bound either, because both ThreadPoolExecutor's context exit
+    # and concurrent.futures' atexit hook join their (non-daemon) workers,
+    # re-hanging on the stuck call right after the "timeout" fired.
+    probe: dict = {}
+
+    def _probe() -> None:
+        try:
+            probe["ids"] = {j.submission_id for j in client.list_jobs()}
+        except Exception as exc:
+            probe["err"] = exc
+
+    prober = threading.Thread(target=_probe, daemon=True, name="eray-watch-preflight")
+    prober.start()
+    prober.join(_PREFLIGHT_TIMEOUT_S)
+    if prober.is_alive():
+        error(f"could not reach the Ray dashboard within {_PREFLIGHT_TIMEOUT_S:.0f}s to check job {job_id}.")
+        raise SystemExit(1)
+    if "err" in probe:
+        error(f"could not reach the Ray dashboard to check job {job_id}: {probe['err']}")
+        raise SystemExit(1)
+    if job_id not in probe["ids"]:
         error(f"job {job_id} not found.")
         raise SystemExit(1)
     info(f"watching {job_id}")

@@ -121,7 +121,9 @@ class TrainBatchPrefetcher:
             max_workers=worker_count,
             thread_name_prefix="easydel-train-batch-prefetch",
         )
-        self._pending: collections.deque[concurrent.futures.Future[tuple[tp.Any, float, float]]] = collections.deque()
+        self._pending: collections.deque[concurrent.futures.Future[tuple[tp.Any, float, float, tp.Any]]] = (
+            collections.deque()
+        )
         self._fetch_cond = threading.Condition()
         self._next_fetch_ticket = 0
         self._submitted_tickets = 0
