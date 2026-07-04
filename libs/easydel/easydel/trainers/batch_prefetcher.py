@@ -128,16 +128,23 @@ class TrainBatchPrefetcher:
         self._closed = False
         self._last_fetch_seconds: float | None = None
         self._last_collate_seconds: float | None = None
+        # Iterator position as of the last batch actually DELIVERED via
+        # :meth:`next`, distinct from ``_data_iter`` (advanced the instant a
+        # ticket's fetch turn arrives, up to ``buffer_size`` ahead of
+        # consumption). See :attr:`data_iter` for why the distinction matters.
+        self._last_delivered_iter = data_iter
         self._top_up()
 
-    def _load(self, ticket: int) -> tuple[tp.Any, float, float]:
+    def _load(self, ticket: int) -> tuple[tp.Any, float, float, tp.Any]:
         """Produce one batch: fetch in ticket order, then collate.
 
         Args:
             ticket: This task's position in the global fetch order.
 
         Returns:
-            Tuple ``(batch, fetch_seconds, collate_seconds)``.
+            Tuple ``(batch, fetch_seconds, collate_seconds, iter_snapshot)``
+            where ``iter_snapshot`` is the shared iterator's value immediately
+            after this ticket's fetch.
 
         Raises:
             _PrefetcherClosed: If the prefetcher closed before this ticket's
@@ -152,6 +159,7 @@ class TrainBatchPrefetcher:
                 with capture_time() as fetch_time:
                     raw_batch, self._data_iter = self._fetch_fn(self._data_iter, self._dataloader)
                 fetch_seconds = float(fetch_time())
+                iter_snapshot = self._data_iter
             finally:
                 # Advance the turn even on a failed fetch so later tickets
                 # don't deadlock waiting for one that will never complete.
@@ -159,7 +167,7 @@ class TrainBatchPrefetcher:
                 self._fetch_cond.notify_all()
         with capture_time() as collate_time:
             batch = self._data_collator(raw_batch)
-        return batch, fetch_seconds, float(collate_time())
+        return batch, fetch_seconds, float(collate_time()), iter_snapshot
 
     def _top_up(self, limit: int | None = None) -> None:
         """Submit producer tasks until ``limit`` (default: full capacity) are pending."""
@@ -200,9 +208,11 @@ class TrainBatchPrefetcher:
             with self._fetch_cond:
                 future = self._pending.popleft()
         with capture_time() as wait_time:
-            batch, fetch_seconds, collate_seconds = future.result()
+            batch, fetch_seconds, collate_seconds, iter_snapshot = future.result()
         self._last_fetch_seconds = fetch_seconds
         self._last_collate_seconds = collate_seconds
+        with self._fetch_cond:
+            self._last_delivered_iter = iter_snapshot
         if schedule_next:
             self._top_up()
         return batch, float(wait_time()), fetch_seconds + collate_seconds
@@ -218,9 +228,19 @@ class TrainBatchPrefetcher:
 
     @property
     def data_iter(self) -> collections.abc.Iterator[tp.Any]:
-        """The shared dataloader iterator (advanced under the fetch lock)."""
+        """Iterator position as of the last batch delivered via :meth:`next`.
+
+        Deliberately not the latest FETCHED position. With readahead
+        buffering, a ticket's fetch (and thus the shared iterator's advance)
+        can complete up to ``buffer_size`` batches before the caller consumes
+        it via :meth:`next`. A caller that persists this property as a resume
+        position (e.g. after :meth:`close`) must see the position after the
+        last batch it actually trained on, not the last one merely fetched
+        into the buffer -- otherwise closing early silently skips the
+        fetched-but-unconsumed batches still sitting in the buffer.
+        """
         with self._fetch_cond:
-            return self._data_iter
+            return self._last_delivered_iter
 
     @property
     def last_fetch_seconds(self) -> float | None:
@@ -235,11 +255,13 @@ class TrainBatchPrefetcher:
     def close(self) -> None:
         """Cancel pending work and shut down the producer threads.
 
-        Idempotent. Tasks that already fetched their rows are discarded, so up
-        to ``buffer_size`` fetched-but-unconsumed batches are dropped from the
-        stream position (the single-worker prefetcher had the same property
-        with one batch). The shared iterator remains accessible through
-        :attr:`data_iter` so callers can persist and resume from it.
+        Idempotent. Tasks that already fetched their rows (up to
+        ``buffer_size`` of them) are discarded without being delivered, but
+        this does *not* lose their place in the stream: :attr:`data_iter`
+        reports the position as of the last batch actually delivered via
+        :meth:`next`, not the latest fetch, so a caller that persists it as a
+        resume position re-fetches exactly the discarded batches next time
+        instead of silently skipping them.
         """
         with self._fetch_cond:
             self._closed = True

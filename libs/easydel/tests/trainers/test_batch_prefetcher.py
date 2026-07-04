@@ -212,6 +212,48 @@ def test_close_is_idempotent_and_next_after_close_raises():
         prefetcher.next(schedule_next=True)
 
 
+def test_data_iter_reflects_last_delivered_not_last_fetched():
+    """close()'s resume position must not skip readahead-buffered batches.
+
+    Regression: with readahead buffering, up to ``buffer_size`` tickets can
+    have their fetch turn (and thus advance the shared iterator) before the
+    caller ever calls ``next()`` for them. If a caller reads ``data_iter``
+    after consuming only one batch and then closes, it must see the position
+    right after that ONE delivered batch -- not the position after every
+    batch that merely got readahead-fetched into the still-full buffer.
+    """
+    positions_fetched: list[int] = []
+
+    def position_fetch(pos, dataloader):
+        positions_fetched.append(pos)
+        return f"item-{pos}", pos + 1
+
+    prefetcher = TrainBatchPrefetcher(
+        fetch_fn=position_fetch,
+        data_iter=0,
+        dataloader=None,
+        data_collator=lambda batch: batch,
+        worker_count=4,
+        buffer_size=4,
+    )
+    # The pipeline warms to full capacity (4 tickets) in the background right
+    # after __init__ -- confirm the readahead actually raced ahead as assumed
+    # before consuming anything.
+    deadline = time.monotonic() + 5.0
+    while len(positions_fetched) < 4 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert len(positions_fetched) == 4
+
+    batch, _, _ = prefetcher.next(schedule_next=False)
+    assert batch == "item-0"
+    prefetcher.close()
+
+    assert prefetcher.data_iter == 1, (
+        f"expected resume position 1 (after the single delivered batch), got {prefetcher.data_iter} "
+        "-- close() is leaking the readahead-fetched-but-undelivered tickets into the resume position"
+    )
+
+
 def test_producer_timings_reported():
     prefetcher = TrainBatchPrefetcher(
         fetch_fn=_simple_fetch,
