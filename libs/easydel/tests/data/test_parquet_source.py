@@ -219,3 +219,107 @@ def test_parquet_source_falls_back_to_projected_column_batches(tmp_path, monkeyp
         (("messages",), 256),
         (("tools",), 256),
     ]
+
+
+def test_null_element_inside_list_takes_python_path_not_float64_nan():
+    """A null ELEMENT inside a non-null list survives arr.null_count == 0 (which
+    only counts null lists); pyarrow's to_numpy() on the flattened child then
+    silently upcasts the ENTIRE column chunk to float64 with NaN in place of
+    the null -- every row in the batch, not just the offending one, and a
+    downstream int cast turns the NaN into a garbage token id with no error
+    anywhere. The fast path must detect element-level nulls and route that
+    column through the python materialization instead."""
+    pa = pytest.importorskip("pyarrow")
+    np = pytest.importorskip("numpy")
+
+    table = pa.table(
+        {
+            "input_ids": pa.array([[101, 202, None, 404], [11, 22, 33, 44]], type=pa.list_(pa.int64())),
+            "clean_ids": pa.array([[7, 8], [9, 10]], type=pa.list_(pa.int64())),
+            "label": pa.array([1, 0]),
+        }
+    )
+    rows = list(ParquetShardedSource._table_to_rows(table))
+    assert len(rows) == 2
+
+    # The nulled column keeps exact values with None preserved -- no float64, no NaN.
+    assert rows[0]["input_ids"] == [101, 202, None, 404]
+    assert rows[1]["input_ids"] == [11, 22, 33, 44]
+    assert all(isinstance(v, int) for v in rows[1]["input_ids"])
+
+    # Columns without nulls anywhere keep the numpy fast path.
+    assert isinstance(rows[0]["clean_ids"], np.ndarray)
+    assert rows[0]["clean_ids"].dtype == np.int64
+    np.testing.assert_array_equal(rows[0]["clean_ids"], [7, 8])
+
+
+def test_numpy_path_failure_falls_back_before_first_row_no_duplicates():
+    """All fallible numpy-path work must happen at call time, BEFORE any row is
+    yielded: a failure after k yielded rows would fall back to the python path
+    and re-yield from row 0, silently duplicating the k rows already consumed.
+    Simulated via a table whose second column raises during materialization --
+    the fallback must produce every row exactly once."""
+    pa = pytest.importorskip("pyarrow")
+
+    real = pa.table({"ok": [1, 2, 3], "bad": ["a", "b", "c"]})
+
+    class PoisonedTable:
+        num_rows = real.num_rows
+        column_names = real.column_names
+
+        @staticmethod
+        def column(name):
+            if name == "bad":
+                raise RuntimeError("materialization failure")
+            return real.column(name)
+
+        @staticmethod
+        def to_pydict():
+            return real.to_pydict()
+
+    rows = list(ParquetShardedSource._table_to_rows(PoisonedTable()))
+    assert [r["ok"] for r in rows] == [1, 2, 3], "fallback duplicated or dropped rows"
+    assert [r["bad"] for r in rows] == ["a", "b", "c"]
+
+
+def test_midstream_iteration_failure_propagates_instead_of_duplicating():
+    """The regression this guards: pre-fix, _table_to_rows wrapped the WHOLE
+    numpy-path iteration in try/except, so an exception thrown after k rows
+    were already yielded fell back to the python path and re-yielded from row
+    0 -- duplicating the k consumed rows with no error surfaced. Post-fix,
+    only call-time materialization may fall back; a mid-iteration failure
+    must propagate, never duplicate."""
+    pa = pytest.importorskip("pyarrow")
+
+    real = pa.table({"ok": [1, 2, 3]})
+
+    class BadPylist:
+        def __getitem__(self, i):
+            if i >= 1:
+                raise RuntimeError("row 1 explodes")
+            return "a"
+
+    class BadColumn:
+        type = pa.string()  # not list / not primitive -> routed to the pylist path
+
+        @staticmethod
+        def to_pylist():
+            return BadPylist()
+
+    class MidstreamPoisonedTable:
+        num_rows = real.num_rows
+        column_names = ["ok", "bad"]
+
+        @staticmethod
+        def column(name):
+            return BadColumn() if name == "bad" else real.column(name)
+
+        @staticmethod
+        def to_pydict():
+            return {"ok": [1, 2, 3], "bad": ["a", "b", "c"]}
+
+    collected = []
+    with pytest.raises(RuntimeError, match="row 1 explodes"):
+        for row in ParquetShardedSource._table_to_rows(MidstreamPoisonedTable()):
+            collected.append(int(row["ok"]))
+    assert collected == [1], f"rows re-yielded after mid-stream failure: {collected}"

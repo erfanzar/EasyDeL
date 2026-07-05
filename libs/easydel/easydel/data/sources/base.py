@@ -422,10 +422,16 @@ class ParquetShardedSource(ShardedDataSource[dict]):
         original Python materialization.
         """
         try:
-            yield from ParquetShardedSource._table_to_rows_numpy(table)
-            return
+            numpy_rows = ParquetShardedSource._table_to_rows_numpy(table)
         except Exception:  # noqa: BLE001 - any surprise reverts to the legacy path
-            pass
+            numpy_rows = None
+        if numpy_rows is not None:
+            # Deliberately outside the try: all fallible materialization ran at
+            # call time above, so iteration can only fail for reasons (e.g.
+            # MemoryError) that must PROPAGATE — falling back mid-stream would
+            # re-yield from row 0 and silently duplicate rows already consumed.
+            yield from numpy_rows
+            return
         try:
             cols = table.to_pydict()
         except Exception as exc:
@@ -443,13 +449,19 @@ class ParquetShardedSource(ShardedDataSource[dict]):
 
     @staticmethod
     def _table_to_rows_numpy(table: tp.Any) -> "Iterator[dict]":
-        """Numpy-first row materialization (see ``_table_to_rows``)."""
-        import numpy as np
+        """Numpy-first row materialization (see ``_table_to_rows``).
+
+        A plain function (not a generator): every fallible step — the Arrow →
+        numpy/pylist column materialization — runs eagerly at call time, so
+        the caller can still fall back to the legacy path before a single row
+        has been yielded. The returned iterator only slices pre-materialized
+        buffers.
+        """
         import pyarrow as pa  # pyright: ignore[reportMissingTypeStubs]
 
         n = int(table.num_rows)
         if n == 0:
-            return
+            return iter(())
         fast_list: dict[str, tuple[tp.Any, tp.Any]] = {}
         fast_flat: dict[str, tp.Any] = {}
         slow: dict[str, list] = {}
@@ -462,6 +474,13 @@ class ParquetShardedSource(ShardedDataSource[dict]):
                 and pa.types.is_primitive(atype.value_type)
                 and not pa.types.is_boolean(atype.value_type)
                 and arr.null_count == 0
+                # arr.null_count only counts null LISTS; a null ELEMENT inside a
+                # non-null list survives it, and to_numpy() on the flattened
+                # child would then silently upcast the ENTIRE column chunk to
+                # float64 with NaN in place of the null — every downstream
+                # int cast turns that into a garbage token id with no error
+                # anywhere. Element-level nulls take the pylist route instead.
+                and arr.values.null_count == 0
             ):
                 values = arr.values.to_numpy(zero_copy_only=False)
                 offsets = arr.offsets.to_numpy(zero_copy_only=False)
@@ -471,15 +490,19 @@ class ParquetShardedSource(ShardedDataSource[dict]):
             else:
                 slow[name] = arr.to_pylist()
         del table
-        for i in range(n):
-            row: dict[str, tp.Any] = {}
-            for name, (offsets, values) in fast_list.items():
-                row[name] = values[offsets[i] : offsets[i + 1]]
-            for name, flat in fast_flat.items():
-                row[name] = flat[i]
-            for name, pylist in slow.items():
-                row[name] = pylist[i]
-            yield row
+
+        def _rows() -> "Iterator[dict]":
+            for i in range(n):
+                row: dict[str, tp.Any] = {}
+                for name, (offsets, values) in fast_list.items():
+                    row[name] = values[offsets[i] : offsets[i + 1]]
+                for name, flat in fast_flat.items():
+                    row[name] = flat[i]
+                for name, pylist in slow.items():
+                    row[name] = pylist[i]
+                yield row
+
+        return _rows()
 
     @staticmethod
     def _column_output_key(column: str) -> str:
