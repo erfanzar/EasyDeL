@@ -748,7 +748,9 @@ class TrainingArguments:
                 "Per-compile XLA compiler option overrides forwarded to the train-step jit "
                 "(e.g. {'xla_tpu_enable_latency_hiding_scheduler': 'true'}). Safer than env "
                 "XLA_FLAGS: unknown options raise a catchable error at compile instead of "
-                "crashing workers at libtpu load."
+                "crashing workers at libtpu load. Applies to the marker-based jit path "
+                "(including bucketed steps); the scheduled MPMD path (mpmd_scheduler with a "
+                "registered scheduled-loss adapter) does not forward it."
             )
         },
     )

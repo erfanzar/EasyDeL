@@ -426,6 +426,7 @@ class SDPOTrainer(GRPOTrainer):
             static_argnums=static_argnames,
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,
+            arguments=self.arguments,
         )
         self._runtime_trace("train.compile_wrapper.end")
 
@@ -448,6 +449,7 @@ class SDPOTrainer(GRPOTrainer):
             static_argnums=static_argnames,
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,
+            arguments=self.arguments,
         )
         self._runtime_trace("eval.compile_wrapper.end")
 

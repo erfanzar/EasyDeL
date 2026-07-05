@@ -322,6 +322,7 @@ class CPOTrainer(Trainer):
             static_argnums=training_static_argnums,
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,
+            arguments=self.arguments,
         )
         self._runtime_trace("train.compile_wrapper.end")
         sharded_training_step_function.static_argnums_ = training_static_argnums
@@ -346,6 +347,7 @@ class CPOTrainer(Trainer):
             static_argnums=evaluation_static_argnums,
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,
+            arguments=self.arguments,
         )
         self._runtime_trace("eval.compile_wrapper.end")
         sharded_evaluation_step_function.static_argnums_ = evaluation_static_argnums

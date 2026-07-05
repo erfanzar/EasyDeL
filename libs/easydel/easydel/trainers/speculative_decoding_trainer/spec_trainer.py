@@ -321,6 +321,7 @@ class SpeculativeDecodingTrainer(Trainer):
                 static_argnums=static_argnums,
                 mesh=self.model.mesh,
                 schedule=self.arguments.mpmd_scheduler,
+                arguments=self.arguments,
             )
         self._runtime_trace("train.compile_wrapper.end")
 
@@ -340,6 +341,7 @@ class SpeculativeDecodingTrainer(Trainer):
                 static_argnums=static_argnums,
                 mesh=self.model.mesh,
                 schedule=self.arguments.mpmd_scheduler,
+                arguments=self.arguments,
             )
         self._runtime_trace("eval.compile_wrapper.end")
 

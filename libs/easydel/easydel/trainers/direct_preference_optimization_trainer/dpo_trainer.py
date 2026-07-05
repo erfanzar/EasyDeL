@@ -453,6 +453,7 @@ class DPOTrainer(Trainer):
             static_argnums=sharded_training_static_argnums,
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,
+            arguments=self.arguments,
         )
         self._runtime_trace("train.compile_wrapper.end")
 
@@ -485,6 +486,7 @@ class DPOTrainer(Trainer):
             static_argnums=sharded_evaluation_static_argnums,
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,
+            arguments=self.arguments,
         )
         self._runtime_trace("eval.compile_wrapper.end")
 
