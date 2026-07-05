@@ -303,6 +303,11 @@ class SpeculativeDecodingTrainer(Trainer):
         static_argnums = tuple(range(3, 20))
         in_shardings = (self.state_shardings, empty_sharding, self.target_state.shardings)
 
+        # xla_compiler_options must reach the direct spx.jit branches too; the
+        # compile_trainer_step branches get it from arguments=self.arguments.
+        _step_jit_options: dict = {}
+        if getattr(self.arguments, "xla_compiler_options", None):
+            _step_jit_options["compiler_options"] = dict(self.arguments.xla_compiler_options)
         self._runtime_trace("train.compile_wrapper.begin")
         if self.arguments.mpmd_scheduler is None:
             sharded_training_step_function = spx.jit(
@@ -311,6 +316,7 @@ class SpeculativeDecodingTrainer(Trainer):
                 out_shardings=(self.state_shardings, empty_sharding),
                 donate_argnums=(0,),
                 static_argnums=static_argnums,
+                **_step_jit_options,
             )
         else:
             sharded_training_step_function = compile_trainer_step(
@@ -332,6 +338,7 @@ class SpeculativeDecodingTrainer(Trainer):
                 in_shardings=in_shardings,
                 out_shardings=empty_sharding,
                 static_argnums=static_argnums,
+                **_step_jit_options,
             )
         else:
             sharded_evaluation_step_function = compile_trainer_step(

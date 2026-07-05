@@ -95,3 +95,27 @@ def test_every_trainer_flavor_passes_arguments_to_compile(monkeypatch):
                 if "arguments=self.arguments," not in window and '"arguments": self.arguments,' not in window:
                     offenders.append(f"{path.relative_to(root)}:{i + 1}")
     assert not offenders, f"compile call sites missing arguments=self.arguments: {offenders}"
+
+
+def test_direct_jit_step_compiles_forward_compiler_options():
+    """distillation and spec trainers bypass compile_trainer_step entirely when
+    mpmd_scheduler is None (a direct spx.jit fast path) -- which is exactly the
+    default non-MPMD configuration, so those step compiles must forward
+    xla_compiler_options themselves or the knob is dead on the common path."""
+    import pathlib
+
+    import easydel.trainers as trainers_pkg
+
+    root = pathlib.Path(trainers_pkg.__file__).parent
+    for rel in (
+        "distillation_trainer/distillation_trainer.py",
+        "speculative_decoding_trainer/spec_trainer.py",
+    ):
+        lines = (root / rel).read_text().splitlines()
+        step_jits = [i for i, line in enumerate(lines) if "step_function = spx.jit(" in line]
+        assert step_jits, f"{rel}: expected direct spx.jit step compiles"
+        for i in step_jits:
+            window = "\n".join(lines[i : i + 12])
+            assert "**_step_jit_options" in window, (
+                f"{rel}:{i + 1} direct spx.jit step compile drops xla_compiler_options"
+            )
