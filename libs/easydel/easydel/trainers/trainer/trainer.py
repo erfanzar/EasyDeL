@@ -1229,6 +1229,7 @@ class Trainer(BaseTrainer):
                 with capture_time() as _device_sync_time:
                     state, metrics = jax.block_until_ready(_result)
                 self._last_step_device_sync_seconds = float(_device_sync_time())
+                self._append_host_phase_log()
             self._runtime_trace(
                 "execute_train_step.compiled_call.end",
                 step=int(jax.device_get(state.step)),
