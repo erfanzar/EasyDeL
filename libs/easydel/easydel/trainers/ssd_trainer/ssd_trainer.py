@@ -114,6 +114,7 @@ class SSDTrainer(GRPOTrainer):
             static_argnums=static_argnums,
             mesh=mesh,
             schedule=self.arguments.mpmd_scheduler,
+            arguments=self.arguments,
         )
         sharded_evaluation_step_function = compile_trainer_step(
             ssd_step,
@@ -122,6 +123,7 @@ class SSDTrainer(GRPOTrainer):
             static_argnums=static_argnums,
             mesh=mesh,
             schedule=self.arguments.mpmd_scheduler,
+            arguments=self.arguments,
         )
         sharded_training_step_function.static_argnums_ = static_argnums
         sharded_evaluation_step_function.static_argnums_ = static_argnums

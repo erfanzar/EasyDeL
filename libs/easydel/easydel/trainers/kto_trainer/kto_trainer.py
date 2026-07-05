@@ -439,6 +439,7 @@ class KTOTrainer(Trainer):
             static_argnums=train_static_argnums,
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,
+            arguments=self.arguments,
         )
         self._runtime_trace("train.compile_wrapper.end")
 
@@ -462,6 +463,7 @@ class KTOTrainer(Trainer):
             static_argnums=eval_static_argnums,
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,
+            arguments=self.arguments,
         )
         self._runtime_trace("eval.compile_wrapper.end")
 

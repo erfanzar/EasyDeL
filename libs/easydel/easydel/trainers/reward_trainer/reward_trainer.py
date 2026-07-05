@@ -317,6 +317,7 @@ class RewardTrainer(Trainer):
             donate_argnums=(0,),
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,
+            arguments=self.arguments,
         )
         self._runtime_trace("train.compile_wrapper.end")
 
@@ -335,6 +336,7 @@ class RewardTrainer(Trainer):
             out_shardings=empty_sharding,
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,
+            arguments=self.arguments,
         )
         self._runtime_trace("eval.compile_wrapper.end")
 

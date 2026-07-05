@@ -288,6 +288,7 @@ class Trainer(BaseTrainer):
             out_shardings=(self.state_shardings, empty_sharding),
             donate_argnums=(0,),
             schedule=self.arguments.mpmd_scheduler,
+            arguments=self.arguments,
             mesh=self.mesh,
         )
         # Per-bucket compilation is driven by BaseTrainer._compile_bucket_step_functions,
@@ -305,6 +306,7 @@ class Trainer(BaseTrainer):
             in_shardings=(self.state_shardings, empty_sharding),
             out_shardings=(empty_sharding),
             schedule=self.arguments.mpmd_scheduler,
+            arguments=self.arguments,
             mesh=self.mesh,
         )
 

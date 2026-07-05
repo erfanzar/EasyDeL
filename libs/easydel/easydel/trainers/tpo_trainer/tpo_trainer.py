@@ -204,6 +204,7 @@ class TPOTrainer(DPOTrainer):
             static_argnums=(2, 3, 4, 5, 6, 7, 8, 9, 10, 11),
             mesh=mesh,
             schedule=self.arguments.mpmd_scheduler,
+            arguments=self.arguments,
         )
         sharded_evaluation_step_function = compile_trainer_step(
             tpo_evaluation_step,
@@ -212,6 +213,7 @@ class TPOTrainer(DPOTrainer):
             static_argnums=(2, 3, 4, 5, 6, 7, 8),
             mesh=mesh,
             schedule=self.arguments.mpmd_scheduler,
+            arguments=self.arguments,
         )
         sharded_training_step_function.static_argnums_ = (2, 3, 4, 5, 6, 7, 8, 9, 10, 11)
         sharded_evaluation_step_function.static_argnums_ = (2, 3, 4, 5, 6, 7, 8)

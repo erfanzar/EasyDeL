@@ -257,6 +257,7 @@ class GKDTrainer(SFTTrainer):
             static_argnums=static_argnums,
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,
+            arguments=self.arguments,
         )
         self._runtime_trace("train.compile_wrapper.end")
         sharded_training_step_function.static_argnums_ = static_argnums
@@ -280,6 +281,7 @@ class GKDTrainer(SFTTrainer):
             static_argnums=static_argnums,
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,
+            arguments=self.arguments,
         )
         self._runtime_trace("eval.compile_wrapper.end")
         sharded_evaluation_step_function.static_argnums_ = static_argnums

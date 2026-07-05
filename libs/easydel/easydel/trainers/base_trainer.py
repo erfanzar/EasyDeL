@@ -5130,6 +5130,7 @@ class BaseTrainer(BaseTrainerProtocol):
             "out_shardings": (state_shardings, empty_sharding),
             "donate_argnums": (0,),
             "schedule": self.arguments.mpmd_scheduler,
+            "arguments": self.arguments,
             "mesh": self.mesh,
         }
 

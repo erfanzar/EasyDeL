@@ -320,6 +320,7 @@ class SFTTrainer(Trainer):
             out_shardings=(self.state_shardings, empty_sharding),
             donate_argnums=(0,),
             schedule=self.arguments.mpmd_scheduler,
+            arguments=self.arguments,
             mesh=self.mesh,
         )
 
@@ -334,6 +335,7 @@ class SFTTrainer(Trainer):
             in_shardings=(self.state_shardings, empty_sharding),
             out_shardings=empty_sharding,
             schedule=self.arguments.mpmd_scheduler,
+            arguments=self.arguments,
             mesh=self.mesh,
         )
 
