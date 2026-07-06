@@ -13,8 +13,10 @@ repos:
       - id: end-of-file-fixer
         stages: [pre-commit]
       - id: check-yaml
+        # The launcher template is YAML-after-substitution ({{NAME}} etc.),
+        # not valid YAML as checked in.
+        exclude: ^libs/eray/eray/provision/templates/
         stages: [pre-commit]
-        exclude: autoscale/easydel-cluster-template.yaml
       - id: check-json
         stages: [pre-commit]
       - id: check-toml

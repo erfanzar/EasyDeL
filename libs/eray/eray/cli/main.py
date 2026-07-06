@@ -201,6 +201,13 @@ from .fleet import register as _register_fleet_commands  # noqa: E402
 _register_fleet_commands(cli)
 
 
+# ── Autoscale subcommands (cluster-launcher configs) ─────────────
+
+from .autoscale import register as _register_autoscale_commands  # noqa: E402
+
+_register_autoscale_commands(cli)
+
+
 # ── TPU subcommands ──────────────────────────────────────────────
 
 
