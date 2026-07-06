@@ -78,7 +78,7 @@ packages:
     benchmarks: libs/ejkernel/benchmarks
     owns:
       modules_operations: "Kernel[Config,Out] subclasses + configs (modules/operations/)"
-      backends: [kernels/_triton, kernels/_pallas/{tpu,gpu}, kernels/_cuda, kernels/_cute, kernels/_tilelang, kernels/_xla]
+      backends: [kernels/_triton, "kernels/_pallas/{tpu,gpu}", kernels/_cuda, kernels/_cute, kernels/_tilelang, kernels/_xla]
       registry: "kernels/_registry.py — @kernel_registry.register(name, Platform, Backend, priority); XLA fallback priority 0"
       ops: [Executor, autotune, 7-tier config selection, persistent cache ~/ejkernel-presistent-cache/, fingerprinting]
       callib: [triton_call, pallas_call, cute_call, tilelang_call, ejit]

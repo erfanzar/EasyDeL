@@ -43,9 +43,13 @@ repos:
         stages: [pre-commit]
         args: ["--fix"]
         exclude: ^libs/
-      # Run the formatter
+      # Run the formatter. Excluded from libs/ for the same reason as the
+      # linter: the per-lib hooks pin a much newer ruff (0.15.x) whose
+      # formatter reflows the same code differently (e.g. assert-message
+      # parens), so a global --all-files run rewrites every lib backwards.
       - id: ruff-format
         stages: [pre-commit]
+        exclude: ^libs/
 
   # Type checking with mypy (optional, can be slow)
   # - repo: https://github.com/pre-commit/mirrors-mypy
