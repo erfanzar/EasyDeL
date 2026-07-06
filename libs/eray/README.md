@@ -274,6 +274,17 @@ from eray import (
 
 `eray` ships with a CLI for connecting TPU hosts into a Ray cluster. It ports the Ray connection logic from `scripts/tpu_setup.sh` into a clean Python tool.
 
+Run on the TPU VM itself, no flags are needed at all — the TPU's name, type,
+zone, and every worker's IP are auto-detected from the instance metadata
+server, and commands targeting this machine execute locally (no SSH):
+
+```bash
+eray tpu connect      # auto-detects the current TPU
+eray tpu status       # auto-detects the head address
+eray tpu health
+eray tpu disconnect
+```
+
 ### Prerequisites
 
 - `gcloud` CLI installed and authenticated

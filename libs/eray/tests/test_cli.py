@@ -19,10 +19,16 @@ from unittest import mock
 
 import pytest
 from click.testing import CliRunner
-
 from eray.cli.main import _resolve_tpu, cli
 from eray.cli.tpu import ConnectResult
-from eray.cli.utils import TpuInfo, build_ray_resource_flags, list_tpus_in_project, list_tpus_in_zone
+from eray.cli.utils import (
+    TpuInfo,
+    build_ray_resource_flags,
+    detect_local_tpu,
+    list_tpus_in_project,
+    list_tpus_in_zone,
+    run_on_host,
+)
 
 # ── TpuInfo unit tests ───────────────────────────────────────────
 
@@ -112,9 +118,31 @@ class TestBuildRayResourceFlags:
 
 
 class TestResolveTpu:
-    def test_no_args_raises(self):
-        with pytest.raises(Exception, match="either"):
-            _resolve_tpu(None, None, None, None, None, None, None)
+    def test_no_args_off_tpu_raises(self):
+        with mock.patch("eray.cli.main.detect_local_tpu", return_value=None):
+            with pytest.raises(Exception, match="auto-detected"):
+                _resolve_tpu(None, None, None, None, None, None, None)
+
+    def test_no_args_autodetects_on_tpu_vm(self):
+        detected = TpuInfo(
+            name="my-spot",
+            project="proj",
+            zone="us-central1-a",
+            accelerator_type="v5p-8",
+            internal_ips=["10.0.0.9"],
+            num_hosts=1,
+            state="READY",
+        )
+        with mock.patch("eray.cli.main.detect_local_tpu", return_value=detected):
+            tpu, user, key = _resolve_tpu(None, None, None, None, None, None, None)
+        assert tpu is detected
+        assert user is None and key is None
+
+    def test_explicit_flags_bypass_autodetection(self):
+        # --ips must not consult the metadata server at all.
+        with mock.patch("eray.cli.main.detect_local_tpu", side_effect=AssertionError("must not be called")):
+            tpu, _, _ = _resolve_tpu(None, None, None, "10.0.0.1", "v4-8", None, None)
+        assert tpu.num_hosts == 1
 
     def test_both_tpu_name_and_ips_raises(self):
         with pytest.raises(Exception, match="mutually exclusive"):
@@ -158,6 +186,72 @@ class TestResolveTpu:
         assert key == "/home/user/.ssh/id_rsa"
 
 
+class TestDetectLocalTpu:
+    """Metadata parsing for zero-flag `eray tpu connect` on a TPU VM.
+
+    Attribute values mirror a live v5p-8 worker's real metadata."""
+
+    def _detect(self, values):
+        with mock.patch("eray.cli.utils._gce_metadata", side_effect=lambda p, timeout=2.0: values.get(p)):
+            return detect_local_tpu()
+
+    def test_parses_single_host_tpu_vm(self):
+        tpu = self._detect(
+            {
+                "instance/attributes/accelerator-type": "v5p-8",
+                "instance/attributes/worker-network-endpoints": "unknown:unknown:10.128.0.122",
+                "instance/attributes/instance-id": "n_server_spot_m",
+                "project/project-id": "my-proj",
+                "instance/zone": "projects/1056288039276/zones/us-central1-a",
+            }
+        )
+        assert tpu.name == "n_server_spot_m"
+        assert tpu.project == "my-proj"
+        assert tpu.zone == "us-central1-a"
+        assert tpu.accelerator_type == "v5p-8"
+        assert tpu.internal_ips == ["10.128.0.122"]
+        assert tpu.num_hosts == 1
+        assert tpu.is_gcloud_managed
+
+    def test_parses_multi_host_endpoints(self):
+        tpu = self._detect(
+            {
+                "instance/attributes/accelerator-type": "v5p-16",
+                "instance/attributes/worker-network-endpoints": ("a:b:10.0.0.1, c:d:10.0.0.2"),
+                "instance/attributes/instance-id": "pod",
+                "project/project-id": "p",
+                "instance/zone": "projects/1/zones/us-east5-a",
+            }
+        )
+        assert tpu.internal_ips == ["10.0.0.1", "10.0.0.2"]
+        assert tpu.num_hosts == 2
+
+    def test_not_a_tpu_vm_returns_none(self):
+        assert self._detect({}) is None
+
+    def test_missing_endpoints_returns_none(self):
+        assert self._detect({"instance/attributes/accelerator-type": "v5p-8"}) is None
+
+    def test_partial_identity_falls_back_to_direct_mode(self):
+        tpu = self._detect(
+            {
+                "instance/attributes/accelerator-type": "v5p-8",
+                "instance/attributes/worker-network-endpoints": "x:y:10.0.0.5",
+            }
+        )
+        assert tpu is not None
+        assert tpu.is_gcloud_managed is False
+        assert tpu.internal_ips == ["10.0.0.5"]
+
+
+class TestRunOnHostLocalExec:
+    def test_local_target_runs_without_ssh(self):
+        tpu = TpuInfo.from_ips(["127.0.0.1"], "v5p-8")
+        result = run_on_host(tpu, 0, "echo local-$((6 * 7))")
+        assert result.returncode == 0
+        assert "local-42" in result.stdout
+
+
 # ── CLI command tests ────────────────────────────────────────────
 
 
@@ -184,9 +278,11 @@ class TestCliEntryPoint:
 
 
 class TestTpuConnect:
-    def test_connect_no_args_fails(self):
+    def test_connect_no_args_fails_off_tpu(self):
+        # Off a TPU VM (no metadata), zero-arg connect must fail with guidance.
         runner = CliRunner()
-        result = runner.invoke(cli, ["tpu", "connect"])
+        with mock.patch("eray.cli.main.detect_local_tpu", return_value=None):
+            result = runner.invoke(cli, ["tpu", "connect"])
         assert result.exit_code != 0
 
     def test_connect_help_shows_both_modes(self):
@@ -248,9 +344,10 @@ class TestTpuConnect:
 
 
 class TestTpuDisconnect:
-    def test_disconnect_no_args_fails(self):
+    def test_disconnect_no_args_fails_off_tpu(self):
         runner = CliRunner()
-        result = runner.invoke(cli, ["tpu", "disconnect"])
+        with mock.patch("eray.cli.main.detect_local_tpu", return_value=None):
+            result = runner.invoke(cli, ["tpu", "disconnect"])
         assert result.exit_code != 0
 
     def test_disconnect_help_shows_both_modes(self):
@@ -262,9 +359,12 @@ class TestTpuDisconnect:
 
 
 class TestTpuStatus:
-    def test_status_requires_address(self):
+    def test_status_requires_address_off_tpu(self):
+        # Off a TPU VM there is nothing to auto-detect; must fail fast, not
+        # attempt a connection.
         runner = CliRunner()
-        result = runner.invoke(cli, ["tpu", "status"])
+        with mock.patch("eray.cli.main.detect_local_tpu", return_value=None):
+            result = runner.invoke(cli, ["tpu", "status"])
         assert result.exit_code != 0
 
     def test_status_help(self):
@@ -275,9 +375,10 @@ class TestTpuStatus:
 
 
 class TestTpuHealth:
-    def test_health_requires_address(self):
+    def test_health_requires_address_off_tpu(self):
         runner = CliRunner()
-        result = runner.invoke(cli, ["tpu", "health"])
+        with mock.patch("eray.cli.main.detect_local_tpu", return_value=None):
+            result = runner.invoke(cli, ["tpu", "health"])
         assert result.exit_code != 0
 
     def test_health_help(self):

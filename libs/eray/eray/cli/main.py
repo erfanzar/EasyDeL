@@ -45,6 +45,7 @@ from .tpu import (
 from .utils import (
     TpuInfo,
     check_gcloud,
+    detect_local_tpu,
     detect_project,
     discover_tpu,
     error,
@@ -127,7 +128,19 @@ def _resolve_tpu(
         info(f"Direct-IP mode: {len(ip_list)} hosts, type={tpu_type}")
         return TpuInfo.from_ips(ip_list, tpu_type), user, ssh_key
 
-    raise click.ClickException("Provide either --tpu-name or --ips.")
+    # No flags: when running on a TPU VM, the instance metadata identifies
+    # the TPU (name, type, every worker's IP) — nothing else to ask for.
+    detected = detect_local_tpu()
+    if detected is not None:
+        info(
+            f"Auto-detected TPU '{detected.name or 'unnamed'}' "
+            f"({detected.accelerator_type}, {detected.num_hosts} host(s)) from this VM's metadata"
+        )
+        return detected, user, ssh_key
+
+    raise click.ClickException(
+        "Provide --tpu-name or --ips (with no flags, the TPU is auto-detected only when running on a TPU VM)."
+    )
 
 
 try:
@@ -145,7 +158,10 @@ def cli(verbose: bool) -> None:
     Connect TPU hosts into a Ray cluster, check status, run health checks.
 
     \b
-    Two ways to connect:
+    Three ways to connect:
+      0. On the TPU VM itself (auto-detected, no flags):
+         eray tpu connect
+
       1. By TPU name (gcloud discovers IPs):
          eray tpu connect --tpu-name my-tpu --project proj --zone us-central2-b
 
@@ -245,6 +261,10 @@ def bounce(tpu_name, project, zone, ips, tpu_type, user, ssh_key, ray_bin, ray_t
 @click.option("--json", "as_json", is_flag=True, default=False, help="Output result as JSON.")
 def connect(tpu_name, project, zone, ips, tpu_type, user, ssh_key, ray_bin, ray_tmp_dir, timeout, as_json):
     """Connect TPU hosts into a Ray cluster.
+
+    \b
+    Mode 0 — on the TPU VM itself (auto-detected from instance metadata):
+        eray tpu connect
 
     \b
     Mode 1 — by TPU name (gcloud discovers IPs automatically):
@@ -375,18 +395,45 @@ def disconnect(tpu_name, project, zone, ips, tpu_type, user, ssh_key, ray_bin):
     success("Ray stopped on all hosts")
 
 
+def _resolve_address(address: str | None) -> str:
+    """Resolve a Ray head address, auto-detecting on a TPU VM.
+
+    Args:
+        address: Explicit ``ip:port``, or None to detect the local TPU's
+            head (worker 0's internal IP on the standard Ray port).
+
+    Returns:
+        The Ray cluster address.
+
+    Raises:
+        click.ClickException: If no address was given and this machine is
+            not a TPU VM.
+    """
+    if address:
+        return address
+    detected = detect_local_tpu()
+    if detected is not None:
+        resolved = f"{detected.internal_ips[0]}:6379"
+        info(f"Auto-detected Ray head {resolved} from this VM's metadata")
+        return resolved
+    raise click.ClickException(
+        "Provide --address (with no flags, the head is auto-detected only when running on a TPU VM)."
+    )
+
+
 @tpu.command()
-@click.option("--address", "-a", required=True, help="Ray cluster address (ip:port).")
+@click.option("--address", "-a", default=None, help="Ray cluster address (ip:port). Auto-detected on a TPU VM.")
 @click.option("--json", "as_json", is_flag=True, default=False, help="Output as JSON.")
 def status(address, as_json):
     """Show Ray cluster status.
 
     \b
-    Example:
+    Examples:
+        eray tpu status               # on the TPU VM itself
         eray tpu status -a 10.0.0.1:6379
 
     Args:
-        address: Ray cluster address (ip:port).
+        address: Ray cluster address (ip:port), or None to auto-detect.
         as_json: Output as JSON.
 
     Returns:
@@ -396,7 +443,7 @@ def status(address, as_json):
         click.ClickException: If the status check fails.
     """
     try:
-        result = cluster_status(address)
+        result = cluster_status(_resolve_address(address))
     except Exception as exc:
         error(f"Failed to get cluster status: {exc}")
         raise click.ClickException(str(exc)) from exc
@@ -415,18 +462,19 @@ def status(address, as_json):
 
 
 @tpu.command()
-@click.option("--address", "-a", required=True, help="Ray cluster address (ip:port).")
+@click.option("--address", "-a", default=None, help="Ray cluster address (ip:port). Auto-detected on a TPU VM.")
 @click.option("--tpu-type", default=None, help="TPU type (e.g. v4-32) for scheduling.")
 @click.option("--json", "as_json", is_flag=True, default=False, help="Output as JSON.")
 def health(address, tpu_type, as_json):
     """Run a health check across the cluster.
 
     \b
-    Example:
+    Examples:
+        eray tpu health               # on the TPU VM itself
         eray tpu health -a 10.0.0.1:6379
 
     Args:
-        address: Ray cluster address (ip:port).
+        address: Ray cluster address (ip:port), or None to auto-detect.
         tpu_type: TPU type (e.g. v4-32) for scheduling.
         as_json: Output as JSON.
 
@@ -437,7 +485,7 @@ def health(address, tpu_type, as_json):
         click.ClickException: If the health check fails.
     """
     try:
-        reports = health_check(address, tpu_type=tpu_type)
+        reports = health_check(_resolve_address(address), tpu_type=tpu_type)
     except Exception as exc:
         error(f"Health check failed: {exc}")
         raise click.ClickException(str(exc)) from exc
