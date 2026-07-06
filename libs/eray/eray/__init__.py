@@ -105,7 +105,7 @@ from .pool import (
     SliceActor,
     SlicePoolManager,
 )
-from .provision import ensure_tpu
+from .provision import ensure_tpu, watch_and_reconnect
 from .resources import (
     AcceleratorConfigType,
     ComputeResourceConfig,
@@ -188,4 +188,5 @@ __all__ = (
     "swarm_execute",
     "swarmed",
     "sweep_raylet_logs",
+    "watch_and_reconnect",
 )
