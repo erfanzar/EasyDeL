@@ -23,14 +23,28 @@ from .configs import (
 )
 from .hardware import HardwareType
 from .ray_resources import RayResources, available_cpu_cores
+from .topology import (
+    DEFAULT_HOST_CHIP_GRIDS,
+    DEFAULT_SPLIT_BASE_PORT,
+    HostPartitionPlan,
+    HostSplitPlan,
+    plan_host_partition,
+    plan_host_split,
+)
 
 __all__ = (
+    "DEFAULT_HOST_CHIP_GRIDS",
+    "DEFAULT_SPLIT_BASE_PORT",
     "AcceleratorConfigType",
     "ComputeResourceConfig",
     "CpuAcceleratorConfig",
     "GpuAcceleratorConfig",
     "HardwareType",
+    "HostPartitionPlan",
+    "HostSplitPlan",
     "RayResources",
     "TpuAcceleratorConfig",
     "available_cpu_cores",
+    "plan_host_partition",
+    "plan_host_split",
 )
