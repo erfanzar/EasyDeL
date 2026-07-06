@@ -76,12 +76,14 @@ def describe_node(name: str, *, project: str, zone: str) -> TpuInfo | None:
         zone: GCP zone.
 
     Returns:
-        The TpuInfo, or None on NOT_FOUND.
+        The TpuInfo, or None on NOT_FOUND. A booting node (no network
+        endpoints yet) comes back with its real state and num_hosts 0
+        rather than an error, so pollers can wait on it.
     """
     from ..cli.utils import discover_tpu
 
     try:
-        return discover_tpu(name, project, zone)
+        return discover_tpu(name, project, zone, allow_no_ips=True)
     except subprocess.CalledProcessError as exc:
         stderr = str(exc.stderr or "")
         if "NOT_FOUND" in stderr or "not found" in stderr.lower():

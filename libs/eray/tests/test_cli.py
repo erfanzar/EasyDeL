@@ -713,3 +713,111 @@ class TestConnectResult:
         )
         assert result.ray_address == "10.0.0.1:6379"
         assert result.num_hosts == 1
+
+
+class TestWaitForCluster:
+    """_wait_for_cluster polls the dashboard HTTP state API — never ray.init().
+
+    A driver handshake would require the operator's Python/Ray versions to
+    match the cluster's, which fails whenever the watcher box connects a
+    node it bootstrapped with the image's system Python.
+    """
+
+    def _serve(self, payload_rows, port_holder):
+        import http.server
+        import json
+        import threading
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = json.dumps({"data": {"result": {"result": payload_rows}}}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        port_holder.append(server.server_port)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return server
+
+    def test_alive_nodes_reaching_expected_returns_true(self):
+        from eray.cli.tpu import _wait_for_cluster
+
+        ports = []
+        rows = [
+            {"state": "ALIVE", "resources_total": {"TPU": 4.0}},
+            {"state": "ALIVE", "resources_total": {"TPU": 4.0}},
+            {"state": "DEAD", "resources_total": {"TPU": 4.0}},
+        ]
+        server = self._serve(rows, ports)
+        try:
+            assert _wait_for_cluster("127.0.0.1:6379", 2, timeout=10, dashboard_port=ports[0]) is True
+        finally:
+            server.shutdown()
+
+    def test_dead_nodes_do_not_count(self, monkeypatch):
+        import eray.cli.tpu as tpu_module
+        from eray.cli.tpu import _wait_for_cluster
+
+        monkeypatch.setattr(tpu_module, "RAY_READINESS_POLL_S", 0.05)
+        ports = []
+        rows = [{"state": "DEAD", "resources_total": {"TPU": 4.0}}]
+        server = self._serve(rows, ports)
+        try:
+            assert _wait_for_cluster("127.0.0.1:6379", 1, timeout=0.5, dashboard_port=ports[0]) is False
+        finally:
+            server.shutdown()
+
+    def test_unreachable_dashboard_times_out_false(self, monkeypatch):
+        import eray.cli.tpu as tpu_module
+        from eray.cli.tpu import _wait_for_cluster
+
+        monkeypatch.setattr(tpu_module, "RAY_READINESS_POLL_S", 0.05)
+        # Port from a server we immediately shut down — nothing listens.
+        ports = []
+        server = self._serve([], ports)
+        server.shutdown()
+        server.server_close()
+        assert _wait_for_cluster("127.0.0.1:6379", 1, timeout=0.5, dashboard_port=ports[0]) is False
+
+
+class TestDiscoverTpuNoIps:
+    """Booting nodes (no networkEndpoints yet) are observable, not errors."""
+
+    def _fake_describe(self, monkeypatch, raw):
+        import eray.cli.utils as utils_module
+
+        monkeypatch.setattr(utils_module, "gcloud_json", lambda args, **kw: raw)
+
+    def test_booting_node_raises_by_default(self, monkeypatch):
+        from eray.cli.utils import discover_tpu
+
+        self._fake_describe(monkeypatch, {"acceleratorType": "v5p-8", "state": "CREATING"})
+        with pytest.raises(ValueError, match="No internal IPs"):
+            discover_tpu("boot", "proj", "zone")
+
+    def test_allow_no_ips_returns_state_for_booting_node(self, monkeypatch):
+        from eray.cli.utils import discover_tpu
+
+        self._fake_describe(monkeypatch, {"acceleratorType": "v5p-8", "state": "CREATING"})
+        tpu = discover_tpu("boot", "proj", "zone", allow_no_ips=True)
+        assert tpu.state == "CREATING"
+        assert tpu.internal_ips == []
+        assert tpu.num_hosts == 0
+
+    def test_describe_node_tolerates_booting_node(self, monkeypatch):
+        import eray.cli.utils as utils_module
+        from eray.provision.fleet import describe_node
+
+        monkeypatch.setattr(
+            utils_module, "gcloud_json", lambda args, **kw: {"acceleratorType": "v5p-8", "state": "STARTING"}
+        )
+        node = describe_node("boot", project="proj", zone="zone")
+        assert node is not None
+        assert node.state == "STARTING"
