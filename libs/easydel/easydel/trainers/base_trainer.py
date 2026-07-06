@@ -6648,7 +6648,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 tail = "" if len(coords) <= 8 else f", ... ({len(coords)} total)"
                 lines.append(f"  {name}[{axis_size}]: {head}{tail}")
             if lines:
-                logger.info("Mesh axis -> physical TPU coords (origin line):\n" + "\n".join(lines))
+                logger.debug("Mesh axis -> physical TPU coords (origin line):\n" + "\n".join(lines))
         except Exception as exc:  # pragma: no cover - diagnostics only
             logger.debug(f"mesh topology log skipped: {exc}")
 
