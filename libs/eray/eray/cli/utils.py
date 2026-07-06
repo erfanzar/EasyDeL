@@ -318,6 +318,99 @@ class TpuInfo:
         )
 
 
+# ── Local TPU auto-detection (running on the TPU VM itself) ─────
+
+GCE_METADATA_BASE = "http://metadata.google.internal/computeMetadata/v1"
+
+
+def _gce_metadata(path: str, timeout: float = 2.0) -> str | None:
+    """Read one value from the GCE metadata server.
+
+    Args:
+        path: Metadata path below the v1 root, e.g.
+            ``instance/attributes/accelerator-type``.
+        timeout: Request timeout in seconds; kept short so non-GCP machines
+            fail fast.
+
+    Returns:
+        The value as a stripped string, or None when the metadata server is
+        unreachable (not on GCP) or the key does not exist.
+    """
+    import requests
+
+    try:
+        r = requests.get(f"{GCE_METADATA_BASE}/{path}", headers={"Metadata-Flavor": "Google"}, timeout=timeout)
+        if r.status_code != 200:
+            return None
+        return r.text.strip()
+    except Exception:
+        return None
+
+
+def detect_local_tpu() -> TpuInfo | None:
+    """Detect the TPU this process is running on, with no flags and no gcloud.
+
+    TPU VM workers expose the pod's full identity through instance metadata:
+    the TPU resource name (``instance-id``), the accelerator type, every
+    worker's internal IP (``worker-network-endpoints``, one
+    ``<id>:<id>:<ip>`` entry per worker), and the project/zone. That is
+    everything ``eray tpu connect`` needs, so when the CLI runs on a TPU VM
+    the name/project/zone flags are optional.
+
+    Returns:
+        A TpuInfo for the local TPU (gcloud-managed when name/project/zone
+        all resolved, so multi-host SSH goes through gcloud), or None when
+        this machine is not a TPU VM.
+    """
+    acc_type = _gce_metadata("instance/attributes/accelerator-type")
+    if not acc_type:
+        return None
+
+    endpoints = _gce_metadata("instance/attributes/worker-network-endpoints") or ""
+    ips = []
+    for entry in endpoints.split(","):
+        ip = entry.strip().rsplit(":", 1)[-1].strip()
+        if ip:
+            ips.append(ip)
+    if not ips:
+        return None
+
+    name = _gce_metadata("instance/attributes/instance-id")
+    project = _gce_metadata("project/project-id")
+    zone_path = _gce_metadata("instance/zone") or ""
+    zone = zone_path.rsplit("/", 1)[-1] or None
+
+    # Only claim gcloud mode with the full identity; otherwise fall back to
+    # direct-IP mode (run_on_host then uses plain SSH between workers).
+    if not (name and project and zone):
+        name = project = zone = None
+
+    return TpuInfo(
+        name=name,
+        project=project,
+        zone=zone,
+        accelerator_type=acc_type,
+        internal_ips=ips,
+        num_hosts=len(ips),
+        state="READY",
+    )
+
+
+def _local_ips() -> set[str]:
+    """Addresses that identify this machine as an SSH target to skip.
+
+    Returns:
+        The loopback names plus every address ``hostname -I`` reports.
+    """
+    ips = {"127.0.0.1", "::1", "localhost"}
+    try:
+        out = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=5)
+        ips.update(out.stdout.split())
+    except Exception:
+        pass
+    return ips
+
+
 # ── gcloud TPU discovery ─────────────────────────────────────────
 
 
@@ -529,7 +622,10 @@ def run_on_host(
 ) -> subprocess.CompletedProcess:
     """Run a command on a specific host.
 
-    Dispatches to gcloud SSH or direct SSH depending on tpu.is_gcloud_managed.
+    Runs locally when the target host is this machine (the CLI running on a
+    TPU VM targeting its own worker — no SSH configuration needed at all);
+    otherwise dispatches to gcloud SSH or direct SSH depending on
+    tpu.is_gcloud_managed.
 
     Args:
         tpu: TpuInfo with host metadata.
@@ -542,11 +638,24 @@ def run_on_host(
     Returns:
         A subprocess.CompletedProcess with the command result.
     """
+    target_ip = tpu.internal_ips[host_index]
+    if target_ip in _local_ips():
+        # Plain (non-login) shell with this interpreter's bin dir first on
+        # PATH: a bare `ray` must resolve to the ray this eray was installed
+        # with, not whatever ~/.local/bin happens to hold (observed live: a
+        # 2.55 user install started the head while the venv client was 2.54,
+        # failing every readiness check with a version mismatch).
+        import os
+        import sys
+
+        env = dict(os.environ)
+        env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
+        return subprocess.run(["bash", "-c", command], capture_output=True, text=True, timeout=timeout, env=env)
     if tpu.is_gcloud_managed:
         return ssh_tpu_worker(tpu, host_index, command, timeout=timeout)
     else:
         return ssh_to_ip(
-            tpu.internal_ips[host_index],
+            target_ip,
             command,
             timeout=timeout,
             user=user,
