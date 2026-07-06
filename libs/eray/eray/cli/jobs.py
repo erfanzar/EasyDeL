@@ -1116,6 +1116,34 @@ def doctor(address, log_max_gb, as_json):
     except Exception as exc:
         _emit("warn", "nodes", f"node state API unavailable: {exc}")
 
+    # Fleet registry (best-effort, registry-only — no gcloud probes so doctor stays fast).
+    try:
+        from ..provision.registry import ClusterRegistry
+
+        registry = ClusterRegistry.from_config()
+        records = registry.load()
+        if records:
+            holder = registry.lease_holder()
+            _emit(
+                "info",
+                "fleet",
+                f"fleet registry: {len(records)} cluster(s), watcher lease "
+                f"{'held by ' + holder if holder else 'free (no live watcher)'}",
+            )
+            for name, rec in sorted(records.items()):
+                line = f"fleet {name}: {rec.state or 'UNKNOWN'} (desired {rec.desired_state}, gen {rec.generation})"
+                if rec.state.startswith("HALTED"):
+                    _emit("error", "fleet", line + "  ← parked, run: eray fleet resume " + name)
+                    exit_code = 1
+                elif rec.state == "NEEDS_BOOTSTRAP":
+                    _emit("warn", "fleet", line + "  ← bootstrap failed; fix, then: eray fleet resume " + name)
+                elif rec.desired_state == "up" and rec.state not in ("HEALTHY", "CONNECTED"):
+                    _emit("warn", "fleet", line)
+                else:
+                    _emit("info", "fleet", line)
+    except Exception as exc:
+        _emit("warn", "fleet", f"fleet registry unreadable: {exc}")
+
     if as_json:
         print(json.dumps({"ok": exit_code == 0, "findings": findings}, indent=2))
     raise SystemExit(exit_code)
