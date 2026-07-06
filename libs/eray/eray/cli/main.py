@@ -211,7 +211,11 @@ _ssh_key_opt = click.option("--ssh-key", default=None, help="SSH key path for di
 @_tpu_type_opt
 @_user_opt
 @_ssh_key_opt
-@click.option("--ray-bin", default="ray", help="Path to ray binary on hosts.")
+@click.option(
+    "--ray-bin",
+    default="ray",
+    help="Ray binary on hosts; default auto-resolves per host (driver venv ray, then PATH, then ~/.local/bin/ray).",
+)
 @click.option("--ray-tmp-dir", default=None, help="Temp dir for Ray on hosts (default: keep tpu.py default).")
 @click.option("--timeout", "-t", default=300, help="Cluster readiness timeout (seconds).")
 @click.option(
@@ -255,7 +259,11 @@ def bounce(tpu_name, project, zone, ips, tpu_type, user, ssh_key, ray_bin, ray_t
 @_tpu_type_opt
 @_user_opt
 @_ssh_key_opt
-@click.option("--ray-bin", default="ray", help="Path to ray binary on hosts.")
+@click.option(
+    "--ray-bin",
+    default="ray",
+    help="Ray binary on hosts; default auto-resolves per host (driver venv ray, then PATH, then ~/.local/bin/ray).",
+)
 @click.option("--ray-tmp-dir", default="/tmp/eray_tmp", help="Temp dir for Ray on hosts.")
 @click.option("--timeout", "-t", default=300, help="Cluster readiness timeout (seconds).")
 @click.option("--json", "as_json", is_flag=True, default=False, help="Output result as JSON.")
@@ -352,7 +360,11 @@ def connect(tpu_name, project, zone, ips, tpu_type, user, ssh_key, ray_bin, ray_
 @_tpu_type_opt
 @_user_opt
 @_ssh_key_opt
-@click.option("--ray-bin", default="ray", help="Path to ray binary on hosts.")
+@click.option(
+    "--ray-bin",
+    default="ray",
+    help="Ray binary on hosts; default auto-resolves per host (driver venv ray, then PATH, then ~/.local/bin/ray).",
+)
 def disconnect(tpu_name, project, zone, ips, tpu_type, user, ssh_key, ray_bin):
     """Stop Ray on all TPU hosts.
 
