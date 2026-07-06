@@ -284,7 +284,7 @@ def _local_ips() -> set[str]:
 # ── gcloud TPU discovery ─────────────────────────────────────────
 
 
-def discover_tpu(name: str, project: str, zone: str) -> TpuInfo:
+def discover_tpu(name: str, project: str, zone: str, *, allow_no_ips: bool = False) -> TpuInfo:
     """Describe a TPU and extract connection metadata.
 
     Uses `gcloud compute tpus tpu-vm describe` to get the accelerator
@@ -294,12 +294,16 @@ def discover_tpu(name: str, project: str, zone: str) -> TpuInfo:
         name: TPU resource name.
         project: GCP project ID.
         zone: GCP zone.
+        allow_no_ips: Return a TpuInfo with empty internal_ips (num_hosts 0)
+            instead of raising when the node has no network endpoints yet,
+            as during CREATING/STARTING.
 
     Returns:
         A TpuInfo populated from the gcloud response.
 
     Raises:
-        ValueError: If the gcloud response is malformed or no internal IPs are found.
+        ValueError: If the gcloud response is malformed, or no internal IPs
+            are found and allow_no_ips is False.
     """
     info(f"Describing TPU {name} in {project}/{zone}...")
     raw = gcloud_json(
@@ -324,7 +328,9 @@ def discover_tpu(name: str, project: str, zone: str) -> TpuInfo:
 
     endpoints = raw.get("networkEndpoints", [])
     ips = [ep.get("ipAddress", "") for ep in endpoints if ep.get("ipAddress")]
-    if not ips:
+    if not ips and not allow_no_ips:
+        # A booting node (CREATING/STARTING) legitimately has no endpoints
+        # yet — pollers pass allow_no_ips to observe the state anyway.
         raise ValueError(f"No internal IPs found for TPU {name}")
 
     return TpuInfo(

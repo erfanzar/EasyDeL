@@ -365,37 +365,43 @@ def _cleanup_ray(
             info(f"Host {host_idx}: Ray cleaned")
 
 
-def _wait_for_cluster(ray_address: str, expected_nodes: int, *, timeout: int = 300) -> bool:
-    """Poll the Ray cluster until all expected nodes are registered.
+def _wait_for_cluster(
+    ray_address: str, expected_nodes: int, *, timeout: int = 300, dashboard_port: int | None = None
+) -> bool:
+    """Poll the head's dashboard state API until all expected nodes are alive.
 
-    Uses ray.init() + ray.nodes() to check cluster topology. Expects
-    `expected_nodes` alive nodes, each with TPU resources.
+    Deliberately NOT ray.init(): a driver handshake requires the operator's
+    Python and Ray versions to match the cluster's exactly, so it can never
+    succeed when the operator box connects a cluster it did not bootstrap
+    itself (observed live: a 3.13 venv watching a node whose head runs the
+    image's system 3.10). The dashboard HTTP API has no such coupling.
 
     Args:
-        ray_address: Ray cluster address (ip:port).
+        ray_address: Ray cluster address (ip:port); the dashboard is assumed
+            on the same host.
         expected_nodes: Number of nodes expected to be alive.
         timeout: Maximum time to wait in seconds.
+        dashboard_port: Dashboard port override (default RAY_DASHBOARD_PORT).
 
     Returns:
         True if all expected nodes are registered before the timeout, False otherwise.
     """
-    import ray
+    import json
+    import urllib.request
 
+    port = dashboard_port or RAY_DASHBOARD_PORT
+    url = f"http://{ray_address.split(':')[0]}:{port}/api/v0/nodes?limit=10000"
     deadline = time.monotonic() + timeout
     last_seen = None
+    last_error = ""
 
     while time.monotonic() < deadline:
         try:
-            if not ray.is_initialized():
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", FutureWarning)
-                    ray.init(
-                        address=ray_address,
-                        ignore_reinit_error=True,
-                        logging_level=logging.ERROR,
-                    )
-            alive = [n for n in ray.nodes() if n.get("Alive")]
-            total_tpus = sum(n.get("Resources", {}).get("TPU", 0) for n in alive)
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                payload = json.loads(resp.read())
+            rows = payload["data"]["result"]["result"]
+            alive = [n for n in rows if n.get("state") == "ALIVE"]
+            total_tpus = sum(n.get("resources_total", {}).get("TPU", 0) for n in alive)
             current = (len(alive), int(total_tpus))
             if current != last_seen:
                 info(f"Cluster: {current[0]}/{expected_nodes} nodes, {current[1]} TPU resources")
@@ -403,9 +409,11 @@ def _wait_for_cluster(ray_address: str, expected_nodes: int, *, timeout: int = 3
             if len(alive) >= expected_nodes:
                 return True
         except Exception as exc:
-            logger.debug(f"Waiting for cluster: {exc}")
-            ray.shutdown()
+            last_error = f"{type(exc).__name__}: {exc}"
+            logger.debug(f"Waiting for cluster: {last_error}")
         time.sleep(RAY_READINESS_POLL_S)
+    if last_error:
+        error(f"cluster readiness: last probe error was {last_error}")
 
     return False
 

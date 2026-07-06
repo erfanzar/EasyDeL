@@ -54,8 +54,12 @@ from .registry import ClusterRecord, ClusterRegistry
 EVENTS_PATH = Path("~/.eray/events.jsonl").expanduser()
 PAUSE_DIR = Path("~/.eray").expanduser()
 
-#: Node states that definitively mean the capacity is gone or going.
-NODE_DEAD_STATES = frozenset({"PREEMPTED", "TERMINATED", "STOPPED", "DELETING"})
+#: Node states that definitively mean the capacity is gone. DELETING is
+#: deliberately absent: it means a delete operation is in flight, and acting
+#: during it races that operation (observed live: QR delete --force during a
+#: node deletion fails with code 10 ABORTED). The next tick sees the terminal
+#: state (NOT_FOUND node / SUSPENDED QR) and recovers cleanly.
+NODE_DEAD_STATES = frozenset({"PREEMPTED", "TERMINATED", "STOPPED"})
 #: QR failure text that means "do not retry" (config problem, not capacity).
 QUOTA_ERROR_MARKERS = ("quota", "permission", "PERMISSION_DENIED", "does not have permission")
 

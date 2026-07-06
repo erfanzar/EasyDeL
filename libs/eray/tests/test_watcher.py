@@ -117,6 +117,22 @@ class TestPlanTruthTable:
         delete = next(a for a in actions if a.kind == "delete_qr")
         assert delete.args["force"] is False
 
+    def test_deleting_node_waits_for_terminal_state(self):
+        # A delete operation is in flight — acting now races it (observed
+        # live: QR delete --force during node deletion fails, code 10
+        # ABORTED). The plan must wait, not recover.
+        actions = plan(make_record(state="HEALTHY"), obs(node_state="DELETING", qr_state="ACTIVE"), WatchPolicy())
+        assert kinds(actions) == ["set_state"]
+        assert "delete_qr" not in kinds(actions)
+
+    def test_node_gone_but_qr_still_active_waits(self):
+        # Right after a node death the QR can briefly still read ACTIVE
+        # before SUSPENDING; recovery starts once the QR reaches a
+        # gone-or-dead state.
+        actions = plan(make_record(state="HEALTHY"), obs(node_state=None, qr_state="ACTIVE"), WatchPolicy())
+        assert "delete_qr" not in kinds(actions)
+        assert "create_qr" not in kinds(actions)
+
     def test_everything_gone_skips_delete(self):
         actions = plan(make_record(), obs(node_state=None, qr_state=None, head_up=None), WatchPolicy())
         assert "delete_qr" not in kinds(actions)
