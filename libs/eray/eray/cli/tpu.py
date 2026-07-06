@@ -121,6 +121,32 @@ def _ray_bin_preamble(ray_bin: str, *, strict: bool) -> str:
     return f'RAY_BIN="$({checks})" || RAY_BIN={shlex.quote(ray_bin)}'
 
 
+def _require_reachable_head(ray_address: str, *, timeout: float = 2.0) -> None:
+    """Fail fast when no Ray head is listening at the address.
+
+    ``ray.init(address=...)`` against a dead head spends ~107s in GCS
+    connection retries (measured live) before erroring with unactionable
+    GCS warnings — and the read-only commands (status/resources/health) are
+    exactly what an operator runs to check whether the cluster is up. A
+    2-second TCP probe converts that into an immediate, actionable error.
+
+    Args:
+        ray_address: Ray cluster address (ip:port).
+        timeout: TCP connect timeout in seconds.
+
+    Raises:
+        RuntimeError: If nothing accepts connections on the head port.
+    """
+    ip, _, port = ray_address.partition(":")
+    try:
+        with socket.create_connection((ip, int(port or RAY_HEAD_PORT)), timeout=timeout):
+            return
+    except OSError as exc:
+        raise RuntimeError(
+            f"no Ray cluster reachable at {ray_address} ({exc}); start one with 'eray tpu connect'"
+        ) from None
+
+
 @dataclass
 class ConnectResult:
     """Result of a TPU cluster connect operation."""
@@ -399,6 +425,7 @@ def cluster_status(ray_address: str) -> dict:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", FutureWarning)
         if not ray.is_initialized():
+            _require_reachable_head(ray_address)
             ray.init(address=ray_address, ignore_reinit_error=True, logging_level=logging.ERROR)
 
     nodes = ray.nodes()
@@ -446,6 +473,7 @@ def resource_usage(ray_address: str, *, per_node: bool = False) -> dict:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", FutureWarning)
         if not ray.is_initialized():
+            _require_reachable_head(ray_address)
             ray.init(address=ray_address, ignore_reinit_error=True, logging_level=logging.ERROR)
 
     total = ray.cluster_resources()
@@ -520,6 +548,7 @@ def health_check(ray_address: str, tpu_type: str | None = None) -> list[dict]:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", FutureWarning)
         if not ray.is_initialized():
+            _require_reachable_head(ray_address)
             ray.init(address=ray_address, ignore_reinit_error=True, logging_level=logging.ERROR)
 
     @ray.remote

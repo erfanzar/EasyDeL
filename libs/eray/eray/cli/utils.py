@@ -21,6 +21,7 @@ import logging
 import subprocess
 import sys
 from dataclasses import dataclass
+from typing import ClassVar
 
 logger = logging.getLogger("eray.cli")
 # The colored print() in info()/success()/warning()/error() is the user-facing
@@ -286,11 +287,24 @@ class TpuInfo:
         parts = self.accelerator_type.split("-")
         return parts[1] if len(parts) > 1 else "8"
 
+    # TensorCores per chip by generation. For 2-core generations the
+    # accelerator-type suffix counts TensorCores, not chips (v5p-8 is a
+    # 4-chip host — verified live: Ray detects TPU=4 and /dev/vfio exposes
+    # chips 0-3); for single-core generations (v5e/v6e) the suffix already
+    # counts chips.
+    _CORES_PER_CHIP: ClassVar[dict[str, int]] = {"v2": 2, "v3": 2, "v4": 2, "v5p": 2}
+
     @property
     def chips_per_host(self) -> int:
-        """Approximate chips per host from the slice topology."""
-        total = int(self.slice_size)
-        return max(total // self.num_hosts, 1) if self.num_hosts else total
+        """Physical chips per host, matching Ray's native TPU accounting.
+
+        Advertising more "TPU" units than physical chips is not cosmetic:
+        Ray hands fractional-TPU tasks TPU_VISIBLE_CHIPS ids up to the
+        advertised count, so a v5p-8 registered as TPU=8 assigns chips 4-7
+        that do not exist and double-books the real ones (observed live).
+        """
+        total_chips = max(int(self.slice_size) // self._CORES_PER_CHIP.get(self.tpu_version.lower(), 1), 1)
+        return max(total_chips // self.num_hosts, 1) if self.num_hosts else total_chips
 
     @classmethod
     def from_ips(
