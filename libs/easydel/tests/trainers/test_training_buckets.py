@@ -24,6 +24,7 @@ from __future__ import annotations
 import copy
 
 import pytest
+
 from easydel.trainers.buckets import (
     BucketRule,
     CallableBucketRule,
@@ -241,6 +242,7 @@ class TestBucketGraphdefStructure:
     def test_vanilla_and_blocksparse_share_param_structure(self):
         import jax
         import spectrax as spx
+
         from easydel import LlamaConfig
         from easydel.modules.llama.modeling_llama import LlamaForCausalLM
 
@@ -274,9 +276,9 @@ class TestBucketGraphdefStructure:
         )
         _, gstate_base, _ = base_model.split_module()
         _, gstate_alt, _ = alt_model.split_module()
-        assert jax.tree_util.tree_structure(gstate_base) == jax.tree_util.tree_structure(
-            gstate_alt
-        ), "vanilla and blocksparse variants must share graphstate structure"
+        assert jax.tree_util.tree_structure(gstate_base) == jax.tree_util.tree_structure(gstate_alt), (
+            "vanilla and blocksparse variants must share graphstate structure"
+        )
 
 
 class _FakeShardedSource:

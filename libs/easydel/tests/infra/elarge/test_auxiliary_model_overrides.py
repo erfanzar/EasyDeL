@@ -20,11 +20,12 @@ shared sections for that role only, must keep the primary mesh, and fall
 back to the shared sections when absent.
 """
 
+import pytest
+from eformer.escale import PartitionAxis
+
 import easydel as ed
 import easydel.infra.elarge.model as elarge_model_mod
-import pytest
 from easydel.infra.elarge.processing import coerce_partition_axis
-from eformer.escale import PartitionAxis
 
 _BASE_CFG = {
     "model": {"name_or_path": "stub/student"},

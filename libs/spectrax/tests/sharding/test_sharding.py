@@ -12,6 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+
 import spectrax as spx
 from spectrax import common_types as ct
 from spectrax.nn.linear import Linear

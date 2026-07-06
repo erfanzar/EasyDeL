@@ -41,16 +41,15 @@ from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec
 from jaxtyping import Array
-from spectrax import with_sharding_constraint
 from spectrax.common_types import BATCH, LENGTH, MODE_TRAIN, VOCAB
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 
 from ..training_utils import (
-    constrain_batch_sharding,
     ScheduledLossAdapter,
     bind_scheduled_module,
+    constrain_batch_sharding,
     filter_kwargs_for_callable,
     make_assertions_and_get_sizes,
     minibatch_call,

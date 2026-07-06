@@ -423,7 +423,7 @@ class ParquetShardedSource(ShardedDataSource[dict]):
         """
         try:
             numpy_rows = ParquetShardedSource._table_to_rows_numpy(table)
-        except Exception:  # noqa: BLE001 - any surprise reverts to the legacy path
+        except Exception:
             numpy_rows = None
         if numpy_rows is not None:
             # Deliberately outside the try: all fallible materialization ran at
