@@ -574,6 +574,44 @@ def run_on_all_hosts(
 # ── Ray resource builder ─────────────────────────────────────────
 
 
+def tpu_resource_labels(accelerator_type: str, num_hosts: int, *, is_head: bool) -> dict[str, int]:
+    """Canonical Ray resource labels for one host of a TPU slice.
+
+    The single source of truth shared by connect-mode
+    (`build_ray_resource_flags`) and the cluster-launcher generator, so the
+    two paths can never drift. Casing is load-bearing: `SlicePoolManager`
+    schedules SliceActors on `TPU-{version}-{size}-head` exactly
+    (eray/pool/slice.py), and the `TPU` count must be physical chips
+    (see `TpuInfo.chips_per_host`).
+
+    Args:
+        accelerator_type: e.g. ``"v5p-64"``.
+        num_hosts: Worker hosts in the slice (drives chips-per-host).
+        is_head: Whether these labels are for worker 0 (the slice head).
+
+    Returns:
+        Resource-name → quantity mapping.
+    """
+    tpu = TpuInfo.from_ips(["0.0.0.0"] * max(num_hosts, 1), accelerator_type)
+    version = tpu.tpu_version
+    slice_size = tpu.slice_size
+    resources: dict[str, int] = {
+        "TPU": tpu.chips_per_host,
+        f"TPU-{version}": tpu.chips_per_host,
+        f"accelerator_type:TPU-{version.upper()}": 1,
+    }
+    if is_head:
+        resources.update(
+            {
+                f"TPU-{version}-{slice_size}-head": 1,
+                f"TPU-{version}-{slice_size}-global-head": 1,
+                "head-node": 1,
+                "ray-cluster-head": 1,
+            }
+        )
+    return resources
+
+
 def build_ray_resource_flags(tpu: TpuInfo, is_head: bool) -> str:
     """Build the Ray --resources JSON for a TPU host.
 
@@ -588,24 +626,5 @@ def build_ray_resource_flags(tpu: TpuInfo, is_head: bool) -> str:
     Returns:
         A JSON string of resource flags for the Ray --resources argument.
     """
-    version = tpu.tpu_version
-    slice_size = tpu.slice_size
-    version_upper = version.upper()
-
-    if is_head:
-        resources = {
-            "TPU": tpu.chips_per_host,
-            f"TPU-{version}": tpu.chips_per_host,
-            f"TPU-{version}-{slice_size}-head": 1,
-            f"TPU-{version}-{slice_size}-global-head": 1,
-            f"accelerator_type:TPU-{version_upper}": 1,
-            "head-node": 1,
-            "ray-cluster-head": 1,
-        }
-    else:
-        resources = {
-            "TPU": tpu.chips_per_host,
-            f"TPU-{version}": tpu.chips_per_host,
-            f"accelerator_type:TPU-{version_upper}": 1,
-        }
+    resources = tpu_resource_labels(tpu.accelerator_type, tpu.num_hosts, is_head=is_head)
     return json.dumps(resources, separators=(",", ":"))

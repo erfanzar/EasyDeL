@@ -9,7 +9,7 @@ provider:
   project_id: {{PROJECT_ID}}
 
 docker:
-  image: "ghcr.io/erfanzar/easydel:latest-tpu"
+  image: "{{IMAGE}}"
   container_name: "ray_docker"
   pull_before_run: true
   worker_run_options:
