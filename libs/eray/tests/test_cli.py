@@ -55,9 +55,23 @@ class TestTpuInfo:
         tpu = self.make_tpu("v4-32")
         assert tpu.slice_size == "32"
 
-    def test_chips_per_host(self):
+    def test_chips_per_host_counts_chips_not_cores(self):
+        # v4 slice suffixes count TensorCores (2 per chip): v4-32 = 16 chips
+        # over 4 hosts. Advertising cores as "TPU" makes Ray assign
+        # nonexistent chip ids to fractional-TPU tasks.
         tpu = self.make_tpu("v4-32", num_hosts=4)
-        assert tpu.chips_per_host == 8
+        assert tpu.chips_per_host == 4
+
+    def test_chips_per_host_v5p_matches_ray_native_detection(self):
+        # Live-anchored: a v5p-8 host exposes 4 chips (/dev/vfio/0-3) and
+        # Ray-native detection reports TPU=4.
+        tpu = self.make_tpu("v5p-8", num_hosts=1)
+        assert tpu.chips_per_host == 4
+
+    def test_chips_per_host_single_core_generations(self):
+        # v5e/v6e suffixes already count chips (one TensorCore per chip).
+        assert self.make_tpu("v5litepod-8", num_hosts=1).chips_per_host == 8
+        assert self.make_tpu("v6e-16", num_hosts=4).chips_per_host == 4
 
     def test_is_gcloud_managed_true(self):
         tpu = self.make_tpu()
@@ -78,7 +92,7 @@ class TestTpuInfo:
 
     def test_from_ips_resource_calculation(self):
         tpu = TpuInfo.from_ips(["10.0.0.1", "10.0.0.2"], "v4-16")
-        assert tpu.chips_per_host == 8  # 16 / 2
+        assert tpu.chips_per_host == 4  # 16 cores / 2 cores-per-chip / 2 hosts
         assert tpu.tpu_version == "v4"
         assert tpu.slice_size == "16"
 
@@ -97,7 +111,7 @@ class TestBuildRayResourceFlags:
         flags = build_ray_resource_flags(tpu, is_head=True)
         resources = json.loads(flags)
         assert resources["head-node"] == 1
-        assert resources["TPU"] == 8
+        assert resources["TPU"] == 4  # v4-32 = 16 chips over 4 hosts
         assert "TPU-v4-32-head" in resources
         assert "accelerator_type:TPU-V4" in resources
 
@@ -107,7 +121,7 @@ class TestBuildRayResourceFlags:
         flags = build_ray_resource_flags(tpu, is_head=False)
         resources = json.loads(flags)
         assert "head-node" not in resources
-        assert resources["TPU"] == 8  # 16 / 2
+        assert resources["TPU"] == 4  # 16 cores / 2 cores-per-chip / 2 hosts
 
     def test_head_has_more_resources_than_worker(self):
         tpu = TpuInfo.from_ips(["10.0.0.1", "10.0.0.2"], "v4-16")
@@ -523,6 +537,31 @@ class TestListTpuHelpers:
 
 
 # ── ConnectResult dataclass ──────────────────────────────────────
+
+
+class TestRequireReachableHead:
+    def test_dead_head_fails_fast_with_guidance(self):
+        # Regression: ray.init against a dead head burns ~107s in GCS
+        # retries; the read-only commands must fail in ~2s instead.
+        import time
+
+        from eray.cli.tpu import _require_reachable_head
+
+        start = time.monotonic()
+        with pytest.raises(RuntimeError, match="eray tpu connect"):
+            _require_reachable_head("127.0.0.1:1")
+        assert time.monotonic() - start < 5
+
+    def test_listening_head_passes(self):
+        import socket
+
+        from eray.cli.tpu import _require_reachable_head
+
+        with socket.socket() as srv:
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(1)
+            port = srv.getsockname()[1]
+            _require_reachable_head(f"127.0.0.1:{port}")  # no raise
 
 
 class TestResourceUsage:
