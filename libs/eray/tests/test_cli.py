@@ -15,12 +15,14 @@
 """Tests for eray.cli — CLI entry point, click commands, and TPU logic."""
 
 import json
+import subprocess
+import sys
 from unittest import mock
 
 import pytest
 from click.testing import CliRunner
 from eray.cli.main import _resolve_tpu, cli
-from eray.cli.tpu import ConnectResult
+from eray.cli.tpu import ConnectResult, _ray_bin_preamble
 from eray.cli.utils import (
     TpuInfo,
     build_ray_resource_flags,
@@ -250,6 +252,80 @@ class TestRunOnHostLocalExec:
         result = run_on_host(tpu, 0, "echo local-$((6 * 7))")
         assert result.returncode == 0
         assert "local-42" in result.stdout
+
+
+class TestRayBinPreamble:
+    """The preamble is a shell contract executed on remote hosts through
+    non-interactive SSH (where venv PATH entries are absent), so these tests
+    run the generated snippet under bash with a controlled PATH/HOME and
+    assert what $RAY_BIN actually resolves to."""
+
+    def _run(self, preamble: str, *, path: str, home: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["/bin/bash", "-c", f'{preamble} && echo "resolved:$RAY_BIN"'],
+            capture_output=True,
+            text=True,
+            env={"PATH": path, "HOME": home},
+            timeout=10,
+        )
+
+    def _fake_ray(self, directory) -> str:
+        directory.mkdir(parents=True, exist_ok=True)
+        ray = directory / "ray"
+        ray.write_text("#!/bin/sh\n")
+        ray.chmod(0o755)
+        return str(ray)
+
+    def test_default_prefers_driver_venv_ray(self, tmp_path):
+        venv_ray = self._fake_ray(tmp_path / "venv-bin")
+        with mock.patch.object(sys, "executable", str(tmp_path / "venv-bin" / "python")):
+            preamble = _ray_bin_preamble("ray", strict=True)
+        result = self._run(preamble, path=str(tmp_path / "empty"), home=str(tmp_path / "home"))
+        assert result.returncode == 0
+        assert f"resolved:{venv_ray}" in result.stdout
+
+    def test_default_falls_back_to_path_lookup(self, tmp_path):
+        path_ray = self._fake_ray(tmp_path / "on-path")
+        with mock.patch.object(sys, "executable", str(tmp_path / "no-venv" / "python")):
+            preamble = _ray_bin_preamble("ray", strict=True)
+        result = self._run(preamble, path=str(tmp_path / "on-path"), home=str(tmp_path / "home"))
+        assert result.returncode == 0
+        assert f"resolved:{path_ray}" in result.stdout
+
+    def test_default_falls_back_to_user_local_bin(self, tmp_path):
+        home = tmp_path / "home"
+        local_ray = self._fake_ray(home / ".local" / "bin")
+        with mock.patch.object(sys, "executable", str(tmp_path / "no-venv" / "python")):
+            preamble = _ray_bin_preamble("ray", strict=True)
+        result = self._run(preamble, path=str(tmp_path / "empty"), home=str(home))
+        assert result.returncode == 0
+        assert f"resolved:{local_ray}" in result.stdout
+
+    def test_strict_fails_with_diagnostic_when_unresolvable(self, tmp_path):
+        # The v5p-1024 regression: bare `ray` in a PATH-less SSH shell must
+        # produce an actionable error, not `ray: command not found`.
+        with mock.patch.object(sys, "executable", str(tmp_path / "no-venv" / "python")):
+            preamble = _ray_bin_preamble("ray", strict=True)
+        result = self._run(preamble, path=str(tmp_path / "empty"), home=str(tmp_path / "home"))
+        assert result.returncode == 127
+        assert "ray executable not found" in result.stderr
+        assert "--ray-bin" in result.stderr
+
+    def test_soft_mode_falls_back_without_failing(self, tmp_path):
+        with mock.patch.object(sys, "executable", str(tmp_path / "no-venv" / "python")):
+            preamble = _ray_bin_preamble("ray", strict=False)
+        result = self._run(preamble, path=str(tmp_path / "empty"), home=str(tmp_path / "home"))
+        assert result.returncode == 0
+        assert "resolved:ray" in result.stdout
+
+    def test_explicit_ray_bin_is_sole_candidate(self, tmp_path):
+        explicit = self._fake_ray(tmp_path / "custom")
+        decoy = self._fake_ray(tmp_path / "on-path")
+        preamble = _ray_bin_preamble(explicit, strict=True)
+        result = self._run(preamble, path=str(tmp_path / "on-path"), home=str(tmp_path / "home"))
+        assert result.returncode == 0
+        assert f"resolved:{explicit}" in result.stdout
+        assert decoy not in result.stdout
 
 
 # ── CLI command tests ────────────────────────────────────────────

@@ -25,8 +25,11 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
+import os
+import shlex
 import socket
 import subprocess
+import sys
 import time
 import warnings
 from dataclasses import dataclass
@@ -71,6 +74,53 @@ def _wait_for_port(ip: str, port: int, *, attempts: int = 30, interval: float = 
     return False
 
 
+def _ray_bin_preamble(ray_bin: str, *, strict: bool) -> str:
+    """Shell preamble that resolves the ray executable into $RAY_BIN on the target host.
+
+    Non-interactive SSH shells (``gcloud ... ssh --command``, plain ``ssh``)
+    do not load the interactive rc files, so a venv-installed ray is not on
+    PATH there even though bare ``ray`` resolves in the operator's own shell
+    (observed live on a v5p-1024: the head, started locally, came up while
+    all 127 SSH-started workers failed with ``ray: command not found``).
+
+    When ``ray_bin`` is the bare default ``"ray"``, candidates are tried in
+    order: this driver's own venv ray (TPU pod hosts share the filesystem
+    layout, and this keeps worker ray versions matched to the head), then
+    PATH, then ``~/.local/bin/ray``. An explicit ``ray_bin`` is the sole
+    candidate.
+
+    Args:
+        ray_bin: Ray binary as passed on the CLI (bare name or path).
+        strict: If True, the preamble exits 127 with a diagnostic when no
+            candidate resolves (start commands must not proceed); if False it
+            falls back to ``ray_bin`` verbatim so best-effort cleanup chains
+            (whose ray calls already tolerate failure) keep running.
+
+    Returns:
+        A shell snippet to prepend to remote commands; subsequent commands
+        invoke ``"$RAY_BIN"``.
+    """
+    if ray_bin != "ray":
+        candidates = [ray_bin]
+    else:
+        candidates = []
+        local_ray = os.path.join(os.path.dirname(sys.executable), "ray")
+        if os.path.exists(local_ray):
+            candidates.append(local_ray)
+        candidates.extend(["ray", "~/.local/bin/ray"])
+    # `~/...` must stay unquoted for tilde expansion in the remote shell.
+    checks = " || ".join(f"command -v {c if c.startswith('~') else shlex.quote(c)}" for c in candidates)
+    if strict:
+        tried = ", ".join(candidates)
+        return (
+            f'RAY_BIN="$({checks})" || '
+            f'{{ echo "eray: ray executable not found on this host (tried: {tried}); '
+            f'non-interactive SSH shells do not see your venv PATH — pass --ray-bin /abs/path/to/ray" >&2; '
+            f"exit 127; }}"
+        )
+    return f'RAY_BIN="$({checks})" || RAY_BIN={shlex.quote(ray_bin)}'
+
+
 @dataclass
 class ConnectResult:
     """Result of a TPU cluster connect operation."""
@@ -103,7 +153,10 @@ def connect_tpus(
 
     Args:
         tpu: TPU info (gcloud-discovered or built from IPs).
-        ray_bin: Path to the ray binary on TPU hosts.
+        ray_bin: Ray binary on the TPU hosts. The bare default ``"ray"``
+            is resolved per host at run time (driver venv ray, then PATH,
+            then ``~/.local/bin/ray``) because non-interactive SSH shells
+            do not see venv PATH entries.
         ray_tmp_dir: Temp directory for Ray on the hosts.
         timeout: Overall readiness timeout in seconds.
         user: SSH user for direct-IP mode (ignored in gcloud mode).
@@ -128,12 +181,14 @@ def connect_tpus(
 
     # --- Step 2: Start Ray head ---
     head_resources = build_ray_resource_flags(tpu, is_head=True)
+    ray_preamble = _ray_bin_preamble(ray_bin, strict=True)
     info(f"Starting Ray head on host 0 ({head_ip})...")
     head_cmd = (
+        f"{ray_preamble} && "
         f"export TMPDIR={ray_tmp_dir} RAY_TMPDIR={ray_tmp_dir}/ray && "
         f"mkdir -p $TMPDIR $RAY_TMPDIR && "
-        f"{ray_bin} stop --force >/dev/null 2>&1 || true && "
-        f"{ray_bin} start --head "
+        f'"$RAY_BIN" stop --force >/dev/null 2>&1 || true && '
+        f'"$RAY_BIN" start --head '
         f"--port={RAY_HEAD_PORT} "
         f"--resources='{head_resources}' "
         f"--node-ip-address={head_ip} "
@@ -160,10 +215,11 @@ def connect_tpus(
         def _start_worker(host_idx: int):
             worker_ip = tpu.internal_ips[host_idx]
             worker_cmd = (
+                f"{ray_preamble} && "
                 f"export TMPDIR={ray_tmp_dir} RAY_TMPDIR={ray_tmp_dir}/ray && "
                 f"mkdir -p $TMPDIR $RAY_TMPDIR && "
-                f"{ray_bin} stop --force >/dev/null 2>&1 || true && "
-                f"{ray_bin} start "
+                f'"$RAY_BIN" stop --force >/dev/null 2>&1 || true && '
+                f'"$RAY_BIN" start '
                 f"--address={ray_address} "
                 f"--resources='{worker_resources}' "
                 f"--node-ip-address={worker_ip} "
@@ -223,7 +279,10 @@ def disconnect_tpus(
 
     Args:
         tpu: TPU info (gcloud-discovered or built from IPs).
-        ray_bin: Path to the ray binary on TPU hosts.
+        ray_bin: Ray binary on the TPU hosts. The bare default ``"ray"``
+            is resolved per host at run time (driver venv ray, then PATH,
+            then ``~/.local/bin/ray``) because non-interactive SSH shells
+            do not see venv PATH entries.
         user: SSH user for direct-IP mode (ignored in gcloud mode).
         ssh_key: SSH key path for direct-IP mode (ignored in gcloud mode).
 
@@ -249,7 +308,10 @@ def _cleanup_ray(
 
     Args:
         tpu: TPU info containing host IPs.
-        ray_bin: Path to the ray binary on TPU hosts.
+        ray_bin: Ray binary on the TPU hosts. The bare default ``"ray"``
+            is resolved per host at run time (driver venv ray, then PATH,
+            then ``~/.local/bin/ray``) because non-interactive SSH shells
+            do not see venv PATH entries.
         user: SSH user for direct-IP mode (ignored in gcloud mode).
         ssh_key: SSH key path for direct-IP mode (ignored in gcloud mode).
 
@@ -257,7 +319,8 @@ def _cleanup_ray(
         None
     """
     cleanup_cmd = (
-        f"timeout 60 {ray_bin} stop --force >/tmp/eray-ray-stop.log 2>&1 || true; "
+        f"{_ray_bin_preamble(ray_bin, strict=False)}; "
+        f'timeout 60 "$RAY_BIN" stop --force >/tmp/eray-ray-stop.log 2>&1 || true; '
         "pids=$(ps -eo pid=,args= | awk "
         "'/[r]ay start/ || /[r]ay::/ || /[s]ite-packages\\/ray\\// "
         "|| /[r]ay\\/core\\/src\\/ray\\// { print $1 }' | sort -u); "
