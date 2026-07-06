@@ -92,6 +92,127 @@ trainer = Trainer()
 trainer.train.remote(data)
 ```
 
+### Host chip splitting
+
+A TPU host is normally driven by one process owning every chip. eray can carve
+a host into multiple processes with disjoint chip ownership (the same libtpu
+environment mechanism torch_xla uses):
+
+```python
+import eray
+
+# Plan only (pure, no Ray): inspect the per-split environment.
+plan = eray.plan_host_split(num_chips=4, num_splits=4, mode="isolated")
+
+# On a slice: run fn once per split on every host.
+# SliceActor.run_split_remote_fn / DeviceHostActor.run_split_remote_fn
+refs = ray.get(host_actor.run_split_remote_fn.remote(fn, 4, mode="isolated"))
+results = ray.get(refs)  # one result per split; ERAY_SPLIT_ID identifies each
+```
+
+- `isolated` (default): each split is an independent runtime with 1 or 2 chips
+  assigned disjointly by Ray — e.g. four single-chip serving replicas on a
+  v4/v5p host.
+- `cooperative`: one process per chip forming a single multi-process runtime
+  (communicating over ICI via `jax.distributed`); chip-dependent variables
+  (`TPU_VISIBLE_CHIPS`, `CLOUD_TPU_TASK_ID`, `TPU_PROCESS_PORT`) are bound
+  inside each task from Ray's chip assignment.
+
+### Swarms — heterogeneous runs with a chip plan
+
+`eray.swarm` packs several independent workloads onto the same TPU hosts.
+`SwarmConfig` mirrors `TpuAcceleratorConfig` (it takes the chip type) plus the
+number of runs and an optional plan for how to split each host's chips:
+
+```python
+import eray
+
+# Even split: four replicas, one chip each per host.
+status = eray.swarm_execute(serve_replica, eray.SwarmConfig(tpu_version="v5p-8", num_runs=4))
+
+# A plan: three different workloads, chips split (2, 1, 1).
+status = eray.swarm_execute(
+    [
+        eray.SwarmRun(train_probe, name="train"),
+        eray.SwarmRun(serve_small, name="serve"),
+        eray.SwarmRun(eval_loop, name="eval"),
+    ],
+    eray.SwarmConfig(tpu_version="v5p-8", chip_split=(2, 1, 1)),
+)
+```
+
+**GPU swarms** use `GpuSwarmConfig` — same layout knobs, but no slice pool:
+Ray natively assigns disjoint GPUs (`CUDA_VISIBLE_DEVICES`) per run, any GPU
+count is allowed (fractions of one GPU too), and `colocate=True` packs all
+runs onto one node via a placement group:
+
+```python
+status = eray.swarm_execute(
+    [
+        eray.SwarmRun(train_probe, name="train", num_cores=8),   # 2 GPUs, 8 CPU cores
+        eray.SwarmRun(serve_small, name="serve"),                # 1 GPU
+        eray.SwarmRun(eval_loop,  name="eval"),                  # 1 GPU
+    ],
+    eray.GpuSwarmConfig(gpu_model="A100", gpu_split=(2, 1, 1), colocate=True),
+)
+```
+
+`SwarmRun.num_cores` reserves CPU cores per run on both TPU and GPU swarms
+(default: the config's `cpu_count` on GPU, the launcher default on TPU).
+GPU runs see `ERAY_RUN_GPUS` instead of `ERAY_RUN_CHIPS`.
+
+There is also a decorator form — bare `SwarmRun(...)` specs (no `fn`) bind to
+the decorated function, and calling it launches the swarm:
+
+```python
+@eray.swarmed(
+    eray.SwarmConfig(tpu_version="v5p-8"),
+    runs=[
+        eray.SwarmRun(name="lr3e4", f_kwargs={"lr": 3e-4}),
+        eray.SwarmRun(name="lr1e4", f_kwargs={"lr": 1e-4}),
+        eray.SwarmRun(name="lr5e5", f_kwargs={"lr": 5e-5}),
+        eray.SwarmRun(name="lr1e5", f_kwargs={"lr": 1e-5}),
+    ],
+)
+def train(lr, warmup):
+    ...
+
+status = train(warmup=100)   # call-time kwargs broadcast to every run
+```
+
+A run may also be a plain **class**: it is instantiated as a long-lived,
+detached named Ray actor on its chip share, addressable from any driver:
+
+```python
+runs = [
+    eray.SwarmRun(ServeReplica, name="serve-a"),   # class -> named actor
+    eray.SwarmRun(ServeReplica, name="serve-b"),
+    eray.SwarmRun(train_probe,  name="train"),     # function -> task
+]
+status = eray.swarm_execute(
+    runs,
+    eray.SwarmConfig(tpu_version="v5p-8", chip_split=(1, 1, 2), namespace="my-swarm"),
+)
+
+# later, from any driver:
+serve = ray.get_actor("serve-a", namespace="my-swarm")
+ray.get(serve.generate.remote(prompt))
+
+eray.shutdown_swarm("my-swarm")   # kill all of the swarm's named actors
+```
+
+Each run is an isolated runtime with disjoint chips (assigned by Ray) and sees
+`ERAY_RUN_ID` / `ERAY_NUM_RUNS` / `ERAY_RUN_CHIPS` / `ERAY_RUN_NAME` in its
+environment. Chip counts per run must be 1, 2, or the whole host, and the plan
+must not oversubscribe the host. Hardware note (validated on v5p-8): 2-chip
+runs only form a sub-slice on aligned chip pairs ({0,1}, {2,3}); a misaligned
+Ray assignment raises a clear error in-task instead of crashing libtpu. When
+launching a Ray driver on a TPU VM, invoke the venv python directly — Ray's
+`uv run` hook repackages the working dir and workers lose libtpu. With `pod_count > 1` or multi-host slices the
+same layout repeats on every host (actor names get a `-s{slice}h{host}`
+suffix). Class-run actors are detached: they survive the swarm call and hold
+their chips until `shutdown_swarm(namespace)` or `ray.kill`.
+
 ## Module Map
 
 | Module | Description |
@@ -123,6 +244,12 @@ from eray import (
 
     # Pool management
     ResourcePoolManager, SlicePoolManager, DeviceHostActor,
+
+    # Host chip splitting
+    HostSplitPlan, plan_host_split,
+
+    # Swarms
+    SwarmConfig, GpuSwarmConfig, SwarmRun, swarm_execute, swarmed, shutdown_swarm, HostPartitionPlan, plan_host_partition,
 
     # Utilities
     handle_ray_error, ExceptionInfo, StopwatchActor, RefBox, DONE,

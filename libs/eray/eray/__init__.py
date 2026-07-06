@@ -51,6 +51,9 @@ Example:
     ... )
 """
 
+from ray import init
+from ray.runtime_env import RuntimeEnv
+
 from .core import (
     DONE,
     DoneSentinel,
@@ -108,10 +111,15 @@ from .resources import (
     CpuAcceleratorConfig,
     GpuAcceleratorConfig,
     HardwareType,
+    HostPartitionPlan,
+    HostSplitPlan,
     RayResources,
     TpuAcceleratorConfig,
     available_cpu_cores,
+    plan_host_partition,
+    plan_host_split,
 )
+from .swarm import GpuSwarmConfig, SwarmConfig, SwarmRun, shutdown_swarm, swarm_execute, swarmed
 
 __version__ = "0.1.0"
 __all__ = (
@@ -128,8 +136,11 @@ __all__ = (
     "DoneSentinel",
     "ExceptionInfo",
     "GpuAcceleratorConfig",
+    "GpuSwarmConfig",
     "HardwareType",
     "HostInfo",
+    "HostPartitionPlan",
+    "HostSplitPlan",
     "InsufficientSlicesError",
     "JobError",
     "JobFailed",
@@ -142,11 +153,14 @@ __all__ = (
     "RayResources",
     "RefBox",
     "ResourcePoolManager",
+    "RuntimeEnv",
     "SliceActor",
     "SliceInfo",
     "SlicePoolManager",
     "SnitchRecipient",
     "StopwatchActor",
+    "SwarmConfig",
+    "SwarmRun",
     "TpuAcceleratorConfig",
     "autoscale_execute",
     "autoscale_execute_resumable",
@@ -157,13 +171,19 @@ __all__ = (
     "execute",
     "execute_resumable",
     "handle_ray_error",
+    "init",
     "log_failures_to",
     "make_docker_run_command",
+    "plan_host_partition",
+    "plan_host_split",
     "print_remote_raise",
     "resolve_maybe_refs",
     "run_docker_async",
     "run_docker_multislice",
     "run_docker_on_pod",
+    "shutdown_swarm",
     "start_raylet_log_guard",
+    "swarm_execute",
+    "swarmed",
     "sweep_raylet_logs",
 )

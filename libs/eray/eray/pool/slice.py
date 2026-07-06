@@ -624,6 +624,72 @@ class SliceActor:
         ]
         return futures
 
+    def run_split_remote_fn(
+        self,
+        remote_fn,
+        num_splits: int,
+        mode: str = "isolated",
+        base_port: int | None = None,
+        runtime_env: dict | None = None,
+        env: dict | None = None,
+        f_args: tuple = (),
+        f_kwargs: dict | None = None,
+    ):
+        """Execute a remote function on every host in this slice, split per host.
+
+        Like run_remote_fn, but each host is carved into ``num_splits``
+        processes with disjoint chip ownership (see
+        DeviceHostActor.run_split_remote_fn). The function runs
+        ``num_hosts * num_splits`` times across the slice.
+
+        Args:
+            remote_fn: Ray remote function or callable to execute per split.
+            num_splits: Number of processes per host. Must divide each
+                host's chip count evenly.
+            mode: ``"isolated"`` (default) or ``"cooperative"`` split mode.
+            base_port: First port for cooperative process endpoints; None
+                uses the topology default.
+            runtime_env: Optional Ray runtime environment configuration.
+            env: Optional environment variables to set on all splits.
+            f_args: Positional arguments to pass to the remote function.
+            f_kwargs: Keyword arguments to pass to the remote function.
+
+        Returns:
+            List[List[ray.ObjectRef]]: One inner list per host (ordered by
+                host_id), each containing ``num_splits`` ObjectRefs ordered
+                by split id.
+
+        Raises:
+            RuntimeError: If slice info is not initialized.
+        """
+        from ..resources.topology import DEFAULT_SPLIT_BASE_PORT
+
+        if not self._slice_info:
+            raise RuntimeError("Slice info not initialized")
+        self.ensure_host_pool(self._slice_info.num_hosts)
+
+        try:
+            self._await_all_hosts_healthy(timeout_s=int(os.getenv("ERAY_HOST_HEALTH_WAIT", "60")))
+        except Exception:
+            pass
+
+        per_host_futures = ray.get(
+            [
+                member.actor.run_split_remote_fn.remote(
+                    remote_fn,
+                    num_splits,
+                    mode=mode,
+                    base_port=base_port if base_port is not None else DEFAULT_SPLIT_BASE_PORT,
+                    f_args=f_args,
+                    f_kwargs=f_kwargs,
+                    runtime_env=runtime_env,
+                    env=env,
+                )
+                for member in self._actor_pool
+            ]
+        )
+        return per_host_futures
+
     def shutdown(self):
         """Gracefully shut down this slice actor.
 
