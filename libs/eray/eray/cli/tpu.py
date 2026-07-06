@@ -419,6 +419,89 @@ def cluster_status(ray_address: str) -> dict:
     }
 
 
+def resource_usage(ray_address: str, *, per_node: bool = False) -> dict:
+    """Collect cluster resource totals, availability, and usage.
+
+    Uses the public ``ray.cluster_resources()`` / ``ray.available_resources()``
+    pair for the cluster view. A resource that is fully consumed disappears
+    from ``available_resources()`` entirely, so usage is computed as
+    ``total - available.get(name, 0)``. The per-node view additionally uses
+    Ray's private ``available_resources_per_node`` (stable across the 2.x
+    line but private API); when it is missing, per-node usage degrades to
+    totals with ``available``/``used`` set to None rather than failing.
+
+    Args:
+        ray_address: Ray cluster address (ip:port).
+        per_node: If True, include a per-node breakdown of alive nodes.
+
+    Returns:
+        A dict with:
+            resources: {name: {"total", "available", "used"}} for the cluster.
+            nodes (only when per_node): list of {"ip", "node_id", "resources"}
+                sorted by IP, where each node's resources map has the same
+                shape (``node:*`` marker resources excluded).
+    """
+    import ray
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        if not ray.is_initialized():
+            ray.init(address=ray_address, ignore_reinit_error=True, logging_level=logging.ERROR)
+
+    total = ray.cluster_resources()
+    available = ray.available_resources()
+    resources = {
+        name: {
+            "total": tot,
+            "available": available.get(name, 0.0),
+            "used": max(tot - available.get(name, 0.0), 0.0),
+        }
+        for name, tot in total.items()
+    }
+    out: dict = {"resources": resources}
+
+    if per_node:
+        try:
+            from ray._private.state import available_resources_per_node
+
+            per_node_available: dict | None = available_resources_per_node()
+        except Exception:
+            per_node_available = None
+
+        nodes = []
+        for node in ray.nodes():
+            if not node.get("Alive"):
+                continue
+            node_id = node.get("NodeID")
+            node_available = None if per_node_available is None else per_node_available.get(node_id, {})
+            node_resources = {}
+            for name, tot in (node.get("Resources") or {}).items():
+                if name.startswith("node:"):
+                    continue
+                if node_available is None:
+                    node_resources[name] = {"total": tot, "available": None, "used": None}
+                else:
+                    avail = node_available.get(name, 0.0)
+                    node_resources[name] = {"total": tot, "available": avail, "used": max(tot - avail, 0.0)}
+            nodes.append(
+                {
+                    "ip": node.get("NodeManagerAddress", "?"),
+                    "node_id": node_id,
+                    "resources": node_resources,
+                }
+            )
+        def _ip_key(entry: dict):
+            try:
+                return (0, tuple(int(part) for part in entry["ip"].split(".")))
+            except ValueError:
+                return (1, entry["ip"])
+
+        nodes.sort(key=_ip_key)
+        out["nodes"] = nodes
+
+    return out
+
+
 def health_check(ray_address: str, tpu_type: str | None = None) -> list[dict]:
     """Run a health check across the cluster.
 

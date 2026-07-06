@@ -22,7 +22,7 @@ from unittest import mock
 import pytest
 from click.testing import CliRunner
 from eray.cli.main import _resolve_tpu, cli
-from eray.cli.tpu import ConnectResult, _ray_bin_preamble
+from eray.cli.tpu import ConnectResult, _ray_bin_preamble, resource_usage
 from eray.cli.utils import (
     TpuInfo,
     build_ray_resource_flags,
@@ -523,6 +523,143 @@ class TestListTpuHelpers:
 
 
 # ── ConnectResult dataclass ──────────────────────────────────────
+
+
+class TestResourceUsage:
+    def _mock_ray(self, *, total, available, nodes=None, per_node_available=None):
+        ray_mock = mock.MagicMock()
+        ray_mock.is_initialized.return_value = True
+        ray_mock.cluster_resources.return_value = total
+        ray_mock.available_resources.return_value = available
+        ray_mock.nodes.return_value = nodes or []
+        state_mock = mock.MagicMock()
+        state_mock.available_resources_per_node.return_value = per_node_available or {}
+        return mock.patch.dict(
+            sys.modules,
+            {
+                "ray": ray_mock,
+                "ray._private": mock.MagicMock(state=state_mock),
+                "ray._private.state": state_mock,
+            },
+        )
+
+    def test_usage_is_total_minus_available(self):
+        with self._mock_ray(total={"CPU": 100.0, "TPU": 8.0}, available={"CPU": 60.0, "TPU": 4.0}):
+            result = resource_usage("10.0.0.1:6379")
+        assert result["resources"]["CPU"] == {"total": 100.0, "available": 60.0, "used": 40.0}
+        assert result["resources"]["TPU"]["used"] == 4.0
+
+    def test_fully_consumed_resource_missing_from_available(self):
+        # Ray drops exhausted resources from available_resources() entirely;
+        # usage must read as total, not KeyError or zero.
+        with self._mock_ray(total={"TPU": 8.0}, available={}):
+            result = resource_usage("10.0.0.1:6379")
+        assert result["resources"]["TPU"] == {"total": 8.0, "available": 0.0, "used": 8.0}
+
+    def test_per_node_breakdown_excludes_markers_and_dead_nodes(self):
+        nodes = [
+            {
+                "NodeID": "aa",
+                "Alive": True,
+                "NodeManagerAddress": "10.0.0.10",
+                "Resources": {"TPU": 4.0, "CPU": 8.0, "node:10.0.0.10": 1.0},
+            },
+            {
+                "NodeID": "bb",
+                "Alive": True,
+                "NodeManagerAddress": "10.0.0.2",
+                "Resources": {"TPU": 4.0, "CPU": 8.0, "node:10.0.0.2": 1.0},
+            },
+            {"NodeID": "cc", "Alive": False, "NodeManagerAddress": "10.0.0.3", "Resources": {"TPU": 4.0}},
+        ]
+        per_node_available = {"aa": {"TPU": 0.0, "CPU": 8.0}, "bb": {"TPU": 4.0, "CPU": 8.0}}
+        with self._mock_ray(
+            total={"TPU": 8.0},
+            available={"TPU": 4.0},
+            nodes=nodes,
+            per_node_available=per_node_available,
+        ):
+            result = resource_usage("10.0.0.1:6379", per_node=True)
+        ips = [n["ip"] for n in result["nodes"]]
+        assert ips == ["10.0.0.2", "10.0.0.10"]  # numeric IP order, dead node dropped
+        busy = next(n for n in result["nodes"] if n["ip"] == "10.0.0.10")
+        assert busy["resources"]["TPU"]["used"] == 4.0
+        assert not any(k.startswith("node:") for n in result["nodes"] for k in n["resources"])
+
+
+class TestResourcesCommand:
+    def test_help(self):
+        runner = CliRunner()
+        result = runner.invoke(cli, ["resources", "--help"])
+        assert result.exit_code == 0
+        assert "--per-node" in result.output
+        assert "--address" in result.output
+
+    def test_requires_address_off_tpu(self):
+        runner = CliRunner()
+        with mock.patch("eray.cli.main.detect_local_tpu", return_value=None):
+            result = runner.invoke(cli, ["resources"])
+        assert result.exit_code != 0
+
+    def test_table_shows_usage_and_hides_node_markers(self):
+        usage = {
+            "resources": {
+                "CPU": {"total": 200.0, "available": 150.0, "used": 50.0},
+                "TPU": {"total": 8.0, "available": 0.0, "used": 8.0},
+                "memory": {"total": 8.0 * 1024**3, "available": 6.0 * 1024**3, "used": 2.0 * 1024**3},
+                "node:10.0.0.1": {"total": 1.0, "available": 1.0, "used": 0.0},
+            }
+        }
+        runner = CliRunner()
+        with mock.patch("eray.cli.main.resource_usage", return_value=usage):
+            result = runner.invoke(cli, ["resources", "-a", "10.0.0.1:6379"])
+        assert result.exit_code == 0
+        assert "node:10.0.0.1" not in result.output
+        cpu_line = next(line for line in result.output.splitlines() if line.startswith("CPU"))
+        assert "50" in cpu_line and "200" in cpu_line and "25.0%" in cpu_line
+        tpu_line = next(line for line in result.output.splitlines() if line.startswith("TPU"))
+        assert "100.0%" in tpu_line
+        mem_line = next(line for line in result.output.splitlines() if line.startswith("memory"))
+        assert "2.0GiB" in mem_line and "8.0GiB" in mem_line
+
+    def test_json_output_roundtrips(self):
+        usage = {"resources": {"TPU": {"total": 8.0, "available": 4.0, "used": 4.0}}}
+        runner = CliRunner()
+        with mock.patch("eray.cli.main.resource_usage", return_value=usage):
+            result = runner.invoke(cli, ["resources", "-a", "10.0.0.1:6379", "--json"])
+        assert result.exit_code == 0
+        assert json.loads(result.output)["resources"]["TPU"]["used"] == 4.0
+
+    def test_per_node_table(self):
+        usage = {
+            "resources": {"TPU": {"total": 8.0, "available": 4.0, "used": 4.0}},
+            "nodes": [
+                {
+                    "ip": "10.0.0.1",
+                    "node_id": "aa",
+                    "resources": {
+                        "TPU": {"total": 4.0, "available": 0.0, "used": 4.0},
+                        "CPU": {"total": 8.0, "available": 8.0, "used": 0.0},
+                    },
+                },
+                {
+                    "ip": "10.0.0.2",
+                    "node_id": "bb",
+                    "resources": {
+                        "TPU": {"total": 4.0, "available": 4.0, "used": 0.0},
+                        "CPU": {"total": 8.0, "available": 8.0, "used": 0.0},
+                    },
+                },
+            ],
+        }
+        runner = CliRunner()
+        with mock.patch("eray.cli.main.resource_usage", return_value=usage):
+            result = runner.invoke(cli, ["resources", "-a", "10.0.0.1:6379", "--per-node"])
+        assert result.exit_code == 0
+        node_line = next(line for line in result.output.splitlines() if line.startswith("10.0.0.1"))
+        assert "4/4" in node_line
+        idle_line = next(line for line in result.output.splitlines() if line.startswith("10.0.0.2"))
+        assert "0/4" in idle_line
 
 
 class TestConnectResult:

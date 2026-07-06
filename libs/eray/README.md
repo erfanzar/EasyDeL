@@ -282,6 +282,7 @@ server, and commands targeting this machine execute locally (no SSH):
 eray tpu connect      # auto-detects the current TPU
 eray tpu status       # auto-detects the head address
 eray tpu health
+eray resources        # cluster resources: used / total / free / util
 eray tpu disconnect
 ```
 
@@ -302,6 +303,9 @@ eray tpu status -a 10.0.0.1:6379
 
 # Run health check (JAX devices per host)
 eray tpu health -a 10.0.0.1:6379
+
+# Show resource usage (CPU, TPU, memory, custom resources); --per-node for a host table
+eray resources -a 10.0.0.1:6379 --per-node
 
 # Stop Ray on all hosts
 eray tpu disconnect -n my-tpu -p my-project -z us-central2-b
