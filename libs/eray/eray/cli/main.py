@@ -21,11 +21,16 @@ Commands:
     eray tpu health      Run health check across cluster
     eray resources       Show cluster resources and their usage
     eray tpu list        List TPUs in a zone
+    eray qr ...          TPU Queued Resources (spot capacity primitive)
+    eray fleet ...       Managed fleet: registry, ensure, watch, pause/resume
+    eray autoscale ...   Ray cluster-launcher configs (elastic clusters)
+    eray run/logs/...    Job submission via the Ray Jobs API
     eray version         Print version
 
 Connection modes:
     --tpu-name (gcloud)  Discover IPs from TPU name via gcloud
     --ips (direct)       Provide IPs directly, no gcloud needed
+    (no flags)           Auto-detect from TPU-VM metadata
 """
 
 from __future__ import annotations
