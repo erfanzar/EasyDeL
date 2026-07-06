@@ -35,18 +35,22 @@ from .qr import (
     wait_for_active,
 )
 from .registry import ClusterRecord, ClusterRegistry, ConflictError, GcsBackend, LocalBackend
+from .watcher import Action, Observed, WatchPolicy, plan, watch_and_reconnect
 
 __all__ = (
     "PENDING_STATES",
     "RUNTIME_VERSION_BY_FAMILY",
     "TERMINAL_STATES",
+    "Action",
     "ClusterRecord",
     "ClusterRegistry",
     "ConflictError",
     "GcsBackend",
     "LocalBackend",
+    "Observed",
     "QrSpec",
     "QueuedResource",
+    "WatchPolicy",
     "create_queued_resource",
     "default_runtime_version",
     "delete_queued_resource",
@@ -55,6 +59,8 @@ __all__ = (
     "fleet_status",
     "head_reachable",
     "list_queued_resources",
+    "plan",
     "qr_create_args",
     "wait_for_active",
+    "watch_and_reconnect",
 )

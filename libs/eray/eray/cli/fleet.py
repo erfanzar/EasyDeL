@@ -227,6 +227,75 @@ def register(cli: click.Group) -> None:
             return
         _print_table(rows)
 
+    @fleet.command()
+    @click.argument("names", nargs=-1)
+    @click.option("--interval", "-i", type=float, default=None, help="Seconds between ticks (default: 30).")
+    @click.option("--once", is_flag=True, default=False, help="Run one tick and exit (cron mode).")
+    @click.option("--resubmit", is_flag=True, default=False, help="Resubmit --restartable jobs after recoveries.")
+    @click.option("--dry-run", "dry_run", is_flag=True, default=False, help="Plan and log, execute nothing.")
+    def watch(names, interval, once, resubmit, dry_run):
+        """Watch the fleet: re-queue preempted capacity, reconnect Ray, resubmit jobs.
+
+        \b
+        Runs in the foreground (systemd/cron it). Examples:
+            eray fleet watch --resubmit
+            eray fleet watch trainer1 --once      # single reconcile tick
+            eray fleet watch --dry-run            # show what would happen
+        """
+        from ..provision.watcher import watch_and_reconnect
+
+        def on_event(cluster: str, event: str, detail: str) -> None:
+            info(f"[{cluster}] {event}" + (f": {detail}" if detail else ""))
+
+        try:
+            watch_and_reconnect(
+                list(names) or None,
+                interval=interval,
+                once=once,
+                resubmit=resubmit,
+                dry_run=dry_run,
+                on_event=on_event,
+            )
+        except RuntimeError as exc:
+            error(str(exc))
+            raise click.exceptions.Exit(4) from exc
+        except KeyboardInterrupt:
+            info("watch stopped.")
+
+    @fleet.command()
+    @click.argument("name", required=False)
+    def pause(name):
+        """Pause the watcher (globally, or for one cluster)."""
+        from ..provision.watcher import PAUSE_DIR
+
+        target = PAUSE_DIR / (f"pause-{name}" if name else "pause")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.touch()
+        success(f"paused {'cluster ' + name if name else 'all watching'} ({target})")
+
+    @fleet.command()
+    @click.argument("name", required=False)
+    def resume(name):
+        """Resume watching; also clears HALTED_*/NEEDS_BOOTSTRAP park states."""
+        from ..provision.watcher import PAUSE_DIR
+
+        target = PAUSE_DIR / (f"pause-{name}" if name else "pause")
+        if target.exists():
+            target.unlink()
+        registry = ClusterRegistry.from_config()
+        cleared = []
+        for cluster_name, record in registry.load().items():
+            if name and cluster_name != name:
+                continue
+            if record.state.startswith("HALTED") or record.state == "NEEDS_BOOTSTRAP":
+                registry.mutate_record(cluster_name, lambda r: setattr(r, "state", "UNKNOWN"))
+                cleared.append(cluster_name)
+        success(
+            "resumed"
+            + (f" cluster {name}" if name else "")
+            + (f"; cleared park state on {', '.join(cleared)}" if cleared else "")
+        )
+
 
 def _emit_result(result: dict, as_json: bool) -> None:
     """Print an ensure/up result.

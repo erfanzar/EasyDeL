@@ -342,6 +342,60 @@ All commands support `--json` for machine-readable output:
 eray tpu connect -n my-tpu -p proj -z zone --json | jq .ray_address
 ```
 
+## Spot fleet management
+
+eray manages spot TPU capacity end to end: **queued resources** are the
+provisioning primitive, a **fleet registry** remembers every cluster, and a
+**watcher** re-queues preempted capacity, reconnects Ray, and resubmits jobs.
+
+```bash
+# capacity (stateless): spot by default, waits in queue instead of failing
+eray qr create trainer1 --type v5p-64 --wait
+eray qr list
+
+# fleet (stateful): registry + reconciliation
+eray fleet init --state gs://my-bucket/eray/clusters.json   # shared registry (optional)
+eray fleet add trainer1 --type v5p-64 --bootstrap-cmd 'curl -fsSL https://.../setup.sh | bash'
+eray fleet add n_server_spot_m           # adopt an existing QR by name
+eray fleet ensure trainer1 --wait 3600   # request capacity + connect Ray, idempotent
+eray fleet status
+
+# jobs against a registered cluster; --restartable opts into auto-resubmission
+eray run -c trainer1 --restartable -- python train.py
+
+# the watcher: detect preemption -> re-queue -> reconnect -> resubmit
+eray fleet watch --resubmit              # foreground; --once for cron; --dry-run to preview
+eray fleet pause / eray fleet resume     # kill switch; resume clears HALTED_* park states
+```
+
+How recovery works: the watcher (run it OFF the TPU — the head dies with the
+slice) fuses three signals per tick (queued-resource state, node state, head
+TCP reachability). Definitive preemption (node `PREEMPTED`, QR `SUSPENDED`)
+triggers: mark degraded → delete the owned QR → create `{name}-r{gen+1}` (the
+node id never changes, so `eray tpu connect -n NAME` always works) → wait
+ACTIVE → bootstrap once per generation → reconnect → resubmit `--restartable`
+jobs as `{id}-p{N}` with `ERAY_RESTART_COUNT`/`ERAY_PREEMPTED_FROM` env (your
+trainer resumes from its own checkpoints). Budgets (4 recreates/hour, 12/day)
+and quota-flavored failures park the cluster in `HALTED_*` instead of looping.
+Jobs are snapshotted while healthy, and resubmission re-packages the recorded
+cwd, so run the watcher on the machine you submit from.
+
+Systemd unit example:
+
+```ini
+[Unit]
+Description=eray fleet watcher
+After=network-online.target
+
+[Service]
+ExecStart=/path/to/venv/bin/eray fleet watch --resubmit
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+```
+
 ## Relationship to eFormer
 
 `eray` was extracted from [`eformer.executor.ray`](https://github.com/erfanzar/eFormer) to provide a focused, standalone Ray execution toolkit. It has **zero dependencies on eFormer or JAX** — you can use it for any Ray-based distributed workload, ML or otherwise.
