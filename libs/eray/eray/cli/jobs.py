@@ -185,6 +185,29 @@ def make_client(address: str | None):
     return JobSubmissionClient(resolve_address(address))
 
 
+def resolve_cluster_address(cluster: str) -> str:
+    """Dashboard address for a fleet-registered cluster.
+
+    Args:
+        cluster: Registered cluster name (see ``eray fleet add``).
+
+    Returns:
+        ``http://<head_ip>:8265``.
+
+    Raises:
+        click.ClickException: If the cluster is unknown or has no recorded
+            head yet (run ``eray fleet ensure <cluster>`` first).
+    """
+    from ..provision.registry import ClusterRegistry
+
+    record = ClusterRegistry.from_config().get(cluster)
+    if record is None:
+        raise click.ClickException(f"cluster {cluster!r} is not registered (eray fleet add ...)")
+    if not record.head_ip:
+        raise click.ClickException(f"cluster {cluster!r} has no known head yet (eray fleet ensure {cluster})")
+    return f"http://{record.head_ip}:8265"
+
+
 def inherited_env(environ: dict[str, str] | None = None) -> dict[str, str]:
     """Filter the current process env down to what a job should inherit.
 
@@ -443,6 +466,15 @@ def extract_metric_rows(text: str, patterns: dict | None = None) -> list[dict]:
 @click.argument("entrypoint", nargs=-1, type=click.UNPROCESSED, required=True)
 @click.option("--address", "-a", default=None, help="Ray dashboard address (default: RAY_ADDRESS or local).")
 @click.option(
+    "--cluster", "-c", default=None, help="Fleet-registered cluster name (resolves the address from the registry)."
+)
+@click.option(
+    "--restartable",
+    is_flag=True,
+    default=False,
+    help="Mark the job safe for automatic resubmission after a spot preemption (used by eray fleet watch).",
+)
+@click.option(
     "--working-dir",
     default=".",
     show_default=True,
@@ -465,6 +497,8 @@ def extract_metric_rows(text: str, patterns: dict | None = None) -> list[dict]:
 def run(
     entrypoint,
     address,
+    cluster,
+    restartable,
     working_dir,
     no_working_dir,
     env_inherit,
@@ -480,11 +514,15 @@ def run(
 
     The current directory is packaged as the working dir by default and the
     current shell environment (minus host-machine variables) is injected into
-    the job, so launch scripts stop hardcoding credentials.
+    the job, so launch scripts stop hardcoding credentials. Address
+    precedence: --address, then --cluster (fleet registry), then RAY_ADDRESS,
+    then the local dashboard.
     """
     entrypoint = tuple(t for t in entrypoint if t != "--")
     if not entrypoint:
         raise click.UsageError("no entrypoint given; usage: eray run -- python launch.py")
+    if address is None and cluster:
+        address = resolve_cluster_address(cluster)
 
     env_vars: dict[str, str] = {}
     if env_inherit:
@@ -515,6 +553,10 @@ def run(
 
     sid = submission_id or generate_submission_id(entrypoint)
     metadata = {"cwd": os.getcwd(), "user": getpass.getuser(), **git_metadata()}
+    if cluster:
+        metadata["cluster"] = cluster
+    if restartable:
+        metadata["restartable"] = "1"
 
     client = make_client(address)
     if queue:

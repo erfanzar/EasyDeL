@@ -105,6 +105,7 @@ from .pool import (
     SliceActor,
     SlicePoolManager,
 )
+from .provision import ensure_tpu
 from .resources import (
     AcceleratorConfigType,
     ComputeResourceConfig,
@@ -168,6 +169,7 @@ __all__ = (
     "build_and_push_docker_image",
     "current_actor_handle",
     "device_remote",
+    "ensure_tpu",
     "execute",
     "execute_resumable",
     "handle_ray_error",

@@ -194,6 +194,13 @@ from .qr import register as _register_qr_commands  # noqa: E402
 _register_qr_commands(cli)
 
 
+# ── Fleet subcommands (registry + reconciliation) ────────────────
+
+from .fleet import register as _register_fleet_commands  # noqa: E402
+
+_register_fleet_commands(cli)
+
+
 # ── TPU subcommands ──────────────────────────────────────────────
 
 
