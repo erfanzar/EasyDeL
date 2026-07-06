@@ -190,9 +190,7 @@ def connect_tpus(
                         error(result.stderr.strip())
                     failed_workers.append(host_idx)
         if failed_workers:
-            raise RuntimeError(
-                f"{len(failed_workers)} Ray workers failed to start (e.g. {failed_workers[:8]})"
-            )
+            raise RuntimeError(f"{len(failed_workers)} Ray workers failed to start (e.g. {failed_workers[:8]})")
         success(f"All {tpu.num_hosts - 1} Ray workers started")
 
     # --- Step 4: Wait for cluster readiness ---

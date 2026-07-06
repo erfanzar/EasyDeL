@@ -37,8 +37,9 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import pytest
-from ejkernel.kernels._pallas.tpu.gated_delta_rule._interface import gated_delta_rule
 from jax.experimental.pallas import tpu as pltpu
+
+from ejkernel.kernels._pallas.tpu.gated_delta_rule._interface import gated_delta_rule
 
 
 def _make_packed_grouped_inputs(seg_period: int, batch=2, seq_len=1024, hq=2, hv=6, k_dim=16, v_dim=16):

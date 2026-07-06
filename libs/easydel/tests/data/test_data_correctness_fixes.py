@@ -25,6 +25,7 @@ import random
 import time
 
 import numpy as np
+
 from easydel.data.execution.loader import AsyncDataLoader, PrefetchIterator
 from easydel.data.transforms.mixture import MixedShardedSource
 from easydel.data.transforms.pack import FirstFitPacker, GreedyPacker, PackedShardedSource, PoolPacker
@@ -73,7 +74,7 @@ class TestLongDocumentPacking:
         packer = FirstFitPacker(seq_length=8, eos_token_id=99, buffer_size=4)
         windows = packer.add(list(range(20)))
         windows += packer.flush_all()
-        got = [t for w in windows for t, m in zip(w.input_ids.tolist(), w.attention_mask.tolist()) if m]
+        got = [t for w in windows for t, m in zip(w.input_ids.tolist(), w.attention_mask.tolist(), strict=False) if m]
         for tok in range(20):
             assert tok in got, f"token {tok} truncated away"
 
@@ -162,8 +163,7 @@ class TestShuffleRng:
 class TestPrefetchTeardown:
     def test_close_unblocks_producer_stuck_on_full_queue(self):
         def slow_source():
-            for i in range(1000):
-                yield i
+            yield from range(1000)
 
         it = PrefetchIterator(slow_source(), buffer_size=1)
         assert next(it) == 0  # starts the producer; it then blocks on the full queue

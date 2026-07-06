@@ -1038,4 +1038,3 @@ def test_fused_train_state_checkpoint_is_tp_portable(tmp_path, load_tp, family):
         f"[{family}] one-step resume diverged after save_tp={save_tp} -> load_tp={load_tp} "
         f"(max|Δlogits|={next_logits_err})"
     )
-

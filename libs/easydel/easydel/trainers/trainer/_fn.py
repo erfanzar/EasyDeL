@@ -33,15 +33,14 @@ import jax
 import optax  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
-from spectrax import with_sharding_constraint
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 
 from ..training_utils import (
-    constrain_batch_sharding,
     ScheduledLossAdapter,
     bind_scheduled_module,
+    constrain_batch_sharding,
     constrain_scheduled_batch,
     make_assertions_and_get_sizes,
     minibatch_call,

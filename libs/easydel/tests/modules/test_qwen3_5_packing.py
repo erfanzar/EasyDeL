@@ -43,6 +43,7 @@ ATOL = 2e-3
 
 def _build(layer_types):
     import spectrax as spx
+
     from easydel.modules.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
     from easydel.modules.qwen3_5.qwen3_5_configuration import Qwen3_5TextConfig
 

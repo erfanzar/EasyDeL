@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+
 from easydel.trainers.pose import (
     PoSEConfig,
     _seq_lens_from_segment_ids,

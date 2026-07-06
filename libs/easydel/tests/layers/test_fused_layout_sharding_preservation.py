@@ -58,7 +58,7 @@ def test_retp_fused_state_preserves_leaf_sharding():
     np.testing.assert_array_equal(np.asarray(jax.device_get(out)), np.asarray(reference))
 
     # Optimizer slots must keep the parameter's sharding too.
-    slot_key = ("mu",) + key
+    slot_key = ("mu", *key)
     opt_ref = retp_fused_optimizer_state(_Stub(), {slot_key: host.copy()}, saved_tp=2, target_tp=4)[slot_key]
     opt_out = retp_fused_optimizer_state(_Stub(), {slot_key: sharded}, saved_tp=2, target_tp=4)[slot_key]
     assert opt_out.sharding.is_equivalent_to(NamedSharding(mesh, spec), opt_out.ndim), (

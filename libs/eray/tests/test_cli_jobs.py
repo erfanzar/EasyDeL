@@ -19,6 +19,7 @@ import time
 from types import SimpleNamespace
 
 from click.testing import CliRunner
+
 from eray.cli import jobs
 
 
