@@ -24,6 +24,20 @@ from dataclasses import dataclass
 from typing import ClassVar
 
 logger = logging.getLogger("eray.cli")
+
+# GCP primitives live in eray.gcp (click-free, shared with eray.provision);
+# re-exported here because the CLI modules and their tests address them as
+# eray.cli.utils members.
+from ..gcp import (  # noqa: E402,F401
+    GCE_METADATA_BASE,
+    _gce_metadata,
+    detect_project,
+    detect_zone,
+    gcloud,
+    gcloud_json,
+    run_command,
+)
+
 # The colored print() in info()/success()/warning()/error() is the user-facing
 # channel; without this, cli()'s logging.basicConfig echoes every message a
 # second time through the root handler (bare, uncolored — observed as
@@ -81,75 +95,7 @@ def error(msg: str) -> None:
 # ── Command execution ────────────────────────────────────────────
 
 
-def run_command(
-    cmd: list[str],
-    *,
-    timeout: int = 300,
-    check: bool = True,
-    capture: bool = True,
-) -> subprocess.CompletedProcess:
-    """Run a subprocess command and return the result.
-
-    Args:
-        cmd: Command and arguments as a list of strings.
-        timeout: Maximum time to wait for the command in seconds.
-        check: If True, raise CalledProcessError on non-zero exit.
-        capture: If True, capture stdout and stderr.
-
-    Returns:
-        A subprocess.CompletedProcess with returncode, stdout, and stderr.
-
-    Raises:
-        subprocess.CalledProcessError: If check is True and the command exits with a non-zero code.
-        subprocess.TimeoutExpired: If the command exceeds the timeout.
-    """
-    logger.debug(f"Running: {' '.join(cmd)}")
-    return subprocess.run(
-        cmd,
-        capture_output=capture,
-        text=True,
-        timeout=timeout,
-        check=check,
-    )
-
-
 # ── gcloud wrappers ──────────────────────────────────────────────
-
-
-def gcloud(args: list[str], *, timeout: int = 300, check: bool = True) -> str:
-    """Run a gcloud command and return stdout.
-
-    Args:
-        args: gcloud subcommand and arguments as a list of strings.
-        timeout: Maximum time to wait for the command in seconds.
-        check: If True, raise CalledProcessError on non-zero exit.
-
-    Returns:
-        The stripped stdout output from the command.
-
-    Raises:
-        subprocess.CalledProcessError: If check is True and gcloud exits with a non-zero code.
-    """
-    result = run_command(["gcloud", *args], timeout=timeout, check=check)
-    return result.stdout.strip()
-
-
-def gcloud_json(args: list[str], *, timeout: int = 300) -> dict | list:
-    """Run a gcloud command and parse JSON output.
-
-    Args:
-        args: gcloud subcommand and arguments as a list of strings.
-        timeout: Maximum time to wait for the command in seconds.
-
-    Returns:
-        Parsed JSON output as a dict or list.
-
-    Raises:
-        subprocess.CalledProcessError: If gcloud exits with a non-zero code.
-        json.JSONDecodeError: If the output is not valid JSON.
-    """
-    result = run_command(["gcloud", *args, "--format=json"], timeout=timeout, check=True)
-    return json.loads(result.stdout)
 
 
 def check_gcloud() -> bool:
@@ -173,69 +119,6 @@ def get_active_account() -> str | None:
     """
     try:
         result = gcloud(["config", "get-value", "account"], check=False)
-        if result and result != "(unset)":
-            return result
-    except Exception:
-        pass
-    return None
-
-
-def _metadata_value(path: str) -> str | None:
-    """Query GCE metadata server (works inside TPU/VM instances).
-
-    Args:
-        path: Metadata path to query (e.g. "project/project-id").
-
-    Returns:
-        The metadata value as a string, or None if unavailable.
-    """
-    try:
-        result = run_command(
-            [
-                "curl",
-                "-fsS",
-                f"http://metadata.google.internal/computeMetadata/v1/{path}",
-                "-H",
-                "Metadata-Flavor: Google",
-            ],
-            timeout=5,
-            check=False,
-        )
-        val = result.stdout.strip()
-        return val if val else None
-    except Exception:
-        return None
-
-
-def detect_project() -> str | None:
-    """Detect GCP project from metadata server, then gcloud config.
-
-    Returns:
-        The GCP project ID, or None if it cannot be determined.
-    """
-    proj = _metadata_value("project/project-id")
-    if proj:
-        return proj
-    try:
-        result = gcloud(["config", "get-value", "project"], check=False)
-        if result and result != "(unset)":
-            return result
-    except Exception:
-        pass
-    return None
-
-
-def detect_zone() -> str | None:
-    """Detect GCP zone from metadata server, then gcloud config.
-
-    Returns:
-        The GCP zone name, or None if it cannot be determined.
-    """
-    zone_raw = _metadata_value("instance/zone")
-    if zone_raw:
-        return zone_raw.split("/")[-1]
-    try:
-        result = gcloud(["config", "get-value", "compute/zone"], check=False)
         if result and result != "(unset)":
             return result
     except Exception:
@@ -333,33 +216,6 @@ class TpuInfo:
 
 
 # ── Local TPU auto-detection (running on the TPU VM itself) ─────
-
-GCE_METADATA_BASE = "http://metadata.google.internal/computeMetadata/v1"
-
-
-def _gce_metadata(path: str, timeout: float = 2.0) -> str | None:
-    """Read one value from the GCE metadata server.
-
-    Args:
-        path: Metadata path below the v1 root, e.g.
-            ``instance/attributes/accelerator-type``.
-        timeout: Request timeout in seconds; kept short so non-GCP machines
-            fail fast.
-
-    Returns:
-        The value as a stripped string, or None when the metadata server is
-        unreachable (not on GCP) or the key does not exist.
-    """
-    import requests
-
-    try:
-        r = requests.get(f"{GCE_METADATA_BASE}/{path}", headers={"Metadata-Flavor": "Google"}, timeout=timeout)
-        if r.status_code != 200:
-            return None
-        return r.text.strip()
-    except Exception:
-        return None
-
 
 def detect_local_tpu() -> TpuInfo | None:
     """Detect the TPU this process is running on, with no flags and no gcloud.

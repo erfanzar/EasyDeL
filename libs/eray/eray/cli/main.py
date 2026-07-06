@@ -187,6 +187,13 @@ from .jobs import register as _register_job_commands  # noqa: E402
 _register_job_commands(cli)
 
 
+# ── Queued-resource subcommands (spot TPU capacity) ──────────────
+
+from .qr import register as _register_qr_commands  # noqa: E402
+
+_register_qr_commands(cli)
+
+
 # ── TPU subcommands ──────────────────────────────────────────────
 
 
