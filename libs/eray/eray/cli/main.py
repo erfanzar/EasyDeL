@@ -19,6 +19,7 @@ Commands:
     eray tpu disconnect  Stop Ray on all TPU hosts
     eray tpu status      Show cluster status
     eray tpu health      Run health check across cluster
+    eray resources       Show cluster resources and their usage
     eray tpu list        List TPUs in a zone
     eray version         Print version
 
@@ -41,6 +42,7 @@ from .tpu import (
     connect_tpus,
     disconnect_tpus,
     health_check,
+    resource_usage,
 )
 from .utils import (
     TpuInfo,
@@ -520,6 +522,122 @@ def health(address, tpu_type, as_json):
         total_hosts = len(reports)
         total_devices = sum(r.get("device_count", 0) for r in reports)
         success(f"Health check passed: {total_hosts} hosts, {total_devices} total devices")
+
+
+# ── Resource usage (top-level: works for any eray-managed Ray cluster) ──
+
+_MEMORY_RESOURCES = {"memory", "object_store_memory"}
+_RESOURCE_DISPLAY_ORDER = {"CPU": 0, "GPU": 1, "TPU": 2, "memory": 3, "object_store_memory": 4}
+
+
+def _fmt_qty(name: str, value: float | None) -> str:
+    """Format a resource quantity for display.
+
+    Args:
+        name: Resource name; memory-like resources are byte counts.
+        value: Quantity, or None when per-node availability is unknown.
+
+    Returns:
+        Human-readable string (GiB for memory resources, thousands-separated
+        counts otherwise, "?" for unknown).
+    """
+    if value is None:
+        return "?"
+    if name in _MEMORY_RESOURCES:
+        return f"{value / (1024**3):,.1f}GiB"
+    if value == int(value):
+        return f"{int(value):,}"
+    return f"{value:,.2f}"
+
+
+def _resource_sort_key(name: str) -> tuple[int, str]:
+    """Sort core resources (CPU/GPU/TPU/memory) first, then customs by name."""
+    return (_RESOURCE_DISPLAY_ORDER.get(name, len(_RESOURCE_DISPLAY_ORDER)), name)
+
+
+@cli.command()
+@click.option("--address", "-a", default=None, help="Ray cluster address (ip:port). Auto-detected on a TPU VM.")
+@click.option("--per-node", "-N", "per_node", is_flag=True, default=False, help="Also show a per-node breakdown.")
+@click.option("--all", "show_all", is_flag=True, default=False, help="Include node:* marker resources.")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Output as JSON.")
+def resources(address, per_node, show_all, as_json):
+    """Show cluster resources and how much of each is in use.
+
+    Reports used / total / free and utilization for every cluster resource
+    (CPU, TPU/GPU, memory, object store, custom resources). With --per-node,
+    adds a per-node usage table to spot busy or idle hosts.
+
+    \b
+    Examples:
+        eray resources                    # on the TPU VM itself
+        eray resources -a 10.0.0.1:6379
+        eray resources --per-node
+        eray resources --json | jq '.resources.TPU'
+
+    Args:
+        address: Ray cluster address (ip:port), or None to auto-detect.
+        per_node: Also show a per-node breakdown.
+        show_all: Include node:* marker resources.
+        as_json: Output as JSON.
+
+    Returns:
+        None
+
+    Raises:
+        click.ClickException: If the cluster cannot be reached.
+    """
+    try:
+        result = resource_usage(_resolve_address(address), per_node=per_node)
+    except Exception as exc:
+        error(f"Failed to get resource usage: {exc}")
+        raise click.ClickException(str(exc)) from exc
+
+    if not show_all:
+        result["resources"] = {k: v for k, v in result["resources"].items() if not k.startswith("node:")}
+
+    if as_json:
+        click.echo(json_lib.dumps(result, indent=2, default=str))
+        return
+
+    rows = []
+    for name in sorted(result["resources"], key=_resource_sort_key):
+        res = result["resources"][name]
+        util = (res["used"] / res["total"] * 100.0) if res["total"] else 0.0
+        rows.append(
+            (
+                name,
+                _fmt_qty(name, res["used"]),
+                _fmt_qty(name, res["total"]),
+                _fmt_qty(name, res["available"]),
+                f"{util:5.1f}%",
+            )
+        )
+    heads = ("RESOURCE", "USED", "TOTAL", "FREE")
+    widths = [max([len(row[col]) for row in rows] + [len(head)]) for col, head in enumerate(heads)]
+    header = f"{heads[0]:<{widths[0]}}  {heads[1]:>{widths[1]}}  {heads[2]:>{widths[2]}}  {heads[3]:>{widths[3]}}"
+    click.echo(f"{header}    UTIL")
+    for name, used, total, free, util in rows:
+        click.echo(f"{name:<{widths[0]}}  {used:>{widths[1]}}  {total:>{widths[2]}}  {free:>{widths[3]}}  {util}")
+
+    if per_node:
+        nodes = result.get("nodes", [])
+        cols = [c for c in ("TPU", "GPU", "CPU", "memory") if any(c in n["resources"] for n in nodes)]
+        cells = []
+        for node in nodes:
+            row = [node["ip"]]
+            for col in cols:
+                res = node["resources"].get(col)
+                if res is None:
+                    row.append("-")
+                else:
+                    row.append(f"{_fmt_qty(col, res['used'])}/{_fmt_qty(col, res['total'])}")
+            cells.append(row)
+        headers = ["NODE"] + [f"{c} used/total" for c in cols]
+        node_widths = [max([len(r[i]) for r in cells] + [len(headers[i])]) for i in range(len(headers))]
+        click.echo("")
+        click.echo("  ".join(f"{h:<{node_widths[i]}}" for i, h in enumerate(headers)))
+        for row in cells:
+            click.echo("  ".join(f"{v:<{node_widths[i]}}" for i, v in enumerate(row)))
 
 
 @tpu.command(name="list")
