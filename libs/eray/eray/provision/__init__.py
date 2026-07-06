@@ -19,6 +19,7 @@ Talks to GCP exclusively through the gcloud CLI (subprocess), consistent with
 the rest of eray; no google-api client dependencies.
 """
 
+from .fleet import ensure_tpu, fleet_status, head_reachable
 from .qr import (
     PENDING_STATES,
     RUNTIME_VERSION_BY_FAMILY,
@@ -33,17 +34,26 @@ from .qr import (
     qr_create_args,
     wait_for_active,
 )
+from .registry import ClusterRecord, ClusterRegistry, ConflictError, GcsBackend, LocalBackend
 
 __all__ = (
     "PENDING_STATES",
     "RUNTIME_VERSION_BY_FAMILY",
     "TERMINAL_STATES",
+    "ClusterRecord",
+    "ClusterRegistry",
+    "ConflictError",
+    "GcsBackend",
+    "LocalBackend",
     "QrSpec",
     "QueuedResource",
     "create_queued_resource",
     "default_runtime_version",
     "delete_queued_resource",
     "describe_queued_resource",
+    "ensure_tpu",
+    "fleet_status",
+    "head_reachable",
     "list_queued_resources",
     "qr_create_args",
     "wait_for_active",
