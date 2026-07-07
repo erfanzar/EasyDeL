@@ -397,6 +397,43 @@ RestartSec=10
 WantedBy=default.target
 ```
 
+### From a laptop (macOS)
+
+Ray heads listen on internal VPC IPs, so a laptop outside the VPC splits the
+work in two: the laptop is the control plane (everything gcloud-backed), and
+one always-on box inside the VPC — any existing VM works — runs the watcher
+and submits restartable jobs (resubmission re-packages that box's cwd).
+
+Laptop, once (Python 3.11–3.13):
+
+```bash
+brew install google-cloud-sdk uv && gcloud auth login
+uv tool install "eray @ git+https://github.com/erfanzar/eray"
+eray fleet init --state gs://my-bucket/eray/clusters.json    # shared with the watcher box
+```
+
+Watcher box, once (same install + `fleet init`, then keep alive via systemd
+or tmux):
+
+```bash
+eray fleet watch --resubmit
+```
+
+Day to day, from the laptop:
+
+```bash
+eray fleet add trainer1 --type v5p-64 --setup-easydel && eray fleet up trainer1
+eray fleet status --no-probe                    # registry view; probes need VPC access
+gcloud compute ssh <watcher-box> -- 'cd repo && eray run -c trainer1 --restartable -- python train.py'
+eray fleet tunnel trainer1 &                    # forward the head's dashboard to 127.0.0.1:8265
+eray logs <job-id> -a http://127.0.0.1:8265 -f  # live logs / browser dashboard through the tunnel
+```
+
+Preemption needs nothing from you: the watcher re-queues, reconnects, and
+resubmits; `eray fleet status` shows the new generation. Non-restartable
+one-off jobs can be submitted straight from the laptop through the tunnel
+(`eray run -a http://127.0.0.1:8265 -- ...`).
+
 ## Relationship to eFormer
 
 `eray` was extracted from [`eformer.executor.ray`](https://github.com/erfanzar/eFormer) to provide a focused, standalone Ray execution toolkit. It has **zero dependencies on eFormer or JAX** — you can use it for any Ray-based distributed workload, ML or otherwise.

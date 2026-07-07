@@ -384,6 +384,21 @@ class TestFleetCli:
         assert result.exit_code != 0
         assert "--setup-easydel" in result.output
 
+    def test_tunnel_execs_gcloud_ssh_forward(self, local_registry):
+        local_registry.upsert(make_record())
+        with mock.patch("os.execvp") as execvp:
+            result = CliRunner().invoke(cli, ["fleet", "tunnel", "trainer1", "--local-port", "9000"])
+        assert result.exit_code == 0, result.output
+        argv = execvp.call_args.args[1]
+        assert argv[:6] == ["gcloud", "compute", "tpus", "tpu-vm", "ssh", "trainer1"]
+        assert "--worker" in argv and argv[argv.index("--worker") + 1] == "0"
+        assert argv[-3:] == ["-N", "-L", "9000:localhost:8265"]
+
+    def test_tunnel_unknown_cluster_errors(self, local_registry):
+        result = CliRunner().invoke(cli, ["fleet", "tunnel", "nope"])
+        assert result.exit_code != 0
+        assert "unknown cluster" in result.output
+
 
 class TestRunClusterFlag:
     def test_resolve_cluster_address(self, tmp_path, monkeypatch):
