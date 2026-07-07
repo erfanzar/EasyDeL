@@ -303,6 +303,39 @@ def register(cli: click.Group) -> None:
             info("watch stopped.")
 
     @fleet.command()
+    @click.argument("name")
+    @click.option("--port", type=int, default=8265, show_default=True, help="Remote port (Ray dashboard/Jobs API).")
+    @click.option("--local-port", type=int, default=None, help="Local port (default: same as --port).")
+    def tunnel(name, port, local_port):
+        """SSH-forward a cluster's head port to this machine.
+
+        Ray heads listen on internal VPC IPs, so from a laptop the dashboard
+        and Jobs API are unreachable directly. This wraps the gcloud TPU SSH
+        forward (worker 0 is the head); it runs in the foreground until
+        Ctrl-C. With the default port, http://127.0.0.1:8265 then serves the
+        dashboard and works as the address for `eray run/logs/status -a`.
+
+        \b
+        Example (from a laptop):
+            eray fleet tunnel trainer1 &
+            eray logs sft-run -a http://127.0.0.1:8265 -f
+        """
+        import os
+
+        record = ClusterRegistry.from_config().get(name)
+        if record is None:
+            raise click.ClickException(f"unknown cluster {name!r} — `eray fleet add` it first.")
+        lp = local_port or port
+        info(f"forwarding 127.0.0.1:{lp} -> {name} worker 0 port {port} (Ctrl-C to close)")
+        info(f"address for eray -a / browser: http://127.0.0.1:{lp}")
+        argv = [
+            *["gcloud", "compute", "tpus", "tpu-vm", "ssh", name],
+            *["--project", record.project, "--zone", record.zone, "--worker", "0"],
+            *["--", "-N", "-L", f"{lp}:localhost:{port}"],
+        ]
+        os.execvp(argv[0], argv)
+
+    @fleet.command()
     @click.argument("name", required=False)
     def pause(name):
         """Pause the watcher (globally, or for one cluster)."""
