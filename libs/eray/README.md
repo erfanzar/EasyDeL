@@ -355,7 +355,8 @@ eray qr list
 
 # fleet (stateful): registry + reconciliation
 eray fleet init --state gs://my-bucket/eray/clusters.json   # shared registry (optional)
-eray fleet add trainer1 --type v5p-64 --bootstrap-cmd 'curl -fsSL https://.../setup.sh | bash'
+eray fleet add trainer1 --type v5p-64 --setup-easydel        # EasyDeL bootstrap (--branch vnext pins a ref)
+eray fleet add gpubox --type v5p-8 --bootstrap-cmd '...'     # or any custom per-host bootstrap command
 eray fleet add n_server_spot_m           # adopt an existing QR by name
 eray fleet ensure trainer1 --wait 3600   # request capacity + connect Ray, idempotent
 eray fleet status

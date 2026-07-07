@@ -32,6 +32,25 @@ from ..provision.registry import ClusterRecord, ClusterRegistry
 from .qr import _resolve_project_zone
 from .utils import error, info, success
 
+#: Raw URL of EasyDeL's multi-host TPU bootstrap script, per git ref.
+EASYDEL_SETUP_URL = "https://raw.githubusercontent.com/erfanzar/EasyDeL/{ref}/scripts/tpu_setup.sh"
+
+
+def easydel_setup_cmd(ref: str) -> str:
+    """The canonical EasyDeL bootstrap command for one git ref.
+
+    Fetches tpu_setup.sh from that ref and installs the same ref on the
+    host, so script and installed tree can't drift apart.
+
+    Args:
+        ref: Git branch, tag, or commit SHA of EasyDeL.
+
+    Returns:
+        A shell command suitable for ClusterRecord.bootstrap_cmd.
+    """
+    url = EASYDEL_SETUP_URL.format(ref=ref)
+    return f"curl -fsSL {url} | bash -s -- --branch {ref}"
+
 
 def _print_table(rows: list[dict]) -> None:
     """Print a list of homogeneous dicts as an aligned table.
@@ -106,14 +125,35 @@ def register(cli: click.Group) -> None:
     @click.option(
         "--bootstrap-cmd", default=None, help="Shell command run on every host before first connect of each generation."
     )
-    def add(name, accelerator_type, zone, project, capacity, runtime_version, bootstrap_cmd):
+    @click.option(
+        "--setup-easydel",
+        "setup_easydel",
+        is_flag=True,
+        default=False,
+        help="Bootstrap hosts with EasyDeL's tpu_setup.sh (pin a ref with --branch; default: main).",
+    )
+    @click.option(
+        "--branch",
+        default=None,
+        metavar="REF",
+        help="EasyDeL branch/tag/SHA for --setup-easydel.",
+    )
+    def add(name, accelerator_type, zone, project, capacity, runtime_version, bootstrap_cmd, setup_easydel, branch):
         """Register a cluster (adopts an existing TPU/QR with the same name).
 
         \b
         Examples:
             eray fleet add trainer1 --type v5p-64 --zone us-east5-a
+            eray fleet add trainer1 --type v5p-64 --setup-easydel                 # EasyDeL@main bootstrap
+            eray fleet add trainer1 --type v5p-64 --setup-easydel --branch vnext  # pin a branch/tag/SHA
             eray fleet add n_server_spot_m      # adopt: type/zone read from the live QR
         """
+        if setup_easydel:
+            if bootstrap_cmd is not None:
+                raise click.ClickException("--setup-easydel and --bootstrap-cmd are mutually exclusive.")
+            bootstrap_cmd = easydel_setup_cmd(branch or "main")
+        elif branch is not None:
+            raise click.ClickException("--branch only makes sense with --setup-easydel.")
         project, zone = _resolve_project_zone(project, zone)
         adopted = describe_queued_resource(name, project=project, zone=zone)
         if adopted is not None:
