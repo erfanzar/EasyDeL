@@ -336,6 +336,54 @@ class TestFleetCli:
         assert result.exit_code == 0
         assert local_registry.get("trainer1") is None
 
+    def test_add_setup_easydel_expands_bootstrap(self, local_registry):
+        with mock.patch("eray.cli.fleet.describe_queued_resource", return_value=None):
+            result = CliRunner().invoke(
+                cli,
+                ["fleet", "add", "t1", "--type", "v5p-64", "--zone", "z", "--project", "p", "--setup-easydel"],
+            )
+        assert result.exit_code == 0, result.output
+        cmd = local_registry.get("t1").bootstrap_cmd
+        assert cmd == (
+            "curl -fsSL https://raw.githubusercontent.com/erfanzar/EasyDeL/main/scripts/tpu_setup.sh"
+            " | bash -s -- --branch main"
+        )
+
+    def test_add_setup_easydel_takes_a_ref(self, local_registry):
+        with mock.patch("eray.cli.fleet.describe_queued_resource", return_value=None):
+            result = CliRunner().invoke(
+                cli,
+                [
+                    *["fleet", "add", "t1", "--type", "v5p-64", "--zone", "z", "--project", "p"],
+                    *["--setup-easydel", "--branch", "vnext"],
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        cmd = local_registry.get("t1").bootstrap_cmd
+        assert "/EasyDeL/vnext/scripts/tpu_setup.sh" in cmd
+        assert cmd.endswith("--branch vnext")
+
+    def test_add_setup_easydel_conflicts_with_bootstrap_cmd(self, local_registry):
+        with mock.patch("eray.cli.fleet.describe_queued_resource", return_value=None):
+            result = CliRunner().invoke(
+                cli,
+                [
+                    *["fleet", "add", "t1", "--type", "v5p-64", "--zone", "z", "--project", "p"],
+                    *["--setup-easydel", "--bootstrap-cmd", "echo hi"],
+                ],
+            )
+        assert result.exit_code != 0
+        assert "mutually exclusive" in result.output
+
+    def test_add_branch_without_setup_easydel_errors(self, local_registry):
+        with mock.patch("eray.cli.fleet.describe_queued_resource", return_value=None):
+            result = CliRunner().invoke(
+                cli,
+                ["fleet", "add", "t1", "--type", "v5p-64", "--zone", "z", "--project", "p", "--branch", "vnext"],
+            )
+        assert result.exit_code != 0
+        assert "--setup-easydel" in result.output
+
 
 class TestRunClusterFlag:
     def test_resolve_cluster_address(self, tmp_path, monkeypatch):
