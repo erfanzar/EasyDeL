@@ -41,8 +41,8 @@ dependencies = [
 "Repository" = "https://github.com/erfanzar/spectrax"
 
 [project.optional-dependencies]
-cuda = ["jax[cuda13]>=0.10.0"]
-tpu = ["jax[tpu]>=0.10.0"]
+cuda = ["jax[cuda13]>=0.10.0 ; sys_platform == 'linux'"]
+tpu = ["jax[tpu]>=0.10.0 ; sys_platform == 'linux'"]
 test = ["pytest>=7", "gcsfs>=2024.2,<2026", "optax>=0.2.8"]
 dev = ["ruff>=0.6", "basedpyright>=1.34", "pytest>=7", "gcsfs>=2024.2,<2026", "optax>=0.2.8"]
 contrib = ["optax>=0.2.8"]
