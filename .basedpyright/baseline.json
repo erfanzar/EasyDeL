@@ -5732,24 +5732,6 @@
                 }
             }
         ],
-        "./external optimizer package/tx/fused_adamw.py": [
-            {
-                "code": "reportPossiblyUnboundVariable",
-                "range": {
-                    "startColumn": 48,
-                    "endColumn": 62,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportPossiblyUnboundVariable",
-                "range": {
-                    "startColumn": 43,
-                    "endColumn": 58,
-                    "lineCount": 1
-                }
-            }
-        ],
         "./scripts/bench_esurge.py": [
             {
                 "code": "reportReturnType",
