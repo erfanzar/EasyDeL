@@ -240,9 +240,7 @@ class TestEnsureTpu:
     def test_bootstrap_skipped_when_generation_matches(self, tmp_path, monkeypatch):
         record = make_record(bootstrap_cmd="setup", generation=1, bootstrapped_generation=1)
         reg = self._setup(tmp_path, monkeypatch, record=record, node=fake_node(), reachable=False)
-        monkeypatch.setattr(
-            "eray.cli.utils.run_on_all_hosts", lambda *a, **k: pytest.fail("bootstrap must not run")
-        )
+        monkeypatch.setattr("eray.cli.utils.run_on_all_hosts", lambda *a, **k: pytest.fail("bootstrap must not run"))
         monkeypatch.setattr(
             "eray.cli.tpu.connect_tpus", lambda node, **k: SimpleNamespace(head_ip="10.0.0.5", num_hosts=1)
         )

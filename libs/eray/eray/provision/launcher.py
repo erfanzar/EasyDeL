@@ -293,9 +293,7 @@ def launcher_head_ip(config_path: str | Path) -> str:
     Raises:
         subprocess.CalledProcessError: If the cluster is not up.
     """
-    result = subprocess.run(
-        ["ray", "get-head-ip", str(config_path)], check=True, capture_output=True, text=True
-    )
+    result = subprocess.run(["ray", "get-head-ip", str(config_path)], check=True, capture_output=True, text=True)
     return result.stdout.strip().splitlines()[-1].strip()
 
 

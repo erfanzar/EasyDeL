@@ -526,6 +526,7 @@ def resource_usage(ray_address: str, *, per_node: bool = False) -> dict:
                     "resources": node_resources,
                 }
             )
+
         def _ip_key(entry: dict):
             try:
                 return (0, tuple(int(part) for part in entry["ip"].split(".")))

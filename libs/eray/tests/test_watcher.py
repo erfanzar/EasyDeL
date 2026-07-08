@@ -391,11 +391,7 @@ class TestWatchLoop:
     def test_dry_run_needs_no_lease_and_mutates_nothing(self, registry, monkeypatch):
         registry.upsert(make_record(name="a", state="DEGRADED"))
         monkeypatch.setattr(watcher_module, "observe", lambda r, **k: obs(node_state="PREEMPTED"))
-        monkeypatch.setattr(
-            watcher_module, "delete_queued_resource", lambda *a, **k: pytest.fail("must not mutate")
-        )
-        monkeypatch.setattr(
-            watcher_module, "create_queued_resource", lambda *a, **k: pytest.fail("must not mutate")
-        )
+        monkeypatch.setattr(watcher_module, "delete_queued_resource", lambda *a, **k: pytest.fail("must not mutate"))
+        monkeypatch.setattr(watcher_module, "create_queued_resource", lambda *a, **k: pytest.fail("must not mutate"))
         watch_and_reconnect(once=True, dry_run=True, registry=registry)
         assert registry.get("a").generation == 0

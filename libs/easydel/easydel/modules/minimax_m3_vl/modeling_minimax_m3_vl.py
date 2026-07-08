@@ -745,9 +745,7 @@ class MiniMaxM3VLIndexer(spx.Module):
         if self.local_blocks > 0:
             local = jnp.arange(self.local_blocks)
             local_idx = jnp.clip(q_block[:, :, None] - local[None, None, :], min=0)  # [B, S, L]
-            local_idx = jnp.broadcast_to(
-                local_idx[:, None, :, :], (batch, self.num_heads, seq_len, self.local_blocks)
-            )
+            local_idx = jnp.broadcast_to(local_idx[:, None, :, :], (batch, self.num_heads, seq_len, self.local_blocks))
             block_scores = jnp.put_along_axis(block_scores, local_idx, jnp.inf, axis=-1, inplace=False)
 
         topk = min(self.topk_blocks, num_key_blocks)
@@ -2180,18 +2178,14 @@ class MiniMaxM3VLModel(EasyDeLBaseModule):
             inputs_embeds = BaseVisionLanguageModule.merge_multimodal_embeddings(
                 input_ids=input_ids,
                 inputs_embeds=inputs_embeds,
-                multimodal_embeddings=image_features.reshape(-1, image_features.shape[-1]).astype(
-                    inputs_embeds.dtype
-                ),
+                multimodal_embeddings=image_features.reshape(-1, image_features.shape[-1]).astype(inputs_embeds.dtype),
                 placeholder_token_id=image_token_index,
             )
         if video_features is not None:
             inputs_embeds = BaseVisionLanguageModule.merge_multimodal_embeddings(
                 input_ids=input_ids,
                 inputs_embeds=inputs_embeds,
-                multimodal_embeddings=video_features.reshape(-1, video_features.shape[-1]).astype(
-                    inputs_embeds.dtype
-                ),
+                multimodal_embeddings=video_features.reshape(-1, video_features.shape[-1]).astype(inputs_embeds.dtype),
                 placeholder_token_id=video_token_index,
             )
         return inputs_embeds

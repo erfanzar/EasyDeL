@@ -158,9 +158,7 @@ class CompressedWindowCacheConfig(BaseCacheConfig):
             raise ValueError("csa_rate and hca_rate must be positive")
         layer_types = tuple(layer_types)
         if len(layer_types) != num_hidden_layers:
-            raise ValueError(
-                f"len(layer_types) ({len(layer_types)}) must equal num_hidden_layers ({num_hidden_layers})"
-            )
+            raise ValueError(f"len(layer_types) ({len(layer_types)}) must equal num_hidden_layers ({num_hidden_layers})")
         bad = [t for t in layer_types if t not in _ALLOWED_LAYER_TYPES]
         if bad:
             raise ValueError(f"layer_types entries must be one of {_ALLOWED_LAYER_TYPES}; got {bad}")
@@ -327,16 +325,12 @@ class CompressedWindowCacheView(BaseCacheView):
             if two_series:
                 index_dim = config.index_head_dim
                 state["compressor_overlap_kv"] = jnp.zeros((batch, rate, head_dim), dtype=dtype)
-                state["compressor_overlap_gate"] = jnp.full(
-                    (batch, rate, head_dim), -jnp.inf, dtype=jnp.float32
-                )
+                state["compressor_overlap_gate"] = jnp.full((batch, rate, head_dim), -jnp.inf, dtype=jnp.float32)
                 state["indexer_buffer_kv"] = jnp.zeros((batch, rate, 2 * index_dim), dtype=dtype)
                 state["indexer_buffer_gate"] = jnp.zeros((batch, rate, 2 * index_dim), dtype=dtype)
                 state["indexer_entries"] = jnp.zeros((batch, n_entries, index_dim), dtype=dtype)
                 state["indexer_overlap_kv"] = jnp.zeros((batch, rate, index_dim), dtype=dtype)
-                state["indexer_overlap_gate"] = jnp.full(
-                    (batch, rate, index_dim), -jnp.inf, dtype=jnp.float32
-                )
+                state["indexer_overlap_gate"] = jnp.full((batch, rate, index_dim), -jnp.inf, dtype=jnp.float32)
         return cls(
             window_kv=window_kv,
             cache_position=jnp.zeros((batch,), dtype=jnp.int32),

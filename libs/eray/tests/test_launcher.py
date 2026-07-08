@@ -119,9 +119,7 @@ class TestGenerateZoneConfig:
 
     def test_yaml_roundtrip_is_valid(self, tmp_path, monkeypatch):
         monkeypatch.setattr(launcher_module, "list_tpu_zones", lambda project: ["us-central1-a"])
-        monkeypatch.setattr(
-            launcher_module, "list_zone_accelerator_types", lambda project, zone: ["v5p-8"]
-        )
+        monkeypatch.setattr(launcher_module, "list_zone_accelerator_types", lambda project, zone: ["v5p-8"])
         written = generate_configs("proj", output_dir=tmp_path)
         assert len(written) == 1
         loaded = yaml.safe_load(written[0].read_text())
@@ -138,9 +136,7 @@ class TestAutoscaleCli:
             assert cmd in result.output
 
     def test_generate_writes_files(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            launcher_module, "list_zone_accelerator_types", lambda project, zone: ["v5p-8"]
-        )
+        monkeypatch.setattr(launcher_module, "list_zone_accelerator_types", lambda project, zone: ["v5p-8"])
         runner = CliRunner()
         result = runner.invoke(
             cli,
