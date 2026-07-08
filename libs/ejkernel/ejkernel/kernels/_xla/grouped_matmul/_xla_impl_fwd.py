@@ -39,6 +39,22 @@ if typing.TYPE_CHECKING:
 
 set_xla_metadata = xla_metadata.set_xla_metadata
 
+# XLA:TPU lowers ``jax.lax.ragged_dot_general`` through ``ragged_dot_expander``,
+# which tiles the ragged (m) dimension by the TPU sublane size (8).  When m is
+# not a multiple of 8 the expander drops into a degenerate windowing whose
+# ``max_ragged_dim_window_bound`` is 2, while the window it actually needs is
+# ``ceil(m / num_groups)``.  For skewed MoE shapes (e.g. m=52, num_groups=8) on
+# jax/jaxlib 0.10.0 this trips a *process-fatal* CHECK during backend
+# compilation:
+#     F ragged_dot_expander.cc:959] Check failed:
+#       ragged_dim_window_bound <= max_ragged_dim_window_bound
+#       Window too large 7 max_ragged_dim_window_bound 2
+# Padding m up to a multiple of 8 moves the expander back into its regular
+# tiling regime.  Verified on v5p safe for m % 8 == 0 across num_groups in
+# {3, 4, 5, 8, 16, 60, 64, 128} and windows up to 270; the ``ragged_dot_tiling``
+# metadata has no influence on this CHECK.
+_RAGGED_DOT_M_ALIGNMENT = 8
+
 
 def grouped_matmul(
     lhs: Float[Array, "m k"],
@@ -103,6 +119,17 @@ def grouped_matmul(
         manager = contextlib.nullcontext()
     else:
         manager = set_xla_metadata(ragged_dot_tiling=",".join([str(t) for t in tiling]))
+
+    # Pad the ragged (m) dimension up to a multiple of the TPU sublane size to
+    # avoid a process-fatal ragged_dot_expander CHECK (see _RAGGED_DOT_M_ALIGNMENT
+    # above).  The padding rows sit past ``sum(group_sizes)`` so ragged_dot leaves
+    # them zero and they are stripped from the output before ``existing_out`` is
+    # added; the result is numerically identical to the unpadded computation.
+    m_orig = lhs.shape[0]
+    ragged_pad = (-m_orig) % _RAGGED_DOT_M_ALIGNMENT
+    if ragged_pad:
+        lhs = jax.lax.pad(lhs, jnp.array(0.0, dtype=lhs.dtype), [(0, ragged_pad, 0), (0, 0, 0)])
+
     with manager:
         out = jax.lax.ragged_dot_general(
             lhs=lhs,
@@ -117,6 +144,8 @@ def grouped_matmul(
                 rhs_group_dimensions=(0,),
             ),
         )
+    if ragged_pad:
+        out = out[:m_orig]
     if existing_out is not None:
         out = out + jnp.asarray(existing_out, dtype=out.dtype)
     return out

@@ -31,9 +31,12 @@ import jax.numpy as jnp
 from jax import lax
 
 from ejkernel.callib import ejit
+from ejkernel.loggings import get_logger
 
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 DEFAULT_VMEM_LIMIT_BYTES = 64 * 1024 * 1024
+
+logger = get_logger(__name__)
 
 
 def cdiv(a: int | jax.Array, b: int | jax.Array) -> jax.Array:
@@ -263,6 +266,28 @@ def multi_latent_ragged_page_attention_impl(
         num_kv_pages_per_block=num_kv_pages_per_block,
         num_queries_per_block=num_queries_per_block,
     )
+
+    # The incoming latent K/V tokens (`keys_values`/`keys_pe`) are written into the
+    # paged `kv_cache` via `lax.dynamic_update_slice`, which requires the update and
+    # the destination buffer to share a dtype. When the model compute dtype differs
+    # from the cache dtype (e.g. a float32 model with a bfloat16 KV cache), cast the
+    # write payload to the cache dtype at the write boundary -- do not silently change
+    # the cache dtype contract. Mirrors the standard ragged_page_attention adapter.
+    kv_cache_dtype = kv_cache.dtype
+    if keys_values.dtype != kv_cache_dtype or keys_pe.dtype != kv_cache_dtype:
+        incoming_itemsize = max(
+            jnp.dtype(keys_values.dtype).itemsize,
+            jnp.dtype(keys_pe.dtype).itemsize,
+        )
+        if jnp.dtype(kv_cache_dtype).itemsize < incoming_itemsize:
+            logger.warning(
+                "Casting keys_values/keys_pe from %s to lower-precision KV cache dtype %s; "
+                "this may reduce numerical fidelity.",
+                keys_values.dtype,
+                kv_cache_dtype,
+            )
+        keys_values = keys_values.astype(kv_cache_dtype)
+        keys_pe = keys_pe.astype(kv_cache_dtype)
 
     total_tokens = int(queries_nope.shape[0])
     num_q_heads = int(queries_nope.shape[1])
