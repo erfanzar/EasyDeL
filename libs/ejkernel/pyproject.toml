@@ -65,22 +65,22 @@ where = ["."]
 [project.optional-dependencies]
 
 cuda = [
-    "jax[cuda13]~=0.10.0",
-    "jax-cuda13-plugin[with-cuda]~=0.10.0",
-    "jax-cuda13-pjrt~=0.10.0",
-    "triton==3.6.0",
-    "nvidia-cutlass-dsl[cu13]==4.5.2",
-    "nvidia-cutlass-dsl-libs-base==4.5.2",
-    "nvidia-cutlass-dsl-libs-cu13==4.5.2",
-    "jax-tvm-ffi==0.1.2",
-    "apache-tvm-ffi==0.1.8.post2",
+    "jax[cuda13]~=0.10.0 ; sys_platform == 'linux'",
+    "jax-cuda13-plugin[with-cuda]~=0.10.0 ; sys_platform == 'linux'",
+    "jax-cuda13-pjrt~=0.10.0 ; sys_platform == 'linux'",
+    "triton==3.6.0 ; sys_platform == 'linux'",
+    "nvidia-cutlass-dsl[cu13]==4.5.2 ; sys_platform == 'linux'",
+    "nvidia-cutlass-dsl-libs-base==4.5.2 ; sys_platform == 'linux'",
+    "nvidia-cutlass-dsl-libs-cu13==4.5.2 ; sys_platform == 'linux'",
+    "jax-tvm-ffi==0.1.2 ; sys_platform == 'linux'",
+    "apache-tvm-ffi==0.1.8.post2 ; sys_platform == 'linux'",
 ]
-tpu = ["jax[tpu]~=0.10.0"]
-triton = ["triton==3.6.0"]
+tpu = ["jax[tpu]~=0.10.0 ; sys_platform == 'linux'"]
+triton = ["triton==3.6.0 ; sys_platform == 'linux'"]
 tilelang = [
-    "tilelang==0.1.9",
-    "apache-tvm-ffi==0.1.8.post2",
-    "nvidia-cudnn-cu12==9.12.0.46",
+    "tilelang==0.1.9 ; sys_platform == 'linux'",
+    "apache-tvm-ffi==0.1.8.post2 ; sys_platform == 'linux'",
+    "nvidia-cudnn-cu12==9.12.0.46 ; sys_platform == 'linux'",
 ]
 
 profile = [

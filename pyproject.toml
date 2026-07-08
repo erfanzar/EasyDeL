@@ -35,11 +35,15 @@ bypass-selection = true
 
 [tool.uv]
 prerelease = "if-necessary-or-explicit"
-# Keep the workspace lock Linux-only. CUDA/TPU extras pull hardware packages
-# that do not publish wheels for every platform, so universal macOS/Windows
-# locking is not useful for this repo.
+# Linux is the deployment target; macOS (Apple Silicon) is supported for local
+# development. The CUDA/TPU extras pull hardware packages (libtpu, nvidia-*,
+# triton, ...) that only publish Linux wheels, so each of those requirements
+# carries a `; sys_platform == 'linux'` marker in its member pyproject — on
+# macOS the tpu/cuda/triton/tilelang extras resolve to nothing (you can't run
+# TPU/CUDA on a Mac anyway) while the portable base still locks and syncs.
 environments = [
     "sys_platform == 'linux'",
+    "sys_platform == 'darwin'",
 ]
 
 [tool.uv.workspace]

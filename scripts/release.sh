@@ -42,7 +42,10 @@ sed -i "0,/^version = \"$current\"/s//version = \"$version\"/" "$pp"
 
 # 2. keep easydel's pins on the sibling libraries in lockstep with the release
 if [ "$lib" != "easydel" ]; then
-    sed -i -E "s/\"$dist(\[[^]]*\])?==[^\"]+\"/\"$dist\1==$version\"/g" libs/easydel/pyproject.toml
+    # Replace only the version token (up to a space/semicolon/quote), so any
+    # trailing environment marker like ` ; sys_platform == 'linux'` on the pin
+    # survives the bump instead of being swallowed by the old `[^"]+`.
+    sed -i -E "s/(\"$dist(\[[^]]*\])?==)[^\"; ]+/\1$version/g" libs/easydel/pyproject.toml
     echo "synced easydel pins:"
     grep -nE "\"$dist(\[[^]]*\])?==" libs/easydel/pyproject.toml
 else
