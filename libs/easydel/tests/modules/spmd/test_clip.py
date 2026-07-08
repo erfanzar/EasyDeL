@@ -14,13 +14,13 @@
 
 """Tests for CLIP model."""
 
+import easydel as ed
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import spectrax as spx
 import torch
 import transformers
-
-import easydel as ed
 
 try:
     from tests.modules.test_utils import compare_hidden_states, setup_config
@@ -168,6 +168,50 @@ class TestCLIP:
 
         cleanup_models(hf_model)
         assert comparison.success, f"CLIP text failed: {comparison.details}"
+
+    def test_conversion_accepts_both_hf_key_layouts(self, clip_vision_config, small_model_config):
+        """Old (wrapper-prefixed) and new (flattened) HF key layouts convert identically.
+
+        transformers >= 5.13 dropped the inner ``vision_model.`` wrapper from
+        standalone ``CLIPVisionModel.state_dict()`` keys, while real hub
+        checkpoints keep the old prefixed layout. Conversion must accept both
+        and produce the same EasyDeL parameter tree.
+        """
+        config = setup_config(clip_vision_config, small_model_config)
+        hf_model = create_hf_model(transformers.CLIPVisionModel, config)
+        state_dict = hf_model.state_dict()
+
+        flattened = {key.removeprefix("vision_model."): value for key, value in state_dict.items()}
+        prefixed = {f"vision_model.{key}": value for key, value in flattened.items()}
+
+        _, module_class = ed.get_modules_by_type("clip_vision_model", ed.TaskType.BASE_VISION)
+        with config.mesh:
+            ed_model = module_class.lazy_init(
+                config=config,
+                dtype=small_model_config["dtype"],
+                param_dtype=small_model_config["dtype"],
+                precision=small_model_config["precision"],
+                rngs=spx.Rngs(0),
+            )
+            tree_from_new = ed_model.pure_transform_fn(flattened)
+            tree_from_old = ed_model.pure_transform_fn(prefixed)
+
+        flat_new = ed.traversals.flatten_dict(tree_from_new)
+        flat_old = ed.traversals.flatten_dict(tree_from_old)
+
+        assert flat_new, "conversion produced an empty parameter tree"
+        assert set(flat_new.keys()) == set(flat_old.keys())
+        assert all(path[0] == "vision_model" for path in flat_new), (
+            "flattened-layout keys were not renamed under the vision_model wrapper"
+        )
+        for path, value in flat_new.items():
+            np.testing.assert_array_equal(
+                np.asarray(value),
+                np.asarray(flat_old[path]),
+                err_msg=f"converted leaf mismatch at {path}",
+            )
+
+        cleanup_models(hf_model)
 
 
 if __name__ == "__main__":

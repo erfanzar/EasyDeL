@@ -352,6 +352,10 @@ class CLIPAttention(AttentionModule):
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=config.attention_dropout,
+            # CLIP runs dense, cache-free encoder attention. Pinning "vanilla"
+            # keeps towers functional when serving stacks recursively retarget
+            # `attn_mechanism` to paged mechanisms (mirrors SigLIP/Qwen2-VL).
+            attn_mechanism="vanilla",
             requires_cache=False,  # Vision/text encoder doesn't need KV cache
         )
 
@@ -1044,6 +1048,12 @@ class CLIPTextModel(EasyDeLBaseModule):
     :class:`AutoEasyDeLModel` can resolve it from a config alone.
     """
 
+    # transformers >= 5.13 flattened ``text_model`` out of the standalone HF
+    # class (see transformers' checkpoint-conversion mapping for
+    # ``CLIPTextModel``); EasyDeL keeps the wrapper, so conversion re-inserts
+    # this prefix into new-layout state-dict keys.
+    _hf_flattened_wrapper = "text_model"
+
     def __init__(
         self,
         config: CLIPTextConfig,
@@ -1278,6 +1288,12 @@ class CLIPVisionModel(EasyDeLBaseModule):
     Conv2d patch embedder. Returns :class:`BaseModelOutputWithPooling` with
     the ``[CLS]`` token's post-layernorm vector as ``pooler_output``.
     """
+
+    # transformers >= 5.13 flattened ``vision_model`` out of the standalone HF
+    # class (see transformers' checkpoint-conversion mapping for
+    # ``CLIPVisionModel``); EasyDeL keeps the wrapper, so conversion re-inserts
+    # this prefix into new-layout state-dict keys.
+    _hf_flattened_wrapper = "vision_model"
 
     def __init__(
         self,

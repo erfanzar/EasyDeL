@@ -783,7 +783,7 @@ requires-dist = [
     { name = "torch", marker = "extra == 'cuda' and extra == 'torch'", specifier = "==2.8.0", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torch", marker = "extra == 'cuda' and extra != 'torch'", specifier = "==2.8.0" },
     { name = "torch", marker = "extra == 'torch'", specifier = "==2.8.0", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "transformers", specifier = "~=5.5.0" },
+    { name = "transformers", specifier = "~=5.13.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32.0" },
     { name = "uvloop", specifier = "==0.21.0" },
     { name = "wandb", specifier = ">=0.22.2" },
@@ -1157,6 +1157,18 @@ wheels = [
 ]
 
 [[package]]
+name = "fire"
+version = "0.7.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "termcolor", marker = "sys_platform == 'linux' or (extra == 'extra-12-spectrax-lib-cuda' and extra == 'extra-12-spectrax-lib-tpu') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c0/00/f8d10588d2019d6d6452653def1ee807353b21983db48550318424b5ff18/fire-0.7.1.tar.gz", hash = "sha256:3b208f05c736de98fb343310d090dcc4d8c78b2a89ea4f32b837c586270a9cbf", size = 88720, upload-time = "2025-08-16T20:20:24.175Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e5/4c/93d0f85318da65923e4b91c1c2ff03d8a458cbefebe3bc612a6693c7906d/fire-0.7.1-py3-none-any.whl", hash = "sha256:e43fd8a5033a9001e7e2973bab96070694b9f12f2e0ecf96d4683971b5ab1882", size = 115945, upload-time = "2025-08-16T20:20:22.87Z" },
+]
+
+[[package]]
 name = "flatbuffers"
 version = "25.12.19"
 source = { registry = "https://pypi.org/simple" }
@@ -1374,7 +1386,7 @@ wheels = [
 
 [[package]]
 name = "google-cloud-storage"
-version = "3.9.0"
+version = "3.12.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "google-api-core", marker = "sys_platform == 'linux' or (extra == 'extra-12-spectrax-lib-cuda' and extra == 'extra-12-spectrax-lib-tpu') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
@@ -1384,9 +1396,9 @@ dependencies = [
     { name = "google-resumable-media", marker = "sys_platform == 'linux' or (extra == 'extra-12-spectrax-lib-cuda' and extra == 'extra-12-spectrax-lib-tpu') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
     { name = "requests", marker = "sys_platform == 'linux' or (extra == 'extra-12-spectrax-lib-cuda' and extra == 'extra-12-spectrax-lib-tpu') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/f7/b1/4f0798e88285b50dfc60ed3a7de071def538b358db2da468c2e0deecbb40/google_cloud_storage-3.9.0.tar.gz", hash = "sha256:f2d8ca7db2f652be757e92573b2196e10fbc09649b5c016f8b422ad593c641cc", size = 17298544, upload-time = "2026-02-02T13:36:34.119Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/58/72/86f94e1639a8bcd9d33e8e01b49afcaa1c3a13bda7683c681717e0901e15/google_cloud_storage-3.12.0.tar.gz", hash = "sha256:03ae9847c6babb368f35f054126b8a08cbc0e3266efb990eb17b9926a45cf3be", size = 17338620, upload-time = "2026-06-12T18:03:29.215Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/46/0b/816a6ae3c9fd096937d2e5f9670558908811d57d59ddf69dd4b83b326fd1/google_cloud_storage-3.9.0-py3-none-any.whl", hash = "sha256:2dce75a9e8b3387078cbbdad44757d410ecdb916101f8ba308abf202b6968066", size = 321324, upload-time = "2026-02-02T13:36:32.271Z" },
+    { url = "https://files.pythonhosted.org/packages/1b/bd/a89eaebd2f9db5f92ddcc8e4f23c266be1dbd11058bb83451d8dd029f34c/google_cloud_storage-3.12.0-py3-none-any.whl", hash = "sha256:3880773754ddf7c27567b04e2a4d193950b6b99429f37b9097d873686e95b09c", size = 340605, upload-time = "2026-06-12T18:03:12.677Z" },
 ]
 
 [[package]]
@@ -4037,20 +4049,21 @@ wheels = [
 
 [[package]]
 name = "safetensors"
-version = "0.7.0"
+version = "0.8.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/29/9c/6e74567782559a63bd040a236edca26fd71bc7ba88de2ef35d75df3bca5e/safetensors-0.7.0.tar.gz", hash = "sha256:07663963b67e8bd9f0b8ad15bb9163606cd27cc5a1b96235a50d8369803b96b0", size = 200878, upload-time = "2025-11-19T15:18:43.199Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/45/06/f955dbbb1859e3bd23c8ac6141af5106e7ad5fedec4a3a6e3d60f94b7001/safetensors-0.8.0.tar.gz", hash = "sha256:fabaf3e0f18a6618d9b36560682562157f77c2b71fcffc7b432be2baed9d753d", size = 325846, upload-time = "2026-06-09T07:52:25.563Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f1/06/578ffed52c2296f93d7fd2d844cabfa92be51a587c38c8afbb8ae449ca89/safetensors-0.7.0-cp38-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:e07d91d0c92a31200f25351f4acb2bc6aff7f48094e13ebb1d0fb995b54b6542", size = 491748, upload-time = "2025-11-19T15:18:09.79Z" },
-    { url = "https://files.pythonhosted.org/packages/ae/33/1debbbb70e4791dde185edb9413d1fe01619255abb64b300157d7f15dddd/safetensors-0.7.0-cp38-abi3-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:8469155f4cb518bafb4acf4865e8bb9d6804110d2d9bdcaa78564b9fd841e104", size = 503881, upload-time = "2025-11-19T15:18:16.145Z" },
-    { url = "https://files.pythonhosted.org/packages/8e/1c/40c2ca924d60792c3be509833df711b553c60effbd91da6f5284a83f7122/safetensors-0.7.0-cp38-abi3-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:54bef08bf00a2bff599982f6b08e8770e09cc012d7bba00783fc7ea38f1fb37d", size = 623463, upload-time = "2025-11-19T15:18:21.11Z" },
-    { url = "https://files.pythonhosted.org/packages/9b/3a/13784a9364bd43b0d61eef4bea2845039bc2030458b16594a1bd787ae26e/safetensors-0.7.0-cp38-abi3-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:42cb091236206bb2016d245c377ed383aa7f78691748f3bb6ee1bfa51ae2ce6a", size = 532855, upload-time = "2025-11-19T15:18:25.719Z" },
-    { url = "https://files.pythonhosted.org/packages/a0/60/429e9b1cb3fc651937727befe258ea24122d9663e4d5709a48c9cbfceecb/safetensors-0.7.0-cp38-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:dac7252938f0696ddea46f5e855dd3138444e82236e3be475f54929f0c510d48", size = 507152, upload-time = "2025-11-19T15:18:33.023Z" },
-    { url = "https://files.pythonhosted.org/packages/3c/a8/4b45e4e059270d17af60359713ffd83f97900d45a6afa73aaa0d737d48b6/safetensors-0.7.0-cp38-abi3-manylinux_2_5_i686.manylinux1_i686.whl", hash = "sha256:1d060c70284127fa805085d8f10fbd0962792aed71879d00864acda69dbab981", size = 541856, upload-time = "2025-11-19T15:18:31.075Z" },
-    { url = "https://files.pythonhosted.org/packages/06/87/d26d8407c44175d8ae164a95b5a62707fcc445f3c0c56108e37d98070a3d/safetensors-0.7.0-cp38-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:cdab83a366799fa730f90a4ebb563e494f28e9e92c4819e556152ad55e43591b", size = 674060, upload-time = "2025-11-19T15:18:37.211Z" },
-    { url = "https://files.pythonhosted.org/packages/11/f5/57644a2ff08dc6325816ba7217e5095f17269dada2554b658442c66aed51/safetensors-0.7.0-cp38-abi3-musllinux_1_2_armv7l.whl", hash = "sha256:672132907fcad9f2aedcb705b2d7b3b93354a2aec1b2f706c4db852abe338f85", size = 771715, upload-time = "2025-11-19T15:18:38.689Z" },
-    { url = "https://files.pythonhosted.org/packages/86/31/17883e13a814bd278ae6e266b13282a01049b0c81341da7fd0e3e71a80a3/safetensors-0.7.0-cp38-abi3-musllinux_1_2_i686.whl", hash = "sha256:5d72abdb8a4d56d4020713724ba81dac065fedb7f3667151c4a637f1d3fb26c0", size = 714377, upload-time = "2025-11-19T15:18:40.162Z" },
-    { url = "https://files.pythonhosted.org/packages/4a/d8/0c8a7dc9b41dcac53c4cbf9df2b9c83e0e0097203de8b37a712b345c0be5/safetensors-0.7.0-cp38-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:b0f6d66c1c538d5a94a73aa9ddca8ccc4227e6c9ff555322ea40bdd142391dd4", size = 677368, upload-time = "2025-11-19T15:18:41.627Z" },
+    { url = "https://files.pythonhosted.org/packages/09/7d/65a7de0af421317bb36a067241e4235fff194eed60b961ed6d3f59a3fc60/safetensors-0.8.0-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:7a46e5ff292c356d6991e60942ba7f79817682d3a2cef0702136448cb9c4d235", size = 502844, upload-time = "2026-06-09T07:52:07.624Z" },
+    { url = "https://files.pythonhosted.org/packages/91/4f/3175c9d75634e0e0dda0082794193521035edd7c70a6f212bf33ca06ddf4/safetensors-0.8.0-cp310-abi3-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:4124502b78f03534117c848f87a39b8f31e577b15eff423bf8bfb95f2a8c30d0", size = 511823, upload-time = "2026-06-09T07:52:09.565Z" },
+    { url = "https://files.pythonhosted.org/packages/20/87/846c289e7aa2299eff406335717cf43ce8777194ece8aad75772e0411615/safetensors-0.8.0-cp310-abi3-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:7bc0a787ba8a35be368ee3574edfa2b1ad389eebd0a72e482ae275490e3f6c98", size = 633461, upload-time = "2026-06-09T07:52:11.128Z" },
+    { url = "https://files.pythonhosted.org/packages/76/22/8d64d9df2c45d5ded401df889d0ad90882804ca172d79ec4f0df8f727fe0/safetensors-0.8.0-cp310-abi3-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:040070828e36dc8e122178bbbd5830ff9e97920affb84cbe0f46442497bed358", size = 545148, upload-time = "2026-06-09T07:52:13.603Z" },
+    { url = "https://files.pythonhosted.org/packages/28/50/f203ff3a3ddfe19308efc83c5a3a29ed02bf786732ec35e68bf9162f3365/safetensors-0.8.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:fd6f3f93c9a0a7cc2788ee63fb763353d4bd2e89b0751bc78fcf7dda00bea774", size = 516040, upload-time = "2026-06-09T07:52:16.29Z" },
+    { url = "https://files.pythonhosted.org/packages/46/fb/cdaed17ceb2948784fd9c36b6fd3e951b608547cea81a48e8ee6f8cfdfcb/safetensors-0.8.0-cp310-abi3-manylinux_2_31_riscv64.whl", hash = "sha256:fcdd41ec4628fee5799f807c73c353629130fbd942aa23d83c623dd6c9d52d78", size = 513832, upload-time = "2026-06-09T07:52:12.37Z" },
+    { url = "https://files.pythonhosted.org/packages/0d/49/1e15de264dcc3b77943d2d0c56a95809956883b1c2d6d585c792523f180b/safetensors-0.8.0-cp310-abi3-manylinux_2_5_i686.manylinux1_i686.whl", hash = "sha256:8e9f537aa183a38ace122d27303dcd986b26bd2a7591f9181d7f0c396f4677ca", size = 559930, upload-time = "2026-06-09T07:52:14.743Z" },
+    { url = "https://files.pythonhosted.org/packages/2a/43/bf38443278eab4b1be1fce2931e2b012ad9cb7df52ada751d0aab8f7659a/safetensors-0.8.0-cp310-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:87eec7ffed2b809f05a398a8becb7d013f19f7837cd15d9748580d6cf30dbaf4", size = 678670, upload-time = "2026-06-09T07:52:20.032Z" },
+    { url = "https://files.pythonhosted.org/packages/72/e3/68cd3fa5b48488e84add63e04cb12f3bc28ae4638c06d4508c6e88823d0e/safetensors-0.8.0-cp310-abi3-musllinux_1_2_armv7l.whl", hash = "sha256:4a95ae2b05d7726d751da4ebf626a2ca782b706e101bd894c95bc2450b1cffcc", size = 786679, upload-time = "2026-06-09T07:52:21.322Z" },
+    { url = "https://files.pythonhosted.org/packages/29/4b/1c19c509d56e01f4fbb3d0a2e597450f6cc04d1d56cf52defb0a62dfd715/safetensors-0.8.0-cp310-abi3-musllinux_1_2_i686.whl", hash = "sha256:3ae091f16662658bdc019a4ff6cb4c085bb7d725eb5978b183ffd265863b6d2d", size = 765683, upload-time = "2026-06-09T07:52:22.594Z" },
+    { url = "https://files.pythonhosted.org/packages/27/43/41c1621732edd934d868a00d1b891584c892a7b62a9aab82ea5a0a5623ee/safetensors-0.8.0-cp310-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:8e080062fcde23be189565e1c3305d16751a218ecf9412c8601e64204eb6f846", size = 722361, upload-time = "2026-06-09T07:52:23.924Z" },
 ]
 
 [[package]]
@@ -4893,7 +4906,7 @@ wheels = [
 
 [[package]]
 name = "transformers"
-version = "5.5.0"
+version = "5.13.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "huggingface-hub", marker = "sys_platform == 'linux' or (extra == 'extra-12-spectrax-lib-cuda' and extra == 'extra-12-spectrax-lib-tpu') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
@@ -4906,9 +4919,9 @@ dependencies = [
     { name = "tqdm", marker = "sys_platform == 'linux' or (extra == 'extra-12-spectrax-lib-cuda' and extra == 'extra-12-spectrax-lib-tpu') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
     { name = "typer", marker = "sys_platform == 'linux' or (extra == 'extra-12-spectrax-lib-cuda' and extra == 'extra-12-spectrax-lib-tpu') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ff/9d/fb46e729b461985f41a5740167688b924a4019141e5c164bea77548d3d9e/transformers-5.5.0.tar.gz", hash = "sha256:c8db656cf51c600cd8c75f06b20ef85c72e8b8ff9abc880c5d3e8bc70e0ddcbd", size = 8237745, upload-time = "2026-04-02T16:13:08.113Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ec/e1/720ff7ff666b04279fea5bb7ac3ef8675e98f0ddbc1b8cb8bc9f3889d62e/transformers-5.13.0.tar.gz", hash = "sha256:940c1428e42a4238f9ccf0cd41e63c590701aa63c19fd2ce3d7d602222d68495", size = 9195801, upload-time = "2026-07-03T16:05:39.362Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e7/28/35f7411ff80a3640c1f4fc907dcbb6a65061ebb82f66950e38bfc9f7f740/transformers-5.5.0-py3-none-any.whl", hash = "sha256:821a9ff0961abbb29eb1eb686d78df1c85929fdf213a3fe49dc6bd94f9efa944", size = 10245591, upload-time = "2026-04-02T16:13:03.462Z" },
+    { url = "https://files.pythonhosted.org/packages/a5/3a/d99704c5effe10c6339c98cb236259161103e159bb99a78468b6729572ec/transformers-5.13.0-py3-none-any.whl", hash = "sha256:8adbc1d20bd5463cd6876b2eb7cb31971e1065788e7dc6bc12bab597a7c504b7", size = 11503730, upload-time = "2026-07-03T16:05:35.569Z" },
 ]
 
 [[package]]
@@ -5004,11 +5017,11 @@ wheels = [
 
 [[package]]
 name = "urllib3"
-version = "2.6.3"
+version = "2.7.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/c7/24/5f1b3bdffd70275f6661c76461e25f024d5a38a46f04aaca912426a2b1d3/urllib3-2.6.3.tar.gz", hash = "sha256:1b62b6884944a57dbe321509ab94fd4d3b307075e0c2eae991ac71ee15ad38ed", size = 435556, upload-time = "2026-01-07T16:24:43.925Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/53/0c/06f8b233b8fd13b9e5ee11424ef85419ba0d8ba0b3138bf360be2ff56953/urllib3-2.7.0.tar.gz", hash = "sha256:231e0ec3b63ceb14667c67be60f2f2c40a518cb38b03af60abc813da26505f4c", size = 433602, upload-time = "2026-05-07T16:13:18.596Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/39/08/aaaad47bc4e9dc8c725e68f9d04865dbcb2052843ff09c97b08904852d84/urllib3-2.6.3-py3-none-any.whl", hash = "sha256:bf272323e553dfb2e87d9bfd225ca7b0f467b919d7bbd355436d3fd37cb0acd4", size = 131584, upload-time = "2026-01-07T16:24:42.685Z" },
+    { url = "https://files.pythonhosted.org/packages/7f/3e/5db95bcf282c52709639744ca2a8b149baccf648e39c8cc87553df9eae0c/urllib3-2.7.0-py3-none-any.whl", hash = "sha256:9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897", size = 131087, upload-time = "2026-05-07T16:13:17.151Z" },
 ]
 
 [[package]]
@@ -5273,23 +5286,27 @@ wheels = [
 
 [[package]]
 name = "xprof-nightly"
-version = "2.23.2a20260421"
+version = "2.23.3a20260707"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
+    { name = "absl-py", marker = "sys_platform == 'linux' or (extra == 'extra-12-spectrax-lib-cuda' and extra == 'extra-12-spectrax-lib-tpu') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
     { name = "cheroot", marker = "sys_platform == 'linux' or (extra == 'extra-12-spectrax-lib-cuda' and extra == 'extra-12-spectrax-lib-tpu') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
     { name = "etils", extra = ["epath"], marker = "sys_platform == 'linux' or (extra == 'extra-12-spectrax-lib-cuda' and extra == 'extra-12-spectrax-lib-tpu') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "fire", marker = "sys_platform == 'linux' or (extra == 'extra-12-spectrax-lib-cuda' and extra == 'extra-12-spectrax-lib-tpu') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
     { name = "fsspec", marker = "sys_platform == 'linux' or (extra == 'extra-12-spectrax-lib-cuda' and extra == 'extra-12-spectrax-lib-tpu') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
     { name = "gcsfs", marker = "sys_platform == 'linux' or (extra == 'extra-12-spectrax-lib-cuda' and extra == 'extra-12-spectrax-lib-tpu') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "google-cloud-storage", marker = "sys_platform == 'linux' or (extra == 'extra-12-spectrax-lib-cuda' and extra == 'extra-12-spectrax-lib-tpu') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
     { name = "gviz-api", marker = "sys_platform == 'linux' or (extra == 'extra-12-spectrax-lib-cuda' and extra == 'extra-12-spectrax-lib-tpu') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
     { name = "protobuf", version = "5.29.6", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform == 'linux' and extra != 'extra-12-spectrax-lib-tpu' and extra == 'extra-7-easydel-tensorflow') or (sys_platform == 'linux' and extra != 'extra-12-spectrax-lib-cuda' and extra == 'extra-7-easydel-tensorflow') or (sys_platform != 'linux' and extra != 'extra-12-spectrax-lib-cuda' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (sys_platform != 'linux' and extra != 'extra-12-spectrax-lib-cuda' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (sys_platform == 'linux' and extra != 'extra-12-spectrax-lib-tpu' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (sys_platform == 'linux' and extra != 'extra-12-spectrax-lib-tpu' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (sys_platform != 'linux' and extra != 'extra-12-spectrax-lib-tpu' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-torch') or (sys_platform != 'linux' and extra != 'extra-12-spectrax-lib-tpu' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (extra == 'extra-12-spectrax-lib-cuda' and extra == 'extra-12-spectrax-lib-tpu') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tpu') or (extra != 'extra-12-spectrax-lib-cuda' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-torch') or (extra != 'extra-12-spectrax-lib-cuda' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu')" },
     { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform == 'linux' and extra != 'extra-12-spectrax-lib-tpu' and extra == 'extra-7-easydel-profile') or (sys_platform == 'linux' and extra != 'extra-12-spectrax-lib-tpu' and extra != 'extra-7-easydel-tensorflow') or (sys_platform == 'linux' and extra != 'extra-12-spectrax-lib-cuda' and extra == 'extra-7-easydel-profile') or (sys_platform == 'linux' and extra != 'extra-12-spectrax-lib-cuda' and extra != 'extra-7-easydel-tensorflow') or (sys_platform != 'linux' and extra != 'extra-12-spectrax-lib-cuda' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (sys_platform != 'linux' and extra != 'extra-12-spectrax-lib-cuda' and extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (sys_platform != 'linux' and extra != 'extra-12-spectrax-lib-tpu' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-torch') or (sys_platform != 'linux' and extra != 'extra-12-spectrax-lib-tpu' and extra == 'extra-7-easydel-cuda' and extra != 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow') or (extra == 'extra-12-spectrax-lib-cuda' and extra == 'extra-12-spectrax-lib-tpu') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tensorflow' and extra == 'extra-7-easydel-tpu')" },
     { name = "setuptools", marker = "sys_platform == 'linux' or (extra == 'extra-12-spectrax-lib-cuda' and extra == 'extra-12-spectrax-lib-tpu') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
     { name = "six", marker = "sys_platform == 'linux' or (extra == 'extra-12-spectrax-lib-cuda' and extra == 'extra-12-spectrax-lib-tpu') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "urllib3", marker = "sys_platform == 'linux' or (extra == 'extra-12-spectrax-lib-cuda' and extra == 'extra-12-spectrax-lib-tpu') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
     { name = "werkzeug", marker = "sys_platform == 'linux' or (extra == 'extra-12-spectrax-lib-cuda' and extra == 'extra-12-spectrax-lib-tpu') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/65/15/02307e188e43e8614de900fc8f0195beb53e689a63f8875f452c3f1b3d52/xprof_nightly-2.23.2a20260421-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:9a52893b487002bc5ae5b1b63f715d68ede23484fe6af7840919092a2d0fa0d1", size = 24854706, upload-time = "2026-04-21T09:11:52.244Z" },
-    { url = "https://files.pythonhosted.org/packages/66/45/344c91746c1dc7e40559785c2232929ae733e986ab1bf1313c9029d5719e/xprof_nightly-2.23.2a20260421-py3-none-manylinux_2_35_aarch64.whl", hash = "sha256:c2810afd9a974f9775c1602ab5c135334e33ec4c8be1862cf94000192f9ba4de", size = 42139207, upload-time = "2026-04-21T09:16:39.351Z" },
+    { url = "https://files.pythonhosted.org/packages/f3/c6/6915dba28b851f8933f4eab1ac03bfd0442a134fb1b09abd76194d289684/xprof_nightly-2.23.3a20260707-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:4d531ac724f16f3bbe318220ccf2fed19d01fddfa1a49568334d9797f9df7b03", size = 23959866, upload-time = "2026-07-07T09:10:33.784Z" },
+    { url = "https://files.pythonhosted.org/packages/40/cc/6c720fe279a628576e8ac0867a2f1a8d1ba4e41c7742f98b60ba3a1168b5/xprof_nightly-2.23.3a20260707-py3-none-manylinux_2_35_aarch64.whl", hash = "sha256:aba882245c392cd997ced825b7a320d9cced99e9b289452fd65ddfde745ec44c", size = 38233852, upload-time = "2026-07-07T09:16:34.52Z" },
 ]
 
 [[package]]

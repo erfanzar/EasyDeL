@@ -2602,6 +2602,19 @@ class EasyBridgeMixin(PushToHubMixin):
         moe_block_path = transformer.keywords.get("moe_block_path")
         moe_path = transformer.keywords.get("moe_path")
         reform_param = transformer.keywords.get("reform_param")
+        hf_flattened_wrappers = transformer.keywords.get("hf_flattened_wrappers")
+
+        def _normalize_key(k: str) -> str:
+            """Map a checkpoint key to EasyDeL naming (re-insert flattened wrappers).
+
+            Args:
+                k: Raw checkpoint state-dict key (old or new HF layout).
+
+            Returns:
+                str: The key with any transformers >= 5.13 flattened wrapper
+                prefix re-inserted; unchanged when already in EasyDeL layout.
+            """
+            return StateDictConverter.normalize_flattened_wrapper_key(k, hf_flattened_wrappers)
 
         moe_names_set = set(moe_names or [])
         expected_expert_name = moe_path[0].split(".")[-2] if moe_path else "experts"
@@ -2614,6 +2627,9 @@ class EasyBridgeMixin(PushToHubMixin):
         def _register_moe_key(k: str):
             """Group an HF expert weight key under its consolidated MoE target path.
 
+            Matching runs on the normalized (EasyDeL-layout) key while the
+            original checkpoint key is stored for later shard fetches.
+
             Args:
                 k: A flattened HF state-dict key.
 
@@ -2623,13 +2639,14 @@ class EasyBridgeMixin(PushToHubMixin):
             """
             if not (moe_block_path and moe_names_set and moe_path):
                 return
-            if expert_prefix not in k:
+            nk = _normalize_key(k)
+            if expert_prefix not in nk:
                 return
             for block_path in moe_block_path:
                 block_expert_prefix = block_path + expert_prefix
-                if not k.startswith(block_expert_prefix):
+                if not nk.startswith(block_expert_prefix):
                     continue
-                remainder = k[len(block_expert_prefix) :]
+                remainder = nk[len(block_expert_prefix) :]
                 dot_idx = remainder.find(".")
                 if dot_idx <= 0:
                     continue
@@ -2673,10 +2690,15 @@ class EasyBridgeMixin(PushToHubMixin):
             consolidated_moe_keys.add(f"{target_path}.weight")
 
         getattr(model, "config", hf_config)
+        normalized_to_original = {_normalize_key(k): k for k in ckpt_key_to_filename}
         reform_fusion_groups, reform_fusion_rules = StateDictConverter.collect_reform_param_fusion_groups(
-            ckpt_key_to_filename.keys(),
+            normalized_to_original.keys(),
             reform_param,
         )
+        reform_fusion_groups = {
+            fused_key: tuple(normalized_to_original.get(source_key, source_key) for source_key in source_keys)
+            for fused_key, source_keys in reform_fusion_groups.items()
+        }
         reform_fusion_source_keys = {
             source_key for source_keys in reform_fusion_groups.values() for source_key in source_keys
         }
@@ -2724,7 +2746,7 @@ class EasyBridgeMixin(PushToHubMixin):
                 None. Side-effect: populates the ``parameters_flat`` dict
                 in the enclosing scope.
             """
-            results = StateDictConverter.process_tensor(key, tensor, converter_config)
+            results = StateDictConverter.process_tensor(_normalize_key(key), tensor, converter_config)
             if results is None:
                 return
             for key_tuple, jax_array in results:
@@ -3373,6 +3395,19 @@ class EasyBridgeMixin(PushToHubMixin):
         moe_block_path = transformer.keywords.get("moe_block_path")
         moe_path = transformer.keywords.get("moe_path")
         reform_param = transformer.keywords.get("reform_param")
+        hf_flattened_wrappers = transformer.keywords.get("hf_flattened_wrappers")
+
+        def _normalize_key(k: str) -> str:
+            """Map a checkpoint key to EasyDeL naming (re-insert flattened wrappers).
+
+            Args:
+                k: Raw checkpoint state-dict key (old or new HF layout).
+
+            Returns:
+                str: The key with any transformers >= 5.13 flattened wrapper
+                prefix re-inserted; unchanged when already in EasyDeL layout.
+            """
+            return StateDictConverter.normalize_flattened_wrapper_key(k, hf_flattened_wrappers)
 
         uses_tie_word_embedding = getattr(hf_config, "tie_word_embeddings", False)
 
@@ -3387,6 +3422,9 @@ class EasyBridgeMixin(PushToHubMixin):
         def _register_moe_key(k: str):
             """Group an HF expert weight key under its consolidated MoE target path.
 
+            Matching runs on the normalized (EasyDeL-layout) key while the
+            original checkpoint key is stored for later shard fetches.
+
             Args:
                 k: A flattened HF state-dict key.
 
@@ -3396,13 +3434,14 @@ class EasyBridgeMixin(PushToHubMixin):
             """
             if not (moe_block_path and moe_names_set and moe_path):
                 return
-            if expert_prefix not in k:
+            nk = _normalize_key(k)
+            if expert_prefix not in nk:
                 return
             for block_path in moe_block_path:
                 block_expert_prefix = block_path + expert_prefix
-                if not k.startswith(block_expert_prefix):
+                if not nk.startswith(block_expert_prefix):
                     continue
-                remainder = k[len(block_expert_prefix) :]
+                remainder = nk[len(block_expert_prefix) :]
                 dot_idx = remainder.find(".")
                 if dot_idx <= 0:
                     continue
@@ -3847,8 +3886,9 @@ class EasyBridgeMixin(PushToHubMixin):
         for k, fname in ckpt_key_to_filename.items():
             file_to_keys.setdefault(fname, []).append(k)
 
+        normalized_to_original = {_normalize_key(k): k for k in ckpt_key_to_filename}
         fusion_groups, fusion_rules_by_target = StateDictConverter.collect_reform_param_fusion_groups(
-            ckpt_key_to_filename.keys(),
+            normalized_to_original.keys(),
             reform_param,
         )
         fusion_source_to_targets: dict[str, list[str]] = {}
@@ -3857,7 +3897,9 @@ class EasyBridgeMixin(PushToHubMixin):
             if key_tuple not in required_params:
                 continue
             for source_key in source_keys:
-                fusion_source_to_targets.setdefault(source_key, []).append(fused_key)
+                fusion_source_to_targets.setdefault(normalized_to_original.get(source_key, source_key), []).append(
+                    fused_key
+                )
         fusion_pending: dict[str, dict[str, tp.Any]] = {fused_key: {} for fused_key in fusion_groups}
         fusion_counts: dict[str, int] = {}
 
@@ -3951,7 +3993,7 @@ class EasyBridgeMixin(PushToHubMixin):
                 None.
             """
             with convert_ctx:
-                results = StateDictConverter.process_tensor(key, tensor, converter_config)
+                results = StateDictConverter.process_tensor(_normalize_key(key), tensor, converter_config)
             if results is None:
                 return
             for key_tuple, jax_array in results:
@@ -3966,7 +4008,7 @@ class EasyBridgeMixin(PushToHubMixin):
             for fused_key in fused_targets:
                 rule = fusion_rules_by_target[fused_key]
                 pending = fusion_pending.setdefault(fused_key, {})
-                pending[key] = tensor
+                pending[_normalize_key(key)] = tensor
                 source_keys = tuple(rule["sources"])
                 if not all(source_key in pending for source_key in source_keys):
                     continue
