@@ -33,7 +33,7 @@ import threading
 import warnings
 from collections.abc import Iterator
 from dataclasses import dataclass, fields, is_dataclass
-from typing import TYPE_CHECKING, ClassVar, Self
+from typing import TYPE_CHECKING, Any, ClassVar, Self
 
 import jax
 import jax.numpy as jnp
@@ -741,7 +741,7 @@ class Module:
         """
         return self.train(False)
 
-    def __call__(self, *args: object, **kwargs: object) -> object:
+    def __call__(self, *args: object, **kwargs: object) -> Any:
         """Invoke the module's forward pipeline.
 
         The full ordering is:
@@ -789,7 +789,7 @@ class Module:
                 for make_context in list(self._spx_contexts):
                     stack.enter_context(make_context())
                 stack.enter_context(push_policy(policy))
-                out: object = self.forward(*args, **kwargs)
+                out: Any = self.forward(*args, **kwargs)
         else:
             with push_policy(policy):
                 out = self.forward(*args, **kwargs)
