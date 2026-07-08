@@ -55,6 +55,56 @@ from . import ToolParser, ToolParserManager
 logger = get_logger("ToolCallingMixin")
 
 
+def build_tool_parser_or_none(
+    parser_class: type[ToolParser] | None,
+    tokenizer: tp.Any,
+    *,
+    context: str = "",
+) -> ToolParser | None:
+    """Instantiate a tool parser, degrading to ``None`` on any failure.
+
+    Several tool parsers validate tokenizer capabilities in ``__init__`` and
+    raise when the requirement is not met (e.g. :class:`MistralToolParser`
+    raises ``RuntimeError`` when the tokenizer vocabulary lacks the
+    ``[TOOL_CALLS]`` delimiter token). When such a parser is auto-selected by
+    model type (``mistral4`` -> ``mistral``) but paired with a tokenizer that
+    does not carry the delimiter, constructing it at request-add time would
+    raise inside the engine's request path and take the request (and, via the
+    scheduler retry budget, the engine) down.
+
+    This helper contains that failure: it returns a live parser when
+    construction succeeds and ``None`` (with a warning) when it does not, so
+    callers can disable function calling gracefully instead of crashing.
+
+    Args:
+        parser_class: The resolved tool-parser class, or ``None`` when tool
+            parsing is disabled.
+        tokenizer: Tokenizer/processor passed to the parser constructor.
+        context: Optional human-readable context (model or request id) folded
+            into the warning message.
+
+    Returns:
+        A constructed :class:`ToolParser`, or ``None`` when ``parser_class`` is
+        ``None`` or its construction raised.
+    """
+    if parser_class is None:
+        return None
+    try:
+        return parser_class(tokenizer)
+    except Exception as exc:
+        # Degrade gracefully on any parser-init failure (missing delimiter
+        # token, unsupported tokenizer, etc.) so callers can disable function
+        # calling instead of crashing.
+        suffix = f" for {context}" if context else ""
+        logger.warning(
+            "Tool parser %s is incompatible with the tokenizer%s; function calling disabled. Reason: %s",
+            getattr(parser_class, "__name__", parser_class),
+            suffix,
+            exc,
+        )
+        return None
+
+
 class ToolCallingMixin:
     """Mixin class providing tool calling functionality for inference API servers.
 
@@ -149,7 +199,12 @@ class ToolCallingMixin:
                     logger.warning(f"No tool parser resolved for model {model_name}, function calling disabled")
                     continue
                 parser_class = ToolParserManager.get_tool_parser(parser_name)
-                tool_parsers[model_name] = parser_class(processor)
+                parser = build_tool_parser_or_none(parser_class, processor, context=f"model {model_name}")
+                if parser is None:
+                    # Incompatible tokenizer (e.g. missing delimiter token): skip
+                    # this model so function calling degrades gracefully.
+                    continue
+                tool_parsers[model_name] = parser
                 logger.info(f"Initialized {parser_name} tool parser for model {model_name}")
             except KeyError:
                 logger.warning(f"Tool parser '{parser_name}' not found, function calling disabled for {model_name}")

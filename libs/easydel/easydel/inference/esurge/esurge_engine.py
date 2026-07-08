@@ -1036,10 +1036,24 @@ class eSurge(
         if tool_parser:
             try:
                 from easydel.inference.tools import ToolParserManager
+                from easydel.inference.tools.tool_calling_mixin import build_tool_parser_or_none
 
-                self._tool_parser_class = ToolParserManager.get_tool_parser(tool_parser)
-                if not self.parsing_config.silent_mode:
-                    logger.info("Initialized tool parser: %s", tool_parser)
+                parser_class = ToolParserManager.get_tool_parser(tool_parser)
+                # Validate the parser can actually construct against this
+                # tokenizer up front. Some parsers (e.g. mistral) require a
+                # special delimiter token in the vocabulary and raise in
+                # __init__ otherwise; a model whose type auto-selects such a
+                # parser (mistral4 -> mistral) but whose tokenizer lacks the
+                # token would otherwise crash at request-add time. Degrade
+                # gracefully by disabling function calling instead.
+                probe = build_tool_parser_or_none(parser_class, self.tokenizer, context=f"tool parser '{tool_parser}'")
+                if probe is None:
+                    self._tool_parser_class = None
+                    self.tool_parser = None
+                else:
+                    self._tool_parser_class = parser_class
+                    if not self.parsing_config.silent_mode:
+                        logger.info("Initialized tool parser: %s", tool_parser)
             except KeyError:
                 logger.warning("Tool parser '%s' not found, function calling disabled", tool_parser)
 

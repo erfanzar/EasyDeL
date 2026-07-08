@@ -33,6 +33,7 @@ import jax
 
 from easydel.inference.parsing import DelegatingParser
 from easydel.inference.sampling_params import SamplingParams
+from easydel.inference.tools.tool_calling_mixin import build_tool_parser_or_none
 
 from ..logger import logger
 from ..metrics import get_metrics_collector, log_metrics_summary
@@ -357,7 +358,7 @@ class EngineRequestsMixin:
                 prompt_text=prompt_for_engine,
                 prompt_token_ids=token_ids,
             )
-            _tp = self._tool_parser_class(self.tokenizer) if self._tool_parser_class else None
+            _tp = build_tool_parser_or_none(self._tool_parser_class, self.tokenizer, context=f"request {request_id}")
             self._active_requests[request_id]["delegating_parser"] = DelegatingParser(
                 reasoning_parser=_rp,
                 tool_parser=_tp,
@@ -483,7 +484,9 @@ class EngineRequestsMixin:
                         prompt_text=prompt_for_engine,
                         prompt_token_ids=token_ids,
                     )
-                    _tp2 = self._tool_parser_class(self.tokenizer) if self._tool_parser_class else None
+                    _tp2 = build_tool_parser_or_none(
+                        self._tool_parser_class, self.tokenizer, context=f"request {child_request_id}"
+                    )
                     self._active_requests[child_request_id]["delegating_parser"] = DelegatingParser(
                         reasoning_parser=_rp2,
                         tool_parser=_tp2,
