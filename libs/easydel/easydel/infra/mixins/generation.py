@@ -5042,6 +5042,12 @@ class EasyGenerationMixin:
             spx.GraphDef: A graph definition that eSurge can consume
             directly.
         """
+        if getattr(self, "esurge_cache_family", None) == "compressed_window":
+            # Compressed-window models (DeepSeek-V4) run bespoke in-model
+            # attention against per-slot CompressedWindowCache state; they
+            # never read `attn_mechanism`, so retargeting onto paged kernels
+            # would be misleading. Serve the graph definition unchanged.
+            return gdef
         backend = _resolve_backend_for_esurge(self.config)
         text_config = self.config.get_text_config()
         attn_mechanism = _normalize_attn_mechanism_value(getattr(self.config, "attn_mechanism", None))
@@ -5144,6 +5150,10 @@ class EasyGenerationMixin:
             >>> # Now safe to use with eSurge inference
             >>> outputs = esurge_model.esurge_generate("Hello world")
         """
+        if getattr(self, "esurge_cache_family", None) == "compressed_window":
+            # Compressed-window models (DeepSeek-V4) serve through their own
+            # per-slot cache path; never retarget them onto paged attention.
+            return self
         backend = _resolve_backend_for_esurge(self.config)
         text_config = self.config.get_text_config()
         attn_mechanism = _normalize_attn_mechanism_value(getattr(self.config, "attn_mechanism", None))

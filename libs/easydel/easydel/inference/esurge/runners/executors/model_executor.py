@@ -153,6 +153,7 @@ class ModelStepExecutor:
         full_hidden_state_max_tokens: int = 0,
         enable_spec_recurrent_commit: bool = False,
         input_sharding: jax.sharding.Sharding | None = None,
+        slot_indexed_state: bool = False,
     ) -> None:
         """Initialize the ModelStepExecutor.
 
@@ -177,6 +178,10 @@ class ModelStepExecutor:
                 below this token count return all token hidden rows rather than
                 only sampled rows. Speculative verification uses this for tiny
                 draft windows while larger prompt buckets keep compact outputs.
+            slot_indexed_state: If True (compressed-window cache families),
+                the compiled steps thread ``recurrent_state_indices`` from the
+                batch metadata into the model's cache metadata even without
+                SPMD DP, so the model can address per-request slot state.
         """
         self.model = model
         self.mesh = mesh
@@ -191,6 +196,7 @@ class ModelStepExecutor:
         self.mpmd_scheduler = mpmd_scheduler
         self.pipeline_plan = pipeline_plan
         self.enable_spec_recurrent_commit = bool(enable_spec_recurrent_commit)
+        self._slot_indexed_state = bool(slot_indexed_state)
         self._input_sharding = input_sharding if input_sharding is not None else empty_sharding
         self._flat_state_args = not self._uses_mpmd_mesh()
         self._graphstate_treedef = jax.tree_util.tree_structure(graphstate_template)
@@ -475,7 +481,7 @@ class ModelStepExecutor:
             dp_query_start_loc=self._empty_sharding if use_spmd_dp else None,
             dp_request_distribution=self._empty_sharding if use_spmd_dp else None,
             dp_context_lens=self._empty_sharding if use_spmd_dp else None,
-            dp_recurrent_state_indices=self._empty_sharding if use_spmd_dp else None,
+            dp_recurrent_state_indices=self._empty_sharding if (use_spmd_dp or self._slot_indexed_state) else None,
             input_token_handoff_positions=self._empty_sharding,
             input_token_handoff_ids=self._empty_sharding,
             input_token_handoff_count=self._empty_sharding,
@@ -1975,7 +1981,9 @@ class ModelStepExecutor:
                             num_kv_update_slices=metadata.num_kv_update_slices,
                             spec_recurrent_commit=metadata.spec_recurrent_commit,
                             recurrent_state_indices=(
-                                metadata.rank_recurrent_state_indices if self._uses_spmd_dp() else None
+                                metadata.rank_recurrent_state_indices
+                                if (self._uses_spmd_dp() or self._slot_indexed_state)
+                                else None
                             ),
                             version=self._metadata_version,
                         )
@@ -2159,7 +2167,9 @@ class ModelStepExecutor:
                             num_kv_update_slices=metadata.num_kv_update_slices,
                             spec_recurrent_commit=metadata.spec_recurrent_commit,
                             recurrent_state_indices=(
-                                metadata.rank_recurrent_state_indices if self._uses_spmd_dp() else None
+                                metadata.rank_recurrent_state_indices
+                                if (self._uses_spmd_dp() or self._slot_indexed_state)
+                                else None
                             ),
                             version=self._metadata_version,
                         )
@@ -2318,7 +2328,9 @@ class ModelStepExecutor:
                             num_kv_update_slices=metadata.num_kv_update_slices,
                             spec_recurrent_commit=metadata.spec_recurrent_commit,
                             recurrent_state_indices=(
-                                metadata.rank_recurrent_state_indices if self._uses_spmd_dp() else None
+                                metadata.rank_recurrent_state_indices
+                                if (self._uses_spmd_dp() or self._slot_indexed_state)
+                                else None
                             ),
                             version=self._metadata_version,
                         )

@@ -745,6 +745,13 @@ class EasyDeLBaseModule(
             Set automatically based on the configuration.
         _parameter_transform_rules: Class-level list of ParameterTransformRule instances
             for handling parameter name/value transformations during conversion.
+        _hf_flattened_wrapper: Name of the inner wrapper submodule this module
+            keeps but transformers >= 5.13 flattened out of the matching HF
+            class's state dict (e.g. ``"vision_model"`` on CLIP/SigLIP vision
+            towers). Consumed by ``_get_hf_flattened_wrappers`` so HF -> EasyDeL
+            conversion accepts both the old (wrapper-prefixed) and new
+            (flattened) key layouts. ``None`` for modules whose HF layout is
+            unchanged.
 
     Example:
         >>> class MyCustomModel(EasyDeLBaseModule):
@@ -778,6 +785,7 @@ class EasyDeLBaseModule(
     _model_task: str | None
     _model_type: str | None
     _parameter_transform_rules: tp.ClassVar[list[ParameterTransformRule]] = []
+    _hf_flattened_wrapper: tp.ClassVar[str | None] = None
 
     def __init_subclass__(cls, **kwargs: tp.Any) -> None:
         """Wrap subclass ``__init__`` to install parameter-init sharding context.
@@ -1194,6 +1202,78 @@ class EasyDeLBaseModule(
         graphother = materialize_meta_leaves(graphother, seed=42)
         return gdef, graphstate, graphother
 
+    @staticmethod
+    def _reconcile_missing_rng_state(graphdef: spx.GraphDef, full_state: spx.State) -> spx.State:
+        """Add RNG leaves that ``graphdef`` requires but ``full_state`` is missing.
+
+        :meth:`sequential_init` reassigns every submodule's ``rngs``
+        (``module.rngs = rng.fork(1)[0]``), so a model built that way exports a
+        ``rng`` collection whose stream paths differ from those of a
+        freshly-constructed module: it grows per-submodule streams
+        (``model.layers.0.mlp.dropout.rngs.default``, ...) and loses the shared
+        top-level ``rngs.parameters`` stream. When such a model's state is
+        rebound against a *freshly-built* graph definition — the
+        attention-retargeted graphdef used by
+        :attr:`~EasyGenerationMixin.esurge_compatible_model`, or the graphdef
+        from :meth:`update_module`/:meth:`new_graphdef` — the graphdef references
+        canonical RNG paths (``rngs.parameters``) the state no longer carries and
+        :func:`spx.bind` raises ``KeyError`` while walking the missing path.
+
+        Only the regenerable ``rng`` collection is reconciled. A missing
+        parameter or buffer is a genuine structural error and is deliberately
+        left for :func:`spx.bind` to surface rather than being silently
+        zero-filled. When nothing is missing (the common same-structure
+        round-trip) the input state is returned unchanged.
+
+        Args:
+            graphdef: Target graph definition being bound against.
+            full_state: The merged ``graphstate.overlay(graphother)`` state.
+
+        Returns:
+            spx.State: ``full_state`` when it already covers every RNG leaf the
+            graphdef needs, otherwise a new state with the missing RNG streams
+            materialized (existing leaves are preserved and win on overlap).
+        """
+        missing_sentinel = object()
+        canonical = dict(graphdef.var_canonical)
+        missing_paths: list[str] = []
+        seen_refs: set[int] = set()
+        for node_idx, ref in graphdef.var_refs:
+            if ref in seen_refs:
+                continue
+            seen_refs.add(ref)
+            node = graphdef.nodes[node_idx]
+            if getattr(node, "collection", None) != "rng":
+                continue
+            path = canonical.get(ref)
+            if path is None:
+                continue
+            if full_state.get("rng", path, missing_sentinel) is missing_sentinel:
+                missing_paths.append(path)
+
+        if not missing_paths:
+            return full_state
+
+        ref_shape: tuple[int, ...] = (4,)
+        ref_dtype: tp.Any = jnp.uint32
+        for collection, _path, leaf in full_state.items():
+            if collection != "rng":
+                continue
+            value = leaf.value if hasattr(leaf, "value") else leaf
+            shape = getattr(value, "shape", None)
+            dtype = getattr(value, "dtype", None)
+            if shape is not None and dtype is not None:
+                ref_shape, ref_dtype = tuple(shape), dtype
+                break
+
+        filler: dict[str, dict[str, tp.Any]] = {"rng": {}}
+        for path in missing_paths:
+            filler["rng"][path] = jax.ShapeDtypeStruct(ref_shape, ref_dtype)
+        filler_state = materialize_meta_leaves(spx.State(filler), seed=42)
+        # ``full_state`` overlaid on top wins on overlap, so already-present RNG
+        # streams keep their real values and only the missing ones are added.
+        return filler_state.overlay(full_state)
+
     def merge_module(
         self: Self,
         graphdef: spx.GraphDef,
@@ -1225,6 +1305,7 @@ class EasyDeLBaseModule(
             >>> new_model = model.merge_module(graphdef, new_params, others)
         """
         full_state = graphstate.overlay(graphother)
+        full_state = self._reconcile_missing_rng_state(graphdef, full_state)
         bound = spx.bind(graphdef, full_state)
         object.__setattr__(bound, "_spx_opaque", dict(self._spx_opaque))
         for opaque_name in self._spx_attr_order:
@@ -2657,6 +2738,33 @@ class EasyDeLBaseModule(
         StateDictConverter.validate_reform_param_schema(reform_param)
         return reform_param
 
+    def _get_hf_flattened_wrappers(self) -> dict[str, str]:
+        """Collect ``_hf_flattened_wrapper`` declarations from the module tree.
+
+        transformers >= 5.13 flattened the inner wrapper module out of
+        standalone tower classes (CLIP/SigLIP vision and text models), so
+        live HF state dicts emit keys without the wrapper prefix while real
+        hub checkpoints keep the old prefixed layout. EasyDeL module trees
+        mirror the old layout; modules that wrap such an HF class declare the
+        dropped wrapper name via the ``_hf_flattened_wrapper`` class
+        attribute. This walks the tree so declarations compose automatically
+        when a tower is embedded in a larger model (e.g. a CLIP tower at
+        ``model.vision_tower`` inside LLaVA).
+
+        Returns:
+            dict[str, str]: Mapping of dotted subtree path (``""`` for the
+                root module) to the wrapper submodule name to re-insert into
+                flattened HF keys during conversion.
+        """
+        from easydel.utils import traversals
+
+        flattened_wrappers: dict[str, str] = {}
+        for path, module in traversals.iter_module_search(self, spx.Module):
+            wrapper = getattr(module, "_hf_flattened_wrapper", None)
+            if wrapper:
+                flattened_wrappers[".".join(map(str, path))] = str(wrapper)
+        return flattened_wrappers
+
     @property
     def fused_params(self) -> dict[str, tuple[int, ...]]:
         """Dynamic registry of fused (TP-interleaved) parameters.
@@ -2702,6 +2810,7 @@ class EasyDeLBaseModule(
             moe_path=moe_path,
             dtype=self.param_dtype,
             reform_param=self._get_reform_param(),
+            hf_flattened_wrappers=self._get_hf_flattened_wrappers(),
         )
         if shard_fns is not None:
             kwargs["shard_fns"] = shard_fns
@@ -2915,21 +3024,50 @@ class EasyDeLBaseModule(
             if explicit_num_moe_layers is not None:
                 return max(0, min(_as_int(explicit_num_moe_layers), num_layers))
 
-            layer_types = getattr(source, "layer_types", None)
-            if layer_types is not None:
-                layer_types = list(layer_types)
+            # Dedicated per-layer MoE schedule. ``mlp_layer_types`` carries the
+            # MoE (dense/sparse/moe) schedule for families such as hy_v3,
+            # minimax_m3_vl and deepseek_v4. It is intentionally distinct from
+            # ``layer_types``, which those same configs use for the *attention*
+            # schedule (full/sliding/linear/sparse-attention). Reading
+            # ``layer_types`` here undercounts MoE layers (e.g. minimax_m3_vl
+            # reports attention markers only) so it must not be the primary
+            # source.
+            mlp_layer_types = getattr(source, "mlp_layer_types", None)
+            if mlp_layer_types is not None:
+                mlp_layer_types = list(mlp_layer_types)[:num_layers]
                 return sum(
                     1
-                    for layer_type in layer_types[:num_layers]
+                    for layer_type in mlp_layer_types
                     if "moe" in str(layer_type).lower() or "sparse" in str(layer_type).lower()
                 )
 
+            # Qwen-style schedule: every layer is MoE except those listed in
+            # ``mlp_only_layers``, gated by ``decoder_sparse_step``
+            # (``(layer_idx + 1) % decoder_sparse_step == 0``).
             mlp_only_layers = getattr(source, "mlp_only_layers", None)
             if isinstance(mlp_only_layers, (list, tuple, set)):
-                return max(
-                    0, num_layers - len({layer_idx for layer_idx in mlp_only_layers if 0 <= layer_idx < num_layers})
+                sparse_step = max(1, _as_int(_config_value(source, "decoder_sparse_step", default=1), 1))
+                dense_only = {layer_idx for layer_idx in mlp_only_layers if 0 <= layer_idx < num_layers}
+                return sum(
+                    1
+                    for layer_idx in range(num_layers)
+                    if layer_idx not in dense_only and (layer_idx + 1) % sparse_step == 0
                 )
 
+            # Legacy fallback: an explicit ``moe`` marker inside the
+            # attention/layer schedule. Only ``moe`` is matched here (never
+            # ``sparse``) because ``sparse`` in ``layer_types`` denotes
+            # sparse-*attention* layers, not MoE FFN layers.
+            layer_types = getattr(source, "layer_types", None)
+            if layer_types is not None:
+                moe_marked = sum(1 for layer_type in list(layer_types)[:num_layers] if "moe" in str(layer_type).lower())
+                if moe_marked:
+                    return moe_marked
+
+            # DeepSeek / Mistral-style schedule (and the default when no
+            # schedule is declared): the first ``first_k_dense_replace`` layers
+            # are dense and the rest follow a ``moe_layer_freq`` cadence. With
+            # the defaults (``0`` dense, freq ``1``) every layer is MoE.
             first_dense_layer_count = _as_int(
                 _config_value(source, "first_k_dense_replace", "first_k_dense_layers", default=0)
             )
@@ -2982,6 +3120,23 @@ class EasyDeLBaseModule(
             )
             if moe_intermediate_dim is not None:
                 moe_intermediate_dim = _as_int(moe_intermediate_dim)
+            shared_expert_intermediate_dim = _as_int(
+                _config_value(
+                    text_config,
+                    "shared_expert_intermediate_size",
+                    "moe_shared_expert_intermediate_size",
+                    "shared_intermediate_size",
+                    default=0,
+                )
+            )
+            # Families such as deepseek_v3, hy_v3 and mistral4 build their shared
+            # expert(s) at the routed-expert width (``moe_intermediate_size``)
+            # and expose no explicit shared-expert-width field. Without this
+            # fallback ``flop_moe_mlp`` sizes the shared expert at
+            # ``intermediate_dim`` (the much larger dense FFN width) and
+            # overcounts the shared-expert contribution.
+            if shared_expert_intermediate_dim <= 0 and num_shared_experts > 0 and moe_intermediate_dim:
+                shared_expert_intermediate_dim = moe_intermediate_dim
             layer_types = getattr(text_config, "layer_types", None)
             fconf = FlopCalcConfig(
                 hidden_dim=hidden_dim,
@@ -3006,14 +3161,7 @@ class EasyDeLBaseModule(
                 num_shared_experts=num_shared_experts,
                 num_experts_per_tok=num_experts_per_tok,
                 moe_intermediate_dim=moe_intermediate_dim,
-                shared_expert_intermediate_dim=_as_int(
-                    _config_value(
-                        text_config,
-                        "shared_expert_intermediate_size",
-                        "moe_shared_expert_intermediate_size",
-                        default=0,
-                    )
-                ),
+                shared_expert_intermediate_dim=shared_expert_intermediate_dim,
                 num_moe_layers=_count_moe_layers(text_config, num_layers, num_experts),
                 layer_types=layer_types,
                 sliding_window=_config_value(text_config, "sliding_window", "window_size", default=None),

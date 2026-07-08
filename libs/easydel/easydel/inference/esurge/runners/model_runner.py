@@ -371,6 +371,18 @@ class eSurgeRunner:
                 standard single-token-per-forward decode.
         """
         self.model = model.esurge_compatible_model
+        # Compressed-window models (DeepSeek-V4) keep ALL decode state in
+        # per-request slots (CompressedWindowCache rows). Requests must keep a
+        # stable physical slot for their lifetime (SequenceBuffer rows can be
+        # condensed/moved), so the recurrent slot pool is used even without
+        # SPMD DP and the slot ids are threaded to the model each step.
+        self._slot_indexed_state = getattr(self.model, "esurge_cache_family", None) == "compressed_window"
+        if self._slot_indexed_state and drafter is not None:
+            raise ValueError(
+                "Speculative decoding is not supported for compressed-window cache models: "
+                "per-slot ring/compressor state advances on every consumed token and cannot "
+                "roll back rejected draft tokens."
+            )
         self.drafter = drafter
         if self.drafter is not None and hasattr(self.drafter, "set_max_length"):
             self.drafter.set_max_length(int(max_model_len))
@@ -599,6 +611,15 @@ class eSurgeRunner:
         """Return whether the runner is using rank-major data-parallel execution."""
         return int(getattr(self.metadata, "data_parallel_size", 1) or 1) > 1
 
+    def _uses_recurrent_slot_pool(self) -> bool:
+        """Whether requests are pinned to pooled physical state slots.
+
+        True under rank-major SPMD DP (per-rank slot blocks) and for
+        slot-indexed state families (compressed-window caches), where the
+        request's state row must survive SequenceBuffer row moves.
+        """
+        return self._uses_spmd_dp() or self._slot_indexed_state
+
     def _recurrent_rows_per_dp_rank(self) -> int:
         """Return the number of recurrent-state rows owned by each DP rank.
 
@@ -647,14 +668,14 @@ class eSurgeRunner:
 
         Returns:
             The physical recurrent-state slot index, or ``None`` when the runner
-            is not using SPMD DP (no per-rank slot pools exist).
+            uses neither SPMD DP nor slot-indexed state (no slot pools exist).
 
         Raises:
             RuntimeError: If an existing slot's inferred rank disagrees with the
                 provided ``dp_rank``, if ``dp_rank`` is out of range, or if no
                 free slot remains in the target rank.
         """
-        if not self._uses_spmd_dp():
+        if not self._uses_recurrent_slot_pool():
             return None
         existing = self._recurrent_slot_by_req.get(req_id)
         rows_per_rank = self._recurrent_rows_per_dp_rank()
@@ -697,7 +718,7 @@ class eSurgeRunner:
         slot = self._recurrent_slot_by_req.pop(req_id, None)
         if forget_rank:
             self._request_dp_rank_by_req.pop(req_id, None)
-        if slot is None or not self._uses_spmd_dp():
+        if slot is None or not self._uses_recurrent_slot_pool():
             return slot
         rows_per_rank = self._recurrent_rows_per_dp_rank()
         dp_size = max(1, int(getattr(self.metadata, "data_parallel_size", 1) or 1))
@@ -2050,8 +2071,18 @@ class eSurgeRunner:
             else:
                 inputs_embeds, info = compiled_result
         except Exception as exc:
-            logger.warning(f"VLM precompute failed for req_id={req_state.req_id}: {exc}")
-            return
+            # A vision-encode failure here is NOT silently recoverable. If we
+            # swallow it and return, the compiled step runs against the raw
+            # prompt token ids (image/video placeholder tokens are never
+            # replaced by visual embeddings), which produces coherent-looking
+            # but semantically garbage output. Fail loudly so the request is
+            # rejected instead of served corrupted generations.
+            logger.error(
+                "VLM vision encode failed for req_id=%s; rejecting request to avoid serving garbage output. Error: %s",
+                req_state.req_id,
+                exc,
+            )
+            raise RuntimeError(f"VLM vision encode failed for req_id={req_state.req_id}: {exc}") from exc
 
         # Store host-side views (keeps compiled step free of vision preprocessing).
         embeds_host = np.asarray(jax.device_get(inputs_embeds))
@@ -2187,8 +2218,9 @@ class eSurgeRunner:
                 removed_req_index_by_id[req_id] = req_index
 
         # 3b) Clear recurrent/SSM state for freed slots so the next request
-        # assigned to the same slot starts from a clean state.
-        slots_to_clear = removed_recurrent_slots if self._uses_spmd_dp() else removed_req_indices
+        # assigned to the same slot starts from a clean state. Slot-pooled
+        # runners clear physical slots; row-identity runners clear buffer rows.
+        slots_to_clear = removed_recurrent_slots if self._uses_recurrent_slot_pool() else removed_req_indices
         if slots_to_clear:
             self.executor_manager.clear_recurrent_slots(slots_to_clear)
             if self.spec_decode_recurrent_candidates:
@@ -2742,11 +2774,15 @@ class eSurgeRunner:
         placeholder_req_id_to_index: dict[str, int] = {}
         discard_set = set(discard_sampled_tokens_req_indices)
 
-        for out_idx, seq_row_idx, req_state, _ in request_seq_lens:
+        for out_idx, seq_row_idx, req_state, placeholder_idx in request_seq_lens:
             if out_idx in discard_set:
                 continue
 
-            start_idx = self.sequence_buffer.num_tokens_no_spec[seq_row_idx]
+            # Honor the placeholder position recorded at schedule time
+            # (``num_computed_tokens + scheduled``). Re-reading
+            # ``num_tokens_no_spec`` here would re-introduce the stale-counter
+            # drift after a synchronously finalized step.
+            start_idx = int(placeholder_idx)
             end_idx = start_idx + 1  # Assume 1 token (no spec decode yet)
 
             if end_idx > self.max_model_len:
@@ -4356,6 +4392,8 @@ class eSurgeRunner:
                                 rows_per_rank = self._recurrent_rows_per_dp_rank()
                                 rank = min(max(int(window_row_indices[row_pos]), 0) // rows_per_rank, dp_size - 1)
                             slot = self._assign_recurrent_slot(str(rid), int(rank))
+                        elif self._slot_indexed_state:
+                            slot = self._assign_recurrent_slot(str(rid), None)
                         else:
                             slot = int(window_row_indices[row_pos])
                     recurrent_slot_indices_cpu[row_pos] = int(slot)
@@ -4745,7 +4783,16 @@ class eSurgeRunner:
                     if is_valid:
                         if req_state is None or req_idx is None or seq_len is None:
                             raise RuntimeError(f"Missing runner state for async request {rid!r}")
-                        placeholder_idx = int(self.sequence_buffer.num_tokens_no_spec[req_idx])
+                        # The token sampled by this step lands right after the tokens
+                        # computed in this step: ``num_computed_tokens + scheduled``
+                        # (== ``seq_len``). ``num_tokens_no_spec`` is only maintained
+                        # by the async placeholder path itself, so it goes stale one
+                        # slot behind whenever the previous step for this request was
+                        # finalized synchronously (e.g. the prefill step). Using the
+                        # stale counter made the next async finalize overwrite the
+                        # previous token and left the real append slot as a 0
+                        # placeholder that was then fed back into the model.
+                        placeholder_idx = int(seq_len)
                         request_seq_lens.append((out_idx, req_idx, req_state, placeholder_idx))
                     else:
                         discard_sampled_tokens_req_indices.append(out_idx)
