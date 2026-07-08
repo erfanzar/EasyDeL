@@ -90,14 +90,15 @@ def _yarn_find_correction_range(  # pyright: ignore[reportUnusedFunction]
     dim: int,
     base: float = 10000,
     max_position_embeddings: int = 2048,
+    truncate: bool = True,
 ) -> tuple[int | Array, int | Array]:
-    """Compute the integer YaRN correction band ``[low, high]`` from rotation budgets.
+    """Compute the YaRN correction band ``[low, high]`` from rotation budgets.
 
     Calls :func:`_yarn_find_correction_dim` once per rotation budget
-    (``low_rot``, ``high_rot``), then floors the low end and ceils the high
-    end so the band covers every plane *fully* extrapolated and *fully*
-    interpolated. Result is clipped to ``[0, dim - 1]`` to keep downstream
-    indexing safe.
+    (``low_rot``, ``high_rot``), then — when ``truncate`` is set — floors the
+    low end and ceils the high end so the band covers every plane *fully*
+    extrapolated and *fully* interpolated. Result is clipped to
+    ``[0, dim - 1]`` to keep downstream indexing safe.
 
     Args:
         low_rot: Lower rotation budget (rotations within the original
@@ -107,28 +108,30 @@ def _yarn_find_correction_range(  # pyright: ignore[reportUnusedFunction]
         dim: Total rotary feature dimension.
         base: RoPE base period.
         max_position_embeddings: Original training context length.
+        truncate: Whether to floor/ceil the band to integer plane indices
+            (matches transformers' ``truncate`` rope parameter; default
+            ``True`` preserves the classic YaRN behaviour).
 
     Returns:
         Tuple ``(low, high)`` with ``low <= high``, both clipped to
         ``[0, dim - 1]``, ready to be consumed by
         :func:`_yarn_linear_ramp_mask`.
     """
-    hr = jnp.ceil(
-        _yarn_find_correction_dim(
-            high_rot,
-            dim,
-            base,
-            max_position_embeddings,
-        )
+    hr = _yarn_find_correction_dim(
+        high_rot,
+        dim,
+        base,
+        max_position_embeddings,
     )
-    lr = jnp.floor(
-        _yarn_find_correction_dim(
-            low_rot,
-            dim,
-            base,
-            max_position_embeddings,
-        )
+    lr = _yarn_find_correction_dim(
+        low_rot,
+        dim,
+        base,
+        max_position_embeddings,
     )
+    if truncate:
+        hr = jnp.ceil(hr)
+        lr = jnp.floor(lr)
     return jax.lax.max(lr, 0.0), jax.lax.min(hr, jnp.array(dim - 1, dtype=jnp.float32))
 
 

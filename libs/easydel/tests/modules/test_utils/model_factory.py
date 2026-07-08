@@ -23,12 +23,11 @@ import gc
 import inspect
 from typing import Any
 
+import easydel as ed
 import spectrax as spx
 import transformers
-from transformers.dynamic_module_utils import get_class_from_dynamic_module
-
-import easydel as ed
 from easydel.infra.etils import EasyDeLGradientCheckPointers
+from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
 
 def _is_simple_config_value(value: Any) -> bool:
@@ -333,6 +332,8 @@ def create_hf_model(
         "glm4v_moe",
         "glm46v",
         "gemma3",
+        "minimax_m3_vl",
+        "minimax_m3_vl_text",
         "mistral3",
         "glm_moe_dsa",
         "phi",
