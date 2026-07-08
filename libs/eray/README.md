@@ -434,6 +434,77 @@ resubmits; `eray fleet status` shows the new generation. Non-restartable
 one-off jobs can be submitted straight from the laptop through the tunnel
 (`eray run -a http://127.0.0.1:8265 -- ...`).
 
+## Elastic autoscale clusters
+
+`eray autoscale` wraps Ray's own cluster-launcher (`ray up/down/dashboard`)
+for the elastic many-small-slices case (prefer `eray fleet` above for
+reliable big slices). `up`/`down`/`status` never need a YAML path: with no
+argument they pick from whatever `generate` already wrote — auto-selecting
+the only profile, or prompting when there's more than one.
+
+```bash
+eray autoscale generate --zones us-east5-a          # writes ~/.eray/autoscale/easydel-us-east5-a.yaml
+eray autoscale up                                    # no path needed: picks/prompts among generated profiles
+eray autoscale up easydel-us-east5-a                  # or name one directly (also accepts a YAML path)
+eray autoscale status                                 # every profile: zone, live status, head, uptime/died
+eray autoscale down                                   # picker again; stamps when it went down
+```
+
+Every `up`/`down` also registers the cluster into the same fleet registry
+`eray fleet` uses (`kind=launcher`), which is what makes `eray dashboard`
+below see autoscale clusters right alongside `eray fleet` ones.
+
+## Dashboard
+
+One place to see everything eray manages — `eray fleet` (QR-based TPU pods)
+and `eray autoscale` (cluster-launcher) clusters together — and to open a
+dashboard without hand-building a `ray dashboard`/gcloud SSH command:
+
+```bash
+eray dashboard              # table of every registered cluster; prompts + opens one if interactive
+eray dashboard ls           # same table, no opening (scriptable; --json too)
+eray dashboard open trainer1 -o   # open (or reuse) trainer1's dashboard; -o also launches the browser
+eray dashboard stop --all   # close every tracked tunnel
+```
+
+Opening a dashboard spawns a tracked **background** port-forward instead of
+blocking your terminal — `eray dashboard ls` shows the local port and PID of
+anything already open, and asking to open the same cluster again reuses that
+forward instead of colliding on the port (the failure mode a bare
+`ray dashboard` has no memory to avoid on its own).
+
+`eray dashboard` also sees generated autoscale profiles that were never
+registered — brought up by hand, or by an eray version before `autoscale up`
+started writing to the registry — listed as `UNREGISTERED`; you can `open`
+one directly with no extra step, or run `eray autoscale up <name>` once
+(idempotent against an already-running cluster) to make it a first-class
+registered entry.
+
+Opening a dashboard forwards **both** Ray's dashboard port (8265) and its GCS
+port (6379) — over one SSH connection — because `ray status`, `eray
+resources`, and `eray tpu status` read cluster state over GCS, not the
+dashboard's HTTP port. (`eray` reads that state the way `ray status` does — a
+pure GCS read via the autoscaler SDK — so it works over a tunnel;
+`ray.init(address=...)` deliberately isn't used, as its driver join can't
+complete over a single tunneled port.) You don't type the address either:
+these commands **auto-detect** the tunnel's local port from eray's own tunnel
+registry, so no `-a` is needed — correct even when the tunnel landed on a
+non-default port because 8265/6379 were busy:
+
+```bash
+eray dashboard open trainer1   # one SSH forwarding dashboard (8265) + GCS (6379)
+eray resources                 # auto-detects the GCS tunnel — no -a
+eray tpu status                # ditto
+eray status                    # auto-detects the dashboard tunnel — no -a
+eray dashboard open trainer1 --no-gcs   # dashboard port only
+```
+
+Tunnels take ~15-20s to establish (SSH negotiation) before the ports answer.
+`eray fleet tunnel` (the foreground, QR-only variant) forwards both ports the
+same way; `--no-gcs` opts out. (`eray tpu health` runs a device probe on every
+worker, so it needs a real driver join and only works on the cluster itself,
+not from a laptop tunnel.)
+
 ## Relationship to eFormer
 
 `eray` was extracted from [`eformer.executor.ray`](https://github.com/erfanzar/eFormer) to provide a focused, standalone Ray execution toolkit. It has **zero dependencies on eFormer or JAX** — you can use it for any Ray-based distributed workload, ML or otherwise.

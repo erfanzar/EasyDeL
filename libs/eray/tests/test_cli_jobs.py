@@ -14,12 +14,12 @@
 
 """Tests for eray.cli.jobs — run/status/logs/stop."""
 
+import sys
 import threading
 import time
 from types import SimpleNamespace
 
 from click.testing import CliRunner
-
 from eray.cli import jobs
 
 
@@ -91,9 +91,62 @@ class TestAddressResolution:
         assert jobs.resolve_address("1.2.3.4:8265") == "http://1.2.3.4:8265"
         assert jobs.resolve_address("1.2.3.4:6379") == "http://1.2.3.4:8265"
         assert jobs.resolve_address("1.2.3.4") == "http://1.2.3.4:8265"
+        # No tunnel tracked (conftest isolates the store) → local default.
         assert jobs.resolve_address(None) == jobs.DEFAULT_DASHBOARD
         monkeypatch.setenv("RAY_ADDRESS", "http://10.0.0.1:8265")
         assert jobs.resolve_address(None) == "http://10.0.0.1:8265"
+
+    def test_none_auto_detects_a_lone_dashboard_tunnel(self, monkeypatch):
+        import eray.provision.tunnel as tunnel_module
+
+        monkeypatch.delenv("RAY_ADDRESS", raising=False)
+        tunnel_module.open_tunnel(
+            "c1",
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            kind="qr",
+            local_port=55084,
+            remote_port=8265,
+        )
+        try:
+            # picks up the tunnel's actual local port, even though it isn't 8265
+            assert jobs.resolve_address(None) == "http://127.0.0.1:55084"
+        finally:
+            tunnel_module.stop_tunnel("c1")
+
+    def test_ray_address_still_wins_over_a_tunnel(self, monkeypatch):
+        import eray.provision.tunnel as tunnel_module
+
+        monkeypatch.setenv("RAY_ADDRESS", "http://10.0.0.1:8265")
+        tunnel_module.open_tunnel(
+            "c1",
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            kind="qr",
+            local_port=55084,
+            remote_port=8265,
+        )
+        try:
+            assert jobs.resolve_address(None) == "http://10.0.0.1:8265"
+        finally:
+            tunnel_module.stop_tunnel("c1")
+
+    def test_multiple_dashboard_tunnels_fall_back_to_default(self, monkeypatch):
+        import eray.provision.tunnel as tunnel_module
+
+        monkeypatch.delenv("RAY_ADDRESS", raising=False)
+        for name, port in (("c1", 55084), ("c2", 55085)):
+            tunnel_module.open_tunnel(
+                name,
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                kind="qr",
+                local_port=port,
+                remote_port=8265,
+            )
+        try:
+            # ambiguous → don't guess; the default keeps existing behavior
+            assert jobs.resolve_address(None) == jobs.DEFAULT_DASHBOARD
+        finally:
+            tunnel_module.stop_tunnel("c1")
+            tunnel_module.stop_tunnel("c2")
 
 
 class TestVerdicts:

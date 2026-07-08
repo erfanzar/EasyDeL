@@ -15,18 +15,25 @@
 """Tests for the cluster-launcher generator: labels, host math, golden config."""
 
 import json
+import subprocess
 
 import eray.provision.launcher as launcher_module
+import pytest
 import yaml
 from click.testing import CliRunner
 from eray.cli.main import cli
 from eray.cli.utils import TpuInfo, build_ray_resource_flags, tpu_resource_labels
 from eray.provision.launcher import (
+    gce_instances_for_cluster,
     generate_configs,
     generate_zone_config,
+    list_profiles,
+    load_profile,
     make_node_type,
+    resolve_profile,
     slice_hosts,
 )
+from eray.provision.registry import ClusterRegistry, LocalBackend
 
 
 class TestSliceHosts:
@@ -160,3 +167,209 @@ class TestAutoscaleCli:
         text = (resources.files("eray.provision") / "templates" / "cluster-template.yaml").read_text()
         assert "available_node_types" in text
         assert "{{IMAGE}}" in text
+
+
+class TestListProfiles:
+    def test_missing_dir_returns_empty(self, tmp_path):
+        assert list_profiles(tmp_path / "does-not-exist") == []
+
+    def test_discovers_valid_profiles(self, tmp_path):
+        (tmp_path / "easydel-us-east5-a.yaml").write_text(
+            "cluster_name: easydel-us-east5-a\nprovider:\n  project_id: proj\n  availability_zone: us-east5-a\n"
+        )
+        profiles = list_profiles(tmp_path)
+        assert len(profiles) == 1
+        profile = profiles[0]
+        assert profile.name == "easydel-us-east5-a"
+        assert profile.cluster_name == "easydel-us-east5-a"
+        assert profile.project == "proj"
+        assert profile.zone == "us-east5-a"
+        assert profile.path == tmp_path / "easydel-us-east5-a.yaml"
+
+    def test_skips_unparsable_and_nameless_files(self, tmp_path):
+        (tmp_path / "bad.yaml").write_text("cluster_name: [unterminated\n")
+        (tmp_path / "no-name.yaml").write_text("provider:\n  project_id: proj\n")
+        (tmp_path / "ok.yaml").write_text("cluster_name: ok\n")
+        assert [p.name for p in list_profiles(tmp_path)] == ["ok"]
+
+    def test_sorted_by_name(self, tmp_path):
+        (tmp_path / "b-zone.yaml").write_text("cluster_name: b-zone\n")
+        (tmp_path / "a-zone.yaml").write_text("cluster_name: a-zone\n")
+        assert [p.name for p in list_profiles(tmp_path)] == ["a-zone", "b-zone"]
+
+
+class TestLoadProfile:
+    def test_missing_file_is_skipped_not_raised(self, tmp_path):
+        assert load_profile(tmp_path / "ghost.yaml") is None
+
+    def test_parses_a_profile(self, tmp_path):
+        path = tmp_path / "x.yaml"
+        path.write_text("cluster_name: x\nprovider:\n  project_id: p\n  availability_zone: z\n")
+        profile = load_profile(path)
+        assert profile.name == "x"
+        assert profile.project == "p"
+        assert profile.zone == "z"
+
+
+class TestResolveProfile:
+    def test_resolves_an_existing_path(self, tmp_path):
+        path = tmp_path / "x.yaml"
+        path.write_text("cluster_name: x\n")
+        assert resolve_profile(str(path), tmp_path) == path
+
+    def test_resolves_a_bare_profile_name(self, tmp_path):
+        path = tmp_path / "easydel-us-east5-a.yaml"
+        path.write_text("cluster_name: easydel-us-east5-a\n")
+        assert resolve_profile("easydel-us-east5-a", tmp_path) == path
+
+    def test_unknown_name_lists_known_profiles(self, tmp_path):
+        (tmp_path / "a.yaml").write_text("cluster_name: a\n")
+        with pytest.raises(FileNotFoundError, match="known profiles: a"):
+            resolve_profile("ghost", tmp_path)
+
+    def test_unknown_name_no_profiles_says_none(self, tmp_path):
+        with pytest.raises(FileNotFoundError, match="known profiles: none"):
+            resolve_profile("ghost", tmp_path)
+
+
+class TestGceInstancesForCluster:
+    def test_builds_the_cluster_label_filter(self, monkeypatch):
+        captured = {}
+
+        def fake_gcloud_json(args, **kwargs):
+            captured["args"] = args
+            return [{"name": "head-0", "status": "RUNNING"}]
+
+        monkeypatch.setattr(launcher_module, "gcloud_json", fake_gcloud_json)
+        result = gce_instances_for_cluster("easydel-us-east5-a", project="proj", zone="us-east5-a")
+        assert result == [{"name": "head-0", "status": "RUNNING"}]
+        args = captured["args"]
+        assert args[args.index("--filter") + 1] == "labels.ray-cluster-name=easydel-us-east5-a"
+        assert args[args.index("--zones") + 1] == "us-east5-a"
+        assert args[args.index("--project") + 1] == "proj"
+
+    def test_gcloud_failure_returns_empty(self, monkeypatch):
+        def raise_err(args, **kwargs):
+            raise subprocess.CalledProcessError(1, "gcloud")
+
+        monkeypatch.setattr(launcher_module, "gcloud_json", raise_err)
+        assert gce_instances_for_cluster("x", project="p", zone="z") == []
+
+
+class TestAutoscaleUpDownStatusCli:
+    """`eray autoscale up/down/status` with no CONFIG: pickers + registry wiring."""
+
+    @pytest.fixture
+    def local_registry(self, tmp_path, monkeypatch):
+        reg = ClusterRegistry(LocalBackend(tmp_path / "clusters.json"))
+        monkeypatch.setattr(ClusterRegistry, "from_config", classmethod(lambda cls: reg))
+        return reg
+
+    @pytest.fixture
+    def profile_dir(self, tmp_path):
+        profiles_dir = tmp_path / "profiles"
+        profiles_dir.mkdir()
+        (profiles_dir / "easydel-us-east5-a.yaml").write_text(
+            "cluster_name: easydel-us-east5-a\nprovider:\n  project_id: proj\n  availability_zone: us-east5-a\n"
+        )
+        return profiles_dir
+
+    def test_up_auto_selects_the_only_profile_and_registers_it(self, local_registry, profile_dir, monkeypatch):
+        monkeypatch.setattr(launcher_module, "ray_up", lambda path, yes=True: None)
+        monkeypatch.setattr(launcher_module, "launcher_head_ip", lambda path: "10.0.0.9")
+        result = CliRunner().invoke(cli, ["autoscale", "up", "--dir", str(profile_dir), "-y"])
+        assert result.exit_code == 0, result.output
+        assert "one profile found" in result.output
+        record = local_registry.get("easydel-us-east5-a")
+        assert record is not None
+        assert record.kind == "launcher"
+        assert record.state == "HEALTHY"
+        assert record.head_ip == "10.0.0.9"
+        assert record.project == "proj"
+        assert record.zone == "us-east5-a"
+        assert record.last_up_ts is not None
+
+    def test_up_multiple_profiles_prompts_and_uses_the_chosen_one(self, local_registry, tmp_path, monkeypatch):
+        profiles_dir = tmp_path / "profiles"
+        profiles_dir.mkdir()
+        (profiles_dir / "a-zone.yaml").write_text("cluster_name: a-zone\n")
+        (profiles_dir / "b-zone.yaml").write_text("cluster_name: b-zone\n")
+        called = {}
+        monkeypatch.setattr(launcher_module, "ray_up", lambda path, yes=True: called.setdefault("path", path))
+        monkeypatch.setattr(launcher_module, "launcher_head_ip", lambda path: "10.0.0.9")
+        result = CliRunner().invoke(cli, ["autoscale", "up", "--dir", str(profiles_dir), "-y"], input="2\n")
+        assert result.exit_code == 0, result.output
+        assert str(called["path"]).endswith("b-zone.yaml")
+        assert local_registry.get("b-zone") is not None
+        assert local_registry.get("a-zone") is None
+
+    def test_up_no_profiles_errors_pointing_at_generate(self, local_registry, tmp_path):
+        result = CliRunner().invoke(cli, ["autoscale", "up", "--dir", str(tmp_path / "empty"), "-y"])
+        assert result.exit_code != 0
+        assert "eray autoscale generate" in result.output
+
+    def test_up_by_bare_profile_name_skips_the_picker(self, local_registry, profile_dir, monkeypatch):
+        monkeypatch.setattr(launcher_module, "ray_up", lambda path, yes=True: None)
+        monkeypatch.setattr(launcher_module, "launcher_head_ip", lambda path: "10.0.0.9")
+        result = CliRunner().invoke(cli, ["autoscale", "up", "easydel-us-east5-a", "--dir", str(profile_dir), "-y"])
+        assert result.exit_code == 0, result.output
+        assert "Multiple profiles" not in result.output
+
+    def test_down_stamps_down_state_and_timestamp(self, local_registry, profile_dir, monkeypatch):
+        monkeypatch.setattr(launcher_module, "ray_up", lambda path, yes=True: None)
+        monkeypatch.setattr(launcher_module, "launcher_head_ip", lambda path: "10.0.0.9")
+        up = CliRunner().invoke(cli, ["autoscale", "up", "--dir", str(profile_dir), "-y"])
+        assert up.exit_code == 0, up.output
+
+        monkeypatch.setattr(launcher_module, "ray_down", lambda path, yes=True: None)
+        down = CliRunner().invoke(cli, ["autoscale", "down", "--dir", str(profile_dir), "-y"])
+        assert down.exit_code == 0, down.output
+
+        record = local_registry.get("easydel-us-east5-a")
+        assert record.state == "DOWN"
+        assert record.last_down_ts is not None
+
+    def test_up_after_down_clears_stale_last_down_ts(self, local_registry, profile_dir, monkeypatch):
+        # A fresh `up` must invalidate any earlier "died at T" history, or a
+        # live cluster can flash DOWN/"died ... ago" if the live GCE probe
+        # runs in the window before the new head instance is discoverable
+        # (launcher_row_status falls back to last_down_ts when the probe
+        # finds no head instance yet).
+        monkeypatch.setattr(launcher_module, "ray_up", lambda path, yes=True: None)
+        monkeypatch.setattr(launcher_module, "launcher_head_ip", lambda path: "10.0.0.9")
+        monkeypatch.setattr(launcher_module, "ray_down", lambda path, yes=True: None)
+
+        CliRunner().invoke(cli, ["autoscale", "up", "--dir", str(profile_dir), "-y"])
+        CliRunner().invoke(cli, ["autoscale", "down", "--dir", str(profile_dir), "-y"])
+        assert local_registry.get("easydel-us-east5-a").last_down_ts is not None
+
+        up_again = CliRunner().invoke(cli, ["autoscale", "up", "--dir", str(profile_dir), "-y"])
+        assert up_again.exit_code == 0, up_again.output
+
+        record = local_registry.get("easydel-us-east5-a")
+        assert record.state == "HEALTHY"
+        assert record.last_down_ts is None
+
+    def test_status_no_config_shows_unregistered_profile(self, local_registry, profile_dir):
+        result = CliRunner().invoke(cli, ["autoscale", "status", "--dir", str(profile_dir)])
+        assert result.exit_code == 0, result.output
+        assert "easydel-us-east5-a" in result.output
+        assert "UNREGISTERED" in result.output
+
+    def test_status_no_config_json_after_down(self, local_registry, profile_dir, monkeypatch):
+        monkeypatch.setattr(launcher_module, "ray_up", lambda path, yes=True: None)
+        monkeypatch.setattr(launcher_module, "launcher_head_ip", lambda path: "10.0.0.9")
+        CliRunner().invoke(cli, ["autoscale", "up", "--dir", str(profile_dir), "-y"])
+        monkeypatch.setattr(launcher_module, "ray_down", lambda path, yes=True: None)
+        CliRunner().invoke(cli, ["autoscale", "down", "--dir", str(profile_dir), "-y"])
+
+        result = CliRunner().invoke(cli, ["autoscale", "status", "--dir", str(profile_dir), "--json"])
+        assert result.exit_code == 0, result.output
+        rows = json.loads(result.output)
+        assert rows[0]["status"] == "DOWN"
+        assert rows[0]["since"].startswith("died")
+
+    def test_status_no_profiles_no_registry_says_so(self, local_registry, tmp_path):
+        result = CliRunner().invoke(cli, ["autoscale", "status", "--dir", str(tmp_path / "empty")])
+        assert result.exit_code == 0, result.output
+        assert "eray autoscale generate" in result.output

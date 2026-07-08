@@ -40,6 +40,7 @@ scheduling contract.
 from __future__ import annotations
 
 import subprocess
+from dataclasses import dataclass
 from importlib import resources as importlib_resources
 from pathlib import Path
 
@@ -50,6 +51,7 @@ from .qr import default_runtime_version
 
 DEFAULT_IMAGE = "ghcr.io/erfanzar/easydel:latest-tpu"
 DEFAULT_FAMILIES = ("v4", "v5e", "v5p", "v6e")
+DEFAULT_OUTPUT_DIR = Path("~/.eray/autoscale").expanduser()
 
 #: Physical chips per host by family (drives node-type host math). v2-v5p
 #: hosts carry 4 chips; v5e hosts carry 8; v6e ships in 4-chip host machines.
@@ -249,6 +251,155 @@ def generate_configs(
     return written
 
 
+@dataclass(frozen=True)
+class AutoscaleProfile:
+    """One generated cluster-launcher YAML, discovered on disk.
+
+    Attributes:
+        name: File stem (e.g. ``"easydel-us-east5-a"``) — the identifier
+            `eray autoscale up/down/status` accept in place of a full path,
+            and the key launcher-kind clusters are registered under in the
+            fleet registry.
+        path: Full YAML path.
+        cluster_name: The ``cluster_name`` field inside the YAML (Ray's own
+            identity for the cluster; normally equal to ``name``).
+        project: GCP project id from ``provider.project_id``.
+        zone: GCP zone from ``provider.availability_zone``.
+    """
+
+    name: str
+    path: Path
+    cluster_name: str
+    project: str | None
+    zone: str | None
+
+
+def load_profile(path: Path | str) -> AutoscaleProfile | None:
+    """Parse one cluster-launcher YAML into a profile.
+
+    Args:
+        path: YAML path (need not be under a discovered output dir — this
+            is also how `eray autoscale up/down` re-derive a profile after
+            resolving an explicit CONFIG path, for the fleet-registry
+            upsert that follows).
+
+    Returns:
+        The profile, or None (with a `warning()`) if the file doesn't parse
+        or has no ``cluster_name``.
+    """
+    from ..cli.utils import warning
+
+    path = Path(path)
+    try:
+        config = yaml.safe_load(path.read_text()) or {}
+    except (yaml.YAMLError, OSError) as exc:
+        warning(f"skipping {path}: {exc}")
+        return None
+    cluster_name = config.get("cluster_name")
+    if not cluster_name:
+        warning(f"skipping {path}: no cluster_name")
+        return None
+    provider = config.get("provider") or {}
+    return AutoscaleProfile(
+        name=path.stem,
+        path=path,
+        cluster_name=str(cluster_name),
+        project=provider.get("project_id"),
+        zone=provider.get("availability_zone"),
+    )
+
+
+def list_profiles(output_dir: Path | str = DEFAULT_OUTPUT_DIR) -> list[AutoscaleProfile]:
+    """Discover generated cluster-launcher YAMLs.
+
+    Args:
+        output_dir: Directory to scan (default: where `generate_configs`
+            writes by default).
+
+    Returns:
+        One profile per parsable ``*.yaml`` file, sorted by name. A file
+        that fails to parse or has no ``cluster_name`` is skipped (see
+        `load_profile`) rather than raised — one bad file shouldn't break
+        the picker for every other profile.
+    """
+    dirp = Path(output_dir).expanduser()
+    if not dirp.exists():
+        return []
+    profiles = (load_profile(path) for path in sorted(dirp.glob("*.yaml")))
+    return [p for p in profiles if p is not None]
+
+
+def resolve_profile(config_or_name: str, output_dir: Path | str = DEFAULT_OUTPUT_DIR) -> Path:
+    """Resolve a CONFIG argument to a YAML path.
+
+    Args:
+        config_or_name: Either an existing path to a cluster-launcher YAML,
+            or a bare profile name (a YAML's file stem, e.g.
+            ``"easydel-us-east5-a"``) to look up under `output_dir`.
+        output_dir: Directory profiles are discovered in.
+
+    Returns:
+        The resolved YAML path.
+
+    Raises:
+        FileNotFoundError: If `config_or_name` is neither an existing path
+            nor a known profile name; the error lists what *was* found.
+    """
+    direct = Path(config_or_name).expanduser()
+    if direct.exists():
+        return direct
+    profiles = list_profiles(output_dir)
+    for profile in profiles:
+        if profile.name == config_or_name:
+            return profile.path
+    known = ", ".join(p.name for p in profiles) or "none"
+    raise FileNotFoundError(
+        f"{config_or_name!r} is not a file and not a known profile in {output_dir} (known profiles: {known})"
+    )
+
+
+def gce_instances_for_cluster(cluster_name: str, *, project: str, zone: str) -> list[dict]:
+    """Live GCE instances Ray's GCP provider created for a launcher cluster.
+
+    Ray's GCP node provider labels every instance it creates with
+    ``ray-cluster-name`` (and ``ray-node-type`` head/worker) —
+    ``ray.autoscaler.tags``. ``ray down`` deletes instances outright, so an
+    empty result means the cluster is down (or never brought up), not merely
+    stopped — there is nothing left in GCP to distinguish the two.
+
+    Args:
+        cluster_name: The launcher config's ``cluster_name`` (usually equal
+            to the eray profile name, but the YAML is the source of truth).
+        project: GCP project id.
+        zone: GCP zone the cluster-launcher config targets.
+
+    Returns:
+        Raw gcloud dicts (``status``, ``creationTimestamp``, ``name``,
+        ``labels``, ...) for every instance still alive for that cluster;
+        empty when down, when gcloud itself is unavailable, or on any other
+        probe failure — this is a best-effort status enrichment for
+        `eray autoscale status`/`eray dashboard`, not authoritative, so it
+        degrades to "unknown" instead of crashing those commands.
+    """
+    try:
+        raw = gcloud_json(
+            [
+                "compute",
+                "instances",
+                "list",
+                "--filter",
+                f"labels.ray-cluster-name={cluster_name}",
+                "--zones",
+                zone,
+                "--project",
+                project,
+            ]
+        )
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return []
+    return raw if isinstance(raw, list) else []
+
+
 def ray_up(config_path: str | Path, *, yes: bool = True) -> None:
     """Bring a launcher cluster up (`ray up`).
 
@@ -301,13 +452,19 @@ __all__ = [
     "CHIPS_PER_HOST_BY_FAMILY",
     "DEFAULT_FAMILIES",
     "DEFAULT_IMAGE",
+    "DEFAULT_OUTPUT_DIR",
+    "AutoscaleProfile",
+    "gce_instances_for_cluster",
     "generate_configs",
     "generate_zone_config",
     "launcher_head_ip",
+    "list_profiles",
     "list_tpu_zones",
     "list_zone_accelerator_types",
+    "load_profile",
     "make_node_type",
     "ray_down",
     "ray_up",
+    "resolve_profile",
     "slice_hosts",
 ]

@@ -20,7 +20,9 @@ import json
 import logging
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
+from datetime import datetime
 from typing import ClassVar
 
 logger = logging.getLogger("eray.cli")
@@ -93,6 +95,75 @@ def error(msg: str) -> None:
 
 
 # ── Command execution ────────────────────────────────────────────
+
+
+def print_table(rows: list[dict]) -> None:
+    """Print a list of homogeneous dicts as an aligned table on stdout.
+
+    Args:
+        rows: Rows; keys of the first row define the columns. A no-op on an
+            empty list.
+    """
+    if not rows:
+        return
+    keys = list(rows[0])
+    widths = {k: max(len(str(r[k])) for r in [*rows, dict.fromkeys(keys, k)]) for k in keys}
+    print("  ".join(f"{k.upper():<{widths[k]}}" for k in keys))
+    for r in rows:
+        print("  ".join(f"{r[k]!s:<{widths[k]}}" for k in keys))
+
+
+def format_duration(seconds: float) -> str:
+    """A short human-readable duration, coarsest two units (e.g. "2d3h", "5m").
+
+    Args:
+        seconds: Duration in seconds (negative clamps to 0).
+
+    Returns:
+        The formatted duration.
+    """
+    total = max(int(seconds), 0)
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, rem = divmod(rem, 60)
+    if days:
+        return f"{days}d{hours}h"
+    if hours:
+        return f"{hours}h{minutes}m"
+    if minutes:
+        return f"{minutes}m"
+    return f"{rem}s"
+
+
+def format_ago(ts: float | None) -> str | None:
+    """ "<duration> ago" for a past unix timestamp.
+
+    Args:
+        ts: Unix timestamp, or None.
+
+    Returns:
+        The formatted string, or None when `ts` is None.
+    """
+    if ts is None:
+        return None
+    return f"{format_duration(time.time() - ts)} ago"
+
+
+def parse_gcp_timestamp(value: str | None) -> float | None:
+    """A GCP RFC3339 timestamp (e.g. ``creationTimestamp``) as a unix time.
+
+    Args:
+        value: The timestamp string, or None.
+
+    Returns:
+        Seconds since epoch, or None if `value` is falsy or unparsable.
+    """
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value).timestamp()
+    except ValueError:
+        return None
 
 
 # ── gcloud wrappers ──────────────────────────────────────────────

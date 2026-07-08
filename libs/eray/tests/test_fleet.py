@@ -26,6 +26,7 @@ import pytest
 from click.testing import CliRunner
 from eray.cli.main import cli
 from eray.provision.registry import (
+    SCHEMA_VERSION,
     ClusterRecord,
     ClusterRegistry,
     ConflictError,
@@ -72,6 +73,34 @@ class TestLocalRegistry:
     def test_mutate_unknown_raises(self, tmp_path):
         with pytest.raises(KeyError, match="not registered"):
             make_registry(tmp_path).mutate_record("ghost", lambda r: None)
+
+    def test_last_up_down_ts_default_none_and_roundtrip(self, tmp_path):
+        reg = make_registry(tmp_path)
+        reg.upsert(make_record())
+        assert reg.get("trainer1").last_up_ts is None
+        assert reg.get("trainer1").last_down_ts is None
+
+        reg.mutate_record("trainer1", lambda r: setattr(r, "last_up_ts", 123.5))
+        reg.mutate_record("trainer1", lambda r: setattr(r, "last_down_ts", 456.5))
+        loaded = reg.get("trainer1")
+        assert loaded.last_up_ts == 123.5
+        assert loaded.last_down_ts == 456.5
+
+    def test_local_backend_custom_empty_doc_shape(self, tmp_path):
+        # provision.tunnel reuses LocalBackend with empty_doc=dict for a
+        # flat {name: session} store instead of the fleet's own
+        # {version, clusters, lease} document — verify the factory is
+        # actually honored for both a missing file and an update.
+        backend = LocalBackend(tmp_path / "flat.json", empty_doc=dict)
+        doc, _ = backend.read()
+        assert doc == {}
+        backend.update(lambda d: d.__setitem__("a", {"x": 1}))
+        assert backend.read()[0] == {"a": {"x": 1}}
+
+    def test_default_empty_doc_unchanged_for_fleet_shape(self, tmp_path):
+        backend = LocalBackend(tmp_path / "clusters.json")
+        doc, _ = backend.read()
+        assert doc == {"version": SCHEMA_VERSION, "clusters": {}, "lease": None}
 
     def test_forward_compat_unknown_fields_preserved(self, tmp_path):
         reg = make_registry(tmp_path)
@@ -384,18 +413,129 @@ class TestFleetCli:
 
     def test_tunnel_execs_gcloud_ssh_forward(self, local_registry):
         local_registry.upsert(make_record())
+        # --no-gcs isolates the base single-port forward; the default (GCS
+        # too) is covered by test_tunnel_gcs_forwards_both_ports below.
         with mock.patch("os.execvp") as execvp:
-            result = CliRunner().invoke(cli, ["fleet", "tunnel", "trainer1", "--local-port", "9000"])
+            result = CliRunner().invoke(cli, ["fleet", "tunnel", "trainer1", "--local-port", "9000", "--no-gcs"])
         assert result.exit_code == 0, result.output
         argv = execvp.call_args.args[1]
         assert argv[:6] == ["gcloud", "compute", "tpus", "tpu-vm", "ssh", "trainer1"]
         assert "--worker" in argv and argv[argv.index("--worker") + 1] == "0"
         assert argv[-3:] == ["-N", "-L", "9000:localhost:8265"]
 
+    def test_tunnel_forwards_gcs_by_default(self, local_registry):
+        local_registry.upsert(make_record())
+        with mock.patch("os.execvp") as execvp:
+            result = CliRunner().invoke(cli, ["fleet", "tunnel", "trainer1"])
+        assert result.exit_code == 0, result.output
+        argv = execvp.call_args.args[1]
+        # no flag needed: both the dashboard and GCS ports are forwarded
+        assert argv.count("-L") == 2
+        assert "8265:localhost:8265" in argv
+        assert "6379:localhost:6379" in argv
+
     def test_tunnel_unknown_cluster_errors(self, local_registry):
         result = CliRunner().invoke(cli, ["fleet", "tunnel", "nope"])
         assert result.exit_code != 0
         assert "unknown cluster" in result.output
+
+    def test_tunnel_rejects_launcher_kind_cluster(self, local_registry):
+        # eray autoscale up/down registers kind="launcher" clusters into
+        # this same registry; `fleet tunnel` only knows how to build a
+        # gcloud tpu-vm ssh forward (qr-kind), so it must reject a
+        # launcher-kind record instead of building a bogus command.
+        local_registry.upsert(make_record(name="lstack", kind="launcher"))
+        with mock.patch("os.execvp") as execvp:
+            result = CliRunner().invoke(cli, ["fleet", "tunnel", "lstack"])
+        assert result.exit_code != 0
+        assert "eray dashboard open lstack" in result.output
+        execvp.assert_not_called()
+
+    def test_tunnel_missing_project_or_zone_errors_cleanly(self, local_registry):
+        # A qr record lacking project/zone would splice None into the gcloud
+        # argv and make os.execvp raise an opaque TypeError; fail clean.
+        local_registry.upsert(make_record(name="halfknown", kind="qr", project=None, zone=None))
+        with mock.patch("os.execvp") as execvp:
+            result = CliRunner().invoke(cli, ["fleet", "tunnel", "halfknown"])
+        assert result.exit_code != 0
+        assert "missing project/zone" in result.output
+        execvp.assert_not_called()
+
+    def test_tunnel_gcs_forwards_both_ports_over_one_connection(self, local_registry):
+        # ray status / eray resources / any raw ray.init() needs the GCS
+        # port (6379), not the dashboard's — --gcs must add a second -L to
+        # the SAME ssh invocation (fleet tunnel is a single foreground
+        # process, it can't spawn a second one).
+        local_registry.upsert(make_record())
+        with mock.patch("os.execvp") as execvp:
+            result = CliRunner().invoke(cli, ["fleet", "tunnel", "trainer1", "--gcs"])
+        assert result.exit_code == 0, result.output
+        argv = execvp.call_args.args[1]
+        assert argv.count("-L") == 2
+        assert "8265:localhost:8265" in argv
+        assert "6379:localhost:6379" in argv
+
+    def test_tunnel_gcs_custom_ports(self, local_registry):
+        local_registry.upsert(make_record())
+        with mock.patch("os.execvp") as execvp:
+            result = CliRunner().invoke(
+                cli, ["fleet", "tunnel", "trainer1", "--gcs", "--gcs-port", "6380", "--gcs-local-port", "16380"]
+            )
+        assert result.exit_code == 0, result.output
+        argv = execvp.call_args.args[1]
+        assert "16380:localhost:6380" in argv
+
+
+class TestQrTunnelArgv:
+    """qr_tunnel_argv is the primitive both `eray fleet tunnel` and
+    `eray dashboard` build their SSH forward from — a regression guard that
+    it still produces exactly what `fleet tunnel` built inline before the
+    extraction (see test_tunnel_execs_gcloud_ssh_forward above)."""
+
+    def test_builds_the_gcloud_ssh_forward(self):
+        record = make_record(name="trainer1", project="proj", zone="us-east5-a")
+        argv = fleet_module.qr_tunnel_argv(record, remote_port=8265, local_port=9000)
+        assert argv == [
+            "gcloud",
+            "compute",
+            "tpus",
+            "tpu-vm",
+            "ssh",
+            "trainer1",
+            "--project",
+            "proj",
+            "--zone",
+            "us-east5-a",
+            "--worker",
+            "0",
+            "--",
+            "-N",
+            "-L",
+            "9000:localhost:8265",
+        ]
+
+    def test_local_and_remote_port_can_differ(self):
+        record = make_record(name="trainer1")
+        argv = fleet_module.qr_tunnel_argv(record, remote_port=8265, local_port=9001)
+        assert argv[-1] == "9001:localhost:8265"
+
+    def test_extra_ports_add_more_L_flags_on_the_same_connection(self):
+        record = make_record(name="trainer1")
+        argv = fleet_module.qr_tunnel_argv(
+            record, remote_port=8265, local_port=8265, extra_ports=((6379, 6379), (1234, 5678))
+        )
+        assert argv.count("-L") == 3
+        assert "8265:localhost:8265" in argv
+        assert "6379:localhost:6379" in argv
+        assert "1234:localhost:5678" in argv
+        # single ssh invocation (one "--" separator), not three
+        assert argv.count("--") == 1
+
+    def test_no_extra_ports_matches_pre_extension_behavior(self):
+        record = make_record(name="trainer1")
+        with_default = fleet_module.qr_tunnel_argv(record, remote_port=8265, local_port=9000)
+        with_empty = fleet_module.qr_tunnel_argv(record, remote_port=8265, local_port=9000, extra_ports=())
+        assert with_default == with_empty
 
 
 class TestRunClusterFlag:

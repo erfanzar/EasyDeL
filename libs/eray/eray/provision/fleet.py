@@ -47,6 +47,10 @@ if TYPE_CHECKING:
     from ..cli.utils import TpuInfo
 
 RAY_HEAD_PORT = 6379
+#: Remote port the Ray dashboard / Jobs API listens on. Canonical home for
+#: this constant so the CLI modules (tpu/dashboard/jobs) import it rather than
+#: each re-declaring 8265 under a different name.
+RAY_DASHBOARD_PORT = 8265
 
 
 def head_reachable(ip: str, *, port: int = RAY_HEAD_PORT, timeout: float = 2.0) -> bool:
@@ -244,6 +248,54 @@ def _bootstrap_if_needed(record: ClusterRecord, node: TpuInfo, registry: Cluster
     if failed:
         raise RuntimeError(f"bootstrap_cmd failed on host(s) {failed} of {record.name}")
     registry.mutate_record(record.name, lambda r: setattr(r, "bootstrapped_generation", record.generation))
+
+
+def qr_tunnel_argv(
+    record: ClusterRecord, *, remote_port: int, local_port: int, extra_ports: tuple[tuple[int, int], ...] = ()
+) -> list[str]:
+    """Build the gcloud SSH argv that forwards a QR-kind cluster's head port.
+
+    Ray heads listen on internal VPC IPs, so from outside the VPC (a laptop)
+    the dashboard/Jobs API are unreachable directly; this wraps the gcloud
+    TPU SSH port-forward (worker 0 is always the head). Shared between
+    `eray fleet tunnel` (foreground) and `eray dashboard` (tracked
+    background), so the two can't drift.
+
+    Args:
+        record: The registered cluster (its name/project/zone identify the
+            TPU node).
+        remote_port: Port on the head to forward (Ray dashboard: 8265).
+        local_port: Local port to bind.
+        extra_ports: Additional ``(local_port, remote_port)`` pairs to
+            forward over the same SSH connection — e.g. the GCS port
+            (`RAY_HEAD_PORT`, 6379) alongside the dashboard port, so
+            `ray status`/`ray.init()`-based tools work through one tunnel.
+
+    Returns:
+        Full argv for ``gcloud compute tpus tpu-vm ssh ... -- -N -L ...``,
+        with one ``-L`` flag per forwarded port.
+    """
+    argv = [
+        "gcloud",
+        "compute",
+        "tpus",
+        "tpu-vm",
+        "ssh",
+        record.name,
+        "--project",
+        record.project,
+        "--zone",
+        record.zone,
+        "--worker",
+        "0",
+        "--",
+        "-N",
+        "-L",
+        f"{local_port}:localhost:{remote_port}",
+    ]
+    for extra_local, extra_remote in extra_ports:
+        argv += ["-L", f"{extra_local}:localhost:{extra_remote}"]
+    return argv
 
 
 def fleet_status(registry: ClusterRegistry | None = None, *, probe: bool = True) -> list[dict]:
