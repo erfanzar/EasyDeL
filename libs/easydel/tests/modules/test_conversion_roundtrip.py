@@ -33,12 +33,11 @@ Run all:             ``pytest tests/modules/test_conversion_roundtrip.py``
 
 from __future__ import annotations
 
+import easydel as ed
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
-import easydel as ed
 
 jax.config.update("jax_platform_name", "cpu")
 
@@ -89,9 +88,12 @@ MOE_MODELS = [
     "qwen3_5_moe",
     "deepseek_v2",
     "deepseek_v3",
+    "deepseek_v4",
+    "mistral4",
     "dbrx",
     "glm4_moe",
     "gpt_oss",
+    "hy_v3",
     "minimax",
 ]
 # State-space / hybrid models with idiosyncratic param layouts (separate follow-up).

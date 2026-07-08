@@ -254,6 +254,11 @@ _import_structure = {
         "DeepseekV3ForCausalLM",
         "DeepseekV3Model",
     ],
+    "modules.deepseek_v4": [
+        "DeepseekV4Config",
+        "DeepseekV4ForCausalLM",
+        "DeepseekV4Model",
+    ],
     "modules.dspark": [
         "DSparkAttention",
         "DSparkConfig",
@@ -410,11 +415,32 @@ _import_structure = {
         "Grok1ForCausalLM",
         "Grok1Model",
     ],
+    "modules.hunyuan_vl": [
+        "HunYuanVLConfig",
+        "HunYuanVLForConditionalGeneration",
+        "HunYuanVLModel",
+        "HunYuanVLTextConfig",
+        "HunYuanVLTextModel",
+        "HunYuanVLVisionConfig",
+        "HunYuanVLVisionModel",
+    ],
+    "modules.hy_v3": [
+        "HyV3Config",
+        "HyV3ForCausalLM",
+        "HyV3Model",
+    ],
     "modules.internlm2": [
         "InternLM2Config",
         "InternLM2ForCausalLM",
         "InternLM2ForSequenceClassification",
         "InternLM2Model",
+    ],
+    "modules.internvl": [
+        "InternVLConfig",
+        "InternVLForConditionalGeneration",
+        "InternVLModel",
+        "InternVLVisionConfig",
+        "InternVLVisionModel",
     ],
     "modules.kimi_linear": [
         "KimiLinearConfig",
@@ -462,6 +488,16 @@ _import_structure = {
         "MiniMaxForCausalLM",
         "MiniMaxModel",
     ],
+    "modules.minimax_m3_vl": [
+        "MiniMaxM3VLConfig",
+        "MiniMaxM3VLForCausalLM",
+        "MiniMaxM3VLForConditionalGeneration",
+        "MiniMaxM3VLModel",
+        "MiniMaxM3VLTextConfig",
+        "MiniMaxM3VLTextModel",
+        "MiniMaxM3VLVisionConfig",
+        "MiniMaxM3VLVisionModel",
+    ],
     "modules.mistral": [
         "MistralConfig",
         "MistralForCausalLM",
@@ -473,6 +509,12 @@ _import_structure = {
         "Mistral3ForConditionalGeneration",
         "Mistral3Model",
         "Mistral3Tokenizer",
+    ],
+    "modules.mistral4": [
+        "Mistral4Config",
+        "Mistral4ForCausalLM",
+        "Mistral4ForSequenceClassification",
+        "Mistral4Model",
     ],
     "modules.mixtral": [
         "MixtralConfig",
@@ -512,6 +554,11 @@ _import_structure = {
         "OPTConfig",
         "OPTForCausalLM",
         "OPTModel",
+    ],
+    "modules.paligemma": [
+        "PaliGemmaConfig",
+        "PaliGemmaForConditionalGeneration",
+        "PaliGemmaModel",
     ],
     "modules.phi": [
         "PhiConfig",
@@ -901,6 +948,7 @@ if _tp.TYPE_CHECKING:
     )
     from .modules.deepseek_v2 import DeepseekV2Config, DeepseekV2ForCausalLM, DeepseekV2Model
     from .modules.deepseek_v3 import DeepseekV3Config, DeepseekV3ForCausalLM, DeepseekV3Model
+    from .modules.deepseek_v4 import DeepseekV4Config, DeepseekV4ForCausalLM, DeepseekV4Model
     from .modules.dflash import DFlashAttention, DFlashConfig, DFlashDecoderLayer, DFlashForwardOutput, DFlashModel
     from .modules.dspark import DSparkAttention, DSparkConfig, DSparkDecoderLayer, DSparkForwardOutput, DSparkModel
     from .modules.eagle3 import Eagle3Attention, Eagle3Config, Eagle3DecoderLayer, Eagle3ForwardOutput, Eagle3Model
@@ -970,11 +1018,28 @@ if _tp.TYPE_CHECKING:
     from .modules.gpt_neox import GPTNeoXConfig, GPTNeoXForCausalLM, GPTNeoXModel
     from .modules.gpt_oss import GptOssConfig, GptOssForCausalLM, GptOssForSequenceClassification, GptOssModel
     from .modules.grok_1 import Grok1Config, Grok1ForCausalLM, Grok1Model
+    from .modules.hunyuan_vl import (
+        HunYuanVLConfig,
+        HunYuanVLForConditionalGeneration,
+        HunYuanVLModel,
+        HunYuanVLTextConfig,
+        HunYuanVLTextModel,
+        HunYuanVLVisionConfig,
+        HunYuanVLVisionModel,
+    )
+    from .modules.hy_v3 import HyV3Config, HyV3ForCausalLM, HyV3Model
     from .modules.internlm2 import (
         InternLM2Config,
         InternLM2ForCausalLM,
         InternLM2ForSequenceClassification,
         InternLM2Model,
+    )
+    from .modules.internvl import (
+        InternVLConfig,
+        InternVLForConditionalGeneration,
+        InternVLModel,
+        InternVLVisionConfig,
+        InternVLVisionModel,
     )
     from .modules.kimi_linear import KimiLinearConfig, KimiLinearForCausalLM, KimiLinearModel
     from .modules.kimi_vl import KimiVLConfig, KimiVLForConditionalGeneration, MoonViTConfig
@@ -993,8 +1058,24 @@ if _tp.TYPE_CHECKING:
     from .modules.mamba import MambaConfig, MambaForCausalLM, MambaModel
     from .modules.mamba2 import Mamba2Config, Mamba2ForCausalLM, Mamba2Model
     from .modules.minimax import MiniMaxConfig, MiniMaxForCausalLM, MiniMaxModel
+    from .modules.minimax_m3_vl import (
+        MiniMaxM3VLConfig,
+        MiniMaxM3VLForCausalLM,
+        MiniMaxM3VLForConditionalGeneration,
+        MiniMaxM3VLModel,
+        MiniMaxM3VLTextConfig,
+        MiniMaxM3VLTextModel,
+        MiniMaxM3VLVisionConfig,
+        MiniMaxM3VLVisionModel,
+    )
     from .modules.mistral import MistralConfig, MistralForCausalLM, MistralForSequenceClassification, MistralModel
     from .modules.mistral3 import Mistral3Config, Mistral3ForConditionalGeneration, Mistral3Model, Mistral3Tokenizer
+    from .modules.mistral4 import (
+        Mistral4Config,
+        Mistral4ForCausalLM,
+        Mistral4ForSequenceClassification,
+        Mistral4Model,
+    )
     from .modules.mixtral import MixtralConfig, MixtralForCausalLM, MixtralForSequenceClassification, MixtralModel
     from .modules.mosaic_mpt import MptAttentionConfig, MptConfig, MptForCausalLM, MptModel
     from .modules.olmo import OlmoConfig, OlmoForCausalLM, OlmoModel
@@ -1002,6 +1083,7 @@ if _tp.TYPE_CHECKING:
     from .modules.olmo3 import Olmo3Config, Olmo3ForCausalLM, Olmo3ForSequenceClassification, Olmo3Model
     from .modules.openelm import OpenELMConfig, OpenELMForCausalLM, OpenELMModel
     from .modules.opt import OPTConfig, OPTForCausalLM, OPTModel
+    from .modules.paligemma import PaliGemmaConfig, PaliGemmaForConditionalGeneration, PaliGemmaModel
     from .modules.phi import PhiConfig, PhiForCausalLM, PhiModel
     from .modules.phi3 import Phi3Config, Phi3ForCausalLM, Phi3Model
     from .modules.phimoe import PhiMoeConfig, PhiMoeForCausalLM, PhiMoeModel

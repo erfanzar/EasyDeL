@@ -188,6 +188,15 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
     _projector_name: str = "multi_modal_projector"
     _language_model_name: str = "language_model"
 
+    # Keys injected by the offline trainers (SFT / preference family) purely for
+    # loss masking. They are consumed by the trainer before the forward call and
+    # are not model inputs; the inner text decoder signature does not accept them.
+    # A VLM head that carries ``**kwargs`` bypasses ``compute_loss``'s signature
+    # filter, so these keys would otherwise be threaded into the text model and
+    # raise ``TypeError``. Subclasses may extend the tuple if they surface extra
+    # trainer-only fields.
+    _trainer_only_call_keys: tuple[str, ...] = ("completion_mask", "assistant_masks")
+
     def __init__(
         self,
         config: ConfigT,
@@ -898,6 +907,46 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
             router_logits=router_logits,
             aux_loss=aux_loss,
         )
+
+    def _drop_trainer_only_kwargs(self, kwargs: dict) -> dict:
+        """Remove trainer-only loss-masking keys from a call kwargs mapping.
+
+        Pops every entry named in :attr:`_trainer_only_call_keys` (e.g.
+        ``completion_mask``) in place and returns the same mapping. These keys
+        are produced by the offline trainers for building ``labels`` and are not
+        forward-pass inputs; dropping them here keeps them from being threaded
+        into the inner text decoder, whose signature rejects them.
+
+        Args:
+            kwargs (dict): Mutable mapping of prepared call arguments.
+
+        Returns:
+            dict: The same mapping with trainer-only keys removed.
+        """
+        for key in self._trainer_only_call_keys:
+            kwargs.pop(key, None)
+        return kwargs
+
+    def prepare_inputs_for_call(self, **kwargs):
+        """Filter trainer-only kwargs before the module forward pass.
+
+        VLM heads accept ``**kwargs`` so per-family multimodal inputs
+        (``pixel_values``, ``image_grid_thw``, ...) can flow through. That
+        variadic signature makes ``EasyDeLBaseModule.compute_loss`` skip its
+        forward-signature filter, so trainer-only fields such as
+        ``completion_mask`` would otherwise reach ``forward`` and be forwarded
+        into the inner text decoder that cannot accept them. Stripping them here
+        — the single hook every trainer loss path calls before ``compute_loss``
+        — makes all inheriting VLM families train through the SFT/preference
+        trainers without leaking those keys.
+
+        Args:
+            **kwargs: The keyword arguments intended for the module call.
+
+        Returns:
+            dict: The prepared keyword arguments without trainer-only keys.
+        """
+        return self._drop_trainer_only_kwargs(kwargs)
 
     def prepare_inputs_for_generation(
         self,

@@ -2676,19 +2676,31 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
                 )
                 if rope_deltas is None:
                     rope_deltas = jnp.zeros((batch_size, 1), dtype=jnp.int32)
-        if drop_ids:
+        # Only drop ``input_ids`` when precomputed ``inputs_embeds`` are supplied.
+        # The training/eval loss path passes ``input_ids`` with no
+        # ``inputs_embeds``; dropping it there would leave the forward with
+        # nothing to embed and raise in ``compute_embedding``.
+        if drop_ids and others.get("inputs_embeds") is not None:
             others.pop("input_ids", None)
+        # NOTE: ``rope_deltas`` is intentionally NOT written back into the call
+        # kwargs. It is a ``VLMCausalLMOutput`` field, and the loss path spreads
+        # both ``**outputs`` and ``**batch`` into the loss function; leaving a
+        # ``rope_deltas`` entry in the batch collides with the output field and
+        # raises ``TypeError: got multiple values for 'rope_deltas'``. The head
+        # only passes ``rope_deltas`` through to its output, so the training loss
+        # path does not need it as an input.
         others.update(
             dict(
                 video_grid_thw=video_grid_thw,
                 image_grid_thw=image_grid_thw,
                 position_ids=position_ids,
-                rope_deltas=rope_deltas,
                 attention_mask=attention_mask,
                 mask_info=mask_info,
             )
         )
-        return others
+        # Strip trainer-only loss-masking keys (e.g. completion_mask) so they are
+        # not forwarded into the module call. See BaseVisionLanguageModule.
+        return self._drop_trainer_only_kwargs(others)
 
     def get_static_arguments(self):
         """Get arguments that should be treated as static for JIT compilation.

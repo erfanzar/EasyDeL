@@ -98,6 +98,7 @@ def compute_yarn_inv_frequencies(
     max_position_embeddings: int,
     scaling_factor: float,
     extrapolation_factor: float,
+    truncate: bool = True,
 ) -> jnp.ndarray:
     """Compute YaRN-adjusted inverse frequencies (interpolated + extrapolated mix).
 
@@ -135,6 +136,9 @@ def compute_yarn_inv_frequencies(
             interpolation branch.
         extrapolation_factor: Scalar in ``[0, 1]`` weighting how much the
             extrapolation regime contributes; ``1.0`` is full YaRN.
+        truncate: Whether to floor/ceil the correction band to integer plane
+            indices before building the ramp (transformers' ``truncate`` rope
+            parameter; default ``True`` preserves classic YaRN).
 
     Returns:
         Float32 array of shape ``(rotary_dim // 2,)`` containing the blended
@@ -149,6 +153,7 @@ def compute_yarn_inv_frequencies(
         dim=rotary_dim,
         base=base,
         max_position_embeddings=max_position_embeddings,
+        truncate=truncate,
     )
     inv_frequencies_mask = (
         1 - _yarn_linear_ramp_mask(low, high, rotary_dim // 2, dtype=jnp.float32)
@@ -359,6 +364,7 @@ def compute_yarn_frequencies(
     scaling_factor: float,
     extrapolation_factor: float,
     attn_factor: float,
+    truncate: bool = True,
 ) -> jnp.ndarray:
     """Compute YaRN-scaled RoPE frequencies with the attention magnitude rescaling.
 
@@ -378,6 +384,9 @@ def compute_yarn_frequencies(
         extrapolation_factor: Scalar in ``[0, 1]`` weighting the
             extrapolation branch.
         attn_factor: User-tunable multiplier composed with the YaRN mscale.
+        truncate: Whether to floor/ceil the correction band to integer plane
+            indices before building the ramp (transformers' ``truncate`` rope
+            parameter; default ``True`` preserves classic YaRN).
 
     Returns:
         Float32 array of shape ``(max_position_embeddings * scaling_factor,
@@ -392,6 +401,7 @@ def compute_yarn_frequencies(
         max_position_embeddings=max_position_embeddings,
         scaling_factor=scaling_factor,
         extrapolation_factor=extrapolation_factor,
+        truncate=truncate,
     )
     t = jnp.arange(max_position_embeddings * scaling_factor, dtype=jnp.float32)
     freqs = jnp.einsum("i,j -> ij", t, inv_freq)
