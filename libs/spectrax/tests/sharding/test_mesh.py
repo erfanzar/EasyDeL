@@ -12,10 +12,10 @@ and :func:`calculate_host_mesh_shape`.
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 import pytest
 from jax.sharding import AxisType, Mesh
-
 from spectrax.sharding import (
     DEFAULT_MESH_AXIS_DIMS,
     DEFAULT_MESH_AXIS_NAMES,
@@ -40,7 +40,9 @@ def test_create_mesh_default_axes():
     assert not mesh.is_mpmd
     assert mesh.mpmd_mesh is None
     assert mesh.axis_names == DEFAULT_MESH_AXIS_NAMES
-    assert mesh.shape["fsdp"] == 4
+    # conftest simulates 4 devices, but the workspace-wide CPU trio forces 8 via
+    # XLA_FLAGS; `-1` must fill whatever is visible.
+    assert mesh.shape["fsdp"] == jax.device_count()
     for name in ("pp", "dp", "ep", "tp", "sp"):
         assert mesh.shape[name] == 1
 
