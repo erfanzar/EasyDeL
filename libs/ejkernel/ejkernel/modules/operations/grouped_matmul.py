@@ -339,7 +339,13 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
         resolved_platform = detect_platform(self.op_id, cfg.platform)
         impl = self.get_impl(cfg)
         tiling = None
-        mSize, kSize, nSize = lhs.shape[0], lhs.shape[1], rhs.shape[2]
+        # ``rhs`` is [num_groups, k, n] normally but [num_groups, n, k] when
+        # transpose_rhs is set, so the output feature (n) is on a different axis.
+        # Using the wrong axis produces a too-large ``tn`` tiling hint that fails
+        # Mosaic lowering on TPU ("E2002 CompileTimeMosaicMisalignedBlockAndTiling")
+        # for small-n transposed grouped matmuls.
+        mSize, kSize = lhs.shape[0], lhs.shape[1]
+        nSize = rhs.shape[1] if transpose_rhs else rhs.shape[2]
         padded_size = 0
 
         if cfg.bypass_xla_tiling and resolved_platform == "xla":

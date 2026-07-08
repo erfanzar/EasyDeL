@@ -19,7 +19,6 @@ import inspect
 import jax
 import jax.numpy as jnp
 import pytest
-
 from ejkernel.kernels import Platform, kernel_registry
 from ejkernel.kernels._xla.grouped_matmul import grouped_matmul
 from ejkernel.kernels._xla.grouped_matmulv3 import grouped_matmulv3
@@ -106,6 +105,53 @@ def test_matches_naive(transpose_rhs, use_jit):
 
     assert out.shape == expected.shape
     assert jnp.allclose(out, expected, rtol=0, atol=0.125)
+
+
+@pytest.mark.parametrize("transpose_rhs", [False, True])
+@pytest.mark.parametrize(
+    ("group_sizes", "k", "n"),
+    [
+        # m=52, num_groups=8: the DeepSeek-V4 / mistral4 / minimax MoE down-proj
+        # shape. m is not a multiple of the TPU sublane size (8), which used to
+        # abort XLA:TPU compilation inside ragged_dot_expander ("Window too large
+        # 7 max_ragged_dim_window_bound 2"). The XLA grouped_matmul now pads the
+        # ragged dimension internally; assert it stays numerically exact.
+        ([7, 7, 7, 7, 6, 6, 6, 6], 32, 128),
+        # Skewed real-routing distribution with empty groups (top-k routing).
+        ([20, 0, 11, 0, 7, 0, 14, 0], 32, 128),
+        # m=52, num_groups=4 (hy_v3): a multiple of num_groups but NOT of 8 -
+        # still crashed pre-fix, so padding must key off 8 and not num_groups.
+        ([13, 13, 13, 13], 32, 128),
+        # Small odd m that pads up to one sublane.
+        ([3, 5, 2], 7, 4),
+    ],
+)
+def test_ragged_dim_not_multiple_of_eight_matches_naive(group_sizes, k, n, transpose_rhs):
+    """Ragged (m) dimensions that are not a multiple of 8 must stay correct.
+
+    XLA:TPU's ragged_dot_expander aborts the process for such shapes unless the
+    ragged dimension is padded up to the sublane size; the XLA grouped_matmul now
+    pads internally and trims the result. This locks in that the padded path is
+    numerically identical to a per-group reference and preserves the m rows
+    (regression for the fused-MoE grouped-matmul crash).
+    """
+    key = jax.random.PRNGKey(11)
+    _, kl, kr = jax.random.split(key, 3)
+    group_sizes = jnp.asarray(group_sizes, dtype=jnp.int32)
+    m = int(group_sizes.sum())
+    g = int(group_sizes.shape[0])
+    assert m % 8 != 0, "this regression must exercise the padding path"
+    lhs = jax.random.normal(kl, (m, k), dtype=jnp.float32)
+    rhs = jax.random.normal(kr, (g, n, k) if transpose_rhs else (g, k, n), dtype=jnp.float32)
+
+    out = jax.jit(lambda lhs, rhs, gs: grouped_matmul(lhs, rhs, gs, transpose_rhs=transpose_rhs, tiling=None))(
+        lhs, rhs, group_sizes
+    )
+    expected = _naive_grouped_matmul(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs)
+
+    assert out.shape == (m, n)
+    assert out.shape == expected.shape
+    assert jnp.allclose(out, expected, rtol=0, atol=1e-4)
 
 
 def test_registry_alias_for_grouped_matmulv2():
