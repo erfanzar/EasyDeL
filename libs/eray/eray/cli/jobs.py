@@ -38,9 +38,10 @@ from pathlib import Path
 
 import click
 
+from ..provision.fleet import RAY_DASHBOARD_PORT
 from .utils import NC, RED, YELLOW, error, info, warning
 
-DEFAULT_DASHBOARD = "http://127.0.0.1:8265"
+DEFAULT_DASHBOARD = f"http://127.0.0.1:{RAY_DASHBOARD_PORT}"
 
 # Bound on the `watch` pre-flight job-existence probe. Module-level so tests
 # can shrink it; see the probe in `watch` for why a daemon thread (not an HTTP
@@ -155,11 +156,28 @@ def _spam_re(patterns: dict) -> re.Pattern:
     return re.compile("|".join(patterns.get("spam") or ["(?!x)x"]))
 
 
+def _auto_dashboard_address() -> str | None:
+    """``http://127.0.0.1:<port>`` for a lone open eray dashboard tunnel.
+
+    Lets `eray status`/`logs`/`watch` work from a laptop with no ``-a`` and
+    no ``RAY_ADDRESS``, and correctly picks up the tunnel's actual local
+    port even when it wasn't 8265 (8265 was busy). Returns None when there
+    is no tunnel, or more than one (ambiguous — fall back to the default).
+    """
+    from ..provision.tunnel import tunnels_for_remote_port
+
+    dash = tunnels_for_remote_port(RAY_DASHBOARD_PORT)
+    if len(dash) == 1:
+        return f"http://127.0.0.1:{dash[0].local_port}"
+    return None
+
+
 def resolve_address(explicit: str | None) -> str:
     """Resolve the Ray dashboard address for job-submission clients.
 
-    Order: explicit flag, ``RAY_ADDRESS`` env var, then the local default
-    dashboard. Bare ``host:port`` values are normalized to ``http://``.
+    Order: explicit flag, ``RAY_ADDRESS`` env var, a lone open eray
+    dashboard tunnel, then the local default dashboard. Bare ``host:port``
+    values are normalized to ``http://``.
 
     Args:
         explicit: Address passed on the command line, if any.
@@ -167,15 +185,15 @@ def resolve_address(explicit: str | None) -> str:
     Returns:
         An ``http(s)://host:port`` URL.
     """
-    addr = explicit or os.environ.get("RAY_ADDRESS") or DEFAULT_DASHBOARD
+    addr = explicit or os.environ.get("RAY_ADDRESS") or _auto_dashboard_address() or DEFAULT_DASHBOARD
     if addr.startswith(("http://", "https://")):
         return addr
     if ":" in addr:
         host, port = addr.rsplit(":", 1)
         if port == "6379":  # GCS port — jobs API lives on the dashboard
-            return f"http://{host}:8265"
+            return f"http://{host}:{RAY_DASHBOARD_PORT}"
         return f"http://{addr}"
-    return f"http://{addr}:8265"
+    return f"http://{addr}:{RAY_DASHBOARD_PORT}"
 
 
 def make_client(address: str | None):
@@ -205,7 +223,7 @@ def resolve_cluster_address(cluster: str) -> str:
         raise click.ClickException(f"cluster {cluster!r} is not registered (eray fleet add ...)")
     if not record.head_ip:
         raise click.ClickException(f"cluster {cluster!r} has no known head yet (eray fleet ensure {cluster})")
-    return f"http://{record.head_ip}:8265"
+    return f"http://{record.head_ip}:{RAY_DASHBOARD_PORT}"
 
 
 def inherited_env(environ: dict[str, str] | None = None) -> dict[str, str]:

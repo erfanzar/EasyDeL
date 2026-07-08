@@ -96,6 +96,14 @@ class ClusterRecord:
         recreate_ts: Bounded ring of recent recreate unix timestamps —
             budget windows survive watcher failover because they live here.
         config_path: Cluster-launcher YAML path (launcher kind).
+        last_up_ts: Unix timestamp of the last successful bring-up (stamped
+            by `eray autoscale up`; QR-kind clusters brought up via `eray
+            fleet up`/`ensure` do not set this). None if never brought up.
+        last_down_ts: Unix timestamp of the last successful teardown (`eray
+            autoscale down`). None if never torn down. For launcher-kind
+            clusters this is the only record of "when did it die" — `ray
+            down` deletes the GCE instances outright, so GCP has nothing
+            left to query after the fact.
         extra: Forward-compatible bag for fields newer eray versions add.
     """
 
@@ -117,6 +125,8 @@ class ClusterRecord:
     job_snapshot: list | None = None
     recreate_ts: list = field(default_factory=list)
     config_path: str | None = None
+    last_up_ts: float | None = None
+    last_down_ts: float | None = None
     extra: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
@@ -148,20 +158,29 @@ class ClusterRecord:
 
 
 class LocalBackend:
-    """Registry storage in a local JSON file guarded by flock.
+    """Local-file JSON document storage guarded by flock, atomic-written.
 
     The lock is held across the entire read-modify-write, so local updates
-    never conflict; ConflictError is not raised by this backend.
+    never conflict; ConflictError is not raised by this backend. Storage
+    is generic over the document shape via `empty_doc` — the fleet registry
+    uses this with its own `_empty_doc` (the default), but any other
+    eray module wanting a safe local JSON store (e.g. `provision.tunnel`'s
+    tracked-process table) can reuse this instead of re-deriving the same
+    flock + atomic-rename primitive.
     """
 
-    def __init__(self, path: Path | str = DEFAULT_LOCAL_PATH):
+    def __init__(self, path: Path | str = DEFAULT_LOCAL_PATH, *, empty_doc: Callable[[], dict] | None = None):
         """Initialize the backend.
 
         Args:
-            path: Registry file path (created on first write).
+            path: Storage file path (created on first write).
+            empty_doc: Factory for the starting document when the file
+                doesn't exist yet, or is empty. Defaults to the fleet
+                registry's ``{"version", "clusters", "lease"}`` shape.
         """
         self.path = Path(path).expanduser()
         self._lock_path = self.path.with_suffix(self.path.suffix + ".lock")
+        self._empty_doc = empty_doc or _empty_doc
 
     def read(self) -> tuple[dict, Any]:
         """Read the document.
@@ -170,8 +189,8 @@ class LocalBackend:
             (document, token) — the token is unused for local storage.
         """
         if not self.path.exists():
-            return _empty_doc(), None
-        return json.loads(self.path.read_text() or "{}") or _empty_doc(), None
+            return self._empty_doc(), None
+        return json.loads(self.path.read_text() or "{}") or self._empty_doc(), None
 
     def write(self, doc: dict, token: Any) -> None:
         """Write the document atomically (tmp + rename).

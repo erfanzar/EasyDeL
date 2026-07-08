@@ -34,6 +34,7 @@ import time
 import warnings
 from dataclasses import dataclass
 
+from ..provision.fleet import RAY_DASHBOARD_PORT, RAY_HEAD_PORT
 from .utils import (
     TpuInfo,
     build_ray_resource_flags,
@@ -47,8 +48,6 @@ from .utils import (
 
 logger = logging.getLogger("eray.cli.tpu")
 
-RAY_HEAD_PORT = 6379
-RAY_DASHBOARD_PORT = 8265
 RAY_TMP_DIR = "/tmp/eray_tmp"
 RAY_READINESS_POLL_S = 5
 
@@ -418,55 +417,206 @@ def _wait_for_cluster(
     return False
 
 
-def cluster_status(ray_address: str) -> dict:
-    """Get cluster status summary.
+def _exc_str(exc: BaseException) -> str:
+    """A never-empty description of an exception.
+
+    Several Ray connection failures (notably ``ConnectionError`` from a
+    driver handshake that can't complete over a single tunneled port)
+    stringify to ``""``, which surfaced as a bare "Failed: " with no reason.
+    Fall back to the type name so the operator always sees *something*.
 
     Args:
-        ray_address: Ray cluster address (ip:port).
+        exc: The exception.
+
+    Returns:
+        ``str(exc)`` if non-empty, else the exception's class name.
+    """
+    return str(exc) or type(exc).__name__
+
+
+def _ip_sort_key(entry: dict):
+    """Sort nodes by dotted-quad IP, non-IPs last."""
+    try:
+        return (0, tuple(int(part) for part in str(entry["ip"]).split(".")))
+    except (ValueError, KeyError):
+        return (1, str(entry.get("ip", "")))
+
+
+def _dashboard_port_for(host: str) -> int:
+    """The local port serving the Ray dashboard for `host`.
+
+    Over an ``eray dashboard``/``eray fleet tunnel`` forward the dashboard
+    rarely lands on 8265 (it falls back when 8265 is busy on the laptop), and
+    the address the resource commands resolve is the *GCS* tunnel's local
+    port, not the dashboard's. So when `host` is the loopback (a tunnel),
+    look the dashboard's real local port up in the tunnel store; a direct
+    cluster IP serves the dashboard on the standard port.
+
+    Args:
+        host: The host portion of a resolved cluster address.
+
+    Returns:
+        The dashboard port to query on `host` — the tracked tunnel's local
+        port when exactly one dashboard tunnel is open and `host` is
+        loopback, else `RAY_DASHBOARD_PORT`.
+    """
+    if host in ("127.0.0.1", "localhost", "::1"):
+        from ..provision.tunnel import tunnels_for_remote_port
+
+        dash = tunnels_for_remote_port(RAY_DASHBOARD_PORT)
+        if len(dash) == 1:
+            return dash[0].local_port
+    return RAY_DASHBOARD_PORT
+
+
+def _dashboard_nodes(ray_address: str, *, dashboard_port: int | None = None, timeout: float = 10.0) -> list[dict]:
+    """Node list from the Ray dashboard state API (``/api/v0/nodes``).
+
+    Plain HTTP against the dashboard — no ``ray.init`` driver handshake, so
+    it works from a laptop over the dashboard tunnel and needs no
+    version-exact client. Each node carries ``resources_total`` and a
+    liveness ``state`` (but no availability — the state API doesn't expose
+    it). The dashboard is assumed on the same host as ``ray_address``; its
+    port is `dashboard_port` when given, else resolved by `_dashboard_port_for`
+    (which finds the real local port of an open dashboard tunnel).
+
+    Args:
+        ray_address: A cluster address (``host:port``); only the host is used.
+        dashboard_port: Dashboard HTTP port; None resolves it per host.
+        timeout: Per-request timeout in seconds.
+
+    Returns:
+        The node result rows.
+
+    Raises:
+        RuntimeError: On any HTTP/parse failure (with a readable reason).
+    """
+    import json
+    import urllib.error
+    import urllib.request
+
+    host = ray_address.split(":")[0]
+    port = dashboard_port if dashboard_port is not None else _dashboard_port_for(host)
+    url = f"http://{host}:{port}/api/v0/nodes?limit=10000"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            payload = json.loads(resp.read())
+        return payload["data"]["result"]["result"]
+    except (urllib.error.URLError, KeyError, ValueError, OSError) as exc:
+        raise RuntimeError(f"dashboard state API unreachable at {url} ({_exc_str(exc)})") from None
+
+
+def _autoscaler_cluster_status(ray_address: str):
+    """The autoscaler's structured cluster status, read from GCS.
+
+    This is exactly what ``ray status`` reads: a pure GCS read of the
+    resource state, so it works from a laptop over the GCS tunnel (no
+    driver join, unlike ``ray.init``) and — unlike the dashboard state API
+    — includes per-resource *usage*, not just totals. Only populated on
+    autoscaler-managed clusters (``eray autoscale``); connect-mode/QR
+    clusters have no autoscaler, so callers fall back to `_dashboard_nodes`.
+
+    Args:
+        ray_address: The GCS address (``host:port``, default GCS port 6379).
+
+    Returns:
+        A ``ray.autoscaler.v2.sdk.ClusterStatus``.
+    """
+    from ray.autoscaler.v2.sdk import get_cluster_status
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return get_cluster_status(ray_address)
+
+
+def _usage_map(resource_usages) -> dict[str, dict]:
+    """``{name: {total, available, used}}`` from autoscaler ResourceUsages."""
+    out: dict[str, dict] = {}
+    for ru in resource_usages:
+        used = ru.used
+        total = ru.total
+        out[ru.resource_name] = {"total": total, "available": max(total - used, 0.0), "used": used}
+    return out
+
+
+def cluster_status(ray_address: str) -> dict:
+    """Cluster status summary, without a ``ray.init`` driver handshake.
+
+    Reads the autoscaler status over GCS (`_autoscaler_cluster_status`);
+    on a non-autoscaler cluster, falls back to the dashboard state API
+    (`_dashboard_nodes`). Both work from a laptop over the tunnels
+    `eray dashboard open` forwards.
+
+    Args:
+        ray_address: Ray cluster / GCS address (ip:port).
 
     Returns:
         A dict with keys: alive_nodes, total_nodes, resources, node_ips,
         dashboard_url.
+
+    Raises:
+        RuntimeError: If neither status source is reachable.
     """
-    import ray
+    _require_reachable_head(ray_address)
+    dashboard_url = f"http://{ray_address.split(':')[0]}:{RAY_DASHBOARD_PORT}"
+    errors = []
+    try:
+        status = _autoscaler_cluster_status(ray_address)
+        alive = [*status.active_nodes, *status.idle_nodes]
+        resources = {ru.resource_name: ru.total for ru in status.cluster_resource_usage}
+        if not alive and not resources:
+            # A non-autoscaler cluster can answer the GCS read with an empty
+            # status instead of raising; treat that as a miss so the dashboard
+            # fallback (which does see the nodes) runs rather than returning
+            # an empty summary.
+            raise RuntimeError("autoscaler status reported no nodes or resources")
+        # failed_nodes keeps a lost node in the total (matching the dashboard
+        # fallback's len(rows)), so `Alive < Total` still flags a crash.
+        failed = getattr(status, "failed_nodes", None) or []
+        return {
+            "alive_nodes": len(alive),
+            "total_nodes": len(alive) + len(status.pending_nodes) + len(failed),
+            "resources": resources,
+            "node_ips": [n.ip_address for n in alive],
+            "dashboard_url": dashboard_url,
+        }
+    except Exception as exc:
+        errors.append(("autoscaler", exc))
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", FutureWarning)
-        if not ray.is_initialized():
-            _require_reachable_head(ray_address)
-            ray.init(address=ray_address, ignore_reinit_error=True, logging_level=logging.ERROR)
+    try:
+        rows = _dashboard_nodes(ray_address)
+        alive = [n for n in rows if n.get("state") == "ALIVE"]
+        resources = {}
+        for n in alive:
+            for k, v in (n.get("resources_total") or {}).items():
+                resources[k] = resources.get(k, 0.0) + v
+        return {
+            "alive_nodes": len(alive),
+            "total_nodes": len(rows),
+            "resources": resources,
+            "node_ips": [n.get("node_ip", "?") for n in alive],
+            "dashboard_url": dashboard_url,
+        }
+    except Exception as exc:
+        errors.append(("dashboard", exc))
 
-    nodes = ray.nodes()
-    alive = [n for n in nodes if n.get("Alive")]
-    all_resources: dict[str, float] = {}
-    for n in alive:
-        for k, v in n.get("Resources", {}).items():
-            all_resources[k] = all_resources.get(k, 0) + v
-
-    node_ips = [n.get("NodeManagerAddress", "?") for n in alive]
-
-    return {
-        "alive_nodes": len(alive),
-        "total_nodes": len(nodes),
-        "resources": all_resources,
-        "node_ips": node_ips,
-        "dashboard_url": f"http://{ray_address.split(':')[0]}:{RAY_DASHBOARD_PORT}",
-    }
+    raise RuntimeError("could not read cluster status: " + "; ".join(f"{k}: {_exc_str(e)}" for k, e in errors))
 
 
 def resource_usage(ray_address: str, *, per_node: bool = False) -> dict:
     """Collect cluster resource totals, availability, and usage.
 
-    Uses the public ``ray.cluster_resources()`` / ``ray.available_resources()``
-    pair for the cluster view. A resource that is fully consumed disappears
-    from ``available_resources()`` entirely, so usage is computed as
-    ``total - available.get(name, 0)``. The per-node view additionally uses
-    Ray's private ``available_resources_per_node`` (stable across the 2.x
-    line but private API); when it is missing, per-node usage degrades to
-    totals with ``available``/``used`` set to None rather than failing.
+    Reads the autoscaler status over GCS the way ``ray status`` does
+    (`_autoscaler_cluster_status`) — which works from a laptop over the GCS
+    tunnel and carries per-resource *usage* (used/total). On a
+    non-autoscaler cluster it falls back to the dashboard state API
+    (`_dashboard_nodes`), which has totals + liveness only, so ``used`` and
+    ``available`` come back ``None`` (rendered as ``?``). Neither path does
+    a ``ray.init`` driver handshake, which can't complete over a single
+    tunneled port and previously failed with an empty ``ConnectionError``.
 
     Args:
-        ray_address: Ray cluster address (ip:port).
+        ray_address: Ray cluster / GCS address (ip:port).
         per_node: If True, include a per-node breakdown of alive nodes.
 
     Returns:
@@ -475,67 +625,66 @@ def resource_usage(ray_address: str, *, per_node: bool = False) -> dict:
             nodes (only when per_node): list of {"ip", "node_id", "resources"}
                 sorted by IP, where each node's resources map has the same
                 shape (``node:*`` marker resources excluded).
+
+    Raises:
+        RuntimeError: If neither status source is reachable.
     """
-    import ray
+    _require_reachable_head(ray_address)
+    errors = []
+    try:
+        return _resource_usage_via_autoscaler(ray_address, per_node=per_node)
+    except Exception as exc:
+        errors.append(("autoscaler", exc))
+    try:
+        return _resource_usage_via_dashboard(ray_address, per_node=per_node)
+    except Exception as exc:
+        errors.append(("dashboard", exc))
+    raise RuntimeError("could not read resource usage: " + "; ".join(f"{k}: {_exc_str(e)}" for k, e in errors))
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", FutureWarning)
-        if not ray.is_initialized():
-            _require_reachable_head(ray_address)
-            ray.init(address=ray_address, ignore_reinit_error=True, logging_level=logging.ERROR)
 
-    total = ray.cluster_resources()
-    available = ray.available_resources()
-    resources = {
-        name: {
-            "total": tot,
-            "available": available.get(name, 0.0),
-            "used": max(tot - available.get(name, 0.0), 0.0),
-        }
-        for name, tot in total.items()
-    }
+def _resource_usage_via_autoscaler(ray_address: str, *, per_node: bool) -> dict:
+    """`resource_usage` via the autoscaler status (used/total per resource)."""
+    status = _autoscaler_cluster_status(ray_address)
+    resources = _usage_map(status.cluster_resource_usage)
+    if not resources:
+        # Empty means this isn't an autoscaler-managed cluster (the GCS read
+        # answered but had nothing); fall through to the dashboard state API
+        # instead of reporting an empty resource table.
+        raise RuntimeError("autoscaler status reported no resources")
     out: dict = {"resources": resources}
-
     if per_node:
-        try:
-            from ray._private.state import available_resources_per_node
-
-            per_node_available: dict | None = available_resources_per_node()
-        except Exception:
-            per_node_available = None
-
         nodes = []
-        for node in ray.nodes():
-            if not node.get("Alive"):
-                continue
-            node_id = node.get("NodeID")
-            node_available = None if per_node_available is None else per_node_available.get(node_id, {})
-            node_resources = {}
-            for name, tot in (node.get("Resources") or {}).items():
-                if name.startswith("node:"):
-                    continue
-                if node_available is None:
-                    node_resources[name] = {"total": tot, "available": None, "used": None}
-                else:
-                    avail = node_available.get(name, 0.0)
-                    node_resources[name] = {"total": tot, "available": avail, "used": max(tot - avail, 0.0)}
-            nodes.append(
-                {
-                    "ip": node.get("NodeManagerAddress", "?"),
-                    "node_id": node_id,
-                    "resources": node_resources,
-                }
-            )
-
-        def _ip_key(entry: dict):
-            try:
-                return (0, tuple(int(part) for part in entry["ip"].split(".")))
-            except ValueError:
-                return (1, entry["ip"])
-
-        nodes.sort(key=_ip_key)
+        for node in [*status.active_nodes, *status.idle_nodes]:
+            usage = node.resource_usage.usage if node.resource_usage else []
+            node_resources = _usage_map(ru for ru in usage if not ru.resource_name.startswith("node:"))
+            nodes.append({"ip": node.ip_address, "node_id": node.node_id, "resources": node_resources})
+        nodes.sort(key=_ip_sort_key)
         out["nodes"] = nodes
+    return out
 
+
+def _resource_usage_via_dashboard(ray_address: str, *, per_node: bool) -> dict:
+    """`resource_usage` via the dashboard state API (totals only; used=None)."""
+    rows = _dashboard_nodes(ray_address)
+    alive = [n for n in rows if n.get("state") == "ALIVE"]
+
+    def _totals(mapping: dict) -> dict:
+        return {name: {"total": tot, "available": None, "used": None} for name, tot in mapping.items()}
+
+    cluster: dict[str, float] = {}
+    for n in alive:
+        for name, tot in (n.get("resources_total") or {}).items():
+            cluster[name] = cluster.get(name, 0.0) + tot
+    out: dict = {"resources": _totals(cluster)}
+    if per_node:
+        nodes = []
+        for n in alive:
+            node_map = {
+                name: tot for name, tot in (n.get("resources_total") or {}).items() if not name.startswith("node:")
+            }
+            nodes.append({"ip": n.get("node_ip", "?"), "node_id": n.get("node_id"), "resources": _totals(node_map)})
+        nodes.sort(key=_ip_sort_key)
+        out["nodes"] = nodes
     return out
 
 
@@ -545,12 +694,23 @@ def health_check(ray_address: str, tpu_type: str | None = None) -> list[dict]:
     Uses a Ray remote function to run a check on every host, reporting
     JAX devices and host info.
 
+    Unlike ``eray tpu status`` / ``eray resources`` (which read cluster
+    state over GCS/HTTP), this runs a JAX device probe *on every worker*,
+    so it needs a real ``ray.init`` driver join — which can't complete over
+    a single tunneled port. It therefore works only on the cluster itself,
+    not from a laptop tunnel; that case raises with guidance rather than an
+    opaque connection error.
+
     Args:
         ray_address: Ray cluster address (ip:port).
         tpu_type: Optional TPU type (e.g. "v4-32") for scheduling.
 
     Returns:
         A list of per-host health report dicts.
+
+    Raises:
+        RuntimeError: If the driver can't join the cluster (e.g. run from a
+            laptop over a tunnel instead of on the cluster).
     """
     import ray
 
@@ -558,7 +718,14 @@ def health_check(ray_address: str, tpu_type: str | None = None) -> list[dict]:
         warnings.simplefilter("ignore", FutureWarning)
         if not ray.is_initialized():
             _require_reachable_head(ray_address)
-            ray.init(address=ray_address, ignore_reinit_error=True, logging_level=logging.ERROR)
+            try:
+                ray.init(address=ray_address, ignore_reinit_error=True, logging_level=logging.ERROR)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"could not join the Ray cluster at {ray_address} ({_exc_str(exc)}); "
+                    "`eray tpu health` runs a device probe on every worker and must run on the "
+                    "cluster itself — from a laptop use `eray tpu status` / `eray resources` instead"
+                ) from None
 
     @ray.remote
     def check_host():

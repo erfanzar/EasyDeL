@@ -26,11 +26,11 @@ import json as json_lib
 
 import click
 
-from ..provision.fleet import ensure_tpu, fleet_status
+from ..provision.fleet import RAY_HEAD_PORT, ensure_tpu, fleet_status
 from ..provision.qr import delete_queued_resource, describe_queued_resource
 from ..provision.registry import ClusterRecord, ClusterRegistry
 from .qr import _resolve_project_zone
-from .utils import error, info, success
+from .utils import error, info, print_table, success
 
 #: Raw URL of EasyDeL's multi-host TPU bootstrap script, per git ref.
 EASYDEL_SETUP_URL = "https://raw.githubusercontent.com/erfanzar/EasyDeL/{ref}/scripts/tpu_setup.sh"
@@ -50,21 +50,6 @@ def easydel_setup_cmd(ref: str) -> str:
     """
     url = EASYDEL_SETUP_URL.format(ref=ref)
     return f"curl -fsSL {url} | bash -s -- --branch {ref}"
-
-
-def _print_table(rows: list[dict]) -> None:
-    """Print a list of homogeneous dicts as an aligned table.
-
-    Args:
-        rows: Rows; keys of the first row define the columns.
-    """
-    if not rows:
-        return
-    keys = list(rows[0])
-    widths = {k: max(len(str(r[k])) for r in [*rows, dict.fromkeys(keys, k)]) for k in keys}
-    click.echo("  ".join(f"{k.upper():<{widths[k]}}" for k in keys))
-    for r in rows:
-        click.echo("  ".join(f"{r[k]!s:<{widths[k]}}" for k in keys))
 
 
 def register(cli: click.Group) -> None:
@@ -265,7 +250,7 @@ def register(cli: click.Group) -> None:
         if not rows:
             info("no clusters registered (eray fleet add ...)")
             return
-        _print_table(rows)
+        print_table(rows)
 
     @fleet.command()
     @click.argument("names", nargs=-1)
@@ -306,33 +291,62 @@ def register(cli: click.Group) -> None:
     @click.argument("name")
     @click.option("--port", type=int, default=8265, show_default=True, help="Remote port (Ray dashboard/Jobs API).")
     @click.option("--local-port", type=int, default=None, help="Local port (default: same as --port).")
-    def tunnel(name, port, local_port):
-        """SSH-forward a cluster's head port to this machine.
+    @click.option(
+        "--gcs/--no-gcs",
+        "forward_gcs",
+        default=True,
+        show_default=True,
+        help="Also forward the GCS port (`ray status`, `eray resources`, `ray.init()`).",
+    )
+    @click.option("--gcs-port", type=int, default=RAY_HEAD_PORT, show_default=True, help="Remote GCS port.")
+    @click.option(
+        "--gcs-local-port", type=int, default=None, help="Local port for the GCS forward (default: same as --gcs-port)."
+    )
+    def tunnel(name, port, local_port, forward_gcs, gcs_port, gcs_local_port):
+        """SSH-forward a cluster's head ports to this machine.
 
         Ray heads listen on internal VPC IPs, so from a laptop the dashboard
         and Jobs API are unreachable directly. This wraps the gcloud TPU SSH
         forward (worker 0 is the head); it runs in the foreground until
-        Ctrl-C. With the default port, http://127.0.0.1:8265 then serves the
-        dashboard and works as the address for `eray run/logs/status -a`.
+        Ctrl-C. With the defaults, http://127.0.0.1:8265 serves the
+        dashboard (the address for `eray run/logs/status`), and the GCS port
+        (6379) is forwarded too so `ray status`/`eray resources`/anything
+        doing a raw `ray.init(address=...)` work over the same connection
+        with no `-a`. Pass --no-gcs for the dashboard port only.
 
         \b
         Example (from a laptop):
             eray fleet tunnel trainer1 &
-            eray logs sft-run -a http://127.0.0.1:8265 -f
+            eray resources                          # auto-detects the GCS tunnel
+            eray logs sft-run -f                    # auto-detects the dashboard tunnel
         """
         import os
+
+        from ..provision.fleet import qr_tunnel_argv
 
         record = ClusterRegistry.from_config().get(name)
         if record is None:
             raise click.ClickException(f"unknown cluster {name!r} — `eray fleet add` it first.")
+        if record.kind != "qr":
+            raise click.ClickException(
+                f"{name!r} is a {record.kind}-kind cluster, not a QR-managed TPU pod — "
+                f"use `eray dashboard open {name}` instead."
+            )
+        if not (record.project and record.zone):
+            # qr_tunnel_argv splices project/zone straight into the gcloud
+            # argv; None there makes os.execvp raise an opaque TypeError.
+            # Fail clean, matching dashboard's _forward_argv guard.
+            raise click.ClickException(f"{name!r}: missing project/zone in the registry.")
         lp = local_port or port
         info(f"forwarding 127.0.0.1:{lp} -> {name} worker 0 port {port} (Ctrl-C to close)")
         info(f"address for eray -a / browser: http://127.0.0.1:{lp}")
-        argv = [
-            *["gcloud", "compute", "tpus", "tpu-vm", "ssh", name],
-            *["--project", record.project, "--zone", record.zone, "--worker", "0"],
-            *["--", "-N", "-L", f"{lp}:localhost:{port}"],
-        ]
+        extra_ports = ()
+        if forward_gcs:
+            gcs_lp = gcs_local_port or gcs_port
+            info(f"forwarding 127.0.0.1:{gcs_lp} -> {name} worker 0 port {gcs_port} (GCS)")
+            info(f"address for eray resources/ray status: 127.0.0.1:{gcs_lp}")
+            extra_ports = ((gcs_lp, gcs_port),)
+        argv = qr_tunnel_argv(record, remote_port=port, local_port=lp, extra_ports=extra_ports)
         os.execvp(argv[0], argv)
 
     @fleet.command()

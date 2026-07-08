@@ -24,6 +24,7 @@ Commands:
     eray qr ...          TPU Queued Resources (spot capacity primitive)
     eray fleet ...       Managed fleet: registry, ensure, watch, pause/resume
     eray autoscale ...   Ray cluster-launcher configs (elastic clusters)
+    eray dashboard ...   Unified status + tracked tunnels (fleet + autoscale)
     eray run/logs/...    Job submission via the Ray Jobs API
     eray version         Print version
 
@@ -211,6 +212,13 @@ _register_fleet_commands(cli)
 from .autoscale import register as _register_autoscale_commands  # noqa: E402
 
 _register_autoscale_commands(cli)
+
+
+# ── Dashboard (unified status + tracked tunnels) ─────────────────
+
+from .dashboard import register as _register_dashboard_commands  # noqa: E402
+
+_register_dashboard_commands(cli)
 
 
 # ── TPU subcommands ──────────────────────────────────────────────
@@ -436,18 +444,24 @@ def disconnect(tpu_name, project, zone, ips, tpu_type, user, ssh_key, ray_bin):
 
 
 def _resolve_address(address: str | None) -> str:
-    """Resolve a Ray head address, auto-detecting on a TPU VM.
+    """Resolve a Ray GCS head address for `ray.init()`-based commands.
+
+    Resolution order, first hit wins:
+      1. an explicit ``--address``;
+      2. this machine's own TPU head, when running on a TPU VM (metadata);
+      3. an open eray GCS tunnel (``eray dashboard open`` / ``eray fleet
+         tunnel`` forward the GCS port by default) — its local port,
+         whatever it landed on, so a laptop needs no ``-a``.
 
     Args:
-        address: Explicit ``ip:port``, or None to detect the local TPU's
-            head (worker 0's internal IP on the standard Ray port).
+        address: Explicit ``ip:port``, or None to auto-detect.
 
     Returns:
-        The Ray cluster address.
+        The Ray cluster address (``host:port``).
 
     Raises:
-        click.ClickException: If no address was given and this machine is
-            not a TPU VM.
+        click.ClickException: Nothing resolved, or more than one GCS tunnel
+            is open (ambiguous — name one with ``--address``).
     """
     if address:
         return address
@@ -456,8 +470,21 @@ def _resolve_address(address: str | None) -> str:
         resolved = f"{detected.internal_ips[0]}:6379"
         info(f"Auto-detected Ray head {resolved} from this VM's metadata")
         return resolved
+
+    from ..provision.fleet import RAY_HEAD_PORT
+    from ..provision.tunnel import tunnels_for_remote_port
+
+    gcs = tunnels_for_remote_port(RAY_HEAD_PORT)
+    if len(gcs) == 1:
+        resolved = f"127.0.0.1:{gcs[0].local_port}"
+        info(f"Auto-detected Ray head {resolved} from an open eray tunnel")
+        return resolved
+    if len(gcs) > 1:
+        names = ", ".join(s.name.removesuffix("-gcs") for s in gcs)
+        raise click.ClickException(f"multiple open GCS tunnels ({names}); pass --address 127.0.0.1:<port> to pick one.")
     raise click.ClickException(
-        "Provide --address (with no flags, the head is auto-detected only when running on a TPU VM)."
+        "Provide --address, or open a tunnel first (`eray dashboard open <cluster>` / "
+        "`eray fleet tunnel <cluster>`); on a TPU VM the head is auto-detected."
     )
 
 
@@ -628,14 +655,19 @@ def resources(address, per_node, show_all, as_json):
     rows = []
     for name in sorted(result["resources"], key=_resource_sort_key):
         res = result["resources"][name]
-        util = (res["used"] / res["total"] * 100.0) if res["total"] else 0.0
+        if res["used"] is not None and res["total"]:
+            util = f"{res['used'] / res['total'] * 100.0:5.1f}%"
+        elif res["used"] is None:
+            util = "    ?"  # dashboard-only source: no availability data
+        else:
+            util = f"{0.0:5.1f}%"
         rows.append(
             (
                 name,
                 _fmt_qty(name, res["used"]),
                 _fmt_qty(name, res["total"]),
                 _fmt_qty(name, res["available"]),
-                f"{util:5.1f}%",
+                util,
             )
         )
     heads = ("RESOURCE", "USED", "TOTAL", "FREE")

@@ -17,18 +17,23 @@
 import json
 import subprocess
 import sys
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 from click.testing import CliRunner
-from eray.cli.main import _resolve_tpu, cli
+from eray.cli.main import _resolve_address, _resolve_tpu, cli
 from eray.cli.tpu import ConnectResult, _ray_bin_preamble, resource_usage
 from eray.cli.utils import (
     TpuInfo,
     build_ray_resource_flags,
     detect_local_tpu,
+    format_ago,
+    format_duration,
     list_tpus_in_project,
     list_tpus_in_zone,
+    parse_gcp_timestamp,
+    print_table,
     run_on_host,
 )
 
@@ -128,6 +133,50 @@ class TestBuildRayResourceFlags:
         head = json.loads(build_ray_resource_flags(tpu, is_head=True))
         worker = json.loads(build_ray_resource_flags(tpu, is_head=False))
         assert len(head) > len(worker)
+
+
+class TestFormatHelpers:
+    def test_format_duration_coarsest_two_units(self):
+        assert format_duration(45) == "45s"
+        assert format_duration(90) == "1m"
+        assert format_duration(3661) == "1h1m"
+        assert format_duration(90000) == "1d1h"
+
+    def test_format_duration_clamps_negative(self):
+        assert format_duration(-5) == "0s"
+
+    def test_format_ago_none_passthrough(self):
+        assert format_ago(None) is None
+
+    def test_format_ago_renders_a_duration(self):
+        import time as time_module
+
+        assert format_ago(time_module.time() - 90) == "1m ago"
+
+    def test_parse_gcp_timestamp_none_and_empty(self):
+        assert parse_gcp_timestamp(None) is None
+        assert parse_gcp_timestamp("") is None
+
+    def test_parse_gcp_timestamp_unparsable(self):
+        assert parse_gcp_timestamp("not-a-timestamp") is None
+
+    def test_parse_gcp_timestamp_parses_rfc3339(self):
+        ts = parse_gcp_timestamp("2026-07-07T18:24:38.123-07:00")
+        assert ts is not None
+        assert ts > 0
+
+
+class TestPrintTable:
+    def test_empty_rows_is_a_noop(self, capsys):
+        print_table([])
+        assert capsys.readouterr().out == ""
+
+    def test_renders_header_and_aligned_rows(self, capsys):
+        print_table([{"name": "a", "status": "UP"}, {"name": "bb", "status": "DOWN"}])
+        out = capsys.readouterr().out.splitlines()
+        assert out[0].split() == ["NAME", "STATUS"]
+        assert "a" in out[1] and "UP" in out[1]
+        assert "bb" in out[2] and "DOWN" in out[2]
 
 
 # ─_resolve_tpu tests ─────────────────────────────────────────
@@ -448,6 +497,83 @@ class TestTpuDisconnect:
         assert "--ips" in result.output
 
 
+class TestResolveAddress:
+    """`_resolve_address` (for `eray resources`/`tpu status`/`tpu health`)
+    auto-detects the GCS address from an open eray tunnel, so a laptop
+    needs no `-a`. The tunnel store is isolated per-test by conftest."""
+
+    def test_explicit_address_wins(self):
+        assert _resolve_address("10.0.0.1:6379") == "10.0.0.1:6379"
+
+    def test_tpu_metadata_beats_a_tunnel(self):
+        import eray.provision.tunnel as tunnel_module
+
+        tpu = TpuInfo.from_ips(["10.0.0.9"], "v5p-8")
+        tunnel_module.open_tunnel(
+            "c1", [sys.executable, "-c", "import time; time.sleep(30)"], kind="qr", local_port=51000, remote_port=6379
+        )
+        try:
+            with mock.patch("eray.cli.main.detect_local_tpu", return_value=tpu):
+                assert _resolve_address(None) == "10.0.0.9:6379"
+        finally:
+            tunnel_module.stop_tunnel("c1")
+
+    def test_auto_detects_a_lone_gcs_tunnel(self):
+        import eray.provision.tunnel as tunnel_module
+
+        # local port isn't 6379 (6379 was busy) — must use the actual port
+        tunnel_module.open_tunnel(
+            "c1-gcs",
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            kind="qr",
+            local_port=51000,
+            remote_port=6379,
+        )
+        try:
+            with mock.patch("eray.cli.main.detect_local_tpu", return_value=None):
+                assert _resolve_address(None) == "127.0.0.1:51000"
+        finally:
+            tunnel_module.stop_tunnel("c1-gcs")
+
+    def test_a_dashboard_tunnel_is_not_a_gcs_tunnel(self):
+        import eray.provision.tunnel as tunnel_module
+
+        # only a dashboard tunnel (8265) open — no GCS address to resolve
+        tunnel_module.open_tunnel(
+            "c1", [sys.executable, "-c", "import time; time.sleep(30)"], kind="qr", local_port=55084, remote_port=8265
+        )
+        try:
+            with mock.patch("eray.cli.main.detect_local_tpu", return_value=None):
+                with pytest.raises(Exception, match="tunnel"):
+                    _resolve_address(None)
+        finally:
+            tunnel_module.stop_tunnel("c1")
+
+    def test_multiple_gcs_tunnels_are_ambiguous(self):
+        import eray.provision.tunnel as tunnel_module
+
+        for name, port in (("a-gcs", 51000), ("b-gcs", 51001)):
+            tunnel_module.open_tunnel(
+                name,
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                kind="qr",
+                local_port=port,
+                remote_port=6379,
+            )
+        try:
+            with mock.patch("eray.cli.main.detect_local_tpu", return_value=None):
+                with pytest.raises(Exception, match="multiple open GCS tunnels"):
+                    _resolve_address(None)
+        finally:
+            tunnel_module.stop_tunnel("a-gcs")
+            tunnel_module.stop_tunnel("b-gcs")
+
+    def test_no_tunnel_off_tpu_errors_with_guidance(self):
+        with mock.patch("eray.cli.main.detect_local_tpu", return_value=None):
+            with pytest.raises(Exception, match="open a tunnel first"):
+                _resolve_address(None)
+
+
 class TestTpuStatus:
     def test_status_requires_address_off_tpu(self):
         # Off a TPU VM there is nothing to auto-detect; must fail fast, not
@@ -564,66 +690,212 @@ class TestRequireReachableHead:
             _require_reachable_head(f"127.0.0.1:{port}")  # no raise
 
 
-class TestResourceUsage:
-    def _mock_ray(self, *, total, available, nodes=None, per_node_available=None):
-        ray_mock = mock.MagicMock()
-        ray_mock.is_initialized.return_value = True
-        ray_mock.cluster_resources.return_value = total
-        ray_mock.available_resources.return_value = available
-        ray_mock.nodes.return_value = nodes or []
-        state_mock = mock.MagicMock()
-        state_mock.available_resources_per_node.return_value = per_node_available or {}
-        return mock.patch.dict(
-            sys.modules,
-            {
-                "ray": ray_mock,
-                "ray._private": mock.MagicMock(state=state_mock),
-                "ray._private.state": state_mock,
-            },
-        )
+def _ru(name, total, used):
+    """A fake autoscaler ResourceUsage."""
+    return SimpleNamespace(resource_name=name, total=total, used=used)
 
-    def test_usage_is_total_minus_available(self):
-        with self._mock_ray(total={"CPU": 100.0, "TPU": 8.0}, available={"CPU": 60.0, "TPU": 4.0}):
+
+def _node(ip, node_id, usages):
+    """A fake autoscaler NodeInfo with a resource_usage.usage list."""
+    return SimpleNamespace(ip_address=ip, node_id=node_id, resource_usage=SimpleNamespace(usage=usages))
+
+
+def _cluster_status(cluster_usage, *, active=None, idle=None, pending=None):
+    """A fake autoscaler ClusterStatus."""
+    return SimpleNamespace(
+        cluster_resource_usage=cluster_usage,
+        active_nodes=active or [],
+        idle_nodes=idle or [],
+        pending_nodes=pending or [],
+    )
+
+
+class TestResourceUsage:
+    """`resource_usage` reads the autoscaler status (used/total per resource)
+    over GCS — no `ray.init` driver handshake (which can't complete over a
+    single tunneled port). Falls back to the dashboard state API (totals
+    only) on non-autoscaler clusters."""
+
+    def test_used_and_available_from_autoscaler(self):
+        status = _cluster_status([_ru("CPU", 100.0, 40.0), _ru("TPU", 8.0, 4.0)])
+        with (
+            mock.patch("eray.cli.tpu._require_reachable_head", lambda a, **k: None),
+            mock.patch("eray.cli.tpu._autoscaler_cluster_status", return_value=status),
+        ):
             result = resource_usage("10.0.0.1:6379")
         assert result["resources"]["CPU"] == {"total": 100.0, "available": 60.0, "used": 40.0}
         assert result["resources"]["TPU"]["used"] == 4.0
 
-    def test_fully_consumed_resource_missing_from_available(self):
-        # Ray drops exhausted resources from available_resources() entirely;
-        # usage must read as total, not KeyError or zero.
-        with self._mock_ray(total={"TPU": 8.0}, available={}):
+    def test_fully_consumed_resource_reads_zero_available(self):
+        status = _cluster_status([_ru("TPU", 8.0, 8.0)])
+        with (
+            mock.patch("eray.cli.tpu._require_reachable_head", lambda a, **k: None),
+            mock.patch("eray.cli.tpu._autoscaler_cluster_status", return_value=status),
+        ):
             result = resource_usage("10.0.0.1:6379")
         assert result["resources"]["TPU"] == {"total": 8.0, "available": 0.0, "used": 8.0}
 
-    def test_per_node_breakdown_excludes_markers_and_dead_nodes(self):
-        nodes = [
-            {
-                "NodeID": "aa",
-                "Alive": True,
-                "NodeManagerAddress": "10.0.0.10",
-                "Resources": {"TPU": 4.0, "CPU": 8.0, "node:10.0.0.10": 1.0},
-            },
-            {
-                "NodeID": "bb",
-                "Alive": True,
-                "NodeManagerAddress": "10.0.0.2",
-                "Resources": {"TPU": 4.0, "CPU": 8.0, "node:10.0.0.2": 1.0},
-            },
-            {"NodeID": "cc", "Alive": False, "NodeManagerAddress": "10.0.0.3", "Resources": {"TPU": 4.0}},
-        ]
-        per_node_available = {"aa": {"TPU": 0.0, "CPU": 8.0}, "bb": {"TPU": 4.0, "CPU": 8.0}}
-        with self._mock_ray(
-            total={"TPU": 8.0},
-            available={"TPU": 4.0},
-            nodes=nodes,
-            per_node_available=per_node_available,
+    def test_per_node_breakdown_excludes_markers_and_sorts_by_ip(self):
+        status = _cluster_status(
+            [_ru("TPU", 8.0, 4.0)],
+            active=[
+                _node("10.0.0.10", "aa", [_ru("TPU", 4.0, 4.0), _ru("CPU", 8.0, 0.0), _ru("node:10.0.0.10", 1.0, 0.0)])
+            ],
+            idle=[_node("10.0.0.2", "bb", [_ru("TPU", 4.0, 0.0), _ru("CPU", 8.0, 0.0), _ru("node:10.0.0.2", 1.0, 0.0)])],
+        )
+        with (
+            mock.patch("eray.cli.tpu._require_reachable_head", lambda a, **k: None),
+            mock.patch("eray.cli.tpu._autoscaler_cluster_status", return_value=status),
         ):
             result = resource_usage("10.0.0.1:6379", per_node=True)
         ips = [n["ip"] for n in result["nodes"]]
-        assert ips == ["10.0.0.2", "10.0.0.10"]  # numeric IP order, dead node dropped
+        assert ips == ["10.0.0.2", "10.0.0.10"]  # numeric IP order (active + idle both alive)
         busy = next(n for n in result["nodes"] if n["ip"] == "10.0.0.10")
         assert busy["resources"]["TPU"]["used"] == 4.0
         assert not any(k.startswith("node:") for n in result["nodes"] for k in n["resources"])
+
+    def test_dashboard_fallback_when_no_autoscaler(self):
+        # A connect-mode/QR cluster has no autoscaler; fall back to the
+        # dashboard state API, which has totals + liveness but no usage.
+        rows = [
+            {
+                "state": "ALIVE",
+                "node_ip": "10.0.0.1",
+                "node_id": "aa",
+                "resources_total": {"TPU": 4.0, "node:10.0.0.1": 1.0},
+            },
+            {"state": "DEAD", "node_ip": "10.0.0.9", "node_id": "zz", "resources_total": {"TPU": 4.0}},
+        ]
+        with (
+            mock.patch("eray.cli.tpu._require_reachable_head", lambda a, **k: None),
+            mock.patch("eray.cli.tpu._autoscaler_cluster_status", side_effect=RuntimeError("no autoscaler")),
+            mock.patch("eray.cli.tpu._dashboard_nodes", return_value=rows),
+        ):
+            result = resource_usage("10.0.0.1:6379", per_node=True)
+        assert result["resources"]["TPU"] == {"total": 4.0, "available": None, "used": None}
+        assert [n["ip"] for n in result["nodes"]] == ["10.0.0.1"]  # dead node dropped
+
+    def test_empty_autoscaler_status_falls_back_to_dashboard(self):
+        # A non-autoscaler cluster can answer the GCS read with an empty
+        # status instead of raising; that must not shadow the dashboard
+        # fallback and leave `eray resources` showing an empty table.
+        rows = [{"state": "ALIVE", "node_ip": "10.0.0.1", "node_id": "aa", "resources_total": {"TPU": 4.0}}]
+        with (
+            mock.patch("eray.cli.tpu._require_reachable_head", lambda a, **k: None),
+            mock.patch("eray.cli.tpu._autoscaler_cluster_status", return_value=_cluster_status([])),
+            mock.patch("eray.cli.tpu._dashboard_nodes", return_value=rows),
+        ):
+            result = resource_usage("10.0.0.1:6379")
+        assert result["resources"]["TPU"]["total"] == 4.0
+
+    def test_both_sources_fail_raises_a_readable_error(self):
+        with (
+            mock.patch("eray.cli.tpu._require_reachable_head", lambda a, **k: None),
+            mock.patch("eray.cli.tpu._autoscaler_cluster_status", side_effect=RuntimeError("no autoscaler")),
+            mock.patch("eray.cli.tpu._dashboard_nodes", side_effect=RuntimeError("dashboard down")),
+        ):
+            with pytest.raises(RuntimeError, match=r"could not read resource usage.*autoscaler.*dashboard"):
+                resource_usage("10.0.0.1:6379")
+
+
+class TestClusterStatus:
+    def test_summary_from_autoscaler(self):
+        from eray.cli.tpu import cluster_status
+
+        status = _cluster_status(
+            [_ru("TPU", 8.0, 4.0), _ru("memory", 100.0, 10.0)],
+            active=[_node("10.0.0.1", "aa", [])],
+            idle=[_node("10.0.0.2", "bb", [])],
+        )
+        with (
+            mock.patch("eray.cli.tpu._require_reachable_head", lambda a, **k: None),
+            mock.patch("eray.cli.tpu._autoscaler_cluster_status", return_value=status),
+        ):
+            result = cluster_status("10.0.0.1:6379")
+        assert result["alive_nodes"] == 2
+        assert result["resources"] == {"TPU": 8.0, "memory": 100.0}
+        assert set(result["node_ips"]) == {"10.0.0.1", "10.0.0.2"}
+        assert result["dashboard_url"] == "http://10.0.0.1:8265"
+
+    def test_total_counts_pending_and_failed_nodes(self):
+        # A crashed node stays in the total (via failed_nodes) so `Alive <
+        # Total` still flags the loss, matching the dashboard fallback's count.
+        from eray.cli.tpu import cluster_status
+
+        status = _cluster_status(
+            [_ru("TPU", 8.0, 4.0)], active=[_node("10.0.0.1", "aa", [])], pending=[SimpleNamespace()]
+        )
+        status.failed_nodes = [SimpleNamespace()]
+        with (
+            mock.patch("eray.cli.tpu._require_reachable_head", lambda a, **k: None),
+            mock.patch("eray.cli.tpu._autoscaler_cluster_status", return_value=status),
+        ):
+            result = cluster_status("10.0.0.1:6379")
+        assert result["alive_nodes"] == 1
+        assert result["total_nodes"] == 3  # 1 alive + 1 pending + 1 failed
+
+    def test_dashboard_fallback(self):
+        from eray.cli.tpu import cluster_status
+
+        rows = [
+            {"state": "ALIVE", "node_ip": "10.0.0.1", "resources_total": {"TPU": 4.0}},
+            {"state": "DEAD", "node_ip": "10.0.0.9", "resources_total": {"TPU": 4.0}},
+        ]
+        with (
+            mock.patch("eray.cli.tpu._require_reachable_head", lambda a, **k: None),
+            mock.patch("eray.cli.tpu._autoscaler_cluster_status", side_effect=RuntimeError("no autoscaler")),
+            mock.patch("eray.cli.tpu._dashboard_nodes", return_value=rows),
+        ):
+            result = cluster_status("10.0.0.1:6379")
+        assert result["alive_nodes"] == 1
+        assert result["resources"] == {"TPU": 4.0}
+        assert result["node_ips"] == ["10.0.0.1"]
+
+    def test_empty_autoscaler_status_falls_back_to_dashboard(self):
+        from eray.cli.tpu import cluster_status
+
+        rows = [{"state": "ALIVE", "node_ip": "10.0.0.1", "resources_total": {"TPU": 4.0}}]
+        with (
+            mock.patch("eray.cli.tpu._require_reachable_head", lambda a, **k: None),
+            mock.patch("eray.cli.tpu._autoscaler_cluster_status", return_value=_cluster_status([])),
+            mock.patch("eray.cli.tpu._dashboard_nodes", return_value=rows),
+        ):
+            result = cluster_status("10.0.0.1:6379")
+        assert result["alive_nodes"] == 1
+        assert result["resources"] == {"TPU": 4.0}
+
+
+class TestDashboardPortResolution:
+    """The dashboard state-API fallback must query the dashboard tunnel's
+    actual local port, not a hardcoded 8265 (which is wrong when 8265 was
+    busy and the tunnel landed elsewhere)."""
+
+    def test_loopback_resolves_open_tunnel_local_port(self):
+        from eray.cli.tpu import _dashboard_port_for
+
+        fake = SimpleNamespace(local_port=18265)
+        with mock.patch("eray.provision.tunnel.tunnels_for_remote_port", return_value=[fake]):
+            assert _dashboard_port_for("127.0.0.1") == 18265
+
+    def test_loopback_with_ambiguous_tunnels_uses_default(self):
+        from eray.cli.tpu import RAY_DASHBOARD_PORT, _dashboard_port_for
+
+        two = [SimpleNamespace(local_port=18265), SimpleNamespace(local_port=28265)]
+        with mock.patch("eray.provision.tunnel.tunnels_for_remote_port", return_value=two):
+            assert _dashboard_port_for("127.0.0.1") == RAY_DASHBOARD_PORT
+
+    def test_direct_ip_uses_default_port(self):
+        from eray.cli.tpu import RAY_DASHBOARD_PORT, _dashboard_port_for
+
+        assert _dashboard_port_for("10.0.0.5") == RAY_DASHBOARD_PORT
+
+
+class TestExcStr:
+    def test_empty_exception_str_falls_back_to_type_name(self):
+        from eray.cli.tpu import _exc_str
+
+        assert _exc_str(ConnectionError()) == "ConnectionError"
+        assert _exc_str(RuntimeError("boom")) == "boom"
 
 
 class TestResourcesCommand:
