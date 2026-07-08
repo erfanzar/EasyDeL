@@ -561,6 +561,71 @@ class RaggedDecodeAttentionConfig(BaseOperationConfig):
 
 
 @dataclass
+class CompressedWindowDecodeConfig(BaseOperationConfig):
+    """Configuration for the compressed-window decode attention operation.
+
+    Shared-KV (``K == V``) single-step (or short-query) attention with an
+    explicit per-``(slot, query, kv)`` additive bias and per-head learnable
+    attention sinks (DeepSeek-V4 compressed-window decode). The entire KV axis
+    (sliding-window ring plus compressed entries) is small and bounded, so the
+    kernel keeps it resident in VMEM and runs a single-pass sink-augmented
+    softmax rather than a flash-style online scan.
+
+    Args:
+        fwd_params: Optional ``FwdParams`` tiling hints. Currently unused by the
+            single-pass kernel (the KV axis is not blocked); accepted for
+            interface parity and future tuning.
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    fwd_params: FwdParams | None = None
+
+    def __post_init__(self):
+        """Convert dict-typed forward params to FwdParams."""
+        if isinstance(self.fwd_params, dict):
+            self.fwd_params = FwdParams(**self.fwd_params)
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class CompressedWindowAttentionConfig(BaseOperationConfig):
+    """Configuration for the compressed-window full-sequence attention operation.
+
+    Shared-KV (``K == V``) full-sequence attention with an explicit additive
+    bias and per-head learnable attention sinks (DeepSeek-V4 training / prefill
+    forward). Unlike the decode config, the KV axis can be long, so the Pallas
+    kernel streams it in tiles (``pltpu.make_async_copy`` double-buffering) with
+    a flash-style online softmax; ``fwd_params`` tunes the tile sizes.
+
+    Args:
+        fwd_params: Optional ``FwdParams`` tiling hints. ``q_blocksize`` sets the
+            query tile and ``kv_blocksize`` the streamed KV tile; both default to
+            ``min(128, round_up(axis, 8))`` when unset.
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto).
+        backend: Backend specification (default: "any").
+        window: Sliding-window size of the token-KV region. ``0`` (default)
+            scans the whole KV axis; ``> 0`` enables the Pallas band-skip
+            (O(S*window) forward + matching windowed backward).
+        token_kv_len: Length of the sliding-window token region at the front of
+            the KV axis (the rest are always-visible compressed entries). Only
+            used when ``window > 0``.
+    """
+
+    fwd_params: FwdParams | None = None
+    window: int = 0
+    token_kv_len: int = 0
+
+    def __post_init__(self):
+        """Convert dict-typed forward params to FwdParams."""
+        if isinstance(self.fwd_params, dict):
+            self.fwd_params = FwdParams(**self.fwd_params)
+
+    __hash__ = hash_fn
+
+
+@dataclass
 class RaggedPageAttentionv2Config(BaseOperationConfig):
     """Configuration for Ragged Page Attention operation.
 

@@ -94,6 +94,8 @@ from .all_gather_matmul import all_gather_matmul
 from .attention import attention
 from .blocksparse_attention import blocksparse_attention
 from .chunked_prefill_paged_decode import chunked_prefill_paged_decode
+from .compressed_window_attention import compressed_window_attention
+from .compressed_window_decode import compressed_window_decode
 from .decode_attention import decode_attention
 from .deepseek_attn import deepseek_attn
 from .flash_attention import flash_attention
@@ -141,6 +143,8 @@ __all__ = [
     "attention",
     "blocksparse_attention",
     "chunked_prefill_paged_decode",
+    "compressed_window_attention",
+    "compressed_window_decode",
     "compute_schedule_table_v2",
     "decode_attention",
     "deepseek_attn",

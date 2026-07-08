@@ -50,6 +50,8 @@ Available kernels:
 
 from .all_gather_matmul import all_gather_matmul
 from .blocksparse_attention import blocksparse_attention as blocksparse_attention
+from .compressed_window_attention import compressed_window_attention
+from .compressed_window_decode import compressed_window_decode
 from .deepseek_attn import deepseek_attn
 from .flash_attention import flash_attention
 from .flash_mla import flash_mla
@@ -77,6 +79,8 @@ from .ring_attention import ring_attention
 __all__ = (
     "all_gather_matmul",
     "blocksparse_attention",
+    "compressed_window_attention",
+    "compressed_window_decode",
     "deepseek_attn",
     "flash_attention",
     "flash_mla",

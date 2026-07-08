@@ -75,6 +75,12 @@ Note:
 from ._abstracts import OperationsMetadata, unwrap_metadata
 from ._metadatabuilder import AttentionMetadataBuilder
 from ._specs import ChunkedLocalAttentionSpec, FullAttentionSpec, KVCacheSpec, MambaSpec, SlidingWindowSpec
+from .compressed_window import (
+    CompressedWindowCache,
+    CompressedWindowCacheConfig,
+    CompressedWindowCacheView,
+    CompressedWindowMetadata,
+)
 from .hybrid import (
     HybridCache,
     HybridCacheConfig,
@@ -107,6 +113,10 @@ from .unified_attention import UnifiedAttentionCache, UnifiedAttentionCacheConfi
 __all__ = (
     "AttentionMetadataBuilder",
     "ChunkedLocalAttentionSpec",
+    "CompressedWindowCache",
+    "CompressedWindowCacheConfig",
+    "CompressedWindowCacheView",
+    "CompressedWindowMetadata",
     "FullAttentionSpec",
     "HybridCache",
     "HybridCacheConfig",
