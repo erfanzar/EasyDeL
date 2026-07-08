@@ -611,9 +611,7 @@ def watch_and_reconnect(
                 try:
                     obs = observe(record, snapshot_jobs=resubmit)
                     actions = plan(record, obs, policy)
-                    execute_actions(
-                        record, actions, registry, policy, resubmit=resubmit, dry_run=dry_run, emit=_emit
-                    )
+                    execute_actions(record, actions, registry, policy, resubmit=resubmit, dry_run=dry_run, emit=_emit)
                 except Exception as exc:  # one cluster's failure must not stop the loop
                     _emit("watch_error", f"{type(exc).__name__}: {exc}")
             if once:

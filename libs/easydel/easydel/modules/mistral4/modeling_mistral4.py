@@ -636,9 +636,7 @@ class Mistral4Attention(UnifiedAttention):
 
         rope_params = getattr(config, "rope_parameters", None) or getattr(config, "rope_scaling", None) or {}
         beta = rope_params.get("llama_4_scaling_beta") if isinstance(rope_params, dict) else None
-        original_max = (
-            rope_params.get("original_max_position_embeddings") if isinstance(rope_params, dict) else None
-        )
+        original_max = rope_params.get("original_max_position_embeddings") if isinstance(rope_params, dict) else None
         self.llama_4_scaling_beta = float(beta) if beta is not None else None
         self.llama_4_original_max_position_embeddings = float(original_max) if original_max is not None else None
 

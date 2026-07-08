@@ -216,9 +216,7 @@ class TestPaliGemma:
         }
         config = setup_config(config, {**small, "vocab_size": 1000})
         with config.mesh:
-            ed_model = create_ed_model(
-                "paligemma", ed.TaskType.IMAGE_TEXT_TO_TEXT, config, small, hf_model=hf_model
-            )
+            ed_model = create_ed_model("paligemma", ed.TaskType.IMAGE_TEXT_TO_TEXT, config, small, hf_model=hf_model)
             jax_ids = jnp.asarray(input_ids.numpy(), dtype="i4")
             jax_pixels = jnp.asarray(pixel_values.numpy(), dtype="f4")
             jax_tt = jnp.asarray(token_type_ids.numpy(), dtype="i4")

@@ -62,6 +62,7 @@ def _gcloud_or_raise(args: list[str]) -> str:
         detail = (exc.stderr or exc.stdout or "").strip()
         raise RuntimeError(f"gcloud {' '.join(args[:4])} failed: {detail or exc}") from None
 
+
 CapacityT = Literal["spot", "on-demand", "reserved", "guaranteed"]
 
 RUNTIME_VERSION_BY_FAMILY: dict[str, str] = {

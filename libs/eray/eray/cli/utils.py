@@ -217,6 +217,7 @@ class TpuInfo:
 
 # ── Local TPU auto-detection (running on the TPU VM itself) ─────
 
+
 def detect_local_tpu() -> TpuInfo | None:
     """Detect the TPU this process is running on, with no flags and no gcloud.
 

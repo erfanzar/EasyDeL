@@ -221,8 +221,9 @@ def _assert_matches_stateless_reference(
     ids = jnp.asarray([padded], dtype=jnp.int32)
     with model.mesh:
         logits = np.asarray(
-            model(input_ids=ids, position_ids=jnp.arange(_REFERENCE_PAD_LEN, dtype=jnp.int32)[None, :])
-            .logits.astype(jnp.float32)
+            model(input_ids=ids, position_ids=jnp.arange(_REFERENCE_PAD_LEN, dtype=jnp.int32)[None, :]).logits.astype(
+                jnp.float32
+            )
         )[0]
     assert np.isfinite(logits[: len(full)]).all(), "non-finite reference logits"
 

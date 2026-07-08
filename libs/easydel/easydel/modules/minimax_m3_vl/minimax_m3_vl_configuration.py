@@ -217,7 +217,9 @@ class MiniMaxM3VLTextConfig(EasyDeLBaseConfig):
             "index_topk_blocks": "sparse_topk_blocks",
             "index_local_blocks": "sparse_local_block",
         }
-        legacy_index_values = {flat: sparse_cfg[legacy] for flat, legacy in legacy_index_map.items() if legacy in sparse_cfg}
+        legacy_index_values = {
+            flat: sparse_cfg[legacy] for flat, legacy in legacy_index_map.items() if legacy in sparse_cfg
+        }
         index_n_heads = legacy_index_values.get("index_n_heads", index_n_heads)
         index_head_dim = legacy_index_values.get("index_head_dim", index_head_dim)
         index_block_size = legacy_index_values.get("index_block_size", index_block_size)
@@ -275,9 +277,7 @@ class MiniMaxM3VLTextConfig(EasyDeLBaseConfig):
             )
         invalid_attn = sorted({t for t in layer_types if t not in _VALID_ATTENTION_LAYER_TYPES})
         if invalid_attn:
-            raise ValueError(
-                f"`layer_types` entries must be one of {_VALID_ATTENTION_LAYER_TYPES}, got {invalid_attn}."
-            )
+            raise ValueError(f"`layer_types` entries must be one of {_VALID_ATTENTION_LAYER_TYPES}, got {invalid_attn}.")
         self.layer_types = list(layer_types)
 
         if mlp_layer_types is None:

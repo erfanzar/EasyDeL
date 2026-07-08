@@ -94,7 +94,12 @@ class TestCreateArgv:
         )
         assert args[args.index("--labels") + 1] == "eray-cluster=my-tpu,eray-owner=erfan"
         assert args[args.index("--metadata") + 1] == "k=v"
-        assert args[args.index("--valid-until") + 1 if "--valid-until" in args else args.index("--valid-until-duration") + 1] == "72h"
+        assert (
+            args[
+                args.index("--valid-until") + 1 if "--valid-until" in args else args.index("--valid-until-duration") + 1
+            ]
+            == "72h"
+        )
 
 
 def qr_payload(state: str, qr_id: str = "my-tpu", node_id: str = "my-tpu", acc: str = "v5p-8") -> dict:

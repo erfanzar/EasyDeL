@@ -239,9 +239,7 @@ def register(cli: click.Group) -> None:
         if poll:
             kwargs["poll"] = poll
         try:
-            qr_obj = wait_for_active(
-                name, project=project, zone=zone, on_state=lambda s: info(f"state: {s}"), **kwargs
-            )
+            qr_obj = wait_for_active(name, project=project, zone=zone, on_state=lambda s: info(f"state: {s}"), **kwargs)
         except Exception as exc:
             error(str(exc))
             raise click.ClickException(str(exc)) from exc
