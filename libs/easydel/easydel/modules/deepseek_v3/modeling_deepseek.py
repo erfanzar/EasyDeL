@@ -1487,6 +1487,7 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
         page_size: int = 128,
         hbm_utilization: float = 0.9,
         dtype: jnp.dtype | None = None,
+        max_cache_tokens: int | None = None,
     ):
         """Create paged cache configuration for MLA attention.
 
@@ -1501,6 +1502,9 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
                 Defaults to 0.9.
             dtype (jnp.dtype | None, optional): Data type for cache. Defaults to None.
 
+            max_cache_tokens: Optional hard ceiling on total KV-cache tokens;
+                the page count becomes ``min(hbm-derived, cap)``. Defaults to None.
+
         Returns:
             RaggedPagesCacheConfig: Configuration object for MLA-compatible paged cache.
         """
@@ -1509,6 +1513,9 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
 
         config = self.config
         text_config = config.get_text_config()
+
+        if dtype is None:
+            dtype = text_config.kvdtype
 
         # MLA dimensions
         q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
@@ -1533,7 +1540,7 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
             return MLARaggedPagesCacheConfig.create(
                 mesh=self.mesh,
                 runtime_sharding_resolver=text_config.runtime_sharding_resolver,
-                kvdtype=text_config.kvdtype,
+                kvdtype=dtype,
                 max_model_length=max_length,
                 num_hidden_layers=config.num_hidden_layers,
                 num_kv_heads=config.num_attention_heads,
@@ -1541,12 +1548,13 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
                 qk_rope_head_dim=config.qk_rope_head_dim,
                 hbm_utilization=hbm_utilization,
                 page_size=page_size,
+                max_cache_tokens=max_cache_tokens,
             )
 
         return RaggedPagesCacheConfig.create(
             mesh=self.mesh,
-            partition_manager=text_config.runtime_sharding_resolver,
-            kvdtype=text_config.kvdtype,
+            runtime_sharding_resolver=text_config.runtime_sharding_resolver,
+            kvdtype=dtype,
             max_model_length=max_length,
             num_hidden_layers=config.num_hidden_layers,
             num_kv_heads=config.num_attention_heads,
@@ -1555,5 +1563,6 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
             v_headdim=v_head_dim,
             hbm_utilization=hbm_utilization,
             page_size=page_size,
+            max_cache_tokens=max_cache_tokens,
             version=version,
         )
