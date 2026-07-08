@@ -1810,6 +1810,7 @@ class GlmMoeDsaForCausalLM(BaseCausalLMModule[GlmMoeDsaModel, GlmMoeDsaConfig]):
         page_size: int = 128,
         hbm_utilization: float = 0.9,
         dtype: jnp.dtype | None = None,
+        max_cache_tokens: int | None = None,
     ):
         """Create paged cache configuration for MLA attention.
 
@@ -1824,6 +1825,9 @@ class GlmMoeDsaForCausalLM(BaseCausalLMModule[GlmMoeDsaModel, GlmMoeDsaConfig]):
             hbm_utilization: Fraction of HBM the cache may consume.
                 Defaults to 0.9.
             dtype: Optional override for the cache dtype.
+
+            max_cache_tokens: Optional hard ceiling on total KV-cache tokens;
+                the page count becomes ``min(hbm-derived, cap)``. Defaults to None.
 
         Returns:
             A cache config object suitable for the chosen attention
@@ -1856,13 +1860,14 @@ class GlmMoeDsaForCausalLM(BaseCausalLMModule[GlmMoeDsaModel, GlmMoeDsaConfig]):
             return self._create_mla_ragged_page_cache_config(
                 max_length=max_length,
                 page_size=page_size,
+                max_cache_tokens=max_cache_tokens,
                 hbm_utilization=hbm_utilization,
                 dtype=dtype,
             )
 
         return RaggedPagesCacheConfig.create(
             mesh=self.mesh,
-            partition_manager=text_config.runtime_sharding_resolver,
+            runtime_sharding_resolver=text_config.runtime_sharding_resolver,
             kvdtype=text_config.kvdtype if dtype is None else dtype,
             max_model_length=max_length,
             num_hidden_layers=self.config.num_hidden_layers,
@@ -1872,6 +1877,7 @@ class GlmMoeDsaForCausalLM(BaseCausalLMModule[GlmMoeDsaModel, GlmMoeDsaConfig]):
             v_headdim=v_head_dim,
             hbm_utilization=hbm_utilization,
             page_size=page_size,
+            max_cache_tokens=max_cache_tokens,
             version=version,
         )
 

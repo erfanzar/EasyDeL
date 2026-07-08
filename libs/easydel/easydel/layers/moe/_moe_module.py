@@ -1349,10 +1349,24 @@ class BaseMoeModule(spx.Module, ABC):
                     scale_replicated_inputs=scale_replicated_inputs,
                 )
 
-                group_sizes = group_sizes[:experts_per_shard]  # only the local experts
-                # Optimize: use dynamic slice instead of masking to avoid wasted computation
-                valid_token_count = jnp.sum(group_sizes)
-                x = jax.lax.dynamic_slice_in_dim(x, 0, valid_token_count, axis=0)
+                # Keep only this shard's local experts. ``roll_to_expert_id`` above
+                # rotated the local experts to ids ``[0, experts_per_shard)`` so their
+                # tokens are the leading rows of the sorted buffer; the remaining rows
+                # belong to non-local experts.
+                #
+                # We deliberately do NOT truncate ``x`` to ``sum(group_sizes)`` here.
+                # The old code sliced with a traced length
+                # (``jax.lax.dynamic_slice_in_dim(x, 0, jnp.sum(group_sizes), ...)``),
+                # which is illegal under jit because a dynamic-slice *size* must be a
+                # static Python int (it raised ``TracerIntegerConversionError`` at
+                # trace time). Instead we leave ``x`` at its full static length and let
+                # the grouped matmul below consume only the leading ``sum(group_sizes)``
+                # rows: ``ragged_dot_general`` writes zeros for every row past
+                # ``sum(group_sizes)`` (the same guarantee the XLA grouped_matmul relies
+                # on for its m-alignment padding), so the non-local tail contributes
+                # exactly zero and this shard's contribution is unchanged. The zero tail
+                # is later summed across expert shards by the ``psum_scatter`` combine.
+                group_sizes = group_sizes[:experts_per_shard]
             else:
                 x, sorted_selected_experts, weights, group_sizes, selected_experts = permute(
                     inputs=x,
@@ -1422,23 +1436,22 @@ class BaseMoeModule(spx.Module, ABC):
                 intermediate_output = intermediate_output + wd_bias[selected_experts]
 
             if self.config.use_ring_of_experts:
-                # No need to mask - intermediate_output was already sliced to valid size
-                # If needed for unpermute shape matching, pad back to expected size
-                expected_size = sorted_selected_experts.shape[0]
-                current_size = intermediate_output.shape[0]
-                if current_size < expected_size:
-                    padding = jnp.zeros(
-                        (expected_size - current_size, intermediate_output.shape[1]), dtype=intermediate_output.dtype
-                    )
-                    intermediate_output = jnp.concatenate([intermediate_output, padding], axis=0)
-
+                # ``intermediate_output`` keeps the full static length here (rows past
+                # ``sum(group_sizes)`` are zero, see the note in the routing block
+                # above), so it already matches ``sorted_selected_experts`` and needs no
+                # padding before unpermute.
                 output = unpermute(
                     intermediate_output,
                     sorted_selected_experts,
                     weights,
                     batch_size=batch_size,
                     sequence_length=sequence_length,
-                    use_custom_sort_vjp=self.config.use_custom_sort_vjp,
+                    # Match the non-ring unpermute and the permute calls above, which all
+                    # pass a literal ``True``. ``use_custom_sort_vjp`` is a permute/unpermute
+                    # argument, not a config field, so ``self.config.use_custom_sort_vjp``
+                    # raised AttributeError once the trace reached this (previously
+                    # unreachable) ring branch.
+                    use_custom_sort_vjp=True,
                     weight_modif_fn=output_weights_hook,
                     num_experts_per_tok=self.num_experts_per_tok,
                     dtype=self.dtype,
@@ -1603,7 +1616,6 @@ class BaseMoeModule(spx.Module, ABC):
         """
         if wd_kernel is None:
             raise ValueError("MoE requires wd_kernel.")
-        self._configure_hooks_for_routing_strategy()
         with self._active_auto_expert_mesh(hidden_state):
             match self.module_moe_method:
                 case MoEMethods.STANDARD_MOE:
@@ -1740,8 +1752,7 @@ class BaseMoeModule(spx.Module, ABC):
         """
         if gate_up_kernel is None and (wi_kernel is None or wu_kernel is None):
             raise ValueError("MoE requires either gate_up_kernel or both wi_kernel and wu_kernel.")
-        self._configure_hooks_for_routing_strategy()
-        hooks = self.moe_hooks if hooks is None else hooks
+        hooks = self._configure_hooks_for_routing_strategy() if hooks is None else hooks
 
         hidden_state = hidden_state.astype(self.dtype)
         gate_hidden_state = hidden_state if gate_hidden_state is None else gate_hidden_state.astype(self.dtype)
@@ -1855,12 +1866,18 @@ class BaseMoeModule(spx.Module, ABC):
 
         return output, prein_gate_logits
 
-    def _configure_hooks_for_routing_strategy(self) -> None:
-        """Configure default hooks based on the current routing strategy.
+    def _configure_hooks_for_routing_strategy(self) -> MoeFusedHooks:
+        """Resolve the effective hooks for the current routing strategy.
 
         This method ensures each routing strategy has appropriate hook configuration
-        without requiring manual setup. Only sets hooks if they haven't been explicitly
-        configured by the user.
+        without requiring manual setup. Only fills in a default ``refine_weights_hook``
+        if one has not been explicitly configured by the user.
+
+        The resolved :class:`MoeFusedHooks` is *returned* rather than written back to
+        ``self.moe_hooks``: assigning a new attribute on an :class:`spx.Module` bumps
+        the graph epoch, which is an illegal structural mutation when the forward runs
+        under a readonly transform (e.g. the jitted training step). Callers thread the
+        returned value through instead of relying on a side effect.
 
         **Hook Configuration by Strategy:**
 
@@ -1881,7 +1898,7 @@ class BaseMoeModule(spx.Module, ABC):
         """
         # Only set default refine_weights_hook if one wasn't already configured by the user.
         if self.moe_hooks.refine_weights_hook is not None:
-            return
+            return self.moe_hooks
 
         refine_weights_hook = None
         if self.routing_strategy == MoeRoutingStrategy.TOP_K:
@@ -1965,7 +1982,8 @@ class BaseMoeModule(spx.Module, ABC):
                 refine_weights_hook = uniform_weights
 
         if refine_weights_hook is not None:
-            self.moe_hooks = self.moe_hooks.replace(refine_weights_hook=refine_weights_hook)
+            return self.moe_hooks.replace(refine_weights_hook=refine_weights_hook)
+        return self.moe_hooks
 
     def _moe_call_standard(
         self,
@@ -2006,9 +2024,7 @@ class BaseMoeModule(spx.Module, ABC):
             - output: MoE layer output. Shape: [B, S, H].
             - metrics_or_logits: MoeMetrics if output_metrics=True, else router_logits.
         """
-        self._configure_hooks_for_routing_strategy()
-
-        hooks = self.moe_hooks
+        hooks = self._configure_hooks_for_routing_strategy()
 
         hidden_state = hidden_state.astype(self.dtype)
         if hooks.before_gate is not None:
