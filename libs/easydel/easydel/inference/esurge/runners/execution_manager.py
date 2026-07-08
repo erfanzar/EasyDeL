@@ -480,6 +480,9 @@ class ExecutionManager:
         self.pp_microbatch_size = pp_microbatch_size
         self.speculative_recurrent_state_tokens = max(0, int(speculative_recurrent_state_tokens))
         self.enable_spec_recurrent_commit_metadata = self.speculative_recurrent_state_tokens > 0
+        # Slot-indexed state families (compressed-window caches) receive the
+        # per-row physical state-slot ids in the batch metadata every step.
+        self._slot_indexed_state = getattr(model, "esurge_cache_family", None) == "compressed_window"
         self.min_input_pad = min_input_pad
         self.max_model_len = max_model_len
         self.max_num_reqs = max_num_reqs
@@ -547,6 +550,7 @@ class ExecutionManager:
             min_input_pad=self.min_input_pad,
             enable_spec_recurrent_commit=self.enable_spec_recurrent_commit_metadata,
             input_sharding=self._input_sharding,
+            slot_indexed_state=self._slot_indexed_state,
         )
         self._model_executor = ModelStepExecutor(
             model=self.model,
@@ -564,6 +568,7 @@ class ExecutionManager:
             full_hidden_state_max_tokens=self.full_hidden_state_max_tokens,
             enable_spec_recurrent_commit=self.enable_spec_recurrent_commit_metadata,
             input_sharding=self._input_sharding,
+            slot_indexed_state=self._slot_indexed_state,
         )
         self._sampler_vocab_size = int(self.model.config.get_text_config().vocab_size)
         self._sampler_executor = SamplerExecutor(
@@ -2679,9 +2684,13 @@ class ExecutionManager:
         rows for every recurrent or hybrid layer present, leaving
         attention layers untouched.
 
-        No-op when the cache is not a :class:`HybridCache` (purely
-        attention models have no recurrent state to clear) or when no
-        slots were freed.
+        Compressed-window caches (DeepSeek-V4) reset the freed rows across
+        every layer's ring/compressor/indexer state via
+        :meth:`~easydel.caching.CompressedWindowCache.reset_slots`.
+
+        No-op when the cache is neither a :class:`HybridCache` nor a
+        :class:`~easydel.caching.CompressedWindowCache` (purely attention
+        models have no per-slot state to clear) or when no slots were freed.
 
         Args:
             slot_indices: Row indices in ``[0, max_num_reqs)`` whose
@@ -2690,6 +2699,11 @@ class ExecutionManager:
         if not slot_indices:
             return
         cache = self.kv_pages
+        from easydel.caching import CompressedWindowCache
+
+        if isinstance(cache, CompressedWindowCache):
+            self.kv_pages = cache.reset_slots(numpy.asarray(sorted({int(s) for s in slot_indices}), dtype=numpy.int32))
+            return
         if not isinstance(cache, HybridCache):
             return
 

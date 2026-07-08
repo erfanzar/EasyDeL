@@ -328,6 +328,14 @@ class Scheduler(SchedulerInterface):
         metadata = runner.metadata
         model_config = runner.model.config
 
+        if enable_prefix_caching and getattr(runner.model, "esurge_cache_family", None) == "compressed_window":
+            # Compressed-window state (DeepSeek-V4 rings/compressor streams)
+            # cannot skip prefix tokens: every token must flow through the
+            # per-slot recurrence, so page-hash reuse would desynchronize the
+            # cache from the stream. Force prefix caching off for this family.
+            logger.warning("Disabling prefix caching: compressed-window cache models must process every prompt token.")
+            enable_prefix_caching = False
+
         if max_num_batched_tokens is None:
             max_num_batched_tokens = runner.max_model_len
 

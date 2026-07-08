@@ -126,6 +126,7 @@ class BatchMetadataPreparer:
         min_input_pad: int,
         enable_spec_recurrent_commit: bool = False,
         input_sharding: jax.sharding.Sharding | None = None,
+        slot_indexed_state: bool = False,
     ) -> None:
         """Initialize the BatchMetadataPreparer.
 
@@ -147,6 +148,11 @@ class BatchMetadataPreparer:
             enable_spec_recurrent_commit: If True, the host payload reserves a
                 slot for the speculative recurrent commit metadata. Required
                 when running the recurrent-drafter speculative decoding path.
+            slot_indexed_state: If True (compressed-window cache families),
+                the per-row physical state-slot ids ride the payload as
+                ``dp_recurrent_state_indices`` (shape ``[1, rows]``) even
+                without SPMD DP, so the model can address per-request slot
+                state that survives SequenceBuffer row moves.
 
         Note:
             This constructor preallocates all CPU buffers to avoid per-step
@@ -162,6 +168,7 @@ class BatchMetadataPreparer:
         self.max_model_len = int(max_model_len)
         self.min_input_pad = int(min_input_pad)
         self._enable_spec_recurrent_commit = bool(enable_spec_recurrent_commit)
+        self._slot_indexed_state = bool(slot_indexed_state)
 
         self._metadata_version = metadata.version
         self._use_slot_mapping = self._metadata_version == "v2"
@@ -833,6 +840,17 @@ class BatchMetadataPreparer:
                 input_ids[off : off + n] = token_ids_cpu[req_idx, start:end]
                 logits_indices[req_idx] = off + n - 1
                 off += n
+            if self._slot_indexed_state:
+                # Per-row physical state-slot ids for slot-indexed cache
+                # families (aligned with query_start_loc rows).
+                rows_cap = int(dp_recurrent_state_indices.shape[1])
+                fill_rows = min(num_requests, rows_cap)
+                if recurrent_slot_indices_cpu is None:
+                    dp_recurrent_state_indices[0, :fill_rows] = np.arange(fill_rows, dtype=np.int32)
+                else:
+                    dp_recurrent_state_indices[0, :fill_rows] = np.asarray(
+                        recurrent_slot_indices_cpu[:fill_rows], dtype=np.int32
+                    )
 
         # seq_lens: computed tokens after this forward (start + scheduled).
         seq_lens.fill(0)
@@ -979,6 +997,8 @@ class BatchMetadataPreparer:
                 dp_context_lens,
                 dp_recurrent_state_indices,
             )
+        elif self._slot_indexed_state:
+            common_payload = (*common_payload, dp_recurrent_state_indices)
         if self._enable_spec_recurrent_commit:
             common_payload = (*common_payload, spec_recurrent_commit_payload)
         if self._use_slot_mapping:
@@ -1137,6 +1157,9 @@ class BatchMetadataPreparer:
             payload_idx += 1
             dp_context_lens_dev = device_payload[payload_idx]
             payload_idx += 1
+            dp_recurrent_state_indices_dev = device_payload[payload_idx]
+            payload_idx += 1
+        elif self._slot_indexed_state:
             dp_recurrent_state_indices_dev = device_payload[payload_idx]
             payload_idx += 1
         spec_recurrent_commit_dev = None
@@ -1476,6 +1499,9 @@ class BatchMetadataPreparer:
             payload_idx += 1
             dp_context_lens_dev = self._pending_transfer[payload_idx]
             payload_idx += 1
+            dp_recurrent_state_indices_dev = self._pending_transfer[payload_idx]
+            payload_idx += 1
+        elif self._slot_indexed_state:
             dp_recurrent_state_indices_dev = self._pending_transfer[payload_idx]
             payload_idx += 1
         spec_recurrent_commit_dev = None
