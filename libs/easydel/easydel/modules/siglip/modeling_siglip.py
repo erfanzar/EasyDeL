@@ -429,6 +429,10 @@ class SiglipAttention(AttentionModule):
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=config.attention_dropout,
             rngs=rngs,
+            # SigLIP runs dense, cache-free encoder attention. Pinning "vanilla"
+            # keeps towers functional when serving stacks recursively retarget
+            # `attn_mechanism` to paged mechanisms (mirrors Qwen2-VL's tower).
+            attn_mechanism="vanilla",
             requires_cache=False,  # Vision/text encoder doesn't need KV cache
         )
 
@@ -949,6 +953,12 @@ class SiglipTextModel(EasyDeLBaseModule):
     any task-specific head, suitable for use in contrastive learning.
     """
 
+    # transformers >= 5.13 flattened ``text_model`` out of the standalone HF
+    # class (see transformers' checkpoint-conversion mapping for
+    # ``SiglipTextModel``); EasyDeL keeps the wrapper, so conversion re-inserts
+    # this prefix into new-layout state-dict keys.
+    _hf_flattened_wrapper = "text_model"
+
     def __init__(
         self,
         config: SiglipTextConfig,
@@ -1409,6 +1419,12 @@ class SiglipVisionModel(EasyDeLBaseModule):
     A bare vision transformer that processes images and produces embeddings
     without any task-specific head, suitable for use in contrastive learning.
     """
+
+    # transformers >= 5.13 flattened ``vision_model`` out of the standalone HF
+    # class (see transformers' checkpoint-conversion mapping for
+    # ``SiglipVisionModel``); EasyDeL keeps the wrapper, so conversion
+    # re-inserts this prefix into new-layout state-dict keys.
+    _hf_flattened_wrapper = "vision_model"
 
     def __init__(
         self,

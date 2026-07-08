@@ -37,7 +37,7 @@ dependencies = [
 	"spectrax-lib==0.1.5",
 	"ray[default]==2.54.0",
 	"einops~=0.8.0",
-	"transformers~=5.5.0",
+	"transformers~=5.13.0",
 	"sentencepiece>=0.2.0",
 	"fastapi>=0.115.2",
 	"wandb>=0.22.2",

@@ -390,6 +390,69 @@ class StateDictConverter:
         return all(t in string for t in required) and not any(n in string for n in forbidden)
 
     @staticmethod
+    def normalize_flattened_wrapper_key(key: str, flattened_wrappers: Mapping[str, str] | None) -> str:
+        """Re-insert a wrapper-module prefix that newer transformers flattened away.
+
+        transformers >= 5.13 removed the inner wrapper module from standalone
+        tower classes (e.g. ``CLIPVisionModel.state_dict()`` keys went from
+        ``vision_model.embeddings...`` to ``embeddings...``); the rename is
+        published per class via ``transformers`` checkpoint-conversion
+        mappings (``get_checkpoint_conversion_mapping("CLIPVisionModel")``).
+        EasyDeL module trees keep the wrapper submodule, so keys arriving in
+        the new (flattened) layout must have the wrapper name re-inserted,
+        while old-layout keys (real hub checkpoints) pass through unchanged.
+
+        Args:
+            key: Dot-separated HF state-dict key.
+            flattened_wrappers: Mapping of module subtree path (``""`` for the
+                root module) to the wrapper submodule name the EasyDeL tree
+                keeps but new transformers layouts drop.
+
+        Returns:
+            The key with the wrapper prefix inserted when missing; the
+            original key otherwise (idempotent for already-prefixed keys).
+        """
+        if not flattened_wrappers:
+            return key
+        for subtree in sorted(flattened_wrappers, key=len, reverse=True):
+            wrapper = flattened_wrappers[subtree]
+            prefix = f"{subtree}." if subtree else ""
+            if prefix and not key.startswith(prefix):
+                continue
+            remainder = key[len(prefix) :]
+            if not remainder:
+                continue
+            if remainder == wrapper or remainder.startswith(f"{wrapper}."):
+                return key
+            return f"{prefix}{wrapper}.{remainder}"
+        return key
+
+    @staticmethod
+    def normalize_flattened_wrapper_keys(
+        state_dict: dict[str, tp.Any],
+        flattened_wrappers: Mapping[str, str] | None,
+    ) -> dict[str, tp.Any]:
+        """Apply :meth:`normalize_flattened_wrapper_key` to a whole state dict.
+
+        Args:
+            state_dict: HuggingFace-style state dict (key -> tensor).
+            flattened_wrappers: Subtree-path to wrapper-name mapping; ``None``
+                or empty returns ``state_dict`` unchanged.
+
+        Returns:
+            The same dict when no rule applies, otherwise a new dict with
+            renamed keys (tensor values are shared, not copied).
+        """
+        if not flattened_wrappers:
+            return state_dict
+        renamed = {
+            key: StateDictConverter.normalize_flattened_wrapper_key(key, flattened_wrappers) for key in state_dict
+        }
+        if all(key == new_key for key, new_key in renamed.items()):
+            return state_dict
+        return {renamed[key]: value for key, value in state_dict.items()}
+
+    @staticmethod
     def collect_reform_param_fusion_groups(
         keys: tp.Iterable[str],
         reform_param: dict | None,
@@ -1040,6 +1103,7 @@ class StateDictConverter:
         lm_head_name: str | None = None,
         uses_tie_word_embedding: bool = False,
         reform_param: dict | None = None,
+        hf_flattened_wrappers: Mapping[str, str] | None = None,
         **kwargs,
     ) -> dict[str, tp.Any]:
         """Convert a PyTorch state dict to EasyDeL format with MoE support.
@@ -1065,10 +1129,16 @@ class StateDictConverter:
             lm_head_name: Language model head parameter name.
             uses_tie_word_embedding: Whether embeddings are tied.
             reform_param: Optional splitting/merging rules.
+            hf_flattened_wrappers: Optional mapping of module subtree path to
+                the wrapper submodule name dropped from live HF state dicts by
+                transformers >= 5.13 (see
+                :meth:`normalize_flattened_wrapper_key`). Keys in either the
+                old (wrapper-prefixed) or new (flattened) layout are accepted.
 
         Returns:
             Nested EasyDeL parameter dictionary.
         """
+        state_dict = StateDictConverter.normalize_flattened_wrapper_keys(state_dict, hf_flattened_wrappers)
         consolidated_moe_keys = set()
         debug = bool(kwargs.pop("debug", False))
         if moe_block_names is not None and moe_names is not None:
