@@ -168,11 +168,15 @@ from .all_gather_matmul import AllGatherMatmul, all_gather_matmul
 from .attention import Attention, attention
 from .blocksparse_attention import BlockSparseAttention, blocksparse_attention
 from .chunked_prefill_paged_decode import ChunkedPrefillPagedDecode, chunked_prefill_paged_decode
+from .compressed_window_attention import CompressedWindowAttention, compressed_window_attention
+from .compressed_window_decode import CompressedWindowDecode, compressed_window_decode
 from .configs import (
     AllGatherMatmulConfig,
     AttentionConfig,
     BlockSparseAttentionConfig,
     ChunkedPrefillPagedDecodeConfig,
+    CompressedWindowAttentionConfig,
+    CompressedWindowDecodeConfig,
     DecodeAttentionConfig,
     DeepSeekAttentionConfig,
     FlashAttentionConfig,
@@ -300,6 +304,10 @@ __all__ = (
     "BlockSparseAttentionConfig",
     "ChunkedPrefillPagedDecode",
     "ChunkedPrefillPagedDecodeConfig",
+    "CompressedWindowAttention",
+    "CompressedWindowAttentionConfig",
+    "CompressedWindowDecode",
+    "CompressedWindowDecodeConfig",
     "CrossEntropyOutput",
     "DecodeAttention",
     "DecodeAttentionConfig",
@@ -384,6 +392,8 @@ __all__ = (
     "attention",
     "blocksparse_attention",
     "chunked_prefill_paged_decode",
+    "compressed_window_attention",
+    "compressed_window_decode",
     "compute_schedule_table_v2",
     "decode_attention",
     "deepseek_attn",

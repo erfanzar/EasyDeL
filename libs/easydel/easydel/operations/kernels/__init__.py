@@ -107,6 +107,8 @@ Example:
 """
 
 from .blocksparse_attention import BlockSparseAttn
+from .compressed_window_attention import CompressedWindowAttn
+from .compressed_window_decode import CompressedWindowDecodeAttn
 from .decode_attention import AutoRegressiveDecodeAttn
 from .flash_attention import FlashAttn
 from .gated_delta_rule import GatedDeltaRuleOp, GatedDeltaRuleOutput
@@ -128,6 +130,8 @@ from .vanilla_attention import VanillaAttn
 __all__ = (
     "AutoRegressiveDecodeAttn",
     "BlockSparseAttn",
+    "CompressedWindowAttn",
+    "CompressedWindowDecodeAttn",
     "FlashAttn",
     "GDNComputeScheduleV2",
     "GDNComputeScheduleV2Config",
