@@ -106,6 +106,7 @@ from .sequence_buffer import (
 )
 from .slot_pool import RecurrentSlotPool
 from .states import CachedRequestState
+from .window_planner import WindowPlanner
 
 if typing.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
@@ -486,6 +487,10 @@ class eSurgeRunner:
                     f"Rank-major SPMD DP requires at least one token bucket divisible by DP size {dp_size}."
                 )
         self.max_num_tokens = self.num_tokens_paddings[-1]
+        self.window_planner = WindowPlanner(
+            num_tokens_paddings=self.num_tokens_paddings,
+            max_num_seq_buckets=self.max_num_seq_buckets,
+        )
         spec_full_hidden_max_tokens = 0
         if drafter is not None:
             spec_window_tokens = max(1, int(self.num_speculative_tokens) + 1)
@@ -960,57 +965,17 @@ class eSurgeRunner:
     def _get_token_paddings(min_token_size: int, max_token_size: int, padding_gap: int) -> list[int]:
         """Generate padding sizes for efficient compilation.
 
-        Args:
-            min_token_size: Minimum token size (must be power of 2)
-            max_token_size: Maximum token size to cover
-            padding_gap: Gap between padding sizes (0 for exponential growth)
-
-        Returns:
-            List of padding sizes
+        Delegates to :meth:`WindowPlanner.get_token_paddings`.
         """
-        if not ((min_token_size & (min_token_size - 1) == 0) and min_token_size > 0):
-            logger.error(f"Invalid min_token_size={min_token_size}, must be power of 2")
-            raise ValueError(f"min_token_size must be a power of 2, got {min_token_size}")
-        paddings = []
-        num = min_token_size
-
-        if padding_gap == 0:
-            while num <= max_token_size:
-                paddings.append(num)
-                num *= 2
-        else:
-            while num <= padding_gap:
-                paddings.append(num)
-                num *= 2
-            num //= 2
-            while num < max_token_size:
-                num += padding_gap
-                paddings.append(num)
-        if paddings[-1] != max_token_size:
-            paddings.append(max_token_size)
-        return paddings
+        return WindowPlanner.get_token_paddings(min_token_size, max_token_size, padding_gap)
 
     @staticmethod
     def _get_request_paddings(min_bucket: int, max_bucket: int) -> list[int]:
         """Generate request count buckets using exponential growth.
 
-        Args:
-            min_bucket: Minimum bucket size.
-            max_bucket: Maximum bucket size (must be included).
-
-        Returns:
-            List of bucket sizes from min_bucket to max_bucket,
-            doubling at each step.
+        Delegates to :meth:`WindowPlanner.get_request_paddings`.
         """
-        min_bucket = max(1, min(min_bucket, max_bucket))
-        buckets: list[int] = []
-        current = min_bucket
-        while current < max_bucket:
-            buckets.append(current)
-            current *= 2
-        if not buckets or buckets[-1] != max_bucket:
-            buckets.append(max_bucket)
-        return buckets
+        return WindowPlanner.get_request_paddings(min_bucket, max_bucket)
 
     def _init_seq_buckets(
         self,
@@ -1020,69 +985,25 @@ class eSurgeRunner:
     ) -> list[int]:
         """Initialize sequence count buckets for compilation.
 
-        Args:
-            user_buckets: Optional user-provided compile bucket sizes. Values
-                may exceed ``max_num_seqs`` so the compiled static request
-                width can match another runtime's padding policy while the
-                scheduler still caps active concurrency at ``max_num_seqs``.
-            max_num_seqs: Maximum number of concurrently running sequences.
-            min_input_pad: Minimum input padding.
-
-        Returns:
-            Sorted list of request compile buckets. Without explicit buckets,
-            derives the usual padding ladder from ``min_input_pad`` to
-            ``max_num_seqs``. With explicit buckets, preserves valid positive
-            buckets and ensures at least one bucket can hold ``max_num_seqs``.
+        Delegates to :meth:`WindowPlanner.init_seq_buckets`.
         """
-        if user_buckets:
-            buckets = sorted({int(b) for b in user_buckets if int(b) > 0})
-        else:
-            buckets = self._get_request_paddings(min_input_pad, max_num_seqs)
-        if not buckets or buckets[-1] < max_num_seqs:
-            buckets.append(max_num_seqs)
-        return buckets
+        return WindowPlanner.init_seq_buckets(user_buckets, max_num_seqs, min_input_pad)
 
     def _get_current_bucket(self, num_reqs: int) -> int:
         """Select the smallest bucket that can accommodate num_reqs.
 
-        Args:
-            num_reqs: Number of active requests
-
-        Returns:
-            Smallest sufficient bucket size from the active runtime buckets.
+        Delegates to :meth:`WindowPlanner.get_current_bucket`, passing the
+        runtime-clamped bucket list when it has been set up.
         """
-        buckets = getattr(self, "active_num_seq_buckets", self.max_num_seq_buckets)
-        if num_reqs <= 0:
-            return buckets[0]
-        for bucket in buckets:
-            if num_reqs <= bucket:
-                return bucket
-        return buckets[-1]
+        return self.window_planner.get_current_bucket(num_reqs, getattr(self, "active_num_seq_buckets", None))
 
     @staticmethod
     def _clamp_request_buckets_to_runtime_cap(buckets: list[int], runtime_cap: int) -> list[int]:
         """Clamp request-count buckets to the runtime execution cap.
 
-        The runner may admit more requests globally than it can execute in a
-        single scheduler window.  Compilation and bucket lookup should
-        therefore only consider request-count buckets that are reachable
-        under the current runtime window cap.
-
-        Args:
-            buckets: Original list of request-count bucket sizes.
-            runtime_cap: Maximum number of requests executable in one
-                scheduler window.
-
-        Returns:
-            Sorted list of bucket sizes where every entry is at most
-            ``runtime_cap``, with ``runtime_cap`` itself always included
-            as the final element.
+        Delegates to :meth:`WindowPlanner.clamp_request_buckets_to_runtime_cap`.
         """
-        runtime_cap = max(1, int(runtime_cap))
-        clamped = sorted({int(bucket) for bucket in buckets if 0 < int(bucket) <= runtime_cap})
-        if not clamped or clamped[-1] != runtime_cap:
-            clamped.append(runtime_cap)
-        return clamped
+        return WindowPlanner.clamp_request_buckets_to_runtime_cap(buckets, runtime_cap)
 
     def _setup_variables(self):
         """Initialize internal variables and preallocate reusable buffers.
@@ -1374,66 +1295,15 @@ class eSurgeRunner:
     ) -> tuple[np.ndarray, list[str | None], list[int], int, bool]:
         """Collect runnable rows for a window, compacting interior zero-token gaps.
 
-        The scheduler keeps some RUNNING requests resident even when they
-        receive zero tokens in the current step. When such rows appear in the
-        middle of a window, the execution key can become `(few tokens, many
-        requests)`, which is not a real batch shape. This helper preserves the
-        common contiguous-prefix fast path and only packs rows when interior
-        zero-token gaps are present.
+        Delegates to :meth:`WindowPlanner.collect_schedulable_window_rows` with
+        the live sequence-buffer row ids.
         """
-        start_index = max(0, int(start_index))
-        stop_index = max(start_index, int(stop_index))
-
-        window_req_ids: list[str | None] = []
-        window_scheduled: list[int] = []
-        last_positive_offset = -1
-
-        for global_row_index in range(start_index, stop_index):
-            rid = self.sequence_buffer.req_ids[global_row_index]
-            scheduled = int(scheduled_tokens_by_req.get(rid, 0)) if rid is not None else 0
-            window_req_ids.append(rid)
-            window_scheduled.append(scheduled)
-            if rid is not None and scheduled > 0:
-                last_positive_offset = global_row_index - start_index
-
-        if last_positive_offset < 0:
-            return np.empty((0,), dtype=np.int32), [], [], stop_index, False
-
-        prefix_stop = last_positive_offset + 1
-        has_interior_zero_rows = any(
-            rid is None or scheduled <= 0
-            for rid, scheduled in zip(window_req_ids[:prefix_stop], window_scheduled[:prefix_stop], strict=False)
-        )
-
-        if not has_interior_zero_rows:
-            row_indices = np.arange(start_index, start_index + prefix_stop, dtype=np.int32)
-            req_ids_window: list[str | None] = [typing.cast(str, rid) for rid in window_req_ids[:prefix_stop]]
-            scheduled_list = [int(scheduled) for scheduled in window_scheduled[:prefix_stop]]
-            return row_indices, req_ids_window, scheduled_list, start_index + prefix_stop, False
-
-        if not allow_sparse_packing:
-            row_indices = np.arange(start_index, start_index + prefix_stop, dtype=np.int32)
-            req_ids_window = [typing.cast(str | None, rid) for rid in window_req_ids[:prefix_stop]]
-            scheduled_list = [int(scheduled) for scheduled in window_scheduled[:prefix_stop]]
-            return row_indices, req_ids_window, scheduled_list, start_index + prefix_stop, False
-
-        row_indices_list: list[int] = []
-        req_ids_window: list[str | None] = []
-        scheduled_list: list[int] = []
-        for offset in range(prefix_stop):
-            rid = window_req_ids[offset]
-            scheduled = int(window_scheduled[offset])
-            if rid is None or scheduled <= 0:
-                continue
-            row_indices_list.append(start_index + offset)
-            req_ids_window.append(rid)
-            scheduled_list.append(scheduled)
-        return (
-            np.asarray(row_indices_list, dtype=np.int32),
-            req_ids_window,
-            scheduled_list,
-            start_index + prefix_stop,
-            True,
+        return WindowPlanner.collect_schedulable_window_rows(
+            req_ids=self.sequence_buffer.req_ids,
+            start_index=start_index,
+            stop_index=stop_index,
+            scheduled_tokens_by_req=scheduled_tokens_by_req,
+            allow_sparse_packing=allow_sparse_packing,
         )
 
     def _precompile_jitted_helpers(
