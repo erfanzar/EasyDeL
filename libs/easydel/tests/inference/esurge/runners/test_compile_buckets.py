@@ -14,8 +14,8 @@
 
 import numpy as np
 import pytest
-
 from easydel.inference.esurge.runners.execution_manager import ExecutionManager
+from easydel.inference.esurge.runners.executors.sampler_executor import SamplerRuntime
 
 
 class _SpmdMesh:
@@ -130,25 +130,25 @@ def test_window_emits_token_accepts_unpadded_request_vectors():
 
 
 def test_compact_sampler_window_masks_rows_missing_unpadded_cpu_state():
-    manager = ExecutionManager.__new__(ExecutionManager)
-    manager._sampler_min_input_pad = 1
-    manager.max_num_reqs = 4
-    manager._sampler_gather_positions_cpu = np.zeros((4,), dtype=np.int32)
-    manager._sampler_sampling_seeds_cpu = np.zeros((4,), dtype=np.int32)
-    manager._sampler_scatter_positions_cpu = np.zeros((4,), dtype=np.int32)
-    manager._sampler_window_row_indices_cpu = np.zeros((4,), dtype=np.int32)
-    manager._sampler_scheduled_cpu = np.zeros((4,), dtype=np.int32)
-    manager._sampler_seq_lens_cpu = np.zeros((4,), dtype=np.int32)
-    manager._sampler_active_mask_cpu = np.zeros((4,), dtype=np.bool_)
-    manager._sampler_temperature_cpu = np.ones((4,), dtype=np.float32)
-    manager._sampler_top_p_cpu = np.ones((4,), dtype=np.float32)
-    manager._sampler_top_k_cpu = np.zeros((4,), dtype=np.int32)
-    manager._sampler_min_p_cpu = np.zeros((4,), dtype=np.float32)
-    manager._sampler_frequency_penalties_cpu = np.zeros((4,), dtype=np.float32)
-    manager._sampler_presence_penalties_cpu = np.zeros((4,), dtype=np.float32)
-    manager._sampler_repetition_penalties_cpu = np.ones((4,), dtype=np.float32)
+    runtime = SamplerRuntime.__new__(SamplerRuntime)
+    runtime._sampler_min_input_pad = 1
+    runtime.max_num_reqs = 4
+    runtime._sampler_gather_positions_cpu = np.zeros((4,), dtype=np.int32)
+    runtime._sampler_sampling_seeds_cpu = np.zeros((4,), dtype=np.int32)
+    runtime._sampler_scatter_positions_cpu = np.zeros((4,), dtype=np.int32)
+    runtime._sampler_window_row_indices_cpu = np.zeros((4,), dtype=np.int32)
+    runtime._sampler_scheduled_cpu = np.zeros((4,), dtype=np.int32)
+    runtime._sampler_seq_lens_cpu = np.zeros((4,), dtype=np.int32)
+    runtime._sampler_active_mask_cpu = np.zeros((4,), dtype=np.bool_)
+    runtime._sampler_temperature_cpu = np.ones((4,), dtype=np.float32)
+    runtime._sampler_top_p_cpu = np.ones((4,), dtype=np.float32)
+    runtime._sampler_top_k_cpu = np.zeros((4,), dtype=np.int32)
+    runtime._sampler_min_p_cpu = np.zeros((4,), dtype=np.float32)
+    runtime._sampler_frequency_penalties_cpu = np.zeros((4,), dtype=np.float32)
+    runtime._sampler_presence_penalties_cpu = np.zeros((4,), dtype=np.float32)
+    runtime._sampler_repetition_penalties_cpu = np.ones((4,), dtype=np.float32)
 
-    sample_count, sampler_padded_num_reqs, total_tokens = manager._prepare_compact_sampler_window(
+    sample_count, sampler_padded_num_reqs, total_tokens = runtime._prepare_compact_sampler_window(
         padded_num_reqs=4,
         scheduled_full_cpu=np.array([1, 1, 1, 1], dtype=np.int32),
         active_mask_full_cpu=np.array([True, True, True, True], dtype=np.bool_),
@@ -166,9 +166,9 @@ def test_compact_sampler_window_masks_rows_missing_unpadded_cpu_state():
     assert sample_count == 3
     assert sampler_padded_num_reqs == 4
     assert total_tokens == 3
-    np.testing.assert_array_equal(manager._sampler_gather_positions_cpu, np.array([0, 1, 2, 0], dtype=np.int32))
-    np.testing.assert_array_equal(manager._sampler_active_mask_cpu, np.array([True, True, True, False]))
-    np.testing.assert_array_equal(manager._sampler_seq_lens_cpu, np.array([5, 6, 7, 0], dtype=np.int32))
+    np.testing.assert_array_equal(runtime._sampler_gather_positions_cpu, np.array([0, 1, 2, 0], dtype=np.int32))
+    np.testing.assert_array_equal(runtime._sampler_active_mask_cpu, np.array([True, True, True, False]))
+    np.testing.assert_array_equal(runtime._sampler_seq_lens_cpu, np.array([5, 6, 7, 0], dtype=np.int32))
 
 
 def test_runtime_bucket_validation_rejects_missing_spmd_bucket():
