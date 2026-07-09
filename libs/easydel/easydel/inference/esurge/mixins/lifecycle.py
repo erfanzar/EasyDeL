@@ -94,6 +94,10 @@ class EngineLifecycleMixin:
             ``"Non-DP-local page IDs detected"`` or ``"Distributed step
             synchronization failure"``); ``False`` otherwise.
         """
+        from ..distributed.coordinator import StepCoordinationError
+
+        if isinstance(exc, StepCoordinationError):
+            return True
         msg = str(exc)
         return isinstance(exc, ValueError) and (
             "Non-DP-local page IDs detected" in msg or "Distributed step synchronization failure" in msg
@@ -528,12 +532,12 @@ class EngineLifecycleMixin:
     def initiate(self) -> None:
         """Start (or wake) the background scheduler so requests can flow.
 
-        Two flavours of behaviour, gated by ``distributed_mode``:
+        Two flavours of behaviour, decided by the step coordinator:
 
-        * **Worker rank** in distributed mode — boots the control server
-          via :meth:`DistributedController.start`, ensures KV pages are
-          allocated, and returns; no scheduler thread is spawned because
-          the leader will dispatch each step over RPC.
+        * **Worker rank** (``coordination="zmq"``) — connects to the leader,
+          ensures KV pages are allocated, and spawns the replay thread that
+          executes the leader's step stream; no scheduler thread is spawned
+          because the leader owns scheduling.
         * **Leader rank or single-host** — re-allocates KV pages if they
           were previously destroyed, clears any prior crash state,
           installs SIGTERM diagnostics, and spawns the daemon scheduler
@@ -564,23 +568,6 @@ class EngineLifecycleMixin:
         ``_paused=False``. No-op if the loop is already running.
         """
         with self._scheduler_lock:
-            distributed_controller = getattr(self, "_distributed_controller", None)
-            if distributed_controller is not None:
-                distributed_controller.start()
-                if distributed_controller.is_worker:
-                    if self.runner.executor_manager.kv_pages is None:
-                        self.runner.initialize_kv_cache()
-                        self._kv_cache_valid = True
-
-                    self._scheduler_exception = None
-                    self._scheduler_exception_tb = None
-                    self._scheduler_running = False
-                    self._touch_activity()
-                    self._start_idle_monitor()
-                    self._paused = False
-                    self._info("Distributed worker control server is running (scheduler loop disabled).")
-                    return
-
             step_coordinator = getattr(self, "_step_coordinator", None)
             if step_coordinator is not None and not step_coordinator.is_leader:
                 # ZMQ worker rank: no scheduler thread; a dedicated replay
@@ -1081,12 +1068,6 @@ class EngineLifecycleMixin:
         scheduler_thread: threading.Thread | None = None
         with self._scheduler_lock:
             if not self._scheduler_running:
-                distributed_controller = getattr(self, "_distributed_controller", None)
-                if distributed_controller is not None and distributed_controller.is_worker:
-                    try:
-                        distributed_controller.shutdown()
-                    except Exception:
-                        logger.debug("Distributed worker controller shutdown encountered an error", exc_info=True)
                 self._stop_engine_output_worker()
                 self._info("Scheduler loop is not running")
                 return

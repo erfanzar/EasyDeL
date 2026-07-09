@@ -96,11 +96,7 @@ from .config import (
     eSurgeVisionConfig,
     eSurgeWorkerConfig,
 )
-from .distributed import (
-    DistributedController,
-    make_config_fingerprint,
-    resolve_distributed_role,
-)
+from .distributed import make_config_fingerprint
 from .distributed.coordinator import create_step_coordinator
 from .engine import build_engine_assets
 from .engine.output_pipeline import OutputPipeline
@@ -363,7 +359,7 @@ class eSurge(
                 - ``compile_runner`` (bool): Pre-compile runner buckets at startup.
                 - ``runner_verbose`` (bool): Verbose runner logging.
                 - ``overlap_execution`` (bool): Overlap host/device work across
-                  steps. Mutually exclusive with ``distributed_mode=True``.
+                  steps.
                 - ``sampler_metrics`` (bool): Emit per-step sampler metrics.
                 - ``long_prefill_token_threshold`` (int | None): Threshold for
                   splitting long prefills.
@@ -458,29 +454,31 @@ class eSurge(
 
                 Consumed via ``Unpack[eSurgeVisionConfig]``.
             distributed (eSurgeDistributedConfig | Mapping[str, Any] | None):
-                Distributed serving config. Fields
+                Multi-host step-coordination config. Fields
                 (see :class:`eSurgeDistributedConfig`):
 
-                - ``distributed_mode`` (bool): Enable multi-host control plane.
-                - ``distributed_role`` (Literal["auto", "leader", "worker"]):
-                  Role for this process; ``"auto"`` resolves from rank.
-                - ``distributed_service_name`` (str | None): DNS / discovery
-                  service name.
-                - ``distributed_world_size`` (int | None): Total ranks; required
-                  when ``distributed_mode=True``.
-                - ``distributed_rank`` (int | None): Rank for this process;
-                  defaults to ``jax.process_index()`` when ``None``.
-                - ``distributed_control_port`` (int): Control-plane TCP port.
-                - ``distributed_control_bind_host`` (str): Control-plane bind host.
-                - ``distributed_advertise_addr`` (str | None): External address
-                  advertised to peers.
+                - ``coordination`` (Literal["replicated", "zmq"]):
+                  ``"replicated"`` (default) assumes an outer driver calls the
+                  engine identically on every host; ``"zmq"`` builds the
+                  leader/worker step-replication plane needed for
+                  single-ingress serving on a pod.
                 - ``distributed_auth_token`` (str | None): Shared auth token;
-                  required when ``distributed_mode=True``.
-                - ``distributed_step_timeout_s`` (float): Per-step RPC timeout.
-                - ``distributed_connect_timeout_s`` (float): Initial connect
-                  timeout.
-                - ``distributed_verify_sampling_digest`` (bool): Verify per-step
-                  sampling digests across ranks.
+                  required for ``coordination="zmq"``.
+                - ``distributed_leader_addr`` (str | None): Leader host/IP;
+                  defaults to the JAX coordinator host, then DNS discovery.
+                - ``distributed_service_name`` (str | None): DNS / discovery
+                  service name (worker-side leader lookup).
+                - ``distributed_control_port`` (int): Control-plane TCP port.
+                - ``distributed_control_bind_host`` (str): Leader bind host.
+                - ``distributed_step_timeout_s`` / ``distributed_connect_timeout_s``
+                  / ``distributed_ready_timeout_s`` (float): Failure-detection
+                  and startup budgets.
+                - ``distributed_heartbeat_interval_s`` /
+                  ``distributed_heartbeat_timeout_s`` (float): Liveness beacons.
+                - ``distributed_verify_digest_interval`` (int): Sampled-token
+                  digest cross-check every K steps (0 disables).
+                - ``distributed_max_inflight_steps`` (int): Leader/worker step
+                  skew bound.
 
                 Consumed via ``Unpack[eSurgeDistributedConfig]``.
             drafter (DrafterProtocol | bool | Mapping[str, Any] | None):
@@ -498,9 +496,8 @@ class eSurge(
             ValueError: If processor/tokenizer cannot be inferred, if a
                 ``runtime``/``cache``/``distributed`` field violates an invariant
                 (positive numbers, valid mode strings), if ``max_model_len <=
-                reserve_tokens``, or if ``distributed_mode=True`` but
-                ``distributed_auth_token`` / ``distributed_world_size`` are
-                missing or ``overlap_execution=True`` is also set.
+                reserve_tokens``, or if ``coordination="zmq"`` is requested
+                without a ``distributed_auth_token``.
         """
         from easydel.modules.auto.auto_modeling import PreTrainedLoading
 
@@ -583,41 +580,6 @@ class eSurge(
 
         self.data_parallelism_axis = _normalize_data_parallelism_axis(self.cache_config.data_parallelism_axis)
         register_attention_data_parallel_axis(self.data_parallelism_axis)
-        self._distributed_controller: DistributedController | None = None
-
-        if self.distributed_config.distributed_mode:
-            if not self.distributed_config.distributed_auth_token:
-                raise ValueError("`distributed_auth_token` must be provided when distributed_mode=True.")
-            if self.distributed_config.distributed_world_size is None:
-                raise ValueError("`distributed_world_size` must be provided when distributed_mode=True.")
-            if self.runtime_config.overlap_execution:
-                raise ValueError(
-                    "`overlap_execution=True` is not supported with distributed_mode=True. "
-                    "Use overlap_execution=False for lockstep multi-host serving."
-                )
-
-            world_size = self.distributed_config.distributed_world_size
-            if world_size <= 0:
-                raise ValueError(f"`distributed_world_size` must be positive, got {world_size}.")
-
-            rank = (
-                self.distributed_config.distributed_rank
-                if self.distributed_config.distributed_rank is not None
-                else int(jax.process_index())
-            )
-            if rank < 0 or rank >= world_size:
-                raise ValueError(
-                    f"`distributed_rank` out of range: rank={rank}, world_size={world_size}. "
-                    "Ensure JAX distributed init and DNS membership agree."
-                )
-
-            self.distributed_role = resolve_distributed_role(self.distributed_config.distributed_role, rank)
-            self.distributed_world_size = world_size
-            self.distributed_rank = rank
-        else:
-            self.distributed_role = "leader"
-            self.distributed_world_size = 1
-            self.distributed_rank = 0
 
         assets = build_engine_assets(
             model=model,
@@ -820,8 +782,8 @@ class eSurge(
         self._eos_ids = self.__eos_ids
         self._eos_set = self.__eos_set
 
-        needs_fingerprint = self.distributed_config.distributed_mode or (
-            str(self.distributed_config.coordination or "replicated") == "zmq" and jax.process_count() > 1
+        needs_fingerprint = str(self.distributed_config.coordination or "replicated") == "zmq" and (
+            jax.process_count() > 1
         )
         if needs_fingerprint:
             distributed_config = {
@@ -840,23 +802,6 @@ class eSurge(
                 ),
             }
             self._distributed_config_fingerprint = make_config_fingerprint(distributed_config)
-            if self.distributed_config.distributed_mode:
-                self._distributed_controller = DistributedController(
-                    enabled=True,
-                    role=self.distributed_role,
-                    rank=self.distributed_rank,
-                    world_size=self.distributed_world_size,
-                    service_name=self.distributed_config.distributed_service_name,
-                    control_port=self.distributed_config.distributed_control_port,
-                    control_bind_host=self.distributed_config.distributed_control_bind_host,
-                    advertise_addr=self.distributed_config.distributed_advertise_addr,
-                    auth_token=self.distributed_config.distributed_auth_token,
-                    step_timeout_s=self.distributed_config.distributed_step_timeout_s,
-                    connect_timeout_s=self.distributed_config.distributed_connect_timeout_s,
-                    verify_sampling_digest=self.distributed_config.distributed_verify_sampling_digest,
-                    config_fingerprint=self._distributed_config_fingerprint,
-                    execute_step=self._distributed_execute_step,
-                )
         else:
             self._distributed_config_fingerprint = None
 
@@ -866,8 +811,10 @@ class eSurge(
             self.runner,
             distributed_config=self.distributed_config,
             config_fingerprint=self._distributed_config_fingerprint,
-            legacy_controller=self._distributed_controller,
         )
+        self.distributed_role = "leader" if self._step_coordinator.is_leader else "worker"
+        self.distributed_rank = int(self._step_coordinator.rank)
+        self.distributed_world_size = int(self._step_coordinator.world_size)
 
         self.initiate()
 
@@ -903,8 +850,8 @@ class eSurge(
 
     @property
     def distributed_mode(self) -> bool:
-        """Whether the multi-host lockstep control plane is enabled."""
-        return bool(self.distributed_config.distributed_mode)
+        """Whether the multi-host step-coordination plane is active."""
+        return int(getattr(self._step_coordinator, "world_size", 1) or 1) > 1
 
     def set_sampling_params_callback(
         self,
@@ -934,21 +881,6 @@ class eSurge(
                 no-op to keep the call site uniform with subclass overrides.
         """
         del model
-
-    def _distributed_execute_step(self, scheduler_output):
-        """Execute a single scheduler step on worker ranks via control-plane RPC.
-
-        Args:
-            scheduler_output: Scheduler step payload to forward to
-                :meth:`runner.execute_model`. Held under the engine's scheduler
-                lock for the duration of the call.
-
-        Returns:
-            The runner's per-step model output (sampled tokens, etc.).
-        """
-
-        with self._scheduler_lock:
-            return self.runner.execute_model(scheduler_output)
 
     def _instantiate_reasoning_parser_for_metadata(self):
         """Build a short-lived reasoning parser instance for token metadata lookups.
@@ -1077,9 +1009,9 @@ class eSurge(
                 self._worker_manager.shutdown()
             except Exception:
                 pass
-        if getattr(self, "_distributed_controller", None) is not None:
+        if getattr(self, "_step_coordinator", None) is not None:
             try:
-                self._distributed_controller.shutdown()
+                self._step_coordinator.shutdown("engine deleted")
             except Exception:
                 pass
         if hasattr(self, "runner"):
@@ -1110,7 +1042,7 @@ class eSurge(
             f"decode_truncated_prompt={self.context_config.decode_truncated_prompt}",
             f"extra_eos_token_ids={self.extra_eos_token_ids}",
             f"extra_stops={self.extra_stops!r}",
-            f"distributed_mode={self.distributed_config.distributed_mode}",
+            f"coordination={self.distributed_config.coordination!r}",
             f"distributed_role={self.distributed_role!r}",
             f"distributed_rank={self.distributed_rank}",
             f"distributed_world_size={self.distributed_world_size}",

@@ -172,15 +172,10 @@ _ESURGE_SECTION_FIELDS: dict[str, frozenset[str]] = {
     "distributed": frozenset(
         {
             "coordination",
-            "distributed_mode",
-            "distributed_role",
             "distributed_service_name",
-            "distributed_world_size",
-            "distributed_rank",
             "distributed_leader_addr",
             "distributed_control_port",
             "distributed_control_bind_host",
-            "distributed_advertise_addr",
             "distributed_auth_token",
             "distributed_step_timeout_s",
             "distributed_connect_timeout_s",
@@ -189,7 +184,6 @@ _ESURGE_SECTION_FIELDS: dict[str, frozenset[str]] = {
             "distributed_heartbeat_timeout_s",
             "distributed_verify_digest_interval",
             "distributed_max_inflight_steps",
-            "distributed_verify_sampling_digest",
         }
     ),
     "drafter": frozenset(
@@ -219,8 +213,6 @@ _ESURGE_INT_FIELDS = frozenset(
         "detokenizer_max_states",
         "max_request_outputs",
         "vision_cache_capacity_mb",
-        "distributed_world_size",
-        "distributed_rank",
         "distributed_control_port",
         "distributed_verify_digest_interval",
         "distributed_max_inflight_steps",
@@ -259,8 +251,6 @@ _ESURGE_BOOL_FIELDS = frozenset(
         "decode_truncated_prompt",
         "ignore_stop_strings_in_reasoning",
         "silent_mode",
-        "distributed_mode",
-        "distributed_verify_sampling_digest",
         "enabled",
     }
 )

@@ -191,22 +191,21 @@ class TestToEsurgeKwargs:
     def test_distributed_defaults(self):
         cfg = {"model": {"name_or_path": "test-model"}}
         result = to_esurge_kwargs(cfg)
-        assert result["distributed"].distributed_mode is False
-        assert result["distributed"].distributed_role == "auto"
+        assert result["distributed"].coordination == "replicated"
         assert result["distributed"].distributed_control_port == 19666
 
     def test_distributed_settings(self):
         cfg = {
             "model": {"name_or_path": "test-model"},
             "esurge": {
-                "distributed_mode": True,
-                "distributed_role": "leader",
+                "coordination": "zmq",
+                "distributed_auth_token": "token",
                 "distributed_control_port": 20000,
             },
         }
         result = to_esurge_kwargs(cfg)
-        assert result["distributed"].distributed_mode is True
-        assert result["distributed"].distributed_role == "leader"
+        assert result["distributed"].coordination == "zmq"
+        assert result["distributed"].distributed_auth_token == "token"
         assert result["distributed"].distributed_control_port == 20000
 
     def test_boolean_flags_false(self):
