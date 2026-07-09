@@ -74,6 +74,7 @@ from jax import numpy as jnp
 
 from easydel.caching import RaggedPagesCacheConfig, UnifiedAttentionCacheConfig
 from easydel.caching._metadatabuilder import AttentionMetadataBuilder
+from easydel.inference.esurge.runners.host_sync import host_payload_broadcast_needed
 from easydel.utils.helpers import check_bool_flag
 
 from ...core.dp_sharding import dp_shard_page_bounds, pages_per_dp_shard
@@ -1124,9 +1125,11 @@ class BatchMetadataPreparer:
 
         device_put_start = time.time()
 
-        # Multi-host: broadcast host-side arrays from coordinator (process 0)
-        # so all hosts pass identical data to `device_put` with replicated sharding.
-        if jax.process_count() > 1:
+        # Replicated-driver multi-host: broadcast host-side arrays from
+        # process 0 so all hosts pass identical data to `device_put` with
+        # replicated sharding. Skipped under the ZMQ step-replication plane,
+        # where payloads are identical by construction (see host_sync).
+        if host_payload_broadcast_needed():
             from jax.experimental import multihost_utils
 
             host_payload = multihost_utils.broadcast_one_to_all(host_payload)
@@ -1416,7 +1419,7 @@ class BatchMetadataPreparer:
         host_build_took = time.time() - host_build_start
 
         device_put_start = time.time()
-        if jax.process_count() > 1:
+        if host_payload_broadcast_needed():
             from jax.experimental import multihost_utils
 
             host_payload = multihost_utils.broadcast_one_to_all(host_payload)

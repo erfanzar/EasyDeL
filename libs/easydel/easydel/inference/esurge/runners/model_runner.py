@@ -89,6 +89,7 @@ from ..scheduler import SchedulerOutput
 from ..utils import model_uses_mrope
 from .async_types import AsyncPreResults, AsyncWindowResult, DeviceInputTokenHandoff
 from .execution_manager import ExecutionManager
+from .host_sync import host_payload_broadcast_needed
 from .perf import RunnerPerfSample, RunnerPerfTracker
 from .pipeline_execution_manager import PipelineExecutionManager
 from .pipeline_plan import build_pipeline_inference_plan, cap_metadata_pages
@@ -2353,7 +2354,7 @@ class eSurgeRunner:
                             slot = int(window_row_indices[row_pos])
                     recurrent_slot_indices_cpu[row_pos] = int(slot)
 
-                if jax.process_count() > 1:
+                if host_payload_broadcast_needed():
                     req_num_tokens_np = multihost_utils.broadcast_one_to_all(req_num_tokens_np)
 
             mrope_position_ids_cpu: np.ndarray | None = None

@@ -84,6 +84,7 @@ from ...core.sampler import apply_history_penalties_from_counts, build_history_t
 from ...core.sampler import sample_tokens as sample_tokens_fn
 from ...core.sampling_metadata import SamplingMetadata
 from ..execution_types import StepFunctionInputs
+from ..host_sync import host_payload_broadcast_needed
 
 if tp.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
@@ -766,7 +767,7 @@ class SamplerRuntime:
 
         _token_ids_cpu = self._sampler_penalty_rebuild_token_ids_cpu
         _seq_lens_cpu = self._sampler_penalty_rebuild_seq_lens_cpu
-        if jax.process_count() > 1:
+        if host_payload_broadcast_needed():
             _token_ids_cpu, _seq_lens_cpu = multihost_utils.broadcast_one_to_all((_token_ids_cpu, _seq_lens_cpu))
         token_history = jax.device_put(_token_ids_cpu, self._sampler_sharding)
         seq_lens = jax.device_put(_seq_lens_cpu, self._sampler_sharding)
@@ -1049,7 +1050,7 @@ class SamplerRuntime:
         self._sampler_packed_misc_i32_cpu[1] = numpy.int32(sampler_total_tokens)
 
         sampler_host_payload = (sampler_packed_f32, sampler_packed_i32, self._sampler_packed_misc_i32_cpu)
-        if jax.process_count() > 1:
+        if host_payload_broadcast_needed():
             sampler_host_payload = multihost_utils.broadcast_one_to_all(sampler_host_payload)
         with jax.named_scope("easydel/esurge/sampler/place_metadata"):
             packed_f32, packed_i32, packed_misc_i32 = _device_put_tree_uniform(sampler_host_payload, sampler_sharding)
