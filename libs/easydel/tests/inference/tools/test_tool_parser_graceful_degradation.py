@@ -24,6 +24,7 @@ function calling with a warning) instead of raising.
 from __future__ import annotations
 
 import pytest
+
 from easydel.inference.tools import ToolParserManager
 from easydel.inference.tools.auto_detect import detect_tool_parser
 from easydel.inference.tools.tool_calling_mixin import ToolCallingMixin, build_tool_parser_or_none

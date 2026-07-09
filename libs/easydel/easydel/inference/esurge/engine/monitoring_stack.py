@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Monitoring mixin for the eSurge engine.
+"""Monitoring stack for the eSurge engine.
 
-Wires Prometheus exporters, optional Grafana auto-spawn, the rich-console live
-monitor, and metric snapshot helpers into :class:`eSurge`. Methods include
-``start_monitoring`` / ``stop_monitoring``, plus helpers to record per-request
-and per-step metrics into the shared :class:`MetricsCollector`.
-
-Exposes :class:`EngineMonitoringMixin`, mixed into :class:`eSurge`.
+Owns Prometheus exporter startup, optional Grafana auto-spawn (local binary,
+Docker, or provisioning an already-running instance), and the rich-console
+live monitor. :class:`MonitoringStack` holds all process/temp-dir state that
+used to live as ``_monitoring_*`` / ``_grafana_*`` / ``_prometheus_*``
+attributes on :class:`eSurge`; the engine delegates ``start_monitoring`` /
+``stop_monitoring`` to it.
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import typing
 import uuid
 from typing import Any
 
@@ -205,8 +206,8 @@ def _build_esurge_dashboard_model(datasource_uid: str) -> dict:
     return dashboard
 
 
-class EngineMonitoringMixin:
-    """Mixin providing monitoring and observability for the eSurge engine.
+class MonitoringStack:
+    """Prometheus/Grafana/console-monitor process management for eSurge.
 
     Manages Prometheus metrics exporting, Grafana dashboard provisioning
     (via local binary or Docker), and runtime performance metric collection.
@@ -214,12 +215,36 @@ class EngineMonitoringMixin:
     Prometheus data source for visualizing inference throughput, latency,
     and resource utilization.
 
-    Methods:
-        start_monitoring: Initialize Prometheus exporter and optional Grafana.
-        stop_monitoring: Shut down all monitoring services.
-        get_metrics_summary: Retrieve current performance metrics snapshot.
-        monitoring_active: Property indicating whether monitoring is running.
+    Args:
+        info: Engine-level info logger callable (respects ``silent_mode``).
     """
+
+    def __init__(self, *, info: typing.Callable[..., None]) -> None:
+        self._info = info
+        self._monitoring_server = None
+        self._monitoring_urls: dict[str, str] | None = None
+        self._monitoring_initialized = False
+        self._grafana_container_name: str | None = None
+        self._grafana_container_id: str | None = None
+        self._grafana_process: subprocess.Popen | None = None
+        self._grafana_temp_dir: str | None = None
+        self._grafana_url: str | None = None
+        self._prometheus_process: subprocess.Popen | None = None
+        self._prometheus_temp_dir: str | None = None
+
+    @property
+    def monitoring_active(self) -> bool:
+        """Check if monitoring services are currently active.
+
+        Returns:
+            True if monitoring has been initialized and is running.
+        """
+        return self._monitoring_initialized
+
+    @property
+    def monitoring_urls(self) -> dict[str, str] | None:
+        """URLs of the started monitoring services, if any."""
+        return self._monitoring_urls
 
     def _prepare_grafana_provisioning(
         self,
@@ -994,45 +1019,3 @@ providers:
         self._monitoring_initialized = False
         self._monitoring_urls = None
         self._info(" Monitoring services stopped")
-
-    def get_metrics_summary(self) -> dict[str, Any]:
-        """Get current performance metrics summary.
-
-        Returns:
-            Dictionary containing:
-            - requests_per_second: Current request throughput
-            - average_latency: Average request latency
-            - average_ttft: Average time to first token
-            - average_throughput: Average tokens/second
-            - total_completed: Total completed requests
-            - total_failed: Total failed requests
-            - total_tokens: Total tokens generated
-            - active_requests: Currently active requests
-            - queue_size: Pending requests in queue
-            - running_requests: Currently running requests
-        """
-        metrics_collector = get_metrics_collector()
-        if not metrics_collector:
-            return {"error": "Metrics collection not initialized"}
-        system_metrics = metrics_collector.get_system_metrics()
-        return {
-            "requests_per_second": system_metrics.requests_per_second,
-            "average_latency": system_metrics.average_latency,
-            "average_ttft": system_metrics.average_ttft,
-            "average_throughput": system_metrics.average_throughput,
-            "total_completed": system_metrics.total_requests_completed,
-            "total_failed": system_metrics.total_requests_failed,
-            "total_tokens": system_metrics.total_tokens_generated,
-            "active_requests": len(self._active_requests),
-            "queue_size": self.num_pending_requests,
-            "running_requests": self.num_running_requests,
-        }
-
-    @property
-    def monitoring_active(self) -> bool:
-        """Check if monitoring services are currently active.
-
-        Returns:
-            True if monitoring has been initialized and is running.
-        """
-        return self._monitoring_initialized

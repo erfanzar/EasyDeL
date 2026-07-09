@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.inference.esurge.mixins.io import EngineIOMixin
-from easydel.inference.esurge.mixins.utils import EngineUtilsMixin
+from easydel.inference.esurge.esurge_engine import eSurge
 from easydel.inference.sampling_params import SamplingParams
 
 
@@ -38,12 +37,16 @@ class _DummyTokenizer:
         return "PROMPT"
 
 
-class _DummyEngine(EngineUtilsMixin):
+class _DummyEngine(eSurge):
+    """eSurge subclass with only a tokenizer; no engine construction."""
+
     def __init__(self):
         self.tokenizer = _DummyTokenizer()
 
 
-class _ChatCaptureEngine(EngineIOMixin, EngineUtilsMixin):
+class _ChatCaptureEngine(eSurge):
+    """eSurge subclass recording generate() calls; periphery stubbed."""
+
     def __init__(self):
         self.tokenizer = _ToolAwareTokenizer()
         self.generate_calls = []

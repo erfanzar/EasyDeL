@@ -21,16 +21,27 @@ from typing import ClassVar, get_args
 import pytest
 
 import easydel.inference.tools.parsers  # noqa: F401
+from easydel.inference.esurge.engine.output_pipeline import OutputPipeline
+from easydel.inference.esurge.engine.registry import RequestRecord, RequestRegistry
 from easydel.inference.esurge.esurge_engine import CompletionOutput, RequestOutput
-from easydel.inference.esurge.mixins.parsing import EngineParsingMixin
 from easydel.inference.openai_api_modules import ChatCompletionRequest, DeltaToolCall
 from easydel.inference.parsing import DelegatingParser
 from easydel.inference.tools import ToolParserManager
 from easydel.inference.tools.abstract_tool import ToolParserName
 
 
-class _ParsingHarness(EngineParsingMixin):
-    pass
+def _make_parsing_harness() -> OutputPipeline:
+    """Build an OutputPipeline with inert fakes; only the parser drive is exercised."""
+    return OutputPipeline(
+        registry=RequestRegistry(),
+        detokenizer_client=None,
+        eos_token_ids=[],
+        decode_interval_tokens=1,
+        decode_interval_secs=0.0,
+        on_stop_strings=lambda stops: None,
+        on_activity=lambda: None,
+        on_fatal=lambda exc, tb: None,
+    )
 
 
 class _GreedyTokenizer:
@@ -364,11 +375,11 @@ def _simulate_engine_stream(case: _ToolParserStreamCase) -> tuple[RequestOutput,
         tool_parser=parser,
         tool_request=request,
     )
-    request_data = {
+    request_data = RequestRecord(**{
         "delegating_parser": delegating_parser,
         "parser_previous_text": "",
         "parser_previous_token_ids": [],
-    }
+    })
     request_output = RequestOutput(
         request_id=f"req_{case.name}",
         prompt="hi",
@@ -376,7 +387,7 @@ def _simulate_engine_stream(case: _ToolParserStreamCase) -> tuple[RequestOutput,
         outputs=[CompletionOutput(index=0, text="", token_ids=[])],
     )
     completion_output = request_output.outputs[0]
-    harness = _ParsingHarness()
+    harness = _make_parsing_harness()
 
     visible_emitted = ""
     streamed_names: list[str] = []

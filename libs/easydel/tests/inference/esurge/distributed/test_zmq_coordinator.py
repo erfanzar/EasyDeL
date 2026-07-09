@@ -31,6 +31,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
+
 from easydel.inference.esurge.distributed.coordinator import (
     LocalCoordinator,
     StepCoordinationError,

@@ -14,15 +14,15 @@
 
 import threading
 
-from easydel.inference.esurge.esurge_engine import CompletionOutput, RequestOutput
-from easydel.inference.esurge.mixins.io import EngineIOMixin
-from easydel.inference.esurge.mixins.utils import EngineUtilsMixin
+from easydel.inference.esurge.esurge_engine import CompletionOutput, RequestOutput, eSurge
 from easydel.inference.esurge.server.api_server import eSurgeApiServer
 from easydel.inference.openai_api_modules import DeltaMessage
 from easydel.inference.sampling_params import SamplingParams
 
 
-class _StreamHarness(EngineIOMixin, EngineUtilsMixin):
+class _StreamHarness(eSurge):
+    """eSurge subclass driving the real stream() loop over stubbed state."""
+
     def __init__(self):
         self._request_lock = threading.Lock()
         self._output_lock = threading.Lock()

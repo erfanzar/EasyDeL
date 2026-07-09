@@ -5,6 +5,7 @@ easydel.inference.esurge.runners package
    :maxdepth: 2
 
    executors/index
+   spec/index
    async_types
    execution_manager
    execution_types

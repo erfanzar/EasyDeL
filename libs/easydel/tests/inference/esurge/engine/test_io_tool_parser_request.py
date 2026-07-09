@@ -12,13 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import threading
-
-from easydel.inference.esurge.engine.registry import RequestRecord
-from easydel.inference.esurge.mixins.io import EngineIOMixin
-from easydel.inference.esurge.mixins.parsing import EngineParsingMixin
-from easydel.inference.esurge.mixins.requests import EngineRequestsMixin
-from easydel.inference.esurge.mixins.utils import EngineUtilsMixin
+from easydel.inference.esurge.engine.admission import RequestAdmission
+from easydel.inference.esurge.engine.output_pipeline import OutputPipeline
+from easydel.inference.esurge.engine.registry import RequestRecord, RequestRegistry
+from easydel.inference.esurge.esurge_engine import eSurge
 from easydel.inference.openai_api_modules import (
     ChatCompletionRequest,
     DeltaFunctionCall,
@@ -32,8 +29,18 @@ from easydel.inference.parsing import DelegatingParser
 from easydel.inference.sampling_params import SamplingParams
 
 
-class _ParsingHarness(EngineParsingMixin, EngineUtilsMixin):
-    pass
+def _make_pipeline():
+    """Build an OutputPipeline with inert fakes for parser-drive tests."""
+    return OutputPipeline(
+        registry=RequestRegistry(),
+        detokenizer_client=None,
+        eos_token_ids=[],
+        decode_interval_tokens=1,
+        decode_interval_secs=0.0,
+        on_stop_strings=lambda stops: None,
+        on_activity=lambda: None,
+        on_fatal=lambda exc, tb: None,
+    )
 
 
 class _RecordingToolParser:
@@ -76,100 +83,69 @@ class _RecordingToolParser:
         )
 
 
-class _RecordingScheduler:
-    """Minimal scheduler stub that records submitted requests for assertions.
+class _RecordingSubmit:
+    """Minimal scheduler-submit stub that records submitted requests.
 
     Attributes:
-        requests: List of requests passed to ``add_request``, in order.
+        requests: List of requests passed to the submit callable, in order.
     """
 
     def __init__(self):
         self.requests = []
 
-    def add_request(self, request):
-        """Append *request* to the internal recording list.
+    def __call__(self, scheduler_requests):
+        """Append the submitted requests to the internal recording list.
 
         Args:
-            request: The request object forwarded by the engine harness.
+            scheduler_requests: The request batch forwarded by admission.
         """
-        self.requests.append(request)
+        self.requests.extend(scheduler_requests)
 
 
-class _RequestsHarness(EngineRequestsMixin):
-    """Lightweight ``EngineRequestsMixin`` implementation for unit tests.
+class _TokenizerClientStub:
+    """Worker tokenizer-client stub returning a fixed dummy token list."""
 
-    Provides the minimal state and stub methods required by the mixin so
-    that ``add_request`` / tokenisation paths can be exercised without
-    spinning up a real eSurge engine.
-
-    Attributes:
-        runner: Fake runner object exposing ``max_model_len``.
-        scheduler: A ``_RecordingScheduler`` that captures forwarded requests.
-        tokenizer: Stub tokenizer with a fixed ``eos_token_id``.
-    """
-
-    def __init__(self):
-        self.runner = type("Runner", (), {"max_model_len": 128})()
-        self.reserve_tokens = 0
-        self.auto_truncate_prompt = False
-        self.strict_context = False
-        self.truncate_mode = "left"
-        self.auto_cap_new_tokens = True
-        self.prefer_preserve_prompt = True
-        self.decode_truncated_prompt = False
-        self._request_lock = threading.Lock()
-        self._output_lock = threading.Lock()
-        self._scheduler_lock = threading.Lock()
-        self._request_events = {}
-        self._active_requests = {}
-        self._request_outputs = {}
-        self._tool_parser_class = _RecordingToolParser
-        self._reasoning_parser_class = None
-        self.scheduler = _RecordingScheduler()
-        self.tokenizer = type("Tokenizer", (), {"eos_token_id": 2})()
-        self._eos_ids = []
-        self._request_counter = 0
-
-    def _touch_activity(self):
-        """No-op activity timestamp update for the test harness.
-
-        Returns:
-            Always ``None``.
-        """
-        return None
-
-    def _tokenize_prompt(self, request_id, prompt):
-        """Return a fixed dummy token list, ignoring the actual prompt.
-
-        Args:
-            request_id: Ignored request identifier.
-            prompt: Ignored prompt text.
-
-        Returns:
-            A hardcoded ``[1, 2, 3]`` token list.
-        """
+    def tokenize(self, request_id, prompt):
+        """Return a fixed ``[1, 2, 3]`` token list, ignoring the inputs."""
         del request_id, prompt
         return [1, 2, 3]
 
-    def _tokenize_prompt_segments(self, prompt):
-        """Return a fixed dummy token list for multi-segment prompts.
 
-        Args:
-            prompt: Ignored prompt segments.
+class _ContextConfigStub:
+    """Context-config stub matching the fields admission reads."""
 
-        Returns:
-            A hardcoded ``[1, 2, 3]`` token list.
-        """
-        del prompt
-        return [1, 2, 3]
+    auto_truncate_prompt = False
+    strict_context = False
+    truncate_mode = "left"
+    auto_cap_new_tokens = True
+    prefer_preserve_prompt = True
+    decode_truncated_prompt = False
 
-    def _info(self, *_args, **_kwargs):
-        """No-op logger stub.
 
-        Returns:
-            Always ``None``.
-        """
-        return None
+def _make_admission():
+    """Build a RequestAdmission over recording fakes for add_request tests."""
+    submit = _RecordingSubmit()
+    admission = RequestAdmission(
+        registry=RequestRegistry(),
+        scheduler_submit=submit,
+        tokenizer_client=_TokenizerClientStub(),
+        tokenizer=type("Tokenizer", (), {"eos_token_id": 2})(),
+        context_config=_ContextConfigStub(),
+        reserve_tokens=0,
+        max_model_len=128,
+        tool_parser_class=_RecordingToolParser,
+        reasoning_parser_class=None,
+        sampling_params_callback=lambda: None,
+        generation_config_dict={},
+        primary_eos_token_id=None,
+        eos_token_ids=[],
+        extra_stops=[],
+        ignore_stop_strings_in_reasoning=False,
+        on_activity=lambda: None,
+        info=lambda *args, **kwargs: None,
+        callback_engine=None,
+    )
+    return admission, submit
 
 
 def _make_request() -> ChatCompletionRequest:
@@ -196,7 +172,7 @@ def _make_request() -> ChatCompletionRequest:
 
 
 def test_run_output_parsers_uses_request_tools_for_batch_tool_parsing():
-    engine = _ParsingHarness()
+    pipeline = _make_pipeline()
     parser = _RecordingToolParser()
     request = _make_request()
     rd = RequestRecord(**{
@@ -209,7 +185,7 @@ def test_run_output_parsers_uses_request_tools_for_batch_tool_parsing():
         "parser_previous_token_ids": [],
     })
 
-    result = engine._run_output_parsers(
+    result = pipeline._run_output_parsers(
         rd=rd,
         accumulated_text="<function=lookup><parameter=limit>5</parameter></function>",
         delta_text="<function=lookup><parameter=limit>5</parameter></function>",
@@ -224,7 +200,7 @@ def test_run_output_parsers_uses_request_tools_for_batch_tool_parsing():
 
 
 def test_run_output_parsers_uses_request_tools_for_streaming_tool_parsing():
-    engine = _ParsingHarness()
+    pipeline = _make_pipeline()
     parser = _RecordingToolParser()
     request = _make_request()
     rd = RequestRecord(**{
@@ -237,7 +213,7 @@ def test_run_output_parsers_uses_request_tools_for_streaming_tool_parsing():
         "parser_previous_token_ids": [],
     })
 
-    result = engine._run_output_parsers(
+    result = pipeline._run_output_parsers(
         rd=rd,
         accumulated_text="<function=lookup>",
         delta_text="<function=lookup>",
@@ -252,7 +228,7 @@ def test_run_output_parsers_uses_request_tools_for_streaming_tool_parsing():
 
 
 def test_build_tool_parser_request_wraps_chat_template_tool_dicts():
-    request = EngineIOMixin._build_tool_parser_request(
+    request = eSurge._build_tool_parser_request(
         prompt="hi",
         tools=[
             {
@@ -275,16 +251,16 @@ def test_build_tool_parser_request_wraps_chat_template_tool_dicts():
 
 
 def test_add_request_creates_delegating_parser_for_single_request():
-    engine = _RequestsHarness()
+    admission, _submit = _make_admission()
 
-    engine._add_request(
+    admission.add_request(
         request_id="req-1",
         prompt="hi",
         sampling_params=SamplingParams(max_tokens=1),
         tool_parser_request=None,
     )
 
-    request_state = engine._active_requests["req-1"]
+    request_state = admission._active_requests["req-1"]
     dp = request_state.delegating_parser
     assert dp is not None
     assert isinstance(dp, DelegatingParser)
@@ -293,9 +269,9 @@ def test_add_request_creates_delegating_parser_for_single_request():
 
 
 def test_add_request_can_defer_scheduler_enqueue_for_batching():
-    engine = _RequestsHarness()
+    admission, submit = _make_admission()
 
-    scheduler_requests = engine._add_request(
+    scheduler_requests = admission.add_request(
         request_id="req-1",
         prompt="hi",
         sampling_params=SamplingParams(max_tokens=1),
@@ -306,23 +282,19 @@ def test_add_request_can_defer_scheduler_enqueue_for_batching():
     assert scheduler_requests is not None
     assert len(scheduler_requests) == 1
     assert scheduler_requests[0].request_id == "req-1"
-    assert engine.scheduler.requests == []
-    assert "req-1" in engine._active_requests
+    assert submit.requests == []
+    assert "req-1" in admission._active_requests
 
 
 def test_build_tool_parser_request_returns_none_without_tools():
     """When both tools and tool_choice are None, should return None."""
-    from easydel.inference.esurge.mixins.io import EngineIOMixin
-
-    result = EngineIOMixin._build_tool_parser_request(prompt="hi", tools=None, tool_choice=None)
+    result = eSurge._build_tool_parser_request(prompt="hi", tools=None, tool_choice=None)
     assert result is None
 
 
 def test_build_tool_parser_request_with_tool_choice_only():
     """When tool_choice is set but tools is None, should still create a request."""
-    from easydel.inference.esurge.mixins.io import EngineIOMixin
-
-    result = EngineIOMixin._build_tool_parser_request(prompt="hi", tools=None, tool_choice="auto")
+    result = eSurge._build_tool_parser_request(prompt="hi", tools=None, tool_choice="auto")
     assert result is not None
     assert result.tool_choice == "auto"
     assert result.tools is None
@@ -330,9 +302,7 @@ def test_build_tool_parser_request_with_tool_choice_only():
 
 def test_build_tool_parser_request_skips_non_dict_tools():
     """Non-dict/non-model tools should be silently skipped."""
-    from easydel.inference.esurge.mixins.io import EngineIOMixin
-
-    result = EngineIOMixin._build_tool_parser_request(
+    result = eSurge._build_tool_parser_request(
         prompt="hi",
         tools=[
             123,  # not a dict
@@ -349,9 +319,7 @@ def test_build_tool_parser_request_skips_non_dict_tools():
 
 def test_build_tool_parser_request_normalizes_nested_function():
     """Tools with function.name structure should be preserved."""
-    from easydel.inference.esurge.mixins.io import EngineIOMixin
-
-    result = EngineIOMixin._build_tool_parser_request(
+    result = eSurge._build_tool_parser_request(
         prompt="hi",
         tools=[
             {
@@ -368,13 +336,13 @@ def test_build_tool_parser_request_normalizes_nested_function():
 
 def test_run_output_parsers_no_delegating_parser():
     """When rd has no delegating_parser, should return passthrough result."""
-    engine = _ParsingHarness()
+    pipeline = _make_pipeline()
     rd = RequestRecord(**{
         "delegating_parser": None,
         "parser_previous_text": "",
         "parser_previous_token_ids": [],
     })
-    result = engine._run_output_parsers(
+    result = pipeline._run_output_parsers(
         rd=rd,
         accumulated_text="hello world",
         delta_text="hello world",

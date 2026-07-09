@@ -34,8 +34,9 @@ import typing as tp
 
 import numpy as np
 import pytest
-from easydel.inference.sampling_params import SamplingParams
 from jax import numpy as jnp
+
+from easydel.inference.sampling_params import SamplingParams
 
 TOKENIZER_REPO = "Qwen/Qwen2.5-0.5B-Instruct"
 

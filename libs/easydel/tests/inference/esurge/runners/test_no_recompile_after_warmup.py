@@ -32,11 +32,12 @@ from __future__ import annotations
 import jax
 import pytest
 import spectrax as spx
+from jax import numpy as jnp
+from jax._src import test_util as jtu
+
 from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.esurge.scheduler import Scheduler
 from easydel.inference.sampling_params import SamplingParams
-from jax import numpy as jnp
-from jax._src import test_util as jtu
 
 try:
     from tests.inference.esurge.runtime_pass._tiny_runtime_common import load_test_tokenizer

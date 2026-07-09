@@ -12,19 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Requests mixin for the eSurge engine.
+"""Request admission for the eSurge engine.
 
-Centralizes per-request bookkeeping: id generation, ``EngineRequest``
-construction, scheduler enqueue/cancel, finished-output draining, and the
-streaming wakeup events used by :meth:`eSurge.stream`.
-
-Exposes :class:`EngineRequestsMixin`, mixed into :class:`eSurge`.
+:class:`RequestAdmission` owns everything between a caller-supplied prompt
+and scheduler enqueue: request-id generation, per-request sampling-params
+preparation (callback, extra stops, generation-config EOS ids), context
+budget enforcement with prompt truncation, request-registry bookkeeping,
+per-request parser construction, and ``n>1`` sample fan-out.
 """
 
 from __future__ import annotations
 
+import copy
 import threading
 import time
+import typing
 import uuid
 from collections.abc import Sequence
 from typing import Any
@@ -35,11 +37,28 @@ from easydel.inference.parsing import DelegatingParser
 from easydel.inference.sampling_params import SamplingParams
 from easydel.inference.tools.tool_calling_mixin import build_tool_parser_or_none
 
-from ..engine.registry import RequestRecord
 from ..logger import logger
-from ..metrics import get_metrics_collector, log_metrics_summary
-from ..request import EngineRequest, EngineRequestStatus
+from ..metrics import get_metrics_collector
+from ..request import EngineRequest
 from ..utils import truncate_tokens
+from .chat_templating import normalize_stop_sequences
+from .registry import RequestRecord, RequestRegistry
+
+
+def clone_sampling_params(sampling_params: SamplingParams) -> SamplingParams:
+    """Create a deep copy of sampling parameters.
+
+    Args:
+        sampling_params: Parameters to clone.
+
+    Returns:
+        Deep copy of the parameters, or original if cloning fails.
+    """
+    try:
+        return copy.deepcopy(sampling_params)
+    except Exception:
+        logger.exception("Failed to clone sampling params; using original instance")
+        return sampling_params
 
 
 def _set_requested_new(sp, n: int):
@@ -62,20 +81,289 @@ def _set_requested_new(sp, n: int):
         sp.max_new_tokens = int(n)
 
 
-class EngineRequestsMixin:
-    """Mixin for request lifecycle management in the eSurge engine.
+class RequestAdmission:
+    """Admission component turning prompts into scheduler-ready requests.
 
-    Handles adding new requests to the scheduler queue with context length
-    management (prompt truncation, token reservation), request ID generation,
-    request abortion, and n>1 parallel sampling support. Implements
-    intelligent prompt truncation strategies (left/right/middle) and
-    automatic max_tokens inference to fit within model constraints.
+    All engine coupling is injected explicitly; there is no back-reference
+    to the engine except the opaque ``callback_engine`` object surfaced in
+    the sampling-params callback metadata (part of that callback's public
+    contract).
 
-    Methods:
-        abort_request: Cancel an in-progress request and notify waiters.
-        num_pending_requests: Property returning count of queued requests.
-        num_running_requests: Property returning count of active requests.
+    Args:
+        registry: Shared :class:`RequestRegistry` holding request records,
+            outputs, events, and their locks.
+        scheduler_submit: Engine callable that acquires the scheduler lock
+            and enqueues a batch of :class:`EngineRequest` objects.
+        tokenizer_client: Worker-pipeline tokenizer client
+            (``tokenize(request_id, prompt) -> list[int]``).
+        tokenizer: In-process tokenizer used for segment tokenization,
+            truncated-prompt decoding, and EOS fallbacks.
+        context_config: The engine's :class:`eSurgeContextConfig`.
+        reserve_tokens: Tokens reserved for generation headroom.
+        max_model_len: Maximum sequence length (prompt + generation).
+        tool_parser_class: Tool-parser class instantiated per request, or
+            ``None``.
+        reasoning_parser_class: Reasoning-parser class instantiated per
+            request, or ``None``.
+        sampling_params_callback: Zero-arg getter returning the engine's
+            current sampling-params callback (or ``None``).
+        generation_config_dict: Model ``generation_config`` payload used to
+            merge extra EOS ids into per-request stop tokens.
+        primary_eos_token_id: The model's primary EOS id, if known.
+        eos_token_ids: Engine-normalized EOS id list.
+        extra_stops: Engine-level extra stop strings merged into every
+            request.
+        ignore_stop_strings_in_reasoning: Engine default for the
+            per-request ``ignore_stop_strings_in_reasoning`` flag.
+        on_activity: Callback marking engine activity for the idle watchdog.
+        info: Engine-level info logger callable.
+        callback_engine: Opaque object surfaced as ``metadata["engine"]``
+            to the sampling-params callback.
     """
+
+    def __init__(
+        self,
+        *,
+        registry: RequestRegistry,
+        scheduler_submit: typing.Callable[[list[EngineRequest]], None],
+        tokenizer_client,
+        tokenizer,
+        context_config,
+        reserve_tokens: int,
+        max_model_len: int,
+        tool_parser_class,
+        reasoning_parser_class,
+        sampling_params_callback: typing.Callable[[], typing.Callable | None],
+        generation_config_dict: dict | None,
+        primary_eos_token_id: int | None,
+        eos_token_ids: Sequence[int],
+        extra_stops: Sequence[str],
+        ignore_stop_strings_in_reasoning: bool,
+        on_activity: typing.Callable[[], None],
+        info: typing.Callable[..., None],
+        callback_engine: Any = None,
+    ) -> None:
+        self._registry = registry
+        self._scheduler_submit = scheduler_submit
+        self._tokenizer_client = tokenizer_client
+        self.tokenizer = tokenizer
+        self.context_config = context_config
+        self.reserve_tokens = int(reserve_tokens)
+        self._max_model_len = int(max_model_len)
+        self._tool_parser_class = tool_parser_class
+        self._reasoning_parser_class = reasoning_parser_class
+        self._sampling_params_callback = sampling_params_callback
+        self._generation_config_dict = generation_config_dict
+        self._primary_eos_token_id = primary_eos_token_id
+        self._eos_ids = list(eos_token_ids)
+        self.extra_stops = list(extra_stops)
+        self._ignore_stop_strings_in_reasoning = bool(ignore_stop_strings_in_reasoning)
+        self._on_activity = on_activity
+        self._info = info
+        self._callback_engine = callback_engine
+
+        # Registry aliases keep the moved method bodies verbatim.
+        self._request_lock = registry.request_lock
+        self._output_lock = registry.output_lock
+        self._active_requests = registry.records
+        self._request_events = registry.events
+        self._request_outputs = registry.outputs
+
+        self._request_counter = 0
+        self._counter_lock = threading.Lock()
+
+    def generate_request_id(self) -> str:
+        """Allocate a fresh request id under the counter lock.
+
+        Two formats are produced depending on the JAX process count:
+
+        * Multi-host (``jax.process_count() > 1``) — the id is purely
+          counter-based (``req-{counter:010d}``) so every host generates
+          the *same* sequence of ids when handed the same input order.
+          This is essential because the SPMD/MPMD runner and distributed
+          control plane key on request id when verifying step digests
+          across ranks.
+        * Single-host — combines a UUID4 hex with the counter
+          (``req-{uuid}-{counter}``) so ids are unique even across engine
+          restarts while keeping a useful arrival-order suffix for logs.
+
+        The internal counter wraps at 2**32 to bound id length.
+
+        Returns:
+            Newly-allocated request id string.
+        """
+        with self._counter_lock:
+            self._request_counter = (self._request_counter + 1) % (1 << 32)
+            if jax.process_count() > 1:
+                return f"req-{self._request_counter:010d}"
+            return f"req-{uuid.uuid4().hex}-{self._request_counter}"
+
+    def _apply_extra_stops_to_sampling_params(self, sampling_params: SamplingParams) -> SamplingParams:
+        """Splice engine-level ``extra_stops`` into a request's ``stop`` list.
+
+        Merges the injected ``extra_stops`` with whatever stop sequences
+        the request already carries. The normalized union (deduplicated,
+        order-preserving via :func:`normalize_stop_sequences`) is written
+        back to ``sampling_params.stop`` *in place* and the same params
+        object is returned for chaining. No-op when the engine has no
+        extra stops.
+
+        Args:
+            sampling_params: Per-request sampling parameters; mutated when
+                a merge is required.
+
+        Returns:
+            ``sampling_params`` (same instance) for chaining.
+        """
+
+        extra_stops = normalize_stop_sequences(self.extra_stops)
+        if not extra_stops:
+            return sampling_params
+
+        merged = normalize_stop_sequences(getattr(sampling_params, "stop", None))
+        seen = set(merged)
+        for stop in extra_stops:
+            if stop in seen:
+                continue
+            seen.add(stop)
+            merged.append(stop)
+        sampling_params.stop = merged
+        return sampling_params
+
+    def _apply_generation_config_to_sampling_params(self, sampling_params: SamplingParams) -> SamplingParams:
+        """Augment request stop-token policy with the model's generation-config EOS ids.
+
+        Some HF models distribute multiple EOS tokens through their
+        ``generation_config.json`` (Llama 3 ``<|eot_id|>``, Qwen
+        ``<|im_end|>``, …). The tokenizer alone often only knows about
+        the *primary* EOS, so requests that don't explicitly enumerate
+        ``stop_token_ids`` would otherwise miss those alternates. This
+        helper folds the generation-config EOS ids into
+        ``sampling_params.stop_token_ids`` (deduplicated, in-place) and
+        returns the same object for chaining. No-op when the model has
+        no extra EOS ids.
+
+        Args:
+            sampling_params: Per-request sampling parameters; mutated when
+                additional EOS ids exist.
+
+        Returns:
+            ``sampling_params`` (same instance) for chaining.
+        """
+
+        generation_config = self._generation_config_dict
+        primary_eos_token_id = self._primary_eos_token_id
+
+        if not generation_config and primary_eos_token_id is None:
+            return sampling_params
+
+        try:
+            sampling_params.update_with_generation_config(
+                generation_config or {},
+                model_eos_token_id=primary_eos_token_id,
+            )
+        except Exception:
+            logger.debug("Failed to merge generation_config EOS token IDs into sampling params", exc_info=True)
+        return sampling_params
+
+    def _clone_sampling_params(self, sampling_params: SamplingParams) -> SamplingParams:
+        """Create a deep copy of sampling parameters.
+
+        Args:
+            sampling_params: Parameters to clone.
+
+        Returns:
+            Deep copy of the parameters, or original if cloning fails.
+        """
+        return clone_sampling_params(sampling_params)
+
+    def prepare_sampling_params_for_request(
+        self,
+        template: SamplingParams,
+        *,
+        request_id: str,
+        prompt: str,
+    ) -> SamplingParams:
+        """Prepare sampling parameters for a specific request.
+
+        Clones the template and applies the sampling_params_callback if configured.
+
+        Args:
+            template: Base sampling parameters to clone.
+            request_id: Request ID for callback context.
+            prompt: Prompt text for callback context.
+
+        Returns:
+            Prepared SamplingParams instance for this request.
+        """
+        params = self._clone_sampling_params(template)
+        callback = self._sampling_params_callback()
+
+        def _finalize(prepared: SamplingParams) -> SamplingParams:
+            """Apply engine-level stop / generation overrides to a per-request params object.
+
+            Inherits ``ignore_stop_strings_in_reasoning`` from the engine when
+            the per-request value is unset, then layers on extra stop strings
+            and generation-config defaults (top-p, temperature, etc.) via the
+            corresponding ``_apply_*`` helpers.
+            """
+            if getattr(prepared, "ignore_stop_strings_in_reasoning", None) is None:
+                prepared.ignore_stop_strings_in_reasoning = self._ignore_stop_strings_in_reasoning
+            prepared = self._apply_extra_stops_to_sampling_params(prepared)
+            prepared = self._apply_generation_config_to_sampling_params(prepared)
+            return prepared
+
+        if callback is None:
+            return _finalize(params)
+
+        metadata = {"request_id": request_id, "prompt": prompt, "engine": self._callback_engine}
+        try:
+            result = callback(params, metadata)
+            if result is None:
+                return _finalize(params)
+            return _finalize(result)
+        except Exception:
+            logger.exception("Sampling params callback failed; falling back to unmodified parameters")
+            return _finalize(params)
+
+    def _prepare_prompt_segments(self, prompt: typing.Any) -> list[str]:
+        """Convert a prompt to a list of string segments.
+
+        Args:
+            prompt: Input prompt, can be a string or list of strings/objects.
+
+        Returns:
+            List of string segments.
+        """
+        if isinstance(prompt, list):
+            return [segment if isinstance(segment, str) else str(segment) for segment in prompt]
+        return [prompt if isinstance(prompt, str) else str(prompt)]
+
+    def _tokenize_prompt_segments(self, prompt: typing.Any) -> list[list[int]]:
+        """Tokenize prompt segments individually.
+
+        Args:
+            prompt: Input prompt, can be a string or list of strings.
+
+        Returns:
+            List of token ID lists, one per segment.
+        """
+        segments = self._prepare_prompt_segments(prompt)
+        token_segments: list[list[int]] = []
+        for segment in segments:
+            try:
+                encoded = self.tokenizer(
+                    segment,
+                    add_special_tokens=False,
+                    return_attention_mask=False,
+                )
+                ids = encoded.get("input_ids", [])
+                if ids and isinstance(ids[0], list):
+                    ids = ids[0]
+            except Exception:
+                ids = []
+            token_segments.append([int(tok) for tok in ids])
+        return token_segments
 
     def _configure_reasoning_parser_for_prompt(
         self,
@@ -108,7 +396,7 @@ class EngineRequestsMixin:
         except Exception:
             logger.debug("Failed to configure reasoning parser prompt context", exc_info=True)
 
-    def _add_request(
+    def add_request(
         self,
         request_id: str,
         prompt: str,
@@ -125,10 +413,10 @@ class EngineRequestsMixin:
     ) -> list[EngineRequest] | None:
         """Add a new request to the scheduler queue with intelligent context management.
 
-        Internal method that tokenizes the prompt, applies context length management
-        policies, creates request tracking structures, and adds the request to the
-        scheduler for processing. Handles prompt truncation and token reservation
-        to ensure generation fits within model constraints.
+        Tokenizes the prompt, applies context length management policies,
+        creates request tracking structures, and adds the request to the
+        scheduler for processing. Handles prompt truncation and token
+        reservation to ensure generation fits within model constraints.
 
         Args:
             request_id: Unique identifier for the request.
@@ -142,9 +430,9 @@ class EngineRequestsMixin:
                 forced-function calls.
             defer_scheduler_enqueue: When ``True``, return the constructed
                 :class:`EngineRequest` objects to the caller instead of
-                enqueueing them on the scheduler. Used by :meth:`generate`
+                enqueueing them on the scheduler. Used by :meth:`eSurge.generate`
                 to batch-add all sample children under a single
-                ``_scheduler_lock`` window.
+                scheduler-lock window.
             pixel_values: Optional vision tensor (image pixels) attached
                 to the request for vision-language models.
             image_grid_thw: Vision grid dimensions (temporal, height, width)
@@ -186,9 +474,9 @@ class EngineRequestsMixin:
         """
         from ..esurge_engine import CompletionOutput, RequestOutput
 
-        self._touch_activity()
+        self._on_activity()
 
-        max_model_len = int(self.runner.max_model_len)
+        max_model_len = int(self._max_model_len)
 
         def _get_requested_new(sp):
             """Read the request's max-new-tokens budget from a :class:`SamplingParams`-like object.
@@ -211,7 +499,7 @@ class EngineRequestsMixin:
         original_requested_new = requested_new if not auto_infer_new_tokens else -1
 
         token_ids_source = (
-            prompt_token_ids if prompt_token_ids is not None else self._tokenize_prompt(request_id, prompt)
+            prompt_token_ids if prompt_token_ids is not None else self._tokenizer_client.tokenize(request_id, prompt)
         )
         token_ids = list(token_ids_source)
         prompt_len = len(token_ids)
@@ -390,7 +678,7 @@ class EngineRequestsMixin:
             )
 
         # Prepare EOS token IDs from engine-normalized EOS set
-        eos_token_ids = [int(tid) for tid in (getattr(self, "_eos_ids", None) or []) if tid is not None]
+        eos_token_ids = [int(tid) for tid in (self._eos_ids or []) if tid is not None]
 
         if not eos_token_ids:
             eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
@@ -398,7 +686,7 @@ class EngineRequestsMixin:
             eos_token_ids = [int(tid) for tid in fallback_ids if tid is not None]
 
         # Use the first EOS token as the primary one for backwards compatibility
-        primary_eos_token_id = eos_token_ids[0] if eos_token_ids else getattr(self, "_primary_eos_token_id", None)
+        primary_eos_token_id = eos_token_ids[0] if eos_token_ids else self._primary_eos_token_id
 
         # Add all EOS tokens to sampling_params.stop_token_ids if not already present
         if eos_token_ids:
@@ -502,9 +790,7 @@ class EngineRequestsMixin:
         if defer_scheduler_enqueue:
             return scheduler_requests
 
-        with self._scheduler_lock:
-            for scheduler_request in scheduler_requests:
-                self.scheduler.add_request(scheduler_request)
+        self._scheduler_submit(scheduler_requests)
 
         self._info(
             f"Queued request {request_id}: prompt_len={prompt_len}, "
@@ -512,256 +798,3 @@ class EngineRequestsMixin:
             f"model_max={max_model_len}, dropped={tokens_dropped}"
         )
         return None
-
-    def _generate_request_id(self) -> str:
-        """Allocate a fresh request id under the counter lock.
-
-        Two formats are produced depending on the JAX process count:
-
-        * Multi-host (``jax.process_count() > 1``) — the id is purely
-          counter-based (``req-{counter:010d}``) so every host generates
-          the *same* sequence of ids when handed the same input order.
-          This is essential because the SPMD/MPMD runner and distributed
-          control plane key on request id when verifying step digests
-          across ranks.
-        * Single-host — combines a UUID4 hex with the counter
-          (``req-{uuid}-{counter}``) so ids are unique even across engine
-          restarts while keeping a useful arrival-order suffix for logs.
-
-        The internal counter wraps at 2**32 to bound id length.
-
-        Returns:
-            Newly-allocated request id string.
-        """
-        with self._counter_lock:
-            self._request_counter = (self._request_counter + 1) % (1 << 32)
-            if jax.process_count() > 1:
-                return f"req-{self._request_counter:010d}"
-            return f"req-{uuid.uuid4().hex}-{self._request_counter}"
-
-    def abort_request(self, request_id: str) -> None:
-        """Cancel a request and release every resource it holds.
-
-        Atomic abort under all three engine locks (scheduler, request,
-        output) so no other thread can observe a half-aborted state. The
-        method:
-
-        1. Resolves whether ``request_id`` is the parent or one of the
-           ``n>1`` sample children, and gathers the full set of scheduler-
-           side ids that must be terminated.
-        2. Calls :meth:`Scheduler.finish_requests` with
-           ``FINISHED_ABORTED`` to evict the request rows and free their
-           pages.
-        3. Marks the parent ``RequestOutput`` (and the appropriate sample
-           slot for child aborts) as finished with ``finish_reason="abort"``.
-        4. Resets the streaming detokenizer state for each terminated id;
-           failures here are absorbed and re-tried later by
-           :meth:`_cleanup_detokenizer_state`.
-        5. Wakes any thread blocked in :meth:`generate` / :meth:`stream`
-           / :meth:`_wait_for_request` so it can observe the new finished
-           state.
-
-        Args:
-            request_id: Identifier of the request to abort. May be the
-                parent id (terminates all sample children) or a child id
-                of the form ``"{parent}-{sample_idx}"`` (terminates only
-                that sample, marking the parent finished once every sample
-                has terminated).
-
-        State on exit: the request is no longer in
-        ``_active_requests`` / ``_request_events``, the scheduler has
-        released its row and pages, and the output object reflects the
-        abort. A best-effort log line records the before/after queue
-        counts for postmortem.
-        """
-        detokenizer_reset_ids: set[str] = set()
-        parent_request_id = request_id
-        sample_index = 0
-        metrics_collector = get_metrics_collector()
-        before_running = 0
-        before_waiting = 0
-        after_running = 0
-        after_waiting = 0
-        abort_ids: set[str] = set()
-        rd_present = False
-        ro_present = False
-
-        # Acquire all locks atomically to prevent race conditions
-        with self._scheduler_lock, self._request_lock, self._output_lock:
-            before_running = len(self.scheduler.running)
-            before_waiting = len(self.scheduler.waiting)
-            rd = self._active_requests.get(request_id)
-            rd_present = rd is not None
-            if rd is not None:
-                parent_request_id = rd.parent_request_id or request_id
-                sample_index = int(rd.sample_index or 0)
-
-            # Resolve scheduler-side IDs to abort (n=1: request_id; n>1: children of parent)
-            if request_id in self.scheduler.requests:
-                abort_ids.add(request_id)
-                parent_request_id = self.scheduler.requests[request_id].parent_request_id or parent_request_id
-            abort_ids.update(
-                rid
-                for rid, req in self.scheduler.requests.items()
-                if getattr(req, "parent_request_id", None) == request_id
-            )
-
-            if abort_ids:
-                self.scheduler.finish_requests(abort_ids, EngineRequestStatus.FINISHED_ABORTED)
-                detokenizer_reset_ids |= abort_ids
-
-            # Clean up active request tracking (output retention honors max_request_outputs).
-            for rid in abort_ids:
-                self._active_requests.pop(rid, None)
-            self._active_requests.pop(parent_request_id, None)
-            for rid in abort_ids:
-                if rid != parent_request_id:
-                    self._request_events.pop(rid, None)
-
-            # Update output state
-            ro = self._request_outputs.get(parent_request_id)
-            ro_present = ro is not None
-            n_samples = len(ro.outputs) if ro is not None else 0
-            if ro is not None:
-                if request_id == parent_request_id:
-                    ro.finished = True
-                    for output in ro.outputs:
-                        output.finish_reason = "abort"
-                    if metrics_collector:
-                        metrics_collector.complete_request(parent_request_id, finish_reason="abort")
-                else:
-                    if 0 <= sample_index < len(ro.outputs):
-                        ro.outputs[sample_index].finish_reason = "abort"
-                    ro.finished = all(output.finish_reason is not None for output in ro.outputs)
-                    if ro.finished and metrics_collector:
-                        metrics_collector.complete_request(parent_request_id, finish_reason="abort")
-                ro.update_seq += 1
-
-            # Get event while still holding lock (streaming uses parent event)
-            ev = self._request_events.get(parent_request_id)
-            after_running = len(self.scheduler.running)
-            after_waiting = len(self.scheduler.waiting)
-
-            if not detokenizer_reset_ids:
-                detokenizer_reset_ids.add(request_id)
-
-        # Reset detokenizer state (outside locks to avoid blocking)
-        for rid in detokenizer_reset_ids:
-            try:
-                self._detokenizer_client.reset(rid)
-                # Remove from failed set if it was there
-                self._failed_detokenizer_resets.discard(rid)
-            except Exception:
-                logger.debug("Failed to reset detokenizer state for %s", rid, exc_info=True)
-                # Track failed reset
-                self._failed_detokenizer_resets.add(rid)
-
-        # Trigger cleanup if threshold reached
-        if len(self._failed_detokenizer_resets) >= self._detokenizer_cleanup_threshold:
-            self._cleanup_detokenizer_state()
-
-        # Notify waiters
-        if ev:
-            ev.set()
-        self._output_event.set()
-        if abort_ids:
-            logger.warning(
-                "Aborted request %s: matched_scheduler_ids=%s parent_request_id=%s "
-                "scheduler_before(run=%s,wait=%s) scheduler_after(run=%s,wait=%s)",
-                request_id,
-                len(abort_ids),
-                parent_request_id,
-                before_running,
-                before_waiting,
-                after_running,
-                after_waiting,
-            )
-        else:
-            logger.warning(
-                "Abort requested for %s but no live scheduler requests matched. "
-                "parent_request_id=%s active_request_present=%s output_present=%s "
-                "scheduler_before(run=%s,wait=%s) scheduler_after(run=%s,wait=%s)",
-                request_id,
-                parent_request_id,
-                rd_present,
-                ro_present,
-                before_running,
-                before_waiting,
-                after_running,
-                after_waiting,
-            )
-        log_metrics_summary()
-        if ro is not None and ro.finished:
-            with self._request_lock:
-                self._request_events.pop(parent_request_id, None)
-                if n_samples > 1:
-                    for sample_idx in range(n_samples):
-                        self._request_events.pop(f"{parent_request_id}-{sample_idx}", None)
-            if self._max_request_outputs is not None:
-                with self._output_lock:
-                    self._track_finished_output(parent_request_id)
-
-    def _cleanup_detokenizer_state(self) -> None:
-        """Attempt to clean up failed detokenizer states.
-
-        Retries resetting detokenizer state for all tracked failed requests.
-        Clears successfully reset requests from the tracking set.
-        """
-        if not self._failed_detokenizer_resets:
-            return
-
-        self._info(
-            "Attempting to clean up %d failed detokenizer states",
-            len(self._failed_detokenizer_resets),
-        )
-
-        successfully_reset = set()
-        for request_id in list(self._failed_detokenizer_resets):
-            try:
-                self._detokenizer_client.reset(request_id)
-                successfully_reset.add(request_id)
-            except Exception:
-                # Still failing, keep in set
-                pass
-
-        # Remove successfully reset requests
-        self._failed_detokenizer_resets -= successfully_reset
-
-        if successfully_reset:
-            self._info("Successfully cleaned up %d detokenizer states", len(successfully_reset))
-        if self._failed_detokenizer_resets:
-            logger.warning(
-                "%d detokenizer states still failed to reset",
-                len(self._failed_detokenizer_resets),
-            )
-
-    @property
-    def num_pending_requests(self) -> int:
-        """Number of requests admitted to the scheduler but not yet running.
-
-        Acquires the scheduler lock to take a consistent snapshot of
-        ``scheduler.waiting``. Surfaced for monitoring dashboards and the
-        idle-reset watchdog (which only frees state when both pending and
-        running counts are zero).
-
-        Returns:
-            Length of the scheduler's waiting queue at this instant.
-        """
-        with self._scheduler_lock:
-            return len(self.scheduler.waiting)
-
-    @property
-    def num_running_requests(self) -> int:
-        """Number of requests currently holding KV pages and being decoded.
-
-        Mirrors :attr:`num_pending_requests` but reads
-        ``scheduler.running``. The two together represent the engine's
-        in-flight workload — both must drop to zero before
-        :meth:`update_model_weights` or :meth:`release_model_state` will
-        proceed.
-
-        Returns:
-            Length of the scheduler's running queue at this instant.
-        """
-        with self._scheduler_lock:
-            return len(self.scheduler.running)

@@ -12,9 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.inference.esurge.esurge_engine import CompletionOutput, RequestOutput
-from easydel.inference.esurge.mixins.io import EngineIOMixin
-from easydel.inference.esurge.mixins.utils import EngineUtilsMixin
+from easydel.inference.esurge.esurge_engine import CompletionOutput, RequestOutput, eSurge
 from easydel.inference.inference_engine_interface import BaseInferenceApiServer
 from easydel.inference.openai_api_modules import (
     ChatCompletionRequest,
@@ -87,7 +85,9 @@ class _Server(ToolCallingMixin):
     pass
 
 
-class _IOStreamHarness(EngineIOMixin):
+class _IOStreamHarness(eSurge):
+    """eSurge subclass whose chat() replays scripted outputs; no engine construction."""
+
     def __init__(self, outputs):
         self.outputs = outputs
         self.chat_calls = []
@@ -170,7 +170,7 @@ def test_compute_delta_text_handles_overlap_and_shrink_without_warnings():
 
 
 def test_compute_snapshot_delta_text_handles_shrink_without_reset_noise():
-    delta = EngineUtilsMixin._compute_snapshot_delta_text(
+    delta = eSurge._compute_snapshot_delta_text(
         current_text="answer",
         previous_text="very long prior content",
         fallback_delta="answer",
@@ -181,21 +181,21 @@ def test_compute_snapshot_delta_text_handles_shrink_without_reset_noise():
 def test_compute_snapshot_delta_text_equal_length_normalization():
     """When parser normalization rewrites content to equal-length different text,
     treat as benign realignment (no warning, return empty delta)."""
-    delta = EngineUtilsMixin._compute_snapshot_delta_text(
+    delta = eSurge._compute_snapshot_delta_text(
         current_text="hello world!",  # 12 chars, different from prev
         previous_text="hello_world!",  # 12 chars
         fallback_delta="",
     )
     assert delta == ""
 
-    delta2 = EngineUtilsMixin._compute_snapshot_delta_text(
+    delta2 = eSurge._compute_snapshot_delta_text(
         current_text="hello world!",
         previous_text="hello_world!",
         fallback_delta="!",  # suffix of prev, so treated as replay
     )
     assert delta2 == ""
 
-    delta3 = EngineUtilsMixin._compute_snapshot_delta_text(
+    delta3 = eSurge._compute_snapshot_delta_text(
         current_text="hello world!",
         previous_text="hello_world!",
         fallback_delta="xyz",

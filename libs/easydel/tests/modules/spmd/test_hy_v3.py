@@ -21,9 +21,10 @@ transformers main), so HF parity is gated on
 once transformers ships the class.
 """
 
-import easydel as ed
 import pytest
 import transformers
+
+import easydel as ed
 
 try:
     from tests.modules.test_utils import CausalLMTester

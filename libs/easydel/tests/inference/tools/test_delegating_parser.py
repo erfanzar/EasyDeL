@@ -420,29 +420,29 @@ def test_equal_length_content_rewrite_keeps_previous():
 
 def test_finish_reason_priority_tool_calls_beats_stop():
     """In _resolve_public_finish_reason, tool_calls should beat stop."""
-    from easydel.inference.esurge.mixins.parsing import EngineParsingMixin
+    from easydel.inference.esurge.engine.output_pipeline import OutputPipeline
 
     class _FakeOutput:
         def __init__(self, fr):
             self.finish_reason = fr
 
     assert (
-        EngineParsingMixin._resolve_public_finish_reason([_FakeOutput("stop"), _FakeOutput("tool_calls")])
+        OutputPipeline._resolve_public_finish_reason([_FakeOutput("stop"), _FakeOutput("tool_calls")])
         == "tool_calls"
     )
 
     assert (
-        EngineParsingMixin._resolve_public_finish_reason([_FakeOutput("tool_calls"), _FakeOutput("stop")])
+        OutputPipeline._resolve_public_finish_reason([_FakeOutput("tool_calls"), _FakeOutput("stop")])
         == "tool_calls"
     )
 
     assert (
-        EngineParsingMixin._resolve_public_finish_reason([_FakeOutput("length"), _FakeOutput("tool_calls")]) == "length"
+        OutputPipeline._resolve_public_finish_reason([_FakeOutput("length"), _FakeOutput("tool_calls")]) == "length"
     )
 
-    assert EngineParsingMixin._resolve_public_finish_reason([_FakeOutput("abort")]) == "abort"
+    assert OutputPipeline._resolve_public_finish_reason([_FakeOutput("abort")]) == "abort"
 
-    assert EngineParsingMixin._resolve_public_finish_reason([_FakeOutput("stop")]) == "stop"
+    assert OutputPipeline._resolve_public_finish_reason([_FakeOutput("stop")]) == "stop"
 
 
 def test_tool_parser_without_request_passes_content():

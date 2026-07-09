@@ -96,6 +96,7 @@ def test_esurge_aggregate_config_fills_sections_and_coerces_nested():
 
 def test_esurge_engine_rejects_config_plus_section_kwargs():
     import pytest
+
     from easydel.inference.esurge.esurge_engine import eSurge
 
     with pytest.raises(ValueError, match="not both"):

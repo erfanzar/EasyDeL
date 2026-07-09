@@ -15,11 +15,12 @@
 import threading
 import time
 
-from easydel.inference.esurge.engine.registry import RequestRecord
+from easydel.inference.esurge.engine.admission import RequestAdmission
+from easydel.inference.esurge.engine.chat_templating import normalize_stop_sequences
+from easydel.inference.esurge.engine.output_pipeline import OutputPipeline
+from easydel.inference.esurge.engine.registry import RequestRecord, RequestRegistry
 from easydel.inference.esurge.engine_types import EngineCoreOutput, EngineCoreOutputs
 from easydel.inference.esurge.esurge_engine import CompletionOutput, RequestOutput
-from easydel.inference.esurge.mixins.parsing import EngineParsingMixin
-from easydel.inference.esurge.mixins.utils import EngineUtilsMixin
 from easydel.inference.esurge.request import EngineRequest, EngineRequestStatus
 from easydel.inference.esurge.scheduler.utils import check_stop
 from easydel.inference.parsing import DelegatingParser
@@ -28,16 +29,80 @@ from easydel.inference.sampling_params import SamplingParams
 from easydel.workers.esurge.pipeline import DetokenizerResult
 
 
-class _StopPolicyHarness(EngineParsingMixin, EngineUtilsMixin):
-    pass
+class _DetokenizerStub:
+    def reset(self, request_id: str):
+        return None
 
 
-class _SamplingParamsHarness(EngineUtilsMixin):
-    def __init__(self, extra_stops=None, callback=None, generation_config=None, primary_eos_token_id=None):
-        self.extra_stops = self._normalize_stop_sequences(extra_stops)
-        self._sampling_params_callback = callback
-        self._generation_config_dict = generation_config or {}
-        self._primary_eos_token_id = primary_eos_token_id
+class _ScriptedDetokenizer(_DetokenizerStub):
+    """Detokenizer-client stub returning a fixed decode result."""
+
+    def __init__(self, decoded_text: str, delta_text: str):
+        self._decoded_text = decoded_text
+        self._delta_text = delta_text
+
+    def decode(
+        self,
+        request_id,
+        tokens,
+        *,
+        finished=False,
+        skip_special_tokens=False,
+        spaces_between_special_tokens=True,
+        prompt_context=None,
+    ):
+        return DetokenizerResult(
+            accumulated_text=self._decoded_text,
+            delta_text=self._delta_text,
+            last_decoded_index=len(tokens),
+            finished=finished,
+            detoktook=0.0,
+        )
+
+
+def _make_pipeline(
+    decoded_text: str = "",
+    delta_text: str = "",
+    *,
+    on_stop_strings=None,
+    decode_interval_tokens: int = 1,
+    decode_interval_secs: float = 0.0,
+) -> OutputPipeline:
+    """Build an OutputPipeline over a scripted detokenizer and inert callbacks."""
+    return OutputPipeline(
+        registry=RequestRegistry(),
+        detokenizer_client=_ScriptedDetokenizer(decoded_text, delta_text),
+        eos_token_ids=[],
+        decode_interval_tokens=decode_interval_tokens,
+        decode_interval_secs=decode_interval_secs,
+        on_stop_strings=on_stop_strings if on_stop_strings is not None else (lambda stops: None),
+        on_activity=lambda: None,
+        on_fatal=lambda exc, tb: None,
+    )
+
+
+def _make_admission(extra_stops=None, callback=None, generation_config=None, primary_eos_token_id=None):
+    """Build a RequestAdmission with inert fakes for sampling-params tests."""
+    return RequestAdmission(
+        registry=RequestRegistry(),
+        scheduler_submit=lambda requests: None,
+        tokenizer_client=None,
+        tokenizer=None,
+        context_config=None,
+        reserve_tokens=0,
+        max_model_len=4096,
+        tool_parser_class=None,
+        reasoning_parser_class=None,
+        sampling_params_callback=lambda: callback,
+        generation_config_dict=generation_config or {},
+        primary_eos_token_id=primary_eos_token_id,
+        eos_token_ids=[],
+        extra_stops=normalize_stop_sequences(extra_stops),
+        ignore_stop_strings_in_reasoning=False,
+        on_activity=lambda: None,
+        info=lambda *args, **kwargs: None,
+        callback_engine=None,
+    )
 
 
 class _DummyTokenizer:
@@ -55,49 +120,6 @@ class _DummyTokenizer:
     def decode(self, token_ids, skip_special_tokens=False):
         reverse = {v: k for k, v in self._vocab.items()}
         return "".join(reverse.get(i, "") for i in token_ids)
-
-
-class _DetokenizerStub:
-    def reset(self, request_id: str):
-        return None
-
-
-class _ProcessHarness(EngineParsingMixin, EngineUtilsMixin):
-    def __init__(self, decoded_text: str, delta_text: str):
-        self.decode_interval_tokens = 1
-        self.decode_interval_secs = 0.0
-        self._decoded_text = decoded_text
-        self._delta_text = delta_text
-        self._request_lock = threading.Lock()
-        self._output_lock = threading.Lock()
-        self._scheduler_lock = threading.Lock()
-        self._request_events = {}
-        self._output_event = threading.Event()
-        self._active_requests = {}
-        self._request_outputs = {}
-        self._detokenizer_client = _DetokenizerStub()
-        self.scheduler = type("Sched", (), {"requests": {}})()
-
-    def _touch_activity(self):
-        return None
-
-    def _decode_with_pipeline(
-        self,
-        request_id,
-        decodable_tokens,
-        finished,
-        skip_special_tokens,
-        spaces_between_special_tokens,
-        prompt_context=None,
-        tokens_are_eos_filtered=False,
-    ):
-        return DetokenizerResult(
-            accumulated_text=self._decoded_text,
-            delta_text=self._delta_text,
-            last_decoded_index=len(decodable_tokens),
-            finished=finished,
-            detoktook=0.0,
-        )
 
 
 def test_check_stop_with_custom_stop_token_id():
@@ -132,11 +154,11 @@ def test_check_stop_ignores_eos_when_ignore_eos_true():
 
 
 def test_stop_string_policy_trims_on_match():
-    harness = _StopPolicyHarness()
+    pipeline = _make_pipeline()
     sampling_params = SamplingParams(max_tokens=32, stop=["<user>"])
     rd = RequestRecord(**{"sampling_params": sampling_params, "decoder_visible_text": "Hello "})
 
-    visible_text, visible_delta, stop_triggered, stop_reason = harness._apply_stop_string_policy(
+    visible_text, visible_delta, stop_triggered, stop_reason = pipeline._apply_stop_string_policy(
         rd,
         accumulated_text="Hello world<user>ignored",
         fallback_delta="world<user>ignored",
@@ -149,11 +171,11 @@ def test_stop_string_policy_trims_on_match():
 
 
 def test_stop_string_policy_passes_through_without_match():
-    harness = _StopPolicyHarness()
+    pipeline = _make_pipeline()
     sampling_params = SamplingParams(max_tokens=32, stop=["abcd"])
     rd = RequestRecord(**{"sampling_params": sampling_params, "decoder_visible_text": ""})
 
-    visible_text, visible_delta, stop_triggered, stop_reason = harness._apply_stop_string_policy(
+    visible_text, visible_delta, stop_triggered, stop_reason = pipeline._apply_stop_string_policy(
         rd,
         accumulated_text="abcx",
         fallback_delta="abcx",
@@ -166,11 +188,11 @@ def test_stop_string_policy_passes_through_without_match():
 
 
 def test_stop_string_policy_can_include_stop_string_when_requested():
-    harness = _StopPolicyHarness()
+    pipeline = _make_pipeline()
     sampling_params = SamplingParams(max_tokens=32, stop=["<user>"], include_stop_str_in_output=True)
     rd = RequestRecord(**{"sampling_params": sampling_params, "decoder_visible_text": ""})
 
-    visible_text, visible_delta, stop_triggered, stop_reason = harness._apply_stop_string_policy(
+    visible_text, visible_delta, stop_triggered, stop_reason = pipeline._apply_stop_string_policy(
         rd,
         accumulated_text="ans<user>tail",
         fallback_delta="ans<user>tail",
@@ -183,9 +205,7 @@ def test_stop_string_policy_can_include_stop_string_when_requested():
 
 
 def test_snapshot_delta_handles_empty_reset_without_fallback():
-    harness = _StopPolicyHarness()
-
-    delta = harness._compute_snapshot_delta_text(
+    delta = OutputPipeline._compute_snapshot_delta_text(
         current_text="",
         previous_text="tool markup before parser normalization",
         fallback_delta="",
@@ -195,10 +215,10 @@ def test_snapshot_delta_handles_empty_reset_without_fallback():
 
 
 def test_prepare_sampling_params_for_request_merges_engine_extra_stops():
-    harness = _SamplingParamsHarness(extra_stops=["<user>", "DONE"])
+    admission = _make_admission(extra_stops=["<user>", "DONE"])
     template = SamplingParams(max_tokens=64, stop=["DONE", "</assistant>"])
 
-    prepared = harness._prepare_sampling_params_for_request(
+    prepared = admission.prepare_sampling_params_for_request(
         template,
         request_id="req-extra-stops",
         prompt="hello",
@@ -213,10 +233,10 @@ def test_prepare_sampling_params_for_request_applies_callback_then_extra_stops()
         params.stop = ["CALLBACK_STOP"]
         return params
 
-    harness = _SamplingParamsHarness(extra_stops="<user>", callback=_callback)
+    admission = _make_admission(extra_stops="<user>", callback=_callback)
     template = SamplingParams(max_tokens=64, stop=["INITIAL"])
 
-    prepared = harness._prepare_sampling_params_for_request(
+    prepared = admission.prepare_sampling_params_for_request(
         template,
         request_id="req-extra-stops-callback",
         prompt="hello",
@@ -226,13 +246,13 @@ def test_prepare_sampling_params_for_request_applies_callback_then_extra_stops()
 
 
 def test_prepare_sampling_params_for_request_merges_generation_config_eos_ids():
-    harness = _SamplingParamsHarness(
+    admission = _make_admission(
         generation_config={"eos_token_id": [154820, 154827, 154829]},
         primary_eos_token_id=154820,
     )
     template = SamplingParams(max_tokens=64, stop_token_ids=[777])
 
-    prepared = harness._prepare_sampling_params_for_request(
+    prepared = admission.prepare_sampling_params_for_request(
         template,
         request_id="req-generation-config-eos",
         prompt="hello",
@@ -244,13 +264,13 @@ def test_prepare_sampling_params_for_request_merges_generation_config_eos_ids():
 
 
 def test_prepare_sampling_params_respects_ignore_eos_for_generation_config_ids():
-    harness = _SamplingParamsHarness(
+    admission = _make_admission(
         generation_config={"eos_token_id": [154820, 154827]},
         primary_eos_token_id=154820,
     )
     template = SamplingParams(max_tokens=64, stop_token_ids=[777], ignore_eos=True)
 
-    prepared = harness._prepare_sampling_params_for_request(
+    prepared = admission.prepare_sampling_params_for_request(
         template,
         request_id="req-generation-config-ignore-eos",
         prompt="hello",
@@ -261,13 +281,13 @@ def test_prepare_sampling_params_respects_ignore_eos_for_generation_config_ids()
 
 
 def test_process_engine_outputs_keeps_raw_text_before_reasoning_split():
-    harness = _ProcessHarness(
+    pipeline = _make_pipeline(
         decoded_text="<think>plan</think><tool_call>{}</tool_call>",
         delta_text="<think>plan</think><tool_call>{}</tool_call>",
     )
     reasoning_parser = DeepSeekR1ReasoningParser(_DummyTokenizer())
     request_id = "req-raw-before-parse"
-    harness._active_requests[request_id] = RequestRecord(**{
+    pipeline._active_requests[request_id] = RequestRecord(**{
         "parent_request_id": request_id,
         "sample_index": 0,
         "generated_tokens": [],
@@ -282,14 +302,14 @@ def test_process_engine_outputs_keeps_raw_text_before_reasoning_split():
         "parser_previous_text": "",
         "parser_previous_token_ids": [],
     })
-    harness._request_outputs[request_id] = RequestOutput(
+    pipeline._request_outputs[request_id] = RequestOutput(
         request_id=request_id,
         prompt="hi",
         prompt_token_ids=[[1, 2]],
         outputs=[CompletionOutput(index=0, text="", token_ids=[])],
     )
 
-    harness._process_engine_outputs(
+    pipeline._process_engine_outputs(
         {
             0: EngineCoreOutputs(
                 outputs=[
@@ -302,7 +322,7 @@ def test_process_engine_outputs_keeps_raw_text_before_reasoning_split():
         }
     )
 
-    output = harness._request_outputs[request_id]
+    output = pipeline._request_outputs[request_id]
     completion = output.outputs[0]
     assert completion.raw_text == "<think>plan</think><tool_call>{}</tool_call>"
     assert output.raw_accumulated_text == "<think>plan</think><tool_call>{}</tool_call>"
@@ -311,10 +331,10 @@ def test_process_engine_outputs_keeps_raw_text_before_reasoning_split():
 
 
 def test_process_engine_outputs_uses_engine_timestamp_for_generation_metrics():
-    harness = _ProcessHarness(decoded_text="xy", delta_text="y")
+    pipeline = _make_pipeline(decoded_text="xy", delta_text="y")
     request_id = "req-engine-timestamp-metrics"
     start_time = 100.0
-    harness._active_requests[request_id] = RequestRecord(**{
+    pipeline._active_requests[request_id] = RequestRecord(**{
         "parent_request_id": request_id,
         "sample_index": 0,
         "generated_tokens": [],
@@ -330,14 +350,14 @@ def test_process_engine_outputs_uses_engine_timestamp_for_generation_metrics():
         "parser_previous_text": "",
         "parser_previous_token_ids": [],
     })
-    harness._request_outputs[request_id] = RequestOutput(
+    pipeline._request_outputs[request_id] = RequestOutput(
         request_id=request_id,
         prompt="hi",
         prompt_token_ids=[[1, 2]],
         outputs=[CompletionOutput(index=0, text="", token_ids=[])],
     )
 
-    harness._process_engine_outputs(
+    pipeline._process_engine_outputs(
         {
             0: EngineCoreOutputs(
                 outputs=[EngineCoreOutput(request_id=request_id, new_token_ids=[11])],
@@ -345,7 +365,7 @@ def test_process_engine_outputs_uses_engine_timestamp_for_generation_metrics():
             )
         }
     )
-    harness._process_engine_outputs(
+    pipeline._process_engine_outputs(
         {
             0: EngineCoreOutputs(
                 outputs=[EngineCoreOutput(request_id=request_id, new_token_ids=[12])],
@@ -354,7 +374,7 @@ def test_process_engine_outputs_uses_engine_timestamp_for_generation_metrics():
         }
     )
 
-    output = harness._request_outputs[request_id]
+    output = pipeline._request_outputs[request_id]
     assert output.time_spent_generating == 2.0
     assert output.first_token_time == 1.0
     assert output.num_generated_tokens == 2
@@ -362,11 +382,14 @@ def test_process_engine_outputs_uses_engine_timestamp_for_generation_metrics():
 
 
 def test_process_engine_outputs_queues_parser_stop_without_scheduler_lock():
-    harness = _ProcessHarness(decoded_text="hello STOP tail", delta_text="hello STOP tail")
     queued_stops = []
-    harness._enqueue_parser_stop_requests = lambda stops: queued_stops.append(dict(stops))
+    pipeline = _make_pipeline(
+        decoded_text="hello STOP tail",
+        delta_text="hello STOP tail",
+        on_stop_strings=lambda stops: queued_stops.append(dict(stops)),
+    )
     request_id = "req-parser-stop-queued"
-    harness._active_requests[request_id] = RequestRecord(**{
+    pipeline._active_requests[request_id] = RequestRecord(**{
         "parent_request_id": request_id,
         "sample_index": 0,
         "generated_tokens": [],
@@ -382,14 +405,14 @@ def test_process_engine_outputs_queues_parser_stop_without_scheduler_lock():
         "parser_previous_text": "",
         "parser_previous_token_ids": [],
     })
-    harness._request_outputs[request_id] = RequestOutput(
+    pipeline._request_outputs[request_id] = RequestOutput(
         request_id=request_id,
         prompt="hi",
         prompt_token_ids=[[1, 2]],
         outputs=[CompletionOutput(index=0, text="", token_ids=[])],
     )
 
-    harness._process_engine_outputs(
+    pipeline._process_engine_outputs(
         {
             0: EngineCoreOutputs(
                 outputs=[EngineCoreOutput(request_id=request_id, new_token_ids=[11])],
@@ -397,18 +420,18 @@ def test_process_engine_outputs_queues_parser_stop_without_scheduler_lock():
         }
     )
 
-    output = harness._request_outputs[request_id]
+    output = pipeline._request_outputs[request_id]
     assert queued_stops == [{request_id: "STOP"}]
     assert output.finished is True
     assert output.outputs[0].finish_reason == "stop"
 
 
 def test_process_engine_outputs_marks_finished_requests_without_token_output():
-    harness = _ProcessHarness(decoded_text="", delta_text="")
+    pipeline = _make_pipeline(decoded_text="", delta_text="")
     request_id = "req-finished-only"
     event = threading.Event()
-    harness._request_events[request_id] = event
-    harness._active_requests[request_id] = RequestRecord(**{
+    pipeline._request_events[request_id] = event
+    pipeline._active_requests[request_id] = RequestRecord(**{
         "parent_request_id": request_id,
         "sample_index": 0,
         "generated_tokens": [],
@@ -423,25 +446,25 @@ def test_process_engine_outputs_marks_finished_requests_without_token_output():
         "parser_previous_text": "",
         "parser_previous_token_ids": [],
     })
-    harness._request_outputs[request_id] = RequestOutput(
+    pipeline._request_outputs[request_id] = RequestOutput(
         request_id=request_id,
         prompt="hi",
         prompt_token_ids=[[1, 2]],
         outputs=[CompletionOutput(index=0, text="", token_ids=[])],
     )
 
-    harness._process_engine_outputs({0: EngineCoreOutputs(finished_requests={request_id})})
+    pipeline._process_engine_outputs({0: EngineCoreOutputs(finished_requests={request_id})})
 
-    output = harness._request_outputs[request_id]
+    output = pipeline._request_outputs[request_id]
     assert event.is_set()
     assert output.finished is True
     assert output.outputs[0].finish_reason == "abort"
-    assert request_id not in harness._active_requests
+    assert request_id not in pipeline._active_requests
 
 
 def test_find_first_stop_string_picks_earliest_match():
     """Stop string matching should pick the earliest occurrence."""
-    result = EngineParsingMixin._find_first_stop_string("hello\nworld\nstop", ["\nstop", "\nworld"])
+    result = OutputPipeline._find_first_stop_string("hello\nworld\nstop", ["\nstop", "\nworld"])
     assert result is not None
     idx, stop = result
     assert stop == "\nworld"
@@ -450,7 +473,7 @@ def test_find_first_stop_string_picks_earliest_match():
 
 def test_find_first_stop_string_prefers_longer_at_same_position():
     """When two stop strings match at the same position, prefer the longer one."""
-    result = EngineParsingMixin._find_first_stop_string("hello\nworld", ["\n", "\nworld"])
+    result = OutputPipeline._find_first_stop_string("hello\nworld", ["\n", "\nworld"])
     assert result is not None
     idx, stop = result
     assert stop == "\nworld"  # longer match at same position
@@ -459,25 +482,25 @@ def test_find_first_stop_string_prefers_longer_at_same_position():
 
 def test_find_first_stop_string_ignores_empty():
     """Empty stop strings should be skipped."""
-    result = EngineParsingMixin._find_first_stop_string("hello world", ["", "world"])
+    result = OutputPipeline._find_first_stop_string("hello world", ["", "world"])
     assert result is not None
     _idx, stop = result
     assert stop == "world"
 
 
 def test_find_first_stop_string_returns_none_when_no_match():
-    result = EngineParsingMixin._find_first_stop_string("hello world", ["xyz", "abc"])
+    result = OutputPipeline._find_first_stop_string("hello world", ["xyz", "abc"])
     assert result is None
 
 
 def test_apply_stop_string_policy_with_include_stop():
     """When include_stop_str_in_output=True, the stop string should be included."""
-    harness = _StopPolicyHarness()
+    pipeline = _make_pipeline()
     sp = SamplingParams(max_tokens=16, stop=["\nstop"])
     sp.include_stop_str_in_output = True
     rd = RequestRecord(**{"sampling_params": sp, "decoder_visible_text": ""})
 
-    visible, _delta, stop_hit, stop_reason = harness._apply_stop_string_policy(
+    visible, _delta, stop_hit, stop_reason = pipeline._apply_stop_string_policy(
         rd, accumulated_text="hello\nstop world", fallback_delta="hello\nstop world"
     )
     assert stop_hit is True
@@ -487,11 +510,11 @@ def test_apply_stop_string_policy_with_include_stop():
 
 def test_apply_stop_string_policy_without_include_stop():
     """Default: stop string should NOT be included in output."""
-    harness = _StopPolicyHarness()
+    pipeline = _make_pipeline()
     sp = SamplingParams(max_tokens=16, stop=["\nstop"])
     rd = RequestRecord(**{"sampling_params": sp, "decoder_visible_text": ""})
 
-    visible, _delta, stop_hit, stop_reason = harness._apply_stop_string_policy(
+    visible, _delta, stop_hit, stop_reason = pipeline._apply_stop_string_policy(
         rd, accumulated_text="hello\nstop world", fallback_delta="hello\nstop world"
     )
     assert stop_hit is True
@@ -501,9 +524,12 @@ def test_apply_stop_string_policy_without_include_stop():
 
 def test_decode_and_parse_skips_when_interval_not_reached():
     """_decode_and_parse should return None when decode interval hasn't been reached."""
-    harness = _ProcessHarness(decoded_text="test", delta_text="test")
-    harness.decode_interval_tokens = 100  # Very high threshold
-    harness.decode_interval_secs = 100.0  # Very high timeout
+    pipeline = _make_pipeline(
+        decoded_text="test",
+        delta_text="test",
+        decode_interval_tokens=100,  # Very high threshold
+        decode_interval_secs=100.0,  # Very high timeout
+    )
     rd = RequestRecord(**{
         "last_decoded_index": 0,
         "last_decode_time": time.perf_counter(),
@@ -513,7 +539,7 @@ def test_decode_and_parse_skips_when_interval_not_reached():
         "parser_previous_token_ids": [],
         "decoder_visible_text": "",
     })
-    parsed, _raw, _raw_delta, _stop_hit, _stop_reason = harness._decode_and_parse(
+    parsed, _raw, _raw_delta, _stop_hit, _stop_reason = pipeline._decode_and_parse(
         "req-1", rd, [1], time.perf_counter(), finished=False
     )
     assert parsed is None  # Should skip because interval not reached

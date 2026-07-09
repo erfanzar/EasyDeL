@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import easydel.inference as inference_module
 import pytest
+
+import easydel.inference as inference_module
 from easydel.infra.elarge.builders import to_esurge_kwargs
 from easydel.infra.elarge.model import eLargeModel
 from easydel.scripts.elarge import _run_action

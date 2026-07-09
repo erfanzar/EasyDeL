@@ -23,11 +23,12 @@ through the plain uncached forward and requires exact argmax agreement.
 
 from __future__ import annotations
 
-import easydel as ed
 import jax
 import pytest
 import spectrax as spx
 from jax import numpy as jnp
+
+import easydel as ed
 
 try:
     from tests.inference.esurge.runtime_pass._tiny_runtime_common import (

@@ -26,6 +26,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+
 from easydel.inference.esurge.runners.model_runner import eSurgeRunner
 
 

@@ -24,9 +24,10 @@ a model onto a freshly-built graph definition (``esurge_compatible_model`` /
 RNG stream the exported state no longer carried.
 """
 
-import easydel as ed
 import jax.numpy as jnp
 import spectrax as spx
+
+import easydel as ed
 
 _CFG = dict(
     vocab_size=128,

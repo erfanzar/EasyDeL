@@ -21,7 +21,8 @@ from types import SimpleNamespace
 import jax.numpy as jnp
 from transformers.generation.configuration_utils import GenerationConfig
 
-from easydel.inference.esurge.mixins.lifecycle import EngineLifecycleMixin
+from easydel.inference.esurge.engine.loop import EngineLoop
+from easydel.inference.esurge.esurge_engine import eSurge
 from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.esurge.runners import model_runner as model_runner_module
 from easydel.inference.esurge.runners.model_runner import eSurgeRunner
@@ -314,7 +315,7 @@ def test_lifecycle_update_graphdef_prefers_overridden_esurge_graphdef():
         def _esurge_graphdef_from_graphdef(self, _graphdef):
             raise AssertionError("wrapper helper should not be used when esurge_graphdef is overridden")
 
-    resolved = EngineLifecycleMixin._resolve_graphdef_for_weight_update(
+    resolved = eSurge._resolve_graphdef_for_weight_update(
         WrapperLike(),
         split_graphdef="split-wrapper-graphdef",
     )
@@ -342,7 +343,7 @@ def test_lifecycle_split_graph_components_prefers_compatible_model_for_wrapper_d
         def esurge_compatible_model(self):
             return self.model
 
-    split_model, graphdef, graphstate, graphother = EngineLifecycleMixin._split_graph_components_for_weight_update(
+    split_model, graphdef, graphstate, graphother = eSurge._split_graph_components_for_weight_update(
         WrapperLike()
     )
 
@@ -375,7 +376,7 @@ def test_lifecycle_prefetch_waits_for_async_decode_batches():
         async_scheduling=True,
     )
 
-    assert not EngineLifecycleMixin._can_prefetch_scheduler_output(scheduler, scheduler_output)
+    assert not EngineLoop._can_prefetch_scheduler_output(scheduler, scheduler_output)
 
 
 def test_lifecycle_prefetch_allows_pure_prefill_batches():
@@ -398,7 +399,7 @@ def test_lifecycle_prefetch_allows_pure_prefill_batches():
         async_scheduling=True,
     )
 
-    assert EngineLifecycleMixin._can_prefetch_scheduler_output(scheduler, scheduler_output)
+    assert EngineLoop._can_prefetch_scheduler_output(scheduler, scheduler_output)
 
 
 def test_lifecycle_aborts_after_prefetched_overlap_drain_failure():
@@ -467,75 +468,42 @@ def test_lifecycle_aborts_after_prefetched_overlap_drain_failure():
         def shutdown(self):
             pass
 
-    class DummyEngine(EngineLifecycleMixin):
-        def __init__(self):
-            self.runtime_config = SimpleNamespace(overlap_execution=True, async_scheduling=False)
-            self._scheduler_lock = threading.Lock()
-            self._request_lock = threading.Lock()
-            self._output_lock = threading.Lock()
-            self._output_event = threading.Event()
-            self._request_events = {}
-            self._active_requests = {}
-            self._request_outputs = {}
-            self._finished_request_ids = set()
-            self._scheduler_running = False
-            self._scheduler_thread = None
-            self._scheduler_exception = None
-            self._scheduler_exception_tb = None
-            self._scheduler_heartbeat = None
-            self._profiling_active = False
-            self._profiling_steps_remaining = 0
-            self._profiling_output_dir = None
-            self._profiling_host_level = None
-            self._profiling_python_level = None
-            self._paused = True
-            self._distributed_controller = None
-            self._kv_cache_valid = True
-            self.runner = DummyRunner()
-            self.scheduler = DummyScheduler()
+    scheduler = DummyScheduler()
+    runner = DummyRunner()
+    recorded: dict = {"exc": None}
 
-        def _touch_activity(self):
-            pass
+    def _emit_outputs(engine_outputs):
+        if not engine_outputs:
+            return
+        raise AssertionError("engine outputs should not be processed after the drain failure")
 
-        def _start_idle_monitor(self):
-            pass
+    loop = EngineLoop(
+        scheduler=scheduler,
+        runner=runner,
+        coordinator=None,
+        scheduler_lock=threading.Lock(),
+        emit_outputs=_emit_outputs,
+        drain_parser_stops=lambda: None,
+        on_fatal=lambda exc: (recorded.__setitem__("exc", exc), loop.request_stop()),
+        heartbeat=lambda: None,
+        handle_profiling_step=lambda: None,
+        is_nonrecoverable=lambda exc: False,
+        overlap_execution=True,
+        async_scheduling=False,
+        runner_verbose=False,
+        info=lambda *args, **kwargs: None,
+    )
+    loop.start()
+    thread = loop.thread
+    assert thread is not None
+    thread.join(timeout=1.0)
 
-        def _stop_idle_monitor(self):
-            pass
-
-        def _info(self, *_args, **_kwargs):
-            pass
-
-        def _update_scheduler_heartbeat(self):
-            pass
-
-        def _process_engine_outputs(self, _outputs):
-            raise AssertionError("engine outputs should not be processed after the drain failure")
-
-        def _handle_profiling_step(self):
-            pass
-
-        def _install_signal_diagnostics(self):
-            pass
-
-        def _is_nonrecoverable_scheduler_error(self, _exc):
-            return False
-
-        def _reset_runner_state_if_idle(self, _reason):
-            pass
-
-    engine = DummyEngine()
-    engine.initiate()
-    assert engine._scheduler_thread is not None
-    engine._scheduler_thread.join(timeout=1.0)
-
-    assert engine._scheduler_thread is not None
-    assert not engine._scheduler_thread.is_alive()
-    assert not engine._scheduler_running
-    assert isinstance(engine._scheduler_exception, RuntimeError)
-    assert "drain failed" in str(engine._scheduler_exception)
-    assert engine.scheduler.schedule_calls == 2
-    assert engine.runner.async_dispatches == 2
+    assert not thread.is_alive()
+    assert not loop.running
+    assert isinstance(recorded["exc"], RuntimeError)
+    assert "drain failed" in str(recorded["exc"])
+    assert scheduler.schedule_calls == 2
+    assert runner.async_dispatches == 2
 
 
 def test_lifecycle_pp_async_dispatches_next_step_before_draining_previous():
@@ -571,6 +539,7 @@ def test_lifecycle_pp_async_dispatches_next_step_before_draining_previous():
     )
 
     events: list[str] = []
+    loop_holder: dict = {"loop": None}
 
     class DummyScheduler:
         def __init__(self):
@@ -594,7 +563,7 @@ def test_lifecycle_pp_async_dispatches_next_step_before_draining_previous():
             self.update_calls += 1
             events.append(f"update{self.update_calls}")
             if self.update_calls >= 2:
-                engine._scheduler_running = False
+                loop_holder["loop"].request_stop()
             return {}
 
     class DummyRunner:
@@ -629,71 +598,34 @@ def test_lifecycle_pp_async_dispatches_next_step_before_draining_previous():
         def log_it(self, *_args, **_kwargs):
             pass
 
-    class DummyEngine(EngineLifecycleMixin):
-        def __init__(self):
-            self.runtime_config = SimpleNamespace(overlap_execution=True, async_scheduling=True)
-            self._scheduler_lock = threading.Lock()
-            self._request_lock = threading.Lock()
-            self._output_lock = threading.Lock()
-            self._output_event = threading.Event()
-            self._request_events = {}
-            self._active_requests = {}
-            self._request_outputs = {}
-            self._finished_request_ids = set()
-            self._scheduler_running = False
-            self._scheduler_thread = None
-            self._scheduler_exception = None
-            self._scheduler_exception_tb = None
-            self._scheduler_heartbeat = None
-            self._profiling_active = False
-            self._profiling_steps_remaining = 0
-            self._profiling_output_dir = None
-            self._profiling_host_level = None
-            self._profiling_python_level = None
-            self._paused = True
-            self._distributed_controller = None
-            self._kv_cache_valid = True
-            self.runner = DummyRunner()
-            self.scheduler = DummyScheduler()
+    scheduler = DummyScheduler()
+    runner = DummyRunner()
+    recorded: dict = {"exc": None}
 
-        def _touch_activity(self):
-            pass
+    loop = EngineLoop(
+        scheduler=scheduler,
+        runner=runner,
+        coordinator=None,
+        scheduler_lock=threading.Lock(),
+        emit_outputs=lambda engine_outputs: None,
+        drain_parser_stops=lambda: None,
+        on_fatal=lambda exc: (recorded.__setitem__("exc", exc), loop.request_stop()),
+        heartbeat=lambda: None,
+        handle_profiling_step=lambda: None,
+        is_nonrecoverable=lambda exc: False,
+        overlap_execution=True,
+        async_scheduling=True,
+        runner_verbose=False,
+        info=lambda *args, **kwargs: None,
+    )
+    loop_holder["loop"] = loop
+    loop.start()
+    thread = loop.thread
+    assert thread is not None
+    thread.join(timeout=1.0)
 
-        def _start_idle_monitor(self):
-            pass
-
-        def _stop_idle_monitor(self):
-            pass
-
-        def _info(self, *_args, **_kwargs):
-            pass
-
-        def _update_scheduler_heartbeat(self):
-            pass
-
-        def _process_engine_outputs(self, _outputs):
-            pass
-
-        def _handle_profiling_step(self):
-            pass
-
-        def _install_signal_diagnostics(self):
-            pass
-
-        def _is_nonrecoverable_scheduler_error(self, _exc):
-            return False
-
-        def _reset_runner_state_if_idle(self, _reason):
-            pass
-
-    engine = DummyEngine()
-    engine.initiate()
-    assert engine._scheduler_thread is not None
-    engine._scheduler_thread.join(timeout=1.0)
-
-    assert engine._scheduler_thread is not None
-    assert not engine._scheduler_thread.is_alive()
-    assert engine._scheduler_exception is None
+    assert not thread.is_alive()
+    assert recorded["exc"] is None
     assert events.index("execute2") < events.index("wait_future1")
     assert events.index("update1") < events.index("wait_future2")
 

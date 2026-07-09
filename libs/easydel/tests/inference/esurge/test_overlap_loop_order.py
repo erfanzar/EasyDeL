@@ -23,9 +23,9 @@ advanced (a next step was scheduled and possibly dispatched) must abort the
 loop, never retry: retrying with an unexecuted prefetched batch corrupts
 scheduler/runner state.
 
-These tests run the real ``EngineLifecycleMixin`` loop against a scripted
-scheduler and runner recording call order — no model, no device work. They
-lock the loop-shape invariants through the EngineLoop extraction refactor.
+These tests run the real :class:`EngineLoop` against a scripted scheduler
+and runner recording call order — no model, no device work. They lock the
+loop-shape invariants established by the EngineLoop extraction refactor.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ import threading
 import time
 from types import SimpleNamespace
 
-from easydel.inference.esurge.mixins.lifecycle import EngineLifecycleMixin
+from easydel.inference.esurge.engine.loop import EngineLoop
 
 JOIN_TIMEOUT_S = 20.0
 POLL_INTERVAL_S = 0.002
@@ -110,56 +110,39 @@ class _FakeScheduler:
         return {}
 
 
-class _LoopHarness(EngineLifecycleMixin):
-    """Real lifecycle loop over scripted collaborators; periphery stubbed out."""
+class _LoopHarness:
+    """Real :class:`EngineLoop` over scripted collaborators; periphery injected as no-ops."""
 
     def __init__(self, script: list, *, fail_drain_tags: set[str] | None = None):
         self.events: list[str] = []
         self.runner = _FakeRunner(self.events, fail_drain_tags=fail_drain_tags)
         self.scheduler = _FakeScheduler(self.events, script)
-        self.runtime_config = SimpleNamespace(
+        self.aborts: list[BaseException] = []
+        self.loop = EngineLoop(
+            scheduler=self.scheduler,
+            runner=self.runner,
+            coordinator=None,
+            scheduler_lock=threading.RLock(),
+            emit_outputs=lambda engine_outputs: None,
+            drain_parser_stops=lambda: None,
+            on_fatal=self._abort,
+            heartbeat=lambda: None,
+            handle_profiling_step=lambda: None,
+            is_nonrecoverable=lambda exc: False,
             overlap_execution=True,
             async_scheduling=True,
             runner_verbose=False,
+            info=lambda *args, **kwargs: None,
         )
-        self._scheduler_lock = threading.RLock()
-        self._scheduler_running = False
-        self._scheduler_thread = None
-        self._profiling_active = False
-        self.aborts: list[BaseException] = []
 
-    # --- stubbed periphery (not under test) ---
-    def _info(self, *args, **kwargs):
-        pass
-
-    def _start_engine_output_worker(self):
-        pass
-
-    def _install_signal_diagnostics(self):
-        pass
-
-    def _touch_activity(self):
-        pass
-
-    def _start_idle_monitor(self):
-        pass
-
-    def _update_scheduler_heartbeat(self):
-        pass
-
-    def _drain_parser_stop_requests_locked(self):
-        pass
-
-    def _enqueue_engine_outputs(self, engine_outputs):
-        pass
-
-    def _abort_scheduler_due_to_error(self, exc):
+    def _abort(self, exc: BaseException) -> None:
+        """Record the fatal error and stop the loop (mirrors the engine's abort)."""
         self.aborts.append(exc)
-        self._scheduler_running = False
+        self.loop.request_stop()
 
     # --- test driver ---
     def run_until(self, predicate, timeout: float = JOIN_TIMEOUT_S) -> None:
-        self.initiate()
+        self.loop.start()
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if predicate(self):
@@ -171,8 +154,8 @@ class _LoopHarness(EngineLifecycleMixin):
         self._stop()
 
     def _stop(self) -> None:
-        self._scheduler_running = False
-        thread = self._scheduler_thread
+        self.loop.request_stop()
+        thread = self.loop.thread
         if thread is not None:
             thread.join(timeout=JOIN_TIMEOUT_S)
             assert not thread.is_alive(), "scheduler loop thread failed to exit"
