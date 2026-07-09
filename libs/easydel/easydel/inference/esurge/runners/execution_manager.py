@@ -103,7 +103,7 @@ from easydel.layers.quantization import TurboQuantConfig
 
 from ..utils import model_uses_mrope
 from .async_types import DeviceInputTokenHandoff
-from .execution_types import BatchMetadata, ModelStepOutputs, StepFunctionInputs
+from .execution_types import ModelStepOutputs, StepFunctionInputs
 from .executors import BatchMetadataPreparer, ModelStepExecutor, SamplerExecutor, SamplerRuntime
 from .executors.pipeline_microbatch import PipelineMicrobatchExecutor
 from .executors.sampler_executor import (
@@ -1505,59 +1505,10 @@ class ExecutionManager:
             metrics,
         )
 
-    @staticmethod
-    def _apply_device_token_handoff(
-        batch_metadata: BatchMetadata,
-        handoff: DeviceInputTokenHandoff,
-    ) -> BatchMetadata:
-        """Attach a compiled-step token handoff to batch metadata.
-
-        PP async decode has a one-token loop-carried dependency: token ``N``
-        sampled by the final stage is token ``N+1``'s input on stage 0. The old
-        path resolved that dependency by materializing token ``N`` on the host
-        and repairing the CPU sequence buffer before the next launch. This
-        helper keeps the dependency on device by carrying the sampled-token
-        arrays into :class:`BatchMetadata`; the compiled model step resolves
-        placeholders via ``BatchMetadata.model_input_ids`` inside the JIT region.
-
-        The returned :class:`BatchMetadata` is a fresh PyTree with all metadata
-        leaves preserved except the handoff buffers. CPU request state is
-        repaired separately after dispatch, which keeps scheduler/accounting
-        correctness while removing host token materialization from the
-        stage-launch critical path.
-        """
-        return BatchMetadata(
-            packed_qsl_seqlens=batch_metadata.packed_qsl_seqlens,
-            packed_i32_padded=batch_metadata.packed_i32_padded,
-            packed_f32_padded=batch_metadata.packed_f32_padded,
-            packed_misc_i32=batch_metadata.packed_misc_i32,
-            pages_tables=batch_metadata.pages_tables,
-            input_ids_buf=batch_metadata.input_ids_buf,
-            position_ids_buf=batch_metadata.position_ids_buf,
-            dp_query_start_loc=batch_metadata.dp_query_start_loc,
-            dp_request_distribution=batch_metadata.dp_request_distribution,
-            dp_context_lens=batch_metadata.dp_context_lens,
-            dp_recurrent_state_indices=batch_metadata.dp_recurrent_state_indices,
-            input_token_handoff_positions=handoff.input_positions,
-            input_token_handoff_ids=handoff.token_ids,
-            input_token_handoff_count=handoff.count,
-            input_token_handoff_offset=(
-                handoff.offset if handoff.offset is not None else jnp.zeros((), dtype=jnp.int32)
-            ),
-            num_tokens=batch_metadata.num_tokens,
-            slot_mapping=batch_metadata.slot_mapping,
-            num_kv_update_slices=batch_metadata.num_kv_update_slices,
-            pixel_values=batch_metadata.pixel_values,
-            image_grid_thw=batch_metadata.image_grid_thw,
-            pixel_values_videos=batch_metadata.pixel_values_videos,
-            video_grid_thw=batch_metadata.video_grid_thw,
-            mrope_position_ids=batch_metadata.mrope_position_ids,
-            prefill_embeds=batch_metadata.prefill_embeds,
-            prefill_embeds_mask=batch_metadata.prefill_embeds_mask,
-            visual_pos_masks=batch_metadata.visual_pos_masks,
-            deepstack_visual_embeds=batch_metadata.deepstack_visual_embeds,
-            spec_recurrent_commit=batch_metadata.spec_recurrent_commit,
-        )
+    # Device-token-handoff application moved to BatchMetadataPreparer (phase
+    # 11.3); kept as a static alias because execute(), the PP microbatch
+    # executor, and tests call it as ExecutionManager._apply_device_token_handoff.
+    _apply_device_token_handoff = staticmethod(BatchMetadataPreparer._apply_device_token_handoff)
 
     def execute_model(
         self,
