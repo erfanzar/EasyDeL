@@ -15,6 +15,7 @@
 import threading
 import time
 
+from easydel.inference.esurge.engine.registry import RequestRecord
 from easydel.inference.esurge.engine_types import EngineCoreOutput, EngineCoreOutputs
 from easydel.inference.esurge.esurge_engine import CompletionOutput, RequestOutput
 from easydel.inference.esurge.mixins.parsing import EngineParsingMixin
@@ -133,7 +134,7 @@ def test_check_stop_ignores_eos_when_ignore_eos_true():
 def test_stop_string_policy_trims_on_match():
     harness = _StopPolicyHarness()
     sampling_params = SamplingParams(max_tokens=32, stop=["<user>"])
-    rd = {"sampling_params": sampling_params, "decoder_visible_text": "Hello "}
+    rd = RequestRecord(**{"sampling_params": sampling_params, "decoder_visible_text": "Hello "})
 
     visible_text, visible_delta, stop_triggered, stop_reason = harness._apply_stop_string_policy(
         rd,
@@ -150,7 +151,7 @@ def test_stop_string_policy_trims_on_match():
 def test_stop_string_policy_passes_through_without_match():
     harness = _StopPolicyHarness()
     sampling_params = SamplingParams(max_tokens=32, stop=["abcd"])
-    rd = {"sampling_params": sampling_params, "decoder_visible_text": ""}
+    rd = RequestRecord(**{"sampling_params": sampling_params, "decoder_visible_text": ""})
 
     visible_text, visible_delta, stop_triggered, stop_reason = harness._apply_stop_string_policy(
         rd,
@@ -167,7 +168,7 @@ def test_stop_string_policy_passes_through_without_match():
 def test_stop_string_policy_can_include_stop_string_when_requested():
     harness = _StopPolicyHarness()
     sampling_params = SamplingParams(max_tokens=32, stop=["<user>"], include_stop_str_in_output=True)
-    rd = {"sampling_params": sampling_params, "decoder_visible_text": ""}
+    rd = RequestRecord(**{"sampling_params": sampling_params, "decoder_visible_text": ""})
 
     visible_text, visible_delta, stop_triggered, stop_reason = harness._apply_stop_string_policy(
         rd,
@@ -266,7 +267,7 @@ def test_process_engine_outputs_keeps_raw_text_before_reasoning_split():
     )
     reasoning_parser = DeepSeekR1ReasoningParser(_DummyTokenizer())
     request_id = "req-raw-before-parse"
-    harness._active_requests[request_id] = {
+    harness._active_requests[request_id] = RequestRecord(**{
         "parent_request_id": request_id,
         "sample_index": 0,
         "generated_tokens": [],
@@ -280,7 +281,7 @@ def test_process_engine_outputs_keeps_raw_text_before_reasoning_split():
         "delegating_parser": DelegatingParser(reasoning_parser=reasoning_parser),
         "parser_previous_text": "",
         "parser_previous_token_ids": [],
-    }
+    })
     harness._request_outputs[request_id] = RequestOutput(
         request_id=request_id,
         prompt="hi",
@@ -313,7 +314,7 @@ def test_process_engine_outputs_uses_engine_timestamp_for_generation_metrics():
     harness = _ProcessHarness(decoded_text="xy", delta_text="y")
     request_id = "req-engine-timestamp-metrics"
     start_time = 100.0
-    harness._active_requests[request_id] = {
+    harness._active_requests[request_id] = RequestRecord(**{
         "parent_request_id": request_id,
         "sample_index": 0,
         "generated_tokens": [],
@@ -328,7 +329,7 @@ def test_process_engine_outputs_uses_engine_timestamp_for_generation_metrics():
         "delegating_parser": DelegatingParser(),
         "parser_previous_text": "",
         "parser_previous_token_ids": [],
-    }
+    })
     harness._request_outputs[request_id] = RequestOutput(
         request_id=request_id,
         prompt="hi",
@@ -365,7 +366,7 @@ def test_process_engine_outputs_queues_parser_stop_without_scheduler_lock():
     queued_stops = []
     harness._enqueue_parser_stop_requests = lambda stops: queued_stops.append(dict(stops))
     request_id = "req-parser-stop-queued"
-    harness._active_requests[request_id] = {
+    harness._active_requests[request_id] = RequestRecord(**{
         "parent_request_id": request_id,
         "sample_index": 0,
         "generated_tokens": [],
@@ -380,7 +381,7 @@ def test_process_engine_outputs_queues_parser_stop_without_scheduler_lock():
         "delegating_parser": DelegatingParser(),
         "parser_previous_text": "",
         "parser_previous_token_ids": [],
-    }
+    })
     harness._request_outputs[request_id] = RequestOutput(
         request_id=request_id,
         prompt="hi",
@@ -407,7 +408,7 @@ def test_process_engine_outputs_marks_finished_requests_without_token_output():
     request_id = "req-finished-only"
     event = threading.Event()
     harness._request_events[request_id] = event
-    harness._active_requests[request_id] = {
+    harness._active_requests[request_id] = RequestRecord(**{
         "parent_request_id": request_id,
         "sample_index": 0,
         "generated_tokens": [],
@@ -421,7 +422,7 @@ def test_process_engine_outputs_marks_finished_requests_without_token_output():
         "delegating_parser": DelegatingParser(),
         "parser_previous_text": "",
         "parser_previous_token_ids": [],
-    }
+    })
     harness._request_outputs[request_id] = RequestOutput(
         request_id=request_id,
         prompt="hi",
@@ -474,7 +475,7 @@ def test_apply_stop_string_policy_with_include_stop():
     harness = _StopPolicyHarness()
     sp = SamplingParams(max_tokens=16, stop=["\nstop"])
     sp.include_stop_str_in_output = True
-    rd = {"sampling_params": sp, "decoder_visible_text": ""}
+    rd = RequestRecord(**{"sampling_params": sp, "decoder_visible_text": ""})
 
     visible, _delta, stop_hit, stop_reason = harness._apply_stop_string_policy(
         rd, accumulated_text="hello\nstop world", fallback_delta="hello\nstop world"
@@ -488,7 +489,7 @@ def test_apply_stop_string_policy_without_include_stop():
     """Default: stop string should NOT be included in output."""
     harness = _StopPolicyHarness()
     sp = SamplingParams(max_tokens=16, stop=["\nstop"])
-    rd = {"sampling_params": sp, "decoder_visible_text": ""}
+    rd = RequestRecord(**{"sampling_params": sp, "decoder_visible_text": ""})
 
     visible, _delta, stop_hit, stop_reason = harness._apply_stop_string_policy(
         rd, accumulated_text="hello\nstop world", fallback_delta="hello\nstop world"
@@ -503,7 +504,7 @@ def test_decode_and_parse_skips_when_interval_not_reached():
     harness = _ProcessHarness(decoded_text="test", delta_text="test")
     harness.decode_interval_tokens = 100  # Very high threshold
     harness.decode_interval_secs = 100.0  # Very high timeout
-    rd = {
+    rd = RequestRecord(**{
         "last_decoded_index": 0,
         "last_decode_time": time.perf_counter(),
         "sampling_params": SamplingParams(max_tokens=16),
@@ -511,7 +512,7 @@ def test_decode_and_parse_skips_when_interval_not_reached():
         "parser_previous_text": "",
         "parser_previous_token_ids": [],
         "decoder_visible_text": "",
-    }
+    })
     parsed, _raw, _raw_delta, _stop_hit, _stop_reason = harness._decode_and_parse(
         "req-1", rd, [1], time.perf_counter(), finished=False
     )

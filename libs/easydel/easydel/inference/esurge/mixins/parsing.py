@@ -151,7 +151,7 @@ class EngineParsingMixin:
         * cuts after the match when ``include_stop_str_in_output=True``.
 
         It then computes a "visible delta" against the previous visible
-        text recorded in ``rd["decoder_visible_text"]`` so the streaming
+        text recorded in ``rd.decoder_visible_text`` so the streaming
         client never sees retracted (post-stop) tokens. ``fallback_delta``
         is used only when the visible text equals the accumulated text
         (no trimming happened) — otherwise it would replay text that was
@@ -173,8 +173,8 @@ class EngineParsingMixin:
             matched, and ``stop_reason`` is the matched string (or
             ``None``).
         """
-        sampling_params = rd.get("sampling_params")
-        previous_visible_text = rd.get("decoder_visible_text", "") or ""
+        sampling_params = rd.sampling_params
+        previous_visible_text = rd.decoder_visible_text or ""
         visible_text = accumulated_text
         stop_triggered = False
         stop_reason = None
@@ -217,12 +217,12 @@ class EngineParsingMixin:
             matching until after the reasoning parser has classified text,
             and a reasoning parser is actually present.
         """
-        sampling_params = rd.get("sampling_params")
+        sampling_params = rd.sampling_params
         if sampling_params is None:
             return False
         if not bool(getattr(sampling_params, "ignore_stop_strings_in_reasoning", False)):
             return False
-        dp = rd.get("delegating_parser")
+        dp = rd.delegating_parser
         return dp is not None and dp.reasoning_parser is not None
 
     def _parse_with_stop_string_policy(
@@ -249,7 +249,7 @@ class EngineParsingMixin:
           ``accumulated_content`` so reasoning blocks shield their text from
           stop-string matching.
 
-        In either branch, ``rd["decoder_visible_text"]`` is updated to the
+        In either branch, ``rd.decoder_visible_text`` is updated to the
         new visible text so subsequent calls compute correct deltas.
 
         Args:
@@ -280,7 +280,7 @@ class EngineParsingMixin:
                 accumulated_text=parsed["accumulated_content"],
                 fallback_delta=parsed["delta_content"] or delta_text,
             )
-            rd["decoder_visible_text"] = visible_text
+            rd.decoder_visible_text = visible_text
             parsed["accumulated_content"] = visible_text
             parsed["delta_content"] = visible_delta
             return parsed, visible_text, visible_delta, stop_hit, stop_reason
@@ -290,7 +290,7 @@ class EngineParsingMixin:
             accumulated_text=accumulated_text,
             fallback_delta=delta_text,
         )
-        rd["decoder_visible_text"] = visible_text
+        rd.decoder_visible_text = visible_text
         parsed = self._run_output_parsers(
             rd=rd,
             accumulated_text=visible_text,
@@ -318,7 +318,7 @@ class EngineParsingMixin:
         parser can compute cumulative state correctly. After invocation
         those previous-* slots are advanced in ``rd``.
 
-        When no parser is configured for the request (``rd["delegating_parser"]
+        When no parser is configured for the request (``rd.delegating_parser
         is None``), returns a pass-through dict where ``content`` carries
         the verbatim text and ``reasoning`` / ``tool_calls`` are empty.
 
@@ -342,7 +342,7 @@ class EngineParsingMixin:
             ``delta_tool_calls`` (any may be ``None`` when not applicable
             to the current step).
         """
-        dp = rd.get("delegating_parser")
+        dp = rd.delegating_parser
         if dp is None:
             return {
                 "delta_reasoning": None,
@@ -353,16 +353,16 @@ class EngineParsingMixin:
                 "delta_tool_calls": None,
             }
 
-        prev_text = rd.get("parser_previous_text", "")
-        prev_token_ids = rd.get("parser_previous_token_ids", [])
+        prev_text = rd.parser_previous_text
+        prev_token_ids = rd.parser_previous_token_ids
 
         if finished:
             result = dp.process_final(accumulated_text, token_ids)
         else:
             result = dp.process_delta(accumulated_text, delta_text, token_ids, prev_text, prev_token_ids)
 
-        rd["parser_previous_text"] = accumulated_text
-        rd["parser_previous_token_ids"] = _TokenPrefixView(token_ids, len(token_ids))
+        rd.parser_previous_text = accumulated_text
+        rd.parser_previous_token_ids = _TokenPrefixView(token_ids, len(token_ids))
 
         return result.to_dict()
 
@@ -438,8 +438,8 @@ class EngineParsingMixin:
         if rd is None:
             return
 
-        parent_request_id = rd.get("parent_request_id", request_id)
-        sample_index = int(rd.get("sample_index", 0) or 0)
+        parent_request_id = rd.parent_request_id or request_id
+        sample_index = int(rd.sample_index or 0)
         ro = self._request_outputs.get(parent_request_id)
         if ro is None:
             self._active_requests.pop(request_id, None)
@@ -457,7 +457,7 @@ class EngineParsingMixin:
             )
             comp.finish_reason = "abort"
 
-        start_time = rd.get("start_time")
+        start_time = rd.start_time
         if start_time is not None:
             elapsed = max(0.0, now - float(start_time))
             ro.processing_time = max(ro.processing_time, elapsed)
@@ -527,9 +527,9 @@ class EngineParsingMixin:
             or ``(None, "", "", False, None)`` if decode was skipped due to
             interval gating.
         """
-        last_idx = rd["last_decoded_index"]
+        last_idx = rd.last_decoded_index
         num_decodable = len(decodable_tokens)
-        sampling_params = rd.get("sampling_params")
+        sampling_params = rd.sampling_params
         skip_special_tokens = bool(getattr(sampling_params, "skip_special_tokens", False))
         spaces_between_special_tokens = bool(getattr(sampling_params, "spaces_between_special_tokens", True))
 
@@ -543,7 +543,7 @@ class EngineParsingMixin:
                 interval_secs = self.decode_interval_secs
 
             should_decode = (
-                num_decodable - last_idx >= interval_tokens or (now - rd.get("last_decode_time", now)) >= interval_secs
+                num_decodable - last_idx >= interval_tokens or (now - rd.last_decode_time) >= interval_secs
             )
             if not should_decode or num_decodable <= last_idx:
                 return None, "", "", False, None
@@ -551,7 +551,7 @@ class EngineParsingMixin:
             if num_decodable == 0 and last_idx == 0:
                 return None, "", "", False, None
 
-        prompt_ctx = rd.get("prompt_token_ids") if last_idx == 0 else None
+        prompt_ctx = rd.prompt_token_ids if last_idx == 0 else None
         pipeline_result = self._decode_with_pipeline(
             request_id,
             decodable_tokens,
@@ -561,9 +561,9 @@ class EngineParsingMixin:
             prompt_context=prompt_ctx[-8:] if prompt_ctx else None,
             tokens_are_eos_filtered=True,
         )
-        rd["last_decoded_index"] = pipeline_result.last_decoded_index
+        rd.last_decoded_index = pipeline_result.last_decoded_index
         if not finished:
-            rd["last_decode_time"] = now
+            rd.last_decode_time = now
 
         raw_accumulated = pipeline_result.accumulated_text
         raw_delta = pipeline_result.delta_text or ""
@@ -580,10 +580,10 @@ class EngineParsingMixin:
     def _append_decodable_tokens(self, rd: dict, new_tokens: list[int]) -> list[int]:
         """Append newly generated tokens to the per-request decode stream.
 
-        ``rd["generated_tokens"]`` intentionally records the exact engine
+        ``rd.generated_tokens`` intentionally records the exact engine
         output, including EOS ids for accounting and final ``token_ids``.
         The detokenizer wants the same stream with EOS ids removed. Keeping
-        ``rd["decodable_tokens"]`` incremental avoids re-filtering the full
+        ``rd.decodable_tokens`` incremental avoids re-filtering the full
         generated list on every streaming update.
 
         Args:
@@ -597,7 +597,7 @@ class EngineParsingMixin:
             The live ``decodable_tokens`` list after extension, suitable
             for forwarding straight into the detokenizer.
         """
-        decodable_tokens = rd.setdefault("decodable_tokens", [])
+        decodable_tokens = rd.decodable_tokens
         eos_set = getattr(self, "_eos_set", None)
         if eos_set is None:
             eos_set = getattr(self, "_eSurge__eos_set", None)
@@ -622,10 +622,10 @@ class EngineParsingMixin:
             EOS-filtered list of decoded token ids for the request's
             final detokenizer pass.
         """
-        decodable_tokens = rd.get("decodable_tokens")
-        if decodable_tokens is not None:
+        decodable_tokens = rd.decodable_tokens
+        if decodable_tokens:
             return decodable_tokens
-        return self._filter_eos_tokens(rd["generated_tokens"])
+        return self._filter_eos_tokens(rd.generated_tokens)
 
     @staticmethod
     def _update_outputs(
@@ -708,7 +708,7 @@ class EngineParsingMixin:
 
         Recomputed every time the parser advances (so streaming clients can
         poll ``tokens_per_second`` mid-flight). The token count is treated
-        idempotently: ``rd["reported_generated_count"]`` records the last
+        idempotently: ``rd.reported_generated_count`` records the last
         observed total so out-of-order or duplicate updates don't double-
         count, and a regression (lower count than reported) silently resets
         the watermark.
@@ -726,16 +726,16 @@ class EngineParsingMixin:
             num_generated: Cumulative count of generated tokens reported
                 for this step.
         """
-        elapsed = now - rd["start_time"]
+        elapsed = now - rd.start_time
         ro.processing_time = elapsed
         ro.time_spent_generating = elapsed
 
-        prev_reported = rd.get("reported_generated_count", 0)
+        prev_reported = rd.reported_generated_count
         if num_generated >= prev_reported:
             ro.num_generated_tokens += num_generated - prev_reported
-            rd["reported_generated_count"] = num_generated
+            rd.reported_generated_count = num_generated
         else:
-            rd["reported_generated_count"] = num_generated
+            rd.reported_generated_count = num_generated
 
         if ro.first_token_time is not None and ro.num_generated_tokens > 0:
             generation_time = elapsed - ro.first_token_time
@@ -818,7 +818,7 @@ class EngineParsingMixin:
             stop_string_finishes[request_id] = stop_reason
 
         if parsed is not None:
-            comp.token_ids = list(rd["generated_tokens"])
+            comp.token_ids = list(rd.generated_tokens)
             if parsed["tool_calls"]:
                 comp.finish_reason = "tool_calls"
             text_changed, structured_changed = self._update_outputs(
@@ -830,9 +830,9 @@ class EngineParsingMixin:
                 raw_delta,
             )
 
-        elapsed = now - rd["start_time"]
+        elapsed = now - rd.start_time
         num_prompt_tokens = (
-            len(rd["prompt_token_ids"]) if "prompt_token_ids" in rd else sum(len(seg) for seg in ro.prompt_token_ids)
+            len(rd.prompt_token_ids) if rd.prompt_token_ids else sum(len(seg) for seg in ro.prompt_token_ids)
         )
         ro.processing_time = elapsed
         ro.time_spent_generating = elapsed
@@ -898,8 +898,8 @@ class EngineParsingMixin:
                     if rd is None:
                         continue
 
-                    parent_request_id = rd.get("parent_request_id", request_id)
-                    sample_index = rd.get("sample_index", 0)
+                    parent_request_id = rd.parent_request_id or request_id
+                    sample_index = rd.sample_index
                     ro = self._request_outputs.get(parent_request_id)
                     if ro is None:
                         continue
@@ -910,18 +910,18 @@ class EngineParsingMixin:
                     new_tokens = engine_output.new_token_ids
 
                     if new_tokens:
-                        rd["generated_tokens"].extend(new_tokens)
-                        num_generated = len(rd["generated_tokens"])
+                        rd.generated_tokens.extend(new_tokens)
+                        num_generated = len(rd.generated_tokens)
 
-                        if rd["first_token_time"] is None and num_generated > 0:
-                            rd["first_token_time"] = now - rd["start_time"]
-                        if rd["first_token_time"] is not None:
+                        if rd.first_token_time is None and num_generated > 0:
+                            rd.first_token_time = now - rd.start_time
+                        if rd.first_token_time is not None:
                             if ro.first_token_time is None:
-                                ro.first_token_time = rd["first_token_time"]
+                                ro.first_token_time = rd.first_token_time
                                 if metrics_collector:
                                     metrics_collector.record_first_token(parent_request_id)
                             else:
-                                ro.first_token_time = min(ro.first_token_time, rd["first_token_time"])
+                                ro.first_token_time = min(ro.first_token_time, rd.first_token_time)
                         if metrics_collector:
                             metrics_collector.add_generated_tokens(parent_request_id, len(new_tokens))
 
@@ -940,7 +940,7 @@ class EngineParsingMixin:
 
                         if parsed is not None:
                             comp = ro.outputs[sample_index]
-                            comp.token_ids = list(rd["generated_tokens"])
+                            comp.token_ids = list(rd.generated_tokens)
                             text_changed, structured_changed = self._update_outputs(
                                 comp,
                                 ro,
