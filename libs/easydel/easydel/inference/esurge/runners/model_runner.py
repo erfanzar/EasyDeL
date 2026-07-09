@@ -92,6 +92,7 @@ from ..scheduler import SchedulerOutput
 from ..utils import model_uses_mrope
 from .async_types import AsyncPreResults, AsyncWindowResult, DeviceInputTokenHandoff
 from .execution_manager import ExecutionManager
+from .perf import RunnerPerfSample, RunnerPerfTracker
 from .pipeline_execution_manager import PipelineExecutionManager
 from .pipeline_plan import build_pipeline_inference_plan, cap_metadata_pages
 from .sequence_buffer import (
@@ -111,37 +112,6 @@ if typing.TYPE_CHECKING:
 
 logger = get_logger("eSurge")
 MLA_RAGGED_ATTN_MECHANISM = "multi_latent_ragged_page_attention_v2"
-
-
-@dataclass(frozen=True)
-class RunnerPerfSample:
-    """One snapshot of runner-level performance counters.
-
-    Emitted by :class:`eSurgeRunner` after each completed step.
-
-    Attributes:
-        iteration: Monotonically increasing step counter.
-        total_tokens: Tokens fed to the model this step (prompt + decode).
-        num_scheduled_reqs: Number of requests in the scheduler output.
-        num_new: Newly arrived requests on this step.
-        num_cached: Requests served from prefix cache on this step.
-        num_finished: Requests that completed this step.
-        total_time: Wall-clock seconds spent in the step.
-        agg_tps: Aggregate tokens/second across all sequences.
-        req_tps: Average per-request tokens/second.
-        ema_tps: Exponential moving average of ``agg_tps``.
-    """
-
-    iteration: int
-    total_tokens: int
-    num_scheduled_reqs: int
-    num_new: int
-    num_cached: int
-    num_finished: int
-    total_time: float
-    agg_tps: float
-    req_tps: float
-    ema_tps: float
 
 
 @dataclass(frozen=True)
@@ -558,15 +528,7 @@ class eSurgeRunner:
         self.enable_sampler_metrics = enable_sampler_metrics
 
         # Perf logging state (kept lightweight; no allocations in the hot path).
-        self._perf_iteration = 0
-        self._perf_tps_ema: float | None = None
-        self._perf_alpha = 0.2
-        self._perf_last_agg_tps: float | None = None
-        self._perf_last_req_tps: float | None = None
-        self._perf_last_total_time: float | None = None
-        self._perf_last_total_tokens: int | None = None
-        self._perf_history: deque[RunnerPerfSample] = deque(maxlen=max(32768, int(max_model_len) * 4))
-        self._perf_phase_history: deque[dict[str, typing.Any]] = deque(maxlen=max(32768, int(max_model_len) * 4))
+        self.perf = RunnerPerfTracker(history_maxlen=max(32768, int(max_model_len) * 4), alpha=0.2)
 
         # Async scheduling state
         self._pre_async_results: AsyncPreResults | None = None
@@ -951,6 +913,85 @@ class eSurgeRunner:
             logger.info("\n".join(lines))
         except Exception as e:
             logger.debug(f"Could not generate startup summary: {e}")
+
+    # --- Perf-tracker passthroughs -------------------------------------------------
+    # The perf state lives on ``self.perf`` (:class:`RunnerPerfTracker`). The
+    # historical ``_perf_*`` attribute names are kept as thin properties because
+    # both the execute path and external readers (scripts/bench_esurge.py,
+    # serving benchmarks) reference them directly.
+
+    @property
+    def _perf_iteration(self) -> int:
+        """Monotonically increasing step counter (see :class:`RunnerPerfTracker`)."""
+        return self.perf.iteration
+
+    @_perf_iteration.setter
+    def _perf_iteration(self, value: int) -> None:
+        self.perf.iteration = value
+
+    @property
+    def _perf_tps_ema(self) -> float | None:
+        """EMA of aggregate tokens/second (see :class:`RunnerPerfTracker`)."""
+        return self.perf.tps_ema
+
+    @_perf_tps_ema.setter
+    def _perf_tps_ema(self, value: float | None) -> None:
+        self.perf.tps_ema = value
+
+    @property
+    def _perf_alpha(self) -> float:
+        """EMA smoothing factor (see :class:`RunnerPerfTracker`)."""
+        return self.perf.alpha
+
+    @_perf_alpha.setter
+    def _perf_alpha(self, value: float) -> None:
+        self.perf.alpha = value
+
+    @property
+    def _perf_last_agg_tps(self) -> float | None:
+        """Aggregate tokens/second of the most recent step."""
+        return self.perf.last_agg_tps
+
+    @_perf_last_agg_tps.setter
+    def _perf_last_agg_tps(self, value: float | None) -> None:
+        self.perf.last_agg_tps = value
+
+    @property
+    def _perf_last_req_tps(self) -> float | None:
+        """Per-request tokens/second of the most recent step."""
+        return self.perf.last_req_tps
+
+    @_perf_last_req_tps.setter
+    def _perf_last_req_tps(self, value: float | None) -> None:
+        self.perf.last_req_tps = value
+
+    @property
+    def _perf_last_total_time(self) -> float | None:
+        """Wall-clock seconds of the most recent step."""
+        return self.perf.last_total_time
+
+    @_perf_last_total_time.setter
+    def _perf_last_total_time(self, value: float | None) -> None:
+        self.perf.last_total_time = value
+
+    @property
+    def _perf_last_total_tokens(self) -> int | None:
+        """Tokens fed to the model on the most recent step."""
+        return self.perf.last_total_tokens
+
+    @_perf_last_total_tokens.setter
+    def _perf_last_total_tokens(self, value: int | None) -> None:
+        self.perf.last_total_tokens = value
+
+    @property
+    def _perf_history(self) -> deque[RunnerPerfSample]:
+        """Bounded deque of :class:`RunnerPerfSample` step snapshots."""
+        return self.perf.history
+
+    @property
+    def _perf_phase_history(self) -> deque[dict[str, typing.Any]]:
+        """Bounded deque of per-step phase-timing dicts (read by bench_esurge)."""
+        return self.perf.phase_history
 
     @property
     def mesh(self):
