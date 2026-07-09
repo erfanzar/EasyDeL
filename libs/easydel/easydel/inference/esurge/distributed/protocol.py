@@ -19,12 +19,6 @@ leader (:class:`~.leader_client.WorkerRpcClient`) and worker
 (:class:`~.worker_server.WorkerControlServer`) sides of the distributed control-plane.
 
 Constants:
-    CMD_HELLO: Handshake command sent during initial connection.
-    CMD_HEALTH: Health-check command for liveness probing.
-    CMD_STEP: Command that triggers a single lockstep inference step on a worker.
-    CMD_SHUTDOWN: Graceful shutdown command.
-    STATUS_OK: Response status indicating success.
-    STATUS_ERROR: Response status indicating failure.
 
 Functions:
     make_config_fingerprint: Generates a deterministic SHA-256 digest of an engine
@@ -39,14 +33,6 @@ import hashlib
 import json
 import typing as tp
 from collections.abc import Mapping
-
-CMD_HELLO = "hello"
-CMD_HEALTH = "health"
-CMD_STEP = "step"
-CMD_SHUTDOWN = "shutdown"
-
-STATUS_OK = "ok"
-STATUS_ERROR = "error"
 
 
 def _canonicalize(value: tp.Any) -> tp.Any:

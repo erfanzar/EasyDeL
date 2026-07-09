@@ -773,13 +773,12 @@ class eLargeModel:
                 - page_size: PagedAttention page size (default: 128)
                 - data_parallelism_axis: Mesh axis used for KV-cache data-parallel
                   page sharding (default: "dp", set "ep" for expert-axis DP)
-                - distributed_mode: Enable lockstep multi-host serving where
-                  rank 0 is leader and other ranks are worker executors.
-                - distributed_role: "auto" (default), "leader", or "worker".
-                - distributed_service_name: DNS service name used to discover
-                  all hosts in fixed world-size mode.
-                - distributed_world_size: Expected number of hosts.
-                - distributed_rank: Optional explicit rank override.
+                - coordination: "replicated" (default) or "zmq". "zmq" builds the
+                  leader/worker step-replication plane for single-ingress serving
+                  on multi-host pods (rank 0 serves; other ranks replay steps).
+                - distributed_auth_token: Shared token, identical on every host.
+                - distributed_leader_addr: Leader host/IP; defaults to the JAX
+                  coordinator host.
                 - distributed_control_port: ZMQ control-plane port (default: 19666).
                 - distributed_auth_token: Shared secret required for control RPC.
                 - enable_prefix_caching: Enable prefix caching optimization

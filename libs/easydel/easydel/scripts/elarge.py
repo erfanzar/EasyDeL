@@ -400,7 +400,7 @@ def _run_action(elm: Any, name: str, value: Any | None) -> None:
             # the YAML is identical), unless the YAML configured it already.
             esurge_section = elm.config.get("esurge", {}) or {}
             dist_section = esurge_section.get("distributed", {}) if isinstance(esurge_section, dict) else {}
-            has_plane = bool(dist_section.get("distributed_mode")) or str(dist_section.get("coordination", "")) == "zmq"
+            has_plane = str(dist_section.get("coordination", "")) == "zmq"
             if not has_plane:
                 import hashlib
                 import json as _json

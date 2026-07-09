@@ -84,7 +84,7 @@ class eSurgeCfg(TypedDict, total=False):
             extra_stops, tool_parser, reasoning_parser, silent_mode).
         vision: Multimodal / vision settings (resolution_buckets,
             vision_cache_capacity_mb).
-        distributed: Multi-host serving (distributed_mode, distributed_role,
+        distributed: Multi-host step coordination (coordination, auth token,
             world_size, rank, control plane settings).
         drafter: Speculative drafter construction settings passed through to
             ``model.drafter(...)`` by eSurge.

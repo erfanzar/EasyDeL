@@ -16,7 +16,7 @@
 
 This module resolves a DNS service name (typically a Kubernetes headless service)
 into a deterministic, de-duplicated list of host addresses.  The resolved list is
-used by :class:`~.controller.DistributedController` to establish the cluster
+used by the step-coordination plane to establish the cluster
 topology — each host's position in the sorted list determines its rank.
 
 Classes:

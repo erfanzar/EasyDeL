@@ -710,15 +710,10 @@ class eSurgeVisionConfig(TypedDict, total=False):
 @typed_config(
     defaults={
         "coordination": "replicated",
-        "distributed_mode": False,
-        "distributed_role": "auto",
         "distributed_service_name": None,
-        "distributed_world_size": None,
-        "distributed_rank": None,
         "distributed_leader_addr": None,
         "distributed_control_port": 19666,
         "distributed_control_bind_host": "0.0.0.0",
-        "distributed_advertise_addr": None,
         "distributed_auth_token": None,
         "distributed_step_timeout_s": 30.0,
         "distributed_connect_timeout_s": 15.0,
@@ -727,7 +722,6 @@ class eSurgeVisionConfig(TypedDict, total=False):
         "distributed_heartbeat_timeout_s": 5.0,
         "distributed_verify_digest_interval": 64,
         "distributed_max_inflight_steps": 4,
-        "distributed_verify_sampling_digest": True,
     },
 )
 class eSurgeDistributedConfig(TypedDict, total=False):
@@ -750,33 +744,14 @@ class eSurgeDistributedConfig(TypedDict, total=False):
             required whenever requests arrive at one host only (e.g. the
             HTTP API server on a pod). Ignored when
             ``jax.process_count() == 1``.
-        distributed_mode: Master switch enabling the *legacy* blocking
-            control plane. When ``False`` all other distributed_* fields are
-            ignored and the engine runs single-process (still supports
-            SPMD/MPMD within the local process). Prefer
-            ``coordination="zmq"``.
-        distributed_role: Role of this rank: ``"leader"`` runs the scheduler
-            and serves requests, ``"worker"`` runs the runner only and waits
-            for dispatch. ``"auto"`` infers the role from
-            ``distributed_rank`` (rank 0 → leader, others → worker).
         distributed_service_name: Service / DNS name used by workers to
             discover the leader. ``None`` skips discovery and requires the
             leader address to be configured out-of-band.
-        distributed_world_size: Total number of participating ranks.
-            Required when ``distributed_mode=True``; may be left ``None``
-            when role is auto-resolved from ``jax.process_count()``.
-        distributed_rank: This process's rank id. ``None`` falls back to
-            ``jax.process_index()`` so SPMD launchers work without extra
-            configuration.
         distributed_control_port: TCP port the control plane binds (leader)
             or connects to (worker). Default ``19666``.
         distributed_control_bind_host: Interface the control server binds
             on. Default ``"0.0.0.0"`` accepts connections on all
             interfaces; restrict for security.
-        distributed_advertise_addr: Address the leader advertises to workers
-            during discovery. ``None`` uses the auto-detected outbound
-            address; set explicitly when running behind NAT or in
-            container networks.
         distributed_auth_token: Shared bearer token required on every
             control-plane RPC. ``None`` disables auth (only safe on
             isolated networks).
@@ -805,22 +780,13 @@ class eSurgeDistributedConfig(TypedDict, total=False):
             the ``coordination="zmq"`` plane; the leader stops dispatching
             when the slowest worker falls this many steps behind. Default
             ``4``.
-        distributed_verify_sampling_digest: When ``True`` (default), every
-            step of the *legacy* plane round-trips a cryptographic digest of
-            the sampled tokens between ranks and aborts if they disagree.
-            Set ``False`` only for benchmarking / development.
     """
 
     coordination: NotRequired[Literal["replicated", "zmq"]]
-    distributed_mode: NotRequired[bool]
-    distributed_role: NotRequired[Literal["auto", "leader", "worker"]]
     distributed_service_name: NotRequired[str | None]
-    distributed_world_size: NotRequired[int | None]
-    distributed_rank: NotRequired[int | None]
     distributed_leader_addr: NotRequired[str | None]
     distributed_control_port: NotRequired[int]
     distributed_control_bind_host: NotRequired[str]
-    distributed_advertise_addr: NotRequired[str | None]
     distributed_auth_token: NotRequired[str | None]
     distributed_step_timeout_s: NotRequired[float]
     distributed_connect_timeout_s: NotRequired[float]
@@ -829,7 +795,6 @@ class eSurgeDistributedConfig(TypedDict, total=False):
     distributed_heartbeat_timeout_s: NotRequired[float]
     distributed_verify_digest_interval: NotRequired[int]
     distributed_max_inflight_steps: NotRequired[int]
-    distributed_verify_sampling_digest: NotRequired[bool]
 
     @classmethod
     def from_dict(

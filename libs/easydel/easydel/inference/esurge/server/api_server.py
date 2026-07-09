@@ -322,12 +322,6 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         for name, esurge in esurge_map.items():
             if not isinstance(esurge, eSurge):
                 raise TypeError(f"Value for key '{name}' must be an instance of eSurge")
-            if getattr(esurge, "distributed_mode", False) and getattr(esurge, "distributed_role", None) == "worker":
-                raise ValueError(
-                    f"Model '{name}' is configured as distributed worker rank "
-                    f"{getattr(esurge, 'distributed_rank', '?')}; only distributed leader rank "
-                    "can run eSurgeApiServer."
-                )
             coordinator = getattr(esurge, "_step_coordinator", None)
             if coordinator is not None and not getattr(coordinator, "is_leader", True):
                 raise ValueError(
@@ -1283,8 +1277,7 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
 
         Raises:
             ValueError: When ``jax.process_count() > 1`` and the engine has
-                neither the ``coordination="zmq"`` plane nor the legacy
-                ``distributed_mode`` control plane.
+                no ``coordination="zmq"`` step-replication plane.
         """
         try:
             import jax
@@ -1295,7 +1288,7 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         if process_count <= 1:
             return
         world_size = int(getattr(coordinator, "world_size", 1) or 1) if coordinator is not None else 1
-        if world_size > 1 or getattr(esurge, "distributed_mode", False):
+        if world_size > 1:
             return
         raise ValueError(
             f"Model '{name}' runs on a {process_count}-process JAX runtime but has no multi-host "

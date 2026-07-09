@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
-
 import easydel.inference as inference_module
+import pytest
 from easydel.infra.elarge.builders import to_esurge_kwargs
 from easydel.infra.elarge.model import eLargeModel
 from easydel.scripts.elarge import _run_action
@@ -131,50 +130,55 @@ def test_to_esurge_kwargs_defaults_distributed_controls():
 
     kwargs = to_esurge_kwargs(cfg)
 
-    assert kwargs["distributed"].distributed_mode is False
-    assert kwargs["distributed"].distributed_role == "auto"
-    assert kwargs["distributed"].distributed_world_size is None
-    assert kwargs["distributed"].distributed_rank is None
+    assert kwargs["distributed"].coordination == "replicated"
+    assert kwargs["distributed"].distributed_leader_addr is None
     assert kwargs["distributed"].distributed_control_port == 19666
     assert kwargs["distributed"].distributed_control_bind_host == "0.0.0.0"
     assert kwargs["distributed"].distributed_step_timeout_s == 30.0
     assert kwargs["distributed"].distributed_connect_timeout_s == 15.0
-    assert kwargs["distributed"].distributed_verify_sampling_digest is True
+    assert kwargs["distributed"].distributed_ready_timeout_s == 600.0
+    assert kwargs["distributed"].distributed_heartbeat_interval_s == 1.0
+    assert kwargs["distributed"].distributed_heartbeat_timeout_s == 5.0
+    assert kwargs["distributed"].distributed_verify_digest_interval == 64
+    assert kwargs["distributed"].distributed_max_inflight_steps == 4
 
 
 def test_to_esurge_kwargs_forwards_distributed_controls():
     cfg = {
         "model": {"name_or_path": "dummy-model"},
         "esurge": {
-            "distributed_mode": True,
-            "distributed_role": "worker",
+            "coordination": "zmq",
             "distributed_service_name": "esurge-workers.internal",
-            "distributed_world_size": 4,
-            "distributed_rank": 2,
+            "distributed_leader_addr": "10.0.0.12",
             "distributed_control_port": 21001,
             "distributed_control_bind_host": "127.0.0.1",
-            "distributed_advertise_addr": "10.0.0.12",
             "distributed_auth_token": "secret",
             "distributed_step_timeout_s": 45.0,
             "distributed_connect_timeout_s": 20.0,
-            "distributed_verify_sampling_digest": False,
+            "distributed_ready_timeout_s": 120.0,
+            "distributed_heartbeat_interval_s": 0.5,
+            "distributed_heartbeat_timeout_s": 10.0,
+            "distributed_verify_digest_interval": 16,
+            "distributed_max_inflight_steps": 2,
         },
     }
 
     kwargs = to_esurge_kwargs(cfg)
 
-    assert kwargs["distributed"].distributed_mode is True
-    assert kwargs["distributed"].distributed_role == "worker"
-    assert kwargs["distributed"].distributed_service_name == "esurge-workers.internal"
-    assert kwargs["distributed"].distributed_world_size == 4
-    assert kwargs["distributed"].distributed_rank == 2
-    assert kwargs["distributed"].distributed_control_port == 21001
-    assert kwargs["distributed"].distributed_control_bind_host == "127.0.0.1"
-    assert kwargs["distributed"].distributed_advertise_addr == "10.0.0.12"
-    assert kwargs["distributed"].distributed_auth_token == "secret"
-    assert kwargs["distributed"].distributed_step_timeout_s == 45.0
-    assert kwargs["distributed"].distributed_connect_timeout_s == 20.0
-    assert kwargs["distributed"].distributed_verify_sampling_digest is False
+    distributed = kwargs["distributed"]
+    assert distributed.coordination == "zmq"
+    assert distributed.distributed_service_name == "esurge-workers.internal"
+    assert distributed.distributed_leader_addr == "10.0.0.12"
+    assert distributed.distributed_control_port == 21001
+    assert distributed.distributed_control_bind_host == "127.0.0.1"
+    assert distributed.distributed_auth_token == "secret"
+    assert distributed.distributed_step_timeout_s == 45.0
+    assert distributed.distributed_connect_timeout_s == 20.0
+    assert distributed.distributed_ready_timeout_s == 120.0
+    assert distributed.distributed_heartbeat_interval_s == 0.5
+    assert distributed.distributed_heartbeat_timeout_s == 10.0
+    assert distributed.distributed_verify_digest_interval == 16
+    assert distributed.distributed_max_inflight_steps == 2
 
 
 def test_set_esurge_preserves_parsers_when_omitted_and_clears_when_none():

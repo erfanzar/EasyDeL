@@ -44,13 +44,12 @@ def main():
         help="Pre-provisioned API key (can be passed multiple times)",
     )
     parser.add_argument("--log-level", type=str, default="info", help="Logging level")
-    parser.add_argument("--distributed-mode", action="store_true", help="Enable distributed lockstep serving mode")
     parser.add_argument(
-        "--distributed-role",
+        "--coordination",
         type=str,
-        default="auto",
-        choices=["auto", "leader", "worker"],
-        help="Distributed role for this host",
+        default="replicated",
+        choices=["replicated", "zmq"],
+        help="Multi-host step coordination ('zmq' for single-ingress serving on pods)",
     )
     parser.add_argument(
         "--distributed-service-name",
@@ -59,16 +58,10 @@ def main():
         help="DNS service name resolving all distributed hosts",
     )
     parser.add_argument(
-        "--distributed-world-size",
-        type=int,
+        "--distributed-leader-addr",
+        type=str,
         default=None,
-        help="Expected number of distributed hosts",
-    )
-    parser.add_argument(
-        "--distributed-rank",
-        type=int,
-        default=None,
-        help="Optional distributed rank override",
+        help="Leader host/IP for the coordination plane (defaults to the JAX coordinator host)",
     )
     parser.add_argument(
         "--distributed-control-port",
@@ -105,18 +98,16 @@ def main():
             enable_prefix_caching=True,
         ),
         distributed=eSurgeDistributedConfig.from_dict(
-            distributed_mode=args.distributed_mode,
-            distributed_role=args.distributed_role,
+            coordination=args.coordination,
             distributed_service_name=args.distributed_service_name,
-            distributed_world_size=args.distributed_world_size,
-            distributed_rank=args.distributed_rank,
+            distributed_leader_addr=args.distributed_leader_addr,
             distributed_control_port=args.distributed_control_port,
             distributed_auth_token=args.distributed_auth_token,
         ),
     )
 
-    if args.distributed_mode and engine.distributed_role == "worker":
-        raise RuntimeError("This script runs the public API server and must be launched on distributed leader rank.")
+    if engine.distributed_role == "worker":
+        raise RuntimeError("This script runs the public API server and must be launched on the leader rank.")
 
     print(f"\nStarting eSurge API server on http://{args.host}:{args.port}")
     print("OpenAI-compatible endpoints:")

@@ -2183,7 +2183,7 @@ class eSurgeRunner:
             self._request_dp_rank_by_req[str(req_id)] = int(dp_rank)
 
         removed_recurrent_slots: list[int] = []
-        for req_id in scheduler_output.finished_req_ids:
+        for req_id in sorted(scheduler_output.finished_req_ids):
             slot = self._release_recurrent_slot(str(req_id), forget_rank=True)
             if slot is not None:
                 removed_recurrent_slots.append(int(slot))
@@ -2193,7 +2193,7 @@ class eSurgeRunner:
         # 2) Remove finished from sequence buffer (functional)
         removed_req_indices: list[int] = []
         removed_req_index_by_id: dict[str, int] = {}
-        for req_id in scheduler_output.finished_req_ids:
+        for req_id in sorted(scheduler_output.finished_req_ids):
             req_index = self.sequence_buffer.remove_request(req_id)
             if req_index is not None:
                 removed_req_indices.append(req_index)
@@ -2204,7 +2204,7 @@ class eSurgeRunner:
         # token budget exhaustion still hold valid rows and pages — removing them
         # would force re-insertion next cycle and trigger "No free sequence row
         # in target DP shard" errors when shard rows are full.
-        for req_id in scheduler_output.preempted_req_ids:
+        for req_id in sorted(scheduler_output.preempted_req_ids):
             req_index = self.sequence_buffer.remove_request(req_id)
             self._pending_spec_recurrent_commit_by_req.pop(str(req_id), None)
             slot = self._release_recurrent_slot(str(req_id), forget_rank=False)

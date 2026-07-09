@@ -157,87 +157,6 @@ class LocalCoordinator:
         """No control plane to tear down."""
 
 
-class DistributedControllerCoordinator:
-    """Adapter running steps through the legacy ZMQ ``DistributedController``.
-
-    Bridges the coordinator seam onto the pre-existing leader/worker control
-    plane (blocking per-step dispatch + verify). Overlap execution is not
-    supported by that plane, so ``supports_overlap`` is ``False`` whenever
-    remote workers exist.
-
-    Args:
-        runner: The engine's :class:`eSurgeRunner`.
-        controller: The engine's started :class:`DistributedController`.
-    """
-
-    def __init__(self, runner, controller) -> None:
-        self._runner = runner
-        self._controller = controller
-        self._next_step_id = 0
-
-    @property
-    def is_leader(self) -> bool:
-        """Whether this rank drives scheduling."""
-        return bool(self._controller.is_leader)
-
-    @property
-    def rank(self) -> int:
-        """This process's control-plane rank."""
-        return int(self._controller.rank)
-
-    @property
-    def world_size(self) -> int:
-        """Total control-plane ranks."""
-        return int(self._controller.world_size)
-
-    @property
-    def supports_overlap(self) -> bool:
-        """The blocking dispatch/verify plane cannot overlap steps."""
-        return not self._controller.has_remote_workers
-
-    def start(self) -> None:
-        """Start the controller's control plane (handshake with workers)."""
-        self._controller.start()
-
-    def execute_sync(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
-        """Dispatch to workers, execute locally, then verify worker acks."""
-        self._next_step_id += 1
-        dispatch = None
-        if self._controller.has_remote_workers:
-            dispatch = self._controller.dispatch_step(scheduler_output)
-        model_output = self._runner.execute_model(scheduler_output)
-        if dispatch is not None:
-            self._controller.verify_step(dispatch, model_output)
-        return model_output
-
-    def execute_async(self, scheduler_output: SchedulerOutput) -> StepHandle:
-        """Async dispatch is only legal with no remote workers."""
-        if self._controller.has_remote_workers:
-            raise StepCoordinationError(
-                "Distributed step synchronization failure: overlap_execution=True is not supported "
-                "with remote distributed workers."
-            )
-        self._next_step_id += 1
-        return StepHandle(
-            step_id=self._next_step_id,
-            runner_handle=self._runner.execute_model_async(scheduler_output),
-            scheduler_output=scheduler_output,
-        )
-
-    def drain(self, handle: StepHandle) -> ModelRunnerOutput:
-        """Wait for a locally-dispatched step (no remote workers involved)."""
-        return self._runner.wait_for_execution(handle.runner_handle)
-
-    def check_health(self) -> None:
-        """Health is checked inline by the blocking verify path."""
-
-    def run_worker_loop(self, stop_event) -> None:
-        """The legacy worker control server runs its own thread; nothing to do."""
-
-    def shutdown(self, reason: str = "") -> None:
-        """Shut the controller's sockets/threads down."""
-        self._controller.shutdown()
-
 def _default_leader_addr() -> str | None:
     """Best-effort leader address from the JAX distributed runtime.
 
@@ -260,17 +179,14 @@ def create_step_coordinator(
     *,
     distributed_config,
     config_fingerprint: str | None,
-    legacy_controller=None,
 ):
     """Build the right coordinator for this process.
 
     Selection order:
 
-    1. A legacy ``DistributedController`` (``distributed_mode=True``) wraps
-       into its blocking adapter.
-    2. ``coordination="zmq"`` with ``jax.process_count() > 1`` builds the
+    1. ``coordination="zmq"`` with ``jax.process_count() > 1`` builds the
        ZeroMQ leader (rank 0) or worker plane.
-    3. Everything else — single host, or the multi-host *replicated* pattern
+    2. Everything else — single host, or the multi-host *replicated* pattern
        where an outer driver (e.g. a trainer's rollout loop) calls the
        engine identically on every host — gets the pass-through
        :class:`LocalCoordinator`.
@@ -280,7 +196,6 @@ def create_step_coordinator(
         distributed_config: The engine's distributed config section.
         config_fingerprint: Engine-config fingerprint for the handshake
             (required for the ZMQ plane).
-        legacy_controller: Started legacy controller, if any.
 
     Returns:
         A :class:`StepCoordinator` implementation.
@@ -289,9 +204,6 @@ def create_step_coordinator(
         StepCoordinationError: If ``coordination="zmq"`` is requested but
             the auth token or leader address cannot be resolved.
     """
-    if legacy_controller is not None:
-        return DistributedControllerCoordinator(runner, legacy_controller)
-
     import jax
 
     world_size = int(jax.process_count())
