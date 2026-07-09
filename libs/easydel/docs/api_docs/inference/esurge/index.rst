@@ -12,7 +12,6 @@ easydel.inference.esurge package
    scheduler/index
    server/index
    config
-   dashboard
    engine_types
    esurge_engine
    logger

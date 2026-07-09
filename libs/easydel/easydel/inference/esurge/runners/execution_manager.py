@@ -1432,7 +1432,7 @@ class ExecutionManager:
             position_ids_buf,
             scheduled_full,
             active_mask_full,
-        ) = self.prepare_batch_metadata(
+        ) = self._batch_preparer.prepare_batch_metadata(
             num_tokens_static=num_tokens,
             scheduled_full_cpu=scheduled_full_cpu,
             active_mask_full_cpu=active_mask_full_cpu,
@@ -2393,24 +2393,26 @@ class ExecutionManager:
             microbatch_scratch_time += time.time() - scratch_start
 
             metadata_start = time.time()
-            batch_metadata, input_ids_buf, position_ids_buf, _scheduled_dev, _active_dev = self.prepare_batch_metadata(
-                num_tokens_static=microbatch_num_tokens,
-                scheduled_full_cpu=mb_scheduled,
-                active_mask_full_cpu=mb_active,
-                input_ids_buf=input_ids_buf,
-                position_ids_buf=position_ids_buf,
-                token_ids_cpu=mb_token_ids,
-                num_computed_tokens_cpu=mb_num_computed,
-                temperature_cpu=mb_temperature,
-                top_p_cpu=mb_top_p,
-                top_k_cpu=mb_top_k,
-                min_p_cpu=mb_min_p,
-                frequency_penalties_cpu=mb_frequency,
-                presence_penalties_cpu=mb_presence,
-                repetition_penalties_cpu=mb_repetition,
-                page_table_cpu=mb_page_table,
-                page_table_version=None,
-                padded_num_reqs_in=microbatch_padded_reqs,
+            batch_metadata, input_ids_buf, position_ids_buf, _scheduled_dev, _active_dev = (
+                self._batch_preparer.prepare_batch_metadata(
+                    num_tokens_static=microbatch_num_tokens,
+                    scheduled_full_cpu=mb_scheduled,
+                    active_mask_full_cpu=mb_active,
+                    input_ids_buf=input_ids_buf,
+                    position_ids_buf=position_ids_buf,
+                    token_ids_cpu=mb_token_ids,
+                    num_computed_tokens_cpu=mb_num_computed,
+                    temperature_cpu=mb_temperature,
+                    top_p_cpu=mb_top_p,
+                    top_k_cpu=mb_top_k,
+                    min_p_cpu=mb_min_p,
+                    frequency_penalties_cpu=mb_frequency,
+                    presence_penalties_cpu=mb_presence,
+                    repetition_penalties_cpu=mb_repetition,
+                    page_table_cpu=mb_page_table,
+                    page_table_version=None,
+                    padded_num_reqs_in=microbatch_padded_reqs,
+                )
             )
             microbatch_metadata_time += time.time() - metadata_start
             local_count = int(chunk.shape[0])
@@ -3416,244 +3418,6 @@ class ExecutionManager:
             )
             self._debug_baselines[f"{num_tokens}_{padded_num_reqs}_hash_in_sampler"] = _tree_hash(sampler_args)
 
-    def _compute_slot_mapping_v2(
-        self,
-        num_requests: int,
-        scheduled: numpy.ndarray,
-        num_computed_tokens_cpu: numpy.ndarray,
-        page_table_cpu: numpy.ndarray,
-    ) -> tuple[numpy.ndarray, int]:
-        """Compute slot mapping tensor for ragged-page attention v2.
-
-        Delegates to the batch preparer's implementation to build the slot
-        mapping that maps logical token positions to physical KV cache locations.
-
-        Args:
-            num_requests: Number of active requests.
-            scheduled: Number of tokens scheduled per request.
-            num_computed_tokens_cpu: Tokens already computed per request.
-            page_table_cpu: Page table mapping request/page to physical page.
-
-        Returns:
-            Tuple of (slot_mapping, total_pages) where slot_mapping has shape
-            [3, padded_num_slices] and total_pages is the number of pages
-            touched by this batch.
-
-        Note:
-            This is used only for v2 attention (self._use_slot_mapping=True).
-            For v3 attention, request_distribution is used instead.
-        """
-        return self._batch_preparer._compute_slot_mapping_v2(
-            num_requests=num_requests,
-            scheduled=scheduled,
-            num_computed_tokens_cpu=num_computed_tokens_cpu,
-            page_table_cpu=page_table_cpu,
-        )
-
-    def prepare_batch_metadata(
-        self,
-        num_tokens_static: int,
-        scheduled_full_cpu: numpy.ndarray,  # CPU array instead of device
-        active_mask_full_cpu: numpy.ndarray,  # CPU array instead of device
-        input_ids_buf: jax.Array,
-        position_ids_buf: jax.Array,
-        token_ids_cpu: numpy.ndarray,
-        num_computed_tokens_cpu: numpy.ndarray,
-        temperature_cpu: numpy.ndarray,
-        top_p_cpu: numpy.ndarray,
-        top_k_cpu: numpy.ndarray,
-        min_p_cpu: numpy.ndarray,
-        frequency_penalties_cpu: numpy.ndarray,
-        presence_penalties_cpu: numpy.ndarray,
-        repetition_penalties_cpu: numpy.ndarray,
-        page_table_cpu: numpy.ndarray,  # Pass page table as CPU array
-        padded_num_reqs_in: int,
-        window_row_indices_cpu: numpy.ndarray | None = None,
-        recurrent_slot_indices_cpu: numpy.ndarray | None = None,
-        spec_recurrent_commit_cpu: numpy.ndarray | None = None,
-        page_table_version: int | None = None,
-        # VLM prefill helpers (optional)
-        mrope_position_ids_cpu: numpy.ndarray | None = None,
-        prefill_embeds_cpu: numpy.ndarray | None = None,
-        prefill_embeds_mask_cpu: numpy.ndarray | None = None,
-        # DeepStack-style visual injection (optional)
-        visual_pos_masks_cpu: numpy.ndarray | None = None,
-        deepstack_visual_embeds_cpu: list[numpy.ndarray] | None = None,
-        # Vision-language model data (optional)
-        pixel_values: numpy.ndarray | None = None,
-        image_grid_thw: numpy.ndarray | None = None,
-        pixel_values_videos: numpy.ndarray | None = None,
-        video_grid_thw: numpy.ndarray | None = None,
-    ) -> tuple[BatchMetadata, jax.Array, jax.Array, jax.Array, jax.Array]:
-        """Prepare batch metadata using CPU-first computation.
-
-        Delegates to the batch preparer to build all metadata on CPU and
-        transfer to device in a single consolidated device_put call.
-
-        Args:
-            num_tokens_static: Static token count for bucket selection.
-            scheduled_full_cpu: Tokens scheduled per request (CPU array).
-            active_mask_full_cpu: Boolean mask for active requests (CPU array).
-            input_ids_buf: Device buffer for input token IDs.
-            position_ids_buf: Device buffer for position IDs.
-            token_ids_cpu: All token IDs for all requests (CPU array).
-            num_computed_tokens_cpu: Computed tokens per request (CPU array).
-            temperature_cpu: Temperature per request (CPU array).
-            top_p_cpu: Top-p per request (CPU array).
-            top_k_cpu: Top-k per request (CPU array).
-            min_p_cpu: Min-p per request (CPU array).
-            frequency_penalties_cpu: Frequency penalty per request (CPU array).
-            presence_penalties_cpu: Presence penalty per request (CPU array).
-            repetition_penalties_cpu: Repetition penalty per request (CPU array).
-            page_table_cpu: Page table (CPU array).
-            padded_num_reqs_in: Requested padding for request count.
-            spec_recurrent_commit_cpu: Optional speculative recurrent commit
-                metadata for the recurrent-drafter speculative decoding path.
-            page_table_version: Optional version for page table caching.
-            mrope_position_ids_cpu: Optional mRoPE positions for VLMs.
-            prefill_embeds_cpu: Optional prefill embeddings for VLMs.
-            prefill_embeds_mask_cpu: Optional mask for prefill embeddings.
-            visual_pos_masks_cpu: Optional visual position masks.
-            deepstack_visual_embeds_cpu: Optional DeepStack visual embeddings.
-            pixel_values: Optional raw image pixel values.
-            image_grid_thw: Optional image grid shape.
-            pixel_values_videos: Optional raw video pixel values.
-            video_grid_thw: Optional video grid shape.
-
-        Returns:
-            Tuple of (batch_metadata, input_ids_buf, position_ids_buf,
-            scheduled_full_dev, active_mask_full_dev) ready for model execution.
-        """
-        return self._batch_preparer.prepare_batch_metadata(
-            num_tokens_static=num_tokens_static,
-            scheduled_full_cpu=scheduled_full_cpu,
-            active_mask_full_cpu=active_mask_full_cpu,
-            input_ids_buf=input_ids_buf,
-            position_ids_buf=position_ids_buf,
-            token_ids_cpu=token_ids_cpu,
-            num_computed_tokens_cpu=num_computed_tokens_cpu,
-            temperature_cpu=temperature_cpu,
-            top_p_cpu=top_p_cpu,
-            top_k_cpu=top_k_cpu,
-            min_p_cpu=min_p_cpu,
-            frequency_penalties_cpu=frequency_penalties_cpu,
-            presence_penalties_cpu=presence_penalties_cpu,
-            repetition_penalties_cpu=repetition_penalties_cpu,
-            page_table_cpu=page_table_cpu,
-            page_table_version=page_table_version,
-            padded_num_reqs_in=padded_num_reqs_in,
-            window_row_indices_cpu=window_row_indices_cpu,
-            recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,
-            spec_recurrent_commit_cpu=spec_recurrent_commit_cpu,
-            mrope_position_ids_cpu=mrope_position_ids_cpu,
-            prefill_embeds_cpu=prefill_embeds_cpu,
-            prefill_embeds_mask_cpu=prefill_embeds_mask_cpu,
-            visual_pos_masks_cpu=visual_pos_masks_cpu,
-            deepstack_visual_embeds_cpu=deepstack_visual_embeds_cpu,
-            pixel_values=pixel_values,
-            image_grid_thw=image_grid_thw,
-            pixel_values_videos=pixel_values_videos,
-            video_grid_thw=video_grid_thw,
-        )
-
-    def start_async_prep(
-        self,
-        num_tokens_static: int,
-        scheduled_full_cpu: numpy.ndarray,
-        active_mask_full_cpu: numpy.ndarray,
-        input_ids_buf: jax.Array,
-        position_ids_buf: jax.Array,
-        token_ids_cpu: numpy.ndarray,
-        num_computed_tokens_cpu: numpy.ndarray,
-        temperature_cpu: numpy.ndarray,
-        top_p_cpu: numpy.ndarray,
-        top_k_cpu: numpy.ndarray,
-        min_p_cpu: numpy.ndarray,
-        frequency_penalties_cpu: numpy.ndarray,
-        presence_penalties_cpu: numpy.ndarray,
-        repetition_penalties_cpu: numpy.ndarray,
-        page_table_cpu: numpy.ndarray,
-        padded_num_reqs_in: int,
-        window_row_indices_cpu: numpy.ndarray | None = None,
-        recurrent_slot_indices_cpu: numpy.ndarray | None = None,
-        spec_recurrent_commit_cpu: numpy.ndarray | None = None,
-        page_table_version: int | None = None,
-    ) -> None:
-        """Start async device transfer for double-buffered batch preparation.
-
-        Initiates an asynchronous device transfer for the next batch's metadata
-        while the current batch is being processed.
-
-        Args:
-            num_tokens_static: Static token count for the next batch.
-            scheduled_full_cpu: Tokens scheduled per request.
-            active_mask_full_cpu: Active request mask.
-            input_ids_buf: Device buffer for input IDs (unused, for API compat).
-            position_ids_buf: Device buffer for positions (unused, for API compat).
-            token_ids_cpu: Token IDs for all requests.
-            num_computed_tokens_cpu: Computed tokens per request.
-            temperature_cpu: Temperature per request.
-            top_p_cpu: Top-p per request.
-            top_k_cpu: Top-k per request.
-            min_p_cpu: Min-p per request.
-            frequency_penalties_cpu: Frequency penalty per request.
-            presence_penalties_cpu: Presence penalty per request.
-            repetition_penalties_cpu: Repetition penalty per request.
-            page_table_cpu: Page table for all requests.
-            padded_num_reqs_in: Requested padding for request count.
-            spec_recurrent_commit_cpu: Optional speculative recurrent commit
-                metadata snapshot for the next batch.
-            page_table_version: Optional version for page table caching.
-
-        Note:
-            Call get_async_prep_result() to retrieve the prepared metadata.
-        """
-        self._batch_preparer.start_async_prep(
-            num_tokens_static=num_tokens_static,
-            scheduled_full_cpu=scheduled_full_cpu,
-            active_mask_full_cpu=active_mask_full_cpu,
-            input_ids_buf=input_ids_buf,
-            position_ids_buf=position_ids_buf,
-            token_ids_cpu=token_ids_cpu,
-            num_computed_tokens_cpu=num_computed_tokens_cpu,
-            temperature_cpu=temperature_cpu,
-            top_p_cpu=top_p_cpu,
-            top_k_cpu=top_k_cpu,
-            min_p_cpu=min_p_cpu,
-            frequency_penalties_cpu=frequency_penalties_cpu,
-            presence_penalties_cpu=presence_penalties_cpu,
-            repetition_penalties_cpu=repetition_penalties_cpu,
-            page_table_cpu=page_table_cpu,
-            page_table_version=page_table_version,
-            spec_recurrent_commit_cpu=spec_recurrent_commit_cpu,
-            padded_num_reqs_in=padded_num_reqs_in,
-            window_row_indices_cpu=window_row_indices_cpu,
-            recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,
-        )
-
-    def get_async_prep_result(
-        self,
-    ) -> (
-        tuple[
-            tuple[BatchMetadata, jax.Array, jax.Array, jax.Array, jax.Array],
-            dict,
-        ]
-        | None
-    ):
-        """Retrieve results from a previously started async batch preparation.
-
-        Completes an async prep operation started by start_async_prep().
-
-        Returns:
-            If an async prep was pending, returns a tuple of:
-            - (batch_metadata, input_ids_buf, position_ids_buf,
-               scheduled_full_dev, active_mask_full_dev)
-            - Metadata dict with timing and configuration information
-
-            If no async prep was pending, returns None.
-        """
-        return self._batch_preparer.get_async_prep_result()
-
     def get_compile_configurations(
         self,
         kv_pages: HybridCache | RaggedPagesCache | UnifiedAttentionCache,
@@ -3754,7 +3518,7 @@ class ExecutionManager:
             position_ids_buf,
             scheduled_full,
             active_mask_full,
-        ) = self.prepare_batch_metadata(
+        ) = self._batch_preparer.prepare_batch_metadata(
             num_tokens_static=num_tokens,
             scheduled_full_cpu=scheduled_full_cpu,
             active_mask_full_cpu=active_mask_full_cpu,

@@ -136,6 +136,7 @@ from .monitoring import (
 from .multimodal import MultiModalManager, VisionEncoderCache
 from .request import EngineRequest, EngineRequestStatus
 from .runners import SequenceBuffer, eSurgeRunner
+from .runners.spec import SpecDecodeStats, build_target_kv_pairs, default_assistant_layer_mapping
 from .scheduler import (
     CachedRequestData,
     FCFSRequestQueue,
@@ -147,13 +148,6 @@ from .scheduler import (
     SchedulerOutput,
 )
 from .server import eSurgeApiServer
-from .speculative_decoding import (
-    SpecDecodeStats,
-    SpeculativeAssistantDriver,
-    SpeculativeMTPDriver,
-    build_target_kv_pairs,
-    default_assistant_layer_mapping,
-)
 
 __all__ = (
     "AttentionSpec",
@@ -198,8 +192,6 @@ __all__ = (
     "SlidingWindowManager",
     "SlidingWindowSpec",
     "SpecDecodeStats",
-    "SpeculativeAssistantDriver",
-    "SpeculativeMTPDriver",
     "StepDispatch",
     "SystemMetrics",
     "UnitaryCacheCoordinator",

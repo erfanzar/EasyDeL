@@ -25,11 +25,6 @@ Classes:
     EngineCoreEvent: Timestamped engine event.
     EngineCoreOutput: Output from engine core processing.
     EngineCoreOutputs: Batch of engine outputs.
-    UtilityResult: Wrapper for special serialization handling.
-    UtilityOutput: Output from utility operations.
-    EngineCoreRequestType: Request type identifiers for socket communication.
-    ReconfigureDistributedRequest: Request to reconfigure distributed setup.
-    ReconfigureRankType: Rank type for reconfiguration.
 
 Example:
     >>> from easydel.inference.esurge.engine_types import (
@@ -54,7 +49,6 @@ Example:
 
 import enum
 import time
-from typing import Any
 
 import msgspec
 import numpy as np
@@ -253,52 +247,6 @@ class EngineCoreOutput(msgspec.Struct, array_like=True, omit_defaults=True, gc=F
         return self.finish_reason is not None
 
 
-class UtilityResult:
-    """Wrapper for special serialization/deserialization handling.
-
-    Provides a container for results that require custom serialization
-    behavior or special handling during data transfer.
-
-    Attributes:
-        result: The wrapped result object.
-
-    Example:
-        >>> result = UtilityResult({"status": "ok", "data": [1, 2, 3]})
-        >>> print(result.result)  # {"status": "ok", "data": [1, 2, 3]}
-    """
-
-    def __init__(self, r: Any = None):
-        """Initialize with an optional result object.
-
-        Args:
-            r: The result object to wrap. Can be any type.
-        """
-        self.result = r
-
-
-class UtilityOutput(msgspec.Struct, array_like=True, gc=False):
-    """Output from utility operations.
-
-    Contains the result of utility operations like cache management
-    or configuration changes.
-
-    Attributes:
-        call_id: Unique identifier for the utility call.
-        failure_message: Error message if the operation failed, None otherwise.
-        result: The result wrapped in UtilityResult if successful.
-
-    Example:
-        >>> output = UtilityOutput(call_id=1, result=UtilityResult("success"))
-        >>> if output.failure_message is None:
-        ...     print("Operation succeeded")
-    """
-
-    call_id: int
-
-    failure_message: str | None = None
-    result: UtilityResult | None = None
-
-
 class EngineCoreOutputs(msgspec.Struct, array_like=True, omit_defaults=True, gc=False):
     """Batch of engine outputs.
 
@@ -309,7 +257,6 @@ class EngineCoreOutputs(msgspec.Struct, array_like=True, omit_defaults=True, gc=
         engine_index: Index of the engine that produced these outputs.
         outputs: List of individual request outputs.
         timestamp: High-resolution monotonic timestamp when outputs were generated.
-        utility_output: Optional utility operation result.
         finished_requests: Set of request IDs that finished in this batch.
         wave_complete: Wave number that completed (for data parallel).
         start_wave: Wave number that started (for data parallel).
@@ -325,7 +272,6 @@ class EngineCoreOutputs(msgspec.Struct, array_like=True, omit_defaults=True, gc=
     engine_index: int = 0
     outputs: list[EngineCoreOutput] = msgspec.field(default_factory=list)
     timestamp: float = 0.0
-    utility_output: UtilityOutput | None = None
     finished_requests: set[str] | None = None
     wave_complete: int | None = None
     start_wave: int | None = None
@@ -334,78 +280,3 @@ class EngineCoreOutputs(msgspec.Struct, array_like=True, omit_defaults=True, gc=
         """Set timestamp to current generation-loop time if not provided."""
         if self.timestamp == 0.0:
             self.timestamp = time.perf_counter()
-
-
-class EngineCoreRequestType(enum.Enum):
-    """Engine request types defined as hex byte strings.
-
-    Used for socket communication where requests need to be identified
-    by type without separate encoding. Each type is a single byte.
-
-    Attributes:
-        ADD: Add a new request to the engine.
-        ABORT: Abort an existing request.
-        START_DP_WAVE: Start a data parallel wave.
-        UTILITY: Execute a utility operation.
-        EXECUTOR_FAILED: Signal that the executor has failed.
-
-    Example:
-        >>> req_type = EngineCoreRequestType.ADD
-        >>> print(req_type.value)  # b'\\x00'
-    """
-
-    ADD = b"\x00"
-    ABORT = b"\x01"
-    START_DP_WAVE = b"\x02"
-    UTILITY = b"\x03"
-
-    EXECUTOR_FAILED = b"\x04"
-
-
-class ReconfigureDistributedRequest(msgspec.Struct):
-    """Request to reconfigure distributed processing setup.
-
-    Used to dynamically change the data parallel configuration during
-    runtime, such as scaling up or down the number of workers.
-
-    Attributes:
-        new_data_parallel_size: New total number of data parallel workers.
-        new_data_parallel_rank: New rank for this worker.
-        new_data_parallel_rank_local: New local rank within the node.
-        new_data_parallel_master_ip: IP address of the master node.
-        new_data_parallel_master_port: Port of the master node.
-
-    Example:
-        >>> config = ReconfigureDistributedRequest(
-        ...     new_data_parallel_size=4,
-        ...     new_data_parallel_rank=1,
-        ...     new_data_parallel_rank_local=1,
-        ...     new_data_parallel_master_ip="192.168.1.1",
-        ...     new_data_parallel_master_port=29500
-        ... )
-    """
-
-    new_data_parallel_size: int
-    new_data_parallel_rank: int
-    new_data_parallel_rank_local: int
-    new_data_parallel_master_ip: str
-    new_data_parallel_master_port: int
-
-
-class ReconfigureRankType(enum.IntEnum):
-    """Rank type for reconfiguring distributed request.
-
-    Special values used during distributed reconfiguration to indicate
-    whether a worker should keep its current role or shut down.
-
-    Attributes:
-        KEEP_CURRENT_RANK: Worker should keep its current rank assignment.
-        SHUTDOWN_CURRENT_RANK: Worker should shut down gracefully.
-
-    Example:
-        >>> if rank_type == ReconfigureRankType.SHUTDOWN_CURRENT_RANK:
-        ...     worker.shutdown()
-    """
-
-    KEEP_CURRENT_RANK = -1
-    SHUTDOWN_CURRENT_RANK = -2

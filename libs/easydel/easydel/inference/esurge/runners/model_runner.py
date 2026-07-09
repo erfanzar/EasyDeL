@@ -362,13 +362,10 @@ class eSurgeRunner:
             drafter: Optional speculative-decoding drafter implementing
                 :class:`~easydel.inference.speculative.DrafterProtocol`
                 (e.g. ``Qwen3_5MTPDrafter`` or ``Gemma4AssistantDrafter``).
-                When set, the runner is drafter-aware: the standalone
-                :class:`~easydel.inference.esurge.SpeculativeMTPDriver`
-                already provides an end-to-end draft/verify loop, and
-                exposing the drafter here lets a future runner-native
-                path fill ``request.spec_token_ids`` from real drafts
-                instead of the ``-1`` placeholders. ``None`` keeps the
-                standard single-token-per-forward decode.
+                When set, the runner drives the runner-native
+                draft/verify/commit path, filling ``request.spec_token_ids``
+                from real drafts. ``None`` keeps the standard
+                single-token-per-forward decode.
         """
         self.model = model.esurge_compatible_model
         # Compressed-window models (DeepSeek-V4) keep ALL decode state in
