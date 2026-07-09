@@ -709,17 +709,24 @@ class eSurgeVisionConfig(TypedDict, total=False):
 
 @typed_config(
     defaults={
+        "coordination": "replicated",
         "distributed_mode": False,
         "distributed_role": "auto",
         "distributed_service_name": None,
         "distributed_world_size": None,
         "distributed_rank": None,
+        "distributed_leader_addr": None,
         "distributed_control_port": 19666,
         "distributed_control_bind_host": "0.0.0.0",
         "distributed_advertise_addr": None,
         "distributed_auth_token": None,
         "distributed_step_timeout_s": 30.0,
         "distributed_connect_timeout_s": 15.0,
+        "distributed_ready_timeout_s": 600.0,
+        "distributed_heartbeat_interval_s": 1.0,
+        "distributed_heartbeat_timeout_s": 5.0,
+        "distributed_verify_digest_interval": 64,
+        "distributed_max_inflight_steps": 4,
         "distributed_verify_sampling_digest": True,
     },
 )
@@ -733,10 +740,21 @@ class eSurgeDistributedConfig(TypedDict, total=False):
     digest that the leader cross-checks before committing the step.
 
     Attributes:
-        distributed_mode: Master switch enabling the multi-host control
-            plane. When ``False`` all other distributed_* fields are ignored
-            and the engine runs single-process (still supports SPMD/MPMD
-            within the local process).
+        coordination: Multi-host step-coordination pattern.
+            ``"replicated"`` (default) assumes an outer driver calls the
+            engine identically on every host in deterministic lockstep — the
+            trainer-rollout pattern; the engine adds no control plane.
+            ``"zmq"`` builds the leader/worker step-replication plane
+            (single-ingress serving): rank 0 owns the scheduler and mirrors
+            its runner-call stream to every worker over ZeroMQ, which is
+            required whenever requests arrive at one host only (e.g. the
+            HTTP API server on a pod). Ignored when
+            ``jax.process_count() == 1``.
+        distributed_mode: Master switch enabling the *legacy* blocking
+            control plane. When ``False`` all other distributed_* fields are
+            ignored and the engine runs single-process (still supports
+            SPMD/MPMD within the local process). Prefer
+            ``coordination="zmq"``.
         distributed_role: Role of this rank: ``"leader"`` runs the scheduler
             and serves requests, ``"worker"`` runs the runner only and waits
             for dispatch. ``"auto"`` infers the role from
@@ -767,23 +785,50 @@ class eSurgeDistributedConfig(TypedDict, total=False):
             this deadline. Default ``30.0``.
         distributed_connect_timeout_s: Timeout for the initial worker→leader
             connect handshake at engine startup. Default ``15.0``.
+        distributed_leader_addr: Explicit leader host/IP for the
+            ``coordination="zmq"`` plane. ``None`` falls back to the JAX
+            distributed coordinator's host (correct for standard pod
+            launches), then DNS discovery via ``distributed_service_name``.
+        distributed_ready_timeout_s: How long the ``coordination="zmq"``
+            leader waits at startup for every worker to hello + ready.
+            Compilation happens before ready, so this defaults generously
+            (``600.0`` seconds).
+        distributed_heartbeat_interval_s: Liveness beacon cadence on the
+            ``coordination="zmq"`` plane. Default ``1.0``.
+        distributed_heartbeat_timeout_s: Peer silence tolerated before the
+            pod aborts. Default ``5.0``.
+        distributed_verify_digest_interval: Every K steps the
+            ``coordination="zmq"`` plane cross-checks a sampled-token digest
+            between hosts, off the step critical path. ``0`` disables.
+            Default ``64``.
+        distributed_max_inflight_steps: Bound on leader/worker step skew for
+            the ``coordination="zmq"`` plane; the leader stops dispatching
+            when the slowest worker falls this many steps behind. Default
+            ``4``.
         distributed_verify_sampling_digest: When ``True`` (default), every
-            step round-trips a cryptographic digest of the sampled tokens
-            between ranks and aborts if they disagree. Set ``False`` only
-            for benchmarking / development.
+            step of the *legacy* plane round-trips a cryptographic digest of
+            the sampled tokens between ranks and aborts if they disagree.
+            Set ``False`` only for benchmarking / development.
     """
 
+    coordination: NotRequired[Literal["replicated", "zmq"]]
     distributed_mode: NotRequired[bool]
     distributed_role: NotRequired[Literal["auto", "leader", "worker"]]
     distributed_service_name: NotRequired[str | None]
     distributed_world_size: NotRequired[int | None]
     distributed_rank: NotRequired[int | None]
+    distributed_leader_addr: NotRequired[str | None]
     distributed_control_port: NotRequired[int]
     distributed_control_bind_host: NotRequired[str]
     distributed_advertise_addr: NotRequired[str | None]
     distributed_auth_token: NotRequired[str | None]
     distributed_step_timeout_s: NotRequired[float]
     distributed_connect_timeout_s: NotRequired[float]
+    distributed_ready_timeout_s: NotRequired[float]
+    distributed_heartbeat_interval_s: NotRequired[float]
+    distributed_heartbeat_timeout_s: NotRequired[float]
+    distributed_verify_digest_interval: NotRequired[int]
+    distributed_max_inflight_steps: NotRequired[int]
     distributed_verify_sampling_digest: NotRequired[bool]
 
     @classmethod

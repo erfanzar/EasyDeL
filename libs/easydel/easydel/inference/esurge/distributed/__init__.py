@@ -46,6 +46,7 @@ from .coordinator import (
     StepCoordinationError,
     StepCoordinator,
     StepHandle,
+    create_step_coordinator,
 )
 from .discovery import DiscoveryResult, resolve_service_hosts
 from .protocol import compute_sampled_digest, make_config_fingerprint
@@ -60,6 +61,7 @@ __all__ = (
     "StepDispatch",
     "StepHandle",
     "compute_sampled_digest",
+    "create_step_coordinator",
     "make_config_fingerprint",
     "resolve_distributed_role",
     "resolve_service_hosts",

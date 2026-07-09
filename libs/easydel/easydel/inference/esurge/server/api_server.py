@@ -328,6 +328,13 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                     f"{getattr(esurge, 'distributed_rank', '?')}; only distributed leader rank "
                     "can run eSurgeApiServer."
                 )
+            coordinator = getattr(esurge, "_step_coordinator", None)
+            if coordinator is not None and not getattr(coordinator, "is_leader", True):
+                raise ValueError(
+                    f"Model '{name}' is a step-coordination worker rank "
+                    f"{getattr(coordinator, 'rank', '?')}; only the leader rank can run eSurgeApiServer."
+                )
+            self._reject_uncoordinated_multihost(name, esurge, coordinator)
             self.adapters[name] = eSurgeAdapter(esurge, name)
 
         self.oai_like_processor = oai_like_processor
@@ -1257,6 +1264,46 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             seen.add(value)
             normalized.append(value)
         return normalized
+
+    @staticmethod
+    def _reject_uncoordinated_multihost(name: str, esurge: eSurge, coordinator) -> None:
+        """Refuse to serve on a multi-host runtime without a control plane.
+
+        HTTP requests arrive at one host only, but the jitted step is a
+        global-mesh collective requiring every process. Without a
+        step-coordination plane the other hosts never enter the collective
+        and the leader blocks forever — a silent deadlock. Failing loudly at
+        startup with the fix beats hanging on the first request.
+
+        Args:
+            name: Engine map key (for the error message).
+            esurge: The engine being served.
+            coordinator: The engine's step coordinator (may be ``None`` for
+                harnesses).
+
+        Raises:
+            ValueError: When ``jax.process_count() > 1`` and the engine has
+                neither the ``coordination="zmq"`` plane nor the legacy
+                ``distributed_mode`` control plane.
+        """
+        try:
+            import jax
+
+            process_count = int(jax.process_count())
+        except Exception:
+            return
+        if process_count <= 1:
+            return
+        world_size = int(getattr(coordinator, "world_size", 1) or 1) if coordinator is not None else 1
+        if world_size > 1 or getattr(esurge, "distributed_mode", False):
+            return
+        raise ValueError(
+            f"Model '{name}' runs on a {process_count}-process JAX runtime but has no multi-host "
+            "step coordination: HTTP requests would reach only this host while the jitted step "
+            "requires every process, deadlocking on the first request. Configure the engine with "
+            'distributed={"coordination": "zmq", "distributed_auth_token": "<same-on-all-hosts>"} '
+            "and start one engine process per host (rank 0 serves; other ranks replay steps)."
+        )
 
     @staticmethod
     def _resolve_esurge_runtime_request_cap(esurge: eSurge) -> int:

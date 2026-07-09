@@ -455,6 +455,37 @@ class EngineLifecycleMixin:
         self._scheduler_running = False
         self._registry.signal_all()
 
+    def _run_worker_replay_loop(self) -> None:
+        """Body of the ZMQ worker replay thread.
+
+        Replays the leader's step stream until Shutdown/stop; any failure is
+        recorded on the engine's crash-state fields and wakes every blocked
+        caller so the process dies loudly instead of desyncing silently.
+        """
+        try:
+            self._step_coordinator.run_worker_loop(self._worker_stop_event)
+        except Exception as exc:
+            traceback.print_exc()
+            logger.critical("Worker replay loop failed: %s", exc)
+            self._scheduler_exception = exc
+            self._scheduler_exception_tb = traceback.format_exc()
+            self._registry.signal_all()
+
+    def _stop_worker_replay_loop(self) -> None:
+        """Cooperatively stop the ZMQ worker replay thread, if running."""
+        stop_event = getattr(self, "_worker_stop_event", None)
+        thread = getattr(self, "_worker_replay_thread", None)
+        if stop_event is None or thread is None:
+            return
+        stop_event.set()
+        if thread.is_alive():
+            thread.join(timeout=5.0)
+            if thread.is_alive():
+                logger.warning("Worker replay thread did not stop gracefully")
+                return
+        if getattr(self, "_worker_replay_thread", None) is thread:
+            self._worker_replay_thread = None
+
     def _start_engine_output_worker(self) -> None:
         """Start the background parser/output worker when the engine owns one.
 
@@ -550,6 +581,35 @@ class EngineLifecycleMixin:
                     self._info("Distributed worker control server is running (scheduler loop disabled).")
                     return
 
+            step_coordinator = getattr(self, "_step_coordinator", None)
+            if step_coordinator is not None and not step_coordinator.is_leader:
+                # ZMQ worker rank: no scheduler thread; a dedicated replay
+                # thread executes the leader's step stream so device dispatch
+                # order matches the leader's call order exactly.
+                if self.runner.executor_manager.kv_pages is None:
+                    self.runner.initialize_kv_cache()
+                    self._kv_cache_valid = True
+                replay_thread = getattr(self, "_worker_replay_thread", None)
+                if replay_thread is not None and replay_thread.is_alive():
+                    self._info("Worker replay loop is already running")
+                    return
+                step_coordinator.start()
+                self._scheduler_exception = None
+                self._scheduler_exception_tb = None
+                self._scheduler_running = False
+                self._worker_stop_event.clear()
+                self._worker_replay_thread = threading.Thread(
+                    target=self._run_worker_replay_loop,
+                    name="eSurgeWorkerReplay",
+                    daemon=True,
+                )
+                self._worker_replay_thread.start()
+                self._touch_activity()
+                self._start_idle_monitor()
+                self._paused = False
+                self._info("Distributed worker replay loop is running (scheduler loop disabled).")
+                return
+
             if self._scheduler_running:
                 self._info("Scheduler loop is already running")
                 return
@@ -557,6 +617,11 @@ class EngineLifecycleMixin:
             if self.runner.executor_manager.kv_pages is None:
                 self.runner.initialize_kv_cache()
                 self._kv_cache_valid = True
+
+            if step_coordinator is not None:
+                # Leader (or single host, where this is a no-op): block until
+                # every worker rank has connected and finished initializing.
+                step_coordinator.start()
 
             self._start_engine_output_worker()
 
@@ -1012,6 +1077,7 @@ class EngineLifecycleMixin:
         and returns.
         """
         self._stop_idle_monitor()
+        self._stop_worker_replay_loop()
         scheduler_thread: threading.Thread | None = None
         with self._scheduler_lock:
             if not self._scheduler_running:
@@ -1049,6 +1115,12 @@ class EngineLifecycleMixin:
                 self.runner.shutdown()
             except Exception:
                 logger.debug("Runner shutdown encountered an error", exc_info=True)
+        step_coordinator = getattr(self, "_step_coordinator", None)
+        if step_coordinator is not None:
+            try:
+                step_coordinator.shutdown("engine terminate")
+            except Exception:
+                logger.debug("Step coordinator shutdown encountered an error", exc_info=True)
         # Clear runner buffers if idle to avoid stale state on next start.
         self._reset_runner_state_if_idle("terminate")
 
