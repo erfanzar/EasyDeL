@@ -16,9 +16,6 @@ import jax
 import numpy as np
 import pytest
 import torch
-from jax import numpy as jnp
-from transformers import TopPLogitsWarper
-
 from easydel.inference.esurge.core.binary_search import apply_topp_mask
 from easydel.inference.esurge.core.sampler import (
     apply_history_penalties,
@@ -28,11 +25,13 @@ from easydel.inference.esurge.core.sampler import (
     update_token_counts,
 )
 from easydel.inference.esurge.core.sampling_metadata import SamplingMetadata
-from easydel.inference.esurge.runners.execution_manager import ExecutionManager
 from easydel.inference.esurge.runners.execution_types import BatchMetadata
+from easydel.inference.esurge.runners.executors.sampler_executor import SamplerRuntime
 from easydel.inference.oai_proxies import InferenceApiRouter
 from easydel.inference.openai_api_modules import ChatCompletionRequest, CompletionRequest
 from easydel.inference.sampling_params import SamplingParams
+from jax import numpy as jnp
+from transformers import TopPLogitsWarper
 
 
 def test_apply_history_penalties_supports_presence_and_repetition():
@@ -160,7 +159,7 @@ def test_sample_tokens_preserves_rng_identity_with_explicit_sampling_seeds():
     np.testing.assert_array_equal(np.asarray(compact), np.asarray(full)[[0, 3]])
 
 
-def test_execution_manager_sample_tokens_forwards_incremental_penalty_state():
+def test_sampler_runtime_sample_tokens_forwards_incremental_penalty_state():
     device = jax.devices()[0]
     calls: dict[str, object] = {}
 
@@ -178,12 +177,12 @@ def test_execution_manager_sample_tokens_forwards_incremental_penalty_state():
             calls["compile_key"] = (num_tokens, padded_num_reqs, greedy)
             return compiled
 
-    manager = object.__new__(ExecutionManager)
-    manager._sampler_executor = _StubSamplerExecutor()
-    manager._empty_sharding = device
-    manager._scatter_sampler_outputs = lambda tokens, valid, scatter_positions, padded_num_reqs: (tokens, valid)
-    manager._sampler_zero_token_counts = jax.device_put(np.zeros((4, 8), dtype=np.uint32), device)
-    manager._sampler_token_counts = jax.device_put(
+    runtime = object.__new__(SamplerRuntime)
+    runtime._sampler_executor = _StubSamplerExecutor()
+    runtime._empty_sharding = device
+    runtime._scatter_sampler_outputs = lambda tokens, valid, scatter_positions, padded_num_reqs: (tokens, valid)
+    runtime._sampler_zero_token_counts = jax.device_put(np.zeros((4, 8), dtype=np.uint32), device)
+    runtime._sampler_token_counts = jax.device_put(
         np.array(
             [
                 [0, 1, 1, 0, 0, 0, 0, 0],
@@ -195,15 +194,15 @@ def test_execution_manager_sample_tokens_forwards_incremental_penalty_state():
         ),
         device,
     )
-    manager._sampler_packed_i32_cpu_by_reqs = {}
-    manager._sampler_packed_f32_cpu_by_reqs = {}
-    manager._sampler_packed_misc_i32_cpu = np.zeros((2,), dtype=np.int32)
-    manager._sampler_prefix_cpu_by_reqs = {}
-    manager._sampler_penalty_state_ready = True
-    manager._ensure_sampler_penalty_state = lambda: calls.setdefault("rebuilt", True)
+    runtime._sampler_packed_i32_cpu_by_reqs = {}
+    runtime._sampler_packed_f32_cpu_by_reqs = {}
+    runtime._sampler_packed_misc_i32_cpu = np.zeros((2,), dtype=np.int32)
+    runtime._sampler_prefix_cpu_by_reqs = {}
+    runtime._sampler_penalty_state_ready = True
+    runtime._ensure_sampler_penalty_state = lambda: calls.setdefault("rebuilt", True)
 
-    result = ExecutionManager.sample_tokens(
-        manager,
+    result = SamplerRuntime.sample_tokens(
+        runtime,
         num_tokens=2,
         padded_num_reqs=2,
         sampler_padded_num_reqs=2,

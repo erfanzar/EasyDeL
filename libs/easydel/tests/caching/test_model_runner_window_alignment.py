@@ -17,7 +17,6 @@ from types import SimpleNamespace
 
 import jax.numpy as jnp
 import numpy as np
-
 from easydel.caching import RaggedPagesCacheConfig
 from easydel.inference.esurge.core.interface import (
     CacheGroupSpec,
@@ -26,7 +25,7 @@ from easydel.inference.esurge.core.interface import (
     estimate_runtime_page_budget,
 )
 from easydel.inference.esurge.runners.execution_manager import ExecutionManager
-from easydel.inference.esurge.runners.executors.sampler_executor import SamplerExecutor
+from easydel.inference.esurge.runners.executors.sampler_executor import SamplerExecutor, SamplerRuntime
 from easydel.inference.esurge.runners.model_runner import eSurgeRunner
 from easydel.modules.gemma4 import Gemma4TextConfig
 from easydel.modules.openelm import OpenELMConfig
@@ -320,25 +319,25 @@ def test_sampler_executor_cache_keeps_all_compiled_variants():
 
 def test_sampler_window_compacts_zero_token_rows_but_keeps_rng_row_ids():
     """Sampler compaction should drop zero-token rows without changing row identity."""
-    manager = object.__new__(ExecutionManager)
-    manager.min_input_pad = 1
-    manager.max_num_reqs = 8
-    manager._sampler_gather_positions_cpu = np.zeros((8,), dtype=np.int32)
-    manager._sampler_sampling_seeds_cpu = np.zeros((8,), dtype=np.int32)
-    manager._sampler_scatter_positions_cpu = np.zeros((8,), dtype=np.int32)
-    manager._sampler_window_row_indices_cpu = np.zeros((8,), dtype=np.int32)
-    manager._sampler_scheduled_cpu = np.zeros((8,), dtype=np.int32)
-    manager._sampler_seq_lens_cpu = np.zeros((8,), dtype=np.int32)
-    manager._sampler_active_mask_cpu = np.zeros((8,), dtype=np.bool_)
-    manager._sampler_temperature_cpu = np.ones((8,), dtype=np.float32)
-    manager._sampler_top_p_cpu = np.ones((8,), dtype=np.float32)
-    manager._sampler_top_k_cpu = np.zeros((8,), dtype=np.int32)
-    manager._sampler_min_p_cpu = np.zeros((8,), dtype=np.float32)
-    manager._sampler_frequency_penalties_cpu = np.zeros((8,), dtype=np.float32)
-    manager._sampler_presence_penalties_cpu = np.zeros((8,), dtype=np.float32)
-    manager._sampler_repetition_penalties_cpu = np.ones((8,), dtype=np.float32)
+    runtime = object.__new__(SamplerRuntime)
+    runtime.min_input_pad = 1
+    runtime.max_num_reqs = 8
+    runtime._sampler_gather_positions_cpu = np.zeros((8,), dtype=np.int32)
+    runtime._sampler_sampling_seeds_cpu = np.zeros((8,), dtype=np.int32)
+    runtime._sampler_scatter_positions_cpu = np.zeros((8,), dtype=np.int32)
+    runtime._sampler_window_row_indices_cpu = np.zeros((8,), dtype=np.int32)
+    runtime._sampler_scheduled_cpu = np.zeros((8,), dtype=np.int32)
+    runtime._sampler_seq_lens_cpu = np.zeros((8,), dtype=np.int32)
+    runtime._sampler_active_mask_cpu = np.zeros((8,), dtype=np.bool_)
+    runtime._sampler_temperature_cpu = np.ones((8,), dtype=np.float32)
+    runtime._sampler_top_p_cpu = np.ones((8,), dtype=np.float32)
+    runtime._sampler_top_k_cpu = np.zeros((8,), dtype=np.int32)
+    runtime._sampler_min_p_cpu = np.zeros((8,), dtype=np.float32)
+    runtime._sampler_frequency_penalties_cpu = np.zeros((8,), dtype=np.float32)
+    runtime._sampler_presence_penalties_cpu = np.zeros((8,), dtype=np.float32)
+    runtime._sampler_repetition_penalties_cpu = np.ones((8,), dtype=np.float32)
 
-    sampler_num_reqs, sampler_padded_num_reqs, sampler_total_tokens = manager._prepare_compact_sampler_window(
+    sampler_num_reqs, sampler_padded_num_reqs, sampler_total_tokens = runtime._prepare_compact_sampler_window(
         padded_num_reqs=8,
         scheduled_full_cpu=np.array([5, 0, 0, 1, 0, 0, 0, 2], dtype=np.int32),
         active_mask_full_cpu=np.array([True, True, True, True, False, True, False, True]),
@@ -356,27 +355,27 @@ def test_sampler_window_compacts_zero_token_rows_but_keeps_rng_row_ids():
     assert sampler_num_reqs == 3
     assert sampler_padded_num_reqs == 4
     assert sampler_total_tokens == 8
-    np.testing.assert_array_equal(manager._sampler_gather_positions_cpu[:4], np.array([0, 3, 7, 0], dtype=np.int32))
-    np.testing.assert_array_equal(manager._sampler_sampling_seeds_cpu[:4], np.array([0, 3, 7, 11], dtype=np.int32))
-    np.testing.assert_array_equal(manager._sampler_scatter_positions_cpu[:4], np.array([0, 3, 7, 11], dtype=np.int32))
-    np.testing.assert_array_equal(manager._sampler_window_row_indices_cpu[:4], np.array([10, 13, 17, 0], dtype=np.int32))
-    np.testing.assert_array_equal(manager._sampler_scheduled_cpu[:4], np.array([5, 1, 2, 0], dtype=np.int32))
-    np.testing.assert_array_equal(manager._sampler_seq_lens_cpu[:4], np.array([25, 24, 29, 0], dtype=np.int32))
-    np.testing.assert_array_equal(manager._sampler_active_mask_cpu[:4], np.array([True, True, True, False]))
-    np.testing.assert_allclose(manager._sampler_temperature_cpu[:4], np.array([0.6, 0.9, 0.3, 1.0], dtype=np.float32))
-    np.testing.assert_allclose(manager._sampler_top_p_cpu[:4], np.array([0.95, 0.93, 0.98, 1.0], dtype=np.float32))
-    np.testing.assert_array_equal(manager._sampler_top_k_cpu[:4], np.array([32, 4, 48, 0], dtype=np.int32))
-    np.testing.assert_allclose(manager._sampler_min_p_cpu[:4], np.array([0.0, 0.1, 0.2, 0.0], dtype=np.float32))
+    np.testing.assert_array_equal(runtime._sampler_gather_positions_cpu[:4], np.array([0, 3, 7, 0], dtype=np.int32))
+    np.testing.assert_array_equal(runtime._sampler_sampling_seeds_cpu[:4], np.array([0, 3, 7, 11], dtype=np.int32))
+    np.testing.assert_array_equal(runtime._sampler_scatter_positions_cpu[:4], np.array([0, 3, 7, 11], dtype=np.int32))
+    np.testing.assert_array_equal(runtime._sampler_window_row_indices_cpu[:4], np.array([10, 13, 17, 0], dtype=np.int32))
+    np.testing.assert_array_equal(runtime._sampler_scheduled_cpu[:4], np.array([5, 1, 2, 0], dtype=np.int32))
+    np.testing.assert_array_equal(runtime._sampler_seq_lens_cpu[:4], np.array([25, 24, 29, 0], dtype=np.int32))
+    np.testing.assert_array_equal(runtime._sampler_active_mask_cpu[:4], np.array([True, True, True, False]))
+    np.testing.assert_allclose(runtime._sampler_temperature_cpu[:4], np.array([0.6, 0.9, 0.3, 1.0], dtype=np.float32))
+    np.testing.assert_allclose(runtime._sampler_top_p_cpu[:4], np.array([0.95, 0.93, 0.98, 1.0], dtype=np.float32))
+    np.testing.assert_array_equal(runtime._sampler_top_k_cpu[:4], np.array([32, 4, 48, 0], dtype=np.int32))
+    np.testing.assert_allclose(runtime._sampler_min_p_cpu[:4], np.array([0.0, 0.1, 0.2, 0.0], dtype=np.float32))
     np.testing.assert_allclose(
-        manager._sampler_frequency_penalties_cpu[:4],
+        runtime._sampler_frequency_penalties_cpu[:4],
         np.array([0.1, 0.2, 0.3, 0.0], dtype=np.float32),
     )
     np.testing.assert_allclose(
-        manager._sampler_presence_penalties_cpu[:4],
+        runtime._sampler_presence_penalties_cpu[:4],
         np.array([0.4, 0.5, 0.6, 0.0], dtype=np.float32),
     )
     np.testing.assert_allclose(
-        manager._sampler_repetition_penalties_cpu[:4],
+        runtime._sampler_repetition_penalties_cpu[:4],
         np.array([1.2, 1.3, 1.4, 1.0], dtype=np.float32),
     )
 
