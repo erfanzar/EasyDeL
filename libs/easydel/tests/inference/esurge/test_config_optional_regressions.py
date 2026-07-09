@@ -14,13 +14,11 @@
 
 from types import SimpleNamespace
 
+import easydel as ed
 import jax
 import jax.numpy as jnp
 import pytest
 import spectrax as spx
-
-import easydel as ed
-from easydel.inference.esurge.config import CacheConfig, Config, SchedulerConfig
 from easydel.inference.esurge.core.interface import CacheGroupsConfig, CacheGroupSpec, FullAttentionSpec
 from easydel.inference.esurge.mixins.parsing import EngineParsingMixin
 from easydel.inference.esurge.mixins.utils import EngineUtilsMixin
@@ -845,15 +843,6 @@ def test_esurge_eval_preserves_math_normalization_for_generation_methods(method_
 
 
 def test_scheduler_falls_back_to_model_len_when_batch_token_limit_is_none():
-    config = Config(
-        scheduler_config=SchedulerConfig(
-            max_num_seqs=4,
-            max_num_batched_tokens=None,
-            max_model_len=128,
-            token_safety_margin=None,
-        ),
-        cache_config=CacheConfig(num_pages=16, page_size=8, enable_prefix_caching=False),
-    )
     kv_cache_config = CacheGroupsConfig(
         num_pages=16,
         kv_cache_groups=[
@@ -870,7 +859,15 @@ def test_scheduler_falls_back_to_model_len_when_batch_token_limit_is_none():
         ],
     )
 
-    scheduler = Scheduler(config=config, kv_cache_config=kv_cache_config)
+    scheduler = Scheduler(
+        kv_cache_config=kv_cache_config,
+        max_num_seqs=4,
+        max_num_batched_tokens=None,
+        max_model_len=128,
+        num_pages=16,
+        page_size=8,
+        enable_prefix_caching=False,
+    )
 
     assert scheduler.max_num_scheduled_tokens == 128
     output = scheduler.schedule()
@@ -878,15 +875,6 @@ def test_scheduler_falls_back_to_model_len_when_batch_token_limit_is_none():
 
 
 def test_scheduler_aborts_empty_prompt_request_instead_of_requeueing():
-    config = Config(
-        scheduler_config=SchedulerConfig(
-            max_num_seqs=4,
-            max_num_batched_tokens=64,
-            max_model_len=128,
-            token_safety_margin=None,
-        ),
-        cache_config=CacheConfig(num_pages=16, page_size=8, enable_prefix_caching=False),
-    )
     kv_cache_config = CacheGroupsConfig(
         num_pages=16,
         kv_cache_groups=[
@@ -903,7 +891,15 @@ def test_scheduler_aborts_empty_prompt_request_instead_of_requeueing():
         ],
     )
 
-    scheduler = Scheduler(config=config, kv_cache_config=kv_cache_config)
+    scheduler = Scheduler(
+        kv_cache_config=kv_cache_config,
+        max_num_seqs=4,
+        max_num_batched_tokens=64,
+        max_model_len=128,
+        num_pages=16,
+        page_size=8,
+        enable_prefix_caching=False,
+    )
     request = EngineRequest(
         request_id="req-empty-prompt",
         prompt_token_ids=[],

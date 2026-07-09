@@ -7,8 +7,6 @@ import os
 os.environ["JAX_PLATFORMS"] = "cpu"
 
 import jax.numpy as jnp
-
-from easydel.inference.esurge.config import CacheConfig, Config, SchedulerConfig
 from easydel.inference.esurge.core.interface import (
     CacheGroupsConfig,
     CacheGroupSpec,
@@ -27,19 +25,6 @@ def _make_scheduler(
     num_pages: int = 6000,
     page_size: int = 128,
 ) -> Scheduler:
-    config = Config(
-        scheduler_config=SchedulerConfig(
-            max_num_seqs=max_num_seqs,
-            max_num_batched_tokens=max_num_batched_tokens,
-            max_model_len=max_model_len,
-            token_safety_margin=None,
-        ),
-        cache_config=CacheConfig(
-            num_pages=num_pages,
-            page_size=page_size,
-            enable_prefix_caching=False,
-        ),
-    )
     kv_cache_config = CacheGroupsConfig(
         num_pages=num_pages,
         kv_cache_groups=[
@@ -55,7 +40,15 @@ def _make_scheduler(
             )
         ],
     )
-    return Scheduler(config=config, kv_cache_config=kv_cache_config)
+    return Scheduler(
+        kv_cache_config=kv_cache_config,
+        max_num_seqs=max_num_seqs,
+        max_num_batched_tokens=max_num_batched_tokens,
+        max_model_len=max_model_len,
+        num_pages=num_pages,
+        page_size=page_size,
+        enable_prefix_caching=False,
+    )
 
 
 def _make_request(request_id: str, prompt_len: int) -> EngineRequest:

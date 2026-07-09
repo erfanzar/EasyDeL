@@ -35,18 +35,17 @@ Classes:
 Example:
     Basic async scheduler usage::
 
-        >>> from easydel.inference.esurge.config import Config, SchedulerConfig
         >>> from easydel.inference.esurge.scheduler import AsyncScheduler
         >>>
-        >>> config = Config(
-        ...     scheduler_config=SchedulerConfig(
-        ...         max_num_seqs=8,
-        ...         max_num_batched_tokens=2048,
-        ...         async_scheduling=True,  # Enable async mode
-        ...     )
+        >>> scheduler = AsyncScheduler(
+        ...     kv_cache_config=kv_config,
+        ...     max_num_seqs=8,
+        ...     max_num_batched_tokens=2048,
+        ...     max_model_len=8192,
+        ...     num_pages=1024,
+        ...     page_size=128,
+        ...     async_scheduling=True,  # Enable async mode
         ... )
-        >>>
-        >>> scheduler = AsyncScheduler(config=config, kv_cache_config=kv_config)
         >>> output = scheduler.schedule()  # Returns with placeholders
 
 Note:
@@ -99,7 +98,7 @@ class AsyncScheduler(Scheduler):
         function properly.
 
     Example:
-        >>> scheduler = AsyncScheduler(config=config, kv_cache_config=kv_config)
+        >>> scheduler = AsyncScheduler(kv_cache_config=kv_config, max_num_seqs=8, ...)
         >>> # Schedule a batch with placeholders
         >>> output = scheduler.schedule()
         >>> # Runner processes batch asynchronously

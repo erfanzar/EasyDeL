@@ -15,8 +15,6 @@
 from __future__ import annotations
 
 import jax.numpy as jnp
-
-from easydel.inference.esurge.config import CacheConfig, Config, SchedulerConfig
 from easydel.inference.esurge.core.interface import CacheGroupsConfig, CacheGroupSpec, FullAttentionSpec
 from easydel.inference.esurge.outputs import ModelRunnerOutput
 from easydel.inference.esurge.request import EngineRequest
@@ -26,19 +24,6 @@ from easydel.inference.sampling_params import SamplingParams
 
 def _make_scheduler(*, num_pages: int) -> Scheduler:
     page_size = 64
-    config = Config(
-        scheduler_config=SchedulerConfig(
-            max_num_seqs=16,
-            max_num_batched_tokens=2048,
-            max_model_len=8208,
-            token_safety_margin=None,
-        ),
-        cache_config=CacheConfig(
-            num_pages=num_pages,
-            page_size=page_size,
-            enable_prefix_caching=False,
-        ),
-    )
     kv_cache_config = CacheGroupsConfig(
         num_pages=num_pages,
         kv_cache_groups=[
@@ -54,7 +39,15 @@ def _make_scheduler(*, num_pages: int) -> Scheduler:
             )
         ],
     )
-    scheduler = Scheduler(config=config, kv_cache_config=kv_cache_config)
+    scheduler = Scheduler(
+        kv_cache_config=kv_cache_config,
+        max_num_seqs=16,
+        max_num_batched_tokens=2048,
+        max_model_len=8208,
+        num_pages=num_pages,
+        page_size=page_size,
+        enable_prefix_caching=False,
+    )
     scheduler.data_parallel_size = 4
     return scheduler
 

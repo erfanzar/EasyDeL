@@ -5696,7 +5696,7 @@ class EasyGenerationMixin:
                     "paused": getattr(engine, "_paused", False),
                     "running_requests": getattr(engine, "num_running_requests", 0),
                     "pending_requests": getattr(engine, "num_pending_requests", 0),
-                    "max_num_seqs": getattr(engine, "_max_num_seqs", None),
+                    "max_num_seqs": getattr(engine, "max_num_seqs", None),
                 }
                 engines_info.append(info)
 
@@ -5747,11 +5747,7 @@ class EasyGenerationMixin:
         if tokenizer is not None and max_num_seqs is not None:
             # Try to find exact match based on parameters
             for engine in matching_engines:
-                if (
-                    hasattr(engine, "tokenizer")
-                    and hasattr(engine, "_max_num_seqs")
-                    and engine._max_num_seqs == max_num_seqs
-                ):
+                if hasattr(engine, "tokenizer") and getattr(engine, "max_num_seqs", None) == max_num_seqs:
                     return engine
 
         # Return the most recently added engine (last in cache)
@@ -5902,12 +5898,17 @@ class EasyGenerationMixin:
                     "Either provide a tokenizer or create an engine first by calling get_esurge with a tokenizer."
                 )
 
-        # Set defaults for other parameters
+        # Set defaults for other parameters (inherit from the cached engine's
+        # sectioned configs when present).
+        cached_runtime = getattr(cached_engine, "runtime_config", None)
+        cached_cache = getattr(cached_engine, "cache_config", None)
+        cached_context = getattr(cached_engine, "context_config", None)
+        cached_parsing = getattr(cached_engine, "parsing_config", None)
         if min_input_pad is None:
-            min_input_pad = getattr(cached_engine, "_min_input_pad", 16) if cached_engine else 16
+            min_input_pad = cached_runtime.min_input_pad if cached_runtime else 16
         max_num_seqs_was_none = max_num_seqs is None
         if max_num_seqs is None:
-            max_num_seqs = getattr(cached_engine, "_max_num_seqs", 32) if cached_engine else 32
+            max_num_seqs = cached_runtime.max_num_seqs if cached_runtime else 32
         if max_num_seq_buckets is None:
             # Only inherit cached buckets when max_num_seqs was also inherited.
             # If max_num_seqs was explicitly provided by caller, let eSurgeRunner
@@ -5917,15 +5918,15 @@ class EasyGenerationMixin:
                 if cached_buckets is not None:
                     max_num_seq_buckets = [int(v) for v in cached_buckets]
         if max_num_batched_tokens is None:
-            max_num_batched_tokens = getattr(cached_engine, "_max_num_batched_tokens", None) if cached_engine else None
+            max_num_batched_tokens = cached_runtime.max_num_batched_tokens if cached_runtime else None
         if hbm_utilization is None:
-            hbm_utilization = getattr(cached_engine, "_hbm_utilization", 0.85) if cached_engine else 0.85
+            hbm_utilization = cached_cache.hbm_utilization if cached_cache else 0.85
         if page_size is None:
-            page_size = getattr(cached_engine, "_page_size", 128) if cached_engine else 128
-        if max_cache_tokens is None and cached_engine is not None:
-            max_cache_tokens = getattr(getattr(cached_engine, "cache_config", None), "max_cache_tokens", None)
+            page_size = cached_cache.page_size if cached_cache else 128
+        if max_cache_tokens is None and cached_cache is not None:
+            max_cache_tokens = cached_cache.max_cache_tokens
         if enable_prefix_caching is None:
-            enable_prefix_caching = getattr(cached_engine, "_enable_prefix_caching", True) if cached_engine else True
+            enable_prefix_caching = cached_cache.enable_prefix_caching if cached_cache else True
         if data_parallelism_axis is None:
             data_parallelism_axis = getattr(cached_engine, "data_parallelism_axis", "dp") if cached_engine else "dp"
         if async_scheduling is None:
@@ -5933,15 +5934,15 @@ class EasyGenerationMixin:
                 getattr(getattr(cached_engine, "runner", None), "async_scheduling", True) if cached_engine else True
             )
         if overlap_execution is None:
-            overlap_execution = getattr(cached_engine, "_overlap_execution", True) if cached_engine else True
+            overlap_execution = cached_runtime.overlap_execution if cached_runtime else True
         if runner_verbose is None:
-            runner_verbose = getattr(cached_engine, "_runner_verbose", False) if cached_engine else False
+            runner_verbose = cached_runtime.runner_verbose if cached_runtime else False
         if decode_truncated_prompt is None:
-            decode_truncated_prompt = getattr(cached_engine, "_decode_truncated_prompt", True) if cached_engine else True
+            decode_truncated_prompt = cached_context.decode_truncated_prompt if cached_context else True
         if destroy_pages_on_pause is None:
-            destroy_pages_on_pause = getattr(cached_engine, "_destroy_pages_on_pause", True) if cached_engine else True
+            destroy_pages_on_pause = cached_cache.destroy_pages_on_pause if cached_cache else True
         if silent_mode is None:
-            silent_mode = getattr(cached_engine, "silent_mode", False) if cached_engine else False
+            silent_mode = cached_parsing.silent_mode if cached_parsing else False
 
         # Build the configuration dict
         model_hash = self._esurge_cache_scope()

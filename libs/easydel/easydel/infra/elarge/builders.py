@@ -166,7 +166,9 @@ _ESURGE_SECTION_FIELDS: dict[str, frozenset[str]] = {
             "reasoning_parser",
         }
     ),
-    "vision": frozenset({"resolution_buckets", "vision_cache_capacity_mb"}),
+    "vision": frozenset(
+        {"resolution_buckets", "vision_cache_capacity_mb", "compile_vision_encoder", "vision_patch_buckets"}
+    ),
     "distributed": frozenset(
         {
             "distributed_mode",
