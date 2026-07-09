@@ -38,6 +38,7 @@ import typing
 import jax
 import spectrax as spx
 
+from ..distributed.coordinator import LocalCoordinator, StepHandle
 from ..logger import logger
 from ..request import EngineRequestStatus
 from ..scheduler import Scheduler, SchedulerOutput
@@ -599,7 +600,9 @@ class EngineLifecycleMixin:
                 self._info("Starting background scheduler loop")
                 consecutive_errors = 0
                 max_consecutive_errors = MAX_CONSECUTIVE_SCHEDULER_ERRORS
-                distributed_controller = getattr(self, "_distributed_controller", None)
+                coordinator = getattr(self, "_step_coordinator", None)
+                if coordinator is None:
+                    coordinator = LocalCoordinator(self.runner)
 
                 _diag_iter = 0
                 _diag_last_log = time.time()
@@ -666,26 +669,17 @@ class EngineLifecycleMixin:
                                 )
                                 _diag_last_log = _now
                             self._update_scheduler_heartbeat()
-                            dispatch = None
+                            coordinator.check_health()
                             if scheduler_output.total_num_scheduled_tokens == 0 and not _zero_schedule_needs_update(
                                 scheduler_output
                             ):
                                 _idle_scheduler_tick()
                                 consecutive_errors = 0
                                 continue
-                            if distributed_controller is not None and distributed_controller.has_remote_workers:
-                                prof_phase = time.perf_counter()
-                                dispatch = distributed_controller.dispatch_step(scheduler_output)
-                                prof_dispatch = time.perf_counter() - prof_phase
-                            else:
-                                prof_dispatch = 0.0
+                            prof_dispatch = 0.0
                             prof_phase = time.perf_counter()
-                            model_output = self.runner.execute_model(scheduler_output)
+                            model_output = coordinator.execute_sync(scheduler_output)
                             prof_execute = time.perf_counter() - prof_phase
-                            if dispatch is not None:
-                                prof_phase = time.perf_counter()
-                                distributed_controller.verify_step(dispatch, model_output)
-                                prof_dispatch += time.perf_counter() - prof_phase
                             prof_phase = time.perf_counter()
                             with self._scheduler_lock:
                                 engine_outputs = self.scheduler.update_from_output(scheduler_output, model_output)
@@ -747,7 +741,7 @@ class EngineLifecycleMixin:
                 pending_execution: tuple[typing.Any, SchedulerOutput] | None = None
                 prefetched_schedule: SchedulerOutput | None = None
 
-                if distributed_controller is not None and distributed_controller.has_remote_workers:
+                if not coordinator.supports_overlap:
                     raise ValueError(
                         "Distributed step synchronization failure: overlap_execution=True is not supported "
                         "with remote distributed workers."
@@ -798,7 +792,7 @@ class EngineLifecycleMixin:
                         scheduler_output
                     ):
                         logger.info("[esurge-loop] executing zero-token scheduler output")
-                    model_output = self.runner.execute_model(scheduler_output)
+                    model_output = coordinator.execute_sync(scheduler_output)
                     with self._scheduler_lock:
                         engine_outputs = self.scheduler.update_from_output(scheduler_output, model_output)
                     self._enqueue_engine_outputs(engine_outputs)
@@ -829,9 +823,9 @@ class EngineLifecycleMixin:
                             bool(defer_safe),
                         )
                     if defer_safe:
-                        return self.runner.execute_model_async(scheduler_output), scheduler_output
+                        return coordinator.execute_async(scheduler_output), scheduler_output
 
-                    model_output = self.runner.execute_model(scheduler_output)
+                    model_output = coordinator.execute_sync(scheduler_output)
                     with self._scheduler_lock:
                         engine_outputs = self.scheduler.update_from_output(scheduler_output, model_output)
                     self._enqueue_engine_outputs(engine_outputs)
@@ -840,6 +834,7 @@ class EngineLifecycleMixin:
 
                 while self._scheduler_running:
                     try:
+                        coordinator.check_health()
                         if pending_execution is not None:
                             future, prev_sched_out = pending_execution
 
@@ -852,7 +847,7 @@ class EngineLifecycleMixin:
                                 if next_sched_out.total_num_scheduled_tokens > 0:
                                     next_pending: tuple[typing.Any, SchedulerOutput] | None = None
                                     if self.runner.can_dispatch_next_before_async_drain(next_sched_out):
-                                        next_pending = (self.runner.execute_model_async(next_sched_out), next_sched_out)
+                                        next_pending = (coordinator.execute_async(next_sched_out), next_sched_out)
                                     try:
                                         self._drain_runner_future(future, prev_sched_out)
                                     except Exception as e:
@@ -1348,7 +1343,14 @@ class EngineLifecycleMixin:
                 sampled tokens back to the right requests.
         """
         wait_start = time.perf_counter()
-        model_output = self.runner.wait_for_execution(future)
+        if isinstance(future, StepHandle):
+            coordinator = getattr(self, "_step_coordinator", None)
+            if coordinator is not None:
+                model_output = coordinator.drain(future)
+            else:
+                model_output = self.runner.wait_for_execution(future.runner_handle)
+        else:
+            model_output = self.runner.wait_for_execution(future)
         wait_time = time.perf_counter() - wait_start
         total_tokens = int(getattr(scheduler_output, "total_num_scheduled_tokens", 0) or 0)
         update_start = time.perf_counter()

@@ -40,13 +40,25 @@ Exports:
 """
 
 from .controller import DistributedController, StepDispatch, resolve_distributed_role
+from .coordinator import (
+    DistributedControllerCoordinator,
+    LocalCoordinator,
+    StepCoordinationError,
+    StepCoordinator,
+    StepHandle,
+)
 from .discovery import DiscoveryResult, resolve_service_hosts
 from .protocol import compute_sampled_digest, make_config_fingerprint
 
 __all__ = (
     "DiscoveryResult",
     "DistributedController",
+    "DistributedControllerCoordinator",
+    "LocalCoordinator",
+    "StepCoordinationError",
+    "StepCoordinator",
     "StepDispatch",
+    "StepHandle",
     "compute_sampled_digest",
     "make_config_fingerprint",
     "resolve_distributed_role",
