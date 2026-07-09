@@ -67,7 +67,6 @@ import subprocess
 import threading
 import time
 import typing
-from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cached_property
@@ -99,6 +98,7 @@ from .config import (
 )
 from .distributed import DistributedController, make_config_fingerprint, resolve_distributed_role
 from .engine import build_engine_assets
+from .engine.registry import RequestRegistry
 from .logger import logger
 from .mixins import (
     EngineIOMixin,
@@ -774,26 +774,28 @@ class eSurge(
         self.decode_interval_tokens = DEFAULT_DECODE_INTERVAL_TOKENS
         self.decode_interval_secs = DEFAULT_DECODE_INTERVAL_SECS
 
-        # State
+        # Request-scoped state lives in the registry; the attribute names
+        # below alias its containers/locks for the mixins until each concern
+        # moves into its own component.
         self._request_counter = 0
-        self._active_requests: dict[str, dict] = {}
-        self._request_outputs: dict[str, RequestOutput] = {}
-        self._max_request_outputs = self.worker_config.max_request_outputs
-        self._finished_request_ids: deque[str] = deque()
+        self._registry = RequestRegistry(max_outputs=self.worker_config.max_request_outputs)
+        self._active_requests = self._registry.records
+        self._request_outputs = self._registry.outputs
+        self._request_events = self._registry.events
+        self._max_request_outputs = self._registry.max_outputs
+        self._finished_request_ids = self._registry.finished_ids
+        self._request_lock = self._registry.request_lock
+        self._output_lock = self._registry.output_lock
+        self._output_event = self._registry.output_event  # kept for generate()
         self._engine_output_queue: queue.Queue = queue.Queue()
         self._engine_output_thread: threading.Thread | None = None
         self._parser_stop_queue: queue.SimpleQueue[dict[str, str]] = queue.SimpleQueue()
 
-        # Per-request events to support many concurrent streams
-        self._request_events: dict[str, threading.Event] = {}
         self.extra_eos_token_ids = self.parsing_config.extra_eos_token_ids or []
         self.extra_stops = self._normalize_stop_sequences(self.parsing_config.extra_stops)
         # Locks and signals
         self._scheduler_lock = threading.RLock()
-        self._request_lock = threading.RLock()
-        self._output_lock = threading.RLock()
         self._counter_lock = threading.Lock()
-        self._output_event = threading.Event()  # kept for generate()
 
         # Scheduler thread
         self._scheduler_thread: threading.Thread | None = None

@@ -14,6 +14,7 @@
 
 import threading
 
+from easydel.inference.esurge.engine.registry import RequestRecord
 from easydel.inference.esurge.mixins.io import EngineIOMixin
 from easydel.inference.esurge.mixins.parsing import EngineParsingMixin
 from easydel.inference.esurge.mixins.requests import EngineRequestsMixin
@@ -198,7 +199,7 @@ def test_run_output_parsers_uses_request_tools_for_batch_tool_parsing():
     engine = _ParsingHarness()
     parser = _RecordingToolParser()
     request = _make_request()
-    rd = {
+    rd = RequestRecord(**{
         "delegating_parser": DelegatingParser(
             reasoning_parser=None,
             tool_parser=parser,
@@ -206,7 +207,7 @@ def test_run_output_parsers_uses_request_tools_for_batch_tool_parsing():
         ),
         "parser_previous_text": "",
         "parser_previous_token_ids": [],
-    }
+    })
 
     result = engine._run_output_parsers(
         rd=rd,
@@ -226,7 +227,7 @@ def test_run_output_parsers_uses_request_tools_for_streaming_tool_parsing():
     engine = _ParsingHarness()
     parser = _RecordingToolParser()
     request = _make_request()
-    rd = {
+    rd = RequestRecord(**{
         "delegating_parser": DelegatingParser(
             reasoning_parser=None,
             tool_parser=parser,
@@ -234,7 +235,7 @@ def test_run_output_parsers_uses_request_tools_for_streaming_tool_parsing():
         ),
         "parser_previous_text": "",
         "parser_previous_token_ids": [],
-    }
+    })
 
     result = engine._run_output_parsers(
         rd=rd,
@@ -284,7 +285,7 @@ def test_add_request_creates_delegating_parser_for_single_request():
     )
 
     request_state = engine._active_requests["req-1"]
-    dp = request_state["delegating_parser"]
+    dp = request_state.delegating_parser
     assert dp is not None
     assert isinstance(dp, DelegatingParser)
     assert dp.tool_parser is not None
@@ -368,11 +369,11 @@ def test_build_tool_parser_request_normalizes_nested_function():
 def test_run_output_parsers_no_delegating_parser():
     """When rd has no delegating_parser, should return passthrough result."""
     engine = _ParsingHarness()
-    rd = {
+    rd = RequestRecord(**{
         "delegating_parser": None,
         "parser_previous_text": "",
         "parser_previous_token_ids": [],
-    }
+    })
     result = engine._run_output_parsers(
         rd=rd,
         accumulated_text="hello world",

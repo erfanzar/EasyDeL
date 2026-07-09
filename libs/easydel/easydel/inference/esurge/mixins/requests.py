@@ -35,6 +35,7 @@ from easydel.inference.parsing import DelegatingParser
 from easydel.inference.sampling_params import SamplingParams
 from easydel.inference.tools.tool_calling_mixin import build_tool_parser_or_none
 
+from ..engine.registry import RequestRecord
 from ..logger import logger
 from ..metrics import get_metrics_collector, log_metrics_summary
 from ..request import EngineRequest, EngineRequestStatus
@@ -330,28 +331,19 @@ class EngineRequestsMixin:
 
         with self._request_lock:
             self._request_events[request_id] = ev
-            self._active_requests[request_id] = {
-                "prompt": prompt_for_engine,
-                "prompt_token_ids": token_ids,
-                "sampling_params": sampling_params,
-                "generated_tokens": [],
-                "decodable_tokens": [],
-                "reported_generated_count": 0,
-                "last_decoded_index": 0,
-                "start_time": start_ts,
-                "first_token_time": None,
-                "last_decode_time": start_ts,
-                "decoder_visible_text": "",
-                "truncated": truncated,
-                "tokens_dropped": tokens_dropped,
-                "requested_new_tokens_original": original_requested_new,
-                "requested_new_tokens_final": requested_new,
-                "reserve_tokens": self.reserve_tokens,
-                "max_model_len": max_model_len,
-                "delegating_parser": None,  # set below after prompt context config
-                "parser_previous_text": "",
-                "parser_previous_token_ids": [],
-            }
+            self._active_requests[request_id] = RequestRecord(
+                prompt=prompt_for_engine,
+                prompt_token_ids=token_ids,
+                sampling_params=sampling_params,
+                start_time=start_ts,
+                last_decode_time=start_ts,
+                truncated=truncated,
+                tokens_dropped=tokens_dropped,
+                requested_new_tokens_original=original_requested_new,
+                requested_new_tokens_final=requested_new,
+                reserve_tokens=self.reserve_tokens,
+                max_model_len=max_model_len,
+            )
             _rp = self._reasoning_parser_class(self.tokenizer) if self._reasoning_parser_class else None
             self._configure_reasoning_parser_for_prompt(
                 reasoning_parser=_rp,
@@ -359,7 +351,7 @@ class EngineRequestsMixin:
                 prompt_token_ids=token_ids,
             )
             _tp = build_tool_parser_or_none(self._tool_parser_class, self.tokenizer, context=f"request {request_id}")
-            self._active_requests[request_id]["delegating_parser"] = DelegatingParser(
+            self._active_requests[request_id].delegating_parser = DelegatingParser(
                 reasoning_parser=_rp,
                 tool_parser=_tp,
                 tool_request=tool_parser_request,
@@ -454,30 +446,21 @@ class EngineRequestsMixin:
                 # IMPORTANT: Create a fresh dict for each sample to avoid sharing mutable objects
                 with self._request_lock:
                     self._request_events[child_request_id] = self._request_events[request_id]
-                    self._active_requests[child_request_id] = {
-                        "prompt": prompt_for_engine,
-                        "prompt_token_ids": token_ids,
-                        "sampling_params": sampling_params,
-                        "generated_tokens": [],  # Fresh list for each sample
-                        "decodable_tokens": [],
-                        "reported_generated_count": 0,
-                        "last_decoded_index": 0,
-                        "start_time": start_ts,
-                        "first_token_time": None,
-                        "last_decode_time": start_ts,
-                        "decoder_visible_text": "",
-                        "truncated": truncated,
-                        "tokens_dropped": tokens_dropped,
-                        "requested_new_tokens_original": original_requested_new,
-                        "requested_new_tokens_final": requested_new,
-                        "reserve_tokens": self.reserve_tokens,
-                        "max_model_len": max_model_len,
-                        "sample_index": sample_idx,
-                        "parent_request_id": request_id,
-                        "delegating_parser": None,  # set below
-                        "parser_previous_text": "",
-                        "parser_previous_token_ids": [],
-                    }
+                    self._active_requests[child_request_id] = RequestRecord(
+                        prompt=prompt_for_engine,
+                        prompt_token_ids=token_ids,
+                        sampling_params=sampling_params,
+                        start_time=start_ts,
+                        last_decode_time=start_ts,
+                        truncated=truncated,
+                        tokens_dropped=tokens_dropped,
+                        requested_new_tokens_original=original_requested_new,
+                        requested_new_tokens_final=requested_new,
+                        reserve_tokens=self.reserve_tokens,
+                        max_model_len=max_model_len,
+                        sample_index=sample_idx,
+                        parent_request_id=request_id,
+                    )
                     _rp2 = self._reasoning_parser_class(self.tokenizer) if self._reasoning_parser_class else None
                     self._configure_reasoning_parser_for_prompt(
                         reasoning_parser=_rp2,
@@ -487,7 +470,7 @@ class EngineRequestsMixin:
                     _tp2 = build_tool_parser_or_none(
                         self._tool_parser_class, self.tokenizer, context=f"request {child_request_id}"
                     )
-                    self._active_requests[child_request_id]["delegating_parser"] = DelegatingParser(
+                    self._active_requests[child_request_id].delegating_parser = DelegatingParser(
                         reasoning_parser=_rp2,
                         tool_parser=_tp2,
                         tool_request=tool_parser_request,
@@ -610,8 +593,8 @@ class EngineRequestsMixin:
             rd = self._active_requests.get(request_id)
             rd_present = rd is not None
             if rd is not None:
-                parent_request_id = rd.get("parent_request_id", request_id)
-                sample_index = int(rd.get("sample_index", 0) or 0)
+                parent_request_id = rd.parent_request_id or request_id
+                sample_index = int(rd.sample_index or 0)
 
             # Resolve scheduler-side IDs to abort (n=1: request_id; n>1: children of parent)
             if request_id in self.scheduler.requests:

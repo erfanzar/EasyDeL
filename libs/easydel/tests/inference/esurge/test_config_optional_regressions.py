@@ -20,6 +20,7 @@ import jax.numpy as jnp
 import pytest
 import spectrax as spx
 from easydel.inference.esurge.core.interface import CacheGroupsConfig, CacheGroupSpec, FullAttentionSpec
+from easydel.inference.esurge.engine.registry import RequestRecord
 from easydel.inference.esurge.mixins.parsing import EngineParsingMixin
 from easydel.inference.esurge.mixins.utils import EngineUtilsMixin
 from easydel.inference.esurge.request import EngineRequest, EngineRequestStatus
@@ -796,16 +797,13 @@ def test_stop_strings_can_ignore_matches_inside_reasoning():
     """Parser-aware stop matching should only inspect visible content."""
     harness = _ParsingHarness()
     raw_output = "<think>plan\nif guard</think>def answer():\n    return 1\nif __name__ == '__main__':\n    pass"
-    request_data = {
-        "sampling_params": SamplingParams(
+    request_data = RequestRecord(
+        sampling_params=SamplingParams(
             stop=["\nif"],
             ignore_stop_strings_in_reasoning=True,
         ),
-        "delegating_parser": DelegatingParser(reasoning_parser=Qwen3ReasoningParser(_DummyTokenizer())),
-        "parser_previous_text": "",
-        "parser_previous_token_ids": [],
-        "decoder_visible_text": "",
-    }
+        delegating_parser=DelegatingParser(reasoning_parser=Qwen3ReasoningParser(_DummyTokenizer())),
+    )
 
     parsed, visible_text, visible_delta, stop_hit, stop_reason = harness._parse_with_stop_string_policy(
         request_data,
