@@ -14,16 +14,26 @@
 
 """Speculative-decoding support for the eSurge runner.
 
-The runner-native drafter path (draft/verify/commit inside
-:class:`~easydel.inference.esurge.runners.model_runner.eSurgeRunner`) is the
-production speculative-decoding implementation. This package holds its
-shared, model-agnostic helpers.
+The runner-native drafter path is the production speculative-decoding
+implementation. It is packaged as a pluggable strategy driven by
+:class:`~easydel.inference.esurge.runners.model_runner.eSurgeRunner`:
+
+- :class:`SpeculativeStrategy` / :class:`NullSpeculation` (interface.py) —
+  the strategy protocol and the inert no-drafter implementation.
+- :class:`DrafterSpeculation` (strategy.py) — the drafter-backed
+  draft/verify/commit machinery.
+- support.py — shared, model-agnostic helpers.
 """
 
+from .interface import NullSpeculation, SpeculativeStrategy
+from .strategy import DrafterSpeculation
 from .support import SpecDecodeStats, build_target_kv_pairs, default_assistant_layer_mapping
 
 __all__ = (
+    "DrafterSpeculation",
+    "NullSpeculation",
     "SpecDecodeStats",
+    "SpeculativeStrategy",
     "build_target_kv_pairs",
     "default_assistant_layer_mapping",
 )
