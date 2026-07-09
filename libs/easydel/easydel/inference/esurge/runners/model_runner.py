@@ -104,6 +104,7 @@ from .sequence_buffer import (
     pack_prompts,
     swap_rows,
 )
+from .slot_pool import RecurrentSlotPool
 from .states import CachedRequestState
 
 if typing.TYPE_CHECKING:
@@ -573,120 +574,52 @@ class eSurgeRunner:
     def _uses_recurrent_slot_pool(self) -> bool:
         """Whether requests are pinned to pooled physical state slots.
 
-        True under rank-major SPMD DP (per-rank slot blocks) and for
-        slot-indexed state families (compressed-window caches), where the
-        request's state row must survive SequenceBuffer row moves.
+        Delegates to :meth:`RecurrentSlotPool.is_enabled`.
         """
-        return self._uses_spmd_dp() or self._slot_indexed_state
+        return self.slot_pool.is_enabled()
 
     def _recurrent_rows_per_dp_rank(self) -> int:
         """Return the number of recurrent-state rows owned by each DP rank.
 
-        Splits the runner's ``max_num_reqs`` recurrent slots evenly across the
-        data-parallel cache axis so each rank gets a contiguous block of rows.
-
-        Returns:
-            ``max_num_reqs // data_parallel_size`` as an int.
-
-        Raises:
-            ValueError: If ``max_num_reqs`` is not divisible by the DP size.
+        Delegates to :meth:`RecurrentSlotPool.rows_per_dp_rank`.
         """
-        dp_size = max(1, int(getattr(self.metadata, "data_parallel_size", 1) or 1))
-        if int(self.max_num_reqs) % dp_size != 0:
-            raise ValueError(
-                "Rank-major SPMD DP requires recurrent slots divisible by DP size: "
-                f"max_num_reqs={self.max_num_reqs}, dp_size={dp_size}."
-            )
-        return int(self.max_num_reqs) // dp_size
+        return self.slot_pool.rows_per_dp_rank()
 
     def _reset_recurrent_slot_pools(self) -> None:
-        """Initialize physical recurrent-state slots partitioned by DP rank."""
-        self._recurrent_slot_by_req: dict[str, int] = {}
-        self._request_dp_rank_by_req: dict[str, int] = {}
-        dp_size = max(1, int(getattr(self.metadata, "data_parallel_size", 1) or 1))
-        if not self._uses_spmd_dp():
-            self._free_recurrent_slots_by_rank = [list(range(int(self.max_num_reqs)))]
-            return
-        rows_per_rank = self._recurrent_rows_per_dp_rank()
-        self._free_recurrent_slots_by_rank = [
-            list(range(rank * rows_per_rank, (rank + 1) * rows_per_rank)) for rank in range(dp_size)
-        ]
+        """Initialize physical recurrent-state slots partitioned by DP rank.
+
+        Delegates to :meth:`RecurrentSlotPool.reset`.
+        """
+        self.slot_pool.reset()
 
     def _assign_recurrent_slot(self, req_id: str, dp_rank: int | None) -> int | None:
         """Assign or return the stable physical recurrent-state slot for a request.
 
-        Under rank-major SPMD DP, each request must keep a fixed recurrent-state
-        row within its DP rank's contiguous slot block. If the request already
-        owns a slot, that slot is returned unchanged; otherwise a free slot in
-        the target rank is allocated and recorded.
-
-        Args:
-            req_id: Request identifier to assign a slot for.
-            dp_rank: Target DP rank for the request, or ``None`` to default to
-                rank ``0``.
-
-        Returns:
-            The physical recurrent-state slot index, or ``None`` when the runner
-            uses neither SPMD DP nor slot-indexed state (no slot pools exist).
-
-        Raises:
-            RuntimeError: If an existing slot's inferred rank disagrees with the
-                provided ``dp_rank``, if ``dp_rank`` is out of range, or if no
-                free slot remains in the target rank.
+        Delegates to :meth:`RecurrentSlotPool.assign_slot`.
         """
-        if not self._uses_recurrent_slot_pool():
-            return None
-        existing = self._recurrent_slot_by_req.get(req_id)
-        rows_per_rank = self._recurrent_rows_per_dp_rank()
-        dp_size = max(1, int(getattr(self.metadata, "data_parallel_size", 1) or 1))
-        if existing is not None:
-            existing_rank = min(max(int(existing), 0) // rows_per_rank, dp_size - 1)
-            if dp_rank is not None and existing_rank != int(dp_rank):
-                raise RuntimeError(
-                    "Existing recurrent slot rank does not match scheduler DP rank: "
-                    f"req_id={req_id} slot={existing} slot_rank={existing_rank} dp_rank={dp_rank}."
-                )
-            return int(existing)
-
-        rank = 0 if dp_rank is None else int(dp_rank)
-        if rank < 0 or rank >= len(self._free_recurrent_slots_by_rank):
-            raise RuntimeError(f"Invalid DP rank for recurrent slot assignment: req_id={req_id} dp_rank={rank}.")
-        free_slots = self._free_recurrent_slots_by_rank[rank]
-        if not free_slots:
-            raise RuntimeError(f"No free recurrent state slots in DP rank {rank} for request {req_id}.")
-        slot = int(free_slots.pop(0))
-        self._recurrent_slot_by_req[req_id] = slot
-        self._request_dp_rank_by_req[req_id] = rank
-        return slot
+        return self.slot_pool.assign_slot(req_id, dp_rank)
 
     def _release_recurrent_slot(self, req_id: str, *, forget_rank: bool) -> int | None:
         """Release a request's physical recurrent-state slot and return it for clearing.
 
-        Pops the request's slot mapping and, under SPMD DP, returns the slot to
-        its owning rank's free list (kept sorted). The returned slot index lets
-        the caller schedule a state clear for the freed row.
-
-        Args:
-            req_id: Request identifier whose slot should be released.
-            forget_rank: When True, also drop the request's recorded DP rank
-                (used for finished requests; preemptions keep the rank).
-
-        Returns:
-            The released slot index, or ``None`` when the request held no slot.
+        Delegates to :meth:`RecurrentSlotPool.release_slot`.
         """
-        slot = self._recurrent_slot_by_req.pop(req_id, None)
-        if forget_rank:
-            self._request_dp_rank_by_req.pop(req_id, None)
-        if slot is None or not self._uses_recurrent_slot_pool():
-            return slot
-        rows_per_rank = self._recurrent_rows_per_dp_rank()
-        dp_size = max(1, int(getattr(self.metadata, "data_parallel_size", 1) or 1))
-        rank = min(max(int(slot), 0) // rows_per_rank, dp_size - 1)
-        free_slots = self._free_recurrent_slots_by_rank[rank]
-        if int(slot) not in free_slots:
-            free_slots.append(int(slot))
-            free_slots.sort()
-        return int(slot)
+        return self.slot_pool.release_slot(req_id, forget_rank=forget_rank)
+
+    @property
+    def _recurrent_slot_by_req(self) -> dict[str, int]:
+        """Live request-id to physical-slot map (see :class:`RecurrentSlotPool`)."""
+        return self.slot_pool.slot_by_req
+
+    @property
+    def _request_dp_rank_by_req(self) -> dict[str, int]:
+        """Live request-id to DP-rank map (see :class:`RecurrentSlotPool`)."""
+        return self.slot_pool.dp_rank_by_req
+
+    @property
+    def _free_recurrent_slots_by_rank(self) -> list[list[int]]:
+        """Per-rank free-lists of physical slots (see :class:`RecurrentSlotPool`)."""
+        return self.slot_pool.free_slots_by_rank
 
     def _build_kv_cache_groups(self):
         """Build cache-group specs for runtime-cap and scheduler estimation.
@@ -1191,7 +1124,11 @@ class eSurgeRunner:
             page_sizes=[self.metadata.page_size] * num_cache_groups,
             sharding=self._empty_sharding,
         )
-        self._reset_recurrent_slot_pools()
+        self.slot_pool = RecurrentSlotPool(
+            metadata=self.metadata,
+            max_num_reqs=self.max_num_reqs,
+            slot_indexed_state=self._slot_indexed_state,
+        )
 
         self.arange = jnp.arange(self.max_num_tokens, dtype=jnp.int32)
         self.arange_np = jnp.arange(self.max_num_reqs, dtype=jnp.int32)
