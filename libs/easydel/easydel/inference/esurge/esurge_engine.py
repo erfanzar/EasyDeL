@@ -128,6 +128,7 @@ from .metrics import get_metrics_collector, log_metrics_summary
 from .multimodal import MultiModalManager
 from .request import EngineRequestStatus
 from .runners import eSurgeRunner
+from .runners.host_sync import mark_host_payloads_replicated
 from .scheduler import Scheduler
 
 if typing.TYPE_CHECKING:
@@ -851,6 +852,10 @@ class eSurge:
         self.distributed_role = "leader" if self._step_coordinator.is_leader else "worker"
         self.distributed_rank = int(self._step_coordinator.rank)
         self.distributed_world_size = int(self._step_coordinator.world_size)
+        if self.distributed_world_size > 1:
+            # The step-replication plane makes host payloads identical by
+            # construction; skip the per-step broadcast_one_to_all collectives.
+            mark_host_payloads_replicated(True)
 
         self.initiate()
 
