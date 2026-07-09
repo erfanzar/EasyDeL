@@ -412,6 +412,14 @@ def to_from_pretrained_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[s
     config_kwargs.pop("partition_axis", None)
     config_kwargs.pop("backend", None)
     config_kwargs.pop("platform", None)
+
+    # `extra_kwargs` entries that are model-config fields (not loader fields)
+    # must ride inside config_kwargs: the pretrained loaders validate their
+    # kwargs against PreTrainedLoading, which rejects unknown top-level
+    # fields like the reward-model `num_labels`.
+    extra_kwargs = dict(model.get("extra_kwargs") or {})
+    if "num_labels" in extra_kwargs:
+        config_kwargs["num_labels"] = extra_kwargs.pop("num_labels")
     quant_model = quant.get("model")
     if quant_model is not None:
         quant_model = QuantizationConfig(**quant_model)
@@ -448,7 +456,7 @@ def to_from_pretrained_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[s
         checkpoint_load_progress=loader.get("checkpoint_load_progress"),
         from_torch=loader.get("from_torch"),
         trust_remote_code=loader.get("trust_remote_code", False),
-        **(model.get("extra_kwargs") or {}),
+        **extra_kwargs,
     )
 
 
@@ -526,6 +534,14 @@ def to_load_state_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[str, A
     config_kwargs.pop("partition_axis", None)
     config_kwargs.pop("backend", None)
     config_kwargs.pop("platform", None)
+
+    # `extra_kwargs` entries that are model-config fields (not loader fields)
+    # must ride inside config_kwargs: the pretrained loaders validate their
+    # kwargs against PreTrainedLoading, which rejects unknown top-level
+    # fields like the reward-model `num_labels`.
+    extra_kwargs = dict(model.get("extra_kwargs") or {})
+    if "num_labels" in extra_kwargs:
+        config_kwargs["num_labels"] = extra_kwargs.pop("num_labels")
     quant_model = quant.get("model")
     if quant_model is not None:
         quant_model = QuantizationConfig(**quant_model)
@@ -563,7 +579,7 @@ def to_load_state_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[str, A
             loader.get("checkpoint_load_tensorstore_metadata_workers", 256)
         ),
         checkpoint_load_progress=loader.get("checkpoint_load_progress"),
-        **(model.get("extra_kwargs") or {}),
+        **extra_kwargs,
     )
 
 
