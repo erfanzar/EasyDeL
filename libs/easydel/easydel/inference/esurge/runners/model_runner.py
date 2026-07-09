@@ -139,6 +139,33 @@ class _SpecVerifyMetadata:
         return len(self.buffer_draft_tokens)
 
 
+def _window_hidden_row(
+    hidden_states: jax.Array,
+    *,
+    row_pos: int,
+    token_offset: int,
+    token_index: int,
+    total_window_tokens: int,
+    padded_reqs: int,
+) -> jax.Array:
+    """Return the hidden row for a window token, tolerating old gathered outputs."""
+    hidden_len = int(hidden_states.shape[0])
+    full_index = int(token_offset) + int(token_index)
+    if hidden_len >= int(total_window_tokens) and 0 <= full_index < hidden_len:
+        return hidden_states[full_index]
+    if hidden_len >= int(padded_reqs) and 0 <= int(row_pos) < hidden_len:
+        return hidden_states[int(row_pos)]
+    return hidden_states[min(max(full_index, 0), hidden_len - 1)]
+
+
+def _copy_kv_tree(kv_pages: typing.Any) -> typing.Any:
+    """Return a deep copy of every device array leaf in a KV-pages pytree."""
+    return jax.tree_util.tree_map(
+        lambda leaf: jnp.array(leaf, copy=True) if isinstance(leaf, jax.Array) else leaf,
+        kv_pages,
+    )
+
+
 class _AsyncExecutionHandle:
     """Deferred host-materialized model output for overlap execution.
 
@@ -374,6 +401,8 @@ class eSurgeRunner:
         self._spec_recurrent_commit_candidate_count: int = 0
         self.spec_decode_reject_backoff_steps = 0
         self._spec_decode_backoff_by_req: dict[str, int] = {}
+        self._spec_suffix_time_acc = 0.0
+        self._spec_replay_time_acc = 0.0
         logger.debug(f"Initializing eSurgeRunner with {max_model_len=}, {max_num_seqs=}")
         logger.debug(f"Configuration: {hbm_utilization=}, {page_size=}")
         self.pipeline_plan = build_pipeline_inference_plan(
@@ -3242,6 +3271,302 @@ class eSurgeRunner:
             wait_for_outputs=True,
         )
 
+    def _spec_run_suffix_sample(
+        self,
+        row_pos: int,
+        start_len: int,
+        suffix_len: int = 1,
+        *,
+        num_computed_tokens_window_cpu,
+        window_row_indices_cpu,
+        recurrent_slot_indices_cpu,
+        padded_num_reqs,
+        token_ids_window_cpu,
+        temperature_window_cpu,
+        top_p_window_cpu,
+        top_k_window_cpu,
+        min_p_window_cpu,
+        frequency_penalties_window_cpu,
+        presence_penalties_window_cpu,
+        repetition_penalties_window_cpu,
+        page_table_window_cpu,
+        page_table_window_version,
+        mrope_position_ids_cpu,
+        prefill_embeds_cpu,
+        prefill_embeds_mask_cpu,
+        visual_pos_masks_cpu,
+        deepstack_visual_embeds_cpu,
+    ) -> tuple[int, jax.Array]:
+        """Execute a one-row suffix forward pass and return the sampled token + hidden row.
+
+        Used by speculative decoding after a rejected prefix to re-sample
+        the corrective token at the rejection boundary without touching
+        any other window row.
+        """
+        suffix_timer_start = time.time()
+        suffix_scheduled = self._scheduled_full_cpu.copy()
+        suffix_scheduled.fill(0)
+        suffix_scheduled[int(row_pos)] = int(suffix_len)
+
+        suffix_active = self._active_mask_full_cpu.copy()
+        suffix_active.fill(False)
+        suffix_active[int(row_pos)] = True
+
+        suffix_num_computed = np.asarray(num_computed_tokens_window_cpu).copy()
+        suffix_num_computed[int(row_pos)] = int(num_computed_tokens_window_cpu[int(row_pos)]) + int(start_len)
+
+        suffix_req_num_tokens = np.asarray(num_computed_tokens_window_cpu).copy()
+        suffix_req_num_tokens[int(row_pos)] = (
+            int(num_computed_tokens_window_cpu[int(row_pos)]) + int(start_len) + int(suffix_len)
+        )
+
+        total_suffix = int(suffix_len)
+        suffix_idx = bisect_left(self.num_tokens_paddings, total_suffix)
+        if suffix_idx >= len(self.num_tokens_paddings):
+            suffix_idx = len(self.num_tokens_paddings) - 1
+        suffix_num_tokens_static = int(self.num_tokens_paddings[suffix_idx])
+
+        out_tokens_suffix, _, _, _, hidden_suffix, _, _ = self.executor_manager.execute(
+            num_tokens=suffix_num_tokens_static,
+            scheduled_full_cpu=suffix_scheduled,
+            req_num_tokens_full_cpu=suffix_req_num_tokens,
+            active_mask_full_cpu=suffix_active,
+            window_row_indices_cpu=window_row_indices_cpu,
+            recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,
+            input_ids_buf=self.input_ids_buf,
+            position_ids_buf=self.position_ids_buf,
+            padded_num_reqs=padded_num_reqs,
+            token_ids_cpu=token_ids_window_cpu,
+            num_computed_tokens_cpu=suffix_num_computed,
+            temperature_cpu=temperature_window_cpu,
+            top_p_cpu=top_p_window_cpu,
+            top_k_cpu=top_k_window_cpu,
+            min_p_cpu=min_p_window_cpu,
+            frequency_penalties_cpu=frequency_penalties_window_cpu,
+            presence_penalties_cpu=presence_penalties_window_cpu,
+            repetition_penalties_cpu=repetition_penalties_window_cpu,
+            page_table_cpu=page_table_window_cpu,
+            page_table_version=page_table_window_version,
+            mrope_position_ids_cpu=mrope_position_ids_cpu,
+            prefill_embeds_cpu=prefill_embeds_cpu,
+            prefill_embeds_mask_cpu=prefill_embeds_mask_cpu,
+            visual_pos_masks_cpu=visual_pos_masks_cpu,
+            deepstack_visual_embeds_cpu=deepstack_visual_embeds_cpu,
+            wait_for_outputs=True,
+        )
+        suffix_token = int(np.asarray(out_tokens_suffix)[int(row_pos)])
+        suffix_hidden = _window_hidden_row(
+            hidden_suffix,
+            row_pos=int(row_pos),
+            token_offset=0,
+            token_index=max(0, int(suffix_len) - 1),
+            total_window_tokens=int(suffix_len),
+            padded_reqs=int(padded_num_reqs),
+        )
+        self._spec_suffix_time_acc += time.time() - suffix_timer_start
+        return suffix_token, suffix_hidden
+
+    def _spec_replay_prefix_sample(
+        self,
+        row_pos: int,
+        prefix_len: int,
+        *,
+        pre_step_kv_pages,
+        num_computed_tokens_window_cpu,
+        num_tokens_static,
+        window_row_indices_cpu,
+        recurrent_slot_indices_cpu,
+        padded_num_reqs,
+        token_ids_window_cpu,
+        temperature_window_cpu,
+        top_p_window_cpu,
+        top_k_window_cpu,
+        min_p_window_cpu,
+        frequency_penalties_window_cpu,
+        presence_penalties_window_cpu,
+        repetition_penalties_window_cpu,
+        page_table_window_cpu,
+        page_table_window_version,
+        mrope_position_ids_cpu,
+        prefill_embeds_cpu,
+        prefill_embeds_mask_cpu,
+        visual_pos_masks_cpu,
+        deepstack_visual_embeds_cpu,
+        window_token_offsets,
+        total_scheduled,
+        rng_after_verify,
+    ) -> tuple[int, jax.Array]:
+        """Replay the accepted speculative prefix in one fused forward pass.
+
+        Restores the pre-spec KV snapshot, then re-runs the row with
+        ``prefix_len`` scheduled tokens so the cache is advanced exactly
+        through the accepted positions before the next decode step.
+        """
+        replay_timer_start = time.time()
+        if pre_step_kv_pages is None:
+            raise RuntimeError("Speculative replay requires a pre-step KV snapshot.")
+        replay_scheduled = self._scheduled_full_cpu.copy()
+        replay_scheduled.fill(0)
+        replay_scheduled[int(row_pos)] = int(prefix_len)
+
+        replay_active = self._active_mask_full_cpu.copy()
+        replay_active.fill(False)
+        replay_active[int(row_pos)] = True
+
+        replay_req_num_tokens = np.asarray(num_computed_tokens_window_cpu).copy()
+        replay_req_num_tokens[int(row_pos)] = int(num_computed_tokens_window_cpu[int(row_pos)]) + int(prefix_len)
+
+        self.executor_manager.kv_pages = _copy_kv_tree(pre_step_kv_pages)
+        out_tokens_replay, _, _, _, hidden_replay, _, _ = self.executor_manager.execute(
+            num_tokens=num_tokens_static,
+            scheduled_full_cpu=replay_scheduled,
+            req_num_tokens_full_cpu=replay_req_num_tokens,
+            active_mask_full_cpu=replay_active,
+            window_row_indices_cpu=window_row_indices_cpu,
+            recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,
+            input_ids_buf=self.input_ids_buf,
+            position_ids_buf=self.position_ids_buf,
+            padded_num_reqs=padded_num_reqs,
+            token_ids_cpu=token_ids_window_cpu,
+            num_computed_tokens_cpu=num_computed_tokens_window_cpu,
+            temperature_cpu=temperature_window_cpu,
+            top_p_cpu=top_p_window_cpu,
+            top_k_cpu=top_k_window_cpu,
+            min_p_cpu=min_p_window_cpu,
+            frequency_penalties_cpu=frequency_penalties_window_cpu,
+            presence_penalties_cpu=presence_penalties_window_cpu,
+            repetition_penalties_cpu=repetition_penalties_window_cpu,
+            page_table_cpu=page_table_window_cpu,
+            page_table_version=page_table_window_version,
+            mrope_position_ids_cpu=mrope_position_ids_cpu,
+            prefill_embeds_cpu=prefill_embeds_cpu,
+            prefill_embeds_mask_cpu=prefill_embeds_mask_cpu,
+            visual_pos_masks_cpu=visual_pos_masks_cpu,
+            deepstack_visual_embeds_cpu=deepstack_visual_embeds_cpu,
+            wait_for_outputs=True,
+        )
+        replay_token = int(np.asarray(out_tokens_replay)[int(row_pos)])
+        replay_hidden = _window_hidden_row(
+            hidden_replay,
+            row_pos=int(row_pos),
+            token_offset=int(window_token_offsets[int(row_pos)]),
+            token_index=int(prefix_len) - 1,
+            total_window_tokens=int(total_scheduled),
+            padded_reqs=int(padded_num_reqs),
+        )
+        if rng_after_verify is not None:
+            self.executor_manager.rng_key = rng_after_verify
+        self._spec_replay_time_acc += time.time() - replay_timer_start
+        return replay_token, replay_hidden
+
+    def _spec_replay_prefix_sequential(
+        self,
+        row_pos: int,
+        prefix_len: int,
+        *,
+        pre_step_kv_pages,
+        num_computed_tokens_window_cpu,
+        window_row_indices_cpu,
+        recurrent_slot_indices_cpu,
+        padded_num_reqs,
+        token_ids_window_cpu,
+        temperature_window_cpu,
+        top_p_window_cpu,
+        top_k_window_cpu,
+        min_p_window_cpu,
+        frequency_penalties_window_cpu,
+        presence_penalties_window_cpu,
+        repetition_penalties_window_cpu,
+        page_table_window_cpu,
+        page_table_window_version,
+        mrope_position_ids_cpu,
+        prefill_embeds_cpu,
+        prefill_embeds_mask_cpu,
+        visual_pos_masks_cpu,
+        deepstack_visual_embeds_cpu,
+        rng_after_verify,
+    ) -> tuple[int, jax.Array]:
+        """Replay an accepted speculative prefix one token at a time.
+
+        Used when the model has recurrent layers that cannot be replayed
+        in a single fused window (no candidate-row cache available). Runs
+        ``prefix_len`` single-token decode steps on top of the pre-spec
+        KV snapshot to advance recurrent state exactly to the boundary.
+        """
+        replay_timer_start = time.time()
+        if pre_step_kv_pages is None:
+            raise RuntimeError("Speculative sequential replay requires a pre-step KV snapshot.")
+        prefix_len = int(prefix_len)
+        if prefix_len <= 0:
+            raise ValueError("prefix_len must be positive for speculative sequential replay.")
+
+        self.executor_manager.kv_pages = _copy_kv_tree(pre_step_kv_pages)
+        replay_scheduled = self._scheduled_full_cpu.copy()
+        replay_active = self._active_mask_full_cpu.copy()
+        replay_num_computed = np.asarray(num_computed_tokens_window_cpu).copy()
+        replay_req_num_tokens = np.asarray(num_computed_tokens_window_cpu).copy()
+        one_token_idx = bisect_left(self.num_tokens_paddings, 1)
+        if one_token_idx >= len(self.num_tokens_paddings):
+            one_token_idx = len(self.num_tokens_paddings) - 1
+        one_token_static = int(self.num_tokens_paddings[one_token_idx])
+
+        replay_token = 0
+        replay_hidden = None
+        for step_idx in range(prefix_len):
+            replay_scheduled.fill(0)
+            replay_scheduled[int(row_pos)] = 1
+            replay_active.fill(False)
+            replay_active[int(row_pos)] = True
+            replay_num_computed[int(row_pos)] = int(num_computed_tokens_window_cpu[int(row_pos)]) + int(step_idx)
+            replay_req_num_tokens[int(row_pos)] = (
+                int(num_computed_tokens_window_cpu[int(row_pos)]) + int(step_idx) + 1
+            )
+
+            out_tokens_replay, _, _, _, hidden_replay, _, _ = self.executor_manager.execute(
+                num_tokens=one_token_static,
+                scheduled_full_cpu=replay_scheduled,
+                req_num_tokens_full_cpu=replay_req_num_tokens,
+                active_mask_full_cpu=replay_active,
+                window_row_indices_cpu=window_row_indices_cpu,
+                recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,
+                input_ids_buf=self.input_ids_buf,
+                position_ids_buf=self.position_ids_buf,
+                padded_num_reqs=padded_num_reqs,
+                token_ids_cpu=token_ids_window_cpu,
+                num_computed_tokens_cpu=replay_num_computed,
+                temperature_cpu=temperature_window_cpu,
+                top_p_cpu=top_p_window_cpu,
+                top_k_cpu=top_k_window_cpu,
+                min_p_cpu=min_p_window_cpu,
+                frequency_penalties_cpu=frequency_penalties_window_cpu,
+                presence_penalties_cpu=presence_penalties_window_cpu,
+                repetition_penalties_cpu=repetition_penalties_window_cpu,
+                page_table_cpu=page_table_window_cpu,
+                page_table_version=page_table_window_version,
+                mrope_position_ids_cpu=mrope_position_ids_cpu,
+                prefill_embeds_cpu=prefill_embeds_cpu,
+                prefill_embeds_mask_cpu=prefill_embeds_mask_cpu,
+                visual_pos_masks_cpu=visual_pos_masks_cpu,
+                deepstack_visual_embeds_cpu=deepstack_visual_embeds_cpu,
+                wait_for_outputs=True,
+            )
+            replay_token = int(np.asarray(out_tokens_replay)[int(row_pos)])
+            replay_hidden = _window_hidden_row(
+                hidden_replay,
+                row_pos=int(row_pos),
+                token_offset=0,
+                token_index=0,
+                total_window_tokens=1,
+                padded_reqs=int(padded_num_reqs),
+            )
+
+        if rng_after_verify is not None:
+            self.executor_manager.rng_key = rng_after_verify
+        self._spec_replay_time_acc += time.time() - replay_timer_start
+        if replay_hidden is None:
+            raise RuntimeError("Speculative sequential replay did not produce hidden state.")
+        return replay_token, replay_hidden
+
     def _execute_model_impl(
         self,
         scheduler_output: SchedulerOutput,
@@ -3401,8 +3726,8 @@ class eSurgeRunner:
         total_token_materialize_time = 0.0
         total_spec_project_time = 0.0
         total_spec_draft_time = 0.0
-        total_spec_suffix_time = 0.0
-        total_spec_replay_time = 0.0
+        self._spec_suffix_time_acc = 0.0
+        self._spec_replay_time_acc = 0.0
         total_spec_commit_time = 0.0
         token_buckets_used: set[int] = set()
         req_buckets_used: set[int] = set()
@@ -3413,31 +3738,6 @@ class eSurgeRunner:
         if self._uses_spmd_dp():
             is_vlm_model = False
         uses_mrope_model = is_vlm_model and model_uses_mrope(self.model)
-
-        def _window_hidden_row(
-            hidden_states: jax.Array,
-            *,
-            row_pos: int,
-            token_offset: int,
-            token_index: int,
-            total_window_tokens: int,
-            padded_reqs: int,
-        ) -> jax.Array:
-            """Return the hidden row for a window token, tolerating old gathered outputs."""
-            hidden_len = int(hidden_states.shape[0])
-            full_index = int(token_offset) + int(token_index)
-            if hidden_len >= int(total_window_tokens) and 0 <= full_index < hidden_len:
-                return hidden_states[full_index]
-            if hidden_len >= int(padded_reqs) and 0 <= int(row_pos) < hidden_len:
-                return hidden_states[int(row_pos)]
-            return hidden_states[min(max(full_index, 0), hidden_len - 1)]
-
-        def _copy_kv_tree(kv_pages: typing.Any) -> typing.Any:
-            """Return a deep copy of every device array leaf in a KV-pages pytree."""
-            return jax.tree_util.tree_map(
-                lambda leaf: jnp.array(leaf, copy=True) if isinstance(leaf, jax.Array) else leaf,
-                kv_pages,
-            )
 
         while start_index < self.sequence_buffer.num_slots:
             host_start = time.time()
@@ -3970,11 +4270,8 @@ class eSurgeRunner:
             spec_window_requires_replay = False
             rng_after_verify = self.executor_manager.rng_key if spec_decode_active_window else None
 
-            def _run_suffix_sample(
-                row_pos: int,
-                start_len: int,
-                suffix_len: int = 1,
-                *,
+            _run_suffix_sample = partial(
+                self._spec_run_suffix_sample,
                 num_computed_tokens_window_cpu=num_computed_tokens_window_cpu,
                 window_row_indices_cpu=window_row_indices_cpu,
                 recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,
@@ -3994,81 +4291,10 @@ class eSurgeRunner:
                 prefill_embeds_mask_cpu=prefill_embeds_mask_cpu,
                 visual_pos_masks_cpu=visual_pos_masks_cpu,
                 deepstack_visual_embeds_cpu=deepstack_visual_embeds_cpu,
-            ) -> tuple[int, jax.Array]:
-                """Execute a one-row suffix forward pass and return the sampled token + hidden row.
+            )
 
-                Used by speculative decoding after a rejected prefix to re-sample
-                the corrective token at the rejection boundary without touching
-                any other window row.
-                """
-                nonlocal total_spec_suffix_time
-                suffix_timer_start = time.time()
-                suffix_scheduled = self._scheduled_full_cpu.copy()
-                suffix_scheduled.fill(0)
-                suffix_scheduled[int(row_pos)] = int(suffix_len)
-
-                suffix_active = self._active_mask_full_cpu.copy()
-                suffix_active.fill(False)
-                suffix_active[int(row_pos)] = True
-
-                suffix_num_computed = np.asarray(num_computed_tokens_window_cpu).copy()
-                suffix_num_computed[int(row_pos)] = int(num_computed_tokens_window_cpu[int(row_pos)]) + int(start_len)
-
-                suffix_req_num_tokens = np.asarray(num_computed_tokens_window_cpu).copy()
-                suffix_req_num_tokens[int(row_pos)] = (
-                    int(num_computed_tokens_window_cpu[int(row_pos)]) + int(start_len) + int(suffix_len)
-                )
-
-                total_suffix = int(suffix_len)
-                suffix_idx = bisect_left(self.num_tokens_paddings, total_suffix)
-                if suffix_idx >= len(self.num_tokens_paddings):
-                    suffix_idx = len(self.num_tokens_paddings) - 1
-                suffix_num_tokens_static = int(self.num_tokens_paddings[suffix_idx])
-
-                out_tokens_suffix, _, _, _, hidden_suffix, _, _ = self.executor_manager.execute(
-                    num_tokens=suffix_num_tokens_static,
-                    scheduled_full_cpu=suffix_scheduled,
-                    req_num_tokens_full_cpu=suffix_req_num_tokens,
-                    active_mask_full_cpu=suffix_active,
-                    window_row_indices_cpu=window_row_indices_cpu,
-                    recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,
-                    input_ids_buf=self.input_ids_buf,
-                    position_ids_buf=self.position_ids_buf,
-                    padded_num_reqs=padded_num_reqs,
-                    token_ids_cpu=token_ids_window_cpu,
-                    num_computed_tokens_cpu=suffix_num_computed,
-                    temperature_cpu=temperature_window_cpu,
-                    top_p_cpu=top_p_window_cpu,
-                    top_k_cpu=top_k_window_cpu,
-                    min_p_cpu=min_p_window_cpu,
-                    frequency_penalties_cpu=frequency_penalties_window_cpu,
-                    presence_penalties_cpu=presence_penalties_window_cpu,
-                    repetition_penalties_cpu=repetition_penalties_window_cpu,
-                    page_table_cpu=page_table_window_cpu,
-                    page_table_version=page_table_window_version,
-                    mrope_position_ids_cpu=mrope_position_ids_cpu,
-                    prefill_embeds_cpu=prefill_embeds_cpu,
-                    prefill_embeds_mask_cpu=prefill_embeds_mask_cpu,
-                    visual_pos_masks_cpu=visual_pos_masks_cpu,
-                    deepstack_visual_embeds_cpu=deepstack_visual_embeds_cpu,
-                    wait_for_outputs=True,
-                )
-                suffix_token = int(np.asarray(out_tokens_suffix)[int(row_pos)])
-                suffix_hidden = _window_hidden_row(
-                    hidden_suffix,
-                    row_pos=int(row_pos),
-                    token_offset=0,
-                    token_index=max(0, int(suffix_len) - 1),
-                    total_window_tokens=int(suffix_len),
-                    padded_reqs=int(padded_num_reqs),
-                )
-                total_spec_suffix_time += time.time() - suffix_timer_start
-                return suffix_token, suffix_hidden
-
-            def _replay_prefix_sample(
-                row_pos: int,
-                prefix_len: int,
-                *,
+            _replay_prefix_sample = partial(
+                self._spec_replay_prefix_sample,
                 pre_step_kv_pages=pre_step_kv_pages,
                 num_computed_tokens_window_cpu=num_computed_tokens_window_cpu,
                 num_tokens_static=num_tokens_static,
@@ -4093,75 +4319,10 @@ class eSurgeRunner:
                 window_token_offsets=window_token_offsets,
                 total_scheduled=total_scheduled,
                 rng_after_verify=rng_after_verify,
-            ) -> tuple[int, jax.Array]:
-                """Replay the accepted speculative prefix in one fused forward pass.
+            )
 
-                Restores the pre-spec KV snapshot, then re-runs the row with
-                ``prefix_len`` scheduled tokens so the cache is advanced exactly
-                through the accepted positions before the next decode step.
-                """
-                nonlocal total_spec_replay_time
-                replay_timer_start = time.time()
-                if pre_step_kv_pages is None:
-                    raise RuntimeError("Speculative replay requires a pre-step KV snapshot.")
-                replay_scheduled = self._scheduled_full_cpu.copy()
-                replay_scheduled.fill(0)
-                replay_scheduled[int(row_pos)] = int(prefix_len)
-
-                replay_active = self._active_mask_full_cpu.copy()
-                replay_active.fill(False)
-                replay_active[int(row_pos)] = True
-
-                replay_req_num_tokens = np.asarray(num_computed_tokens_window_cpu).copy()
-                replay_req_num_tokens[int(row_pos)] = int(num_computed_tokens_window_cpu[int(row_pos)]) + int(prefix_len)
-
-                self.executor_manager.kv_pages = _copy_kv_tree(pre_step_kv_pages)
-                out_tokens_replay, _, _, _, hidden_replay, _, _ = self.executor_manager.execute(
-                    num_tokens=num_tokens_static,
-                    scheduled_full_cpu=replay_scheduled,
-                    req_num_tokens_full_cpu=replay_req_num_tokens,
-                    active_mask_full_cpu=replay_active,
-                    window_row_indices_cpu=window_row_indices_cpu,
-                    recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,
-                    input_ids_buf=self.input_ids_buf,
-                    position_ids_buf=self.position_ids_buf,
-                    padded_num_reqs=padded_num_reqs,
-                    token_ids_cpu=token_ids_window_cpu,
-                    num_computed_tokens_cpu=num_computed_tokens_window_cpu,
-                    temperature_cpu=temperature_window_cpu,
-                    top_p_cpu=top_p_window_cpu,
-                    top_k_cpu=top_k_window_cpu,
-                    min_p_cpu=min_p_window_cpu,
-                    frequency_penalties_cpu=frequency_penalties_window_cpu,
-                    presence_penalties_cpu=presence_penalties_window_cpu,
-                    repetition_penalties_cpu=repetition_penalties_window_cpu,
-                    page_table_cpu=page_table_window_cpu,
-                    page_table_version=page_table_window_version,
-                    mrope_position_ids_cpu=mrope_position_ids_cpu,
-                    prefill_embeds_cpu=prefill_embeds_cpu,
-                    prefill_embeds_mask_cpu=prefill_embeds_mask_cpu,
-                    visual_pos_masks_cpu=visual_pos_masks_cpu,
-                    deepstack_visual_embeds_cpu=deepstack_visual_embeds_cpu,
-                    wait_for_outputs=True,
-                )
-                replay_token = int(np.asarray(out_tokens_replay)[int(row_pos)])
-                replay_hidden = _window_hidden_row(
-                    hidden_replay,
-                    row_pos=int(row_pos),
-                    token_offset=int(window_token_offsets[int(row_pos)]),
-                    token_index=int(prefix_len) - 1,
-                    total_window_tokens=int(total_scheduled),
-                    padded_reqs=int(padded_num_reqs),
-                )
-                if rng_after_verify is not None:
-                    self.executor_manager.rng_key = rng_after_verify
-                total_spec_replay_time += time.time() - replay_timer_start
-                return replay_token, replay_hidden
-
-            def _replay_prefix_sequential(
-                row_pos: int,
-                prefix_len: int,
-                *,
+            _replay_prefix_sequential = partial(
+                self._spec_replay_prefix_sequential,
                 pre_step_kv_pages=pre_step_kv_pages,
                 num_computed_tokens_window_cpu=num_computed_tokens_window_cpu,
                 window_row_indices_cpu=window_row_indices_cpu,
@@ -4183,88 +4344,7 @@ class eSurgeRunner:
                 visual_pos_masks_cpu=visual_pos_masks_cpu,
                 deepstack_visual_embeds_cpu=deepstack_visual_embeds_cpu,
                 rng_after_verify=rng_after_verify,
-            ) -> tuple[int, jax.Array]:
-                """Replay an accepted speculative prefix one token at a time.
-
-                Used when the model has recurrent layers that cannot be replayed
-                in a single fused window (no candidate-row cache available). Runs
-                ``prefix_len`` single-token decode steps on top of the pre-spec
-                KV snapshot to advance recurrent state exactly to the boundary.
-                """
-                nonlocal total_spec_replay_time
-                replay_timer_start = time.time()
-                if pre_step_kv_pages is None:
-                    raise RuntimeError("Speculative sequential replay requires a pre-step KV snapshot.")
-                prefix_len = int(prefix_len)
-                if prefix_len <= 0:
-                    raise ValueError("prefix_len must be positive for speculative sequential replay.")
-
-                self.executor_manager.kv_pages = _copy_kv_tree(pre_step_kv_pages)
-                replay_scheduled = self._scheduled_full_cpu.copy()
-                replay_active = self._active_mask_full_cpu.copy()
-                replay_num_computed = np.asarray(num_computed_tokens_window_cpu).copy()
-                replay_req_num_tokens = np.asarray(num_computed_tokens_window_cpu).copy()
-                one_token_idx = bisect_left(self.num_tokens_paddings, 1)
-                if one_token_idx >= len(self.num_tokens_paddings):
-                    one_token_idx = len(self.num_tokens_paddings) - 1
-                one_token_static = int(self.num_tokens_paddings[one_token_idx])
-
-                replay_token = 0
-                replay_hidden = None
-                for step_idx in range(prefix_len):
-                    replay_scheduled.fill(0)
-                    replay_scheduled[int(row_pos)] = 1
-                    replay_active.fill(False)
-                    replay_active[int(row_pos)] = True
-                    replay_num_computed[int(row_pos)] = int(num_computed_tokens_window_cpu[int(row_pos)]) + int(step_idx)
-                    replay_req_num_tokens[int(row_pos)] = (
-                        int(num_computed_tokens_window_cpu[int(row_pos)]) + int(step_idx) + 1
-                    )
-
-                    out_tokens_replay, _, _, _, hidden_replay, _, _ = self.executor_manager.execute(
-                        num_tokens=one_token_static,
-                        scheduled_full_cpu=replay_scheduled,
-                        req_num_tokens_full_cpu=replay_req_num_tokens,
-                        active_mask_full_cpu=replay_active,
-                        window_row_indices_cpu=window_row_indices_cpu,
-                        recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,
-                        input_ids_buf=self.input_ids_buf,
-                        position_ids_buf=self.position_ids_buf,
-                        padded_num_reqs=padded_num_reqs,
-                        token_ids_cpu=token_ids_window_cpu,
-                        num_computed_tokens_cpu=replay_num_computed,
-                        temperature_cpu=temperature_window_cpu,
-                        top_p_cpu=top_p_window_cpu,
-                        top_k_cpu=top_k_window_cpu,
-                        min_p_cpu=min_p_window_cpu,
-                        frequency_penalties_cpu=frequency_penalties_window_cpu,
-                        presence_penalties_cpu=presence_penalties_window_cpu,
-                        repetition_penalties_cpu=repetition_penalties_window_cpu,
-                        page_table_cpu=page_table_window_cpu,
-                        page_table_version=page_table_window_version,
-                        mrope_position_ids_cpu=mrope_position_ids_cpu,
-                        prefill_embeds_cpu=prefill_embeds_cpu,
-                        prefill_embeds_mask_cpu=prefill_embeds_mask_cpu,
-                        visual_pos_masks_cpu=visual_pos_masks_cpu,
-                        deepstack_visual_embeds_cpu=deepstack_visual_embeds_cpu,
-                        wait_for_outputs=True,
-                    )
-                    replay_token = int(np.asarray(out_tokens_replay)[int(row_pos)])
-                    replay_hidden = _window_hidden_row(
-                        hidden_replay,
-                        row_pos=int(row_pos),
-                        token_offset=0,
-                        token_index=0,
-                        total_window_tokens=1,
-                        padded_reqs=int(padded_num_reqs),
-                    )
-
-                if rng_after_verify is not None:
-                    self.executor_manager.rng_key = rng_after_verify
-                total_spec_replay_time += time.time() - replay_timer_start
-                if replay_hidden is None:
-                    raise RuntimeError("Speculative sequential replay did not produce hidden state.")
-                return replay_token, replay_hidden
+            )
 
             for row_pos, rid, req_state, req_idx, seq_len, is_valid in window_entries:
                 if not is_valid:
@@ -4932,8 +5012,8 @@ class eSurgeRunner:
                 "post_time": total_post_proc_time,
                 "spec_project_time": total_spec_project_time,
                 "spec_draft_time": total_spec_draft_time,
-                "spec_suffix_time": total_spec_suffix_time,
-                "spec_replay_time": total_spec_replay_time,
+                "spec_suffix_time": self._spec_suffix_time_acc,
+                "spec_replay_time": self._spec_replay_time_acc,
                 "spec_commit_time": total_spec_commit_time,
                 "misc_time": misc_time,
                 "pp_stage_dispatch_time": total_pp_stage_dispatch_time,
