@@ -98,11 +98,10 @@ from .config import (
 )
 from .distributed import (
     DistributedController,
-    DistributedControllerCoordinator,
-    LocalCoordinator,
     make_config_fingerprint,
     resolve_distributed_role,
 )
+from .distributed.coordinator import create_step_coordinator
 from .engine import build_engine_assets
 from .engine.output_pipeline import OutputPipeline
 from .engine.registry import RequestRegistry
@@ -821,7 +820,10 @@ class eSurge(
         self._eos_ids = self.__eos_ids
         self._eos_set = self.__eos_set
 
-        if self.distributed_config.distributed_mode:
+        needs_fingerprint = self.distributed_config.distributed_mode or (
+            str(self.distributed_config.coordination or "replicated") == "zmq" and jax.process_count() > 1
+        )
+        if needs_fingerprint:
             distributed_config = {
                 "max_model_len": self.runtime_config.max_model_len,
                 "max_num_seqs": self.runtime_config.max_num_seqs,
@@ -838,29 +840,34 @@ class eSurge(
                 ),
             }
             self._distributed_config_fingerprint = make_config_fingerprint(distributed_config)
-            self._distributed_controller = DistributedController(
-                enabled=True,
-                role=self.distributed_role,
-                rank=self.distributed_rank,
-                world_size=self.distributed_world_size,
-                service_name=self.distributed_config.distributed_service_name,
-                control_port=self.distributed_config.distributed_control_port,
-                control_bind_host=self.distributed_config.distributed_control_bind_host,
-                advertise_addr=self.distributed_config.distributed_advertise_addr,
-                auth_token=self.distributed_config.distributed_auth_token,
-                step_timeout_s=self.distributed_config.distributed_step_timeout_s,
-                connect_timeout_s=self.distributed_config.distributed_connect_timeout_s,
-                verify_sampling_digest=self.distributed_config.distributed_verify_sampling_digest,
-                config_fingerprint=self._distributed_config_fingerprint,
-                execute_step=self._distributed_execute_step,
-            )
+            if self.distributed_config.distributed_mode:
+                self._distributed_controller = DistributedController(
+                    enabled=True,
+                    role=self.distributed_role,
+                    rank=self.distributed_rank,
+                    world_size=self.distributed_world_size,
+                    service_name=self.distributed_config.distributed_service_name,
+                    control_port=self.distributed_config.distributed_control_port,
+                    control_bind_host=self.distributed_config.distributed_control_bind_host,
+                    advertise_addr=self.distributed_config.distributed_advertise_addr,
+                    auth_token=self.distributed_config.distributed_auth_token,
+                    step_timeout_s=self.distributed_config.distributed_step_timeout_s,
+                    connect_timeout_s=self.distributed_config.distributed_connect_timeout_s,
+                    verify_sampling_digest=self.distributed_config.distributed_verify_sampling_digest,
+                    config_fingerprint=self._distributed_config_fingerprint,
+                    execute_step=self._distributed_execute_step,
+                )
         else:
             self._distributed_config_fingerprint = None
 
-        if self._distributed_controller is not None:
-            self._step_coordinator = DistributedControllerCoordinator(self.runner, self._distributed_controller)
-        else:
-            self._step_coordinator = LocalCoordinator(self.runner)
+        self._worker_stop_event = threading.Event()
+        self._worker_replay_thread: threading.Thread | None = None
+        self._step_coordinator = create_step_coordinator(
+            self.runner,
+            distributed_config=self.distributed_config,
+            config_fingerprint=self._distributed_config_fingerprint,
+            legacy_controller=self._distributed_controller,
+        )
 
         self.initiate()
 

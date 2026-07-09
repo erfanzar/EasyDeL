@@ -237,3 +237,115 @@ class DistributedControllerCoordinator:
     def shutdown(self, reason: str = "") -> None:
         """Shut the controller's sockets/threads down."""
         self._controller.shutdown()
+
+def _default_leader_addr() -> str | None:
+    """Best-effort leader address from the JAX distributed runtime.
+
+    In standard pod launches process 0 hosts the JAX coordinator, so its
+    address is a correct default for the eSurge control-plane leader.
+    """
+    try:
+        from jax._src.distributed import global_state
+
+        addr = getattr(global_state, "coordinator_address", None)
+        if addr:
+            return str(addr).rsplit(":", 1)[0]
+    except Exception:
+        return None
+    return None
+
+
+def create_step_coordinator(
+    runner,
+    *,
+    distributed_config,
+    config_fingerprint: str | None,
+    legacy_controller=None,
+):
+    """Build the right coordinator for this process.
+
+    Selection order:
+
+    1. A legacy ``DistributedController`` (``distributed_mode=True``) wraps
+       into its blocking adapter.
+    2. ``coordination="zmq"`` with ``jax.process_count() > 1`` builds the
+       ZeroMQ leader (rank 0) or worker plane.
+    3. Everything else — single host, or the multi-host *replicated* pattern
+       where an outer driver (e.g. a trainer's rollout loop) calls the
+       engine identically on every host — gets the pass-through
+       :class:`LocalCoordinator`.
+
+    Args:
+        runner: The engine's runner.
+        distributed_config: The engine's distributed config section.
+        config_fingerprint: Engine-config fingerprint for the handshake
+            (required for the ZMQ plane).
+        legacy_controller: Started legacy controller, if any.
+
+    Returns:
+        A :class:`StepCoordinator` implementation.
+
+    Raises:
+        StepCoordinationError: If ``coordination="zmq"`` is requested but
+            the auth token or leader address cannot be resolved.
+    """
+    if legacy_controller is not None:
+        return DistributedControllerCoordinator(runner, legacy_controller)
+
+    import jax
+
+    world_size = int(jax.process_count())
+    coordination = str(getattr(distributed_config, "coordination", "replicated") or "replicated")
+    if world_size <= 1 or coordination != "zmq":
+        return LocalCoordinator(runner)
+
+    from .zmq_coordinator import ZmqLeaderCoordinator, ZmqWorkerCoordinator
+
+    auth_token = distributed_config.distributed_auth_token
+    if not auth_token:
+        raise StepCoordinationError(
+            "coordination='zmq' requires `distributed_auth_token` (the same value on every host)."
+        )
+    fingerprint = config_fingerprint or ""
+    rank = int(jax.process_index())
+    control_port = int(distributed_config.distributed_control_port)
+    common = dict(
+        auth_token=str(auth_token),
+        config_fingerprint=fingerprint,
+        heartbeat_interval_s=float(distributed_config.distributed_heartbeat_interval_s),
+        heartbeat_timeout_s=float(distributed_config.distributed_heartbeat_timeout_s),
+    )
+    if rank == 0:
+        return ZmqLeaderCoordinator(
+            runner,
+            world_size=world_size,
+            bind_host=str(distributed_config.distributed_control_bind_host),
+            control_port=control_port,
+            ready_timeout_s=float(distributed_config.distributed_ready_timeout_s),
+            step_timeout_s=float(distributed_config.distributed_step_timeout_s),
+            verify_digest_interval=int(distributed_config.distributed_verify_digest_interval),
+            max_inflight_steps=int(distributed_config.distributed_max_inflight_steps),
+            **common,
+        )
+
+    leader_addr = distributed_config.distributed_leader_addr or _default_leader_addr()
+    if not leader_addr and distributed_config.distributed_service_name:
+        from .discovery import resolve_service_hosts
+
+        leader_addr = resolve_service_hosts(
+            distributed_config.distributed_service_name, world_size=world_size
+        ).hosts[0]
+    if not leader_addr:
+        raise StepCoordinationError(
+            "coordination='zmq' worker cannot resolve the leader address: set "
+            "`distributed_leader_addr`, `distributed_service_name`, or initialize jax.distributed."
+        )
+    return ZmqWorkerCoordinator(
+        runner,
+        rank=rank,
+        world_size=world_size,
+        leader_addr=str(leader_addr),
+        control_port=control_port,
+        connect_timeout_s=float(distributed_config.distributed_connect_timeout_s),
+        **common,
+    )

@@ -389,7 +389,45 @@ def _run_action(elm: Any, name: str, value: Any | None) -> None:
             server_kwargs["cors_origins"] = cors_origins
 
         elm.validate()
+
+        import jax
+
+        if int(jax.process_count()) > 1:
+            # Serving on a multi-process runtime needs the step-coordination
+            # plane: requests arrive at rank 0 only, but the jitted step is a
+            # global collective. Enable coordination="zmq" automatically with
+            # a config-derived auth token (identical on every host because
+            # the YAML is identical), unless the YAML configured it already.
+            esurge_section = elm.config.get("esurge", {}) or {}
+            dist_section = esurge_section.get("distributed", {}) if isinstance(esurge_section, dict) else {}
+            has_plane = bool(dist_section.get("distributed_mode")) or str(dist_section.get("coordination", "")) == "zmq"
+            if not has_plane:
+                import hashlib
+                import json as _json
+
+                auth = dist_section.get("distributed_auth_token") or hashlib.sha256(
+                    _json.dumps(elm.config, sort_keys=True, default=str).encode()
+                ).hexdigest()
+                elm.set_esurge(coordination="zmq", distributed_auth_token=auth)
+                logger.info(
+                    "Multi-process serve: enabled esurge step coordination "
+                    "(coordination='zmq', %d processes, rank %d).",
+                    int(jax.process_count()),
+                    int(jax.process_index()),
+                )
+
         surge = elm.build_esurge()
+
+        if int(jax.process_count()) > 1 and int(jax.process_index()) != 0:
+            logger.info("Worker rank %d: replaying leader steps; the API server runs on rank 0.", jax.process_index())
+            replay_thread = getattr(surge, "_worker_replay_thread", None)
+            if replay_thread is None:
+                raise SystemExit(
+                    "Worker rank has no replay loop; ensure esurge.distributed.coordination='zmq' on every host."
+                )
+            replay_thread.join()
+            return
+
         server = eSurgeApiServer(surge, **server_kwargs)
         server.run(
             host=host,
