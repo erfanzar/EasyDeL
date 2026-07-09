@@ -74,12 +74,14 @@ Example:
 """
 
 from .batch_preparer import BatchMetadataPreparer
+from .compile_orchestrator import CompileOrchestrator
 from .model_executor import ModelStepExecutor
 from .pipeline_microbatch import PipelineMicrobatchExecutor
 from .sampler_executor import SamplerExecutor, SamplerRuntime
 
 __all__ = (
     "BatchMetadataPreparer",
+    "CompileOrchestrator",
     "ModelStepExecutor",
     "PipelineMicrobatchExecutor",
     "SamplerExecutor",
