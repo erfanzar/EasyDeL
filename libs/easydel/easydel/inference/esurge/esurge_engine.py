@@ -96,7 +96,13 @@ from .config import (
     eSurgeVisionConfig,
     eSurgeWorkerConfig,
 )
-from .distributed import DistributedController, make_config_fingerprint, resolve_distributed_role
+from .distributed import (
+    DistributedController,
+    DistributedControllerCoordinator,
+    LocalCoordinator,
+    make_config_fingerprint,
+    resolve_distributed_role,
+)
 from .engine import build_engine_assets
 from .engine.output_pipeline import OutputPipeline
 from .engine.registry import RequestRegistry
@@ -850,6 +856,11 @@ class eSurge(
             )
         else:
             self._distributed_config_fingerprint = None
+
+        if self._distributed_controller is not None:
+            self._step_coordinator = DistributedControllerCoordinator(self.runner, self._distributed_controller)
+        else:
+            self._step_coordinator = LocalCoordinator(self.runner)
 
         self.initiate()
 
