@@ -297,9 +297,8 @@ model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 # Create eSurge engine for high-performance inference
 engine = ed.eSurge(
     model=model,
-    tokenizer=tokenizer,
-    max_model_len=4096,
-    max_num_seqs=8,  # Continuous batching with 8 sequences
+    processor=tokenizer,
+    runtime={"max_model_len": 4096, "max_num_seqs": 8},  # continuous batching with 8 sequences
 )
 
 
@@ -336,7 +335,7 @@ import easydel as ed
 # Traditional approach - multiple configuration objects
 model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(...)
 tokenizer = AutoTokenizer.from_pretrained(...)
-engine = ed.eSurge(model=model, tokenizer=tokenizer, ...)
+engine = ed.eSurge(model=model, processor=tokenizer, ...)
 
 # eLargeModel approach - unified configuration
 elm = ed.eLargeModel({...})  # Define everything once

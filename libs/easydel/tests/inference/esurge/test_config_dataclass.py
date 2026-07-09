@@ -75,3 +75,28 @@ def test_generated_config_mutable_defaults_are_isolated():
     one.config_kwargs["flag"] = True
     # Mutating one instance's dict must not leak into another.
     assert "flag" not in two.config_kwargs
+
+
+def test_esurge_aggregate_config_fills_sections_and_coerces_nested():
+    from easydel.inference.esurge.config import eSurgeConfig
+
+    cfg = eSurgeConfig.from_dict(
+        runtime={"max_model_len": 4096, "max_num_seqs": 4},
+        cache={"page_size": 64},
+    )
+    assert cfg.runtime.max_model_len == 4096
+    assert cfg.cache.page_size == 64
+    # omitted sections materialize with their defaults
+    assert cfg.parsing.silent_mode is False
+    assert cfg.drafter.enabled is False
+    assert cfg.context.truncate_mode == "left"
+    # idempotent coercion
+    assert eSurgeConfig.coerce_config(cfg) is cfg
+
+
+def test_esurge_engine_rejects_config_plus_section_kwargs():
+    import pytest
+    from easydel.inference.esurge.esurge_engine import eSurge
+
+    with pytest.raises(ValueError, match="not both"):
+        eSurge(model="unused-model-id", config={}, runtime={"max_model_len": 2048})

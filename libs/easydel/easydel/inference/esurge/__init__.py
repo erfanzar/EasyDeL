@@ -74,6 +74,7 @@ Note:
 
 from .config import (
     eSurgeCacheRuntimeConfig,
+    eSurgeConfig,
     eSurgeContextConfig,
     eSurgeDistributedConfig,
     eSurgeDrafterConfig,
@@ -203,6 +204,7 @@ __all__ = (
     "eSurge",
     "eSurgeApiServer",
     "eSurgeCacheRuntimeConfig",
+    "eSurgeConfig",
     "eSurgeContextConfig",
     "eSurgeDistributedConfig",
     "eSurgeDrafterConfig",

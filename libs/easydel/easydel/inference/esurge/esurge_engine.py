@@ -89,6 +89,7 @@ from easydel.workers.esurge.pipeline import WorkerManager
 
 from .config import (
     eSurgeCacheRuntimeConfig,
+    eSurgeConfig,
     eSurgeContextConfig,
     eSurgeDistributedConfig,
     eSurgeDrafterConfig,
@@ -477,8 +478,8 @@ class eSurge(
         *,
         model: str | EasyDeLBaseModule,
         processor: Any | None = None,
-        tokenizer: str | PreTrainedTokenizerBase | None = None,
         loading_kwargs: PreTrainedLoading | typing.Mapping[str, Any] | None = None,
+        config: eSurgeConfig | typing.Mapping[str, Any] | None = None,
         runtime: eSurgeRuntimeConfig | typing.Mapping[str, Any] | None = None,
         cache: eSurgeCacheRuntimeConfig | typing.Mapping[str, Any] | None = None,
         context: eSurgeContextConfig | typing.Mapping[str, Any] | None = None,
@@ -488,8 +489,6 @@ class eSurge(
         distributed: eSurgeDistributedConfig | typing.Mapping[str, Any] | None = None,
         drafter: DrafterProtocol | bool | typing.Mapping[str, Any] | None = None,
         drafter_config: eSurgeDrafterConfig | typing.Mapping[str, Any] | None = None,
-        assistant_model: str | EasyDeLBaseModule | None = None,
-        num_draft_tokens: int | None = None,
     ):
         """Initialize the eSurge engine.
 
@@ -504,13 +503,14 @@ class eSurge(
             processor (Any | None): Unified text/multimodal processor. May be a
                 tokenizer or an HF processor. When omitted for a string ``model``,
                 it is auto-loaded from the same id/path.
-            tokenizer (str | PreTrainedTokenizerBase | None): Deprecated alias /
-                fallback for ``processor``. Used only if ``processor`` cannot
-                supply a tokenizer.
             loading_kwargs (PreTrainedLoading | Mapping[str, Any] | None):
                 Optional pretrained-loader kwargs forwarded to
                 ``AutoEasyDeLModelForCausalLM.from_pretrained`` when ``model`` is
                 a string id/path.
+            config (eSurgeConfig | Mapping[str, Any] | None): Aggregate of all
+                sections in one object (e.g. from an eLarge YAML ``esurge:``
+                block). Mutually exclusive with the per-section arguments
+                below; sections absent from the aggregate use their defaults.
             runtime (eSurgeRuntimeConfig | Mapping[str, Any] | None): Runtime
                 and execution config. Fields (see :class:`eSurgeRuntimeConfig`):
 
@@ -658,12 +658,9 @@ class eSurge(
             drafter_config (eSurgeDrafterConfig | Mapping[str, Any] | None):
                 Declarative drafter settings. When enabled, eSurge calls
                 ``model.drafter(method=..., num_draft_tokens=..., ...)`` after
-                the target model is loaded.
-            assistant_model (str | EasyDeLBaseModule | None): Legacy assistant
-                drafter shortcut. Prefer ``drafter_config={"method":
-                "gemma4_assistant", "assistant_model": ...}``.
-            num_draft_tokens (int | None): Legacy override for drafter token
-                count. Prefer putting it in ``drafter_config``.
+                the target model is loaded. An assistant drafter model is
+                configured via ``drafter_config={"method": "gemma4_assistant",
+                "assistant_model": ...}``.
 
         Raises:
             ValueError: If processor/tokenizer cannot be inferred, if a
@@ -688,14 +685,43 @@ class eSurge(
             processor = loading_data.pop("processor", None)
         else:
             loading_data.pop("processor", None)
-        if tokenizer is None:
-            tokenizer = loading_data.pop("tokenizer", None)
-        else:
-            loading_data.pop("tokenizer", None)
+        loading_data.pop("tokenizer", None)
         loading_data["pretrained_model_name_or_path"] = model
         loading_data["processor"] = processor
-        loading_data["tokenizer"] = tokenizer
         self.loading_kwargs = PreTrainedLoading.coerce_config(loading_data)
+
+        if isinstance(drafter, Mapping):
+            if drafter_config is not None:
+                raise ValueError("Pass either `drafter` as a config mapping or `drafter_config`, not both.")
+            drafter_config = drafter
+            drafter = None
+
+        if config is not None:
+            sections = {
+                "runtime": runtime,
+                "cache": cache,
+                "context": context,
+                "workers": workers,
+                "parsing": parsing,
+                "vision": vision,
+                "distributed": distributed,
+                "drafter_config": drafter_config,
+            }
+            conflicting = sorted(name for name, value in sections.items() if value is not None)
+            if conflicting:
+                raise ValueError(
+                    f"Pass either `config` or per-section arguments, not both (got both `config` and {conflicting})."
+                )
+            aggregate = eSurgeConfig.coerce_config(config)
+            runtime = aggregate.runtime
+            cache = aggregate.cache
+            context = aggregate.context
+            workers = aggregate.workers
+            parsing = aggregate.parsing
+            vision = aggregate.vision
+            distributed = aggregate.distributed
+            drafter_config = aggregate.drafter
+
         self.runtime_config = eSurgeRuntimeConfig.coerce_config(runtime)
         self.cache_config = eSurgeCacheRuntimeConfig.coerce_config(cache)
         self.context_config = eSurgeContextConfig.coerce_config(context)
@@ -703,34 +729,11 @@ class eSurge(
         self.parsing_config = eSurgeParsingConfig.coerce_config(parsing)
         self.vision_config = eSurgeVisionConfig.coerce_config(vision)
         self.distributed_config = eSurgeDistributedConfig.coerce_config(distributed)
-        if isinstance(drafter, Mapping):
-            if drafter_config is not None:
-                raise ValueError("Pass either `drafter` as a config mapping or `drafter_config`, not both.")
-            drafter_config = drafter
-            drafter = None
         self.drafter_config = eSurgeDrafterConfig.coerce_config(drafter_config)
 
-        # Backward-compatible public aliases.  The sectioned configs above are
-        # the source of truth, but server/eval adapters still read these names.
-        self.silent_mode = bool(self.parsing_config.silent_mode)
-        self.max_model_len = self.runtime_config.max_model_len
-        self.max_num_seqs = self.runtime_config.max_num_seqs
-        self.page_size = self.cache_config.page_size
-        self.enable_window_aware_runtime_cap = self.runtime_config.enable_window_aware_runtime_cap
-        self.distributed_mode = bool(self.distributed_config.distributed_mode)
-        self._overlap_execution = self.runtime_config.overlap_execution
-        self._scheduler_enable_prefix_caching = self.cache_config.enable_prefix_caching
-        self._min_input_pad = self.runtime_config.min_input_pad
-        self._max_num_seqs = self.runtime_config.max_num_seqs
-        self._max_num_batched_tokens = self.runtime_config.max_num_batched_tokens
-        self._hbm_utilization = self.cache_config.hbm_utilization
-        self._page_size = self.cache_config.page_size
-        self._enable_prefix_caching = self.cache_config.enable_prefix_caching
-        self._runner_verbose = self.runtime_config.runner_verbose
-        self._decode_truncated_prompt = self.context_config.decode_truncated_prompt
-        self._destroy_pages_on_pause = self.cache_config.destroy_pages_on_pause
+        # Mutable engine-level override; also settable later via
+        # :meth:`set_sampling_params_callback`.
         self._sampling_params_callback = self.parsing_config.sampling_params_callback
-        self.ignore_stop_strings_in_reasoning = bool(self.parsing_config.ignore_stop_strings_in_reasoning)
 
         # Locals only for values that get transformed (resolved, normalized, or
         # mutated). Pure config field reads use ``self.X_config.field`` directly.
@@ -788,11 +791,7 @@ class eSurge(
             self.distributed_rank = 0
 
         # `processor` is the unified interface for text + multimodal workflows.
-        # Backward-compat: if `processor` isn't provided, fall back to `tokenizer`.
-        if tokenizer is not None and processor is not None and tokenizer is not processor:
-            logger.warning("Both `tokenizer` and `processor` were provided; `processor` will be used for multimodal.")
-
-        processor_obj: Any | None = processor if processor is not None else tokenizer
+        processor_obj: Any | None = processor
         processor_source: str | None = None
 
         if processor_obj is None:
@@ -816,18 +815,12 @@ class eSurge(
                 tokenizer_obj = maybe_tok
 
         if tokenizer_obj is None:
-            if isinstance(tokenizer, PreTrainedTokenizerBase):
-                tokenizer_obj = tokenizer
-            elif isinstance(tokenizer, str):
-                processor_source = processor_source or tokenizer
-                tokenizer_obj = AutoTokenizer.from_pretrained(tokenizer)
-            else:
-                source = processor_source or (model if isinstance(model, str) else None)
-                if source is None:
-                    raise ValueError(
-                        "Tokenizer must be provided (or inferable from processor) when using a preloaded model."
-                    )
-                tokenizer_obj = AutoTokenizer.from_pretrained(source)
+            source = processor_source or (model if isinstance(model, str) else None)
+            if source is None:
+                raise ValueError(
+                    "Tokenizer must be provided (or inferable from processor) when using a preloaded model."
+                )
+            tokenizer_obj = AutoTokenizer.from_pretrained(source)
 
         tokenizer_source = (
             getattr(tokenizer_obj, "name_or_path", None)
@@ -1079,11 +1072,7 @@ class eSurge(
                 drafter_kwargs.setdefault("target_embed_module", self.drafter_config.target_embed_module)
             if self.drafter_config.layer_mapping is not None:
                 drafter_kwargs.setdefault("layer_mapping", list(self.drafter_config.layer_mapping))
-            configured_assistant_model = self.drafter_config.assistant_model
-            if configured_assistant_model is not None:
-                assistant_model = configured_assistant_model
-            if num_draft_tokens is not None:
-                self.drafter_config.num_draft_tokens = int(num_draft_tokens)
+            assistant_model = self.drafter_config.assistant_model
             if assistant_model is not None and isinstance(assistant_model, str):
                 assistant_loading = self.loading_kwargs.to_dict()
                 assistant_loading["pretrained_model_name_or_path"] = assistant_model
@@ -1100,29 +1089,11 @@ class eSurge(
                 **drafter_kwargs,
             )
 
-        if drafter is None and assistant_model is not None:
-            if isinstance(assistant_model, str):
-                assistant_loading = self.loading_kwargs.to_dict()
-                assistant_loading["pretrained_model_name_or_path"] = assistant_model
-                assistant_loading["dtype"] = dtype
-                assistant_loading["param_dtype"] = dtype
-                assistant_loading.pop("processor", None)
-                assistant_loading.pop("tokenizer", None)
-                assistant_loading.pop("config_kwargs", None)
-                assistant_model = AutoEasyDeLModelForCausalLM.from_pretrained(**assistant_loading)
-            drafter = model.drafter(
-                method="gemma4_assistant",
-                assistant_model=assistant_model,
-                num_draft_tokens=1 if num_draft_tokens is None else int(num_draft_tokens),
-            )
-
         if auto_drafter_requested and drafter is None:
             drafter = model.drafter(
                 method="auto",
-                num_draft_tokens=1 if num_draft_tokens is None else int(num_draft_tokens),
+                num_draft_tokens=int(self.drafter_config.num_draft_tokens),
             )
-        if drafter is not None and num_draft_tokens is not None:
-            drafter.num_draft_tokens = int(num_draft_tokens)
         self.drafter = drafter
         runner_async_scheduling = bool(self.runtime_config.async_scheduling)
         if drafter is not None and runner_async_scheduling:
@@ -1374,6 +1345,31 @@ class eSurge(
             auto-generated name based on model type and size.
         """
         return self.runtime_config.esurge_name or self._possible_name
+
+    @property
+    def max_model_len(self) -> int:
+        """Maximum sequence length (prompt + generation) supported per request."""
+        return self.runtime_config.max_model_len
+
+    @property
+    def max_num_seqs(self) -> int:
+        """Maximum number of concurrently running requests."""
+        return self.runtime_config.max_num_seqs
+
+    @property
+    def silent_mode(self) -> bool:
+        """Whether info-level engine logging is suppressed."""
+        return bool(self.parsing_config.silent_mode)
+
+    @property
+    def ignore_stop_strings_in_reasoning(self) -> bool:
+        """Whether stop strings are suppressed inside reasoning blocks."""
+        return bool(self.parsing_config.ignore_stop_strings_in_reasoning)
+
+    @property
+    def distributed_mode(self) -> bool:
+        """Whether the multi-host lockstep control plane is enabled."""
+        return bool(self.distributed_config.distributed_mode)
 
     def set_sampling_params_callback(
         self,

@@ -42,14 +42,15 @@ Example:
     Basic scheduler usage::
 
         >>> from easydel.inference.esurge.scheduler import Scheduler
-        >>> from easydel.inference.esurge.config import SchedulerConfig
         >>>
-        >>> config = SchedulerConfig(
+        >>> scheduler = Scheduler(
+        ...     kv_cache_config=kv_config,
         ...     max_num_seqs=16,
         ...     max_num_batched_tokens=2048,
-        ...     max_model_len=8192
+        ...     max_model_len=8192,
+        ...     num_pages=1024,
+        ...     page_size=128,
         ... )
-        >>> scheduler = Scheduler(config)
         >>> output = scheduler.schedule()
 
     For async scheduling with improved throughput::

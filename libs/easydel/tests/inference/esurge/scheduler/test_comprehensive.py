@@ -7,8 +7,6 @@ import os
 os.environ["JAX_PLATFORMS"] = "cpu"
 
 import jax.numpy as jnp
-
-from easydel.inference.esurge.config import CacheConfig, Config, SchedulerConfig
 from easydel.inference.esurge.core.interface import (
     CacheGroupsConfig,
     CacheGroupSpec,
@@ -33,22 +31,6 @@ def make_scheduler(
     token_safety_margin: int | None = None,
     policy: str = "fcfs",
 ) -> Scheduler:
-    config = Config(
-        scheduler_config=SchedulerConfig(
-            max_num_seqs=max_num_seqs,
-            max_num_batched_tokens=max_num_batched_tokens,
-            max_model_len=max_model_len,
-            token_safety_margin=token_safety_margin,
-            chunked_prefill_enabled=chunked_prefill,
-            long_prefill_token_threshold=long_prefill_threshold,
-            policy=policy,
-        ),
-        cache_config=CacheConfig(
-            num_pages=num_pages,
-            page_size=page_size,
-            enable_prefix_caching=enable_prefix_caching,
-        ),
-    )
     kv = CacheGroupsConfig(
         num_pages=num_pages,
         kv_cache_groups=[
@@ -64,7 +46,19 @@ def make_scheduler(
             )
         ],
     )
-    return Scheduler(config=config, kv_cache_config=kv)
+    return Scheduler(
+        kv_cache_config=kv,
+        max_num_seqs=max_num_seqs,
+        max_num_batched_tokens=max_num_batched_tokens,
+        max_model_len=max_model_len,
+        num_pages=num_pages,
+        page_size=page_size,
+        enable_prefix_caching=enable_prefix_caching,
+        token_safety_margin=token_safety_margin,
+        chunked_prefill_enabled=chunked_prefill,
+        long_prefill_token_threshold=long_prefill_threshold,
+        policy=policy,
+    )
 
 
 def make_req(rid: str, prompt_len: int, max_tokens: int = 8192) -> EngineRequest:

@@ -138,7 +138,6 @@ class Scheduler(SchedulerInterface):
         max_model_len: int | None = None,
         num_pages: int | None = None,
         page_size: int | None = None,
-        config: object | None = None,
         enable_prefix_caching: bool = True,
         max_num_seq_buckets: list[int] | None = None,
         async_scheduling: bool = True,
@@ -178,31 +177,6 @@ class Scheduler(SchedulerInterface):
         Raises:
             ValueError: For unknown scheduling policy or non-positive num_pages.
         """
-        if config is not None:
-            scheduler_config = getattr(config, "scheduler_config", None)
-            cache_config = getattr(config, "cache_config", None)
-            if scheduler_config is not None:
-                max_num_seqs = max_num_seqs if max_num_seqs is not None else scheduler_config.max_num_seqs
-                max_num_batched_tokens = (
-                    max_num_batched_tokens
-                    if max_num_batched_tokens is not None
-                    else scheduler_config.max_num_batched_tokens
-                )
-                max_model_len = max_model_len if max_model_len is not None else scheduler_config.max_model_len
-                max_num_seq_buckets = (
-                    max_num_seq_buckets if max_num_seq_buckets is not None else scheduler_config.max_num_seq_buckets
-                )
-                async_scheduling = scheduler_config.async_scheduling
-                long_prefill_token_threshold = scheduler_config.long_prefill_token_threshold
-                chunked_prefill_enabled = scheduler_config.chunked_prefill_enabled
-                token_safety_margin = scheduler_config.token_safety_margin
-                policy = scheduler_config.policy
-                num_speculative_tokens = scheduler_config.num_speculative_tokens
-            if cache_config is not None:
-                num_pages = num_pages if num_pages is not None else cache_config.num_pages
-                page_size = page_size if page_size is not None else cache_config.page_size
-                enable_prefix_caching = cache_config.enable_prefix_caching
-
         missing = [
             name
             for name, value in (

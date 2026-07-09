@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypeAlias, TypedDict, Unpack
 
 from ejkernel.modules.operations import KernelTilePolicy, normalize_kernel_tile_policy
@@ -928,111 +927,104 @@ class eSurgeDrafterConfig(TypedDict, total=False):
         """
         ...
 
+def _validate_esurge_config(self) -> None:
+    """Fill absent sections with their all-defaults instances."""
+    if self.runtime is None:
+        self.runtime = eSurgeRuntimeConfig.coerce_config(None)
+    if self.cache is None:
+        self.cache = eSurgeCacheRuntimeConfig.coerce_config(None)
+    if self.context is None:
+        self.context = eSurgeContextConfig.coerce_config(None)
+    if self.workers is None:
+        self.workers = eSurgeWorkerConfig.coerce_config(None)
+    if self.parsing is None:
+        self.parsing = eSurgeParsingConfig.coerce_config(None)
+    if self.vision is None:
+        self.vision = eSurgeVisionConfig.coerce_config(None)
+    if self.distributed is None:
+        self.distributed = eSurgeDistributedConfig.coerce_config(None)
+    if self.drafter is None:
+        self.drafter = eSurgeDrafterConfig.coerce_config(None)
 
-class SchedulerConfig(SimpleNamespace):
-    """Backward-compatible scheduler section for direct Scheduler tests.
 
-    New engine construction uses :class:`eSurgeRuntimeConfig` and
-    :class:`eSurgeCacheRuntimeConfig`; a few direct scheduler call sites still
-    build a small aggregate ``Config`` object. This shim preserves that
-    runtime-facing surface without reintroducing the old monolithic config as
-    the primary API.
+@typed_config(
+    defaults={
+        "runtime": None,
+        "cache": None,
+        "context": None,
+        "workers": None,
+        "parsing": None,
+        "vision": None,
+        "distributed": None,
+        "drafter": None,
+    },
+    post_init=_validate_esurge_config,
+)
+class eSurgeConfig(TypedDict, total=False):
+    """Aggregate of every eSurge config section under one object.
+
+    One mapping — e.g. the ``esurge:`` block of an eLarge YAML — coerces into
+    all eight sections in a single call. Sections omitted from the input are
+    filled with their defaults, and nested mappings are promoted to their
+    typed sections recursively::
+
+        >>> cfg = eSurgeConfig.from_dict(
+        ...     runtime={"max_model_len": 8192, "max_num_seqs": 16},
+        ...     cache={"page_size": 128},
+        ... )
+        >>> cfg.runtime.max_num_seqs
+        16
+        >>> engine = eSurge(model="model-id", config=cfg)
+
+    Attributes:
+        runtime: Runtime/execution section (:class:`eSurgeRuntimeConfig`).
+        cache: KV-cache section (:class:`eSurgeCacheRuntimeConfig`).
+        context: Context-window section (:class:`eSurgeContextConfig`).
+        workers: Tokenizer/detokenizer worker section (:class:`eSurgeWorkerConfig`).
+        parsing: Tool/reasoning/sampling parser section (:class:`eSurgeParsingConfig`).
+        vision: Multimodal section (:class:`eSurgeVisionConfig`).
+        distributed: Multi-host serving section (:class:`eSurgeDistributedConfig`).
+        drafter: Speculative-decoding drafter section (:class:`eSurgeDrafterConfig`).
     """
 
-    def __init__(
-        self,
-        *,
-        max_num_seqs: int = 256,
-        max_num_batched_tokens: int | None = None,
-        max_model_len: int = 8192,
-        max_num_seq_buckets: list[int] | None = None,
-        async_scheduling: bool = True,
-        long_prefill_token_threshold: int | None = None,
-        chunked_prefill_enabled: bool = False,
-        token_safety_margin: int | None = None,
-        policy: Literal["priority", "fcfs"] = "fcfs",
-        num_speculative_tokens: int = 0,
-    ) -> None:
-        """Build a scheduler-config namespace consumed by the Scheduler.
+    runtime: NotRequired[eSurgeRuntimeConfig | None]
+    cache: NotRequired[eSurgeCacheRuntimeConfig | None]
+    context: NotRequired[eSurgeContextConfig | None]
+    workers: NotRequired[eSurgeWorkerConfig | None]
+    parsing: NotRequired[eSurgeParsingConfig | None]
+    vision: NotRequired[eSurgeVisionConfig | None]
+    distributed: NotRequired[eSurgeDistributedConfig | None]
+    drafter: NotRequired[eSurgeDrafterConfig | None]
 
-        Args:
-            max_num_seqs: Hard ceiling on concurrent in-flight sequences.
-            max_num_batched_tokens: Per-step token budget; ``None`` falls
-                back to ``max_model_len``.
-            max_model_len: Hard upper bound on per-request total sequence
-                length.
-            max_num_seq_buckets: Explicit request-count bucket ladder, or
-                ``None`` for the framework default.
-            async_scheduling: Run the scheduler on a background thread
-                so it can produce the next batch while the device finishes
-                the previous one.
-            long_prefill_token_threshold: Token count above which a single
-                prompt is split into multiple chunked-prefill steps.
-            chunked_prefill_enabled: Master switch for chunked prefill.
-            token_safety_margin: Optional safety margin (tokens) reserved
-                in the per-step budget.
-            policy: Admission policy: ``"fcfs"`` (default) or
-                ``"priority"``.
-            num_speculative_tokens: Number of speculative draft tokens
-                proposed per verify window. ``0`` disables speculation.
-        """
-        super().__init__(
-            max_num_seqs=max_num_seqs,
-            max_num_batched_tokens=max_num_batched_tokens,
-            max_model_len=max_model_len,
-            max_num_seq_buckets=max_num_seq_buckets,
-            async_scheduling=async_scheduling,
-            long_prefill_token_threshold=long_prefill_token_threshold,
-            chunked_prefill_enabled=chunked_prefill_enabled,
-            token_safety_margin=token_safety_margin,
-            policy=policy,
-            num_speculative_tokens=num_speculative_tokens,
-        )
+    if TYPE_CHECKING:
 
+        @classmethod
+        def from_dict(
+            cls,
+            data: Mapping[str, Any] | None = None,
+            **kwargs: Unpack[eSurgeConfig],
+        ) -> eSurgeConfig:
+            """Build an aggregate config from a mapping and/or keyword sections.
 
-class CacheConfig(SimpleNamespace):
-    """Backward-compatible cache section for direct Scheduler tests."""
+            Args:
+                data: Optional mapping of section name to section
+                    mapping/instance.
+                **kwargs: Section overrides by name.
 
-    def __init__(
-        self,
-        *,
-        num_pages: int,
-        page_size: int,
-        enable_prefix_caching: bool = True,
-    ) -> None:
-        """Build a cache-config namespace consumed by the Scheduler.
+            Returns:
+                A coerced ``eSurgeConfig`` with every section populated.
+            """
+            ...
 
-        Args:
-            num_pages: Total number of KV-cache pages in the pool.
-            page_size: Tokens stored per KV-cache page.
-            enable_prefix_caching: When ``True``, identical prompt
-                prefixes hit already-resident pages and skip re-prefill.
-        """
-        super().__init__(
-            num_pages=num_pages,
-            page_size=page_size,
-            enable_prefix_caching=enable_prefix_caching,
-        )
+        @classmethod
+        def coerce_config(cls, value: eSurgeConfig | Mapping[str, Any] | None = None) -> eSurgeConfig:
+            """Coerce ``value`` into an ``eSurgeConfig`` (idempotent).
 
+            Args:
+                value: An existing instance, a plain mapping, or ``None``
+                    for all-defaults.
 
-class Config(SimpleNamespace):
-    """Backward-compatible aggregate config for direct Scheduler construction."""
-
-    def __init__(
-        self,
-        *,
-        scheduler_config: SchedulerConfig | None = None,
-        cache_config: CacheConfig | None = None,
-    ) -> None:
-        """Build an aggregate config namespace for direct Scheduler tests.
-
-        Args:
-            scheduler_config: The scheduler section. ``None`` builds a
-                default :class:`SchedulerConfig`.
-            cache_config: The cache section, or ``None`` when the
-                scheduler is being exercised without a real cache.
-        """
-        super().__init__(
-            scheduler_config=scheduler_config or SchedulerConfig(),
-            cache_config=cache_config,
-        )
+            Returns:
+                A validated ``eSurgeConfig`` instance.
+            """
+            ...
