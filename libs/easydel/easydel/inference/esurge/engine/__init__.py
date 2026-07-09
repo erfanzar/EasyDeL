@@ -20,8 +20,13 @@ root that wires them together.
 """
 
 from .bootstrap import EngineAssets, build_engine_assets
+from .output_pipeline import OutputPipeline
+from .registry import RequestRecord, RequestRegistry
 
 __all__ = (
     "EngineAssets",
+    "OutputPipeline",
+    "RequestRecord",
+    "RequestRegistry",
     "build_engine_assets",
 )

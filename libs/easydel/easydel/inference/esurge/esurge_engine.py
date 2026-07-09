@@ -98,6 +98,7 @@ from .config import (
 )
 from .distributed import DistributedController, make_config_fingerprint, resolve_distributed_role
 from .engine import build_engine_assets
+from .engine.output_pipeline import OutputPipeline
 from .engine.registry import RequestRegistry
 from .logger import logger
 from .mixins import (
@@ -787,8 +788,10 @@ class eSurge(
         self._request_lock = self._registry.request_lock
         self._output_lock = self._registry.output_lock
         self._output_event = self._registry.output_event  # kept for generate()
-        self._engine_output_queue: queue.Queue = queue.Queue()
-        self._engine_output_thread: threading.Thread | None = None
+        self._output_pipeline = OutputPipeline(
+            process=self._process_engine_outputs,
+            on_fatal=self._on_output_worker_fatal,
+        )
         self._parser_stop_queue: queue.SimpleQueue[dict[str, str]] = queue.SimpleQueue()
 
         self.extra_eos_token_ids = self.parsing_config.extra_eos_token_ids or []

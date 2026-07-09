@@ -436,60 +436,41 @@ class EngineLifecycleMixin:
                 continue
             self._request_outputs.pop(old_id, None)
 
+    def _on_output_worker_fatal(self, exc: BaseException, tb: str) -> None:
+        """Record an output-worker failure and wake every blocked caller.
+
+        Runs on the output-worker thread. Records the exception on
+        ``self._scheduler_exception``, flips ``_scheduler_running`` off, and
+        wakes every blocked request event plus the global output event so
+        generate/stream callers exit their wait loops with the captured
+        traceback rather than hanging.
+
+        Args:
+            exc: The exception raised inside output processing.
+            tb: Its formatted traceback.
+        """
+        self._scheduler_exception = exc
+        self._scheduler_exception_tb = tb
+        self._scheduler_running = False
+        self._registry.signal_all()
+
     def _start_engine_output_worker(self) -> None:
         """Start the background parser/output worker when the engine owns one.
 
         The scheduler loop is the hot generation path. It should apply model
         tokens to scheduler state and immediately return to launching work.
         Detokenization, reasoning/tool parsing, stream-delta assembly, and
-        request-event wakeups are handled by this single FIFO worker so output
-        processing overlaps the next device step while preserving per-token
-        ordering.
+        request-event wakeups are handled by the :class:`OutputPipeline`
+        worker so output processing overlaps the next device step while
+        preserving per-token ordering.
 
         Lightweight lifecycle test harnesses do not define
-        ``_engine_output_queue``; those keep the historical synchronous path.
+        ``_output_pipeline``; those keep the historical synchronous path.
         """
-        output_queue = getattr(self, "_engine_output_queue", None)
-        if output_queue is None:
+        pipeline = getattr(self, "_output_pipeline", None)
+        if pipeline is None:
             return
-
-        thread = getattr(self, "_engine_output_thread", None)
-        if thread is not None and thread.is_alive():
-            return
-
-        def _output_loop() -> None:
-            """Background loop draining engine outputs into the parser pipeline.
-
-            Pulls bundles from ``_engine_output_queue`` and feeds them to
-            :meth:`_process_engine_outputs` (detokenization, parser updates,
-            request-event wakeups). A ``None`` sentinel terminates the loop.
-            On any exception the worker records the exception on
-            ``self._scheduler_exception``, flips ``_scheduler_running`` off,
-            wakes every blocked request event, and signals
-            ``_output_event`` so generate/stream callers exit their wait
-            loops with the captured traceback rather than hanging.
-            """
-            while True:
-                engine_outputs = output_queue.get()
-                try:
-                    if engine_outputs is None:
-                        return
-                    self._process_engine_outputs(engine_outputs)
-                except Exception as exc:
-                    traceback.print_exc()
-                    logger.error("Engine output worker failed: %s", exc)
-                    self._scheduler_exception = exc
-                    self._scheduler_exception_tb = traceback.format_exc()
-                    self._scheduler_running = False
-                    with self._request_lock:
-                        for event in self._request_events.values():
-                            event.set()
-                    self._output_event.set()
-                finally:
-                    output_queue.task_done()
-
-        self._engine_output_thread = threading.Thread(target=_output_loop, name="eSurgeOutputWorker", daemon=True)
-        self._engine_output_thread.start()
+        pipeline.start()
 
     def _enqueue_engine_outputs(self, engine_outputs) -> None:
         """Queue engine outputs for asynchronous parsing, or process inline.
@@ -500,27 +481,17 @@ class EngineLifecycleMixin:
         """
         if not engine_outputs:
             return
-        output_queue = getattr(self, "_engine_output_queue", None)
-        thread = getattr(self, "_engine_output_thread", None)
-        if output_queue is None or thread is None or not thread.is_alive():
+        pipeline = getattr(self, "_output_pipeline", None)
+        if pipeline is None:
             self._process_engine_outputs(engine_outputs)
             return
-        output_queue.put(engine_outputs)
+        pipeline.submit(engine_outputs)
 
     def _stop_engine_output_worker(self) -> None:
         """Drain and stop the asynchronous parser/output worker."""
-        output_queue = getattr(self, "_engine_output_queue", None)
-        thread = getattr(self, "_engine_output_thread", None)
-        if output_queue is None or thread is None:
-            return
-        if thread.is_alive():
-            output_queue.put(None)
-            thread.join(timeout=5.0)
-            if thread.is_alive():
-                logger.warning("Engine output worker did not stop gracefully")
-                return
-        if getattr(self, "_engine_output_thread", None) is thread:
-            self._engine_output_thread = None
+        pipeline = getattr(self, "_output_pipeline", None)
+        if pipeline is not None:
+            pipeline.stop()
 
     def initiate(self) -> None:
         """Start (or wake) the background scheduler so requests can flow.
