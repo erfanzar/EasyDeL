@@ -76,12 +76,11 @@ from typing import Any
 import jax
 from jax import numpy as jnp
 from spectrax.common_types import NOT_GIVEN
-from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from easydel.axis import register_attention_data_parallel_axis
 from easydel.inference.sampling_params import SamplingParams
 from easydel.inference.speculative import DrafterProtocol
-from easydel.utils import Registry, set_inference_mode
+from easydel.utils import Registry
 
 if typing.TYPE_CHECKING:
     from easydel.modules.auto.auto_modeling import PreTrainedLoading
@@ -99,6 +98,7 @@ from .config import (
     eSurgeWorkerConfig,
 )
 from .distributed import DistributedController, make_config_fingerprint, resolve_distributed_role
+from .engine import build_engine_assets
 from .logger import logger
 from .mixins import (
     EngineIOMixin,
@@ -113,8 +113,6 @@ from .runners import eSurgeRunner
 from .scheduler import Scheduler
 
 if typing.TYPE_CHECKING:
-    from easydel.inference.reasoning.abstract_reasoning import ReasoningParserName
-    from easydel.inference.tools.abstract_tool import ToolParserName
     from easydel.infra import EasyDeLBaseModule
 
 # Configuration constants
@@ -130,11 +128,6 @@ MAX_CONSECUTIVE_SCHEDULER_ERRORS = int(os.environ.get("EASURGE_MAX_SCHEDULER_ERR
 WORKER_DRAIN_MAX_RETRIES = 3  # Maximum retry attempts for worker drain
 WORKER_DRAIN_INITIAL_DELAY = 0.1  # Initial retry delay in seconds
 SamplingCallable = typing.Callable[[SamplingParams, dict[str, typing.Any]], SamplingParams | None] | None
-MLA_RAGGED_ATTN_MECHANISM = "multi_latent_ragged_page_attention_v2"
-_MLA_RAGGED_ATTN_MECHANISMS = {
-    "multi_latent_ragged_page_attention_v1",
-    "multi_latent_ragged_page_attention_v2",
-}
 
 
 def _normalize_data_parallelism_axis(axis: str) -> str:
@@ -155,125 +148,6 @@ def _normalize_data_parallelism_axis(axis: str) -> str:
     if not axis_name:
         raise ValueError("`data_parallelism_axis` must be a non-empty string.")
     return axis_name
-
-
-def _normalize_attn_mechanism_value(attn_mechanism: Any) -> str | None:
-    """Normalize an attention mechanism identifier to a plain string.
-
-    Handles enum-like objects (with a ``.value`` attribute) as well as
-    raw strings.
-
-    Args:
-        attn_mechanism: An attention mechanism identifier. May be ``None``,
-            a string, or an enum with a ``value`` attribute.
-
-    Returns:
-        The string representation of the mechanism, or ``None`` if the
-        input is ``None``.
-    """
-    if attn_mechanism is None:
-        return None
-    if hasattr(attn_mechanism, "value"):
-        attn_mechanism = attn_mechanism.value
-    return str(attn_mechanism)
-
-
-def _text_config_uses_mla(text_config: Any) -> bool:
-    """Detect whether a text config indicates Multi-Latent Attention (MLA).
-
-    Uses several heuristics in order of priority:
-    1. Explicit ``attn_mechanism`` or ``mla_attn_mechanism`` matching the
-       MLA ragged attention constant.
-    2. An ``attention_type`` attribute equal to ``"mla"``.
-    3. A callable or boolean ``is_mla`` attribute.
-    4. Presence of ``kv_lora_rank`` (or ``kv_lora_dim``) together with
-       ``qk_rope_head_dim`` or ``qk_nope_head_dim``.
-
-    Args:
-        text_config: A model text configuration object (e.g.,
-            ``PretrainedConfig``). May be ``None``.
-
-    Returns:
-        ``True`` if the config signals MLA usage, ``False`` otherwise.
-    """
-    if text_config is None:
-        return False
-
-    attn_mechanism = _normalize_attn_mechanism_value(getattr(text_config, "attn_mechanism", None))
-    if attn_mechanism in _MLA_RAGGED_ATTN_MECHANISMS:
-        return True
-    mla_attn_mechanism = _normalize_attn_mechanism_value(getattr(text_config, "mla_attn_mechanism", None))
-    if mla_attn_mechanism in _MLA_RAGGED_ATTN_MECHANISMS:
-        return True
-
-    attention_type = getattr(text_config, "attention_type", None)
-    if attention_type is not None and str(attention_type).lower() == "mla":
-        return True
-
-    is_mla_attr = getattr(text_config, "is_mla", None)
-    try:
-        if callable(is_mla_attr):
-            if bool(is_mla_attr()):
-                return True
-        elif is_mla_attr is not None and bool(is_mla_attr):
-            return True
-    except Exception:
-        pass
-
-    kv_lora_rank = getattr(text_config, "kv_lora_rank", None)
-    if kv_lora_rank is None:
-        kv_lora_rank = getattr(text_config, "kv_lora_dim", None)
-
-    qk_rope_head_dim = getattr(text_config, "qk_rope_head_dim", None)
-    qk_nope_head_dim = getattr(text_config, "qk_nope_head_dim", None)
-
-    if kv_lora_rank is None or (qk_rope_head_dim is None and qk_nope_head_dim is None):
-        return False
-
-    try:
-        return int(kv_lora_rank) > 0
-    except Exception:
-        return True
-
-
-def _detect_mla_attention_mix(model: Any, text_config: Any = None) -> tuple[bool, bool]:
-    """Detect whether a model contains MLA and/or non-MLA attention blocks.
-
-    Traverses all ``UnifiedAttention`` sub-modules in *model* and inspects
-    each one's ``attention_type``. Falls back to config-level heuristics
-    via ``_text_config_uses_mla`` when no attention modules are found.
-
-    Args:
-        model: An EasyDeL model instance to inspect.
-        text_config: Optional text configuration used as a fallback when
-            module traversal yields no results.
-
-    Returns:
-        A ``(has_mla, has_non_mla)`` tuple of booleans indicating
-        whether MLA and/or standard attention blocks were detected.
-    """
-    has_mla_attention = False
-    has_non_mla_attention = False
-
-    try:
-        from easydel.layers.attention import UnifiedAttention
-        from easydel.utils.traversals import iter_module_search
-
-        for _, module in iter_module_search(model, UnifiedAttention):
-            attention_type = str(getattr(module, "attention_type", "standard")).lower()
-            if attention_type == "mla":
-                has_mla_attention = True
-            else:
-                has_non_mla_attention = True
-            if has_mla_attention and has_non_mla_attention:
-                break
-    except Exception:
-        pass
-
-    if not has_mla_attention and not has_non_mla_attention and _text_config_uses_mla(text_config):
-        has_mla_attention = True
-
-    return has_mla_attention, has_non_mla_attention
 
 
 @dataclass
@@ -424,54 +298,6 @@ class eSurge(
         >>> for output in engine.stream("Tell me a story"):
         ...     print(output.delta_text, end="", flush=True)
     """
-
-    @staticmethod
-    def _auto_detect_tool_parser(
-        *,
-        tokenizer: PreTrainedTokenizerBase | None,
-        model_type: str | None,
-    ) -> ToolParserName | None:
-        """Infer the tool parser from tokenizer/template hints and model type.
-
-        Args:
-            tokenizer (PreTrainedTokenizerBase | None): Tokenizer whose chat
-                template and special tokens may indicate a tool-call format.
-            model_type (str | None): Model architecture identifier used as a
-                fallback hint (e.g. ``"llama"``, ``"qwen2"``).
-
-        Returns:
-            The detected :class:`ToolParserName` or ``None`` if nothing matched.
-        """
-
-        from easydel.inference.tools.auto_detect import detect_tool_parser
-
-        detected = detect_tool_parser(model_type=model_type, tokenizer=tokenizer)
-        return detected or None
-
-    @staticmethod
-    def _auto_detect_reasoning_parser_name(
-        *,
-        tokenizer: PreTrainedTokenizerBase | None,
-        model_type: str | None,
-    ) -> ReasoningParserName | None:
-        """Infer the reasoning parser from tokenizer/template hints and model type.
-
-        Args:
-            tokenizer (PreTrainedTokenizerBase | None): Tokenizer whose chat
-                template and special tokens may signal a reasoning format
-                (``<think>`` tags, etc.).
-            model_type (str | None): Model architecture identifier used as a
-                fallback hint.
-
-        Returns:
-            The detected :class:`ReasoningParserName` or ``None`` if nothing
-            matched.
-        """
-
-        from easydel.inference.reasoning.auto_detect import detect_reasoning_parser
-
-        detected = detect_reasoning_parser(model_type=model_type, tokenizer=tokenizer)
-        return detected or None
 
     def __init__(
         self,
@@ -670,9 +496,6 @@ class eSurge(
                 ``distributed_auth_token`` / ``distributed_world_size`` are
                 missing or ``overlap_execution=True`` is also set.
         """
-        from easydel.infra import EasyDeLBaseConfigDict
-        from easydel.layers.attention import AttentionMechanisms
-        from easydel.modules.auto import AutoEasyDeLModelForCausalLM
         from easydel.modules.auto.auto_modeling import PreTrainedLoading
 
         loading_data = dict(loading_kwargs or {})
@@ -790,55 +613,28 @@ class eSurge(
             self.distributed_world_size = 1
             self.distributed_rank = 0
 
-        # `processor` is the unified interface for text + multimodal workflows.
-        processor_obj: Any | None = processor
-        processor_source: str | None = None
-
-        if processor_obj is None:
-            if isinstance(model, str):
-                processor_source = model
-                processor_obj = AutoTokenizer.from_pretrained(model)
-            else:
-                raise ValueError("Processor must be provided when using a preloaded model.")
-        elif isinstance(processor_obj, str):
-            processor_source = processor_obj
-            processor_obj = AutoTokenizer.from_pretrained(processor_obj)
-        else:
-            processor_source = getattr(processor_obj, "name_or_path", None)
-
-        tokenizer_obj: PreTrainedTokenizerBase | None = None
-        if isinstance(processor_obj, PreTrainedTokenizerBase):
-            tokenizer_obj = processor_obj
-        else:
-            maybe_tok = getattr(processor_obj, "tokenizer", None)
-            if isinstance(maybe_tok, PreTrainedTokenizerBase):
-                tokenizer_obj = maybe_tok
-
-        if tokenizer_obj is None:
-            source = processor_source or (model if isinstance(model, str) else None)
-            if source is None:
-                raise ValueError(
-                    "Tokenizer must be provided (or inferable from processor) when using a preloaded model."
-                )
-            tokenizer_obj = AutoTokenizer.from_pretrained(source)
-
-        tokenizer_source = (
-            getattr(tokenizer_obj, "name_or_path", None)
-            or processor_source
-            or (model if isinstance(model, str) else None)
+        assets = build_engine_assets(
+            model=model,
+            processor=processor,
+            loading_kwargs=self.loading_kwargs,
+            runtime_config=self.runtime_config,
+            parsing_config=self.parsing_config,
+            drafter_config=self.drafter_config,
+            drafter=drafter,
+            data_parallelism_axis=self.data_parallelism_axis,
+            dtype=dtype,
         )
-        if tokenizer_source is None:
-            raise ValueError("Could not infer a tokenizer source for tokenizer/detokenizer workers.")
-
-        self.processor = processor_obj
-        self.tokenizer = tokenizer_obj
+        model = assets.model
+        self.processor = assets.processor
+        self.tokenizer = assets.tokenizer
+        self._apply_data_parallel_axis_to_model(model)
 
         # Vision-language model support
         self._multimodal_manager: MultiModalManager | None = None
         if self.processor is not None:
             self._multimodal_manager = MultiModalManager(
                 processor=self.processor,
-                model=None if isinstance(model, str) else model,
+                model=model,
                 resolution_buckets=self.vision_config.resolution_buckets,
                 cache_capacity_mb=self.vision_config.vision_cache_capacity_mb,
                 enable_cache=True,
@@ -871,7 +667,9 @@ class eSurge(
         tokenizer_endpoint = self.worker_config.tokenizer_endpoint or os.environ.get("EASURGE_TOKENIZER_ENDPOINT")
         detokenizer_endpoint = self.worker_config.detokenizer_endpoint or os.environ.get("EASURGE_DETOKENIZER_ENDPOINT")
 
-        self._worker_manager = WorkerManager(tokenizer_source, startup_timeout=self.worker_config.worker_startup_timeout)
+        self._worker_manager = WorkerManager(
+            assets.tokenizer_source, startup_timeout=self.worker_config.worker_startup_timeout
+        )
         self._tokenizer_client, self._detokenizer_client = self._worker_manager.start(
             detokenizer_max_states=self.worker_config.detokenizer_max_states,
             tokenizer_endpoint=tokenizer_endpoint,
@@ -881,219 +679,12 @@ class eSurge(
         self._detokenizer_endpoint = self._worker_manager.detokenizer_endpoint
         self._worker_startup_timeout = self._worker_manager._startup_timeout
 
-        if isinstance(model, str):
-            backend = jax.default_backend()
-            preferred_attn_mechanism = (
-                AttentionMechanisms.UNIFIED_ATTENTION
-                if backend == "gpu"
-                else AttentionMechanisms.RAGGED_PAGE_ATTENTION_V3
-            )
-            user_config_kwargs = dict(self.loading_kwargs.config_kwargs or {})
-            user_provided_attn = "attn_mechanism" in user_config_kwargs
-            requested_attn = user_config_kwargs.get("attn_mechanism") if user_provided_attn else None
-            if requested_attn is None:
-                user_provided_attn = False
+        self.tool_parser = assets.tool_parser_name
+        self.reasoning_parser_name = assets.reasoning_parser_name
+        self._tool_parser_class = assets.tool_parser_class
+        self._reasoning_parser_class = assets.reasoning_parser_class
 
-            if user_provided_attn:
-                attn_value = (
-                    requested_attn.value
-                    if isinstance(requested_attn, AttentionMechanisms)
-                    else str(requested_attn)
-                    if requested_attn is not None
-                    else None
-                )
-                if backend == "gpu" and attn_value in (
-                    AttentionMechanisms.RAGGED_PAGE_ATTENTION_V2.value,
-                    AttentionMechanisms.RAGGED_PAGE_ATTENTION_V3.value,
-                ):
-                    logger.warning(
-                        "GPU backend detected: `unified_attention` is preferred for eSurge inference; "
-                        f"got attn_mechanism={attn_value!r}."
-                    )
-                elif backend != "gpu" and attn_value == AttentionMechanisms.PAGED_FLASH_ATTENTION.value:
-                    logger.warning(
-                        "Paged flash attention is CUDA-only; non-GPU backends are not supported. "
-                        f"got attn_mechanism={attn_value!r}."
-                    )
-                elif backend == "tpu" and attn_value == AttentionMechanisms.UNIFIED_ATTENTION.value:
-                    logger.warning(
-                        "TPU backend detected: `ragged_page_attention_v3` is preferred for eSurge inference; "
-                        f"got attn_mechanism={attn_value!r}."
-                    )
-                elif backend == "tpu" and attn_value == AttentionMechanisms.RAGGED_PAGE_ATTENTION_V2.value:
-                    logger.warning(
-                        "TPU backend detected: `ragged_page_attention_v3` is preferred for eSurge inference; "
-                        f"got attn_mechanism={attn_value!r}."
-                    )
-
-            sharding_axis_names_resolved = tuple(self.loading_kwargs.sharding_axis_names)
-            if self.data_parallelism_axis not in sharding_axis_names_resolved:
-                logger.warning(
-                    "`data_parallelism_axis=%r` not found in `sharding_axis_names=%r`; "
-                    "KV page sharding will behave as unsharded for that axis.",
-                    self.data_parallelism_axis,
-                    sharding_axis_names_resolved,
-                )
-
-            user_config_kwargs.pop("attn_mechanism", None)
-
-            loading = self.loading_kwargs.to_dict()
-            loading["dtype"] = dtype
-            loading["param_dtype"] = dtype
-            loading["precision"] = jax.lax.Precision.DEFAULT
-            loading["sharding_axis_dims"] = tuple(self.loading_kwargs.sharding_axis_dims)
-            loading["sharding_axis_names"] = sharding_axis_names_resolved
-            loading["config_kwargs"] = EasyDeLBaseConfigDict(
-                attn_mechanism=requested_attn if user_provided_attn else preferred_attn_mechanism,
-                attn_dtype=dtype,
-                kvdtype=dtype,
-                freq_max_position_embeddings=self.runtime_config.max_model_len,
-                mask_max_position_embeddings=self.runtime_config.max_model_len,
-                **user_config_kwargs,
-            )
-
-            with set_inference_mode():
-                model = AutoEasyDeLModelForCausalLM.from_pretrained(**loading)
-            text_config = model.config.get_text_config()
-            has_mla_attention, has_non_mla_attention = _detect_mla_attention_mix(model, text_config)
-
-            _num_heads = getattr(text_config, "num_attention_heads", 0) or 0
-            _mla_kernel_compatible = int(_num_heads) > 0
-
-            if has_mla_attention and _mla_kernel_compatible:
-                attn_value = _normalize_attn_mechanism_value(getattr(text_config, "attn_mechanism", None))
-                mla_compatible = attn_value in _MLA_RAGGED_ATTN_MECHANISMS
-                if jax.default_backend() == "gpu":
-                    mla_compatible = mla_compatible or attn_value in {
-                        AttentionMechanisms.UNIFIED_ATTENTION.value,
-                        AttentionMechanisms.PAGED_FLASH_ATTENTION.value,
-                    }
-                if not mla_compatible:
-                    if has_non_mla_attention:
-                        logger.warning(
-                            "Mixed MLA and non-MLA full-attention layers detected, "
-                            "but forcing all inference layers to "
-                            f"{MLA_RAGGED_ATTN_MECHANISM!r}."
-                        )
-                    logger.info(
-                        "MLA architecture detected; forcing inference attention mechanism to "
-                        f"{MLA_RAGGED_ATTN_MECHANISM!r}."
-                    )
-                    compat_graphdef = model.new_graphdef(
-                        recursive_update=True,
-                        attn_mechanism=MLA_RAGGED_ATTN_MECHANISM,
-                        decode_attn_mechanism=MLA_RAGGED_ATTN_MECHANISM,
-                        mla_attn_mechanism=MLA_RAGGED_ATTN_MECHANISM,
-                    )
-                    model = model.merge_module(compat_graphdef, model.graphstate, model.graphother)
-            elif has_mla_attention and not _mla_kernel_compatible:
-                fallback_attn = (
-                    AttentionMechanisms.UNIFIED_ATTENTION
-                    if jax.default_backend() == "gpu"
-                    else AttentionMechanisms.RAGGED_PAGE_ATTENTION_V3
-                )
-                logger.info(
-                    f"MLA architecture detected but num_attention_heads <= 0; falling back to {fallback_attn.value!r}."
-                )
-                compat_graphdef = model.new_graphdef(
-                    recursive_update=True,
-                    attn_mechanism=fallback_attn,
-                    decode_attn_mechanism=fallback_attn,
-                )
-                model = model.merge_module(compat_graphdef, model.graphstate, model.graphother)
-
-        self._apply_data_parallel_axis_to_model(model)
-
-        if self._multimodal_manager is not None and self._multimodal_manager.model is None:
-            self._multimodal_manager.model = model
-
-        detected_model_type = getattr(getattr(model, "config", None), "model_type", None)
-        tool_parser = self.parsing_config.tool_parser
-        if tool_parser is None:
-            tool_parser = self._auto_detect_tool_parser(
-                tokenizer=self.tokenizer,
-                model_type=detected_model_type,
-            )
-        reasoning_parser = self.parsing_config.reasoning_parser
-        if reasoning_parser is None:
-            reasoning_parser = self._auto_detect_reasoning_parser_name(
-                tokenizer=self.tokenizer,
-                model_type=detected_model_type,
-            )
-
-        self.tool_parser = tool_parser
-        self.reasoning_parser_name = reasoning_parser
-        self._tool_parser_class = None
-        self._reasoning_parser_class = None
-
-        if tool_parser:
-            try:
-                from easydel.inference.tools import ToolParserManager
-                from easydel.inference.tools.tool_calling_mixin import build_tool_parser_or_none
-
-                parser_class = ToolParserManager.get_tool_parser(tool_parser)
-                # Validate the parser can actually construct against this
-                # tokenizer up front. Some parsers (e.g. mistral) require a
-                # special delimiter token in the vocabulary and raise in
-                # __init__ otherwise; a model whose type auto-selects such a
-                # parser (mistral4 -> mistral) but whose tokenizer lacks the
-                # token would otherwise crash at request-add time. Degrade
-                # gracefully by disabling function calling instead.
-                probe = build_tool_parser_or_none(parser_class, self.tokenizer, context=f"tool parser '{tool_parser}'")
-                if probe is None:
-                    self._tool_parser_class = None
-                    self.tool_parser = None
-                else:
-                    self._tool_parser_class = parser_class
-                    if not self.parsing_config.silent_mode:
-                        logger.info("Initialized tool parser: %s", tool_parser)
-            except KeyError:
-                logger.warning("Tool parser '%s' not found, function calling disabled", tool_parser)
-
-        if reasoning_parser:
-            try:
-                from easydel.inference.reasoning import ReasoningParserManager
-
-                self._reasoning_parser_class = ReasoningParserManager.get_reasoning_parser(reasoning_parser)
-                if not self.parsing_config.silent_mode:
-                    logger.info("Initialized reasoning parser: %s", reasoning_parser)
-            except KeyError:
-                logger.warning("Reasoning parser '%s' not found, reasoning disabled", reasoning_parser)
-
-        auto_drafter_requested = drafter is True
-        if drafter is True or drafter is False:
-            drafter = None
-
-        if self.drafter_config.enabled:
-            if drafter is not None:
-                raise ValueError("Pass either an explicit `drafter` object or `drafter_config`, not both.")
-            drafter_kwargs = dict(self.drafter_config.kwargs or {})
-            if self.drafter_config.target_embed_module is not None:
-                drafter_kwargs.setdefault("target_embed_module", self.drafter_config.target_embed_module)
-            if self.drafter_config.layer_mapping is not None:
-                drafter_kwargs.setdefault("layer_mapping", list(self.drafter_config.layer_mapping))
-            assistant_model = self.drafter_config.assistant_model
-            if assistant_model is not None and isinstance(assistant_model, str):
-                assistant_loading = self.loading_kwargs.to_dict()
-                assistant_loading["pretrained_model_name_or_path"] = assistant_model
-                assistant_loading["dtype"] = dtype
-                assistant_loading["param_dtype"] = dtype
-                assistant_loading.pop("processor", None)
-                assistant_loading.pop("tokenizer", None)
-                assistant_loading.pop("config_kwargs", None)
-                assistant_model = AutoEasyDeLModelForCausalLM.from_pretrained(**assistant_loading)
-            drafter = model.drafter(
-                method=self.drafter_config.method or "auto",
-                num_draft_tokens=int(self.drafter_config.num_draft_tokens),
-                assistant_model=assistant_model,
-                **drafter_kwargs,
-            )
-
-        if auto_drafter_requested and drafter is None:
-            drafter = model.drafter(
-                method="auto",
-                num_draft_tokens=int(self.drafter_config.num_draft_tokens),
-            )
+        drafter = assets.drafter
         self.drafter = drafter
         runner_async_scheduling = bool(self.runtime_config.async_scheduling)
         if drafter is not None and runner_async_scheduling:
@@ -1124,7 +715,7 @@ class eSurge(
         self._profiling_output_dir: str | None = None
         self._profiling_host_level: int | None = None
         self._profiling_python_level: int | None = None
-        self._possible_name = self._get_model_name(model)
+        self._possible_name = assets.model_name
 
         self.runtime_config.async_scheduling = bool(self.runtime_config.async_scheduling)
 
@@ -1210,49 +801,10 @@ class eSurge(
         self._scheduler_exception: BaseException | None = None
         self._scheduler_exception_tb: str | None = None
 
-        generation_config = getattr(model, "generation_config", None)
-        if isinstance(generation_config, dict):
-            self._generation_config_dict = dict(generation_config)
-        elif generation_config is not None and hasattr(generation_config, "to_dict"):
-            try:
-                self._generation_config_dict = generation_config.to_dict()
-            except Exception:
-                self._generation_config_dict = {}
-                logger.debug("Failed to serialize model generation_config; continuing without it", exc_info=True)
-        else:
-            self._generation_config_dict = {}
-
-        def _coerce_token_ids(raw: Any) -> list[int]:
-            if raw is None:
-                return []
-            candidates = raw if isinstance(raw, (list, tuple, set)) else [raw]
-            token_ids: list[int] = []
-            for candidate in candidates:
-                if candidate is None:
-                    continue
-                try:
-                    token_id = int(candidate)
-                except (TypeError, ValueError):
-                    logger.debug("Ignoring non-integer EOS token candidate: %r", candidate)
-                    continue
-                token_ids.append(token_id)
-            return token_ids
-
-        tokenizer_eos_ids = _coerce_token_ids(getattr(self.tokenizer, "eos_token_id", None))
-        generation_config_eos_ids = _coerce_token_ids(self._generation_config_dict.get("eos_token_id"))
-        engine_extra_eos_ids = _coerce_token_ids(self.extra_eos_token_ids)
-
-        combined_eos_ids: list[int] = []
-        seen_eos_ids: set[int] = set()
-        for token_id in [*tokenizer_eos_ids, *generation_config_eos_ids, *engine_extra_eos_ids]:
-            if token_id in seen_eos_ids:
-                continue
-            seen_eos_ids.add(token_id)
-            combined_eos_ids.append(token_id)
-
-        self._generation_config_eos_token_ids = generation_config_eos_ids
-        self.__eos_ids = combined_eos_ids
-        self.__eos_set = set(combined_eos_ids)
+        self._generation_config_dict = assets.generation_config_dict
+        self._generation_config_eos_token_ids = assets.generation_config_eos_ids
+        self.__eos_ids = list(assets.eos_token_ids)
+        self.__eos_set = set(assets.eos_token_ids)
         self._primary_eos_token_id = self.__eos_ids[0] if self.__eos_ids else None
         # Publicly-named aliases for mixins/helpers to avoid class-name mangling.
         self._eos_ids = self.__eos_ids
@@ -1295,46 +847,6 @@ class eSurge(
             self._distributed_config_fingerprint = None
 
         self.initiate()
-
-    def _calculate_model_size(self, graphstate) -> str:
-        """Calculate the model size in billions of parameters.
-
-        Args:
-            graphstate: The model's graph state containing parameter arrays.
-
-        Returns:
-            String representation of model size in billions (e.g., "7.00").
-            Returns "unknown" if calculation fails.
-        """
-        try:
-            num_params = sum(n.size for n in jax.tree_util.tree_flatten(graphstate)[0])
-            return f"{num_params / 1e9:.2f}"
-        except Exception:
-            return "unknown"
-
-    def _get_model_type(self, model) -> str:
-        """Get the model type from its configuration.
-
-        Args:
-            model: The EasyDeL model instance.
-
-        Returns:
-            Lowercase model type string (e.g., "llama", "mistral", "unknown").
-        """
-        return getattr(model.config, "model_type", "unknown").lower()
-
-    def _get_model_name(self, model) -> str:
-        """Generate a human-readable model name.
-
-        Args:
-            model: The EasyDeL model instance.
-
-        Returns:
-            String in format "{model_type}-{size}b" (e.g., "llama-7.00b").
-        """
-        model_type = self._get_model_type(model)
-        model_size = self._calculate_model_size(model.graphstate)
-        return f"{model_type}-{model_size}b"
 
     @cached_property
     def esurge_name(self) -> str:

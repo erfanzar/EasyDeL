@@ -17,7 +17,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
-from easydel.inference.esurge.esurge_engine import CompletionOutput, RequestOutput, eSurge
+from easydel.inference.esurge.esurge_engine import CompletionOutput, RequestOutput
 from easydel.inference.esurge.server.api_server import eSurgeApiServer
 from easydel.inference.inference_engine_interface import BaseInferenceApiServer
 from easydel.inference.openai_api_modules import (
@@ -191,7 +191,9 @@ def test_esurge_auto_detect_tool_parser_uses_tokenizer_hints_without_model_type(
         def get_vocab():
             return {}
 
-    detected = eSurge._auto_detect_tool_parser(
+    from easydel.inference.esurge.engine.bootstrap import auto_detect_tool_parser
+
+    detected = auto_detect_tool_parser(
         tokenizer=DummyTokenizer(),
         model_type=None,
     )
