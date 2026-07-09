@@ -106,6 +106,7 @@ from .sequence_buffer import (
 )
 from .slot_pool import RecurrentSlotPool
 from .states import CachedRequestState
+from .vlm_prefill import VlmPrefillHelper
 from .window_planner import WindowPlanner
 
 if typing.TYPE_CHECKING:
@@ -370,13 +371,6 @@ class eSurgeRunner:
         self._spec_verify_sample_fns: dict[tuple, typing.Callable] = {}
         self._spec_recurrent_commit_fn: typing.Callable | None = None
         self._spec_recurrent_commit_candidate_count: int = 0
-        self.compile_vision_encoder = bool(compile_vision_encoder)
-        self.vision_patch_buckets = (
-            [int(bucket) for bucket in vision_patch_buckets] if vision_patch_buckets is not None else None
-        )
-        self._vlm_image_features_jit: typing.Callable | None = None
-        self._vlm_video_features_jit: typing.Callable | None = None
-        self._vlm_vision_jit_disabled = False
         self.spec_decode_reject_backoff_steps = 0
         self._spec_decode_backoff_by_req: dict[str, int] = {}
         logger.debug(f"Initializing eSurgeRunner with {max_model_len=}, {max_num_seqs=}")
@@ -490,6 +484,14 @@ class eSurgeRunner:
         self.window_planner = WindowPlanner(
             num_tokens_paddings=self.num_tokens_paddings,
             max_num_seq_buckets=self.max_num_seq_buckets,
+        )
+        self.vlm = VlmPrefillHelper(
+            model_getter=lambda: self.model,
+            metadata=self.metadata,
+            compile_vision_encoder=compile_vision_encoder,
+            vision_patch_buckets=vision_patch_buckets,
+            max_num_batched_tokens=self.max_num_batched_tokens,
+            max_num_tokens=self.max_num_tokens,
         )
         spec_full_hidden_max_tokens = 0
         if drafter is not None:
@@ -1083,16 +1085,7 @@ class eSurgeRunner:
 
         # VLM host-side scratch buffers keyed by `num_tokens_static` (avoid repeated
         # large allocations while keeping the step-function input pytree stable).
-        self._vlm_cpu_buffers: dict[
-            int,
-            tuple[
-                np.ndarray | None,  # prefill_embeds_cpu
-                np.ndarray | None,  # prefill_embeds_mask_cpu
-                np.ndarray | None,  # mrope_position_ids_cpu
-                np.ndarray | None,  # visual_pos_masks_cpu
-                list[np.ndarray] | None,  # deepstack_visual_embeds_cpu
-            ],
-        ] = {}
+        self.vlm.reset_cpu_buffers()
 
     def _get_vlm_cpu_buffers(
         self,
@@ -1102,75 +1095,12 @@ class eSurgeRunner:
     ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None, list[np.ndarray] | None]:
         """Get or create cached CPU buffers for VLM prefill data.
 
-        Retrieves pre-allocated CPU buffers for VLM embedding overrides,
-        keyed by num_tokens_static to avoid repeated allocations while
-        keeping the step function input shape stable.
-
-        Args:
-            num_tokens_static: Token count bucket size for buffer sizing.
-            uses_mrope_model: Whether the model uses mRoPE positions.
-
-        Returns:
-            Tuple of (prefill_embeds_cpu, prefill_embeds_mask_cpu,
-            mrope_position_ids_cpu, visual_pos_masks_cpu,
-            deepstack_visual_embeds_cpu) where optional arrays are
-            None if not applicable.
-
-        Side Effects:
-            - Creates and caches buffers in self._vlm_cpu_buffers.
-            - Clears masks/position buffers each call (filled by caller).
+        Delegates to :meth:`VlmPrefillHelper.get_cpu_buffers`.
         """
-        num_tokens_static = int(num_tokens_static)
-        cached = self._vlm_cpu_buffers.get(num_tokens_static)
-        if cached is None:
-            hidden_size = int(getattr(self.model.config.get_text_config(), "hidden_size", 0) or 1)
-
-            prefill_embeds_cpu = np.zeros((num_tokens_static, hidden_size), dtype=np.float16)
-            prefill_embeds_mask_cpu = np.zeros((num_tokens_static,), dtype=bool)
-
-            mrope_position_ids_cpu = None
-            visual_pos_masks_cpu = None
-            deepstack_visual_embeds_cpu = None
-            if uses_mrope_model:
-                mrope_position_ids_cpu = np.zeros((3, num_tokens_static), dtype=np.int32)
-                deepstack_indexes = getattr(
-                    getattr(self.model.config, "vision_config", None),
-                    "deepstack_visual_indexes",
-                    None,
-                )
-                deepstack_layers = len(deepstack_indexes) if deepstack_indexes else 0
-                if deepstack_layers:
-                    visual_pos_masks_cpu = np.zeros((num_tokens_static,), dtype=bool)
-                    deepstack_visual_embeds_cpu = [
-                        np.zeros((num_tokens_static, hidden_size), dtype=np.float16) for _ in range(deepstack_layers)
-                    ]
-
-            cached = (
-                prefill_embeds_cpu,
-                prefill_embeds_mask_cpu,
-                mrope_position_ids_cpu,
-                visual_pos_masks_cpu,
-                deepstack_visual_embeds_cpu,
-            )
-            self._vlm_cpu_buffers[num_tokens_static] = cached
-
-        (
-            prefill_embeds_cpu,
-            prefill_embeds_mask_cpu,
-            mrope_position_ids_cpu,
-            visual_pos_masks_cpu,
-            deepstack_visual_embeds_cpu,
-        ) = cached
-
-        # Clear masks/position ids each step; large embed buffers are overwritten only
-        # for the masked regions, and ignored otherwise.
-        prefill_embeds_mask_cpu.fill(False)
-        if mrope_position_ids_cpu is not None:
-            mrope_position_ids_cpu.fill(0)
-        if visual_pos_masks_cpu is not None:
-            visual_pos_masks_cpu.fill(False)
-
-        return cached
+        return self.vlm.get_cpu_buffers(
+            num_tokens_static=num_tokens_static,
+            uses_mrope_model=uses_mrope_model,
+        )
 
     def _get_window_state_views(
         self,
@@ -1611,205 +1541,124 @@ class eSurgeRunner:
         )
         return
 
+    # --- VLM prefill passthroughs ---------------------------------------------------
+    # The VLM prefill machinery lives on ``self.vlm`` (:class:`VlmPrefillHelper`).
+    # The historical runner method/attribute names are kept as thin delegators
+    # and properties so _execute_model_impl, compile(), weight-update paths, and
+    # external tests are untouched.
+
+    @property
+    def compile_vision_encoder(self) -> bool:
+        """Whether the bucketed vision JIT path is enabled (see :class:`VlmPrefillHelper`)."""
+        return self.vlm.compile_vision_encoder
+
+    @property
+    def vision_patch_buckets(self) -> list[int] | None:
+        """Raw patch-count buckets for vision precompile (see :class:`VlmPrefillHelper`)."""
+        return self.vlm.vision_patch_buckets
+
+    @property
+    def _vlm_image_features_jit(self) -> typing.Callable | None:
+        """Cached image-features JIT closure (see :class:`VlmPrefillHelper`)."""
+        return self.vlm.image_features_jit
+
+    @_vlm_image_features_jit.setter
+    def _vlm_image_features_jit(self, value: typing.Callable | None) -> None:
+        self.vlm.image_features_jit = value
+
+    @property
+    def _vlm_video_features_jit(self) -> typing.Callable | None:
+        """Cached video-features JIT closure (see :class:`VlmPrefillHelper`)."""
+        return self.vlm.video_features_jit
+
+    @_vlm_video_features_jit.setter
+    def _vlm_video_features_jit(self, value: typing.Callable | None) -> None:
+        self.vlm.video_features_jit = value
+
+    @property
+    def _vlm_vision_jit_disabled(self) -> bool:
+        """Sticky vision-JIT fallback flag (see :class:`VlmPrefillHelper`)."""
+        return self.vlm.vision_jit_disabled
+
+    @_vlm_vision_jit_disabled.setter
+    def _vlm_vision_jit_disabled(self, value: bool) -> None:
+        self.vlm.vision_jit_disabled = value
+
+    @property
+    def _vlm_cpu_buffers(self):
+        """Host-side VLM scratch buffers keyed by bucket (see :class:`VlmPrefillHelper`)."""
+        return self.vlm.cpu_buffers
+
     @staticmethod
     def _static_grid_thw(grid: np.ndarray | jax.Array | tuple | list | None) -> tuple[tuple[int, int, int], ...] | None:
-        """Convert a processor grid into a hashable static JIT argument."""
-        if grid is None:
-            return None
-        arr = np.asarray(grid, dtype=np.int64)
-        if arr.size == 0:
-            return None
-        if arr.ndim == 1:
-            if arr.shape[0] != 3:
-                return None
-            arr = arr.reshape(1, 3)
-        if arr.ndim != 2 or arr.shape[-1] != 3:
-            return None
-        return tuple(tuple(int(v) for v in row) for row in arr.tolist())
+        """Convert a processor grid into a hashable static JIT argument.
+
+        Delegates to :meth:`VlmPrefillHelper.static_grid_thw`.
+        """
+        return VlmPrefillHelper.static_grid_thw(grid)
 
     @staticmethod
     def _max_grid_size(grid: tuple[tuple[int, int, int], ...] | None) -> int | None:
-        """Return the static max spatial grid size used by Qwen-style vision towers."""
-        if not grid:
-            return None
-        return max(max(int(row[1]), int(row[2])) for row in grid)
+        """Return the static max spatial grid size used by Qwen-style vision towers.
+
+        Delegates to :meth:`VlmPrefillHelper.max_grid_size`.
+        """
+        return VlmPrefillHelper.max_grid_size(grid)
 
     @staticmethod
     def _block_tree_until_ready(value: typing.Any) -> None:
-        for leaf in jax.tree_util.tree_leaves(value):
-            if hasattr(leaf, "block_until_ready"):
-                leaf.block_until_ready()
+        """Block until every device-array leaf in ``value`` is ready.
+
+        Delegates to :meth:`VlmPrefillHelper.block_tree_until_ready`.
+        """
+        VlmPrefillHelper.block_tree_until_ready(value)
 
     def _vlm_uses_deepstack_visuals(self) -> bool:
-        vision_config = getattr(getattr(self.model, "config", None), "vision_config", None)
-        deepstack_indexes = getattr(vision_config, "deepstack_visual_indexes", None)
-        return bool(deepstack_indexes)
+        """Delegates to :meth:`VlmPrefillHelper.uses_deepstack_visuals`."""
+        return self.vlm.uses_deepstack_visuals()
 
     def _vision_patch_input_dim(self) -> int | None:
-        vision_config = getattr(getattr(self.model, "config", None), "vision_config", None)
-        if vision_config is None:
-            return None
-        try:
-            in_channels = int(vision_config.in_channels)
-            temporal_patch_size = int(vision_config.temporal_patch_size)
-            patch_size = int(vision_config.patch_size)
-        except (TypeError, ValueError, AttributeError):
-            return None
-        return in_channels * temporal_patch_size * patch_size * patch_size
+        """Delegates to :meth:`VlmPrefillHelper.vision_patch_input_dim`."""
+        return self.vlm.vision_patch_input_dim()
 
     def _vision_spatial_merge_size(self) -> int:
-        vision_config = getattr(getattr(self.model, "config", None), "vision_config", None)
-        try:
-            return max(1, int(getattr(vision_config, "spatial_merge_size", 1) or 1))
-        except (TypeError, ValueError):
-            return 1
+        """Delegates to :meth:`VlmPrefillHelper.vision_spatial_merge_size`."""
+        return self.vlm.vision_spatial_merge_size()
 
     def _vision_dtype(self) -> jnp.dtype:
-        base_model = getattr(self.model, "base_model", self.model)
-        visual = getattr(base_model, "visual", getattr(self.model, "visual", None))
-        if visual is not None and callable(getattr(visual, "get_dtype", None)):
-            dtype = visual.get_dtype()
-        else:
-            dtype = getattr(self.model, "dtype", jnp.bfloat16)
-        try:
-            return jnp.dtype(dtype)
-        except TypeError:
-            return jnp.bfloat16
+        """Delegates to :meth:`VlmPrefillHelper.vision_dtype`."""
+        return self.vlm.vision_dtype()
 
     def _vision_grid_for_patch_bucket(self, raw_patches: int) -> tuple[int, tuple[int, int, int]]:
-        spatial_merge = self._vision_spatial_merge_size()
-        merge_unit = spatial_merge * spatial_merge
-        raw_patches = max(merge_unit, int(raw_patches))
-        if raw_patches % merge_unit:
-            raw_patches = ((raw_patches + merge_unit - 1) // merge_unit) * merge_unit
-
-        merged_tokens = max(1, raw_patches // merge_unit)
-        h_merged = max(1, int(np.sqrt(merged_tokens)))
-        while h_merged > 1 and merged_tokens % h_merged:
-            h_merged -= 1
-        w_merged = max(1, merged_tokens // h_merged)
-        return raw_patches, (1, h_merged * spatial_merge, w_merged * spatial_merge)
+        """Delegates to :meth:`VlmPrefillHelper.vision_grid_for_patch_bucket`."""
+        return self.vlm.vision_grid_for_patch_bucket(raw_patches)
 
     def _vision_patch_buckets_for_compile(self, *, max_num_batched_tokens: int | None) -> list[int]:
-        if self.vision_patch_buckets is not None:
-            return sorted({max(1, int(bucket)) for bucket in self.vision_patch_buckets})
-
-        spatial_merge = self._vision_spatial_merge_size()
-        merge_unit = spatial_merge * spatial_merge
-        token_budget = max(1, int(max_num_batched_tokens or self.max_num_batched_tokens or self.max_num_tokens))
-        max_patches = max(16, token_budget // merge_unit)
-        min_shift = 4
-        max_shift = max(min_shift, (max_patches - 1).bit_length())
-        return [1 << shift for shift in range(min_shift, max_shift + 1)]
+        """Delegates to :meth:`VlmPrefillHelper.vision_patch_buckets_for_compile`."""
+        return self.vlm.vision_patch_buckets_for_compile(max_num_batched_tokens=max_num_batched_tokens)
 
     def _get_vlm_image_features_jit(self) -> typing.Callable:
-        if self._vlm_image_features_jit is None:
-            model = self.model
-
-            @partial(jax.jit, static_argnames=("image_grid_thw", "image_max_grid_size"))
-            def _image_features(
-                pixel_values: jax.Array,
-                *,
-                image_grid_thw: tuple[tuple[int, int, int], ...],
-                image_max_grid_size: int | None,
-            ):
-                image_embeds_tuple, deepstack_image_embeds = model.get_image_features(
-                    pixel_values,
-                    image_grid_thw,
-                    image_max_grid_size,
-                )
-                deepstack = () if deepstack_image_embeds is None else tuple(deepstack_image_embeds)
-                return jnp.concatenate(image_embeds_tuple, axis=0), deepstack
-
-            self._vlm_image_features_jit = _image_features
-        return self._vlm_image_features_jit
+        """Delegates to :meth:`VlmPrefillHelper.get_image_features_jit`."""
+        return self.vlm.get_image_features_jit()
 
     def _get_vlm_video_features_jit(self) -> typing.Callable:
-        if self._vlm_video_features_jit is None:
-            model = self.model
-
-            @partial(jax.jit, static_argnames=("video_grid_thw", "video_max_grid_size"))
-            def _video_features(
-                pixel_values_videos: jax.Array,
-                *,
-                video_grid_thw: tuple[tuple[int, int, int], ...],
-                video_max_grid_size: int | None,
-            ):
-                video_embeds_tuple, deepstack_video_embeds = model.get_video_features(
-                    pixel_values_videos,
-                    video_grid_thw,
-                    video_max_grid_size,
-                )
-                deepstack = () if deepstack_video_embeds is None else tuple(deepstack_video_embeds)
-                return jnp.concatenate(video_embeds_tuple, axis=0), deepstack
-
-            self._vlm_video_features_jit = _video_features
-        return self._vlm_video_features_jit
+        """Delegates to :meth:`VlmPrefillHelper.get_video_features_jit`."""
+        return self.vlm.get_video_features_jit()
 
     def _compute_embedding_with_info_single_pass(
         self,
         input_ids: jax.Array,
         embed_kwargs: dict[str, typing.Any],
     ) -> tuple[jax.Array, typing.Any]:
-        """Compute VLM embeddings while avoiding wrapper-level duplicate vision work."""
-        base_model = getattr(self.model, "base_model", None)
-        base_fn = getattr(base_model, "compute_embedding_with_info", None) if base_model is not None else None
-        if callable(base_fn):
-            try:
-                return base_fn(input_ids, **embed_kwargs)
-            except TypeError:
-                pass
-        return self.model.compute_embedding_with_info(input_ids, **embed_kwargs)
+        """Compute VLM embeddings while avoiding wrapper-level duplicate vision work.
+
+        Delegates to :meth:`VlmPrefillHelper.compute_embedding_with_info_single_pass`.
+        """
+        return self.vlm.compute_embedding_with_info_single_pass(input_ids, embed_kwargs)
 
     def _compiled_vision_embed_kwargs(self, req_state: CachedRequestState) -> dict[str, typing.Any] | None:
-        if (
-            not self.compile_vision_encoder
-            or self._vlm_vision_jit_disabled
-            or self._vlm_uses_deepstack_visuals()
-            or self.model is None
-        ):
-            return None
-        if int(getattr(self.metadata, "data_parallel_size", 1) or 1) > 1:
-            return None
-
-        embed_kwargs: dict[str, typing.Any] = {}
-        try:
-            if req_state.pixel_values is not None:
-                image_grid = self._static_grid_thw(req_state.image_grid_thw)
-                if image_grid is None:
-                    return None
-                image_embeds, deepstack_image_embeds = self._get_vlm_image_features_jit()(
-                    jnp.asarray(req_state.pixel_values),
-                    image_grid_thw=image_grid,
-                    image_max_grid_size=self._max_grid_size(image_grid),
-                )
-                if deepstack_image_embeds:
-                    return None
-                embed_kwargs["image_embeds"] = image_embeds
-                embed_kwargs["image_grid_thw"] = image_grid
-
-            if req_state.pixel_values_videos is not None:
-                video_grid = self._static_grid_thw(req_state.video_grid_thw)
-                if video_grid is None:
-                    return None
-                video_embeds, deepstack_video_embeds = self._get_vlm_video_features_jit()(
-                    jnp.asarray(req_state.pixel_values_videos),
-                    video_grid_thw=video_grid,
-                    video_max_grid_size=self._max_grid_size(video_grid),
-                )
-                if deepstack_video_embeds:
-                    return None
-                embed_kwargs["video_embeds"] = video_embeds
-                embed_kwargs["video_grid_thw"] = video_grid
-        except Exception as exc:
-            self._vlm_vision_jit_disabled = True
-            logger.warning(
-                "VLM vision JIT helper failed; falling back to eager vision precompute: %s",
-                exc,
-            )
-            return None
-
-        return embed_kwargs or None
+        """Delegates to :meth:`VlmPrefillHelper.compiled_vision_embed_kwargs`."""
+        return self.vlm.compiled_vision_embed_kwargs(req_state)
 
     def _compute_vlm_prefill_with_compiled_vision(
         self,
@@ -1817,146 +1666,23 @@ class eSurgeRunner:
         input_ids: jax.Array,
         attention_mask: jax.Array,
     ) -> tuple[jax.Array, typing.Any] | None:
-        vision_kwargs = self._compiled_vision_embed_kwargs(req_state)
-        if vision_kwargs is None:
-            return None
-        embed_kwargs: dict[str, typing.Any] = {"attention_mask": attention_mask}
-        embed_kwargs.update(vision_kwargs)
-        return self._compute_embedding_with_info_single_pass(input_ids, embed_kwargs)
+        """Delegates to :meth:`VlmPrefillHelper.compute_prefill_with_compiled_vision`."""
+        return self.vlm.compute_prefill_with_compiled_vision(
+            req_state=req_state,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
 
     def _precompile_vlm_vision_helpers(self, *, max_num_batched_tokens: int | None) -> None:
-        if (
-            not self.compile_vision_encoder
-            or self._vlm_vision_jit_disabled
-            or self._vlm_uses_deepstack_visuals()
-            or self.model is None
-            or not callable(getattr(self.model, "get_image_features", None))
-        ):
-            return
-        if int(getattr(self.metadata, "data_parallel_size", 1) or 1) > 1:
-            return
-
-        patch_input_dim = self._vision_patch_input_dim()
-        if patch_input_dim is None:
-            return
-
-        buckets = self._vision_patch_buckets_for_compile(max_num_batched_tokens=max_num_batched_tokens)
-        if not buckets:
-            return
-
-        image_features = self._get_vlm_image_features_jit()
-        dtype = self._vision_dtype()
-        logger.info("Precompiling VLM vision feature buckets: %s raw patches", buckets)
-        for bucket in buckets:
-            raw_patches, grid = self._vision_grid_for_patch_bucket(bucket)
-            dummy_pixels = jnp.ones((raw_patches, patch_input_dim), dtype=dtype)
-            try:
-                out = image_features(
-                    dummy_pixels,
-                    image_grid_thw=(grid,),
-                    image_max_grid_size=self._max_grid_size((grid,)),
-                )
-                self._block_tree_until_ready(out)
-            except Exception as exc:
-                self._vlm_vision_jit_disabled = True
-                logger.warning(
-                    "VLM vision JIT precompile failed at raw_patches=%d; falling back to eager vision precompute: %s",
-                    raw_patches,
-                    exc,
-                )
-                return
-        logger.info("VLM vision feature precompilation finished")
+        """Delegates to :meth:`VlmPrefillHelper.precompile_vision_helpers`."""
+        self.vlm.precompile_vision_helpers(max_num_batched_tokens=max_num_batched_tokens)
 
     def _precompute_vlm_prefill(self, req_state: CachedRequestState) -> None:
         """Precompute prompt embeddings (+ optional mRoPE indices) for VLM requests.
 
-        Some VLM base models compute mRoPE indices via NumPy/data-dependent control-flow
-        which is not compatible with JIT/AOT inside the compiled eSurge step. We run
-        those parts eagerly here and store host-side arrays for later reuse.
+        Delegates to :meth:`VlmPrefillHelper.precompute_prefill`.
         """
-        if req_state.vision_processed:
-            return
-
-        uses_mrope = model_uses_mrope(self.model)
-
-        # If raw vision inputs are missing but the request is marked as "has_vision"
-        # (e.g. only cached mm_features remain), skip precompute and treat it as processed.
-        if req_state.pixel_values is None and req_state.pixel_values_videos is None:
-            req_state._vision_processed = True
-            return
-
-        if req_state.prefill_inputs_embeds is not None and (
-            not uses_mrope or req_state.prefill_position_ids is not None
-        ):
-            req_state.clear_vision_data()
-            return
-
-        prompt_ids = np.asarray(req_state.prompt_token_ids, dtype=np.int32)[None, :]
-        input_ids = jnp.asarray(prompt_ids, dtype=jnp.int32)
-        attention_mask = jnp.ones(input_ids.shape, dtype=jnp.int32)
-
-        try:
-            embed_kwargs: dict[str, typing.Any] = {"attention_mask": attention_mask}
-            if req_state.pixel_values is not None:
-                embed_kwargs["pixel_values"] = req_state.pixel_values
-                if req_state.image_grid_thw is not None:
-                    embed_kwargs["image_grid_thw"] = req_state.image_grid_thw
-            if req_state.pixel_values_videos is not None:
-                embed_kwargs["pixel_values_videos"] = req_state.pixel_values_videos
-                if req_state.video_grid_thw is not None:
-                    embed_kwargs["video_grid_thw"] = req_state.video_grid_thw
-
-            compiled_result = self._compute_vlm_prefill_with_compiled_vision(
-                req_state=req_state,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-            )
-            if compiled_result is None:
-                inputs_embeds, info = self._compute_embedding_with_info_single_pass(input_ids, embed_kwargs)
-            else:
-                inputs_embeds, info = compiled_result
-        except Exception as exc:
-            # A vision-encode failure here is NOT silently recoverable. If we
-            # swallow it and return, the compiled step runs against the raw
-            # prompt token ids (image/video placeholder tokens are never
-            # replaced by visual embeddings), which produces coherent-looking
-            # but semantically garbage output. Fail loudly so the request is
-            # rejected instead of served corrupted generations.
-            logger.error(
-                "VLM vision encode failed for req_id=%s; rejecting request to avoid serving garbage output. Error: %s",
-                req_state.req_id,
-                exc,
-            )
-            raise RuntimeError(f"VLM vision encode failed for req_id={req_state.req_id}: {exc}") from exc
-
-        # Store host-side views (keeps compiled step free of vision preprocessing).
-        embeds_host = np.asarray(jax.device_get(inputs_embeds))
-        req_state.prefill_inputs_embeds = embeds_host[0]
-
-        if getattr(info, "position_ids", None) is not None:
-            pos_host = np.asarray(jax.device_get(info.position_ids))
-            if pos_host.ndim == 3:
-                pos_host = pos_host[:, 0, :]
-            req_state.prefill_position_ids = pos_host.astype(np.int32, copy=False)
-
-        if getattr(info, "rope_deltas", None) is not None:
-            req_state.prefill_rope_deltas = np.asarray(jax.device_get(info.rope_deltas)).astype(np.int32, copy=False)
-
-        if getattr(info, "visual_pos_masks", None) is not None:
-            mask_host = np.asarray(jax.device_get(info.visual_pos_masks))
-            if mask_host.ndim == 2:
-                mask_host = mask_host[0]
-            req_state.prefill_visual_pos_masks = mask_host.astype(bool, copy=False)
-
-        deepstack_visual_embeds = getattr(info, "deepstack_visual_embeds", None)
-        if deepstack_visual_embeds is not None:
-            ds_list = []
-            for arr in deepstack_visual_embeds:
-                ds_list.append(np.asarray(jax.device_get(arr)))
-            req_state.prefill_deepstack_visual_embeds = ds_list
-
-        # Raw vision tensors are no longer needed once embeddings are cached.
-        req_state.clear_vision_data()
+        self.vlm.precompute_prefill(req_state)
 
     def _update_states(self, scheduler_output: SchedulerOutput) -> bool:
         """Update internal states based on scheduler output.

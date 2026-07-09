@@ -26,20 +26,29 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-
 from easydel.inference.esurge.runners.model_runner import eSurgeRunner
+from easydel.inference.esurge.runners.vlm_prefill import VlmPrefillHelper
 
 
 def _runner_that_fails_vision(exc: Exception) -> eSurgeRunner:
     runner = object.__new__(eSurgeRunner)
     # model_uses_mrope tolerates a config-less model (returns False).
     runner.model = SimpleNamespace()
+    helper = VlmPrefillHelper(
+        model_getter=lambda: runner.model,
+        metadata=SimpleNamespace(data_parallel_size=1),
+        compile_vision_encoder=True,
+        vision_patch_buckets=None,
+        max_num_batched_tokens=1,
+        max_num_tokens=1,
+    )
 
     def _raise(*args, **kwargs):
         raise exc
 
-    runner._compute_vlm_prefill_with_compiled_vision = _raise
-    runner._compute_embedding_with_info_single_pass = _raise
+    helper.compute_prefill_with_compiled_vision = _raise
+    helper.compute_embedding_with_info_single_pass = _raise
+    runner.vlm = helper
     return runner
 
 
