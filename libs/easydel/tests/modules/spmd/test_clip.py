@@ -14,13 +14,14 @@
 
 """Tests for CLIP model."""
 
-import easydel as ed
 import jax.numpy as jnp
 import numpy as np
 import pytest
 import spectrax as spx
 import torch
 import transformers
+
+import easydel as ed
 
 try:
     from tests.modules.test_utils import compare_hidden_states, setup_config

@@ -14,10 +14,11 @@
 
 """Tests for the Mistral4 model (DeepSeek-V3-shaped MLA + MoE from Mistral AI)."""
 
-import easydel as ed
 import jax
 import pytest
 import transformers
+
+import easydel as ed
 
 try:
     from tests.modules.test_utils import CausalLMTester

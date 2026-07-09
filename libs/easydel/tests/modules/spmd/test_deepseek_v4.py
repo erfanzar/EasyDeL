@@ -14,13 +14,14 @@
 
 """Tests for the DeepSeek-V4 model (stateless forward + cached decode)."""
 
-import easydel as ed
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 import spectrax as spx
 import transformers
+
+import easydel as ed
 
 try:
     from tests.modules.test_utils import CausalLMTester
@@ -138,6 +139,7 @@ class TestDeepseekV4:
         ``value_and_grad`` + optimizer steps run with finite, changing params.
         """
         import optax
+
         from easydel.infra.base_state import EasyDeLState
         from easydel.modules.deepseek_v4 import modeling_deepseek_v4 as M
 

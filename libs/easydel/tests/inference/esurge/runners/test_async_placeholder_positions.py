@@ -29,6 +29,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+
 from easydel.inference.esurge.runners.model_runner import eSurgeRunner
 
 

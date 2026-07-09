@@ -12,19 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for ``easydel.inference.esurge.mixins.{monitoring, lifecycle}``.
+"""Tests for the eSurge monitoring stack and engine lifecycle helpers.
 
-Both mixins assume a rich engine-instance ``self`` (scheduler, request
-state, threading primitives, model handles). To keep these tests fast and
-self-contained, we stub only the attributes each method actually touches
-and target:
+Targets:
 
 * Pure helper functions (``_panel``, ``_build_esurge_dashboard_model``)
-* Static / classmethod predicates (``_is_nonrecoverable_scheduler_error``,
-  ``_can_prefetch_scheduler_output``, ``_model_overrides_esurge_graphdef``)
-* Filesystem-only helpers (``_prepare_grafana_provisioning`` -- uses tmp_path
-  to avoid polluting ``/tmp``)
-* State-based methods on ``EngineLifecycleMixin`` (``_abort_scheduler_due_to_error``,
+* Static / classmethod predicates (``eSurge._is_nonrecoverable_scheduler_error``,
+  ``EngineLoop._can_prefetch_scheduler_output``,
+  ``eSurge._model_overrides_esurge_graphdef``)
+* Filesystem-only helpers (``MonitoringStack._prepare_grafana_provisioning``
+  -- uses tmp_path to avoid polluting ``/tmp``)
+* State-based methods on ``eSurge`` (``_abort_scheduler_due_to_error``,
   ``_raise_if_scheduler_failed``, heartbeat helpers) via a lightweight stub
 """
 
@@ -38,12 +36,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from easydel.inference.esurge.mixins.lifecycle import EngineLifecycleMixin
-from easydel.inference.esurge.mixins.monitoring import (
-    EngineMonitoringMixin,
+from easydel.inference.esurge.engine.loop import EngineLoop
+from easydel.inference.esurge.engine.monitoring_stack import (
+    MonitoringStack,
     _build_esurge_dashboard_model,
     _panel,
 )
+from easydel.inference.esurge.esurge_engine import eSurge
 
 
 def test_panel_builds_required_fields():
@@ -98,22 +97,21 @@ def test_dashboard_model_panel_ids_are_unique():
     assert len(ids) == len(set(ids)), "panel IDs must be unique within a dashboard"
 
 
-class _MonitoringStub(EngineMonitoringMixin):
-    """Minimal subclass that exposes the provisioning helper (no engine state needed)."""
-
-    pass
+def _make_monitoring_stack() -> MonitoringStack:
+    """Build a MonitoringStack with a silent info logger."""
+    return MonitoringStack(info=lambda *args, **kwargs: None)
 
 
 def test_prepare_grafana_provisioning_creates_expected_files(tmp_path, monkeypatch):
     """``_prepare_grafana_provisioning`` writes datasource, provider, and dashboard JSON files."""
 
     monkeypatch.setattr(
-        "easydel.inference.esurge.mixins.monitoring.tempfile.mkdtemp",
+        "easydel.inference.esurge.engine.monitoring_stack.tempfile.mkdtemp",
         lambda prefix="": str(tmp_path / f"{prefix}root"),
     )
 
-    stub = _MonitoringStub()
-    root = stub._prepare_grafana_provisioning(
+    stack = _make_monitoring_stack()
+    root = stack._prepare_grafana_provisioning(
         datasource_name="esurge",
         datasource_uid="uid-1",
         datasource_url="http://localhost:9090",
@@ -130,11 +128,11 @@ def test_prepare_grafana_provisioning_creates_expected_files(tmp_path, monkeypat
 
 def test_prepare_grafana_provisioning_docker_mode_uses_container_path(tmp_path, monkeypatch):
     monkeypatch.setattr(
-        "easydel.inference.esurge.mixins.monitoring.tempfile.mkdtemp",
+        "easydel.inference.esurge.engine.monitoring_stack.tempfile.mkdtemp",
         lambda prefix="": str(tmp_path / f"{prefix}root"),
     )
-    stub = _MonitoringStub()
-    root = stub._prepare_grafana_provisioning(
+    stack = _make_monitoring_stack()
+    root = stack._prepare_grafana_provisioning(
         datasource_name="ds",
         datasource_uid="uid-2",
         datasource_url="http://prom:9090",
@@ -149,26 +147,26 @@ def test_prepare_grafana_provisioning_docker_mode_uses_container_path(tmp_path, 
 
 def test_is_nonrecoverable_scheduler_error_value_error_with_dp_marker():
     err = ValueError("Non-DP-local page IDs detected on rank 3")
-    assert EngineLifecycleMixin._is_nonrecoverable_scheduler_error(err) is True
+    assert eSurge._is_nonrecoverable_scheduler_error(err) is True
 
 
 def test_is_nonrecoverable_scheduler_error_value_error_with_sync_marker():
     err = ValueError("Distributed step synchronization failure at step 100")
-    assert EngineLifecycleMixin._is_nonrecoverable_scheduler_error(err) is True
+    assert eSurge._is_nonrecoverable_scheduler_error(err) is True
 
 
 def test_is_nonrecoverable_scheduler_error_unrelated_value_error():
     err = ValueError("just a regular value error")
-    assert EngineLifecycleMixin._is_nonrecoverable_scheduler_error(err) is False
+    assert eSurge._is_nonrecoverable_scheduler_error(err) is False
 
 
 def test_is_nonrecoverable_scheduler_error_non_value_error():
     """RuntimeError, KeyError, etc. are recoverable per the predicate's contract."""
     assert (
-        EngineLifecycleMixin._is_nonrecoverable_scheduler_error(RuntimeError("Non-DP-local page IDs detected")) is False
+        eSurge._is_nonrecoverable_scheduler_error(RuntimeError("Non-DP-local page IDs detected")) is False
     )
     assert (
-        EngineLifecycleMixin._is_nonrecoverable_scheduler_error(KeyError("Distributed step synchronization failure"))
+        eSurge._is_nonrecoverable_scheduler_error(KeyError("Distributed step synchronization failure"))
         is False
     )
 
@@ -180,7 +178,7 @@ def test_model_overrides_esurge_graphdef_returns_false_for_plain_class():
         pass
 
     obj = Plain()
-    assert EngineLifecycleMixin._model_overrides_esurge_graphdef(obj) is False
+    assert eSurge._model_overrides_esurge_graphdef(obj) is False
 
 
 def test_model_overrides_esurge_graphdef_returns_true_when_class_has_attr():
@@ -188,7 +186,7 @@ def test_model_overrides_esurge_graphdef_returns_true_when_class_has_attr():
         esurge_graphdef = "non-None placeholder"
 
     obj = WithGraphdef()
-    assert EngineLifecycleMixin._model_overrides_esurge_graphdef(obj) is True
+    assert eSurge._model_overrides_esurge_graphdef(obj) is True
 
 
 def test_can_prefetch_scheduler_output_safe_for_pure_prefill():
@@ -196,7 +194,7 @@ def test_can_prefetch_scheduler_output_safe_for_pure_prefill():
     request = SimpleNamespace(num_output_placeholders=0, num_computed_tokens=10, num_tokens=128)
     scheduler = SimpleNamespace(requests={"r1": request})
     output = SimpleNamespace(num_scheduled_tokens={"r1": 32})
-    assert EngineLifecycleMixin._can_prefetch_scheduler_output(scheduler, output) is True
+    assert EngineLoop._can_prefetch_scheduler_output(scheduler, output) is True
 
 
 def test_can_prefetch_scheduler_output_unsafe_when_request_has_placeholders():
@@ -204,7 +202,7 @@ def test_can_prefetch_scheduler_output_unsafe_when_request_has_placeholders():
     request = SimpleNamespace(num_output_placeholders=1, num_computed_tokens=10, num_tokens=128)
     scheduler = SimpleNamespace(requests={"r1": request})
     output = SimpleNamespace(num_scheduled_tokens={"r1": 32})
-    assert EngineLifecycleMixin._can_prefetch_scheduler_output(scheduler, output) is False
+    assert EngineLoop._can_prefetch_scheduler_output(scheduler, output) is False
 
 
 def test_can_prefetch_scheduler_output_unsafe_when_at_prompt_length():
@@ -212,7 +210,7 @@ def test_can_prefetch_scheduler_output_unsafe_when_at_prompt_length():
     request = SimpleNamespace(num_output_placeholders=0, num_computed_tokens=128, num_tokens=128)
     scheduler = SimpleNamespace(requests={"r1": request})
     output = SimpleNamespace(num_scheduled_tokens={"r1": 1})
-    assert EngineLifecycleMixin._can_prefetch_scheduler_output(scheduler, output) is False
+    assert EngineLoop._can_prefetch_scheduler_output(scheduler, output) is False
 
 
 def test_can_prefetch_scheduler_output_skips_unknown_request_id():
@@ -220,18 +218,18 @@ def test_can_prefetch_scheduler_output_skips_unknown_request_id():
     scheduler = SimpleNamespace(requests={})
     output = SimpleNamespace(num_scheduled_tokens={"r1": 32})
 
-    assert EngineLifecycleMixin._can_prefetch_scheduler_output(scheduler, output) is True
+    assert EngineLoop._can_prefetch_scheduler_output(scheduler, output) is True
 
 
 def test_can_prefetch_scheduler_output_handles_internal_exception():
     """Any exception during inspection short-circuits to False (conservative)."""
     scheduler = SimpleNamespace()
     output = SimpleNamespace(num_scheduled_tokens={"r1": 1})
-    assert EngineLifecycleMixin._can_prefetch_scheduler_output(scheduler, output) is False
+    assert EngineLoop._can_prefetch_scheduler_output(scheduler, output) is False
 
 
-class _LifecycleStub(EngineLifecycleMixin):
-    """Stub that supplies the attrs ``_abort_scheduler_due_to_error`` / ``_raise_if_scheduler_failed`` need."""
+class _LifecycleStub(eSurge):
+    """eSurge subclass supplying only the attrs ``_abort_scheduler_due_to_error`` / ``_raise_if_scheduler_failed`` need."""
 
     def __init__(self):
         self._scheduler_exception = None

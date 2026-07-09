@@ -5,6 +5,7 @@ easydel.inference.esurge.scheduler package
    :maxdepth: 2
 
    async_scheduler
+   dp_scheduler
    interface
    output
    request_queue

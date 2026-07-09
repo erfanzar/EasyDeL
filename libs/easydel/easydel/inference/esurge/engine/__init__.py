@@ -19,13 +19,22 @@ dependencies; :class:`~easydel.inference.esurge.eSurge` is the composition
 root that wires them together.
 """
 
+from .admission import RequestAdmission
 from .bootstrap import EngineAssets, build_engine_assets
+from .idle import IdleMonitor
+from .loop import MAX_CONSECUTIVE_SCHEDULER_ERRORS, EngineLoop
+from .monitoring_stack import MonitoringStack
 from .output_pipeline import OutputPipeline
 from .registry import RequestRecord, RequestRegistry
 
 __all__ = (
+    "MAX_CONSECUTIVE_SCHEDULER_ERRORS",
     "EngineAssets",
+    "EngineLoop",
+    "IdleMonitor",
+    "MonitoringStack",
     "OutputPipeline",
+    "RequestAdmission",
     "RequestRecord",
     "RequestRegistry",
     "build_engine_assets",

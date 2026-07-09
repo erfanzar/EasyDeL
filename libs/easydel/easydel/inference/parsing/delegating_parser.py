@@ -16,7 +16,7 @@
 
 Wraps a ReasoningParser and a ToolParser behind a single interface with an
 explicit phase state machine, eliminating the ad-hoc orchestration and
-expensive retokenization previously done in EngineParsingMixin._run_output_parsers().
+expensive retokenization previously done in OutputPipeline._run_output_parsers().
 
 Design inspired by a delegating parser pattern.
 """
@@ -80,7 +80,7 @@ class ParseResult:
       that need to know whether buffering is active).
 
     ``to_dict()`` flattens the result into the dict format consumed by
-    ``EngineParsingMixin._process_engine_outputs``.
+    ``OutputPipeline._process_engine_outputs``.
     """
 
     delta_reasoning: str | None = None
@@ -92,7 +92,7 @@ class ParseResult:
     phase: ParsePhase = ParsePhase.CONTENT
 
     def to_dict(self) -> dict:
-        """Flatten into the dict format consumed by ``EngineParsingMixin._run_output_parsers``."""
+        """Flatten into the dict format consumed by ``OutputPipeline._run_output_parsers``."""
         return {
             "delta_reasoning": self.delta_reasoning,
             "delta_content": self.delta_content,

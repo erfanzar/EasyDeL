@@ -38,7 +38,7 @@ def _spx_imports(path: Path) -> list[str]:
 
 def test_inference_graph_rebinding_uses_spectrax() -> None:
     runtime_files = [
-        INFERENCE_ROOT / "esurge" / "mixins" / "lifecycle.py",
+        INFERENCE_ROOT / "esurge" / "esurge_engine.py",
         INFERENCE_ROOT / "esurge" / "runners" / "model_runner.py",
         INFERENCE_ROOT / "esurge" / "runners" / "executors" / "model_executor.py",
         INFERENCE_ROOT / "vwhisper" / "core.py",

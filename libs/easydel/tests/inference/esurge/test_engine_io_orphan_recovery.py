@@ -14,11 +14,12 @@
 
 import threading
 
-from easydel.inference.esurge.esurge_engine import CompletionOutput, RequestOutput
-from easydel.inference.esurge.mixins.io import EngineIOMixin
+from easydel.inference.esurge.esurge_engine import CompletionOutput, RequestOutput, eSurge
 
 
-class _DummyIOEngine(EngineIOMixin):
+class _DummyIOEngine(eSurge):
+    """eSurge subclass with stubbed request state; no engine construction."""
+
     def __init__(self, request_output: RequestOutput, *, scheduler_request_ids: set[str], active_request_ids: set[str]):
         self._output_lock = threading.RLock()
         self._scheduler_lock = threading.RLock()

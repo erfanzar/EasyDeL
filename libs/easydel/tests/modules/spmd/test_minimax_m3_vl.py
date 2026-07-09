@@ -22,10 +22,11 @@ dense clamped-SwiGLU-OAI MLP + full attention on layer 0, sigmoid-routed MoE
 scatter against the HF reference built from the same config.
 """
 
-import easydel as ed
 import numpy as np
 import pytest
 import transformers
+
+import easydel as ed
 
 try:
     from tests.modules.test_utils import CausalLMTester, VisionLanguageTester

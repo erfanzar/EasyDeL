@@ -32,12 +32,13 @@ the ``hunyuan_vl`` mRoPE input prep dropped ``input_ids`` / leaked a
 
 from __future__ import annotations
 
-import easydel as ed
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax  # pyright: ignore[reportMissingTypeStubs]
 import pytest
+
+import easydel as ed
 from easydel.infra.base_state import EasyDeLState
 from easydel.trainers.trainer._fn import training_step
 

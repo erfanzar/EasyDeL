@@ -6,7 +6,7 @@ easydel.inference.esurge package
 
    core/index
    distributed/index
-   mixins/index
+   engine/index
    multimodal/index
    runners/index
    scheduler/index

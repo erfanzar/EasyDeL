@@ -32,9 +32,10 @@ asserts the reference discriminates the specific bug it guards.
 
 import dataclasses
 
-import easydel as ed
 import jax.numpy as jnp
 import spectrax as spx
+
+import easydel as ed
 from easydel.infra.factory import TaskType
 from easydel.infra.utils import ActivationType, FlopCalcConfig
 from easydel.infra.utils import flops_per_token as flops_per_token_from_cfg

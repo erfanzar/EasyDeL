@@ -14,15 +14,16 @@
 
 from types import SimpleNamespace
 
-import easydel as ed
 import jax
 import jax.numpy as jnp
 import pytest
 import spectrax as spx
+
+import easydel as ed
 from easydel.inference.esurge.core.interface import CacheGroupsConfig, CacheGroupSpec, FullAttentionSpec
-from easydel.inference.esurge.engine.registry import RequestRecord
-from easydel.inference.esurge.mixins.parsing import EngineParsingMixin
-from easydel.inference.esurge.mixins.utils import EngineUtilsMixin
+from easydel.inference.esurge.engine.admission import RequestAdmission
+from easydel.inference.esurge.engine.output_pipeline import OutputPipeline
+from easydel.inference.esurge.engine.registry import RequestRecord, RequestRegistry
 from easydel.inference.esurge.request import EngineRequest, EngineRequestStatus
 from easydel.inference.esurge.scheduler.scheduler import Scheduler
 from easydel.inference.evaluations.esurge_eval import eSurgeLMEvalAdapter
@@ -181,14 +182,18 @@ class _DummyTokenizer:
         return {}
 
 
-class _ParsingHarness(EngineParsingMixin, EngineUtilsMixin):
+def _make_output_pipeline() -> OutputPipeline:
     """Small helper exposing parser/stop-policy logic for unit tests."""
-
-    ignore_stop_strings_in_reasoning = False
-    extra_stops = None
-    _generation_config_dict = None
-    _primary_eos_token_id = None
-    _sampling_params_callback = None
+    return OutputPipeline(
+        registry=RequestRegistry(),
+        detokenizer_client=None,
+        eos_token_ids=[],
+        decode_interval_tokens=1,
+        decode_interval_secs=0.0,
+        on_stop_strings=lambda stops: None,
+        on_activity=lambda: None,
+        on_fatal=lambda exc, tb: None,
+    )
 
 
 class _FakeGenerateOutput:
@@ -768,9 +773,28 @@ def test_esurge_eval_pretruncates_generation_prompts_before_dispatch():
 
 def test_engine_default_can_enable_reasoning_aware_stop_matching():
     """Engine defaults should propagate parser-aware stop matching to requests."""
-    harness = _ParsingHarness()
+    admission = RequestAdmission(
+        registry=RequestRegistry(),
+        scheduler_submit=lambda requests: None,
+        tokenizer_client=None,
+        tokenizer=None,
+        context_config=None,
+        reserve_tokens=0,
+        max_model_len=4096,
+        tool_parser_class=None,
+        reasoning_parser_class=None,
+        sampling_params_callback=lambda: None,
+        generation_config_dict={},
+        primary_eos_token_id=None,
+        eos_token_ids=[],
+        extra_stops=[],
+        ignore_stop_strings_in_reasoning=False,
+        on_activity=lambda: None,
+        info=lambda *args, **kwargs: None,
+        callback_engine=None,
+    )
 
-    prepared = harness._prepare_sampling_params_for_request(
+    prepared = admission.prepare_sampling_params_for_request(
         SamplingParams(stop=["\nif"]),
         request_id="req-stop-aware",
         prompt="prompt",
@@ -795,7 +819,7 @@ def test_esurge_exposes_reasoning_boundary_token_properties():
 
 def test_stop_strings_can_ignore_matches_inside_reasoning():
     """Parser-aware stop matching should only inspect visible content."""
-    harness = _ParsingHarness()
+    harness = _make_output_pipeline()
     raw_output = "<think>plan\nif guard</think>def answer():\n    return 1\nif __name__ == '__main__':\n    pass"
     request_data = RequestRecord(
         sampling_params=SamplingParams(

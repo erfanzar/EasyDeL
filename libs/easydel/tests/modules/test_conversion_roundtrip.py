@@ -33,11 +33,12 @@ Run all:             ``pytest tests/modules/test_conversion_roundtrip.py``
 
 from __future__ import annotations
 
-import easydel as ed
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+
+import easydel as ed
 
 jax.config.update("jax_platform_name", "cpu")
 
