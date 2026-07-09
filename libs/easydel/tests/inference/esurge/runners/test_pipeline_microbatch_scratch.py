@@ -13,8 +13,7 @@
 # limitations under the License.
 
 import numpy as np
-
-from easydel.inference.esurge.runners.execution_manager import ExecutionManager
+from easydel.inference.esurge.runners.executors.pipeline_microbatch import PipelineMicrobatchExecutor
 
 
 def _scratch_slot(max_reqs: int = 5, max_len: int = 4, max_pages: int = 3) -> dict:
@@ -49,7 +48,7 @@ def test_pipeline_microbatch_scratch_clears_stale_rows_when_batch_shrinks():
     page_table = np.arange(15, dtype=np.int32).reshape(5, 3)
     slot = _scratch_slot()
 
-    ExecutionManager._populate_pipeline_microbatch_scratch(
+    PipelineMicrobatchExecutor._populate_pipeline_microbatch_scratch(
         slot,
         chunk=np.array([0, 2, 4], dtype=np.int32),
         scheduled_full_cpu=scheduled,
@@ -64,7 +63,7 @@ def test_pipeline_microbatch_scratch_clears_stale_rows_when_batch_shrinks():
         repetition_penalties_cpu=repetition,
         page_table_cpu=page_table,
     )
-    ExecutionManager._populate_pipeline_microbatch_scratch(
+    PipelineMicrobatchExecutor._populate_pipeline_microbatch_scratch(
         slot,
         chunk=np.array([3], dtype=np.int32),
         scheduled_full_cpu=scheduled,
@@ -92,7 +91,7 @@ def test_pipeline_microbatch_scratch_clears_stale_rows_when_batch_shrinks():
 
 
 def test_pipeline_microbatching_rejects_underfilled_token_buckets():
-    assert ExecutionManager._use_pipeline_microbatching(
+    assert PipelineMicrobatchExecutor._use_pipeline_microbatching(
         active_count=16,
         num_stages=4,
         microbatch_count=4,
@@ -100,7 +99,7 @@ def test_pipeline_microbatching_rejects_underfilled_token_buckets():
         min_token_bucket=4,
         has_compiled_handoff=False,
     )
-    assert not ExecutionManager._use_pipeline_microbatching(
+    assert not PipelineMicrobatchExecutor._use_pipeline_microbatching(
         active_count=4,
         num_stages=4,
         microbatch_count=4,
@@ -108,7 +107,7 @@ def test_pipeline_microbatching_rejects_underfilled_token_buckets():
         min_token_bucket=4,
         has_compiled_handoff=False,
     )
-    assert ExecutionManager._use_pipeline_microbatching(
+    assert PipelineMicrobatchExecutor._use_pipeline_microbatching(
         active_count=4,
         num_stages=4,
         microbatch_count=4,
@@ -116,7 +115,7 @@ def test_pipeline_microbatching_rejects_underfilled_token_buckets():
         min_token_bucket=4,
         has_compiled_handoff=True,
     )
-    assert not ExecutionManager._use_pipeline_microbatching(
+    assert not PipelineMicrobatchExecutor._use_pipeline_microbatching(
         active_count=3,
         num_stages=4,
         microbatch_count=3,
@@ -127,26 +126,26 @@ def test_pipeline_microbatching_rejects_underfilled_token_buckets():
 
 
 def test_pipeline_microbatch_shape_supports_auto_count_size_and_disable():
-    assert ExecutionManager._resolve_pipeline_microbatch_shape(
+    assert PipelineMicrobatchExecutor._resolve_pipeline_microbatch_shape(
         active_count=16,
         num_stages=4,
         pp_microbatch_count="auto",
         pp_microbatch_size="auto",
     ) == (4, 4)
-    assert ExecutionManager._resolve_pipeline_microbatch_shape(
+    assert PipelineMicrobatchExecutor._resolve_pipeline_microbatch_shape(
         active_count=16,
         num_stages=4,
         pp_microbatch_count=8,
         pp_microbatch_size="auto",
     ) == (8, 2)
-    assert ExecutionManager._resolve_pipeline_microbatch_shape(
+    assert PipelineMicrobatchExecutor._resolve_pipeline_microbatch_shape(
         active_count=16,
         num_stages=4,
         pp_microbatch_count="auto",
         pp_microbatch_size=5,
     ) == (4, 5)
     assert (
-        ExecutionManager._resolve_pipeline_microbatch_shape(
+        PipelineMicrobatchExecutor._resolve_pipeline_microbatch_shape(
             active_count=16,
             num_stages=4,
             pp_microbatch_count=0,

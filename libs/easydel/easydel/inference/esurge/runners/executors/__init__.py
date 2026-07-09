@@ -75,11 +75,13 @@ Example:
 
 from .batch_preparer import BatchMetadataPreparer
 from .model_executor import ModelStepExecutor
+from .pipeline_microbatch import PipelineMicrobatchExecutor
 from .sampler_executor import SamplerExecutor, SamplerRuntime
 
 __all__ = (
     "BatchMetadataPreparer",
     "ModelStepExecutor",
+    "PipelineMicrobatchExecutor",
     "SamplerExecutor",
     "SamplerRuntime",
 )
