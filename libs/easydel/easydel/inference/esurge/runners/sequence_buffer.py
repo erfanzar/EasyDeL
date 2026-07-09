@@ -41,7 +41,6 @@ from typing import Any
 import jax
 import numpy as np
 from eformer.loggings import get_logger
-from eformer.pytree import auto_pytree, field
 from jax import numpy as jnp
 
 from easydel.inference.esurge.request import EngineRequest
@@ -1050,92 +1049,6 @@ class SequenceBuffer:
 
         self._update_request_distribution()
         self._layout_version += 1
-
-
-@auto_pytree
-class ModelRunnerSamplingMetadata:
-    """Metadata for sampling operations during model execution.
-
-    Contains sampling parameters and optional penalty/constraint data
-    for batch processing during inference.
-
-    Attributes:
-        temperature: Temperature values for sampling.
-        min_p: Minimum probability thresholds.
-        top_k: Top-k sampling parameters.
-        top_p: Top-p (nucleus) sampling parameters.
-        all_greedy: Whether all requests use greedy sampling.
-        logprobs: Whether to compute log probabilities.
-        no_penalties: Whether penalties are disabled.
-        prompt_token_ids: Optional prompt tokens for context.
-        frequency_penalties: Optional frequency penalties.
-        presence_penalties: Optional presence penalties.
-        repetition_penalties: Optional repetition penalties.
-        output_token_ids: Generated output tokens.
-        min_tokens: Minimum tokens to generate.
-        logit_bias: Per-token logit adjustments.
-        allowed_token_ids_mask: Mask for allowed tokens.
-        bad_words_token_ids: Tokens to avoid generating.
-    """
-
-    temperature: jax.Array
-    min_p: jax.Array
-    top_k: jax.Array
-    top_p: jax.Array
-
-    all_greedy: bool = True
-    logprobs: bool = False
-    no_penalties: bool = True
-
-    prompt_token_ids: Any = None
-    frequency_penalties: Any = None
-    presence_penalties: Any = None
-    repetition_penalties: Any = None
-
-    output_token_ids: list[list[int]] = field(default_factory=list)
-    min_tokens: Any = None
-    logit_bias: list[dict[int, float]] = field(default_factory=list)
-    allowed_token_ids_mask: Any = None
-    bad_words_token_ids: Any = None
-
-    @classmethod
-    def from_sequence_buffer(
-        cls,
-        sequence_buffer: SequenceBuffer,
-        padded_num_reqs: int,
-        generate_params_if_all_greedy: bool = False,
-    ):
-        """Create sampling metadata from a sequence buffer.
-
-        Args:
-            sequence_buffer: Source buffer containing sampling parameters.
-            padded_num_reqs: Target padded number of requests.
-            generate_params_if_all_greedy: Whether to generate parameters
-                even when all requests use greedy sampling.
-
-        Returns:
-            ModelRunnerSamplingMetadata with padded sampling arrays.
-
-        Note:
-            If all requests use greedy sampling and generate_params_if_all_greedy
-            is False, returns zero-filled arrays for efficiency.
-        """
-        if sequence_buffer.all_greedy is True and not generate_params_if_all_greedy:
-            return cls(
-                temperature=jnp.zeros((padded_num_reqs,), dtype=jnp.float32),
-                min_p=jnp.zeros((padded_num_reqs,), dtype=jnp.float32),
-                top_p=jnp.zeros((padded_num_reqs,), dtype=jnp.float32),
-                top_k=jnp.zeros((padded_num_reqs,), dtype=jnp.int32),
-            )
-
-        num_reqs = sequence_buffer.num_reqs
-
-        return cls(
-            temperature=fill_slice(sequence_buffer.temperature, -1.0, num_reqs, padded_num_reqs).astype(jnp.float32),
-            min_p=fill_slice(sequence_buffer.min_p, 0.0, num_reqs, padded_num_reqs).astype(jnp.float32),
-            top_p=fill_slice(sequence_buffer.top_p, 1.0, num_reqs, padded_num_reqs).astype(jnp.float32),
-            top_k=fill_slice(sequence_buffer.top_k, 0, num_reqs, padded_num_reqs).astype(jnp.int32),
-        )
 
 
 @ejit(static_argnums=(2, 3))  # pyright: ignore[reportUntypedFunctionDecorator]

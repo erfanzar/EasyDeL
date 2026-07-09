@@ -611,7 +611,7 @@ class Gemma4AssistantDrafter:
         if target_layers is None:
             target_layers = assistant_layers
 
-        from easydel.inference.esurge.speculative_decoding import default_assistant_layer_mapping
+        from easydel.inference.esurge.runners.spec import default_assistant_layer_mapping
 
         return default_assistant_layer_mapping(assistant_layers, int(target_layers))
 

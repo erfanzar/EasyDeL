@@ -30,7 +30,6 @@ Key structures:
     BatchMetadata: Precomputed batch layout tensors with packed storage.
     ModelStepOutputs: Pure model forward pass outputs (cache, hidden, logits).
     StepFunctionInputs: Consolidated inputs for fused step execution.
-    StepFunctionOutputs: Consolidated outputs from fused step execution.
 
 Architecture Notes:
     The module uses array packing to minimize host-device transfer overhead.
@@ -590,62 +589,3 @@ class StepFunctionInputs:
         if self.batch_metadata.spec_recurrent_commit is not None:
             lines.append(f"  spec_recurrent_commit:{self.batch_metadata.spec_recurrent_commit.shape}")
         print("\n".join(lines))
-
-
-@auto_pytree(frozen=True)
-class StepFunctionOutputs:
-    """Consolidated outputs from fused step execution.
-
-    This frozen PyTree packages all step execution results into a single typed
-    structure, enabling clean return semantics and automatic sharding propagation.
-
-    Attributes:
-        device_state: Updated minimal device state (token_ids, num_tokens) reflecting
-            new token generation from sampler.
-        kv_pages: Updated key-value cache pages with newly computed attention states.
-        input_ids_buf: Updated input token buffer [max_num_tokens]. May contain
-            newly sampled tokens appended for next iteration.
-        position_ids_buf: Updated position buffer [max_num_tokens]. Position indices
-            incremented for decode steps.
-        query_start_loc: Cumulative query start indices [max_num_reqs+1]. Used to
-            slice contiguous token buffers into per-request segments. Last element
-            contains total token count.
-        seq_lens: Current sequence length for each request [max_num_reqs]. Updated
-            after token generation to track progress toward max_tokens.
-        pages_tables: Page table mapping for attention [num_reqs, max_pages].
-            Maps logical KV cache positions to physical page indices.
-        rng_key: Updated JAX random key for next sampling step. Must be threaded
-            through for proper random state management.
-        out_tokens: Newly sampled tokens [max_num_reqs]. Invalid positions masked
-            with -1 (for finished or inactive requests).
-        valid_mask: Boolean mask for valid outputs [max_num_reqs]. True for requests
-            that generated valid tokens this step.
-        hidden_states: Final layer hidden states [num_tokens, hidden_dim]. Raw
-            transformer outputs before LM head projection.
-        logits: Vocabulary logits from LM head [padded_num_reqs, vocab_size].
-            Unfiltered probability distributions before sampling.
-
-    Note:
-        Output tensors maintain device placement from inputs. The structure is
-        frozen to prevent accidental mutation. Use PyTree unpacking to extract
-        individual fields.
-
-    Example:
-        >>> outputs = step_fn(inputs)
-        >>> new_tokens = outputs.out_tokens
-        >>> is_valid = outputs.valid_mask
-        >>> updated_cache = outputs.kv_pages
-    """
-
-    device_state: MinimalDeviceState
-    kv_pages: HybridCache | RaggedPagesCache | UnifiedAttentionCache
-    input_ids_buf: jax.Array
-    position_ids_buf: jax.Array
-    query_start_loc: jax.Array
-    seq_lens: jax.Array
-    pages_tables: jax.Array
-    rng_key: jax.Array
-    out_tokens: jax.Array
-    valid_mask: jax.Array
-    hidden_states: jax.Array
-    logits: jax.Array
