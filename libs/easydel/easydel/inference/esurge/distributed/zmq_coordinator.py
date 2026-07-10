@@ -229,6 +229,7 @@ class ZmqLeaderCoordinator:
         self._max_inflight = max(1, int(max_inflight_steps))
         self._engine_spec = engine_spec
         self._plane_handler = plane_handler
+        self._stats_provider: typing.Callable[[], wire.QueueStats] | None = None
 
         self._outbox: queue.Queue = queue.Queue()
         self._io_thread: threading.Thread | None = None
@@ -264,10 +265,16 @@ class ZmqLeaderCoordinator:
         Restartable: after :meth:`shutdown` a subsequent ``start()`` resets
         the handshake/ledger state and waits for a fresh worker handshake
         (needed by engine weight hot-swaps, which terminate and re-initiate).
+
+        A ``world_size == 1`` leader has no workers to wait for — it exists
+        purely to serve request-plane clients (DP replica engines) and is
+        ready immediately.
         """
         if self._io_thread is not None:
             return
         self._reset_control_state()
+        if self.world_size <= 1:
+            self._ready_event.set()
         self._io_thread = threading.Thread(target=self._io_loop, name="eSurgeCoordLeaderIO", daemon=True)
         self._io_thread.start()
         if not self._ready_event.wait(self._ready_timeout_s):
@@ -286,6 +293,16 @@ class ZmqLeaderCoordinator:
         """Install the request-plane inbound handler (Admit/AbortReq/StopHit/...)."""
         self._plane_handler = handler
 
+    def set_stats_provider(self, provider: typing.Callable[[], wire.QueueStats] | None) -> None:
+        """Install the queue-stats snapshot provider.
+
+        When set, every client-directed heartbeat is followed by a
+        :class:`wire.QueueStats` so routers can join-shortest-queue without
+        polling. The provider runs on the IO thread and must be lock-free
+        (best-effort reads of live scheduler state).
+        """
+        self._stats_provider = provider
+
     def send_to_peer(self, identity: bytes, header: wire.WireMessage, payload: bytes | None = None) -> None:
         """Queue a message for one specific peer (worker or client) identity."""
         self._outbox.put((identity, wire.encode_message(header), payload))
@@ -300,6 +317,10 @@ class ZmqLeaderCoordinator:
         return interval > 0 and step_id % interval == 0
 
     def _broadcast_step(self, step_id: int, mode: int, scheduler_output, want_digest: bool) -> None:
+        if self.world_size <= 1:
+            # Client-serving leader with no step-replay workers: nothing to
+            # mirror, so skip the payload pickling entirely.
+            return
         self._ledger.raise_if_failed()
         self._ledger.wait_for_window(step_id, self._max_inflight)
         header = wire.Step(step_id=step_id, mode=mode, want_digest=want_digest)
@@ -327,16 +348,21 @@ class ZmqLeaderCoordinator:
 
     def drain(self, handle: StepHandle) -> ModelRunnerOutput:
         """Mirror DRAIN to all workers, then materialize locally."""
-        self._ledger.raise_if_failed()
-        want_digest = self._want_digest(handle.step_id)
-        header = wire.Drain(step_id=handle.step_id, want_digest=want_digest)
-        self._ledger.expect(handle.step_id, self._ledger.last_acked.keys())
-        self._outbox.put((_DEST_WORKERS, wire.encode_message(header), None))
+        if self.world_size > 1:
+            self._ledger.raise_if_failed()
+            want_digest = self._want_digest(handle.step_id)
+            header = wire.Drain(step_id=handle.step_id, want_digest=want_digest)
+            self._ledger.expect(handle.step_id, self._ledger.last_acked.keys())
+            self._outbox.put((_DEST_WORKERS, wire.encode_message(header), None))
+        else:
+            want_digest = False
         model_output = self._runner.wait_for_execution(handle.runner_handle)
         self._record_local(handle.step_id, model_output, want_digest)
         return model_output
 
     def _record_local(self, step_id: int, model_output, want_digest: bool) -> None:
+        if self.world_size <= 1:
+            return
         num_reqs = len(getattr(model_output, "req_ids", []) or [])
         digest = None
         if want_digest:
@@ -441,8 +467,16 @@ class ZmqLeaderCoordinator:
                     beat = wire.encode_message(wire.Heartbeat(rank=0, ts=time.time()))
                     for identity in worker_identities.values():
                         sock.send_multipart([identity, beat])
+                    stats_frame = None
+                    if self._client_identities and self._stats_provider is not None:
+                        try:
+                            stats_frame = wire.encode_message(self._stats_provider())
+                        except Exception:
+                            logger.debug("eSurge coordinator: stats provider failed", exc_info=True)
                     for identity in self._client_identities.values():
                         sock.send_multipart([identity, beat])
+                        if stats_frame is not None:
+                            sock.send_multipart([identity, stats_frame])
                     last_beat = now
                 if now - last_sweep >= 0.5:
                     if self._ready_event.is_set():
