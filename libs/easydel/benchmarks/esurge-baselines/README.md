@@ -24,3 +24,18 @@ prep −1.3%). Verdict: performance-neutral.
 Still open on hardware: multi-host pod validation of the coordination="zmq"
 plane (v5p-8 is one process; needs v5p-16+), decode-heavy config B, PP-sharded
 run, and the broadcast-skip gain measurement.
+
+## 2026-07-10 — request-plane phases P0-P5 (config A, same command/host)
+
+- `PLANE_A_mixed_1024x256.json` — post-plane `d1995e594`: 1893.5 tok/s
+  (+0.8% vs post-refactor 1878.8, +1.8% vs pre-refactor 1860.1)
+
+Bucket ladders and step counts identical (hot decode bucket 32: 245 steps,
+greedy fastpath 245/245 in both); hot-bucket wallclock 1.127s vs 1.160s
+(−2.8%), prefill buckets byte-equal timings. Single-host builds no plane
+object, so this run measures the added per-step checks (one getattr on the
+emit path, forks on submit/abort): performance-neutral.
+
+Unmeasured on hardware: multi-host plane throughput and the deleted
+broadcast_one_to_all gain (needs v5p-16+), the flip branch's trainer path
+(pod GRPO parity gate), DP-replica aggregate throughput scaling.
