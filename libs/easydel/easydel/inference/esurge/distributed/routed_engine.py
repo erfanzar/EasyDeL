@@ -323,6 +323,34 @@ class RoutedEngine:
             tool_parser_request=tool_parser_request,
         )
 
+    def _chat_routing_key(self, messages: list[dict]) -> str:
+        """A stable prompt-shaped key for affinity routing of chat calls."""
+        try:
+            return str(
+                self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            )
+        except Exception:
+            return repr(messages)
+
+    def _route_for_key(self, routing_key: str) -> typing.Any:
+        member_index = self.select_member(routing_key)
+        self.affinity.record(routing_key, member_index)
+        return self.members[member_index]
+
+    def chat(self, messages: list[dict], *args, **kwargs):
+        """Route a chat call to one member (affinity by templated prompt)."""
+        return self._route_for_key(self._chat_routing_key(messages)).chat(messages, *args, **kwargs)
+
+    def iter_chat_completion_stream(self, *, messages: list[dict], **kwargs):
+        """Route an OpenAI chat-completion stream to one member."""
+        member = self._route_for_key(self._chat_routing_key(messages))
+        yield from member.iter_chat_completion_stream(messages=messages, **kwargs)
+
+    def iter_responses_stream(self, *, messages: list[dict], **kwargs):
+        """Route an OpenAI Responses-API stream to one member."""
+        member = self._route_for_key(self._chat_routing_key(messages))
+        yield from member.iter_responses_stream(messages=messages, **kwargs)
+
     def abort_request(self, request_id: str) -> None:
         """Cancel a request wherever it landed (no-op on non-owners)."""
         for member in self.members:

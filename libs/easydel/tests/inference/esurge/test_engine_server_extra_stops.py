@@ -17,14 +17,13 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
-from fastapi import HTTPException
-from fastapi.responses import JSONResponse
-
 from easydel.inference.esurge.esurge_engine import CompletionOutput, RequestOutput
 from easydel.inference.esurge.server.api_server import eSurgeApiServer
 from easydel.inference.inference_engine_interface import BaseInferenceApiServer, ServerStatus
 from easydel.inference.openai_api_modules import ChatCompletionRequest, CompletionRequest, ResponsesRequest
 from easydel.inference.sampling_params import SamplingParams
+from fastapi import HTTPException
+from fastapi.responses import JSONResponse
 
 
 def _make_server(extra_stops):
@@ -169,9 +168,24 @@ def test_api_server_defaults_generation_slots_to_runtime_request_cap(monkeypatch
             self.esurge_name = "fake-model"
             self.tokenizer = object()
             self.max_num_seqs = max_num_seqs
+            self.max_model_len = 128
             self.runner = SimpleNamespace(metadata=FakeMetadata(), num_reqs_max_model_len=32)
             self.distributed_mode = False
             self.distributed_role = None
+
+        # The server accepts engines by surface (duck-typed), so the fake
+        # must expose the adapter contract even though it never generates.
+        def generate(self, *args, **kwargs):
+            raise NotImplementedError
+
+        def stream(self, *args, **kwargs):
+            raise NotImplementedError
+
+        def chat(self, *args, **kwargs):
+            raise NotImplementedError
+
+        def abort_request(self, *args, **kwargs):
+            raise NotImplementedError
 
     class DummyAuthManager:
         def __init__(self, **kwargs):

@@ -27,6 +27,7 @@ Ordering matters: the replica-death test kills engine B, so it runs last.
 
 from __future__ import annotations
 
+import json
 import socket
 import time
 
@@ -217,6 +218,38 @@ def test_router_joins_shortest_queue_on_stats(replicas):
         assert chosen == 0, "JSQ must avoid the loaded replica"
     finally:
         replicas.handle_b._channel.queue_stats = original
+
+
+def test_routed_engine_serves_the_openai_api(replicas):
+    """eSurgeApiServer accepts the duck-typed RoutedEngine and serves it."""
+    from easydel.inference.esurge.server.api_server import eSurgeApiServer
+    from fastapi.testclient import TestClient
+
+    server = eSurgeApiServer({"routed-tiny": replicas.router})
+    with TestClient(server.app) as client:
+        body = {
+            "model": "routed-tiny",
+            "messages": [{"role": "user", "content": "hello there"}],
+            "max_tokens": 8,
+            "temperature": 0.0,
+        }
+        response = client.post("/v1/chat/completions", json=body)
+        assert response.status_code == 200, response.text
+        data = response.json()
+        assert data["model"] == "routed-tiny"
+        assert isinstance(data["choices"][0]["message"]["content"], str)
+        assert data["choices"][0]["finish_reason"] in ("stop", "length")
+
+        chunks = []
+        with client.stream("POST", "/v1/chat/completions", json={**body, "stream": True}) as stream:
+            for line in stream.iter_lines():
+                if line.startswith("data:"):
+                    chunks.append(line[len("data:") :].strip())
+        assert chunks, "streaming endpoint produced no SSE frames"
+        assert chunks[-1] == "[DONE]"
+        # Frames serialize with exclude_unset, so assert on structure.
+        parsed = [json.loads(frame) for frame in chunks[:-1]]
+        assert parsed and any(frame.get("choices") for frame in parsed)
 
 
 def test_zz_dead_replica_fails_over(replicas):
