@@ -1236,6 +1236,13 @@ class ExecutionManager:
         )
         use_greedy_argmax_fastpath = bool(
             not need_penalties
+            # Under an MPMD/PP mesh the logits live on the final stage's
+            # submesh, but the fastpath's helper tensors (valid mask, RNG
+            # fold scalar) are replicated over the full mesh — a device-set
+            # mismatch inside the jitted argmax. The standard sampler path
+            # places its inputs on the stage submesh, so fall back to it for
+            # pipeline meshes (greedy decode stays correct, just not fused).
+            and not self._model_executor._uses_mpmd_mesh()
             and int(sampler_padded_num_reqs) == int(padded_num_reqs)
             and int(model_logits_padded_num_reqs) == int(padded_num_reqs)
             and numpy.array_equal(
