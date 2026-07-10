@@ -179,6 +179,7 @@ def create_step_coordinator(
     *,
     distributed_config,
     config_fingerprint: str | None,
+    engine_spec=None,
 ):
     """Build the right coordinator for this process.
 
@@ -196,6 +197,8 @@ def create_step_coordinator(
         distributed_config: The engine's distributed config section.
         config_fingerprint: Engine-config fingerprint for the handshake
             (required for the ZMQ plane).
+        engine_spec: Optional ``wire.EngineSpec`` the leader hands to
+            request-plane clients in ``HelloOk``.
 
     Returns:
         A :class:`StepCoordinator` implementation.
@@ -237,6 +240,7 @@ def create_step_coordinator(
             step_timeout_s=float(distributed_config.distributed_step_timeout_s),
             verify_digest_interval=int(distributed_config.distributed_verify_digest_interval),
             max_inflight_steps=int(distributed_config.distributed_max_inflight_steps),
+            engine_spec=engine_spec,
             **common,
         )
 

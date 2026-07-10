@@ -24,6 +24,7 @@ per-request parser construction, and ``n>1`` sample fan-out.
 from __future__ import annotations
 
 import copy
+import hashlib
 import threading
 import time
 import typing
@@ -43,6 +44,40 @@ from ..request import EngineRequest
 from ..utils import truncate_tokens
 from .chat_templating import normalize_stop_sequences
 from .registry import RequestRecord, RequestRegistry
+
+
+def compute_admission_key(
+    prompt_token_ids: Sequence[int],
+    sampling_params: Any,
+    n: int,
+    *,
+    salt: str = "",
+) -> str:
+    """Content hash identifying a logical admission across ranks.
+
+    The unified request plane keys cross-rank coalescing on
+    ``(origin_counter, content_hash)``: two ranks admitting the same tokens
+    with the same sampling parameters in the same admission slot are the
+    same logical request. The hash canonicalizes the sampling params via
+    their public attribute dict (attribute insertion order is identical
+    across ranks for equal construction paths, and ``repr`` of equal values
+    is deterministic), so equal-valued params hash equally on every rank.
+
+    Args:
+        prompt_token_ids: Post-truncation prompt token ids.
+        sampling_params: The request's ``SamplingParams`` (or ``None``).
+        n: Parallel-sampling fan-out.
+        salt: Extra discriminator; callers pass the explicit request id when
+            one was supplied so only auto-id (trainer) traffic coalesces.
+
+    Returns:
+        Hex SHA-256 digest of the canonicalized admission content.
+    """
+    parts = [repr(tuple(int(tok) for tok in prompt_token_ids)), repr(int(n or 1)), str(salt)]
+    if sampling_params is not None:
+        state = {key: value for key, value in vars(sampling_params).items() if not key.startswith("_")}
+        parts.append(repr(sorted((str(key), repr(value)) for key, value in state.items())))
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()
 
 
 def clone_sampling_params(sampling_params: SamplingParams) -> SamplingParams:
@@ -197,6 +232,21 @@ class RequestAdmission:
             if jax.process_count() > 1:
                 return f"req-{self._request_counter:010d}"
             return f"req-{uuid.uuid4().hex}-{self._request_counter}"
+
+    def next_arrival_stamp(self) -> float:
+        """Advance the admission counter and return it as an arrival stamp.
+
+        The request plane's owner side stamps remotely-admitted requests
+        with this so they interleave FCFS with owner-local admissions:
+        both share one monotonic counter scale (local multi-host admissions
+        stamp ``arrival_time`` from the same counter).
+
+        Returns:
+            The advanced counter value as a float arrival time.
+        """
+        with self._counter_lock:
+            self._request_counter = (self._request_counter + 1) % (1 << 32)
+            return float(self._request_counter)
 
     def _apply_extra_stops_to_sampling_params(self, sampling_params: SamplingParams) -> SamplingParams:
         """Splice engine-level ``extra_stops`` into a request's ``stop`` list.

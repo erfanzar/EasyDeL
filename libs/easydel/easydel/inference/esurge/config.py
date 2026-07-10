@@ -722,6 +722,7 @@ class eSurgeVisionConfig(TypedDict, total=False):
         "distributed_heartbeat_timeout_s": 5.0,
         "distributed_verify_digest_interval": 64,
         "distributed_max_inflight_steps": 4,
+        "distributed_admit_timeout_s": 120.0,
     },
 )
 class eSurgeDistributedConfig(TypedDict, total=False):
@@ -780,6 +781,11 @@ class eSurgeDistributedConfig(TypedDict, total=False):
             the ``coordination="zmq"`` plane; the leader stops dispatching
             when the slowest worker falls this many steps behind. Default
             ``4``.
+        distributed_admit_timeout_s: How long a non-leader rank blocks on
+            the owner's acknowledgement when forwarding a request admission
+            through the unified request plane. The first admissions overlap
+            owner-side warmup compilation, so this defaults generously
+            (``120.0`` seconds).
     """
 
     coordination: NotRequired[Literal["replicated", "zmq"]]
@@ -795,6 +801,7 @@ class eSurgeDistributedConfig(TypedDict, total=False):
     distributed_heartbeat_timeout_s: NotRequired[float]
     distributed_verify_digest_interval: NotRequired[int]
     distributed_max_inflight_steps: NotRequired[int]
+    distributed_admit_timeout_s: NotRequired[float]
 
     @classmethod
     def from_dict(
