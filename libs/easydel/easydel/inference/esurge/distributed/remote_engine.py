@@ -611,6 +611,127 @@ class RemoteEngineHandle:
             with self._registry.request_lock:
                 self._registry.events.pop(rid, None)
 
+    def chat(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        tool_choice: str | dict | None = None,
+        sampling_params: SamplingParams | None = None,
+        request_id: str | None = None,
+        stream: bool = False,
+        chat_template: str | None = None,
+        chat_template_kwargs: dict | None = None,
+    ):
+        """Chat interface over the remote engine (text-only).
+
+        Renders the conversation through the handle's tokenizer chat
+        template and forwards it as a plain generation. Multimodal content
+        needs the owner's processor and is not supported through a remote
+        handle.
+
+        Args:
+            messages: OpenAI-style message dicts.
+            tools: Tool definitions rendered into the template; when
+                present, special tokens are preserved so the model can emit
+                tool calls.
+            tool_choice: Accepted for signature parity.
+            sampling_params: Generation parameters (default ``max_tokens=128``).
+            request_id: Optional explicit id.
+            stream: Yield incremental snapshots instead of blocking.
+            chat_template: Optional template override.
+            chat_template_kwargs: Extra ``apply_chat_template`` kwargs.
+
+        Returns:
+            A finished ``RequestOutput`` (``stream=False``) or an iterator
+            of incremental snapshots (``stream=True``).
+        """
+        del tool_choice
+        from ..engine.admission import clone_sampling_params
+        from ..engine.chat_templating import format_chat_prompt
+
+        params = clone_sampling_params(sampling_params or SamplingParams(max_tokens=128))
+        if tools:
+            params.skip_special_tokens = False
+            params.logit_bias = None
+        else:
+            params.skip_special_tokens = True
+        prompt = format_chat_prompt(
+            self.tokenizer,
+            messages,
+            add_generation_prompt=True,
+            chat_template=chat_template,
+            tools=tools,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+        if stream:
+            return self.stream(prompt, sampling_params=params, request_id=request_id)
+        return self.generate(prompt, sampling_params=params, request_id=request_id)[0]
+
+    def iter_chat_completion_stream(
+        self,
+        *,
+        model: str,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        tool_choice: str | dict | None = None,
+        sampling_params: SamplingParams | None = None,
+        request_id: str | None = None,
+        chat_template: str | None = None,
+        chat_template_kwargs: dict | None = None,
+    ):
+        """Bridge :meth:`chat` snapshots into OpenAI chat-completion chunks."""
+        from ...stream_protocol import iter_chat_completion_stream_responses
+
+        outputs = self.chat(
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            sampling_params=sampling_params,
+            request_id=request_id,
+            stream=True,
+            chat_template=chat_template,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+        yield from iter_chat_completion_stream_responses(outputs, model=model)
+
+    def iter_responses_stream(
+        self,
+        *,
+        response_id: str,
+        model: str,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        tool_choice: str | dict | None = None,
+        sampling_params: SamplingParams | None = None,
+        request_id: str | None = None,
+        include_reasoning_summary: bool = False,
+        final_response_overrides=None,
+        created_at: int | None = None,
+        chat_template: str | None = None,
+        chat_template_kwargs: dict | None = None,
+    ):
+        """Bridge :meth:`chat` snapshots into OpenAI Responses-API frames."""
+        from ...stream_protocol import iter_responses_stream_frames
+
+        outputs = self.chat(
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            sampling_params=sampling_params,
+            request_id=request_id,
+            stream=True,
+            chat_template=chat_template,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+        yield from iter_responses_stream_frames(
+            outputs,
+            response_id=response_id,
+            model=model,
+            include_reasoning_summary=include_reasoning_summary,
+            final_response_overrides=final_response_overrides,
+            created_at=created_at,
+        )
+
     def abort_request(self, request_id: str) -> None:
         """Cancel a request: notify the owner, render the abort locally."""
         self._plane.notify_abort(request_id)

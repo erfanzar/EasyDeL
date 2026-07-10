@@ -312,23 +312,33 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         Raises:
             TypeError: If esurge_map values are not eSurge instances.
         """
-        if isinstance(esurge_map, eSurge):
-            model_name = esurge_map.esurge_name
+        if not isinstance(esurge_map, dict):
+            model_name = getattr(esurge_map, "esurge_name", None) or "esurge"
             esurge_map = {model_name: esurge_map}
 
         self.esurge_map = esurge_map
         self.adapters: dict[str, eSurgeAdapter] = {}
 
+        # Engines are accepted by surface, not by class: RoutedEngine and
+        # RemoteEngineHandle (DP-replica fronts) serve exactly like a local
+        # eSurge as long as they expose the adapter contract.
+        engine_surface = ("generate", "stream", "chat", "abort_request", "tokenizer", "max_model_len", "max_num_seqs")
         for name, esurge in esurge_map.items():
-            if not isinstance(esurge, eSurge):
-                raise TypeError(f"Value for key '{name}' must be an instance of eSurge")
+            missing = [attr for attr in engine_surface if not hasattr(esurge, attr)]
+            if missing:
+                raise TypeError(
+                    f"Value for key '{name}' does not expose the eSurge engine surface; missing: {missing}"
+                )
             coordinator = getattr(esurge, "_step_coordinator", None)
             if coordinator is not None and not getattr(coordinator, "is_leader", True):
                 raise ValueError(
                     f"Model '{name}' is a step-coordination worker rank "
                     f"{getattr(coordinator, 'rank', '?')}; only the leader rank can run eSurgeApiServer."
                 )
-            self._reject_uncoordinated_multihost(name, esurge, coordinator)
+            if isinstance(esurge, eSurge):
+                # Remote/routed members run no local collectives; only a
+                # local engine can deadlock a multi-host runtime.
+                self._reject_uncoordinated_multihost(name, esurge, coordinator)
             self.adapters[name] = eSurgeAdapter(esurge, name)
 
         self.oai_like_processor = oai_like_processor
