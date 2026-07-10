@@ -40,19 +40,24 @@ from .coordinator import (
 )
 from .discovery import DiscoveryResult, resolve_service_hosts
 from .protocol import compute_sampled_digest, make_config_fingerprint
+from .remote_engine import RemoteEngineHandle
 from .request_plane import (
     OriginRequestPlane,
     OwnerRequestPlane,
     RequestPlaneError,
     create_request_plane,
 )
+from .routed_engine import PrefixAffinityMap, RoutedEngine
 
 __all__ = (
     "DiscoveryResult",
     "LocalCoordinator",
     "OriginRequestPlane",
     "OwnerRequestPlane",
+    "PrefixAffinityMap",
+    "RemoteEngineHandle",
     "RequestPlaneError",
+    "RoutedEngine",
     "StepCoordinationError",
     "StepCoordinator",
     "StepHandle",

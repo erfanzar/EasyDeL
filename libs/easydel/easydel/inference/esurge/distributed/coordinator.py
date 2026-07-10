@@ -187,10 +187,14 @@ def create_step_coordinator(
 
     1. ``coordination="zmq"`` with ``jax.process_count() > 1`` builds the
        ZeroMQ leader (rank 0) or worker plane.
-    2. Everything else — single host, or the multi-host *replicated* pattern
-       where an outer driver (e.g. a trainer's rollout loop) calls the
-       engine identically on every host — gets the pass-through
-       :class:`LocalCoordinator`.
+    2. ``coordination="zmq"`` on a single process builds a workerless
+       leader: no step replication, but the control socket serves
+       request-plane clients — the DP-replica pattern where each replica
+       engine is its own JAX world fronted by a router.
+    3. Everything else — the default single host, or the multi-host
+       *replicated* pattern where an outer driver (e.g. a trainer's rollout
+       loop) calls the engine identically on every host — gets the
+       pass-through :class:`LocalCoordinator`.
 
     Args:
         runner: The engine's runner.
@@ -211,7 +215,7 @@ def create_step_coordinator(
 
     world_size = int(jax.process_count())
     coordination = str(getattr(distributed_config, "coordination", "replicated") or "replicated")
-    if world_size <= 1 or coordination != "zmq":
+    if coordination != "zmq":
         return LocalCoordinator(runner)
 
     from .zmq_coordinator import ZmqLeaderCoordinator, ZmqWorkerCoordinator
