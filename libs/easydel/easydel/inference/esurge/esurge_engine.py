@@ -2137,6 +2137,9 @@ class eSurge:
                 self._scheduler_exception = None
                 self._scheduler_exception_tb = None
                 self._scheduler_running = False
+                # Worker ranks render remotely-admitted request outputs
+                # locally (request plane), so they need the output worker too.
+                self._start_engine_output_worker()
                 self._worker_stop_event.clear()
                 self._worker_replay_thread = threading.Thread(
                     target=self._run_worker_replay_loop,
