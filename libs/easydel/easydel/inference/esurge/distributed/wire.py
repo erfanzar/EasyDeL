@@ -82,6 +82,7 @@ class EngineSpec(msgspec.Struct):
         reserve_tokens: Tokens reserved for generation at admission.
         eos_token_ids: Combined engine EOS ids, in priority order.
         tokenizer_source: Id/path clients can load a matching tokenizer from.
+        page_size: KV page size in tokens (prefix-affinity block alignment).
     """
 
     esurge_name: str = ""
@@ -90,6 +91,7 @@ class EngineSpec(msgspec.Struct):
     reserve_tokens: int = 0
     eos_token_ids: list[int] = []
     tokenizer_source: str = ""
+    page_size: int = 0
 
 
 class HelloOk(msgspec.Struct, tag=True):
@@ -207,11 +209,16 @@ class Admit(msgspec.Struct, tag=True):
     Attributes:
         request_id: The origin's parent request id (its local registry key).
         origin_rank: Origin process rank (identifies the return path).
-        origin_counter: Origin-plane monotonic admission counter.
+        origin_counter: Origin-plane monotonic admission counter (all
+            admissions; keeps owner-side ids unique per rank).
         content_hash: :func:`compute_admission_key` over (tokens, params, n);
             the coalescing key component and owner-id suffix source.
         coalescable: Whether identical cross-rank admissions may share one
             scheduled request (deterministic-counter trainer traffic).
+        coalesce_counter: Per-rank sequence counting only *coalescable*
+            admissions — the coalescing key's counter component. Kept
+            separate from ``origin_counter`` so interleaved non-coalescable
+            traffic on one rank cannot desynchronize the key sequence.
         n_samples: Parallel-sampling fan-out (validation aid).
         payload_codec: Encoding of the payload frame.
     """
@@ -221,6 +228,7 @@ class Admit(msgspec.Struct, tag=True):
     origin_counter: int
     content_hash: str = ""
     coalescable: bool = False
+    coalesce_counter: int = 0
     n_samples: int = 1
     payload_codec: str = PAYLOAD_CODEC_PICKLE
 
@@ -232,14 +240,18 @@ class AdmitAck(msgspec.Struct, tag=True):
         request_id: Echo of the origin's parent request id.
         ok: ``False`` turns this into a NACK.
         error: Failure description on NACK.
-        already_finished: Late coalesced attach: the shared request already
-            finished; the payload frame replays its full token log.
+        already_finished: Coalesced attach to a group that already finished.
+        payload_codec: Encoding of the optional payload frame. A coalesced
+            attach to a group that already produced tokens carries a
+            catch-up payload: the ``(outputs, finished_requests)`` tuple
+            replaying the group's token log in the subscriber's id space.
     """
 
     request_id: str
     ok: bool
     error: str | None = None
     already_finished: bool = False
+    payload_codec: str = PAYLOAD_CODEC_PICKLE
 
 
 class OutputUpdate(msgspec.Struct, tag=True):
@@ -286,6 +298,25 @@ class StopHit(msgspec.Struct, tag=True):
     hits: dict[str, str] = {}
 
 
+class QueueStats(msgspec.Struct, tag=True):
+    """Owner → clients: scheduler load snapshot for join-shortest-queue routing.
+
+    Piggybacked on the leader's heartbeat cadence to request-plane clients.
+    Values are best-effort reads of live scheduler state (no lock taken on
+    the owner) — routing tolerates slight staleness.
+
+    Attributes:
+        num_waiting: Requests queued but not yet running.
+        num_running: Requests currently scheduled.
+        pending_prefill_tokens: Prompt tokens not yet computed across the
+            waiting/running sets — the JSQ cost signal.
+    """
+
+    num_waiting: int = 0
+    num_running: int = 0
+    pending_prefill_tokens: int = 0
+
+
 WireMessage = (
     Hello
     | HelloOk
@@ -301,6 +332,7 @@ WireMessage = (
     | OutputUpdate
     | AbortReq
     | StopHit
+    | QueueStats
 )
 
 _encoder = msgspec.msgpack.Encoder()
