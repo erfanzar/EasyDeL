@@ -445,6 +445,14 @@ def run_batch(runner, prompts: list[list[int]], output_len: int, max_num_batched
         ("exec_wait_s", "exec_wait_time"),
         ("sampler_wait_s", "sampler_wait_time"),
         ("prev_async_s", "prev_async_time"),
+        ("prep_host_s", "prep_host_time"),
+        ("prep_put_s", "prep_put_time"),
+        ("prep_extra_put_s", "prep_extra_put_time"),
+        ("prep_batch_metadata_s", "prep_batch_metadata_time"),
+        ("prep_handoff_s", "prep_handoff_time"),
+        ("prep_sampler_window_s", "prep_sampler_window_time"),
+        ("prep_ensure_variants_s", "prep_ensure_variants_time"),
+        ("prep_pack_inputs_s", "prep_pack_inputs_time"),
     )
     for record in profile_records:
         key = str(int(record.get("total_tokens", 0) or 0))

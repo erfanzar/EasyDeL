@@ -39,3 +39,29 @@ emit path, forks on submit/abort): performance-neutral.
 Unmeasured on hardware: multi-host plane throughput and the deleted
 broadcast_one_to_all gain (needs v5p-16+), the flip branch's trainer path
 (pod GRPO parity gate), DP-replica aggregate throughput scaling.
+
+## 2026-07-10 — decode host-path optimization (configs A + B)
+
+Config B (decode-heavy): `--prompt-len 128 --output-len 512`, otherwise
+identical command/host to config A.
+
+- `BASE_B_decode_128x512.json` — pre-optimization: 4685.4 tok/s
+- `OPT2_B_decode_128x512.json` — post-optimization: 4967.7 tok/s (+6.0%)
+- `OPT_A_mixed_1024x256.json` — config A post-optimization: 1919.0 tok/s
+  (+1.3% over `PLANE_A`'s 1893.5)
+
+Two host-dispatch caches, byte-identical outputs in every run
+(`per_request_generated` equal, greedy fastpath 245/245 resp. 511/511):
+greedy-argmax device transfers cached by content (724 -> 139 us/step) and
+small host-payload slots content-keyed so unchanged metadata skips its
+device_put (prep_put 657 -> 436 us/step). Decode-bucket wallclock
+4471 -> 3678 us/step.
+
+Finding for the next round: after these cuts the decode step is
+DEVICE-bound (~3.7 ms effective; sync-mode logits wait 5.25 ms/step),
+~3-4x above the weight-bandwidth roofline for a 4B on 4 v5p chips —
+further host-side work buys nothing until the device step (hybrid GDR
+kernels / ragged paged attention / LM head) is profiled and improved.
+The remaining measured host costs per decode step: compiled-call arg
+processing ~1.8 ms (scales with ~550 pytree leaves, C++ fastpath floor),
+prep 0.8 ms, scheduler gap 0.4 ms.

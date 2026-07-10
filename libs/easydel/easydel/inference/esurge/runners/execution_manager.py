@@ -313,6 +313,11 @@ class ExecutionManager:
 
         self._empty_sharding = replicated_named_sharding(model.mesh)
         self._input_sharding = self._empty_sharding
+        # Greedy-fastpath dispatch caches: in steady decode the valid mask
+        # and total-token scalar are identical step over step, so the
+        # host->device transfers they'd otherwise enqueue are pure waste.
+        self._greedy_mask_cache: tuple[bytes, jax.Array] | None = None
+        self._greedy_total_tokens_cache: dict[int, jax.Array] = {}
         if int(getattr(metadata, "data_parallel_size", 1) or 1) > 1:
             resolver = getattr(metadata, "runtime_sharding_resolver", None) or text_config.runtime_sharding_resolver
             self._input_sharding = NamedSharding(
@@ -1295,12 +1300,12 @@ class ExecutionManager:
         if use_greedy_argmax_fastpath:
             sampler_enqueue_took = 0.0
             greedy_argmax_start = time.time()
-            valid_mask_dev = jax.device_put(valid_mask_cpu, self._empty_sharding)
+            valid_mask_dev = self._greedy_valid_mask_device(valid_mask_cpu)
             rng_key_out, out_tokens_full, valid_mask_full = _greedy_argmax_tokens(
                 model_outputs.logits,
                 valid_mask_dev,
                 self.rng_key,
-                jnp.asarray(sampler_total_tokens, dtype=jnp.int32),
+                self._greedy_total_tokens_device(int(sampler_total_tokens)),
                 padded_num_reqs=int(padded_num_reqs),
             )
             token_counts_out = self._sampler_token_counts
@@ -1425,6 +1430,32 @@ class ExecutionManager:
     # 11.3); kept as a static alias because execute(), the PP microbatch
     # executor, and tests call it as ExecutionManager._apply_device_token_handoff.
     _apply_device_token_handoff = staticmethod(BatchMetadataPreparer._apply_device_token_handoff)
+
+    def _greedy_valid_mask_device(self, valid_mask_cpu) -> jax.Array:
+        """Device copy of the greedy valid mask, cached by content.
+
+        Steady-state decode presents the same mask every step; keying on the
+        raw bytes skips the per-step ``device_put`` dispatch while staying
+        correct the moment membership changes.
+        """
+        key = valid_mask_cpu.tobytes()
+        cached = self._greedy_mask_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        device_mask = jax.device_put(valid_mask_cpu, self._empty_sharding)
+        self._greedy_mask_cache = (key, device_mask)
+        return device_mask
+
+    def _greedy_total_tokens_device(self, total_tokens: int) -> jax.Array:
+        """Device scalar for the sampled-token RNG fold, cached per value.
+
+        Bounded by the token-bucket ladder, so the cache stays tiny.
+        """
+        cached = self._greedy_total_tokens_cache.get(total_tokens)
+        if cached is None:
+            cached = jax.device_put(jnp.asarray(total_tokens, dtype=jnp.int32), self._empty_sharding)
+            self._greedy_total_tokens_cache[total_tokens] = cached
+        return cached
 
     def execute_model(
         self,
