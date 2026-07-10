@@ -43,26 +43,65 @@ ACK_PHASE_SYNC_DONE = 0
 ACK_PHASE_DRAINED = 1
 
 
+ROLE_WORKER = "worker"
+ROLE_CLIENT = "client"
+
+
 class Hello(msgspec.Struct, tag=True):
-    """Worker's first message: identity + config proof.
+    """A peer's first message: identity + config proof.
 
     Attributes:
-        rank: The worker's ``jax.process_index()``.
-        world_size: The worker's ``jax.process_count()``.
-        config_fingerprint: SHA-256 fingerprint of the engine config.
+        rank: The worker's ``jax.process_index()`` (``-1`` for clients).
+        world_size: The worker's ``jax.process_count()`` (``0`` for clients).
+        config_fingerprint: SHA-256 fingerprint of the engine config. Clients
+            send ``""`` — they attach to whatever engine the owner runs.
         auth: Shared auth token.
+        role: ``ROLE_WORKER`` for in-group step-replay ranks (counted toward
+            the Ready barrier), ``ROLE_CLIENT`` for request-plane clients
+            (remote engine handles, routers) that only admit requests and
+            receive outputs.
+        client_id: Stable identifier for ``ROLE_CLIENT`` peers (unused for
+            workers).
     """
 
     rank: int
     world_size: int
     config_fingerprint: str
     auth: str
+    role: str = ROLE_WORKER
+    client_id: str = ""
+
+
+class EngineSpec(msgspec.Struct):
+    """Owner-engine facts a request-plane client needs to admit remotely.
+
+    Attributes:
+        esurge_name: The owner engine's display name.
+        max_model_len: Context limit (prompt + generation).
+        max_num_seqs: Concurrent-request limit.
+        reserve_tokens: Tokens reserved for generation at admission.
+        eos_token_ids: Combined engine EOS ids, in priority order.
+        tokenizer_source: Id/path clients can load a matching tokenizer from.
+    """
+
+    esurge_name: str = ""
+    max_model_len: int = 0
+    max_num_seqs: int = 0
+    reserve_tokens: int = 0
+    eos_token_ids: list[int] = []
+    tokenizer_source: str = ""
 
 
 class HelloOk(msgspec.Struct, tag=True):
-    """Leader's acceptance of a worker's :class:`Hello`."""
+    """Leader's acceptance of a peer's :class:`Hello`.
+
+    Attributes:
+        rank: Echo of the accepted worker rank (``-1`` for clients).
+        engine_spec: Owner-engine facts for request-plane clients.
+    """
 
     rank: int
+    engine_spec: EngineSpec | None = None
 
 
 class Ready(msgspec.Struct, tag=True):

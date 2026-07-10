@@ -31,7 +31,6 @@ import time
 from types import SimpleNamespace
 
 import pytest
-
 from easydel.inference.esurge.distributed.coordinator import (
     LocalCoordinator,
     StepCoordinationError,
@@ -105,6 +104,8 @@ class _Plane:
     """One leader + one worker over loopback, torn down deterministically."""
 
     def __init__(self, *, worker_runner=None, leader_runner=None, verify_digest_interval: int = 1):
+        from easydel.inference.esurge.distributed import wire
+
         port = _free_port()
         self.leader_runner = leader_runner or _MockRunner()
         self.worker_runner = worker_runner or _MockRunner()
@@ -121,6 +122,14 @@ class _Plane:
             heartbeat_timeout_s=DEADLINE_S,
             verify_digest_interval=verify_digest_interval,
             max_inflight_steps=4,
+            engine_spec=wire.EngineSpec(
+                esurge_name="mock-engine",
+                max_model_len=128,
+                max_num_seqs=2,
+                reserve_tokens=2,
+                eos_token_ids=[0],
+                tokenizer_source="mock-tokenizer",
+            ),
         )
         self.worker = ZmqWorkerCoordinator(
             self.worker_runner,
@@ -304,3 +313,180 @@ def test_local_coordinator_is_identity_passthrough():
     assert runner.calls == ["sync:A", "dispatch:B", "drain:B"]
     with pytest.raises(StepCoordinationError):
         local.run_worker_loop(threading.Event())
+
+
+class _RawClient:
+    """Minimal request-plane client speaking Hello(role=client) over a DEALER."""
+
+    def __init__(self, port: int, *, auth: str = AUTH, client_id: str = "client-a"):
+        import zmq
+
+        self.ctx = zmq.Context.instance()
+        self.sock = self.ctx.socket(zmq.DEALER)
+        self.sock.setsockopt(zmq.IDENTITY, f"client-{client_id}".encode())
+        self.sock.setsockopt(zmq.LINGER, 0)
+        self.sock.connect(f"tcp://127.0.0.1:{port}")
+        self.client_id = client_id
+        self.auth = auth
+
+    def hello(self, timeout_s: float = DEADLINE_S):
+        from easydel.inference.esurge.distributed import wire
+
+        self.sock.send_multipart(
+            [
+                wire.encode_message(
+                    wire.Hello(
+                        rank=-1,
+                        world_size=0,
+                        config_fingerprint="",
+                        auth=self.auth,
+                        role=wire.ROLE_CLIENT,
+                        client_id=self.client_id,
+                    )
+                )
+            ]
+        )
+        assert self.sock.poll(int(timeout_s * 1000)), "no HelloOk for client"
+        frames = self.sock.recv_multipart()
+        return wire.decode_message(frames[0])
+
+    def recv_until(self, predicate, timeout_s: float = DEADLINE_S):
+        from easydel.inference.esurge.distributed import wire
+
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if not self.sock.poll(200):
+                continue
+            frames = self.sock.recv_multipart()
+            message = wire.decode_message(frames[0])
+            if predicate(message):
+                return message
+        raise AssertionError("expected client message not received")
+
+    def close(self):
+        self.sock.close(linger=0)
+
+
+def test_client_role_handshake_and_targeted_send():
+    from easydel.inference.esurge.distributed import wire
+
+    with _Plane() as plane:
+        port = int(plane.leader._bind_endpoint.rsplit(":", 1)[1])
+        client = _RawClient(port)
+        try:
+            ok = client.hello()
+            assert isinstance(ok, wire.HelloOk)
+            assert ok.rank == -1
+            assert ok.engine_spec is not None and ok.engine_spec.esurge_name == "mock-engine"
+
+            _wait_until(lambda: plane.leader.client_identity("client-a") is not None)
+            # Clients must not receive the step broadcast.
+            plane.leader.execute_sync(_sched_output("S1"))
+            # Targeted delivery reaches only the addressed client.
+            identity = plane.leader.client_identity("client-a")
+            plane.leader.send_to_peer(identity, wire.Control(kind="ping", args={"x": 1}))
+            message = client.recv_until(lambda m: isinstance(m, wire.Control))
+            assert message.kind == "ping" and message.args == {"x": 1}
+            # The worker replayed the step; the client saw none.
+            _wait_until(lambda: plane.worker_runner.calls == ["sync:S1"])
+        finally:
+            client.close()
+
+
+def test_client_with_bad_auth_is_ignored_but_workers_proceed():
+    from easydel.inference.esurge.distributed import wire
+
+    with _Plane() as plane:
+        port = int(plane.leader._bind_endpoint.rsplit(":", 1)[1])
+        intruder = _RawClient(port, auth="wrong", client_id="intruder")
+        try:
+            intruder.sock.send_multipart(
+                [
+                    wire.encode_message(
+                        wire.Hello(
+                            rank=-1,
+                            world_size=0,
+                            config_fingerprint="",
+                            auth="wrong",
+                            role=wire.ROLE_CLIENT,
+                            client_id="intruder",
+                        )
+                    )
+                ]
+            )
+            time.sleep(0.3)
+            assert plane.leader.client_identity("intruder") is None
+            plane.leader.execute_sync(_sched_output("S1"))
+            _wait_until(lambda: plane.worker_runner.calls == ["sync:S1"])
+        finally:
+            intruder.close()
+
+
+def test_worker_send_to_leader_reaches_plane_handler():
+    from easydel.inference.esurge.distributed import wire
+
+    received = []
+
+    with _Plane() as plane:
+        plane.leader._plane_handler = lambda identity, message, payload: received.append((message, payload))
+        plane.worker.send_to_leader(wire.Control(kind="admit-test", args={"k": "v"}), b"payload-bytes")
+        _wait_until(lambda: bool(received))
+        message, payload = received[0]
+        assert isinstance(message, wire.Control)
+        assert message.kind == "admit-test"
+        assert payload == b"payload-bytes"
+
+
+def test_leader_restarts_after_shutdown():
+    port = _free_port()
+
+    def _make_worker():
+        return ZmqWorkerCoordinator(
+            _MockRunner(),
+            rank=1,
+            world_size=2,
+            leader_addr="127.0.0.1",
+            control_port=port,
+            auth_token=AUTH,
+            config_fingerprint=FINGERPRINT,
+            connect_timeout_s=DEADLINE_S,
+            heartbeat_interval_s=0.2,
+            heartbeat_timeout_s=DEADLINE_S,
+        )
+
+    leader = ZmqLeaderCoordinator(
+        _MockRunner(),
+        world_size=2,
+        bind_host="127.0.0.1",
+        control_port=port,
+        auth_token=AUTH,
+        config_fingerprint=FINGERPRINT,
+        ready_timeout_s=DEADLINE_S,
+        step_timeout_s=5.0,
+        heartbeat_interval_s=0.2,
+        heartbeat_timeout_s=DEADLINE_S,
+    )
+
+    for round_idx in range(2):
+        worker = _make_worker()
+        stop_event = threading.Event()
+        worker_runner = worker._runner
+
+        def _body(w=worker, ev=stop_event):
+            try:
+                w.start()
+                w.run_worker_loop(ev)
+            except StepCoordinationError:
+                pass
+
+        thread = threading.Thread(target=_body, daemon=True)
+        thread.start()
+        leader.start()
+        out = leader.execute_sync(_sched_output(f"R{round_idx}"))
+        assert out.tag == f"R{round_idx}"
+        _wait_until(lambda calls=worker_runner.calls, r=round_idx: calls == [f"sync:R{r}"])
+        leader.shutdown(f"round {round_idx} teardown")
+        stop_event.set()
+        thread.join(timeout=DEADLINE_S)
+        worker.shutdown()
+        assert not thread.is_alive()
