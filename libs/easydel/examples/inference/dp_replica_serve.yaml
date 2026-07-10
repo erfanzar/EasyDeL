@@ -27,9 +27,12 @@ config:
     name_or_path: Qwen/Qwen3.5-4B
     dtype: bf16
   sharding:
-    # dp = replica count; tp fills each replica's carved chip subset.
-    axis_dims: [2, 1, 1, -1, 1]
-    axis_names: ["dp", "fsdp", "ep", "tp", "sp"]
+    # Canonical 6-axis mesh. `dp` = replica count (peeled into independent
+    # processes); the remaining axes shard WITHIN each replica's carved chip
+    # subset — `tp=-1` fills it, and `pp>1` would pipeline-shard a large
+    # model across the subset. Here: 2 replicas, tp filling each.
+    axis_dims: [1, 2, 1, 1, -1, 1]
+    axis_names: ["pp", "dp", "fsdp", "ep", "tp", "sp"]
   esurge:
     runtime:
       max_model_len: 4096

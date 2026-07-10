@@ -60,10 +60,11 @@ def main():
                 "verbose": True,
             },
             "sharding": {
-                # Shard the single model across every chip of the pod (tp fills
-                # all visible devices across all hosts).
-                "axis_dims": (1, 1, 1, -1, 1),
-                "axis_names": ("dp", "fsdp", "ep", "tp", "sp"),
+                # Canonical 6-axis mesh. Shard the single model across every
+                # chip of the pod: tp fills all visible devices across all
+                # hosts. Set pp>1 instead to pipeline-shard across stages.
+                "axis_dims": (1, 1, 1, 1, -1, 1),
+                "axis_names": ("pp", "dp", "fsdp", "ep", "tp", "sp"),
                 "auto_shard_model": True,
             },
             "esurge": {
