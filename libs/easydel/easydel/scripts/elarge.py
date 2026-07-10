@@ -352,9 +352,42 @@ def _serve_replicated(
         raise SystemExit("PyYAML is required for `serve.replicas`.") from exc
 
     endpoints = replicas_params.get("endpoints")
-    count = int(replicas_params.get("count", len(endpoints) if endpoints else 0))
-    if count < 2:
-        raise SystemExit("`serve.replicas.count` must be >= 2 (or provide `endpoints`).")
+
+    # Replica count + per-replica config come from the mesh `dp` axis:
+    # replica-DP peels `dp` into independent processes, so the count
+    # defaults to that axis size and each replica's own mesh collapses `dp`
+    # to 1 (its remaining axes — usually `tp` — size against its carved
+    # chip subset). An explicit `serve.replicas.count` overrides the
+    # derived value. json-roundtrip makes the config yaml-safe and its dims
+    # mutable for the collapse.
+    config_dict = json.loads(json.dumps(elm.to_dict(), default=str))
+    sharding = config_dict.get("sharding") or {}
+    axis_names = list(sharding.get("axis_names") or ())
+    axis_dims = list(sharding.get("axis_dims") or ())
+    has_dp = "dp" in axis_names and len(axis_dims) == len(axis_names)
+    dp_size = int(axis_dims[axis_names.index("dp")]) if has_dp else 1
+
+    explicit_count = replicas_params.get("count")
+    if explicit_count is not None:
+        count = int(explicit_count)
+    elif endpoints:
+        count = len(endpoints)
+    elif dp_size > 1:
+        count = dp_size
+    else:
+        raise SystemExit(
+            "`serve.replicas` needs a replica count: set the mesh `dp` axis > 1 in `sharding.axis_dims`, "
+            "pass `serve.replicas.count`, or provide `serve.replicas.endpoints`."
+        )
+    if not endpoints and count < 2:
+        raise SystemExit(f"`serve.replicas` resolved count={count}; need >= 2 replicas (or `endpoints`).")
+
+    # Each replica is its own process, so its mesh must not also fan out dp.
+    if has_dp:
+        axis_dims[axis_names.index("dp")] = 1
+        sharding["axis_dims"] = axis_dims
+        config_dict["sharding"] = sharding
+
     base_control_port = int(replicas_params.get("base_control_port", 19700))
     ready_timeout_s = float(replicas_params.get("ready_timeout_s", 1800.0))
     auth_token = replicas_params.get("auth_token") or hashlib.sha256(
@@ -381,7 +414,6 @@ def _serve_replicated(
         os.makedirs(workdir, exist_ok=True)
         chip_envs = _plan_replica_tpu_envs(count)
         platform_override = replicas_params.get("platform")
-        config_dict = elm.to_dict()
         targets = []
         for index in range(count):
             control_port = base_control_port + index
@@ -688,14 +720,16 @@ def _run_action(elm: Any, name: str, value: Any | None) -> None:
                 raise SystemExit("`serve.cors_origins` must be a list of strings (or null).")
             server_kwargs["cors_origins"] = cors_origins
 
-        replicas_value = params.get("replicas")
-        if replicas_value:
+        if "replicas" in params:
             # Data-parallel serving: N independent replica engines behind
             # one routed server. The parent never builds a model or touches
             # the accelerator, so skip validate() (each replica validates).
+            # An empty `replicas:` block is valid — count derives from the
+            # mesh `dp` axis inside _serve_replicated.
+            replicas_value = params["replicas"]
             _serve_replicated(
                 elm=elm,
-                replicas_params=_require_mapping(replicas_value, ctx="`serve.replicas`"),
+                replicas_params=_require_mapping(replicas_value or {}, ctx="`serve.replicas`"),
                 server_kwargs=server_kwargs,
                 host=host,
                 port=port_int,

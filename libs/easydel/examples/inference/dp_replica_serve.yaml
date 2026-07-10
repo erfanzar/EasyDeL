@@ -2,9 +2,11 @@
 #
 #   python -m easydel.scripts.elarge --config dp_replica_serve.yaml
 #
-# eLarge carves this host's TPU chips into `replicas.count` independent
-# replica engines (each its own JAX world on a contiguous chip subset),
-# then starts a routed OpenAI API server in front of them. Validated on a
+# eLarge carves this host's TPU chips into one replica per mesh `dp` unit
+# (each its own JAX world on a contiguous chip subset), then starts a
+# routed OpenAI API server in front of them. The replica count comes from
+# `sharding.axis_dims` dp — here dp=2, so two replicas — and each replica's
+# own mesh collapses dp to 1 (tp fills its chip subset). Validated on a
 # v5p-8: two replicas x two chips, coherent chat + concurrent load spread
 # across both replicas.
 #
@@ -12,14 +14,22 @@
 # replicas own the accelerator), connects to each replica over the request
 # plane, and load-balances with prefix-affinity + join-shortest-queue.
 #
-# To serve replicas that live on OTHER hosts instead of splitting one host,
-# drop `count` and pass `endpoints: ["host1:19760", "host2:19760", ...]`
-# under `replicas` — launch one `serve_replica` per host, route here.
+# Overrides (all optional):
+#   - serve.replicas.count           pin the replica count explicitly
+#                                    (otherwise it follows the dp axis)
+#   - serve.replicas.base_control_port  request-plane port base (default 19700)
+#   - serve.replicas.endpoints       route to replicas on OTHER hosts instead
+#                                    of splitting this host, e.g.
+#                                    ["host1:19700", "host2:19700"]
 
 config:
   model:
     name_or_path: Qwen/Qwen3.5-4B
     dtype: bf16
+  sharding:
+    # dp = replica count; tp fills each replica's carved chip subset.
+    axis_dims: [2, 1, 1, -1, 1]
+    axis_names: ["dp", "fsdp", "ep", "tp", "sp"]
   esurge:
     runtime:
       max_model_len: 4096
@@ -35,6 +45,4 @@ actions:
   - serve:
       host: "0.0.0.0"
       port: 11556
-      replicas:
-        count: 2                 # split this host's chips into 2 replicas
-        base_control_port: 19760 # replica i binds request plane on 19760 + i
+      replicas: {}   # count follows sharding dp (=2); empty block is enough
