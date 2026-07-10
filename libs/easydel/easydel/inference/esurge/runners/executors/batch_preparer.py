@@ -82,6 +82,18 @@ from ...page_table import PAGE_TABLE_PADDING_VAL, SLOT_MAPPING_PADDING_VAL
 from ..async_types import DeviceInputTokenHandoff
 from ..execution_types import BatchMetadata
 
+#: Host-payload slots at or below this size are content-hashed and their
+#: device copies reused when unchanged (steady decode keeps most slots
+#: byte-identical). Larger slots always transfer: hashing them would cost
+#: more than the dispatch it saves.
+_PAYLOAD_PUT_CACHE_LIMIT_BYTES = 1 << 16
+
+#: The page-table slot keeps its own version-driven device cache upstream;
+#: when it arrives here as a host array that cache already decided a fresh
+#: transfer is required (bumped or unknown version), and the content cache
+#: must not alias it back to a stale device array.
+_PAYLOAD_PAGE_TABLE_INDEX = 3
+
 
 class BatchMetadataPreparer:
     """Prepare and transfer per-step metadata for model execution.
@@ -308,6 +320,13 @@ class BatchMetadataPreparer:
         # the input PyTree stable (non-None fields) without paying host→device cost
         # on steps where those buffers are effectively unused (e.g., all-false masks).
         self._zero_dev_cache: dict[tuple[str, tuple[int, ...], str], jax.Array] = {}
+        # Content-keyed device copies of small host-payload slots. In steady
+        # decode most metadata slots (sampling params, misc counters, slot
+        # indices) are byte-identical step over step; reusing the previous
+        # device array skips their per-step device_put dispatch. Metadata is
+        # never donated by the compiled step (only kv_pages is), so cached
+        # arrays stay valid across calls.
+        self._payload_put_cache: dict[int, tuple[bytes, tuple[int, ...], str, jax.Array]] = {}
 
     def _enforce_dp_local_page_tables(
         self,
@@ -419,20 +438,36 @@ class BatchMetadataPreparer:
         put_indices: list[int] = []
         put_values: list[object] = []
         put_shardings: list[jax.sharding.Sharding] = []
+        pending_cache_keys: dict[int, tuple[bytes, tuple[int, ...], str]] = {}
         for idx, value in enumerate(host_payload):
             if isinstance(value, jax.Array):
                 outputs[idx] = value
-            else:
-                put_indices.append(idx)
-                put_values.append(value)
-                put_shardings.append(
-                    self._input_sharding if self._uses_spmd_dp() and idx in (0, 1) else self._empty_sharding
-                )
+                continue
+            arr = np.asarray(value)
+            cache_entry = None
+            if idx != _PAYLOAD_PAGE_TABLE_INDEX and arr.nbytes <= _PAYLOAD_PUT_CACHE_LIMIT_BYTES:
+                shape = tuple(int(dim) for dim in arr.shape)
+                dtype = str(arr.dtype)
+                key = arr.tobytes()
+                cached = self._payload_put_cache.get(idx)
+                if cached is not None and cached[0] == key and cached[1] == shape and cached[2] == dtype:
+                    outputs[idx] = cached[3]
+                    continue
+                cache_entry = (key, shape, dtype)
+                pending_cache_keys[idx] = cache_entry
+            put_indices.append(idx)
+            put_values.append(value)
+            put_shardings.append(
+                self._input_sharding if self._uses_spmd_dp() and idx in (0, 1) else self._empty_sharding
+            )
 
         if put_values:
             put_results = jax.device_put(tuple(put_values), tuple(put_shardings))
             for idx, value in zip(put_indices, put_results, strict=True):
                 outputs[idx] = value
+                cache_entry = pending_cache_keys.get(idx)
+                if cache_entry is not None:
+                    self._payload_put_cache[idx] = (*cache_entry, value)
 
         return tuple(outputs)
 
