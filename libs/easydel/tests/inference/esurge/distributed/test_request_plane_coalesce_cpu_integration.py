@@ -298,8 +298,14 @@ def test_lockstep_ranks_coalesce_to_one_scheduled_request_each():
         assert rank0["slot3_finish"] == "length"
         assert rank0["slot3_tokens"] == 32
 
-        # The owner scheduled each logical slot exactly once; the twin
-        # admission attached instead of double-scheduling.
+        # The owner scheduled each logical slot once, with twin admissions
+        # attaching instead of double-scheduling. Slot 3 legitimately races:
+        # when rank 1's abort detaches before rank 0 attaches, the
+        # last-subscriber-gone rule retires the group and rank 0 re-creates
+        # it — 4 groups then, 3 otherwise. Slots 1 and 2 must always
+        # coalesce, so groups+attaches covers all six admissions either way.
         stats = rank0["stats"]
-        assert stats["scheduled_groups"] == 3, stats
-        assert stats["coalesced_attaches"] == 3, stats
+        assert stats["remote_admits"] == 3, stats
+        assert stats["replayed_attaches"] >= 1, stats
+        assert stats["scheduled_groups"] in (3, 4), stats
+        assert stats["scheduled_groups"] + stats["coalesced_attaches"] == 6, stats

@@ -166,7 +166,10 @@ class RoutedEngine:
             affinity_block_chars = page_size * 4 if page_size > 0 else _DEFAULT_BLOCK_CHARS
         self.affinity = PrefixAffinityMap(block_chars=affinity_block_chars)
         self._route_lock = threading.Lock()
-        self._rr = 0
+        # Router-local in-flight counts: the JSQ primary signal. Remote
+        # QueueStats ride 1s heartbeats, so a burst arriving between beats
+        # would otherwise dump entirely on the lowest-indexed member.
+        self._inflight = [0] * len(self.members)
 
     # ---------------------------------------------------------------- routing
     def _alive_indices(self) -> list[int]:
@@ -180,8 +183,27 @@ class RoutedEngine:
             raise RequestPlaneError("no live replica: every routed engine member is down")
         return alive
 
+    def _acquire(self, member_index: int) -> None:
+        with self._route_lock:
+            self._inflight[member_index] += 1
+
+    def _release(self, member_index: int) -> None:
+        with self._route_lock:
+            self._inflight[member_index] = max(0, self._inflight[member_index] - 1)
+
+    def _released_iterator(self, iterator: typing.Iterator, member_index: int) -> typing.Iterator:
+        """Wrap a streaming result so its in-flight slot frees when it ends."""
+        try:
+            yield from iterator
+        finally:
+            self._release(member_index)
+
     def select_member(self, prompt: str) -> int:
         """Pick the member for one prompt: prefix affinity, then JSQ.
+
+        The queue key is (router-local in-flight, owner-reported pending
+        prefill tokens, index): the local count is instantaneous, the
+        remote signal covers load from other clients.
 
         Args:
             prompt: The incoming prompt text.
@@ -193,7 +215,12 @@ class RoutedEngine:
         pinned, _depth = self.affinity.lookup(prompt)
         if pinned is not None and pinned in alive:
             return pinned
-        return min(alive, key=lambda index: (_member_pending_prefill_tokens(self.members[index]), index))
+        with self._route_lock:
+            inflight = list(self._inflight)
+        return min(
+            alive,
+            key=lambda index: (inflight[index], _member_pending_prefill_tokens(self.members[index]), index),
+        )
 
     # -------------------------------------------------------- adapter surface
     @property
@@ -263,6 +290,7 @@ class RoutedEngine:
             member_index = self.select_member(prompt)
             by_member.setdefault(member_index, []).append(position)
             self.affinity.record(prompt, member_index)
+            self._acquire(member_index)
 
         results: list[RequestOutput | None] = [None] * len(prompts)
         errors: list[Exception] = []
@@ -290,6 +318,9 @@ class RoutedEngine:
                     results[position] = output
             except Exception as exc:  # surfaced after the join below
                 errors.append(exc)
+            finally:
+                for _ in positions:
+                    self._release(member_index)
 
         for member_index, positions in by_member.items():
             if len(by_member) == 1:
@@ -315,12 +346,16 @@ class RoutedEngine:
         prompt = prompts[0] if isinstance(prompts, list) else prompts
         member_index = self.select_member(prompt)
         self.affinity.record(prompt, member_index)
+        self._acquire(member_index)
         member = self.members[member_index]
-        yield from member.stream(
-            prompt,
-            sampling_params=sampling_params,
-            request_id=request_id,
-            tool_parser_request=tool_parser_request,
+        yield from self._released_iterator(
+            member.stream(
+                prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                tool_parser_request=tool_parser_request,
+            ),
+            member_index,
         )
 
     def _chat_routing_key(self, messages: list[dict]) -> str:
@@ -332,24 +367,41 @@ class RoutedEngine:
         except Exception:
             return repr(messages)
 
-    def _route_for_key(self, routing_key: str) -> typing.Any:
+    def _route_for_key(self, routing_key: str) -> int:
         member_index = self.select_member(routing_key)
         self.affinity.record(routing_key, member_index)
-        return self.members[member_index]
+        self._acquire(member_index)
+        return member_index
 
     def chat(self, messages: list[dict], *args, **kwargs):
         """Route a chat call to one member (affinity by templated prompt)."""
-        return self._route_for_key(self._chat_routing_key(messages)).chat(messages, *args, **kwargs)
+        member_index = self._route_for_key(self._chat_routing_key(messages))
+        try:
+            result = self.members[member_index].chat(messages, *args, **kwargs)
+        except Exception:
+            self._release(member_index)
+            raise
+        if hasattr(result, "__next__"):
+            # Streaming chat: the slot frees when the iterator ends.
+            return self._released_iterator(result, member_index)
+        self._release(member_index)
+        return result
 
     def iter_chat_completion_stream(self, *, messages: list[dict], **kwargs):
         """Route an OpenAI chat-completion stream to one member."""
-        member = self._route_for_key(self._chat_routing_key(messages))
-        yield from member.iter_chat_completion_stream(messages=messages, **kwargs)
+        member_index = self._route_for_key(self._chat_routing_key(messages))
+        yield from self._released_iterator(
+            self.members[member_index].iter_chat_completion_stream(messages=messages, **kwargs),
+            member_index,
+        )
 
     def iter_responses_stream(self, *, messages: list[dict], **kwargs):
         """Route an OpenAI Responses-API stream to one member."""
-        member = self._route_for_key(self._chat_routing_key(messages))
-        yield from member.iter_responses_stream(messages=messages, **kwargs)
+        member_index = self._route_for_key(self._chat_routing_key(messages))
+        yield from self._released_iterator(
+            self.members[member_index].iter_responses_stream(messages=messages, **kwargs),
+            member_index,
+        )
 
     def abort_request(self, request_id: str) -> None:
         """Cancel a request wherever it landed (no-op on non-owners)."""

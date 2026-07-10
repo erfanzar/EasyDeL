@@ -224,11 +224,281 @@ def _require_str(value: Any, *, ctx: str) -> str:
     return value
 
 
+def _plan_replica_tpu_envs(count: int) -> list[dict[str, str]]:
+    """Carve this host's TPU chips into per-replica visibility environments.
+
+    Detects the chip count lock-free via ``/dev/accel*`` (the parent must
+    never initialize a TPU runtime — the replicas own the chips) and writes
+    the same visibility variables Ray's TPU accelerator manager uses for
+    1/2/4-chip subsets. Chips are assigned contiguously so 2-chip splits
+    land on aligned pairs ({0,1}, {2,3}).
+
+    Args:
+        count: Number of replica processes to carve the host into.
+
+    Returns:
+        One environment dict per replica; empty dicts when the host has no
+        TPU chips (CPU/GPU replicas manage their own visibility).
+
+    Raises:
+        SystemExit: If the chip count does not divide evenly or the
+            per-replica subset size has no known bounds layout.
+    """
+    import glob
+
+    num_chips = len(glob.glob("/dev/accel*")) or len(glob.glob("/dev/vfio/*")) - (
+        1 if glob.glob("/dev/vfio/vfio") else 0
+    )
+    if num_chips <= 0:
+        return [{} for _ in range(count)]
+    if num_chips % count != 0:
+        raise SystemExit(f"`serve.replicas.count={count}` must divide the host's {num_chips} TPU chips evenly.")
+    chips_per_replica = num_chips // count
+    bounds = {1: "1,1,1", 2: "1,2,1", 4: "2,2,1"}.get(chips_per_replica)
+    if bounds is None:
+        raise SystemExit(
+            f"Unsupported chips-per-replica={chips_per_replica}; single-host splits support 1, 2, or 4 chips."
+        )
+    envs = []
+    for index in range(count):
+        chip_ids = range(index * chips_per_replica, (index + 1) * chips_per_replica)
+        envs.append(
+            {
+                "TPU_VISIBLE_CHIPS": ",".join(str(chip) for chip in chip_ids),
+                "TPU_CHIPS_PER_HOST_BOUNDS": bounds,
+                "TPU_HOST_BOUNDS": "1,1,1",
+            }
+        )
+    return envs
+
+
+def _serve_replicated(
+    *,
+    elm: Any,
+    replicas_params: dict[str, Any],
+    server_kwargs: dict[str, Any],
+    host: str,
+    port: int,
+    log_level: str,
+    ssl_keyfile: str | None,
+    ssl_certfile: str | None,
+) -> None:
+    """Serve N independent engine replicas behind one routed API server.
+
+    Two substrates:
+
+    * **Spawn** (default): launch ``count`` subprocesses of this same
+      runner, each executing a generated ``serve_replica`` overlay of the
+      current config — its own JAX world on a carved chip subset, exposing
+      the request plane on ``base_control_port + i``. This is single-host
+      chip-split data parallelism in one command.
+    * **Attach** (``endpoints:`` set): connect to externally-launched
+      replicas (e.g. one ``serve_replica`` run per pod host via eray) and
+      only run the router here.
+
+    The parent stays off the accelerator entirely (its JAX is pinned to
+    CPU); it renders through :class:`RemoteEngineHandle` clients and fronts
+    them with a prefix-affinity + JSQ :class:`RoutedEngine`.
+
+    Args:
+        elm: The parsed ``eLargeModel`` (config source; never built here).
+        replicas_params: The ``serve.replicas`` mapping.
+        server_kwargs: Validated ``eSurgeApiServer`` kwargs.
+        host: API-server bind host.
+        port: API-server port.
+        log_level: Uvicorn log level.
+        ssl_keyfile: Optional TLS key path.
+        ssl_certfile: Optional TLS cert path.
+
+    Raises:
+        SystemExit: On invalid parameters, a replica exiting during
+            startup, or the ready deadline lapsing.
+    """
+    import hashlib
+    import os
+    import subprocess
+    import sys
+    import tempfile
+    import time
+
+    if os.environ.get("_ELARGE_DP_ROUTER") != "1":
+        # This process already imported easydel/jax, which initializes the
+        # local accelerator at import time — and the replicas need those
+        # chips. Re-exec ourselves CPU-pinned: the exec replaces the
+        # process image, releasing the TPU before replicas spawn. libtpu
+        # opens its device fds (/dev/vfio/*, /dev/accel*) without
+        # close-on-exec, so mark every inherited fd CLOEXEC first or the
+        # re-exec'd router would keep the chips locked forever.
+        import fcntl
+
+        for fd_name in os.listdir("/proc/self/fd"):
+            try:
+                fd = int(fd_name)
+                if fd > 2:
+                    flags = fcntl.fcntl(fd, fcntl.F_GETFD)
+                    fcntl.fcntl(fd, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
+            except (OSError, ValueError):
+                continue
+        environ = dict(os.environ)
+        environ["_ELARGE_DP_ROUTER"] = "1"
+        environ["JAX_PLATFORMS"] = "cpu"
+        environ["ENABLE_DISTRIBUTED_INIT"] = "0"
+        logger.info("Re-executing the DP-serve router CPU-pinned; replicas own the accelerator.")
+        os.execve(sys.executable, [sys.executable, "-m", "easydel.scripts.elarge", *sys.argv[1:]], environ)
+
+    try:
+        import yaml
+    except ImportError as exc:
+        raise SystemExit("PyYAML is required for `serve.replicas`.") from exc
+
+    endpoints = replicas_params.get("endpoints")
+    count = int(replicas_params.get("count", len(endpoints) if endpoints else 0))
+    if count < 2:
+        raise SystemExit("`serve.replicas.count` must be >= 2 (or provide `endpoints`).")
+    base_control_port = int(replicas_params.get("base_control_port", 19700))
+    ready_timeout_s = float(replicas_params.get("ready_timeout_s", 1800.0))
+    auth_token = replicas_params.get("auth_token") or hashlib.sha256(
+        json.dumps(elm.to_dict(), sort_keys=True, default=str).encode()
+    ).hexdigest()
+
+    # The replicas own the accelerator; any incidental JAX use in this
+    # router process must never grab the TPU (libtpu locks per chip).
+    os.environ.setdefault("JAX_PLATFORMS", "cpu")
+
+    procs: list[subprocess.Popen] = []
+    log_paths: list[str] = []
+    open_logs: list[Any] = []
+    if endpoints:
+        targets = []
+        for entry in endpoints:
+            entry = str(entry)
+            addr, _, entry_port = entry.rpartition(":")
+            if not addr or not entry_port.isdigit():
+                raise SystemExit(f"`serve.replicas.endpoints` entries must be 'host:port', got {entry!r}.")
+            targets.append((addr, int(entry_port)))
+    else:
+        workdir = str(replicas_params.get("workdir") or tempfile.mkdtemp(prefix="elarge-dp-serve-"))
+        os.makedirs(workdir, exist_ok=True)
+        chip_envs = _plan_replica_tpu_envs(count)
+        platform_override = replicas_params.get("platform")
+        config_dict = elm.to_dict()
+        targets = []
+        for index in range(count):
+            control_port = base_control_port + index
+            overlay = {
+                "config": config_dict,
+                "actions": [
+                    {
+                        "serve_replica": {
+                            "control_port": control_port,
+                            "auth_token": auth_token,
+                            "bind_host": "127.0.0.1",
+                        }
+                    }
+                ],
+            }
+            overlay_path = os.path.join(workdir, f"replica_{index}.yaml")
+            with open(overlay_path, "w", encoding="utf-8") as handle:
+                yaml.safe_dump(overlay, handle, sort_keys=False)
+
+            env = dict(os.environ)
+            env.update(chip_envs[index])
+            env["ENABLE_DISTRIBUTED_INIT"] = "0"
+            # Replicas auto-detect their accelerator; drop the router's
+            # CPU pin and re-exec marker unless the YAML forces a platform.
+            env.pop("JAX_PLATFORMS", None)
+            env.pop("_ELARGE_DP_ROUTER", None)
+            if platform_override:
+                env["JAX_PLATFORMS"] = str(platform_override)
+
+            log_path = os.path.join(workdir, f"replica_{index}.log")
+            log_file = open(log_path, "w")
+            log_paths.append(log_path)
+            open_logs.append(log_file)
+            procs.append(
+                subprocess.Popen(
+                    [sys.executable, "-m", "easydel.scripts.elarge", "--config", overlay_path],
+                    env=env,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                )
+            )
+            targets.append(("127.0.0.1", control_port))
+        logger.info("Spawned %d replica processes (logs under %s); waiting for their request planes.", count, workdir)
+
+    from easydel.inference import eSurgeApiServer
+    from easydel.inference.esurge.distributed.remote_engine import RemoteEngineHandle
+    from easydel.inference.esurge.distributed.request_plane import RequestPlaneUnavailable
+    from easydel.inference.esurge.distributed.routed_engine import RoutedEngine
+
+    handles: list[RemoteEngineHandle] = []
+    try:
+        deadline = time.time() + ready_timeout_s
+        for index, (addr, control_port) in enumerate(targets):
+            while True:
+                if procs and procs[index].poll() is not None:
+                    tail = ""
+                    if log_paths:
+                        with open(log_paths[index], encoding="utf-8", errors="replace") as handle:
+                            tail = handle.read()[-2000:]
+                    raise SystemExit(f"Replica {index} exited during startup (code {procs[index].returncode}).\n{tail}")
+                try:
+                    handles.append(
+                        RemoteEngineHandle(
+                            addr,
+                            control_port,
+                            auth_token=auth_token,
+                            tokenizer_source=replicas_params.get("tokenizer_source"),
+                            connect_timeout_s=10.0,
+                        )
+                    )
+                    logger.info("Replica %d ready at %s:%d.", index, addr, control_port)
+                    break
+                except RequestPlaneUnavailable:
+                    # Still compiling before it binds the control socket.
+                    if time.time() > deadline:
+                        raise SystemExit(
+                            f"Replica {index} at {addr}:{control_port} not ready within {ready_timeout_s}s."
+                        ) from None
+                    time.sleep(5.0)
+                except Exception as exc:
+                    raise SystemExit(f"Replica {index} at {addr}:{control_port} attach failed: {exc}") from exc
+
+        router = RoutedEngine(handles)
+        server = eSurgeApiServer(router, **server_kwargs)
+        logger.info("Routing across %d replicas; serving on %s:%d.", len(handles), host, port)
+        server.run(
+            host=host,
+            port=port,
+            workers=1,
+            log_level=log_level,
+            ssl_keyfile=ssl_keyfile,
+            ssl_certfile=ssl_certfile,
+            reload=False,
+        )
+    finally:
+        for handle in handles:
+            try:
+                handle.close()
+            except Exception:
+                pass
+        for proc in procs:
+            proc.terminate()
+        for proc in procs:
+            try:
+                proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        for log_file in open_logs:
+            log_file.close()
+
+
 def _run_action(elm: Any, name: str, value: Any | None) -> None:
     """Execute a single named action on an eLargeModel instance.
 
     Supported actions: ``validate``, ``print``/``show``, ``dump_config``,
-    ``to_json``, ``to_yaml``, ``train``, ``eval``, ``serve``.
+    ``to_json``, ``to_yaml``, ``train``, ``eval``, ``serve``,
+    ``serve_replica``.
 
     Args:
         elm: An ``eLargeModel`` instance.
@@ -297,6 +567,36 @@ def _run_action(elm: Any, name: str, value: Any | None) -> None:
         )
         if params.get("print_results", False):
             logger.info(json.dumps(results, indent=2))
+        return
+
+    if action == "serve_replica":
+        # One DP replica: its own JAX world exposing the request plane on a
+        # workerless ZMQ leader; a routed API server (or any request-plane
+        # client) fronts it. Blocks until the parent terminates the process.
+        params = _require_mapping(value, ctx="`serve_replica` action")
+        try:
+            control_port = int(params["control_port"])
+        except (KeyError, TypeError, ValueError) as e:
+            raise SystemExit("`serve_replica.control_port` (int) is required.") from e
+        auth_token = _require_str(params.get("auth_token"), ctx="`serve_replica.auth_token`")
+        bind_host = str(params.get("bind_host", "0.0.0.0"))
+        elm.set_esurge(
+            coordination="zmq",
+            distributed_auth_token=auth_token,
+            distributed_control_port=control_port,
+            distributed_control_bind_host=bind_host,
+        )
+        elm.validate()
+        surge = elm.build_esurge()
+        logger.info(
+            "Replica engine %r ready: request plane on %s:%d.",
+            surge.esurge_name,
+            bind_host,
+            control_port,
+        )
+        import threading
+
+        threading.Event().wait()
         return
 
     if action in {"serve", "server"}:
@@ -387,6 +687,23 @@ def _run_action(elm: Any, name: str, value: Any | None) -> None:
             if isinstance(cors_origins, list) and any(not isinstance(v, str) for v in cors_origins):
                 raise SystemExit("`serve.cors_origins` must be a list of strings (or null).")
             server_kwargs["cors_origins"] = cors_origins
+
+        replicas_value = params.get("replicas")
+        if replicas_value:
+            # Data-parallel serving: N independent replica engines behind
+            # one routed server. The parent never builds a model or touches
+            # the accelerator, so skip validate() (each replica validates).
+            _serve_replicated(
+                elm=elm,
+                replicas_params=_require_mapping(replicas_value, ctx="`serve.replicas`"),
+                server_kwargs=server_kwargs,
+                host=host,
+                port=port_int,
+                log_level=log_level,
+                ssl_keyfile=ssl_keyfile,
+                ssl_certfile=ssl_certfile,
+            )
+            return
 
         elm.validate()
 

@@ -856,7 +856,10 @@ class eSurge:
                 max_num_seqs=int(self.runtime_config.max_num_seqs),
                 reserve_tokens=int(self.reserve_tokens),
                 eos_token_ids=[int(tid) for tid in self._eos_ids],
-                tokenizer_source=str(self._possible_name or ""),
+                # Must be a loadable tokenizer id/path — remote clients
+                # bootstrap their own tokenizer from it. The display name
+                # (_possible_name) is only a fallback.
+                tokenizer_source=str(getattr(assets, "tokenizer_source", None) or self._possible_name or ""),
                 page_size=int(self.cache_config.page_size),
             ),
         )
