@@ -56,7 +56,7 @@ from ..engine.output_pipeline import OutputPipeline
 from ..engine.registry import RequestRegistry
 from ..logger import logger
 from . import wire
-from .request_plane import OriginRequestPlane, RequestPlaneError
+from .request_plane import OriginRequestPlane, RequestPlaneError, RequestPlaneUnavailable
 
 if typing.TYPE_CHECKING:
     from ..esurge_engine import RequestOutput
@@ -173,7 +173,7 @@ class _ClientChannel:
         )
         if not sock.poll(int(self._connect_timeout_s * 1000)):
             sock.close(linger=0)
-            raise RequestPlaneError(
+            raise RequestPlaneUnavailable(
                 f"no HelloOk from engine owner at {self._endpoint} within {self._connect_timeout_s}s"
             )
         message = wire.decode_message(sock.recv_multipart()[0])
@@ -333,16 +333,33 @@ class RemoteEngineHandle:
             )
         self._spec = spec
 
-        self._registry = RequestRegistry()
-        self._worker_manager = WorkerManager(tokenizer_source or spec.tokenizer_source)
-        self._tokenizer_client, self._detokenizer_client = self._worker_manager.start(
-            detokenizer_max_states=max(64, int(spec.max_num_seqs) * 4),
-            tokenizer_endpoint=None,
-            detokenizer_endpoint=None,
-        )
-        from transformers import AutoTokenizer
+        # Bootstrap failures after a successful handshake (bad tokenizer id,
+        # worker spawn trouble) are permanent — close the transport and
+        # re-raise as a plane error so callers don't retry them as
+        # not-ready-yet.
+        try:
+            self._registry = RequestRegistry()
+            self._worker_manager = WorkerManager(tokenizer_source or spec.tokenizer_source)
+            self._tokenizer_client, self._detokenizer_client = self._worker_manager.start(
+                detokenizer_max_states=max(64, int(spec.max_num_seqs) * 4),
+                tokenizer_endpoint=None,
+                detokenizer_endpoint=None,
+            )
+            from transformers import AutoTokenizer
 
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_source or spec.tokenizer_source)
+            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_source or spec.tokenizer_source)
+        except Exception as exc:
+            self._channel.close()
+            manager = getattr(self, "_worker_manager", None)
+            if manager is not None:
+                try:
+                    manager.shutdown()
+                except Exception:
+                    pass
+            raise RequestPlaneError(
+                f"remote handle bootstrap failed (tokenizer source "
+                f"{(tokenizer_source or spec.tokenizer_source)!r}): {exc}"
+            ) from exc
 
         self._plane = OriginRequestPlane(
             coordinator=self._channel,

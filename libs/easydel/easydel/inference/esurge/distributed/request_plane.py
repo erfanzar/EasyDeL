@@ -102,6 +102,15 @@ class RequestPlaneError(RuntimeError):
     """
 
 
+class RequestPlaneUnavailable(RequestPlaneError):
+    """The owner's control endpoint is not reachable (yet).
+
+    The retryable subset of plane failures: the engine may simply still be
+    compiling before it binds its control socket. Launchers poll on this;
+    every other :class:`RequestPlaneError` is permanent.
+    """
+
+
 def _is_coalescable_id(request_id: str) -> bool:
     """Whether ``request_id`` is an auto-generated (coalescable) parent id."""
     return _AUTO_ID_PATTERN.match(request_id) is not None
