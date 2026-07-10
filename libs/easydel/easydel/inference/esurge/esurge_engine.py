@@ -857,15 +857,20 @@ class eSurge:
                 reserve_tokens=int(self.reserve_tokens),
                 eos_token_ids=[int(tid) for tid in self._eos_ids],
                 tokenizer_source=str(self._possible_name or ""),
+                page_size=int(self.cache_config.page_size),
             ),
         )
+        if hasattr(self._step_coordinator, "set_stats_provider"):
+            # Queue-load snapshots piggyback on client heartbeats so DP
+            # routers can join-shortest-queue without polling.
+            self._step_coordinator.set_stats_provider(self._queue_stats_snapshot)
         # Unified request plane: ingress on any rank. The owner (leader)
         # schedules; origin ranks forward admissions upstream and render the
         # returned token deltas through their own output pipeline.
         self._request_plane = create_request_plane(
             self._step_coordinator,
             submit_outputs=self._output_pipeline.submit,
-            scheduler_submit=self._submit_scheduler_requests,
+            scheduler_submit=self._schedule_requests_direct,
             abort_request=self.abort_request,
             apply_stop_strings=self._enqueue_parser_stop_requests,
             next_arrival_stamp=self._admission.next_arrival_stamp,
@@ -907,6 +912,30 @@ class eSurge:
             loop.running = bool(value)
         else:
             self._scheduler_running_fallback = bool(value)
+
+    def _queue_stats_snapshot(self):
+        """Best-effort scheduler-load snapshot for request-plane clients.
+
+        Runs on the coordinator IO thread WITHOUT the scheduler lock —
+        routing tolerates slightly stale or torn reads, and taking the lock
+        here could stall the step stream behind a heartbeat.
+        """
+        from .distributed.wire import QueueStats
+
+        try:
+            scheduler = self.scheduler
+            pending = 0
+            for request in list(scheduler.running):
+                pending += max(0, int(request.num_prompt_tokens) - int(request.num_computed_tokens))
+            for request in list(scheduler.waiting):
+                pending += int(request.num_prompt_tokens)
+            return QueueStats(
+                num_waiting=len(scheduler.waiting),
+                num_running=len(scheduler.running),
+                pending_prefill_tokens=int(pending),
+            )
+        except Exception:
+            return QueueStats()
 
     @property
     def _generation_alive(self) -> bool:
@@ -1279,6 +1308,20 @@ class eSurge:
     def decode_interval_secs(self, value: float) -> None:
         self._output_pipeline.decode_interval_secs = float(value)
 
+    def _schedule_requests_direct(self, scheduler_requests: list[EngineRequest]) -> None:
+        """Enqueue requests on the local scheduler under the scheduler lock.
+
+        The raw scheduling primitive: no plane routing, no coalescing. The
+        request plane's owner half injects this as its ``scheduler_submit``
+        so plane-managed admissions cannot re-enter the plane.
+
+        Args:
+            scheduler_requests: Fully-formed :class:`EngineRequest` objects.
+        """
+        with self._scheduler_lock:
+            for scheduler_request in scheduler_requests:
+                self.scheduler.add_request(scheduler_request)
+
     def _submit_scheduler_requests(self, scheduler_requests: list[EngineRequest]) -> None:
         """Route admission-built requests to whichever scheduler owns this rank.
 
@@ -1286,20 +1329,22 @@ class eSurge:
         batch to the owner over the plane, blocking on its acknowledgement
         with no engine locks held; local registry state was already
         registered by admission, so the origin renders the returned deltas
-        itself. Owner and single-host ranks enqueue on the local scheduler
-        under the scheduler lock.
+        itself. The owner routes its own admissions through the plane's
+        coalescing table (identical lockstep admissions from other ranks
+        attach to one scheduled request). Single-host ranks enqueue on the
+        local scheduler directly.
 
         Args:
             scheduler_requests: Requests produced by
                 :meth:`RequestAdmission.add_request`.
         """
         plane = getattr(self, "_request_plane", None)
-        if plane is not None and not plane.owns_scheduling:
+        if plane is None:
+            self._schedule_requests_direct(scheduler_requests)
+        elif plane.owns_scheduling:
+            plane.admit_local(scheduler_requests)
+        else:
             plane.submit_remote(scheduler_requests)
-            return
-        with self._scheduler_lock:
-            for scheduler_request in scheduler_requests:
-                self.scheduler.add_request(scheduler_request)
 
     def _add_request(
         self,
@@ -1555,12 +1600,18 @@ class eSurge:
         counts for postmortem.
         """
         plane = getattr(self, "_request_plane", None)
-        if plane is not None and not plane.owns_scheduling:
-            # Origin rank: the scheduled rows live on the owner; tell it to
-            # free them, then run the local registry/output cleanup below
-            # (the scheduler-side steps no-op — the ids are not scheduled
-            # here) so waiters observe the abort immediately.
-            plane.notify_abort(request_id)
+        if plane is not None:
+            if plane.owns_scheduling:
+                # Detach this caller from any coalesced group it subscribes
+                # to; when the group was scheduled under a neutral id and
+                # this was its last subscriber, the plane aborts those rows.
+                plane.notify_local_abort(request_id)
+            else:
+                # Origin rank: the scheduled rows live on the owner; tell it
+                # to free them, then run the local registry/output cleanup
+                # below (the scheduler-side steps no-op — the ids are not
+                # scheduled here) so waiters observe the abort immediately.
+                plane.notify_abort(request_id)
         detokenizer_reset_ids: set[str] = set()
         parent_request_id = request_id
         sample_index = 0
@@ -1891,13 +1942,19 @@ class eSurge:
         if not stop_string_finishes:
             return
         plane = getattr(self, "_request_plane", None)
-        if plane is not None and not plane.owns_scheduling:
-            # Origin rank: the request is scheduled on the owner; forward the
-            # stop hit so the owner frees the rows. Any locally-owned rest
-            # (none today on origin ranks) falls through to the local path.
-            stop_string_finishes = plane.forward_stop_hits(stop_string_finishes)
-            if not stop_string_finishes:
-                return
+        if plane is not None:
+            if plane.owns_scheduling:
+                # Coalesced groups scheduled under neutral ids (remote-first
+                # attach) need their local sample ids mapped back onto the
+                # scheduler's ids; everything else passes through unchanged.
+                stop_string_finishes = plane.translate_local_stop_hits(stop_string_finishes)
+            else:
+                # Origin rank: the request is scheduled on the owner; forward
+                # the stop hit so the owner frees the rows. Any locally-owned
+                # rest (none today on origin ranks) falls through below.
+                stop_string_finishes = plane.forward_stop_hits(stop_string_finishes)
+                if not stop_string_finishes:
+                    return
         stop_queue = getattr(self, "_parser_stop_queue", None)
         if stop_queue is None:
             with self._scheduler_lock:
@@ -2178,7 +2235,7 @@ class eSurge:
                 ``update_from_output``.
         """
         plane = getattr(self, "_request_plane", None)
-        if plane is not None and plane.owns_scheduling and plane.has_remote:
+        if plane is not None and plane.owns_scheduling and plane.needs_tee:
             plane.tee_outputs(engine_outputs)
         self._output_pipeline.submit(engine_outputs)
 
