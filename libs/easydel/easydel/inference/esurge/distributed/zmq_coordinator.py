@@ -280,6 +280,12 @@ class ZmqLeaderCoordinator:
         logger.info("eSurge coordinator: %d worker(s) ready.", self.world_size - 1)
 
     # ---------------------------------------------------------- request plane
+    def set_plane_handler(
+        self, handler: typing.Callable[[bytes, wire.WireMessage, bytes | None], None] | None
+    ) -> None:
+        """Install the request-plane inbound handler (Admit/AbortReq/StopHit/...)."""
+        self._plane_handler = handler
+
     def send_to_peer(self, identity: bytes, header: wire.WireMessage, payload: bytes | None = None) -> None:
         """Queue a message for one specific peer (worker or client) identity."""
         self._outbox.put((identity, wire.encode_message(header), payload))

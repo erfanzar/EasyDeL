@@ -40,14 +40,24 @@ from .coordinator import (
 )
 from .discovery import DiscoveryResult, resolve_service_hosts
 from .protocol import compute_sampled_digest, make_config_fingerprint
+from .request_plane import (
+    OriginRequestPlane,
+    OwnerRequestPlane,
+    RequestPlaneError,
+    create_request_plane,
+)
 
 __all__ = (
     "DiscoveryResult",
     "LocalCoordinator",
+    "OriginRequestPlane",
+    "OwnerRequestPlane",
+    "RequestPlaneError",
     "StepCoordinationError",
     "StepCoordinator",
     "StepHandle",
     "compute_sampled_digest",
+    "create_request_plane",
     "create_step_coordinator",
     "make_config_fingerprint",
     "resolve_service_hosts",

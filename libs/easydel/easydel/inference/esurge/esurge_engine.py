@@ -115,6 +115,8 @@ from .config import (
 )
 from .distributed import make_config_fingerprint
 from .distributed.coordinator import create_step_coordinator
+from .distributed.request_plane import create_request_plane
+from .distributed.wire import EngineSpec
 from .engine import build_engine_assets
 from .engine.admission import RequestAdmission, clone_sampling_params
 from .engine.chat_templating import format_chat_prompt, normalize_stop_sequences
@@ -848,6 +850,28 @@ class eSurge:
             self.runner,
             distributed_config=self.distributed_config,
             config_fingerprint=self._distributed_config_fingerprint,
+            engine_spec=EngineSpec(
+                esurge_name=str(self.esurge_name or ""),
+                max_model_len=int(self.runner.max_model_len),
+                max_num_seqs=int(self.runtime_config.max_num_seqs),
+                reserve_tokens=int(self.reserve_tokens),
+                eos_token_ids=[int(tid) for tid in self._eos_ids],
+                tokenizer_source=str(self._possible_name or ""),
+            ),
+        )
+        # Unified request plane: ingress on any rank. The owner (leader)
+        # schedules; origin ranks forward admissions upstream and render the
+        # returned token deltas through their own output pipeline.
+        self._request_plane = create_request_plane(
+            self._step_coordinator,
+            submit_outputs=self._output_pipeline.submit,
+            scheduler_submit=self._submit_scheduler_requests,
+            abort_request=self.abort_request,
+            apply_stop_strings=self._enqueue_parser_stop_requests,
+            next_arrival_stamp=self._admission.next_arrival_stamp,
+            alive=lambda: self._generation_alive,
+            admit_timeout_s=float(self.distributed_config.distributed_admit_timeout_s),
+            info=self._info,
         )
         self.distributed_role = "leader" if self._step_coordinator.is_leader else "worker"
         self.distributed_rank = int(self._step_coordinator.rank)
@@ -883,6 +907,21 @@ class eSurge:
             loop.running = bool(value)
         else:
             self._scheduler_running_fallback = bool(value)
+
+    @property
+    def _generation_alive(self) -> bool:
+        """Whether requests can make progress on this rank.
+
+        True when the local scheduler loop runs (owner / single host), or
+        when this is a worker rank whose replay thread is serving the
+        owner's step stream — requests admitted here are forwarded through
+        the request plane and rendered locally, so generate/stream waiters
+        are live even though no local scheduler thread exists.
+        """
+        if self._scheduler_running:
+            return True
+        thread = getattr(self, "_worker_replay_thread", None)
+        return thread is not None and thread.is_alive()
 
     @property
     def _scheduler_thread(self) -> threading.Thread | None:
@@ -1241,12 +1280,23 @@ class eSurge:
         self._output_pipeline.decode_interval_secs = float(value)
 
     def _submit_scheduler_requests(self, scheduler_requests: list[EngineRequest]) -> None:
-        """Enqueue admission-built requests on the scheduler under the scheduler lock.
+        """Route admission-built requests to whichever scheduler owns this rank.
+
+        Ranks that do not own scheduling (request-plane origins) forward the
+        batch to the owner over the plane, blocking on its acknowledgement
+        with no engine locks held; local registry state was already
+        registered by admission, so the origin renders the returned deltas
+        itself. Owner and single-host ranks enqueue on the local scheduler
+        under the scheduler lock.
 
         Args:
             scheduler_requests: Requests produced by
                 :meth:`RequestAdmission.add_request`.
         """
+        plane = getattr(self, "_request_plane", None)
+        if plane is not None and not plane.owns_scheduling:
+            plane.submit_remote(scheduler_requests)
+            return
         with self._scheduler_lock:
             for scheduler_request in scheduler_requests:
                 self.scheduler.add_request(scheduler_request)
@@ -1504,6 +1554,13 @@ class eSurge:
         abort. A best-effort log line records the before/after queue
         counts for postmortem.
         """
+        plane = getattr(self, "_request_plane", None)
+        if plane is not None and not plane.owns_scheduling:
+            # Origin rank: the scheduled rows live on the owner; tell it to
+            # free them, then run the local registry/output cleanup below
+            # (the scheduler-side steps no-op — the ids are not scheduled
+            # here) so waiters observe the abort immediately.
+            plane.notify_abort(request_id)
         detokenizer_reset_ids: set[str] = set()
         parent_request_id = request_id
         sample_index = 0
@@ -1540,11 +1597,22 @@ class eSurge:
                 self.scheduler.finish_requests(abort_ids, EngineRequestStatus.FINISHED_ABORTED)
                 detokenizer_reset_ids |= abort_ids
 
+            # Registry-side ids to clean up. On request-plane origin ranks the
+            # children were scheduled on the owner, so the scheduler yields no
+            # ids here — the local registry is the authority for cleanup.
+            cleanup_ids = set(abort_ids)
+            cleanup_ids.update(
+                rid
+                for rid, record in self._active_requests.items()
+                if getattr(record, "parent_request_id", None) == request_id
+            )
+            detokenizer_reset_ids |= cleanup_ids
+
             # Clean up active request tracking (output retention honors max_request_outputs).
-            for rid in abort_ids:
+            for rid in cleanup_ids:
                 self._active_requests.pop(rid, None)
             self._active_requests.pop(parent_request_id, None)
-            for rid in abort_ids:
+            for rid in cleanup_ids:
                 if rid != parent_request_id:
                     self._request_events.pop(rid, None)
 
@@ -1822,6 +1890,14 @@ class eSurge:
         """
         if not stop_string_finishes:
             return
+        plane = getattr(self, "_request_plane", None)
+        if plane is not None and not plane.owns_scheduling:
+            # Origin rank: the request is scheduled on the owner; forward the
+            # stop hit so the owner frees the rows. Any locally-owned rest
+            # (none today on origin ranks) falls through to the local path.
+            stop_string_finishes = plane.forward_stop_hits(stop_string_finishes)
+            if not stop_string_finishes:
+                return
         stop_queue = getattr(self, "_parser_stop_queue", None)
         if stop_queue is None:
             with self._scheduler_lock:
@@ -2064,6 +2140,11 @@ class eSurge:
         thread = getattr(self, "_worker_replay_thread", None)
         if stop_event is None or thread is None:
             return
+        plane = getattr(self, "_request_plane", None)
+        if plane is not None and not plane.owns_scheduling:
+            # The replay thread is the origin's receive path; admissions
+            # blocked on owner acks can never complete once it stops.
+            plane.fail_pending("worker replay loop stopped")
         stop_event.set()
         if thread.is_alive():
             thread.join(timeout=5.0)
@@ -2088,10 +2169,17 @@ class eSurge:
     def _enqueue_engine_outputs(self, engine_outputs) -> None:
         """Queue engine outputs for asynchronous parsing, or process inline.
 
+        When this rank owns scheduling for remote origins, the bundle is
+        also teed to the request plane (one bool read plus one queue put on
+        the hot path) so origins receive their raw token deltas.
+
         Args:
             engine_outputs: Scheduler-produced output bundle from
                 ``update_from_output``.
         """
+        plane = getattr(self, "_request_plane", None)
+        if plane is not None and plane.owns_scheduling and plane.has_remote:
+            plane.tee_outputs(engine_outputs)
         self._output_pipeline.submit(engine_outputs)
 
     def _stop_engine_output_worker(self) -> None:
@@ -2165,6 +2253,10 @@ class eSurge:
                 # Leader (or single host, where this is a no-op): block until
                 # every worker rank has connected and finished initializing.
                 step_coordinator.start()
+
+            request_plane = getattr(self, "_request_plane", None)
+            if request_plane is not None and request_plane.owns_scheduling:
+                request_plane.ensure_started()
 
             self._start_engine_output_worker()
 
@@ -2263,6 +2355,15 @@ class eSurge:
                 step_coordinator.shutdown("engine terminate")
             except Exception:
                 logger.debug("Step coordinator shutdown encountered an error", exc_info=True)
+        request_plane = getattr(self, "_request_plane", None)
+        if request_plane is not None:
+            try:
+                if request_plane.owns_scheduling:
+                    request_plane.shutdown()
+                else:
+                    request_plane.fail_pending("engine terminated")
+            except Exception:
+                logger.debug("Request plane shutdown encountered an error", exc_info=True)
         # Clear runner buffers if idle to avoid stale state on next start.
         self._reset_runner_state_if_idle("terminate")
 
@@ -2437,6 +2538,10 @@ class eSurge:
             self._finished_request_ids.clear()
             self._request_events.clear()
 
+        request_plane = getattr(self, "_request_plane", None)
+        if request_plane is not None and request_plane.owns_scheduling:
+            request_plane.reset()
+
         self.scheduler = Scheduler.from_runner(
             self.runner,
             max_num_batched_tokens=self._scheduler_max_num_batched_tokens,
@@ -2576,7 +2681,7 @@ class eSurge:
                 ``"stream-start"``, …) embedded into the error message
                 so log scrapers can identify the originating call.
         """
-        if self._scheduler_running:
+        if self._generation_alive:
             return
         self._raise_if_scheduler_failed()
         raise RuntimeError(f"Background scheduler is not running ({context}).")
@@ -2815,9 +2920,7 @@ class eSurge:
                 deferred_scheduler_requests.extend(maybe_scheduler_requests)
 
         if deferred_scheduler_requests:
-            with self._scheduler_lock:
-                for scheduler_request in deferred_scheduler_requests:
-                    self.scheduler.add_request(scheduler_request)
+            self._submit_scheduler_requests(deferred_scheduler_requests)
             logger.info(
                 "Queued generate batch: parent_requests=%d scheduler_requests=%d",
                 len(prompts),
@@ -2839,7 +2942,7 @@ class eSurge:
             self._output_event.wait(timeout=0.1)
             self._output_event.clear()
             self._raise_if_scheduler_failed()
-            if not self._scheduler_running:
+            if not self._generation_alive:
                 pending_ids = [rid for rid in request_ids if rid not in completed]
                 for rid in pending_ids:
                     self.abort_request(rid)
@@ -2964,7 +3067,7 @@ class eSurge:
                 req_event.wait(timeout=1.0)
                 req_event.clear()
                 self._raise_if_scheduler_failed()
-                if not self._scheduler_running:
+                if not self._generation_alive:
                     self.abort_request(request_id)
                     raise RuntimeError("Background scheduler stopped while streaming request.")
                 if self._recover_orphaned_request(request_id):
@@ -3536,7 +3639,7 @@ class eSurge:
                 req_event.wait(timeout=1.0)
                 req_event.clear()
                 self._raise_if_scheduler_failed()
-                if not self._scheduler_running:
+                if not self._generation_alive:
                     self.abort_request(request_id)
                     raise RuntimeError("Background scheduler stopped while streaming multimodal request.")
                 if self._recover_orphaned_request(request_id):
@@ -3677,7 +3780,7 @@ class eSurge:
             req_event.wait(timeout=1.0)
             req_event.clear()
             self._raise_if_scheduler_failed()
-            if not self._scheduler_running:
+            if not self._generation_alive:
                 self.abort_request(request_id)
                 raise RuntimeError("Background scheduler stopped while waiting for request completion.")
             if self._recover_orphaned_request(request_id):

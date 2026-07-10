@@ -195,7 +195,113 @@ class Control(msgspec.Struct, tag=True):
     args: dict[str, typing.Any] = {}
 
 
-WireMessage = Hello | HelloOk | Ready | Step | Drain | StepAck | Heartbeat | Shutdown | Control
+class Admit(msgspec.Struct, tag=True):
+    """Origin → owner: admit a request group into the owner's scheduler.
+
+    The payload frame carries the origin-built ``EngineRequest`` objects
+    (pickled) — post-truncation token ids, finalized sampling params, and the
+    ``n>1`` child fan-out — so the owner schedules exactly what a local
+    admission would have produced. The owner renames the request ids into its
+    own id space and streams raw token deltas back to the origin.
+
+    Attributes:
+        request_id: The origin's parent request id (its local registry key).
+        origin_rank: Origin process rank (identifies the return path).
+        origin_counter: Origin-plane monotonic admission counter.
+        content_hash: :func:`compute_admission_key` over (tokens, params, n);
+            the coalescing key component and owner-id suffix source.
+        coalescable: Whether identical cross-rank admissions may share one
+            scheduled request (deterministic-counter trainer traffic).
+        n_samples: Parallel-sampling fan-out (validation aid).
+        payload_codec: Encoding of the payload frame.
+    """
+
+    request_id: str
+    origin_rank: int
+    origin_counter: int
+    content_hash: str = ""
+    coalescable: bool = False
+    n_samples: int = 1
+    payload_codec: str = PAYLOAD_CODEC_PICKLE
+
+
+class AdmitAck(msgspec.Struct, tag=True):
+    """Owner → origin: acceptance (or rejection) of an :class:`Admit`.
+
+    Attributes:
+        request_id: Echo of the origin's parent request id.
+        ok: ``False`` turns this into a NACK.
+        error: Failure description on NACK.
+        already_finished: Late coalesced attach: the shared request already
+            finished; the payload frame replays its full token log.
+    """
+
+    request_id: str
+    ok: bool
+    error: str | None = None
+    already_finished: bool = False
+
+
+class OutputUpdate(msgspec.Struct, tag=True):
+    """Owner → origin: one step's raw token deltas for remotely-admitted requests.
+
+    The payload frame carries a pickled ``(outputs, finished_requests)``
+    tuple: a list of ``EngineCoreOutput`` renamed into the origin's id space,
+    and the origin-mapped scheduler-side finished ids (terminations that
+    carry no terminal output). The origin re-stamps the bundle with its own
+    clock — ``perf_counter`` is process-local — and feeds its unchanged
+    :class:`OutputPipeline`.
+
+    Attributes:
+        seq: Owner-plane monotonic update sequence (gap detection aid).
+        payload_codec: Encoding of the payload frame.
+    """
+
+    seq: int
+    payload_codec: str = PAYLOAD_CODEC_PICKLE
+
+
+class AbortReq(msgspec.Struct, tag=True):
+    """Origin → owner: cancel a remotely-admitted request.
+
+    Attributes:
+        request_id: Origin-side request id (parent aborts every ``n>1``
+            child; a child id aborts one sample).
+    """
+
+    request_id: str
+
+
+class StopHit(msgspec.Struct, tag=True):
+    """Origin → owner: parser-detected stop-string matches.
+
+    The origin renders text locally, so stop strings are discovered there;
+    the owner must still free the scheduled rows. Mirrors the engine's
+    internal ``on_stop_strings`` payload.
+
+    Attributes:
+        hits: Origin-side sample-level request id → matched stop string.
+    """
+
+    hits: dict[str, str] = {}
+
+
+WireMessage = (
+    Hello
+    | HelloOk
+    | Ready
+    | Step
+    | Drain
+    | StepAck
+    | Heartbeat
+    | Shutdown
+    | Control
+    | Admit
+    | AdmitAck
+    | OutputUpdate
+    | AbortReq
+    | StopHit
+)
 
 _encoder = msgspec.msgpack.Encoder()
 _decoder = msgspec.msgpack.Decoder(WireMessage)
@@ -215,9 +321,9 @@ def decode_message(data: bytes) -> WireMessage:
     return _decoder.decode(data)
 
 
-def encode_payload(scheduler_output) -> bytes:
-    """Serialize a scheduler output for the payload frame."""
-    return pickle.dumps(scheduler_output, protocol=pickle.HIGHEST_PROTOCOL)
+def encode_payload(obj) -> bytes:
+    """Serialize a payload-frame object (scheduler outputs, admits, deltas)."""
+    return pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
 
 
 def decode_payload(data: bytes):
