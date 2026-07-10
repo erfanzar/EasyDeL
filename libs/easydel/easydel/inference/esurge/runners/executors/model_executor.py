@@ -695,6 +695,33 @@ class ModelStepExecutor:
             return hidden_states
         return jax.device_put(hidden_states, sharding)
 
+    def _place_lm_head_index(self, index: jax.Array) -> jax.Array:
+        """Move a PP gather-index tensor to the LM-head stage; pass through otherwise.
+
+        Companion to :meth:`_place_lm_head_hidden` for the 1-D
+        ``logits_index`` tensors consumed by the pipeline from-parts LM
+        head. The head jit runs on the LM-head-stage submesh (stage 0 for
+        tied embeddings, the final stage otherwise), but under PP the
+        indices are produced replicated on the *final* stage. This rebinds
+        them to the LM-head-stage replicated sharding so the head jit's
+        ``in_shardings`` are satisfied on a single device set. For untied
+        heads the LM-head stage *is* the final stage, so the move is a
+        no-op. SPMD / no-stage-mesh cases pass through unchanged.
+        """
+        if not self._uses_mpmd_mesh():
+            return index
+        sharding = self._lm_head_replicated_sharding()
+        if sharding is None:
+            return index
+        current = getattr(index, "sharding", None)
+        if (
+            isinstance(current, NamedSharding)
+            and getattr(current, "mesh", None) == sharding.mesh
+            and getattr(current, "spec", None) == sharding.spec
+        ):
+            return index
+        return jax.device_put(index, sharding)
+
     def _stage_local_lm_head_state(self, state: tp.Any) -> tp.Any:
         """Pin every leaf of an exported LM-head state onto the head-stage mesh.
 
@@ -1086,7 +1113,7 @@ class ModelStepExecutor:
             if part_sharding is not None:
                 dummy_hs = jax.device_put(dummy_hs, part_sharding)
             dummy_parts.append(dummy_hs)
-            dummy_indices.append(jnp.arange(rows, dtype=jnp.int32))
+            dummy_indices.append(self._place_lm_head_index(jnp.arange(rows, dtype=jnp.int32)))
 
         stage_mesh = self._lm_head_stage_mesh()
         logits_sharding = self._lm_head_replicated_sharding()
@@ -1167,6 +1194,16 @@ class ModelStepExecutor:
             _ = (graphstate_, graphother_)
             if self._lm_head_state is None:
                 raise ValueError("eSurge PP lm_head state was not initialized.")
+            # The PP backbone emits the final-stage hidden rows and their gather
+            # indices on the *final* stage's submesh, but this LM-head jit runs on
+            # the LM-head stage (stage 0 for tied embeddings). Rebind the small
+            # per-part tensors onto the LM-head-stage sharding so the jit sees all
+            # of its inputs (tied weight + hidden + indices) on one device set,
+            # instead of replicating the large tied projection onto the final
+            # stage. For untied heads the LM-head stage is the final stage, so
+            # these are no-ops.
+            hidden_parts_ = tuple(self._place_lm_head_hidden(part) for part in hidden_parts_)
+            index_parts_ = tuple(self._place_lm_head_index(idx) for idx in index_parts_)
             return _stage_lm_head_from_parts(self._lm_head_state, hidden_parts_, index_parts_)
 
         self._cache_store(self._pipeline_lm_head_cache, key, wrapped_lm_head_from_parts)
