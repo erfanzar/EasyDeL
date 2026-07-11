@@ -117,6 +117,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--json-out", default="/tmp/easydel_qwen35_9b_131k_32_1024x256.json")
     parser.add_argument("--no-async", action="store_true")
     parser.add_argument("--no-overlap", action="store_true")
+    parser.add_argument(
+        "--min-input-pad",
+        type=int,
+        default=None,
+        help="Override runner min_input_pad (defaults to --max-num-seqs). Lower it to let PP decode "
+        "microbatching engage (the wavefront gate needs microbatch rows >= min_input_pad).",
+    )
+    parser.add_argument(
+        "--pp-microbatch-count",
+        type=int,
+        default=None,
+        help="Pin PP decode microbatch count (default auto = min(num_stages, active_reqs)).",
+    )
     parser.add_argument("--use-aot-forward", action="store_true")
     parser.add_argument("--verbose-runner", action="store_true")
     parser.add_argument(
@@ -586,7 +599,7 @@ def main() -> int:
         page_size=args.page_size,
         max_model_len=args.max_model_len,
         max_num_batched_tokens=args.max_num_batched_tokens,
-        min_input_pad=args.max_num_seqs,
+        min_input_pad=args.min_input_pad if args.min_input_pad is not None else args.max_num_seqs,
         min_token_pad=16,
         max_num_seqs=args.max_num_seqs,
         max_num_seq_buckets=[args.max_num_seqs],
@@ -596,6 +609,7 @@ def main() -> int:
         enable_overlap_execution=not args.no_overlap,
         enable_window_aware_runtime_cap=False,
         kernel_tile_policy="auto",
+        pp_microbatch_count=(args.pp_microbatch_count if args.pp_microbatch_count is not None else "auto"),
         drafter=None,
     )
     print(f"runner page_size={runner.page_size} token_buckets={runner.num_tokens_paddings}")
