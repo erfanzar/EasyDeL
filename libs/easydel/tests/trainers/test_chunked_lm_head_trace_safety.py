@@ -27,13 +27,12 @@ that runs under ``jax.grad``).
 
 from __future__ import annotations
 
+# Import easydel first so jax.distributed.initialize() runs before jax.devices()
+import easydel  # noqa: F401
 import jax
 import jax.numpy as jnp
 import pytest
 import spectrax as spx
-
-# Import easydel first so jax.distributed.initialize() runs before jax.devices()
-import easydel  # noqa: F401
 
 _MESH = jax.sharding.Mesh(jax.devices(), ("dp",))
 
@@ -67,9 +66,7 @@ def _split(model):
     return model.split_module()
 
 
-# ---------------------------------------------------------------------------
 # Helpers for building loss functions that exercise the chunked paths
-# ---------------------------------------------------------------------------
 
 B, L, CHUNK = 2, 8, 4
 
@@ -162,9 +159,7 @@ def _loss_logprob_utils(graphdef, graphother, model):
     return loss_fn
 
 
-# ---------------------------------------------------------------------------
 # Parametrized tests
-# ---------------------------------------------------------------------------
 
 _LOSS_FNS = [
     ("make_lm_head_fn_scan", _loss_make_lm_head_fn_scan),

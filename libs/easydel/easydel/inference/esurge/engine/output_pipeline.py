@@ -156,9 +156,7 @@ class OutputPipeline:
         self._request_events = registry.events
         self._output_event = registry.output_event
 
-    # ------------------------------------------------------------------
     # Worker thread plumbing
-    # ------------------------------------------------------------------
 
     @property
     def running(self) -> bool:
@@ -220,9 +218,7 @@ class OutputPipeline:
             finally:
                 self.queue.task_done()
 
-    # ------------------------------------------------------------------
     # Decode helpers
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _compute_snapshot_delta_text(current_text: str, previous_text: str, fallback_delta: str) -> str:
@@ -299,9 +295,7 @@ class OutputPipeline:
             prompt_context=prompt_context,
         )
 
-    # ------------------------------------------------------------------
     # Stop-string policy and parser drive
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _find_first_stop_string(text: str, stop_sequences: list[str]) -> tuple[int, str] | None:

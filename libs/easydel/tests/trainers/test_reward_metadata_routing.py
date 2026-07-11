@@ -17,8 +17,6 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from jax import numpy as jnp
-
 from easydel.inference.openai_api_modules import FunctionCall, ToolCall
 from easydel.infra.base_state import EasyDeLState
 from easydel.trainers.agentic_moshpit.agentic_moshpit_trainer import AgenticMoshPitTrainer
@@ -34,6 +32,7 @@ from easydel.trainers.base_trainer import GenerationResults
 from easydel.trainers.group_relative_policy_optimization.grpo_trainer import GRPOTrainer
 from easydel.trainers.nash_md_trainer.nash_md_trainer import NashMDTrainer
 from easydel.trainers.xpo_trainer.xpo_trainer import XPOTrainer
+from jax import numpy as jnp
 
 
 class _TokenizerStub:
@@ -134,7 +133,7 @@ def test_agentic_generate_fn_keeps_raw_text_but_returns_post_strip_action_text()
     trainer = object.__new__(AgenticMoshPitTrainer)
     trainer._strip_thinking = lambda text: text.replace("<think>plan</think>", "")
 
-    def fake_generate_unified(**kwargs):
+    def fake_rollout(**kwargs):
         del kwargs
         return GenerationResults(
             generation_results=["legacy"],
@@ -151,7 +150,7 @@ def test_agentic_generate_fn_keeps_raw_text_but_returns_post_strip_action_text()
             raw_text=["<think>plan</think>answer"],
         )
 
-    trainer.generate_unified = fake_generate_unified
+    trainer.rollout = fake_rollout
     generate_fn = AgenticMoshPitTrainer._make_generate_fn(trainer, state=SimpleNamespace())
 
     responses = generate_fn(["prompt"], strip_thinking=True)
@@ -536,7 +535,7 @@ def test_grpo_reward_models_render_structured_tool_calls():
     object.__setattr__(reward_model, "apply_fn", reward_apply_fn)
     trainer.reward_funcs = [reward_model]
 
-    def fake_generate_unified(**kwargs):
+    def fake_rollout(**kwargs):
         del kwargs
         prompt_messages = [[{"role": "user", "content": "Question"}]]
         return GenerationResults(
@@ -563,7 +562,7 @@ def test_grpo_reward_models_render_structured_tool_calls():
             raw_text=["<tool_call>{}</tool_call>"],
         )
 
-    trainer.generate_unified = fake_generate_unified
+    trainer.rollout = fake_rollout
 
     processed_batch, metrics = GRPOTrainer._preprocess_batch_input(
         trainer,
@@ -624,7 +623,7 @@ def test_grpo_environment_factory_feedback_reaches_rewards_and_advantages():
 
     trainer.reward_funcs = [capture_reward]
 
-    def fake_generate_unified(**kwargs):
+    def fake_rollout(**kwargs):
         del kwargs
         return GenerationResults(
             generation_results=["final"],
@@ -641,7 +640,7 @@ def test_grpo_environment_factory_feedback_reaches_rewards_and_advantages():
             raw_text=["final"],
         )
 
-    trainer.generate_unified = fake_generate_unified
+    trainer.rollout = fake_rollout
 
     processed_batch, metrics = GRPOTrainer._preprocess_batch_input(
         trainer,
@@ -711,7 +710,7 @@ def test_grpo_tool_call_loop_appends_tool_result_and_regenerates():
     trainer.reward_funcs = [capture_reward]
     call_count = {"value": 0}
 
-    def fake_generate_unified(**kwargs):
+    def fake_rollout(**kwargs):
         call_count["value"] += 1
         if call_count["value"] == 1:
             return GenerationResults(
@@ -753,7 +752,7 @@ def test_grpo_tool_call_loop_appends_tool_result_and_regenerates():
             raw_text=["final"],
         )
 
-    trainer.generate_unified = fake_generate_unified
+    trainer.rollout = fake_rollout
 
     processed_batch, metrics = GRPOTrainer._preprocess_batch_input(
         trainer,
@@ -927,7 +926,7 @@ def test_nash_md_mixture_rewards_follow_generated_mixture_metadata():
 
     trainer.reward_funcs = [capture_reward]
 
-    def fake_generate_unified(*, state, **kwargs):
+    def fake_rollout(*, state, **kwargs):
         del kwargs
         if state is trainer.ref_state:
             return GenerationResults(
@@ -959,7 +958,7 @@ def test_nash_md_mixture_rewards_follow_generated_mixture_metadata():
             raw_text=["<think>policy</think>Policy answer"],
         )
 
-    trainer.generate_unified = fake_generate_unified
+    trainer.rollout = fake_rollout
 
     NashMDTrainer._preprocess_batch_input(
         trainer,
@@ -1007,7 +1006,7 @@ def test_xpo_preprocess_supports_reward_models_without_text_decoding():
     trainer.reward_funcs = [reward_state]
     trainer._get_reward_processing_classes = lambda: [trainer.processing_class]
 
-    def fake_generate_unified(*, state, **kwargs):
+    def fake_rollout(*, state, **kwargs):
         del kwargs
         completion_token = 11 if state is not trainer.ref_state else 21
         completion_text = "policy" if state is not trainer.ref_state else "reference"
@@ -1026,7 +1025,7 @@ def test_xpo_preprocess_supports_reward_models_without_text_decoding():
             raw_text=[f"<think>plan</think>{completion_text}"],
         )
 
-    trainer.generate_unified = fake_generate_unified
+    trainer.rollout = fake_rollout
 
     processed_batch, metrics = XPOTrainer._preprocess_batch_input(
         trainer,

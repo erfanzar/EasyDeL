@@ -54,10 +54,10 @@ def generate_rollout_completions(
     generation_overrides: dict[str, object] | None = None,
     as_chat: bool | None = None,
 ) -> list[dict[str, object]]:
-    """Generate completions from an EasyDeL trainer through ``generate_unified``.
+    """Generate completions from an EasyDeL trainer through ``rollout``.
 
     Args:
-        trainer: Trainer object exposing EasyDeL's ``generate_unified`` method.
+        trainer: Trainer object exposing EasyDeL's ``rollout`` method.
         prompts: Raw prompt strings to complete.
         generation_overrides: Optional generation config overrides passed to
             eSurge/local generation.
@@ -65,15 +65,15 @@ def generate_rollout_completions(
 
     Returns:
         One dictionary per generated completion, carrying text plus available
-        token/sequences side data returned by ``generate_unified``.
+        token/sequences side data returned by ``rollout``.
     """
     if not prompts:
         return []
-    generate_unified = getattr(trainer, "generate_unified", None)
-    if generate_unified is None:
-        raise TypeError("`trainer` must provide EasyDeL `generate_unified` for rollout generation.")
+    rollout = getattr(trainer, "rollout", None)
+    if rollout is None:
+        raise TypeError("`trainer` must provide EasyDeL `rollout` for rollout generation.")
     use_esurge = bool(getattr(getattr(trainer, "arguments", None), "use_esurge_generation", True))
-    results = generate_unified(
+    results = rollout(
         prompts=prompts,
         use_esurge=use_esurge,
         apply_chat_template=bool(as_chat),
@@ -114,7 +114,7 @@ class eSurgeRolloutGenerator:
 
     The wrapper binds a trainer instance and default rollout config so the same
     object can be passed into APIs that expect a simple callable generator. It
-    still delegates all actual generation to the trainer's ``generate_unified``
+    still delegates all actual generation to the trainer's ``rollout``
     method.
     """
 
@@ -122,7 +122,7 @@ class eSurgeRolloutGenerator:
         """Bind a trainer and default rollout options for repeated generation.
 
         Args:
-            trainer: Trainer object exposing EasyDeL ``generate_unified``. The
+            trainer: Trainer object exposing EasyDeL ``rollout``. The
                 generator does not own or modify the trainer state.
             config: Optional immutable rollout defaults for generation
                 overrides and chat-template handling. A default empty config is

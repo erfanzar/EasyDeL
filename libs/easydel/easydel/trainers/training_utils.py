@@ -2688,6 +2688,25 @@ def minibatch_call(
     coming from model forwards (for example cached teacher hidden states in
     distillation), where introducing a new leading accumulation axis can confuse
     downstream partitioned computations.
+
+    Contract (IMPORTANT): the accumulated gradients and metrics are **averaged**
+    by ``1/num_accum_steps``. This is correct only for an *intensive* loss — one
+    whose ``grad_fn`` normalizer scales with the microbatch (a per-example mean,
+    or a masked mean over the microbatch's own tokens). Such losses reconstruct
+    the full-batch value under averaging.
+
+    An *extensive* loss — normalized by a GLOBAL batch-level scalar carried in the
+    batch (e.g. ``num_items_in_batch = jnp.sum(completion_mask)`` computed over the
+    full batch) — is silently scaled by ``1/num_accum_steps``: a 0-dim scalar is
+    NOT sliced (see ``_slice_leaf`` below), so each microbatch divides its own
+    token-sum by the *global* count, and the K per-microbatch gradients already
+    sum to the correct full-batch gradient before the ``÷K`` average shrinks it.
+    Trainers using the global ``num_items_in_batch`` convention (GRPO ``dapo`` /
+    ``cispo`` / ``vespo`` / ``dppo``, SDPO) must therefore divide that global
+    normalizer by ``gradient_accumulation_steps`` in their loss (see
+    ``group_relative_policy_optimization._fn._global_token_normalizer``) so the
+    average recombines correctly. Do NOT add a global-scalar normalizer to a loss
+    without that compensation.
     """
     batch_size = _infer_batch_size(batch)
     if minibatch_size <= 0:

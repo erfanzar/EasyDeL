@@ -210,9 +210,7 @@ class _PlaneHarness:
         assert not self.worker_thread.is_alive(), "worker replay thread failed to exit"
 
 
-# ---------------------------------------------------------------------------
 # Distinct (non-coalescable) path
-# ---------------------------------------------------------------------------
 
 
 def test_remote_admit_renames_and_schedules():
@@ -317,9 +315,7 @@ def test_admit_nack_raises_and_forgets():
         assert not plane.owner.needs_tee
 
 
-# ---------------------------------------------------------------------------
 # Coalesced (auto-id lockstep) path
-# ---------------------------------------------------------------------------
 
 
 def test_coalesce_owner_first_keeps_local_ids_and_fans_remote():

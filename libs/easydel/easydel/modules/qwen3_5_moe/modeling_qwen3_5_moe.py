@@ -90,7 +90,7 @@ class _Qwen3_5MoeMTPMixin:
     See ``easydel.modules.qwen3_5.modeling_qwen3_5`` for the canonical docstrings.
     """
 
-    # --- hooks: text and vision-language variants differ only in these three ---
+    # hooks: text and vision-language variants differ only in these three
     def _mtp_embed(self, token_ids_i4):
         return self.model.get_embedding()(token_ids_i4)
 
@@ -100,7 +100,7 @@ class _Qwen3_5MoeMTPMixin:
     def _mtp_loss_coef(self) -> float:
         return float(getattr(self.config, "mtp_loss_coef", 0.0))
 
-    # --- shared MTP API (model-agnostic; uses self.mtp + the hooks) ---
+    # shared MTP API (model-agnostic; uses self.mtp + the hooks)
     def has_mtp(self) -> bool:
         return self.mtp is not None
 

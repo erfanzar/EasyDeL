@@ -1167,7 +1167,7 @@ class GRPOTrainer(Trainer):
                 break
 
             max_new_tokens = max(max_completion_length - len(completion_rows[idx]) for idx in loop_indices)
-            followup_results = self.generate_unified(
+            followup_results = self.rollout(
                 prompts=loop_prompts,
                 state=state,
                 apply_chat_template=False,
@@ -1540,7 +1540,7 @@ class GRPOTrainer(Trainer):
 
         For every prompt this hook:
 
-        1. Calls :meth:`generate_unified` to draw ``num_generations``
+        1. Calls :meth:`rollout` to draw ``num_generations``
            completions per prompt.
         2. Computes the reference-model per-token log-probabilities
            via the compiled :meth:`compute_refmodel_logps`.
@@ -1585,7 +1585,7 @@ class GRPOTrainer(Trainer):
             )
 
             with capture_time() as generation_time_fn:
-                results = self.generate_unified(
+                results = self.rollout(
                     input_ids=prompt_ids,
                     attention_mask=prompt_mask,
                     model_kwargs=prompt_model_kwargs,

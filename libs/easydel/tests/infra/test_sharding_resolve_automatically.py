@@ -33,12 +33,11 @@ from __future__ import annotations
 import collections
 import re
 
+import easydel as ed
 import jax
 import jax.numpy as jnp
 import pytest
 import spectrax as spx
-
-import easydel as ed
 
 AXIS_NAMES = ("pp", "dp", "fsdp", "ep", "tp", "sp")
 
@@ -80,7 +79,6 @@ def _layer_index_from_path(path: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
-# ---------------------------------------------------------------------------
 # Common invariants applied to every config
 
 
@@ -101,7 +99,6 @@ def _assert_common_invariants(rules):
         assert "pp" not in _spec_axes(ns.spec), f"{pat}: spec={ns.spec} still references pp"
 
 
-# ---------------------------------------------------------------------------
 # Per-mesh assertions
 
 
@@ -123,7 +120,6 @@ def _assert_all_on_full_mesh(rules, n_devices):
         assert _device_set(ns) == full, f"{pat}: expected full mesh {full}, got {_device_set(ns)}"
 
 
-# ---------------------------------------------------------------------------
 # Tests
 
 

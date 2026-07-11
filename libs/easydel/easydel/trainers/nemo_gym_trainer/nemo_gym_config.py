@@ -29,7 +29,7 @@ class NeMoGymConfig(GRPOConfig):
     """Configuration for NeMo Gym style environment training.
 
     Policy completions are produced by the inherited eSurge
-    ``generate_unified`` path, then the configured environment factory scores
+    ``rollout`` path, then the configured environment factory scores
     each completion.
     """
 

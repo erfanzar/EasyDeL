@@ -171,7 +171,7 @@ class RoutedEngine:
         # would otherwise dump entirely on the lowest-indexed member.
         self._inflight = [0] * len(self.members)
 
-    # ---------------------------------------------------------------- routing
+    # routing
     def _alive_indices(self) -> list[int]:
         alive = []
         for index, member in enumerate(self.members):
@@ -222,7 +222,7 @@ class RoutedEngine:
             key=lambda index: (inflight[index], _member_pending_prefill_tokens(self.members[index]), index),
         )
 
-    # -------------------------------------------------------- adapter surface
+    # adapter surface
     @property
     def esurge_name(self) -> str:
         """The replica group's display name (first member's)."""

@@ -512,7 +512,7 @@ class XPOTrainer(GRPOTrainer):
             prompt_mask = batch["attention_mask"]
 
             with capture_time() as policy_time_fn:
-                policy_results = self.generate_unified(
+                policy_results = self.rollout(
                     input_ids=prompt_ids,
                     attention_mask=prompt_mask,
                     state=state,
@@ -537,7 +537,7 @@ class XPOTrainer(GRPOTrainer):
                 ref_generation_time = 0.0
             else:
                 with capture_time() as ref_time_fn:
-                    ref_results = self.generate_unified(
+                    ref_results = self.rollout(
                         input_ids=prompt_ids,
                         attention_mask=prompt_mask,
                         state=self.ref_state,

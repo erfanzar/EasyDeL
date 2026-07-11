@@ -42,10 +42,8 @@ from operator import mul
 import jax
 import jax.numpy as jnp
 
-# ---------------------------------------------------------------------------
 # EasyDeL CE port (vendored to avoid Python-version mismatch on this host).
 # Source: easydel.infra.loss_utils (Apache 2.0).
-# ---------------------------------------------------------------------------
 
 
 def _easydel_onehot(labels, num_classes, on_value=1.0, off_value=0.0):
@@ -127,9 +125,7 @@ def easydel_cross_entropy(logits, targets, weights=None, *, label_smoothing=0.0,
     return jnp.sum(total_loss) / jnp.maximum(weight_sum, 1e-8)
 
 
-# ---------------------------------------------------------------------------
 # Naive JAX KL baseline.
-# ---------------------------------------------------------------------------
 
 
 def naive_kl(student_logits, teacher_logits, weights=None):
@@ -143,9 +139,7 @@ def naive_kl(student_logits, teacher_logits, weights=None):
     return jnp.sum(per_row * weights) / jnp.maximum(jnp.sum(weights), 1e-8)
 
 
-# ---------------------------------------------------------------------------
 # Timing helper.
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -172,9 +166,7 @@ def time_fn(fn, *args, warmup: int = 3, iters: int = 10) -> Timing:
     return Timing(median_ms=samples[len(samples) // 2], min_ms=samples[0], n_iters=iters)
 
 
-# ---------------------------------------------------------------------------
 # Driver.
-# ---------------------------------------------------------------------------
 
 
 def bench_ce(shape, dtype, *, warmup=3, iters=10, platforms=("xla",)):

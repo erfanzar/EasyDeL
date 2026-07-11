@@ -508,7 +508,7 @@ class ExecutionManager:
     _cpu_vector_size = staticmethod(_cpu_vector_size)
     _padded_cpu_window = staticmethod(_padded_cpu_window)
 
-    # --- SamplerRuntime back-references (phase 11.1) -----------------------
+    # SamplerRuntime back-references (phase 11.1)
     # execute() and the PP microbatch path read the sampler scratch inline at
     # many sites. The numpy buffers are mutated in place by the runtime and
     # never rebound, so read-only property views preserve behavior exactly.

@@ -18,7 +18,6 @@ import jax
 import jax.numpy as jnp
 import optax  # pyright: ignore[reportMissingTypeStubs]
 import pytest
-
 from easydel.trainers.distillation_trainer._fn import chunked_distillation_loss, distillation_loss
 
 
@@ -32,8 +31,25 @@ def _build_expected_ce(
     *,
     attention_mask: jnp.ndarray | None,
     loss_mask: jnp.ndarray | None,
+    shift_tokens: bool = True,
 ) -> jnp.ndarray:
+    """Independent reference for the distillation hard-label CE.
+
+    When ``shift_tokens`` (the ``LossConfig.shift_tokens`` default) the reference is
+    causally shifted -- ``student_logits[:, :-1]`` scored against ``labels[:, 1:]`` and
+    the completion / attention ``mask[:, 1:]`` -- so it matches ``ForCausalLMLoss`` and
+    the fixed ``distillation_loss``. With ``shift_tokens=False`` it reproduces the old
+    unshifted ``CE(logits[t], labels[t])`` behavior.
+    """
     dtype = student_logits.dtype
+    if shift_tokens:
+        student_logits = student_logits[:, :-1]
+        labels = labels[:, 1:]
+        if attention_mask is not None:
+            attention_mask = attention_mask[:, 1:]
+        if loss_mask is not None:
+            loss_mask = loss_mask[:, 1:]
+
     if loss_mask is not None:
         mask = loss_mask.astype(dtype)
     elif attention_mask is not None:
@@ -242,12 +258,134 @@ def test_supervised_ce_unchanged():
     assert jnp.allclose(metrics_b["ce_loss"], expected_ce, atol=1e-6)
 
 
+def test_pure_ce_is_causally_shifted():
+    """alpha=0 pure-CE trains logits[:, :-1] against labels[:, 1:] (BUG 1 regression).
+
+    The old (buggy) path scored ``CE(logits[t], labels[t])``; the fix scores
+    ``CE(logits[t], labels[t+1])``. Data is chosen so the shifted and unshifted
+    references genuinely differ, so this fails on the old code and passes on the fix.
+    """
+    student_logits = jnp.array(
+        [[[2.0, 0.1, -1.0, 0.3], [0.2, 1.5, -0.4, 0.0], [-0.5, 0.2, 1.1, 0.8]]],
+        dtype=jnp.float32,
+    )
+    # Unshifted labels (trainer convention): label[t] == input_ids[t], -100 outside completion.
+    labels = jnp.array([[-100, 1, 2]], dtype=jnp.int32)
+    attention_mask = jnp.array([[1, 1, 1]], dtype=jnp.int32)
+
+    shifted_ref = _build_expected_ce(
+        student_logits=student_logits,
+        labels=labels,
+        attention_mask=attention_mask,
+        loss_mask=None,
+        shift_tokens=True,
+    )
+    unshifted_ref = _build_expected_ce(
+        student_logits=student_logits,
+        labels=labels,
+        attention_mask=attention_mask,
+        loss_mask=None,
+        shift_tokens=False,
+    )
+    # Guard against a vacuous assertion: the two references must actually differ.
+    assert not jnp.allclose(shifted_ref, unshifted_ref, atol=1e-4)
+
+    # teacher == student so KL == 0 and, at alpha=0, total loss == the hard-label CE.
+    _, metrics = distillation_loss(
+        student_logits=student_logits,
+        teacher_logits=student_logits,
+        attention_mask=attention_mask,
+        labels=labels,
+        use_hard_labels=True,
+        temperature=2.0,
+        alpha=0.0,
+    )
+    assert jnp.allclose(metrics["ce_loss"], shifted_ref, atol=1e-6)
+    assert not jnp.allclose(metrics["ce_loss"], unshifted_ref, atol=1e-4)
+
+    # shift_tokens=False must reproduce the old unshifted behavior exactly.
+    _, metrics_noshift = distillation_loss(
+        student_logits=student_logits,
+        teacher_logits=student_logits,
+        attention_mask=attention_mask,
+        labels=labels,
+        use_hard_labels=True,
+        temperature=2.0,
+        alpha=0.0,
+        shift_tokens=False,
+    )
+    assert jnp.allclose(metrics_noshift["ce_loss"], unshifted_ref, atol=1e-6)
+
+
+def test_forward_kl_mask_is_causally_shifted():
+    """Completion-only KD masks the KL by completion_mask[t+1] (BUG 2 regression).
+
+    Position t predicts token t+1, so the forward-KL masked mean uses ``mask[:, 1:]``
+    over student/teacher ``logits[:, :-1]``. The mask + data are chosen so the shifted
+    and unshifted references differ, so this fails on the old code and passes on the fix.
+    """
+    student_logits = jnp.array(
+        [[[1.0, 0.0, -0.5], [0.2, 0.9, -0.3], [-0.4, 0.5, 1.2]]],
+        dtype=jnp.float32,
+    )
+    teacher_logits = jnp.array(
+        [[[0.1, 0.6, -0.2], [0.4, -0.1, 0.3], [0.7, 0.2, -0.5]]],
+        dtype=jnp.float32,
+    )
+    completion_mask = jnp.array([[0, 1, 1]], dtype=jnp.int32)
+    temperature = 2.0
+    t_sq = temperature**2
+
+    def _forward_kl_masked(student, teacher, mask):
+        s_lp = jax.nn.log_softmax(student / temperature, axis=-1)
+        t_lp = jax.nn.log_softmax(teacher / temperature, axis=-1)
+        per_token = jnp.sum(jnp.exp(t_lp) * (t_lp - s_lp), axis=-1)
+        return jnp.sum(per_token * mask) / jnp.sum(mask) * t_sq
+
+    shifted_ref = _forward_kl_masked(
+        student_logits[:, :-1],
+        teacher_logits[:, :-1],
+        completion_mask[:, 1:].astype(jnp.float32),
+    )
+    unshifted_ref = _forward_kl_masked(
+        student_logits,
+        teacher_logits,
+        completion_mask.astype(jnp.float32),
+    )
+    assert not jnp.allclose(shifted_ref, unshifted_ref, atol=1e-4)
+
+    # Default classic-KD (beta=None) forward KL, pure distillation (alpha=1.0).
+    _, metrics = distillation_loss(
+        student_logits=student_logits,
+        teacher_logits=teacher_logits,
+        loss_mask=completion_mask,
+        use_hard_labels=False,
+        temperature=temperature,
+        alpha=1.0,
+    )
+    assert jnp.allclose(metrics["kl_loss"], shifted_ref, atol=1e-5)
+    assert not jnp.allclose(metrics["kl_loss"], unshifted_ref, atol=1e-4)
+
+    _, metrics_noshift = distillation_loss(
+        student_logits=student_logits,
+        teacher_logits=teacher_logits,
+        loss_mask=completion_mask,
+        use_hard_labels=False,
+        temperature=temperature,
+        alpha=1.0,
+        shift_tokens=False,
+    )
+    assert jnp.allclose(metrics_noshift["kl_loss"], unshifted_ref, atol=1e-5)
+
+
 def test_distillation_beta_uses_generalized_jsd():
     student_logits = jnp.array([[[1.0, 0.0, -0.5], [0.2, 0.5, -0.3]]], dtype=jnp.float32)
     teacher_logits = jnp.array([[[0.1, 0.6, -0.2], [0.4, -0.1, 0.3]]], dtype=jnp.float32)
     mask = jnp.array([[1, 0]], dtype=jnp.int32)
     beta = 0.25
 
+    # shift_tokens=False: verify the GJSD math on a fixed (unshifted) window; the causal
+    # shift is exercised separately by test_forward_kl_mask_is_causally_shifted.
     _, metrics = distillation_loss(
         student_logits=student_logits,
         teacher_logits=teacher_logits,
@@ -255,6 +393,7 @@ def test_distillation_beta_uses_generalized_jsd():
         temperature=1.5,
         alpha=1.0,
         beta=beta,
+        shift_tokens=False,
     )
 
     student_log_probs = jax.nn.log_softmax(student_logits / 1.5, axis=-1)
@@ -291,6 +430,8 @@ def test_distillation_beta_endpoints_match_gkd_convention():
     reverse_kl = jnp.sum(jnp.exp(student_log_probs) * (student_log_probs - teacher_log_probs), axis=-1)
     t_sq = temperature**2
 
+    # shift_tokens=False: this checks the forward/reverse KL endpoint math over both
+    # positions; the causal shift is covered by test_forward_kl_mask_is_causally_shifted.
     _, metrics_fwd = distillation_loss(
         student_logits=student_logits,
         teacher_logits=teacher_logits,
@@ -298,6 +439,7 @@ def test_distillation_beta_endpoints_match_gkd_convention():
         temperature=temperature,
         alpha=1.0,
         beta=0.0,
+        shift_tokens=False,
     )
     assert jnp.allclose(metrics_fwd["kl_loss"], jnp.mean(forward_kl) * t_sq, atol=1e-5)
 
@@ -308,6 +450,7 @@ def test_distillation_beta_endpoints_match_gkd_convention():
         temperature=temperature,
         alpha=1.0,
         beta=1.0,
+        shift_tokens=False,
     )
     assert jnp.allclose(metrics_rev["kl_loss"], jnp.mean(reverse_kl) * t_sq, atol=1e-5)
 
@@ -319,6 +462,7 @@ def test_distillation_cakld_blends_forward_and_reverse_kl():
     temperature = 1.5
     gamma = 0.7
 
+    # shift_tokens=False: CAKLD forward/reverse blend on a fixed window.
     _, metrics = distillation_loss(
         student_logits=student_logits,
         teacher_logits=teacher_logits,
@@ -326,6 +470,7 @@ def test_distillation_cakld_blends_forward_and_reverse_kl():
         temperature=temperature,
         alpha=1.0,
         cakld_gamma=gamma,
+        shift_tokens=False,
     )
 
     student_log_probs = jax.nn.log_softmax(student_logits / temperature, axis=-1)
@@ -374,6 +519,8 @@ def test_distillation_topk_tail_matches_bucketed_loss():
     student_logits = jnp.array([[[0.1, 0.7, -0.2, 0.5]]], dtype=jnp.float32)
     teacher_logits = jnp.array([[[1.2, 0.4, -0.1, 0.2]]], dtype=jnp.float32)
 
+    # Single-position example: shift_tokens=False keeps the position (a shift would empty it)
+    # and lets the top-k tail bucketing be checked directly against the manual reference.
     _, metrics = distillation_loss(
         student_logits=student_logits,
         teacher_logits=teacher_logits,
@@ -381,6 +528,7 @@ def test_distillation_topk_tail_matches_bucketed_loss():
         alpha=1.0,
         loss_top_k=2,
         loss_add_tail=True,
+        shift_tokens=False,
     )
 
     teacher_log_probs = jax.nn.log_softmax(teacher_logits, axis=-1)
@@ -438,6 +586,8 @@ def test_chunked_z_loss_matches_manual_reference():
     attention_mask = jnp.asarray([[1] * 8, [1] * 5 + [0] * 3], jnp.int32)
     coef = 1e-2
 
+    # shift_tokens=False: the manual z-loss reference below is over the full (unshifted)
+    # logsumexp window; the causal shift itself is covered by the CE/KL shift tests.
     base_total, base_components = chunked_distillation_loss(
         student_hidden=student_hidden,
         teacher_hidden=teacher_hidden,
@@ -447,6 +597,7 @@ def test_chunked_z_loss_matches_manual_reference():
         temperature=1.0,
         alpha=1.0,
         chunk_size=4,
+        shift_tokens=False,
     )
     total, components = chunked_distillation_loss(
         student_hidden=student_hidden,
@@ -458,6 +609,7 @@ def test_chunked_z_loss_matches_manual_reference():
         alpha=1.0,
         chunk_size=4,
         z_loss=coef,
+        shift_tokens=False,
     )
 
     mask = attention_mask.astype(jnp.float32)
@@ -482,6 +634,7 @@ def test_chunked_z_loss_zero_coefficient_is_identity():
         temperature=1.0,
         alpha=1.0,
         chunk_size=4,
+        shift_tokens=False,
     )
     total_off, comps_off = chunked_distillation_loss(**kwargs)
     total_default, comps_default = chunked_distillation_loss(**kwargs, z_loss=0.0)

@@ -13,16 +13,16 @@
 # limitations under the License.
 
 """
-Lightweight smoke for GRPO generate_unified alignment without running full training.
+Lightweight smoke for GRPO rollout alignment without running full training.
 
 This uses the GRPO trainer with a tiny config and a minimal tokenizer/model stub
 available from the GRPO test helpers. It checks that prompt_ids/prompt_mask are
 preserved and that completion_prompts length matches completions.
 """
 
+import easydel as ed
 import numpy as np
 
-import easydel as ed
 from tests.trainers._common import (
     dummy_reward_fn,
     get_tokenizer,
@@ -32,7 +32,7 @@ from tests.trainers._common import (
 )
 
 
-def test_generate_unified_matches_prompt_ids():
+def test_rollout_matches_prompt_ids():
     tokenizer = get_tokenizer()
     model = load_causal_lm_model()
     dataset = load_preference_dataset().select(range(2))
@@ -82,7 +82,7 @@ def test_generate_unified_matches_prompt_ids():
         processing_class=tokenizer,
     )
 
-    results = trainer.generate_unified(
+    results = trainer.rollout(
         input_ids=input_ids,
         attention_mask=attention_mask,
         state=trainer.model_state,
@@ -100,4 +100,4 @@ def test_generate_unified_matches_prompt_ids():
 
 
 if __name__ == "__main__":
-    test_generate_unified_matches_prompt_ids()
+    test_rollout_matches_prompt_ids()

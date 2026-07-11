@@ -383,7 +383,7 @@ class OnlineDPOTrainer(DPOTrainer):
             raise ValueError("OnlineDPO batches must contain `prompt` text or pretokenized `input_ids`.")
 
         with capture_time() as generation_time_fn:
-            results = self.generate_unified(
+            results = self.rollout(
                 input_ids=None if input_ids is None else jnp.asarray(input_ids),
                 attention_mask=None if attention_mask is None else jnp.asarray(attention_mask),
                 prompts=prompts,

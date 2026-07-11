@@ -891,10 +891,6 @@ class eSurge:
 
         self.initiate()
 
-    # ------------------------------------------------------------------
-    # Scheduler-loop state (backed by the current EngineLoop)
-    # ------------------------------------------------------------------
-
     @property
     def _scheduler_running(self) -> bool:
         """Whether the background scheduler loop is running.
@@ -1203,10 +1199,6 @@ class eSurge:
             f"scheduler_running={self._scheduler_running}",
         ]
         return "eSurge(\n  " + ",\n  ".join(attrs) + "\n)"
-
-    # ------------------------------------------------------------------
-    # Component delegators and small helpers
-    # ------------------------------------------------------------------
 
     def _format_chat_prompt(
         self,
@@ -1563,10 +1555,6 @@ class eSurge:
                         exc_info=True,
                     )
 
-    # ------------------------------------------------------------------
-    # Request cancellation and queue introspection
-    # ------------------------------------------------------------------
-
     def abort_request(self, request_id: str) -> None:
         """Cancel a request and release every resource it holds.
 
@@ -1817,10 +1805,6 @@ class eSurge:
         """
         with self._scheduler_lock:
             return len(self.scheduler.running)
-
-    # ------------------------------------------------------------------
-    # Lifecycle: scheduler loop, output worker, weights, profiling
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _is_nonrecoverable_scheduler_error(exc: BaseException) -> bool:
@@ -2718,9 +2702,6 @@ class eSurge:
         if self._profiling_steps_remaining <= 0:
             self.stop_profiling()
 
-    # ------------------------------------------------------------------
-    # Public generation API
-    # ------------------------------------------------------------------
 
     def _ensure_scheduler_running(self, *, context: str) -> None:
         """Fail fast when the scheduler is not actually running.
@@ -3864,9 +3845,6 @@ class eSurge:
                 self._track_finished_output(request_id)
         return output
 
-    # ------------------------------------------------------------------
-    # Monitoring delegators
-    # ------------------------------------------------------------------
 
     def start_monitoring(self, **kwargs) -> dict[str, str]:
         """Start Prometheus-based monitoring for the engine.

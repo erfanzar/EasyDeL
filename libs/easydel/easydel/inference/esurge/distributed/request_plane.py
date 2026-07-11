@@ -266,7 +266,7 @@ class OwnerRequestPlane:
         self._out_seq = 0
         self._lock = threading.RLock()
 
-        # --- non-coalescable remote requests -----------------------------
+        # non-coalescable remote requests
         # Owner scheduler id (per-sample child) -> (identity, origin id).
         self._owner_to_origin: dict[str, tuple[bytes, str]] = {}
         # (identity, origin id) -> owner id, for AbortReq/StopHit translation.
@@ -277,7 +277,7 @@ class OwnerRequestPlane:
         self._owner_child_to_parent: dict[str, str] = {}
         self._parents: dict[str, tuple[bytes, str]] = {}
 
-        # --- coalesced groups ---------------------------------------------
+        # coalesced groups
         self._entries: dict[tuple[int, str], _CoalesceEntry] = {}
         # coalesce counter -> content hash, for loud lockstep-divergence NACKs.
         self._by_counter: dict[int, str] = {}
@@ -299,7 +299,7 @@ class OwnerRequestPlane:
 
         coordinator.set_plane_handler(self.handle_inbound)
 
-    # ------------------------------------------------------------- lifecycle
+    # lifecycle
     def ensure_started(self) -> None:
         """Start the ingest thread (idempotent; safe across engine restarts)."""
         thread = self._thread
@@ -335,7 +335,7 @@ class OwnerRequestPlane:
             self._subscriber_children.clear()
             self.needs_tee = False
 
-    # -------------------------------------------------------------- handoffs
+    # handoffs
     def handle_inbound(self, identity: bytes, message: wire.WireMessage, payload: bytes | None) -> None:
         """Coordinator IO-thread handoff for plane wire messages."""
         self._queue.put(("wire", identity, message, payload))
@@ -349,7 +349,7 @@ class OwnerRequestPlane:
         """
         self._queue.put(("outputs", None, engine_outputs, None))
 
-    # ------------------------------------------------------ local admissions
+    # local admissions
     def admit_local(self, scheduler_requests: list[EngineRequest]) -> None:
         """Route the owner's own admissions through the coalescing table.
 
@@ -490,7 +490,7 @@ class OwnerRequestPlane:
         if scheduled_abort is not None:
             self._abort_request(scheduled_abort)
 
-    # ---------------------------------------------------------- ingest thread
+    # ingest thread
     def _loop(self) -> None:
         while True:
             try:
@@ -521,7 +521,7 @@ class OwnerRequestPlane:
         else:
             logger.warning("Request plane: ignoring unexpected %s", type(message).__name__)
 
-    # ------------------------------------------------------ coalescing tables
+    # coalescing tables
     def _lookup_entry(self, counter: int, content_hash: str, *, origin: str) -> _CoalesceEntry | None:
         """Find the group for a coalescing key, failing loudly on divergence."""
         known_hash = self._by_counter.get(counter)
@@ -578,7 +578,7 @@ class OwnerRequestPlane:
                 if fully_attached or now - entry.finished_at > self._retention_s:
                     self._retire_entry(entry)
 
-    # -------------------------------------------------------- wire admissions
+    # wire admissions
     def _handle_admit(self, identity: bytes, admit: wire.Admit, payload: bytes | None) -> None:
         """Schedule (or coalesce-attach) a remote admission and ack it."""
         try:
@@ -700,7 +700,7 @@ class OwnerRequestPlane:
             ack_payload,
         )
 
-    # --------------------------------------------------------- aborts / stops
+    # aborts / stops
     def _handle_abort(self, identity: bytes, message: wire.AbortReq) -> None:
         scheduled_abort: str | None = None
         with self._lock:
@@ -741,7 +741,7 @@ class OwnerRequestPlane:
         if mapped:
             self._apply_stop_strings(mapped)
 
-    # ---------------------------------------------- non-coalescable retirement
+    # non-coalescable retirement
     def _retire(self, owner_id: str) -> None:
         """Retire one owner child id; retire the group when its last child drains."""
         entry = self._owner_to_origin.pop(owner_id, None)
@@ -758,7 +758,7 @@ class OwnerRequestPlane:
                     self._origin_to_owner.pop((parent_entry[0], parent_entry[1]), None)
         self._refresh_needs_tee()
 
-    # ---------------------------------------------------------------- fan-out
+    # fan-out
     def _fan_out(self, engine_outputs) -> None:
         """Log and translate one step's outputs to every subscriber."""
         if not engine_outputs:
@@ -922,7 +922,7 @@ class OriginRequestPlane:
 
         coordinator.set_plane_handler(self._handle_inbound)
 
-    # -------------------------------------------------------------- admission
+    # admission
     def submit_remote(self, scheduler_requests: list[EngineRequest]) -> None:
         """Forward admission-built requests to the owner and await its acks.
 
@@ -1003,7 +1003,7 @@ class OriginRequestPlane:
                     self._child_to_parent.pop(child_id, None)
                     self._remote_ids.discard(child_id)
 
-    # ------------------------------------------------------------ engine forks
+    # engine forks
     def is_remote(self, request_id: str) -> bool:
         """Whether ``request_id`` (parent or sample child) is remotely owned."""
         with self._lock:
@@ -1068,7 +1068,7 @@ class OriginRequestPlane:
             slot.ack = wire.AdmitAck(request_id=parent_id, ok=False, error=reason)
             slot.event.set()
 
-    # ------------------------------------------------------------ inbound path
+    # inbound path
     def _handle_inbound(self, message: wire.WireMessage, payload: bytes | None) -> None:
         """Worker replay-thread handoff for plane wire messages."""
         if isinstance(message, wire.AdmitAck):

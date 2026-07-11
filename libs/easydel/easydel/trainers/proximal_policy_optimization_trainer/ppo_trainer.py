@@ -946,7 +946,7 @@ class PPOTrainer(Trainer):
         :func:`ppo_step` consumes:
 
         1. Generate completions from the prompt batch via
-           :meth:`generate_unified` using the *current* policy.
+           :meth:`rollout` using the *current* policy.
         2. Build the completion mask (optionally zeroing out completions
            that hit ``max_completion_length`` without an EOS when
            ``mask_truncated_completions`` is enabled).
@@ -999,7 +999,7 @@ class PPOTrainer(Trainer):
             prompt_ids, prompt_mask = batch["input_ids"], batch["attention_mask"]
 
             with capture_time() as generation_time_fn:
-                results = self.generate_unified(
+                results = self.rollout(
                     input_ids=prompt_ids,
                     attention_mask=prompt_mask,
                     state=state,

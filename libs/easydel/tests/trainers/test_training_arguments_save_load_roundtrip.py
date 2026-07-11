@@ -30,13 +30,12 @@ from typing import Any
 
 import jax.numpy as jnp
 import pytest
-from jax.sharding import PartitionSpec
-
 from easydel.infra.etils import EasyDeLOptimizers, EasyDeLSchedulers
 from easydel.infra.loss_utils import LossConfig
 from easydel.trainers.metrics import LogWatcher
 from easydel.trainers.pose import PoSEConfig
 from easydel.trainers.training_configurations import TrainingArguments
+from jax.sharding import PartitionSpec
 
 
 def _full_training_arguments_kwargs() -> dict[str, Any]:
@@ -48,13 +47,13 @@ def _full_training_arguments_kwargs() -> dict[str, Any]:
     stringification path that ``__post_init__`` later normalizes back.
     """
     return {
-        # ---- Identity / metadata ----
+        # Identity / metadata
         "model_name": "test-model-7b",
         "trainer_prefix": "RoundtripTest",
         "wandb_entity": "easydel-team",
         "wandb_name": "roundtrip-run",
         "use_wandb": False,
-        # ---- Core training schedule ----
+        # Core training schedule
         "learning_rate": 3e-5,
         "learning_rate_end": 1e-7,
         "num_train_epochs": 7,
@@ -71,7 +70,7 @@ def _full_training_arguments_kwargs() -> dict[str, Any]:
         "scheduler": EasyDeLSchedulers.COSINE,
         "trainable_selector": "parameters",
         "extra_optimizer_kwargs": {"b1": 0.9, "b2": 0.99},
-        # ---- Data loading ----
+        # Data loading
         "dataloader_num_workers": 8,
         "dataloader_pin_memory": True,
         "remove_unused_columns": False,
@@ -85,7 +84,7 @@ def _full_training_arguments_kwargs() -> dict[str, Any]:
         "offload_dataset": True,
         "offload_device_type": "cpu",
         "offload_device_index": 0,
-        # ---- Lifecycle flags ----
+        # Lifecycle flags
         "do_train": True,
         "do_eval": True,
         "do_last_save": False,
@@ -98,10 +97,10 @@ def _full_training_arguments_kwargs() -> dict[str, Any]:
         "step_start_point": 100,
         "force_step_start_point": True,
         "resume_if_possible": False,
-        # ---- Sequence handling ----
+        # Sequence handling
         "truncation_mode": "keep_start",
         "max_length": 8192,
-        # ---- Checkpointing ----
+        # Checkpointing
         "save_interval_minutes": 30.0,
         "save_steps": 500,
         "save_total_limit": 10,
@@ -111,10 +110,10 @@ def _full_training_arguments_kwargs() -> dict[str, Any]:
         "merge_lora_before_tpu_preemption_save": True,
         "save_tpu_preemption_checkpoints": False,
         "remove_ckpt_after_load": True,
-        # ---- Evaluation cadence ----
+        # Evaluation cadence
         "evaluation_steps": 200,
         "max_evaluation_steps": 100,
-        # ---- Logging cadence ----
+        # Logging cadence
         "log_steps": 25,
         "report_steps": 10,
         "log_all_workers": True,
@@ -126,17 +125,17 @@ def _full_training_arguments_kwargs() -> dict[str, Any]:
         "weight_distribution_log_steps": 250,
         "verbose": False,
         "process_zero_is_admin": False,
-        # ---- Backend / sharding ----
+        # Backend / sharding
         "backend": "tpu",
         "auto_shard_states": False,
         "performance_mode": False,  # avoids _setup_logging side-effects on use_wandb
         "track_memory": 0.5,
         "low_mem_usage": False,
-        # ---- QAT ----
+        # QAT
         "quantization_mode": "nf4",
         "quantization_group_size": 64,
         "quantization_bits": 4,
-        # ---- Loss / model ----
+        # Loss / model
         "model_parameters": {"hidden_size": 4096, "num_layers": 32},
         "frozen_parameters": r".*embed.*",
         "loss_config": LossConfig(label_smoothing=0.1, z_loss=1e-4, ignore_index=-100),
@@ -144,12 +143,12 @@ def _full_training_arguments_kwargs() -> dict[str, Any]:
         "jax_distributed_config": {"coordinator_address": "localhost:1234"},
         "step_partition_spec": PartitionSpec(("dp", "fsdp"), "sp"),
         "state_apply_fn_kwarguments_to_model": {"deterministic": False},
-        # ---- Sparsification ----
+        # Sparsification
         "sparsify_module": True,
         "sparse_module_type": "bcoo",
-        # ---- Optimizer momentum dtype ----
+        # Optimizer momentum dtype
         "tx_mu_dtype": jnp.bfloat16,
-        # ---- Generation preview ----
+        # Generation preview
         "generation_top_p": 0.92,
         "generation_top_k": 40,
         "generation_presence_penalty": 0.1,
@@ -171,13 +170,13 @@ def _full_training_arguments_kwargs() -> dict[str, Any]:
         "generation_preview_print": True,
         "generation_log_to_wandb": False,
         "log_training_generations_to_wandb": False,
-        # ---- Benchmarks (lm-eval suites) ----
+        # Benchmarks (lm-eval suites)
         "benchmark_interval": 500,
         "benchmarks": [
             {"name": "core", "tasks": ["hellaswag", "mmlu"], "limit": 50, "num_fewshot": 5},
             {"name": "math", "tasks": "gsm8k", "limit": 20},
         ],
-        # ---- eSurge generation integration ----
+        # eSurge generation integration
         "use_esurge_generation": False,
         "esurge_use_tqdm": False,
         "esurge_hbm_utilization": 0.6,
@@ -190,7 +189,7 @@ def _full_training_arguments_kwargs() -> dict[str, Any]:
         "esurge_max_num_batched_tokens": 4096,
         "esurge_enable_prefix_caching": True,
         "esurge_data_parallelism_axis": "dp",
-        # ---- Training buckets (runtime-only objects excluded from to_dict;
+        # Training buckets (runtime-only objects excluded from to_dict;
         # bucket_rule survives as a reconstructed BucketRule) ----
         "buckets": None,
         "bucket_datasets": None,

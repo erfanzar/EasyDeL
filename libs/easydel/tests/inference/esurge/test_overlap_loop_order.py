@@ -140,7 +140,7 @@ class _LoopHarness:
         self.aborts.append(exc)
         self.loop.request_stop()
 
-    # --- test driver ---
+    # test driver
     def run_until(self, predicate, timeout: float = JOIN_TIMEOUT_S) -> None:
         self.loop.start()
         deadline = time.monotonic() + timeout
