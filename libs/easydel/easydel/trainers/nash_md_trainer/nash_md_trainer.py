@@ -550,7 +550,7 @@ class NashMDTrainer(GRPOTrainer):
             prompt_mask = batch["attention_mask"]
 
             with capture_time() as generation_time_fn:
-                results = self.generate_unified(
+                results = self.rollout(
                     input_ids=prompt_ids,
                     attention_mask=prompt_mask,
                     state=state,
@@ -591,7 +591,7 @@ class NashMDTrainer(GRPOTrainer):
                 mixture_generate_kwargs = {}
                 if mixture_logits_processor is not None:
                     mixture_generate_kwargs["logits_processor"] = mixture_logits_processor
-                mixture_results = self.generate_unified(
+                mixture_results = self.rollout(
                     input_ids=prompt_ids,
                     attention_mask=prompt_mask,
                     state=mixture_state,

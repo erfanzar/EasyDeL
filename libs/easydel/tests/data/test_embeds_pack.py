@@ -55,7 +55,6 @@ import os
 import jax
 import numpy as np
 import pytest
-
 from easydel.data.transforms.collators import (
     _decode_row_embeds,
 )
@@ -161,7 +160,6 @@ def test_scatter_places_real_embeds(rows):
     """``merge_multimodal_embeddings`` replaces the k-th placeholder with the k-th decoded embed
     (left-to-right) and leaves every non-placeholder position equal to the original text embed."""
     import jax.numpy as jnp
-
     from easydel.modules.qwen3_vl.modeling_qwen3_vl import merge_multimodal_embeddings
 
     row = next(r for r in rows if int(r["n_images"]) > 0)
@@ -346,7 +344,6 @@ def _build_tiny_text_model(seq_cap: int, *, hidden_size: int = HIDDEN):
     """
     import jax.numpy as jnp
     import spectrax as spx
-
     from easydel.modules.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
     from easydel.modules.qwen3_5.qwen3_5_configuration import Qwen3_5TextConfig
 
@@ -383,7 +380,6 @@ def test_embeds_pack_e2e_no_vision_tower(rows):
     """End-to-end: scatter real embeds into synthetic text embeds, push the merged tensor through
     the real Qwen3.5 stack via ``inputs_embeds`` (vision tower skipped) and get finite logits."""
     import jax.numpy as jnp
-
     from easydel.modules.qwen3_vl.modeling_qwen3_vl import merge_multimodal_embeddings
 
     row = next(r for r in rows if int(r["n_images"]) > 0)
@@ -408,7 +404,6 @@ def _build_tiny_vl_model(seq_cap: int):
     """
     import jax.numpy as jnp
     import spectrax as spx
-
     from easydel.modules.qwen3_5.modeling_qwen3_5 import Qwen3_5Model
     from easydel.modules.qwen3_5.qwen3_5_configuration import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
 
@@ -444,7 +439,6 @@ def test_compute_embedding_scatters_precomputed_embeds(rows):
     and we compare those positions bit-for-bit (``equal_nan``) against the no-image baseline.
     """
     import jax.numpy as jnp
-
     from easydel.modules.qwen3_vl.modeling_qwen3_vl import merge_multimodal_embeddings
 
     row = next(r for r in rows if int(r["n_images"]) > 0)
@@ -467,7 +461,7 @@ def test_compute_embedding_scatters_precomputed_embeds(rows):
     assert np.array_equal(merged, reference, equal_nan=True), "model embedding entrypoint != standalone merge helper"
 
 
-# --- Remapped tiny-vocab scheme for the decoder-running tests (6-8) -------------------------
+# Remapped tiny-vocab scheme for the decoder-running tests (6-8)
 # Real ids (~248k) are out of range for a tiny embedding table -> NaN at text positions. We map
 # the structure-bearing tokens into a small vocab and leave everything else as one text filler id.
 _RM_VSTART, _RM_PLACE, _RM_VEND, _RM_VIDEO, _RM_TEXT = 1, 2, 3, 4, 5
@@ -524,7 +518,6 @@ def vl_remapped(rows):
     shared by the forward-equivalence and mRoPE tests."""
     import jax.numpy as jnp
     import spectrax as spx
-
     from easydel.modules.qwen3_5.modeling_qwen3_5 import Qwen3_5Model
 
     row = next(r for r in rows if int(r["n_images"]) > 0)
@@ -619,7 +612,6 @@ def test_for_conditional_generation_standard_call(rows):
     the wrapper's ``**kwargs`` into the base model and out through the head."""
     import jax.numpy as jnp
     import spectrax as spx
-
     from easydel.modules.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
 
     row = next(r for r in rows if int(r["n_images"]) > 0)
@@ -699,7 +691,6 @@ def test_compute_loss_and_grads_train_the_pack(rows):
     import jax
     import jax.numpy as jnp
     import spectrax as spx
-
     from easydel.modules.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
 
     row = next(r for r in rows if int(r["n_images"]) > 0)
@@ -783,7 +774,6 @@ def test_zero_image_batch_trains_with_none_and_empty_embeds():
     import jax
     import jax.numpy as jnp
     import spectrax as spx
-
     from easydel.modules.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
 
     S = 64
@@ -867,7 +857,6 @@ def test_get_rope_index_is_eager_only_under_jit():
     import jax
     import jax.numpy as jnp
     import spectrax as spx
-
     from easydel.modules.qwen3_5.modeling_qwen3_5 import Qwen3_5Model
 
     # Minimal grid-detected input: vision_start, then 4 placeholders (1x4x2 grid, merge 2 -> 1*2*1=2)...
@@ -911,11 +900,10 @@ def test_live_teacher_distillation_step_trains_student(rows):
     import jax.numpy as jnp
     import optax
     import spectrax as spx
-    from jax.sharding import PartitionSpec
-
     from easydel.infra.base_state import EasyDeLState
     from easydel.modules.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
     from easydel.trainers.distillation_trainer._fn import distillation_step
+    from jax.sharding import PartitionSpec
 
     row = next(r for r in rows if int(r["n_images"]) > 0)
     batch, _n_real = _remapped_pack_batch(row, pad_tail=0)
@@ -984,7 +972,6 @@ def test_bucketed_static_batch_jit_stable_no_rope_trace(rows):
     import jax
     import jax.numpy as jnp
     import spectrax as spx
-
     from easydel.modules.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
 
     # Two SHORTEST real image rows -> a small, fast CPU forward; the proof is shape-driven, not size-driven.
@@ -1058,7 +1045,6 @@ def test_two_image_row_both_images_inject_and_train(rows):
     import jax
     import jax.numpy as jnp
     import spectrax as spx
-
     from easydel.modules.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
 
     row = next((r for r in rows if int(r["n_images"]) == 2), None)
@@ -1126,7 +1112,6 @@ def test_real_loader_carries_bucket_collator_into_jitted_step():
     import jax.numpy as jnp
     import pyarrow.parquet as pq
     import spectrax as spx
-
     from easydel.data.execution.loader import AsyncDataLoader
     from easydel.data.sources.base import ParquetShardedSource
     from easydel.modules.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
@@ -1199,7 +1184,7 @@ def test_real_loader_carries_bucket_collator_into_jitted_step():
     assert np.isfinite(logits).all(), "real-loader bucket batch did not flow through the jitted step to finite logits"
 
 
-# --- packed-sequence collator (collate_packed_embeds) -------------------------------------------
+# packed-sequence collator (collate_packed_embeds)
 def _packable_row(
     text_len: int, imgs: list[int], source: str = "pixmo-points", area_bucket: int = 1024, slen_band: int | None = None
 ) -> dict:

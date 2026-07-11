@@ -48,7 +48,7 @@ from spectrax import with_sharding_constraint
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 
-from ..group_relative_policy_optimization._fn import get_per_token_logps
+from ..group_relative_policy_optimization._fn import _global_token_normalizer, get_per_token_logps
 from ..training_utils import (
     make_assertions_and_get_sizes,
     minibatch_call,
@@ -289,10 +289,16 @@ def sdpo_step(
 
         prompt_len = prompt_ids.shape[-1]
         completion_token_count = jnp.sum(completion_mask)
-        num_items = (
-            completion_token_count
-            if completion_was_truncated
-            else minibatch.get("num_items_in_batch", completion_token_count)
+        # `num_items_in_batch` is the full-batch token count (a 0-dim scalar that
+        # minibatch_call does not slice). Divide it by gradient_accumulation_steps
+        # so the K per-microbatch losses recombine correctly after minibatch_call's
+        # 1/K averaging; otherwise SDPO trains at 1/K the intended learning rate
+        # under gradient accumulation. See _global_token_normalizer.
+        num_items = _global_token_normalizer(
+            minibatch.get("num_items_in_batch"),
+            completion_token_count,
+            completion_was_truncated,
+            gradient_accumulation_steps,
         )
 
         use_full_vocab_loss = full_logit_distillation or distillation_topk is not None

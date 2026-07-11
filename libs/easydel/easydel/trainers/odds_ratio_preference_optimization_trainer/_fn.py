@@ -681,19 +681,21 @@ def orpo_step(
                 grad_fn=jax.value_and_grad(calculate_loss, has_aux=True),
             )
         with jax.named_scope(scope_root + "/update_state"):
+            # Log the learning rate for the CURRENT step BEFORE updating the state
+            # (update_state_respectfully increments state.step). Doing it after
+            # would report lr_fn(step + 1). Matches DPO/CPO/KTO/BCO ordering.
+            metrics = update_metrics(
+                metrics=metrics,
+                learning_rate_fn=learning_rate_fn,
+                step=state.step,
+                gradients=gradients,
+            )
             # Update model state with computed gradients.
             state = update_state_respectfully(
                 state=state,
                 gradients=gradients,
                 loss_config=loss_config,
                 metrics=metrics,
-            )
-            # Update metrics with learning rate and step information.
-            metrics = update_metrics(
-                metrics=metrics,
-                learning_rate_fn=learning_rate_fn,
-                step=state.step,
-                gradients=gradients,
             )
         return state, metrics
     else:

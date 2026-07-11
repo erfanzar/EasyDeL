@@ -200,11 +200,11 @@ def connect_tpus(
     mode = "gcloud" if tpu.is_gcloud_managed else "direct-IP"
     info(f"Connecting {tpu.num_hosts} hosts ({mode}) into Ray cluster...")
 
-    # --- Step 1: Clean existing Ray ---
+    # Step 1: Clean existing Ray
     info("Cleaning existing Ray processes on all hosts...")
     _cleanup_ray(tpu, ray_bin=ray_bin, user=user, ssh_key=ssh_key)
 
-    # --- Step 2: Start Ray head ---
+    # Step 2: Start Ray head
     head_resources = build_ray_resource_flags(tpu, is_head=True)
     ray_preamble = _ray_bin_preamble(ray_bin, strict=True)
     info(f"Starting Ray head on host 0 ({head_ip})...")
@@ -228,7 +228,7 @@ def connect_tpus(
         raise RuntimeError("Ray head failed to start")
     success("Ray head started")
 
-    # --- Step 3: Start Ray workers (parallel fan-out) ---
+    # Step 3: Start Ray workers (parallel fan-out)
     worker_resources = build_ray_resource_flags(tpu, is_head=False)
     if tpu.num_hosts > 1:
         # One reachability check for the head port; per-worker checks would
@@ -274,7 +274,7 @@ def connect_tpus(
             raise RuntimeError(f"{len(failed_workers)} Ray workers failed to start (e.g. {failed_workers[:8]})")
         success(f"All {tpu.num_hosts - 1} Ray workers started")
 
-    # --- Step 4: Wait for cluster readiness ---
+    # Step 4: Wait for cluster readiness
     info(f"Waiting for cluster readiness ({tpu.num_hosts} nodes, {ray_address})...")
     if not _wait_for_cluster(ray_address, tpu.num_hosts, timeout=timeout):
         error(f"Ray cluster did not become ready after {timeout}s")

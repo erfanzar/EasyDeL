@@ -469,6 +469,7 @@ def distillation_loss(
     cakld_gamma: float | None = None,
     loss_top_k: int = 0,
     loss_add_tail: bool = False,
+    shift_tokens: bool = True,
     partition_manager: tp.Any = None,
 ) -> tuple[Array, dict[str, Array]]:
     """Compute knowledge distillation loss between student and teacher models.
@@ -502,6 +503,15 @@ def distillation_loss(
             computes ``gamma * KL(p_student || p_teacher) + (1 - gamma) *
             KL(p_teacher || p_student)``. The scalar is intended to be the
             precomputed averaged teacher-token confidence described by CAKLD.
+        shift_tokens: When ``True`` (``LossConfig.shift_tokens`` default),
+            apply the causal shift before both the KL/JSD and the hard-label
+            CE terms: student/teacher logits drop the last time step
+            (``[:, :-1]``) while labels and the completion/attention mask drop
+            the first (``[:, 1:]``), so position ``t`` is trained against
+            token ``t + 1``. This matches ``ForCausalLMLoss`` (which shifts
+            internally) and the UNSHIFTED ``-100``/completion labels the
+            distillation trainer builds. When ``False``, logits at ``t`` are
+            trained against the label at ``t`` (no shift).
 
     Returns:
         tuple[Array, dict[str, Array]]: Scalar loss value combining distillation
@@ -522,6 +532,23 @@ def distillation_loss(
     teacher_logits = jax.lax.stop_gradient(teacher_logits)
     alpha_s = jnp.array(alpha, dtype=dtype)
     temp_sq = jnp.array(temperature * temperature, dtype=dtype)
+
+    # Causal shift (LossConfig.shift_tokens default). Position t predicts token t+1, so align the
+    # student/teacher distributions at [:, :-1] against labels[:, 1:] and the completion/attention
+    # mask[:, 1:] for BOTH the KL/JSD term and the hard-label CE term. This mirrors ForCausalLMLoss
+    # (which shifts internally) and the UNSHIFTED -100/completion labels the distillation trainer
+    # builds. Everything downstream (dense, vocab-parallel, chunked-in-caller, top-k, CAKLD) then
+    # operates on the shifted window, including the shard_map divisibility pads which re-read the
+    # now-shifted leading shapes.
+    if shift_tokens:
+        student_logits = student_logits[:, :-1]
+        teacher_logits = teacher_logits[:, :-1]
+        if labels is not None:
+            labels = labels[:, 1:]
+        if attention_mask is not None:
+            attention_mask = attention_mask[:, 1:]
+        if loss_mask is not None:
+            loss_mask = loss_mask[:, 1:]
 
     # Combined per-token loss mask: loss_mask > attention_mask, AND labels != -100.
     if loss_mask is not None:
@@ -979,6 +1006,7 @@ def chunked_distillation_loss(
     chunk_size: int = 128,
     checkpoint_chunks: bool = True,
     z_loss: float = 0.0,
+    shift_tokens: bool = True,
 ) -> tuple[Array, dict[str, Array]]:
     """Memory-efficient distillation loss that avoids materialising full logits.
 
@@ -1027,6 +1055,12 @@ def chunked_distillation_loss(
         checkpoint_chunks: When ``True``, ``jax.checkpoint`` the
             per-chunk body so vocab-sized logits are recomputed in
             the backward pass.
+        z_loss: Coefficient for the ``logsumexp(logits)**2`` regularizer.
+        shift_tokens: When ``True`` (``LossConfig.shift_tokens`` default),
+            drop the last hidden-state time step and the first label / mask
+            position so position ``t`` is trained against token ``t + 1``,
+            matching :func:`distillation_loss` and ``ForCausalLMLoss``. When
+            ``False``, no shift is applied.
 
     Returns:
         ``(total_loss, metrics)`` where ``metrics`` is a dict with
@@ -1034,6 +1068,21 @@ def chunked_distillation_loss(
         and ``ce_loss``.
     """
     dtype = student_hidden.dtype
+
+    # Causal shift (LossConfig.shift_tokens default), applied before chunking so every downstream
+    # term -- KL, hard-label CE, and the z-loss regularizer -- runs on the aligned window: position
+    # t predicts token t+1, i.e. student/teacher hidden[:, :-1] against labels[:, 1:] and the
+    # completion/attention mask[:, 1:]. Matches :func:`distillation_loss` and ForCausalLMLoss.
+    if shift_tokens:
+        student_hidden = student_hidden[:, :-1]
+        teacher_hidden = teacher_hidden[:, :-1]
+        if attention_mask is not None:
+            attention_mask = attention_mask[:, 1:]
+        if loss_mask is not None:
+            loss_mask = loss_mask[:, 1:]
+        if labels is not None:
+            labels = labels[:, 1:]
+
     B, L = student_hidden.shape[:2]
 
     # Pad sequence length to a multiple of chunk_size.
@@ -1435,6 +1484,7 @@ def distillation_step(
     )
     _tp_parallel = _stage_mesh is not None and "tp" in _stage_mesh.axis_names and _stage_mesh.shape["tp"] > 1
     _z_loss_coef = float(getattr(loss_config, "z_loss", 0.0) or 0.0) if loss_config is not None else 0.0
+    _shift_tokens = bool(getattr(loss_config, "shift_tokens", True)) if loss_config is not None else True
 
     def teacher_forward(input_batch: collections.abc.Mapping[str, jax.Array]) -> dict[str, tp.Any]:
         """Run the teacher in stop-gradient mode for one minibatch.
@@ -1612,6 +1662,7 @@ def distillation_step(
                 chunk_size=int(logits_chunk_size),
                 checkpoint_chunks=checkpoint_kl_loss,
                 z_loss=_z_loss_coef,
+                shift_tokens=_shift_tokens,
             )
         else:
             # If the vocabulary is tensor-parallel-sharded, route the KL/CE through the vocab-parallel
@@ -1637,6 +1688,7 @@ def distillation_step(
                 cakld_gamma=cakld_gamma,
                 loss_top_k=loss_top_k,
                 loss_add_tail=loss_add_tail,
+                shift_tokens=_shift_tokens,
                 partition_manager=partition_manager,
             )
         metrics_map: dict[str, jax.Array] = dict(loss_components)
@@ -1644,13 +1696,24 @@ def distillation_step(
         if _z_loss_coef and not use_chunked:
             # z-loss (coef * logsumexp(logits)^2, LossConfig.z_loss semantics)
             # on the raw student logits, averaged over the same valid tokens
-            # the KL uses (attention_mask AND completion_mask).
-            z_mask = jnp.ones(student_outputs.logits.shape[:2], dtype=jnp.float32)
-            if attention_mask is not None:
-                z_mask = z_mask * attention_mask.astype(jnp.float32)
-            if completion_mask is not None:
-                z_mask = z_mask * completion_mask.astype(jnp.float32)
-            lse = jax.nn.logsumexp(student_outputs.logits.astype(jnp.float32), axis=-1)
+            # the KL uses (attention_mask AND completion_mask). Apply the same
+            # causal shift as the KL/CE so this regularizer scores the same
+            # aligned prediction window (and stays parity with the chunked path).
+            z_logits = student_outputs.logits
+            z_attention_mask = attention_mask
+            z_completion_mask = completion_mask
+            if _shift_tokens:
+                z_logits = z_logits[:, :-1]
+                if z_attention_mask is not None:
+                    z_attention_mask = z_attention_mask[:, 1:]
+                if z_completion_mask is not None:
+                    z_completion_mask = z_completion_mask[:, 1:]
+            z_mask = jnp.ones(z_logits.shape[:2], dtype=jnp.float32)
+            if z_attention_mask is not None:
+                z_mask = z_mask * z_attention_mask.astype(jnp.float32)
+            if z_completion_mask is not None:
+                z_mask = z_mask * z_completion_mask.astype(jnp.float32)
+            lse = jax.nn.logsumexp(z_logits.astype(jnp.float32), axis=-1)
             z_value = (
                 jnp.asarray(_z_loss_coef, jnp.float32)
                 * jnp.sum(jnp.square(lse) * z_mask)
@@ -1883,6 +1946,8 @@ def _make_distillation_scheduled_loss(call):
     request_hidden_states = hidden_state_weight != 0.0
     request_attentions = attention_weight != 0.0
     teacher_state = call.get("teacher_state")
+    _loss_config = call.get("loss_config")
+    shift_tokens = bool(getattr(_loss_config, "shift_tokens", True)) if _loss_config is not None else True
 
     if hidden_state_loss != "mse":
         raise ValueError(f"Unsupported hidden state loss '{hidden_state_loss}'. Only 'mse' is available.")
@@ -1954,6 +2019,7 @@ def _make_distillation_scheduled_loss(call):
                     alpha=alpha,
                     chunk_size=int(logits_chunk_size),
                     checkpoint_chunks=checkpoint_kl_loss,
+                    shift_tokens=shift_tokens,
                 )
             else:
                 partition_manager = None
@@ -1973,6 +2039,7 @@ def _make_distillation_scheduled_loss(call):
                     cakld_gamma=cakld_gamma,
                     loss_top_k=loss_top_k,
                     loss_add_tail=loss_add_tail,
+                    shift_tokens=shift_tokens,
                     partition_manager=partition_manager,
                 )
 

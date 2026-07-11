@@ -254,9 +254,7 @@ class StopwatchActor:
         return self._times_per.get(name, 0) / self._counts_per.get(name, 1)
 
 
-# ---------------------------------------------------------------------------
 # Raylet / GCS log-spam guard
-# ---------------------------------------------------------------------------
 # Ray (<= 2.54) does not rotate the raylet/GCS component logs: a raylet stuck
 # in a retry loop (e.g. "Caller of RequestWorkerLease is dead" after killed
 # drivers) appends to ``raylet.out`` at tens of GB per hour until the node's

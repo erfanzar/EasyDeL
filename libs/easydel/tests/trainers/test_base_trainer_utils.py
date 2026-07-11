@@ -23,7 +23,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from easydel.data.core.protocols import ShardedDataSource, ShardInfo
 from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLPreemptionSignal
 from easydel.infra.loss_utils import LossMetrics
@@ -1362,7 +1361,7 @@ def test_maybe_generate_batches_prompts_and_maps_multiple_return_sequences():
 
     generate_calls: list[dict[str, object]] = []
 
-    def fake_generate_unified(
+    def fake_rollout(
         *,
         input_ids,
         attention_mask,
@@ -1401,7 +1400,7 @@ def test_maybe_generate_batches_prompts_and_maps_multiple_return_sequences():
             tool_calls=[[{"name": "lookup-0"}], None, [{"name": "lookup-2"}], []],
         )
 
-    trainer.generate_unified = fake_generate_unified
+    trainer.rollout = fake_rollout
 
     class _Model:
         def __init__(self):
@@ -1477,7 +1476,7 @@ def test_maybe_generate_skips_malformed_prompt_when_batching():
 
     generate_calls: list[dict[str, object]] = []
 
-    def fake_generate_unified(
+    def fake_rollout(
         *,
         input_ids,
         attention_mask,
@@ -1509,7 +1508,7 @@ def test_maybe_generate_skips_malformed_prompt_when_batching():
             completion_prompts=["Valid Prompt"],
         )
 
-    trainer.generate_unified = fake_generate_unified
+    trainer.rollout = fake_rollout
 
     class _Model:
         def pause_esurge(self, **kwargs):
@@ -1556,7 +1555,7 @@ def test_maybe_generate_prefers_completion_aligned_text_field():
     }
     trainer._batch_decode_tokens = lambda token_ids: ["decoded"]
 
-    def fake_generate_unified(
+    def fake_rollout(
         *,
         input_ids,
         attention_mask,
@@ -1581,7 +1580,7 @@ def test_maybe_generate_prefers_completion_aligned_text_field():
             tool_calls=[[{"name": "lookup", "arguments": "{}"}]],
         )
 
-    trainer.generate_unified = fake_generate_unified
+    trainer.rollout = fake_rollout
 
     class _Model:
         def pause_esurge(self, **kwargs):
@@ -1623,7 +1622,7 @@ def test_maybe_generate_ignores_rollout_metrics_and_still_runs_preview():
 
     generate_calls = 0
 
-    def fake_generate_unified(**kwargs):
+    def fake_rollout(**kwargs):
         del kwargs
         nonlocal generate_calls
         generate_calls += 1
@@ -1641,7 +1640,7 @@ def test_maybe_generate_ignores_rollout_metrics_and_still_runs_preview():
             completion_prompts=["Prompt 1"],
         )
 
-    trainer.generate_unified = fake_generate_unified
+    trainer.rollout = fake_rollout
 
     metrics = SimpleNamespace(
         other_metrics={
@@ -1654,7 +1653,7 @@ def test_maybe_generate_ignores_rollout_metrics_and_still_runs_preview():
     assert generate_calls >= 1
 
 
-def test_generate_unified_esurge_releases_all_generation_runtimes():
+def test_rollout_esurge_releases_all_generation_runtimes():
     trainer = object.__new__(_PreviewTrainer)
     trainer.arguments = SimpleNamespace(
         generation_max_new_tokens=2,
@@ -1739,7 +1738,7 @@ def test_generate_unified_esurge_releases_all_generation_runtimes():
     model = _Model(engine, other_engine)
     state = SimpleNamespace(model=model)
 
-    results = trainer.generate_unified(
+    results = trainer.rollout(
         prompts=["prompt-text"],
         state=state,
         use_esurge=True,
@@ -1764,7 +1763,7 @@ def test_generate_unified_esurge_releases_all_generation_runtimes():
     assert trainer.generate_function_with_model_kwargs is None
 
 
-def test_generate_unified_esurge_ignores_cleanup_failures_after_success():
+def test_rollout_esurge_ignores_cleanup_failures_after_success():
     trainer = object.__new__(_PreviewTrainer)
     trainer.arguments = SimpleNamespace(
         generation_max_new_tokens=2,
@@ -1840,7 +1839,7 @@ def test_generate_unified_esurge_ignores_cleanup_failures_after_success():
     model = _Model(engine)
     state = SimpleNamespace(model=model)
 
-    results = trainer.generate_unified(
+    results = trainer.rollout(
         prompts=["prompt-text"],
         state=state,
         use_esurge=True,
@@ -1855,7 +1854,7 @@ def test_generate_unified_esurge_ignores_cleanup_failures_after_success():
     assert engine.release_calls == 0
 
 
-def test_generate_unified_esurge_can_keep_runtime_alive():
+def test_rollout_esurge_can_keep_runtime_alive():
     trainer = object.__new__(_PreviewTrainer)
     trainer.arguments = SimpleNamespace(
         generation_max_new_tokens=2,
@@ -1926,7 +1925,7 @@ def test_generate_unified_esurge_can_keep_runtime_alive():
     model = _Model(engine)
     state = SimpleNamespace(model=model)
 
-    results = trainer.generate_unified(
+    results = trainer.rollout(
         prompts=["prompt-text"],
         state=state,
         use_esurge=True,
@@ -1942,7 +1941,7 @@ def test_generate_unified_esurge_can_keep_runtime_alive():
     assert engine.release_calls == []
 
 
-def test_generate_unified_esurge_cleans_up_after_post_generation_failure():
+def test_rollout_esurge_cleans_up_after_post_generation_failure():
     trainer = object.__new__(_PreviewTrainer)
     trainer.arguments = SimpleNamespace(
         generation_max_new_tokens=2,
@@ -2008,7 +2007,7 @@ def test_generate_unified_esurge_cleans_up_after_post_generation_failure():
     state = SimpleNamespace(model=model)
 
     with pytest.raises(AttributeError, match="outputs"):
-        trainer.generate_unified(
+        trainer.rollout(
             prompts=["prompt-text"],
             state=state,
             use_esurge=True,
@@ -2022,7 +2021,7 @@ def test_generate_unified_esurge_cleans_up_after_post_generation_failure():
     assert model.pause_esurge_calls == 0
 
 
-def test_generate_unified_esurge_propagates_generation_penalties():
+def test_rollout_esurge_propagates_generation_penalties():
     trainer = object.__new__(_PreviewTrainer)
     trainer.arguments = SimpleNamespace(
         generation_max_new_tokens=2,
@@ -2092,7 +2091,7 @@ def test_generate_unified_esurge_propagates_generation_penalties():
     model = _Model(engine)
     state = SimpleNamespace(model=model)
 
-    trainer.generate_unified(
+    trainer.rollout(
         prompts=["prompt-text"],
         state=state,
         use_esurge=True,
@@ -2114,7 +2113,7 @@ def test_generate_unified_esurge_propagates_generation_penalties():
     assert sampling_params.repetition_penalty == pytest.approx(1.4)
 
 
-def test_generate_unified_compiled_populates_completion_aligned_text_fields():
+def test_rollout_compiled_populates_completion_aligned_text_fields():
     trainer = object.__new__(_PreviewTrainer)
     trainer.arguments = SimpleNamespace(
         generation_max_new_tokens=2,
@@ -2157,7 +2156,7 @@ def test_generate_unified_compiled_populates_completion_aligned_text_fields():
 
     trainer.generate_aio = fake_generate_aio
 
-    results = trainer.generate_unified(
+    results = trainer.rollout(
         input_ids=jnp.asarray([[11, 12, 0]], dtype=jnp.int32),
         attention_mask=jnp.asarray([[1, 1, 0]], dtype=jnp.int32),
         state=trainer.model_state,
@@ -2236,7 +2235,7 @@ def test_maybe_generate_falls_back_to_per_prompt_after_batch_failure():
 
     call_shapes: list[tuple[int, int]] = []
 
-    def fake_generate_unified(
+    def fake_rollout(
         *,
         input_ids,
         attention_mask,
@@ -2267,7 +2266,7 @@ def test_maybe_generate_falls_back_to_per_prompt_after_batch_failure():
             completion_prompts=["Good Prompt"],
         )
 
-    trainer.generate_unified = fake_generate_unified
+    trainer.rollout = fake_rollout
 
     class _Model:
         def pause_esurge(self, **kwargs):

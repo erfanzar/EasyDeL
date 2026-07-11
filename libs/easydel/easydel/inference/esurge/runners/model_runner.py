@@ -833,7 +833,7 @@ class eSurgeRunner:
         except Exception as e:
             logger.debug(f"Could not generate startup summary: {e}")
 
-    # --- Perf-tracker passthroughs -------------------------------------------------
+    # Perf-tracker passthroughs
     # The perf state lives on ``self.perf`` (:class:`RunnerPerfTracker`). The
     # historical ``_perf_*`` attribute names are kept as thin properties because
     # both the execute path and external readers (scripts/bench_esurge.py,
@@ -912,7 +912,7 @@ class eSurgeRunner:
         """Bounded deque of per-step phase-timing dicts (read by bench_esurge)."""
         return self.perf.phase_history
 
-    # --- Speculative-decoding passthroughs -------------------------------------------
+    # Speculative-decoding passthroughs
     # The draft/verify/commit machinery lives on ``self.spec`` (NullSpeculation or
     # DrafterSpeculation). The historical runner attribute names are kept as thin
     # delegating properties so the engine, benchmarks, and external tests are
@@ -1587,7 +1587,7 @@ class eSurgeRunner:
         )
         return
 
-    # --- VLM prefill passthroughs ---------------------------------------------------
+    # VLM prefill passthroughs
     # The VLM prefill machinery lives on ``self.vlm`` (:class:`VlmPrefillHelper`).
     # The historical runner method/attribute names are kept as thin delegators
     # and properties so _execute_model_impl, compile(), weight-update paths, and

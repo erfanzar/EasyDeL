@@ -355,7 +355,7 @@ class GFPOTrainer(GRPOTrainer):
         that inserts the GFPO filtering stage after reward computation
         but before group-relative advantages are derived. The pipeline:
 
-        1. Run :meth:`generate_unified` to sample ``num_generations``
+        1. Run :meth:`rollout` to sample ``num_generations``
            completions per prompt.
         2. Build ``completion_mask`` (optionally zeroing out
            non-EOS-terminated completions).
@@ -404,7 +404,7 @@ class GFPOTrainer(GRPOTrainer):
             )
 
             with capture_time() as generation_time_fn:
-                results = self.generate_unified(
+                results = self.rollout(
                     input_ids=prompt_ids,
                     attention_mask=prompt_mask,
                     model_kwargs=prompt_model_kwargs,

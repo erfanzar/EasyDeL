@@ -240,11 +240,11 @@ def embedding_training_step(
     streams through the same encoder module, then computes the
     selected contrastive loss. With ``matryoshka_dims`` set, the loss
     is evaluated at every requested truncation dim and averaged
-    (Matryoshka Representation Learning). The encoder is run in
-    ``eval()`` mode inside the loss closure so dropout-style noise
-    does not pollute the embeddings (it is, however, still
-    differentiated against -- only the internal stochastic layers are
-    disabled).
+    (Matryoshka Representation Learning). The encoder runs in the
+    module's default (train) mode inside the training loss closure, so
+    any dropout configured on the encoder is active during embedding
+    training; the eval path (``base_step``) is what switches to
+    ``eval()``.
 
     The batch must carry tokenised ``query_*`` and ``positive_*``
     streams; ``negative_*`` is optional and triggers explicit hard

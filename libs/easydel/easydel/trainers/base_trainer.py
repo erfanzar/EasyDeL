@@ -299,6 +299,37 @@ class GenerationResults(NamedTuple):
     finish_reason: list[str | None] | None = None
 
 
+class _EsurgeGenerationArrays(NamedTuple):
+    """Reconstructed token arrays and per-completion records from eSurge outputs.
+
+    Attributes:
+        prompt_ids: Left-padded prompt token IDs.
+        prompt_mask: Attention mask aligned with ``prompt_ids``.
+        sequences: Full prompt+completion sequences sliced to
+            ``prompt_len + completion_len``.
+        completion_ids: Right-padded completion token IDs.
+        completion_mask: Attention mask aligned with ``completion_ids``.
+        output_records: Visible completion text per completion.
+        reasoning_records: Parsed reasoning text per completion.
+        tool_call_records: Parsed tool-call payloads per completion.
+        raw_output_records: Raw completion text per completion.
+        finish_reason_records: Per-completion stop reason.
+        completion_prompts: Prompt objects aligned one-to-one with completions.
+    """
+
+    prompt_ids: jax.Array
+    prompt_mask: jax.Array
+    sequences: jax.Array
+    completion_ids: jax.Array
+    completion_mask: jax.Array
+    output_records: list[str]
+    reasoning_records: list[str | None]
+    tool_call_records: list[list | None]
+    raw_output_records: list[str]
+    finish_reason_records: list[str | None]
+    completion_prompts: list[str | list[dict[str, str]]]
+
+
 class BaseTrainer(BaseTrainerProtocol):
     """
     Base trainer class implementing core training functionality for EasyDeL models.
@@ -617,7 +648,7 @@ class BaseTrainer(BaseTrainerProtocol):
         self._train_source = self._to_sharded_source(dataset_train)
         self._eval_source = self._to_sharded_source(dataset_eval)
 
-        # --- Training buckets (optional) -------------------------------------
+        # Training buckets (optional)
         # Constructor kwargs take precedence over TrainingArguments fields.
         # buckets / bucket_datasets may each be None independently; bucket_rule
         # is required when buckets are set.
@@ -3178,7 +3209,7 @@ class BaseTrainer(BaseTrainerProtocol):
 
         This is intentionally opt-in per generation call. Some trainers perform
         multiple back-to-back generations (for example policy then reference
-        rollouts), so unconditional teardown inside `generate_unified` would
+        rollouts), so unconditional teardown inside `rollout` would
         introduce avoidable resume/rebuild churn.
         """
         if not release_runtime_after_generation:
@@ -3193,7 +3224,7 @@ class BaseTrainer(BaseTrainerProtocol):
         )
         return results
 
-    def generate_unified(
+    def rollout(
         self,
         input_ids: jax.Array | np.ndarray | None = None,
         attention_mask: jax.Array | np.ndarray | None = None,
@@ -3252,20 +3283,20 @@ class BaseTrainer(BaseTrainerProtocol):
 
         Example:
             >>> # Generate from token IDs (GRPO-style, no chat template)
-            >>> results = trainer.generate_unified(
+            >>> results = trainer.rollout(
             ...     input_ids=prompt_ids,
             ...     attention_mask=mask,
             ...     apply_chat_template=False  # Raw generation
             ... )
             >>>
             >>> # Generate with chat template (preview generation)
-            >>> results = trainer.generate_unified(
+            >>> results = trainer.rollout(
             ...     prompts="Explain quantum computing",
             ...     apply_chat_template=True  # Applies chat template
             ... )
             >>>
             >>> # eSurge with chat format
-            >>> results = trainer.generate_unified(
+            >>> results = trainer.rollout(
             ...     prompts=[{"role": "user", "content": "Hello"}],
             ...     use_esurge=True
             ... )
@@ -3305,6 +3336,58 @@ class BaseTrainer(BaseTrainerProtocol):
             )
             use_esurge = False
         pad_token_id = self._pad_token_id
+        sampling_params = self._build_generation_sampling_params(args, config_overrides)
+
+        if use_esurge:
+            return self._generate_via_esurge(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                prompts=prompts,
+                processor=processor,
+                pad_token_id=pad_token_id,
+                sampling_params=sampling_params,
+                state=state,
+                apply_chat_template=apply_chat_template,
+                all_gather=all_gather,
+                release_runtime_after_generation=release_runtime_after_generation,
+                clear_esurge_compiled_cache_after_generation=clear_esurge_compiled_cache_after_generation,
+            )
+        return self._generate_via_compiled(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            prompts=prompts,
+            processor=processor,
+            pad_token_id=pad_token_id,
+            sampling_params=sampling_params,
+            state=state,
+            apply_chat_template=apply_chat_template,
+            generation_config=generation_config,
+            shard_inputs=shard_inputs,
+            config_overrides=config_overrides,
+            normalized_model_kwargs=normalized_model_kwargs,
+            has_model_kwargs=has_model_kwargs,
+            all_gather=all_gather,
+            release_runtime_after_generation=release_runtime_after_generation,
+            clear_esurge_compiled_cache_after_generation=clear_esurge_compiled_cache_after_generation,
+            generate_kwargs=generate_kwargs,
+        )
+
+    def _build_generation_sampling_params(self, args, config_overrides) -> SamplingParams:
+        """Build sampling params for unified generation from trainer args + overrides.
+
+        Reproduces the historical inline logic: resolve ``max_tokens`` from
+        ``generation_max_new_tokens`` -> ``max_completion_length`` -> ``1024``,
+        construct :class:`SamplingParams`, then apply any per-call
+        ``config_overrides``.
+
+        Args:
+            args: The resolved :class:`TrainingArguments`.
+            config_overrides: Optional overrides keyed by generation config name;
+                ``None``/empty leaves the sampling params untouched.
+
+        Returns:
+            SamplingParams: The sampling parameters for this generation call.
+        """
         max_tokens = args.generation_max_new_tokens
         if max_tokens is None:
             max_tokens = getattr(args, "max_completion_length", None)
@@ -3321,464 +3404,569 @@ class BaseTrainer(BaseTrainerProtocol):
             n=args.generation_num_return_sequences or 1,
         )
         if config_overrides:
-            max_new_tokens = config_overrides.get("max_new_tokens")
-            if max_new_tokens is not None:
-                sampling_params.max_tokens = int(max_new_tokens)
-            temperature = config_overrides.get("temperature")
-            if temperature is not None:
-                sampling_params.temperature = float(temperature)
-            top_p = config_overrides.get("top_p")
-            if top_p is not None:
-                sampling_params.top_p = float(top_p)
-            top_k = config_overrides.get("top_k")
-            if top_k is not None:
-                sampling_params.top_k = int(top_k)
-            num_return_sequences = config_overrides.get("num_return_sequences")
-            if num_return_sequences is not None:
-                sampling_params.n = int(num_return_sequences)
-            presence_penalty = config_overrides.get("presence_penalty")
-            if presence_penalty is not None:
-                sampling_params.presence_penalty = float(presence_penalty)
-            frequency_penalty = config_overrides.get("frequency_penalty")
-            if frequency_penalty is not None:
-                sampling_params.frequency_penalty = float(frequency_penalty)
-            repetition_penalty = config_overrides.get("repetition_penalty")
-            if repetition_penalty is not None:
-                sampling_params.repetition_penalty = float(repetition_penalty)
+            override_map = {
+                "max_new_tokens": ("max_tokens", int),
+                "temperature": ("temperature", float),
+                "top_p": ("top_p", float),
+                "top_k": ("top_k", int),
+                "num_return_sequences": ("n", int),
+                "presence_penalty": ("presence_penalty", float),
+                "frequency_penalty": ("frequency_penalty", float),
+                "repetition_penalty": ("repetition_penalty", float),
+            }
+            for key, (attr, cast) in override_map.items():
+                value = config_overrides.get(key)
+                if value is not None:
+                    setattr(sampling_params, attr, cast(value))
+        return sampling_params
 
-        # Handle eSurge generation path
-        if use_esurge:
-            # When the caller provides tokenized prompts, respect their prompt length for
-            # eSurge padding/sequence construction. Using `args.max_length` here can lead
-            # to sequences where completions are truncated away when `args.max_length`
-            # exceeds the provided `input_ids` length (common in RL trainers where
-            # `input_ids` is padded to `max_prompt_length`, not `max_length`).
-            prompt_seq_len = None
-            if input_ids is not None:
-                try:
-                    prompt_seq_len = int(input_ids.shape[-1])
-                except Exception:  # pragma: no cover - defensive: odd prompt containers
-                    prompt_seq_len = None
+    def _esurge_outputs_to_arrays(
+        self,
+        outputs,
+        *,
+        input_ids,
+        attention_mask,
+        return_prompts,
+        pad_token_id,
+        max_seq_len,
+        max_new_tokens,
+    ) -> _EsurgeGenerationArrays:
+        """Reconstruct padded token arrays and per-completion records from eSurge outputs.
 
-            if prompts is None:
-                decoded_prompts = self._decode_prompt_batch(
-                    processor,
-                    input_ids,
-                    False,
-                    pad_token_id,
-                    True,
-                    attention_mask,
-                )
-                prompts = self._normalize_esurge_prompts(decoded_prompts, apply_chat_template)
-            else:
-                prompts = self._normalize_esurge_prompts(prompts, apply_chat_template)
-            return_prompts = prompts
-            if not prompts:
-                raise ValueError("No prompts available for eSurge generation")
+        Pure code motion of the array-building block that formerly lived inline
+        in the eSurge branch of :meth:`rollout`.
 
-            esurge_kwargs = self._esurge_init_kwargs()
-            effective_prompt_len = prompt_seq_len if prompt_seq_len is not None else (args.max_length or 2048)
-            # eSurge reserves a few tokens from the context budget (defaults to
-            # `reserve_tokens = max_num_seqs`). When we tightly pack
-            # `prompt_len + max_new_tokens == max_model_len` (common in PPO/GRPO
-            # rollouts where prompt is padded to max_prompt_length), eSurge will
-            # cap max_new_tokens by the reserve amount. Include the reserve in
-            # the requested max_model_len so the user-visible generation length
-            # stays consistent with `max_new_tokens`.
-            reserve_tokens = esurge_kwargs.get("reserve_tokens")
-            if reserve_tokens is None:
-                reserve_tokens = esurge_kwargs.get("max_num_seqs", 0)
-            esurge_kwargs["max_model_len"] = sampling_params.max_tokens + effective_prompt_len + int(reserve_tokens or 0)  # pyright: ignore[reportOptionalOperand]
+        Args:
+            outputs: The list of eSurge ``RequestOutput`` objects.
+            input_ids: Caller-supplied tokenized prompts, or ``None``.
+            attention_mask: Attention mask aligned with ``input_ids``, or ``None``.
+            return_prompts: Normalized prompts used as the per-request fallback
+                ``source_prompt``.
+            pad_token_id: Pad token id used for left/right padding and prompt
+                signature matching.
+            max_seq_len: Prompt sequence length arrays are padded to.
+            max_new_tokens: Completion length arrays are padded/truncated to.
 
-            _log_kwargs = {k: v for k, v in esurge_kwargs.items() if k != "tokenizer"}
-            logger.info_once(f"Creating eSurge {pprint.pformat(_log_kwargs)}")
-            logger.info_once(
-                f"SamplingParams(max_tokens={sampling_params.max_tokens},"
-                f" temperature={sampling_params.temperature},"
-                f" top_p={sampling_params.top_p},"
-                f" top_k={sampling_params.top_k},"
-                f" presence_penalty={sampling_params.presence_penalty},"
-                f" frequency_penalty={sampling_params.frequency_penalty},"
-                f" repetition_penalty={sampling_params.repetition_penalty},"
-                f" n={sampling_params.n})"
+        Returns:
+            _EsurgeGenerationArrays: The reconstructed arrays and record lists.
+        """
+        # Build padded token arrays from eSurge outputs to ensure consistent shapes
+        max_total_len = max_seq_len + max_new_tokens
+
+        # Track prompt arrays once per request
+        prompt_id_rows: list[list[int]] = []
+        prompt_mask_rows: list[list[int]] = []
+        sequence_rows: list[list[int]] = []
+        completion_id_rows: list[list[int]] = []
+        completion_mask_rows: list[list[int]] = []
+        output_records: list[str] = []
+        reasoning_records: list[str | None] = []
+        tool_call_records: list[list | None] = []
+        raw_output_records: list[str] = []
+        finish_reason_records: list[str | None] = []
+        completion_prompts: list[str | list[dict[str, str]]] = []
+        prompt_indices: list[int | None] = []
+
+        def _strip_pad(tokens: list[int] | np.ndarray) -> tuple[int, ...]:
+            """Remove pad tokens for matching prompts across shuffled eSurge outputs."""
+            arr = np.asarray(tokens, dtype=np.int64).tolist()
+            return tuple(int(t) for t in arr if pad_token_id is None or t != pad_token_id)
+
+        # If caller supplied tokenized prompts, keep them as-is for return values
+        if input_ids is not None:
+            base_prompt_ids = np.asarray(input_ids, dtype=np.int32)
+            if base_prompt_ids.ndim == 1:
+                base_prompt_ids = base_prompt_ids[None, :]
+            base_prompt_mask = (
+                np.ones_like(base_prompt_ids, dtype=np.int32)
+                if attention_mask is None
+                else np.asarray(attention_mask, dtype=np.int32)
             )
-            esurge_engine = None
-
-            def _cleanup_failed_esurge_generation() -> None:
-                """Best-effort teardown of an eSurge engine after a generation failure.
-
-                Pauses the engine and optionally releases its model state /
-                compiled cache so the next training step starts from a clean
-                slate.  All exceptions are swallowed since this runs on the
-                error path.
-                """
-                if esurge_engine is None:
-                    try:
-                        # If setup failed before returning an engine handle, fall back to
-                        # model-level pause to clean any partially initialized cached engine.
-                        state.model.pause_esurge()
-                    except Exception as cleanup_exc:  # pragma: no cover - best-effort resource cleanup
-                        log_debug_maybe(f"Failed to pause eSurge engine(s) after setup failure: {cleanup_exc}")
-                    return
-
-                try:
-                    esurge_engine.pause()
-                    if hasattr(esurge_engine, "release_model_state"):
-                        esurge_engine.release_model_state(
-                            clear_compiled_cache=clear_esurge_compiled_cache_after_generation
-                        )
-                except Exception as cleanup_exc:  # pragma: no cover - best-effort resource cleanup
-                    log_debug_maybe(f"Failed to pause/release eSurge engine after generation failure: {cleanup_exc}")
-
-            try:
-                esurge_engine = state.model.get_esurge(**esurge_kwargs)
-                # Use the resolved engine directly to avoid a second get_esurge()/refresh pass.
-                outputs: list[RequestOutput] = state.model._call_esurge_engine(
-                    esurge_engine,
-                    prompts=prompts,
-                    sampling_params=sampling_params,
-                    stream=False,
-                    use_tqdm=args.esurge_use_tqdm,
-                )
-            except Exception:
-                _cleanup_failed_esurge_generation()
-                raise
-
-            try:
-                # Build padded token arrays from eSurge outputs to ensure consistent shapes
-                max_seq_len = prompt_seq_len if prompt_seq_len is not None else (args.max_length or 2048)
-                max_new_tokens = sampling_params.max_tokens if sampling_params.max_tokens is not None else 1024
-                max_total_len = max_seq_len + max_new_tokens
-
-                # Track prompt arrays once per request
-                prompt_id_rows: list[list[int]] = []
-                prompt_mask_rows: list[list[int]] = []
-                sequence_rows: list[list[int]] = []
-                completion_id_rows: list[list[int]] = []
-                completion_mask_rows: list[list[int]] = []
-                output_records: list[str] = []
-                reasoning_records: list[str | None] = []
-                tool_call_records: list[list | None] = []
-                raw_output_records: list[str] = []
-                finish_reason_records: list[str | None] = []
-                completion_prompts: list[str | list[dict[str, str]]] = []
-                prompt_indices: list[int | None] = []
-
-                def _strip_pad(tokens: list[int] | np.ndarray) -> tuple[int, ...]:
-                    """Remove pad tokens for matching prompts across shuffled eSurge outputs."""
-                    arr = np.asarray(tokens, dtype=np.int64).tolist()
-                    return tuple(int(t) for t in arr if pad_token_id is None or t != pad_token_id)
-
-                # If caller supplied tokenized prompts, keep them as-is for return values
-                if input_ids is not None:
-                    base_prompt_ids = np.asarray(input_ids, dtype=np.int32)
-                    if base_prompt_ids.ndim == 1:
-                        base_prompt_ids = base_prompt_ids[None, :]
-                    base_prompt_mask = (
-                        np.ones_like(base_prompt_ids, dtype=np.int32)
-                        if attention_mask is None
-                        else np.asarray(attention_mask, dtype=np.int32)
-                    )
-                    for row in base_prompt_ids:
-                        prompt_id_rows.append(list(row))
-                    for row in base_prompt_mask:
-                        prompt_mask_rows.append(list(row))
-                    prompt_signature_map: dict[tuple[int, ...], list[int]] = {}
-                    for idx, row in enumerate(base_prompt_ids):
-                        sig = _strip_pad(row)
-                        prompt_signature_map.setdefault(sig, []).append(idx)
-                else:
-                    prompt_signature_map = {}
-
-                # When n>1, each RequestOutput has multiple CompletionOutput objects
-                for output_idx, output in enumerate(outputs):
-                    # Flatten and truncate prompt tokens
-                    flattened_prompt_tokens: list[int] = []
-                    if output.prompt_token_ids:
-                        for segment in output.prompt_token_ids:
-                            flattened_prompt_tokens.extend(segment)
-                    base_prompt_tokens = flattened_prompt_tokens[:max_seq_len]
-                    base_prompt_len = len(base_prompt_tokens)
-                    prompt_padding = max_seq_len - base_prompt_len
-
-                    # Left-pad prompts for RL training
-                    padded_prompt_ids = [pad_token_id] * prompt_padding + base_prompt_tokens
-                    padded_prompt_mask = [0] * prompt_padding + [1] * base_prompt_len
-                    if input_ids is None:
-                        # When prompts were strings, this represents the canonical prompt ids/masks.
-                        prompt_id_rows.append(padded_prompt_ids)
-                        prompt_mask_rows.append(padded_prompt_mask)
-
-                    mapped_prompt_idx = None
-                    if prompt_signature_map:
-                        sig = _strip_pad(base_prompt_tokens)
-                        if prompt_signature_map.get(sig):
-                            mapped_prompt_idx = prompt_signature_map[sig].pop(0)
-                            if not prompt_signature_map[sig]:
-                                prompt_signature_map.pop(sig, None)
-
-                    source_prompt = getattr(output, "prompt", return_prompts[output_idx] if return_prompts else None)
-
-                    # Process each completion (handles n>1 sampling)
-                    for completion in output.outputs:
-                        completion_prompts.append(source_prompt)
-                        prompt_indices.append(mapped_prompt_idx)
-                        completion_text = getattr(completion, "text", None)
-                        if not isinstance(completion_text, str) or completion_text == "":
-                            output_get_text = getattr(output, "get_text", None)
-                            output_fallback_text = output_get_text() if callable(output_get_text) else ""
-                            completion_text = getattr(output, "accumulated_text", "") or output_fallback_text
-                        output_records.append(completion_text)
-
-                        completion_reasoning = getattr(completion, "reasoning_content", None)
-                        reasoning_records.append(completion_reasoning if isinstance(completion_reasoning, str) else None)
-
-                        completion_tool_calls = getattr(completion, "tool_calls", None)
-                        tool_call_records.append(completion_tool_calls if completion_tool_calls is not None else None)
-
-                        completion_raw_text = getattr(completion, "raw_text", None)
-                        if not isinstance(completion_raw_text, str) or completion_raw_text == "":
-                            output_get_text = getattr(output, "get_text", None)
-                            output_fallback_text = output_get_text() if callable(output_get_text) else ""
-                            completion_raw_text = (
-                                getattr(output, "raw_accumulated_text", "")
-                                or getattr(output, "accumulated_text", "")
-                                or output_fallback_text
-                            )
-                        raw_output_records.append(completion_raw_text)
-
-                        completion_finish_reason = getattr(completion, "finish_reason", None)
-                        finish_reason_records.append(
-                            completion_finish_reason if isinstance(completion_finish_reason, str) else None
-                        )
-
-                        completion_tokens: list[int] = []
-                        if completion:
-                            completion_tokens = list(getattr(completion, "token_ids", []) or [])
-
-                        if len(completion_tokens) > max_new_tokens:
-                            completion_tokens = completion_tokens[:max_new_tokens]
-
-                        completion_len = len(completion_tokens)
-                        completion_padding = max_new_tokens - completion_len
-                        padded_completion_ids = completion_tokens + [pad_token_id] * completion_padding
-                        padded_completion_mask = [1] * completion_len + [0] * completion_padding
-
-                        completion_id_rows.append(padded_completion_ids)
-                        completion_mask_rows.append(padded_completion_mask)
-
-                        sequence_tokens = [pad_token_id] * prompt_padding + base_prompt_tokens + completion_tokens
-                        remaining_padding = max_total_len - len(sequence_tokens)
-                        sequence_rows.append(sequence_tokens + [pad_token_id] * remaining_padding)
-
-                if not sequence_rows:
-                    raise RuntimeError("eSurge generation returned no completions")
-                if not prompt_id_rows or not prompt_mask_rows:
-                    raise RuntimeError("Could not determine prompt token metadata for eSurge generation")
-
-                if prompt_indices:
-                    num_prompts = len(prompt_id_rows)
-                    per_prompt: list[list[int]] = [[] for _ in range(num_prompts)]
-                    unmatched: list[int] = []
-                    for i, pidx in enumerate(prompt_indices):
-                        if pidx is None or pidx < 0 or pidx >= num_prompts:
-                            unmatched.append(i)
-                        else:
-                            per_prompt[pidx].append(i)
-                    new_order = [idx for group in per_prompt for idx in group] + unmatched
-                    completion_id_rows = [completion_id_rows[i] for i in new_order]
-                    completion_mask_rows = [completion_mask_rows[i] for i in new_order]
-                    completion_prompts = [completion_prompts[i] for i in new_order]
-                    output_records = [output_records[i] for i in new_order]
-                    reasoning_records = [reasoning_records[i] for i in new_order]
-                    tool_call_records = [tool_call_records[i] for i in new_order]
-                    raw_output_records = [raw_output_records[i] for i in new_order]
-                    finish_reason_records = [finish_reason_records[i] for i in new_order]
-                    sequence_rows = [sequence_rows[i] for i in new_order]
-
-                base_prompt_ids = jnp.array(np.asarray(prompt_id_rows, dtype=np.int32))
-                base_prompt_mask = jnp.array(np.asarray(prompt_mask_rows, dtype=np.int32))
-                prompt_ids = base_prompt_ids
-                prompt_mask = base_prompt_mask
-
-                sequences = jnp.array(np.asarray(sequence_rows, dtype=np.int32))
-                completion_ids = jnp.array(np.asarray(completion_id_rows, dtype=np.int32))
-                completion_mask = jnp.array(np.asarray(completion_mask_rows, dtype=np.int32))
-                total_seq_len = prompt_ids.shape[-1] + completion_ids.shape[-1]
-                sequences = sequences[:, :total_seq_len]
-
-                if all_gather:
-                    sequences = self._all_gather(sequences)
-                    prompt_ids = self._all_gather(prompt_ids)
-                    prompt_mask = self._all_gather(prompt_mask)
-                    completion_ids = self._all_gather(completion_ids)
-                    completion_mask = self._all_gather(completion_mask)
-                results = self.maybe_release_generation_runtime(
-                    GenerationResults(
-                        generation_results=output_records,
-                        prompt_ids=prompt_ids,
-                        prompt_mask=prompt_mask,
-                        sequences=sequences,
-                        completion_ids=completion_ids,
-                        completion_mask=completion_mask,
-                        decoded_prompts=return_prompts,
-                        completion_prompts=completion_prompts,
-                        text=output_records,
-                        reasoning=reasoning_records,
-                        tool_calls=tool_call_records,
-                        raw_text=raw_output_records,
-                        finish_reason=finish_reason_records,
-                    ),
-                    state=state,
-                    release_runtime_after_generation=release_runtime_after_generation,
-                    clear_esurge_compiled_cache_after_generation=clear_esurge_compiled_cache_after_generation,
-                )
-            except Exception:
-                _cleanup_failed_esurge_generation()
-                raise
-            return results
-
-        # Handle compiled generation path
+            for row in base_prompt_ids:
+                prompt_id_rows.append(list(row))
+            for row in base_prompt_mask:
+                prompt_mask_rows.append(list(row))
+            prompt_signature_map: dict[tuple[int, ...], list[int]] = {}
+            for idx, row in enumerate(base_prompt_ids):
+                sig = _strip_pad(row)
+                prompt_signature_map.setdefault(sig, []).append(idx)
         else:
-            prompt_text_records: list[str] = []
+            prompt_signature_map = {}
 
+        # When n>1, each RequestOutput has multiple CompletionOutput objects
+        for output_idx, output in enumerate(outputs):
+            # Flatten and truncate prompt tokens
+            flattened_prompt_tokens: list[int] = []
+            if output.prompt_token_ids:
+                for segment in output.prompt_token_ids:
+                    flattened_prompt_tokens.extend(segment)
+            base_prompt_tokens = flattened_prompt_tokens[:max_seq_len]
+            base_prompt_len = len(base_prompt_tokens)
+            prompt_padding = max_seq_len - base_prompt_len
+
+            # Left-pad prompts for RL training
+            padded_prompt_ids = [pad_token_id] * prompt_padding + base_prompt_tokens
+            padded_prompt_mask = [0] * prompt_padding + [1] * base_prompt_len
             if input_ids is None:
-                if prompts is None:
-                    raise ValueError("Must provide prompts when input_ids is None")
-                if processor is None or not hasattr(processor, "encode"):
-                    raise ValueError("Cannot tokenize prompts without a valid processor")
+                # When prompts were strings, this represents the canonical prompt ids/masks.
+                prompt_id_rows.append(padded_prompt_ids)
+                prompt_mask_rows.append(padded_prompt_mask)
 
-                normalized_prompts = self._normalize_esurge_prompts(prompts, apply_chat_template)
-                if not normalized_prompts:
-                    raise ValueError("No prompts provided for generation")
+            mapped_prompt_idx = None
+            if prompt_signature_map:
+                sig = _strip_pad(base_prompt_tokens)
+                if prompt_signature_map.get(sig):
+                    mapped_prompt_idx = prompt_signature_map[sig].pop(0)
+                    if not prompt_signature_map[sig]:
+                        prompt_signature_map.pop(sig, None)
 
-                max_seq_len = args.max_length or 2048
+            source_prompt = getattr(output, "prompt", return_prompts[output_idx] if return_prompts else None)
 
-                # Ensure left-padding for RL training (prompts should align at the right)
-                original_padding_side = getattr(processor, "padding_side", None)
-                if hasattr(processor, "padding_side"):
-                    processor.padding_side = "left"
+            # Process each completion (handles n>1 sampling)
+            for completion in output.outputs:
+                completion_prompts.append(source_prompt)
+                prompt_indices.append(mapped_prompt_idx)
+                completion_text = getattr(completion, "text", None)
+                if not isinstance(completion_text, str) or completion_text == "":
+                    output_get_text = getattr(output, "get_text", None)
+                    output_fallback_text = output_get_text() if callable(output_get_text) else ""
+                    completion_text = getattr(output, "accumulated_text", "") or output_fallback_text
+                output_records.append(completion_text)
 
-                encoded_ids: list[np.ndarray] = []
-                encoded_masks: list[np.ndarray] = []
+                completion_reasoning = getattr(completion, "reasoning_content", None)
+                reasoning_records.append(completion_reasoning if isinstance(completion_reasoning, str) else None)
 
-                for normalized in normalized_prompts:
-                    if isinstance(normalized, list):
-                        if not apply_chat_template or not hasattr(processor, "apply_chat_template"):
-                            raise ValueError(
-                                "Chat prompts require apply_chat_template=True when using compiled generation"
-                            )
-                        encoding = processor.apply_chat_template(
-                            normalized,
-                            return_tensors="np",
-                            padding="max_length",
-                            max_length=max_seq_len,
-                            truncation=True,
-                            add_generation_prompt=True,
-                            return_dict=True,
-                        )
-                        prompt_text_records.append(str(normalized))
-                    else:
-                        encoding = processor(
-                            normalized,
-                            return_tensors="np",
-                            padding="max_length",
-                            max_length=max_seq_len,
-                            truncation=True,
-                            add_special_tokens=True,
-                        )
-                        prompt_text_records.append(normalized)
+                completion_tool_calls = getattr(completion, "tool_calls", None)
+                tool_call_records.append(completion_tool_calls if completion_tool_calls is not None else None)
 
-                    ids = np.asarray(encoding["input_ids"], dtype=np.int32)
-                    mask = encoding.get("attention_mask")
-                    if mask is None:
-                        mask = np.ones_like(ids, dtype=np.int32)
-                    else:
-                        mask = np.asarray(mask, dtype=np.int32)
-                    encoded_ids.append(ids)
-                    encoded_masks.append(mask)
+                completion_raw_text = getattr(completion, "raw_text", None)
+                if not isinstance(completion_raw_text, str) or completion_raw_text == "":
+                    output_get_text = getattr(output, "get_text", None)
+                    output_fallback_text = output_get_text() if callable(output_get_text) else ""
+                    completion_raw_text = (
+                        getattr(output, "raw_accumulated_text", "")
+                        or getattr(output, "accumulated_text", "")
+                        or output_fallback_text
+                    )
+                raw_output_records.append(completion_raw_text)
 
-                # Restore original padding side
-                if hasattr(processor, "padding_side") and original_padding_side is not None:
-                    processor.padding_side = original_padding_side
+                completion_finish_reason = getattr(completion, "finish_reason", None)
+                finish_reason_records.append(
+                    completion_finish_reason if isinstance(completion_finish_reason, str) else None
+                )
 
-                input_ids = jnp.asarray(np.concatenate(encoded_ids, axis=0), dtype=jnp.int32)
-                attention_mask = jnp.asarray(np.concatenate(encoded_masks, axis=0), dtype=jnp.int32)
+                completion_tokens: list[int] = []
+                if completion:
+                    completion_tokens = list(getattr(completion, "token_ids", []) or [])
 
-            # Use compiled generation (internal call, deprecation warning suppressed)
-            sequences, prompt_ids, prompt_mask = self.generate_aio(
+                if len(completion_tokens) > max_new_tokens:
+                    completion_tokens = completion_tokens[:max_new_tokens]
+
+                completion_len = len(completion_tokens)
+                completion_padding = max_new_tokens - completion_len
+                padded_completion_ids = completion_tokens + [pad_token_id] * completion_padding
+                padded_completion_mask = [1] * completion_len + [0] * completion_padding
+
+                completion_id_rows.append(padded_completion_ids)
+                completion_mask_rows.append(padded_completion_mask)
+
+                sequence_tokens = [pad_token_id] * prompt_padding + base_prompt_tokens + completion_tokens
+                remaining_padding = max_total_len - len(sequence_tokens)
+                sequence_rows.append(sequence_tokens + [pad_token_id] * remaining_padding)
+
+        if not sequence_rows:
+            raise RuntimeError("eSurge generation returned no completions")
+        if not prompt_id_rows or not prompt_mask_rows:
+            raise RuntimeError("Could not determine prompt token metadata for eSurge generation")
+
+        if prompt_indices:
+            num_prompts = len(prompt_id_rows)
+            per_prompt: list[list[int]] = [[] for _ in range(num_prompts)]
+            unmatched: list[int] = []
+            for i, pidx in enumerate(prompt_indices):
+                if pidx is None or pidx < 0 or pidx >= num_prompts:
+                    unmatched.append(i)
+                else:
+                    per_prompt[pidx].append(i)
+            new_order = [idx for group in per_prompt for idx in group] + unmatched
+            completion_id_rows = [completion_id_rows[i] for i in new_order]
+            completion_mask_rows = [completion_mask_rows[i] for i in new_order]
+            completion_prompts = [completion_prompts[i] for i in new_order]
+            output_records = [output_records[i] for i in new_order]
+            reasoning_records = [reasoning_records[i] for i in new_order]
+            tool_call_records = [tool_call_records[i] for i in new_order]
+            raw_output_records = [raw_output_records[i] for i in new_order]
+            finish_reason_records = [finish_reason_records[i] for i in new_order]
+            sequence_rows = [sequence_rows[i] for i in new_order]
+
+        base_prompt_ids = jnp.array(np.asarray(prompt_id_rows, dtype=np.int32))
+        base_prompt_mask = jnp.array(np.asarray(prompt_mask_rows, dtype=np.int32))
+        prompt_ids = base_prompt_ids
+        prompt_mask = base_prompt_mask
+
+        sequences = jnp.array(np.asarray(sequence_rows, dtype=np.int32))
+        completion_ids = jnp.array(np.asarray(completion_id_rows, dtype=np.int32))
+        completion_mask = jnp.array(np.asarray(completion_mask_rows, dtype=np.int32))
+        total_seq_len = prompt_ids.shape[-1] + completion_ids.shape[-1]
+        sequences = sequences[:, :total_seq_len]
+        return _EsurgeGenerationArrays(
+            prompt_ids=prompt_ids,
+            prompt_mask=prompt_mask,
+            sequences=sequences,
+            completion_ids=completion_ids,
+            completion_mask=completion_mask,
+            output_records=output_records,
+            reasoning_records=reasoning_records,
+            tool_call_records=tool_call_records,
+            raw_output_records=raw_output_records,
+            finish_reason_records=finish_reason_records,
+            completion_prompts=completion_prompts,
+        )
+
+    def _generate_via_esurge(
+        self,
+        *,
+        input_ids,
+        attention_mask,
+        prompts,
+        processor,
+        pad_token_id,
+        sampling_params,
+        state,
+        apply_chat_template,
+        all_gather,
+        release_runtime_after_generation,
+        clear_esurge_compiled_cache_after_generation,
+    ) -> GenerationResults:
+        """Run the eSurge generation path and return unified results.
+
+        Pure code motion of the ``if use_esurge:`` branch of
+        :meth:`rollout`; see that method for argument semantics.
+
+        Returns:
+            GenerationResults: The unified generation results.
+        """
+        args = self.arguments
+        # When the caller provides tokenized prompts, respect their prompt length for
+        # eSurge padding/sequence construction. Using `args.max_length` here can lead
+        # to sequences where completions are truncated away when `args.max_length`
+        # exceeds the provided `input_ids` length (common in RL trainers where
+        # `input_ids` is padded to `max_prompt_length`, not `max_length`).
+        prompt_seq_len = None
+        if input_ids is not None:
+            try:
+                prompt_seq_len = int(input_ids.shape[-1])
+            except Exception:  # pragma: no cover - defensive: odd prompt containers
+                prompt_seq_len = None
+
+        if prompts is None:
+            decoded_prompts = self._decode_prompt_batch(
+                processor,
+                input_ids,
+                False,
+                pad_token_id,
+                True,
+                attention_mask,
+            )
+            prompts = self._normalize_esurge_prompts(decoded_prompts, apply_chat_template)
+        else:
+            prompts = self._normalize_esurge_prompts(prompts, apply_chat_template)
+        return_prompts = prompts
+        if not prompts:
+            raise ValueError("No prompts available for eSurge generation")
+
+        esurge_kwargs = self._esurge_init_kwargs()
+        effective_prompt_len = prompt_seq_len if prompt_seq_len is not None else (args.max_length or 2048)
+        # eSurge reserves a few tokens from the context budget (defaults to
+        # `reserve_tokens = max_num_seqs`). When we tightly pack
+        # `prompt_len + max_new_tokens == max_model_len` (common in PPO/GRPO
+        # rollouts where prompt is padded to max_prompt_length), eSurge will
+        # cap max_new_tokens by the reserve amount. Include the reserve in
+        # the requested max_model_len so the user-visible generation length
+        # stays consistent with `max_new_tokens`.
+        reserve_tokens = esurge_kwargs.get("reserve_tokens")
+        if reserve_tokens is None:
+            reserve_tokens = esurge_kwargs.get("max_num_seqs", 0)
+        esurge_kwargs["max_model_len"] = sampling_params.max_tokens + effective_prompt_len + int(reserve_tokens or 0)  # pyright: ignore[reportOptionalOperand]
+
+        _log_kwargs = {k: v for k, v in esurge_kwargs.items() if k != "tokenizer"}
+        logger.info_once(f"Creating eSurge {pprint.pformat(_log_kwargs)}")
+        logger.info_once(
+            f"SamplingParams(max_tokens={sampling_params.max_tokens},"
+            f" temperature={sampling_params.temperature},"
+            f" top_p={sampling_params.top_p},"
+            f" top_k={sampling_params.top_k},"
+            f" presence_penalty={sampling_params.presence_penalty},"
+            f" frequency_penalty={sampling_params.frequency_penalty},"
+            f" repetition_penalty={sampling_params.repetition_penalty},"
+            f" n={sampling_params.n})"
+        )
+        esurge_engine = None
+
+        def _cleanup_failed_esurge_generation() -> None:
+            """Best-effort teardown of an eSurge engine after a generation failure.
+
+            Pauses the engine and optionally releases its model state /
+            compiled cache so the next training step starts from a clean
+            slate.  All exceptions are swallowed since this runs on the
+            error path.
+            """
+            if esurge_engine is None:
+                try:
+                    # If setup failed before returning an engine handle, fall back to
+                    # model-level pause to clean any partially initialized cached engine.
+                    state.model.pause_esurge()
+                except Exception as cleanup_exc:  # pragma: no cover - best-effort resource cleanup
+                    log_debug_maybe(f"Failed to pause eSurge engine(s) after setup failure: {cleanup_exc}")
+                return
+
+            try:
+                esurge_engine.pause()
+                if hasattr(esurge_engine, "release_model_state"):
+                    esurge_engine.release_model_state(
+                        clear_compiled_cache=clear_esurge_compiled_cache_after_generation
+                    )
+            except Exception as cleanup_exc:  # pragma: no cover - best-effort resource cleanup
+                log_debug_maybe(f"Failed to pause/release eSurge engine after generation failure: {cleanup_exc}")
+
+        try:
+            esurge_engine = state.model.get_esurge(**esurge_kwargs)
+            # Use the resolved engine directly to avoid a second get_esurge()/refresh pass.
+            outputs: list[RequestOutput] = state.model._call_esurge_engine(
+                esurge_engine,
+                prompts=prompts,
+                sampling_params=sampling_params,
+                stream=False,
+                use_tqdm=args.esurge_use_tqdm,
+            )
+        except Exception:
+            _cleanup_failed_esurge_generation()
+            raise
+
+        try:
+            max_seq_len = prompt_seq_len if prompt_seq_len is not None else (args.max_length or 2048)
+            max_new_tokens = sampling_params.max_tokens if sampling_params.max_tokens is not None else 1024
+            arrays = self._esurge_outputs_to_arrays(
+                outputs,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                model_kwargs=normalized_model_kwargs if has_model_kwargs else None,
-                state=state,
-                generation_config=generation_config,
-                shard_inputs=shard_inputs,
-                config_overrides=config_overrides,
-                return_metadata=True,
-                all_gather=all_gather,
-                **generate_kwargs,
-            )
-            # Extract completion tokens from sequences
-            max_new_tokens = sampling_params.max_tokens
-            prompt_len = prompt_ids.shape[1]
-            completion_ids = sequences[:, prompt_len : prompt_len + max_new_tokens]
-            completion_mask = self._make_attn_mask(completion_ids)
-            decoded_prompt_texts = self._decode_prompt_batch(processor, prompt_ids, False, pad_token_id, True)
-
-            # Build per-completion prompt list aligned with generated rows.
-            completion_prompts: list[str | list[dict[str, str]]] = []
-            repeat_factor = completion_ids.shape[0] // max(len(decoded_prompt_texts), 1)
-            repeat_factor = max(repeat_factor, 1)
-            for text_prompt in decoded_prompt_texts:
-                completion_prompts.extend([text_prompt] * repeat_factor)
-            if len(completion_prompts) < completion_ids.shape[0] and decoded_prompt_texts:
-                completion_prompts.extend(
-                    [decoded_prompt_texts[-1]] * (completion_ids.shape[0] - len(completion_prompts))
-                )
-            completion_prompts = completion_prompts[: completion_ids.shape[0]]
-
-            generated_texts = self._decode_prompt_batch(
-                processor,
-                sequences,
-                skip_special_tokens=True,
+                return_prompts=return_prompts,
                 pad_token_id=pad_token_id,
-                pop_pad_tokens=True,
+                max_seq_len=max_seq_len,
+                max_new_tokens=max_new_tokens,
             )
-            completion_texts = self._decode_prompt_batch(
-                processor,
-                completion_ids,
-                skip_special_tokens=True,
-                pad_token_id=pad_token_id,
-                pop_pad_tokens=True,
-            )
-            raw_completion_texts = self._decode_prompt_batch(
-                processor,
-                completion_ids,
-                skip_special_tokens=False,
-                pad_token_id=pad_token_id,
-                pop_pad_tokens=True,
-            )
+            prompt_ids = arrays.prompt_ids
+            prompt_mask = arrays.prompt_mask
+            sequences = arrays.sequences
+            completion_ids = arrays.completion_ids
+            completion_mask = arrays.completion_mask
+            output_records = arrays.output_records
+            reasoning_records = arrays.reasoning_records
+            tool_call_records = arrays.tool_call_records
+            raw_output_records = arrays.raw_output_records
+            finish_reason_records = arrays.finish_reason_records
+            completion_prompts = arrays.completion_prompts
 
+            if all_gather:
+                sequences = self._all_gather(sequences)
+                prompt_ids = self._all_gather(prompt_ids)
+                prompt_mask = self._all_gather(prompt_mask)
+                completion_ids = self._all_gather(completion_ids)
+                completion_mask = self._all_gather(completion_mask)
             results = self.maybe_release_generation_runtime(
                 GenerationResults(
-                    generation_results=generated_texts,
+                    generation_results=output_records,
                     prompt_ids=prompt_ids,
                     prompt_mask=prompt_mask,
                     sequences=sequences,
                     completion_ids=completion_ids,
                     completion_mask=completion_mask,
-                    decoded_prompts=decoded_prompt_texts,
-                    completion_prompts=completion_prompts or None,
-                    text=completion_texts,
-                    reasoning=[None] * len(completion_texts),
-                    tool_calls=[None] * len(completion_texts),
-                    raw_text=raw_completion_texts,
+                    decoded_prompts=return_prompts,
+                    completion_prompts=completion_prompts,
+                    text=output_records,
+                    reasoning=reasoning_records,
+                    tool_calls=tool_call_records,
+                    raw_text=raw_output_records,
+                    finish_reason=finish_reason_records,
                 ),
                 state=state,
                 release_runtime_after_generation=release_runtime_after_generation,
                 clear_esurge_compiled_cache_after_generation=clear_esurge_compiled_cache_after_generation,
             )
-            return results
+        except Exception:
+            _cleanup_failed_esurge_generation()
+            raise
+        return results
+
+    def _generate_via_compiled(
+        self,
+        *,
+        input_ids,
+        attention_mask,
+        prompts,
+        processor,
+        pad_token_id,
+        sampling_params,
+        state,
+        apply_chat_template,
+        generation_config,
+        shard_inputs,
+        config_overrides,
+        normalized_model_kwargs,
+        has_model_kwargs,
+        all_gather,
+        release_runtime_after_generation,
+        clear_esurge_compiled_cache_after_generation,
+        generate_kwargs,
+    ) -> GenerationResults:
+        """Run the compiled generation path and return unified results.
+
+        Pure code motion of the ``else`` (compiled) branch of
+        :meth:`rollout`; see that method for argument semantics.
+
+        Returns:
+            GenerationResults: The unified generation results.
+        """
+        args = self.arguments
+        prompt_text_records: list[str] = []
+
+        if input_ids is None:
+            if prompts is None:
+                raise ValueError("Must provide prompts when input_ids is None")
+            if processor is None or not hasattr(processor, "encode"):
+                raise ValueError("Cannot tokenize prompts without a valid processor")
+
+            normalized_prompts = self._normalize_esurge_prompts(prompts, apply_chat_template)
+            if not normalized_prompts:
+                raise ValueError("No prompts provided for generation")
+
+            max_seq_len = args.max_length or 2048
+
+            # Ensure left-padding for RL training (prompts should align at the right)
+            original_padding_side = getattr(processor, "padding_side", None)
+            if hasattr(processor, "padding_side"):
+                processor.padding_side = "left"
+
+            encoded_ids: list[np.ndarray] = []
+            encoded_masks: list[np.ndarray] = []
+
+            for normalized in normalized_prompts:
+                if isinstance(normalized, list):
+                    if not apply_chat_template or not hasattr(processor, "apply_chat_template"):
+                        raise ValueError(
+                            "Chat prompts require apply_chat_template=True when using compiled generation"
+                        )
+                    encoding = processor.apply_chat_template(
+                        normalized,
+                        return_tensors="np",
+                        padding="max_length",
+                        max_length=max_seq_len,
+                        truncation=True,
+                        add_generation_prompt=True,
+                        return_dict=True,
+                    )
+                    prompt_text_records.append(str(normalized))
+                else:
+                    encoding = processor(
+                        normalized,
+                        return_tensors="np",
+                        padding="max_length",
+                        max_length=max_seq_len,
+                        truncation=True,
+                        add_special_tokens=True,
+                    )
+                    prompt_text_records.append(normalized)
+
+                ids = np.asarray(encoding["input_ids"], dtype=np.int32)
+                mask = encoding.get("attention_mask")
+                if mask is None:
+                    mask = np.ones_like(ids, dtype=np.int32)
+                else:
+                    mask = np.asarray(mask, dtype=np.int32)
+                encoded_ids.append(ids)
+                encoded_masks.append(mask)
+
+            # Restore original padding side
+            if hasattr(processor, "padding_side") and original_padding_side is not None:
+                processor.padding_side = original_padding_side
+
+            input_ids = jnp.asarray(np.concatenate(encoded_ids, axis=0), dtype=jnp.int32)
+            attention_mask = jnp.asarray(np.concatenate(encoded_masks, axis=0), dtype=jnp.int32)
+
+        # Use compiled generation (internal call, deprecation warning suppressed)
+        sequences, prompt_ids, prompt_mask = self.generate_aio(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            model_kwargs=normalized_model_kwargs if has_model_kwargs else None,
+            state=state,
+            generation_config=generation_config,
+            shard_inputs=shard_inputs,
+            config_overrides=config_overrides,
+            return_metadata=True,
+            all_gather=all_gather,
+            **generate_kwargs,
+        )
+        # Extract completion tokens from sequences
+        max_new_tokens = sampling_params.max_tokens
+        prompt_len = prompt_ids.shape[1]
+        completion_ids = sequences[:, prompt_len : prompt_len + max_new_tokens]
+        completion_mask = self._make_attn_mask(completion_ids)
+        decoded_prompt_texts = self._decode_prompt_batch(processor, prompt_ids, False, pad_token_id, True)
+
+        # Build per-completion prompt list aligned with generated rows.
+        completion_prompts: list[str | list[dict[str, str]]] = []
+        repeat_factor = completion_ids.shape[0] // max(len(decoded_prompt_texts), 1)
+        repeat_factor = max(repeat_factor, 1)
+        for text_prompt in decoded_prompt_texts:
+            completion_prompts.extend([text_prompt] * repeat_factor)
+        if len(completion_prompts) < completion_ids.shape[0] and decoded_prompt_texts:
+            completion_prompts.extend(
+                [decoded_prompt_texts[-1]] * (completion_ids.shape[0] - len(completion_prompts))
+            )
+        completion_prompts = completion_prompts[: completion_ids.shape[0]]
+
+        generated_texts = self._decode_prompt_batch(
+            processor,
+            sequences,
+            skip_special_tokens=True,
+            pad_token_id=pad_token_id,
+            pop_pad_tokens=True,
+        )
+        completion_texts = self._decode_prompt_batch(
+            processor,
+            completion_ids,
+            skip_special_tokens=True,
+            pad_token_id=pad_token_id,
+            pop_pad_tokens=True,
+        )
+        raw_completion_texts = self._decode_prompt_batch(
+            processor,
+            completion_ids,
+            skip_special_tokens=False,
+            pad_token_id=pad_token_id,
+            pop_pad_tokens=True,
+        )
+
+        results = self.maybe_release_generation_runtime(
+            GenerationResults(
+                generation_results=generated_texts,
+                prompt_ids=prompt_ids,
+                prompt_mask=prompt_mask,
+                sequences=sequences,
+                completion_ids=completion_ids,
+                completion_mask=completion_mask,
+                decoded_prompts=decoded_prompt_texts,
+                completion_prompts=completion_prompts or None,
+                text=completion_texts,
+                reasoning=[None] * len(completion_texts),
+                tool_calls=[None] * len(completion_texts),
+                raw_text=raw_completion_texts,
+            ),
+            state=state,
+            release_runtime_after_generation=release_runtime_after_generation,
+            clear_esurge_compiled_cache_after_generation=clear_esurge_compiled_cache_after_generation,
+        )
+        return results
 
     def _get_processing_class(self):
         """Resolve the tokenizer or processor associated with the trainer.
@@ -4155,7 +4343,7 @@ class BaseTrainer(BaseTrainerProtocol):
     ) -> None:
         """Optionally run preview generation to monitor training progress.
 
-        Uses `generate_unified` for consistent generation across both eSurge and compiled modes.
+        Uses `rollout` for consistent generation across both eSurge and compiled modes.
         """
 
         args = self.arguments
@@ -4358,7 +4546,7 @@ class BaseTrainer(BaseTrainerProtocol):
             return
 
         try:
-            gen_results = self.generate_unified(
+            gen_results = self.rollout(
                 input_ids=batched_input_ids,
                 attention_mask=batched_attention_mask,
                 state=state,
@@ -4371,7 +4559,7 @@ class BaseTrainer(BaseTrainerProtocol):
             log_debug_maybe(f"Preview generation failed: {exc}")
             for _prompt_idx, prepared in enumerate(prepared_prompts):
                 try:
-                    single_results = self.generate_unified(
+                    single_results = self.rollout(
                         input_ids=prepared["input_ids"],
                         attention_mask=prepared["attention_mask"],
                         state=state,

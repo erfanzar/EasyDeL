@@ -19,8 +19,6 @@ trainers (GRPO and its relatives, PPO, OnlineDPO, ...).  A subclass bundles the
 reward's *name*, its *group reduction*, and its *scoring logic* in one place:
 
     class MyReward(RewardProtocol):
-        reduction = "sum"
-
         def compute(self, *, prompt, completion, messages=None, **kwargs) -> float:
             return 1.0 if "the answer is" in completion.lower() else 0.0
 
@@ -125,10 +123,12 @@ class RewardProtocol:
     (vectorized).  Class attributes configure naming and group reduction:
 
     Attributes:
-        reduction: ``"sum"`` or ``"mean"`` -- how this reward is reduced over
+        reduction: ``"mean"`` or ``"sum"`` -- how this reward is reduced over
             the ``num_generations`` group to form the advantage baseline in the
-            GRPO family.  Defaults to ``"sum"``.  Ignored by trainers that do
-            not use a group baseline (PPO, OnlineDPO).
+            GRPO family.  Defaults to ``"mean"`` (the standard GRPO baseline
+            ``r_i - mean(group)``; matches the plain-callable path).  ``"sum"``
+            is an opt-in non-centered baseline.  Ignored by trainers that do not
+            use a group baseline (PPO, OnlineDPO).
         weight: Scalar multiplier for this reward in the (multi-reward) weighted
             sum.  The trainer builds its ``reward_weights`` from each reward's
             ``weight`` (defaults to ``1.0``), so weights live on the reward
@@ -138,7 +138,7 @@ class RewardProtocol:
             class name.
     """
 
-    reduction: Reduction = "sum"
+    reduction: Reduction = "mean"
     weight: float = 1.0
     name: str | None = None
 

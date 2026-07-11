@@ -304,6 +304,17 @@ def training_step(
             batch["reference_logps"] = jax.lax.stop_gradient(ref_out["completion_logps"])
 
         if calculate_kl:
+            # Both the reference AND policy KL anchors must be built from the same
+            # full-batch rolled pairing (prompt_i with completion_{i-1}). The
+            # reference is precomputed here and sliced per-microbatch by
+            # minibatch_call. The policy KL is stop-gradient (it never needs a
+            # gradient), so it is likewise precomputed here on the full batch at
+            # the current policy params instead of being re-rolled inside
+            # _loss_fn -- re-rolling within a microbatch (`_build_kl_batch(minibatch)`)
+            # pairs prompt_i with a DIFFERENT completion than the reference,
+            # corrupting the KL anchor `z` whenever gradient_accumulation_steps > 1.
+            # This mirrors the MPMD scheduled path (_prepare_kto_scheduled_batch).
+            kl_batch = None
             if "_reference_kl_logps" not in batch:
                 reference_kl_logps = batch.get("reference_KL_logps")
                 if reference_kl_logps is None:
@@ -311,6 +322,14 @@ def training_step(
                     ref_kl_out = forward_fn(reference_state.model, kl_batch)
                     reference_kl_logps = ref_kl_out["completion_logps"]
                 batch["_reference_kl_logps"] = jax.lax.stop_gradient(reference_kl_logps)
+            if "_policy_kl_logps" not in batch:
+                policy_kl_logps = batch.get("policy_KL_logps")
+                if policy_kl_logps is None:
+                    if kl_batch is None:
+                        kl_batch = _build_kl_batch(batch)
+                    policy_kl_out = forward_fn(state.model, kl_batch)
+                    policy_kl_logps = policy_kl_out["completion_logps"]
+                batch["_policy_kl_logps"] = jax.lax.stop_gradient(policy_kl_logps)
 
     def _loss_fn(tree: spx.State, minibatch: dict[str, jax.Array]):
         """Compute the KTO loss for one minibatch.
@@ -342,10 +361,12 @@ def training_step(
             reference_logps = jax.lax.stop_gradient(minibatch["reference_logps"])
 
             if calculate_kl:
-                with jax.named_scope(scope_root + "/loss_fn/policy_kl_forward"):
-                    kl_batch = _build_kl_batch(minibatch)
-                    policy_kl_logps = jax.lax.stop_gradient(forward_fn(module, kl_batch)["completion_logps"])
-                    reference_kl_logps = jax.lax.stop_gradient(minibatch["_reference_kl_logps"])
+                # Both KL anchors were precomputed on the full batch (same rolled
+                # pairing) and sliced per-microbatch by minibatch_call. Re-rolling
+                # here with `_build_kl_batch(minibatch)` would mis-pair the policy
+                # completions vs the reference under gradient accumulation.
+                policy_kl_logps = jax.lax.stop_gradient(minibatch["_policy_kl_logps"])
+                reference_kl_logps = jax.lax.stop_gradient(minibatch["_reference_kl_logps"])
             else:
                 policy_kl_logps = reference_kl_logps = None
 

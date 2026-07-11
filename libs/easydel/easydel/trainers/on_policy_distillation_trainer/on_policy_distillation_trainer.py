@@ -412,7 +412,7 @@ class OnPolicyDistillationTrainer(Trainer):
                 gen_state = state
 
             with capture_time() as generation_time_fn:
-                results = self.generate_unified(
+                results = self.rollout(
                     input_ids=prompt_ids,
                     attention_mask=prompt_mask,
                     state=gen_state,

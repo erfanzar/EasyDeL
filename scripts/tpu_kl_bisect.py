@@ -97,7 +97,7 @@ def main(argv=None):
 
     gdef, gstate, gother = model.split_module()
 
-    # ---- student path: filtered kwargs, forward as primal of jax.vjp ----
+    # student path: filtered kwargs, forward as primal of jax.vjp
     s_kwargs = filter_kwargs_for_callable(model.__call__, dict(batch))
     s_kwargs = sanitize_model_call_kwargs(s_kwargs)
 
@@ -108,7 +108,7 @@ def main(argv=None):
 
     (s_logits, s_hidden), _ = jax.vjp(student_fwd, gstate)
 
-    # ---- teacher path: static split + checkpoint(nothing_saveable) + stop_gradient state ----
+    # teacher path: static split + checkpoint(nothing_saveable) + stop_gradient state
     t_kwargs = filter_kwargs_for_callable(model.__call__, dict(batch))
     t_kwargs = sanitize_model_call_kwargs(t_kwargs)
     t_static = {k: t_kwargs.pop(k) for k in list(t_kwargs) if not hasattr(t_kwargs[k], "shape")}

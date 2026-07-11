@@ -53,11 +53,10 @@ os.environ.setdefault("ENABLE_DISTRIBUTED_INIT", "0")
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
 
+import easydel as ed
 import jax.numpy as jnp
 import numpy as np
 import spectrax as spx
-
-import easydel as ed
 from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.esurge.runners import eSurgeRunner
 from easydel.inference.esurge.scheduler import Scheduler
@@ -264,9 +263,7 @@ def _assert_family_serves(model, family: str, mm_spec: dict | None, mm_ref_kwarg
         harness.close()
 
 
-# ---------------------------------------------------------------------------
 # paligemma — SigLIP tower + Gemma text; causal serving (see module docstring)
-# ---------------------------------------------------------------------------
 
 
 def _make_paligemma():
@@ -318,9 +315,7 @@ def test_paligemma_esurge_greedy_parity():
     )
 
 
-# ---------------------------------------------------------------------------
 # internvl — InternVL ViT tower + Qwen2 text
-# ---------------------------------------------------------------------------
 
 
 def _make_internvl():
@@ -366,9 +361,7 @@ def test_internvl_esurge_greedy_parity():
     )
 
 
-# ---------------------------------------------------------------------------
 # hunyuan_vl — own GQA text + ViT, 3-axis mRoPE (position-consistent decode)
-# ---------------------------------------------------------------------------
 
 
 def _make_hunyuan_vl():
@@ -445,9 +438,7 @@ def test_hunyuan_vl_esurge_greedy_parity():
     )
 
 
-# ---------------------------------------------------------------------------
 # minimax_m3_vl — MoE text + vision tower (full-attention config only)
-# ---------------------------------------------------------------------------
 
 
 def _minimax_text_config():

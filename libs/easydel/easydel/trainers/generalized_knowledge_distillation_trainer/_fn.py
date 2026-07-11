@@ -274,6 +274,7 @@ def gkd_step(
         otherwise ``LossMetrics``. ``other_metrics["gkd_jsd_loss"]``
         records the raw scalar GJSD value.
     """
+    shift_tokens = bool(getattr(loss_config, "shift_tokens", True)) if loss_config is not None else True
     scope_root = "easydel/trainer/gkd/" + ("train_step" if is_training else "eval_step")
     with jax.named_scope(scope_root + "/prepare_batch"):
         _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
@@ -368,9 +369,23 @@ def gkd_step(
             attention_mask = minibatch.get("attention_mask")
             mask = completion_mask if completion_mask is not None else attention_mask
 
+            # Causal shift (LossConfig.shift_tokens default). Position t predicts token t+1, so the
+            # JSD compares student/teacher distributions at [:, :-1] and masks by the completion /
+            # attention mask[:, 1:] (and labels[:, 1:]) -- matching TRL GKD and ForCausalLMLoss, and
+            # the UNSHIFTED -100/completion labels the trainer builds. ``generalized_jsd_loss`` stays
+            # a pure (unshifted) reduction; the shift lives here.
+            student_logits = student_outputs.logits
+            if shift_tokens:
+                student_logits = student_logits[:, :-1]
+                teacher_logits = teacher_logits[:, :-1]
+                if labels is not None:
+                    labels = labels[:, 1:]
+                if mask is not None:
+                    mask = mask[:, 1:]
+
             with jax.named_scope(scope_root + "/loss_fn/compute_gjsd_loss"):
                 loss_value = generalized_jsd_loss(
-                    student_logits=student_outputs.logits,
+                    student_logits=student_logits,
                     teacher_logits=teacher_logits,
                     labels=labels,
                     mask=mask,
@@ -478,6 +493,8 @@ def _make_gkd_scheduled_loss(call):
     beta = call.get("beta", 0.5)
     temperature = call.get("temperature", 1.0)
     partition_spec = call.get("partition_spec")
+    _loss_config = call.get("loss_config")
+    shift_tokens = bool(getattr(_loss_config, "shift_tokens", True)) if _loss_config is not None else True
 
     def scheduled_loss(tree: spx.State, batch: dict[str, tp.Any]):
         """Compute the scalar GKD loss inside the SpectraX scheduled VJP.
@@ -511,6 +528,15 @@ def _make_gkd_scheduled_loss(call):
             completion_mask = call_batch.get("completion_mask")
             attention_mask = call_batch.get("attention_mask")
             mask = completion_mask if completion_mask is not None else attention_mask
+            # Causal shift (LossConfig.shift_tokens default), matching the eager ``gkd_step``:
+            # position t predicts token t+1, so compare logits[:, :-1] and mask by [:, 1:].
+            if shift_tokens:
+                student_logits = student_logits[:, :-1]
+                teacher_logits = teacher_logits[:, :-1]
+                if labels is not None:
+                    labels = labels[:, 1:]
+                if mask is not None:
+                    mask = mask[:, 1:]
             with jax.named_scope("easydel/trainer/gkd/scheduled_loss/compute_gjsd_loss"):
                 return generalized_jsd_loss(
                     student_logits=student_logits,

@@ -194,7 +194,7 @@ def main(argv=None):
         print("[interp]", "FAIL" if failed else "PASS")
         return 1 if failed else 0
 
-    # --- TPU modes ---
+    # TPU modes
     fwd_j = jax.jit(fwd_chunked)
     t0 = time.perf_counter()
     out, st = jax.block_until_ready(fwd_j(*ops))

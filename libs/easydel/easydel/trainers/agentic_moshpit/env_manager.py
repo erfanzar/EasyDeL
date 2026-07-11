@@ -17,7 +17,7 @@
 This module implements the core multi-turn rollout loop for agentic MoshPit
 training with **batched parallel generation**. All active environments
 generate simultaneously at each turn via a single batched call to
-``generate_unified``, then all environments are stepped in parallel.
+``rollout``, then all environments are stepped in parallel.
 
 The loop is:
 
@@ -256,7 +256,7 @@ class RolloutManager:
 
     The ``generate_fn`` passed to ``run_grouped_episodes`` must accept
     a **list of prompt strings** and return a **list of response strings**
-    (one per prompt). The trainer wraps ``generate_unified`` to provide
+    (one per prompt). The trainer wraps ``rollout`` to provide
     this batched interface.
 
     Attributes:
@@ -320,7 +320,7 @@ class RolloutManager:
             env_factory: Factory function to create environment instances.
             generate_fn: Batched generation function. Accepts a list of
                 prompt strings, returns a list of response strings (same
-                length). This is one call to ``generate_unified``.
+                length). This is one call to ``rollout``.
             group_size: Number of rollouts per seed group.
             base_seed: Starting seed for the first group.
             num_groups: Number of distinct seeds (prompts).

@@ -58,7 +58,7 @@ class SeqKDTrainer(Trainer):
 
     Two teacher modes are supported:
         1. **Local teacher model** (``teacher_model``): An EasyDeL model that
-           generates completions via ``generate_unified``.
+           generates completions via ``rollout``.
         2. **External teacher function** (``teacher_fn``): A callable
            ``(prompts: list[str]) -> list[str]`` for API-based teachers.
            When ``num_generations_per_prompt > 1``, prompts are repeated in
@@ -134,7 +134,7 @@ class SeqKDTrainer(Trainer):
                 Student model (the one being trained).
             teacher_model (EasyDeLBaseModule | EasyDeLState | None):
                 Optional in-process teacher model used via
-                ``generate_unified``. Mutually exclusive with
+                ``rollout``. Mutually exclusive with
                 ``teacher_fn``.
             teacher_fn (tp.Callable[[list[str]], list[str]] | None):
                 Optional API-style teacher callable mapping a list of
@@ -307,7 +307,7 @@ class SeqKDTrainer(Trainer):
         If ``teacher_fn`` is set, prompts are decoded to text, optionally
         repeated per prompt when ``num_generations_per_prompt > 1``, passed to
         the callable, and the returned completions are re-tokenized.  Otherwise
-        ``generate_unified`` is called on the local teacher model.
+        ``rollout`` is called on the local teacher model.
 
         Args:
             state (EasyDeLState): Current student state (unused for
@@ -374,7 +374,7 @@ class SeqKDTrainer(Trainer):
                 generation_time = generation_time_fn()
             else:
                 with capture_time() as generation_time_fn:
-                    results = self.generate_unified(
+                    results = self.rollout(
                         input_ids=prompt_ids,
                         attention_mask=prompt_mask,
                         state=self.teacher_state,

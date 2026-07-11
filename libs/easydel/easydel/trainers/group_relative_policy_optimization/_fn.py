@@ -91,6 +91,37 @@ def _masked_sum_and_count(x: jax.Array, mask: jax.Array) -> tuple[jax.Array, jax
     return jnp.sum(x * mask), jnp.maximum(jnp.sum(mask), 1.0).astype(jnp.float32)
 
 
+def _global_token_normalizer(
+    num_items_in_batch: jax.Array | None,
+    local_token_count: jax.Array,
+    was_truncated: bool,
+    gradient_accumulation_steps: int,
+) -> jax.Array:
+    """Normalizer for globally token-normalized losses (``dapo``/``cispo``/``vespo``/``dppo``).
+
+    These loss types divide ``sum(per_token_loss * mask)`` by the *full-batch*
+    completion-token count carried in ``num_items_in_batch`` — a 0-dim scalar
+    that :func:`minibatch_call` deliberately does **not** slice per microbatch.
+    Under gradient accumulation (``gradient_accumulation_steps = K > 1``),
+    ``minibatch_call`` averages the accumulated gradients by ``1/K``. So each of
+    the ``K`` microbatches computes ``S_k / N_global`` and the average is
+    ``(1/K)·(S_total / N_global)`` — a factor ``1/K`` below the true full-batch
+    value, silently scaling the effective learning rate by ``1/K``.
+
+    Dividing the global count by ``K`` here makes each microbatch loss
+    ``S_k / (N_global/K) = K·S_k / N_global`` so the ``1/K`` average recombines
+    to the correct ``S_total / N_global``. ``K == 1`` is a no-op (``minibatch_call``
+    takes its non-accumulating branch and does not average).
+
+    A truncated window or a missing ``num_items_in_batch`` falls back to the
+    microbatch-local token count, which is already correct under ``1/K``
+    averaging (a per-microbatch mean) and must **not** be divided.
+    """
+    if was_truncated or num_items_in_batch is None:
+        return local_token_count
+    return num_items_in_batch / max(int(gradient_accumulation_steps), 1)
+
+
 def _compute_log_importance_weights(
     *,
     per_token_logps: jax.Array,
@@ -886,13 +917,11 @@ def grpo_step(
             expanded_prompt_ids = prompt_ids.repeat(effective_num_generations, 0)
             expanded_prompt_mask = prompt_mask.repeat(effective_num_generations, 0)
             completion_batch_size = int(completion_ids.shape[0])
-            normalizer = (
-                completion_token_count
-                if completion_was_truncated
-                else minibatch.get(
-                    "num_items_in_batch",
-                    completion_token_count,
-                )
+            normalizer = _global_token_normalizer(
+                minibatch.get("num_items_in_batch"),
+                completion_token_count,
+                completion_was_truncated,
+                gradient_accumulation_steps,
             )
 
             loss_numerator = jnp.array(0.0, dtype=jnp.float32)
@@ -1310,13 +1339,11 @@ def grpo_step(
                 if has_difficulty_weights:
                     normalizer = jnp.sum(completion_mask * difficulty_weights)
                 else:
-                    normalizer = (
-                        completion_token_count
-                        if completion_was_truncated
-                        else minibatch.get(
-                            "num_items_in_batch",
-                            completion_token_count,
-                        )
+                    normalizer = _global_token_normalizer(
+                        minibatch.get("num_items_in_batch"),
+                        completion_token_count,
+                        completion_was_truncated,
+                        gradient_accumulation_steps,
                     )
                 loss = jnp.sum(per_token_loss * completion_mask) / jnp.maximum(normalizer, 1.0)
             else:

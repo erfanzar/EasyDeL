@@ -24,7 +24,6 @@ from __future__ import annotations
 import copy
 
 import pytest
-
 from easydel.trainers.buckets import (
     BucketRule,
     CallableBucketRule,
@@ -43,9 +42,9 @@ class _FakeConfig:
         self.attn_mechanism = attn_mechanism
 
 
-# --------------------------------------------------------------------------- #
+# #
 # BucketRule math
-# --------------------------------------------------------------------------- #
+# #
 
 
 class TestModBucketRule:
@@ -126,9 +125,9 @@ class TestCallableBucketRule:
             rule.to_dict()
 
 
-# --------------------------------------------------------------------------- #
+# #
 # Serialization round-trips
-# --------------------------------------------------------------------------- #
+# #
 
 
 class TestRuleSerialization:
@@ -153,9 +152,9 @@ class TestRuleSerialization:
             BucketRule.from_dict({"kind": "nope"})
 
 
-# --------------------------------------------------------------------------- #
+# #
 # resolve_bucket_config
-# --------------------------------------------------------------------------- #
+# #
 
 
 class TestResolveBucketConfig:
@@ -198,9 +197,9 @@ class TestResolveBucketConfig:
         assert base.attn_mechanism == base_copy.attn_mechanism == "auto"
 
 
-# --------------------------------------------------------------------------- #
+# #
 # TrainingBucket defaults
-# --------------------------------------------------------------------------- #
+# #
 
 
 class TestTrainingBucket:
@@ -219,9 +218,9 @@ class TestTrainingBucket:
         assert splash.max_length == 131072
 
 
-# --------------------------------------------------------------------------- #
+# #
 # Structural-equality + integration (need JAX + a model backend)
-# --------------------------------------------------------------------------- #
+# #
 
 
 def _has_jax():
@@ -242,7 +241,6 @@ class TestBucketGraphdefStructure:
     def test_vanilla_and_blocksparse_share_param_structure(self):
         import jax
         import spectrax as spx
-
         from easydel import LlamaConfig
         from easydel.modules.llama.modeling_llama import LlamaForCausalLM
 

@@ -2410,7 +2410,7 @@ class eLargeModel:
             with phase_timer("build_trainer.get_train_source", tag="eLargeModel"):
                 train_dataset = self.get_train_source()
 
-        # --- Optional training buckets ----------------------------------------
+        # Optional training buckets
         # Build per-bucket TrainingBucket configs, a BucketRule, and one data
         # source per bucket from `bucket_datasets`. The model *variants* (one
         # graphdef per bucket, differing e.g. in attn_mechanism) are constructed

@@ -6,9 +6,7 @@ import jax
 import jax.numpy as jnp
 
 
-# ---------------------------------------------------------------------------
 # EasyDeL CE port (vendored; Apache 2.0). Rank-agnostic fix for the FWD VJP.
-# ---------------------------------------------------------------------------
 @jax.custom_vjp
 def _easydel_ce_with_logits(logits, targets, z_loss):
     log_sm = logits - jax.scipy.special.logsumexp(logits, axis=-1, keepdims=True)

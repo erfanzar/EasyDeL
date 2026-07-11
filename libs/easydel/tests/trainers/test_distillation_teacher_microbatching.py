@@ -18,7 +18,6 @@ from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
-
 from easydel.trainers.distillation_trainer import _fn as distill_fn
 from easydel.trainers.generalized_knowledge_distillation_trainer import _fn as gkd_fn
 
@@ -135,7 +134,7 @@ def test_distillation_teacher_forward_uses_minibatches(monkeypatch):
     monkeypatch.setattr(distill_fn, "minibatch_call", _run_single_minibatch)
     monkeypatch.setattr(distill_fn, "update_state_respectfully", lambda state, gradients, loss_config, metrics: state)
     monkeypatch.setattr(distill_fn, "update_metrics", lambda metrics, learning_rate_fn, step, gradients: metrics)
-    monkeypatch.setattr(distill_fn, "with_sharding_constraint", lambda batch, sharding, **kwargs: batch)
+    monkeypatch.setattr(distill_fn, "constrain_batch_sharding", lambda batch, sharding, **kwargs: batch)
 
     _state, metrics = distill_fn.distillation_step(
         student_state=student_state,
@@ -176,7 +175,7 @@ def test_distillation_step_uses_precomputed_teacher_logits(monkeypatch):
     monkeypatch.setattr(distill_fn, "minibatch_call", run_single_minibatch_with_teacher)
     monkeypatch.setattr(distill_fn, "update_state_respectfully", lambda state, gradients, loss_config, metrics: state)
     monkeypatch.setattr(distill_fn, "update_metrics", lambda metrics, learning_rate_fn, step, gradients: metrics)
-    monkeypatch.setattr(distill_fn, "with_sharding_constraint", lambda batch, sharding, **kwargs: batch)
+    monkeypatch.setattr(distill_fn, "constrain_batch_sharding", lambda batch, sharding, **kwargs: batch)
 
     _state, metrics = distill_fn.distillation_step(
         student_state=student_state,

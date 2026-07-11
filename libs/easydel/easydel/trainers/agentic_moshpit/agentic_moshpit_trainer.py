@@ -328,7 +328,7 @@ class AgenticMoshPitTrainer(GRPOTrainer):
     ) -> tp.Callable[..., list[str]]:
         """Create a batched generation function for rollouts.
 
-        Wraps ``generate_unified`` to accept a list of prompt strings
+        Wraps ``rollout`` to accept a list of prompt strings
         and return a list of response strings. Supports optional
         ``temperature``, ``top_p``, ``top_k`` overrides per call so
         the questioner/verifier can use different sampling params
@@ -378,7 +378,7 @@ class AgenticMoshPitTrainer(GRPOTrainer):
             if num_return_sequences is not None:
                 overrides["num_return_sequences"] = num_return_sequences
 
-            results = self.generate_unified(
+            results = self.rollout(
                 prompts=prompts,
                 state=state,
                 apply_chat_template=False,
