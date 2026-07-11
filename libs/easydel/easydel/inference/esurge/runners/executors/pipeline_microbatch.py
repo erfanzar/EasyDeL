@@ -28,6 +28,7 @@ scheduler thread, so the single-writer discipline for ``kv_pages`` /
 
 from __future__ import annotations
 
+import os
 import time
 import typing as tp
 from functools import partial
@@ -45,6 +46,8 @@ from .sampler_executor import _get_padded_num_reqs_with_upper_limit
 
 if tp.TYPE_CHECKING:
     from ..execution_manager import ExecutionManager
+
+_PP_MB_DEBUG = bool(os.environ.get("ESURGE_PP_MB_DEBUG"))
 
 
 class _PipelineMicrobatchScratchSlot(tp.TypedDict):
@@ -159,6 +162,20 @@ class PipelineMicrobatchExecutor:
         self._pipeline_microbatch_scratch_signature = None
         self._pipeline_logits_index_cache.clear()
         self._pipeline_handoff_scalar_cache.clear()
+
+    @staticmethod
+    def _skip(reason: str, **ctx: tp.Any) -> None:
+        """Log (when ``ESURGE_PP_MB_DEBUG`` is set) why the wavefront was skipped.
+
+        Diagnostic-only: every ``try_execute`` bailout routes through here so a
+        single instrumented decode run reveals which gate keeps the PP wavefront
+        overlap from engaging. Returns ``None`` so callers can ``return
+        self._skip(...)`` directly.
+        """
+        if _PP_MB_DEBUG:
+            extra = " ".join(f"{k}={v}" for k, v in ctx.items())
+            print(f"[pp-mb-skip] {reason} {extra}".rstrip(), flush=True)
+        return None
 
     def _get_pipeline_handoff_scalars(self, *, offset: int, count: int) -> tuple[jax.Array, jax.Array]:
         """Return cached device scalars for a PP microbatch handoff span.
@@ -514,7 +531,7 @@ class PipelineMicrobatchExecutor:
         pipeline_plan = self._manager._model_executor.pipeline_plan
         pipeline_runtime = self._manager._model_executor.pipeline_runtime
         if pipeline_plan is None or not pipeline_plan.is_enabled or pipeline_runtime is None:
-            return None
+            return self._skip("plan_disabled")
         if any(
             x is not None
             for x in (
@@ -529,20 +546,20 @@ class PipelineMicrobatchExecutor:
                 video_grid_thw,
             )
         ):
-            return None
+            return self._skip("multimodal_inputs")
 
         active_window = numpy.asarray(active_mask_full_cpu[:padded_num_reqs], dtype=numpy.bool_)
         scheduled_window = numpy.asarray(scheduled_full_cpu[:padded_num_reqs], dtype=numpy.int32)
         active_positions = numpy.flatnonzero(active_window & (scheduled_window > 0))
         active_count = int(active_positions.size)
         if active_count < 2:
-            return None
+            return self._skip("active_count<2", active_count=active_count)
         if not numpy.all(scheduled_window[active_positions] == 1):
-            return None
+            return self._skip("not_decode_only")
 
         num_stages = len(pipeline_plan.stage_meshes)
         if num_stages < 2:
-            return None
+            return self._skip("num_stages<2", num_stages=num_stages)
         microbatch_shape = self._resolve_pipeline_microbatch_shape(
             active_count=active_count,
             num_stages=num_stages,
@@ -550,7 +567,11 @@ class PipelineMicrobatchExecutor:
             pp_microbatch_size=self._manager.pp_microbatch_size,
         )
         if microbatch_shape is None:
-            return None
+            return self._skip(
+                "microbatch_shape_disabled",
+                pp_microbatch_count=self._manager.pp_microbatch_count,
+                pp_microbatch_size=self._manager.pp_microbatch_size,
+            )
         microbatch_count, microbatch_req_count = microbatch_shape
         if not self._use_pipeline_microbatching(
             active_count=active_count,
@@ -560,7 +581,15 @@ class PipelineMicrobatchExecutor:
             min_token_bucket=int(self._manager.min_input_pad),
             has_compiled_handoff=device_token_handoff is not None,
         ):
-            return None
+            return self._skip(
+                "use_microbatching=False",
+                active_count=active_count,
+                num_stages=num_stages,
+                microbatch_count=microbatch_count,
+                microbatch_req_count=microbatch_req_count,
+                min_input_pad=int(self._manager.min_input_pad),
+                has_handoff=device_token_handoff is not None,
+            )
         microbatch_padded_reqs = _get_padded_num_reqs_with_upper_limit(
             microbatch_req_count,
             upper_limit=int(padded_num_reqs),
@@ -570,21 +599,33 @@ class PipelineMicrobatchExecutor:
         if token_paddings:
             candidates = [int(x) for x in token_paddings if int(x) >= int(microbatch_req_count)]
             if not candidates:
-                return None
+                return self._skip(
+                    "no_token_bucket",
+                    microbatch_req_count=microbatch_req_count,
+                    token_paddings=list(token_paddings),
+                )
             microbatch_num_tokens = min(candidates)
         else:
             microbatch_num_tokens = max(int(num_tokens), int(microbatch_req_count), int(self._manager.min_input_pad))
         if not self._manager._has_backbone_variant(microbatch_num_tokens, use_pipeline_runtime=True):
-            return None
+            return self._skip(
+                "no_pp_backbone_variant",
+                microbatch_num_tokens=microbatch_num_tokens,
+                microbatch_req_count=microbatch_req_count,
+            )
         if not self._manager._model_executor.has_lm_head(padded_num_reqs):
-            return None
+            return self._skip("no_lm_head", padded_num_reqs=padded_num_reqs)
 
         start_prep = time.time()
         chunks = [active_positions[i : i + microbatch_req_count] for i in range(0, active_count, microbatch_req_count)]
         if len(chunks) < 2:
-            return None
+            return self._skip("chunks<2", num_chunks=len(chunks), microbatch_req_count=microbatch_req_count)
         if device_token_handoff is not None and int(device_token_handoff.token_ids.shape[0]) < active_count:
-            return None
+            return self._skip(
+                "handoff_too_small",
+                handoff_rows=int(device_token_handoff.token_ids.shape[0]),
+                active_count=active_count,
+            )
 
         input_batches: list[tuple[tp.Any, tp.Any, tp.Any, BatchMetadata]] = []
         metadata_batches: list[BatchMetadata] = []
