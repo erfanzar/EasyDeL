@@ -602,7 +602,13 @@ def main() -> int:
         min_input_pad=args.min_input_pad if args.min_input_pad is not None else args.max_num_seqs,
         min_token_pad=16,
         max_num_seqs=args.max_num_seqs,
-        max_num_seq_buckets=[args.max_num_seqs],
+        # A single request bucket ([max_num_seqs]) minimizes compile cost, but it
+        # clamps the runner's min_input_pad up to max_num_seqs, which disables PP
+        # decode microbatching (the wavefront gate needs microbatch rows >=
+        # min_input_pad). When --min-input-pad is set, derive the usual bucket
+        # ladder from it so the smaller request buckets exist and the wavefront
+        # can engage; otherwise keep the compile-cheap single bucket.
+        max_num_seq_buckets=(None if args.min_input_pad is not None else [args.max_num_seqs]),
         async_scheduling=not args.no_async,
         use_aot_forward=args.use_aot_forward,
         verbose=args.verbose_runner,
