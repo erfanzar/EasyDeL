@@ -2184,28 +2184,17 @@ def _strict_sanitize_explicit_stage_spec(
     return shape_spec
 
 
-def _canonical_stage_sharding(value: object, sharding: object, stage_mesh: object) -> object | None:
-    """Return a canonical ``NamedSharding`` for ``value`` on ``stage_mesh``.
+_CACHE_MISSING = object()
+_CANONICAL_STAGE_SHARDING_CACHE: dict[tuple[object, ...], object] = {}
+_CANONICAL_STAGE_SHARDING_CACHE_MAX = 8192
 
-    The runtime may receive parameters whose existing sharding still contains
-    singleton mesh axes from model initialization, while the optimizer returns
-    the same physical layout with those trailing singleton axes elided.  Without
-    canonicalization, the first training step compiles one set of stage jits and
-    the second step compiles the same jits again with equivalent but shorter
-    specs.
 
-    Args:
-        value: Value consumed by the helper.
-        sharding: JAX sharding object describing how an array is placed.
-        stage_mesh: Mesh assigned to the current pipeline stage.
+def _compute_canonical_stage_sharding(spec: object, shape: tuple[int, ...], stage_mesh: object) -> object:
+    """Compute the canonical ``NamedSharding`` for ``(spec, shape, stage_mesh)``.
 
-    Returns:
-        Return a canonical ``NamedSharding`` for ``value`` on ``stage_mesh``.
+    Pure function extracted from :func:`_canonical_stage_sharding` so the result
+    can be memoized per stable ``(spec, shape, stage_mesh)`` decode bucket key.
     """
-    spec = sharding if isinstance(sharding, jax.sharding.PartitionSpec) else getattr(sharding, "spec", None)
-    if spec is None or not hasattr(value, "shape"):
-        return None
-    shape = tuple(getattr(value, "shape", ()))
     try:
         edge_mesh, spec = _explicit_stage_mesh_and_spec(
             spec,
@@ -2222,6 +2211,52 @@ def _canonical_stage_sharding(value: object, sharding: object, stage_mesh: objec
         )
     spec = _trim_trailing_replicated_stage_axes(spec, edge_mesh)
     return jax.sharding.NamedSharding(edge_mesh, spec)
+
+
+def _canonical_stage_sharding(value: object, sharding: object, stage_mesh: object) -> object | None:
+    """Return a canonical ``NamedSharding`` for ``value`` on ``stage_mesh``.
+
+    The runtime may receive parameters whose existing sharding still contains
+    singleton mesh axes from model initialization, while the optimizer returns
+    the same physical layout with those trailing singleton axes elided.  Without
+    canonicalization, the first training step compiles one set of stage jits and
+    the second step compiles the same jits again with equivalent but shorter
+    specs.
+
+    The ``(spec, shape, stage_mesh)`` -> ``NamedSharding`` mapping is a pure
+    function of stable inputs, and the resident MPMD decode dispatcher calls this
+    once per dynamic stage input (KV/metadata leaves) on *every* token. The
+    result is memoized so repeated same-bucket decode steps reuse the computed
+    sharding instead of re-running spec sanitisation and mesh resolution each
+    step; the cache is keyed on hashable inputs only and falls back to a direct
+    (uncached) computation for any unhashable key, so behaviour is unchanged.
+
+    Args:
+        value: Value consumed by the helper.
+        sharding: JAX sharding object describing how an array is placed.
+        stage_mesh: Mesh assigned to the current pipeline stage.
+
+    Returns:
+        Return a canonical ``NamedSharding`` for ``value`` on ``stage_mesh``.
+    """
+    spec = sharding if isinstance(sharding, jax.sharding.PartitionSpec) else getattr(sharding, "spec", None)
+    if spec is None or not hasattr(value, "shape"):
+        return None
+    shape = tuple(getattr(value, "shape", ()))
+    cache_key: tuple[object, ...] | None = (spec, shape, stage_mesh)
+    try:
+        cached = _CANONICAL_STAGE_SHARDING_CACHE.get(cache_key, _CACHE_MISSING)
+    except TypeError:
+        cache_key = None
+        cached = _CACHE_MISSING
+    if cached is not _CACHE_MISSING:
+        return cached
+    result = _compute_canonical_stage_sharding(spec, shape, stage_mesh)
+    if cache_key is not None:
+        if len(_CANONICAL_STAGE_SHARDING_CACHE) >= _CANONICAL_STAGE_SHARDING_CACHE_MAX:
+            _CANONICAL_STAGE_SHARDING_CACHE.clear()
+        _CANONICAL_STAGE_SHARDING_CACHE[cache_key] = result
+    return result
 
 
 def _live_shape_compatible_sharding(
