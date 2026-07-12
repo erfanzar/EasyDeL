@@ -395,9 +395,11 @@ class Tool(abc.ABC):
 class PythonCodeTool(Tool):
     """Sandboxed Python code execution.
 
-    Runs Python code and captures stdout/stderr. The code has access
-    to the full standard library (math, json, re, collections, etc.).
-    Uses ``SIGALRM`` for timeout on POSIX systems.
+    Runs Python code in a hardened child process (CPU/memory rlimits,
+    scrubbed env, temp cwd, process-group-kill timeout; see
+    :class:`easydel.trainers._shared.sandbox.Sandbox`) and captures
+    stdout/stderr. Because it is out-of-process, a crash or resource bomb in
+    the generated code cannot take down the trainer worker.
 
     Args:
         timeout: Maximum execution time in seconds.
@@ -420,41 +422,17 @@ class PythonCodeTool(Tool):
 
         code: Complete Python code to execute. Must use print() to produce visible output.
         """
-        import contextlib
-        import io
-        import signal
+        from .._shared.sandbox import Sandbox
 
-        output = io.StringIO()
-        try:
-
-            def _timeout_handler(signum, frame):
-                """Raise ``TimeoutError`` from a ``SIGALRM`` interrupt.
-
-                Args:
-                    signum: Signal number (ignored).
-                    frame: Current stack frame (ignored).
-
-                Raises:
-                    TimeoutError: Always.
-                """
-                raise TimeoutError(f"Code execution timed out after {self._timeout}s")
-
-            old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
-            signal.alarm(int(self._timeout))
-            try:
-                restricted_globals: dict[str, tp.Any] = {"__builtins__": __builtins__}
-                with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
-                    exec(code, restricted_globals)
-            finally:
-                signal.alarm(0)
-                signal.signal(signal.SIGALRM, old_handler)
-        except Exception as e:
-            output.write(f"\nError: {type(e).__name__}: {e}")
-
-        result = output.getvalue()
-        if len(result) > self._max_output_length:
-            result = result[: self._max_output_length] + "\n... (output truncated)"
-        return result or "(no output)"
+        res = Sandbox(timeout=self._timeout, max_output=self._max_output_length).run_python(code)
+        output = res.stdout
+        if res.stderr:
+            output += ("\n" if output else "") + res.stderr
+        if res.timed_out:
+            output += f"\nError: code execution timed out after {self._timeout}s"
+        if len(output) > self._max_output_length:
+            output = output[: self._max_output_length] + "\n... (output truncated)"
+        return output or "(no output)"
 
 
 @register_tool("calculator")
@@ -564,24 +542,17 @@ class BashTool(Tool):
 
         command: The shell command to execute, e.g. 'ls -la /tmp', 'echo hello | wc -c', 'curl -s https://example.com'.
         """
-        import subprocess
+        from .._shared.sandbox import Sandbox
 
-        try:
-            result = subprocess.run(
-                [self._shell, "-c", command],
-                capture_output=True,
-                text=True,
-                timeout=self._timeout,
-            )
-            output = result.stdout
-            if result.stderr:
-                output += f"\n[stderr]\n{result.stderr}"
-            if result.returncode != 0:
-                output += f"\n[exit code: {result.returncode}]"
-        except subprocess.TimeoutExpired:
+        res = Sandbox(timeout=self._timeout, max_output=self._max_output_length).run_bash(command, shell=self._shell)
+        if res.timed_out:
             output = f"Error: command timed out after {self._timeout}s"
-        except Exception as e:
-            output = f"Error: {type(e).__name__}: {e}"
+        else:
+            output = res.stdout
+            if res.stderr:
+                output += f"\n[stderr]\n{res.stderr}"
+            if res.returncode not in (0, None):
+                output += f"\n[exit code: {res.returncode}]"
 
         if len(output) > self._max_output_length:
             output = output[: self._max_output_length] + "\n... (output truncated)"
