@@ -437,6 +437,32 @@ def test_worker_send_to_leader_reaches_plane_handler():
         assert payload == b"payload-bytes"
 
 
+def test_leader_shutdown_delivers_shutdown_broadcast_to_client():
+    """leader.shutdown() must flush the Shutdown broadcast to connected peers.
+
+    The IO loop drains its outbox at the top of each iteration and polls with
+    the same 50ms timeout that shutdown() waits before flipping _stop_io, so
+    the top-of-loop drain can miss the just-enqueued Shutdown and the loop
+    exits without sending it — peers then see the owner go silent instead of
+    receiving a clean teardown. Draining once more in the loop's finally
+    (flushed by the socket LINGER) closes that race.
+    """
+    from easydel.inference.esurge.distributed import wire
+
+    with _Plane() as plane:
+        port = int(plane.leader._bind_endpoint.rsplit(":", 1)[1])
+        client = _RawClient(port)
+        try:
+            assert isinstance(client.hello(), wire.HelloOk)
+            _wait_until(lambda: plane.leader.client_identity("client-a") is not None)
+
+            plane.leader.shutdown("bye")
+            message = client.recv_until(lambda m: isinstance(m, wire.Shutdown), timeout_s=5.0)
+            assert message.reason == "bye"
+        finally:
+            client.close()
+
+
 def test_leader_restarts_after_shutdown():
     port = _free_port()
 
@@ -490,3 +516,77 @@ def test_leader_restarts_after_shutdown():
         thread.join(timeout=DEADLINE_S)
         worker.shutdown()
         assert not thread.is_alive()
+
+
+def test_worker_coordinator_rejoins_across_leader_restart():
+    """A REUSED worker coordinator must re-Hello after a leader restart.
+
+    This is the weight-hot-swap lifecycle (``update_model_weights`` on a
+    worker rank): leader and worker tear down and re-initiate in lockstep,
+    but the worker *coordinator object* survives — only its replay thread is
+    respawned. ``start()`` must therefore drop the stale DEALER and
+    re-handshake; otherwise the restarted leader (which resets its authed
+    set and ledger) drops the worker's frames as unauthenticated and it
+    never rejoins, so the second ``leader.start()`` would time out.
+
+    Unlike :func:`test_leader_restarts_after_shutdown`, which builds a fresh
+    worker (and socket) per round, this reuses one worker across rounds so
+    the stale-socket path is actually exercised.
+    """
+    port = _free_port()
+    leader = ZmqLeaderCoordinator(
+        _MockRunner(),
+        world_size=2,
+        bind_host="127.0.0.1",
+        control_port=port,
+        auth_token=AUTH,
+        config_fingerprint=FINGERPRINT,
+        ready_timeout_s=DEADLINE_S,
+        step_timeout_s=5.0,
+        heartbeat_interval_s=0.2,
+        heartbeat_timeout_s=DEADLINE_S,
+    )
+    worker = ZmqWorkerCoordinator(
+        _MockRunner(),
+        rank=1,
+        world_size=2,
+        leader_addr="127.0.0.1",
+        control_port=port,
+        auth_token=AUTH,
+        config_fingerprint=FINGERPRINT,
+        connect_timeout_s=DEADLINE_S,
+        heartbeat_interval_s=0.2,
+        heartbeat_timeout_s=DEADLINE_S,
+    )
+    worker_runner = worker._runner
+
+    try:
+        for round_idx in range(2):
+            stop_event = threading.Event()
+
+            def _body(ev=stop_event):
+                try:
+                    # Reused coordinator: round 1+ hits the stale-socket
+                    # re-handshake path.
+                    worker.start()
+                    worker.run_worker_loop(ev)
+                except StepCoordinationError:
+                    pass
+
+            thread = threading.Thread(target=_body, daemon=True)
+            thread.start()
+            leader.start()  # would time out here in round 1 without the re-Hello
+            out = leader.execute_sync(_sched_output(f"R{round_idx}"))
+            assert out.tag == f"R{round_idx}"
+            expected = [f"sync:R{r}" for r in range(round_idx + 1)]
+            _wait_until(lambda exp=expected: worker_runner.calls == exp)
+            assert worker._sock is not None, "worker must hold a live handshake after rejoining"
+
+            # Leader broadcasts Shutdown; the worker replay loop returns but
+            # the coordinator object (and its now-stale socket) survives.
+            leader.shutdown(f"round {round_idx} teardown")
+            stop_event.set()
+            thread.join(timeout=DEADLINE_S)
+            assert not thread.is_alive()
+    finally:
+        worker.shutdown()
