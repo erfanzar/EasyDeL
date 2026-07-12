@@ -153,6 +153,23 @@ class GlmMoeDsaConfig(EasyDeLBaseConfig):
             ``num_attention_heads // 2`` when ``None``).
         indexer_rope_interleave (`bool`, *optional*, defaults to ``False``):
             Whether to use interleaved RoPE layout for the indexer.
+        indexer_types (`list[str]`, *optional*):
+            Per-layer DSA indexer mode (``"full"`` runs the layer's own indexer, ``"shared"``
+            reuses the previous ``"full"`` layer's top-k selection). Defaults to the schedule
+            derived from ``index_topk_pattern`` (or ``index_topk_freq`` /
+            ``index_skip_topk_offset``), which with the defaults is all-``"full"``.
+        index_topk_pattern (`str | list[str]`, *optional*):
+            Compact per-layer indexer schedule; a string of ``"F"`` (full) / ``"S"`` (shared)
+            characters, or an explicit list. Overrides ``index_topk_freq`` /
+            ``index_skip_topk_offset`` when provided. Only used to derive ``indexer_types``.
+        index_topk_freq (`int`, *optional*, defaults to 1):
+            Period of ``"full"`` indexer layers when deriving ``indexer_types`` (a value of 1
+            makes every layer ``"full"``). Only used when ``indexer_types`` is ``None`` and no
+            ``index_topk_pattern`` is given.
+        index_skip_topk_offset (`int`, *optional*, defaults to 2):
+            Layer offset applied before the ``index_topk_freq`` modulo when deriving
+            ``indexer_types``. Only used when ``indexer_types`` is ``None`` and no
+            ``index_topk_pattern`` is given.
         mlp_layer_types (`list[str]`, *optional*):
             Per-layer MLP type schedule (``"dense"`` or ``"sparse"``). Defaults to the first
             3 layers dense and the remainder sparse.
@@ -204,6 +221,10 @@ class GlmMoeDsaConfig(EasyDeLBaseConfig):
         index_head_dim: int = 128,
         index_n_heads: int | None = 32,
         indexer_rope_interleave: bool = False,
+        indexer_types: list[str] | None = None,
+        index_topk_pattern: str | list[str] | None = None,
+        index_topk_freq: int = 1,
+        index_skip_topk_offset: int = 2,
         mlp_layer_types: list[str] | None = None,
         attention_bias: bool = False,
         attention_dropout: float = 0.0,
@@ -258,6 +279,21 @@ class GlmMoeDsaConfig(EasyDeLBaseConfig):
                 to ``num_attention_heads // 2`` when ``None``.
             indexer_rope_interleave: Whether the DSA indexer uses
                 interleaved RoPE.
+            indexer_types: Optional per-layer ``"full"``/``"shared"``
+                indexer schedule; ``"full"`` layers run their own DSA
+                indexer, ``"shared"`` layers reuse the previous full
+                layer's top-k. Defaults to the schedule derived from
+                ``index_topk_pattern`` / ``index_topk_freq`` /
+                ``index_skip_topk_offset`` (all-``"full"`` with the
+                defaults). Mirrors HF's ``__post_init__`` derivation.
+            index_topk_pattern: Compact indexer schedule (``"F"``/``"S"``
+                string or explicit list) used to derive ``indexer_types``
+                when it is ``None``; overrides the freq/offset schedule.
+            index_topk_freq: Period of ``"full"`` layers when deriving
+                ``indexer_types`` from the freq/offset schedule (1 makes
+                every layer ``"full"``).
+            index_skip_topk_offset: Layer offset applied before the
+                ``index_topk_freq`` modulo when deriving ``indexer_types``.
             mlp_layer_types: Optional per-layer ``"dense"``/``"sparse"``
                 schedule; defaults to the first three layers dense and
                 the remainder sparse.
@@ -267,8 +303,9 @@ class GlmMoeDsaConfig(EasyDeLBaseConfig):
 
         Raises:
             ValueError: If ``n_routed_experts`` is not divisible by
-                ``n_group``, if ``mlp_layer_types`` length disagrees with
-                ``num_hidden_layers``, or if it contains an unknown entry.
+                ``n_group``, if ``mlp_layer_types`` or ``indexer_types``
+                length disagrees with ``num_hidden_layers``, or if either
+                contains an unknown entry.
         """
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
@@ -327,6 +364,36 @@ class GlmMoeDsaConfig(EasyDeLBaseConfig):
         for layer_type in self.mlp_layer_types:
             if layer_type not in ("dense", "sparse"):
                 raise ValueError(f"Invalid layer type {layer_type}. Expected 'dense' or 'sparse'.")
+
+        # Per-layer DSA indexer schedule. Mirrors HF ``GlmMoeDsaConfig.__post_init__``:
+        # an explicit ``index_topk_pattern`` ("F"/"S" or list) wins, otherwise derive from
+        # ``index_topk_freq`` (>=1) + ``index_skip_topk_offset`` — the freq=1 default makes
+        # every layer "full". This attribute must exist because HF's own ``__init__`` reads
+        # ``config.indexer_types[layer_idx]`` directly (its ``__post_init__`` does not run
+        # when the tester hands it an EasyDeL config).
+        self.indexer_types = indexer_types
+        if self.indexer_types is None:
+            if index_topk_pattern is not None:
+                self.indexer_types = (
+                    [{"F": "full", "S": "shared"}[c] for c in index_topk_pattern]
+                    if isinstance(index_topk_pattern, str)
+                    else list(index_topk_pattern)
+                )
+            else:
+                freq = max(index_topk_freq, 1)
+                offset = index_skip_topk_offset
+                self.indexer_types = [
+                    "full" if (max(i - offset + 1, 0) % freq) == 0 else "shared"
+                    for i in range(self.num_hidden_layers)
+                ]
+
+        if len(self.indexer_types) != self.num_hidden_layers:
+            raise ValueError(
+                f"indexer_types must have length {self.num_hidden_layers}, got {len(self.indexer_types)}."
+            )
+        for indexer_type in self.indexer_types:
+            if indexer_type not in ("full", "shared"):
+                raise ValueError(f"Invalid indexer type {indexer_type}. Expected 'full' or 'shared'.")
 
         super().__init__(
             pad_token_id=pad_token_id,

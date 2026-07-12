@@ -38,8 +38,13 @@ import spectrax as spx
 AXIS_NAMES = ("pp", "dp", "fsdp", "ep", "tp", "sp")
 
 
-def _build_qwen3_moe_block():
-    """Single-device (ep=1) Qwen3MoeSparseBlock; ep=1 avoids ragged_all_to_all on CPU."""
+def _build_qwen3_moe_block(norm_topk_prob: bool = True):
+    """Single-device (ep=1) Qwen3MoeSparseBlock; ep=1 avoids ragged_all_to_all on CPU.
+
+    ``norm_topk_prob`` selects the routing strategy: True -> TOP_K (renormalize
+    top-k weights), False -> TOP_K_NDIV (raw weights). It does not change parameter
+    shapes, so two blocks built with the same seed share identical weights.
+    """
     from easydel.modules.qwen3_moe.modeling_qwen3_moe import Qwen3MoeSparseBlock
     from easydel.modules.qwen3_moe.qwen3_moe_configuration import Qwen3MoeConfig
 
@@ -53,7 +58,7 @@ def _build_qwen3_moe_block():
         head_dim=8,
         num_experts=8,
         num_experts_per_tok=2,
-        norm_topk_prob=True,
+        norm_topk_prob=norm_topk_prob,
         sharding_axis_dims=(1, 1, 1, 1, 1, 1),
         sharding_axis_names=AXIS_NAMES,
         scan_layers=False,
@@ -108,3 +113,38 @@ def test_moe_block_forward_under_readonly_transform_does_not_raise():
     assert bool(jnp.all(jnp.isfinite(out)))
     # The readonly transform must not have rebound the hooks on the live module.
     assert block.moe_hooks.refine_weights_hook is None
+
+
+def test_fused_path_applies_topk_renorm_like_standard():
+    """Regression: the default FUSED_MOE path must apply the TOP_K weight-renorm default.
+
+    ``_sparse_moe_call`` (the recommended/default fused engine) previously read the
+    raw ``self.moe_hooks`` and skipped ``_configure_hooks_for_routing_strategy``, so a
+    TOP_K model relying on the framework default (``norm_topk_prob``, no explicit
+    hooks — Mixtral/Arctic, norm_topk_prob Qwen) did NOT renormalize its top-k
+    weights on the fused path, diverging from HF and from the dense/standard paths.
+    The other tests only assert the default hook is *returned*, never that the fused
+    path *applies* it — this pins the applied behavior by requiring the fused and
+    standard paths to agree. On the buggy code they differ by the renorm factor.
+    """
+    # Same fused engine, same init weights; only the routing strategy differs:
+    # TOP_K (renormalize) vs TOP_K_NDIV (raw). If the fused path applies the TOP_K
+    # renorm default, the two outputs MUST differ. On the buggy code the fused path
+    # ignored the routing-strategy hook, so both were raw -> identical outputs.
+    cfg_norm, block_norm = _build_qwen3_moe_block(norm_topk_prob=True)
+    cfg_raw, block_raw = _build_qwen3_moe_block(norm_topk_prob=False)
+    # Non-uniform input so the top-2 mass is < 1 (makes renormalization observable).
+    x = jnp.linspace(-1.0, 1.0, 1 * 4 * cfg_norm.hidden_size, dtype=jnp.float32).reshape(1, 4, cfg_norm.hidden_size)
+
+    with cfg_norm.mesh:
+        out_norm, _ = block_norm(x)
+    with cfg_raw.mesh:
+        out_raw, _ = block_raw(x)
+
+    max_diff = float(jnp.max(jnp.abs(out_norm - out_raw)))
+    assert max_diff > 1e-6, (
+        "TOP_K (norm_topk_prob=True) and TOP_K_NDIV fused outputs are identical "
+        f"(max diff {max_diff:.2e}) — the fused path is not applying the TOP_K weight "
+        "renormalization (it silently read raw self.moe_hooks instead of the "
+        "routing-strategy-configured hooks)"
+    )
