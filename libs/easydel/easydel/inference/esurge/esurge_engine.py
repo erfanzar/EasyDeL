@@ -2529,9 +2529,29 @@ class eSurge:
         if model is None and graphdef is None and graphstate is None and graphother is None:
             raise ValueError("No new model or graph components provided for update")
 
-        was_running = self._scheduler_running
+        step_coordinator = getattr(self, "_step_coordinator", None)
+        is_worker_rank = step_coordinator is not None and not step_coordinator.is_leader
+
+        # A ZMQ worker rank runs a replay thread, not the scheduler loop, so
+        # `_scheduler_running` is always False there; gate on the liveness
+        # property that covers both flavours so the worker actually tears
+        # down and rejoins the (restarted) leader across the swap.
+        was_running = self._generation_alive
         if was_running:
             self.terminate()
+            if is_worker_rank and step_coordinator is not None:
+                # Worker `terminate()` stops the replay loop but returns
+                # before the step-coordinator shutdown (there is no scheduler
+                # loop to drain), leaving the DEALER connected to the
+                # pre-restart leader. Force it closed so the re-`initiate()`
+                # below re-handshakes with the leader — which resets its
+                # authed set and ledger when the leader rank re-`start()`s in
+                # lockstep — instead of replaying on a stale connection whose
+                # frames are dropped as unauthenticated.
+                try:
+                    step_coordinator.shutdown("update_model_weights")
+                except Exception:
+                    logger.debug("Worker step coordinator shutdown failed", exc_info=True)
 
         self._drain_pipeline_workers("update_model_weights")
 

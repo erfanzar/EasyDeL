@@ -434,6 +434,71 @@ def test_subscriber_abort_detaches_until_last_one_aborts_rows():
         assert not plane.owner.needs_tee
 
 
+def test_coalesce_parent_abort_retires_whole_group():
+    """A bare parent id aborts every sample of a coalesced n>1 group.
+
+    Subscriber children are keyed ``parent + suffix`` (``AUTO-0``, ``AUTO-1``),
+    so a bare parent id (``AUTO``) used to miss the lookup and silently drop
+    the abort — the scheduled rows kept generating while the origin had
+    already forgotten the ids. The owner must abort the whole scheduled group.
+    """
+    with _PlaneHarness() as plane:
+        requests = [
+            FakeEngineRequest(f"{AUTO_1}-0", parent_request_id=AUTO_1, sample_index=0),
+            FakeEngineRequest(f"{AUTO_1}-1", parent_request_id=AUTO_1, sample_index=1),
+        ]
+        plane.origin.submit_remote(requests)
+        _wait_until(lambda: len(plane.owner_engine.submitted) == 1)
+        scheduled_parent = plane.owner_engine.submitted[0][0].parent_request_id
+        assert scheduled_parent.startswith("q0000000001-")
+        assert plane.owner.needs_tee
+
+        # Abort by the bare PARENT id.
+        assert plane.origin.notify_abort(AUTO_1)
+        _wait_until(lambda: plane.owner_engine.aborted == [scheduled_parent])
+        _wait_until(lambda: not plane.owner.needs_tee)
+        assert not plane.origin.is_remote(AUTO_1)
+
+
+def test_coalesce_child_abort_spares_surviving_sample():
+    """A child id aborts ONE sample; the survivors stream to completion.
+
+    ``_detach`` used to remove all of the subscriber's sample keys and the
+    subscriber, so the last-subscriber rule aborted the WHOLE group — the
+    surviving samples' deltas never reached the origin and its ``generate()``
+    hung forever. A child abort must pop only that suffix and take down only
+    that scheduled row.
+    """
+    with _PlaneHarness() as plane:
+        requests = [
+            FakeEngineRequest(f"{AUTO_1}-0", parent_request_id=AUTO_1, sample_index=0),
+            FakeEngineRequest(f"{AUTO_1}-1", parent_request_id=AUTO_1, sample_index=1),
+        ]
+        plane.origin.submit_remote(requests)
+        _wait_until(lambda: len(plane.owner_engine.submitted) == 1)
+        scheduled_parent = plane.owner_engine.submitted[0][0].parent_request_id
+
+        # Abort sample -0 only.
+        assert plane.origin.notify_abort(f"{AUTO_1}-0")
+        _wait_until(lambda: plane.owner_engine.aborted == [f"{scheduled_parent}-0"])
+        assert scheduled_parent not in plane.owner_engine.aborted, "the group must NOT be wholly aborted"
+        assert plane.owner.needs_tee, "the group keeps generating for the surviving sample"
+
+        # Sample -1 still streams and terminates to the origin.
+        plane.tee(EngineCoreOutput(request_id=f"{scheduled_parent}-1", new_token_ids=[7]))
+        _wait_until(lambda: any(o.request_id == f"{AUTO_1}-1" for o in plane.origin_sink.all_outputs()))
+        plane.tee(
+            EngineCoreOutput(
+                request_id=f"{scheduled_parent}-1", new_token_ids=[8], finish_reason=FinishReason.STOP
+            )
+        )
+        _wait_until(lambda: not plane.origin.is_remote(f"{AUTO_1}-1"))
+        survivor = [o for o in plane.origin_sink.all_outputs() if o.request_id == f"{AUTO_1}-1"]
+        assert survivor[-1].finish_reason == FinishReason.STOP
+        # The aborted sample never streamed anything upstream.
+        assert all(o.request_id != f"{AUTO_1}-0" for o in plane.origin_sink.all_outputs())
+
+
 def test_explicit_ids_bypass_coalescing_on_admit_local():
     with _PlaneHarness() as plane:
         plane.owner.admit_local([FakeEngineRequest(DISTINCT_B)])

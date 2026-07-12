@@ -702,7 +702,7 @@ class OwnerRequestPlane:
 
     # aborts / stops
     def _handle_abort(self, identity: bytes, message: wire.AbortReq) -> None:
-        scheduled_abort: str | None = None
+        scheduled_aborts: list[str] = []
         with self._lock:
             owner_id = self._origin_to_owner.get((identity, message.request_id))
             if owner_id is not None:
@@ -710,17 +710,53 @@ class OwnerRequestPlane:
                 for child_id in list(self._children.get(owner_id, ())):
                     self._retire(child_id)
                 self._retire(owner_id)
-                scheduled_abort = owner_id
+                scheduled_aborts.append(owner_id)
             else:
-                mapped = self._subscriber_children.get((identity, message.request_id))
-                if mapped is None:
-                    return
-                entry, _suffix, parent_id = mapped
-                self._detach(entry, identity, parent_id)
-                if not entry.subscribers and not entry.all_finished:
-                    scheduled_abort = entry.scheduled_parent
-                    self._retire_entry(entry)
-        if scheduled_abort is not None:
+                # Coalescable abort. Subscriber children are keyed by
+                # ``parent + suffix``, so a bare parent id never matches a
+                # ``get`` on the raw id (``AUTO`` vs ``AUTO-0``). Mirror
+                # ``notify_local_abort``: the wire id is either a subscriber
+                # parent id (``AbortReq`` contract: aborts every ``n>1``
+                # child) or a subscriber sample-child id (aborts one sample).
+                request_id = message.request_id
+                matched_keys = [
+                    key
+                    for key, (_entry, _suffix, parent_id) in self._subscriber_children.items()
+                    if key[0] == identity and (key[1] == request_id or parent_id == request_id)
+                ]
+                for key in matched_keys:
+                    mapped = self._subscriber_children.get(key)
+                    if mapped is None:
+                        continue  # already retired while handling a sibling suffix
+                    entry, suffix, parent_id = mapped
+                    self._subscriber_children.pop(key, None)
+                    # A parent-level (or n=1) abort detaches the subscriber
+                    # entirely; a sample-level abort keeps it attached for its
+                    # remaining samples.
+                    if parent_id == request_id or key[1] == parent_id:
+                        entry.subscribers.pop((identity, parent_id), None)
+                    if not entry.subscribers and not entry.all_finished:
+                        # Last subscriber gone: tear the whole group down.
+                        scheduled_aborts.append(entry.scheduled_parent)
+                        self._retire_entry(entry)
+                    elif (
+                        suffix not in entry.finished_suffixes
+                        and suffix not in entry.scheduler_finished
+                        and not any(
+                            value[0] is entry and value[1] == suffix
+                            for value in self._subscriber_children.values()
+                        )
+                    ):
+                        # Subscribers remain, but none still wants this sample:
+                        # abort only its scheduled row so the survivors stream
+                        # on (the AbortReq contract is "a child id aborts one
+                        # sample"). Mark it finished so the group retires once
+                        # the rest terminate.
+                        entry.scheduler_finished.add(suffix)
+                        if entry.all_finished and entry.finished_at is None:
+                            entry.finished_at = time.monotonic()
+                        scheduled_aborts.append(entry.scheduled_parent + suffix)
+        for scheduled_abort in scheduled_aborts:
             try:
                 self._abort_request(scheduled_abort)
             except Exception:

@@ -443,24 +443,27 @@ class ZmqLeaderCoordinator:
                 frames.append(payload)
             sock.send_multipart(frames)
 
+        def _drain_outbox() -> None:
+            # Outbound in FIFO order. Destinations: _DEST_WORKERS broadcasts
+            # the step stream to worker ranks, _DEST_ALL additionally covers
+            # plane clients (shutdown), an identity targets one peer.
+            try:
+                while True:
+                    dest, header, payload = self._outbox.get_nowait()
+                    if dest is _DEST_WORKERS or dest is _DEST_ALL:
+                        for identity in worker_identities.values():
+                            _send_to(identity, header, payload)
+                        if dest is _DEST_ALL:
+                            for identity in self._client_identities.values():
+                                _send_to(identity, header, payload)
+                    else:
+                        _send_to(dest, header, payload)
+            except queue.Empty:
+                pass
+
         try:
             while not self._stop_io.is_set():
-                # Outbound in FIFO order. Destinations: _DEST_WORKERS broadcasts
-                # the step stream to worker ranks, _DEST_ALL additionally covers
-                # plane clients (shutdown), an identity targets one peer.
-                try:
-                    while True:
-                        dest, header, payload = self._outbox.get_nowait()
-                        if dest is _DEST_WORKERS or dest is _DEST_ALL:
-                            for identity in worker_identities.values():
-                                _send_to(identity, header, payload)
-                            if dest is _DEST_ALL:
-                                for identity in self._client_identities.values():
-                                    _send_to(identity, header, payload)
-                        else:
-                            _send_to(dest, header, payload)
-                except queue.Empty:
-                    pass
+                _drain_outbox()
 
                 now = time.monotonic()
                 if now - last_beat >= self._heartbeat_interval_s and (worker_identities or self._client_identities):
@@ -521,6 +524,11 @@ class ZmqLeaderCoordinator:
                     except Exception:
                         logger.exception("eSurge coordinator: plane handler failed")
         finally:
+            # Drain once more before closing: shutdown() enqueues the
+            # Shutdown broadcast and then sets _stop_io within one poll
+            # interval, so the top-of-loop drain can miss it. LINGER on
+            # close() flushes the queued frames to peers.
+            _drain_outbox()
             sock.close(linger=500)
 
 
@@ -596,11 +604,20 @@ class ZmqWorkerCoordinator:
                     pass
 
     def start(self) -> None:
-        """Connect, Hello, and wait for the leader's HelloOk."""
+        """Connect, Hello, and wait for the leader's HelloOk.
+
+        Restartable: the sole caller (engine ``initiate``) reaches here only
+        after any prior replay loop has exited, so an existing socket is
+        stale — a weight hot-swap tears the worker down in lockstep with the
+        leader, and the restarted leader resets its authed set and ledger. A
+        stale DEALER would auto-reconnect at the transport layer but never
+        re-Hello, so the leader would drop its frames as unauthenticated.
+        Close it first and re-handshake.
+        """
         import zmq
 
         if self._sock is not None:
-            return
+            self.shutdown()
         self._ctx = zmq.Context.instance()
         sock = self._ctx.socket(zmq.DEALER)
         sock.setsockopt(zmq.IDENTITY, _worker_identity(self.rank))

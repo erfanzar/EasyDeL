@@ -285,6 +285,14 @@ class RoutedEngine:
         else:
             request_ids = list(request_id)
 
+        # Validate the explicit/auto id mix up front, on the caller's thread.
+        # A mixed batch used to raise inside a daemon `_run` thread before its
+        # try/finally, so the error was swallowed (caller saw `None` outputs)
+        # and the acquired JSQ slots leaked. Fail cleanly before acquiring any.
+        provided = [rid for rid in request_ids if rid is not None]
+        if provided and len(provided) != len(request_ids):
+            raise ValueError("Mix of explicit and auto request ids in one routed batch is unsupported")
+
         by_member: dict[int, list[int]] = {}
         for position, prompt in enumerate(prompts):
             member_index = self.select_member(prompt)
@@ -297,16 +305,16 @@ class RoutedEngine:
         threads: list[threading.Thread] = []
 
         def _run(member_index: int, positions: list[int]) -> None:
-            member = self.members[member_index]
-            member_prompts = [prompts[p] for p in positions]
-            member_ids = [request_ids[p] for p in positions]
-            explicit = [rid for rid in member_ids if rid is not None]
-            kwargs: dict[str, typing.Any] = {}
-            if explicit:
-                if len(explicit) != len(member_ids):
-                    raise ValueError("Mix of explicit and auto request ids in one routed batch is unsupported")
-                kwargs["request_id"] = explicit if len(explicit) > 1 else explicit[0]
+            # The whole body runs under the release-protecting try/finally so
+            # the acquired in-flight slots free on every exit path.
             try:
+                member = self.members[member_index]
+                member_prompts = [prompts[p] for p in positions]
+                member_ids = [request_ids[p] for p in positions]
+                explicit = [rid for rid in member_ids if rid is not None]
+                kwargs: dict[str, typing.Any] = {}
+                if explicit:
+                    kwargs["request_id"] = explicit if len(explicit) > 1 else explicit[0]
                 outputs = member.generate(
                     member_prompts,
                     sampling_params=sampling_params,
