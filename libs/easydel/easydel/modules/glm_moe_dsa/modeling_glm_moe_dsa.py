@@ -1003,6 +1003,9 @@ class GlmMoeDsaAttention(UnifiedAttention):
 
         self.rotary = self._create_rotary(config, dtype)
         self.attention_performer = self._create_attention_performer(config, rngs)
+        # A full DSA indexer is created on every layer regardless of ``config.indexer_types``.
+        # This matches HF for "full" layers; "shared"-layer top-k reuse is not implemented here
+        # (see the warning in ``GlmMoeDsaModel.__init__``).
         self.indexer = GlmMoeDsaIndexer(
             config=config,
             dtype=dtype,
@@ -1556,6 +1559,22 @@ class GlmMoeDsaModel(EasyDeLBaseModule):
         self.param_dtype = param_dtype
         self.precision = precision
         self.rngs = rngs
+
+        # NOTE: the decoder stack is built with ``self.layers.scan`` (structurally identical
+        # layers), so every layer instantiates and runs its own DSA indexer. That is exactly
+        # HF's all-"full" schedule, but it does NOT implement HF's cross-layer top-k sharing
+        # where a "shared" layer reuses the previous "full" layer's top-k (``prev_topk_indices``)
+        # and carries no indexer weights. Warn loudly if a checkpoint declares "shared" layers
+        # so the divergence is never silent. Full "shared" support needs an unrolled stack (scan
+        # forbids per-layer structural differences) plus threading the prior top-k through the
+        # carry and dropping indexer params on shared layers.
+        if any(t == "shared" for t in (getattr(config, "indexer_types", None) or [])):
+            logger.warning_once(
+                "GLM-MoE-DSA config declares 'shared' indexer layers, but this EasyDeL "
+                "implementation runs a full DSA indexer on every layer and does not reuse a "
+                "previous full layer's top-k selection. Logits match HF only for all-'full' "
+                "indexer schedules; 'shared'-layer checkpoints will diverge."
+            )
 
         with self.assign_layer_stage(0, total_layers=self.config.num_hidden_layers):
             self.embed_tokens = Embed(

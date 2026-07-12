@@ -1149,7 +1149,13 @@ class BaseMoeModule(spx.Module, ABC):
 
         if gate_up_kernel is None and (wi_kernel is None or wu_kernel is None):
             raise ValueError("MoE requires either gate_up_kernel or both wi_kernel and wu_kernel.")
-        hooks = self.moe_hooks if hooks is None else hooks
+        # Resolve routing-strategy defaults (e.g. TOP_K weight renormalization) the same
+        # way the dense/standard paths do — the fused default path previously read the raw
+        # self.moe_hooks and silently skipped the default refine/select hook, so TOP_K MoE
+        # models relying on the framework default (Mixtral/Arctic, norm_topk_prob Qwen) were
+        # not renormalizing top-k weights. _configure_hooks_for_routing_strategy returns
+        # self.moe_hooks unchanged when the model set its own hooks, so this is a no-op there.
+        hooks = self._configure_hooks_for_routing_strategy() if hooks is None else hooks
         select_hook = hooks.select_hook if hooks else None
         refine_weights_hook = hooks.refine_weights_hook if hooks else None
         refine_inputs_hook = hooks.refine_inputs_hook if hooks else None
@@ -1436,10 +1442,21 @@ class BaseMoeModule(spx.Module, ABC):
                 intermediate_output = intermediate_output + wd_bias[selected_experts]
 
             if self.config.use_ring_of_experts:
-                # ``intermediate_output`` keeps the full static length here (rows past
-                # ``sum(group_sizes)`` are zero, see the note in the routing block
-                # above), so it already matches ``sorted_selected_experts`` and needs no
-                # padding before unpermute.
+                # The unpermute + expert-axis ``psum_scatter`` combine below sums every
+                # row across expert shards, so only the shard that OWNS a token's expert
+                # may carry a nonzero value — the non-local tail (rolled expert ids
+                # ``>= experts_per_shard``) MUST be exactly zero. The down grouped_matmul
+                # is *supposed* to zero rows past ``sum(local group_sizes)``, but that
+                # implicit zeroing is not guaranteed on every backend: XLA:CPU honors it,
+                # but on TPU the tail holds garbage (ep=4 zero-bias output diverged 373x
+                # from the non-ring reference, with NaNs at small magnitudes). ``wd_bias``,
+                # added AFTER the matmul, additionally taints the tail via its clamped
+                # out-of-bounds gather. Zero the tail explicitly so the combine is correct;
+                # this is a no-op on backends that already zero it (bit-identical on CPU).
+                local_mask = (selected_experts < (self.n_routed_experts // ep_size))[:, None]
+                intermediate_output = jnp.where(local_mask, intermediate_output, 0)
+                # ``intermediate_output`` keeps the full static length here, so it already
+                # matches ``sorted_selected_experts`` and needs no padding before unpermute.
                 output = unpermute(
                     intermediate_output,
                     sorted_selected_experts,
