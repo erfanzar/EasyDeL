@@ -57,18 +57,32 @@ Example:
 
 from .reward_verifiers import (
     CodeVerifier,
+    CompositeVerifier,
+    ContainsVerifier,
+    ExactMatchVerifier,
     FormatVerifier,
+    JSONVerifier,
     LengthPenaltyVerifier,
     MathVerifier,
+    MultipleChoiceVerifier,
+    ReasoningFormatVerifier,
+    RepetitionPenaltyVerifier,
 )
 from .rlvr_config import RLVRConfig
 from .rlvr_trainer import RLVRTrainer
 
 __all__ = (
     "CodeVerifier",
+    "CompositeVerifier",
+    "ContainsVerifier",
+    "ExactMatchVerifier",
     "FormatVerifier",
+    "JSONVerifier",
     "LengthPenaltyVerifier",
     "MathVerifier",
+    "MultipleChoiceVerifier",
     "RLVRConfig",
     "RLVRTrainer",
+    "ReasoningFormatVerifier",
+    "RepetitionPenaltyVerifier",
 )
