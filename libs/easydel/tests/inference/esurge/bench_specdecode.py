@@ -39,8 +39,9 @@ os.environ.setdefault("ENABLE_DISTRIBUTED_INIT", "0")
 os.environ["JAX_PLATFORMS"] = "tpu"
 os.environ["JAX_PLATFORM_NAME"] = "tpu"
 
-CKPT = "Qwen/Qwen3.5-2B"
-CKPT_DIR = "/dev/shm/easydel_ckpts/hf"
+CKPT = os.environ.get("EASYDEL_BENCH_CKPT", "Qwen/Qwen3.5-2B")
+TOKENIZER_ID = os.environ.get("EASYDEL_BENCH_TOKENIZER", CKPT)
+CKPT_DIR = os.environ.get("EASYDEL_BENCH_CKPT_DIR", "/dev/shm/easydel_ckpts/hf")
 FALLBACK_PROMPT = [3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3, 2, 3, 8, 4, 6, 2, 6, 4, 3, 3, 8, 3, 2, 7, 9, 5]
 PROMPT_TEXT = os.environ.get(
     "EASYDEL_BENCH_PROMPT_TEXT",
@@ -81,7 +82,7 @@ BENCH_MODES = {
     if part.strip()
 }
 REJECT_BACKOFF = 0
-MTP_DRAFT_TOKENS = 1
+MTP_DRAFT_TOKENS = int(os.environ.get("EASYDEL_BENCH_MTP_DRAFT_TOKENS", "1"))
 BENCH_SHARDING_AXIS_DIMS = tuple(
     int(part.strip())
     for part in os.environ.get("EASYDEL_BENCH_SHARDING_AXIS_DIMS", "1,1,1,1,-1,1").split(",")
@@ -140,8 +141,13 @@ PROFILE_TIME_FIELDS = (
 BENCH_RESULTS: dict[str, dict] = {}
 
 
+def _is_direct_ckpt_path(ckpt: str) -> bool:
+    """A gs://-style URI, an absolute path, or an existing local dir loads straight through."""
+    return "://" in ckpt or ckpt.startswith("/") or Path(ckpt).is_dir()
+
+
 def _local_snapshots() -> list[Path]:
-    snapshot_root = Path(CKPT_DIR) / "models--Qwen--Qwen3.5-2B" / "snapshots"
+    snapshot_root = Path(CKPT_DIR) / f"models--{CKPT.replace('/', '--')}" / "snapshots"
     return sorted(p for p in snapshot_root.glob("*/") if (p / "config.json").is_file())
 
 
@@ -185,15 +191,20 @@ def load_model():
     if REPLICATE_HIDDEN_TP:
         partition_axis.hidden_state_axis = None
 
-    local_snapshots = _local_snapshots()
-    if local_snapshots:
-        path = str(local_snapshots[-1])
+    if _is_direct_ckpt_path(CKPT):
+        # Direct EasyDeL-native checkpoint (gs:// TensorStore, absolute path, or local dir):
+        # load straight through from_pretrained — no HF snapshot_download.
+        path = CKPT
     else:
-        path = snapshot_download(
-            CKPT,
-            cache_dir=CKPT_DIR,
-            allow_patterns=["*.json", "*.txt", "*.safetensors", "*.model"],
-        )
+        local_snapshots = _local_snapshots()
+        if local_snapshots:
+            path = str(local_snapshots[-1])
+        else:
+            path = snapshot_download(
+                CKPT,
+                cache_dir=CKPT_DIR,
+                allow_patterns=["*.json", "*.txt", "*.safetensors", "*.model"],
+            )
     print(f"  checkpoint: {path}")
     model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
         pretrained_model_name_or_path=path,
@@ -230,7 +241,7 @@ def resolve_prompt_tokens(checkpoint_path: str) -> list[int]:
     try:
         from transformers import AutoTokenizer
 
-        tokenizer = AutoTokenizer.from_pretrained(checkpoint_path, local_files_only=True, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_ID, trust_remote_code=True)
         tokens = tokenizer(PROMPT_TEXT, add_special_tokens=False)["input_ids"]
         if tokens:
             return [int(tok) for tok in tokens]
@@ -693,6 +704,25 @@ def main():
                 base_toks=sample_base_toks,
                 max_new_tokens=MAX_NEW,
             )
+    if os.environ.get("EASYDEL_BENCH_DECODE_TEXT", "0").lower() in {"1", "true", "yes"}:
+        try:
+            from transformers import AutoTokenizer
+
+            _tok = AutoTokenizer.from_pretrained(TOKENIZER_ID, trust_remote_code=True)
+            print("\n" + "=" * 78)
+            print("DECODED OUTPUTS (coherence check)")
+            print("=" * 78)
+            for _lbl, _t in (
+                ("baseline-greedy", base_toks),
+                ("spec-greedy", spec_toks),
+                ("baseline-sampling", sample_base_toks),
+                ("spec-sampling", sample_spec_toks),
+            ):
+                if _t:
+                    print(f"\n[{_lbl}] ({len(_t)} tokens)\n{_tok.decode(_t)}")
+        except Exception as exc:
+            print(f"  decode-text failed ({exc!r})")
+
     if PROFILE_JSON:
         payload = {
             "benchmark": "bench_specdecode.py",
