@@ -2283,6 +2283,12 @@ class eSurgeRunner:
 
             original_scheduled_list = [int(n) for n in scheduled_list]
             model_scheduled_list = list(original_scheduled_list)
+            # SP3: intentionally always empty. No code path populates
+            # `sequential_greedy_spec_rows`, so the sequential-greedy spec fast
+            # path it guards below (`if int(row_pos) in sequential_greedy_spec_rows
+            # and len(scheduled_spec_tokens) == 1`) is dead. It is kept, unrevived,
+            # as the seam for a future one-token sequential-greedy verify: do NOT
+            # populate it without also validating that fast path end-to-end.
             sequential_greedy_spec_rows: dict[int, int] = {}
 
             total_scheduled = sum(model_scheduled_list)
@@ -3113,6 +3119,24 @@ class eSurgeRunner:
                                         req_state,
                                     )
                                     corrected_token = self.spec.sample_distribution(bonus_full, req_state)
+                            else:
+                                # SP1: the drafter distributions are missing/short, so
+                                # every draft must be rejected (accepted stays 0).
+                                # Resample the target at the FIRST draft position, whose
+                                # context is the real tokens only — mirroring the
+                                # full-hidden branch (target_fulls[:1]). The pre-set
+                                # fallback `corrected_token = tokens_np[row_pos]` is the
+                                # bonus-position sample taken with the drafts as context
+                                # and must not be emitted.
+                                _target_token, target_hidden = _replay_prefix_sample(row_pos, real_count)
+                                target_full = self.spec.filtered_log_probs(
+                                    self.spec.project_hidden_rows(target_hidden[None, :]),
+                                    req_state,
+                                )
+                                corrected_token = self.spec.sample_distribution(target_full, req_state)
+                                seed_hidden = target_hidden
+                                if want_trace_logits:
+                                    trace_logits_rows.append(target_full[0])
 
                         self.spec.record_verify_trace(
                             meta=verify_meta,

@@ -84,6 +84,7 @@ from spectrax import sharding as _spectrax_sharding
 from easydel.typings import ConfigDataclass
 
 from .sharding import AxisPolicy, RuntimeShardingResolver, TensorLayout, logical_axis_rules, sharding_for_layout
+from .spec_decode import DrafterRegistry, SpecDecodeBase, register_drafter
 
 Rngs = spx.Rngs
 sharding = _spectrax_sharding
@@ -139,6 +140,7 @@ def init_cluster():
 __all__ = (
     "AxisPolicy",
     "BenchmarkConfig",
+    "DrafterRegistry",
     "EasyDeLBaseConfig",
     "EasyDeLBaseConfigDict",
     "EasyDeLBaseModule",
@@ -148,11 +150,13 @@ __all__ = (
     "PyTree",
     "Rngs",
     "RuntimeShardingResolver",
+    "SpecDecodeBase",
     "TensorLayout",
     "auto_pytree",
     "eLargeModel",
     "init_cluster",
     "logical_axis_rules",
+    "register_drafter",
     "sharding",
     "sharding_for_layout",
 )

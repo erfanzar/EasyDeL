@@ -14,12 +14,14 @@
 
 """Tests for DeepSpec-style speculative drafter modules."""
 
+import easydel as ed
 import jax
 import jax.numpy as jnp
+import numpy as np
 import spectrax as spx
-
-import easydel as ed
+from easydel.inference.speculative import DraftStep
 from easydel.infra.factory import TaskType, registry
+from easydel.infra.spec_decode import SpecDecodeBase
 
 
 def _input_ids(batch_size: int = 2, seq_len: int = 6, vocab_size: int = 32):
@@ -311,3 +313,160 @@ def test_dflash_block_forward_disables_dspark_extra_heads():
     assert outputs.confidence_logits is None
     assert registry.get_config("dflash") is ed.DFlashConfig
     assert registry.get_module_registration(TaskType.BASE_MODULE, "dflash").module is ed.DFlashModel
+
+
+def test_model_native_drafters_compose_spec_decode_base():
+    """EAGLE3 / DSpark / DFlash compose ``EasyDeLBaseModule`` + ``SpecDecodeBase``.
+
+    A subclass with a metaclass conflict would fail to *import*, so reaching this
+    assertion at all proves the MRO composed; the ``issubclass`` checks lock it.
+    """
+    assert issubclass(ed.Eagle3Model, SpecDecodeBase)
+    assert issubclass(ed.DSparkModel, SpecDecodeBase)
+    assert issubclass(ed.DFlashModel, SpecDecodeBase)
+    # DFlash inherits the drafter surface from DSpark unchanged.
+    assert ed.DFlashModel._draft_logits is ed.DSparkModel._draft_logits
+    # EAGLE3 accepts a multi-token prefix; the DSpark family does not.
+    assert ed.Eagle3Model.supports_prefix_draft is True
+    assert ed.DSparkModel.supports_prefix_draft is False
+
+
+def _assert_valid_draftstep(step, *, batch: int, vocab: int, expect_full: bool):
+    """Assert a :class:`DraftStep` has the documented shapes/dtypes."""
+    assert isinstance(step, DraftStep)
+    assert step.token_ids.shape == (batch,)
+    assert step.token_ids.dtype == jnp.int32
+    tokens = np.asarray(step.token_ids)
+    assert tokens.min() >= 0 and tokens.max() < vocab
+    if expect_full:
+        assert step.full_log_probs is not None
+        assert step.full_log_probs.shape == (batch, vocab)
+        assert step.log_probs is not None
+        assert step.log_probs.shape == (batch,)
+    else:
+        assert step.full_log_probs is None
+        assert step.log_probs is None
+
+
+def test_eagle3_draft_returns_valid_draftstep():
+    """``Eagle3Model.draft`` yields a valid greedy + full-log-prob ``DraftStep``.
+
+    EAGLE3 is fixed at five target layers, so ``draft`` is exercised with a
+    per-layer hidden-state tuple (the trainer-shaped input) rather than a single
+    runner-seed hidden.
+    """
+    cfg = ed.Eagle3Config(
+        vocab_size=32,
+        hidden_size=16,
+        target_hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=4,
+        max_position_embeddings=16,
+        target_layer_ids=(0, 1, 2, 3, 4),
+    )
+    model = ed.Eagle3Model(config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
+    input_ids = _input_ids(batch_size=2, seq_len=6, vocab_size=32)
+    target_hidden = _target_hidden_states(6, batch_size=2, seq_len=6, hidden_size=16)
+
+    _assert_valid_draftstep(
+        model.draft(input_ids=input_ids, target_hidden_states=target_hidden),
+        batch=2,
+        vocab=32,
+        expect_full=False,
+    )
+    _assert_valid_draftstep(
+        model.draft(input_ids=input_ids, target_hidden_states=target_hidden, return_full_log_probs=True),
+        batch=2,
+        vocab=32,
+        expect_full=True,
+    )
+
+
+def test_dspark_draft_returns_valid_draftstep():
+    """``DSparkModel.draft`` (single target layer) yields a valid ``DraftStep``."""
+    cfg = ed.DSparkConfig(
+        vocab_size=32,
+        hidden_size=16,
+        target_hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=4,
+        max_position_embeddings=16,
+        target_layer_ids=(0,),
+        block_size=3,
+        num_anchors=2,
+        mask_token_id=31,
+    )
+    model = ed.DSparkModel(config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
+    input_ids = _input_ids(batch_size=2, seq_len=6, vocab_size=32)
+    hidden = _target_hidden_states(1, batch_size=2, seq_len=6, hidden_size=16)[0]
+
+    _assert_valid_draftstep(
+        model.draft(input_ids=input_ids, target_hidden_states=hidden, return_full_log_probs=True),
+        batch=2,
+        vocab=32,
+        expect_full=True,
+    )
+
+
+def test_dflash_draft_returns_valid_draftstep():
+    """``DFlashModel`` inherits DSpark's drafter surface and drafts a valid step."""
+    cfg = ed.DFlashConfig(
+        vocab_size=32,
+        hidden_size=16,
+        target_hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=4,
+        max_position_embeddings=16,
+        target_layer_ids=(0,),
+        block_size=3,
+        num_anchors=2,
+        mask_token_id=31,
+    )
+    model = ed.DFlashModel(config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
+    input_ids = _input_ids(batch_size=2, seq_len=6, vocab_size=32)
+    hidden = _target_hidden_states(1, batch_size=2, seq_len=6, hidden_size=16)[0]
+
+    _assert_valid_draftstep(
+        model.draft(input_ids=input_ids, target_hidden_states=hidden),
+        batch=2,
+        vocab=32,
+        expect_full=False,
+    )
+
+
+def test_dspark_model_drafter_registry_path():
+    """``model.drafter(method="dspark", drafter_model=...)`` resolves via the registry."""
+    cfg = ed.DSparkConfig(
+        vocab_size=32,
+        hidden_size=16,
+        target_hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=4,
+        max_position_embeddings=16,
+        target_layer_ids=(0,),
+        block_size=3,
+        num_anchors=2,
+        mask_token_id=31,
+    )
+    drafter_model = ed.DSparkModel(config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
+    target_model = ed.DSparkModel(config=cfg, rngs=spx.Rngs(1), dtype=jnp.float32, param_dtype=jnp.float32)
+
+    built = target_model.drafter(method="dspark", drafter_model=drafter_model, num_draft_tokens=3)
+    assert built is drafter_model
+    assert built.num_draft_tokens == 3
+    # Aliases/normalization route to the same builder as the model-native path.
+    from easydel.infra import DrafterRegistry
+
+    assert DrafterRegistry.resolve("dspark") is DrafterRegistry.resolve("DSpark")

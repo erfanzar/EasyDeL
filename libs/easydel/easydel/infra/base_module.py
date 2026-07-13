@@ -917,9 +917,17 @@ class EasyDeLBaseModule(
         target_embed_module: tp.Any | None = None,
         layer_mapping: list[int] | None = None,
         target_config: tp.Any | None = None,
+        drafter_model: tp.Any | None = None,
         **kwargs: tp.Any,
     ) -> tp.Any:
         """Build a speculative-decoding drafter owned by this model.
+
+        The drafter family is resolved through
+        :class:`easydel.infra.spec_decode.DrafterRegistry`, so any drafter
+        registered with ``@register_drafter(...)`` is reachable by name here
+        (and, declaratively, through ``eSurgeDrafterConfig``). The built-in
+        families are ``"mtp"``, ``"gemma4_assistant"``, ``"eagle3"``,
+        ``"dspark"``, and ``"dflash"`` (plus their aliases).
 
         Examples:
             >>> drafter = model.drafter(method="mtp", num_draft_tokens=4)
@@ -928,11 +936,12 @@ class EasyDeLBaseModule(
             ...     assistant_model=assistant,
             ...     num_draft_tokens=4,
             ... )
+            >>> drafter = model.drafter(method="eagle3", drafter_model=eagle3)
 
         Args:
-            method: Drafter family. ``"auto"`` picks ``"mtp"`` when this
-                model exposes an inline MTP head. Supported values today are
-                ``"mtp"`` and ``"gemma4_assistant"``.
+            method: Drafter family (any registered name/alias). ``"auto"`` picks
+                ``"mtp"`` when this model exposes an inline MTP head, otherwise
+                ``"gemma4_assistant"`` when an ``assistant_model`` is supplied.
             num_draft_tokens: Speculative tokens proposed per verify window.
             assistant_model: Standalone assistant model for assistant-based
                 drafting.
@@ -940,21 +949,21 @@ class EasyDeLBaseModule(
                 assistant drafting. If omitted, it is resolved from ``self``.
             layer_mapping: Optional assistant-layer to target-layer mapping.
             target_config: Optional target config. Defaults to ``self.config``.
+            drafter_model: Optional standalone model-native drafter instance
+                (an ``EasyDeLBaseModule`` + ``SpecDecodeBase``) for families such
+                as EAGLE3 / DSpark / DFlash.
             **kwargs: Extra drafter-specific constructor arguments.
 
         Returns:
             A drafter implementing :class:`easydel.inference.speculative.DrafterProtocol`.
+
+        Raises:
+            ValueError: If ``method`` matches no registered drafter, or ``"auto"``
+                cannot infer a family for this model.
         """
+        from easydel.infra.spec_decode import DrafterRegistry
+
         method_key = re.sub(r"[^a-z0-9]+", "_", str(method or "auto").strip().lower()).strip("_")
-        method_aliases = {
-            "qwen3_5_mtp": "mtp",
-            "qwen35_mtp": "mtp",
-            "inline_mtp": "mtp",
-            "assistant": "gemma4_assistant",
-            "gemma4": "gemma4_assistant",
-            "gemma4_assistant_drafter": "gemma4_assistant",
-        }
-        method_key = method_aliases.get(method_key, method_key)
 
         if method_key == "auto":
             if bool(getattr(self, "has_mtp", lambda: False)()):
@@ -963,42 +972,21 @@ class EasyDeLBaseModule(
                 method_key = "gemma4_assistant"
             else:
                 raise ValueError(
-                    f"{type(self).__name__} cannot infer a drafter. Pass method='mtp' or method='gemma4_assistant'."
+                    f"{type(self).__name__} cannot infer a drafter. Pass an explicit method= "
+                    f"(one of {DrafterRegistry.names()})."
                 )
 
-        if method_key == "mtp":
-            if not bool(getattr(self, "has_mtp", lambda: False)()):
-                raise ValueError(f"{type(self).__name__} does not expose an inline MTP head.")
-            from easydel.inference.speculative import Qwen3_5MTPDrafter
-
-            return Qwen3_5MTPDrafter(
-                self,
-                num_draft_tokens=num_draft_tokens,
-                **kwargs,
-            )
-
-        if method_key == "gemma4_assistant":
-            if assistant_model is None:
-                raise ValueError("method='gemma4_assistant' requires assistant_model=...")
-            from easydel.inference.speculative import Gemma4AssistantDrafter
-
-            drafter = Gemma4AssistantDrafter(
-                assistant_model=assistant_model,
-                target_embed_module=target_embed_module or self._resolve_drafter_target_embedding(),
-                layer_mapping=layer_mapping,
-                target_config=target_config if target_config is not None else getattr(self, "config", None),
-                **kwargs,
-            )
-            drafter.num_draft_tokens = max(1, int(num_draft_tokens))
-            return drafter
-
-        if method_key in {"dflash", "eagle", "eagle3", "medusa", "mlp_speculator"}:
-            raise NotImplementedError(
-                f"model.drafter(method={method!r}) is not wired in EasyDeL yet. "
-                "Use method='mtp' or method='gemma4_assistant' for now."
-            )
-
-        raise ValueError(f"Unknown drafter method {method!r}.")
+        builder = DrafterRegistry.resolve(method_key)
+        return builder(
+            self,
+            num_draft_tokens=num_draft_tokens,
+            assistant_model=assistant_model,
+            target_embed_module=target_embed_module,
+            layer_mapping=layer_mapping,
+            target_config=target_config,
+            drafter_model=drafter_model,
+            **kwargs,
+        )
 
     def _resolve_drafter_target_embedding(self) -> tp.Any:
         """Resolve this model's token embedding module for assistant drafters.

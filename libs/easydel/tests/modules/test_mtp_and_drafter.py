@@ -31,12 +31,11 @@ import sys
 import time
 import traceback
 
+import easydel as ed  # ensures registry side effects fire
 import jax
 import jax.numpy as jnp
 import numpy as np
 import spectrax as spx
-
-import easydel as ed  # ensures registry side effects fire
 
 __test__ = False
 
@@ -463,6 +462,55 @@ def test_qwen35_drafter_without_mtp_raises():
     except ValueError:
         return
     raise AssertionError("Expected ValueError when wrapping model without MTP head")
+
+
+@test("model.drafter resolves through the DrafterRegistry (name + aliases)")
+def test_drafter_registry_resolution():
+    from easydel.inference.speculative import Qwen3_5MTPDrafter
+    from easydel.infra.spec_decode import DrafterRegistry
+
+    cfg = make_qwen35_text_config()
+    model = Qwen3_5ForCausalLM(config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
+
+    # The built-in families are all registered.
+    for name in ("mtp", "gemma4_assistant", "eagle3", "dspark", "dflash"):
+        assert DrafterRegistry.has(name), f"{name} not registered"
+
+    # Aliases + slug normalization resolve to the same builder.
+    assert DrafterRegistry.resolve("mtp") is DrafterRegistry.resolve("qwen3_5_mtp")
+    assert DrafterRegistry.resolve("mtp") is DrafterRegistry.resolve("inline_mtp")
+    assert DrafterRegistry.resolve("mtp") is DrafterRegistry.resolve("Qwen3.5 MTP")
+
+    # The public model.drafter API routes each alias to the MTP drafter.
+    for method in ("mtp", "qwen3_5_mtp", "inline_mtp", "auto"):
+        drafter = model.drafter(method=method, num_draft_tokens=2)
+        assert isinstance(drafter, Qwen3_5MTPDrafter), f"method={method!r} did not build an MTP drafter"
+        assert drafter.num_draft_tokens == 2
+
+    # Unknown method fails loudly, listing the registered names.
+    try:
+        model.drafter(method="totally_unknown_drafter")
+    except ValueError as exc:
+        assert "totally_unknown_drafter" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError for an unknown drafter method")
+
+
+@test("custom @register_drafter is reachable via model.drafter")
+def test_custom_register_drafter_via_model():
+    from easydel.infra.spec_decode import register_drafter
+
+    sentinel = object()
+
+    @register_drafter("mtp_and_drafter_custom", "mtp_and_drafter_custom_alias")
+    def _builder(target_model, *, num_draft_tokens=1, drafter_model=None, **kwargs):
+        del target_model, num_draft_tokens, kwargs
+        return drafter_model if drafter_model is not None else sentinel
+
+    cfg = make_qwen35_text_config()
+    model = Qwen3_5ForCausalLM(config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
+    assert model.drafter(method="mtp_and_drafter_custom") is sentinel
+    assert model.drafter(method="mtp and drafter custom alias") is sentinel
 
 
 def _qwen35_2b_snap():
@@ -947,6 +995,8 @@ ALL_TESTS = [
     test_resample_rejected,
     test_qwen35_mtp_drafter,
     test_qwen35_drafter_without_mtp_raises,
+    test_drafter_registry_resolution,
+    test_custom_register_drafter_via_model,
     test_qwen35_real_mtp_load_and_forward,
     test_gemma4_real_assistant_load_and_forward,
     test_qwen35_real_mtp_output_nondegenerate,
