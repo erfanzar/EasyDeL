@@ -485,6 +485,7 @@ class eSurgeRunner:
         layer_types = getattr(text_config, "layer_types", ()) or ()
         recurrent_layer_types = {"linear_attention", "kda_linear_attention", "parallel_hybrid", "hybrid"}
         has_recurrent_layers = any(str(layer_type).lower() in recurrent_layer_types for layer_type in layer_types)
+        self._has_recurrent_layers = bool(has_recurrent_layers)
         self.spec_decode_recurrent_candidates = bool(
             drafter is not None and int(self.num_speculative_tokens) > 0 and has_recurrent_layers
         )
@@ -563,6 +564,62 @@ class eSurgeRunner:
         Delegates to :meth:`RecurrentSlotPool.is_enabled`.
         """
         return self.slot_pool.is_enabled()
+
+    def _plain_recurrent_row_sync_enabled(self) -> bool:
+        """Whether device recurrent rows must track SequenceBuffer row moves.
+
+        True only on the plain-recurrent path: the model has recurrent/SSM
+        state AND requests are not pinned to a stable pooled slot. Rank-major
+        SPMD DP and slot-indexed compressed-window families
+        (``slot_pool.is_enabled()``) already thread ``recurrent_state_indices``
+        to the kernel, so their device state is keyed by a stable slot and must
+        not be permuted here.
+        """
+        return bool(self._has_recurrent_layers) and not self.slot_pool.is_enabled()
+
+    def _sync_recurrent_rows(self, prev_row_owner: list[str | None] | None) -> None:
+        """Move device recurrent-state rows to follow SequenceBuffer row moves.
+
+        On the plain-recurrent path the conv/GDR/SSM cache is indexed by the
+        physical ``SequenceBuffer`` row a request occupies in the packed batch.
+        ``_update_states`` (condense) and ``reorder_decode_first`` can relocate a
+        surviving request to a different row; without moving its device state in
+        lockstep the request would read a freed/zeroed neighbour's state and emit
+        garbage. This computes the row permutation from the pre-mutation layout
+        ``prev_row_owner`` (which the device recurrent rows currently reflect) to
+        the current layout and applies it via
+        :meth:`ExecutionManager.permute_recurrent_slots`.
+
+        Args:
+            prev_row_owner: Per-row request ids captured immediately before
+                ``_update_states`` this step, or ``None`` when the plain-recurrent
+                row sync is disabled (non-recurrent or slot-pooled models).
+        """
+        if prev_row_owner is None:
+            return
+        n = int(self.max_num_reqs)
+        new_ids = self.sequence_buffer.req_ids
+        prev_index: dict[str, int] = {}
+        for f, rid in enumerate(prev_row_owner):
+            if rid is not None and f < n:
+                prev_index[str(rid)] = f
+        perm = np.full((n,), -1, dtype=np.int32)
+        moved = False
+        for t in range(n):
+            rid = new_ids[t] if t < len(new_ids) else None
+            if rid is None:
+                continue
+            f = prev_index.get(str(rid))
+            if f is None:
+                # Newly admitted this step: its row is (re)populated by prefill;
+                # leaving perm[t] == -1 zeroes any stale occupant first.
+                continue
+            perm[t] = f
+            if f != t:
+                moved = True
+        if not moved:
+            return
+        self.executor_manager.permute_recurrent_slots(perm)
 
     def _recurrent_rows_per_dp_rank(self) -> int:
         """Return the number of recurrent-state rows owned by each DP rank.
@@ -2132,6 +2189,9 @@ class eSurgeRunner:
 
         updating_states_start = time.time()
         layout_version_before = self.sequence_buffer.layout_version
+        prev_recurrent_row_owner = (
+            list(self.sequence_buffer.req_ids) if self._plain_recurrent_row_sync_enabled() else None
+        )
         self._update_states(scheduler_output)
         self.spec.on_states_applied(scheduler_output)
         updating_states_time = time.time() - updating_states_start
@@ -2158,6 +2218,9 @@ class eSurgeRunner:
                 self.sequence_buffer.token_ids,
                 self.sequence_buffer.num_tokens,
             )
+            # Keep the plain-recurrent conv/GDR/SSM device state (indexed by
+            # physical buffer row) in lockstep with condense/reorder row moves.
+            self._sync_recurrent_rows(prev_recurrent_row_owner)
 
         if not scheduler_output.total_num_scheduled_tokens:
             if pending_pre_async_results is not None and pre_async_repair_pending:
