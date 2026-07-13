@@ -97,6 +97,123 @@ def _copy_kv_tree(kv_pages: typing.Any) -> typing.Any:
     )
 
 
+# Device-array fields carried by a recurrent cache view. These are the only
+# leaves whose state advances irreversibly inside a fused speculative forward
+# and therefore the only leaves a speculative rollback must restore.
+_REC_ARRAY_FIELDS = ("conv_state", "recurrent_state", "positions", "seqlen_offset")
+
+
+@jax.jit
+def _jit_copy_arrays(arrays: list[jax.Array]) -> list[jax.Array]:
+    """Copy a flat list of device arrays in a SINGLE fused dispatch.
+
+    Eager ``jnp.array(x, copy=True)`` per leaf costs one host dispatch each; a
+    hybrid model has ~4 recurrent leaves per linear layer (~200 for a 64-layer
+    27B), so per-leaf copying spent ~30 ms/spec-step purely on dispatch. Copying
+    the whole flat list under one ``jax.jit`` collapses that to one dispatch.
+    ``jax.jit`` outputs are freshly allocated buffers (no input-output aliasing
+    without ``donate_argnums``), so the copies survive the KV-buffer donation the
+    fused forward performs on the originals.
+    """
+    return [jnp.array(a, copy=True) for a in arrays]
+
+
+def _recurrent_view_of(view: typing.Any, recurrent_cls: type, parallel_cls: type) -> typing.Any:
+    """Return the ``RecurrentCacheView`` carried by ``view`` (or ``None``)."""
+    if isinstance(view, recurrent_cls):
+        return view
+    if isinstance(view, parallel_cls) and view.recurrent is not None:
+        return view.recurrent
+    return None
+
+
+def _snapshot_recurrent_state(kv_pages: typing.Any) -> typing.Any:
+    """Snapshot only the recurrent leaves of a hybrid KV cache for spec rollback.
+
+    Speculative rollback for hybrid models only needs the recurrent leaves
+    (:data:`_REC_ARRAY_FIELDS`) preserved. The paged full-attention KV is pure
+    position-indexed storage (``RaggedPagesCacheView`` has no device-side length
+    pointer): a replay forward re-derives the accepted positions deterministically
+    from token id + position, and rejected draft positions are never read before a
+    later step overwrites them. So the paged tree is rolled back by truncation
+    (overwrite), never copied.
+
+    All recurrent leaves across every layer are gathered into one flat list and
+    copied in a single fused dispatch (:func:`_jit_copy_arrays`), which is what
+    makes the per-spec-step snapshot cheap.
+
+    Args:
+        kv_pages: The live cache (expected to be a ``HybridCache`` when a
+            snapshot is requested).
+
+    Returns:
+        ``(layout, copied_arrays)`` where ``layout`` records, per recurrent view,
+        its cache-view index, whether it is a parallel-hybrid view, and the
+        per-field index into ``copied_arrays`` (or ``None`` for a non-array
+        field); or ``None`` when the cache has no recurrent leaves.
+    """
+    from easydel.caching import ParallelHybridCacheView, RecurrentCacheView
+
+    views = getattr(kv_pages, "views", None)
+    if views is None:
+        return None
+    layout: list[tuple[int, bool, dict[str, int | None]]] = []
+    flat: list[jax.Array] = []
+    for idx, view in enumerate(views):
+        rec = _recurrent_view_of(view, RecurrentCacheView, ParallelHybridCacheView)
+        if rec is None:
+            continue
+        field_map: dict[str, int | None] = {}
+        for field_name in _REC_ARRAY_FIELDS:
+            val = getattr(rec, field_name, None)
+            if isinstance(val, jax.Array):
+                field_map[field_name] = len(flat)
+                flat.append(val)
+            else:
+                field_map[field_name] = None
+        layout.append((idx, isinstance(view, ParallelHybridCacheView), field_map))
+    if not flat:
+        return None
+    return (layout, _jit_copy_arrays(flat))
+
+
+def _restore_recurrent_state(live_kv_pages: typing.Any, snapshot: typing.Any) -> typing.Any:
+    """Rebuild a hybrid cache from live attention pages + snapshot recurrent state.
+
+    Keeps every full-attention/paged view of ``live_kv_pages`` (the post-forward
+    cache) as-is and splices back fresh copies of the recurrent leaves captured by
+    :func:`_snapshot_recurrent_state`. The snapshot leaves are re-copied (one
+    fused dispatch) on every restore so a single snapshot survives the KV-buffer
+    donation performed by each replay forward (one snapshot may feed several
+    replay calls within a verify window).
+
+    Args:
+        live_kv_pages: The current (post-forward) cache whose attention pages are
+            reused verbatim.
+        snapshot: ``(layout, copied_arrays)`` from
+            :func:`_snapshot_recurrent_state`; ``None`` returns ``live_kv_pages``
+            unchanged.
+
+    Returns:
+        A ``HybridCache`` with live attention views and pre-step recurrent state.
+    """
+    from easydel.caching import HybridCache
+
+    if snapshot is None:
+        return live_kv_pages
+    layout, copied = snapshot
+    fresh = _jit_copy_arrays(copied)
+    views = list(live_kv_pages.views)
+    for view_idx, is_parallel, field_map in layout:
+        updates = {name: (fresh[i] if i is not None else None) for name, i in field_map.items()}
+        live_view = views[view_idx]
+        if is_parallel:
+            views[view_idx] = live_view.replace(recurrent=live_view.recurrent.replace(**updates), **updates)
+        else:
+            views[view_idx] = live_view.replace(**updates)
+    return HybridCache(views=views)
+
+
 class DrafterSpeculation:
     """Runner-native speculative decoding driven by an attached drafter.
 
@@ -1326,7 +1443,9 @@ class DrafterSpeculation:
                 buffers; passed through to the replay step.
         """
         total_commit = int(sum(commit_scheduled_list))
-        self._runner.executor_manager.kv_pages = pre_step_kv_pages
+        self._runner.executor_manager.kv_pages = _restore_recurrent_state(
+            self._runner.executor_manager.kv_pages, pre_step_kv_pages
+        )
         if total_commit <= 0:
             return
         idx = bisect_left(self._runner.num_tokens_paddings, total_commit)
@@ -1518,7 +1637,9 @@ class DrafterSpeculation:
         replay_req_num_tokens = np.asarray(num_computed_tokens_window_cpu).copy()
         replay_req_num_tokens[int(row_pos)] = int(num_computed_tokens_window_cpu[int(row_pos)]) + int(prefix_len)
 
-        self._runner.executor_manager.kv_pages = _copy_kv_tree(pre_step_kv_pages)
+        self._runner.executor_manager.kv_pages = _restore_recurrent_state(
+            self._runner.executor_manager.kv_pages, pre_step_kv_pages
+        )
         out_tokens_replay, _, _, _, hidden_replay, _, _ = self._runner.executor_manager.execute(
             num_tokens=num_tokens_static,
             scheduled_full_cpu=replay_scheduled,
@@ -1602,7 +1723,9 @@ class DrafterSpeculation:
         if prefix_len <= 0:
             raise ValueError("prefix_len must be positive for speculative sequential replay.")
 
-        self._runner.executor_manager.kv_pages = _copy_kv_tree(pre_step_kv_pages)
+        self._runner.executor_manager.kv_pages = _restore_recurrent_state(
+            self._runner.executor_manager.kv_pages, pre_step_kv_pages
+        )
         replay_scheduled = self._runner._scheduled_full_cpu.copy()
         replay_active = self._runner._active_mask_full_cpu.copy()
         replay_num_computed = np.asarray(num_computed_tokens_window_cpu).copy()
