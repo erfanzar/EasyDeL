@@ -1606,6 +1606,114 @@ class ExecutionManager:
         if changed:
             self.kv_pages = HybridCache(views=new_views)
 
+    def permute_recurrent_slots(self, perm: numpy.ndarray) -> None:
+        """Gather recurrent/SSM state rows into a new physical row layout.
+
+        On the plain-recurrent path (no per-request slot pool) the conv/GDR/SSM
+        cache is indexed by the physical ``SequenceBuffer`` row a request
+        occupies in the packed batch — the ragged conv/GDN kernels read and
+        write ``state_indices = arange(num_slots)``. When ``condense`` or
+        ``reorder_decode_first`` relocates a surviving request to a different
+        row (e.g. after a mid-stream request finishes), its device-side
+        ``conv_state``/``recurrent_state`` must move in lockstep or the request
+        reads a freed/zeroed neighbour's state and emits garbage. This method
+        applies that row permutation to every recurrent or hybrid layer.
+
+        No-op unless the cache is a :class:`HybridCache`. Rank-major SPMD DP and
+        slot-indexed compressed-window families never use this path — they pin
+        each request to a stable pooled slot and thread ``recurrent_state_indices``
+        to the kernel instead (see :meth:`clear_recurrent_slots`).
+
+        Args:
+            perm: Integer array of length ``max_num_reqs``. ``perm[t]`` is the
+                source row whose recurrent state should occupy destination row
+                ``t``, or ``-1`` when destination ``t`` must be zeroed (a freed
+                row, or a newly admitted request whose state is repopulated by
+                its own prefill). Any speculative-candidate rows follow their
+                owning base row automatically.
+        """
+        cache = self.kv_pages
+        if not isinstance(cache, HybridCache):
+            return
+        base_slots = int(self.max_num_reqs)
+        perm = numpy.asarray(perm, dtype=numpy.int32).reshape(-1)
+        if perm.shape[0] < base_slots:
+            perm = numpy.concatenate([perm, numpy.full((base_slots - perm.shape[0],), -1, dtype=numpy.int32)])
+        else:
+            perm = perm[:base_slots]
+        candidate_count = max(0, int(getattr(self, "speculative_recurrent_state_tokens", 0) or 0))
+
+        changed = False
+        new_views = list(cache.views)
+        for idx, view in enumerate(new_views):
+            if isinstance(view, RecurrentCacheView):
+                rec = view
+            elif isinstance(view, ParallelHybridCacheView) and view.recurrent is not None:
+                rec = view.recurrent
+            else:
+                continue
+
+            new_conv = rec.conv_state
+            new_rec = rec.recurrent_state
+            if new_conv is not None:
+                n_slots = int(typing.cast(jax.Array, new_conv).shape[0])
+            elif new_rec is not None:
+                n_slots = int(typing.cast(jax.Array, new_rec).shape[0])
+            else:
+                continue
+
+            # Build a full-tensor gather index + keep mask. Extend the base-row
+            # permutation to each request's speculative-candidate block so
+            # candidate state (if any) follows its owning request too.
+            gather = numpy.arange(n_slots, dtype=numpy.int32)
+            keep = numpy.ones((n_slots,), dtype=bool)
+            upper = min(base_slots, n_slots)
+            base = perm[:upper]
+            gather[:upper] = numpy.where(base >= 0, base, 0)
+            keep[:upper] = base >= 0
+            if candidate_count > 0 and n_slots > base_slots:
+                for b in range(base_slots):
+                    src_b = int(perm[b])
+                    for k in range(candidate_count):
+                        dst = base_slots + b * candidate_count + k
+                        if dst >= n_slots:
+                            break
+                        if src_b >= 0:
+                            gather[dst] = base_slots + src_b * candidate_count + k
+                        else:
+                            gather[dst] = 0
+                            keep[dst] = False
+
+            if keep.all() and numpy.array_equal(gather, numpy.arange(n_slots, dtype=numpy.int32)):
+                continue
+
+            gather_idx = jnp.asarray(gather, dtype=jnp.int32)
+            keep_mask = jnp.asarray(keep, dtype=jnp.bool_)
+            if new_conv is not None:
+                gathered = new_conv[gather_idx]
+                new_conv = jnp.where(keep_mask.reshape(-1, *([1] * (new_conv.ndim - 1))), gathered, 0).astype(
+                    new_conv.dtype
+                )
+            if new_rec is not None:
+                gathered = new_rec[gather_idx]
+                new_rec = jnp.where(keep_mask.reshape(-1, *([1] * (new_rec.ndim - 1))), gathered, 0).astype(
+                    new_rec.dtype
+                )
+
+            new_recurrent = rec.replace(conv_state=new_conv, recurrent_state=new_rec)
+            if isinstance(view, ParallelHybridCacheView):
+                new_views[idx] = view.replace(
+                    recurrent=new_recurrent,
+                    conv_state=new_conv,
+                    recurrent_state=new_rec,
+                )
+            else:
+                new_views[idx] = new_recurrent
+            changed = True
+
+        if changed:
+            self.kv_pages = HybridCache(views=new_views)
+
     def sample_tokens(
         self,
         num_tokens: int,
