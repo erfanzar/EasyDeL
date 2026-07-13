@@ -593,6 +593,15 @@ class TransformerCacheView(BaseCacheView):
             )
         return out
 
+    def reset(self) -> "TransformerCacheView":
+        """Return this cache view with key/value storage and position indices zeroed."""
+        return self.replace(
+            key=None if self.key is None else jnp.zeros_like(self.key),
+            value=None if self.value is None else jnp.zeros_like(self.value),
+            indexes=jnp.zeros_like(self.indexes),
+            starts=jnp.zeros_like(self.starts),
+        )
+
     @jax.named_scope("easydel-transformer-cacheview-concatenate-to-cache")
     def concatenate_to_cache(
         self,
