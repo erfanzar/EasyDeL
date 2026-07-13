@@ -33,6 +33,7 @@ from spectrax import nn
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
+from easydel.infra.spec_decode import SpecDecodeBase
 from easydel.layers import ColumnParallelLinear, Embed, RMSNorm
 from easydel.modules._drafting import (
     DraftAttention,
@@ -197,7 +198,7 @@ class Eagle3DecoderLayer(spx.Module):
 
 
 @register_module(TaskType.BASE_MODULE, config=Eagle3Config, model_type="eagle3")
-class Eagle3Model(EasyDeLBaseModule):
+class Eagle3Model(EasyDeLBaseModule, SpecDecodeBase):
     """DeepSpec-compatible EAGLE3 draft model.
 
     Inputs are either pre-projected drafter hidden states or target hidden
@@ -205,11 +206,53 @@ class Eagle3Model(EasyDeLBaseModule):
     exactly the configured five decoder layers, concatenates them, projects to
     `hidden_size`, and runs the EAGLE3 refinement blocks.  `return_logits=True`
     returns `Eagle3ForwardOutput` with drafter logits and optional target logits.
+
+    As a :class:`SpecDecodeBase`, EAGLE3 is a runner-native drafter: the shared
+    ``draft(...)`` tail calls :meth:`_draft_logits`, which delegates to
+    ``forward(..., return_logits=True)``. EAGLE3 accepts a multi-token prefix,
+    so ``supports_prefix_draft`` is ``True``.
     """
 
     _task_type = TaskType.BASE_MODULE
     _model_type = "eagle3"
     _config_class = Eagle3Config
+
+    supports_prefix_draft = True
+
+    def _draft_logits(
+        self,
+        input_ids: Int[Array, "batch seq"],
+        *,
+        target_hidden_states: tp.Any | None,
+        position_ids: Int[Array, "batch seq"] | None = None,
+        target_kv_cache: tp.Any | None = None,
+        attention_mask: tp.Any | None = None,
+    ) -> tuple[jax.Array, jax.Array | None]:
+        """Produce EAGLE3 draft logits + hidden rows for :meth:`SpecDecodeBase.draft`.
+
+        Delegates to :meth:`forward` with ``return_logits=True`` and returns the
+        drafter logits alongside the refined hidden states.
+
+        Args:
+            input_ids: ``(batch, seq)`` seed/verified tokens.
+            target_hidden_states: Target hidden state(s) to project (single
+                layer or pre-concatenated target features).
+            position_ids: Optional absolute positions for the input rows.
+            target_kv_cache: Ignored (EAGLE3 does not cross-attend to target K/V).
+            attention_mask: Optional attention mask.
+
+        Returns:
+            Tuple ``(logits, hidden_states)``.
+        """
+        del target_kv_cache
+        out = self.forward(
+            input_ids=input_ids,
+            target_hidden_states=target_hidden_states,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            return_logits=True,
+        )
+        return out.logits, out.hidden_states
 
     def __init__(
         self,

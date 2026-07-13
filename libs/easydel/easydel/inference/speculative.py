@@ -53,6 +53,7 @@ from jaxtyping import Array, Float, Int
 from spectrax import common_types
 
 from easydel.caching import TransformerCache, TransformerCacheConfig, TransformerMetadata
+from easydel.infra.spec_decode import SpecDecodeBase, register_drafter
 
 
 @dataclass(frozen=True)
@@ -107,7 +108,29 @@ class DrafterProtocol(typing.Protocol):
 
     Concrete drafters wrap their model-specific forward path behind
     this protocol so the speculative-decode controller can be generic.
+
+    Capability flags (the eSurge runner reads them via ``getattr`` with the
+    documented defaults, so a drafter only sets the ones it changes):
+
+    Attributes:
+        supports_return_full_log_probs: The drafter can materialize a dense
+            ``(batch, vocab)`` distribution for distribution-correct sampled
+            speculative decoding (default ``False`` when unset by the drafter).
+        supports_prefix_draft: The drafter accepts a multi-token prefix instead
+            of a single seed token for its first draft step (default ``False``).
+        requires_target_kv_cache: The drafter cross-attends to the target's
+            per-layer K/V and must be fed a target K/V payload (default
+            ``False``).
+        uses_mtp_cache: The drafter keeps an internal MTP KV cache that the
+            runner should account for (default ``False``).
+        num_draft_tokens: Speculative tokens proposed per verify window (the
+            runner also accepts ``num_speculative_tokens`` as a fallback name).
     """
+
+    supports_return_full_log_probs: bool
+    supports_prefix_draft: bool
+    requires_target_kv_cache: bool
+    num_draft_tokens: int
 
     def reset(self, batch_size: int) -> None:
         """Reset the drafter's internal state for a new generation.
@@ -120,6 +143,19 @@ class DrafterProtocol(typing.Protocol):
         """
         ...
 
+    def reset_request(self, request_id: str | None = None) -> None:
+        """Reset per-request / per-verify-window drafter state.
+
+        Drafters that carry an internal KV cache across ``draft`` calls clear
+        it here so state never leaks across requests. The eSurge runner calls
+        this at the start of each verify window. Stateless drafters make it a
+        no-op (the runner probes it via ``getattr`` and skips when absent).
+
+        Args:
+            request_id: Identifier of the request being drafted for, or ``None``.
+        """
+        ...
+
     def draft(
         self,
         input_ids: Int[Array, "batch seq"],
@@ -127,6 +163,9 @@ class DrafterProtocol(typing.Protocol):
         target_kv_cache: typing.Any | None = None,
         position_ids: Int[Array, "batch seq"] | None = None,
         return_full_log_probs: bool = False,
+        sample: bool = False,
+        rng_key: jax.Array | None = None,
+        attention_mask: typing.Any | None = None,
     ) -> DraftStep:
         """Propose one next-token draft per batch element.
 
@@ -147,6 +186,11 @@ class DrafterProtocol(typing.Protocol):
                 the hidden row's RoPE position.
             return_full_log_probs: Request a dense drafter
                 distribution for sampled speculative decoding.
+            sample: Sample from the drafter distribution instead of
+                taking the argmax.
+            rng_key: PRNG key required when ``sample=True``.
+            attention_mask: Optional mask used by drafters that consume a
+                statically-padded target K/V cache.
 
         Returns:
             :class:`DraftStep` with the proposed token IDs and (if
@@ -289,6 +333,26 @@ class Qwen3_5MTPDrafter:
         batch_size = int(batch_size)
         self._mtp_cache = self._init_mtp_cache(batch_size)
         self._mtp_cache_batch_size = batch_size if self._mtp_cache is not None else None
+
+    def reset_request(self, request_id: str | None = None) -> None:
+        """Clear the MTP-local KV cache at a request / verify-window boundary.
+
+        The MTP cache is a single rolling KV buffer keyed only on batch size, so
+        without an explicit boundary it is reused across requests and windows —
+        the previous request's/window's K/V then pollutes the next drafter call
+        and acceptance collapses. Clearing it here forces ``_ensure_mtp_cache``
+        to reallocate a fresh cache on the next ``draft`` so each verify window
+        starts from an empty MTP state. The eSurge runner calls this once per
+        window (see ``DrafterSpeculation.draft_next``). Output is unchanged; this
+        only prevents cross-request cache leakage.
+
+        Args:
+            request_id: Identifier of the request being drafted for (unused;
+                accepted for protocol compatibility).
+        """
+        del request_id
+        self._mtp_cache = None
+        self._mtp_cache_batch_size = None
 
     def _init_mtp_cache(self, batch_size: int) -> TransformerCache | None:
         """Allocate a full-attention cache for the inline MTP block.
@@ -776,6 +840,185 @@ class Gemma4AssistantDrafter:
             full_log_probs=log_probs,
             hidden_states=out.backbone_hidden_state,
         )
+
+
+def _drafter_target_layer_count(drafter: typing.Any) -> int:
+    """Return how many target layers a standalone drafter concatenates.
+
+    Reads ``drafter.config.target_layer_ids``; defaults to ``1`` when absent or
+    not sized.
+
+    Args:
+        drafter: The standalone drafter model instance.
+
+    Returns:
+        The number of configured target layers.
+    """
+    cfg = getattr(drafter, "config", None)
+    ids = getattr(cfg, "target_layer_ids", None)
+    if ids is None:
+        return 1
+    try:
+        return len(tuple(ids))
+    except TypeError:
+        return 1
+
+
+@register_drafter("mtp", "qwen3_5_mtp", "qwen35_mtp", "inline_mtp")
+def _build_mtp_drafter(
+    target_model: typing.Any,
+    *,
+    num_draft_tokens: int = 1,
+    assistant_model: typing.Any | None = None,
+    target_embed_module: typing.Any | None = None,
+    layer_mapping: list[int] | None = None,
+    target_config: typing.Any | None = None,
+    drafter_model: typing.Any | None = None,
+    **kwargs: typing.Any,
+) -> "Qwen3_5MTPDrafter":
+    """Build the inline Qwen3.5 MTP drafter for ``target_model``.
+
+    Args:
+        target_model: Target causal-LM exposing ``has_mtp()`` + MTP head.
+        num_draft_tokens: Speculative tokens proposed per verify window.
+        assistant_model: Ignored (MTP is inline).
+        target_embed_module: Ignored (MTP is inline).
+        layer_mapping: Ignored (MTP is inline).
+        target_config: Ignored (MTP reads ``target_model.config``).
+        drafter_model: Ignored (MTP is inline).
+        **kwargs: Forwarded to :class:`Qwen3_5MTPDrafter` (``use_cache``,
+            ``cache_length``).
+
+    Returns:
+        A configured :class:`Qwen3_5MTPDrafter`.
+
+    Raises:
+        ValueError: If ``target_model`` has no inline MTP head.
+    """
+    del assistant_model, target_embed_module, layer_mapping, target_config, drafter_model
+    if not bool(getattr(target_model, "has_mtp", lambda: False)()):
+        raise ValueError(f"{type(target_model).__name__} does not expose an inline MTP head.")
+    return Qwen3_5MTPDrafter(target_model, num_draft_tokens=max(1, int(num_draft_tokens)), **kwargs)
+
+
+@register_drafter("gemma4_assistant", "assistant", "gemma4", "gemma4_assistant_drafter")
+def _build_gemma4_assistant_drafter(
+    target_model: typing.Any,
+    *,
+    num_draft_tokens: int = 1,
+    assistant_model: typing.Any | None = None,
+    target_embed_module: typing.Any | None = None,
+    layer_mapping: list[int] | None = None,
+    target_config: typing.Any | None = None,
+    drafter_model: typing.Any | None = None,
+    **kwargs: typing.Any,
+) -> "Gemma4AssistantDrafter":
+    """Build the standalone Gemma4 assistant drafter.
+
+    Args:
+        target_model: Target model whose embedding + config seed the assistant.
+        num_draft_tokens: Speculative tokens proposed per verify window.
+        assistant_model: The standalone ``Gemma4AssistantForCausalLM`` (also
+            accepted via ``drafter_model``).
+        target_embed_module: Optional target token embedding module; resolved
+            from ``target_model`` when omitted.
+        layer_mapping: Optional assistant-layer to target-layer mapping.
+        target_config: Optional target config; defaults to ``target_model.config``.
+        drafter_model: Alternative slot for ``assistant_model``.
+        **kwargs: Forwarded to :class:`Gemma4AssistantDrafter`.
+
+    Returns:
+        A configured :class:`Gemma4AssistantDrafter`.
+
+    Raises:
+        ValueError: If no assistant model is supplied.
+    """
+    assistant = assistant_model if assistant_model is not None else drafter_model
+    if assistant is None:
+        raise ValueError("method='gemma4_assistant' requires assistant_model=...")
+    drafter = Gemma4AssistantDrafter(
+        assistant_model=assistant,
+        target_embed_module=target_embed_module or target_model._resolve_drafter_target_embedding(),
+        layer_mapping=layer_mapping,
+        target_config=target_config if target_config is not None else getattr(target_model, "config", None),
+        **kwargs,
+    )
+    drafter.num_draft_tokens = max(1, int(num_draft_tokens))
+    return drafter
+
+
+@register_drafter("eagle3")
+@register_drafter("dspark")
+@register_drafter("dflash")
+def _build_model_native_drafter(
+    target_model: typing.Any,
+    *,
+    num_draft_tokens: int = 1,
+    assistant_model: typing.Any | None = None,
+    target_embed_module: typing.Any | None = None,
+    layer_mapping: list[int] | None = None,
+    target_config: typing.Any | None = None,
+    drafter_model: typing.Any | None = None,
+    **kwargs: typing.Any,
+) -> typing.Any:
+    """Configure a standalone model-native drafter (EAGLE3 / DSpark / DFlash).
+
+    The drafter is a separate ``EasyDeLBaseModule`` + :class:`SpecDecodeBase`
+    instance supplied via ``drafter_model`` (or, for config-driven builds, the
+    ``assistant_model`` slot). This builder validates it, records the target
+    config + draft-token count, and returns it unchanged.
+
+    Args:
+        target_model: Target model whose config seeds the drafter.
+        num_draft_tokens: Speculative tokens proposed per verify window.
+        assistant_model: Fallback slot for ``drafter_model``.
+        target_embed_module: Ignored (model-native drafters own their embedding).
+        layer_mapping: Ignored (the runner seeds a single hidden per window).
+        target_config: Optional target config; defaults to ``target_model.config``.
+        drafter_model: The standalone drafter instance.
+        **kwargs: Ignored.
+
+    Returns:
+        The configured drafter instance.
+
+    Raises:
+        ValueError: If no drafter instance is supplied, or it is a multi-layer
+            standalone drafter (which the single-hidden runner seed cannot feed).
+        TypeError: If the supplied drafter is not a :class:`SpecDecodeBase`.
+    """
+    del target_embed_module, layer_mapping, kwargs
+    drafter = drafter_model if drafter_model is not None else assistant_model
+    if drafter is None:
+        raise ValueError(
+            "Model-native drafters (eagle3/dspark/dflash) require a standalone "
+            "drafter_model=... (an EasyDeLBaseModule + SpecDecodeBase instance)."
+        )
+    if not isinstance(drafter, SpecDecodeBase):
+        raise TypeError(f"drafter_model must be an EasyDeLBaseModule + SpecDecodeBase; got {type(drafter).__name__}.")
+    # Seed-hidden shape gate (5b): the eSurge runner seeds the drafter with ONE
+    # target hidden state per verify window, but a multi-layer standalone
+    # drafter's `extract_context_feature` expects `len(target_layer_ids)`
+    # concatenated layers. Fail early with a clear message instead of a
+    # far-away shape error deep inside the drafter forward.
+    # TODO(5a): wire a multi-layer runner-seed gather so multi-layer standalone
+    #   drafters can be seeded directly; that change lives in the recurrent /
+    #   hidden-gather path of model_runner.py and is intentionally out of scope
+    #   here.
+    n_layers = _drafter_target_layer_count(drafter)
+    if n_layers > 1:
+        raise ValueError(
+            f"{type(drafter).__name__} is configured with {n_layers} target layers "
+            "(target_layer_ids), but eSurge runner-native speculative decoding seeds the "
+            "drafter with a single target hidden state per window. Configure the drafter "
+            "with a single target layer, or pre-concatenate the target hidden states. "
+            "Multi-layer runner seeding is not yet wired."
+        )
+    drafter.target_config = target_config if target_config is not None else getattr(target_model, "config", None)
+    if hasattr(drafter, "set_num_draft_tokens"):
+        drafter.set_num_draft_tokens(int(num_draft_tokens))
+    else:
+        drafter.num_draft_tokens = max(1, int(num_draft_tokens))
+    return drafter
 
 
 __all__ = [

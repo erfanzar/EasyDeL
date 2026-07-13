@@ -246,9 +246,14 @@ class DrafterSpeculation:
 
         min_p = float(getattr(sampling_params, "min_p", 0.0) or 0.0)
         if min_p > 0.0:
-            max_logits = jnp.max(logits, axis=-1, keepdims=True)
+            # Min-p in PROBABILITY space (matches the production sampler's
+            # `apply_min_p_mask`): keep tokens whose probability is
+            # >= min_p * max_prob. Doing this on raw logits is a different,
+            # wrong criterion; `min_p == 0` is gated out above so it stays a no-op.
+            probs = jax.nn.softmax(logits, axis=-1)
+            max_probs = jnp.max(probs, axis=-1, keepdims=True)
             logits = jnp.where(
-                logits >= (jnp.asarray(min_p, dtype=jnp.float32) * max_logits),
+                probs >= (jnp.asarray(min_p, dtype=jnp.float32) * max_probs),
                 logits,
                 jnp.full_like(logits, min_val),
             )
@@ -342,10 +347,16 @@ class DrafterSpeculation:
         )
 
         def _apply_min_p(legi):
-            """Mask logits below ``min_p * max(logits)`` to ``min_val``."""
-            max_logits = jnp.max(legi, axis=-1, keepdims=True)
+            """Mask tokens whose probability is below ``min_p * max_prob``.
+
+            Min-p in PROBABILITY space, matching the production sampler's
+            ``apply_min_p_mask`` (``prob >= min_p * max_prob``); the ``min_p == 0``
+            case is a no-op via the ``jax.lax.cond`` gate below.
+            """
+            probs = jax.nn.softmax(legi, axis=-1)
+            max_probs = jnp.max(probs, axis=-1, keepdims=True)
             return jnp.where(
-                legi >= (min_p.astype(jnp.float32) * max_logits),
+                probs >= (min_p.astype(jnp.float32) * max_probs),
                 legi,
                 jnp.full_like(legi, min_val),
             )
@@ -988,6 +999,14 @@ class DrafterSpeculation:
         if bool(getattr(self.drafter, "requires_target_kv_cache", False)) and target_kv_payload is None:
             logger.debug("Speculative assistant drafter has no target K/V payload; skipping drafts.")
             return []
+        # Per-verify-window reset boundary (SP2): drafters that carry an internal
+        # KV cache (e.g. the inline MTP drafter) must not reuse a previous
+        # request's/window's K/V — that pollutes this window's drafts and
+        # collapses acceptance. Stateless drafters expose no `reset_request` and
+        # are skipped.
+        reset_request = getattr(self.drafter, "reset_request", None)
+        if callable(reset_request):
+            reset_request(request_id=str(req_id))
         for draft_idx in range(self.num_speculative_tokens):
             position_ids = (
                 jnp.asarray(prefix_position_ids, dtype=jnp.int32)

@@ -33,6 +33,7 @@ from spectrax import nn
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
+from easydel.infra.spec_decode import SpecDecodeBase
 from easydel.layers import ColumnParallelLinear, Embed, RMSNorm
 from easydel.modules._drafting import (
     AcceptRatePredictor,
@@ -191,7 +192,7 @@ class DSparkDecoderLayer(spx.Module):
 
 
 @register_module(TaskType.BASE_MODULE, config=DSparkConfig, model_type="dspark")
-class DSparkModel(EasyDeLBaseModule):
+class DSparkModel(EasyDeLBaseModule, SpecDecodeBase):
     """DeepSpec-compatible DSpark block drafter.
 
     The public forward supports two modes.  Without `loss_mask` it returns
@@ -200,11 +201,50 @@ class DSparkModel(EasyDeLBaseModule):
     follows DeepSpec's DSpark training path and returns block logits, target
     IDs, evaluation masks, anchor positions, optional Markov-adjusted logits,
     and optional confidence logits.
+
+    As a :class:`SpecDecodeBase`, DSpark is a runner-native drafter: the shared
+    ``draft(...)`` tail calls :meth:`_draft_logits`, which runs the sequence-mode
+    forward. ``DFlashModel`` subclasses this class and inherits the drafter
+    surface unchanged.
     """
 
     _task_type = TaskType.BASE_MODULE
     _model_type = "dspark"
     _config_class = DSparkConfig
+
+    def _draft_logits(
+        self,
+        input_ids: Int[Array, "batch seq"],
+        *,
+        target_hidden_states: tp.Any | None,
+        position_ids: Int[Array, "batch seq"] | None = None,
+        target_kv_cache: tp.Any | None = None,
+        attention_mask: tp.Any | None = None,
+    ) -> tuple[jax.Array, jax.Array | None]:
+        """Produce DSpark draft logits + hidden rows for :meth:`SpecDecodeBase.draft`.
+
+        Runs the sequence-mode :meth:`forward` (no ``loss_mask`` /
+        ``return_block_outputs``) so it returns ``[batch, seq, vocab]`` logits
+        instead of the block-mode training output.
+
+        Args:
+            input_ids: ``(batch, seq)`` seed/verified tokens.
+            target_hidden_states: Target hidden state(s) to project (single
+                layer or pre-concatenated target features).
+            position_ids: Ignored (sequence-mode forward builds its own).
+            target_kv_cache: Ignored (DSpark does not cross-attend to target K/V).
+            attention_mask: Optional attention mask.
+
+        Returns:
+            Tuple ``(logits, hidden_states)``.
+        """
+        del position_ids, target_kv_cache
+        out = self.forward(
+            input_ids=input_ids,
+            target_hidden_states=target_hidden_states,
+            attention_mask=attention_mask,
+        )
+        return out.logits, out.hidden_states
 
     def __init__(
         self,
