@@ -2266,7 +2266,11 @@ class ModelStepExecutor:
                         hidden_states = self._flatten_model_hidden(output.last_hidden_state)
                         gathered_hidden_states = hidden_states[metadata.logits_indices[:padded_num_reqs]]
                     with jax.named_scope("easydel/esurge/pp_model_step/lm_head"):
-                        logits = model.apply_lm_head(gathered_hidden_states)
+                        # Use compute_lm_logits (not raw apply_lm_head) so model-level
+                        # final logit post-processing runs (e.g. gemma2 softcap,
+                        # cohere logit_scale). No-op for families whose
+                        # compute_lm_logits is identity over apply_lm_head.
+                        logits = model.compute_lm_logits(gathered_hidden_states)
                     return ModelStepOutputs(
                         kv_pages=output.past_key_values,
                         hidden_states=gathered_hidden_states,
@@ -2426,7 +2430,11 @@ class ModelStepExecutor:
                         hidden_states = self._flatten_model_hidden(output.last_hidden_state)
                         gathered_hidden_states = hidden_states[metadata.logits_indices[:padded_num_reqs]]
                     with jax.named_scope("easydel/esurge/spmd_model_step/lm_head"):
-                        logits = model.apply_lm_head(gathered_hidden_states)
+                        # Use compute_lm_logits (not raw apply_lm_head) so model-level
+                        # final logit post-processing runs (e.g. gemma2 softcap,
+                        # cohere logit_scale). No-op for families whose
+                        # compute_lm_logits is identity over apply_lm_head.
+                        logits = model.compute_lm_logits(gathered_hidden_states)
                     return_full_hidden = (
                         self.full_hidden_state_max_tokens > 0
                         and int(hidden_states.shape[0]) <= self.full_hidden_state_max_tokens
@@ -2493,7 +2501,9 @@ class ModelStepExecutor:
             (or the upstream backbone wrapper) has already gathered, so the
             compiled executable is keyed only by the request-axis bucket.
             Binds ``graphdef`` / ``graphstate`` / ``graphother`` to materialize
-            the model module and delegates to :meth:`apply_lm_head`.
+            the model module and delegates to :meth:`compute_lm_logits` so any
+            model-level final logit post-processing (e.g. Gemma-2 soft-capping,
+            Cohere ``logit_scale``) is applied on top of the raw projection.
             """
             with self.model.mesh:
                 # spx.bind only runs at trace/compile time (inside @spx.jit),
@@ -2504,6 +2514,10 @@ class ModelStepExecutor:
                         graphother = jax.tree_util.tree_unflatten(graphother_treedef, graphother)
                     model: "EasyDeLBaseModule" = spx.bind(graphdef, graphstate.merge(graphother, copy=False))
                     with jax.named_scope("easydel/esurge/lm_head_step/project"):
-                        return model.apply_lm_head(gathered_hidden_states)
+                        # Use compute_lm_logits (not raw apply_lm_head) so model-level
+                        # final logit post-processing runs (e.g. gemma2 softcap,
+                        # cohere logit_scale). No-op for families whose
+                        # compute_lm_logits is identity over apply_lm_head.
+                        return model.compute_lm_logits(gathered_hidden_states)
 
         return _lm_head_step

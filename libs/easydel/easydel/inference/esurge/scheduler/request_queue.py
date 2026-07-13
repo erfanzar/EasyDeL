@@ -56,6 +56,7 @@ Example:
 from __future__ import annotations
 
 import heapq
+import itertools
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Iterable, Iterator
@@ -488,7 +489,14 @@ class PriorityRequestQueue(RequestQueue):
 
         Creates an empty heap for storing requests.
         """
-        self._heap: list[tuple[int, float, EngineRequest]] = []
+        # Entries are (priority, arrival_time, seq, request). ``seq`` is a
+        # strictly increasing insertion counter that acts as a final
+        # tiebreaker so two entries with equal (priority, arrival_time) never
+        # fall through to comparing the ``EngineRequest`` objects (which define
+        # no ordering and would raise ``TypeError`` under heapq). It also makes
+        # ties resolve FIFO by insertion order.
+        self._heap: list[tuple[int, float, int, EngineRequest]] = []
+        self._seq_counter = itertools.count()
 
     def add_request(self, request: EngineRequest) -> None:
         """Add a request to the queue according to priority policy.
@@ -503,7 +511,10 @@ class PriorityRequestQueue(RequestQueue):
         Example:
             >>> queue.add_request(new_request)
         """
-        heapq.heappush(self._heap, (request.priority, request.arrival_time, request))
+        heapq.heappush(
+            self._heap,
+            (request.priority, request.arrival_time, next(self._seq_counter), request),
+        )
 
     def pop_request(self) -> EngineRequest:
         """Pop a request from the queue according to priority policy.
@@ -522,7 +533,7 @@ class PriorityRequestQueue(RequestQueue):
         """
         if not self._heap:
             raise IndexError("pop from empty heap")
-        _, _, request = heapq.heappop(self._heap)
+        _, _, _, request = heapq.heappop(self._heap)
         return request
 
     def peek_request(self) -> EngineRequest:
@@ -541,7 +552,7 @@ class PriorityRequestQueue(RequestQueue):
         """
         if not self._heap:
             raise IndexError("peek from empty heap")
-        _, _, request = self._heap[0]
+        _, _, _, request = self._heap[0]
         return request
 
     def prepend_request(self, request: EngineRequest) -> None:
@@ -596,7 +607,7 @@ class PriorityRequestQueue(RequestQueue):
         Example:
             >>> queue.remove_request(cancelled_request)
         """
-        self._heap = [(p, t, r) for p, t, r in self._heap if r != request]
+        self._heap = [(p, t, c, r) for p, t, c, r in self._heap if r != request]
         heapq.heapify(self._heap)
 
     def remove_requests(self, requests: Iterable[EngineRequest]) -> None:
@@ -612,7 +623,7 @@ class PriorityRequestQueue(RequestQueue):
             >>> queue.remove_requests([req1, req2, req3])
         """
         requests_to_remove = set(requests)
-        self._heap = [(p, t, r) for p, t, r in self._heap if r not in requests_to_remove]
+        self._heap = [(p, t, c, r) for p, t, c, r in self._heap if r not in requests_to_remove]
         heapq.heapify(self._heap)
 
     def __bool__(self) -> bool:
@@ -647,7 +658,7 @@ class PriorityRequestQueue(RequestQueue):
         """
         heap_copy = self._heap[:]
         while heap_copy:
-            _, _, request = heapq.heappop(heap_copy)
+            _, _, _, request = heapq.heappop(heap_copy)
             yield request
 
     def __reversed__(self) -> Iterator[EngineRequest]:

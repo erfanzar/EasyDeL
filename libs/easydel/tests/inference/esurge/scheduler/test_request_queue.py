@@ -27,7 +27,6 @@ from dataclasses import dataclass
 from typing import cast
 
 import pytest
-
 from easydel.inference.esurge.scheduler.request_queue import (
     FCFSRequestQueue,
     PriorityRequestQueue,
@@ -196,6 +195,41 @@ def test_priority_tie_breaks_by_arrival_time():
     q.add_request(earlier)
     assert q.pop_request() is earlier
     assert q.pop_request() is later
+
+
+def test_priority_full_tie_breaks_fifo_without_comparing_requests():
+    """Equal (priority, arrival_time) must not fall through to comparing the
+    request objects (which define no ordering -> ``TypeError``); ties resolve
+    FIFO by insertion order."""
+    q = PriorityRequestQueue()
+    first = _r("first", priority=5, arrival_time=1.0)
+    second = _r("second", priority=5, arrival_time=1.0)
+    third = _r("third", priority=5, arrival_time=1.0)
+    # With the bug, the second push already raises TypeError comparing _Req.
+    for req in (first, second, third):
+        q.add_request(req)
+
+    assert q.pop_request() is first
+    assert q.pop_request() is second
+    assert q.pop_request() is third
+
+
+def test_priority_tie_after_remove_still_orders_by_insertion():
+    """The insertion tiebreaker must survive a remove+reheapify so a later tie
+    does not start comparing request objects."""
+    q = PriorityRequestQueue()
+    a = _r("a", priority=1, arrival_time=1.0)
+    b = _r("b", priority=1, arrival_time=1.0)
+    c = _r("c", priority=1, arrival_time=1.0)
+    for req in (a, b, c):
+        q.add_request(req)
+    q.remove_request(b)  # forces heapify over the remaining tuples
+    d = _r("d", priority=1, arrival_time=1.0)
+    q.add_request(d)
+
+    assert q.pop_request() is a
+    assert q.pop_request() is c
+    assert q.pop_request() is d
 
 
 def test_priority_peek_returns_top_without_popping():

@@ -271,6 +271,39 @@ class CacheManager:
 
         return CachePages(computed_pages), num_new_computed_tokens
 
+    def probe_num_computed_tokens(self, request: EngineRequest) -> int:
+        """Read-only prefix-cache probe returning the cached-token count.
+
+        Unlike :meth:`get_computed_pages`, this does **not** persist the
+        request's page hashes into ``req_to_page_hashes``. It is used by the
+        DP scheduler to compare prefix-cache locality across ranks before
+        choosing an owner. Persisting here would leak a ``req_to_page_hashes``
+        entry on every non-owning rank (only the chosen rank ever frees it via
+        :meth:`free_page_hashes`).
+
+        Args:
+            request: The request to probe for cached prefix tokens.
+
+        Returns:
+            The number of tokens that would be served from the prefix cache.
+        """
+        if not self.enable_caching or (
+            request.sampling_params is not None and request.sampling_params.prompt_logprobs is not None
+        ):
+            return 0
+
+        page_hashes = self.req_to_page_hashes.get(request.request_id)
+        if not page_hashes:
+            assert self.page_size is not None
+            page_hashes = hash_request_tokens(hash, self.page_size, request)
+
+        max_cache_hit_length = request.num_tokens - 1
+        _computed_pages, num_new_computed_tokens = self.coordinator.find_longest_cache_hit(
+            page_hashes,
+            max_cache_hit_length,
+        )
+        return int(num_new_computed_tokens)
+
     def _infer_dp_shard_from_pages(
         self,
         pages: tuple[list[CachePage], ...],

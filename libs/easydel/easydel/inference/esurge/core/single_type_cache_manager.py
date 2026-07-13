@@ -210,6 +210,37 @@ class SingleTypeCacheManager(ABC):
             req_pages.extend(new_pages)
             return new_pages
 
+    def rollback_allocated_pages(self, request_id: str, pages: list[CachePage]) -> None:
+        """Undo pages just allocated by :meth:`allocate_new_pages`.
+
+        Detaches ``pages`` (the tail appended by the most recent allocation)
+        from the request's page list and returns them to the pool. Used by the
+        coordinator to roll back a partially-completed multi-group allocation
+        when a later group fails, so earlier groups' pages are not leaked.
+
+        Args:
+            request_id: The request ID.
+            pages: The pages returned by the matching ``allocate_new_pages``
+                call for this group.
+        """
+        if not pages:
+            return
+        req_pages = self.req_to_pages.get(request_id)
+        if req_pages:
+            num = len(pages)
+            if req_pages[-num:] == pages:
+                del req_pages[-num:]
+            else:
+                for page in pages:
+                    try:
+                        req_pages.remove(page)
+                    except ValueError:
+                        continue
+            if not req_pages:
+                self.req_to_pages.pop(request_id, None)
+        # Return to the pool tail-first, matching free()'s eviction ordering.
+        self.page_pool.free_pages(list(reversed(pages)))
+
     def cache_pages(self, request: EngineRequest, page_hashes: list[PageHash], num_tokens: int) -> None:
         """Mark this group's pages as prefix-cacheable up to ``num_tokens``.
 

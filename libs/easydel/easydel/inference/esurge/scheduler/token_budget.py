@@ -154,3 +154,18 @@ class TokenBudgetManager:
         grant = min(requested_tokens, self._remaining)
         self._remaining -= grant
         return grant
+
+    def release(self, tokens: int) -> None:
+        """Return tokens consumed earlier in this cycle back to the budget.
+
+        Used when a request scheduled earlier in the same scheduling step is
+        subsequently un-scheduled (e.g. priority preemption evicts a victim
+        that had already been granted its decode budget this step).
+
+        Args:
+            tokens: Number of tokens to return. Non-positive values are
+                ignored.
+        """
+        if tokens <= 0:
+            return
+        self._remaining += int(tokens)

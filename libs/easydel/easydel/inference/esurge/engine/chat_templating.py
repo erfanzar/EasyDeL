@@ -518,6 +518,20 @@ def format_chat_prompt(
 
     if chat_template_kwargs is None:
         chat_template_kwargs = {}
+    else:
+        # Copy so we never mutate the caller's dict, then strip keys we also
+        # pass explicitly below. A client body carrying e.g.
+        # {"chat_template_kwargs": {"add_generation_prompt": true}} would
+        # otherwise collide with the explicit keyword argument and raise
+        # ``TypeError: got multiple values for keyword argument``. Client
+        # values win (mirrors the OpenAI-style _prepare_chat_input helper).
+        chat_template_kwargs = dict(chat_template_kwargs)
+        if "add_generation_prompt" in chat_template_kwargs:
+            add_generation_prompt = chat_template_kwargs.pop("add_generation_prompt")
+        if "chat_template" in chat_template_kwargs:
+            chat_template = chat_template_kwargs.pop("chat_template")
+        if "tools" in chat_template_kwargs:
+            tools = chat_template_kwargs.pop("tools")
     normalized_messages = normalize_chat_template_messages(messages)
     normalized_tools = normalize_chat_template_tools(tools)
     normalized_wrapped_tools = normalize_wrapped_chat_template_tools(tools)
