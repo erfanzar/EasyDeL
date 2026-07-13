@@ -92,9 +92,15 @@ def test_spmd_lm_head_applies_final_softcapping():
     expected = model.compute_lm_logits(hidden)  # soft-capped
     raw = model.apply_lm_head(hidden)  # raw projection (buggy output)
 
-    # The executable must reproduce the model's post-processed logits ...
-    assert jnp.allclose(logits, expected, atol=1e-4), (
-        f"max abs diff vs compute_lm_logits = {float(jnp.max(jnp.abs(logits - expected)))}"
+    # The executable must reproduce the model's post-processed logits. On TPU the
+    # compiled LM-head runs in bf16, so the executable and the eager
+    # compute_lm_logits reference round each op slightly differently (~1 bf16 ULP,
+    # ~1.6e-2 at these magnitudes); on CPU the path is fp32 and matches tightly.
+    # Scale the tolerance to the output dtype so the softcap-correctness check
+    # holds on both without being fooled by the raw path (which differs by >0.5).
+    tol = 5e-2 if jnp.dtype(logits.dtype) == jnp.bfloat16 else 1e-4
+    assert jnp.allclose(logits.astype(jnp.float32), expected.astype(jnp.float32), atol=tol), (
+        f"max abs diff vs compute_lm_logits = {float(jnp.max(jnp.abs(logits.astype(jnp.float32) - expected.astype(jnp.float32))))}"
     )
     # ... and must NOT be the raw projection: the soft-cap has to bite here,
     # which is exactly what the fix restores (fails on the pre-fix code that
