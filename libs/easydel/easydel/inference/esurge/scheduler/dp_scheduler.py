@@ -98,8 +98,9 @@ def _probe_computed_tokens(scheduler: Scheduler, request: EngineRequest) -> int:
     manager = scheduler.kv_cache_manager
     if not manager.enable_caching:
         return 0
-    _pages, cached_tokens = manager.get_computed_pages(request)
-    return int(cached_tokens)
+    # Use the read-only probe so ranks that never own this request do not
+    # accumulate a req_to_page_hashes entry (only the chosen rank frees it).
+    return int(manager.probe_num_computed_tokens(request))
 
 
 def _scheduler_worker_process(

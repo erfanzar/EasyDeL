@@ -363,13 +363,21 @@ def apply_min_p_mask(logits: jax.Array, sampling_metadata: SamplingMetadata) -> 
         Masked logits with min-p filtering applied [batch, vocab_size].
 
     Note:
-        Min-p is applied as: keep tokens where logit >= min_p * max(logit).
-        This is computed on logits directly, not on probabilities, to avoid
-        issues with already-filtered distributions.
+        Min-p is applied in PROBABILITY space: keep tokens whose probability is
+        ``>= min_p * max_prob`` (Nucleus/min-p per Minh et al.). This must not be
+        done on raw logits — ``logit >= min_p * max_logit`` is a different, wrong
+        criterion that (a) masks the entire vocab when ``max_logit <= 0`` and
+        (b) is not a no-op at ``min_p == 0`` (it drops every negative-logit
+        token). Because ``need_min_p_sampling`` is a batch-global flag, that
+        second bug corrupted requests that never set min-p whenever *any* row in
+        the batch used it. In probability space ``min_p == 0`` gives threshold
+        ``0`` and keeps every token — a true no-op — so the batch-wide
+        application is safe.
     """
-    max_logits = jnp.max(logits, axis=-1, keepdims=True)
-    threshold = sampling_metadata.min_ps[:, None] * max_logits
-    mask = logits >= threshold
+    probs = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)
+    max_probs = jnp.max(probs, axis=-1, keepdims=True)
+    threshold = sampling_metadata.min_ps[:, None] * max_probs
+    mask = probs >= threshold
     return jnp.where(mask, logits, jnp.full_like(logits, -1e10))
 
 

@@ -178,16 +178,34 @@ class CacheCoordinator(ABC):
 
         Returns:
             Tuple of newly allocated pages, one list per cache group.
+
+        Raises:
+            ValueError: Propagated from a per-group allocation (e.g. per-shard
+                page exhaustion). Before re-raising, any pages already
+                allocated for earlier groups during this call are freed and
+                detached, so the request's page state is restored to what it
+                was before the call (no leaked pages / no partial allocation).
         """
-        return tuple(
-            manager.allocate_new_pages(
-                request_id,
-                num_tokens,
-                dp_shard_hint=dp_shard_hint,
-                data_parallel_size=data_parallel_size,
-            )
-            for manager in self.single_type_managers
-        )
+        allocated: list[tuple[object, list[CachePage]]] = []
+        results: list[list[CachePage]] = []
+        try:
+            for manager in self.single_type_managers:
+                group_pages = manager.allocate_new_pages(
+                    request_id,
+                    num_tokens,
+                    dp_shard_hint=dp_shard_hint,
+                    data_parallel_size=data_parallel_size,
+                )
+                allocated.append((manager, group_pages))
+                results.append(group_pages)
+        except Exception:
+            # Transactional rollback: undo the partial per-group allocations
+            # from this call so a later re-schedule of the same request starts
+            # from a clean state instead of leaking earlier groups' pages.
+            for manager, group_pages in allocated:
+                manager.rollback_allocated_pages(request_id, group_pages)
+            raise
+        return tuple(results)
 
     def cache_pages(self, request: EngineRequest, page_hashes: list[PageHash], num_computed_tokens: int) -> None:
         """Mark pages as prefix-cacheable across every cache group.

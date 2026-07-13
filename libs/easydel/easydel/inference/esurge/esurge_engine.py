@@ -2988,7 +2988,7 @@ class eSurge:
                 len(deferred_scheduler_requests),
             )
 
-        outputs = []
+        outputs_by_id: dict[str, RequestOutput] = {}
         pbar = None
         if use_tqdm:
             from tqdm import tqdm
@@ -3017,12 +3017,18 @@ class eSurge:
                         output = self._request_outputs[req_id]
                         if output.finished:
                             completed.add(req_id)
-                            outputs.append(output)
+                            outputs_by_id[req_id] = output
                             if pbar:
                                 pbar.update(1)
 
         if pbar:
             pbar.close()
+
+        # Return outputs in prompt/request_ids order rather than completion
+        # order: requests may finish out of order, but positional callers
+        # (enumerate over prompts, benchmarks, RLHF rollouts) rely on the i-th
+        # output corresponding to the i-th prompt.
+        outputs = [outputs_by_id[rid] for rid in request_ids]
 
         # Cleanup per-request events (outputs retained per max_request_outputs).
         with self._request_lock:

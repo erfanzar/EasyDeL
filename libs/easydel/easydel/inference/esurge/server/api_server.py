@@ -2074,6 +2074,34 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             logger.exception("Error in /v1/responses: %s", e)
             return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e), response_id)
 
+    @staticmethod
+    def _build_completion_choices(output: RequestOutput) -> list[CompletionResponseChoice]:
+        """Build one ``CompletionResponseChoice`` per sampled completion.
+
+        Each choice must carry its own sample's text (``completion.text``).
+        ``output.accumulated_text`` mirrors only sample index 0, so using it
+        for every choice made ``/v1/completions`` with ``n>1`` return the same
+        text for every choice.
+
+        Args:
+            output: Finalized :class:`RequestOutput` holding one
+                :class:`CompletionOutput` per requested sample.
+
+        Returns:
+            A list of :class:`CompletionResponseChoice`, one per sample, in
+            sample order.
+        """
+        choices: list[CompletionResponseChoice] = []
+        for idx, completion in enumerate(output.outputs):
+            choices.append(
+                CompletionResponseChoice(
+                    index=idx,
+                    text=completion.text,
+                    finish_reason=completion.finish_reason or "stop",
+                )
+            )
+        return choices
+
     def _build_chat_completion_response(
         self,
         request: ChatCompletionRequest,
@@ -2497,15 +2525,7 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             tokens_per_second = output.tokens_per_second
             processing_time = output.processing_time
 
-            choices = []
-            for idx, completion in enumerate(output.outputs):
-                choices.append(
-                    CompletionResponseChoice(
-                        index=idx,
-                        text=output.accumulated_text,
-                        finish_reason=completion.finish_reason or "stop",
-                    )
-                )
+            choices = self._build_completion_choices(output)
 
             usage = UsageInfo(
                 prompt_tokens=prompt_tokens,

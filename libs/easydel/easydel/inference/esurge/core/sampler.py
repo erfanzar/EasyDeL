@@ -125,8 +125,19 @@ def _regular_sample(logits: jax.Array, sampling_metadata: SamplingMetadata, rng:
         legi = lax.cond(need_top_p, apply_topp, lambda x: x, legi)
 
         def apply_temp(legi):
-            """Scale logits by per-sample temperature values."""
-            return legi / sampling_metadata.temperatures
+            """Scale logits by per-sample temperature values.
+
+            Greedy rows carry the reset sentinel temperature ``-1.0`` (see
+            ``SequenceBuffer``). Dividing by it would *negate* their logits, so a
+            mixed greedy+sampling batch (which does not take the all-greedy
+            short-circuit) would sample the greedy row's *lowest*-logit tokens.
+            Guard those rows with a safe temperature of ``1.0`` here — their final
+            token is overridden with the argmax below, so the scaled value is
+            discarded; the guard only keeps the shared tensor finite (also avoids
+            div-by-zero for an explicit ``temperature==0``).
+            """
+            safe_temp = jnp.where(sampling_metadata.temperatures <= 0.0, 1.0, sampling_metadata.temperatures)
+            return legi / safe_temp
 
         legi = lax.cond(need_temp, apply_temp, lambda x: x, legi)
 
@@ -142,7 +153,17 @@ def _regular_sample(logits: jax.Array, sampling_metadata: SamplingMetadata, rng:
     # Keep the common no-filter path in the model logits dtype. For bf16 TPU
     # inference this avoids a full-vocab fp32 materialization before categorical
     # sampling. Filtering paths still promote to fp32 for numerical stability.
-    return lax.cond(need_filter_math, sample_filtered, sample_direct, logits)
+    sampled = lax.cond(need_filter_math, sample_filtered, sample_direct, logits)
+
+    # Per-row greedy override. An all-greedy batch short-circuits to
+    # ``_greedy_sample`` upstream (``sample_tokens``), but a MIXED batch runs this
+    # function for every row — including greedy rows (sentinel temperature <= 0),
+    # whose token must be the argmax of the (penalty-applied) logits rather than a
+    # temperature-scaled stochastic draw. Without this, greedy requests co-batched
+    # with any sampling request emit near-worst-case tokens.
+    is_greedy_row = (sampling_metadata.temperatures <= 0.0).reshape(-1)
+    greedy_tokens = jnp.argmax(logits, axis=-1).astype(jnp.int32)
+    return jnp.where(is_greedy_row, greedy_tokens, sampled)
 
 
 def build_history_token_counts(

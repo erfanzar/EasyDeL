@@ -605,6 +605,24 @@ class Scheduler(SchedulerInterface):
                             key=lambda r: (r.priority, r.arrival_time),
                         )
                         self.running.remove(preempted_req)
+                        # The victim may already have been scheduled earlier in
+                        # this same step. Un-schedule it before treating it as
+                        # preempted, otherwise scheduled_running_reqs /
+                        # num_scheduled_tokens / req_to_new_page_ids keep a
+                        # request that is no longer running: the token budget
+                        # leaks, req_to_new_page_ids points at freed pages, and
+                        # the "total scheduled <= running" invariant below
+                        # raises RuntimeError.
+                        if preempted_req in scheduled_running_reqs:
+                            scheduled_running_reqs.remove(preempted_req)
+                            refunded_tokens = num_scheduled_tokens.pop(preempted_req.request_id, 0)
+                            req_to_new_page_ids.pop(preempted_req.request_id, None)
+                            if self._token_budget_manager:
+                                self._token_budget_manager.release(refunded_tokens)
+                                token_budget = self._token_budget_manager.remaining
+                            else:
+                                token_budget += refunded_tokens
+                            req_index -= 1
                     else:
                         preempted_req = self.running.pop()
 
@@ -653,6 +671,12 @@ class Scheduler(SchedulerInterface):
                 if num_scheduled_spec_tokens > 0:
                     del request.spec_token_ids[num_scheduled_spec_tokens:]
                     scheduled_spec_decode_tokens[request.request_id] = request.spec_token_ids
+        # Requests skipped this step are accumulated with add_request (append,
+        # i.e. in skip order) rather than prepend_request. Since they are
+        # popped from the front of ``self.waiting`` in FCFS order and later
+        # re-prepended via ``prepend_requests`` (which preserves the source
+        # queue's iteration order at the front), appending keeps their original
+        # relative FCFS order stable across the skip/requeue round-trip.
         skipped_waiting_requests = create_request_queue(self.policy)
         if not preempted_reqs:
             while self.waiting and token_budget > 0:
@@ -670,7 +694,7 @@ class Scheduler(SchedulerInterface):
                         request.status = EngineRequestStatus.WAITING
                     else:
                         self.waiting.pop_request()
-                        skipped_waiting_requests.prepend_request(request)
+                        skipped_waiting_requests.add_request(request)
                         continue
 
                 num_external_computed_tokens = 0
@@ -678,7 +702,7 @@ class Scheduler(SchedulerInterface):
                 row_shard_hint = _pick_new_shard(request)
                 if use_dp_local_shard_hints and row_shard_hint is None:
                     self.waiting.pop_request()
-                    skipped_waiting_requests.prepend_request(request)
+                    skipped_waiting_requests.add_request(request)
                     continue
 
                 if request.num_computed_tokens == 0:
@@ -722,7 +746,7 @@ class Scheduler(SchedulerInterface):
                             pass
                         else:
                             self.waiting.pop_request()
-                            skipped_waiting_requests.prepend_request(request)
+                            skipped_waiting_requests.add_request(request)
                             continue
 
                     num_new_tokens = min(num_new_tokens, token_budget)
@@ -755,7 +779,7 @@ class Scheduler(SchedulerInterface):
 
                 request = self.waiting.pop_request()
                 if load_kv_async:
-                    skipped_waiting_requests.prepend_request(request)
+                    skipped_waiting_requests.add_request(request)
                     request.status = EngineRequestStatus.WAITING_FOR_REMOTE_KVS
                     continue
 
