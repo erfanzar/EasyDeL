@@ -104,7 +104,7 @@ from .sequence_buffer import (
 )
 from .slot_pool import RecurrentSlotPool
 from .spec.interface import NullSpeculation, SpeculativeStrategy
-from .spec.strategy import DrafterSpeculation, _copy_kv_tree, _window_hidden_row
+from .spec.strategy import DrafterSpeculation, _snapshot_recurrent_state, _window_hidden_row
 from .state_sync import SequenceStateSync
 from .states import CachedRequestState
 from .vlm_prefill import VlmPrefillHelper
@@ -2643,7 +2643,9 @@ class eSurgeRunner:
                     if _scheduled_specs and int(_row_pos) not in sequential_greedy_spec_rows:
                         spec_window_needs_snapshot = self.spec.cache_replay_required()
                         break
-            pre_step_kv_pages = _copy_kv_tree(self.executor_manager.kv_pages) if spec_window_needs_snapshot else None
+            pre_step_kv_pages = (
+                _snapshot_recurrent_state(self.executor_manager.kv_pages) if spec_window_needs_snapshot else None
+            )
             window_token_offsets = np.zeros((len(model_scheduled_list),), dtype=np.int32)
             if self.drafter is not None and model_scheduled_list:
                 running_off = 0

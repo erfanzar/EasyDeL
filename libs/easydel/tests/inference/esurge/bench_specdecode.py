@@ -73,6 +73,7 @@ KERNEL_TILE_POLICY = os.environ.get("EASYDEL_BENCH_KERNEL_TILE_POLICY", "auto")
 OVERLAP_EXECUTION = os.environ.get("EASYDEL_BENCH_OVERLAP", "0").lower() in {"1", "true", "yes"}
 ASYNC_SCHEDULING = os.environ.get("EASYDEL_BENCH_ASYNC", "0").lower() in {"1", "true", "yes"}
 REPLICATE_HIDDEN_TP = os.environ.get("EASYDEL_BENCH_REPLICATE_HIDDEN_TP", "1").lower() in {"1", "true", "yes"}
+MODEL_AUTO_CLASS = os.environ.get("EASYDEL_BENCH_MODEL_CLASS", "causal_lm").strip().lower()
 BENCH_MODES = {
     part.strip().lower()
     for part in os.environ.get(
@@ -206,7 +207,13 @@ def load_model():
                 allow_patterns=["*.json", "*.txt", "*.safetensors", "*.model"],
             )
     print(f"  checkpoint: {path}")
-    model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+    auto_cls = {
+        "causal_lm": ed.AutoEasyDeLModelForCausalLM,
+        "image_text_to_text": ed.AutoEasyDeLModelForImageTextToText,
+        "vision_lm": ed.AutoEasyDeLModelForImageTextToText,
+    }.get(MODEL_AUTO_CLASS, ed.AutoEasyDeLModelForCausalLM)
+    print(f"  auto_class: {auto_cls.__name__}")
+    model = auto_cls.from_pretrained(
         pretrained_model_name_or_path=path,
         dtype=jnp.bfloat16,
         param_dtype=jnp.bfloat16,
