@@ -486,7 +486,11 @@ def _coerce_seed(s: int | ArrayLike) -> Array:
         Result described by this helper.
     """
     if isinstance(s, int):
-        cpu_devices = jax.local_devices(backend="cpu")
+        try:
+            cpu_devices = jax.local_devices(backend="cpu")
+        except RuntimeError:
+            # No CPU backend registered (e.g. JAX_PLATFORMS=tpu); fall through to default device.
+            cpu_devices = []
         if cpu_devices:
             with jax.default_device(cpu_devices[0]):
                 return jax.random.PRNGKey(s)
