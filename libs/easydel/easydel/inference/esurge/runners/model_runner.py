@@ -58,6 +58,7 @@ Example:
 
 from __future__ import annotations
 
+import os
 import time
 import typing
 from bisect import bisect_left
@@ -488,6 +489,18 @@ class eSurgeRunner:
         self._has_recurrent_layers = bool(has_recurrent_layers)
         self.spec_decode_recurrent_candidates = bool(
             drafter is not None and int(self.num_speculative_tokens) > 0 and has_recurrent_layers
+        )
+        # Greedy recurrent verify: advance the live recurrent (GDN) state with an
+        # exact sequential replay of the accepted prefix (default). The removed
+        # "fast" path derived the corrected token + next-draft seed hidden from the
+        # fused verify forward and relied on the deferred recurrent candidate-commit
+        # to advance the live state; that commit is not exact for greedy, so greedy
+        # spec output diverged from the target's plain-greedy stream and was
+        # cross-process non-deterministic (stale/uninitialized candidate rows).
+        # Set EASURGE_SPEC_RECURRENT_REPLAY=0 to opt back into the fast (incorrect)
+        # path for A/B perf measurement only.
+        self.spec_decode_recurrent_replay = bool(
+            int(os.environ.get("EASURGE_SPEC_RECURRENT_REPLAY", "1") or 1)
         )
 
         logger.debug("Creating ExecutionManager and initializing pages cache")
@@ -2632,7 +2645,10 @@ class eSurgeRunner:
             spec_decode_active_window = self.drafter is not None and bool(scheduler_output.scheduled_spec_decode_tokens)
             spec_window_needs_snapshot = bool(
                 spec_decode_active_window
-                and (self.spec.cache_replay_required() or self.spec_decode_recurrent_candidates)
+                # ``or`` is commutative here; put the O(1) flag first so the
+                # O(num_layers) ``cache_replay_required()`` view scan is skipped
+                # every step whenever recurrent candidate rows are in use.
+                and (self.spec_decode_recurrent_candidates or self.spec.cache_replay_required())
             )
             if sequential_greedy_spec_rows:
                 spec_window_needs_snapshot = False
@@ -3091,7 +3107,21 @@ class eSurgeRunner:
                                     break
                                 accepted += 1
                             corrected_token = int(projected_target_tokens[accepted])
-                            if self.spec_decode_recurrent_candidates:
+                            if self.spec_decode_recurrent_candidates and self.spec_decode_recurrent_replay:
+                                # Exact greedy path (default; required for
+                                # correctness): advance the live recurrent state via
+                                # a sequential-GDN replay and re-derive the corrected
+                                # token + seed hidden from it. The "fast" path
+                                # (EASURGE_SPEC_RECURRENT_REPLAY=0) instead reused the
+                                # fused verify forward's argmax + the deferred
+                                # recurrent candidate-commit; that commit is NOT exact
+                                # for greedy, so the live GDN state diverged from
+                                # plain greedy decode -> greedy spec output diverged
+                                # from the target's greedy stream at the first verify
+                                # window and was cross-process non-deterministic
+                                # (stale/uninitialized candidate rows). See
+                                # tests/inference/esurge/test_spec_decode.py::
+                                # test_esurge_runner_spec_decode.
                                 corrected_token, replay_hidden = _replay_prefix_sequential(
                                     int(row_pos),
                                     prefix_len=int(real_count + accepted),
