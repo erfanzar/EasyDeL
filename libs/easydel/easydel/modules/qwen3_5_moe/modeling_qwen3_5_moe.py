@@ -70,6 +70,29 @@ from easydel.modules.qwen3_vl_moe.qwen3_vl_moe_configuration import Qwen3VLMoeCo
 from .qwen3_5_moe_configuration import Qwen3_5MoeConfig, Qwen3_5MoeTextConfig
 
 
+def _mtp_mlp_is_moe(text_config) -> bool:
+    """Whether the Qwen3.5-MoE MTP block's FFN should be a sparse MoE block.
+
+    The DeepSeek-V3-style MTP block mirrors the base decoder's FFN type, so its
+    FFN is MoE iff the decoder is MoE: the config must declare routed experts and
+    the last decoder layer must route through them. This is derived from the
+    config's own ``is_moe_layer`` schedule (rather than a class check) so it stays
+    correct for both families:
+
+    - Dense Qwen3.5 (:class:`Qwen3_5TextConfig`) overrides ``is_moe_layer`` to
+      return ``False`` unconditionally -> dense MTP FFN (byte-identical 27B).
+    - Qwen3.5-MoE (:class:`Qwen3_5MoeTextConfig`) inherits the Qwen3-Next
+      ``decoder_sparse_step`` / ``mlp_only_layers`` schedule -> MoE MTP FFN,
+      matching the ``mtp.*.mlp.experts`` / ``shared_expert`` / ``gate`` tensors
+      in the Qwen3.6-35B-A3B checkpoint.
+    """
+    num_experts = int(getattr(text_config, "num_experts", 0) or 0)
+    num_layers = int(getattr(text_config, "num_hidden_layers", 0) or 0)
+    if num_experts <= 0 or num_layers <= 0:
+        return False
+    return bool(text_config.is_moe_layer(num_layers - 1))
+
+
 @register_module(TaskType.BASE_MODULE, config=Qwen3_5MoeTextConfig, model_type="qwen3_5_moe_text")
 class Qwen3_5MoeTextModel(Qwen3NextModel):
     """Qwen3.5-MoE text-only base model (no LM head).
@@ -82,12 +105,15 @@ class Qwen3_5MoeTextModel(Qwen3NextModel):
 class _Qwen3_5MoeMTPMixin:
     """Shared Multi-Token-Prediction (MTP) methods for the Qwen3.5-MoE causal-LM classes.
 
-    Mirrors the qwen3_5 implementation. The dense :class:`Qwen3_5MTPHead` is reused
-    directly (the MoE model's depth-1 MTP block is structurally identical — full
-    attention + dense FFN — and the real checkpoint's ``mtp.*`` FFN type is not
-    exposed by transformers, so dense is the safe default). Subclasses set ``self.mtp``
-    in ``__init__`` and may override the three hooks below (text vs vision-language).
-    See ``easydel.modules.qwen3_5.modeling_qwen3_5`` for the canonical docstrings.
+    Mirrors the qwen3_5 implementation and reuses :class:`Qwen3_5MTPHead` directly.
+    The MoE model's depth-1 MTP block is structurally identical to one decoder layer
+    (full attention + FFN); the FFN is built as a :class:`Qwen3NextSparseMoeBlock`
+    (routed experts + shared expert + gate) by passing ``use_moe_mlp=True`` to the
+    head, matching the ``mtp.*.mlp.experts`` / ``shared_expert`` / ``gate`` tensors
+    in the Qwen3.5-MoE checkpoint (see :func:`_mtp_mlp_is_moe`). Subclasses set
+    ``self.mtp`` in ``__init__`` and may override the three hooks below (text vs
+    vision-language). See ``easydel.modules.qwen3_5.modeling_qwen3_5`` for the
+    canonical docstrings.
     """
 
     # hooks: text and vision-language variants differ only in these three
@@ -247,7 +273,12 @@ class Qwen3_5MoeForCausalLM(_Qwen3_5MoeMTPMixin, Qwen3NextForCausalLM):
         )
         if int(getattr(config, "mtp_num_hidden_layers", 0)) > 0:
             self.mtp = Qwen3_5MTPHead(
-                config=config, dtype=dtype, param_dtype=param_dtype, precision=precision, rngs=rngs
+                config=config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                use_moe_mlp=_mtp_mlp_is_moe(config),
+                rngs=rngs,
             )
         else:
             self.mtp = None
@@ -617,7 +648,12 @@ class Qwen3_5MoeForConditionalGeneration(
         self.vocab_size = config.text_config.vocab_size
         if int(getattr(config.text_config, "mtp_num_hidden_layers", 0)) > 0:
             self.mtp = Qwen3_5MTPHead(
-                config=config.text_config, dtype=dtype, param_dtype=param_dtype, precision=precision, rngs=rngs
+                config=config.text_config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                use_moe_mlp=_mtp_mlp_is_moe(config.text_config),
+                rngs=rngs,
             )
         else:
             self.mtp = None
