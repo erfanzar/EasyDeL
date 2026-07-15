@@ -1142,24 +1142,39 @@ def _apply_qwen3_next_packed_updates_unified(
             beta_step = jnp.where(token_mask, beta_step, 0)
             decay_step = jnp.where(token_mask, decay_step, 0)
 
+            # Advance the draft state with the EXACT same op the single-token
+            # decode fast lane uses (`apply_grouped_single_step_gdr` / `gdr_op`),
+            # not a hand-inlined fp32 formula. The two are algebraically identical
+            # but the op runs in `recurrent_state.dtype` (bf16) through the fused
+            # grouped-decode kernel (Pallas on TPU), so a manual fp32 XLA copy
+            # produces low-bit-different candidate states that do not match a real
+            # sequential decode. Reusing the op makes each candidate row
+            # bit-identical to sequentially decoding the accepted prefix, which is
+            # what lets the cheap candidate-commit rewind be exact (no replay
+            # forward needed). See `_apply_single_token_fast_lane` above.
             if expand_ratio > 1:
-                query = jnp.repeat(query, expand_ratio, axis=2)
-                key = jnp.repeat(key, expand_ratio, axis=2)
-            query = l2norm_decode(query, axis=-1, eps=1e-6)
-            key = l2norm_decode(key, axis=-1, eps=1e-6)
-            scale = jax.lax.rsqrt(jnp.asarray(head_k_dim, dtype=jnp.float32))
-            query_f = query[:, 0].astype(jnp.float32) * scale
-            key_f = key[:, 0].astype(jnp.float32)
-            value_f = value[:, 0].astype(jnp.float32)
-            beta_f = beta_step[:, 0].astype(jnp.float32)
-            exp_g = jnp.exp(decay_step[:, 0].astype(jnp.float32))
-            state_f = rolling_recurrent.astype(jnp.float32)
-            k_state = jnp.einsum("bhd,bhdm->bhm", key_f, state_f)
-            q_state = jnp.einsum("bhd,bhdm->bhm", query_f, state_f)
-            v_new = beta_f[..., None] * (value_f - exp_g[..., None] * k_state)
-            q_k = jnp.sum(query_f * key_f, axis=-1, keepdims=True)
-            step_output = (exp_g[..., None] * q_state + q_k * v_new)[:, None, :, :]
-            step_recurrent = state_f * exp_g[..., None, None] + key_f[..., :, None] * v_new[..., None, :]
+                step_output, step_recurrent = apply_grouped_single_step_gdr(
+                    query=query,
+                    key=key,
+                    value=value,
+                    beta=beta_step,
+                    decay=decay_step,
+                    recurrent_state=rolling_recurrent,
+                    gdr_op=gdr_op,
+                )
+            else:
+                gdr_step: GatedDeltaRuleOutput = gdr_op(
+                    query=query,
+                    key=key,
+                    value=value,
+                    beta=beta_step,
+                    decay=decay_step,
+                    recurrent_state=rolling_recurrent,
+                )
+                step_output = gdr_step.attention_outputs
+                step_recurrent = gdr_step.recurrent_state
+            if step_output is None:
+                raise RuntimeError("Grouped delta rule did not return attention outputs.")
 
             rolling_conv = jnp.where(
                 prefix_valid[:, None, None],
