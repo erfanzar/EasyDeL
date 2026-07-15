@@ -22,6 +22,11 @@ import traceback
 os.environ.setdefault("ENABLE_DISTRIBUTED_INIT", "0")
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
+# This test asserts bit-identical greedy (spec == baseline). Only the exact
+# sequential-replay recurrent path guarantees that; the default fast path is
+# coherent but not bit-identical on recurrent models (see model_runner
+# spec_decode_recurrent_replay). Force the exact path here.
+os.environ.setdefault("EASURGE_SPEC_RECURRENT_REPLAY", "1")
 
 import jax
 import jax.numpy as jnp

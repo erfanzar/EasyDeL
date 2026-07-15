@@ -262,6 +262,13 @@ class DrafterSpeculation:
         self._recurrent_commit_candidate_count: int = 0
         self.reject_backoff_steps = 0
         self._backoff_by_req: dict[str, int] = {}
+        # Persist-with-rollback of the inline-MTP KV cache (EAGLE-style). The MTP
+        # cache is a single rolling buffer keyed on batch size, so it can only
+        # hold one request's context at a time; `_mtp_persist_req_id` tracks which
+        # request it currently holds and `_mtp_persist_base_pos` is that request's
+        # first-window seed position (the RoPE origin of compacted cache slot 0).
+        self._mtp_persist_req_id: str | None = None
+        self._mtp_persist_base_pos: int = 0
 
     @property
     def uses_recurrent_candidates(self) -> bool:
@@ -275,6 +282,8 @@ class DrafterSpeculation:
         """
         self.draft_full_log_probs_by_req.clear()
         self._backoff_by_req.clear()
+        self._mtp_persist_req_id = None
+        self._mtp_persist_base_pos = 0
         if self.drafter is not None:
             try:
                 self.drafter.reset(batch_size=max(1, int(self._runner.max_num_seqs)))
@@ -1052,6 +1061,28 @@ class DrafterSpeculation:
         )
         return pairs, attention_mask
 
+    def _mtp_persist_enabled(self) -> bool:
+        """Whether the inline-MTP drafter should persist its KV across windows.
+
+        Persist-with-rollback keeps the accepted-context K/V across verify
+        windows and only rolls it back to the committed position each window
+        (EAGLE / vLLM style), instead of the default per-window full clear. It is
+        enabled by ``EASYDEL_MTP_PERSIST_KV=1`` or a drafter built with
+        ``persist_kv=True``, and requires the drafter to expose ``rollback_to``.
+        Default off: behavior is byte-identical to the historical per-window
+        clear.
+
+        Returns:
+            ``True`` when persistence should be used for the attached drafter.
+        """
+        if self.drafter is None:
+            return False
+        if not callable(getattr(self.drafter, "rollback_to", None)):
+            return False
+        if bool(getattr(self.drafter, "persist_kv", False)):
+            return True
+        return os.environ.get("EASYDEL_MTP_PERSIST_KV", "0") == "1"
+
     def draft_next(
         self,
         *,
@@ -1116,13 +1147,44 @@ class DrafterSpeculation:
         if bool(getattr(self.drafter, "requires_target_kv_cache", False)) and target_kv_payload is None:
             logger.debug("Speculative assistant drafter has no target K/V payload; skipping drafts.")
             return []
-        # Per-verify-window reset boundary (SP2): drafters that carry an internal
-        # KV cache (e.g. the inline MTP drafter) must not reuse a previous
-        # request's/window's K/V — that pollutes this window's drafts and
-        # collapses acceptance. Stateless drafters expose no `reset_request` and
-        # are skipped.
+        # Per-verify-window drafter cache boundary. Two policies:
+        #
+        # * Default (persist off, SP2): FULL clear each window via
+        #   ``reset_request`` so a previous request's/window's K/V never pollutes
+        #   this window's drafts — leaving it collapses acceptance. Stateless
+        #   drafters expose no ``reset_request`` and are skipped.
+        # * Persist-with-rollback (``EASYDEL_MTP_PERSIST_KV`` /
+        #   drafter ``persist_kv=True``): KEEP the inline-MTP KV across windows
+        #   within a request and only roll it back to the committed sequence
+        #   position, dropping the previous window's rejected-draft K/V. Each
+        #   window's MTP self-attention then sees the full accepted-sequence
+        #   context (EAGLE / vLLM). Still FULL-clears across requests.
         reset_request = getattr(self.drafter, "reset_request", None)
-        if callable(reset_request):
+        if self._mtp_persist_enabled():
+            if self._mtp_persist_req_id != str(req_id):
+                # New (or switched) request: the single rolling MTP cache holds
+                # the wrong request. Clear it and re-base the committed-position
+                # origin on this window's first written slot. The first window
+                # has nothing to persist, so this is byte-identical to the
+                # per-window clear.
+                if callable(reset_request):
+                    reset_request(request_id=str(req_id))
+                self._mtp_persist_req_id = str(req_id)
+                if use_prefix and prefix_position_ids is not None:
+                    self._mtp_persist_base_pos = int(np.asarray(prefix_position_ids).reshape(-1)[0])
+                else:
+                    self._mtp_persist_base_pos = int(seed_position)
+            else:
+                # Same request, later window: roll the MTP cache back to the
+                # committed position so the previous window's rejected-draft K/V
+                # is dropped while the accepted context is retained.
+                # ``seed_position`` advances with the accepted sequence; the
+                # compacted committed length is its offset from the request's
+                # first written slot. ``rollback_to`` clamps this down to the
+                # written extent, so an all-accepted window cannot over-advance.
+                committed_len = max(0, int(seed_position) - int(self._mtp_persist_base_pos))
+                self.drafter.rollback_to(committed_len)
+        elif callable(reset_request):
             reset_request(request_id=str(req_id))
         for draft_idx in range(self.num_speculative_tokens):
             position_ids = (

@@ -280,6 +280,7 @@ class Qwen3_5MTPDrafter:
         num_draft_tokens: int = 1,
         use_cache: bool = True,
         cache_length: int | None = None,
+        persist_kv: bool = False,
     ):
         """Wrap a Qwen3.5 causal-LM (or multimodal generation) model.
 
@@ -295,6 +296,14 @@ class Qwen3_5MTPDrafter:
             cache_length: Optional MTP-local cache length. The eSurge runner
                 sets this to the runner max length; standalone use falls back
                 to the model config length.
+            persist_kv: Opt into persist-with-rollback of the MTP KV cache
+                across verify windows (EAGLE / vLLM style) instead of the
+                default per-window full clear. When ``True`` the eSurge
+                strategy keeps the accepted context K/V across windows and only
+                rolls it back to the committed sequence position via
+                :meth:`rollback_to`; see that method. Default ``False`` keeps
+                the historical per-window clear (:meth:`reset_request`), and the
+                ``EASYDEL_MTP_PERSIST_KV=1`` env var enables persistence too.
 
         Raises:
             ValueError: If the model lacks an MTP head.
@@ -305,6 +314,7 @@ class Qwen3_5MTPDrafter:
         self.supports_return_full_log_probs = True
         self.supports_prefix_draft = True
         self.uses_mtp_cache = bool(use_cache)
+        self.persist_kv = bool(persist_kv)
         self._mtp_cache: TransformerCache | None = None
         self._mtp_cache_batch_size: int | None = None
         self._mtp_cache_max_length: int | None = max(1, int(cache_length)) if cache_length is not None else None
@@ -353,6 +363,51 @@ class Qwen3_5MTPDrafter:
         del request_id
         self._mtp_cache = None
         self._mtp_cache_batch_size = None
+
+    def rollback_to(self, committed_len: int) -> int:
+        """Roll the MTP KV cache back to a committed length (persist-with-rollback).
+
+        Instead of clearing the whole MTP cache at each verify-window boundary
+        (:meth:`reset_request`), keep the confirmed-context K/V and discard only
+        the K/V of the previous window's rejected / tentative draft tokens
+        written past ``committed_len``. The next window's writes overwrite the
+        slots at and beyond ``committed_len``, so its MTP self-attention sees the
+        full accepted-sequence context (the EAGLE / vLLM persistent-drafter
+        approach). The eSurge strategy calls this once per window (in place of
+        the full clear) when persistence is enabled.
+
+        Rollback is a truncation of the per-layer write index (``indexes``): the
+        attention reads only ``[0, indexes)`` and later writes overwrite the
+        dropped slots before they are read, so lowering ``indexes`` drops the
+        rejected K/V without touching the stored tensors (the same
+        truncate-and-overwrite invariant paged attention relies on). Each view's
+        index is additionally clamped down to its current value (the written
+        extent), so a window that accepted more tokens than the drafter laid down
+        fused states for can never point ``indexes`` at an unwritten slot.
+
+        Args:
+            committed_len: Number of leading cache slots to retain — the accepted
+                MTP context length, in the cache's compacted slot space. Clamped
+                up to zero.
+
+        Returns:
+            The requested ``committed_len`` clamped to ``>= 0`` (the value the
+            per-layer write index is set to, subject to the written-extent clamp
+            applied per view), or ``0`` when the drafter holds no MTP cache.
+        """
+        if not self.uses_mtp_cache or self._mtp_cache is None:
+            return 0
+        target = max(0, int(committed_len))
+        target_arr = jnp.asarray(target, dtype=jnp.int32)
+        new_views: list[typing.Any] = []
+        for view in self._mtp_cache.views:
+            if view is None:
+                new_views.append(view)
+                continue
+            clamped = jnp.minimum(view.indexes.astype(jnp.int32), target_arr).astype(view.indexes.dtype)
+            new_views.append(view.replace(indexes=clamped))
+        self._mtp_cache = TransformerCache(views=new_views)
+        return target
 
     def _init_mtp_cache(self, batch_size: int) -> TransformerCache | None:
         """Allocate a full-attention cache for the inline MTP block.
