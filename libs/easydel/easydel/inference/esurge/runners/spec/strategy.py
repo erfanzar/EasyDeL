@@ -262,13 +262,17 @@ class DrafterSpeculation:
         self._recurrent_commit_candidate_count: int = 0
         self.reject_backoff_steps = 0
         self._backoff_by_req: dict[str, int] = {}
-        # Persist-with-rollback of the inline-MTP KV cache (EAGLE-style). The MTP
-        # cache is a single rolling buffer keyed on batch size, so it can only
-        # hold one request's context at a time; `_mtp_persist_req_id` tracks which
-        # request it currently holds and `_mtp_persist_base_pos` is that request's
-        # first-window seed position (the RoPE origin of compacted cache slot 0).
-        self._mtp_persist_req_id: str | None = None
-        self._mtp_persist_base_pos: int = 0
+        # Persist-with-rollback of the inline-MTP KV cache (EAGLE-style), now
+        # PER REQUEST for batched serving. The MTP cache is sized to the request
+        # pool (``max_num_reqs`` rows) and each concurrent request keeps its own
+        # row across verify windows, keyed on its stable KV-pool slot (the
+        # runner's ``req_idx``). `_mtp_persist_base_pos_by_row` maps a row to that
+        # request's first-window seed position (the RoPE origin of compacted cache
+        # slot 0 for that row); `_mtp_persist_req_by_row` maps a row to the request
+        # id currently occupying it, so a slot reused by a different request is
+        # detected and re-based (its stale K/V dropped) instead of leaking.
+        self._mtp_persist_base_pos_by_row: dict[int, int] = {}
+        self._mtp_persist_req_by_row: dict[int, str] = {}
 
     @property
     def uses_recurrent_candidates(self) -> bool:
@@ -282,11 +286,14 @@ class DrafterSpeculation:
         """
         self.draft_full_log_probs_by_req.clear()
         self._backoff_by_req.clear()
-        self._mtp_persist_req_id = None
-        self._mtp_persist_base_pos = 0
+        self._mtp_persist_base_pos_by_row.clear()
+        self._mtp_persist_req_by_row.clear()
         if self.drafter is not None:
             try:
-                self.drafter.reset(batch_size=max(1, int(self._runner.max_num_seqs)))
+                # Size to the request pool (``max_num_reqs`` == sequence-buffer
+                # rows), not ``max_num_seqs`` — per-request persistence keys the MTP
+                # cache row on ``req_idx``, which ranges over the full pool.
+                self.drafter.reset(batch_size=max(1, int(self._runner.max_num_reqs)))
             except Exception:
                 logger.debug("Speculative drafter reset failed.", exc_info=True)
 
@@ -1094,6 +1101,7 @@ class DrafterSpeculation:
         prefix_input_ids: jax.Array | None = None,
         prefix_hidden_states: jax.Array | None = None,
         prefix_position_ids: jax.Array | None = None,
+        row_pos: int = 0,
     ) -> list[int]:
         """Generate up to ``num_speculative_tokens`` draft tokens for one request.
 
@@ -1113,6 +1121,12 @@ class DrafterSpeculation:
             prefix_hidden_states: Optional prefix hidden states matching
                 ``prefix_input_ids``.
             prefix_position_ids: Optional prefix position ids.
+            row_pos: The request's stable KV-pool slot (the runner's ``req_idx``,
+                which is constant for the request's lifetime — unlike the runner's
+                window-local row index that aliases across windows). Used as the
+                request's row in the shared inline-MTP cache when persist-with-
+                rollback is enabled, so each concurrent request keeps its own MTP
+                K/V across verify windows. Ignored when persistence is off.
 
         Returns:
             List of drafted token ids (length may be less than the maximum on
@@ -1158,32 +1172,45 @@ class DrafterSpeculation:
         #   within a request and only roll it back to the committed sequence
         #   position, dropping the previous window's rejected-draft K/V. Each
         #   window's MTP self-attention then sees the full accepted-sequence
-        #   context (EAGLE / vLLM). Still FULL-clears across requests.
+        #   context (EAGLE / vLLM). This is now PER REQUEST: the MTP cache is
+        #   sized to the request pool and each request owns its own row
+        #   (``row_pos`` == the request's stable KV-pool slot), so interleaved
+        #   ``draft_next`` calls for different concurrent requests never thrash
+        #   each other's cache.
         reset_request = getattr(self.drafter, "reset_request", None)
-        if self._mtp_persist_enabled():
-            if self._mtp_persist_req_id != str(req_id):
-                # New (or switched) request: the single rolling MTP cache holds
-                # the wrong request. Clear it and re-base the committed-position
-                # origin on this window's first written slot. The first window
-                # has nothing to persist, so this is byte-identical to the
-                # per-window clear.
-                if callable(reset_request):
-                    reset_request(request_id=str(req_id))
-                self._mtp_persist_req_id = str(req_id)
+        persist_on = self._mtp_persist_enabled()
+        row = int(row_pos)
+        if persist_on:
+            # Size the pool cache to hold every concurrent request's row. This is
+            # idempotent (allocates once, no-op thereafter) so a live request's
+            # accumulated K/V is never wiped mid-generation.
+            ensure = getattr(self.drafter, "ensure_batch_size", None)
+            if callable(ensure):
+                ensure(max(1, int(getattr(self._runner, "max_num_reqs", 1))))
+            if self._mtp_persist_req_by_row.get(row) != str(req_id):
+                # This row is newly assigned to this request — either a fresh
+                # request or a slot reused by a different request. Drop only THIS
+                # row's stale K/V (rollback to 0) and re-base its committed-origin
+                # on the window's first written slot; other rows are untouched.
+                # The first window has nothing to persist, so this matches the
+                # per-window clear for that request.
+                self._mtp_persist_req_by_row[row] = str(req_id)
                 if use_prefix and prefix_position_ids is not None:
-                    self._mtp_persist_base_pos = int(np.asarray(prefix_position_ids).reshape(-1)[0])
+                    self._mtp_persist_base_pos_by_row[row] = int(np.asarray(prefix_position_ids).reshape(-1)[0])
                 else:
-                    self._mtp_persist_base_pos = int(seed_position)
+                    self._mtp_persist_base_pos_by_row[row] = int(seed_position)
+                self.drafter.rollback_to(0, row_pos=row)
             else:
-                # Same request, later window: roll the MTP cache back to the
-                # committed position so the previous window's rejected-draft K/V
-                # is dropped while the accepted context is retained.
+                # Same request, later window: roll only this request's row back to
+                # its committed position so the previous window's rejected-draft
+                # K/V is dropped while the accepted context is retained.
                 # ``seed_position`` advances with the accepted sequence; the
-                # compacted committed length is its offset from the request's
+                # compacted committed length is its offset from that request's
                 # first written slot. ``rollback_to`` clamps this down to the
                 # written extent, so an all-accepted window cannot over-advance.
-                committed_len = max(0, int(seed_position) - int(self._mtp_persist_base_pos))
-                self.drafter.rollback_to(committed_len)
+                base = int(self._mtp_persist_base_pos_by_row.get(row, int(seed_position)))
+                committed_len = max(0, int(seed_position) - base)
+                self.drafter.rollback_to(committed_len, row_pos=row)
         elif callable(reset_request):
             reset_request(request_id=str(req_id))
         for draft_idx in range(self.num_speculative_tokens):
@@ -1200,6 +1227,10 @@ class DrafterSpeculation:
                     "sample": False,
                     "rng_key": None,
                 }
+                if persist_on:
+                    # Only the inline-MTP persist path understands per-request rows;
+                    # other drafters keep their original single-row signature.
+                    draft_kwargs["row_pos"] = row
                 if not greedy and bool(getattr(self.drafter, "supports_return_full_log_probs", False)):
                     draft_kwargs["return_full_log_probs"] = True
                 if target_kv_payload is not None:

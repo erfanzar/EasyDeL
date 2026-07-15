@@ -364,7 +364,7 @@ class Qwen3_5MTPDrafter:
         self._mtp_cache = None
         self._mtp_cache_batch_size = None
 
-    def rollback_to(self, committed_len: int) -> int:
+    def rollback_to(self, committed_len: int, row_pos: int | None = None) -> int:
         """Roll the MTP KV cache back to a committed length (persist-with-rollback).
 
         Instead of clearing the whole MTP cache at each verify-window boundary
@@ -385,10 +385,22 @@ class Qwen3_5MTPDrafter:
         extent), so a window that accepted more tokens than the drafter laid down
         fused states for can never point ``indexes`` at an unwritten slot.
 
+        With ``row_pos`` the rollback is **per row**: only that batch row's write
+        index is truncated, leaving every other concurrent request's row
+        untouched. This is what batched serving needs — the MTP cache is sized to
+        the request pool (:meth:`ensure_batch_size`) and each request keeps its
+        own row across verify windows, so a window boundary for one request must
+        not disturb another's accumulated context. Without ``row_pos`` (the
+        legacy single-request path) every row is truncated, which is what a
+        batch-1 cache wants.
+
         Args:
             committed_len: Number of leading cache slots to retain — the accepted
                 MTP context length, in the cache's compacted slot space. Clamped
                 up to zero.
+            row_pos: Optional batch row (the request's stable KV-pool slot) to
+                roll back. ``None`` truncates every row (legacy single-request /
+                batch-1 behavior).
 
         Returns:
             The requested ``committed_len`` clamped to ``>= 0`` (the value the
@@ -399,13 +411,19 @@ class Qwen3_5MTPDrafter:
             return 0
         target = max(0, int(committed_len))
         target_arr = jnp.asarray(target, dtype=jnp.int32)
+        row = None if row_pos is None else int(row_pos)
         new_views: list[typing.Any] = []
         for view in self._mtp_cache.views:
             if view is None:
                 new_views.append(view)
                 continue
-            clamped = jnp.minimum(view.indexes.astype(jnp.int32), target_arr).astype(view.indexes.dtype)
-            new_views.append(view.replace(indexes=clamped))
+            idx = view.indexes.astype(jnp.int32)
+            if row is None:
+                clamped = jnp.minimum(idx, target_arr)
+            else:
+                # Truncate only this request's row; other rows keep their K/V.
+                clamped = idx.at[row].set(jnp.minimum(idx[row], target_arr))
+            new_views.append(view.replace(indexes=clamped.astype(view.indexes.dtype)))
         self._mtp_cache = TransformerCache(views=new_views)
         return target
 
@@ -483,12 +501,34 @@ class Qwen3_5MTPDrafter:
             self._mtp_cache_batch_size = batch_size if self._mtp_cache is not None else None
         return self._mtp_cache
 
+    def ensure_batch_size(self, batch_size: int) -> None:
+        """Grow the MTP cache so it can hold at least ``batch_size`` rows.
+
+        Unlike :meth:`_ensure_mtp_cache` / :meth:`reset` (which reallocate on any
+        size *mismatch* and therefore clear the cache), this only reallocates when
+        the current cache is too small. Batched persist-with-rollback calls it
+        once per draft with the request-pool size (``max_num_reqs``): the first
+        call allocates the batch-N cache and every later call is a no-op, so a
+        concurrent request's accumulated K/V is never wiped mid-generation.
+
+        Args:
+            batch_size: Minimum number of rows (concurrent request slots) the MTP
+                cache must accommodate; clamped up to one.
+        """
+        if not self.uses_mtp_cache:
+            return
+        batch_size = max(1, int(batch_size))
+        if self._mtp_cache is None or int(self._mtp_cache_batch_size or 0) < batch_size:
+            self._mtp_cache = self._init_mtp_cache(batch_size)
+            self._mtp_cache_batch_size = batch_size if self._mtp_cache is not None else None
+
     def _mtp_hidden_and_logits(
         self,
         input_ids: Int[Array, "batch seq"],
         target_hidden_states: Float[Array, "batch seq hidden"],
         position_ids: Int[Array, "batch seq"] | None = None,
         mtp_cache: TransformerCache | None = None,
+        row_pos: int | None = None,
     ) -> tuple[Float[Array, "batch seq hidden"], Float[Array, "batch seq vocab"], TransformerCache | None]:
         """JIT-cached MTP-head forward → vocab logits ``(B, S, V)``.
 
@@ -498,7 +538,17 @@ class Qwen3_5MTPDrafter:
         dispatch. Here ``input_ids`` are the already-sampled next-token
         embeddings supplied to the DeepSeek-style MTP fusion, not the
         unshifted training labels used by ``compute_mtp_outputs``.
+
+        When ``row_pos`` is given the MTP cache is the shared request-pool cache
+        (batch ``N`` == ``max_num_reqs``) but the forward still runs batch-1 for a
+        single request: each layer's cache view is sliced down to that request's
+        row, advanced by the batch-1 attention, and the batch-1 result scattered
+        back into the pool row. So one concurrent request never reads or writes
+        another's row, the per-token MTP compute stays batch-1, and — because the
+        row is a *traced* index rather than a Python constant — every row shares a
+        single compiled program (no per-row recompile).
         """
+        use_row = row_pos is not None and mtp_cache is not None
         key = (
             tuple(input_ids.shape),
             str(input_ids.dtype),
@@ -521,6 +571,7 @@ class Qwen3_5MTPDrafter:
                 )
                 for view in mtp_cache.views
             ),
+            bool(use_row),
         )
         fn = self._jit_mtp.get(key)
         if fn is None:
@@ -530,7 +581,25 @@ class Qwen3_5MTPDrafter:
                     return self.model.get_input_embeddings()(ids.astype("i4"))
                 return self.model.model.get_embedding()(ids.astype("i4"))
 
-            def _compute(ids, hidden, pos, cache):
+            def _slice_view_row(view, row):
+                """Slice a batch-N cache view down to a batch-1 view at ``row``."""
+                return view.replace(
+                    key=jax.lax.dynamic_slice_in_dim(view.key, row, 1, axis=0),
+                    value=jax.lax.dynamic_slice_in_dim(view.value, row, 1, axis=0),
+                    indexes=jax.lax.dynamic_slice_in_dim(view.indexes, row, 1, axis=0),
+                    starts=jax.lax.dynamic_slice_in_dim(view.starts, row, 1, axis=0),
+                )
+
+            def _scatter_view_row(full, updated, row):
+                """Write a batch-1 updated view back into ``row`` of the pool view."""
+                return full.replace(
+                    key=jax.lax.dynamic_update_slice_in_dim(full.key, updated.key, row, axis=0),
+                    value=jax.lax.dynamic_update_slice_in_dim(full.value, updated.value, row, axis=0),
+                    indexes=jax.lax.dynamic_update_slice_in_dim(full.indexes, updated.indexes, row, axis=0),
+                    starts=jax.lax.dynamic_update_slice_in_dim(full.starts, updated.starts, row, axis=0),
+                )
+
+            def _compute(ids, hidden, pos, cache, row):
                 mtp = self.model.mtp
                 next_embeds = _embed_next(ids)
                 normed_e = mtp.pre_fc_norm_embedding(next_embeds)
@@ -556,7 +625,10 @@ class Qwen3_5MTPDrafter:
                 new_views = []
                 mtp_mode = common_types.MODE_PREFILL if ids.shape[1] > 1 else common_types.MODE_DECODE
                 for layer in mtp.layers:
-                    cv_in = views[layer.layer_idx] if views is not None and layer.layer_idx < len(views) else None
+                    cv_full = views[layer.layer_idx] if views is not None and layer.layer_idx < len(views) else None
+                    # Per-request row targeting: slice this request's row out of the
+                    # shared pool cache so the batch-1 attention only touches it.
+                    cv_in = _slice_view_row(cv_full, row) if (cv_full is not None and row is not None) else cv_full
                     cache_metadata = (
                         TransformerMetadata(
                             postpadded=False,
@@ -575,19 +647,37 @@ class Qwen3_5MTPDrafter:
                         cache_metadata,
                         frequencies,
                     )
+                    if cv_full is not None and row is not None:
+                        _cache_view = _scatter_view_row(cv_full, _cache_view, row)
                     new_views.append(_cache_view)
                 h = mtp.norm(h)
                 new_cache = TransformerCache(views=new_views) if cache is not None else None
                 return h, self.model.apply_lm_head(h), new_cache
 
-            _ = _compute(input_ids, target_hidden_states, position_ids, mtp_cache)
+            if use_row:
+                row_arr = jnp.asarray(int(row_pos), dtype=jnp.int32)
+                _ = _compute(input_ids, target_hidden_states, position_ids, mtp_cache, row_arr)
 
-            @jax.jit
-            def _fn(ids, hidden, pos, cache):
-                return _compute(ids, hidden, pos, cache)
+                @jax.jit
+                def _fn(ids, hidden, pos, cache, row):
+                    return _compute(ids, hidden, pos, cache, row)
+            else:
+                _ = _compute(input_ids, target_hidden_states, position_ids, mtp_cache, None)
+
+                @jax.jit
+                def _fn(ids, hidden, pos, cache):
+                    return _compute(ids, hidden, pos, cache, None)
 
             fn = _fn
             self._jit_mtp[key] = fn
+        if use_row:
+            return fn(
+                input_ids,
+                target_hidden_states,
+                position_ids,
+                mtp_cache,
+                jnp.asarray(int(row_pos), dtype=jnp.int32),
+            )
         return fn(input_ids, target_hidden_states, position_ids, mtp_cache)
 
     def draft(
@@ -599,6 +689,7 @@ class Qwen3_5MTPDrafter:
         return_full_log_probs: bool = False,
         sample: bool = False,
         rng_key: jax.Array | None = None,
+        row_pos: int | None = None,
     ) -> DraftStep:
         """Produce one MTP draft token per batch element.
 
@@ -617,6 +708,12 @@ class Qwen3_5MTPDrafter:
             sample: Whether to sample from the MTP distribution
                 rather than argmax. Requires ``rng_key``.
             rng_key: PRNG key for sampling.
+            row_pos: Optional per-request row for batched persist-with-rollback.
+                ``None`` (default) is the legacy single-request path: the MTP
+                cache batch equals the input batch and writes land at row 0.
+                When given, the MTP cache is the shared request-pool cache and
+                this request reads/writes only its own stable row ``row_pos``
+                (the forward stays batch-1); other rows are untouched.
 
         Returns:
             :class:`DraftStep` with the predicted token at the LAST
@@ -626,16 +723,24 @@ class Qwen3_5MTPDrafter:
         if target_hidden_states is None:
             raise ValueError("Qwen3_5MTPDrafter.draft requires target_hidden_states")
 
-        mtp_cache = self._ensure_mtp_cache(int(input_ids.shape[0]))
+        if row_pos is None:
+            mtp_cache = self._ensure_mtp_cache(int(input_ids.shape[0]))
+        else:
+            # Batched path: the cache is sized to the request pool (see
+            # ``ensure_batch_size``); never shrink it to the batch-1 input here.
+            mtp_cache = self._ensure_mtp_cache(max(int(self._mtp_cache_batch_size or 0), int(row_pos) + 1))
         hidden_states, logits, new_cache = self._mtp_hidden_and_logits(
             input_ids,
             target_hidden_states,
             position_ids,
             mtp_cache,
+            None if row_pos is None else int(row_pos),
         )
         if new_cache is not None:
             self._mtp_cache = new_cache
-            self._mtp_cache_batch_size = int(input_ids.shape[0])
+            if row_pos is None:
+                self._mtp_cache_batch_size = int(input_ids.shape[0])
+            # else: keep the pool batch size — the batch-1 input is not the cache batch.
         last = logits[:, -1, :].astype(jnp.float32)
         if sample:
             if rng_key is None:
