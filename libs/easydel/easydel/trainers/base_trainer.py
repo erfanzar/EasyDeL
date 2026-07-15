@@ -94,6 +94,7 @@ from .buckets import (
     BucketRule,
     CycleBucketRule,
     ModBucketRule,
+    PiecewiseBucketRule,
     StepThresholdRule,
     TrainingBucket,
     resolve_bucket_config,
@@ -5151,16 +5152,26 @@ class BaseTrainer(BaseTrainerProtocol):
         # steps that covers the structured rules' discontinuities (modulo wrap,
         # each StepThresholdRule cutoff, and a high step) in addition to step 0.
         n_buckets = len(self._buckets)
+
+        def rule_probe_steps(rule: BucketRule, start: int = 0) -> set[int]:
+            probes = {start}
+            if isinstance(rule, StepThresholdRule):
+                for t in rule.thresholds:
+                    probes.update((t - 1, t, t + 1))
+            elif isinstance(rule, ModBucketRule):
+                probes.update(range(start, start + rule.mod))
+            elif isinstance(rule, CycleBucketRule):
+                probes.update(range(start, start + rule.period * rule.num_buckets))
+            elif isinstance(rule, PiecewiseBucketRule):
+                for boundary in rule.boundaries:
+                    probes.update((boundary - 1, boundary, boundary + 1))
+                for seg_start, sub_rule in zip([start, *rule.boundaries], rule.rules, strict=True):
+                    probes.update(rule_probe_steps(sub_rule, start=seg_start))
+            return {p for p in probes if p >= 0}
+
         probe_steps = {0}
         rule = self._bucket_rule
-        if isinstance(rule, StepThresholdRule):
-            probe_steps.update(rule.thresholds)
-            probe_steps.update(t - 1 for t in rule.thresholds)
-            probe_steps.update(t + 1 for t in rule.thresholds)
-        elif isinstance(rule, ModBucketRule):
-            probe_steps.update(range(rule.mod))
-        elif isinstance(rule, CycleBucketRule):
-            probe_steps.update(range(rule.period * rule.num_buckets))
+        probe_steps.update(rule_probe_steps(rule))
         probe_steps.add(max(probe_steps) + 1)  # one step past the last probed
         probe_steps.add(10**9)  # a definitely-"high" step for StepThresholdRule
         for probe_step in sorted(probe_steps):
