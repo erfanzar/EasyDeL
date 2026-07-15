@@ -71,6 +71,7 @@ from easydel.modules.qwen3_next.modeling_qwen3_next import (
     Qwen3NextMLP,
     Qwen3NextModel,
     Qwen3NextRMSNorm,
+    Qwen3NextSparseMoeBlock,
 )
 from easydel.modules.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VisionTransformerPretrainedModel,
@@ -219,9 +220,13 @@ class Qwen3_5MTPLayer(spx.Module):
     """Single MTP transformer block.
 
     Combines a Qwen3-Next full-attention layer (with attention output
-    gating + per-head qk-norm) and a dense SwiGLU MLP, identical in
-    shape to one Qwen3.5 full-attention decoder layer. Allocated
-    outside the main model so MTP carries its own KV cache namespace.
+    gating + per-head qk-norm) and a feed-forward network identical in
+    shape to one Qwen3.5 decoder layer. The FFN is a dense SwiGLU MLP
+    for the dense Qwen3.5 family and a :class:`Qwen3NextSparseMoeBlock`
+    (routed experts + shared expert + gate) for the Qwen3.5-MoE family;
+    the choice is driven by ``use_moe_mlp`` so the HF ``mtp.*`` tensors
+    bind by name in both cases. Allocated outside the main model so MTP
+    carries its own KV cache namespace.
     """
 
     def __init__(
@@ -232,6 +237,7 @@ class Qwen3_5MTPLayer(spx.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
+        use_moe_mlp: bool = False,
         rngs: spx.Rngs,
     ):
         """Build the MTP block.
@@ -243,6 +249,14 @@ class Qwen3_5MTPLayer(spx.Module):
             dtype: Computation dtype.
             param_dtype: Parameter storage dtype.
             precision: JAX matmul precision.
+            use_moe_mlp: When ``True`` build a
+                :class:`Qwen3NextSparseMoeBlock` (routed experts +
+                shared expert + gate) as the FFN, matching the
+                Qwen3.5-MoE checkpoint's ``mtp.*.mlp.experts`` /
+                ``shared_expert`` / ``gate`` tensors. When ``False``
+                (the dense Qwen3.5 default) build a dense
+                :class:`Qwen3NextMLP`, keeping the 27B behavior
+                byte-identical.
             rngs: PRNG container.
         """
         self.config = config
@@ -250,6 +264,7 @@ class Qwen3_5MTPLayer(spx.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
+        self.is_moe = use_moe_mlp
 
         mtp_attn_config = copy.copy(config)
         mtp_attn_config.attn_mechanism = "vanilla"
@@ -262,13 +277,22 @@ class Qwen3_5MTPLayer(spx.Module):
             rngs=rngs,
             layer_idx=layer_idx,
         )
-        self.mlp = Qwen3NextMLP(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
+        if use_moe_mlp:
+            self.mlp = Qwen3NextSparseMoeBlock(
+                config=config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+            )
+        else:
+            self.mlp = Qwen3NextMLP(
+                config=config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+            )
         self.input_layernorm = Qwen3NextRMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
@@ -326,7 +350,12 @@ class Qwen3_5MTPLayer(spx.Module):
 
         residual = hidden_states
         h = self.post_attention_layernorm(hidden_states)
-        if self.config.use_scan_mlp:
+        if self.is_moe:
+            # Qwen3NextSparseMoeBlock returns (output, router_logits); the MTP
+            # head is auxiliary so the router logits are discarded here (the
+            # MoE aux load-balancing loss rides the main decoder's layers).
+            h, _router_logits = self.mlp(h)
+        elif self.config.use_scan_mlp:
             h = blockwise_ffn(
                 self.mlp,
                 h,
@@ -366,6 +395,7 @@ class Qwen3_5MTPHead(spx.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
+        use_moe_mlp: bool = False,
         rngs: spx.Rngs,
     ):
         """Build the MTP head.
@@ -376,12 +406,17 @@ class Qwen3_5MTPHead(spx.Module):
             dtype: Computation dtype.
             param_dtype: Parameter storage dtype.
             precision: JAX matmul precision.
+            use_moe_mlp: When ``True`` every MTP block builds a
+                :class:`Qwen3NextSparseMoeBlock` FFN (Qwen3.5-MoE); when
+                ``False`` (default) a dense :class:`Qwen3NextMLP` FFN
+                (dense Qwen3.5). Threaded to each :class:`Qwen3_5MTPLayer`.
             rngs: PRNG container.
         """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
+        self.use_moe_mlp = use_moe_mlp
 
         num_mtp_layers = int(getattr(config, "mtp_num_hidden_layers", 0))
         if num_mtp_layers < 1:
@@ -430,6 +465,7 @@ class Qwen3_5MTPHead(spx.Module):
                     dtype=dtype,
                     param_dtype=param_dtype,
                     precision=precision,
+                    use_moe_mlp=use_moe_mlp,
                     rngs=rngs,
                 )
                 for i in range(num_mtp_layers)

@@ -14,11 +14,10 @@
 
 """Tests for Qwen3.5-MoE text and multimodal models."""
 
+import easydel as ed
 import numpy as np
 import pytest
 import transformers
-
-import easydel as ed
 
 try:
     from tests.modules.test_utils import CausalLMTester, VisionLanguageTester
@@ -224,6 +223,98 @@ class TestQwen3_5Moe:
             max_new_tokens=16,
         )
         assert result.success, f"Qwen3.5-MoE multimodal generation failed: {result.error_message}"
+
+    def test_mtp_head_uses_moe_block(self):
+        """The Qwen3.5-MoE MTP block must build a sparse MoE FFN, not a dense MLP.
+
+        Regression guard for the Qwen3.6-35B-A3B conversion failure: the MTP
+        layer's ``mlp`` has to be a :class:`Qwen3NextSparseMoeBlock` so the
+        checkpoint's ``mtp.*.mlp.experts`` / ``shared_expert`` / ``gate`` tensors
+        bind, and the dense ``mtp.*.mlp.{gate_up,down}_proj`` leaves must NOT be
+        built. Also asserts the HF-conversion reform/MoE paths automatically
+        cover ``mtp.*`` (they walk the full module tree), and that the dense
+        Qwen3.5 family keeps a dense MTP FFN (no regression).
+        """
+        import jax
+        import spectrax as spx
+        from easydel.modules.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5MTPHead
+        from easydel.modules.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeForCausalLM, _mtp_mlp_is_moe
+        from easydel.modules.qwen3_next.modeling_qwen3_next import Qwen3NextMLP, Qwen3NextSparseMoeBlock
+
+        def _leaf_names(module):
+            state = spx.tree_state(module)
+            names = []
+            for path, _leaf in jax.tree_util.tree_flatten_with_path(state)[0]:
+                parts = [str(p.key) if hasattr(p, "key") else str(getattr(p, "idx", p)) for p in path]
+                if parts and parts[0] == "parameters":
+                    parts = parts[1:]
+                names.append(".".join(parts))
+            return names
+
+        common = dict(
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=4,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=32,
+            max_position_embeddings=64,
+            layer_types=["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+            mtp_num_hidden_layers=1,
+            rms_norm_eps=1e-6,
+            attn_output_gate=True,
+        )
+        moe_cfg = ed.Qwen3_5MoeTextConfig(
+            num_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=64,
+            shared_expert_intermediate_size=64,
+            decoder_sparse_step=1,
+            mlp_only_layers=None,
+            **common,
+        )
+        moe_cfg.moe_force_xla_gmm = True
+
+        # Condition correctness for both families.
+        assert _mtp_mlp_is_moe(moe_cfg) is True
+        dense_cfg = ed.Qwen3_5TextConfig(**common)
+        assert _mtp_mlp_is_moe(dense_cfg) is False
+
+        # MoE MTP head builds the sparse block with the checkpoint's structure.
+        head = Qwen3_5MTPHead(config=moe_cfg, rngs=spx.Rngs(0), use_moe_mlp=True)
+        mlp0 = head.layers[0].mlp
+        assert isinstance(mlp0, Qwen3NextSparseMoeBlock), type(mlp0)
+        for attr in ("experts", "gate", "shared_expert", "shared_expert_gate"):
+            assert hasattr(mlp0, attr), f"MoE MTP block missing {attr}"
+
+        names = _leaf_names(head)
+        assert any(n.startswith("layers.0.mlp.experts") for n in names)
+        assert "layers.0.mlp.gate.weight" in names
+        assert any(n.startswith("layers.0.mlp.shared_expert.") for n in names)
+        assert "layers.0.mlp.shared_expert_gate.weight" in names
+        assert "layers.0.mlp.down_proj.weight" not in names, "dense down_proj leaked into MoE MTP"
+        assert "layers.0.mlp.gate_up_proj.weight" not in names, "dense gate_up_proj leaked into MoE MTP"
+
+        # HF conversion machinery must cover mtp.* the same way it covers model.layers.*.
+        model = Qwen3_5MoeForCausalLM(config=moe_cfg, rngs=spx.Rngs(0))
+        assert isinstance(model.mtp.layers[0].mlp, Qwen3NextSparseMoeBlock)
+        reform = model._get_reform_param()
+        assert any(k.startswith("mtp.layers.0.mlp.experts") for k in reform), "no mtp expert reform rule collected"
+        tk = model.transform_fn.keywords
+        assert any(p.startswith("mtp.") for p in tk.get("moe_block_path", [])), "mtp MoE block not in moe_block_path"
+        assert any(p.startswith("mtp.") for p in tk.get("moe_path", [])), "mtp MoE linear not in moe_path"
+
+        # Dense Qwen3.5 family keeps a dense MTP FFN (no regression, byte-identical).
+        dense_head = Qwen3_5MTPHead(config=dense_cfg, rngs=spx.Rngs(0))
+        assert isinstance(dense_head.layers[0].mlp, Qwen3NextMLP)
+        assert dense_head.layers[0].is_moe is False
+        dnames = _leaf_names(dense_head)
+        assert "layers.0.mlp.gate_up_proj.weight" in dnames
+        assert "layers.0.mlp.down_proj.weight" in dnames
+        assert not any(n.startswith("layers.0.mlp.experts") for n in dnames)
+        dense_model = Qwen3_5ForCausalLM(config=dense_cfg, rngs=spx.Rngs(0))
+        assert isinstance(dense_model.mtp.layers[0].mlp, Qwen3NextMLP)
 
 
 if __name__ == "__main__":
