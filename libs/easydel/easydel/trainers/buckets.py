@@ -37,6 +37,7 @@ place by whichever function runs.
 from __future__ import annotations
 
 import abc
+import bisect
 import copy
 import typing as tp
 from dataclasses import dataclass
@@ -86,6 +87,11 @@ class BucketRule(abc.ABC):
             return CycleBucketRule(
                 period=int(d["period"]),
                 num_buckets=int(d.get("num_buckets", 2)),
+            )
+        if kind == "piecewise":
+            return PiecewiseBucketRule(
+                boundaries=[int(b) for b in d["boundaries"]],
+                rules=[r if isinstance(r, BucketRule) else cls.from_dict(r) for r in d["rules"]],
             )
         raise ValueError(f"Unknown BucketRule kind: {kind!r}")
 
@@ -188,6 +194,59 @@ class CycleBucketRule(BucketRule):
 
     def to_dict(self) -> dict[str, tp.Any]:
         return {"kind": "cycle", "period": self.period, "num_buckets": self.num_buckets}
+
+
+@dataclass
+class PiecewiseBucketRule(BucketRule):
+    """Compose serializable rules over disjoint step ranges.
+
+    ``boundaries=[b0]`` with ``rules=[r0, r1]`` selects via ``r0`` for
+    ``step < b0`` and via ``r1`` for ``step >= b0`` (same boundary semantics
+    as :class:`StepThresholdRule`). Sub-rules receive the GLOBAL step, not a
+    segment-local one, so a ``ModBucketRule`` segment keeps its absolute
+    offset anchoring. The motivating case is a cadence change late in a run
+    (e.g. a long-context bucket every 11th step for most of training, then
+    every 4th step during a final cooldown)::
+
+        PiecewiseBucketRule(
+            boundaries=[17_900],
+            rules=[
+                ModBucketRule(mod=11, offset=10, on_bucket=1, off_bucket=0),
+                ModBucketRule(mod=4, offset=3, on_bucket=1, off_bucket=0),
+            ],
+        )
+
+    Attributes:
+            boundaries: Strictly increasing step cutoffs; segment ``i`` covers
+                    ``boundaries[i-1] <= step < boundaries[i]``.
+            rules: One rule per segment; ``len(rules) == len(boundaries) + 1``.
+    """
+
+    boundaries: list[int]
+    rules: list[BucketRule]
+
+    def __post_init__(self) -> None:
+        self.boundaries = [int(b) for b in self.boundaries]
+        if any(b <= a for a, b in zip(self.boundaries[:-1], self.boundaries[1:], strict=False)):
+            raise ValueError(f"PiecewiseBucketRule.boundaries must be strictly increasing, got {self.boundaries}.")
+        if len(self.rules) != len(self.boundaries) + 1:
+            raise ValueError(
+                f"PiecewiseBucketRule needs len(boundaries) + 1 rules, got {len(self.rules)} rule(s) "
+                f"for {len(self.boundaries)} boundary(ies)."
+            )
+        for rule in self.rules:
+            if not isinstance(rule, BucketRule):
+                raise TypeError(f"PiecewiseBucketRule.rules entries must be BucketRule, got {type(rule).__name__}.")
+
+    def select(self, step: int) -> int:
+        return self.rules[bisect.bisect_right(self.boundaries, step)].select(step)
+
+    def to_dict(self) -> dict[str, tp.Any]:
+        return {
+            "kind": "piecewise",
+            "boundaries": list(self.boundaries),
+            "rules": [rule.to_dict() for rule in self.rules],
+        }
 
 
 @dataclass

@@ -22,6 +22,7 @@ skipped when JAX / a real model backend is unavailable.
 from __future__ import annotations
 
 import copy
+import itertools
 
 import pytest
 from easydel.trainers.buckets import (
@@ -29,6 +30,7 @@ from easydel.trainers.buckets import (
     CallableBucketRule,
     CycleBucketRule,
     ModBucketRule,
+    PiecewiseBucketRule,
     StepThresholdRule,
     TrainingBucket,
     resolve_bucket_config,
@@ -110,6 +112,85 @@ class TestStepThresholdRule:
         rule = StepThresholdRule(thresholds=[10])
         assert rule.select(9) == 0
         assert rule.select(10) == 1
+
+
+class TestPiecewiseBucketRule:
+    def test_segments_delegate_on_global_step(self):
+        # mod-3 before step 10, mod-2 from step 10 on; sub-rules see the
+        # global step, so the mod-2 segment's parity is global, not local.
+        rule = PiecewiseBucketRule(
+            boundaries=[10],
+            rules=[
+                ModBucketRule(mod=3, offset=0, on_bucket=1, off_bucket=0),
+                ModBucketRule(mod=2, offset=0, on_bucket=1, off_bucket=0),
+            ],
+        )
+        assert [rule.select(s) for s in range(9)] == [1, 0, 0, 1, 0, 0, 1, 0, 0]
+        assert rule.select(9) == 1  # last step of segment 0: (9 - 0) % 3 == 0
+        assert rule.select(10) == 1  # first step of segment 1: 10 % 2 == 0
+        assert [rule.select(s) for s in range(10, 16)] == [1, 0, 1, 0, 1, 0]
+
+    def test_boundary_belongs_to_later_segment(self):
+        rule = PiecewiseBucketRule(
+            boundaries=[5],
+            rules=[
+                ModBucketRule(mod=1, on_bucket=0, off_bucket=1),  # always 0
+                ModBucketRule(mod=1, on_bucket=1, off_bucket=0),  # always 1
+            ],
+        )
+        assert rule.select(4) == 0
+        assert rule.select(5) == 1
+
+    def test_cooldown_cadence_change(self):
+        # The production shape: long-context bucket (1) every 11th step for
+        # most of the run, then every 4th step during a 500-step cooldown.
+        start, cooldown_start, end = 15_400, 17_900, 18_400
+        rule = PiecewiseBucketRule(
+            boundaries=[cooldown_start],
+            rules=[
+                ModBucketRule(mod=11, offset=(start + 10) % 11, on_bucket=1, off_bucket=0),
+                ModBucketRule(mod=4, offset=(cooldown_start + 3) % 4, on_bucket=1, off_bucket=0),
+            ],
+        )
+        pre = [s for s in range(start, cooldown_start) if rule.select(s) == 1]
+        assert pre[0] == start + 10  # opens with ten short steps
+        assert all(b - a == 11 for a, b in itertools.pairwise(pre))
+        cool = [s for s in range(cooldown_start, end) if rule.select(s) == 1]
+        assert cool[0] == cooldown_start + 3  # cooldown opens with three short steps
+        assert all(b - a == 4 for a, b in itertools.pairwise(cool))
+        assert len(cool) == 125
+
+    def test_roundtrip(self):
+        rule = PiecewiseBucketRule(
+            boundaries=[100, 200],
+            rules=[
+                ModBucketRule(mod=5, on_bucket=1, off_bucket=0),
+                CycleBucketRule(period=2, num_buckets=2),
+                StepThresholdRule(thresholds=[300]),
+            ],
+        )
+        d = rule.to_dict()
+        assert d["kind"] == "piecewise"
+        restored = BucketRule.from_dict(d)
+        assert isinstance(restored, PiecewiseBucketRule)
+        assert restored.to_dict() == d
+        probe = [0, 5, 99, 100, 101, 199, 200, 299, 300, 10**6]
+        assert [restored.select(s) for s in probe] == [rule.select(s) for s in probe]
+
+    def test_rule_count_mismatch_raises(self):
+        with pytest.raises(ValueError):
+            PiecewiseBucketRule(boundaries=[10], rules=[ModBucketRule(mod=2)])
+
+    def test_non_increasing_boundaries_raise(self):
+        rules = [ModBucketRule(mod=2), ModBucketRule(mod=3), ModBucketRule(mod=5)]
+        with pytest.raises(ValueError):
+            PiecewiseBucketRule(boundaries=[10, 10], rules=rules)
+        with pytest.raises(ValueError):
+            PiecewiseBucketRule(boundaries=[20, 10], rules=rules)
+
+    def test_non_rule_entry_raises(self):
+        with pytest.raises(TypeError):
+            PiecewiseBucketRule(boundaries=[], rules=[lambda s: 0])
 
 
 class TestCallableBucketRule:
