@@ -245,11 +245,31 @@ def resolve_prompt_tokens(checkpoint_path: str) -> list[int]:
             raise ValueError("EASYDEL_BENCH_PROMPT_TOKENS was set but no token IDs were parsed.")
         return tokens
 
+    # Instruct/reasoning checkpoints MUST see their chat template. A raw
+    # `tokenizer(text, add_special_tokens=False)` prompt is out-of-distribution:
+    # the target then greedily emits reserved/degenerate tokens (e.g. Qwen3.5's
+    # 248068/248069 near the top of a 248320 vocab) and loops, so coherent MTP
+    # drafts cannot match it and speculative acceptance collapses (~30%). With the
+    # chat template applied the target is coherent and acceptance recovers to
+    # ~67% at K=2. Set EASYDEL_BENCH_CHAT_TEMPLATE=0 to force the raw prompt.
+    use_chat_template = os.environ.get("EASYDEL_BENCH_CHAT_TEMPLATE", "1").lower() in {"1", "true", "yes"}
     try:
         from transformers import AutoTokenizer
 
         tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_ID, trust_remote_code=True)
-        tokens = tokenizer(PROMPT_TEXT, add_special_tokens=False)["input_ids"]
+        if use_chat_template and getattr(tokenizer, "chat_template", None):
+            text = tokenizer.apply_chat_template(
+                [{"role": "user", "content": PROMPT_TEXT}],
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+            if isinstance(text, (list, tuple)):
+                text = text[0]
+            tokens = tokenizer(text, add_special_tokens=False)["input_ids"]
+        else:
+            tokens = tokenizer(PROMPT_TEXT, add_special_tokens=False)["input_ids"]
+        if tokens and isinstance(tokens[0], (list, tuple)):
+            tokens = tokens[0]
         if tokens:
             return [int(tok) for tok in tokens]
     except Exception as exc:

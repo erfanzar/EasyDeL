@@ -1106,7 +1106,7 @@ class DrafterSpeculation:
         )
         cur_position = int(seed_position)
         seed_hidden_bsh = jnp.asarray(prefix_hidden_states) if use_prefix else jnp.asarray(seed_hidden)[None, None, :]
-        drafted: list[int] = []
+        drafted_dev: list[jax.Array] = []
         draft_fulls: list[jax.Array] = []
         greedy = self.is_greedy_request(req_state)
         target_kv_payload = self.target_kv_payload_for_drafter(
@@ -1153,19 +1153,29 @@ class DrafterSpeculation:
                 logger.warning("Speculative drafter failed; disabling drafts for this request.", exc_info=True)
                 return []
             if greedy:
-                token = int(np.asarray(step.token_ids).reshape(-1)[0])
+                # Keep the drafted token on-device: the next chained MTP step
+                # consumes it as a device array, so the K drafts pipeline back to
+                # back without a blocking host round-trip each. The whole window is
+                # read back to host once, after the loop (values are unchanged).
+                tok_dev = step.token_ids.reshape(-1)[:1].astype(jnp.int32)
             else:
                 if step.full_log_probs is None or req_state is None:
                     return []
                 sampled_ids, filtered = self.filter_and_sample_log_probs(step.full_log_probs, req_state)
                 draft_fulls.append(filtered[0])
-                token = int(np.asarray(sampled_ids).reshape(-1)[0])
-            drafted.append(token)
-            cur_token = jnp.asarray([[token]], dtype=jnp.int32)
+                tok_dev = sampled_ids.reshape(-1)[:1].astype(jnp.int32)
+            drafted_dev.append(tok_dev)
+            cur_token = tok_dev.reshape(1, 1)
             cur_position += 1
             step_hidden = getattr(step, "hidden_states", None)
             if step_hidden is not None:
-                seed_hidden_bsh = jnp.asarray(step_hidden)[:, -1:, :]
+                seed_hidden_bsh = step_hidden[:, -1:, :]
+        if not drafted_dev:
+            return []
+        # Single batched device->host transfer for the whole draft window (was one
+        # blocking ``int(np.asarray(...))`` per draft token, which serialized the K
+        # chained MTP forwards on the host). Argmax/sample values are unchanged.
+        drafted = [int(t) for t in np.asarray(jnp.concatenate(drafted_dev, axis=0)).reshape(-1)]
         self.num_drafts_generated += len(drafted)
         if not greedy and draft_fulls:
             self.draft_full_log_probs_by_req[str(req_id)] = jnp.stack(draft_fulls, axis=0)
