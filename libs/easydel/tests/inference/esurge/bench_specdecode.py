@@ -610,6 +610,15 @@ def report(
         print(f"  correctness    : spec == baseline tokens -> {spec_toks == base_toks}")
         if spec_toks != base_toks:
             print("  WARNING: greedy output differs — spec-decode must be exact. Investigate.")
+        print(f"  base_toks[:40] : {list(base_toks)[:40]}")
+        print(f"  spec_toks[:40] : {list(spec_toks)[:40]}")
+        _tok = getattr(spec_runner, "tokenizer", None)
+        if _tok is not None:
+            try:
+                print(f"  base_text: {_tok.decode(list(base_toks))!r}")
+                print(f"  spec_text: {_tok.decode(list(spec_toks))!r}")
+            except Exception as _e:
+                print(f"  (decode failed: {_e})")
     traces = getattr(spec_runner, "spec_decode_debug_traces", [])
     if traces:
         print("  debug traces:")

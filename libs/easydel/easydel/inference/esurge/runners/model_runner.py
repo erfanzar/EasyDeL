@@ -490,17 +490,21 @@ class eSurgeRunner:
         self.spec_decode_recurrent_candidates = bool(
             drafter is not None and int(self.num_speculative_tokens) > 0 and has_recurrent_layers
         )
-        # Greedy recurrent verify: advance the live recurrent (GDN) state with an
-        # exact sequential replay of the accepted prefix (default). The removed
-        # "fast" path derived the corrected token + next-draft seed hidden from the
-        # fused verify forward and relied on the deferred recurrent candidate-commit
-        # to advance the live state; that commit is not exact for greedy, so greedy
-        # spec output diverged from the target's plain-greedy stream and was
-        # cross-process non-deterministic (stale/uninitialized candidate rows).
-        # Set EASURGE_SPEC_RECURRENT_REPLAY=0 to opt back into the fast (incorrect)
-        # path for A/B perf measurement only.
+        # Greedy recurrent verify: how to advance the live recurrent (GDN) state
+        # after a verify window.
+        #   fast path (default): reuse the fused verify forward's argmax + the
+        #     deferred recurrent candidate-commit. Coherent output, ~0.95x on a
+        #     27B GDN hybrid. NOT bit-identical to plain greedy (a chunked verify
+        #     cannot match a per-token decode on a linear-attention model) and
+        #     cross-process non-deterministic at the low bits.
+        #   exact replay (EASURGE_SPEC_RECURRENT_REPLAY=1): advance the live state
+        #     via a sequential-GDN replay of the accepted prefix. Bit-identical to
+        #     plain greedy, but the extra per-window replay forward costs ~2.5x
+        #     (measured 0.39x vs 0.95x on Qwen3.6-27B, tp=4, K=2) — so it is opt-in.
+        # Default fast so speculative decoding serves its purpose (a speedup);
+        # set the env to 1 when bit-exact greedy is required over throughput.
         self.spec_decode_recurrent_replay = bool(
-            int(os.environ.get("EASURGE_SPEC_RECURRENT_REPLAY", "1") or 1)
+            int(os.environ.get("EASURGE_SPEC_RECURRENT_REPLAY", "0") or 0)
         )
 
         logger.debug("Creating ExecutionManager and initializing pages cache")
