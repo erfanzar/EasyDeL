@@ -3037,6 +3037,10 @@ class eSurgeRunner:
                             seed_position=max(0, int(known_len) - 2),
                             seed_hidden=seed_hidden,
                             req_state=req_state,
+                            # ``req_idx`` is the request's stable sequence-buffer / KV-pool
+                            # slot (window-local ``row_pos`` aliases across windows); use it
+                            # as the persistent per-request inline-MTP cache row.
+                            row_pos=int(req_idx),
                         )
                         total_spec_draft_time += time.time() - draft_timer_start
                         if next_drafts:
@@ -3273,6 +3277,8 @@ class eSurgeRunner:
                         seed_position=max(0, int(known_len) - 2),
                         seed_hidden=seed_hidden,
                         req_state=req_state,
+                        # Stable KV-pool slot (see the sequential-greedy call above).
+                        row_pos=int(req_idx),
                     )
                     total_spec_draft_time += time.time() - draft_timer_start
                     if next_drafts:
@@ -3379,6 +3385,8 @@ class eSurgeRunner:
                                 prefix_input_ids=prefix_input_ids,
                                 prefix_hidden_states=prefix_hidden_states,
                                 prefix_position_ids=prefix_position_ids,
+                                # Stable KV-pool slot (see the sequential-greedy call above).
+                                row_pos=int(req_idx),
                             )
                             total_spec_draft_time += time.time() - draft_timer_start
                             self.sequence_buffer.num_tokens_no_spec[req_idx] = min(known_len, self.max_model_len)

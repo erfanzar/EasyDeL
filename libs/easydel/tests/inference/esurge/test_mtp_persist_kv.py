@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import gc
 import os
+import types
 
 os.environ.setdefault("ENABLE_DISTRIBUTED_INIT", "0")
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
@@ -49,6 +50,7 @@ import numpy as np
 import spectrax as spx
 from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.esurge.runners import eSurgeRunner
+from easydel.inference.esurge.runners.spec.strategy import DrafterSpeculation
 from easydel.inference.esurge.scheduler import Scheduler
 from easydel.inference.sampling_params import SamplingParams
 from easydel.inference.speculative import Qwen3_5MTPDrafter
@@ -283,6 +285,118 @@ def test_runner_greedy_output_unchanged_with_persist():
         f"greedy output changed under persistent speculative decoding\n"
         f"  baseline={baseline}\n  persist ={persist}"
     )
+
+
+def _seed_hidden(i: int) -> jnp.ndarray:
+    """A (hidden,)-shaped seed hidden state for ``draft_next`` (it adds the B/S axes)."""
+    return jax.random.normal(jax.random.fold_in(jax.random.PRNGKey(11), i), (_HIDDEN,), dtype=jnp.float32)
+
+
+def _row_index(drafter: Qwen3_5MTPDrafter, row: int) -> int:
+    """Return the first MTP layer view's write index for cache batch ``row``."""
+    return int(np.asarray(drafter._mtp_cache.views[0].indexes).reshape(-1)[row])
+
+
+def _make_strategy(drafter: Qwen3_5MTPDrafter, n_rows: int, k: int) -> DrafterSpeculation:
+    """A DrafterSpeculation over a stub runner exposing only the pool size.
+
+    ``draft_next`` (with an inline-MTP drafter and persist-with-rollback) reads
+    only ``max_num_reqs`` off the runner — the target K/V payload path short-
+    circuits for inline MTP — so a namespace stub is sufficient to exercise the
+    per-request row bookkeeping without standing up a full runner.
+    """
+    runner = types.SimpleNamespace(max_num_reqs=n_rows, max_num_seqs=n_rows)
+    return DrafterSpeculation(runner=runner, drafter=drafter, num_speculative_tokens=k)
+
+
+# Greedy (temperature 0) so drafting is deterministic argmax and spec-eligible.
+_REQ_STATE = types.SimpleNamespace(sampling_params=SamplingParams(temperature=0.0, max_tokens=32))
+
+
+def _draft(strategy: DrafterSpeculation, req_id: str, row: int, token: int, pos: int, hidden) -> list[int]:
+    """Thin ``draft_next`` wrapper: one greedy verify window for ``req_id`` on ``row``."""
+    return strategy.draft_next(
+        req_id=req_id,
+        row_pos=row,
+        seed_token=token,
+        seed_position=pos,
+        seed_hidden=hidden,
+        req_state=_REQ_STATE,
+    )
+
+
+def test_batched_persist_keeps_a_row_per_request():
+    """Persist-with-rollback keeps a separate MTP row per concurrent request.
+
+    Two concurrent requests share one pool-sized MTP cache (batch ``N`` ==
+    ``max_num_reqs``); each owns a row keyed on its stable KV-pool slot. This
+    covers the batched limitation the per-request work fixes:
+
+    (a) each request's row rolls back to ITS committed length independently;
+    (b) interleaving ``draft_next(A), draft_next(B), draft_next(A)`` does NOT
+        clear A's context — A's row keeps its accumulated K/V and A's second
+        window is byte-identical with or without B's interleaved call; and
+    (c) a slot reused by a NEW request re-bases (drops the stale K/V) so its
+        drafts match a truly-fresh request's.
+    """
+    model = make_tiny_model()
+    n, k = 2, 2
+
+    a_seed, a_hidden = 5, _seed_hidden(0)
+    b_seed, b_hidden = 9, _seed_hidden(1)
+    a_w2_seed, a_w2_hidden = 7, _seed_hidden(2)
+
+    # --- Scenario 1: interleave A (row 0), B (row 1), A (row 0). ---
+    d1 = Qwen3_5MTPDrafter(model, num_draft_tokens=k, persist_kv=True)
+    s1 = _make_strategy(d1, n, k)
+
+    # A window 1 (fresh request on row 0): row 0 re-based to seed_position 4.
+    a_w1 = _draft(s1, "A", 0, a_seed, 4, a_hidden)
+    assert len(a_w1) == k, "a full greedy window should draft k tokens"
+    assert s1._mtp_persist_base_pos_by_row[0] == 4
+    assert s1._mtp_persist_req_by_row[0] == "A"
+    assert _row_index(d1, 0) == k, "row 0 advanced by k drafts"
+    assert _row_index(d1, 1) == 0, "row 1 must be untouched by A's window"
+
+    # B window 1 (fresh request on row 1): must not disturb row 0.
+    b_w1 = _draft(s1, "B", 1, b_seed, 10, b_hidden)
+    assert len(b_w1) == k
+    assert s1._mtp_persist_base_pos_by_row[1] == 10
+    assert _row_index(d1, 1) == k, "row 1 advanced by B's window"
+    assert _row_index(d1, 0) == k, "(b) row 0 retained its K/V across B's interleaved call (no thrash)"
+
+    # A window 2 (SAME request on row 0): rolls back to ITS committed length (2),
+    # not a full clear — base is unchanged, so B's interleaved call did not re-base A.
+    a_w2_inter = _draft(s1, "A", 0, a_w2_seed, 6, a_w2_hidden)
+    assert s1._mtp_persist_base_pos_by_row[0] == 4, "(b) same request must not re-base (that would clear its row)"
+    assert _row_index(d1, 0) == 2 + k, "(a) row 0 rolled back to committed=2 then advanced by k"
+    assert _row_index(d1, 1) == k, "(a) row 1 independent of A's second window"
+
+    # --- Scenario 2: A alone (no B interleaved), identical A inputs. ---
+    d2 = Qwen3_5MTPDrafter(model, num_draft_tokens=k, persist_kv=True)
+    s2 = _make_strategy(d2, n, k)
+    a2_w1 = _draft(s2, "A", 0, a_seed, 4, a_hidden)
+    a2_w2 = _draft(s2, "A", 0, a_w2_seed, 6, a_w2_hidden)
+    assert a_w1 == a2_w1, "A's first window is independent of scheduling"
+    assert a_w2_inter == a2_w2, "(b) B's interleaved call did not change A's second-window drafts"
+
+    # --- (c) Reuse row 0 for a NEW request C: stale A K/V must be dropped. ---
+    c_seed, c_hidden = 13, _seed_hidden(3)
+    c_reuse = _draft(s1, "C", 0, c_seed, 20, c_hidden)
+    assert s1._mtp_persist_req_by_row[0] == "C", "row 0 now belongs to C"
+    assert s1._mtp_persist_base_pos_by_row[0] == 20, "(c) reused slot re-bases the committed origin"
+    assert _row_index(d1, 0) == k, "(c) reused slot restarts from 0 (stale A K/V dropped), not 2+k+k"
+    assert _row_index(d1, 1) == k, "C's window on row 0 must not touch B's row 1"
+
+    # Every draft above targeted a different row (0, 1, then 0 reused) at the same
+    # cache shape: the row is a traced argument, not part of the compile key, so
+    # all rows share ONE compiled MTP program (no per-row recompile).
+    assert len(d1._jit_mtp) == 1, "row targeting must not add compile-cache entries"
+
+    d3 = Qwen3_5MTPDrafter(model, num_draft_tokens=k, persist_kv=True)
+    s3 = _make_strategy(d3, n, k)
+    c_fresh = _draft(s3, "C", 0, c_seed, 20, c_hidden)
+    assert c_reuse == c_fresh, "(c) drafts on a reused slot equal a truly-fresh request's (no stale K/V leak)"
 
 
 if __name__ == "__main__":
