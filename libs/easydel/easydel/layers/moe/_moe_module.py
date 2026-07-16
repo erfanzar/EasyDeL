@@ -371,6 +371,43 @@ class BaseMoeModule(spx.Module, ABC):
             arr=arr,
         )
 
+    def _moe_batch_axis_names(self, expert_mesh: spx.SpxMesh, dp_axis_name: str) -> tuple[str, ...]:
+        """Mesh axes carrying the token batch inside the fused-MoE ``shard_map``.
+
+        On the folded 3-D expert mesh, :meth:`_build_active_expert_mesh` has
+        already multiplied every non-expert-bound batch axis (fsdp, and sp when
+        not ``sp_is_ep_bound``) into its dp axis, so naming dp alone shards the
+        full batch group. On the 5-D SPMD stage mesh, dp and fsdp stay separate
+        axes: a dp-only spec replicates the whole global batch into every fsdp
+        shard, and the permuted dispatch buffer inside the shard_map then
+        scales as ``B*S*k`` rows per device instead of ``B/(dp*fsdp)*S*k``
+        (137 GB per core at B=512, S=8192, k=8, H=2048 — over the TPU int32
+        allocation bound). Mirroring the folded path, fsdp joins the batch
+        axes whenever it is a distinct axis of the active mesh that is not
+        bound to expert parallelism. The sp axis keeps its historical
+        replicated behavior (the batch is not generally divisible by sp).
+
+        Args:
+            expert_mesh: Active expert mesh as returned by
+                :meth:`_build_active_expert_mesh` (5-D stage mesh or folded
+                3-D expert mesh).
+            dp_axis_name: Resolved physical name of the data-parallel axis.
+
+        Returns:
+            Tuple of physical mesh axis names to place on the batch dimension
+            of the fused-MoE input/gate-logits/output partition specs.
+        """
+        batch_axis_names = (dp_axis_name,)
+        if not self.config.fsdp_is_ep_bound:
+            fsdp_axis_name = resolve_eformer_axis(FSDP, self.runtime_sharding_resolver)
+            if (
+                isinstance(fsdp_axis_name, str)
+                and fsdp_axis_name != dp_axis_name
+                and fsdp_axis_name in expert_mesh.jax_mesh.axis_names
+            ):
+                batch_axis_names += (fsdp_axis_name,)
+        return batch_axis_names
+
     def get_moe_spec(
         self,
         direction: tp.Literal["row", "column"],
@@ -1206,15 +1243,20 @@ class BaseMoeModule(spx.Module, ABC):
                 f"dropped from compute."
             )
 
-        # Partition specs over the active expert layout. On MPMD stages this
-        # is usually the 5D stage mesh with only dp/ep/tp used by these specs.
-        input_ps = jax.sharding.PartitionSpec(dp_axis_name, None, None)
-        glps = jax.sharding.PartitionSpec(dp_axis_name, None)
+        # Partition specs over the active expert layout. On MPMD stages this is
+        # the folded 3D expert mesh; on SPMD (pp=1) it is the 5D stage mesh,
+        # where dp and fsdp are separate axes and the batch dimension must name
+        # both — otherwise dp=1/fsdp-dominant training meshes replicate the
+        # whole global batch into every shard of the region below.
+        batch_axis_names = self._moe_batch_axis_names(expert_mesh, dp_axis_name)
+        batch_axes = batch_axis_names if len(batch_axis_names) > 1 else batch_axis_names[0]
+        input_ps = jax.sharding.PartitionSpec(batch_axes, None, None)
+        glps = jax.sharding.PartitionSpec(batch_axes, None)
 
         if self.config.use_expert_tensor_mode:
-            output_ps = jax.sharding.PartitionSpec(dp_axis_name, None, None)
+            output_ps = jax.sharding.PartitionSpec(batch_axes, None, None)
         else:
-            output_ps = jax.sharding.PartitionSpec(dp_axis_name, None, tensor_axis_name)
+            output_ps = jax.sharding.PartitionSpec(batch_axes, None, tensor_axis_name)
 
         if ffn_activation is None:
 
@@ -1474,7 +1516,15 @@ class BaseMoeModule(spx.Module, ABC):
                     dtype=self.dtype,
                 )
 
-                output = jnp.reshape(output, (-1, sequence_length, HD))
+                # ``unpermute`` reshaped the ep-gathered token rows with the
+                # pre-gather ``batch_size``, folding the gather factor into its
+                # last dim; this reshape recovers token-aligned rows. Their true
+                # width is the per-shard hidden size: after the TP
+                # ``psum_scatter`` above (scatter_dimension=1) each row carries
+                # ``HD // tp_size`` features, so reshaping with the global
+                # ``HD`` under tp>1 would misfold hidden chunks into the batch
+                # dimension right before the expert-axis combine.
+                output = jnp.reshape(output, (-1, sequence_length, HD // tp_size))
                 output = jax.lax.psum_scatter(output, expert_axis_name, scatter_dimension=0, tiled=True)
 
             else:
@@ -1535,6 +1585,11 @@ class BaseMoeModule(spx.Module, ABC):
             mode=MODE_TRAIN,
             shape=output.shape,
         )
+        if len(batch_axis_names) > 1:
+            # The shard_map output carries the batch over (dp, fsdp); keep the
+            # boundary constraint on the same axes instead of the resolver's
+            # dp-only spec, which would all-gather the batch over fsdp here.
+            original_output_ps = jax.sharding.PartitionSpec(batch_axis_names, *tuple(original_output_ps)[1:])
         # # @erfanzar NOTE: spx.with_sharding_constraint (NOT jax.lax.*) so the
         # constraint is MPMD-aware and the spec lands on the resolved
         # stage-local submesh.
