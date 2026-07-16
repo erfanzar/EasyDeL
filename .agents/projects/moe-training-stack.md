@@ -92,8 +92,9 @@ prior behavior bit-for-bit (pinned by tests).
 - All three branches are chunked: ep=1, ring (chunk after the ep all-gather,
   ep psum_scatter combine once at the end), and non-ring ep>1 (per-chunk
   `local_permute` + `ragged_all_to_all` with per-chunk group sizes). The
-  ep>1 branch traces (eval_shape) but cannot execute on XLA:CPU
-  (ragged_all_to_all unsupported) — runtime numerics on TPU unverified.
+  ep>1 branch cannot execute on XLA:CPU (ragged_all_to_all unsupported);
+  its runtime numerics were validated on the v5p-2048 slice — see the TPU
+  validation section below.
 
 ### Layout planner (`easydel/layers/moe/_layout_planner.py`)
 
@@ -110,16 +111,51 @@ prior behavior bit-for-bit (pinned by tests).
 - Regression tests encode the four measured configs above plus the
   weight-residency case.
 
+## TPU validation of the ep>1 non-ring branch (2026-07-16, v5p-2048)
+
+After the M3 measurement run (dp4/fsdp16/ep4/tp4, non-ring, chunk=65536,
+fsdp-shard-weights, 35B-A3B distillation) died at step 1-2 with "NaN Loss",
+the ep>1 non-ring branch was bisected on the real 1024-device slice via
+`scripts/tpu_probe_moe_ep_parity.py` (eray-submitted, `@execute` fan-out).
+Every configuration was FINITE and consistent with its ep=1 reference:
+
+| probe (all on-slice, 1024 devices) | result |
+| --- | --- |
+| GptOss block f32, ep4 non-ring, base / chunk16 / fsdpW / chunk+fsdpW / single-padded-chunk, XLA gmm | finite, max diff vs ep1 1.2e-4..1.8e-4 |
+| same five configs, Pallas gmm | identical results |
+| GptOss bf16 fwd+bwd (H=256 I=768) ep4 base + chunk | loss/grads finite; elementwise fwd spread vs ep1 max 5.8e-2 at mean 1e-4 — same spread as the trusted ring path at ep2, i.e. bf16 accumulation-order noise, not a defect |
+| GptOss bf16 M3-scale (65536 tokens/core, chunk=65536, fsdpW, Pallas) fwd | finite, matches ep1 (6.29e-3 vs 6.26e-3 max-abs) |
+| same, fwd+bwd | loss 8.1391e-07 both meshes, all grads finite |
+| Qwen3NextSparseMoeBlock (the qwen3_5_moe block: FUSED gate_up, shared expert, TOP_K) bf16 M3-scale fwd+bwd | ep1 loss 5.3693e-08, ep4 loss 5.3694e-08, all grads finite |
+
+Garbage-tail hypothesis disproven for this branch: `jax.lax.ragged_all_to_all`
+sends only the leading `send_sizes` rows of each shard's buffer and the
+receive buffer is fresh zeros, so the TPU grouped-matmul's unzeroed tail never
+reaches another shard's combine (unlike the ring branch, whose combine sums
+full static-length buffers across shards and needed the explicit tail mask).
+An explicit tail-zero guard was A/B'd on the slice and was bit-identical to
+the unguarded path; the branch carries a comment instead of dead masking.
+
+Consequence: the M3 NaN is NOT reproducible in the fused-MoE ep>1 non-ring
+dispatch in isolation (random weights, up to M3 scale, fwd+bwd, bf16+Pallas).
+Remaining deltas to the real failure: real 35B checkpoint weights (256
+experts, real routing skew), the full 48-layer GDN/full-attention hybrid
+stack under the changed mesh (batch rows/shard 2 -> 8 for every layer, not
+just MoE), the distillation teacher forward + KL loss, and the external
+ternary optimizer step. Next-probe order: (1) tiny full-model qwen3_5_moe
+distillation step on both meshes, (2) real-checkpoint student forward-only
+finiteness on the M3 mesh, (3) M3 relaunch with per-component finiteness
+dumps.
+
 ## Hardware-unverified (explicitly)
 
-- Pallas grouped-matmul behavior with small per-chunk group sizes (tile
-  occupancy, autotune cache keys) — CPU tests force the XLA gmm.
-- Per-chunk `ragged_all_to_all` on TPU (correctness verified by trace only;
-  performance unknown).
+- Pallas grouped-matmul small-group tile occupancy/autotune performance (the
+  parity probe validated numerics, not step time).
 - Actual step-time cost of chunking (scan overhead + remat recompute) and of
   the per-layer fsdp weight gather (expected ~0.4 GB/layer/device of
   gather traffic; whether XLA overlaps it with compute is unmeasured).
 - The int32 bounds-check word granularity (see calibration note).
+- The full 35B ep>1 configuration end-to-end (see the M3 investigation above).
 
 ## Roadmap NOT built here
 
