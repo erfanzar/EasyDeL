@@ -529,6 +529,18 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
             building the per-stage expert mesh.
         sp_is_ep_bound: Fold the sequence-parallel axis into the expert axis
             when building the per-stage expert mesh.
+        moe_chunk_size: Optional token chunk size for the fused-MoE dispatch
+            pipeline. When set, the per-shard token stream inside the fused
+            MoE ``shard_map`` is processed in chunks of this many tokens
+            under a gradient-checkpointed scan, capping the peak dispatch
+            buffer at ``moe_chunk_size * num_experts_per_tok * hidden_size``
+            elements per core regardless of batch/sequence size. ``None``
+            (default) keeps the single-pass dispatch.
+        moe_fsdp_shard_expert_weights: Shard the expert (leading) dimension
+            of MoE expert weights over the FSDP axis at rest and all-gather
+            them over FSDP inside the fused-MoE ``shard_map`` right before
+            use (ZeRO-3 style). Only takes effect when the FSDP axis is not
+            expert-bound (``fsdp_is_ep_bound=False``). Default ``False``.
         quantization_config: Quantization config applied to linear layers.
             ``None`` disables weight quantization.
         operation_configs: Mapping from ejkernel operation name to a
@@ -596,6 +608,8 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     use_ring_of_experts: NotRequired[bool]
     fsdp_is_ep_bound: NotRequired[bool]
     sp_is_ep_bound: NotRequired[bool]
+    moe_chunk_size: NotRequired[int | None]
+    moe_fsdp_shard_expert_weights: NotRequired[bool]
     quantization_config: NotRequired[QuantizationConfig | None]
     operation_configs: NotRequired[dict[str, BaseOperationConfig] | None]
     mask_max_position_embeddings: NotRequired[int]
@@ -677,6 +691,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         use_expert_tensor_mode: Treat experts as an additional tensor-parallel axis.
         fsdp_is_ep_bound: Fold the FSDP axis into the expert axis when building expert meshes.
         sp_is_ep_bound: Fold the sequence-parallel axis into the expert axis when building expert meshes.
+        moe_chunk_size: Optional token chunk size for chunk-scanned fused-MoE dispatch (``None`` disables).
+        moe_fsdp_shard_expert_weights: Shard MoE expert weights over FSDP at rest and gather at use.
         **kwargs: Forwarded to `PretrainedConfig`.
 
     Raises:
@@ -1057,6 +1073,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         use_ring_of_experts: bool = RING_EXPERTS,
         fsdp_is_ep_bound: bool = FSDP_IS_EP_BOUND,
         sp_is_ep_bound: bool = SP_IS_EP_BOUND,
+        moe_chunk_size: int | None = None,
+        moe_fsdp_shard_expert_weights: bool = False,
         operation_configs: dict[str, BaseOperationConfig] | None = None,
         **kwargs,
     ):
@@ -1191,6 +1209,19 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.use_expert_tensor_mode = getattr(self, "use_expert_tensor_mode", use_expert_tensor_mode)
         self.fsdp_is_ep_bound = getattr(self, "fsdp_is_ep_bound", fsdp_is_ep_bound)
         self.sp_is_ep_bound = getattr(self, "sp_is_ep_bound", sp_is_ep_bound)
+        self.moe_chunk_size = getattr(self, "moe_chunk_size", moe_chunk_size)
+        if self.moe_chunk_size is not None:
+            if not isinstance(self.moe_chunk_size, (int, np.integer)):
+                raise TypeError(
+                    "`moe_chunk_size` must be an int when provided, got "
+                    f"{type(self.moe_chunk_size).__name__}: {self.moe_chunk_size!r}"
+                )
+            self.moe_chunk_size = int(self.moe_chunk_size)
+            if self.moe_chunk_size <= 0:
+                raise ValueError("`moe_chunk_size` must be positive when provided.")
+        self.moe_fsdp_shard_expert_weights = getattr(
+            self, "moe_fsdp_shard_expert_weights", moe_fsdp_shard_expert_weights
+        )
         self.operation_configs = (
             operation_configs if operation_configs is not None else getattr(self, "operation_configs", None)
         )
@@ -1799,6 +1830,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
             "use_expert_tensor_mode",
             "fsdp_is_ep_bound",
             "sp_is_ep_bound",
+            "moe_chunk_size",
+            "moe_fsdp_shard_expert_weights",
         ]
         for key in base_reads:
             if hasattr(config, key):
@@ -1858,6 +1891,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         use_expert_tensor_mode: bool = NOT_GIVEN,
         fsdp_is_ep_bound: bool = NOT_GIVEN,
         sp_is_ep_bound: bool = NOT_GIVEN,
+        moe_chunk_size: int | None = NOT_GIVEN,
+        moe_fsdp_shard_expert_weights: bool = NOT_GIVEN,
         **kwargs,
     ):
         """
@@ -1926,6 +1961,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
             use_expert_tensor_mode: Treat experts as a tensor-parallel axis (default ``EXPERT_TP_MODE``).
             fsdp_is_ep_bound: Fold FSDP into the expert axis when building expert meshes.
             sp_is_ep_bound: Fold sequence-parallel into the expert axis when building expert meshes.
+            moe_chunk_size: Token chunk size for chunk-scanned fused-MoE dispatch (default ``None`` = disabled).
+            moe_fsdp_shard_expert_weights: Shard MoE expert weights over FSDP at rest and gather at use
+                (default ``False``).
             **kwargs: Extra attributes to attach to this config and any defined ``sub_configs``.
         """
 
@@ -2003,6 +2041,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         set_attrs_smartly(self, "use_expert_tensor_mode", EXPERT_TP_MODE, use_expert_tensor_mode)
         set_attrs_smartly(self, "fsdp_is_ep_bound", FSDP_IS_EP_BOUND, fsdp_is_ep_bound)
         set_attrs_smartly(self, "sp_is_ep_bound", SP_IS_EP_BOUND, sp_is_ep_bound)
+        set_attrs_smartly(self, "moe_chunk_size", None, moe_chunk_size)
+        set_attrs_smartly(self, "moe_fsdp_shard_expert_weights", False, moe_fsdp_shard_expert_weights)
 
         for key_, value_ in kwargs.items():
             if key_ in _REMOVED_BASE_CONFIG_KEYS:

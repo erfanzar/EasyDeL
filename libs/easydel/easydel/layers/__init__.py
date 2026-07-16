@@ -84,11 +84,14 @@ from .linears import (
 from .moe import (
     BaseMoeModule,
     MoeFusedHooks,
+    MoeLayoutEstimate,
     MoeLoadBalancingStrategy,
     MoEMethods,
     MoeMetrics,
     MoeRoutingStrategy,
+    estimate_moe_layout,
     get_moe_partition_spec,
+    validate_moe_layout,
 )
 from .norms import RMSNorm, RMSNormGated
 from .quantization import (
@@ -147,6 +150,7 @@ __all__ = [
     "Llama3RotaryEmbedding",
     "MoEMethods",
     "MoeFusedHooks",
+    "MoeLayoutEstimate",
     "MoeLoadBalancingStrategy",
     "MoeMetrics",
     "MoeRoutingStrategy",
@@ -180,6 +184,7 @@ __all__ = [
     "dense_gate_up_layout",
     "dense_qkv_layout",
     "eLoRA",
+    "estimate_moe_layout",
     "gate_up_fusion_reform_param",
     "get_frequencies",
     "get_inv_frequencies",
@@ -213,5 +218,6 @@ __all__ = [
     "torch_deinterleave_segments_for_tp",
     "torch_interleave_axis_segments_for_tp",
     "torch_interleave_segments_for_tp",
+    "validate_moe_layout",
     "with_tp_last_axis_sharding",
 ]
