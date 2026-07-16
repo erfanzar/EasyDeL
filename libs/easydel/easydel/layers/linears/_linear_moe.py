@@ -67,7 +67,12 @@ from jax.sharding import PartitionSpec
 from jaxtyping import Array, Float, Int
 from spectrax import common_types
 
-from easydel.infra.sharding import RuntimeShardingResolver, TensorLayout, sharding_for_layout
+from easydel.infra.sharding import (
+    RuntimeShardingResolver,
+    TensorLayout,
+    moe_fsdp_shard_expert_weights_enabled,
+    sharding_for_layout,
+)
 
 
 def promote_dtype(values, *, dtype=None):
@@ -114,12 +119,19 @@ def _moe_parameter_layout(
     direction: typing.Literal["row", "column"] | None,
     use_expert_tensor_mode: bool,
     is_bias: bool = False,
+    fsdp_shard_expert_weights: bool | None = None,
 ) -> TensorLayout | None:
     """Build the per-expert parameter layout for an MoE linear weight or bias.
 
     The layout determines how the parameter is partitioned across the mesh:
     along the expert (``EP``) axis, the tensor-parallel (``TP``) axis, or
     the special "expert-on-TP" mode used when experts fit on the TP axis.
+    With ``fsdp_shard_expert_weights`` the expert dimension is additionally
+    sharded over the FSDP axis (ZeRO-3-style at-rest sharding); optimizer
+    states mirror the parameter sharding, so this shrinks per-device expert
+    parameter and optimizer residency by the FSDP world size. Non-divisible
+    expert counts are handled downstream: shape-aware spec sanitization drops
+    the FSDP component instead of failing.
 
     Args:
         direction: Parallelism direction of the linear layer. ``"column"``
@@ -129,6 +141,11 @@ def _moe_parameter_layout(
             axis instead of the EP axis. Useful when ``num_experts`` is small.
         is_bias: ``True`` for the 2-D bias parameter, ``False`` for the 3-D
             weight kernel.
+        fsdp_shard_expert_weights: When ``True``, shard the expert (leading)
+            dimension over ``(EP, FSDP)`` instead of ``EP`` alone. ``None``
+            (default) reads the ambient parameter-init scope installed by
+            the EasyDeL base-module constructor from
+            ``config.moe_fsdp_shard_expert_weights``.
 
     Returns:
         A :class:`TensorLayout` describing the partitioning of the parameter,
@@ -138,11 +155,14 @@ def _moe_parameter_layout(
         return None
     if use_expert_tensor_mode:
         return TensorLayout((TP, None) if is_bias else (TP, None, None))
+    if fsdp_shard_expert_weights is None:
+        fsdp_shard_expert_weights = moe_fsdp_shard_expert_weights_enabled()
+    expert_entry = (EP, FSDP) if fsdp_shard_expert_weights else EP
     if is_bias:
-        return TensorLayout((EP, TP))
+        return TensorLayout((expert_entry, TP))
     if direction == "column":
-        return TensorLayout((EP, None, TP))
-    return TensorLayout((EP, TP, None))
+        return TensorLayout((expert_entry, None, TP))
+    return TensorLayout((expert_entry, TP, None))
 
 
 class ParallelMoELinear(spx.Module):

@@ -1222,6 +1222,7 @@ def get_moe_partition_spec(
     fsdp_is_ep_bound: bool = True,
     sp_is_ep_bound: bool = True,
     module_view: bool = False,
+    fsdp_shards_experts: bool = False,
 ) -> jax.sharding.PartitionSpec:
     """Build the :class:`PartitionSpec` for an MoE expert weight or bias tensor.
 
@@ -1255,6 +1256,11 @@ def get_moe_partition_spec(
         module_view: If True, combines EP with FSDP and/or SP axes for joint
             sharding. Creates a tuple axis like (ep, sp, fsdp) for the expert
             dimension. If False, only uses EP axis for expert dimension.
+        fsdp_shards_experts: If True (and fsdp is not ep-bound), append the
+            FSDP axis to the expert-dimension placement so specs match
+            expert weights that are FSDP-sharded at rest
+            (``moe_fsdp_shard_expert_weights``). Ignored in expert tensor
+            mode.
 
     Returns:
         PartitionSpec appropriate for the tensor configuration. Examples:
@@ -1297,6 +1303,8 @@ def get_moe_partition_spec(
             expert_place += (sp_axis_name,)
         if fsdp_is_ep_bound:
             expert_place += (fsdp_axis_name,)
+    if fsdp_shards_experts and not fsdp_is_ep_bound and fsdp_axis_name not in expert_place:
+        expert_place += (fsdp_axis_name,)
     if len(expert_place) == 1:
         expert_place = expert_place[0]
     if tensors_are_expert:

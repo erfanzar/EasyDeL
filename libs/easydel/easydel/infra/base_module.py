@@ -87,7 +87,7 @@ from jax.sharding import NamedSharding, PartitionSpec
 from jaxtyping import Array, Float, Int
 from spectrax import nn
 
-from easydel.infra.sharding import is_mpmd_mesh, replicated_named_sharding
+from easydel.infra.sharding import is_mpmd_mesh, moe_expert_param_layout_scope, replicated_named_sharding
 from easydel.infra.utils import ArrayParam, materialize_meta_leaves
 from easydel.layers.norms import LayerNorm
 from easydel.utils import traversals
@@ -259,6 +259,15 @@ def _parameter_init_sharding_context(config: tp.Any):
             stack.enter_context(mesh)
         if hasattr(resolver, "logical_axis_rules"):
             stack.enter_context(resolver.logical_axis_rules())
+        # MoE expert weights only shard their expert dim over fsdp when the
+        # config opts in AND fsdp is a batch axis (not folded into expert
+        # parallelism); ep-bound configs already shard experts over fsdp.
+        stack.enter_context(
+            moe_expert_param_layout_scope(
+                fsdp_shard_expert_weights=bool(getattr(config, "moe_fsdp_shard_expert_weights", False))
+                and not bool(getattr(config, "fsdp_is_ep_bound", True))
+            )
+        )
         stack.enter_context(spx.variable_init_placement(place))
         yield
 
