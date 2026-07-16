@@ -76,6 +76,7 @@ _FORWARDED = (
     "REPRO_LR_MULT",
     "REPRO_GDR_PLATFORM",
     "REPRO_ATTN",
+    "REPRO_ROUTER_SCALE",
 )
 
 
@@ -122,6 +123,7 @@ def run_probe():
         MESH_DIMS = {
             "ep1": (1, 4, 64, 1, 4, 1),  # healthy production control
             "ep4": (1, 1, 64, 4, 4, 1),  # ordered production target
+            "m3": (1, 4, 16, 4, 4, 1),  # the exact mesh the M3 failure ran on
         }
     else:
         MESH_DIMS = {  # CPU fake-8-device smoke (ep>1 cannot run on CPU)
@@ -219,10 +221,22 @@ def run_probe():
         )
         return config
 
+    ROUTER_SCALE = float(os.environ.get("REPRO_ROUTER_SCALE", "1.0"))
+
     def build_model(dims, seed):
         config = build_config(dims)
         with _parameter_init_sharding_context(config):
-            return Qwen3_5MoeForCausalLM(config=config, dtype=PDTYPE, param_dtype=PDTYPE, rngs=spx.Rngs(seed))
+            model = Qwen3_5MoeForCausalLM(config=config, dtype=PDTYPE, param_dtype=PDTYPE, rngs=spx.Rngs(seed))
+        if ROUTER_SCALE != 1.0:
+            # Emulate the routing skew of a trained checkpoint: a scaled-up router
+            # sharpens the softmax so a few experts go hot (random init routes
+            # near-uniformly, which is the big fidelity gap vs the real model).
+            for layer in model.model.layers:
+                mlp = getattr(layer, "mlp", None)
+                gate = getattr(mlp, "gate", None)
+                if gate is not None and hasattr(gate, "weight"):
+                    gate.weight.value = gate.weight.value * jnp.asarray(ROUTER_SCALE, dtype=gate.weight.value.dtype)
+        return model
 
     def make_wsd_schedule(total_steps: int) -> optax.Schedule:
         """Production launch.py WSD shape, optionally LR-scaled."""
@@ -410,10 +424,12 @@ def run_probe():
                 kl = float(jax.device_get(kl)) if kl is not None else float("nan")
                 gnorm_tree = metrics.grad_norms
                 bad_grads = []
+                grad_norm_items = []
                 if gnorm_tree is not None:
                     flat, _ = jtu.tree_flatten_with_path(gnorm_tree)
                     vals = jax.device_get([leaf for _, leaf in flat])
-                    bad_grads = [jtu.keystr(p) for (p, _), v in zip(flat, vals, strict=True) if not np.isfinite(v)]
+                    grad_norm_items = [(jtu.keystr(p), float(v)) for (p, _), v in zip(flat, vals, strict=True)]
+                    bad_grads = [name for name, v in grad_norm_items if not np.isfinite(v)]
                 max_gn = float(jax.device_get(metrics.max_grad_norm)) if metrics.max_grad_norm is not None else -1.0
                 params_ok, bad_params = finiteness_report(student_state.graphstate)
                 opt_ok, bad_opt = finiteness_report(student_state.opt_state)
@@ -421,8 +437,11 @@ def run_probe():
                     f"[repro:{mesh_key}] step {i}: loss={loss:.6e} kl={kl:.6e} max_grad_norm={max_gn:.3e} "
                     f"bad_grad_leaves={len(bad_grads)} params_finite={params_ok} opt_finite={opt_ok}"
                 )
-                for name in bad_grads[:12]:
-                    log(f"[repro:{mesh_key}]   NONFINITE grad: {name}")
+                if bad_grads:
+                    # Dump EVERY grad-leaf norm: the highest layer with a
+                    # non-finite grad hosts the NaN origin in the backward.
+                    for name, v in grad_norm_items:
+                        log(f"[repro:{mesh_key}]   gradnorm {'BAD ' if not np.isfinite(v) else 'ok  '} {v:.3e} {name}")
                 for name in bad_params[:12]:
                     log(f"[repro:{mesh_key}]   NONFINITE param: {name}")
                 for name in bad_opt[:12]:
