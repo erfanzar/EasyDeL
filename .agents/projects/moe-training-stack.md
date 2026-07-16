@@ -232,3 +232,37 @@ Side observation (separate issue, NOT the NaN cause, mesh-independent):
 in the tiny repro the GDN-core input grads (`in_proj_qkv/a/b`, `conv1d`,
 `A_log`, `dt_bias`) are exactly 0.0 while `in_proj_z`/`norm`/`out_proj`
 receive gradient — needs a follow-up check on the ep1 dump / real model.
+
+### Post-fix leaf-norm comparison (job ep_nan_fixval3, tiny model, step 0)
+
+ep1 vs ep4 with the tail-mask fix: all leaves finite on both meshes;
+~60 leaves match within bf16 noise (<1%). Systematic exception: the fused
+expert weights (`experts.gate_up_proj`, `experts.down_proj`) have grad
+norms EXACTLY 1/ep of the ep1 values on every layer (measured ratios
+3.999-4.001 at ep=4, e.g. layer0 gate_up 1.317e-05 -> 3.293e-06). Router
+gate / shared-expert / all non-dispatch leaves match. Pre-existing ep>1
+dispatch-backward property (the masks only zero rows outside every group,
+which cannot scale dW; dW over valid rows is untouched). A uniform
+per-leaf grad scale cancels in Adam-family preconditioners
+(s*mu/sqrt(s^2*nu) = mu/sqrt(nu)), so training dynamics are essentially
+unaffected; resuming ep1-trained mu/nu on the ep mesh gives a ~20-100
+step transient on expert-leaf update scale. Follow-up: root-cause the
+replication/transpose bookkeeping (tokens are ep-replicated inside the
+fused shard_map with check_vma=False; suspect the unmapped-out /
+fan-out-a2a transpose pair) and restore exact dW scale.
+
+### Fix validation (job ep_nan_fixval3, 2026-07-17, tiny model, 6 steps/arm)
+
+| arm | result |
+| --- | --- |
+| ep1 (1,4,64,1,4,1) + fix | 6/6 finite; losses BITWISE identical to pre-fix ep1 (1.020937/927/851/870/832/794e-01) — ep=1 graph unchanged |
+| ep4 (1,1,64,4,4,1) + fix | 6/6 finite (was: NaN grads at step 0); losses track ep1 within ~2e-6; max_grad_norm 6.409e-03 == ep1 |
+| ep4 chunk=0 (single-pass) + fix | 6/6 finite; loss series identical to the chunked arm |
+| m3 mesh (1,4,16,4,4,1) + fix | 6/6 finite |
+
+GDN side-observation resolved: on healthy meshes all GDN-core grads are
+nonzero (ep1 dump: in_proj_qkv 8.5e-4, conv1d 4.5e-5, A_log 1.2e-6, ...);
+the exact-zeros seen in the broken ep4 run were an artifact of the
+poisoned backward, not a separate bug.
+
+CPU: moe suite + stage-aware expert mesh = 47 passed with the fix.
