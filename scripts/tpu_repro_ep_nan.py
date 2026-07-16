@@ -77,7 +77,31 @@ _FORWARDED = (
     "REPRO_GDR_PLATFORM",
     "REPRO_ATTN",
     "REPRO_ROUTER_SCALE",
+    "REPRO_ARMS",
 )
+
+
+def run_arms():
+    """Run one probe per arm from ``REPRO_ARMS`` (semicolon-separated k=v lists).
+
+    Example: ``REPRO_ARMS="loss=ce;layers=full;fsdpw=0;chunk=0"`` runs four
+    configurations sequentially in one job, each on top of the base env.
+    """
+    arms_spec = os.environ.get("REPRO_ARMS", "").strip()
+    if not arms_spec:
+        run_probe()
+        return
+    base_env = dict(os.environ)
+    for i, spec in enumerate(s for s in arms_spec.split(";") if s.strip()):
+        os.environ.clear()
+        os.environ.update(base_env)
+        for kv in spec.split(","):
+            if not kv.strip():
+                continue
+            k, v = kv.split("=", 1)
+            os.environ["REPRO_" + k.strip().upper()] = v.strip()
+        print(f"[repro] ===== ARM {i}: {spec.strip()} =====", flush=True)
+        run_probe()
 
 
 def run_probe():
@@ -437,7 +461,7 @@ def run_probe():
                     f"[repro:{mesh_key}] step {i}: loss={loss:.6e} kl={kl:.6e} max_grad_norm={max_gn:.3e} "
                     f"bad_grad_leaves={len(bad_grads)} params_finite={params_ok} opt_finite={opt_ok}"
                 )
-                if bad_grads:
+                if bad_grads or i == 0:
                     # Dump EVERY grad-leaf norm: the highest layer with a
                     # non-finite grad hosts the NaN origin in the backward.
                     for name, v in grad_norm_items:
@@ -507,13 +531,13 @@ if os.environ.get("REPRO_LOCAL_CPU") != "1":
         if _root not in sys.path:
             sys.path.insert(0, _root)
 
-        run_probe()
+        run_arms()
         return "ok"
 
 
 if __name__ == "__main__":
     if os.environ.get("REPRO_LOCAL_CPU") == "1":
-        run_probe()
+        run_arms()
     else:
         result = main()
         if hasattr(result, "error") and result.error is not None:
