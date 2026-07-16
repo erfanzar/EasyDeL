@@ -1541,6 +1541,12 @@ class BaseMoeModule(spx.Module, ABC):
                         )
                     inter = expert_ffn(xs, group_sizes, selected)
                     if ep_size > 1:
+                        # Unlike the ring combine, no tail-zeroing is needed
+                        # here: ragged_all_to_all sends only the leading
+                        # ``send_sizes`` rows of each shard's buffer and the
+                        # receive buffer is fresh zeros, so the TPU grouped-
+                        # matmul garbage tail never propagates (verified by a
+                        # masked/unmasked A/B on a v5p-2048 ep=4 mesh).
                         rows = moe_chunk_size * self.num_experts_per_tok
                         out_buf = jnp.zeros((rows, HD // tp_size), dtype=inter.dtype)
                         in_off, send_sz, out_off, recv_sz = get_all_to_all_params(
@@ -1851,6 +1857,14 @@ class BaseMoeModule(spx.Module, ABC):
 
             else:
                 if ep_size > 1:
+                    # Unlike the ring combine, no tail-zeroing is needed here:
+                    # the ragged_all_to_all below sends only the leading
+                    # ``send_sizes`` rows of each shard's buffer (offsets and
+                    # sizes derive from the local group sizes) and the receive
+                    # buffer is fresh zeros, so the TPU grouped-matmul garbage
+                    # tail never reaches another shard's combine (verified by
+                    # a masked/unmasked A/B on a v5p-2048 ep=4 mesh:
+                    # identical outputs and finite grads either way).
                     original_inputs_first_dim = batch_size * sequence_length * self.num_experts_per_tok
 
                     if sorted_selected_experts.shape[0] != original_inputs_first_dim:
