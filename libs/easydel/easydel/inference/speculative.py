@@ -65,11 +65,17 @@ class DraftStep:
         log_probs: ``(batch,)`` log-prob assigned by the drafter to
             ``token_ids``. Used for the rejection-sampling correction in
             :func:`accept_or_reject`. ``None`` for greedy drafters.
-        full_log_probs: Optional ``(batch, vocab)`` full distribution over the
-            vocabulary. Required if the verifier wants to do
+        full_log_probs: Optional ``(batch, vocab)`` full drafter distribution
+            over the vocabulary. Required if the verifier wants to do
             distribution-correct rejection sampling rather than the simple
             ratio test. ``None`` to skip the correction (uses greedy
-            verification: accept if ``argmax(target) == draft``).
+            verification: accept if ``argmax(target) == draft``). These are
+            normalized log-probs on the drafter-internal ``sample=True`` path;
+            on the external-resample path (``return_full_log_probs=True`` with
+            ``sample=False``) a drafter may instead hand back the RAW
+            (unnormalized) last-position logits, which the caller filters and
+            ``log_softmax``-normalizes itself — numerically equivalent and
+            cheaper on the hot draft loop.
         hidden_states: Optional drafter hidden rows for this step. Inline MTP
             drafters reuse this as the next step's ``hidden_states``, matching
             repeated-MTP proposal loops.
@@ -743,20 +749,46 @@ class Qwen3_5MTPDrafter:
             # else: keep the pool batch size — the batch-1 input is not the cache batch.
         last = logits[:, -1, :].astype(jnp.float32)
         if sample:
+            # Drafter-internal sampling path (used by callers that consume the
+            # drafter's own token + normalized log-probs directly). Keep the
+            # honest log_softmax and the gathered per-token log-prob here.
             if rng_key is None:
                 raise ValueError("rng_key required when sample=True")
             token_ids = jax.random.categorical(rng_key, last)
-        else:
-            token_ids = jnp.argmax(last, axis=-1)
-        log_probs = None
-        token_log_probs = None
-        if sample or return_full_log_probs:
             log_probs = jax.nn.log_softmax(last, axis=-1)
             token_log_probs = jnp.take_along_axis(log_probs, token_ids[:, None], axis=-1).squeeze(-1)
+            return DraftStep(
+                token_ids=token_ids.astype(jnp.int32),
+                log_probs=token_log_probs,
+                full_log_probs=log_probs,
+                hidden_states=hidden_states,
+            )
+        token_ids = jnp.argmax(last, axis=-1)
+        if return_full_log_probs:
+            # External-resample path (eSurge non-greedy speculative strategy):
+            # the caller re-applies the request's top-k/top-p/min-p/temperature
+            # filter and a final ``log_softmax`` before sampling + on-device
+            # rejection (``DrafterSpeculation.filter_and_sample_log_probs`` ->
+            # ``verify_sampled_window``). Return the RAW last-position logits and
+            # skip the drafter-side ``log_softmax`` + the unused per-token gather:
+            # the downstream filter is rank/softmax based and its final
+            # ``log_softmax`` is shift-invariant, so a raw-logit input yields a
+            # bit-identical filtered distribution, sampled token, and residual as
+            # a pre-normalized one (masked positions collapse to exactly zero
+            # probability either way). This removes redundant full-vocab passes
+            # from the hot per-draft loop; the on-device rejection math is
+            # unchanged. ``token_ids`` is the greedy pick, kept only for the
+            # DraftStep contract — the strategy re-samples and ignores it.
+            return DraftStep(
+                token_ids=token_ids.astype(jnp.int32),
+                log_probs=None,
+                full_log_probs=last,
+                hidden_states=hidden_states,
+            )
         return DraftStep(
             token_ids=token_ids.astype(jnp.int32),
-            log_probs=token_log_probs,
-            full_log_probs=log_probs,
+            log_probs=None,
+            full_log_probs=None,
             hidden_states=hidden_states,
         )
 
