@@ -1664,6 +1664,33 @@ class BaseMoeModule(spx.Module, ABC):
                 gate_up_bias = _gather_expert_param(gate_up_bias)
                 wd_bias = _gather_expert_param(wd_bias)
 
+            def _mask_dispatch_tail(t: jax.Array, group_sizes: jax.Array) -> jax.Array:
+                """Zero rows past ``sum(group_sizes)`` of a dispatch-buffer tensor.
+
+                With ep>1 the expert-sorted buffers keep their full static
+                length but only the leading ``sum(group_sizes)`` rows belong to
+                this shard's experts; the grouped-matmul kernels never *write*
+                the remaining rows — forward or backward — so on TPU that tail
+                holds whatever the buffer held, including NaNs (see the ring
+                combine note below). The forward is protected (non-ring:
+                ``ragged_all_to_all`` sends only the leading rows; ring: the
+                explicit ``local_mask``), but the BACKWARD was not:
+                ``back_grouped_matmul`` leaves the tail of ``d(x_rows)`` /
+                ``d(intermediate)`` unwritten, and the sort-VJP scatter then
+                routes that garbage into real token cotangents — the "M3" NaN
+                (finite loss, non-finite grads, ep>1 meshes only; the top MoE
+                layer's weight grads stay finite while its d(x) is NaN).
+                Masking the gmm operands on the valid prefix is a forward
+                no-op, and its transpose zeroes exactly those unwritten
+                cotangent rows. At ep=1 every row belongs to a group (no
+                tail), so this branch is not emitted and the ep=1 graph is
+                unchanged.
+                """
+                if ep_size <= 1:
+                    return t
+                keep = jnp.arange(t.shape[0], dtype=jnp.int32) < jnp.sum(group_sizes)
+                return jnp.where(keep[:, None], t, jnp.zeros_like(t))
+
             def _expert_ffn(x_rows: jax.Array, group_sizes: jax.Array, selected_experts: jax.Array) -> jax.Array:
                 """Grouped-matmul expert FFN core over expert-sorted rows.
 
@@ -1683,11 +1710,13 @@ class BaseMoeModule(spx.Module, ABC):
                     Down-projected rows ``[rows, H // tp_size]`` (``H`` when
                     ``tp_size == 1``).
                 """
+                x_rows = _mask_dispatch_tail(x_rows, group_sizes)
                 if gate_up_kernel is not None:
                     layer_gate_up = grouped_matmul(x_rows, gate_up_kernel, group_sizes, **gmm_kws)
                     layer_gate_up = checkpoint_name(layer_gate_up, "mlp_gate_up")
                     if gate_up_bias is not None:
                         layer_gate_up = layer_gate_up + gate_up_bias[selected_experts]
+                    layer_gate_up = _mask_dispatch_tail(layer_gate_up, group_sizes)
                     layer_w0, layer_w1 = jnp.split(layer_gate_up, 2, axis=-1)
                 else:
                     layer_w0 = grouped_matmul(x_rows, wi_kernel, group_sizes, **gmm_kws)
@@ -1695,14 +1724,16 @@ class BaseMoeModule(spx.Module, ABC):
                     layer_w0 = checkpoint_name(layer_w0, "mlp_gate")
                     if wi_bias is not None:
                         layer_w0 = layer_w0 + wi_bias[selected_experts]
+                    layer_w0 = _mask_dispatch_tail(layer_w0, group_sizes)
 
                     layer_w1 = grouped_matmul(x_rows, wu_kernel, group_sizes, **gmm_kws)
 
                     layer_w1 = checkpoint_name(layer_w1, "mlp_up")
                     if wu_bias is not None:
                         layer_w1 = layer_w1 + wu_bias[selected_experts]
+                    layer_w1 = _mask_dispatch_tail(layer_w1, group_sizes)
 
-                intermediate_layer = ffn_activation(layer_w0, layer_w1)
+                intermediate_layer = _mask_dispatch_tail(ffn_activation(layer_w0, layer_w1), group_sizes)
 
                 intermediate_output = grouped_matmul(intermediate_layer, wd_kernel, group_sizes, **gmm_kws)
                 intermediate_output = checkpoint_name(intermediate_output, "mlp_down")

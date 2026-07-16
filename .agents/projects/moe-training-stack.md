@@ -169,3 +169,66 @@ dumps.
 - **Async weight-gather overlap verification**: confirm on TPU profiles that
   the per-layer fsdp all-gather overlaps the previous layer's compute (and
   pipeline it explicitly if not).
+
+## M3 NaN root-cause investigation (2026-07-16/17, this session)
+
+Primary evidence recovered from the M3 driver log
+(`eray logs launch_m3-erfan-20260716-171447`): at train_step 1 the metrics
+line reads `loss: 0.011, kl_loss: 0.011, max_grad_norm: nan,
+mean_grad_norm: nan` — the GRADIENTS were already non-finite at step 1
+while the loss was finite. The trainer's NaN gate only checks the scalar
+loss, `update_state_respectfully`'s in-graph skip also only checks the
+loss, and the optimizer chain starts with `optax.clip_by_global_norm(1.0)`
+— a single non-finite grad leaf makes the global norm non-finite and
+poisons EVERY parameter in one update. Step 2's forward then NaNs. The
+optimizer is exonerated as the generator (norms are computed on raw grads
+before tx.update); the optimizer update math never saw finite grads.
+launch_m4.py (diff: mesh (1,4,64,1,4,1) instead of (1,4,16,4,4,1), plus
+profiler) ran 281+ healthy steps on the same code/data/checkpoint.
+
+Tiny repro REPRODUCES this (scripts/tpu_repro_ep_nan.py, job ep_nan_tiny1):
+tiny qwen3_5_moe (4 layers, 3xGDN+1xfull-attn, 256 tiny experts, H=256,
+V=4096), student+frozen teacher KD (real `distillation_step`, chunked KL,
+T=1 alpha=1), external optimizer package fused_adamw production kwargs, B=512 S=1024,
+bf16, random weights:
+  ep1 (1,4,64,1,4,1): 6/6 steps finite (loss ~0.1021, max_grad_norm 6.4e-3)
+  ep4 (1,1,64,4,4,1): step 0 loss FINITE 0.1021 but 40 grad leaves
+    non-finite; params/opt-state poisoned after the update. lm_head grad
+    finite; embed + layer-0 grads NaN -> origin mid-backward.
+
+### Root cause (identified 2026-07-17)
+
+Leaf-level grad-norm map on the failing ep4 mesh (job ep_nan_leafmap2):
+the TOP MoE layer's six mlp WEIGHT grads are finite (1e-7..7e-5) while its
+`post_attention_layernorm` grad — fed by d(x) of the expert dispatch — is
+NaN, and everything upstream in backward order is NaN (40 leaves,
+exactly embed + 11 x layers0-2 + 6 x layer3-attn-side). lm_head and the
+final norm (computed before the poison point) are finite. So the NaN
+enters through the dispatch's INPUT-cotangent path, not through dW.
+
+Mechanism: with ep>1 the expert-sorted dispatch buffers keep full static
+length but only the leading `sum(group_sizes)` rows belong to this shard's
+experts. The Pallas grouped-matmul grid only visits tiles covered by
+groups (grouped_matmulv2 `make_group_metadata`), so rows past the group
+prefix are NEVER WRITTEN — on TPU they hold stale buffer garbage
+including NaNs (already documented for the FORWARD in the ring-combine
+note in `_moe_module.py`). The forward is protected (non-ring:
+ragged_all_to_all sends only leading rows; ring: explicit local_mask),
+but the BACKWARD was not: `back_grouped_matmul` (custom-VJP grad_lhs)
+leaves the tail of d(x_rows)/d(intermediate) unwritten, and the
+sort-VJP transpose then SCATTERS that garbage into real token cotangents.
+At ep=1 every row belongs to a group (no tail) — hence ep-mesh-only.
+The correct cotangent for tail rows is exactly zero (they influence
+nothing), so masking is the mathematically exact fix.
+
+Fix: `_mask_dispatch_tail` in `_sparse_call` (_moe_module.py) — zero rows
+past `sum(group_sizes)` on the gmm operands (x_rows at `_expert_ffn`
+entry, gate_up/w0/w1 outputs, post-activation intermediate). Emitted only
+when `ep_size > 1`; the ep=1 graph is unchanged. Covers chunked +
+single-pass and ring + non-ring branches (ring ep>1 training had the same
+backward exposure).
+
+Side observation (separate issue, NOT the NaN cause, mesh-independent):
+in the tiny repro the GDN-core input grads (`in_proj_qkv/a/b`, `conv1d`,
+`A_log`, `dt_bias`) are exactly 0.0 while `in_proj_z`/`norm`/`out_proj`
+receive gradient — needs a follow-up check on the ep1 dump / real model.
