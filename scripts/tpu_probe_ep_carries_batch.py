@@ -47,11 +47,21 @@ Env knobs:
     REPRO_SHAPE           : "8k" (default: S=8192) or "131k" (S=131072) bucket
     REPRO_TOKENS_PER_CORE : per-core token target at dp*fsdp*ep=256 batch ways
         (default 16384 for 8k — the production 8k bucket; 131k forces 131072)
-    REPRO_HIDDEN          : hidden/intermediate size (default 2048 to make the
-        a2a volume production-shaped; use 512 for a quick smoke)
+    REPRO_HIDDEN          : hidden size H (default 2048 so the a2a volume is
+        production-shaped; the MoE intermediate is fixed at 512 like
+        production so gmm shapes match the real regime)
     REPRO_FORCE_XLA       : 1 forces the XLA grouped matmul (default 0: Pallas)
     REPRO_TIME_STEPS      : timed steps after the compile step (default 4)
     REPRO_RUN_KNOB_OFF    : 1 (default) also times the knob-OFF ep=4 baseline
+
+Note on tiling (first-run failure, job 20260717-073048): the config default
+``moe_tiling_size_batch=4`` fails the ``% 8`` check in ``_sparse_moe_call``
+and silently falls back to the XLA ``ragged_dot`` with ``bypass_xla_tiling``;
+XLA's ragged_dot_expander then materializes a gathered per-8-row-tile RHS of
+``[m/8, K, N]`` — ``bf16[16384, 2048, 4096]`` = 2^32 64-byte words at the
+first probe's shapes, tripping the jellyfish int32 bounds check in EVERY arm
+(ep=1 included). The probe pins ``moe_tiling_size_batch/dim = 1024`` so the
+fused path takes the real Pallas grouped matmul, as production does.
 """
 
 from __future__ import annotations
@@ -155,8 +165,8 @@ def main():
         config = Qwen3NextConfig(
             hidden_size=H,
             intermediate_size=H,
-            moe_intermediate_size=H,
-            shared_expert_intermediate_size=H,
+            moe_intermediate_size=512,  # production M; keeps gmm shapes in the real Pallas regime
+            shared_expert_intermediate_size=512,
             num_hidden_layers=2,
             num_attention_heads=4,
             num_key_value_heads=2,
@@ -177,6 +187,11 @@ def main():
             moe_chunk_size=chunk,
             moe_fsdp_shard_expert_weights=True,
             moe_ep_carries_batch=ep_carries_batch,
+            # Pallas-valid tiles: the default moe_tiling_size_batch=4 fails the
+            # %8 check and drops into the XLA ragged_dot expander, whose
+            # gathered [m/8, K, N] RHS trips the int32 bounds check here.
+            moe_tiling_size_batch=1024,
+            moe_tiling_size_dim=1024,
         )
         with _parameter_init_sharding_context(config):
             return Qwen3NextSparseMoeBlock(config=config, dtype=PDTYPE, param_dtype=PDTYPE, rngs=spx.Rngs(SEED))
@@ -190,10 +205,14 @@ def main():
         o, _ = m(xin)
         return jnp.mean(o.astype(jnp.float32) ** 2), o
 
-    step = spx.jit(lambda m, xin: spx.value_and_grad(loss_fn, has_aux=True)(m, xin))
-
     def run(tag, block, batch_axes):
-        """Compile + parity + steady-state step timing; prints one report line."""
+        """Compile + parity + steady-state step timing; prints one report line.
+
+        A FRESH ``spx.jit`` per arm: the three arms have identical global
+        avals but different meshes baked into their shard_maps, so sharing
+        one jitted callable across arms risks reusing the first arm's trace.
+        """
+        step = spx.jit(lambda m, xin: spx.value_and_grad(loss_fn, has_aux=True)(m, xin))
         with block.config.mesh:
             x = make_x(block.config.mesh, batch_axes)
 
