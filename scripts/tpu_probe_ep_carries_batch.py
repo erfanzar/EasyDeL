@@ -196,11 +196,6 @@ def main():
         with _parameter_init_sharding_context(config):
             return Qwen3NextSparseMoeBlock(config=config, dtype=PDTYPE, param_dtype=PDTYPE, rngs=spx.Rngs(SEED))
 
-    def make_x(mesh, batch_axes):
-        """Deterministic (B, S, H) batch sharded over the given batch axes."""
-        sh = NamedSharding(mesh.jax_mesh, P(batch_axes, None, None))
-        return jax.jit(lambda k: jax.random.normal(k, (B, S, H), PDTYPE) * 0.1, out_shardings=sh)(jax.random.PRNGKey(0))
-
     def loss_fn(m, xin):
         o, _ = m(xin)
         return jnp.mean(o.astype(jnp.float32) ** 2), o
@@ -208,41 +203,70 @@ def main():
     def run(tag, block, batch_axes):
         """Compile + parity + steady-state step timing; prints one report line.
 
-        A FRESH ``spx.jit`` per arm: the three arms have identical global
-        avals but different meshes baked into their shard_maps, so sharing
-        one jitted callable across arms risks reusing the first arm's trace.
+        Each arm is ONE jitted program returning scalars only. The first two
+        probe runs died on cross-program traffic: (a) the RNG-based global
+        batch generator can replicate its f32 intermediate per device when
+        the threefry lowering is not partitioned, and (b) returning the full
+        ``[B, S, H]`` output (plus grads) out of the step and reducing it
+        eagerly holds tens of GB of arrays and loaded-program reservations
+        across differently-ordered meshes, which JAX bridges with an
+        ``_identity_fn`` reshard program that could not reserve its arena
+        (``RuntimeProgramAllocationFailure``, 64 G needed / 31 G free).
+        Generating the batch from broadcasted iota math INSIDE the step
+        (trivially partitionable, deterministic, identical across meshes so
+        the parity check stays valid) and reducing finiteness/max stats
+        in-graph leaves only scalars to cross the program boundary. A fresh
+        ``spx.jit`` per arm avoids reusing another mesh's trace.
         """
-        step = spx.jit(lambda m, xin: spx.value_and_grad(loss_fn, has_aux=True)(m, xin))
+
+        def gen_x():
+            """Deterministic pseudo-random (B, S, H) batch from iota math."""
+            b_i = jax.lax.broadcasted_iota(jnp.uint32, (B, S, H), 0)
+            s_i = jax.lax.broadcasted_iota(jnp.uint32, (B, S, H), 1)
+            h_i = jax.lax.broadcasted_iota(jnp.uint32, (B, S, H), 2)
+            v = b_i * jnp.uint32(2654435761) + s_i * jnp.uint32(40503) + h_i * jnp.uint32(2246822519)
+            v = v ^ (v >> 15)
+            x = (v & jnp.uint32(0xFFFF)).astype(jnp.float32) / 65536.0  # [0, 1)
+            x = ((x - 0.5) * 0.2).astype(PDTYPE)
+            sh = NamedSharding(block.config.mesh.jax_mesh, P(batch_axes, None, None))
+            return jax.lax.with_sharding_constraint(x, sh)
+
+        def step_fn(m):
+            """One measured step: gen + fwd + bwd + in-graph reductions -> scalars."""
+            (loss, o), grads = spx.value_and_grad(loss_fn, has_aux=True)(m, gen_x())
+            ofin = jnp.all(jnp.isfinite(o))
+            omax = jnp.max(jnp.abs(jnp.where(jnp.isfinite(o), o, 0)).astype(jnp.float32))
+            gfin = jnp.array(True)
+            gmax = jnp.array(0.0, dtype=jnp.float32)
+            for g in jax.tree_util.tree_leaves(grads):
+                gfin = jnp.logical_and(gfin, jnp.all(jnp.isfinite(g)))
+                gmax = jnp.maximum(gmax, jnp.max(jnp.abs(jnp.where(jnp.isfinite(g), g, 0)).astype(jnp.float32)))
+            return loss, ofin, omax, gfin, gmax
+
+        step = spx.jit(step_fn)
         with block.config.mesh:
-            x = make_x(block.config.mesh, batch_axes)
-
             t0 = time.perf_counter()
-            (loss, out), grads = step(block, x)
-            jax.block_until_ready((loss, out))
+            stats = step(block)
+            jax.block_until_ready(stats)
             compile_s = time.perf_counter() - t0
-
-            leaves = jax.tree_util.tree_leaves(grads)
-            gfin = all(bool(jnp.all(jnp.isfinite(g))) for g in leaves)
-            gmax = max(float(jnp.max(jnp.abs(jnp.where(jnp.isfinite(g), g, 0.0)))) for g in leaves)
-            ofin = bool(jnp.all(jnp.isfinite(out)))
-            omax = float(jnp.max(jnp.abs(jnp.where(jnp.isfinite(out), out, 0.0))))
 
             times = []
             for _ in range(TIME_STEPS):
                 t0 = time.perf_counter()
-                (loss, out), grads = step(block, x)
-                jax.block_until_ready((loss, out, grads))
+                stats = step(block)
+                jax.block_until_ready(stats)
                 times.append(time.perf_counter() - t0)
             mean_s = sum(times) / max(1, len(times))
             best_s = min(times) if times else float("nan")
 
+            loss, ofin, omax, gfin, gmax = (float(s) for s in stats)
             print(
-                f"[{tag}] loss={float(loss):.6e} loss_fin={bool(jnp.isfinite(loss))} "
-                f"fwd_fin={ofin} fwd_max={omax:.3e} grad_fin={gfin} grad_max={gmax:.3e} "
+                f"[{tag}] loss={loss:.6e} loss_fin={loss == loss} "
+                f"fwd_fin={bool(ofin)} fwd_max={omax:.3e} grad_fin={bool(gfin)} grad_max={gmax:.3e} "
                 f"compile+step1={compile_s:.2f}s step_mean={mean_s * 1e3:.1f}ms step_best={best_s * 1e3:.1f}ms",
                 flush=True,
             )
-            return float(loss)
+            return loss
 
     print(
         f"[probe] devices={jax.device_count()} shape={shape} B={B} S={S} H={H} K={K} experts={EXPERTS} "
@@ -250,21 +274,29 @@ def main():
         flush=True,
     )
 
-    ref_loss = None
-    try:
-        ref_loss = run("REF  ep1        fsdpW", build(REF_DIMS, ep_carries_batch=False), ("dp", "fsdp"))
-    except Exception as e:  # noqa: BLE001
-        print(f"[REF  ep1] EXC {type(e).__name__}: {e}", flush=True)
-    if RUN_KNOB_OFF:
+    def arm(tag, dims, *, ep_carries_batch, batch_axes):
+        """Build, run, and fully release one arm (buffers + loaded programs)."""
+        import gc
+
         try:
-            run("BASE ep4 knobOFF fsdpW", build(CAND_DIMS, ep_carries_batch=False), ("dp", "fsdp"))
+            block = build(dims, ep_carries_batch=ep_carries_batch)
+            loss = run(tag, block, batch_axes)
         except Exception as e:  # noqa: BLE001
-            print(f"[BASE ep4 knobOFF] EXC {type(e).__name__}: {e}", flush=True)
-    cand_loss = None
-    try:
-        cand_loss = run("CAND ep4 knobON  fsdpW", build(CAND_DIMS, ep_carries_batch=True), ("dp", "fsdp", "ep"))
-    except Exception as e:  # noqa: BLE001
-        print(f"[CAND ep4 knobON] EXC {type(e).__name__}: {e}", flush=True)
+            print(f"[{tag}] EXC {type(e).__name__}: {e}", flush=True)
+            loss = None
+        finally:
+            # Drop parameter buffers and unload compiled programs before the
+            # next arm compiles on a different mesh: loaded-program arena
+            # reservations otherwise accumulate across arms.
+            block = None  # noqa: F841
+            gc.collect()
+            jax.clear_caches()
+        return loss
+
+    ref_loss = arm("REF  ep1        fsdpW", REF_DIMS, ep_carries_batch=False, batch_axes=("dp", "fsdp"))
+    if RUN_KNOB_OFF:
+        arm("BASE ep4 knobOFF fsdpW", CAND_DIMS, ep_carries_batch=False, batch_axes=("dp", "fsdp"))
+    cand_loss = arm("CAND ep4 knobON  fsdpW", CAND_DIMS, ep_carries_batch=True, batch_axes=("dp", "fsdp", "ep"))
 
     if ref_loss is not None and cand_loss is not None:
         rel = abs(cand_loss - ref_loss) / max(abs(ref_loss), 1e-30)
