@@ -266,3 +266,34 @@ the exact-zeros seen in the broken ep4 run were an artifact of the
 poisoned backward, not a separate bug.
 
 CPU: moe suite + stage-aware expert mesh = 47 passed with the fix.
+
+### Full-scale validation on the ordered mesh (job ep_validate_full, 2026-07-17)
+
+launch_ep_validate.py = production launch.py with mesh (1,1,64,4,4,1),
+per-bucket gradient_accumulation_steps=4 on the 131k bucket (microbatch 64
+= 1 row/core; TrainingBucket field, distillation static slot 3), WANDB
+disabled, profiler off. Resume from run-1000 (START_STEP=1000), 35B
+student + bf16 teacher, worktree libs with the tail-mask fix.
+
+Steps 1001-1018, every step logged `[graddiag] all 966 grad leaves
+finite`; no NaN gate, no skip:
+
+- step 1001 (131k bucket + compile): 1266.2 s, kl 0.172 — EXACTLY the
+  production ep1 run's step-1001 kl (0.172; job launch-erfan-20260716-215251)
+- step 1002 (8k + compile): 861.3 s, kl 0.158
+- steps 1003-1011 (8k steady): 22.1 s/step typical (22.06-29.9),
+  kl 0.119 -> 0.096, max_grad_norm 0.3-1.3
+- step 1012 (131k steady, accum=4): 1175.3 s (dispatch 878.0 + device
+  sync 297.2, data wait 0.0), kl 0.145, max_grad_norm 0.902
+- stopped by hand at step 1018 (kl 0.096) — measurement policy; save_steps
+  500 means no checkpoint was written in the window.
+
+ep1-mesh comparators: 8k ~14.6-17.0 s/step (production step 1027 =
+14.585; M4 step 281 = 16.974); 131k first step 927.91 s compile-inclusive
+(steady unknown). The ep4 mesh pays ~1.4x on the 8k bucket (non-MoE
+layers are ep-replicated: 4x tokens/core there) and ~1.2-1.3x on the
+observed 131k step sample.
+
+Bucket cadence note: ModBucketRule.select(current_step) is called with the
+pre-increment step, so the 131k bucket runs at DISPLAYED train_steps 1001,
+1012, 1023, ... ((step-10) % 11 == 0).
