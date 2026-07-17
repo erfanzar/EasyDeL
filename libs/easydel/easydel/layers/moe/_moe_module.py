@@ -80,6 +80,9 @@ from ._communication_utils import (
     MoEMethods,
     MoeMetrics,
     MoeRoutingStrategy,
+    build_ep_traffic_matrix,
+    chunk_group_sizes,
+    ep_batch_receive_buffer_rows,
     get_all_to_all_params,
     get_experts_location,
     get_moe_partition_spec,
@@ -372,7 +375,70 @@ class BaseMoeModule(spx.Module, ABC):
             arr=arr,
         )
 
-    def _moe_batch_axis_names(self, expert_mesh: spx.SpxMesh, dp_axis_name: str) -> tuple[str, ...]:
+    def _ep_carries_batch_active(self, expert_mesh: spx.SpxMesh) -> bool:
+        """Whether the MaxText-style "ep carries batch" dispatch is active.
+
+        The ``moe_ep_carries_batch`` knob shards the token batch over the
+        expert axis and dispatches tokens to their expert-owning shard with a
+        ragged all-to-all (instead of replicating the batch over ep and
+        computing at home). It only composes with the SPMD stage-mesh layout
+        where dp/fsdp/ep are distinct mesh axes:
+
+        * non-ring only — ring-of-experts all-gathers the batch over ep, the
+          exact opposite placement;
+        * ``fsdp_is_ep_bound`` / ``sp_is_ep_bound`` must be ``False`` — the
+          folded 3-D expert mesh absorbs those axes into ep and has no
+          distinct fsdp axis to co-shard the batch with;
+        * ``use_expert_tensor_mode`` swaps ep onto tp and has no expert axis
+          to dispatch over;
+        * ``n_routed_experts`` must divide by ep so every shard owns the same
+          contiguous expert block (the traffic matrix assumes it).
+
+        Shape-dependent conditions (batch divisibility by ``dp*fsdp*ep``) are
+        checked separately in :meth:`_sparse_moe_call`, which may still
+        deactivate the path per layer invocation.
+
+        Args:
+            expert_mesh: Active expert mesh from
+                :meth:`_build_active_expert_mesh`.
+
+        Returns:
+            ``True`` when every static condition for the ep-carries-batch
+            dispatch holds on this mesh.
+        """
+        if not bool(getattr(self.config, "moe_ep_carries_batch", False)):
+            return False
+        if self.config.use_ring_of_experts or self.config.use_expert_tensor_mode:
+            return False
+        if self.config.fsdp_is_ep_bound or self.config.sp_is_ep_bound:
+            return False
+        axis_names = expert_mesh.jax_mesh.axis_names
+        ep_axis_name = resolve_eformer_axis(EP, self.runtime_sharding_resolver)
+        fsdp_axis_name = resolve_eformer_axis(FSDP, self.runtime_sharding_resolver)
+        # Stage-mesh path only: the folded 3-D expert mesh has no distinct
+        # fsdp axis, and MPMD stages (pp > 1) always fold.
+        if not (isinstance(ep_axis_name, str) and ep_axis_name in axis_names):
+            return False
+        if not (isinstance(fsdp_axis_name, str) and fsdp_axis_name in axis_names):
+            return False
+        ep_size = int(expert_mesh.shape[ep_axis_name])
+        if ep_size <= 1:
+            return False
+        if self.n_routed_experts % ep_size != 0:
+            logger.warn_once(
+                f"moe_ep_carries_batch=True but n_routed_experts={self.n_routed_experts} is not divisible "
+                f"by ep={ep_size}; falling back to the batch-replicated ep dispatch."
+            )
+            return False
+        return True
+
+    def _moe_batch_axis_names(
+        self,
+        expert_mesh: spx.SpxMesh,
+        dp_axis_name: str,
+        *,
+        ep_carries_batch: bool | None = None,
+    ) -> tuple[str, ...]:
         """Mesh axes carrying the token batch inside the fused-MoE ``shard_map``.
 
         On the folded 3-D expert mesh, :meth:`_build_active_expert_mesh` has
@@ -388,11 +454,20 @@ class BaseMoeModule(spx.Module, ABC):
         bound to expert parallelism. The sp axis keeps its historical
         replicated behavior (the batch is not generally divisible by sp).
 
+        With ``moe_ep_carries_batch`` active the expert axis joins the batch
+        axes as well (MaxText's "batch is sharded by ep" training layout), so
+        each ep shard holds ``B/(dp*fsdp*ep)`` tokens and the dispatch
+        all-to-all moves tokens to their expert-owning shard.
+
         Args:
             expert_mesh: Active expert mesh as returned by
                 :meth:`_build_active_expert_mesh` (5-D stage mesh or folded
                 3-D expert mesh).
             dp_axis_name: Resolved physical name of the data-parallel axis.
+            ep_carries_batch: Explicit ep-carries-batch decision from the
+                caller (which may include shape-dependent conditions such as
+                batch divisibility). ``None`` recomputes the static gate via
+                :meth:`_ep_carries_batch_active`.
 
         Returns:
             Tuple of physical mesh axis names to place on the batch dimension
@@ -407,6 +482,16 @@ class BaseMoeModule(spx.Module, ABC):
                 and fsdp_axis_name in expert_mesh.jax_mesh.axis_names
             ):
                 batch_axis_names += (fsdp_axis_name,)
+        if ep_carries_batch is None:
+            ep_carries_batch = self._ep_carries_batch_active(expert_mesh)
+        if ep_carries_batch:
+            ep_axis_name = resolve_eformer_axis(EP, self.runtime_sharding_resolver)
+            if (
+                isinstance(ep_axis_name, str)
+                and ep_axis_name not in batch_axis_names
+                and ep_axis_name in expert_mesh.jax_mesh.axis_names
+            ):
+                batch_axis_names += (ep_axis_name,)
         return batch_axis_names
 
     def get_moe_spec(
@@ -532,6 +617,7 @@ class BaseMoeModule(spx.Module, ABC):
         global_tokens: int,
         expert_params_bytes: int,
         chunk_size: int | None,
+        ep_carries_batch: bool = False,
     ) -> None:
         """Log the fused-MoE layout estimate and hard-fail impossible layouts.
 
@@ -549,6 +635,10 @@ class BaseMoeModule(spx.Module, ABC):
                 parameters (kernels + biases) at their storage dtype.
             chunk_size: Active ``moe_chunk_size`` (``None`` when chunking is
                 disabled).
+            ep_carries_batch: Whether the ep-carries-batch dispatch is active
+                for this invocation (batch sharded over ep, worst-case a2a
+                receive buffer accounted instead of the replicated dispatch
+                buffer).
 
         Raises:
             ValueError: Propagated from :func:`validate_moe_layout` when the
@@ -575,6 +665,7 @@ class BaseMoeModule(spx.Module, ABC):
             use_ring_of_experts=bool(self.config.use_ring_of_experts),
             chunk_size=chunk_size,
             fsdp_shard_expert_weights=bool(getattr(self.config, "moe_fsdp_shard_expert_weights", False)),
+            ep_carries_batch=bool(ep_carries_batch),
         )
 
     def _replicate_and_sort_tokens(
@@ -1333,6 +1424,27 @@ class BaseMoeModule(spx.Module, ABC):
                 "fused MoE shard_map (any at-rest fsdp sharding is gathered at the boundary instead)."
             )
 
+        # MaxText-style "ep carries batch" (moe_ep_carries_batch): shard the
+        # token batch over ep as well and dispatch tokens to their expert-
+        # owning shard with a ragged all-to-all. Static mesh/config conditions
+        # live in _ep_carries_batch_active; the batch-divisibility check needs
+        # the traced shapes, so it lives here and may deactivate per layer.
+        ep_carries_batch = self._ep_carries_batch_active(expert_mesh)
+        if ep_carries_batch:
+            dp_size = (
+                int(expert_mesh.shape[dp_axis_name])
+                if isinstance(dp_axis_name, str) and dp_axis_name in expert_mesh.jax_mesh.axis_names
+                else 1
+            )
+            batch_ways = dp_size * fsdp_size * ep_size
+            if _BS % batch_ways != 0:
+                logger.warn_once(
+                    f"moe_ep_carries_batch=True but batch={_BS} is not divisible by "
+                    f"dp*fsdp*ep={batch_ways}; falling back to (dp, fsdp) batch sharding "
+                    "with the batch-replicated ep dispatch for this layer."
+                )
+                ep_carries_batch = False
+
         expert_params_bytes = 0
         for _param in (wi_kernel, wu_kernel, gate_up_kernel, wd_kernel, wi_bias, wu_bias, gate_up_bias, wd_bias):
             if _param is not None:
@@ -1341,6 +1453,7 @@ class BaseMoeModule(spx.Module, ABC):
             global_tokens=_BS * _SQLN,
             expert_params_bytes=expert_params_bytes,
             chunk_size=moe_chunk_size,
+            ep_carries_batch=ep_carries_batch,
         )
 
         # Partition specs over the active expert layout. On MPMD stages this is
@@ -1348,7 +1461,7 @@ class BaseMoeModule(spx.Module, ABC):
         # where dp and fsdp are separate axes and the batch dimension must name
         # both — otherwise dp=1/fsdp-dominant training meshes replicate the
         # whole global batch into every shard of the region below.
-        batch_axis_names = self._moe_batch_axis_names(expert_mesh, dp_axis_name)
+        batch_axis_names = self._moe_batch_axis_names(expert_mesh, dp_axis_name, ep_carries_batch=ep_carries_batch)
         batch_axes = batch_axis_names if len(batch_axis_names) > 1 else batch_axis_names[0]
         input_ps = jax.sharding.PartitionSpec(batch_axes, None, None)
         glps = jax.sharding.PartitionSpec(batch_axes, None)
@@ -1751,6 +1864,200 @@ class BaseMoeModule(spx.Module, ABC):
                 if wd_bias is not None:
                     intermediate_output = intermediate_output + wd_bias[selected_experts]
                 return intermediate_output
+
+            def _dispatch_ep_batch(x: jax.Array, gate_logits: jax.Array) -> jax.Array:
+                """MaxText-style "ep carries batch" dispatch (``moe_ep_carries_batch``).
+
+                The token batch is sharded over ep as well, so each shard
+                permutes only its own ``B/(dp*fsdp*ep)`` tokens and the
+                tokens travel to their expert-owning shard:
+
+                1. ``permute`` sorts the local rows by *global* expert id, so
+                   each destination shard's rows are contiguous.
+                2. One ``all_gather`` of the per-expert group sizes yields the
+                   global routing table; folding it gives the ``[ep, ep]``
+                   traffic matrix for both all-to-all directions.
+                3. DISPATCH ``ragged_all_to_all`` moves rows into a worst-case
+                   sized receive buffer (see
+                   :func:`ep_batch_receive_buffer_rows`); its output is
+                   ``checkpoint_name``-tagged ``"moe_dispatch"`` so remat
+                   policies can save it instead of replaying the collective.
+                4. ``local_permute`` re-sorts the received rows by local
+                   expert id; the valid rows form the leading prefix, the
+                   buffer slack is a zero/garbage tail that every grouped
+                   matmul masks away (``_mask_dispatch_tail``) — on TPU the
+                   kernels never write rows past ``sum(group_sizes)``, so the
+                   tail must be assumed garbage in forward AND backward.
+                5. ``_expert_ffn`` (optionally chunk-scanned over the received
+                   rows when ``moe_chunk_size`` is set — the a2a stays outside
+                   the scan) computes the expert outputs.
+                6. Local unsort + COMBINE ``ragged_all_to_all`` (the transposed
+                   traffic matrix) returns each row to its home shard at its
+                   original sorted position; tagged ``"moe_combine"``.
+                7. ``unpermute`` restores token order and applies the top-k
+                   combine weights.
+
+                Args:
+                    x: Local hidden-state block ``[B_local, S, H]`` (batch
+                        sharded over dp, fsdp AND ep).
+                    gate_logits: Local normalized gate scores
+                        ``[B_local*S, E]``.
+
+                Returns:
+                    Combined per-token outputs ``[B_local, S, H // tp_size]``.
+                """
+                local_expert_size = self.n_routed_experts // ep_size
+                x, sorted_selected_experts, weights, group_sizes, _selected_experts = permute(
+                    inputs=x,
+                    gate_logits=gate_logits,
+                    pre_bias_logits=None,
+                    use_custom_sort_vjp=True,
+                    roll_to_expert_id=None,
+                    num_experts_per_tok=self.num_experts_per_tok,
+                    num_experts=self.n_routed_experts,
+                    dtype=self.dtype,
+                    select_hook=select_hook,
+                    refine_weights_hook=refine_weights_hook,
+                    refine_inputs_hook=refine_inputs_hook,
+                    scale_replicated_inputs=scale_replicated_inputs,
+                )
+                local_rows = x.shape[0]  # B_local * S * k
+                local_tokens = local_rows // self.num_experts_per_tok
+
+                # One all_gather feeds both the [ep, ep] traffic matrix and
+                # local_permute's per-source group layout.
+                global_group_sizes = jax.lax.all_gather(group_sizes, axis_name=expert_axis_name)
+                all_shards_group_sizes = build_ep_traffic_matrix(global_group_sizes, ep_size, local_expert_size)
+
+                in_off, send_sz, out_off, recv_sz = get_all_to_all_params(
+                    all_shards_group_sizes,
+                    expert_shard_id,
+                    ep_size,
+                    is_batch_sharded=True,
+                    is_dispatch=True,
+                )
+                recv_rows = ep_batch_receive_buffer_rows(
+                    local_tokens, self.num_experts_per_tok, ep_size, local_expert_size
+                )
+                recv_buf = jnp.zeros((recv_rows, HD), dtype=x.dtype)
+                x = jax.lax.ragged_all_to_all(
+                    x,
+                    recv_buf,
+                    in_off,
+                    send_sz,
+                    out_off,
+                    recv_sz,
+                    axis_name=expert_axis_name,
+                )
+                x = checkpoint_name(x, "moe_dispatch")
+
+                x, local_sorted_indices, local_group_sizes, local_sorted_experts = local_permute(
+                    x,
+                    global_group_sizes,
+                    local_expert_size,
+                    shard_index=expert_shard_id,
+                    is_offset=False,
+                    use_custom_sort_vjp=True,
+                )
+                valid_rows = jnp.sum(local_group_sizes)
+
+                def _mask_row_tail(t: jax.Array) -> jax.Array:
+                    """Zero rows past the valid prefix of a receive-sized buffer.
+
+                    Forward no-op (the tail is already zero on backends that
+                    honor the a2a/gmm zero-fill), but its transpose zeroes the
+                    corresponding cotangent rows — on TPU the unwritten tails
+                    of ``ragged_all_to_all`` transposes and grouped-matmul
+                    backward outputs hold garbage that the sort/scatter
+                    transposes would otherwise route into real token
+                    cotangents (the 8ef1ddb9 "M3" NaN class).
+                    """
+                    keep = jnp.arange(t.shape[0], dtype=jnp.int32) < valid_rows
+                    return jnp.where(keep[:, None], t, jnp.zeros_like(t))
+
+                if moe_chunk_size is None:
+                    intermediate = _expert_ffn(x, local_group_sizes, local_sorted_experts)
+                else:
+                    # Chunk-scan over the *received* rows: the dispatch a2a is
+                    # already done, so the scan only bounds grouped-matmul
+                    # live buffers. Group boundaries per chunk come from the
+                    # cumulative group offsets (exact, and rows past the valid
+                    # prefix fall outside every group automatically).
+                    chunk_rows = int(moe_chunk_size) * self.num_experts_per_tok
+                    num_chunks = -(-recv_rows // chunk_rows)
+                    padded_rows = num_chunks * chunk_rows
+                    x_p = x if padded_rows == recv_rows else jnp.pad(x, ((0, padded_rows - recv_rows), (0, 0)))
+                    ids_p = (
+                        local_sorted_experts
+                        if padded_rows == recv_rows
+                        else jnp.pad(
+                            local_sorted_experts,
+                            (0, padded_rows - recv_rows),
+                            constant_values=local_expert_size - 1,
+                        )
+                    )
+                    group_ends = jnp.cumsum(local_group_sizes)
+                    group_starts = group_ends - local_group_sizes
+                    x_chunks = x_p.reshape(num_chunks, chunk_rows, HD)
+                    id_chunks = ids_p.reshape(num_chunks, chunk_rows)
+                    chunk_offsets = jnp.arange(num_chunks, dtype=group_ends.dtype) * chunk_rows
+
+                    def _scan_body(
+                        carry: None, chunk_inputs: tuple[jax.Array, jax.Array, jax.Array]
+                    ) -> tuple[None, jax.Array]:
+                        """Run ``_expert_ffn`` on one contiguous row chunk."""
+                        x_c, ids_c, c0 = chunk_inputs
+                        gs_c = chunk_group_sizes(group_starts, group_ends, c0, chunk_rows)
+                        return carry, _expert_ffn(x_c, gs_c, ids_c)
+
+                    _, inter_chunks = jax.lax.scan(
+                        jax.checkpoint(_scan_body), None, (x_chunks, id_chunks, chunk_offsets)
+                    )
+                    intermediate = inter_chunks.reshape(padded_rows, -1)
+                    if padded_rows != recv_rows:
+                        intermediate = intermediate[:recv_rows]
+
+                # Mask the gmm output tail before the unsort moves it around,
+                # and the unsorted buffer before the combine reads from it.
+                intermediate = _mask_row_tail(intermediate)
+                local_output = sort_activations(intermediate, jnp.argsort(local_sorted_indices), True)
+                local_output = _mask_row_tail(local_output)
+
+                c_in_off, c_send_sz, c_out_off, c_recv_sz = get_all_to_all_params(
+                    all_shards_group_sizes,
+                    expert_shard_id,
+                    ep_size,
+                    is_batch_sharded=True,
+                    is_dispatch=False,
+                )
+                combine_buf = jnp.zeros((local_rows, HD // tp_size), dtype=local_output.dtype)
+                combined = jax.lax.ragged_all_to_all(
+                    local_output,
+                    combine_buf,
+                    c_in_off,
+                    c_send_sz,
+                    c_out_off,
+                    c_recv_sz,
+                    axis_name=expert_axis_name,
+                )
+                combined = checkpoint_name(combined, "moe_combine")
+
+                return unpermute(
+                    combined,
+                    sorted_selected_experts,
+                    weights,
+                    batch_size=batch_size,
+                    sequence_length=sequence_length,
+                    use_custom_sort_vjp=True,
+                    weight_modif_fn=output_weights_hook,
+                    num_experts_per_tok=self.num_experts_per_tok,
+                    dtype=self.dtype,
+                )
+
+            if ep_carries_batch:
+                # Batch is sharded over ep; chunking (if any) happens inside,
+                # after the dispatch all-to-all.
+                return _dispatch_ep_batch(x, gate_logits)
 
             if moe_chunk_size is not None:
                 if self.config.use_ring_of_experts:
