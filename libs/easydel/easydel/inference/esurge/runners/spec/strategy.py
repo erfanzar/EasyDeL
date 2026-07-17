@@ -1090,6 +1090,26 @@ class DrafterSpeculation:
             return True
         return os.environ.get("EASYDEL_MTP_PERSIST_KV", "0") == "1"
 
+    def _adaptive_conf_threshold(self) -> float:
+        """Return the adaptive (early-exit) draft confidence threshold.
+
+        Read from ``EASYDEL_SPEC_ADAPTIVE_CONF`` (a top-1 softmax-probability
+        threshold). Default ``"0"`` means OFF: :meth:`draft_next` uses the fixed-K
+        Python draft loop exactly as before. A positive value routes greedy,
+        non-prefix drafts through :meth:`Qwen3_5MTPDrafter.draft_adaptive`, whose
+        on-device ``while_loop`` drafts up to ``num_speculative_tokens`` but stops
+        early once the MTP's confidence drops below this threshold — spending deep
+        drafts only while the drafter is confident. Values ``<= 0`` (or an
+        unparseable value) keep the feature off.
+
+        Returns:
+            The parsed threshold, or ``0.0`` when unset / invalid.
+        """
+        try:
+            return float(os.environ.get("EASYDEL_SPEC_ADAPTIVE_CONF", "0") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
     def draft_next(
         self,
         *,
@@ -1213,6 +1233,44 @@ class DrafterSpeculation:
                 self.drafter.rollback_to(committed_len, row_pos=row)
         elif callable(reset_request):
             reset_request(request_id=str(req_id))
+        # Adaptive (early-exit) draft length: run the whole K_max recursion as one
+        # on-device ``while_loop`` that stops early when the MTP's confidence drops,
+        # so K_max can be large without paying for low-value deep drafts. Only the
+        # greedy, non-prefix inline-MTP path is eligible (the drafter exposes
+        # ``draft_adaptive``); prefix/first-window drafts, sampled drafts, and
+        # non-MTP drafters keep the fixed-K Python loop below. Persist-with-rollback
+        # is preserved: the per-request ``row`` and the (already rolled-back) MTP
+        # cache are threaded through the loop.
+        adaptive_conf = self._adaptive_conf_threshold()
+        if (
+            adaptive_conf > 0.0
+            and greedy
+            and not use_prefix
+            and target_kv_payload is None
+            and callable(getattr(self.drafter, "draft_adaptive", None))
+        ):
+            try:
+                drafts_dev, valid_count_dev = self.drafter.draft_adaptive(
+                    seed_token=int(seed_token),
+                    seed_hidden=seed_hidden_bsh,
+                    seed_position=int(seed_position),
+                    k_max=self.num_speculative_tokens,
+                    conf_threshold=adaptive_conf,
+                    row_pos=(row if persist_on else None),
+                )
+            except Exception:
+                logger.warning(
+                    "Adaptive speculative drafter failed; disabling drafts for this request.",
+                    exc_info=True,
+                )
+                return []
+            # ONE batched device->host readback of the padded drafts + the valid
+            # count; slice the valid prefix on the host (variable-length window).
+            drafts_host, valid_host = jax.device_get((drafts_dev, valid_count_dev))
+            valid = max(0, int(np.asarray(valid_host).reshape(-1)[0]))
+            drafted = [int(t) for t in np.asarray(drafts_host).reshape(-1)[:valid]]
+            self.num_drafts_generated += len(drafted)
+            return drafted
         for draft_idx in range(self.num_speculative_tokens):
             position_ids = (
                 jnp.asarray(prefix_position_ids, dtype=jnp.int32)
