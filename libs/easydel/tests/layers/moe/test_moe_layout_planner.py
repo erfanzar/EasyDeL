@@ -220,5 +220,85 @@ def test_chunk_larger_than_stream_is_clamped():
     assert est.dispatch_buffer_bytes == unchunked.dispatch_buffer_bytes
 
 
+def test_case_f_ep_carries_batch_131k_production_numbers():
+    """(f) ep-carries-batch on fsdp64/ep4/tp4, 131k bucket: 256 batch ways, 4.3 GB/dir a2a.
+
+    Batch shards over dp*fsdp*ep = 256 ways -> 131,072 tokens/core. The
+    balanced dispatch all-to-all moves tokens_per_core * k * H * bf16 =
+    4.3 GB per direction per layer; the worst-case receive buffer is
+    ep * balanced = 4x that (min(k=8, E/ep=64) = k, no top-k cap) — 17.2 GB,
+    inside the warn band but not the hard int32 bound.
+    """
+    est = _estimate(MESH_FSDP64_EP4_TP4, TOKENS_131K_BUCKET, ep_carries_batch=True)
+    assert est.local_tokens == TOKENS_131K_BUCKET // 256
+    assert est.local_tokens == 131_072
+    assert est.all_to_all_bytes_per_layer == 131_072 * K * H * BF16
+    assert est.all_to_all_bytes_per_layer == 4_294_967_296  # 4.3 GB / direction / layer
+    assert est.dispatch_buffer_bytes == 4 * 131_072 * K * H * BF16
+    assert est.dispatch_buffer_bytes == 17_179_869_184  # worst-case receive buffer
+    assert not est.exceeds_int32_allocation_bound
+    assert est.near_int32_allocation_bound
+    assert "ep_carries_batch=True" in est.summary
+
+
+def test_case_f_ep_carries_batch_8k_bucket_numbers():
+    """(f) 8k bucket (B=512, S=8192): 16,384 tokens/core, 537 MB/dir a2a, 2.1 GB buffer."""
+    est = _estimate(MESH_FSDP64_EP4_TP4, TOKENS_8K_BUCKET, ep_carries_batch=True)
+    assert est.local_tokens == TOKENS_8K_BUCKET // 256
+    assert est.local_tokens == 16_384
+    assert est.all_to_all_bytes_per_layer == 16_384 * K * H * BF16
+    assert est.all_to_all_bytes_per_layer == 536_870_912  # 537 MB / direction / layer
+    assert est.dispatch_buffer_bytes == 4 * 16_384 * K * H * BF16
+    assert est.dispatch_buffer_bytes == 2_147_483_648
+    assert not est.exceeds_int32_allocation_bound
+    assert not est.near_int32_allocation_bound
+
+
+def test_ep_carries_batch_chunk_does_not_cap_receive_buffer():
+    """Chunking bounds the gmm buffers but NOT the a2a receive buffer (dispatch precedes the scan)."""
+    est = _estimate(
+        MESH_FSDP64_EP4_TP4,
+        TOKENS_131K_BUCKET,
+        ep_carries_batch=True,
+        chunk_size=65536,
+    )
+    assert est.chunk_tokens == 65536
+    assert est.dispatch_buffer_bytes == 17_179_869_184, (
+        "the worst-case a2a receive buffer must not shrink with moe_chunk_size: the dispatch "
+        "all-to-all happens before the chunk scan"
+    )
+
+
+def test_ep_carries_batch_recommendation_logic():
+    """Planner recommends the knob exactly where it applies (ep>1, non-ring, unbound, off)."""
+    applies = _estimate(MESH_FSDP64_EP4_TP4, TOKENS_131K_BUCKET)
+    assert "moe_ep_carries_batch" in applies.summary
+
+    active = _estimate(MESH_FSDP64_EP4_TP4, TOKENS_131K_BUCKET, ep_carries_batch=True)
+    assert "set moe_ep_carries_batch=True" not in active.summary
+
+    ep1 = _estimate(MESH_DP4_FSDP64_EP1_TP4, TOKENS_131K_BUCKET)
+    assert "moe_ep_carries_batch" not in ep1.summary
+
+    bound = _estimate(MESH_FSDP64_EP4_TP4, TOKENS_8K_BUCKET, fsdp_is_ep_bound=True)
+    assert "moe_ep_carries_batch" not in bound.summary
+
+    ring = _estimate(MESH_FSDP64_EP4_TP4, TOKENS_8K_BUCKET, use_ring_of_experts=True)
+    assert "moe_ep_carries_batch" not in ring.summary
+
+
+def test_ep_carries_batch_flag_ignored_when_inapplicable():
+    """The flag is inert on ep=1 / ring / ep-bound layouts (no silent batch-way change)."""
+    for kw in (
+        dict(mesh=MESH_DP4_FSDP64_EP1_TP4, extra={}),
+        dict(mesh=MESH_FSDP64_EP4_TP4, extra={"use_ring_of_experts": True}),
+        dict(mesh=MESH_FSDP64_EP4_TP4, extra={"fsdp_is_ep_bound": True}),
+    ):
+        base = _estimate(kw["mesh"], TOKENS_8K_BUCKET, **kw["extra"])
+        flagged = _estimate(kw["mesh"], TOKENS_8K_BUCKET, ep_carries_batch=True, **kw["extra"])
+        assert flagged.local_tokens == base.local_tokens
+        assert flagged.dispatch_buffer_bytes == base.dispatch_buffer_bytes
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-s"])

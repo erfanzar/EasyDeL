@@ -145,7 +145,11 @@ class MoeLayoutEstimate:
             rest and gathered at use).
         all_to_all_bytes_per_layer: First-order estimate of per-device token
             communication for the expert combine (ragged all-to-all, or ring
-            gather+scatter). Zero when ``ep == 1``.
+            gather+scatter). Zero when ``ep == 1``. In the ep-carries-batch
+            regime this is the balanced dispatch-direction volume
+            ``local_tokens * k * H * dtype_bytes`` per layer (there are two
+            all-to-alls; the combine direction carries ``H / tp``-wide rows,
+            i.e. ``1/tp`` of this).
         exceeds_int32_allocation_bound: ``True`` when the dispatch buffer
             exceeds the conservative hard bound
             (:data:`INT32_ALLOCATION_HARD_BOUND_BYTES`) — such a config has
@@ -186,15 +190,18 @@ def estimate_moe_layout(
     use_ring_of_experts: bool,
     chunk_size: int | None,
     fsdp_shard_expert_weights: bool = False,
+    ep_carries_batch: bool = False,
 ) -> MoeLayoutEstimate:
     """Estimate the fused-MoE per-core memory and communication footprint.
 
     Pure shape math on the logical mesh layout — no device or JAX work. The
     model mirrors ``BaseMoeModule._sparse_moe_call``: the token batch is
-    sharded over ``dp`` (plus ``fsdp`` when not ep-bound) and replicated over
-    ``ep``/``tp``/``sp``; ring-of-experts additionally all-gathers tokens
-    over ``ep`` before dispatch; ``moe_chunk_size`` caps the number of
-    tokens permuted at once.
+    sharded over ``dp`` (plus ``fsdp`` when not ep-bound, plus ``ep`` in the
+    ep-carries-batch regime) and replicated over the remaining axes;
+    ring-of-experts additionally all-gathers tokens over ``ep`` before
+    dispatch; ``moe_chunk_size`` caps the number of tokens permuted at once
+    (except the ep-carries-batch a2a receive buffer, which chunking cannot
+    cap because the dispatch happens before the chunk scan).
 
     Args:
         mesh_axis_sizes: Mapping of **logical** axis roles (``"dp"``,
@@ -222,6 +229,14 @@ def estimate_moe_layout(
         chunk_size: ``moe_chunk_size`` (tokens per chunk) or ``None``.
         fsdp_shard_expert_weights: Whether expert weights are fsdp-sharded
             at rest and gathered at use (``moe_fsdp_shard_expert_weights``).
+        ep_carries_batch: Whether the ep-carries-batch dispatch is active
+            (``moe_ep_carries_batch``): the token batch shards over ep as
+            well (``batch_ways = dp * fsdp * ep``) and tokens travel to
+            their expert-owning shard via two ragged all-to-alls. The
+            dominating buffer becomes the worst-case a2a receive buffer of
+            ``ep * local_tokens * min(k, E/ep) * H`` elements. Only
+            meaningful with ``ep > 1``, ``use_ring_of_experts=False`` and
+            ``fsdp_is_ep_bound=False``.
 
     Returns:
         A :class:`MoeLayoutEstimate` with per-core, per-layer byte counts
@@ -236,7 +251,11 @@ def estimate_moe_layout(
     total_devices = dp * fsdp * ep * tp * sp
     global_tokens = int(tokens_per_device) * total_devices
 
-    batch_ways = dp * (1 if fsdp_is_ep_bound else fsdp)
+    # ep-carries-batch only exists on the non-ring, ep-unbound stage-mesh
+    # path with ep > 1 (mirrors BaseMoeModule._ep_carries_batch_active).
+    ep_carries_batch_active = bool(ep_carries_batch) and ep > 1 and not use_ring_of_experts and not fsdp_is_ep_bound
+
+    batch_ways = dp * (1 if fsdp_is_ep_bound else fsdp) * (ep if ep_carries_batch_active else 1)
     local_tokens = math.ceil(global_tokens / batch_ways)
     dispatch_tokens = local_tokens * (ep if use_ring_of_experts else 1)
 
@@ -244,7 +263,17 @@ def estimate_moe_layout(
     if chunk_size is not None and int(chunk_size) > 0:
         chunk_tokens = min(int(chunk_size), dispatch_tokens)
 
-    buffer_rows = (chunk_tokens if chunk_tokens is not None else dispatch_tokens) * int(num_experts_per_tok)
+    if ep_carries_batch_active:
+        # The binding allocation is the worst-case a2a receive buffer: every
+        # source shard could route all its rows here, capped by the fact a
+        # token's k experts are distinct so it contributes at most
+        # min(k, E/ep) rows to one shard. Chunking cannot cap this buffer —
+        # the dispatch a2a happens before the chunk scan (the scan only
+        # bounds grouped-matmul live buffers).
+        local_expert_size = max(1, int(num_experts) // ep)
+        buffer_rows = ep * local_tokens * min(int(num_experts_per_tok), local_expert_size)
+    else:
+        buffer_rows = (chunk_tokens if chunk_tokens is not None else dispatch_tokens) * int(num_experts_per_tok)
     dispatch_buffer_bytes = buffer_rows * int(hidden_size) * int(dtype_bytes)
     live_dispatch_bytes = dispatch_buffer_bytes * FWD_BWD_LIVE_BUFFER_MULTIPLIER
 
@@ -272,6 +301,11 @@ def estimate_moe_layout(
         # all_gather of the local token block over ep (in) + psum_scatter of
         # the combined output over ep (out).
         all_to_all_bytes_per_layer = 2 * local_tokens * (ep - 1) * int(hidden_size) * int(dtype_bytes)
+    elif ep_carries_batch_active:
+        # Balanced dispatch-direction volume: each core sends/receives its
+        # local rows once at full hidden width (the combine direction moves
+        # the same rows at H/tp width, i.e. 1/tp of this).
+        all_to_all_bytes_per_layer = local_tokens * int(num_experts_per_tok) * int(hidden_size) * int(dtype_bytes)
     else:
         # ragged_all_to_all replicating each shard's computed rows to the
         # other ep shards (H is tp-scattered by then).
@@ -284,20 +318,33 @@ def estimate_moe_layout(
     recommend_fsdp_weights = (
         not fsdp_shards_weights and fsdp > 1 and expert_weights_bytes_per_device > MOE_WEIGHT_RESIDENCY_RECOMMEND_BYTES
     )
+    recommend_ep_carries_batch = (
+        not ep_carries_batch_active and ep > 1 and not use_ring_of_experts and not fsdp_is_ep_bound
+    )
 
     parts = [
         (
             f"MoE layout dp={dp} fsdp={fsdp} ep={ep} tp={tp} sp={sp} "
             f"(fsdp_is_ep_bound={fsdp_is_ep_bound}, ring={use_ring_of_experts}, "
             f"chunk={chunk_tokens if chunk_tokens is not None else 'off'}, "
-            f"fsdp_shard_expert_weights={fsdp_shard_expert_weights})"
+            f"fsdp_shard_expert_weights={fsdp_shard_expert_weights}, "
+            f"ep_carries_batch={ep_carries_batch_active})"
         ),
         f"{local_tokens:,} tokens/core (x{ep} ring-gathered)" if use_ring_of_experts else f"{local_tokens:,} tokens/core",
-        f"dispatch buffer {_fmt_bytes(dispatch_buffer_bytes)}/core "
-        f"(~x{FWD_BWD_LIVE_BUFFER_MULTIPLIER} live fwd+bwd = {_fmt_bytes(live_dispatch_bytes)})",
+        (
+            f"a2a worst-case receive buffer {_fmt_bytes(dispatch_buffer_bytes)}/core "
+            f"(~x{FWD_BWD_LIVE_BUFFER_MULTIPLIER} live fwd+bwd = {_fmt_bytes(live_dispatch_bytes)})"
+            if ep_carries_batch_active
+            else f"dispatch buffer {_fmt_bytes(dispatch_buffer_bytes)}/core "
+            f"(~x{FWD_BWD_LIVE_BUFFER_MULTIPLIER} live fwd+bwd = {_fmt_bytes(live_dispatch_bytes)})"
+        ),
         f"expert weights resident {_fmt_bytes(expert_weights_bytes_per_device)}/device",
         f"weight-gather {_fmt_bytes(weight_gather_bytes_per_layer)}/layer",
-        f"token-comm {_fmt_bytes(all_to_all_bytes_per_layer)}/layer",
+        (
+            f"token-comm {_fmt_bytes(all_to_all_bytes_per_layer)}/dir/layer (2 a2a; combine dir is 1/tp of this)"
+            if ep_carries_batch_active
+            else f"token-comm {_fmt_bytes(all_to_all_bytes_per_layer)}/layer"
+        ),
     ]
     if exceeds_hard:
         parts.append("EXCEEDS TPU int32 single-allocation bound (cannot compile)")
@@ -307,6 +354,12 @@ def estimate_moe_layout(
         parts.append(
             "recommendation: set moe_fsdp_shard_expert_weights=True to shard expert weights "
             f"(and their optimizer state) over fsdp={fsdp}"
+        )
+    if recommend_ep_carries_batch:
+        parts.append(
+            "recommendation: set moe_ep_carries_batch=True to shard the token batch over "
+            f"ep={ep} (dispatch tokens/core /= {ep}; tokens travel to their expert shard "
+            "via ragged all-to-all instead of every ep shard replicating the batch)"
         )
     summary = "; ".join(parts)
 
@@ -340,6 +393,7 @@ def _validate_moe_layout_cached(
     use_ring_of_experts: bool,
     chunk_size: int | None,
     fsdp_shard_expert_weights: bool,
+    ep_carries_batch: bool,
 ) -> MoeLayoutEstimate:
     """Cached estimate + logging + hard failure for one hashable layout.
 
@@ -362,6 +416,7 @@ def _validate_moe_layout_cached(
         use_ring_of_experts: See :func:`estimate_moe_layout`.
         chunk_size: See :func:`estimate_moe_layout`.
         fsdp_shard_expert_weights: See :func:`estimate_moe_layout`.
+        ep_carries_batch: See :func:`estimate_moe_layout`.
 
     Returns:
         The computed :class:`MoeLayoutEstimate`.
@@ -383,6 +438,7 @@ def _validate_moe_layout_cached(
         use_ring_of_experts=use_ring_of_experts,
         chunk_size=chunk_size,
         fsdp_shard_expert_weights=fsdp_shard_expert_weights,
+        ep_carries_batch=ep_carries_batch,
     )
     logger.info(estimate.summary)
     if estimate.exceeds_int32_allocation_bound:
@@ -424,6 +480,7 @@ def validate_moe_layout(
     use_ring_of_experts: bool,
     chunk_size: int | None,
     fsdp_shard_expert_weights: bool = False,
+    ep_carries_batch: bool = False,
 ) -> MoeLayoutEstimate:
     """Estimate an MoE layout, log it at INFO, and hard-fail impossible ones.
 
@@ -451,4 +508,5 @@ def validate_moe_layout(
         bool(use_ring_of_experts),
         None if chunk_size is None else int(chunk_size),
         bool(fsdp_shard_expert_weights),
+        bool(ep_carries_batch),
     )
