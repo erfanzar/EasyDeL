@@ -48,6 +48,7 @@ from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
+import spectrax as spx
 from ejkernel.types import MaskInfo
 from jaxtyping import Array, Float, Int
 from spectrax import common_types
@@ -326,6 +327,37 @@ class Qwen3_5MTPDrafter:
         self._mtp_cache_max_length: int | None = max(1, int(cache_length)) if cache_length is not None else None
         self.num_draft_tokens = max(1, int(num_draft_tokens))
         self._jit_mtp: dict[tuple, typing.Callable] = {}
+        self._jit_adaptive: dict[tuple, typing.Callable] = {}
+        # Cached static GraphDef for ``self.model`` (structurally invariant for a
+        # fixed model). The model State (the actual weight arrays) is threaded
+        # through the drafter jits as a runtime INPUT, never closed over — see
+        # ``_model_graph_and_state``.
+        self._graphdef: spx.GraphDef | None = None
+
+    def _model_graph_and_state(self) -> tuple[spx.GraphDef, spx.State]:
+        """Split ``self.model`` into (cached static GraphDef, live State).
+
+        The MTP-head forward reaches the target's weights (``model.mtp``, the
+        input embeddings, and ``model.apply_lm_head``). If those weights are
+        reached through the ``self.model`` *closure* of a plain ``jax.jit`` they
+        are baked into the compiled program as captured CONSTANTS — for the 27B
+        that is ~6 GB copied into every drafter executable, which makes the
+        program too large to serialize (never caches, re-lowers each process) and
+        stacks a second full weight copy on top of the KV pool at warmup (batched
+        spec-decode then OOMs on TPU).
+
+        Passing the ``State`` as a jit input instead makes the compiled program
+        reference the already-resident weight buffers. ``spx.export`` only
+        traverses the module pytree; it references the existing device arrays and
+        does not copy them, so this adds no HBM (the drafter shares ``self.model``
+        with the main runner — same device buffers). The GraphDef is cached once;
+        the State is re-exported each call so live/updated weights are picked up
+        and the arrays are never part of the compile key.
+        """
+        graphdef, state = spx.export(self.model)
+        if self._graphdef is None:
+            self._graphdef = graphdef
+        return self._graphdef, state
 
     def set_max_length(self, max_length: int) -> None:
         """Configure the MTP-local cache length used by runner-native decode.
@@ -528,6 +560,128 @@ class Qwen3_5MTPDrafter:
             self._mtp_cache = self._init_mtp_cache(batch_size)
             self._mtp_cache_batch_size = batch_size if self._mtp_cache is not None else None
 
+    def _mtp_forward_compute(
+        self,
+        model: typing.Any,
+        ids: Int[Array, "batch seq"],
+        hidden: Float[Array, "batch seq hidden"],
+        pos: Int[Array, "batch seq"] | None,
+        cache: TransformerCache | None,
+        row: jax.Array | None,
+    ) -> tuple[Float[Array, "batch seq hidden"], Float[Array, "batch seq vocab"], TransformerCache | None]:
+        """One inline-MTP-head forward: ``(ids, hidden) -> (hidden_out, logits, new_cache)``.
+
+        This is the traceable core shared by the single-step decode path
+        (:meth:`_mtp_hidden_and_logits`, one call per drafter step) and the
+        adaptive on-device draft loop (:meth:`draft_adaptive`, which threads the
+        returned cache through a ``jax.lax.while_loop`` carry so the K_max-step
+        recursion runs as one compiled program with early exit). Keeping it a
+        method (rather than a closure) is what lets the while_loop reuse the exact
+        row-targeted forward the per-request persistence path relies on, so a
+        fixed-K adaptive run (``conf_threshold <= 0``) is byte-identical to K
+        chained :meth:`draft` calls.
+
+        Args:
+            model: The target module whose MTP head, input embeddings, and LM
+                head this forward reads. Passed in explicitly (rather than read
+                off ``self.model``) so callers can hand in a model reconstructed
+                from a State that was threaded through their ``jax.jit`` as an
+                input — keeping the weights out of the compiled program's
+                captured constants (see ``_model_graph_and_state``).
+            ids: ``(batch, seq)`` already-sampled next-token ids fed to the MTP
+                fusion (embeddings + shifted hidden), not training labels.
+            hidden: ``(batch, seq, hidden)`` target hidden rows to fuse.
+            pos: Absolute positions for ``hidden``; ``None`` builds ``arange``.
+            cache: Inline-MTP ``TransformerCache`` to read/advance, or ``None`` to
+                run cache-free (each step re-fuses only its own hidden + token).
+            row: Traced batch row for per-request row targeting (the shared
+                request-pool cache is sliced down to this row for a batch-1
+                forward, then the result is scattered back). ``None`` runs the
+                legacy path where the cache batch equals the input batch.
+
+        Returns:
+            ``(hidden_out, logits, new_cache)`` — the MTP hidden rows, the vocab
+            logits ``(batch, seq, vocab)``, and the advanced cache (or ``None``
+            when ``cache`` was ``None``).
+        """
+
+        def _embed_next(ids_):
+            if hasattr(model, "get_input_embeddings"):
+                return model.get_input_embeddings()(ids_.astype("i4"))
+            return model.model.get_embedding()(ids_.astype("i4"))
+
+        def _slice_view_row(view, row_):
+            """Slice a batch-N cache view down to a batch-1 view at ``row``."""
+            return view.replace(
+                key=jax.lax.dynamic_slice_in_dim(view.key, row_, 1, axis=0),
+                value=jax.lax.dynamic_slice_in_dim(view.value, row_, 1, axis=0),
+                indexes=jax.lax.dynamic_slice_in_dim(view.indexes, row_, 1, axis=0),
+                starts=jax.lax.dynamic_slice_in_dim(view.starts, row_, 1, axis=0),
+            )
+
+        def _scatter_view_row(full, updated, row_):
+            """Write a batch-1 updated view back into ``row`` of the pool view."""
+            return full.replace(
+                key=jax.lax.dynamic_update_slice_in_dim(full.key, updated.key, row_, axis=0),
+                value=jax.lax.dynamic_update_slice_in_dim(full.value, updated.value, row_, axis=0),
+                indexes=jax.lax.dynamic_update_slice_in_dim(full.indexes, updated.indexes, row_, axis=0),
+                starts=jax.lax.dynamic_update_slice_in_dim(full.starts, updated.starts, row_, axis=0),
+            )
+
+        mtp = model.mtp
+        next_embeds = _embed_next(ids)
+        normed_e = mtp.pre_fc_norm_embedding(next_embeds)
+        normed_h = mtp.pre_fc_norm_hidden(hidden)
+        h = mtp.fc(jnp.concatenate([normed_e, normed_h], axis=-1))
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=None,
+            input_ids=None,
+            inputs_embeds=h,
+            attention_mask=None,
+        )
+        if pos is None:
+            batch_size, seq_len = h.shape[:2]
+            pos = jnp.arange(seq_len, dtype=jnp.int32)[None, :].repeat(
+                batch_size,
+                axis=0,
+            )
+        base_model = getattr(model, "model", None)
+        language_model = getattr(base_model, "language_model", None)
+        frequencies_owner = language_model if language_model is not None else base_model
+        frequencies = getattr(frequencies_owner, "frequencies", None)
+        views = cache.views if cache is not None else None
+        new_views = []
+        mtp_mode = common_types.MODE_PREFILL if ids.shape[1] > 1 else common_types.MODE_DECODE
+        for layer in mtp.layers:
+            cv_full = views[layer.layer_idx] if views is not None and layer.layer_idx < len(views) else None
+            # Per-request row targeting: slice this request's row out of the
+            # shared pool cache so the batch-1 attention only touches it.
+            cv_in = _slice_view_row(cv_full, row) if (cv_full is not None and row is not None) else cv_full
+            cache_metadata = (
+                TransformerMetadata(
+                    postpadded=False,
+                    starts=cv_in.starts,
+                    indexes=cv_in.indexes,
+                )
+                if cv_in is not None
+                else None
+            )
+            h, _cache_view = layer(
+                h,
+                mask_info,
+                pos,
+                mtp_mode,
+                cv_in,
+                cache_metadata,
+                frequencies,
+            )
+            if cv_full is not None and row is not None:
+                _cache_view = _scatter_view_row(cv_full, _cache_view, row)
+            new_views.append(_cache_view)
+        h = mtp.norm(h)
+        new_cache = TransformerCache(views=new_views) if cache is not None else None
+        return h, model.apply_lm_head(h), new_cache
+
     def _mtp_hidden_and_logits(
         self,
         input_ids: Int[Array, "batch seq"],
@@ -581,110 +735,49 @@ class Qwen3_5MTPDrafter:
         )
         fn = self._jit_mtp.get(key)
         if fn is None:
-
-            def _embed_next(ids):
-                if hasattr(self.model, "get_input_embeddings"):
-                    return self.model.get_input_embeddings()(ids.astype("i4"))
-                return self.model.model.get_embedding()(ids.astype("i4"))
-
-            def _slice_view_row(view, row):
-                """Slice a batch-N cache view down to a batch-1 view at ``row``."""
-                return view.replace(
-                    key=jax.lax.dynamic_slice_in_dim(view.key, row, 1, axis=0),
-                    value=jax.lax.dynamic_slice_in_dim(view.value, row, 1, axis=0),
-                    indexes=jax.lax.dynamic_slice_in_dim(view.indexes, row, 1, axis=0),
-                    starts=jax.lax.dynamic_slice_in_dim(view.starts, row, 1, axis=0),
-                )
-
-            def _scatter_view_row(full, updated, row):
-                """Write a batch-1 updated view back into ``row`` of the pool view."""
-                return full.replace(
-                    key=jax.lax.dynamic_update_slice_in_dim(full.key, updated.key, row, axis=0),
-                    value=jax.lax.dynamic_update_slice_in_dim(full.value, updated.value, row, axis=0),
-                    indexes=jax.lax.dynamic_update_slice_in_dim(full.indexes, updated.indexes, row, axis=0),
-                    starts=jax.lax.dynamic_update_slice_in_dim(full.starts, updated.starts, row, axis=0),
-                )
-
-            def _compute(ids, hidden, pos, cache, row):
-                mtp = self.model.mtp
-                next_embeds = _embed_next(ids)
-                normed_e = mtp.pre_fc_norm_embedding(next_embeds)
-                normed_h = mtp.pre_fc_norm_hidden(hidden)
-                h = mtp.fc(jnp.concatenate([normed_e, normed_h], axis=-1))
-                mask_info = MaskInfo.dynamic_init(
-                    mask_info=None,
-                    input_ids=None,
-                    inputs_embeds=h,
-                    attention_mask=None,
-                )
-                if pos is None:
-                    batch_size, seq_len = h.shape[:2]
-                    pos = jnp.arange(seq_len, dtype=jnp.int32)[None, :].repeat(
-                        batch_size,
-                        axis=0,
-                    )
-                base_model = getattr(self.model, "model", None)
-                language_model = getattr(base_model, "language_model", None)
-                frequencies_owner = language_model if language_model is not None else base_model
-                frequencies = getattr(frequencies_owner, "frequencies", None)
-                views = cache.views if cache is not None else None
-                new_views = []
-                mtp_mode = common_types.MODE_PREFILL if ids.shape[1] > 1 else common_types.MODE_DECODE
-                for layer in mtp.layers:
-                    cv_full = views[layer.layer_idx] if views is not None and layer.layer_idx < len(views) else None
-                    # Per-request row targeting: slice this request's row out of the
-                    # shared pool cache so the batch-1 attention only touches it.
-                    cv_in = _slice_view_row(cv_full, row) if (cv_full is not None and row is not None) else cv_full
-                    cache_metadata = (
-                        TransformerMetadata(
-                            postpadded=False,
-                            starts=cv_in.starts,
-                            indexes=cv_in.indexes,
-                        )
-                        if cv_in is not None
-                        else None
-                    )
-                    h, _cache_view = layer(
-                        h,
-                        mask_info,
-                        pos,
-                        mtp_mode,
-                        cv_in,
-                        cache_metadata,
-                        frequencies,
-                    )
-                    if cv_full is not None and row is not None:
-                        _cache_view = _scatter_view_row(cv_full, _cache_view, row)
-                    new_views.append(_cache_view)
-                h = mtp.norm(h)
-                new_cache = TransformerCache(views=new_views) if cache is not None else None
-                return h, self.model.apply_lm_head(h), new_cache
-
+            # Eager warmup on ``self.model`` (concrete, NOT under a trace)
+            # materializes any lazily-created state (rotary ``frequencies``,
+            # deferred variables) into the module before it is split/traced, so
+            # the exported State is complete and no trace-time tracer is cached
+            # onto the shared model.
             if use_row:
                 row_arr = jnp.asarray(int(row_pos), dtype=jnp.int32)
-                _ = _compute(input_ids, target_hidden_states, position_ids, mtp_cache, row_arr)
-
-                @jax.jit
-                def _fn(ids, hidden, pos, cache, row):
-                    return _compute(ids, hidden, pos, cache, row)
+                _ = self._mtp_forward_compute(
+                    self.model, input_ids, target_hidden_states, position_ids, mtp_cache, row_arr
+                )
             else:
-                _ = _compute(input_ids, target_hidden_states, position_ids, mtp_cache, None)
+                _ = self._mtp_forward_compute(self.model, input_ids, target_hidden_states, position_ids, mtp_cache, None)
+            # Thread the model weights through the jit as a State INPUT (see
+            # ``_model_graph_and_state``): the compiled program references the
+            # resident weight buffers instead of baking a copy of them in as
+            # captured constants. ``graphdef`` is static (closed over); the
+            # ``state`` passed at call time is a runtime argument, so it never
+            # enters the compile ``key``.
+            graphdef, _ = self._model_graph_and_state()
+            if use_row:
 
                 @jax.jit
-                def _fn(ids, hidden, pos, cache):
-                    return _compute(ids, hidden, pos, cache, None)
+                def _fn(state, ids, hidden, pos, cache, row):
+                    return self._mtp_forward_compute(spx.bind(graphdef, state), ids, hidden, pos, cache, row)
+            else:
+
+                @jax.jit
+                def _fn(state, ids, hidden, pos, cache):
+                    return self._mtp_forward_compute(spx.bind(graphdef, state), ids, hidden, pos, cache, None)
 
             fn = _fn
             self._jit_mtp[key] = fn
+        _, state = self._model_graph_and_state()
         if use_row:
             return fn(
+                state,
                 input_ids,
                 target_hidden_states,
                 position_ids,
                 mtp_cache,
                 jnp.asarray(int(row_pos), dtype=jnp.int32),
             )
-        return fn(input_ids, target_hidden_states, position_ids, mtp_cache)
+        return fn(state, input_ids, target_hidden_states, position_ids, mtp_cache)
 
     def draft(
         self,
@@ -791,6 +884,214 @@ class Qwen3_5MTPDrafter:
             full_log_probs=None,
             hidden_states=hidden_states,
         )
+
+    def _get_adaptive_fn(
+        self,
+        k_max: int,
+        cur_token: jax.Array,
+        cur_hidden: jax.Array,
+        position: jax.Array,
+        mtp_cache: TransformerCache | None,
+        use_row: bool,
+    ) -> typing.Callable:
+        """Build (or fetch) the jitted early-exit draft ``while_loop`` for a shape.
+
+        The returned callable runs the whole ``k_max``-step MTP recursion as a
+        single ``jax.lax.while_loop`` whose ``cond`` early-exits once the top-1
+        confidence drops below the (traced) threshold, so it executes FEWER MTP
+        forwards on device when the drafter is unsure — without any per-step host
+        sync. The compiled program is fixed (its trip count is data-dependent),
+        so it compiles once per shape signature: ``conf_threshold`` and the target
+        ``row`` are traced arguments, never part of the key, so varying the
+        threshold or the early-exit point reuses one compiled program.
+
+        Args:
+            k_max: Maximum number of draft tokens (static: sizes the pre-allocated
+                ``drafts`` buffer and bounds the loop).
+            cur_token: ``(batch, 1)`` seed token, used only for its shape/dtype.
+            cur_hidden: ``(batch, 1, hidden)`` seed hidden, used for shape/dtype.
+            position: ``(batch, 1)`` seed position, used for shape/dtype.
+            mtp_cache: The MTP cache pytree threaded through the carry (shape/dtype
+                signature keys the compile), or ``None`` for the cache-free path.
+            use_row: Whether the forward targets a single pool-cache row (the row
+                is a traced argument, so all rows share one compiled program).
+
+        Returns:
+            A jitted ``fn(state, cur_token, cur_hidden, position, cache,
+            conf_threshold, row) -> (drafts[k_max], valid_count, new_cache)``.
+            ``state`` is the target model's weight State (threaded as an input so
+            the weights are not captured constants).
+        """
+        has_cache = mtp_cache is not None
+        key = (
+            int(k_max),
+            tuple(cur_token.shape),
+            str(cur_token.dtype),
+            tuple(cur_hidden.shape),
+            str(cur_hidden.dtype),
+            tuple(position.shape),
+            str(position.dtype),
+            None
+            if mtp_cache is None
+            else tuple(
+                None
+                if view is None
+                else (
+                    tuple(view.key.shape),
+                    str(view.key.dtype),
+                    tuple(view.value.shape),
+                    str(view.value.dtype),
+                    tuple(view.indexes.shape),
+                    str(view.indexes.dtype),
+                )
+                for view in mtp_cache.views
+            ),
+            bool(use_row),
+        )
+        fn = self._jit_adaptive.get(key)
+        if fn is not None:
+            return fn
+
+        batch = int(cur_token.shape[0])
+        # Cache the static GraphDef so the compiled while_loop closes over
+        # structure only; the weight State is a runtime jit input (see
+        # ``_model_graph_and_state``) and thus never a captured constant.
+        graphdef, _ = self._model_graph_and_state()
+
+        def _step(model, ct, ch, pos, cache_in, row):
+            """One MTP forward -> (next_token[B], next_hidden[B,1,H], confidence, new_cache)."""
+            h, logits, new_cache = self._mtp_forward_compute(model, ct, ch, pos, cache_in, row)
+            last = logits[:, -1, :].astype(jnp.float32)
+            probs = jax.nn.softmax(last, axis=-1)
+            # Top-1 confidence = the argmax token's softmax prob == max softmax
+            # prob; take the batch-min so the loop stops when the least-confident
+            # row drops (batch is 1 on the eSurge single-request draft path).
+            confidence = jnp.min(jnp.max(probs, axis=-1))
+            next_tok = jnp.argmax(last, axis=-1).astype(jnp.int32)
+            return next_tok, h[:, -1:, :], confidence, new_cache
+
+        def _run(state, ct0, ch0, pos0, cache0, conf_threshold, row):
+            model = spx.bind(graphdef, state)
+            drafts0 = jnp.zeros((k_max,), dtype=jnp.int32)
+            row_arg = row if use_row else None
+
+            def _cond(carry):
+                i = carry[0]
+                keep = carry[-1]
+                return jnp.logical_and(i < k_max, keep)
+
+            def _body(carry):
+                if has_cache:
+                    i, ct, ch, pos, drafts, cache_in, _keep = carry
+                else:
+                    i, ct, ch, pos, drafts, _keep = carry
+                    cache_in = None
+                next_tok, next_hidden, confidence, new_cache = _step(model, ct, ch, pos, cache_in, row_arg)
+                # Keep the carried hidden's dtype invariant across iterations (the
+                # ``while_loop`` requires it). The seed hidden is model-sourced, so
+                # this is an identity cast in the expected case (seed dtype == MTP
+                # output dtype) and only guards a hypothetical mismatch.
+                next_hidden = next_hidden.astype(ch0.dtype)
+                drafts = drafts.at[i].set(next_tok[0])
+                # Write token i, then decide whether to draft i+1: stop AFTER a
+                # low-confidence token (it is still proposed and target-verified).
+                # ``conf_threshold <= 0`` keeps this True (confidence in (0, 1]), so
+                # the loop always runs the full k_max (fixed-K behavior).
+                keep_next = confidence >= conf_threshold
+                ct_next = next_tok.reshape(batch, 1)
+                pos_next = pos + 1
+                if has_cache:
+                    return (i + 1, ct_next, next_hidden, pos_next, drafts, new_cache, keep_next)
+                return (i + 1, ct_next, next_hidden, pos_next, drafts, keep_next)
+
+            keep0 = jnp.asarray(True)
+            if has_cache:
+                init = (jnp.asarray(0, dtype=jnp.int32), ct0, ch0, pos0, drafts0, cache0, keep0)
+            else:
+                init = (jnp.asarray(0, dtype=jnp.int32), ct0, ch0, pos0, drafts0, keep0)
+            final = jax.lax.while_loop(_cond, _body, init)
+            valid_count = final[0]
+            drafts_final = final[4]
+            new_cache = final[5] if has_cache else None
+            return drafts_final, valid_count, new_cache
+
+        fn = jax.jit(_run)
+        self._jit_adaptive[key] = fn
+        return fn
+
+    def draft_adaptive(
+        self,
+        seed_token: int,
+        seed_hidden: Float[Array, "batch seq hidden"] | Float[Array, "hidden"],
+        seed_position: int,
+        k_max: int,
+        conf_threshold: float,
+        *,
+        row_pos: int | None = None,
+    ) -> tuple[Int[Array, "k_max"], Int[Array, ""]]:
+        """Greedy adaptive-length draft: up to ``k_max`` tokens, early-exit on low confidence.
+
+        Runs the ``k_max``-step MTP recursion as a single on-device
+        ``jax.lax.while_loop`` (via :meth:`_get_adaptive_fn`) that stops once the
+        MTP's top-1 confidence for the token it just produced falls below
+        ``conf_threshold``. Because the exit test lives in the loop ``cond``, low
+        confidence draws FEWER MTP forwards on device — the point of adaptive
+        drafting is to spend deep drafts only while the MTP is confident. All draft
+        tokens are still target-verified downstream, so this only changes HOW MANY
+        tokens are proposed, never correctness; greedy spec output is unchanged.
+
+        The MTP KV cache is carried through the loop and (when ``row_pos`` is given)
+        each iteration reads/advances only that request's pool-cache row, so
+        per-request persist-with-rollback keeps working inside the loop. With
+        ``conf_threshold <= 0`` the loop always runs the full ``k_max`` and the
+        result is byte-identical to ``k_max`` chained :meth:`draft` calls.
+
+        Args:
+            seed_token: Seed token id (position ``seed_position``).
+            seed_hidden: Target hidden at the seed; ``(H,)`` or ``(batch, 1, H)``.
+            seed_position: Absolute position of ``seed_token``.
+            k_max: Maximum draft tokens to propose (the compiled loop bound).
+            conf_threshold: Top-1 softmax-probability threshold below which the
+                loop stops. ``<= 0`` disables early exit (drafts exactly ``k_max``).
+            row_pos: Optional per-request pool-cache row for batched persist-with-
+                rollback; ``None`` uses the legacy single-request cache.
+
+        Returns:
+            ``(drafts, valid_count)`` device arrays: ``drafts`` is the ``k_max``
+            pre-allocated buffer (only ``drafts[:valid_count]`` are valid) and
+            ``valid_count`` is the number of tokens actually drafted. The caller
+            does a single host readback of both.
+        """
+        k_max = max(1, int(k_max))
+        cur_token = jnp.asarray([[int(seed_token)]], dtype=jnp.int32)
+        cur_hidden = jnp.asarray(seed_hidden)
+        if cur_hidden.ndim == 1:
+            cur_hidden = cur_hidden[None, None, :]
+        position = jnp.asarray([[int(seed_position)]], dtype=jnp.int32)
+        conf_threshold_arr = jnp.asarray(float(conf_threshold), dtype=jnp.float32)
+
+        if row_pos is None:
+            mtp_cache = self._ensure_mtp_cache(int(cur_token.shape[0]))
+        else:
+            # Batched path: keep the pool cache sized to the request pool (see
+            # ``ensure_batch_size``); never shrink it to the batch-1 input here.
+            mtp_cache = self._ensure_mtp_cache(max(int(self._mtp_cache_batch_size or 0), int(row_pos) + 1))
+
+        use_row = row_pos is not None and mtp_cache is not None
+        fn = self._get_adaptive_fn(k_max, cur_token, cur_hidden, position, mtp_cache, use_row)
+        # Pass the live model State as the first jit input (never closed over),
+        # so the weights stay out of the compiled program's captured constants.
+        _, state = self._model_graph_and_state()
+        row_arg = jnp.asarray(int(row_pos) if use_row else 0, dtype=jnp.int32)
+        drafts, valid_count, new_cache = fn(
+            state, cur_token, cur_hidden, position, mtp_cache, conf_threshold_arr, row_arg
+        )
+        if new_cache is not None:
+            self._mtp_cache = new_cache
+            if row_pos is None:
+                self._mtp_cache_batch_size = int(cur_token.shape[0])
+            # else: keep the pool batch size — the batch-1 input is not the cache batch.
+        return drafts, valid_count
 
 
 class Gemma4AssistantDrafter:
