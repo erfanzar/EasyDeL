@@ -297,3 +297,90 @@ observed 131k step sample.
 Bucket cadence note: ModBucketRule.select(current_step) is called with the
 pre-increment step, so the 131k bucket runs at DISPLAYED train_steps 1001,
 1012, 1023, ... ((step-10) % 11 == 0).
+
+## "ep carries batch" dispatch (`moe_ep_carries_batch`, 2026-07-17, this session)
+
+MaxText-style batch-sharded EP for training: the token batch shards over the
+expert axis too, and tokens travel to their expert-owning shard instead of
+every ep shard replicating the batch. Removes the ~1.4x ep4 tax measured on
+the 8k bucket (non-MoE layers were ep-replicated: 4x tokens/core) and cuts
+the fused-MoE dispatch buffers by ep.
+
+### MaxText reference mapping (clone at
+`/home/erfan/.claude/jobs/129ae660/tmp/maxtext/src/maxtext/layers/moe.py`)
+
+| MaxText | easydel port |
+| --- | --- |
+| `is_batch_sharded_by_ep` (~line 1500): training batch IS ep-sharded; `activation_batch` logical axis includes "expert" | `EasyDeLBaseConfig._maybe_extend_batch_axis_for_ep` (base_config.py): `PartitionAxis.batch_axis` -> `("fsdp","dp","ep")`, model-wide via the BATCH semantic axis; `_moe_batch_axis_names` adds ep to the shard_map specs |
+| `get_all_to_all_params(..., is_batch_sharded=True, is_dispatch=...)` (~1139) with `transform_array` strategies | `_communication_utils.get_all_to_all_params` already had `is_batch_sharded=True`; added `is_dispatch` (combine = transposed traffic matrix, matching MaxText line ~1272) |
+| `ra2a_and_route` batch-sharded arm (~1662-1706): all_gather group sizes -> a2a params -> `ragged_all_to_all` -> `local_permute(is_offset=False)` | `_dispatch_ep_batch` nested in `_sparse_call` (_moe_module.py): one all_gather of `group_sizes` feeds both `build_ep_traffic_matrix` and `local_permute` |
+| `unsort_output_and_ra2a` batch-sharded arm (~1884-1922): local unsort + combine a2a (`is_dispatch=False`) | same flow, with `_mask_row_tail` on the gmm output and the unsorted buffer (see tail-masking note) |
+| `get_ragged_buffer_size` worst case `min(ep, E/k)` (~1304-1338) | `ep_batch_receive_buffer_rows`: `ep * local_tokens * min(k, E/ep)` (integer form of the same bound) |
+| `ragged_buffer_factor` capacity truncation (~95-113, ~1009-1033, `_truncate_matrix`) | NOT ported — follow-up. Unbounded worst-case buffers are acceptable at our shapes (17.2 GB at 131k, 2.1 GB at 8k); the factor becomes interesting if 131k HBM pressure bites |
+| `DISPATCH`/`COMBINE` (lines 56-57) | In this MaxText clone those are *einsum names for the dense capacity path*, not remat tags. easydel instead tags the two a2a outputs `checkpoint_name(x, "moe_dispatch")` / `"moe_combine"` following its own `mlp_gate`/`mlp_up`/`mlp_down` convention; names registered in `infra/etils.py` target lists |
+
+### Design decisions
+
+- **Gate** (`BaseMoeModule._ep_carries_batch_active` + shape check in
+  `_sparse_moe_call`): ep>1, non-ring, `fsdp_is_ep_bound=False`,
+  `sp_is_ep_bound=False`, no expert-tensor mode, stage-mesh path (distinct
+  fsdp axis), `E % ep == 0`, and batch divisible by `dp*fsdp*ep` (else
+  warn_once + per-layer fallback to the old path).
+- **Global batch**: activations resolve BATCH -> `("fsdp","dp","ep")` via the
+  config's PartitionAxis (single lever; spectrax
+  `sharding/manager.py:536` is where the default `(fsdp, dp)` lives). The
+  trainer's `step_partition_spec` default stays `P(("dp","fsdp"), "sp")` —
+  set it to `P(("dp","fsdp","ep"), "sp")` in TrainingArguments to also place
+  the input batch; otherwise there is exactly one input-boundary reshard per
+  step. Non-divisible batches degrade safely: spec sanitization drops the
+  trailing ep entry (activations) and the MoE gate falls back.
+- **Chunking composes AFTER dispatch**: the dispatch a2a runs once over all
+  local rows; `moe_chunk_size` then scans `_expert_ffn` over row-chunks of
+  the *received* buffer (`chunk_group_sizes` computes per-chunk group sizes
+  from cumulative offsets). Consequence: chunking bounds gmm live buffers
+  but NOT the a2a receive buffer.
+- **Tail masking (the 8ef1ddb9 lesson, applied by construction)**: every
+  ragged buffer's rows past `sum(group_sizes)` are assumed garbage on TPU in
+  fwd AND bwd. `_expert_ffn` masks its operands (pre-existing);
+  `_dispatch_ep_batch` additionally masks the gmm output before the local
+  unsort and the unsorted buffer before the combine — their transposes zero
+  the unwritten cotangent tails of the a2a transposes before the sort-VJP
+  scatters can route them into real token cotangents. CPU zeroes these tails,
+  so CPU tests cannot catch this class; the masks are forward no-ops.
+- **Remat**: to keep the two collectives out of the backward replay under a
+  NOTHING_SAVEABLE-style policy, use
+  `gradient_checkpointing="save_only_these_names"` with
+  `gradient_checkpointing_targets=["moe_dispatch", "moe_combine", ...]`
+  (add the mlp_* names you also want saved), or
+  `"save_anything_except_these_names"` excluding everything else. No default
+  policy was changed.
+
+### Expected numbers (planner-verified, `test_moe_layout_planner.py` case f)
+
+Mesh (1,1,64,4,4,1), k=8, H=2048, bf16, E=256:
+
+| bucket | batch ways | tokens/core | a2a per dir per layer | worst-case recv buffer |
+| --- | --- | --- | --- | --- |
+| 131k (B=256, S=131072) | 256 (dp*fsdp*ep) | 131,072 | 4.29 GB (combine dir = /tp) | 17.2 GB (warn band, ~x3 live fwd+bwd) |
+| 8k (B=512, S=8192) | 256 | 16,384 | 537 MB | 2.1 GB |
+
+The planner recommends the knob on any ep>1/non-ring/unbound layout where it
+is off, and reports the worst-case receive buffer as the binding allocation.
+
+### Verification state
+
+- CPU (fake 8-device): `tests/layers/moe/test_moe_ep_carries_batch.py` —
+  numpy-emulated 2-shard dispatch == dense reference (offsets/permutes/masks
+  exact), hand-computed a2a params both directions, receive-bound brute
+  force, chunk group-size tiling, fwd+bwd `eval_shape` traces (chunked and
+  unchunked), remat tags in the jaxpr, non-divisible fallback, knob-off and
+  knob-inactive bit-identity. XLA:CPU cannot execute `ragged_all_to_all`, so
+  multi-shard runtime numerics are NOT CPU-provable.
+- TPU (pending, next production pause): `scripts/tpu_probe_ep_carries_batch.py`
+  — ep4+knob vs ep1 loss parity (fwd+bwd finite), plus step timing of
+  REF ep1 / BASE ep4 knob-off / CAND ep4 knob-on for 8k- and 131k-shaped
+  configs (`REPRO_SHAPE=131k`). Unknowns it resolves: ragged a2a throughput
+  on the v5p torus at 537 MB-4.3 GB/dir/layer, and whether the knob's
+  worst-case buffers fit alongside remat at 131k. Hot-expert imbalance under
+  real routing (recv skew toward popular shards) remains unmeasured until a
+  real-checkpoint run.
