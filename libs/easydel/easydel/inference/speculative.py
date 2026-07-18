@@ -328,6 +328,8 @@ class Qwen3_5MTPDrafter:
         self.num_draft_tokens = max(1, int(num_draft_tokens))
         self._jit_mtp: dict[tuple, typing.Callable] = {}
         self._jit_adaptive: dict[tuple, typing.Callable] = {}
+        self._jit_batched: dict[tuple, typing.Callable] = {}
+        self.supports_batched_draft = True
         # Cached static GraphDef for ``self.model`` (structurally invariant for a
         # fixed model). The model State (the actual weight arrays) is threaded
         # through the drafter jits as a runtime INPUT, never closed over — see
@@ -1092,6 +1094,195 @@ class Qwen3_5MTPDrafter:
                 self._mtp_cache_batch_size = int(cur_token.shape[0])
             # else: keep the pool batch size — the batch-1 input is not the cache batch.
         return drafts, valid_count
+
+    def _get_batched_draft_fn(
+        self,
+        k: int,
+        ids0: jax.Array,
+        hidden0: jax.Array,
+        pos0: jax.Array,
+        mtp_cache: TransformerCache | None,
+    ) -> typing.Callable:
+        """Build (or fetch) the jitted fixed-``k`` batched-draft program for a shape.
+
+        Unlike :meth:`_mtp_hidden_and_logits` (which slices ONE pool row for a
+        batch-1 forward and scatters it back), this program runs the whole
+        ``batch`` dimension through the MTP recurrence at once: the input is the
+        FULL request pool ``[N, 1]`` and the MTP cache is the pool cache ``[N, …]``,
+        so the ``k`` chained MTP forwards are ``k`` natural batched decodes rather
+        than ``N * k`` row-sliced batch-1 forwards. Every pool row is advanced by
+        the forward, so persistence is preserved with a pair of ``[N]`` index
+        fixups computed inside the program:
+
+        * ``committed_lens[r]`` rolls each *collected* row's write index back to
+          its committed length before the forwards (per-row EAGLE rollback,
+          vectorized as ``minimum(index, committed_lens)``); non-collected rows
+          keep their index.
+        * After the ``k`` forwards, each collected row keeps the advanced write
+          index (``committed + k``) while every non-collected row's write index
+          (and ``starts``) is RESTORED to its pre-forward value. A non-collected
+          row's forward only writes at ``[index, index + k)`` (never inside its
+          read window ``[0, index)``), so restoring the index leaves its trusted
+          K/V untouched — the batched pass cannot corrupt a row a concurrent
+          per-request draft (or an idle slot) owns.
+
+        Because ``N`` is fixed for a runner, this compiles ONCE regardless of how
+        many rows are live in a given step (idle rows ride along masked); the
+        per-row rollback targets and the collected mask are traced arguments and
+        never part of the compile key.
+
+        Args:
+            k: Number of draft tokens per row (static; unrolls the recurrence).
+            ids0: ``(N, 1)`` seed tokens (shape/dtype only).
+            hidden0: ``(N, 1, H)`` seed hidden (shape/dtype only).
+            pos0: ``(N, 1)`` seed positions (shape/dtype only).
+            mtp_cache: The pool ``TransformerCache`` (shape/dtype signature keys the
+                compile) or ``None`` for the cache-free path.
+
+        Returns:
+            ``fn(state, ids0, hidden0, pos0, cache, committed_lens, collected_mask)
+            -> (drafts[N, k], new_cache)``.
+        """
+        has_cache = mtp_cache is not None
+        key = (
+            int(k),
+            tuple(ids0.shape),
+            str(ids0.dtype),
+            tuple(hidden0.shape),
+            str(hidden0.dtype),
+            tuple(pos0.shape),
+            str(pos0.dtype),
+            None
+            if mtp_cache is None
+            else tuple(
+                None
+                if view is None
+                else (
+                    tuple(view.key.shape),
+                    str(view.key.dtype),
+                    tuple(view.value.shape),
+                    str(view.value.dtype),
+                    tuple(view.indexes.shape),
+                    str(view.indexes.dtype),
+                )
+                for view in mtp_cache.views
+            ),
+        )
+        fn = self._jit_batched.get(key)
+        if fn is not None:
+            return fn
+
+        # Eager warmup on the concrete model (NOT under a trace) materializes any
+        # lazily-created state before it is split/traced (see
+        # ``_model_graph_and_state``).
+        _ = self._mtp_forward_compute(self.model, ids0, hidden0, pos0, mtp_cache, None)
+        graphdef, _ = self._model_graph_and_state()
+
+        def _run(state, ids0, hidden0, pos0, cache0, committed_lens, collected_mask):
+            model = spx.bind(graphdef, state)
+            orig_indexes: list = []
+            orig_starts: list = []
+            if has_cache:
+                committed = committed_lens.astype(jnp.int32)
+                rolled_views = []
+                for v in cache0.views:
+                    if v is None:
+                        rolled_views.append(None)
+                        orig_indexes.append(None)
+                        orig_starts.append(None)
+                        continue
+                    orig_indexes.append(v.indexes)
+                    orig_starts.append(v.starts)
+                    idx = v.indexes.astype(jnp.int32)
+                    rolled = jnp.where(collected_mask, jnp.minimum(idx, committed), idx)
+                    rolled_views.append(v.replace(indexes=rolled.astype(v.indexes.dtype)))
+                cache: TransformerCache | None = TransformerCache(views=rolled_views)
+            else:
+                cache = None
+
+            ct, ch, pos = ids0, hidden0, pos0
+            drafts_cols = []
+            for _ in range(int(k)):
+                h, logits, cache = self._mtp_forward_compute(model, ct, ch, pos, cache, None)
+                last = logits[:, -1, :].astype(jnp.float32)
+                next_tok = jnp.argmax(last, axis=-1).astype(jnp.int32)
+                drafts_cols.append(next_tok)
+                ct = next_tok.reshape(-1, 1)
+                ch = h[:, -1:, :].astype(hidden0.dtype)
+                pos = pos + 1
+            drafts = jnp.stack(drafts_cols, axis=1)
+
+            if has_cache and cache is not None:
+                fixed_views = []
+                for v, orig_idx, orig_st in zip(cache.views, orig_indexes, orig_starts):
+                    if v is None:
+                        fixed_views.append(None)
+                        continue
+                    adv_idx = v.indexes.astype(jnp.int32)
+                    fixed_idx = jnp.where(collected_mask, adv_idx, orig_idx.astype(jnp.int32))
+                    v2 = v.replace(indexes=fixed_idx.astype(v.indexes.dtype))
+                    if orig_st is not None:
+                        adv_st = v.starts
+                        mask_st = collected_mask.reshape((-1,) + (1,) * (adv_st.ndim - 1))
+                        v2 = v2.replace(starts=jnp.where(mask_st, adv_st, orig_st))
+                    fixed_views.append(v2)
+                cache = TransformerCache(views=fixed_views)
+            return drafts, cache
+
+        fn = jax.jit(_run)
+        self._jit_batched[key] = fn
+        return fn
+
+    def draft_batched(
+        self,
+        *,
+        seed_tokens: jax.Array,
+        seed_hidden: jax.Array,
+        seed_positions: jax.Array,
+        committed_lens: jax.Array,
+        collected_mask: jax.Array,
+        num_speculative_tokens: int,
+    ) -> Int[Array, "pool k"]:
+        """Draft ``k`` greedy tokens for every pool row in ONE batched pass.
+
+        This is the batched-serving counterpart of chaining :meth:`draft`
+        per-request: all spec-active requests in a decode step are drafted
+        together over the pooled MTP cache, so a running batch of ``N`` requests
+        costs ``k`` batched MTP forwards instead of ``N * k`` batch-1 forwards.
+
+        Args:
+            seed_tokens: ``(N,)`` seed token id per pool row (dummy for idle /
+                non-collected rows; those are masked out by ``collected_mask``).
+            seed_hidden: ``(N, 1, H)`` (or ``(N, H)``) target hidden per pool row.
+            seed_positions: ``(N,)`` absolute seed position per pool row.
+            committed_lens: ``(N,)`` per-row EAGLE rollback target (the committed
+                MTP context length); ignored for non-collected rows. Use ``0`` for
+                the non-persistent per-window-clear behavior.
+            collected_mask: ``(N,)`` boolean; ``True`` for rows actually drafted
+                this step. Non-collected rows ride the batched forward but have
+                their cache write index restored (never corrupted).
+            num_speculative_tokens: Number of draft tokens ``k`` per row.
+
+        Returns:
+            ``(N, k)`` device array of drafted token ids. Row ``r`` is valid only
+            when ``collected_mask[r]`` is ``True``.
+        """
+        ids0 = jnp.asarray(seed_tokens, dtype=jnp.int32).reshape(-1, 1)
+        pos0 = jnp.asarray(seed_positions, dtype=jnp.int32).reshape(-1, 1)
+        hidden0 = jnp.asarray(seed_hidden)
+        if hidden0.ndim == 2:
+            hidden0 = hidden0[:, None, :]
+        n = int(ids0.shape[0])
+        self.ensure_batch_size(n)
+        mtp_cache = self._mtp_cache if self.uses_mtp_cache else None
+        committed = jnp.asarray(committed_lens, dtype=jnp.int32).reshape(-1)
+        mask = jnp.asarray(collected_mask).astype(bool).reshape(-1)
+        fn = self._get_batched_draft_fn(int(num_speculative_tokens), ids0, hidden0, pos0, mtp_cache)
+        _, state = self._model_graph_and_state()
+        drafts, new_cache = fn(state, ids0, hidden0, pos0, mtp_cache, committed, mask)
+        if new_cache is not None:
+            self._mtp_cache = new_cache
+        return drafts
 
 
 class Gemma4AssistantDrafter:
