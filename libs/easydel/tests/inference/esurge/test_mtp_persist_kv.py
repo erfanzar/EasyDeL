@@ -41,7 +41,11 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
 # The runner-level greedy-exactness check needs the exact sequential-replay
 # recurrent path (the tiny model has linear_attention layers); the default fast
-# path is coherent but not bit-identical on recurrent models.
+# path is coherent but not bit-identical to the no-spec baseline on recurrent
+# models. ``_run_generation`` forces EASURGE_SPEC_RECURRENT_REPLAY=1 for its own
+# runs (overriding any ambient fast-path setting) rather than relying on this
+# process default, so the greedy==baseline assertion can't be made flaky by the
+# caller's environment. This ``setdefault`` only sets a default for the rest.
 os.environ.setdefault("EASURGE_SPEC_RECURRENT_REPLAY", "1")
 
 import jax
@@ -213,7 +217,12 @@ def test_multi_window_persist_runs_and_tracks_committed():
 def _run_generation(model, *, drafter, persist_kv: bool, max_new_tokens: int = 8) -> list[int]:
     """Drive a greedy eSurge generation to completion; return the emitted tokens."""
     prev = os.environ.get("EASYDEL_MTP_PERSIST_KV")
+    prev_replay = os.environ.get("EASURGE_SPEC_RECURRENT_REPLAY")
     os.environ["EASYDEL_MTP_PERSIST_KV"] = "1" if persist_kv else "0"
+    # Exact sequential replay is required for greedy spec output to be bit-identical
+    # to the no-spec baseline on this recurrent model; force it here so an ambient
+    # EASURGE_SPEC_RECURRENT_REPLAY=0 (fast path) can't make this assertion flaky.
+    os.environ["EASURGE_SPEC_RECURRENT_REPLAY"] = "1"
     try:
         runner = eSurgeRunner(
             model=model,
@@ -265,25 +274,63 @@ def _run_generation(model, *, drafter, persist_kv: bool, max_new_tokens: int = 8
             os.environ.pop("EASYDEL_MTP_PERSIST_KV", None)
         else:
             os.environ["EASYDEL_MTP_PERSIST_KV"] = prev
+        if prev_replay is None:
+            os.environ.pop("EASURGE_SPEC_RECURRENT_REPLAY", None)
+        else:
+            os.environ["EASURGE_SPEC_RECURRENT_REPLAY"] = prev_replay
 
 
 def test_runner_greedy_output_unchanged_with_persist():
-    """Persist-with-rollback must not change greedy output (verification stays exact)."""
-    model = make_tiny_model(mtp_layers=1)
-    assert model.has_mtp()
+    """Persist-with-rollback: a single request drafts in-loop, so batched ON == OFF.
 
-    baseline = _run_generation(model, drafter=None, persist_kv=False)
-    gc.collect()
-    persist = _run_generation(
-        model,
-        drafter=Qwen3_5MTPDrafter(model, num_draft_tokens=1, persist_kv=True),
-        persist_kv=True,
-    )
-    assert persist, "persistent speculative run emitted no tokens"
-    assert min(persist) >= 0 and max(persist) < _VOCAB
-    assert persist == baseline, (
-        f"greedy output changed under persistent speculative decoding\n"
-        f"  baseline={baseline}\n  persist ={persist}"
+    The batched pool draft would run the greedy MTP forward as ONE program moved
+    past the window loop — a different XLA program from the per-request row-targeted
+    forward, so on this tiny recurrent model's spec-verify near-tie (a ~1 ULP flip,
+    the same floating-point sensitivity that makes greedy output change under any
+    batched-decode engine) it can land on the other side. The runner therefore only
+    engages the pooled forward when >= 2 spec-active requests are verified together
+    (``eSurgeRunner`` ``step_allows_batch``); a single request drafts in-loop through
+    the EXACT per-request code, so batched-ON output is bit-identical to batched-OFF
+    by construction.
+
+    This asserts that gate deterministically: driving one request with the batched
+    path ENABLED, the pooled ``draft_next_batched`` is never called (each greedy MTP
+    draft runs in-loop). Multi-request batched drafting is compared to the
+    per-request path directly and deterministically by the isolated
+    ``draft_next_batched`` parity tests (``test_mtp_batched_draft``).
+    """
+    from easydel.inference.esurge.runners.spec import strategy as _strategy
+
+    batched_seed_counts: list[int] = []
+    orig = _strategy.DrafterSpeculation.draft_next_batched
+
+    def _spy(self, seeds):
+        batched_seed_counts.append(len(seeds))
+        return orig(self, seeds)
+
+    _strategy.DrafterSpeculation.draft_next_batched = _spy
+    prev = os.environ.get("EASURGE_DISABLE_BATCHED_DRAFT")
+    os.environ["EASURGE_DISABLE_BATCHED_DRAFT"] = "0"  # batched path ENABLED
+    try:
+        model = make_tiny_model(mtp_layers=1)
+        assert model.has_mtp()
+        out = _run_generation(
+            model,
+            drafter=Qwen3_5MTPDrafter(model, num_draft_tokens=1, persist_kv=True),
+            persist_kv=True,
+        )
+    finally:
+        _strategy.DrafterSpeculation.draft_next_batched = orig
+        if prev is None:
+            os.environ.pop("EASURGE_DISABLE_BATCHED_DRAFT", None)
+        else:
+            os.environ["EASURGE_DISABLE_BATCHED_DRAFT"] = prev
+
+    assert out, "persistent speculative run emitted no tokens"
+    assert min(out) >= 0 and max(out) < _VOCAB
+    assert batched_seed_counts == [], (
+        "a single request must draft in-loop through the per-request path, not the "
+        f"pooled batched draft (batched engaged with row counts {batched_seed_counts})"
     )
 
 

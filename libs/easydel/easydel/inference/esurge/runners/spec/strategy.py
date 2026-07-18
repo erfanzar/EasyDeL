@@ -1332,6 +1332,147 @@ class DrafterSpeculation:
             self.draft_full_log_probs_by_req[str(req_id)] = jnp.stack(draft_fulls, axis=0)
         return drafted
 
+    def can_batch_draft(self, req_state: CachedRequestState | None) -> bool:
+        """Whether ``req_state`` can be drafted through the batched pool path.
+
+        The batched drafter (:meth:`draft_next_batched`) runs the greedy inline-MTP
+        recurrence for every spec-active request in a decode step together. A
+        request is eligible only when the attached drafter exposes
+        :meth:`~easydel.inference.speculative.Qwen3_5MTPDrafter.draft_batched`, the
+        request is spec-eligible, and it is greedy (temperature ``<= 0``). Sampled
+        requests, non-MTP drafters, and the prefix-draft first window fall back to
+        the per-request :meth:`draft_next` path.
+
+        Args:
+            req_state: The cached request state to inspect.
+
+        Returns:
+            ``True`` when the request should be collected for the post-loop batched
+            draft; ``False`` when it must use the per-request fallback.
+        """
+        if self.drafter is None or self.num_speculative_tokens <= 0:
+            return False
+        # Escape hatch to force the legacy per-request draft path (benchmark A/B and
+        # debugging); the batched pool path is the default.
+        if os.environ.get("EASURGE_DISABLE_BATCHED_DRAFT", "0") == "1":
+            return False
+        if not bool(getattr(self.drafter, "supports_batched_draft", False)):
+            return False
+        if not callable(getattr(self.drafter, "draft_batched", None)):
+            return False
+        if bool(getattr(self.drafter, "requires_target_kv_cache", False)):
+            # Cross-model (assistant) drafters need per-request target K/V payloads;
+            # the pooled batched path only handles the inline-MTP cache.
+            return False
+        if not self.is_spec_request(req_state):
+            return False
+        return self.is_greedy_request(req_state)
+
+    def draft_next_batched(
+        self,
+        seeds: list[tuple[str, int, int, int, jax.Array]],
+    ) -> dict[str, list[int]]:
+        """Draft ``k`` tokens for a batch of requests in ONE pooled MTP pass.
+
+        Replaces per-request :meth:`draft_next` calls for the greedy inline-MTP
+        path: all requests collected during a decode step's window loop are drafted
+        together over the drafter's pooled cache. The seeds are scattered into full
+        request-pool ``(N,)`` arrays (idle rows masked out and left untouched by the
+        forward), the per-row EAGLE rollback target is computed exactly as
+        :meth:`draft_next` does (fresh request / reused slot re-base vs. same-request
+        commit), the drafter runs ``k`` batched forwards, and the ``(N, k)`` result
+        is read back once and mapped by pool row to each request.
+
+        Args:
+            seeds: One ``(req_id, row, seed_token, seed_position, seed_hidden)`` per
+                collected request, where ``row`` is the request's stable KV-pool
+                slot (the runner ``req_idx``) and ``seed_hidden`` is a ``(H,)`` (or
+                ``(1, 1, H)``) device array.
+
+        Returns:
+            ``{req_id: [drafted token ids]}`` for every input seed (an empty list
+            for a request whose draft was suppressed by the reject-backoff gate).
+        """
+        out: dict[str, list[int]] = {str(rid): [] for (rid, *_rest) in seeds}
+        if (
+            not seeds
+            or self.drafter is None
+            or self.num_speculative_tokens <= 0
+            or not callable(getattr(self.drafter, "draft_batched", None))
+        ):
+            return out
+
+        n = max(1, int(getattr(self._runner, "max_num_reqs", 1)))
+        persist_on = self._mtp_persist_enabled()
+        ensure = getattr(self.drafter, "ensure_batch_size", None)
+        if callable(ensure):
+            ensure(n)
+
+        seed_tokens = np.zeros((n,), dtype=np.int32)
+        seed_positions = np.zeros((n,), dtype=np.int32)
+        committed_lens = np.zeros((n,), dtype=np.int32)
+        collected_mask = np.zeros((n,), dtype=bool)
+        active_rows: list[int] = []
+        active_hidden: list[jax.Array] = []
+        active_reqs: list[tuple[str, int]] = []
+
+        for rid, row, seed_token, seed_position, seed_hidden in seeds:
+            rid = str(rid)
+            row = int(row)
+            if not (0 <= row < n):
+                continue
+            backoff = int(self._backoff_by_req.get(rid, 0))
+            if backoff > 0:
+                # Reject-backoff: skip drafting this request this step (mirrors the
+                # early-return branch of ``draft_next``).
+                self._backoff_by_req[rid] = backoff - 1
+                continue
+            if persist_on:
+                if self._mtp_persist_req_by_row.get(row) != rid:
+                    # Fresh request or a slot reused by a different request: re-base
+                    # this row's committed origin and drop its stale K/V (roll to 0).
+                    self._mtp_persist_req_by_row[row] = rid
+                    self._mtp_persist_base_pos_by_row[row] = int(seed_position)
+                    committed = 0
+                else:
+                    base = int(self._mtp_persist_base_pos_by_row.get(row, int(seed_position)))
+                    committed = max(0, int(seed_position) - base)
+            else:
+                committed = 0
+            seed_tokens[row] = int(seed_token)
+            seed_positions[row] = int(seed_position)
+            committed_lens[row] = int(committed)
+            collected_mask[row] = True
+            active_rows.append(row)
+            active_hidden.append(jnp.asarray(seed_hidden).reshape(-1))
+            active_reqs.append((rid, row))
+
+        if not active_rows:
+            return out
+
+        hidden_dim = int(active_hidden[0].shape[-1])
+        hidden_full = jnp.zeros((n, 1, hidden_dim), dtype=active_hidden[0].dtype)
+        rows_arr = jnp.asarray(active_rows, dtype=jnp.int32)
+        stacked_hidden = jnp.stack(active_hidden, axis=0)[:, None, :]
+        hidden_full = hidden_full.at[rows_arr].set(stacked_hidden)
+
+        drafts_dev = self.drafter.draft_batched(
+            seed_tokens=jnp.asarray(seed_tokens),
+            seed_hidden=hidden_full,
+            seed_positions=jnp.asarray(seed_positions),
+            committed_lens=jnp.asarray(committed_lens),
+            collected_mask=jnp.asarray(collected_mask),
+            num_speculative_tokens=int(self.num_speculative_tokens),
+        )
+        drafts_host = np.asarray(jax.device_get(drafts_dev))
+        total = 0
+        for rid, row in active_reqs:
+            drafted = [int(t) for t in drafts_host[row, :]]
+            out[rid] = drafted
+            total += len(drafted)
+        self.num_drafts_generated += total
+        return out
+
     def record_acceptance(self, req_id: str, accepted: int, num_drafts: int) -> None:
         """Update the adaptive drafter stop-loss after a verify window.
 

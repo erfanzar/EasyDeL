@@ -2330,6 +2330,29 @@ class eSurgeRunner:
         self._spec_suffix_time_acc = 0.0
         self._spec_replay_time_acc = 0.0
         total_spec_commit_time = 0.0
+        # Greedy inline-MTP requests collected during the window loop(s) for ONE
+        # post-loop batched draft pass, instead of ``N`` per-request drafts. Each
+        # entry: (req_id, req_idx, seed_token, seed_position, seed_hidden, req_state,
+        # known_len, spec_idx). See ``DrafterSpeculation.draft_next_batched``.
+        pending_batched_drafts: list[tuple] = []
+        # Only engage the batched pool draft when >= 2 spec-active requests are being
+        # verified this step. Batching a single request wins no throughput (a pooled
+        # [1, ...] forward is no cheaper than one row-targeted forward) but moves the
+        # draft forward past the window loop, reordering it relative to the recurrent
+        # replay/commit; on a near-tie greedy argmax that XLA:CPU execution-order
+        # change can flip the verify's next token. Below the threshold each request
+        # drafts in-loop through the exact per-request path, so single-request serving
+        # stays bit-identical to the non-batched drafter. (For >= 2 the pooled forward
+        # is used; its batched matmul differs from N separate matmuls by ~1 ULP, the
+        # same near-tie sensitivity any batched-decode inference engine has.)
+        step_batch_candidate_count = 0
+        if self.drafter is not None and scheduler_output.scheduled_spec_decode_tokens:
+            for _spec_rid, _spec_toks in scheduler_output.scheduled_spec_decode_tokens.items():
+                if _spec_toks and all(int(_t) >= 0 for _t in _spec_toks) and self.spec.can_batch_draft(
+                    self.requests.get(_spec_rid)
+                ):
+                    step_batch_candidate_count += 1
+        step_allows_batch = step_batch_candidate_count >= 2
         token_buckets_used: set[int] = set()
         req_buckets_used: set[int] = set()
         request_seq_lens: list[tuple[int, int, CachedRequestState, int]] = []
@@ -3030,29 +3053,48 @@ class eSurgeRunner:
                             accepted=int(accepted),
                             num_drafts=len(scheduled_spec_tokens),
                         )
-                        draft_timer_start = time.time()
-                        next_drafts = self.spec.draft_next(
-                            req_id=rid,
-                            seed_token=int(emitted[-1]),
-                            seed_position=max(0, int(known_len) - 2),
-                            seed_hidden=seed_hidden,
-                            req_state=req_state,
-                            # ``req_idx`` is the request's stable sequence-buffer / KV-pool
-                            # slot (window-local ``row_pos`` aliases across windows); use it
-                            # as the persistent per-request inline-MTP cache row.
-                            row_pos=int(req_idx),
-                        )
-                        total_spec_draft_time += time.time() - draft_timer_start
-                        if next_drafts:
-                            draft_start = known_len
-                            draft_end = min(draft_start + len(next_drafts), self.max_model_len)
-                            self.sequence_buffer.token_ids[req_idx, draft_start:draft_end] = np.asarray(
-                                next_drafts[: draft_end - draft_start],
-                                dtype=np.int32,
+                        if self.spec.can_batch_draft(req_state) and step_allows_batch and spec_token_ids_all is not None:
+                            # Defer to the post-loop batched draft: collect the seed,
+                            # reserve this request's positional slot in the output
+                            # list, and write the drafts once for the whole batch.
+                            spec_idx = len(spec_token_ids_all)
+                            spec_token_ids_all.append([])
+                            pending_batched_drafts.append(
+                                (
+                                    rid,
+                                    int(req_idx),
+                                    int(emitted[-1]),
+                                    max(0, int(known_len) - 2),
+                                    seed_hidden,
+                                    req_state,
+                                    int(known_len),
+                                    spec_idx,
+                                )
                             )
-                            self.sequence_buffer.num_tokens[req_idx] = draft_end
-                        if spec_token_ids_all is not None:
-                            spec_token_ids_all.append(next_drafts)
+                        else:
+                            draft_timer_start = time.time()
+                            next_drafts = self.spec.draft_next(
+                                req_id=rid,
+                                seed_token=int(emitted[-1]),
+                                seed_position=max(0, int(known_len) - 2),
+                                seed_hidden=seed_hidden,
+                                req_state=req_state,
+                                # ``req_idx`` is the request's stable sequence-buffer / KV-pool
+                                # slot (window-local ``row_pos`` aliases across windows); use it
+                                # as the persistent per-request inline-MTP cache row.
+                                row_pos=int(req_idx),
+                            )
+                            total_spec_draft_time += time.time() - draft_timer_start
+                            if next_drafts:
+                                draft_start = known_len
+                                draft_end = min(draft_start + len(next_drafts), self.max_model_len)
+                                self.sequence_buffer.token_ids[req_idx, draft_start:draft_end] = np.asarray(
+                                    next_drafts[: draft_end - draft_start],
+                                    dtype=np.int32,
+                                )
+                                self.sequence_buffer.num_tokens[req_idx] = draft_end
+                            if spec_token_ids_all is not None:
+                                spec_token_ids_all.append(next_drafts)
                         if accepted_spec_tokens_by_req is not None:
                             accepted_spec_tokens_by_req[rid] = int(accepted)
                         if hidden_states_by_req is not None:
@@ -3270,27 +3312,44 @@ class eSurgeRunner:
                         accepted=int(accepted),
                         num_drafts=len(draft_tokens_for_verify),
                     )
-                    draft_timer_start = time.time()
-                    next_drafts = self.spec.draft_next(
-                        req_id=rid,
-                        seed_token=int(emitted[-1]),
-                        seed_position=max(0, int(known_len) - 2),
-                        seed_hidden=seed_hidden,
-                        req_state=req_state,
-                        # Stable KV-pool slot (see the sequential-greedy call above).
-                        row_pos=int(req_idx),
-                    )
-                    total_spec_draft_time += time.time() - draft_timer_start
-                    if next_drafts:
-                        draft_start = known_len
-                        draft_end = min(draft_start + len(next_drafts), self.max_model_len)
-                        self.sequence_buffer.token_ids[req_idx, draft_start:draft_end] = np.asarray(
-                            next_drafts[: draft_end - draft_start],
-                            dtype=np.int32,
+                    if self.spec.can_batch_draft(req_state) and step_allows_batch and spec_token_ids_all is not None:
+                        # Defer to the post-loop batched draft (see callsite above).
+                        spec_idx = len(spec_token_ids_all)
+                        spec_token_ids_all.append([])
+                        pending_batched_drafts.append(
+                            (
+                                rid,
+                                int(req_idx),
+                                int(emitted[-1]),
+                                max(0, int(known_len) - 2),
+                                seed_hidden,
+                                req_state,
+                                int(known_len),
+                                spec_idx,
+                            )
                         )
-                        self.sequence_buffer.num_tokens[req_idx] = draft_end
-                    if spec_token_ids_all is not None:
-                        spec_token_ids_all.append(next_drafts)
+                    else:
+                        draft_timer_start = time.time()
+                        next_drafts = self.spec.draft_next(
+                            req_id=rid,
+                            seed_token=int(emitted[-1]),
+                            seed_position=max(0, int(known_len) - 2),
+                            seed_hidden=seed_hidden,
+                            req_state=req_state,
+                            # Stable KV-pool slot (see the sequential-greedy call above).
+                            row_pos=int(req_idx),
+                        )
+                        total_spec_draft_time += time.time() - draft_timer_start
+                        if next_drafts:
+                            draft_start = known_len
+                            draft_end = min(draft_start + len(next_drafts), self.max_model_len)
+                            self.sequence_buffer.token_ids[req_idx, draft_start:draft_end] = np.asarray(
+                                next_drafts[: draft_end - draft_start],
+                                dtype=np.int32,
+                            )
+                            self.sequence_buffer.num_tokens[req_idx] = draft_end
+                        if spec_token_ids_all is not None:
+                            spec_token_ids_all.append(next_drafts)
                     if accepted_spec_tokens_by_req is not None:
                         accepted_spec_tokens_by_req[rid] = int(accepted)
                     if hidden_states_by_req is not None:
@@ -3444,6 +3503,41 @@ class eSurgeRunner:
             total_post_proc_time += time.time() - up_wtime
 
             start_index = next_start_index
+
+        # Draft every collected greedy inline-MTP request in ONE batched pass over
+        # the pooled MTP cache (``k`` batched forwards for the whole running batch,
+        # not ``N * k`` batch-1 forwards). Only reached with >= 2 collected requests
+        # (see ``step_allows_batch``); single-request steps drafted in-loop through the
+        # exact per-request path above and never populate this list. Runs after the
+        # window loop so all per-request fallback drafts (prefix / first window) have
+        # already advanced their pool rows; the batched pass leaves those rows
+        # untouched. The drafts are scattered back into each request's reserved output
+        # slot and sequence buffer exactly as the per-request path would have written
+        # them.
+        if pending_batched_drafts and spec_token_ids_all is not None:
+            draft_timer_start = time.time()
+            batched_drafts = self.spec.draft_next_batched(
+                [
+                    (rid, req_idx, seed_token, seed_position, seed_hidden)
+                    for (rid, req_idx, seed_token, seed_position, seed_hidden, _rs, _known_len, _spec_idx) in (
+                        pending_batched_drafts
+                    )
+                ]
+            )
+            for rid, req_idx, _seed_token, _seed_position, _seed_hidden, _req_state, known_len, spec_idx in (
+                pending_batched_drafts
+            ):
+                next_drafts = batched_drafts.get(rid, [])
+                if next_drafts:
+                    draft_start = known_len
+                    draft_end = min(draft_start + len(next_drafts), self.max_model_len)
+                    self.sequence_buffer.token_ids[req_idx, draft_start:draft_end] = np.asarray(
+                        next_drafts[: draft_end - draft_start],
+                        dtype=np.int32,
+                    )
+                    self.sequence_buffer.num_tokens[req_idx] = draft_end
+                spec_token_ids_all[spec_idx] = next_drafts
+            total_spec_draft_time += time.time() - draft_timer_start
 
         req_id_to_row_index = {
             rid: int(req_idx)
