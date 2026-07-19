@@ -384,3 +384,22 @@ is off, and reports the worst-case receive buffer as the binding allocation.
   worst-case buffers fit alongside remat at 131k. Hot-expert imbalance under
   real routing (recv skew toward popular shards) remains unmeasured until a
   real-checkpoint run.
+
+### Teacher ring-attention verify (2026-07-19, launch_teacher_ring_verify.py)
+
+Config under test: mesh (1,1,64,4,2,2), SEQUENCE_AXIS_NAME="sp",
+moe_ep_carries_batch=False, chunked MoE, attn=RING. Driver logs:
+/tmp/vp_run1_corehalt.log (run1), /tmp/vp2.log (retry).
+
+- ring@4096: overall_H=0.732, top1=63.7% (ppl 2.1) vs flash/vanilla ref
+  0.744 — MATCH on all 256 processes. Ring numerics validated at 4k under
+  the exact production candidate config.
+- ring@131072 run1: E0200 RuntimeUnexpectedCoreHalt (assertion args all
+  zero) reported by host 10.164.15.242; rest of pod died on the collapsed
+  collective (exitcode 1). Not a numeric result — TPU runtime fatal.
+  Undiagnosed: hardware flake vs reproducible ring@131k compiler/kernel bug.
+  15.242 has no known-bad history in ops memory.
+- Retry probe (running): L=131072 only, same config, one variable (rerun).
+  Halt again => reproducible bug, do NOT switch production to ring at 131k;
+  pass => run1 was an infra flake and ring is validated end-to-end.
+- Production launch.py switch is ON HOLD pending this retry.
