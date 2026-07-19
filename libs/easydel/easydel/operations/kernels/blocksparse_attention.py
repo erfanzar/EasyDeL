@@ -61,6 +61,7 @@ References:
 
 from __future__ import annotations
 
+import math
 import typing as tp
 
 import jax
@@ -92,6 +93,27 @@ if tp.TYPE_CHECKING:
     pass
 
 logger = get_logger("EasyDeL-BlockSparseAttn")
+
+
+def _axis_entry_shard_factor(mesh: jax.sharding.Mesh | None, axis_entry: tp.Any) -> int:
+    """Return the number of shards a PartitionSpec axis entry induces on ``mesh``.
+
+    Args:
+        mesh: The mesh the spec is resolved against, or ``None``.
+        axis_entry: A single PartitionSpec entry — ``None``, a mesh-axis name,
+            or a tuple of mesh-axis names.
+
+    Returns:
+        The product of the mesh sizes of the named axes (1 when unsharded or
+        when no mesh is available).
+    """
+    if mesh is None or axis_entry is None:
+        return 1
+    axis_names = axis_entry if isinstance(axis_entry, tuple) else (axis_entry,)
+    factor = 1
+    for name in axis_names:
+        factor *= int(mesh.shape[name])
+    return factor
 
 
 @OperationRegistry.register
@@ -360,6 +382,34 @@ class BlockSparseAttn(OperationImpl):
             tensor=query_transposed,
             preserved_indices=[0, 1],
         )
+
+        # GQA + shard_map consistency: the kernel regroups query heads onto KV
+        # heads *inside each shard* as ``local_h // (local_q_heads / local_kv_heads)``.
+        # That local regrouping only matches the global blocked GQA mapping when
+        # the KV-head axis is sharded by exactly the same factor as the
+        # query-head axis. When the KV head count is not divisible by the
+        # query-head shard factor, the spec sanitizer silently *replicates* the
+        # KV heads while the query heads stay sharded, and every shard then
+        # attends half (or more) of its query heads to the wrong KV head.
+        # Repair: block-repeat the KV heads by the minimal factor that makes
+        # the count divisible by the shard factor (lcm expansion). Blocked
+        # ``jnp.repeat`` keeps the global q->kv mapping intact.
+        num_kv_heads: int = key_transposed.shape[1]
+        head_shard_factor = 1
+        if query_sharding is not None and len(query_sharding) > 1:
+            head_shard_factor = _axis_entry_shard_factor(self.metadata.mesh, query_sharding[1])
+        if head_shard_factor > 1 and num_kv_heads > 1 and num_kv_heads % head_shard_factor != 0:
+            kv_head_reps = head_shard_factor // math.gcd(num_kv_heads, head_shard_factor)
+            logger.debug(
+                "Expanding KV heads %d -> %d so the KV-head axis shards evenly with the "
+                "query-head axis (%d-way); required for correct in-shard GQA regrouping.",
+                num_kv_heads,
+                num_kv_heads * kv_head_reps,
+                head_shard_factor,
+            )
+            key_transposed = jnp.repeat(key_transposed, kv_head_reps, axis=1)
+            value_transposed = jnp.repeat(value_transposed, kv_head_reps, axis=1)
+
         key_sharding = self.create_stable_sharding(
             shardings.key,
             dep=key_transposed,
