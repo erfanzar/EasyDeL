@@ -119,6 +119,35 @@ logger = get_logger("eSurge")
 MLA_RAGGED_ATTN_MECHANISM = "multi_latent_ragged_page_attention_v2"
 
 
+class _BatchedVerifyRow(typing.NamedTuple):
+    """Precomputed batched greedy verify result for one spec request.
+
+    Populated by the per-step batched emission pre-pass (see
+    ``_execute_model_impl``): the LM-head projection and greedy argmax for the
+    whole running batch's verify rows run ONCE, and each request's slice is read
+    back here so the per-request emission loop consumes host integers instead of
+    issuing its own device->host argmax sync.
+
+    Attributes:
+        verify_meta: The request's :class:`_SpecVerifyMetadata`.
+        offset: Start row of this request inside the batched gather/argmax.
+        count: Number of verify rows for this request (``num_drafts + 1``).
+        argmaxes: Host greedy argmax token ids for this request's ``count`` rows.
+        gathered_hidden: The shared batched ``[pad_rows, H]`` gathered hidden
+            device array; ``gathered_hidden[offset + accepted]`` is the seed
+            hidden for drafting, bit-identical to the per-request gather.
+        batched_logits: The shared batched ``[pad_rows, vocab]`` logits device
+            array; sliced only when verify tracing is enabled.
+    """
+
+    verify_meta: typing.Any
+    offset: int
+    count: int
+    argmaxes: list[int]
+    gathered_hidden: jax.Array
+    batched_logits: jax.Array
+
+
 class _AsyncExecutionHandle:
     """Deferred host-materialized model output for overlap execution.
 
@@ -2326,6 +2355,9 @@ class eSurgeRunner:
         total_async_copy_enqueue_time = 0.0
         total_token_materialize_time = 0.0
         total_spec_project_time = 0.0
+        total_spec_argmax_sync_time = 0.0
+        total_spec_meta_time = 0.0
+        total_spec_emit_write_time = 0.0
         total_spec_draft_time = 0.0
         self._spec_suffix_time_acc = 0.0
         self._spec_replay_time_acc = 0.0
@@ -2981,6 +3013,92 @@ class eSurgeRunner:
                 rng_after_verify=rng_after_verify,
             )
 
+            # --- Batched greedy verify pre-pass -------------------------------
+            # Project + argmax the verify rows of EVERY greedy spec request in
+            # this window together: ONE LM-head matmul over the pooled
+            # ``[sum(k+1), H]`` hidden rows and ONE device->host argmax transfer,
+            # instead of N per-request projections and N blocking int() syncs.
+            # Each request's slice is stashed in ``batched_verify_by_row`` and
+            # consumed by the emission loop below, which then does only host
+            # bookkeeping. Gated exactly like the batched drafter: only greedy,
+            # spec-eligible, full-hidden-available rows, and only when >= 2 are
+            # verified together (a single request stays bit-identical to the
+            # per-request path). ``EASURGE_DISABLE_BATCHED_EMIT=1`` forces the
+            # legacy per-request project/argmax (A/B + isolated parity proof).
+            batched_verify_by_row: dict[int, _BatchedVerifyRow] = {}
+            verify_meta_by_row: dict[int, typing.Any] = {}
+            batched_emit_enabled = (
+                spec_decode_active_window
+                and self.drafter is not None
+                and hidden_states_for_spec is not None
+                and os.environ.get("EASURGE_DISABLE_BATCHED_EMIT", "0") != "1"
+            )
+            if batched_emit_enabled:
+                _flat_indices: list[int] = []
+                _pending_bv: list[tuple[int, int, int, typing.Any]] = []
+                for _rp, _rid, _rs, _ridx, _sl, _iv in window_entries:
+                    if not _iv or _rs is None or _ridx is None:
+                        continue
+                    _sched_n = int(scheduled_list[_rp])
+                    _spec_toks = scheduler_output.scheduled_spec_decode_tokens.get(_rid, [])
+                    if not (
+                        bool(_spec_toks)
+                        and all(int(_t) >= 0 for _t in _spec_toks)
+                        and self.spec.is_spec_request(_rs)
+                    ):
+                        continue
+                    if int(_rp) in sequential_greedy_spec_rows and len(_spec_toks) == 1:
+                        continue
+                    _real_count = _sched_n - len(_spec_toks)
+                    if _real_count <= 0:
+                        continue
+                    if not self.spec.is_greedy_request(_rs):
+                        continue
+                    _meta_start = time.time()
+                    _meta = self.spec.build_verify_metadata(
+                        request_id=_rid,
+                        row_pos=int(_rp),
+                        req_idx=int(_ridx),
+                        start_pos=int(num_computed_tokens_window_cpu[_rp]),
+                        real_count=int(_real_count),
+                        scheduled_draft_tokens=[int(_t) for _t in _spec_toks],
+                        token_ids_window_cpu=token_ids_window_cpu,
+                        token_offset=int(window_token_offsets[int(_rp)]),
+                    )
+                    total_spec_meta_time += time.time() - _meta_start
+                    if hidden_np_len < int(_meta.bonus_local_index) + 1:
+                        continue
+                    _idxs = [*_meta.target_local_indices, int(_meta.bonus_local_index)]
+                    _pending_bv.append((int(_rp), len(_flat_indices), len(_idxs), _meta))
+                    _flat_indices.extend(int(_x) for _x in _idxs)
+                if len(_pending_bv) >= 2:
+                    _total_rows = len(_flat_indices)
+                    # Pad to a stable ``padded_num_reqs * (k+1)`` bucket so the
+                    # on-demand LM-head executable count stays bounded (<= one
+                    # per request bucket) instead of one per distinct row total.
+                    _pad_target = max(_total_rows, int(padded_num_reqs) * (int(self.num_speculative_tokens) + 1))
+                    if _total_rows < _pad_target:
+                        _flat_indices.extend([_flat_indices[0]] * (_pad_target - _total_rows))
+                    _idx_arr = np.asarray(_flat_indices, dtype=np.int32)
+                    _project_start = time.time()
+                    _gathered_hidden = hidden_states_for_spec[_idx_arr]
+                    _batched_logits = self.spec.project_hidden_rows(_gathered_hidden)
+                    total_spec_project_time += time.time() - _project_start
+                    _argmax_start = time.time()
+                    _batched_argmax = np.asarray(jnp.argmax(_batched_logits, axis=-1)).astype(np.int64)
+                    total_spec_argmax_sync_time += time.time() - _argmax_start
+                    for _rp, _off, _cnt, _meta in _pending_bv:
+                        verify_meta_by_row[_rp] = _meta
+                        batched_verify_by_row[_rp] = _BatchedVerifyRow(
+                            verify_meta=_meta,
+                            offset=int(_off),
+                            count=int(_cnt),
+                            argmaxes=[int(_x) for _x in _batched_argmax[_off : _off + _cnt].tolist()],
+                            gathered_hidden=_gathered_hidden,
+                            batched_logits=_batched_logits,
+                        )
+            # ------------------------------------------------------------------
+
             for row_pos, rid, req_state, req_idx, seq_len, is_valid in window_entries:
                 if not is_valid:
                     sampled_token_ids_all.append([])
@@ -3121,16 +3239,20 @@ class eSurgeRunner:
                         tid = int(emitted[-1])
                         continue
 
-                    verify_meta = self.spec.build_verify_metadata(
-                        request_id=rid,
-                        row_pos=int(row_pos),
-                        req_idx=int(req_idx),
-                        start_pos=int(num_computed_tokens_window_cpu[row_pos]),
-                        real_count=int(real_count),
-                        scheduled_draft_tokens=scheduled_spec_tokens,
-                        token_ids_window_cpu=token_ids_window_cpu,
-                        token_offset=int(window_token_offsets[int(row_pos)]),
-                    )
+                    verify_meta = verify_meta_by_row.get(int(row_pos))
+                    if verify_meta is None:
+                        _meta_start = time.time()
+                        verify_meta = self.spec.build_verify_metadata(
+                            request_id=rid,
+                            row_pos=int(row_pos),
+                            req_idx=int(req_idx),
+                            start_pos=int(num_computed_tokens_window_cpu[row_pos]),
+                            real_count=int(real_count),
+                            scheduled_draft_tokens=scheduled_spec_tokens,
+                            token_ids_window_cpu=token_ids_window_cpu,
+                            token_offset=int(window_token_offsets[int(row_pos)]),
+                        )
+                        total_spec_meta_time += time.time() - _meta_start
                     draft_tokens_for_verify = verify_meta.buffer_draft_tokens
                     accepted = 0
                     projected_target_tokens: list[int] = []
@@ -3139,7 +3261,29 @@ class eSurgeRunner:
                     recurrent_state_advanced_by_suffix = False
                     required_hidden_len = int(verify_meta.bonus_local_index) + 1
                     can_project_full_hidden = hidden_np_len >= required_hidden_len
-                    if can_project_full_hidden:
+                    _bv = batched_verify_by_row.get(int(row_pos)) if can_project_full_hidden else None
+                    if _bv is not None:
+                        # Batched greedy fast path: this request's verify-row LM-head
+                        # projection and greedy argmax were computed once in the
+                        # per-step pre-pass over the whole running batch. Consume the
+                        # host argmaxes and the shared gathered hidden; no per-request
+                        # project / argmax / device->host sync happens here.
+                        for draft_idx, draft_token in enumerate(draft_tokens_for_verify):
+                            if int(_bv.argmaxes[draft_idx]) != int(draft_token):
+                                break
+                            accepted += 1
+                        corrected_token = int(_bv.argmaxes[accepted])
+                        seed_hidden = _bv.gathered_hidden[_bv.offset + accepted]
+                        if self.spec_decode_debug_max_traces > 0:
+                            self.spec.record_verify_trace(
+                                meta=verify_meta,
+                                logits_rows=_bv.batched_logits[_bv.offset : _bv.offset + _bv.count],
+                                accepted=accepted,
+                                corrected_token=corrected_token,
+                                greedy=True,
+                                source="full-hidden-batched",
+                            )
+                    elif can_project_full_hidden:
                         spec_hidden_indices = np.asarray(
                             [*verify_meta.target_local_indices, verify_meta.bonus_local_index],
                             dtype=np.int32,
@@ -3149,9 +3293,11 @@ class eSurgeRunner:
                         logits_rows = self.spec.project_hidden_rows(hidden_rows)
                         total_spec_project_time += time.time() - project_timer_start
                         if greedy_spec:
+                            _argmax_start = time.time()
                             projected_target_tokens = (
                                 np.asarray(jnp.argmax(logits_rows, axis=-1)).astype(np.int64).tolist()
                             )
+                            total_spec_argmax_sync_time += time.time() - _argmax_start
                             for draft_idx, draft_token in enumerate(draft_tokens_for_verify):
                                 if int(projected_target_tokens[draft_idx]) != int(draft_token):
                                     break
@@ -3292,6 +3438,7 @@ class eSurgeRunner:
                             source="replay",
                         )
 
+                    _emit_write_start = time.time()
                     emitted = [int(t) for t in draft_tokens_for_verify[:accepted]] + [int(corrected_token)]
                     sampled_token_ids_all.append(emitted)
                     req_state.output_token_ids.extend(emitted)
@@ -3306,6 +3453,7 @@ class eSurgeRunner:
                     known_len = int(num_computed_tokens_window_cpu[row_pos]) + real_count + len(emitted)
                     self.sequence_buffer.num_tokens_no_spec[req_idx] = min(known_len, self.max_model_len)
                     self.sequence_buffer.num_tokens[req_idx] = min(known_len, self.max_model_len)
+                    total_spec_emit_write_time += time.time() - _emit_write_start
 
                     self.spec.record_acceptance(
                         rid,
@@ -3757,6 +3905,9 @@ class eSurgeRunner:
                 "sync_time": updating_states_time,
                 "post_time": total_post_proc_time,
                 "spec_project_time": total_spec_project_time,
+                "spec_argmax_sync_time": total_spec_argmax_sync_time,
+                "spec_meta_time": total_spec_meta_time,
+                "spec_emit_write_time": total_spec_emit_write_time,
                 "spec_draft_time": total_spec_draft_time,
                 "spec_suffix_time": self._spec_suffix_time_acc,
                 "spec_replay_time": self._spec_replay_time_acc,
