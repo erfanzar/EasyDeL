@@ -59,6 +59,8 @@ References:
     - https://arxiv.org/abs/2310.01889
 """
 
+import math
+
 import jax
 from ejkernel.modules import ring_attention  # pyright: ignore[reportMissingTypeStubs]
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
@@ -70,7 +72,7 @@ from spectrax import common_types
 from easydel.caching import TransformerCacheView
 
 from .._attention_outputs import AttentionOutput
-from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
+from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry, axis_entry_shard_factor
 from ..requirements import (
     CacheType,
     ExecutionMode,
@@ -230,6 +232,27 @@ class RingAttn(OperationImpl):
             tensor=query,
             preserved_indices=[0, 1, 2],
         )
+
+        # GQA + shard_map consistency (same defect class as BlockSparseAttn):
+        # the ring kernels regroup query heads onto KV heads *inside each
+        # shard* with the blocked mapping ``local_h // (local_q / local_kv)``.
+        # That only matches the global GQA grouping when the KV-head axis is
+        # sharded by exactly the same factor as the query-head axis. When the
+        # KV head count is not divisible by the query-head shard factor, the
+        # spec sanitizer silently replicates the KV heads while query heads
+        # stay sharded, and shards attend query heads to the wrong KV head.
+        # Repair: block-repeat KV heads by the minimal (lcm) factor so the
+        # count divides evenly; blocked ``jnp.repeat`` preserves the global
+        # q->kv mapping. Layout here is BTHD, so the head axis is index 2.
+        num_kv_heads: int = key.shape[2]
+        head_shard_factor = 1
+        if query_sharding is not None and len(query_sharding) > 2:
+            head_shard_factor = axis_entry_shard_factor(self.metadata.mesh, query_sharding[2])
+        if head_shard_factor > 1 and num_kv_heads > 1 and num_kv_heads % head_shard_factor != 0:
+            kv_head_reps = head_shard_factor // math.gcd(num_kv_heads, head_shard_factor)
+            key = jnp.repeat(key, kv_head_reps, axis=2)
+            value = jnp.repeat(value, kv_head_reps, axis=2)
+
         key_sharding = self.create_stable_sharding(
             shardings.key,
             dep=key,
