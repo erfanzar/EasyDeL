@@ -399,7 +399,26 @@ moe_ep_carries_batch=False, chunked MoE, attn=RING. Driver logs:
   collective (exitcode 1). Not a numeric result — TPU runtime fatal.
   Undiagnosed: hardware flake vs reproducible ring@131k compiler/kernel bug.
   15.242 has no known-bad history in ops memory.
-- Retry probe (running): L=131072 only, same config, one variable (rerun).
-  Halt again => reproducible bug, do NOT switch production to ring at 131k;
-  pass => run1 was an infra flake and ring is validated end-to-end.
-- Production launch.py switch is ON HOLD pending this retry.
+- Retry (L=131072 only, same config): REPRODUCED the TPU fatal. Evidence:
+  second libtpu slice dump initiated ~01:25:40 with 2.4 GB disk still free
+  (dumps are written only on TPU fatals); the driver died at exit 120 in the
+  ensuing disk-full cascade before the E0200 line could be logged. Two
+  fatals in two attempts at the exact same shape => reproducible
+  compiler/kernel bug in ring attention at B=256 S=131072 under
+  (1,1,64,4,2,2), NOT an infra flake, NOT host-specific evidence.
+- ring@65536: never executed under this config (trimmed for disk budget) —
+  unknown. Non-SPLASH 131k forward remains UNVALIDATED by any mechanism
+  (flash/vanilla refs exist only for 4k/65k).
+- DECISION (user, via coordinator): PATH B — fix the SPLASH head_dim=256
+  kernel itself. No launch.py ring/mesh changes applied or committed. Ring
+  documented here as partial fallback only (numerics good <=4k; fatal at
+  131k as-is).
+- Ops post-mortem: each TPU fatal writes an ~11 GB /tmp/slice_*.dump on
+  this dev VM (live production ray head + worker host!). run1's dump ate
+  the 15 GB headroom; the retry's dump then took / to 100%, which is what
+  killed the retry driver (raylet file_system_monitor + ENOSPC), and put
+  the production worker host at risk. 48 GB of accumulated dumps from this
+  hunt's crashes deleted 2026-07-19; also cleared 10.2 GiB uv cache and
+  truncated fat ray session logs (monitor.log/raylet.out/gcs_server.out).
+  Rule of thumb: after any TPU fatal probe on this host, delete
+  /tmp/slice_*.dump before the next launch.
