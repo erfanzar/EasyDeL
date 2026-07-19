@@ -185,6 +185,35 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
         assert in_specs is not None, "in_specs must be provided for shard_map execution"
         assert out_specs is not None, "out_specs must be provided for shard_map execution"
 
+        def _head_axis_shard_factor(spec) -> int:
+            """Number of shards the head axis (dim 1) of a QKV spec induces."""
+            if spec is None or len(spec) < 2 or spec[1] is None:
+                return 1
+            axis_names = spec[1] if isinstance(spec[1], tuple) else (spec[1],)
+            factor = 1
+            for name in axis_names:
+                factor *= int(mesh.shape[name])
+            return factor
+
+        num_kv_heads = key.shape[1]
+        if num_kv_heads > 1:
+            q_head_shards = _head_axis_shard_factor(in_specs[0])
+            k_head_shards = _head_axis_shard_factor(in_specs[1])
+            v_head_shards = _head_axis_shard_factor(in_specs[2])
+            if q_head_shards != k_head_shards or q_head_shards != v_head_shards:
+                raise ValueError(
+                    "blocksparse_attention shard_map specs shard the query-head axis "
+                    f"{q_head_shards}-way but the key/value-head axes {k_head_shards}/"
+                    f"{v_head_shards}-way (num_kv_heads={num_kv_heads}). The kernel "
+                    "regroups query heads onto KV heads inside each shard "
+                    "(local_h // (local_q_heads / local_kv_heads)), which is globally "
+                    "incorrect under mismatched head shardings: shards attend query "
+                    "heads to the wrong KV heads and silently produce garbage. "
+                    "Shard the KV-head axis by the same factor as the query-head axis "
+                    "(block-repeat KV heads first if the count does not divide), or "
+                    "replicate the query-head axis."
+                )
+
         def _wrapped_blocksparse_attn(
             query: Float[Array, "batch num_heads seq_len head_dim"],
             key: Float[Array, "batch kv_num_heads kv_len head_dim"],

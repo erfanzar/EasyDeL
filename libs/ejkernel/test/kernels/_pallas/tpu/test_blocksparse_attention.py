@@ -133,5 +133,45 @@ def test_softmax_aux_parity_vs_xla():
     assert jnp.allclose(out_tpu, out_xla, rtol=0.0, atol=0.2)
 
 
+@pytest.mark.parametrize(
+    ("num_q_heads", "num_kv_heads"),
+    [(8, 8), (16, 2)],
+    ids=["mha8:8", "gqa16:2"],
+)
+@pytest.mark.parametrize("head_dim", [128, 256], ids=["hd128", "hd256"])
+def test_causal_parity_vs_f32_xla_head_dim_and_gqa(num_q_heads, num_kv_heads, head_dim):
+    """bf16 Pallas Splash vs f32 XLA reference across head_dim and GQA envelope.
+
+    Regression coverage for the Qwen3.6-35B-A3B production envelope
+    (GQA 16q:2kv, head_dim=256, causal, bf16, long sequence) which no prior
+    Splash test exercised (all were MHA with head_dim <= 128).
+    """
+    key = jax.random.PRNGKey(42)
+    _, kq, kk, kv = jax.random.split(key, 4)
+
+    batch, seq_len = 1, 4096
+    q = jax.random.normal(kq, (batch, num_q_heads, seq_len, head_dim), dtype=jnp.bfloat16)
+    k = jax.random.normal(kk, (batch, num_kv_heads, seq_len, head_dim), dtype=jnp.bfloat16)
+    v = jax.random.normal(kv, (batch, num_kv_heads, seq_len, head_dim), dtype=jnp.bfloat16)
+
+    out_tpu = blocksparse_attention(q, k, v, causal=True)
+    out_ref = blocksparse_attention_xla(
+        q.astype(jnp.float32),
+        k.astype(jnp.float32),
+        v.astype(jnp.float32),
+        causal=True,
+    )
+
+    assert out_tpu.shape == out_ref.shape
+    err = jnp.abs(out_tpu.astype(jnp.float32) - out_ref)
+    max_abs = float(err.max())
+    mean_abs = float(err.mean())
+    # Healthy bf16-vs-f32 parity is ~0.02-0.05 max / <1e-3 mean at this shape;
+    # kernel miscomputation (wrong tiling or head grouping) produces O(1) max
+    # and O(1e-2) mean errors.
+    assert max_abs < 0.1, f"max abs err {max_abs} (hd={head_dim}, {num_q_heads}:{num_kv_heads})"
+    assert mean_abs < 5e-3, f"mean abs err {mean_abs} (hd={head_dim}, {num_q_heads}:{num_kv_heads})"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
