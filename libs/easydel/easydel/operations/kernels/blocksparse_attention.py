@@ -79,7 +79,7 @@ from easydel.caching import TransformerCacheView
 from easydel.caching.transformer import TransformerMetadata
 
 from .._attention_outputs import AttentionOutput
-from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
+from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry, axis_entry_shard_factor
 from ..requirements import (
     CacheType,
     ExecutionMode,
@@ -93,27 +93,6 @@ if tp.TYPE_CHECKING:
     pass
 
 logger = get_logger("EasyDeL-BlockSparseAttn")
-
-
-def _axis_entry_shard_factor(mesh: jax.sharding.Mesh | None, axis_entry: tp.Any) -> int:
-    """Return the number of shards a PartitionSpec axis entry induces on ``mesh``.
-
-    Args:
-        mesh: The mesh the spec is resolved against, or ``None``.
-        axis_entry: A single PartitionSpec entry — ``None``, a mesh-axis name,
-            or a tuple of mesh-axis names.
-
-    Returns:
-        The product of the mesh sizes of the named axes (1 when unsharded or
-        when no mesh is available).
-    """
-    if mesh is None or axis_entry is None:
-        return 1
-    axis_names = axis_entry if isinstance(axis_entry, tuple) else (axis_entry,)
-    factor = 1
-    for name in axis_names:
-        factor *= int(mesh.shape[name])
-    return factor
 
 
 @OperationRegistry.register
@@ -397,7 +376,7 @@ class BlockSparseAttn(OperationImpl):
         num_kv_heads: int = key_transposed.shape[1]
         head_shard_factor = 1
         if query_sharding is not None and len(query_sharding) > 1:
-            head_shard_factor = _axis_entry_shard_factor(self.metadata.mesh, query_sharding[1])
+            head_shard_factor = axis_entry_shard_factor(self.metadata.mesh, query_sharding[1])
         if head_shard_factor > 1 and num_kv_heads > 1 and num_kv_heads % head_shard_factor != 0:
             kv_head_reps = head_shard_factor // math.gcd(num_kv_heads, head_shard_factor)
             logger.debug(
