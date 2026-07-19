@@ -40,6 +40,7 @@ The planner is pure shape math, so these run on any host with no devices.
 from __future__ import annotations
 
 import pytest
+
 from easydel.layers.moe import estimate_moe_layout, validate_moe_layout
 from easydel.layers.moe._layout_planner import (
     FWD_BWD_LIVE_BUFFER_MULTIPLIER,
