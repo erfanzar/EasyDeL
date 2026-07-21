@@ -60,6 +60,7 @@ from .fused_cross_entropy import fused_cross_entropy
 from .fused_kl_divergence import fused_kl_divergence
 from .gated_delta_rule import gated_delta_rule
 from .gated_delta_rule_grouped_decode import gated_delta_rule_grouped_decode
+from .gdn_spec_window import gdn_spec_window_states
 from .grouped_matmul import grouped_matmul
 from .grouped_matmulv2 import grouped_matmulv2
 from .grouped_matmulv3 import grouped_matmulv3
@@ -89,6 +90,7 @@ __all__ = (
     "fused_kl_divergence",
     "gated_delta_rule",
     "gated_delta_rule_grouped_decode",
+    "gdn_spec_window_states",
     "grouped_matmul",
     "grouped_matmulv2",
     "grouped_matmulv3",

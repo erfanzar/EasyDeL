@@ -187,6 +187,7 @@ from .configs import (
     GatedDeltaRuleConfig,
     GatedDeltaRuleGroupedDecodeConfig,
     GDNComputeScheduleV2Config,
+    GdnSpecWindowStatesConfig,
     GLAttentionConfig,
     GroupedMatmulConfig,
     KernelDeltaAttentionConfig,
@@ -232,6 +233,11 @@ from .gated_delta_rule_grouped_decode import (
 )
 from .gated_linear_attention import GLAttention, gla_attention
 from .gdn_compute_schedule_v2 import GDNComputeScheduleV2, compute_schedule_table_v2, gdn_compute_schedule_v2
+from .gdn_spec_window import (
+    GdnSpecWindowStates,
+    gdn_spec_window_states,
+    gdn_spec_window_states_op,
+)
 from .grouped_matmul import GroupedMatmul, grouped_matmul
 from .kernel_delta_attention import KernelDeltaAttention, kda_attention, kernel_delta_attention
 from .lightning_attention import LightningAttention, lightning_attention
@@ -331,6 +337,8 @@ __all__ = (
     "GatedDeltaRuleConfig",
     "GatedDeltaRuleGroupedDecode",
     "GatedDeltaRuleGroupedDecodeConfig",
+    "GdnSpecWindowStates",
+    "GdnSpecWindowStatesConfig",
     "GroupedMatmul",
     "GroupedMatmulConfig",
     "KLDivergenceOutput",
@@ -407,6 +415,8 @@ __all__ = (
     "gated_delta_rule_grouped_decode",
     "gated_delta_rule_grouped_decode_op",
     "gdn_compute_schedule_v2",
+    "gdn_spec_window_states",
+    "gdn_spec_window_states_op",
     "gdr_attention",
     "gla_attention",
     "grouped_matmul",
