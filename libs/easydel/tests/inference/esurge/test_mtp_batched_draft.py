@@ -193,11 +193,14 @@ def test_batched_draft_leaves_idle_rows_untouched():
     for rid, _row, _tok, _pos, _h in collected:
         assert got[rid] == ref[rid], f"{rid}: batched {got[rid]} != per-request {ref[rid]}"
 
-    # Collected rows advanced by k; idle rows must remain at write index 0.
-    assert _row_index(dbat, 0) == k
-    assert _row_index(dbat, 2) == k
-    assert _row_index(dbat, 1) == 0, "idle row 1 must be untouched by the batched forward"
-    assert _row_index(dbat, 3) == 0, "idle row 3 must be untouched by the batched forward"
+    # Collected requests' (lifetime-stable, strategy-allocated) rows advanced by
+    # k; every other row must remain at write index 0.
+    row_a = sbat._mtp_row_by_req["A"]
+    row_c = sbat._mtp_row_by_req["C"]
+    assert _row_index(dbat, row_a) == k
+    assert _row_index(dbat, row_c) == k
+    for idle in set(range(n)) - {row_a, row_c}:
+        assert _row_index(dbat, idle) == 0, f"idle row {idle} must be untouched by the batched forward"
 
 
 def test_batched_draft_different_committed_lens_per_row():

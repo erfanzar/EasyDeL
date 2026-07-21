@@ -32,7 +32,6 @@ asserts the emitted tokens are unchanged (greedy verification stays exact).
 
 from __future__ import annotations
 
-import gc
 import os
 import types
 
@@ -427,9 +426,14 @@ def test_batched_persist_keeps_a_row_per_request():
     assert a_w1 == a2_w1, "A's first window is independent of scheduling"
     assert a_w2_inter == a2_w2, "(b) B's interleaved call did not change A's second-window drafts"
 
-    # --- (c) Reuse row 0 for a NEW request C: stale A K/V must be dropped. ---
+    # --- (c) A finishes; a NEW request C takes its freed row: stale A K/V must
+    # be dropped. Drafter rows are lifetime-stable (allocated per request, NOT
+    # keyed on the runner's mutable req_idx), so the row is only reused after
+    # the scheduler reports its owner finished.
     c_seed, c_hidden = 13, _seed_hidden(3)
+    s1._release_finished_drafter_rows(types.SimpleNamespace(finished_req_ids={"A"}))
     c_reuse = _draft(s1, "C", 0, c_seed, 20, c_hidden)
+    assert s1._mtp_row_by_req["C"] == 0, "C reuses A's freed drafter row"
     assert s1._mtp_persist_req_by_row[0] == "C", "row 0 now belongs to C"
     assert s1._mtp_persist_base_pos_by_row[0] == 20, "(c) reused slot re-bases the committed origin"
     assert _row_index(d1, 0) == k, "(c) reused slot restarts from 0 (stale A K/V dropped), not 2+k+k"

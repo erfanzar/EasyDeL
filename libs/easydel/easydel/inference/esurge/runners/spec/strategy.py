@@ -273,6 +273,65 @@ class DrafterSpeculation:
         # detected and re-based (its stale K/V dropped) instead of leaking.
         self._mtp_persist_base_pos_by_row: dict[int, int] = {}
         self._mtp_persist_req_by_row: dict[int, str] = {}
+        # STABLE per-request drafter rows. The runner's ``req_idx`` is NOT
+        # stable: ``condense``/``reorder_decode_first`` relocate surviving
+        # requests to different sequence-buffer rows, and while the paged KV
+        # (page-table rows) and recurrent state (``permute_recurrent_slots``)
+        # move in lockstep, the drafter's pooled MTP cache does not. Keying the
+        # MTP rows on ``req_idx`` therefore cold-started (or, on an A->B->A
+        # move, corrupted) a relocated request's MTP context — and relocation
+        # frequency grows with concurrency, degrading acceptance as n grows.
+        # Instead the strategy allocates each request its own drafter row for
+        # its whole lifetime, released when the scheduler reports it finished.
+        self._mtp_row_by_req: dict[str, int] = {}
+        self._mtp_row_free: list[int] = []
+        self._mtp_row_capacity: int = 0
+
+    def _stable_drafter_row(self, req_id: str, fallback_row: int) -> int:
+        """Return this request's lifetime-stable row in the pooled MTP cache.
+
+        Allocates a free row on first use and keeps it until the request
+        finishes (released in :meth:`on_states_applied`). Falls back to
+        reclaiming rows of no-longer-live requests when the free list is
+        empty (missed release), and only as a last resort to the caller's
+        (unstable) ``req_idx``.
+
+        Args:
+            req_id: Request identifier.
+            fallback_row: Row to use if allocation is impossible.
+
+        Returns:
+            The stable row index in ``[0, max_num_reqs)``.
+        """
+        rid = str(req_id)
+        capacity = max(1, int(getattr(self._runner, "max_num_reqs", 1)))
+        if self._mtp_row_capacity != capacity:
+            live = set(self._mtp_row_by_req.values())
+            self._mtp_row_capacity = capacity
+            self._mtp_row_free = [r for r in range(capacity - 1, -1, -1) if r not in live]
+        row = self._mtp_row_by_req.get(rid)
+        if row is not None:
+            return row
+        if not self._mtp_row_free:
+            # Self-heal: reclaim rows whose owners are no longer live.
+            live_reqs = getattr(self._runner, "requests", {}) or {}
+            for other_rid in [r for r in self._mtp_row_by_req if r not in live_reqs]:
+                self._mtp_row_free.append(self._mtp_row_by_req.pop(other_rid))
+        row = self._mtp_row_free.pop() if self._mtp_row_free else int(fallback_row)
+        self._mtp_row_by_req[rid] = row
+        return row
+
+    def _release_finished_drafter_rows(self, scheduler_output: SchedulerOutput) -> None:
+        """Free the stable drafter rows of requests the scheduler finished."""
+        finished = getattr(scheduler_output, "finished_req_ids", None) or ()
+        for rid in finished:
+            row = self._mtp_row_by_req.pop(str(rid), None)
+            if row is None:
+                continue
+            self._mtp_row_free.append(row)
+            if self._mtp_persist_req_by_row.get(row) == str(rid):
+                self._mtp_persist_req_by_row.pop(row, None)
+                self._mtp_persist_base_pos_by_row.pop(row, None)
 
     @property
     def uses_recurrent_candidates(self) -> bool:
@@ -288,6 +347,9 @@ class DrafterSpeculation:
         self._backoff_by_req.clear()
         self._mtp_persist_base_pos_by_row.clear()
         self._mtp_persist_req_by_row.clear()
+        self._mtp_row_by_req.clear()
+        self._mtp_row_free = []
+        self._mtp_row_capacity = 0
         if self.drafter is not None:
             try:
                 # Size to the request pool (``max_num_reqs`` == sequence-buffer
@@ -832,7 +894,10 @@ class DrafterSpeculation:
             scheduler_output: Scheduler decision carrying the per-request
                 ``scheduled_spec_decode_tokens`` mapping.
         """
-        if self.drafter is None or not scheduler_output.scheduled_spec_decode_tokens:
+        if self.drafter is None:
+            return
+        self._release_finished_drafter_rows(scheduler_output)
+        if not scheduler_output.scheduled_spec_decode_tokens:
             return
         for req_id, spec_tokens in scheduler_output.scheduled_spec_decode_tokens.items():
             if not spec_tokens:
@@ -1199,7 +1264,10 @@ class DrafterSpeculation:
         #   each other's cache.
         reset_request = getattr(self.drafter, "reset_request", None)
         persist_on = self._mtp_persist_enabled()
-        row = int(row_pos)
+        # ``row_pos`` (the runner's req_idx) is NOT stable across condense /
+        # reorder row moves; use the strategy's lifetime-stable row instead so
+        # the request's MTP context survives relocations (see __init__ note).
+        row = self._stable_drafter_row(req_id, int(row_pos)) if persist_on else int(row_pos)
         if persist_on:
             # Size the pool cache to hold every concurrent request's row. This is
             # idempotent (allocates once, no-op thereafter) so a live request's
@@ -1418,7 +1486,9 @@ class DrafterSpeculation:
 
         for rid, row, seed_token, seed_position, seed_hidden in seeds:
             rid = str(rid)
-            row = int(row)
+            # Remap the runner's (unstable) req_idx to this request's
+            # lifetime-stable drafter row (see __init__ note).
+            row = self._stable_drafter_row(rid, int(row)) if persist_on else int(row)
             if not (0 <= row < n):
                 continue
             backoff = int(self._backoff_by_req.get(rid, 0))
