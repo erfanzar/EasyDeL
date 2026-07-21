@@ -1735,11 +1735,22 @@ def _apply_qwen3_next_packed_updates_ragged(
     use_head_sharded_conv = (
         mesh is not None and head_axis is not None and tp_size > 1 and all(size % tp_size == 0 for size in split_sizes)
     )
+    # Speculative-decode verify windows (recognized statically by the presence
+    # of candidate state rows) route the multi-token main pass through the
+    # fused recurrent-scan kernel: a K+1-token window per slot is a terrible
+    # fit for the chunked path (full WY machinery on chunk-16 padding cost
+    # ~27ms/forward on the 27B at tp=4; the scan costs ~4ms). Small buckets
+    # only — chunked prefill keeps the large prompt buckets. Non-speculative
+    # runners are unaffected.
+    _has_candidate_rows = conv_states.shape[0] > (query_start_loc.shape[0] - 1)
     use_recurrent_scan_prefill = (
         jax.default_backend() == "tpu"
-        and seq_len >= 128
         and not bool(disable_recurrent_scan_prefill)
-        and (force_recurrent_scan_prefill or seq_len <= recurrent_scan_prefill_max_seq_len)
+        and (
+            force_recurrent_scan_prefill
+            or (seq_len >= 128 and seq_len <= recurrent_scan_prefill_max_seq_len)
+            or (_has_candidate_rows and seq_len <= 256)
+        )
     )
     def _run_normal_ragged_path(_):
         """Run the standard ragged conv + ragged GDR fast path.
