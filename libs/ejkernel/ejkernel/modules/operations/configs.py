@@ -1023,6 +1023,20 @@ class GatedDeltaRuleGroupedDecodeConfig(BaseOperationConfig):
 
 
 @dataclass
+class GdnSpecWindowStatesConfig(BaseOperationConfig):
+    """Configuration for the GDN speculative-window state-scan op.
+
+    Args:
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    pass
+
+    __hash__ = hash_fn
+
+
+@dataclass
 class RaggedGatedDeltaRuleV2Config(BaseOperationConfig):
     """Configuration for the Qwen3-Next packed-inference ragged GDN op.
 
