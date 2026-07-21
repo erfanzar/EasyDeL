@@ -330,11 +330,138 @@ class Qwen3_5MTPDrafter:
         self._jit_adaptive: dict[tuple, typing.Callable] = {}
         self._jit_batched: dict[tuple, typing.Callable] = {}
         self.supports_batched_draft = True
+        # Cached static GraphDefs for the batched-draft submodule bundle
+        # (mtp block, input embeddings, LM head) — see
+        # ``_batched_bundle_graph_and_states``.
+        self._bundle_graphdefs: tuple | None = None
         # Cached static GraphDef for ``self.model`` (structurally invariant for a
         # fixed model). The model State (the actual weight arrays) is threaded
         # through the drafter jits as a runtime INPUT, never closed over — see
         # ``_model_graph_and_state``.
         self._graphdef: spx.GraphDef | None = None
+
+    def _batched_bundle_graph_and_states(self):
+        """Split ONLY the modules the MTP forward touches into (GraphDefs, States).
+
+        The batched drafter runs once per decode step, and threading the FULL
+        27B model State through its ``jax.jit`` costs ~14 ms of host dispatch
+        (1100+ leaves flattened/matched per call) plus ~9 ms re-exporting the
+        whole module tree — 4-6x the actual device time of the k MTP forwards.
+        The forward only reads the inline MTP block, the input embeddings, the
+        LM head, and the rotary frequency table, so export just those: a few
+        dozen leaves, microsecond-scale export and dispatch.
+
+        GraphDefs (static structure) are cached on first use; the sub-States
+        are re-exported every call so live/updated weights are picked up, same
+        contract as ``_model_graph_and_state``.
+
+        Returns:
+            ``((mtp_gd, embed_gd, head_gd), (mtp_st, embed_st, head_st),
+            frequencies, tie_embeddings)`` where ``frequencies`` is the rotary
+            table array (or ``None``) and ``tie_embeddings`` the static
+            weight-tying flag consumed by the LM-head application.
+        """
+        model = self.model
+        mtp_gd, mtp_st = spx.export(model.mtp)
+        if hasattr(model, "get_input_embeddings"):
+            embed_module = model.get_input_embeddings()
+        else:
+            embed_module = model.model.get_embedding()
+        embed_gd, embed_st = spx.export(embed_module)
+        head_gd, head_st = spx.export(model.get_lm_head())
+        if self._bundle_graphdefs is None:
+            self._bundle_graphdefs = (mtp_gd, embed_gd, head_gd)
+        base_model = getattr(model, "model", None)
+        language_model = getattr(base_model, "language_model", None)
+        frequencies_owner = language_model if language_model is not None else base_model
+        frequencies = getattr(frequencies_owner, "frequencies", None)
+        cfg = getattr(model, "config", None)
+        tie_embeddings = next(
+            (
+                getattr(cfg, key)
+                for key in ("tie_word_embeddings", "use_lm_head", "share_input_output_layers")
+                if hasattr(cfg, key)
+            ),
+            False,
+        )
+        return self._bundle_graphdefs, (mtp_st, embed_st, head_st), frequencies, bool(tie_embeddings)
+
+    @staticmethod
+    def _mtp_forward_compute_parts(
+        mtp: typing.Any,
+        embed_module: typing.Any,
+        lm_head_module: typing.Any,
+        frequencies: Array | None,
+        tie_embeddings: bool,
+        ids: Int[Array, "batch seq"],
+        hidden: Float[Array, "batch seq hidden"],
+        pos: Int[Array, "batch seq"] | None,
+        cache: TransformerCache | None,
+    ) -> tuple[Float[Array, "batch seq hidden"], Float[Array, "batch seq vocab"], TransformerCache | None]:
+        """One inline-MTP-head forward from its constituent modules.
+
+        Same numerics as ``_mtp_forward_compute`` (no row targeting), but the
+        target model's pieces are passed in explicitly so the batched-draft
+        jit can thread ONLY their (small) States as inputs instead of the full
+        model State — see ``_batched_bundle_graph_and_states``.
+
+        Args:
+            mtp: The inline MTP block (``model.mtp``).
+            embed_module: The input-embedding module (also supplies the tied
+                LM-head weight when ``tie_embeddings``).
+            lm_head_module: The LM-head projection module.
+            frequencies: Rotary frequency table array, or ``None``.
+            tie_embeddings: Static weight-tying flag (matches
+                ``apply_lm_head``'s config resolution).
+            ids: ``(batch, seq)`` already-sampled next-token ids.
+            hidden: ``(batch, seq, hidden)`` target hidden rows to fuse.
+            pos: Absolute positions for ``hidden``; ``None`` builds ``arange``.
+            cache: Inline-MTP ``TransformerCache`` to read/advance, or ``None``.
+
+        Returns:
+            ``(hidden_out, logits, new_cache)``.
+        """
+        next_embeds = embed_module(ids.astype("i4"))
+        normed_e = mtp.pre_fc_norm_embedding(next_embeds)
+        normed_h = mtp.pre_fc_norm_hidden(hidden)
+        h = mtp.fc(jnp.concatenate([normed_e, normed_h], axis=-1))
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=None,
+            input_ids=None,
+            inputs_embeds=h,
+            attention_mask=None,
+        )
+        if pos is None:
+            batch_size, seq_len = h.shape[:2]
+            pos = jnp.arange(seq_len, dtype=jnp.int32)[None, :].repeat(batch_size, axis=0)
+        views = cache.views if cache is not None else None
+        new_views = []
+        mtp_mode = common_types.MODE_PREFILL if ids.shape[1] > 1 else common_types.MODE_DECODE
+        for layer in mtp.layers:
+            cv_in = views[layer.layer_idx] if views is not None and layer.layer_idx < len(views) else None
+            cache_metadata = (
+                TransformerMetadata(
+                    postpadded=False,
+                    starts=cv_in.starts,
+                    indexes=cv_in.indexes,
+                )
+                if cv_in is not None
+                else None
+            )
+            h, _cache_view = layer(
+                h,
+                mask_info,
+                pos,
+                mtp_mode,
+                cv_in,
+                cache_metadata,
+                frequencies,
+            )
+            new_views.append(_cache_view)
+        h = mtp.norm(h)
+        new_cache = TransformerCache(views=new_views) if cache is not None else None
+        w = embed_module.weight.value.T if tie_embeddings else None
+        return h, lm_head_module(h, w=w), new_cache
 
     def _model_graph_and_state(self) -> tuple[spx.GraphDef, spx.State]:
         """Split ``self.model`` into (cached static GraphDef, live State).
@@ -1176,10 +1303,13 @@ class Qwen3_5MTPDrafter:
         # lazily-created state before it is split/traced (see
         # ``_model_graph_and_state``).
         _ = self._mtp_forward_compute(self.model, ids0, hidden0, pos0, mtp_cache, None)
-        graphdef, _ = self._model_graph_and_state()
+        graphdefs, _states, _freqs, tie_embeddings = self._batched_bundle_graph_and_states()
+        mtp_gd, embed_gd, head_gd = graphdefs
 
-        def _run(state, ids0, hidden0, pos0, cache0, committed_lens, collected_mask):
-            model = spx.bind(graphdef, state)
+        def _run(mtp_st, embed_st, head_st, freqs, ids0, hidden0, pos0, cache0, committed_lens, collected_mask):
+            mtp = spx.bind(mtp_gd, mtp_st)
+            embed_module = spx.bind(embed_gd, embed_st)
+            head_module = spx.bind(head_gd, head_st)
             orig_indexes: list = []
             orig_starts: list = []
             if has_cache:
@@ -1203,7 +1333,9 @@ class Qwen3_5MTPDrafter:
             ct, ch, pos = ids0, hidden0, pos0
             drafts_cols = []
             for _ in range(int(k)):
-                h, logits, cache = self._mtp_forward_compute(model, ct, ch, pos, cache, None)
+                h, logits, cache = self._mtp_forward_compute_parts(
+                    mtp, embed_module, head_module, freqs, tie_embeddings, ct, ch, pos, cache
+                )
                 last = logits[:, -1, :].astype(jnp.float32)
                 next_tok = jnp.argmax(last, axis=-1).astype(jnp.int32)
                 drafts_cols.append(next_tok)
@@ -1214,7 +1346,7 @@ class Qwen3_5MTPDrafter:
 
             if has_cache and cache is not None:
                 fixed_views = []
-                for v, orig_idx, orig_st in zip(cache.views, orig_indexes, orig_starts):
+                for v, orig_idx, orig_st in zip(cache.views, orig_indexes, orig_starts, strict=False):
                     if v is None:
                         fixed_views.append(None)
                         continue
@@ -1278,8 +1410,8 @@ class Qwen3_5MTPDrafter:
         committed = jnp.asarray(committed_lens, dtype=jnp.int32).reshape(-1)
         mask = jnp.asarray(collected_mask).astype(bool).reshape(-1)
         fn = self._get_batched_draft_fn(int(num_speculative_tokens), ids0, hidden0, pos0, mtp_cache)
-        _, state = self._model_graph_and_state()
-        drafts, new_cache = fn(state, ids0, hidden0, pos0, mtp_cache, committed, mask)
+        _gds, (mtp_st, embed_st, head_st), freqs, _tie = self._batched_bundle_graph_and_states()
+        drafts, new_cache = fn(mtp_st, embed_st, head_st, freqs, ids0, hidden0, pos0, mtp_cache, committed, mask)
         if new_cache is not None:
             self._mtp_cache = new_cache
         return drafts
