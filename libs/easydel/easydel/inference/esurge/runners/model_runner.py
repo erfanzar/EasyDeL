@@ -2718,6 +2718,40 @@ class eSurgeRunner:
                     if _scheduled_specs and int(_row_pos) not in sequential_greedy_spec_rows:
                         spec_window_needs_snapshot = self.spec.cache_replay_required()
                         break
+            if (
+                spec_window_needs_snapshot
+                and self.spec_decode_recurrent_candidates
+                and not self.spec_decode_recurrent_replay
+                and not sequential_greedy_spec_rows
+            ):
+                # Steady-state candidate fast path: the pre-step recurrent
+                # snapshot exists only to feed the replay fallbacks
+                # (``replay_prefix_sample`` / ``commit_cache_replay``). Those
+                # can only trigger when (a) full hidden rows do NOT cover the
+                # window, or (b) a spec request schedules more than one real
+                # token (the in-model spec lane is skipped, so the candidate
+                # commit cannot cover the accepted prefix). In the steady
+                # decode state — every spec request schedules exactly
+                # 1 real + k draft tokens and the window bucket returns full
+                # hidden — the commit always succeeds and the snapshot is a
+                # dead full-pool copy of every recurrent layer, every step.
+                # Skip it; any window violating the conditions keeps it.
+                _full_hidden_ok = int(num_tokens_static) <= int(
+                    getattr(self.executor_manager, "full_hidden_state_max_tokens", 0) or 0
+                )
+                _snapshot_needed = not _full_hidden_ok
+                if not _snapshot_needed:
+                    for _row_pos, _rid in enumerate(req_ids_window):
+                        if _rid is None:
+                            continue
+                        _specs = scheduler_output.scheduled_spec_decode_tokens.get(_rid, [])
+                        if not _specs or any(int(_t) < 0 for _t in _specs):
+                            continue
+                        _real = int(model_scheduled_list[_row_pos]) - len(_specs)
+                        if _real != 1:
+                            _snapshot_needed = True
+                            break
+                spec_window_needs_snapshot = _snapshot_needed
             pre_step_kv_pages = (
                 _snapshot_recurrent_state(self.executor_manager.kv_pages) if spec_window_needs_snapshot else None
             )
