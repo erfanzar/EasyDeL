@@ -613,6 +613,7 @@ def get_all_to_all_params(
     shard_id: int,
     num_expert_parallelism: int,
     is_batch_sharded: bool,
+    is_dispatch: bool = True,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Compute send/receive offsets and sizes for a ragged expert-parallel all-to-all.
 
@@ -630,6 +631,15 @@ def get_all_to_all_params(
         is_batch_sharded: Whether the batch dimension is also sharded across devices.
             If True, tokens are distributed across both batch and expert dimensions.
             If False, the batch is replicated and only experts are distributed.
+        is_dispatch: Direction of the exchange. ``True`` computes parameters
+            for the dispatch all-to-all (tokens travel from their home batch
+            shard to the shard owning their expert); ``False`` computes the
+            combine direction (expert outputs travel back to the tokens' home
+            shards). The combine is the same exchange with the traffic matrix
+            transposed: ``matrix[i, j]`` — rows batch shard *i* sends expert
+            shard *j* at dispatch — becomes the rows *j* returns to *i*.
+            Transposition is a no-op for the 1-D replicated-batch layout, so
+            this flag only matters when ``is_batch_sharded=True``.
 
     Returns:
         A tuple containing four arrays:
@@ -690,11 +700,102 @@ def get_all_to_all_params(
                 return inp
         raise ValueError("Unknown transform")
 
-    in_off = transform(all_shards_group_sizes, shard_id, _Transform.INPUT_OFFSET, is_batch_sharded)
-    send = transform(all_shards_group_sizes, shard_id, _Transform.SEND_SIZE, is_batch_sharded)
-    out_off = transform(all_shards_group_sizes, shard_id, _Transform.OUTPUT_OFFSET, is_batch_sharded)
-    recv = transform(all_shards_group_sizes, shard_id, _Transform.RECV_SIZE, is_batch_sharded)
+    matrix = all_shards_group_sizes if is_dispatch else jnp.transpose(all_shards_group_sizes)
+    in_off = transform(matrix, shard_id, _Transform.INPUT_OFFSET, is_batch_sharded)
+    send = transform(matrix, shard_id, _Transform.SEND_SIZE, is_batch_sharded)
+    out_off = transform(matrix, shard_id, _Transform.OUTPUT_OFFSET, is_batch_sharded)
+    recv = transform(matrix, shard_id, _Transform.RECV_SIZE, is_batch_sharded)
     return in_off, send, out_off, recv
+
+
+def build_ep_traffic_matrix(global_group_sizes: jax.Array, ep_size: int, local_expert_size: int) -> jax.Array:
+    """Fold a per-shard routing table into the EP dispatch traffic matrix.
+
+    Args:
+        global_group_sizes: Per-source-shard token counts per global expert,
+            as produced by ``all_gather`` of each shard's ``group_sizes``.
+            Shape ``[ep_size, num_experts]``.
+        ep_size: Number of expert-parallel shards.
+        local_expert_size: Experts owned by each shard
+            (``num_experts // ep_size``).
+
+    Returns:
+        Integer matrix of shape ``[ep_size, ep_size]`` where entry ``[i, j]``
+        is the number of token rows batch shard *i* sends to expert shard *j*
+        during the batch-sharded dispatch all-to-all (experts
+        ``[j * local_expert_size, (j + 1) * local_expert_size)`` are owned by
+        shard *j*, and the dispatch buffer is sorted by global expert id, so
+        each destination's rows are contiguous on the sender).
+    """
+    return jnp.sum(global_group_sizes.reshape(ep_size, ep_size, local_expert_size), axis=2)
+
+
+def ep_batch_receive_buffer_rows(
+    local_tokens: int,
+    num_experts_per_tok: int,
+    ep_size: int,
+    local_expert_size: int,
+) -> int:
+    """Worst-case static row bound for the batch-sharded dispatch receive buffer.
+
+    ``jax.lax.ragged_all_to_all`` needs a statically-shaped receive buffer.
+    In the worst routing case every token in the EP group routes to a single
+    shard's experts, so the bound starts at ``ep_size * local_tokens * k``
+    rows (all ``ep_size`` source shards send all their replicated rows to
+    one destination). A token's ``k`` chosen experts are distinct, so a
+    single token can contribute at most ``min(k, local_expert_size)`` rows
+    to any one shard, which tightens the bound to
+    ``ep_size * local_tokens * min(k, local_expert_size)`` — MaxText's
+    ``min(ep, num_experts / k)`` worst-case factor expressed in integer
+    arithmetic. Balanced routing fills only ``local_tokens * k`` of these
+    rows; the slack tail is zero-filled and masked out of every grouped
+    matmul (a capacity-style ``ragged_buffer_factor`` truncation is a noted
+    follow-up, not implemented).
+
+    Args:
+        local_tokens: Tokens resident on one shard (``batch_local * seq``).
+        num_experts_per_tok: Routing top-k width.
+        ep_size: Number of expert-parallel shards.
+        local_expert_size: Experts owned by each shard.
+
+    Returns:
+        Static row count for the receive buffer.
+    """
+    per_source_rows = int(local_tokens) * min(int(num_experts_per_tok), int(local_expert_size))
+    return int(ep_size) * per_source_rows
+
+
+def chunk_group_sizes(
+    group_starts: jax.Array,
+    group_ends: jax.Array,
+    chunk_offset: jax.Array,
+    chunk_rows: int,
+) -> jax.Array:
+    """Per-expert row counts inside one contiguous chunk of a sorted buffer.
+
+    For a buffer sorted by expert id with per-expert row ranges
+    ``[group_starts[e], group_ends[e])``, returns how many of each expert's
+    rows fall inside the chunk ``[chunk_offset, chunk_offset + chunk_rows)``.
+    Rows past ``group_ends[-1]`` (buffer padding/slack) fall outside every
+    group and are counted by none — exactly what grouped matmul needs so it
+    never writes the tail. Used by the ep-carries-batch chunked FFN scan,
+    where chunk boundaries cut through the ragged expert groups.
+
+    Args:
+        group_starts: Cumulative start row of each expert group,
+            ``int[num_local_experts]``.
+        group_ends: Cumulative end row of each expert group (exclusive),
+            ``int[num_local_experts]``.
+        chunk_offset: First row of the chunk (may be traced).
+        chunk_rows: Static number of rows per chunk.
+
+    Returns:
+        ``int[num_local_experts]`` group sizes local to the chunk; they sum
+        to the number of valid rows inside the chunk.
+    """
+    lo = jnp.clip(group_starts, chunk_offset, chunk_offset + chunk_rows)
+    hi = jnp.clip(group_ends, chunk_offset, chunk_offset + chunk_rows)
+    return (hi - lo).astype(group_starts.dtype)
 
 
 def tp_global_topk(logits_shard: jax.Array, k: int, tp_axis: str) -> tuple[jax.Array, jax.Array]:
@@ -1222,6 +1323,7 @@ def get_moe_partition_spec(
     fsdp_is_ep_bound: bool = True,
     sp_is_ep_bound: bool = True,
     module_view: bool = False,
+    fsdp_shards_experts: bool = False,
 ) -> jax.sharding.PartitionSpec:
     """Build the :class:`PartitionSpec` for an MoE expert weight or bias tensor.
 
@@ -1255,6 +1357,11 @@ def get_moe_partition_spec(
         module_view: If True, combines EP with FSDP and/or SP axes for joint
             sharding. Creates a tuple axis like (ep, sp, fsdp) for the expert
             dimension. If False, only uses EP axis for expert dimension.
+        fsdp_shards_experts: If True (and fsdp is not ep-bound), append the
+            FSDP axis to the expert-dimension placement so specs match
+            expert weights that are FSDP-sharded at rest
+            (``moe_fsdp_shard_expert_weights``). Ignored in expert tensor
+            mode.
 
     Returns:
         PartitionSpec appropriate for the tensor configuration. Examples:
@@ -1297,6 +1404,8 @@ def get_moe_partition_spec(
             expert_place += (sp_axis_name,)
         if fsdp_is_ep_bound:
             expert_place += (fsdp_axis_name,)
+    if fsdp_shards_experts and not fsdp_is_ep_bound and fsdp_axis_name not in expert_place:
+        expert_place += (fsdp_axis_name,)
     if len(expert_place) == 1:
         expert_place = expert_place[0]
     if tensors_are_expert:

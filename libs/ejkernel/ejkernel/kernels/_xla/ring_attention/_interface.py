@@ -323,6 +323,23 @@ def ring_attention(
     """
     del mask_builder, bwd_params, fused_backward
 
+    # GQA/MQA support: the scan core computes with a single shared head count
+    # (it rebinds ``num_heads`` from each operand and reshapes with it), so KV
+    # heads must be block-expanded to the query head count. Blocked
+    # ``jnp.repeat`` maps query head ``h`` onto KV head ``h // reps`` — the
+    # standard blocked GQA grouping, consistent with the Pallas backends.
+    num_q_heads = query.shape[2]
+    num_kv_heads = key.shape[2]
+    if num_kv_heads != num_q_heads:
+        if num_q_heads % num_kv_heads != 0:
+            raise ValueError(
+                f"ring_attention (xla): query head count {num_q_heads} is not divisible "
+                f"by KV head count {num_kv_heads}; cannot expand KV heads for GQA."
+            )
+        kv_head_reps = num_q_heads // num_kv_heads
+        key = jnp.repeat(key, kv_head_reps, axis=2)
+        value = jnp.repeat(value, kv_head_reps, axis=2)
+
     if fwd_params is None:
         fwd_params = FwdParams()
 

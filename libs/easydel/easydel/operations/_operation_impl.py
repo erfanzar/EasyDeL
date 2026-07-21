@@ -86,6 +86,31 @@ BIAS_HEAD_SEQ = common_types.BIAS_HEAD_SEQ
 BIAS_KV_SEQ = common_types.BIAS_KV_SEQ
 
 
+def axis_entry_shard_factor(mesh, axis_entry) -> int:
+    """Return the number of shards a PartitionSpec axis entry induces on ``mesh``.
+
+    Used by attention adapters to read the effective shard factor of a tensor
+    axis (e.g. the query-head axis) from a sanitized PartitionSpec, so KV
+    heads can be expanded to shard consistently for GQA under ``shard_map``.
+
+    Args:
+        mesh: The mesh the spec is resolved against, or ``None``.
+        axis_entry: A single PartitionSpec entry — ``None``, a mesh-axis name,
+            or a tuple of mesh-axis names.
+
+    Returns:
+        The product of the mesh sizes of the named axes (1 when unsharded or
+        when no mesh is available).
+    """
+    if mesh is None or axis_entry is None:
+        return 1
+    axis_names = axis_entry if isinstance(axis_entry, tuple) else (axis_entry,)
+    factor = 1
+    for name in axis_names:
+        factor *= int(mesh.shape[name])
+    return factor
+
+
 @auto_pytree
 class OperationOutput:
     """Base pytree-compatible container for operation results.
