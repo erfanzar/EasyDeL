@@ -1597,7 +1597,8 @@ class DrafterSpeculation:
                 if arr is None:
                     return None
                 n_slots = int(arr.shape[0])
-                candidate_row = base_slots + row * int(candidate_count) + prefix - 1
+                # Prefix-major candidate layout: base + prefix * base_slots + slot.
+                candidate_row = base_slots + (prefix - 1) * base_slots + row
                 safe_dst = jnp.clip(row, 0, n_slots - 1)
                 safe_src = jnp.clip(candidate_row, 0, n_slots - 1)
                 valid = (row >= 0) & (row < n_slots) & (prefix > 0) & (prefix <= int(candidate_count))

@@ -1562,8 +1562,10 @@ class ExecutionManager:
             base_slots = int(self.max_num_reqs)
             for slot in slot_indices:
                 if 0 <= int(slot) < base_slots:
-                    start = base_slots + int(slot) * candidate_count
-                    slot_indices_to_clear.extend(range(start, start + candidate_count))
+                    # Prefix-major candidate layout: base + prefix * base_slots + slot.
+                    slot_indices_to_clear.extend(
+                        base_slots + k * base_slots + int(slot) for k in range(candidate_count)
+                    )
         for idx, view in enumerate(new_views):
             rec = None
             if isinstance(view, RecurrentCacheView):
@@ -1672,14 +1674,20 @@ class ExecutionManager:
             gather[:upper] = numpy.where(base >= 0, base, 0)
             keep[:upper] = base >= 0
             if candidate_count > 0 and n_slots > base_slots:
+                # Prefix-major candidate layout: base + prefix * base_slots + slot.
                 for b in range(base_slots):
                     src_b = int(perm[b])
                     for k in range(candidate_count):
-                        dst = base_slots + b * candidate_count + k
+                        dst = base_slots + k * base_slots + b
                         if dst >= n_slots:
-                            break
+                            continue
                         if src_b >= 0:
-                            gather[dst] = base_slots + src_b * candidate_count + k
+                            src = base_slots + k * base_slots + src_b
+                            if src < n_slots:
+                                gather[dst] = src
+                            else:
+                                gather[dst] = 0
+                                keep[dst] = False
                         else:
                             gather[dst] = 0
                             keep[dst] = False

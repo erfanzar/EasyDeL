@@ -59,6 +59,9 @@ from dataclasses import dataclass
 import jax
 import jax.numpy as jnp
 import spectrax as spx
+from ejkernel.modules.operations.ragged_causal_conv1d import (
+    _reorder_concatenated_tensor_for_sharding,
+)
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec
@@ -990,7 +993,8 @@ def _apply_qwen3_next_packed_updates_unified(
         commit = jnp.asarray(spec_recurrent_commit, dtype=jnp.int32)
         raw_prefix = commit[1, :num_slots]
         commit_active = (commit[0, :num_slots] > 0) & (raw_prefix > 0) & (raw_prefix <= int(candidate_count))
-        candidate_rows = num_slots + slot_ids * int(candidate_count) + raw_prefix - 1
+        # Prefix-major candidate layout: base + prefix * num_slots + slot.
+        candidate_rows = num_slots + (raw_prefix - 1) * num_slots + slot_ids
         safe_rows = jnp.clip(candidate_rows, 0, conv_states.shape[0] - 1)
         row_valid = commit_active & (candidate_rows < conv_states.shape[0])
         conv_states = conv_states.at[:num_slots].set(
@@ -1106,14 +1110,16 @@ def _apply_qwen3_next_packed_updates_unified(
         Iterates over the ``candidate_count`` draft positions, advancing
         a rolling ``(conv, recurrent)`` state per slot using
         :meth:`GatedDeltaRuleOp.fused_conv_decode` plus a manual
-        single-step gated-delta-rule, and writes each intermediate state
-        into the corresponding candidate row of the per-request commit
-        buffer so that later acceptance/rejection can rewind to any
-        prefix length.
+        single-step gated-delta-rule, stacking each intermediate state and
+        writing all candidate rows with one ``dynamic_update_slice`` in the
+        prefix-major ``base + prefix * num_slots + slot`` layout so that
+        later acceptance/rejection can rewind to any prefix length.
         """
         token_outputs_i, conv_states_i, recurrent_states_i, candidate_conv_i, candidate_recurrent_i = operand
         rolling_conv = conv_states_i
         rolling_recurrent = recurrent_states_i
+        stacked_conv: list[Array] = []
+        stacked_recurrent: list[Array] = []
 
         for prefix_idx in range(candidate_count):
             prefix_pos = jnp.asarray(prefix_idx, dtype=jnp.int32)
@@ -1189,24 +1195,15 @@ def _apply_qwen3_next_packed_updates_unified(
             token_outputs_i = token_outputs_i.at[safe_positions].add(
                 jnp.where(token_mask, step_output[:, 0].astype(token_outputs_i.dtype), 0)
             )
+            stacked_conv.append(rolling_conv.astype(candidate_conv_i.dtype))
+            stacked_recurrent.append(rolling_recurrent.astype(candidate_recurrent_i.dtype))
 
-            candidate_rows = num_slots + slot_ids * int(candidate_count) + int(prefix_idx)
-            safe_rows = jnp.clip(candidate_rows, 0, conv_states.shape[0] - 1)
-            row_valid = prefix_valid & (candidate_rows < conv_states.shape[0])
-            candidate_conv_values = jnp.where(
-                row_valid[:, None, None],
-                rolling_conv.astype(candidate_conv_i.dtype),
-                candidate_conv_i[safe_rows],
-            )
-            candidate_recurrent_values = jnp.where(
-                row_valid[:, None, None, None],
-                rolling_recurrent.astype(candidate_recurrent_i.dtype),
-                candidate_recurrent_i[safe_rows],
-            )
-            candidate_conv_i = candidate_conv_i.at[safe_rows].set(candidate_conv_values.astype(candidate_conv_i.dtype))
-            candidate_recurrent_i = candidate_recurrent_i.at[safe_rows].set(
-                candidate_recurrent_values.astype(candidate_recurrent_i.dtype)
-            )
+        candidate_conv_i = jax.lax.dynamic_update_slice_in_dim(
+            candidate_conv_i, jnp.concatenate(stacked_conv, axis=0), num_slots, axis=0
+        )
+        candidate_recurrent_i = jax.lax.dynamic_update_slice_in_dim(
+            candidate_recurrent_i, jnp.concatenate(stacked_recurrent, axis=0), num_slots, axis=0
+        )
 
         conv_states_i = jnp.where(spec_slot_mask[:, None, None], rolling_conv, conv_states_i)
         recurrent_states_i = jnp.where(spec_slot_mask[:, None, None, None], rolling_recurrent, recurrent_states_i)
@@ -1434,7 +1431,7 @@ def _write_qwen3_next_spec_candidate_states(
     conv_states: Float[Array, "num_slots conv_dim d_conv"],
     recurrent_states: Float[Array, "num_slots num_v_heads head_dim value_dim"],
     conv_input: Float[Array, "batch seq_len conv_dim"],
-    kernel: Float[Array, "conv_dim d_conv"],
+    conv_outputs_flat: Float[Array, "seq_len conv_dim"],
     query_start_loc: Int[Array, "num_slots_plus_1"],
     context_lens: Int[Array, "num_slots"] | None,
     num_requests: Int[Array, ""],
@@ -1442,38 +1439,74 @@ def _write_qwen3_next_spec_candidate_states(
     head_k_dim: int,
     num_v_heads: int,
     head_v_dim: int,
-    conv_output_dtype: jnp.dtype,
     alpha_raw: Float[Array, "batch seq_len num_v_heads"],
     beta_raw: Float[Array, "batch seq_len num_v_heads"],
     A_log: Float[Array, "num_v_heads"],
     dt_bias: Float[Array, "num_v_heads"],
+    apply_silu_rows: bool,
+    split_sizes: tuple[int, ...],
+    use_head_sharded: bool,
+    mesh=None,
+    head_axis=None,
 ) -> tuple[
-    Float[Array, "num_slots conv_dim d_conv"],
-    Float[Array, "num_slots num_v_heads head_dim value_dim"],
-]:
-    """Write speculative GDN candidate states into extra cache rows.
+    Float[Array, "candidate_rows conv_dim d_conv"],
+    Float[Array, "candidate_rows num_v_heads head_dim value_dim"],
+] | None:
+    """Compute speculative GDN candidate state blocks for the extra cache rows.
 
     eSurge stores live recurrent state in rows ``[0, max_num_reqs)``. When the
-    runner allocates speculative candidate rows, they are laid out as
-    ``base + request_row * num_candidates + prefix_index``. Prefix index 0 is
+    runner allocates speculative candidate rows, they are laid out PREFIX-MAJOR:
+    ``base + prefix_index * max_num_reqs + request_row``. Prefix index 0 is
     the state after the real decode token, index 1 after the first accepted
     draft, and so on. The full-accept case can use the normal live row because
     the main ragged update already advanced through the complete verify window.
+
+    The recurrent candidates come from ONE fused window scan
+    (:meth:`GatedDeltaRuleOp.gdn_spec_window_states`): the window-entry state
+    is read once and every per-prefix state is emitted step-major, matching the
+    prefix-major candidate rows, so the whole write is a single
+    ``dynamic_update_slice`` per state tensor. The per-token Q/K/V rows are
+    reused from the main ragged conv pass (``conv_outputs_flat``) instead of
+    re-running a per-step conv chain.
+
+    The conv candidates are pure data movement: the conv state after ``p``
+    window tokens is the trailing ``d_conv`` window of
+    ``[state columns .. window tokens]``. When the head-sharded conv is active
+    the persistent conv-state pool lives in the interleaved per-shard feature
+    layout, so the window token columns are reordered into that layout first —
+    keeping the committed candidate rows layout-consistent with the pool (the
+    per-step legacy writer stored plain-layout token columns there).
+
+    Rows whose slot is not in this step's spec window receive copies of that
+    slot's (unchanged) window-entry state. Those rows are dead data: a
+    candidate row is only ever read by the commit gather at the top of a LATER
+    step, and a commit is only queued for a request that went through a spec
+    window in THIS step — which wrote its rows here. For the same reason the
+    blocks are computed UNconditionally whenever candidate rows exist (no
+    ``lax.cond``): a conditional would force the full state pool through the
+    cond output every step, which costs more than the block computation, and
+    non-spec windows in a speculative runner are rare.
+
+    Returns:
+        ``(conv_block, recurrent_block)`` of leading length
+        ``candidate_count * base_slots`` (prefix-major), to be written at row
+        offset ``base_slots`` of the updated pools — or ``None`` when the
+        cache carries no candidate rows (non-speculative runners).
     """
     base_slots = query_start_loc.shape[0] - 1
     if base_slots <= 0:
-        return conv_states, recurrent_states
+        return None
 
     extra_slots = conv_states.shape[0] - base_slots
     if extra_slots <= 0:
-        return conv_states, recurrent_states
+        return None
 
     candidate_count = extra_slots // base_slots
     if candidate_count <= 0:
-        return conv_states, recurrent_states
+        return None
 
     seq_len = conv_input.shape[1]
-    key_dim = int(num_k_heads) * int(head_k_dim)
+    d_conv = conv_states.shape[-1]
     slot_ids = jnp.arange(base_slots, dtype=jnp.int32)
     starts = query_start_loc[:base_slots]
     scheduled_tokens = query_start_loc[1 : base_slots + 1] - starts
@@ -1487,97 +1520,55 @@ def _write_qwen3_next_spec_candidate_states(
         active_slots & (scheduled_tokens > 1) & (scheduled_tokens <= (candidate_count + 1)) & (context_before > 0)
     )
 
-    def _run_candidate_scan(_):
-        """Compute and stash per-prefix speculative candidate states.
+    step_ids = jnp.arange(candidate_count, dtype=jnp.int32)
+    positions = starts[:, None] + step_ids[None, :]
+    safe_positions = jnp.clip(positions, 0, seq_len - 1)
+    step_valid = spec_slot_mask[:, None] & (step_ids[None, :] < scheduled_tokens[:, None])
 
-        Conditional body executed when ``spec_slot_mask`` has any
-        active entries. For each draft prefix position it advances a
-        rolling ``(conv, recurrent)`` copy of the live state and writes
-        the resulting tuple into the slot's candidate row using the
-        ``base + slot * candidate_count + prefix`` layout so the
-        scheduler can rewind to any accepted prefix length.
-        """
-        candidate_conv_states = conv_states
-        candidate_recurrent_states = recurrent_states
-        rolling_conv = conv_states[:base_slots]
-        rolling_recurrent = recurrent_states[:base_slots]
-        repeat_factor = max(1, int(num_v_heads) // max(1, int(num_k_heads)))
-
-        for prefix_idx in range(candidate_count):
-            token_positions = starts + jnp.asarray(prefix_idx, dtype=jnp.int32)
-            safe_positions = jnp.clip(token_positions, 0, seq_len - 1)
-            prefix_valid = spec_slot_mask & (jnp.asarray(prefix_idx, dtype=jnp.int32) < scheduled_tokens)
-
-            new_tokens = conv_input[0, safe_positions, :]
-            shifted_conv, conv_output = GatedDeltaRuleOp.fused_conv_decode(
-                conv_state=rolling_conv,
-                new_tokens=new_tokens,
-                kernel=kernel,
-                output_dtype=conv_output_dtype,
-            )
-
-            query = conv_output[:, :key_dim].reshape(base_slots, num_k_heads, head_k_dim)
-            key = conv_output[:, key_dim : key_dim * 2].reshape(base_slots, num_k_heads, head_k_dim)
-            value = conv_output[:, key_dim * 2 :].reshape(base_slots, num_v_heads, head_v_dim)
-            if repeat_factor > 1:
-                query = jnp.repeat(query, repeat_factor, axis=1)
-                key = jnp.repeat(key, repeat_factor, axis=1)
-
-            query = l2norm_decode(query, axis=-1, eps=1e-6)
-            key = l2norm_decode(key, axis=-1, eps=1e-6)
-            scale = jax.lax.rsqrt(jnp.asarray(head_k_dim, dtype=jnp.float32))
-            query = (query.astype(jnp.float32) * scale).astype(query.dtype)
-
-            beta = jax.nn.sigmoid(beta_raw[0, safe_positions].astype(jnp.float32))
-            g = -jnp.exp(A_log.astype(jnp.float32))[None, :] * jax.nn.softplus(
-                alpha_raw[0, safe_positions].astype(jnp.float32) + dt_bias.astype(jnp.float32)[None, :]
-            )
-            exp_g = jnp.exp(g)
-
-            state_f = rolling_recurrent.astype(jnp.float32)
-            key_f = key.astype(jnp.float32)
-            value_f = value.astype(jnp.float32)
-            exp_g_f = exp_g.astype(jnp.float32)
-            k_state = jnp.einsum("bhd,bhdm->bhm", key_f, state_f)
-            v_new = beta[..., None] * (value_f - exp_g_f[..., None] * k_state)
-            next_recurrent = state_f * exp_g_f[..., None, None] + key_f[..., :, None] * v_new[..., None, :]
-
-            rolling_conv = jnp.where(
-                prefix_valid[:, None, None],
-                shifted_conv.astype(rolling_conv.dtype),
-                rolling_conv,
-            ).astype(rolling_conv.dtype)
-            rolling_recurrent = jnp.where(
-                prefix_valid[:, None, None, None],
-                next_recurrent.astype(rolling_recurrent.dtype),
-                rolling_recurrent,
-            )
-
-            candidate_rows = base_slots + slot_ids * candidate_count + int(prefix_idx)
-            in_bounds = candidate_rows < conv_states.shape[0]
-            safe_rows = jnp.clip(candidate_rows, 0, conv_states.shape[0] - 1)
-            write_mask = prefix_valid & in_bounds
-            candidate_conv_values = jnp.where(
-                write_mask[:, None, None],
-                rolling_conv.astype(candidate_conv_states.dtype),
-                candidate_conv_states[safe_rows],
-            ).astype(candidate_conv_states.dtype)
-            candidate_recurrent_values = jnp.where(
-                write_mask[:, None, None, None],
-                rolling_recurrent.astype(candidate_recurrent_states.dtype),
-                candidate_recurrent_states[safe_rows],
-            ).astype(candidate_recurrent_states.dtype)
-            candidate_conv_states = candidate_conv_states.at[safe_rows].set(candidate_conv_values)
-            candidate_recurrent_states = candidate_recurrent_states.at[safe_rows].set(candidate_recurrent_values)
-
-        return candidate_conv_states, candidate_recurrent_states
-
-    return jax.lax.cond(
-        jnp.any(spec_slot_mask),
-        _run_candidate_scan,
-        lambda _: (conv_states, recurrent_states),
-        operand=None,
+    qkv_rows = conv_outputs_flat[safe_positions.reshape(-1)].reshape(base_slots, candidate_count, -1)
+    b_rows = beta_raw[0, safe_positions]
+    a_rows = alpha_raw[0, safe_positions]
+    stacked_states = GatedDeltaRuleOp.gdn_spec_window_states(
+        qkv_rows,
+        b_rows,
+        a_rows,
+        A_log,
+        dt_bias,
+        step_valid,
+        recurrent_states[:base_slots],
+        n_kq=num_k_heads,
+        n_v=num_v_heads,
+        d_k=head_k_dim,
+        d_v=head_v_dim,
+        apply_silu=apply_silu_rows,
+        mesh=mesh if use_head_sharded else None,
+        head_axis=head_axis if use_head_sharded else None,
     )
+    candidate_recurrent_block = stacked_states.reshape(
+        candidate_count * base_slots, num_v_heads, head_k_dim, head_v_dim
+    ).astype(recurrent_states.dtype)
+
+    token_cols = conv_input[0, safe_positions]
+    if use_head_sharded:
+        # The persistent conv-state pool is stored in the interleaved
+        # per-shard feature layout (see ragged_causal_conv1d_head_sharded);
+        # bring the window token columns into the same layout.
+        token_cols = _reorder_concatenated_tensor_for_sharding(
+            token_cols, split_sizes, int(mesh_axis_size(mesh, head_axis)), -1
+        )
+    combined_cols = jnp.concatenate(
+        [conv_states[:base_slots], token_cols.transpose(0, 2, 1).astype(conv_states.dtype)],
+        axis=2,
+    )
+    rolling_conv = conv_states[:base_slots]
+    stacked_conv: list[Array] = []
+    for prefix_idx in range(candidate_count):
+        window_p = jax.lax.slice_in_dim(combined_cols, prefix_idx + 1, prefix_idx + 1 + d_conv, axis=2)
+        rolling_conv = jnp.where(step_valid[:, prefix_idx][:, None, None], window_p, rolling_conv)
+        stacked_conv.append(rolling_conv)
+    candidate_conv_block = jnp.concatenate(stacked_conv, axis=0).astype(conv_states.dtype)
+
+    return candidate_conv_block, candidate_recurrent_block
 
 
 def _apply_qwen3_next_packed_updates_ragged(
@@ -1701,7 +1692,8 @@ def _apply_qwen3_next_packed_updates_ragged(
         commit = jnp.asarray(spec_recurrent_commit, dtype=jnp.int32)
         raw_prefix = commit[1, :num_slots]
         commit_active = (commit[0, :num_slots] > 0) & (raw_prefix > 0) & (raw_prefix <= int(candidate_count))
-        candidate_rows = num_slots + slot_ids * int(candidate_count) + raw_prefix - 1
+        # Prefix-major candidate layout: base + prefix * num_slots + slot.
+        candidate_rows = num_slots + (raw_prefix - 1) * num_slots + slot_ids
         safe_rows = jnp.clip(candidate_rows, 0, conv_states.shape[0] - 1)
         row_valid = commit_active & (candidate_rows < conv_states.shape[0])
         conv_states = conv_states.at[:num_slots].set(
@@ -1749,25 +1741,6 @@ def _apply_qwen3_next_packed_updates_ragged(
         and not bool(disable_recurrent_scan_prefill)
         and (force_recurrent_scan_prefill or seq_len <= recurrent_scan_prefill_max_seq_len)
     )
-    candidate_conv_states, candidate_recurrent_states = _write_qwen3_next_spec_candidate_states(
-        conv_states=conv_states,
-        recurrent_states=recurrent_states,
-        conv_input=conv_input,
-        kernel=kernel,
-        query_start_loc=query_start_loc,
-        context_lens=context_lens,
-        num_requests=num_requests,
-        num_k_heads=num_k_heads,
-        head_k_dim=head_k_dim,
-        num_v_heads=num_v_heads,
-        head_v_dim=head_v_dim,
-        conv_output_dtype=conv_output_dtype,
-        alpha_raw=alpha_raw,
-        beta_raw=beta_raw,
-        A_log=A_log,
-        dt_bias=dt_bias,
-    )
-
     def _run_normal_ragged_path(_):
         """Run the standard ragged conv + ragged GDR fast path.
 
@@ -1775,8 +1748,8 @@ def _apply_qwen3_next_packed_updates_ragged(
         chunked / decode-only branches of :class:`RaggedGatedDeltaRule`,
         sharing one ``(query_start_loc, state_indices, distribution)``
         triple so the entire layer collapses to two kernel launches.
-        Speculative-candidate rows produced earlier are merged back
-        after both kernel calls.
+        Speculative-candidate rows are produced from the SAME conv outputs
+        (one fused window scan) and merged back after both kernel calls.
         """
         conv_outputs_flat, updated_conv_states = ragged_causal_conv1d_head_sharded(
             conv_input[0],
@@ -1793,6 +1766,29 @@ def _apply_qwen3_next_packed_updates_ragged(
             pre_sharded=False,
         )
         conv_outputs_flat = conv_outputs_flat.astype(conv_output_dtype)
+
+        candidate_blocks = _write_qwen3_next_spec_candidate_states(
+            conv_states=conv_states,
+            recurrent_states=recurrent_states,
+            conv_input=conv_input,
+            conv_outputs_flat=conv_outputs_flat,
+            query_start_loc=query_start_loc,
+            context_lens=context_lens,
+            num_requests=num_requests,
+            num_k_heads=num_k_heads,
+            head_k_dim=head_k_dim,
+            num_v_heads=num_v_heads,
+            head_v_dim=head_v_dim,
+            alpha_raw=alpha_raw,
+            beta_raw=beta_raw,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            apply_silu_rows=use_recurrent_scan_prefill,
+            split_sizes=split_sizes,
+            use_head_sharded=use_head_sharded_conv,
+            mesh=mesh,
+            head_axis=head_axis,
+        )
 
         new_recurrent_state, token_outputs_i = ragged_gdr_op(
             mixed_qkv=conv_outputs_flat,
@@ -1818,12 +1814,15 @@ def _apply_qwen3_next_packed_updates_ragged(
             mask_initial_state=context_lens is not None,
         )
         token_outputs_i = token_outputs_i.reshape(seq_len, num_v_heads, head_v_dim)
-        if conv_states.shape[0] > num_slots:
-            updated_conv_states = updated_conv_states.at[num_slots:].set(
-                candidate_conv_states[num_slots:].astype(updated_conv_states.dtype)
+        if candidate_blocks is not None:
+            conv_block, recurrent_block = candidate_blocks
+            # The main-pass outputs are freshly produced, so these in-place
+            # slice updates alias instead of copying the full state pools.
+            updated_conv_states = jax.lax.dynamic_update_slice_in_dim(
+                updated_conv_states, conv_block.astype(updated_conv_states.dtype), num_slots, axis=0
             )
-            new_recurrent_state = new_recurrent_state.at[num_slots:].set(
-                candidate_recurrent_states[num_slots:].astype(new_recurrent_state.dtype)
+            new_recurrent_state = jax.lax.dynamic_update_slice_in_dim(
+                new_recurrent_state, recurrent_block.astype(new_recurrent_state.dtype), num_slots, axis=0
             )
         return updated_conv_states, new_recurrent_state, token_outputs_i.astype(jnp.float32)
 

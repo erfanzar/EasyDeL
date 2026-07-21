@@ -55,8 +55,12 @@ from ejkernel.modules.operations import (
 from ejkernel.modules.operations import (
     gated_delta_rule_grouped_decode as _ejkernel_gated_delta_rule_grouped_decode,
 )
+from ejkernel.modules.operations import (
+    gdn_spec_window_states as _ejkernel_gdn_spec_window_states,
+)
 from ejkernel.modules.operations.configs import GatedDeltaRuleConfig
-from jaxtyping import Array, Float
+from jax.sharding import PartitionSpec
+from jaxtyping import Array, Bool, Float
 from spectrax import with_sharding_constraint
 
 from easydel.caching import RecurrentCacheView
@@ -215,6 +219,100 @@ class GatedDeltaRuleOp(OperationImpl):
             decay,
             recurrent_state,
             platform="xla",
+        )
+
+    @staticmethod
+    def gdn_spec_window_states(
+        mixed_qkv: Float[Array, "batch num_steps qkv_dim"],
+        b: Float[Array, "batch num_steps num_v_heads"],
+        a: Float[Array, "batch num_steps num_v_heads"],
+        A_log: Float[Array, "num_v_heads"],  # noqa: F821
+        dt_bias: Float[Array, "num_v_heads"],  # noqa: F821
+        step_valid: Bool[Array, "batch num_steps"],
+        recurrent_state: Float[Array, "batch num_v_heads key_dim value_dim"],
+        *,
+        n_kq: int,
+        n_v: int,
+        d_k: int,
+        d_v: int,
+        apply_silu: bool = False,
+        mesh=None,
+        head_axis=None,
+    ) -> Float[Array, "num_steps batch num_v_heads key_dim value_dim"]:
+        """Per-prefix GDN recurrent states over a speculative verify window.
+
+        Delegates to the eJKernel ``gdn_spec_window_states`` operation: one
+        fused scan that reads the window-entry state once and returns the
+        state after every window step, stacked step-major (the prefix-major
+        candidate-row layout). On TPU the fused Pallas kernel keeps the state
+        tile in VMEM; elsewhere the XLA reference runs the same math.
+
+        Args:
+            mixed_qkv: Post-conv packed rows ``[batch, num_steps, qkv_dim]``.
+                When ``mesh``/``head_axis`` are given, the feature axis must be
+                in the interleaved per-shard concat layout produced by the
+                head-sharded ragged conv.
+            b: Raw beta gate rows ``[batch, num_steps, n_v]``.
+            a: Raw alpha gate rows ``[batch, num_steps, n_v]``.
+            A_log: Per-value-head log-decay parameter ``[n_v]``.
+            dt_bias: Per-value-head delta-time bias ``[n_v]``.
+            step_valid: ``[batch, num_steps]`` per-step validity mask.
+            recurrent_state: Window-entry state ``[batch, n_v, d_k, d_v]``.
+            n_kq: GLOBAL number of key/query heads.
+            n_v: GLOBAL number of value heads.
+            d_k: Key/query head dim.
+            d_v: Value head dim.
+            apply_silu: Apply SiLU to ``mixed_qkv`` inside the op (rows taken
+                from a conv pass that skipped its fused activation).
+            mesh: Optional mesh for tensor-parallel ``shard_map`` execution.
+            head_axis: Logical mesh axis the heads are sharded over.
+
+        Returns:
+            ``[num_steps, batch, n_v, d_k, d_v]`` states in
+            ``recurrent_state.dtype``.
+        """
+        if mesh is not None and head_axis is not None:
+            head_spec = PartitionSpec(None, None, head_axis)
+            in_specs = (
+                head_spec,
+                head_spec,
+                head_spec,
+                PartitionSpec(head_axis),
+                PartitionSpec(head_axis),
+                PartitionSpec(None, None),
+                PartitionSpec(None, head_axis, None, None),
+            )
+            out_specs = PartitionSpec(None, None, head_axis, None, None)
+            return _ejkernel_gdn_spec_window_states(
+                mixed_qkv,
+                b,
+                a,
+                A_log,
+                dt_bias,
+                step_valid,
+                recurrent_state,
+                n_kq=n_kq,
+                n_v=n_v,
+                d_k=d_k,
+                d_v=d_v,
+                apply_silu=apply_silu,
+                mesh=mesh,
+                in_specs=in_specs,
+                out_specs=out_specs,
+            )
+        return _ejkernel_gdn_spec_window_states(
+            mixed_qkv,
+            b,
+            a,
+            A_log,
+            dt_bias,
+            step_valid,
+            recurrent_state,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            apply_silu=apply_silu,
         )
 
     @staticmethod
