@@ -92,6 +92,49 @@ def _record_sharding_adjustment(before: tp.Any, after: tp.Any) -> None:
         counter["count"] += 1
 
 
+_MOE_FSDP_SHARD_EXPERT_WEIGHTS: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "easydel_moe_fsdp_shard_expert_weights",
+    default=False,
+)
+
+
+@contextmanager
+def moe_expert_param_layout_scope(*, fsdp_shard_expert_weights: bool) -> Iterator[None]:
+    """Scope the MoE expert-parameter layout policy for parameter construction.
+
+    The parameter-init sharding context (``EasyDeLBaseModule``'s wrapped
+    ``__init__``) enters this scope with the config-derived
+    ``moe_fsdp_shard_expert_weights`` knob so that ``ParallelMoELinear``
+    layers built anywhere under a model constructor can extend the expert
+    (leading) dimension of their weight layout with the FSDP axis without
+    every model family having to thread the flag explicitly.
+
+    Args:
+        fsdp_shard_expert_weights: Whether MoE expert weights constructed
+            inside the scope should shard their expert dimension over the
+            FSDP axis (in addition to EP) at rest.
+
+    Yields:
+        None: Inside the ``with`` block the ambient flag is visible via
+        :func:`moe_fsdp_shard_expert_weights_enabled`.
+    """
+    token = _MOE_FSDP_SHARD_EXPERT_WEIGHTS.set(bool(fsdp_shard_expert_weights))
+    try:
+        yield
+    finally:
+        _MOE_FSDP_SHARD_EXPERT_WEIGHTS.reset(token)
+
+
+def moe_fsdp_shard_expert_weights_enabled() -> bool:
+    """Return the ambient MoE expert-weight FSDP-sharding flag.
+
+    Returns:
+        bool: ``True`` when the enclosing parameter-init context requested
+        FSDP-sharded expert weights, ``False`` otherwise (the default).
+    """
+    return _MOE_FSDP_SHARD_EXPERT_WEIGHTS.get()
+
+
 CANONICAL_MESH_AXIS_NAMES: tuple[str, ...] = ("pp", "dp", "fsdp", "ep", "tp", "sp")
 _SIMPLE_SEMANTIC_AXES: tuple[str, ...] = (
     common_types.DATA_PARALLEL,
