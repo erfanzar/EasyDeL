@@ -1718,22 +1718,10 @@ def _apply_qwen3_next_packed_updates_ragged(
         window scan adds no extra region boundary; the candidate conv
         windows (pure data movement) are built outside and both blocks are
         merged into the freshly produced pools in place.
-
-        On speculative runners the state pools carry ``candidate_count *
-        num_slots`` extra candidate rows that the conv/GDN kernels never
-        write (``state_indices`` covers rows ``[0, num_slots)`` only), but
-        threading the FULL pools through the ops' internal branch
-        conditionals forced XLA defensive copies of the whole pool inside
-        every branch, every layer (HLO: ~4 pool-sized copies/layer). Slice
-        the pools to the base rows around the ops and merge the results
-        back into the donated full pools once, in place.
         """
-        base_conv_pool = conv_states[:num_slots] if extra_slots > 0 else conv_states
-        base_recurrent_pool = recurrent_states[:num_slots] if extra_slots > 0 else recurrent_states
-
-        conv_outputs_flat, updated_base_conv = ragged_causal_conv1d_head_sharded(
+        conv_outputs_flat, updated_conv_states = ragged_causal_conv1d_head_sharded(
             conv_input[0],
-            base_conv_pool,
+            conv_states,
             kernel,
             qsl,
             state_indices,
@@ -1746,12 +1734,6 @@ def _apply_qwen3_next_packed_updates_ragged(
             pre_sharded=False,
         )
         conv_outputs_flat = conv_outputs_flat.astype(conv_output_dtype)
-        if extra_slots > 0:
-            updated_conv_states = jax.lax.dynamic_update_slice_in_dim(
-                conv_states, updated_base_conv.astype(conv_states.dtype), 0, axis=0
-            )
-        else:
-            updated_conv_states = updated_base_conv
 
         window_prep = _qwen3_next_spec_window_prep(
             conv_states=conv_states,
@@ -1767,11 +1749,11 @@ def _apply_qwen3_next_packed_updates_ragged(
 
         if window_prep is not None:
             safe_positions, step_valid, candidate_count, conv_block = window_prep
-            new_base_recurrent, token_outputs_i, stacked_states = ragged_gdr_op.forward_with_window_states(
+            new_recurrent_state, token_outputs_i, stacked_states = ragged_gdr_op.forward_with_window_states(
                 mixed_qkv=conv_outputs_flat,
                 b=beta_raw[0, :seq_len],
                 a=alpha_raw[0, :seq_len],
-                recurrent_state=base_recurrent_pool,
+                recurrent_state=recurrent_states,
                 A_log=A_log,
                 dt_bias=dt_bias,
                 query_start_loc=qsl,
@@ -1797,24 +1779,21 @@ def _apply_qwen3_next_packed_updates_ragged(
                 candidate_count * num_slots, num_v_heads, head_k_dim, head_v_dim
             )
             token_outputs_i = token_outputs_i.reshape(seq_len, num_v_heads, head_v_dim)
-            # Merge the base rows and candidate blocks into the donated full
-            # pools in place (both regions are disjoint slice updates).
-            new_recurrent_state = jax.lax.dynamic_update_slice_in_dim(
-                recurrent_states, new_base_recurrent.astype(recurrent_states.dtype), 0, axis=0
-            )
-            updated_conv_states_full = jax.lax.dynamic_update_slice_in_dim(
+            # The main-pass outputs are freshly produced, so these in-place
+            # slice updates alias instead of copying the full state pools.
+            updated_conv_states = jax.lax.dynamic_update_slice_in_dim(
                 updated_conv_states, conv_block.astype(updated_conv_states.dtype), num_slots, axis=0
             )
             new_recurrent_state = jax.lax.dynamic_update_slice_in_dim(
                 new_recurrent_state, recurrent_block.astype(new_recurrent_state.dtype), num_slots, axis=0
             )
-            return updated_conv_states_full, new_recurrent_state, token_outputs_i.astype(jnp.float32)
+            return updated_conv_states, new_recurrent_state, token_outputs_i.astype(jnp.float32)
 
-        new_base_recurrent, token_outputs_i = ragged_gdr_op(
+        new_recurrent_state, token_outputs_i = ragged_gdr_op(
             mixed_qkv=conv_outputs_flat,
             b=beta_raw[0, :seq_len],
             a=alpha_raw[0, :seq_len],
-            recurrent_state=base_recurrent_pool,
+            recurrent_state=recurrent_states,
             A_log=A_log,
             dt_bias=dt_bias,
             query_start_loc=qsl,
@@ -1834,12 +1813,6 @@ def _apply_qwen3_next_packed_updates_ragged(
             mask_initial_state=context_lens is not None,
         )
         token_outputs_i = token_outputs_i.reshape(seq_len, num_v_heads, head_v_dim)
-        if extra_slots > 0:
-            new_recurrent_state = jax.lax.dynamic_update_slice_in_dim(
-                recurrent_states, new_base_recurrent.astype(recurrent_states.dtype), 0, axis=0
-            )
-        else:
-            new_recurrent_state = new_base_recurrent
         return updated_conv_states, new_recurrent_state, token_outputs_i.astype(jnp.float32)
 
     return _run_normal_ragged_path(None)
