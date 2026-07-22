@@ -1426,56 +1426,34 @@ def _apply_qwen3_next_packed_updates_unified(
     return out_conv_states, out_recurrent_states, token_outputs
 
 
-def _write_qwen3_next_spec_candidate_states(
+def _qwen3_next_spec_window_prep(
     *,
     conv_states: Float[Array, "num_slots conv_dim d_conv"],
-    recurrent_states: Float[Array, "num_slots num_v_heads head_dim value_dim"],
     conv_input: Float[Array, "batch seq_len conv_dim"],
-    conv_outputs_flat: Float[Array, "seq_len conv_dim"],
     query_start_loc: Int[Array, "num_slots_plus_1"],
     context_lens: Int[Array, "num_slots"] | None,
     num_requests: Int[Array, ""],
-    num_k_heads: int,
-    head_k_dim: int,
-    num_v_heads: int,
-    head_v_dim: int,
-    alpha_raw: Float[Array, "batch seq_len num_v_heads"],
-    beta_raw: Float[Array, "batch seq_len num_v_heads"],
-    A_log: Float[Array, "num_v_heads"],
-    dt_bias: Float[Array, "num_v_heads"],
-    apply_silu_rows: bool,
     split_sizes: tuple[int, ...],
     use_head_sharded: bool,
     mesh=None,
     head_axis=None,
-) -> tuple[
-    Float[Array, "candidate_rows conv_dim d_conv"],
-    Float[Array, "candidate_rows num_v_heads head_dim value_dim"],
-] | None:
-    """Compute speculative GDN candidate state blocks for the extra cache rows.
+) -> tuple[Int[Array, "base_slots num_steps"], Bool[Array, "base_slots num_steps"], int, Array] | None:
+    """Speculative-window metadata + candidate CONV block for the extra cache rows.
 
     eSurge stores live recurrent state in rows ``[0, max_num_reqs)``. When the
     runner allocates speculative candidate rows, they are laid out PREFIX-MAJOR:
     ``base + prefix_index * max_num_reqs + request_row``. Prefix index 0 is
     the state after the real decode token, index 1 after the first accepted
-    draft, and so on. The full-accept case can use the normal live row because
-    the main ragged update already advanced through the complete verify window.
+    draft, and so on.
 
-    The recurrent candidates come from ONE fused window scan
-    (:meth:`GatedDeltaRuleOp.gdn_spec_window_states`): the window-entry state
-    is read once and every per-prefix state is emitted step-major, matching the
-    prefix-major candidate rows, so the whole write is a single
-    ``dynamic_update_slice`` per state tensor. The per-token Q/K/V rows are
-    reused from the main ragged conv pass (``conv_outputs_flat``) instead of
-    re-running a per-step conv chain.
-
-    The conv candidates are pure data movement: the conv state after ``p``
-    window tokens is the trailing ``d_conv`` window of
+    This helper computes the per-slot window token positions and validity mask
+    (consumed by the fused ragged-GDN-plus-window-states operation, which
+    produces the RECURRENT candidate blocks inside the main pass's shard_map
+    region) and the candidate CONV blocks, which are pure data movement: the
+    conv state after ``p`` window tokens is the trailing ``d_conv`` window of
     ``[state columns .. window tokens]``. When the head-sharded conv is active
     the persistent conv-state pool lives in the interleaved per-shard feature
-    layout, so the window token columns are reordered into that layout first —
-    keeping the committed candidate rows layout-consistent with the pool (the
-    per-step legacy writer stored plain-layout token columns there).
+    layout, so the window token columns are reordered into that layout first.
 
     Rows whose slot is not in this step's spec window receive copies of that
     slot's (unchanged) window-entry state. Those rows are dead data: a
@@ -1488,10 +1466,9 @@ def _write_qwen3_next_spec_candidate_states(
     non-spec windows in a speculative runner are rare.
 
     Returns:
-        ``(conv_block, recurrent_block)`` of leading length
-        ``candidate_count * base_slots`` (prefix-major), to be written at row
-        offset ``base_slots`` of the updated pools — or ``None`` when the
-        cache carries no candidate rows (non-speculative runners).
+        ``(safe_positions, step_valid, candidate_count, conv_block)`` — or
+        ``None`` when the cache carries no candidate rows (non-speculative
+        runners).
     """
     base_slots = query_start_loc.shape[0] - 1
     if base_slots <= 0:
@@ -1525,29 +1502,6 @@ def _write_qwen3_next_spec_candidate_states(
     safe_positions = jnp.clip(positions, 0, seq_len - 1)
     step_valid = spec_slot_mask[:, None] & (step_ids[None, :] < scheduled_tokens[:, None])
 
-    qkv_rows = conv_outputs_flat[safe_positions.reshape(-1)].reshape(base_slots, candidate_count, -1)
-    b_rows = beta_raw[0, safe_positions]
-    a_rows = alpha_raw[0, safe_positions]
-    stacked_states = GatedDeltaRuleOp.gdn_spec_window_states(
-        qkv_rows,
-        b_rows,
-        a_rows,
-        A_log,
-        dt_bias,
-        step_valid,
-        recurrent_states[:base_slots],
-        n_kq=num_k_heads,
-        n_v=num_v_heads,
-        d_k=head_k_dim,
-        d_v=head_v_dim,
-        apply_silu=apply_silu_rows,
-        mesh=mesh if use_head_sharded else None,
-        head_axis=head_axis if use_head_sharded else None,
-    )
-    candidate_recurrent_block = stacked_states.reshape(
-        candidate_count * base_slots, num_v_heads, head_k_dim, head_v_dim
-    ).astype(recurrent_states.dtype)
-
     token_cols = conv_input[0, safe_positions]
     if use_head_sharded:
         # The persistent conv-state pool is stored in the interleaved
@@ -1568,7 +1522,7 @@ def _write_qwen3_next_spec_candidate_states(
         stacked_conv.append(rolling_conv)
     candidate_conv_block = jnp.concatenate(stacked_conv, axis=0).astype(conv_states.dtype)
 
-    return candidate_conv_block, candidate_recurrent_block
+    return safe_positions, step_valid, candidate_count, candidate_conv_block
 
 
 def _apply_qwen3_next_packed_updates_ragged(
@@ -1758,9 +1712,12 @@ def _apply_qwen3_next_packed_updates_ragged(
         Composes :func:`ragged_causal_conv1d_head_sharded` with the
         chunked / decode-only branches of :class:`RaggedGatedDeltaRule`,
         sharing one ``(query_start_loc, state_indices, distribution)``
-        triple so the entire layer collapses to two kernel launches.
-        Speculative-candidate rows are produced from the SAME conv outputs
-        (one fused window scan) and merged back after both kernel calls.
+        triple. On speculative runners the per-prefix candidate recurrent
+        states are computed INSIDE the main pass's shard_map region
+        (:meth:`RaggedGatedDeltaRule.forward_with_window_states`) so the
+        window scan adds no extra region boundary; the candidate conv
+        windows (pure data movement) are built outside and both blocks are
+        merged into the freshly produced pools in place.
         """
         conv_outputs_flat, updated_conv_states = ragged_causal_conv1d_head_sharded(
             conv_input[0],
@@ -1778,28 +1735,59 @@ def _apply_qwen3_next_packed_updates_ragged(
         )
         conv_outputs_flat = conv_outputs_flat.astype(conv_output_dtype)
 
-        candidate_blocks = _write_qwen3_next_spec_candidate_states(
+        window_prep = _qwen3_next_spec_window_prep(
             conv_states=conv_states,
-            recurrent_states=recurrent_states,
             conv_input=conv_input,
-            conv_outputs_flat=conv_outputs_flat,
             query_start_loc=query_start_loc,
             context_lens=context_lens,
             num_requests=num_requests,
-            num_k_heads=num_k_heads,
-            head_k_dim=head_k_dim,
-            num_v_heads=num_v_heads,
-            head_v_dim=head_v_dim,
-            alpha_raw=alpha_raw,
-            beta_raw=beta_raw,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            apply_silu_rows=use_recurrent_scan_prefill,
             split_sizes=split_sizes,
             use_head_sharded=use_head_sharded_conv,
             mesh=mesh,
             head_axis=head_axis,
         )
+
+        if window_prep is not None:
+            safe_positions, step_valid, candidate_count, conv_block = window_prep
+            new_recurrent_state, token_outputs_i, stacked_states = ragged_gdr_op.forward_with_window_states(
+                mixed_qkv=conv_outputs_flat,
+                b=beta_raw[0, :seq_len],
+                a=alpha_raw[0, :seq_len],
+                recurrent_state=recurrent_states,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                query_start_loc=qsl,
+                state_indices=state_indices,
+                distribution=distribution,
+                window_positions=safe_positions,
+                window_valid=step_valid,
+                has_initial_state=has_initial_state,
+                num_base_slots=num_slots,
+                n_kq=num_k_heads,
+                n_v=num_v_heads,
+                d_k=head_k_dim,
+                d_v=head_v_dim,
+                use_qk_norm_in_gdn=True,
+                pre_sharded_mixed_qkv=use_head_sharded_conv,
+                flat_tp_shard=use_head_sharded_conv,
+                chunk_size=ragged_gdr_chunk_size,
+                apply_silu_in_gdr=use_recurrent_scan_prefill,
+                use_recurrent_scan_prefill=use_recurrent_scan_prefill,
+                mask_initial_state=context_lens is not None,
+            )
+            recurrent_block = stacked_states.reshape(
+                candidate_count * num_slots, num_v_heads, head_k_dim, head_v_dim
+            )
+            token_outputs_i = token_outputs_i.reshape(seq_len, num_v_heads, head_v_dim)
+            # The main-pass outputs are freshly produced, so these in-place
+            # slice updates alias instead of copying the full state pools.
+            updated_conv_states = jax.lax.dynamic_update_slice_in_dim(
+                updated_conv_states, conv_block.astype(updated_conv_states.dtype), num_slots, axis=0
+            )
+            new_recurrent_state = jax.lax.dynamic_update_slice_in_dim(
+                new_recurrent_state, recurrent_block.astype(new_recurrent_state.dtype), num_slots, axis=0
+            )
+            return updated_conv_states, new_recurrent_state, token_outputs_i.astype(jnp.float32)
 
         new_recurrent_state, token_outputs_i = ragged_gdr_op(
             mixed_qkv=conv_outputs_flat,
@@ -1825,16 +1813,6 @@ def _apply_qwen3_next_packed_updates_ragged(
             mask_initial_state=context_lens is not None,
         )
         token_outputs_i = token_outputs_i.reshape(seq_len, num_v_heads, head_v_dim)
-        if candidate_blocks is not None:
-            conv_block, recurrent_block = candidate_blocks
-            # The main-pass outputs are freshly produced, so these in-place
-            # slice updates alias instead of copying the full state pools.
-            updated_conv_states = jax.lax.dynamic_update_slice_in_dim(
-                updated_conv_states, conv_block.astype(updated_conv_states.dtype), num_slots, axis=0
-            )
-            new_recurrent_state = jax.lax.dynamic_update_slice_in_dim(
-                new_recurrent_state, recurrent_block.astype(new_recurrent_state.dtype), num_slots, axis=0
-            )
         return updated_conv_states, new_recurrent_state, token_outputs_i.astype(jnp.float32)
 
     return _run_normal_ragged_path(None)

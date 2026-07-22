@@ -1128,6 +1128,295 @@ def ragged_gated_delta_rule_v2(
 
 ragged_gated_delta_rule_v2_op = ragged_gated_delta_rule_v2
 
+
+def ragged_gated_delta_rule_v2_with_window_states(
+    mixed_qkv: jnp.ndarray,
+    b: jnp.ndarray,
+    a: jnp.ndarray,
+    recurrent_state: jnp.ndarray,
+    A_log: jnp.ndarray,
+    dt_bias: jnp.ndarray,
+    query_start_loc: jnp.ndarray,
+    state_indices: jnp.ndarray,
+    distribution: jnp.ndarray,
+    window_positions: jnp.ndarray,
+    window_valid: jnp.ndarray,
+    has_initial_state: jnp.ndarray | None = None,
+    *,
+    num_base_slots: int,
+    n_kq: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+    chunk_size: int = 64,
+    use_qk_norm_in_gdn: bool = True,
+    pre_sharded_mixed_qkv: bool = False,
+    flat_tp_shard: bool = False,
+    apply_silu_in_gdr: bool = False,
+    use_recurrent_scan_prefill: bool = False,
+    mask_initial_state: bool = False,
+    runtime_dtype: object | None = None,
+    mesh: object | None = None,
+    head_axis: object | None = None,
+    platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
+    cfg: RaggedGatedDeltaRuleV2Config | None = None,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Ragged GDN v2 plus the speculative-window state scan in ONE region.
+
+    Speculative decoding needs both the ragged GDN main pass and the per-prefix
+    window states (``gdn_spec_window_states``) every verify step. Running them
+    as two ``shard_map`` regions materializes the window op's inputs/outputs at
+    an extra region boundary each layer (measured as per-layer copy/transpose
+    traffic on the 27B verify forward). This entry point runs BOTH inside one
+    ``shard_map`` region on the tensor-parallel flat path: the window's per-step
+    rows are gathered from the SAME local ``mixed_qkv``/``b``/``a`` shards the
+    main pass consumes, and its entry states are a local slice of the same
+    state pool, so the only extra boundary traffic is the tiny
+    ``window_positions``/``window_valid`` masks in and the stacked states out.
+
+    Falls back to the plain two-call composition on the unsharded and
+    split-QKV paths (identical numerics; the fusion is a boundary optimization,
+    not a math change).
+
+    Args:
+        mixed_qkv: Packed Q/K/V token buffer (see
+            :func:`ragged_gated_delta_rule_v2`).
+        b: Per-token beta gate input ``[tokens, n_v]``.
+        a: Per-token decay gate input ``[tokens, n_v]``.
+        recurrent_state: Recurrent state pool ``[num_slots, n_v, d_k, d_v]``.
+        A_log: Per-value-head log-``A`` parameter.
+        dt_bias: Per-value-head ``dt`` bias.
+        query_start_loc: CSR-style cumulative token offsets per request.
+        state_indices: Request-to-state-slot mapping.
+        distribution: Runtime ``[decode_end, prefill_end, total]`` triple.
+        window_positions: ``[num_base_slots, num_steps]`` int32 packed-token
+            positions of each slot's window steps (clipped in-range).
+        window_valid: ``[num_base_slots, num_steps]`` per-step validity mask.
+        has_initial_state: Optional per-request state validity mask.
+        num_base_slots: Number of live state rows (the window scan's batch).
+        n_kq: GLOBAL number of query/key heads.
+        n_v: GLOBAL number of value heads.
+        d_k: Query/key head dimension.
+        d_v: Value head dimension.
+        chunk_size: Prefill chunk size for the main pass.
+        use_qk_norm_in_gdn: Whether to normalize Q/K inside the recurrence.
+        pre_sharded_mixed_qkv: Whether ``mixed_qkv`` is already flat-sharded.
+        flat_tp_shard: Prefer flat mixed-QKV head sharding when possible.
+        apply_silu_in_gdr: Whether SiLU still needs applying to ``mixed_qkv``
+            (also forwarded to the window scan's row prep).
+        use_recurrent_scan_prefill: Enable recurrent-scan prefill in supported
+            backends.
+        mask_initial_state: Whether ``has_initial_state`` zeroes stale slots.
+        runtime_dtype: Runtime dtype override for the main pass.
+        mesh: Optional mesh for tensor-parallel ``shard_map`` execution.
+        head_axis: Logical mesh axis used for head sharding.
+        platform: Optional implementation family override (both sub-ops).
+        cfg: Optional main-pass operation config.
+
+    Returns:
+        ``(updated_recurrent_state, output, window_states)`` where
+        ``window_states`` is ``[num_steps, num_base_slots, n_v, d_k, d_v]`` in
+        ``recurrent_state.dtype`` (the per-prefix candidate states).
+    """
+    from .gdn_spec_window import GdnSpecWindowStates, GdnSpecWindowStatesConfig
+
+    if has_initial_state is None:
+        has_initial_state = jnp.ones(state_indices.shape[0], dtype=jnp.bool_)
+
+    op = RaggedGatedDeltaRuleV2()
+    window_op = GdnSpecWindowStates()
+    head_axis = _select_head_shard_axis(mesh, head_axis, n_kq=n_kq, n_v=n_v, d_k=d_k, d_v=d_v)
+    tp_size = mesh_axis_size(mesh, head_axis)
+    key_dim = int(n_kq * d_k)
+    value_dim = int(n_v * d_v)
+    can_flat_shard = (
+        mesh is not None
+        and head_axis is not None
+        and int(tp_size) > 1
+        and n_kq % int(tp_size) == 0
+        and n_v % int(tp_size) == 0
+        and key_dim % int(tp_size) == 0
+        and value_dim % int(tp_size) == 0
+    )
+    window_cfg = GdnSpecWindowStatesConfig(platform=platform or "auto")
+    run_cfg = cfg or RaggedGatedDeltaRuleV2Config(chunk_size=chunk_size, platform=platform or "auto")
+
+    if not (flat_tp_shard and can_flat_shard):
+        # Unsharded / split-QKV configurations: keep the existing two-call
+        # composition (the fusion only pays off on the flat TP path). The
+        # window scan runs FIRST: it reads the window-entry state, and the
+        # main-pass executor may donate the pool buffer in eager use.
+        flat_positions = window_positions.reshape(-1)
+        num_steps = int(window_positions.shape[1])
+        qkv_rows = mixed_qkv[flat_positions].reshape(num_base_slots, num_steps, -1)
+        b_rows = b[flat_positions].reshape(num_base_slots, num_steps, -1)
+        a_rows = a[flat_positions].reshape(num_base_slots, num_steps, -1)
+        window_states = window_op.run(
+            qkv_rows,
+            b_rows,
+            a_rows,
+            A_log,
+            dt_bias,
+            window_valid,
+            recurrent_state[:num_base_slots],
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            apply_silu=apply_silu_in_gdr,
+            platform=platform,
+            cfg=window_cfg,
+        )
+        new_state, output = ragged_gated_delta_rule_v2(
+            mixed_qkv,
+            b,
+            a,
+            recurrent_state,
+            A_log,
+            dt_bias,
+            query_start_loc,
+            state_indices,
+            distribution,
+            has_initial_state,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            chunk_size=chunk_size,
+            use_qk_norm_in_gdn=use_qk_norm_in_gdn,
+            pre_sharded_mixed_qkv=pre_sharded_mixed_qkv,
+            flat_tp_shard=flat_tp_shard,
+            apply_silu_in_gdr=apply_silu_in_gdr,
+            use_recurrent_scan_prefill=use_recurrent_scan_prefill,
+            mask_initial_state=mask_initial_state,
+            runtime_dtype=runtime_dtype,
+            mesh=mesh,
+            head_axis=head_axis,
+            platform=platform,
+            cfg=cfg,
+        )
+        return new_state, output, window_states
+
+    local_n_kq = n_kq // int(tp_size)
+    local_n_v = n_v // int(tp_size)
+    if not pre_sharded_mixed_qkv:
+        mixed_qkv = _reorder_concatenated_tensor_for_sharding(
+            mixed_qkv,
+            (key_dim, key_dim, value_dim),
+            int(tp_size),
+            -1,
+        )
+
+    run_chunk_size = int(chunk_size if chunk_size is not None else run_cfg.chunk_size)
+    num_steps = int(window_positions.shape[1])
+
+    def _wrapped(
+        local_mixed_qkv,
+        local_b,
+        local_a,
+        local_state,
+        local_A_log,
+        local_dt_bias,
+        local_qsl,
+        local_si,
+        local_dist,
+        local_has_initial_state,
+        local_window_positions,
+        local_window_valid,
+    ):
+        """One-region body: ragged GDN main pass + spec-window state scan.
+
+        Both consume the SAME per-shard tensors; the window rows are gathered
+        locally so no extra pool/row traffic crosses the region boundary.
+        """
+        new_state, output = op.run(
+            mixed_qkv=local_mixed_qkv,
+            b=local_b,
+            a=local_a,
+            recurrent_state=local_state,
+            A_log=local_A_log,
+            dt_bias=local_dt_bias,
+            query_start_loc=local_qsl,
+            state_indices=local_si,
+            distribution=local_dist,
+            has_initial_state=local_has_initial_state,
+            n_kq=local_n_kq,
+            n_v=local_n_v,
+            d_k=d_k,
+            d_v=d_v,
+            chunk_size=run_chunk_size,
+            use_qk_norm_in_gdn=use_qk_norm_in_gdn,
+            apply_silu_in_gdr=apply_silu_in_gdr,
+            use_recurrent_scan_prefill=use_recurrent_scan_prefill,
+            mask_initial_state=mask_initial_state,
+            runtime_dtype=runtime_dtype,
+            platform=platform,
+            cfg=run_cfg,
+        )
+        flat_positions = local_window_positions.reshape(-1)
+        qkv_rows = local_mixed_qkv[flat_positions].reshape(num_base_slots, num_steps, -1)
+        b_rows = local_b[flat_positions].reshape(num_base_slots, num_steps, -1)
+        a_rows = local_a[flat_positions].reshape(num_base_slots, num_steps, -1)
+        window_states = window_op.run(
+            qkv_rows,
+            b_rows,
+            a_rows,
+            local_A_log,
+            local_dt_bias,
+            local_window_valid,
+            local_state[:num_base_slots],
+            n_kq=local_n_kq,
+            n_v=local_n_v,
+            d_k=d_k,
+            d_v=d_v,
+            apply_silu=apply_silu_in_gdr,
+            platform=platform,
+            cfg=window_cfg,
+        )
+        return new_state, output, window_states
+
+    beta_spec = PartitionSpec(None, head_axis)
+    state_spec = PartitionSpec(None, head_axis, None, None)
+    head_param_spec = PartitionSpec(head_axis)
+    replicated = PartitionSpec()
+    mixed_spec = PartitionSpec(None, head_axis)
+    window_out_spec = PartitionSpec(None, None, head_axis, None, None)
+
+    shard_map_fn = jax.shard_map(
+        _wrapped,
+        mesh=mesh_to_jax_mesh(mesh),
+        in_specs=(
+            mixed_spec,
+            beta_spec,
+            beta_spec,
+            state_spec,
+            head_param_spec,
+            head_param_spec,
+            replicated,
+            replicated,
+            replicated,
+            replicated,
+            replicated,
+            replicated,
+        ),
+        out_specs=(state_spec, mixed_spec, window_out_spec),
+        check_vma=False,
+    )
+    return shard_map_fn(
+        mixed_qkv,
+        b,
+        a,
+        recurrent_state,
+        A_log,
+        dt_bias,
+        query_start_loc,
+        state_indices,
+        distribution,
+        has_initial_state,
+        window_positions,
+        window_valid,
+    )
+
 __all__ = (
     "KERNEL_TILE_POLICIES",
     "KernelTilePolicy",

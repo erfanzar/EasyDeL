@@ -33,6 +33,9 @@ from ejkernel.modules.operations.ragged_gated_delta_rule_v2 import (
 from ejkernel.modules.operations.ragged_gated_delta_rule_v2 import (
     ragged_gated_delta_rule_v2 as _ejkernel_ragged_gated_delta_rule_v2,
 )
+from ejkernel.modules.operations.ragged_gated_delta_rule_v2 import (
+    ragged_gated_delta_rule_v2_with_window_states as _ejkernel_ragged_gdn_v2_with_window_states,
+)
 
 from .._operation_impl import OperationImpl, OperationRegistry
 from ..requirements import (
@@ -171,6 +174,108 @@ class RaggedGatedDeltaRule(OperationImpl):
             state_indices=state_indices,
             distribution=distribution,
             has_initial_state=has_initial_state,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            chunk_size=chunk_size,
+            use_qk_norm_in_gdn=use_qk_norm_in_gdn,
+            pre_sharded_mixed_qkv=pre_sharded_mixed_qkv,
+            flat_tp_shard=flat_tp_shard,
+            apply_silu_in_gdr=apply_silu_in_gdr,
+            use_recurrent_scan_prefill=use_recurrent_scan_prefill,
+            mask_initial_state=mask_initial_state,
+            runtime_dtype=self.metadata.runtime_dtype,
+            mesh=self.metadata.mesh,
+            head_axis=head_axis,
+            cfg=cfg,
+        )
+
+    def forward_with_window_states(
+        self,
+        mixed_qkv: jnp.ndarray,
+        b: jnp.ndarray,
+        a: jnp.ndarray,
+        recurrent_state: jnp.ndarray,
+        A_log: jnp.ndarray,
+        dt_bias: jnp.ndarray,
+        query_start_loc: jnp.ndarray,
+        state_indices: jnp.ndarray,
+        distribution: jnp.ndarray,
+        window_positions: jnp.ndarray,
+        window_valid: jnp.ndarray,
+        has_initial_state: jnp.ndarray | None = None,
+        *,
+        num_base_slots: int,
+        n_kq: int,
+        n_v: int,
+        d_k: int,
+        d_v: int,
+        chunk_size: int = 64,
+        use_qk_norm_in_gdn: bool = True,
+        pre_sharded_mixed_qkv: bool = False,
+        flat_tp_shard: bool = False,
+        apply_silu_in_gdr: bool = False,
+        use_recurrent_scan_prefill: bool = False,
+        mask_initial_state: bool = False,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """Ragged GDN v2 plus the speculative-window state scan in ONE region.
+
+        Same contract as :meth:`forward_native` plus the per-prefix window
+        states (``gdn_spec_window_states``) computed inside the SAME
+        ``shard_map`` region, eliminating the separate window op's per-layer
+        region-boundary materialization on speculative verify steps.
+
+        Args:
+            mixed_qkv: Packed Q/K/V token buffer.
+            b: Per-token beta gate input.
+            a: Per-token decay gate input.
+            recurrent_state: Recurrent state pool.
+            A_log: Per-value-head log-``A`` parameter.
+            dt_bias: Per-value-head ``dt`` bias.
+            query_start_loc: CSR-style cumulative token offsets.
+            state_indices: Request-to-state-slot mapping.
+            distribution: Runtime distribution vector.
+            window_positions: ``[num_base_slots, k + 1]`` packed-token
+                positions of each slot's speculative window steps.
+            window_valid: ``[num_base_slots, k + 1]`` per-step validity mask.
+            has_initial_state: Optional per-request state-valid mask.
+            num_base_slots: Number of live state rows.
+            n_kq: Number of query/key heads.
+            n_v: Number of value heads.
+            d_k: Query/key head dim.
+            d_v: Value head dim.
+            chunk_size: Prefill chunk size.
+            use_qk_norm_in_gdn: Whether to normalize Q/K in the recurrence.
+            pre_sharded_mixed_qkv: Whether mixed QKV is already flat-sharded.
+            flat_tp_shard: Prefer flat mixed-QKV tensor-parallel sharding.
+            apply_silu_in_gdr: Whether to apply SiLU inside GDR (and to the
+                window scan's rows).
+            use_recurrent_scan_prefill: Enable recurrent-scan prefill.
+            mask_initial_state: Whether to mask stale recurrent slots.
+
+        Returns:
+            ``(updated_recurrent_state, output, window_states)``.
+        """
+        mode = self.get_mode(query=jnp.expand_dims(mixed_qkv, 0), BTHD=False)
+        shardings_bthd = self.metadata.get_shardings(mode, layout="bthd")
+        head_axis = shardings_bthd.query[2] if shardings_bthd.query is not None else None
+        cfg = self.metadata.get_operation_config("ragged_gated_delta_rule_v2")
+
+        return _ejkernel_ragged_gdn_v2_with_window_states(
+            mixed_qkv,
+            b,
+            a,
+            recurrent_state,
+            A_log,
+            dt_bias,
+            query_start_loc,
+            state_indices,
+            distribution,
+            window_positions,
+            window_valid,
+            has_initial_state,
+            num_base_slots=num_base_slots,
             n_kq=n_kq,
             n_v=n_v,
             d_k=d_k,
