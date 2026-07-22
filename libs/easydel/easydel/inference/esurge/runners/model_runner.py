@@ -477,11 +477,25 @@ class eSurgeRunner:
             min_token_size=min_token_pad_i,
             # Compile token buckets up to the per-step batched-token budget, not
             # just one sequence's length, so a multi-prefill step (sum of tokens
-            # > max_model_len) still has a bucket and doesn't overflow the
+            # > max_token_size) still has a bucket and doesn't overflow the
             # scheduler's static budget.
             max_token_size=max(int(self.max_model_len), int(self.max_num_batched_tokens)),
             padding_gap=0,
         )
+        if self.drafter is not None and int(self.num_speculative_tokens) > 0:
+            # Speculative steady-state verify windows schedule EXACTLY
+            # n_active * (1 + k) tokens. With power-of-two buckets those windows
+            # pad 64->40, 128->80, 256->160 (~60% utilization), and most of the
+            # verify forward's cost scales with the token bucket. Add an exact
+            # spec bucket per request bucket so verify windows run tight.
+            window = int(self.num_speculative_tokens) + 1
+            max_bucket = max(int(self.max_model_len), int(self.max_num_batched_tokens))
+            spec_buckets = {
+                int(reqs) * window
+                for reqs in self.max_num_seq_buckets
+                if min_token_pad_i <= int(reqs) * window <= max_bucket
+            }
+            self.num_tokens_paddings = sorted(set(self.num_tokens_paddings) | spec_buckets)
         if self._uses_spmd_dp():
             dp_size = max(1, int(getattr(self.metadata, "data_parallel_size", 1) or 1))
             self.num_tokens_paddings = [int(bucket) for bucket in self.num_tokens_paddings if int(bucket) % dp_size == 0]
