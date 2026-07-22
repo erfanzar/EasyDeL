@@ -113,6 +113,27 @@ from .sequence_buffer import SequenceBuffer
 
 DEBUG_MODE = False
 
+
+@jax.jit
+def _jit_zero_rows(arrays: list[jax.Array], keep_mask: jax.Array) -> list[jax.Array]:
+    """Zero masked rows of every array in ONE fused dispatch.
+
+    Eager per-array ``jnp.where`` in a python loop over a hybrid model's ~100
+    recurrent leaves costs one host dispatch each per slot-clear event; one
+    jitted list call collapses that to a single dispatch.
+    """
+    return [jnp.where(keep_mask.reshape(-1, *([1] * (a.ndim - 1))), a, 0) for a in arrays]
+
+
+@jax.jit
+def _jit_permute_rows(arrays: list[jax.Array], gather_idx: jax.Array, keep_mask: jax.Array) -> list[jax.Array]:
+    """Row-gather + keep-mask every array in ONE fused dispatch (see _jit_zero_rows)."""
+    out = []
+    for a in arrays:
+        gathered = a[gather_idx]
+        out.append(jnp.where(keep_mask.reshape(-1, *([1] * (a.ndim - 1))), gathered, 0).astype(a.dtype))
+    return out
+
 if typing.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
     from easydel.infra.etils import MpMdSchedulers
@@ -1566,6 +1587,10 @@ class ExecutionManager:
                     slot_indices_to_clear.extend(
                         base_slots + k * base_slots + int(slot) for k in range(candidate_count)
                     )
+        # Collect every recurrent leaf first, then zero the masked rows of all
+        # of them in ONE fused dispatch per distinct pool size (a python loop of
+        # eager wheres cost ~100 host dispatches per slot-clear event).
+        entries: list[tuple[int, typing.Any, jax.Array | None, jax.Array | None, int]] = []
         for idx, view in enumerate(new_views):
             rec = None
             if isinstance(view, RecurrentCacheView):
@@ -1574,27 +1599,47 @@ class ExecutionManager:
                 rec = view.recurrent
             else:
                 continue
-
-            new_conv = rec.conv_state
-            new_rec = rec.recurrent_state
-            # Build mask once — conv_state and recurrent_state share the batch dim.
-            if new_conv is not None:
-                n_slots = typing.cast(jax.Array, new_conv).shape[0]
-            elif new_rec is not None:
-                n_slots = typing.cast(jax.Array, new_rec).shape[0]
+            conv_arr = rec.conv_state
+            rec_arr = rec.recurrent_state
+            if conv_arr is not None:
+                n_slots = int(typing.cast(jax.Array, conv_arr).shape[0])
+            elif rec_arr is not None:
+                n_slots = int(typing.cast(jax.Array, rec_arr).shape[0])
             else:
                 continue
-            filtered_slots = sorted({int(s) for s in slot_indices_to_clear if 0 <= int(s) < int(n_slots)})
+            entries.append((idx, rec, conv_arr, rec_arr, n_slots))
+
+        by_pool: dict[int, list[jax.Array]] = {}
+        for _idx, _rec, conv_arr, rec_arr, n_slots in entries:
+            bucket = by_pool.setdefault(n_slots, [])
+            if conv_arr is not None:
+                bucket.append(conv_arr)
+            if rec_arr is not None:
+                bucket.append(rec_arr)
+        cleared_by_pool: dict[int, list[jax.Array]] = {}
+        for n_slots, arrays in by_pool.items():
+            filtered_slots = sorted({int(s) for s in slot_indices_to_clear if 0 <= int(s) < n_slots})
             if not filtered_slots:
                 continue
-            slot_arr = jnp.array(filtered_slots, dtype=jnp.int32)
-            keep_mask = jnp.ones(n_slots, dtype=jnp.bool_).at[slot_arr].set(False)
-            if new_conv is not None:
-                new_conv = jnp.where(keep_mask.reshape(-1, *([1] * (new_conv.ndim - 1))), new_conv, 0)
-            if new_rec is not None:
-                new_rec = jnp.where(keep_mask.reshape(-1, *([1] * (new_rec.ndim - 1))), new_rec, 0)
+            keep_np = numpy.ones((n_slots,), dtype=bool)
+            keep_np[numpy.asarray(filtered_slots, dtype=numpy.int64)] = False
+            cleared_by_pool[n_slots] = list(_jit_zero_rows(arrays, jnp.asarray(keep_np)))
 
+        cursors = dict.fromkeys(cleared_by_pool, 0)
+        for idx, rec, conv_arr, rec_arr, n_slots in entries:
+            cleared = cleared_by_pool.get(n_slots)
+            if cleared is None:
+                continue
+            new_conv = conv_arr
+            new_rec = rec_arr
+            if conv_arr is not None:
+                new_conv = cleared[cursors[n_slots]]
+                cursors[n_slots] += 1
+            if rec_arr is not None:
+                new_rec = cleared[cursors[n_slots]]
+                cursors[n_slots] += 1
             new_recurrent = rec.replace(conv_state=new_conv, recurrent_state=new_rec)
+            view = new_views[idx]
             if isinstance(view, ParallelHybridCacheView):
                 new_views[idx] = view.replace(
                     recurrent=new_recurrent,
@@ -1647,6 +1692,11 @@ class ExecutionManager:
 
         changed = False
         new_views = list(cache.views)
+        # Collect every recurrent leaf first, then apply the whole permutation
+        # in ONE fused dispatch per distinct pool size (the previous per-view
+        # python loop cost ~100 eager gather+where dispatches per row-move
+        # event, which scales with request churn and thus with concurrency).
+        entries: list[tuple[int, typing.Any, jax.Array | None, jax.Array | None, int]] = []
         for idx, view in enumerate(new_views):
             if isinstance(view, RecurrentCacheView):
                 rec = view
@@ -1654,19 +1704,18 @@ class ExecutionManager:
                 rec = view.recurrent
             else:
                 continue
-
-            new_conv = rec.conv_state
-            new_rec = rec.recurrent_state
-            if new_conv is not None:
-                n_slots = int(typing.cast(jax.Array, new_conv).shape[0])
-            elif new_rec is not None:
-                n_slots = int(typing.cast(jax.Array, new_rec).shape[0])
+            conv_arr = rec.conv_state
+            rec_arr = rec.recurrent_state
+            if conv_arr is not None:
+                n_slots = int(typing.cast(jax.Array, conv_arr).shape[0])
+            elif rec_arr is not None:
+                n_slots = int(typing.cast(jax.Array, rec_arr).shape[0])
             else:
                 continue
+            entries.append((idx, rec, conv_arr, rec_arr, n_slots))
 
-            # Build a full-tensor gather index + keep mask. Extend the base-row
-            # permutation to each request's speculative-candidate block so
-            # candidate state (if any) follows its owning request too.
+        def _gather_keep(n_slots: int) -> tuple[numpy.ndarray, numpy.ndarray] | None:
+            """Full-pool gather index + keep mask for one pool size (or None if identity)."""
             gather = numpy.arange(n_slots, dtype=numpy.int32)
             keep = numpy.ones((n_slots,), dtype=bool)
             upper = min(base_slots, n_slots)
@@ -1675,40 +1724,54 @@ class ExecutionManager:
             keep[:upper] = base >= 0
             if candidate_count > 0 and n_slots > base_slots:
                 # Prefix-major candidate layout: base + prefix * base_slots + slot.
-                for b in range(base_slots):
-                    src_b = int(perm[b])
-                    for k in range(candidate_count):
-                        dst = base_slots + k * base_slots + b
-                        if dst >= n_slots:
-                            continue
-                        if src_b >= 0:
-                            src = base_slots + k * base_slots + src_b
-                            if src < n_slots:
-                                gather[dst] = src
-                            else:
-                                gather[dst] = 0
-                                keep[dst] = False
-                        else:
-                            gather[dst] = 0
-                            keep[dst] = False
-
+                # Candidate rows follow their owning base row.
+                for k in range(candidate_count):
+                    lo = base_slots + k * base_slots
+                    hi = min(lo + base_slots, n_slots)
+                    width = hi - lo
+                    if width <= 0:
+                        break
+                    seg_base = perm[:width]
+                    src = lo + numpy.where(seg_base >= 0, seg_base, 0)
+                    valid = (seg_base >= 0) & (src < n_slots)
+                    gather[lo:hi] = numpy.where(valid, src, 0)
+                    keep[lo:hi] = valid
             if keep.all() and numpy.array_equal(gather, numpy.arange(n_slots, dtype=numpy.int32)):
+                return None
+            return gather, keep
+
+        by_pool: dict[int, list[jax.Array]] = {}
+        for _idx, _rec, conv_arr, rec_arr, n_slots in entries:
+            bucket = by_pool.setdefault(n_slots, [])
+            if conv_arr is not None:
+                bucket.append(conv_arr)
+            if rec_arr is not None:
+                bucket.append(rec_arr)
+        moved_by_pool: dict[int, list[jax.Array]] = {}
+        for n_slots, arrays in by_pool.items():
+            gk = _gather_keep(n_slots)
+            if gk is None:
                 continue
+            gather, keep = gk
+            moved_by_pool[n_slots] = list(
+                _jit_permute_rows(arrays, jnp.asarray(gather, dtype=jnp.int32), jnp.asarray(keep))
+            )
 
-            gather_idx = jnp.asarray(gather, dtype=jnp.int32)
-            keep_mask = jnp.asarray(keep, dtype=jnp.bool_)
-            if new_conv is not None:
-                gathered = new_conv[gather_idx]
-                new_conv = jnp.where(keep_mask.reshape(-1, *([1] * (new_conv.ndim - 1))), gathered, 0).astype(
-                    new_conv.dtype
-                )
-            if new_rec is not None:
-                gathered = new_rec[gather_idx]
-                new_rec = jnp.where(keep_mask.reshape(-1, *([1] * (new_rec.ndim - 1))), gathered, 0).astype(
-                    new_rec.dtype
-                )
-
+        cursors = dict.fromkeys(moved_by_pool, 0)
+        for idx, rec, conv_arr, rec_arr, n_slots in entries:
+            moved = moved_by_pool.get(n_slots)
+            if moved is None:
+                continue
+            new_conv = conv_arr
+            new_rec = rec_arr
+            if conv_arr is not None:
+                new_conv = moved[cursors[n_slots]]
+                cursors[n_slots] += 1
+            if rec_arr is not None:
+                new_rec = moved[cursors[n_slots]]
+                cursors[n_slots] += 1
             new_recurrent = rec.replace(conv_state=new_conv, recurrent_state=new_rec)
+            view = new_views[idx]
             if isinstance(view, ParallelHybridCacheView):
                 new_views[idx] = view.replace(
                     recurrent=new_recurrent,
