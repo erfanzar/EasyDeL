@@ -520,7 +520,13 @@ class Qwen3_5MTPHead(spx.Module):
         """
         normed_h = self.pre_fc_norm_hidden(prev_hidden_states)
         normed_e = self.pre_fc_norm_embedding(next_token_embeds)
-        fused = jnp.concatenate([normed_h, normed_e], axis=-1)
+        # Fusion order is [embedding, hidden] — the layout the released Qwen3.5/3.6
+        # ``mtp.fc`` weights were trained with (vLLM's Qwen3NextMTP does
+        # ``cat([inputs_embeds, hidden_states])``; the eSurge drafter fusion in
+        # ``inference/speculative.py`` matches it). The reversed order silently
+        # produces near-uniform draft logits from a trained head: HF ignores
+        # ``mtp.*`` on load, so only the drafter/serving path ever validated this.
+        fused = jnp.concatenate([normed_e, normed_h], axis=-1)
         h = self.fc(fused)
         h = apply_logical_sharding(
             h,
@@ -1385,8 +1391,12 @@ class Qwen3_5ForConditionalGeneration(BaseVisionLanguageModule[Qwen3_5Model, Qwe
         if self.mtp is None or n_steps < 1:
             return None
         b = input_ids.shape[0]
-        embed = self.model.get_embedding()
-        frequencies = getattr(self.model, "frequencies", None)
+        embed = self.model.get_input_embeddings()
+        # The rotary table lives on the inner text model, not the multimodal
+        # container — resolve it the same way compute_mtp_outputs does so the
+        # chained head sees the exact serving-time frequencies.
+        language_model = getattr(self.model, "language_model", None)
+        frequencies = getattr(language_model if language_model is not None else self.model, "frequencies", None)
         prev_hidden = outputs.last_hidden_state
         step_logits: list[jax.Array] = []
         for k in range(1, n_steps + 1):

@@ -30,12 +30,11 @@ import traceback
 
 os.environ.setdefault("ENABLE_DISTRIBUTED_INIT", "0")
 
+import easydel
+import easydel.trainers  # noqa: F401
 import jax
 import jax.numpy as jnp
 import spectrax as spx
-
-import easydel
-import easydel.trainers  # noqa: F401
 from easydel.modules.qwen3_5 import Qwen3_5ForCausalLM
 from easydel.modules.qwen3_5.qwen3_5_configuration import Qwen3_5TextConfig
 from easydel.trainers import DistillationConfig
@@ -222,6 +221,48 @@ def test_mtp_chain_perfect_alignment():
     assert len(per_step) == k
 
 
+@_case("MTP head training forward == eSurge drafter fusion (cross-path parity)")
+def test_mtp_training_forward_matches_drafter_fusion():
+    """Pin the training-path MTP forward to the serving drafter's exact math.
+
+    The released Qwen3.5/3.6 ``mtp.fc`` weights were trained with the fusion
+    order ``concat([embeds, hidden])`` (vLLM's Qwen3NextMTP; the eSurge drafter
+    in ``inference/speculative.py``). The model-side head must produce the SAME
+    logits as the drafter fusion on identical inputs — a swapped concat order
+    feeds a trained ``fc`` transposed halves and silently turns a 58%-acceptance
+    head into a uniform-draft head (only visible with trained weights, which is
+    why the self-consistent random-weight tests above cannot catch it).
+    """
+    from easydel.inference.speculative import Qwen3_5MTPDrafter
+
+    b, s, v = 2, 24, 128
+    ids = jax.random.randint(jax.random.PRNGKey(3), (b, s), 0, v)
+    am = jnp.ones((b, s), dtype="i4")
+    model = Qwen3_5ForCausalLM(config=_cfg(1, 0.3), rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
+
+    # training path: main forward exposes depth-1 mtp_logits (aux path)
+    out = model(input_ids=ids, attention_mask=am)
+    logits_train = out.mtp_logits
+
+    # serving path: the drafter's fusion on identical inputs. The drafter takes
+    # the ALREADY-SHIFTED next-token ids (the model path shifts internally).
+    next_ids = jnp.concatenate([ids[:, 1:], jnp.zeros((b, 1), dtype=ids.dtype)], axis=-1)
+    pos = jnp.arange(s, dtype=jnp.int32)[None, :].repeat(b, axis=0)
+    _h, logits_serve, _cache = Qwen3_5MTPDrafter._mtp_forward_compute_parts(
+        model.mtp,
+        model.model.get_embedding(),
+        model.get_lm_head(),
+        getattr(model.model, "frequencies", None),
+        False,  # tie_embeddings
+        next_ids,
+        out.last_hidden_state,
+        pos,
+        None,  # cache
+    )
+    diff = float(jnp.max(jnp.abs(logits_train - logits_serve)))
+    assert diff < 1e-3, f"training-path MTP logits diverge from drafter fusion (max abs diff {diff})"
+
+
 @_case("DistillationConfig: MTP knobs + validation")
 def test_config_validation():
     c = DistillationConfig(mtp_distillation=True, mtp_kd_weight=0.5, mtp_draft_tokens=6, save_directory="/tmp/_mtp_cfg")
@@ -259,6 +300,7 @@ ALL_TESTS = [
     test_mtp_chain_cakld_blend,
     test_mtp_chain_shape_and_consistency,
     test_mtp_chain_perfect_alignment,
+    test_mtp_training_forward_matches_drafter_fusion,
     test_config_validation,
 ]
 
