@@ -113,3 +113,83 @@ def test_apply_silu_path():
         )
     )
     np.testing.assert_allclose(got, ref, rtol=1e-6, atol=1e-6)
+
+
+def test_combined_ragged_gdn_window_matches_two_op_composition():
+    """The fused ragged-GDN+window entry point equals the two-op composition."""
+    from ejkernel.modules.operations.ragged_gated_delta_rule_v2 import (
+        ragged_gated_delta_rule_v2,
+        ragged_gated_delta_rule_v2_with_window_states,
+    )
+
+    base, cc = 4, 3
+    seq = 16
+    key = jax.random.PRNGKey(7)
+    kx, kb, ka, kal, ks = jax.random.split(key, 5)
+    mixed = jax.random.normal(kx, (seq, QKV_DIM), dtype=jnp.float32) * 0.3
+    b = jax.random.normal(kb, (seq, NV), dtype=jnp.float32)
+    a = jax.random.normal(ka, (seq, NV), dtype=jnp.float32)
+    A_log = jax.random.normal(kal, (NV,), dtype=jnp.float32) * 0.1
+    dt_bias = jnp.ones((NV,), dtype=jnp.float32)
+    pool = jax.random.normal(ks, (base * (1 + cc), NV, DK, DV), dtype=jnp.float32) * 0.05
+
+    sched = np.array([cc, cc, cc, 0], dtype=np.int32)
+    qsl = np.zeros((base + 1,), dtype=np.int32)
+    qsl[1:] = np.cumsum(sched)
+    starts = qsl[:base]
+    state_indices = jnp.arange(base, dtype=jnp.int32)
+    distribution = jnp.asarray([0, 3, 3], dtype=jnp.int32)
+    has_init = jnp.asarray([True, True, True, False])
+    positions = np.clip(starts[:, None] + np.arange(cc)[None, :], 0, seq - 1).astype(np.int32)
+    valid = jnp.asarray(np.array([[1, 1, 1], [1, 1, 0], [1, 0, 0], [0, 0, 0]], dtype=bool))
+
+    common = dict(n_kq=NKQ, n_v=NV, d_k=DK, d_v=DV, chunk_size=8, use_qk_norm_in_gdn=True, platform="xla")
+    ref_state, ref_out = ragged_gated_delta_rule_v2(
+        mixed,
+        b,
+        a,
+        jnp.array(pool, copy=True),
+        A_log,
+        dt_bias,
+        jnp.asarray(qsl),
+        state_indices,
+        distribution,
+        has_init,
+        **common,
+    )
+    from ejkernel.kernels._xla.gdn_spec_window import gdn_spec_window_states as window_ref
+
+    flat = positions.reshape(-1)
+    ref_stack = window_ref(
+        jnp.asarray(mixed)[flat].reshape(base, cc, -1),
+        jnp.asarray(b)[flat].reshape(base, cc, -1),
+        jnp.asarray(a)[flat].reshape(base, cc, -1),
+        A_log,
+        dt_bias,
+        valid,
+        pool[:base],
+        n_kq=NKQ,
+        n_v=NV,
+        d_k=DK,
+        d_v=DV,
+    )
+
+    got_state, got_out, got_stack = ragged_gated_delta_rule_v2_with_window_states(
+        mixed,
+        b,
+        a,
+        jnp.array(pool, copy=True),
+        A_log,
+        dt_bias,
+        jnp.asarray(qsl),
+        state_indices,
+        distribution,
+        jnp.asarray(positions),
+        valid,
+        has_init,
+        num_base_slots=base,
+        **common,
+    )
+    np.testing.assert_allclose(np.asarray(got_state), np.asarray(ref_state), rtol=0, atol=0)
+    np.testing.assert_allclose(np.asarray(got_out), np.asarray(ref_out), rtol=0, atol=0)
+    np.testing.assert_allclose(np.asarray(got_stack), np.asarray(ref_stack), rtol=0, atol=0)
