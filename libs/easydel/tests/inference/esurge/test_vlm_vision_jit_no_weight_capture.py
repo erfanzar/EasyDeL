@@ -19,21 +19,20 @@ inside). These tests assert, on a tiny Qwen3.5 VLM:
 from __future__ import annotations
 
 import os
-import re
 import types
 
 os.environ.setdefault("ENABLE_DISTRIBUTED_INIT", "0")
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
 
+import easydel as ed
 import jax
 import numpy as np
 import pytest
 import spectrax as spx
-from jax import numpy as jnp
-
-import easydel as ed
 from easydel.inference.esurge.runners.vlm_prefill import VlmPrefillHelper
+from easydel.utils.graph_jit import assert_no_large_constants
+from jax import numpy as jnp
 
 _HIDDEN = 64
 
@@ -95,21 +94,6 @@ def _helper_stub(model) -> types.SimpleNamespace:
     )
 
 
-def _max_constant_elements(mlir_text: str) -> int:
-    """Largest dense-constant tensor (in elements) in a lowered MLIR module."""
-    worst = 0
-    for line in mlir_text.splitlines():
-        if "constant" not in line:
-            continue
-        for shape in re.findall(r"tensor<([0-9x]+)x[a-z]", line):
-            elems = 1
-            for d in shape.split("x"):
-                if d:
-                    elems *= int(d)
-            worst = max(worst, elems)
-    return worst
-
-
 def test_image_features_jit_matches_eager():
     model = make_tiny_vlm()
     stub = _helper_stub(model)
@@ -131,13 +115,12 @@ def test_image_features_jit_captures_no_weight_constants():
     fn = VlmPrefillHelper.get_image_features_jit(stub)
     pixels, grid_thw, max_grid = _pixels_and_grid(model)
 
-    _, state = spx.export(model)
-    lowered = fn._inner_jit.lower(state, pixels, image_grid_thw=grid_thw, image_max_grid_size=max_grid)
-    worst = _max_constant_elements(lowered.as_text())
+    lowered = fn.lower(pixels, image_grid_thw=grid_thw, image_max_grid_size=max_grid)
     # Even this tiny model's single largest vision weight (128x256 mlp = 32k
     # elements) would blow this bound if weights were captured; position/index
     # constants stay far below it.
-    assert worst < 10_000, f"lowered vision program embeds a {worst}-element constant (weight capture regressed)"
+    worst = assert_no_large_constants(lowered, max_elements=10_000)
+    assert worst < 10_000
 
 
 def test_image_features_jit_is_reused_and_stable():

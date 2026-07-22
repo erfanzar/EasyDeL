@@ -70,12 +70,12 @@ which is shape-correct but semantically wrong for drafting.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from functools import cached_property, partial
 
 import jax
 import jax.numpy as jnp
 import spectrax as spx
+from eformer.pytree import auto_pytree
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Float, Int
 from spectrax import apply_logical_sharding, common_types, nn
@@ -101,9 +101,13 @@ from .configuration_gemma4_assistant import (
 )
 
 
-@dataclass(frozen=True)
+@auto_pytree
 class Gemma4AssistantOutput:
     """Output of :class:`Gemma4AssistantForCausalLM`.
+
+    Registered as a JAX pytree (``@auto_pytree``, matching the other EasyDeL
+    model outputs) so it can be returned from a ``jax.jit``-traced drafter
+    forward.
 
     Attributes:
         last_hidden_state: ``(B, S, hidden)`` final drafter hidden
