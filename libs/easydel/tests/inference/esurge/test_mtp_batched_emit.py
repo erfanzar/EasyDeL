@@ -60,7 +60,6 @@ os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
 import jax
 import jax.numpy as jnp
 import spectrax as spx
-
 from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.esurge.runners import eSurgeRunner
 from easydel.inference.esurge.runners.spec import strategy as _strategy
@@ -119,6 +118,21 @@ def _fake_draft_next_batched(self, seeds):
     }
 
 
+def _fake_begin_batched_draft(self, seeds, *, seed_hidden_matrix=None):
+    """Early-dispatch fake: compute the same deterministic drafts eagerly.
+
+    The runner's early batched-draft pre-pass passes seed hidden as INT rows
+    into ``seed_hidden_matrix``; the deterministic fake only consumes the host
+    ints (seed token/position), so both call shapes produce identical drafts.
+    """
+    del seed_hidden_matrix
+    return {"fake": _fake_draft_next_batched(self, seeds)}
+
+
+def _fake_finish_batched_draft(self, handle):
+    return handle["fake"]
+
+
 def _run(model, *, n, k, disable_emit, prompts, project_rows):
     """Fully-deterministic generation (faked forward/project/drafter); returns
     {rid: emitted tokens}. Only the emission batching differs by ``disable_emit``."""
@@ -126,6 +140,8 @@ def _run(model, *, n, k, disable_emit, prompts, project_rows):
         "proj": _strategy.DrafterSpeculation.project_hidden_rows,
         "dn": _strategy.DrafterSpeculation.draft_next,
         "dnb": _strategy.DrafterSpeculation.draft_next_batched,
+        "bbd": _strategy.DrafterSpeculation.begin_batched_draft,
+        "fbd": _strategy.DrafterSpeculation.finish_batched_draft,
         "emit": os.environ.get("EASURGE_DISABLE_BATCHED_EMIT"),
         "persist": os.environ.get("EASYDEL_MTP_PERSIST_KV"),
     }
@@ -137,6 +153,8 @@ def _run(model, *, n, k, disable_emit, prompts, project_rows):
     _strategy.DrafterSpeculation.project_hidden_rows = _spy_project
     _strategy.DrafterSpeculation.draft_next = _fake_draft_next
     _strategy.DrafterSpeculation.draft_next_batched = _fake_draft_next_batched
+    _strategy.DrafterSpeculation.begin_batched_draft = _fake_begin_batched_draft
+    _strategy.DrafterSpeculation.finish_batched_draft = _fake_finish_batched_draft
     os.environ["EASURGE_DISABLE_BATCHED_EMIT"] = "1" if disable_emit else "0"
     os.environ["EASYDEL_MTP_PERSIST_KV"] = "1"
     try:
@@ -198,6 +216,8 @@ def _run(model, *, n, k, disable_emit, prompts, project_rows):
         _strategy.DrafterSpeculation.project_hidden_rows = saved["proj"]
         _strategy.DrafterSpeculation.draft_next = saved["dn"]
         _strategy.DrafterSpeculation.draft_next_batched = saved["dnb"]
+        _strategy.DrafterSpeculation.begin_batched_draft = saved["bbd"]
+        _strategy.DrafterSpeculation.finish_batched_draft = saved["fbd"]
         for key, val in (("EASURGE_DISABLE_BATCHED_EMIT", saved["emit"]), ("EASYDEL_MTP_PERSIST_KV", saved["persist"])):
             if val is None:
                 os.environ.pop(key, None)
