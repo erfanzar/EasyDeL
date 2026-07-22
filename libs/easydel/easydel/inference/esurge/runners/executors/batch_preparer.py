@@ -188,7 +188,7 @@ class BatchMetadataPreparer:
         self._metadata_version = metadata.version
         self._use_slot_mapping = self._metadata_version == "v2"
         self._use_request_distribution = not self._use_slot_mapping
-        self._enable_dp_local_page_path = check_bool_flag("EASURGE_ENABLE_DP_LOCAL_PAGE_PATH", default=True)
+        self._enable_dp_local_page_path = check_bool_flag("EASYDEL_ENABLE_DP_LOCAL_PAGE_PATH", default=True)
         self._data_parallel_size = max(1, int(getattr(metadata, "data_parallel_size", 1) or 1))
 
         # Ragged paging shapes (compile-stable).

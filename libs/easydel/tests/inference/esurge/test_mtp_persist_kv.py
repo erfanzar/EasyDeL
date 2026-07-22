@@ -41,11 +41,11 @@ os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
 # The runner-level greedy-exactness check needs the exact sequential-replay
 # recurrent path (the tiny model has linear_attention layers); the default fast
 # path is coherent but not bit-identical to the no-spec baseline on recurrent
-# models. ``_run_generation`` forces EASURGE_SPEC_RECURRENT_REPLAY=1 for its own
+# models. ``_run_generation`` forces EASYDEL_SPEC_RECURRENT_REPLAY=1 for its own
 # runs (overriding any ambient fast-path setting) rather than relying on this
 # process default, so the greedy==baseline assertion can't be made flaky by the
 # caller's environment. This ``setdefault`` only sets a default for the rest.
-os.environ.setdefault("EASURGE_SPEC_RECURRENT_REPLAY", "1")
+os.environ.setdefault("EASYDEL_SPEC_RECURRENT_REPLAY", "1")
 
 import jax
 import jax.numpy as jnp
@@ -216,12 +216,12 @@ def test_multi_window_persist_runs_and_tracks_committed():
 def _run_generation(model, *, drafter, persist_kv: bool, max_new_tokens: int = 8) -> list[int]:
     """Drive a greedy eSurge generation to completion; return the emitted tokens."""
     prev = os.environ.get("EASYDEL_MTP_PERSIST_KV")
-    prev_replay = os.environ.get("EASURGE_SPEC_RECURRENT_REPLAY")
+    prev_replay = os.environ.get("EASYDEL_SPEC_RECURRENT_REPLAY")
     os.environ["EASYDEL_MTP_PERSIST_KV"] = "1" if persist_kv else "0"
     # Exact sequential replay is required for greedy spec output to be bit-identical
     # to the no-spec baseline on this recurrent model; force it here so an ambient
-    # EASURGE_SPEC_RECURRENT_REPLAY=0 (fast path) can't make this assertion flaky.
-    os.environ["EASURGE_SPEC_RECURRENT_REPLAY"] = "1"
+    # EASYDEL_SPEC_RECURRENT_REPLAY=0 (fast path) can't make this assertion flaky.
+    os.environ["EASYDEL_SPEC_RECURRENT_REPLAY"] = "1"
     try:
         runner = eSurgeRunner(
             model=model,
@@ -274,9 +274,9 @@ def _run_generation(model, *, drafter, persist_kv: bool, max_new_tokens: int = 8
         else:
             os.environ["EASYDEL_MTP_PERSIST_KV"] = prev
         if prev_replay is None:
-            os.environ.pop("EASURGE_SPEC_RECURRENT_REPLAY", None)
+            os.environ.pop("EASYDEL_SPEC_RECURRENT_REPLAY", None)
         else:
-            os.environ["EASURGE_SPEC_RECURRENT_REPLAY"] = prev_replay
+            os.environ["EASYDEL_SPEC_RECURRENT_REPLAY"] = prev_replay
 
 
 def test_runner_greedy_output_unchanged_with_persist():
@@ -308,8 +308,8 @@ def test_runner_greedy_output_unchanged_with_persist():
         return orig(self, seeds)
 
     _strategy.DrafterSpeculation.draft_next_batched = _spy
-    prev = os.environ.get("EASURGE_DISABLE_BATCHED_DRAFT")
-    os.environ["EASURGE_DISABLE_BATCHED_DRAFT"] = "0"  # batched path ENABLED
+    prev = os.environ.get("EASYDEL_DISABLE_BATCHED_DRAFT")
+    os.environ["EASYDEL_DISABLE_BATCHED_DRAFT"] = "0"  # batched path ENABLED
     try:
         model = make_tiny_model(mtp_layers=1)
         assert model.has_mtp()
@@ -321,9 +321,9 @@ def test_runner_greedy_output_unchanged_with_persist():
     finally:
         _strategy.DrafterSpeculation.draft_next_batched = orig
         if prev is None:
-            os.environ.pop("EASURGE_DISABLE_BATCHED_DRAFT", None)
+            os.environ.pop("EASYDEL_DISABLE_BATCHED_DRAFT", None)
         else:
-            os.environ["EASURGE_DISABLE_BATCHED_DRAFT"] = prev
+            os.environ["EASYDEL_DISABLE_BATCHED_DRAFT"] = prev
 
     assert out, "persistent speculative run emitted no tokens"
     assert min(out) >= 0 and max(out) < _VOCAB

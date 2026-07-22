@@ -58,7 +58,6 @@ Example:
 
 from __future__ import annotations
 
-import os
 import time
 import typing
 from bisect import bisect_left
@@ -81,6 +80,7 @@ from easydel.inference.esurge.config import (
 from easydel.inference.speculative import DrafterProtocol, accept_or_reject, resample_rejected
 from easydel.infra.sharding import replicated_named_sharding
 from easydel.layers.quantization import TurboQuantConfig
+from easydel.utils import flags
 
 from ..core.dp_sharding import dp_shard_page_bounds, pages_per_dp_shard
 from ..core.interface import create_kv_cache_specs_from_config, estimate_runtime_page_budget
@@ -540,15 +540,13 @@ class eSurgeRunner:
         #     27B GDN hybrid. NOT bit-identical to plain greedy (a chunked verify
         #     cannot match a per-token decode on a linear-attention model) and
         #     cross-process non-deterministic at the low bits.
-        #   exact replay (EASURGE_SPEC_RECURRENT_REPLAY=1): advance the live state
+        #   exact replay (EASYDEL_SPEC_RECURRENT_REPLAY=1): advance the live state
         #     via a sequential-GDN replay of the accepted prefix. Bit-identical to
         #     plain greedy, but the extra per-window replay forward costs ~2.5x
         #     (measured 0.39x vs 0.95x on Qwen3.6-27B, tp=4, K=2) — so it is opt-in.
         # Default fast so speculative decoding serves its purpose (a speedup);
         # set the env to 1 when bit-exact greedy is required over throughput.
-        self.spec_decode_recurrent_replay = bool(
-            int(os.environ.get("EASURGE_SPEC_RECURRENT_REPLAY", "0") or 0)
-        )
+        self.spec_decode_recurrent_replay = flags.get_bool(flags.EASYDEL_SPEC_RECURRENT_REPLAY)
 
         logger.debug("Creating ExecutionManager and initializing pages cache")
         manager_cls = PipelineExecutionManager if self.pipeline_plan.is_enabled else ExecutionManager
@@ -3074,7 +3072,7 @@ class eSurgeRunner:
             # bookkeeping. Gated exactly like the batched drafter: only greedy,
             # spec-eligible, full-hidden-available rows, and only when >= 2 are
             # verified together (a single request stays bit-identical to the
-            # per-request path). ``EASURGE_DISABLE_BATCHED_EMIT=1`` forces the
+            # per-request path). ``EASYDEL_DISABLE_BATCHED_EMIT=1`` forces the
             # legacy per-request project/argmax (A/B + isolated parity proof).
             batched_verify_by_row: dict[int, _BatchedVerifyRow] = {}
             verify_meta_by_row: dict[int, typing.Any] = {}
@@ -3082,7 +3080,7 @@ class eSurgeRunner:
                 spec_decode_active_window
                 and self.drafter is not None
                 and hidden_states_for_spec is not None
-                and os.environ.get("EASURGE_DISABLE_BATCHED_EMIT", "0") != "1"
+                and not flags.get_bool(flags.EASYDEL_DISABLE_BATCHED_EMIT)
             )
             if batched_emit_enabled:
                 _flat_indices: list[int] = []
@@ -3417,7 +3415,7 @@ class eSurgeRunner:
                                 # correctness): advance the live recurrent state via
                                 # a sequential-GDN replay and re-derive the corrected
                                 # token + seed hidden from it. The "fast" path
-                                # (EASURGE_SPEC_RECURRENT_REPLAY=0) instead reused the
+                                # (EASYDEL_SPEC_RECURRENT_REPLAY=0) instead reused the
                                 # fused verify forward's argmax + the deferred
                                 # recurrent candidate-commit; that commit is NOT exact
                                 # for greedy, so the live GDN state diverged from

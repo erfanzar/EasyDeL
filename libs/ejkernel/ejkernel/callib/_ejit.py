@@ -76,6 +76,11 @@ if tp.TYPE_CHECKING:
 P = tp.ParamSpec("P")
 R = tp.TypeVar("R")
 
+# These two flags use the EASYDEL_ prefix by intentional cross-package
+# agreement: ejkernel's compile cache is driven by the same env vars EasyDeL
+# users already set (easydel.utils.compiling_utils re-exports these values), so
+# a single EASYDEL_CACHE_COMPILES / EASYDEL_RECOMPILE_FORCE controls caching in
+# both packages. They are deliberately NOT renamed to an EJKERNEL_ prefix.
 RECOMPILE_FORCE = check_bool_flag("EASYDEL_RECOMPILE_FORCE", False)
 ECACHE_COMPILES = check_bool_flag("EASYDEL_CACHE_COMPILES", False)
 ALLOW_FULL_CACHE = check_bool_flag("ALLOW_FULL_CACHE", False)

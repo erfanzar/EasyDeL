@@ -29,7 +29,7 @@ The op handles ragged (variable-length) batches via per-request page tables
 and ``query_start_loc``, performs request distribution bookkeeping, and
 dispatches to one of two ``shard_map`` paths: the DP-local path that slices
 context lengths and page tables per shard (active when
-``EASURGE_ENABLE_DP_LOCAL_PAGE_PATH=True`` and the request count divides the
+``EASYDEL_ENABLE_DP_LOCAL_PAGE_PATH=True`` and the request count divides the
 DP axis size), or the globally replicated path that runs the kernel against
 the full batch on every shard.
 
@@ -65,7 +65,7 @@ from ..requirements import (
     RequirementsBuilder,
 )
 
-ENABLE_DP_LOCAL_PAGE_PATH = check_bool_flag("EASURGE_ENABLE_DP_LOCAL_PAGE_PATH", default=True)
+ENABLE_DP_LOCAL_PAGE_PATH = check_bool_flag("EASYDEL_ENABLE_DP_LOCAL_PAGE_PATH", default=True)
 
 
 def _dp_page_axis(cache_view: MLARaggedPagesCacheView):
@@ -258,7 +258,7 @@ class MultiLatentRaggedPageAttn(OperationImpl):
     * Separate ``keys_values`` (the low-rank latent KV representation) and
       ``keys_pe`` (positional-embedding keys) tensors.
     * Ragged (variable-length) batches with page-table-based KV caches.
-    * Data-parallel local-page sharding when ``EASURGE_ENABLE_DP_LOCAL_PAGE_PATH``
+    * Data-parallel local-page sharding when ``EASYDEL_ENABLE_DP_LOCAL_PAGE_PATH``
       is active, falling back to a globally-replicated page path otherwise.
     * Automatic sharding via ``jax.shard_map`` for TPU/GPU meshes.
 

@@ -52,7 +52,7 @@ from .zmq_workers import DetokenizerWorkerClient, TokenizerWorkerClient
 logger = get_logger(__name__)
 
 DEFAULT_WORKER_STARTUP_TIMEOUT = 120.0
-_WORKER_STARTUP_TIMEOUT_ENV_VARS = ("EASURGE_WORKER_STARTUP_TIMEOUT", "ESURGE_WORKER_STARTUP_TIMEOUT")
+_WORKER_STARTUP_TIMEOUT_ENV_VARS = ("EASYDEL_WORKER_STARTUP_TIMEOUT",)
 
 
 class WorkerManager:
@@ -247,7 +247,7 @@ class WorkerManager:
         Order of precedence:
 
         1. ``startup_timeout`` argument (must be > 0).
-        2. ``EASURGE_WORKER_STARTUP_TIMEOUT`` / ``ESURGE_WORKER_STARTUP_TIMEOUT``
+        2. ``EASYDEL_WORKER_STARTUP_TIMEOUT``
            environment variables (first valid value wins).
         3. :data:`DEFAULT_WORKER_STARTUP_TIMEOUT`.
 
@@ -361,7 +361,7 @@ class WorkerManager:
         pid_text = f" (pid={process.pid})" if process is not None and process.poll() is None else ""
         raise TimeoutError(
             f"Timed out waiting {self._startup_timeout:.1f}s for {worker_name} worker to bind to {endpoint}{pid_text}. "
-            "Increase `worker_startup_timeout` or set `EASURGE_WORKER_STARTUP_TIMEOUT`."
+            "Increase `worker_startup_timeout` or set `EASYDEL_WORKER_STARTUP_TIMEOUT`."
         )
 
     def _make_ipc_endpoint(self, prefix: str) -> str:

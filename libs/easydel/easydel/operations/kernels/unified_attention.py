@@ -29,7 +29,7 @@ Capabilities and constraints:
   already contain the current step's K/V for the new query tokens. Updates
   happen earlier via :meth:`UnifiedAttentionCacheView.concatenate_to_cache`.
 * When the cache reports ``data_parallel_size > 1`` and
-  ``EASURGE_ENABLE_DP_LOCAL_PAGE_PATH`` is enabled, the op runs under
+  ``EASYDEL_ENABLE_DP_LOCAL_PAGE_PATH`` is enabled, the op runs under
   ``shard_map`` with DP-local page slicing: each DP shard sees its own
   rows and translates block-table IDs into per-shard pages, then a
   ``psum`` reduces over the data-parallel axis to recover the full output.
@@ -57,7 +57,7 @@ from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationRegistry
 from ..requirements import CacheType, ExecutionMode, MetadataField, OperationRequirements, RequirementsBuilder
 
-ENABLE_DP_LOCAL_PAGE_PATH = check_bool_flag("EASURGE_ENABLE_DP_LOCAL_PAGE_PATH", default=True)
+ENABLE_DP_LOCAL_PAGE_PATH = check_bool_flag("EASYDEL_ENABLE_DP_LOCAL_PAGE_PATH", default=True)
 
 
 def _dp_page_axis(cache_view: UnifiedAttentionCacheView):

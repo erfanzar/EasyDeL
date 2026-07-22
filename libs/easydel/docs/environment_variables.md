@@ -143,10 +143,18 @@ These are set during ejkernel import or profiler setup:
 | Env var                             | Default         | What it does                                                              | Use case                                          |
 | ----------------------------------- | --------------- | ------------------------------------------------------------------------- | ------------------------------------------------- |
 | `EASYDEL_TOPK_FOR_COMPUTE`          | `64`            | Limits top-k in efficient top-p sampling.                                 | Trade accuracy vs speed in sampling.              |
-| `EASURGE_MAX_SCHEDULER_ERRORS`      | `1`             | Max consecutive scheduler errors before eSurge stops.                     | Increase for resiliency in flaky environments.    |
-| `EASURGE_TOKENIZER_ENDPOINT`        | none            | Overrides tokenizer worker ZeroMQ endpoint.                               | Run tokenizer/detokenizer on custom endpoints.    |
-| `EASURGE_DETOKENIZER_ENDPOINT`      | none            | Overrides detokenizer worker ZeroMQ endpoint.                             | Same as above.                                    |
-| `EASURGE_SYNC_INPUTS_FOR_TIMING`    | `0`             | If `1`, syncs inputs for more accurate timing (adds a device round-trip). | Benchmarking accurate prep time.                  |
+| `EASYDEL_MAX_SCHEDULER_ERRORS`      | `5`             | Max consecutive scheduler errors before the eSurge loop stops.            | Increase for resiliency in flaky environments.    |
+| `EASYDEL_HEARTBEAT_WARN_S`          | `120`           | Seconds without a scheduler heartbeat before a stall warning is logged.   | Tune stall detection sensitivity.                 |
+| `EASYDEL_HEARTBEAT_WARN_INTERVAL_S` | `30`            | Minimum seconds between repeated scheduler-stall warnings.                | Throttle stall-warning noise.                     |
+| `EASYDEL_TOKENIZER_ENDPOINT`        | none            | Overrides tokenizer worker ZeroMQ endpoint.                               | Run tokenizer/detokenizer on custom endpoints.    |
+| `EASYDEL_DETOKENIZER_ENDPOINT`      | none            | Overrides detokenizer worker ZeroMQ endpoint.                             | Same as above.                                    |
+| `EASYDEL_WORKER_STARTUP_TIMEOUT`    | `120`           | Seconds to wait for a tokenizer/detokenizer worker to bind.               | Raise for slow worker startup.                    |
+| `EASYDEL_SYNC_INPUTS_FOR_TIMING`    | `0`             | If `1`, syncs inputs for more accurate timing (adds a device round-trip). | Benchmarking accurate prep time.                  |
+| `EASYDEL_ENABLE_DP_LOCAL_PAGE_PATH` | `1`             | Enable the DP-local paged-attention path when request count divides evenly.| Toggle the data-parallel local-page attention path.|
+| `EASYDEL_SPEC_RECURRENT_REPLAY`     | `0`             | Bit-exact greedy spec-decode via sequential-GDN replay of the accepted prefix (slower). | Force bit-exact greedy over throughput. |
+| `EASYDEL_DISABLE_BATCHED_DRAFT`     | `0`             | A/B fallback: force the per-request MTP draft path.                       | Benchmark batched vs per-request drafting.        |
+| `EASYDEL_DISABLE_BATCHED_EMIT`      | `0`             | A/B fallback: force the per-request MTP emit path.                        | Benchmark batched vs per-request emit.            |
+| `EASYDEL_MTP_PERSIST_KV`            | drafter default | `0`/`1` overrides whether the MTP drafter KV cache persists across windows.| Force persist/no-persist for the MTP drafter.     |
 | `ESURGE_DETOKENIZER_CONTEXT_WINDOW` | `4`             | Token context window used by the detokenizer worker for streaming decode. | Improve joiner/WordPiece decoding in streams.     |
 | `ESURGE_WORKER_TRUST_REMOTE_CODE`   | `1`             | Controls `trust_remote_code` for tokenizer workers.                       | Disable to avoid executing remote tokenizer code. |
 | `OPENAI_API_KEY`                    | none            | Used by OpenAI-compatible proxy when `api_key` not provided.              | Required for proxying to OpenAI.                  |
