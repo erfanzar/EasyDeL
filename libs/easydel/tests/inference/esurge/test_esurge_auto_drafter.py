@@ -26,38 +26,21 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import spectrax as spx
-
 from easydel.inference.esurge.config import eSurgeDrafterConfig
 from easydel.inference.esurge.engine.bootstrap import _build_drafter
 from easydel.inference.esurge.runners.spec.strategy import DrafterSpeculation
 from easydel.inference.sampling_params import SamplingParams
 from easydel.inference.speculative import Qwen3_5MTPDrafter
-from easydel.modules.qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5TextConfig
+
+try:
+    from ._common import make_tiny_qwen35 as make_tiny_model
+except ImportError:  # standalone `python test_x.py`
+    from _common import make_tiny_qwen35 as make_tiny_model
 
 _VOCAB = 256
 _HIDDEN = 128
 
 
-def make_tiny_model(mtp_layers: int = 1) -> Qwen3_5ForCausalLM:
-    """Tiny Qwen3.5 with an MTP head (same shape as test_mtp_persist_kv)."""
-    cfg = Qwen3_5TextConfig(
-        vocab_size=_VOCAB,
-        hidden_size=_HIDDEN,
-        intermediate_size=256,
-        num_hidden_layers=4,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=32,
-        max_position_embeddings=512,
-        layer_types=["linear_attention", "linear_attention", "linear_attention", "full_attention"],
-        mtp_num_hidden_layers=mtp_layers,
-        mtp_loss_coef=0.0,
-        attn_output_gate=True,
-        rms_norm_eps=1e-6,
-        partial_rotary_factor=0.25,
-    )
-    return Qwen3_5ForCausalLM(config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
 
 
 def test_model_drafter_auto_resolves_mtp_with_tuned_defaults():
