@@ -31,33 +31,18 @@ os.environ.setdefault("EASYDEL_SPEC_RECURRENT_REPLAY", "1")
 import jax
 import jax.numpy as jnp
 import numpy as np
-import spectrax as spx
 from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.esurge.runners import eSurgeRunner
 from easydel.inference.esurge.scheduler import Scheduler
 from easydel.inference.sampling_params import SamplingParams
 from easydel.inference.speculative import DraftStep
-from easydel.modules.qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5TextConfig
+
+try:
+    from ._common import make_tiny_qwen35 as make_tiny_model
+except ImportError:  # standalone `python test_x.py`
+    from _common import make_tiny_qwen35 as make_tiny_model
 
 
-def make_tiny_model(mtp_layers: int = 1):
-    cfg = Qwen3_5TextConfig(
-        vocab_size=256,
-        hidden_size=128,
-        intermediate_size=256,
-        num_hidden_layers=4,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=32,
-        max_position_embeddings=512,
-        layer_types=["linear_attention", "linear_attention", "linear_attention", "full_attention"],
-        mtp_num_hidden_layers=mtp_layers,
-        mtp_loss_coef=0.0,
-        attn_output_gate=True,
-        rms_norm_eps=1e-6,
-        partial_rotary_factor=0.25,
-    )
-    return Qwen3_5ForCausalLM(config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
 
 
 class BaselineSequenceDrafter:
