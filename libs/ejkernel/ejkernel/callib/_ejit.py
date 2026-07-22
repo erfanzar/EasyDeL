@@ -57,11 +57,14 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import importlib.metadata
 import inspect
 import os
 import pickle
+import platform
 import typing as tp
 import warnings
+from pathlib import Path
 
 import jax
 import numpy as np
@@ -80,14 +83,122 @@ ECACHE_COMPILES = check_bool_flag("EASYDEL_CACHE_COMPILES", False)
 ALLOW_FULL_CACHE = check_bool_flag("ALLOW_FULL_CACHE", False)
 
 CACHE_DIR = get_cache_dir()
-COMPILE_FUNC_DIR = os.getenv("COMPILE_FUNC_DIR", CACHE_DIR / "ejit_compiled_functions")
+COMPILE_FUNC_DIR = Path(os.getenv("COMPILE_FUNC_DIR") or (CACHE_DIR / "ejit_compiled_functions"))
 
-if not isinstance(COMPILE_FUNC_DIR, str) and hasattr(COMPILE_FUNC_DIR, "mkdir"):
-    COMPILE_FUNC_DIR.mkdir(parents=True, exist_ok=True)
+
+def _env_fingerprint() -> str:
+    """Import-safe fingerprint of the compilation environment.
+
+    Serialized/AOT executables are only valid for the exact toolchain and
+    machine class that produced them: a blob compiled against a different
+    jax/jaxlib/libtpu, or on a CPU with target features this host lacks
+    (e.g. ``+prefer-no-gather``), deserializes into garbage that aborts the
+    process with SIGILL-class native crashes — long after any Python
+    ``except`` block. Namespacing the on-disk cache by this fingerprint makes
+    foreign entries invisible instead of fatal.
+
+    Deliberately avoids ``jax.devices()`` (must not initialize a backend at
+    import time); accelerator identity is already part of every executable's
+    lowering, and toolchain + host-CPU identity is what the flat cache could
+    not see.
+    """
+    parts = [f"jax={jax.__version__}"]
+    for dist in ("jaxlib", "libtpu", "libtpu-nightly", "jax-cuda12-plugin", "jax-cuda13-plugin"):
+        try:
+            parts.append(f"{dist}={importlib.metadata.version(dist)}")
+        except importlib.metadata.PackageNotFoundError:
+            continue
+    parts.append(platform.machine())
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.startswith(("flags", "Features")):
+                    parts.append(hashlib.sha1(line.encode()).hexdigest()[:8])
+                    break
+    except OSError:
+        parts.append("nocpuinfo")
+    return hashlib.sha1("|".join(parts).encode()).hexdigest()[:12]
+
+
+EFFECTIVE_COMPILE_FUNC_DIR = COMPILE_FUNC_DIR / f"env-{_env_fingerprint()}"
+try:
+    EFFECTIVE_COMPILE_FUNC_DIR.mkdir(parents=True, exist_ok=True)
+except OSError:  # read-only filesystem: caching disabled naturally at write time
+    pass
+
+
+def get_effective_compile_dir() -> Path:
+    """The environment-namespaced directory all compile caching reads/writes."""
+    return EFFECTIVE_COMPILE_FUNC_DIR
+
 
 COMPILED_FILE_NAME = "compiled.executable"
 SIGNATURE_FILE_NAME = "compiled.signature"
 COMPILED_CACHE: dict[str, Compiled] = {}
+
+# Serialized XLA executables are protobuf-framed; entries at/over the 2 GiB
+# protobuf limit fail metadata parsing on read and can abort the reader
+# natively. An executable this large almost always means model weights were
+# captured as jit constants — a bug to fix at the call site, never to cache.
+MAX_CACHE_ENTRY_BYTES = int(os.getenv("EJIT_MAX_CACHE_ENTRY_BYTES", str(1_900_000_000)))
+
+_JAX_PERSISTENT_CACHE_CONFIGURED = False
+
+
+def _configure_jax_persistent_cache() -> None:
+    """Point JAX's persistent compilation cache at the namespaced dir (once).
+
+    Also sweeps any oversized entry out of the directory so a partially
+    written or weight-capturing giant blob can never poison later readers.
+    """
+    global _JAX_PERSISTENT_CACHE_CONFIGURED
+    if _JAX_PERSISTENT_CACHE_CONFIGURED:
+        return
+    from jax.experimental.compilation_cache import compilation_cache as cc
+
+    cc.set_cache_dir(str(EFFECTIVE_COMPILE_FUNC_DIR))
+    jax.config.update("jax_compilation_cache_dir", str(EFFECTIVE_COMPILE_FUNC_DIR))
+    if ALLOW_FULL_CACHE:
+        jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+        jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+        jax.config.update("jax_persistent_cache_enable_xla_caches", "all")
+    try:
+        for entry in EFFECTIVE_COMPILE_FUNC_DIR.iterdir():
+            if entry.is_file() and entry.stat().st_size > MAX_CACHE_ENTRY_BYTES:
+                warnings.warn(
+                    f"Removing oversized compile-cache entry {entry.name} "
+                    f"({entry.stat().st_size / 1e9:.2f} GB > {MAX_CACHE_ENTRY_BYTES / 1e9:.2f} GB): "
+                    "entries this large fail protobuf parsing on read and can crash the reader. "
+                    "The producing jit likely captures model weights as constants.",
+                    stacklevel=2,
+                )
+                entry.unlink(missing_ok=True)
+    except OSError:
+        pass
+    _JAX_PERSISTENT_CACHE_CONFIGURED = True
+
+
+def _entry_too_large(num_bytes: int, what: str, *, verbose: bool = True) -> bool:
+    """True (with an actionable warning) when a cache entry exceeds the safe size."""
+    if num_bytes <= MAX_CACHE_ENTRY_BYTES:
+        return False
+    if verbose:
+        warnings.warn(
+            f"Skipping compile-cache {what}: {num_bytes / 1e9:.2f} GB exceeds the "
+            f"{MAX_CACHE_ENTRY_BYTES / 1e9:.2f} GB safe limit (protobuf parse ceiling). "
+            "An executable this large usually means model weights were captured as jit "
+            "constants — thread them as inputs (spx.export/spx.bind) instead.",
+            stacklevel=3,
+        )
+    return True
+
+
+def _atomic_pickle_dump(obj: tp.Any, path: Path) -> None:
+    """Write a pickle atomically (tmp + rename) so readers never see partial blobs."""
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    with open(tmp, "wb") as f:
+        pickle.dump(obj, f)
+    os.replace(tmp, path)
 
 
 def _get_hardware_signature() -> str:
@@ -213,14 +324,7 @@ def ejit(
         )
 
     if not ECACHE_COMPILES:
-        from jax.experimental.compilation_cache import compilation_cache as cc
-
-        cc.set_cache_dir(str(COMPILE_FUNC_DIR))
-        jax.config.update("jax_compilation_cache_dir", str(COMPILE_FUNC_DIR))
-        if ALLOW_FULL_CACHE:
-            jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
-            jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
-            jax.config.update("jax_persistent_cache_enable_xla_caches", "all")
+        _configure_jax_persistent_cache()
 
         jitted_function = jax.jit(
             func,
@@ -319,15 +423,16 @@ def ejit(
         if compilation_key in COMPILED_CACHE and not RECOMPILE_FORCE:
             return COMPILED_CACHE[compilation_key]
 
-        func_dir = COMPILE_FUNC_DIR / compilation_key
+        func_dir = EFFECTIVE_COMPILE_FUNC_DIR / compilation_key
         filepath = func_dir / COMPILED_FILE_NAME
         if filepath.exists() and not RECOMPILE_FORCE:
             try:
-                with open(filepath, "rb") as f:
-                    serialized, in_tree, out_tree = pickle.load(f)
-                compiled_func = deserialize_and_load(serialized, in_tree, out_tree)
-                COMPILED_CACHE[compilation_key] = compiled_func
-                return compiled_func
+                if not _entry_too_large(filepath.stat().st_size, f"load of '{filepath}'"):
+                    with open(filepath, "rb") as f:
+                        serialized, in_tree, out_tree = pickle.load(f)
+                    compiled_func = deserialize_and_load(serialized, in_tree, out_tree)
+                    COMPILED_CACHE[compilation_key] = compiled_func
+                    return compiled_func
             except Exception as e:
                 warnings.warn(f"Could not load ejit cache from '{filepath}'. Recompiling. Error: {e}", stacklevel=2)
 
@@ -337,9 +442,9 @@ def ejit(
 
             try:
                 serialized, in_tree, out_tree = serialize(compiled_func)
-                func_dir.mkdir(parents=True, exist_ok=True)
-                with open(filepath, "wb") as f:
-                    pickle.dump((serialized, in_tree, out_tree), f)
+                if not _entry_too_large(len(serialized), f"save for '{func.__name__}'"):
+                    func_dir.mkdir(parents=True, exist_ok=True)
+                    _atomic_pickle_dump((serialized, in_tree, out_tree), filepath)
             except Exception:
                 pass
 
@@ -398,11 +503,11 @@ def load_cached_functions(verbose: bool = True) -> None:
         This is useful at startup to warm up the cache before running
         performance-critical code paths.
     """
-    if not COMPILE_FUNC_DIR.exists():
+    if not EFFECTIVE_COMPILE_FUNC_DIR.exists():
         return
 
     loaded_count = 0
-    for cache_key_dir in COMPILE_FUNC_DIR.iterdir():
+    for cache_key_dir in EFFECTIVE_COMPILE_FUNC_DIR.iterdir():
         if not cache_key_dir.is_dir():
             continue
 
@@ -411,6 +516,8 @@ def load_cached_functions(verbose: bool = True) -> None:
 
         if filepath.exists():
             try:
+                if _entry_too_large(filepath.stat().st_size, f"pre-load of '{filepath}'", verbose=verbose):
+                    continue
                 with open(filepath, "rb") as f:
                     serialized, in_tree, out_tree = pickle.load(f)
                 compiled_func = deserialize_and_load(serialized, in_tree, out_tree)
@@ -461,16 +568,15 @@ def save_compiled_fn(path: str | os.PathLike, fn: Compiled, prefix: str | None =
         - Large models may produce large cache files
         - Uses pickle for serialization (standard security caveats apply)
     """
-    from pathlib import Path
-
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
     prefix = prefix or ""
     filename = path / (prefix + "-" + COMPILED_FILE_NAME if prefix else COMPILED_FILE_NAME)
     serialized, in_tree, out_tree = serialize(fn)
+    if _entry_too_large(len(serialized), f"save to '{filename}'"):
+        return
     try:
-        with open(filename, "wb") as f:
-            pickle.dump((serialized, in_tree, out_tree), f)
+        _atomic_pickle_dump((serialized, in_tree, out_tree), filename)
     except Exception as e:
         warnings.warn(f"Could not save compiled function to {filename}: {e}", stacklevel=2)
 
@@ -501,11 +607,14 @@ def load_compiled_fn(path: str | os.PathLike, prefix: str | None = None):
         a file produced on a different GPU model or JAX version will likely
         raise an error inside ``deserialize_and_load``.
     """
-    from pathlib import Path
-
     path = Path(path)
     prefix = prefix or ""
     filename = path / (prefix + "-" + COMPILED_FILE_NAME if prefix else COMPILED_FILE_NAME)
+    if _entry_too_large(filename.stat().st_size, f"load of '{filename}'"):
+        raise ValueError(
+            f"Refusing to deserialize '{filename}': {filename.stat().st_size / 1e9:.2f} GB exceeds the "
+            "safe protobuf parse ceiling (readers can crash natively on such entries)."
+        )
     serialized, in_tree, out_tree = pickle.load(open(filename, "rb"))
     return deserialize_and_load(
         serialized=serialized,
@@ -627,7 +736,7 @@ def smart_compile(
     """
     func_hash = get_hash_of_lowering(lowered_func)
     foldername = str(func_hash) if tag is None else f"{tag}-{func_hash}"
-    func_dir = COMPILE_FUNC_DIR / foldername
+    func_dir = EFFECTIVE_COMPILE_FUNC_DIR / foldername
     filepath = func_dir / COMPILED_FILE_NAME
     signature_filepath = func_dir / SIGNATURE_FILE_NAME
     post_fix = f" (TAG : {tag})" if tag else ""
@@ -635,6 +744,8 @@ def smart_compile(
 
     if filepath.exists() and not RECOMPILE_FORCE:
         try:
+            if _entry_too_large(filepath.stat().st_size, f"load of '{filepath}'", verbose=verbose):
+                raise ValueError("cache entry exceeds the safe deserialization size")
             serialized, in_tree, out_tree = pickle.load(open(filepath, "rb"))
             signature = pickle.load(open(signature_filepath, "rb"))
             compiled_func = deserialize_and_load(
@@ -652,25 +763,27 @@ def smart_compile(
             compiled_func: Compiled = lowered_func.compile()
             if ECACHE_COMPILES:
                 serialized, in_tree, out_tree = serialize(compiled_func)
-                func_dir.mkdir(parents=True, exist_ok=True)
-                try:
-                    pickle.dump((serialized, in_tree, out_tree), open(filepath, "wb"))
-                    pickle.dump(cache_key, open(signature_filepath, "wb"))
-                except Exception as e:
-                    if verbose:
-                        warnings.warn(
-                            f"couldn't save compiled function due to {e}" + post_fix,
-                            stacklevel=4,
-                        )
+                if not _entry_too_large(len(serialized), f"save of '{filepath}'", verbose=verbose):
+                    func_dir.mkdir(parents=True, exist_ok=True)
+                    try:
+                        _atomic_pickle_dump((serialized, in_tree, out_tree), filepath)
+                        _atomic_pickle_dump(cache_key, signature_filepath)
+                    except Exception as e:
+                        if verbose:
+                            warnings.warn(
+                                f"couldn't save compiled function due to {e}" + post_fix,
+                                stacklevel=4,
+                            )
             return compiled_func, signature
     else:
         compiled_func: Compiled = lowered_func.compile()
         if ECACHE_COMPILES:
             try:
                 serialized, in_tree, out_tree = serialize(compiled_func)
-                func_dir.mkdir(parents=True, exist_ok=True)
-                pickle.dump((serialized, in_tree, out_tree), open(filepath, "wb"))
-                pickle.dump(cache_key, open(signature_filepath, "wb"))
+                if not _entry_too_large(len(serialized), f"save of '{filepath}'", verbose=verbose):
+                    func_dir.mkdir(parents=True, exist_ok=True)
+                    _atomic_pickle_dump((serialized, in_tree, out_tree), filepath)
+                    _atomic_pickle_dump(cache_key, signature_filepath)
             except Exception as e:
                 if verbose:
                     warnings.warn(
