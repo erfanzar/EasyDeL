@@ -2381,6 +2381,9 @@ class eSurgeRunner:
         # entry: (req_id, req_idx, seed_token, seed_position, seed_hidden, req_state,
         # known_len, spec_idx). See ``DrafterSpeculation.draft_next_batched``.
         pending_batched_drafts: list[tuple] = []
+        # Early-dispatched batched drafts, one (handle, writeback-map) per
+        # window; read back after the emission loop (see the pre-pass block).
+        early_draft_batches: list[tuple[dict, dict]] = []
         # Only engage the batched pool draft when >= 2 spec-active requests are being
         # verified this step. Batching a single request wins no throughput (a pooled
         # [1, ...] forward is no cheaper than one row-targeted forward) but moves the
@@ -3145,6 +3148,57 @@ class eSurgeRunner:
                             gathered_hidden=_gathered_hidden,
                             batched_logits=_batched_logits,
                         )
+            # --- Early batched-draft dispatch --------------------------------
+            # Every input the batched drafter needs (per-request accepted count,
+            # corrected token, seed position, seed hidden row) is derivable from
+            # the pre-pass argmaxes, so ENQUEUE the drafter's device work here —
+            # before the host emission loop — and read it back after the loop
+            # (finish_batched_draft). The drafter's device time then overlaps
+            # the emission python instead of serializing after it, and the seed
+            # hidden rows are fetched with ONE fused gather instead of one
+            # eager device slice per request. Gated exactly like the emission
+            # loop's batched-draft queueing (greedy, batched-capable requests,
+            # >= 2 verified together), plus: no recurrent replay (which would
+            # re-derive the corrected token after this point) and no
+            # reject-backoff (its state is only updated later in the loop).
+            early_draft_handle: dict | None = None
+            early_draft_by_rid: dict[str, tuple[int, int]] = {}
+            if (
+                batched_verify_by_row
+                and step_allows_batch
+                and spec_token_ids_all is not None
+                and not self.spec_decode_recurrent_replay
+                and int(getattr(self.spec, "reject_backoff_steps", 0) or 0) <= 0
+            ):
+                draft_timer_start = time.time()
+                _early_seeds: list[tuple[str, int, int, int, int]] = []
+                for _rp, _off, _cnt, _meta in _pending_bv:
+                    _bv2 = batched_verify_by_row.get(int(_rp))
+                    if _bv2 is None:
+                        continue
+                    _rid2 = str(_meta.request_id)
+                    _rs2 = self.requests.get(_rid2)
+                    if not self.spec.can_batch_draft(_rs2):
+                        continue
+                    _acc = 0
+                    for _draft_idx, _draft_tok in enumerate(_meta.buffer_draft_tokens):
+                        if int(_bv2.argmaxes[_draft_idx]) != int(_draft_tok):
+                            break
+                        _acc += 1
+                    _corrected = int(_bv2.argmaxes[_acc])
+                    _known_len = int(_meta.start_pos) + int(_meta.real_count) + _acc + 1
+                    _seed_pos = max(0, _known_len - 2)
+                    _early_seeds.append((_rid2, int(_meta.req_idx), _corrected, _seed_pos, int(_off) + _acc))
+                    early_draft_by_rid[_rid2] = (int(_meta.req_idx), _known_len)
+                if len(_early_seeds) >= 2:
+                    early_draft_handle = self.spec.begin_batched_draft(
+                        _early_seeds,
+                        seed_hidden_matrix=_gathered_hidden,
+                    )
+                    early_draft_batches.append((early_draft_handle, early_draft_by_rid))
+                else:
+                    early_draft_by_rid.clear()
+                total_spec_draft_time += time.time() - draft_timer_start
             # ------------------------------------------------------------------
 
             for row_pos, rid, req_state, req_idx, seq_len, is_valid in window_entries:
@@ -3321,7 +3375,14 @@ class eSurgeRunner:
                                 break
                             accepted += 1
                         corrected_token = int(_bv.argmaxes[accepted])
-                        seed_hidden = _bv.gathered_hidden[_bv.offset + accepted]
+                        if str(rid) in early_draft_by_rid:
+                            # This request's next drafts were already dispatched by
+                            # the early batched-draft pre-pass, which also fetched
+                            # its seed hidden row in the fused gather — skip the
+                            # per-request device slice on the hot loop.
+                            seed_hidden = None
+                        else:
+                            seed_hidden = _bv.gathered_hidden[_bv.offset + accepted]
                         if self.spec_decode_debug_max_traces > 0:
                             self.spec.record_verify_trace(
                                 meta=verify_meta,
@@ -3508,7 +3569,14 @@ class eSurgeRunner:
                         accepted=int(accepted),
                         num_drafts=len(draft_tokens_for_verify),
                     )
-                    if self.spec.can_batch_draft(req_state) and step_allows_batch and spec_token_ids_all is not None:
+                    if str(rid) in early_draft_by_rid:
+                        # Drafts already dispatched by the early batched-draft
+                        # pre-pass; reserve the output slot and write back after
+                        # the loop (finish_batched_draft).
+                        spec_idx = len(spec_token_ids_all)
+                        spec_token_ids_all.append([])
+                        early_draft_by_rid[str(rid)] = (int(req_idx), int(known_len), spec_idx)
+                    elif self.spec.can_batch_draft(req_state) and step_allows_batch and spec_token_ids_all is not None:
                         # Defer to the post-loop batched draft (see callsite above).
                         spec_idx = len(spec_token_ids_all)
                         spec_token_ids_all.append([])
@@ -3548,7 +3616,7 @@ class eSurgeRunner:
                             spec_token_ids_all.append(next_drafts)
                     if accepted_spec_tokens_by_req is not None:
                         accepted_spec_tokens_by_req[rid] = int(accepted)
-                    if hidden_states_by_req is not None:
+                    if hidden_states_by_req is not None and seed_hidden is not None:
                         hidden_states_by_req[rid] = seed_hidden
                     self.spec_decode_num_drafts_accepted += int(accepted)
                     self.spec_decode_num_verify_steps += 1
@@ -3710,6 +3778,29 @@ class eSurgeRunner:
         # untouched. The drafts are scattered back into each request's reserved output
         # slot and sequence buffer exactly as the per-request path would have written
         # them.
+        # Read back the early-dispatched batched drafts (their device work
+        # overlapped the emission loop above) and write them into the sequence
+        # buffer / output slots exactly as the legacy post-loop path would.
+        if early_draft_batches and spec_token_ids_all is not None:
+            draft_timer_start = time.time()
+            for _handle, _by_rid in early_draft_batches:
+                early_drafts = self.spec.finish_batched_draft(_handle)
+                for _rid3, _entry in _by_rid.items():
+                    if len(_entry) != 3:
+                        continue
+                    _req_idx3, _known_len3, _spec_idx3 = _entry
+                    next_drafts = early_drafts.get(_rid3, [])
+                    if next_drafts:
+                        draft_start = int(_known_len3)
+                        draft_end = min(draft_start + len(next_drafts), self.max_model_len)
+                        self.sequence_buffer.token_ids[_req_idx3, draft_start:draft_end] = np.asarray(
+                            next_drafts[: draft_end - draft_start],
+                            dtype=np.int32,
+                        )
+                        self.sequence_buffer.num_tokens[_req_idx3] = draft_end
+                    spec_token_ids_all[_spec_idx3] = next_drafts
+            total_spec_draft_time += time.time() - draft_timer_start
+
         if pending_batched_drafts and spec_token_ids_all is not None:
             draft_timer_start = time.time()
             batched_drafts = self.spec.draft_next_batched(

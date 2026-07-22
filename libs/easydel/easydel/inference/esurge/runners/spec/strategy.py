@@ -1442,14 +1442,8 @@ class DrafterSpeculation:
     ) -> dict[str, list[int]]:
         """Draft ``k`` tokens for a batch of requests in ONE pooled MTP pass.
 
-        Replaces per-request :meth:`draft_next` calls for the greedy inline-MTP
-        path: all requests collected during a decode step's window loop are drafted
-        together over the drafter's pooled cache. The seeds are scattered into full
-        request-pool ``(N,)`` arrays (idle rows masked out and left untouched by the
-        forward), the per-row EAGLE rollback target is computed exactly as
-        :meth:`draft_next` does (fresh request / reused slot re-base vs. same-request
-        commit), the drafter runs ``k`` batched forwards, and the ``(N, k)`` result
-        is read back once and mapped by pool row to each request.
+        Synchronous composition of :meth:`begin_batched_draft` (dispatch) and
+        :meth:`finish_batched_draft` (readback); see those for the mechanism.
 
         Args:
             seeds: One ``(req_id, row, seed_token, seed_position, seed_hidden)`` per
@@ -1461,6 +1455,39 @@ class DrafterSpeculation:
             ``{req_id: [drafted token ids]}`` for every input seed (an empty list
             for a request whose draft was suppressed by the reject-backoff gate).
         """
+        return self.finish_batched_draft(self.begin_batched_draft(seeds))
+
+    def begin_batched_draft(
+        self,
+        seeds: list[tuple[str, int, int, int, typing.Any]],
+        *,
+        seed_hidden_matrix: jax.Array | None = None,
+    ) -> dict:
+        """Dispatch a pooled batched MTP draft WITHOUT blocking on the result.
+
+        Replaces per-request :meth:`draft_next` calls for the greedy inline-MTP
+        path: all requests collected for a decode step are drafted together over
+        the drafter's pooled cache. The seeds are scattered into full
+        request-pool ``(N,)`` arrays (idle rows masked out and left untouched by
+        the forward), the per-row EAGLE rollback target is computed exactly as
+        :meth:`draft_next` does, and the drafter's ``k`` batched forwards are
+        ENQUEUED on device. The caller reads the result back later with
+        :meth:`finish_batched_draft`, so the drafter's device time overlaps
+        whatever host work runs in between (the emission loop).
+
+        Args:
+            seeds: One ``(req_id, row, seed_token, seed_position, seed_hidden)``
+                per collected request. ``seed_hidden`` is either a ``(H,)`` /
+                ``(1, 1, H)`` device array, or — when ``seed_hidden_matrix`` is
+                given — an INT row index into that matrix (all seed rows are then
+                fetched with one fused gather instead of per-request slices).
+            seed_hidden_matrix: Optional ``[rows, H]`` device matrix the int
+                seed-hidden indices refer to (the batched-verify pre-pass's
+                gathered hidden rows).
+
+        Returns:
+            An opaque handle dict for :meth:`finish_batched_draft`.
+        """
         out: dict[str, list[int]] = {str(rid): [] for (rid, *_rest) in seeds}
         if (
             not seeds
@@ -1468,7 +1495,7 @@ class DrafterSpeculation:
             or self.num_speculative_tokens <= 0
             or not callable(getattr(self.drafter, "draft_batched", None))
         ):
-            return out
+            return {"out": out, "drafts_dev": None, "active_reqs": []}
 
         n = max(1, int(getattr(self._runner, "max_num_reqs", 1)))
         persist_on = self._mtp_persist_enabled()
@@ -1482,6 +1509,7 @@ class DrafterSpeculation:
         collected_mask = np.zeros((n,), dtype=bool)
         active_rows: list[int] = []
         active_hidden: list[jax.Array] = []
+        active_hidden_rows: list[int] = []
         active_reqs: list[tuple[str, int]] = []
 
         for rid, row, seed_token, seed_position, seed_hidden in seeds:
@@ -1514,16 +1542,30 @@ class DrafterSpeculation:
             committed_lens[row] = int(committed)
             collected_mask[row] = True
             active_rows.append(row)
-            active_hidden.append(jnp.asarray(seed_hidden).reshape(-1))
+            if seed_hidden_matrix is not None and isinstance(seed_hidden, (int, np.integer)):
+                active_hidden_rows.append(int(seed_hidden))
+            else:
+                active_hidden.append(jnp.asarray(seed_hidden).reshape(-1))
             active_reqs.append((rid, row))
 
         if not active_rows:
-            return out
+            return {"out": out, "drafts_dev": None, "active_reqs": []}
 
-        hidden_dim = int(active_hidden[0].shape[-1])
-        hidden_full = jnp.zeros((n, 1, hidden_dim), dtype=active_hidden[0].dtype)
         rows_arr = jnp.asarray(active_rows, dtype=jnp.int32)
-        stacked_hidden = jnp.stack(active_hidden, axis=0)[:, None, :]
+        if seed_hidden_matrix is not None and active_hidden_rows and not active_hidden:
+            # One fused gather of all seed rows out of the pre-pass hidden
+            # matrix, instead of one eager device slice per request.
+            matrix = jnp.asarray(seed_hidden_matrix)
+            stacked_hidden = matrix[jnp.asarray(active_hidden_rows, dtype=jnp.int32)][:, None, :]
+        else:
+            if seed_hidden_matrix is not None and active_hidden_rows:
+                # Mixed int/array seeds (not produced by the runner today):
+                # materialize the int rows so both kinds stack uniformly.
+                matrix = jnp.asarray(seed_hidden_matrix)
+                active_hidden.extend(matrix[int(i)].reshape(-1) for i in active_hidden_rows)
+            stacked_hidden = jnp.stack(active_hidden, axis=0)[:, None, :]
+        hidden_dim = int(stacked_hidden.shape[-1])
+        hidden_full = jnp.zeros((n, 1, hidden_dim), dtype=stacked_hidden.dtype)
         hidden_full = hidden_full.at[rows_arr].set(stacked_hidden)
 
         drafts_dev = self.drafter.draft_batched(
@@ -1534,9 +1576,27 @@ class DrafterSpeculation:
             collected_mask=jnp.asarray(collected_mask),
             num_speculative_tokens=int(self.num_speculative_tokens),
         )
+        return {"out": out, "drafts_dev": drafts_dev, "active_reqs": active_reqs}
+
+    def finish_batched_draft(self, handle: dict) -> dict[str, list[int]]:
+        """Read back a batched draft dispatched by :meth:`begin_batched_draft`.
+
+        Blocks on the device drafts (the only synchronous part of the batched
+        draft) and maps each pool row back to its request id.
+
+        Args:
+            handle: The dict returned by :meth:`begin_batched_draft`.
+
+        Returns:
+            ``{req_id: [drafted token ids]}`` for every input seed.
+        """
+        out = handle["out"]
+        drafts_dev = handle.get("drafts_dev")
+        if drafts_dev is None:
+            return out
         drafts_host = np.asarray(jax.device_get(drafts_dev))
         total = 0
-        for rid, row in active_reqs:
+        for rid, row in handle["active_reqs"]:
             drafted = [int(t) for t in drafts_host[row, :]]
             out[rid] = drafted
             total += len(drafted)

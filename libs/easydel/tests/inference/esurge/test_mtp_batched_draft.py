@@ -262,12 +262,19 @@ def test_batched_runner_engages_and_scatters_for_multi_request():
 
     seed_counts: list[int] = []
     orig = _strategy.DrafterSpeculation.draft_next_batched
+    orig_begin = _strategy.DrafterSpeculation.begin_batched_draft
 
     def _spy(self, seeds):
         seed_counts.append(len(seeds))
         return orig(self, seeds)
 
+    def _spy_begin(self, seeds, **kwargs):
+        # The early-dispatch pre-pass is the batched pool path too.
+        seed_counts.append(len(seeds))
+        return orig_begin(self, seeds, **kwargs)
+
     _strategy.DrafterSpeculation.draft_next_batched = _spy
+    _strategy.DrafterSpeculation.begin_batched_draft = _spy_begin
     try:
         model = make_tiny_model()
         assert model.has_mtp()
@@ -279,6 +286,7 @@ def test_batched_runner_engages_and_scatters_for_multi_request():
         toks = _run_runner_generation(model, n_seqs=3, k=3, disable_batched=False, prompts=prompts)
     finally:
         _strategy.DrafterSpeculation.draft_next_batched = orig
+        _strategy.DrafterSpeculation.begin_batched_draft = orig_begin
 
     # Every request completed with a full, valid decode.
     assert set(toks) == {"r-0", "r-1", "r-2"}
