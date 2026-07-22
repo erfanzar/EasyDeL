@@ -58,7 +58,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from ._ejit import ejit
+from ._ejit import (
+    ejit,
+    get_effective_compile_dir,
+    load_cached_functions,
+    load_compiled_fn,
+    save_compiled_fn,
+    smart_compile,
+)
 from ._pallas_call import buffered_pallas_call
 from ._utils import cdiv, next_power_of_2, strides_from_shape
 
@@ -209,8 +216,13 @@ __all__ = (
     "cdiv",
     "cute_call",
     "ejit",
+    "get_effective_compile_dir",
     "get_triton_type",
+    "load_cached_functions",
+    "load_compiled_fn",
     "next_power_of_2",
+    "save_compiled_fn",
+    "smart_compile",
     "strides_from_shape",
     "tilelang_call",
     "triton_call",
