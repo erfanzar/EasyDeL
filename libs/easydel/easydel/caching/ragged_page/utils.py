@@ -36,31 +36,11 @@ Optimizations:
 """
 
 import jax
-from ejkernel.callib import ejit  # pyright: ignore[reportMissingTypeStubs]
+from ejkernel.callib import cdiv, ejit  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jaxtyping import Array, Float, Int
-
-
-def cdiv(a: int, v: int) -> int:
-    """Ceiling division: divide a by v and round up.
-
-    Calculates the ceiling of a/v using integer arithmetic,
-    avoiding floating point operations for efficiency.
-
-    Args:
-        a (int): Numerator (e.g., total items)
-        v (int): Denominator (e.g., items per page)
-
-    Returns:
-        int: The ceiling of a/v
-
-    Example:
-        >>> cdiv(10, 3)  # 10 items, 3 per page
-        4  # Need 4 pages
-    """
-    return (a + v - 1) // v
 
 
 def localize_slice_indices_for_page_shard(

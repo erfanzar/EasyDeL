@@ -56,56 +56,12 @@ Example:
     >>> output = flash_attention(q, k, v, causal=True, cfg=cfg)
 """
 
-import hashlib
 import json
 from dataclasses import asdict, dataclass
 from typing import Literal
 
+from ejkernel.callib import hash_fn
 from ejkernel.ops import BwdParams, FwdParams
-
-
-def get_safe_hash_int(text, algorithm="md5"):
-    """Generate a hash of text using specified algorithm with safety checks.
-
-    Args:
-        text: Input text to hash. Will be converted to string if not already.
-        algorithm: Hash algorithm name (default: "md5"). Must be a valid hashlib algorithm.
-
-    Returns:
-        Integer representation of the hash digest.
-
-    Raises:
-        ValueError: If the hash algorithm is not supported.
-        Exception: If any other error occurs during hash generation.
-    """
-    try:
-        text_str = str(text)
-        hash_object = getattr(hashlib, algorithm)(text_str.encode())
-        return int.from_bytes(hash_object.digest(), byteorder="big")
-    except AttributeError as e:
-        raise ValueError(f"Unsupported hash algorithm: {algorithm}") from e
-    except Exception as e:
-        raise Exception(f"Error generating hash: {e!s}") from e
-
-
-def hash_fn(self) -> int:
-    """Generate a hash for an object based on its dictionary values.
-
-    This function creates a deterministic hash by concatenating string representations
-    of numeric and collection-type attributes, then hashing the result.
-
-    Args:
-        self: The object instance to hash.
-
-    Returns:
-        Integer hash value derived from the object's attribute values.
-
-    Note:
-        Only includes float, int, bool, dict, list, and tuple attributes in
-        the hash.
-    """
-    shu = "".join(str(cu) for cu in self.__dict__.values() if isinstance(cu, float | int | bool | dict | list | tuple))
-    return get_safe_hash_int(shu)
 
 
 @dataclass

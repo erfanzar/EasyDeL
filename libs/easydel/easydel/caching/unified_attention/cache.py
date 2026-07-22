@@ -57,6 +57,7 @@ import spectrax as spx
 from eformer.loggings import get_logger
 from eformer.mpric import DTYPE_TO_STRING_MAP
 from eformer.pytree import auto_pytree, field
+from ejkernel.callib import cdiv
 from jax.sharding import NamedSharding as Ns
 from jaxtyping import Array, Float
 from spectrax import PartitionAxis, common_types
@@ -85,19 +86,6 @@ logger = get_logger(__name__)
 EMPTY = common_types.EMPTY
 KV_HEAD = common_types.KV_HEAD
 MODE_PREFILL = common_types.MODE_PREFILL
-
-
-def cdiv(a: int, b: int) -> int:
-    """Ceiling division: compute ceil(a / b) using integer arithmetic.
-
-    Args:
-        a: Numerator.
-        b: Denominator (must be positive).
-
-    Returns:
-        int: Ceiling of a / b.
-    """
-    return (a + b - 1) // b
 
 
 def per_device_hbm_budget_bytes(util: float = 0.9, mode: str = "free", safety_margin: int = 256 << 20) -> int:

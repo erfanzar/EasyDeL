@@ -24,84 +24,20 @@ All fields default to ``None``, which signals to the kernel that it should
 select an appropriate value automatically (via heuristics or autotuning).
 
 Custom hashing:
-    Both dataclasses override ``__hash__`` with :func:`hash_fn`, which builds
-    a hash from the concatenated string representations of all ``float``,
-    ``int``, ``bool``, ``dict``, and ``list`` attributes.  This makes the
-    objects usable as dictionary keys and in :class:`~ejkernel.ops.config.ConfigCache`
-    lookups without requiring them to be ``frozen=True``.
+    Both dataclasses override ``__hash__`` with :func:`ejkernel.callib.hash_fn`,
+    which builds a hash from the concatenated string representations of the
+    object's numeric/collection attributes. This makes the objects usable as
+    dictionary keys and in :class:`~ejkernel.ops.config.ConfigCache` lookups
+    without requiring them to be ``frozen=True``.
 
 Classes:
     FwdParams: Block-size and GPU-execution parameters for forward kernels.
     BwdParams: Block-size and GPU-execution parameters for backward kernels.
 """
 
-import hashlib
 from dataclasses import dataclass
 
-
-def get_safe_hash_int(text, algorithm="md5"):
-    """Generate an integer hash of text using the specified algorithm.
-
-    Converts any input to a string and computes a hash using the specified
-    algorithm from the hashlib module. The hash digest is then converted
-    to a big-endian integer.
-
-    Args:
-        text: Input to hash (will be converted to string)
-        algorithm: Hash algorithm name from hashlib (default: "md5")
-
-    Returns:
-        Integer representation of the hash digest
-
-    Raises:
-        ValueError: If the specified algorithm is not supported by hashlib
-        Exception: If any other error occurs during hash generation
-
-    Example:
-        >>> get_safe_hash_int("test_string")
-        123456789012345678901234567890
-        >>> get_safe_hash_int("test", algorithm="sha256")
-        987654321098765432109876543210
-    """
-    try:
-        text_str = str(text)
-        hash_object = getattr(hashlib, algorithm)(text_str.encode())
-        return int.from_bytes(hash_object.digest(), byteorder="big")
-    except AttributeError as e:
-        raise ValueError(f"Unsupported hash algorithm: {algorithm}") from e
-    except Exception as e:
-        raise Exception(f"Error generating hash: {e!s}") from e
-
-
-def hash_fn(self) -> int:
-    """Compute an integer hash from the numeric/collection attributes of an object.
-
-    Intended to be assigned as the ``__hash__`` method of a dataclass (e.g.
-    ``__hash__ = hash_fn``), providing hashability without requiring the
-    dataclass to be ``frozen=True``.
-
-    The hash is derived from the concatenated ``str()`` representations of all
-    attribute values whose types are ``float``, ``int``, ``bool``, ``dict``, or
-    ``list``.  Attribute values of other types (``None``, ``str``, arbitrary
-    objects) are excluded from the hash computation.
-
-    Args:
-        self: Dataclass instance whose ``__dict__`` contains the configuration
-            attributes to hash.
-
-    Returns:
-        An integer hash value.  Two instances with the same numeric/collection
-        attribute values will produce the same hash (though not necessarily the
-        same string representation for ``str``-typed attributes).
-
-    Note:
-        ``None`` values are excluded from the hash, so a parameter left at its
-        default of ``None`` does not contribute to the hash.  This means two
-        instances that differ only in ``None`` vs a set value will have
-        different hashes only when the set value is of a hashable primitive type.
-    """
-    shu = "".join(str(cu) for cu in self.__dict__.values() if isinstance(cu, float | int | bool | dict | list))
-    return get_safe_hash_int(shu)
+from ejkernel.callib import hash_fn
 
 
 @dataclass

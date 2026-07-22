@@ -59,14 +59,27 @@ from __future__ import annotations
 from typing import Any
 
 from ._ejit import (
+    COMPILED_CACHE,
+    COMPILED_FILE_NAME,
+    ECACHE_COMPILES,
+    RECOMPILE_FORCE,
     ejit,
     get_effective_compile_dir,
+    get_hash_of_lowering,
     load_cached_functions,
     load_compiled_fn,
     save_compiled_fn,
 )
 from ._pallas_call import buffered_pallas_call
-from ._utils import cdiv, next_power_of_2, strides_from_shape
+from ._utils import (
+    cdiv,
+    check_bool_flag,
+    get_cache_dir,
+    get_safe_hash_int,
+    hash_fn,
+    next_power_of_2,
+    strides_from_shape,
+)
 
 
 def _raise_triton_unavailable(err: Exception) -> None:
@@ -210,13 +223,22 @@ except (ImportError, ModuleNotFoundError) as _tilelang_import_error:  # pragma: 
 
 
 __all__ = (
+    "COMPILED_CACHE",
+    "COMPILED_FILE_NAME",
+    "ECACHE_COMPILES",
+    "RECOMPILE_FORCE",
     "buffered_pallas_call",
     "build_tilelang_call",
     "cdiv",
+    "check_bool_flag",
     "cute_call",
     "ejit",
+    "get_cache_dir",
     "get_effective_compile_dir",
+    "get_hash_of_lowering",
+    "get_safe_hash_int",
     "get_triton_type",
+    "hash_fn",
     "load_cached_functions",
     "load_compiled_fn",
     "next_power_of_2",

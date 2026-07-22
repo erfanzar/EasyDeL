@@ -23,26 +23,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from eformer.loggings import get_logger
+from ejkernel.callib import cdiv
 
 logger = get_logger(__name__)
-
-
-def cdiv(a: int, b: int) -> int:
-    """Compute ceiling division.
-
-    Args:
-        a: Dividend.
-        b: Divisor.
-
-    Returns:
-        The ceiling of a/b.
-
-    Example:
-        >>> cdiv(7, 3)  # Returns 3
-        >>> cdiv(6, 3)  # Returns 2
-        >>> cdiv(5, 3)  # Returns 2
-    """
-    return (a + b - 1) // b
 
 
 SLOT_MAPPING_PADDING_VAL = 0

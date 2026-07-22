@@ -363,7 +363,7 @@ def coerce_partition_axis(value: tp.Any) -> tp.Any:
     """
     if value is None:
         return None
-    from eformer.escale import PartitionAxis
+    from spectrax import PartitionAxis
 
     if isinstance(value, PartitionAxis):
         return value

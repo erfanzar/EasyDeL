@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 import argparse
-import datetime
 import json
 import logging
 import os
@@ -26,12 +25,12 @@ import shutil
 import subprocess
 import sys
 import time
-import typing as tp
-from functools import wraps
 from typing import Any
 
 import requests
 import yaml
+
+from eformer.loggings import get_logger
 
 TPU_VERSION = os.getenv("TPU_VERSION", "v4")
 TPU_SLICE_SIZE = int(os.getenv("TPU_SLICE_SIZE", "8"))
@@ -39,49 +38,6 @@ TPU_CORES_PER_HOST = int(os.getenv("TPU_CORES_PER_HOST", "4"))
 SSH_USER = os.getenv("PATCHER_USER")
 INTERNAL_IPS = ["0.0.0.0"]
 EXTERNAL_IPS = ["0.0.0.0"]
-
-
-COLORS: dict[str, str] = {
-    "PURPLE": "\033[95m",
-    "BLUE": "\033[94m",
-    "CYAN": "\033[96m",
-    "GREEN": "\033[92m",
-    "YELLOW": "\033[93m",
-    "RED": "\033[91m",
-    "ORANGE": "\033[38;5;208m",
-    "BOLD": "\033[1m",
-    "UNDERLINE": "\033[4m",
-    "RESET": "\033[0m",
-    "BLUE_PURPLE": "\033[38;5;99m",
-}
-
-LEVEL_COLORS: dict[str, str] = {
-    "DEBUG": COLORS["ORANGE"],
-    "INFO": COLORS["BLUE_PURPLE"],
-    "WARNING": COLORS["YELLOW"],
-    "ERROR": COLORS["RED"],
-    "CRITICAL": COLORS["RED"] + COLORS["BOLD"],
-    "FATAL": COLORS["RED"] + COLORS["BOLD"],
-}
-
-_LOGGING_LEVELS: dict[str, int] = {
-    "CRITICAL": 50,
-    "FATAL": 50,
-    "ERROR": 40,
-    "WARNING": 30,
-    "WARN": 30,
-    "INFO": 20,
-    "DEBUG": 10,
-    "NOTSET": 0,
-    "critical": 50,
-    "fatal": 50,
-    "error": 40,
-    "warning": 30,
-    "warn": 30,
-    "info": 20,
-    "debug": 10,
-    "notset": 0,
-}
 
 
 def _resources_json(d: dict) -> str:
@@ -98,136 +54,6 @@ def _resources_json(d: dict) -> str:
         '{"TPU":4,"CPU":8}'
     """
     return json.dumps(d, separators=(",", ":"))
-
-
-class ColorFormatter(logging.Formatter):
-    """Custom log formatter that adds color coding to log messages based on level.
-
-    Formats log messages with ANSI color codes to make different log levels
-    visually distinct in terminal output. Colors are defined in the LEVEL_COLORS
-    dictionary and include support for DEBUG, INFO, WARNING, ERROR, and CRITICAL levels.
-
-    Attributes:
-        Inherits all attributes from logging.Formatter.
-
-    Example:
-        >>> handler = logging.StreamHandler()
-        >>> handler.setFormatter(ColorFormatter())
-        >>> logger.addHandler(handler)
-    """
-
-    def format(self, record: logging.LogRecord) -> str:
-        """Format a log record with color coding.
-
-        Args:
-            record: The log record to format.
-
-        Returns:
-            str: Formatted log message with ANSI color codes.
-        """
-        orig_levelname = record.levelname
-        color = LEVEL_COLORS.get(record.levelname, COLORS["RESET"])
-        record.levelname = f"{color}{record.levelname:<8}{COLORS['RESET']}"
-        current_time = datetime.datetime.fromtimestamp(record.created).strftime("%H:%M:%S")
-        formatted_name = f"{color}({current_time} {record.name}){COLORS['RESET']}"
-        message = f"{formatted_name} {record.getMessage()}"
-        record.levelname = orig_levelname
-        return message
-
-
-class LazyLogger:
-    """A lazily-initialized logger that defers setup until first use.
-
-    This class provides a logger that is not initialized until the first
-    log message is emitted, reducing startup overhead when logging may
-    not be used. It uses ColorFormatter for colorized terminal output.
-
-    Attributes:
-        _name: Name for the logger.
-        _level: Logging level (defaults to LOGGING_LEVEL_ED environment variable).
-        _logger: The underlying logging.Logger instance, initialized on first use.
-
-    Example:
-        >>> logger = LazyLogger("my_module")
-        >>> logger.info("This message triggers initialization")
-    """
-
-    def __init__(self, name: str, level: int | None = None):
-        """Initialize a LazyLogger.
-
-        Args:
-            name: Name for the logger, typically the module name.
-            level: Optional logging level. Defaults to LOGGING_LEVEL_ED
-                environment variable or INFO if not set.
-        """
-        self._name = name
-        self._level = level or _LOGGING_LEVELS[os.getenv("LOGGING_LEVEL_ED", "INFO")]
-        self._logger: logging.Logger | None = None
-
-    def _ensure_initialized(self) -> None:
-        """Initialize the underlying logger if not already done.
-
-        Creates a logging.Logger with a StreamHandler and ColorFormatter.
-        Disables propagation to avoid duplicate messages.
-        """
-        if self._logger is not None:
-            return
-
-        logger = logging.getLogger(self._name)
-        logger.propagate = False
-        logger.setLevel(self._level)
-        console_handler = logging.StreamHandler()
-        console_handler.setLevel(self._level)
-        formatter = ColorFormatter()
-        console_handler.setFormatter(formatter)
-        logger.addHandler(console_handler)
-        self._logger = logger
-
-    def __getattr__(self, name: str) -> tp.Callable:
-        """Proxy attribute access to the underlying logger.
-
-        Intercepts calls to logging methods (debug, info, warning, etc.)
-        and ensures the logger is initialized before delegating.
-
-        Args:
-            name: Name of the attribute being accessed.
-
-        Returns:
-            Callable: A wrapped logging method.
-
-        Raises:
-            AttributeError: If the attribute is not a valid logging method.
-        """
-        if name in _LOGGING_LEVELS or name.upper() in _LOGGING_LEVELS or name in ("exception", "log"):
-
-            @wraps(getattr(logging.Logger, name))
-            def wrapped_log_method(*args: tp.Any, **kwargs: tp.Any) -> tp.Any:
-                self._ensure_initialized()
-                return getattr(self._logger, name)(*args, **kwargs)
-
-            return wrapped_log_method
-        raise AttributeError(f"'LazyLogger' object has no attribute '{name}'")
-
-
-def get_logger(name: str, level: int | None = None) -> LazyLogger:
-    """Create a LazyLogger instance with the specified name and level.
-
-    Factory function for creating LazyLogger instances. Provides a simple
-    interface for obtaining loggers throughout the application.
-
-    Args:
-        name: Name for the logger, typically the module name (__name__).
-        level: Optional logging level override. If None, uses the
-            LOGGING_LEVEL_ED environment variable or defaults to INFO.
-
-    Returns:
-        LazyLogger: A lazily-initialized logger instance.
-
-    Example:
-        >>> logger = get_logger(__name__)
-        >>> logger.info("Application started")
-    """
-    return LazyLogger(name, level)
 
 
 class RayManager:
