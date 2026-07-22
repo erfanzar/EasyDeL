@@ -55,7 +55,6 @@ from __future__ import annotations
 
 import hashlib
 import typing as tp
-from functools import wraps
 
 import jax
 import numpy as np
@@ -66,7 +65,6 @@ from ejkernel.callib import (  # pyright: ignore[reportMissingTypeStubs]
     load_compiled_fn,
     save_compiled_fn,
 )
-from jax._src.interpreters import pxla
 
 from .helpers import check_bool_flag, get_cache_dir
 
@@ -76,7 +74,6 @@ if tp.TYPE_CHECKING:
 ejit = ejit
 
 __all__ = [
-    "NoCompileContext",
     "ejit",
     "get_hash_of_lowering",
     "get_safe_hash_int",
@@ -207,76 +204,3 @@ def get_hash_of_lowering(lowered_func: Lowered):
     hash_object = hashlib.sha256(text_representation.encode("utf-8"))
     hash_digest = hash_object.hexdigest()
     return hash_digest
-
-
-class NoCompileContext:
-    """Context manager that fails if JAX triggers a new compilation.
-
-    Useful around hot paths that are expected to hit cached executables only.
-    """
-
-    def __init__(self, message: str = "JAX attempted to compile a new executable inside ForbidCompile."):
-        """Initialize the guard with a custom failure message.
-
-        Args:
-            message: Error message raised when a cache miss is detected
-                inside the guarded block.
-        """
-        self.message = message
-        self._original_func = None
-
-    def __enter__(self):
-        """Patch JAX's cached lowering to detect compilation cache misses.
-
-        Returns:
-            ``None``; the guard is intended to be used purely for its side
-            effect of installing the wrapper.
-        """
-        # Store the original function
-        self._original_func = pxla._cached_lowering_to_hlo
-        original_cached_func = self._original_func
-
-        @wraps(original_cached_func)
-        def wrapper(*args, **kwargs):
-            """Forward to the cached lowering and detect cache misses.
-
-            Args:
-                *args: Positional arguments forwarded to the cached function.
-                **kwargs: Keyword arguments forwarded to the cached function.
-
-            Returns:
-                The lowered HLO returned by the underlying cached function.
-
-            Raises:
-                RuntimeError: If the call increased the cache-miss counter,
-                    meaning a fresh compilation was triggered inside the guard.
-            """
-            info_before = original_cached_func.cache_info()
-            misses_before = info_before.misses
-
-            result = original_cached_func(*args, **kwargs)
-            info_after = original_cached_func.cache_info()
-            misses_after = info_after.misses
-
-            if misses_after > misses_before:
-                raise RuntimeError(self.message)
-
-            return result
-
-        pxla._cached_lowering_to_hlo = wrapper
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        """Restore the cached lowering function on context exit.
-
-        Args:
-            exc_type: Exception class raised inside the block, if any.
-            exc_value: Exception instance, if any.
-            traceback: Traceback object associated with ``exc_value``.
-
-        Returns:
-            ``False`` so any exception raised inside the block continues to
-            propagate.
-        """
-        if self._original_func:
-            pxla._cached_lowering_to_hlo = self._original_func
-        return False

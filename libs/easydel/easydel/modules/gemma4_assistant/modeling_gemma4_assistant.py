@@ -61,11 +61,11 @@ This file implements:
 4. :class:`Gemma4AssistantForCausalLM` — adds tied LM head and the
    centroid output path.
 
-Runtime contract for speculative decoding (TODO — not implemented in
-this file): the caller must call :meth:`forward_with_target` (added
-in a follow-up) and pass per-layer ``(k, v)`` tensors gathered from
-the target model's KV cache. See ``docs/spec_decode_gemma4.md`` for
-the proposer protocol.
+Runtime contract for speculative decoding: the caller invokes
+:meth:`Gemma4AssistantModel.forward` and passes per-layer ``(k, v)``
+tensors gathered from the target model's KV cache via
+``target_key_value_pairs``. Omitting them falls back to self-K/V,
+which is shape-correct but semantically wrong for drafting.
 """
 
 from __future__ import annotations
@@ -757,9 +757,8 @@ class Gemma4AssistantModel(EasyDeLBaseModule):
             target_key_value_pairs: Per-drafter-layer ``(K, V)``
                 tensors gathered from the target model's KV cache.
                 ``None`` (or any per-layer ``None``) falls back to
-                self-K/V — only correct shape, not correct semantics.
-                **TODO: full speculative-decode controller; see
-                module docstring.**
+                self-K/V — only correct shape, not correct semantics
+                (see module docstring for the proposer contract).
             position_ids: Position IDs for Q-side RoPE.
             attention_mask: Optional float-additive attention mask.
 

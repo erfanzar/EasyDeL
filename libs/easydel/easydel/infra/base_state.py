@@ -1195,7 +1195,6 @@ class EasyDeLState(_PyTreeNode):
         # (IllegalMutationError). The scope key is metadata only — bypass
         # the spectrax setattr path so accessing `state.model` is pure.
         object.__setattr__(model, "_esurge_cache_scope_key", self.esurge_cache_scope_key)
-        # TODO: Make me Dynamic.
         return tp.cast("EasyDeLBaseModule", model)
 
     @property

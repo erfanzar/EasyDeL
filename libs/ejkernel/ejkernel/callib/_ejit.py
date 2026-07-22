@@ -23,7 +23,6 @@ Functions:
     save_compiled_fn: Save compiled function to disk
     load_compiled_fn: Load compiled function from disk
     load_cached_functions: Load multiple cached functions
-    smart_compile: Smart compilation with auto-caching
     hash_fn: Generate hash for function signature
 
 Constants:
@@ -133,7 +132,6 @@ def get_effective_compile_dir() -> Path:
 
 
 COMPILED_FILE_NAME = "compiled.executable"
-SIGNATURE_FILE_NAME = "compiled.signature"
 COMPILED_CACHE: dict[str, Compiled] = {}
 
 # Serialized XLA executables are protobuf-framed; entries at/over the 2 GiB
@@ -694,103 +692,6 @@ def get_hash_of_lowering(lowered_func: Lowered) -> str:
     hash_object = hashlib.sha256(text_representation.encode("utf-8"))
     hash_digest = hash_object.hexdigest()
     return hash_digest
-
-
-def smart_compile(
-    lowered_func: Lowered,
-    tag: str | None = None,
-    verbose: bool = True,
-    cache_key: tuple[str, tuple] | None = None,
-) -> tuple[Compiled, tuple[str, tuple] | None]:
-    """Compile a lowered JAX function with intelligent disk caching.
-
-    Attempts to load a previously compiled version from the disk cache
-    (``COMPILE_FUNC_DIR/<tag>-<sha256>/compiled.executable``), falling back
-    to fresh compilation if not found or if the cache entry is corrupt.
-    Newly compiled functions are persisted to disk only when
-    ``EASYDEL_CACHE_COMPILES`` is set; otherwise only the in-memory path via
-    :func:`ejit` is used.
-
-    Args:
-        lowered_func: A ``jax.stages.Lowered`` object — typically the result
-            of calling ``jax.jit(fn).lower(*args)``.
-        tag: Optional human-readable tag prepended to the directory name under
-            ``COMPILE_FUNC_DIR`` (e.g. a model name). Useful for organizing
-            multiple compiled functions in the same cache root.
-        verbose: If ``True``, emit warnings via the ``warnings`` module when
-            loading or saving fails.
-        cache_key: Optional caller-supplied signature tuple that is persisted
-            alongside the compiled binary in a ``compiled.signature`` file. On
-            a cache hit the stored signature is returned to the caller.
-
-    Returns:
-        A tuple ``(compiled_func, effective_cache_key)`` where
-        ``compiled_func`` is the ready-to-call ``Compiled`` object and
-        ``effective_cache_key`` is either the signature loaded from disk (on
-        a clean hit) or the ``cache_key`` argument passed in.
-
-    Note:
-        The cache directory key is ``SHA-256(lowered_func.as_text())``, so the
-        cache is automatically invalidated whenever the lowered MLIR changes
-        (e.g. after a JAX or XLA version upgrade).
-    """
-    func_hash = get_hash_of_lowering(lowered_func)
-    foldername = str(func_hash) if tag is None else f"{tag}-{func_hash}"
-    func_dir = EFFECTIVE_COMPILE_FUNC_DIR / foldername
-    filepath = func_dir / COMPILED_FILE_NAME
-    signature_filepath = func_dir / SIGNATURE_FILE_NAME
-    post_fix = f" (TAG : {tag})" if tag else ""
-    signature = cache_key
-
-    if filepath.exists() and not RECOMPILE_FORCE:
-        try:
-            if _entry_too_large(filepath.stat().st_size, f"load of '{filepath}'", verbose=verbose):
-                raise ValueError("cache entry exceeds the safe deserialization size")
-            serialized, in_tree, out_tree = pickle.load(open(filepath, "rb"))
-            signature = pickle.load(open(signature_filepath, "rb"))
-            compiled_func = deserialize_and_load(
-                serialized=serialized,
-                in_tree=in_tree,
-                out_tree=out_tree,
-            )
-            return compiled_func, signature
-        except Exception as e:
-            if verbose:
-                warnings.warn(
-                    f"couldn't load compiled function due to {e}" + post_fix,
-                    stacklevel=4,
-                )
-            compiled_func: Compiled = lowered_func.compile()
-            if ECACHE_COMPILES:
-                serialized, in_tree, out_tree = serialize(compiled_func)
-                if not _entry_too_large(len(serialized), f"save of '{filepath}'", verbose=verbose):
-                    func_dir.mkdir(parents=True, exist_ok=True)
-                    try:
-                        _atomic_pickle_dump((serialized, in_tree, out_tree), filepath)
-                        _atomic_pickle_dump(cache_key, signature_filepath)
-                    except Exception as e:
-                        if verbose:
-                            warnings.warn(
-                                f"couldn't save compiled function due to {e}" + post_fix,
-                                stacklevel=4,
-                            )
-            return compiled_func, signature
-    else:
-        compiled_func: Compiled = lowered_func.compile()
-        if ECACHE_COMPILES:
-            try:
-                serialized, in_tree, out_tree = serialize(compiled_func)
-                if not _entry_too_large(len(serialized), f"save of '{filepath}'", verbose=verbose):
-                    func_dir.mkdir(parents=True, exist_ok=True)
-                    _atomic_pickle_dump((serialized, in_tree, out_tree), filepath)
-                    _atomic_pickle_dump(cache_key, signature_filepath)
-            except Exception as e:
-                if verbose:
-                    warnings.warn(
-                        f"couldn't save and serialize compiled function due to {e}" + post_fix,
-                        stacklevel=4,
-                    )
-        return compiled_func, signature
 
 
 if __name__ == "__main__":

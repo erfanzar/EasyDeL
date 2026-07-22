@@ -62,7 +62,6 @@ from eformer.paths import ePath, ePathLike
 
 from . import analyze_memory, compiling_utils, traversals
 from .compiling_utils import (
-    NoCompileContext,
     ejit,
     load_cached_functions,
     load_compiled_fn,
@@ -77,7 +76,6 @@ from .registery import Registry
 __all__ = (
     "LazyModule",
     "ModelConverter",
-    "NoCompileContext",
     "Registry",
     "StateDictConverter",
     "TensorConverter",

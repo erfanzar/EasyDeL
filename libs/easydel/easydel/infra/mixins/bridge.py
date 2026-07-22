@@ -3675,15 +3675,10 @@ class EasyBridgeMixin(PushToHubMixin):
             Returns:
                 list[int]: A chunk shape suitable for the zarr backend.
             """
-            # TODO: Comeafter this
-            # spec = spec_map.get(key_tuple)
+            # Chunk shapes are derived from the full global shape; per-shard
+            # chunking is intentionally not applied here (TensorStore stores the
+            # global array and shards on read).
             local_shape = global_shape
-            # if spec is not None:
-            #     try:
-            #         sharding = jax.sharding.NamedSharding(ed_config.mesh, spec)
-            #         local_shape = tuple(int(x) for x in sharding.shard_shape(global_shape))
-            #     except Exception:
-            #         local_shape = global_shape
             chunk = ts_impl._compute_chunk_shape(
                 tuple(int(max(1, d)) for d in local_shape), dtype_, tensorstore_chunk_bytes
             )

@@ -9,7 +9,6 @@ easydel.infra package
    base_config
    base_module
    base_state
-   config_dataclass
    errors
    etils
    factory
