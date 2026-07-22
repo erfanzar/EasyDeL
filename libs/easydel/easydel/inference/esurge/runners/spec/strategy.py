@@ -39,6 +39,7 @@ from jax import numpy as jnp
 
 from easydel.utils import flags
 
+from ...config import normalize_draft_schedule, resolve_num_draft_tokens
 from ...core.binary_search import apply_topk_mask, apply_topp_mask
 
 if typing.TYPE_CHECKING:
@@ -239,6 +240,7 @@ class DrafterSpeculation:
         runner: eSurgeRunner,
         drafter: DrafterProtocol,
         num_draft_tokens: int,
+        draft_schedule: list[tuple[int, int, int]] | None = None,
     ) -> None:
         """Initialize the drafter-backed strategy.
 
@@ -247,11 +249,27 @@ class DrafterSpeculation:
                 used to reach live runner state.
             drafter: Speculative drafter implementing
                 :class:`~easydel.inference.speculative.DrafterProtocol`.
-            num_draft_tokens: Draft tokens proposed per verify window.
+            num_draft_tokens: Static draft tokens proposed per verify window;
+                the compiled maximum, and the fallback for concurrencies the
+                schedule does not cover.
+            draft_schedule: Optional dynamic draft-token schedule
+                (``num_draft_tokens_per_batch_size``): inclusive
+                ``(start, end, k)`` live-concurrency ranges resolved once per
+                scheduler step via :meth:`resolve_step_draft_budget`. ``None``
+                keeps the static count at every concurrency.
         """
         self._runner = runner
         self.drafter = drafter
         self.num_draft_tokens = int(num_draft_tokens)
+        self.draft_schedule = (
+            normalize_draft_schedule(draft_schedule, max_num_draft_tokens=self.num_draft_tokens)
+            if draft_schedule is not None
+            else None
+        )
+        # Live per-step draft budget; re-resolved every scheduler step from
+        # the schedule (static without one). Draft paths read THIS, never the
+        # static maximum, so a K transition takes effect on the next window.
+        self.live_num_draft_tokens = int(num_draft_tokens)
         self.num_drafts_generated = 0
         self.num_drafts_accepted = 0
         self.num_verify_steps = 0
@@ -340,6 +358,42 @@ class DrafterSpeculation:
         """Whether hybrid recurrent caches keep speculative candidate rows."""
         return bool(getattr(self._runner, "spec_decode_recurrent_candidates", False))
 
+    def resolve_step_draft_budget(self, concurrency: int) -> int:
+        """Resolve this step's draft-token budget from the live concurrency.
+
+        Called ONCE per scheduler step by the runner (never per request) with
+        the number of requests scheduled in the step. Drafts produced during a
+        step are verified on the NEXT step at approximately the same
+        concurrency, so the step's scheduled-request count is the natural
+        predictor. Gap semantics follow
+        :func:`~easydel.inference.esurge.config.resolve_num_draft_tokens`:
+        concurrencies no range covers fall back to the static
+        ``num_draft_tokens``. The ``EASYDEL_DISABLE_DYNAMIC_SPEC`` flag (read
+        at call time) forces the static count for A/B comparisons.
+
+        A budget of ``0`` makes every draft path a no-op for the step: no
+        drafter forward runs, requests carry no spec tokens into the next
+        step, and the next step therefore takes the plain single-token decode
+        path. No hysteresis is applied — the inclusive ranges provide natural
+        bands; add a hysteresis knob only if oscillation shows up in practice.
+
+        Args:
+            concurrency: Number of requests scheduled in this step.
+
+        Returns:
+            The resolved live budget in ``[0, num_draft_tokens]`` (also stored
+            on :attr:`live_num_draft_tokens`).
+        """
+        if self.draft_schedule is None or flags.get_bool(flags.EASYDEL_DISABLE_DYNAMIC_SPEC):
+            self.live_num_draft_tokens = int(self.num_draft_tokens)
+        else:
+            self.live_num_draft_tokens = resolve_num_draft_tokens(
+                self.draft_schedule,
+                batch_size=int(concurrency),
+                num_draft_tokens=self.num_draft_tokens,
+            )
+        return self.live_num_draft_tokens
+
     def on_reset(self) -> None:
         """Clear per-request speculative state and reset the drafter.
 
@@ -352,6 +406,7 @@ class DrafterSpeculation:
         self._mtp_row_by_req.clear()
         self._mtp_row_free = []
         self._mtp_row_capacity = 0
+        self.live_num_draft_tokens = int(self.num_draft_tokens)
         if self.drafter is not None:
             try:
                 # Size to the request pool (``max_num_reqs`` == sequence-buffer
@@ -1219,9 +1274,13 @@ class DrafterSpeculation:
 
         Returns:
             List of drafted token ids (length may be less than the maximum on
-            drafter failure or backoff).
+            drafter failure or backoff). The window drafts
+            :attr:`live_num_draft_tokens` tokens (the per-step dynamic budget;
+            equal to the static ``num_draft_tokens`` without a schedule) —
+            a live budget of ``0`` returns ``[]`` without any drafter call.
         """
-        if self.drafter is None or self.num_draft_tokens <= 0 or not self.is_spec_request(req_state):
+        k_live = int(self.live_num_draft_tokens)
+        if self.drafter is None or k_live <= 0 or not self.is_spec_request(req_state):
             return []
         backoff = int(self._backoff_by_req.get(str(req_id), 0))
         if backoff > 0:
@@ -1326,7 +1385,7 @@ class DrafterSpeculation:
                     seed_token=int(seed_token),
                     seed_hidden=seed_hidden_bsh,
                     seed_position=int(seed_position),
-                    k_max=self.num_draft_tokens,
+                    k_max=k_live,
                     conf_threshold=adaptive_conf,
                     row_pos=(row if persist_on else None),
                 )
@@ -1343,7 +1402,7 @@ class DrafterSpeculation:
             drafted = [int(t) for t in np.asarray(drafts_host).reshape(-1)[:valid]]
             self.num_drafts_generated += len(drafted)
             return drafted
-        for draft_idx in range(self.num_draft_tokens):
+        for draft_idx in range(k_live):
             position_ids = (
                 jnp.asarray(prefix_position_ids, dtype=jnp.int32)
                 if use_prefix and draft_idx == 0
@@ -1493,10 +1552,14 @@ class DrafterSpeculation:
             An opaque handle dict for :meth:`finish_batched_draft`.
         """
         out: dict[str, list[int]] = {str(rid): [] for (rid, *_rest) in seeds}
+        # Per-step dynamic budget: 0 means speculation is throttled OFF for
+        # this step's concurrency — return the empty handle before any device
+        # work so a K=0 step carries no drafter overhead at all.
+        k_live = int(self.live_num_draft_tokens)
         if (
             not seeds
             or self.drafter is None
-            or self.num_draft_tokens <= 0
+            or k_live <= 0
             or not callable(getattr(self.drafter, "draft_batched", None))
         ):
             return {"out": out, "drafts_dev": None, "active_reqs": []}
@@ -1578,7 +1641,10 @@ class DrafterSpeculation:
             seed_positions=jnp.asarray(seed_positions),
             committed_lens=jnp.asarray(committed_lens),
             collected_mask=jnp.asarray(collected_mask),
-            num_draft_tokens=int(self.num_draft_tokens),
+            # The drafter compile-keys on k (unrolled recurrence); a schedule
+            # contributes one compile per distinct k, warmed by
+            # ``eSurgeRunner.compile`` so serving never JITs mid-flight.
+            num_draft_tokens=k_live,
         )
         return {"out": out, "drafts_dev": drafts_dev, "active_reqs": active_reqs}
 

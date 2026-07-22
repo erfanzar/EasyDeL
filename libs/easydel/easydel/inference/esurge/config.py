@@ -32,8 +32,9 @@ Example:
 
 from __future__ import annotations
 
+import itertools
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypeAlias, TypedDict, Unpack
 
 from ejkernel.modules.operations import KernelTilePolicy, normalize_kernel_tile_policy
@@ -822,6 +823,127 @@ class eSurgeDistributedConfig(TypedDict, total=False):
         ...
 
 
+DraftSchedule: TypeAlias = list[tuple[int, int, int]]
+"""Normalized dynamic draft-token schedule: ``[(start, end, k), ...]``.
+
+Each entry maps the inclusive live-concurrency range ``[start, end]`` (the
+number of requests scheduled in a step) to the number of draft tokens ``k``
+proposed per verify window at that concurrency. ``k == 0`` disables
+speculative drafting for the range. This mirrors vLLM's
+``num_speculative_tokens_per_batch_size`` schema.
+"""
+
+
+def normalize_draft_schedule(
+    schedule: Sequence[Sequence[int]],
+    *,
+    max_num_draft_tokens: int | None = None,
+) -> DraftSchedule:
+    """Validate and normalize a ``num_draft_tokens_per_batch_size`` schedule.
+
+    Args:
+        schedule: Iterable of ``(start, end, k)`` triples (tuples or lists,
+            e.g. straight out of YAML). ``start``/``end`` are the inclusive
+            batch-size (live-concurrency) bounds of the range; ``k`` is the
+            draft-token count for that range (``0`` = speculation off).
+        max_num_draft_tokens: When given, every ``k`` must be ``<=`` this
+            static ``num_draft_tokens`` (compiled buckets and the drafter
+            cache are sized for the static maximum).
+
+    Returns:
+        The normalized schedule: a list of int 3-tuples sorted by ``start``.
+
+    Raises:
+        ValueError: If an entry is not a length-3 sequence of ints, if
+            ``start < 1`` or ``end < start``, if ``k < 0`` or
+            ``k > max_num_draft_tokens``, or if two ranges overlap.
+    """
+    entries: list[tuple[int, int, int]] = []
+    for raw_entry in schedule:
+        entry = tuple(raw_entry)
+        if len(entry) != 3:
+            raise ValueError(
+                f"num_draft_tokens_per_batch_size entries must be (start_batch_size, end_batch_size, "
+                f"num_draft_tokens) triples, got {raw_entry!r}"
+            )
+        start, end, k = (int(v) for v in entry)
+        if start < 1:
+            raise ValueError(f"num_draft_tokens_per_batch_size range start must be >= 1, got {start}")
+        if end < start:
+            raise ValueError(f"num_draft_tokens_per_batch_size range end must be >= start, got ({start}, {end})")
+        if k < 0:
+            raise ValueError(f"num_draft_tokens_per_batch_size draft count must be >= 0, got {k}")
+        if max_num_draft_tokens is not None and k > int(max_num_draft_tokens):
+            raise ValueError(
+                f"num_draft_tokens_per_batch_size draft count {k} exceeds num_draft_tokens="
+                f"{int(max_num_draft_tokens)}; the static num_draft_tokens is the compiled maximum."
+            )
+        entries.append((start, end, k))
+    entries.sort(key=lambda item: item[0])
+    for (prev_start, prev_end, _prev_k), (next_start, next_end, _next_k) in itertools.pairwise(entries):
+        if next_start <= prev_end:
+            raise ValueError(
+                "num_draft_tokens_per_batch_size ranges must not overlap: "
+                f"[{prev_start}, {prev_end}] overlaps [{next_start}, {next_end}]"
+            )
+    return entries
+
+
+def resolve_num_draft_tokens(
+    schedule: DraftSchedule | None,
+    *,
+    batch_size: int,
+    num_draft_tokens: int,
+) -> int:
+    """Resolve the live draft-token count ``k`` for a step's concurrency.
+
+    Range bounds are inclusive on both ends. Batch sizes not covered by any
+    range (gaps, or beyond the last range) fall back to the static
+    ``num_draft_tokens`` — a schedule only overrides where it speaks.
+
+    Args:
+        schedule: A normalized schedule (see :func:`normalize_draft_schedule`)
+            or ``None`` for static behavior.
+        batch_size: Live concurrency (number of requests scheduled this step);
+            clamped up to ``1``.
+        num_draft_tokens: The static draft-token count (gap fallback and
+            upper clamp).
+
+    Returns:
+        The resolved ``k`` in ``[0, num_draft_tokens]``.
+    """
+    static_k = max(0, int(num_draft_tokens))
+    if not schedule:
+        return static_k
+    live = max(1, int(batch_size))
+    for start, end, k in schedule:
+        if start <= live <= end:
+            return min(int(k), static_k)
+    return static_k
+
+
+def default_auto_draft_schedule(num_draft_tokens: int) -> DraftSchedule:
+    """Default dynamic schedule for the plug-and-play ``drafter=True`` path.
+
+    Measured on the current inline-MTP head (Qwen3.6-27B GDN hybrid, v5p-8,
+    decode-only spec-on/spec-off ratios: batch-1 1.25x, n=8 0.98x, n=16 0.93x,
+    n=32 0.92x): drafting wins clearly at very low concurrency and turns into
+    a net loss well before saturation, so the auto path drafts only up to
+    concurrency 4 and switches speculation OFF above that. The thresholds are
+    NOT universal — they are tuned for the inline-MTP drafter measured above
+    and are fully overridable via
+    ``eSurgeDrafterConfig.num_draft_tokens_per_batch_size``.
+
+    Args:
+        num_draft_tokens: The static draft-token count ``K`` used for the
+            low-concurrency range.
+
+    Returns:
+        ``[(1, 4, K), (5, 2**30, 0)]``.
+    """
+    return [(1, 4, max(0, int(num_draft_tokens))), (5, 1 << 30, 0)]
+
+
 def _validate_esurge_drafter_config(self):
     """Validate and normalize an :class:`eSurgeDrafterConfig` after construction.
 
@@ -830,16 +952,20 @@ def _validate_esurge_drafter_config(self):
     runs collapsed to underscores), reconciles ``enabled`` with ``method``
     (a recognized disable-token clears the method and disables drafting, while
     an enabled config with no method defaults ``method`` to ``"auto"``), coerces
-    ``layer_mapping`` entries to ``int``, and normalizes ``kwargs`` to a plain
-    ``dict`` (``None`` becomes ``{}``).
+    ``layer_mapping`` entries to ``int``, normalizes
+    ``num_draft_tokens_per_batch_size`` via :func:`normalize_draft_schedule`,
+    and normalizes ``kwargs`` to a plain ``dict`` (``None`` becomes ``{}``).
 
     Args:
         self: The newly-built ``eSurgeDrafterConfig`` (a dict subclass) whose
-            ``enabled``, ``method``, ``num_draft_tokens``, ``layer_mapping``, and
+            ``enabled``, ``method``, ``num_draft_tokens``,
+            ``num_draft_tokens_per_batch_size``, ``layer_mapping``, and
             ``kwargs`` fields are validated and normalized in place.
 
     Raises:
-        ValueError: If ``num_draft_tokens`` is not positive.
+        ValueError: If ``num_draft_tokens`` is not positive, or if
+            ``num_draft_tokens_per_batch_size`` has malformed/overlapping
+            ranges or a draft count above ``num_draft_tokens``.
         TypeError: If ``kwargs`` is neither ``None`` nor a mapping.
     """
     method = self.method
@@ -859,6 +985,12 @@ def _validate_esurge_drafter_config(self):
     num_draft_tokens = int(self.num_draft_tokens)
     if num_draft_tokens <= 0:
         raise ValueError(f"num_draft_tokens must be positive, got {num_draft_tokens}")
+
+    if self.num_draft_tokens_per_batch_size is not None:
+        self.num_draft_tokens_per_batch_size = normalize_draft_schedule(
+            self.num_draft_tokens_per_batch_size,
+            max_num_draft_tokens=num_draft_tokens,
+        )
 
     if self.layer_mapping is not None:
         self.layer_mapping = [int(layer_idx) for layer_idx in self.layer_mapping]
@@ -880,6 +1012,7 @@ def _validate_esurge_drafter_config(self):
         "enabled": False,
         "method": None,
         "num_draft_tokens": 4,
+        "num_draft_tokens_per_batch_size": None,
         "assistant_model": None,
         "target_embed_module": None,
         "layer_mapping": None,
@@ -911,6 +1044,19 @@ class eSurgeDrafterConfig(TypedDict, total=False):
         num_draft_tokens: Draft tokens proposed per verify window (default 4,
             the measured sweet spot for inline-MTP drafting with KV
             persistence).
+        num_draft_tokens_per_batch_size: Optional dynamic draft-token
+            schedule — vLLM's ``num_speculative_tokens_per_batch_size``. A
+            list of inclusive ``(start_batch_size, end_batch_size,
+            num_draft_tokens)`` ranges resolved against the live concurrency
+            (requests scheduled per step): e.g. ``[(1, 4, 4), (5, 2**30, 0)]``
+            drafts 4 tokens up to concurrency 4 and turns speculation off
+            above it. ``k == 0`` disables drafting for the range; batch sizes
+            in gaps fall back to the static ``num_draft_tokens``. Every ``k``
+            must be ``<= num_draft_tokens`` and ranges must not overlap.
+            ``None`` (default) keeps the static ``num_draft_tokens`` at every
+            concurrency. Note the engine's plug-and-play ``drafter=True``
+            path installs :func:`default_auto_draft_schedule` when this is
+            unset.
         assistant_model: Optional standalone assistant model or model id/path
             for assistant-style drafting.
         target_embed_module: Optional target embedding module forwarded to
@@ -922,6 +1068,7 @@ class eSurgeDrafterConfig(TypedDict, total=False):
     enabled: NotRequired[bool]
     method: NotRequired[str | None]
     num_draft_tokens: NotRequired[int]
+    num_draft_tokens_per_batch_size: NotRequired[list[tuple[int, int, int]] | None]
     assistant_model: NotRequired[Any | None]
     target_embed_module: NotRequired[Any | None]
     layer_mapping: NotRequired[list[int] | tuple[int, ...] | None]

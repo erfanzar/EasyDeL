@@ -191,6 +191,7 @@ _ESURGE_SECTION_FIELDS: dict[str, frozenset[str]] = {
             "enabled",
             "method",
             "num_draft_tokens",
+            "num_draft_tokens_per_batch_size",
             "assistant_model",
             "target_embed_module",
             "layer_mapping",

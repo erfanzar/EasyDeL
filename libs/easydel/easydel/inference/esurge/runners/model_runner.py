@@ -76,6 +76,8 @@ from jax.experimental import multihost_utils
 from easydel.inference.esurge.config import (
     ESURGE_MIN_TOKEN_PAD,
     KernelTilePolicy,
+    normalize_draft_schedule,
+    resolve_num_draft_tokens,
 )
 from easydel.inference.speculative import DrafterProtocol, accept_or_reject, resample_rejected
 from easydel.infra.sharding import replicated_named_sharding
@@ -146,6 +148,74 @@ class _BatchedVerifyRow(typing.NamedTuple):
     argmaxes: list[int]
     gathered_hidden: jax.Array
     batched_logits: jax.Array
+
+
+def derive_spec_token_buckets(
+    *,
+    seq_buckets: typing.Sequence[int],
+    num_draft_tokens: int,
+    draft_schedule: list[tuple[int, int, int]] | None,
+    min_token_pad: int,
+    max_bucket: int,
+) -> set[int]:
+    """Exact spec-window token buckets for the runner's compile grid.
+
+    Speculative steady-state verify windows schedule EXACTLY
+    ``n_active * (1 + k)`` tokens; without exact buckets those windows pad to
+    the next power-of-two token bucket (~60% utilization). This returns the
+    extra token buckets to add:
+
+    - Static K (``draft_schedule is None``): one ``reqs * (K + 1)`` bucket per
+      request bucket — the pre-schedule behavior, unchanged.
+    - Dynamic schedule: for each request bucket, only the ``k`` values the
+      schedule can actually resolve within that bucket's live-concurrency
+      range ``(prev_bucket, bucket]`` contribute a ``reqs * (k + 1)`` bucket
+      (``k == 0`` ranges contribute nothing — plain decode buckets already
+      exist). This is strictly FEWER buckets than the static grid whenever
+      the schedule throttles speculation off at high concurrency.
+
+    Args:
+        seq_buckets: Sorted request-count buckets (``max_num_seq_buckets``).
+        num_draft_tokens: Static draft-token count (compiled maximum and the
+            schedule's gap fallback).
+        draft_schedule: Normalized dynamic schedule or ``None`` for static.
+        min_token_pad: Smallest allowed token bucket.
+        max_bucket: Largest allowed token bucket.
+
+    Returns:
+        The set of exact spec token-bucket sizes within
+        ``[min_token_pad, max_bucket]``.
+    """
+    buckets: set[int] = set()
+    static_k = max(0, int(num_draft_tokens))
+    if static_k <= 0:
+        return buckets
+    prev_bucket = 0
+    for reqs in sorted(int(b) for b in seq_buckets):
+        if draft_schedule is None:
+            k_candidates = {static_k}
+        else:
+            # Probe every concurrency at which the resolved k can change within
+            # this bucket's live range (prev_bucket, reqs]: the range edges plus
+            # each schedule boundary (a range start, or the first concurrency
+            # after a range end) that falls inside it.
+            probes = {prev_bucket + 1, reqs}
+            for start, end, _k in draft_schedule:
+                for boundary in (start, end, end + 1):
+                    if prev_bucket < boundary <= reqs:
+                        probes.add(boundary)
+            k_candidates = {
+                resolve_num_draft_tokens(draft_schedule, batch_size=probe, num_draft_tokens=static_k)
+                for probe in probes
+            }
+        for k in k_candidates:
+            if k <= 0:
+                continue
+            spec_bucket = reqs * (k + 1)
+            if int(min_token_pad) <= spec_bucket <= int(max_bucket):
+                buckets.add(spec_bucket)
+        prev_bucket = reqs
+    return buckets
 
 
 class _AsyncExecutionHandle:
@@ -367,11 +437,32 @@ class eSurgeRunner:
         if self.drafter is not None and hasattr(self.drafter, "set_max_length"):
             self.drafter.set_max_length(int(max_model_len))
         self.num_draft_tokens = int(getattr(drafter, "num_draft_tokens", 1) if drafter is not None else 0)
+        # Dynamic speculative-token scheduling: the drafter may carry a
+        # ``num_draft_tokens_per_batch_size`` schedule (attached by the engine
+        # bootstrap from the drafter config, or set directly on the object).
+        # ``num_draft_tokens`` stays the compiled maximum; the strategy
+        # re-resolves the live per-step budget from this schedule.
+        raw_draft_schedule = getattr(drafter, "num_draft_tokens_per_batch_size", None) if drafter is not None else None
+        if raw_draft_schedule is not None and flags.get_bool(flags.EASYDEL_DISABLE_DYNAMIC_SPEC):
+            logger.info(
+                "EASYDEL_DISABLE_DYNAMIC_SPEC is set: ignoring the drafter's "
+                "num_draft_tokens_per_batch_size schedule (static num_draft_tokens=%d).",
+                self.num_draft_tokens,
+            )
+            raw_draft_schedule = None
+        self.draft_schedule = (
+            normalize_draft_schedule(raw_draft_schedule, max_num_draft_tokens=self.num_draft_tokens)
+            if raw_draft_schedule is not None
+            else None
+        )
+        if self.draft_schedule is not None:
+            logger.info("Dynamic speculative-token schedule active: %s", self.draft_schedule)
         self.spec: SpeculativeStrategy = (
             DrafterSpeculation(
                 runner=self,
                 drafter=self.drafter,
                 num_draft_tokens=self.num_draft_tokens,
+                draft_schedule=self.draft_schedule,
             )
             if self.drafter is not None
             else NullSpeculation()
@@ -483,14 +574,16 @@ class eSurgeRunner:
             # n_active * (1 + k) tokens. With power-of-two buckets those windows
             # pad 64->40, 128->80, 256->160 (~60% utilization), and most of the
             # verify forward's cost scales with the token bucket. Add an exact
-            # spec bucket per request bucket so verify windows run tight.
-            window = int(self.num_draft_tokens) + 1
-            max_bucket = max(int(self.max_model_len), int(self.max_num_batched_tokens))
-            spec_buckets = {
-                int(reqs) * window
-                for reqs in self.max_num_seq_buckets
-                if min_token_pad_i <= int(reqs) * window <= max_bucket
-            }
+            # spec bucket per request bucket so verify windows run tight. With a
+            # dynamic schedule only the k values reachable at each request
+            # bucket's concurrency contribute (k=0 ranges add nothing).
+            spec_buckets = derive_spec_token_buckets(
+                seq_buckets=self.max_num_seq_buckets,
+                num_draft_tokens=self.num_draft_tokens,
+                draft_schedule=self.draft_schedule,
+                min_token_pad=min_token_pad_i,
+                max_bucket=max(int(self.max_model_len), int(self.max_num_batched_tokens)),
+            )
             self.num_tokens_paddings = sorted(set(self.num_tokens_paddings) | spec_buckets)
         if self._uses_spmd_dp():
             dp_size = max(1, int(getattr(self.metadata, "data_parallel_size", 1) or 1))
@@ -1500,6 +1593,51 @@ class eSurgeRunner:
 
         logger.info("Helper kernel precompilation finished")
 
+    def _precompile_draft_schedule_variants(self) -> None:
+        """Warm the batched drafter's per-``k`` compiles for every schedule ``k``.
+
+        ``Qwen3_5MTPDrafter.draft_batched`` compile-keys on the draft count
+        ``k`` (the recurrence is unrolled), so a dynamic schedule with several
+        distinct ``k`` values would otherwise hit one cold JIT per value the
+        first time serving crosses each concurrency band. Warm each distinct
+        ``k`` (schedule values plus the static gap-fallback) here with an
+        all-idle (``collected_mask`` all-``False``) call: every pool row's
+        write index is restored by the batched program, so the warmup leaves
+        the drafter cache coherent while materializing the executable.
+
+        No-op for drafters without ``draft_batched`` (their per-request
+        ``draft`` path is not keyed on ``k``). Failures are logged and
+        skipped — the runtime path can still JIT lazily.
+        """
+        if self.drafter is None or int(self.num_draft_tokens) <= 0:
+            return
+        if not bool(getattr(self.drafter, "supports_batched_draft", False)):
+            return
+        if not callable(getattr(self.drafter, "draft_batched", None)):
+            return
+        k_values = {int(self.num_draft_tokens)}
+        if self.draft_schedule is not None:
+            k_values |= {int(k) for (_start, _end, k) in self.draft_schedule if int(k) > 0}
+        n = max(1, int(self.max_num_reqs))
+        ensure = getattr(self.drafter, "ensure_batch_size", None)
+        if callable(ensure):
+            ensure(n)
+        hidden_size = int(self.model.config.get_text_config().hidden_size)
+        hidden_dtype = getattr(self.model, "dtype", None) or jnp.float32
+        for k in sorted(k_values):
+            try:
+                _ = self.drafter.draft_batched(
+                    seed_tokens=jnp.zeros((n,), dtype=jnp.int32),
+                    seed_hidden=jnp.zeros((n, 1, hidden_size), dtype=hidden_dtype),
+                    seed_positions=jnp.zeros((n,), dtype=jnp.int32),
+                    committed_lens=jnp.zeros((n,), dtype=jnp.int32),
+                    collected_mask=jnp.zeros((n,), dtype=bool),
+                    num_draft_tokens=int(k),
+                )
+                logger.debug(f"Batched drafter precompiled for k={k} (pool={n})")
+            except Exception as e:
+                logger.debug(f"Batched drafter precompile skip (k={k}): {e}")
+
     def compile(self, *, max_num_batched_tokens: int | None = None) -> None:
         """Compile the model for token/request bucket sizes.
 
@@ -1565,6 +1703,8 @@ class eSurgeRunner:
             precompile_allowed_mask=False,
             allowed_max=4096,
         )
+
+        self._precompile_draft_schedule_variants()
 
     def update_model_weights(
         self,
@@ -2303,6 +2443,13 @@ class eSurgeRunner:
         needs_async_output = return_async_output or can_defer_async_output
         if self.drafter is not None and return_async_output:
             raise NotImplementedError("eSurge runner-native speculative decoding is synchronous-only for now.")
+        if self.drafter is not None:
+            # Dynamic speculative-token scheduling: resolve the step's draft
+            # budget ONCE from the live concurrency (requests scheduled this
+            # step — drafts produced now are verified next step at ~the same
+            # concurrency). Verification of ALREADY-scheduled drafts is
+            # unaffected; only how many new drafts this step proposes changes.
+            self.spec.resolve_step_draft_budget(len(scheduler_output.num_scheduled_tokens))
         start_index = 0
         total_step_time = 0.0
         total_post_proc_time = 0.0
@@ -3121,7 +3268,17 @@ class eSurgeRunner:
                     # Pad to a stable ``padded_num_reqs * (k+1)`` bucket so the
                     # on-demand LM-head executable count stays bounded (<= one
                     # per request bucket) instead of one per distinct row total.
-                    _pad_target = max(_total_rows, int(padded_num_reqs) * (int(self.num_draft_tokens) + 1))
+                    # With a dynamic schedule, size k to the LARGEST verify
+                    # window actually collected this step (a schedule k, so the
+                    # executable count stays <= one per (request bucket,
+                    # schedule-k) pair) instead of always the static maximum.
+                    _pad_window_k = int(self.num_draft_tokens)
+                    if self.draft_schedule is not None:
+                        _pad_window_k = max(
+                            (int(_cnt) - 1 for (_rp2, _off2, _cnt, _meta2) in _pending_bv),
+                            default=_pad_window_k,
+                        )
+                    _pad_target = max(_total_rows, int(padded_num_reqs) * (_pad_window_k + 1))
                     if _total_rows < _pad_target:
                         _flat_indices.extend([_flat_indices[0]] * (_pad_target - _total_rows))
                     _idx_arr = np.asarray(_flat_indices, dtype=np.int32)

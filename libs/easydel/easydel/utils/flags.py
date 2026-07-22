@@ -217,3 +217,7 @@ EASYDEL_MTP_PERSIST_KV = _register(
     "EASYDEL_MTP_PERSIST_KV", "bool", False, "eSurge spec-decode",
     "Persist the MTP drafter KV cache across verify windows.",
 )
+EASYDEL_DISABLE_DYNAMIC_SPEC = _register(
+    "EASYDEL_DISABLE_DYNAMIC_SPEC", "bool", False, "eSurge spec-decode",
+    "A/B escape hatch: force the static num_draft_tokens (ignore num_draft_tokens_per_batch_size schedules).",
+)

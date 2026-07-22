@@ -585,8 +585,24 @@ def _build_drafter(
     Raises:
         ValueError: If both an explicit drafter object and an enabled
             ``drafter_config`` are provided.
+
+    Notes:
+        Dynamic speculative-token scheduling: config-built drafters carry
+        ``drafter_config.num_draft_tokens_per_batch_size`` verbatim (``None``
+        = static K, today's behavior). The plug-and-play ``drafter=True``
+        auto path is different — unless the user provided a schedule it
+        installs :func:`~easydel.inference.esurge.config.default_auto_draft_schedule`
+        (``[(1, 4, K), (5, 2**30, 0)]``) so
+        ``drafter=True`` is never a regression: a latency win at low
+        concurrency and speculation auto-throttled OFF at saturation. Those
+        thresholds are measured for the current inline-MTP head (see the
+        default's docstring) and are overridable through the drafter config.
+        Explicit drafter *objects* are never touched — set
+        ``num_draft_tokens_per_batch_size`` on the object to opt in.
     """
     from easydel.modules.auto import AutoEasyDeLModelForCausalLM
+
+    from ..config import default_auto_draft_schedule
 
     auto_drafter_requested = drafter is True
     if drafter is True or drafter is False:
@@ -616,12 +632,22 @@ def _build_drafter(
             assistant_model=assistant_model,
             **drafter_kwargs,
         )
+        # Explicit static configs keep static behavior: the schedule rides the
+        # drafter only when the user asked for one (None = static K).
+        drafter.num_draft_tokens_per_batch_size = drafter_config.num_draft_tokens_per_batch_size
 
     if auto_drafter_requested and drafter is None:
         drafter = model.drafter(
             method="auto",
             num_draft_tokens=int(drafter_config.num_draft_tokens),
         )
+        # Plug-and-play path: default to the measured dynamic schedule so
+        # `drafter=True` never regresses throughput at high concurrency (see
+        # the Notes section above). A user-provided schedule wins.
+        schedule = drafter_config.num_draft_tokens_per_batch_size
+        if schedule is None:
+            schedule = default_auto_draft_schedule(int(drafter_config.num_draft_tokens))
+        drafter.num_draft_tokens_per_batch_size = schedule
     return drafter
 
 
