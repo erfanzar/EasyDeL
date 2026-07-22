@@ -146,11 +146,18 @@ def main():
                 "axis_names": ("pp", "dp", "fsdp", "ep", "tp", "sp"),
                 "auto_shard_model": True,
             },
+            # Training-runtime attention override only (the checkpoint bakes the
+            # eSurge decode mechanism ragged_page_attention_v3, which is not a
+            # training path). Deliberately NO gradient_checkpointing override:
+            # the trunk is frozen (no backward -> no residuals to save) and a
+            # remat-wrapped MTP layer in the SAVED config breaks the serving
+            # drafter (jax.checkpoint rejects its positional string `mode` arg).
+            # These runtime values are restored to the base checkpoint's before
+            # the final save so the artifact serves exactly like the base.
             "base_config": {
                 "values": {
                     "attn_mechanism": ed.AttentionMechanisms.AUTO,
                     "attn_dtype": "bf16",
-                    "gradient_checkpointing": ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
                 }
             },
             "trainer": {
@@ -173,12 +180,14 @@ def main():
                 "mtp_distillation": True,
                 "mtp_kd_weight": args.mtp_kd_weight,
                 "mtp_draft_tokens": args.mtp_draft_tokens,
-                # Save policy: the full model is ~41 GB on /dev/shm — one final
-                # save by default (save_steps=None + do_last_save).
+                # Save policy: the full model is ~41 GB on /dev/shm — exactly one
+                # save, done manually after training so the artifact's config is
+                # restored to the base checkpoint's serving values first
+                # (do_last_save would snapshot the training-runtime config).
                 "save_steps": args.save_steps,
                 "save_total_limit": 1,
                 "save_optimizer_state": False,
-                "do_last_save": True,
+                "do_last_save": False,
                 "log_steps": 1,
                 "report_steps": 10,
                 "progress_bar_type": "json",
@@ -220,7 +229,25 @@ def main():
         )
     print(f"[mtp-drafter-distill] trainable leaves: {len(trainable_paths)} (all mtp.*)", flush=True)
 
-    trainer.train()
+    output = trainer.train()
+
+    # Restore the training-runtime attention overrides to the BASE checkpoint's
+    # serving values before the one final save. The saved config.json must be a
+    # drop-in for eSurge: `attn_mechanism=auto` and a remat policy would change
+    # (or break — see gradient_checkpointing note above) the serving runtime.
+    import json
+
+    base_cfg = json.loads((__import__("pathlib").Path(args.model) / "config.json").read_text())
+    state = output.state
+    pairs = [(state.model.config, base_cfg)]
+    if getattr(state.model.config, "text_config", None) is not None and isinstance(base_cfg.get("text_config"), dict):
+        pairs.append((state.model.config.text_config, base_cfg["text_config"]))
+    for cfg, src in pairs:
+        for key in ("attn_mechanism", "attn_dtype", "gradient_checkpointing"):
+            if key in src:
+                setattr(cfg, key, src[key])
+    saved_dir = trainer._save_state(state)
+    print(f"[mtp-drafter-distill] final checkpoint: {saved_dir}", flush=True)
 
 
 if __name__ == "__main__":
