@@ -55,6 +55,8 @@ import warnings
 from pathlib import Path
 
 from eformer.loggings import get_logger
+from ejkernel.callib import check_bool_flag as check_bool_flag
+from ejkernel.callib import get_cache_dir as _ejk_get_cache_dir
 
 warnings.filterwarnings("ignore", message=".*'repr' attribute.*", category=UserWarning)
 warnings.filterwarnings("ignore", message=".*'frozen' attribute.*", category=UserWarning)
@@ -456,10 +458,11 @@ class Timers:
 
 
 def get_cache_dir() -> Path:
-    """Get the EasyDeL cache directory.
+    """Get the EasyDeL cache directory (``<platform cache root>/easydel``).
 
-    Returns the platform-specific cache directory for EasyDeL.
-    Creates the directory if it doesn't exist.
+    Delegates to :func:`ejkernel.callib.get_cache_dir` with the EasyDeL app
+    name so the platform-resolution logic lives in exactly one place. Creates
+    the directory if it doesn't exist.
 
     Returns:
         Path to the cache directory.
@@ -469,40 +472,4 @@ def get_cache_dir() -> Path:
         >>> print(cache_dir)
         /home/user/.cache/easydel
     """
-    home_dir = Path.home()
-    app_name = "easydel"
-    if os.name == "nt":  # Windows
-        cache_dir = Path(os.getenv("LOCALAPPDATA", home_dir / "AppData" / "Local")) / app_name
-    elif os.name == "posix":  # Linux and macOS
-        if "darwin" in os.sys.platform:  # macOS
-            cache_dir = home_dir / "Library" / "Caches" / app_name
-        else:  # Linux
-            cache_dir = home_dir / ".cache" / app_name
-    else:
-        cache_dir = home_dir / ".cache" / app_name
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir
-
-
-def check_bool_flag(name: str, default: bool = True) -> bool:
-    """Parse boolean environment variable.
-
-    Interprets various string representations as boolean values.
-    Accepts: 'true', 'yes', 'ok', '1', 'easy' (case-insensitive).
-
-    Args:
-        name: Environment variable name.
-        default: Default value if variable not set.
-
-    Returns:
-        Boolean interpretation of the environment variable.
-
-    Example:
-        >>> os.environ['DEBUG'] = 'yes'
-        >>> check_bool_flag('DEBUG')
-        True
-        >>> check_bool_flag('MISSING', default=False)
-        False
-    """
-    default = "1" if default else "0"
-    return str(os.getenv(name, default)).lower() in ["true", "yes", "ok", "1", "easy"]
+    return _ejk_get_cache_dir("easydel")

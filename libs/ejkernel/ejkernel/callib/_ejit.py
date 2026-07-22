@@ -23,7 +23,6 @@ Functions:
     save_compiled_fn: Save compiled function to disk
     load_compiled_fn: Load compiled function from disk
     load_cached_functions: Load multiple cached functions
-    hash_fn: Generate hash for function signature
 
 Constants:
     RECOMPILE_FORCE: Force recompilation flag (``EASYDEL_RECOMPILE_FORCE``).
@@ -619,61 +618,6 @@ def load_compiled_fn(path: str | os.PathLike, prefix: str | None = None):
         in_tree=in_tree,
         out_tree=out_tree,
     )
-
-
-def hash_fn(self) -> int:
-    """Generate a deterministic integer hash for an object based on its attribute values.
-
-    Concatenates the string representations of all hashable-type attribute values
-    (``float``, ``int``, ``bool``, ``dict``, ``list``) from the object's ``__dict__``
-    and produces an MD5-based integer hash.
-
-    Args:
-        self: Any object with a ``__dict__`` containing primitive-typed values.
-
-    Returns:
-        Deterministic positive integer hash derived from the object's attributes.
-
-    Note:
-        Only attributes of type ``float``, ``int``, ``bool``, ``dict``, or ``list``
-        contribute to the hash. Other attribute types are silently ignored.
-    """
-    shu = "".join(str(cu) for cu in self.__dict__.values() if isinstance(cu, float | int | bool | dict | list))
-    return get_safe_hash_int(shu)
-
-
-def get_safe_hash_int(text, algorithm="md5"):
-    """Generate a deterministic integer hash of text using the specified algorithm.
-
-    Converts the input to a string, hashes it with the given ``hashlib``
-    algorithm, and returns the digest as a big-endian unsigned integer.
-
-    Args:
-        text: Input to hash. Will be converted to ``str`` before hashing.
-        algorithm: Name of a ``hashlib`` algorithm (e.g., ``'md5'``, ``'sha256'``).
-            Defaults to ``'md5'``.
-
-    Returns:
-        Non-negative integer representing the hash digest.
-
-    Raises:
-        ValueError: If the specified algorithm is not supported by ``hashlib``.
-        Exception: For any other hashing failure.
-
-    Example:
-        >>> get_safe_hash_int("hello world")  # doctest: +SKIP
-        295242985...
-        >>> get_safe_hash_int("hello world", algorithm="sha256")  # doctest: +SKIP
-        805318394...
-    """
-    try:
-        text_str = str(text)
-        hash_object = getattr(hashlib, algorithm)(text_str.encode())
-        return int.from_bytes(hash_object.digest(), byteorder="big")
-    except AttributeError as e:
-        raise ValueError(f"Unsupported hash algorithm: {algorithm}") from e
-    except Exception as e:
-        raise Exception(f"Error generating hash: {e!s}") from e
 
 
 def get_hash_of_lowering(lowered_func: Lowered) -> str:

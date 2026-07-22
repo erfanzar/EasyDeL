@@ -53,29 +53,7 @@ from math import prod
 from typing import Self
 
 import jax
-
-
-def cdiv(a: int, b: int) -> int:
-    """Ceiling division: divide a by b and round up.
-
-    Computes the ceiling of a/b using integer arithmetic to avoid
-    floating point operations. This is commonly used for calculating
-    the number of pages needed for a given number of tokens.
-
-    Args:
-        a (int): Numerator (e.g., number of tokens)
-        b (int): Denominator (e.g., page size)
-
-    Returns:
-        int: The ceiling of a/b
-
-    Example:
-        >>> cdiv(10, 3)  # 10 tokens, 3 per page
-        4  # Need 4 pages
-        >>> cdiv(9, 3)   # 9 tokens, 3 per page
-        3  # Need 3 pages
-    """
-    return (a + b - 1) // b
+from ejkernel.callib import cdiv
 
 
 @dataclass

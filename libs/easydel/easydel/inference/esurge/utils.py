@@ -45,6 +45,7 @@ Example:
 from collections.abc import Mapping, Sequence
 from typing import Any, Generic, Literal, TypeVar, overload
 
+from ejkernel.callib import cdiv as cdiv
 from jax import numpy as jnp
 from typing_extensions import TypeIs
 
@@ -301,30 +302,6 @@ def chunk_list(lst: list[T], chunk_size: int):
     """
     for i in range(0, len(lst), chunk_size):
         yield lst[i : i + chunk_size]
-
-
-def cdiv(a: int, b: int) -> int:
-    """Compute ceiling division.
-
-    Divides a by b and rounds up to the nearest integer.
-    Equivalent to math.ceil(a / b) but using integer arithmetic.
-
-    Args:
-        a: The dividend.
-        b: The divisor. Must not be zero.
-
-    Returns:
-        The ceiling of a divided by b.
-
-    Example:
-        >>> cdiv(7, 3)
-        3
-        >>> cdiv(6, 3)
-        2
-        >>> cdiv(5, 3)
-        2
-    """
-    return -(a // -b)
 
 
 def next_power_of_2(n) -> int:

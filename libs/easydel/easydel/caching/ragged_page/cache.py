@@ -58,6 +58,7 @@ from eformer.jaximus import ImplicitArray
 from eformer.loggings import get_logger
 from eformer.mpric import DTYPE_TO_STRING_MAP
 from eformer.pytree import auto_pytree, field
+from ejkernel.callib import cdiv
 from jax.sharding import NamedSharding as Ns
 from jaxtyping import Array, Float, Int
 from spectrax import PartitionAxis, common_types
@@ -97,19 +98,6 @@ HEAD_DIM_ALIGNMENT = 128
 KV_UPDATE_WINDOW_BYTES = 16 * 1024 * 1024
 # Hard cap on slices per processing page; matches the kernel's loop unroll budget.
 MAX_SLICES_PER_UPDATE_PAGE = 64
-
-
-def cdiv(a: int, b: int) -> int:
-    """Ceiling division: compute ceil(a / b) using integer arithmetic.
-
-    Args:
-        a: Numerator.
-        b: Denominator (must be positive).
-
-    Returns:
-        int: Ceiling of a / b.
-    """
-    return (a + b - 1) // b
 
 
 def previous_power_of_2(n: int) -> int:

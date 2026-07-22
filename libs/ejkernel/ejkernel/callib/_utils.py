@@ -24,6 +24,7 @@ Key Functions:
     - strides_from_shape: Calculate strides for contiguous arrays
     - next_power_of_2: Find next power of 2
     - get_cache_dir: Get platform-specific cache directory
+    - get_safe_hash_int / hash_fn: Deterministic hashing helpers
     - quiet: Context manager for suppressing output
     - check_bool_flag: Parse boolean environment variables
 
@@ -33,6 +34,7 @@ Protocols:
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sys
 from contextlib import contextmanager
@@ -153,11 +155,12 @@ class ShapeDtype(Protocol):
         ...
 
 
-def get_cache_dir() -> Path:
-    """Get the EasyDeL cache directory.
+def get_cache_dir(app_name: str = "ejkernel-cache") -> Path:
+    """Get a platform-specific cache directory, creating it if needed.
 
-    Returns the platform-specific cache directory for EasyDeL.
-    Creates the directory if it doesn't exist.
+    Args:
+        app_name: Leaf directory name under the platform cache root
+            (``ejkernel-cache`` by default; EasyDeL passes ``"easydel"``).
 
     Returns:
         Path to the cache directory.
@@ -168,7 +171,6 @@ def get_cache_dir() -> Path:
         /home/user/.cache/ejkernel-cache
     """
     home_dir = Path.home()
-    app_name = "ejkernel-cache"
     if os.name == "nt":
         cache_dir = Path(os.getenv("LOCALAPPDATA", home_dir / "AppData" / "Local")) / app_name
     elif os.name == "posix":
@@ -271,3 +273,45 @@ def check_bool_flag(name: str, default: bool = True) -> bool:
     """
     default = "1" if default else "0"
     return str(os.getenv(name, default)).lower() in ["true", "yes", "ok", "1", "easy"]
+
+
+def get_safe_hash_int(text, algorithm: str = "md5") -> int:
+    """Generate an integer hash of ``text`` using the given hashlib algorithm.
+
+    Args:
+        text: Input value (converted to ``str`` before hashing).
+        algorithm: Name of the hashlib algorithm to use (default: ``"md5"``).
+
+    Returns:
+        Big-endian integer representation of the hash digest.
+
+    Raises:
+        ValueError: If the algorithm is not supported by hashlib.
+        RuntimeError: If hashing fails for any other reason.
+    """
+    try:
+        text_str = str(text)
+        hash_object = getattr(hashlib, algorithm)(text_str.encode())
+        return int.from_bytes(hash_object.digest(), byteorder="big")
+    except AttributeError as e:
+        raise ValueError(f"Unsupported hash algorithm: {algorithm}") from e
+    except Exception as e:
+        raise RuntimeError(f"Error generating hash: {e!s}") from e
+
+
+def hash_fn(self) -> int:
+    """Deterministic ``__hash__`` over an object's scalar/collection attributes.
+
+    Concatenates the ``str()`` of every ``__dict__`` value whose type is one of
+    ``float``/``int``/``bool``/``dict``/``list``/``tuple`` and hashes the result
+    via :func:`get_safe_hash_int`. Intended to be assigned as ``__hash__`` on a
+    (non-frozen) dataclass so instances stay usable as dict / cache keys.
+
+    Args:
+        self: The object to hash.
+
+    Returns:
+        Integer hash derived from the object's attributes.
+    """
+    shu = "".join(str(cu) for cu in self.__dict__.values() if isinstance(cu, float | int | bool | dict | list | tuple))
+    return get_safe_hash_int(shu)
