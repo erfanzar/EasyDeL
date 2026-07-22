@@ -921,7 +921,7 @@ class EasyDeLBaseModule(
         self,
         method: str = "auto",
         *,
-        num_draft_tokens: int = 2,
+        num_draft_tokens: int = 4,
         assistant_model: tp.Any | None = None,
         target_embed_module: tp.Any | None = None,
         layer_mapping: list[int] | None = None,

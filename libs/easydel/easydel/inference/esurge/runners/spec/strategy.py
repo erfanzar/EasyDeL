@@ -1138,11 +1138,12 @@ class DrafterSpeculation:
 
         Persist-with-rollback keeps the accepted-context K/V across verify
         windows and only rolls it back to the committed position each window
-        (EAGLE / vLLM style), instead of the default per-window full clear. It is
-        enabled by ``EASYDEL_MTP_PERSIST_KV=1`` or a drafter built with
-        ``persist_kv=True``, and requires the drafter to expose ``rollback_to``.
-        Default off: behavior is byte-identical to the historical per-window
-        clear.
+        (EAGLE / vLLM style), instead of a per-window full clear. It follows the
+        drafter's ``persist_kv`` flag (default ``True`` for the inline MTP
+        drafter — without it acceptance collapses with draft depth) and requires
+        the drafter to expose ``rollback_to``. The ``EASYDEL_MTP_PERSIST_KV``
+        env var overrides the flag in either direction: ``"1"`` forces
+        persistence on, ``"0"`` forces the historical per-window clear.
 
         Returns:
             ``True`` when persistence should be used for the attached drafter.
@@ -1151,9 +1152,10 @@ class DrafterSpeculation:
             return False
         if not callable(getattr(self.drafter, "rollback_to", None)):
             return False
-        if bool(getattr(self.drafter, "persist_kv", False)):
-            return True
-        return os.environ.get("EASYDEL_MTP_PERSIST_KV", "0") == "1"
+        env = os.environ.get("EASYDEL_MTP_PERSIST_KV", "").strip()
+        if env in ("0", "1"):
+            return env == "1"
+        return bool(getattr(self.drafter, "persist_kv", False))
 
     def _adaptive_conf_threshold(self) -> float:
         """Return the adaptive (early-exit) draft confidence threshold.
