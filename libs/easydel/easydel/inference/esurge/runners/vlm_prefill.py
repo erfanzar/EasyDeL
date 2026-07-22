@@ -33,6 +33,7 @@ from functools import partial
 
 import jax
 import numpy as np
+import spectrax as spx
 from eformer.loggings import get_logger
 from jax import numpy as jnp
 
@@ -298,18 +299,32 @@ class VlmPrefillHelper:
         return [1 << shift for shift in range(min_shift, max_shift + 1)]
 
     def get_image_features_jit(self) -> typing.Callable:
-        """Return (building if needed) the bucketed image-features JIT closure."""
+        """Return (building if needed) the bucketed image-features JIT closure.
+
+        The model's weights are threaded through the jit as a ``spx.State``
+        INPUT (``spx.export`` outside, ``spx.bind`` inside) instead of being
+        reached through a closure. A closure would bake the full vision tower
+        into the compiled program as captured constants — for real VLMs that is
+        gigabytes per vision bucket, which slows compilation, pushes persistent
+        compilation-cache entries past protobuf's 2 GB parse limit (poisoning
+        the cache for every later process), and duplicates weights in HBM.
+        ``spx.export`` only traverses the module pytree and references the
+        already-resident device buffers; it copies nothing.
+        """
         if self.image_features_jit is None:
             model = self.model_getter()
+            graphdef, _ = spx.export(model)
 
             @partial(jax.jit, static_argnames=("image_grid_thw", "image_max_grid_size"))
             def _image_features(
+                state: spx.State,
                 pixel_values: jax.Array,
                 *,
                 image_grid_thw: tuple[tuple[int, int, int], ...],
                 image_max_grid_size: int | None,
             ):
-                image_embeds_tuple, deepstack_image_embeds = model.get_image_features(
+                bound = spx.bind(graphdef, state)
+                image_embeds_tuple, deepstack_image_embeds = bound.get_image_features(
                     pixel_values,
                     image_grid_thw,
                     image_max_grid_size,
@@ -317,22 +332,44 @@ class VlmPrefillHelper:
                 deepstack = () if deepstack_image_embeds is None else tuple(deepstack_image_embeds)
                 return jnp.concatenate(image_embeds_tuple, axis=0), deepstack
 
-            self.image_features_jit = _image_features
+            def _call(
+                pixel_values: jax.Array,
+                *,
+                image_grid_thw: tuple[tuple[int, int, int], ...],
+                image_max_grid_size: int | None,
+            ):
+                _, state = spx.export(self.model_getter())
+                return _image_features(
+                    state,
+                    pixel_values,
+                    image_grid_thw=image_grid_thw,
+                    image_max_grid_size=image_max_grid_size,
+                )
+
+            _call._inner_jit = _image_features
+            self.image_features_jit = _call
         return self.image_features_jit
 
     def get_video_features_jit(self) -> typing.Callable:
-        """Return (building if needed) the bucketed video-features JIT closure."""
+        """Return (building if needed) the bucketed video-features JIT closure.
+
+        Weights are threaded as a ``spx.State`` jit input rather than captured
+        via closure — see :meth:`get_image_features_jit` for why.
+        """
         if self.video_features_jit is None:
             model = self.model_getter()
+            graphdef, _ = spx.export(model)
 
             @partial(jax.jit, static_argnames=("video_grid_thw", "video_max_grid_size"))
             def _video_features(
+                state: spx.State,
                 pixel_values_videos: jax.Array,
                 *,
                 video_grid_thw: tuple[tuple[int, int, int], ...],
                 video_max_grid_size: int | None,
             ):
-                video_embeds_tuple, deepstack_video_embeds = model.get_video_features(
+                bound = spx.bind(graphdef, state)
+                video_embeds_tuple, deepstack_video_embeds = bound.get_video_features(
                     pixel_values_videos,
                     video_grid_thw,
                     video_max_grid_size,
@@ -340,7 +377,22 @@ class VlmPrefillHelper:
                 deepstack = () if deepstack_video_embeds is None else tuple(deepstack_video_embeds)
                 return jnp.concatenate(video_embeds_tuple, axis=0), deepstack
 
-            self.video_features_jit = _video_features
+            def _call(
+                pixel_values_videos: jax.Array,
+                *,
+                video_grid_thw: tuple[tuple[int, int, int], ...],
+                video_max_grid_size: int | None,
+            ):
+                _, state = spx.export(self.model_getter())
+                return _video_features(
+                    state,
+                    pixel_values_videos,
+                    video_grid_thw=video_grid_thw,
+                    video_max_grid_size=video_max_grid_size,
+                )
+
+            _call._inner_jit = _video_features
+            self.video_features_jit = _call
         return self.video_features_jit
 
     def compute_embedding_with_info_single_pass(
