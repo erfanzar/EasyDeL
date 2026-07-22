@@ -66,7 +66,7 @@ class _StubReqState:
 
 
 def _make_spec(seed: int = 0) -> DrafterSpeculation:
-    return DrafterSpeculation(runner=_StubRunner(seed), drafter=None, num_speculative_tokens=2)
+    return DrafterSpeculation(runner=_StubRunner(seed), drafter=None, num_draft_tokens=2)
 
 
 def _filtered_probs(logits: jax.Array, sp: SamplingParams) -> np.ndarray:

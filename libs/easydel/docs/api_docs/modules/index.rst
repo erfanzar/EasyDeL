@@ -14,6 +14,10 @@ easydel.modules package
    dbrx/index
    deepseek_v2/index
    deepseek_v3/index
+   deepseek_v4/index
+   dflash/index
+   dspark/index
+   eagle3/index
    exaone/index
    exaone4/index
    falcon/index
@@ -23,6 +27,7 @@ easydel.modules package
    gemma2/index
    gemma3/index
    gemma4/index
+   gemma4_assistant/index
    gidd/index
    glm/index
    glm4/index
@@ -37,7 +42,10 @@ easydel.modules package
    gpt_neox/index
    gpt_oss/index
    grok_1/index
+   hunyuan_vl/index
+   hy_v3/index
    internlm2/index
+   internvl/index
    kimi_linear/index
    kimi_vl/index
    llama/index
@@ -46,8 +54,10 @@ easydel.modules package
    mamba/index
    mamba2/index
    minimax/index
+   minimax_m3_vl/index
    mistral/index
    mistral3/index
+   mistral4/index
    mixtral/index
    mosaic_mpt/index
    olmo/index
@@ -55,6 +65,7 @@ easydel.modules package
    olmo3/index
    openelm/index
    opt/index
+   paligemma/index
    phi/index
    phi3/index
    phimoe/index
@@ -79,3 +90,4 @@ easydel.modules package
    whisper/index
    xerxes/index
    xerxes2/index
+   _drafting

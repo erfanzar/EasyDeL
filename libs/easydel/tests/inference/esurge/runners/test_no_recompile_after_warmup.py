@@ -32,12 +32,11 @@ from __future__ import annotations
 import jax
 import pytest
 import spectrax as spx
-from jax import numpy as jnp
-from jax._src import test_util as jtu
-
 from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.esurge.scheduler import Scheduler
 from easydel.inference.sampling_params import SamplingParams
+from jax import numpy as jnp
+from jax._src import test_util as jtu
 
 try:
     from tests.inference.esurge.runtime_pass._tiny_runtime_common import load_test_tokenizer
@@ -122,7 +121,7 @@ def _drive_generation(runner) -> int:
         runner,
         enable_prefix_caching=False,
         async_scheduling=False,
-        num_speculative_tokens=0,
+        num_draft_tokens=0,
     )
     sampling = SamplingParams(max_tokens=OUTPUT_LEN, temperature=0.0, ignore_eos=True)
     request = EngineRequest(
@@ -179,7 +178,7 @@ def test_second_generation_is_greedy_deterministic(warm_runner):
             runner,
             enable_prefix_caching=False,
             async_scheduling=False,
-            num_speculative_tokens=0,
+            num_draft_tokens=0,
         )
         request = EngineRequest(
             request_id="det-0",

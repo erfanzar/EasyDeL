@@ -145,7 +145,7 @@ class Scheduler(SchedulerInterface):
         chunked_prefill_enabled: bool = False,
         token_safety_margin: int | None = None,
         policy: typing.Literal["priority", "fcfs"] = "fcfs",
-        num_speculative_tokens: int = 0,
+        num_draft_tokens: int = 0,
         use_eagle: bool = False,
         include_finished_set: bool = False,
     ) -> None:
@@ -170,7 +170,7 @@ class Scheduler(SchedulerInterface):
             token_safety_margin: Tokens reserved for safety; ``None`` disables
                 the token-budget manager.
             policy: Request scheduling policy (``"fcfs"`` or ``"priority"``).
-            num_speculative_tokens: Number of speculative tokens (0 disables).
+            num_draft_tokens: Number of speculative tokens (0 disables).
             use_eagle: Enable EAGLE-style speculative decoding.
             include_finished_set: Track finished request IDs per client.
 
@@ -237,9 +237,9 @@ class Scheduler(SchedulerInterface):
         self.finished_req_ids: set[str] = set()
         self.finished_recving_kv_req_ids: set[str] = set()
 
-        self.use_eagle = bool(use_eagle and num_speculative_tokens > 0)
-        self.num_spec_tokens = num_speculative_tokens
-        self.num_lookahead_tokens = num_speculative_tokens if self.use_eagle else 0
+        self.use_eagle = bool(use_eagle and num_draft_tokens > 0)
+        self.num_spec_tokens = num_draft_tokens
+        self.num_lookahead_tokens = num_draft_tokens if self.use_eagle else 0
 
         self.kv_cache_manager = CacheManager(
             num_pages=num_pages,
@@ -268,7 +268,7 @@ class Scheduler(SchedulerInterface):
         enable_prefix_caching: bool = True,
         async_scheduling: bool = True,
         long_prefill_token_threshold: int | None = None,
-        num_speculative_tokens: int = 0,
+        num_draft_tokens: int = 0,
     ) -> Scheduler:
         """Create a Scheduler instance from an eSurgeRunner.
 
@@ -336,7 +336,7 @@ class Scheduler(SchedulerInterface):
             max_num_seq_buckets=list(runner.max_num_seq_buckets) if runner.max_num_seq_buckets else None,
             async_scheduling=async_scheduling,
             long_prefill_token_threshold=long_prefill_token_threshold,
-            num_speculative_tokens=int(num_speculative_tokens),
+            num_draft_tokens=int(num_draft_tokens),
         )
 
         data_parallel_size = int(getattr(metadata, "data_parallel_size", 1) or 1)
@@ -349,7 +349,7 @@ class Scheduler(SchedulerInterface):
                 enable_prefix_caching=enable_prefix_caching,
                 async_scheduling=async_scheduling,
                 long_prefill_token_threshold=long_prefill_token_threshold,
-                num_speculative_tokens=num_speculative_tokens,
+                num_draft_tokens=num_draft_tokens,
             )
 
         if async_scheduling:

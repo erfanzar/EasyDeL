@@ -11,6 +11,7 @@ easydel.inference.esurge package
    runners/index
    scheduler/index
    server/index
+   benchmarking
    config
    engine_types
    esurge_engine

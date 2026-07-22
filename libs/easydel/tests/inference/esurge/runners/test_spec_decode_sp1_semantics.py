@@ -70,7 +70,7 @@ def _strategy():
         executor_manager=SimpleNamespace(rng_key=jax.random.PRNGKey(0)),
         max_num_seqs=1,
     )
-    return DrafterSpeculation(runner=runner, drafter=SimpleNamespace(num_draft_tokens=2), num_speculative_tokens=2)
+    return DrafterSpeculation(runner=runner, drafter=SimpleNamespace(num_draft_tokens=2), num_draft_tokens=2)
 
 
 def _peaked(token: int) -> jnp.ndarray:

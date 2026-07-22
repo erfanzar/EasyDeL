@@ -67,7 +67,7 @@ def _seed_hidden(i: int) -> jnp.ndarray:
 
 def _make_strategy(drafter: Qwen3_5MTPDrafter, n_rows: int, k: int) -> DrafterSpeculation:
     runner = types.SimpleNamespace(max_num_reqs=n_rows, max_num_seqs=n_rows)
-    return DrafterSpeculation(runner=runner, drafter=drafter, num_speculative_tokens=k)
+    return DrafterSpeculation(runner=runner, drafter=drafter, num_draft_tokens=k)
 
 
 # Greedy (temperature 0) so drafting is deterministic argmax and spec-eligible.
@@ -320,7 +320,7 @@ def _run_runner_generation(model, *, n_seqs, k, disable_batched, prompts, max_ne
             max_num_batched_tokens=64,
             enable_prefix_caching=False,
             async_scheduling=False,
-            num_speculative_tokens=runner.num_speculative_tokens,
+            num_draft_tokens=runner.num_draft_tokens,
         )
         reqs = []
         for i in range(n_seqs):

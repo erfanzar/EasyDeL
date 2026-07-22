@@ -9,4 +9,5 @@ easydel.data package
    execution/index
    sources/index
    transforms/index
+   profiling
    utils

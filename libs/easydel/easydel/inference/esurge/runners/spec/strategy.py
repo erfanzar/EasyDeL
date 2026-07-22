@@ -238,7 +238,7 @@ class DrafterSpeculation:
         *,
         runner: eSurgeRunner,
         drafter: DrafterProtocol,
-        num_speculative_tokens: int,
+        num_draft_tokens: int,
     ) -> None:
         """Initialize the drafter-backed strategy.
 
@@ -247,11 +247,11 @@ class DrafterSpeculation:
                 used to reach live runner state.
             drafter: Speculative drafter implementing
                 :class:`~easydel.inference.speculative.DrafterProtocol`.
-            num_speculative_tokens: Draft tokens proposed per verify window.
+            num_draft_tokens: Draft tokens proposed per verify window.
         """
         self._runner = runner
         self.drafter = drafter
-        self.num_speculative_tokens = int(num_speculative_tokens)
+        self.num_draft_tokens = int(num_draft_tokens)
         self.num_drafts_generated = 0
         self.num_drafts_accepted = 0
         self.num_verify_steps = 0
@@ -388,11 +388,11 @@ class DrafterSpeculation:
             req_state: Cached request state to inspect.
 
         Returns:
-            ``True`` if the drafter is set, ``num_speculative_tokens > 0``, and
+            ``True`` if the drafter is set, ``num_draft_tokens > 0``, and
             the request uses default-shaped sampling parameters; ``False``
             otherwise.
         """
-        if self.drafter is None or req_state is None or self.num_speculative_tokens <= 0:
+        if self.drafter is None or req_state is None or self.num_draft_tokens <= 0:
             return False
         sampling_params = req_state.sampling_params
         if getattr(sampling_params, "n", 1) != 1:
@@ -1166,7 +1166,7 @@ class DrafterSpeculation:
         threshold). Default ``"0"`` means OFF: :meth:`draft_next` uses the fixed-K
         Python draft loop exactly as before. A positive value routes greedy,
         non-prefix drafts through :meth:`Qwen3_5MTPDrafter.draft_adaptive`, whose
-        on-device ``while_loop`` drafts up to ``num_speculative_tokens`` but stops
+        on-device ``while_loop`` drafts up to ``num_draft_tokens`` but stops
         early once the MTP's confidence drops below this threshold — spending deep
         drafts only while the drafter is confident. Values ``<= 0`` (or an
         unparseable value) keep the feature off.
@@ -1192,7 +1192,7 @@ class DrafterSpeculation:
         prefix_position_ids: jax.Array | None = None,
         row_pos: int = 0,
     ) -> list[int]:
-        """Generate up to ``num_speculative_tokens`` draft tokens for one request.
+        """Generate up to ``num_draft_tokens`` draft tokens for one request.
 
         Runs the attached drafter from ``seed_token`` / ``seed_hidden`` at
         ``seed_position``. When the drafter supports prefix drafting and a
@@ -1221,7 +1221,7 @@ class DrafterSpeculation:
             List of drafted token ids (length may be less than the maximum on
             drafter failure or backoff).
         """
-        if self.drafter is None or self.num_speculative_tokens <= 0 or not self.is_spec_request(req_state):
+        if self.drafter is None or self.num_draft_tokens <= 0 or not self.is_spec_request(req_state):
             return []
         backoff = int(self._backoff_by_req.get(str(req_id), 0))
         if backoff > 0:
@@ -1326,7 +1326,7 @@ class DrafterSpeculation:
                     seed_token=int(seed_token),
                     seed_hidden=seed_hidden_bsh,
                     seed_position=int(seed_position),
-                    k_max=self.num_speculative_tokens,
+                    k_max=self.num_draft_tokens,
                     conf_threshold=adaptive_conf,
                     row_pos=(row if persist_on else None),
                 )
@@ -1343,7 +1343,7 @@ class DrafterSpeculation:
             drafted = [int(t) for t in np.asarray(drafts_host).reshape(-1)[:valid]]
             self.num_drafts_generated += len(drafted)
             return drafted
-        for draft_idx in range(self.num_speculative_tokens):
+        for draft_idx in range(self.num_draft_tokens):
             position_ids = (
                 jnp.asarray(prefix_position_ids, dtype=jnp.int32)
                 if use_prefix and draft_idx == 0
@@ -1422,7 +1422,7 @@ class DrafterSpeculation:
             ``True`` when the request should be collected for the post-loop batched
             draft; ``False`` when it must use the per-request fallback.
         """
-        if self.drafter is None or self.num_speculative_tokens <= 0:
+        if self.drafter is None or self.num_draft_tokens <= 0:
             return False
         # Escape hatch to force the legacy per-request draft path (benchmark A/B and
         # debugging); the batched pool path is the default.
@@ -1496,7 +1496,7 @@ class DrafterSpeculation:
         if (
             not seeds
             or self.drafter is None
-            or self.num_speculative_tokens <= 0
+            or self.num_draft_tokens <= 0
             or not callable(getattr(self.drafter, "draft_batched", None))
         ):
             return {"out": out, "drafts_dev": None, "active_reqs": []}
@@ -1578,7 +1578,7 @@ class DrafterSpeculation:
             seed_positions=jnp.asarray(seed_positions),
             committed_lens=jnp.asarray(committed_lens),
             collected_mask=jnp.asarray(collected_mask),
-            num_speculative_tokens=int(self.num_speculative_tokens),
+            num_draft_tokens=int(self.num_draft_tokens),
         )
         return {"out": out, "drafts_dev": drafts_dev, "active_reqs": active_reqs}
 

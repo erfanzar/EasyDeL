@@ -339,7 +339,7 @@ def generate_once(
         max_num_batched_tokens=MAX_BATCHED,
         enable_prefix_caching=False,
         async_scheduling=async_scheduling,
-        num_speculative_tokens=runner.num_speculative_tokens,
+        num_draft_tokens=runner.num_draft_tokens,
     )
     request = EngineRequest(
         request_id=f"bench-{run_id}",

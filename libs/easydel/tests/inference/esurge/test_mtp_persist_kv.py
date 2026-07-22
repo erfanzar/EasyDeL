@@ -231,7 +231,7 @@ def _run_generation(model, *, drafter, persist_kv: bool, max_new_tokens: int = 8
             max_num_batched_tokens=16,
             enable_prefix_caching=False,
             async_scheduling=False,
-            num_speculative_tokens=runner.num_speculative_tokens,
+            num_draft_tokens=runner.num_draft_tokens,
         )
         request = EngineRequest(
             request_id="req-persist-0",
@@ -336,7 +336,7 @@ def _make_strategy(drafter: Qwen3_5MTPDrafter, n_rows: int, k: int) -> DrafterSp
     per-request row bookkeeping without standing up a full runner.
     """
     runner = types.SimpleNamespace(max_num_reqs=n_rows, max_num_seqs=n_rows)
-    return DrafterSpeculation(runner=runner, drafter=drafter, num_speculative_tokens=k)
+    return DrafterSpeculation(runner=runner, drafter=drafter, num_draft_tokens=k)
 
 
 # Greedy (temperature 0) so drafting is deterministic argmax and spec-eligible.
