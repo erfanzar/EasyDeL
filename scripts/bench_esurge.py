@@ -167,64 +167,6 @@ def configure_tpu_process() -> None:
         lockfile.unlink()
 
 
-def make_prompts(*, count: int, prompt_len: int, vocab_size: int, seed: int) -> list[list[int]]:
-    """Generate ``count`` random token-ID prompts of exactly ``prompt_len`` tokens.
-
-    Samples integer tokens uniformly from ``[1000, min(vocab_size-1, 100000))``
-    to avoid special tokens at the very low end of the vocabulary while
-    keeping prompts well inside the model's regular vocab range.
-
-    Args:
-        count: Number of prompts to produce.
-        prompt_len: Token length of each prompt.
-        vocab_size: Vocabulary size of the target model.
-        seed: NumPy PRNG seed for reproducibility.
-
-    Returns:
-        list[list[int]]: ``count`` lists of ``prompt_len`` Python ints.
-    """
-    import numpy as np
-
-    rng = np.random.default_rng(seed)
-    lo = 1000
-    hi = max(lo + 1, min(int(vocab_size) - 1, 100000))
-    return [[int(tok) for tok in rng.integers(lo, hi, size=prompt_len, dtype=np.int32)] for _ in range(count)]
-
-
-def all_finished(requests) -> bool:
-    """Return ``True`` when every request in ``requests`` has finished.
-
-    Args:
-        requests: Iterable of :class:`EngineRequest` objects.
-
-    Returns:
-        bool: ``True`` if every request is finished.
-    """
-    return all(req.is_finished() for req in requests)
-
-
-def zero_schedule_needs_update(scheduler_output) -> bool:
-    """Return ``True`` if a zero-token schedule still requires a model update.
-
-    A schedule with zero scheduled tokens can still carry side effects
-    (finished requests to release, preempted requests to spill, new requests
-    to admit, or cached requests that need a no-op pass). When any of those
-    bookkeeping fields are non-empty the model still needs to be invoked.
-
-    Args:
-        scheduler_output: Output of :meth:`Scheduler.schedule`.
-
-    Returns:
-        bool: ``True`` when a follow-up ``execute_model`` is required.
-    """
-    return bool(
-        scheduler_output.finished_req_ids
-        or scheduler_output.preempted_req_ids
-        or scheduler_output.scheduled_new_reqs
-        or scheduler_output.scheduled_cached_reqs.num_reqs
-    )
-
-
 def reset_runner(runner) -> None:
     """Reset a runner's state between benchmark batches without zeroing KV pages.
 
@@ -316,6 +258,7 @@ def run_batch(runner, prompts: list[list[int]], output_len: int, max_num_batched
     import jax
     import jax.numpy as jnp
 
+    from easydel.inference.esurge.benchmarking import all_finished, zero_schedule_needs_update
     from easydel.inference.esurge.request import EngineRequest
     from easydel.inference.esurge.scheduler import Scheduler
     from easydel.inference.sampling_params import SamplingParams
@@ -538,6 +481,7 @@ def main() -> int:
     import jax.numpy as jnp
 
     import easydel as ed
+    from easydel.inference.esurge.benchmarking import make_prompts
     from easydel.inference.esurge.runners import eSurgeRunner
     from easydel.utils import set_inference_mode
 
