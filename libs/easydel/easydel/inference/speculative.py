@@ -55,6 +55,7 @@ from spectrax import common_types
 
 from easydel.caching import TransformerCache, TransformerCacheConfig, TransformerMetadata
 from easydel.infra.spec_decode import SpecDecodeBase, register_drafter
+from easydel.utils.graph_jit import module_jit
 
 
 @dataclass(frozen=True)
@@ -1512,7 +1513,17 @@ class Gemma4AssistantDrafter:
         self.requires_target_kv_cache = True
         backbone_h = int(assistant_model.config.backbone_hidden_size)
         self._embed_scale = jnp.sqrt(jnp.array(backbone_h, dtype=jnp.float32))
-        self._jit_assistant: dict[tuple, typing.Callable] = {}
+        # Thread the assistant AND the target embedding through the jit as
+        # spx.State inputs (export outside, bind inside) so neither is baked
+        # into the compiled program as captured constants — see
+        # easydel.utils.graph_jit.module_jit. jax.jit's own cache handles the
+        # per-shape / per-kv-structure variants; `return_dense_logits` is the
+        # only compile-time-static argument.
+        self._assistant_jit = module_jit(
+            self._assistant_body,
+            (lambda: self.assistant, lambda: self.target_embed),
+            static_argnames=("return_dense_logits",),
+        )
 
     def resolve_layer_mapping(self, target_cache: typing.Any | None = None) -> list[int]:
         """Return the assistant-layer to target-layer K/V mapping.
@@ -1555,6 +1566,34 @@ class Gemma4AssistantDrafter:
         """
         del batch_size
 
+    def _assistant_body(
+        self,
+        assistant: typing.Any,
+        target_embed: typing.Any,
+        input_ids: Int[Array, "batch seq"],
+        target_hidden_states: Float[Array, "batch seq backbone_hidden"],
+        target_kv_cache: list[tuple[Array, Array] | None] | None,
+        position_ids: Int[Array, "batch seq"] | None,
+        attention_mask: Float[Array, "batch 1 q_len kv_len"] | None,
+        *,
+        return_dense_logits: bool,
+    ) -> typing.Any:
+        """Traced Gemma4 Assistant forward body run under :func:`module_jit`.
+
+        ``assistant`` and ``target_embed`` are the modules bound *inside* the
+        trace from States threaded as jit inputs (never captured constants).
+        Only ``self._embed_scale`` (a scalar) is closed over.
+        """
+        embeds = target_embed(input_ids.astype("i4")) * self._embed_scale.astype(target_hidden_states.dtype)
+        return assistant(
+            backbone_hidden_states=target_hidden_states,
+            target_token_embeds=embeds,
+            target_key_value_pairs=target_kv_cache,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            return_dense_logits=return_dense_logits,
+        )
+
     def _assistant_forward(
         self,
         input_ids: Int[Array, "batch seq"],
@@ -1564,67 +1603,22 @@ class Gemma4AssistantDrafter:
         attention_mask: Float[Array, "batch 1 q_len kv_len"] | None,
         return_dense_logits: bool,
     ) -> typing.Any:
-        """JIT-cached Gemma4 Assistant forward (compiled once per shape).
+        """Weight-safe JIT Gemma4 Assistant forward.
 
-        ``target_kv_cache`` is part of the traced pytree (a list of
-        ``(K, V)`` arrays, or ``None``); a structural change in it
-        triggers one extra compile, which is fine for the fixed
-        decode geometry.
+        The assistant weights and the target embedding are threaded through the
+        jit as ``spx.State`` inputs (via :func:`module_jit`), so they are never
+        baked into the compiled program as captured constants. ``jax.jit``'s own
+        cache compiles one variant per input shape / ``target_kv_cache`` pytree
+        structure; ``return_dense_logits`` is a compile-time-static flag.
         """
-        has_kv = target_kv_cache is not None
-        kv_signature = None
-        if target_kv_cache is not None:
-            kv_signature = tuple(
-                None
-                if pair is None
-                else (
-                    (tuple(pair[0].shape), str(pair[0].dtype)),
-                    (tuple(pair[1].shape), str(pair[1].dtype)),
-                )
-                for pair in target_kv_cache
-            )
-        key = (
-            tuple(input_ids.shape),
-            str(input_ids.dtype),
-            tuple(target_hidden_states.shape),
-            str(target_hidden_states.dtype),
-            has_kv,
-            kv_signature,
-            None if position_ids is None else tuple(position_ids.shape),
-            None if position_ids is None else str(position_ids.dtype),
-            None if attention_mask is None else tuple(attention_mask.shape),
-            None if attention_mask is None else str(attention_mask.dtype),
-            bool(return_dense_logits),
+        return self._assistant_jit(
+            input_ids,
+            target_hidden_states,
+            target_kv_cache,
+            position_ids,
+            attention_mask,
+            return_dense_logits=bool(return_dense_logits),
         )
-        fn = self._jit_assistant.get(key)
-        if fn is None:
-            target_embeds = self.target_embed(input_ids.astype("i4")) * self._embed_scale.astype(
-                target_hidden_states.dtype
-            )
-            _ = self.assistant(
-                backbone_hidden_states=target_hidden_states,
-                target_token_embeds=target_embeds,
-                target_key_value_pairs=target_kv_cache,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                return_dense_logits=return_dense_logits,
-            )
-
-            @jax.jit
-            def _fn(ids, hidden, kv, pos, mask):
-                embeds = self.target_embed(ids.astype("i4")) * self._embed_scale.astype(hidden.dtype)
-                return self.assistant(
-                    backbone_hidden_states=hidden,
-                    target_token_embeds=embeds,
-                    target_key_value_pairs=kv,
-                    position_ids=pos,
-                    attention_mask=mask,
-                    return_dense_logits=return_dense_logits,
-                )
-
-            fn = _fn
-            self._jit_assistant[key] = fn
-        return fn(input_ids, target_hidden_states, target_kv_cache, position_ids, attention_mask)
 
     def draft(
         self,
