@@ -46,9 +46,12 @@ class SpeculativeStrategy(typing.Protocol):
     """Call surface the eSurge runner drives speculative decoding through.
 
     Attributes:
-        num_draft_tokens: Draft tokens proposed per verify window
+        num_draft_tokens: Static draft tokens proposed per verify window
             (``0`` disables speculative decoding; the scheduler reads the
-            runner mirror of this value).
+            runner mirror of this value). This is the compiled maximum.
+        live_num_draft_tokens: The per-step dynamic draft budget resolved by
+            :meth:`resolve_step_draft_budget`; equals ``num_draft_tokens``
+            without a schedule. Draft paths read this value.
         uses_recurrent_candidates: Whether hybrid recurrent caches keep
             per-request speculative candidate rows for this configuration.
         num_drafts_generated: Total draft tokens proposed so far.
@@ -63,6 +66,7 @@ class SpeculativeStrategy(typing.Protocol):
     """
 
     num_draft_tokens: int
+    live_num_draft_tokens: int
     uses_recurrent_candidates: bool
     num_drafts_generated: int
     num_drafts_accepted: int
@@ -71,6 +75,10 @@ class SpeculativeStrategy(typing.Protocol):
     debug_traces: list[dict[str, typing.Any]]
     debug_max_traces: int
     draft_full_log_probs_by_req: dict[str, jax.Array]
+
+    def resolve_step_draft_budget(self, concurrency: int) -> int:
+        """Resolve the per-step draft-token budget from the live concurrency."""
+        ...
 
     def on_states_applied(self, scheduler_output: SchedulerOutput) -> None:
         """Materialize scheduler-provided draft tokens into the sequence buffer."""
@@ -234,6 +242,7 @@ class NullSpeculation:
     def __init__(self) -> None:
         """Initialize the inert strategy with zeroed counters and no state."""
         self.num_draft_tokens = 0
+        self.live_num_draft_tokens = 0
         self.num_drafts_generated = 0
         self.num_drafts_accepted = 0
         self.num_verify_steps = 0
@@ -241,6 +250,11 @@ class NullSpeculation:
         self.debug_traces: list[dict[str, typing.Any]] = []
         self.debug_max_traces = 0
         self.draft_full_log_probs_by_req: dict[str, jax.Array] = {}
+
+    def resolve_step_draft_budget(self, concurrency: int) -> int:
+        """Always ``0``: no drafter, no draft budget at any concurrency."""
+        del concurrency
+        return 0
 
     def on_states_applied(self, scheduler_output: SchedulerOutput) -> None:
         """No-op: nothing to materialize without a drafter."""
