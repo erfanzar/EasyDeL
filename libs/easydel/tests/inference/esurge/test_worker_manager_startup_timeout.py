@@ -16,7 +16,7 @@ from easydel.workers.esurge.pipeline.worker_manager import DEFAULT_WORKER_STARTU
 
 
 def test_worker_manager_reads_startup_timeout_from_env(monkeypatch):
-    monkeypatch.setenv("EASURGE_WORKER_STARTUP_TIMEOUT", "77.5")
+    monkeypatch.setenv("EASYDEL_WORKER_STARTUP_TIMEOUT", "77.5")
 
     manager = WorkerManager("dummy-tokenizer")
 
@@ -24,7 +24,7 @@ def test_worker_manager_reads_startup_timeout_from_env(monkeypatch):
 
 
 def test_worker_manager_prefers_explicit_startup_timeout(monkeypatch):
-    monkeypatch.setenv("EASURGE_WORKER_STARTUP_TIMEOUT", "77.5")
+    monkeypatch.setenv("EASYDEL_WORKER_STARTUP_TIMEOUT", "77.5")
 
     manager = WorkerManager("dummy-tokenizer", startup_timeout=12.0)
 
@@ -32,7 +32,7 @@ def test_worker_manager_prefers_explicit_startup_timeout(monkeypatch):
 
 
 def test_worker_manager_ignores_invalid_env_timeout(monkeypatch):
-    monkeypatch.setenv("EASURGE_WORKER_STARTUP_TIMEOUT", "not-a-number")
+    monkeypatch.setenv("EASYDEL_WORKER_STARTUP_TIMEOUT", "not-a-number")
 
     manager = WorkerManager("dummy-tokenizer")
 

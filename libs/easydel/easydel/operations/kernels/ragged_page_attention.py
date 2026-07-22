@@ -110,7 +110,7 @@ from ..requirements import (
 
 logger = get_logger(__name__)
 USE_SHARDMAP = True
-ENABLE_DP_LOCAL_PAGE_PATH = check_bool_flag("EASURGE_ENABLE_DP_LOCAL_PAGE_PATH", default=True)
+ENABLE_DP_LOCAL_PAGE_PATH = check_bool_flag("EASYDEL_ENABLE_DP_LOCAL_PAGE_PATH", default=True)
 
 
 def _request_distribution_bounds(scheduled: Array, context_lens: Array) -> Array:
@@ -475,7 +475,7 @@ class _RaggedPageAttn(OperationImpl):
       :func:`_runtime_sharding_resolver`, including DP-page axis selection
       (``ATTN_DP`` vs ``ct.EMPTY``) and KV-head axis fan-out.
     * Two ``shard_map`` paths controlled by
-      ``EASURGE_ENABLE_DP_LOCAL_PAGE_PATH``: a DP-local path that slices
+      ``EASYDEL_ENABLE_DP_LOCAL_PAGE_PATH``: a DP-local path that slices
       ``context_lens`` / ``pages_tables`` per DP shard and ``psum``-reduces
       the per-shard outputs, and a globally replicated path that runs the
       kernel against the full batch.

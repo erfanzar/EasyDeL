@@ -37,6 +37,8 @@ import numpy as np
 from eformer.loggings import get_logger
 from jax import numpy as jnp
 
+from easydel.utils import flags
+
 from ...core.binary_search import apply_topk_mask, apply_topp_mask
 
 if typing.TYPE_CHECKING:
@@ -1424,7 +1426,7 @@ class DrafterSpeculation:
             return False
         # Escape hatch to force the legacy per-request draft path (benchmark A/B and
         # debugging); the batched pool path is the default.
-        if os.environ.get("EASURGE_DISABLE_BATCHED_DRAFT", "0") == "1":
+        if flags.get_bool(flags.EASYDEL_DISABLE_BATCHED_DRAFT):
             return False
         if not bool(getattr(self.drafter, "supports_batched_draft", False)):
             return False

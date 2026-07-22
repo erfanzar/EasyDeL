@@ -71,7 +71,6 @@ Example:
 
 from __future__ import annotations
 
-import os
 import time
 import typing
 import typing as tp
@@ -96,6 +95,7 @@ from easydel.caching import (
 )
 from easydel.infra.sharding import replicated_named_sharding
 from easydel.layers.quantization import TurboQuantConfig
+from easydel.utils import flags
 
 from ..utils import model_uses_mrope
 from .async_types import DeviceInputTokenHandoff
@@ -142,7 +142,7 @@ logger = get_logger("eSurge-ExecutionManager")
 
 # Syncing inputs after host->device metadata transfer makes `prep_time` more accurate,
 # but it adds a device round-trip that hurts throughput. Keep it opt-in.
-SYNC_INPUTS_FOR_TIMING = bool(int(os.environ.get("EASURGE_SYNC_INPUTS_FOR_TIMING", "0")))
+SYNC_INPUTS_FOR_TIMING = flags.get_bool(flags.EASYDEL_SYNC_INPUTS_FOR_TIMING)
 
 
 class ExecutionManager:

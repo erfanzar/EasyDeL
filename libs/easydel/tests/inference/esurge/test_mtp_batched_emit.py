@@ -142,7 +142,7 @@ def _run(model, *, n, k, disable_emit, prompts, project_rows):
         "dnb": _strategy.DrafterSpeculation.draft_next_batched,
         "bbd": _strategy.DrafterSpeculation.begin_batched_draft,
         "fbd": _strategy.DrafterSpeculation.finish_batched_draft,
-        "emit": os.environ.get("EASURGE_DISABLE_BATCHED_EMIT"),
+        "emit": os.environ.get("EASYDEL_DISABLE_BATCHED_EMIT"),
         "persist": os.environ.get("EASYDEL_MTP_PERSIST_KV"),
     }
 
@@ -155,7 +155,7 @@ def _run(model, *, n, k, disable_emit, prompts, project_rows):
     _strategy.DrafterSpeculation.draft_next_batched = _fake_draft_next_batched
     _strategy.DrafterSpeculation.begin_batched_draft = _fake_begin_batched_draft
     _strategy.DrafterSpeculation.finish_batched_draft = _fake_finish_batched_draft
-    os.environ["EASURGE_DISABLE_BATCHED_EMIT"] = "1" if disable_emit else "0"
+    os.environ["EASYDEL_DISABLE_BATCHED_EMIT"] = "1" if disable_emit else "0"
     os.environ["EASYDEL_MTP_PERSIST_KV"] = "1"
     try:
         runner = eSurgeRunner(
@@ -218,7 +218,7 @@ def _run(model, *, n, k, disable_emit, prompts, project_rows):
         _strategy.DrafterSpeculation.draft_next_batched = saved["dnb"]
         _strategy.DrafterSpeculation.begin_batched_draft = saved["bbd"]
         _strategy.DrafterSpeculation.finish_batched_draft = saved["fbd"]
-        for key, val in (("EASURGE_DISABLE_BATCHED_EMIT", saved["emit"]), ("EASYDEL_MTP_PERSIST_KV", saved["persist"])):
+        for key, val in (("EASYDEL_DISABLE_BATCHED_EMIT", saved["emit"]), ("EASYDEL_MTP_PERSIST_KV", saved["persist"])):
             if val is None:
                 os.environ.pop(key, None)
             else:

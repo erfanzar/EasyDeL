@@ -31,7 +31,7 @@ Capabilities and constraints:
 * Optional data-parallel page sharding is honored: the ``ATTN_DP`` axis
   enters the in_specs only when the cache reports
   ``data_parallel_size > 1`` and the
-  ``EASURGE_ENABLE_DP_LOCAL_PAGE_PATH`` flag is on, in which case
+  ``EASYDEL_ENABLE_DP_LOCAL_PAGE_PATH`` flag is on, in which case
   block-table page IDs are translated into per-shard local IDs by
   :func:`_localize_block_tables_for_dp_pages`.
 * Segment IDs in the ``mask_info`` are not supported (paged KV makes them
@@ -57,7 +57,7 @@ from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationRegistry
 from ..requirements import CacheType, ExecutionMode, MetadataField, OperationRequirements, RequirementsBuilder
 
-ENABLE_DP_LOCAL_PAGE_PATH = check_bool_flag("EASURGE_ENABLE_DP_LOCAL_PAGE_PATH", default=True)
+ENABLE_DP_LOCAL_PAGE_PATH = check_bool_flag("EASYDEL_ENABLE_DP_LOCAL_PAGE_PATH", default=True)
 
 
 def _dp_page_axis(cache_view: UnifiedAttentionCacheView):
@@ -137,7 +137,7 @@ class PagedFlashAttn(OperationImpl):
         - Falls back to :class:`UnifiedAttn` when the query batch dimension
           and ``pages_tables`` batch dimension disagree (e.g. mid-step
           rebatching scenarios).
-        - Honors the ``EASURGE_ENABLE_DP_LOCAL_PAGE_PATH`` flag for
+        - Honors the ``EASYDEL_ENABLE_DP_LOCAL_PAGE_PATH`` flag for
           DP-sharded page pools; block tables are translated via
           :func:`_localize_block_tables_for_dp_pages` so each DP shard sees
           local page IDs only.

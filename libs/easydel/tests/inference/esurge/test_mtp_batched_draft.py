@@ -303,12 +303,12 @@ def _run_runner_generation(model, *, n_seqs, k, disable_batched, prompts, max_ne
     """Drive ``n_seqs`` concurrent requests through a real eSurgeRunner to completion.
 
     ``disable_batched`` toggles the batched pool draft path off (per-request
-    fallback) via ``EASURGE_DISABLE_BATCHED_DRAFT`` so the same runner code can be
+    fallback) via ``EASYDEL_DISABLE_BATCHED_DRAFT`` so the same runner code can be
     exercised in both modes. Returns ``{req_id: [emitted token ids]}``.
     """
-    prev_batch = os.environ.get("EASURGE_DISABLE_BATCHED_DRAFT")
+    prev_batch = os.environ.get("EASYDEL_DISABLE_BATCHED_DRAFT")
     prev_persist = os.environ.get("EASYDEL_MTP_PERSIST_KV")
-    os.environ["EASURGE_DISABLE_BATCHED_DRAFT"] = "1" if disable_batched else "0"
+    os.environ["EASYDEL_DISABLE_BATCHED_DRAFT"] = "1" if disable_batched else "0"
     os.environ["EASYDEL_MTP_PERSIST_KV"] = "1"
     try:
         runner = eSurgeRunner(
@@ -360,7 +360,7 @@ def _run_runner_generation(model, *, n_seqs, k, disable_batched, prompts, max_ne
         runner.executor_manager.kv_pages = None
         return toks
     finally:
-        for key, prev in (("EASURGE_DISABLE_BATCHED_DRAFT", prev_batch), ("EASYDEL_MTP_PERSIST_KV", prev_persist)):
+        for key, prev in (("EASYDEL_DISABLE_BATCHED_DRAFT", prev_batch), ("EASYDEL_MTP_PERSIST_KV", prev_persist)):
             if prev is None:
                 os.environ.pop(key, None)
             else:

@@ -88,7 +88,7 @@ from spectrax.common_types import NOT_GIVEN
 from easydel.axis import register_attention_data_parallel_axis
 from easydel.inference.sampling_params import SamplingParams
 from easydel.inference.speculative import DrafterProtocol
-from easydel.utils import Registry
+from easydel.utils import Registry, flags
 
 if typing.TYPE_CHECKING:
     from easydel.modules.auto.auto_modeling import PreTrainedLoading
@@ -148,8 +148,8 @@ DEFAULT_DECODE_INTERVAL_TOKENS = 16  # Decode every N tokens
 DEFAULT_DECODE_INTERVAL_SECS = 0.04  # Or decode every N seconds (20ms)
 WORKER_DRAIN_MAX_RETRIES = 3  # Maximum retry attempts for worker drain
 WORKER_DRAIN_INITIAL_DELAY = 0.1  # Initial retry delay in seconds
-_SCHEDULER_HEARTBEAT_WARN_S = float(os.environ.get("EASURGE_HEARTBEAT_WARN_S", "120"))
-_SCHEDULER_HEARTBEAT_WARN_INTERVAL_S = float(os.environ.get("EASURGE_HEARTBEAT_WARN_INTERVAL_S", "30"))
+_SCHEDULER_HEARTBEAT_WARN_S = flags.get_float(flags.EASYDEL_HEARTBEAT_WARN_S)
+_SCHEDULER_HEARTBEAT_WARN_INTERVAL_S = flags.get_float(flags.EASYDEL_HEARTBEAT_WARN_INTERVAL_S)
 SamplingCallable = typing.Callable[[SamplingParams, dict[str, typing.Any]], SamplingParams | None] | None
 
 
@@ -653,8 +653,10 @@ class eSurge:
             info=self._info,
         )
 
-        tokenizer_endpoint = self.worker_config.tokenizer_endpoint or os.environ.get("EASURGE_TOKENIZER_ENDPOINT")
-        detokenizer_endpoint = self.worker_config.detokenizer_endpoint or os.environ.get("EASURGE_DETOKENIZER_ENDPOINT")
+        tokenizer_endpoint = self.worker_config.tokenizer_endpoint or flags.get_str(flags.EASYDEL_TOKENIZER_ENDPOINT)
+        detokenizer_endpoint = self.worker_config.detokenizer_endpoint or flags.get_str(
+            flags.EASYDEL_DETOKENIZER_ENDPOINT
+        )
 
         self._worker_manager = WorkerManager(
             assets.tokenizer_source, startup_timeout=self.worker_config.worker_startup_timeout

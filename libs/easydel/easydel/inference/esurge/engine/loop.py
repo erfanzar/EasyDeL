@@ -26,11 +26,12 @@ scheduler lock is the engine's own RLock, shared so the lock order contract
 
 from __future__ import annotations
 
-import os
 import threading
 import time
 import traceback
 import typing
+
+from easydel.utils import flags
 
 from ..distributed.coordinator import LocalCoordinator, StepHandle
 from ..logger import logger
@@ -38,9 +39,9 @@ from ..logger import logger
 if typing.TYPE_CHECKING:
     from ..scheduler import Scheduler, SchedulerOutput
 
-# Default to fail-fast (1) so benchmark runs don't spin for hours on fatal errors.
-# Set `EASURGE_MAX_SCHEDULER_ERRORS=10` (or higher) to restore retry behavior.
-MAX_CONSECUTIVE_SCHEDULER_ERRORS = int(os.environ.get("EASURGE_MAX_SCHEDULER_ERRORS", "5"))
+# Default to fail-fast so benchmark runs don't spin for hours on fatal errors.
+# Set `EASYDEL_MAX_SCHEDULER_ERRORS=10` (or higher) to restore retry behavior.
+MAX_CONSECUTIVE_SCHEDULER_ERRORS = flags.get_int(flags.EASYDEL_MAX_SCHEDULER_ERRORS)
 
 
 class EngineLoop:

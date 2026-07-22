@@ -26,13 +26,12 @@ os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
 # sequential-replay recurrent path guarantees that; the default fast path is
 # coherent but not bit-identical on recurrent models (see model_runner
 # spec_decode_recurrent_replay). Force the exact path here.
-os.environ.setdefault("EASURGE_SPEC_RECURRENT_REPLAY", "1")
+os.environ.setdefault("EASYDEL_SPEC_RECURRENT_REPLAY", "1")
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import spectrax as spx
-
 from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.esurge.runners import eSurgeRunner
 from easydel.inference.esurge.scheduler import Scheduler
