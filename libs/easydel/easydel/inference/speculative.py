@@ -287,7 +287,7 @@ class Qwen3_5MTPDrafter:
         num_draft_tokens: int = 1,
         use_cache: bool = True,
         cache_length: int | None = None,
-        persist_kv: bool = False,
+        persist_kv: bool = True,
     ):
         """Wrap a Qwen3.5 causal-LM (or multimodal generation) model.
 
@@ -303,14 +303,16 @@ class Qwen3_5MTPDrafter:
             cache_length: Optional MTP-local cache length. The eSurge runner
                 sets this to the runner max length; standalone use falls back
                 to the model config length.
-            persist_kv: Opt into persist-with-rollback of the MTP KV cache
-                across verify windows (EAGLE / vLLM style) instead of the
-                default per-window full clear. When ``True`` the eSurge
-                strategy keeps the accepted context K/V across windows and only
-                rolls it back to the committed sequence position via
-                :meth:`rollback_to`; see that method. Default ``False`` keeps
-                the historical per-window clear (:meth:`reset_request`), and the
-                ``EASYDEL_MTP_PERSIST_KV=1`` env var enables persistence too.
+            persist_kv: Persist-with-rollback of the MTP KV cache across
+                verify windows (EAGLE / vLLM style) instead of a per-window
+                full clear. When ``True`` (the default) the eSurge strategy
+                keeps the accepted context K/V across windows and only rolls
+                it back to the committed sequence position via
+                :meth:`rollback_to`; without it, acceptance collapses with
+                draft depth (measured 58% -> 25% at K=4). ``False`` restores
+                the historical per-window clear (:meth:`reset_request`). The
+                ``EASYDEL_MTP_PERSIST_KV`` env var (``"0"``/``"1"``) overrides
+                this flag either way at the eSurge strategy level.
 
         Raises:
             ValueError: If the model lacks an MTP head.

@@ -879,7 +879,7 @@ def _validate_esurge_drafter_config(self):
     defaults={
         "enabled": False,
         "method": None,
-        "num_draft_tokens": 1,
+        "num_draft_tokens": 4,
         "assistant_model": None,
         "target_embed_module": None,
         "layer_mapping": None,
@@ -908,7 +908,9 @@ class eSurgeDrafterConfig(TypedDict, total=False):
         method: Drafter family passed to ``model.drafter``. Supported runtime
             values depend on the model, currently ``"auto"``, ``"mtp"``, and
             ``"gemma4_assistant"``.
-        num_draft_tokens: Draft tokens proposed per verify window.
+        num_draft_tokens: Draft tokens proposed per verify window (default 4,
+            the measured sweet spot for inline-MTP drafting with KV
+            persistence).
         assistant_model: Optional standalone assistant model or model id/path
             for assistant-style drafting.
         target_embed_module: Optional target embedding module forwarded to

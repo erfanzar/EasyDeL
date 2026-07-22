@@ -503,9 +503,13 @@ class eSurge:
 
                 Consumed via ``Unpack[eSurgeDistributedConfig]``.
             drafter (DrafterProtocol | bool | Mapping[str, Any] | None):
-                Explicit drafter object, ``True`` for auto drafter construction,
+                Explicit drafter object, ``True`` for auto drafter discovery,
                 or a config mapping treated as ``drafter_config`` for concise
-                calls.
+                calls. ``drafter=True`` is the plug-and-play path: eSurge asks
+                the loaded model for its own drafter (``model.drafter("auto")``
+                — e.g. the built-in MTP head on Qwen3.5/3.6 checkpoints) with
+                the tuned defaults (4 draft tokens, persistent MTP KV). No
+                drafter class or method name needed.
             drafter_config (eSurgeDrafterConfig | Mapping[str, Any] | None):
                 Declarative drafter settings. When enabled, eSurge calls
                 ``model.drafter(method=..., num_draft_tokens=..., ...)`` after
