@@ -1864,15 +1864,14 @@ def _build_model_native_drafter(
         )
     if not isinstance(drafter, SpecDecodeBase):
         raise TypeError(f"drafter_model must be an EasyDeLBaseModule + SpecDecodeBase; got {type(drafter).__name__}.")
-    # Seed-hidden shape gate (5b): the eSurge runner seeds the drafter with ONE
+    # Seed-hidden shape gate: the eSurge runner seeds the drafter with ONE
     # target hidden state per verify window, but a multi-layer standalone
     # drafter's `extract_context_feature` expects `len(target_layer_ids)`
     # concatenated layers. Fail early with a clear message instead of a
-    # far-away shape error deep inside the drafter forward.
-    # TODO(5a): wire a multi-layer runner-seed gather so multi-layer standalone
-    #   drafters can be seeded directly; that change lives in the recurrent /
-    #   hidden-gather path of model_runner.py and is intentionally out of scope
-    #   here.
+    # far-away shape error deep inside the drafter forward. Seeding multi-layer
+    # standalone drafters directly would require a multi-layer runner-seed
+    # gather in the recurrent / hidden-gather path of model_runner.py, which is
+    # not supported.
     n_layers = _drafter_target_layer_count(drafter)
     if n_layers > 1:
         raise ValueError(

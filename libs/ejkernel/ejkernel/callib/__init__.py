@@ -64,7 +64,6 @@ from ._ejit import (
     load_cached_functions,
     load_compiled_fn,
     save_compiled_fn,
-    smart_compile,
 )
 from ._pallas_call import buffered_pallas_call
 from ._utils import cdiv, next_power_of_2, strides_from_shape
@@ -222,7 +221,6 @@ __all__ = (
     "load_compiled_fn",
     "next_power_of_2",
     "save_compiled_fn",
-    "smart_compile",
     "strides_from_shape",
     "tilelang_call",
     "triton_call",

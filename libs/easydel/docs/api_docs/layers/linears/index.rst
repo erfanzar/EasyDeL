@@ -6,7 +6,6 @@ easydel.layers.linears package
 
    _linear
    _linear_moe
-   _linear_moe_quantized
    _linear_quantized
    _lora
    _utils
