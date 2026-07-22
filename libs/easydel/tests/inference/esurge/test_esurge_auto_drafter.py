@@ -117,7 +117,7 @@ _REQ_STATE = types.SimpleNamespace(sampling_params=SamplingParams(temperature=0.
 
 def _make_strategy(drafter: Qwen3_5MTPDrafter, n_rows: int, k: int) -> DrafterSpeculation:
     runner = types.SimpleNamespace(max_num_reqs=n_rows, max_num_seqs=n_rows)
-    return DrafterSpeculation(runner=runner, drafter=drafter, num_speculative_tokens=k)
+    return DrafterSpeculation(runner=runner, drafter=drafter, num_draft_tokens=k)
 
 
 def _row_index(drafter: Qwen3_5MTPDrafter, row: int) -> int:

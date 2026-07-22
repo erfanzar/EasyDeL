@@ -110,7 +110,7 @@ def run_generation(model, *, drafter, max_new_tokens: int = 8) -> tuple[list[int
         max_num_batched_tokens=16,
         enable_prefix_caching=False,
         async_scheduling=False,
-        num_speculative_tokens=runner.num_speculative_tokens,
+        num_draft_tokens=runner.num_draft_tokens,
     )
     request = EngineRequest(
         request_id="req-0",

@@ -18,7 +18,7 @@
 speculative decoding through a strategy object exposed as ``runner.spec``:
 
 - :class:`NullSpeculation` — inert strategy for plain (non-speculative)
-  decode; every hook is a no-op and ``num_speculative_tokens`` is ``0``.
+  decode; every hook is a no-op and ``num_draft_tokens`` is ``0``.
 - :class:`~easydel.inference.esurge.runners.spec.strategy.DrafterSpeculation`
   — the runner-native draft/verify/commit implementation backed by a
   drafter (:class:`~easydel.inference.speculative.DrafterProtocol`).
@@ -46,7 +46,7 @@ class SpeculativeStrategy(typing.Protocol):
     """Call surface the eSurge runner drives speculative decoding through.
 
     Attributes:
-        num_speculative_tokens: Draft tokens proposed per verify window
+        num_draft_tokens: Draft tokens proposed per verify window
             (``0`` disables speculative decoding; the scheduler reads the
             runner mirror of this value).
         uses_recurrent_candidates: Whether hybrid recurrent caches keep
@@ -62,7 +62,7 @@ class SpeculativeStrategy(typing.Protocol):
             log-probability tensors awaiting verification.
     """
 
-    num_speculative_tokens: int
+    num_draft_tokens: int
     uses_recurrent_candidates: bool
     num_drafts_generated: int
     num_drafts_accepted: int
@@ -179,7 +179,7 @@ class SpeculativeStrategy(typing.Protocol):
         prefix_hidden_states: jax.Array | None = None,
         prefix_position_ids: jax.Array | None = None,
     ) -> list[int]:
-        """Generate up to ``num_speculative_tokens`` draft tokens for one request."""
+        """Generate up to ``num_draft_tokens`` draft tokens for one request."""
         ...
 
     def record_acceptance(self, req_id: str, accepted: int, num_drafts: int) -> None:
@@ -233,7 +233,7 @@ class NullSpeculation:
 
     def __init__(self) -> None:
         """Initialize the inert strategy with zeroed counters and no state."""
-        self.num_speculative_tokens = 0
+        self.num_draft_tokens = 0
         self.num_drafts_generated = 0
         self.num_drafts_accepted = 0
         self.num_verify_steps = 0

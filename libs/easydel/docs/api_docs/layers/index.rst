@@ -6,6 +6,7 @@ easydel.layers package
 
    attention/index
    embeddings/index
+   layouts/index
    linear_attention/index
    linears/index
    moe/index

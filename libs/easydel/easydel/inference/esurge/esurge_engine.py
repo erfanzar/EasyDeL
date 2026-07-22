@@ -757,7 +757,7 @@ class eSurge:
             enable_prefix_caching=self.cache_config.enable_prefix_caching,
             async_scheduling=runner_async_scheduling,
             long_prefill_token_threshold=long_prefill_token_threshold,
-            num_speculative_tokens=self.runner.num_speculative_tokens,
+            num_draft_tokens=self.runner.num_draft_tokens,
         )
         self._scheduler_max_num_batched_tokens = max_num_batched_tokens
 

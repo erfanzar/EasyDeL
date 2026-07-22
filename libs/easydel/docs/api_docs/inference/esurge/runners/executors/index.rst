@@ -5,5 +5,7 @@ easydel.inference.esurge.runners.executors package
    :maxdepth: 2
 
    batch_preparer
+   compile_orchestrator
    model_executor
+   pipeline_microbatch
    sampler_executor

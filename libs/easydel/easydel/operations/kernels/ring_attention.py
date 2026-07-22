@@ -429,7 +429,7 @@ if __name__ == "__main__":
     ring = RingAttn(
         OperationMetadata(
             runtime_dtype=jnp.bfloat16,
-            base_config=EasyDeLBaseConfig(sharding_axis_dims=(1, 1, 1, 1, -1)),
+            base_config=EasyDeLBaseConfig(sharding_axis_dims=(1, 1, 1, 1, 1, -1)),
         )
     )
     from ejkernel.modules import attention  # pyright: ignore[reportMissingTypeStubs]

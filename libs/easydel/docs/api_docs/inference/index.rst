@@ -17,5 +17,6 @@ easydel.inference package
    openai_api_modules
    sampling_funcs
    sampling_params
+   speculative
    stream_protocol
    typed_models

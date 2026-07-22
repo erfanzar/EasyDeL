@@ -269,7 +269,7 @@ def run_batch(runner, prompts: list[list[int]], output_len: int, max_num_batched
         max_num_batched_tokens=max_num_batched_tokens,
         enable_prefix_caching=False,
         async_scheduling=bool(getattr(runner, "async_scheduling", False)),
-        num_speculative_tokens=0,
+        num_draft_tokens=0,
     )
 
     sampling = SamplingParams(max_tokens=output_len, temperature=0.0, top_p=1.0, ignore_eos=True)

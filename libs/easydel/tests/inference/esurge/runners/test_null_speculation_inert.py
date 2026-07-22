@@ -73,7 +73,7 @@ def _generate_tokens(runner: eSurgeRunner) -> list[int]:
         max_num_batched_tokens=16,
         enable_prefix_caching=False,
         async_scheduling=False,
-        num_speculative_tokens=runner.num_speculative_tokens,
+        num_draft_tokens=runner.num_draft_tokens,
     )
     request = EngineRequest(
         request_id="null-spec-0",
@@ -118,8 +118,8 @@ def test_null_speculation_inert():
     runner.compile(max_num_batched_tokens=16)
 
     assert isinstance(runner.spec, NullSpeculation), f"expected NullSpeculation, got {type(runner.spec)!r}"
-    assert runner.num_speculative_tokens == 0
-    assert runner.spec.num_speculative_tokens == 0
+    assert runner.num_draft_tokens == 0
+    assert runner.spec.num_draft_tokens == 0
 
     first = _generate_tokens(runner)
     second = _generate_tokens(runner)

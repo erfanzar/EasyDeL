@@ -497,13 +497,13 @@ You can use `-1` in `sharding_axis_dims` to let EasyDeL infer the remaining dime
 
 ```python
 # 8 devices, pure FSDP
-sharding_axis_dims = (1, 8, 1, 1, 1)
+sharding_axis_dims = (1, 1, 8, 1, 1, 1)
 
 # 8 devices, 2-way DP x 4-way FSDP
-sharding_axis_dims = (2, 4, 1, 1, 1)
+sharding_axis_dims = (1, 2, 4, 1, 1, 1)
 
 # 8 devices, 4-way FSDP x 2-way TP
-sharding_axis_dims = (1, 4, 1, 2, 1)
+sharding_axis_dims = (1, 1, 4, 1, 2, 1)
 ```
 </details>
 

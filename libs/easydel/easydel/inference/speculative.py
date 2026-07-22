@@ -131,8 +131,7 @@ class DrafterProtocol(typing.Protocol):
             ``False``).
         uses_mtp_cache: The drafter keeps an internal MTP KV cache that the
             runner should account for (default ``False``).
-        num_draft_tokens: Speculative tokens proposed per verify window (the
-            runner also accepts ``num_speculative_tokens`` as a fallback name).
+        num_draft_tokens: Speculative tokens proposed per verify window.
     """
 
     supports_return_full_log_probs: bool
@@ -1427,7 +1426,7 @@ class Qwen3_5MTPDrafter:
         seed_positions: jax.Array,
         committed_lens: jax.Array,
         collected_mask: jax.Array,
-        num_speculative_tokens: int,
+        num_draft_tokens: int,
     ) -> Int[Array, "pool k"]:
         """Draft ``k`` greedy tokens for every pool row in ONE batched pass.
 
@@ -1447,7 +1446,7 @@ class Qwen3_5MTPDrafter:
             collected_mask: ``(N,)`` boolean; ``True`` for rows actually drafted
                 this step. Non-collected rows ride the batched forward but have
                 their cache write index restored (never corrupted).
-            num_speculative_tokens: Number of draft tokens ``k`` per row.
+            num_draft_tokens: Number of draft tokens ``k`` per row.
 
         Returns:
             ``(N, k)`` device array of drafted token ids. Row ``r`` is valid only
@@ -1463,7 +1462,7 @@ class Qwen3_5MTPDrafter:
         mtp_cache = self._mtp_cache if self.uses_mtp_cache else None
         committed = jnp.asarray(committed_lens, dtype=jnp.int32).reshape(-1)
         mask = jnp.asarray(collected_mask).astype(bool).reshape(-1)
-        fn = self._get_batched_draft_fn(int(num_speculative_tokens), ids0, hidden0, pos0, mtp_cache)
+        fn = self._get_batched_draft_fn(int(num_draft_tokens), ids0, hidden0, pos0, mtp_cache)
         _gds, (mtp_st, embed_st, head_st), freqs, _tie = self._batched_bundle_graph_and_states()
         drafts, new_cache = fn(mtp_st, embed_st, head_st, freqs, ids0, hidden0, pos0, mtp_cache, committed, mask)
         if new_cache is not None:

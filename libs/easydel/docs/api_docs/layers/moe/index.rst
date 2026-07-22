@@ -5,4 +5,5 @@ easydel.layers.moe package
    :maxdepth: 2
 
    _communication_utils
+   _layout_planner
    _moe_module

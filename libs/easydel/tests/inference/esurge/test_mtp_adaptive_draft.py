@@ -14,7 +14,7 @@
 
 """Adaptive (early-exit) MTP draft length for eSurge speculative decoding.
 
-The fixed-K MTP drafter runs ``num_speculative_tokens`` sequential MTP forwards
+The fixed-K MTP drafter runs ``num_draft_tokens`` sequential MTP forwards
 per verify window regardless of how confident the drafter is; deep recursive
 drafts are weak and mostly rejected, so a large K overpays on the drafter cost.
 :meth:`Qwen3_5MTPDrafter.draft_adaptive` instead runs the whole ``k_max``-step
@@ -265,7 +265,7 @@ def _make_strategy(drafter: Qwen3_5MTPDrafter, n_rows: int, k: int) -> DrafterSp
     bookkeeping without standing up a full runner.
     """
     runner = types.SimpleNamespace(max_num_reqs=n_rows, max_num_seqs=n_rows)
-    return DrafterSpeculation(runner=runner, drafter=drafter, num_speculative_tokens=k)
+    return DrafterSpeculation(runner=runner, drafter=drafter, num_draft_tokens=k)
 
 
 def test_draft_next_adaptive_engages_via_env():

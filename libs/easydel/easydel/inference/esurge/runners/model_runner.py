@@ -366,16 +366,12 @@ class eSurgeRunner:
         self.drafter = drafter
         if self.drafter is not None and hasattr(self.drafter, "set_max_length"):
             self.drafter.set_max_length(int(max_model_len))
-        self.num_speculative_tokens = int(
-            getattr(drafter, "num_draft_tokens", getattr(drafter, "num_speculative_tokens", 1))
-            if drafter is not None
-            else 0
-        )
+        self.num_draft_tokens = int(getattr(drafter, "num_draft_tokens", 1) if drafter is not None else 0)
         self.spec: SpeculativeStrategy = (
             DrafterSpeculation(
                 runner=self,
                 drafter=self.drafter,
-                num_speculative_tokens=self.num_speculative_tokens,
+                num_draft_tokens=self.num_draft_tokens,
             )
             if self.drafter is not None
             else NullSpeculation()
@@ -482,13 +478,13 @@ class eSurgeRunner:
             max_token_size=max(int(self.max_model_len), int(self.max_num_batched_tokens)),
             padding_gap=0,
         )
-        if self.drafter is not None and int(self.num_speculative_tokens) > 0:
+        if self.drafter is not None and int(self.num_draft_tokens) > 0:
             # Speculative steady-state verify windows schedule EXACTLY
             # n_active * (1 + k) tokens. With power-of-two buckets those windows
             # pad 64->40, 128->80, 256->160 (~60% utilization), and most of the
             # verify forward's cost scales with the token bucket. Add an exact
             # spec bucket per request bucket so verify windows run tight.
-            window = int(self.num_speculative_tokens) + 1
+            window = int(self.num_draft_tokens) + 1
             max_bucket = max(int(self.max_model_len), int(self.max_num_batched_tokens))
             spec_buckets = {
                 int(reqs) * window
@@ -518,7 +514,7 @@ class eSurgeRunner:
         )
         spec_full_hidden_max_tokens = 0
         if drafter is not None:
-            spec_window_tokens = max(1, int(self.num_speculative_tokens) + 1)
+            spec_window_tokens = max(1, int(self.num_draft_tokens) + 1)
             if bool(getattr(drafter, "supports_prefix_draft", False)):
                 spec_window_tokens = max(spec_window_tokens, int(max_num_batched_tokens))
             spec_bucket_idx = bisect_left(self.num_tokens_paddings, spec_window_tokens)
@@ -531,7 +527,7 @@ class eSurgeRunner:
         has_recurrent_layers = any(str(layer_type).lower() in recurrent_layer_types for layer_type in layer_types)
         self._has_recurrent_layers = bool(has_recurrent_layers)
         self.spec_decode_recurrent_candidates = bool(
-            drafter is not None and int(self.num_speculative_tokens) > 0 and has_recurrent_layers
+            drafter is not None and int(self.num_draft_tokens) > 0 and has_recurrent_layers
         )
         # Greedy recurrent verify: how to advance the live recurrent (GDN) state
         # after a verify window.
@@ -565,7 +561,7 @@ class eSurgeRunner:
             pp_microbatch_size=pp_microbatch_size,
             full_hidden_state_max_tokens=spec_full_hidden_max_tokens,
             speculative_recurrent_state_tokens=(
-                int(self.num_speculative_tokens) + 1 if self.spec_decode_recurrent_candidates else 0
+                int(self.num_draft_tokens) + 1 if self.spec_decode_recurrent_candidates else 0
             ),
         )
         self.log_it = logger.info if verbose else logger.debug
@@ -3125,7 +3121,7 @@ class eSurgeRunner:
                     # Pad to a stable ``padded_num_reqs * (k+1)`` bucket so the
                     # on-demand LM-head executable count stays bounded (<= one
                     # per request bucket) instead of one per distinct row total.
-                    _pad_target = max(_total_rows, int(padded_num_reqs) * (int(self.num_speculative_tokens) + 1))
+                    _pad_target = max(_total_rows, int(padded_num_reqs) * (int(self.num_draft_tokens) + 1))
                     if _total_rows < _pad_target:
                         _flat_indices.extend([_flat_indices[0]] * (_pad_target - _total_rows))
                     _idx_arr = np.asarray(_flat_indices, dtype=np.int32)

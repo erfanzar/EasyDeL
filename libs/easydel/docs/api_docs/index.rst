@@ -15,5 +15,6 @@ easydel API Reference
    trainers/index
    utils/index
    workers/index
+   _linkup
    axis
    typings

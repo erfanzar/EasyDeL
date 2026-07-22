@@ -6,3 +6,4 @@ easydel.trainers._shared package
 
    preference_config_helpers
    preference_forward_helpers
+   sandbox

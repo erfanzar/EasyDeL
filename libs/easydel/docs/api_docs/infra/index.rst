@@ -14,5 +14,7 @@ easydel.infra package
    factory
    loss_utils
    modeling_outputs
+   sequence_packing
    sharding
+   spec_decode
    utils

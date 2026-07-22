@@ -321,7 +321,7 @@ class DPScheduler(SchedulerInterface):
         chunked_prefill_enabled: bool = False,
         token_safety_margin: int | None = None,
         policy: typing.Literal["priority", "fcfs"] = "fcfs",
-        num_speculative_tokens: int = 0,
+        num_draft_tokens: int = 0,
         use_eagle: bool = False,
         include_finished_set: bool = False,
         use_worker_processes: bool = True,
@@ -382,7 +382,7 @@ class DPScheduler(SchedulerInterface):
                 chunked_prefill_enabled=chunked_prefill_enabled,
                 token_safety_margin=token_safety_margin,
                 policy=policy,
-                num_speculative_tokens=num_speculative_tokens,
+                num_draft_tokens=num_draft_tokens,
                 use_eagle=use_eagle,
                 include_finished_set=include_finished_set,
             )
@@ -424,7 +424,7 @@ class DPScheduler(SchedulerInterface):
         enable_prefix_caching: bool = True,
         async_scheduling: bool = True,
         long_prefill_token_threshold: int | None = None,
-        num_speculative_tokens: int = 0,
+        num_draft_tokens: int = 0,
     ) -> DPScheduler:
         from ..core.interface import create_kv_cache_specs_from_config
 
@@ -456,7 +456,7 @@ class DPScheduler(SchedulerInterface):
             max_num_seq_buckets=list(runner.max_num_seq_buckets) if runner.max_num_seq_buckets else None,
             async_scheduling=async_scheduling,
             long_prefill_token_threshold=long_prefill_token_threshold,
-            num_speculative_tokens=int(num_speculative_tokens),
+            num_draft_tokens=int(num_draft_tokens),
         )
 
     @property

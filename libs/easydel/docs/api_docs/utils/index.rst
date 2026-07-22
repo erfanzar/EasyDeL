@@ -7,6 +7,8 @@ easydel.utils package
    analyze_memory
    checkpoint_compat
    compiling_utils
+   flags
+   graph_jit
    helpers
    inference_mode
    instrumentation

@@ -4,6 +4,7 @@ easydel.caching package
 .. toctree::
    :maxdepth: 2
 
+   compressed_window/index
    hybrid/index
    kda/index
    lightning/index

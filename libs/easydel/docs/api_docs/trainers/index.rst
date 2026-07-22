@@ -6,35 +6,59 @@ easydel.trainers package
 
    _shared/index
    agentic_moshpit/index
+   async_grpo_trainer/index
+   bema_trainer/index
    binary_classifier_optimization_trainer/index
    contrastive_preference_optimization_trainer/index
    direct_preference_optimization_trainer/index
    distillation_trainer/index
+   dppo_trainer/index
    embedding_trainer/index
+   esurge_rollout/index
    generalized_knowledge_distillation_trainer/index
+   gold_trainer/index
    group_filtered_policy_optimization/index
    group_relative_policy_optimization/index
    group_sequence_policy_optimization/index
+   grpo_replay_buffer_trainer/index
+   gspo_token_trainer/index
    kto_trainer/index
+   merge_callback/index
+   minillm_trainer/index
    nash_md_trainer/index
+   nemo_gym_trainer/index
    odds_ratio_preference_optimization_trainer/index
    on_policy_distillation_trainer/index
+   online_dpo_trainer/index
+   papo_trainer/index
+   prm_trainer/index
    proximal_policy_optimization_trainer/index
    ray_scaler/index
    reward_trainer/index
+   rloo_trainer/index
    rlvr_trainer/index
+   sdft_trainer/index
    self_distillation_policy_optimization/index
    seq_kd_trainer/index
    sparse_distillation_trainer/index
+   speculative_decoding_trainer/index
+   ssd_trainer/index
    supervised_fine_tuning_trainer/index
+   tpo_trainer/index
    trainer/index
    xpo_trainer/index
    _logprob_utils
    base_trainer
+   batch_prefetcher
+   buckets
+   fused_optimizers
    metrics
+   model_loading
    packer
+   pose
    prompt_transforms
    prompt_utils
+   reward_protocol
    trainer_protocol
    training_configurations
    training_utils

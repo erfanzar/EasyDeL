@@ -117,7 +117,7 @@ def reset_runner(runner):
 
 def run_batch(runner, prompts, output_len, max_num_batched_tokens):
     """Continuous-batching loop (mirrors scripts/bench_esurge.run_batch) with the
-    correct num_speculative_tokens for the runner."""
+    correct num_draft_tokens for the runner."""
     from easydel.inference.esurge.benchmarking import all_finished
     from easydel.inference.esurge.benchmarking import zero_schedule_needs_update as zero_needs_update
     from easydel.inference.esurge.request import EngineRequest
@@ -127,13 +127,13 @@ def run_batch(runner, prompts, output_len, max_num_batched_tokens):
     reset_runner(runner)
     # Speculative decoding drives draft/verify/commit inside the synchronous
     # execute_model path; the async dispatch path does not advance it.
-    use_async = bool(getattr(runner, "async_scheduling", False)) and int(runner.num_speculative_tokens) == 0
+    use_async = bool(getattr(runner, "async_scheduling", False)) and int(runner.num_draft_tokens) == 0
     scheduler = Scheduler.from_runner(
         runner,
         max_num_batched_tokens=max_num_batched_tokens,
         enable_prefix_caching=False,
         async_scheduling=use_async,
-        num_speculative_tokens=runner.num_speculative_tokens,
+        num_draft_tokens=runner.num_draft_tokens,
     )
     sampling = SamplingParams(max_tokens=output_len, temperature=0.0, top_p=1.0, ignore_eos=True)
     requests = []
@@ -324,7 +324,7 @@ def build_runner(model, *, drafter, args):
     runner._vocab_size = int(getattr(tc, "vocab_size", 151936))
     print(
         f"  runner: token_buckets={runner.num_tokens_paddings} req_buckets={runner.max_num_seq_buckets} "
-        f"num_spec={runner.num_speculative_tokens}",
+        f"num_spec={runner.num_draft_tokens}",
         flush=True,
     )
     t0 = time.perf_counter()

@@ -98,7 +98,7 @@ def _fake_project(_self, hidden_rows):
 
 def _fake_draft_next(self, *, req_id, seed_token, seed_position, seed_hidden, req_state, row_pos=None, **kw):
     """Deterministic drafts from host ints (no drafter forward -> no ULP noise)."""
-    k = int(self.num_speculative_tokens)
+    k = int(self.num_draft_tokens)
     base = int(seed_token) * 3 + int(seed_position) + 1
     return [int((base + i * 5) % _VOCAB) for i in range(k)]
 
@@ -183,7 +183,7 @@ def _run(model, *, n, k, disable_emit, prompts, project_rows):
 
         sch = Scheduler.from_runner(
             runner, max_num_batched_tokens=64, enable_prefix_caching=False,
-            async_scheduling=False, num_speculative_tokens=runner.num_speculative_tokens,
+            async_scheduling=False, num_draft_tokens=runner.num_draft_tokens,
         )
         reqs = []
         for i in range(n):
