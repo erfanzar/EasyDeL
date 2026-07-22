@@ -397,13 +397,14 @@ class Qwen3_5MTPDrafter:
         hidden: Float[Array, "batch seq hidden"],
         pos: Int[Array, "batch seq"] | None,
         cache: TransformerCache | None,
+        row: jax.Array | None = None,
     ) -> tuple[Float[Array, "batch seq hidden"], Float[Array, "batch seq vocab"], TransformerCache | None]:
         """One inline-MTP-head forward from its constituent modules.
 
-        Same numerics as ``_mtp_forward_compute`` (no row targeting), but the
-        target model's pieces are passed in explicitly so the batched-draft
-        jit can thread ONLY their (small) States as inputs instead of the full
-        model State — see ``_batched_bundle_graph_and_states``.
+        Same numerics as ``_mtp_forward_compute``, but the target model's
+        pieces are passed in explicitly so the drafter jits can thread ONLY
+        their (small) States as inputs instead of the full model State — see
+        ``_batched_bundle_graph_and_states``.
 
         Args:
             mtp: The inline MTP block (``model.mtp``).
@@ -417,10 +418,33 @@ class Qwen3_5MTPDrafter:
             hidden: ``(batch, seq, hidden)`` target hidden rows to fuse.
             pos: Absolute positions for ``hidden``; ``None`` builds ``arange``.
             cache: Inline-MTP ``TransformerCache`` to read/advance, or ``None``.
+            row: Optional traced batch row for per-request row targeting: the
+                pool cache is sliced down to this row for a batch-1 forward and
+                the advanced view scattered back (same semantics as
+                ``_mtp_forward_compute``'s ``row``).
 
         Returns:
             ``(hidden_out, logits, new_cache)``.
         """
+
+        def _slice_view_row(view, row_):
+            """Slice a batch-N cache view down to a batch-1 view at ``row``."""
+            return view.replace(
+                key=jax.lax.dynamic_slice_in_dim(view.key, row_, 1, axis=0),
+                value=jax.lax.dynamic_slice_in_dim(view.value, row_, 1, axis=0),
+                indexes=jax.lax.dynamic_slice_in_dim(view.indexes, row_, 1, axis=0),
+                starts=jax.lax.dynamic_slice_in_dim(view.starts, row_, 1, axis=0),
+            )
+
+        def _scatter_view_row(full, updated, row_):
+            """Write a batch-1 updated view back into ``row`` of the pool view."""
+            return full.replace(
+                key=jax.lax.dynamic_update_slice_in_dim(full.key, updated.key, row_, axis=0),
+                value=jax.lax.dynamic_update_slice_in_dim(full.value, updated.value, row_, axis=0),
+                indexes=jax.lax.dynamic_update_slice_in_dim(full.indexes, updated.indexes, row_, axis=0),
+                starts=jax.lax.dynamic_update_slice_in_dim(full.starts, updated.starts, row_, axis=0),
+            )
+
         next_embeds = embed_module(ids.astype("i4"))
         normed_e = mtp.pre_fc_norm_embedding(next_embeds)
         normed_h = mtp.pre_fc_norm_hidden(hidden)
@@ -438,7 +462,8 @@ class Qwen3_5MTPDrafter:
         new_views = []
         mtp_mode = common_types.MODE_PREFILL if ids.shape[1] > 1 else common_types.MODE_DECODE
         for layer in mtp.layers:
-            cv_in = views[layer.layer_idx] if views is not None and layer.layer_idx < len(views) else None
+            cv_full = views[layer.layer_idx] if views is not None and layer.layer_idx < len(views) else None
+            cv_in = _slice_view_row(cv_full, row) if (cv_full is not None and row is not None) else cv_full
             cache_metadata = (
                 TransformerMetadata(
                     postpadded=False,
@@ -457,6 +482,8 @@ class Qwen3_5MTPDrafter:
                 cache_metadata,
                 frequencies,
             )
+            if cv_full is not None and row is not None:
+                _cache_view = _scatter_view_row(cv_full, _cache_view, row)
             new_views.append(_cache_view)
         h = mtp.norm(h)
         new_cache = TransformerCache(views=new_views) if cache is not None else None
@@ -876,37 +903,61 @@ class Qwen3_5MTPDrafter:
                 )
             else:
                 _ = self._mtp_forward_compute(self.model, input_ids, target_hidden_states, position_ids, mtp_cache, None)
-            # Thread the model weights through the jit as a State INPUT (see
-            # ``_model_graph_and_state``): the compiled program references the
-            # resident weight buffers instead of baking a copy of them in as
-            # captured constants. ``graphdef`` is static (closed over); the
-            # ``state`` passed at call time is a runtime argument, so it never
-            # enters the compile ``key``.
-            graphdef, _ = self._model_graph_and_state()
+            # Thread ONLY the MTP-touched submodules' States through the jit as
+            # inputs (see ``_batched_bundle_graph_and_states``): a few dozen
+            # leaves instead of the full model State (1100+ leaves whose
+            # per-call re-export + dispatch dominated the per-request draft).
+            graphdefs, _states, _freqs, tie_embeddings = self._batched_bundle_graph_and_states()
+            mtp_gd, embed_gd, head_gd = graphdefs
             if use_row:
 
                 @jax.jit
-                def _fn(state, ids, hidden, pos, cache, row):
-                    return self._mtp_forward_compute(spx.bind(graphdef, state), ids, hidden, pos, cache, row)
+                def _fn(mtp_st, embed_st, head_st, freqs, ids, hidden, pos, cache, row):
+                    return self._mtp_forward_compute_parts(
+                        spx.bind(mtp_gd, mtp_st),
+                        spx.bind(embed_gd, embed_st),
+                        spx.bind(head_gd, head_st),
+                        freqs,
+                        tie_embeddings,
+                        ids,
+                        hidden,
+                        pos,
+                        cache,
+                        row,
+                    )
             else:
 
                 @jax.jit
-                def _fn(state, ids, hidden, pos, cache):
-                    return self._mtp_forward_compute(spx.bind(graphdef, state), ids, hidden, pos, cache, None)
+                def _fn(mtp_st, embed_st, head_st, freqs, ids, hidden, pos, cache):
+                    return self._mtp_forward_compute_parts(
+                        spx.bind(mtp_gd, mtp_st),
+                        spx.bind(embed_gd, embed_st),
+                        spx.bind(head_gd, head_st),
+                        freqs,
+                        tie_embeddings,
+                        ids,
+                        hidden,
+                        pos,
+                        cache,
+                        None,
+                    )
 
             fn = _fn
             self._jit_mtp[key] = fn
-        _, state = self._model_graph_and_state()
+        _gds, (mtp_st, embed_st, head_st), freqs, _tie = self._batched_bundle_graph_and_states()
         if use_row:
             return fn(
-                state,
+                mtp_st,
+                embed_st,
+                head_st,
+                freqs,
                 input_ids,
                 target_hidden_states,
                 position_ids,
                 mtp_cache,
                 jnp.asarray(int(row_pos), dtype=jnp.int32),
             )
-        return fn(state, input_ids, target_hidden_states, position_ids, mtp_cache)
+        return fn(mtp_st, embed_st, head_st, freqs, input_ids, target_hidden_states, position_ids, mtp_cache)
 
     def draft(
         self,
