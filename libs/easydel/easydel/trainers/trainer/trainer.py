@@ -303,7 +303,10 @@ class Trainer(BaseTrainer):
         sharded_evaluation_step_function = compile_trainer_step(
             evaluation_step,
             static_argnums=(2, 3),
-            in_shardings=(self.state_shardings, empty_sharding),
+            # eval_state_shardings carries the eval-override graphdef when
+            # `eval_config_overrides` is active (state_shardings otherwise);
+            # _execute_eval_step swaps the same graphdef into the state.
+            in_shardings=(self.eval_state_shardings, empty_sharding),
             out_shardings=(empty_sharding),
             schedule=self.arguments.mpmd_scheduler,
             arguments=self.arguments,
@@ -1091,8 +1094,12 @@ class Trainer(BaseTrainer):
             batch=batch,
             is_train=False,
         )
+        # Swap in the eval-override graphdef (e.g. vanilla attention) when
+        # configured; a cheap static swap sharing all buffers. The training
+        # state is untouched — eval returns metrics only.
+        eval_state = self._eval_state_for_compiled_step(state)
         metrics = self.sharded_evaluation_step_function(
-            state,
+            eval_state,
             batch,
             *self._eval_shared_fn_extra_args,
             *self._eval_shared_fn_static_args,

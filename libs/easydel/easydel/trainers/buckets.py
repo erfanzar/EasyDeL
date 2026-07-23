@@ -310,6 +310,37 @@ class TrainingBucket:
     # not on this dataclass, to keep it free of dataset/dataloader imports.
 
 
+def apply_config_overrides(
+    base_config: "EasyDeLBaseConfig",
+    overrides: dict[str, tp.Any],
+    *,
+    label: str,
+) -> "EasyDeLBaseConfig":
+    """Return a deep copy of ``base_config`` with ``overrides`` applied via ``setattr``.
+
+    Shared by per-bucket config resolution and the trainer-level
+    ``eval_config_overrides`` path so both validate keys identically.
+
+    Args:
+            base_config: The config to copy and override; never mutated.
+            overrides: Field-name -> value overrides.
+            label: Human-readable origin used in error messages
+                    (e.g. a bucket name or ``"eval_config_overrides"``).
+
+    Returns:
+            The overridden deep copy.
+
+    Raises:
+            AttributeError: if an override key is not a field of the base config.
+    """
+    cfg = copy.deepcopy(base_config)
+    for key, value in overrides.items():
+        if not hasattr(cfg, key):
+            raise AttributeError(f"{label}: base config has no field {key!r} to override.")
+        setattr(cfg, key, value)
+    return cfg
+
+
 def resolve_bucket_config(
     base_config: "EasyDeLBaseConfig",
     bucket: TrainingBucket,
@@ -332,11 +363,6 @@ def resolve_bucket_config(
     if bucket.config is None:
         return base_config
     if isinstance(bucket.config, dict):
-        cfg = copy.deepcopy(base_config)
-        for key, value in bucket.config.items():
-            if not hasattr(cfg, key):
-                raise AttributeError(f"Bucket {bucket.name!r}: base config has no field {key!r} to override.")
-            setattr(cfg, key, value)
-        return cfg
+        return apply_config_overrides(base_config, bucket.config, label=f"Bucket {bucket.name!r}")
     # Already an EasyDeLBaseConfig (or compatible): use as-is.
     return bucket.config
