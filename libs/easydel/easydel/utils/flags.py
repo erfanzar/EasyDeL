@@ -221,3 +221,7 @@ EASYDEL_DISABLE_DYNAMIC_SPEC = _register(
     "EASYDEL_DISABLE_DYNAMIC_SPEC", "bool", False, "eSurge spec-decode",
     "A/B escape hatch: force the static num_draft_tokens (ignore num_draft_tokens_per_batch_size schedules).",
 )
+EASYDEL_DISABLE_DRAFT_IN_VERIFY = _register(
+    "EASYDEL_DISABLE_DRAFT_IN_VERIFY", "bool", False, "eSurge spec-decode",
+    "A/B escape hatch: force the two-dispatch verify->draft flow instead of the fused draft-in-verify program.",
+)
