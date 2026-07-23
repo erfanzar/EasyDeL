@@ -424,10 +424,17 @@ class Trainer(BaseTrainer):
             pbar.update(min(initial_step, self.max_training_steps))
             start_epoch = self._get_resume_epoch(initial_step)
             if initial_step < self.max_training_steps:
-                logger.info(
-                    f"Resuming training from step {initial_step}; fast-forwarding dataloader by {initial_step} batches."
-                )
-                train_iter = self._fast_forward_batches(train_iter, self.dataloader_train, initial_step)
+                if getattr(self.arguments, "dataloader_fast_forward_on_resume", True):
+                    logger.info(
+                        f"Resuming training from step {initial_step}; fast-forwarding dataloader by "
+                        f"{initial_step} batches."
+                    )
+                    train_iter = self._fast_forward_batches(train_iter, self.dataloader_train, initial_step)
+                else:
+                    logger.info(
+                        f"Resuming training from step {initial_step} WITHOUT dataloader fast-forward "
+                        "(dataloader_fast_forward_on_resume=False); the train stream restarts from batch 0."
+                    )
             else:
                 logger.info(
                     f"Resumed state is already at step {initial_step}, which is at or beyond "

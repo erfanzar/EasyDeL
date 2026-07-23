@@ -269,3 +269,34 @@ class TestEvalConfigOverrideGuards:
     def test_structure_changing_override_fails_at_construction(self, tmp_path):
         with pytest.raises(ValueError, match="parameter structure"):
             _make_trainer(tmp_path, eval_config_overrides={"num_hidden_layers": 1})
+
+
+class TestDataloaderFastForwardOnResume:
+    """`dataloader_fast_forward_on_resume=False` resumes without seeking the
+    train stream — the escape hatch for pack-on-the-fly sources where a
+    sequential skip re-renders the whole consumed prefix."""
+
+    @pytest.mark.parametrize("fast_forward", [True, False])
+    def test_resume_honors_fast_forward_flag(self, tmp_path, fast_forward):
+        trainer = _make_trainer(tmp_path / str(fast_forward), eval_config_overrides=None)
+        trainer.arguments.dataloader_fast_forward_on_resume = fast_forward
+        resume_step = 2
+        trainer.model_state = trainer.model_state.replace(
+            step=jnp.asarray(resume_step, dtype=trainer.model_state.step.dtype)
+        )
+
+        forwarded = []
+        inner_fast_forward = trainer._fast_forward_batches
+
+        def fast_forward_spy(data_iter, dataloader, num_batches):
+            forwarded.append(int(num_batches))
+            return inner_fast_forward(data_iter, dataloader, num_batches)
+
+        trainer._fast_forward_batches = fast_forward_spy
+
+        output = trainer.train()
+        assert int(jax.device_get(output.state.step)) == 4
+        if fast_forward:
+            assert forwarded == [resume_step]
+        else:
+            assert forwarded == []

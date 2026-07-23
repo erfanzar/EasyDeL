@@ -88,6 +88,7 @@ def _full_training_arguments_kwargs() -> dict[str, Any]:
         # Lifecycle flags
         "do_train": True,
         "do_eval": True,
+        "dataloader_fast_forward_on_resume": False,
         "do_last_save": False,
         "is_fine_tuning": False,
         "init_tx": False,
