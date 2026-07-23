@@ -338,6 +338,18 @@ class TrainingArguments:
             )
         },
     )
+    dataloader_fast_forward_on_resume: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Fast-forward/seek the train dataloader by the resumed global step at the start of "
+                "training. Disable for streaming pack-on-the-fly sources where no cheap seek exists and "
+                "a sequential skip would re-render/re-pack the entire consumed prefix; the stream then "
+                "restarts from batch 0 (same behavior training buckets document on resume) while the "
+                "optimizer/scheduler/step state still resumes correctly."
+            )
+        },
+    )
     do_eval: bool = field(
         default=False,
         metadata={"help": "Whether to run evaluation during training."},
