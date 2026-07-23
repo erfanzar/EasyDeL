@@ -687,6 +687,7 @@ class ParallelLinearQuantized(spx.Module):
         qmm_tpu_auto_xla_max_m: int | None = 1024,
         qmm_policy_table: dict[str, tp.Any] | None = None,
         qmm_allow_input_all_gather: bool = False,
+        layout: tp.Any | None = None,
         rngs: spx.Rngs,
     ):
         """Initialize a quantized parallel linear layer.
@@ -736,6 +737,11 @@ class ParallelLinearQuantized(spx.Module):
             qmm_allow_input_all_gather: Whether column-parallel execution may
                 all_gather local input K slices when they mismatch the local
                 kernel shard. Defaults to False to avoid OOM.
+            layout: Optional fused projection layout carried over from the
+                dense layer. Consumers (e.g. UnifiedAttention) use it to split
+                fused activations TP-interleave-aware; dropping it silently
+                falls back to a contiguous split, which scrambles Q/K/V under
+                tensor parallelism.
             rngs: SpecTrax random number generators for initialization.
 
         Raises:
@@ -746,6 +752,7 @@ class ParallelLinearQuantized(spx.Module):
         # Fused projections pass a sequence of output widths (e.g. qkv = (q, k, v));
         # the stored quantized kernel/bias use the summed width like the dense layer.
         out_features_sum = sum(out_features) if isinstance(out_features, (tuple, list)) else out_features
+        self.out_features_sum = int(out_features_sum)
         self.use_bias = use_bias
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -762,6 +769,7 @@ class ParallelLinearQuantized(spx.Module):
         self.qmm_tpu_auto_xla_max_m = qmm_tpu_auto_xla_max_m
         self.qmm_policy_table = qmm_policy_table
         self.qmm_allow_input_all_gather = bool(qmm_allow_input_all_gather)
+        self.layout = layout
         self.rngs = rngs
         # Set by _quantize_array during __init__; used by _resolve_ejkernel_params afterwards.
         self._ej_group_size: int | None = None
@@ -795,6 +803,32 @@ class ParallelLinearQuantized(spx.Module):
                 bias_init(rngs.parameters, (out_features_sum,), param_dtype),
                 sharding=sharding_for_layout(layout_specs.get("bias")),
             )
+        else:
+            # Mirror ParallelLinear's attribute surface: consumers read `.bias`
+            # directly (e.g. fused gate/up separate-projection guards).
+            self.bias = None
+
+    def split(self, outputs: Array, *, config: tp.Any | None = None) -> tuple[Array, ...]:
+        """Split outputs with the projection's fused layout (mirrors :class:`ParallelLinear`)."""
+        if self.layout is None:
+            raise ValueError("This quantized linear layer does not carry a fused projection layout.")
+        return self.layout.split(outputs, config=config)
+
+    def build_reform_param(
+        self,
+        target_prefix: str,
+        *,
+        config: tp.Any | None = None,
+        include_bias: bool | None = None,
+    ) -> dict:
+        """Build checkpoint reform rules from the projection's fused layout (mirrors :class:`ParallelLinear`)."""
+        if self.layout is None:
+            raise ValueError("This quantized linear layer does not carry a fused projection layout.")
+        return self.layout.reform_param(
+            target_prefix,
+            config=config,
+            include_bias=self.use_bias if include_bias is None else include_bias,
+        )
 
     def _qmm_runtime_kwargs(
         self,
@@ -1069,6 +1103,7 @@ class ParallelLinearQuantized(spx.Module):
                 precision=self.precision,
                 kernel_init=self.kernel_init,
                 bias_init=self.bias_init,
+                layout=getattr(self, "layout", None),
                 rngs=r,
             ),
             rngs,
@@ -1482,7 +1517,7 @@ class ParallelLinearQuantized(spx.Module):
                 group_size=group_size,
                 bits=bits,
                 mode=mode,
-            ).reshape((*inputs.shape[:-1], self.out_features))
+            ).reshape((*inputs.shape[:-1], self.out_features_sum))
 
             if self.dtype is not None:
                 out = out.astype(self.dtype)
