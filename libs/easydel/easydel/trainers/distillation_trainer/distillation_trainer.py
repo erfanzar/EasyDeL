@@ -430,11 +430,17 @@ class DistillationTrainer(Trainer):
             bool(self.arguments.teacher_matched_compilation),
         )
 
+        # The eval step may run under `eval_config_overrides` (e.g. vanilla
+        # attention): compile it against the eval-graphdef shardings for BOTH
+        # the student (eval_state_shardings) and the teacher (the swapped
+        # teacher state built by _configure_eval_config_override) so the
+        # sharding trees match the states passed at call time.
+        eval_teacher_state = getattr(self, "_eval_teacher_state", None) or self.teacher_state
         self._runtime_trace("eval.compile_wrapper.begin")
         if self.arguments.mpmd_scheduler is None:
             sharded_evaluation_step_function = spx.jit(
                 distillation_step,
-                in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
+                in_shardings=(self.eval_state_shardings, empty_sharding, eval_teacher_state.shardings),
                 out_shardings=empty_sharding,
                 static_argnums=static_argnums,
                 **_step_jit_options,
@@ -442,7 +448,7 @@ class DistillationTrainer(Trainer):
         else:
             sharded_evaluation_step_function = compile_trainer_step(
                 distillation_step,
-                in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
+                in_shardings=(self.eval_state_shardings, empty_sharding, eval_teacher_state.shardings),
                 out_shardings=empty_sharding,
                 static_argnums=static_argnums,
                 mesh=self.model.mesh,
@@ -661,9 +667,38 @@ class DistillationTrainer(Trainer):
         """Extra positional args appended to every compiled evaluation step call.
 
         Same as :attr:`_train_shared_fn_extra_args` — the evaluation step uses
-        the same compiled function with ``is_train=False`` in its static args.
+        the same compiled function with ``is_train=False`` in its static args —
+        except under ``eval_config_overrides``, where the teacher state carrying
+        the eval graphdef (e.g. vanilla attention) is passed instead so the
+        teacher forward also runs on the overridden config.
         """
+        eval_teacher_state = getattr(self, "_eval_teacher_state", None)
+        if eval_teacher_state is not None:
+            return (eval_teacher_state,)
         return (self.teacher_state,)
+
+    def _configure_eval_config_override(self):
+        """Extend the base override with a matching teacher-side eval graphdef.
+
+        Distillation's compiled eval step consumes ``teacher_state`` as a
+        regular input; evaluating the student on an overridden config while the
+        teacher keeps the training config would score the eval KL/entropy
+        against a mismatched reference, so the same overrides are applied to a
+        teacher graphdef variant (buffers shared, teacher stays frozen).
+        """
+        super()._configure_eval_config_override()
+        self._eval_teacher_state = None
+        if self._eval_graphdef is None:
+            return
+        teacher_graphdef = self._build_config_override_graphdef(
+            model=self.teacher_state.model,
+            overrides=self.arguments.eval_config_overrides,
+            reference_graphstate=self.teacher_state.graphstate,
+            trainable_selector=None,
+            label="eval_config_overrides (teacher)",
+            eval_mode=True,
+        )
+        self._eval_teacher_state = self.teacher_state.replace(graphdef=teacher_graphdef)
 
     # -- Training-bucket hooks (see BaseTrainer._compile_bucket_step_functions) --
     # Without these overrides, buckets compiled the BASE Trainer's

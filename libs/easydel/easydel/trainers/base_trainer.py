@@ -97,6 +97,7 @@ from .buckets import (
     PiecewiseBucketRule,
     StepThresholdRule,
     TrainingBucket,
+    apply_config_overrides,
     resolve_bucket_config,
 )
 from .metrics import BaseProgressBar, JSONProgressBar, NullProgressBar, RichProgressBar, TqdmProgressBar
@@ -2386,6 +2387,9 @@ class BaseTrainer(BaseTrainerProtocol):
 
         self.state_shardings = getattr(self, "state_shardings", None)
         self.model_state = getattr(self, "model_state", None)
+        # Eval-only graphdef variant built from `arguments.eval_config_overrides`
+        # (None when evaluation runs with the training config).
+        self._eval_graphdef = getattr(self, "_eval_graphdef", None)
 
         self._training_time_start = getattr(self, "_training_time_start", None)
         self._evaluation_time_start = getattr(self, "_evaluation_time_start", None)
@@ -5025,6 +5029,7 @@ class BaseTrainer(BaseTrainerProtocol):
             ("configure_model", self._configure_model),
             ("configure_state", self._configure_state),
             ("configure_buckets", self._configure_buckets),
+            ("configure_eval_config_override", self._configure_eval_config_override),
             ("configure_functions", self._configure_functions),
         ):
             self._runtime_trace(f"{name}.begin")
@@ -5230,6 +5235,115 @@ class BaseTrainer(BaseTrainerProtocol):
                 )
         self.timer.log("configure buckets")
         self._runtime_trace("_configure_buckets.done", num_buckets=len(self._buckets))
+
+    def _build_config_override_graphdef(
+        self,
+        *,
+        model,
+        overrides: dict[str, tp.Any],
+        reference_graphstate,
+        trainable_selector,
+        label: str,
+        eval_mode: bool = False,
+    ):
+        """Build a structure-matched graphdef variant of ``model`` from config overrides.
+
+        Mirrors the per-bucket variant construction in :meth:`_configure_buckets`:
+        the overridden config is baked into a fresh ``lazy_init`` module (so
+        graphdef-static knobs like ``attn_mechanism`` take effect) whose
+        graphstate structure must match ``reference_graphstate`` — the variant
+        shares the caller's parameter/optimizer buffers and never copies them.
+
+        Args:
+            model: The base module whose class/dtypes/config are mirrored.
+            overrides: Config field overrides (``setattr`` on a deep copy).
+            reference_graphstate: Graphstate whose tree structure the variant
+                must preserve (the state that will be run under the new graphdef).
+            trainable_selector: Selector forwarded to ``split_module`` so the
+                variant splits identically to the reference state.
+            label: Origin tag for error messages.
+            eval_mode: Put the variant module in eval mode before splitting
+                (matches frozen reference/teacher states exported after
+                ``.eval()``).
+
+        Returns:
+            The variant module's graphdef.
+
+        Raises:
+            ValueError: if the overrides change the parameter tree structure.
+        """
+        import spectrax as spx
+
+        cfg = apply_config_overrides(model.config, overrides, label=label)
+        module = type(model).lazy_init(
+            config=cfg,
+            dtype=model.dtype,
+            param_dtype=model.param_dtype,
+            precision=model.precision,
+            rngs=spx.Rngs(0),
+        )
+        if eval_mode:
+            module.eval()
+        graphdef, graphstate, _ = module.split_module(trainable_selector=trainable_selector)
+        if jax.tree_util.tree_structure(graphstate) != jax.tree_util.tree_structure(reference_graphstate):
+            raise ValueError(
+                f"{label}: overrides {overrides!r} change the parameter structure; only "
+                "structure-preserving config overrides (e.g. attn_mechanism) are allowed."
+            )
+        return graphdef
+
+    def _configure_eval_config_override(self):
+        """Build the eval-only graphdef from ``arguments.eval_config_overrides``.
+
+        Runs after :meth:`_configure_state` (state sharded, ``state_shardings``
+        set) and before :meth:`_configure_functions` so flavors can compile
+        their evaluation step against :attr:`eval_state_shardings`. No-op when
+        the override is unset. Flavors carrying auxiliary states through the
+        eval step (e.g. distillation's teacher) extend this to build their own
+        swapped variants.
+        """
+        overrides = getattr(self.arguments, "eval_config_overrides", None)
+        if not overrides:
+            self._eval_graphdef = None
+            self._runtime_trace("_configure_eval_config_override.skipped", reason="no overrides")
+            return
+        self._eval_graphdef = self._build_config_override_graphdef(
+            model=self.model_state.model,
+            overrides=overrides,
+            reference_graphstate=self.model_state.graphstate,
+            trainable_selector=self.arguments.trainable_selector,
+            label="eval_config_overrides",
+        )
+        logger.info("Evaluation config override active: %s (dedicated eval graphdef built).", overrides)
+        self._runtime_trace("_configure_eval_config_override.done", overrides=tuple(overrides.keys()))
+
+    @property
+    def eval_state_shardings(self):
+        """State shardings for the compiled evaluation step.
+
+        Identical to :attr:`state_shardings` unless ``eval_config_overrides``
+        is active, in which case the eval graphdef is swapped in — the
+        graphdef is a static pytree field, so the sharding tree passed to the
+        compile must carry the same graphdef as the state passed at call time
+        (see :meth:`_bucket_step_compile_kwargs` for the matching bucket rule).
+        """
+        state_shardings = self.state_shardings
+        eval_graphdef = getattr(self, "_eval_graphdef", None)
+        if eval_graphdef is not None and hasattr(state_shardings, "replace"):
+            state_shardings = state_shardings.replace(graphdef=eval_graphdef)
+        return state_shardings
+
+    def _eval_state_for_compiled_step(self, state):
+        """Swap the eval-override graphdef into ``state`` for a compiled eval call.
+
+        Cheap static swap (graphdef is ``pytree_node=False``); parameter and
+        optimizer buffers are shared. The caller keeps its original state for
+        training — evaluation returns metrics only, so nothing is restored.
+        """
+        eval_graphdef = getattr(self, "_eval_graphdef", None)
+        if eval_graphdef is None:
+            return state
+        return state.replace(graphdef=eval_graphdef)
 
     def _prepare_bucket_source(
         self,
@@ -6721,7 +6835,9 @@ class BaseTrainer(BaseTrainerProtocol):
             self.sharded_evaluation_step_function = compile_function(
                 self.sharded_evaluation_step_function,
                 self.dataloader_eval,
-                self.model_state,
+                # The eval step is compiled against the eval-override graphdef
+                # (when configured); lowering must see the same static graphdef.
+                self._eval_state_for_compiled_step(self.model_state),
                 "trainer.sharded_evaluation_step_function",
             )
             compiled = True

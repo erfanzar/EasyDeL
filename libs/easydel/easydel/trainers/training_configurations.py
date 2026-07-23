@@ -354,6 +354,20 @@ class TrainingArguments:
         default=None,
         metadata={"help": "The batch size to use for evaluation."},
     )
+    eval_config_overrides: dict | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Model-config overrides applied ONLY to the evaluation forward, e.g. "
+                "{'attn_mechanism': 'vanilla'} to evaluate on the reference attention kernel while "
+                "training on a sparse one. Like training buckets, this builds a separate structure-"
+                "preserving graphdef via lazy_init and swaps it into the state for the compiled eval "
+                "step; parameter/optimizer buffers are shared, never copied, and never mutated by "
+                "evaluation. Only structure-preserving keys are allowed. None (default) evaluates "
+                "with the training config."
+            )
+        },
+    )
     evaluation_steps: int | None = field(
         default=None,
         metadata={"help": "Run evaluation every X steps."},
