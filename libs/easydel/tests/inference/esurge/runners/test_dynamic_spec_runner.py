@@ -178,6 +178,7 @@ def test_above_threshold_drafter_not_invoked_during_serving(monkeypatch):
     draft_calls: list[int] = []
     orig_batched = Qwen3_5MTPDrafter.draft_batched
     orig_draft = Qwen3_5MTPDrafter.draft
+    orig_fused = Qwen3_5MTPDrafter.verify_draft_batched
 
     def _spy_batched(self, **kwargs):
         draft_calls.append(int(kwargs["num_draft_tokens"]))
@@ -187,9 +188,14 @@ def test_above_threshold_drafter_not_invoked_during_serving(monkeypatch):
         draft_calls.append(1)
         return orig_draft(self, **kwargs)
 
+    def _spy_fused(self, **kwargs):
+        draft_calls.append(int(kwargs["num_draft_tokens"]))
+        return orig_fused(self, **kwargs)
+
     # Installed AFTER compile() so the precompile warmup is not counted.
     monkeypatch.setattr(Qwen3_5MTPDrafter, "draft_batched", _spy_batched)
     monkeypatch.setattr(Qwen3_5MTPDrafter, "draft", _spy_draft)
+    monkeypatch.setattr(Qwen3_5MTPDrafter, "verify_draft_batched", _spy_fused)
 
     toks = _serve(runner, _PROMPTS)
     assert draft_calls == [], f"drafter invoked at K=0 concurrency: {draft_calls}"
@@ -209,12 +215,20 @@ def test_below_threshold_drafter_invoked_with_scheduled_k(monkeypatch):
 
     batched_ks: list[int] = []
     orig_batched = Qwen3_5MTPDrafter.draft_batched
+    orig_fused = Qwen3_5MTPDrafter.verify_draft_batched
 
     def _spy_batched(self, **kwargs):
         batched_ks.append(int(kwargs["num_draft_tokens"]))
         return orig_batched(self, **kwargs)
 
+    def _spy_fused(self, **kwargs):
+        # The fused draft-in-verify program (the default steady-state path)
+        # must honor the same live-K contract as the two-dispatch drafter.
+        batched_ks.append(int(kwargs["num_draft_tokens"]))
+        return orig_fused(self, **kwargs)
+
     monkeypatch.setattr(Qwen3_5MTPDrafter, "draft_batched", _spy_batched)
+    monkeypatch.setattr(Qwen3_5MTPDrafter, "verify_draft_batched", _spy_fused)
 
     toks = _serve(runner, _PROMPTS)
     for rid, out in toks.items():
