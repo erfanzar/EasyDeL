@@ -331,7 +331,9 @@ class Qwen3_5MTPDrafter:
         self._jit_mtp: dict[tuple, typing.Callable] = {}
         self._jit_adaptive: dict[tuple, typing.Callable] = {}
         self._jit_batched: dict[tuple, typing.Callable] = {}
+        self._jit_verify_draft: dict[tuple, typing.Callable] = {}
         self.supports_batched_draft = True
+        self.supports_draft_in_verify = True
         # Cached static GraphDefs for the batched-draft submodule bundle
         # (mtp block, input embeddings, LM head) — see
         # ``_batched_bundle_graph_and_states``.
@@ -1468,6 +1470,309 @@ class Qwen3_5MTPDrafter:
         if new_cache is not None:
             self._mtp_cache = new_cache
         return drafts
+
+    @staticmethod
+    def _cache_signature(mtp_cache: TransformerCache | None) -> tuple | None:
+        """Shape/dtype signature of an MTP cache for drafter compile keys."""
+        if mtp_cache is None:
+            return None
+        return tuple(
+            None
+            if view is None
+            else (
+                tuple(view.key.shape),
+                str(view.key.dtype),
+                tuple(view.value.shape),
+                str(view.value.dtype),
+                tuple(view.indexes.shape),
+                str(view.indexes.dtype),
+            )
+            for view in mtp_cache.views
+        )
+
+    def _get_verify_draft_fn(
+        self,
+        *,
+        k_pad: int,
+        k_live: int,
+        gathered_hidden: jax.Array,
+        mtp_cache: TransformerCache | None,
+        project_fn: typing.Callable | None,
+    ) -> typing.Callable:
+        """Build (or fetch) the fused DRAFT-IN-VERIFY program for a shape.
+
+        One compiled program that folds the greedy verify pre-pass AND the
+        ``k_live`` recursive MTP draft steps together, so a spec decode step
+        needs no host round-trip between "read the verify argmaxes back" and
+        "dispatch the drafter":
+
+        1. **Verify projection + argmax** — the gathered ``[R, H]`` verify-row
+           hidden states are projected through the (shared) LM head and greedily
+           argmax'd, exactly like the runner's batched-emission pre-pass.
+        2. **In-program acceptance** — per pool row, the number of leading
+           draft tokens whose argmax matches (the host emission loop's greedy
+           semantics: reject at the first mismatch, the corrected/bonus token is
+           ``argmaxes[accepted]``). Positions at or beyond the row's
+           ``draft_counts`` are masked out, so ragged windows are safe even
+           though every row gathers a fixed ``k_pad + 1`` argmax stripe.
+        3. **Seed derivation** — seed token = the corrected token, seed hidden =
+           the gathered hidden at the accepted position, seed position =
+           ``seed_pos_base + accepted`` (all per row, all in-program).
+        4. **Per-row EAGLE rollback + K MTP forwards** — byte-for-byte the
+           ``_get_batched_draft_fn`` body, with the committed length computed
+           in-program as ``committed_base + accepted`` (``0`` for fresh rows).
+           Non-collected rows ride the batched forward but have their cache
+           write index (and ``starts``) restored, so idle/concurrent rows are
+           never corrupted.
+
+        The MTP pool cache is **donated** (``donate_argnums``): the program
+        aliases the pool buffers input->output instead of allocating (and
+        copying into) a fresh pool every step. The caller must replace its
+        cache reference with the returned one (``verify_draft_batched`` does).
+
+        Args:
+            k_pad: Verify-window width (drafts per row the window was scheduled
+                with; static — sizes the argmax stripe and ``draft_tokens``).
+            k_live: Draft tokens to produce for the NEXT window (static;
+                unrolls the MTP recurrence). The runner only engages the fused
+                path when ``k_pad == k_live`` (steady state); transitions fall
+                back to the two-dispatch flow.
+            gathered_hidden: ``[R, H]`` gathered verify-row hidden states
+                (shape/dtype only).
+            mtp_cache: The pool ``TransformerCache`` (shape/dtype signature keys
+                the compile) or ``None`` for the cache-free path.
+            project_fn: Optional traceable override for the verify projection
+                (hidden ``[R, H]`` -> logits ``[R, V]``). ``None`` uses the
+                shared LM head from the drafter bundle (same math as
+                ``apply_lm_head``). Must be a STABLE callable — its ``id`` is
+                part of the compile key.
+
+        Returns:
+            ``fn(mtp_st, embed_st, head_st, freqs, hidden, row_offsets,
+            draft_tokens, draft_counts, seed_pos_base, committed_base,
+            fresh_mask, collected_mask, cache) -> (arg_mat[N, k_pad+1],
+            accepted[N], seed_positions[N], drafts[N, k_live], new_cache)``.
+        """
+        has_cache = mtp_cache is not None
+        key = (
+            int(k_pad),
+            int(k_live),
+            tuple(gathered_hidden.shape),
+            str(gathered_hidden.dtype),
+            self._cache_signature(mtp_cache),
+            None if project_fn is None else id(project_fn),
+        )
+        fn = self._jit_verify_draft.get(key)
+        if fn is not None:
+            return fn
+
+        n = int(self._mtp_cache_batch_size or 1) if has_cache else 1
+        hidden_dim = int(gathered_hidden.shape[-1])
+        # Eager warmup on the concrete model (NOT under a trace) materializes any
+        # lazily-created state before it is split/traced (see
+        # ``_model_graph_and_state``).
+        warm_ids = jnp.zeros((n, 1), dtype=jnp.int32)
+        warm_hidden = jnp.zeros((n, 1, hidden_dim), dtype=gathered_hidden.dtype)
+        warm_pos = jnp.zeros((n, 1), dtype=jnp.int32)
+        _ = self._mtp_forward_compute(self.model, warm_ids, warm_hidden, warm_pos, mtp_cache, None)
+        graphdefs, _states, _freqs, tie_embeddings = self._batched_bundle_graph_and_states()
+        mtp_gd, embed_gd, head_gd = graphdefs
+        k_pad = int(k_pad)
+        k_live = int(k_live)
+
+        def _run(
+            mtp_st,
+            embed_st,
+            head_st,
+            freqs,
+            hidden,
+            row_offsets,
+            draft_tokens,
+            draft_counts,
+            seed_pos_base,
+            committed_base,
+            fresh_mask,
+            collected_mask,
+            cache0,
+        ):
+            mtp = spx.bind(mtp_gd, mtp_st)
+            embed_module = spx.bind(embed_gd, embed_st)
+            head_module = spx.bind(head_gd, head_st)
+
+            # --- 1. verify projection + greedy argmax over the window rows ---
+            if project_fn is not None:
+                logits = project_fn(hidden)
+            else:
+                w = embed_module.weight.value.T if tie_embeddings else None
+                logits = head_module(hidden, w=w)
+            argmaxes = jnp.argmax(logits.astype(jnp.float32), axis=-1).astype(jnp.int32)  # [R]
+            r_total = int(argmaxes.shape[0])
+            stripe = jnp.arange(k_pad + 1, dtype=jnp.int32)[None, :]
+            arg_mat = argmaxes[jnp.clip(row_offsets[:, None] + stripe, 0, r_total - 1)]  # [N, k_pad+1]
+
+            # --- 2. in-program greedy acceptance (leading-match count) ---
+            valid = jnp.arange(k_pad, dtype=jnp.int32)[None, :] < draft_counts[:, None]
+            matches = jnp.logical_and(arg_mat[:, :k_pad] == draft_tokens, valid)
+            accepted = jnp.sum(jnp.cumprod(matches.astype(jnp.int32), axis=1), axis=1)  # [N]
+
+            # --- 3. per-row draft seeds from the accepted position ---
+            seed_tokens = jnp.take_along_axis(arg_mat, accepted[:, None], axis=1)[:, 0]
+            seed_rows = jnp.clip(row_offsets + accepted, 0, r_total - 1)
+            seed_hidden = hidden[seed_rows][:, None, :]  # [N, 1, H]
+            seed_positions = jnp.maximum(seed_pos_base + accepted, 0).astype(jnp.int32)
+            committed = jnp.where(
+                fresh_mask,
+                jnp.zeros_like(accepted),
+                jnp.maximum(committed_base + accepted, 0),
+            ).astype(jnp.int32)
+
+            # --- 4. rollback + k_live MTP forwards + non-collected restore ---
+            # (same body as ``_get_batched_draft_fn``, with in-program seeds).
+            orig_indexes: list = []
+            orig_starts: list = []
+            if has_cache:
+                rolled_views = []
+                for v in cache0.views:
+                    if v is None:
+                        rolled_views.append(None)
+                        orig_indexes.append(None)
+                        orig_starts.append(None)
+                        continue
+                    orig_indexes.append(v.indexes)
+                    orig_starts.append(v.starts)
+                    idx = v.indexes.astype(jnp.int32)
+                    rolled = jnp.where(collected_mask, jnp.minimum(idx, committed), idx)
+                    rolled_views.append(v.replace(indexes=rolled.astype(v.indexes.dtype)))
+                cache: TransformerCache | None = TransformerCache(views=rolled_views)
+            else:
+                cache = None
+
+            ct = seed_tokens.reshape(-1, 1)
+            ch = seed_hidden.astype(hidden.dtype)
+            pos = seed_positions.reshape(-1, 1)
+            drafts_cols = []
+            for _ in range(k_live):
+                h, step_logits, cache = self._mtp_forward_compute_parts(
+                    mtp, embed_module, head_module, freqs, tie_embeddings, ct, ch, pos, cache
+                )
+                last = step_logits[:, -1, :].astype(jnp.float32)
+                next_tok = jnp.argmax(last, axis=-1).astype(jnp.int32)
+                drafts_cols.append(next_tok)
+                ct = next_tok.reshape(-1, 1)
+                ch = h[:, -1:, :].astype(hidden.dtype)
+                pos = pos + 1
+            drafts = jnp.stack(drafts_cols, axis=1)
+
+            if has_cache and cache is not None:
+                fixed_views = []
+                for v, orig_idx, orig_st in zip(cache.views, orig_indexes, orig_starts, strict=False):
+                    if v is None:
+                        fixed_views.append(None)
+                        continue
+                    adv_idx = v.indexes.astype(jnp.int32)
+                    fixed_idx = jnp.where(collected_mask, adv_idx, orig_idx.astype(jnp.int32))
+                    v2 = v.replace(indexes=fixed_idx.astype(v.indexes.dtype))
+                    if orig_st is not None:
+                        adv_st = v.starts
+                        mask_st = collected_mask.reshape((-1,) + (1,) * (adv_st.ndim - 1))
+                        v2 = v2.replace(starts=jnp.where(mask_st, adv_st, orig_st))
+                    fixed_views.append(v2)
+                cache = TransformerCache(views=fixed_views)
+            return arg_mat, accepted, seed_positions, drafts, cache
+
+        # Donate the MTP pool cache (arg 12): the program aliases the pool
+        # buffers input->output instead of copying the whole pool each step.
+        fn = jax.jit(_run, donate_argnums=(12,))
+        self._jit_verify_draft[key] = fn
+        return fn
+
+    def verify_draft_batched(
+        self,
+        *,
+        gathered_hidden: jax.Array,
+        row_offsets: jax.Array,
+        draft_tokens: jax.Array,
+        draft_counts: jax.Array,
+        seed_pos_base: jax.Array,
+        committed_base: jax.Array,
+        fresh_mask: jax.Array,
+        collected_mask: jax.Array,
+        num_draft_tokens: int,
+        project_fn: typing.Callable | None = None,
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        """Fused greedy verify + batched ``k``-token MTP draft in ONE dispatch.
+
+        Draft-in-verify: instead of the two-dispatch flow (project+argmax
+        program, blocking host readback, host acceptance, separate drafter
+        dispatch), the whole greedy window — verify argmax, acceptance,
+        corrected-token/seed selection, per-row EAGLE rollback, and the ``k``
+        recursive MTP forwards — runs as one compiled program (see
+        :meth:`_get_verify_draft_fn`). The caller does a single host readback of
+        the returned arrays after this call.
+
+        The MTP pool cache is donated to the program and ``self._mtp_cache`` is
+        replaced with the advanced pool it returns.
+
+        Args:
+            gathered_hidden: ``[R, H]`` verify-row hidden states (the runner's
+                pre-pass gather; padded to the request-bucket stripe).
+            row_offsets: ``(N,)`` start row of each pool row's verify stripe in
+                ``gathered_hidden`` (``0`` for non-collected rows).
+            draft_tokens: ``(N, k_pad)`` scheduled draft tokens per pool row
+                (from the verify metadata's buffer-materialized tokens).
+            draft_counts: ``(N,)`` number of valid drafts per row (rows may be
+                ragged; positions past the count never accept).
+            seed_pos_base: ``(N,)`` per-row ``start_pos + real_count - 1``; the
+                seed position is ``seed_pos_base + accepted`` in-program.
+            committed_base: ``(N,)`` per-row committed-length base (the host's
+                ``seed_pos_base - persist_base``); the in-program rollback
+                target is ``committed_base + accepted`` for persisted rows.
+            fresh_mask: ``(N,)`` boolean; ``True`` rows roll back to ``0``
+                (fresh request / reused slot / persistence off).
+            collected_mask: ``(N,)`` boolean; ``True`` for rows verified+drafted
+                this step. Non-collected rows are left untouched.
+            num_draft_tokens: Draft count ``k_live`` for the next window.
+            project_fn: Optional stable traceable verify-projection override
+                (tests); ``None`` uses the shared LM head.
+
+        Returns:
+            ``(arg_mat, accepted, seed_positions, drafts)`` device arrays:
+            ``arg_mat`` is ``(N, k_pad + 1)`` greedy argmax token ids per row
+            stripe, ``accepted`` is ``(N,)``, ``seed_positions`` is ``(N,)``
+            (the drafted-from position, = committed seed), and ``drafts`` is
+            ``(N, k_live)``.
+        """
+        row_offsets = jnp.asarray(row_offsets, dtype=jnp.int32).reshape(-1)
+        n = int(row_offsets.shape[0])
+        self.ensure_batch_size(n)
+        mtp_cache = self._mtp_cache if self.uses_mtp_cache else None
+        draft_tokens = jnp.asarray(draft_tokens, dtype=jnp.int32).reshape(n, -1)
+        fn = self._get_verify_draft_fn(
+            k_pad=int(draft_tokens.shape[1]),
+            k_live=int(num_draft_tokens),
+            gathered_hidden=gathered_hidden,
+            mtp_cache=mtp_cache,
+            project_fn=project_fn,
+        )
+        _gds, (mtp_st, embed_st, head_st), freqs, _tie = self._batched_bundle_graph_and_states()
+        arg_mat, accepted, seed_positions, drafts, new_cache = fn(
+            mtp_st,
+            embed_st,
+            head_st,
+            freqs,
+            jnp.asarray(gathered_hidden),
+            row_offsets,
+            draft_tokens,
+            jnp.asarray(draft_counts, dtype=jnp.int32).reshape(-1),
+            jnp.asarray(seed_pos_base, dtype=jnp.int32).reshape(-1),
+            jnp.asarray(committed_base, dtype=jnp.int32).reshape(-1),
+            jnp.asarray(fresh_mask).astype(bool).reshape(-1),
+            jnp.asarray(collected_mask).astype(bool).reshape(-1),
+            mtp_cache,
+        )
+        if new_cache is not None:
+            self._mtp_cache = new_cache
+        return arg_mat, accepted, seed_positions, drafts
 
 
 class Gemma4AssistantDrafter:
