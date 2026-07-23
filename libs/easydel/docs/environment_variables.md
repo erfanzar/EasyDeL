@@ -156,6 +156,7 @@ These are set during ejkernel import or profiler setup:
 | `EASYDEL_DISABLE_BATCHED_EMIT`      | `0`             | A/B fallback: force the per-request MTP emit path.                        | Benchmark batched vs per-request emit.            |
 | `EASYDEL_MTP_PERSIST_KV`            | drafter default | `0`/`1` overrides whether the MTP drafter KV cache persists across windows.| Force persist/no-persist for the MTP drafter.     |
 | `EASYDEL_DISABLE_DYNAMIC_SPEC`      | `0`             | Forces the static `num_draft_tokens` (ignores `num_draft_tokens_per_batch_size` schedules). | A/B dynamic vs static speculative scheduling.     |
+| `EASYDEL_DISABLE_DRAFT_IN_VERIFY`   | `0`             | A/B escape hatch: force the two-dispatch verify->draft flow instead of the fused draft-in-verify program. | Benchmark fused vs two-dispatch spec decode.      |
 | `ESURGE_DETOKENIZER_CONTEXT_WINDOW` | `4`             | Token context window used by the detokenizer worker for streaming decode. | Improve joiner/WordPiece decoding in streams.     |
 | `ESURGE_WORKER_TRUST_REMOTE_CODE`   | `1`             | Controls `trust_remote_code` for tokenizer workers.                       | Disable to avoid executing remote tokenizer code. |
 | `OPENAI_API_KEY`                    | none            | Used by OpenAI-compatible proxy when `api_key` not provided.              | Required for proxying to OpenAI.                  |
