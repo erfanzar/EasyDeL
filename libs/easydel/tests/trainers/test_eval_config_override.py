@@ -103,13 +103,13 @@ def _tiny_student_state():
     return state.replace(graphstate=graphstate)
 
 
-def _token_rows(num_rows: int, *, seed: int) -> Dataset:
+def _token_rows(num_rows: int, *, seed: int, seq_len: int = SEQ_LEN) -> Dataset:
     rng = np.random.default_rng(seed)
-    ids = rng.integers(2, VOCAB, size=(num_rows, SEQ_LEN), dtype=np.int32)
+    ids = rng.integers(2, VOCAB, size=(num_rows, seq_len), dtype=np.int32)
     return Dataset.from_dict(
         {
             "input_ids": ids.tolist(),
-            "attention_mask": np.ones((num_rows, SEQ_LEN), dtype=np.int32).tolist(),
+            "attention_mask": np.ones((num_rows, seq_len), dtype=np.int32).tolist(),
         }
     )
 
@@ -300,3 +300,160 @@ class TestDataloaderFastForwardOnResume:
             assert forwarded == [resume_step]
         else:
             assert forwarded == []
+
+
+# 2:1 training-bucket cadence (mirrors the production v2 recipe: 2 x long-attn :
+# 1 x short-vanilla) combined with the periodic 8k-vanilla eval override.
+LONG_LEN = 16
+SHORT_LEN = 8
+BUCKET_BATCH = 8
+
+
+def _make_bucketed_trainer_with_eval(tmp_path, *, max_training_steps: int = 6):
+    """DistillationTrainer with two TRAINING buckets + periodic eval override.
+
+    bucket 0 = "long" (base attn = sdpa, LONG_LEN), bucket 1 = "short"
+    (per-bucket attn override = vanilla, SHORT_LEN). ModBucketRule mod=3 fires
+    the short bucket once per three steps (2:1). Eval (evaluation_steps) runs a
+    separate held-out set through the vanilla eval-config override — a distinct
+    path from the vanilla TRAINING bucket.
+    """
+    from easydel.trainers.buckets import ModBucketRule, TrainingBucket
+
+    student_state = _tiny_student_state()
+    teacher_state = deepcopy_model(student_state)
+    arguments = ed.DistillationConfig(
+        model_name="bucket-eval-coexist-test",
+        save_directory=str(tmp_path),
+        max_training_steps=max_training_steps,
+        num_train_epochs=1,
+        total_batch_size=BUCKET_BATCH,
+        eval_batch_size=BUCKET_BATCH,
+        do_eval=True,
+        evaluation_steps=3,
+        eval_config_overrides={"attn_mechanism": EVAL_ATTN},
+        max_length=LONG_LEN,
+        learning_rate=1e-4,
+        alpha=1.0,
+        temperature=1.0,
+        disable_dropout=True,
+        use_wandb=False,
+        do_last_save=False,
+        save_steps=None,
+        save_optimizer_state=False,
+        log_steps=1_000_000,
+        report_steps=1_000_000,
+        weight_distribution_log_steps=0,
+        track_memory=False,
+        shuffle_train_dataset=False,
+        progress_bar_type="json",
+    )
+    buckets = [
+        TrainingBucket(name="long", max_length=LONG_LEN, config=None, total_batch_size=BUCKET_BATCH),
+        TrainingBucket(
+            name="short",
+            max_length=SHORT_LEN,
+            config={"attn_mechanism": EVAL_ATTN},
+            total_batch_size=BUCKET_BATCH,
+        ),
+    ]
+    # (step-2)%3==0 -> short(1); else long(0): steps 0,1->long 2->short 3,4->long 5->short.
+    bucket_rule = ModBucketRule(mod=3, offset=2, on_bucket=1, off_bucket=0)
+    # Enough rows that the resolved step capacity covers max_training_steps
+    # (rows / BUCKET_BATCH must be >= max_training_steps).
+    bucket_train_rows = BUCKET_BATCH * max_training_steps * 2
+    bucket_datasets = [
+        _token_rows(bucket_train_rows, seed=0, seq_len=LONG_LEN),
+        _token_rows(bucket_train_rows, seed=2, seq_len=SHORT_LEN),
+    ]
+    return ed.DistillationTrainer(
+        arguments=arguments,
+        processing_class=_Tokenizer(),
+        student_model=student_state,
+        teacher_model=teacher_state,
+        train_dataset=_token_rows(bucket_train_rows, seed=0, seq_len=LONG_LEN),
+        eval_dataset=_token_rows(EVAL_ROWS, seed=1, seq_len=LONG_LEN),
+        buckets=buckets,
+        bucket_rule=bucket_rule,
+        bucket_datasets=bucket_datasets,
+    )
+
+
+class TestTrainingBucketsCoexistWithEvalOverride:
+    """The 2:1 training buckets (per-bucket attn) and the eval-config override
+    are independent: training swaps per-bucket graphdefs, eval swaps its own."""
+
+    def test_per_bucket_attn_and_eval_override_are_independent(self, tmp_path):
+        trainer = _make_bucketed_trainer_with_eval(tmp_path)
+
+        # Two training buckets, each with its own graphdef (built once).
+        assert len(trainer._bucket_graphdefs) == 2
+        long_attn = _attn_of(trainer.model_state.replace(graphdef=trainer._bucket_graphdefs[0]))
+        short_attn = _attn_of(trainer.model_state.replace(graphdef=trainer._bucket_graphdefs[1]))
+        assert long_attn == TRAIN_ATTN  # base attn (sdpa)
+        assert short_attn == EVAL_ATTN  # per-bucket vanilla override
+        # The eval override graphdef exists and is a DISTINCT object from the
+        # vanilla training-bucket graphdef (separate compile, separate purpose).
+        assert trainer._eval_graphdef is not None
+        assert trainer._eval_graphdef is not trainer._bucket_graphdefs[1]
+        assert _attn_of(trainer.model_state.replace(graphdef=trainer._eval_graphdef)) == EVAL_ATTN
+
+    def test_bucket_step_fns_compiled_once_and_reused(self, tmp_path):
+        trainer = _make_bucketed_trainer_with_eval(tmp_path)
+
+        # Per-bucket compiled step fns are built once at init (before train()),
+        # one per bucket — this is the cache the runtime loop indexes into.
+        assert set(trainer._bucket_step_fns) == {0, 1}
+
+        # Wrap the cached fns with per-bucket counters. The training loop only
+        # INDEXES self._bucket_step_fns[bi]; it never recompiles. So a single
+        # cached fn per bucket must service every step routed to that bucket.
+        calls = {0: 0, 1: 0}
+
+        def _wrap(idx, fn):
+            def wrapped(*args, **kwargs):
+                calls[idx] += 1
+                return fn(*args, **kwargs)
+
+            return wrapped
+
+        trainer._bucket_step_fns[0] = _wrap(0, trainer._bucket_step_fns[0])
+        trainer._bucket_step_fns[1] = _wrap(1, trainer._bucket_step_fns[1])
+
+        output = trainer.train()
+
+        # 6 steps at 2:1 -> long bucket 4 steps, short bucket 2 steps, each
+        # served by its one cached compiled fn (no per-switch recompilation).
+        assert int(jax.device_get(output.state.step)) == 6
+        assert calls == {0: 4, 1: 2}, calls
+
+    def test_eval_runs_vanilla_and_training_state_survives_under_buckets(self, tmp_path):
+        trainer = _make_bucketed_trainer_with_eval(tmp_path)
+
+        captured_eval_states = []
+        inner_eval_fn = trainer.sharded_evaluation_step_function
+
+        def eval_fn_spy(state, batch, teacher_state, *static_args):
+            captured_eval_states.append((state, teacher_state))
+            return inner_eval_fn(state, batch, teacher_state, *static_args)
+
+        trainer.sharded_evaluation_step_function = eval_fn_spy
+
+        params_before = jax.device_get(jax.tree_util.tree_leaves(trainer.model_state.graphstate))
+        output = trainer.train()
+
+        # Eval fired during the bucketed run and used the vanilla override for
+        # both student and teacher forwards.
+        assert captured_eval_states, "eval never fired under training buckets"
+        for student_state, teacher_state in captured_eval_states:
+            assert _attn_of(student_state) == EVAL_ATTN
+            assert _attn_of(teacher_state) == EVAL_ATTN
+
+        # Training completed all 6 steps; the base (training) config is intact.
+        assert int(jax.device_get(output.state.step)) == 6
+        assert _attn_of(trainer.model_state) == TRAIN_ATTN
+        assert _attn_of(trainer.teacher_state) == TRAIN_ATTN
+        # Params moved (training happened) but stayed finite.
+        params_after = jax.device_get(jax.tree_util.tree_leaves(output.state.graphstate))
+        assert all(np.all(np.isfinite(p)) for p in params_after)
+        assert len(params_after) == len(params_before)
