@@ -457,3 +457,155 @@ class TestTrainingBucketsCoexistWithEvalOverride:
         params_after = jax.device_get(jax.tree_util.tree_leaves(output.state.graphstate))
         assert all(np.all(np.isfinite(p)) for p in params_after)
         assert len(params_after) == len(params_before)
+
+
+# Three-bucket 2:2:1 cadence (production v3 recipe: 2 x medium-vanilla,
+# 2 x short-vanilla, 1 x long-base-attn over mod 5).
+MEDIUM_LEN = 12
+
+
+def _make_three_bucket_trainer(tmp_path, *, max_training_steps: int = 10, resume_step: int = 0):
+    """DistillationTrainer with THREE training buckets on a 2:2:1 PatternBucketRule.
+
+    bucket 0 = medium (vanilla override, MEDIUM_LEN), bucket 1 = short (vanilla
+    override, SHORT_LEN), bucket 2 = long (base attn, LONG_LEN). The pattern
+    [0,0,1,1,2] fires 2 medium : 2 short : 1 long per 5-step cycle. The periodic
+    eval override runs on its own fixed set, independent of all three.
+    """
+    from easydel.trainers.buckets import PatternBucketRule, TrainingBucket
+
+    student_state = _tiny_student_state()
+    teacher_state = deepcopy_model(student_state)
+    arguments = ed.DistillationConfig(
+        model_name="three-bucket-test",
+        save_directory=str(tmp_path),
+        max_training_steps=max_training_steps,
+        num_train_epochs=1,
+        total_batch_size=BUCKET_BATCH,
+        eval_batch_size=BUCKET_BATCH,
+        do_eval=True,
+        evaluation_steps=5,
+        eval_config_overrides={"attn_mechanism": EVAL_ATTN},
+        max_length=LONG_LEN,
+        learning_rate=1e-4,
+        alpha=1.0,
+        temperature=1.0,
+        disable_dropout=True,
+        use_wandb=False,
+        do_last_save=False,
+        save_steps=None,
+        save_optimizer_state=False,
+        log_steps=1_000_000,
+        report_steps=1_000_000,
+        weight_distribution_log_steps=0,
+        track_memory=False,
+        shuffle_train_dataset=False,
+        progress_bar_type="json",
+        step_start_point=resume_step or None,
+        force_step_start_point=bool(resume_step),
+    )
+    buckets = [
+        TrainingBucket(
+            name="medium",
+            max_length=MEDIUM_LEN,
+            config={"attn_mechanism": EVAL_ATTN},
+            total_batch_size=BUCKET_BATCH,
+        ),
+        TrainingBucket(
+            name="short",
+            max_length=SHORT_LEN,
+            config={"attn_mechanism": EVAL_ATTN},
+            total_batch_size=BUCKET_BATCH,
+        ),
+        TrainingBucket(name="long", max_length=LONG_LEN, config=None, total_batch_size=BUCKET_BATCH),
+    ]
+    bucket_rule = PatternBucketRule(pattern=[0, 0, 1, 1, 2])
+    bucket_train_rows = BUCKET_BATCH * (max_training_steps + resume_step) * 2
+    bucket_datasets = [
+        _token_rows(bucket_train_rows, seed=3, seq_len=MEDIUM_LEN),
+        _token_rows(bucket_train_rows, seed=2, seq_len=SHORT_LEN),
+        _token_rows(bucket_train_rows, seed=0, seq_len=LONG_LEN),
+    ]
+    return ed.DistillationTrainer(
+        arguments=arguments,
+        processing_class=_Tokenizer(),
+        student_model=student_state,
+        teacher_model=teacher_state,
+        train_dataset=_token_rows(bucket_train_rows, seed=0, seq_len=LONG_LEN),
+        eval_dataset=_token_rows(EVAL_ROWS, seed=1, seq_len=LONG_LEN),
+        buckets=buckets,
+        bucket_rule=bucket_rule,
+        bucket_datasets=bucket_datasets,
+    )
+
+
+class TestThreeBucketPatternCadence:
+    """2:2:1 over three buckets with per-bucket attn + shapes, plus eval."""
+
+    def test_three_graphdefs_with_correct_per_bucket_attn_and_length(self, tmp_path):
+        trainer = _make_three_bucket_trainer(tmp_path)
+
+        assert len(trainer._bucket_graphdefs) == 3
+        attns = [_attn_of(trainer.model_state.replace(graphdef=trainer._bucket_graphdefs[i])) for i in range(3)]
+        assert attns == [EVAL_ATTN, EVAL_ATTN, TRAIN_ATTN]
+        # Each bucket keeps its own sequence length (fixed shape per program).
+        assert [b.max_length for b in trainer._buckets] == [MEDIUM_LEN, SHORT_LEN, LONG_LEN]
+        # Three distinct training programs + one distinct eval program.
+        assert len({id(g) for g in trainer._bucket_graphdefs.values()}) == 3
+        assert trainer._eval_graphdef is not None
+        assert all(trainer._eval_graphdef is not g for g in trainer._bucket_graphdefs.values())
+
+    def test_realized_2_2_1_step_ratio_and_one_compile_per_bucket(self, tmp_path):
+        trainer = _make_three_bucket_trainer(tmp_path, max_training_steps=10)
+
+        # One cached compiled step fn per bucket, built before train().
+        assert set(trainer._bucket_step_fns) == {0, 1, 2}
+
+        calls = {0: 0, 1: 0, 2: 0}
+        batch_shapes = {0: set(), 1: set(), 2: set()}
+
+        def _wrap(idx, fn):
+            def wrapped(state, batch, *args, **kwargs):
+                calls[idx] += 1
+                batch_shapes[idx].add(tuple(np.asarray(batch["input_ids"]).shape))
+                return fn(state, batch, *args, **kwargs)
+
+            return wrapped
+
+        for i in range(3):
+            trainer._bucket_step_fns[i] = _wrap(i, trainer._bucket_step_fns[i])
+
+        output = trainer.train()
+
+        # 10 steps = 2 full cycles -> 4 medium : 4 short : 2 long (exactly 2:2:1).
+        assert int(jax.device_get(output.state.step)) == 10
+        assert calls == {0: 4, 1: 4, 2: 2}, calls
+        # Each bucket's program saw exactly ONE batch shape (fixed shapes => the
+        # single cached compile per bucket is never re-traced).
+        assert batch_shapes[0] == {(BUCKET_BATCH, MEDIUM_LEN)}, batch_shapes[0]
+        assert batch_shapes[1] == {(BUCKET_BATCH, SHORT_LEN)}, batch_shapes[1]
+        assert batch_shapes[2] == {(BUCKET_BATCH, LONG_LEN)}, batch_shapes[2]
+
+    def test_cadence_phase_is_anchored_on_the_resumed_global_step(self, tmp_path):
+        # Resuming at a step divisible by the modulus must open the cycle at
+        # phase 0 (two medium steps), matching the production 3000-resume.
+        resume_step = 10
+        trainer = _make_three_bucket_trainer(tmp_path, max_training_steps=15, resume_step=resume_step)
+        assert int(jax.device_get(trainer.model_state.step)) == resume_step
+
+        order = []
+        for i in range(3):
+            inner = trainer._bucket_step_fns[i]
+
+            def _wrap(idx, fn):
+                def wrapped(*args, **kwargs):
+                    order.append(idx)
+                    return fn(*args, **kwargs)
+
+                return wrapped
+
+            trainer._bucket_step_fns[i] = _wrap(i, inner)
+
+        trainer.train()
+        # Steps 10..14 are one full cycle starting at phase 0.
+        assert order[:5] == [0, 0, 1, 1, 2], order[:5]
