@@ -93,6 +93,11 @@ class BucketRule(abc.ABC):
                 boundaries=[int(b) for b in d["boundaries"]],
                 rules=[r if isinstance(r, BucketRule) else cls.from_dict(r) for r in d["rules"]],
             )
+        if kind == "pattern":
+            return PatternBucketRule(
+                pattern=[int(b) for b in d["pattern"]],
+                offset=int(d.get("offset", 0)),
+            )
         raise ValueError(f"Unknown BucketRule kind: {kind!r}")
 
 
@@ -250,10 +255,55 @@ class PiecewiseBucketRule(BucketRule):
 
 
 @dataclass
+class PatternBucketRule(BucketRule):
+    """Repeating explicit bucket pattern — arbitrary N-way ratios.
+
+    ``select(step) == pattern[(step - offset) % len(pattern)]``. This is the
+    general repeating-ratio rule: :class:`ModBucketRule` covers only two
+    buckets, :class:`CycleBucketRule` only equal-width blocks, and
+    :class:`PiecewiseBucketRule` / :class:`StepThresholdRule` partition absolute
+    step *ranges* rather than repeating phases. A three-bucket 2:2:1 cadence
+    (two medium-context steps, two short steps, then one long-context step) is::
+
+        PatternBucketRule(pattern=[0, 0, 1, 1, 2])
+
+    Unlike :class:`CallableBucketRule` this is serializable, so it round-trips
+    through an eLarge config and through ``TrainingArguments.to_dict`` (which
+    every checkpoint save writes).
+
+    Attributes:
+            pattern: Bucket index per phase, one entry per step of the cycle.
+                    Repeats forever; ``len(pattern)`` is the cadence modulus.
+            offset: Step offset; ``offset=0`` means ``pattern[0]`` applies at
+                    step 0 (and at every step divisible by ``len(pattern)``).
+    """
+
+    pattern: list[int]
+    offset: int = 0
+
+    def __post_init__(self) -> None:
+        self.pattern = [int(b) for b in self.pattern]
+        if not self.pattern:
+            raise ValueError("PatternBucketRule.pattern must be non-empty.")
+        if any(b < 0 for b in self.pattern):
+            raise ValueError(f"PatternBucketRule.pattern entries must be >= 0, got {self.pattern}.")
+        self.offset = int(self.offset)
+
+    def select(self, step: int) -> int:
+        return self.pattern[(step - self.offset) % len(self.pattern)]
+
+    def to_dict(self) -> dict[str, tp.Any]:
+        return {"kind": "pattern", "pattern": list(self.pattern), "offset": self.offset}
+
+
+@dataclass
 class CallableBucketRule(BucketRule):
     """Escape hatch wrapping any ``(int) -> int`` callable.
 
     Not serializable for eLarge configs; :meth:`to_dict` raises ``TypeError``.
+    Because ``TrainingArguments.to_dict`` is called on every checkpoint save,
+    a callable rule also breaks saving mid-run — prefer
+    :class:`PatternBucketRule` for any fixed repeating cadence.
     """
 
     fn: tp.Callable[[int], int]

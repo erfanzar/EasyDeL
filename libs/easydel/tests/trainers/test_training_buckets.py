@@ -30,6 +30,7 @@ from easydel.trainers.buckets import (
     CallableBucketRule,
     CycleBucketRule,
     ModBucketRule,
+    PatternBucketRule,
     PiecewiseBucketRule,
     StepThresholdRule,
     TrainingBucket,
@@ -191,6 +192,78 @@ class TestPiecewiseBucketRule:
     def test_non_rule_entry_raises(self):
         with pytest.raises(TypeError):
             PiecewiseBucketRule(boundaries=[], rules=[lambda s: 0])
+
+
+class TestPatternBucketRule:
+    """Repeating explicit N-way ratios — what mod/cycle/piecewise cannot express."""
+
+    def test_three_bucket_2_2_1_cadence(self):
+        # The production shape: 2 x medium(0), 2 x short(1), 1 x long(2) over mod 5.
+        rule = PatternBucketRule(pattern=[0, 0, 1, 1, 2])
+        assert [rule.select(s) for s in range(12)] == [0, 0, 1, 1, 2, 0, 0, 1, 1, 2, 0, 0]
+
+    def test_realized_ratio_is_exact_over_many_cycles(self):
+        rule = PatternBucketRule(pattern=[0, 0, 1, 1, 2])
+        # Anchored at a resumed step divisible by the modulus: phase is well defined.
+        window = [rule.select(s) for s in range(3000, 3500)]
+        assert window[:5] == [0, 0, 1, 1, 2]
+        counts = {b: window.count(b) for b in (0, 1, 2)}
+        assert counts == {0: 200, 1: 200, 2: 100}  # exactly 2:2:1 over 500 steps
+
+    def test_offset_shifts_phase(self):
+        rule = PatternBucketRule(pattern=[0, 0, 1, 1, 2], offset=1)
+        # pattern[0] now lands on step 1, so step 0 sees the last phase (2).
+        assert rule.select(0) == 2
+        assert [rule.select(s) for s in range(1, 6)] == [0, 0, 1, 1, 2]
+
+    def test_negative_steps_stay_in_range(self):
+        rule = PatternBucketRule(pattern=[0, 0, 1, 1, 2])
+        # Python modulo keeps negatives in range; a rule must never emit a bad index.
+        assert all(0 <= rule.select(s) <= 2 for s in range(-10, 10))
+
+    def test_roundtrip(self):
+        rule = PatternBucketRule(pattern=[0, 0, 1, 1, 2], offset=3)
+        d = rule.to_dict()
+        assert d == {"kind": "pattern", "pattern": [0, 0, 1, 1, 2], "offset": 3}
+        restored = BucketRule.from_dict(d)
+        assert isinstance(restored, PatternBucketRule)
+        assert restored.to_dict() == d
+        probe = [0, 1, 2, 3, 4, 5, 3000, 3001, 6999, 10**6]
+        assert [restored.select(s) for s in probe] == [rule.select(s) for s in probe]
+
+    def test_json_serializable(self):
+        # TrainingArguments.to_dict runs on every checkpoint save, so the dict
+        # projection must survive json.dumps (CallableBucketRule does not).
+        import json
+
+        rule = PatternBucketRule(pattern=[0, 0, 1, 1, 2])
+        assert json.loads(json.dumps(rule.to_dict())) == rule.to_dict()
+
+    def test_empty_pattern_raises(self):
+        with pytest.raises(ValueError):
+            PatternBucketRule(pattern=[])
+
+    def test_negative_bucket_index_raises(self):
+        with pytest.raises(ValueError):
+            PatternBucketRule(pattern=[0, -1])
+
+    def test_existing_kinds_cannot_express_2_2_1(self):
+        """Why this rule exists: the other kinds structurally cannot do 2:2:1."""
+        target = [0, 0, 1, 1, 2] * 2
+        # equal-width blocks only -> 2:2:2
+        assert [CycleBucketRule(period=2, num_buckets=3).select(s) for s in range(10)] != target
+        # two buckets only
+        assert len({ModBucketRule(mod=5).select(s) for s in range(10)}) == 2
+        # absolute step ranges, not repeating phases: sticks in the last segment
+        piecewise = PiecewiseBucketRule(
+            boundaries=[2, 4],
+            rules=[
+                ModBucketRule(mod=1, on_bucket=0, off_bucket=0),
+                ModBucketRule(mod=1, on_bucket=1, off_bucket=1),
+                ModBucketRule(mod=1, on_bucket=2, off_bucket=2),
+            ],
+        )
+        assert [piecewise.select(s) for s in range(10)] == [0, 0, 1, 1, 2, 2, 2, 2, 2, 2]
 
 
 class TestCallableBucketRule:

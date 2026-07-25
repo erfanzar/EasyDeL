@@ -270,8 +270,10 @@ class TrainingArguments:
         metadata={
             "help": (
                 "easydel.trainers.buckets.BucketRule selecting the active bucket index per optimizer "
-                "step (e.g. ModBucketRule(mod=5, on_bucket=0, off_bucket=1)). Required when `buckets` "
-                "is set; ignored otherwise."
+                "step (e.g. ModBucketRule(mod=5, on_bucket=0, off_bucket=1) for two buckets, or "
+                "PatternBucketRule(pattern=[0, 0, 1, 1, 2]) for an arbitrary repeating N-way ratio). "
+                "Required when `buckets` is set; ignored otherwise. Must be serializable "
+                "(CallableBucketRule is not — to_dict runs on every checkpoint save)."
             )
         },
     )

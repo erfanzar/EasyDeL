@@ -94,6 +94,7 @@ from .buckets import (
     BucketRule,
     CycleBucketRule,
     ModBucketRule,
+    PatternBucketRule,
     PiecewiseBucketRule,
     StepThresholdRule,
     TrainingBucket,
@@ -5167,6 +5168,8 @@ class BaseTrainer(BaseTrainerProtocol):
                 probes.update(range(start, start + rule.mod))
             elif isinstance(rule, CycleBucketRule):
                 probes.update(range(start, start + rule.period * rule.num_buckets))
+            elif isinstance(rule, PatternBucketRule):
+                probes.update(range(start, start + len(rule.pattern)))
             elif isinstance(rule, PiecewiseBucketRule):
                 for boundary in rule.boundaries:
                     probes.update((boundary - 1, boundary, boundary + 1))
