@@ -190,6 +190,24 @@ class SpeculativeStrategy(typing.Protocol):
         """Generate up to ``num_draft_tokens`` draft tokens for one request."""
         ...
 
+    def can_draft_in_verify(self) -> bool:
+        """Whether the fused draft-in-verify program can serve this drafter."""
+        ...
+
+    def begin_draft_in_verify(
+        self,
+        entries: list[tuple[_SpecVerifyMetadata, int, int]],
+        *,
+        gathered_hidden: jax.Array,
+        k_pad: int,
+    ) -> dict | None:
+        """Dispatch the fused verify+draft program without blocking on it."""
+        ...
+
+    def finish_draft_in_verify(self, handle: dict) -> dict[str, dict[str, typing.Any]]:
+        """Read back a fused verify+draft dispatched by :meth:`begin_draft_in_verify`."""
+        ...
+
     def record_acceptance(self, req_id: str, accepted: int, num_drafts: int) -> None:
         """Update the adaptive drafter stop-loss after a verify window."""
         ...
@@ -293,6 +311,20 @@ class NullSpeculation:
         """Return no drafts, matching the old ``drafter is None`` early exit."""
         del kwargs
         return []
+
+    def can_draft_in_verify(self) -> bool:
+        """Always ``False``: no drafter, no fused verify+draft program."""
+        return False
+
+    def begin_draft_in_verify(self, *args: typing.Any, **kwargs: typing.Any) -> typing.NoReturn:
+        """Unreachable without a drafter; fails loudly."""
+        del args, kwargs
+        self._unsupported("begin_draft_in_verify")
+
+    def finish_draft_in_verify(self, *args: typing.Any, **kwargs: typing.Any) -> typing.NoReturn:
+        """Unreachable without a drafter; fails loudly."""
+        del args, kwargs
+        self._unsupported("finish_draft_in_verify")
 
     def _unsupported(self, operation: str) -> typing.NoReturn:
         """Raise for draft/verify/commit surfaces that require a drafter.

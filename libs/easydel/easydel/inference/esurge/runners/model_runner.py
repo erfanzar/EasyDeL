@@ -1638,6 +1638,58 @@ class eSurgeRunner:
             except Exception as e:
                 logger.debug(f"Batched drafter precompile skip (k={k}): {e}")
 
+    def _precompile_draft_in_verify_variants(self) -> None:
+        """Warm the fused draft-in-verify program for every (request bucket, k).
+
+        The fused program (``Qwen3_5MTPDrafter.verify_draft_batched``) compile-
+        keys on the gathered verify-stripe shape — ``padded_num_reqs * (k + 1)``
+        rows — and on the draft count ``k`` (unrolled recurrence), so its
+        executable count is exactly one per (request bucket, schedule-``k``)
+        pair. Warm each pair here with an all-idle (``collected_mask``
+        all-``False``) call: every pool row's write index is restored by the
+        program, so the warmup leaves the drafter cache coherent while
+        materializing the executable.
+
+        No-op when the strategy cannot use the fused path (no capable drafter,
+        or ``EASYDEL_DISABLE_DRAFT_IN_VERIFY`` / ``EASYDEL_DISABLE_BATCHED_DRAFT``
+        set at compile time). Failures are logged and skipped — the runtime
+        path can still JIT lazily.
+        """
+        if self.drafter is None or int(self.num_draft_tokens) <= 0:
+            return
+        can_fused = getattr(self.spec, "can_draft_in_verify", None)
+        if not callable(can_fused) or not can_fused():
+            return
+        k_values = {int(self.num_draft_tokens)}
+        if self.draft_schedule is not None:
+            k_values |= {int(k) for (_start, _end, k) in self.draft_schedule if int(k) > 0}
+        n = max(1, int(self.max_num_reqs))
+        ensure = getattr(self.drafter, "ensure_batch_size", None)
+        if callable(ensure):
+            ensure(n)
+        hidden_size = int(self.model.config.get_text_config().hidden_size)
+        hidden_dtype = getattr(self.model, "dtype", None) or jnp.float32
+        project_fn = self.spec.draft_in_verify_project_fn()
+        for pnr in sorted({int(b) for b in self.active_num_seq_buckets}):
+            for k in sorted(k_values):
+                rows = int(pnr) * (int(k) + 1)
+                try:
+                    _ = self.drafter.verify_draft_batched(
+                        gathered_hidden=jnp.zeros((rows, hidden_size), dtype=hidden_dtype),
+                        row_offsets=np.zeros((n,), dtype=np.int32),
+                        draft_tokens=np.zeros((n, int(k)), dtype=np.int32),
+                        draft_counts=np.zeros((n,), dtype=np.int32),
+                        seed_pos_base=np.zeros((n,), dtype=np.int32),
+                        committed_base=np.zeros((n,), dtype=np.int32),
+                        fresh_mask=np.zeros((n,), dtype=bool),
+                        collected_mask=np.zeros((n,), dtype=bool),
+                        num_draft_tokens=int(k),
+                        project_fn=project_fn,
+                    )
+                    logger.debug(f"Draft-in-verify precompiled for (reqs={pnr}, k={k}, pool={n})")
+                except Exception as e:
+                    logger.debug(f"Draft-in-verify precompile skip (reqs={pnr}, k={k}): {e}")
+
     def compile(self, *, max_num_batched_tokens: int | None = None) -> None:
         """Compile the model for token/request bucket sizes.
 
@@ -1705,6 +1757,7 @@ class eSurgeRunner:
         )
 
         self._precompile_draft_schedule_variants()
+        self._precompile_draft_in_verify_variants()
 
     def update_model_weights(
         self,
@@ -2525,6 +2578,11 @@ class eSurgeRunner:
         # Early-dispatched batched drafts, one (handle, writeback-map) per
         # window; read back after the emission loop (see the pre-pass block).
         early_draft_batches: list[tuple[dict, dict]] = []
+        # Fused draft-in-verify results, one (host drafts-by-rid, writeback-map)
+        # per window; the drafts are already host lists (the fused program's
+        # single readback returned them with the argmaxes), so the post-loop
+        # writeback needs no strategy readback call.
+        fused_draft_batches: list[tuple[dict[str, list[int]], dict]] = []
         # Only engage the batched pool draft when >= 2 spec-active requests are being
         # verified this step. Batching a single request wins no throughput (a pooled
         # [1, ...] forward is no cheaper than one row-targeted forward) but moves the
@@ -3219,6 +3277,12 @@ class eSurgeRunner:
             # legacy per-request project/argmax (A/B + isolated parity proof).
             batched_verify_by_row: dict[int, _BatchedVerifyRow] = {}
             verify_meta_by_row: dict[int, typing.Any] = {}
+            # Populated either by the fused draft-in-verify pre-pass (drafts
+            # already on host) or by the legacy early batched-draft dispatch
+            # below (drafts still on device); consumed by the emission loop and
+            # the post-loop writeback in both cases.
+            early_draft_handle: dict | None = None
+            early_draft_by_rid: dict[str, tuple[int, int]] = {}
             batched_emit_enabled = (
                 spec_decode_active_window
                 and self.drafter is not None
@@ -3284,21 +3348,85 @@ class eSurgeRunner:
                     _idx_arr = np.asarray(_flat_indices, dtype=np.int32)
                     _project_start = time.time()
                     _gathered_hidden = hidden_states_for_spec[_idx_arr]
-                    _batched_logits = self.spec.project_hidden_rows(_gathered_hidden)
                     total_spec_project_time += time.time() - _project_start
-                    _argmax_start = time.time()
-                    _batched_argmax = np.asarray(jnp.argmax(_batched_logits, axis=-1)).astype(np.int64)
-                    total_spec_argmax_sync_time += time.time() - _argmax_start
-                    for _rp, _off, _cnt, _meta in _pending_bv:
-                        verify_meta_by_row[_rp] = _meta
-                        batched_verify_by_row[_rp] = _BatchedVerifyRow(
-                            verify_meta=_meta,
-                            offset=int(_off),
-                            count=int(_cnt),
-                            argmaxes=[int(_x) for _x in _batched_argmax[_off : _off + _cnt].tolist()],
-                            gathered_hidden=_gathered_hidden,
-                            batched_logits=_batched_logits,
+                    # --- DRAFT-IN-VERIFY (fused) --------------------------------
+                    # Fold the greedy argmax, the acceptance compare, and the K
+                    # recursive MTP draft forwards into ONE compiled program:
+                    # the separate drafter dispatch (and the host round-trip
+                    # between the argmax readback and that dispatch)
+                    # disappears — the step's only host sync returns argmaxes
+                    # AND next-window drafts together. Gated to the exact cases
+                    # whose host semantics the in-program acceptance reproduces:
+                    # greedy batched rows (>= 2), no recurrent replay (it
+                    # re-derives the corrected token after this point), no
+                    # reject-backoff, no debug traces (they need the full verify
+                    # logits), and a steady-state window (the verify width
+                    # k_pad equals this step's live draft budget — dynamic-K
+                    # transition steps fall back to the two-dispatch flow).
+                    # ``EASYDEL_DISABLE_DRAFT_IN_VERIFY=1`` forces the fallback.
+                    fused_verify_results: dict | None = None
+                    if (
+                        step_allows_batch
+                        and spec_token_ids_all is not None
+                        and not self.spec_decode_recurrent_replay
+                        and int(getattr(self.spec, "reject_backoff_steps", 0) or 0) <= 0
+                        and self.spec_decode_debug_max_traces <= 0
+                        and int(_pad_window_k) == int(getattr(self.spec, "live_num_draft_tokens", 0))
+                        and self.spec.can_draft_in_verify()
+                        and all(
+                            self.spec.can_batch_draft(self.requests.get(str(_meta2.request_id)))
+                            for (_rp2, _off2, _cnt2, _meta2) in _pending_bv
                         )
+                    ):
+                        draft_timer_start = time.time()
+                        _fused_handle = self.spec.begin_draft_in_verify(
+                            [(_meta2, int(_off2), int(_cnt2)) for (_rp2, _off2, _cnt2, _meta2) in _pending_bv],
+                            gathered_hidden=_gathered_hidden,
+                            k_pad=int(_pad_window_k),
+                        )
+                        total_spec_draft_time += time.time() - draft_timer_start
+                        if _fused_handle is not None:
+                            _argmax_start = time.time()
+                            fused_verify_results = self.spec.finish_draft_in_verify(_fused_handle)
+                            total_spec_argmax_sync_time += time.time() - _argmax_start
+                    if fused_verify_results is not None:
+                        _fused_drafts_by_rid: dict[str, list[int]] = {}
+                        for _rp, _off, _cnt, _meta in _pending_bv:
+                            _rid2 = str(_meta.request_id)
+                            _res = fused_verify_results[_rid2]
+                            verify_meta_by_row[_rp] = _meta
+                            batched_verify_by_row[_rp] = _BatchedVerifyRow(
+                                verify_meta=_meta,
+                                offset=int(_off),
+                                count=int(_cnt),
+                                argmaxes=[int(_x) for _x in _res["argmaxes"]],
+                                gathered_hidden=_gathered_hidden,
+                                batched_logits=None,
+                            )
+                            # Mark the request as already drafted so the emission
+                            # loop reserves its output slot; the drafts (already
+                            # on host) are written back after the loop through
+                            # the shared early-draft writeback.
+                            early_draft_by_rid[_rid2] = (int(_meta.req_idx), int(_res["known_len"]))
+                            _fused_drafts_by_rid[_rid2] = list(_res["drafts"])
+                        fused_draft_batches.append((_fused_drafts_by_rid, early_draft_by_rid))
+                    else:
+                        _project_start = time.time()
+                        _batched_logits = self.spec.project_hidden_rows(_gathered_hidden)
+                        total_spec_project_time += time.time() - _project_start
+                        _argmax_start = time.time()
+                        _batched_argmax = np.asarray(jnp.argmax(_batched_logits, axis=-1)).astype(np.int64)
+                        total_spec_argmax_sync_time += time.time() - _argmax_start
+                        for _rp, _off, _cnt, _meta in _pending_bv:
+                            verify_meta_by_row[_rp] = _meta
+                            batched_verify_by_row[_rp] = _BatchedVerifyRow(
+                                verify_meta=_meta,
+                                offset=int(_off),
+                                count=int(_cnt),
+                                argmaxes=[int(_x) for _x in _batched_argmax[_off : _off + _cnt].tolist()],
+                                gathered_hidden=_gathered_hidden,
+                                batched_logits=_batched_logits,
+                            )
             # --- Early batched-draft dispatch --------------------------------
             # Every input the batched drafter needs (per-request accepted count,
             # corrected token, seed position, seed hidden row) is derivable from
@@ -3312,10 +3440,11 @@ class eSurgeRunner:
             # >= 2 verified together), plus: no recurrent replay (which would
             # re-derive the corrected token after this point) and no
             # reject-backoff (its state is only updated later in the loop).
-            early_draft_handle: dict | None = None
-            early_draft_by_rid: dict[str, tuple[int, int]] = {}
+            # Skipped when the fused draft-in-verify pre-pass already produced
+            # this window's drafts (``early_draft_by_rid`` pre-populated).
             if (
-                batched_verify_by_row
+                not early_draft_by_rid
+                and batched_verify_by_row
                 and step_allows_batch
                 and spec_token_ids_all is not None
                 and not self.spec_decode_recurrent_replay
@@ -3932,10 +4061,16 @@ class eSurgeRunner:
         # Read back the early-dispatched batched drafts (their device work
         # overlapped the emission loop above) and write them into the sequence
         # buffer / output slots exactly as the legacy post-loop path would.
-        if early_draft_batches and spec_token_ids_all is not None:
+        if (early_draft_batches or fused_draft_batches) and spec_token_ids_all is not None:
             draft_timer_start = time.time()
-            for _handle, _by_rid in early_draft_batches:
-                early_drafts = self.spec.finish_batched_draft(_handle)
+            resolved_batches = [
+                # Two-dispatch handles need the strategy readback; fused batches
+                # already carry host drafts (their single sync happened in the
+                # pre-pass together with the argmaxes).
+                *((self.spec.finish_batched_draft(_handle), _by_rid) for _handle, _by_rid in early_draft_batches),
+                *fused_draft_batches,
+            ]
+            for early_drafts, _by_rid in resolved_batches:
                 for _rid3, _entry in _by_rid.items():
                     if len(_entry) != 3:
                         continue

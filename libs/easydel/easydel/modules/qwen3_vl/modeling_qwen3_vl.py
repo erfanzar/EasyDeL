@@ -1011,7 +1011,16 @@ class Qwen3VisionTransformerPretrainedModel(EasyDeLBaseModule):
         Returns:
             jnp.dtype: Data type of the model parameters.
         """
-        return self.blocks[0].mlp.linear_fc2.weight.value.dtype
+        probe = self.blocks[0].mlp.linear_fc2
+        weight = getattr(probe, "weight", None)
+        if weight is not None:
+            return weight.value.dtype
+        # Quantized linears carry no dense `weight`; their param_dtype is the
+        # dtype activations/dequantized weights use.
+        param_dtype = getattr(probe, "param_dtype", None)
+        if param_dtype is not None:
+            return jnp.dtype(param_dtype)
+        return self.patch_embed.proj.weight.value.dtype
 
     def fast_pos_embed_interpolate(self, grid_thw: Array) -> Array:
         """Compute positional embeddings with bilinear interpolation.

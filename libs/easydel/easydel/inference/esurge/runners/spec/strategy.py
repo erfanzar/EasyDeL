@@ -1673,6 +1673,239 @@ class DrafterSpeculation:
         self.num_drafts_generated += total
         return out
 
+    def can_draft_in_verify(self) -> bool:
+        """Whether the fused DRAFT-IN-VERIFY program can serve this drafter.
+
+        The fused path folds the greedy verify argmax, the acceptance compare,
+        and the ``k`` recursive MTP draft forwards into ONE compiled program
+        (:meth:`~easydel.inference.speculative.Qwen3_5MTPDrafter.verify_draft_batched`),
+        removing the separate drafter dispatch and one host round-trip per
+        decode step. It subsumes the batched-draft path, so it honors BOTH
+        escape hatches: ``EASYDEL_DISABLE_DRAFT_IN_VERIFY`` (fall back to the
+        two-dispatch flow) and ``EASYDEL_DISABLE_BATCHED_DRAFT`` (fall all the
+        way back to per-request drafting).
+
+        Returns:
+            ``True`` when the attached drafter exposes the fused program and no
+            escape hatch is set. Per-request/per-step gating (greedy, backoff,
+            recurrent replay, dynamic-K transitions) stays with the runner.
+        """
+        if self.drafter is None or self.num_draft_tokens <= 0:
+            return False
+        if flags.get_bool(flags.EASYDEL_DISABLE_DRAFT_IN_VERIFY):
+            return False
+        if flags.get_bool(flags.EASYDEL_DISABLE_BATCHED_DRAFT):
+            return False
+        if not bool(getattr(self.drafter, "supports_draft_in_verify", False)):
+            return False
+        if not callable(getattr(self.drafter, "verify_draft_batched", None)):
+            return False
+        if bool(getattr(self.drafter, "requires_target_kv_cache", False)):
+            return False
+        # The fused program's default verify projection is the raw shared LM
+        # head (``apply_lm_head`` math). The two-dispatch path projects through
+        # ``compute_lm_logits``, which additionally applies logit caps / scales
+        # / soft caps when a model configures them. Those never coexist with an
+        # inline MTP head today (Qwen3.5 family has none), but gate the fused
+        # path off rather than silently diverging if a future family does —
+        # unless a test/deployment injected its own projection hook.
+        if self.draft_in_verify_project_fn() is None:
+            model = getattr(self._runner, "model", None)
+            if getattr(model, "_logit_cap_feature", None) is not None:
+                return False
+            for attr in ("logit_scale", "output_multiplier_scale"):
+                if getattr(model, attr, None) is not None:
+                    return False
+            if getattr(getattr(model, "base_model", None), "lm_head_multiplier", None) is not None:
+                return False
+            cfg = getattr(model, "config", None)
+            get_text_config = getattr(cfg, "get_text_config", None)
+            text_cfg = get_text_config() if callable(get_text_config) else cfg
+            for c in {id(cfg): cfg, id(text_cfg): text_cfg}.values():
+                if getattr(c, "final_logit_softcapping", None) is not None:
+                    return False
+        return True
+
+    def draft_in_verify_project_fn(self) -> typing.Callable | None:
+        """Traceable verify-projection override for the fused program.
+
+        ``None`` (the default) lets the drafter project the verify rows through
+        the shared LM head inside the fused program — the same
+        ``apply_lm_head`` math :meth:`project_hidden_rows` runs on the
+        two-dispatch path. Tests override this to inject a deterministic
+        batch-invariant projection into BOTH paths. The returned callable must
+        be STABLE (its identity keys the drafter's compile cache).
+
+        Returns:
+            A traceable ``[R, H] -> [R, V]`` callable, or ``None``.
+        """
+        return None
+
+    def begin_draft_in_verify(
+        self,
+        entries: list[tuple[_SpecVerifyMetadata, int, int]],
+        *,
+        gathered_hidden: jax.Array,
+        k_pad: int,
+    ) -> dict | None:
+        """Dispatch the fused verify+draft program WITHOUT blocking on it.
+
+        Replaces the two-dispatch flow (standalone argmax program -> blocking
+        argmax readback -> host acceptance -> :meth:`begin_batched_draft`) for
+        the greedy batched path: acceptance moves INTO the compiled program, so
+        the ``k`` MTP draft forwards are enqueued in the same dispatch as the
+        verify projection and the step's only host sync
+        (:meth:`finish_draft_in_verify`) returns argmaxes AND next-window
+        drafts together.
+
+        Host persist bookkeeping is split around the dispatch: row claims
+        (``_mtp_persist_req_by_row``) happen here because freshness does not
+        depend on the acceptance result, while a fresh row's committed-origin
+        (``_mtp_persist_base_pos_by_row``) is only known after the program
+        computes the accepted count, so it is recorded in
+        :meth:`finish_draft_in_verify` from the read-back seed position. A
+        reused row's stale base is dropped at claim time so an abort between
+        the two phases can never make a later fallback path misread it.
+
+        Args:
+            entries: One ``(verify_meta, offset, count)`` per collected greedy
+                request, where ``offset``/``count`` locate the request's verify
+                rows inside ``gathered_hidden`` (the runner pre-pass layout).
+            gathered_hidden: ``[R, H]`` gathered verify-row hidden states.
+            k_pad: Verify-window width the gather stripe was padded to. The
+                fused program is only engaged at steady state
+                (``k_pad == live_num_draft_tokens``); the runner gates
+                transitions to the fallback flow.
+
+        Returns:
+            An opaque handle for :meth:`finish_draft_in_verify`, or ``None``
+            when the fused path cannot serve this window (the caller falls back
+            to the two-dispatch flow with no state disturbed).
+        """
+        k_live = int(self.live_num_draft_tokens)
+        if not entries or k_live <= 0 or int(k_pad) != k_live or not self.can_draft_in_verify():
+            return None
+        n = max(1, int(getattr(self._runner, "max_num_reqs", 1)))
+        persist_on = self._mtp_persist_enabled()
+
+        # Validation pass (no state mutation): any ineligible row falls the
+        # whole window back to the two-dispatch flow.
+        rows_by_entry: list[int] = []
+        for meta, _off, _cnt in entries:
+            rid = str(meta.request_id)
+            if int(self._backoff_by_req.get(rid, 0)) > 0:
+                return None
+            if len(meta.buffer_draft_tokens) > int(k_pad):
+                return None
+            row = self._stable_drafter_row(rid, int(meta.req_idx)) if persist_on else int(meta.req_idx)
+            if not (0 <= row < n):
+                return None
+            rows_by_entry.append(row)
+
+        ensure = getattr(self.drafter, "ensure_batch_size", None)
+        if callable(ensure):
+            ensure(n)
+
+        row_offsets = np.zeros((n,), dtype=np.int32)
+        draft_tokens = np.zeros((n, int(k_pad)), dtype=np.int32)
+        draft_counts = np.zeros((n,), dtype=np.int32)
+        seed_pos_base = np.zeros((n,), dtype=np.int32)
+        committed_base = np.zeros((n,), dtype=np.int32)
+        fresh_mask = np.zeros((n,), dtype=bool)
+        collected_mask = np.zeros((n,), dtype=bool)
+        active: list[tuple[str, int, int, int]] = []
+
+        for (meta, off, cnt), row in zip(entries, rows_by_entry, strict=True):
+            rid = str(meta.request_id)
+            base_known = int(meta.start_pos) + int(meta.real_count) - 1
+            if persist_on:
+                if self._mtp_persist_req_by_row.get(row) != rid:
+                    # Fresh request or a slot reused by a different request:
+                    # claim the row, drop any stale base (so a fallback after an
+                    # abort computes committed == 0 too), and roll to 0
+                    # in-program. The base is re-recorded post-readback.
+                    self._mtp_persist_req_by_row[row] = rid
+                    self._mtp_persist_base_pos_by_row.pop(row, None)
+                    fresh_mask[row] = True
+                else:
+                    base = int(self._mtp_persist_base_pos_by_row.get(row, base_known))
+                    committed_base[row] = base_known - base
+            else:
+                fresh_mask[row] = True
+            drafts_row = [int(t) for t in meta.buffer_draft_tokens]
+            draft_tokens[row, : len(drafts_row)] = drafts_row
+            draft_counts[row] = len(drafts_row)
+            row_offsets[row] = int(off)
+            seed_pos_base[row] = base_known
+            collected_mask[row] = True
+            active.append((rid, row, int(off), int(cnt)))
+
+        arg_mat, accepted, seed_positions, drafts = self.drafter.verify_draft_batched(
+            gathered_hidden=gathered_hidden,
+            row_offsets=row_offsets,
+            draft_tokens=draft_tokens,
+            draft_counts=draft_counts,
+            seed_pos_base=seed_pos_base,
+            committed_base=committed_base,
+            fresh_mask=fresh_mask,
+            collected_mask=collected_mask,
+            num_draft_tokens=k_live,
+            project_fn=self.draft_in_verify_project_fn(),
+        )
+        return {
+            "arg_mat": arg_mat,
+            "accepted": accepted,
+            "seed_positions": seed_positions,
+            "drafts": drafts,
+            "active": active,
+            "fresh": fresh_mask,
+            "persist_on": persist_on,
+        }
+
+    def finish_draft_in_verify(self, handle: dict) -> dict[str, dict[str, typing.Any]]:
+        """Read back a fused verify+draft dispatched by :meth:`begin_draft_in_verify`.
+
+        The step's single host sync: one ``jax.device_get`` over the argmax
+        stripes, accepted counts, seed positions, and next-window drafts. Also
+        records a fresh row's persist base (its committed-origin) from the
+        read-back seed position — the deferred half of the bookkeeping
+        :meth:`begin_draft_in_verify` could not do before acceptance was known.
+
+        Args:
+            handle: The dict returned by :meth:`begin_draft_in_verify`.
+
+        Returns:
+            ``{req_id: {"argmaxes": [count ints], "accepted": int,
+            "known_len": int, "drafts": [k ints]}}`` — ``argmaxes`` matches the
+            two-dispatch pre-pass slice for the request (its ``count`` verify
+            rows), and ``known_len`` is ``start + real + accepted + 1`` (the
+            emitted-through length the runner writes drafts after).
+        """
+        arg_np, acc_np, pos_np, drafts_np = jax.device_get(
+            (handle["arg_mat"], handle["accepted"], handle["seed_positions"], handle["drafts"])
+        )
+        arg_np = np.asarray(arg_np)
+        acc_np = np.asarray(acc_np)
+        pos_np = np.asarray(pos_np)
+        drafts_np = np.asarray(drafts_np)
+        persist_on = bool(handle["persist_on"])
+        fresh = handle["fresh"]
+        out: dict[str, dict[str, typing.Any]] = {}
+        total = 0
+        for rid, row, _off, cnt in handle["active"]:
+            drafted = [int(t) for t in drafts_np[row, :]]
+            if persist_on and bool(fresh[row]):
+                self._mtp_persist_base_pos_by_row[row] = int(pos_np[row])
+            out[rid] = {
+                "argmaxes": [int(t) for t in arg_np[row, : int(cnt)]],
+                "accepted": int(acc_np[row]),
+                "known_len": int(pos_np[row]) + 2,
+                "drafts": drafted,
+            }
+            total += len(drafted)
+        self.num_drafts_generated += total
+        return out
+
     def record_acceptance(self, req_id: str, accepted: int, num_drafts: int) -> None:
         """Update the adaptive drafter stop-loss after a verify window.
 

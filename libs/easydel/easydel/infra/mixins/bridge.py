@@ -1213,6 +1213,10 @@ class EasyBridgeMixin(PushToHubMixin):
                 path_str = ".".join([str(p) for p in path])
                 if pattern is not None and not pattern.search(path_str):
                     continue
+                # iter_module_search yields string path segments; checkpoint
+                # state keys promote digit segments to int (string_key_to_int).
+                # Canonicalize so kernel_map keys match state keys exactly.
+                path = tuple(int(p) if isinstance(p, str) and p.isdigit() else p for p in path)
                 kernel_key = (*path, "weight")
                 kernel_map[kernel_key] = ((*path, "quant_kernel"), (*path, "quant_scales"), (*path, "quant_biases"))
 
@@ -1408,10 +1412,27 @@ class EasyBridgeMixin(PushToHubMixin):
                     model = quantizer_for_modules.apply_quantization(model, verbose=verbose)
                     modules_quantized_on_load = True
 
+                    # Module paths carry no collection segment, but modern spx
+                    # checkpoints key their leaves as ``(collection, *path)``
+                    # (e.g. ``("parameters", "model", ..., "weight")``). Resolve
+                    # each kernel path against both forms and reuse the resolved
+                    # prefix for the packed quant_* keys so they land in the
+                    # same collection as the dense weight they replace.
+                    prefix_by_suffix: dict[tuple, tuple] = {}
+                    for state_key in state:
+                        if isinstance(state_key, tuple) and len(state_key) > 1:
+                            prefix_by_suffix.setdefault(state_key[1:], state_key[:1])
+                    quantized_on_load_count = 0
                     for kernel_key, (quant_kernel_key, quant_scales_key, quant_biases_key) in kernel_map.items():
-                        if kernel_key not in state:
-                            continue
-                        kernel_value = state.pop(kernel_key)
+                        prefix: tuple = ()
+                        source_key = kernel_key
+                        if source_key not in state:
+                            found = prefix_by_suffix.get(kernel_key)
+                            if found is None:
+                                continue
+                            prefix = tuple(found)
+                            source_key = (*prefix, *kernel_key)
+                        kernel_value = state.pop(source_key)
                         mode, group_size, bits, needs_biases = resolve_ejkernel_quant_params(quantization_config)
                         group_size = _effective_ejkernel_group_size(mode, group_size, tuple(kernel_value.shape))
                         if needs_biases:
@@ -1431,12 +1452,27 @@ class EasyBridgeMixin(PushToHubMixin):
                                 transpose=False,
                             )
                             quant_biases = None
-                        state[quant_kernel_key] = quant_kernel
-                        state[quant_scales_key] = quant_scales
-                        state[quant_biases_key] = quant_biases
+                        state[(*prefix, *quant_kernel_key)] = quant_kernel
+                        state[(*prefix, *quant_scales_key)] = quant_scales
+                        state[(*prefix, *quant_biases_key)] = quant_biases
+                        quantized_on_load_count += 1
                         if hasattr(quant_kernel, "block_until_ready"):
                             quant_kernel.block_until_ready()
                         del kernel_value
+                    if quantized_on_load_count == 0:
+                        logger.warning(
+                            "apply_quantization was requested and %d modules were converted, but no "
+                            "matching checkpoint kernels were found to prepack; the load will fail "
+                            "with abstract quantized leaves.",
+                            len(kernel_map),
+                        )
+                    else:
+                        logger.info(
+                            "Quantized %d/%d checkpoint kernels on load (%s).",
+                            quantized_on_load_count,
+                            len(kernel_map),
+                            quantization_config.dtype,
+                        )
 
             with _phase_timer("  load: build required_params (spx.export)"):
                 # Use the full spx.Parameter tree here instead of model.graphtree_parameters_shape:
