@@ -18,10 +18,10 @@ import inspect
 from dataclasses import fields
 
 import pytest
-
 from easydel.infra.elarge.model import eLargeModel
 from easydel.infra.elarge.types import (
     BASE_TRAINER_DEFAULTS,
+    ELARGE_ONLY_TRAINER_KEYS,
     TRAINER_SPECIFIC_DEFAULTS,
     BaseTrainerCfg,
     get_training_arguments_class,
@@ -57,7 +57,11 @@ def test_normalized_configs_construct_every_training_arguments_class():
             }
         )
         args_cls = get_training_arguments_class(trainer_type)
-        payload = {key: value for key, value in config.items() if key != "trainer_type"}
+        # `eLargeModel.build_trainer` consumes the eLarge-only bucket keys and strips
+        # them before constructing the arguments class; mirror that here so the test
+        # checks the payload production actually forwards.
+        skipped = {"trainer_type", *ELARGE_ONLY_TRAINER_KEYS}
+        payload = {key: value for key, value in config.items() if key not in skipped}
 
         signature = inspect.signature(args_cls.__init__)
         valid_parameters = set(signature.parameters) - {"self"}
@@ -83,7 +87,7 @@ def test_normalized_configs_construct_every_training_arguments_class():
 def test_base_defaults_do_not_include_unknown_training_arguments_keys():
     args_signature = inspect.signature(TrainingArguments.__init__)
     valid_parameters = set(args_signature.parameters) - {"self", "max_sequence_length", "quantization_block"}
-    unknown_defaults = sorted(set(BASE_TRAINER_DEFAULTS) - valid_parameters)
+    unknown_defaults = sorted(set(BASE_TRAINER_DEFAULTS) - valid_parameters - set(ELARGE_ONLY_TRAINER_KEYS))
     assert unknown_defaults == [], f"BASE_TRAINER_DEFAULTS includes unknown keys: {unknown_defaults}"
 
 

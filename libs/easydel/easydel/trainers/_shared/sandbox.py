@@ -44,6 +44,7 @@ substitute for a VM/container boundary against a determined adversary.
 from __future__ import annotations
 
 import dataclasses
+import math
 import os
 import shutil
 import signal
@@ -53,6 +54,10 @@ import tempfile
 import typing as tp
 
 _POSIX = os.name == "posix"
+# Return code of a child killed by the RLIMIT_CPU backstop. SIGXCPU is POSIX-only,
+# and no rlimits are installed off POSIX, so no return code maps to a budget kill
+# there.
+_CPU_BUDGET_RETURNCODE: int | None = -signal.SIGXCPU if _POSIX else None
 
 # Environment variables that are safe to expose to sandboxed processes. Anything
 # else (API keys, cloud creds, proxies, JAX/XLA/TPU coordinator vars) is dropped.
@@ -68,7 +73,9 @@ class SandboxResult:
         stdout: Captured standard output (truncated to ``max_output``).
         stderr: Captured standard error (truncated to ``max_output``).
         returncode: Child exit code, or ``None`` if it never exited cleanly.
-        timed_out: True if the wall-clock timeout fired and the group was killed.
+        timed_out: True if the execution exhausted its time budget -- either the
+            wall-clock timeout fired and the group was killed, or the ``RLIMIT_CPU``
+            backstop terminated the child with ``SIGXCPU`` first.
     """
 
     ok: bool
@@ -118,7 +125,12 @@ class Sandbox:
             RuntimeError: If ``use_jail="required"`` but no jailer is on PATH.
         """
         self._timeout = float(timeout)
-        self._cpu_seconds = int(cpu_seconds) if cpu_seconds is not None else int(self._timeout) + 1
+        # ceil, not truncation: a fractional timeout such as 1.5 would otherwise get
+        # a 2-second CPU cap, leaving the rlimit backstop only half a second behind
+        # the wall clock. A busy child then trips RLIMIT_CPU before a contended
+        # parent thread observes its own timeout, and the kill is reported as a
+        # plain non-zero exit instead of a timeout.
+        self._cpu_seconds = int(cpu_seconds) if cpu_seconds is not None else math.ceil(self._timeout) + 1
         self._memory_mb = int(memory_mb)
         self._max_output = int(max_output)
         self._network = bool(network)
@@ -170,7 +182,11 @@ class Sandbox:
             """Apply CPU / address-space rlimits inside the forked child."""
             import resource
 
-            resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
+            # Soft below hard so exhausting the CPU budget raises SIGXCPU, which is
+            # attributable, rather than a bare SIGKILL that is indistinguishable
+            # from an OOM kill. The hard limit still guarantees termination if the
+            # child installs a SIGXCPU handler.
+            resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu + 1))
             if mem_bytes:
                 try:
                     resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
@@ -216,7 +232,11 @@ class Sandbox:
                     stdout=out[: self._max_output],
                     stderr=err[: self._max_output],
                     returncode=proc.returncode,
-                    timed_out=False,
+                    # RLIMIT_CPU is the backstop for the wall clock, so a child it
+                    # kills has exhausted its time budget just as surely as one the
+                    # timeout path reaps -- and it can win the race whenever this
+                    # thread is slow to observe its own deadline.
+                    timed_out=_CPU_BUDGET_RETURNCODE is not None and proc.returncode == _CPU_BUDGET_RETURNCODE,
                 )
             except subprocess.TimeoutExpired:
                 self._kill_group(proc)
@@ -229,7 +249,9 @@ class Sandbox:
                     timed_out=True,
                 )
         except Exception as exc:  # pragma: no cover - launch failure (e.g. missing interpreter)
-            return SandboxResult(ok=False, stdout="", stderr=f"{type(exc).__name__}: {exc}", returncode=None, timed_out=False)
+            return SandboxResult(
+                ok=False, stdout="", stderr=f"{type(exc).__name__}: {exc}", returncode=None, timed_out=False
+            )
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

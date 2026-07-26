@@ -250,8 +250,10 @@ class OwnedPolicySnapshot:
         snapshot's weights up through the normal engine weight refresh.
 
         Returns:
-            Number of bytes released, summed across devices. ``0`` when the
-            snapshot was already released.
+            Logical size of the released arrays, i.e. the sum of ``jax.Array``
+            ``nbytes``. A replicated leaf counts once even though a copy is
+            freed on every device holding it, so this is a lower bound on the
+            HBM actually reclaimed. ``0`` when the snapshot was already released.
         """
         if self._released:
             return 0
