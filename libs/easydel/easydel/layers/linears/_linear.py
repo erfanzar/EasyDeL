@@ -465,6 +465,9 @@ class ParallelLinear(spx.Module):
                 kernel_init=self.kernel_init,
                 bias_init=self.bias_init,
                 config=config,
+                # Fused projections rely on the layout for TP-interleave-aware
+                # activation splits; it must survive quantization.
+                layout=self.layout,
                 **kwargs,
                 rngs=rngs,
             ),

@@ -293,8 +293,14 @@ def _run_runner_generation(model, *, n_seqs, k, disable_batched, prompts, max_ne
     """
     prev_batch = os.environ.get("EASYDEL_DISABLE_BATCHED_DRAFT")
     prev_persist = os.environ.get("EASYDEL_MTP_PERSIST_KV")
+    prev_fused = os.environ.get("EASYDEL_DISABLE_DRAFT_IN_VERIFY")
     os.environ["EASYDEL_DISABLE_BATCHED_DRAFT"] = "1" if disable_batched else "0"
     os.environ["EASYDEL_MTP_PERSIST_KV"] = "1"
+    # This file's runner integration asserts the TWO-DISPATCH pooled batched
+    # draft engages (begin/finish_batched_draft); pin the fused draft-in-verify
+    # program off so that path is actually exercised. The fused path has its
+    # own engagement + parity coverage in ``test_mtp_draft_in_verify.py``.
+    os.environ["EASYDEL_DISABLE_DRAFT_IN_VERIFY"] = "1"
     try:
         runner = eSurgeRunner(
             model=model,
@@ -345,7 +351,11 @@ def _run_runner_generation(model, *, n_seqs, k, disable_batched, prompts, max_ne
         runner.executor_manager.kv_pages = None
         return toks
     finally:
-        for key, prev in (("EASYDEL_DISABLE_BATCHED_DRAFT", prev_batch), ("EASYDEL_MTP_PERSIST_KV", prev_persist)):
+        for key, prev in (
+            ("EASYDEL_DISABLE_BATCHED_DRAFT", prev_batch),
+            ("EASYDEL_MTP_PERSIST_KV", prev_persist),
+            ("EASYDEL_DISABLE_DRAFT_IN_VERIFY", prev_fused),
+        ):
             if prev is None:
                 os.environ.pop(key, None)
             else:

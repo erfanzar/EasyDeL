@@ -138,6 +138,7 @@ def _run(model, *, n, k, disable_emit, prompts, project_rows):
         "fbd": _strategy.DrafterSpeculation.finish_batched_draft,
         "emit": os.environ.get("EASYDEL_DISABLE_BATCHED_EMIT"),
         "persist": os.environ.get("EASYDEL_MTP_PERSIST_KV"),
+        "fused": os.environ.get("EASYDEL_DISABLE_DRAFT_IN_VERIFY"),
     }
 
     def _spy_project(self, hr):
@@ -151,6 +152,11 @@ def _run(model, *, n, k, disable_emit, prompts, project_rows):
     _strategy.DrafterSpeculation.finish_batched_draft = _fake_finish_batched_draft
     os.environ["EASYDEL_DISABLE_BATCHED_EMIT"] = "1" if disable_emit else "0"
     os.environ["EASYDEL_MTP_PERSIST_KV"] = "1"
+    # This test isolates the two-dispatch EMISSION batching (host-loop argmax
+    # consumption + drafter fakes); pin the fused draft-in-verify program off so
+    # both arms run the faked project/draft seams it compares. The fused path
+    # has its own parity coverage in ``test_mtp_draft_in_verify.py``.
+    os.environ["EASYDEL_DISABLE_DRAFT_IN_VERIFY"] = "1"
     try:
         runner = eSurgeRunner(
             model=model, hbm_utilization=0.05, page_size=16, max_cache_tokens=4096,
@@ -212,7 +218,11 @@ def _run(model, *, n, k, disable_emit, prompts, project_rows):
         _strategy.DrafterSpeculation.draft_next_batched = saved["dnb"]
         _strategy.DrafterSpeculation.begin_batched_draft = saved["bbd"]
         _strategy.DrafterSpeculation.finish_batched_draft = saved["fbd"]
-        for key, val in (("EASYDEL_DISABLE_BATCHED_EMIT", saved["emit"]), ("EASYDEL_MTP_PERSIST_KV", saved["persist"])):
+        for key, val in (
+            ("EASYDEL_DISABLE_BATCHED_EMIT", saved["emit"]),
+            ("EASYDEL_MTP_PERSIST_KV", saved["persist"]),
+            ("EASYDEL_DISABLE_DRAFT_IN_VERIFY", saved["fused"]),
+        ):
             if val is None:
                 os.environ.pop(key, None)
             else:
