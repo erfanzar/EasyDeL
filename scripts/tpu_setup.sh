@@ -267,6 +267,15 @@ log_success "eopod configured successfully"
 log_warning "IMPORTANT: Press Enter during first execution to accept terms (terms may not be displayed)"
 echo ""
 
+# eopod (>=0.0.36) renders command output through rich with forced terminal
+# styling even when piped: status markers come back as e.g.
+# "__EASYDEL_REMOTE_EXIT_STATUS__:\e[1;36m0\e[0m" and spinner frames are
+# carriage-return separated. Strip ANSI escapes and turn \r into newlines so
+# the marker/IP parsing below keeps working.
+strip_eopod_ansi() {
+  sed -u -e 's/\x1b\[[0-9;?]*[a-zA-Z]//g' -e 's/\x1b\][^\x07]*\x07//g' -e 's/\r/\n/g'
+}
+
 emit_eopod_payload_output() {
   awk '
     /^Output:$/ { in_output = 1; next }
@@ -330,6 +339,7 @@ exit \${status}"
   output="$("$LOCAL_EOPOD_PATH" run --no-stream --timeout "$timeout" "printf %s ${encoded_payload} | base64 -d | bash" 2>&1)"
   status=$?
   set -e
+  output="$(strip_eopod_ansi <<< "$output")"
 
   remote_status="$(sed -n 's/.*__EASYDEL_REMOTE_EXIT_STATUS__:\([0-9][0-9]*\).*/\1/p' <<< "$output" | tail -n1)"
   if (( status != 0 )) || [ -z "${remote_status:-}" ] || (( remote_status != 0 )); then
@@ -363,6 +373,7 @@ run_on_tpu_stream() {
 
   set +e
   "$LOCAL_EOPOD_PATH" run --timeout "$timeout" "bash ${remote_script}" 2>&1 \
+    | strip_eopod_ansi \
     | tee "$output_file" \
     | awk '
       /^__EASYDEL_REMOTE_EXIT_STATUS__:/ { next }
@@ -565,6 +576,7 @@ configure_ray_on_tpu() {
     log_error "Failed to fetch TPU internal IPs"
     return 1
   fi
+  internal_ips_output="$(strip_eopod_ansi <<< "$internal_ips_output")"
   internal_ips_str="$(tr -d '[:space:]' <<< "$internal_ips_output")"
   if [ -z "${internal_ips_str:-}" ]; then
     log_error "No TPU internal IPs returned by eopod"
