@@ -25,6 +25,7 @@ from easydel.infra.base_state import EasyDeLState
 from easydel.utils import Registry
 from easydel.utils.helpers import capture_time
 
+from .._shared import drop_optimizer_state
 from ..group_relative_policy_optimization import GRPOTrainer
 from ..metrics import _host_scalar_float
 from ..model_loading import disable_state_dropout, reject_string_model_id
@@ -93,11 +94,18 @@ class MiniLLMTrainer(GRPOTrainer):
             data_tokenize_fn=data_tokenize_fn,
         )
         if teacher_model is None:
+            if self.ref_state is None:
+                raise ValueError(
+                    "MiniLLM distills against a frozen teacher, but no `teacher_model` was given and "
+                    f"`beta={arguments.beta}` disables the inherited GRPO reference model. Pass a "
+                    "`teacher_model` or set a non-zero `beta` so a reference state is allocated."
+                )
             self.teacher_state = self.ref_state
         elif isinstance(teacher_model, EasyDeLState):
             self.teacher_state = teacher_model
         else:
             self.teacher_state = teacher_model.to_state(trainable_selector=arguments.trainable_selector)
+        self.teacher_state = drop_optimizer_state(self.teacher_state)
         if arguments.disable_dropout:
             self.teacher_state = disable_state_dropout(self.teacher_state)
 

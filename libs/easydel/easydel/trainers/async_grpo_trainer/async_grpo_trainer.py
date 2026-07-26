@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import typing as tp
 from dataclasses import dataclass
 
@@ -26,11 +27,14 @@ from easydel.infra.base_state import EasyDeLState
 from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLPreemptionSignal, EasyDeLTimerError
 from easydel.infra.loss_utils import LossMetrics
 from easydel.utils import Registry
-from easydel.utils.helpers import capture_time
+from easydel.utils.helpers import capture_time, get_logger
 
+from .._shared import OwnedPolicySnapshot
 from ..group_relative_policy_optimization import GRPOTrainer
 from ..metrics import BaseProgressBar, MetricsTracker, StepMetrics
 from .async_grpo_config import AsyncGRPOConfig
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -107,14 +111,13 @@ class AsyncGRPOTrainer(GRPOTrainer):
             environment_factory=environment_factory,
         )
 
-    @staticmethod
-    def _copy_rollout_leaf(value: object) -> object:
-        """Return an independent copy for JAX array leaves used by the actor."""
-        if isinstance(value, jax.Array):
-            return value.copy()
-        return value
-
-    def _copy_rollout_policy_state(self, state: EasyDeLState, *, cache_scope_key: str) -> EasyDeLState:
+    def _take_rollout_snapshot(
+        self,
+        state: EasyDeLState,
+        *,
+        policy_step: int,
+        cache_scope_key: str,
+    ) -> OwnedPolicySnapshot:
         """Build an inference-only policy snapshot for background rollouts.
 
         The snapshot owns separate JAX buffers for model graph leaves so the
@@ -122,15 +125,68 @@ class AsyncGRPOTrainer(GRPOTrainer):
         transform and optimizer slots are intentionally dropped: eSurge
         generation and policy log-prob scoring only need the model graph.
         """
-        rollout_state = state.replace(
-            step=self._copy_rollout_leaf(state.step),
-            graphstate=jax.tree_util.tree_map(self._copy_rollout_leaf, state.graphstate),
-            graphother=jax.tree_util.tree_map(self._copy_rollout_leaf, state.graphother),
-            tx=None,
-            opt_state=None,
-            esurge_cache_scope_key=cache_scope_key,
+        return OwnedPolicySnapshot.from_training_state(
+            state,
+            policy_step=policy_step,
+            cache_scope_key=cache_scope_key,
         )
-        return jax.block_until_ready(rollout_state)
+
+    def _sync_rollout_snapshot(
+        self,
+        snapshot: OwnedPolicySnapshot | None,
+        policy_state: EasyDeLState,
+        policy_step: int,
+        *,
+        force: bool,
+        can_release: bool,
+        cache_scope_key: str,
+    ) -> tuple[OwnedPolicySnapshot, float]:
+        """Return an up-to-date rollout snapshot and the seconds spent syncing.
+
+        The snapshot is reused until ``weight_sync_steps`` optimizer steps have
+        elapsed since it was taken (or ``force`` demands a fresh policy). On a
+        refresh the outgoing snapshot is released *before* its replacement is
+        allocated, so only one extra copy of the policy is ever resident;
+        reference counting cannot achieve that because the cached eSurge engine
+        keeps its own reference to the graph trees it last generated from.
+
+        Releasing is only safe when nothing is reading the outgoing snapshot,
+        which the caller asserts through ``can_release``; the engine that
+        generated from it must be idle and will pick the replacement's weights
+        up through ``get_esurge``'s weight refresh before it executes again.
+
+        Args:
+            snapshot: Current snapshot, or ``None`` on the first sync.
+            policy_state: Live training state to copy from.
+            policy_step: Optimizer step of ``policy_state``.
+            force: Refresh regardless of the sync interval.
+            can_release: Whether no rollout is reading ``snapshot``. When
+                ``False`` the outgoing snapshot is merely dereferenced.
+            cache_scope_key: eSurge cache scope for the snapshot's engine.
+
+        Returns:
+            ``(snapshot, sync_seconds)`` where ``sync_seconds`` is ``0.0`` when
+            the existing snapshot was reused.
+        """
+        sync_interval = int(self.arguments.weight_sync_steps)
+        if snapshot is not None and not force and policy_step - snapshot.policy_step < sync_interval:
+            return snapshot, 0.0
+        with capture_time() as sync_time:
+            if snapshot is not None:
+                if can_release:
+                    snapshot.release()
+                else:
+                    # Unreachable through `_train_epoch`, which consumes the
+                    # in-flight rollout before every sync. Dereference instead so
+                    # a future edit cannot free buffers a worker is still reading.
+                    logger.debug("Rollout in flight during policy sync; deferring snapshot release to GC")
+                snapshot = None
+            snapshot = self._take_rollout_snapshot(
+                policy_state,
+                policy_step=policy_step,
+                cache_scope_key=cache_scope_key,
+            )
+        return snapshot, float(sync_time())
 
     def _store_buffered_grpo_batch(
         self,
@@ -288,6 +344,12 @@ class AsyncGRPOTrainer(GRPOTrainer):
         step consumes that future if its policy staleness is within
         ``max_staleness``; otherwise it regenerates synchronously with the
         current state.
+
+        Rollouts read a params-only :class:`OwnedPolicySnapshot` rather than the
+        live state, which the compiled step donates. Exactly one snapshot is
+        resident at a time: :meth:`_sync_rollout_snapshot` frees the outgoing
+        one before allocating its replacement, and the epoch's cleanup releases
+        the last one once the rollout workers have joined.
         """
         data_collator = self.data_collator
         if data_collator is None:
@@ -305,8 +367,7 @@ class AsyncGRPOTrainer(GRPOTrainer):
         pending_data_time = 0.0
         pending_sync_time = 0.0
         pending_batch = None
-        rollout_state_snapshot: EasyDeLState | None = None
-        rollout_state_step = -1
+        rollout_snapshot: OwnedPolicySnapshot | None = None
         rollout_cache_scope_key = f"{state.esurge_cache_scope_key}-async-grpo-rollout"
         max_workers = max(1, min(int(self.arguments.max_inflight_tasks), 2))
 
@@ -331,31 +392,43 @@ class AsyncGRPOTrainer(GRPOTrainer):
                 produced_at_step=produced_at_step,
             )
 
-        def ensure_rollout_state(
+        def ensure_rollout_snapshot(
             policy_state: EasyDeLState,
             policy_step: int,
             *,
             force: bool = False,
-        ) -> tuple[EasyDeLState, int, float]:
-            nonlocal rollout_state_snapshot, rollout_state_step
-            sync_interval = int(self.arguments.weight_sync_steps)
-            if rollout_state_snapshot is not None and not force and policy_step - rollout_state_step < sync_interval:
-                return rollout_state_snapshot, rollout_state_step, 0.0
-            old_snapshot = rollout_state_snapshot
-            rollout_state_snapshot = None
-            del old_snapshot
-            with capture_time() as sync_time:
-                rollout_state_snapshot = self._copy_rollout_policy_state(
-                    policy_state,
-                    cache_scope_key=rollout_cache_scope_key,
-                )
-            rollout_state_step = policy_step
-            return rollout_state_snapshot, rollout_state_step, float(sync_time())
+        ) -> tuple[OwnedPolicySnapshot, float]:
+            """Refresh the loop's rollout snapshot through :meth:`_sync_rollout_snapshot`."""
+            nonlocal rollout_snapshot
+            rollout_snapshot, sync_seconds = self._sync_rollout_snapshot(
+                rollout_snapshot,
+                policy_state,
+                policy_step,
+                force=force,
+                can_release=pending_future is None,
+                cache_scope_key=rollout_cache_scope_key,
+            )
+            return rollout_snapshot, sync_seconds
 
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=max_workers,
-            thread_name_prefix="async-grpo-rollout",
-        ) as executor:
+        def release_rollout_snapshot() -> None:
+            """Free the snapshot's device buffers once no worker can read them."""
+            nonlocal rollout_snapshot
+            if rollout_snapshot is not None:
+                rollout_snapshot.release()
+                rollout_snapshot = None
+
+        with contextlib.ExitStack() as cleanup:
+            # Registered before the executor so it unwinds *after* the executor
+            # has joined its rollout workers: the snapshot is then unreachable
+            # and its buffers are freed on every exit path (break, return, raise)
+            # rather than being held until the next epoch overwrites it.
+            cleanup.callback(release_rollout_snapshot)
+            executor = cleanup.enter_context(
+                concurrent.futures.ThreadPoolExecutor(
+                    max_workers=max_workers,
+                    thread_name_prefix="async-grpo-rollout",
+                )
+            )
             while True:
                 with capture_time() as iteration_time:
                     current_step = int(jax.device_get(state.step))
@@ -369,15 +442,12 @@ class AsyncGRPOTrainer(GRPOTrainer):
                         with capture_time() as rollout_wait_time:
                             if pending_future is None:
                                 pending_batch, pending_data_time = fetch_batch()
-                                rollout_state, rollout_policy_step, pending_sync_time = ensure_rollout_state(
-                                    state,
-                                    current_step,
-                                )
+                                snapshot, pending_sync_time = ensure_rollout_snapshot(state, current_step)
                                 pending_future = submit_rollout(
                                     executor,
-                                    rollout_state=rollout_state,
+                                    rollout_state=snapshot.state,
                                     rollout_batch=pending_batch,
-                                    produced_at_step=rollout_policy_step,
+                                    produced_at_step=snapshot.policy_step,
                                 )
                             rollout = pending_future.result(timeout=float(self.arguments.request_timeout))
                         rollout_wait_seconds = float(rollout_wait_time())
@@ -396,15 +466,15 @@ class AsyncGRPOTrainer(GRPOTrainer):
 
                     rollout_staleness = max(0, current_step - int(rollout.produced_at_step))
                     if rollout_staleness > int(self.arguments.max_staleness):
-                        rollout_state, rollout_policy_step, rollout_sync_seconds = ensure_rollout_state(
+                        snapshot, rollout_sync_seconds = ensure_rollout_snapshot(
                             state,
                             current_step,
                             force=True,
                         )
                         rollout = self._preprocess_async_rollout(
-                            state=rollout_state,
+                            state=snapshot.state,
                             batch=tp.cast(dict[str, object], pending_batch),
-                            produced_at_step=rollout_policy_step,
+                            produced_at_step=snapshot.policy_step,
                         )
                         rollout_staleness = 0
                         rollout_wait_seconds = 0.0
@@ -418,15 +488,12 @@ class AsyncGRPOTrainer(GRPOTrainer):
                     next_data_time = 0.0
                     if schedule_next:
                         next_batch, next_data_time = fetch_batch()
-                        rollout_state, rollout_policy_step, pending_sync_time = ensure_rollout_state(
-                            state,
-                            current_step,
-                        )
+                        snapshot, pending_sync_time = ensure_rollout_snapshot(state, current_step)
                         pending_future = submit_rollout(
                             executor,
-                            rollout_state=rollout_state,
+                            rollout_state=snapshot.state,
                             rollout_batch=next_batch,
-                            produced_at_step=rollout_policy_step,
+                            produced_at_step=snapshot.policy_step,
                         )
                         pending_batch = next_batch
 
@@ -435,6 +502,8 @@ class AsyncGRPOTrainer(GRPOTrainer):
                     rollout.informations["async_grpo/rollout_preprocessing_time"] = rollout.preprocessing_time
                     rollout.informations["async_grpo/policy_sync_time"] = rollout_sync_seconds
                     rollout.informations["async_grpo/next_rollout_scheduled"] = int(schedule_next)
+                    if rollout_snapshot is not None:
+                        rollout.informations["async_grpo/policy_snapshot_gib"] = rollout_snapshot.nbytes / 1024**3
 
                     with self.train_tracker.trace_compilation():
                         with capture_time() as execution_time:

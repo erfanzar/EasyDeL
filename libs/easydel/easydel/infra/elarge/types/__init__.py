@@ -62,11 +62,13 @@ from .quantization import EasyDeLQuantizationCfg, QuantizationCfg
 from .root import eLMConfig
 from .training import (
     BASE_TRAINER_DEFAULTS,
+    ELARGE_ONLY_TRAINER_KEYS,
     TRAINER_SPECIFIC_DEFAULTS,
     AgenticMoshPitTrainerCfg,
     AsyncGRPOTrainerCfg,
     BaseTrainerCfg,
     BCOTrainerCfg,
+    CompactionRLTrainerCfg,
     CPOTrainerCfg,
     DistillationTrainerCfg,
     DPOTrainerCfg,
@@ -92,6 +94,7 @@ from .training import (
     RewardTrainerCfg,
     RLOOTrainerCfg,
     RLVRTrainerCfg,
+    SAOTrainerCfg,
     SDFTTrainerCfg,
     SDPOTrainerCfg,
     SeqKDTrainerCfg,
@@ -111,6 +114,7 @@ from .training import (
 
 __all__ = (
     "BASE_TRAINER_DEFAULTS",
+    "ELARGE_ONLY_TRAINER_KEYS",
     "TRAINER_SPECIFIC_DEFAULTS",
     "AgenticMoshPitTrainerCfg",
     "AsyncGRPOTrainerCfg",
@@ -121,6 +125,7 @@ __all__ = (
     "BenchmarkTask",
     "BenchmarkTasks",
     "CPOTrainerCfg",
+    "CompactionRLTrainerCfg",
     "DPOTrainerCfg",
     "DPPOTrainerCfg",
     "DTypeLike",
@@ -161,6 +166,7 @@ __all__ = (
     "RLVRTrainerCfg",
     "ResolvedBenchmarkConfig",
     "RewardTrainerCfg",
+    "SAOTrainerCfg",
     "SDFTTrainerCfg",
     "SDPOTrainerCfg",
     "SFTTrainerCfg",

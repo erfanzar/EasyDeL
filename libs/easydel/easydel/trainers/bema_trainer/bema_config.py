@@ -116,7 +116,10 @@ class BEMACallback:
 
         beta = self._ema_beta(step)
         alpha = self._bema_alpha(step)
-        current_graphstate = self._copy_graphstate(graphstate)
+        # No copy of `graphstate`: it is only read as an operand below and both
+        # tree maps allocate their outputs, so copying it here would add a
+        # transient full parameter set on top of the three BEMA snapshots.
+        current_graphstate = graphstate
 
         def _update(current: object, theta0: object, ema: object) -> object:
             """Compute the bias-corrected BEMA leaf for one pytree position.
@@ -158,6 +161,13 @@ class BEMACallback:
         divides the current step offset. When an update is due, only the
         graphstate is replaced; optimizer state and other reference metadata are
         preserved.
+
+        The reference shares the BEMA snapshot's arrays rather than copying them.
+        BEMA never mutates a snapshot in place -- :meth:`update_graphstate`
+        rebinds ``_bema_graphstate`` to freshly allocated arrays -- and the
+        reference is a non-donated input to the compiled step, so a copy would
+        just keep a fourth parameter set resident alongside ``theta0``, ``ema``,
+        and ``bema``.
         """
         bema_graphstate = self.update_graphstate(policy_state.graphstate, step)
         if (
@@ -167,7 +177,7 @@ class BEMACallback:
             or (step - self.ref_model_update_after) % self.ref_model_update_freq != 0
         ):
             return reference_state
-        return reference_state.replace(graphstate=self._copy_graphstate(bema_graphstate))
+        return reference_state.replace(graphstate=bema_graphstate)
 
     def on_step_end(self, *args: tp.Any, **kwargs: tp.Any) -> None:
         """Compatibility no-op for external callback lists.

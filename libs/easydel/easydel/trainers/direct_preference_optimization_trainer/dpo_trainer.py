@@ -27,7 +27,6 @@ import typing as tp
 from collections import defaultdict
 from functools import partial
 
-import jax
 import numpy as np
 from eformer.loggings import get_logger
 from tqdm.autonotebook import tqdm
@@ -37,8 +36,8 @@ from easydel.infra.base_state import EasyDeLState
 from easydel.infra.sharding import replicated_named_sharding
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
-from easydel.utils.traversals import deepcopy_model
 
+from .._shared import copy_frozen_policy, drop_optimizer_state, polyak_update_reference_graphstate
 from ..base_trainer import TrainerConfigureFunctionOutput  # pyright: ignore[reportPrivateLocalImportUsage]
 from ..model_loading import disable_state_dropout, reject_string_model_id
 from ..prompt_transforms import DPOPreprocessTransform
@@ -112,16 +111,17 @@ class DPOTrainer(Trainer):
     ):
         """Initialize the DPO trainer.
 
-        Resolves the policy and reference states (deep-copying the
-        policy when no reference is provided), configures the padding
+        Resolves the policy and reference states (copying the policy's
+        parameters when no reference is provided), configures the padding
         value, builds the default preference collators, and forwards
-        construction to :class:`Trainer`.
+        construction to :class:`Trainer`. The reference never keeps optimizer
+        slots: it is frozen, so only ``graphstate``/``graphother`` are needed.
 
         Args:
             arguments: DPO-specific training configuration.  Required.
             model: Policy module or state.
-            reference_model: Optional reference module/state; deep-
-                copied from ``model`` when omitted.
+            reference_model: Optional reference module/state; its
+                parameters are copied from ``model`` when omitted.
             processing_class: Tokenizer/processor used to encode
                 preference triples.
             train_dataset: Training dataset of preference triples.
@@ -202,10 +202,11 @@ class DPOTrainer(Trainer):
         if not isinstance(model, EasyDeLState):
             model = model.to_state(trainable_selector=arguments.trainable_selector)
         if reference_model is None:
-            reference_model = deepcopy_model(model)
+            reference_model = copy_frozen_policy(model)
         if not isinstance(reference_model, EasyDeLState):
             reference_model = reference_model.to_state(trainable_selector=arguments.trainable_selector)
 
+        reference_model = drop_optimizer_state(reference_model)
         self.reference_state: EasyDeLState | None = reference_model
         if arguments.disable_dropout:
             model, reference_model = self._disable_state_dropout(model, reference_model)
@@ -746,11 +747,11 @@ class DPOTrainer(Trainer):
             and self.reference_state is not None
             and (step % self.arguments.ref_model_sync_steps == 0)
         ):
-            alpha = self.arguments.ref_model_mixup_alpha
-            new_graphstate = jax.tree_util.tree_map(
-                lambda new, old: alpha * new + (1 - alpha) * old,
-                deepcopy_model(state.graphstate),
-                self.reference_state.graphstate,
+            self.reference_state = self.reference_state.replace(
+                graphstate=polyak_update_reference_graphstate(
+                    self.reference_state.graphstate,
+                    state.graphstate,
+                    alpha=self.arguments.ref_model_mixup_alpha,
+                )
             )
-            self.reference_state = self.reference_state.replace(graphstate=new_graphstate)
         return state, metrics

@@ -27,8 +27,21 @@ have their own MRO constraints:
 * :func:`gather_multimodal_kwargs` -- collects optional vision-tower
   inputs (``pixel_values``, ``pixel_attention_mask``, ``image_sizes``)
   and the MoE auxiliary-loss flag from a batch dict.
+* :class:`OwnedPolicySnapshot` -- a params-only policy copy with an
+  explicit release, used by asynchronous RL trainers whose rollouts
+  cannot read the donated live training state.
+* :func:`polyak_update_reference_graphstate` -- the ``sync_ref_model``
+  reference refresh shared by GRPO, XPO, DPO, and SDPO.
+* :func:`drop_optimizer_state` / :func:`copy_frozen_policy` -- keep frozen
+  teacher/reference/target states parameters-only.
 """
 
+from .policy_snapshot import (
+    OwnedPolicySnapshot,
+    copy_frozen_policy,
+    drop_optimizer_state,
+    polyak_update_reference_graphstate,
+)
 from .preference_config_helpers import normalize_logprob_vocab_chunk_size
 from .preference_forward_helpers import (
     apply_paired_truncation,
@@ -36,7 +49,11 @@ from .preference_forward_helpers import (
 )
 
 __all__ = [
+    "OwnedPolicySnapshot",
     "apply_paired_truncation",
+    "copy_frozen_policy",
+    "drop_optimizer_state",
     "gather_multimodal_kwargs",
     "normalize_logprob_vocab_chunk_size",
+    "polyak_update_reference_graphstate",
 ]

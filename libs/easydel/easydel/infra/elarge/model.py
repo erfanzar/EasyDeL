@@ -75,6 +75,7 @@ from .processing import (
     write_text_atomic,
 )
 from .types import (
+    ELARGE_ONLY_TRAINER_KEYS,
     BenchmarkConfig,
     EvalKwargs,
     eLMConfig,
@@ -144,10 +145,20 @@ class BuildTrainerKws(typing.TypedDict, total=False):
         teacher_model: :class:`EasyDeLBaseModule` whose logits drive the
             distillation losses in distillation/on-policy-distillation/SeqKD
             and sparse distillation trainers.
+        critic_model: Optional base model used to initialize the independently
+            optimized SAO/CompactionRL critic. When omitted, those trainers
+            initialize the critic from the actor.
+        critic_state: Optional prebuilt value-head critic state for
+            SAO/CompactionRL.
+        critic_trainable_selector: Optional SpectraX selector overriding the
+            online actor/critic trainer's structural critic-freezing policy.
         reward_funcs: Single callable or list of callables of signature
             ``(prompts, completions, **kwargs) -> list[float]`` consumed by
             GRPO/SDPO/PPO-flavored trainers in lieu of (or in addition to) a
             learned reward model.
+        rollout_provider: Runtime callable that produces token-aligned online
+            RL trajectory batches. Used by SAO and CompactionRL for multi-turn
+            or asynchronous rollout collection.
         external_reward_funcs: Auxiliary list of callables that augment the
             primary RLVR/GRPO reward signal (e.g. format-checkers, math
             verifiers, code-test runners) without replacing it.
@@ -169,6 +180,10 @@ class BuildTrainerKws(typing.TypedDict, total=False):
             AgenticMoshPit trainer; typically aligned with ``tool_names`` on
             the trainer config so that the registered names resolve to these
             objects.
+        tool_guard: Optional runtime tool-call guard used by CompactionRL.
+        compaction_controller: Optional runtime context-compaction controller
+            used by CompactionRL. The trainer builds its default controller
+            from serializable config fields when this is omitted.
     """
 
     data_collator: NotRequired[typing.Callable]
@@ -179,7 +194,11 @@ class BuildTrainerKws(typing.TypedDict, total=False):
     reward_model: NotRequired[EasyDeLBaseModule | None]
     target_model: NotRequired[EasyDeLBaseModule | None]
     teacher_model: NotRequired[EasyDeLBaseModule | None]
+    critic_model: NotRequired[EasyDeLBaseModule | None]
+    critic_state: NotRequired[EasyDeLState | None]
+    critic_trainable_selector: NotRequired[Any | None]
     reward_funcs: NotRequired[Any | None]
+    rollout_provider: NotRequired[typing.Callable | None]
     external_reward_funcs: NotRequired[Any | None]
     external_reward_processing_classes: NotRequired[list[typing.Callable] | None]
     external_reward_weights: NotRequired[list[float] | None]
@@ -188,6 +207,8 @@ class BuildTrainerKws(typing.TypedDict, total=False):
     environment_factory: NotRequired[typing.Callable | None]
     bema_callback: NotRequired[Any | None]
     tools: NotRequired[list | None]
+    tool_guard: NotRequired[Any | None]
+    compaction_controller: NotRequired[Any | None]
 
 
 class eLargeModel:
@@ -1705,6 +1726,7 @@ class eLargeModel:
         prompt_only_trainers = {
             "agentic-moshpit",
             "async_grpo",
+            "compaction_rl",
             "dppo",
             "gfpo",
             "grpo",
@@ -1719,6 +1741,7 @@ class eLargeModel:
             "ppo",
             "rlvr",
             "rloo",
+            "sao",
             "sdft",
             "sdpo",
             "seq_kd",
@@ -1727,7 +1750,9 @@ class eLargeModel:
             "xpo",
         }
         if trainer_type in prompt_only_trainers:
-            transform_cls = PPOPreprocessTransform if trainer_type == "ppo" else GRPOPreprocessTransform
+            transform_cls = (
+                PPOPreprocessTransform if trainer_type in {"compaction_rl", "ppo", "sao"} else GRPOPreprocessTransform
+            )
             return transform_cls(
                 tokenizer=tokenizer,
                 max_prompt_length=arguments.max_prompt_length,
@@ -2090,6 +2115,9 @@ class eLargeModel:
                 - "dpo": Direct Preference Optimization
                 - "orpo": Odds Ratio Preference Optimization
                 - "grpo": Group Relative Policy Optimization
+                - "ppo": Proximal Policy Optimization
+                - "sao": Single-Rollout Asynchronous Optimization
+                - "compaction_rl": Compaction Reinforcement Learning
                 - "sdpo": Self-Distillation Policy Optimization
                 - "reward": Reward model training
                 - "distillation": Knowledge distillation
@@ -2234,8 +2262,16 @@ class eLargeModel:
                     for speculative-decoding drafter training.
                 teacher_model (EasyDeLBaseModule | None): Teacher model for
                     distillation training.
+                critic_model (EasyDeLBaseModule | None): Optional critic
+                    initialization model for SAO/CompactionRL.
+                critic_state (EasyDeLState | None): Optional prebuilt critic
+                    state for SAO/CompactionRL.
+                critic_trainable_selector (Any | None): Optional structural
+                    selector for critic parameters.
                 reward_funcs (Any | None): Custom reward functions for
                     GRPO/SDPO/PPO-style trainers.
+                rollout_provider (Callable | None): Runtime online-RL rollout
+                    provider for SAO/CompactionRL.
                 external_reward_funcs (Any | None): Additional RLVR reward
                     functions appended after built-in verifiers.
                 external_reward_processing_classes (list[Callable] | None):
@@ -2246,8 +2282,12 @@ class eLargeModel:
                     callback for SDPO.
                 env_factory (Callable | None): Environment factory for the
                     AgenticMoshPit trainer.
-                tools (list | None): Tool instances for the AgenticMoshPit
-                    trainer.
+                environment_factory (Callable | None): Environment-factory
+                    alias used by online agentic trainers.
+                tools (list | None): Tool instances for agentic trainers.
+                tool_guard (Any | None): Optional CompactionRL tool guard.
+                compaction_controller (Any | None): Optional CompactionRL
+                    context controller.
 
         Returns:
             Training results from the trainer, including metrics and final model state
@@ -2317,7 +2357,7 @@ class eLargeModel:
         # build_trainer (TrainingBucket objects + resolved BucketRule + built
         # sources), not through TrainingArguments. Strip the raw eLarge keys so
         # they don't leak into the dataclass (which uses different field names).
-        for _bk in ("bucket_configs", "bucket_rule", "bucket_datasets"):
+        for _bk in ELARGE_ONLY_TRAINER_KEYS:
             config_for_args.pop(_bk, None)
 
         try:
@@ -2648,6 +2688,34 @@ class eLargeModel:
             trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes", None)
             trainer_kwargs["data_tokenize_fn"] = kwargs.get("data_tokenize_fn", None)
 
+        elif trainer_type in {"compaction_rl", "sao"}:
+            if reward_funcs is None and reward_model is None:
+                reward_model = self.build_reward_model()
+
+            resolved_reward = reward_funcs if reward_funcs is not None else reward_model
+            if resolved_reward is None:
+                raise ValueError(
+                    f"{trainer_type} training requires `reward_model` (config key) or `reward_funcs` (runtime kwarg)."
+                )
+
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["reward_funcs"] = resolved_reward
+            trainer_kwargs["critic_model"] = kwargs.get("critic_model")
+            trainer_kwargs["critic_state"] = kwargs.get("critic_state")
+            trainer_kwargs["critic_trainable_selector"] = kwargs.get("critic_trainable_selector")
+            trainer_kwargs["rollout_provider"] = kwargs.get("rollout_provider")
+            trainer_kwargs["environment_factory"] = kwargs.get("environment_factory", kwargs.get("env_factory"))
+            trainer_kwargs["tools"] = kwargs.get("tools")
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes")
+            trainer_kwargs["data_tokenize_fn"] = kwargs.get("data_tokenize_fn")
+            if trainer_type == "compaction_rl":
+                trainer_kwargs["compaction_controller"] = kwargs.get("compaction_controller")
+                trainer_kwargs["tool_guard"] = kwargs.get("tool_guard")
+
         elif trainer_type == "ppo":
             if reward_funcs is None and reward_model is None:
                 reward_model = self.build_reward_model()
@@ -2872,10 +2940,16 @@ class eLargeModel:
                     "reward_processing_classes",
                     "data_tokenize_fn",
                     "feedback_func",
+                    "critic_model",
+                    "critic_state",
+                    "critic_trainable_selector",
+                    "rollout_provider",
                     "env_factory",
                     "environment_factory",
                     "bema_callback",
                     "tools",
+                    "tool_guard",
+                    "compaction_controller",
                 ]:
                     trainer_kwargs[key] = value
 

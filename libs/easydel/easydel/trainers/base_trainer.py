@@ -85,6 +85,7 @@ from easydel.infra.loss_utils import LossMetrics
 from easydel.infra.sharding import replicated_named_sharding
 from easydel.infra.utils import CompilationTracker
 from easydel.trainers.pose import apply_pose_to_batch, validate_pose_target_max_pos
+from easydel.trainers.process_encoder import EncoderProcessor, validate_process_encoder
 from easydel.utils import Timers, is_remote_path, readme_generator
 from easydel.utils.lazy_import import is_package_available
 from easydel.utils.traversals import specs_to_name_sharding
@@ -371,6 +372,16 @@ class BaseTrainer(BaseTrainerProtocol):
     # trainers (SFT, ...) leave this True; RL/online and paired-preference trainers whose
     # data path is incompatible override it to False so the flag is warned-and-ignored.
     supports_sequence_packing: tp.ClassVar[bool] = True
+
+    # Class-level fallbacks for flags ``__init__`` populates. Step, checkpoint, and
+    # preprocessing methods are routinely exercised against partially built
+    # instances (``object.__new__(Trainer)``), where reading these should mean
+    # "no buckets / no user collator" rather than raising AttributeError. A real
+    # ``__init__`` always overwrites both. Unannotated on purpose so subclass
+    # dataclass processing cannot turn them into fields.
+    _has_buckets = False
+    _user_data_collator = False
+    _encoder_processor = None
     _RUNTIME_MODEL_OVERRIDE_STATE_ATTRS: tp.ClassVar[frozenset[str]] = frozenset(
         {
             "model_state",
@@ -554,6 +565,7 @@ class BaseTrainer(BaseTrainerProtocol):
                     actual_step = int(jax.device_get(resumed_state.step))
                     logger.info(f"Successfully resumed from checkpoint at step {actual_step}")
 
+                    self._load_auxiliary_states(checkpoint_path)
                     model_state = resumed_state
                     self._resumed_from_checkpoint = True
                     self._maybe_remove_loaded_checkpoint(checkpoint_path)
@@ -573,6 +585,7 @@ class BaseTrainer(BaseTrainerProtocol):
         self.finetune = finetune
         self.processing_class = processing_class
         self._pose_image_token_id, self._pose_pad_id = self._setup_pose()
+        self._encoder_processor = self._setup_process_encoder()
 
         if self.data_collator is None and getattr(self.arguments, "use_data_collator", True):
             base_collator = self.create_collect_function(
@@ -2643,6 +2656,53 @@ class BaseTrainer(BaseTrainerProtocol):
             pad_id=self._pose_pad_id,
         )
 
+    def _setup_process_encoder(self) -> EncoderProcessor | None:
+        """Resolve the vision-encoder binding once, at construction.
+
+        Returns ``None`` when the feature is disabled, so the per-microbatch hook costs a
+        single ``None`` check on text-only runs. Validation happens here rather than mid-
+        training so an unsupported model or a trainable-tower conflict fails before the
+        first step instead of quietly training the wrong thing.
+        """
+        config = getattr(self.arguments, "process_encoder", None)
+        if config is None or not config.enabled:
+            return None
+        model = self.model_state.model if getattr(self, "model_state", None) is not None else self.model
+        binding = validate_process_encoder(
+            config,
+            model,
+            trainable_selector=getattr(self.arguments, "trainable_selector", None),
+        )
+        if binding is None:
+            return None
+        return EncoderProcessor(model, config, binding=binding)
+
+    def _apply_process_encoder_to_batch(self, batch: tp.Any, step: int) -> tp.Any:
+        """Host-side, pre-forward vision-encoder processing on a collated batch.
+
+        Runs the model's vision tower out of band on the batch's vision-bearing rows and
+        swaps ``pixel_values`` for the precomputed patch embeddings, so the jitted step
+        neither re-runs the tower nor backpropagates through it. A no-op unless
+        ``arguments.process_encoder.enabled``; see
+        :mod:`easydel.trainers.process_encoder` for the ordering contract that makes
+        dropping text-only rows exact.
+
+        Args:
+            batch: The collated microbatch.
+            step: Current global step, used for bucket routing.
+
+        Returns:
+            The batch, with vision features substituted when processing ran.
+        """
+        processor = getattr(self, "_encoder_processor", None)
+        if processor is None:
+            return batch
+        return processor.process(
+            batch,
+            model=self.model_state.model,
+            bucket_index=self._bucket_for_step if self._has_buckets else None,
+        )
+
     def _purify_batch(self, batch: dict) -> dict:
         """Remove non-JAX-compatible fields from a batch.
 
@@ -3729,9 +3789,7 @@ class BaseTrainer(BaseTrainerProtocol):
             try:
                 esurge_engine.pause()
                 if hasattr(esurge_engine, "release_model_state"):
-                    esurge_engine.release_model_state(
-                        clear_compiled_cache=clear_esurge_compiled_cache_after_generation
-                    )
+                    esurge_engine.release_model_state(clear_compiled_cache=clear_esurge_compiled_cache_after_generation)
             except Exception as cleanup_exc:  # pragma: no cover - best-effort resource cleanup
                 log_debug_maybe(f"Failed to pause/release eSurge engine after generation failure: {cleanup_exc}")
 
@@ -3859,9 +3917,7 @@ class BaseTrainer(BaseTrainerProtocol):
             for normalized in normalized_prompts:
                 if isinstance(normalized, list):
                     if not apply_chat_template or not hasattr(processor, "apply_chat_template"):
-                        raise ValueError(
-                            "Chat prompts require apply_chat_template=True when using compiled generation"
-                        )
+                        raise ValueError("Chat prompts require apply_chat_template=True when using compiled generation")
                     encoding = processor.apply_chat_template(
                         normalized,
                         return_tensors="np",
@@ -3926,9 +3982,7 @@ class BaseTrainer(BaseTrainerProtocol):
         for text_prompt in decoded_prompt_texts:
             completion_prompts.extend([text_prompt] * repeat_factor)
         if len(completion_prompts) < completion_ids.shape[0] and decoded_prompt_texts:
-            completion_prompts.extend(
-                [decoded_prompt_texts[-1]] * (completion_ids.shape[0] - len(completion_prompts))
-            )
+            completion_prompts.extend([decoded_prompt_texts[-1]] * (completion_ids.shape[0] - len(completion_prompts)))
         completion_prompts = completion_prompts[: completion_ids.shape[0]]
 
         generated_texts = self._decode_prompt_batch(
@@ -6350,6 +6404,22 @@ class BaseTrainer(BaseTrainerProtocol):
                 mh.sync_global_devices("easydel.remove_ckpt_after_load.after")
         except Exception as exc:
             logger.warning(f"Failed to remove checkpoint after load {checkpoint_path}: {exc}")
+
+    def _load_auxiliary_states(self, checkpoint_path: str) -> None:
+        """Restore trainer-owned auxiliary model states from a checkpoint.
+
+        The base trainer owns only ``model_state`` and therefore has no
+        auxiliary state to restore.  Trainers with independently optimized
+        models (for example, an online-RL critic) override this hook.  It is
+        called after the primary actor state has loaded and before an optional
+        ``remove_ckpt_after_load`` cleanup, so auxiliary files cannot be
+        deleted before the subclass sees them.
+
+        Args:
+            checkpoint_path: Path to the checkpoint directory containing the
+                already-restored primary model state.
+        """
+        del checkpoint_path
 
     def _create_checkpointer(self):
         """Create and configure the Checkpointer instance.

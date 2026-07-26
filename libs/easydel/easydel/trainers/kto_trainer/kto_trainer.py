@@ -33,8 +33,8 @@ from easydel.infra.base_state import EasyDeLState
 from easydel.infra.sharding import replicated_named_sharding
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
-from easydel.utils.traversals import deepcopy_model
 
+from .._shared import copy_frozen_policy, drop_optimizer_state
 from ..binary_classifier_optimization_trainer._fn import concatenated_forward
 from ..model_loading import disable_state_dropout, reject_string_model_id
 from ..prompt_transforms import KTOPreprocessTransform
@@ -146,13 +146,13 @@ class KTOTrainer(Trainer):
             model_state = model.to_state(trainable_selector=arguments.trainable_selector)
 
         if reference_model is None:
-            reference_state = deepcopy_model(model_state)
+            reference_state = copy_frozen_policy(model_state)
         elif isinstance(reference_model, EasyDeLState):
             reference_state = reference_model
         elif isinstance(reference_model, EasyDeLBaseModule):
             reference_state = reference_model.to_state(trainable_selector=arguments.trainable_selector)
         else:
-            reference_state = deepcopy_model(model_state)
+            reference_state = copy_frozen_policy(model_state)
 
         if arguments.disable_dropout:
             model_state = disable_state_dropout(model_state)
@@ -202,7 +202,7 @@ class KTOTrainer(Trainer):
         self.input_data_collator_grain = input_data_collator_grain
 
         self.processing_class = processing_class
-        self.reference_state = reference_state
+        self.reference_state = drop_optimizer_state(reference_state)
         self.calculate_kl = arguments.loss_type == "kto"
         self.aux_loss_enabled = getattr(model_state.model, "output_router_logits", False)
         self.aux_loss_coef = getattr(model_state.model, "router_aux_loss_coef", 0.0)

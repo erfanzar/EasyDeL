@@ -63,6 +63,7 @@ from easydel.infra.etils import (
 )
 from easydel.infra.loss_utils import LossConfig
 from easydel.trainers.pose import PoSEConfig
+from easydel.trainers.process_encoder import ProcessEncoderConfig
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import hash_fn
 
@@ -251,6 +252,15 @@ class TrainingArguments:
     pose: PoSEConfig = field(
         default_factory=PoSEConfig,
         metadata={"help": "PoSE (positional skip-wise) position_ids augmentation; disabled by default."},
+    )
+    process_encoder: ProcessEncoderConfig = field(
+        default_factory=ProcessEncoderConfig,
+        metadata={
+            "help": (
+                "Run a VLM vision tower out of band (frozen, vision-bearing rows only) and hand "
+                "precomputed patch embeddings to the train step; disabled by default."
+            )
+        },
     )
     buckets: tp.Any = field(
         default=None,
@@ -1482,6 +1492,10 @@ class TrainingArguments:
             self.pose = PoSEConfig()
         elif isinstance(self.pose, dict):
             self.pose = PoSEConfig.from_dict(self.pose)
+        if self.process_encoder is None:
+            self.process_encoder = ProcessEncoderConfig()
+        elif isinstance(self.process_encoder, dict):
+            self.process_encoder = ProcessEncoderConfig.from_dict(self.process_encoder)
         if self.loss_config is None:
             self.loss_config = LossConfig()
         if isinstance(self.loss_config, dict):
@@ -2245,6 +2259,8 @@ class TrainingArguments:
 
             if field_name == "pose" and isinstance(value, dict):
                 processed_data[field_name] = PoSEConfig.from_dict(value)
+            elif field_name == "process_encoder" and isinstance(value, dict):
+                processed_data[field_name] = ProcessEncoderConfig.from_dict(value)
             elif field_name == "bucket_rule" and isinstance(value, dict):
                 # Reconstruct the BucketRule from its discriminator-tagged dict
                 # ({"kind": "mod", ...}). Deferred import avoids a cycle.

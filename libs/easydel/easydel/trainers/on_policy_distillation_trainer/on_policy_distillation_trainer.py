@@ -35,6 +35,7 @@ from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
 from easydel.utils.helpers import capture_time
 
+from .._shared import drop_optimizer_state
 from ..metrics import _host_mean_float
 from ..prompt_transforms import GRPOPreprocessTransform
 from ..trainer import Trainer
@@ -139,7 +140,7 @@ class OnPolicyDistillationTrainer(Trainer):
         if not isinstance(teacher_model, EasyDeLState):
             teacher_model = teacher_model.to_state(trainable_selector=arguments.trainable_selector)
 
-        self.teacher_state = teacher_model
+        self.teacher_state = drop_optimizer_state(teacher_model)
         self.processing_class = processing_class
 
         pad_token_id = getattr(processing_class, "pad_token_id", None)

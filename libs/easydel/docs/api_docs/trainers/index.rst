@@ -4,11 +4,14 @@ easydel.trainers package
 .. toctree::
    :maxdepth: 2
 
+   _online_rl/index
    _shared/index
    agentic_moshpit/index
+   agentic_rollout/index
    async_grpo_trainer/index
    bema_trainer/index
    binary_classifier_optimization_trainer/index
+   compaction_reinforcement_learning_trainer/index
    contrastive_preference_optimization_trainer/index
    direct_preference_optimization_trainer/index
    distillation_trainer/index
@@ -40,6 +43,7 @@ easydel.trainers package
    sdft_trainer/index
    self_distillation_policy_optimization/index
    seq_kd_trainer/index
+   single_rollout_asynchronous_optimization_trainer/index
    sparse_distillation_trainer/index
    speculative_decoding_trainer/index
    ssd_trainer/index

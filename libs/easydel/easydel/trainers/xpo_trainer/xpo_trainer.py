@@ -38,12 +38,11 @@ from easydel.infra.sharding import replicated_named_sharding
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
 from easydel.utils.helpers import capture_time
-from easydel.utils.traversals import deepcopy_model
 
+from .._shared import drop_optimizer_state
 from ..group_relative_policy_optimization.grpo_trainer import GRPOTrainer
 from ..metrics import _host_mean_float
 from ..trainer_protocol import TrainerConfigureFunctionOutput
-from ..training_configurations import MetricsType
 from ..training_utils import compile_trainer_step, resolve_straight_through_emulator
 from ._fn import xpo_step
 from .xpo_config import XPOConfig
@@ -199,7 +198,7 @@ class XPOTrainer(GRPOTrainer):
             reward_processing_classes=reward_processing_classes,
         )
         if reference_state is not None:
-            self.ref_state = reference_state
+            self.ref_state = drop_optimizer_state(reference_state)
 
     def _get_reward_processing_classes(self) -> list[ProcessingClassType | None]:
         """Normalize reward processing classes to a list aligned to reward functions.
@@ -355,9 +354,6 @@ class XPOTrainer(GRPOTrainer):
 
         self.arguments.ensure_checkpoint_path()
         checkpoint_manager = self.arguments.get_streaming_checkpointer()
-
-        self._train_shared_fn_extra_args = (self.ref_state,)
-        self._eval_shared_fn_extra_args = (self.ref_state,)
 
         return TrainerConfigureFunctionOutput(
             sharded_training_step_function=sharded_training_step_function,
@@ -698,29 +694,19 @@ class XPOTrainer(GRPOTrainer):
         }
         return processed_batch, metrics_dict
 
-    def on_step_end(
-        self,
-        state: EasyDeLState,
-        metrics: MetricsType,
-        step: int,
-    ) -> tuple[EasyDeLState, MetricsType]:
-        """Hook called at the end of each training step.
+    @property
+    def _train_shared_fn_extra_args(self) -> tuple[tp.Any, ...]:
+        """Forward the *live* reference state alongside the shared training step.
 
-        Optionally synchronizes the reference model with the current policy
-        if sync_ref_model is enabled and the sync interval has been reached.
-
-        Args:
-            state: Current model state after the step.
-            metrics: Metrics collected during the step.
-            step: Current training step number.
-
-        Returns:
-            Tuple of (potentially updated state, metrics).
+        Resolved per call rather than captured once at compile time: the
+        reference state is rebound after ``configure_functions`` runs -- by an
+        explicitly supplied ``reference_state`` and by
+        :meth:`GRPOTrainer.on_step_end`'s optional periodic sync -- and a cached
+        tuple would keep feeding the loss the original deep copy.
         """
-        if (
-            self.arguments.sync_ref_model
-            and self.ref_state is not None
-            and (step % self.arguments.ref_model_sync_steps == 0)
-        ):
-            self.ref_state = deepcopy_model(state)
-        return state, metrics
+        return (self.ref_state,)
+
+    @property
+    def _eval_shared_fn_extra_args(self) -> tuple[tp.Any, ...]:
+        """Forward the live reference state alongside the shared evaluation step."""
+        return (self.ref_state,)

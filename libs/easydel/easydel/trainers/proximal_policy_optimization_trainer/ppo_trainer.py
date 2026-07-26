@@ -47,13 +47,13 @@ from easydel.infra.sharding import replicated_named_sharding
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
 from easydel.utils.helpers import capture_time, get_logger  # pyright: ignore[reportPrivateLocalImportUsage]
-from easydel.utils.traversals import deepcopy_model
 
 from .._logprob_utils import (
     compute_per_token_logps_and_entropies_from_hidden_states,
     compute_token_logps_and_entropies_chunked,
     resolve_lmhead_chunksize,
 )
+from .._shared import copy_frozen_policy
 from ..metrics import _host_mean_float, _host_scalar_float
 from ..model_loading import reject_string_model_id
 from ..prompt_transforms import GRPOPreprocessTransform
@@ -104,7 +104,8 @@ class PPOTrainer(Trainer):
 
     Attributes:
         arguments: PPOConfig with training hyperparameters.
-        ref_state: Frozen reference model for KL computation.
+        ref_state: Frozen reference model for KL computation, or ``None`` when
+            ``kl_coef == 0`` disables the KL penalty (no copy is allocated).
         reward_funcs: List of reward functions/models.
         reward_weights: Weights for combining multiple rewards.
         processing_class: Tokenizer for text encoding.
@@ -129,6 +130,7 @@ class PPOTrainer(Trainer):
     """
 
     supports_sequence_packing: tp.ClassVar[bool] = False  # RL/online or paired-preference: warn-and-ignore packing
+    requires_value_head: tp.ClassVar[bool] = True
 
     arguments: PPOConfig
 
@@ -195,19 +197,27 @@ class PPOTrainer(Trainer):
 
         model = self._resolve_policy_model(model, arguments)
 
-        # Ensure we have a value head attached.
+        # Standard PPO jointly trains a value head. Subclasses with an
+        # independently optimized critic can opt out so the actor remains a
+        # normal registry-constructible causal LM and stays resume-safe through
+        # EasyDeLState.load_state.
         if isinstance(model, EasyDeLState):
             module = model.model
-            if not hasattr(module, "value_head"):
+            if self.requires_value_head and not hasattr(module, "value_head"):
                 model = CausalLMWithValueHead(module, rngs=spx.Rngs(0)).to_state(
                     trainable_selector=arguments.trainable_selector
                 )
         else:
-            if not hasattr(model, "value_head"):
+            if self.requires_value_head and not hasattr(model, "value_head"):
                 model = CausalLMWithValueHead(model, rngs=spx.Rngs(0))
             model = model.to_state(trainable_selector=arguments.trainable_selector)
 
-        self.ref_state = deepcopy_model(model=model)
+        # kl_coef == 0 zeroes the whole non-score reward, so the reference model
+        # would only ever contribute dead compute. Skipping the deep copy frees a
+        # full parameter set (and one forward per rollout) for KL-free runs --
+        # notably actor-critic subclasses whose off-policy correction lives in the
+        # policy loss rather than in a KL penalty.
+        self.ref_state = copy_frozen_policy(model) if float(arguments.kl_coef) != 0.0 else None
 
         if processing_class is None:
             processing_class = AutoTokenizer.from_pretrained(
@@ -621,18 +631,22 @@ class PPOTrainer(Trainer):
                 )
                 return token_log_probs
 
-        self.compute_refmodel_logps = compile_trainer_step(
-            partial(_compute_refmodel_logps, graphdef=self.ref_state.graphdef),
-            mesh=mesh,
-            static_argnames=("graphdef",),
-            in_shardings=(
-                self.ref_state.shardings.graphstate,
-                self.ref_state.shardings.graphother,
-                empty_sharding,
-                empty_sharding,
-            ),
-            out_shardings=empty_sharding,
-        )
+        if self.ref_state is None:
+            # kl_coef == 0: no reference model, so no reference-scoring function.
+            self.compute_refmodel_logps = None
+        else:
+            self.compute_refmodel_logps = compile_trainer_step(
+                partial(_compute_refmodel_logps, graphdef=self.ref_state.graphdef),
+                mesh=mesh,
+                static_argnames=("graphdef",),
+                in_shardings=(
+                    self.ref_state.shardings.graphstate,
+                    self.ref_state.shardings.graphother,
+                    empty_sharding,
+                    empty_sharding,
+                ),
+                out_shardings=empty_sharding,
+            )
 
         def _compute_rollout_logps_values(graphtree, graphother, ids, mask, graphdef):
             """Compute policy log-probabilities and value-head predictions for a rollout.
@@ -934,6 +948,33 @@ class PPOTrainer(Trainer):
         returns = advantages + values
         return advantages, returns
 
+    def _score_rollout_policy_and_values(
+        self,
+        state: EasyDeLState,
+        input_ids: jax.Array,
+        attention_mask: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Score a generated batch under PPO's rollout policy and value head.
+
+        Online actor/critic subclasses override this hook to score a plain
+        registry-constructible actor and an independent critic while reusing
+        PPO's generation, reward routing, and KL construction.
+
+        Args:
+            state: Policy snapshot that generated the rollout.
+            input_ids: Full prompt-plus-completion token IDs.
+            attention_mask: Full attention mask.
+
+        Returns:
+            Completion-aligned ``(log_probs, values)``.
+        """
+        return self.compute_rollout_logps_values(
+            state.graphstate,
+            state.graphother,
+            input_ids,
+            attention_mask,
+        )
+
     def _preprocess_batch_input(
         self,
         state: EasyDeLState,
@@ -954,6 +995,8 @@ class PPOTrainer(Trainer):
            (:attr:`compute_refmodel_logps`) and the rollout policy
            (:attr:`compute_rollout_logps_values`) to capture
            ``ref_per_token_logps``, ``old_logps`` and ``old_values``.
+           The reference forward is skipped when ``kl_coef == 0``, which
+           leaves the KL term (and thus the non-score reward) at zero.
         4. Run each registered reward function (callable or
            :class:`EasyDeLState`) and combine the results with
            :attr:`reward_weights` to a scalar ``score`` per completion,
@@ -1027,19 +1070,24 @@ class PPOTrainer(Trainer):
             attention_mask = jnp.concatenate([prompt_mask_rep, completion_mask], axis=1)
             input_ids = sequences
 
-            with capture_time() as ref_logps_time_fn:
-                ref_per_token_logps = self.compute_refmodel_logps(
-                    self.ref_state.graphstate,
-                    self.ref_state.graphother,
-                    input_ids,
-                    attention_mask,
-                )
-            ref_logps_time = ref_logps_time_fn()
+            if self.ref_state is None:
+                # kl_coef == 0: the KL penalty is identically zero, so the
+                # reference forward is skipped along with the reference model.
+                ref_per_token_logps = None
+                ref_logps_time = 0.0
+            else:
+                with capture_time() as ref_logps_time_fn:
+                    ref_per_token_logps = self.compute_refmodel_logps(
+                        self.ref_state.graphstate,
+                        self.ref_state.graphother,
+                        input_ids,
+                        attention_mask,
+                    )
+                ref_logps_time = ref_logps_time_fn()
 
             with capture_time() as rollout_stats_time_fn:
-                old_logps, old_values = self.compute_rollout_logps_values(
-                    state.graphstate,
-                    state.graphother,
+                old_logps, old_values = self._score_rollout_policy_and_values(
+                    state,
                     input_ids,
                     attention_mask,
                 )
@@ -1174,7 +1222,8 @@ class PPOTrainer(Trainer):
             attention_mask = self._all_gather(attention_mask)
             old_logps = self._all_gather(old_logps)
             old_values = self._all_gather(old_values)
-            ref_per_token_logps = self._all_gather(ref_per_token_logps)
+            if ref_per_token_logps is not None:
+                ref_per_token_logps = self._all_gather(ref_per_token_logps)
             rewards_per_func = self._all_gather(rewards_per_func)
 
             scores = jnp.nansum(rewards_per_func * self.reward_weights[None, :], axis=1)
@@ -1183,11 +1232,14 @@ class PPOTrainer(Trainer):
                 has_eos = jnp.any(jnp.isin(completion_ids, eos_tokens), axis=1)
                 scores = scores - (~has_eos).astype(scores.dtype) * float(self.arguments.missing_eos_penalty)
 
-            logr = ref_per_token_logps - old_logps
-            if self.arguments.kl_estimator == "k1":
-                kl = -logr
+            if ref_per_token_logps is None:
+                kl = jnp.zeros_like(old_logps)
             else:
-                kl = jnp.exp(logr) - 1.0 - logr
+                logr = ref_per_token_logps - old_logps
+                if self.arguments.kl_estimator == "k1":
+                    kl = -logr
+                else:
+                    kl = jnp.exp(logr) - 1.0 - logr
             non_score_reward = -float(self.arguments.kl_coef) * kl
             rewards = non_score_reward
 

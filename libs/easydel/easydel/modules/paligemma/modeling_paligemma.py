@@ -318,6 +318,7 @@ class PaliGemmaModel(EasyDeLBaseModule):
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        image_features: Array | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         **lm_kwargs,
@@ -376,8 +377,7 @@ class PaliGemmaModel(EasyDeLBaseModule):
         if pixel_values is not None and input_ids is None:
             raise ValueError("`input_ids` must be provided when `pixel_values` is not None.")
 
-        image_features = None
-        if pixel_values is not None:
+        if image_features is None and pixel_values is not None:
             image_features = self.get_image_features(pixel_values)
 
         if inputs_embeds is None:

@@ -44,6 +44,7 @@ from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
 from easydel.utils.helpers import capture_time
 
+from .._shared import drop_optimizer_state
 from ..group_relative_policy_optimization._fn import get_per_token_logps
 from ..group_relative_policy_optimization.grpo_trainer import GRPOTrainer
 from ..metrics import _host_mean_float
@@ -195,7 +196,7 @@ class NashMDTrainer(GRPOTrainer):
         )
         ref_state = _ensure_state(reference_model, trainable_selector=arguments.trainable_selector)
         if ref_state is not None:
-            self.ref_state = ref_state
+            self.ref_state = drop_optimizer_state(ref_state)
 
         self._beta_schedule = arguments.beta
         self._mixture_schedule = arguments.mixture_coef

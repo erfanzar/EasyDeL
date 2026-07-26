@@ -40,6 +40,7 @@ from .async_grpo_trainer import AsyncGRPOConfig, AsyncGRPOTrainer
 from .base_trainer import BaseTrainer
 from .bema_trainer import BEMACallback, BEMAConfig, BEMADPOTrainer
 from .binary_classifier_optimization_trainer import BCOConfig, BCOTrainer
+from .compaction_reinforcement_learning_trainer import CompactionRLConfig, CompactionRLTrainer
 from .contrastive_preference_optimization_trainer import CPOConfig, CPOTrainer
 from .direct_preference_optimization_trainer import DPOConfig, DPOTrainer
 from .distillation_trainer import DistillationConfig, DistillationTrainer
@@ -90,6 +91,7 @@ from .rlvr_trainer import RLVRConfig, RLVRTrainer
 from .sdft_trainer import SDFTConfig, SDFTTrainer, SelfDistillationConfig, SelfDistillationTrainer
 from .self_distillation_policy_optimization import SDPOConfig, SDPOTrainer
 from .seq_kd_trainer import SeqKDConfig, SeqKDTrainer
+from .single_rollout_asynchronous_optimization_trainer import SAOConfig, SAOTrainer
 from .sparse_distillation_trainer import SparseDistillationConfig, SparseDistillationTrainer
 from .speculative_decoding_trainer import SpeculativeDecodingConfig, SpeculativeDecodingTrainer
 from .ssd_trainer import SSDConfig, SSDTrainer
@@ -114,6 +116,8 @@ __all__ = (
     "CPOConfig",
     "CPOPreprocessTransform",
     "CPOTrainer",
+    "CompactionRLConfig",
+    "CompactionRLTrainer",
     "DPOConfig",
     "DPOPreprocessTransform",
     "DPOTrainer",
@@ -177,6 +181,8 @@ __all__ = (
     "RewardPreprocessTransform",
     "RewardProtocol",
     "RewardTrainer",
+    "SAOConfig",
+    "SAOTrainer",
     "SDFTConfig",
     "SDFTTrainer",
     "SDPOConfig",

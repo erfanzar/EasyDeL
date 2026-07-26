@@ -18,7 +18,6 @@ import json
 from pathlib import Path
 
 import pytest
-
 from easydel.data.execution import pipeline as pipeline_mod
 from easydel.infra.elarge.builders import _create_source_from_inform
 from easydel.infra.elarge.model import eLargeModel
@@ -462,6 +461,7 @@ def test_pre_tokenize_writes_multi_inform_datasets_to_separate_folders(tmp_path)
         ("prm", "PRMPreprocessTransform"),
         ("embedding", "EmbeddingPreprocessTransform"),
         ("async_grpo", "GRPOPreprocessTransform"),
+        ("compaction-rl", "PPOPreprocessTransform"),
         ("dppo", "GRPOPreprocessTransform"),
         ("grpo", "GRPOPreprocessTransform"),
         ("grpo_with_replay_buffer", "GRPOPreprocessTransform"),
@@ -480,6 +480,7 @@ def test_pre_tokenize_writes_multi_inform_datasets_to_separate_folders(tmp_path)
         ("xpo", "GRPOPreprocessTransform"),
         ("nash_md", "GRPOPreprocessTransform"),
         ("rlvr", "GRPOPreprocessTransform"),
+        ("sao", "PPOPreprocessTransform"),
         ("agentic_moshpit", "GRPOPreprocessTransform"),
         ("on_policy_distillation", "GRPOPreprocessTransform"),
         ("seq_kd", "GRPOPreprocessTransform"),
@@ -506,6 +507,7 @@ def test_pre_tokenize_resolves_trainer_transforms(trainer_type, expected_cls):
     ("trainer_type", "expected_class", "expected_args"),
     [
         ("async-grpo", "AsyncGRPOTrainer", "AsyncGRPOConfig"),
+        ("compaction-rl", "CompactionRLTrainer", "CompactionRLConfig"),
         ("dppo", "DPPOTrainer", "DPPOConfig"),
         ("gold", "GOLDTrainer", "GOLDConfig"),
         ("grpo-replay-buffer", "GRPOWithReplayBufferTrainer", "GRPOWithReplayBufferConfig"),
@@ -516,6 +518,7 @@ def test_pre_tokenize_resolves_trainer_transforms(trainer_type, expected_cls):
         ("papo", "PAPOTrainer", "PAPOConfig"),
         ("prm", "PRMTrainer", "PRMConfig"),
         ("rloo", "RLOOTrainer", "RLOOConfig"),
+        ("single-rollout-asynchronous-optimization", "SAOTrainer", "SAOConfig"),
         ("self_distillation", "SDFTTrainer", "SDFTConfig"),
         ("ssd", "SSDTrainer", "SSDConfig"),
         ("tpo", "TPOTrainer", "TPOConfig"),
