@@ -17,7 +17,6 @@ from types import SimpleNamespace
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from easydel.infra.errors import EasyDeLPreemptionSignal
 from easydel.trainers.trainer.trainer import Trainer
 
@@ -99,6 +98,9 @@ def _make_trainer(*, max_training_steps: int = 11, num_train_epochs: int = 2):
         total_batch_size=1,
         gradient_accumulation_steps=1,
         profiler_path=None,
+        # `_apply_pose_to_batch` reads this on every microbatch; disabled PoSE
+        # short-circuits before `applies_to_bucket` is consulted.
+        pose=SimpleNamespace(enabled=False),
     )
     trainer._profiler_started = False
     trainer._profiler_active = False

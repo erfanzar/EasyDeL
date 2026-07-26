@@ -32,13 +32,12 @@ the ``hunyuan_vl`` mRoPE input prep dropped ``input_ids`` / leaked a
 
 from __future__ import annotations
 
+import easydel as ed
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax  # pyright: ignore[reportMissingTypeStubs]
 import pytest
-
-import easydel as ed
 from easydel.infra.base_state import EasyDeLState
 from easydel.trainers.trainer._fn import training_step
 
@@ -284,7 +283,14 @@ def test_vlm_head_sft_step_finite(family: str):
         model = create_ed_model_only(family, ed.TaskType.IMAGE_TEXT_TO_TEXT, cfg, sc)
         state = EasyDeLState.create(model=model, tx=optax.sgd(1e-3), init_opt_state=True)
 
-        batch_size, sequence_length = 2, 32
+        # The fused-MoE `_sparse_call` shard_map maps the batch axis to
+        # ``P(('dp', 'fsdp'), ...)``, so the batch must be divisible by that
+        # product. Folding the expert axis into ``fsdp`` above makes it 4 on the
+        # 8-fake-device CPU mesh (and 2 on a 4-device accelerator), which a fixed
+        # batch of 2 would violate on CPU only.
+        mesh_shape = cfg.mesh.shape
+        data_axis_product = int(mesh_shape["dp"]) * int(mesh_shape["fsdp"])
+        batch_size, sequence_length = max(2, data_axis_product), 32
         rng = np.random.default_rng(0)
         input_ids = jnp.asarray(rng.integers(1, 100, (batch_size, sequence_length)), dtype="i4")
         attention_mask = jnp.ones((batch_size, sequence_length), dtype="i4")

@@ -20,6 +20,7 @@ containment, and environment/working-directory isolation.
 """
 
 import os
+import signal
 import threading
 
 import pytest
@@ -56,6 +57,29 @@ def test_infinite_loop_times_out():
     res = Sandbox(timeout=1.5).run_python("while True:\n    pass")
     assert res.timed_out is True
     assert res.ok is False
+
+
+def test_cpu_rlimit_backstop_is_reported_as_a_timeout():
+    """A child killed by RLIMIT_CPU exhausted its time budget, so it must say so.
+
+    The backstop wins the race against the wall clock whenever the calling thread
+    is slow to observe its own deadline (contended interpreter, GIL pressure). It
+    used to surface as a plain non-zero exit, which turns an infinite loop into a
+    generic failure for anything scoring sandbox results. Forced deterministically
+    here by leaving the wall clock far out of reach.
+    """
+    res = Sandbox(timeout=30.0, cpu_seconds=1).run_python("while True:\n    pass")
+
+    assert res.timed_out is True
+    assert res.ok is False
+    assert res.returncode == -signal.SIGXCPU
+
+
+def test_default_cpu_budget_clears_a_fractional_wall_clock():
+    """The CPU cap must sit above the wall clock, per the documented ceil+1."""
+    assert Sandbox(timeout=1.5)._cpu_seconds == 3
+    assert Sandbox(timeout=2.0)._cpu_seconds == 3
+    assert Sandbox(timeout=10.0)._cpu_seconds == 11
 
 
 def test_timeout_works_off_main_thread():

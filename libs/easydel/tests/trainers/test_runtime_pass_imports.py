@@ -13,15 +13,21 @@ def test_trainer_runtime_pass_modules_import() -> None:
     dependencies without launching the expensive training loops in ``main``.
     """
 
+    # Resolved against this file rather than the process CWD: globbing relative
+    # paths silently yields nothing when pytest runs from the repository root,
+    # which turns this into a vacuous pass or an `assert modules` failure
+    # depending on where it was invoked from.
+    tests_root = Path(__file__).resolve().parents[1]
     roots = (
-        Path("tests/trainers/runtime_pass"),
-        Path("tests/trainers/mpmd_runtime_pass"),
+        tests_root / "trainers" / "runtime_pass",
+        tests_root / "trainers" / "mpmd_runtime_pass",
     )
     modules: list[str] = []
     for root in roots:
         for path in sorted(root.glob("*.py")):
             if path.name != "__init__.py":
-                modules.append(".".join(path.with_suffix("").parts))
+                relative = path.relative_to(tests_root.parent).with_suffix("")
+                modules.append(".".join(relative.parts))
 
     assert modules
     for module in modules:
