@@ -93,6 +93,10 @@ PERMITTED_KV_KERNELS = check_bool_flag("PERMITTED_KV_KERNELS")
 # Padding multiple for the per-head dimension. Aligns to 128 to satisfy the
 # Pallas/TPU tile shape used by the ragged-page kernels.
 HEAD_DIM_ALIGNMENT = 128
+# Head dim whose ragged-page kernel concatenates the key/value pair into the
+# head-dim axis (64 + 64 == 128) instead of interleaving it on the head axis.
+# See `kv_pair_shares_head_dim_axis`.
+KV_PAIRED_HEAD_DIM = 64
 # Processing-window size used when batching cache-update slices. 16 MiB keeps
 # the inner buffer in HBM-friendly territory across page sizes.
 KV_UPDATE_WINDOW_BYTES = 16 * 1024 * 1024
@@ -169,24 +173,52 @@ def align_to_multiple(value: int, multiple: int) -> int:
     return cdiv(value, multiple) * multiple
 
 
-def _storage_num_combined_kv_heads_for_dtype(num_kv_heads: int, k_headdim: int, kvdtype: jnp.dtype) -> int:
-    """Return packed combined KV heads for a given cache dtype.
+def kv_pair_shares_head_dim_axis(k_headdim: int) -> bool:
+    """Whether K and V share the storage head-dim axis for ``k_headdim``.
 
-    The storage layout interleaves keys and values into a single packed axis
-    whose width is a multiple of the dtype packing factor. This helper reports
-    that aligned width for ``num_kv_heads`` heads.
+    ejkernel dispatches ``ragged_page_attention_v3`` on the *query* head dim, and
+    ``head_dim == 64`` routes to a kernel with its own page layout. Its canonical
+    shape helper (``_pallas_impl_fwd_h64.get_kv_cache_shape``) returns::
+
+        (pages, page_size, align_to(num_kv_heads, packing) // packing, packing, 128)
+
+    -- keys and values are concatenated into the 128-wide last axis (64 + 64),
+    so the head axis carries ``num_kv_heads``. Every other head dim uses the
+    ``_pallas_impl_fwd`` layout, which interleaves the pair on the *head* axis
+    (``num_kv_heads * 2``) and pads the head dim to :data:`HEAD_DIM_ALIGNMENT`.
+
+    Applying the K/V factor of two on both axes allocates twice the KV bytes and
+    the kernel rejects the shape, so the head axis must skip the doubling exactly
+    when the head-dim axis already carries the pair.
+
+    Args:
+        k_headdim: Per-head key dimension.
+
+    Returns:
+        ``True`` when the pair is concatenated into the head-dim axis.
+    """
+    return int(k_headdim) == KV_PAIRED_HEAD_DIM
+
+
+def _storage_num_combined_kv_heads_for_dtype(num_kv_heads: int, k_headdim: int, kvdtype: jnp.dtype) -> int:
+    """Return the packed width of the storage KV-head axis for a cache dtype.
+
+    The axis width is a multiple of the dtype packing factor. It counts K and V
+    separately only when they are *not* already concatenated inside the head-dim
+    axis (see :func:`kv_pair_shares_head_dim_axis`).
 
     Args:
         num_kv_heads: Number of distinct KV heads (per-layer).
-        k_headdim: Per-head dimension (currently unused, retained for symmetry
-            with downstream layout helpers).
+        k_headdim: Per-head dimension, which decides whether the head-dim axis
+            already carries the key/value pair.
         kvdtype: KV cache storage dtype.
 
     Returns:
-        The padded number of combined KV head slots for ``kvdtype``.
+        The padded number of KV head slots for ``kvdtype``.
     """
-    del k_headdim
     packing = get_dtype_packing(kvdtype)
+    if kv_pair_shares_head_dim_axis(k_headdim):
+        return align_to_multiple(num_kv_heads, packing)
     return align_to_multiple(num_kv_heads * 2, packing)
 
 
@@ -416,7 +448,10 @@ def get_page_size_bytes(
         int: Size of one page in bytes.
     """
     padded_head_size = cdiv(head_size, HEAD_DIM_ALIGNMENT) * HEAD_DIM_ALIGNMENT
-    num_combined_kv_heads = num_kv_heads * 2
+    # When the padded head dim already carries the key/value pair, counting K and
+    # V again on the head axis doubles the reported page size and halves the page
+    # pool that fits in HBM.
+    num_combined_kv_heads = num_kv_heads if kv_pair_shares_head_dim_axis(head_size) else num_kv_heads * 2
     packing = get_dtype_packing(kv_cache_dtype)
     num_combined_kv_heads = cdiv(num_combined_kv_heads, packing) * packing
     kv_cache_dtype_bits = jnp.finfo(kv_cache_dtype).bits
@@ -765,7 +800,7 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
         Returns:
             int: Aligned number of combined K+V heads.
         """
-        return align_to_multiple(self.num_kv_heads * 2, self.kv_head_packing)
+        return _storage_num_combined_kv_heads_for_dtype(self.num_kv_heads, self.k_headdim, self.kvdtype)
 
     @property
     def storage_num_kv_groups(self) -> int:
