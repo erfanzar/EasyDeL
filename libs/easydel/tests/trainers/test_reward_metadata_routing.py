@@ -234,6 +234,30 @@ def test_rollout_manager_preserves_generation_metadata_on_turn_records():
     assert assistant_turn.tool_calls == [{"name": "lookup", "args": {}}]
 
 
+def test_rollout_collator_attends_observations_without_training_on_them():
+    manager = RolloutManager(tokenizer=_TokenizerStub(), max_steps=2, max_seq_length=256)
+    trajectory = TrajectoryResult(
+        input_ids=np.asarray([10, 11, 20, 21, 30, 22], dtype=np.int64),
+        attention_mask=np.ones(6, dtype=np.int32),
+        prompt_mask=np.asarray([1, 1, 0, 0, 1, 0], dtype=np.int32),
+        response_mask=np.asarray([0, 0, 1, 1, 0, 1], dtype=np.int32),
+        episode_reward=1.0,
+        step_rewards=[0.0, 1.0],
+        num_steps=2,
+        turns=[],
+    )
+
+    batch = manager.collate_trajectories(
+        [trajectory],
+        max_prompt_length=3,
+        max_completion_length=5,
+    )
+
+    np.testing.assert_array_equal(batch["completion_ids"][0], [20, 21, 30, 22, 0])
+    np.testing.assert_array_equal(batch["completion_attention_mask"][0], [1, 1, 1, 1, 0])
+    np.testing.assert_array_equal(batch["completion_mask"][0], [1, 1, 0, 1, 0])
+
+
 def test_turn_record_to_message_normalizes_tool_call_models():
     message = turn_record_to_message(
         TurnRecord(

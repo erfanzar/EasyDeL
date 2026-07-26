@@ -159,3 +159,72 @@ def test_sparse_distillation_resolves_classes():
 
     assert get_trainer_class("sparse_distillation").__name__ == "SparseDistillationTrainer"
     assert get_training_arguments_class("sparse_distillation").__name__ == "SparseDistillationConfig"
+
+
+@pytest.mark.skipif(not _REQUIRES_PY311, reason="EasyDeL requires Python 3.11+")
+@pytest.mark.parametrize(
+    ("alias", "canonical"),
+    [
+        ("sao", "sao"),
+        ("single_rollout_asynchronous_optimization", "sao"),
+        ("single-rollout-asynchronous-optimization", "sao"),
+        ("compaction_rl", "compaction_rl"),
+        ("compaction-rl", "compaction_rl"),
+    ],
+)
+def test_online_actor_critic_aliases_normalized(alias, canonical):
+    trainer_types = _load_trainer_types_module()
+
+    config = trainer_types.normalize_trainer_config({"trainer_type": alias})
+
+    assert config["trainer_type"] == canonical
+
+
+@pytest.mark.skipif(not _REQUIRES_PY311, reason="EasyDeL requires Python 3.11+")
+def test_sao_normalized_and_defaults_present():
+    trainer_types = _load_trainer_types_module()
+
+    config = trainer_types.normalize_trainer_config({"trainer_type": "sao"})
+
+    assert config["trainer_prefix"] == "SAO"
+    assert config["num_return_sequences"] == 1
+    assert config["num_generations"] == 1
+    assert config["total_batch_size"] == 128
+    assert config["critic_learning_rate"] == 5e-6
+    assert config["critic_updates_per_actor_update"] == 2
+    assert config["dis_epsilon_low"] == 0.3
+    assert config["dis_epsilon_high"] == 5.0
+
+
+@pytest.mark.skipif(not _REQUIRES_PY311, reason="EasyDeL requires Python 3.11+")
+def test_compaction_rl_normalized_and_defaults_present():
+    trainer_types = _load_trainer_types_module()
+
+    config = trainer_types.normalize_trainer_config({"trainer_type": "compaction-rl"})
+
+    assert config["trainer_type"] == "compaction_rl"
+    assert config["trainer_prefix"] == "CompactionRL"
+    assert config["context_budget"] == 65_536
+    assert config["max_prompt_length"] == 55_296
+    assert config["max_completion_length"] == 10_240
+    assert config["total_batch_size"] == 128
+    assert config["weight_decay"] == 0.0
+    assert config["critic_learning_rate"] == 3e-6
+    assert config["critic_pretrain_steps"] == 50
+    assert config["token_level_loss"] is True
+
+
+@pytest.mark.skipif(not _REQUIRES_PY311, reason="EasyDeL requires Python 3.11+")
+@pytest.mark.parametrize(
+    ("alias", "trainer_name", "arguments_name"),
+    [
+        ("single-rollout-asynchronous-optimization", "SAOTrainer", "SAOConfig"),
+        ("compaction-rl", "CompactionRLTrainer", "CompactionRLConfig"),
+    ],
+)
+def test_online_actor_critic_aliases_resolve_classes(alias, trainer_name, arguments_name):
+    pytest.importorskip("eformer.paths")
+    from easydel.infra.elarge.types import get_trainer_class, get_training_arguments_class
+
+    assert get_trainer_class(alias).__name__ == trainer_name
+    assert get_training_arguments_class(alias).__name__ == arguments_name

@@ -36,8 +36,8 @@ from easydel.infra.base_state import EasyDeLState
 from easydel.infra.sharding import replicated_named_sharding
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils.registery import Registry
-from easydel.utils.traversals import deepcopy_model
 
+from .._shared import copy_frozen_policy, drop_optimizer_state
 from ..model_loading import disable_state_dropout, reject_string_model_id
 from ..prompt_transforms import BCOPreprocessTransform
 from ..trainer.trainer import Trainer
@@ -162,7 +162,7 @@ class BCOTrainer(Trainer):
             model_state = model.to_state(trainable_selector=arguments.trainable_selector)
 
         if reference_model is None:
-            reference_state = deepcopy_model(model_state)
+            reference_state = copy_frozen_policy(model_state)
         elif isinstance(reference_model, EasyDeLState):
             reference_state = reference_model
         else:
@@ -219,7 +219,7 @@ class BCOTrainer(Trainer):
         self.truncation_mode = arguments.truncation_mode
         self.label_pad_token_id = arguments.label_pad_token_id
 
-        self.reference_state = reference_state
+        self.reference_state = drop_optimizer_state(reference_state)
         self._precomputed_train_ref_log_probs = False
         self._precomputed_eval_ref_log_probs = False
         self.clf_weights: tuple[np.ndarray, float] | None = None

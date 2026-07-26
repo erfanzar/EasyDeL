@@ -47,6 +47,7 @@ from easydel.infra.sharding import replicated_named_sharding
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
 
+from .._shared import drop_optimizer_state
 from ..model_loading import disable_state_dropout, reject_string_model_id
 from ..prompt_transforms import SFTPreprocessTransform
 from ..trainer import Trainer
@@ -186,7 +187,7 @@ class DistillationTrainer(Trainer):
             student_model = disable_state_dropout(student_model)
             teacher_model = disable_state_dropout(teacher_model)
 
-        self.teacher_state = teacher_model
+        self.teacher_state = drop_optimizer_state(teacher_model)
 
         super().__init__(
             arguments=arguments,

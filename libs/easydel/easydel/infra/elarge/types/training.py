@@ -77,6 +77,8 @@ _TRAINER_TYPE_ALIASES: dict[str, str] = {
     "nash_md": "nash-md",
     "agentic_moshpit": "agentic-moshpit",
     "async-grpo": "async_grpo",
+    "compaction-rl": "compaction_rl",
+    "compaction_reinforcement_learning": "compaction_rl",
     "dppo-trainer": "dppo",
     "gspo-token": "gspo_token",
     "grpo-replay-buffer": "grpo_with_replay_buffer",
@@ -87,6 +89,8 @@ _TRAINER_TYPE_ALIASES: dict[str, str] = {
     "online-dpo": "online_dpo",
     "rlvr_trainer": "rlvr",
     "self_distillation": "sdft",
+    "single-rollout-asynchronous-optimization": "sao",
+    "single_rollout_asynchronous_optimization": "sao",
     "spec": "speculative_decoding",
     "spec-decoding": "speculative_decoding",
     "spec_decoding": "speculative_decoding",
@@ -249,6 +253,9 @@ class BaseTrainerCfg(TypedDict, total=False):
         per_epoch_evaluation_steps: Number of evaluation steps per epoch.
         total_batch_size: Total batch size across all devices and accumulation steps.
         eval_batch_size: Batch size for evaluation. Defaults to total_batch_size.
+        eval_config_overrides: Model-config overrides applied only to the evaluation
+            forward, e.g. ``{'attn_mechanism': 'vanilla'}`` to evaluate against the
+            reference attention kernel while training on a fused one.
         gradient_accumulation_steps: Number of gradient accumulation steps before
             performing an optimizer update.
         optimizer: Optimizer type string (e.g., "adamw", "lion", "sgd").
@@ -265,6 +272,10 @@ class BaseTrainerCfg(TypedDict, total=False):
             to ``spx.jit(schedule=...)`` when the model mesh is MPMD. None ⇒ forward-only
             marker-cluster MPMD program (no microbatch interleaving). Ignored on SPMD meshes.
         dataloader_num_workers: Number of worker processes for data loading.
+        dataloader_fast_forward_on_resume: Whether a resumed run seeks the train
+            dataloader forward by the restored global step before the first step.
+            Defaults to True; set False when the source is already positioned or
+            seeking is prohibitively expensive.
         dataloader_pin_memory: Whether to pin memory in data loaders for faster
             GPU transfer.
         dataloader_prefetch: Whether to overlap host-side batch fetching with
@@ -298,7 +309,17 @@ class BaseTrainerCfg(TypedDict, total=False):
             to target tokens.
         aux_loss_enabled: Whether to enable auxiliary losses (e.g., for MoE).
         pose: Optional PoSE position-augmentation configuration.
+        process_encoder: Optional on-the-fly vision-encoder configuration. Runs a VLM's
+            vision tower outside the train step (frozen, so no vision backward) and
+            hands precomputed patch embeddings to the step. Keys: ``enabled``,
+            ``row_bucket_multiple``, ``max_rows_per_step``, ``feature_dtype``,
+            ``presence_key``, ``only_buckets``, ``require_support``.
         training_time_limit: Maximum training time as string (e.g., "2h30m").
+        buckets: Optional training-bucket definitions routed per step.
+        xla_compiler_options: Extra options forwarded to the XLA compiler.
+        profiler_duration_ms: Profiler capture duration in milliseconds.
+        profiler_enable_hlo_proto: Whether the profiler emits the HLO proto.
+        profiler_stop_step: Step at which profiling stops.
         step_start_point: Step number to resume training from.
         force_step_start_point: Whether to force ``step_start_point`` onto a
             loaded nonzero state and reseed optimizer/scheduler counters.
@@ -466,6 +487,9 @@ class BaseTrainerCfg(TypedDict, total=False):
             "agentic-moshpit",
             "agentic_moshpit",
             "async_grpo",
+            "compaction-rl",
+            "compaction_rl",
+            "compaction_reinforcement_learning",
             "dppo",
             "gold",
             "grpo_with_replay_buffer",
@@ -477,10 +501,13 @@ class BaseTrainerCfg(TypedDict, total=False):
             "prm",
             "rlvr",
             "rloo",
+            "sao",
             "sdft",
             "ssd",
             "tpo",
             "embedding",
+            "single-rollout-asynchronous-optimization",
+            "single_rollout_asynchronous_optimization",
         ]
     ]
     learning_rate: NotRequired[float]
@@ -491,6 +518,7 @@ class BaseTrainerCfg(TypedDict, total=False):
     per_epoch_evaluation_steps: NotRequired[int | None]
     total_batch_size: NotRequired[int]
     eval_batch_size: NotRequired[int | None]
+    eval_config_overrides: NotRequired[dict[str, Any] | None]
     gradient_accumulation_steps: NotRequired[int]
 
     optimizer: NotRequired[str]
@@ -504,6 +532,7 @@ class BaseTrainerCfg(TypedDict, total=False):
     mpmd_scheduler: NotRequired[MpMdSchedulers | None]
 
     dataloader_num_workers: NotRequired[int | None]
+    dataloader_fast_forward_on_resume: NotRequired[bool]
     dataloader_pin_memory: NotRequired[bool | None]
     dataloader_prefetch: NotRequired[bool]
     dataloader_prefetch_workers: NotRequired[int]
@@ -528,6 +557,12 @@ class BaseTrainerCfg(TypedDict, total=False):
     train_on_inputs: NotRequired[bool]
     aux_loss_enabled: NotRequired[bool]
     pose: NotRequired[dict[str, Any] | None]
+    process_encoder: NotRequired[dict[str, Any] | None]
+    buckets: NotRequired[Any]
+    xla_compiler_options: NotRequired[dict[str, Any] | None]
+    profiler_duration_ms: NotRequired[int | None]
+    profiler_enable_hlo_proto: NotRequired[bool | None]
+    profiler_stop_step: NotRequired[int | None]
     training_time_limit: NotRequired[str | None]
     step_start_point: NotRequired[int | None]
     force_step_start_point: NotRequired[bool]
@@ -1258,6 +1293,72 @@ class PPOTrainerCfg(BaseTrainerCfg):
     stop_token_id: NotRequired[int | None]
     total_episodes: NotRequired[int | None]
     world_size: NotRequired[int | None]
+
+
+class OnlineActorCriticTrainerCfg(PPOTrainerCfg):
+    """Shared eLarge schema for separately optimized actor/critic trainers.
+
+    Runtime objects such as a critic module, rollout provider, environment
+    factory, or tool guard are intentionally not part of this serializable
+    YAML schema. They are supplied to :meth:`eLargeModel.train` as runtime
+    construction kwargs.
+    """
+
+    critic_learning_rate: NotRequired[float]
+    critic_learning_rate_end: NotRequired[float | None]
+    critic_optimizer: NotRequired[str | None]
+    critic_scheduler: NotRequired[str | None]
+    critic_warmup_steps: NotRequired[int]
+    critic_updates_per_actor_update: NotRequired[int]
+    critic_pretrain_steps: NotRequired[int]
+    critic_cliprange_value: NotRequired[float]
+    critic_gae_lambda: NotRequired[float]
+    critic_gae_mode: NotRequired[Literal["fixed", "match_policy"]]
+    critic_trainable_mode: NotRequired[Literal["full_except_attention", "all"]]
+    policy_gae_mode: NotRequired[Literal["fixed", "length_adaptive"]]
+    length_adaptive_alpha: NotRequired[float]
+    global_token_normalization: NotRequired[bool]
+    rollout_logprob_source: NotRequired[Literal["recompute", "engine"]]
+    max_inflight_rollouts: NotRequired[int]
+    rollout_queue_size: NotRequired[int]
+    weight_sync_steps: NotRequired[int]
+    max_policy_staleness: NotRequired[int | None]
+    rollout_timeout: NotRequired[float | None]
+
+
+class SAOTrainerCfg(OnlineActorCriticTrainerCfg):
+    """eLarge config for Single-Rollout Asynchronous Optimization (SAOConfig).
+
+    SAO consumes one rollout per prompt, trains a distinct critic, and applies
+    direct double-sided importance sampling to action tokens.
+    """
+
+    dis_epsilon_low: NotRequired[float]
+    dis_epsilon_high: NotRequired[float]
+    asynchronous_rollouts: NotRequired[bool]
+
+
+class CompactionRLTrainerCfg(OnlineActorCriticTrainerCfg):
+    """eLarge config for context-compacting agentic RL (CompactionRLConfig).
+
+    The serialized fields describe compaction policy and loss behavior.
+    Runtime environment/tool/controller callables remain construction kwargs.
+    """
+
+    context_budget: NotRequired[int]
+    compaction_threshold: NotRequired[int]
+    max_compactions: NotRequired[int]
+    recent_steps: NotRequired[int]
+    max_assistant_tokens: NotRequired[int]
+    max_summary_tokens: NotRequired[int]
+    max_turns: NotRequired[int]
+    summary_instruction: NotRequired[str]
+    resume_template: NotRequired[str]
+    train_summary_tokens: NotRequired[bool]
+    cross_trajectory_gae: NotRequired[bool]
+    token_level_loss: NotRequired[bool]
+    compaction_failure_policy: NotRequired[Literal["keep_context", "raise"]]
+    guard_failure_policy: NotRequired[Literal["block", "allow"]]
 
 
 class SFTTrainerCfg(BaseTrainerCfg):
@@ -2045,6 +2146,8 @@ class TrainerConfig(
     GFPOTrainerCfg,
     GSPOTrainerCfg,
     PPOTrainerCfg,
+    SAOTrainerCfg,
+    CompactionRLTrainerCfg,
     SFTTrainerCfg,
     RewardTrainerCfg,
     DistillationTrainerCfg,
@@ -2102,6 +2205,13 @@ class TrainerConfig(
 
     ...
 
+
+# Raw eLarge trainer-config keys that ``eLargeModel.build_trainer`` consumes itself
+# and strips before constructing the trainer-arguments dataclass. They describe
+# bucket wiring in eLarge's own vocabulary (plain dicts and a serialized rule)
+# rather than the dataclass field names, so they must never be forwarded as kwargs.
+# Kept here so the builder and the config-compat tests agree on one list.
+ELARGE_ONLY_TRAINER_KEYS: tuple[str, ...] = ("bucket_configs", "bucket_rule", "bucket_datasets")
 
 BASE_TRAINER_DEFAULTS: BaseTrainerCfg = {
     "learning_rate": 5e-5,
@@ -2645,6 +2755,59 @@ TRAINER_SPECIFIC_DEFAULTS.update(
             "weight_sync_steps": 1,
             "request_timeout": 120.0,
         },
+        "compaction_rl": {
+            **TRAINER_SPECIFIC_DEFAULTS["ppo"],
+            "trainer_prefix": "CompactionRL",
+            "learning_rate": 2e-6,
+            "total_batch_size": 128,
+            "weight_decay": 0.0,
+            "kl_coef": 0.0,
+            "critic_learning_rate": 3e-6,
+            "critic_learning_rate_end": None,
+            "critic_optimizer": None,
+            "critic_scheduler": None,
+            "critic_warmup_steps": 0,
+            "critic_updates_per_actor_update": 2,
+            "critic_pretrain_steps": 50,
+            "critic_cliprange_value": 0.2,
+            "critic_gae_lambda": 1.0,
+            "critic_gae_mode": "match_policy",
+            "critic_trainable_mode": "all",
+            "policy_gae_mode": "length_adaptive",
+            "length_adaptive_alpha": 1.5,
+            "global_token_normalization": True,
+            "rollout_logprob_source": "recompute",
+            "max_inflight_rollouts": 32,
+            "rollout_queue_size": 0,
+            "weight_sync_steps": 1,
+            "max_policy_staleness": None,
+            "rollout_timeout": 120.0,
+            "max_length": 65_536,
+            "max_prompt_length": 55_296,
+            "max_completion_length": 10_240,
+            "num_return_sequences": 1,
+            "num_generations": 1,
+            "num_ppo_epochs": 1,
+            "context_budget": 65_536,
+            "compaction_threshold": 10_240,
+            "max_compactions": 3,
+            "recent_steps": 2,
+            "max_assistant_tokens": 10_240,
+            "max_summary_tokens": 2_048,
+            "max_turns": 250,
+            "summary_instruction": (
+                "Summarize the completed work, important observations, tool results, "
+                "remaining goals, and constraints so the task can continue from a shorter context."
+            ),
+            "resume_template": (
+                "The previous context was compacted. Continue the original task using this summary:\n\n{summary}"
+            ),
+            "train_summary_tokens": True,
+            "cross_trajectory_gae": True,
+            "token_level_loss": True,
+            "compaction_failure_policy": "raise",
+            "guard_failure_policy": "block",
+        },
         "dppo": {
             **TRAINER_SPECIFIC_DEFAULTS["grpo"],
             "trainer_prefix": "DPPO",
@@ -2716,6 +2879,39 @@ TRAINER_SPECIFIC_DEFAULTS.update(
             "advantage_estimator": "leave_one_out",
             "scale_rewards": "none",
         },
+        "sao": {
+            **TRAINER_SPECIFIC_DEFAULTS["ppo"],
+            "trainer_prefix": "SAO",
+            "learning_rate": 1e-6,
+            "total_batch_size": 128,
+            "kl_coef": 0.0,
+            "critic_learning_rate": 5e-6,
+            "critic_learning_rate_end": 5e-6,
+            "critic_optimizer": None,
+            "critic_scheduler": "linear",
+            "critic_warmup_steps": 10,
+            "critic_updates_per_actor_update": 2,
+            "critic_pretrain_steps": 0,
+            "critic_cliprange_value": 0.2,
+            "critic_gae_lambda": 1.0,
+            "critic_gae_mode": "fixed",
+            "critic_trainable_mode": "full_except_attention",
+            "policy_gae_mode": "length_adaptive",
+            "length_adaptive_alpha": 1.5,
+            "global_token_normalization": True,
+            "rollout_logprob_source": "engine",
+            "max_inflight_rollouts": 32,
+            "rollout_queue_size": 0,
+            "weight_sync_steps": 1,
+            "max_policy_staleness": None,
+            "rollout_timeout": 120.0,
+            "dis_epsilon_low": 0.3,
+            "dis_epsilon_high": 5.0,
+            "num_return_sequences": 1,
+            "num_generations": 1,
+            "num_ppo_epochs": 1,
+            "asynchronous_rollouts": True,
+        },
         "sdft": {
             **TRAINER_SPECIFIC_DEFAULTS["sdpo"],
             "trainer_prefix": "SDFT",
@@ -2760,6 +2956,7 @@ _TRAINERS_WITH_COMPLETION_LENGTH = frozenset(
     {
         "async_grpo",
         "bco",
+        "compaction_rl",
         "cpo",
         "dpo",
         "dppo",
@@ -2776,6 +2973,7 @@ _TRAINERS_WITH_COMPLETION_LENGTH = frozenset(
         "papo",
         "ppo",
         "rloo",
+        "sao",
         "sdft",
         "sdpo",
         "ssd",
@@ -2951,7 +3149,7 @@ def get_trainer_class(trainer_type: str):
         trainer_type: Type of trainer to retrieve. Supported values include:
             "sft", "dpo", "orpo", "grpo", "sdpo", "ppo", "reward", "distillation",
             "kto", "bco", "cpo", "gkd", "nash-md", "xpo", "base",
-            "agentic-moshpit", "rlvr".
+            "agentic-moshpit", "rlvr", "sao", "compaction_rl".
             Case-insensitive with alias support.
 
     Returns:
@@ -2987,7 +3185,7 @@ def get_training_arguments_class(trainer_type: str):
         trainer_type: Type of trainer configuration to retrieve. Supported values
             include: "sft", "dpo", "orpo", "grpo", "sdpo", "ppo", "reward", "distillation",
             "kto", "bco", "cpo", "gkd", "nash-md", "xpo", "base",
-            "agentic-moshpit", "rlvr".
+            "agentic-moshpit", "rlvr", "sao", "compaction_rl".
             Case-insensitive with alias support.
 
     Returns:

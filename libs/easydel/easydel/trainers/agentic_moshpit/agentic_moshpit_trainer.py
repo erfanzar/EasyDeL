@@ -712,6 +712,7 @@ class AgenticMoshPitTrainer(GRPOTrainer):
             prompt_ids = jnp.array(collated["prompt_ids"])
             prompt_mask = jnp.array(collated["prompt_mask"])
             completion_ids = jnp.array(collated["completion_ids"])
+            completion_attention_mask = jnp.array(collated["completion_attention_mask"])
             completion_mask = jnp.array(collated["completion_mask"])
             env_rewards = jnp.array(collated["rewards"])
             step_rewards_list = collated["step_rewards_list"]
@@ -764,44 +765,52 @@ class AgenticMoshPitTrainer(GRPOTrainer):
                 seq_mask = jnp.concatenate(
                     [
                         prompt_mask.repeat(1, 0),
-                        completion_mask,
+                        completion_attention_mask,
                     ],
                     axis=1,
                 )
 
-                ref_model_kwargs = normalize_generation_model_kwargs(
-                    None,
-                    model_callable=getattr(self.ref_state.model, "forward", self.ref_state.model),
-                )
-
-                if self.ref_logps_chunk_size is not None and sequences.shape[0] > self.ref_logps_chunk_size:
-                    ref_chunks: list[jax.Array] = []
-                    full_batch_size = int(sequences.shape[0])
-                    for start in range(0, full_batch_size, self.ref_logps_chunk_size):
-                        end = min(start + self.ref_logps_chunk_size, full_batch_size)
-                        ref_chunks.append(
-                            self.compute_refmodel_logps(
-                                self.ref_state.graphstate,
-                                self.ref_state.graphother,
-                                sequences[start:end],
-                                seq_mask[start:end],
-                                slice_prompt_aligned_model_kwargs(
-                                    ref_model_kwargs,
-                                    start,
-                                    end,
-                                    prompt_batch_size=full_batch_size,
-                                ),
-                            )
-                        )
-                    ref_per_token_logps = jnp.concatenate(ref_chunks, axis=0)
-                else:
-                    ref_per_token_logps = self.compute_refmodel_logps(
-                        self.ref_state.graphstate,
-                        self.ref_state.graphother,
-                        sequences,
-                        seq_mask,
-                        ref_model_kwargs,
+                if self.ref_state is None:
+                    # beta == 0: KL term disabled -> skip the reference forward
+                    # entirely. The placeholder is never read by the loss.
+                    ref_per_token_logps = jnp.zeros(
+                        (completion_ids.shape[0], completion_ids.shape[1]),
+                        dtype=jnp.float32,
                     )
+                else:
+                    ref_model_kwargs = normalize_generation_model_kwargs(
+                        None,
+                        model_callable=getattr(self.ref_state.model, "forward", self.ref_state.model),
+                    )
+
+                    if self.ref_logps_chunk_size is not None and sequences.shape[0] > self.ref_logps_chunk_size:
+                        ref_chunks: list[jax.Array] = []
+                        full_batch_size = int(sequences.shape[0])
+                        for start in range(0, full_batch_size, self.ref_logps_chunk_size):
+                            end = min(start + self.ref_logps_chunk_size, full_batch_size)
+                            ref_chunks.append(
+                                self.compute_refmodel_logps(
+                                    self.ref_state.graphstate,
+                                    self.ref_state.graphother,
+                                    sequences[start:end],
+                                    seq_mask[start:end],
+                                    slice_prompt_aligned_model_kwargs(
+                                        ref_model_kwargs,
+                                        start,
+                                        end,
+                                        prompt_batch_size=full_batch_size,
+                                    ),
+                                )
+                            )
+                        ref_per_token_logps = jnp.concatenate(ref_chunks, axis=0)
+                    else:
+                        ref_per_token_logps = self.compute_refmodel_logps(
+                            self.ref_state.graphstate,
+                            self.ref_state.graphother,
+                            sequences,
+                            seq_mask,
+                            ref_model_kwargs,
+                        )
             ref_logps_time = ref_logps_time_fn()
 
             self._log_training_generations_to_wandb(
@@ -819,6 +828,7 @@ class AgenticMoshPitTrainer(GRPOTrainer):
             prompt_ids = self._all_gather(prompt_ids)
             prompt_mask = self._all_gather(prompt_mask)
             completion_ids = self._all_gather(completion_ids)
+            completion_attention_mask = self._all_gather(completion_attention_mask)
             completion_mask = self._all_gather(completion_mask)
             ref_per_token_logps = self._all_gather(ref_per_token_logps)
             advantages = self._all_gather(advantages)
@@ -851,6 +861,7 @@ class AgenticMoshPitTrainer(GRPOTrainer):
                 "prompt_ids": prompt_ids,
                 "prompt_mask": prompt_mask,
                 "completion_ids": completion_ids,
+                "completion_attention_mask": completion_attention_mask,
                 "completion_mask": completion_mask,
                 "ref_per_token_logps": ref_per_token_logps,
                 "advantages": advantages,

@@ -866,11 +866,13 @@ def grpo_step(
             minibatch["completion_mask"],
             minibatch["advantages"],
         )
+        completion_attention_mask = minibatch.get("completion_attention_mask", completion_mask)
 
         completion_was_truncated = False
         if max_loss_completion_tokens is not None and completion_ids.shape[1] > max_loss_completion_tokens:
             completion_ids = completion_ids[:, :max_loss_completion_tokens]
             completion_mask = completion_mask[:, :max_loss_completion_tokens]
+            completion_attention_mask = completion_attention_mask[:, :max_loss_completion_tokens]
             completion_was_truncated = True
 
         # Use runtime batch shapes so filtered-group trainers (e.g. GFPO) can
@@ -879,7 +881,10 @@ def grpo_step(
         effective_num_generations = max(effective_num_generations, 1)
 
         input_ids = jnp.concatenate([prompt_ids.repeat(effective_num_generations, 0), completion_ids], axis=1)
-        attention_mask = jnp.concatenate([prompt_mask.repeat(effective_num_generations, 0), completion_mask], axis=1)
+        attention_mask = jnp.concatenate(
+            [prompt_mask.repeat(effective_num_generations, 0), completion_attention_mask],
+            axis=1,
+        )
         prompt_len = prompt_ids.shape[-1]
         prompt_model_kwargs = extract_generation_model_kwargs(
             minibatch,
@@ -945,10 +950,14 @@ def grpo_step(
                 end = min(start + completion_chunk_size, completion_batch_size)
                 chunk_completion_ids = completion_ids[start:end]
                 chunk_completion_mask = completion_mask[start:end]
+                chunk_completion_attention_mask = completion_attention_mask[start:end]
                 chunk_prompt_ids = expanded_prompt_ids[start:end]
                 chunk_prompt_mask = expanded_prompt_mask[start:end]
                 chunk_input_ids = jnp.concatenate([chunk_prompt_ids, chunk_completion_ids], axis=1)
-                chunk_attention_mask = jnp.concatenate([chunk_prompt_mask, chunk_completion_mask], axis=1)
+                chunk_attention_mask = jnp.concatenate(
+                    [chunk_prompt_mask, chunk_completion_attention_mask],
+                    axis=1,
+                )
                 chunk_model_kwargs = slice_prompt_aligned_model_kwargs(
                     completion_model_kwargs,
                     start,

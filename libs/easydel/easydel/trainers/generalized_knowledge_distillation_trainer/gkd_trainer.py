@@ -50,8 +50,8 @@ from easydel.infra.base_state import EasyDeLState
 from easydel.infra.sharding import replicated_named_sharding
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
-from easydel.utils.traversals import deepcopy_model
 
+from .._shared import copy_frozen_policy, drop_optimizer_state
 from ..model_loading import disable_state_dropout, reject_string_model_id
 from ..supervised_fine_tuning_trainer import SFTTrainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
@@ -153,8 +153,9 @@ class GKDTrainer(SFTTrainer):
             teacher_model=teacher_model,
         )
 
-        if teacher_model is None:
-            teacher_state = deepcopy_model(student_state)
+        self_distillation = teacher_model is None
+        if self_distillation:
+            teacher_state = student_state
         elif isinstance(teacher_model, EasyDeLState):
             teacher_state = teacher_model
         else:
@@ -162,9 +163,14 @@ class GKDTrainer(SFTTrainer):
 
         if arguments.disable_dropout:
             student_state = disable_state_dropout(student_state)
-            teacher_state = disable_state_dropout(teacher_state)
+            teacher_state = student_state if self_distillation else disable_state_dropout(teacher_state)
 
-        self.teacher_state = teacher_state
+        # Self-distillation borrows the student state until the base initializer
+        # has finalized `self.model_state` (optimizer init, resharding, resume).
+        # `configure_functions` only reads shardings/flops off the teacher, so no
+        # copy is needed yet -- and copying here would leave a second teacher
+        # resident for the whole run once the real copy is taken below.
+        self.teacher_state = drop_optimizer_state(teacher_state)
 
         super().__init__(
             arguments=arguments,
@@ -176,8 +182,10 @@ class GKDTrainer(SFTTrainer):
             data_collator=data_collator,
         )
 
-        if teacher_model is None:
-            self.teacher_state = deepcopy_model(self.model_state)
+        if self_distillation:
+            # `self.model_state` now carries optimizer slots, so a whole-pytree
+            # deep copy would duplicate those too; the teacher only needs params.
+            self.teacher_state = copy_frozen_policy(self.model_state)
 
         self.pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
         if self.pad_token_id is None:
@@ -288,8 +296,6 @@ class GKDTrainer(SFTTrainer):
 
         self.sharded_training_step_function = sharded_training_step_function
         self.sharded_evaluation_step_function = sharded_evaluation_step_function
-        self._train_shared_fn_extra_args = (self.teacher_state,)
-        self._eval_shared_fn_extra_args = (self.teacher_state,)
 
         teacher_flops = self.teacher_state.model.flops_per_token(include_loss=True, include_backward=False)
         self._extra_forward_flops_per_token = teacher_flops
@@ -302,6 +308,23 @@ class GKDTrainer(SFTTrainer):
             mesh=mesh,
             checkpoint_manager=checkpoint_manager,
         )
+
+    @property
+    def _train_shared_fn_extra_args(self) -> tuple[tp.Any, ...]:
+        """Forward the *live* teacher state alongside the shared training step.
+
+        Resolved per call rather than captured once at compile time: in the
+        self-distillation path the teacher is copied from the finalized student
+        after ``configure_functions`` has already run, and a cached tuple would
+        keep feeding the loss the pre-initialization state (the pre-resume
+        weights, for a resumed run).
+        """
+        return (self.teacher_state,)
+
+    @property
+    def _eval_shared_fn_extra_args(self) -> tuple[tp.Any, ...]:
+        """Forward the live teacher state alongside the shared evaluation step."""
+        return (self.teacher_state,)
 
     def _preprocess_batch_input(
         self,

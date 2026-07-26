@@ -55,8 +55,8 @@ from easydel.infra.sharding import replicated_named_sharding
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
 from easydel.utils.helpers import capture_time, get_logger  # pyright: ignore[reportPrivateLocalImportUsage]
-from easydel.utils.traversals import deepcopy_model
 
+from .._shared import polyak_update_reference_graphstate
 from ..group_relative_policy_optimization._fn import get_per_token_logps
 from ..group_relative_policy_optimization.grpo_trainer import GRPOTrainer
 from ..metrics import _host_mean_float, _host_scalar_float
@@ -1001,11 +1001,11 @@ class SDPOTrainer(GRPOTrainer):
             and self.ref_state is not None
             and (step % self.arguments.ref_model_sync_steps == 0)
         ):
-            alpha = self.arguments.ref_model_mixup_alpha
-            new_graphstate = jax.tree_util.tree_map(
-                lambda new, old: alpha * new + (1 - alpha) * old,
-                deepcopy_model(state.graphstate),
-                self.ref_state.graphstate,
+            self.ref_state = self.ref_state.replace(
+                graphstate=polyak_update_reference_graphstate(
+                    self.ref_state.graphstate,
+                    state.graphstate,
+                    alpha=self.arguments.ref_model_mixup_alpha,
+                )
             )
-            self.ref_state = self.ref_state.replace(graphstate=new_graphstate)
         return state, metrics

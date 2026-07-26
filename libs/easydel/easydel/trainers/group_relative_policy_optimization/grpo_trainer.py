@@ -46,8 +46,8 @@ from easydel.utils.helpers import (  # pyright: ignore[reportPrivateLocalImportU
     capture_time,
     get_logger,
 )
-from easydel.utils.traversals import deepcopy_model
 
+from .._shared import copy_frozen_policy, polyak_update_reference_graphstate
 from ..agentic_moshpit.environment import ToolEnvWrapper, create_tool_call_parser
 from ..agentic_moshpit.tools import function_to_json, make_tool
 from ..metrics import _host_mean_float, _host_scalar_float
@@ -408,7 +408,7 @@ class GRPOTrainer(Trainer):
             model = model.to_state(trainable_selector=arguments.trainable_selector)
 
         if arguments.beta != 0.0:
-            self.ref_state = deepcopy_model(model=model)
+            self.ref_state = copy_frozen_policy(model)
             if arguments.disable_dropout:
                 model, self.ref_state = self._disable_state_dropout(model, self.ref_state)
         else:
@@ -2003,11 +2003,11 @@ class GRPOTrainer(Trainer):
             and self.ref_state is not None
             and (step % self.arguments.ref_model_sync_steps == 0)
         ):
-            alpha = self.arguments.ref_model_mixup_alpha
-            new_graphstate = jax.tree_util.tree_map(
-                lambda new, old: alpha * new + (1 - alpha) * old,
-                deepcopy_model(state.graphstate),
-                self.ref_state.graphstate,
+            self.ref_state = self.ref_state.replace(
+                graphstate=polyak_update_reference_graphstate(
+                    self.ref_state.graphstate,
+                    state.graphstate,
+                    alpha=self.arguments.ref_model_mixup_alpha,
+                )
             )
-            self.ref_state = self.ref_state.replace(graphstate=new_graphstate)
         return state, metrics

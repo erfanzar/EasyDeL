@@ -436,41 +436,52 @@ class GFPOTrainer(GRPOTrainer):
                 generation_factor,
                 prompt_batch_size=prompt_mask.shape[0],
             )
-            normalized_repeated_model_kwargs = normalize_generation_model_kwargs(
-                repeated_prompt_model_kwargs,
-                model_callable=getattr(self.ref_state.model, "forward", self.ref_state.model),
-            )
             prompt_completion_mask = jnp.concatenate([ridmask, completion_mask], -1)
 
             with capture_time() as token_logps_time_fn:
-                if self.ref_logps_chunk_size is not None and prompt_completion_ids.shape[0] > self.ref_logps_chunk_size:
-                    ref_chunks: list[jax.Array] = []
-                    full_batch_size = int(prompt_completion_ids.shape[0])
-                    for start in range(0, full_batch_size, self.ref_logps_chunk_size):
-                        end = min(start + self.ref_logps_chunk_size, full_batch_size)
-                        ref_chunks.append(
-                            self.compute_refmodel_logps(
-                                self.ref_state.graphstate,
-                                self.ref_state.graphother,
-                                prompt_completion_ids[start:end],
-                                prompt_completion_mask[start:end],
-                                slice_prompt_aligned_model_kwargs(
-                                    normalized_repeated_model_kwargs,
-                                    start,
-                                    end,
-                                    prompt_batch_size=full_batch_size,
-                                ),
-                            )
-                        )
-                    ref_per_token_logps = jnp.concatenate(ref_chunks, axis=0)
-                else:
-                    ref_per_token_logps = self.compute_refmodel_logps(
-                        self.ref_state.graphstate,
-                        self.ref_state.graphother,
-                        prompt_completion_ids,
-                        prompt_completion_mask,
-                        normalized_repeated_model_kwargs,
+                if self.ref_state is None:
+                    # beta == 0: KL term disabled -> skip the reference forward
+                    # entirely. The placeholder is never read by the loss.
+                    ref_per_token_logps = jnp.zeros(
+                        (completion_ids.shape[0], completion_ids.shape[1]),
+                        dtype=jnp.float32,
                     )
+                else:
+                    normalized_repeated_model_kwargs = normalize_generation_model_kwargs(
+                        repeated_prompt_model_kwargs,
+                        model_callable=getattr(self.ref_state.model, "forward", self.ref_state.model),
+                    )
+                    if (
+                        self.ref_logps_chunk_size is not None
+                        and prompt_completion_ids.shape[0] > self.ref_logps_chunk_size
+                    ):
+                        ref_chunks: list[jax.Array] = []
+                        full_batch_size = int(prompt_completion_ids.shape[0])
+                        for start in range(0, full_batch_size, self.ref_logps_chunk_size):
+                            end = min(start + self.ref_logps_chunk_size, full_batch_size)
+                            ref_chunks.append(
+                                self.compute_refmodel_logps(
+                                    self.ref_state.graphstate,
+                                    self.ref_state.graphother,
+                                    prompt_completion_ids[start:end],
+                                    prompt_completion_mask[start:end],
+                                    slice_prompt_aligned_model_kwargs(
+                                        normalized_repeated_model_kwargs,
+                                        start,
+                                        end,
+                                        prompt_batch_size=full_batch_size,
+                                    ),
+                                )
+                            )
+                        ref_per_token_logps = jnp.concatenate(ref_chunks, axis=0)
+                    else:
+                        ref_per_token_logps = self.compute_refmodel_logps(
+                            self.ref_state.graphstate,
+                            self.ref_state.graphother,
+                            prompt_completion_ids,
+                            prompt_completion_mask,
+                            normalized_repeated_model_kwargs,
+                        )
             token_logps_time = token_logps_time_fn()
 
             raw_completions_text = self._coerce_generation_texts(

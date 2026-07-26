@@ -138,6 +138,8 @@ Zare Chavoshi, Erfan. "EasyDeL, an open-source library, is specifically designed
    trainers/sft.md
    trainers/dpo.md
    trainers/grpo.md
+   trainers/sao.md
+   trainers/compaction_rl.md
    trainers/orpo.md
    trainers/reward.md
 

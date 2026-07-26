@@ -754,6 +754,10 @@ class Trainer(BaseTrainer):
                         # PoSE (text-only): host-side position_ids skip, once per microbatch
                         # before the forward (no-op unless arguments.pose.enabled).
                         batch = self._apply_pose_to_batch(batch, current_step)
+                        # Vision encoder: run the tower out of band on the vision-bearing
+                        # rows and swap in precomputed features, once per microbatch before
+                        # the forward (no-op unless arguments.process_encoder.enabled).
+                        batch = self._apply_process_encoder_to_batch(batch, current_step)
                     # Persist the (possibly re-created on exhaustion) bucket iterator.
                     if self._has_buckets:
                         self._bucket_iters[self._bucket_for_step] = train_iter

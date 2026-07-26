@@ -525,11 +525,15 @@ class RolloutManager:
 
         Returns:
             Dict with ``prompt_ids``, ``prompt_mask``, ``completion_ids``,
-            ``completion_mask``, ``rewards``, ``step_rewards_list``.
+            ``completion_attention_mask``, ``completion_mask``, ``rewards``,
+            and ``step_rewards_list``. ``completion_attention_mask`` marks
+            every real post-split token (including environment observations);
+            ``completion_mask`` marks only model-generated response tokens.
         """
         batch_prompt_ids = []
         batch_prompt_mask = []
         batch_completion_ids = []
+        batch_completion_attention_mask = []
         batch_completion_mask = []
         batch_rewards = []
         batch_step_rewards = []
@@ -541,6 +545,7 @@ class RolloutManager:
 
             prompt_ids = traj.input_ids[:first_response_idx]
             completion_ids = traj.input_ids[first_response_idx:]
+            completion_response_mask = traj.response_mask[first_response_idx:]
 
             if len(prompt_ids) > max_prompt_length:
                 prompt_ids = prompt_ids[-max_prompt_length:]
@@ -560,6 +565,7 @@ class RolloutManager:
 
             if len(completion_ids) > max_completion_length:
                 completion_ids = completion_ids[:max_completion_length]
+                completion_response_mask = completion_response_mask[:max_completion_length]
             comp_pad_len = max_completion_length - len(completion_ids)
             padded_completion = np.concatenate(
                 [
@@ -567,9 +573,15 @@ class RolloutManager:
                     np.full(comp_pad_len, self._pad_token_id, dtype=np.int64),
                 ]
             )
-            completion_mask = np.concatenate(
+            completion_attention_mask = np.concatenate(
                 [
                     np.ones(len(completion_ids), dtype=np.int32),
+                    np.zeros(comp_pad_len, dtype=np.int32),
+                ]
+            )
+            completion_mask = np.concatenate(
+                [
+                    completion_response_mask.astype(np.int32),
                     np.zeros(comp_pad_len, dtype=np.int32),
                 ]
             )
@@ -577,6 +589,7 @@ class RolloutManager:
             batch_prompt_ids.append(padded_prompt)
             batch_prompt_mask.append(prompt_mask)
             batch_completion_ids.append(padded_completion)
+            batch_completion_attention_mask.append(completion_attention_mask)
             batch_completion_mask.append(completion_mask)
             batch_rewards.append(traj.episode_reward)
             batch_step_rewards.append(traj.step_rewards)
@@ -585,6 +598,7 @@ class RolloutManager:
             "prompt_ids": np.stack(batch_prompt_ids),
             "prompt_mask": np.stack(batch_prompt_mask),
             "completion_ids": np.stack(batch_completion_ids),
+            "completion_attention_mask": np.stack(batch_completion_attention_mask),
             "completion_mask": np.stack(batch_completion_mask),
             "rewards": np.array(batch_rewards, dtype=np.float32),
             "step_rewards_list": batch_step_rewards,

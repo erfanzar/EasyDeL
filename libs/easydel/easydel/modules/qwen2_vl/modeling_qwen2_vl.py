@@ -2006,6 +2006,7 @@ class Qwen2VLModel(EasyDeLBaseModule):
         pixel_values_videos: Array | None = None,
         image_grid_thw: Array | None = None,
         video_grid_thw: Array | None = None,
+        image_embeds: Array | None = None,
         rope_deltas: Array | None = None,
         cache_position: Array | None = None,
         mask_info: MaskInfo | None = None,
@@ -2063,6 +2064,7 @@ class Qwen2VLModel(EasyDeLBaseModule):
                 pixel_values_videos=pixel_values_videos,
                 image_grid_thw=image_grid_thw,
                 video_grid_thw=video_grid_thw,
+                image_embeds=image_embeds,
             )
 
         if position_ids is None:
