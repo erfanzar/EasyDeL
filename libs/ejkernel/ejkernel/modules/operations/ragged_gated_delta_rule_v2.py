@@ -1246,6 +1246,19 @@ def ragged_gated_delta_rule_v2_with_window_states(
         # composition (the fusion only pays off on the flat TP path). The
         # window scan runs FIRST: it reads the window-entry state, and the
         # main-pass executor may donate the pool buffer in eager use.
+        #
+        # Same precondition as the main pass: neither op can run as a TPU Pallas
+        # kernel outside a shard_map region on a multi-device mesh. Mosaic would
+        # otherwise reject the window scan with "Mosaic kernels cannot be
+        # automatically partitioned", which points at the kernel rather than at
+        # the mesh/head-count mismatch that actually caused it.
+        if _is_tpu_pallas_request(platform=platform, cfg=run_cfg) and _has_nontrivial_mesh_axis(mesh):
+            raise ValueError(
+                "TPU Pallas ragged GDN with speculative window states requires a non-replicated "
+                f"shard_map axis on multi-device meshes. No mesh axis divides n_kq={n_kq}, n_v={n_v}, "
+                f"d_k={d_k}, d_v={d_v}; mesh axes={_mesh_axis_items(mesh)}. Shard a head axis (so the "
+                'fused path engages) or request platform="xla".'
+            )
         flat_positions = window_positions.reshape(-1)
         num_steps = int(window_positions.shape[1])
         qkv_rows = mixed_qkv[flat_positions].reshape(num_base_slots, num_steps, -1)
