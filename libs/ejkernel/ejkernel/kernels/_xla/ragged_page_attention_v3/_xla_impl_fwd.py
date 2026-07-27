@@ -122,6 +122,29 @@ def align_to(x, a):
     return cdiv(x, a) * a
 
 
+KV_PAIR_IN_HEAD_DIM_HEAD_DIM = 64
+
+
+def kv_pair_in_head_dim(actual_head_dim: int) -> bool:
+    """Whether this head dim stores K and V concatenated in the head-dim axis.
+
+    Mirrors the dispatch in ``_interface.ragged_page_attention_v3``: a query head
+    dim of 64 routes to the ``_pallas_impl_fwd_h64`` TPU kernel, whose pages are
+    ``[pages, page_size, align_to(num_kv_heads, pack) // pack, pack, 2 * head_dim]``
+    -- K in the low half of the 128-wide last axis, V in the high half. Every
+    other head dim interleaves the pair on the head axis instead. This reference
+    implementation must read and write whichever layout the dispatched kernel
+    would, or a cache filled on one backend is unreadable on another.
+
+    Args:
+        actual_head_dim: Per-head query/key dimension.
+
+    Returns:
+        ``True`` when K and V share the head-dim axis.
+    """
+    return int(actual_head_dim) == KV_PAIR_IN_HEAD_DIM_HEAD_DIM
+
+
 def merge_kv(k: jax.Array, v: jax.Array) -> jax.Array:
     """Interleave and pack key and value tensors into the merged paged-cache format.
 
@@ -156,6 +179,21 @@ def merge_kv(k: jax.Array, v: jax.Array) -> jax.Array:
         assert k.dtype == v.dtype
         max_num_tokens, actual_num_kv_heads, actual_head_dim = k.shape
         kv_packing = get_dtype_packing(k.dtype)
+        if kv_pair_in_head_dim(actual_head_dim):
+            # K|V concatenated into the last axis; the head axis stays at
+            # num_kv_heads and needs no head-dim padding (2 * 64 == 128).
+            padded_heads = align_to(actual_num_kv_heads, kv_packing)
+            kv = jnp.pad(
+                jnp.concat([k, v], axis=-1),
+                ((0, 0), (0, padded_heads - actual_num_kv_heads), (0, 0)),
+                constant_values=0,
+            )
+            return kv.reshape(
+                max_num_tokens,
+                padded_heads // kv_packing,
+                kv_packing,
+                actual_head_dim * 2,
+            )
         actual_num_kv_heads_x2 = actual_num_kv_heads * 2
         num_kv_heads_x2 = align_to(actual_num_kv_heads_x2, kv_packing)
         head_dim = align_to(actual_head_dim, 128)
@@ -618,10 +656,15 @@ def ragged_paged_attention(
                         head_dim_padded,
                     )
                     kv_tok = kv_tok.reshape(kv_tokens_per_block, num_kv_heads_x2, head_dim_padded)
-                    kv_tok = kv_tok[:, : actual_num_kv_heads * 2, :]
-                    kv_tok = kv_tok.reshape(kv_tokens_per_block, actual_num_kv_heads, 2, head_dim_padded)
-                    k_block = kv_tok[:, :, 0, :actual_head_dim]
-                    v_block = kv_tok[:, :, 1, :actual_head_dim]
+                    if kv_pair_in_head_dim(actual_head_dim):
+                        kv_tok = kv_tok[:, :actual_num_kv_heads, :]
+                        k_block = kv_tok[:, :, :actual_head_dim]
+                        v_block = kv_tok[:, :, actual_head_dim : actual_head_dim * 2]
+                    else:
+                        kv_tok = kv_tok[:, : actual_num_kv_heads * 2, :]
+                        kv_tok = kv_tok.reshape(kv_tokens_per_block, actual_num_kv_heads, 2, head_dim_padded)
+                        k_block = kv_tok[:, :, 0, :actual_head_dim]
+                        v_block = kv_tok[:, :, 1, :actual_head_dim]
 
                     with jax.named_scope("logits"):
                         logits = jnp.einsum(
