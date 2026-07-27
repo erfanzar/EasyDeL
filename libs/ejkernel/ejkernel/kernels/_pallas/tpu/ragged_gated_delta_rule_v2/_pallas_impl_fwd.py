@@ -1011,7 +1011,10 @@ def _select_pallas_gdn_btok(
     module default set by :func:`set_gdn_kernel_tile_policy`. In ``"auto"``
     mode it iterates over ``(16, 8, 4)`` candidates and returns the first that
     both divides ``num_tokens`` and keeps ``2 * b_tok * n_v * d_k * d_v *
-    bytes_per`` under a 14 MiB cap (input + output state windows).
+    bytes_per`` under one quarter of the device's VMEM capacity (input +
+    output state windows). Mosaic double-buffers those windows; the remaining
+    half of VMEM is reserved for compiler spill slots, activation windows,
+    and scratch.
 
     Args:
         num_tokens: Total tokens packed into the decode batch.
@@ -1036,9 +1039,15 @@ def _select_pallas_gdn_btok(
     except Exception:
         pass
     # TPU Mosaic may double-buffer these windows and still needs spill space.
-    # Keep the raw input+output state window pair small enough that buffering
-    # does not push the program over the 64MiB VMEM ceiling.
-    max_window_pair_bytes = 14 << 20
+    # VMEM capacity is generation-dependent (for example, 16 MiB on TPU v4),
+    # so a fixed 14 MiB window allowance can select a tile that cannot compile.
+    try:
+        vmem_capacity_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes)
+    except Exception:
+        # Preserve the former conservative ceiling when device information is
+        # unavailable during host-only tracing.
+        vmem_capacity_bytes = 28 << 20
+    max_window_pair_bytes = max(vmem_capacity_bytes // 4, 1)
     for b_tok in _PALLAS_GDN_BTOK_CANDIDATES:
         if num_tokens < b_tok or num_tokens % b_tok != 0:
             continue
