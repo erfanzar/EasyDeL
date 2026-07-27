@@ -26,12 +26,30 @@ with the standard sibling-helper fallback::
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 import spectrax as spx
 from easydel.modules.qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5TextConfig
 
 VOCAB = 256
 HIDDEN = 128
+
+
+def _spec_decode_axis_dims() -> tuple[int, int, int, int, int, int]:
+    """Mesh dims that keep the GDN kernels on their sharded path.
+
+    ejkernel runs ragged GDN (and its speculative-window scan) as a TPU Pallas
+    kernel only inside a shard_map region, which it enters when a head axis is
+    shardable. With the default ``tp=1`` mesh no axis qualifies, so on a
+    multi-device TPU the kernels are asked to run unsharded and Mosaic rejects
+    them -- while on CPU the same config silently falls back to XLA and passes.
+    Pinning ``tp=2`` (a divisor of this model's 4 attention heads, 2 KV heads,
+    16 linear key heads, and 32 linear value heads) makes these tests exercise
+    the real sharded path on every backend.
+    """
+    devices = jax.device_count()
+    tp = 2 if devices % 2 == 0 else 1
+    return (1, 1, -1, 1, tp, 1)
 
 
 def make_tiny_qwen35(mtp_layers: int = 1) -> Qwen3_5ForCausalLM:
@@ -59,5 +77,6 @@ def make_tiny_qwen35(mtp_layers: int = 1) -> Qwen3_5ForCausalLM:
         attn_output_gate=True,
         rms_norm_eps=1e-6,
         partial_rotary_factor=0.25,
+        sharding_axis_dims=_spec_decode_axis_dims(),
     )
     return Qwen3_5ForCausalLM(config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
