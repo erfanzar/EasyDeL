@@ -527,7 +527,6 @@ def _apply_auto_environment() -> None:
         "--xla_gpu_enable_cublaslt=true "
         "--xla_gpu_enable_cudnn_fmha=true "
         "--xla_gpu_force_compilation_parallelism=4 "
-        "--xla_gpu_enable_shared_constants=true "
         "--xla_gpu_enable_triton_gemm=true "
         "--xla_gpu_enable_command_buffer='' "
         "--xla_disable_hlo_passes=collective-permute-motion "
