@@ -39,16 +39,11 @@ to drive the kernels under a realistic sharding configuration. TPU/multi-device-
 tests are guarded with ``pytest.mark.skipif``.
 """
 
+import easydel.modules.qwen3_next.modeling_qwen3_next as qwen3_next_modeling
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from ejkernel.kernels._xla.gated_delta_rule._xla_impl_fwd import _single_step_gdr_fwd
-from ejkernel.modules.operations import gated_delta_rule_grouped_decode
-from jax.sharding import Mesh, NamedSharding, PartitionSpec
-from spectrax import PartitionAxis, PartitionManager, SpxMesh
-
-import easydel.modules.qwen3_next.modeling_qwen3_next as qwen3_next_modeling
 from easydel.modules.qwen3_next.modeling_qwen3_next import (
     _apply_qwen3_next_depthwise_conv_sequence,
     _apply_qwen3_next_packed_updates,
@@ -61,6 +56,10 @@ from easydel.modules.qwen3_next.qwen3_next_configuration import Qwen3NextConfig
 from easydel.operations import OperationMetadata
 from easydel.operations.kernels import GatedDeltaRuleOp
 from easydel.utils.inference_mode import set_inference_mode
+from ejkernel.kernels._xla.gated_delta_rule._xla_impl_fwd import _single_step_gdr_fwd
+from ejkernel.modules.operations import gated_delta_rule_grouped_decode
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from spectrax import PartitionAxis, PartitionManager, SpxMesh
 
 
 def _make_decode_inputs(dtype=jnp.bfloat16):
@@ -698,12 +697,12 @@ def test_grouped_single_step_gdr_matches_repeated_heads_without_decay():
     assert jnp.allclose(grouped_state.astype(jnp.float32), legacy_state.astype(jnp.float32), rtol=0.02, atol=0.05)
 
 
-def test_grouped_gdr_decode_honors_runtime_dtype():
-    """Grouped decode honors the op's runtime dtype for the recurrent state.
+def test_grouped_gdr_decode_preserves_state_dtype():
+    """Grouped decode preserves the recurrent-cache dtype.
 
     Feeds float32 inputs but a ``GatedDeltaRuleOp`` built with ``runtime_dtype=jnp.bfloat16`` and
-    asserts the returned output keeps the float32 input dtype while the updated recurrent state is
-    cast to the op's bfloat16 runtime dtype.
+    asserts the returned output keeps the float32 input dtype while the updated recurrent state
+    remains float32 for generation-loop carry stability.
     """
     query, key, value, beta, decay, recurrent_state = _make_tp_grouped_decode_inputs(dtype=jnp.float32, batch=2)
     mesh = _make_runtime_mesh()
@@ -721,7 +720,7 @@ def test_grouped_gdr_decode_honors_runtime_dtype():
         )
 
     assert grouped_output.dtype == jnp.float32
-    assert grouped_state.dtype == jnp.bfloat16
+    assert grouped_state.dtype == jnp.float32
 
 
 def test_packed_updates_match_reference_loop_for_decode_like_schedule():
