@@ -267,13 +267,102 @@ def test_chat_stream_protocol_forwards_engine_deltas_without_recompute():
     assert len({chunk.id for chunk in chunks}) == 1
     assert len({chunk.created for chunk in chunks}) == 1
     assert all(chunk.object == "chat.completion.chunk" for chunk in chunks)
-    assert [chunk.usage.completion_tokens for chunk in chunks[:-1]] == [1, 3]
-    assert all(chunk.usage.prompt_tokens == 2 for chunk in chunks)
+    assert all(chunk.usage is None for chunk in chunks[:-1])
     assert chunks[-1].choices[0].finish_reason == "stop"
+    assert chunks[-1].usage.prompt_tokens == 2
     assert chunks[-1].usage.completion_tokens == 3
 
     first_payload = chunks[0].model_dump(exclude_none=True)
-    assert {"id", "object", "created", "model", "choices", "usage"} <= first_payload.keys()
+    assert {"id", "object", "created", "model", "choices"} <= first_payload.keys()
+    assert "usage" not in first_payload
+
+    assert chunks[0].choices[0].delta.role == "assistant"
+    assert all(chunk.choices[0].delta.role is None for chunk in chunks[1:])
+
+
+def test_chat_stream_protocol_skips_snapshots_without_a_usable_delta():
+    """Snapshots with no content/reasoning/tool-call delta must not be emitted.
+
+    A role-only chunk (``{"role": "assistant"}``) carries nothing a client can
+    append to any stream, and OpenAI-compatible frontends forward it to their
+    UI layer verbatim instead of routing it through their content pipeline.
+    """
+    outputs = iter(
+        [
+            RequestOutput(
+                request_id="req-empty",
+                prompt="hi",
+                prompt_token_ids=[1, 2],
+                outputs=[CompletionOutput(index=0, text="", token_ids=[10], finish_reason=None)],
+                accumulated_text="",
+                delta_text="",
+                num_generated_tokens=1,
+                tokens_per_second=5.0,
+                processing_time=0.1,
+                first_token_time=0.01,
+            ),
+            RequestOutput(
+                request_id="req-empty",
+                prompt="hi",
+                prompt_token_ids=[1, 2],
+                outputs=[CompletionOutput(index=0, text="ok", token_ids=[10, 11], finish_reason="stop")],
+                finished=True,
+                accumulated_text="ok",
+                delta_text="ok",
+                num_generated_tokens=2,
+                tokens_per_second=6.0,
+                processing_time=0.2,
+                first_token_time=0.01,
+            ),
+        ]
+    )
+
+    chunks = list(iter_chat_completion_stream_responses(outputs, model="demo-model"))
+
+    assert len(chunks) == 2
+    assert chunks[0].choices[0].delta.content == "ok"
+    assert chunks[-1].choices[0].finish_reason == "stop"
+    assert chunks[-1].usage.completion_tokens == 2
+
+
+def test_chat_stream_protocol_keeps_reasoning_only_deltas():
+    """Reasoning-only deltas are real payload and must survive the empty-delta filter."""
+    outputs = iter(
+        [
+            RequestOutput(
+                request_id="req-reason",
+                prompt="hi",
+                prompt_token_ids=[1, 2],
+                outputs=[CompletionOutput(index=0, text="", token_ids=[10], finish_reason=None)],
+                accumulated_text="",
+                delta_text="",
+                delta_reasoning_content="thinking",
+                num_generated_tokens=1,
+                tokens_per_second=5.0,
+                processing_time=0.1,
+                first_token_time=0.01,
+            ),
+            RequestOutput(
+                request_id="req-reason",
+                prompt="hi",
+                prompt_token_ids=[1, 2],
+                outputs=[CompletionOutput(index=0, text="4", token_ids=[10, 11], finish_reason="stop")],
+                finished=True,
+                accumulated_text="4",
+                delta_text="4",
+                num_generated_tokens=2,
+                tokens_per_second=6.0,
+                processing_time=0.2,
+                first_token_time=0.01,
+            ),
+        ]
+    )
+
+    chunks = list(iter_chat_completion_stream_responses(outputs, model="demo-model"))
+
+    assert chunks[0].choices[0].delta.reasoning_content == "thinking"
+    assert chunks[1].choices[0].delta.content == "4"
+    assert chunks[-1].choices[0].finish_reason == "stop"
 
 
 def test_engine_io_iter_chat_completion_stream_executes_real_wrapper():

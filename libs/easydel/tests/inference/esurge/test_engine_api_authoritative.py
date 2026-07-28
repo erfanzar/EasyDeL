@@ -265,37 +265,20 @@ def test_handle_chat_streaming_forwards_engine_chunks_without_api_delta_logic():
     finally:
         server.thread_pool.shutdown(wait=True)
 
-    expected_chunks = [
-        ChatCompletionStreamResponse(
-            model="dummy-model",
-            choices=[
-                ChatCompletionStreamResponseChoice(
-                    index=0,
-                    delta=DeltaMessage(role="assistant", content="Hello!"),
-                    finish_reason=None,
-                )
-            ],
-            usage=UsageInfo(prompt_tokens=3, completion_tokens=1, total_tokens=4),
-        ),
-        ChatCompletionStreamResponse(
-            model="dummy-model",
-            choices=[
-                ChatCompletionStreamResponseChoice(
-                    index=0,
-                    delta=DeltaMessage(role="assistant", content=""),
-                    finish_reason="stop",
-                )
-            ],
-            usage=UsageInfo(prompt_tokens=3, completion_tokens=1, total_tokens=4),
-        ),
+    frames = [line[len("data: ") :] for line in body.split("\n\n") if line.startswith("data: ")]
+    assert frames[-1] == "[DONE]"
+
+    payloads = [json.loads(frame) for frame in frames[:-1]]
+    assert len(payloads) == 2
+    assert [payload["choices"][0]["delta"] for payload in payloads] == [
+        {"role": "assistant", "content": "Hello!"},
+        {"role": "assistant", "content": ""},
     ]
-    assert body == "".join(
-        [
-            f"data: {expected_chunks[0].model_dump_json(exclude_unset=True, exclude_none=True)}\n\n",
-            f"data: {expected_chunks[1].model_dump_json(exclude_unset=True, exclude_none=True)}\n\n",
-            "data: [DONE]\n\n",
-        ]
-    )
+    assert [payload["choices"][0].get("finish_reason") for payload in payloads] == [None, "stop"]
+    assert all(payload["object"] == "chat.completion.chunk" for payload in payloads)
+    assert all(payload["model"] == "dummy-model" for payload in payloads)
+    assert payloads[-1]["usage"]["prompt_tokens"] == 3
+    assert payloads[-1]["usage"]["completion_tokens"] == 1
 
 
 def test_responses_streaming_forwards_engine_frames_without_api_parser_state():

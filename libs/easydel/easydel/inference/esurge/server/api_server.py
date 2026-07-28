@@ -2589,12 +2589,15 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             ):
                 prompt_tokens = len(esurge.tokenizer(prompt)["input_ids"])
                 previous_text = ""
+                stream_id = f"cmpl-{uuid.uuid4().hex}"
+                created_at = int(time.time())
                 queue = self._start_stream_task(lambda: esurge.stream(prompt, sampling_params, request_id=request_id))
                 total_generated = 0
                 generation_time = 0.0
                 tokens_per_second = 0.0
                 last_output: RequestOutput | None = None
                 disconnected = False
+                sent_role = False
 
                 try:
                     stream_error: Exception | None = None  # pyright: ignore[reportUnusedVariable]
@@ -2615,33 +2618,36 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
 
                         output = tp.cast(RequestOutput, payload)
                         last_output = output
-                        current_completion_tokens = output.num_generated_tokens
-                        current_tps = output.tokens_per_second
-                        elapsed_time = output.processing_time
 
                         current_text = output.accumulated_text or ""
                         delta_text = self._compute_delta_text(current_text, previous_text, output.delta_text or "")
                         previous_text = current_text
 
+                        if not delta_text:
+                            total_generated = output.num_generated_tokens
+                            generation_time = output.processing_time
+                            tokens_per_second = output.tokens_per_second
+                            continue
+
                         chunk = ChatCompletionStreamResponse(
+                            id=stream_id,
+                            object="chat.completion.chunk",
+                            created=created_at,
                             model=request.model,
                             choices=[
                                 ChatCompletionStreamResponseChoice(
                                     index=0,
-                                    delta=DeltaMessage(content=delta_text, role="assistant"),
+                                    delta=DeltaMessage(
+                                        content=delta_text,
+                                        role=None if sent_role else "assistant",
+                                    ),
                                     finish_reason=None,
                                 )
                             ],
-                            usage=UsageInfo(
-                                prompt_tokens=prompt_tokens,
-                                completion_tokens=current_completion_tokens,
-                                total_tokens=prompt_tokens + current_completion_tokens,
-                                tokens_per_second=current_tps,
-                                processing_time=elapsed_time,
-                                first_token_time=output.first_token_time,
-                            ),
+                            usage=None,
                         )
-                        yield f"data: {chunk.model_dump_json(exclude_unset=True, exclude_none=True)}\n\n"
+                        sent_role = True
+                        yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
                         total_generated = output.num_generated_tokens
                         generation_time = output.processing_time
                         tokens_per_second = output.tokens_per_second
@@ -2662,18 +2668,21 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                     )
 
                     final_chunk = ChatCompletionStreamResponse(
+                        id=stream_id,
+                        object="chat.completion.chunk",
+                        created=created_at,
                         model=request.model,
                         choices=[
                             ChatCompletionStreamResponseChoice(
                                 index=0,
-                                delta=DeltaMessage(content="", role="assistant"),
+                                delta=DeltaMessage(content="", role=None if sent_role else "assistant"),
                                 finish_reason="stop",
                             )
                         ],
                         usage=usage,
                     )
 
-                    yield f"data: {final_chunk.model_dump_json(exclude_unset=True)}\n\n"
+                    yield f"data: {final_chunk.model_dump_json(exclude_none=True)}\n\n"
                     yield "data: [DONE]\n\n"
 
                     self.metrics.total_tokens_generated += total_generated
