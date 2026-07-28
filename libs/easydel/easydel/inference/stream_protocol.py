@@ -40,6 +40,7 @@ from __future__ import annotations
 import json
 import time
 import typing as tp
+import uuid
 from typing import Protocol
 
 from .openai_api_modules import (
@@ -579,6 +580,8 @@ def iter_chat_completion_stream_responses(
     outputs: tp.Iterator[RequestOutputLike],
     *,
     model: str,
+    completion_id: str | None = None,
+    created: int | None = None,
 ) -> tp.Iterator[ChatCompletionStreamResponse]:
     """Convert a stream of engine output snapshots into OpenAI Chat Completion SSE chunks.
 
@@ -603,6 +606,8 @@ def iter_chat_completion_stream_responses(
         RuntimeError: If ``outputs`` produced no snapshots at all.
     """
 
+    stream_id = completion_id or f"chat-{uuid.uuid4().hex}"
+    created_at = int(created if created is not None else time.time())
     prompt_tokens = 0
     total_generated = 0
     generation_time = 0.0
@@ -639,6 +644,9 @@ def iter_chat_completion_stream_responses(
             saw_tool_call_delta = True
 
         yield ChatCompletionStreamResponse(
+            id=stream_id,
+            object="chat.completion.chunk",
+            created=created_at,
             model=model,
             choices=[
                 ChatCompletionStreamResponseChoice(
@@ -677,6 +685,9 @@ def iter_chat_completion_stream_responses(
         finish_reason = "stop"
 
     yield ChatCompletionStreamResponse(
+        id=stream_id,
+        object="chat.completion.chunk",
+        created=created_at,
         model=model,
         choices=[
             ChatCompletionStreamResponseChoice(

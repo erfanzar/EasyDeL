@@ -416,7 +416,7 @@ class ChatCompletionStreamResponse(OpenAIBaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
     choices: list[ChatCompletionStreamResponseChoice]
-    usage: UsageInfo  # Usage info might be included in chunks, often zero until the end
+    usage: UsageInfo | None = None
 
 
 class CompletionRequest(OpenAIBaseModel):
