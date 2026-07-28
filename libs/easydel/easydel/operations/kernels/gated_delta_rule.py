@@ -162,7 +162,8 @@ class GatedDeltaRuleOp(OperationImpl):
             A tuple of:
             - output: Attention output, shape ``[batch, num_v_heads, value_dim]``.
             - new_state: Updated recurrent state,
-              shape ``[batch, num_v_heads, head_dim, value_dim]``.
+              shape ``[batch, num_v_heads, head_dim, value_dim]`` with the
+              same dtype as ``recurrent_state``.
         """
         runtime_dtype = self.metadata.runtime_dtype
         return _ejkernel_gated_delta_rule_grouped_decode(
@@ -171,7 +172,10 @@ class GatedDeltaRuleOp(OperationImpl):
             value.astype(runtime_dtype),
             beta.astype(runtime_dtype),
             decay.astype(runtime_dtype) if decay is not None else None,
-            recurrent_state.astype(runtime_dtype),
+            # Recurrent state is an explicit accumulator/cache dtype. eJKernel
+            # computes in and returns this dtype, so it must not follow the
+            # lower-precision activation runtime dtype.
+            recurrent_state,
             platform="xla",
         )
 
@@ -528,9 +532,6 @@ class GatedDeltaRuleOp(OperationImpl):
             if decay.ndim == 4 and decay.shape[-1] == 1:
                 decay = decay[..., 0]
 
-        if recurrent_state is not None:
-            recurrent_state = recurrent_state.astype(runtime_dtype)
-
         query_sharding = self.create_stable_sharding(
             shardings_bthd.query,
             tensor=query,
@@ -700,7 +701,6 @@ class GatedDeltaRuleOp(OperationImpl):
             decay = decay.astype(runtime_dtype)
         else:
             decay = jnp.zeros_like(beta)
-        recurrent_state = recurrent_state.astype(runtime_dtype)
 
         mesh = self.metadata.mesh
         platform = None

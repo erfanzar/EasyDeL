@@ -35,16 +35,11 @@ Tests gated with ``@pytest.mark.skipif`` require a real multi-device TPU mesh an
 tensor-parallel sharding axis and the Pallas grouped-decode kernel; they are skipped on CPU/GPU.
 """
 
+import easydel.modules.qwen3_next.modeling_qwen3_next as qwen3_next_modeling
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from ejkernel.kernels._xla.gated_delta_rule._xla_impl_fwd import _single_step_gdr_fwd
-from ejkernel.modules.operations import gated_delta_rule_grouped_decode
-from jax.sharding import Mesh, NamedSharding, PartitionSpec
-from spectrax import PartitionAxis, PartitionManager, SpxMesh
-
-import easydel.modules.qwen3_next.modeling_qwen3_next as qwen3_next_modeling
 from easydel.modules.qwen3_next.modeling_qwen3_next import (
     _apply_qwen3_next_depthwise_conv_sequence,
     _apply_qwen3_next_packed_updates,
@@ -57,6 +52,10 @@ from easydel.modules.qwen3_next.qwen3_next_configuration import Qwen3NextConfig
 from easydel.operations import OperationMetadata
 from easydel.operations.kernels import GatedDeltaRuleOp
 from easydel.utils.inference_mode import set_inference_mode
+from ejkernel.kernels._xla.gated_delta_rule._xla_impl_fwd import _single_step_gdr_fwd
+from ejkernel.modules.operations import gated_delta_rule_grouped_decode
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from spectrax import PartitionAxis, PartitionManager, SpxMesh
 
 
 def _make_decode_inputs(dtype=jnp.bfloat16):
@@ -697,12 +696,13 @@ def test_grouped_single_step_gdr_matches_repeated_heads_without_decay():
     assert jnp.allclose(grouped_state.astype(jnp.float32), legacy_state.astype(jnp.float32), rtol=0.02, atol=0.05)
 
 
-def test_grouped_gdr_decode_honors_runtime_dtype():
-    """Assert the grouped decode honors the op's runtime dtype for the state while keeping the output dtype.
+def test_grouped_gdr_decode_preserves_state_dtype():
+    """Assert grouped decode keeps the cache dtype independent from the activation runtime dtype.
 
     Feeds float32 inputs through ``apply_grouped_single_step_gdr`` with a ``GatedDeltaRuleOp`` whose
     ``runtime_dtype`` is bf16, under an active mesh. Verifies the attention output keeps float32 (matching the
-    query dtype) while the returned recurrent state is cast to the op's bf16 runtime dtype.
+    query dtype) and the returned recurrent state remains float32. The latter is required because Qwen3.5
+    prefills its recurrent cache in float32 before carrying it through the generation loop.
     """
     query, key, value, beta, decay, recurrent_state = _make_tp_grouped_decode_inputs(dtype=jnp.float32, batch=2)
     mesh = _make_runtime_mesh()
@@ -720,7 +720,45 @@ def test_grouped_gdr_decode_honors_runtime_dtype():
         )
 
     assert grouped_output.dtype == jnp.float32
-    assert grouped_state.dtype == jnp.bfloat16
+    assert grouped_state.dtype == jnp.float32
+
+
+def test_grouped_gdr_decode_keeps_while_loop_carry_dtype_stable():
+    """Assert a bf16 decode op can repeatedly update an fp32 recurrent-state carry.
+
+    Qwen3.5 generation prefills the GDR cache in float32 and then carries it through
+    ``jax.lax.while_loop`` while activations remain bf16. JAX requires the loop body to
+    return the exact carry dtype it received, so this test exercises two grouped decode
+    steps and fails at trace time if the operation downcasts the state.
+    """
+    query, key, value, beta, decay, recurrent_state = _make_decode_inputs(dtype=jnp.bfloat16)
+    mesh = _make_runtime_mesh()
+
+    with mesh:
+        gdr_op = _make_gdr_op(mesh, runtime_dtype=jnp.bfloat16)
+
+        def loop_body(carry):
+            step, state = carry
+            _, state = apply_grouped_single_step_gdr(
+                query=query,
+                key=key,
+                value=value,
+                beta=beta,
+                decay=decay,
+                recurrent_state=state,
+                gdr_op=gdr_op,
+            )
+            return step + 1, state
+
+        final_step, final_state = jax.lax.while_loop(
+            lambda carry: carry[0] < 2,
+            loop_body,
+            (jnp.array(0, dtype=jnp.int32), recurrent_state.astype(jnp.float32)),
+        )
+
+    assert final_step == 2
+    assert final_state.dtype == jnp.float32
+    assert jnp.all(jnp.isfinite(final_state))
 
 
 def test_packed_updates_match_reference_loop_for_decode_like_schedule():

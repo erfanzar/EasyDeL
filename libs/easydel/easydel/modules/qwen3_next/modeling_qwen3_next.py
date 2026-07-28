@@ -1150,14 +1150,14 @@ def _apply_qwen3_next_packed_updates_unified(
 
             # Advance the draft state with the EXACT same op the single-token
             # decode fast lane uses (`apply_grouped_single_step_gdr` / `gdr_op`),
-            # not a hand-inlined fp32 formula. The two are algebraically identical
-            # but the op runs in `recurrent_state.dtype` (bf16) through the fused
-            # grouped-decode kernel (Pallas on TPU), so a manual fp32 XLA copy
-            # produces low-bit-different candidate states that do not match a real
-            # sequential decode. Reusing the op makes each candidate row
-            # bit-identical to sequentially decoding the accepted prefix, which is
-            # what lets the cheap candidate-commit rewind be exact (no replay
-            # forward needed). See `_apply_single_token_fast_lane` above.
+            # not a hand-inlined formula. The op keeps bf16 activation inputs
+            # separate from the recurrent cache dtype (normally fp32) and delegates
+            # the grouped update to eJKernel's XLA implementation. A manual copy can
+            # still lower with different operation ordering and produce
+            # low-bit-different candidate states. Reusing the op makes each
+            # candidate row bit-identical to sequentially decoding the accepted
+            # prefix, which is what lets the cheap candidate-commit rewind be exact
+            # (no replay forward needed). See `_apply_single_token_fast_lane` above.
             if expand_ratio > 1:
                 step_output, step_recurrent = apply_grouped_single_step_gdr(
                     query=query,
