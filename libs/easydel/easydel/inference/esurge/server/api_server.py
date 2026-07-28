@@ -2342,7 +2342,7 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                         chunk = tp.cast(ChatCompletionStreamResponse, payload)
                         last_chunk = chunk
                         delta_message = chunk.choices[0].delta if chunk.choices else None
-                        yield f"data: {chunk.model_dump_json(exclude_unset=True, exclude_none=True)}\n\n"
+                        yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
 
                     if disconnected:
                         return

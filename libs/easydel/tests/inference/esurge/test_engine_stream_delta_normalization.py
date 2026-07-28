@@ -264,8 +264,16 @@ def test_chat_stream_protocol_forwards_engine_deltas_without_recompute():
         "Hello!",
         " How can I assist you today?",
     ]
+    assert len({chunk.id for chunk in chunks}) == 1
+    assert len({chunk.created for chunk in chunks}) == 1
+    assert all(chunk.object == "chat.completion.chunk" for chunk in chunks)
+    assert [chunk.usage.completion_tokens for chunk in chunks[:-1]] == [1, 3]
+    assert all(chunk.usage.prompt_tokens == 2 for chunk in chunks)
     assert chunks[-1].choices[0].finish_reason == "stop"
     assert chunks[-1].usage.completion_tokens == 3
+
+    first_payload = chunks[0].model_dump(exclude_none=True)
+    assert {"id", "object", "created", "model", "choices", "usage"} <= first_payload.keys()
 
 
 def test_engine_io_iter_chat_completion_stream_executes_real_wrapper():
