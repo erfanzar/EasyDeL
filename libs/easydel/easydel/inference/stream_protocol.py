@@ -363,6 +363,32 @@ def coerce_stream_delta_message(
     return normalized
 
 
+def stream_delta_has_payload(delta_message: DeltaMessage) -> bool:
+    """Report whether a streaming delta carries anything a client can consume.
+
+    A delta whose only populated field is ``role`` conveys no content, no
+    reasoning, and no tool-call progress. Emitting such a chunk is legal JSON
+    but useless: OpenAI-compatible consumers cannot route it into any stream,
+    and some forward the raw chunk to their UI layer unchanged. Snapshots that
+    produce one are dropped by the stream builders.
+
+    Args:
+        delta_message: Normalized delta to inspect.
+
+    Returns:
+        ``True`` when the delta has content, reasoning content, tool calls, or
+        a function call; ``False`` when it is role-only/empty.
+    """
+    if delta_message.tool_calls or delta_message.function_call:
+        return True
+    if delta_message.reasoning_content:
+        return True
+    content = delta_message.content
+    if isinstance(content, list):
+        return bool(content)
+    return bool(content)
+
+
 def build_responses_reasoning_item(reasoning_text: str) -> ResponseReasoningItem:
     """Create a ``ResponseReasoningItem`` wrapping the given reasoning text.
 
@@ -594,13 +620,24 @@ def iter_chat_completion_stream_responses(
     upgraded to ``"tool_calls"`` whenever at least one delta or batch tool
     call was detected during the stream.
 
+    Per the OpenAI streaming contract, ``usage`` is ``None`` on every delta
+    chunk and is populated only on the terminal chunk. Emitting cumulative
+    usage on every chunk makes clients that accumulate usage across frames
+    (OpenWebUI's ``merge_usage``, for instance) report token counts that grow
+    quadratically with the response length. Snapshots that carry no visible
+    delta (no content, no reasoning, no tool calls) are skipped entirely
+    rather than emitted as an empty ``{"role": "assistant"}`` chunk, which
+    clients cannot route into any content stream.
+
     Args:
         outputs: Iterator of engine output snapshots.
         model: Model identifier embedded in each emitted chunk.
+        completion_id: Stable ``id`` shared by every chunk; generated when omitted.
+        created: Unix timestamp shared by every chunk; defaults to the current time.
 
     Yields:
         :class:`ChatCompletionStreamResponse` chunks, with the final chunk
-        carrying the resolved ``finish_reason``.
+        carrying the resolved ``finish_reason`` and the stream usage.
 
     Raises:
         RuntimeError: If ``outputs`` produced no snapshots at all.
@@ -614,6 +651,7 @@ def iter_chat_completion_stream_responses(
     tokens_per_second = 0.0
     last_output = None
     saw_tool_call_delta = False
+    sent_role = False
 
     for output in outputs:
         last_output = output
@@ -634,7 +672,7 @@ def iter_chat_completion_stream_responses(
             fallback_text=output.delta_text or "",
             default_role="assistant",
         )
-        if delta_message is None:
+        if delta_message is None or not stream_delta_has_payload(delta_message):
             total_generated = current_completion_tokens
             generation_time = elapsed_time
             tokens_per_second = current_tps
@@ -642,6 +680,11 @@ def iter_chat_completion_stream_responses(
 
         if delta_message.tool_calls:
             saw_tool_call_delta = True
+
+        if sent_role:
+            delta_message.role = None
+        else:
+            sent_role = True
 
         yield ChatCompletionStreamResponse(
             id=stream_id,
@@ -655,14 +698,7 @@ def iter_chat_completion_stream_responses(
                     finish_reason=None,
                 )
             ],
-            usage=UsageInfo(
-                prompt_tokens=prompt_tokens,
-                completion_tokens=current_completion_tokens,
-                total_tokens=prompt_tokens + current_completion_tokens,
-                tokens_per_second=current_tps,
-                processing_time=elapsed_time,
-                first_token_time=output.first_token_time,
-            ),
+            usage=None,
         )
         total_generated = current_completion_tokens
         generation_time = elapsed_time
@@ -692,7 +728,10 @@ def iter_chat_completion_stream_responses(
         choices=[
             ChatCompletionStreamResponseChoice(
                 index=0,
-                delta=DeltaMessage(content=None if has_tool_calls else "", role="assistant"),
+                delta=DeltaMessage(
+                    content=None if has_tool_calls else "",
+                    role=None if sent_role else "assistant",
+                ),
                 finish_reason=finish_reason,
             )
         ],
