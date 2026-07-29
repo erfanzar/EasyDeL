@@ -1388,6 +1388,73 @@ class BaseTrainer(BaseTrainerProtocol):
         return normalized[:target_len]
 
     @staticmethod
+    def _warn_on_ungradeable_completions(
+        *,
+        clean_texts: collections.abc.Sequence[str | None] | None,
+        raw_texts: collections.abc.Sequence[str | None] | None,
+        truncated: collections.abc.Sequence[tp.Any] | None,
+    ) -> None:
+        """Warn when rollouts cannot produce a reward signal at all.
+
+        Reward functions score the parsed completion text. A reasoning model
+        whose chat template prefills ``<think>`` and never emits ``</think>``
+        within the completion budget leaves that parsed text empty, so every
+        reward is 0 no matter how long training runs and no matter how good the
+        underlying generation is. Nothing else surfaces this: the run looks
+        healthy, gradients flow, and only a flat zero reward hints at it.
+
+        Distinguishing empty-parsed-but-non-empty-raw is what makes the warning
+        actionable, because it separates "the policy said nothing" from "the
+        policy said plenty but none of it survived parsing".
+
+        Args:
+            clean_texts: Parsed per-completion text handed to reward functions.
+            raw_texts: Pre-parse per-completion text, when available.
+            truncated: Per-completion truncation flags (``True`` when the
+                completion hit the length cap).
+        """
+        if not clean_texts:
+            return
+        total = len(clean_texts)
+        empty_indices = [i for i, text in enumerate(clean_texts) if not (text or "").strip()]
+        if not empty_indices:
+            return
+        empty_fraction = len(empty_indices) / total
+        if empty_fraction < 0.5:
+            return
+
+        raw_list = list(raw_texts or [])
+        nonempty_raw = sum(
+            1 for i in empty_indices if i < len(raw_list) and (raw_list[i] or "").strip()
+        )
+        truncated_list = list(truncated or [])
+        truncated_count = sum(1 for i in empty_indices if i < len(truncated_list) and truncated_list[i])
+
+        if nonempty_raw:
+            logger.warn_once(
+                "%.0f%% of completions (%d/%d) parsed to empty text, but %d of those generated non-empty output "
+                "before parsing, and %d hit the length cap. Reward functions score the parsed text, so these "
+                "rollouts are ungradeable and their reward is structurally 0 regardless of training. This is the "
+                "signature of a reasoning template that opens a thinking block the completion budget is too small "
+                "to close: raise the completion budget past the typical reasoning length, or disable thinking in "
+                "the chat template.",
+                empty_fraction * 100.0,
+                len(empty_indices),
+                total,
+                nonempty_raw,
+                truncated_count,
+            )
+            return
+        logger.warn_once(
+            "%.0f%% of completions (%d/%d) are empty, %d of them after hitting the length cap. Reward functions "
+            "score completion text, so these rollouts contribute no learning signal.",
+            empty_fraction * 100.0,
+            len(empty_indices),
+            total,
+            truncated_count,
+        )
+
+    @staticmethod
     def _coerce_generation_metadata_list(
         values: collections.abc.Sequence[tp.Any] | tp.Any | None,
         *,
