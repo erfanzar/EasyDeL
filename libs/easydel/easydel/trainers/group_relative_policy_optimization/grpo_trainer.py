@@ -1790,6 +1790,11 @@ class GRPOTrainer(Trainer):
                 ],
                 target_len=target_len,
             )
+            self._warn_on_ungradeable_completions(
+                clean_texts=clean_completions_text,
+                raw_texts=raw_completions_text,
+                truncated=truncated_records,
+            )
             structured_clean_completions = (
                 self._build_structured_assistant_messages(
                     clean_completions_text,
