@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 
 import jax.numpy as jnp
-
 from easydel.inference.esurge.core.interface import CacheGroupsConfig, CacheGroupSpec, FullAttentionSpec
 from easydel.inference.esurge.outputs import ModelRunnerOutput
 from easydel.inference.esurge.request import EngineRequest
@@ -129,5 +129,145 @@ def test_dp_scheduler_routes_merges_offsets_and_splits_update() -> None:
 
         assert next_output.scheduled_cached_reqs.req_ids == ["r0", "r1"]
         assert next_output.scheduled_cached_reqs.dp_ranks == [0, 1]
+    finally:
+        scheduler.shutdown()
+
+
+def test_dp_scheduler_idle_schedule_does_not_desynchronize_next_update() -> None:
+    scheduler = _make_dp_scheduler()
+    try:
+        idle_output = scheduler.schedule()
+        assert idle_output.total_num_scheduled_tokens == 0
+        assert not idle_output.scheduled_new_reqs
+        assert idle_output.scheduled_cached_reqs.num_reqs == 0
+
+        request0 = _request("r0")
+        request1 = _request("r1")
+        scheduler.add_request(request0)
+        scheduler.add_request(request1)
+
+        output = scheduler.schedule()
+        engine_outputs = scheduler.update_from_output(output, _model_output(list(output.num_scheduled_tokens)))
+
+        emitted = {
+            out.request_id: out.new_token_ids
+            for client_output in engine_outputs.values()
+            for out in client_output.outputs
+        }
+        assert emitted == {"r0": [100], "r1": [101]}
+        assert list(scheduler.schedulers[0].requests["r0"].output_token_ids) == [100]
+        assert list(scheduler.schedulers[1].requests["r1"].output_token_ids) == [101]
+    finally:
+        scheduler.shutdown()
+
+
+def test_dp_scheduler_worker_rpc_replies_stay_with_the_calling_thread() -> None:
+    scheduler = _make_dp_scheduler()
+    try:
+        rank0 = scheduler.schedulers[0]
+        original_get_result = rank0._get_result
+        schedule_waiting = threading.Event()
+        counts_received = threading.Event()
+        results: dict[str, object] = {}
+        errors: list[BaseException] = []
+
+        def coordinated_get_result(command):
+            if command.value == "schedule":
+                schedule_waiting.set()
+                counts_received.wait(timeout=0.5)
+                return original_get_result(command)
+            result = original_get_result(command)
+            if command.value == "get_request_counts":
+                counts_received.set()
+            return result
+
+        rank0._get_result = coordinated_get_result
+
+        def run_schedule() -> None:
+            try:
+                results["schedule"] = scheduler.schedule()
+            except BaseException as exc:
+                errors.append(exc)
+
+        def read_counts() -> None:
+            try:
+                results["counts"] = scheduler.get_request_counts()
+            except BaseException as exc:
+                errors.append(exc)
+
+        schedule_thread = threading.Thread(target=run_schedule)
+        counts_thread = threading.Thread(target=read_counts)
+        schedule_thread.start()
+        assert schedule_waiting.wait(timeout=5)
+        counts_thread.start()
+        schedule_thread.join(timeout=5)
+        counts_thread.join(timeout=5)
+
+        assert not schedule_thread.is_alive()
+        assert not counts_thread.is_alive()
+        assert not errors
+        assert results["schedule"].total_num_scheduled_tokens == 0
+        assert results["counts"] == (0, 0)
+    finally:
+        scheduler.shutdown()
+
+
+def test_in_process_dp_scheduler_appends_each_sampled_token_once() -> None:
+    """In-process ranks mutate the coordinator's own EngineRequest objects.
+
+    Mirroring engine outputs on top of that appends every sampled token a
+    second time, which then makes the next ``schedule()`` request two tokens
+    per decode step instead of one.
+    """
+    scheduler = DPScheduler(
+        kv_cache_config=_kv_config(),
+        dp_size=2,
+        max_num_seqs=4,
+        max_num_batched_tokens=64,
+        max_model_len=64,
+        num_pages=64,
+        page_size=4,
+        enable_prefix_caching=False,
+        async_scheduling=False,
+        use_worker_processes=False,
+    )
+    try:
+        scheduler.add_request(_request("r0"))
+        scheduler.add_request(_request("r1"))
+
+        prefill = scheduler.schedule()
+        scheduler.update_from_output(prefill, _model_output(list(prefill.num_scheduled_tokens)))
+        assert list(scheduler.requests["r0"].output_token_ids) == [100]
+
+        decode = scheduler.schedule()
+        assert dict(decode.num_scheduled_tokens) == {"r0": 1, "r1": 1}
+        scheduler.update_from_output(decode, _model_output(list(decode.num_scheduled_tokens)))
+
+        assert list(scheduler.requests["r0"].output_token_ids) == [100, 100]
+        assert list(scheduler.requests["r1"].output_token_ids) == [101, 101]
+    finally:
+        scheduler.shutdown()
+
+
+def test_dp_scheduler_fanout_preserves_rank_order_and_update_pairing() -> None:
+    """Concurrent send/serial receive must not reorder rank results."""
+    scheduler = _make_dp_scheduler()
+    try:
+        scheduler.add_request(_request("r0"))
+        scheduler.add_request(_request("r1"))
+
+        output = scheduler.schedule()
+        assert output.req_ids_per_rank == {0: ["r0"], 1: ["r1"]}
+        assert [req.dp_rank for req in output.scheduled_new_reqs] == [0, 1]
+
+        engine_outputs = scheduler.update_from_output(output, _model_output(list(output.num_scheduled_tokens)))
+        emitted = {
+            out.request_id: out.new_token_ids
+            for client_output in engine_outputs.values()
+            for out in client_output.outputs
+        }
+        assert emitted == {"r0": [100], "r1": [101]}
+        assert list(scheduler.schedulers[0].requests["r0"].output_token_ids) == [100]
+        assert list(scheduler.schedulers[1].requests["r1"].output_token_ids) == [101]
     finally:
         scheduler.shutdown()

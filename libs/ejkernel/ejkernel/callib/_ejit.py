@@ -28,9 +28,11 @@ Constants:
     RECOMPILE_FORCE: Force recompilation flag (``EASYDEL_RECOMPILE_FORCE``).
     ECACHE_COMPILES: Enable two-level compilation caching (``EASYDEL_CACHE_COMPILES``).
     ALLOW_FULL_CACHE: Persist all XLA caches including tiny entries (``ALLOW_FULL_CACHE``).
-    CACHE_DIR: Platform-specific base cache directory.
+    CACHE_DIR: Base cache directory (``EJKERNEL_CACHE_ROOT`` relocates it).
     COMPILE_FUNC_DIR: Directory for serialized compiled executables
-        (``COMPILE_FUNC_DIR`` env var or ``<CACHE_DIR>/ejit_compiled_functions``).
+        (``EJKERNEL_COMPILE_CACHE_DIR``, legacy ``COMPILE_FUNC_DIR``, or
+        ``<CACHE_DIR>/ejit_compiled_functions``). This is the cache that grows
+        to multiple GB; ``EJKERNEL_PERSISTENT_CACHE_DIR`` does not relocate it.
     COMPILED_CACHE: Module-level in-memory dict of compiled ``Compiled`` objects.
 
 Key Features:
@@ -86,7 +88,19 @@ ECACHE_COMPILES = check_bool_flag("EASYDEL_CACHE_COMPILES", False)
 ALLOW_FULL_CACHE = check_bool_flag("ALLOW_FULL_CACHE", False)
 
 CACHE_DIR = get_cache_dir()
-COMPILE_FUNC_DIR = Path(os.getenv("COMPILE_FUNC_DIR") or (CACHE_DIR / "ejit_compiled_functions"))
+
+# This is the cache that actually grows: serialized XLA executables, routinely
+# several GB. ``EJKERNEL_COMPILE_CACHE_DIR`` is the documented name; the older
+# unprefixed ``COMPILE_FUNC_DIR`` keeps working for existing setups. Note that
+# neither ``EJKERNEL_PERSISTENT_CACHE_DIR`` (autotuned kernel configs) nor
+# ``JAX_COMPILATION_CACHE_DIR`` relocates it -- pointing those at another
+# volume to escape a full root filesystem does nothing for this directory,
+# which is the one worth moving.
+COMPILE_FUNC_DIR = Path(
+    os.getenv("EJKERNEL_COMPILE_CACHE_DIR")
+    or os.getenv("COMPILE_FUNC_DIR")
+    or (CACHE_DIR / "ejit_compiled_functions")
+).expanduser()
 
 
 def _env_fingerprint() -> str:
@@ -150,6 +164,12 @@ _JAX_PERSISTENT_CACHE_CONFIGURED = False
 def _configure_jax_persistent_cache() -> None:
     """Point JAX's persistent compilation cache at the namespaced dir (once).
 
+    An explicit ``JAX_COMPILATION_CACHE_DIR`` wins. Overwriting it silently
+    redirected JAX's cache back under this module's directory, so operators who
+    set that variable to move compile artifacts off a nearly-full root
+    filesystem saw the traffic land in the old place anyway, with no warning
+    and no way to tell from the environment.
+
     Also sweeps any oversized entry out of the directory so a partially
     written or weight-capturing giant blob can never poison later readers.
     """
@@ -158,8 +178,9 @@ def _configure_jax_persistent_cache() -> None:
         return
     from jax.experimental.compilation_cache import compilation_cache as cc
 
-    cc.set_cache_dir(str(EFFECTIVE_COMPILE_FUNC_DIR))
-    jax.config.update("jax_compilation_cache_dir", str(EFFECTIVE_COMPILE_FUNC_DIR))
+    jax_cache_dir = os.getenv("JAX_COMPILATION_CACHE_DIR") or str(EFFECTIVE_COMPILE_FUNC_DIR)
+    cc.set_cache_dir(jax_cache_dir)
+    jax.config.update("jax_compilation_cache_dir", jax_cache_dir)
     if ALLOW_FULL_CACHE:
         jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
         jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)

@@ -26,6 +26,7 @@ scheduler lock is the engine's own RLock, shared so the lock order contract
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 import traceback
@@ -326,6 +327,7 @@ class EngineLoop:
 
         _diag_iter = 0
         _diag_last_log = time.time()
+        _diag_debug = int(getattr(logger, "level", logging.INFO)) <= logging.DEBUG
 
         while self._running:
             try:
@@ -338,7 +340,13 @@ class EngineLoop:
                 prof_sched = time.perf_counter() - prof_phase
                 _n = len(scheduler_output.num_scheduled_tokens) if scheduler_output else 0
                 _now = time.time()
-                if _n > 0 or (_now - _diag_last_log) > 30:
+                # ``scheduler.running``/``waiting`` are RPC snapshots under
+                # DPScheduler worker processes: each access pickles a rank's
+                # full EngineRequest list back to the coordinator. Python
+                # evaluates logger arguments eagerly, so this diagnostic must
+                # stay behind an explicit level check or every decode step
+                # pays for a log line that is then discarded.
+                if _diag_debug and (_n > 0 or (_now - _diag_last_log) > 30):
                     logger.debug(
                         "loop iter=%d sched=%d run=%d wait=%d",
                         _diag_iter,

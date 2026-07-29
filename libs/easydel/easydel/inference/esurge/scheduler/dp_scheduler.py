@@ -28,6 +28,7 @@ import enum
 import multiprocessing
 import os
 import signal
+import threading
 import time
 import typing
 from collections import defaultdict, deque
@@ -178,6 +179,7 @@ class _SchedulerWorkerClient:
         start_method: str,
     ) -> None:
         self.rank = int(rank)
+        self._rpc_lock = threading.Lock()
         ctx = multiprocessing.get_context(start_method)
         input_parent, input_child = ctx.Pipe()
         output_parent, output_child = ctx.Pipe()
@@ -188,7 +190,26 @@ class _SchedulerWorkerClient:
             args=(self.rank, input_child, output_child, scheduler_cls, scheduler_kwargs),
             name=f"eSurgeDPSchedulerRank{self.rank}",
         )
-        self._process.start()
+        # A rank scheduler is pure host-side bookkeeping, but under the default
+        # ``spawn`` start method the child re-imports easydel to unpickle the
+        # target, and that import calls ``initialize_distributed()``, which
+        # defaults to ON. A second incarnation connecting to the parent's
+        # coordination service makes the parent's own distributed client abort
+        # the whole process ("tried to connect with a different incarnation"),
+        # killing the engine a few seconds after the workers come up. Every
+        # other spawned EasyDeL worker already opts out the same way (see
+        # ``workers/esurge/pipeline/worker_main.py``); this one must too, and it
+        # has to happen in the parent because ``spawn`` snapshots ``os.environ``
+        # at exec time -- before any code in the child runs.
+        previous_distributed_init = os.environ.get("ENABLE_DISTRIBUTED_INIT")
+        os.environ["ENABLE_DISTRIBUTED_INIT"] = "0"
+        try:
+            self._process.start()
+        finally:
+            if previous_distributed_init is None:
+                os.environ.pop("ENABLE_DISTRIBUTED_INIT", None)
+            else:
+                os.environ["ENABLE_DISTRIBUTED_INIT"] = previous_distributed_init
         input_child.close()
         output_child.close()
         atexit.register(self._atexit_cleanup)
@@ -220,8 +241,47 @@ class _SchedulerWorkerClient:
         return result
 
     def _call(self, command: _SchedulerCommand, data: typing.Any = None) -> typing.Any:
-        self._send_command(command, data)
-        return self._get_result(command)
+        # ``multiprocessing.Connection`` does not preserve request/reply
+        # ownership when multiple engine threads use the same client. Keep
+        # each untagged RPC atomic so a queue-stats read cannot consume the
+        # scheduler loop's result (or vice versa).
+        with self._rpc_lock:
+            self._send_command(command, data)
+            return self._get_result(command)
+
+    def begin_call(self, command: _SchedulerCommand, data: typing.Any = None) -> None:
+        """Send an RPC and hold this client's lock until :meth:`end_call`.
+
+        Splitting send from receive lets the coordinator dispatch every rank
+        before blocking on any reply, so independent worker processes run
+        their share concurrently instead of one-at-a-time. The lock is still
+        held across the whole request/reply window, preserving the atomicity
+        that :meth:`_call` provides against concurrent stats readers.
+
+        Args:
+            command: Worker command to dispatch.
+            data: Command payload.
+        """
+        self._rpc_lock.acquire()
+        try:
+            self._send_command(command, data)
+        except BaseException:
+            self._rpc_lock.release()
+            raise
+
+    def end_call(self, command: _SchedulerCommand) -> typing.Any:
+        """Receive the reply for a pending :meth:`begin_call` and unlock.
+
+        Args:
+            command: The command passed to the matching :meth:`begin_call`.
+
+        Returns:
+            The worker's deserialized result.
+        """
+        try:
+            return self._get_result(command)
+        finally:
+            self._rpc_lock.release()
 
     def add_request(self, request: EngineRequest) -> None:
         self._call(_SchedulerCommand.ADD_REQUEST, request)
@@ -465,11 +525,71 @@ class DPScheduler(SchedulerInterface):
 
     @property
     def running(self) -> list[EngineRequest]:
+        if self.use_worker_processes:
+            return [req for rank_running in self._fanout(_SchedulerCommand.SNAPSHOT_RUNNING) for req in rank_running]
         return [req for scheduler in self.schedulers for req in scheduler.running]
 
     @property
     def waiting(self) -> list[EngineRequest]:
+        if self.use_worker_processes:
+            return [req for rank_waiting in self._fanout(_SchedulerCommand.SNAPSHOT_WAITING) for req in rank_waiting]
         return [req for scheduler in self.schedulers for req in scheduler.waiting]
+
+    def _fanout(
+        self,
+        command: _SchedulerCommand,
+        payloads: list[typing.Any] | None = None,
+        *,
+        collect_errors: bool = False,
+    ) -> list[typing.Any]:
+        """Run one worker RPC per rank concurrently, results in rank order.
+
+        Every rank's request is written before any reply is read, so the
+        worker processes overlap instead of serializing behind the
+        coordinator. Replies are still consumed in rank order, so the
+        returned list is deterministic and each client's FIFO pairing is
+        unchanged.
+
+        Args:
+            command: Worker command to dispatch to every rank.
+            payloads: Per-rank payloads; ``None`` sends ``None`` to each rank.
+            collect_errors: When True a failing rank yields ``None`` in the
+                result list instead of aborting the whole fan-out.
+
+        Returns:
+            One result per rank, ordered by rank.
+
+        Raises:
+            Exception: The first rank error, unless ``collect_errors`` is set.
+        """
+        clients = typing.cast(list[_SchedulerWorkerClient], self.schedulers)
+        started: list[_SchedulerWorkerClient] = []
+        try:
+            for rank, client in enumerate(clients):
+                client.begin_call(command, None if payloads is None else payloads[rank])
+                started.append(client)
+        except BaseException:
+            # Drain whatever was already dispatched; leaving replies queued
+            # would desynchronize those clients' pipes for every later call.
+            for client in started:
+                try:
+                    client.end_call(command)
+                except Exception:
+                    logger.debug("Discarding rank %d reply after a fan-out send failure.", client.rank, exc_info=True)
+            raise
+
+        results: list[typing.Any] = []
+        first_error: BaseException | None = None
+        for client in started:
+            try:
+                results.append(client.end_call(command))
+            except BaseException as exc:
+                results.append(None)
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None and not collect_errors:
+            raise first_error
+        return results
 
     def _global_page_id(self, rank: int, page_id: int) -> int:
         pid = int(page_id)
@@ -487,25 +607,26 @@ class DPScheduler(SchedulerInterface):
             dp_rank=rank,
         )
 
-    def _rank_pending_prefill_tokens(self, rank: int) -> int:
-        scheduler = self.schedulers[rank]
-        if isinstance(scheduler, _SchedulerWorkerClient):
-            return scheduler.get_pending_prefill_tokens()
-        return _pending_prefill_tokens(scheduler)
-
     def _find_best_rank_for_request(self, request: EngineRequest) -> int:
+        if self.use_worker_processes:
+            probes = self._fanout(
+                _SchedulerCommand.PROBE_COMPUTED_TOKENS,
+                [request] * self.dp_size,
+                collect_errors=True,
+            )
+        else:
+            probes = []
+            for scheduler in self.schedulers:
+                try:
+                    probes.append(_probe_computed_tokens(typing.cast(Scheduler, scheduler), request))
+                except Exception:
+                    probes.append(None)
+
         best_cache_rank: int | None = None
         best_cache_tokens = 0
-        for rank, scheduler in enumerate(self.schedulers):
-            try:
-                if isinstance(scheduler, _SchedulerWorkerClient):
-                    cached_tokens = scheduler.probe_computed_tokens(request)
-                else:
-                    cached_tokens = _probe_computed_tokens(scheduler, request)
-            except Exception:
-                logger.debug(
-                    "Prefix-cache rank probe failed for req %s rank %d.", request.request_id, rank, exc_info=True
-                )
+        for rank, cached_tokens in enumerate(probes):
+            if cached_tokens is None:
+                logger.debug("Prefix-cache rank probe failed for req %s rank %d.", request.request_id, rank)
                 continue
             cached_tokens = int(cached_tokens)
             if cached_tokens > best_cache_tokens:
@@ -514,7 +635,11 @@ class DPScheduler(SchedulerInterface):
         if best_cache_rank is not None:
             return best_cache_rank
 
-        return min(range(self.dp_size), key=lambda rank: (self._rank_pending_prefill_tokens(rank), rank))
+        if self.use_worker_processes:
+            pending = self._fanout(_SchedulerCommand.GET_PENDING_PREFILL_TOKENS)
+        else:
+            pending = [_pending_prefill_tokens(typing.cast(Scheduler, s)) for s in self.schedulers]
+        return min(range(self.dp_size), key=lambda rank: (int(pending[rank]), rank))
 
     def add_request(self, request: EngineRequest) -> None:
         if request.request_id in self.req_id_to_dp_rank:
@@ -533,9 +658,25 @@ class DPScheduler(SchedulerInterface):
             logger.debug("DPScheduler previous step e2e time: %.4f seconds", now - self._last_schedule_start)
         self._last_schedule_start = now
 
-        rank_outputs = [scheduler.schedule() for scheduler in self.schedulers]
-        self._cached_rank_outputs.append(rank_outputs)
-        return self._combine_scheduler_outputs(rank_outputs)
+        if self.use_worker_processes:
+            rank_outputs = self._fanout(_SchedulerCommand.SCHEDULE)
+        else:
+            rank_outputs = [scheduler.schedule() for scheduler in self.schedulers]
+        combined_output = self._combine_scheduler_outputs(rank_outputs)
+        # EngineLoop deliberately skips ``update_from_output`` for a completely
+        # idle schedule. Caching those rank-local outputs would leave this
+        # queue permanently ahead of the updates: after any idle period, the
+        # next real model result would be applied to an old empty schedule and
+        # its sampled tokens would be dropped.
+        if (
+            combined_output.total_num_scheduled_tokens > 0
+            or combined_output.finished_req_ids
+            or combined_output.preempted_req_ids
+            or combined_output.scheduled_new_reqs
+            or combined_output.scheduled_cached_reqs.num_reqs
+        ):
+            self._cached_rank_outputs.append(rank_outputs)
+        return combined_output
 
     def _combine_scheduler_outputs(self, rank_outputs: list[SchedulerOutput]) -> SchedulerOutput:
         scheduled_new_reqs: list[NewRequestData] = []
@@ -642,10 +783,20 @@ class DPScheduler(SchedulerInterface):
             ]
 
         rank_model_outputs = self._split_model_output_by_rank(scheduler_output, model_runner_output)
+        if self.use_worker_processes:
+            per_rank_engine_outputs = self._fanout(
+                _SchedulerCommand.UPDATE_FROM_OUTPUT,
+                [(rank_outputs[rank], rank_model_outputs[rank]) for rank in range(self.dp_size)],
+            )
+        else:
+            per_rank_engine_outputs = [
+                scheduler.update_from_output(rank_outputs[rank], rank_model_outputs[rank])
+                for rank, scheduler in enumerate(self.schedulers)
+            ]
+
         combined: dict[int, EngineCoreOutputs] = {}
         finished_req_ids: set[str] = set()
-        for rank, scheduler in enumerate(self.schedulers):
-            rank_engine_outputs = scheduler.update_from_output(rank_outputs[rank], rank_model_outputs[rank])
+        for rank_engine_outputs in per_rank_engine_outputs:
             for client_index, engine_outputs in rank_engine_outputs.items():
                 if engine_outputs.finished_requests:
                     finished_req_ids.update(engine_outputs.finished_requests)
@@ -668,6 +819,15 @@ class DPScheduler(SchedulerInterface):
         return combined
 
     def _mirror_engine_outputs(self, engine_outputs_by_client: dict[int, EngineCoreOutputs]) -> None:
+        if not self.use_worker_processes:
+            # In-process rank schedulers mutate the very ``EngineRequest``
+            # objects stored in ``self._requests``: they have already
+            # appended the sampled tokens and set the finished status /
+            # stop reason. Mirroring here would append every token a second
+            # time, which then makes the next ``schedule()`` ask the runner
+            # for two tokens per request. Only worker-process ranks hold
+            # distinct (cloudpickled) copies that need catching up.
+            return
         for engine_outputs in engine_outputs_by_client.values():
             for output in engine_outputs.outputs:
                 request = self._requests.get(output.request_id)
@@ -847,21 +1007,30 @@ class DPScheduler(SchedulerInterface):
                 request.status = finished_status
 
     def get_num_unfinished_requests(self) -> int:
+        if self.use_worker_processes:
+            return sum(int(count) for count in self._fanout(_SchedulerCommand.GET_NUM_UNFINISHED_REQUESTS))
         return sum(scheduler.get_num_unfinished_requests() for scheduler in self.schedulers)
 
     def has_finished_requests(self) -> bool:
+        if self.use_worker_processes:
+            return any(bool(flag) for flag in self._fanout(_SchedulerCommand.HAS_FINISHED_REQUESTS))
         return any(scheduler.has_finished_requests() for scheduler in self.schedulers)
 
     def get_request_counts(self) -> tuple[int, int]:
+        if self.use_worker_processes:
+            per_rank = self._fanout(_SchedulerCommand.GET_REQUEST_COUNTS)
+        else:
+            per_rank = [scheduler.get_request_counts() for scheduler in self.schedulers]
         running = 0
         waiting = 0
-        for scheduler in self.schedulers:
-            rank_running, rank_waiting = scheduler.get_request_counts()
+        for rank_running, rank_waiting in per_rank:
             running += int(rank_running)
             waiting += int(rank_waiting)
         return running, waiting
 
     def reset_prefix_cache(self) -> bool:
+        if self.use_worker_processes:
+            return all(bool(ok) for ok in self._fanout(_SchedulerCommand.RESET_PREFIX_CACHE))
         return all(scheduler.reset_prefix_cache() for scheduler in self.schedulers)
 
     def shutdown(self) -> None:

@@ -24,10 +24,13 @@ CPU (the end-to-end garbage is TPU-only, but the row bookkeeping is not).
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from easydel.caching import HybridCache, RecurrentCacheView
 from easydel.inference.esurge.runners.execution_manager import ExecutionManager
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 
 def _make_view(n: int) -> RecurrentCacheView:
@@ -35,8 +38,12 @@ def _make_view(n: int) -> RecurrentCacheView:
 
     Distinct per-row fill values make row moves directly observable.
     """
+    # Ranks match the real GDR cache: conv_state is [slots, conv_dim, kernel]
+    # and recurrent_state is [slots, v_heads, k_head_dim, v_head_dim]. The
+    # extra recurrent rank matters — a 3-element PartitionSpec applied to a
+    # rank-4 array is where sharding-preservation regressions actually show up.
     conv = jnp.stack([jnp.full((2, 3), float(i + 1)) for i in range(n)], axis=0)
-    rec = jnp.stack([jnp.full((2, 2), float(i + 1)) for i in range(n)], axis=0)
+    rec = jnp.stack([jnp.full((2, 2, 2), float(i + 1)) for i in range(n)], axis=0)
     return RecurrentCacheView(
         conv_state=conv,
         recurrent_state=rec,
@@ -61,6 +68,59 @@ def _row_values(mgr: ExecutionManager) -> list[float]:
     return [float(conv[i, 0, 0]) for i in range(conv.shape[0])]
 
 
+def _make_fsdp_sharded_manager(n: int) -> tuple[ExecutionManager, NamedSharding]:
+    """Place recurrent leaves on the cache layout used by the Qwen AOT step."""
+    if len(jax.devices()) < 4:
+        pytest.skip("requires at least four fake or physical devices")
+    mesh = Mesh(
+        np.asarray(jax.devices()[:4], dtype=object).reshape((1, 1, 4, 1, 1, 1)),
+        ("pp", "dp", "fsdp", "ep", "tp", "sp"),
+    )
+    cache_sharding = NamedSharding(
+        mesh,
+        PartitionSpec(("fsdp", "dp"), "tp", "sp"),
+    )
+    mgr = _make_manager(n)
+    view = mgr.kv_pages.views[0]
+    mgr.kv_pages = HybridCache(
+        views=[
+            view.replace(
+                conv_state=jax.device_put(view.conv_state, cache_sharding),
+                recurrent_state=jax.device_put(view.recurrent_state, cache_sharding),
+            )
+        ]
+    )
+    return mgr, cache_sharding
+
+
+@pytest.mark.parametrize("operation", ["permute", "clear"])
+def test_recurrent_row_transforms_preserve_aot_cache_shardings(operation: str) -> None:
+    """Row maintenance must not invalidate the AOT model-step cache contract."""
+    mgr, required_sharding = _make_fsdp_sharded_manager(4)
+
+    if operation == "permute":
+        mgr.permute_recurrent_slots(np.array([1, 0, 2, 3], dtype=np.int32))
+    else:
+        mgr.clear_recurrent_slots([1])
+
+    view = mgr.kv_pages.views[0]
+    assert view.conv_state.sharding == required_sharding
+    assert view.recurrent_state.sharding == required_sharding
+
+    # A lower().compile() executable checks shardings at call time instead of
+    # silently inserting a reshard, matching the failing production path.
+    compiled = (
+        jax.jit(
+            lambda conv_state, recurrent_state: (conv_state, recurrent_state),
+            in_shardings=(required_sharding, required_sharding),
+            out_shardings=(required_sharding, required_sharding),
+        )
+        .lower(view.conv_state, view.recurrent_state)
+        .compile()
+    )
+    jax.block_until_ready(compiled(view.conv_state, view.recurrent_state))
+
+
 def test_permute_condense_moves_survivor_and_zeroes_freed_row() -> None:
     """condense: middle request removed, last survivor moved into the hole."""
     mgr = _make_manager(4)
@@ -76,7 +136,7 @@ def test_permute_condense_moves_survivor_and_zeroes_freed_row() -> None:
 
     # recurrent_state must move identically to conv_state.
     rec = np.asarray(mgr.kv_pages.views[0].recurrent_state)
-    assert [float(rec[i, 0, 0]) for i in range(4)] == [1.0, 4.0, 3.0, 0.0]
+    assert [float(rec[i, 0, 0, 0]) for i in range(4)] == [1.0, 4.0, 3.0, 0.0]
 
 
 def test_permute_swap_exchanges_rows() -> None:
@@ -115,9 +175,9 @@ def test_permute_noop_on_non_hybrid_cache() -> None:
 def test_permute_extends_to_speculative_candidate_rows() -> None:
     """Candidate rows (spec-decode) follow their owning base row.
 
-    Layout: base rows [0, n); candidate block for base row b is
-    [n + b*cc, n + b*cc + cc). Moving base row f -> t must move its candidate
-    block too.
+    Layout is prefix-major: base rows occupy ``[0, n)`` and candidate prefix
+    ``k`` for every base row occupies ``[n + k*n, n + (k+1)*n)``. Moving base
+    row ``f`` to ``t`` must move every corresponding prefix row too.
     """
     n = 3
     cc = 2
@@ -140,10 +200,9 @@ def test_permute_extends_to_speculative_candidate_rows() -> None:
     assert values[0] == 3.0  # base row0 now holds former base row2
     assert values[1] == 0.0
     assert values[2] == 0.0
-    # Candidate block of dest base row0 must come from source base row2's block.
-    # base row2 candidate rows were indices n + 2*cc + k = 3 + 4 + k = {7, 8} (values 8, 9).
-    assert values[n + 0 * cc + 0] == 8.0
-    assert values[n + 0 * cc + 1] == 9.0
-    # Removed base rows' candidate blocks zeroed.
-    assert values[n + 1 * cc + 0] == 0.0
-    assert values[n + 2 * cc + 1] == 0.0
+    # Destination base row0 gets source base row2 in every candidate prefix.
+    assert values[n + 0 * n + 0] == 6.0  # prefix0: source index n + 0*n + 2
+    assert values[n + 1 * n + 0] == 9.0  # prefix1: source index n + 1*n + 2
+    # Removed base rows' candidate rows are zeroed in every prefix.
+    assert values[n + 0 * n + 1] == 0.0
+    assert values[n + 1 * n + 2] == 0.0
