@@ -45,6 +45,7 @@ import operator
 import os
 import pprint
 import sys
+import threading
 import time
 import typing as tp
 from abc import abstractmethod
@@ -189,6 +190,180 @@ def _iter_sharded_source_from_example_offset(
             started = True
             continue
         yield from source.open_shard(shard_name)
+
+
+class MsgpackDecode(grain.MapTransform):
+    """Grain transform decoding one ``msgpack``-packed ``.array_record`` row (bytes -> dict).
+
+    ``msgpack`` is imported lazily so importing this module never requires it.
+    """
+
+    def __post_init__(self):
+        import msgpack
+
+        self._unpackb = msgpack.unpackb
+
+    def map(self, record: bytes):
+        return self._unpackb(record, raw=False)
+
+
+class _ArrayRecordReadRateLimiter:
+    """Process-wide byte token bucket shared by Grain ArrayRecord read threads."""
+
+    def __init__(self, bytes_per_second: float, burst_seconds: float):
+        self._lock = threading.Lock()
+        self._tokens = 0.0  # start EMPTY: at job start all 256 hosts are also synchronized, so don't
+        self._updated_at = time.monotonic()  # let each release a full bucket on the first read.
+        self.configure(bytes_per_second, burst_seconds)
+
+    @property
+    def bytes_per_second(self) -> float:
+        return self._bytes_per_second
+
+    @property
+    def burst_seconds(self) -> float:
+        return self._burst_seconds
+
+    def configure(self, bytes_per_second: float, burst_seconds: float) -> None:
+        bytes_per_second = float(bytes_per_second)
+        burst_seconds = float(burst_seconds)
+        if bytes_per_second <= 0:
+            raise ValueError("ArrayRecord read rate limiter requires a positive byte/sec rate.")
+        if burst_seconds <= 0:
+            raise ValueError("ArrayRecord read rate limiter requires a positive burst window (seconds).")
+        with self._lock:
+            self._bytes_per_second = bytes_per_second
+            self._burst_seconds = burst_seconds
+            # Burst capacity = rate * burst_seconds: the MOST one host can release in a single instant.
+            # A SMALL window bounds the SYNCHRONIZED fleet-wide spike -- after a slow step all 256 hosts
+            # refill prefetch in lockstep, so 256 * capacity hits the shared egress quota at once. At
+            # 50 MB/s * 0.25s = 12.5 MB/host -> ~3.2 GB fleet burst over 0.25s = 12.8 GB/s (< 25 GB/s).
+            self._capacity = max(bytes_per_second * burst_seconds, 1.0)
+            self._tokens = min(getattr(self, "_tokens", self._capacity), self._capacity)
+            self._updated_at = time.monotonic()
+
+    def acquire(self, num_bytes: int) -> None:
+        num_bytes = int(num_bytes)
+        if num_bytes <= 0:
+            return
+
+        with self._lock:
+            now = time.monotonic()
+            elapsed = max(now - self._updated_at, 0.0)
+            self._tokens = min(self._capacity, self._tokens + elapsed * self._bytes_per_second)
+            self._updated_at = now
+            self._tokens -= float(num_bytes)
+            wait_seconds = max(-self._tokens / self._bytes_per_second, 0.0)
+
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+
+
+_ARRAYRECORD_READ_RATE_LIMITER: _ArrayRecordReadRateLimiter | None = None
+_ARRAYRECORD_READ_RATE_LIMITER_LOCK = threading.Lock()
+
+
+def _get_arrayrecord_read_rate_limiter(bytes_per_second: float, burst_seconds: float) -> _ArrayRecordReadRateLimiter:
+    """Return the one process/host token bucket used by all ArrayRecord decode transforms."""
+    global _ARRAYRECORD_READ_RATE_LIMITER
+    with _ARRAYRECORD_READ_RATE_LIMITER_LOCK:
+        if _ARRAYRECORD_READ_RATE_LIMITER is None:
+            _ARRAYRECORD_READ_RATE_LIMITER = _ArrayRecordReadRateLimiter(bytes_per_second, burst_seconds)
+        elif (
+            _ARRAYRECORD_READ_RATE_LIMITER.bytes_per_second != float(bytes_per_second)
+            or _ARRAYRECORD_READ_RATE_LIMITER.burst_seconds != float(burst_seconds)
+        ):
+            _ARRAYRECORD_READ_RATE_LIMITER.configure(bytes_per_second, burst_seconds)
+        return _ARRAYRECORD_READ_RATE_LIMITER
+
+
+def _arrayrecord_read_rate_limit_bytes_per_second(mb_per_second: float | int | None) -> float | None:
+    """Convert the explicit ArrayRecord MB/s cap to bytes/sec; None or 0 disables it."""
+    if mb_per_second is None:
+        return None
+    if isinstance(mb_per_second, bool):
+        raise ValueError("`arrayrecord_read_rate_limit_mb_per_sec` must be a number, None, or 0; bool is invalid.")
+    try:
+        rate_mb_per_second = float(mb_per_second)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "`arrayrecord_read_rate_limit_mb_per_sec` must be a positive number, None, or 0."
+        ) from exc
+    if rate_mb_per_second == 0:
+        return None
+    if rate_mb_per_second < 0 or not np.isfinite(rate_mb_per_second):
+        raise ValueError("`arrayrecord_read_rate_limit_mb_per_sec` must be finite and non-negative.")
+    return rate_mb_per_second * 1_000_000.0
+
+
+def _arrayrecord_avg_compressed_bytes_per_row(
+    rows: list[dict[str, tp.Any]],
+    *,
+    source_name: str | None = None,
+) -> float:
+    """Compute source-average compressed/on-disk bytes per row from manifest rows."""
+    label = f" for source {source_name!r}" if source_name else ""
+    total_bytes = 0
+    total_rows = 0
+    for row in rows:
+        try:
+            nbytes = int(row["nbytes"])
+            nrows = int(row["nrows"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"arrayrecord read-rate compressed metering requires manifest `nbytes` and `nrows`{label}; "
+                f"bad row={row!r}."
+            ) from exc
+        if nbytes <= 0 or nrows <= 0:
+            raise ValueError(
+                f"arrayrecord read-rate compressed metering requires positive manifest `nbytes` and `nrows`{label}; "
+                f"got nbytes={nbytes}, nrows={nrows}, row={row!r}."
+            )
+        total_bytes += nbytes
+        total_rows += nrows
+    if total_rows <= 0:
+        raise ValueError(f"arrayrecord read-rate compressed metering found zero manifest rows{label}.")
+    return total_bytes / total_rows
+
+
+class _ArrayRecordReadRateLimit(grain.MapTransform):
+    """Meter ArrayRecord compressed wire bytes before msgpack decode."""
+
+    def __init__(
+        self,
+        bytes_per_second: float,
+        burst_seconds: float,
+        *,
+        compressed_bytes_per_record: float | int | None = None,
+    ):
+        bytes_per_second = float(bytes_per_second)
+        burst_seconds = float(burst_seconds)
+        if bytes_per_second <= 0:
+            raise ValueError("ArrayRecord read-rate transform requires a positive byte/sec rate.")
+        if burst_seconds <= 0:
+            raise ValueError("ArrayRecord read-rate transform requires a positive burst window (seconds).")
+        if compressed_bytes_per_record is not None:
+            compressed_bytes_per_record = float(compressed_bytes_per_record)
+            if compressed_bytes_per_record <= 0 or not np.isfinite(compressed_bytes_per_record):
+                raise ValueError(
+                    "ArrayRecord read-rate transform requires a positive finite compressed byte weight "
+                    f"when provided; got {compressed_bytes_per_record!r}."
+                )
+            compressed_bytes_per_record = int(np.ceil(compressed_bytes_per_record))
+        self._bytes_per_second = bytes_per_second
+        self._burst_seconds = burst_seconds
+        self._compressed_bytes_per_record = compressed_bytes_per_record
+
+    def map(self, record: bytes):
+        if self._compressed_bytes_per_record is None:
+            try:
+                num_bytes = len(record)
+            except TypeError as exc:
+                raise TypeError("ArrayRecord read-rate limiter expected a bytes-like record with len().") from exc
+        else:
+            num_bytes = self._compressed_bytes_per_record
+        _get_arrayrecord_read_rate_limiter(self._bytes_per_second, self._burst_seconds).acquire(num_bytes)
+        return record
 
 
 class _ReiterableDataLoader:
@@ -6238,10 +6413,262 @@ class BaseTrainer(BaseTrainerProtocol):
             TrainerConfigureDataloaderOutput: An object containing the configured dataloaders and the
                                             maximum number of training and evaluation steps.
         """
+        if self.arguments.arrayrecord_train_files or self.arguments.arrayrecord_train_datasets:
+            return self._configure_arrayrecord_dataloader()
         if self.arguments.use_grain:
             return self._configure_grain_dataloader()
         else:
             return self._configure_tfds_dataloader()
+
+    def _configure_arrayrecord_dataloader(self) -> TrainerConfigureDataloaderOutput:
+        """Configure a grain ArrayRecord dataloader for the precomputed VL pack.
+
+        Architecture (grain best practice for a weighted, globally-shuffled mixture):
+        each dataset is its OWN ArrayRecord set, loaded as a ``MapDataset`` and shuffled
+        independently, then combined with ``grain.MapDataset.mix(weights)`` so the
+        mixture weights are preserved and CONTROLLABLE (not merely size-proportional).
+        The mixed stream is sharded per host (``slice(shard_index, None, shard_count)``,
+        deterministic + disjoint), ``MsgpackDecode``-d, and grouped by ``batch`` into a
+        LIST of ``batch_size`` row dicts (``batch_fn=list``, uncollated). The trainer's
+        prefetcher applies ``self._data_collator`` (the VL packed-embeds collator) to that
+        list — same contract as the ShardedDataSource path — so collation happens exactly
+        once. ``.to_iter_dataset(read_options=...)`` drives native ``gs://`` random-access
+        reads with parallel prefetch.
+
+        A single ``arrayrecord_train_files`` source is handled as a one-dataset mixture
+        (uniform / size-proportional). ``mix`` length is ``min_i(size_i / weight_i)`` —
+        one epoch ends when the most-constrained dataset would be exhausted; ``repeat``
+        cycles for ``num_train_epochs``.
+
+        Empirically the loader sustains far above the step rate (no data-starved steps).
+        """
+        from easydel.data.sources.base import expand_data_files
+
+        # Build grain.ArrayRecordDataSource from precomputed FileInstructions (filename/skip/take/
+        # examples_in_shard, from each set's _MANIFEST.tsv) so array_record SKIPS its per-shard footer-count
+        # reads at init -- else it opens every shard (the thread/fork storm that crashed init). len() is instant too.
+        import dataclasses
+
+        import fsspec
+
+        @dataclasses.dataclass
+        class _ArrayRecordFI:
+            filename: str
+            skip: int
+            take: int
+            examples_in_shard: int
+
+        def _file_instructions(spec, *, source_name: str):
+            """array_record FileInstructions for one set, from its _MANIFEST.tsv. Fail-loud: a missing or
+            malformed manifest raises (never silently falls back to the footer-count burst)."""
+            globs = [spec] if isinstance(spec, str) else list(spec)
+            if not globs:
+                raise ValueError("arrayrecord_train_datasets entry is empty; expected a gs:// glob.")
+            set_dir = str(globs[0]).rsplit("/", 1)[0]  # gs://.../data_grain/<set>
+            root = set_dir.rsplit("/", 1)[0]  # gs://.../data_grain   (manifest paths are root-relative)
+            manifest = f"{set_dir}/_MANIFEST.tsv"
+            try:
+                with fsspec.open(manifest, "r") as fh:
+                    raw = fh.read()
+            except Exception as exc:
+                raise ValueError(
+                    f"arrayrecord FileInstruction build: cannot read manifest {manifest} "
+                    f"(required to skip the footer-count burst): {exc}"
+                ) from exc
+            instructions = []
+            manifest_rows = []
+            for line in raw.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split("\t")
+                # manifest rows are `<relpath>\t<bytes>\t<rows>`; skip any header / non-shard line.
+                if len(parts) != 3 or not parts[0].endswith(".array_record"):
+                    continue
+                relpath, _nbytes, nrows = parts
+                try:
+                    nbytes = int(_nbytes)
+                    n = int(nrows)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"arrayrecord FileInstruction build: invalid byte/row counts in {manifest}: {line!r} "
+                        "(expected positive integers)."
+                    ) from exc
+                if nbytes <= 0 or n <= 0:
+                    raise ValueError(
+                        f"arrayrecord FileInstruction build: non-positive byte/row counts in {manifest}: {line!r} "
+                        "(expected positive integers)."
+                    )
+                manifest_rows.append({"nbytes": nbytes, "nrows": n})
+                instructions.append(_ArrayRecordFI(filename=f"{root}/{relpath}", skip=0, take=n, examples_in_shard=n))
+            if not instructions:
+                raise ValueError(
+                    f"arrayrecord FileInstruction build: manifest {manifest} yielded 0 valid shards "
+                    "(expected `<relpath>\\t<bytes>\\t<rows>` lines)."
+                )
+            return instructions, _arrayrecord_avg_compressed_bytes_per_row(manifest_rows, source_name=source_name)
+
+        if self.data_collator is None:
+            raise ValueError(
+                "arrayrecord_train_files/_datasets requires an explicit `data_collator` (the VL "
+                "packed-embeds collator) — the trainer applies it to each list batch the loader yields."
+            )
+
+        shard_index = (
+            self.arguments.grain_shard_index if self.arguments.grain_shard_index is not None else jax.process_index()
+        )
+        shard_count = (
+            self.arguments.grain_shard_count if self.arguments.grain_shard_count is not None else jax.process_count()
+        )
+        read_rate_limit_bytes_per_second = _arrayrecord_read_rate_limit_bytes_per_second(
+            self.arguments.arrayrecord_read_rate_limit_mb_per_sec
+        )
+        read_rate_burst_seconds = float(self.arguments.arrayrecord_read_rate_burst_seconds)
+        if read_rate_limit_bytes_per_second is not None and read_rate_burst_seconds <= 0:
+            raise ValueError(
+                "`arrayrecord_read_rate_burst_seconds` must be > 0 when the read rate limiter is enabled; "
+                f"got {self.arguments.arrayrecord_read_rate_burst_seconds!r}."
+            )
+        if read_rate_limit_bytes_per_second is None:
+            logger.warning(
+                "arrayrecord read rate limiter is disabled because "
+                "`arrayrecord_read_rate_limit_mb_per_sec` is None or 0."
+            )
+        else:
+            logger.info(
+                "arrayrecord read rate limiter enabled at %.2f MB/s per process/host "
+                "(burst window %.3fs, capacity %.2f MB).",
+                read_rate_limit_bytes_per_second / 1_000_000.0,
+                read_rate_burst_seconds,
+                read_rate_limit_bytes_per_second * read_rate_burst_seconds / 1_000_000.0,
+            )
+
+        def _build(datasets: dict, weights: dict | None, batch_size, *, is_train, manifest_backed):
+            seed = self.arguments.shuffle_seed_train if is_train else 0
+            do_shuffle = self.arguments.shuffle_train_dataset if is_train else False
+            num_epochs = self.arguments.num_train_epochs if is_train else 1
+            if weights is not None:
+                missing = set(datasets) - set(weights)
+                extra = set(weights) - set(datasets)
+                if missing or extra:
+                    raise ValueError(
+                        "arrayrecord_mixture_weights keys must exactly match the dataset names; "
+                        f"missing weights for {sorted(missing)}, unknown weight keys {sorted(extra)}."
+                    )
+
+            # Batch PER SOURCE before mixing: the VLM packed collator requires one (source x area_bucket)
+            # partition per batch (collate_packed_embeds asserts it) and each data_grain source is a single
+            # area_bucket, so per-source batches are homogeneous. Mixing the BATCHED streams preserves the
+            # row-level mixture proportions (uniform batch size => batch-weight is proportional to rows).
+            per_ds, ws = [], []
+            for i, name in enumerate(sorted(datasets)):
+                # data_grain sets carry a _MANIFEST.tsv -> FileInstructions (skip footer burst);
+                # the generic arrayrecord_train_files path has no manifest -> expand globs as before.
+                compressed_bytes_per_record = None
+                if manifest_backed:
+                    source_files, compressed_bytes_per_record = _file_instructions(datasets[name], source_name=name)
+                else:
+                    source_files = expand_data_files(datasets[name])
+                source = grain.ArrayRecordDataSource(source_files)
+                ds = grain.MapDataset.source(source)
+                if do_shuffle:
+                    ds = ds.shuffle(seed=seed + i)
+                # Meter compressed/on-disk wire bytes before msgpack decode so all Grain read threads
+                # share one per-process/host token bucket. ArrayRecord yields decompressed records here,
+                # so manifest-backed sources use source-average nbytes/nrows rather than len(record).
+                if read_rate_limit_bytes_per_second is not None:
+                    ds = ds.map(
+                        _ArrayRecordReadRateLimit(
+                            read_rate_limit_bytes_per_second,
+                            read_rate_burst_seconds,
+                            compressed_bytes_per_record=compressed_bytes_per_record,
+                        )
+                    )
+                # Decode per record, then batch WITHIN this source -> homogeneous batches. batch_fn=list
+                # yields a LIST of row dicts (uncollated); the trainer's prefetcher applies
+                # self._data_collator to it (collating here would double-collate).
+                ds = ds.map(MsgpackDecode()).batch(batch_size=batch_size, drop_remainder=True, batch_fn=list)
+                per_ds.append(ds)
+                ws.append(float(weights[name]) if weights else float(len(source)))
+
+            is_mixture = len(per_ds) > 1
+            mixed = grain.MapDataset.mix(per_ds, weights=ws) if is_mixture else per_ds[0]
+
+            # grain weighted-mix __len__ reports the exhaustion length (min_i N_i/(w_i/Sum_w)), not the total
+            # -- honor the explicit max_training_steps and REPEAT enough to supply that many batches/host.
+            explicit_steps = self.arguments.max_training_steps if is_train else None
+            target_steps = int(explicit_steps) if (explicit_steps and explicit_steps > 0) else None
+
+            if is_train and target_steps is None and is_mixture:
+                # no-silent-fallback: never train for grain's misleading weighted-mixture length.
+                raise ValueError(
+                    "arrayrecord weighted-mixture training requires an explicit max_training_steps "
+                    "(grain MapDataset.mix __len__ under-reports the total); set the trainer's "
+                    "max_training_steps to the intended step count."
+                )
+
+            if target_steps is not None:
+                base_batches = len(mixed)  # batches produced per mixture pass (units: BATCHES)
+                if base_batches <= 0:
+                    raise ValueError(f"arrayrecord mixture reported {base_batches} batches; cannot build the loader.")
+                # Repeat to supply >= target_steps batches/host after the shard slice (+2 margin; repeats are lazy).
+                needed_batches = target_steps * max(shard_count, 1)
+                num_repeats = -(-needed_batches // base_batches) + 2  # ceil(needed/base) + margin
+                mixed = mixed.repeat(num_repeats)
+            elif num_epochs and num_epochs > 1:
+                mixed = mixed.repeat(num_epochs)
+
+            # Shard whole BATCHES across hosts (deterministic + disjoint); each element is already one
+            # homogeneous batch (list of batch_size row dicts).
+            if shard_count > 1:
+                mixed = mixed.slice(slice(shard_index, None, shard_count))
+
+            # Step count = the explicit target when set (the repeated/sharded stream supplies >= this
+            # many batches); otherwise the true per-host batch count (single set / eval).
+            steps = target_steps if target_steps is not None else len(mixed)
+            iterable = mixed.to_iter_dataset(
+                read_options=grain.ReadOptions(
+                    num_threads=self.arguments.arrayrecord_num_threads,
+                    prefetch_buffer_size=self.arguments.arrayrecord_prefetch_buffer,
+                )
+            )
+            return _ReiterableDataLoader(factory=lambda: iter(iterable), length=steps), steps
+
+        def _resolve(datasets, files):
+            # 3rd value = manifest_backed: data_grain `*_datasets` have per-set _MANIFEST.tsv (use
+            # FileInstructions); generic `*_files` globs do not (fall back to footer-counting).
+            if datasets:
+                return dict(datasets), self.arguments.arrayrecord_mixture_weights, True
+            if files:
+                return {"_default": files}, None, False
+            return None, None, False
+
+        train_datasets, train_weights, train_manifest_backed = _resolve(
+            self.arguments.arrayrecord_train_datasets, self.arguments.arrayrecord_train_files
+        )
+        dataloader_train, max_training_steps = _build(
+            train_datasets, train_weights, self.training_batch_size, is_train=True, manifest_backed=train_manifest_backed
+        )
+        self._set_dataset_size_metadata(
+            is_train=True, resolution=_ResolvedStepCount(max_training_steps, None, False, "arrayrecord", True, False)
+        )
+
+        dataloader_eval, max_evaluation_steps = None, 0
+        eval_datasets, eval_weights, eval_manifest_backed = _resolve(
+            self.arguments.arrayrecord_eval_datasets, self.arguments.arrayrecord_eval_files
+        )
+        if eval_datasets and self.arguments.do_eval:
+            dataloader_eval, max_evaluation_steps = _build(
+                eval_datasets, eval_weights, self.evaluation_batch_size, is_train=False,
+                manifest_backed=eval_manifest_backed,
+            )
+
+        return TrainerConfigureDataloaderOutput(
+            dataloader_train=dataloader_train,
+            max_training_steps=max_training_steps,
+            dataloader_eval=dataloader_eval,
+            max_evaluation_steps=max_evaluation_steps,
+        )
 
     def configure_model(self) -> TrainerConfigureModelOutput:
         """
@@ -7297,6 +7724,15 @@ class BaseTrainer(BaseTrainerProtocol):
         This mirrors the normal training-time iterator semantics, including
         automatic reinitialization when a finite dataloader is exhausted.
         """
+        # The grain ArrayRecord loader is globally shuffled, so resuming with a FRESH dataloader
+        # position is statistically equivalent — and fast-forwarding would re-pull num_batches over
+        # GCS (minutes-to-hours, the abort-prone read path). Skip it for the arrayrecord path.
+        if self.arguments.arrayrecord_train_datasets or self.arguments.arrayrecord_train_files:
+            logger.info(
+                f"arrayrecord loader: skipping dataloader fast-forward of {int(num_batches)} batches "
+                "(global shuffle makes exact batch position irrelevant); resuming with a fresh position."
+            )
+            return data_iter
         num_batches = max(int(num_batches), 0)
         if num_batches > 10_000:
             logger.warning(

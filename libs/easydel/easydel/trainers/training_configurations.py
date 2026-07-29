@@ -412,6 +412,50 @@ class TrainingArguments:
         default=None,
         metadata={"help": "sharding count to be used for grain dataloaders in both train and eval steps."},
     )
+    arrayrecord_train_files: str | list[str] | None = field(
+        default=None,
+        metadata={"help": "Path/glob/list of `.array_record` files; builds the grain ArrayRecord dataloader."},
+    )
+    arrayrecord_eval_files: str | list[str] | None = field(
+        default=None,
+        metadata={"help": "Optional `.array_record` files for evaluation (same pipeline as train)."},
+    )
+    arrayrecord_train_datasets: dict[str, str | list[str]] | None = field(
+        default=None,
+        metadata={"help": "Per-dataset ArrayRecord sets `{name: path/glob}` for weighted mixing; "
+                  "takes precedence over `arrayrecord_train_files`."},
+    )
+    arrayrecord_eval_datasets: dict[str, str | list[str]] | None = field(
+        default=None,
+        metadata={"help": "Per-dataset ArrayRecord sets for evaluation weighted mixing."},
+    )
+    arrayrecord_mixture_weights: dict[str, float] | None = field(
+        default=None,
+        metadata={"help": "Mixing weights `{name: weight}` for `arrayrecord_train_datasets`; None -> size-proportional."},
+    )
+    arrayrecord_num_threads: int = field(
+        default=16,
+        metadata={"help": "grain ReadOptions.num_threads for ArrayRecord reads."},
+    )
+    arrayrecord_prefetch_buffer: int = field(
+        default=64,
+        metadata={"help": "grain ReadOptions.prefetch_buffer_size for the ArrayRecord dataloader."},
+    )
+    arrayrecord_read_rate_limit_mb_per_sec: float | None = field(
+        default=50.0,
+        metadata={"help": "Per-HOST read-bandwidth cap (MB/s) for the ArrayRecord loader, enforced by a "
+                  "process-wide byte token bucket shared across the read threads (caps the host aggregate, "
+                  "not per-thread). Paces gs:// pulls so the fleet stays under the per-project egress quota "
+                  "(e.g. 256 hosts x 50 MB/s = 12.8 GB/s < 25 GB/s = 200 Gbps). None or 0 DISABLES the limiter "
+                  "(explicit; no silent throttle)."},
+    )
+    arrayrecord_read_rate_burst_seconds: float = field(
+        default=0.25,
+        metadata={"help": "Burst window (seconds) for the ArrayRecord read rate limiter: token-bucket "
+                  "capacity = rate * this. SMALL is safer -- it bounds the SYNCHRONIZED fleet-wide spike when "
+                  "all hosts refill prefetch in lockstep after a slow step (256 * rate * window must stay "
+                  "under the per-project egress quota). Only used when the limiter is enabled; must be > 0."},
+    )
     gradient_accumulation_steps: int = field(
         default=1,
         metadata={"help": "The number of steps to accumulate gradients over."},
