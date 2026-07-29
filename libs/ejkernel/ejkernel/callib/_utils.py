@@ -158,8 +158,15 @@ class ShapeDtype(Protocol):
 def get_cache_dir(app_name: str = "ejkernel-cache") -> Path:
     """Get a platform-specific cache directory, creating it if needed.
 
+    ``EJKERNEL_CACHE_ROOT`` overrides the platform cache root, so hosts whose
+    home directory shares a small filesystem with ``/`` and ``/tmp`` can move
+    every cache this function backs onto another volume. Compiled-executable
+    caches routinely reach several GB, and filling the root filesystem takes
+    the whole machine down, not just the cache. The ``app_name`` leaf is still
+    appended, so different apps stay in separate subdirectories.
+
     Args:
-        app_name: Leaf directory name under the platform cache root
+        app_name: Leaf directory name under the cache root
             (``ejkernel-cache`` by default; EasyDeL passes ``"easydel"``).
 
     Returns:
@@ -169,7 +176,16 @@ def get_cache_dir(app_name: str = "ejkernel-cache") -> Path:
         >>> cache_dir = get_cache_dir()
         >>> print(cache_dir)
         /home/user/.cache/ejkernel-cache
+        >>> os.environ["EJKERNEL_CACHE_ROOT"] = "/dev/shm/ejk"
+        >>> print(get_cache_dir())
+        /dev/shm/ejk/ejkernel-cache
     """
+    cache_root = os.getenv("EJKERNEL_CACHE_ROOT")
+    if cache_root:
+        cache_dir = Path(cache_root).expanduser() / app_name
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir
+
     home_dir = Path.home()
     if os.name == "nt":
         cache_dir = Path(os.getenv("LOCALAPPDATA", home_dir / "AppData" / "Local")) / app_name

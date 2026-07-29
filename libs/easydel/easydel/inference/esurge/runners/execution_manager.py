@@ -74,6 +74,7 @@ from __future__ import annotations
 import time
 import typing
 import typing as tp
+from functools import lru_cache
 
 import jax
 import numpy
@@ -114,25 +115,60 @@ from .sequence_buffer import SequenceBuffer
 DEBUG_MODE = False
 
 
-@jax.jit
-def _jit_zero_rows(arrays: list[jax.Array], keep_mask: jax.Array) -> list[jax.Array]:
+def _zero_rows_body(arrays: list[jax.Array], keep_mask: jax.Array) -> list[jax.Array]:
     """Zero masked rows of every array in ONE fused dispatch.
 
     Eager per-array ``jnp.where`` in a python loop over a hybrid model's ~100
     recurrent leaves costs one host dispatch each per slot-clear event; one
     jitted list call collapses that to a single dispatch.
     """
-    return [jnp.where(keep_mask.reshape(-1, *([1] * (a.ndim - 1))), a, 0) for a in arrays]
+    return [jnp.where(keep_mask.reshape(-1, *([1] * (array.ndim - 1))), array, 0) for array in arrays]
 
 
-@jax.jit
-def _jit_permute_rows(arrays: list[jax.Array], gather_idx: jax.Array, keep_mask: jax.Array) -> list[jax.Array]:
-    """Row-gather + keep-mask every array in ONE fused dispatch (see _jit_zero_rows)."""
+def _permute_rows_body(arrays: list[jax.Array], gather_idx: jax.Array, keep_mask: jax.Array) -> list[jax.Array]:
+    """Row-gather + keep-mask every array in ONE fused dispatch (see _zero_rows_body)."""
     out = []
-    for a in arrays:
-        gathered = a[gather_idx]
-        out.append(jnp.where(keep_mask.reshape(-1, *([1] * (a.ndim - 1))), gathered, 0).astype(a.dtype))
+    for array in arrays:
+        gathered = array[gather_idx]
+        out.append(jnp.where(keep_mask.reshape(-1, *([1] * (array.ndim - 1))), gathered, 0).astype(array.dtype))
     return out
+
+
+@lru_cache(maxsize=32)
+def _jit_zero_rows(output_shardings: tuple[jax.sharding.Sharding, ...]):
+    """Compile the slot-clear transform pinned to the live cache layout.
+
+    Pinning ``out_shardings`` to the leaves' own shardings keeps row
+    maintenance inside the layout the AOT model executable captured. The
+    row-gather in :func:`_jit_permute_rows` otherwise lets the partitioner
+    all-gather its way to a replicated ``P()`` result, which the next
+    compiled model call rejects. The clear path happens to preserve the
+    layout on its own, but pinning both is uniform and costs nothing
+    measurable.
+
+    Args:
+        output_shardings: Per-leaf shardings, in the order the leaves are
+            passed to the returned function.
+
+    Returns:
+        A jitted callable ``(arrays, keep_mask) -> arrays``.
+    """
+    return jax.jit(_zero_rows_body, out_shardings=list(output_shardings))
+
+
+@lru_cache(maxsize=1024)
+def _jit_permute_rows(output_shardings: tuple[jax.sharding.Sharding, ...]):
+    """Compile the slot-permute transform pinned to the live cache layout.
+
+    Args:
+        output_shardings: Per-leaf shardings, in the order the leaves are
+            passed to the returned function.
+
+    Returns:
+        A jitted callable ``(arrays, gather_idx, keep_mask) -> arrays``.
+    """
+    return jax.jit(_permute_rows_body, out_shardings=list(output_shardings))
+
 
 if typing.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
@@ -1623,7 +1659,8 @@ class ExecutionManager:
                 continue
             keep_np = numpy.ones((n_slots,), dtype=bool)
             keep_np[numpy.asarray(filtered_slots, dtype=numpy.int64)] = False
-            cleared_by_pool[n_slots] = list(_jit_zero_rows(arrays, jnp.asarray(keep_np)))
+            transform = _jit_zero_rows(tuple(array.sharding for array in arrays))
+            cleared_by_pool[n_slots] = list(transform(arrays, jnp.asarray(keep_np)))
 
         cursors = dict.fromkeys(cleared_by_pool, 0)
         for idx, rec, conv_arr, rec_arr, n_slots in entries:
@@ -1753,8 +1790,9 @@ class ExecutionManager:
             if gk is None:
                 continue
             gather, keep = gk
+            transform = _jit_permute_rows(tuple(array.sharding for array in arrays))
             moved_by_pool[n_slots] = list(
-                _jit_permute_rows(arrays, jnp.asarray(gather, dtype=jnp.int32), jnp.asarray(keep))
+                transform(arrays, jnp.asarray(gather, dtype=jnp.int32), jnp.asarray(keep))
             )
 
         cursors = dict.fromkeys(moved_by_pool, 0)
