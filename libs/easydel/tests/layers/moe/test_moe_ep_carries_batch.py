@@ -38,7 +38,7 @@ CPU thunk emitter), so runtime coverage here has three layers:
   bit-identical to the historical path.
 
 True multi-shard runtime numerics require TPU
-(``scripts/tpu_probe_ep_carries_batch.py``).
+(an on-TPU probe, since removed).
 """
 
 from __future__ import annotations

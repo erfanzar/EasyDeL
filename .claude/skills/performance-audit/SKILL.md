@@ -42,11 +42,11 @@ Work through each; skip none silently — state "not applicable because X".
      priority dispatch looks like a regression). `FORCE_NATIVE_RUNTIME=1`
      for A/B; autotune cache under `~/ejkernel-presistent-cache/` (override: `EJKERNEL_PERSISTENT_CACHE_DIR`) pinned or cleared.
 5. **Throughput / FLOPs / MFU**
-   - Serving: `python scripts/bench_esurge.py --json-out ...`; compare
+   - Serving: `python an eSurge benchmark harness --json-out ...`; compare
      `profile_by_total_tokens` buckets against a baseline run of the
      pre-change commit. Sharding dims stated in `pp,dp,fsdp,ep,tp,sp` order.
-   - Training: `scripts/bench_llama_8b_sharded.py`,
-     `scripts/sft_pp_tp_comparison.py`, or a focused trainer-step timing;
+   - Training: a sharded-Llama benchmark harness,
+     `scripts/an SFT PP/TP comparison harness, or a focused trainer-step timing;
      FLOP counting via spectrax `inspect/counting.py`; report MFU with the
      assumed peak.
 

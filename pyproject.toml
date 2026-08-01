@@ -89,7 +89,6 @@ target-version = "py311"
 [tool.basedpyright]
 # Keep the linter useful: correctness diagnostics stay enabled, while the
 # dynamic JAX/SpectraX/model-registry noise is muted below.
-baselineFile = ".basedpyright/baseline.json"
 reportAssignmentType = "none"
 reportUnknownVariableType = "none"
 reportPrivateUsage = "none"

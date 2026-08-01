@@ -10,7 +10,7 @@ state.
 
 ## Measurement surfaces
 
-- **Serving**: `scripts/bench_esurge.py` (repo root) — `--num-prompts
+- **Serving**: an eSurge benchmark harness (repo root) — `--num-prompts
   --prompt-len --output-len --warmups --trials --json-out`;
   `--sharding-axis-dims` in `pp,dp,fsdp,ep,tp,sp` order. Compare JSON
   `profile_by_total_tokens` buckets, not aggregate tokens/sec. It builds a
@@ -23,9 +23,9 @@ state.
   Skills: `optimize-ejkernel-kernel`, then the backend-specific one
   (`optimize-pallas-tpu`, `optimize-triton-gpu`, `optimize-cuda-gpu`,
   `optimize-tilelang-gpu`).
-- **Training**: repo-root `scripts/bench_llama_8b_sharded.py`,
-  `bench_qwen3_next_packed_prefill.py`, `sft_pp_tp_comparison.py`,
-  `gdr_synthetic_probe.py`. Trainer step timing comes from the trainer's own
+- **Training**: repo-root a sharded-Llama benchmark harness,
+  a packed-prefill benchmark harness, an SFT PP/TP comparison harness,
+  a synthetic GDR probe. Trainer step timing comes from the trainer's own
   metrics (`execution_time` in LossMetrics, CompilationTracker stats).
 - **Memory**: `easydel/utils/analyze_memory.py` (`SMPMemoryMonitor`); for
   compile-time OOM analysis use the `debug-training-oom` skill.

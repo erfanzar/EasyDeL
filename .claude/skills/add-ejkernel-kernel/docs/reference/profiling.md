@@ -33,7 +33,7 @@ For EasyDeL integration paths:
   `libs/easydel/easydel/trainers/training_configurations.py`.
 - The base trainer starts JAX profiling after step 1 and stops it in
   `libs/easydel/easydel/trainers/base_trainer.py`.
-- eSurge benchmark profiling uses `scripts/bench_esurge.py --xprof-dir`,
+- eSurge benchmark profiling uses an eSurge benchmark harness --xprof-dir`,
   `--xprof-trial`, `--xprof-host-level`, and `--xprof-python-level`.
 
 ## Benchmark Suite Workflow
@@ -112,7 +112,7 @@ Use EasyDeL trainer `profiler_path` for training-loop profiles. The trainer
 starts after step 1, so the profile is steady-state rather than first-compile
 time.
 
-Use `scripts/bench_esurge.py --xprof-dir <dir>` only for eSurge serving
+Use an eSurge benchmark harness --xprof-dir <dir>` only for eSurge serving
 throughput/debugging, not for isolated ejkernel microbenchmarks.
 
 ## What To Report

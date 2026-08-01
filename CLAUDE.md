@@ -90,12 +90,12 @@ uv run python scripts/format_and_generate_docs.py --libs easydel --fix   # forma
 ejkernel Pallas-TPU tests (`libs/ejkernel/test/kernels/_pallas/tpu`) need a
 real TPU and the libtpu process lock (single process per host).
 
-Key runners and benchmarks (repo root `scripts/`): `python -m
-easydel.scripts.elarge --config <yaml>` (eLarge train/eval/serve runner),
-`bench_esurge.py` (serving throughput; `--sharding-axis-dims` in
-`pp,dp,fsdp,ep,tp,sp` order), `convert_hf_to_easydel.py`, `tpu_setup.sh
---branch <branch>` (multi-host TPU bootstrap), `verify_checkpoint.py`,
-`visualize_spectrax_pipeline.py`.
+Key runners (repo root `scripts/`): `python -m easydel.scripts.elarge
+--config <yaml>` (eLarge train/eval/serve runner), `convert_hf_to_easydel.py`
+(plus the `_batch` variant), `tpu_setup.sh --branch <branch>` (multi-host TPU
+bootstrap), `format_and_generate_docs.py`, `subtree-sync.sh`, `release.sh` /
+`publish.sh`. The benchmark and probe scripts that used to live here were
+removed; write a throwaway harness for one-off measurements instead.
 
 ## Architecture in one pass
 
@@ -151,7 +151,7 @@ alongside.
   `from eformer.pytree import auto_pytree`, `from eformer.escale import ...`).
 - **Ruff:** line length 121, target py3.11, rules `A,B,E,F,I,NPY,RUF,UP,W`;
   `modeling_*.py` may use quoted jaxtyping annotations (UP037/F821 ignored
-  there). basedpyright runs against a checked-in baseline.
+  there). basedpyright runs without a checked-in baseline.
 - **Docstrings:** Google style (Args/Returns/Raises).
 - **Naming:** configs `FooConfig`, task heads `FooForCausalLM`, trainer dirs
   `snake_case_trainer/` with `FooTrainer`+`FooConfig`, kernels registered
@@ -221,8 +221,8 @@ alongside.
   resolutions. Remember `PageTable.commit()` syncs CPU page tables to device.
 - **Perf claims need hardware numbers:** baseline vs candidate on the target
   platform, shape/dtype stated, compile-time and steady-state separated. For
-  eSurge compare `bench_esurge.py` JSON `profile_by_total_tokens` buckets, not
-  aggregate tokens/sec. Kernel work: `optimize-ejkernel-kernel` +
+  eSurge compare per-bucket profiles (grouped by total tokens), not aggregate
+  tokens/sec. Kernel work: `optimize-ejkernel-kernel` +
   per-backend skills (`optimize-pallas-tpu`, `optimize-triton-gpu`, ...);
   ejkernel has `benchmarks/` with baselines.
 

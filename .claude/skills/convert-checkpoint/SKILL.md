@@ -18,7 +18,7 @@ Read these before running or editing conversion flows:
 - `.claude/ops/OPS.md`
 - `scripts/convert_hf_to_easydel.py`
 - `scripts/convert_hf_to_easydel_batch.py`
-- `scripts/verify_checkpoint.py`
+- a checkpoint verification harness
 - `scripts/download_hf_repo_chunked_to_gcs.py`
 - `scripts/download_hf_large_weights_to_gcs.py`
 - `scripts/update_hf_model_readmes.py`
@@ -128,11 +128,11 @@ Every conversion needs an artifact check, not only a completed script:
 ```bash
 ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
 XLA_FLAGS=--xla_force_host_platform_device_count=8 \
-  uv run python scripts/verify_checkpoint.py <checkpoint> \
+  uv run python a checkpoint verification harness <checkpoint> \
     --tokenizer <tokenizer-or-source> --tp 1 --seq 64
 ```
 
-`scripts/verify_checkpoint.py` also accepts `--max-real-entropy` and
+a checkpoint verification harness also accepts `--max-real-entropy` and
 `--min-repeat-acc`. It builds an `eLargeModel` state, disables MTP in config,
 and exits nonzero on failed checks.
 

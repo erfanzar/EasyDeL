@@ -19,7 +19,7 @@ runner updates after every completed step. The accumulation and log-emission
 logic itself stays in :meth:`eSurgeRunner._execute_model_impl`; this module
 only owns the state that outlives a single step (EMA, last-step scalars, and
 the bounded step histories consumed by benchmarks such as
-``scripts/bench_esurge.py``).
+an external benchmark harness).
 """
 
 from __future__ import annotations
@@ -65,7 +65,7 @@ class RunnerPerfTracker:
 
     Kept lightweight; no allocations in the hot path. The runner exposes the
     historical ``_perf_*`` attribute names as thin passthrough properties so
-    external readers (``scripts/bench_esurge.py``, serving benchmarks) keep
+    external readers (serving benchmarks) keep
     working unchanged.
 
     Attributes:

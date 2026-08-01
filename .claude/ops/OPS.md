@@ -71,7 +71,7 @@ Start from these files:
 - `libs/easydel/easydel/inference/esurge/scheduler/`
 - `libs/easydel/easydel/operations/kernels/ragged_page_attention.py`
 - `libs/easydel/docs/esurge.rst`
-- `scripts/bench_esurge.py`
+- an eSurge benchmark harness
 
 Focused tests:
 
@@ -88,8 +88,8 @@ XLA_FLAGS=--xla_force_host_platform_device_count=8 \
 Runtime benchmark harness:
 
 ```bash
-python scripts/bench_esurge.py --help
-python scripts/bench_esurge.py \
+python an eSurge benchmark harness --help
+python an eSurge benchmark harness \
   --num-prompts 32 --prompt-len 1024 --output-len 256 \
   --warmups 1 --trials 1 \
   --json-out /tmp/easydel_esurge_bench.json
@@ -107,7 +107,7 @@ Symptom routes:
 - DP/KV-page sharding failures: inspect `easydel/axis.py`,
   `easydel/inference/esurge/core/dp_sharding.py`, and
   `tests/inference/esurge/core/test_dp_sharding_pages.py`.
-- Throughput regressions: compare `scripts/bench_esurge.py` JSON
+- Throughput regressions: compare an eSurge benchmark harness JSON
   `profile_by_total_tokens` buckets, not only aggregate tokens/sec.
 - Text-only serving: keep speculative/MTP disabled unless the user explicitly
   asks for speculative decoding.

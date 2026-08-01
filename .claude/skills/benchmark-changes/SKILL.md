@@ -13,13 +13,13 @@ produces honest A/B numbers for a change.
 
 | surface | command |
 | ------- | ------- |
-| eSurge serving | `python scripts/bench_esurge.py --num-prompts N --prompt-len L --output-len M --warmups 1 --trials T --json-out out.json` (`--sharding-axis-dims` in `pp,dp,fsdp,ep,tp,sp` order; builds a no-MTP workload) |
-| eSurge penalized sampling | `scripts/bench_esurge_penalized_sampler.py` |
-| sharded training step | `scripts/bench_llama_8b_sharded.py` |
-| PP vs TP SFT comparison | `scripts/sft_pp_tp_comparison.py` |
-| packed prefill (qwen3-next) | `scripts/bench_qwen3_next_packed_prefill.py` |
-| scan-trace overhead | `scripts/bench_llama_scan_trace.py` |
-| GDR kernel probe | `scripts/gdr_synthetic_probe.py` |
+| eSurge serving | `python an eSurge benchmark harness --num-prompts N --prompt-len L --output-len M --warmups 1 --trials T --json-out out.json` (`--sharding-axis-dims` in `pp,dp,fsdp,ep,tp,sp` order; builds a no-MTP workload) |
+| eSurge penalized sampling | a sampler benchmark harness |
+| sharded training step | a sharded-Llama benchmark harness |
+| PP vs TP SFT comparison | `scripts/an SFT PP/TP comparison harness |
+| packed prefill (qwen3-next) | `scripts/a packed-prefill benchmark harness |
+| scan-trace overhead | a scan-trace benchmark harness |
+| GDR kernel probe | `scripts/a synthetic GDR probe |
 | ejkernel ops | `libs/ejkernel/benchmarks/benchmark_<op>.py` (registry: `_op_benchmark_registry.py`; baselines in `benchmarks/baselines/`) |
 | speculative decoding | `libs/easydel/tests/inference/esurge/bench_specdecode.py` |
 
@@ -46,4 +46,4 @@ candidate tables, and an explicit verdict per surface (improved / neutral /
 regressed with magnitude). CPU results are labeled indicative-only.
 `EASURGE_SYNC_INPUTS_FOR_TIMING=1` only when measuring input-prep accuracy —
 it costs a device round trip. Do not benchmark speculative decoding with
-`bench_esurge.py`; use `bench_specdecode.py`.
+an eSurge benchmark harness; use `bench_specdecode.py`.

@@ -116,7 +116,7 @@ prior behavior bit-for-bit (pinned by tests).
 After the M3 measurement run (dp4/fsdp16/ep4/tp4, non-ring, chunk=65536,
 fsdp-shard-weights, 35B-A3B distillation) died at step 1-2 with "NaN Loss",
 the ep>1 non-ring branch was bisected on the real 1024-device slice via
-`scripts/tpu_probe_moe_ep_parity.py` (eray-submitted, `@execute` fan-out).
+an on-slice MoE EP parity probe (eray-submitted, `@execute` fan-out).
 Every configuration was FINITE and consistent with its ep=1 reference:
 
 | probe (all on-slice, 1024 devices) | result |
@@ -376,7 +376,7 @@ is off, and reports the worst-case receive buffer as the binding allocation.
   unchunked), remat tags in the jaxpr, non-divisible fallback, knob-off and
   knob-inactive bit-identity. XLA:CPU cannot execute `ragged_all_to_all`, so
   multi-shard runtime numerics are NOT CPU-provable.
-- TPU (pending, next production pause): `scripts/tpu_probe_ep_carries_batch.py`
+- TPU (pending, next production pause): an EP-carries-batch probe
   — ep4+knob vs ep1 loss parity (fwd+bwd finite), plus step timing of
   REF ep1 / BASE ep4 knob-off / CAND ep4 knob-on for 8k- and 131k-shaped
   configs (`REPRO_SHAPE=131k`). Unknowns it resolves: ragged a2a throughput

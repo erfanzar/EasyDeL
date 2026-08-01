@@ -18,7 +18,7 @@ Read these before editing or explaining an eSurge failure:
 - `.claude/ops/OPS.md`
 - `libs/easydel/docs/esurge.rst`
 - `libs/easydel/docs/esurge_examples.rst`
-- `scripts/bench_esurge.py`
+- an eSurge benchmark harness
 - `libs/easydel/easydel/inference/esurge/`
 
 For runner/executor failures, open:
@@ -44,12 +44,12 @@ For runner/executor failures, open:
 - OpenAI API tool or reasoning output mismatches: load
   `.claude/skills/tool-reasoning-parser/SKILL.md` and inspect
   `libs/easydel/easydel/inference/esurge/server/api_server.py`.
-- Throughput regressions: compare `scripts/bench_esurge.py` JSON
+- Throughput regressions: compare an eSurge benchmark harness JSON
   `profile_by_total_tokens` buckets, not just aggregate tokens/sec.
 
 ## Benchmark Harness
 
-`scripts/bench_esurge.py` is the repo harness for eSurge. It defaults to TPU
+an eSurge benchmark harness is the repo harness for eSurge. It defaults to TPU
 and exits if JAX does not report a TPU backend. Useful flags include:
 
 - `--model`
@@ -80,7 +80,7 @@ decoding benchmark.
 
 ```bash
 ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu \
-  uv run python scripts/bench_esurge.py \
+  uv run python an eSurge benchmark harness \
     --model <model-or-checkpoint> \
     --num-prompts 32 --prompt-len 1024 --output-len 256 \
     --warmups 1 --trials 1 \

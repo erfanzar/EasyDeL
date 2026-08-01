@@ -1040,7 +1040,7 @@ class eSurgeRunner:
     # Perf-tracker passthroughs
     # The perf state lives on ``self.perf`` (:class:`RunnerPerfTracker`). The
     # historical ``_perf_*`` attribute names are kept as thin properties because
-    # both the execute path and external readers (scripts/bench_esurge.py,
+    # both the execute path and external readers (
     # serving benchmarks) reference them directly.
 
     @property
@@ -1113,7 +1113,7 @@ class eSurgeRunner:
 
     @property
     def _perf_phase_history(self) -> deque[dict[str, typing.Any]]:
-        """Bounded deque of per-step phase-timing dicts (read by bench_esurge)."""
+        """Bounded deque of per-step phase-timing dicts (read by external benchmark harnesses)."""
         return self.perf.phase_history
 
     # Speculative-decoding passthroughs

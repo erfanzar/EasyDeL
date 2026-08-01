@@ -169,8 +169,7 @@ reportOptionalOperand = "error"
 reportOptionalSubscript = "error"
 reportPossiblyUnboundVariable = "error"
 reportPropertyTypeMismatch = "none"
-# Existing return-type debt is tracked in .basedpyright/baseline.json so
-# newly introduced mismatches still fail CI instead of being hidden globally.
+# Return-type mismatches fail CI rather than being hidden globally.
 reportReturnType = "error"
 reportTypedDictNotRequiredAccess = "none"
 reportUnsupportedDunderAll = "none"

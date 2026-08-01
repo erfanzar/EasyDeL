@@ -48,7 +48,7 @@ with auto_detect by model name and streaming variants. Speculative:
    binary search must match reference sorting semantics
    (`core/test_binary_search_penalties.py`); stop conditions include extra
    server-side stops.
-6. **Speculative/MTP off by default** for text serving; bench_esurge builds
+6. **Speculative/MTP off by default** for text serving; eSurge benchmark builds
    a no-MTP workload — don't read it as a spec-decode benchmark.
 7. **Streaming**: delta normalization and error propagation
    (`test_engine_stream_*`); parser streaming variants must never emit tool
@@ -56,7 +56,7 @@ with auto_detect by model name and streaming variants. Speculative:
 
 ## Perf discipline
 
-Throughput claims: `scripts/bench_esurge.py` JSON `profile_by_total_tokens`
+Throughput claims: an eSurge benchmark harness JSON `profile_by_total_tokens`
 buckets, warm runs, sharding dims stated (`pp,dp,fsdp,ep,tp,sp`).
 `EASURGE_SYNC_INPUTS_FOR_TIMING=1` only for prep-time measurements.
 

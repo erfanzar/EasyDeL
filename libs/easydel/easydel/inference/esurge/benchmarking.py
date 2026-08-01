@@ -14,7 +14,7 @@
 
 """Shared building blocks for eSurge serving benchmarks.
 
-The benchmark scripts (``scripts/bench_esurge.py``, ``scripts/bench_spec_ab.py``,
+External benchmark harnesses (
 the spec-decode bench, ...) each rebuilt the same prompt generators and
 scheduler-loop predicates. These pure helpers now live here so every harness
 draws from one source.

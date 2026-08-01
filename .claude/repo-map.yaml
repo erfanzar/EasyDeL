@@ -128,7 +128,7 @@ flows:
 
 ci:
   - workspace-ci.yaml: affected-only import/forward smoke + lint-imports on PR
-  - lint.yaml: ruff + basedpyright (baseline at .basedpyright/baseline.json)
+  - lint.yaml: ruff + basedpyright (no checked-in baseline)
   - publish.yaml: tag-triggered per-package PyPI publish
   - sync-subtrees.yaml: server-side mirror backstop
 
