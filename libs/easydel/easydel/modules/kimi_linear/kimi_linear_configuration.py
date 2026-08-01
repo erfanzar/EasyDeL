@@ -178,6 +178,11 @@ class KimiLinearConfig(EasyDeLBaseConfig):
         num_nextn_predict_layers: int = 0,
         linear_attn_config: dict | None = None,
         max_position_embeddings: int = 2**16,
+        attn_res_block_size: int | None = None,
+        activation_situ_beta: float | None = None,
+        activation_situ_linear_beta: float | None = None,
+        routed_expert_hidden_size: int | None = None,
+        latent_moe_use_norm: bool = False,
         **kwargs,
     ):
         """Initialise a :class:`KimiLinearConfig`.
@@ -233,12 +238,35 @@ class KimiLinearConfig(EasyDeLBaseConfig):
         self.topk_group = topk_group
         self.num_nextn_predict_layers = num_nextn_predict_layers
         self.max_position_embeddings = max_position_embeddings
+        # Attention Residuals: every `attn_res_block_size` layers the model mixes
+        # the running prefix sum with that block's residual through a softmax over
+        # RMS-normed candidates. ``None`` keeps the plain residual stream.
+        self.attn_res_block_size = attn_res_block_size
+        # SITU gated activation parameters (``hidden_act="situ"``).
+        self.activation_situ_beta = activation_situ_beta
+        self.activation_situ_linear_beta = activation_situ_linear_beta
+        # LatentMoE: routed experts operate in their own latent width instead of
+        # ``hidden_size``, with an optional norm on the down-projected latent.
+        self.routed_expert_hidden_size = routed_expert_hidden_size
+        self.latent_moe_use_norm = latent_moe_use_norm
         if linear_attn_config is not None:
-            assert linear_attn_config.get("kda_layers") is not None
-            assert linear_attn_config.get("full_attn_layers") is not None
+            if linear_attn_config.get("full_attn_layers") is None:
+                raise ValueError("`linear_attn_config` must define `full_attn_layers`.")
+            if linear_attn_config.get("kda_layers") is None:
+                # Kimi K3 ships only the full-attention indices; every remaining
+                # layer is KDA. Derive the complement so downstream layer-type
+                # dispatch and HybridCache see an explicit list either way.
+                full = set(int(i) for i in linear_attn_config["full_attn_layers"])
+                linear_attn_config = dict(linear_attn_config)
+                linear_attn_config["kda_layers"] = [i for i in range(1, num_hidden_layers + 1) if i not in full]
         self.linear_attn_config = linear_attn_config
-        if kwargs.get("layer_types", None) is None:
-            kwargs["layer_types"] = list(self.get_layer_types())
+        # Held back from ``super().__init__``: the validator inherited from
+        # transformers would run its generic ALLOWED_LAYER_TYPES check against
+        # these entries and reject the KDA type the hybrid cache needs. Assign
+        # and validate after, the same way DeepSeek-V4 handles its own types.
+        layer_types = kwargs.pop("layer_types", None)
+        if layer_types is None:
+            layer_types = list(self.get_layer_types())
 
         super().__init__(
             pad_token_id=pad_token_id,
@@ -247,6 +275,9 @@ class KimiLinearConfig(EasyDeLBaseConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+
+        self.layer_types = layer_types
+        self.validate_layer_type()
 
     @property
     def is_mla(self) -> bool:
@@ -315,6 +346,34 @@ class KimiLinearConfig(EasyDeLBaseConfig):
             and layer_idx >= self.first_k_dense_replace
             and layer_idx % self.moe_layer_freq == 0
         )
+
+    def validate_layer_type(self):
+        """Allow the KDA layer type the hybrid cache dispatches on.
+
+        The validator inherited from transformers only knows its generic
+        ``ALLOWED_LAYER_TYPES``, which has no entry for KDA. Kimi models emit
+        :data:`KDA_LINEAR_ATTENTION` -- the same string
+        :mod:`easydel.caching.hybrid` keys its per-layer state on -- so without
+        this override any config carrying a ``linear_attn_config`` fails to
+        construct. Mapping KDA onto the generic ``linear_attention`` instead
+        would lose the distinction the cache needs to give those layers
+        conv + recurrent state rather than KV pages.
+
+        Raises:
+            ValueError: On a length mismatch or an unknown layer type.
+        """
+        num_hidden_layers = getattr(self, "num_hidden_layers", None)
+        layer_types = getattr(self, "layer_types", None)
+        if num_hidden_layers is None or layer_types is None:
+            return
+        if len(layer_types) != num_hidden_layers:
+            raise ValueError(
+                f"`num_hidden_layers` ({num_hidden_layers}) must equal `len(layer_types)` ({len(layer_types)})."
+            )
+        allowed = (FULL_ATTENTION, KDA_LINEAR_ATTENTION)
+        bad = sorted({t for t in layer_types if t not in allowed})
+        if bad:
+            raise ValueError(f"`layer_types` entries must be one of {allowed} for Kimi; got {bad}.")
 
     def get_layer_types(self) -> tuple[str, ...]:
         """Get layer types tuple for HybridCache initialization.

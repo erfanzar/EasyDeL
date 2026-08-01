@@ -1354,7 +1354,11 @@ class BaseMoeModule(spx.Module, ABC):
         if hooks is not None and hooks.before_gate is not None:
             gate_hidden_state = hooks.before_gate(gate_hidden_state)
 
-        prein_gate_logits = gate_layer(gate_hidden_state.reshape(-1, HD))
+        # Flatten by the gate input's OWN width: `gate_hidden_state` exists so the
+        # router can score a different tensor than the experts consume (LatentMoE
+        # routes on full-width hidden while experts run in a narrower latent), and
+        # reusing the expert width `HD` here would reshape it wrongly.
+        prein_gate_logits = gate_layer(gate_hidden_state.reshape(-1, gate_hidden_state.shape[-1]))
         if hooks is not None and hooks.after_gate is not None:
             prein_gate_logits = hooks.after_gate(prein_gate_logits)
 
@@ -2508,7 +2512,9 @@ class BaseMoeModule(spx.Module, ABC):
         batch_size, seq_len, hidden_dim = hidden_state.shape
         tokens = batch_size * seq_len
         hidden_flat = hidden_state.reshape(tokens, hidden_dim)
-        gate_hidden_flat = gate_hidden_state.reshape(tokens, hidden_dim)
+        # Gate input keeps its own width; see `_sparse_moe_call` for why this is
+        # not `hidden_dim` (the expert width).
+        gate_hidden_flat = gate_hidden_state.reshape(tokens, gate_hidden_state.shape[-1])
 
         prein_gate_logits = gate_layer(gate_hidden_flat)
         gate_logits = prein_gate_logits

@@ -27,6 +27,7 @@ References:
     - Kimi Linear: https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct
 """
 
+import functools
 import typing
 from functools import cached_property, partial
 from typing import ClassVar
@@ -141,6 +142,69 @@ class KimiRMSNorm(spx.Module):
         return (self.weight.value * hidden_states).astype(input_dtype)
 
 
+SITU_ACTIVATION = "situ"
+
+
+def situ_and_mul(
+    gate: jnp.ndarray,
+    up: jnp.ndarray,
+    *,
+    beta: float,
+    linear_beta: float | None,
+) -> jnp.ndarray:
+    """Apply the SITU gated activation used by Kimi K3.
+
+    ``beta * tanh(gate / beta) * sigmoid(gate)`` bounds the gate branch at
+    ``+/-beta`` while keeping the sigmoid's soft gating, and when
+    ``linear_beta`` is set the *linear* branch is squashed the same way. That
+    second transform is why SITU cannot be expressed as a unary ``ACT2FN``
+    entry composed with a plain multiply -- it touches ``up`` as well as
+    ``gate``.
+
+    Both branches are evaluated in float32 (upstream does the same) and cast
+    back, so bf16 activations do not lose the tanh/sigmoid tails.
+
+    Args:
+        gate: Gate branch of the fused projection.
+        up: Linear branch of the fused projection.
+        beta: Saturation scale for the gate branch.
+        linear_beta: Saturation scale for the linear branch; ``None`` leaves
+            ``up`` untouched.
+
+    Returns:
+        The activated product, in ``gate``'s dtype.
+    """
+    out_dtype = gate.dtype
+    gate_f32 = gate.astype(jnp.float32)
+    up_f32 = up.astype(jnp.float32)
+    activated = beta * jnp.tanh(gate_f32 / beta) * jax.nn.sigmoid(gate_f32)
+    if linear_beta is not None:
+        up_f32 = linear_beta * jnp.tanh(up_f32 / linear_beta)
+    return (activated * up_f32).astype(out_dtype)
+
+
+def resolve_gated_activation(config: KimiLinearConfig) -> typing.Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
+    """Return the ``(gate, up) -> output`` activation for ``config``.
+
+    SITU needs both branches, so it is returned as a fused callable; every
+    other activation keeps the usual ``act_fn(gate) * up`` shape. The result
+    is also what gets handed to :meth:`BaseMoeModule.moe_call` as
+    ``ffn_activation``.
+
+    Args:
+        config: Model configuration whose ``hidden_act`` selects the activation.
+
+    Returns:
+        A callable combining the gate and linear branches.
+    """
+    if config.hidden_act == SITU_ACTIVATION:
+        beta = getattr(config, "activation_situ_beta", None) or 1.0
+        linear_beta = getattr(config, "activation_situ_linear_beta", None)
+        return functools.partial(situ_and_mul, beta=float(beta), linear_beta=linear_beta)
+    act_fn = ACT2FN[config.hidden_act]
+    return lambda gate, up: act_fn(gate) * up
+
+
 class KimiMLP(spx.Module):
     """Kimi Linear dense MLP module.
 
@@ -198,7 +262,7 @@ class KimiMLP(spx.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.act_fn = ACT2FN[config.hidden_act]
+        self.act_fn = resolve_gated_activation(config)
 
     @property
     def reform_param(self):
@@ -228,8 +292,8 @@ class KimiMLP(spx.Module):
         )
         gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
         gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
-        gate = checkpoint_name(self.act_fn(gate_raw), "mlp_gate")
-        hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
+        gate = checkpoint_name(self.act_fn(gate_raw, up), "mlp_gate")
+        hidden_states = checkpoint_name(self.down_proj(gate), "mlp_down")
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -384,6 +448,7 @@ class KimiMLPMoE(spx.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
+        hidden_size: int | None = None,
         rngs: spx.Rngs,
     ):
         """Initialize Kimi MoE MLP experts.
@@ -393,19 +458,23 @@ class KimiMLPMoE(spx.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            hidden_size (int | None, optional): Width the experts consume and return.
+                Defaults to ``config.hidden_size``; LatentMoE passes the narrower
+                ``routed_expert_hidden_size`` so routed experts run in the latent space.
             rngs (spx.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
+        self.hidden_size = config.hidden_size if hidden_size is None else int(hidden_size)
 
         intermediate_size = config.moe_intermediate_size
         if intermediate_size is None:
             intermediate_size = config.intermediate_size
         self.gate_up_proj = ColumnParallelMoELinear(
             num_experts=config.num_experts,
-            in_features=config.hidden_size,
+            in_features=self.hidden_size,
             out_features=2 * intermediate_size,
             use_bias=False,
             dtype=dtype,
@@ -418,7 +487,7 @@ class KimiMLPMoE(spx.Module):
         self.down_proj = RowParallelMoELinear(
             num_experts=config.num_experts,
             in_features=intermediate_size,
-            out_features=config.hidden_size,
+            out_features=self.hidden_size,
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -427,7 +496,7 @@ class KimiMLPMoE(spx.Module):
             use_expert_tensor_mode=config.use_expert_tensor_mode,
             rngs=rngs,
         )
-        self.act_fn = ACT2FN[config.hidden_act]
+        self.act_fn = resolve_gated_activation(config)
 
     @property
     def reform_param(self):
@@ -455,7 +524,7 @@ class KimiMLPMoE(spx.Module):
         """
         gate_up = self.gate_up_proj(hidden_states, group_sizes, sorted_experts)
         gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
-        return self.down_proj(self.act_fn(gate) * up, group_sizes, sorted_experts)
+        return self.down_proj(self.act_fn(gate, up), group_sizes, sorted_experts)
 
 
 class KimiSparseMoeBlock(BaseMoeModule):
@@ -505,11 +574,20 @@ class KimiSparseMoeBlock(BaseMoeModule):
         # shared MoE module (mirrors the KimiMoEGate asserts).
         assert config.num_experts is not None, "num_experts must not be None"
         assert config.num_experts_per_token is not None, "num_experts_per_token must not be None"
+        # LatentMoE (Kimi K3): routed experts run in their own, narrower latent
+        # space. Tokens are projected down before dispatch and back up after
+        # combine, so expert parameters scale with `routed_expert_hidden_size`
+        # rather than `hidden_size`. Resolved before `super().__init__` because
+        # the MoE engine dispatches at the expert width. The router still scores
+        # the FULL-width hidden state (see `gate_hidden_state` in `forward`),
+        # and the shared experts stay on the full width too.
+        use_latent_moe = getattr(config, "routed_expert_hidden_size", None) is not None
+        moe_hidden_size = config.routed_expert_hidden_size if use_latent_moe else config.hidden_size
         super().__init__(
             config=config,
             n_routed_experts=config.num_experts,
             num_experts_per_tok=config.num_experts_per_token,
-            hidden_size=config.hidden_size,
+            hidden_size=moe_hidden_size,
             lbl_coef=None,
             rzl_coef=None,
             routing_strategy=MoeRoutingStrategy.TOP_K,
@@ -528,13 +606,50 @@ class KimiSparseMoeBlock(BaseMoeModule):
             rngs=rngs,
         )
 
+        self.use_latent_moe = use_latent_moe
+        self.moe_hidden_size = moe_hidden_size
+
         self.experts = KimiMLPMoE(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
+            hidden_size=self.moe_hidden_size,
             rngs=rngs,
         )
+
+        if self.use_latent_moe:
+            self.routed_expert_down_proj = ColumnParallelLinear(
+                config.hidden_size,
+                self.moe_hidden_size,
+                use_bias=False,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                kernel_init=jax.nn.initializers.normal(config.initializer_range),
+                rngs=rngs,
+            )
+            self.routed_expert_up_proj = RowParallelLinear(
+                self.moe_hidden_size,
+                config.hidden_size,
+                use_bias=False,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                kernel_init=jax.nn.initializers.normal(config.initializer_range),
+                rngs=rngs,
+            )
+            self.routed_expert_norm = (
+                KimiRMSNorm(
+                    hidden_size=self.moe_hidden_size,
+                    eps=config.rms_norm_eps,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    rngs=rngs,
+                )
+                if getattr(config, "latent_moe_use_norm", False)
+                else None
+            )
 
         if config.num_shared_experts is not None and config.num_shared_experts > 0:
             assert config.moe_intermediate_size is not None
@@ -562,14 +677,26 @@ class KimiSparseMoeBlock(BaseMoeModule):
             tuple[Array, Array]: Tuple of (output tensor, router logits).
                 Output has shape (batch, seq_len, hidden_dim).
         """
+        expert_input = self.routed_expert_down_proj(hidden_states) if self.use_latent_moe else hidden_states
         out, router_logits = self.moe_call(
-            hidden_state=hidden_states,
+            hidden_state=expert_input,
+            # Routing is scored on the full-width hidden state even when the
+            # experts consume the latent projection, matching upstream.
+            gate_hidden_state=hidden_states if self.use_latent_moe else None,
             gate_layer=self.gate,
             expert_layer=self.experts,
             gate_up_kernel=self.experts.gate_up_proj.weight.value,
             wd_kernel=self.experts.down_proj.weight.value,
-            act_fn=self.experts.act_fn,
+            # SITU transforms both branches, so the engine gets the fused
+            # (gate, up) callable rather than a unary activation.
+            ffn_activation=self.experts.act_fn,
+            act_fn=jax.nn.silu,
         )
+
+        if self.use_latent_moe:
+            if self.routed_expert_norm is not None:
+                out = self.routed_expert_norm(out)
+            out = self.routed_expert_up_proj(out)
 
         if self.config.num_shared_experts is not None and self.config.num_shared_experts > 0:
             shared_out = self.shared_experts(hidden_states)
