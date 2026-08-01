@@ -11,7 +11,7 @@
 .gitignore
 .dockerignore
 .rayignore
-.agents/
+.claude/
 .claude/
 .codex/
 .cursor/

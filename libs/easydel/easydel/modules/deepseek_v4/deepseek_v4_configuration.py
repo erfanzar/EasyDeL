@@ -38,7 +38,7 @@ DeepSeek-V4 is a genuinely novel decoder architecture combining:
 This EasyDeL port implements the numerically-faithful *stateless* forward
 (training / prefill, ``use_cache=False`` semantics). Decode-time caching of the
 compressor branches is not implemented yet — see
-``.agents/projects/port_hyv3_dsv4_mistral4.md``.
+``.claude/projects/port_hyv3_dsv4_mistral4.md``.
 """
 
 import typing as tp

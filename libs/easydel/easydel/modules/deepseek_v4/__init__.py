@@ -25,7 +25,7 @@ layers.
 This port implements the numerically-faithful *stateless* forward
 (training / prefill). Decode-time caching of the compressor branches and
 eSurge serving are not supported — see
-``.agents/projects/port_hyv3_dsv4_mistral4.md``.
+``.claude/projects/port_hyv3_dsv4_mistral4.md``.
 """
 
 from .deepseek_v4_configuration import DeepseekV4Config

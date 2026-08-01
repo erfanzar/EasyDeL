@@ -14,7 +14,7 @@
 
 """Job-lifecycle commands for the eray CLI: run, status, logs, stop.
 
-Design notes live in the workspace repo under ``.agents/projects/eray-cli.md``.
+Design notes live in the workspace repo under ``.claude/projects/eray-cli.md``.
 The guiding rule is truthfulness: Ray reports a job SUCCEEDED even when the
 remote function raised and the driver printed the exception via
 ``print_remote_raise`` — ``eray status`` re-derives a verdict from the driver

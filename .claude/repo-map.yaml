@@ -1,0 +1,148 @@
+# Machine-readable architecture map of the EasyDeL monorepo.
+# Audience: AI coding sessions. Humans: read WORKSPACE.md instead.
+# Keep in sync when subsystems move; verified against the tree on 2026-07-01.
+
+workspace:
+  kind: uv-workspace monorepo (source of truth; libs mirrored to standalone repos on push)
+  layering_contract:
+    rule: only easydel may import spectrax/ejkernel/eformer/eray; foundation libs independent of each other
+    enforced_by: [uv run lint-imports, .github/workflows/workspace-ci.yaml]
+  test_env_cpu: "ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=8"
+  mesh_axes_easydel: [pp, dp, fsdp, ep, tp, sp]   # EasyDeLBaseConfig order; -1 dim auto-fills
+
+packages:
+  easydel:
+    path: libs/easydel
+    role: LLM framework (only consumer of the foundation libs)
+    tests: libs/easydel/tests
+    subsystems:
+      infra:
+        path: libs/easydel/easydel/infra
+        owns: [EasyDeLBaseConfig, EasyDeLBaseModule, EasyDeLState, TaskType/registry (factory.py),
+               LossConfig/LossMetrics (loss_utils.py), AxisPolicy/RuntimeShardingResolver (sharding.py),
+               HF bridge (mixins/bridge.py), generation mixin, elarge/]
+        extension_points:
+          - register_config("<model_type>") / register_module(TaskType, ...)  # factory.py
+          - BaseLossStrategy subclasses (loss_utils.py)
+          - eLarge config sections (elarge/types/*)
+      layers:
+        path: libs/easydel/easydel/layers
+        owns: [UnifiedAttention (attention/_unified.py), FlexibleAttentionModule,
+               Column/RowParallelLinear (linears/), fused layouts + reform rules (layouts/),
+               BaseMoeModule (moe/), norms, rotary variants, quantization]
+      operations:
+        path: libs/easydel/easydel/operations
+        owns: [OperationRegistry, BaseOperation platform dispatch, OperationMetadata sharding,
+               requirements/ (cache+metadata contracts), kernels/ (ejkernel adapters)]
+        exemplar_adapter: libs/easydel/easydel/operations/kernels/gated_delta_rule.py
+      modules:
+        path: libs/easydel/easydel/modules
+        owns: ["~74 model families: <family>/{modeling_<family>.py,<family>_configuration.py}",
+               _base/ task wrappers, auto/ factory classes]
+      caching:
+        path: libs/easydel/easydel/caching
+        owns: [Transformer, RaggedPages, MLARaggedPages, Recurrent, Linear, Hybrid, Lightning, KDA caches]
+      trainers:
+        path: libs/easydel/easydel/trainers
+        owns: [base_trainer.py, trainer/trainer.py, training_configurations.py (TrainingArguments),
+               "~40 trainer dirs each: <name>_config.py + <name>_trainer.py + _fn.py",
+               reward_protocol.py, esurge_rollout/, agentic_moshpit/]
+        registration: '@Registry.register("trainer-arguments", name) AND @Registry.register("trainer", name)'
+      inference:
+        path: libs/easydel/easydel/inference
+        owns: [esurge/ (engine, scheduler/, runners/, core/ cache+sampler, server/, distributed/, multimodal/),
+               tools/parsers (35+), reasoning/parsers (15+), vwhisper/, sampling]
+      data:
+        path: libs/easydel/easydel/data
+        owns: [Pipeline builder (execution/pipeline.py), sources/, transforms DSL (">>"), distributed/ Ray preprocessing]
+      utils_workers:
+        paths: [libs/easydel/easydel/utils, libs/easydel/easydel/workers, libs/easydel/easydel/scripts]
+        owns: [parameters_transformation (HF<->EasyDeL), ejit/compiling_utils, jit_context,
+               ZMQ workers + response stores, elarge.py runner]
+  spectrax:
+    path: libs/spectrax
+    role: spx.Module object model + MPMD/SPMD pipeline runtime
+    import_alias: spx
+    tests: libs/spectrax/tests
+    owns:
+      core: [Module, Parameter/Buffer/RngStream, GraphDef/State via export()/bind(), Selector]
+      transforms: [spx.jit (mutable-aware), grad/value_and_grad (wrt selector), scan (carry/invariant), vmap, remat]
+      runtime: [mpmd/ (sxcall/sxjit, sxstage_iter/sxstage_region markers, per-rank compile),
+                spmd/ (shard_map path), schedules/ (GPipe, 1F1B, ZeroBubble, Interleaved, DualPipeV, ...)]
+      sharding: [logical axis rules, get_named_sharding, SpxMesh (is_mpmd)]
+      serialization: [Checkpointer, AsyncCheckpointManager (TensorStore)]
+  ejkernel:
+    path: libs/ejkernel
+    role: hardware kernels behind priority registry with mandatory XLA fallback
+    tests: libs/ejkernel/test          # singular; _pallas/tpu needs real TPU
+    benchmarks: libs/ejkernel/benchmarks
+    owns:
+      modules_operations: "Kernel[Config,Out] subclasses + configs (modules/operations/)"
+      backends: [kernels/_triton, "kernels/_pallas/{tpu,gpu}", kernels/_cuda, kernels/_cute, kernels/_tilelang, kernels/_xla]
+      registry: "kernels/_registry.py — @kernel_registry.register(name, Platform, Backend, priority); XLA fallback priority 0"
+      ops: [Executor, autotune, 7-tier config selection, persistent cache ~/ejkernel-presistent-cache/, fingerprinting]
+      callib: [triton_call, pallas_call, cute_call, tilelang_call, ejit]
+  eformer:
+    path: libs/eformer
+    role: scale infrastructure
+    tests: libs/eformer/tests
+    owns:
+      escale: [create_mesh (multi-slice DCN), PartitionAxis, PartitionManager, auto_partition_spec]
+      optimizers: "OptimizerFactory + @register_optimizer builders; scheduler factories"
+      serialization: [Checkpointer, AsyncCheckpointManager, sharded TensorStore save/load without all-gather]
+      mpric: [Policy, PrecisionHandler, DynamicLossScale]
+      jaximus_ops: [ImplicitArray dispatch, NF4/INT8 quantized arrays]
+      misc: [aparser (dataclass CLI/YAML), pytree utils, ePath (local/GCS), common_types semantic axes]
+  eray:
+    path: libs/eray
+    role: Ray orchestration for TPU/GPU pods
+    tests: libs/eray/tests
+    owns: [cli (eray tpu connect/status/health/list), execution (RayExecutor, autoscale_execute_resumable),
+           pool (SlicePoolManager/SliceActor/DeviceHostActor), resources (accelerator configs), docker]
+  external optimizer package:
+    path: external optimizer package
+    role: quantization-aware optimizers registered into easydel via @register_optimizer
+
+flows:
+  model_forward:
+    - AutoEasyDeLModelForCausalLM.from_pretrained -> registry resolve (infra/factory.py)
+    - HF weights -> utils/parameters_transformation (+ layers/layouts reform rules for fused QKV/gate-up)
+    - spx.Module init inside parameter-init sharding context (mesh from EasyDeLBaseConfig.mesh)
+    - attention: module -> UnifiedAttention -> OperationRegistry.create(config.attn_mechanism, metadata) -> ejkernel kernel by platform priority
+  training:
+    - trainer (_config/_trainer/_fn) -> EasyDeLState (params+opt+step) with eformer OptimizerFactory
+    - compiled sharded step (compile_trainer_step) -> data/ Pipeline batches -> async TensorStore checkpoints
+    - online-RL variants generate rollouts via eSurge inside the loop (esurge_rollout/, async_grpo)
+  inference:
+    - request -> eSurge engine (mixins/io) -> scheduler (continuous batching, prefix-cached PagePool)
+    - runner compile-bucketed forward (ragged page attention) -> SamplerExecutor -> stream/generate output
+    - server/api_server.py exposes OpenAI-compatible endpoints; tools+reasoning parsers post-process
+  pipeline_parallelism:
+    - sharding_axis_dims[0]>1 -> SpxMesh(is_mpmd) -> layer stage assignment (EasyDeLLayerStackMixin)
+    - spectrax runtime compiles per-rank executables; schedule orchestrates microbatches
+  data:
+    - Pipeline.source -> tokenize -> mix -> pack -> load (transforms chained with ">>"; Ray for distributed preprocessing)
+  release:
+    - scripts/release.sh <lib> <ver> (bump+pins+commit, local) -> scripts/publish.sh <lib> (tag -> CI PyPI)
+    - git push triggers subtree mirror sync (scripts/subtree-sync.sh auto)
+
+ci:
+  - workspace-ci.yaml: affected-only import/forward smoke + lint-imports on PR
+  - lint.yaml: ruff + basedpyright (baseline at .basedpyright/baseline.json)
+  - publish.yaml: tag-triggered per-package PyPI publish
+  - sync-subtrees.yaml: server-side mirror backstop
+
+ownership_routing:  # which .claude/agents expert owns a surface
+  libs/easydel/easydel/infra: [architect, sharding-expert]
+  libs/easydel/easydel/modules: [model-expert]
+  libs/easydel/easydel/layers: [model-expert, quantization-expert]
+  libs/easydel/easydel/operations: [kernel-expert]
+  libs/easydel/easydel/caching: [model-expert, inference-expert]
+  libs/easydel/easydel/trainers: [trainer-expert, rlhf-expert]
+  libs/easydel/easydel/inference: [inference-expert]
+  libs/easydel/easydel/data: [trainer-expert]
+  libs/spectrax: [jax-expert, sharding-expert]
+  libs/ejkernel: [kernel-expert]
+  libs/eformer: [sharding-expert, quantization-expert]
+  libs/eray: [tpu-expert]
+  external optimizer package: [quantization-expert]

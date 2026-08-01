@@ -76,7 +76,7 @@ def _v4_config_kwargs(small_model_config):
         # entries). With random init roughly half the relu'd indexer scores are exactly
         # zero, and a truncating top-k orders those ties backend-dependently (HF included),
         # which is not a portable parity target — see
-        # .agents/projects/port_hyv3_dsv4_mistral4.md. The full indexer path (scorer,
+        # .claude/projects/port_hyv3_dsv4_mistral4.md. The full indexer path (scorer,
         # causal threshold, -1 invalidation) still executes.
         index_topk=128,
         partial_rotary_factor=0.25,
