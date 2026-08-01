@@ -11,6 +11,7 @@ execute_command.sh
 *.txt
 env.ipynb
 env.py
+.basedpyright
 exp.py
 vxp.py
 nohup.out
