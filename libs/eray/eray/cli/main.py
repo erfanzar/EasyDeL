@@ -221,12 +221,26 @@ from .dashboard import register as _register_dashboard_commands  # noqa: E402
 _register_dashboard_commands(cli)
 
 
+# ── Managed runs (declare / watch / recover training runs) ───────
+
+from .runs import register as _register_runs_commands  # noqa: E402
+
+_register_runs_commands(cli)
+
+
 # ── TPU subcommands ──────────────────────────────────────────────
 
 
 @cli.group()
 def tpu() -> None:
     """TPU cluster management commands."""
+
+
+# ── Capacity subcommands (provision / reclaim / release pools) ────
+
+from .capacity import register as _register_capacity_commands  # noqa: E402
+
+_register_capacity_commands(tpu)
 
 
 # Common options reused by connect and disconnect

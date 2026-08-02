@@ -299,7 +299,7 @@ def observe(record: ClusterRecord, *, snapshot_jobs: bool = False) -> Observed:
         The observation snapshot.
     """
     now = time.time()
-    node = describe_node(record.name, project=record.project, zone=record.zone)
+    node = describe_node(record.resolved_node_id(), project=record.project, zone=record.zone)
     qr = describe_queued_resource(record.qr_id or record.name, project=record.project, zone=record.zone)
     head_up: bool | None = None
     jobs: list[dict] | None = None
@@ -523,13 +523,13 @@ def execute_actions(
             registry.mutate_record(name, _ring)
         elif action.kind == "bootstrap":
             fresh = registry.get(name)
-            node = describe_node(name, project=record.project, zone=record.zone)
+            node = describe_node(record.resolved_node_id(), project=record.project, zone=record.zone)
             if node is not None:
                 from .fleet import _bootstrap_if_needed
 
                 _bootstrap_if_needed(fresh, node, registry, lambda msg: _emit("bootstrap", msg))
         elif action.kind == "connect":
-            node = describe_node(name, project=record.project, zone=record.zone)
+            node = describe_node(record.resolved_node_id(), project=record.project, zone=record.zone)
             if node is None or node.state != "READY":
                 _emit("connect_skipped", f"node state {node.state if node else 'missing'}")
                 continue
