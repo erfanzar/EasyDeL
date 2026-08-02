@@ -202,10 +202,8 @@ class BaseTokenClassificationModule(BaseTaskModule[ModelT, ConfigT]):
             head_kernel_init=classifier_kernel_init,
         )
 
-        # Optional dropout before classifier
         self.dropout = nn.Dropout(rate=classifier_dropout, rngs=rngs) if classifier_dropout is not None else None
 
-        # Create classifier head
         classifier_block = ColumnParallelLinear
         if self._gradient_checkpointing_feature.should_checkpoint():
             classifier_block = auto_remat(
@@ -311,11 +309,9 @@ class BaseTokenClassificationModule(BaseTaskModule[ModelT, ConfigT]):
 
         hidden_states = outputs.last_hidden_state
 
-        # Apply dropout if configured
         if self.dropout is not None:
             hidden_states = self.dropout(hidden_states)
 
-        # Apply classifier to each token
         logits = self.classifier(hidden_states)
 
         return TokenClassifierOutput(

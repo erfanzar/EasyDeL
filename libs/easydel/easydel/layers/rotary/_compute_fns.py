@@ -579,7 +579,6 @@ def compute_deepseek_frequencies(
         dtype=jnp.float32,
     )
     freqs = jnp.einsum("i,j -> ij", t, inv_freq)
-    # DeepSeek mscale calculation
     attention_factor = (
         yarn_get_mscale(scaling_factor, mscale) / yarn_get_mscale(scaling_factor, mscale_all_dim) * attn_factor
     )

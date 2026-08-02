@@ -869,7 +869,6 @@ class ReadmeGenerator:
 
 # Example usage (for testing the generator script itself)
 if __name__ == "__main__":
-    # Create dummy model info for testing
     test_model_info = ModelInfo(
         name="TestModel-EasyDeL",
         type="TestLM",
@@ -883,7 +882,6 @@ if __name__ == "__main__":
         features=["Feature A", "Feature B"],
     )
 
-    # Generate the README
     generator = ReadmeGenerator()
     readme_content = generator.generate_readme(test_model_info, output_path="tmp-test-readme.md")
     print(f"Generated tmp-test-readme.md for model '{test_model_info.name}'")

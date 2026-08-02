@@ -61,7 +61,6 @@ def make_divisible(
     if min_value is None:
         min_value = divisor
     new_v = max(min_value, int(v + divisor / 2) // divisor * divisor)
-    # Make sure that round down does not go down by more than 10%.
     if new_v < 0.9 * v:
         new_v += divisor
     return new_v
@@ -318,7 +317,6 @@ class OpenELMConfig(EasyDeLBaseConfig):
                     dtype=float,
                 )
             ]
-            # Make sure that scaled model dimension is divisible by scaled head dimension.
             query_dims = [
                 int(make_divisible(self.model_dim * m, divisor=self.head_dim * head_multiple_of))
                 for m in qkv_multipliers
@@ -363,7 +361,6 @@ class OpenELMConfig(EasyDeLBaseConfig):
             )
         self.ffn_multipliers = [float(multiplier) for multiplier in self.ffn_multipliers]
 
-        # check num_query_heads divisible by num_kv_heads for every layer
         for layer_idx in range(len(query_dims)):
             assert self.num_query_heads[layer_idx] % self.num_kv_heads[layer_idx] == 0
 

@@ -172,11 +172,9 @@ class BaseTaskModule(EasyDeLBaseModule, Generic[ModelT, ConfigT], ABC):
         """
         super().__init_subclass__(**kwargs)
 
-        # Auto-register if enabled and task type is specified
         if cls._auto_register and cls._task_type is not None:
             # Only register if this is a concrete subclass with a model type
             if cls._model_type is not None and cls._config_class is not None:
-                # Apply registration decorator
                 register_module(
                     task_type=cls._task_type,
                     config=cls._config_class,
@@ -194,12 +192,10 @@ class BaseTaskModule(EasyDeLBaseModule, Generic[ModelT, ConfigT], ABC):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: spx.Rngs,
-        # Feature flags
         tie_word_embeddings: bool = False,
         logit_cap: float | None = None,
         router_aux_loss_coef: float | None = None,
         pooling_strategy: str = "last",
-        # Head configuration
         head_bias: bool = False,
         head_kernel_init: Callable | None = None,
     ):
@@ -275,7 +271,6 @@ class BaseTaskModule(EasyDeLBaseModule, Generic[ModelT, ConfigT], ABC):
             rngs=rngs,
         )
 
-        # Create or store base model
         if base_model is None:
             if base_model_class is None:
                 raise ValueError("Either base_model or base_model_class must be provided")
@@ -287,11 +282,9 @@ class BaseTaskModule(EasyDeLBaseModule, Generic[ModelT, ConfigT], ABC):
                 rngs=rngs,
             )
 
-        # Store base model with custom attribute name
         setattr(self, base_model_name, base_model)
         self._base_model_name = base_model_name
 
-        # Store head configuration
         self._head_bias = head_bias
         self._head_kernel_init = head_kernel_init or jax.nn.initializers.normal(
             stddev=getattr(config, "initializer_range", 0.02)

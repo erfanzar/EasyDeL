@@ -140,7 +140,6 @@ def main():
 
     args = parser.parse_args()
 
-    # Convert dtype string to jnp type
     dtype_map = {
         "float32": jnp.float32,
         "float16": jnp.float16,

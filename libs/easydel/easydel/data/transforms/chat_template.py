@@ -61,7 +61,6 @@ def is_conversational(example: dict) -> bool:
         if value is None:
             continue
 
-        # Check if it's a list of dicts with role/content
         if isinstance(value, list) and value:
             first_item = value[0]
             if isinstance(first_item, dict):
@@ -92,7 +91,6 @@ def convert_to_chatml(messages: list[dict]) -> list[dict]:
     result = []
     for msg in messages:
         if "from" in msg and "value" in msg:
-            # Convert from/value to role/content
             result.append(
                 {
                     "role": msg["from"],
@@ -204,7 +202,6 @@ class ChatTemplateTransform(Transform):
         """
         result = example.copy()
 
-        # Handle alternate field names
         messages = None
         source_field = None
         for field in [self._messages_field, "conversations", "conversation"]:
@@ -216,13 +213,11 @@ class ChatTemplateTransform(Transform):
         if messages is None:
             return result
 
-        # Convert from/value format if needed
         if self._convert_from_value and messages:
             first_msg = messages[0] if isinstance(messages, list) and messages else None
             if isinstance(first_msg, dict) and "from" in first_msg and "value" in first_msg:
                 messages = convert_to_chatml(messages)
 
-        # Apply chat template
         try:
             formatted_text = self._tokenizer.apply_chat_template(
                 messages,
@@ -405,7 +400,6 @@ class ConvertInputOutputToChatML(Transform):
         """
         result = example.copy()
 
-        # Find conversation field
         conversation = None
         source_field = None
         for field in [self._input_field, "conversation", "conversations"]:
@@ -417,7 +411,6 @@ class ConvertInputOutputToChatML(Transform):
         if conversation is None:
             return result
 
-        # Convert input/output pairs to messages
         messages = []
         for turn in conversation:
             if "input" in turn:
@@ -435,7 +428,6 @@ class ConvertInputOutputToChatML(Transform):
             )
             return result
 
-        # Remove old field if different from output
         if source_field and source_field != self._output_field:
             result.pop(source_field, None)
 
@@ -451,7 +443,6 @@ class ConvertInputOutputToChatML(Transform):
         return f"ConvertInputOutputToChatML({self._input_field!r} -> {self._output_field!r})"
 
 
-# Default role mapping for common dataset formats to ChatML standard roles
 DEFAULT_ROLE_MAPPING: dict[str, str] = {
     # Common variations -> ChatML standard
     "human": "user",
@@ -526,7 +517,6 @@ class ConvertToChatML(Transform):
         self._input_field = input_field
         self._output_field = output_field
 
-        # Build role mapping
         if use_default_mapping:
             self._role_mapping = DEFAULT_ROLE_MAPPING.copy()
             if role_mapping:
@@ -557,7 +547,6 @@ class ConvertToChatML(Transform):
         """
         result = example.copy()
 
-        # Find messages field
         messages = None
         source_field = None
         for field in [self._input_field, "conversations", "messages"]:
@@ -577,7 +566,6 @@ class ConvertToChatML(Transform):
         for msg in messages:
             new_msg = {k: v for k, v in msg.items() if k not in ("from", "value", "role", "content")}
 
-            # Handle role/from
             if "from" in msg:
                 role = msg["from"]
             elif "role" in msg:
@@ -588,7 +576,6 @@ class ConvertToChatML(Transform):
             # Apply role mapping (normalize to ChatML standard roles)
             new_msg["role"] = self._role_mapping.get(role, role)
 
-            # Handle content/value
             if "value" in msg:
                 new_msg["content"] = msg["value"]
             elif "content" in msg:
@@ -598,7 +585,6 @@ class ConvertToChatML(Transform):
 
             converted.append(new_msg)
 
-        # Remove old field if different from output
         if source_field and source_field != self._output_field:
             result.pop(source_field, None)
 

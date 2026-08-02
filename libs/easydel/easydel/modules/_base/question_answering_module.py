@@ -308,7 +308,6 @@ class BaseQuestionAnsweringModule(BaseTaskModule[ModelT, ConfigT]):
 
         hidden_states = outputs.last_hidden_state
 
-        # Get start and end logits
         logits = self.qa_outputs(hidden_states)
         start_logits, end_logits = jnp.split(logits, 2, axis=-1)
         start_logits = start_logits.squeeze(-1)

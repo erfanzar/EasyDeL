@@ -346,7 +346,6 @@ class OpenAIToolParser(ToolParser):
             self.streamed_args_for_tool.append("")
             return delta
 
-        # Emit function name
         if not self.current_tool_name_sent:
             function_name = current_tool_call.get("name")
             if isinstance(function_name, str) and function_name:
@@ -363,7 +362,6 @@ class OpenAIToolParser(ToolParser):
                 )
             return None
 
-        # Emit argument diffs
         cur_arguments = current_tool_call.get("arguments")
         if cur_arguments is None:
             return None
@@ -400,7 +398,6 @@ class OpenAIToolParser(ToolParser):
             )
             self.streamed_args_for_tool[self.current_tool_id] += argument_diff
 
-        # Save state for next diff
         if len(self.prev_tool_call_arr) <= self.current_tool_id:
             self.prev_tool_call_arr.append({"arguments": cur_arguments})
         else:

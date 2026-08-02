@@ -320,21 +320,18 @@ class DatasetProfiler:
         seq_length = self.seq_length
         dummy_tokens = [self.eos_token_id]
 
-        # Greedy
         greedy = GreedyPacker(seq_length, self.eos_token_id, self.pad_token_id)
         for length in lengths:
             greedy.add(dummy_tokens * length)
         greedy.flush_final()
         result: dict[str, float] = {"greedy": greedy.stats.efficiency}
 
-        # Pool
         pool = PoolPacker(seq_length, self.eos_token_id, self.pad_token_id, num_packers=4)
         for length in lengths:
             pool.add(dummy_tokens * length)
         pool.flush_all()
         result["pool"] = pool.stats.efficiency
 
-        # First-fit
         buffer_size = max(1, min(len(lengths), 1000))
         first_fit = FirstFitPacker(
             seq_length,

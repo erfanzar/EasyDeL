@@ -186,7 +186,6 @@ class HFDatasetShardedSource(ShardedDataSource[dict]):
             Individual examples from the dataset as dictionaries.
         """
         if self._is_iterable:
-            # IterableDataset - just iterate
             for example in self._dataset:
                 yield self._to_example(example)
         else:
@@ -205,7 +204,6 @@ class HFDatasetShardedSource(ShardedDataSource[dict]):
             Examples starting from the specified row.
         """
         if self._is_iterable:
-            # IterableDataset - skip rows
             for i, example in enumerate(self._dataset):
                 if i >= row:
                     yield self._to_example(example)

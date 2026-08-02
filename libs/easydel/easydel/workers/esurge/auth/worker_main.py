@@ -98,7 +98,6 @@ def _auth_worker(
         auto_save_interval: Minimum seconds between auto-saves; also
             controls how often the dirty flag triggers a flush.
     """
-    # Initialize auth manager
     auth_manager = EnhancedApiKeyManager(
         require_api_key=require_api_key,
         admin_key=admin_key,
@@ -316,7 +315,6 @@ def main():
     parser.set_defaults(enable_audit_logging=True, enable_persistence=True)
     args = parser.parse_args()
 
-    # Disable JAX initialization
     os.environ.setdefault("JAX_PLATFORMS", "cpu")
     os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
     os.environ.setdefault("ENABLE_DISTRIBUTED_INIT", "0")

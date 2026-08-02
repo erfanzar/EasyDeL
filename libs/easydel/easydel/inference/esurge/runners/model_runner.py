@@ -665,7 +665,6 @@ class eSurgeRunner:
         # Perf logging state (kept lightweight; no allocations in the hot path).
         self.perf = RunnerPerfTracker(history_maxlen=max(32768, int(max_model_len) * 4), alpha=0.2)
 
-        # Async scheduling state
         self._pre_async_results: AsyncPreResults | None = None
         self._executor: typing.Any = None  # ThreadPoolExecutor, typed as Any to avoid circular import
         self._handoff_positions_cache: dict[int, jax.Array] = {}
@@ -1831,7 +1830,6 @@ class eSurgeRunner:
         if clear_compiled_cache:
             self.executor_manager.clear_cache()
 
-        # Drop strong references to model and device-resident graph trees.
         self.model = None
         self._vlm_image_features_jit = None
         self._vlm_video_features_jit = None
@@ -2364,7 +2362,6 @@ class eSurgeRunner:
                     f"Total number of tokens: {end_idx} > max_model_len: {self.max_model_len}"
                 )
 
-            # Update buffer state
             self.sequence_buffer.num_tokens_no_spec[seq_row_idx] = end_idx
             self.sequence_buffer.num_tokens[seq_row_idx] = end_idx
 
@@ -2670,7 +2667,6 @@ class eSurgeRunner:
             window_row_indices_cpu = self._window_row_indices_cpu
             recurrent_slot_indices_cpu = self._window_recurrent_slot_indices_cpu
             if num_reqs > 0:
-                # Keep scheduled and active_mask as CPU arrays
                 scheduled_full_cpu = self._scheduled_full_cpu
                 scheduled_full_cpu.fill(0)
                 scheduled_full_cpu[: len(model_scheduled_list)] = model_scheduled_list
@@ -3479,7 +3475,6 @@ class eSurgeRunner:
                 else:
                     early_draft_by_rid.clear()
                 total_spec_draft_time += time.time() - draft_timer_start
-            # ------------------------------------------------------------------
 
             for row_pos, rid, req_state, req_idx, seq_len, is_valid in window_entries:
                 if not is_valid:

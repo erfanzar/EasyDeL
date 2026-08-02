@@ -813,7 +813,6 @@ def grpo_step(
     """
     scope_root = "easydel/trainer/grpo/" + ("train_step" if is_training else "eval_step")
     with jax.named_scope(scope_root + "/prepare_batch"):
-        # Determine batch size, minibatch size, and enforce partition spec.
         _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
             batch=batch,
             gradient_accumulation_steps=gradient_accumulation_steps,
@@ -1412,7 +1411,6 @@ def grpo_step(
             other_metrics=other_metrics,
         )
 
-    # Compute gradients and metrics across minibatches.
     if is_training:
         with jax.named_scope(scope_root + "/grad_and_minibatch"):
             gradients, metrics = minibatch_call(

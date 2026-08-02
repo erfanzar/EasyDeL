@@ -133,7 +133,6 @@ class VisionEncoderCache:
         self.current_size = 0
         self._cache: OrderedDict[str, tuple[jax.Array, int]] = OrderedDict()
         self._lock = threading.RLock()
-        # Metrics
         self.hits = 0
         self.misses = 0
 

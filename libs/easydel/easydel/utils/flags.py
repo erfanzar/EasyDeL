@@ -164,7 +164,6 @@ def render_markdown() -> str:
 # ``flags.EASYDEL_SPEC_RECURRENT_REPLAY`` instead of a bare string literal.
 # --------------------------------------------------------------------------- #
 
-# eSurge engine / scheduler
 EASYDEL_MAX_SCHEDULER_ERRORS = _register(
     "EASYDEL_MAX_SCHEDULER_ERRORS", "int", 5, "eSurge engine",
     "Max consecutive scheduler errors before the eSurge engine loop stops.",
@@ -190,7 +189,6 @@ EASYDEL_WORKER_STARTUP_TIMEOUT = _register(
     "Seconds to wait for a tokenizer/detokenizer worker to bind before timing out.",
 )
 
-# eSurge runner / execution
 EASYDEL_SYNC_INPUTS_FOR_TIMING = _register(
     "EASYDEL_SYNC_INPUTS_FOR_TIMING", "bool", False, "eSurge runner",
     "Sync step inputs for accurate timing (adds a device round-trip).",
@@ -200,7 +198,6 @@ EASYDEL_ENABLE_DP_LOCAL_PAGE_PATH = _register(
     "Enable the data-parallel local-page attention path when the request count divides evenly.",
 )
 
-# eSurge speculative decoding
 EASYDEL_SPEC_RECURRENT_REPLAY = _register(
     "EASYDEL_SPEC_RECURRENT_REPLAY", "bool", False, "eSurge spec-decode",
     "Bit-exact greedy under spec-decode via sequential-GDN replay of the accepted prefix (slower; opt-in).",

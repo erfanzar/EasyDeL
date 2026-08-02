@@ -78,9 +78,7 @@ class FalconH1Config(EasyDeLBaseConfig):
         time_step_min: float = 0.001,
         time_step_max: float = 0.1,
         time_step_limit: tuple[float, float] | None = (0.0, float("inf")),
-        # Shared projection biases
         projectors_bias: bool = False,
-        # RoPE
         rope_parameters: dict | None = None,
         rope_theta: float = 100_000.0,
         rope_scaling: dict[str, str | float] | None = None,

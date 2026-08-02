@@ -133,7 +133,6 @@ class SchedulerBuilder(ABC):
         pass
 
 
-# Registry dictionaries
 _OPTIMIZER_BUILDER_REGISTRY: dict[str, type[OptimizerBuilder]] = {}
 _SCHEDULER_BUILDER_REGISTRY: dict[str, type[SchedulerBuilder]] = {}
 

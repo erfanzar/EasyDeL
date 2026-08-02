@@ -482,7 +482,6 @@ class SamplingParams:
     top_k: int = 0
     seed: int | None = None
 
-    # Stopping Conditions
     stop: list[str] = field(default_factory=list)
     stop_token_ids: list[int] = field(default_factory=list)
     stop_pattern: str | None = None  # Regex pattern for stopping generation
@@ -491,7 +490,6 @@ class SamplingParams:
     max_tokens: int | None = 16
     min_tokens: int = 0
 
-    # Output Control
     logprobs: int | None = None
     prompt_logprobs: int | None = None
     detokenize: bool = True
@@ -501,7 +499,6 @@ class SamplingParams:
     output_kind: RequestOutputKind = RequestOutputKind.CUMULATIVE
     ignore_stop_strings_in_reasoning: bool | None = True
 
-    # Advanced & Guided Decoding
     truncate_prompt_tokens: Annotated[int, "ge=1"] | None = None
     guided_decoding: GuidedDecodingParams | None = None
     logit_bias: dict[int, float] | None = None

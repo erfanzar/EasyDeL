@@ -379,7 +379,6 @@ class GemmaDecoderLayer(spx.Module):
         self.param_dtype = param_dtype
         self.precision = precision
 
-        # Define layers
         self.input_layernorm = GemmaRMSNorm(self.config, dtype=self.dtype)
         self.post_attention_layernorm = GemmaRMSNorm(self.config, dtype=self.dtype)
         self.self_attn = GemmaAttention(
@@ -462,7 +461,6 @@ class GemmaDecoderLayer(spx.Module):
             )
         else:
             feed_forward_hidden_states = self.mlp(hidden_states)
-        # residual connection
         hidden_states = checkpoint_name(residual + feed_forward_hidden_states, "residual")
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -569,7 +567,6 @@ class GemmaModel(EasyDeLBaseModule):
         with self.assign_layer_stage(final_layer_idx, total_layers=self.config.num_hidden_layers):
             self.norm = GemmaRMSNorm(self.config, dtype=self.dtype)
 
-    # Ignore copy
     def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,

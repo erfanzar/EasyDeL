@@ -71,7 +71,6 @@ class DeepSeekV3ReasoningParser(ReasoningParser):
             tokenizer: Tokenizer whose chat template determines the delegate.
         """
         super().__init__(tokenizer)
-        # Check if tokenizer's chat template supports thinking
         chat_template = getattr(tokenizer, "chat_template", "") or ""
         has_thinking = (
             "thinking" in chat_template

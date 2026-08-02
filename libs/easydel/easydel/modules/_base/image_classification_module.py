@@ -208,7 +208,6 @@ class BaseImageClassificationModule(BaseTaskModule[ModelT, ConfigT]):
             head_kernel_init=classifier_kernel_init,
         )
 
-        # Create classifier head
         classifier_block = ColumnParallelLinear
         if self._gradient_checkpointing_feature.should_checkpoint():
             classifier_block = auto_remat(

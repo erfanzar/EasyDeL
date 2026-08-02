@@ -676,7 +676,6 @@ def apply_chat_template(
     ]:
         raise KeyError(f"Invalid keys in the example: {example_keys}")
 
-    # Initialize variables that may be conditionally assigned
     messages: str = ""
     prompt: str = ""
     chosen: str = ""

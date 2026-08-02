@@ -319,7 +319,6 @@ def create_whisper_app(model_name: str = "openai/whisper-large-v3-turbo", dtype=
         version="1.0.0",
     )
 
-    # Add CORS middleware
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -328,7 +327,6 @@ def create_whisper_app(model_name: str = "openai/whisper-large-v3-turbo", dtype=
         allow_headers=["*"],
     )
 
-    # Initialize the model
     model_instance = WhisperModel(model_name=model_name, dtype=dtype)
 
     @app.get("/")
@@ -398,27 +396,21 @@ def create_whisper_app(model_name: str = "openai/whisper-large-v3-turbo", dtype=
         """
         temp_file_path: str | None = None
         try:
-            # Create a temporary file to store the uploaded audio
             with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as temp_file:
-                # Read the uploaded file
                 audio_content = await file.read()
-                # Write to the temporary file
                 temp_file.write(audio_content)
                 temp_file_path = temp_file.name
 
-            # Get timestamps based on granularities
             return_timestamps = False
             if timestamp_granularities and "word" in timestamp_granularities:
                 return_timestamps = True
 
-            # Process the audio with Whisper
             result = model_instance.inference(
                 audio_input=temp_file_path,
                 language=language,
                 return_timestamps=return_timestamps,
             )
 
-            # Format the response based on the requested format
             if response_format == ResponseFormat.text:
                 return {"text": result["text"]}
             elif response_format == ResponseFormat.json:
@@ -434,7 +426,6 @@ def create_whisper_app(model_name: str = "openai/whisper-large-v3-turbo", dtype=
             raise HTTPException(status_code=500, detail=f"Error processing audio: {e!s}") from e
 
         finally:
-            # Clean up the temporary file
             if temp_file_path is not None and os.path.exists(temp_file_path):
                 os.unlink(temp_file_path)
 
@@ -494,27 +485,21 @@ def create_whisper_app(model_name: str = "openai/whisper-large-v3-turbo", dtype=
         """
         temp_file_path: str | None = None
         try:
-            # Create a temporary file to store the uploaded audio
             with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as temp_file:
-                # Read the uploaded file
                 audio_content = await file.read()
-                # Write to the temporary file
                 temp_file.write(audio_content)
                 temp_file_path = temp_file.name
 
-            # Get timestamps based on granularities
             return_timestamps = False
             if timestamp_granularities and "word" in timestamp_granularities:
                 return_timestamps = True
 
-            # Process the audio with Whisper
             result = model_instance.inference(
                 audio_input=temp_file_path,
                 task="translate",
                 return_timestamps=return_timestamps,
             )
 
-            # Format the response based on the requested format
             if response_format == ResponseFormat.text:
                 return {"text": result["text"]}
             elif response_format == ResponseFormat.json:
@@ -530,7 +515,6 @@ def create_whisper_app(model_name: str = "openai/whisper-large-v3-turbo", dtype=
             raise HTTPException(status_code=500, detail=f"Error processing audio: {str(e)}")  # noqa
 
         finally:
-            # Clean up the temporary file
             if temp_file_path is not None and os.path.exists(temp_file_path):
                 os.unlink(temp_file_path)
 

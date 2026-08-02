@@ -136,7 +136,6 @@ class Pipeline:
             chained.
         """
         if isinstance(config, dict):
-            # Convert dict to PipelineConfig
             datasets = [DatasetConfig(**ds) if isinstance(ds, dict) else ds for ds in config.get("datasets", [])]
             config = PipelineConfig(
                 datasets=datasets,
@@ -409,7 +408,6 @@ class Pipeline:
         if len(self._data) == 1:
             return next(iter(self._data.values()))
 
-        # Return the mixed/combined result
         return next(iter(self._data.values()))
 
     def get_data(self) -> dict[str, tp.Any]:
@@ -638,7 +636,6 @@ def pretokenize(
         logger.info(f"Pretokenizing with {transform.__class__.__name__}...")
         logger.info(f"Output: {output_path} ({output_format})")
 
-    # Wrap source with transform
     if num_proc and num_proc > 1:
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
         parallel_source_cls = (
@@ -662,7 +659,6 @@ def pretokenize(
     if progress_update_interval is not None:
         transformed_source = _ProgressBarShardedSource(transformed_source, progress_update_interval)
 
-    # Save to disk
     stats = save_dataset(
         source=transformed_source,
         output_path=output_path,

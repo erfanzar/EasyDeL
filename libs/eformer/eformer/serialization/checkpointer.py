@@ -54,7 +54,6 @@ from .async_manager import AsyncCheckpointManager
 
 logger = get_logger(__name__)
 
-# Type aliases
 MetadataDict = dict[str, tp.Any]
 CheckpointPath = str
 Sequence = tp.Sequence

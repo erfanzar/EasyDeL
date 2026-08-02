@@ -151,7 +151,6 @@ def validate_metadata_availability(
         ValidationResult indicating whether all required fields are present.
     """
     if requirements.metadata.is_satisfied_by(available):
-        # Check for unused optional fields
         unused_optional = requirements.metadata.optional & ~available
         warnings = []
         if unused_optional != MetadataField.NONE:
@@ -202,12 +201,10 @@ class RequirementsValidator:
         all_errors: list[str] = []
         all_warnings: list[str] = []
 
-        # Validate cache compatibility
         cache_result = validate_cache_compatibility(requirements, self.cache_type)
         all_errors.extend(cache_result.errors)
         all_warnings.extend(cache_result.warnings)
 
-        # Validate metadata availability
         metadata_result = validate_metadata_availability(requirements, self.available_metadata)
         all_errors.extend(metadata_result.errors)
         all_warnings.extend(metadata_result.warnings)

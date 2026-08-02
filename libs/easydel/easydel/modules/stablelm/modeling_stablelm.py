@@ -220,7 +220,6 @@ class StableLmLayerNormPerHead(spx.Module):
         """
         # hidden_states: [batch, seq_len, num_heads * head_dim]
         states_per_heads = jnp.split(hidden_states, 1, axis=1)
-        # Normalize and merge the heads back together
         return jnp.concatenate(
             [norm(hidden_states) for norm, hidden_states in zip(self.norms, states_per_heads, strict=False)],
             axis=1,

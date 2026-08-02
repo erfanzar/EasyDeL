@@ -392,13 +392,10 @@ def unwrap_metadata(metadata: tp.Any, expected_type: str | None = None) -> tp.An
     if metadata is None:
         return None
 
-    # If it's OperationsMetadata, extract the inner metadata
     if isinstance(metadata, OperationsMetadata):
         if expected_type == "transformer":
-            # First check if we have direct transformer metadata
             if metadata.transformer is not None:
                 return metadata.transformer
-            # If we have hybrid metadata, convert to transformer metadata
             if metadata.hybrid is not None:
                 from easydel.caching.transformer import TransformerMetadata
 
@@ -415,7 +412,6 @@ def unwrap_metadata(metadata: tp.Any, expected_type: str | None = None) -> tp.An
         elif expected_type == "recurrent":
             return metadata.recurrent
         else:
-            # Return whatever is populated
             return metadata.get_inner()
 
     # Check if it's HybridMetadata and we need TransformerMetadata

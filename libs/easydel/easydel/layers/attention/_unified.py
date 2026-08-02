@@ -215,7 +215,6 @@ def apply_rotary_pos_emb(
         rotated: Float[Array, "batch_size num_heads_any seq_len head_dim"] = jnp.concatenate((-x2, x1), axis=-1)
         return rotated
 
-    # Apply rotary embeddings
     q_rotated: Float[Array, "batch_size num_heads seq_len head_dim"] = rotate_half(q)
     k_rotated: Float[Array, "batch_size num_kv_heads seq_len head_dim"] = rotate_half(k)
     q_embed: Float[Array, "batch_size num_heads seq_len head_dim"] = (q * cos_expanded) + (q_rotated * sin_expanded)
@@ -894,11 +893,9 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             to broadcast against ``[batch, num_heads, seq_q, seq_k]``
             logits.
         """
-        # Create position indices
         positions = jnp.arange(sequence_length)
         # Compute relative positions (broadcasting)
         relative_positions: Int[Array, "seq_len seq_len"] = positions[None, :] - positions[:, None]
-        # Apply slopes
         alibi_bias: Float[Array, "num_heads seq_len seq_len"] = (
             relative_positions[None, :, :] * self.alibi_slopes[:, None, None]
         )
@@ -1516,12 +1513,10 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         # Split query into nope (non-positional) and pe (positional) parts
         q_nope, q_pe = q[..., : self.qk_nope_head_dim], q[..., self.qk_nope_head_dim :]
 
-        # KV projection with compression
         compressed_kv = self.mla_kv_a_proj_with_mqa(hidden_states)
         k_pe = compressed_kv[..., self.kv_lora_rank :]
         compressed_kv = compressed_kv[..., : self.kv_lora_rank]
 
-        # Reshape k_pe for RoPE
         k_pe = k_pe.reshape(bsz, q_len, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
 
         _use_mla_ragged = isinstance(cache_view, MLARaggedPagesCacheView)
@@ -1545,7 +1540,6 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
 
         # Apply RoPE directly to MLA format [batch, heads, seq, rope_dim]
         if frequencies is not None:
-            # Extract array from ModuleCaches if needed
             freq_array = frequencies.value if hasattr(frequencies, "value") else frequencies
             # Gather frequencies for all positions: position_ids is [batch, seq], freq_array is [max_seq, rope_dim*2]
             # Result: [batch, seq, rope_dim*2]
@@ -1678,7 +1672,6 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             key_states = key_states.transpose(0, 2, 1, 3)
             value_states = value_states.transpose(0, 2, 1, 3)
 
-            # Concatenate with KV cache
             (
                 key_states,
                 value_states,

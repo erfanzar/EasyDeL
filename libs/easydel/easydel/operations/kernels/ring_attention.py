@@ -179,7 +179,6 @@ class RingAttn(OperationImpl):
             AttentionOutput: ``attention_outputs`` of shape ``(B, seq_len_q,
             num_heads, head_dim)``. ``attention_weights`` is ``None``.
         """
-        # Check dimension compatibility for MLA-style attention
         query_dim: int = query.shape[-1]
         key_dim: int = key.shape[-1]
         value_dim: int = value.shape[-1]
@@ -220,12 +219,10 @@ class RingAttn(OperationImpl):
             softmax_aux=softmax_aux,
         )
 
-        # Cast tensors to runtime dtype
         query: Float[Array, "batch seq_len_q num_heads head_dim"] = query.astype(dtype_runtime)
         key: Float[Array, "batch seq_len_k num_kv_heads head_dim"] = key.astype(dtype_runtime)
         value: Float[Array, "batch seq_len_k num_kv_heads head_dim"] = value.astype(dtype_runtime)
 
-        # Create sharding specs
         query_sharding = self.create_stable_sharding(
             shardings.query,
             dep=query,

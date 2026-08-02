@@ -802,14 +802,12 @@ class PixtralVisionModel(EasyDeLBaseModule):
             self.patch_conv(jnp.expand_dims(img, 0).astype(self.dtype).transpose(0, 2, 3, 1)) for img in pixel_values
         ]
         patch_embeds_list = [p.transpose(0, 3, 1, 2) for p in patch_embeds_list]
-        # flatten to a single sequence
         patch_embeds = jnp.concatenate(
             [jnp.transpose(jnp.reshape(p, (p.shape[0], p.shape[1], -1)), (0, 2, 1)) for p in patch_embeds_list],
             axis=1,
         )
         patch_embeds = checkpoint_name(self.ln_pre(patch_embeds), "embeddings")
 
-        # positional embeddings
         position_ids = position_ids_in_meshgrid(
             patch_embeds_list,
             max_width=self.config.image_size // self.config.patch_size,

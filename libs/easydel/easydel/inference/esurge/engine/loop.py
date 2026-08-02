@@ -388,7 +388,6 @@ class EngineLoop:
                         prof_process * 1e3,
                         (time.perf_counter() - prof_loop_t0) * 1e3,
                     )
-                # Reset error counter on success
                 consecutive_errors = 0
                 self._heartbeat()
             except KeyboardInterrupt:
@@ -620,7 +619,6 @@ class EngineLoop:
                 else:
                     pending_execution = _execute_positive_schedule(scheduler_output)
 
-                # Reset error counter on success
                 consecutive_errors = 0
                 self._heartbeat()
             except KeyboardInterrupt:

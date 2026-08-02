@@ -152,7 +152,6 @@ class TurboQuantRaggedPagesCacheConfig(RaggedPagesCacheConfig):
         if num_pages <= 0:
             raise ValueError("Computed `num_pages` is non-positive; increase `hbm_utilization` or reduce model size.")
 
-        # Compare with uncompressed bf16 equivalent
         uncompressed_bytes = page_size * num_kv_heads * head_dim * 2 * 2  # K+V, bf16
         compression_ratio = uncompressed_bytes / page_bytes_per_layer
 

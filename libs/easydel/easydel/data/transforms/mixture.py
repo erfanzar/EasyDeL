@@ -94,12 +94,10 @@ class WeightScheduler:
         if not schedule:
             raise ValueError("Schedule must have at least one point")
 
-        # Sort by step
         self._schedule = sorted(schedule, key=lambda p: p.step)
         self._interpolation = interpolation
         self._dataset_names = list(self._schedule[0].weights.keys())
 
-        # Validate all points have same dataset names
         for point in self._schedule:
             if set(point.weights.keys()) != set(self._dataset_names):
                 raise ValueError("All schedule points must have the same dataset names")
@@ -124,14 +122,12 @@ class WeightScheduler:
             steps and equals
             :attr:`WeightSchedulePoint.weights`'s keys.
         """
-        # Find surrounding schedule points
         if step <= self._schedule[0].step:
             return self._schedule[0].weights.copy()
 
         if step >= self._schedule[-1].step:
             return self._schedule[-1].weights.copy()
 
-        # Find the interval
         for i in range(len(self._schedule) - 1):
             if self._schedule[i].step <= step < self._schedule[i + 1].step:
                 start = self._schedule[i]
@@ -140,15 +136,12 @@ class WeightScheduler:
         else:
             return self._schedule[-1].weights.copy()
 
-        # Interpolate
         if self._interpolation == "step":
             return start.weights.copy()
 
-        # Calculate interpolation factor
         progress = (step - start.step) / (end.step - start.step)
 
         if self._interpolation == "cosine":
-            # Cosine annealing
             progress = (1 - math.cos(progress * math.pi)) / 2
 
         # Linear interpolation (or cosine-adjusted linear)
@@ -158,7 +151,6 @@ class WeightScheduler:
             end_w = end.weights[name]
             result[name] = start_w + progress * (end_w - start_w)
 
-        # Normalize to ensure sum is 1
         total = sum(result.values())
         if total > 0:
             result = {k: v / total for k, v in result.items()}
@@ -271,7 +263,6 @@ class MixedShardedSource(ShardedDataSource[dict]):
         self._stop_strategy = stop_strategy
         self._weight_scheduler = weight_scheduler
 
-        # Validate and normalize weights
         if weights is None:
             n = len(self._names)
             self._weights = {name: 1.0 / n for name in self._names}
@@ -449,7 +440,6 @@ class MixedShardedSource(ShardedDataSource[dict]):
                     continue
                 try:
                     example = next(iters[name])
-                    # Add source metadata
                     example["__source__"] = name
                     yield example
                     examples_emitted += 1
@@ -462,7 +452,6 @@ class MixedShardedSource(ShardedDataSource[dict]):
                             yield example
                             examples_emitted += 1
                         except StopIteration:
-                            # Empty dataset
                             logger.warning(f"Dataset '{name}' is empty")
                             dead.add(name)
                     elif self._stop_strategy == "first_exhausted":
@@ -674,7 +663,6 @@ class MixStage(BaseStage):
             # Single dataset, no mixing needed
             return data
 
-        # Create weight scheduler if schedule provided
         weight_scheduler = None
         if self._stage_config.weight_schedule:
             weight_scheduler = WeightScheduler(
@@ -682,7 +670,6 @@ class MixStage(BaseStage):
                 interpolation=self._stage_config.weight_schedule_type,
             )
 
-        # Create mixed source
         mixed = MixedShardedSource(
             sources=data,
             weights=self._stage_config.weights,
@@ -799,7 +786,6 @@ def block_mixture_interleave(
         iters = [iter(ds) for ds in datasets_list]
         block_idx = 0
         while True:
-            # Create deterministic RNG per block for reproducible checkpoint resume
             block_rng = np.random.default_rng(seed + block_idx if seed is not None else None)
             ids = []
             for i, c in enumerate(counts):

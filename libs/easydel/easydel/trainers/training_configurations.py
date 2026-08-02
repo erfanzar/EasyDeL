@@ -207,7 +207,6 @@ def _apply_training_args_legacy_aliases(data: dict[str, tp.Any]) -> dict[str, tp
     return data
 
 
-# Constants
 AVAILABLE_BACKENDS: list[str] = ["cpu", "gpu", "tpu", None]
 
 

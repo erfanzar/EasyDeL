@@ -493,7 +493,6 @@ class ParquetWriter(DatasetWriter):
         import pyarrow as pa  # pyright: ignore[reportMissingTypeStubs]
         import pyarrow.parquet as pq  # pyright: ignore[reportMissingTypeStubs]
 
-        # Create output directory
         fs, path = fsspec.core.url_to_fs(self.output_path)
         fs.makedirs(path, exist_ok=True)
         self._prepare_output_dir(fs, path, ".parquet")
@@ -520,11 +519,9 @@ class ParquetWriter(DatasetWriter):
             if not current_rows:
                 return
 
-            # Convert to Arrow table
             if current_rows:
                 table = _rows_to_arrow_table(current_rows, pa)
 
-                # Write shard
                 shard_path = f"{path}/shard-{current_shard:05d}.parquet"
                 with fs.open(shard_path, "wb") as f:
                     pq.write_table(table, f, compression=self.compression)
@@ -538,7 +535,6 @@ class ParquetWriter(DatasetWriter):
             current_size = 0
             current_shard += 1
 
-        # Iterate and accumulate
         for shard_name in source.shard_names:
             for example in source.open_shard(shard_name):
                 current_rows.append(example)
@@ -548,7 +544,6 @@ class ParquetWriter(DatasetWriter):
                 if current_size >= self.max_shard_size:
                     flush_shard()
 
-        # Final flush
         flush_shard()
 
         logger.info(f"Wrote {stats.num_examples} examples to {stats.num_shards} Parquet shards")
@@ -603,10 +598,8 @@ class ArrowWriter(DatasetWriter):
             if not current_rows:
                 return
 
-            # Convert to Arrow table
             table = _rows_to_arrow_table(current_rows, pa)
 
-            # Write shard
             shard_path = f"{path}/shard-{current_shard:05d}.arrow"
             with fs.open(shard_path, "wb") as f:
                 writer = ipc.new_file(f, table.schema)
@@ -868,10 +861,8 @@ class SaveStage(BaseStage):
                     save_format = ds_config.save_format
 
             if save_path is None:
-                # Use global output_dir with dataset name
                 save_path = f"{self._stage_config.output_dir}/{ds_name}"
 
-            # Create writer and save
             writer = create_writer(
                 output_path=save_path,
                 format=save_format,
@@ -887,7 +878,6 @@ class SaveStage(BaseStage):
             self._update_metric(f"{ds_name}_num_examples", stats.num_examples)
             self._update_metric(f"{ds_name}_num_shards", stats.num_shards)
 
-            # Push to Hub if configured
             if self._stage_config.push_to_hub and self._stage_config.hub_repo_id:
                 self._push_to_hub(save_path, ds_name, stats)
 
@@ -917,7 +907,6 @@ class SaveStage(BaseStage):
             api = HfApi(token=self._stage_config.hub_token)
             repo_id = self._stage_config.hub_repo_id
 
-            # Create repo if needed
             api.create_repo(
                 repo_id=repo_id,
                 repo_type="dataset",
@@ -925,7 +914,6 @@ class SaveStage(BaseStage):
                 exist_ok=True,
             )
 
-            # Upload files
             if stats.output_paths is None:
                 logger.warning("No output paths to upload")
                 return

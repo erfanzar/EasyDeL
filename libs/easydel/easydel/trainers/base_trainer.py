@@ -660,7 +660,6 @@ class BaseTrainer(BaseTrainerProtocol):
 
             self.data_collator = _auto_data_collator
 
-        # Convert datasets to ShardedDataSource for unified internal handling
         self._train_source = self._to_sharded_source(dataset_train)
         self._eval_source = self._to_sharded_source(dataset_eval)
 
@@ -723,7 +722,6 @@ class BaseTrainer(BaseTrainerProtocol):
                     f"pose.only_buckets {out_of_range} out of range for {len(self._buckets)} configured bucket(s)."
                 )
 
-        # Apply trainer-specific preprocessing transform if available
         self._apply_preprocess_transforms()
 
         self._initialize_attributes()
@@ -1315,7 +1313,6 @@ class BaseTrainer(BaseTrainerProtocol):
             if mask.ndim == 1:
                 mask = mask[None, :]
 
-        # Get pad_token_id if not provided
         if pop_pad_tokens and pad_token_id is None:
             pad_token_id = (
                 getattr(processor, "pad_token_id", None)
@@ -2817,12 +2814,10 @@ class BaseTrainer(BaseTrainerProtocol):
             collated = {}
             for key in batch[0].keys():
                 values = [example.get(key) for example in batch]
-                # Skip None values
                 if any(v is None for v in values):
                     continue
                 try:
                     arrays = [np.asarray(v) for v in values]
-                    # Check if arrays have same shape
                     if all(arr.shape == arrays[0].shape for arr in arrays):
                         collated[key] = _normalize_batch_array(np.stack(arrays))
                     else:
@@ -3454,7 +3449,6 @@ class BaseTrainer(BaseTrainerProtocol):
             )
         has_model_kwargs = bool(compact_generation_model_kwargs(normalized_model_kwargs))
 
-        # Determine whether to use eSurge
         if use_esurge is None:
             use_esurge = args.use_esurge_generation
         if has_model_kwargs and prompts is not None and input_ids is None:
@@ -3583,10 +3577,8 @@ class BaseTrainer(BaseTrainerProtocol):
         Returns:
             _EsurgeGenerationArrays: The reconstructed arrays and record lists.
         """
-        # Build padded token arrays from eSurge outputs to ensure consistent shapes
         max_total_len = max_seq_len + max_new_tokens
 
-        # Track prompt arrays once per request
         prompt_id_rows: list[list[int]] = []
         prompt_mask_rows: list[list[int]] = []
         sequence_rows: list[list[int]] = []
@@ -3628,7 +3620,6 @@ class BaseTrainer(BaseTrainerProtocol):
 
         # When n>1, each RequestOutput has multiple CompletionOutput objects
         for output_idx, output in enumerate(outputs):
-            # Flatten and truncate prompt tokens
             flattened_prompt_tokens: list[int] = []
             if output.prompt_token_ids:
                 for segment in output.prompt_token_ids:
@@ -4015,7 +4006,6 @@ class BaseTrainer(BaseTrainerProtocol):
                 encoded_ids.append(ids)
                 encoded_masks.append(mask)
 
-            # Restore original padding side
             if hasattr(processor, "padding_side") and original_padding_side is not None:
                 processor.padding_side = original_padding_side
 
@@ -4035,7 +4025,6 @@ class BaseTrainer(BaseTrainerProtocol):
             all_gather=all_gather,
             **generate_kwargs,
         )
-        # Extract completion tokens from sequences
         max_new_tokens = sampling_params.max_tokens
         prompt_len = prompt_ids.shape[1]
         completion_ids = sequences[:, prompt_len : prompt_len + max_new_tokens]
@@ -5888,7 +5877,6 @@ class BaseTrainer(BaseTrainerProtocol):
                 if len(batch) >= batch_size:
                     yield batch
                     batch = []
-            # Handle remainder
             if batch and not drop_remainder:
                 yield batch
             skip_examples = 0
@@ -6055,7 +6043,6 @@ class BaseTrainer(BaseTrainerProtocol):
         import tensorflow as tf  # type: ignore
 
         try:
-            # Disable all GPUS
             tf.config.set_visible_devices([], "GPU")
             visible_devices = tf.config.get_visible_devices()
             for device in visible_devices:
@@ -6527,13 +6514,11 @@ class BaseTrainer(BaseTrainerProtocol):
         if not save_dir.exists():
             return
 
-        # Find all checkpoint directories with metadata
         checkpoint_dirs = []
         for path in save_dir.glob("run-*"):
             if path.is_dir() and (path / "metadata.json").exists():
                 try:
                     metadata = read_checkpoint_metadata(str(path))
-                    # Only consider permanent checkpoints
                     if not metadata.get("is_temporary", False):
                         checkpoint_dirs.append(path)
                 except Exception:
@@ -7233,7 +7218,6 @@ class BaseTrainer(BaseTrainerProtocol):
         Notes:
             Logs model size, parameter count, and training configuration.
         """
-        # Calculate and log model size
         model_size = self.count_model_parameters(state.graphstate)
         config_metrics = {
             "Number of Model Parameters (Billion)": model_size,
@@ -7285,7 +7269,6 @@ class BaseTrainer(BaseTrainerProtocol):
             except StopIteration as exc:
                 raise RuntimeError("Dataloader is empty and cannot provide batches.") from exc
 
-        # Remove specified ids from batch if needed
         for id_to_pop in self.arguments.ids_to_pop_from_dataset or []:
             _ = batch.pop(id_to_pop, None)
 
@@ -7491,7 +7474,6 @@ class BaseTrainer(BaseTrainerProtocol):
                 for k, v in metrics.items()
                 if not (k.startswith("train/grad_norm") or k.startswith("eval/grad_norm"))
             }
-            # Update progress bar
             pbar.set_postfix(**display_metrics)
             update_size = 0 if step == 0 else self.arguments.log_steps
             pbar.update(update_size)

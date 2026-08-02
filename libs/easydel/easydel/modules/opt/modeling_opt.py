@@ -427,7 +427,6 @@ class OPTDecoderLayer(spx.Module):
         if self.do_layer_norm_before:
             hidden_states = self.self_attn_layer_norm(hidden_states)
 
-        # Self Attention
         attn_outputs = self.self_attn(
             hidden_states=hidden_states,
             mask_info=mask_info,
@@ -447,7 +446,6 @@ class OPTDecoderLayer(spx.Module):
         if not self.do_layer_norm_before:
             hidden_states = self.self_attn_layer_norm(hidden_states)
 
-        # Fully Connected
         hidden_states_shape = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
         residual = hidden_states
@@ -569,11 +567,9 @@ class OPTLearnedPositionalEmbedding(spx.Module):
         Returns:
             Positional embeddings [batch, seq_len, features]
         """
-        # Add offset to inputs and lookup embeddings
         indices = inputs + self.offset
         # Use take for embedding lookup, matching Embed behavior
         embedded = jnp.take(self.weight.value, indices, axis=0)
-        # Cast to output dtype if needed
         if self.dtype != self.param_dtype:
             embedded = embedded.astype(self.dtype)
         return embedded
@@ -1137,7 +1133,6 @@ class OPTForCausalLM(BaseCausalLMModule[OPTModel, OPTConfig]):  # type: ignore
                 - attention_mask: Extended attention mask of shape (batch_size, max_length)
                 - position_ids: Position indices for the input tokens
         """
-        # initializing the cache
         batch_size, seq_length = input_ids.shape
 
         if starts is None:

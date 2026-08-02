@@ -991,7 +991,6 @@ class RaggedPagesCacheView(BaseCacheView):
         mesh = resolve_stage_cache_mesh(mesh)
         runtime_sharding_resolver = coerce_runtime_sharding_resolver(runtime_sharding_resolver, mesh=mesh)
 
-        # Allocate KV pages
         kv_pages_shape, axes = config.get_shape_and_axes()
         kv_pages_sharding = runtime_sharding_resolver.resolve(
             axes=axes, mode=common_types.MODE_PREFILL, shape=kv_pages_shape
@@ -1046,7 +1045,6 @@ class RaggedPagesCacheView(BaseCacheView):
         Returns:
             RaggedPagesCacheView: Updated cache view with new KV pairs.
         """
-        # Unwrap OperationsMetadata to RaggedPagesMetadata if needed
         cache_metadata = unwrap_metadata(cache_metadata, "ragged")
 
         if self.metadata.is_v2:

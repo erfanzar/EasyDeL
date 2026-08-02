@@ -178,7 +178,6 @@ class BaseThinkingReasoningParser(ReasoningParser):
                 return reasoning or None, None
             return None, model_output
 
-        # Split at start token
         before_start, after_start = model_output.split(self.start_token, 1)
 
         if self.end_token not in after_start:

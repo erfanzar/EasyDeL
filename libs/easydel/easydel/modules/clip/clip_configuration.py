@@ -397,14 +397,12 @@ class CLIPConfig(EasyDeLBaseConfig):
                         )
                     logger.info(message)
 
-            # Update all values in `text_config` with the ones in `_text_config_dict`.
             text_config.update(_text_config_dict)
 
         if vision_config_dict is not None:
             if vision_config is None:
                 vision_config = {}
 
-            # This is the complete result when using `vision_config_dict`.
             _vision_config_dict = CLIPVisionConfig(**vision_config_dict).to_dict()
             # convert keys to string instead of integer
             if "id2label" in _vision_config_dict:
@@ -415,7 +413,6 @@ class CLIPConfig(EasyDeLBaseConfig):
             # Give a warning if the values exist in both `_vision_config_dict` and `vision_config` but being different.
             for key, value in _vision_config_dict.items():
                 if key in vision_config and value != vision_config[key] and key not in ["transformers_version"]:
-                    # If specified in `vision_config_dict`
                     if key in vision_config_dict:
                         message = (
                             f"`{key}` is found in both `vision_config_dict` and `vision_config` but with different "
@@ -429,7 +426,6 @@ class CLIPConfig(EasyDeLBaseConfig):
                         )
                     logger.info(message)
 
-            # Update all values in `vision_config` with the ones in `_vision_config_dict`.
             vision_config.update(_vision_config_dict)
 
         if text_config is None:

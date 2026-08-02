@@ -314,16 +314,13 @@ class AutoRegressiveDecodeAttn(OperationImpl):
         # Create sharding for cache metadata (batch dimension only)
         views_sharding: Ps = Ps(shardings.query[0])
 
-        # Reshape cache metadata for processing
         starts_2d = cache_metadata.starts.reshape(-1, 1)
         indexes_2d = cache_metadata.indexes.reshape(-1, 1)
 
-        # Extract last query token and flatten cache metadata
         query_squeezed: Float[Array, "batch num_q_heads head_dim"] = query[:, -1, :, :]
         starts_flat = starts_2d.reshape(-1)
         indexes_flat = indexes_2d.reshape(-1)
 
-        # Create sharding specs for all inputs
         query_sharding: Ps | None = self.create_stable_sharding(
             shardings.query3d,
             dep=query_squeezed,

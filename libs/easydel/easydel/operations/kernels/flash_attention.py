@@ -287,7 +287,6 @@ class FlashAttn(OperationImpl):
         is_decode_mode = model_mode == common_types.MODE_DECODE
         causal_computed: bool = causal if not is_decode_mode else False
 
-        # Cast tensors to runtime dtype
         query: Float[Array, "batch seq_len_q num_heads head_dim"] = query.astype(dtype)
         key: Float[Array, "batch seq_len_k num_kv_heads head_dim"] = key.astype(dtype)
         value: Float[Array, "batch seq_len_k num_kv_heads head_dim"] = value.astype(dtype)
@@ -295,7 +294,6 @@ class FlashAttn(OperationImpl):
             bias.astype(dtype) if bias is not None else None
         )
 
-        # Create sharding specs
         query_sharding = self.create_stable_sharding(
             shardings.query,
             tensor=query,
@@ -536,7 +534,6 @@ class FlashAttn(OperationImpl):
 if __name__ == "__main__":
     from easydel.infra import EasyDeLBaseConfig
 
-    # Test cace when qkv might refer to mla
     b, qs, ks, qh, kh, d, vd = 4, 1024, 1024, 32, 32, 128, 128
     query = jr.normal(jr.key(0), (b, qs, qh, d), "f4")
     key = jr.normal(jr.key(1), (b, ks, kh, d), "f4")

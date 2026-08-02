@@ -820,7 +820,6 @@ class ExecutionManager:
         """
         if model is not None:
             self.model = model
-            # Keep sub-executors in sync with the active model reference.
             self._model_executor.model = model
             self._sampler_executor.model = model
             if graphdef is None or graphstate is None or graphother is None:
@@ -868,7 +867,6 @@ class ExecutionManager:
         if self.graphstate is not None and self.graphother is not None:
             self._model_executor.set_runtime_graph_args(self.graphstate, self.graphother)
 
-        # Clear cached baselines so future diagnostics re-hash with new weights.
         self._debug_baselines.clear()
 
     def execute(
@@ -1997,7 +1995,6 @@ class ExecutionManager:
             shardings exactly to avoid recompilation.
         """
 
-        # Create temporary buffer to generate dummy inputs
         temp_buffer = SequenceBuffer(
             max_num_reqs=max_num_reqs,
             max_model_len=self.max_model_len,
@@ -2052,7 +2049,6 @@ class ExecutionManager:
                         numpy.zeros((int(num_tokens), hidden_size), dtype=numpy.float16) for _ in range(deepstack_layers)
                     ]
 
-        # Get page table as CPU array
         page_table_cpu_dummy = temp_buffer.page_table[0].page_table_cpu
 
         (

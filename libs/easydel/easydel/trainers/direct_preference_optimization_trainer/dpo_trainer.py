@@ -151,7 +151,6 @@ class DPOTrainer(Trainer):
         self._apply_pad_token_override(processing_class, arguments.pad_token)
         self.padding_free = self._resolve_padding_free(arguments)
 
-        # Determine padding value
         if arguments.padding_value is not None:
             self.padding_value = arguments.padding_value
         else:
@@ -168,7 +167,6 @@ class DPOTrainer(Trainer):
                 )
         arguments.padding_value = self.padding_value
 
-        # Setup data collators
         self.input_data_collator_tfds = (
             DataCollatorForPreferenceTFDS(
                 max_prompt_length=arguments.max_prompt_length,

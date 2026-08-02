@@ -900,7 +900,6 @@ class Scheduler(SchedulerInterface):
             req_id_to_dp_rank=output_req_id_to_dp_rank,
         )
         self._update_after_schedule(scheduler_output)
-        # Log scheduler metrics
         schedule_time = time.time() - schedule_start_time
         metrics_collector = get_metrics_collector()
         if metrics_collector:
@@ -913,7 +912,6 @@ class Scheduler(SchedulerInterface):
                 schedule_time=schedule_time,
             )
 
-            # Log cache metrics
             cache_manager = self.kv_cache_manager
             total_pages = cache_manager.num_pages
             used_pages = total_pages - cache_manager.page_pool.get_num_free_pages()

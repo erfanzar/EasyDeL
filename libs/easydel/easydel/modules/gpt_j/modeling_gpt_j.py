@@ -297,10 +297,8 @@ class GPTJAttention(UnifiedAttention):
             precision: JAX precision setting for matrix operations.
             rngs: Random number generators.
         """
-        # Call parent to create standard Q/K/V/O projections
         super().define_network(config, dtype, param_dtype, precision, rngs)
 
-        # GPT-J has residual dropout
         self.resid_dropout = nn.Dropout(rate=config.resid_pdrop, rngs=rngs)
 
     def _split_heads(self, hidden_states):

@@ -526,7 +526,6 @@ class BatchedMultiModalInputs:
                     request_to_video_indices[feat.request_idx] = []
                 request_to_video_indices[feat.request_idx].append(idx)
 
-        # Concatenate image data
         pixel_values = None
         image_grid_thw = None
         if image_features:
@@ -537,7 +536,6 @@ class BatchedMultiModalInputs:
             if grid_list:
                 image_grid_thw = np.concatenate(grid_list, axis=0)
 
-        # Concatenate video data
         pixel_values_videos = None
         video_grid_thw = None
         if video_features:

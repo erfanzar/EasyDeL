@@ -147,7 +147,6 @@ class LazyModule(ModuleType):
                         self._class_to_module[value] = key
                     _import_structure.setdefault(key, []).extend(values)
 
-                # Needed for autocompletion in an IDE
                 self.__all__.extend(list(module.keys()) + list(chain(*module.values())))
 
             self.__file__ = module_file
@@ -164,7 +163,6 @@ class LazyModule(ModuleType):
             for key, values in import_structure.items():
                 for value in values:
                     self._class_to_module[value] = key
-            # Needed for autocompletion in an IDE
             self.__all__ = list[BACKENDS_T](import_structure.keys()) + list[Any](chain(*import_structure.values()))
             self.__file__ = module_file
             self.__spec__ = module_spec

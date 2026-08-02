@@ -258,7 +258,6 @@ class ZmqLeaderCoordinator:
             except queue.Empty:
                 break
 
-    # setup
     def start(self) -> None:
         """Bind, then block until every worker has helloed and readied.
 
@@ -286,7 +285,6 @@ class ZmqLeaderCoordinator:
             raise StepCoordinationError(self._hello_error)
         logger.info("eSurge coordinator: %d worker(s) ready.", self.world_size - 1)
 
-    # request plane
     def set_plane_handler(
         self, handler: typing.Callable[[bytes, wire.WireMessage, bytes | None], None] | None
     ) -> None:
@@ -311,7 +309,6 @@ class ZmqLeaderCoordinator:
         """Resolve a request-plane client's ZMQ identity, if connected."""
         return self._client_identities.get(client_id)
 
-    # step plane
     def _want_digest(self, step_id: int) -> bool:
         interval = self._verify_digest_interval
         return interval > 0 and step_id % interval == 0
@@ -387,7 +384,6 @@ class ZmqLeaderCoordinator:
         self._io_thread.join(timeout=5.0)
         self._io_thread = None
 
-    # IO thread
     def _handle_hello(self, sock, identity: bytes, message: wire.Hello, worker_identities: dict, authed: set) -> None:
         """Validate a Hello and register the peer (worker or plane client)."""
         if message.auth != self._auth_token:

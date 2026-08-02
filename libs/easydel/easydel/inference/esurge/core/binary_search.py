@@ -140,7 +140,6 @@ def apply_float32_bsearch(batch_shape, predicate):
         x = _monotonic_int32_to_float32_bit_pattern(x)
         is_finite = (x & exponent_bits) != exponent_bits
 
-        # Handle non-finite values at int32 extremes
         predicate_on_nonfinite = x >= 0
         x_float32 = lax.bitcast_convert_type(x, jnp.float32)
         return jnp.where(is_finite, predicate(x_float32), predicate_on_nonfinite)

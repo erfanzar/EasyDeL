@@ -1095,13 +1095,11 @@ class InternVLModel(EasyDeLBaseModule):
         if (height * scale_factor) % 1 != 0 or (width * scale_factor) % 1 != 0:
             raise ValueError("Height and width must be divisible by scale_factor for proper downsampling.")
 
-        # Reshape to allow downsampling
         vision_features = vision_features.reshape(
             batch_size, width, int(height * scale_factor), int(channels / scale_factor)
         )
         # Permute dimensions to align downsampled axis correctly
         vision_features = jnp.transpose(vision_features, (0, 2, 1, 3))
-        # Reshape to achieve final downsampled dimensions
         vision_features = vision_features.reshape(
             batch_size, int(height * scale_factor), int(width * scale_factor), int(channels / (scale_factor**2))
         )
@@ -1435,11 +1433,9 @@ class InternVLForConditionalGeneration(BaseVisionLanguageModule[InternVLModel, I
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-            # VLM-specific configuration
             vision_feature_layer=config.vision_feature_layer,
             vision_feature_select_strategy=getattr(config, "vision_feature_select_strategy", "default"),
             image_token_index=config.image_token_id,
-            # LM head configuration
             tie_word_embeddings=getattr(config, "tie_word_embeddings", False),
             lm_head_bias=False,
         )

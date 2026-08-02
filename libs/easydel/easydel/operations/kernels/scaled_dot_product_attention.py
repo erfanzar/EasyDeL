@@ -225,7 +225,6 @@ class ScaledDotProductAttn(OperationImpl):
 
         shardings = self.metadata.get_shardings(model_mode, layout="bthd")
 
-        # Initialize bias if needed
         needs_bias_init: bool = mask_info is None and bias is None and init_bias is not None
         bias_computed: Float[Array, "batch num_heads seq_len kv_len"] | None
         if needs_bias_init:
@@ -233,7 +232,6 @@ class ScaledDotProductAttn(OperationImpl):
         else:
             bias_computed = bias
 
-        # Cast tensors to runtime dtype
         query: Float[Array, "batch seq_len num_q_heads head_dim"] = query.astype(dtype)
         key: Float[Array, "batch kv_len num_kv_heads head_dim"] = key.astype(dtype)
         value: Float[Array, "batch kv_len num_kv_heads head_dim"] = value.astype(dtype)
@@ -241,7 +239,6 @@ class ScaledDotProductAttn(OperationImpl):
             bias_computed.astype(dtype) if bias_computed is not None else None
         )
 
-        # Create sharding specs
         query_sharding = self.create_stable_sharding(shardings.query, [0, 2], dep=query)
         key_sharding = self.create_stable_sharding(shardings.key, [0, 2], dep=key)
         value_sharding = self.create_stable_sharding(shardings.value, [0, 2], dep=value)
@@ -410,7 +407,6 @@ class ScaledDotProductAttn(OperationImpl):
 if __name__ == "__main__":
     from easydel.infra import EasyDeLBaseConfig
 
-    # Test cace when qkv might refer to mla
     b, qs, ks, qh, kh, d, vd = 1, 1024, 1024, 32, 8, 128, 128
     query = jr.normal(jr.key(0), (b, qs, qh, d), "f2")
     key = jr.normal(jr.key(1), (b, ks, kh, d), "f2")

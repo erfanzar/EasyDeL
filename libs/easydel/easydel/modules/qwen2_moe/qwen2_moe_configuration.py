@@ -192,7 +192,6 @@ class Qwen2MoeConfig(EasyDeLBaseConfig):
         self.rope_theta = rope_theta
         self.attention_dropout = attention_dropout
 
-        # MoE arguments
         self.decoder_sparse_step = decoder_sparse_step
         self.moe_intermediate_size = moe_intermediate_size
         self.shared_expert_intermediate_size = shared_expert_intermediate_size

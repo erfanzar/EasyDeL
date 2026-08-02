@@ -748,7 +748,6 @@ def health_check(ray_address: str, tpu_type: str | None = None) -> list[dict]:
             report["local_device_count"] = 0
         return report
 
-    # Run on all nodes
     refs = [check_host.remote()]
     nodes = ray.nodes()
     alive = [n for n in nodes if n.get("Alive")]

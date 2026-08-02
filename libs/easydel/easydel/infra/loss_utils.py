@@ -924,7 +924,6 @@ def auxiliary_load_balancing_loss_func(
     # If gate_logits is a tuple or list, concatenate them.
     # Assumes individual layer logits are already on the correct device.
     if isinstance(gate_logits, (tuple, list)):
-        # Ensure all logits are JAX arrays before concatenation
         gate_logits_list = [jnp.asarray(layer_gate.reshape(-1, num_experts)) for layer_gate in gate_logits]
         concatenated_gate_logits = jnp.concatenate(gate_logits_list, axis=0)
     elif isinstance(gate_logits, jnp.ndarray):
@@ -1256,7 +1255,6 @@ def fixed_cross_entropy(
             total_loss = total_loss / loss_normalizing_factor
             total_z_loss = total_z_loss / loss_normalizing_factor
 
-        # Optional post-normalization
         if num_items_in_batch is not None:
             loss = total_loss / num_items_in_batch
         elif config.divide_weight_sum:

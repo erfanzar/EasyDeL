@@ -482,13 +482,11 @@ class Gemma4ToolParser(ToolParser):
         prev_start_count = previous_text.count(TOOL_CALL_START)
         prev_end_count = previous_text.count(TOOL_CALL_END)
 
-        # Not inside any tool call
         if start_count == end_count and prev_end_count == end_count and TOOL_CALL_END not in delta_text:
             if delta_text:
                 return DeltaMessage(content=delta_text)
             return None
 
-        # Starting a new tool call
         if start_count > prev_start_count and start_count > end_count:
             self.current_tool_id += 1
             self.current_tool_name_sent = False
@@ -501,7 +499,6 @@ class Gemma4ToolParser(ToolParser):
         if end_count > prev_end_count:
             return self._handle_tool_call_end(current_text)
 
-        # In the middle of a tool call
         if start_count > end_count:
             return self._handle_tool_call_middle(current_text)
 

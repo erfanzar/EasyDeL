@@ -156,11 +156,9 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: spx.Rngs,
-        # Feature flags
         tie_word_embeddings: bool = False,
         logit_cap: float | None = None,
         router_aux_loss_coef: float | None = None,
-        # LM head configuration
         lm_head_name: str = "lm_head",
         lm_head_bias: bool = False,
         lm_head_kernel_init: Callable | None = None,
@@ -237,7 +235,6 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
                     router_aux_loss_coef=0.001,
                 )
         """
-        # Initialize base with features
         super().__init__(
             config=config,
             base_model=base_model,
@@ -254,7 +251,6 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
             head_kernel_init=lm_head_kernel_init,
         )
 
-        # Store LM head name for dynamic access
         self._lm_head_name = lm_head_name
 
         # Create LM head with optional gradient checkpointing.
@@ -421,7 +417,6 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
         if apply_lm_head:
             lm_logits = self.compute_lm_logits(self.prepare_lm_head_inputs(outputs.last_hidden_state))
 
-        # Compute router auxiliary loss if configured
         aux_loss = self.compute_router_aux_loss(outputs)
 
         # Return MoeCausalLMOutput for MoE models, CausalLMOutput otherwise
@@ -523,11 +518,9 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
             Auxiliary loss computation is automatically skipped during inference
             modes (decode, prefill, insert) as it's only needed for training.
         """
-        # Set default for output_router_logits
         if output_router_logits is None:
             output_router_logits = getattr(self.config, "output_router_logits", False)
 
-        # Forward through base model
         outputs = self.base_model(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
@@ -678,7 +671,6 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
         """
         return getattr(self, self._lm_head_name)
 
-    # Convenience alias
     def get_lm_head(self):
         """Alias for get_task_head for backwards compatibility.
 

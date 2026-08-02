@@ -181,7 +181,6 @@ class ORPOConfig(TrainingArguments):
             self.generation_interval = self.generation_interval or self.evaluation_steps or 1
             self.use_esurge_generation = True
 
-        # Call the post_init of the parent class if it exists.
         if hasattr(super(), "__post_init__"):
             super().__post_init__(
                 max_sequence_length=None,

@@ -298,7 +298,6 @@ def create_constant_length_dataset(
         while more_examples:
             buffer, buffer_len = [], 0
 
-            # Fill the buffer
             while True:
                 if buffer_len >= max_buffer_size:
                     break
@@ -322,7 +321,6 @@ def create_constant_length_dataset(
             if shuffle:
                 random.shuffle(buffer)
 
-            # Tokenize all texts in the buffer
             tokens = processing_class(
                 text=buffer,
                 add_special_tokens=add_special_tokens,
@@ -340,7 +338,6 @@ def create_constant_length_dataset(
                 all_token_ids.extend(tokenized_input)
                 all_attention_masks.extend(attention_mask)
 
-            # Create fixed-length examples
             examples = []
             examples_attention_masks = []
             for i in range(0, len(all_token_ids), seq_length):
@@ -356,7 +353,6 @@ def create_constant_length_dataset(
                 random.shuffle(combined)
                 examples, examples_attention_masks = zip(*combined, strict=False)
 
-            # Yield examples
             for example, example_attention_mask in zip(examples, examples_attention_masks, strict=False):
                 yield {
                     "input_ids": jnp.asarray(example, dtype="i4"),
@@ -1194,7 +1190,6 @@ class DataCollatorForPreferenceTFDS:
             ref_chosen_logps = jnp.array([feature[ref_chosen_key] for feature in features])
             ref_rejected_logps = jnp.array([feature[ref_rejected_key] for feature in features])
 
-        # Pad sequences
         output = {
             "prompt_input_ids": pad(
                 prompt_input_ids,
@@ -1359,7 +1354,6 @@ class DataCollatorForPreferenceGrain:
             ref_chosen_logps = np.array(features[ref_chosen_key])
             ref_rejected_logps = np.array(features[ref_rejected_key])
 
-        # Pad sequences
         output = {
             "prompt_input_ids": pad_single(
                 prompt_input_ids,
@@ -1395,7 +1389,6 @@ class DataCollatorForPreferenceGrain:
             ),
         }
 
-        # Add optional outputs
         if pixel_values is not None:
             output["pixel_values"] = pad_single(pixel_values, prompt_pad_length, padding_value=0.0)
         if pixel_attention_mask is not None:

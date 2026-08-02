@@ -100,7 +100,6 @@ def partial_kl_distillation_loss(
         axis=-1,
     )  # [B, L, V]
 
-    # Gather student log-probs at teacher's top-k indices
     student_logprobs_at_k = jnp.take_along_axis(
         student_log_probs,
         teacher_top_k_indices,

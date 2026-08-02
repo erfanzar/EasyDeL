@@ -753,7 +753,6 @@ class MiniMaxM3VLIndexer(spx.Module):
         # Future/empty blocks keep their -inf score; tag them -1 (dropped).
         topk_indices = jnp.where(topk_scores == -jnp.inf, -1, topk_indices)
 
-        # Scatter the kept blocks to 0; -1 slots land in a throwaway column.
         safe = jnp.where(topk_indices < 0, num_key_blocks, topk_indices)
         block_bias = jnp.full((batch, self.num_heads, seq_len, num_key_blocks + 1), -jnp.inf, dtype=jnp.float32)
         block_bias = jnp.put_along_axis(block_bias, safe, 0.0, axis=-1, inplace=False)

@@ -590,7 +590,6 @@ def define_flags_with_default(
     for name, value in kwargs.items():
         default_values[name] = value
 
-        # Custom type handling:
         if isinstance(value, tuple):
             # For tuples, use a custom action to convert the string to a tuple of ints
             parser.add_argument(
@@ -601,7 +600,6 @@ def define_flags_with_default(
                 action=StoreTupleAction,
             )
         else:
-            # For other types, infer type from default value
             parser.add_argument(f"--{name}", type=type(value), default=value, help=f"Value for {name}")
 
     args = parser.parse_args()

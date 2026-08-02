@@ -672,7 +672,6 @@ class eSurge:
         self._kv_cache_valid = True
         self._paused = False
 
-        # Detokenizer cleanup tracking
         self._failed_detokenizer_resets: set[str] = set()
         self._detokenizer_cleanup_threshold = 100  # Clean up after this many failures
 
@@ -733,7 +732,6 @@ class eSurge:
         elif max_num_batched_tokens is NOT_GIVEN:
             max_num_batched_tokens = None
 
-        # Profiling state
         self._profiling_active = False
         self._profiling_steps_remaining = 0
         self._profiling_output_dir: str | None = None
@@ -810,7 +808,6 @@ class eSurge:
 
         self.extra_eos_token_ids = self.parsing_config.extra_eos_token_ids or []
         self.extra_stops = normalize_stop_sequences(self.parsing_config.extra_stops)
-        # Locks and signals
         self._scheduler_lock = threading.RLock()
 
         # Scheduler thread crash state
@@ -1739,7 +1736,6 @@ class eSurge:
                 if rid != parent_request_id:
                     self._request_events.pop(rid, None)
 
-            # Update output state
             ro = self._request_outputs.get(parent_request_id)
             ro_present = ro is not None
             n_samples = len(ro.outputs) if ro is not None else 0
@@ -1770,18 +1766,14 @@ class eSurge:
         for rid in detokenizer_reset_ids:
             try:
                 self._detokenizer_client.reset(rid)
-                # Remove from failed set if it was there
                 self._failed_detokenizer_resets.discard(rid)
             except Exception:
                 logger.debug("Failed to reset detokenizer state for %s", rid, exc_info=True)
-                # Track failed reset
                 self._failed_detokenizer_resets.add(rid)
 
-        # Trigger cleanup if threshold reached
         if len(self._failed_detokenizer_resets) >= self._detokenizer_cleanup_threshold:
             self._cleanup_detokenizer_state()
 
-        # Notify waiters
         if ev:
             ev.set()
         self._output_event.set()
@@ -1845,7 +1837,6 @@ class eSurge:
                 # Still failing, keep in set
                 pass
 
-        # Remove successfully reset requests
         self._failed_detokenizer_resets -= successfully_reset
 
         if successfully_reset:
@@ -2385,7 +2376,6 @@ class eSurge:
 
             self._start_engine_output_worker()
 
-            # Clear any previous crash state before starting a fresh scheduler thread.
             self._scheduler_exception = None
             self._scheduler_exception_tb = None
             self._scheduler_heartbeat = None
@@ -3689,7 +3679,6 @@ class eSurge:
         pixel_values, image_grid_thw = self._multimodal_manager.process_images(images)
         pixel_values_videos, video_grid_thw = self._multimodal_manager.process_videos(videos)
 
-        # Create mm_features for caching and batching support
         mm_features = []
         if images:
             mm_features.extend(self._multimodal_manager.process_images_to_features(images))
@@ -3723,7 +3712,6 @@ class eSurge:
             tool_choice=tool_choice,
         )
 
-        # Add request with vision data
         self._add_request(
             request_id=request_id,
             prompt=prompt,

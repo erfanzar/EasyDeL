@@ -281,7 +281,6 @@ class SequenceStateSync:
                 # Resumed requests may provide a full replacement page table.
                 self.sequence_buffer.page_table.add_row(new_page_ids, req_index)
             else:
-                # Running requests report only incremental page allocations.
                 if any(len(ids) for ids in new_page_ids):
                     batched_page_rows.append((req_index, new_page_ids))
 
@@ -376,7 +375,6 @@ class SequenceStateSync:
                 self.slot_pool.assign_slot(req_id, target_shard)
             self.sequence_buffer.add_request(req_state, reuse_index)
 
-        # 7) Condense to remove holes
         if removed_pool and not use_dp_local_rows:
             self.sequence_buffer.condense(sorted(removed_pool))
 
@@ -424,13 +422,11 @@ class SequenceStateSync:
                     continue
                 valid_sampled_token_ids.append(np.array([int(next_tokens_cpu[row_pos])], dtype=np.int32))
 
-        # Apply tokens to sequence buffer
         for pre_req_idx, _, req_state, placeholder_idx in pre_request_seq_lens:
             sampled_ids = valid_sampled_token_ids[pre_req_idx]
             if len(sampled_ids) == 0:
                 continue
 
-            # Check if request is still active
             req_id = req_state.req_id
             if req_id not in self.sequence_buffer.req_id_to_index or req_id not in self.requests:
                 continue
@@ -445,7 +441,6 @@ class SequenceStateSync:
                 raise ValueError(f"Token position {start_idx} exceeds max_model_len {self.max_model_len}")
 
             self.sequence_buffer.token_ids[req_idx, start_idx:end_idx] = sampled_ids
-            # Replace placeholder in output_token_ids
             req_state.output_token_ids[-1] = int(sampled_ids[-1])
 
     @staticmethod

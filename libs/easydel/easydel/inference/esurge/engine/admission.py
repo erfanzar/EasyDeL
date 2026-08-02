@@ -586,7 +586,6 @@ class RequestAdmission:
                 max_model_len,
             )
 
-        # Keep prompt *and* reserve safety margin when capping new tokens.
         allowed_new_if_keep_prompt = max(0, max_model_len - prompt_len - self.reserve_tokens)
 
         if requested_new > allowed_new_if_keep_prompt:
@@ -704,7 +703,6 @@ class RequestAdmission:
         # Handle n > 1 sampling: create multiple EngineRequest objects
         n_samples = getattr(sampling_params, "n", 1) or 1
 
-        # Create n CompletionOutput objects for the RequestOutput
         completion_outputs = [CompletionOutput(index=i, text="", token_ids=[]) for i in range(n_samples)]
 
         with self._output_lock:
@@ -727,7 +725,6 @@ class RequestAdmission:
                 delta_seq=0,
             )
 
-        # Prepare EOS token IDs from engine-normalized EOS set
         eos_token_ids = [int(tid) for tid in (self._eos_ids or []) if tid is not None]
 
         if not eos_token_ids:
@@ -750,7 +747,6 @@ class RequestAdmission:
                     sampling_params.stop_token_ids.append(eos_id)
                     all_stop_ids.add(eos_id)
 
-        # Create n EngineRequest objects for parallel sampling
         mm_features_cache_key_only = None
         if mm_features and n_samples > 1:
             mm_features_cache_key_only = []
@@ -772,11 +768,9 @@ class RequestAdmission:
         scheduler_requests: list[EngineRequest] = []
         for sample_idx in range(n_samples):
             if n_samples == 1:
-                # For n=1, use the original request_id
                 child_request_id = request_id
                 parent_id = None
             else:
-                # For n>1, create child request IDs
                 child_request_id = f"{request_id}-{sample_idx}"
                 parent_id = request_id
 

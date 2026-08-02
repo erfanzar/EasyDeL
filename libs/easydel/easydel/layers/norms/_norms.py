@@ -186,7 +186,6 @@ def _compute_stats(x, axes, dtype, axis_name, axis_index_groups, use_fast_varian
     """
     axes = _canonicalize_axes(x.ndim, axes)
     if mask is not None:
-        # Masked mean/variance
         mask = jnp.expand_dims(mask, axis=tuple(range(x.ndim - mask.ndim)))
         denom = jnp.sum(mask, axis=axes, keepdims=True)
         mean = jnp.sum(x * mask, axis=axes, keepdims=True, dtype=dtype) / jnp.maximum(denom, 1.0)
@@ -719,7 +718,6 @@ class BatchNorm(spx.Module):
                 use_fast_variance=self.use_fast_variance,
                 mask=mask,
             )
-            # stop_gradient only for spx_array_ref
             if self.mean._can_update or self.var._can_update:
                 stop_gradient = jax.lax.stop_gradient
             else:

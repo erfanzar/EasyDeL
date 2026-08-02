@@ -388,7 +388,6 @@ class BaseInferenceApiServer(ABC):
             swagger_ui_init_oauth=swagger_ui_init_oauth,
         )
 
-        # Add security schemes to OpenAPI schema if auth UI is enabled
         if enable_auth_ui:
             self.app.openapi_schema = None  # Reset to regenerate
             self._configure_openapi_security()
@@ -467,7 +466,6 @@ class BaseInferenceApiServer(ABC):
                 routes=self.app.routes,
             )
 
-            # Define security schemes
             openapi_schema["components"]["securitySchemes"] = {
                 "BearerAuth": {
                     "type": "http",

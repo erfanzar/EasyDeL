@@ -182,7 +182,6 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
     All methods marked with @abstractmethod must be implemented by subclasses.
     """
 
-    # Required attributes for all trainers
     arguments: TrainingArguments
     dataset_train: Dataset | None
     dataset_eval: Dataset | None

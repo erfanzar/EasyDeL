@@ -219,14 +219,12 @@ class VisionEncoderFeature:
                 axis=-1,
             )
 
-        # Apply selection strategy
         if select_strategy == "default":
             # Skip CLS token (first token)
             return selected_feature[:, 1:]
         elif select_strategy == "full":
             return selected_feature
         elif select_strategy == "pooled":
-            # Return only CLS token
             return selected_feature[:, 0:1]
         else:
             raise ValueError(f"Unknown selection strategy: {select_strategy}")
@@ -411,7 +409,6 @@ class MultiModalMergeFeature:
             if len(placeholder_token_id) == 1:
                 placeholder_token_id = placeholder_token_id[0]
 
-        # Create mask for multimodal positions
         if isinstance(placeholder_token_id, list):
             placeholder_token_id = jnp.array(placeholder_token_id)
             is_multimodal = jnp.isin(input_ids, placeholder_token_id)
@@ -453,11 +450,9 @@ class MultiModalMergeFeature:
         dummy_row = jnp.zeros_like(multimodal_embeddings[0:1])
         flattened_padded = jnp.concatenate([dummy_row, multimodal_embeddings], axis=0)
 
-        # Use cumsum to create gather indices
         gather_indices = jnp.cumsum(is_multimodal)
         update_values = flattened_padded[gather_indices]
 
-        # Conditionally replace embeddings
         condition = jnp.expand_dims(is_multimodal, axis=-1)
         return jnp.where(condition, update_values, inputs_embeds)
 

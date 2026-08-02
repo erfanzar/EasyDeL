@@ -236,14 +236,12 @@ class InferenceApiRouter:
         self.metrics = ServerMetrics()
         self.base_url = str(base_url) if base_url else None
 
-        # Create FastAPI app
         self.app = FastAPI(
             title="EasyDeL Inference API Hub",
             description="High-performance inference server with OpenAI API compatibility",
             version="2.0.0",
         )
 
-        # Register all endpoints
         self._register_endpoints()
         if enable_function_calling:
             self._add_function_calling_endpoints()
@@ -575,7 +573,6 @@ class InferenceApiRouter:
         request_id = getattr(request, "request_id", None)
 
         try:
-            # Update metrics
             self.metrics.total_requests += 1
 
             openai_params = self.build_oai_params_from_chat_request(request)
@@ -661,7 +658,6 @@ class InferenceApiRouter:
         request_id = getattr(request, "request_id", None)
 
         try:
-            # Update metrics
             self.metrics.total_requests += 1
 
             openai_params = self.build_oai_params_from_request(request)
@@ -870,7 +866,6 @@ class InferenceApiRouter:
                     "parent": None,
                 }
 
-                # Add metadata if we're connected to a custom backend
                 if self.base_url:
                     model_info["metadata"] = {
                         "supports_chat": True,  # Assume true for now
@@ -920,7 +915,6 @@ class InferenceApiRouter:
                 "parent": None,
             }
 
-            # Add metadata
             if self.base_url:
                 model_info["metadata"] = {
                     "supports_chat": True,
@@ -968,7 +962,6 @@ class InferenceApiRouter:
                 # Backend doesn't support tools endpoint
                 pass
 
-        # Return default tools structure
         return JSONResponse(
             {
                 "models": {},

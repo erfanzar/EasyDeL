@@ -727,7 +727,6 @@ def list_tpus(project, zone, as_json):
     """
     _validate_gcloud()
 
-    # Auto-detect project
     if not project:
         project = detect_project()
         if not project:
@@ -756,7 +755,6 @@ def list_tpus(project, zone, as_json):
         info(f"No TPUs found in {scope}")
         return
 
-    # Format output as a table
     click.echo()
     header = f"  {'NAME':<30s} {'TYPE':<12s} {'STATE':<12s} {'HOSTS':>5s}  {'ZONE'}"
     click.echo(header)

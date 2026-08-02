@@ -151,10 +151,8 @@ class BaseSequenceClassificationModule(BaseTaskModule[ModelT, ConfigT]):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: spx.Rngs,
-        # Feature flags
         pooling_strategy: str = "last",
         router_aux_loss_coef: float | None = None,
-        # Classification head configuration
         score_head_name: str = "score",
         score_head_bias: bool = False,
         score_head_kernel_init: Callable | None = None,
@@ -217,7 +215,6 @@ class BaseSequenceClassificationModule(BaseTaskModule[ModelT, ConfigT]):
                     score_head_bias=True,
                 )
         """
-        # Validate config has num_labels
         assert hasattr(config, "num_labels"), (
             "in order to use `SequenceClassification` Models in `EasyDeL` "
             "you first need to attach `num_labels` to model `config`"
@@ -230,7 +227,6 @@ class BaseSequenceClassificationModule(BaseTaskModule[ModelT, ConfigT]):
         if classifier_kernel_init is not None:
             score_head_kernel_init = classifier_kernel_init
 
-        # Initialize base with features
         super().__init__(
             config=config,
             base_model=base_model,
@@ -246,10 +242,8 @@ class BaseSequenceClassificationModule(BaseTaskModule[ModelT, ConfigT]):
             head_kernel_init=score_head_kernel_init,
         )
 
-        # Store score head name for dynamic access
         self._score_head_name = score_head_name
 
-        # Create classification head with optional gradient checkpointing
         score_head_block = ColumnParallelLinear
 
         if self._gradient_checkpointing_feature.should_checkpoint():
@@ -258,7 +252,6 @@ class BaseSequenceClassificationModule(BaseTaskModule[ModelT, ConfigT]):
                 **self._gradient_checkpointing_feature.get_config(),
             )
 
-        # Create classification head with custom attribute name
         score_head = score_head_block(
             config.hidden_size,
             config.num_labels,
@@ -345,7 +338,6 @@ class BaseSequenceClassificationModule(BaseTaskModule[ModelT, ConfigT]):
                 )
                 # outputs.hidden_states is a tuple of arrays
         """
-        # Forward through base model
         outputs = self.base_model(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
@@ -361,24 +353,19 @@ class BaseSequenceClassificationModule(BaseTaskModule[ModelT, ConfigT]):
 
         hidden_states = outputs.last_hidden_state
 
-        # Apply classification head to all positions
         score_head = getattr(self, self._score_head_name)
         logits = score_head(hidden_states)
 
-        # Determine batch size
         if input_ids is not None:
             batch_size = input_ids.shape[0]
         else:
             batch_size = inputs_embeds.shape[0]
 
-        # Validate batch size requirements
         if self.config.pad_token_id is None and attention_mask is None and batch_size != 1:
             raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
 
-        # Pool logits to get sequence-level predictions
         pooled_logits = self.pool_sequence(logits, input_ids=input_ids, attention_mask=attention_mask)
 
-        # Compute router auxiliary loss if configured
         aux_loss = self.compute_router_aux_loss(outputs)
 
         return SequenceClassifierOutput(

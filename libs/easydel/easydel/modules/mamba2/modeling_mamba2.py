@@ -560,7 +560,6 @@ class Mamba2Mixer(spx.Module):
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        # Prepare dt with bias and clipping
         dt = dt.astype(jnp.float32)
         dt = jax.nn.softplus(dt + self.dt_bias.value.astype(jnp.float32))
         dt = jnp.clip(dt, self.time_step_limit[0], self.time_step_limit[1])
@@ -570,7 +569,6 @@ class Mamba2Mixer(spx.Module):
         else:
             ssm_state0 = None
 
-        # Call SSM2Op
         ssm_output = self.ssm_op(
             x=x,  # [batch, seq_len, num_heads, head_dim]
             A=self.A_log.value,  # [num_heads] in log form

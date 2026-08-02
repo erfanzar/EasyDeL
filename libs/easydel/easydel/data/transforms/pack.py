@@ -229,7 +229,6 @@ class GreedyPacker:
         if extra_field_separator_values:
             self.extra_field_separator_values.update(extra_field_separator_values)
 
-        # Current buffer
         self._buffer: list[int] = []
         self._segment_ids: list[int] = []
         self._extra_buffers: dict[str, list[int]] = {key: [] for key in self.extra_field_pad_values}
@@ -276,7 +275,6 @@ class GreedyPacker:
 
         aligned_extra_fields = self._normalize_extra_fields(tokens, extra_fields)
 
-        # Add tokens to buffer
         for index, tok in enumerate(tokens):
             self._buffer.append(tok)
             if self.include_segment_ids:
@@ -284,11 +282,9 @@ class GreedyPacker:
             for field_name, values in aligned_extra_fields.items():
                 self._extra_buffers[field_name].append(values[index])
 
-            # Check if we have a full sequence
             if len(self._buffer) >= self.seq_length:
                 results.append(self._flush())
 
-        # Add EOS and update segment
         if len(self._buffer) > 0:
             self._buffer.append(self.eos_token_id)
             self._stats.total_eos_separators += 1
@@ -300,7 +296,6 @@ class GreedyPacker:
             if source_id:
                 self._source_ids.append(source_id)
 
-        # Check if we hit the target length
         if len(self._buffer) >= self.seq_length:
             results.append(self._flush())
 
@@ -338,7 +333,6 @@ class GreedyPacker:
             num_segments=self._current_segment,
         )
 
-        # Keep remainder
         self._buffer = self._buffer[self.seq_length :]
         if self.include_segment_ids:
             self._segment_ids = self._segment_ids[self.seq_length :]
@@ -366,7 +360,6 @@ class GreedyPacker:
         if not self._buffer:
             return None
 
-        # Pad to seq_length
         pad_len = self.seq_length - len(self._buffer)
         input_ids = np.array(self._buffer + [self.pad_token_id] * pad_len, dtype=np.int32)
 
@@ -514,7 +507,6 @@ class PoolPacker:
                 best_fit = remaining_after
                 best_idx = i
 
-        # Add to best packer
         return self._packers[best_idx].add(tokens, source_id, extra_fields)
 
     def flush_all(self) -> list[PackedSequence]:
@@ -670,10 +662,8 @@ class FirstFitPacker:
             token_len = len(tokens) + int(append_eos)
             placed = False
 
-            # Find first bin that fits
             for _i, (bin_tokens, bin_segments, bin_sources, bin_extra_fields) in enumerate(bins):
                 if len(bin_tokens) + token_len <= self.seq_length:
-                    # Add to this bin
                     segment_id = max(bin_segments) + 1 if bin_segments else 0
                     bin_tokens.extend(tokens)
                     if append_eos:
@@ -690,7 +680,6 @@ class FirstFitPacker:
                     break
 
             if not placed:
-                # Create new bin
                 new_tokens = [*tokens]
                 if append_eos:
                     new_tokens.append(self.eos_token_id)
@@ -705,10 +694,8 @@ class FirstFitPacker:
                     new_extra_fields[field_name] = field_values
                 bins.append((new_tokens, new_segments, new_sources, new_extra_fields))
 
-        # Convert bins to PackedSequences
         results = []
         for bin_tokens, bin_segments, bin_sources, bin_extra_fields in bins:
-            # Pad if needed
             pad_len = self.seq_length - len(bin_tokens)
             input_ids = np.array(bin_tokens + [self.pad_token_id] * pad_len, dtype=np.int32)
 
@@ -1009,7 +996,6 @@ class PackedShardedSource(ShardedDataSource[dict]):
             padded_check_seen = 0
             padded_check_full = 0
 
-            # Iterate through source
             for source_shard in self._source.shard_names:
                 for example in self._source.open_shard(source_shard):
                     tokens = example.get(self._input_field, [])
@@ -1041,7 +1027,6 @@ class PackedShardedSource(ShardedDataSource[dict]):
                     self._seq_length,
                 )
 
-            # Flush packer
             if isinstance(packer, (PoolPacker, FirstFitPacker)):
                 for packed in packer.flush_all():
                     out = emit(packed)
@@ -1054,7 +1039,6 @@ class PackedShardedSource(ShardedDataSource[dict]):
                     if out is not None:
                         yield out
 
-            # Emit remaining shuffle buffer
             if self._shuffle:
                 rng.shuffle(shuffle_buffer)
                 yield from shuffle_buffer

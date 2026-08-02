@@ -226,7 +226,6 @@ class GRPOPreprocessTransform(Transform):
         Returns:
             Preprocessed example with input_ids and attention_mask.
         """
-        # Skip if already tokenized
         if "input_ids" in example:
             return example
 
@@ -267,7 +266,6 @@ class GRPOPreprocessTransform(Transform):
         # Strict field access - will raise KeyError if prompt is missing
         prompt = result["prompt"]
 
-        # Apply chat template if conversational format
         if isinstance(prompt, list) and not self._skip_apply_chat_template:
             prompt = self._tokenizer.apply_chat_template(
                 prompt,
@@ -299,7 +297,6 @@ class GRPOPreprocessTransform(Transform):
 
         target_length = self._resolve_prompt_pad_length(len(input_ids))
 
-        # Apply left padding manually if tokenizer doesn't support it
         if target_length is not None and len(input_ids) < target_length:
             pad_len = target_length - len(input_ids)
             input_ids = [self._pad_token_id] * pad_len + input_ids
@@ -415,7 +412,6 @@ class KTOPreprocessTransform(Transform):
         Raises:
             KeyError: If required fields (prompt, completion, label) are missing.
         """
-        # Skip if already tokenized
         if "prompt_input_ids" in example:
             return example
 
@@ -436,14 +432,12 @@ class KTOPreprocessTransform(Transform):
         prompt_ids = self._tokenizer(prompt, add_special_tokens=False)["input_ids"]
         completion_ids = self._tokenizer(completion, add_special_tokens=False)["input_ids"]
 
-        # Add BOS to prompt if requested
         bos_token_id = self._tokenizer.bos_token_id
         eos_token_id = self._tokenizer.eos_token_id
 
         if self._add_special_tokens and bos_token_id is not None:
             prompt_ids = [bos_token_id, *prompt_ids]
 
-        # Add EOS to completion
         if eos_token_id is not None:
             completion_ids = [*completion_ids, eos_token_id]
 
@@ -455,7 +449,6 @@ class KTOPreprocessTransform(Transform):
         if self._max_completion_length is not None:
             completion_ids = completion_ids[: self._max_completion_length]
 
-        # Build full sequence: prompt + completion
         full_ids = prompt_ids + completion_ids
         prompt_len = len(prompt_ids)
 
@@ -466,7 +459,6 @@ class KTOPreprocessTransform(Transform):
         prompt_mask = [1] * len(prompt_ids)
         full_mask = [1] * len(full_ids)
 
-        # Set outputs
         result["prompt_input_ids"] = prompt_ids
         result["prompt_attention_mask"] = prompt_mask
         result["completion_input_ids"] = full_ids
@@ -474,7 +466,6 @@ class KTOPreprocessTransform(Transform):
         result["completion_labels"] = full_labels
         result["label"] = bool(label)
 
-        # Add embedding tokens for BCO UDM if embedding tokenizer is provided
         if self._embedding_tokenizer is not None:
             emb_tokenized = self._embedding_tokenizer(
                 prompt,
@@ -484,7 +475,6 @@ class KTOPreprocessTransform(Transform):
             result["embedding_input_ids"] = emb_tokenized["input_ids"]
             result["embedding_attention_mask"] = emb_tokenized["attention_mask"]
 
-        # Remove non-tokenized fields
         return purify_example(result)
 
     def __repr__(self) -> str:
@@ -583,14 +573,12 @@ class BCOPreprocessTransform(ExpandTransform):
         Raises:
             KeyError: If required fields are missing from the example.
         """
-        # Skip if already tokenized
         if "prompt_input_ids" in example:
             yield example
             return
 
         # Check if already unpaired (has prompt/completion/label)
         if "completion" in example and "label" in example:
-            # Already unpaired - just tokenize and yield single example
             yield self._tokenize_unpaired(example)
             return
 
@@ -599,7 +587,6 @@ class BCOPreprocessTransform(ExpandTransform):
         # Step 1: Convert from/value format to role/content if needed (ShareGPT → ChatML)
         example = maybe_convert_to_chatml(example)
 
-        # Step 2: Extract prompt from chosen/rejected if needed
         example = extract_prompt_from_preference(example)
 
         # Step 3: Apply chat template if conversational (uses maybe_apply_chat_template)
@@ -668,14 +655,12 @@ class BCOPreprocessTransform(ExpandTransform):
         prompt_ids = self._tokenizer(prompt, add_special_tokens=False)["input_ids"]
         completion_ids = self._tokenizer(completion, add_special_tokens=False)["input_ids"]
 
-        # Add BOS to prompt if requested
         bos_token_id = self._tokenizer.bos_token_id
         eos_token_id = self._tokenizer.eos_token_id
 
         if self._add_special_tokens and bos_token_id is not None:
             prompt_ids = [bos_token_id, *prompt_ids]
 
-        # Add EOS to completion
         if eos_token_id is not None:
             completion_ids = [*completion_ids, eos_token_id]
 
@@ -687,7 +672,6 @@ class BCOPreprocessTransform(ExpandTransform):
         if self._max_completion_length is not None:
             completion_ids = completion_ids[: self._max_completion_length]
 
-        # Build full sequence: prompt + completion
         full_ids = prompt_ids + completion_ids
         prompt_len = len(prompt_ids)
 
@@ -698,7 +682,6 @@ class BCOPreprocessTransform(ExpandTransform):
         prompt_mask = [1] * len(prompt_ids)
         full_mask = [1] * len(full_ids)
 
-        # Set outputs
         result["prompt_input_ids"] = prompt_ids
         result["prompt_attention_mask"] = prompt_mask
         result["completion_input_ids"] = full_ids
@@ -706,7 +689,6 @@ class BCOPreprocessTransform(ExpandTransform):
         result["completion_labels"] = full_labels
         result["label"] = bool(label)
 
-        # Add embedding tokens for BCO UDM if embedding tokenizer is provided
         if self._embedding_tokenizer is not None:
             emb_tokenized = self._embedding_tokenizer(
                 prompt,
@@ -716,7 +698,6 @@ class BCOPreprocessTransform(ExpandTransform):
             result["embedding_input_ids"] = emb_tokenized["input_ids"]
             result["embedding_attention_mask"] = emb_tokenized["attention_mask"]
 
-        # Remove non-tokenized fields
         return purify_example(result)
 
     def __repr__(self) -> str:
@@ -795,24 +776,20 @@ class DPOPreprocessTransform(Transform):
             Preprocessed example with prompt_input_ids, chosen_input_ids,
             rejected_input_ids.
         """
-        # Skip if already tokenized
         if "prompt_input_ids" in example:
             return example
 
         # Step 1: Convert from/value format to role/content if needed (ShareGPT → ChatML)
         example = maybe_convert_to_chatml(example)
 
-        # Step 2: Extract prompt if needed
         result = extract_prompt_from_preference(example)
 
-        # Step 3: Apply chat template if conversational
         result = maybe_apply_chat_template(
             result,
             self._tokenizer,
             resolve_example_tools(result, self._tools),
         )
 
-        # Step 4: Tokenize
         return self._tokenize(result)
 
     def _tokenize(self, example: dict) -> dict:
@@ -835,16 +812,13 @@ class DPOPreprocessTransform(Transform):
         chosen = example["chosen"]
         rejected = example["rejected"]
 
-        # Tokenize each part separately
         prompt_ids = self._tokenizer(prompt, add_special_tokens=False)["input_ids"]
         chosen_completion_ids = self._tokenizer(chosen, add_special_tokens=False)["input_ids"]
         rejected_completion_ids = self._tokenizer(rejected, add_special_tokens=False)["input_ids"]
 
-        # Add BOS to prompt if requested
         if self._add_special_tokens and self._tokenizer.bos_token_id is not None:
             prompt_ids = [self._tokenizer.bos_token_id, *prompt_ids]
 
-        # Add EOS to completions
         if self._tokenizer.eos_token_id is not None:
             chosen_completion_ids = [*chosen_completion_ids, self._tokenizer.eos_token_id]
             rejected_completion_ids = [*rejected_completion_ids, self._tokenizer.eos_token_id]
@@ -858,7 +832,6 @@ class DPOPreprocessTransform(Transform):
             chosen_completion_ids = chosen_completion_ids[: self._max_completion_length]
             rejected_completion_ids = rejected_completion_ids[: self._max_completion_length]
 
-        # Build full sequences: prompt + completion
         chosen_full_ids = prompt_ids + chosen_completion_ids
         rejected_full_ids = prompt_ids + rejected_completion_ids
 
@@ -867,7 +840,6 @@ class DPOPreprocessTransform(Transform):
         chosen_labels = [self._label_pad_token_id] * prompt_len + chosen_completion_ids
         rejected_labels = [self._label_pad_token_id] * prompt_len + rejected_completion_ids
 
-        # Pad to max lengths
         max_seq_length = (self._max_prompt_length or 0) + (self._max_completion_length or 0)
 
         def _pad_sequence(seq, max_len, pad_value):
@@ -885,10 +857,8 @@ class DPOPreprocessTransform(Transform):
                 return seq + [pad_value] * (max_len - len(seq))
             return seq
 
-        # Pad prompt
         prompt_max = self._max_prompt_length
         if prompt_max:
-            # Left-pad prompt
             if len(prompt_ids) < prompt_max:
                 pad_len = prompt_max - len(prompt_ids)
                 prompt_ids = [self._pad_token_id] * pad_len + prompt_ids
@@ -913,7 +883,6 @@ class DPOPreprocessTransform(Transform):
             chosen_attention_mask = [1] * len(chosen_full_ids)
             rejected_attention_mask = [1] * len(rejected_full_ids)
 
-        # Set all outputs
         result["prompt_input_ids"] = prompt_ids
         result["prompt_attention_mask"] = prompt_attention_mask
         result["chosen_input_ids"] = chosen_full_ids
@@ -923,7 +892,6 @@ class DPOPreprocessTransform(Transform):
         result["rejected_attention_mask"] = rejected_attention_mask
         result["rejected_labels"] = rejected_labels
 
-        # Remove non-tokenized fields
         return purify_example(result)
 
     def __repr__(self) -> str:
@@ -1003,7 +971,6 @@ class RewardPreprocessTransform(Transform):
         Raises:
             KeyError: If required fields (chosen, rejected) are missing.
         """
-        # Skip if already tokenized
         if "input_ids_chosen" in example:
             return example
 
@@ -1031,7 +998,6 @@ class RewardPreprocessTransform(Transform):
             chosen = prompt + chosen
             rejected = prompt + rejected
 
-        # Tokenize both
         chosen_tokens = self._tokenizer(
             chosen,
             truncation=self._truncation,
@@ -1054,7 +1020,6 @@ class RewardPreprocessTransform(Transform):
         result["input_ids_rejected"] = rejected_tokens["input_ids"]
         result["attention_mask_rejected"] = rejected_tokens["attention_mask"]
 
-        # Remove non-tokenized fields
         return purify_example(result)
 
     def __repr__(self) -> str:
@@ -1188,13 +1153,11 @@ class SFTPreprocessTransform(Transform):
         Returns:
             Preprocessed example with input_ids, attention_mask, etc.
         """
-        # Skip if already tokenized
         if "input_ids" in example:
             return example
 
         result = dict(example)
 
-        # Step 0: Apply formatting function if provided
         if self._formatting_func is not None:
             formatted = self._formatting_func(example)
             if isinstance(formatted, str):
@@ -1209,7 +1172,6 @@ class SFTPreprocessTransform(Transform):
         # Step 1: Normalize conversational payloads (ChatML / stringified JSON / tools)
         result = maybe_convert_to_chatml(result)
 
-        # Step 2: Handle conversational format
         raw_messages = result.get(self._messages_field)
         if raw_messages is None and self._messages_field != "messages":
             raw_messages = result.get("messages")
@@ -1226,15 +1188,12 @@ class SFTPreprocessTransform(Transform):
         if messages:
             return self._tokenize_conversational(result, messages)
 
-        # Step 3: Handle prompt/completion format
         if "prompt" in result and "completion" in result:
             return self._tokenize_prompt_completion(result)
 
-        # Step 4: Handle plain text format
         if self._text_field in result:
             return self._tokenize_text(result)
 
-        # No recognized format, return as-is
         return result
 
     def map_batch(self, examples: list[Example]) -> list[Example]:
@@ -1469,7 +1428,6 @@ class SFTPreprocessTransform(Transform):
         if normalized_messages:
             messages = normalized_messages
 
-        # Handle tools if present
         tools = resolve_example_tools(result)
 
         try:
@@ -1509,7 +1467,6 @@ class SFTPreprocessTransform(Transform):
             result["input_ids"] = tokens["input_ids"]
             result["attention_mask"] = tokens["attention_mask"]
 
-        # Remove non-tokenized fields
         result = self._pad_row_to_multiple(result)
         return purify_example(result)
 
@@ -1531,7 +1488,6 @@ class SFTPreprocessTransform(Transform):
             role = msg.get("role", "user")
             content = msg.get("content", "")
 
-            # Handle tool calls in assistant messages
             if role == "assistant" and "tool_calls" in msg:
                 tool_calls = msg.get("tool_calls", [])
                 if tool_calls:
@@ -1542,7 +1498,6 @@ class SFTPreprocessTransform(Transform):
                         else f"<tool_calls>{tool_str}</tool_calls>"
                     )
 
-            # Handle tool response messages
             if role == "tool":
                 tool_name = msg.get("name", "tool")
                 content = f'<tool_response name="{tool_name}">{content}</tool_response>'
@@ -1564,7 +1519,6 @@ class SFTPreprocessTransform(Transform):
         prompt = result["prompt"]
         completion = result["completion"]
 
-        # Add EOS to completion if needed
         if self._add_eos and not completion.endswith(self._tokenizer.eos_token):
             completion = completion + self._tokenizer.eos_token
 
@@ -1593,17 +1547,14 @@ class SFTPreprocessTransform(Transform):
         result["input_ids"] = tokens["input_ids"]
         result["attention_mask"] = tokens["attention_mask"]
 
-        # Create completion mask if needed
         if self._mask_prompt:
             prompt_len = min(len(prompt_ids), len(tokens["input_ids"]))
             seq_len = len(tokens["input_ids"])
             # Mask: 0 for prompt tokens, 1 for completion tokens, 0 for padding
             completion_mask = [0] * prompt_len + [1] * (seq_len - prompt_len)
-            # Apply attention mask to zero out padding positions
             completion_mask = [m * a for m, a in zip(completion_mask, tokens["attention_mask"], strict=True)]
             result["completion_mask"] = completion_mask
 
-        # Remove non-tokenized fields
         result = self._pad_row_to_multiple(result)
         return purify_example(result)
 
@@ -1613,7 +1564,6 @@ class SFTPreprocessTransform(Transform):
 
         text = example[self._text_field]
 
-        # Add EOS if needed
         if self._add_eos and not text.endswith(self._tokenizer.eos_token):
             text = text + self._tokenizer.eos_token
 
@@ -1630,7 +1580,6 @@ class SFTPreprocessTransform(Transform):
         result["input_ids"] = tokens["input_ids"]
         result["attention_mask"] = tokens["attention_mask"]
 
-        # Remove non-tokenized fields
         result = self._pad_row_to_multiple(result)
         return purify_example(result)
 

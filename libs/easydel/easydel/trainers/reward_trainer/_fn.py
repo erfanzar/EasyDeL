@@ -135,7 +135,6 @@ def training_step(
     """
     scope_root = "easydel/trainer/reward/train_step"
     with jax.named_scope(scope_root + "/prepare_batch"):
-        # Determine batch size, minibatch size, and enforce partition spec.
         _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
             batch=batch,
             gradient_accumulation_steps=gradient_accumulation_steps,
@@ -204,7 +203,6 @@ def training_step(
             return loss, metrics
 
     with jax.named_scope(scope_root + "/grad_and_minibatch"):
-        # Compute gradients and metrics across minibatches.
         gradients, metrics = minibatch_call(
             state=state,
             batch=batch,
@@ -212,7 +210,6 @@ def training_step(
             grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
         )
     with jax.named_scope(scope_root + "/update_state"):
-        # Update state using the computed gradients and updated metrics.
         state = update_state_respectfully(
             state=state,
             gradients=gradients,
@@ -377,7 +374,6 @@ def evaluation_step(
         """
 
         with jax.named_scope(eval_scope + "/loss_fn"):
-            # Merge the state with the provided tree update.
             with jax.named_scope(eval_scope + "/loss_fn/merge_state"):
                 module = state.merge(tree)
 

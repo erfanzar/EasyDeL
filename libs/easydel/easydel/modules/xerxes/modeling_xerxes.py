@@ -242,7 +242,6 @@ class XerxesAttention(UnifiedAttention):
             is_cross_attention (bool, optional): Whether this is cross-attention. Defaults to False.
             rngs (spx.Rngs): Random number generator state.
         """
-        # Set sliding window BEFORE super().__init__()
         self.is_local_attn = False
         sliding_window = None
         if not config.xe_kvnorm:

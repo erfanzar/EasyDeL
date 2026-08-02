@@ -102,7 +102,6 @@ PrecisionLike = lax.PrecisionLike
 Shape = collections.abc.Sequence[int]
 AxisNames = str | collections.abc.Sequence[str] | tuple[str, ...]
 
-# Default initializers
 default_kernel_init = jax.nn.initializers.lecun_normal()
 default_bias_init = jax.nn.initializers.zeros
 

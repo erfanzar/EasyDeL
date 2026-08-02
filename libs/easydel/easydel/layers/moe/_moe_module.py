@@ -2815,7 +2815,6 @@ class BaseMoeModule(spx.Module, ABC):
             num_experts_per_tok=self.num_experts_per_tok,
         )
 
-        # Detailed logging for debugging
         if layer_idx is not None:
             # Get top-k logits (before softmax) for comparison
             top_k_logits_pre, _ = jax.lax.top_k(prein_gate_logits, self.num_experts_per_tok)
@@ -2860,7 +2859,6 @@ class BaseMoeModule(spx.Module, ABC):
 
         output = jnp.sum(out_unflat * selected_weights[..., None], axis=1).reshape(batch_size, seq_len, hidden_size)
 
-        # Log expert output
         if layer_idx is not None:
             jax.debug.print("  [ED Experts L{}] output[0,:5]: {}", layer_idx, output.reshape(-1, hidden_size)[0, :5])
 

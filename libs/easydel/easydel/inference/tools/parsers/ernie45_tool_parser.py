@@ -264,7 +264,6 @@ class Ernie45ToolParser(ToolParser):
             ):
                 cur_text = cur_text.strip("\n")
 
-            # handle <response> </response> when tool_call is not triggered
             content = cur_text
             if self.response_start_token_id is not None and self.response_start_token_id in delta_token_ids:
                 content = content.lstrip("\n")
@@ -277,7 +276,6 @@ class Ernie45ToolParser(ToolParser):
                 response_end_idx = content.rfind(self.response_end_token)
                 content = content[:response_end_idx]
 
-            # remove \\n after </think> or <response> or </response>
             if (
                 len(previous_token_ids) > 0
                 and previous_token_ids[-1] in self.parser_token_ids
@@ -331,7 +329,6 @@ class Ernie45ToolParser(ToolParser):
             self._buffer = cur_text[end_idx + len(self.tool_call_end_token) :]
             return delta
 
-        # Keep buffering from the tool call start
         self._buffer = cur_text[start_idx:]
         content = cur_text[:start_idx].rstrip("\n")
         return DeltaMessage(content=content if content else None)

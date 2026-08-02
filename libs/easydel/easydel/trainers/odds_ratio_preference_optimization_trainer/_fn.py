@@ -137,7 +137,6 @@ def concatenated_forward(
 
     len_chosen = batch["chosen_labels"].shape[0]
 
-    # Prepare model keyword arguments for encoder-decoder architectures.
     model_kwargs = (
         {
             "labels": concatenated_batch["concatenated_labels"],
@@ -152,7 +151,6 @@ def concatenated_forward(
         if lmhead_chunksize is not None:
             model_kwargs["apply_lm_head"] = False
 
-    # Forward pass through the model.
     call_kwargs = {
         "input_ids": concatenated_batch["concatenated_input_ids"],
         "attention_mask": concatenated_batch["concatenated_attention_mask"],
@@ -240,7 +238,6 @@ def concatenated_forward(
         ) / jnp.maximum(jnp.sum(valid.astype(jnp.float32)), 1.0)
         return loss, accuracy
 
-    # Set labels for computing loss.
     if is_encoder_decoder:
         labels = effective_labels
     else:
@@ -287,13 +284,11 @@ def concatenated_forward(
     else:
         if all_logits is None:
             raise TypeError(f"{type(model).__name__} did not return logits.")
-        # Compute negative log likelihood loss and accuracy for the chosen examples.
         chosen_nll_loss, chosen_accuracy = cross_entropy_loss(
             all_logits[:len_chosen],
             labels[:len_chosen],
         )
 
-        # Compute log probabilities for the entire batch.
         all_log_probs = get_batch_logps(
             all_logits,
             effective_labels,
@@ -303,7 +298,6 @@ def concatenated_forward(
             logprob_vocab_chunk_size=logprob_vocab_chunk_size,
         )
 
-        # Split log probabilities and logit summaries into chosen and rejected.
         chosen_log_probs = all_log_probs[:len_chosen]
         rejected_log_probs = all_log_probs[len_chosen:]
         all_logit_summaries = get_batch_mean_logit_summaries(
@@ -369,7 +363,6 @@ def get_batch_logps(
         labels = labels[:, 1:]
         logits = logits[:, :-1, :]
 
-    # Create a mask to ignore the padded tokens.
     loss_mask = labels != label_pad_token_id
     # Replace pad token indices in labels with 0 (since they are masked out later).
     labels = jnp.expand_dims(jnp.where(labels == label_pad_token_id, 0, labels), -1)
@@ -380,7 +373,6 @@ def get_batch_logps(
         chunk_size=logprob_vocab_chunk_size,
     )
 
-    # Return averaged or summed log probabilities based on the flag.
     if average_log_prob:
         return (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1)
     else:
@@ -471,12 +463,10 @@ def concatenated_inputs(
     """
     concatenated_batch = {}
 
-    # Process chosen examples.
     for k in batch:
         if k.startswith("chosen") and isinstance(batch[k], jax.Array):
             concatenated_key = k.replace("chosen", "concatenated")
             concatenated_batch[concatenated_key] = batch[k]
-    # Process rejected examples and concatenate with chosen examples.
     for k in batch:
         if k.startswith("rejected") and isinstance(batch[k], jax.Array):
             concatenated_key = k.replace("rejected", "concatenated")
@@ -600,7 +590,6 @@ def orpo_step(
             gradient_accumulation_steps=gradient_accumulation_steps if mode == "train" else 1,
         )
 
-        # Apply sharding constraints to the batch.
         batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
     def calculate_loss(tree: spx.State, batch: dict):
@@ -673,7 +662,6 @@ def orpo_step(
 
     if mode == "train":
         with jax.named_scope(scope_root + "/grad_and_minibatch"):
-            # Compute gradients and metrics via minibatch processing.
             gradients, metrics = minibatch_call(
                 state=state,
                 batch=batch,
@@ -690,7 +678,6 @@ def orpo_step(
                 step=state.step,
                 gradients=gradients,
             )
-            # Update model state with computed gradients.
             state = update_state_respectfully(
                 state=state,
                 gradients=gradients,

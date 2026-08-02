@@ -192,7 +192,6 @@ class CachedRequestState:
         self.image_grid_thw = None
         self.pixel_values_videos = None
         self.video_grid_thw = None
-        # Clear pixel values from features but preserve cached embeddings
         for feat in self.mm_features:
             if hasattr(feat, "clear_pixel_values"):
                 feat.clear_pixel_values()

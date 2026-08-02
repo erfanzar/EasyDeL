@@ -1558,7 +1558,6 @@ class BatchMetadataPreparer:
         scheduled_full_dev = self._scheduled_full_placeholder_dev
         active_mask_full_dev = self._active_mask_full_placeholder_dev
 
-        # Update `pages_tables` cache when async prep is used.
         pt_ver = transfer_meta.get("page_table_version")
         rows_to_copy = transfer_meta.get("rows_to_copy")
         if pt_ver is not None and rows_to_copy is not None:

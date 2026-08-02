@@ -1095,10 +1095,8 @@ def materialize_base_config(cfg: eLMConfig, prefer: tp.Literal["base", "sections
     if kv_quant is not None:
         kv_quant = QuantizationConfig(**kv_quant)
 
-    # KV cache quantization config
     set_maybe("kv_cache_quantization_config", kv_quant)
 
-    # model layer quantization config
     set_maybe("quantization_config", quant.get("model"))
     set_maybe("use_qmm_best_config", quant.get("use_qmm_best_config"))
     set_maybe("qmm_platform_override", quant.get("qmm_platform_override"))

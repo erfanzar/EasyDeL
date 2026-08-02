@@ -397,7 +397,6 @@ class SeqKDTrainer(Trainer):
             expanded_prompt_ids = prompt_ids.repeat(generation_factor, 0) if generation_factor > 1 else prompt_ids
             expanded_prompt_mask = prompt_mask.repeat(generation_factor, 0) if generation_factor > 1 else prompt_mask
 
-            # Concatenate prompt + completion into full sequences
             input_ids_full = jnp.concatenate([expanded_prompt_ids, completion_ids], axis=1)
             attention_mask_full = jnp.concatenate([expanded_prompt_mask, completion_mask], axis=1)
 

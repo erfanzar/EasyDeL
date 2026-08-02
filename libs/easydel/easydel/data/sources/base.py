@@ -861,7 +861,6 @@ class ParquetShardedSource(ShardedDataSource[dict]):
                     skip_in_rg = row - rg_starts[rg_idx]
                     break
 
-            # Iterate from the target row group
             for rg_idx in range(start_rg, pf.num_row_groups):
                 start_i = skip_in_rg if rg_idx == start_rg else 0
                 base = rg_starts[rg_idx]
@@ -1593,7 +1592,6 @@ def create_source(config: "DatasetConfig") -> ShardedDataSource:
     source_type = config.type
     storage_options = None  # Could be added to DatasetConfig
 
-    # Check if it's a HuggingFace dataset
     if source_type in ("huggingface", "hf"):
         if isinstance(data_files, str) and not _is_pathlike(data_files):
             return HuggingFaceShardedSource(
@@ -1602,11 +1600,9 @@ def create_source(config: "DatasetConfig") -> ShardedDataSource:
                 subset=config.dataset_split_name,
             )
 
-    # Expand files and detect format
     try:
         files = expand_data_files(data_files)
     except FileNotFoundError:
-        # Might be a HuggingFace dataset
         if isinstance(data_files, str):
             return HuggingFaceShardedSource(
                 dataset_name=data_files,
@@ -1629,7 +1625,6 @@ def create_source(config: "DatasetConfig") -> ShardedDataSource:
     else:
         fmt = _detect_format(files)
 
-    # Create appropriate source
     if fmt == "parquet":
         return ParquetShardedSource(files, storage_options)
     elif fmt == "json":
@@ -1754,7 +1749,6 @@ def load_for_inform(inform, mixture):
         )
         return _apply_num_rows_limit(dataset)
 
-    # File-based loading
     builder, files = _detect_builder_and_files(df)
     specified_builder = t if t in {"json", "jsonl", "csv", "parquet", "arrow"} else None
     builder = specified_builder or builder

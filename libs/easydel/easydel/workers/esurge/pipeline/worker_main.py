@@ -206,7 +206,6 @@ class FastIncrementalDecoder:
         )
 
         if decoded_context and not decoded_candidate.startswith(decoded_context):
-            # Fall back to no-context decode if prefix alignment fails.
             decoded_context = ""
             decoded_candidate = self._decode(
                 buffered + fresh,

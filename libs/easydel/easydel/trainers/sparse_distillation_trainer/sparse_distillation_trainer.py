@@ -494,7 +494,6 @@ class SparseDistillationTrainer(Trainer):
                     teacher_kwargs = sanitize_model_call_kwargs(teacher_kwargs)
                     teacher_outputs = self.teacher_state.model(**teacher_kwargs)
 
-                    # Extract top-k from full logits
                     k = self.arguments.top_k_teacher
                     teacher_log_probs = jax.nn.log_softmax(
                         teacher_outputs.logits.astype(jnp.float32),

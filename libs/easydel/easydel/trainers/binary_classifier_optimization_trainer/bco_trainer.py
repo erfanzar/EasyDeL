@@ -394,7 +394,6 @@ class BCOTrainer(Trainer):
         undesirable_embeddings: list[np.ndarray] = []
         sample_size = self.arguments.prompt_sample_size
 
-        # Iterate through the transformed source to collect embeddings
         for shard_name in self._train_source.shard_names:
             for example in self._train_source.open_shard(shard_name):
                 if "embedding_input_ids" not in example:
@@ -424,7 +423,6 @@ class BCOTrainer(Trainer):
             logger.warning("UDM was requested but dataset does not include both desirable and undesirable samples.")
             return
 
-        # Random sample down to prompt_sample_size
         n_d = min(len(desirable_embeddings), sample_size)
         n_u = min(len(undesirable_embeddings), sample_size)
 

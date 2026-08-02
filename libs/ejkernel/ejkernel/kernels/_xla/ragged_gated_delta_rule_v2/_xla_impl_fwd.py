@@ -300,7 +300,6 @@ def pack_inputs_single_stream(
     last_valid_loc = query_start_loc[num_valid_seqs]
     effective_query_start_loc = jnp.where(valid_loc_mask, query_start_loc, last_valid_loc)
 
-    # Calculate sequence lengths and pad them to multiples of chunk_size.
     seq_lengths = effective_query_start_loc[1:] - effective_query_start_loc[:-1]
     num_chunks = (seq_lengths + chunk_size - 1) // chunk_size
     padded_lengths = num_chunks * chunk_size
@@ -446,7 +445,6 @@ def ragged_gated_delta_rule_mixed_prefill(
         a_reshaped.astype(jnp.float32) + dt_bias.astype(jnp.float32)
     )
 
-    # Pack inputs
     (
         packed_query,
         packed_key,
@@ -577,7 +575,6 @@ def ragged_gated_delta_rule_mixed_prefill(
     g_i_last_exp_scan = g_i_last_exp_chunks
     k_i_g_diff_scan = k_i_g_diff_chunks
 
-    # Prepare init_h_per_chunk
     init_h_per_chunk = jnp.zeros((num_chunks, H, K_dim, V_dim), dtype=recurrent_state.dtype)
     start_chunk_indices = new_query_start_loc[:-1] // chunk_size
     init_states_for_seqs = recurrent_state[state_indices]
@@ -668,11 +665,9 @@ def ragged_gated_delta_rule_mixed_prefill(
 
     o = o.astype(initial_dtype)
 
-    # Unpack output
     packed_output_flat = o.reshape(-1, H * V_dim)
     output = packed_output_flat[padded_indices_valid]
 
-    # Update recurrent state
     last_chunk_indices = (new_query_start_loc[1:] // chunk_size) - 1
     final_states = h_chunks[last_chunk_indices]
 

@@ -1499,7 +1499,6 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
 
             total_len = len(ctx_ids) + len(cont_ids)
             if total_len > self.max_length + 1:
-                # Keep the full continuation and truncate context from the left.
                 drop = total_len - (self.max_length + 1)
                 if drop >= len(ctx_ids):
                     raise ValueError(

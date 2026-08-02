@@ -332,7 +332,6 @@ class TransformerCacheConfig(BaseCacheConfig):
     sequence_length: int = field(pytree_node=False)
     num_hidden_layers: int = field(pytree_node=False)
     pad_token_id: int = field(pytree_node=False)
-    # Optional attention-related fields
     num_heads: int | None = field(pytree_node=False)
     head_dim: int | None = field(pytree_node=False)
     key_heads: int | None = field(pytree_node=False)
@@ -341,7 +340,6 @@ class TransformerCacheConfig(BaseCacheConfig):
     value_dim: int | None = field(pytree_node=False)
     sliding_window: int | None = field(pytree_node=False)
 
-    # Configuration flags
     update_causal_mask: bool = field(pytree_node=False)
     create_attention_bias: bool = field(pytree_node=False)
 
@@ -401,7 +399,6 @@ class TransformerCacheConfig(BaseCacheConfig):
             if key_dim is None or value_dim is None:
                 raise ValueError("Either head_dim or both key_dim and value_dim must be specified")
 
-        # Derive heads from num_heads if not specified
         if num_heads is not None:
             key_heads = key_heads or num_heads
             value_heads = value_heads or num_heads
@@ -654,7 +651,6 @@ class TransformerCacheView(BaseCacheView):
         """
         from easydel.infra.utils import AttnMaskType
 
-        # Unwrap OperationsMetadata to TransformerMetadata if needed
         cache_metadata = unwrap_metadata(cache_metadata, "transformer")
 
         runtime_dtype = query.dtype

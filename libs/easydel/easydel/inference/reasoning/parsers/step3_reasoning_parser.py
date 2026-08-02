@@ -72,7 +72,6 @@ class Step3ReasoningParser(BaseThinkingReasoningParser):
                 cleaned = model_output.replace(self.start_token, "").strip()
                 return cleaned or None, None
             return None, model_output
-        # Split at end token; everything before is reasoning
         parts = model_output.split(self.end_token, 1)
         reasoning = parts[0].replace(self.start_token, "").strip()
         content = parts[1].strip() if len(parts) > 1 else None
@@ -123,6 +122,5 @@ class Step3ReasoningParser(BaseThinkingReasoningParser):
                 content=content_part if content_part else None,
             )
 
-        # Still accumulating reasoning
         cleaned = delta_text.replace(self.start_token, "")
         return DeltaMessage(reasoning_content=cleaned) if cleaned else None

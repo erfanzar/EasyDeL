@@ -541,7 +541,6 @@ def read_checkpoint_metadata(checkpoint_path: str) -> MetadataDict:
     return json.loads(text)
 
 
-# Backward-compatible alias
 _read_checkpoint_metadata = read_checkpoint_metadata
 
 

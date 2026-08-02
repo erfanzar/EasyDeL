@@ -482,10 +482,8 @@ class AsyncDataLoader(AsyncDataset[dict]):
             pre-sharded ``jax.Array`` values when ``sharding_map`` was
             supplied.
         """
-        # Create the underlying iterator
         iterator = self._create_iterator()
 
-        # Wrap in executor for async
         loop = asyncio.get_event_loop()
         executor = ThreadPoolExecutor(max_workers=1)
 
@@ -535,7 +533,6 @@ class AsyncDataLoader(AsyncDataset[dict]):
             into the training step.
         """
 
-        # Chain all shards
         def iter_examples():
             """Inline closure that flattens shard iteration into a single example stream.
 
@@ -552,17 +549,14 @@ class AsyncDataLoader(AsyncDataset[dict]):
 
         examples = iter_examples()
 
-        # Shuffle if configured
         if self._shuffle_buffer_size:
             examples = self._shuffle_stream(examples, self._shuffle_buffer_size)
 
-        # Batch
         batches = batch_iterator(examples, self._batch_size, self._drop_last, collate_fn=self._collate_fn)
 
         if self._sharding_map:
             batches = (preshard_batch(b, self._sharding_map) for b in batches)
 
-        # Prefetch
         if self._prefetch_enabled:
             return PrefetchIterator(
                 batches,

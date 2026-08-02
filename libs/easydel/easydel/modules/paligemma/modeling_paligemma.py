@@ -393,7 +393,6 @@ class PaliGemmaModel(EasyDeLBaseModule):
             attention_mask=attention_mask,
         )
         if position_ids is None:
-            # PaliGemma positions are 1-indexed.
             position_ids = mask_info.q_position_ids + 1
 
         # HF PaliGemma ORs a bidirectional block over tokens with token_type_ids == 0
@@ -577,7 +576,6 @@ class PaliGemmaForConditionalGeneration(BaseVisionLanguageModule[PaliGemmaModel,
     _supports_video = False
     _uses_mrope = False
 
-    # Component name mapping
     _vision_tower_name = "vision_tower"
     _projector_name = "multi_modal_projector"
     _language_model_name = "language_model"
@@ -611,11 +609,9 @@ class PaliGemmaForConditionalGeneration(BaseVisionLanguageModule[PaliGemmaModel,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-            # VLM-specific configuration
             vision_feature_layer=getattr(config, "vision_feature_layer", -1),
             vision_feature_select_strategy=getattr(config, "vision_feature_select_strategy", "full"),
             image_token_index=config.image_token_id,
-            # LM head configuration
             tie_word_embeddings=getattr(config, "tie_word_embeddings", True),
             lm_head_bias=False,
         )

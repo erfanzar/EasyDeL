@@ -141,34 +141,27 @@ class AsyncScheduler(Scheduler):
             Placeholders will be replaced with actual tokens in the next
             iteration via the runner's _modify_prev_results() method.
         """
-        # Call parent implementation first to update num_computed_tokens
         super()._update_after_schedule(scheduler_output)
 
-        # Track if any requests have pending structured output
         pending_structured_output_tokens = False
         spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
 
-        # Add placeholders for each scheduled request
         for req_id in scheduler_output.num_scheduled_tokens:
             request = self.requests[req_id]
 
-            # Track structured output requests
             pending_structured_output_tokens |= request.use_structured_output and request.num_output_placeholders > 0
 
-            # Calculate number of speculative tokens for this request
             cur_num_spec_tokens = len(spec_decode_tokens.get(req_id, ()))
 
             # Check if request will generate a token this iteration
             # Request generates when computed tokens equals total tokens needed
             if request.num_computed_tokens == request.num_tokens + request.num_output_placeholders + cur_num_spec_tokens:
-                # Request will generate 1 new token plus num_spec_tokens
                 request.num_output_placeholders += 1 + cur_num_spec_tokens
 
                 # Add placeholders for speculative tokens (will be updated by runner)
                 # Use -1 as placeholder value to indicate not yet sampled
                 request.spec_token_ids = [-1] * self.num_spec_tokens
 
-        # Update scheduler output with structured output status
         scheduler_output.pending_structured_output_tokens = pending_structured_output_tokens
 
     def _update_request_with_output(
@@ -219,7 +212,6 @@ class AsyncScheduler(Scheduler):
         # Store status before parent update (which may change it)
         status_before_update = request.status
 
-        # Call parent implementation to handle token appending and stop checking
         new_token_ids, stopped = super()._update_request_with_output(request, new_token_ids)
 
         # Decrement placeholder count by number of actual tokens received

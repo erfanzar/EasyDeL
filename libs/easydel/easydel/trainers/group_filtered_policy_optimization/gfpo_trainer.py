@@ -181,7 +181,6 @@ class GFPOTrainer(GRPOTrainer):
         output = super().configure_functions()
         straight_through_emulator = self._train_shared_fn_static_args[-1]
 
-        # If filtering is active, replace num_generations with num_remains_in_group
         if self.arguments.num_remains_in_group is not None:
             effective_generations = self.arguments.num_remains_in_group
 
@@ -305,7 +304,6 @@ class GFPOTrainer(GRPOTrainer):
         Returns:
             Filtered versions of all inputs with shape [num_prompts * num_remains, ...]
         """
-        # Compute filter scores
         filter_func = self.group_filter_func or self._default_filter_func
         scores = filter_func(completion_ids, rewards, completion_mask)
 
@@ -313,14 +311,11 @@ class GFPOTrainer(GRPOTrainer):
         num_prompts = prompt_ids.shape[0]
         scores_grouped = scores.reshape(num_prompts, num_generations)
 
-        # Select top-K indices per group
         _, top_indices = jax.lax.top_k(scores_grouped, num_remains)  # [num_prompts, num_remains]
 
-        # Create batch indices for gathering
         batch_offsets = jnp.arange(num_prompts)[:, None] * num_generations  # [num_prompts, 1]
         gather_indices = (batch_offsets + top_indices).reshape(-1)  # [num_prompts * num_remains]
 
-        # Gather filtered samples
         filtered_completion_ids = completion_ids[gather_indices]
         filtered_completion_mask = completion_mask[gather_indices]
         filtered_ref_per_token_logps = ref_per_token_logps[gather_indices]

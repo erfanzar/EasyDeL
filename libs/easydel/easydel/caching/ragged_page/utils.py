@@ -151,7 +151,6 @@ def _kv_cache_update_kernel(
         copy_operation.start()
         pending_async_copies.append(copy_operation)
 
-    # Wait for all copies to complete
     for copy_operation in pending_async_copies:
         copy_operation.wait()
 
@@ -331,7 +330,6 @@ def kv_cache_update_jax(
     slice_ids = jnp.arange(num_slices, dtype=jnp.int32)
     active_slices = slice_ids < num_valid_slices
 
-    # Slice lengths, masked to 0 for inactive slices.
     slice_lens = jnp.where(active_slices, slice_indices[2].astype(jnp.int32), 0)
 
     # Build a monotonic "slice ends" vector via cumsum so we can map each token

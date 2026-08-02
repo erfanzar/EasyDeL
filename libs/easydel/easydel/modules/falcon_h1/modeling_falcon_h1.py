@@ -684,7 +684,6 @@ class FalconH1Mixer(spx.Module):
                 conv_states_c, ssm_states_c, token_outputs_c = carry
                 slot = token_slots[idx]
 
-                # 1) Conv update for this token
                 conv_state_i = jax.lax.dynamic_slice_in_dim(conv_states_c, slot, 1, axis=0)  # [1, conv_dim, d_conv]
                 new_token = hidden_states_B_C[0, idx, :]  # [conv_dim]
                 conv_state_i = jnp.roll(conv_state_i, shift=-1, axis=-1)
@@ -695,7 +694,6 @@ class FalconH1Mixer(spx.Module):
                 conv_out_full = jnp.sum(conv_state_i[0] * kernel[:, 0, :].T, axis=-1) + conv_bias  # [conv_dim]
                 conv_out_i = self.act(conv_out_full).astype(jnp.float32)
 
-                # 2) Split conv output into x, B, C
                 groups_time_state_size = self.n_groups * self.ssm_state_size
                 x_i = conv_out_i[: self.intermediate_size]
                 ssm_b_i = conv_out_i[self.intermediate_size : self.intermediate_size + groups_time_state_size]
@@ -706,7 +704,6 @@ class FalconH1Mixer(spx.Module):
                 ssm_c_i = ssm_c_i.reshape(1, self.n_groups, self.ssm_state_size)
                 dt_i = dt[0, idx, :].reshape(1, self.num_heads)
 
-                # 3) SSM single step
                 ssm_state_i = jax.lax.dynamic_slice_in_dim(ssm_states_c, slot, 1, axis=0)  # [1, H, D, N]
                 y_i, new_ssm_state_i = _single_step_ssm2_fwd(
                     x=x_i,
@@ -719,7 +716,6 @@ class FalconH1Mixer(spx.Module):
                     n_groups=self.n_groups,
                 )
 
-                # 4) Write back states
                 conv_states_c = jax.lax.dynamic_update_slice_in_dim(conv_states_c, conv_state_i, slot, axis=0)
                 ssm_states_c = jax.lax.dynamic_update_slice_in_dim(
                     ssm_states_c, new_ssm_state_i.astype(ssm_states_c.dtype), slot, axis=0
@@ -742,7 +738,6 @@ class FalconH1Mixer(spx.Module):
                 recurrent_state=ssm_states.astype(dtype),
             )
 
-            # Apply gating and output projection
             if self.mamba_rms_norm:
                 scan_output = self.norm(y, gate)
             else:
@@ -784,7 +779,6 @@ class FalconH1Mixer(spx.Module):
                     output_dtype=dtype,
                 )
 
-            # Update cache with conv_state for future decoding
             if cache_view is not None:
                 if segment_ids is None:
                     conv_in_t = hidden_states_B_C.transpose(0, 2, 1)  # [batch, conv_dim, seq_len]
@@ -813,7 +807,6 @@ class FalconH1Mixer(spx.Module):
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        # Prepare dt with bias
         dt = jax.nn.softplus(dt.astype(jnp.float32) + self.dt_bias.value.astype(jnp.float32))
         if q_mask is not None and seq_len > 1:
             dt = dt * q_mask[:, :, None].astype(dt.dtype)
@@ -823,7 +816,6 @@ class FalconH1Mixer(spx.Module):
         else:
             ssm_state0 = None
 
-        # Call SSM2Op
         ssm_output = self.ssm_op(
             x=x,
             A=self.A_log.value,
@@ -841,7 +833,6 @@ class FalconH1Mixer(spx.Module):
 
         y = ssm_output.attention_outputs.reshape(batch_size, seq_len, self.intermediate_size)
 
-        # Update cache with final SSM state
         if updated_cache_view is not None:
             updated_cache_view = updated_cache_view.replace(recurrent_state=ssm_output.ssm_state.astype(dtype))
         if self.mamba_rms_norm:
@@ -1141,7 +1132,6 @@ class FalconH1DecoderLayer(spx.Module):
         # Parallel combination: sum of mamba and attention outputs
         hidden_states = residual + (mamba_hidden_states + attn_hidden_states)
 
-        # MLP
         residual = hidden_states
         hidden_states = self.pre_ff_layernorm(hidden_states)
         if self.config.use_scan_mlp:
@@ -1345,7 +1335,6 @@ class FalconH1Model(EasyDeLBaseModule):
         hidden_states = inputs_embeds
         _batch_size, seq_len = hidden_states.shape[:2]
 
-        # Determine runtime mode
         if mode is None:
             if past_key_values is not None and seq_len == 1:
                 mode = common_types.MODE_DECODE
@@ -1632,7 +1621,6 @@ class FalconH1ForCausalLM(BaseCausalLMModule[FalconH1Model, FalconH1Config]):  #
         del kwargs
         batch_size, seq_length = input_ids.shape
 
-        # Calculate starts if not provided
         if starts is None:
             if attention_mask is not None:
                 starts = self.compute_prefill_length_from_mask(attention_mask.astype(jnp.bool_))
@@ -1645,7 +1633,6 @@ class FalconH1ForCausalLM(BaseCausalLMModule[FalconH1Model, FalconH1Config]):  #
             starts=starts,
         )
 
-        # Setup mask info
         if attention_mask is not None:
             mask_info = MaskInfo.from_attention_mask(attention_mask)
         else:
@@ -1684,14 +1671,11 @@ class FalconH1ForCausalLM(BaseCausalLMModule[FalconH1Model, FalconH1Config]):  #
                 - past_key_values: Updated HybridCache from model_outputs
                 - position_ids: Incremented position for the next token
         """
-        # Update cache
         if model_outputs.past_key_values is not None:
             model_kwargs["past_key_values"] = model_outputs.past_key_values
 
-        # Update position IDs for next token
         if "position_ids" in model_kwargs:
             position_ids = model_kwargs["position_ids"]
-            # Increment by 1 for the next token
             model_kwargs["position_ids"] = position_ids[:, -1:] + 1
 
         return model_kwargs

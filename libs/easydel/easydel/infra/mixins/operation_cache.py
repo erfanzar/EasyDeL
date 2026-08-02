@@ -749,7 +749,6 @@ class OperationCacheMixin:
         # Phase 2: Find BaseOperation instances stored directly on modules
         # This catches cases like Qwen3NextLinearAttention which stores GatedDeltaRuleOp as gdr_op
         for path, module in iter_module_search(self, spx.Module):
-            # Skip FlexibleAttentionModule - already handled in Phase 1
             if isinstance(module, FlexibleAttentionModule):
                 continue
 
@@ -890,7 +889,6 @@ class OperationCacheMixin:
         """
         path_str = ".".join(map(str, path)).lower()
 
-        # Check for specific attention types in path
         if "cross_attn" in path_str:
             return "cross_attention"
         if "vision" in path_str:
@@ -940,7 +938,6 @@ class OperationCacheMixin:
             if layer.is_recurrent_layer:
                 has_recurrent = True
 
-        # Get prefill/decode ops from first layer
         prefill_op = layers[0].operation_name if layers else ""
         decode_op = layers[0].decode_operation_name or prefill_op if layers else ""
 

@@ -879,7 +879,6 @@ class RobertaLayer(spx.Module):
                 - cross_attention: Cross-attention output if encoder_hidden_states provided
                 - cache_view: Updated cache view
         """
-        # Self Attention
         attention_outputs = self.attention(
             hidden_states=hidden_states,
             mask_info=mask_info,
@@ -891,7 +890,6 @@ class RobertaLayer(spx.Module):
         )
         attention_output = attention_outputs.attention_output
 
-        # Cross-Attention Block
         cross_attention = None
         if encoder_hidden_states is not None:
             cross_attention_outputs = self.crossattention(
@@ -1030,7 +1028,6 @@ class RobertaEncoder(EasyDeLLayerStackMixin, spx.Module):
         all_hidden_states = () if output_hidden_states else None
         all_cross_attentions = () if encoder_hidden_states is not None else None
 
-        # Check if head_mask has a correct number of layers specified if desired
         if head_mask is not None:
             if head_mask.shape[0] != (len(self.layer)):
                 raise ValueError(
@@ -1476,11 +1473,9 @@ class RobertaModel(EasyDeLBaseModule):
                 - attentions: Tuple of attention weights if output_attentions=True
                 - cross_attentions: Tuple of cross-attention weights if applicable
         """
-        # make sure `token_type_ids` is correctly initialized when not passed
         if token_type_ids is None:
             token_type_ids = jnp.zeros_like(input_ids)
 
-        # make sure `position_ids` is correctly initialized when not passed
         if attention_mask is None:
             attention_mask = jnp.ones_like(input_ids, dtype=jnp.bool_)
         else:
@@ -1499,7 +1494,6 @@ class RobertaModel(EasyDeLBaseModule):
             attention_mask=attention_mask,
         )
 
-        # Initialize MaskInfo
         mask_info = MaskInfo.dynamic_init(
             mask_info=None,
             input_ids=input_ids,
@@ -1507,7 +1501,6 @@ class RobertaModel(EasyDeLBaseModule):
             attention_mask=attention_mask,
         )
 
-        # Initialize encoder MaskInfo for cross-attention if encoder_hidden_states provided
         encoder_mask_info = None
         if encoder_hidden_states is not None:
             batch_size = hidden_states.shape[0]
@@ -1522,7 +1515,6 @@ class RobertaModel(EasyDeLBaseModule):
                     encoder_attention_mask[:, None, :], (batch_size, decoder_seq_len, encoder_seq_len)
                 )
             else:
-                # No padding - all ones
                 cross_attn_mask = jnp.ones((batch_size, decoder_seq_len, encoder_seq_len), dtype=jnp.bool_)
 
             encoder_mask_info = MaskInfo.from_attention_mask(
@@ -1674,7 +1666,6 @@ class RobertaForSequenceClassification(BaseSequenceClassificationModule[RobertaM
                 - hidden_states: Tuple of hidden states if output_hidden_states=True
                 - attentions: Tuple of attention weights if output_attentions=True
         """
-        # Model
         outputs = self.roberta(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1838,7 +1829,6 @@ class RobertaForMultipleChoice(EasyDeLBaseModule):
         token_type_ids = token_type_ids.reshape(-1, token_type_ids.shape[-1]) if token_type_ids is not None else None
         position_ids = position_ids.reshape(-1, position_ids.shape[-1]) if position_ids is not None else None
 
-        # Model
         outputs = self.roberta(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1981,7 +1971,6 @@ class RobertaForTokenClassification(BaseTokenClassificationModule[RobertaModel, 
                 - hidden_states: Tuple of hidden states if output_hidden_states=True
                 - attentions: Tuple of attention weights if output_attentions=True
         """
-        # Model
         outputs = self.roberta(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -2133,7 +2122,6 @@ class RobertaForQuestionAnswering(BaseQuestionAnsweringModule[RobertaModel, Robe
                 - hidden_states: Tuple of hidden states if output_hidden_states=True
                 - attentions: Tuple of attention weights if output_attentions=True
         """
-        # Model
         outputs = self.roberta(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -2333,7 +2321,6 @@ class RobertaForCausalLM(BaseCausalLMModule[RobertaModel, RobertaConfig]):  # ty
                 - attentions: Tuple of attention weights if output_attentions=True
                 - cross_attentions: Tuple of cross-attention weights if applicable
         """
-        # Model
         outputs = self.roberta(
             input_ids=input_ids,
             attention_mask=attention_mask,

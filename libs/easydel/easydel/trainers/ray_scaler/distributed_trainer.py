@@ -220,7 +220,6 @@ class RayDistributedTrainer:
             variables that do not scale with ``scaling_index``.
     """
 
-    # Model identity
     model_task: TaskType
     model_type: str
     model_class: type[EasyDeLBaseModule]

@@ -112,22 +112,18 @@ DEFAULT_SHARDING_AXIS_NAMES: tuple[str, ...] = ("pp", "dp", "fsdp", "ep", "tp", 
 # Model weight file name constants for different frameworks.
 # These are used when loading/saving models in various formats.
 
-# Default filename for PyTorch model weights.
 WEIGHTS_NAME = "pytorch_model.bin"
 
 # Index file for sharded PyTorch model weights.
 WEIGHTS_INDEX_NAME = "pytorch_model.bin.index.json"
 
-# Default filename for TensorFlow 2 model weights.
 TF2_WEIGHTS_NAME = "tf_model.h5"
 
 # Index file for sharded TensorFlow 2 model weights.
 TF2_WEIGHTS_INDEX_NAME = "tf_model.h5.index.json"
 
-# Default filename for TensorFlow 1 model checkpoints.
 TF_WEIGHTS_NAME = "model.ckpt"
 
-# Default filename for SafeTensors format model weights.
 SAFE_WEIGHTS_NAME = "model.safetensors"
 
 # Index file for sharded SafeTensors format model weights.
@@ -148,10 +144,8 @@ CHAT_TEMPLATE_NAME = "chat_template.json"
 # Configuration file for generation parameters.
 GENERATION_CONFIG_NAME = "generation_config.json"
 
-# Model card metadata file.
 MODEL_CARD_NAME = "modelcard.json"
 
-# Default Mixture of Experts implementation method.
 DEFAULT_MOE_METHOD = "fused_moe"
 
 # Whether to treat experts as tensor-parallel by default.
@@ -170,7 +164,6 @@ RING_EXPERTS = False
 # Flag indicating whether EKernel operations are enabled via EKERNEL_OPS env var.
 EKERNEL_OPS = check_bool_flag("EKERNEL_OPS", default=False)
 
-# Config keys intentionally removed from EasyDeL's public base surface.
 _REMOVED_BASE_CONFIG_KEYS = frozenset(
     {
         "hardware_abstraction",
@@ -245,7 +238,6 @@ def _mesh_shape_ep(mesh, pm, fsdp_is_ep_bound, sp_is_ep_bound):
         Tuple of ((dp_size, ep_size, tp_size), (dp_name, ep_name, tp_name)) containing
         the flattened mesh dimensions and corresponding axis names.
     """
-    # Resolve Names
     dpname, fsdpname, epname, tpname, spname = (
         _resolve_eformer_axis(DP, pm),
         _resolve_eformer_axis(FSDP, pm),
@@ -2130,7 +2122,6 @@ class EasyDeLBaseConfig(PretrainedConfig):
     # and would clutter the representation, as well as HuggingFace PretrainedConfig
     # defaults that are typically not modified by users.
     _hidden_repr_attrs: tp.ClassVar[set[str]] = {
-        # EasyDeL-specific attributes
         "sharding_axis_dims",
         "sharding_dcn_axis_dims",
         "sharding_axis_names",
@@ -3355,8 +3346,6 @@ class EasyDeLBaseConfig(PretrainedConfig):
             Requires `self.make_rng("fcm")` to be available for random sampling.
         """
         if not deterministic and self.fcm_max_ratio > 0:
-            # Apply forgetful causal mask
-
             fcm_ratio = jax.random.uniform(
                 self.make_rng("fcm"),
                 shape=(batch_size, 1, 1, 1),

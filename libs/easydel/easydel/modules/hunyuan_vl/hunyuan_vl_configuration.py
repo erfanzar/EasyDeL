@@ -487,7 +487,6 @@ class HunYuanVLConfig(EasyDeLBaseConfig):
         else:
             self.text_config = text_config
 
-        # Keep the vision tower in sync with the consuming text backbone.
         self.vision_config.text_hidden_size = self.text_config.hidden_size
 
         self.image_token_id = image_token_id

@@ -700,7 +700,6 @@ class AyaVisionForConditionalGeneration(BaseVisionLanguageModule[AyaVisionModel,
     _supports_video = False
     _uses_mrope = False
 
-    # Component name mapping
     _vision_tower_name = "vision_tower"
     _projector_name = "multi_modal_projector"
     _language_model_name = "language_model"
@@ -733,11 +732,9 @@ class AyaVisionForConditionalGeneration(BaseVisionLanguageModule[AyaVisionModel,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-            # VLM-specific configuration
             vision_feature_layer=getattr(config, "vision_feature_layer", -1),
             vision_feature_select_strategy=getattr(config, "vision_feature_select_strategy", "default"),
             image_token_index=config.image_token_id,
-            # LM head configuration
             tie_word_embeddings=getattr(config, "tie_word_embeddings", False),
             lm_head_bias=False,
         )
@@ -859,7 +856,6 @@ class AyaVisionForConditionalGeneration(BaseVisionLanguageModule[AyaVisionModel,
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
-        # Forward through base model
         outputs = self.base_model(
             input_ids=input_ids,
             attention_mask=attention_mask,

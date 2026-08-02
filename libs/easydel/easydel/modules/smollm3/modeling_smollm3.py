@@ -217,7 +217,6 @@ class SmolLM3DecoderLayer(spx.Module):
         self.param_dtype = param_dtype
         self.precision = precision
 
-        # Self-attention
         self.self_attn = SmolLM3Attention(
             config=config,
             dtype=dtype,
@@ -227,7 +226,6 @@ class SmolLM3DecoderLayer(spx.Module):
             layer_idx=layer_idx,
         )
 
-        # MLP
         self.mlp = self._create_mlp(config, dtype, param_dtype, precision, rngs)
 
         # Layer norms (pre-norm architecture)
@@ -318,7 +316,6 @@ class SmolLM3DecoderLayer(spx.Module):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
-        # Self-attention
         attention_output = self.self_attn(
             hidden_states,
             mask_info,
@@ -335,7 +332,6 @@ class SmolLM3DecoderLayer(spx.Module):
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
 
-        # MLP
         if self.config.use_scan_mlp:
             mlp_output = blockwise_ffn(
                 self.mlp,
@@ -613,7 +609,6 @@ class SmolLM3Model(EasyDeLBaseModule):
         Raises:
             ValueError: If both input_ids and inputs_embeds are provided or both are None.
         """
-        # Validate inputs
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -639,7 +634,6 @@ class SmolLM3Model(EasyDeLBaseModule):
                 else common_types.MODE_TRAIN
             )
 
-        # Initialize KV cache if needed
         if past_key_values is None and cache_metadata is not None:
             if isinstance(cache_metadata, RaggedPagesMetadata):
                 past_key_values = RaggedPagesCache.init_empty(self.config)
@@ -649,7 +643,6 @@ class SmolLM3Model(EasyDeLBaseModule):
         all_hidden_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
 
-        # Forward pass through layers
         hidden_states = inputs_embeds
 
         views = past_key_values.views if past_key_values is not None else None

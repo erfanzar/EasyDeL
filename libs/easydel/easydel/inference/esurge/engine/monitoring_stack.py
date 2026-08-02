@@ -573,7 +573,6 @@ providers:
             "Authorization": f"Basic {auth}",
         }
 
-        # Check if Grafana is reachable
         try:
             req = urllib.request.Request(f"{grafana_base}/api/health", headers=headers)
             urllib.request.urlopen(req, timeout=3)
@@ -582,7 +581,6 @@ providers:
 
         self._info(" Detected running Grafana at %s, provisioning via API...", grafana_base)
 
-        # Upsert datasource
         datasource_provisioned = False
         ds_payload = json.dumps(
             {
@@ -607,7 +605,6 @@ providers:
             datasource_provisioned = True
         except urllib.error.HTTPError as e:
             if e.code == 409:
-                # Already exists — update it
                 try:
                     req = urllib.request.Request(
                         f"{grafana_base}/api/datasources/uid/{datasource_uid}",
@@ -625,7 +622,6 @@ providers:
         if not datasource_provisioned:
             return None
 
-        # Upsert dashboard
         dashboard_model = _build_esurge_dashboard_model(datasource_uid)
         dashboard_payload = json.dumps(
             {
@@ -730,7 +726,6 @@ providers:
             .replace("127.0.0.1", "host.docker.internal")
         )
 
-        # If Grafana is already running, provision via HTTP API
         api_url = self._provision_running_grafana(
             grafana_host=grafana_host,
             grafana_port=grafana_port,
@@ -795,7 +790,6 @@ providers:
         Cleans up Docker containers, local processes, and temporary provisioning
         directories. Safe to call even if Grafana was not started.
         """
-        # Stop processes/containers BEFORE removing their temp dirs
         container = self._grafana_container_id or self._grafana_container_name
         docker_exe = shutil.which("docker") if container else None
         if container and docker_exe:
@@ -821,7 +815,6 @@ providers:
 
         self._stop_prometheus_server()
 
-        # Now safe to remove temp dirs
         if self._grafana_temp_dir:
             shutil.rmtree(self._grafana_temp_dir, ignore_errors=True)
 
@@ -1004,7 +997,6 @@ providers:
                 self._info(f" Error stopping Prometheus server: {e}")
             self._monitoring_server = None
 
-        # Stop the console monitor if it was started
         try:
             from .. import monitoring as _mon_module
 

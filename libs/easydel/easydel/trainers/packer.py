@@ -137,48 +137,39 @@ def pack_sequences(
             else:
                 return list(range(start_position, start_position + length))
 
-        # Iterate through all examples in the batch
         for input_ids, attention_mask in zip(examples["input_ids"], examples["attention_mask"], strict=False):
             seq_length = len(input_ids)
 
             # If adding this sequence would exceed max_length, start a new packed sequence
             if current_length + seq_length + 1 > max_length:
-                # Pad the current packed sequence if needed
                 if current_length < max_length:
                     padding_length = max_length - current_length
                     current_packed_input_ids.extend([pad_token_id] * padding_length)
                     current_packed_attention_mask.extend([0] * padding_length)
                     current_packed_position_ids.extend([0] * padding_length)
 
-                # Add the completed packed sequence to results
                 packed_input_ids.append(current_packed_input_ids)
                 packed_attention_mask.append(current_packed_attention_mask)
                 packed_position_ids.append(current_packed_position_ids)
 
-                # Start new packed sequence
                 current_packed_input_ids = []
                 current_packed_attention_mask = []
                 current_packed_position_ids = []
                 current_length = 0
 
-            # Generate position IDs for current sequence
             position_ids = get_position_ids(seq_length, start_position=current_length)
 
-            # Add current sequence
             current_packed_input_ids.extend(input_ids)
             current_packed_attention_mask.extend(attention_mask)
             current_packed_position_ids.extend(position_ids)
 
-            # Add separator token
             current_packed_input_ids.append(pad_token_id)
             current_packed_attention_mask.append(0)
             current_packed_position_ids.append(position_ids[-1] + 1 if not reset_position_ids else 0)
 
             current_length += seq_length + 1
 
-        # Handle the last packed sequence
         if current_packed_input_ids:
-            # Pad if needed
             if current_length < max_length:
                 padding_length = max_length - current_length
                 current_packed_input_ids.extend([pad_token_id] * padding_length)
@@ -195,7 +186,6 @@ def pack_sequences(
             "position_ids": packed_position_ids,
         }
 
-    # Process the dataset in batches using HuggingFace map function
     packed_dataset = dataset.map(
         pack_examples,
         batched=True,

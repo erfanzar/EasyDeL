@@ -415,7 +415,6 @@ class eLargeModel:
 
         from .processing import normalize_task
 
-        # Auto-detect task if None or AUTO_BIND
         if task is None or task == TaskType.AUTO_BIND or task == "auto-bind":
             inferred_task = infer_task_from_hf_config(model_name_or_path)
             if inferred_task is not None:
@@ -3347,7 +3346,6 @@ class eLargeModel:
         lines.append(f"║{self.model_name or 'not set':^{w + 1}}║")
         lines.append(f"╠{'═' * (w + 1)}╣")
 
-        # Loader & Task
         loader = self._config.get("loader", {})
         dtype_str = loader.get("dtype", "default")
         prec_str = loader.get("precision", "default")
@@ -3365,7 +3363,6 @@ class eLargeModel:
 
         lines.append(_sep())
 
-        # Config section
         base_cfg = self._config.get("base_config", {}).get("values", {})
         if base_cfg:
             if "attn_mechanism" in base_cfg:
@@ -3379,12 +3376,10 @@ class eLargeModel:
                 gc_str = _fmt(gc) or "disabled"
                 lines.append(_line(f"▸ grad_ckpt: {gc_str}"))
 
-        # Quantization
         quant = self._config.get("quantization", {})
         if quant.get("method"):
             lines.append(_line(f"▸ quant: {quant['method']} (group:{quant.get('group_size', 128)})"))
 
-        # eSurge
         esurge = self._config.get("esurge", {})
         if esurge and any(esurge.get(k) for k in ["max_model_len", "max_num_seqs", "hbm_utilization"]):
             lines.append(_sep())
@@ -3409,7 +3404,6 @@ class eLargeModel:
             if parts:
                 lines.append(_line(f"▸ {' │ '.join(parts)}"))
 
-        # Training
         trainer = self._config.get("trainer", {})
         trainer_type = trainer.get("trainer_type")
         if trainer_type:
@@ -3428,7 +3422,6 @@ class eLargeModel:
             if parts:
                 lines.append(_line(f"▸ {' │ '.join(parts)}"))
 
-        # Status
         lines.append(_sep())
         model_icon = "●" if self._model is not None else "○"
         tok_icon = "●" if self._tokenizer is not None else "○"

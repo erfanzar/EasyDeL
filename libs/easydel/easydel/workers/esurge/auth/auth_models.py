@@ -235,7 +235,6 @@ class ApiKeyMetadata:
     last_used_at: float | None = None
     last_rotated_at: float | None = None
 
-    # Usage tracking
     total_requests: int = 0
     total_prompt_tokens: int = 0
     total_completion_tokens: int = 0
@@ -243,12 +242,10 @@ class ApiKeyMetadata:
     monthly_tokens: int = 0
     last_reset_month: int = field(default_factory=lambda: time.localtime().tm_mon)
 
-    # Configuration
     rate_limits: RateLimitConfig = field(default_factory=RateLimitConfig)
     quota: QuotaConfig = field(default_factory=QuotaConfig)
     permissions: ApiKeyPermissions = field(default_factory=ApiKeyPermissions)
 
-    # Metadata
     tags: list[str] = field(default_factory=list)
     metadata: dict[str, tp.Any] = field(default_factory=dict)
 

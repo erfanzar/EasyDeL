@@ -269,7 +269,6 @@ def quantize(
         - EasyQuantizer: High-level API for model quantization
         - QuantizationConfig: Configuration dataclass
     """
-    # Resolve config
     if config is not None:
         dtype = config.dtype
         group_size = config.group_size
@@ -557,7 +556,6 @@ class EasyQuantizer:
         if quantization_pattern is None:
             quantization_pattern = self.pattern
 
-        # Update model config if it exists
         if hasattr(model, "config"):
             model.config.quantization_config = self.config
 

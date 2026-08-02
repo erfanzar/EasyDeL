@@ -619,7 +619,6 @@ class Qwen3_5MTPDrafter:
             if row is None:
                 clamped = jnp.minimum(idx, target_arr)
             else:
-                # Truncate only this request's row; other rows keep their K/V.
                 clamped = idx.at[row].set(jnp.minimum(idx[row], target_arr))
             new_views.append(view.replace(indexes=clamped.astype(view.indexes.dtype)))
         self._mtp_cache = TransformerCache(views=new_views)

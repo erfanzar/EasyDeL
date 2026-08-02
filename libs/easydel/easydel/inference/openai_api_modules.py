@@ -502,12 +502,10 @@ class ResponsesRequest(OpenAIBaseModel):
     messages: list[ChatMessage] | None = None
     instructions: str | None = None
 
-    # Conversation state / storage
     store: bool | None = None
     previous_response_id: str | None = None
     conversation: str | ConversationReference | None = None
 
-    # Generation settings
     max_output_tokens: int | None = None
     max_tokens: int | None = None
     max_completion_tokens: int | None = None
@@ -521,14 +519,12 @@ class ResponsesRequest(OpenAIBaseModel):
     stop: str | list[str] | None = None
     n: int | None = None
 
-    # Tools
     tools: list[ToolDefinition] | None = None
     functions: list[FunctionDefinition] | None = None
     tool_choice: str | ToolChoiceOption | None = None
     parallel_tool_calls: bool | None = None
     reasoning: bool | ResponseReasoningConfig | None = None
 
-    # Streaming / misc
     stream: bool | None = False
     truncation: str | None = None
     include: list[str] | None = None

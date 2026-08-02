@@ -590,12 +590,10 @@ def concatenated_inputs(
             axis=0,
         )
 
-    # Determine maximum length for the completion inputs.
     max_completion_length = max(
         batch["chosen_input_ids"].shape[1],
         batch["rejected_input_ids"].shape[1],
     )
-    # Pad chosen and rejected completion input IDs to the same length and concatenate them.
     output["completion_input_ids"] = jnp.concatenate(
         (
             pad_to_length(
@@ -1337,7 +1335,6 @@ def concatenated_forward(
         labels = jnp.roll(input_ids, shift=-1, axis=1)
         loss_mask = jnp.roll(loss_mask, shift=-1, axis=1).astype("bool")
 
-    # Adjust logits shape if necessary.
     if logits is not None and logits.shape[:2] != labels.shape[:2]:
         seq_len = labels.shape[1]
         logits = logits[:, -seq_len:]

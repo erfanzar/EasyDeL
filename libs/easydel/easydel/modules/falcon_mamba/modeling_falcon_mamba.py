@@ -544,7 +544,6 @@ class FalconMambaMixer(spx.Module):
                 conv_states_c, ssm_states_c, token_outputs_c = carry
                 slot = token_slots[idx]
 
-                # 1) Conv update for this token
                 conv_state_i = jax.lax.dynamic_slice_in_dim(conv_states_c, slot, 1, axis=0)  # [1, I, d_conv]
                 new_token = hidden_states[0, :, idx]  # [I]
                 conv_state_i = jnp.roll(conv_state_i, shift=-1, axis=-1)
@@ -561,16 +560,13 @@ class FalconMambaMixer(spx.Module):
                 ssm_b_i = x_proj_out[self.time_step_rank : self.time_step_rank + self.ssm_state_size]
                 ssm_c_i = x_proj_out[self.time_step_rank + self.ssm_state_size :]
 
-                # 3) RMS normalize
                 ssm_b_i = rms_forward(ssm_b_i[None], variance_epsilon=self.rms_eps)[0]  # [N]
                 ssm_c_i = rms_forward(ssm_c_i[None], variance_epsilon=self.rms_eps)[0]  # [N]
                 time_step_i = rms_forward(time_step_i[None], variance_epsilon=self.rms_eps)[0]  # [tr]
 
-                # 4) dt_proj + softplus
                 dt_i = self.dt_proj(time_step_i[None, None, :])[0, 0]  # [I]
                 dt_i = jax.nn.softplus(dt_i)
 
-                # 5) SSM single step
                 ssm_state_i = jax.lax.dynamic_slice_in_dim(ssm_states_c, slot, 1, axis=0)  # [1, I, N]
                 y_i, new_ssm_state_i = _single_step_ssm1_fwd(
                     hidden_states=conv_out[None, :],
@@ -586,7 +582,6 @@ class FalconMambaMixer(spx.Module):
                 gate_i = gate[0, :, idx]  # [I]
                 y_gated = y_i[0] * jax.nn.silu(gate_i.astype(jnp.float32))
 
-                # Write back
                 conv_states_c = jax.lax.dynamic_update_slice_in_dim(conv_states_c, conv_state_i, slot, axis=0)
                 ssm_states_c = jax.lax.dynamic_update_slice_in_dim(
                     ssm_states_c, new_ssm_state_i.astype(ssm_states_c.dtype), slot, axis=0

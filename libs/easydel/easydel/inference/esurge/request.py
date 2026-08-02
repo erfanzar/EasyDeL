@@ -211,7 +211,6 @@ class EngineRequest:
         self.image_grid_thw = None
         self.pixel_values_videos = None
         self.video_grid_thw = None
-        # Clear pixel values from features but preserve cached embeddings
         for feat in self.mm_features:
             feat.clear_pixel_values()
         self._vision_processed = True

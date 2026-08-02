@@ -239,10 +239,8 @@ class BaseDecoderLayer:
         residual_name: str
         norm_name, residual_name = checkpoint_names
 
-        # Apply normalization
         normed: Float[Array, "batch_size seq_len hidden_dim"] = checkpoint_name(norm_module(hidden_states), norm_name)
 
-        # Apply attention
         attn_outputs: AttentionLayerOutput = attention_module(
             normed,
             mask_info,
@@ -254,7 +252,6 @@ class BaseDecoderLayer:
             frequencies,
         )
 
-        # Residual connection
         residual_added: Float[Array, "batch_size seq_len hidden_dim"] = hidden_states + attn_outputs.attention_output
         hidden_states_updated: Float[Array, "batch_size seq_len hidden_dim"] = checkpoint_name(
             residual_added, residual_name
@@ -303,7 +300,6 @@ class BaseDecoderLayer:
         residual_name: str
         norm_name, residual_name = checkpoint_names
 
-        # Apply normalization
         normed: Float[Array, "batch_size seq_len hidden_dim"] = checkpoint_name(norm_module(hidden_states), norm_name)
 
         # Apply MLP (with optional scan)
@@ -313,7 +309,6 @@ class BaseDecoderLayer:
         else:
             mlp_output = mlp_module(normed)
 
-        # Residual connection
         residual_added: Float[Array, "batch_size seq_len hidden_dim"] = hidden_states + mlp_output
         hidden_states_updated: Float[Array, "batch_size seq_len hidden_dim"] = checkpoint_name(
             residual_added, residual_name
@@ -430,7 +425,6 @@ class BaseDecoderLayer:
             checkpoint_names=("attn_norm", "attn_residual"),
         )
 
-        # MLP with pre-norm residual
         hidden_states_after_mlp: Float[Array, "batch_size seq_len hidden_dim"] = BaseDecoderLayer.pre_norm_residual_mlp(
             hidden_states_after_attn,
             mlp_module,
@@ -440,7 +434,6 @@ class BaseDecoderLayer:
             checkpoint_names=("mlp_norm", "mlp_residual"),
         )
 
-        # Apply output sharding
         hidden_states_sharded: Float[Array, "batch_size seq_len hidden_dim"] = BaseDecoderLayer.apply_output_sharding(
             hidden_states_after_mlp, partition_manager
         )
@@ -503,7 +496,6 @@ def blockwise_ffn(
         mlp_out: Float[Array, "batch_size seq_len hidden_dim"] = mlp_module(inputs)
         return mlp_out
 
-    # Process in chunks
     num_chunks: int = (seq_len + chunk_size - 1) // chunk_size
     outputs: list[Float[Array, "batch_size chunk_seq_len hidden_dim"]] = []
 

@@ -632,7 +632,6 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         if not self._auth_system_enabled():
             return None
 
-        # Collect candidate keys
         candidate_keys: list[str] = []
 
         def add_candidate(value: tp.Any) -> None:
@@ -650,10 +649,8 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
 
         add_candidate(self._extract_api_key(raw_request))
 
-        # Get client IP
         ip_address = raw_request.client.host if raw_request.client else None
 
-        # Try each candidate key
         for candidate in candidate_keys:
             try:
                 metadata = self.auth_manager.authorize_request(
@@ -663,14 +660,12 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                     model=model,
                     requested_tokens=requested_tokens,
                 )
-                # Authorization successful
                 raw_request.state.api_key = candidate
                 raw_request.state.api_key_metadata = metadata
                 return candidate
             except (PermissionDenied, RateLimitExceeded, QuotaExceeded) as e:
                 # If we have more candidates, try them. Otherwise, raise the exception.
                 if candidate == candidate_keys[-1]:
-                    # Last candidate failed
                     if isinstance(e, RateLimitExceeded):
                         raise HTTPException(status_code=429, detail=str(e)) from e
                     elif isinstance(e, QuotaExceeded):
@@ -679,7 +674,6 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                         raise HTTPException(status_code=403, detail=str(e)) from e
                 continue
 
-        # No valid key found
         try:
             require_key = self.auth_manager.require_api_key
         except AttributeError:
@@ -2801,7 +2795,6 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         self._authorize_request(raw_request, endpoint="/v1/metrics")
         self.metrics.uptime_seconds = time.time() - self.metrics.start_time
 
-        # Get authentication statistics
         auth_stats = self.auth_manager.get_statistics()
 
         return JSONResponse(
@@ -2944,10 +2937,8 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         """
         from ...inference_engine_interface import EndpointConfig
 
-        # Get base endpoints from parent class
         base_endpoints = super()._endpoints
 
-        # Add admin authentication endpoints
         admin_endpoints = [
             EndpointConfig(
                 path="/v1/admin/keys",

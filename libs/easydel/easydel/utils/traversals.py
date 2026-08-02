@@ -744,7 +744,6 @@ def set_module_from_path(model: spx.Module, path: ModulePath, new_value: tp.Any)
                 except (ValueError, IndexError, TypeError):
                     raise
 
-    # Set the new value at the target location
     last_item = path[-1]
     if isinstance(last_item, int):
         current[last_item] = new_value

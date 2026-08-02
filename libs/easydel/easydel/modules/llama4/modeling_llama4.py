@@ -632,10 +632,8 @@ class Llama4TextMoe(BaseMoeModule):
         """
         del training
 
-        # Shared expert output
         shared_out = self.shared_expert(hidden_states)
 
-        # MoE expert output
         def ffn_activation(gate, up):
             """Llama4 SwiGLU expert nonlinearity: ``act_fn(gate) * up``."""
             return self.experts.act_fn(gate) * up
@@ -2342,7 +2340,6 @@ class Llama4VisionModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        # encoders
         self.model = Llama4VisionEncoder(
             config=config,
             dtype=dtype,
@@ -2392,7 +2389,6 @@ class Llama4VisionModel(EasyDeLBaseModule):
         hidden_states = self.patch_embedding(pixel_values)
         _, num_patches, hidden_dim = hidden_states.shape
 
-        # Add cls token
         hidden_states = hidden_states.reshape(
             batch_size_times_num_tiles * num_concurrent_media * num_chunks,
             num_patches,
@@ -2405,7 +2401,6 @@ class Llama4VisionModel(EasyDeLBaseModule):
         hidden_states = jnp.concatenate([hidden_states, class_embedding], axis=1)
         num_patches += 1
 
-        # Position embeddings
         hidden_states = hidden_states.reshape(
             batch_size_times_num_tiles * num_concurrent_media,
             num_chunks,
@@ -2507,7 +2502,6 @@ class Llama4ForConditionalGeneration(BaseVisionLanguageModule[Llama4ForCausalLM,
     _supports_video = True
     _uses_mrope = False
 
-    # Component name mapping
     _vision_tower_name = "vision_model"
     _projector_name = "multi_modal_projector"
     _language_model_name = "language_model"

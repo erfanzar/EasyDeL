@@ -445,7 +445,6 @@ class FunctionGemmaToolParser(ToolParser):
             prev_start_count = previous_text.count(self.tool_call_start_token)
             prev_end_count = previous_text.count(self.tool_call_end_token)
 
-            # Starting a new function call
             if start_count > prev_start_count and start_count > end_count:
                 self.current_tool_id += 1
                 self.current_tool_name_sent = False
@@ -454,7 +453,6 @@ class FunctionGemmaToolParser(ToolParser):
                 logger.debug("Starting new tool call %d", self.current_tool_id)
                 return None
 
-            # In the middle of a function call
             if start_count > end_count:
                 last_start = current_text.rfind(self.tool_call_start_token)
                 partial_call = current_text[last_start + len(self.tool_call_start_token) :]

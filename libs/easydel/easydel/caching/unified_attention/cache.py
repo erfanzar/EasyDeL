@@ -333,7 +333,6 @@ class UnifiedAttentionCacheConfig(BaseCacheConfig):
 
         # A lightweight heuristic for slot-mapping padding; matches eSurge expectations.
         page_size_bytes = 2 * page_size * num_kv_heads * head_dim * bytes_av
-        # Keep this conservative; it only affects padding of the update schedule.
         slices_raw = KV_UPDATE_WINDOW_BYTES // max(1, int(page_size_bytes))
         num_slices_per_page = min(MAX_SLICES_PER_UPDATE_PAGE, _previous_power_of_2(int(slices_raw)))
 
@@ -402,7 +401,6 @@ class UnifiedAttentionCacheConfig(BaseCacheConfig):
         if self.window_aware_max_num_seqs > 0:
             return int(self.window_aware_max_num_seqs)
 
-        # Same heuristic as RaggedPagesCacheConfig.
         num_page_per_req = cdiv(self.max_model_length, self.page_size)
         return 1024 * 1024 // 2 // num_page_per_req // 4
 

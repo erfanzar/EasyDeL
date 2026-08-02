@@ -259,11 +259,9 @@ class KTOTrainer(Trainer):
         if dataset is None:
             return None
 
-        # Check if this is a dict of datasets
         if isinstance(dataset, dict):
             return {k: KTOTrainer._preprocess_kto_dataset(v, processing_class, arguments) for k, v in dataset.items()}
 
-        # Map kwargs for dataset processing
         map_kwargs = {"writer_batch_size": 10}
         try:
             from datasets import Dataset  # pyright: ignore[reportMissingTypeStubs]
@@ -273,13 +271,11 @@ class KTOTrainer(Trainer):
         except ImportError:
             pass
 
-        # Step 1: Extract shared prompts from chosen/rejected if needed
         dataset = dataset.map(maybe_extract_prompt, **map_kwargs)
 
         # Step 2: Unpair preference data (chosen/rejected → prompt/completion/label)
         dataset = maybe_unpair_preference_dataset(dataset, num_proc=map_kwargs.get("num_proc"))
 
-        # Step 3: Apply chat template if data is conversational
         if not getattr(arguments, "skip_apply_chat_template", False):
             dataset = dataset.map(
                 maybe_apply_chat_template,

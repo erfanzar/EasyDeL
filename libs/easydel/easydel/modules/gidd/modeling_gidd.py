@@ -216,7 +216,6 @@ class GiddAttention(AttentionModule):
         head_dim = config.hidden_size // config.num_attention_heads
         self.head_dim = getattr(config, "head_dim", head_dim)
 
-        # QK normalization settings
         self.use_qk_norm = config.use_qk_norm
         self.qk_norm_eps = config.qk_norm_eps
 
@@ -311,7 +310,6 @@ class GiddAttention(AttentionModule):
         Returns:
             tuple: Contains (key, value, mask_info, init_attention_bias, cache_view).
         """
-        # Validate that query and key have matching sequence lengths
         assert query.shape[1] == key.shape[1], "Query and Key lengths must match for GIDD attention."
 
         attention_mask = pairwise_attention_mask_from_mask_info(mask_info, query.shape[1], key.shape[1])
@@ -320,7 +318,6 @@ class GiddAttention(AttentionModule):
                 warnings.warn("attention_mask should be a boolean array", stacklevel=1)
                 attention_mask = (attention_mask == 1).astype("b1")
 
-        # Expand attention mask to match attention computation dimensions
         assert attention_mask is not None, "attention_mask must not be None for GIDD attention"
         if attention_mask.ndim == 2:
             attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
@@ -337,10 +334,8 @@ class GiddAttention(AttentionModule):
             noise_mask_kv = jnp.expand_dims(noise_mask, axis=-2)
             noise_attn_mask = jnp.expand_dims(noise_mask_q >= noise_mask_kv, axis=-3)
 
-            # Combine with attention mask
             attention_mask = jnp.logical_and(attention_mask, noise_attn_mask)
 
-        # Function to initialize attention bias
         def init_attention_bias():
             """Build the additive attention bias from ``attention_mask``.
 
@@ -399,7 +394,6 @@ class GiddAttention(AttentionModule):
         """
         batch_size, sequence_length = hidden_states.shape[:2]
 
-        # Project inputs to Q, K, V
         qkv = checkpoint_name(self.qkv_proj(hidden_states), name="attn_qkv")
         query_states, key_states, value_states = self.qkv_proj.split(qkv, config=self.config)
 
@@ -436,7 +430,6 @@ class GiddAttention(AttentionModule):
             frequencies=frequencies,
         )
 
-        # Prepare inputs for attention computation
         (
             key_states,
             value_states,
@@ -532,7 +525,6 @@ class GiddRMSNorm(spx.Module):
         variance = jnp.power(variance, 2)
         variance = variance.mean(-1, keepdims=True)
 
-        # Normalize and apply scale
         hidden_states = hidden_states / jnp.sqrt(variance + self.epsilon)
         return (1 + self.weight.value.astype(self.dtype)) * jnp.asarray(hidden_states, dtype=self.dtype)
 
@@ -705,7 +697,6 @@ class GiddModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        # Calculate residual scale factor
         self.resid_scale = config.resid_scale / config.num_hidden_layers
 
         with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
@@ -794,7 +785,6 @@ class GiddModel(EasyDeLBaseModule):
             ValueError: If both input_ids and inputs_embeds are provided or both are None.
             AssertionError: If sequence_length exceeds max_position_embeddings.
         """
-        # Validate input
         if (input_ids is None) ^ (inputs_embeds is None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
@@ -808,7 +798,6 @@ class GiddModel(EasyDeLBaseModule):
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
 
-        # Validate sequence length
         assert sequence_length <= self.config.max_position_embeddings, (
             f"Maximum Position Embedding Reached ! "
             f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
@@ -821,14 +810,11 @@ class GiddModel(EasyDeLBaseModule):
             attention_mask=attention_mask,
         )
 
-        # Generate position IDs if not provided
         if position_ids is None:
             position_ids = mask_info.q_position_ids
 
-        # Start with input embeddings
         hidden_states = inputs_embeds
 
-        # Determine runtime mode
         if mode is None:
             mode = (
                 common_types.MODE_DECODE
@@ -884,7 +870,6 @@ class GiddModel(EasyDeLBaseModule):
             (hidden_states, all_hidden_states, all_attentions, 0),
             trace=True,
         )
-        # Apply final normalization
         hidden_states = self.norm(hidden_states)
 
         if output_hidden_states:
@@ -974,7 +959,6 @@ class GiddForDiffusionLM(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        # Initialize base model
         self.model = GiddModel(
             config=config,
             dtype=dtype,
@@ -983,7 +967,6 @@ class GiddForDiffusionLM(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        # Initialize language modeling head
         self.lm_head = ColumnParallelLinear(
             config.hidden_size,
             config.vocab_size,
@@ -1042,7 +1025,6 @@ class GiddForDiffusionLM(EasyDeLBaseModule):
             CausalLMOutput: Contains logits (if apply_lm_head), hidden_states, last_hidden_state,
                 attentions, and past_key_values.
         """
-        # Get outputs from base model
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1066,7 +1048,6 @@ class GiddForDiffusionLM(EasyDeLBaseModule):
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        # Apply language modeling head if requested
         lm_logits = None
         if apply_lm_head:
             lm_logits = self.compute_lm_logits(hidden_states)

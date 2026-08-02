@@ -308,7 +308,6 @@ class MixtralSparseMoeBlock(BaseMoeModule):
         self.param_dtype = param_dtype
         self.precision = precision
 
-        # Router/gate
         self.gate = ColumnParallelLinear(
             config.hidden_size,
             config.num_local_experts,
@@ -320,7 +319,6 @@ class MixtralSparseMoeBlock(BaseMoeModule):
             kernel_init=jax.nn.initializers.normal(),
         )
 
-        # Expert MLPs
         self.experts = MixtralMoEMlp(
             config=config,
             dtype=dtype,

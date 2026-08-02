@@ -203,10 +203,8 @@ class EnhancedApiKeyManager:
         # Token usage tracking for rate limits
         self._token_usage_windows: dict[str, dict[str, deque]] = defaultdict(lambda: defaultdict(deque))
 
-        # Audit log
         self._audit_log: deque[AuditLogEntry] = deque(maxlen=max_audit_entries)
 
-        # Initialize persistent storage
         self.storage: AuthStorage | None = None
         if enable_persistence:
             self.storage = AuthStorage(
@@ -243,14 +241,12 @@ class EnhancedApiKeyManager:
             return
 
         try:
-            # Load keys
             keys = self.storage.load_keys()
             for hashed_key, metadata in keys.items():
                 self._keys[hashed_key] = metadata
                 self._key_id_to_hash[metadata.key_id] = hashed_key
             logger.info(f"Loaded {len(keys)} API keys from storage")
 
-            # Load audit logs
             if self.enable_audit_logging:
                 logs = self.storage.load_audit_logs()
                 for log in logs[-self.max_audit_entries :]:  # Only load up to max
@@ -270,14 +266,11 @@ class EnhancedApiKeyManager:
             return
 
         try:
-            # Save keys
             self.storage.save_keys(self._keys)
 
-            # Save audit logs
             if self.enable_audit_logging:
                 self.storage.save_audit_logs(list(self._audit_log))
 
-            # Save usage stats
             stats = self.get_statistics()
             self.storage.save_usage_stats(stats)
 
@@ -314,11 +307,9 @@ class EnhancedApiKeyManager:
         Args:
             key: Raw admin key string supplied to the constructor.
         """
-        # Check if admin key already exists in storage
         hashed = self._hash_key(key)
         if hashed in self._keys:
             logger.info("Admin key already exists in storage, skipping creation")
-            # Cache the raw key for validation
             self._raw_to_hash_cache[key] = hashed
             return
 
@@ -558,7 +549,6 @@ class EnhancedApiKeyManager:
         if not raw_key:
             return None
 
-        # Check cache first
         hashed_key = self._raw_to_hash_cache.get(raw_key)
         if hashed_key is None:
             hashed_key = self._hash_key(raw_key)
@@ -569,7 +559,6 @@ class EnhancedApiKeyManager:
         if metadata is None:
             return None
 
-        # Check if key is active
         if not metadata.is_active():
             return None
 
@@ -617,7 +606,6 @@ class EnhancedApiKeyManager:
             RateLimitExceeded: When a sliding-window limit fires.
             QuotaExceeded: When a cumulative quota is breached.
         """
-        # Validate key
         metadata = self.validate_key(raw_key)
         if metadata is None:
             self._log_audit(
@@ -628,10 +616,8 @@ class EnhancedApiKeyManager:
             )
             raise PermissionDenied("Invalid or inactive API key")
 
-        # Update last used timestamp
         metadata.update_last_used()
 
-        # Check IP restrictions
         if not self._check_ip_permissions(metadata, ip_address):
             self._log_audit(
                 action="request_denied",
@@ -642,7 +628,6 @@ class EnhancedApiKeyManager:
             )
             raise PermissionDenied(f"Access denied from IP address: {ip_address}")
 
-        # Check endpoint permissions
         if not self._check_endpoint_permissions(metadata, endpoint):
             self._log_audit(
                 action="request_denied",
@@ -653,7 +638,6 @@ class EnhancedApiKeyManager:
             )
             raise PermissionDenied(f"Access denied to endpoint: {endpoint}")
 
-        # Check model permissions
         if model and not self._check_model_permissions(metadata, model):
             self._log_audit(
                 action="request_denied",
@@ -664,13 +648,10 @@ class EnhancedApiKeyManager:
             )
             raise PermissionDenied(f"Access denied to model: {model}")
 
-        # Check rate limits
         self._check_rate_limits(metadata, requested_tokens)
 
-        # Check quotas
         self._check_quotas(metadata, requested_tokens)
 
-        # Check per-request token limit
         if metadata.permissions.max_tokens_per_request:
             if requested_tokens > metadata.permissions.max_tokens_per_request:
                 raise PermissionDenied(
@@ -704,12 +685,10 @@ class EnhancedApiKeyManager:
 
         permissions = metadata.permissions
 
-        # Check blocklist first
         if permissions.blocked_ip_addresses:
             if ip_address in permissions.blocked_ip_addresses:
                 return False
 
-        # Check allowlist
         if permissions.allowed_ip_addresses:
             return ip_address in permissions.allowed_ip_addresses
 
@@ -786,7 +765,6 @@ class EnhancedApiKeyManager:
         key_id = metadata.key_id
         requested_tokens = max(requested_tokens, 0)
 
-        # Check requests per minute
         if rate_limits.requests_per_minute:
             window = self._rate_limit_windows[key_id]["requests_minute"]
             self._clean_window(window, current_time, 60)
@@ -794,7 +772,6 @@ class EnhancedApiKeyManager:
                 raise RateLimitExceeded(f"Rate limit exceeded: {rate_limits.requests_per_minute} requests/minute")
             window.append(current_time)
 
-        # Check requests per hour
         if rate_limits.requests_per_hour:
             window = self._rate_limit_windows[key_id]["requests_hour"]
             self._clean_window(window, current_time, 3600)
@@ -802,7 +779,6 @@ class EnhancedApiKeyManager:
                 raise RateLimitExceeded(f"Rate limit exceeded: {rate_limits.requests_per_hour} requests/hour")
             window.append(current_time)
 
-        # Check requests per day
         if rate_limits.requests_per_day:
             window = self._rate_limit_windows[key_id]["requests_day"]
             self._clean_window(window, current_time, 86400)
@@ -857,7 +833,6 @@ class EnhancedApiKeyManager:
         metadata.reset_monthly_counters_if_needed()
         quota = metadata.quota
 
-        # Check lifetime token limit
         if quota.max_total_tokens:
             if (
                 metadata.total_prompt_tokens + metadata.total_completion_tokens + requested_tokens
@@ -865,17 +840,14 @@ class EnhancedApiKeyManager:
             ):
                 raise QuotaExceeded(f"Total token quota exceeded: {quota.max_total_tokens}")
 
-        # Check lifetime request limit
         if quota.max_total_requests:
             if metadata.total_requests >= quota.max_total_requests:
                 raise QuotaExceeded(f"Total request quota exceeded: {quota.max_total_requests}")
 
-        # Check monthly token limit
         if quota.monthly_token_limit:
             if metadata.monthly_tokens + requested_tokens > quota.monthly_token_limit:
                 raise QuotaExceeded(f"Monthly token quota exceeded: {quota.monthly_token_limit}")
 
-        # Check monthly request limit
         if quota.monthly_request_limit:
             if metadata.monthly_requests >= quota.monthly_request_limit:
                 raise QuotaExceeded(f"Monthly request quota exceeded: {quota.monthly_request_limit}")
@@ -936,10 +908,8 @@ class EnhancedApiKeyManager:
             metadata.monthly_requests += 1
             metadata.monthly_tokens += max(prompt_tokens + completion_tokens, 0)
 
-        # Track token rate limits
         self._record_token_rate_limit(metadata, prompt_tokens + completion_tokens)
 
-        # Mark storage as dirty for next auto-save
         self._mark_dirty_and_save()
 
     def _record_token_rate_limit(self, metadata: ApiKeyMetadata, tokens: int) -> None:
@@ -1115,16 +1085,13 @@ class EnhancedApiKeyManager:
             if metadata is None:
                 return False
 
-            # Remove from all data structures
             del self._keys[hashed_key]
             del self._key_id_to_hash[key_id]
 
-            # Clear from cache
             for raw_key, cached_hash in list(self._raw_to_hash_cache.items()):
                 if cached_hash == hashed_key:
                     del self._raw_to_hash_cache[raw_key]
 
-            # Clear rate limit windows
             if key_id in self._rate_limit_windows:
                 del self._rate_limit_windows[key_id]
             if key_id in self._token_usage_windows:
@@ -1311,22 +1278,18 @@ class EnhancedApiKeyManager:
         if old_metadata is None:
             return None
 
-        # Generate new key
         new_raw_key = f"sk-{secrets.token_urlsafe(48)}"
         new_hashed_key = self._hash_key(new_raw_key)
 
         with self._lock:
-            # Remove old key
             old_hashed_key = self._key_id_to_hash.get(key_id)
             if old_hashed_key:
                 del self._keys[old_hashed_key]
 
-            # Update metadata
             old_metadata.hashed_key = new_hashed_key
             old_metadata.key_prefix = new_raw_key[:12] + "..."
             old_metadata.last_rotated_at = time.time()
 
-            # Store with new hash
             self._keys[new_hashed_key] = old_metadata
             self._key_id_to_hash[key_id] = new_hashed_key
             self._raw_to_hash_cache[new_raw_key] = new_hashed_key

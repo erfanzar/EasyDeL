@@ -181,7 +181,6 @@ class BaseDatasetInform:
                 inferred from :attr:`data_files`.
         """
         if self.type is None:
-            # Convert PathLike to string for type inference
             inferred_type = None
             if self.data_files:
                 first_file: os.PathLike | str | None
@@ -422,11 +421,9 @@ class DatasetMixture:
     pack_on_the_fly: bool = False
     tokenize_callback: tp.Callable[[dict[str, tp.Any]], list[int]] | None = None
 
-    # Prefetch configuration
     prefetch_workers: int = 2
     prefetch_buffer_size: int = 4
 
-    # Cloud storage options
     cloud_max_retries: int = 3
     cloud_retry_delay: float = 0.1
     cache_remote_files: bool = True

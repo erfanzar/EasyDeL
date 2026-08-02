@@ -121,7 +121,6 @@ def quantize(
     """
     # Import here to avoid circular dependencies
 
-    # Resolve config
     if config is not None:
         dtype = config.dtype
         block_size = config.block_size
@@ -132,7 +131,6 @@ def quantize(
     if isinstance(dtype, str):
         dtype = QuantizationType(dtype)
 
-    # Dispatch to appropriate quantization
     if dtype == QuantizationType.NF4:
         quantized = ArrayNF4.quantize(array, block_size=block_size)
         return quantized.materialize() if simulate else quantized
@@ -207,7 +205,6 @@ def straight_through(
     """
     # Import type-specific STE functions
 
-    # Resolve config
     if config is not None:
         dtype = config.dtype
         block_size = config.block_size
@@ -217,7 +214,6 @@ def straight_through(
     if isinstance(dtype, str):
         dtype = QuantizationType(dtype)
 
-    # Dispatch to appropriate STE
     if dtype == QuantizationType.NF4:
         return straight_through_nf4(array, block_size=block_size)
 

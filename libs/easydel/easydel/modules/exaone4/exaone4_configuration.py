@@ -179,13 +179,11 @@ class Exaone4Config(EasyDeLBaseConfig):
         self.rope_scaling = rope_scaling
         self._rope_scaling_validation()
 
-        # Set num_key_value_heads
         if num_key_value_heads is None:
             num_key_value_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
         self.head_dim = hidden_size // num_attention_heads
 
-        # Compute layer_types from sliding_window_pattern
         if self.sliding_window is None:
             sliding_window_pattern = 0
 

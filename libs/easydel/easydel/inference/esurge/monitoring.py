@@ -159,7 +159,6 @@ class PrometheusMetrics:
 
         self.prefix = prefix
 
-        # Request metrics
         self.requests_total = Counter(f"{prefix}requests_total", "Total number of requests", ["status"])
 
         self.request_duration = Histogram(
@@ -178,7 +177,6 @@ class PrometheusMetrics:
 
         self.tokens_per_second = Gauge(f"{prefix}tokens_per_second", "Current tokens per second throughput")
 
-        # Scheduler metrics
         self.waiting_requests = Gauge(f"{prefix}waiting_requests", "Number of requests waiting to be scheduled")
 
         self.running_requests = Gauge(f"{prefix}running_requests", "Number of currently running requests")
@@ -195,7 +193,6 @@ class PrometheusMetrics:
             buckets=[0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1],
         )
 
-        # Model runner metrics
         self.model_execution_duration = Histogram(
             f"{prefix}model_execution_duration_seconds",
             "Model execution duration in seconds",
@@ -204,14 +201,12 @@ class PrometheusMetrics:
 
         self.batch_size = Gauge(f"{prefix}batch_size", "Current batch size")
 
-        # Cache metrics
         self.cache_pages_total = Gauge(f"{prefix}cache_pages_total", "Total number of cache pages")
 
         self.cache_pages_used = Gauge(f"{prefix}cache_pages_used", "Number of used cache pages")
 
         self.cache_hit_rate = Gauge(f"{prefix}cache_hit_rate", "Cache hit rate (0-1)")
 
-        # System info
         self.system_info = Info(f"{prefix}system_info", "System information")
 
         # Monotonic cursor: total requests seen so far (completed + failed).
@@ -392,7 +387,6 @@ class RichConsoleMonitor:
         self.running = False
         self._thread: threading.Thread | None = None
 
-        # Layout for the console display
         self.layout = Layout()
         self.layout.split_column(Layout(name="header", size=3), Layout(name="main"), Layout(name="footer", size=3))
 
@@ -545,18 +539,15 @@ class RichConsoleMonitor:
             self.layout["header"].update(Panel("No metrics collector initialized", style="red"))
             return
 
-        # Header
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         self.layout["header"].update(Panel(f"eSurge Live Monitor - {timestamp}", style="bold blue"))
 
-        # Left column
         left_layout = Layout()
         left_layout.split_column(
             Layout(self._create_system_metrics_table(collector)), Layout(self._create_recent_requests_table(collector))
         )
         self.layout["left"].update(left_layout)
 
-        # Right column
         right_layout = Layout()
         right_layout.split_column(
             Layout(self._create_scheduler_metrics_table(collector)),
@@ -565,7 +556,6 @@ class RichConsoleMonitor:
         )
         self.layout["right"].update(right_layout)
 
-        # Footer
         self.layout["footer"].update(Panel("Press Ctrl+C to stop monitoring", style="dim"))
 
     def start(self, blocking: bool = False) -> None:
@@ -654,7 +644,6 @@ class eSurgeMonitoringServer:
         self.dashboard_port = dashboard_port
         self.update_interval = update_interval
 
-        # Initialize Prometheus metrics if available
         self.prometheus_metrics = None
         if PROMETHEUS_AVAILABLE:
             self.prometheus_metrics = PrometheusMetrics(metrics_prefix)
@@ -702,10 +691,8 @@ class eSurgeMonitoringServer:
 
         self.running = True
 
-        # Start Prometheus server
         self.start_prometheus_server()
 
-        # Start metrics update thread
         self._update_thread = threading.Thread(target=self._update_metrics_loop, daemon=True)
         self._update_thread.start()
 
@@ -723,7 +710,6 @@ class eSurgeMonitoringServer:
         logging.info("eSurge monitoring server stopped")
 
 
-# Global monitoring instances
 _monitoring_server: eSurgeMonitoringServer | None = None
 _console_monitor: RichConsoleMonitor | None = None
 

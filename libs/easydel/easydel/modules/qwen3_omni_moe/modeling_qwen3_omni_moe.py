@@ -3920,7 +3920,6 @@ class Qwen3OmniMoeCode2Wav(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        # Offset buffer for each quantizer
         self.code_offset = jnp.arange(config.num_quantizers).reshape(1, -1, 1) * config.codebook_size
 
         self.pre_transformer = Qwen3OmniMoeCode2WavTransformerModel(
@@ -3951,7 +3950,6 @@ class Qwen3OmniMoeCode2Wav(EasyDeLBaseModule):
         codes_with_offset = codec_tokens + self.code_offset
         hidden_states = self.code_embedding(codes_with_offset.astype("i4")).mean(axis=1)
 
-        # Pass through transformer
         outputs = typing.cast(BaseModelOutput, self.pre_transformer(hidden_states, attention_mask))
 
         return outputs

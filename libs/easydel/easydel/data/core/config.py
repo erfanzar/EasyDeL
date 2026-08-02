@@ -163,10 +163,8 @@ class DatasetConfig:
     # Source (required)
     data_files: str | os.PathLike | list[str | os.PathLike]
 
-    # Identity
     name: str | None = None
 
-    # Source options
     type: Literal["json", "jsonl", "parquet", "csv", "arrow", "huggingface", "hf", "txt"] | None = None
     split: str = "train"
     num_rows: int | None = None
@@ -184,7 +182,6 @@ class DatasetConfig:
     save_path: str | None = None
     save_format: Literal["parquet", "arrow", "jsonl"] | None = None
 
-    # Content mapping
     content_field: str = "text"
     additional_fields: list[str] | None = None
     format_callback: Callable[[dict[str, Any]], dict[str, Any]] | None = None
@@ -708,12 +705,10 @@ class PipelineConfig:
     # Datasets (required)
     datasets: list[DatasetConfig]
 
-    # Global settings
     default_tokenizer: str | None = None
     streaming: bool = True
     seed: int | None = None
 
-    # Stage configurations
     source: SourceStageConfig = field(default_factory=SourceStageConfig)
     tokenize: TokenizeStageConfig = field(default_factory=TokenizeStageConfig)
     cache: CacheStageConfig = field(default_factory=CacheStageConfig)
@@ -739,7 +734,6 @@ class PipelineConfig:
         if not self.datasets:
             raise ValueError("At least one dataset is required")
 
-        # Assign auto-generated names to datasets without names
         for i, ds in enumerate(self.datasets):
             if ds.name is None:
                 ds.name = f"dataset_{i}"
@@ -776,18 +770,15 @@ class PipelineConfig:
         """
         errors = []
 
-        # Check for duplicate dataset names
         names = [ds.name for ds in self.datasets]
         if len(names) != len(set(names)):
             errors.append("Duplicate dataset names found")
 
-        # Validate mix weights reference valid dataset names
         if self.mix.weights:
             for name in self.mix.weights:
                 if name not in names:
                     errors.append(f"Mix weight references unknown dataset: {name}")
 
-        # Validate weight schedule
         if self.mix.weight_schedule:
             for point in self.mix.weight_schedule:
                 for name in point.weights:
@@ -858,11 +849,9 @@ def merge_tokenizer_config(
     if tok_cfg is not None:
         return tok_cfg
 
-    # Check stage default
     if stage_cfg.default_tokenizer:
         return TokenizerConfig(name_or_path=stage_cfg.default_tokenizer, max_length=stage_cfg.max_length)
 
-    # Check global default
     if global_tokenizer:
         return TokenizerConfig(name_or_path=global_tokenizer, max_length=stage_cfg.max_length)
 

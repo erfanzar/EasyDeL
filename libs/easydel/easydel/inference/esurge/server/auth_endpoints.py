@@ -36,7 +36,6 @@ from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-# Import auth models from workers
 from easydel.workers.esurge.auth.auth_models import (
     ApiKeyPermissions,
     ApiKeyRole,
@@ -89,7 +88,6 @@ class CreateApiKeyRequest(BaseModel):
     enable_function_calling: bool = Field(True, description="Allow function calling")
     max_tokens_per_request: int | None = Field(None, description="Max tokens per single request (None = unlimited)")
 
-    # Metadata
     tags: list[str] | None = Field(None, description="Tags for organization")
     metadata: dict[str, tp.Any] | None = Field(None, description="Additional custom metadata")
 
@@ -135,7 +133,6 @@ class UpdateApiKeyRequest(BaseModel):
     enable_function_calling: bool | None = Field(None, description="Allow function calling")
     max_tokens_per_request: int | None = Field(None, description="Max tokens per request (None = unlimited)")
 
-    # Metadata
     tags: list[str] | None = Field(None, description="Tags for organization")
     metadata: dict[str, tp.Any] | None = Field(None, description="Additional custom metadata")
 
@@ -166,18 +163,15 @@ class AuthEndpointsMixin:
             if auth_header and auth_header.lower().startswith("bearer "):
                 api_key = auth_header.split(" ", 1)[1].strip()
 
-            # Try X-API-Key header
             if not api_key:
                 api_key = raw_request.headers.get("X-API-Key")
 
-            # Try query parameter
             if not api_key:
                 api_key = raw_request.query_params.get("api_key")
 
         if not api_key:
             raise HTTPException(status_code=401, detail="API key required for this endpoint")
 
-        # Validate the key and check role
         if not hasattr(self, "auth_manager"):
             raise HTTPException(status_code=500, detail="Auth manager not initialized")
 
@@ -188,7 +182,6 @@ class AuthEndpointsMixin:
         if metadata.role != ApiKeyRole.ADMIN:
             raise HTTPException(status_code=403, detail="Admin role required for this endpoint")
 
-        # Store in state for later use
         raw_request.state.api_key = api_key
         raw_request.state.api_key_metadata = metadata
 
@@ -207,7 +200,6 @@ class AuthEndpointsMixin:
         """
         self._require_admin_role(raw_request)
 
-        # Build configuration objects
         rate_limits = RateLimitConfig(
             requests_per_minute=request.requests_per_minute,
             requests_per_hour=request.requests_per_hour,
@@ -234,12 +226,10 @@ class AuthEndpointsMixin:
             max_tokens_per_request=request.max_tokens_per_request,
         )
 
-        # Get the admin's key for audit trail
         admin_key = getattr(raw_request.state, "api_key", None)
         admin_metadata = self.auth_manager.validate_key(admin_key)
         created_by = admin_metadata.name if admin_metadata else "unknown"
 
-        # Generate the key
         raw_key, metadata = self.auth_manager.generate_api_key(
             name=request.name,
             role=request.role,
@@ -368,7 +358,6 @@ class AuthEndpointsMixin:
 
         provided_fields = set(request.model_fields_set)
 
-        # Build configuration objects if any fields are set
         rate_limits = None
         rate_limit_fields = {
             "requests_per_minute",
@@ -492,7 +481,6 @@ class AuthEndpointsMixin:
                 ),
             )
 
-        # Get the admin's key for audit trail
         admin_key = getattr(raw_request.state, "api_key", None)
         admin_metadata = self.auth_manager.validate_key(admin_key)
         updated_by = admin_metadata.name if admin_metadata else "unknown"

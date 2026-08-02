@@ -225,7 +225,6 @@ class OperationMetadata:
         self.set_attrs_carefully("axis_policy", AxisPolicy.from_partition_axis(self.partition_axis))
         self.axis_policy = AxisPolicy.from_partition_axis(self.axis_policy)
         self.partition_axis = self.axis_policy.to_partition_axis()
-        # DON'T READ FROM CONFIG
         self.set_attrs_carefully("sequence_axis_name", "sp", "sequence_axis_name", use_base_config=False)
         self.set_attrs_carefully("backend", jax.default_backend(), "backend")
         self.set_attrs_carefully("platform", NOT_GIVEN, "platform")

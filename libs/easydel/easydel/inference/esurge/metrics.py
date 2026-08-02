@@ -306,21 +306,17 @@ class MetricsCollector:
         # Thread-safe data structures
         self._lock = Lock()
 
-        # Metrics storage
         self.request_metrics: dict[str, RequestMetrics] = {}
         self.completed_requests: deque[RequestMetrics] = deque(maxlen=history_size)
         self.scheduler_metrics: deque[SchedulerMetrics] = deque(maxlen=history_size)
         self.runner_metrics: deque[ModelRunnerMetrics] = deque(maxlen=history_size)
         self.cache_metrics: deque[CacheMetrics] = deque(maxlen=history_size)
 
-        # Counters and aggregates
         self.counters = defaultdict(int)
         self.timers = defaultdict(list)
 
-        # Last log time
         self.last_log_time = time.time()
 
-        # Setup logging
         self.logger = logging.getLogger("eSurge.metrics")
         if log_file:
             handler = logging.FileHandler(log_file)
@@ -412,17 +408,14 @@ class MetricsCollector:
             metrics.finish_reason = finish_reason
             metrics.error = error
 
-            # Calculate tokens per second
             if metrics.generated_tokens > 0 and metrics.time_to_first_token is not None:
                 generation_time = metrics.total_latency - metrics.time_to_first_token
                 if generation_time > 0:
                     metrics.tokens_per_second = metrics.generated_tokens / generation_time
 
-            # Move to completed requests
             self.completed_requests.append(metrics)
             del self.request_metrics[request_id]
 
-            # Update counters
             if error:
                 self.counters["total_failed"] += 1
             else:
@@ -559,13 +552,11 @@ class MetricsCollector:
         cutoff_time = current_time - window_seconds
 
         with self._lock:
-            # Filter recent completed requests
             recent_requests = [req for req in self.completed_requests if req.end_time and req.end_time >= cutoff_time]
 
             if not recent_requests:
                 return SystemMetrics(timestamp=current_time)
 
-            # Calculate aggregates
             total_completed = len(recent_requests)
             total_failed = len([req for req in recent_requests if req.error])
             total_tokens = sum(req.generated_tokens for req in recent_requests)
@@ -609,7 +600,6 @@ class MetricsCollector:
         with self._lock:
             system_metrics = self.get_system_metrics()
 
-            # Get latest metrics from each category
             latest_scheduler = self.scheduler_metrics[-1] if self.scheduler_metrics else None
             latest_runner = self.runner_metrics[-1] if self.runner_metrics else None
             latest_cache = self.cache_metrics[-1] if self.cache_metrics else None
@@ -679,7 +669,6 @@ class MetricsCollector:
             self.timers.clear()
 
 
-# Global metrics collector instance
 _global_metrics_collector: MetricsCollector | None = None
 
 

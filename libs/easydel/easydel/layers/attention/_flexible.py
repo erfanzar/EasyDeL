@@ -555,7 +555,6 @@ class FlexibleAttentionModule(spx.Module):
         else:
             output_attentions_computed = output_attentions
 
-        # Use provided softmax_scale or self.softmax_scale
         if softmax_scale is None:
             softmax_scale_computed = self.softmax_scale
         else:
@@ -1301,7 +1300,6 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
                 current_row = index - 1
                 start_k = jnp.clip(current_row - left_window, 0, jnp.maximum(K - width, 0))
                 imsk = jax.lax.dynamic_slice_in_dim(imsk, start_k, width, axis=2)  # (H,1,width)
-                # Slice KV tensors along K
                 ikey = jax.lax.dynamic_slice_in_dim(ikey, start_k, width, axis=0)  # (width, ...)
                 ival = jax.lax.dynamic_slice_in_dim(ival, start_k, width, axis=0)  # (width, ...)
                 return ikey, ival, imsk

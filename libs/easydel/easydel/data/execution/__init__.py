@@ -53,11 +53,8 @@ from .save import (
 )
 
 __all__ = [
-    # Save
     "ArrowWriter",
-    # Loader
     "AsyncDataLoader",
-    # Cache
     "CacheLayer",
     "CacheMetadata",
     "DatasetCache",
@@ -67,7 +64,6 @@ __all__ = [
     "LoadStage",
     "MemoryCache",
     "ParquetWriter",
-    # Pipeline
     "Pipeline",
     "PrefetchIterator",
     "SaveStage",

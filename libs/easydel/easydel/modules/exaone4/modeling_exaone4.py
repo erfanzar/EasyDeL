@@ -422,7 +422,6 @@ class Exaone4DecoderLayer(spx.Module):
         """
         # Post-norm pattern: residual + norm(sublayer(x))
 
-        # Self-attention block
         residual = hidden_states
         attention_output = self.self_attn(
             hidden_states,
@@ -437,7 +436,6 @@ class Exaone4DecoderLayer(spx.Module):
         hidden_states = self.post_attention_layernorm(attention_output.attention_output)
         hidden_states = residual + hidden_states
 
-        # MLP block
         residual = hidden_states
         if self.config.use_scan_mlp:
             mlp_output = blockwise_ffn(

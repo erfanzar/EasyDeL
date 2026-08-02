@@ -486,14 +486,12 @@ class DiskCache(CacheLayer):
         if not data_path.exists():
             return None
 
-        # Check expiry
         if self.expiry_seconds is not None:
             age = time.time() - data_path.stat().st_mtime
             if age > self.expiry_seconds:
                 self.invalidate(key)
                 return None
 
-        # Load metadata
         metadata = None
         if meta_path.exists():
             try:
@@ -510,7 +508,6 @@ class DiskCache(CacheLayer):
                 except OSError:
                     logger.debug("Failed to delete invalid cache metadata at %s.", meta_path, exc_info=True)
 
-        # Load data
         try:
             compressed = data_path.read_bytes()
             data = pickle.loads(self._decompress(compressed))
@@ -540,12 +537,10 @@ class DiskCache(CacheLayer):
         """
         data_path, meta_path = self._get_paths(key)
 
-        # Save data
         serialized = pickle.dumps(value)
         compressed = self._compress(serialized)
         data_path.write_bytes(compressed)
 
-        # Save metadata
         if metadata:
             meta_path.write_text(json.dumps(metadata.to_dict()))
 
@@ -562,7 +557,6 @@ class DiskCache(CacheLayer):
         if not data_path.exists():
             return False
 
-        # Check expiry
         if self.expiry_seconds is not None:
             age = time.time() - data_path.stat().st_mtime
             if age > self.expiry_seconds:
@@ -578,7 +572,6 @@ class DiskCache(CacheLayer):
                 under ``cache_dir``.
         """
         if key is None:
-            # Clear entire cache
             import shutil
 
             shutil.rmtree(self.cache_dir, ignore_errors=True)
@@ -660,7 +653,6 @@ class TreeCacheManager:
         for i, layer in enumerate(self._layers):
             result = layer.get(key)
             if result is not None:
-                # Promote to higher layers
                 for higher_layer in self._layers[:i]:
                     higher_layer.put(key, result[0], result[1])
                 return result
@@ -738,7 +730,6 @@ class TreeCacheManager:
         if result is not None:
             data, cached_meta = result
 
-            # Validate if function provided
             if validate_fn is not None and cached_meta is not None:
                 if not validate_fn(cached_meta):
                     self.invalidate(key)
@@ -747,7 +738,6 @@ class TreeCacheManager:
             else:
                 return data
 
-        # Compute and cache
         value = compute_fn()
         self.put(key, value, metadata)
         return value

@@ -194,7 +194,6 @@ class VanillaAttn(OperationImpl):
             model_mode = self.get_mode(query=query, BTHD=True)
             shardings = self.metadata.get_shardings(model_mode, layout="bthd")
 
-            # Initialize bias if needed
             needs_bias_init: bool = mask_info is None and bias is None and init_bias is not None
             bias_computed: Float[Array, "batch num_heads seq_len kv_len"] | None
             if needs_bias_init:
@@ -202,7 +201,6 @@ class VanillaAttn(OperationImpl):
             else:
                 bias_computed = bias
 
-            # Apply sharding constraints to inputs
             query = with_sharding_constraint(arr=query, sharding=shardings.query, mesh=mesh)
             key = with_sharding_constraint(arr=key, sharding=shardings.key, mesh=mesh)
             value = with_sharding_constraint(arr=value, sharding=shardings.value, mesh=mesh)
@@ -270,7 +268,6 @@ class VanillaAttn(OperationImpl):
             else:
                 outputs, weights = attn_result, None
 
-            # Apply output sharding
             outputs_sharded = with_sharding_constraint(arr=outputs, sharding=shardings.output, mesh=mesh)
             return AttentionOutput(attention_weights=weights, attention_outputs=outputs_sharded)
 
@@ -512,7 +509,6 @@ class VanillaAttn(OperationImpl):
 if __name__ == "__main__":
     from easydel.infra import EasyDeLBaseConfig
 
-    # Test cace when qkv might refer to mla
     b, qs, ks, qh, kh, d, vd = 1, 1024, 1024, 32, 8, 128, 128 + 64
     query = jr.normal(jr.key(0), (b, qs, qh, d), "f2")
     key = jr.normal(jr.key(1), (b, ks, kh, d), "f2")

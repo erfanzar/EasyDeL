@@ -227,7 +227,6 @@ class ModelOutput(collections.OrderedDict):
         """
         class_fields = fields(self)
 
-        # Safety and consistency checks
         if not len(class_fields):
             raise ValueError(f"{self.__class__.__name__} has no fields.")
         if not all(field.default is None for field in class_fields[1:]):

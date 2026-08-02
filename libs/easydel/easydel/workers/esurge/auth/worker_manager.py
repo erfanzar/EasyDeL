@@ -243,7 +243,6 @@ class AuthWorkerManager:
             endpoint,
         ]
 
-        # Add auth config parameters
         if self._require_api_key:
             cmd.append("--require-api-key")
         if self._admin_key:

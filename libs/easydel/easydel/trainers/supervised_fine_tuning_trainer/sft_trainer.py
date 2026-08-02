@@ -153,7 +153,6 @@ class SFTTrainer(Trainer):
         if formatting_func is None and arguments.dataset_text_field is None and train_dataset is not None:
             formatting_func = get_formatting_func_from_dataset(train_dataset, processing_class)
 
-        # Store for use in _get_preprocess_transform
         self.arguments = arguments
         self.tokenizer = tokenizer
         self._formatting_func = formatting_func
@@ -207,7 +206,6 @@ class SFTTrainer(Trainer):
         if bool(dataset_kwargs.get("skip_prepare_dataset", False)):
             return None
 
-        # Skip if already tokenized
         if self._is_pretokenized():
             return None
 

@@ -206,7 +206,6 @@ class OperationImpl(BaseOperation):
             >>> # Instance override: metadata.requires_cache=False
             >>> instance_reqs = op.get_instance_requirements()
         """
-        # Get class-level requirements
         reqs = self.get_requirements(mode)
 
         # Apply instance-level requires_cache override from metadata

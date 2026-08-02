@@ -1085,7 +1085,6 @@ def chunked_distillation_loss(
 
     B, L = student_hidden.shape[:2]
 
-    # Pad sequence length to a multiple of chunk_size.
     pad_len = (-L) % chunk_size
     if pad_len:
         student_hidden = jnp.pad(student_hidden, ((0, 0), (0, pad_len), (0, 0)))
@@ -1834,7 +1833,6 @@ def distillation_step(
         )
         return total_loss, metrics
 
-    # Compute gradients and metrics across minibatches.
     if is_training:
         gradients, metrics = minibatch_call(
             state=student_state,

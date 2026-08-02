@@ -202,7 +202,6 @@ def nf4xf32_to_f32(x):
     )
 
 
-# Bit operation utilities
 sr = jax.lax.shift_right_logical  # Logical right shift (zero-fill)
 sl = jax.lax.shift_left  # Left shift
 ba = jax.lax.bitwise_and  # Bitwise AND
@@ -378,7 +377,6 @@ def single_quantize_and_pack_nf4(blocks, block_size=64):
     num_blocks = features // block_size
     blocks = blocks.reshape(*batch_dims, num_blocks, block_size)
 
-    # Compute absmax per block along last dimension
     absmax = jnp.max(jnp.abs(blocks), axis=-1, keepdims=True)  # (..., num_blocks, 1)
     normalized = blocks / (absmax + jnp.finfo(blocks.dtype).tiny)
 
@@ -386,7 +384,6 @@ def single_quantize_and_pack_nf4(blocks, block_size=64):
     errors = normalized[..., None] - get_nf4()  # (..., num_blocks, block_size, 16)
     quantized = jnp.argmin(jnp.abs(errors), axis=-1)  # (..., num_blocks, block_size)
 
-    # Pack two 4-bit values into one 8-bit value
     quantized = quantized.reshape(*batch_dims, num_blocks, block_size // 2, 2)
     packed = (quantized[..., 0] << 4) | quantized[..., 1]  # (..., num_blocks, block_size // 2)
 
@@ -425,21 +422,17 @@ def single_dequantize_nf4(packed_values, absmax, block_size):
         Uses a polynomial approximation (nf4xf32_to_f32) instead of table lookup
         for faster dequantization on accelerators.
     """
-    # Unpack 4-bit values from 8-bit packed format
     high = (packed_values >> 4) & 0xF  # (..., num_blocks, block_size // 2)
     low = packed_values & 0xF  # (..., num_blocks, block_size // 2)
     unpacked = jnp.stack([high, low], axis=-1)  # (..., num_blocks, block_size // 2, 2)
 
-    # Get shape info
     *batch_dims, num_blocks, _ = packed_values.shape
     unpacked = unpacked.reshape(*batch_dims, num_blocks, block_size)  # (..., num_blocks, block_size)
 
     dequantized = nf4xf32_to_f32(unpacked)
 
-    # Scale by absmax
     scaled = dequantized * absmax[..., None]  # (..., num_blocks, block_size)
 
-    # Flatten last two dimensions back to original feature dimension
     scaled = scaled.reshape(*batch_dims, num_blocks * block_size)  # (..., features)
     return scaled
 
@@ -615,7 +608,6 @@ def bmm_nf4(
     if quants.dtype == jnp.int8:
         w1 = (quants.astype(jnp.float32) / 127.5) * scale.astype(jnp.float32)
     else:
-        # Convert int4 to unsigned, then dequantize
         quants = i4tou4(quants.astype(jnp.int32))
         quants = nf4xf32_to_f32(quants)
         w1 = quants * scale
@@ -730,7 +722,6 @@ def nf4_matmul(inputs, *tensors, kernel, backward=False, blocks=None):
     if k < block_k:
         block_k = max(128, int(2 ** np.floor(np.log2(k))))
 
-    # Pad inputs and tensors to match block sizes
     x_pad = (block_x - x) % block_x
     k_pad = (block_k - k) % block_k
 

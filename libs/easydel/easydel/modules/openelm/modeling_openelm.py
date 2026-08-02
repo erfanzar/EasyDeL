@@ -697,7 +697,6 @@ class OpenELMDecoderLayer(spx.Module):
         )
         hidden_states = checkpoint_name(residual + attn_outputs.attention_output, "residual")
 
-        # Fully Connected
         residual = hidden_states
         hidden_states = self.ffn_norm(hidden_states)
         if self.config.use_scan_mlp:

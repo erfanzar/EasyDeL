@@ -261,7 +261,6 @@ class BlockSparseAttn(OperationImpl):
         query_length: int = query.shape[1]
         key_length: int = key.shape[1]
 
-        # Check dimension compatibility for MLA-style attention
         query_dim: int = query.shape[-1]
         key_dim: int = key.shape[-1]
         value_dim: int = value.shape[-1]
@@ -270,7 +269,6 @@ class BlockSparseAttn(OperationImpl):
         if dims_incompatible:
             return _run_vanilla_fallback()
 
-        # Check hardware-specific constraints for block sparse attention
         current_backend: str = jax.default_backend()
         is_tpu: bool = current_backend == "tpu"
         is_gpu: bool = current_backend == "gpu"
@@ -354,7 +352,6 @@ class BlockSparseAttn(OperationImpl):
         key_transposed: Float[Array, "batch kv_num_heads kv_len head_dim"] = key.transpose(0, 2, 1, 3).astype(dtype)
         value_transposed: Float[Array, "batch kv_num_heads kv_len vhead_dim"] = value.transpose(0, 2, 1, 3).astype(dtype)
 
-        # Create sharding specs
         query_sharding = self.create_stable_sharding(
             shardings.query,
             dep=query_transposed,

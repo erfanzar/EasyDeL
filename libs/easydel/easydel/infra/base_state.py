@@ -228,10 +228,8 @@ if tp.TYPE_CHECKING:
 # Alias for AsyncCheckpointManager for convenient access.
 AM = AsyncCheckpointManager
 
-# Default filename for saving model parameters.
 WEIGHTS_NAME = "easydel-model.parameters"
 
-# Default filename for saving optimizer state tensors.
 OPTIMIZER_NAME = "easydel-optstate.parameters"
 
 # Default filename for saving optimizer state structure (pickle format).

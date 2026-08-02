@@ -52,13 +52,11 @@ from .types import (
 )
 
 __all__ = [
-    # Protocols
     "AsyncDataset",
     "AsyncDatasetProtocol",
     # Types (legacy)
     "BaseDatasetInform",
     "BaseStage",
-    # Config
     "CacheStageConfig",
     "DatasetConfig",
     "DatasetLoadError",

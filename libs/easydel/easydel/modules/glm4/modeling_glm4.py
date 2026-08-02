@@ -357,7 +357,6 @@ class Glm4DecoderLayer(spx.Module):
         """
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        # Self Attention
         attn_outputs = self.self_attn(
             hidden_states=hidden_states,
             mask_info=mask_info,
@@ -370,7 +369,6 @@ class Glm4DecoderLayer(spx.Module):
         )
         hidden_states = self.post_self_attn_layernorm(attn_outputs.attention_output)
         hidden_states = residual + hidden_states
-        # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         if self.config.use_scan_mlp:

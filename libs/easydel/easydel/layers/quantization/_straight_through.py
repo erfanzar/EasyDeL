@@ -424,7 +424,6 @@ def straight_through(
     """
     # Import type-specific STE functions
 
-    # Resolve config
     if config is not None:
         dtype = config.dtype
         group_size = config.group_size

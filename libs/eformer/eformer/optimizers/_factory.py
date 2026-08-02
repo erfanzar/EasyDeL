@@ -208,7 +208,6 @@ class OptimizerFactory:
             raise ValueError(f"Unsupported optimizer: {optimizer_type}. Available: {available}")
 
         builder_cls = _OPTIMIZER_BUILDER_REGISTRY[optimizer_type]
-        # Get the config type from the builder's type hint
         config_field = next((f for f in fields(builder_cls) if f.name == "config"), None)
         if config_field and config_field.type:
             return config_field.type
@@ -253,10 +252,8 @@ class OptimizerFactory:
             TypeError: If the configuration type is invalid.
         """
 
-        # Get the appropriate config class
         config_cls = cls._get_config_class(optimizer_type)
 
-        # Create default config if none provided
         if optimizer_config is None:
             optimizer_config = config_cls()
             for key in list(kwargs.keys()):
@@ -264,23 +261,18 @@ class OptimizerFactory:
                     setattr(optimizer_config, key, kwargs.pop(key))
         if scheduler_config is None:
             scheduler_config = SchedulerConfig()
-        # Convert string dtypes to JAX dtypes
         cls._convert_dtypes(optimizer_config)
 
-        # Validate config type
         if not isinstance(optimizer_config, config_cls):
             raise TypeError(
                 f"Invalid config type {type(optimizer_config)} for optimizer {optimizer_type}. Expected {config_cls}"
             )
 
-        # Validate scheduler config
         if scheduler_config.scheduler_type is None and scheduler_config.warmup_steps:
             raise ValueError("Warmup steps require specifying a scheduler type")
 
-        # Create scheduler
         scheduler = SchedulerFactory.create_scheduler(scheduler_config, custom_scheduler)
 
-        # Create optimizer using builder pattern
         builder_cls = _OPTIMIZER_BUILDER_REGISTRY[optimizer_type]
         builder = builder_cls(config=optimizer_config)
         builder.validate()
@@ -380,14 +372,11 @@ class OptimizerFactory:
         """
         chain = []
 
-        # Add gradient clipping if specified
         if clip_grad:
             chain.append(optax.clip_by_global_norm(clip_grad))
 
-        # Add base optimizer
         chain.append(base_optimizer)
 
-        # Add weight decay if specified
         if weight_decay != 0.0:
             chain.append(
                 optax_add_scheduled_weight_decay(
@@ -396,10 +385,8 @@ class OptimizerFactory:
                 )
             )
 
-        # Chain all transformations
         tx = optax.chain(*chain)
 
-        # Add gradient accumulation if specified
         if gradient_accumulation_steps > 1:
             tx = optax.MultiSteps(tx, gradient_accumulation_steps)
 

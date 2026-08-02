@@ -1373,7 +1373,6 @@ class Qwen2VLVisionTransformer(EasyDeLBaseModule):
         pos_ids = []
 
         for t, h, w in grid_thw:
-            # Convert to Python ints for reshape operations
             t, h, w = int(t), int(h), int(w)
 
             hpos_ids = jnp.arange(h)

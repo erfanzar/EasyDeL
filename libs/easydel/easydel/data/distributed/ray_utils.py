@@ -191,7 +191,6 @@ class RayTokenizeWorker:
                 if tokenized.attention_masks:
                     result["attention_mask"] = tokenized.attention_masks[j]
 
-                # Preserve additional fields
                 for key, value in ex.items():
                     if key != content_field and key not in result:
                         result[key] = value
@@ -269,7 +268,6 @@ class RayPreprocessor:
         if self._tokenizer_config is None:
             raise ValueError("tokenizer_config is required for tokenization workers")
 
-        # Create workers
         worker_options = {}
         if self._config.resources_per_worker:
             worker_options["num_cpus"] = self._config.resources_per_worker.get("CPU", 1)

@@ -292,7 +292,6 @@ class TokenizedShardedSource(ShardedDataSource[dict]):
             Example after the optional format callback and rename map
             have been applied (in place).
         """
-        # Apply format callback first
         if self._format_callback is not None:
             example = self._format_callback(example)
 
@@ -322,7 +321,6 @@ class TokenizedShardedSource(ShardedDataSource[dict]):
         """
         example = self._transform_example(example)
 
-        # Get text content
         text = example.get(self._content_field, "")
         if isinstance(text, (list, tuple)):
             raise TypeError(
@@ -334,7 +332,6 @@ class TokenizedShardedSource(ShardedDataSource[dict]):
             logger.warning(f"Empty content field '{self._content_field}' in example")
             text = ""
 
-        # Tokenize
         tokenized = self._manager.tokenize_text(
             self._tokenizer,
             text,
@@ -342,7 +339,6 @@ class TokenizedShardedSource(ShardedDataSource[dict]):
             call_kwargs=self._tokenizer_call_kwargs,
         )
 
-        # Build result with tokenized data and additional fields
         result = dict(tokenized)
         for field in self._additional_fields:
             if field in example:
@@ -461,7 +457,6 @@ def batched_tokenize_iterator(
 
         for i in range(len(batch)):
             result = {k: v[i] for k, v in tokenized.items()}
-            # Add back additional fields
             for field in additional_fields:
                 if field in batch_meta[i]:
                     result[field] = batch_meta[i][field]
@@ -469,7 +464,6 @@ def batched_tokenize_iterator(
 
     for shard_name in source.shard_names:
         for example in source.open_shard(shard_name):
-            # Apply format callback
             if format_callback is not None:
                 example = format_callback(example)
 
@@ -481,7 +475,6 @@ def batched_tokenize_iterator(
                 batch = []
                 batch_meta = []
 
-    # Flush remaining
     yield from flush_batch()
 
 
@@ -574,7 +567,6 @@ class TokenizeStage(BaseStage):
             call_kwargs = ds_config.tokenizer_kwargs or None
             tokenizer = self._tokenizer_manager.get_tokenizer(tok_config)
 
-            # Create tokenized source
             tokenized = TokenizedShardedSource(
                 source=source,
                 tokenizer=tokenizer,

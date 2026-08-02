@@ -1133,7 +1133,6 @@ def tokenize_dataset(
             (and optionally ``"attention_mask"`` when ``return_attention_mask``
             is true).
         """
-        # Handle both batched and single examples
         texts = examples[text_field]
         if isinstance(texts, str):
             texts = [texts]
@@ -1153,14 +1152,12 @@ def tokenize_dataset(
 
         return result
 
-    # Determine columns to remove
     if remove_columns is None:
         if hasattr(dataset, "column_names"):
             remove_columns = dataset.column_names
         else:
             remove_columns = []
 
-    # Handle streaming vs non-streaming datasets
     if is_streaming(dataset):
         return dataset.map(
             tokenize_fn,
@@ -1252,21 +1249,16 @@ def save_dataset(
 
     from easydel.data.utils import is_streaming
 
-    # Check if output exists
     if os.path.exists(output_path) and not overwrite:
         raise FileExistsError(f"Output path '{output_path}' already exists. Set overwrite=True to replace.")
 
-    # Handle streaming datasets - materialize first
     if is_streaming(dataset):
         from datasets import Dataset  # pyright: ignore[reportMissingTypeStubs]
 
-        # Convert iterable dataset to regular dataset
         dataset = Dataset.from_generator(lambda: (ex for ex in dataset))
 
-    # Create output directory
     os.makedirs(output_path, exist_ok=True)
 
-    # Save based on format
     if format == "parquet":
         dataset.to_parquet(
             os.path.join(output_path, "data.parquet"),
@@ -1282,7 +1274,6 @@ def save_dataset(
     else:
         raise ValueError(f"Unsupported format: {format}. Use 'parquet', 'arrow', 'json', or 'jsonl'.")
 
-    # Push to Hub if requested
     if push_to_hub:
         if not hub_repo_id:
             raise ValueError("hub_repo_id is required when push_to_hub=True")
@@ -1375,11 +1366,9 @@ def build_tokenized_dataset(
     if not mixture_cfg or not mixture_cfg.get("informs"):
         raise ValueError("mixture.informs is required for tokenization")
 
-    # Get tokenization config
     tok_cfg = mixture_cfg.get("tokenization", {})
     save_cfg = mixture_cfg.get("save", {})
 
-    # Determine tokenizer path
     tokenizer_path = tok_cfg.get("tokenizer")
     if tokenizer_path is None:
         model_cfg = cfg.get("model", {})
@@ -1388,7 +1377,6 @@ def build_tokenized_dataset(
     if not tokenizer_path:
         raise ValueError("Tokenizer not specified. Set mixture.tokenization.tokenizer or model.name_or_path")
 
-    # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 
     # Build dataset (ensure non-streaming for save)
@@ -1404,7 +1392,6 @@ def build_tokenized_dataset(
     if dataset is None:
         raise ValueError("Failed to build dataset from configuration")
 
-    # Tokenize
     tokenized = tokenize_dataset(
         dataset,
         tokenizer,
@@ -1422,7 +1409,6 @@ def build_tokenized_dataset(
         keep_in_memory=tok_cfg.get("keep_in_memory", False),
     )
 
-    # Save if requested
     if save and save_cfg:
         output_path = save_cfg.get("output_path")
         if not output_path:
@@ -1514,7 +1500,6 @@ def _extract_dataset_name(inform_cfg: Mapping[str, Any], fallback_index: int = 0
         cleaned = cleaned.strip().strip("._- ")
         return cleaned
 
-    # Check for explicit name
     if inform_cfg.get("name"):
         return inform_cfg["name"]
 
@@ -1522,13 +1507,11 @@ def _extract_dataset_name(inform_cfg: Mapping[str, Any], fallback_index: int = 0
     candidate: str | None = None
 
     if not isinstance(data_files, str):
-        # Handle list of files - use first file
         if isinstance(data_files, list) and data_files:
             data_files = data_files[0]
         else:
             return f"dataset_{fallback_index}"
 
-    # Strip whitespace
     data_files = data_files.strip()
 
     # Handle cloud storage paths (gs://, s3://, az://, hf://)
@@ -1542,10 +1525,8 @@ def _extract_dataset_name(inform_cfg: Mapping[str, Any], fallback_index: int = 0
 
         # Walk backwards to find a meaningful name (skip bucket, globs, extensions)
         for part in reversed(parts):
-            # Skip if it's just a file extension pattern
             if part.startswith("*."):
                 continue
-            # Clean glob patterns and extensions
             clean = part.rstrip("*").rstrip("/")
             name, _ = os.path.splitext(clean)
             name = _normalize_name(name)
@@ -1587,7 +1568,6 @@ def _extract_dataset_name(inform_cfg: Mapping[str, Any], fallback_index: int = 0
     clean_path = data_files.rstrip("*").rstrip("/")
     base_name = os.path.basename(clean_path)
     if base_name:
-        # Remove extension if present
         name, _ = os.path.splitext(base_name)
         name = _normalize_name(name)
         if name:
@@ -1690,7 +1670,6 @@ def _create_source_from_inform(
     split = inform_cfg.get("split", "train")
     dataset_split_name = inform_cfg.get("dataset_split_name")
 
-    # Check if it's a HuggingFace dataset
     if source_type in ("huggingface", "hf"):
         if not isinstance(data_files, str):
             raise TypeError("mixture.informs[].data_files must be a string for HuggingFace datasets")
@@ -1706,7 +1685,6 @@ def _create_source_from_inform(
         )
         return LimitedShardedSource(source, num_rows) if num_rows is not None else source
 
-    # Expand files
     try:
         files = expand_data_files(data_files)
     except FileNotFoundError:
@@ -1773,7 +1751,6 @@ def _create_source_from_inform(
             add_column(field)
         return columns or None
 
-    # Create appropriate source
     if source_type in ("json", "jsonl"):
         source = JsonShardedSource(files)
     elif source_type == "parquet":
@@ -1869,12 +1846,10 @@ def build_sharded_source(cfg_like: eLMConfig | Mapping[str, Any]) -> "ShardedDat
     if not mixture_cfg or not mixture_cfg.get("informs"):
         return None
 
-    # Build ShardedDataSource for each inform
     sources: dict[str, "ShardedDataSource"] = {}
     content_target = mixture_cfg.get("text_target_field", "text")
 
     for i, inform_cfg in enumerate(mixture_cfg.get("informs", [])):
-        # Extract meaningful name from config
         name = _extract_dataset_name(inform_cfg, fallback_index=i)
         if name in sources:
             unique_name = f"{name}-{i}"
@@ -1892,19 +1867,16 @@ def build_sharded_source(cfg_like: eLMConfig | Mapping[str, Any]) -> "ShardedDat
         if format_callback is not None:
             source = source.transform(MapTransform(format_callback))
 
-        # Apply field renaming if format_fields is specified
         format_fields = inform_cfg.get("format_fields")
         if format_fields:
             source = source.transform(RenameFields(format_fields))
 
-        # Rename content_field to target field
         content_field = inform_cfg.get("content_field", "content")
         if content_field != content_target:
             source = source.transform(RenameFields({content_field: content_target}))
 
         sources[name] = source
 
-    # Mix if multiple sources
     if len(sources) > 1:
         weights = mixture_cfg.get("mixture_weights")
 

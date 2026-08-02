@@ -159,7 +159,6 @@ def create_causal_lm_class(
         # Merge default kwargs with instance kwargs (instance overrides defaults)
         merged_kwargs = {**default_feature_kwargs, **kwargs}
 
-        # Set default dtype if not provided
         import jax.numpy as jnp
 
         dtype = dtype or jnp.bfloat16
@@ -176,7 +175,6 @@ def create_causal_lm_class(
             **merged_kwargs,
         )
 
-    # Create class dynamically with proper metadata
     cls = type(
         class_name,
         (BaseCausalLMModule,),
@@ -715,7 +713,6 @@ def create_embedding_class(
     return cls
 
 
-# Registry mapping task types to factory functions
 AUTO_MODEL_FACTORY_REGISTRY: dict[TaskType, callable] = {
     TaskType.CAUSAL_LM: create_causal_lm_class,
     TaskType.SEQUENCE_CLASSIFICATION: create_sequence_classification_class,

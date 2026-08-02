@@ -248,7 +248,6 @@ class Glm4MoeConfig(EasyDeLBaseConfig):
         if self.rope_scaling is not None and "type" in self.rope_scaling:
             self.rope_scaling["rope_type"] = self.rope_scaling["type"]
 
-        # MoE arguments
         self.moe_intermediate_size = moe_intermediate_size
         self.num_experts_per_tok = num_experts_per_tok
         self.n_group = n_group

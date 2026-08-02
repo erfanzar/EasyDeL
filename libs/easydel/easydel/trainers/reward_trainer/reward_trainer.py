@@ -138,7 +138,6 @@ class RewardTrainer(Trainer):
 
         self.arguments = arguments
 
-        # Setup data collators
         if data_collator is None:
             self.input_data_collator_tfds = RewardDataCollatorWithPaddingTFDS(
                 processing_class,

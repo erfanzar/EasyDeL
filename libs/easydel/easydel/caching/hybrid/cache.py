@@ -143,7 +143,6 @@ class HybridCacheConfig(BaseCacheConfig):
             (the latter is normalized to ``PARALLEL_HYBRID``).
     """
 
-    # Required fields
     num_hidden_layers: int = field(pytree_node=False)
     partition_axis: PartitionAxis = field(pytree_node=False)
     batch_size: int = field(pytree_node=False)
@@ -159,7 +158,6 @@ class HybridCacheConfig(BaseCacheConfig):
     d_state: int = field(pytree_node=False)
     num_attention_heads: int = field(pytree_node=False)
 
-    # Layer type configuration
     layer_types: tuple[str, ...] = field(pytree_node=False)
 
     @classmethod
@@ -219,7 +217,6 @@ class HybridCacheConfig(BaseCacheConfig):
 
         normalized_layer_types = [PARALLEL_HYBRID if lt == HYBRID else lt for lt in layer_types]
 
-        # Validate layer types
         valid_types = {FULL_ATTENTION, LINEAR_ATTENTION, KDA_LINEAR_ATTENTION, PARALLEL_HYBRID, HYBRID}
         for i, lt in enumerate(layer_types):
             if lt not in valid_types:
@@ -397,7 +394,6 @@ class HybridCacheView(BaseCacheView):
                 None,
             )
 
-        # Initialize all fields to None
         key = None
         value = None
         conv_state = None
@@ -407,7 +403,6 @@ class HybridCacheView(BaseCacheView):
         v_conv_state = None
 
         if layer_type == FULL_ATTENTION:
-            # Allocate KV cache
             key = with_sharding_constraint(
                 arr=jnp.zeros(
                     shape=(
@@ -433,7 +428,6 @@ class HybridCacheView(BaseCacheView):
                 sharding=partition_specs,
             )
         elif layer_type == LINEAR_ATTENTION:
-            # Allocate combined conv state + recurrent state for GatedDeltaNet
             recurrent_dtype = _linear_recurrent_state_dtype(dtype)
             conv_state = with_sharding_constraint(
                 arr=jnp.zeros(
@@ -635,7 +629,6 @@ class HybridCacheView(BaseCacheView):
             For non-full-attention layers, key_cache and value_cache are None.
         """
         if self.layer_type == FULL_ATTENTION:
-            # Update KV cache for full attention layers
             if key_states is None or value_states is None:
                 return self.key, self.value, self
 
@@ -652,7 +645,6 @@ class HybridCacheView(BaseCacheView):
             new_key = lax.dynamic_update_slice(new_key, key_states, start_indices)
             new_value = lax.dynamic_update_slice(new_value, value_states, start_indices)
 
-            # Update positions
             new_positions = cache_position + seq_len
 
             return (
@@ -666,7 +658,6 @@ class HybridCacheView(BaseCacheView):
             )
 
         elif self.layer_type == LINEAR_ATTENTION:
-            # Update conv state and recurrent state for linear attention
             new_conv_state = conv_state if conv_state is not None else self.conv_state
             new_recurrent_state = recurrent_state if recurrent_state is not None else self.recurrent_state
 
@@ -680,7 +671,6 @@ class HybridCacheView(BaseCacheView):
             )
 
         elif self.layer_type == KDA_LINEAR_ATTENTION:
-            # Update KDA states for kda_linear_attention layers
             new_q_conv_state = q_conv_state if q_conv_state is not None else self.q_conv_state
             new_k_conv_state = k_conv_state if k_conv_state is not None else self.k_conv_state
             new_v_conv_state = v_conv_state if v_conv_state is not None else self.v_conv_state
@@ -784,7 +774,6 @@ class HybridCacheView(BaseCacheView):
                 f"update_conv_state is only valid for linear_attention or parallel_hybrid layers, got {self.layer_type}"
             )
 
-        # Roll and update
         conv_state = jnp.roll(self.conv_state, shift=-1, axis=-1)
         conv_state = conv_state.at[:, :, -1].set(new_hidden_state)
 
@@ -1371,7 +1360,6 @@ class HybridCache(BaseCache):
                 cache_data.append(None)
                 layer_types.append("none")
             elif hasattr(view, "key") and view.key is not None:
-                # TransformerCacheView-like
                 cache_data.append(
                     {
                         "key": view.key,
@@ -1389,7 +1377,6 @@ class HybridCache(BaseCache):
                         "conv_state": view.conv_state,
                         "recurrent_state": view.recurrent_state,
                         "positions": getattr(view, "positions", None),
-                        # KDA-specific fields
                         "q_conv_state": getattr(view, "q_conv_state", None),
                         "k_conv_state": getattr(view, "k_conv_state", None),
                         "v_conv_state": getattr(view, "v_conv_state", None),
@@ -1502,7 +1489,6 @@ class HybridCache(BaseCache):
             layer_type = getattr(view, "layer_type", FULL_ATTENTION)
 
             if layer_type == FULL_ATTENTION and hasattr(view, "key"):
-                # TransformerCacheView-like
                 new_key = lax.dynamic_update_slice(
                     view.key,
                     oview.key.astype(view.key.dtype),
@@ -1524,7 +1510,6 @@ class HybridCache(BaseCache):
                 new_views[idx] = view.replace(**update_dict)
 
             elif layer_type == LINEAR_ATTENTION and hasattr(view, "conv_state"):
-                # RecurrentCacheView-like
                 new_conv = (
                     lax.dynamic_update_slice_in_dim(view.conv_state, oview.conv_state, slot, 0)
                     if view.conv_state is not None
@@ -1548,7 +1533,6 @@ class HybridCache(BaseCache):
                 new_views[idx] = view.replace(**update_dict)
 
             elif layer_type == KDA_LINEAR_ATTENTION:
-                # KDACacheView-like
                 update_dict = {}
 
                 for field in ["q_conv_state", "k_conv_state", "v_conv_state", "recurrent_state"]:
@@ -1623,7 +1607,6 @@ if __name__ == "__main__":
     cache = HybridCache.init_cache(metadata, dtype=jnp.float32)
     print(f"Initialized cache with {len(cache)} views")
 
-    # Print layer types
     for i, view in enumerate(cache.views):
         print(f"  Layer {i}: {view.layer_type}")
         if view.layer_type == FULL_ATTENTION:

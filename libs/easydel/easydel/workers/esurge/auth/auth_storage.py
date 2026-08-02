@@ -96,17 +96,14 @@ class AuthStorage:
         self.auto_save = auto_save
         self.save_interval = save_interval
 
-        # File paths
         self.keys_file = self.storage_dir / "keys.json"
         self.audit_logs_file = self.storage_dir / "audit_logs.json"
         self.stats_file = self.storage_dir / "usage_stats.json"
 
-        # Thread safety
         self._lock = threading.Lock()
         self._dirty = False  # Track if data needs saving
         self._last_save = time.time()
 
-        # Create storage directory
         self._ensure_storage_dir()
 
         logger.info(f"Auth storage initialized at: {self.storage_dir}")
@@ -140,27 +137,22 @@ class AuthStorage:
         backup_file = file_path.with_suffix(".bak")
 
         try:
-            # Write to temp file
             temp_file.write_text(data, encoding="utf-8")
 
-            # Backup existing file if it exists
             if file_path.exists():
                 if backup_file.exists():
                     backup_file.unlink()
                 file_path.rename(backup_file)
 
-            # Rename temp to target
             temp_file.rename(file_path)
 
             logger.debug(f"Successfully saved: {file_path}")
         except Exception as e:
             logger.error(f"Failed to write {file_path}: {e}")
-            # Restore backup if available
             if backup_file.exists() and not file_path.exists():
                 backup_file.rename(file_path)
             raise
         finally:
-            # Clean up temp file if it still exists
             if temp_file.exists():
                 temp_file.unlink()
 
@@ -172,7 +164,6 @@ class AuthStorage:
         """
         with self._lock:
             try:
-                # Convert to serializable format
                 keys_data = {hashed_key: self._serialize_key_metadata(metadata) for hashed_key, metadata in keys.items()}
 
                 data = {
@@ -214,7 +205,6 @@ class AuthStorage:
                 return keys
             except Exception as e:
                 logger.error(f"Failed to load keys: {e}")
-                # Try to load from backup
                 backup_file = self.keys_file.with_suffix(".bak")
                 if backup_file.exists():
                     logger.info("Attempting to load from backup...")

@@ -692,7 +692,6 @@ def apply_grouped_single_step_gdr(
         key = l2norm_decode(key, axis=-1, eps=1e-6)
 
     input_dtype = query.dtype
-    # Squeeze seq_len=1 and reshape for the kernel interface
     q_2d = query[:, 0, :, :]  # [batch, num_k_heads, head_dim]
     k_2d = key[:, 0, :, :]
     v_grouped = value[:, 0, :, :].reshape(batch_size, num_k_heads, expand_ratio, -1)

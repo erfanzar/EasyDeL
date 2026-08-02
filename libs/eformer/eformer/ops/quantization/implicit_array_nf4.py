@@ -144,7 +144,6 @@ class ArrayNF4(ImplicitArray):
             .astype(self.dtype)
         )
 
-        # Apply sharding constraint if available
         if self.sharding is not None:
             result = _apply_sharding(result, self.sharding)
 

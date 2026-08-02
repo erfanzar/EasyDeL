@@ -1031,10 +1031,8 @@ def count_flop_jaxpr(jaxpr) -> int:
 
         (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = dimension_numbers
 
-        # Calculate sizes for contracting dimensions
         contracting_size = np.prod([shapes[0][d] for d in lhs_contract])
 
-        # Calculate output shape size
         batch_size = np.prod([shapes[0][d] for d in lhs_batch])
         lhs_remaining = [d for i, d in enumerate(shapes[0]) if i not in lhs_contract and i not in lhs_batch]
         rhs_remaining = [d for i, d in enumerate(shapes[1]) if i not in rhs_contract and i not in rhs_batch]
@@ -1138,9 +1136,7 @@ def count_flop_jaxpr(jaxpr) -> int:
     def compute_max_flops(eqn) -> int:
         """Compute FLOPs for max operation."""
         if len(eqn.invars) == 2:
-            # Binary max
             return compute_binary_op_flops(eqn)
-        # Unary max
         return compute_unary_op_flops(eqn)
 
     def compute_pow_flops(eqn) -> int:
@@ -1185,9 +1181,7 @@ def count_flop_jaxpr(jaxpr) -> int:
     def compute_min_flops(eqn) -> int:
         """Compute FLOPs for min operation."""
         if len(eqn.invars) == 2:
-            # Binary min
             return compute_binary_op_flops(eqn)
-        # Unary min
         return compute_unary_op_flops(eqn)
 
     def compute_rem_flops(eqn) -> int:
@@ -1227,7 +1221,6 @@ def count_flop_jaxpr(jaxpr) -> int:
 
     # Dictionary mapping primitives to their FLOP counting functions
     primitive_flops: dict[str, tp.Callable] = {
-        # Binary operations
         "mul": compute_binary_op_flops,
         "add": compute_binary_op_flops,
         "sub": compute_binary_op_flops,
@@ -1238,7 +1231,6 @@ def count_flop_jaxpr(jaxpr) -> int:
         "le": compute_binary_op_flops,
         "ne": compute_binary_op_flops,
         "eq": compute_binary_op_flops,
-        # Unary operations
         "neg": compute_unary_op_flops,
         "sin": lambda eqn: 5 * compute_unary_op_flops(eqn),
         "cos": lambda eqn: 5 * compute_unary_op_flops(eqn),
@@ -1247,14 +1239,11 @@ def count_flop_jaxpr(jaxpr) -> int:
         "log1p": lambda eqn: 6 * compute_unary_op_flops(eqn),
         "tanh": lambda eqn: 7 * compute_unary_op_flops(eqn),
         "rsqrt": lambda eqn: 6 * compute_unary_op_flops(eqn),
-        # Linear algebra
         "dot_general": compute_dot_general_flops,
         "conv_general_dilated": compute_conv_flops,
-        # Reduction operations
         "reduce_sum": compute_reduce_flops,
         "reduce_max": compute_reduce_flops,
         "reduce_min": compute_reduce_flops,
-        # Special operations
         "scatter-add": get_scatter_flops,
         "scan": count_scan_flops,
         "cond": count_cond_flops,
@@ -1272,7 +1261,6 @@ def count_flop_jaxpr(jaxpr) -> int:
         "pjit": lambda eqn: 0,
         "shard_map": lambda eqn: 0,
         "sharding_constraint": lambda eqn: 0,
-        # Other operations
         "dot_product_attention_fwd_wrapper": compute_attention_flops,
         "select_n": compute_select_n_flops,
         "cumsum": compute_cumsum_flops,
@@ -1299,11 +1287,9 @@ def count_flop_jaxpr(jaxpr) -> int:
         "shift_right_logical": compute_shift_right_logical_flops,
         "or": compute_or_flops,
         "bitcast_convert_type": lambda eqn: 0,  # Type conversion, no computation
-        # Mathematical operations
         "abs": compute_unary_op_flops,  # Single comparison/selection per element
         "erf_inv": compute_erf_inv_flops,  # Inverse error function
         "triangular_solve": compute_triangular_solve_flops,
-        # Computation operations
         "square": compute_square_flops,
         "sqrt": compute_sqrt_flops,
         "argmax": compute_argmax_flops,
@@ -1331,7 +1317,6 @@ def count_flop_jaxpr(jaxpr) -> int:
             else:
                 warnings.warn(f"Unhandled primitive {primitive_name}", stacklevel=1)
 
-            # Recursively visit subjaxprs
             for subjaxpr in jax.core.jaxprs_in_params(eqn.params):
                 visit_jaxpr(subjaxpr)
 
@@ -1720,11 +1705,9 @@ class FlopCalcConfig:
     head_dim: int
     seq_len: int  # decoder (or encoder-only) sequence length
 
-    # Optional encoder for seq2seq / encoder-decoder
     enc_num_layers: int = 0
     enc_seq_len: int = 0
 
-    # MoE / GLU
     glu: bool = False
     num_experts: int = 1
     num_shared_experts: int = 0
@@ -1735,7 +1718,6 @@ class FlopCalcConfig:
     layer_types: Sequence[str] | None = None
     sliding_window: int | None = None
 
-    # Task specifics
     activation_type: ActivationType = ActivationType.GELU
     task: TaskType = TaskType.AUTO_BIND
     vocab_size: int = 0

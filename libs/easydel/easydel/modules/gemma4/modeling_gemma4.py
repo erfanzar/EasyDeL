@@ -3299,7 +3299,6 @@ class Gemma4TextModel(EasyDeLBaseModule):
                 )
             hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
-            # Store captured K/V for potential downstream sharing.
             captured = getattr(attn, "_captured_kv", None)
             if captured is not None and not attn.is_kv_shared_layer:
                 shared_kv[idx] = captured

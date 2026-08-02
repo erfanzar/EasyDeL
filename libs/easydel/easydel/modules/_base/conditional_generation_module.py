@@ -139,10 +139,8 @@ class BaseConditionalGenerationModule(BaseTaskModule[ModelT, ConfigT]):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: spx.Rngs,
-        # Feature flags
         tie_word_embeddings: bool = False,
         logit_cap: float | None = None,
-        # LM head configuration
         lm_head_name: str = "lm_head",
         lm_head_bias: bool = False,
         lm_head_kernel_init: Callable | None = None,
@@ -274,7 +272,6 @@ class BaseConditionalGenerationModule(BaseTaskModule[ModelT, ConfigT]):
         decoder_attention_mask: Bool[Array, "batch dec_seq_len"] | None = None,
         # Vision inputs for multimodal models
         pixel_values: Float[Array, "batch channels height width"] | None = None,
-        # Common arguments
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,

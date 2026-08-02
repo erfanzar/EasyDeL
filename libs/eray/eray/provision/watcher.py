@@ -165,7 +165,6 @@ def plan(record: ClusterRecord, obs: Observed, policy: WatchPolicy) -> list[Acti
     dead_node = obs.node_state in NODE_DEAD_STATES
     qr_gone_or_dead = obs.qr_state in (None, "SUSPENDING", "SUSPENDED", "FAILED")
 
-    # ── Healthy path ────────────────────────────────────────────
     if healthy_node and obs.head_up:
         actions = [Action("set_state", {"state": "HEALTHY", "head_ip": obs.node_head_ip, "reset_incident": True})]
         if obs.jobs is not None:
@@ -199,7 +198,6 @@ def plan(record: ClusterRecord, obs: Observed, policy: WatchPolicy) -> list[Acti
             ]
         return _recovery_actions(record, obs, policy, reason=f"node={obs.node_state} qr={obs.qr_state}")
 
-    # ── Capacity in flight ──────────────────────────────────────
     if obs.qr_state in ("ACCEPTED", "CREATING", "WAITING_FOR_RESOURCES"):
         return [Action("set_state", {"state": "WAITING"})]
     if obs.qr_state == "PROVISIONING":

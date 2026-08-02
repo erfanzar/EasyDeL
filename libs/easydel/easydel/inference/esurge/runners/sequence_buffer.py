@@ -268,7 +268,6 @@ class SequenceBuffer:
             page_sizes: List of page sizes for the page table.
             sharding: Optional JAX sharding for page table arrays.
         """
-        # Static configuration
         self.max_num_reqs = max_num_reqs
         self.max_model_len = max_model_len
         self.max_num_batched_tokens = max_num_batched_tokens
@@ -289,7 +288,6 @@ class SequenceBuffer:
         self.presence_penalties = np.zeros((max_num_reqs,), dtype=np.float32)
         self.repetition_penalties = np.ones((max_num_reqs,), dtype=np.float32)
 
-        # Page table
         self.page_table = MultiGroupPageTable(
             max_num_reqs=max_num_reqs,
             max_model_len=max_model_len,
@@ -298,7 +296,6 @@ class SequenceBuffer:
             sharding=sharding,
         )
 
-        # Python bookkeeping
         self._req_ids: list[str | None] = []
         self.req_id_to_index: dict[str, int] = {}
         self.req_output_token_ids: list[list[int] | None] = []
@@ -470,7 +467,6 @@ class SequenceBuffer:
         # Page table - mutate in-place
         self.page_table.add_row(request.page_ids, req_index)
 
-        # Sampling params
         sampling_params = request.sampling_params
         if sampling_params is None:
             raise ValueError("pooling requests not supported yet")
@@ -549,7 +545,6 @@ class SequenceBuffer:
         self.in_progress_prompt_logprobs_cpu.pop(req_id, None)
         self.bad_words_token_ids.pop(req_index, None)
 
-        # Guarded indexing
         self._ensure_logit_bias_capacity(req_index)
         self.logit_bias[req_index] = None
 
@@ -690,7 +685,6 @@ class SequenceBuffer:
             logger.debug("_move_request called on empty slot from_idx=%s", from_idx)
             return
 
-        # Static bookkeeping
         self._req_ids[to_idx] = req_id
         self._req_ids[from_idx] = None
         self.req_output_token_ids[to_idx] = self.req_output_token_ids[from_idx]
@@ -728,7 +722,6 @@ class SequenceBuffer:
         self.page_table.move_row(from_idx, to_idx)
         self.page_table.clear_row(from_idx)
 
-        # Sparse/optional data
         self._move_sparse_data(from_idx, to_idx)
         self._layout_version += 1
 
@@ -859,7 +852,6 @@ class SequenceBuffer:
 
         if sampling_params.logit_bias is not None:
             if len(self.logit_bias) < self.max_num_reqs:
-                # Ensure list length
                 self.logit_bias.extend([None] * (self.max_num_reqs - len(self.logit_bias)))
             self.logit_bias[req_index] = sampling_params.logit_bias
 
@@ -1043,7 +1035,6 @@ class SequenceBuffer:
         # Page table - mutate in-place (no commit needed for clear)
         self.page_table.clear()
 
-        # Clear allowed token IDs mask
         if self.allowed_token_ids_mask is not None:
             self.allowed_token_ids_mask = jnp.zeros_like(self.allowed_token_ids_mask, dtype=bool)
 

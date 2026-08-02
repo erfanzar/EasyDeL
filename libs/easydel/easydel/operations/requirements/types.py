@@ -50,7 +50,6 @@ class MetadataField(Flag):
 
     NONE = 0
 
-    # Core sequence information
     SEQ_LENS = auto()
     """Sequence lengths for each request in batch."""
 
@@ -80,7 +79,6 @@ class MetadataField(Flag):
     STATE_INDICES = auto()
     """Indices mapping requests to their state slots."""
 
-    # Output selection
     LOGITS_INDICES = auto()
     """Indices for selecting which positions to compute logits for."""
 

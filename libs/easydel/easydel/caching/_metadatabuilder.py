@@ -433,7 +433,6 @@ class AttentionMetadataBuilder:
             ...     version="v3"
             ... )
         """
-        # Normalize synonyms.
         if pages_tables is None and block_tables is not None:
             pages_tables = block_tables
         if context_lens is None and seq_lens is not None:

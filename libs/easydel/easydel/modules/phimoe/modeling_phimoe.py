@@ -488,7 +488,6 @@ class PhiMoeDecoderLayer(spx.Module):
 
         hidden_states = checkpoint_name(residual + hidden_states, "residual")
 
-        # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states, router_logits = self.mlp(hidden_states)

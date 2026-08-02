@@ -429,7 +429,6 @@ def _chunk_kda_fwd(
     k_beta_scaled = k_beta * jnp.exp(g_cumsum)[:, :, :, :, None]
     k_cumdecay = jnp.einsum("bhcij,bhcjk->bhcik", attn, k_beta_scaled, precision=_MATMUL_PRECISION)
 
-    # Initialize state
     if initial_state is None:
         initial_state = jnp.zeros((B, H, K_dim, V_dim), dtype=jnp.float32)
     else:

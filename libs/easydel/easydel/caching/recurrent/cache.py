@@ -331,11 +331,9 @@ class RecurrentCacheView(BaseCacheView):
         new_conv_state = self.conv_state
         new_recurrent_state = self.recurrent_state
 
-        # Update conv_state with rolling buffer
         if conv_state is not None and self.conv_state is not None:
             if cache_position is not None:
                 cache_position = jnp.clip(cache_position, 0, self.metadata.conv_kernel_size - 1)
-            # Roll and insert new state
             rolled = jnp.roll(self.conv_state, shift=-1, axis=-1)
             if cache_position is not None:
                 new_conv_state = rolled.at[:, :, cache_position].set(conv_state)
@@ -548,7 +546,6 @@ class RecurrentCache(BaseCache):
         new_views[layer_idx] = updated_view
         return RecurrentCache(views=new_views)
 
-    # Alias for backward compatibility
     def update_ssm_state(
         self,
         layer_idx: int,

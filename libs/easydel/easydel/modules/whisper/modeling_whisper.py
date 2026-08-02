@@ -663,7 +663,6 @@ class WhisperDecoderLayer(spx.Module):
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
 
-        # Self Attention
         hidden_states, self_attn_weights, cache_view = self.self_attn(
             hidden_states=hidden_states,
             mask_info=mask_info,
@@ -674,7 +673,6 @@ class WhisperDecoderLayer(spx.Module):
         hidden_states = self.dropout_layer(hidden_states)
         hidden_states = checkpoint_name(residual + hidden_states, "residual")
 
-        # Cross-Attention Block
         cross_attn_weights = None
         if encoder_hidden_states is not None:
             residual = hidden_states
@@ -688,7 +686,6 @@ class WhisperDecoderLayer(spx.Module):
             hidden_states = self.dropout_layer(hidden_states)
             hidden_states = checkpoint_name(residual + hidden_states, "residual")
 
-        # Fully Connected
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
         if self.config.use_scan_mlp:
@@ -885,7 +882,6 @@ class WhisperEncoder(EasyDeLBaseModule):
                 all_hidden_states = (*all_hidden_states, hidden_states)
             dropout_probability = random.uniform(0, 1)
             if self.training and (dropout_probability < self.layerdrop):
-                # skip the layer
                 layer_outputs = (None, None)
             else:
                 with self._layer_stage_context(idx, layers=self.layers):
@@ -1143,7 +1139,6 @@ class WhisperDecoder(EasyDeLBaseModule):
             (hidden_states, all_hidden_states, all_self_attns, all_cross_attentions, 0),
             trace=True,
         )
-        # add hidden states from the last decoder layer
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
@@ -1945,7 +1940,6 @@ class WhisperForConditionalGeneration(BaseConditionalGenerationModule[WhisperMod
                 - decoder_mask_info: MaskInfo for decoder self-attention.
                 - decoder_position_ids: Position indices for decoder inputs.
         """
-        # initializing the cache
         batch_size, seq_length = decoder_input_ids.shape
 
         if starts is None:

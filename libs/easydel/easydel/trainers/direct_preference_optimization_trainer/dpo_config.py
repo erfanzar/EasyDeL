@@ -410,7 +410,6 @@ class DPOConfig(TrainingArguments):
             self.generation_interval = self.generation_interval or self.evaluation_steps or 1
             self.use_esurge_generation = True
         self.logprob_vocab_chunk_size = normalize_logprob_vocab_chunk_size(self.logprob_vocab_chunk_size)
-        # Call the post_init of the parent class if it exists. Important for inheritance
         if hasattr(super(), "__post_init__"):
             super().__post_init__(
                 max_sequence_length=None,

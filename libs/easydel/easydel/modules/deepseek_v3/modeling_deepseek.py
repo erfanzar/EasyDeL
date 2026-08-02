@@ -754,7 +754,6 @@ class DeepseekV3Attention(UnifiedAttention):
                 ),
             )
 
-        # KV compression projection
         setattr(
             self,
             self.projection_mapping["mla_kv_a_proj_with_mqa"],
@@ -982,7 +981,6 @@ class DeepseekV3DecoderLayer(spx.Module):
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        # Self Attention
         attn_out = self.self_attn(
             hidden_states,
             mask_info,
@@ -996,7 +994,6 @@ class DeepseekV3DecoderLayer(spx.Module):
         hidden_states = attn_out.attention_output
         hidden_states = checkpoint_name(residual + hidden_states, "residual")
 
-        # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
 
@@ -1465,7 +1462,6 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
 
         config = self.config
 
-        # MLA dimensions
         q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
         v_head_dim = config.v_head_dim
 
@@ -1517,7 +1513,6 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
         if dtype is None:
             dtype = text_config.kvdtype
 
-        # MLA dimensions
         q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
         v_head_dim = config.v_head_dim
 

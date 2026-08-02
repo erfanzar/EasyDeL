@@ -1007,7 +1007,6 @@ class PipelineContext:
     epoch: int = 0
     metrics: dict[str, dict[str, Any]] = field(default_factory=dict)
 
-    # Cached resources
     _tokenizers: dict[str, Any] = field(default_factory=dict, repr=False)
     _cache_manager: Any = field(default=None, repr=False)
 

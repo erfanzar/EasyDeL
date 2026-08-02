@@ -317,11 +317,9 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
         )
         self._clear_dynamic_language_stage_hints()
 
-        # Get token IDs from config if not provided
         image_token_index = image_token_index or getattr(config, "image_token_id", None)
         video_token_index = video_token_index or getattr(config, "video_token_id", None)
 
-        # Initialize VLM features
         self._vision_encoder_feature = VisionEncoderFeature(
             vision_feature_layer=vision_feature_layer,
             vision_feature_select_strategy=vision_feature_select_strategy,
@@ -333,7 +331,6 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
             video_token_id=video_token_index,
         )
 
-        # Optional video processing feature
         if self._supports_video:
             self._video_feature = VideoProcessingFeature(
                 temporal_patch_size=temporal_patch_size,
@@ -342,7 +339,6 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
         else:
             self._video_feature = None
 
-        # Optional mRoPE feature
         if self._uses_mrope:
             self._mrope_feature = MultiDimensionalRoPEFeature(
                 spatial_merge_size=spatial_merge_size,
@@ -351,7 +347,6 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
         else:
             self._mrope_feature = None
 
-        # Store router aux loss coefficient for MoE models
         self._router_aux_loss_coef = router_aux_loss_coef
 
     def _clear_dynamic_language_stage_hints(self) -> None:
@@ -771,12 +766,10 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        # Vision inputs
         pixel_values: Float[Array, "batch channels height width"] | None = None,
         pixel_values_videos: Float[Array, "..."] | None = None,
         image_grid_thw: tuple | None = None,
         video_grid_thw: tuple | None = None,
-        # Common arguments
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
@@ -852,11 +845,9 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
                 )
                 # Generate answer autoregressively
         """
-        # Track image/video hidden states for output
         image_hidden_states = None
         video_hidden_states = None
 
-        # Forward through base model with all inputs
         outputs = self.base_model(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
@@ -887,12 +878,10 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
         if apply_lm_head:
             lm_logits = self.compute_lm_logits(hidden_states)
 
-        # Get optional outputs
         rope_deltas = getattr(outputs, "rope_deltas", None)
         router_logits = getattr(outputs, "router_logits", None)
         image_hidden_states = getattr(outputs, "image_hidden_states", None)
 
-        # Compute aux loss for MoE models
         aux_loss = self.compute_router_aux_loss(outputs)
 
         return VLMCausalLMOutput(
@@ -995,7 +984,6 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
             attention_mask=attention_mask,
             **forwarded_kwargs,
         )
-        # Add vision inputs
         model_inputs["pixel_values"] = pixel_values
         for key, value in kwargs.items():
             if value is not None:

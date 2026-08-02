@@ -1750,7 +1750,6 @@ class SiglipModel(EasyDeLBaseModule):
         image_embeds = vision_outputs[1]
         text_embeds = text_outputs[1]
 
-        # normalized features
         image_embeds = image_embeds / jnp.linalg.norm(
             image_embeds,
             ord=2,
@@ -1764,7 +1763,6 @@ class SiglipModel(EasyDeLBaseModule):
             keepdims=True,
         )
 
-        # cosine similarity as logits
         logits_per_text = jnp.matmul(text_embeds, image_embeds.T)
 
         logit_scale, logit_bias = (self.logit_scale, self.logit_bias)

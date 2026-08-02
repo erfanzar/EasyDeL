@@ -474,7 +474,6 @@ class Glm4vMoeTextConfig(EasyDeLBaseConfig):
         self.rope_theta = 10000.0 if rope_theta is None else float(rope_theta)
         self.rope_scaling = _rope_scaling_from_rope_parameters(rope_parameters, rope_scaling)
 
-        # MoE arguments
         self.moe_intermediate_size = moe_intermediate_size
         self.num_experts_per_tok = num_experts_per_tok
         self.n_shared_experts = n_shared_experts

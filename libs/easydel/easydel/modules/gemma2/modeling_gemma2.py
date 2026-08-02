@@ -193,7 +193,6 @@ class Gemma2Attention(UnifiedAttention):
         ``attention_softmax_in_fp32`` based on ``dtype`` and stores
         ``is_cross_attention`` for later cross-attention specialisation.
         """
-        # Set layer-specific attributes before super().__init__
         self.is_cross_attention = is_cross_attention
 
         super().__init__(
@@ -212,7 +211,6 @@ class Gemma2Attention(UnifiedAttention):
             ),
         )
 
-        # Gemma2-specific attributes
         self.attention_softmax_in_fp32 = self.dtype is not jnp.float32
 
     def _create_rotary(self, config: Gemma2Config, dtype: jnp.dtype):

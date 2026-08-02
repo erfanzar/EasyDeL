@@ -96,7 +96,6 @@ def _single_step_ssm1_fwd(
     # dB * x: (dt * B) * x
     dBx = dt[:, :, None] * B[:, None, :] * hidden_states[:, :, None]  # [B, I, N]
 
-    # State update
     ssm_state_new = dA * ssm_state + dBx
 
     # Output: y = sum(state * C, axis=-1) + D * x
@@ -283,7 +282,6 @@ class SSM1Op(OperationImpl):
         # Convert A from log form to real form (negative for stability)
         A_real = -jnp.exp(A.astype(jnp.float32))
 
-        # Get activation function
         act_fn = ACT2FN.get(activation, jax.nn.silu) if gate is not None else None
 
         if segment_ids is not None and hidden_states.shape[1] > 1:

@@ -363,7 +363,6 @@ class GlmDecoderLayer(spx.Module):
 
         hidden_states = residual + attn_outputs.attention_output
 
-        # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
 

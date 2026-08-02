@@ -133,7 +133,6 @@ class ORPOTrainer(Trainer):
         self.processing_class = processing_class
         self.is_encoder_decoder = arguments.is_encoder_decoder
 
-        # Determine padding value
         if arguments.padding_value is not None:
             self.padding_value = arguments.padding_value
         else:
@@ -148,7 +147,6 @@ class ORPOTrainer(Trainer):
                 )
         arguments.padding_value = self.padding_value
 
-        # Setup data collators
         self.input_data_collator_tfds = (
             DPODataCollatorWithPaddingTFDS(
                 max_prompt_length=arguments.max_prompt_length,

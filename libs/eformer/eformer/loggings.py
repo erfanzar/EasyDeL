@@ -238,7 +238,6 @@ class LazyLogger:
             *args: Arguments for message formatting.
             **kwargs: Additional keyword arguments passed to the logger.
         """
-        # Create a hashable key from the level, message, and args
         safe_args = tuple(self._make_hashable(arg) for arg in args)
         message_key = (logging.getLevelName(level), message, *safe_args)
         with self._logged_once_lock:

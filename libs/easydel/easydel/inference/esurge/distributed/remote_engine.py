@@ -120,7 +120,6 @@ class _ClientChannel:
         self._io_thread: threading.Thread | None = None
         self._dead_reason: str | None = None
 
-    # coordinator surface
     def set_plane_handler(self, handler: typing.Callable[[wire.WireMessage, bytes | None], None] | None) -> None:
         """Install the request-plane inbound handler (AdmitAck/OutputUpdate)."""
         self._plane_handler = handler
@@ -135,7 +134,6 @@ class _ClientChannel:
                 except Exception:
                     pass
 
-    # lifecycle
     @property
     def alive(self) -> bool:
         """Whether the owner link is up (handshaken and heartbeating)."""
@@ -204,7 +202,6 @@ class _ClientChannel:
         except Exception:
             logger.exception("Remote engine handle: on_dead callback failed")
 
-    # IO thread
     def _io_loop(self) -> None:
         import zmq
 
@@ -401,7 +398,6 @@ class RemoteEngineHandle:
         )
         self._fatal: tuple[BaseException, str] | None = None
 
-    # death paths
     def _on_owner_dead(self, reason: str) -> None:
         self._plane.fail_pending(reason)
         with self._registry.request_lock, self._registry.output_lock:
@@ -432,7 +428,6 @@ class RemoteEngineHandle:
         if not self._channel.alive:
             raise RequestPlaneError(f"remote engine is unreachable: {self._channel.dead_reason or 'link closed'}")
 
-    # adapter surface
     @property
     def esurge_name(self) -> str:
         """The remote engine's display name."""

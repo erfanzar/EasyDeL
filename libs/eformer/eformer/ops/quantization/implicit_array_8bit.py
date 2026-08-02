@@ -139,7 +139,6 @@ class Array8B(ImplicitArray):
         """
         result = dequantize_int8(self.weight, self.scale).reshape(self.shape).astype(self.dtype)
 
-        # Apply sharding constraint if available
         if self.sharding is not None:
             result = _apply_sharding(result, self.sharding)
 

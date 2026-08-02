@@ -227,7 +227,6 @@ class DatasetMixtureCfg(TypedDict, total=False):
     shuffle_buffer_size: NotRequired[int | None]
     seed: NotRequired[int | None]
 
-    # Token packing configuration
     pack_tokens: NotRequired[bool]
     tokens_field_name: NotRequired[str]
     pack_seq_length: NotRequired[int | None]
@@ -237,21 +236,17 @@ class DatasetMixtureCfg(TypedDict, total=False):
     pack_tokenize_batch_size: NotRequired[int | None]
     dask_storage_options: NotRequired[dict[str, Any] | None]
 
-    # On-the-fly tokenization and packing
     pack_on_the_fly: NotRequired[bool]
     tokenize_callback: NotRequired[tp.Callable[[dict[str, Any]], list[int]] | None]
 
-    # Prefetch configuration
     prefetch_workers: NotRequired[int]
     prefetch_buffer_size: NotRequired[int]
 
-    # Cloud storage options
     cloud_max_retries: NotRequired[int]
     cloud_retry_delay: NotRequired[float]
     cache_remote_files: NotRequired[bool]
     cache_expiry_seconds: NotRequired[int]
 
-    # Block-deterministic mixture configuration
     block_mixture: NotRequired[bool]
     mixture_block_size: NotRequired[int]
     stop_strategy: NotRequired[str]
@@ -272,10 +267,8 @@ class DataMixtureCfg(DatasetMixtureCfg, total=False):
         enable_caching: (Legacy) Whether to enable dataset caching.
     """
 
-    # Tokenization configuration
     tokenization: NotRequired[TokenizationCfg | None]
 
-    # Save configuration
     save: NotRequired[DatasetSaveCfg | None]
 
     # ShardedDataSource configuration (new data pipeline)

@@ -1964,7 +1964,6 @@ class EasyGenerationMixin:
             )
         )
         if is_falcon_h1:
-            # FalconH1 uses mamba_intermediate_size property or mamba_d_ssm
             intermediate_size = getattr(text_config, "mamba_intermediate_size", None)
             if intermediate_size is None:
                 mamba_d_ssm = getattr(text_config, "mamba_d_ssm", None)
@@ -2129,7 +2128,6 @@ class EasyGenerationMixin:
         if partition_axis is None:
             partition_axis = PartitionAxis()
 
-        # Get heads/dims from config
         num_heads = getattr(text_config, "num_attention_heads", None)
         head_dim = getattr(text_config, "head_dim", None)
         if head_dim is None:
@@ -2137,7 +2135,6 @@ class EasyGenerationMixin:
             if hidden_size and num_heads:
                 head_dim = hidden_size // num_heads
 
-        # Key/value heads for MQA/GQA
         key_heads = getattr(text_config, "num_key_value_heads", num_heads)
         value_heads = getattr(text_config, "num_key_value_heads", num_heads)
 
@@ -2656,7 +2653,6 @@ class EasyGenerationMixin:
                     f"got {type(ragged_config)}"
                 )
 
-        # Check if TurboQuant KV cache quantization is configured
         kv_quant_cfg = getattr(text_config, "kv_cache_quantization_config", None)
         _is_turboquant = isinstance(kv_quant_cfg, TurboQuantConfig)
 
@@ -3201,7 +3197,6 @@ class EasyGenerationMixin:
         """
         from easydel.caching import OperationsMetadata
 
-        # Check if ragged pages metadata is requested
         if pages_tables is not None and context_lens is not None:
             return OperationsMetadata.for_ragged(
                 pages_tables=pages_tables,
@@ -4037,7 +4032,6 @@ class EasyGenerationMixin:
 
         logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
 
-        # set init values
         prng_key = prng_key if prng_key is not None else jax.random.PRNGKey(0)
 
         if generation_config.pad_token_id is None and generation_config.eos_token_id is not None:
@@ -4077,13 +4071,11 @@ class EasyGenerationMixin:
             trace = False
 
         if self.config.is_encoder_decoder:
-            # add encoder_outputs to model_kwargs
             if model_kwargs.get("encoder_outputs") is None:
                 model_kwargs = self._prepare_encoder_decoder_kwargs_for_generation(
                     input_ids,
                     model_kwargs,
                 )
-            # prepare decoder_input_ids for generation
             input_ids = self._prepare_decoder_input_ids_for_generation(
                 batch_size,
                 decoder_start_token_id=generation_config.decoder_start_token_id,
@@ -4091,7 +4083,6 @@ class EasyGenerationMixin:
                 model_kwargs=model_kwargs,
             )
 
-        # Prepare `max_length` depending on other stopping criteria.
         input_ids_seq_length = input_ids.shape[-1]
         has_default_max_length = kwargs.get("max_length") is None and generation_config.max_length is not None
         if has_default_max_length and generation_config.max_new_tokens is None and generation_config.max_length == 20:
@@ -4558,7 +4549,6 @@ class EasyGenerationMixin:
             ... )
             >>> print(output.sequences)
         """
-        # init values
         max_length = max_length if max_length is not None else self.generation_config.max_length
         pad_token_id = pad_token_id if pad_token_id is not None else self.generation_config.pad_token_id
         eos_token_id = eos_token_id if eos_token_id is not None else self.generation_config.eos_token_id
@@ -4573,7 +4563,6 @@ class EasyGenerationMixin:
         is_sent_finished = jnp.zeros((batch_size,), dtype=jnp.bool_)
         model = self.decode if self.config.is_encoder_decoder else self
 
-        # initialize state
         state = SampleState(
             cur_len=cur_len,
             sequences=sequences,
@@ -4822,7 +4811,6 @@ class EasyGenerationMixin:
 
             return jax.tree_util.tree_map(gather_fn, nested)
 
-        # init values
         max_length = max_length if max_length is not None else self.generation_config.max_length
         pad_token_id = pad_token_id if pad_token_id is not None else self.generation_config.pad_token_id
         eos_token_id = eos_token_id if eos_token_id is not None else self.generation_config.eos_token_id
@@ -4854,7 +4842,6 @@ class EasyGenerationMixin:
         # and pass it the `encoder_outputs`, which are part of the `model_kwargs`.
         model = self.decode if self.config.is_encoder_decoder else self
 
-        # flatten beam dim
         assert model_kwargs is not None, "model_kwargs must not be None for beam search"
         if "encoder_outputs" in model_kwargs:
             model_kwargs["encoder_outputs"]["last_hidden_state"] = flatten_beam_dim(
@@ -4872,7 +4859,6 @@ class EasyGenerationMixin:
             **model_kwargs,
         )
 
-        # initialize state
         state = BeamSearchState(
             cur_len=cur_len,
             running_sequences=running_sequences,
@@ -5590,7 +5576,6 @@ class EasyGenerationMixin:
         model_hash = self._esurge_cache_scope()
 
         if engine_id is not None:
-            # Pause specific engine
             if engine_id in _ESURGE_MAP_CACHE:
                 eng = _ESURGE_MAP_CACHE[engine_id]
                 eng.pause()
@@ -5601,7 +5586,6 @@ class EasyGenerationMixin:
             else:
                 logger.warning(f"Engine not found: {engine_id}")
         else:
-            # Pause all engines for this model
             paused_count = 0
             should_log = False
             for cache_key, engine in _ESURGE_MAP_CACHE.items():
@@ -5638,7 +5622,6 @@ class EasyGenerationMixin:
         model_hash = self._esurge_cache_scope()
 
         if engine_id is not None:
-            # Resume specific engine
             if engine_id in _ESURGE_MAP_CACHE:
                 eng = _ESURGE_MAP_CACHE[engine_id]
                 if not self._esurge_engine_has_model_state(eng):
@@ -5649,7 +5632,6 @@ class EasyGenerationMixin:
             else:
                 logger.warning(f"Engine not found: {engine_id}")
         else:
-            # Resume all engines for this model
             resumed_count = 0
             should_log = False
             for cache_key, engine in _ESURGE_MAP_CACHE.items():
@@ -5849,7 +5831,6 @@ class EasyGenerationMixin:
             if cached_engine is not None:
                 if not self._esurge_engine_has_model_state(cached_engine):
                     self._refresh_esurge_engine_weights(cached_engine, restart_scheduler=False)
-                # Auto-resume if paused
                 if hasattr(cached_engine, "_paused") and cached_engine._paused:
                     if not getattr(cached_engine, "silent_mode", False):
                         logger.info("Auto-resuming paused eSurge engine")
@@ -5857,7 +5838,6 @@ class EasyGenerationMixin:
                 return cached_engine
             # No cache exists, will use defaults below
 
-        # Set default for max_model_len
         if max_model_len is None:
             max_model_len = self.config.granted_freq_max_position_embedding
 
@@ -5888,7 +5868,6 @@ class EasyGenerationMixin:
         if any_none:
             cached_engine = self.get_relevant_esurge(tokenizer=tokenizer, max_num_seqs=max_num_seqs)
 
-        # Extract parameters from cached engine or use defaults
         if tokenizer is None:
             if cached_engine is not None:
                 tokenizer = cached_engine.tokenizer
@@ -5944,7 +5923,6 @@ class EasyGenerationMixin:
         if silent_mode is None:
             silent_mode = cached_parsing.silent_mode if cached_parsing else False
 
-        # Build the configuration dict
         model_hash = self._esurge_cache_scope()
         extra_dict = dict(
             tokenizer=tokenizer,
@@ -5966,7 +5944,6 @@ class EasyGenerationMixin:
             silent_mode=silent_mode,
         )
 
-        # Check if this exact configuration exists in cache
         extra_dict_str = pprint.pformat(self._normalize_esurge_cache_value(extra_dict), sort_dicts=True)
         bytes_in = hashlib.md5(extra_dict_str.encode("utf-8")).digest()
         extra_dict_hash = int.from_bytes(bytes_in, byteorder="big", signed=True)
@@ -5976,7 +5953,6 @@ class EasyGenerationMixin:
         if esurge_hash in _ESURGE_MAP_CACHE:
             esurge = _ESURGE_MAP_CACHE[esurge_hash]
         else:
-            # Create new engine
             from easydel.inference import eSurge
             from easydel.inference.esurge.config import (
                 eSurgeCacheRuntimeConfig,
@@ -6176,7 +6152,6 @@ class EasyGenerationMixin:
             >>> response = model.esurge_generate(messages)
             >>> print(response.get_text())
         """
-        # Get or create eSurge engine with specified parameters
         esurge = self.get_esurge(
             tokenizer=tokenizer,
             max_model_len=max_model_len,
@@ -6195,7 +6170,6 @@ class EasyGenerationMixin:
             silent_mode=silent_mode,
         )
 
-        # Call the engine with the appropriate method
         return self._call_esurge_engine(
             esurge,
             prompts=prompts,

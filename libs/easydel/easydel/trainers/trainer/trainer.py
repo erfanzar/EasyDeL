@@ -775,7 +775,6 @@ class Trainer(BaseTrainer):
                     )
                     return state, exc, close_prefetcher()
 
-                # Execute training step
                 self._runtime_trace("train_step.execute.begin", epoch=epoch, current_step=current_step)
                 if getattr(self.arguments, "profiler_include_compile", False):
                     self._maybe_start_profiler(current_step)
@@ -1261,7 +1260,6 @@ class Trainer(BaseTrainer):
                     informations.update(metrics.other_metrics)
                 metrics = metrics.replace(other_metrics=informations)
 
-            # Apply post-gradient updates via the pruning module, if present.
             if self.pruning_module is not None:
                 state = state.replace(
                     graphstate=self.pruning_module.post_gradient_update(

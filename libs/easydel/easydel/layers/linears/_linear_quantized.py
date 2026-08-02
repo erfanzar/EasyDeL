@@ -479,7 +479,6 @@ def _quantized_linear_sharding_fn(
     if direction is None:
         return None
 
-    # Validate supported grouped quantization modes early.
     if mode not in {"affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"}:
         return None
     if group_size <= 0:

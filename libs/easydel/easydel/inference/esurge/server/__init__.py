@@ -61,7 +61,6 @@ See Also:
     - `easydel.workers.esurge.auth`: Authentication and authorization components
 """
 
-# Import auth components from workers
 from easydel.workers.esurge.auth import (
     ApiKeyMetadata,
     ApiKeyPermissions,

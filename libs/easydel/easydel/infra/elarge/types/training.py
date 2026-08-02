@@ -633,7 +633,6 @@ class BaseTrainerCfg(TypedDict, total=False):
 
     tx_mu_dtype: NotRequired[Any]
 
-    # Generation preview configuration
     generation_top_p: NotRequired[float | None]
     generation_top_k: NotRequired[int | None]
     generation_presence_penalty: NotRequired[float | None]
@@ -658,7 +657,6 @@ class BaseTrainerCfg(TypedDict, total=False):
     benchmark_interval: NotRequired[int | None]
     benchmarks: NotRequired[list[BenchmarkConfig] | BenchmarkConfig | None]
 
-    # eSurge integration for generation
     use_esurge_generation: NotRequired[bool]
     esurge_use_tqdm: NotRequired[bool]
     esurge_hbm_utilization: NotRequired[float | None]
@@ -940,7 +938,6 @@ class GRPOTrainerCfg(BaseTrainerCfg):
     frequency_penalty: NotRequired[float]
     repetition_penalty: NotRequired[float]
     temperature: NotRequired[float]
-    # Loss / clipping knobs.
     epsilon: NotRequired[float]
     epsilon_high: NotRequired[float | None]
     delta: NotRequired[float | None]
@@ -952,7 +949,6 @@ class GRPOTrainerCfg(BaseTrainerCfg):
     scale_rewards: NotRequired[Literal["group", "batch", "none"] | bool]
     mask_truncated_completions: NotRequired[bool]
     top_entropy_quantile: NotRequired[float]
-    # Generation-side knobs.
     min_p: NotRequired[float | None]
     generation_kwargs: NotRequired[dict | None]
     chat_template_kwargs: NotRequired[dict | None]
@@ -1524,11 +1520,9 @@ class DistillationTrainerCfg(BaseTrainerCfg):
     dataset_text_field: NotRequired[str | None]
     assistant_only_loss: NotRequired[bool]
     completion_only_loss: NotRequired[bool | None]
-    # Optional hidden-state matching loss.
     hidden_state_loss_weight: NotRequired[float | None]
     hidden_state_layers: NotRequired[tuple[int, ...] | None]
     hidden_state_loss: NotRequired[Literal["mse"]]
-    # Optional attention-matrix matching loss.
     attention_loss_weight: NotRequired[float | None]
     attention_layers: NotRequired[tuple[int, ...] | None]
     attention_normalize: NotRequired[bool]
@@ -2275,7 +2269,6 @@ BASE_TRAINER_DEFAULTS: BaseTrainerCfg = {
     "lmhead_chunksize": None,
     "sparsify_module": False,
     "sparse_module_type": "bcoo",
-    # Generation preview defaults
     "generation_shard_inputs": True,
     "generation_use_train_prompts": False,
     "generation_num_prompts": 1,
@@ -2285,7 +2278,6 @@ BASE_TRAINER_DEFAULTS: BaseTrainerCfg = {
     "log_training_generations_to_wandb": True,
     "benchmark_interval": None,
     "benchmarks": [],
-    # eSurge integration defaults
     "use_esurge_generation": True,
     # Both KV-cache sizing knobs default to None: when neither is set the trainer
     # auto-computes a tight token budget from the rollout shape (see
@@ -3111,7 +3103,6 @@ def normalize_trainer_config(config: dict[str, Any]) -> TrainerConfig:
         )
         config.pop("max_sequence_length", None)
 
-    # Get merged defaults from registry
     defaults = get_trainer_defaults(trainer_type)
 
     # Apply defaults (config values take precedence)
@@ -3120,16 +3111,13 @@ def normalize_trainer_config(config: dict[str, Any]) -> TrainerConfig:
 
     config["trainer_type"] = trainer_type
 
-    # Auto-compute max_completion_length for applicable trainers
     if "max_completion_length" not in config and trainer_type in _TRAINERS_WITH_COMPLETION_LENGTH:
         if "max_length" in config and "max_prompt_length" in config:
             config["max_completion_length"] = config["max_length"] - config["max_prompt_length"]
 
-    # Default eval_batch_size to total_batch_size
     if "eval_batch_size" not in config:
         config["eval_batch_size"] = config.get("total_batch_size", 32)
 
-    # Convert loss_config dict to LossConfig instance
     if "loss_config" in config and isinstance(config["loss_config"], dict):
         from easydel.infra.loss_utils import LossConfig
 
