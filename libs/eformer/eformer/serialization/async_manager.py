@@ -116,6 +116,31 @@ def _is_none(x):
     return x is None
 
 
+def _cast_floating_leaves(arrays: list, dtype) -> list:
+    """Cast only floating-point leaves to ``dtype``, leaving others untouched.
+
+    The ``dtype`` argument of the load path means "store parameters at this
+    precision", which is meaningful only for floating-point data. Applying it
+    to integer leaves destroys them: packed quantized weight codes
+    (``uint32``), block scales (``uint8``), token ids and index tensors all
+    become garbage when reinterpreted as ``bfloat16``. The save path already
+    restricts its cast this way (see ``to_host``); this keeps load symmetric
+    with it.
+
+    Args:
+        arrays: Deserialized leaves.
+        dtype: Target floating dtype.
+
+    Returns:
+        The leaves, with floating-point ones cast and the rest as-is.
+    """
+    cast = []
+    for leaf in arrays:
+        array = jnp.asarray(leaf)
+        cast.append(array.astype(dtype) if jnp.issubdtype(array.dtype, jnp.floating) else array)
+    return cast
+
+
 def _sync_remote_checkpoint_visibility(path: ePathLike | str, *, scope: str) -> None:
     """Block multihost callers until shared remote checkpoint files are visible."""
     if not fsspec_utils.is_remote_path(path):
@@ -1254,7 +1279,7 @@ class AsyncCheckpointManager:
                     "Index or structure may be stale."
                 )
             if dtype is not None:
-                array_leaves = [jnp.asarray(x, dtype=dtype) for x in array_leaves]
+                array_leaves = _cast_floating_leaves(array_leaves, dtype)
             if callback is not None:
                 array_leaves = [callback(arr, key) for arr, key in zip(array_leaves, array_keys, strict=False)]
         else:
@@ -1268,7 +1293,7 @@ class AsyncCheckpointManager:
                 chunk_arrays = self.global_manager.deserialize_with_paths(shardings=chunk_shardings, paths=chunk_paths)
                 self.global_manager.wait_until_finished()
                 if dtype is not None:
-                    chunk_arrays = [jnp.asarray(x, dtype=dtype) for x in chunk_arrays]
+                    chunk_arrays = _cast_floating_leaves(chunk_arrays, dtype)
                 if callback is not None:
                     chunk_arrays = [callback(arr, key) for arr, key in zip(chunk_arrays, chunk_keys, strict=False)]
                 array_leaves.extend(chunk_arrays)

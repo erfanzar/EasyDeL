@@ -12,10 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import easydel as ed
 import jax.numpy as jnp
 import spectrax as spx
-
-import easydel as ed
 from easydel.layers.quantization import QuantizationConfig, QuantizationType
 
 

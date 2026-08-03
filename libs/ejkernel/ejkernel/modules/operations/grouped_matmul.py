@@ -157,7 +157,7 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
     def create_shard_map_wrapper(
         self,
         lhs: Float[Array, "m k"],
-        rhs: Float[Array, "num_groups k n"] | Float[Array, "num_groups n k"],
+        rhs: Float[Array, "num_groups k n"] | Float[Array, "num_groups n k"] | Int[Array, "num_groups k n"] | Int[Array, "num_groups n k"],
         group_sizes: Int[Array, "num_groups_or_shards"],
         preferred_element_type: DTypeLike = jnp.float32,
         group_offset: Int[Array, "..."] | None = None,
@@ -216,7 +216,7 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
 
         def _wrapped_grouped_matmul(
             lhs: Float[Array, "m k"],
-            rhs: Float[Array, "num_groups k n"] | Float[Array, "num_groups n k"],
+            rhs: Float[Array, "num_groups k n"] | Float[Array, "num_groups n k"] | Int[Array, "num_groups k n"] | Int[Array, "num_groups n k"],
             group_sizes: Int[Array, "num_groups_or_shards"],
         ) -> Float[Array, "m n"]:
             """Shard-local grouped matmul forwarding to self.run."""
@@ -263,7 +263,7 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
     def run(
         self,
         lhs: Float[Array, "m k"],
-        rhs: Float[Array, "num_groups k n"] | Float[Array, "num_groups n k"],
+        rhs: Float[Array, "num_groups k n"] | Float[Array, "num_groups n k"] | Int[Array, "num_groups k n"] | Int[Array, "num_groups n k"],
         group_sizes: Int[Array, "num_groups_or_shards"],
         preferred_element_type: DTypeLike = jnp.float32,
         group_offset: Int[Array, "..."] | None = None,
@@ -549,7 +549,7 @@ _grouped_matmul_executor: Executor[GroupedMatmulConfig, Array] = Executor(
 
 def grouped_matmul(
     lhs: Float[Array, "m k"],
-    rhs: Float[Array, "num_groups k n"] | Float[Array, "num_groups n k"],
+    rhs: Float[Array, "num_groups k n"] | Float[Array, "num_groups n k"] | Int[Array, "num_groups k n"] | Int[Array, "num_groups n k"],
     group_sizes: Int[Array, "num_groups_or_shards"],
     group_offset: Int[Array, "..."] | None = None,
     existing_out: Float[Array, "m n"] | None = None,

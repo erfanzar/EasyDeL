@@ -480,32 +480,79 @@ def inner_kernel(
 
         acc_list = []
         if cfgs.lhs_cfgs.quant_dtype is None:
-            mxu_size = pltpu.get_tpu_info().mxu_column_size
+            tpu_info = pltpu.get_tpu_info()
+            mxu_size = tpu_info.mxu_column_size
             rhs_qbs = cfgs.rhs_cfgs.quant_block_size
-            for start_n in range(0, rhs_tile_n, mxu_size):
-                end_n = min(rhs_tile_n, start_n + mxu_size)
-                col_size = end_n - start_n
+            lhs_dtype = tiled_lhs.dtype
+            # The MXU only accepts specific dtype pairs; on hardware without
+            # native support for (lhs, rhs) — e.g. bf16 x f4E2M1FN, or
+            # bf16 x f8 on chips with no fp8 units — feeding the pair directly
+            # is a Mosaic compile error, so the rhs must be dequantized into
+            # the lhs dtype first. The same pre-matmul dequantization also wins
+            # when the rhs quant block is narrower than the MXU column: the
+            # post-scale path would split the contraction into `mxu/qbs` tiny
+            # matmuls per column strip, starving the MXU.
+            matmul_supported = tpu_info.is_matmul_supported(lhs_dtype, tiled_rhs.dtype)
+            dequantize_before = not matmul_supported or (cfgs.rhs_cfgs.has_scale and rhs_qbs < mxu_size)
 
-                acc_n = jnp.zeros((cfgs.tiles.tile_m, col_size), dtype=acc_ref.dtype)
-                for b_id in range(cfgs.num_quant_blocks_per_tile_k):
-                    k_start = b_id * rhs_qbs
-                    k_end = k_start + rhs_qbs
+            if dequantize_before:
+                if cfgs.rhs_cfgs.has_scale:
+                    # Fold per-block scales into the rhs in registers:
+                    # [tile_k, tile_n] -> [blocks, qbs, tile_n] * [blocks, 1, tile_n].
+                    # Upcast BEFORE reshaping — Mosaic supports rank-3 f32
+                    # vectors but not rank-3 sub-byte vectors.
+                    tiled_rhs_scale = tiled_rhs_ref.get_scale()
+                    blocks = cfgs.num_quant_blocks_per_tile_k
+                    dequantized = tiled_rhs.astype(jnp.float32).reshape(
+                        blocks, rhs_qbs, rhs_tile_n
+                    ) * tiled_rhs_scale.astype(jnp.float32)
+                    tiled_rhs_lhs_dtype = dequantized.reshape(tiled_rhs.shape[0], rhs_tile_n).astype(lhs_dtype)
+                else:
+                    tiled_rhs_lhs_dtype = tiled_rhs.astype(lhs_dtype)
 
-                    block_acc = jnp.matmul(
-                        tiled_lhs[:, k_start:k_end],
-                        tiled_rhs[k_start:k_end, start_n:end_n],
-                        preferred_element_type=jnp.float32,
-                    ).astype(acc_ref.dtype)
+                for start_n in range(0, rhs_tile_n, mxu_size):
+                    end_n = min(rhs_tile_n, start_n + mxu_size)
+                    acc_list.append(
+                        jnp.matmul(
+                            tiled_lhs,
+                            tiled_rhs_lhs_dtype[:, start_n:end_n],
+                            preferred_element_type=jnp.float32,
+                        ).astype(acc_ref.dtype)
+                    )
+            else:
+                for start_n in range(0, rhs_tile_n, mxu_size):
+                    end_n = min(rhs_tile_n, start_n + mxu_size)
+                    col_size = end_n - start_n
 
-                    if cfgs.rhs_cfgs.has_scale:
-                        tiled_rhs_scale = tiled_rhs_ref.get_scale()
-                        block_acc *= tiled_rhs_scale[b_id, :, start_n:end_n].astype(acc_ref.dtype)
+                    acc_n = jnp.zeros((cfgs.tiles.tile_m, col_size), dtype=acc_ref.dtype)
+                    for b_id in range(cfgs.num_quant_blocks_per_tile_k):
+                        k_start = b_id * rhs_qbs
+                        k_end = k_start + rhs_qbs
 
-                    acc_n += block_acc
-                acc_list.append(acc_n)
+                        block_acc = jnp.matmul(
+                            tiled_lhs[:, k_start:k_end],
+                            tiled_rhs[k_start:k_end, start_n:end_n],
+                            preferred_element_type=jnp.float32,
+                        ).astype(acc_ref.dtype)
+
+                        if cfgs.rhs_cfgs.has_scale:
+                            tiled_rhs_scale = tiled_rhs_ref.get_scale()
+                            block_acc *= tiled_rhs_scale[b_id, :, start_n:end_n].astype(acc_ref.dtype)
+
+                        acc_n += block_acc
+                    acc_list.append(acc_n)
         else:
             lhs_q_dtype = cfgs.lhs_cfgs.quant_dtype
             q_block_size = cfgs.lhs_cfgs.quant_block_size
+            # The k-loop below applies ONE rhs scale per iteration
+            # (``b_id = start_k // rhs_qbs``), so an iteration must never span
+            # more than one rhs quant block: with a 512-wide lhs block over
+            # 128-wide rhs blocks, one scale would silently cover four blocks.
+            # Clamping the step to the rhs block keeps the scale indexing
+            # exact; the finer lhs quantization it implies is numerically
+            # harmless (per-token scales just get more granular).
+            if cfgs.rhs_cfgs.has_scale:
+                q_block_size = min(q_block_size, cfgs.rhs_cfgs.quant_block_size)
 
             if jnp.issubdtype(lhs_q_dtype, jnp.floating):
                 dtype_max = float(jnp.finfo(lhs_q_dtype).max)
@@ -530,6 +577,14 @@ def inner_kernel(
                     block_scale = block_abs_max / dtype_max
                     block_scale_inv = jnp.where(block_scale == 0, 0, 1 / block_scale)
                     block_lhs_q = (block_lhs * block_scale_inv).astype(lhs_q_dtype)
+
+                    # The MXU may not accept the quantized-lhs dtype paired
+                    # with the rhs storage dtype (e.g. int8 x int4). Config
+                    # selection guarantees the classes match (int lhs only for
+                    # int rhs, float lhs only for float rhs), so upcasting the
+                    # rhs to the lhs dtype is exact.
+                    if not pltpu.get_tpu_info().is_matmul_supported(lhs_q_dtype, block_rhs.dtype):
+                        block_rhs = block_rhs.astype(lhs_q_dtype)
 
                     block_acc = jnp.matmul(
                         block_lhs_q,

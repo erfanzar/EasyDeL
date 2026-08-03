@@ -62,6 +62,58 @@ def _is_array_like(x):
     return hasattr(x, "shape") and hasattr(x, "dtype")
 
 
+def _leaf_target_dtype(target_dtype, storage_dtype):
+    """Resolve the read dtype for one leaf, preserving non-float storage.
+
+    The load-time ``dtype`` means "hold parameters at this precision", which is
+    meaningful only for floating-point data. Applied to an integer leaf it
+    silently destroys the values: packed quantized weight codes (``uint32``),
+    block scales (``uint8``), token ids and index tensors all become garbage
+    when reinterpreted as ``bfloat16``. Saving already restricts its cast to
+    floating arrays, so without this a quantized checkpoint could not be read
+    back by the same writer that produced it.
+
+    When the stored dtype is unknown the requested dtype is honoured, which
+    preserves the previous behaviour for checkpoints without index metadata.
+
+    Args:
+        target_dtype: Dtype requested by the caller, or ``None``.
+        storage_dtype: Dtype recorded for this array, or ``None`` if unknown.
+
+    Returns:
+        The dtype to read as, or ``None`` to keep the stored dtype.
+    """
+    if target_dtype is None or storage_dtype is None:
+        return target_dtype
+    return target_dtype if jnp.issubdtype(storage_dtype, jnp.floating) else None
+
+
+def _cast_floating_leaves(arrays: list, dtype) -> list:
+    """Cast only floating-point leaves to ``dtype``, leaving others untouched.
+
+    The load path's ``dtype`` means "hold parameters at this precision", which
+    is meaningful only for floating-point data. Applying it to integer leaves
+    destroys them: packed quantized weight codes (``uint32``), block scales
+    (``uint8``), token ids and index tensors all become garbage when
+    reinterpreted as ``bfloat16``. Saving already restricts its cast this way,
+    so an unguarded load made quantized checkpoints unreadable by the very
+    writer that produced them.
+
+    Args:
+        arrays: Deserialized leaves.
+        dtype: Target floating dtype.
+
+    Returns:
+        The leaves, with floating-point ones cast and the rest as-is.
+    """
+    cast = []
+    for leaf in arrays:
+        array = jnp.asarray(leaf)
+        cast.append(array.astype(dtype) if jnp.issubdtype(array.dtype, jnp.floating) else array)
+    return cast
+
+
+
 def _treedef_to_b64(treedef) -> str:
     """Serialize a JAX tree definition to a base64 string.
 
@@ -707,7 +759,7 @@ class AsyncCheckpointManager:
                     shardings[index],  # pyright: ignore[reportArgumentType]
                     spec,
                     global_shape=shape,
-                    dtype=target_dtype,
+                    dtype=_leaf_target_dtype(target_dtype, storage_dtype),
                     byte_limiter=byte_limiter,
                     context=context if context is not None else array_serialization.TS_CONTEXT,
                     assume_metadata=assume_metadata,
@@ -1089,7 +1141,7 @@ class AsyncCheckpointManager:
                     "Index or structure may be stale."
                 )
             if dtype is not None:
-                array_leaves = [jnp.asarray(x, dtype=dtype) for x in array_leaves]
+                array_leaves = _cast_floating_leaves(array_leaves, dtype)
             if callback is not None:
                 array_leaves = [callback(arr, key) for arr, key in zip(array_leaves, array_keys, strict=False)]
         else:
@@ -1126,7 +1178,7 @@ class AsyncCheckpointManager:
                     ),
                 )
                 if dtype is not None:
-                    chunk_arrays = [jnp.asarray(x, dtype=dtype) for x in chunk_arrays]
+                    chunk_arrays = _cast_floating_leaves(chunk_arrays, dtype)
                 if callback is not None:
                     chunk_arrays = [callback(arr, key) for arr, key in zip(chunk_arrays, chunk_keys, strict=False)]
                 for index, array in zip(chunk_indices, chunk_arrays, strict=True):
@@ -1375,7 +1427,7 @@ class AsyncCheckpointManager:
                 tensorstore_metadata=tensorstore_metadata,
             )
             if dtype is not None:
-                array_leaves = [jnp.asarray(x, dtype=dtype) for x in array_leaves]
+                array_leaves = _cast_floating_leaves(array_leaves, dtype)
             if callback is not None:
                 array_leaves = [callback(arr, key) for arr, key in zip(array_leaves, array_keys, strict=False)]
         else:
@@ -1397,7 +1449,7 @@ class AsyncCheckpointManager:
                     tensorstore_metadata=tensorstore_metadata[start:end] if tensorstore_metadata is not None else None,
                 )
                 if dtype is not None:
-                    chunk_arrays = [jnp.asarray(x, dtype=dtype) for x in chunk_arrays]
+                    chunk_arrays = _cast_floating_leaves(chunk_arrays, dtype)
                 if callback is not None:
                     chunk_arrays = [
                         callback(arr, key) for arr, key in zip(chunk_arrays, array_keys[start:end], strict=False)

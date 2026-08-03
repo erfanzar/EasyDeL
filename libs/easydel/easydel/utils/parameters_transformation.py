@@ -210,6 +210,27 @@ class TensorConverter:
         return jnp.array(npv, dtype=dtype)
 
     @staticmethod
+    def to_jax_preserving_dtype(tensor: tp.Any) -> jnp.ndarray:
+        """Convert a tensor to a JAX array **without** changing its dtype.
+
+        The counterpart to :meth:`convert_pytorch_to_jnp`, which casts to the
+        model's parameter dtype. Quantized checkpoint leaves must not be cast:
+        a packed ``uint32`` kernel or a ``uint8`` block scale reinterpreted as
+        ``bfloat16`` is silently destroyed. Accepts values that are already
+        JAX/NumPy arrays so it can sit on paths where an earlier stage
+        converted.
+
+        Args:
+            tensor: A PyTorch tensor, NumPy array, or JAX array.
+
+        Returns:
+            A JAX array holding the same values and dtype.
+        """
+        if hasattr(tensor, "detach"):
+            return TensorConverter.pytorch_to_jax(tensor)
+        return jnp.asarray(tensor)
+
+    @staticmethod
     @functools.lru_cache
     def get_torch():
         """Import and return the ``torch`` module, cached across calls.
@@ -737,6 +758,11 @@ class StateDictConverter:
                             new_config = config.copy()
                             new_config["reform_param"] = {}
                             new_config["_reform_processed"] = True
+                            # Quantized checkpoint rules produce packed integer codes and
+                            # 8-bit scales; casting those to the model's param dtype would
+                            # destroy them, so such rules opt out of the dtype cast.
+                            if value.get("preserve_dtype", False):
+                                new_config["_preserve_dtype"] = True
 
                             for split in splits:
                                 split_name = split["name"]
@@ -784,7 +810,10 @@ class StateDictConverter:
         # if config["uses_tie_word_embedding"] and config["lm_head_name"] and key_tuple[0] == config["lm_head_name"]:
         #     return None
 
-        array = TensorConverter.convert_pytorch_to_jnp(tensor, config["dtype"])
+        if config.get("_preserve_dtype", False):
+            array = TensorConverter.to_jax_preserving_dtype(tensor)
+        else:
+            array = TensorConverter.convert_pytorch_to_jnp(tensor, config["dtype"])
         return [(key_tuple, array)]
 
     @staticmethod

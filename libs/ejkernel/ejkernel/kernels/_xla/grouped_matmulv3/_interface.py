@@ -504,7 +504,7 @@ _grouped_matmulv3_core.defvjp(_grouped_matmulv3_fwd, _grouped_matmulv3_bwd)
 @jaxtyping.jaxtyped(typechecker=beartype)
 def grouped_matmulv3(
     lhs: Float[Array, "m k"],
-    rhs: Float[Array, "num_groups k n"] | Float[Array, "num_groups n k"],
+    rhs: Float[Array, "num_groups k n"] | Float[Array, "num_groups n k"] | Int[Array, "num_groups k n"] | Int[Array, "num_groups n k"],
     group_sizes: Int[Array, "num_groups_or_shards"],
     preferred_element_type: DTypeLike = jnp.float32,
     tiling: tuple[int, int, int] | LutFn | None = (128, 128, 128),

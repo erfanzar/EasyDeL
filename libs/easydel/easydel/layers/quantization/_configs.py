@@ -51,7 +51,9 @@ See Also:
 
 from __future__ import annotations
 
+import dataclasses
 import enum
+import typing as tp
 from dataclasses import dataclass, field
 
 from easydel.utils.compiling_utils import hash_fn
@@ -211,6 +213,51 @@ class QuantizationConfig:
         if self.bits is not None:
             self.bits = int(self.bits)
         self.jax_native = bool(self.jax_native)
+
+    def to_dict(self) -> dict[str, tp.Any]:
+        """Serialize to a JSON-safe mapping.
+
+        Required for ``save_pretrained`` on a quantized model: applying
+        quantization stores this object on ``config.quantization_config``, and
+        the config is written out as JSON. The encoder used for EasyDeL
+        configs delegates to ``to_dict`` when present, so defining it here is
+        all that is needed — without it, saving any quantized model fails with
+        ``Object of type QuantizationConfig is not JSON serializable``.
+
+        Enum members are written as their string values so the result
+        round-trips through :meth:`from_dict` and stays readable in
+        ``config.json``.
+
+        Returns:
+            A mapping of field name to JSON-safe value.
+        """
+        return {
+            "dtype": self.dtype.value if isinstance(self.dtype, QuantizationType) else self.dtype,
+            "runtime_dtype": (
+                self.runtime_dtype.value if isinstance(self.runtime_dtype, QuantizationType) else self.runtime_dtype
+            ),
+            "group_size": self.group_size,
+            "bits": self.bits,
+            "simulate": self.simulate,
+            "jax_native": self.jax_native,
+            "pattern": self.pattern,
+        }
+
+    @classmethod
+    def from_dict(cls, data: tp.Mapping[str, tp.Any]) -> "QuantizationConfig":
+        """Rebuild from a mapping produced by :meth:`to_dict`.
+
+        Unknown keys are ignored so a config written by a newer version stays
+        loadable.
+
+        Args:
+            data: Mapping of field name to value.
+
+        Returns:
+            The reconstructed :class:`QuantizationConfig`.
+        """
+        fields = {f.name for f in dataclasses.fields(cls)}
+        return cls(**{key: value for key, value in data.items() if key in fields})
 
     __hash__ = hash_fn
 

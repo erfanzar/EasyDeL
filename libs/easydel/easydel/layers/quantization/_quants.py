@@ -614,16 +614,20 @@ class EasyQuantizer:
         if self._config is None:
             return model
 
-        if hasattr(model, "config"):
-            model.config.quantization_config = self.config
-
         for path, block_instance in iter_module_search(model, spx.Module):
             if hasattr(block_instance, "from_quantized") and callable(block_instance.from_quantized):
                 set_module_from_path(
                     model=model,
                     path=path,
-                    new_value=block_instance.from_quantized(config=self.config),
+                    new_value=block_instance.from_quantized(),
                 )
+
+        # Clear the marker only after the walk: the model is no longer
+        # quantized, and leaving a config behind makes `save_pretrained` write
+        # a checkpoint that claims to be quantized and `from_pretrained`
+        # rebuild quantized layers around dense weights.
+        if hasattr(model, "config"):
+            model.config.quantization_config = None
         return model
 
     def __str__(self) -> str:
