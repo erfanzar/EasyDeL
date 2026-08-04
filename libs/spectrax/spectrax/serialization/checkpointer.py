@@ -560,7 +560,22 @@ def find_latest_checkpoint(base_path: str) -> str | None:
     if not _fs.is_dir(base_path):
         return None
 
-    candidates = [p for p in _fs.iterdir(base_path) if _fs.is_dir(p)]
+    # ``_fs.iterdir()`` returns paths with the URI scheme stripped
+    # ("gs://bucket/run" -> "bucket/run"). Every subsequent path operation --
+    # including the metadata.json existence probe below -- then resolves against
+    # the LOCAL filesystem and is unconditionally False for remote object
+    # storage, so discovery silently returns None and resumption never happens.
+    # Re-attach the scheme taken from ``base_path`` before touching the results.
+    _scheme = base_path.split("://", 1)[0] + "://" if "://" in base_path else ""
+
+    def _restore_scheme(path: str) -> str:
+        if not _scheme or path.startswith(_scheme):
+            return path
+        return _scheme + path.lstrip("/")
+
+    candidates = [
+        q for q in (_restore_scheme(p) for p in _fs.iterdir(base_path)) if _fs.is_dir(q)
+    ]
     candidates.append(base_path)
 
     ckpts = [p for p in candidates if _fs.exists(_fs.joinpath(p, "metadata.json"))]
