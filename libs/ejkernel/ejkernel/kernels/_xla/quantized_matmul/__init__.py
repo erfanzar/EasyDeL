@@ -28,6 +28,7 @@ Key Features:
     - Configurable tile sizes and compute precision
 """
 
+from ._channelwise import channelwise_quantized_matmul
 from ._interface import quantized_matmul
 
-__all__ = ["quantized_matmul"]
+__all__ = ["channelwise_quantized_matmul", "quantized_matmul"]

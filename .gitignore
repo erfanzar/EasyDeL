@@ -169,3 +169,4 @@ dmypy.json
 .basedpyright/
 debug/*
 model-files/*
+autoresearch-results.tsv

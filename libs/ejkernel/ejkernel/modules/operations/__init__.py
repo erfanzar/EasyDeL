@@ -238,6 +238,7 @@ from .gdn_spec_window import (
     gdn_spec_window_states,
     gdn_spec_window_states_op,
 )
+from .fused_mlp import fused_mlp, split_gate_up
 from .grouped_matmul import GroupedMatmul, grouped_matmul
 from .kernel_delta_attention import KernelDeltaAttention, kda_attention, kernel_delta_attention
 from .lightning_attention import LightningAttention, lightning_attention
@@ -420,7 +421,9 @@ __all__ = (
     "gdn_spec_window_states_op",
     "gdr_attention",
     "gla_attention",
+    "fused_mlp",
     "grouped_matmul",
+    "split_gate_up",
     "kda_attention",
     "kernel_delta_attention",
     "lightning_attention",

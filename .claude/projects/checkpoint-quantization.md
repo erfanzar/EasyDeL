@@ -516,6 +516,165 @@ with native-dtype storage (kills the uint32 in-kernel unpack path on TPU),
 make checkpoint `target_spec` hardware-aware (v5 -> affine int8/int4), add a
 tuned tiling LUT seeded from the sweep above.
 
+## Autoresearch: 2x-speedup loop (2026-08-03, branch `autoresearch-qmm-2x`)
+
+8 iterations, git-as-memory on the branch, log in `autoresearch-results.tsv`.
+Metric: min speedup vs jitted bf16 over {int8,int4} x {qkv,gate_up,down} x
+{t=8,2048}, relerr gate 0.08. **0.456 -> 1.078** (2.4x metric improvement);
+every cell >1x.
+
+The path was one demolition and one construction:
+- **Pallas is the wrong tool for this op.** The v3 kernel's *pure bf16*
+  ceiling measured 0.47-0.78x of XLA's matmul — quantization tuning inside it
+  is capped below 1 before it starts. (Same lesson as the MoE ragged_dot
+  history.)
+- **The winner is a 30-line XLA composition** — now
+  `ejkernel.kernels._xla.quantized_matmul.channelwise_quantized_matmul`
+  (12 CPU parity tests): decode = `x @ w_q.astype(bf16)` (XLA fuses the
+  upcast into the weight stream; ANY pre-dot arithmetic breaks the fusion)
+  with the per-channel scale on the [m,n] output; prefill = per-token int8
+  acts + native int8xint8 dot (459 TOPS/core = 2x bf16) + epilogue scales.
+  Per-channel scales are load-bearing: K-blocked scales force either the
+  fusion break or [blocks,m,n] int32 partials (1.9 GB at m=2048).
+
+Where 2x stands, honestly:
+- **Achieved**: W4A4 prefill 2.88x (int4 MXU is 920 TOPS/core = 4x bf16) —
+  but relerr 0.11 unsmoothed, so it is an opt-in behind calibration, and the
+  relerr gate correctly rejected it as a default.
+- **Approached with size**: decode speedup grows as the dispatch floor
+  (~125us, shared with bf16) amortizes — 27B-class shard: int8 1.52x, int4
+  1.77x, asymptote = byte ratio.
+- **Structurally capped in the harness min**: qkv-7B t=8 is floor-bound for
+  BOTH paths; no single-op change can reach 2x there. Reaching 2x end-to-end
+  needs either per-layer weights large enough to bury the floor (27B+ shards)
+  or multi-op fusion per dispatch — a serving-integration lever, not a kernel
+  one.
+
+Kernel-side facts bought along the way: Mosaic CSEs repeated lhs quant
+(hoisting: no-op); the 128-col strip loop genuinely pipelines VPU/MXU
+(removing it: -6%); f32 epilogue is free (bf16 epilogue: slower AND less
+accurate); int8xint4 is not MXU-native (upcast, int8 rate).
+
+Next integration steps: route ejkernel's dense qmm TPU dispatch to
+`channelwise_quantized_matmul` for int-target specs; adapters emit
+per-channel int8/int4 on v5; wire `qmm_*` layer knobs; expose W4A4 as an
+explicitly-calibrated opt-in.
+
+## Autoresearch: packed-int4 decode / 4x attempt (2026-08-04)
+
+Six iterations + two probes on `autoresearch-qmm-2x`. Deliverables in
+`ejkernel/kernels/_pallas/tpu/quantized_matmul/_packed_gemv.py` (TPU parity
+tests 3/3): `packed_int4_gemv` (W4A16, 2 weights/byte, split-K packing) and
+`w4a4_gemv` (packed weights fed to the int4 MXU via `pltpu.bitcast` — zero
+per-element decode). Bench: `benchmarks/bench_packed_int4_decode.py`.
+
+Decode vs jitted bf16, TPU v5 single chip:
+
+| path | 13B gate_up | 27B gate_up |
+| --- | --- | --- |
+| XLA fused-upcast int4 (W4A16) | 1.36-1.41x | 1.76-1.78x |
+| Pallas packed W4A16 | 1.15-1.18x | 1.29-1.32x |
+| **Pallas W4A4 (bitcast MXU feed)** | **1.44x** | **2.07x** (241us, kernel-exact vs its quantized semantics) |
+
+**4x verdict for v5: not reachable, two measured walls.**
+1. *Convert bound* — any W-A16 path converts every weight element for the
+   MXU (~1.5-1.7T elem/s through the convert pipeline, XLA's fused convert
+   being the best implementation); packing bytes doesn't help because bytes
+   are not the pole. Cap ≈ 1.8x.
+2. *int4-MXU ingest floor* — W4A4 removes the convert entirely (bitcast is a
+   register reinterpret) but plateaus at ~223us/2.2x on 27B across every
+   tile/split-k geometry: the MXU's weight-ingest rate at tiny m is the wall.
+
+4x lives on v6e/v7 (native sub-byte MXU feeds / faster convert) or at
+per-chip weights well beyond 27B-class. On v5 the practical ladder is:
+prefill W8A8 1.77x / W4A4 2.88x (calibration-gated), decode W4A4 2.07x
+(calibration-gated) or W4A16 1.8x (exact).
+
+Mosaic v5 lowering facts collected: no 8-bit vector bitwise; `arith.shrui`
+does not legalize (use signed shifts in int32); `bitcast(u8->int4)` expands
+sublane-major matching adjacent-rows packing; CPU backend rejects int4
+dot_general even in interpret mode (W4A4 tests are TPU-only).
+
+## Push-more session: the cost model that closes the case (2026-08-07)
+
+Follow-up probes on `autoresearch-qmm-2x` produced a complete cost model that
+explains every measurement of the packed-decode investigation:
+
+    time_per_op = fixed + bytes / 2.51 TB/s
+    fixed = ~123us at a jit boundary; ~36us (native XLA op) / ~57us
+    (pallas_call) inside a compiled graph.
+
+Verified fits: w4a4 27B microbench 123+94=217us (measured 222); bf16 27B
+123+375=498 (measured 497). Everything earlier called "MXU ingest floor" or
+"dtype stream penalty" was this fixed cost polluting small-array rates — the
+dtype-stream sweep showed all dtypes stream identically once overhead is
+subtracted, and the size sweep fit fixed=123us, BW=2.51 (Pallas marginal)
+/ 1.74 (XLA reduce marginal; XLA *matmul* streams at ~2.5 like Pallas).
+
+Consequences, all measured:
+- **In-graph (serving-realistic) w4a4 decode at 27B: 2.72x** (151.2 vs
+  411.4us/op; jit-boundary microbench shows only 2.08-2.23x). In-graph is the
+  number that matters for eSurge.
+- `parallel` grid semantics beat `arbitrary` by ~8% for the w4a4 grid
+  (222 vs 241us); promoted into the kernel. `CORE_PARALLEL` (megacore) gave
+  nothing — Pallas single-kernel BW is the same ~2.51 TB/s marginal.
+- XLA cannot read packed nibbles: `bitcast_convert_type+reshape` into a dot
+  does NOT fuse (materializes, 6-13x slower) and its nibble order differs.
+- Two measurement traps for future benches: XLA dead-column-eliminates
+  weights whose outputs are sliced (a `[:, :K]` chain let bf16 "read" 940MB
+  in 90us); and any chaining operand as large as the weight doubles the
+  traffic being measured.
+
+Remaining route to ~4x on v5, now exactly quantified: amortize the fixed cost
+over more bytes per dispatch — a fused MLP kernel (gate_up+act+down in one
+pallas_call) projects (2x411)/(57+188) = 3.4x, four fused weights ~3.8x.
+That is an eSurge/layer-level integration, not further kernel tuning; the
+w4a4 kernel itself sits on the DMA line.
+## Fused MLP op (2026-08-07): forward + backward, modular, measured
+
+Shipped on `autoresearch-qmm-2x`: `ejkernel.modules.fused_mlp` — one surface
+for `down(act(gate(x)) * up(x))` across formats (bf16 / channelwise int8 /
+channelwise int4 / packed-int4), layouts (separate, fused-concat,
+TP-interleaved — normalized by `split_gate_up` at the boundary so kernels
+carry zero layout branches), activations (silu/gelu/gelu_tanh/relu/sigmoid),
+and **both directions**:
+
+* forward: Pallas single-dispatch W4A4 kernel on TPU decode shapes
+  (`kernels/_pallas/tpu/fused_mlp`, registered `Platform.PALLAS`); XLA
+  composition otherwise (`kernels/_xla/fused_mlp`, registered fallback).
+  The Pallas kernel keeps hidden activations in registers, re-quantizing
+  per-(token, I-tile) — finer than the per-token scales that failed the
+  accuracy gate — and is tested kernel-exact against a tile-wise NumPy
+  replication of its semantics.
+* backward: `custom_vjp`, flash-style recompute (no saved intermediates);
+  dense weights get true dW (parity vs naive autodiff < 0.5% on all four
+  cotangents); integer codes are frozen (float0 cotangents) with exact dx —
+  the LoRA/frozen-backbone training contract.
+
+Measured (TPU v5, single chip, `bench_fused_mlp.py`), whole MLP block:
+
+| path | 13B decode | 27B decode | 27B train fwd+bwd (t=2048) |
+| --- | --- | --- | --- |
+| bf16 single-jit / in-graph | 303 / 207us | 689 / 589us | 16.3ms |
+| w4a4 unfused (2 dispatches) | 185us | (VMEM OOM at tile 1024) | — |
+| **w4a4 FUSED (1 dispatch, tile_i=512)** | **185us** | **298us = 1.98x in-graph / 2.31x single** | — |
+| int8-frozen differentiable path | — | — | 15.5ms |
+
+Honest notes (corrected after the optimize-pallas pass): the 197us "floor"
+was WRONG — it used the DMA-only marginal bandwidth (2.51 TB/s) where the
+int4-matmul weight-ingest rate applies (~1.06 TB/s; the same wall measured
+for the single gemv AND for XLA's own int4 dot — all three agree, so it is
+the hardware's int4-matmul ingest path at tiny m, not a schedule bug). True
+floor ~ 352MB/1.06 + fixed ~= 330-370us; the kernel at 295us/tile_i=1024 is
+AT its floor. Raising vmem_limit_bytes and quadrupling tile size moved it
+~2% — step-count overhead was a misattribution, now falsified by experiment.
+Dense-format training runs the plain composition under autodiff and is
+bit-identical to XLA (1.00x, worst grad relerr 0.0).
+13B MLPs are small enough that fixed costs still dominate (fused == unfused).
+Training with quantized-frozen weights is ~5% faster than bf16 fwd+bwd (the
+bwd is the same dense math; the fwd saves) — real training wins need the
+int8-dot prefill path in bwd's transposed products, future work. Tests:
+13 CPU + 2 TPU new, all green; layering intact.
 ## Open decisions
 
 - **fp8 has no matching ejkernel mode.** Our modes are affine (integer),
