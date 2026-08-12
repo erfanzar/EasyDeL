@@ -276,6 +276,15 @@ class RayResources:
                 info = ExceptionInfo.ser_exc_info(e)
                 queue.put((False, info))
 
+        # Escape hatch: run inline in this process instead of forking. When the
+        # child dies hard the parent can only report a generic timeout and the
+        # real traceback is lost, which makes accelerator-init failures hard to
+        # diagnose; this propagates the original exception instead. Checked here,
+        # in the parent, before the process exists -- inside the child body it
+        # could not prevent the fork.
+        if os.getenv("EFORMER_DISABLE_FORKIFY"):
+            return underlying_function(*args, **kwargs)
+
         queue = multiprocessing.Queue()
         process = multiprocessing.Process(target=target_fn, args=(queue, args, kwargs))
         timeout_s = float(os.getenv("EFORMER_SUBPROCESS_TIMEOUT_S", "1000000"))

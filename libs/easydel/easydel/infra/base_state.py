@@ -329,7 +329,19 @@ def _optimizer_state_shardings_from_params(
             )
             return _sanitize_slot_shardings(slot_shardings)
         except ValueError as exc:
-            if "Mismatch custom node data" not in str(exc):
+            # jax phrases a treedef mismatch differently across versions:
+            # "Mismatch custom node data" before 0.10, "different pytree
+            # metadata" / "pytree structure error" from 0.10 on. Matching only
+            # the old wording means that on current jax the exception escapes
+            # instead of falling through to the structural path below, so any
+            # optimizer whose pytree node definition carries value-dependent
+            # static aux_data fails here rather than being handled.
+            _mismatch_markers = (
+                "Mismatch custom node data",
+                "different pytree metadata",
+                "pytree structure error",
+            )
+            if not any(m in str(exc) for m in _mismatch_markers):
                 raise
 
     param_treedef = jax.tree_util.tree_structure(param_shardings, is_leaf=_is_sharding_leaf)
