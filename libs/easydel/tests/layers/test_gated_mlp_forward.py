@@ -521,6 +521,13 @@ def test_resolved_specs_follow_the_decode_scope_not_the_shape():
     from easydel.infra.sharding import decode_mode_specs
     from easydel.layers.mlp import _resolved_specs
 
+    # Both axes must be > 1 for the assertions to mean anything, and the mesh
+    # has to fit the live device set: the CPU trio fakes 8 devices while a
+    # v5p-8 has 4, so derive the dims instead of hardcoding a device count.
+    if jax.device_count() < 4:
+        pytest.skip("needs at least 4 devices for a tp>1, sp>1 mesh")
+    tp = 2
+    sp = jax.device_count() // tp
     cfg = ed.LlamaConfig(
         hidden_size=64,
         intermediate_size=128,
@@ -528,7 +535,7 @@ def test_resolved_specs_follow_the_decode_scope_not_the_shape():
         num_attention_heads=4,
         num_key_value_heads=4,
         vocab_size=256,
-        sharding_axis_dims=(1, 1, 1, 1, 4, 2),
+        sharding_axis_dims=(1, 1, 1, 1, tp, sp),
     )
     with cfg.mesh:
         mlp = LlamaMLP(cfg, rngs=spx.Rngs(0))
