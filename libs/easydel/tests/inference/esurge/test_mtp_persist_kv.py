@@ -66,8 +66,6 @@ _VOCAB = 256
 _HIDDEN = 128
 
 
-
-
 def _hidden(seed: int) -> jnp.ndarray:
     return jax.random.normal(jax.random.fold_in(jax.random.PRNGKey(7), seed), (1, 1, _HIDDEN), dtype=jnp.float32)
 
@@ -117,7 +115,9 @@ def test_rollback_sets_cache_length_to_committed():
     for view in drafter._mtp_cache.views:
         if view is None:
             continue
-        assert int(np.asarray(view.indexes).reshape(-1)[0]) == 2, "rollback must set the write index to the committed len"
+        assert int(np.asarray(view.indexes).reshape(-1)[0]) == 2, (
+            "rollback must set the write index to the committed len"
+        )
 
     # The next window's writes resume from the committed position, not from 0.
     _run_window(drafter, seed_token=7, seed_position=2, seed_hidden=_hidden(1), k=1)

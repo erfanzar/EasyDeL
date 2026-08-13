@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from types import MappingProxyType
+
 import jax
 import numpy as np
 import pytest
@@ -31,14 +33,13 @@ def test_retp_fused_state_preserves_leaf_sharding():
     bf16[5120,34816] forward all-gathers on a v5p-2048 fsdp64/tp4 run loading
     a fused_param_tp=2 checkpoint (2026-07-04).
     """
-    from jax.sharding import Mesh, NamedSharding, PartitionSpec
-
     from easydel.layers.layouts import retp_fused_optimizer_state, retp_fused_state
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
     hidden = 32  # fused gate_up out dim = 2*hidden = 64; divisible by tp 2 and 4
 
     class _Stub:
-        fused_params = {"mlp.gate_up_proj": (hidden, hidden)}
+        fused_params = MappingProxyType({"mlp.gate_up_proj": (hidden, hidden)})
 
     if len(jax.devices()) < 8:
         pytest.skip("needs 8 (fake) devices")

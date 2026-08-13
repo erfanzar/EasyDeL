@@ -66,7 +66,10 @@ Example:
 
 from __future__ import annotations
 
+import dataclasses
+import os
 import time
+import typing as tp
 
 import jax
 import numpy as np
@@ -93,6 +96,71 @@ _PAYLOAD_PUT_CACHE_LIMIT_BYTES = 1 << 16
 #: transfer is required (bumped or unknown version), and the content cache
 #: must not alias it back to a stale device array.
 _PAYLOAD_PAGE_TABLE_INDEX = 3
+
+
+_batch_metadata_dump_dir: str | None = None
+
+
+def set_batch_metadata_dump_dir(path: str | None) -> None:
+    """Enable (or disable with ``None``) the per-step batch-metadata ring dump.
+
+    Debug API: when set, every ``prepare_batch_metadata`` call writes an
+    8-slot ring of ``batchmeta_{step%%8}.npz`` files (scheduled/computed/
+    seq_lens/qsl/page_table snapshots) to *path*. This is the capture that
+    root-caused the RPA v3 empty-row device hang; pair it with a standalone
+    kernel replay to reproduce device faults from live engine metadata.
+
+    Args:
+        path: Target directory (created on first write), or ``None`` to
+            disable dumping.
+    """
+    global _batch_metadata_dump_dir
+    _batch_metadata_dump_dir = path
+
+
+def get_batch_metadata_dump_dir() -> str | None:
+    """Return the active batch-metadata dump directory (``None`` = off)."""
+    return _batch_metadata_dump_dir
+
+
+def compute_request_distribution_prefix(
+    scheduled: np.ndarray,
+    num_computed_tokens: np.ndarray,
+    num_requests: int,
+) -> tuple[int, int, int]:
+    """Classify slot-ordered rows for the v3 positional distribution contract.
+
+    The ragged-page-attention v3 kernel runs rows ``[0, decode_end)`` on a
+    static ``q_len=1`` decode path, ``[decode_end, prefill_end)`` on the
+    chunked-prefill path, and ``[prefill_end, total)`` on the order-agnostic
+    variable-length mixed path. Rows are persistent slots packed in slot
+    order, so classification MUST be positional: this returns the longest
+    leading run of decodes, the following run of prefills, and pushes any
+    interleaved or inactive tail into the mixed range. Count-based
+    classification (the previous behavior) desyncs the kernel and hangs the
+    device the first time a freed slot is reused by a new prefill while
+    later slots still decode.
+
+    Args:
+        scheduled: Per-row scheduled token counts ``[>= num_requests]``.
+        num_computed_tokens: Per-row computed-token counts.
+        num_requests: Number of live rows.
+
+    Returns:
+        ``(decode_end, prefill_end, num_requests)``.
+    """
+    if num_requests <= 0:
+        return 0, 0, 0
+    active = scheduled[:num_requests] > 0
+    is_decode = (scheduled[:num_requests] == 1) & (num_computed_tokens[:num_requests] > 0) & active
+    flags = np.zeros(num_requests, dtype=np.int8)
+    flags[is_decode] = 1
+    flags[active & ~is_decode] = 2
+    non_decode = np.flatnonzero(flags != 1)
+    decode_end = int(non_decode[0]) if non_decode.size else num_requests
+    non_prefill = np.flatnonzero(flags[decode_end:] != 2)
+    prefill_end = decode_end + (int(non_prefill[0]) if non_prefill.size else num_requests - decode_end)
+    return decode_end, prefill_end, num_requests
 
 
 class BatchMetadataPreparer:
@@ -312,6 +380,18 @@ class BatchMetadataPreparer:
         # Double buffering: store pending async device transfer
         self._pending_transfer: tuple | None = None
         self._pending_transfer_metadata: dict | None = None
+
+        # Steady-decode incremental prep cache. In pure decode the only
+        # metadata that changes step over step is (seq_lens, input token,
+        # position) per request — everything else (query_start_loc, scheduled,
+        # logits indices, sampling params, misc counters, page tables) is
+        # byte-identical. The full prep path primes this cache; the fast path
+        # content-compares the current inputs against the primed snapshots
+        # (no event tracking, no prediction) and, on a hit, rebuilds only the
+        # three changing arrays with a single small batched device_put.
+        self._incr_cache: dict[str, tp.Any] | None = None
+        self.incremental_prep_hits: int = 0
+        self.incremental_prep_misses: int = 0
 
         # Last-prep timing breakdown (seconds).
         self.last_prep_stats: dict[str, float] = {}
@@ -857,10 +937,20 @@ class BatchMetadataPreparer:
                 live_rows = int(rank_live_rows[rank])
                 rank_used = int(rank_used_tokens[rank])
                 dp_query_start_loc[rank, live_rows + 1 : rows_per_rank + 1] = rank_used
-                decode_count = int(rank_decode_counts[rank])
-                prefill_count = int(rank_prefill_counts[rank])
-                dp_request_distribution[rank, 0] = decode_count
-                dp_request_distribution[rank, 1] = decode_count + prefill_count
+                # Positional-contract prefix classification (see the non-DP
+                # branch): count-based fills desync the kernel when a reused
+                # slot interleaves a prefill among decodes.
+                qsl_rank = dp_query_start_loc[rank]
+                row_lens = qsl_rank[1 : live_rows + 1] - qsl_rank[:live_rows]
+                row_ctx = dp_context_lens[rank, :live_rows]
+                row_is_decode = (row_lens == 1) & ((row_ctx - row_lens) > 0)
+                row_is_prefill = (row_lens > 0) & ~row_is_decode
+                non_decode = np.flatnonzero(~row_is_decode)
+                decode_end = int(non_decode[0]) if non_decode.size else live_rows
+                non_prefill = np.flatnonzero(~row_is_prefill[decode_end:])
+                prefill_end = decode_end + (int(non_prefill[0]) if non_prefill.size else live_rows - decode_end)
+                dp_request_distribution[rank, 0] = decode_end
+                dp_request_distribution[rank, 1] = prefill_end
                 dp_request_distribution[rank, 2] = live_rows
         else:
             off = 0
@@ -952,19 +1042,43 @@ class BatchMetadataPreparer:
 
         # request_distribution (v3) / slot_mapping (v2)
         request_distribution.fill(0)
+        _dump_dir = get_batch_metadata_dump_dir()
+        if _dump_dir:
+            os.makedirs(_dump_dir, exist_ok=True)
+            self._meta_dump_step = getattr(self, "_meta_dump_step", -1) + 1
+            _slot = self._meta_dump_step % 8
+            np.savez(
+                f"{_dump_dir}/batchmeta_{_slot}.npz",
+                step=np.int64(self._meta_dump_step),
+                num_requests=np.int64(num_requests),
+                num_tokens_static=np.int64(num_tokens_static),
+                scheduled=scheduled[: max(num_requests, 1)].copy(),
+                computed=num_computed_tokens_cpu[: max(num_requests, 1)].copy(),
+                seq_lens=seq_lens.copy(),
+                qsl=qsl.copy(),
+                page_table=page_table_cpu[: max(num_requests, 1), :64].copy(),
+            )
         slot_mapping_cpu = None
         num_kv_update_cpu.fill(0)
 
         if self._use_request_distribution:
-            if num_requests > 0:
-                is_decode = (scheduled[:num_requests] == 1) & (num_computed_tokens_cpu[:num_requests] > 0)
-                decode_count = int(np.sum(is_decode))
-                prefill_count = int(np.sum((scheduled[:num_requests] > 0) & (~is_decode)))
-            else:
-                decode_count = 0
-                prefill_count = 0
-            prefill_end = decode_count + prefill_count
-            request_distribution[0] = decode_count
+            # The v3 kernel's distribution contract is POSITIONAL: rows
+            # [0, decode_end) run a static q_len=1 decode path, rows
+            # [decode_end, prefill_end) the chunked-prefill path, and rows
+            # [prefill_end, total) the variable-length mixed path. Rows are
+            # persistent slots packed in slot order, so when a finished
+            # request's slot is reused by a new prefill while later slots
+            # still decode, a prefill lands inside the decode range —
+            # classifying by COUNTS (the previous behavior) then desyncs the
+            # kernel's per-class offsets and hangs the device. Classify by
+            # the longest valid decode-run/prefill-run PREFIX instead and
+            # push any interleaved tail into the mixed range, which is
+            # order-agnostic. Steady decode and initial prefill waves keep
+            # their specialized fast paths.
+            decode_end, prefill_end, _total = compute_request_distribution_prefix(
+                scheduled, num_computed_tokens_cpu, num_requests
+            )
+            request_distribution[0] = decode_end
             request_distribution[1] = prefill_end
             request_distribution[2] = num_requests
 
@@ -1050,6 +1164,225 @@ class BatchMetadataPreparer:
 
         return host_payload, padded_num_reqs, num_requests, rows_to_copy
 
+    def _try_incremental_decode_prepare(
+        self,
+        *,
+        num_tokens_static: int,
+        scheduled_full_cpu: np.ndarray,
+        active_mask_full_cpu: np.ndarray,
+        token_ids_cpu: np.ndarray,
+        num_computed_tokens_cpu: np.ndarray,
+        temperature_cpu: np.ndarray,
+        top_p_cpu: np.ndarray,
+        top_k_cpu: np.ndarray,
+        min_p_cpu: np.ndarray,
+        frequency_penalties_cpu: np.ndarray,
+        presence_penalties_cpu: np.ndarray,
+        repetition_penalties_cpu: np.ndarray,
+        page_table_version: int | None,
+        padded_num_reqs_in: int,
+        window_row_indices_cpu: np.ndarray | None,
+        spec_recurrent_commit_cpu: np.ndarray | None,
+        has_vlm_inputs: bool,
+    ) -> tuple[BatchMetadata, jax.Array, jax.Array, jax.Array, jax.Array] | None:
+        """Steady-decode fast path: rebuild only the per-step-changing arrays.
+
+        Eligibility is decided by CONTENT comparison against snapshots primed
+        by the last full prep — never by tracking scheduler events — so any
+        change (request set, budget skips, sampling params, page allocations
+        via ``page_table_version``, spec/VLM activity) falls back to the full
+        path, which re-primes the cache.
+
+        On a hit, only ``packed_qsl_seqlens`` (seq_lens row), ``input_ids``
+        and ``positions`` are rebuilt (vectorised, one small batched
+        ``device_put``); every other device array is reused from the primed
+        :class:`BatchMetadata` template.
+
+        Returns:
+            The same 5-tuple as :meth:`prepare_batch_metadata`, or ``None``
+            when ineligible.
+        """
+        cache = self._incr_cache
+        if cache is None:
+            # Counted like every other ineligibility branch below, so
+            # hits + misses equals the number of prepare calls and the
+            # reported hit rate is not inflated by the (common) cold-cache
+            # case right after a full prep or a prefill wave.
+            self.incremental_prep_misses += 1
+            return None
+        if (
+            not self._use_request_distribution
+            or self._uses_spmd_dp()
+            or self._slot_indexed_state
+            or has_vlm_inputs
+            or spec_recurrent_commit_cpu is not None
+            or page_table_version is None
+            or get_batch_metadata_dump_dir()
+            or host_payload_broadcast_needed()
+        ):
+            self.incremental_prep_misses += 1
+            return None
+        if (
+            int(num_tokens_static) != cache["num_tokens_static"]
+            or int(padded_num_reqs_in) != cache["padded_num_reqs_in"]
+            or int(page_table_version) != cache["page_table_version"]
+            or self._cached_page_table_version != int(page_table_version)
+            or self._cached_pages_tables_dev is None
+        ):
+            self.incremental_prep_misses += 1
+            return None
+
+        num_requests = cache["num_requests"]
+        if not (
+            np.array_equal(scheduled_full_cpu[: self.max_num_reqs], cache["scheduled"])
+            and np.array_equal(active_mask_full_cpu[: self.max_num_reqs], cache["active"])
+            and np.array_equal(temperature_cpu[:num_requests], cache["temperature"])
+            and np.array_equal(top_p_cpu[:num_requests], cache["top_p"])
+            and np.array_equal(top_k_cpu[:num_requests], cache["top_k"])
+            and np.array_equal(min_p_cpu[:num_requests], cache["min_p"])
+            and np.array_equal(frequency_penalties_cpu[:num_requests], cache["freq"])
+            and np.array_equal(presence_penalties_cpu[:num_requests], cache["pres"])
+            and np.array_equal(repetition_penalties_cpu[:num_requests], cache["rep"])
+        ):
+            self.incremental_prep_misses += 1
+            return None
+        if window_row_indices_cpu is None:
+            if cache["window_rows"] is not None:
+                self.incremental_prep_misses += 1
+                return None
+        elif cache["window_rows"] is None or not np.array_equal(
+            window_row_indices_cpu[:num_requests], cache["window_rows"]
+        ):
+            self.incremental_prep_misses += 1
+            return None
+
+        computed = num_computed_tokens_cpu[:num_requests]
+        # `computed > 0` is the same invariant the prime path enforces: a
+        # scheduled==1, computed==0 row is a first prefill chunk, which the
+        # primed all-decode request_distribution would misclassify. It has to
+        # be re-checked here rather than inherited from the snapshot —
+        # scheduled/active matching says the SHAPE of the window is unchanged,
+        # not that the rows behind it are still the same requests, so a slot
+        # refilled by a fresh single-token request would otherwise ride the
+        # cached distribution.
+        if num_requests > 0 and (
+            not bool(np.all(computed > 0)) or int(computed.max(initial=0)) + 1 > int(token_ids_cpu.shape[1])
+        ):
+            self.incremental_prep_misses += 1
+            return None
+
+        host_start = time.time()
+        # seq_lens row of the packed qsl buffer: computed + scheduled(=1).
+        packed_qsl = self._packed_qsl_seqlens_cpu
+        packed_qsl[0, :] = cache["qsl_row"]
+        packed_qsl[1, :].fill(0)
+        np.add(computed, 1, out=packed_qsl[1, :num_requests], dtype=np.int32)
+
+        # Pure-decode token/position rows: one token per request at `computed`.
+        input_ids = self._input_ids_cpu[: int(num_tokens_static)]
+        positions = self._positions_cpu[: int(num_tokens_static)]
+        input_ids.fill(0)
+        positions.fill(0)
+        rows = np.arange(num_requests, dtype=np.int64)
+        input_ids[:num_requests] = token_ids_cpu[rows, computed]
+        positions[:num_requests] = computed
+        host_took = time.time() - host_start
+
+        put_start = time.time()
+        qsl_dev, ids_dev, pos_dev = jax.device_put(
+            (packed_qsl, input_ids, positions),
+            (self._empty_sharding, self._empty_sharding, self._empty_sharding),
+        )
+        put_took = time.time() - put_start
+
+        metadata = dataclasses.replace(
+            cache["metadata"],
+            packed_qsl_seqlens=qsl_dev,
+            input_ids_buf=ids_dev,
+            position_ids_buf=pos_dev,
+        )
+        self.incremental_prep_hits += 1
+        self.last_prep_stats = {
+            "prep_host_time": float(host_took),
+            "prep_put_time": float(put_took),
+            "prep_extra_put_time": 0.0,
+            "prep_incremental": 1.0,
+        }
+        return (
+            metadata,
+            ids_dev,
+            pos_dev,
+            self._scheduled_full_placeholder_dev,
+            self._active_mask_full_placeholder_dev,
+        )
+
+    def _prime_incremental_decode_cache(
+        self,
+        *,
+        num_tokens_static: int,
+        scheduled_full_cpu: np.ndarray,
+        active_mask_full_cpu: np.ndarray,
+        num_computed_tokens_cpu: np.ndarray,
+        temperature_cpu: np.ndarray,
+        top_p_cpu: np.ndarray,
+        top_k_cpu: np.ndarray,
+        min_p_cpu: np.ndarray,
+        frequency_penalties_cpu: np.ndarray,
+        presence_penalties_cpu: np.ndarray,
+        repetition_penalties_cpu: np.ndarray,
+        page_table_version: int | None,
+        padded_num_reqs_in: int,
+        window_row_indices_cpu: np.ndarray | None,
+        num_requests: int,
+        metadata: BatchMetadata,
+    ) -> None:
+        """Prime the steady-decode cache from a completed full prep.
+
+        Only pure one-token-per-active-request windows are cacheable (the
+        fast path's vectorised token/position fill assumes ``scheduled == 1``
+        for every active row); anything else clears the cache.
+        """
+        self._incr_cache = None
+        if page_table_version is None or num_requests <= 0:
+            return
+        active = active_mask_full_cpu[: self.max_num_reqs]
+        scheduled = scheduled_full_cpu[: self.max_num_reqs]
+        if bool(np.any(scheduled[active] != 1)) or bool(np.any(scheduled[~active] != 0)):
+            return
+        # A scheduled==1 row with computed==0 is a 1-token FIRST PREFILL
+        # chunk, not decode: the primed template's request_distribution
+        # would permanently classify it (and rows after it) as prefill on
+        # every fast-path hit. Only prime when every row is true decode.
+        if not bool(np.all(num_computed_tokens_cpu[:num_requests] > 0)):
+            return
+        # The fast path fills tokens/positions at raw row indices
+        # ``arange(num_requests)`` while the full path packs by SCHEDULED
+        # order, skipping holes — the two agree only when the active rows are
+        # exactly the contiguous prefix [0, num_requests). SequenceBuffer
+        # condense() maintains that invariant today, but enforce it here so a
+        # holey-yet-stable window can never prime and then serve stale tokens
+        # from a freed slot.
+        if not (bool(np.all(active[:num_requests])) and not bool(np.any(active[num_requests:]))):
+            return
+        self._incr_cache = {
+            "num_tokens_static": int(num_tokens_static),
+            "padded_num_reqs_in": int(padded_num_reqs_in),
+            "page_table_version": int(page_table_version),
+            "num_requests": int(num_requests),
+            "scheduled": scheduled.copy(),
+            "active": active.copy(),
+            "temperature": temperature_cpu[:num_requests].copy(),
+            "top_p": top_p_cpu[:num_requests].copy(),
+            "top_k": top_k_cpu[:num_requests].copy(),
+            "min_p": min_p_cpu[:num_requests].copy(),
+            "freq": frequency_penalties_cpu[:num_requests].copy(),
+            "pres": presence_penalties_cpu[:num_requests].copy(),
+            "rep": repetition_penalties_cpu[:num_requests].copy(),
+            "window_rows": None if window_row_indices_cpu is None else window_row_indices_cpu[:num_requests].copy(),
+            "qsl_row": self._packed_qsl_seqlens_cpu[0, :].copy(),
+            "metadata": metadata,
+        }
+
     def prepare_batch_metadata(
         self,
         *,
@@ -1134,6 +1467,41 @@ class BatchMetadataPreparer:
             - prep_put_time: Main device_put time
             - prep_extra_put_time: VLM data transfer time
         """
+        incremental = self._try_incremental_decode_prepare(
+            num_tokens_static=int(num_tokens_static),
+            scheduled_full_cpu=scheduled_full_cpu,
+            active_mask_full_cpu=active_mask_full_cpu,
+            token_ids_cpu=token_ids_cpu,
+            num_computed_tokens_cpu=num_computed_tokens_cpu,
+            temperature_cpu=temperature_cpu,
+            top_p_cpu=top_p_cpu,
+            top_k_cpu=top_k_cpu,
+            min_p_cpu=min_p_cpu,
+            frequency_penalties_cpu=frequency_penalties_cpu,
+            presence_penalties_cpu=presence_penalties_cpu,
+            repetition_penalties_cpu=repetition_penalties_cpu,
+            page_table_version=page_table_version,
+            padded_num_reqs_in=int(padded_num_reqs_in),
+            window_row_indices_cpu=window_row_indices_cpu,
+            spec_recurrent_commit_cpu=spec_recurrent_commit_cpu,
+            has_vlm_inputs=any(
+                arg is not None
+                for arg in (
+                    mrope_position_ids_cpu,
+                    prefill_embeds_cpu,
+                    prefill_embeds_mask_cpu,
+                    visual_pos_masks_cpu,
+                    deepstack_visual_embeds_cpu,
+                    pixel_values,
+                    image_grid_thw,
+                    pixel_values_videos,
+                    video_grid_thw,
+                )
+            ),
+        )
+        if incremental is not None:
+            return incremental
+
         host_build_start = time.time()
         host_payload, _padded_num_reqs, _num_requests, rows_to_copy = self._build_host_payload(
             num_tokens_static=int(num_tokens_static),
@@ -1331,6 +1699,47 @@ class BatchMetadataPreparer:
             deepstack_visual_embeds=deepstack_visual_embeds_dev,
             spec_recurrent_commit=spec_recurrent_commit_dev,
         )
+
+        if (
+            self._use_request_distribution
+            and not self._uses_spmd_dp()
+            and not self._slot_indexed_state
+            and spec_recurrent_commit_cpu is None
+            # Must mirror the try-gate's has_vlm_inputs set exactly: any VLM
+            # input missing here could prime a metadata template embedding
+            # stale VLM device arrays that every fast-path hit then reuses.
+            and mrope_position_ids_cpu is None
+            and prefill_embeds_cpu is None
+            and prefill_embeds_mask_cpu is None
+            and visual_pos_masks_cpu is None
+            and deepstack_visual_embeds_cpu is None
+            and pixel_values is None
+            and image_grid_thw is None
+            and pixel_values_videos is None
+            and video_grid_thw is None
+            and not get_batch_metadata_dump_dir()
+            and not host_payload_broadcast_needed()
+        ):
+            self._prime_incremental_decode_cache(
+                num_tokens_static=int(num_tokens_static),
+                scheduled_full_cpu=scheduled_full_cpu,
+                active_mask_full_cpu=active_mask_full_cpu,
+                num_computed_tokens_cpu=num_computed_tokens_cpu,
+                temperature_cpu=temperature_cpu,
+                top_p_cpu=top_p_cpu,
+                top_k_cpu=top_k_cpu,
+                min_p_cpu=min_p_cpu,
+                frequency_penalties_cpu=frequency_penalties_cpu,
+                presence_penalties_cpu=presence_penalties_cpu,
+                repetition_penalties_cpu=repetition_penalties_cpu,
+                page_table_version=page_table_version,
+                padded_num_reqs_in=int(padded_num_reqs_in),
+                window_row_indices_cpu=window_row_indices_cpu,
+                num_requests=int(_num_requests),
+                metadata=metadata,
+            )
+        else:
+            self._incr_cache = None
 
         return (
             metadata,

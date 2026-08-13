@@ -62,7 +62,7 @@ from easydel.layers import (
     RMSNorm,
     RowParallelLinear,
     dense_gate_up_layout,
-    split_fused_gate_up_projection,
+    gated_mlp_forward,
 )
 from easydel.layers.attention import UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
@@ -149,12 +149,9 @@ class Olmo2MLP(spx.Module):
     ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Forward pass of the Olmo2MLP module implementing a Gated Linear Unit structure.
 
-        This method applies the standard GLU-based feedforward transformation used in
-        modern transformer models:
-        1. Gate stream: hidden_states -> gate_proj -> SiLU activation
-        2. Value stream: hidden_states -> up_proj
-        3. Combine: element-wise multiply gate and value
-        4. Project down: down_proj to original hidden dimension
+        Delegates to :func:`easydel.layers.gated_mlp_forward`, which routes
+        supported layouts through the ejkernel fused MLP kernels and runs
+        the legacy composition otherwise.
 
         Args:
             hidden_states (Float[Array, "batch seq_len hidden_dim"]): Input hidden states tensor.
@@ -163,26 +160,8 @@ class Olmo2MLP(spx.Module):
         Returns:
             Float[Array, "batch seq_len hidden_dim"]: Output hidden states after MLP transformation.
                 Shape: (batch_size, sequence_length, hidden_size)
-
-        Note:
-            The method applies logical sharding for distributed training and uses
-            checkpoint_name for gradient checkpointing at intermediate computation steps.
         """
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
-        gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
-        gate = checkpoint_name(self.act_fn(gate_raw), "mlp_gate")
-        hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        return checkpoint_name(hidden_states, "mlp_output")
+        return gated_mlp_forward(self, hidden_states)
 
 
 class Olmo2Attention(UnifiedAttention):

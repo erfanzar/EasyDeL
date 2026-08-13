@@ -35,6 +35,7 @@ the final model-shaped gradient pytree from the captured module consts.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import hashlib
 import tempfile
@@ -129,6 +130,42 @@ def _reset_jax_persistent_cache_state() -> None:
         _jax_compilation_cache._cache_initialized = False  # pyright: ignore[reportPrivateUsage]
         _jax_compilation_cache._cache_checked = False  # pyright: ignore[reportPrivateUsage]
         _jax_compilation_cache._cache_used = False  # pyright: ignore[reportPrivateUsage]
+
+
+@contextlib.contextmanager
+def _stage_persistent_cache_bypass():
+    """Disable JAX's persistent compilation cache for one stage-compile region.
+
+    The scheduled warm-compile path lowers stage programs through their
+    :class:`_ScopedPersistentCacheJit` wrappers but then calls
+    ``lowered.compile()`` on worker threads. Without this scope those
+    compiles consult the process-global persistent cache: stage executables
+    get written to disk and, on a later process run, revived by
+    deserialization — TPU revives them with broken sync-flag/HLO mapping
+    metadata and the first execution halts the core
+    (``EncodeRemoteSyncFlagAddress() no HLO mapping``). Holding this scope
+    around the whole warm-compile phase keeps every stage compile in-process
+    while leaving caching for the rest of the program untouched.
+
+    The scope owns :data:`_persistent_cache_scope_lock` for its duration, so
+    nested :class:`_ScopedPersistentCacheJit` calls from the same thread
+    remain safe (the lock is reentrant) and worker threads may compile
+    lowered stage programs without touching JAX config themselves.
+    """
+    with _persistent_cache_scope_lock:
+        was_enabled = bool(jax.config.jax_enable_compilation_cache)
+        old_cache_dir = jax.config.jax_compilation_cache_dir
+        scratch_dir = tempfile.TemporaryDirectory(prefix="spectrax-stage-warm-")
+        jax.config.update("jax_enable_compilation_cache", False)
+        jax.config.update("jax_compilation_cache_dir", scratch_dir.name)
+        _reset_jax_persistent_cache_state()
+        try:
+            yield
+        finally:
+            jax.config.update("jax_compilation_cache_dir", old_cache_dir)
+            jax.config.update("jax_enable_compilation_cache", was_enabled)
+            _reset_jax_persistent_cache_state()
+            scratch_dir.cleanup()
 
 
 class _ScopedPersistentCacheJit:
@@ -992,14 +1029,17 @@ def _make_terminal_jit(
     donate_argnums: tuple[int, ...] = (),
     out_shardings: object | None = None,
     stage_mesh: object | None = None,
+    n_aux: int = 0,
 ) -> Callable[..., object]:
     """Return ``@jax.jit`` ``value_and_grad`` callable for the terminal cluster.
 
-    Signature: ``(consts, *invars) -> (loss, (g_consts, g_invars))``.
+    Signature: ``(consts, *invars) -> (loss, aux, (g_consts, g_invars))``.
 
-    The terminal cluster produces exactly one scalar output (the loss).
+    The terminal cluster produces the scalar per-microbatch loss as its
+    first output plus ``n_aux`` auxiliary (non-differentiated) outputs.
     :func:`jax.value_and_grad` supplies the initial cotangent of
-    ``1.0`` automatically so we don't have to thread it from outside.
+    ``1.0`` automatically so we don't have to thread it from outside;
+    aux outputs ride along via ``has_aux`` and receive no cotangent.
 
     Args:
         cluster_jaxpr: Cluster jaxpr value consumed by this operation.
@@ -1007,6 +1047,8 @@ def _make_terminal_jit(
         donate_argnums: Donate argnums value consumed by this operation.
         out_shardings: Output shardings supplied to the compiled function.
         stage_mesh: Mesh assigned to the current pipeline stage.
+        n_aux: Number of auxiliary (non-loss) outputs the terminal
+            cluster produces after the scalar loss.
 
     Returns:
         Return ``@jax.jit`` ``value_and_grad`` callable for the terminal cluster.
@@ -1015,7 +1057,9 @@ def _make_terminal_jit(
     if stage_mesh is not None:
         cluster_jaxpr = _rebase_jaxpr_mesh_params(cluster_jaxpr, stage_mesh)
 
-    def term(consts: tuple[object, ...], *invars: object) -> tuple[object, tuple[object, tuple[object, ...]]]:
+    def term(
+        consts: tuple[object, ...], *invars: object
+    ) -> tuple[object, tuple[object, ...], tuple[object, tuple[object, ...]]]:
         """Compute the loss and its gradients w.r.t. ``(consts, *invars)`` in one jit.
 
         Wraps the cluster's scalar-loss evaluator in
@@ -1030,36 +1074,36 @@ def _make_terminal_jit(
                 activations entering the loss layer).
 
         Returns:
-            ``(loss, (g_consts, g_invars))`` — the scalar loss plus
-            its gradients.
+            ``(loss, aux, (g_consts, g_invars))`` — the scalar loss,
+            the auxiliary outputs, and the gradients.
         """
 
         with jax.named_scope("spectrax/mpmd/schedule/terminal_loss_backward"):
 
-            def pure(c: tuple[object, ...], *xs: object) -> object:
-                """Scalar-loss evaluator, asserts a single cluster output.
+            def pure(c: tuple[object, ...], *xs: object) -> tuple[object, tuple[object, ...]]:
+                """Scalar-loss (+aux) evaluator for the terminal cluster.
 
                 Args:
                     c: C value consumed by this operation.
                     *xs: Additional positional arguments forwarded to the wrapped callable or backend.
 
                 Returns:
-                    Result described by this helper.
+                    ``(loss, aux_tuple)`` for ``value_and_grad(has_aux=True)``.
                 """
                 with jax.named_scope("spectrax/mpmd/schedule/terminal_loss_backward/pure_forward"):
                     outs = jax.core.eval_jaxpr(cluster_jaxpr, list(c), *xs)
-                    if len(outs) != 1:
+                    if len(outs) != 1 + n_aux:
                         raise ValueError(
-                            f"Terminal cluster must produce exactly one scalar output "
-                            f"(the per-microbatch loss); got {len(outs)}."
+                            f"Terminal cluster must produce the scalar per-microbatch loss plus "
+                            f"{n_aux} auxiliary output(s); got {len(outs)} output(s)."
                         )
-                    return outs[0]
+                    return outs[0], tuple(outs[1:])
 
             argnums = tuple(range(1 + n_invars))
-            loss, grads = jax.value_and_grad(pure, argnums=argnums, allow_int=True)(consts, *invars)
+            (loss, aux), grads = jax.value_and_grad(pure, argnums=argnums, has_aux=True, allow_int=True)(consts, *invars)
             g_consts = grads[0]
             g_invars = tuple(grads[1:])
-            return loss, (g_consts, g_invars)
+            return loss, aux, (g_consts, g_invars)
 
     jit_kwargs: dict[str, object] = {}
     if donate_argnums:
@@ -2146,7 +2190,7 @@ def dispatch_pscan(plan: PscanPlan) -> list[object]:
 
                 if loc == plan.terminal_loc:
                     with submesh:
-                        _, (g_consts, g_invars) = plan.terminal_jit(consts, *invars)
+                        _, _aux, (g_consts, g_invars) = plan.terminal_jit(consts, *invars)
                 else:
                     cot = _materialize_cotangents(cotangents_into.get(key), fwd_outputs[key])
                     with submesh:

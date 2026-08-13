@@ -242,3 +242,16 @@ class Mamba2Config(EasyDeLBaseConfig):
         self.gradient_checkpointing = gradient_checkpointing
         self.intermediate_size = int(expand * hidden_size)
         super().__init__(**kwargs)
+
+    @property
+    def layer_types(self) -> list[str]:
+        """Per-layer type list — every Mamba-2 layer is a linear-attention layer.
+
+        Mirrors the upstream HuggingFace ``Mamba2Config.layer_types`` property:
+        recent ``transformers`` versions index it inside ``Mamba2Mixer``, so
+        HF-parity paths that hand this config to the HF model require it.
+
+        Returns:
+            ``["linear_attention"]`` repeated for every hidden layer.
+        """
+        return ["linear_attention"] * self.num_hidden_layers

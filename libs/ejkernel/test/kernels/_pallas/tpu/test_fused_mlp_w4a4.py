@@ -117,17 +117,21 @@ def test_public_op_dispatches_to_packed_kernel():
     )
     weights = (jnp.asarray(gate[0], jnp.int4), jnp.asarray(up[0], jnp.int4), jnp.asarray(down[0], jnp.int4))
 
-    via_op = np.asarray(
-        fused_mlp(x, *weights, **common, packed_weights=packed, packed_tile_i=TILE_I), np.float32
-    )
+    via_op = np.asarray(fused_mlp(x, *weights, **common, packed_weights=packed, packed_tile_i=TILE_I), np.float32)
 
     x_abs = jnp.max(jnp.abs(x.astype(jnp.float32)), axis=1, keepdims=True)
     x_scale = x_abs / 7.0
     x4 = jnp.clip(jnp.round(x.astype(jnp.float32) / jnp.where(x_scale == 0, 1, x_scale)), -7, 7).astype(jnp.int4)
     direct = np.asarray(
         fused_mlp_w4a4_pallas(
-            x4, *packed, jnp.asarray(gate[1]), jnp.asarray(up[1]), jnp.asarray(down[1]),
-            x_scale, activation="silu", tile_i=TILE_I,
+            x4,
+            *packed,
+            jnp.asarray(gate[1]),
+            jnp.asarray(up[1]),
+            jnp.asarray(down[1]),
+            x_scale,
+            activation="silu",
+            tile_i=TILE_I,
         ).astype(x.dtype),
         np.float32,
     )
@@ -136,3 +140,30 @@ def test_public_op_dispatches_to_packed_kernel():
     xla_out = np.asarray(fused_mlp(x, *weights, **common), np.float32)
     assert np.abs(via_op - xla_out).max() > 0, "packed path did not engage (identical to XLA path)"
     assert np.isfinite(via_op).all()
+
+
+def test_platform_xla_opt_out_bypasses_kernel():
+    """platform='xla' with packed weights must run the vanilla XLA path."""
+    rng = np.random.default_rng(2)
+    gate = _quantize(rng, K_DIM, I_DIM)
+    up = _quantize(rng, K_DIM, I_DIM)
+    down = _quantize(rng, I_DIM, K_DIM)
+    x = jnp.asarray(rng.normal(size=(TOKENS, K_DIM)), jnp.bfloat16)
+
+    packed = tuple(pack_int4_adjacent(jnp.asarray(codes)) for codes, _ in (gate, up, down))
+    common = dict(
+        gate_scale=jnp.asarray(gate[1]),
+        up_scale=jnp.asarray(up[1]),
+        down_scale=jnp.asarray(down[1]),
+    )
+    weights = (jnp.asarray(gate[0], jnp.int4), jnp.asarray(up[0], jnp.int4), jnp.asarray(down[0], jnp.int4))
+
+    forced = np.asarray(
+        fused_mlp(x, *weights, **common, packed_weights=packed, packed_tile_i=TILE_I, platform="xla"),
+        np.float32,
+    )
+    unpacked = np.asarray(fused_mlp(x, *weights, **common), np.float32)
+    pallas = np.asarray(fused_mlp(x, *weights, **common, packed_weights=packed, packed_tile_i=TILE_I), np.float32)
+
+    np.testing.assert_array_equal(forced, unpacked)
+    assert np.abs(forced - pallas).max() > 0, "opt-out did not bypass the Pallas kernel"

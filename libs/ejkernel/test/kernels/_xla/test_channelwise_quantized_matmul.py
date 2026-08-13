@@ -19,7 +19,6 @@ the implementation under test, so a broken fusion or a scale applied on the
 wrong axis fails loudly rather than cancelling out.
 """
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -37,9 +36,7 @@ def _quantize_channelwise(weight: np.ndarray, qdtype) -> tuple[jnp.ndarray, jnp.
 
 def _reference(x, w_q, scale):
     """Dense float32 reference of the quantized product."""
-    return np.asarray(x, dtype=np.float32) @ (
-        np.asarray(w_q, dtype=np.float32) * np.asarray(scale, dtype=np.float32)
-    )
+    return np.asarray(x, dtype=np.float32) @ (np.asarray(w_q, dtype=np.float32) * np.asarray(scale, dtype=np.float32))
 
 
 @pytest.mark.parametrize("qdtype", [jnp.int8, jnp.int4])
@@ -79,9 +76,7 @@ def test_decode_stays_on_upcast_path_even_with_activations_enabled():
     w_q, scale = _quantize_channelwise(weight, jnp.int8)
     x = jnp.asarray(rng.normal(size=(8, 256)), dtype=jnp.bfloat16)
 
-    with_flag = np.asarray(
-        channelwise_quantized_matmul(x, w_q, scale, quantize_activations=True, prefill_threshold=256)
-    )
+    with_flag = np.asarray(channelwise_quantized_matmul(x, w_q, scale, quantize_activations=True, prefill_threshold=256))
     without_flag = np.asarray(channelwise_quantized_matmul(x, w_q, scale))
     np.testing.assert_array_equal(with_flag, without_flag)
 

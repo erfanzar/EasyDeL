@@ -62,19 +62,25 @@ class IgnoreRules:
 
     * ``ignored_layers`` (compressed-tensors, fp8) lists **exact leaf module
       names** such as ``model.layers.0.self_attn.q_proj``.
-    * ``modules_to_not_convert`` (AWQ, MXFP4) lists **container names** such
-      as ``model.vision_tower``, meaning everything nested beneath.
+    * ``modules_to_not_convert`` (AWQ, MXFP4) uses HF's matching (transformers
+      ``should_convert_module``): an entry excludes a path when it names a
+      container the path sits beneath, a **suffix** of the path (Mixtral's
+      AWQ checkpoints ship ``"gate"`` for every ``block_sparse_moe.gate``),
+      or matches as a start-anchored regex — which is how gpt-oss's
+      glob-style entries (``model.layers.*.self_attn``) work.
 
     Matching one with the other's semantics silently quantizes layers the
-    checkpoint never quantized, which shows up as garbage logits far from the
-    cause.
+    checkpoint never quantized — and then *demands* quantized tensors the
+    checkpoint never wrote — which shows up as garbage logits or a failed
+    load far from the cause.
 
     compressed-tensors additionally allows ``re:`` prefixed regexes in its
     ``ignore`` list, which is the third form.
 
     Attributes:
         exact: Fully-qualified module paths that must match exactly.
-        prefixes: Container paths; any path at or beneath one is ignored.
+        prefixes: ``modules_to_not_convert`` entries, matched with HF's
+            semantics (containment / suffix / start-anchored regex).
         patterns: Regexes searched against the path.
     """
 
@@ -94,7 +100,7 @@ class IgnoreRules:
         """
         if path in self.exact:
             return True
-        if any(path == prefix or path.startswith(f"{prefix}.") for prefix in self.prefixes):
+        if any(_module_pattern_matches(entry, path) for entry in self.prefixes):
             return True
         return any(re.search(pattern, path) for pattern in self.patterns)
 
@@ -112,6 +118,39 @@ class IgnoreRules:
             prefixes=(*self.prefixes, *other.prefixes),
             patterns=(*self.patterns, *other.patterns),
         )
+
+
+def _module_pattern_matches(entry: str, path: str) -> bool:
+    """HF-compatible ``modules_to_not_convert`` matching for one entry.
+
+    Mirrors transformers' ``should_convert_module``: an entry excludes
+    ``path`` when
+
+    1. ``path`` ends with the entry verbatim (``"gate"`` excludes
+       ``model.layers.0.block_sparse_moe.gate`` — how Mixtral-AWQ protects
+       its routers);
+    2. the entry, read as a start-anchored regex, covers a dot-terminated
+       prefix of the path (``"model.vision_tower"`` excludes everything
+       beneath the tower; ``"model.layers.*.self_attn"`` — gpt-oss's
+       glob-style form — excludes every attention projection); or
+    3. the entry, read as a start-anchored regex, matches the path itself.
+
+    Entries that are not valid regexes fall back to literal container
+    matching (exact name or dotted-prefix).
+
+    Args:
+        entry: One ``modules_to_not_convert`` entry.
+        path: Dotted module path being resolved.
+
+    Returns:
+        ``True`` when the entry excludes the path.
+    """
+    if path.endswith(entry):
+        return True
+    try:
+        return bool(re.match(f"{entry}\\.", path) or re.match(entry, path))
+    except re.error:
+        return path == entry or path.startswith(f"{entry}.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -291,9 +330,7 @@ def register_adapter(
             raise TypeError(f"{adapter_cls.__name__} must subclass CheckpointQuantAdapter to be registered.")
         names = tuple(quant_methods) or adapter_cls.quant_methods
         if not names:
-            raise ValueError(
-                f"{adapter_cls.__name__} must declare `quant_methods` or pass names to register_adapter()."
-            )
+            raise ValueError(f"{adapter_cls.__name__} must declare `quant_methods` or pass names to register_adapter().")
         adapter_cls.quant_methods = names
         Registry.register(
             CHECKPOINT_QUANT_CATEGORY,

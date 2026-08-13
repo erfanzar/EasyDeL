@@ -72,6 +72,7 @@ from collections import OrderedDict
 
 import jax
 import spectrax as spx
+from eformer.loggings import get_logger
 from jax import numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec
 
@@ -83,12 +84,15 @@ from easydel.caching import (
     UnifiedAttentionCache,
     UnifiedAttentionCacheConfig,
 )
-from easydel.infra.sharding import MeshLike, replicate_on_array_mesh, resolve_stage_mesh
+from easydel.infra.sharding import MeshLike, decode_mode_specs, replicate_on_array_mesh, resolve_stage_mesh
 from easydel.utils import set_inference_mode
 
 from ..execution_types import BackboneOutputs, BatchMetadata, ModelStepOutputs, StepFunctionInputs
 from ..pipeline_plan import PipelineInferencePlan
 from ..pipeline_runtime import PipelineStageRuntime
+from .state_packing import StatePacker
+
+logger = get_logger("eSurge-ModelExecutor")
 
 if tp.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
@@ -201,6 +205,27 @@ class ModelStepExecutor:
         self._flat_state_args = not self._uses_mpmd_mesh()
         self._graphstate_treedef = jax.tree_util.tree_structure(graphstate_template)
         self._graphother_treedef = jax.tree_util.tree_structure(graphother_template)
+        self._graphstate_packer: StatePacker | None = None
+        self._graphother_packer: StatePacker | None = None
+        self._packed_source_leaves: tuple[tuple[tp.Any, ...], tuple[tp.Any, ...]] | None = None
+        if self._flat_state_args:
+            gs_packer = StatePacker(tuple(jax.tree_util.tree_leaves(graphstate_template)))
+            go_packer = StatePacker(tuple(jax.tree_util.tree_leaves(graphother_template)))
+            self._graphstate_packer = gs_packer if gs_packer.is_effective else None
+            self._graphother_packer = go_packer if go_packer.is_effective else None
+            if self._graphstate_packer is not None or self._graphother_packer is not None:
+                logger.info(
+                    "eSurge packed-args: graphstate %d->%d leaves, graphother %d->%d leaves (%.1f MB packed copies)",
+                    gs_packer.num_leaves,
+                    gs_packer.packed_arg_count if gs_packer.is_effective else gs_packer.num_leaves,
+                    go_packer.num_leaves,
+                    go_packer.packed_arg_count if go_packer.is_effective else go_packer.num_leaves,
+                    (
+                        (gs_packer.packed_bytes if gs_packer.is_effective else 0)
+                        + (go_packer.packed_bytes if go_packer.is_effective else 0)
+                    )
+                    / 1024**2,
+                )
         self._runtime_graphstate_arg: tp.Any = graphstate_template
         self._runtime_graphother_arg: tp.Any = graphother_template
         self.set_runtime_graph_args(graphstate_template, graphother_template)
@@ -212,6 +237,16 @@ class ModelStepExecutor:
         del cache_capacity
 
         self._backbone_fn = self._build_backbone_fn(
+            kv_pages_template=kv_pages_template,
+            graphstate_template=graphstate_template,
+            graphother_template=graphother_template,
+        )
+        # Separate spx.jit instance for decode-layout traces: the plan/jit
+        # caches inside a jitted callable key on shape signatures only, so a
+        # single shared fn would serve whichever layout compiled FIRST to
+        # both variants (decode_mode_specs would silently no-op on the plan-
+        # cache hit). Two instances give the two layouts disjoint caches.
+        self._backbone_fn_decode = self._build_backbone_fn(
             kv_pages_template=kv_pages_template,
             graphstate_template=graphstate_template,
             graphother_template=graphother_template,
@@ -261,17 +296,39 @@ class ModelStepExecutor:
 
         Pre-flattens the graph state to a tuple of leaves when the executor
         runs on SPMD (so the hot-path call into the compiled jit does not pay
-        the per-step pytree traversal cost). On MPMD the original pytrees are
-        kept because SpectraX's stage-aware dispatch wants the nested
-        structure.
+        the per-step pytree traversal cost), then packs same-(shape, dtype,
+        sharding) leaf groups into stacked buffers via :class:`StatePacker`
+        so the per-leaf dispatch cost shrinks with the argument count. On
+        MPMD the original pytrees are kept because SpectraX's stage-aware
+        dispatch wants the nested structure.
 
         Args:
             graphstate: Live mutable parameter pytree.
             graphother: Live auxiliary buffer pytree.
         """
         if self._flat_state_args:
-            self._runtime_graphstate_arg = tuple(jax.tree_util.tree_leaves(graphstate))
-            self._runtime_graphother_arg = tuple(jax.tree_util.tree_leaves(graphother))
+            gs_leaves, gs_treedef = jax.tree_util.tree_flatten(graphstate)
+            go_leaves, go_treedef = jax.tree_util.tree_flatten(graphother)
+            # The StatePacker's leaf grouping was computed from the template
+            # pytrees at construction; a structurally different pytree would
+            # silently pack leaves into the wrong stacked buffers. Fail loud.
+            if gs_treedef != self._graphstate_treedef or go_treedef != self._graphother_treedef:
+                raise ValueError(
+                    "set_runtime_graph_args received graph pytrees whose treedef does not match the "
+                    "templates this executor's StatePacker was built from "
+                    f"(graphstate match={gs_treedef == self._graphstate_treedef}, "
+                    f"graphother match={go_treedef == self._graphother_treedef}). "
+                    "Rebuild the executor when the model graph structure changes."
+                )
+            gs_leaves = tuple(gs_leaves)
+            go_leaves = tuple(go_leaves)
+            self._runtime_graphstate_arg = (
+                self._graphstate_packer.pack(gs_leaves) if self._graphstate_packer is not None else gs_leaves
+            )
+            self._runtime_graphother_arg = (
+                self._graphother_packer.pack(go_leaves) if self._graphother_packer is not None else go_leaves
+            )
+            self._packed_source_leaves = (gs_leaves, go_leaves)
         else:
             self._runtime_graphstate_arg = graphstate
             self._runtime_graphother_arg = graphother
@@ -279,6 +336,40 @@ class ModelStepExecutor:
     def runtime_graph_args(self) -> tuple[tp.Any, tp.Any]:
         """Return cached graph-state arguments for hot-path dispatch."""
         return self._runtime_graphstate_arg, self._runtime_graphother_arg
+
+    def _graph_call_args(self, graphstate: tp.Any, graphother: tp.Any) -> tuple[tp.Any, tp.Any]:
+        """Convert graph pytrees into the compiled-call argument form.
+
+        On SPMD this is the flat leaf tuple, packed by the executor's
+        :class:`StatePacker` when one is active — so compile-time lowering
+        sees the same avals the packed runtime arguments carry. When the
+        pytrees are leaf-identical to the last :meth:`set_runtime_graph_args`
+        state, the cached packed tuples are reused instead of re-stacking on
+        device.
+
+        Args:
+            graphstate: Parameter pytree to convert.
+            graphother: Auxiliary pytree to convert.
+
+        Returns:
+            ``(graphstate_arg, graphother_arg)`` in compiled-call form.
+        """
+        if not self._flat_state_args:
+            return graphstate, graphother
+        gs_leaves = tuple(jax.tree_util.tree_leaves(graphstate))
+        go_leaves = tuple(jax.tree_util.tree_leaves(graphother))
+        if self._packed_source_leaves is not None:
+            cached_gs, cached_go = self._packed_source_leaves
+            if (
+                len(gs_leaves) == len(cached_gs)
+                and len(go_leaves) == len(cached_go)
+                and all(a is b for a, b in zip(gs_leaves, cached_gs, strict=True))
+                and all(a is b for a, b in zip(go_leaves, cached_go, strict=True))
+            ):
+                return self._runtime_graphstate_arg, self._runtime_graphother_arg
+        gs_arg = self._graphstate_packer.pack(gs_leaves) if self._graphstate_packer is not None else gs_leaves
+        go_arg = self._graphother_packer.pack(go_leaves) if self._graphother_packer is not None else go_leaves
+        return gs_arg, go_arg
 
     def _uses_spmd_dp(self) -> bool:
         """Return whether compiled model inputs use rank-major DP layout."""
@@ -301,22 +392,28 @@ class ModelStepExecutor:
         """Drop cached graph-state call arguments."""
         self._runtime_graphstate_arg = None
         self._runtime_graphother_arg = None
+        self._packed_source_leaves = None
 
-    def _graph_arg_sharding(self, state: tp.Any) -> tp.Any:
+    def _graph_arg_sharding(self, state: tp.Any, packer: StatePacker | None = None) -> tp.Any:
         """Resolve the in-shardings tuple for a graph-state argument.
 
         Honors :attr:`_flat_state_args`: on SPMD the model state is passed as
         a flat tuple of leaves so the compiled jit's ``in_shardings`` must be
-        a matching flat tuple. On MPMD the original nested pytree shape is
-        kept so SpectraX's stage-aware placement can match the leaves.
+        a matching flat tuple — mapped through ``packer`` onto the packed
+        argument order when leaf packing is active. On MPMD the original
+        nested pytree shape is kept so SpectraX's stage-aware placement can
+        match the leaves.
 
         Args:
             state: Graph state or other pytree whose sharding structure is
                 being extracted.
+            packer: Active :class:`StatePacker` for this state, or ``None``
+                when its leaves are passed unpacked.
 
         Returns:
-            A flat tuple of leaf shardings (SPMD path), the nested sharding
-            tree (MPMD path), or ``None`` when leaf counts cannot be aligned.
+            A flat tuple of leaf shardings (SPMD path, packed order when
+            ``packer`` is given), the nested sharding tree (MPMD path), or
+            ``None`` when leaf counts cannot be aligned.
         """
         sharding = spx.extract_sharding_structure(state, mesh=self.mesh)
         if self._flat_state_args:
@@ -324,6 +421,8 @@ class ModelStepExecutor:
             sharding_leaves = tuple(jax.tree_util.tree_leaves(sharding))
             if len(sharding_leaves) != len(state_leaves):
                 return None
+            if packer is not None:
+                return packer.packed_shardings(sharding_leaves)
             return sharding_leaves
         return sharding
 
@@ -938,6 +1037,42 @@ class ModelStepExecutor:
         """
         return (int(num_tokens), "backbone", self._compile_mode(), bool(use_pipeline_runtime))
 
+    def _backbone_decode_only(self, num_tokens: int, *, use_pipeline_runtime: bool) -> bool:
+        """Whether a backbone bucket traces under the decode-layout scope.
+
+        Deliberately a function of the cache key alone. ``padded_num_reqs`` is
+        not part of :meth:`_backbone_cache_key` — keeping it out is what makes
+        the compile cache linear in the bucket count instead of the cartesian
+        product — so anything selecting the traced layout must be recoverable
+        from the key. The two compile paths pass different request buckets for
+        the same key: :meth:`CompileOrchestrator._compile_backbone_variant`
+        sends ``num_tokens`` under the PP runtime and ``max_num_reqs``
+        otherwise, while :meth:`compile` forwards the live bucket. Reading the
+        caller's value would let whichever compiled first pin a layout the
+        other silently reuses, which is the invariant
+        :meth:`compile_backbone` documents.
+
+        The PP-runtime variant is therefore unconditionally decode: its real
+        request bucket IS the token bucket. That is an invariant, not an
+        assumption about this bucket —
+        :meth:`ExecutionManager._is_decode_only_window` gates every runtime
+        dispatch on ``use_pipeline_runtime`` behind a check that each active
+        scheduled row contributes exactly one token, so a prefill window can
+        never reach a variant traced here. The direct-dispatch variant serves
+        mixed windows and keeps the conservative ``max_num_reqs`` bucket.
+
+        Args:
+            num_tokens: Token-axis bucket.
+            use_pipeline_runtime: Whether the resident PP stage runtime serves
+                this variant.
+
+        Returns:
+            ``True`` for a pure-decode window.
+        """
+        if use_pipeline_runtime:
+            return True
+        return int(num_tokens) == int(self.max_num_reqs)
+
     def has_backbone(self, num_tokens: int, *, use_pipeline_runtime: bool = True) -> bool:
         """Whether a backbone variant has been compiled for the given token bucket.
 
@@ -1256,6 +1391,7 @@ class ModelStepExecutor:
         self.graphdef = graphdef
         backbone_out = self.compile_backbone(
             num_tokens=num_tokens,
+            padded_num_reqs=padded_num_reqs,
             graphdef=graphdef,
             graphstate=graphstate,
             graphother=graphother,
@@ -1300,40 +1436,47 @@ class ModelStepExecutor:
         if key in self._cache:
             return None
 
-        graphstate_arg = tuple(jax.tree_util.tree_leaves(graphstate)) if self._flat_state_args else graphstate
-        graphother_arg = tuple(jax.tree_util.tree_leaves(graphother)) if self._flat_state_args else graphother
-        if self.use_aot_forward:
-            compiled = self._model_step_fn.lower(  # pyright: ignore[reportFunctionMemberAccess]
-                *(
-                    graphdef,
-                    graphstate_arg,
-                    graphother_arg,
-                    inputs.kv_pages,
-                    inputs.batch_metadata,
-                    int(padded_num_reqs),
+        graphstate_arg, graphother_arg = self._graph_call_args(graphstate, graphother)
+        # Pure-decode buckets (every request contributes exactly one token) are
+        # traced under the decode-layout scope: the residual stream stays
+        # replicated over TP, removing the per-layer norm/qkv/router
+        # collectives self-inflicted by tp-sharded decode activations. The
+        # condition is derivable from the bucket key itself, so the compiled
+        # cache stays consistent (a given (num_tokens, padded_num_reqs) shape
+        # always traces in the same mode).
+        with decode_mode_specs(int(num_tokens) == int(padded_num_reqs)):
+            if self.use_aot_forward:
+                compiled = self._model_step_fn.lower(  # pyright: ignore[reportFunctionMemberAccess]
+                    *(
+                        graphdef,
+                        graphstate_arg,
+                        graphother_arg,
+                        inputs.kv_pages,
+                        inputs.batch_metadata,
+                        int(padded_num_reqs),
+                    )
+                ).compile()
+                self._cache_store(self._cache, key, compiled)
+                return None
+
+            def wrapped_model_step(graphstate_, graphother_, kv_pages_, metadata_):
+                """JIT-mode SPMD model-step wrapper that re-injects the live ``graphdef``.
+
+                Captures ``self`` so the AOT-bypass path always traces against the
+                most recent graphdef set by :meth:`update_graphs`, while keeping
+                the wrapper's ``(graphstate, graphother, kv_pages, metadata)``
+                signature symmetric with the AOT-compiled variant.
+                """
+                return self._model_step_fn(
+                    self.graphdef,
+                    graphstate_,
+                    graphother_,
+                    kv_pages_,
+                    metadata_,
+                    padded_num_reqs,
                 )
-            ).compile()
-            self._cache_store(self._cache, key, compiled)
-            return None
 
-        def wrapped_model_step(graphstate_, graphother_, kv_pages_, metadata_):
-            """JIT-mode SPMD model-step wrapper that re-injects the live ``graphdef``.
-
-            Captures ``self`` so the AOT-bypass path always traces against the
-            most recent graphdef set by :meth:`update_graphs`, while keeping
-            the wrapper's ``(graphstate, graphother, kv_pages, metadata)``
-            signature symmetric with the AOT-compiled variant.
-            """
-            return self._model_step_fn(
-                self.graphdef,
-                graphstate_,
-                graphother_,
-                kv_pages_,
-                metadata_,
-                padded_num_reqs,
-            )
-
-        out = wrapped_model_step(graphstate_arg, graphother_arg, inputs.kv_pages, inputs.batch_metadata)
+            out = wrapped_model_step(graphstate_arg, graphother_arg, inputs.kv_pages, inputs.batch_metadata)
         self._cache_store(self._cache, key, wrapped_model_step)
         return out
 
@@ -1394,7 +1537,10 @@ class ModelStepExecutor:
                 padded_num_reqs=pnr,
             )
 
-        out = wrapped_pipeline_model_step(graphstate, graphother, inputs.kv_pages, inputs.batch_metadata)
+        # See compile_model_step: pure-decode buckets trace under the
+        # decode-layout scope (condition derivable from the bucket key).
+        with decode_mode_specs(int(num_tokens) == pnr):
+            out = wrapped_pipeline_model_step(graphstate, graphother, inputs.kv_pages, inputs.batch_metadata)
         self._cache_store(self._cache, key, wrapped_pipeline_model_step)
         return out
 
@@ -1402,6 +1548,7 @@ class ModelStepExecutor:
         self,
         *,
         num_tokens: int,
+        padded_num_reqs: int,
         graphdef: tp.Any,
         graphstate: tp.Any,
         graphother: tp.Any,
@@ -1427,6 +1574,11 @@ class ModelStepExecutor:
 
         Args:
             num_tokens: Token-axis bucket to compile for.
+            padded_num_reqs: Request-axis bucket the caller is compiling for.
+                Accepted for signature symmetry with
+                :meth:`compile_model_step`; it does NOT select the trace mode,
+                because it is not part of the backbone cache key. See the
+                comment on the ``decode_only`` derivation below.
             graphdef: Updated graphdef pinned on ``self`` for closure use.
             graphstate, graphother: Trace templates / capture constants.
             inputs: Dummy ``StepFunctionInputs`` providing concrete shapes
@@ -1446,23 +1598,34 @@ class ModelStepExecutor:
         if key in self._backbone_cache:
             return None
 
+        # See compile_model_step: pure-decode buckets trace under the decode-
+        # layout scope. The condition is derived from the cache key rather
+        # than from `padded_num_reqs`, so every caller compiling this bucket
+        # agrees on the layout — see _backbone_decode_only.
+        decode_only = self._backbone_decode_only(num_tokens, use_pipeline_runtime=use_pipeline_runtime)
+        backbone_fn = self._backbone_fn_decode if decode_only else self._backbone_fn
+
         if self._uses_mpmd_mesh():
 
             def wrapped_backbone(graphstate_, graphother_, kv_pages_, metadata_):
                 """MPMD backbone wrapper using resident PP or direct sxjit dispatch."""
                 if use_pipeline_runtime:
-                    return self._dispatch_pipeline_backbone(graphstate_, graphother_, kv_pages_, metadata_)
-                return self._backbone_fn(self.graphdef, graphstate_, graphother_, kv_pages_, metadata_)
+                    return self._dispatch_pipeline_backbone(
+                        graphstate_, graphother_, kv_pages_, metadata_, backbone_fn=backbone_fn
+                    )
+                return backbone_fn(self.graphdef, graphstate_, graphother_, kv_pages_, metadata_)
 
-            out = wrapped_backbone(graphstate, graphother, inputs.kv_pages, inputs.batch_metadata)
+            with decode_mode_specs(decode_only):
+                out = wrapped_backbone(graphstate, graphother, inputs.kv_pages, inputs.batch_metadata)
             jax.block_until_ready(out.hidden_states)
             self._cache_store(self._backbone_cache, key, wrapped_backbone)
             return out
 
         if self.use_aot_forward:
-            compiled = self._backbone_fn.lower(  # pyright: ignore[reportFunctionMemberAccess]
-                *(graphdef, graphstate, graphother, inputs.kv_pages, inputs.batch_metadata)
-            ).compile()
+            with decode_mode_specs(decode_only):
+                compiled = backbone_fn.lower(  # pyright: ignore[reportFunctionMemberAccess]
+                    *(graphdef, graphstate, graphother, inputs.kv_pages, inputs.batch_metadata)
+                ).compile()
             self._cache_store(self._backbone_cache, key, compiled)
             return None
 
@@ -1473,13 +1636,16 @@ class ModelStepExecutor:
             the next call without recompiling, by reading ``self.graphdef``
             inside the closure each call.
             """
-            return self._backbone_fn(self.graphdef, graphstate_, graphother_, kv_pages_, metadata_)
+            return backbone_fn(self.graphdef, graphstate_, graphother_, kv_pages_, metadata_)
 
-        out = wrapped_backbone(graphstate, graphother, inputs.kv_pages, inputs.batch_metadata)
+        with decode_mode_specs(decode_only):
+            out = wrapped_backbone(graphstate, graphother, inputs.kv_pages, inputs.batch_metadata)
         self._cache_store(self._backbone_cache, key, wrapped_backbone)
         return out
 
-    def _dispatch_pipeline_backbone(self, graphstate_, graphother_, kv_pages_, metadata_) -> BackboneOutputs:
+    def _dispatch_pipeline_backbone(
+        self, graphstate_, graphother_, kv_pages_, metadata_, *, backbone_fn=None
+    ) -> BackboneOutputs:
         """Run the backbone through the resident PP runtime, falling back to direct call.
 
         Called from the MPMD-mode wrapper installed by
@@ -1497,15 +1663,20 @@ class ModelStepExecutor:
         Args:
             graphstate_, graphother_, kv_pages_, metadata_: Same step
                 inputs the compiled wrapper received from the runner.
+            backbone_fn: The layout-specific backbone jit to dispatch
+                (decode twin vs standard); defaults to the standard fn for
+                legacy callers.
 
         Returns:
             :class:`BackboneOutputs` for this step.
         """
+        if backbone_fn is None:
+            backbone_fn = self._backbone_fn
         pipeline_runtime = self.pipeline_runtime
         if pipeline_runtime is None:
-            return self._backbone_fn(self.graphdef, graphstate_, graphother_, kv_pages_, metadata_)
+            return backbone_fn(self.graphdef, graphstate_, graphother_, kv_pages_, metadata_)
         return pipeline_runtime.dispatch(
-            self._backbone_fn,
+            backbone_fn,
             self.graphdef,
             graphstate_,
             graphother_,
@@ -1584,7 +1755,8 @@ class ModelStepExecutor:
         if cached is not None:
             return cached
 
-        prepare = getattr(self._backbone_fn, "_mpmd_prepare", None)
+        # The microbatched PP wavefront always runs the decode-layout twin.
+        prepare = getattr(self._backbone_fn_decode, "_mpmd_prepare", None)
         if prepare is None:
             return {}
         state = prepare(self.graphdef, graphstate_, graphother_, kv_pages_, metadata_)
@@ -1706,7 +1878,7 @@ class ModelStepExecutor:
             for graphstate_, graphother_, kv_pages_, metadata_ in input_batches
         ]
         return self._pipeline_runtime.dispatch_many(
-            self._backbone_fn,
+            self._backbone_fn_decode,
             backbone_arg_batches,
             carry_input_output_map=carry_map,
             prepare_cache_key=(
@@ -1742,7 +1914,10 @@ class ModelStepExecutor:
         """
         if self._pipeline_runtime is None:
             state = getattr(self._backbone_fn, "_mpmd_state", {})
-            launches = int(state.get("forward_stage_launches", 0) or 0)
+            state_decode = getattr(self._backbone_fn_decode, "_mpmd_state", {})
+            launches = int(state.get("forward_stage_launches", 0) or 0) + int(
+                state_decode.get("forward_stage_launches", 0) or 0
+            )
             if launches <= 0:
                 return {}
             return {"pp_stage_launches": launches}
@@ -1811,8 +1986,7 @@ class ModelStepExecutor:
         if key in self._lm_head_cache:
             return
 
-        graphstate_arg = tuple(jax.tree_util.tree_leaves(graphstate)) if self._flat_state_args else graphstate
-        graphother_arg = tuple(jax.tree_util.tree_leaves(graphother)) if self._flat_state_args else graphother
+        graphstate_arg, graphother_arg = self._graph_call_args(graphstate, graphother)
         if hidden_dim is None:
             hidden_dim = int(self.model.config.get_text_config().hidden_size)
         if dtype is None:
@@ -2310,8 +2484,8 @@ class ModelStepExecutor:
             "static_argnums": (0, 5),
             "donate_argnums": (3,),
             "in_shardings": (
-                self._graph_arg_sharding(graphstate_template),
-                self._graph_arg_sharding(graphother_template),
+                self._graph_arg_sharding(graphstate_template, packer=self._graphstate_packer),
+                self._graph_arg_sharding(graphother_template, packer=self._graphother_packer),
                 kv_pages_sharding,
                 metadata_sharding,
             ),
@@ -2320,6 +2494,8 @@ class ModelStepExecutor:
         flat_state_args = bool(self._flat_state_args)
         graphstate_treedef = self._graphstate_treedef
         graphother_treedef = self._graphother_treedef
+        graphstate_packer = self._graphstate_packer
+        graphother_packer = self._graphother_packer
 
         @jax.jit(**jit_kwargs)
         def _model_step(
@@ -2342,6 +2518,10 @@ class ModelStepExecutor:
             with self.model.mesh:
                 with jax.named_scope("easydel/esurge/spmd_model_step"):
                     if flat_state_args:
+                        if graphstate_packer is not None:
+                            graphstate = graphstate_packer.unpack(graphstate)
+                        if graphother_packer is not None:
+                            graphother = graphother_packer.unpack(graphother)
                         graphstate = jax.tree_util.tree_unflatten(graphstate_treedef, graphstate)
                         graphother = jax.tree_util.tree_unflatten(graphother_treedef, graphother)
                     model: "EasyDeLBaseModule" = spx.bind(graphdef, graphstate.merge(graphother, copy=False))
@@ -2479,12 +2659,14 @@ class ModelStepExecutor:
         flat_state_args = bool(self._flat_state_args)
         graphstate_treedef = self._graphstate_treedef
         graphother_treedef = self._graphother_treedef
+        graphstate_packer = self._graphstate_packer
+        graphother_packer = self._graphother_packer
 
         @spx.jit(  # pyright: ignore[reportUntypedFunctionDecorator]
             static_argnums=(0,),
             in_shardings=(
-                self._graph_arg_sharding(graphstate_template),
-                self._graph_arg_sharding(graphother_template),
+                self._graph_arg_sharding(graphstate_template, packer=self._graphstate_packer),
+                self._graph_arg_sharding(graphother_template, packer=self._graphother_packer),
                 hidden_in_sharding,
             ),
             out_shardings=out_sharding,
@@ -2510,6 +2692,10 @@ class ModelStepExecutor:
                 # not at inference runtime; XLA sees through it.
                 with jax.named_scope("easydel/esurge/lm_head_step"):
                     if flat_state_args:
+                        if graphstate_packer is not None:
+                            graphstate = graphstate_packer.unpack(graphstate)
+                        if graphother_packer is not None:
+                            graphother = graphother_packer.unpack(graphother)
                         graphstate = jax.tree_util.tree_unflatten(graphstate_treedef, graphstate)
                         graphother = jax.tree_util.tree_unflatten(graphother_treedef, graphother)
                     model: "EasyDeLBaseModule" = spx.bind(graphdef, graphstate.merge(graphother, copy=False))

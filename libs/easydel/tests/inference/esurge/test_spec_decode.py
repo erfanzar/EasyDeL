@@ -43,8 +43,6 @@ except ImportError:  # standalone `python test_x.py`
     from _common import make_tiny_qwen35 as make_tiny_model
 
 
-
-
 class BaselineSequenceDrafter:
     """One-token drafter that proposes the next token from a known greedy stream."""
 

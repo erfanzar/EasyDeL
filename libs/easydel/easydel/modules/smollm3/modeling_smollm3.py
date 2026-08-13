@@ -49,7 +49,7 @@ from easydel.layers import (
     RMSNorm,
     RowParallelLinear,
     dense_gate_up_layout,
-    split_fused_gate_up_projection,
+    gated_mlp_forward,
 )
 from easydel.layers.attention import UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
@@ -424,6 +424,8 @@ class SmolLM3MLP(spx.Module):
             precision=precision,
             rngs=rngs,
         )
+        # SmolLM3 uses SiLU gating (SwiGLU).
+        self.act_fn = jax.nn.silu
 
     @property
     def reform_param(self):
@@ -440,6 +442,10 @@ class SmolLM3MLP(spx.Module):
 
         Computes: down_proj(silu(gate_proj(x)) * up_proj(x))
 
+        Delegates to :func:`easydel.layers.gated_mlp_forward`, which routes
+        supported layouts through the ejkernel fused MLP kernels and runs
+        the legacy composition otherwise.
+
         Args:
             hidden_states (Float[Array, "batch seq_len hidden_dim"]): Input tensor of shape
                 (batch_size, sequence_length, hidden_dim).
@@ -448,23 +454,7 @@ class SmolLM3MLP(spx.Module):
             Float[Array, "batch seq_len hidden_dim"]: Transformed hidden states with same
                 shape as input (batch_size, sequence_length, hidden_dim).
         """
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        # SwiGLU activation: silu(gate) * up
-        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
-        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
-        gate = checkpoint_name(gate, "mlp_gate")
-        hidden_states = jax.nn.silu(gate) * up
-        hidden_states = checkpoint_name(self.down_proj(hidden_states), "mlp_down")
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        return checkpoint_name(hidden_states, "mlp_output")
+        return gated_mlp_forward(self, hidden_states)
 
 
 @register_module(

@@ -327,6 +327,25 @@ class ToolParser:
                 hints.append(hint)
         return tuple(hints)
 
+    def get_tool_machinery_hints(self) -> Sequence[str]:
+        """Return substrings whose presence must engage the streaming tool machinery.
+
+        Defaults to :meth:`get_streaming_buffer_hints`. Parsers that also
+        accept *markerless* tool payloads (bare JSON objects/arrays with no
+        protocol marker, e.g. ``{"name": ...}``) override this to add those
+        start prefixes so the delegating parser's machinery gate cannot drop
+        a markerless call. Kept separate from the buffering hints on
+        purpose: feeding ``"{"`` / ``"["`` into
+        :meth:`is_buffering_protocol` would suppress ordinary visible
+        content that merely contains a brace.
+
+        Returns:
+            Tuple of unique substrings that should trigger the streaming
+            tool machinery when seen in the visible content.
+        """
+
+        return self.get_streaming_buffer_hints()
+
     def is_buffering_protocol(
         self,
         *,

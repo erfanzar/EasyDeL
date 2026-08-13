@@ -120,6 +120,7 @@ from .grad_core import (
     _accumulate_state,
     _get_fused_fwd_bwd_jit,
     _get_loss_and_g_y,
+    _scale_grad_donate,
     _scale_grad_tree,
     _scale_state,
     _zeros_like_state,
@@ -150,6 +151,7 @@ from .pscan_compiler import (
     _materialize_cotangents,
     _rebase_jaxpr_mesh_params,
     _stage_jit_name_suffix,
+    _stage_persistent_cache_bypass,
     build_pscan_plan,
     dispatch_pscan,
     has_pscan,
@@ -3048,7 +3050,33 @@ def _build_schedule_plan(
         return args[i]
 
     mb_dynamic_args = tuple(_make_mb_arg(i) for i in dynamic_argnums)
-    closed_jaxpr = jax.make_jaxpr(_wrapper)(*mb_dynamic_args)
+    closed_jaxpr, out_shape = jax.make_jaxpr(_wrapper, return_shape=True)(*mb_dynamic_args)
+    out_leaves, fn_out_treedef = jax.tree_util.tree_flatten(out_shape)
+    terminal_n_aux = len(out_leaves) - 1
+    if terminal_n_aux < 0:
+        raise ValueError("sxjit schedule path: the function must return at least a scalar loss output.")
+    if terminal_n_aux > 0:
+        # With auxiliary outputs the return structure must be an explicit
+        # (loss, aux) 2-tuple. Anything else (a flat (loss, a, b) tuple, a
+        # dict, ...) would silently differentiate whichever scalar happens to
+        # flatten first — reject it instead of guessing.
+        if not isinstance(out_shape, tuple | list) or len(out_shape) != 2:
+            raise ValueError(
+                "sxjit schedule path: functions returning auxiliary outputs must return an "
+                "explicit 2-tuple (loss, aux) where aux is a pytree of auxiliary outputs; "
+                f"got return structure {jax.tree_util.tree_structure(out_shape)}."
+            )
+        if len(jax.tree_util.tree_leaves(out_shape[0])) != 1:
+            raise ValueError(
+                "sxjit schedule path: the first element of the (loss, aux) return must be the "
+                "single scalar per-microbatch loss; got a pytree with "
+                f"{len(jax.tree_util.tree_leaves(out_shape[0]))} leaves."
+            )
+    if getattr(out_leaves[0], "shape", None) not in ((), None):
+        raise ValueError(
+            "sxjit schedule path: the first output (flattened order) must be the scalar "
+            f"per-microbatch loss; got shape {getattr(out_leaves[0], 'shape', None)}."
+        )
     body_jaxpr = _normalize_marker_flows(closed_jaxpr.jaxpr)
     has_regions = has_stage_regions(body_jaxpr)
 
@@ -3085,6 +3113,13 @@ def _build_schedule_plan(
     )
     terminal_logical = len(clusters) - 1
     terminal_loc = loc_for_logical[terminal_logical]
+    if len(clusters[terminal_logical].outvars) != 1 + terminal_n_aux:
+        raise ValueError(
+            "sxjit schedule path: the terminal (loss) stage must produce every function output "
+            f"(the scalar loss plus {terminal_n_aux} auxiliary output(s)), but its cluster has "
+            f"{len(clusters[terminal_logical].outvars)} output(s). Auxiliary outputs must be "
+            "computed after the final sxstage_iter marker."
+        )
     invar_sources = _build_invar_sources(body_jaxpr, clusters)
 
     all_constvars = list(body_jaxpr.constvars)
@@ -3397,8 +3432,11 @@ def _build_schedule_plan(
         logical: int,
         loc: tuple[int, int],
         consts: tuple[object, ...],
-    ) -> tuple[object | None, tuple[tuple[object, ...], tuple[object | None, ...]]]:
+    ) -> tuple[object | None, object | None, tuple[tuple[object, ...], tuple[object | None, ...]]]:
         """Build ``jax.jit(out_shardings=...)`` for the terminal loss stage.
+
+        The terminal jit returns ``(loss, aux, (g_consts, g_invars))``;
+        loss and aux stay unconstrained (``None`` prefix entries).
 
         Args:
             logical: Logical value consumed by this operation.
@@ -3408,7 +3446,7 @@ def _build_schedule_plan(
         Returns:
             Result described by this helper.
         """
-        return None, _bwd_out_shardings_for(logical, loc, consts)
+        return None, None, _bwd_out_shardings_for(logical, loc, consts)
 
     def _fwd_out_shardings_for(logical: int, loc: tuple[int, int]) -> tuple[object, ...] | None:
         """Build ``jax.jit(out_shardings=...)`` for one scheduled forward stage."""
@@ -3546,6 +3584,7 @@ def _build_schedule_plan(
                 donate_argnums=donate_positions,
                 out_shardings=_terminal_out_shardings_for(logical, loc, placed_consts),
                 stage_mesh=stage_mesh,
+                n_aux=terminal_n_aux,
             )
 
     assert terminal_jit is not None
@@ -3631,6 +3670,9 @@ def _build_schedule_plan(
         "logical_for_loc": logical_for_loc,
         "terminal_loc": terminal_loc,
         "terminal_logical": terminal_logical,
+        "terminal_n_aux": terminal_n_aux,
+        "fn_out_treedef": fn_out_treedef,
+        "args_treedef": jax.tree.structure(args),
         "serial_region_plan": serial_region_plan,
         "invar_sources": invar_sources,
         "per_loc_consts": per_loc_consts,
@@ -4075,6 +4117,118 @@ def _accumulate_flat_grad(
     accums[flat_idx] = _add_grad_on_common_sharding(accums[flat_idx], grad, target, flat_idx=flat_idx)
 
 
+_MICROBATCH_WEIGHT_FN_VAR: contextvars.ContextVar["Callable[..., object] | None"] = contextvars.ContextVar(
+    "spectrax_mpmd_microbatch_weight_fn",
+    default=None,
+)
+
+
+def _resolve_microbatch_loss_scales(
+    plan: dict[str, object],
+    flat_args_live: list[object] | tuple[object, ...],
+    m: int,
+    mb_args: list[object] | None = None,
+) -> list[float] | None:
+    """Resolve per-microbatch loss scales from the plan's weight callable.
+
+    When the ambient microbatch weight fn is set (a ContextVar bound by
+    ``sxvalue_and_grad(..., microbatch_weight_fn=...)``), each microbatch's
+    weight ``w_mb`` is evaluated on the microbatch-sliced call arguments and
+    the returned scales are ``w_mb / sum(w)``. Scaling every microbatch's
+    loss and gradients by these factors turns the scheduled estimator into
+    the weight-weighted global mean ``sum(w_mb * loss_mb) / sum(w)`` — for
+    token-count weights this reproduces the single-program (SPMD)
+    token-weighted loss exactly, instead of the uniform mean-of-means.
+
+    Args:
+        plan: Dispatch plan from :func:`_build_schedule_plan`.
+        flat_args_live: Flattened live call arguments.
+        m: Number of microbatches.
+        mb_args: Optional pre-split microbatch stacks aligned with
+            ``flat_args_live`` (built by the dispatchers). When ``None``,
+            batch leaves are split here.
+
+    Returns:
+        ``[w_mb / sum(w)] * m`` as host floats, or ``None`` when no
+        weight callable is attached (uniform ``1/m`` behavior).
+    """
+    weight_fn = _MICROBATCH_WEIGHT_FN_VAR.get()
+    if weight_fn is None:
+        return None
+    args_treedef = plan.get("args_treedef")
+    if args_treedef is None:
+        raise ValueError("sxjit schedule plan has no args_treedef; microbatch weighting requires a rebuilt plan.")
+    microbatch_mask = plan.get("microbatch_mask", plan["dynamic_mask"])
+    if mb_args is None:
+        mb_args = [_microbatch(arg, m) if microbatch_mask[i] else arg for i, arg in enumerate(flat_args_live)]
+    # Issue every microbatch's weight computation BEFORE touching the host.
+    # Transferring inside the loop serialized the dispatch path into
+    # issue/block/issue/block — m synchronous round trips per resolver, and
+    # the resolvers run for both the forward and the backward pass — which
+    # stalls the host ahead of any stage work and undoes the runtime's host
+    # run-ahead. Issued asynchronously, the host waits once for the last.
+    pending = []
+    for mb in range(m):
+        leaves = [mb_args[i][mb] if microbatch_mask[i] else flat_args_live[i] for i in range(len(flat_args_live))]
+        args_mb = jax.tree.unflatten(args_treedef, list(leaves))
+        pending.append(weight_fn(*args_mb))
+    weights: list[float] = [max(float(w), 0.0) for w in jax.device_get(pending)]
+    total = sum(weights)
+    if total <= 0.0:
+        return [1.0 / m] * m
+    return [w / total for w in weights]
+
+
+def _weighted_terms_sum(terms: list[tuple[int, object]], scales: list[float] | None, m: int) -> object | None:
+    """Reduce per-microbatch ``(mb, value)`` terms into the scheduled loss/aux value.
+
+    Args:
+        terms: ``(microbatch_index, value)`` pairs in any order.
+        scales: Per-microbatch loss scales from
+            :func:`_resolve_microbatch_loss_scales`, or ``None`` for the
+            uniform ``sum / m`` mean.
+        m: Number of microbatches.
+
+    Returns:
+        The reduced scalar (or pytree-leaf) value, or ``None`` when
+        ``terms`` is empty.
+    """
+    if not terms:
+        return None
+    ordered = sorted(terms, key=lambda item: item[0])
+    if scales is None:
+        acc = ordered[0][1]
+        for _mb, value in ordered[1:]:
+            acc = acc + value
+        return acc / jnp.asarray(m, dtype=getattr(acc, "dtype", jnp.float32))
+    acc = None
+    for mb, value in ordered:
+        scaled = value * jnp.asarray(scales[mb], dtype=jnp.float32)
+        acc = scaled if acc is None else acc + scaled
+    return acc
+
+
+def _scale_terminal_grad_tuple(values: tuple[object, ...], scale: object) -> tuple[object, ...]:
+    """Scale a tuple of terminal-stage gradient leaves in place.
+
+    Each array leaf is scaled through the donating leaf jit so XLA reuses
+    the fresh gradient buffer (dtype-preserving). ``None`` and ``float0``
+    leaves pass through untouched — they cannot be jit inputs and are
+    scale-invariant anyway.
+
+    Args:
+        values: Gradient leaves (``g_invars`` or ``g_consts``).
+        scale: Scalar multiplier.
+
+    Returns:
+        The scaled tuple, buffers reused in place where possible.
+    """
+    return tuple(
+        x if (x is None or _is_float0(x) or not isinstance(x, jax.Array)) else _scale_grad_donate(x, scale)
+        for x in values
+    )
+
+
 def _dispatch_gpipe_fwd(
     plan: dict[str, object],
     args: tuple,
@@ -4127,7 +4281,10 @@ def _dispatch_gpipe_fwd(
 
     saved_inputs: dict[tuple[int, int, int], tuple[object, ...]] = {}
     saved_outputs: dict[tuple[int, int, int], tuple[object, ...]] = {}
-    loss_acc: jax.Array | None = None
+    terminal_n_aux = int(plan.get("terminal_n_aux", 0))
+    mb_loss_scales = _resolve_microbatch_loss_scales(plan, flat_args, m, mb_args=mb_args)
+    loss_terms: list[tuple[int, object]] = []
+    aux_terms: list[tuple[int, tuple[object, ...]]] = []
 
     for mb in range(m):
         for logical in range(n_logical):
@@ -4180,26 +4337,34 @@ def _dispatch_gpipe_fwd(
             with submesh:
                 if logical == terminal_logical:
                     terminal_out = fwd_jits[stage_key](consts, *invars)
-                    if len(terminal_out) != 1:
+                    if len(terminal_out) != 1 + terminal_n_aux:
                         raise ValueError(
-                            f"Terminal forward cluster must produce exactly one scalar loss; "
-                            f"got {len(terminal_out)} outputs."
+                            f"Terminal forward cluster must produce the scalar loss plus "
+                            f"{terminal_n_aux} auxiliary output(s); got {len(terminal_out)} outputs."
                         )
-                    loss = terminal_out[0]
-                    loss_acc = loss if loss_acc is None else loss_acc + loss
+                    loss_terms.append((mb, terminal_out[0]))
+                    if terminal_n_aux:
+                        aux_terms.append((mb, tuple(terminal_out[1:])))
                 else:
                     out = fwd_jits[stage_key](consts, *invars)
                     saved_outputs[key] = out
             saved_inputs[key] = tuple(invars)
 
-    if loss_acc is None:
+    mean_loss = _weighted_terms_sum(loss_terms, mb_loss_scales, m)
+    if mean_loss is None:
         raise ValueError("sxjit schedule forward did not execute a terminal loss stage.")
-    mean_loss = loss_acc / jnp.asarray(m, dtype=loss_acc.dtype)
+    aux_out: tuple[object, ...] | None = None
+    if terminal_n_aux:
+        aux_out = tuple(
+            _weighted_terms_sum([(mb, aux[pos]) for mb, aux in aux_terms], mb_loss_scales, m)
+            for pos in range(terminal_n_aux)
+        )
     return mean_loss, {
         "saved_inputs": saved_inputs,
         "saved_outputs": saved_outputs,
         "per_loc_consts": per_loc_consts,
         "flat_args_live": tuple[Leaf, ...](flat_args),
+        "aux_flat": aux_out,
     }
 
 
@@ -4242,6 +4407,7 @@ def _dispatch_gpipe_bwd(
 
     saved_inputs = saved["saved_inputs"]
     saved_outputs = saved["saved_outputs"]
+    mb_loss_scales = _resolve_microbatch_loss_scales(plan, saved.get("flat_args_live") or (), m)
 
     grad_accums: dict[int, object] = {}
     recv_cots: dict[tuple[int, ...], list[object | None]] = {}
@@ -4284,9 +4450,12 @@ def _dispatch_gpipe_bwd(
 
             with submesh:
                 if logical == terminal_logical:
-                    _, (g_consts, g_invars) = terminal_jit(consts, *invars)
+                    _, _aux, (g_consts, g_invars) = terminal_jit(consts, *invars)
                     cotangent = jnp.asarray(1.0, dtype=jnp.float32) if g is None else g
-                    scale = cotangent / jnp.asarray(m, dtype=jnp.float32)
+                    if mb_loss_scales is None:
+                        scale = cotangent / jnp.asarray(m, dtype=jnp.float32)
+                    else:
+                        scale = cotangent * jnp.asarray(mb_loss_scales[mb], dtype=jnp.float32)
                     g_consts = jax.tree.map(lambda x, s=scale: _scale_grad(x, s), g_consts, is_leaf=_is_leaf)
                     g_invars = tuple(_scale_grad(x, scale) for x in g_invars)
                 else:
@@ -4464,7 +4633,10 @@ def _dispatch_schedule_faithful_serial(
     recv_cots: dict[tuple[int, ...], list[object | None]] = {}
     grad_accums: dict[int, object] = {}
     terminal_const_grad_accums: dict[int, object] = {}
-    loss_acc = jnp.asarray(0.0)
+    terminal_n_aux = int(plan.get("terminal_n_aux", 0))
+    mb_loss_scales = _resolve_microbatch_loss_scales(plan, flat_args_live, m, mb_args=mb_args)
+    loss_terms: list[tuple[int, object]] = []
+    aux_terms: list[tuple[int, tuple[object, ...]]] = []
     lazy_bwd_actions: dict[int, list[tuple[object, int]]] = {}
 
     for group in range(region_groups):
@@ -4525,13 +4697,15 @@ def _dispatch_schedule_faithful_serial(
 
                     with submesh:
                         if logical == terminal_logical:
-                            loss, (g_consts, g_invars) = _time_call(
+                            loss, aux, (g_consts, g_invars) = _time_call(
                                 f"stage{logical}_terminal_fwd_mb{mb}",
                                 terminal_jit,
                                 consts,
                                 *invars,
                             )
-                            loss_acc = loss_acc + loss
+                            loss_terms.append((mb, loss))
+                            if terminal_n_aux:
+                                aux_terms.append((mb, tuple(aux)))
                             terminal_grads[key] = (g_consts, g_invars)
                         else:
                             out = _time_call(f"stage{logical}_fwd_mb{mb}", fwd_jits[stage_key], consts, *invars)
@@ -4551,14 +4725,21 @@ def _dispatch_schedule_faithful_serial(
                         if logical == terminal_logical:
                             cached_terminal_grads = terminal_grads.pop(key, None)
                             if cached_terminal_grads is None:
-                                _, cached_terminal_grads = _time_call(
+                                _, _aux, cached_terminal_grads = _time_call(
                                     f"stage{logical}_terminal_{phase_label}_mb{mb}",
                                     terminal_jit,
                                     consts,
                                     *invars,
                                 )
                             g_consts, g_invars = cached_terminal_grads
-                            scale = 1.0 / jnp.asarray(m, dtype=jnp.float32)
+                            if mb_loss_scales is None:
+                                scale = 1.0 / jnp.asarray(m, dtype=jnp.float32)
+                            else:
+                                scale = jnp.asarray(mb_loss_scales[mb], dtype=jnp.float32)
+                                # BWD_I discards const grads below; skip the
+                                # dead scaling launch for that phase.
+                                if phase is not Phase.BWD_I:
+                                    g_consts = _scale_terminal_grad_tuple(tuple(g_consts), scale)
                             g_invars = tuple(_scale_grad(x, scale) for x in g_invars)
                         else:
                             cotangents = _materialize_cotangents(
@@ -4674,20 +4855,24 @@ def _dispatch_schedule_faithful_serial(
             consts = per_loc_consts[stage_key]
 
             if logical == terminal_logical:
-                scale = 1.0 / jnp.asarray(m, dtype=jnp.float32)
                 for mb in mbs:
                     key = _runtime_key(logical, mb)
                     invars = saved_inputs[key]
                     with submesh:
                         cached_terminal_grads = terminal_grads.pop(key, None)
                         if cached_terminal_grads is None:
-                            _, cached_terminal_grads = _time_call(
+                            _, _aux, cached_terminal_grads = _time_call(
                                 f"stage{logical}_terminal_lazy_bwd_mb{mb}",
                                 terminal_jit,
                                 consts,
                                 *invars,
                             )
                         g_consts, g_invars = cached_terminal_grads
+                        if mb_loss_scales is None:
+                            scale = 1.0 / jnp.asarray(m, dtype=jnp.float32)
+                        else:
+                            scale = jnp.asarray(mb_loss_scales[mb], dtype=jnp.float32)
+                            g_consts = _scale_terminal_grad_tuple(tuple(g_consts), scale)
                         g_invars = tuple(_scale_grad(x, scale) for x in g_invars)
                     for local_idx, const_idx in enumerate(plan["const_indices_per_loc"][stage_key]):
                         flat_idx = const_idx_to_flat_idx.get(const_idx)
@@ -4868,11 +5053,12 @@ def _dispatch_schedule_faithful_serial(
             grad = grad_accums.get(i)
             terminal_grad = terminal_const_grad_accums.get(i)
             if terminal_grad is not None:
-                terminal_grad = jax.tree.map(
-                    lambda x, s=terminal_const_scale: _scale_grad(x, s),
-                    terminal_grad,
-                    is_leaf=_is_leaf,
-                )
+                if mb_loss_scales is None:
+                    terminal_grad = jax.tree.map(
+                        lambda x, s=terminal_const_scale: _scale_grad(x, s),
+                        terminal_grad,
+                        is_leaf=_is_leaf,
+                    )
                 if grad is None:
                     grad = _place_grad_on_target(terminal_grad, grad_targets.get(i), flat_idx=i)
                 else:
@@ -4891,16 +5077,24 @@ def _dispatch_schedule_faithful_serial(
         else:
             final_grads.append(None)
 
-    mean_loss = loss_acc / jnp.asarray(m, dtype=loss_acc.dtype)
-    return (mean_loss if return_loss else None), tuple(final_grads)
+    mean_loss = _weighted_terms_sum(loss_terms, mb_loss_scales, m)
+    if mean_loss is None:
+        mean_loss = jnp.asarray(0.0)
+    aux_out: tuple[object, ...] | None = None
+    if terminal_n_aux:
+        aux_out = tuple(
+            _weighted_terms_sum([(mb, aux[pos]) for mb, aux in aux_terms], mb_loss_scales, m)
+            for pos in range(terminal_n_aux)
+        )
+    return (mean_loss if return_loss else None), tuple(final_grads), aux_out
 
 
 def _dispatch_schedule_faithful(
     plan: dict[str, object],
     args: tuple,
     return_loss: bool = False,
-) -> tuple[jax.Array | None, tuple[object, ...]]:
-    """Run the schedule-driven training dispatch and return ``(loss, grads)``.
+) -> tuple[jax.Array | None, tuple[object, ...], tuple[object, ...] | None]:
+    """Run the schedule-driven training dispatch and return ``(loss, grads, aux)``.
 
     The default path lowers the schedule into dependency-tracked units
     and fires them through :func:`_dispatch_schedule_fused_async`.
@@ -4917,7 +5111,9 @@ def _dispatch_schedule_faithful(
             (``False`` is used by ``sxgrad`` which wants only grads).
 
     Returns:
-        ``(loss_or_None, flat_grads_tuple)``.
+        ``(loss_or_None, flat_grads_tuple, aux_flat_or_None)`` — ``aux``
+        is the tuple of reduced auxiliary terminal outputs (``None``
+        when the traced function returns only the scalar loss).
     """
     if getattr(plan["schedule"], "lazy_bwd_batching", False):
         plan["last_schedule_runtime_stats"] = {
@@ -4927,8 +5123,26 @@ def _dispatch_schedule_faithful(
             "fallback_reason": "lazy_bwd_batching",
         }
         return _dispatch_schedule_faithful_serial(plan, args, return_loss=return_loss)
-    units = _build_schedule_units_from_plan(plan)
-    deps = _build_schedule_unit_dependencies(plan, units)
+    # The unit list and dependency sets are pure functions of the plan plus the
+    # apply-unit request; rebuilding (and re-running preflight stats) on every
+    # training step is host overhead and re-logs the preflight line each step.
+    # Cache them on the plan, keyed by the only per-call toggles that change
+    # the DAG. The apply-jit key is the sorted (rank, virt) identity of the
+    # compiled apply map — not its truthiness — so a partial per-rank map can
+    # never reuse a DAG built for a different rank set.
+    apply_jits = plan.get("apply_jits") or {}
+    units_cache_key = (
+        tuple(sorted(apply_jits)),
+        bool(plan.get("apply_requires_all_grads", False)),
+    )
+    cached_units = plan.get("_schedule_units_cache")
+    if cached_units is not None and cached_units[0] == units_cache_key:
+        _key, units, deps = cached_units
+    else:
+        units = _build_schedule_units_from_plan(plan)
+        deps = _build_schedule_unit_dependencies(plan, units)
+        plan["_schedule_units_cache"] = (units_cache_key, units, deps)
+        plan.pop("last_schedule_preflight_stats", None)
     return _dispatch_schedule_fused_async(plan, args, return_loss=return_loss, units=units, deps=deps)
 
 
@@ -4939,7 +5153,7 @@ def _dispatch_schedule_fused_async(
     *,
     units: list[_ScheduleUnit] | None = None,
     deps: dict[int, set[int]] | None = None,
-) -> tuple[jax.Array | None, tuple[object, ...]]:
+) -> tuple[jax.Array | None, tuple[object, ...], tuple[object, ...] | None]:
     """Run a schedule grid using real fused FWD+BWD units where possible.
 
     The schedule grid is lowered into dependency-tracked units. Same-rank
@@ -5049,6 +5263,7 @@ def _dispatch_schedule_fused_async(
     bwd_w_cotangents: dict[tuple[int, ...], tuple[object, ...]] = {}
     grad_accums: dict[int, object] = {}
     stage_local_grad_accums: dict[tuple[int, tuple[object, ...]], object] = {}
+    rank_grad_sync: dict[int, tuple[object, ...]] = {}
     _STAGE_LOCAL_MISSING = object()
     deferred_flat_grad_updates: list[tuple[int, object]] = []
     const_tuple_accums: dict[tuple[int, ...], object] = {}
@@ -5057,8 +5272,10 @@ def _dispatch_schedule_fused_async(
     requested_grad_flat_indices = (
         set(requested_grad_flat_indices) if requested_grad_flat_indices is not None else set(range(n_flat))
     )
-    loss_acc = jnp.asarray(0.0)
-    loss_terms: list[object] = []
+    terminal_n_aux = int(plan.get("terminal_n_aux", 0))
+    mb_loss_scales = _resolve_microbatch_loss_scales(plan, flat_args_live, m, mb_args=mb_args)
+    loss_terms: list[tuple[int, object]] = []
+    aux_terms: list[tuple[int, tuple[object, ...]]] = []
     state_lock = threading.Lock()
     collective_launch_lock = threading.Lock()
     placed_dynamic_invars: dict[tuple[int, int, int], object] = {}
@@ -5171,6 +5388,52 @@ def _dispatch_schedule_fused_async(
                 return
             for future in pending:
                 future.result()
+
+    def _throttle_grad_unit_runahead(rank: int) -> None:
+        """Bound per-rank enqueue run-ahead of gradient-producing schedule units.
+
+        PJRT allocates every executable's output buffers at host enqueue time,
+        so an unthrottled dispatcher piles up several full per-microbatch
+        gradient trees per device before the device catches up — at large model
+        scale that alone exhausts HBM (each tree is roughly parameter-sized).
+        Before enqueueing the next gradient-producing unit on a rank, wait for
+        the previous unit's accumulator merge on that rank to be
+        device-complete; the merge donates the running accumulator, so its
+        completion frees the previous unit's fresh gradient tree. Forward
+        units, cotangent transfers, and other ranks stay fully asynchronous, so
+        pipeline overlap across ranks is unaffected.
+        """
+        with state_lock:
+            handles = rank_grad_sync.pop(rank, None)
+        if not handles:
+            return
+        t0 = time.perf_counter_ns()
+        try:
+            jax.block_until_ready(tuple(_resolve_future_value(handle) for handle in handles))
+        finally:
+            if stats_collector is not None:
+                stats_collector.record_gate_wait(
+                    f"grad_runahead_rank{rank}",
+                    rank,
+                    (time.perf_counter_ns() - t0) / 1e6,
+                    "grad_runahead",
+                )
+
+    def _terminal_loss_scale(mb: int) -> object:
+        """Return microbatch ``mb``'s loss scale (``1/M`` or its weighted share)."""
+        if mb_loss_scales is None:
+            return 1.0 / jnp.asarray(m, dtype=jnp.float32)
+        return jnp.asarray(mb_loss_scales[mb], dtype=jnp.float32)
+
+    def _scale_terminal_grads(g_invars_tuple: tuple[object, ...], scale: object) -> tuple[object, ...]:
+        """Apply the per-microbatch loss scale to terminal grads without an extra tree.
+
+        Each array leaf is scaled through the donating leaf jit so XLA reuses
+        the fresh gradient buffer in place (dtype-preserving). ``None`` and
+        ``float0`` leaves pass through untouched — they cannot be jit inputs
+        and are scale-invariant anyway.
+        """
+        return _scale_terminal_grad_tuple(g_invars_tuple, scale)
 
     def _rank_for_exact_sharding_device_set(sharding: object) -> int | None:
         """Return the physical rank whose submesh exactly owns ``sharding``."""
@@ -5603,10 +5866,16 @@ def _dispatch_schedule_fused_async(
 
     def _accumulate_stage_local_flat_grad_batch(
         updates: tuple[tuple[int, object], ...],
-    ) -> bool:
-        """Fold a stage-local gradient batch with one JAX add for compatible leaves."""
+    ) -> tuple[bool, tuple[object, ...]]:
+        """Fold a stage-local gradient batch with one JAX add for compatible leaves.
+
+        Returns:
+            ``(saw_update, merge_handles)`` — whether any update was folded,
+            plus the merged/placed accumulator values launched by this batch
+            (used to throttle per-rank gradient-unit run-ahead).
+        """
         if not updates:
-            return False
+            return False, ()
         claims: list[tuple[int, object, tuple[int, tuple[object, ...]], object, concurrent.futures.Future[object]]] = []
         claimed_keys: set[tuple[int, tuple[object, ...]]] = set()
         try:
@@ -5632,7 +5901,7 @@ def _dispatch_schedule_fused_async(
                         accumulated = (
                             _accumulate_stage_local_flat_grad(inner_flat_idx, inner_grad, task_name=None) or accumulated
                         )
-                    return accumulated
+                    return accumulated, ()
                 claimed_keys.add(key)
                 future: concurrent.futures.Future[object] = concurrent.futures.Future()
                 with state_lock:
@@ -5640,7 +5909,7 @@ def _dispatch_schedule_fused_async(
                     stage_local_grad_accums[key] = future
                 claims.append((flat_idx, grad, key, existing, future))
             if not claims:
-                return False
+                return False, ()
 
             place_claims: list[
                 tuple[int, object, tuple[int, tuple[object, ...]], concurrent.futures.Future[object]]
@@ -5661,10 +5930,12 @@ def _dispatch_schedule_fused_async(
                 else:
                     fallback_claims.append((flat_idx, existing_value, grad, key, future))
 
+            merge_handles: list[object] = []
             with collective_launch_lock:
                 for flat_idx, grad, key, future in place_claims:
                     placed = _place_grad_on_accum_target(grad, _value_sharding(grad), flat_idx=flat_idx)
                     _set_stage_local_claim_result(key=key, future=future, value=placed)
+                    merge_handles.append(placed)
                 if batch_claims:
                     xs = tuple(
                         cast(jax.Array, existing_value)
@@ -5678,11 +5949,13 @@ def _dispatch_schedule_fused_async(
                         strict=True,
                     ):
                         _set_stage_local_claim_result(key=key, future=future, value=merged)
+                        merge_handles.append(merged)
                 for flat_idx, existing_value, grad, key, future in fallback_claims:
                     target = _value_sharding(grad)
                     merged = _add_grad_on_accum_target(existing_value, grad, target, flat_idx=flat_idx)
                     _set_stage_local_claim_result(key=key, future=future, value=merged)
-            return True
+                    merge_handles.append(merged)
+            return True, tuple(merge_handles)
         except BaseException as exc:
             _restore_stage_local_claims(tuple(claims), exc)
             raise
@@ -6809,6 +7082,7 @@ def _dispatch_schedule_fused_async(
         stage_local_grad_updates: list[tuple[int, object]] = []
         stage_local_grad_slot = None
         saw_stage_local_grad_update = False
+        stage_local_merge_handles: tuple[object, ...] = ()
         for update_idx, (flat_idx, grad) in enumerate(flat_grad_updates):
             global_nbytes = _grad_global_nbytes(grad)
             defer_stage_local = flat_idx in shared_body_grad_flat_indices
@@ -6882,7 +7156,9 @@ def _dispatch_schedule_fused_async(
                     kind="stage_local_grad",
                 )
             try:
-                saw_stage_local_grad_update = _accumulate_stage_local_flat_grad_batch(tuple(stage_local_grad_updates))
+                saw_stage_local_grad_update, stage_local_merge_handles = _accumulate_stage_local_flat_grad_batch(
+                    tuple(stage_local_grad_updates)
+                )
             finally:
                 if stage_local_grad_slot is not None:
                     stage_local_grad_slot.release()
@@ -6946,6 +7222,17 @@ def _dispatch_schedule_fused_async(
                 recv_cots=len(recv_cots),
                 const_accums=len(const_accums),
             )
+        runahead_handles: list[object] = list(stage_local_merge_handles)
+        if phase is not Phase.BWD_I and g_consts is not None:
+            with state_lock:
+                merged_consts = const_accums.get(_stage_key(logical))
+            if merged_consts is not None:
+                runahead_handles.extend(
+                    leaf for leaf in jax.tree_util.tree_leaves(merged_consts) if isinstance(leaf, jax.Array)
+                )
+        if runahead_handles:
+            with state_lock:
+                rank_grad_sync[rank] = tuple(runahead_handles)
         _progress(
             "accumulate-bwd-exit",
             logical=logical,
@@ -6973,7 +7260,6 @@ def _dispatch_schedule_fused_async(
             virt: Virt value consumed by this operation.
             action: Action value consumed by this operation.
         """
-        nonlocal loss_acc
         mb = action.microbatch
         loc = (rank, virt)
         stage_key = _stage_key(logical)
@@ -7012,7 +7298,8 @@ def _dispatch_schedule_fused_async(
         with rank_submeshes[rank]:
             if logical == terminal_logical:
                 if cache_terminal_grads:
-                    loss, (g_consts, g_invars) = _stage_call(
+                    _throttle_grad_unit_runahead(rank)
+                    loss, aux, (g_consts, g_invars) = _stage_call(
                         rank,
                         f"stage{logical}_terminal_fwd_mb{mb}",
                         terminal_jit,
@@ -7028,16 +7315,22 @@ def _dispatch_schedule_fused_async(
                         *invars,
                     )
                     loss = loss_out[0]
+                    aux = tuple(loss_out[1:])
                     g_consts = None
                     g_invars = ()
-                loss_terms.append(loss)
+                with state_lock:
+                    loss_terms.append((mb, loss))
+                    if terminal_n_aux:
+                        aux_terms.append((mb, tuple(aux)))
                 if cache_terminal_grads and not eager_terminal_bwd:
                     terminal_grads[key] = (g_consts, g_invars)
                 saved_inputs[key] = tuple(invars)
                 if eager_terminal_bwd:
                     if g_consts is None:
                         raise ValueError("Cannot run eager terminal backward when terminal gradients were not computed.")
-                    scale = 1.0 / jnp.asarray(m, dtype=jnp.float32)
+                    scale = _terminal_loss_scale(mb)
+                    if mb_loss_scales is not None:
+                        g_consts = _scale_terminal_grads(tuple(g_consts), scale)
                     _accumulate_bwd_result(
                         loc=loc,
                         logical=logical,
@@ -7045,7 +7338,7 @@ def _dispatch_schedule_fused_async(
                         mb=mb,
                         phase=Phase.BWD,
                         g_consts=g_consts,
-                        g_invars=tuple(_scale_grad(x, scale) for x in g_invars),
+                        g_invars=_scale_terminal_grads(g_invars, scale),
                         const_grad_accums=terminal_const_tuple_accums,
                     )
                     _release_consumed_backward_state(logical, mb, Phase.BWD)
@@ -7196,6 +7489,7 @@ def _dispatch_schedule_fused_async(
                         active_grad_ready=active_grad_count,
                     )
                 _wait_active_grad_reductions()
+                _throttle_grad_unit_runahead(rank)
                 if focused_terminal_bwd:
                     with state_lock:
                         active_grad_count = sum(1 for future in active_grad_ready_futures if not future.done())
@@ -7215,7 +7509,7 @@ def _dispatch_schedule_fused_async(
                 if cached_terminal_grads is None:
                     if focused_terminal_bwd:
                         _focused_terminal_bwd_debug("run-bwd-before-terminal-call")
-                    _, cached_terminal_grads = _stage_call(
+                    _, _aux, cached_terminal_grads = _stage_call(
                         rank,
                         f"stage{logical}_terminal_{phase_label}_mb{mb}",
                         terminal_jit,
@@ -7225,14 +7519,18 @@ def _dispatch_schedule_fused_async(
                     if focused_terminal_bwd:
                         _focused_terminal_bwd_debug("run-bwd-after-terminal-call")
                 g_consts, g_invars = cached_terminal_grads
-                scale = 1.0 / jnp.asarray(m, dtype=jnp.float32)
+                scale = _terminal_loss_scale(mb)
                 if focused_terminal_bwd:
                     _focused_terminal_bwd_debug(
                         "run-bwd-before-scale",
                         g_const_leaves=len(jax.tree_util.tree_leaves(g_consts)) if g_consts is not None else 0,
                         g_invar_count=len(g_invars),
                     )
-                g_invars = tuple(_scale_grad(x, scale) for x in g_invars)
+                # The accumulator discards const grads for BWD_I; gating the
+                # scaling on phase removes that dead device launch.
+                if mb_loss_scales is not None and g_consts is not None and phase is not Phase.BWD_I:
+                    g_consts = _scale_terminal_grads(tuple(g_consts), scale)
+                g_invars = _scale_terminal_grads(g_invars, scale)
                 if focused_terminal_bwd:
                     _focused_terminal_bwd_debug("run-bwd-after-scale", g_invar_count=len(g_invars))
             else:
@@ -7328,6 +7626,7 @@ def _dispatch_schedule_fused_async(
                             invar_count=len(invars),
                             cotangent_count=len(cotangents),
                         )
+                    _throttle_grad_unit_runahead(rank)
                     g_consts, g_invars = _stage_call(
                         rank,
                         task_name,
@@ -7347,6 +7646,7 @@ def _dispatch_schedule_fused_async(
                             invar_count=len(invars),
                             cotangent_count=len(cotangents),
                         )
+                    _throttle_grad_unit_runahead(rank)
                     g_consts, g_invars = _stage_call(
                         rank,
                         task_name,
@@ -7495,6 +7795,7 @@ def _dispatch_schedule_fused_async(
             n_invars,
         )
         with rank_submeshes[rank]:
+            _throttle_grad_unit_runahead(rank)
             fwd_out, g_consts, g_invars = _stage_call(
                 rank,
                 f"stage{logical}_fused_fwd_mb{fwd_mb}_bwd_mb{bwd_mb}",
@@ -8299,18 +8600,8 @@ def _dispatch_schedule_fused_async(
             }
             raise RuntimeError(f"schedule executor dependency cycle or missing dependency: {blocked}")
 
-    def _warm_compile_schedule(units: list[_ScheduleUnit]) -> None:
-        """Compile stage-local scheduled executables before first real dispatch.
-
-        The scheduled runtime used to discover most XLA executables lazily while
-        executing the first pipeline step. On large multi-controller meshes that
-        makes the first few microbatches look stuck because each stage/rank pays
-        its compile cost on the critical path. This warmup lowers stage programs
-        with abstract values carrying the exact stage-local shardings, submits
-        the expensive ``compile()`` calls in parallel, and waits before the
-        scheduler starts launching real data. It never executes pair-mesh
-        collectives or synthesizes payload data.
-        """
+    def _warm_compile_signature(units: list[_ScheduleUnit]) -> str:
+        """Build the plan/shape signature identifying one warm-compiled schedule."""
 
         def unit_key(unit: _ScheduleUnit) -> tuple[object, ...]:
             return (
@@ -8333,7 +8624,7 @@ def _dispatch_schedule_fused_async(
             for stage_key, cluster_jaxpr in sorted(plan["cluster_jaxprs_per_loc"].items())
         )
         schedule_obj = plan["schedule"]
-        signature = repr(
+        return repr(
             (
                 int(n_logical),
                 len(rank_submeshes),
@@ -8348,9 +8639,47 @@ def _dispatch_schedule_fused_async(
                 _shape_dtype_signature_key(tuple(flat_args_live)),
             )
         )
-        warm_keys = plan.setdefault("_warm_compile_signatures", set())
-        if signature in warm_keys:
+
+    def _warm_compile_schedule(units: list[_ScheduleUnit]) -> None:
+        """Warm-compile scheduled stage executables outside the persistent cache.
+
+        The already-warmed check runs FIRST, before any global state is
+        touched: :func:`_stage_persistent_cache_bypass` acquires a global
+        lock, flips ``jax_enable_compilation_cache`` /
+        ``jax_compilation_cache_dir``, resets JAX's private cache state and
+        creates a tempdir — doing that on every dispatch would make
+        concurrent compiles elsewhere in the process (e.g. eSurge rollout
+        compiles during RL) silently lose persistent caching. Steady-state
+        dispatch must not touch process-global JAX config at all.
+
+        The ``lowered.compile()`` calls below run on worker threads; the
+        bypass scope keeps them (and everything else in the phase) away from
+        JAX's persistent disk cache — deserialized stage executables halt TPU
+        cores on first execution (see :func:`_stage_persistent_cache_bypass`).
+        """
+        signature = _warm_compile_signature(units)
+        if signature in plan.setdefault("_warm_compile_signatures", set()):
             return
+        with _stage_persistent_cache_bypass():
+            _warm_compile_schedule_impl(units, signature)
+
+    def _warm_compile_schedule_impl(units: list[_ScheduleUnit], signature: str) -> None:
+        """Compile stage-local scheduled executables before first real dispatch.
+
+        The scheduled runtime used to discover most XLA executables lazily while
+        executing the first pipeline step. On large multi-controller meshes that
+        makes the first few microbatches look stuck because each stage/rank pays
+        its compile cost on the critical path. This warmup lowers stage programs
+        with abstract values carrying the exact stage-local shardings, submits
+        the expensive ``compile()`` calls in parallel, and waits before the
+        scheduler starts launching real data. It never executes pair-mesh
+        collectives or synthesizes payload data.
+
+        The caller (:func:`_warm_compile_schedule`) has already checked
+        ``signature`` against ``plan["_warm_compile_signatures"]``; this body
+        only records it on success.
+        """
+        warm_keys = plan.setdefault("_warm_compile_signatures", set())
         try:
             process_index = jax.process_index()
         except Exception:
@@ -9093,9 +9422,12 @@ def _dispatch_schedule_fused_async(
         terminal_backward_mode=terminal_backward_mode,
         eager_terminal_bwd=eager_terminal_bwd,
     )
-    preflight_stats = _schedule_preflight_stats(units, deps)
-    plan["last_schedule_preflight_stats"] = preflight_stats
-    if _SCHEDULE_TRANSPORT_DIAGNOSTICS.get("preflight_logged", 0) < 8:
+    preflight_stats = plan.get("last_schedule_preflight_stats")
+    preflight_is_fresh = preflight_stats is None
+    if preflight_is_fresh:
+        preflight_stats = _schedule_preflight_stats(units, deps)
+        plan["last_schedule_preflight_stats"] = preflight_stats
+    if preflight_is_fresh and _SCHEDULE_TRANSPORT_DIAGNOSTICS.get("preflight_logged", 0) < 8:
         try:
             process_index = jax.process_index()
         except Exception:
@@ -9182,7 +9514,10 @@ def _dispatch_schedule_fused_async(
             grad = g_consts[local_idx]
             _accumulate_flat_grad_claimed(flat_idx, grad)
     for loc, g_consts in terminal_const_tuple_accums.items():
-        scaled_consts = _scale_grad_tree(g_consts, terminal_const_scale)
+        # With per-microbatch loss weighting the terminal const grads were
+        # already scaled by each microbatch's w_mb / sum(w) before
+        # accumulation; the uniform path defers the single 1/M scale here.
+        scaled_consts = g_consts if mb_loss_scales is not None else _scale_grad_tree(g_consts, terminal_const_scale)
         for local_idx, const_idx in enumerate(const_indices_per_loc[loc]):
             flat_idx = const_idx_to_flat_idx.get(const_idx)
             if flat_idx is None:
@@ -9229,11 +9564,15 @@ def _dispatch_schedule_fused_async(
     phase_timings_ms["final_grad_pack_ms"] = (time.perf_counter_ns() - phase_start_ns) / 1e6
 
     phase_start_ns = time.perf_counter_ns()
-    if loss_terms:
-        loss_acc = loss_terms[0]
-        for loss_term in loss_terms[1:]:
-            loss_acc = loss_acc + loss_term
-    mean_loss = loss_acc / jnp.asarray(m, dtype=loss_acc.dtype)
+    mean_loss = _weighted_terms_sum(loss_terms, mb_loss_scales, m)
+    if mean_loss is None:
+        mean_loss = jnp.asarray(0.0)
+    aux_out: tuple[object, ...] | None = None
+    if terminal_n_aux:
+        aux_out = tuple(
+            _weighted_terms_sum([(mb, aux[pos]) for mb, aux in aux_terms], mb_loss_scales, m)
+            for pos in range(terminal_n_aux)
+        )
     phase_timings_ms["loss_reduce_ms"] = (time.perf_counter_ns() - phase_start_ns) / 1e6
     schedule_stats = stats_collector.as_dict(deps, units)
     schedule_stats["schedule_dispatcher"] = schedule_dispatcher
@@ -9287,7 +9626,7 @@ def _dispatch_schedule_fused_async(
     try:
         _progress("drain-enter")
         phase_start_ns = time.perf_counter_ns()
-        jax.block_until_ready((mean_loss, tuple(final_grads)))
+        jax.block_until_ready((mean_loss, tuple(final_grads), aux_out if aux_out is not None else ()))
         phase_timings_ms["drain_ms"] = (time.perf_counter_ns() - phase_start_ns) / 1e6
         schedule_stats["phase_ms"] = {key: round(value, 3) for key, value in phase_timings_ms.items()}
         schedule_stats["dispatch_wall_ms"] = round((time.perf_counter_ns() - dispatch_wall_start_ns) / 1e6, 3)
@@ -9314,7 +9653,7 @@ def _dispatch_schedule_fused_async(
         _progress("drain-fail", error=repr(exc))
         raise RuntimeError("SpectraX MPMD schedule dispatch failed while draining all controllers.") from exc
     _progress("dispatch-return")
-    return (mean_loss if return_loss else None), tuple(final_grads)
+    return (mean_loss if return_loss else None), tuple(final_grads), aux_out
 
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(0,))
@@ -9333,9 +9672,14 @@ def _schedule_forward(plan: dict[str, object], *args: object) -> jax.Array:
         *args: Flattened user arguments.
 
     Returns:
-        The forward-pass scalar loss as a :class:`jax.Array`.
+        The forward-pass scalar loss as a :class:`jax.Array` — or, when
+        the traced function returns auxiliary outputs, the flat tuple
+        ``(loss, *aux)`` (aux entries are treated as non-differentiable).
     """
-    loss, _ = _dispatch_gpipe_fwd(plan, args)
+    loss, saved = _dispatch_gpipe_fwd(plan, args)
+    aux_flat = saved.get("aux_flat")
+    if aux_flat is not None:
+        return (loss, *aux_flat)
     return loss
 
 
@@ -9357,12 +9701,14 @@ def _schedule_forward_fwd(plan: dict[str, object], *args: object) -> tuple[jax.A
         ``(loss, saved)`` — the forward output plus the residuals
         consumed by the backward rule.
     """
-    loss, flat_grads = _dispatch_schedule_faithful(plan, args, return_loss=True)
+    loss, flat_grads, aux_flat = _dispatch_schedule_faithful(plan, args, return_loss=True)
     leaf_ranges = _arg_leaf_ranges(args)
     packed_grads = tuple(
         jax.tree.unflatten(jax.tree.structure(arg), list(flat_grads[start:end]))
         for arg, (start, end) in zip(args, leaf_ranges, strict=True)
     )
+    if aux_flat is not None:
+        return (cast(jax.Array, loss), *aux_flat), packed_grads
     return cast(jax.Array, loss), packed_grads
 
 
@@ -9372,13 +9718,17 @@ def _schedule_forward_bwd(plan: dict[str, object], saved: tuple[object, ...], g:
     Args:
         plan: Dispatch plan (non-differentiable).
         saved: Packed per-argument gradients from :func:`_schedule_forward_fwd`.
-        g: Cotangent of the scalar loss output (typically ``1.0``).
+        g: Cotangent of the loss output (typically ``1.0``); when the
+            traced function returns auxiliary outputs, ``g`` matches the
+            ``(loss, *aux)`` structure and only the loss cotangent is
+            honored (aux outputs are non-differentiable).
 
     Returns:
         Tuple of cotangents aligned with the differentiable
         positional arguments of :func:`_schedule_forward`.
     """
-    del plan
+    if int(plan.get("terminal_n_aux", 0)) and isinstance(g, tuple):
+        g = g[0]
     cotangent = jnp.asarray(1.0, dtype=jnp.float32) if g is None else g
     return jax.tree.map(lambda grad: _scale_grad(grad, cotangent), saved, is_leaf=_is_leaf)
 
@@ -9416,7 +9766,7 @@ def sxgrad(fn: Callable, argnums: int | tuple[int, ...] = 0) -> Callable:
         """
         validated_argnums = _normalize_argnums(argnums, len(args))
         plan = _ensure_schedule_plan(fn, args, grad_argnums=validated_argnums)
-        _loss, grads_flat = _dispatch_schedule_faithful(plan, args, return_loss=False)
+        _loss, grads_flat, _aux = _dispatch_schedule_faithful(plan, args, return_loss=False)
         leaf_ranges = _arg_leaf_ranges(args)
         result = []
         for argnum in validated_argnums:
@@ -9432,16 +9782,39 @@ def sxgrad(fn: Callable, argnums: int | tuple[int, ...] = 0) -> Callable:
     return grad_fn
 
 
-def sxvalue_and_grad(fn: Callable, argnums: int | tuple[int, ...] = 0) -> Callable:
+def sxvalue_and_grad(
+    fn: Callable,
+    argnums: int | tuple[int, ...] = 0,
+    *,
+    has_aux: bool = False,
+    microbatch_weight_fn: Callable[..., object] | None = None,
+) -> Callable:
     """Schedule-faithful ``value_and_grad`` of a schedule-driven ``sxjit`` function.
 
     Args:
         fn: A function decorated with ``@sxjit(..., schedule=...)``.
         argnums: Positional argument indices to differentiate w.r.t.
+        has_aux: When ``True``, ``fn`` must return ``(loss, aux)`` where
+            ``aux`` is a pytree of auxiliary (non-differentiated) outputs
+            computed in the terminal stage. The returned callable then
+            yields ``((loss, aux), grads_tuple)`` — jax's
+            ``value_and_grad(has_aux=True)`` convention. Aux values are
+            reduced across microbatches with the same per-microbatch
+            scales as the loss.
+        microbatch_weight_fn: Optional callable with ``fn``'s positional
+            signature, evaluated eagerly per microbatch (on the sliced
+            batch arguments) and returning that microbatch's scalar loss
+            weight ``w_mb`` (e.g. its valid-token count). When provided,
+            the scheduled loss and gradients become the weighted global
+            mean ``sum(w_mb * loss_mb) / sum(w)`` instead of the uniform
+            microbatch mean — reproducing a single-program token-weighted
+            estimator when microbatches carry different numbers of valid
+            tokens.
 
     Returns:
         A callable with the same signature as ``fn`` that returns
-        ``(loss, grads_tuple)``.
+        ``(loss, grads_tuple)`` — or ``((loss, aux), grads_tuple)`` with
+        ``has_aux=True``.
     """
     if not hasattr(fn, "_mpmd_state") or not fn._mpmd_state.get("schedule_requested", False):
         raise TypeError("sxvalue_and_grad requires an sxjit-decorated function with a schedule.")
@@ -9451,7 +9824,7 @@ def sxvalue_and_grad(fn: Callable, argnums: int | tuple[int, ...] = 0) -> Callab
     else:
         argnums = tuple(argnums)
 
-    def vg_fn(*args: object) -> tuple[jax.Array, tuple[object, ...]]:
+    def vg_fn(*args: object) -> tuple[object, tuple[object, ...]]:
         """Run the schedule for both loss and grads, returning ``(loss, grad_tuple)``.
 
         Args:
@@ -9462,7 +9835,24 @@ def sxvalue_and_grad(fn: Callable, argnums: int | tuple[int, ...] = 0) -> Callab
         """
         validated_argnums = _normalize_argnums(argnums, len(args))
         plan = _ensure_schedule_plan(fn, args, grad_argnums=validated_argnums)
-        loss, grads_flat = _dispatch_schedule_faithful(plan, args, return_loss=True)
+        terminal_n_aux = int(plan.get("terminal_n_aux", 0))
+        if has_aux and terminal_n_aux == 0:
+            raise ValueError("sxvalue_and_grad(has_aux=True) requires the scheduled function to return (loss, aux).")
+        if not has_aux and terminal_n_aux > 0:
+            raise ValueError(
+                "The scheduled function returns auxiliary outputs; call "
+                "sxvalue_and_grad(..., has_aux=True) to receive them."
+            )
+        # Carried via a ContextVar, NOT by mutating the shared cached plan:
+        # the plan is one object per traced fn, so a plan-dict set/finally-pop
+        # races when two dispatches overlap (one call's cleanup would strip
+        # the other's weight fn mid-flight, silently reverting it to uniform
+        # 1/M weighting). ContextVars give per-context isolation for free.
+        _wf_token = _MICROBATCH_WEIGHT_FN_VAR.set(microbatch_weight_fn)
+        try:
+            loss, grads_flat, aux_flat = _dispatch_schedule_faithful(plan, args, return_loss=True)
+        finally:
+            _MICROBATCH_WEIGHT_FN_VAR.reset(_wf_token)
         leaf_ranges = _arg_leaf_ranges(args)
         result = []
         for argnum in validated_argnums:
@@ -9473,6 +9863,9 @@ def sxvalue_and_grad(fn: Callable, argnums: int | tuple[int, ...] = 0) -> Callab
             else:
                 arg_grad = jax.tree.unflatten(jax.tree.structure(args[argnum]), list(arg_leaves))
                 result.append(arg_grad)
+        if has_aux:
+            fn_out = jax.tree.unflatten(plan["fn_out_treedef"], [loss, *(aux_flat or ())])
+            return fn_out, tuple(result)
         return cast(jax.Array, loss), tuple(result)
 
     return vg_fn
@@ -10229,6 +10622,8 @@ def sxjit(
                 plan = _state["schedule_plan"]
                 result = _schedule_forward(plan, *args)
                 _previous_schedule_result["value"] = result
+                if int(plan.get("terminal_n_aux", 0)) and isinstance(result, tuple):
+                    return jax.tree.unflatten(plan["fn_out_treedef"], list(result))
                 return result
 
             if "pscan_plan" in _state:

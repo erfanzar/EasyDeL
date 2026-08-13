@@ -107,6 +107,7 @@ class QuantizationType(enum.StrEnum):
     NF4 = "nf4"
     AFFINE = "affine"
     INT8 = "int8"
+    CHANNELWISE = "channelwise"
     TERNARY = "ternary"
     BINARY = "binary"
     TURBOQUANT = "turboquant"
@@ -192,6 +193,7 @@ class QuantizationConfig:
     runtime_dtype: QuantizationType | str | None = None
     group_size: int | None = None
     bits: int | None = None
+    activation_bits: int | None = None
     simulate: bool = False
     jax_native: bool = False
 
@@ -238,6 +240,7 @@ class QuantizationConfig:
             ),
             "group_size": self.group_size,
             "bits": self.bits,
+            "activation_bits": self.activation_bits,
             "simulate": self.simulate,
             "jax_native": self.jax_native,
             "pattern": self.pattern,
@@ -300,6 +303,17 @@ def resolve_ejkernel_quant_params(config: QuantizationConfig) -> tuple[str, int,
     dtype = config.dtype
     if isinstance(dtype, str):
         dtype = QuantizationType(dtype)
+
+    if dtype == QuantizationType.CHANNELWISE:
+        # Per-output-channel symmetric integer codes: one scale per output
+        # channel over the FULL contraction axis, no zero-points. This is
+        # the storage format the fused-MLP/channelwise TPU kernels consume
+        # directly (W8A16/W8A8/W4A16/W4A4 execution). group_size is reported
+        # as 0 (sentinel: full-K; the layer records the concrete extent).
+        bits = 8 if config.bits is None else int(config.bits)
+        if bits not in {4, 8}:
+            raise ValueError(f"channelwise quantization supports bits in {{4, 8}}, got {bits}.")
+        return "channelwise", 0, bits, False
 
     if dtype in {QuantizationType.AFFINE, QuantizationType.INT8}:
         # Map INT8 to ejkernel affine quantization (8-bit by default).

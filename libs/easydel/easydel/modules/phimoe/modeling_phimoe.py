@@ -673,14 +673,31 @@ class PhiMoeModel(EasyDeLBaseModule):
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
+        trace_layers = self._layer_scan_trace(
+            False,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache,
+        )
+        cache_views = views if trace_layers else None
+        # Hoisted out of the loop body: the caching property must not be
+        # first materialized inside the lax.scan trace (tracer leak).
+        frequencies = self.frequencies
+
         def _layer_loop(block, carry):
             """Apply a single decoder layer inside the layer-stack scan.
 
-            Body of ``self.layers.scan``; runs ``block`` on the current
-            hidden states, optionally accumulates per-layer hidden states
-            / attention weights, and returns the updated carry tuple.
+            Body of ``self.layers.scan``; carry layout is ``(hidden_states,
+            cache_views, all_hidden_states, all_attentions, idx)``. Runs
+            ``block`` on the current hidden states, optionally accumulates
+            per-layer hidden states / attention weights, and returns the
+            updated carry tuple.
             """
-            hidden_states, all_hidden_states, all_attentions, idx = carry
+            hidden_states, cv, all_hidden_states, all_attentions, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -690,25 +707,31 @@ class PhiMoeModel(EasyDeLBaseModule):
                     mask_info=mask_info,
                     position_ids=position_ids,
                     mode=mode,
-                    cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
+                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
                     cache_metadata=cache_metadata,
                     output_attentions=output_attentions,
                     output_router_logits=bool(output_router_logits),
-                    frequencies=self.frequencies,
+                    frequencies=frequencies,
                 )
             hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
 
-            self._layer_cache_view_update(None, idx, layer_outputs.cache_view, enabled=True, cache=past_key_values)
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                layer_outputs.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
 
-            return hidden_states, all_hidden_states, all_attentions, idx + 1
+            return hidden_states, cv, all_hidden_states, all_attentions, idx + 1
 
-        hidden_states, all_hidden_states, all_attentions, _ = self.layers.scan(
+        hidden_states, _, all_hidden_states, all_attentions, _ = self.layers.scan(
             _layer_loop,
-            (hidden_states, all_hidden_states, all_attentions, 0),
-            trace=True,
+            (hidden_states, cache_views, all_hidden_states, all_attentions, 0),
+            trace=trace_layers,
         )
         hidden_states = self.norm(hidden_states)
         hidden_states = checkpoint_name(hidden_states, "model_output")

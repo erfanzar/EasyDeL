@@ -110,6 +110,34 @@ def test_mpmd_compile_prepares_fused_split_and_sampler_buckets():
     assert sampler_calls == [1, 2, 4, 8]
 
 
+def test_backbone_trace_mode_is_determined_by_the_cache_key():
+    """Callers compiling the same backbone bucket must agree on the layout.
+
+    ``_backbone_cache_key`` omits ``padded_num_reqs`` on purpose — that is
+    what keeps the compile cache linear in the bucket count — so whatever
+    selects the traced decode/prefill layout has to be recoverable from the
+    key. ``CompileOrchestrator`` asks with ``padded_num_reqs = num_tokens``
+    under the PP runtime and ``max_num_reqs`` otherwise, while ``compile()``
+    forwards the live request bucket. Deriving the mode from the caller's
+    value instead lets whichever compiles first pin a layout the other
+    silently reuses.
+    """
+    from easydel.inference.esurge.runners.executors.model_executor import ModelStepExecutor
+
+    executor = ModelStepExecutor.__new__(ModelStepExecutor)
+    executor.max_num_reqs = 8
+
+    # PP runtime: the request bucket IS the token bucket, so always decode.
+    assert executor._backbone_decode_only(4, use_pipeline_runtime=True)
+    assert executor._backbone_decode_only(16, use_pipeline_runtime=True)
+
+    # Direct dispatch serves mixed prefill windows at the conservative
+    # max_num_reqs bucket, so only the matching token bucket is pure decode.
+    assert not executor._backbone_decode_only(4, use_pipeline_runtime=False)
+    assert not executor._backbone_decode_only(16, use_pipeline_runtime=False)
+    assert executor._backbone_decode_only(8, use_pipeline_runtime=False)
+
+
 def test_fused_pp_runtime_logits_bucket_respects_model_min_input_pad():
     manager = ExecutionManager.__new__(ExecutionManager)
     manager.min_input_pad = 4

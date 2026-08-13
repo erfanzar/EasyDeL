@@ -105,6 +105,7 @@ from easydel.layers import (
     compute_basic_inv_frequencies,
     compute_yarn_inv_frequencies,
     dense_gate_up_layout,
+    gated_mlp_forward,
     split_fused_gate_up_projection,
 )
 from easydel.modules._base import BaseCausalLMModule
@@ -2197,6 +2198,14 @@ class DeepseekV4MLP(spx.Module):
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.moe_intermediate_size
         self.limit = config.swiglu_limit
+        # ejkernel's ``clamped_swiglu`` combine hard-codes silu, so declaring it
+        # for a non-silu ``hidden_act`` would silently compute silu here while
+        # the experts (which clamp around ``ACT2FN[hidden_act]``) keep the
+        # configured activation. Declare only when the two agree; every other
+        # activation keeps the explicit composition in ``forward``.
+        if str(config.hidden_act).lower() in ("silu", "swish"):
+            self.fused_act_name = "clamped_swiglu"
+            self.fused_act_params = (float(config.swiglu_limit),)
         self.gate_up_proj = ColumnParallelLinear(
             self.hidden_size,
             (self.intermediate_size, self.intermediate_size),
@@ -2226,7 +2235,13 @@ class DeepseekV4MLP(spx.Module):
         return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
 
     def forward(self, hidden_states: Float[Array, "batch seq hidden"]) -> Float[Array, "batch seq hidden"]:
-        """Apply the clamped SwiGLU feed-forward.
+        """Clamped-SwiGLU MLP.
+
+        With a silu ``hidden_act`` this delegates to
+        :func:`easydel.layers.gated_mlp_forward`, whose declared
+        ``clamped_swiglu`` combine runs on both the fused and fallback paths.
+        Any other activation keeps the explicit composition, which clamps
+        around ``ACT2FN[hidden_act]`` exactly like the routed experts do.
 
         Args:
             hidden_states: Input ``[B, S, D_model]``.
@@ -2234,6 +2249,8 @@ class DeepseekV4MLP(spx.Module):
         Returns:
             Output ``[B, S, D_model]``.
         """
+        if getattr(self, "fused_act_name", None) is not None:
+            return gated_mlp_forward(self, hidden_states)
         gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
         gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
         gate = jnp.clip(gate, max=self.limit)
@@ -2627,9 +2644,9 @@ class DeepseekV4SparseMoeBlock(BaseMoeModule):
             hidden_state=hidden_states,
             gate_layer=gate_layer,
             expert_layer=self.experts,
-            wi_kernel=self.experts.gate_proj.weight.value,
-            wu_kernel=self.experts.up_proj.weight.value,
-            wd_kernel=self.experts.down_proj.weight.value,
+            wi_kernel=self.experts.gate_proj.kernel_view(),
+            wu_kernel=self.experts.up_proj.kernel_view(),
+            wd_kernel=self.experts.down_proj.kernel_view(),
             act_fn=self.experts.act_fn,
             ffn_activation=ffn_activation,
             hooks=hooks,

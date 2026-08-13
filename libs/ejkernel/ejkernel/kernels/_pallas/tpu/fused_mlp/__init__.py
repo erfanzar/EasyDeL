@@ -14,6 +14,7 @@
 
 """Pallas TPU fused MLP (packed W4A4 decode kernel)."""
 
+from ._bf16 import fused_mlp_bf16_pallas
 from ._interface import fused_mlp_w4a4_pallas
 
-__all__ = ["fused_mlp_w4a4_pallas"]
+__all__ = ["fused_mlp_bf16_pallas", "fused_mlp_w4a4_pallas"]

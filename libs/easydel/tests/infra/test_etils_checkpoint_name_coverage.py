@@ -20,10 +20,20 @@ from easydel.infra.etils import GRADIENT_CHECKPOINT_TARGETS
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODULES_ROOT = REPO_ROOT / "easydel" / "modules"
 WRAPPER_MODELS_WITHOUT_LOCAL_CHECKPOINTS = {
+    "easydel/modules/dflash/modeling_dflash.py",
+    "easydel/modules/dspark/modeling_dspark.py",
+    "easydel/modules/eagle3/modeling_eagle3.py",
     "easydel/modules/glm46v/modeling_glm46v.py",
     "easydel/modules/glm4v_moe/modeling_glm4v_moe.py",
     "easydel/modules/qwen3_5_moe/modeling_qwen3_5_moe.py",
 }
+
+#: Shared layer helpers that emit ``checkpoint_name`` labels on the caller's
+#: behalf. A model file that routes its forward through one of these still
+#: participates in name-based remat policies even though the literal call does
+#: not appear in the model file — see :func:`easydel.layers.gated_mlp_forward`,
+#: which tags ``mlp_gate_up`` / ``mlp_gate`` / ``mlp_down`` / ``mlp_output``.
+LABEL_EMITTING_HELPERS = ("gated_mlp_forward",)
 
 
 def _collect_checkpoint_names(path: Path) -> set[str]:
@@ -68,10 +78,22 @@ def test_all_checkpoint_name_labels_are_registered():
 
 
 def test_only_wrapper_model_files_skip_checkpoint_names():
-    files_without_checkpoint_names = {
-        str(path.relative_to(REPO_ROOT))
-        for path in MODULES_ROOT.rglob("modeling_*.py")
-        if "checkpoint_name(" not in path.read_text()
-    }
+    """Every model family must be reachable by name-based remat policies.
+
+    A family satisfies this either by tagging its own activations with
+    ``checkpoint_name`` or by routing its forward through a shared helper that
+    tags them (:data:`LABEL_EMITTING_HELPERS`). Only true wrappers — families
+    that define no local blocks and reuse another family's modules — are
+    allowed to do neither; those are enumerated explicitly so a new family
+    cannot silently lose ``EasyDeLGradientCheckPointers`` coverage.
+    """
+    files_without_checkpoint_names = set()
+    for path in MODULES_ROOT.rglob("modeling_*.py"):
+        source = path.read_text()
+        if "checkpoint_name(" in source:
+            continue
+        if any(helper in source for helper in LABEL_EMITTING_HELPERS):
+            continue
+        files_without_checkpoint_names.add(str(path.relative_to(REPO_ROOT)))
 
     assert files_without_checkpoint_names == WRAPPER_MODELS_WITHOUT_LOCAL_CHECKPOINTS

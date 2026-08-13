@@ -48,12 +48,27 @@ if tp.TYPE_CHECKING:
     from ._scheme import ResolvedScheme
 
 
+#: Parameter names a quantized linear actually registers, and therefore the
+#: only legal split targets. Mirrors the tuple
+#: :func:`~easydel.layers.linears._linear_quantized._quantized_linear_layout_spec`
+#: iterates and the parameters ``ParallelLinearQuantized.__init__`` assigns
+#: (``quant_kernel_packed`` is derived from ``quant_kernel``, never loaded).
+#: Not imported from there: this module is on the checkpoint side of the seam
+#: and must not pull the layer stack in at import time.
+LOADABLE_PARAM_NAMES: frozenset[str] = frozenset({"quant_kernel", "quant_scales", "quant_biases"})
+
+
 def canonical_param_names(target: QuantSpec, source: SourceFormat) -> tuple[str, ...]:
     """List the EasyDeL parameter names a quantized weight expands into.
 
     Determined statically from the scheme — split rules must be declared
     before any tensor is seen — and kept in sync with
     :meth:`~._canonical.CanonicalQuantizedWeight.arrays`.
+
+    Names outside :data:`LOADABLE_PARAM_NAMES` describe values the canonical
+    weight legitimately carries but no layer can hold yet;
+    :func:`checkpoint_quant_reform_param` refuses to build a rule for them
+    rather than emitting a split that writes nowhere.
 
     Args:
         target: The runtime quantization target.
@@ -175,8 +190,7 @@ class ExtractField:
         arrays = weight.arrays()
         if self.name not in arrays:
             raise KeyError(
-                f"Adapter produced no {self.name!r}, but the reform rule declared it. "
-                f"Available: {sorted(arrays)}."
+                f"Adapter produced no {self.name!r}, but the reform rule declared it. Available: {sorted(arrays)}."
             )
         return arrays[self.name]
 
@@ -291,6 +305,8 @@ def checkpoint_quant_reform_param(
     Raises:
         ValueError: If the adapter declares no source suffixes, declares
             duplicates, or declares a source that collides with the rule key.
+        NotImplementedError: If the scheme expands into a parameter no
+            quantized layer registers (see :data:`LOADABLE_PARAM_NAMES`).
     """
     suffixes = scheme.source_suffixes
     if not suffixes:
@@ -300,6 +316,32 @@ def checkpoint_quant_reform_param(
 
     src_prefix = target_prefix if source_prefix is None else source_prefix
     param_names = canonical_param_names(scheme.target, scheme.source)
+
+    # Every split must name a parameter the layer actually registers. The
+    # canonical weight can carry two values that no layer holds yet:
+    #
+    #   * ``output_scale`` — NVFP4's per-tensor global scale. It cannot simply
+    #     be folded into the dense weight before repacking: ejkernel's nvfp4
+    #     mode stores per-group scales as E4M3 codes, and the global factor is
+    #     what keeps those scales inside E4M3's normal range. Folding pushes
+    #     them into subnormals and destroys the weight.
+    #   * ``activation_scale`` — the calibrated per-tensor scale a static
+    #     activation policy needs. The layer quantizes activations
+    #     dynamically from ``config.activation_bits`` and has no slot for a
+    #     checkpoint-supplied scale.
+    #
+    # Emitting a split for either writes to a parameter that does not exist,
+    # so refuse here where the checkpoint and the missing surface are both
+    # still nameable.
+    unsupported = tuple(name for name in param_names if name not in LOADABLE_PARAM_NAMES)
+    if unsupported:
+        raise NotImplementedError(
+            f"{scheme.source.quant_method!r} checkpoints at {scheme.path!r} expand into {unsupported}, which "
+            f"ParallelLinearQuantized does not register (it holds {sorted(LOADABLE_PARAM_NAMES)}). Loading one "
+            f"needs the layer to gain the parameter and apply it in forward; until then the split would write "
+            f"to nothing."
+        )
+
     rule_key = _join(target_prefix, param_names[0])
     sources = tuple(_join(src_prefix, suffix) for suffix in suffixes)
 

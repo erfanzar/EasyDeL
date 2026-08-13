@@ -12,12 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import jax.numpy as jnp
-from spectrax import PartitionAxis
-
 import easydel.caching.ragged_page.cache as ragged_cache_mod
 import easydel.caching.unified_attention.cache as unified_cache_mod
+import jax.numpy as jnp
 from easydel.infra.sharding import coerce_runtime_sharding_resolver
+from spectrax import PartitionAxis
 
 
 class _FakeMesh:
@@ -35,6 +34,24 @@ def _mesh_dp_tp():
 
 def _partition_manager():
     return coerce_runtime_sharding_resolver(PartitionAxis(kv_head_axis="tp", data_parallel_axis="dp"))
+
+
+def _h64_reference_kv_storage_dims(cfg):
+    """Storage dims the ``head_dim==64`` v3 kernel allocates for itself.
+
+    Independent reference: the Pallas kernel's own ``get_kv_cache_shape``, so
+    a drift between EasyDeL's cache config and the kernel it feeds fails here
+    rather than as a shape rejection on device.
+    """
+    from ejkernel.kernels._pallas.tpu.ragged_page_attention_v3._pallas_impl_fwd_h64 import get_kv_cache_shape
+
+    return get_kv_cache_shape(
+        cfg.num_pages,
+        cfg.page_size,
+        cfg.num_kv_heads,
+        cfg.k_headdim,
+        cfg.kvdtype,
+    )[2:]
 
 
 def test_ragged_page_budget_scales_with_mesh_dp_axis(monkeypatch):
@@ -128,6 +145,17 @@ def test_ragged_page_budget_replicates_when_tp_would_split_kv_pairs(monkeypatch)
 
 
 def test_ragged_v3_storage_keeps_combined_kv_heads_for_small_head_dim(monkeypatch):
+    """At ``head_dim == 64`` the K/V pair rides the head-DIM axis, not the head axis.
+
+    ejkernel dispatches ``ragged_page_attention_v3`` on the query head dim, and
+    64 routes to ``_pallas_impl_fwd_h64``, whose page layout concatenates keys
+    and values into a 128-wide last axis. The head axis therefore carries
+    ``num_kv_heads`` and must NOT also be doubled — applying the factor of two
+    on both axes allocates twice the KV bytes and the kernel rejects the shape
+    (see :func:`kv_pair_shares_head_dim_axis`). Every other head dim keeps the
+    ``num_kv_heads * 2`` head axis asserted by
+    ``test_ragged_page_budget_replicates_when_tp_would_split_kv_pairs``.
+    """
     monkeypatch.setattr(
         ragged_cache_mod,
         "per_device_hbm_budget_bytes",
@@ -149,8 +177,12 @@ def test_ragged_v3_storage_keeps_combined_kv_heads_for_small_head_dim(monkeypatc
 
     shape, _axes = cfg.get_shape_and_axes()
 
-    assert shape[2] * shape[3] >= cfg.num_kv_heads * 2
-    assert shape[4] >= cfg.k_headdim
+    assert ragged_cache_mod.kv_pair_shares_head_dim_axis(cfg.k_headdim)
+    # Head axis carries the heads once; the pair lives in the head-dim axis.
+    assert shape[2] * shape[3] == cfg.num_kv_heads
+    assert shape[4] >= cfg.k_headdim * 2
+    # The layout must still match what the h64 kernel allocates for itself.
+    assert (shape[2], shape[3], shape[4]) == _h64_reference_kv_storage_dims(cfg)
 
 
 def test_unified_page_budget_scales_with_mesh_dp_axis(monkeypatch):

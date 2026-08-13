@@ -1000,6 +1000,16 @@ class FalconMambaModel(EasyDeLBaseModule):
         segment_ids = packed_segment_ids_from_mask_info(mask_info, inputs_embeds.shape[1])
         hidden_states = inputs_embeds
 
+        # Live recurrent-cache views are read/written by python index — any
+        # allocated cache forces the trace path; the fresh ``init_empty``
+        # placeholder (all-``None`` views) can ride the lax.scan path.
+        views = cache_params.views if cache_params is not None else None
+        trace_layers = self._layer_scan_trace(
+            False,
+            output_hidden_states=output_hidden_states,
+            cache_views=views,
+        )
+
         def _layer_loop(block, carry):
             """Per-layer step body for :meth:`nn.ModuleList.scan`.
 
@@ -1007,20 +1017,21 @@ class FalconMambaModel(EasyDeLBaseModule):
             FalconMamba :class:`FalconMambaBlock` (RMSNorm + Mamba mixer with
             residual). Optionally records the pre-layer hidden state and
             propagates the recurrent SSM cache view in-place on
-            ``cache_params``.
+            ``cache_params`` on the trace path.
             """
             hidden_states, all_hidden_states, idx = carry
             with self._layer_stage_context(idx, layers=self.layers):
                 hidden_states, cache_view = block(
                     hidden_states=hidden_states,
-                    cache_params=cache_params.views[idx],
+                    cache_params=cache_params.views[idx] if trace_layers else None,
                     cache_position=cache_position,
                     attention_mask=attention_mask,
                     cache_metadata=cache_metadata,
                     segment_ids=segment_ids,
                 )
             hidden_states = self._mark_layer_stage_boundary(hidden_states, idx, layers=self.layers)
-            cache_params[idx] = cache_view
+            if trace_layers:
+                cache_params[idx] = cache_view
             if output_hidden_states:
                 assert all_hidden_states is not None
                 all_hidden_states = (*all_hidden_states, hidden_states)
@@ -1030,7 +1041,7 @@ class FalconMambaModel(EasyDeLBaseModule):
         hidden_states, all_hidden_states, _ = self.layers.scan(
             _layer_loop,
             (hidden_states, all_hidden_states, 0),
-            trace=True,
+            trace=trace_layers,
         )
         hidden_states = self.norm_f(hidden_states)
         if output_hidden_states:

@@ -563,8 +563,8 @@ class ArcticMoeBlock(BaseMoeModule):
                 hidden_state=hidden_states,
                 gate_layer=self.gate,
                 expert_layer=self.experts,
-                gate_up_kernel=self.experts.gate_up_proj.weight.value,
-                wd_kernel=self.experts.w2.weight.value,
+                gate_up_kernel=self.experts.gate_up_proj.kernel_view(),
+                wd_kernel=self.experts.w2.kernel_view(),
                 act_fn=self.experts.act_fn,
             )
             return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")  # pyright: ignore[reportReturnType]
@@ -958,18 +958,35 @@ class ArcticModel(EasyDeLBaseModule):
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
+        # Router-logit aggregation grows a Python tuple per layer, which
+        # lax.scan cannot carry — collecting it forces the trace path too.
+        trace_layers = self._layer_scan_trace(
+            False,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache or bool(output_router_logits),
+        )
+        cache_views = views if trace_layers else None
+        # Hoisted out of the loop body: the caching property must not be
+        # first materialized inside the lax.scan trace (tracer leak).
+        frequencies = self.frequencies
+
         def _layer_loop(layer, carry):
             """Per-layer body for the Arctic decoder ``scan``.
 
-            Carry layout: ``(hidden_states, all_hidden_states, all_self_attns,
-            all_router_logits, idx)``. Optionally records the input hidden
-            state, runs one :class:`ArcticDecoderLayer` (dense or MoE
-            depending on ``moe_layer_frequency``) at the assigned pipeline
-            stage, accumulates attention weights and MoE router logits when
-            requested, updates the per-layer KV cache slot, and returns the
-            next carry.
+            Carry layout: ``(hidden_states, cv, all_hidden_states,
+            all_self_attns, all_router_logits, idx)``. Optionally records the
+            input hidden state, runs one :class:`ArcticDecoderLayer` (dense
+            or MoE depending on ``moe_layer_frequency``) at the assigned
+            pipeline stage, accumulates attention weights and MoE router
+            logits when requested, updates the per-layer KV cache slot, and
+            returns the next carry.
             """
-            hidden_states, all_hidden_states, all_self_attns, all_router_logits, idx = carry
+            hidden_states, cv, all_hidden_states, all_self_attns, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
             with self._layer_stage_context(idx, layers=self.layers):
@@ -978,11 +995,11 @@ class ArcticModel(EasyDeLBaseModule):
                     mask_info=mask_info,
                     position_ids=position_ids,
                     mode=mode,
-                    cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
+                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
                     cache_metadata=cache_metadata,
                     output_attentions=output_attentions,
                     output_router_logits=output_router_logits,
-                    frequencies=self.frequencies,
+                    frequencies=frequencies,
                 )
             hidden_states = self._mark_layer_stage_boundary(outputs.hidden_states, idx, layers=self.layers)
 
@@ -998,14 +1015,20 @@ class ArcticModel(EasyDeLBaseModule):
             if output_router_logits:
                 all_router_logits += (outputs.router_logits,)
 
-            self._layer_cache_view_update(None, idx, outputs.cache_view, enabled=True, cache=past_key_values)
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                outputs.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
 
-            return hidden_states, all_hidden_states, all_self_attns, all_router_logits, idx + 1
+            return hidden_states, cv, all_hidden_states, all_self_attns, all_router_logits, idx + 1
 
-        hidden_states, all_hidden_states, all_self_attns, all_router_logits, _ = self.layers.scan(
+        hidden_states, _, all_hidden_states, all_self_attns, all_router_logits, _ = self.layers.scan(
             _layer_loop,
-            (hidden_states, all_hidden_states, all_self_attns, all_router_logits, 0),
-            trace=True,
+            (hidden_states, cache_views, all_hidden_states, all_self_attns, all_router_logits, 0),
+            trace=trace_layers,
         )
         hidden_states = self.norm(hidden_states)
         hidden_states = checkpoint_name(hidden_states, "model_output")

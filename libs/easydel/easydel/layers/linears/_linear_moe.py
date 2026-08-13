@@ -70,6 +70,7 @@ from spectrax import common_types
 from easydel.infra.sharding import (
     RuntimeShardingResolver,
     TensorLayout,
+    moe_expert_param_layout_scope,
     moe_fsdp_shard_expert_weights_enabled,
     sharding_for_layout,
 )
@@ -578,6 +579,184 @@ class ParallelMoELinear(spx.Module):
             bias_rows = self.bias.value.shape[0]
             indices = jnp.repeat(jnp.arange(bias_rows), group_sizes)
         return self.bias.value[indices]
+
+    def kernel_view(self) -> Array | tuple[Array, Array]:
+        """Return the expert kernel as the fused-MoE path consumes it.
+
+        Dense layers return the bf16 weight array; quantized layers return a
+        ``(codes, scales)`` tuple that the fused-MoE dispatch routes to the
+        w8a8 grouped matmul. Modeling files pass this into ``moe_call``
+        instead of touching ``.weight.value`` directly so quantization stays
+        a drop-in.
+        """
+        return self.weight.value
+
+    def quantization_supported(self, config) -> bool:
+        """Whether :meth:`to_quantized` can handle this layer under *config*.
+
+        Checked by the checkpoint bridge and :class:`EasyQuantizer` before
+        attempting conversion, so unsupported formats silently keep the dense
+        expert weights instead of failing the load.
+        """
+        from easydel.layers.quantization import QuantizationType
+
+        # ``bits`` is optional on the config; CHANNELWISE resolves ``None``
+        # to the mode default of 8 (see ``resolve_ejkernel_quant_params``).
+        bits = 8 if config.bits is None else int(config.bits)
+        return (
+            config.dtype == QuantizationType.CHANNELWISE and bits in (4, 8) and not self.out_first and self.bias is None
+        )
+
+    def to_quantized(self, config, **kwargs) -> "ParallelMoELinearQuantized":
+        """Convert to the channelwise-int8 quantized twin.
+
+        Only ``QuantizationType.CHANNELWISE`` with ``bits=8`` is supported for
+        stacked expert weights (the w8a8 expert path); other formats keep the
+        dense layer untouched by raising, so callers can fall back.
+
+        Args:
+            config: Quantization configuration.
+            **kwargs: Ignored runtime knobs (accepted for quantizer
+                compatibility).
+
+        Returns:
+            A :class:`ParallelMoELinearQuantized` (lazy when weights are
+            abstract; quantized in place when concrete).
+        """
+        del kwargs
+        from easydel.layers.quantization import QuantizationType
+
+        if config.dtype != QuantizationType.CHANNELWISE:
+            raise NotImplementedError(f"MoE expert quantization supports channelwise only, got {config.dtype}.")
+        bits = 8 if config.bits is None else int(config.bits)
+        if bits not in (4, 8):
+            raise NotImplementedError(f"MoE expert quantization supports 4/8-bit codes, got {bits}.")
+        if self.out_first:
+            raise NotImplementedError("Quantized MoE experts require out_first=False kernels.")
+        if self.bias is not None:
+            raise NotImplementedError("Quantized MoE experts do not support per-expert bias yet.")
+
+        # Quantize-at-load runs OUTSIDE the parameter-init sharding scope the
+        # model constructor entered, so the ContextVar-backed
+        # ``moe_fsdp_shard_expert_weights`` flag reads its default (False)
+        # here. Re-enter the scope with the layout the DENSE twin was
+        # actually declared with, so quant_kernel/quant_scales keep the
+        # (EP, FSDP) at-rest expert sharding instead of silently dropping to
+        # EP-only.
+        dense_axes = getattr(getattr(self.weight, "sharding", None), "axis_names", None) or ()
+        expert_entry = dense_axes[0] if dense_axes else None
+        expert_axes = expert_entry if isinstance(expert_entry, (tuple, list)) else (expert_entry,)
+        with moe_expert_param_layout_scope(fsdp_shard_expert_weights=FSDP in expert_axes):
+            lazy_module = jax.eval_shape(
+                lambda rngs: ParallelMoELinearQuantized(
+                    num_experts=self.num_experts,
+                    in_features=self.in_features,
+                    out_features=self.out_features,
+                    use_bias=False,
+                    out_first=self.out_first,
+                    kernel_init=self.kernel_init,
+                    bias_init=self.bias_init,
+                    dtype=self.dtype,
+                    param_dtype=self.param_dtype,
+                    runtime_sharding_resolver=self.runtime_sharding_resolver,
+                    direction=self._direction,
+                    use_expert_tensor_mode=self.use_expert_tensor_mode,
+                    quantization_bits=bits,
+                    rngs=rngs,
+                ),
+                spx.Rngs(0),
+            )
+        if isinstance(self.weight.value, jax.ShapeDtypeStruct):
+            return lazy_module
+        return lazy_module.restage_from_dense(self.weight.value)
+
+
+class ParallelMoELinearQuantized(ParallelMoELinear):
+    """Stacked expert linear with channelwise-int8 weights (w8a8 runtime).
+
+    Stores per-expert int8 codes ``[E, K, N]`` plus per-expert per-output-
+    channel float32 scales ``[E, 1, N]``. The forward quantizes activations
+    per row at runtime and runs TPU's native int8 ragged_dot via
+    :func:`ejkernel.modules.grouped_matmul_w8a8` — halving expert weight HBM
+    traffic, the dominant cost of decode-shaped MoE steps.
+    """
+
+    def __init__(self, *args, quantization_bits: int = 8, **kwargs):
+        self._quantization_bits = int(quantization_bits)
+        super().__init__(*args, **kwargs)
+        weight_layout = _moe_parameter_layout(
+            direction=self._direction,
+            use_expert_tensor_mode=self.use_expert_tensor_mode,
+            is_bias=False,
+        )
+        scales_layout = TensorLayout((weight_layout.axes[0], None, weight_layout.axes[2]))
+        kshape = self.weight.value.shape
+        code_dtype = jnp.int8 if self._quantization_bits == 8 else jnp.int4
+        self.quant_kernel = spx.Parameter(
+            jnp.zeros(kshape, code_dtype)
+            if not isinstance(self.weight.value, jax.ShapeDtypeStruct)
+            else jax.ShapeDtypeStruct(kshape, code_dtype),
+            sharding=sharding_for_layout(weight_layout),
+        )
+        self.quant_scales = spx.Parameter(
+            jnp.ones((kshape[0], 1, kshape[2]), jnp.float32)
+            if not isinstance(self.weight.value, jax.ShapeDtypeStruct)
+            else jax.ShapeDtypeStruct((kshape[0], 1, kshape[2]), jnp.float32),
+            sharding=sharding_for_layout(scales_layout),
+        )
+        self.quant_biases = None
+        # The dense kernel slot must not survive: it would double memory and
+        # the checkpoint bridge replaces it with the quant_* leaves.
+        self.weight = None
+
+    def quantization_supported(self, config) -> bool:
+        """Already quantized — report unsupported so conversion loops skip it."""
+        del config
+        return False
+
+    def to_quantized(self, config, **kwargs) -> "ParallelMoELinearQuantized":
+        """Idempotent: a second conversion pass returns the module unchanged."""
+        del config, kwargs
+        return self
+
+    def restage_from_dense(self, dense_kernel: Array) -> "ParallelMoELinearQuantized":
+        """Fill quant leaves by quantizing a concrete dense kernel in place."""
+        from ._linear_quantized import channelwise_quantize_array
+
+        codes, scales, _ = channelwise_quantize_array(dense_kernel, self._quantization_bits)
+        self.quant_kernel = spx.Parameter(codes, sharding=self.quant_kernel.sharding)
+        self.quant_scales = spx.Parameter(scales, sharding=self.quant_scales.sharding)
+        return self
+
+    def kernel_view(self) -> tuple[Array, Array]:
+        """Return ``(codes, scales)`` for the fused-MoE w8a8 dispatch."""
+        return (self.quant_kernel.value, self.quant_scales.value)
+
+    def forward(
+        self,
+        inputs: Float[Array, "tokens_ragged hidden_dim"],
+        group_sizes: Int[Array, "num_groups"],  # noqa
+        sorted_experts: Int[Array, "tokens_ragged"] | None = None,  # noqa
+    ) -> Float[Array, "tokens_ragged out_dim"]:
+        """Apply the per-expert transformation via the w8a8 grouped matmul."""
+        del sorted_experts
+        from ejkernel.modules import grouped_matmul_w8a8  # pyright: ignore[reportMissingTypeStubs]
+
+        codes = self.quant_kernel.value
+        if codes.dtype != jnp.int8:
+            # ``grouped_matmul_w8a8`` requires int8 codes. int4 codes are
+            # valid int8 codes, so the upcast is exact — it keeps this
+            # standalone fallback on the same w8a8 semantics the fused
+            # ``moe_call`` path realises for int4 (which dequantizes the
+            # codes in-VMEM instead of materializing them).
+            codes = codes.astype(jnp.int8)
+        return grouped_matmul_w8a8(
+            inputs,
+            codes,
+            self.quant_scales.value,
+            group_sizes,
+            preferred_element_type=jnp.bfloat16 if self.dtype != jnp.float32 else jnp.float32,
+        )
 
 
 class RowParallelMoELinear(ParallelMoELinear):

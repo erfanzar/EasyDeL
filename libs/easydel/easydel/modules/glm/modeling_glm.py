@@ -36,7 +36,6 @@ import jax
 import jax.numpy as jnp
 import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 from spectrax import apply_logical_sharding, common_types, nn
 
@@ -60,7 +59,7 @@ from easydel.layers import (
     RMSNorm,
     RowParallelLinear,
     dense_gate_up_layout,
-    split_fused_gate_up_projection,
+    gated_mlp_forward,
 )
 from easydel.layers.attention import UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
@@ -141,26 +140,17 @@ class GlmMLP(spx.Module):
     ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Apply gated feedforward transformation.
 
+        Delegates to :func:`easydel.layers.gated_mlp_forward`, which routes
+        supported layouts through the ejkernel fused MLP kernels and runs
+        the legacy composition otherwise.
+
         Args:
             hidden_states: Input tensor [batch, seq_len, hidden_dim]
 
         Returns:
             Transformed hidden states [batch, seq_len, hidden_dim]
         """
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        gate_up_states = checkpoint_name(self.gate_up_proj(hidden_states), name="mlp_gate_up")
-        gate, up_states = split_fused_gate_up_projection(gate_up_states, config=self.config)
-        hidden_states = checkpoint_name(self.down_proj(up_states * self.act_fn(gate)), name="mlp_down")
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        return hidden_states
+        return gated_mlp_forward(self, hidden_states)
 
 
 class GlmAttention(UnifiedAttention):

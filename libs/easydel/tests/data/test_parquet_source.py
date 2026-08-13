@@ -308,7 +308,7 @@ def test_midstream_iteration_failure_propagates_instead_of_duplicating():
 
     class MidstreamPoisonedTable:
         num_rows = real.num_rows
-        column_names = ["ok", "bad"]
+        column_names = ("ok", "bad")
 
         @staticmethod
         def column(name):

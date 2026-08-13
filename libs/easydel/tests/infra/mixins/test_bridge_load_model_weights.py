@@ -2,9 +2,8 @@ import jax
 import numpy as np
 import pytest
 import spectrax as spx
-from jax import numpy as jnp
-
 from easydel.infra.mixins.bridge import EasyBridgeMixin
+from jax import numpy as jnp
 
 
 class _LoadConfigStub:
@@ -23,6 +22,12 @@ class _LoadModelStub:
         if self.abstract_error:
             raise ValueError("loading weights left abstract trainable parameter leaf")
         return self
+
+    def _spx_graph_children(self):
+        # SpectraX graph-walk surface. The load path now discovers fused
+        # projections via `iter_module_search`, which descends through this
+        # hook; the stub owns no submodules, so it yields nothing.
+        return ()
 
     def materialize_meta_state(self, *, seed: int = 0):
         # Mirror the real EasyDeLBaseModule API added alongside the load path:

@@ -48,7 +48,9 @@ Available kernels:
     ring_attention: Distributed attention using ring all-reduce collectives.
 """
 
+from .all_gather import all_gather
 from .all_gather_matmul import all_gather_matmul
+from .all_reduce import all_reduce
 from .blocksparse_attention import blocksparse_attention as blocksparse_attention
 from .compressed_window_attention import compressed_window_attention
 from .compressed_window_decode import compressed_window_decode
@@ -74,11 +76,14 @@ from .ragged_gated_delta_rule import ragged_gated_delta_rule as ragged_gated_del
 from .ragged_gated_delta_rule_v2 import ragged_gated_delta_rule_v2
 from .ragged_page_attention_v2 import ragged_page_attention_v2
 from .ragged_page_attention_v3 import ragged_page_attention_v3
+from .reduce_scatter import reduce_scatter
 from .reduce_scatter_matmul import reduce_scatter_matmul
 from .ring_attention import ring_attention
 
 __all__ = (
+    "all_gather",
     "all_gather_matmul",
+    "all_reduce",
     "blocksparse_attention",
     "compressed_window_attention",
     "compressed_window_decode",
@@ -104,6 +109,7 @@ __all__ = (
     "ragged_gated_delta_rule_v2",
     "ragged_page_attention_v2",
     "ragged_page_attention_v3",
+    "reduce_scatter",
     "reduce_scatter_matmul",
     "ring_attention",
 )

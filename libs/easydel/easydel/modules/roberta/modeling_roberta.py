@@ -1037,15 +1037,31 @@ class RobertaEncoder(EasyDeLLayerStackMixin, spx.Module):
         if past_key_values is None:
             past_key_values = TransformerCache.init_empty(len(self.layer))
 
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
+        # Cross-attention aggregation grows a python tuple per layer and
+        # ``head_mask`` is indexed per layer at the python level — both force
+        # the trace path.
+        trace_layers = self._layer_scan_trace(
+            False,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache or encoder_hidden_states is not None or head_mask is not None,
+        )
+        cache_views = views if trace_layers else None
+
         def _layer_loop(layer, carry):
             """Apply a single encoder layer inside the layer-stack scan.
 
-            Body of ``self.layer.scan``; runs ``layer`` on the current
-            hidden states, optionally accumulates per-layer hidden
-            states, self-attention weights and cross-attention weights,
-            and returns the updated carry tuple.
+            Body of ``self.layer.scan``; carries ``(hidden_states,
+            cache_views, all_hidden_states, all_attentions,
+            all_cross_attentions, layer_index)``, optionally accumulating
+            per-layer hidden states, self-attention weights and
+            cross-attention weights.
             """
-            hidden_states, all_hidden_states, all_attentions, all_cross_attentions, i = carry
+            hidden_states, cv, all_hidden_states, all_attentions, all_cross_attentions, i = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -1055,7 +1071,7 @@ class RobertaEncoder(EasyDeLLayerStackMixin, spx.Module):
                     mask_info=mask_info,
                     layer_head_mask=head_mask[i] if head_mask is not None else None,
                     mode=mode,
-                    cache_view=past_key_values.views[i],
+                    cache_view=self._layer_cache_view_at(cv, i, enabled=trace_layers, cache=past_key_values),
                     cache_metadata=cache_metadata,
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_mask_info=encoder_mask_info,
@@ -1067,17 +1083,23 @@ class RobertaEncoder(EasyDeLLayerStackMixin, spx.Module):
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
 
-            past_key_values[i] = layer_outputs.cache_view
+            cv = self._layer_cache_view_update(
+                cv,
+                i,
+                layer_outputs.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
 
             if encoder_hidden_states is not None:
                 all_cross_attentions += (layer_outputs.cross_attention,)
 
-            return hidden_states, all_hidden_states, all_attentions, all_cross_attentions, i + 1
+            return hidden_states, cv, all_hidden_states, all_attentions, all_cross_attentions, i + 1
 
-        hidden_states, all_hidden_states, all_attentions, all_cross_attentions, _ = self.layer.scan(
+        hidden_states, _, all_hidden_states, all_attentions, all_cross_attentions, _ = self.layer.scan(
             _layer_loop,
-            (hidden_states, all_hidden_states, all_attentions, all_cross_attentions, 0),
-            trace=True,
+            (hidden_states, cache_views, all_hidden_states, all_attentions, all_cross_attentions, 0),
+            trace=trace_layers,
         )
         if output_hidden_states:
             all_hidden_states += (hidden_states,)

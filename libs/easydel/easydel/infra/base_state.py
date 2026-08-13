@@ -1546,7 +1546,12 @@ class EasyDeLState(_PyTreeNode):
                         # Passing step would create duplicate run-{step}/run-{step} structure
                     )
                 if not is_remote_path(save_directory) or jax.process_index() == 0:
-                    write_fused_layout_marker(save_directory, _fused_tp_size(model.config))
+                    # ``tensor_parallel_size`` documents ``None`` as "no config,
+                    # use the default PartitionAxis"; reach the config the same
+                    # defensive way, so saving an optimizer for a model-like
+                    # without one records the canonical tp instead of raising
+                    # out of the marker write.
+                    write_fused_layout_marker(save_directory, _fused_tp_size(getattr(model, "config", None)))
             except Exception as e:
                 logger.error(f"Optimizer save failed: {e!s}")
                 raise

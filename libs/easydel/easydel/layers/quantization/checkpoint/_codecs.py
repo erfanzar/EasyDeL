@@ -65,6 +65,7 @@ def decode_scaled_elements(
     *,
     transpose: bool = True,
     dtype: jnp.dtype = jnp.float32,
+    block_shape: tp.Sequence[int] | None = None,
 ) -> Array:
     """Decode any element-wise-scaled weight (fp8, int8, and their block forms).
 
@@ -82,11 +83,18 @@ def decode_scaled_elements(
         transpose: Whether the input is HF ``[out, in]`` and must be flipped
             to EasyDeL's ``[in, out]``.
         dtype: Output dtype.
+        block_shape: The checkpoint's declared block sizes (e.g. DeepSeek's
+            ``weight_block_size=[128, 128]``), aligned to the ``[out, in]``
+            axes as stored. Required for correct scale expansion whenever a
+            dimension is not a multiple of its block size.
 
     Returns:
         Dense weight in ``[in, out]`` layout.
     """
-    dense = dequantize_with_scale(weight, scale, dtype=dtype)
+    # HF layout puts output channels on axis -2, so that is where a 1-D
+    # per-channel `weight_scale` indexes — including for a square weight,
+    # where length alone cannot tell the two axes apart.
+    dense = dequantize_with_scale(weight, scale, dtype=dtype, block_shape=block_shape, channel_axis=-2)
     return _swap_last_two(dense) if transpose else dense
 
 
@@ -118,7 +126,9 @@ def decode_awq_int4(
     zeros = None
     if qzeros is not None:
         zeros = unpack_uint32_to_uint4(qzeros.astype(jnp.uint32), axis=-1, awq_order=True).astype(jnp.float32)
-    return dequantize_with_scale(codes, scales, zero_point=zeros, dtype=dtype)
+    # AWQ decodes straight into [in, out], so output channels are axis -1 —
+    # the opposite of the HF-layout codecs.
+    return dequantize_with_scale(codes, scales, zero_point=zeros, dtype=dtype, channel_axis=-1)
 
 
 def decode_gptq_int4(
@@ -171,7 +181,44 @@ def decode_gptq_int4(
             values = values - jnp.take(zeros, row_index, axis=0)
         return (values * row_scales).astype(dtype)
 
-    return dequantize_with_scale(codes, scales, zero_point=zeros, dtype=dtype)
+    # GPTQ unpacks along the input axis, leaving [in, out]: output channels
+    # are axis -1.
+    return dequantize_with_scale(codes, scales, zero_point=zeros, dtype=dtype, channel_axis=-1)
+
+
+def decode_compressed_int4(
+    weight_packed: Array,
+    weight_scale: Array,
+    *,
+    transpose: bool = True,
+    dtype: jnp.dtype = jnp.float32,
+) -> Array:
+    """Decode a compressed-tensors ``pack-quantized`` int4 weight.
+
+    compressed-tensors stores ``weight_packed`` as ``[out, in // 8]`` int32,
+    packed sequentially (LSB-first, GPTQ lane order — not AWQ's interleave)
+    along the **input** axis, i.e. the *last* axis of the HF ``[out, in]``
+    layout. That is the transpose of GPTQ's ``[in // 8, out]`` packing, so
+    reusing :func:`decode_gptq_int4` here silently produces a wrong-shaped,
+    wrong-valued weight. Codes are stored unsigned with a ``+8`` offset
+    (``pack_to_int32`` adds ``2**(bits-1)`` before packing); the symmetric
+    scheme ships no zero-point tensor, so decoding subtracts the offset back.
+    ``weight_scale`` is ``[out, in // group]`` (or per-channel ``[out, 1]``).
+
+    Args:
+        weight_packed: Packed ``int32``/``uint32`` codes, ``[out, in // 8]``.
+        weight_scale: Per-group scales, ``[out, in // group]`` or ``[out, 1]``.
+        transpose: Whether to flip the HF ``[out, in]`` result to EasyDeL's
+            ``[in, out]``.
+        dtype: Output dtype.
+
+    Returns:
+        Dense weight in ``[in, out]`` layout.
+    """
+    codes = unpack_uint32_to_uint4(weight_packed.astype(jnp.uint32), axis=-1, awq_order=False)
+    values = codes.astype(jnp.float32) - 8.0
+    dense = (values * expand_scale(weight_scale, codes.shape, channel_axis=-2)).astype(dtype)
+    return _swap_last_two(dense) if transpose else dense
 
 
 def decode_mxfp4(
@@ -200,7 +247,7 @@ def decode_mxfp4(
         Dense weight in ``[in, out]`` layout.
     """
     codes = unpack_uint8_to_e2m1(blocks, axis=-1).astype(jnp.float32)
-    dense = codes * expand_scale(decode_e8m0_scale(scales), codes.shape)
+    dense = codes * expand_scale(decode_e8m0_scale(scales), codes.shape, channel_axis=-2)
     dense = dense.astype(dtype)
     return _swap_last_two(dense) if transpose else dense
 
@@ -233,6 +280,6 @@ def decode_nvfp4(
         Dense weight in ``[in, out]`` layout, excluding the global scale.
     """
     codes = unpack_uint8_to_e2m1(weight_packed, axis=-1).astype(jnp.float32)
-    dense = codes * expand_scale(decode_e4m3_scale(weight_scale), codes.shape)
+    dense = codes * expand_scale(decode_e4m3_scale(weight_scale), codes.shape, channel_axis=-2)
     dense = dense.astype(dtype)
     return _swap_last_two(dense) if transpose else dense

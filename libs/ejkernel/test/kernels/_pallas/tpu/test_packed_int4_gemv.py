@@ -87,6 +87,29 @@ def test_w4a4_matches_quantized_reference():
     assert rel < 0.01, f"W4A4 gemv diverged from its quantized reference: relerr={rel}"
 
 
+@pytest.mark.parametrize("n_dim", [640, 1376])
+def test_w4a16_covers_a_non_divisible_output_width(n_dim):
+    """Every output column is written when ``tile_n`` does not divide ``n``.
+
+    A floor-divided grid leaves the trailing ``n % tile_n`` columns assigned by
+    no grid step, so they come back as whatever was in the output buffer.
+    """
+    rng = np.random.default_rng(2)
+    k_dim, tokens, tile_n = 1024, 8, 512
+    codes, scale = _quantize(rng, k_dim, n_dim)
+    x = jnp.asarray(rng.normal(size=(tokens, k_dim)), dtype=jnp.bfloat16)
+
+    got = np.asarray(
+        packed_int4_gemv(x, pack_int4_split_k(jnp.asarray(codes)), jnp.asarray(scale), tile_n=tile_n, chunk=256),
+        dtype=np.float32,
+    )
+    ref = np.asarray(x, dtype=np.float32) @ (codes.astype(np.float32) * scale)
+
+    tail = slice((n_dim // tile_n) * tile_n, n_dim)
+    rel_tail = np.abs(got[:, tail] - ref[:, tail]).max() / np.abs(ref[:, tail]).max()
+    assert rel_tail < 0.02, f"trailing columns {tail} were not computed: relerr={rel_tail}"
+
+
 def test_w4a4_rejects_unquantized_activations():
     """Float activations mean the caller wanted W4A16 — fail loudly."""
     x = jnp.ones((8, 256), jnp.bfloat16)

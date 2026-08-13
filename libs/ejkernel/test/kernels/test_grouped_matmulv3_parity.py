@@ -19,7 +19,6 @@ from __future__ import annotations
 import inspect
 
 import pytest
-
 from ejkernel.kernels import _xla as xla_kernels
 from ejkernel.kernels._pallas import tpu as pallas_tpu_kernels
 from ejkernel.kernels._pallas.tpu.grouped_matmulv3 import _interface as pallas_interface
@@ -51,6 +50,54 @@ class TestGroupedMatmulV3Parity:
         pallas_impl = kernel_registry.get("grouped_matmulv3", platform=Platform.PALLAS, backend=Backend.TPU)
         assert callable(xla_impl)
         assert callable(pallas_impl)
+
+
+class TestPreDequantDecision:
+    """Pins the unquantized-lhs pre-dequantization contract.
+
+    The pre-dequant branch rounds f32-dequantized weights into the lhs dtype
+    (bf16) BEFORE the matmul, changing numerics versus the in-accumulator
+    scale path. It therefore exists only for MXU-unsupported dtype pairs,
+    where it is the sole way to execute at all. Supported pairs must keep the
+    exact path no matter how narrow the rhs quant block is — easydel's
+    default affine group size is 64, below the 128-wide MXU column, so a
+    block-size trigger silently re-rounds every default quantized weight
+    with no opt-out (the regression this class pins). Structural test only:
+    the kernel's numerics are Pallas-TPU and cannot execute on CPU.
+    """
+
+    def test_supported_pairs_never_predequantize(self):
+        from ejkernel.kernels._pallas.tpu.grouped_matmulv3._pallas_impl import (
+            should_dequantize_rhs_before_matmul,
+        )
+
+        for has_scale in (False, True):
+            for block in (16, 32, 64, 128, 256, 512):
+                assert (
+                    should_dequantize_rhs_before_matmul(
+                        matmul_supported=True,
+                        has_scale=has_scale,
+                        rhs_quant_block_size=block,
+                        mxu_size=128,
+                    )
+                    is False
+                ), f"supported pair pre-dequantized at block={block}, has_scale={has_scale}"
+
+    def test_unsupported_pairs_predequantize(self):
+        from ejkernel.kernels._pallas.tpu.grouped_matmulv3._pallas_impl import (
+            should_dequantize_rhs_before_matmul,
+        )
+
+        for has_scale in (False, True):
+            assert (
+                should_dequantize_rhs_before_matmul(
+                    matmul_supported=False,
+                    has_scale=has_scale,
+                    rhs_quant_block_size=128,
+                    mxu_size=128,
+                )
+                is True
+            )
 
 
 if __name__ == "__main__":

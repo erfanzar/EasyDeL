@@ -73,11 +73,7 @@ def _reference(mixed, b, a, A_log, dt_bias, valid, state, apply_silu=False):
 def test_matches_independent_reference():
     """XLA impl matches a per-(batch,head) numpy reference including masking."""
     mixed, b, a, A_log, dt_bias, valid, state = _make_inputs()
-    got = np.asarray(
-        gdn_spec_window_states(
-            mixed, b, a, A_log, dt_bias, valid, state, n_kq=NKQ, n_v=NV, d_k=DK, d_v=DV
-        )
-    )
+    got = np.asarray(gdn_spec_window_states(mixed, b, a, A_log, dt_bias, valid, state, n_kq=NKQ, n_v=NV, d_k=DK, d_v=DV))
     ref = _reference(mixed, b, a, A_log, dt_bias, valid, state)
     np.testing.assert_allclose(got, ref, rtol=2e-5, atol=2e-5)
 
@@ -86,11 +82,7 @@ def test_invalid_steps_freeze_state():
     """Rows with valid=False must carry the state through unchanged."""
     mixed, b, a, A_log, dt_bias, _, state = _make_inputs(batch=2, steps=3)
     valid = jnp.asarray(np.array([[True, False, True], [False, False, False]]))
-    got = np.asarray(
-        gdn_spec_window_states(
-            mixed, b, a, A_log, dt_bias, valid, state, n_kq=NKQ, n_v=NV, d_k=DK, d_v=DV
-        )
-    )
+    got = np.asarray(gdn_spec_window_states(mixed, b, a, A_log, dt_bias, valid, state, n_kq=NKQ, n_v=NV, d_k=DK, d_v=DV))
     # Batch row 1 is fully invalid: every stacked step equals the entry state.
     for t in range(3):
         np.testing.assert_allclose(got[t, 1], np.asarray(state[1], dtype=np.float32), rtol=0, atol=0)

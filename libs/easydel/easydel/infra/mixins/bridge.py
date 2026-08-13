@@ -1213,6 +1213,9 @@ class EasyBridgeMixin(PushToHubMixin):
                 path_str = ".".join([str(p) for p in path])
                 if pattern is not None and not pattern.search(path_str):
                     continue
+                _supported = getattr(module, "quantization_supported", None)
+                if callable(_supported) and not _supported(quantization_config):
+                    continue
                 # iter_module_search yields string path segments; checkpoint
                 # state keys promote digit segments to int (string_key_to_int).
                 # Canonicalize so kernel_map keys match state keys exactly.
@@ -1349,12 +1352,73 @@ class EasyBridgeMixin(PushToHubMixin):
 
                 from easydel.utils.parameters_transformation import StateDictConverter
 
+                # ``getattr`` on the model too, matching the ``config`` accesses
+                # above: this path also runs for model-likes that never bind a
+                # transform fn, and a missing one means the same as one without
+                # reform rules.
+                _pure_transform_fn = getattr(model, "pure_transform_fn", None)
                 native_fused_counts = StateDictConverter.apply_native_reform_param_fusions(
                     state,
-                    getattr(model.pure_transform_fn, "keywords", {}).get("reform_param"),
+                    getattr(_pure_transform_fn, "keywords", {}).get("reform_param"),
                 )
                 for label, count in native_fused_counts.items():
                     logger.info("Fused %d native checkpoint %s into runtime merged weights.", count, label)
+
+                if native_fused_counts or _cf_saved_tp is not None:
+                    # Leaves synthesized after the rule-based tensorstore read
+                    # (native fusions, tp re-interleaves) bypassed the loader's
+                    # placement: their sources matched no live-variable rule and
+                    # loaded replicated. Left that way, XLA re-slices the
+                    # replicated copy inside every shard_map call (measured:
+                    # 8ms/step and 4x expert HBM on a tp=4 qwen3-30B decode).
+                    # Re-place any leaf whose live sharding mismatches its rule.
+                    _rules = tuple(sharding_rules or ())
+                    # Fast path: resolve_shardings_regex pins each variable's
+                    # LITERAL path wrapped as `^(?:.*/)?<escaped>(?:/.*)?$`.
+                    # Un-wrap and un-escape those cores so the dict is keyed
+                    # by the resolved plain path (the raw regex pattern never
+                    # equals a path, so keying by pattern made this dead) and
+                    # the common exact-path case is one dict hit instead of a
+                    # full regex scan. First-wins to mirror the scan order.
+                    _literal = {}
+                    _prefix, _suffix = r"^(?:.*/)?", r"(?:/.*)?$"
+                    for _pat, _shard in _rules:
+                        _core = _pat
+                        if _core.startswith(_prefix):
+                            _core = _core[len(_prefix) :]
+                        if _core.endswith(_suffix):
+                            _core = _core[: -len(_suffix)]
+                        _plain = re.sub(r"\\(.)", r"\1", _core)
+                        if re.escape(_plain) == _core:
+                            _literal.setdefault(_plain, _shard)
+
+                    def _rule_sharding_for(key_tuple):
+                        parts = [str(p) for p in key_tuple]
+                        if parts and parts[0] in ("parameters", "params", "buffers"):
+                            parts = parts[1:]
+                        path = "/".join(parts)
+                        hit = _literal.get(path)
+                        if hit is not None:
+                            return hit
+                        for pat, shard in _rules:
+                            if re.fullmatch(pat, path):
+                                return shard
+                        return None
+
+                    _replaced = 0
+                    for _key, _leaf in list(state.items()):
+                        if not hasattr(_leaf, "sharding"):
+                            continue
+                        _target = _rule_sharding_for(_key)
+                        if _target is None or _leaf.sharding == _target:
+                            continue
+                        state[_key] = jax.device_put(_leaf, _target)
+                        _replaced += 1
+                    if _replaced:
+                        logger.info(
+                            "Re-placed %d post-load synthesized leaves onto their live variable shardings.",
+                            _replaced,
+                        )
 
             has_quantized_keys = any(
                 isinstance(k, tuple) and k and str(k[-1]).startswith("quant_") for k in state.keys()
@@ -1379,6 +1443,12 @@ class EasyBridgeMixin(PushToHubMixin):
                     apply_quantization=True,
                     verbose=verbose,
                     raise_error=False,
+                )
+            elif itwas_tensorstore and not apply_quantization and quantization_config is not None:
+                logger.warning(
+                    "quantization_config was provided but apply_quantization=False; weights stay "
+                    "unquantized on this native-checkpoint load. Pass apply_quantization=True to "
+                    "quantize at load."
                 )
             elif itwas_tensorstore and apply_quantization:
                 if quantization_config is None:
@@ -1434,6 +1504,32 @@ class EasyBridgeMixin(PushToHubMixin):
                             source_key = (*prefix, *kernel_key)
                         kernel_value = state.pop(source_key)
                         mode, group_size, bits, needs_biases = resolve_ejkernel_quant_params(quantization_config)
+                        if mode == "channelwise":
+                            from easydel.layers.linears._linear_quantized import channelwise_quantize_array
+
+                            quant_kernel, quant_scales, quant_biases = channelwise_quantize_array(
+                                jnp.asarray(kernel_value), bits
+                            )
+                            state[(*prefix, *quant_kernel_key)] = quant_kernel
+                            state[(*prefix, *quant_scales_key)] = quant_scales
+                            state[(*prefix, *quant_biases_key)] = quant_biases
+                            if bits == 4 and quant_kernel.ndim == 2:
+                                from easydel.layers.linears._linear_quantized import should_pack_int4_companion
+
+                                # Same gate the module constructor applies:
+                                # only layers large enough for the fused
+                                # W4A4 pair route declare (and can receive)
+                                # a packed companion leaf.
+                                if should_pack_int4_companion(*quant_kernel.shape):
+                                    from ejkernel.modules import pack_int4_adjacent
+
+                                    packed_key = (*quant_kernel_key[:-1], "quant_kernel_packed")
+                                    state[(*prefix, *packed_key)] = pack_int4_adjacent(quant_kernel)
+                            quantized_on_load_count += 1
+                            if hasattr(quant_kernel, "block_until_ready"):
+                                quant_kernel.block_until_ready()
+                            del kernel_value
+                            continue
                         group_size = _effective_ejkernel_group_size(mode, group_size, tuple(kernel_value.shape))
                         if needs_biases:
                             quant_kernel, quant_scales, quant_biases = prepack_quantized_weights(
@@ -1957,6 +2053,8 @@ class EasyBridgeMixin(PushToHubMixin):
             with _phase_timer("model.shard_model", accumulator=timings):
                 model = model.shard_model()
 
+        model = model.wire_distributed_matmul()
+
         total_elapsed = time.perf_counter() - total_start
         breakdown = ", ".join(f"{k}={v:.2f}s" for k, v in sorted(timings.items(), key=lambda kv: -kv[1]))
         logger.debug(f"[from_pretrained] TOTAL={total_elapsed:.2f}s  ({breakdown})")
@@ -2206,6 +2304,7 @@ class EasyBridgeMixin(PushToHubMixin):
             apply_quantization=apply_quantization,
             raise_error=False,
         )
+        model = model.wire_distributed_matmul()
 
         logger.debug("returning model.")
         return model

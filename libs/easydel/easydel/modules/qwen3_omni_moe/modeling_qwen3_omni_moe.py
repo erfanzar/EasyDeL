@@ -67,6 +67,7 @@ from easydel.layers import (
     RowParallelMoELinear,
     dense_gate_up_layout,
     dense_qkv_layout,
+    gated_mlp_forward,
     moe_down_projection_reform_param,
     moe_fused_gate_up_reform_param,
     split_fused_gate_up_projection,
@@ -1443,22 +1444,17 @@ class Qwen3OmniMoeTextMLP(spx.Module):
     def forward(self, hidden_states: Array) -> Array:
         """Apply SwiGLU feedforward transformation.
 
+        Delegates to :func:`easydel.layers.gated_mlp_forward`, which routes
+        supported layouts through the ejkernel fused MLP kernels and runs
+        the legacy composition otherwise.
+
         Args:
             hidden_states: Input tensor [batch, seq_len, hidden_dim].
 
         Returns:
             Transformed hidden states [batch, seq_len, hidden_dim].
         """
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
-        gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
-        gate = checkpoint_name(self.act_fn(gate_raw), "mlp_gate")
-        hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
-        return checkpoint_name(hidden_states, "mlp_output")
+        return gated_mlp_forward(self, hidden_states)
 
 
 class Qwen3OmniMoeMLPStack(spx.Module):
@@ -1610,8 +1606,8 @@ class Qwen3OmniMoeTextSparseBlock(BaseMoeModule):
             hidden_state=hidden_states,
             gate_layer=self.gate,
             expert_layer=self.experts,
-            gate_up_kernel=self.experts.gate_up_proj.weight.value,
-            wd_kernel=self.experts.down_proj.weight.value,
+            gate_up_kernel=self.experts.gate_up_proj.kernel_view(),
+            wd_kernel=self.experts.down_proj.kernel_view(),
             act_fn=self.experts.act_fn,
         )
         return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
@@ -1934,22 +1930,17 @@ class Qwen3OmniMoeTalkerTextMLP(spx.Module):
     def forward(self, hidden_states: Array) -> Array:
         """Apply SwiGLU feedforward transformation.
 
+        Delegates to :func:`easydel.layers.gated_mlp_forward`, which routes
+        supported layouts through the ejkernel fused MLP kernels and runs
+        the legacy composition otherwise.
+
         Args:
             hidden_states: Input tensor [batch, seq_len, hidden_dim].
 
         Returns:
             Transformed hidden states [batch, seq_len, hidden_dim].
         """
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
-        gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
-        gate = checkpoint_name(self.act_fn(gate_raw), "mlp_gate")
-        hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
-        return checkpoint_name(hidden_states, "mlp_output")
+        return gated_mlp_forward(self, hidden_states)
 
 
 class Qwen3OmniMoeTalkerMLPStack(spx.Module):
@@ -2128,8 +2119,8 @@ class Qwen3OmniMoeTalkerTextSparseMoeBlock(BaseMoeModule):
             hidden_state=hidden_states,
             gate_layer=self.gate,
             expert_layer=self.experts,
-            gate_up_kernel=self.experts.gate_up_proj.weight.value,
-            wd_kernel=self.experts.down_proj.weight.value,
+            gate_up_kernel=self.experts.gate_up_proj.kernel_view(),
+            wd_kernel=self.experts.down_proj.kernel_view(),
             act_fn=self.experts.act_fn,
         )
 
@@ -2391,22 +2382,17 @@ class Qwen3OmniMoeTalkerCodePredictorMLP(spx.Module):
     def forward(self, hidden_states: Array) -> Array:
         """Apply SwiGLU feedforward transformation.
 
+        Delegates to :func:`easydel.layers.gated_mlp_forward`, which routes
+        supported layouts through the ejkernel fused MLP kernels and runs
+        the legacy composition otherwise.
+
         Args:
             hidden_states: Input tensor [batch, seq_len, hidden_dim].
 
         Returns:
             Transformed hidden states [batch, seq_len, hidden_dim].
         """
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
-        gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
-        gate = checkpoint_name(self.act_fn(gate_raw), "mlp_gate")
-        hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
-        return checkpoint_name(hidden_states, "mlp_output")
+        return gated_mlp_forward(self, hidden_states)
 
 
 class Qwen3OmniMoeTalkerCodePredictorAttention(UnifiedAttention):
@@ -2724,15 +2710,30 @@ class Qwen3OmniMoeTalkerCodePredictorModel(EasyDeLBaseModule):
         all_hidden_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
 
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
+        trace_layers = self._layer_scan_trace(
+            False,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache,
+        )
+        cache_views = views if trace_layers else None
+        # Hoisted out of the loop body: the caching property must not be
+        # first materialized inside the lax.scan trace (tracer leak).
+        frequencies = self.frequencies
+
         def _layer_loop(block, carry):
             """Apply a single decoder layer inside the layer-stack scan.
 
             Body of ``self.layers.scan`` for a non-MoE decoder stack;
-            runs ``block`` on the current hidden states, optionally
-            accumulates per-layer hidden states / attention weights, and
-            returns the updated carry tuple.
+            carries ``(hidden_states, cache_views, all_hidden_states,
+            all_attentions, layer_index)``, optionally accumulating
+            per-layer hidden states / attention weights.
             """
-            hidden_states, all_hidden_states, all_attentions, idx = carry
+            hidden_states, cv, all_hidden_states, all_attentions, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -2742,24 +2743,30 @@ class Qwen3OmniMoeTalkerCodePredictorModel(EasyDeLBaseModule):
                     mask_info=mask_info,
                     position_ids=position_ids,
                     mode=mode,
-                    cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
+                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
                     cache_metadata=cache_metadata,
                     output_attentions=output_attentions,
-                    frequencies=self.frequencies,
+                    frequencies=frequencies,
                 )
             hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
 
-            self._layer_cache_view_update(None, idx, layer_outputs.cache_view, enabled=True, cache=past_key_values)
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                layer_outputs.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
 
-            return hidden_states, all_hidden_states, all_attentions, idx + 1
+            return hidden_states, cv, all_hidden_states, all_attentions, idx + 1
 
-        hidden_states, all_hidden_states, all_attentions, _ = self.layers.scan(
+        hidden_states, _, all_hidden_states, all_attentions, _ = self.layers.scan(
             _layer_loop,
-            (hidden_states, all_hidden_states, all_attentions, 0),
-            trace=True,
+            (hidden_states, cache_views, all_hidden_states, all_attentions, 0),
+            trace=trace_layers,
         )
         hidden_states = self.norm(hidden_states)
 
@@ -3117,15 +3124,33 @@ class Qwen3OmniMoeTalkerModel(EasyDeLBaseModule):
         all_attentions = () if output_attentions else None
         all_router_logits = () if output_router_logits else None
 
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
+        # Router-logit aggregation grows a Python tuple per layer, which
+        # lax.scan cannot carry — collecting it forces the trace path too.
+        trace_layers = self._layer_scan_trace(
+            False,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache or bool(output_router_logits),
+        )
+        cache_views = views if trace_layers else None
+        # Hoisted out of the loop body: the caching property must not be
+        # first materialized inside the lax.scan trace (tracer leak).
+        frequencies = self.frequencies
+
         def _layer_loop(block, carry):
             """Apply a single Thinker MoE decoder layer inside the layer-stack scan.
 
             Body of ``self.layers.scan`` for the Thinker text decoder;
-            runs ``block`` on the current hidden states, optionally
-            accumulates per-layer hidden states, attention weights, and
-            MoE router logits, and returns the updated carry tuple.
+            carries ``(hidden_states, cache_views, all_hidden_states,
+            all_attentions, all_router_logits, layer_index)``, optionally
+            accumulating per-layer hidden states, attention weights, and
+            MoE router logits.
             """
-            hidden_states, all_hidden_states, all_attentions, all_router_logits, idx = carry
+            hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -3135,27 +3160,33 @@ class Qwen3OmniMoeTalkerModel(EasyDeLBaseModule):
                     mask_info=mask_info,
                     position_ids=position_ids,
                     mode=mode,
-                    cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
+                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
                     cache_metadata=cache_metadata,
                     output_attentions=output_attentions,
                     output_router_logits=output_router_logits,
-                    frequencies=self.frequencies,
+                    frequencies=frequencies,
                 )
             hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
 
-            self._layer_cache_view_update(None, idx, layer_outputs.cache_view, enabled=True, cache=past_key_values)
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                layer_outputs.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
             if output_router_logits and layer_outputs.router_logits is not None:
                 all_router_logits += (layer_outputs.router_logits,)
 
-            return hidden_states, all_hidden_states, all_attentions, all_router_logits, idx + 1
+            return hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx + 1
 
-        hidden_states, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
+        hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
             _layer_loop,
-            (hidden_states, all_hidden_states, all_attentions, all_router_logits, 0),
-            trace=True,
+            (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
+            trace=trace_layers,
         )
         hidden_states = self.norm(hidden_states)
 
@@ -3501,16 +3532,17 @@ class Qwen3OmniMoeCode2WavMLP(spx.Module):
     def forward(self, hidden_states: Array) -> Array:
         """Apply gated MLP: down_proj(act(gate_proj(x)) * up_proj(x)).
 
+        Delegates to :func:`easydel.layers.gated_mlp_forward`, which routes
+        supported layouts through the ejkernel fused MLP kernels and runs
+        the legacy composition otherwise.
+
         Args:
             hidden_states: Input hidden states.
 
         Returns:
             Transformed hidden states with same hidden dimension.
         """
-        gate_up = self.gate_up_proj(hidden_states)
-        gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
-        gate = self.act_fn(gate_raw)
-        return self.down_proj(gate * up)
+        return gated_mlp_forward(self, hidden_states)
 
 
 class Qwen3OmniMoeCode2WavAttention(spx.Module):
@@ -4169,6 +4201,19 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
 
         hidden_states = inputs_embeds
 
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
+        # Router-logit aggregation grows a Python tuple per layer, which
+        # lax.scan cannot carry — collecting it forces the trace path too.
+        trace_layers = self._layer_scan_trace(
+            False,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache or bool(output_router_logits),
+        )
+
         def _layer_loop(layer, carry):
             """Apply a single Talker code-predictor MoE layer inside the layer-stack scan.
 
@@ -4189,7 +4234,9 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
                     position_ids=position_ids,
                     output_attentions=output_attentions,
                     mode=mode,
-                    cache_view=past_key_values.views[layer_idx] if past_key_values is not None else None,
+                    cache_view=(
+                        past_key_values.views[layer_idx] if trace_layers and past_key_values is not None else None
+                    ),
                     cache_metadata=cache_metadata,
                 )
             hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, layer_idx, layers=self.layers)
@@ -4204,7 +4251,7 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
         hidden_states, all_hidden_states, all_self_attentions, all_router_logits, _ = self.layers.scan(
             _layer_loop,
             (hidden_states, all_hidden_states, all_self_attentions, all_router_logits, 0),
-            trace=True,
+            trace=trace_layers,
         )
         hidden_states = self.norm(hidden_states)
 
@@ -4564,15 +4611,33 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
             partition_manager=text_config.runtime_sharding_resolver,
         )
 
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
+        # Router-logit aggregation grows a Python tuple per layer, which
+        # lax.scan cannot carry — collecting it forces the trace path too.
+        trace_layers = self._layer_scan_trace(
+            False,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache or bool(output_router_logits),
+        )
+        cache_views = views if trace_layers else None
+        # Hoisted out of the loop body: the caching property must not be
+        # first materialized inside the lax.scan trace (tracer leak).
+        frequencies = self.frequencies
+
         def _layer_loop(block, carry):
             """Apply a single Talker MoE decoder layer inside the layer-stack scan.
 
             Body of ``self.layers.scan`` for the Talker text decoder;
-            runs ``block`` on the current hidden states, optionally
-            accumulates per-layer hidden states, attention weights, and
-            MoE router logits, and returns the updated carry tuple.
+            carries ``(hidden_states, cache_views, all_hidden_states,
+            all_attentions, all_router_logits, layer_index)``, optionally
+            accumulating per-layer hidden states, attention weights, and
+            MoE router logits.
             """
-            hidden_states, all_hidden_states, all_attentions, all_router_logits, idx = carry
+            hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -4582,27 +4647,33 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
                     mask_info=mask_info,
                     position_ids=position_ids,
                     mode=mode,
-                    cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
+                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
                     cache_metadata=cache_metadata,
                     output_attentions=output_attentions,
                     output_router_logits=output_router_logits,
-                    frequencies=self.frequencies,
+                    frequencies=frequencies,
                 )
             hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
 
-            self._layer_cache_view_update(None, idx, layer_outputs.cache_view, enabled=True, cache=past_key_values)
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                layer_outputs.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
             if output_router_logits and layer_outputs.router_logits is not None:
                 all_router_logits += (layer_outputs.router_logits,)
 
-            return hidden_states, all_hidden_states, all_attentions, all_router_logits, idx + 1
+            return hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx + 1
 
-        hidden_states, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
+        hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
             _layer_loop,
-            (hidden_states, all_hidden_states, all_attentions, all_router_logits, 0),
-            trace=True,
+            (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
+            trace=trace_layers,
         )
         hidden_states = checkpoint_name(self.norm(hidden_states), "model_output")
 

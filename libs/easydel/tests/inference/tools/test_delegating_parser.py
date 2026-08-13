@@ -426,19 +426,11 @@ def test_finish_reason_priority_tool_calls_beats_stop():
         def __init__(self, fr):
             self.finish_reason = fr
 
-    assert (
-        OutputPipeline._resolve_public_finish_reason([_FakeOutput("stop"), _FakeOutput("tool_calls")])
-        == "tool_calls"
-    )
+    assert OutputPipeline._resolve_public_finish_reason([_FakeOutput("stop"), _FakeOutput("tool_calls")]) == "tool_calls"
 
-    assert (
-        OutputPipeline._resolve_public_finish_reason([_FakeOutput("tool_calls"), _FakeOutput("stop")])
-        == "tool_calls"
-    )
+    assert OutputPipeline._resolve_public_finish_reason([_FakeOutput("tool_calls"), _FakeOutput("stop")]) == "tool_calls"
 
-    assert (
-        OutputPipeline._resolve_public_finish_reason([_FakeOutput("length"), _FakeOutput("tool_calls")]) == "length"
-    )
+    assert OutputPipeline._resolve_public_finish_reason([_FakeOutput("length"), _FakeOutput("tool_calls")]) == "length"
 
     assert OutputPipeline._resolve_public_finish_reason([_FakeOutput("abort")]) == "abort"
 
@@ -474,3 +466,100 @@ def test_tool_parser_with_tool_choice_none():
     r = dp.process_delta("hello", "hello", "hello", [], [])
     assert r.accumulated_content == "hello"
     assert dp.phase == ParsePhase.CONTENT
+
+
+class _MiniTokenizer:
+    """Tiny stand-in tokenizer for parsers that only need ``encode``."""
+
+    def __init__(self):
+        self._vocab: dict[str, int] = {}
+
+    def encode(self, text, add_special_tokens=False):
+        token_id = self._vocab.setdefault(text, len(self._vocab) + 1)
+        return [token_id]
+
+    def decode(self, token_ids):
+        inv = {v: k for k, v in self._vocab.items()}
+        return "".join(inv.get(i, "") for i in token_ids)
+
+
+def _make_llama_request():
+    return ChatCompletionRequest.model_validate(
+        {
+            "model": "test",
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+                    },
+                }
+            ],
+        }
+    )
+
+
+def _make_llama_parser():
+    from easydel.inference.tools.parsers.llama_tool_parser import Llama3JsonToolParser
+
+    return Llama3JsonToolParser(_MiniTokenizer())
+
+
+def test_llama_bare_json_tool_call_final():
+    """Markerless bare-JSON llama tool call must survive the machinery gate (final path)."""
+    dp = DelegatingParser(
+        tool_parser=_make_llama_parser(),
+        tool_request=_make_llama_request(),
+    )
+    r = dp.process_final('{"name": "get_weather", "arguments": {"city": "NYC"}}', [])
+    assert r.tool_calls, "bare-JSON tool call was finalized as plain content"
+    assert r.tool_calls[0].function.name == "get_weather"
+
+
+def test_llama_bare_json_tool_call_streaming():
+    """Markerless bare-JSON llama tool call must stream tool-call deltas."""
+    dp = DelegatingParser(
+        tool_parser=_make_llama_parser(),
+        tool_request=_make_llama_request(),
+    )
+    chunks = [
+        '{"name": "get_weather", ',
+        '"arguments": {"city": ',
+        '"NYC"}}',
+    ]
+    accumulated = ""
+    prev_ids: list[int] = []
+    saw_tool_delta = False
+    for chunk in chunks:
+        prev = accumulated
+        accumulated += chunk
+        ids = list(range(len(accumulated)))
+        r = dp.process_delta(accumulated, chunk, ids, prev, prev_ids)
+        prev_ids = ids
+        if r.delta_tool_calls:
+            saw_tool_delta = True
+    assert saw_tool_delta, "streaming gate dropped the markerless bare-JSON tool call"
+
+    final = dp.process_final(accumulated, prev_ids)
+    assert final.tool_calls, "final pass after streaming must extract the tool call"
+    assert final.tool_calls[0].function.name == "get_weather"
+
+
+def test_llama_prose_then_bare_json_final_and_previous_text_sync():
+    """Prose before a bare-JSON call: pass-through keeps the tool view in sync, final extracts."""
+    dp = DelegatingParser(
+        tool_parser=_make_llama_parser(),
+        tool_request=_make_llama_request(),
+    )
+    r = dp.process_delta("Sure - calling now. ", "Sure - calling now. ", [1], "", [])
+    assert r.delta_content == "Sure - calling now. "
+    # The gate's pass-through branch must keep the tool parser's
+    # previous-text view current for the first engaged call.
+    assert dp._tool_previous_text == "Sure - calling now. "
+
+    full = 'Sure - calling now. {"name": "get_weather", "arguments": {"city": "NYC"}}'
+    final = dp.process_final(full, [1, 2])
+    assert final.tool_calls, "final extraction must find the embedded bare-JSON call"
+    assert final.tool_calls[0].function.name == "get_weather"

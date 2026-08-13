@@ -67,6 +67,8 @@ def _make_spmd_lm_head_fn(model):
     executor._flat_state_args = not model.mesh.is_mpmd
     executor._graphstate_treedef = jax.tree_util.tree_structure(graphstate)
     executor._graphother_treedef = jax.tree_util.tree_structure(graphother)
+    executor._graphstate_packer = None
+    executor._graphother_packer = None
 
     lm_head_fn = executor._build_lm_head_fn(
         graphstate_template=graphstate,

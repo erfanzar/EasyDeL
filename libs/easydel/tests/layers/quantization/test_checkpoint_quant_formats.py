@@ -215,6 +215,36 @@ class TestFp8:
         )
         assert _relative_error(_dequantize_canonical(weight), reference) < 0.01
 
+    def test_block_scaled_non_divisible_dim_uses_declared_block(self):
+        """Scale boundaries sit at the checkpoint's block size, not at ceil.
+
+        A 576-row weight with 128-row blocks (DeepSeek-V3 shapes) carries 5
+        scale rows. Expanding each by ``ceil(576 / 5) = 116`` puts every
+        boundary in the wrong place and mis-scales 120 rows; the declared
+        ``weight_block_size`` must drive the expansion instead.
+        """
+        from easydel.layers.quantization.checkpoint._codecs import decode_scaled_elements
+
+        rng = np.random.default_rng(9)
+        out_features, in_features, block = 576, 128, 128
+        dense = rng.normal(size=(out_features, in_features)).astype(np.float32)
+        scale = rng.random((-(-out_features // block), 1)).astype(np.float32) + 0.5
+        expanded = np.repeat(scale, block, axis=0)[:out_features]
+        expanded = np.repeat(expanded, block, axis=1)[:, :in_features]
+        codes = jnp.asarray(dense / expanded).astype(jnp.float8_e4m3fn)
+        reference = (np.asarray(codes.astype(jnp.float32)) * expanded).T
+
+        resolved = _scheme(quant_method="fp8", weight_block_size=[block, block]).for_path("l")
+        decoded = np.asarray(decode_scaled_elements(codes, jnp.asarray(scale), block_shape=resolved.source.block_shape))
+        np.testing.assert_allclose(decoded, reference, rtol=1e-6, atol=1e-6)
+
+        weight = resolved.adapter.to_canonical(
+            {"weight": codes, "weight_scale_inv": jnp.asarray(scale)},
+            source=resolved.source,
+            target=resolved.target,
+        )
+        assert _relative_error(_dequantize_canonical(weight), reference) < 0.01
+
     def test_static_activation_adds_input_scale(self):
         """A static activation scheme consumes and carries its calibration."""
         resolved = _scheme(quant_method="fp8", activation_scheme="static").for_path("l")
@@ -274,9 +304,9 @@ class TestGptq:
             "scales": jnp.asarray(scales),
             "qzeros": jnp.asarray(_pack_u4_sequential(zeros, axis=-1)),
         }
-        reference = (
-            codes.astype(np.float32) - (np.repeat(zeros, group, 0).astype(np.float32) + 1.0)
-        ) * np.repeat(scales, group, 0)
+        reference = (codes.astype(np.float32) - (np.repeat(zeros, group, 0).astype(np.float32) + 1.0)) * np.repeat(
+            scales, group, 0
+        )
         return tensors, reference
 
     def test_round_trips(self):
@@ -307,9 +337,7 @@ class TestMxfp4:
         out_features, in_features = 128, 256
         codes = rng.integers(0, 16, size=(out_features, in_features)).astype(np.uint8)
         exponents = rng.integers(120, 135, size=(out_features, in_features // 32)).astype(np.uint8)
-        reference = (
-            E2M1_VALUES[codes] * np.repeat(np.exp2(exponents.astype(np.float32) - 127), 32, axis=1)
-        ).T
+        reference = (E2M1_VALUES[codes] * np.repeat(np.exp2(exponents.astype(np.float32) - 127), 32, axis=1)).T
 
         resolved = _scheme(quant_method="mxfp4").for_path("l")
         weight = resolved.adapter.to_canonical(
@@ -356,6 +384,21 @@ class TestNvfp4:
 
         resolved = _scheme(quant_method="modelopt_fp4").for_path("l")
         assert "output_scale" in canonical_param_names(resolved.target, resolved.source)
+
+    def test_rule_generation_refuses_the_unheld_output_scale(self):
+        """No layer registers ``output_scale``, so no rule may declare it.
+
+        Folding it into the weight is not a substitute: ejkernel's nvfp4 mode
+        stores per-group scales as E4M3 codes, and the global factor is what
+        keeps those inside E4M3's normal range. The seam must therefore fail
+        where the missing surface is still nameable rather than emit a split
+        that writes to a parameter the module tree does not have.
+        """
+        from easydel.layers.quantization.checkpoint import checkpoint_quant_reform_param
+
+        resolved = _scheme(quant_method="modelopt_fp4").for_path("l")
+        with pytest.raises(NotImplementedError, match="output_scale"):
+            checkpoint_quant_reform_param(resolved, target_prefix="l")
 
 
 class TestCompressedTensors:
@@ -418,6 +461,38 @@ class TestCompressedTensors:
         assert scheme.for_path("model.layers.0.mlp.down_proj") is None
         assert scheme.for_path("model.layers.0.self_attn.q_proj") is not None
 
+    def test_int4_pack_quantized_round_trips(self):
+        """CT ``pack-quantized``: ``weight_packed`` is ``[out, in // 8]``,
+        packed sequentially along the INPUT axis with a +8 storage offset —
+        the transpose of GPTQ's ``[in // 8, out]`` packing. Decoding with the
+        GPTQ codec produces a wrong-shaped, wrong-valued weight."""
+        from easydel.layers.quantization.checkpoint._codecs import decode_compressed_int4
+
+        rng = np.random.default_rng(8)
+        out_features, in_features, group = 128, 64, 32
+        signed = rng.integers(-8, 8, size=(out_features, in_features))
+        scales = rng.random((out_features, in_features // group)).astype(np.float32) + 0.1
+        reference = (signed.astype(np.float32) * np.repeat(scales, group, axis=1)).T
+
+        packed = _pack_u4_sequential((signed + 8).astype(np.uint32), axis=-1)
+        assert packed.shape == (out_features, in_features // 8)
+
+        # The codec decodes exactly: right axis, [in, out] orientation,
+        # signed values via the -8 offset.
+        dense = np.asarray(decode_compressed_int4(jnp.asarray(packed.astype(np.int32)), jnp.asarray(scales)))
+        assert dense.shape == (in_features, out_features)
+        np.testing.assert_allclose(dense, reference, rtol=1e-6, atol=1e-6)
+
+        config = self._config({"num_bits": 4, "type": "int", "strategy": "group", "group_size": group})
+        resolved = _scheme(**config).for_path("model.layers.0.q_proj")
+        assert resolved.source_suffixes == ("weight_packed", "weight_scale")
+        weight = resolved.adapter.to_canonical(
+            {"weight_packed": jnp.asarray(packed.astype(np.int32)), "weight_scale": jnp.asarray(scales)},
+            source=resolved.source,
+            target=resolved.target,
+        )
+        assert _relative_error(_dequantize_canonical(weight), reference) < 0.10
+
     def test_targeted_group_overrides_the_default(self):
         """A named target selects its own scheme over the catch-all."""
         config = {
@@ -431,11 +506,125 @@ class TestCompressedTensors:
         assert scheme.for_path("model.layers.0.q_proj").target.bits == 4
         assert scheme.for_path("model.layers.0.k_proj").target.bits == 8
 
+    def test_group_listing_class_and_module_targets_keeps_both(self):
+        """A group may name a class AND specific modules; neither may be lost.
+
+        Recording the catch-all and skipping the rest of the group drops the
+        module targets, so those layers silently fall back to whichever
+        catch-all was registered last — a different bit width here.
+        """
+        config = {
+            "quant_method": "compressed-tensors",
+            "config_groups": {
+                "narrow": {
+                    "targets": ["QKVParallelLinear", "model.layers.0.mlp.down_proj"],
+                    "weights": {"num_bits": 4, "type": "int", "group_size": 32},
+                },
+                "wide": {"targets": ["Linear"], "weights": {"num_bits": 8, "type": "int"}},
+            },
+        }
+        scheme = _scheme(**config)
+
+        assert scheme.for_path("model.layers.0.mlp.down_proj").target.bits == 4
+        assert scheme.for_path("model.layers.0.self_attn.k_proj").target.bits == 8
+
+    def test_nvfp4_global_scale_is_inverted(self):
+        """compressed-tensors stores the NVFP4 global scale as a divisor.
+
+        llm-compressor folds ``(FP8_MAX * FP4_MAX) / amax`` into the e4m3
+        block scales, so dequantization divides by ``weight_global_scale``.
+        ModelOpt's ``weight_scale_2`` is the reciprocal and multiplies.
+        Carrying this one through unchanged is off by ``global**2``.
+        """
+        rng = np.random.default_rng(11)
+        out_features, in_features = 128, 256
+        codes = rng.integers(0, 16, size=(out_features, in_features)).astype(np.uint8)
+        scale_codes = rng.integers(100, 126, size=(out_features, in_features // 16)).astype(np.uint8)
+        block_scales = np.asarray(jnp.asarray(scale_codes).view(jnp.float8_e4m3fn).astype(jnp.float32))
+        global_scale = np.float32(27.0)
+        reference = (E2M1_VALUES[codes] * np.repeat(block_scales, 16, axis=1) / global_scale).T
+
+        config = self._config({"num_bits": 4, "type": "float", "group_size": 16})
+        resolved = _scheme(**config).for_path("model.layers.0.q_proj")
+        assert resolved.source_suffixes == ("weight_packed", "weight_scale", "weight_global_scale")
+
+        weight = resolved.adapter.to_canonical(
+            {
+                "weight_packed": jnp.asarray(_pack_e2m1(codes)),
+                "weight_scale": jnp.asarray(scale_codes),
+                "weight_global_scale": jnp.asarray(global_scale),
+            },
+            source=resolved.source,
+            target=resolved.target,
+        )
+
+        assert float(weight.output_scale) == pytest.approx(1.0 / float(global_scale), rel=1e-6)
+        assert _relative_error(_dequantize_canonical(weight), reference) < 0.25
+
+    def test_asymmetric_scheme_is_refused(self):
+        """``symmetric: false`` ships a zero-point this adapter cannot read.
+
+        Parsing the flag and then decoding as symmetric offsets every group by
+        a full scale, which loads cleanly and produces garbage.
+        """
+        config = self._config({"num_bits": 4, "type": "int", "group_size": 32, "symmetric": False})
+        with pytest.raises(NotImplementedError, match="weight_zero_point"):
+            _scheme(**config)
+
     def test_unsupported_scheme_raises(self):
         """A bit width with no decoder must fail loudly at resolution."""
         config = self._config({"num_bits": 3, "type": "int"})
         with pytest.raises(NotImplementedError, match="no decoder"):
             _scheme(**config).for_path("x")
+
+
+class TestPerChannelScaleAxis:
+    """A 1-D scale must land on the axis its own codec's layout uses.
+
+    The codecs hand :func:`expand_scale` two orientations — fp8/MXFP4/NVFP4
+    and compressed-tensors decode in HF ``[out, in]``, AWQ and GPTQ decode in
+    ``[in, out]`` — so no fixed tie-break can be right for both. On a square
+    weight both axes match a per-channel scale's length, and guessing
+    transposes the scales: the load succeeds and the logits are garbage.
+    """
+
+    def test_square_weight_without_a_declared_axis_is_rejected(self):
+        """Length alone cannot disambiguate; refuse rather than guess."""
+        from easydel.layers.quantization.checkpoint import expand_scale
+
+        with pytest.raises(ValueError, match="ambiguous"):
+            expand_scale(jnp.arange(4, dtype=jnp.float32), (4, 4))
+
+    def test_declared_axis_places_the_scale(self):
+        """``channel_axis`` picks the axis outright, square or not."""
+        from easydel.layers.quantization.checkpoint import expand_scale
+
+        scale = jnp.asarray([1.0, 2.0, 3.0, 4.0])
+
+        rows = np.asarray(expand_scale(scale, (4, 4), channel_axis=0))
+        cols = np.asarray(expand_scale(scale, (4, 4), channel_axis=1))
+
+        np.testing.assert_allclose(rows, np.tile(np.arange(1, 5)[:, None], (1, 4)))
+        np.testing.assert_allclose(cols, np.tile(np.arange(1, 5)[None, :], (4, 1)))
+
+    def test_fp8_square_weight_scales_per_output_channel(self):
+        """The fp8 codec must scale rows of the HF ``[out, in]`` weight.
+
+        Resolving the tie to the input axis instead transposes the scales,
+        which is invisible in shape and fatal in value.
+        """
+        from easydel.layers.quantization.checkpoint import decode_scaled_elements
+
+        size = 8
+        codes = np.ones((size, size), np.float32)
+        scale = np.arange(1, size + 1, dtype=np.float32)
+        # HF [out, in] -> EasyDeL [in, out]: scaling output channels means the
+        # ramp lands on the COLUMNS of the returned array.
+        expected = np.tile(scale[None, :], (size, 1))
+
+        dense = np.asarray(decode_scaled_elements(jnp.asarray(codes), jnp.asarray(scale)))
+
+        np.testing.assert_allclose(dense, expected)
 
 
 class TestGroupingAxisLimitation:
@@ -463,9 +652,7 @@ class TestGroupingAxisLimitation:
         packed = prepack_quantized_weights(
             jnp.asarray(dense), group_size=32, bits=4, mode="mxfp4", axis=axis, transpose=False
         )
-        restored = np.asarray(
-            dequantize(packed[0], packed[1], None, group_size=32, bits=4, mode="mxfp4", axis=axis)
-        )
+        restored = np.asarray(dequantize(packed[0], packed[1], None, group_size=32, bits=4, mode="mxfp4", axis=axis))
         return restored.T if restored.shape != dense.shape else restored
 
     def test_input_axis_grouping_would_be_lossless(self):

@@ -544,6 +544,29 @@ def read_checkpoint_metadata(checkpoint_path: str) -> MetadataDict:
 _read_checkpoint_metadata = read_checkpoint_metadata
 
 
+def _reattach_scheme(scheme: str, path: str) -> str:
+    """Re-attach a URI *scheme* (e.g. ``"gs://"``) to a scheme-stripped *path*.
+
+    ``_fs.iterdir()`` yields paths with the URI scheme stripped: absolute for
+    local backends (``file:///a/b`` -> ``/a/b/child``) and bucket-relative for
+    object stores (``gs://bucket/run`` -> ``bucket/run/child``). The scheme is
+    prepended verbatim — no slash stripping — so ``file://`` URIs keep their
+    absolute-path root (``file://`` + ``/a/b`` == ``file:///a/b``).
+
+    Args:
+        scheme: URI scheme including the separator (``"file://"``), or ``""``
+            for plain local paths.
+        path: Child path as returned by ``_fs.iterdir``.
+
+    Returns:
+        The path with the scheme attached (unchanged when *scheme* is empty
+        or *path* already carries it).
+    """
+    if not scheme or path.startswith(scheme):
+        return path
+    return scheme + path
+
+
 def find_latest_checkpoint(base_path: str) -> str | None:
     """Find the most recent checkpoint under *base_path*.
 
@@ -568,14 +591,7 @@ def find_latest_checkpoint(base_path: str) -> str | None:
     # Re-attach the scheme taken from ``base_path`` before touching the results.
     _scheme = base_path.split("://", 1)[0] + "://" if "://" in base_path else ""
 
-    def _restore_scheme(path: str) -> str:
-        if not _scheme or path.startswith(_scheme):
-            return path
-        return _scheme + path.lstrip("/")
-
-    candidates = [
-        q for q in (_restore_scheme(p) for p in _fs.iterdir(base_path)) if _fs.is_dir(q)
-    ]
+    candidates = [q for q in (_reattach_scheme(_scheme, p) for p in _fs.iterdir(base_path)) if _fs.is_dir(q)]
     candidates.append(base_path)
 
     ckpts = [p for p in candidates if _fs.exists(_fs.joinpath(p, "metadata.json"))]

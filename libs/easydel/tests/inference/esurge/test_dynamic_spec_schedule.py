@@ -84,9 +84,7 @@ def test_config_default_is_static():
 
 def test_config_rejects_overlapping_ranges():
     with pytest.raises(ValueError, match="overlap"):
-        eSurgeDrafterConfig.coerce_config(
-            {"method": "mtp", "num_draft_tokens_per_batch_size": [(1, 8, 2), (8, 16, 0)]}
-        )
+        eSurgeDrafterConfig.coerce_config({"method": "mtp", "num_draft_tokens_per_batch_size": [(1, 8, 2), (8, 16, 0)]})
 
 
 def test_config_rejects_k_above_num_draft_tokens():

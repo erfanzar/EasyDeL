@@ -1241,17 +1241,34 @@ class DbrxModel(EasyDeLBaseModule):
         if past_key_values is None:
             past_key_values = TransformerCache.init_empty(len(self.blocks))
 
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
+        # Router-logit aggregation grows a Python tuple per layer, which
+        # lax.scan cannot carry — collecting it forces the trace path too.
+        trace_layers = self._layer_scan_trace(
+            False,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache or bool(output_router_logits),
+        )
+        cache_views = views if trace_layers else None
+        # Hoisted out of the loop body: the caching property must not be
+        # first materialized inside the lax.scan trace (tracer leak).
+        frequencies = self.frequencies
+
         def _layer_loop(block, carry):
             """Per-block body for the DBRX decoder ``scan``.
 
-            Carry layout: ``(hidden_states, all_hidden_states, all_attentions,
-            all_router_logits, idx)``. Records the input hidden state when
-            requested, runs one DBRX decoder block at the corresponding
-            pipeline stage, optionally accumulates attention weights and the
-            block's MoE router logits, updates the per-block KV cache slot,
-            and returns the next carry.
+            Carry layout: ``(hidden_states, cv, all_hidden_states,
+            all_attentions, all_router_logits, idx)``. Records the input
+            hidden state when requested, runs one DBRX decoder block at the
+            corresponding pipeline stage, optionally accumulates attention
+            weights and the block's MoE router logits, updates the per-block
+            KV cache slot, and returns the next carry.
             """
-            hidden_states, all_hidden_states, all_attentions, all_router_logits, idx = carry
+            hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
             with self._layer_stage_context(idx, layers=self.blocks):
@@ -1260,11 +1277,11 @@ class DbrxModel(EasyDeLBaseModule):
                     mask_info=mask_info,
                     position_ids=position_ids,
                     mode=mode,
-                    cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
+                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
                     cache_metadata=cache_metadata,
                     output_attentions=output_attentions,
                     output_router_logits=output_router_logits,
-                    frequencies=self.frequencies,
+                    frequencies=frequencies,
                 )
             hidden_states = self._mark_layer_stage_boundary(outputs.hidden_states, idx, layers=self.blocks)
 
@@ -1279,13 +1296,19 @@ class DbrxModel(EasyDeLBaseModule):
                 all_attentions += (outputs.attention_weight,)
             if output_router_logits:
                 all_router_logits += (outputs.router_logits,)
-            self._layer_cache_view_update(None, idx, outputs.cache_view, enabled=True, cache=past_key_values)
-            return hidden_states, all_hidden_states, all_attentions, all_router_logits, idx + 1
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                outputs.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
+            return hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx + 1
 
-        hidden_states, all_hidden_states, all_attentions, all_router_logits, _ = self.blocks.scan(
+        hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _ = self.blocks.scan(
             _layer_loop,
-            (hidden_states, all_hidden_states, all_attentions, all_router_logits, 0),
-            trace=True,
+            (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
+            trace=trace_layers,
         )
         hidden_states = self.norm_f(hidden_states)
 

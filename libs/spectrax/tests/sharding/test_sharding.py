@@ -12,7 +12,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 import spectrax as spx
 from spectrax import common_types as ct
 from spectrax.nn.linear import Linear
@@ -89,6 +88,46 @@ def test_partition_axis_resolves_builtin_semantics_and_generation_mode():
         None,
     ]
     assert paxis.resolve_axis([ct.BATCH, ct.HEAD], mode=ct.MODE_DECODE) == [("fsdp", "dp"), "tp"]
+
+
+def test_decode_axes_declared_none_stay_replicated_in_decode_mode():
+    """A ``decode_*`` field declared ``None`` means replicated, not "unset".
+
+    ``__post_init__`` collapses only the ``NOT_GIVEN`` decode fields onto
+    their standard counterparts. The three that ship ``None`` by declaration
+    are deliberate overrides: decode windows carry a handful of tokens, so
+    sharding the query-sequence or head-dim axes there buys nothing and costs
+    a latency-bound collective at every consumer. Treating ``None`` as "unset"
+    makes the override inexpressible and silently re-inherits ``sp``/``tp``.
+    """
+    paxis = PartitionAxis(data_parallel_axis="dp", tensor_parallel_axis="tp", sequence_parallel_axis="sp")
+
+    assert paxis.resolve_axis([ct.QUERY_LENGTH], mode=ct.MODE_TRAIN) == ["sp"]
+    assert paxis.resolve_axis([ct.QUERY_LENGTH], mode=ct.MODE_DECODE) == [None]
+    assert paxis.resolve_axis([ct.HEAD_DIM], mode=ct.MODE_DECODE) == [None]
+    # Sharded in training, replicated in decode — same reasoning.
+    assert paxis.resolve_axis([ct.EMBED], mode=ct.MODE_TRAIN) == ["tp"]
+    assert paxis.resolve_axis([ct.EMBED], mode=ct.MODE_DECODE) == [None]
+    # A NOT_GIVEN decode field still mirrors its standard counterpart.
+    assert paxis.resolve_axis([ct.KV_LENGTH], mode=ct.MODE_DECODE) == ["sp"]
+
+
+def test_explicit_decode_axis_overrides_the_replicated_default():
+    """Passing a decode axis explicitly opts back into sharded decode.
+
+    Decode fields hold concrete mesh-axis names, not semantic constants:
+    ``_resolve_axis_rule`` returns a field's value verbatim once it resolves
+    the field name, so a semantic sentinel stored here would leak through.
+    """
+    paxis = PartitionAxis(
+        tensor_parallel_axis="tp",
+        sequence_parallel_axis="sp",
+        decode_hidden_state_axis="tp",
+        decode_query_sequence_axis="sp",
+    )
+
+    assert paxis.resolve_axis([ct.EMBED], mode=ct.MODE_DECODE) == ["tp"]
+    assert paxis.resolve_axis([ct.QUERY_LENGTH], mode=ct.MODE_DECODE) == ["sp"]
 
 
 def test_partition_axis_rejects_unknown_composite_sub_axis():

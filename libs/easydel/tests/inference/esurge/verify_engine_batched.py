@@ -131,7 +131,13 @@ def run_engine(engine, tokenizer, label: str) -> dict:
     print(f"  sum(engine per-req tok/s) = {sum(engine_tps_vals):.2f}  mean per-req = {mean_engine_tps:.2f}")
     print(f"  sample response[0]: {outs[0].get_text()[:240]!r}")
     engine.terminate()
-    return {"label": label, "agg_tps": agg, "sum_engine_tps": sum(engine_tps_vals), "total_tokens": total_tokens, "wall": wall}
+    return {
+        "label": label,
+        "agg_tps": agg,
+        "sum_engine_tps": sum(engine_tps_vals),
+        "total_tokens": total_tokens,
+        "wall": wall,
+    }
 
 
 def main():

@@ -763,9 +763,9 @@ class MambaModel(EasyDeLBaseModule):
     ) -> tuple | MambaOutput:
         """Embed tokens and run them through every Mamba layer, threading the cache.
 
-        The trunk is executed via :meth:`nn.ModuleList.scan` with
-        ``trace=True`` so the layer body is JIT-traced once and replayed for
-        each block, keeping compile time independent of ``num_hidden_layers``.
+        The trunk is executed via :meth:`nn.ModuleList.scan`; the trace-vs-scan
+        decision follows ``config.scan_layers`` and is forced to the python
+        trace path whenever live cache views are present.
         At each step the per-layer :class:`RecurrentCacheView` is read from
         ``cache.views[idx]`` and the updated view is written back in-place;
         passing ``cache=None`` causes a fresh empty cache to be allocated, which
@@ -832,24 +832,36 @@ class MambaModel(EasyDeLBaseModule):
         hidden_states = inputs_embeds
         all_hidden_states = () if output_hidden_states else None
 
+        # Live recurrent-cache views are read/written by python index — any
+        # allocated cache forces the trace path; the fresh ``init_empty``
+        # placeholder (all-``None`` views) can ride the lax.scan path.
+        views = cache.views if cache is not None else None
+        trace_layers = self._layer_scan_trace(
+            False,
+            output_hidden_states=output_hidden_states,
+            cache_views=views,
+        )
+
         def _layer_loop(block, carry):
             """Run a single :class:`MambaBlock` and update the SSM cache.
 
             Carry: ``(hidden_states, all_hidden_states, layer_index)``. Reads
             the layer's :class:`RecurrentCacheView` from ``cache.views[idx]``
-            and writes the updated view back into ``cache[idx]``.
+            and writes the updated view back into ``cache[idx]`` on the
+            trace path.
             """
             hidden_states, all_hidden_states, idx = carry
             with self._layer_stage_context(idx, layers=self.layers):
                 hidden_states, cache_view = block(
                     hidden_states=hidden_states,
-                    cache=cache.views[idx],
+                    cache=cache.views[idx] if trace_layers else None,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                     segment_ids=segment_ids,
                 )
             hidden_states = self._mark_layer_stage_boundary(hidden_states, idx, layers=self.layers)
-            cache[idx] = cache_view
+            if trace_layers:
+                cache[idx] = cache_view
             if output_hidden_states:
                 assert all_hidden_states is not None
                 all_hidden_states = (*all_hidden_states, hidden_states)
@@ -859,7 +871,7 @@ class MambaModel(EasyDeLBaseModule):
         hidden_states, all_hidden_states, _ = self.layers.scan(
             _layer_loop,
             (hidden_states, all_hidden_states, 0),
-            trace=True,
+            trace=trace_layers,
         )
         hidden_states = self.norm_f(hidden_states)
 

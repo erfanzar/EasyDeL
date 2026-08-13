@@ -868,6 +868,15 @@ class WhisperEncoder(EasyDeLBaseModule):
 
         hidden_states = self.dropout_layer(hidden_states)
 
+        # LayerDrop draws a python coin per layer, which cannot ride a
+        # lax.scan body — training with layerdrop forces the trace path.
+        trace_layers = self._layer_scan_trace(
+            False,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            extra=bool(self.training and self.layerdrop > 0),
+        )
+
         def _layer_loop(encoder_layer, carry):
             """Apply a single Whisper encoder layer inside the layer-stack scan.
 
@@ -900,7 +909,7 @@ class WhisperEncoder(EasyDeLBaseModule):
         hidden_states, all_hidden_states, all_attentions, _ = self.layers.scan(
             _layer_loop,
             (hidden_states, all_hidden_states, all_attentions, 0),
-            trace=True,
+            trace=trace_layers,
         )
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
@@ -1097,15 +1106,30 @@ class WhisperDecoder(EasyDeLBaseModule):
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
+        # LayerDrop draws a python coin per layer, which cannot ride a
+        # lax.scan body — training with layerdrop forces the trace path.
+        trace_layers = self._layer_scan_trace(
+            False,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache or bool(self.training and self.layerdrop > 0),
+        )
+        cache_views = views if trace_layers else None
+
         def _layer_loop(decoder_layer, carry):
             """Apply a single Whisper decoder layer inside the layer-stack scan.
 
-            Body of ``self.layers.scan``; runs ``decoder_layer`` on the
-            current hidden states, optionally accumulates per-layer
-            hidden states, self-attention weights and cross-attention
-            weights, and returns the updated carry tuple.
+            Body of ``self.layers.scan``; carries ``(hidden_states,
+            cache_views, all_hidden_states, all_self_attns,
+            all_cross_attentions, layer_index)``, optionally accumulating
+            per-layer hidden states, self-attention weights and
+            cross-attention weights.
             """
-            hidden_states, all_hidden_states, all_self_attns, all_cross_attentions, idx = carry
+            hidden_states, cv, all_hidden_states, all_self_attns, all_cross_attentions, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
                 # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
@@ -1120,11 +1144,17 @@ class WhisperDecoder(EasyDeLBaseModule):
                         encoder_hidden_states=encoder_hidden_states,
                         encoder_mask_info=encoder_mask_info,
                         mode=mode,
-                        cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
+                        cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
                         cache_metadata=cache_metadata,
                         output_attentions=output_attentions,
                     )
-            self._layer_cache_view_update(None, idx, layer_outputs[-1], enabled=True, cache=past_key_values)
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                layer_outputs[-1],
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
             hidden_states = self._mark_layer_stage_boundary(layer_outputs[0], idx, layers=self.layers)
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
@@ -1132,12 +1162,12 @@ class WhisperDecoder(EasyDeLBaseModule):
                 if encoder_hidden_states is not None:
                     all_cross_attentions += (layer_outputs[2],)
 
-            return hidden_states, all_hidden_states, all_self_attns, all_cross_attentions, idx + 1
+            return hidden_states, cv, all_hidden_states, all_self_attns, all_cross_attentions, idx + 1
 
-        hidden_states, all_hidden_states, all_self_attns, all_cross_attentions, _ = self.layers.scan(
+        hidden_states, _, all_hidden_states, all_self_attns, all_cross_attentions, _ = self.layers.scan(
             _layer_loop,
-            (hidden_states, all_hidden_states, all_self_attns, all_cross_attentions, 0),
-            trace=True,
+            (hidden_states, cache_views, all_hidden_states, all_self_attns, all_cross_attentions, 0),
+            trace=trace_layers,
         )
         if output_hidden_states:
             all_hidden_states += (hidden_states,)

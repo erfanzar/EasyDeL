@@ -600,22 +600,34 @@ def _ragged_paged_attention_kernel_loop(
     bkv_sz = bkv_p * page_size
     start_seq_idx, end_seq_idx = case.get_range(distribution_ref)
 
+    def q_len_of(s):
+        return cu_q_lens_ref[s + 1] - cu_q_lens_ref[s]
+
+    def next_nonempty_seq(idx):
+        # Rows with zero scheduled tokens (budget-skipped or async-retired
+        # requests) are legitimate mid-batch: they run zero block iterations,
+        # so routing the fetch pipeline through them strands the next row's
+        # DMA semaphore and hangs the device. Skip them in the prefetch chain.
+        def cond(j):
+            return jnp.logical_and(j < end_seq_idx, q_len_of(j) == 0)
+
+        return lax.while_loop(cond, lambda j: j + 1, idx)
+
+    def start_bkv_idx_of(s):
+        if sliding_window is None:
+            return 0
+        gap = kv_lens_ref[s] - q_len_of(s)
+        return jnp.maximum(gap - sliding_window, 0) // bkv_sz
+
     q_start = cu_q_lens_ref[seq_idx]
     q_end = cu_q_lens_ref[seq_idx + 1]
     q_len = q_end - q_start
     kv_len = kv_lens_ref[seq_idx]
     kv_q_gap = kv_len - q_len
-    cur_seq_start_bkv_idx = 0
+
     next_seq_start_bkv_idx = 0
     if sliding_window is not None:
-        cur_seq_start_bkv_idx = jnp.maximum(kv_q_gap - sliding_window, 0) // bkv_sz
-        next_seq_idx = jnp.minimum(seq_idx + 1, end_seq_idx - 1)
-        next_q_start = cu_q_lens_ref[next_seq_idx]
-        next_q_end = cu_q_lens_ref[next_seq_idx + 1]
-        next_q_len = next_q_end - next_q_start
-        next_kv_len = kv_lens_ref[next_seq_idx]
-        next_kv_q_gap = next_kv_len - next_q_len
-        next_seq_start_bkv_idx = jnp.maximum(next_kv_q_gap - sliding_window, 0) // bkv_sz
+        next_seq_start_bkv_idx = start_bkv_idx_of(jnp.minimum(next_nonempty_seq(seq_idx + 1), end_seq_idx - 1))
 
     def flash_attention(
         q,
@@ -968,7 +980,7 @@ def _ragged_paged_attention_kernel_loop(
             next_bq_idx = bq_idx + 1
             is_last_bq = next_bq_idx == num_bq
             next_bq_idx = lax.select(is_last_bq, 0, next_bq_idx)
-            next_seq_idx = lax.select(is_last_bq, seq_idx + 1, seq_idx)
+            next_seq_idx = lax.select(is_last_bq, next_nonempty_seq(seq_idx + 1), seq_idx)
             next_bq_sem_idx = lax.select(bq_sem_idx == 0, 1, 0)
             return next_seq_idx, next_bq_idx, next_bq_sem_idx
 
@@ -978,7 +990,7 @@ def _ragged_paged_attention_kernel_loop(
             next_bq_idx = lax.select(is_last_bkv, bq_idx + 1, bq_idx)
             is_last_bq = next_bq_idx == num_bq
             next_bq_idx = lax.select(is_last_bq, 0, next_bq_idx)
-            next_seq_idx = lax.select(is_last_bq, seq_idx + 1, seq_idx)
+            next_seq_idx = lax.select(is_last_bq, next_nonempty_seq(seq_idx + 1), seq_idx)
             next_bkv_sem_idx = lax.select(bkv_sem_idx == 0, 1, 0)
 
             next_bq_start_bkv_idx = get_start_bkv_idx(kv_q_gap + (bq_idx + 1) * actual_bq_sz)
@@ -1084,10 +1096,14 @@ def _ragged_paged_attention_kernel_loop(
 
     @pl.when(seq_idx == start_seq_idx)
     def prologue():
-        start_fetch_bq(start_seq_idx, 0, 0)
-        start_fetch_bkv(start_seq_idx, cur_seq_start_bkv_idx, 0)
+        first_seq_idx = next_nonempty_seq(start_seq_idx)
 
-    @pl.when(jnp.logical_and(start_seq_idx <= seq_idx, seq_idx < end_seq_idx))
+        @pl.when(first_seq_idx < end_seq_idx)
+        def _():
+            start_fetch_bq(first_seq_idx, 0, 0)
+            start_fetch_bkv(first_seq_idx, start_bkv_idx_of(first_seq_idx), 0)
+
+    @pl.when(jnp.logical_and(jnp.logical_and(start_seq_idx <= seq_idx, seq_idx < end_seq_idx), q_len > 0))
     def pipeline():
         process()
 
@@ -1344,6 +1360,10 @@ def dynamic_validate_inputs(
     for i in range(k):
         q_len = query_start_loc[i + 1] - query_start_loc[i]
         kv_len = kv_lens[i]
+        if q_len == 0:
+            # Empty rows (budget-skipped or async-retired requests) are part
+            # of the contract: the kernel skips them entirely.
+            continue
         if not (0 < q_len <= kv_len):
             raise ValueError(f"Require 0 < {q_len=} <= {kv_len=} at sequence {i}.")
         page_cnt = cdiv(kv_len, page_size)

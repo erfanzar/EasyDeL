@@ -162,9 +162,9 @@ class FalconMambaConfig(EasyDeLBaseConfig):
         """Expose the recurrent-only layer layout for HF parity and cache helpers.
 
         Returns:
-            List of ``"mamba"`` strings with length ``num_hidden_layers``.
+            List of ``"linear_attention"`` strings (HF-validator-accepted; routes identically to ``"mamba"`` in EasyDeL) with length ``num_hidden_layers``.
         """
-        return ["mamba"] * self.num_hidden_layers
+        return ["linear_attention"] * self.num_hidden_layers
 
     def get_mask_details(self):
         """Recurrent Mamba layers do not use attention-mask descriptors.

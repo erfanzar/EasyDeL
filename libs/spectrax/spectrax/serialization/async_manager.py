@@ -113,7 +113,6 @@ def _cast_floating_leaves(arrays: list, dtype) -> list:
     return cast
 
 
-
 def _treedef_to_b64(treedef) -> str:
     """Serialize a JAX tree definition to a base64 string.
 
@@ -687,8 +686,20 @@ class AsyncCheckpointManager:
             or tensorstore_assume_metadata
             or show_progress
         )
-        target_dtypes = None if target_dtype is None else [target_dtype] * len(paths)
         if not use_custom_path:
+            target_dtypes = None
+            if target_dtype is not None:
+                # Same per-leaf guard the custom path applies through
+                # ``_leaf_target_dtype``: the requested dtype only casts
+                # floating leaves. Integer leaves (packed quantized codes,
+                # scales, token ids) read back as their stored dtype — passed
+                # explicitly rather than as ``None`` entries, because the JAX
+                # manager tree-maps over the dtypes list and a ``None`` entry
+                # would change its pytree structure.
+                target_dtypes = []
+                for storage_dtype in storage_dtypes or [None] * len(paths):
+                    leaf_dtype = _leaf_target_dtype(target_dtype, storage_dtype)
+                    target_dtypes.append(storage_dtype if leaf_dtype is None else leaf_dtype)
             return list(
                 self.global_manager.deserialize_with_paths(
                     shardings=shardings,  # pyright: ignore[reportArgumentType]

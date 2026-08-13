@@ -114,6 +114,18 @@ class OpenAIToolParser(ToolParser):
         self.tool_call_start_token = "["
         self.tool_call_end_token = "]"
 
+    def get_tool_machinery_hints(self) -> Sequence[str]:
+        """Include the bare-JSON dict prefix alongside the ``[`` start token.
+
+        ``_extract_json_candidate`` accepts markerless dict payloads
+        (``stripped.startswith("{")`` and fenced ``\\`\\`\\`json`` blocks), so
+        the delegating parser's machinery gate must engage on ``{`` too.
+        """
+        hints = list(super().get_tool_machinery_hints())
+        if "{" not in hints:
+            hints.append("{")
+        return tuple(hints)
+
     @staticmethod
     def _extract_json_candidate(text: str) -> tuple[str | None, str | None]:
         """Extract JSON content from model output text.

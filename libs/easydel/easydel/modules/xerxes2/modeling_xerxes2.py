@@ -67,6 +67,7 @@ from easydel.layers import (
     RowParallelLinear,
     RowParallelMoELinear,
     dense_gate_up_layout,
+    gated_mlp_forward,
     moe_gate_up_fusion_reform_param,
     split_fused_gate_up_projection,
 )
@@ -346,7 +347,7 @@ class Xerxes2MLP(spx.Module):
         self.precision = precision
         self.rngs = rngs
 
-        self.act = jax.nn.silu
+        self.act_fn = jax.nn.silu
         self.gate_up_proj = ColumnParallelLinear(
             config.hidden_size,
             (config.intermediate_size, config.intermediate_size),
@@ -374,26 +375,17 @@ class Xerxes2MLP(spx.Module):
     ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Apply gated feedforward transformation with fused projections.
 
+        Delegates to :func:`easydel.layers.gated_mlp_forward`, which routes
+        supported layouts through the ejkernel fused MLP kernels and runs
+        the legacy composition otherwise.
+
         Args:
             hidden_states: Input tensor [batch, seq_len, hidden_dim]
 
         Returns:
             Transformed hidden states [batch, seq_len, hidden_dim]
         """
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        up_states = self.gate_up_proj(hidden_states)
-        gate, up_states = split_fused_gate_up_projection(up_states, config=self.config)
-        hidden_states = checkpoint_name(self.down_proj(up_states * jax.nn.silu(gate)), "mlp_output")
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        return hidden_states
+        return gated_mlp_forward(self, hidden_states)
 
 
 class Xerxes2MoeMLPStack(spx.Module):
@@ -579,8 +571,8 @@ class Xerxes2MoeSparseBlock(BaseMoeModule):
             hidden_state=hidden_states,
             gate_layer=self.gate,
             expert_layer=self.experts,
-            gate_up_kernel=self.experts.gate_up_proj.weight.value,
-            wd_kernel=self.experts.down_proj.weight.value,
+            gate_up_kernel=self.experts.gate_up_proj.kernel_view(),
+            wd_kernel=self.experts.down_proj.kernel_view(),
             act_fn=self.experts.act_fn,
         )
         return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")

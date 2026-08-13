@@ -82,16 +82,27 @@ def _scale_grad(x: object, scale: object) -> object:
     ``float0`` leaves are returned unchanged so the resulting pytree
     can still be passed back through JAX's autodiff plumbing.
 
+    The result keeps ``x``'s dtype: a strongly-typed scalar (e.g. the
+    ``float32`` ``1/num_microbatches`` loss scale) would otherwise promote
+    bf16 gradient trees to f32, doubling gradient memory on the terminal
+    pipeline stage and making its accumulation dtype inconsistent with the
+    non-terminal stages.
+
     Args:
         x: Cotangent leaf.
         scale: Scalar multiplier.
 
     Returns:
-        ``x * scale`` for normal arrays, ``x`` for ``float0``.
+        ``x * scale`` cast back to ``x``'s dtype for normal arrays,
+        ``x`` for ``float0``.
     """
     if x is None or _is_float0(x):
         return x
-    return x * scale
+    scaled = x * scale
+    dtype = getattr(x, "dtype", None)
+    if dtype is not None and getattr(scaled, "dtype", None) != dtype and hasattr(scaled, "astype"):
+        scaled = scaled.astype(dtype)
+    return scaled
 
 
 def _add_grad(a: object, b: object) -> object:

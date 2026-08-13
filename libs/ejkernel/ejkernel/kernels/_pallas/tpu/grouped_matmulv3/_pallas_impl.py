@@ -428,6 +428,41 @@ def generate_block_specs(
     return (lhs_block_spec, rhs_block_spec), out_block_spec
 
 
+def should_dequantize_rhs_before_matmul(
+    *,
+    matmul_supported: bool,
+    has_scale: bool,
+    rhs_quant_block_size: int,
+    mxu_size: int,
+) -> bool:
+    """Decide whether the unquantized-lhs path pre-dequantizes the RHS tile.
+
+    Only a genuinely MXU-unsupported ``(lhs, rhs)`` dtype pair takes the
+    pre-dequant branch — there the pair cannot be fed to the MXU at all, so
+    folding the scales in registers and rounding into the lhs dtype is the
+    only way to execute. Supported pairs must NEVER pre-dequantize, no matter
+    how narrow the rhs quant block is relative to the MXU column: the
+    pre-dequant branch rounds f32-dequantized weights into the lhs dtype
+    (bf16) before the matmul, silently changing numerics versus the exact
+    in-accumulator scale path that has always served them (easydel's default
+    affine group size is 64, well below the 128-wide MXU column). Any future
+    perf work on narrow blocks must keep supported-pair numerics or add an
+    explicit opt-in.
+
+    Args:
+        matmul_supported: Whether the MXU natively accepts the (lhs, rhs)
+            dtype pair.
+        has_scale: Whether the rhs carries per-block quantization scales.
+        rhs_quant_block_size: The rhs quantization block width along K.
+        mxu_size: The MXU column size.
+
+    Returns:
+        ``True`` only when the dtype pair is unsupported.
+    """
+    del has_scale, rhs_quant_block_size, mxu_size  # deliberately NOT decision inputs
+    return not matmul_supported
+
+
 def inner_kernel(
     tiled_lhs_ref: jax.Array,
     tiled_rhs_ref: RhsRef,
@@ -488,12 +523,21 @@ def inner_kernel(
             # native support for (lhs, rhs) — e.g. bf16 x f4E2M1FN, or
             # bf16 x f8 on chips with no fp8 units — feeding the pair directly
             # is a Mosaic compile error, so the rhs must be dequantized into
-            # the lhs dtype first. The same pre-matmul dequantization also wins
-            # when the rhs quant block is narrower than the MXU column: the
-            # post-scale path would split the contraction into `mxu/qbs` tiny
-            # matmuls per column strip, starving the MXU.
+            # the lhs dtype first. That is the ONLY case that may take the
+            # pre-dequant branch: it rounds the f32-dequantized rhs into the
+            # lhs dtype (bf16) before the matmul, which changes numerics
+            # versus the exact in-accumulator scale path. Supported pairs keep
+            # the in-accumulator path regardless of quant block size —
+            # easydel's default affine group size is 64 (< mxu column), so a
+            # block-size trigger here would silently re-round every default
+            # quantized weight with no opt-out.
             matmul_supported = tpu_info.is_matmul_supported(lhs_dtype, tiled_rhs.dtype)
-            dequantize_before = not matmul_supported or (cfgs.rhs_cfgs.has_scale and rhs_qbs < mxu_size)
+            dequantize_before = should_dequantize_rhs_before_matmul(
+                matmul_supported=matmul_supported,
+                has_scale=cfgs.rhs_cfgs.has_scale,
+                rhs_quant_block_size=rhs_qbs,
+                mxu_size=mxu_size,
+            )
 
             if dequantize_before:
                 if cfgs.rhs_cfgs.has_scale:

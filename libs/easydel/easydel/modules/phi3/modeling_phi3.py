@@ -60,7 +60,7 @@ from easydel.layers import (
     RowParallelLinear,
     dense_gate_up_layout,
     dense_qkv_layout,
-    split_fused_gate_up_projection,
+    gated_mlp_forward,
     split_fused_qkv_projection,
 )
 from easydel.layers import RMSNorm as RMSNorm
@@ -125,7 +125,7 @@ class Phi3MLP(spx.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.activation_fn = ACT2FN[self.config.hidden_act]
+        self.act_fn = ACT2FN[self.config.hidden_act]
 
     @property
     def reform_param(self) -> dict:
@@ -137,28 +137,17 @@ class Phi3MLP(spx.Module):
     ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Apply gated feedforward transformation.
 
+        Delegates to :func:`easydel.layers.gated_mlp_forward`, which routes
+        supported layouts through the ejkernel fused MLP kernels and runs
+        the legacy composition otherwise.
+
         Args:
             hidden_states: Input tensor [batch, seq_len, hidden_dim]
 
         Returns:
             Transformed hidden states [batch, seq_len, hidden_dim] after gated MLP
         """
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        up_states = self.gate_up_proj(hidden_states)
-        gate, up_states = split_fused_gate_up_projection(up_states, config=self.config)
-        gate = checkpoint_name(self.activation_fn(gate), "mlp_gate")
-        up_states = checkpoint_name(up_states * gate, "mlp_up")
-        hidden_states = checkpoint_name(self.down_proj(up_states), "mlp_down")
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        return checkpoint_name(hidden_states, "mlp_output")
+        return gated_mlp_forward(self, hidden_states)
 
 
 class Phi3Attention(UnifiedAttention):

@@ -98,10 +98,16 @@ Example:
 
 from ._linear import ColumnParallelLinear, ParallelLinear, RowParallelLinear
 from ._linear_moe import ColumnParallelMoELinear, ParallelMoELinear, RowParallelMoELinear
-from ._linear_quantized import ColumnParallelLinearQuantized, ParallelLinearQuantized, RowParallelLinearQuantized
+from ._linear_quantized import (
+    W4A4_FUSED_PAIR_MIN_PACKED_BYTES,
+    ColumnParallelLinearQuantized,
+    ParallelLinearQuantized,
+    RowParallelLinearQuantized,
+)
 from ._lora import eLoRA
 
 __all__ = (
+    "W4A4_FUSED_PAIR_MIN_PACKED_BYTES",
     "ColumnParallelLinear",
     "ColumnParallelLinearQuantized",
     "ColumnParallelMoELinear",

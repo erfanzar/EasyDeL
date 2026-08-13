@@ -12,6 +12,7 @@ import jax
 
 from ...core._weakcache import weak_invalidate
 from ..schedules import FusedTask, Phase
+from .pscan_compiler import _scope_stage_persistent_cache
 from .schedule_types import _ApplyPayload, _ScheduleUnit
 
 _SCHEDULE_FUSED_FWDBWD_CACHE: dict[tuple[int, ...], Callable[..., object]] = {}
@@ -147,7 +148,8 @@ def _eval_schedule_cluster_terminal(
     n_invars: int,
     consts: tuple[object, ...],
     *invars: object,
-) -> tuple[object, tuple[object, tuple[object, ...]]]:
+    n_aux: int = 0,
+) -> tuple[object, tuple[object, ...], tuple[object, tuple[object, ...]]]:
     """Run the terminal cluster's loss + gradient computation in-place.
 
     Used as a building block for direct-fused jits that compose the
@@ -162,17 +164,18 @@ def _eval_schedule_cluster_terminal(
         n_invars: Cluster's invar count.
         consts: Placed cluster constants.
         *invars: Cluster's positional inputs.
+        n_aux: Number of auxiliary (non-loss) terminal outputs.
 
     Returns:
-        ``(loss, (g_consts, g_invars))`` mirroring
+        ``(loss, aux, (g_consts, g_invars))`` mirroring
         :func:`_make_terminal_jit`'s output.
     """
 
-    def pure(c: tuple[object, ...], *xs: object) -> object:
-        """Pure (consts, invars) -> scalar interpreter for the loss cluster.
+    def pure(c: tuple[object, ...], *xs: object) -> tuple[object, tuple[object, ...]]:
+        """Pure (consts, invars) -> (scalar, aux) interpreter for the loss cluster.
 
-        The terminal cluster is required to produce a single scalar
-        (the per-microbatch loss). Anything else is a tracing error.
+        The terminal cluster is required to produce the per-microbatch
+        scalar loss first, followed by ``n_aux`` auxiliary outputs.
 
         Args:
             c: C value consumed by this operation.
@@ -182,15 +185,16 @@ def _eval_schedule_cluster_terminal(
             Result described by this helper.
         """
         outs = jax.core.eval_jaxpr(cluster_jaxpr, list(c), *xs)
-        if len(outs) != 1:
+        if len(outs) != 1 + n_aux:
             raise ValueError(
-                f"Terminal cluster must produce exactly one scalar output (the per-microbatch loss); got {len(outs)}."
+                f"Terminal cluster must produce the scalar per-microbatch loss plus "
+                f"{n_aux} auxiliary output(s); got {len(outs)} output(s)."
             )
-        return outs[0]
+        return outs[0], tuple(outs[1:])
 
     argnums = tuple(range(1 + n_invars))
-    loss, grads = jax.value_and_grad(pure, argnums=argnums, allow_int=True)(consts, *invars)
-    return loss, (grads[0], tuple(grads[1:]))
+    (loss, aux), grads = jax.value_and_grad(pure, argnums=argnums, has_aux=True, allow_int=True)(consts, *invars)
+    return loss, aux, (grads[0], tuple(grads[1:]))
 
 
 def _get_schedule_direct_fused_fwd_bwd_jit(
@@ -253,8 +257,13 @@ def _get_schedule_direct_fused_fwd_bwd_jit(
                 )
             return fwd_outs, g_consts, g_bwd_invars
 
-    _SCHEDULE_DIRECT_FUSED_FWDBWD_CACHE[key] = fused
-    return fused
+    # Stage executables must never round-trip through JAX's persistent disk
+    # cache: TPU deserialization revives them with broken sync-flag metadata
+    # and the first execution halts the core. Same guard as the per-stage
+    # fwd/bwd jits built by pscan_compiler._make_private_stage_jit.
+    scoped_fused = _scope_stage_persistent_cache(fused)
+    _SCHEDULE_DIRECT_FUSED_FWDBWD_CACHE[key] = scoped_fused
+    return scoped_fused
 
 
 def _schedule_action_unit(

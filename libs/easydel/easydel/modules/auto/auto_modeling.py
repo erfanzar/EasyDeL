@@ -227,13 +227,14 @@ class BaseAutoEasyModel:
         registration = registry.get_module_registration(cls.model_task, config.model_type)
         if rngs is None:
             rngs = spx.Rngs(42)
-        return registration.module(
+        model = registration.module(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
         )
+        return model.wire_distributed_matmul()
 
     @classmethod
     def from_pretrained(cls, **kwargs: Unpack[PreTrainedLoading]) -> EasyDeLBaseModule:

@@ -34,7 +34,7 @@ from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
-from spectrax import apply_logical_sharding, common_types, nn
+from spectrax import common_types, nn
 
 from easydel.infra.base_module import EasyDeLBaseModule, EasyDeLLayerStackMixin
 from easydel.infra.factory import TaskType, register_module
@@ -46,7 +46,7 @@ from easydel.layers import (
     RowParallelLinear,
     dense_gate_up_layout,
     dense_qkv_layout,
-    split_fused_gate_up_projection,
+    gated_mlp_forward,
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 
@@ -261,27 +261,17 @@ class PixtralMLP(spx.Module):
     ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Apply SiLU-gated feedforward transformation.
 
+        Delegates to :func:`easydel.layers.gated_mlp_forward`, which routes
+        supported layouts through the ejkernel fused MLP kernels and runs
+        the legacy composition otherwise.
+
         Args:
             hidden_states: Input tensor [batch, seq_len, hidden_dim]
 
         Returns:
             Transformed hidden states [batch, seq_len, hidden_dim]
         """
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
-        gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
-        gate = checkpoint_name(self.act_fn(gate_raw), "mlp_gate")
-        hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        return checkpoint_name(hidden_states, "mlp_output")
+        return gated_mlp_forward(self, hidden_states)
 
 
 class PixtralAttention(AttentionModule):

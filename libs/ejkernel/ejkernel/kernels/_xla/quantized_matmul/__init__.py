@@ -30,5 +30,6 @@ Key Features:
 
 from ._channelwise import channelwise_quantized_matmul
 from ._interface import quantized_matmul
+from ._packed_reference import packed_int4_gemv_xla, w4a4_gemv_xla
 
-__all__ = ["channelwise_quantized_matmul", "quantized_matmul"]
+__all__ = ["channelwise_quantized_matmul", "packed_int4_gemv_xla", "quantized_matmul", "w4a4_gemv_xla"]

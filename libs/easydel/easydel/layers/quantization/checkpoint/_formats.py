@@ -54,7 +54,14 @@ from eformer.loggings import get_logger
 from .._configs import QuantizationType
 from ._adapter import CheckpointQuantAdapter, ConfigParse, IgnoreRules, register_adapter
 from ._canonical import ActivationPolicy, CanonicalQuantizedWeight, QuantSpec, SourceFormat
-from ._codecs import decode_awq_int4, decode_gptq_int4, decode_mxfp4, decode_nvfp4, decode_scaled_elements
+from ._codecs import (
+    decode_awq_int4,
+    decode_compressed_int4,
+    decode_gptq_int4,
+    decode_mxfp4,
+    decode_nvfp4,
+    decode_scaled_elements,
+)
 from ._decode import largest_supported_group_size
 
 logger = get_logger(__name__)
@@ -64,8 +71,11 @@ def _ignore_rules(quant_config: tp.Mapping[str, tp.Any]) -> IgnoreRules:
     """Read a config's ignore lists, honouring each key's own semantics.
 
     ``ignored_layers`` and compressed-tensors' ``ignore`` name exact leaf
-    modules; ``modules_to_not_convert`` names containers whose whole subtree is
-    skipped. Entries prefixed ``re:`` are regexes.
+    modules; ``modules_to_not_convert`` entries follow HF's matching
+    (containment/suffix/start-anchored regex — see
+    :class:`~._adapter.IgnoreRules`), covering container names, bare leaf
+    names like Mixtral-AWQ's ``"gate"``, and gpt-oss's glob-style patterns.
+    Entries prefixed ``re:`` are regexes.
 
     Args:
         quant_config: Raw ``quantization_config`` mapping.
@@ -233,7 +243,7 @@ class ScaledElementsAdapter(CheckpointQuantAdapter):
     def to_canonical(cls, tensors, *, source, target):
         """Dequantize the fp8 elements and repack to the runtime target."""
         scale_name = "weight_scale_inv" if source.is_block_scaled else "weight_scale"
-        dense = decode_scaled_elements(tensors["weight"], tensors[scale_name])
+        dense = decode_scaled_elements(tensors["weight"], tensors[scale_name], block_shape=source.block_shape)
         return CanonicalQuantizedWeight.from_dense(
             dense,
             spec=target,
@@ -479,6 +489,13 @@ class CompressedTensorsAdapter(CheckpointQuantAdapter):
             # ("q_proj", "model.layers.0.mlp"), which target specific layers.
             # The two are distinguished by case, as the ecosystem does:
             # classes are CamelCase, module names are snake_case paths.
+            #
+            # One group may legally list both — a scheme covering a class plus
+            # named extras — so the two kinds are collected independently. An
+            # early `continue` on seeing a class name drops the group's module
+            # targets, leaving those layers on whatever catch-all was recorded
+            # last, which for a heterogeneous checkpoint is a different bit
+            # width decoded with the wrong scheme's suffixes.
             if any(_is_class_name(target) for target in targets):
                 if default is not None:
                     logger.warning(
@@ -486,7 +503,6 @@ class CompressedTensorsAdapter(CheckpointQuantAdapter):
                         group_name,
                     )
                 default = source
-                continue
             for target in targets:
                 if _is_class_name(target):
                     continue
@@ -511,11 +527,28 @@ class CompressedTensorsAdapter(CheckpointQuantAdapter):
 
         Returns:
             The :class:`SourceFormat` describing this group.
+
+        Raises:
+            NotImplementedError: If the group is asymmetric. Asymmetric
+                schemes ship a packed ``weight_zero_point`` tensor whose
+                layout this adapter does not decode; reading the codes
+                without it offsets every group by a full scale, which loads
+                cleanly and produces garbage. Refusing is the only honest
+                option until the packing is implemented.
         """
         num_bits = int(weights.get("num_bits", 8))
         weight_type = str(weights.get("type", "int")).lower()
         block = weights.get("block_structure")
         group_size = weights.get("group_size")
+        symmetric = bool(weights.get("symmetric", True))
+
+        if not symmetric:
+            raise NotImplementedError(
+                f"compressed-tensors group declares symmetric=false (type={weight_type!r}, "
+                f"num_bits={num_bits}), which ships a weight_zero_point tensor. This adapter reads only "
+                f"weight_packed/weight and weight_scale, so the zero-point would be silently dropped. "
+                f"Load a symmetric checkpoint, or add zero-point decoding to CompressedTensorsAdapter."
+            )
 
         if activations is None:
             activation = ActivationPolicy.none()
@@ -529,8 +562,8 @@ class CompressedTensorsAdapter(CheckpointQuantAdapter):
             weight_dtype=f"{weight_type}{num_bits}",
             block_shape=tuple(int(dim) for dim in block) if block else None,
             group_size=int(group_size) if group_size else None,
-            symmetric=bool(weights.get("symmetric", True)),
-            has_zero_point=not bool(weights.get("symmetric", True)),
+            symmetric=symmetric,
+            has_zero_point=not symmetric,
             has_global_scale=weight_type == "float" and num_bits == 4,
             activation=activation,
             raw={"weights": dict(weights), "quantization_config": dict(quant_config)},
@@ -560,9 +593,7 @@ class CompressedTensorsAdapter(CheckpointQuantAdapter):
             return "int8"
         if num_bits == 4:
             return "int4"
-        raise NotImplementedError(
-            f"compressed-tensors scheme type={weight_type!r} num_bits={num_bits} has no decoder."
-        )
+        raise NotImplementedError(f"compressed-tensors scheme type={weight_type!r} num_bits={num_bits} has no decoder.")
 
     @classmethod
     def target_spec(cls, source, *, expert_dim=False):
@@ -604,21 +635,26 @@ class CompressedTensorsAdapter(CheckpointQuantAdapter):
         encoding = cls._encoding(source)
         if encoding == "nvfp4":
             dense = decode_nvfp4(tensors["weight_packed"], tensors["weight_scale"])
+            # compressed-tensors and ModelOpt store this scalar in opposite
+            # directions. llm-compressor computes
+            # `global_scale = (FP8_E4M3_MAX * FP4_E2M1_MAX) / amax` and folds
+            # it INTO the e4m3 block scales, so its dequantization divides:
+            # `w = codes * weight_scale / weight_global_scale`. ModelOpt's
+            # `weight_scale_2` is already the reciprocal and multiplies (see
+            # Nvfp4Adapter). Carrying this one through unchanged would scale
+            # every weight by `global_scale ** 2`.
             global_scale = jnp.asarray(tensors["weight_global_scale"]).astype(jnp.float32).reshape(-1)[0]
-            return CanonicalQuantizedWeight.from_dense(dense, spec=target, output_scale=global_scale)
+            return CanonicalQuantizedWeight.from_dense(dense, spec=target, output_scale=1.0 / global_scale)
 
         if encoding == "int4":
-            # compressed-tensors packs int4 sequentially along the input axis,
-            # matching GPTQ rather than AWQ's interleaved lanes.
-            dense = decode_gptq_int4(
-                tensors["weight_packed"],
-                tensors["weight_scale"],
-                None,
-                zero_point_offset=0,
-            )
+            # compressed-tensors packs int4 sequentially along the input axis
+            # — but along the LAST axis of the HF [out, in] layout, i.e. the
+            # transpose of GPTQ's [in // 8, out] packing — with codes stored
+            # unsigned at a +8 offset. It needs its own decoder.
+            dense = decode_compressed_int4(tensors["weight_packed"], tensors["weight_scale"])
             return CanonicalQuantizedWeight.from_dense(dense, spec=target)
 
-        dense = decode_scaled_elements(tensors["weight"], tensors["weight_scale"])
+        dense = decode_scaled_elements(tensors["weight"], tensors["weight_scale"], block_shape=source.block_shape)
         return CanonicalQuantizedWeight.from_dense(dense, spec=target)
 
 

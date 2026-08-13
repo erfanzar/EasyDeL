@@ -119,7 +119,9 @@ def run_engine(engine, tokenizer, label: str) -> dict:
         tps = ntok / gen_time if gen_time > 0 else (ntok / dt if dt > 0 else 0.0)
         results.append({"prompt": prompt, "text": text, "ntok": ntok, "tps": tps, "engine_tps": out.tokens_per_second})
         print(f"\n--- prompt {i + 1}: {prompt}")
-        print(f"    [{ntok} tok, wall={dt:.2f}s gen={gen_time:.2f}s, {tps:.2f} tok/s, engine_tps={out.tokens_per_second:.2f}]")
+        print(
+            f"    [{ntok} tok, wall={dt:.2f}s gen={gen_time:.2f}s, {tps:.2f} tok/s, engine_tps={out.tokens_per_second:.2f}]"
+        )
         print(f"    {text!r}")
     # Primary metric: mean of the engine's own per-request tokens/sec. This
     # excludes first-use XLA compilation stalls (a warm prompt can trigger a

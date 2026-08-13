@@ -568,6 +568,9 @@ class EasyQuantizer:
             str_path = ".".join([str(p) for p in path])
             if pattern.search(str_path):
                 if hasattr(block_instance, "to_quantized") and callable(block_instance.to_quantized):
+                    _supported = getattr(block_instance, "quantization_supported", None)
+                    if callable(_supported) and not _supported(self.config):
+                        continue
                     to_quantized = block_instance.to_quantized
                     quantized_kwargs = _filter_supported_to_quantized_kwargs(to_quantized, qmm_overrides)
                     if quantized_kwargs:

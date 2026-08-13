@@ -14,7 +14,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
-
 from spectrax.serialization import AsyncCheckpointManager
 from spectrax.serialization.async_manager import _tensorstore_spec_for_load
 
@@ -54,6 +53,33 @@ class TestAsyncCheckpointManager:
         assert loaded["step"] == sample_pytree["step"]
         assert loaded["name"] == sample_pytree["name"]
         assert isinstance(meta, dict)
+
+    def test_default_path_dtype_preserves_integer_leaves(self, tmp_checkpoint_dir, mesh):
+        """The DEFAULT (non-custom) load path must not value-cast integer leaves.
+
+        ``dtype`` means "hold parameters at this precision" and applies only
+        to floating leaves. The default path used to hand ``[dtype] * n`` to
+        the JAX manager, so packed quantized codes (uint32) and scales
+        (uint8) were value-cast at read (70003 -> bf16 70144, garbage). The
+        guard already existed on the custom path; both must agree.
+        """
+        tree = {
+            "weight": jnp.arange(8, dtype=jnp.float32).reshape(2, 4),
+            "codes": jnp.arange(70000, 70016, dtype=jnp.uint32).reshape(4, 4),
+            "scales": jnp.arange(16, dtype=jnp.uint8).reshape(4, 4),
+        }
+        mgr = AsyncCheckpointManager()
+        mgr.save_pytree(tree, tmp_checkpoint_dir, mesh=mesh, prefix="model")
+
+        # No fast-load options and no progress bar -> the default JAX-manager
+        # deserialization path runs.
+        loaded, _ = mgr.load_pytree(tmp_checkpoint_dir, mesh, prefix="model", dtype=jnp.bfloat16)
+
+        assert loaded["weight"].dtype == jnp.bfloat16
+        assert loaded["codes"].dtype == jnp.uint32
+        assert loaded["scales"].dtype == jnp.uint8
+        np.testing.assert_array_equal(np.asarray(loaded["codes"]), np.asarray(tree["codes"]))
+        np.testing.assert_array_equal(np.asarray(loaded["scales"]), np.asarray(tree["scales"]))
 
     def test_nonarray_payload_preserved(self, tmp_checkpoint_dir, mesh):
         """Ints, strings, and None survive the roundtrip."""

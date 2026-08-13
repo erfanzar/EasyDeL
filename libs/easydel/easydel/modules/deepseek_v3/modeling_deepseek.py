@@ -81,6 +81,7 @@ from easydel.layers import (
     RowParallelLinear,
     RowParallelMoELinear,
     dense_gate_up_layout,
+    gated_mlp_forward,
     moe_gate_up_fusion_reform_param,
     split_fused_gate_up_projection,
 )
@@ -170,29 +171,24 @@ class DeepseekV3MLP(spx.Module):
     ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Apply SwiGLU feedforward transformation.
 
+        The standard 3D path delegates to
+        :func:`easydel.layers.gated_mlp_forward` (ejkernel fused MLP where
+        supported, legacy composition otherwise). The moe-infer 2D path
+        keeps its composition, which skips logical sharding.
+
         Args:
             hidden_states: Input tensor [batch, seq_len, hidden_dim]
 
         Returns:
             Transformed hidden states [batch, seq_len, hidden_dim]
         """
-        if hidden_states.ndim == 3:  # if not in moe infer
-            hidden_states = apply_logical_sharding(
-                hidden_states,
-                dynamic_axes=common_types.HiddenStateSharding,
-                partition_manager=self.config.runtime_sharding_resolver,
-            )
-        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
-        gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
-        gate = checkpoint_name(self.act_fn(gate_raw), "mlp_gate")
-        hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
-        if hidden_states.ndim == 3:  # if not in moe infer
-            hidden_states = apply_logical_sharding(
-                hidden_states,
-                dynamic_axes=common_types.HiddenStateSharding,
-                partition_manager=self.config.runtime_sharding_resolver,
-            )
-        return checkpoint_name(hidden_states, "mlp_output")
+        if hidden_states.ndim != 3:  # moe infer
+            gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
+            gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
+            gate = checkpoint_name(self.act_fn(gate_raw), "mlp_gate")
+            hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
+            return checkpoint_name(hidden_states, "mlp_output")
+        return gated_mlp_forward(self, hidden_states)
 
 
 class MoEGate(spx.Module):
@@ -581,8 +577,8 @@ class DeepseekV3MoE(BaseMoeModule):
             hidden_state=hidden_states,
             gate_layer=self.gate,
             expert_layer=self.experts,
-            gate_up_kernel=self.experts.gate_up_proj.weight.value,
-            wd_kernel=self.experts.down_proj.weight.value,
+            gate_up_kernel=self.experts.gate_up_proj.kernel_view(),
+            wd_kernel=self.experts.down_proj.kernel_view(),
             act_fn=self.experts.act_fn,
         )
         if self.config.n_shared_experts is not None:
@@ -1218,30 +1214,48 @@ class DeepseekV3Model(EasyDeLBaseModule):
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
+        # Router-logit aggregation grows a Python tuple per layer, which
+        # lax.scan cannot carry — collecting it forces the trace path too.
+        trace_layers = self._layer_scan_trace(
+            False,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache or bool(output_router_logits),
+        )
+        cache_views = views if trace_layers else None
+        # Hoisted out of the loop body: the caching property must not be
+        # first materialized inside the lax.scan trace (tracer leak).
+        frequencies = self.frequencies
+
         def _layer_loop(layer, carry):
             """Per-layer body for the DeepSeek-V3 decoder ``scan``.
 
-            Carry layout: ``(hidden_states, all_hidden_states, all_attentions,
-            all_router_logits, idx)``. Records the input hidden state when
-            requested, runs one DeepSeek-V3 decoder layer (MLA attention plus
-            dense MLP for the first ``first_k_dense_replace`` layers, or
-            DeepSeekMoE block with auxiliary-free top-k routing afterwards) at
-            the assigned pipeline stage, accumulates attention weights and
-            MoE router logits when requested, updates the per-layer KV cache
-            slot, and returns the next carry.
+            Carry layout: ``(hidden_states, cv, all_hidden_states,
+            all_attentions, all_router_logits, idx)``. Records the input
+            hidden state when requested, runs one DeepSeek-V3 decoder layer
+            (MLA attention plus dense MLP for the first
+            ``first_k_dense_replace`` layers, or DeepSeekMoE block with
+            auxiliary-free top-k routing afterwards) at the assigned pipeline
+            stage, accumulates attention weights and MoE router logits when
+            requested, updates the per-layer KV cache slot, and returns the
+            next carry.
             """
-            hidden_states, all_hidden_states, all_attentions, all_router_logits, idx = carry
+            hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
             with self._layer_stage_context(idx, layers=self.layers):
                 output = layer(
                     hidden_states=hidden_states,
-                    frequencies=self.frequencies,
+                    frequencies=frequencies,
                     mask_info=mask_info,
                     position_ids=position_ids,
                     output_attentions=output_attentions,
                     mode=mode,
-                    cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
+                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
                     cache_metadata=cache_metadata,
                 )
             hidden_states = self._mark_layer_stage_boundary(output.hidden_states, idx, layers=self.layers)
@@ -1252,14 +1266,20 @@ class DeepseekV3Model(EasyDeLBaseModule):
             if output_router_logits and hasattr(output, "router_logits") and output.router_logits is not None:
                 all_router_logits += (output.router_logits,)
 
-            self._layer_cache_view_update(None, idx, output.cache_view, enabled=True, cache=past_key_values)
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                output.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
 
-            return hidden_states, all_hidden_states, all_attentions, all_router_logits, idx + 1
+            return hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx + 1
 
-        hidden_states, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
+        hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
             _layer_loop,
-            (hidden_states, all_hidden_states, all_attentions, all_router_logits, 0),
-            trace=True,
+            (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
+            trace=trace_layers,
         )
         hidden_states = self.norm(hidden_states)
         hidden_states = checkpoint_name(hidden_states, "model_output")

@@ -474,6 +474,7 @@ class OperationMetadata:
                 - "unified_attention": Unified paged attention (serving-style)
                 - "paged_flash_attention": Paged FlashAttention (CUDA, block tables)
                 - "sdpa": Scaled dot product attention
+                - "fused_mlp": Fused gated-MLP block (dense / channelwise-int / packed W4A4)
                 - "vanilla": Vanilla attention
 
         Returns:

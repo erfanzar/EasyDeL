@@ -69,7 +69,7 @@ from easydel.layers import (
     Embed,
     RowParallelLinear,
     dense_gate_up_layout,
-    split_fused_gate_up_projection,
+    gated_mlp_forward,
 )
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
@@ -284,7 +284,7 @@ class Gemma2MLP(spx.Module):
         dtype (jnp.dtype): Data type for computation.
         param_dtype (jnp.dtype): Data type for parameters.
         precision: Numerical precision for matrix operations.
-        act: Activation function applied to the gate projection.
+        act_fn: Activation function applied to the gate projection.
     """
 
     def __init__(
@@ -315,7 +315,7 @@ class Gemma2MLP(spx.Module):
         inner_dim = self.config.intermediate_size if self.config.intermediate_size is not None else 4 * embed_dim
         kernel_init = jax.nn.initializers.normal(config.initializer_range)
 
-        self.act = ACT2FN[self.config.hidden_activation]
+        self.act_fn = ACT2FN[self.config.hidden_activation]
 
         self.down_proj = RowParallelLinear(
             inner_dim,
@@ -355,7 +355,9 @@ class Gemma2MLP(spx.Module):
     ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Forward pass through the MLP block.
 
-        Applies gated linear units with activation function: down_proj(act(gate_proj(x)) * up_proj(x))
+        Delegates to :func:`easydel.layers.gated_mlp_forward`, which routes
+        supported layouts through the ejkernel fused MLP kernels and runs
+        the legacy composition otherwise.
 
         Args:
             hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
@@ -363,21 +365,7 @@ class Gemma2MLP(spx.Module):
         Returns:
             Array: Output tensor of shape (batch_size, sequence_length, hidden_dim).
         """
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
-        gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
-        gate = checkpoint_name(self.act(gate_raw), "mlp_gate")
-        hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        return checkpoint_name(hidden_states, "mlp_output")
+        return gated_mlp_forward(self, hidden_states)
 
 
 class Gemma2DecoderLayer(spx.Module):

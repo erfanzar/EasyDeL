@@ -435,7 +435,9 @@ class CompileOrchestrator:
             self._manager.kv_pages = model_out.kv_pages
         if self._manager.use_aot_forward:
             warm_args = (graphstate, graphother, inputs)
-            self._manager._debug_baselines[f"{num_tokens}_{padded_num_reqs}_hash_in_pp_model_step"] = _tree_hash(warm_args)
+            self._manager._debug_baselines[f"{num_tokens}_{padded_num_reqs}_hash_in_pp_model_step"] = _tree_hash(
+                warm_args
+            )
 
     def _compile_backbone_variant(
         self,
@@ -448,7 +450,10 @@ class CompileOrchestrator:
         """Compile the backbone (transformer forward) for a token bucket.
 
         Keyed by ``num_tokens`` only.  Uses ``max_num_reqs`` as the dummy
-        ``padded_num_reqs`` so that metadata shapes are fixed.
+        ``padded_num_reqs`` for the warm-up input shapes (metadata shapes are
+        fixed); the decode-layout request bucket passed to
+        :meth:`ModelStepExecutor.compile_backbone` depends on the variant —
+        see the call-site comment.
         """
         if self._manager._has_backbone_variant(num_tokens, use_pipeline_runtime=use_pipeline_runtime):
             return
@@ -462,8 +467,15 @@ class CompileOrchestrator:
             metadata,
         )
         graphdef, graphstate, graphother, inputs = compargs
+        # The resident PP-runtime variant only ever serves decode wavefronts,
+        # where every request contributes exactly one token — its real request
+        # bucket IS the token bucket, so it traces under the decode layout.
+        # The direct-dispatch variant serves mixed prefill windows and keeps
+        # the conservative max_num_reqs bucket (decode layout only when the
+        # token bucket equals max_num_reqs, the historical behavior).
         backbone_out = self._manager._model_executor.compile_backbone(
             num_tokens=num_tokens,
+            padded_num_reqs=num_tokens if use_pipeline_runtime else max_num_reqs,
             graphdef=graphdef,
             graphstate=graphstate,
             graphother=graphother,

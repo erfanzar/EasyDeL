@@ -4,7 +4,6 @@ from types import SimpleNamespace
 
 import jax
 import numpy as np
-
 from easydel.inference.esurge.runners.executors.batch_preparer import BatchMetadataPreparer
 
 
@@ -62,9 +61,14 @@ def test_spmd_packs_tokens_rank_major_and_builds_rank_local_metadata():
     np.testing.assert_array_equal(input_ids, np.array([0, 1, 21, 0, 32, 33, 34, 55], dtype=np.int32))
     np.testing.assert_array_equal(positions, np.array([0, 1, 5, 0, 0, 1, 2, 7], dtype=np.int32))
     np.testing.assert_array_equal(packed_i32[1, :4], np.array([1, 2, 6, 7], dtype=np.int32))
-    np.testing.assert_array_equal(packed_misc[2:5], np.array([2, 4, 4], dtype=np.int32))
+    # POSITIONAL v3 contract: rows are [prefill, decode, prefill, decode], so
+    # the decode prefix is empty and the prefill run is a single row; the
+    # interleaved tail goes to the mixed range (count-based fills desync the
+    # kernel's per-class offsets and hang the device).
+    np.testing.assert_array_equal(packed_misc[2:5], np.array([0, 1, 4], dtype=np.int32))
     np.testing.assert_array_equal(dp_query_start_loc, np.array([[0, 2, 3], [0, 3, 4]], dtype=np.int32))
-    np.testing.assert_array_equal(dp_request_distribution, np.array([[1, 2, 2], [1, 2, 2]], dtype=np.int32))
+    # Each rank's rows are [prefill, decode]: empty decode prefix, one prefill.
+    np.testing.assert_array_equal(dp_request_distribution, np.array([[0, 1, 2], [0, 1, 2]], dtype=np.int32))
     np.testing.assert_array_equal(dp_context_lens, np.array([[2, 6], [3, 8]], dtype=np.int32))
     np.testing.assert_array_equal(dp_recurrent_state_indices, np.array([[0, 1], [0, 1]], dtype=np.int32))
 
@@ -110,6 +114,7 @@ def test_spmd_accepts_sparse_global_rows_and_state_indices():
     np.testing.assert_array_equal(positions, np.array([0, 0, 0, 0, 0, 1, 5, 0], dtype=np.int32))
     np.testing.assert_array_equal(packed_i32[1, :2], np.array([5, 6], dtype=np.int32))
     np.testing.assert_array_equal(dp_query_start_loc, np.array([[0, 0, 0], [0, 2, 3]], dtype=np.int32))
-    np.testing.assert_array_equal(dp_request_distribution, np.array([[0, 0, 0], [1, 2, 2]], dtype=np.int32))
+    # rank1 rows are [prefill(2 tok), decode]: positional prefix is [0, 1, 2].
+    np.testing.assert_array_equal(dp_request_distribution, np.array([[0, 0, 0], [0, 1, 2]], dtype=np.int32))
     np.testing.assert_array_equal(dp_context_lens, np.array([[0, 0], [2, 6]], dtype=np.int32))
     np.testing.assert_array_equal(dp_recurrent_state_indices, np.array([[0, 0], [1, 0]], dtype=np.int32))

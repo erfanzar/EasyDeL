@@ -239,9 +239,7 @@ def test_sync_peak_stays_at_one_snapshot_in_device_memory():
     trainer.arguments = SimpleNamespace(weight_sync_steps=1)
 
     baseline = _device_bytes_in_use()
-    first, _ = trainer._sync_rollout_snapshot(
-        None, state, 0, force=False, can_release=True, cache_scope_key="scope"
-    )
+    first, _ = trainer._sync_rollout_snapshot(None, state, 0, force=False, can_release=True, cache_scope_key="scope")
     one_snapshot_resident = _device_bytes_in_use()
     assert one_snapshot_resident - baseline >= params_bytes * 0.5, "snapshot should be visible in device memory"
 
@@ -253,9 +251,7 @@ def test_sync_peak_stays_at_one_snapshot_in_device_memory():
         return original_take(*args, **kwargs)
 
     trainer._take_rollout_snapshot = probe
-    second, _ = trainer._sync_rollout_snapshot(
-        first, state, 1, force=False, can_release=True, cache_scope_key="scope"
-    )
+    second, _ = trainer._sync_rollout_snapshot(first, state, 1, force=False, can_release=True, cache_scope_key="scope")
     try:
         # At allocation time the outgoing snapshot's buffers are already returned,
         # so usage is back near the no-snapshot baseline rather than carrying two.

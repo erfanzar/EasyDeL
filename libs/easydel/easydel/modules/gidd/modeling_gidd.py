@@ -147,7 +147,7 @@ class GiddMLP(spx.Module):
         )
 
         h = checkpoint_name(self.up_proj(h), name="mlp_up")
-        h = nn.relu(h) ** 2
+        h = jax.nn.relu(h) ** 2
 
         h = checkpoint_name(self.down_proj(h), name="mlp_down")
 
@@ -308,7 +308,9 @@ class GiddAttention(AttentionModule):
                 Metadata for cache operations. Defaults to None.
 
         Returns:
-            tuple: Contains (key, value, mask_info, init_attention_bias, cache_view).
+            tuple: Contains (key, value, combined_attention_mask, init_attention_bias, cache_view),
+                where ``combined_attention_mask`` is the pairwise mask ANDed with the noise mask
+                (a raw boolean array, not a :class:`MaskInfo`).
         """
         assert query.shape[1] == key.shape[1], "Query and Key lengths must match for GIDD attention."
 
@@ -341,13 +343,17 @@ class GiddAttention(AttentionModule):
 
             Returns ``0.0`` where ``attention_mask > 0`` and the dtype's
             ``finfo.min`` elsewhere, so the bias added to the logits zeros
-            valid positions and saturates masked ones.
+            valid positions and saturates masked ones. Broadcast to the full
+            head dimension — attention ops infer head count from the bias
+            when no ``mask_info`` is provided.
             """
-            return jax.lax.select(
+            bias = jax.lax.select(
                 attention_mask > 0,
                 jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
                 jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
             )
+            heads = self.config.num_attention_heads
+            return jnp.broadcast_to(bias, (bias.shape[0], heads, *bias.shape[2:]))
 
         return key, value, attention_mask, init_attention_bias, cache_view  # pyright: ignore[reportReturnType]
 
@@ -433,7 +439,7 @@ class GiddAttention(AttentionModule):
         (
             key_states,
             value_states,
-            mask_info,
+            _combined_attention_mask,
             init_attention_bias,
             cache_view,
         ) = self.concatenate(
@@ -446,6 +452,10 @@ class GiddAttention(AttentionModule):
             noise_mask=noise_mask,
         )
 
+        # mask_info must be None here: the attention ops only materialize
+        # ``init_bias`` when no mask_info is given, and for GIDD the bias is
+        # the complete mask semantics (pairwise attention mask ANDed with the
+        # diffusion noise mask) — passing mask_info would drop the noise term.
         attentions = self.attention_performer.forward(
             query_states=query_states * self.qk_scale,
             key_states=key_states,
@@ -455,7 +465,7 @@ class GiddAttention(AttentionModule):
             cache_metadata=cache_metadata,
             cache_view=cache_view,
             init_bias=init_attention_bias,
-            mask_info=mask_info,
+            mask_info=None,
             causal=False,
         )
 
@@ -785,7 +795,7 @@ class GiddModel(EasyDeLBaseModule):
             ValueError: If both input_ids and inputs_embeds are provided or both are None.
             AssertionError: If sequence_length exceeds max_position_embeddings.
         """
-        if (input_ids is None) ^ (inputs_embeds is None):
+        if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
@@ -1059,6 +1069,22 @@ class GiddForDiffusionLM(EasyDeLBaseModule):
             attentions=outputs.attentions,
             past_key_values=outputs.past_key_values,
         )
+
+    def compute_lm_logits(self, hidden_states: Array) -> Array:
+        """Project hidden states to vocabulary logits via the diffusion LM head.
+
+        ``GiddForDiffusionLM`` extends :class:`EasyDeLBaseModule` directly
+        (not :class:`BaseTaskModule`), so it provides this projection itself;
+        callers such as the eSurge LM-head step and :meth:`forward` rely on
+        the ``compute_lm_logits`` task-head interface.
+
+        Args:
+            hidden_states: Final hidden states ``[..., hidden_size]``.
+
+        Returns:
+            Vocabulary logits ``[..., vocab_size]``.
+        """
+        return self.lm_head(hidden_states)
 
     def get_encoder(self):
         """Returns the encoder part of the model's graph definition.

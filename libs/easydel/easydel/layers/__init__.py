@@ -81,6 +81,7 @@ from .linears import (
     RowParallelMoELinear,
     eLoRA,
 )
+from .mlp import gated_mlp_forward
 from .moe import (
     BaseMoeModule,
     MoeFusedHooks,
@@ -186,6 +187,7 @@ __all__ = [
     "eLoRA",
     "estimate_moe_layout",
     "gate_up_fusion_reform_param",
+    "gated_mlp_forward",
     "get_frequencies",
     "get_inv_frequencies",
     "get_moe_partition_spec",

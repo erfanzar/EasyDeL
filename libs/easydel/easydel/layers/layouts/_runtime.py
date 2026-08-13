@@ -50,15 +50,23 @@ from ._types import Array, EasyDeLBaseConfig
 def _partition_axis(config: EasyDeLBaseConfig | None = None) -> PartitionAxis:
     """Return the real :class:`PartitionAxis` from a config, with a fallback.
 
+    ``getattr``, not attribute access: these resolvers are reached from the
+    checkpoint save/load path, which runs against whatever config object the
+    model carries — including plain HF configs and other minimal stand-ins
+    that never declare EasyDeL's sharding fields. An absent attribute means
+    the same thing as ``None`` here (no configured axis), so it takes the
+    same documented fallback instead of raising.
+
     Args:
-        config: Owning model config; ``None`` triggers a default
-            :class:`PartitionAxis()` instance.
+        config: Owning model config; ``None`` (or a config without the
+            attribute) triggers a default :class:`PartitionAxis()` instance.
 
     Returns:
         Resolved :class:`PartitionAxis` for sharding-axis lookups.
     """
-    if config is not None and config.partition_axis is not None:
-        return config.partition_axis
+    partition_axis = getattr(config, "partition_axis", None) if config is not None else None
+    if partition_axis is not None:
+        return partition_axis
     return PartitionAxis()
 
 
@@ -66,15 +74,16 @@ def _mesh(config: EasyDeLBaseConfig | None = None) -> OptionalMesh:
     """Return the active mesh from a config, with a fallback.
 
     Args:
-        config: Owning model config; ``None`` returns ``None`` so callers
-            fall back to the ambient JAX mesh.
+        config: Owning model config; ``None`` (or a config without a mesh
+            attribute — see :func:`_partition_axis`) returns ``None`` so
+            callers fall back to the ambient JAX mesh.
 
     Returns:
         The mesh attached to ``config`` or ``None`` when no config was
         supplied.
     """
     if config is not None:
-        return config.mesh
+        return getattr(config, "mesh", None)
     return None
 
 

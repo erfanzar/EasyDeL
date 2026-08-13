@@ -59,8 +59,6 @@ _VOCAB = 256
 _HIDDEN = 128
 
 
-
-
 def _seed_hidden(i: int) -> jnp.ndarray:
     return jax.random.normal(jax.random.fold_in(jax.random.PRNGKey(11), i), (_HIDDEN,), dtype=jnp.float32)
 
@@ -209,7 +207,9 @@ def test_batched_draft_different_committed_lens_per_row():
     for rid, row, tok, pos, h in w1:
         sref.draft_next(req_id=rid, row_pos=row, seed_token=tok, seed_position=pos, seed_hidden=h, req_state=_REQ_STATE)
     ref_w2 = {
-        rid: sref.draft_next(req_id=rid, row_pos=row, seed_token=tok, seed_position=pos, seed_hidden=h, req_state=_REQ_STATE)
+        rid: sref.draft_next(
+            req_id=rid, row_pos=row, seed_token=tok, seed_position=pos, seed_hidden=h, req_state=_REQ_STATE
+        )
         for rid, row, tok, pos, h in w2
     }
 

@@ -83,6 +83,7 @@ from easydel.layers import (
     RowParallelMoELinear,
     dense_gate_up_layout,
     dense_qkv_layout,
+    gated_mlp_forward,
     moe_down_projection_reform_param,
     moe_fused_gate_up_reform_param,
     split_fused_gate_up_projection,
@@ -371,7 +372,7 @@ class Llama4TextMLP(spx.Module):
         gate_proj (ColumnParallelLinear): ``hidden_size -> intermediate_size``.
         up_proj (ColumnParallelLinear): ``hidden_size -> intermediate_size``.
         down_proj (RowParallelLinear): ``intermediate_size -> hidden_size``.
-        activation_fn (Callable): SiLU (default) or anything in ``ACT2FN``.
+        act_fn (Callable): SiLU (default) or anything in ``ACT2FN``.
     """
 
     def __init__(
@@ -423,7 +424,7 @@ class Llama4TextMLP(spx.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.activation_fn = ACT2FN[self.config.hidden_act]
+        self.act_fn = ACT2FN[self.config.hidden_act]
 
     @property
     def reform_param(self):
@@ -439,27 +440,17 @@ class Llama4TextMLP(spx.Module):
     def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jnp.ndarray:
         """Apply SwiGLU feedforward transformation.
 
+        Delegates to :func:`easydel.layers.gated_mlp_forward`, which routes
+        supported layouts through the ejkernel fused MLP kernels and runs
+        the legacy composition otherwise.
+
         Args:
             hidden_states: Input tensor [batch, seq_len, hidden_dim].
 
         Returns:
             Transformed hidden states [batch, seq_len, hidden_dim].
         """
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
-        gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
-        gate = checkpoint_name(self.activation_fn(gate_raw), "mlp_gate")
-        hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        return checkpoint_name(hidden_states, "mlp_output")
+        return gated_mlp_forward(self, hidden_states)
 
 
 class Llama4TextMoe(BaseMoeModule):
@@ -642,8 +633,8 @@ class Llama4TextMoe(BaseMoeModule):
             hidden_state=hidden_states,
             gate_layer=self.router,
             expert_layer=self.experts,
-            gate_up_kernel=self.experts.gate_up_proj.weight.value,
-            wd_kernel=self.experts.down_proj.weight.value,
+            gate_up_kernel=self.experts.gate_up_proj.kernel_view(),
+            wd_kernel=self.experts.down_proj.kernel_view(),
             act_fn=self.experts.act_fn,
             ffn_activation=ffn_activation,
             layer_idx=layer_idx,
@@ -1170,16 +1161,28 @@ class Llama4TextModel(EasyDeLBaseModule):
         mask_info = mask_info.apply_chunked(self.config.attention_chunk_size)
         frequencies = self.compute_complex_rotary(position_ids)
 
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
+        trace_layers = self._layer_scan_trace(
+            False,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache,
+        )
+        cache_views = views if trace_layers else None
+
         def _layer_loop(block, carry):
             """Body of the text-decoder scan over Llama4 transformer layers.
 
-            Carry: ``(hidden_states, all_hidden_states, all_attentions,
-            layer_index)``. Routes per-layer KV cache views through the
-            HybridCache machinery and applies the precomputed (chunked or
-            full) ``mask_info`` plus complex RoPE ``frequencies`` from the
-            enclosing scope.
+            Carry: ``(hidden_states, cache_views, all_hidden_states,
+            all_attentions, layer_index)``. Routes per-layer KV cache views
+            through the HybridCache machinery and applies the precomputed
+            (chunked or full) ``mask_info`` plus complex RoPE ``frequencies``
+            from the enclosing scope.
             """
-            hidden_states, all_hidden_states, all_attentions, idx = carry
+            hidden_states, cv, all_hidden_states, all_attentions, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -1189,7 +1192,7 @@ class Llama4TextModel(EasyDeLBaseModule):
                     mask_info=mask_info,
                     position_ids=position_ids,
                     mode=mode,
-                    cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
+                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
                     cache_metadata=cache_metadata,
                     output_attentions=output_attentions,
                     frequencies=frequencies,
@@ -1199,14 +1202,20 @@ class Llama4TextModel(EasyDeLBaseModule):
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
 
-            self._layer_cache_view_update(None, idx, layer_outputs.cache_view, enabled=True, cache=past_key_values)
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                layer_outputs.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
 
-            return hidden_states, all_hidden_states, all_attentions, idx + 1
+            return hidden_states, cv, all_hidden_states, all_attentions, idx + 1
 
-        hidden_states, all_hidden_states, all_attentions, _ = self.layers.scan(
+        hidden_states, _, all_hidden_states, all_attentions, _ = self.layers.scan(
             _layer_loop,
-            (hidden_states, all_hidden_states, all_attentions, 0),
-            trace=True,
+            (hidden_states, cache_views, all_hidden_states, all_attentions, 0),
+            trace=trace_layers,
         )
         hidden_states = self.norm(hidden_states)
 

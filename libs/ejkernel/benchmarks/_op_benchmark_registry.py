@@ -34,8 +34,9 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
-
+import numpy as np
 from ejkernel.benchmarks import Benchmark
+from ejkernel.kernels._pallas.tpu.quantized_matmul._packed_gemv import pack_int4_adjacent, pack_int4_split_k
 from ejkernel.kernels._registry import Backend, kernel_registry
 from ejkernel.modules import operations as ops
 from ejkernel.quantization import prepack_quantized_weights
@@ -812,6 +813,19 @@ def _cfgs_ragged_gdr_decode_fused():
     return _limit_configs(configs)
 
 
+def _cfgs_collective():
+    """Generate benchmark configs for standalone collective APIs.
+
+    Sizes span the latency-bound decode regime (16x2048 bf16 ~ 64 KiB) up to
+    bandwidth-bound multi-MiB buffers.
+    """
+    configs = _grid(
+        m=[16, 128, 1024],
+        n=[2048, 8192],
+    )
+    return _limit_configs(configs)
+
+
 def _cfgs_collective_matmul():
     """Generate benchmark configs for collective matmul APIs."""
     configs = _grid(
@@ -831,6 +845,148 @@ def _cfgs_grouped_matmul_v3():
         n=[64, 128],
         transpose_rhs=[False, True],
     )
+    return _limit_configs(configs)
+
+
+def _cfgs_channelwise_quantized_matmul():
+    """Generate benchmark configs for the channelwise quantized matmul."""
+    configs = _grid(
+        m=[32, 1024],
+        k=[2048],
+        n=[4096],
+        weight_bits=[8, 4],
+        quantize_activations=[False, True],
+    )
+    return _limit_configs(configs)
+
+
+def _cfgs_packed_int4_gemv():
+    """Generate decode-shaped benchmark configs for the packed-int4 gemvs."""
+    configs = _grid(
+        m=[8, 32],
+        k=[2048],
+        n=[4096],
+    )
+    return _limit_configs(configs)
+
+
+def _cfgs_grouped_matmul_quant():
+    """Generate benchmark configs for the int8-code quantized grouped matmuls."""
+    configs = _grid(
+        groups=[8, 16],
+        m_per_group=[32],
+        k=[256, 512],
+        n=[512],
+    )
+    return _limit_configs(configs)
+
+
+def _cfgs_fused_mlp():
+    """Generate benchmark configs for the dense fused MLP block."""
+    configs = _grid(
+        m=[32, 512],
+        k=[1024],
+        i=[2048],
+    )
+    return _limit_configs(configs)
+
+
+def _cfgs_fused_mlp_w4a4():
+    """Generate decode-shaped benchmark configs for the fused W4A4 MLP."""
+    configs = _grid(
+        m=[8, 32],
+        k=[1024],
+        i=[2048],
+    )
+    return _limit_configs(configs)
+
+
+def _cfgs_compressed_window_attention():
+    """Generate prefill-shaped configs for compressed-window attention."""
+    configs = _grid(
+        batch=[1, 2],
+        heads=[16],
+        q_len=[64, 256],
+        head_dim=[128],
+        kv_len=[160, 320],
+    )
+    return _limit_configs(configs)
+
+
+def _cfgs_compressed_window_decode():
+    """Generate decode-shaped configs for compressed-window attention."""
+    configs = _grid(
+        batch=[8, 32],
+        heads=[16],
+        q_len=[1],
+        head_dim=[128],
+        kv_len=[132, 256],
+    )
+    return _limit_configs(configs)
+
+
+def _cfgs_fused_conv_decode():
+    """Generate decode-shaped configs for the fused conv-state decode."""
+    configs = _grid(
+        slots=[8, 32],
+        dim=[1024, 2048],
+        d_conv=[4],
+    )
+    return _limit_configs(configs)
+
+
+def _cfgs_ragged_causal_conv1d():
+    """Generate decode-shaped configs for the ragged causal conv1d."""
+    configs = _grid(
+        num_requests=[8, 32],
+        dim=[1024, 2048],
+        d_conv=[4],
+    )
+    return _limit_configs(configs)
+
+
+def _cfgs_gdr_grouped_decode():
+    """Generate decode-shaped configs for grouped GDR single-step decode."""
+    configs = _grid(
+        batch=[8, 32],
+        k_heads=[8],
+        head_dim=[128],
+        expand_ratio=[2],
+        value_dim=[128],
+    )
+    return _limit_configs(configs)
+
+
+def _cfgs_gdn_compute_schedule_v2():
+    """Generate schedule-table configs spanning decode and prefill layouts."""
+    configs = _grid(
+        num_seqs=[8, 32],
+        tokens_per_seq=[1, 16],
+        chunk_size=[64],
+    )
+    return _limit_configs(configs)
+
+
+def _cfgs_gdn_spec_window():
+    """Generate decode-window configs for the GDN speculative state scan."""
+    configs = _grid(
+        batch=[8, 32],
+        steps=[4],
+        n_kq=[8],
+        n_v=[16],
+        d_k=[128],
+        d_v=[128],
+    )
+    return _limit_configs(configs)
+
+
+def _cfgs_ragged_gdr_v2():
+    """Generate decode and prefill configs for ragged gated delta rule v2."""
+    configs = [
+        {"mode": "decode", "num_requests": 8},
+        {"mode": "decode", "num_requests": 32},
+        {"mode": "prefill", "prefill_tokens": 256},
+    ]
     return _limit_configs(configs)
 
 
@@ -1588,6 +1744,49 @@ def _gen_ragged_gdr_decode_fused_inputs(config: dict[str, Any]):
     )
 
 
+def _gen_collective_inputs(config: dict[str, Any]):
+    """Generate inputs for standalone collectives (all_reduce/all_gather/reduce_scatter)."""
+    m = config.get("m", 128)
+    n = config.get("n", 256)
+    dtype = config.get("dtype", _default_dtype())
+    (x,) = _rand_inputs(config, (m, n), dtype=dtype)
+    return x, "__tp_dummy__"
+
+
+def _gen_all_to_all_inputs(config: dict[str, Any]):
+    """Generate inputs for the dense all-to-all collective."""
+    m = config.get("m", 128)
+    n = config.get("n", 256)
+    dtype = config.get("dtype", _default_dtype())
+    (x,) = _rand_inputs(config, (m, n), dtype=dtype)
+    return (x,)
+
+
+def _gen_ragged_gather_inputs(config: dict[str, Any]):
+    """Generate inputs for the ragged row-gather."""
+    m = config.get("m", 128)
+    n = config.get("n", 256)
+    dtype = config.get("dtype", _default_dtype())
+    (x,) = _rand_inputs(config, (m, n), dtype=dtype)
+    key = jax.random.PRNGKey(config.get("seed", 0) + 7)
+    indices = jax.random.randint(key, (2 * m,), 0, m).astype(jnp.int32)
+    return x, indices
+
+
+def _gen_ragged_gather_reduce_inputs(config: dict[str, Any]):
+    """Generate inputs for the weighted grouped gather-sum (top-k combine)."""
+    m = config.get("m", 128)
+    n = config.get("n", 256)
+    k = config.get("reduce_group_size", 4)
+    dtype = config.get("dtype", _default_dtype())
+    (x,) = _rand_inputs(config, (m, n), dtype=dtype)
+    key = jax.random.PRNGKey(config.get("seed", 0) + 11)
+    k1, k2 = jax.random.split(key)
+    indices = jax.random.randint(k1, (m * k,), 0, m).astype(jnp.int32)
+    weights = jax.random.uniform(k2, (m * k,), dtype=dtype)
+    return x, indices, weights, k
+
+
 def _gen_all_gather_matmul_inputs(config: dict[str, Any]):
     """Generate inputs for all-gather matmul."""
     m = config.get("m", 128)
@@ -1724,6 +1923,297 @@ def _gen_recurrent_inputs(config: dict[str, Any]):
 def _gen_unified_inputs(config: dict[str, Any]):
     """Generate inputs for unified attention (delegates to ``_make_unified_inputs``)."""
     return _make_unified_inputs(config)
+
+
+def _symmetric_channel_codes(key, k: int, n: int, qmax: float, dtype: jnp.dtype):
+    """Quantize a random ``[k, n]`` weight to symmetric per-output-channel codes.
+
+    Args:
+        key: PRNG key for the dense weight draw.
+        k: Contraction dimension.
+        n: Output-channel dimension.
+        qmax: Largest code magnitude (127 for int8, 7 for int4).
+        dtype: Integer dtype of the returned codes.
+
+    Returns:
+        Tuple of ``(codes [k, n], scale [1, n] float32)``.
+    """
+    w = jax.random.normal(key, (k, n), dtype=jnp.float32)
+    absmax = jnp.max(jnp.abs(w), axis=0, keepdims=True)
+    scale = jnp.where(absmax == 0, 1.0, absmax / qmax).astype(jnp.float32)
+    codes = jnp.clip(jnp.round(w / scale), -qmax, qmax).astype(dtype)
+    return codes, scale
+
+
+def _gen_channelwise_quantized_matmul_inputs(config: dict[str, Any]):
+    """Generate activations, integer codes, channel scale, and the static quant flag."""
+    m = config.get("m", 32)
+    k = config.get("k", 2048)
+    n = config.get("n", 4096)
+    weight_bits = config.get("weight_bits", 8)
+    key = jax.random.PRNGKey(config.get("seed", 0))
+    k1, k2 = jax.random.split(key, 2)
+    x = jax.random.normal(k1, (m, k), dtype=_default_dtype())
+    qmax = 7.0 if weight_bits == 4 else 127.0
+    wdtype = jnp.int4 if weight_bits == 4 else jnp.int8
+    w_q, scale = _symmetric_channel_codes(k2, k, n, qmax, wdtype)
+    return x, w_q, scale, bool(config.get("quantize_activations", False))
+
+
+def _gen_packed_int4_gemv_inputs(config: dict[str, Any]):
+    """Generate activations plus split-K packed int4 weights for the W4A16 gemv."""
+    m = config.get("m", 8)
+    k = config.get("k", 2048)
+    n = config.get("n", 4096)
+    key = jax.random.PRNGKey(config.get("seed", 0))
+    k1, k2 = jax.random.split(key, 2)
+    x = jax.random.normal(k1, (m, k), dtype=_default_dtype())
+    codes, scale = _symmetric_channel_codes(k2, k, n, 7.0, jnp.int8)
+    return x, pack_int4_split_k(codes), scale
+
+
+def _gen_w4a4_gemv_inputs(config: dict[str, Any]):
+    """Generate int4 activations plus adjacent-packed int4 weights for the W4A4 gemv."""
+    m = config.get("m", 8)
+    k = config.get("k", 2048)
+    n = config.get("n", 4096)
+    key = jax.random.PRNGKey(config.get("seed", 0))
+    k1, k2 = jax.random.split(key, 2)
+    x = jax.random.normal(k1, (m, k), dtype=jnp.float32)
+    x_absmax = jnp.max(jnp.abs(x), axis=1, keepdims=True)
+    x_scale = jnp.where(x_absmax == 0, 1.0, x_absmax / 7.0)
+    x4 = jnp.clip(jnp.round(x / x_scale), -7, 7).astype(jnp.int4)
+    codes, scale = _symmetric_channel_codes(k2, k, n, 7.0, jnp.int8)
+    return x4, pack_int4_adjacent(codes), scale
+
+
+def _gen_grouped_matmul_quant_inputs(config: dict[str, Any]):
+    """Generate LHS, per-group int8 codes, scales, and group sizes for quantized grouped matmul."""
+    groups = config.get("groups", 8)
+    m_per = config.get("m_per_group", 32)
+    k = config.get("k", 512)
+    n = config.get("n", 512)
+    m = groups * m_per
+    key = jax.random.PRNGKey(config.get("seed", 0))
+    k1, k2 = jax.random.split(key, 2)
+    lhs = jax.random.normal(k1, (m, k), dtype=_default_dtype())
+    w = jax.random.normal(k2, (groups, k, n), dtype=jnp.float32)
+    absmax = jnp.max(jnp.abs(w), axis=1, keepdims=True)
+    scales = jnp.where(absmax == 0, 1.0, absmax / 127.0).astype(jnp.float32)
+    codes = jnp.clip(jnp.round(w / scales), -127, 127).astype(jnp.int8)
+    group_sizes = jnp.full((groups,), m_per, dtype=jnp.int32)
+    return lhs, codes, scales, group_sizes
+
+
+def _gen_fused_mlp_inputs(config: dict[str, Any]):
+    """Generate activations and dense gate/up/down weights for the fused MLP."""
+    m = config.get("m", 32)
+    k = config.get("k", 1024)
+    i = config.get("i", 2048)
+    dtype = _default_dtype()
+    key = jax.random.PRNGKey(config.get("seed", 0))
+    k1, k2, k3, k4 = jax.random.split(key, 4)
+    x = jax.random.normal(k1, (m, k), dtype=dtype)
+    w_gate = jax.random.normal(k2, (k, i), dtype=dtype) * 0.02
+    w_up = jax.random.normal(k3, (k, i), dtype=dtype) * 0.02
+    w_down = jax.random.normal(k4, (i, k), dtype=dtype) * 0.02
+    return x, w_gate, w_up, w_down
+
+
+def _gen_fused_mlp_bf16_inputs(config: dict[str, Any]):
+    """Generate activations, the fused ``[k, 2i]`` gate_up weight, and the down weight."""
+    m = config.get("m", 32)
+    k = config.get("k", 1024)
+    i = config.get("i", 2048)
+    dtype = _default_dtype()
+    key = jax.random.PRNGKey(config.get("seed", 0))
+    k1, k2, k3 = jax.random.split(key, 3)
+    x = jax.random.normal(k1, (m, k), dtype=dtype)
+    gate_up = jax.random.normal(k2, (k, 2 * i), dtype=dtype) * 0.02
+    w_down = jax.random.normal(k3, (i, k), dtype=dtype) * 0.02
+    return x, gate_up, w_down
+
+
+def _gen_fused_mlp_w4a4_inputs(config: dict[str, Any]):
+    """Generate int4 activations plus adjacent-packed gate/up/down weights and scales."""
+    m = config.get("m", 8)
+    k = config.get("k", 1024)
+    i = config.get("i", 2048)
+    key = jax.random.PRNGKey(config.get("seed", 0))
+    kx, kg, ku, kd = jax.random.split(key, 4)
+    x = jax.random.normal(kx, (m, k), dtype=jnp.float32)
+    x_absmax = jnp.max(jnp.abs(x), axis=1, keepdims=True)
+    x_scale = jnp.where(x_absmax == 0, 1.0, x_absmax / 7.0)
+    x4 = jnp.clip(jnp.round(x / x_scale), -7, 7).astype(jnp.int4)
+    gate_codes, gate_scale = _symmetric_channel_codes(kg, k, i, 7.0, jnp.int8)
+    up_codes, up_scale = _symmetric_channel_codes(ku, k, i, 7.0, jnp.int8)
+    down_codes, down_scale = _symmetric_channel_codes(kd, i, k, 7.0, jnp.int8)
+    return (
+        x4,
+        pack_int4_adjacent(gate_codes),
+        pack_int4_adjacent(up_codes),
+        pack_int4_adjacent(down_codes),
+        gate_scale,
+        up_scale,
+        down_scale,
+        x_scale,
+    )
+
+
+def _gen_compressed_window_inputs(config: dict[str, Any]):
+    """Generate query, shared KV, additive bias, and per-head sinks for compressed-window attention."""
+    batch = config.get("batch", 1)
+    heads = config.get("heads", 16)
+    q_len = config.get("q_len", 1)
+    head_dim = config.get("head_dim", 128)
+    kv_len = config.get("kv_len", 160)
+    dtype = _default_dtype()
+    key = jax.random.PRNGKey(config.get("seed", 0))
+    k1, k2, k3, k4 = jax.random.split(key, 4)
+    query = jax.random.normal(k1, (batch, heads, q_len, head_dim), dtype=dtype)
+    kv = jax.random.normal(k2, (batch, kv_len, head_dim), dtype=dtype)
+    bias = jax.random.normal(k3, (batch, q_len, kv_len), dtype=jnp.float32) * 0.5
+    sinks = jax.random.normal(k4, (heads,), dtype=jnp.float32)
+    return query, kv, bias, sinks
+
+
+def _gen_fused_conv_decode_inputs(config: dict[str, Any]):
+    """Generate conv state, new tokens, depthwise kernel, and the static window width."""
+    slots = config.get("slots", 8)
+    dim = config.get("dim", 1024)
+    d_conv = config.get("d_conv", 4)
+    dtype = _default_dtype()
+    key = jax.random.PRNGKey(config.get("seed", 0))
+    k1, k2, k3 = jax.random.split(key, 3)
+    conv_state = jax.random.normal(k1, (slots, dim, d_conv), dtype=dtype)
+    new_tokens = jax.random.normal(k2, (slots, dim), dtype=dtype)
+    kernel = jax.random.normal(k3, (dim, d_conv), dtype=dtype) * 0.25
+    return conv_state, new_tokens, kernel, d_conv
+
+
+def _gen_ragged_causal_conv1d_inputs(config: dict[str, Any]):
+    """Generate a decode-only ragged batch for the stateful causal conv1d."""
+    num_requests = config.get("num_requests", 8)
+    dim = config.get("dim", 1024)
+    d_conv = config.get("d_conv", 4)
+    dtype = _default_dtype()
+    key = jax.random.PRNGKey(config.get("seed", 0))
+    k1, k2, k3 = jax.random.split(key, 3)
+    x = jax.random.normal(k1, (num_requests, dim), dtype=dtype)
+    conv_state = jax.random.normal(k2, (num_requests, dim, d_conv), dtype=dtype)
+    kernel = jax.random.normal(k3, (dim, d_conv), dtype=dtype) * 0.25
+    query_start_loc = jnp.arange(num_requests + 1, dtype=jnp.int32)
+    state_indices = jnp.arange(num_requests, dtype=jnp.int32)
+    distribution = jnp.asarray([num_requests, num_requests, num_requests], dtype=jnp.int32)
+    return x, conv_state, kernel, query_start_loc, state_indices, distribution, d_conv
+
+
+def _gen_gdr_grouped_decode_inputs(config: dict[str, Any]):
+    """Generate one grouped GDR decode step (grouped keys, expanded value heads)."""
+    batch = config.get("batch", 8)
+    k_heads = config.get("k_heads", 8)
+    head_dim = config.get("head_dim", 128)
+    expand_ratio = config.get("expand_ratio", 2)
+    value_dim = config.get("value_dim", 128)
+    v_heads = k_heads * expand_ratio
+    dtype = _default_dtype()
+    key = jax.random.PRNGKey(config.get("seed", 0))
+    keys = jax.random.split(key, 6)
+    query = jax.random.normal(keys[0], (batch, k_heads, head_dim), dtype=dtype)
+    key_tensor = jax.random.normal(keys[1], (batch, k_heads, head_dim), dtype=dtype)
+    value = jax.random.normal(keys[2], (batch, k_heads, expand_ratio, value_dim), dtype=dtype)
+    beta = jax.nn.sigmoid(jax.random.normal(keys[3], (batch, k_heads, expand_ratio), dtype=jnp.float32)).astype(dtype)
+    decay = (jax.random.normal(keys[4], (batch, k_heads, expand_ratio), dtype=jnp.float32) * -0.01).astype(dtype)
+    recurrent_state = jax.random.normal(keys[5], (batch, v_heads, head_dim, value_dim), dtype=jnp.float32) * 0.05
+    return query, key_tensor, value, beta, decay, recurrent_state
+
+
+def _gen_gdn_compute_schedule_v2_inputs(config: dict[str, Any]):
+    """Generate ragged offsets plus static budgets for the GDN v2 schedule table."""
+    num_seqs = config.get("num_seqs", 8)
+    tokens_per_seq = config.get("tokens_per_seq", 1)
+    chunk_size = config.get("chunk_size", 64)
+    total_tokens = num_seqs * tokens_per_seq
+    query_start_loc = jnp.arange(0, total_tokens + 1, tokens_per_seq, dtype=jnp.int32)
+    decode_tokens = jnp.asarray(num_seqs if tokens_per_seq == 1 else 0, dtype=jnp.int32)
+    num_valid_seqs = jnp.asarray(num_seqs, dtype=jnp.int32)
+    return query_start_loc, decode_tokens, num_valid_seqs, total_tokens, chunk_size
+
+
+def _gen_gdn_spec_window_inputs(config: dict[str, Any]):
+    """Generate a speculative decode window batch for the GDN state scan."""
+    batch = config.get("batch", 8)
+    steps = config.get("steps", 4)
+    n_kq = config.get("n_kq", 8)
+    n_v = config.get("n_v", 16)
+    d_k = config.get("d_k", 128)
+    d_v = config.get("d_v", 128)
+    qkv_dim = 2 * n_kq * d_k + n_v * d_v
+    dtype = _default_dtype()
+    key = jax.random.PRNGKey(config.get("seed", 0))
+    keys = jax.random.split(key, 5)
+    mixed_qkv = jax.random.normal(keys[0], (batch, steps, qkv_dim), dtype=dtype) * 0.3
+    b = jax.random.normal(keys[1], (batch, steps, n_v), dtype=dtype)
+    a = jax.random.normal(keys[2], (batch, steps, n_v), dtype=dtype)
+    a_log = jax.random.normal(keys[3], (n_v,), dtype=jnp.float32) * 0.1
+    dt_bias = jnp.ones((n_v,), dtype=jnp.float32)
+    step_valid = jnp.ones((batch, steps), dtype=bool)
+    recurrent_state = jax.random.normal(keys[4], (batch, n_v, d_k, d_v), dtype=jnp.float32) * 0.05
+    return mixed_qkv, b, a, a_log, dt_bias, step_valid, recurrent_state, n_kq, n_v, d_k, d_v
+
+
+def _gen_ragged_gdr_v2_inputs(config: dict[str, Any]):
+    """Generate a decode or prefill ragged batch for gated delta rule v2.
+
+    ``mode="decode"`` packs ``num_requests`` single-token sequences
+    (``distribution=[n, n, n]``); ``mode="prefill"`` packs one
+    ``prefill_tokens``-long sequence (``distribution=[0, 1, 1]``).
+    """
+    mode = config.get("mode", "decode")
+    n_kq = config.get("n_kq", 8)
+    n_v = config.get("n_v", 16)
+    d_k = config.get("d_k", 128)
+    d_v = config.get("d_v", 128)
+    chunk_size = config.get("chunk_size", 64)
+    if mode == "decode":
+        num_requests = config.get("num_requests", 8)
+        total_tokens = num_requests
+        query_start_loc = jnp.arange(num_requests + 1, dtype=jnp.int32)
+        distribution = jnp.asarray([num_requests, num_requests, num_requests], dtype=jnp.int32)
+    else:
+        num_requests = 1
+        total_tokens = config.get("prefill_tokens", 256)
+        query_start_loc = jnp.asarray([0, total_tokens], dtype=jnp.int32)
+        distribution = jnp.asarray([0, 1, 1], dtype=jnp.int32)
+    qkv_dim = 2 * n_kq * d_k + n_v * d_v
+    dtype = _default_dtype()
+    key = jax.random.PRNGKey(config.get("seed", 0))
+    keys = jax.random.split(key, 5)
+    mixed_qkv = jax.random.normal(keys[0], (total_tokens, qkv_dim), dtype=dtype) * 0.3
+    b = jax.random.normal(keys[1], (total_tokens, n_v), dtype=dtype)
+    a = jax.random.normal(keys[2], (total_tokens, n_v), dtype=dtype)
+    recurrent_state = jax.random.normal(keys[3], (num_requests, n_v, d_k, d_v), dtype=jnp.float32) * 0.05
+    a_log = jax.random.normal(keys[4], (n_v,), dtype=jnp.float32) * 0.1
+    dt_bias = jnp.ones((n_v,), dtype=jnp.float32)
+    state_indices = jnp.arange(num_requests, dtype=jnp.int32)
+    has_initial_state = jnp.ones((num_requests,), dtype=bool)
+    return (
+        mixed_qkv,
+        b,
+        a,
+        recurrent_state,
+        a_log,
+        dt_bias,
+        query_start_loc,
+        state_indices,
+        distribution,
+        has_initial_state,
+        n_kq,
+        n_v,
+        d_k,
+        d_v,
+        chunk_size,
+    )
 
 
 def _build_algorithms(
@@ -2447,6 +2937,90 @@ def _ragged_gdr_decode_fused_wrapper(op_fn: Callable[..., Any], platform: str):
     return _fn
 
 
+def _collective_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Wrap a standalone collective with a static dummy axis."""
+
+    def _fn(x, axis_name):
+        """Call the collective ``op_fn`` with a static ``axis_name`` and ``platform``.
+
+        Args:
+            x: Operand tensor (partials or shard, depending on the op).
+            axis_name: Static mesh axis name for the collective.
+
+        Returns:
+            The collective result.
+        """
+        return op_fn(x, axis_name, platform=platform)
+
+    return _fn
+
+
+def _all_to_all_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Wrap all-to-all in a shard_map over all local devices."""
+    from jax import shard_map
+    from jax.sharding import Mesh, PartitionSpec
+
+    mesh = Mesh(np.array(jax.devices()), axis_names=("bench",))
+
+    def _fn(x):
+        """Run the all-to-all across the local-device mesh axis.
+
+        Args:
+            x: Operand tensor, sharded on its trailing axis for the exchange.
+
+        Returns:
+            The exchanged tensor (sharded on the leading axis).
+        """
+        inner = shard_map(
+            lambda v: op_fn(v, "bench", split_axis=0, concat_axis=1, platform=platform),
+            mesh=mesh,
+            in_specs=(PartitionSpec(None, "bench"),),
+            out_specs=PartitionSpec("bench", None),
+            check_vma=False,
+        )
+        return inner(x)
+
+    return _fn
+
+
+def _ragged_gather_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Wrap the ragged gather with a static platform."""
+
+    def _fn(x, indices):
+        """Gather rows of ``x`` by ``indices``.
+
+        Args:
+            x: Source table.
+            indices: Row indices.
+
+        Returns:
+            The gathered rows.
+        """
+        return op_fn(x, indices, platform=platform)
+
+    return _fn
+
+
+def _ragged_gather_reduce_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Wrap the grouped gather-sum with static group size and platform."""
+
+    def _fn(x, indices, weights, reduce_group_size):
+        """Weighted grouped gather-sum of ``x`` rows.
+
+        Args:
+            x: Source table.
+            indices: Flat slot indices.
+            weights: Per-slot weights.
+            reduce_group_size: Slots summed per output row.
+
+        Returns:
+            The combined rows.
+        """
+        return op_fn(x, indices, weights, reduce_group_size=reduce_group_size, platform=platform)
+
+    return _fn
+
+
 def _all_gather_matmul_wrapper(op_fn: Callable[..., Any], platform: str):
     """Wrap all-gather matmul with a static dummy axis."""
 
@@ -2564,7 +3138,293 @@ def _fused_kl_divergence_wrapper(op_fn: Callable[..., Any], platform: str):
     return _fn
 
 
+def _channelwise_qmm_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Wrap channelwise quantized matmul with a static activation-quant flag."""
+    del platform
+
+    def _fn(x, w_q, channel_scale, quantize_activations):
+        """Call the channelwise quantized matmul with the static quant flag.
+
+        Args:
+            x: Activation tensor.
+            w_q: Integer weight codes.
+            channel_scale: Per-output-channel scale.
+            quantize_activations: Static flag enabling the integer-dot prefill path.
+
+        Returns:
+            The matmul output.
+        """
+        return op_fn(x, w_q, channel_scale, quantize_activations=quantize_activations)
+
+    return _fn
+
+
+def _compressed_window_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Wrap compressed-window attention/decode with a static platform."""
+
+    def _fn(query, kv, bias, softmax_aux):
+        """Call the compressed-window op on the positional forward inputs.
+
+        Args:
+            query: Query tensor ``[batch, heads, q_len, head_dim]``.
+            kv: Shared key/value tensor ``[batch, kv_len, head_dim]``.
+            bias: Additive bias / mask ``[batch, q_len, kv_len]``.
+            softmax_aux: Per-head sink logits.
+
+        Returns:
+            The first element when ``op_fn`` returns a tuple, otherwise the attention output.
+        """
+        out = op_fn(query, kv, bias, softmax_aux, platform=platform)
+        return out[0] if isinstance(out, tuple) else out
+
+    return _fn
+
+
+def _fused_conv_decode_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Wrap fused conv decode with static window width and output dtype."""
+
+    def _fn(conv_state, new_tokens, kernel, d_conv):
+        """Run one fused conv-state decode step.
+
+        Args:
+            conv_state: Rolling conv state ``[slots, dim, d_conv]``.
+            new_tokens: Newest token activations ``[slots, dim]``.
+            kernel: Depthwise conv kernel ``[dim, d_conv]``.
+            d_conv: Static conv window width.
+
+        Returns:
+            The updated conv state (first tuple element).
+        """
+        out = op_fn(
+            conv_state,
+            new_tokens,
+            kernel,
+            output_dtype=new_tokens.dtype,
+            activation="silu",
+            d_conv=d_conv,
+            platform=platform,
+        )
+        return out[0] if isinstance(out, tuple) else out
+
+    return _fn
+
+
+def _ragged_causal_conv1d_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Wrap the ragged causal conv1d with static window width and platform."""
+
+    def _fn(x, conv_state, kernel, query_start_loc, state_indices, distribution, d_conv):
+        """Run the stateful ragged causal conv1d.
+
+        Args:
+            x: Packed token activations ``[total_tokens, dim]``.
+            conv_state: Per-slot conv state ``[num_slots, dim, d_conv]``.
+            kernel: Depthwise conv kernel ``[dim, d_conv]``.
+            query_start_loc: Ragged query start offsets.
+            state_indices: Per-sequence indices into the conv state.
+            distribution: ``(decode_end, prefill_end, total)`` request layout.
+            d_conv: Static conv window width.
+
+        Returns:
+            The conv output (first tuple element).
+        """
+        out = op_fn(
+            x,
+            conv_state,
+            kernel,
+            query_start_loc,
+            state_indices,
+            distribution,
+            d_conv=d_conv,
+            apply_silu=True,
+            platform=platform,
+        )
+        return out[0] if isinstance(out, tuple) else out
+
+    return _fn
+
+
+def _gdn_compute_schedule_v2_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Wrap the GDN v2 schedule builder (XLA-only, no platform argument)."""
+    del platform
+
+    def _fn(query_start_loc, decode_tokens, num_valid_seqs, max_tokens, chunk_size):
+        """Build the GDN v2 work-descriptor table.
+
+        Args:
+            query_start_loc: Ragged query start offsets.
+            decode_tokens: Number of single-token decode requests at the head.
+            num_valid_seqs: Number of live sequences.
+            max_tokens: Static token budget sizing the table.
+            chunk_size: Static recurrence chunk size.
+
+        Returns:
+            The schedule table (first tuple element).
+        """
+        out = op_fn(query_start_loc, decode_tokens, num_valid_seqs, max_tokens, chunk_size)
+        return out[0] if isinstance(out, tuple) else out
+
+    return _fn
+
+
+def _gdn_spec_window_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Wrap the GDN speculative-window state scan with static head geometry."""
+
+    def _fn(mixed_qkv, b, a, A_log, dt_bias, step_valid, recurrent_state, n_kq, n_v, d_k, d_v):
+        """Run the speculative-window state scan.
+
+        Args:
+            mixed_qkv: Fused QKV rows ``[batch, steps, qkv_dim]``.
+            b: Beta gate logits ``[batch, steps, n_v]``.
+            a: Decay logits ``[batch, steps, n_v]``.
+            A_log: Per-head log-decay parameters.
+            dt_bias: Per-head dt bias.
+            step_valid: Per-step validity mask.
+            recurrent_state: Entry recurrent state ``[batch, n_v, d_k, d_v]``.
+            n_kq: Static number of key/query heads.
+            n_v: Static number of value heads.
+            d_k: Static key head dim.
+            d_v: Static value head dim.
+
+        Returns:
+            The stacked per-step states.
+        """
+        out = op_fn(
+            mixed_qkv,
+            b,
+            a,
+            A_log,
+            dt_bias,
+            step_valid,
+            recurrent_state,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            platform=platform,
+        )
+        return out[0] if isinstance(out, tuple) else out
+
+    return _fn
+
+
+def _ragged_gdr_v2_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Wrap ragged gated delta rule v2 with static head geometry and chunking."""
+
+    def _fn(
+        mixed_qkv,
+        b,
+        a,
+        recurrent_state,
+        A_log,
+        dt_bias,
+        query_start_loc,
+        state_indices,
+        distribution,
+        has_initial_state,
+        n_kq,
+        n_v,
+        d_k,
+        d_v,
+        chunk_size,
+    ):
+        """Run ragged gated delta rule v2 over a packed decode/prefill batch.
+
+        Args:
+            mixed_qkv: Fused QKV rows ``[total_tokens, qkv_dim]``.
+            b: Beta gate logits ``[total_tokens, n_v]``.
+            a: Decay logits ``[total_tokens, n_v]``.
+            recurrent_state: Per-slot recurrent state pool.
+            A_log: Per-head log-decay parameters.
+            dt_bias: Per-head dt bias.
+            query_start_loc: Ragged query start offsets.
+            state_indices: Per-sequence indices into the state pool.
+            distribution: ``(decode_end, prefill_end, total)`` request layout.
+            has_initial_state: Per-sequence carried-state mask.
+            n_kq: Static number of key/query heads.
+            n_v: Static number of value heads.
+            d_k: Static key head dim.
+            d_v: Static value head dim.
+            chunk_size: Static recurrence chunk size.
+
+        Returns:
+            The updated recurrent state (first tuple element).
+        """
+        out = op_fn(
+            mixed_qkv,
+            b,
+            a,
+            recurrent_state,
+            A_log,
+            dt_bias,
+            query_start_loc,
+            state_indices,
+            distribution,
+            has_initial_state,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            chunk_size=chunk_size,
+            platform=platform,
+        )
+        return out[0] if isinstance(out, tuple) else out
+
+    return _fn
+
+
 SPECS: dict[str, OpBenchmarkSpec] = {
+    "all_gather": OpBenchmarkSpec(
+        op_name="all_gather",
+        algorithm="all_gather",
+        op_fn=ops.all_gather,
+        input_generator=_gen_collective_inputs,
+        configs=_cfgs_collective(),
+        wrapper_factory=_collective_wrapper,
+        static_kwargs=["axis_name"],
+    ),
+    "all_to_all": OpBenchmarkSpec(
+        op_name="all_to_all",
+        algorithm="all_to_all",
+        op_fn=ops.all_to_all,
+        input_generator=_gen_all_to_all_inputs,
+        configs=_cfgs_collective(),
+        wrapper_factory=_all_to_all_wrapper,
+    ),
+    "ragged_gather": OpBenchmarkSpec(
+        op_name="ragged_gather",
+        algorithm="ragged_gather",
+        op_fn=ops.ragged_gather,
+        input_generator=_gen_ragged_gather_inputs,
+        configs=_cfgs_collective(),
+        wrapper_factory=_ragged_gather_wrapper,
+    ),
+    "ragged_gather_reduce": OpBenchmarkSpec(
+        op_name="ragged_gather_reduce",
+        algorithm="ragged_gather_reduce",
+        op_fn=ops.ragged_gather_reduce,
+        input_generator=_gen_ragged_gather_reduce_inputs,
+        configs=_cfgs_collective(),
+        wrapper_factory=_ragged_gather_reduce_wrapper,
+        static_kwargs=["reduce_group_size"],
+    ),
+    "all_reduce": OpBenchmarkSpec(
+        op_name="all_reduce",
+        algorithm="all_reduce",
+        op_fn=ops.all_reduce,
+        input_generator=_gen_collective_inputs,
+        configs=_cfgs_collective(),
+        wrapper_factory=_collective_wrapper,
+        static_kwargs=["axis_name"],
+    ),
+    "reduce_scatter": OpBenchmarkSpec(
+        op_name="reduce_scatter",
+        algorithm="reduce_scatter",
+        op_fn=ops.reduce_scatter,
+        input_generator=_gen_collective_inputs,
+        configs=_cfgs_collective(),
+        wrapper_factory=_collective_wrapper,
+        static_kwargs=["axis_name"],
+    ),
     "all_gather_matmul": OpBenchmarkSpec(
         op_name="all_gather_matmul",
         algorithm="all_gather_matmul",
@@ -2973,5 +3833,139 @@ SPECS: dict[str, OpBenchmarkSpec] = {
         input_generator=_gen_state_space_v2_inputs,
         configs=_cfgs_state_space_v2(),
         wrapper_factory=_registry_wrapper("ssm2"),
+    ),
+    "channelwise_quantized_matmul": OpBenchmarkSpec(
+        op_name="channelwise_quantized_matmul",
+        algorithm="channelwise_quantized_matmul",
+        op_fn=ops.channelwise_quantized_matmul,
+        input_generator=_gen_channelwise_quantized_matmul_inputs,
+        configs=_cfgs_channelwise_quantized_matmul(),
+        wrapper_factory=_channelwise_qmm_wrapper,
+        static_kwargs=["quantize_activations"],
+    ),
+    "packed_int4_gemv": OpBenchmarkSpec(
+        op_name="packed_int4_gemv",
+        algorithm="packed_int4_gemv",
+        op_fn=ops.channelwise_quantized_matmul,
+        input_generator=_gen_packed_int4_gemv_inputs,
+        configs=_cfgs_packed_int4_gemv(),
+        wrapper_factory=_registry_wrapper("packed_int4_gemv"),
+    ),
+    "w4a4_gemv": OpBenchmarkSpec(
+        op_name="w4a4_gemv",
+        algorithm="w4a4_gemv",
+        op_fn=ops.channelwise_quantized_matmul,
+        input_generator=_gen_w4a4_gemv_inputs,
+        configs=_cfgs_packed_int4_gemv(),
+        wrapper_factory=_registry_wrapper("w4a4_gemv"),
+    ),
+    "grouped_matmul_quant": OpBenchmarkSpec(
+        op_name="grouped_matmul_quant",
+        algorithm="grouped_matmul_quant",
+        op_fn=ops.grouped_matmul,
+        input_generator=_gen_grouped_matmul_quant_inputs,
+        configs=_cfgs_grouped_matmul_quant(),
+        wrapper_factory=_registry_wrapper("grouped_matmul_quant"),
+    ),
+    "grouped_matmul_w8a8": OpBenchmarkSpec(
+        op_name="grouped_matmul_w8a8",
+        algorithm="grouped_matmul_w8a8",
+        op_fn=ops.grouped_matmul_w8a8,
+        input_generator=_gen_grouped_matmul_quant_inputs,
+        configs=_cfgs_grouped_matmul_quant(),
+        needs_platform=False,
+    ),
+    "fused_mlp": OpBenchmarkSpec(
+        op_name="fused_mlp",
+        algorithm="fused_mlp",
+        op_fn=ops.fused_mlp,
+        input_generator=_gen_fused_mlp_inputs,
+        configs=_cfgs_fused_mlp(),
+        bench_bwd=True,
+    ),
+    "fused_mlp_bf16": OpBenchmarkSpec(
+        op_name="fused_mlp_bf16",
+        algorithm="fused_mlp_bf16",
+        op_fn=ops.fused_mlp,
+        input_generator=_gen_fused_mlp_bf16_inputs,
+        configs=_cfgs_fused_mlp(),
+        wrapper_factory=_registry_wrapper("fused_mlp_bf16"),
+    ),
+    "fused_mlp_w4a4": OpBenchmarkSpec(
+        op_name="fused_mlp_w4a4",
+        algorithm="fused_mlp_w4a4",
+        op_fn=ops.fused_mlp,
+        input_generator=_gen_fused_mlp_w4a4_inputs,
+        configs=_cfgs_fused_mlp_w4a4(),
+        wrapper_factory=_registry_wrapper("fused_mlp_w4a4"),
+    ),
+    "compressed_window_attention": OpBenchmarkSpec(
+        op_name="compressed_window_attention",
+        algorithm="compressed_window_attention",
+        op_fn=ops.compressed_window_attention,
+        input_generator=_gen_compressed_window_inputs,
+        configs=_cfgs_compressed_window_attention(),
+        wrapper_factory=_compressed_window_wrapper,
+        bench_bwd=True,
+    ),
+    "compressed_window_decode": OpBenchmarkSpec(
+        op_name="compressed_window_decode",
+        algorithm="compressed_window_decode",
+        op_fn=ops.compressed_window_decode,
+        input_generator=_gen_compressed_window_inputs,
+        configs=_cfgs_compressed_window_decode(),
+        wrapper_factory=_compressed_window_wrapper,
+    ),
+    "fused_conv_decode": OpBenchmarkSpec(
+        op_name="fused_conv_decode",
+        algorithm="fused_conv_decode",
+        op_fn=ops.fused_conv_decode,
+        input_generator=_gen_fused_conv_decode_inputs,
+        configs=_cfgs_fused_conv_decode(),
+        wrapper_factory=_fused_conv_decode_wrapper,
+        static_kwargs=["d_conv"],
+    ),
+    "ragged_causal_conv1d": OpBenchmarkSpec(
+        op_name="ragged_causal_conv1d",
+        algorithm="ragged_causal_conv1d",
+        op_fn=ops.ragged_causal_conv1d,
+        input_generator=_gen_ragged_causal_conv1d_inputs,
+        configs=_cfgs_ragged_causal_conv1d(),
+        wrapper_factory=_ragged_causal_conv1d_wrapper,
+        static_kwargs=["d_conv"],
+    ),
+    "gated_delta_rule_grouped_decode": OpBenchmarkSpec(
+        op_name="gated_delta_rule_grouped_decode",
+        algorithm="gated_delta_rule_grouped_decode",
+        op_fn=ops.gated_delta_rule_grouped_decode,
+        input_generator=_gen_gdr_grouped_decode_inputs,
+        configs=_cfgs_gdr_grouped_decode(),
+    ),
+    "gdn_compute_schedule_v2": OpBenchmarkSpec(
+        op_name="gdn_compute_schedule_v2",
+        algorithm="gdn_compute_schedule_v2",
+        op_fn=ops.gdn_compute_schedule_v2,
+        input_generator=_gen_gdn_compute_schedule_v2_inputs,
+        configs=_cfgs_gdn_compute_schedule_v2(),
+        wrapper_factory=_gdn_compute_schedule_v2_wrapper,
+        static_kwargs=["max_tokens", "chunk_size"],
+    ),
+    "gdn_spec_window_states": OpBenchmarkSpec(
+        op_name="gdn_spec_window_states",
+        algorithm="gdn_spec_window_states",
+        op_fn=ops.gdn_spec_window_states,
+        input_generator=_gen_gdn_spec_window_inputs,
+        configs=_cfgs_gdn_spec_window(),
+        wrapper_factory=_gdn_spec_window_wrapper,
+        static_kwargs=["n_kq", "n_v", "d_k", "d_v"],
+    ),
+    "ragged_gated_delta_rule_v2": OpBenchmarkSpec(
+        op_name="ragged_gated_delta_rule_v2",
+        algorithm="ragged_gated_delta_rule_v2",
+        op_fn=ops.ragged_gated_delta_rule_v2,
+        input_generator=_gen_ragged_gdr_v2_inputs,
+        configs=_cfgs_ragged_gdr_v2(),
+        wrapper_factory=_ragged_gdr_v2_wrapper,
+        static_kwargs=["n_kq", "n_v", "d_k", "d_v", "chunk_size"],
     ),
 }

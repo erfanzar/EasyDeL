@@ -89,8 +89,8 @@ from easydel.layers import (
     Embed,
     RowParallelLinear,
     dense_gate_up_layout,
+    gated_mlp_forward,
     get_frequencies,
-    split_fused_gate_up_projection,
 )
 from easydel.layers.rotary._compute_fns import apply_basic_rope
 from easydel.modules.gemma4.modeling_gemma4 import Gemma4RMSNorm
@@ -336,10 +336,13 @@ class Gemma4AssistantMLP(spx.Module):
         return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
 
     def forward(self, x: Float[Array, "batch seq_len hidden"]) -> Float[Array, "batch seq_len hidden"]:
-        """SwiGLU forward (despite the name; Gemma4 uses gelu)."""
-        gate_up = self.gate_up_proj(x)
-        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
-        return self.down_proj(self.act_fn(gate) * up)
+        """SwiGLU forward (despite the name; Gemma4 uses gelu).
+
+        Delegates to :func:`easydel.layers.gated_mlp_forward`, which routes
+        supported layouts through the ejkernel fused MLP kernels and runs
+        the legacy composition otherwise.
+        """
+        return gated_mlp_forward(self, x)
 
 
 class Gemma4AssistantQOnlyAttention(spx.Module):

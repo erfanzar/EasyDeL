@@ -38,7 +38,6 @@ import jax
 import jax.numpy as jnp
 import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 from spectrax import apply_logical_sharding, common_types, nn
 
@@ -66,7 +65,7 @@ from easydel.layers import (
     Embed,
     RowParallelLinear,
     dense_gate_up_layout,
-    split_fused_gate_up_projection,
+    gated_mlp_forward,
 )
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
@@ -307,6 +306,7 @@ class Cohere2MLP(spx.Module):
             precision=self.precision,
             rngs=rngs,
         )
+        self.act_fn = jax.nn.silu
 
     @property
     def reform_param(self):
@@ -331,21 +331,7 @@ class Cohere2MLP(spx.Module):
         Returns:
             Array: Transformed hidden states of shape (batch, seq_len, hidden_dim).
         """
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), name="mlp_gate_up")
-        gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
-        gate = jax.nn.silu(checkpoint_name(gate_raw, name="mlp_gate"))
-        hidden_states = checkpoint_name(self.down_proj(gate * up), name="mlp_down")
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        return hidden_states
+        return gated_mlp_forward(self, hidden_states)
 
 
 class Cohere2Block(spx.Module):
@@ -648,16 +634,31 @@ class Cohere2Model(EasyDeLBaseModule):
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
+        trace_layers = self._layer_scan_trace(
+            False,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache,
+        )
+        cache_views = views if trace_layers else None
+        # Hoisted out of the loop body: the caching property must not be
+        # first materialized inside the lax.scan trace (tracer leak).
+        frequencies = self.frequencies
+
         def _layer_loop(block, carry):
             """Per-layer body for the Cohere2 decoder ``scan``.
 
-            Carry layout: ``(hidden_states, all_hidden_states, all_attentions,
-            idx)``. Optionally records the input hidden state, runs one
-            decoder block at its assigned pipeline stage, captures the
+            Carry layout: ``(hidden_states, cache_views, all_hidden_states,
+            all_attentions, idx)``. Optionally records the input hidden state,
+            runs one decoder block at its assigned pipeline stage, captures the
             attention weights when requested, and writes the updated KV cache
             slot before returning the next carry.
             """
-            hidden_states, all_hidden_states, all_attentions, idx = carry
+            hidden_states, cv, all_hidden_states, all_attentions, idx = carry
             stage_idx = getattr(block, "layer_idx", idx)
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -668,24 +669,30 @@ class Cohere2Model(EasyDeLBaseModule):
                     mask_info=mask_info,
                     position_ids=position_ids,
                     mode=mode,
-                    cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
+                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
                     cache_metadata=cache_metadata,
                     output_attentions=output_attentions,
-                    frequencies=self.frequencies,
+                    frequencies=frequencies,
                 )
             hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, stage_idx, layers=self.layers)
 
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
 
-            self._layer_cache_view_update(None, idx, layer_outputs.cache_view, enabled=True, cache=past_key_values)
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                layer_outputs.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
 
-            return hidden_states, all_hidden_states, all_attentions, idx + 1
+            return hidden_states, cv, all_hidden_states, all_attentions, idx + 1
 
-        hidden_states, all_hidden_states, all_attentions, _ = self.layers.scan(
+        hidden_states, _, all_hidden_states, all_attentions, _ = self.layers.scan(
             _layer_loop,
-            (hidden_states, all_hidden_states, all_attentions, 0),
-            trace=True,
+            (hidden_states, cache_views, all_hidden_states, all_attentions, 0),
+            trace=trace_layers,
         )
         hidden_states = self.norm(hidden_states)
 

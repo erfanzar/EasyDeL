@@ -1080,7 +1080,10 @@ def materialize_base_config(cfg: eLMConfig, prefer: tp.Literal["base", "sections
 
     set_maybe("attn_dtype", coerce_dtype(loader.get("dtype")))
     set_maybe("kvdtype", coerce_dtype(loader.get("dtype")))
-    set_maybe("attn_softmax_dtype", coerce_dtype(loader.get("dtype")))
+    # attn_softmax_dtype is deliberately NOT derived from the loader dtype:
+    # softmax accumulation stays at the model default (float32) unless the
+    # config sets base_config.values.attn_softmax_dtype explicitly. Deriving
+    # it from a bf16 loader dtype silently degrades attention numerics.
 
     set_maybe("partition_axis", sharding.get("partition_axis"))
     set_maybe("backend", platform.get("backend"))

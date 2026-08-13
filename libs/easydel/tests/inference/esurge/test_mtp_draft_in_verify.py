@@ -326,9 +326,7 @@ def test_fused_pool_is_donated_not_copied():
     rows = n * (k + 1)
     gathered = _gathered(0, rows)
     mtp_cache = drafter._mtp_cache
-    fn = drafter._get_verify_draft_fn(
-        k_pad=k, k_live=k, gathered_hidden=gathered, mtp_cache=mtp_cache, project_fn=None
-    )
+    fn = drafter._get_verify_draft_fn(k_pad=k, k_live=k, gathered_hidden=gathered, mtp_cache=mtp_cache, project_fn=None)
     _gds, (mtp_st, embed_st, head_st), freqs, _tie = drafter._batched_bundle_graph_and_states()
     args = (
         mtp_st,

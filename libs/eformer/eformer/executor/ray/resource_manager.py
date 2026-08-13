@@ -65,6 +65,31 @@ from .types import ExceptionInfo
 
 logger = logging.getLogger("ray")
 
+_forkify_disabled: bool = False
+
+
+def set_forkify_disabled(disabled: bool = True) -> bool:
+    """Toggle the fork-isolation escape hatch for forkified remote functions.
+
+    :meth:`RayResources.separate_process_fn` normally runs the wrapped
+    function in a forked subprocess for isolation. When the child dies hard
+    the parent can only report a generic timeout and the real traceback is
+    lost, which makes accelerator-init failures hard to diagnose. Disabling
+    forkify runs the function inline in the calling process so the original
+    exception propagates.
+
+    Args:
+        disabled: ``True`` to run forkified functions inline (no subprocess),
+            ``False`` to restore the default fork-based isolation.
+
+    Returns:
+        The previous value of the flag, so callers can restore it.
+    """
+    global _forkify_disabled
+    previous = _forkify_disabled
+    _forkify_disabled = bool(disabled)
+    return previous
+
 
 @dataclass
 class RayResources:
@@ -227,9 +252,11 @@ class RayResources:
         if isinstance(remote_fn, RemoteFunction):
             fn = remote_fn._function
 
+            _disabled_at_wrap = _forkify_disabled
+
             @functools.wraps(fn)
             def wrapped_fn(*args, **kwargs):
-                return RayResources.separate_process_fn(fn, args, kwargs)
+                return RayResources.separate_process_fn(fn, args, kwargs, forkify_disabled=_disabled_at_wrap)
 
             remote_fn = RemoteFunction(
                 language=remote_fn._language,
@@ -239,10 +266,10 @@ class RayResources:
             )
             return remote_fn
         else:
-            return functools.partial(RayResources.separate_process_fn, remote_fn)
+            return functools.partial(RayResources.separate_process_fn, remote_fn, forkify_disabled=_forkify_disabled)
 
     @staticmethod
-    def separate_process_fn(underlying_function, args, kwargs):
+    def separate_process_fn(underlying_function, args, kwargs, forkify_disabled: bool | None = None):
         """Execute a function in a separate subprocess with error handling.
 
         This method runs the specified function in an isolated subprocess,
@@ -276,13 +303,15 @@ class RayResources:
                 info = ExceptionInfo.ser_exc_info(e)
                 queue.put((False, info))
 
-        # Escape hatch: run inline in this process instead of forking. When the
-        # child dies hard the parent can only report a generic timeout and the
-        # real traceback is lost, which makes accelerator-init failures hard to
-        # diagnose; this propagates the original exception instead. Checked here,
-        # in the parent, before the process exists -- inside the child body it
-        # could not prevent the fork.
-        if os.getenv("EFORMER_DISABLE_FORKIFY"):
+        # Escape hatch (see :func:`set_forkify_disabled`): run inline in this
+        # process instead of forking. When the child dies hard the parent can
+        # only report a generic timeout and the real traceback is lost, which
+        # makes accelerator-init failures hard to diagnose; this propagates
+        # the original exception instead. Checked here, in the parent, before
+        # the process exists -- inside the child body it could not prevent
+        # the fork.
+        disabled = _forkify_disabled if forkify_disabled is None else forkify_disabled
+        if disabled:
             return underlying_function(*args, **kwargs)
 
         queue = multiprocessing.Queue()

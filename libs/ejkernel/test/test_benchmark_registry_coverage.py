@@ -48,6 +48,7 @@ def test_no_duplicate_benchmark_entrypoints():
     allowed = {f"benchmark_{name}.py" for name in SPECS}
     allowed.update(
         {
+            "__init__.py",
             "_op_benchmark_registry.py",
             "benchmark_quantized_matmul_native_vs_gemlite.py",
             "benchmark_suite.py",

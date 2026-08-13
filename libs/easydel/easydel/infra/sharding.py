@@ -1041,6 +1041,59 @@ def _metadata_has_compound_axis_names(metadata: Mapping[str, tp.Any]) -> bool:
         return False
 
 
+_decode_mode_specs_var: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
+    "easydel_decode_mode_specs", default=False
+)
+
+
+@contextmanager
+def decode_mode_specs(enabled: bool = True) -> tp.Iterator[bool]:
+    """Scope that pins ALL sharding-mode resolution to decode-mode specs.
+
+    Mesh-scope-style context manager: inside the block every
+    :meth:`RuntimeShardingResolver._resolve_mode` call returns
+    ``MODE_DECODE`` regardless of shape-derived or explicitly passed modes.
+
+    This is the production decode-layout switch: eSurge's compile paths
+    open this scope for pure-decode buckets so the residual stream traces
+    with the decode-mode specs, and the fused-MoE boundary
+    (``_moe_module.py``) is mode-aware and emits a matching replicated
+    output. Forcing decode specs at constraint sites WITHOUT the MoE
+    boundary flip was measured WORSE on v5p-8 qwen3-30B-A3B decode
+    (435 -> 482 collectives: the RMSNorm all-reduces anchor to the MoE
+    shard_map out_spec, not to constraints) — keep the two in sync.
+
+    Args:
+        enabled: Whether the forcing is active inside the block.
+
+    Yields:
+        The ``enabled`` value.
+    """
+    token = _decode_mode_specs_var.set(bool(enabled))
+    try:
+        yield bool(enabled)
+    finally:
+        _decode_mode_specs_var.reset(token)
+
+
+def inference_mode_forces_decode() -> bool:
+    """Whether an enclosing :func:`decode_mode_specs` scope is active.
+
+    Public because the decode-layout contract spans three subsystems that
+    must agree on it within a single trace: the constraint sites resolved
+    through :meth:`RuntimeShardingResolver._resolve_mode`, the fused-MoE
+    output boundary (``layers/moe/_moe_module.py``), and the fused-MLP spec
+    resolution (``layers/mlp.py``). Read this rather than re-deriving the
+    mode from a tensor's shape — eSurge packs decode as ``[1, N]`` tokens,
+    which shape-classifies as training.
+    """
+    return _decode_mode_specs_var.get()
+
+
+#: Backwards-compatible private alias for :func:`inference_mode_forces_decode`.
+_inference_mode_forces_decode = inference_mode_forces_decode
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class AxisPolicy:
     """Immutable wrapper around a :class:`PartitionAxis` that exposes EasyDeL's logical axis vocabulary.
@@ -1358,6 +1411,12 @@ class RuntimeShardingResolver:
         Raises:
             ValueError: If ``mode`` is an int and ``shape`` was not provided.
         """
+        # Inside an explicit ``decode_mode_specs()`` scope every constraint
+        # resolves decode-mode specs, overriding shape-derived and
+        # explicitly-passed TRAIN modes (eSurge packs decode as ``[1, N]``
+        # tokens, which shape-classifies as training).
+        if _inference_mode_forces_decode():
+            return MODE_DECODE
         selected_mode = layout_mode if mode is NOT_GIVEN else mode
         if isinstance(selected_mode, int):
             if shape is NOT_GIVEN:
@@ -2062,7 +2121,9 @@ __all__ = [
     "coerce_axis_policy",
     "coerce_partition_spec",
     "coerce_runtime_sharding_resolver",
+    "decode_mode_specs",
     "final_stage_replicated_sharding",
+    "inference_mode_forces_decode",
     "is_mpmd_mesh",
     "is_valid_mesh",
     "logical_axis_rules",

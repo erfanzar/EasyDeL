@@ -354,6 +354,29 @@ class AttentionConfig(BaseOperationConfig):
 
 
 @dataclass
+class FusedMlpConfig(BaseOperationConfig):
+    """Configuration for the fused MLP operation.
+
+    Args:
+        tile_i: Intermediate-dimension tile width per grid step for the
+            Pallas kernels (default: 1024, the measured optimum on TPU v5).
+            Semantic for the W4A4 variant (hidden re-quantization block
+            boundaries); pure tiling for the bf16 variant.
+        tile_m: Row-tile width for the dense bf16 Pallas kernel.
+        prefill_threshold: Token count at which integer formats switch from
+            the fused-upcast path to the int-MXU dot (default: 256).
+        platform: Target platform (pallas/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    tile_i: int = 1024
+    tile_m: int = 512
+    prefill_threshold: int = 256
+
+    __hash__ = hash_fn
+
+
+@dataclass
 class GroupedMatmulConfig(BaseOperationConfig):
     """Configuration for Grouped Matrix Multiplication operation.
 
@@ -433,6 +456,98 @@ class ReduceScatterMatmulConfig(BaseOperationConfig):
     block_k: int = 128
     num_warps: int = 4
     num_stages: int = 2
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class AllReduceConfig(BaseOperationConfig):
+    """Configuration for the standalone all-reduce collective.
+
+    Args:
+        mode: Collective algorithm.  ``"one_shot"`` forces the Pallas TPU
+            direct-exchange kernel, ``"ring"`` delegates to XLA's lowering,
+            and ``"auto"`` resolves to the XLA path (measured faster on
+            v5p-8 at all sizes).
+        platform: Target platform (pallas/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    mode: Literal["auto", "one_shot", "ring"] = "auto"
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class AllGatherConfig(BaseOperationConfig):
+    """Configuration for the standalone all-gather collective.
+
+    Args:
+        mode: Collective algorithm.  ``"one_shot"`` forces the Pallas TPU
+            direct-exchange kernel, ``"ring"`` delegates to XLA's lowering,
+            ``"auto"`` resolves to the XLA path (measured faster on v5p-8).
+        platform: Target platform (pallas/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    mode: Literal["auto", "one_shot", "ring"] = "auto"
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class ReduceScatterConfig(BaseOperationConfig):
+    """Configuration for the standalone reduce-scatter collective.
+
+    Args:
+        mode: Collective algorithm.  ``"one_shot"`` forces the Pallas TPU
+            direct slice-exchange kernel, ``"ring"`` delegates to XLA's
+            lowering, ``"auto"`` resolves to the XLA path (measured faster
+            on v5p-8).
+        platform: Target platform (pallas/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    mode: Literal["auto", "one_shot", "ring"] = "auto"
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class AllToAllConfig(BaseOperationConfig):
+    """Configuration for the dense all-to-all collective.
+
+    Args:
+        platform: Target platform (xla/auto; no TPU-specific engine —
+            XLA's lowering is the measured-best on current hardware).
+        backend: Backend specification (default: "any").
+    """
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class RaggedGatherConfig(BaseOperationConfig):
+    """Configuration for the ragged row-gather (MoE permute/unpermute).
+
+    Args:
+        platform: Target platform (xla/auto).  A SparseCore engine was
+            measured 7-23x slower than the TC gather on v5p and is not
+            registered; this op is the landing pad for newer-gen SC engines.
+        backend: Backend specification (default: "any").
+    """
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class RaggedGatherReduceConfig(BaseOperationConfig):
+    """Configuration for the weighted grouped gather-sum (MoE top-k combine).
+
+    Args:
+        platform: Target platform (xla/auto).
+        backend: Backend specification (default: "any").
+    """
 
     __hash__ = hash_fn
 

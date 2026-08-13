@@ -14,6 +14,20 @@
 
 """XLA reference fused MLP (registry fallback + training path)."""
 
-from ._interface import ACTIVATIONS, fused_mlp_xla, split_gate_up
+from ._interface import (
+    ACTIVATIONS,
+    fused_mlp_bf16_xla,
+    fused_mlp_w4a4_xla,
+    fused_mlp_xla,
+    resolve_mlp_combine,
+    split_gate_up,
+)
 
-__all__ = ["ACTIVATIONS", "fused_mlp_xla", "split_gate_up"]
+__all__ = [
+    "ACTIVATIONS",
+    "fused_mlp_bf16_xla",
+    "fused_mlp_w4a4_xla",
+    "fused_mlp_xla",
+    "resolve_mlp_combine",
+    "split_gate_up",
+]

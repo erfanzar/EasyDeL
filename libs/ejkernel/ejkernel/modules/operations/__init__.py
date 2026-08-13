@@ -164,14 +164,20 @@ Note:
     to ``"heuristics"`` to skip autotuning and always use heuristic defaults.
 """
 
+from .all_gather import AllGather, all_gather
 from .all_gather_matmul import AllGatherMatmul, all_gather_matmul
+from .all_reduce import AllReduce, all_reduce
+from .all_to_all import AllToAll, all_to_all
 from .attention import Attention, attention
 from .blocksparse_attention import BlockSparseAttention, blocksparse_attention
 from .chunked_prefill_paged_decode import ChunkedPrefillPagedDecode, chunked_prefill_paged_decode
 from .compressed_window_attention import CompressedWindowAttention, compressed_window_attention
 from .compressed_window_decode import CompressedWindowDecode, compressed_window_decode
 from .configs import (
+    AllGatherConfig,
     AllGatherMatmulConfig,
+    AllReduceConfig,
+    AllToAllConfig,
     AttentionConfig,
     BlockSparseAttentionConfig,
     ChunkedPrefillPagedDecodeConfig,
@@ -203,11 +209,14 @@ from .configs import (
     RaggedDecodeAttentionConfig,
     RaggedGatedDeltaRuleConfig,
     RaggedGatedDeltaRuleV2Config,
+    RaggedGatherConfig,
+    RaggedGatherReduceConfig,
     RaggedPageAttentionv2Config,
     RaggedPageAttentionv2TurboQuantConfig,
     RaggedPageAttentionv3Config,
     RaggedPageAttentionv3TurboQuantConfig,
     RecurrentAttentionConfig,
+    ReduceScatterConfig,
     ReduceScatterMatmulConfig,
     RingAttentionConfig,
     RWKV4Config,
@@ -225,6 +234,14 @@ from .flash_attention import FlashAttention, flash_attention
 from .fused_conv_decode import FusedConvDecode, fused_conv_decode, fused_conv_decode_op
 from .fused_cross_entropy import CrossEntropyOutput, FusedCrossEntropy, fused_cross_entropy
 from .fused_kl_divergence import FusedKLDivergence, KLDivergenceOutput, fused_kl_divergence
+from .fused_mlp import (
+    FusedMlp,
+    channelwise_quantized_matmul,
+    fused_mlp,
+    pack_int4_adjacent,
+    resolve_mlp_combine,
+    split_gate_up,
+)
 from .gated_delta_rule import GatedDeltaRule, gated_delta_rule
 from .gated_delta_rule_grouped_decode import (
     GatedDeltaRuleGroupedDecode,
@@ -238,8 +255,7 @@ from .gdn_spec_window import (
     gdn_spec_window_states,
     gdn_spec_window_states_op,
 )
-from .fused_mlp import fused_mlp, split_gate_up
-from .grouped_matmul import GroupedMatmul, grouped_matmul
+from .grouped_matmul import GroupedMatmul, grouped_matmul, grouped_matmul_w8a8
 from .kernel_delta_attention import KernelDeltaAttention, kda_attention, kernel_delta_attention
 from .lightning_attention import LightningAttention, lightning_attention
 from .multi_head_latent_attention import FlashMLA, flash_mla
@@ -276,6 +292,8 @@ from .ragged_gated_delta_rule_v2 import (
     ragged_gated_delta_rule_v2_with_window_states,
     set_gdn_kernel_tile_policy,
 )
+from .ragged_gather import RaggedGather, ragged_gather
+from .ragged_gather_reduce import RaggedGatherReduce, ragged_gather_reduce
 from .ragged_page_attention_v2 import RaggedPageAttentionv2, ragged_page_attention_v2
 from .ragged_page_attention_v2_turboquant import (
     RaggedPageAttentionv2TurboQuant,
@@ -287,6 +305,7 @@ from .ragged_page_attention_v3_turboquant import (
     ragged_page_attention_v3_turboquant,
 )
 from .recurrent import RecurrentAttention, recurrent_attention
+from .reduce_scatter import ReduceScatter, reduce_scatter
 from .reduce_scatter_matmul import ReduceScatterMatmul, reduce_scatter_matmul
 from .ring_attention import RingAttention, ring_attention
 from .rwkv4 import RWKV4, rwkv4
@@ -304,8 +323,14 @@ __all__ = (
     "RWKV4",
     "RWKV6",
     "RWKV7",
+    "AllGather",
+    "AllGatherConfig",
     "AllGatherMatmul",
     "AllGatherMatmulConfig",
+    "AllReduce",
+    "AllReduceConfig",
+    "AllToAll",
+    "AllToAllConfig",
     "Attention",
     "AttentionConfig",
     "BlockSparseAttention",
@@ -331,6 +356,7 @@ __all__ = (
     "FusedCrossEntropyConfig",
     "FusedKLDivergence",
     "FusedKLDivergenceConfig",
+    "FusedMlp",
     "GDNComputeScheduleV2",
     "GDNComputeScheduleV2Config",
     "GLAttention",
@@ -376,6 +402,10 @@ __all__ = (
     "RaggedGatedDeltaRuleConfig",
     "RaggedGatedDeltaRuleV2",
     "RaggedGatedDeltaRuleV2Config",
+    "RaggedGather",
+    "RaggedGatherConfig",
+    "RaggedGatherReduce",
+    "RaggedGatherReduceConfig",
     "RaggedPageAttentionv2",
     "RaggedPageAttentionv2Config",
     "RaggedPageAttentionv2TurboQuant",
@@ -386,6 +416,8 @@ __all__ = (
     "RaggedPageAttentionv3TurboQuantConfig",
     "RecurrentAttention",
     "RecurrentAttentionConfig",
+    "ReduceScatter",
+    "ReduceScatterConfig",
     "ReduceScatterMatmul",
     "ReduceScatterMatmulConfig",
     "RingAttention",
@@ -398,9 +430,13 @@ __all__ = (
     "StateSpaceV2Config",
     "UnifiedAttention",
     "UnifiedAttentionConfig",
+    "all_gather",
     "all_gather_matmul",
+    "all_reduce",
+    "all_to_all",
     "attention",
     "blocksparse_attention",
+    "channelwise_quantized_matmul",
     "chunked_prefill_paged_decode",
     "compressed_window_attention",
     "compressed_window_decode",
@@ -413,6 +449,7 @@ __all__ = (
     "fused_conv_decode_op",
     "fused_cross_entropy",
     "fused_kl_divergence",
+    "fused_mlp",
     "gated_delta_rule",
     "gated_delta_rule_grouped_decode",
     "gated_delta_rule_grouped_decode_op",
@@ -421,9 +458,8 @@ __all__ = (
     "gdn_spec_window_states_op",
     "gdr_attention",
     "gla_attention",
-    "fused_mlp",
     "grouped_matmul",
-    "split_gate_up",
+    "grouped_matmul_w8a8",
     "kda_attention",
     "kernel_delta_attention",
     "lightning_attention",
@@ -432,6 +468,7 @@ __all__ = (
     "multi_latent_ragged_page_attention_v2",
     "native_sparse_attention",
     "normalize_kernel_tile_policy",
+    "pack_int4_adjacent",
     "page_attention",
     "prefill_page_attention",
     "quantized_matmul",
@@ -445,12 +482,16 @@ __all__ = (
     "ragged_gated_delta_rule_v2",
     "ragged_gated_delta_rule_v2_op",
     "ragged_gated_delta_rule_v2_with_window_states",
+    "ragged_gather",
+    "ragged_gather_reduce",
     "ragged_page_attention_v2",
     "ragged_page_attention_v2_turboquant",
     "ragged_page_attention_v3",
     "ragged_page_attention_v3_turboquant",
     "recurrent_attention",
+    "reduce_scatter",
     "reduce_scatter_matmul",
+    "resolve_mlp_combine",
     "ring_attention",
     "rwkv4",
     "rwkv6",
@@ -458,6 +499,7 @@ __all__ = (
     "rwkv7_mul",
     "scaled_dot_product_attention",
     "set_gdn_kernel_tile_policy",
+    "split_gate_up",
     "state_space_v1",
     "state_space_v2",
     "unified_attention",

@@ -136,7 +136,61 @@ def decode_e4m3_scale(codes: Array, *, dtype: jnp.dtype = jnp.float32) -> Array:
     return codes.astype(dtype)
 
 
-def expand_scale(scale: Array, shape: tp.Sequence[int]) -> Array:
+def _resolve_channel_axis(
+    length: int,
+    shape: tuple[int, ...],
+    channel_axis: int | None,
+) -> int:
+    """Decide which weight axis a 1-D per-channel scale indexes.
+
+    Length matching alone cannot answer this: the codecs hand
+    :func:`expand_scale` two different orientations — fp8/MXFP4/NVFP4 and
+    compressed-tensors decode in HF ``[out, in]``, while AWQ and GPTQ decode
+    in ``[in, out]`` — so "the output axis" is axis 0 for some callers and
+    axis 1 for others. Whenever the weight is square both axes match the
+    scale's length and any fixed tie-break silently transposes the scales for
+    half of the callers, which loads cleanly and produces garbage logits.
+
+    Args:
+        length: Number of scale entries.
+        shape: Target weight shape, rank 2.
+        channel_axis: Axis the caller knows its per-channel scales index, or
+            ``None`` to infer it from ``length``.
+
+    Returns:
+        The resolved axis index.
+
+    Raises:
+        ValueError: If ``channel_axis`` disagrees with ``length``, if no axis
+            matches, or if the weight is square and no axis was declared.
+    """
+    if channel_axis is not None:
+        axis = channel_axis % len(shape)
+        if shape[axis] != length:
+            raise ValueError(
+                f"channel_axis={channel_axis} selects a weight axis of {shape[axis]}, but the scale has "
+                f"{length} entries (weight shape {shape})."
+            )
+        return axis
+
+    matches = [axis for axis, dim in enumerate(shape) if dim == length]
+    if not matches:
+        raise ValueError(f"1-D scale of length {length} matches neither axis of weight shape {shape}.")
+    if len(matches) > 1:
+        raise ValueError(
+            f"1-D scale of length {length} is ambiguous for square weight shape {shape}: it could index "
+            f"either axis. Pass channel_axis to say which one the checkpoint's layout uses."
+        )
+    return matches[0]
+
+
+def expand_scale(
+    scale: Array,
+    shape: tp.Sequence[int],
+    *,
+    block_shape: tp.Sequence[int] | None = None,
+    channel_axis: int | None = None,
+) -> Array:
     """Broadcast per-tensor, per-channel, per-group or per-block scales to full shape.
 
     One primitive covers every scale granularity any supported format uses:
@@ -146,16 +200,34 @@ def expand_scale(scale: Array, shape: tp.Sequence[int]) -> Array:
     partial trailing blocks — legal in block-scaled fp8 when a dimension is
     not a multiple of the block size — are handled without special-casing.
 
+    When the checkpoint declares a block size (``weight_block_size`` /
+    ``block_structure``), it MUST be used: for a non-divisible axis the
+    repetition factor is the block size itself, not ``ceil(dim / entries)``.
+    A 576-row weight with 128-row blocks carries 5 scale rows; repeating each
+    by ``ceil(576 / 5) = 116`` puts every boundary in the wrong place and
+    silently mis-scales most of the tensor. Without a declared block shape
+    the ceil-derived factor is kept — exact whenever the axis divides evenly.
+
     Args:
         scale: Scale array with rank 0, or rank equal to ``len(shape)``.
         shape: Target weight shape.
+        block_shape: The checkpoint's per-axis block sizes, aligned to the
+            trailing axes of ``shape`` (a leading expert axis carries no
+            block entry). Entries that do not agree with the scale grid
+            (``scale_dim != ceil(dim / block)``) fall back to the derived
+            factor rather than under-covering the axis.
+        channel_axis: Axis a 1-D per-channel scale indexes. Codecs pass the
+            axis their own layout puts output channels on; ``None`` infers it
+            from the scale's length and raises when the weight is square,
+            because guessing there transposes the scales silently.
 
     Returns:
         A float32 array of exactly ``shape``.
 
     Raises:
         ValueError: If ``scale`` has a rank that is neither 0 nor
-            ``len(shape)``, or an axis coarser than the target.
+            ``len(shape)``, an axis coarser than the target, or a 1-D length
+            that cannot be attributed to one axis.
     """
     scale = scale.astype(jnp.float32)
     shape = tuple(int(dim) for dim in shape)
@@ -165,18 +237,19 @@ def expand_scale(scale: Array, shape: tp.Sequence[int]) -> Array:
 
     if scale.ndim == 1 and len(shape) == 2:
         # A per-channel vector is a grid with one of its axes degenerate.
-        # Which axis it indexes is decided by length; ambiguity (a square
-        # weight) is resolved in favour of the output axis, matching every
-        # checkpoint convention that ships 1-D scales.
-        if scale.shape[0] == shape[1]:
-            scale = scale.reshape(1, shape[1])
-        elif scale.shape[0] == shape[0]:
-            scale = scale.reshape(shape[0], 1)
-        else:
-            raise ValueError(f"1-D scale of length {scale.shape[0]} matches neither axis of weight shape {shape}.")
+        entries = scale.shape[0]
+        axis = _resolve_channel_axis(entries, shape, channel_axis)
+        scale = scale.reshape((entries, 1) if axis == 0 else (1, entries))
 
     if scale.ndim != len(shape):
         raise ValueError(f"Scale rank {scale.ndim} cannot be expanded to weight shape {shape}.")
+
+    blocks: tuple[int | None, ...] = (None,) * len(shape)
+    if block_shape:
+        declared = tuple(int(dim) for dim in block_shape)
+        if len(declared) <= len(shape):
+            # Right-align: a leading expert axis has no block entry.
+            blocks = (None,) * (len(shape) - len(declared)) + declared
 
     for axis, (scale_dim, target_dim) in enumerate(zip(scale.shape, shape, strict=True)):
         if scale_dim == target_dim:
@@ -186,7 +259,13 @@ def expand_scale(scale: Array, shape: tp.Sequence[int]) -> Array:
                 f"Scale axis {axis} has {scale_dim} entries for a weight axis of {target_dim}; scales must be "
                 f"coarser than or equal to the weight."
             )
-        repeats = -(-target_dim // scale_dim)  # ceil, for partial trailing blocks
+        block = blocks[axis]
+        if block is not None and block > 0 and scale_dim == -(-target_dim // block):
+            # The checkpoint's own block size places partial-trailing-block
+            # boundaries correctly; the ceil-derived factor does not.
+            repeats = block
+        else:
+            repeats = -(-target_dim // scale_dim)  # ceil, exact for divisible axes
         scale = jnp.repeat(scale, repeats, axis=axis)
 
     return jax.lax.slice(scale, [0] * len(shape), list(shape))
@@ -198,6 +277,8 @@ def dequantize_with_scale(
     *,
     zero_point: Array | None = None,
     dtype: jnp.dtype = jnp.float32,
+    block_shape: tp.Sequence[int] | None = None,
+    channel_axis: int | None = None,
 ) -> Array:
     """Reconstruct dense values from quantized codes and their scales.
 
@@ -208,14 +289,25 @@ def dequantize_with_scale(
         zero_point: Optional zero-points, subtracted before scaling and
             broadcast the same way. Asymmetric schemes (AWQ/GPTQ) supply it.
         dtype: Output dtype.
+        block_shape: The checkpoint's declared per-axis block sizes, forwarded
+            to :func:`expand_scale` so non-divisible axes expand at the true
+            block boundaries.
+        channel_axis: Axis a 1-D per-channel scale indexes in ``codes``'s own
+            layout, forwarded to :func:`expand_scale`.
 
     Returns:
         The dequantized array, shaped like ``codes``.
     """
     values = codes.astype(jnp.float32)
     if zero_point is not None:
-        values = values - expand_scale(zero_point, codes.shape)
-    return (values * expand_scale(scale, codes.shape)).astype(dtype)
+        values = values - expand_scale(
+            zero_point,
+            codes.shape,
+            block_shape=block_shape,
+            channel_axis=channel_axis,
+        )
+    expanded = expand_scale(scale, codes.shape, block_shape=block_shape, channel_axis=channel_axis)
+    return (values * expanded).astype(dtype)
 
 
 def largest_supported_group_size(contracting_dim: int) -> int:

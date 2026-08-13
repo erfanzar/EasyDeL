@@ -67,6 +67,7 @@ from typing import Any, cast
 import jax
 
 from .runtime import (
+    _MICROBATCH_WEIGHT_FN_VAR,
     _arg_leaf_ranges,
     _dispatch_schedule_faithful,
     _ensure_schedule_plan,
@@ -77,6 +78,9 @@ from .runtime import (
 def sxvalue_and_grad_and_apply(
     fn: Callable,
     argnums: int | tuple[int, ...] = 0,
+    *,
+    has_aux: bool = False,
+    microbatch_weight_fn: Callable[..., object] | None = None,
 ) -> Callable:
     """Fuse value-and-grad and optimizer-apply into one MPMD schedule pass.
 
@@ -93,6 +97,12 @@ def sxvalue_and_grad_and_apply(
             (or ``sxstage_region``) boundaries and returns a scalar loss.
         argnums: Index (or indices) of arguments to differentiate with
             respect to. Default ``0`` (first argument is the params).
+        has_aux: When ``True``, ``fn`` returns ``(loss, aux)`` with aux
+            computed in the terminal stage; the returned callable yields
+            ``((loss, aux), new_params, new_opt_state)``.
+        microbatch_weight_fn: Optional per-microbatch loss-weight callable
+            (see :func:`spectrax.sxvalue_and_grad`); turns the scheduled
+            estimator into the weighted global mean.
 
     Returns:
         A callable. Its signature is::
@@ -133,7 +143,7 @@ def sxvalue_and_grad_and_apply(
         opt_state: Any,
         learning_rate_fn: Any = None,
         **apply_context_extras: Any,
-    ) -> tuple[jax.Array, Any, Any]:
+    ) -> tuple[Any, Any, Any]:
         validated_argnums = _normalize_argnums(norm_argnums, len(args))
         plan = _ensure_schedule_plan(fn, args, grad_argnums=validated_argnums)
 
@@ -154,13 +164,27 @@ def sxvalue_and_grad_and_apply(
         }
 
         n_rank = int(plan.get("n", 0))
+        terminal_n_aux = int(plan.get("terminal_n_aux", 0))
+        if has_aux and terminal_n_aux == 0:
+            raise ValueError(
+                "sxvalue_and_grad_and_apply(has_aux=True) requires the scheduled function to return (loss, aux)."
+            )
+        if not has_aux and terminal_n_aux > 0:
+            raise ValueError(
+                "The scheduled function returns auxiliary outputs; call "
+                "sxvalue_and_grad_and_apply(..., has_aux=True) to receive them."
+            )
         plan["apply_jits"] = {(rank, 0): True for rank in range(n_rank)}
         plan["apply_context"] = apply_context
         plan["apply_requires_all_grads"] = bool(apply_context_extras.get("apply_requires_all_grads", False))
-
+        # Same ContextVar carrier as sxvalue_and_grad — the shared cached
+        # plan dict must not be mutated (concurrent-dispatch race), and the
+        # scale resolver reads ONLY the ContextVar.
+        _wf_token = _MICROBATCH_WEIGHT_FN_VAR.set(microbatch_weight_fn)
         try:
-            loss, grads_flat = _dispatch_schedule_faithful(plan, args, return_loss=True)
+            loss, grads_flat, aux_flat = _dispatch_schedule_faithful(plan, args, return_loss=True)
         finally:
+            _MICROBATCH_WEIGHT_FN_VAR.reset(_wf_token)
             plan.pop("apply_context", None)
             plan.pop("apply_jits", None)
             plan.pop("apply_requires_all_grads", None)
@@ -182,6 +206,9 @@ def sxvalue_and_grad_and_apply(
         else:
             new_params, new_opt_state = _default_assemble_outputs(apply_context)
 
+        if has_aux:
+            fn_out = jax.tree.unflatten(plan["fn_out_treedef"], [loss, *(aux_flat or ())])
+            return fn_out, new_params, new_opt_state
         return cast(jax.Array, loss), new_params, new_opt_state
 
     return vga_fn

@@ -90,7 +90,10 @@ Note:
     are also used as the numerical gold standard in test suites.
 """
 
+from .all_gather import all_gather
 from .all_gather_matmul import all_gather_matmul
+from .all_reduce import all_reduce
+from .all_to_all import all_to_all
 from .attention import attention
 from .blocksparse_attention import blocksparse_attention
 from .chunked_prefill_paged_decode import chunked_prefill_paged_decode
@@ -109,6 +112,7 @@ from .gdn_compute_schedule_v2 import compute_schedule_table_v2
 from .gdn_spec_window import gdn_spec_window_states
 from .gla import recurrent_gla
 from .grouped_matmul import grouped_matmul
+from .grouped_matmul_quant import grouped_matmul_quant, grouped_matmul_w8a8
 from .grouped_matmulv3 import grouped_matmulv3
 from .kernel_delta_attention import kda, kda_decay, kernel_delta_attention
 from .lightning_attn import lightning_attn
@@ -123,11 +127,14 @@ from .ragged_causal_conv1d import ragged_causal_conv1d
 from .ragged_decode_attention import ragged_decode_attention
 from .ragged_gated_delta_rule import ragged_gated_delta_rule as ragged_gated_delta_rule
 from .ragged_gated_delta_rule_v2 import ragged_gated_delta_rule_v2
+from .ragged_gather import ragged_gather
+from .ragged_gather_reduce import ragged_gather_reduce
 from .ragged_page_attention_v2 import ragged_page_attention_v2
 from .ragged_page_attention_v2_turboquant import ragged_page_attention_v2_turboquant
 from .ragged_page_attention_v3 import ragged_page_attention_v3
 from .ragged_page_attention_v3_turboquant import ragged_page_attention_v3_turboquant
 from .recurrent import recurrent
+from .reduce_scatter import reduce_scatter
 from .reduce_scatter_matmul import reduce_scatter_matmul
 from .ring_attention import ring_attention
 from .rwkv4 import rwkv4
@@ -139,7 +146,10 @@ from .state_space_v2 import state_space_v2
 from .unified_attention import unified_attention
 
 __all__ = [
+    "all_gather",
     "all_gather_matmul",
+    "all_reduce",
+    "all_to_all",
     "apply_native_sparse_attention",
     "attention",
     "blocksparse_attention",
@@ -158,6 +168,8 @@ __all__ = [
     "gated_delta_rule_grouped_decode",
     "gdn_spec_window_states",
     "grouped_matmul",
+    "grouped_matmul_quant",
+    "grouped_matmul_w8a8",
     "grouped_matmulv3",
     "kda",
     "kda_decay",
@@ -173,12 +185,15 @@ __all__ = [
     "ragged_decode_attention",
     "ragged_gated_delta_rule",
     "ragged_gated_delta_rule_v2",
+    "ragged_gather",
+    "ragged_gather_reduce",
     "ragged_page_attention_v2",
     "ragged_page_attention_v2_turboquant",
     "ragged_page_attention_v3",
     "ragged_page_attention_v3_turboquant",
     "recurrent",
     "recurrent_gla",
+    "reduce_scatter",
     "reduce_scatter_matmul",
     "ring_attention",
     "rwkv4",

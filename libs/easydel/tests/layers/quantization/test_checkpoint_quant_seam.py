@@ -246,11 +246,37 @@ class TestIgnoreSemantics:
         assert scheme.for_path("model.layers.10.q_proj") is not None
 
     def test_container_names_match_everything_beneath(self):
-        """A container entry must capture nested modules but not lookalikes."""
+        """A container entry captures itself and every nested module.
+
+        Matching follows HF's ``should_convert_module`` (start-anchored
+        regex / suffix), so a same-prefix sibling like
+        ``model.vision_tower_adapter`` is ALSO excluded — HF checkpoints are
+        authored against exactly that behavior.
+        """
         scheme = _scheme(modules_to_not_convert=["model.vision_tower"])
         assert scheme.for_path("model.vision_tower") is None
         assert scheme.for_path("model.vision_tower.encoder.0.q_proj") is None
-        assert scheme.for_path("model.vision_tower_adapter") is not None
+        assert scheme.for_path("model.vision_tower_adapter") is None
+        assert scheme.for_path("model.language_model.q_proj") is not None
+
+    def test_bare_leaf_name_excludes_by_suffix(self):
+        """Mixtral-AWQ ships ``modules_to_not_convert=["gate"]`` to protect
+        its routers: the entry must exclude every ``block_sparse_moe.gate``
+        leaf without also swallowing ``gate_proj``."""
+        scheme = _scheme(modules_to_not_convert=["gate"])
+        assert scheme.for_path("model.layers.0.block_sparse_moe.gate") is None
+        assert scheme.for_path("model.layers.7.block_sparse_moe.gate") is None
+        assert scheme.for_path("model.layers.0.mlp.gate_proj") is not None
+        assert scheme.for_path("model.layers.0.self_attn.q_proj") is not None
+
+    def test_glob_entries_exclude_their_subtrees(self):
+        """gpt-oss ships glob-style entries (``model.layers.*.self_attn``);
+        every projection under a matching container must stay dense."""
+        scheme = _scheme(modules_to_not_convert=["model.layers.*.self_attn"])
+        assert scheme.for_path("model.layers.0.self_attn.q_proj") is None
+        assert scheme.for_path("model.layers.11.self_attn.o_proj") is None
+        assert scheme.for_path("model.layers.0.self_attn") is None
+        assert scheme.for_path("model.layers.0.mlp.down_proj") is not None
 
 
 class TestFusedShardAgreement:

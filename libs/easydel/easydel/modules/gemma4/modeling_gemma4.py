@@ -107,6 +107,7 @@ from easydel.layers import (
     RowParallelMoELinear,
     dense_gate_up_layout,
     dense_qkv_layout,
+    gated_mlp_forward,
     moe_down_projection_reform_param,
     moe_fused_gate_up_reform_param,
     split_fused_gate_up_projection,
@@ -2208,7 +2209,7 @@ class Gemma4MLP(spx.Module):
         inner_dim = config.intermediate_size * (2 if use_double_wide else 1)
         kernel_init = jax.nn.initializers.normal(config.initializer_range)
 
-        self.act = ACT2FN[config.hidden_activation]
+        self.act_fn = ACT2FN[config.hidden_activation]
 
         self.gate_up_proj = ColumnParallelLinear(
             embed_dim,
@@ -2246,9 +2247,11 @@ class Gemma4MLP(spx.Module):
     def forward(self, hidden_states: Array) -> Array:
         """Apply the gated MLP transformation.
 
-        Computes ``down_proj(activation(gate_proj(x)) * up_proj(x))`` with
-        logical sharding applied at input and output boundaries for tensor
-        parallelism.
+        The standard path delegates to
+        :func:`easydel.layers.gated_mlp_forward` (ejkernel fused MLP where
+        supported, legacy composition otherwise). The
+        ``activations_in_float32`` branch keeps its specialized composition,
+        which upcasts the gate/up activations to float32.
 
         Args:
             hidden_states: Input tensor of shape
@@ -2257,24 +2260,25 @@ class Gemma4MLP(spx.Module):
         Returns:
             Transformed tensor with the same shape as the input.
         """
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
-        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
         if self.config.activations_in_float32:
+            hidden_states = apply_logical_sharding(
+                hidden_states,
+                dynamic_axes=common_types.HiddenStateSharding,
+                partition_manager=self.config.runtime_sharding_resolver,
+            )
+            gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
+            gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
             gate = gate.astype(jnp.float32)
             up = up.astype(jnp.float32)
-        gate = checkpoint_name(self.act(gate), "mlp_gate")
-        hidden_states = checkpoint_name(self.down_proj((gate * up).astype(self.dtype)), "mlp_down")
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        return checkpoint_name(hidden_states, "mlp_output")
+            gate = checkpoint_name(self.act_fn(gate), "mlp_gate")
+            hidden_states = checkpoint_name(self.down_proj((gate * up).astype(self.dtype)), "mlp_down")
+            hidden_states = apply_logical_sharding(
+                hidden_states,
+                dynamic_axes=common_types.HiddenStateSharding,
+                partition_manager=self.config.runtime_sharding_resolver,
+            )
+            return checkpoint_name(hidden_states, "mlp_output")
+        return gated_mlp_forward(self, hidden_states)
 
 
 class Gemma4TextMLPStack(spx.Module):
@@ -2616,8 +2620,8 @@ class Gemma4TextRouter(BaseMoeModule):
             gate_hidden_state=router_hidden_states,
             gate_layer=self.proj,
             expert_layer=expert_layer,
-            gate_up_kernel=expert_layer.gate_up_proj.weight.value,
-            wd_kernel=expert_layer.down_proj.weight.value,
+            gate_up_kernel=expert_layer.gate_up_proj.kernel_view(),
+            wd_kernel=expert_layer.down_proj.kernel_view(),
             hooks=runtime_hooks,
             act_fn=expert_layer.act_fn,
         )
@@ -3313,6 +3317,11 @@ class Gemma4TextModel(EasyDeLBaseModule):
 
             return hidden_states, all_hidden_states, all_attentions, idx + 1
 
+        # NOTE: the KV-sharing rule threads per-layer python state
+        # (``shared_kv`` / ``donor_cache_views`` dicts, ``layer_types[idx]``
+        # lookups, ``per_layer_inputs`` slicing by concrete idx) that cannot
+        # ride a ``lax.scan`` carry, so this stack always uses the
+        # python-loop path; ``scan_layers=True`` is unsupported here.
         hidden_states, all_hidden_states, all_attentions, _ = self.layers.scan(
             _layer_loop,
             (hidden_states, all_hidden_states, all_attentions, 0),

@@ -1434,7 +1434,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             cache_view = attentions.cache_view
 
         attention_out = self._merge_heads(attentions.attention_outputs)
-        attn_output = self.shard_attention_prod(attention_out)
+        attn_output = self.shard_attention_prod(attention_out, pre_projection=True)
         attn_output = checkpoint_name(self.output_projection(attn_output), "attn_output")
         attn_output = self.shard_attention_prod(attn_output)
 
@@ -1710,7 +1710,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             attn_out = attentions.attention_outputs
             attn_output = self._merge_heads(attn_out)
 
-        attn_output = self.shard_attention_prod(attn_output)
+        attn_output = self.shard_attention_prod(attn_output, pre_projection=True)
         attn_output = checkpoint_name(self.output_projection(attn_output), name="attn_output")
         attn_output = self.shard_attention_prod(attn_output)
 
@@ -1829,7 +1829,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             output_attentions=output_attentions,
         )
 
-        attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
+        attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs), pre_projection=True)
         attn_output = checkpoint_name(self.output_projection(attn_output), "attn_output")
         attn_output = self.shard_attention_prod(attn_output)
 

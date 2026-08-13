@@ -70,8 +70,7 @@ def test_greedy_row_takes_argmax_when_co_batched_with_sampling():
     # On the buggy code the greedy row sampled from -logits (peak_token had the
     # lowest probability) and would essentially never be `peak_token`.
     assert int(tokens[0]) == peak_token, (
-        f"greedy row emitted {int(tokens[0])}, expected argmax {peak_token} "
-        "(mixed-batch greedy negation regression)"
+        f"greedy row emitted {int(tokens[0])}, expected argmax {peak_token} (mixed-batch greedy negation regression)"
     )
 
 

@@ -34,6 +34,7 @@ weaker assertions (no exception, right shapes) passed while the weights were
 being silently destroyed.
 """
 
+import easydel as ed
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -44,8 +45,6 @@ from easydel.layers.linears._linear_quantized import ParallelLinearQuantized
 from easydel.layers.quantization import EasyQuantizer, QuantizationConfig
 from easydel.utils import set_inference_mode
 from easydel.utils.traversals import iter_module_search
-
-import easydel as ed
 
 
 def _tiny_config():

@@ -80,6 +80,7 @@ from ._formats import (
     ScaledElementsAdapter,
 )
 from ._reform import (
+    LOADABLE_PARAM_NAMES,
     ExtractField,
     FromCanonical,
     RebuildCanonical,
@@ -91,6 +92,7 @@ from ._scheme import CheckpointQuantScheme, ResolvedScheme
 
 __all__ = (
     "CHECKPOINT_QUANT_CATEGORY",
+    "LOADABLE_PARAM_NAMES",
     "ActivationPolicy",
     "ActivationQuantKind",
     "AwqAdapter",

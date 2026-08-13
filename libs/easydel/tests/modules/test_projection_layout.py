@@ -16,7 +16,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import spectrax as spx
-
 from easydel.layers import ColumnParallelLinear, eLoRA
 from easydel.layers.layouts import (
     FusedColumnLayout,
@@ -28,7 +27,7 @@ from easydel.layers.layouts import (
 from easydel.modules.qwen3_next.modeling_qwen3_next import (
     Qwen3NextFullAttention,
     Qwen3NextMLP,
-    _qwen3_next_tp_ring_column_linear,
+    _qwen3_next_tp_sharded_column_linear,
 )
 from easydel.modules.qwen3_next.qwen3_next_configuration import Qwen3NextConfig
 from easydel.utils.parameters_transformation import StateDictConverter
@@ -219,7 +218,7 @@ def test_qwen3_next_tp_ring_full_attention_qkv_matches_projection():
 
     with config.mesh:
         reference = attn.qkv_proj(x)
-        ring = _qwen3_next_tp_ring_column_linear(
+        ring = _qwen3_next_tp_sharded_column_linear(
             attn.qkv_proj,
             x,
             config=config,

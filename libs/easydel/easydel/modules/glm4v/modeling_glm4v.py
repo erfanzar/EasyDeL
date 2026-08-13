@@ -73,6 +73,7 @@ from easydel.layers import (
     RMSNorm,
     RowParallelLinear,
     dense_gate_up_layout,
+    gated_mlp_forward,
     split_fused_gate_up_projection,
     split_interleaved_pair_last_axis,
 )
@@ -1095,16 +1096,17 @@ class Glm4vTextMLP(spx.Module):
     def forward(self, hidden_states: Array) -> Array:
         """Apply gated feedforward transformation.
 
+        Delegates to :func:`easydel.layers.gated_mlp_forward`, which routes
+        supported layouts through the ejkernel fused MLP kernels and runs
+        the legacy composition otherwise.
+
         Args:
             hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_dim).
 
         Returns:
             Array: Transformed tensor of shape (batch, seq_len, hidden_dim).
         """
-        gate_up_states = checkpoint_name(self.gate_up_proj(hidden_states), name="mlp_gate_up")
-        gate, up_states = split_fused_gate_up_projection(gate_up_states, config=self.config)
-        hidden_states = checkpoint_name(self.down_proj(up_states * self.act_fn(gate)), name="mlp_down")
-        return hidden_states
+        return gated_mlp_forward(self, hidden_states)
 
 
 class Glm4vTextAttention(UnifiedAttention):

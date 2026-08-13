@@ -62,7 +62,12 @@ class TestDenseForwardBackward:
         w_gate, w_up, w_down = _weights(rng)
         x = jnp.asarray(rng.normal(size=(TOKENS, K_DIM)), jnp.bfloat16)
         got = np.asarray(
-            fused_mlp(x, jnp.asarray(w_gate, jnp.bfloat16), jnp.asarray(w_up, jnp.bfloat16), jnp.asarray(w_down, jnp.bfloat16)),
+            fused_mlp(
+                x,
+                jnp.asarray(w_gate, jnp.bfloat16),
+                jnp.asarray(w_up, jnp.bfloat16),
+                jnp.asarray(w_down, jnp.bfloat16),
+            ),
             np.float32,
         )
         ref = _naive(x, w_gate, w_up, w_down)
@@ -205,13 +210,16 @@ class TestLayouts:
 class TestActivations:
     """Every table activation runs and matches its naive composition."""
 
-    @pytest.mark.parametrize("name,fn", [
-        ("silu", jax.nn.silu),
-        ("gelu", jax.nn.gelu),
-        ("gelu_tanh", lambda v: jax.nn.gelu(v, approximate=True)),
-        ("relu", jax.nn.relu),
-        ("sigmoid", jax.nn.sigmoid),
-    ])
+    @pytest.mark.parametrize(
+        "name,fn",
+        [
+            ("silu", jax.nn.silu),
+            ("gelu", jax.nn.gelu),
+            ("gelu_tanh", lambda v: jax.nn.gelu(v, approximate=True)),
+            ("relu", jax.nn.relu),
+            ("sigmoid", jax.nn.sigmoid),
+        ],
+    )
     def test_activation_matches_naive(self, name, fn):
         """Forward under each activation equals the naive composition."""
         rng = np.random.default_rng(7)

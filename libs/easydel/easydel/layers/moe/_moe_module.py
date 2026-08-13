@@ -71,8 +71,9 @@ from jax.sharding import PartitionSpec
 from jaxtyping import Array, Bool, Float, Int
 from spectrax import common_types
 
-from easydel.infra.sharding import resolve_stage_mesh
+from easydel.infra.sharding import inference_mode_forces_decode, resolve_stage_mesh
 from easydel.utils.helpers import check_bool_flag
+from easydel.utils.inference_mode import is_inference_mode
 
 from ._communication_utils import (
     MoeFusedHooks,
@@ -1359,6 +1360,16 @@ class BaseMoeModule(spx.Module, ABC):
         # routes on full-width hidden while experts run in a narrower latent), and
         # reusing the expert width `HD` here would reshape it wrongly.
         prein_gate_logits = gate_layer(gate_hidden_state.reshape(-1, gate_hidden_state.shape[-1]))
+        if inference_mode_forces_decode():
+            # Decode-replicated scope: materialize the tiny [tokens, E] router
+            # logits replicated ONCE so the softmax/top-k below run locally —
+            # the sharded-logits path pays max/sum all-reduces plus a gather
+            # per layer for data that is a few KB at decode.
+            prein_gate_logits = spx.with_sharding_constraint(
+                prein_gate_logits,
+                jax.sharding.PartitionSpec(None, None),
+                mesh=self.mesh,
+            )
         if hooks is not None and hooks.after_gate is not None:
             prein_gate_logits = hooks.after_gate(prein_gate_logits)
 
@@ -1451,8 +1462,10 @@ class BaseMoeModule(spx.Module, ABC):
 
         expert_params_bytes = 0
         for _param in (wi_kernel, wu_kernel, gate_up_kernel, wd_kernel, wi_bias, wu_bias, gate_up_bias, wd_bias):
-            if _param is not None:
-                expert_params_bytes += int(_param.size) * jnp.dtype(_param.dtype).itemsize
+            if _param is None:
+                continue
+            for _leaf in _param if isinstance(_param, tuple) else (_param,):
+                expert_params_bytes += int(_leaf.size) * jnp.dtype(_leaf.dtype).itemsize
         self._validate_fused_moe_layout(
             global_tokens=_BS * _SQLN,
             expert_params_bytes=expert_params_bytes,
@@ -1466,11 +1479,45 @@ class BaseMoeModule(spx.Module, ABC):
         # both — otherwise dp=1/fsdp-dominant training meshes replicate the
         # whole global batch into every shard of the region below.
         batch_axis_names = self._moe_batch_axis_names(expert_mesh, dp_axis_name, ep_carries_batch=ep_carries_batch)
-        batch_axes = batch_axis_names if len(batch_axis_names) > 1 else batch_axis_names[0]
+        # Shape-aware batch sanitization, INFERENCE TRACES ONLY: serving-style
+        # packed batches can be smaller than the batch mesh group (eSurge
+        # packs EVERY window — decode and prefill — as [1, N] tokens; with
+        # fsdp>1 the ('dp','fsdp') batch spec cannot divide B=1 and shard_map
+        # hard-errors). The batch placement must be dropped CONSISTENTLY
+        # across x [B,S,H], gate logits [B*S,E], and the output — a partial
+        # drop would pair replicated activations with sharded logits inside
+        # the body. Batch-replicated execution is numerically identical, just
+        # redundant across those shards. The drop is gated to inference
+        # traces (eSurge compiles run under ``set_inference_mode()``; pure-
+        # decode buckets additionally force decode-mode specs): a TRAINING
+        # batch that cannot divide the batch group keeps the loud shard_map
+        # error, because silently replicating it would multiply per-shard
+        # compute without any signal to the user.
+        _batch_group = 1
+        _mesh_axis_sizes = dict(expert_mesh.jax_mesh.shape)
+        for _axis_name in batch_axis_names:
+            _batch_group *= int(_mesh_axis_sizes.get(_axis_name, 1))
+        if _batch_group > 1 and _BS % _batch_group != 0 and (is_inference_mode() or inference_mode_forces_decode()):
+            batch_axis_names = ()
+        batch_axes = (
+            batch_axis_names if len(batch_axis_names) > 1 else (batch_axis_names[0] if batch_axis_names else None)
+        )
         input_ps = jax.sharding.PartitionSpec(batch_axes, None, None)
         glps = jax.sharding.PartitionSpec(batch_axes, None)
 
-        if self.config.use_expert_tensor_mode:
+        # Mode-aware decode boundary: inside a ``decode_mode_specs()`` scope the
+        # residual stream is replicated over TP (decode_hidden_state_axis=None),
+        # so the MoE block must EMIT replicated hidden — otherwise its
+        # tp-sharded output re-anchors the ~7/layer norm/qkv/router collectives
+        # the decode layout removes (measured: constraint-only forcing made the
+        # step WORSE, 435→482 collectives, because this producer didn't flip).
+        # The body keeps the cheap psum_scatter over the top-k-expanded rows
+        # and adds one small all-gather on the combined [tokens, H/tp] output.
+        decode_replicated_out = inference_mode_forces_decode() and not self.config.use_expert_tensor_mode and tp_size > 1
+        if decode_replicated_out:
+            logger.debug("MoE decode-replicated boundary active for this trace")
+
+        if self.config.use_expert_tensor_mode or decode_replicated_out:
             output_ps = jax.sharding.PartitionSpec(batch_axes, None, None)
         else:
             output_ps = jax.sharding.PartitionSpec(batch_axes, None, tensor_axis_name)
@@ -1496,20 +1543,29 @@ class BaseMoeModule(spx.Module, ABC):
         # expert dim so each shard receives its fsdp-local expert slice; the
         # shard_map body then all-gathers over fsdp explicitly.
         wspec = partial(self.get_moe_spec, fsdp_shards_experts=gather_expert_weights_over_fsdp)
-        wikps = wspec("column", use_expert_tensor, is_bias=False) if gate_up_kernel is None else None
-        wukps = wspec("column", use_expert_tensor, is_bias=False) if gate_up_kernel is None else None
-        wgukps = wspec("column", use_expert_tensor, is_bias=False) if gate_up_kernel is not None else None
-        wdkps = wspec("row", use_expert_tensor, is_bias=False)
+
+        def _wspec_for(kernel_arg, direction):
+            """Weight spec; quantized (codes, scales) tuples get a matching
+            spec tuple — scales ``[E, 1, N]`` drop the contraction-axis
+            placement (its axis is size 1)."""
+            if kernel_arg is None:
+                return None
+            base = wspec(direction, use_expert_tensor, is_bias=False)
+            if isinstance(kernel_arg, tuple):
+                scales_spec = PartitionSpec(base[0], None, base[2] if direction == "column" else None)
+                return (base, scales_spec)
+            return base
+
+        wikps = _wspec_for(wi_kernel, "column") if gate_up_kernel is None else None
+        wukps = _wspec_for(wu_kernel, "column") if gate_up_kernel is None else None
+        wgukps = _wspec_for(gate_up_kernel, "column") if gate_up_kernel is not None else None
+        wdkps = _wspec_for(wd_kernel, "row")
 
         wibps = (
-            wspec("column", use_expert_tensor, is_bias=True)
-            if gate_up_kernel is None and wi_bias is not None
-            else None
+            wspec("column", use_expert_tensor, is_bias=True) if gate_up_kernel is None and wi_bias is not None else None
         )
         wubps = (
-            wspec("column", use_expert_tensor, is_bias=True)
-            if gate_up_kernel is None and wu_bias is not None
-            else None
+            wspec("column", use_expert_tensor, is_bias=True) if gate_up_kernel is None and wu_bias is not None else None
         )
         wgubps = (
             wspec("column", use_expert_tensor, is_bias=True)
@@ -1713,14 +1769,7 @@ class BaseMoeModule(spx.Module, ABC):
                 combined = combined[:tokens]
             return combined.reshape(local_batch, local_seq, -1)
 
-        @partial(
-            shard_map,
-            mesh=expert_mesh.jax_mesh,
-            in_specs=(input_ps, glps, wikps, wukps, wgukps, wdkps, wibps, wubps, wgubps, wdbps),
-            out_specs=output_ps,
-            check_vma=False,
-        )
-        def _sparse_call(
+        def _sparse_call_body(
             x: jax.Array,
             gate_logits: jax.Array,
             wi_kernel: jax.Array,
@@ -1827,23 +1876,64 @@ class BaseMoeModule(spx.Module, ABC):
                     Down-projected rows ``[rows, H // tp_size]`` (``H`` when
                     ``tp_size == 1``).
                 """
+
+                def _expert_gmm(rows, kernel):
+                    """Dense bf16 grouped matmul, or — when the kernel is a
+                    quantized ``(codes, scales)`` pair from ``kernel_view()`` —
+                    the v3 grouped matmul's native quantised-weight path:
+                    int8/int4 codes dequantised in-VMEM against per-channel
+                    scales (measured 1.9-2.1x over bf16 at decode shapes and
+                    1.5x at prefill on v5p; the auto-tiler loses to explicit
+                    whole-K/whole-N tiles at MoE shapes, hence the cfg)."""
+                    if isinstance(kernel, tuple):
+                        codes, scales = kernel
+                        n_groups, k_dim, n_dim = codes.shape
+                        # `moe_force_xla_gmm` is a user-facing override that the
+                        # dense branch honours through `gmm_kws`. Re-check it
+                        # here or the knob silently applies to dense experts
+                        # only, leaving quantized experts on Pallas.
+                        on_pallas = jax.default_backend() == "tpu" and not self.config.moe_force_xla_gmm
+                        # Explicit whole-K/whole-N tiles beat the auto-tiler by
+                        # ~10x at MoE shapes, but Mosaic requires 128-aligned
+                        # slice shapes — non-aligned contractions (e.g. a
+                        # tp-sharded down projection with local k=192) must
+                        # fall back to the auto-tiler.
+                        tile_m = 64 if rows.shape[0] <= 1024 else 128
+                        if k_dim % 128 == 0 and n_dim % 128 == 0:
+                            cfg = GroupedMatmulConfig(block_m=tile_m, block_k=k_dim, block_n=n_dim)
+                        else:
+                            # block_k/n=0 sentinel: defer to the v3 kernel's
+                            # own tiler, which handles non-aligned contractions.
+                            cfg = GroupedMatmulConfig(block_m=tile_m, block_k=0, block_n=0)
+                        return grouped_matmul(
+                            rows,
+                            codes,
+                            group_sizes,
+                            preferred_element_type=gmm_kws.get("preferred_element_type", jnp.bfloat16),
+                            rhs_scale=scales.reshape(n_groups, 1, 1, n_dim),
+                            use_v3=True,
+                            platform="pallas" if on_pallas else "xla",
+                            cfg=cfg,
+                        )
+                    return grouped_matmul(rows, kernel, group_sizes, **gmm_kws)
+
                 x_rows = _mask_dispatch_tail(x_rows, group_sizes)
                 if gate_up_kernel is not None:
-                    layer_gate_up = grouped_matmul(x_rows, gate_up_kernel, group_sizes, **gmm_kws)
+                    layer_gate_up = _expert_gmm(x_rows, gate_up_kernel)
                     layer_gate_up = checkpoint_name(layer_gate_up, "mlp_gate_up")
                     if gate_up_bias is not None:
                         layer_gate_up = layer_gate_up + gate_up_bias[selected_experts]
                     layer_gate_up = _mask_dispatch_tail(layer_gate_up, group_sizes)
                     layer_w0, layer_w1 = jnp.split(layer_gate_up, 2, axis=-1)
                 else:
-                    layer_w0 = grouped_matmul(x_rows, wi_kernel, group_sizes, **gmm_kws)
+                    layer_w0 = _expert_gmm(x_rows, wi_kernel)
 
                     layer_w0 = checkpoint_name(layer_w0, "mlp_gate")
                     if wi_bias is not None:
                         layer_w0 = layer_w0 + wi_bias[selected_experts]
                     layer_w0 = _mask_dispatch_tail(layer_w0, group_sizes)
 
-                    layer_w1 = grouped_matmul(x_rows, wu_kernel, group_sizes, **gmm_kws)
+                    layer_w1 = _expert_gmm(x_rows, wu_kernel)
 
                     layer_w1 = checkpoint_name(layer_w1, "mlp_up")
                     if wu_bias is not None:
@@ -1852,7 +1942,7 @@ class BaseMoeModule(spx.Module, ABC):
 
                 intermediate_layer = _mask_dispatch_tail(ffn_activation(layer_w0, layer_w1), group_sizes)
 
-                intermediate_output = grouped_matmul(intermediate_layer, wd_kernel, group_sizes, **gmm_kws)
+                intermediate_output = _expert_gmm(intermediate_layer, wd_kernel)
                 intermediate_output = checkpoint_name(intermediate_output, "mlp_down")
 
                 # TP reduction: psum_scatter to shard output across TP on hidden dimension
@@ -2243,6 +2333,26 @@ class BaseMoeModule(spx.Module, ABC):
                 )
             return output
 
+        @partial(
+            shard_map,
+            mesh=expert_mesh.jax_mesh,
+            in_specs=(input_ps, glps, wikps, wukps, wgukps, wdkps, wibps, wubps, wgubps, wdbps),
+            out_specs=output_ps,
+            check_vma=False,
+        )
+        def _sparse_call(*call_args):
+            """Run the fused body, then match the mode-aware boundary layout.
+
+            In decode-replicated mode the body's tp-sharded ``[B, S, H/tp]``
+            result is all-gathered back to full hidden so the block's output
+            matches the replicated decode residual stream declared by
+            ``output_ps``.
+            """
+            out = _sparse_call_body(*call_args)
+            if decode_replicated_out:
+                out = jax.lax.all_gather(out, tensor_axis_name, axis=2, tiled=True)
+            return out
+
         output = _sparse_call(
             hidden_state,
             gate_logits,
@@ -2259,7 +2369,9 @@ class BaseMoeModule(spx.Module, ABC):
         # Reshard output back to original 5D mesh for compatibility with rest of model
         # This ensures the output can be used in residual connections
         original_output_ps = self.runtime_sharding_resolver.resolve(
-            axes=[DP, EMPTY, TP] if not self.config.use_expert_tensor_mode else [DP, EMPTY, EMPTY],
+            axes=(
+                [DP, EMPTY, EMPTY] if (self.config.use_expert_tensor_mode or decode_replicated_out) else [DP, EMPTY, TP]
+            ),
             mode=MODE_TRAIN,
             shape=output.shape,
         )
@@ -2366,6 +2478,13 @@ class BaseMoeModule(spx.Module, ABC):
         """
         if wd_kernel is None:
             raise ValueError("MoE requires wd_kernel.")
+        if (
+            any(isinstance(_k, tuple) for _k in (wi_kernel, wu_kernel, gate_up_kernel, wd_kernel) if _k is not None)
+            and self.module_moe_method != MoEMethods.FUSED_MOE
+        ):
+            raise NotImplementedError(
+                "Quantized (codes, scales) expert kernels are only supported on the FUSED_MOE path."
+            )
         with self._active_auto_expert_mesh(hidden_state):
             match self.module_moe_method:
                 case MoEMethods.STANDARD_MOE:

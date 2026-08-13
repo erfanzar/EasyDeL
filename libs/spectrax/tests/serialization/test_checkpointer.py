@@ -14,8 +14,47 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
-
 from spectrax.serialization import Checkpointer, CheckpointInterval
+from spectrax.serialization.checkpointer import _reattach_scheme, find_latest_checkpoint
+
+
+class TestFindLatestCheckpointSchemes:
+    """URI-scheme handling in checkpoint discovery.
+
+    ``_fs.iterdir`` strips URI schemes; discovery must re-attach them without
+    mangling the path. ``file://`` URIs are the regression case: the old
+    ``lstrip("/")`` turned ``file:///abs/path`` children into relative
+    ``file://abs/path`` entries, so ``find_latest_checkpoint`` returned None.
+    """
+
+    def test_reattach_scheme_file_and_gs_roundtrip(self):
+        """file:// keeps its absolute root; gs:// keeps bucket-relative paths."""
+        assert _reattach_scheme("file://", "/abs/run/step_1") == "file:///abs/run/step_1"
+        assert _reattach_scheme("gs://", "bucket/run/step_1") == "gs://bucket/run/step_1"
+        # Idempotent when the scheme is already attached.
+        assert _reattach_scheme("file://", "file:///abs/run/step_1") == "file:///abs/run/step_1"
+        assert _reattach_scheme("gs://", "gs://bucket/run/step_1") == "gs://bucket/run/step_1"
+        # Plain local paths (no scheme) pass through untouched.
+        assert _reattach_scheme("", "/abs/run/step_1") == "/abs/run/step_1"
+
+    def test_find_latest_checkpoint_file_uri(self, tmp_path):
+        """Discovery through a file:// URI finds the newest child checkpoint."""
+        for step, ts in ((10, "2026-01-01T00:00:00"), (20, "2026-01-02T00:00:00")):
+            d = tmp_path / f"run-{step}"
+            d.mkdir()
+            (d / "metadata.json").write_text(json.dumps({"timestamp": ts, "step": step}))
+
+        found = find_latest_checkpoint(f"file://{tmp_path}")
+        assert found == f"file://{tmp_path}/run-20"
+
+    def test_find_latest_checkpoint_plain_local_path(self, tmp_path):
+        """Plain local paths (no scheme) keep working identically."""
+        for step, ts in ((10, "2026-01-01T00:00:00"), (20, "2026-01-02T00:00:00")):
+            d = tmp_path / f"run-{step}"
+            d.mkdir()
+            (d / "metadata.json").write_text(json.dumps({"timestamp": ts, "step": step}))
+
+        assert find_latest_checkpoint(str(tmp_path)) == str(tmp_path / "run-20")
 
 
 class TestCheckpointer:

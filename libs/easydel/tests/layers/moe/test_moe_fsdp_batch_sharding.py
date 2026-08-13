@@ -276,7 +276,46 @@ def test_fsdp_batch_grad_matches_dp_reference():
     assert bool(jnp.all(jnp.isfinite(grad_ref)))
     assert bool(jnp.all(jnp.isfinite(grad_shd)))
     max_abs_diff = float(jnp.max(jnp.abs(grad_ref - grad_shd)))
-    assert max_abs_diff < 1e-4, f"fsdp-carried batch gradient diverges from dp reference: max_abs_diff={max_abs_diff:.3e}"
+    assert max_abs_diff < 1e-4, (
+        f"fsdp-carried batch gradient diverges from dp reference: max_abs_diff={max_abs_diff:.3e}"
+    )
+
+
+def test_indivisible_batch_drop_is_inference_gated():
+    """The batch-spec drop for indivisible batches must only apply to inference traces.
+
+    eSurge packs EVERY window (decode and prefill) as ``[1, N]`` tokens,
+    which cannot divide a ``(dp, fsdp)`` batch group — inside a
+    ``set_inference_mode()`` or ``decode_mode_specs()`` scope the batch
+    placement is dropped (batch-replicated execution, numerically
+    identical). OUTSIDE inference the historical loud shard_map error must
+    stay: silently replicating a training batch across the batch group
+    multiplies per-shard compute without any signal to the user.
+    """
+    from easydel.infra.sharding import decode_mode_specs
+    from easydel.utils.inference_mode import set_inference_mode
+
+    _require_fake_mesh()
+
+    block = _build_gptoss_block(sharding_axis_dims=(1, 1, 4, 1, 2, 1), ring=False)
+    # B=2 is indivisible by the (dp=1, fsdp=4) batch group.
+    x = jax.random.normal(jax.random.PRNGKey(0), (2, 4, 32), dtype=jnp.float32)
+
+    with block.config.mesh:
+        with pytest.raises(Exception):  # noqa: B017 - loud shard_map divisibility error
+            block(x)
+
+    with block.config.mesh, decode_mode_specs(True):
+        out, _ = block(x)
+    assert out.shape == x.shape
+    assert bool(jnp.all(jnp.isfinite(out)))
+
+    # eSurge prefill compiles trace inside set_inference_mode() WITHOUT the
+    # decode scope — the drop must engage there too.
+    with block.config.mesh, set_inference_mode():
+        out_prefill, _ = block(x)
+    assert out_prefill.shape == x.shape
+    assert bool(jnp.all(jnp.isfinite(out_prefill)))
 
 
 if __name__ == "__main__":

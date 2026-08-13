@@ -36,7 +36,7 @@ def step_break(runner, ntrials, verify_steps, k):
     """Median per-phase ms over the timed-trial decode (verify) steps."""
     hist = list(runner._perf_phase_history)
     # each trial = 1 prefill record + (verify_steps/ntrials) verify records
-    tail = hist[-(int(verify_steps) + ntrials + 2):] if verify_steps else hist
+    tail = hist[-(int(verify_steps) + ntrials + 2) :] if verify_steps else hist
     dec = [r for r in tail if 1 <= int(r.get("total_tokens", 0)) <= k + 2]
 
     def med(field):
@@ -70,7 +70,7 @@ def main():
     base = B.build_runner(model, drafter=None)
     bg_tps, _, bg_toks = B.bench(base, "baseline-greedy", temperature=0.0, top_p=1.0)
     bg_break = step_break(base, TRIALS, len(bg_toks) * TRIALS, 0)
-    bs_tps, _, bs_toks = B.bench(base, "baseline-sampling", temperature=0.8, top_p=0.95)
+    bs_tps, _, _bs_toks = B.bench(base, "baseline-sampling", temperature=0.8, top_p=0.95)
     print(f"\nSAMPLE[baseline-greedy]: {tok.decode(bg_toks)[:220]!r}")
 
     rows = []
@@ -88,7 +88,7 @@ def main():
         g_steps_pt = (g_steps / TRIALS) if g_steps else 0.0
         g_sample = tok.decode(sg_toks)
 
-        ss_tps, _, ss_toks = B.bench(sr, "spec-sampling", temperature=0.8, top_p=0.95)
+        ss_tps, _, _ss_toks = B.bench(sr, "spec-sampling", temperature=0.8, top_p=0.95)
         s_gen = sr.spec_decode_num_drafts_generated
         s_acc = sr.spec_decode_num_drafts_accepted
         s_steps = sr.spec_decode_num_verify_steps
@@ -117,7 +117,9 @@ def main():
     print("\n\n" + "=" * 118)
     print("SWEEP RESULTS — Qwen3.6-27B tp=4 bf16 fast-path")
     print("=" * 118)
-    print(f"baseline greedy  : {bg_tps:7.2f} tok/s   per-step total={bg_break['total']:.2f}ms fwd={bg_break['fwd']:.2f}ms")
+    print(
+        f"baseline greedy  : {bg_tps:7.2f} tok/s   per-step total={bg_break['total']:.2f}ms fwd={bg_break['fwd']:.2f}ms"
+    )
     print(f"baseline sampling: {bs_tps:7.2f} tok/s")
     print("-" * 118)
     hdr = (
@@ -134,7 +136,9 @@ def main():
             f"{b['post']:>7.2f} | {r['s_tps']:>8.2f} {r['s_spd']:>7.2f}x {r['s_acc_rate']:>7.1%}"
         )
     print("=" * 118)
-    print("cols: verify=forward_time(target verify fwd)  draft=spec_draft_time(recursive MTP draft)  proj=spec_project_time")
+    print(
+        "cols: verify=forward_time(target verify fwd)  draft=spec_draft_time(recursive MTP draft)  proj=spec_project_time"
+    )
     for r in rows:
         print(f"\n--- K={r['k']} greedy coherence (match_baseline={r['g_match']}) ---\n{r['g_sample'][:400]}")
     return 0

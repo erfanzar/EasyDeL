@@ -63,6 +63,7 @@ from spectrax.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.sharding import (
     MeshLike,
+    TensorLayout,
     partition_spec_for_mesh,
     pick_array_mesh,
     sanitize_partition_spec_for_shape,
@@ -88,6 +89,37 @@ default_bias_init = jax.nn.initializers.zeros
 
 _QMM_NON_AFFINE_MODES = frozenset({"nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"})
 _EJKERNEL_GROUP_SIZES = (1024, 512, 256, 128, 64, 32, 16)
+
+#: Combined packed-byte floor of the fused W4A4 decode route: the route only
+#: engages when the gate_up + down packed pair is at least this large
+#: (mirrored by the dispatch gate in ``easydel.layers.mlp``).
+W4A4_FUSED_PAIR_MIN_PACKED_BYTES = 48 * 1024 * 1024
+
+
+def should_pack_int4_companion(in_features: int, out_features: int) -> bool:
+    """Whether a channelwise-int4 linear should carry a packed companion.
+
+    The ``quant_kernel_packed`` companion exists solely to feed the fused
+    W4A4 decode kernel, whose dispatch gate requires a gate_up/down pair
+    whose combined packed bytes reach
+    :data:`W4A4_FUSED_PAIR_MIN_PACKED_BYTES`. In such a pair the smallest
+    member is the down projection at one third of the pair total
+    (``gate_up`` packs ``K*I`` bytes, ``down`` packs ``K*I/2``), so any layer
+    whose own packed size falls below a third of the gate can NEVER be part
+    of a qualifying pair — materializing its companion is pure dead HBM and
+    checkpoint weight (~1 GB across a 7B's attention projections).
+
+    Args:
+        in_features: The layer's contraction dimension.
+        out_features: The layer's (summed) output dimension.
+
+    Returns:
+        ``True`` when the packed companion could actually be consumed.
+    """
+    packed_nbytes = (int(in_features) * int(out_features)) // 2  # uint8, two int4 codes per byte
+    return packed_nbytes >= W4A4_FUSED_PAIR_MIN_PACKED_BYTES // 3
+
+
 _QMM_DEFAULT_POLICY_TABLE: dict[str, tp.Any] = {
     "tpu": {
         "affine": {
@@ -276,6 +308,34 @@ def prepack_quantized_weights_jit(array: jax.Array, *, group_size: int, bits: in
         ``(w_q, scales)`` or ``(w_q, scales, zeros)`` depending on ``mode``.
     """
     return prepack_quantized_weights(array, group_size=group_size, bits=bits, mode=mode, transpose=False)
+
+
+def channelwise_quantize_array(array: jax.Array, bits: int) -> tuple[jax.Array, jax.Array, None]:
+    """Per-output-channel symmetric quantization over the full contraction axis.
+
+    Produces the exact format the channelwise/fused-MLP kernels consume
+    without unpacking: integer codes ``[in, out]`` (int8 or int4) and float32
+    scales ``[1, out]``. Single source of truth for both module-level
+    quantization (:meth:`ParallelLinearQuantized._quantize_array`) and the
+    streaming quantize-at-load path in the checkpoint bridge.
+
+    Args:
+        array: Full-precision weight ``[in_features, out_features]``.
+        bits: 8 or 4.
+
+    Returns:
+        Tuple of (codes, scales, None) — the trailing None mirrors the
+        (kernel, scales, biases) triple of the grouped modes.
+    """
+    qmax = 127.0 if bits == 8 else 7.0
+    qdtype = jnp.int8 if bits == 8 else jnp.int4
+    w32 = array.astype(jnp.float32)
+    # Reduce over the contraction axis: axis 0 for [in, out] dense kernels,
+    # axis 1 for stacked expert kernels [experts, in, out] — both are axis -2.
+    scales = jnp.max(jnp.abs(w32), axis=-2, keepdims=True) / qmax
+    scales = jnp.where(scales == 0, 1.0, scales)
+    codes = jnp.clip(jnp.round(w32 / scales), -qmax, qmax).astype(qdtype)
+    return codes, scales.astype(jnp.float32), None
 
 
 def _effective_ejkernel_group_size(mode: str, requested_group_size: int, array_shape: tuple[int, ...]) -> int:
@@ -512,9 +572,9 @@ def _quantized_linear_sharding_fn(
     if direction is None:
         return None
 
-    if mode not in {"affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"}:
+    if mode not in {"affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8", "channelwise"}:
         return None
-    if group_size <= 0:
+    if group_size <= 0 and mode != "channelwise":
         raise ValueError(f"`group_size` must be > 0, got {group_size}.")
 
     if param_name == "bias":
@@ -524,8 +584,19 @@ def _quantized_linear_sharding_fn(
         # Non-affine modes do not materialize per-group zero/bias tensors.
         return None
 
+    base = RowWise if direction == "row" else ColumnWise
+
+    if mode == "channelwise" and param_name == "quant_scales":
+        # Channelwise reduces the whole contraction axis, so its scales are
+        # [1, out] rather than the grouped modes' [in // group, out]. Handing
+        # a size-1 axis the contraction placement (TP for row-parallel,
+        # (FSDP, SP) for column-parallel) asks it to divide across an axis of
+        # size > 1. The stacked-expert twin drops the same placement for the
+        # same reason (see ParallelMoELinearQuantized's scales_layout).
+        return TensorLayout((None, base.axes[1]), mode=base.mode)
+
     if param_name in {"quant_kernel", "quant_scales", "quant_biases"}:
-        return RowWise if direction == "row" else ColumnWise
+        return base
 
     return None
 
@@ -834,6 +905,24 @@ class ParallelLinearQuantized(spx.Module):
             quant_biases,
             sharding=sharding_for_layout(layout_specs.get("quant_biases")),
         )
+        if (
+            mode == "channelwise"
+            and quant_kernel.dtype == jnp.int4
+            and should_pack_int4_companion(in_features, out_features_sum)
+        ):
+            # Adjacent-rows packed companion feeding the fused W4A4 decode
+            # kernel (uint8 [in/2, out]); shares the kernel's sharding. Only
+            # layers large enough to ever pass the fused route's pair gate
+            # carry one — for everything else (attention projections, small
+            # MLPs) it would be dead HBM and checkpoint weight.
+            from ejkernel.modules import pack_int4_adjacent as _pack_int4_adjacent
+
+            self.quant_kernel_packed = spx.Parameter(
+                _pack_int4_adjacent(quant_kernel),
+                sharding=sharding_for_layout(layout_specs.get("quant_kernel")),
+            )
+        else:
+            self.quant_kernel_packed = None
 
         if use_bias:
             self.bias = spx.Parameter(
@@ -1025,6 +1114,9 @@ class ParallelLinearQuantized(spx.Module):
             ValueError: If the configured quantization dtype is not supported.
         """
         mode, group_size, bits, needs_biases = self._resolve_ejkernel_params()
+        if mode == "channelwise":
+            self._ej_group_size = int(array.shape[0])
+            return channelwise_quantize_array(array, bits)
         group_size = _effective_ejkernel_group_size(mode, group_size, tuple(array.shape))
         self._ej_group_size = int(group_size)
         if needs_biases:
@@ -1198,6 +1290,12 @@ class ParallelLinearQuantized(spx.Module):
         self.quant_kernel.value = wq
         self.quant_scales.value = scale
         self.quant_biases.value = quant_bias
+        if self.quant_kernel_packed is not None and wq.dtype == jnp.int4:
+            # Keep the fused-W4A4 companion in sync with the fresh codes; a
+            # stale packed twin would feed the decode kernel garbage.
+            from ejkernel.modules import pack_int4_adjacent as _pack_int4_adjacent
+
+            self.quant_kernel_packed.value = _pack_int4_adjacent(wq)
         if bias_value is not None and self.use_bias:
             self.bias.value = bias_value
         return self
@@ -1544,15 +1642,27 @@ class ParallelLinearQuantized(spx.Module):
             if needs_biases and bias_value is None:
                 raise ValueError("Affine quantization requires quant_biases; re-quantize the module weights.")
 
-            out = self._distributed_quantized_matmul(
-                inputs.reshape((-1, inputs.shape[-1])),
-                kernel_value,
-                scale_value,
-                bias_value,
-                group_size=group_size,
-                bits=bits,
-                mode=mode,
-            ).reshape((*inputs.shape[:-1], self.out_features_sum))
+            if mode == "channelwise":
+                from ejkernel.modules import channelwise_quantized_matmul as _cw_qmm
+
+                act_bits = getattr(self.config, "activation_bits", None)
+                out = _cw_qmm(
+                    inputs.reshape((-1, inputs.shape[-1])),
+                    kernel_value,
+                    scale_value,
+                    quantize_activations=act_bits is not None,
+                    activation_bits=int(act_bits) if act_bits is not None else 8,
+                ).reshape((*inputs.shape[:-1], self.out_features_sum))
+            else:
+                out = self._distributed_quantized_matmul(
+                    inputs.reshape((-1, inputs.shape[-1])),
+                    kernel_value,
+                    scale_value,
+                    bias_value,
+                    group_size=group_size,
+                    bits=bits,
+                    mode=mode,
+                ).reshape((*inputs.shape[:-1], self.out_features_sum))
 
             if self.dtype is not None:
                 out = out.astype(self.dtype)

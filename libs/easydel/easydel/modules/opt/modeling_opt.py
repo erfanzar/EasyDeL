@@ -804,6 +804,18 @@ class OPTDecoder(EasyDeLBaseModule):
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
+        trace_layers = self._layer_scan_trace(
+            False,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache,
+        )
+        cache_views = views if trace_layers else None
+
         def _layer_loop(decoder_layer, carry):
             """Run one OPT decoder layer inside the scanned trunk.
 
@@ -811,9 +823,9 @@ class OPTDecoder(EasyDeLBaseModule):
             already added at the input via the learned ``OPTLearnedPositionalEmbedding``
             and per-layer biases; this closure therefore does not pass any
             ``frequencies`` and just threads ``hidden_states`` and the per-
-            layer cache view through the scan.
+            layer cache view through the carry.
             """
-            hidden_states, all_hidden_states, all_self_attns, idx = carry
+            hidden_states, cv, all_hidden_states, all_self_attns, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -822,7 +834,7 @@ class OPTDecoder(EasyDeLBaseModule):
                     hidden_states=hidden_states,
                     mask_info=mask_info,
                     mode=mode,
-                    cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
+                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
                     cache_metadata=cache_metadata,
                     output_attentions=output_attentions,
                 )
@@ -831,14 +843,20 @@ class OPTDecoder(EasyDeLBaseModule):
             if output_attentions:
                 all_self_attns += (layer_outputs.attention_weight,)
 
-            self._layer_cache_view_update(None, idx, layer_outputs.cache_view, enabled=True, cache=past_key_values)
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                layer_outputs.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
 
-            return hidden_states, all_hidden_states, all_self_attns, idx + 1
+            return hidden_states, cv, all_hidden_states, all_self_attns, idx + 1
 
-        hidden_states, all_hidden_states, all_self_attns, _ = self.layers.scan(
+        hidden_states, _, all_hidden_states, all_self_attns, _ = self.layers.scan(
             _layer_loop,
-            (hidden_states, all_hidden_states, all_self_attns, 0),
-            trace=True,
+            (hidden_states, cache_views, all_hidden_states, all_self_attns, 0),
+            trace=trace_layers,
         )
         if self.final_layer_norm is not None:
             hidden_state = checkpoint_name(self.final_layer_norm(hidden_states), "model_output")

@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import functools
 import typing as tp
+from functools import partial
 
 import jax
 from jax import numpy as jnp
@@ -46,13 +47,14 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from ...._registry import Backend, Platform, kernel_registry
+from ...._xla.fused_mlp import resolve_mlp_combine
 from ..quantized_matmul._packed_gemv import supports_int4_mxu
 
 __all__ = ["fused_mlp_w4a4_pallas"]
 
 _KERNEL_ACTIVATIONS: dict[str, tp.Callable[[jax.Array], jax.Array]] = {
     "silu": jax.nn.silu,
-    "gelu": jax.nn.gelu,
+    "gelu": partial(jax.nn.gelu, approximate=False),
     "gelu_tanh": lambda x: jax.nn.gelu(x, approximate=True),
     "relu": jax.nn.relu,
     "sigmoid": jax.nn.sigmoid,
@@ -72,6 +74,7 @@ def _kernel(
     acc_ref,
     *,
     activation: str,
+    act_params: tuple,
 ):
     """One I-tile of the fused MLP.
 
@@ -100,7 +103,7 @@ def _kernel(
     up = jnp.matmul(x_ref[...], up_w, preferred_element_type=jnp.int32).astype(jnp.float32)
     up *= up_scale_ref[...] * x_scale
 
-    hidden = _KERNEL_ACTIVATIONS[activation](gate) * up  # [m, tile_i] f32, never leaves registers
+    hidden = resolve_mlp_combine(activation, act_params)(gate, up)  # [m, tile_i] f32, in registers
 
     # Re-quantize per (token, tile): each tile carries its own row scales, so
     # the down matmul below is exact w.r.t. these codes and the accumulated
@@ -127,8 +130,8 @@ def _kernel(
         out_ref[...] = (acc_ref[...] * down_scale_ref[...]).astype(out_ref.dtype)
 
 
-@kernel_registry.register("fused_mlp", Platform.PALLAS, Backend.TPU)
-@functools.partial(jax.jit, static_argnames=("activation", "tile_i", "interpret"))
+@kernel_registry.register("fused_mlp_w4a4", Platform.PALLAS, Backend.TPU)
+@functools.partial(jax.jit, static_argnames=("activation", "act_params", "tile_i", "interpret"))
 def fused_mlp_w4a4_pallas(
     x4: jax.Array,
     gate_packed: jax.Array,
@@ -140,6 +143,7 @@ def fused_mlp_w4a4_pallas(
     x_scale: jax.Array,
     *,
     activation: str = "silu",
+    act_params: tuple[float, ...] = (),
     tile_i: int = 1024,
     interpret: bool = False,
 ) -> jax.Array:
@@ -183,8 +187,7 @@ def fused_mlp_w4a4_pallas(
         raise ValueError(f"down_packed shape {down_packed.shape}; expected {(i_dim // 2, k_dim)}.")
     if i_dim % tile_i:
         raise ValueError(f"tile_i={tile_i} must divide I={i_dim}.")
-    if activation not in _KERNEL_ACTIVATIONS:
-        raise ValueError(f"Unknown activation {activation!r}; supported: {sorted(_KERNEL_ACTIVATIONS)}.")
+    resolve_mlp_combine(activation, act_params)  # validates name + arity
 
     gate_scale = gate_scale.reshape(1, i_dim).astype(jnp.float32)
     up_scale = up_scale.reshape(1, i_dim).astype(jnp.float32)
@@ -193,7 +196,7 @@ def fused_mlp_w4a4_pallas(
 
     grid = (i_dim // tile_i,)
     return pl.pallas_call(
-        functools.partial(_kernel, activation=activation),
+        functools.partial(_kernel, activation=activation, act_params=act_params),
         grid=grid,
         in_specs=[
             pl.BlockSpec((m, k_dim), lambda j: (0, 0)),

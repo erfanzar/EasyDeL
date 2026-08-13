@@ -87,8 +87,6 @@ def test_rank_probe_does_not_leak_page_hashes_on_non_owning_ranks():
             owned = {rid for rid, owner in scheduler.req_id_to_dp_rank.items() if owner == rank}
             hashed = set(rank_scheduler.kv_cache_manager.req_to_page_hashes.keys())
             leaked = hashed - owned
-            assert not leaked, (
-                f"rank {rank} retained prefix-hash entries for requests it does not own: {sorted(leaked)}"
-            )
+            assert not leaked, f"rank {rank} retained prefix-hash entries for requests it does not own: {sorted(leaked)}"
     finally:
         scheduler.shutdown()

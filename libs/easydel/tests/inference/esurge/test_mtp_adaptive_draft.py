@@ -63,8 +63,6 @@ _VOCAB = 256
 _HIDDEN = 128
 
 
-
-
 def _seed_hidden(i: int) -> jnp.ndarray:
     """A (hidden,)-shaped seed hidden state (draft/draft_adaptive add the B/S axes)."""
     return jax.random.normal(jax.random.fold_in(jax.random.PRNGKey(11), i), (_HIDDEN,), dtype=jnp.float32)

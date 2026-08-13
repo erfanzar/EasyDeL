@@ -257,6 +257,30 @@ _accumulate_grad_tree = jax.jit(_accumulate_grad_tree_impl)
 _accumulate_grad_tree_donate = jax.jit(_accumulate_grad_tree_impl, donate_argnums=(0,))
 
 
+def _scale_grad_leaf_donate_impl(x, scalar):
+    """Scale one gradient leaf in place (dtype-preserving, buffer-donating).
+
+    Used by the terminal pipeline stage to apply the ``1/num_microbatches``
+    loss scale to a freshly produced gradient leaf without materializing a
+    second parameter-sized tree: the input buffer is donated and, because
+    :func:`_scale_grad` preserves the leaf dtype, XLA reuses it for the
+    output.
+
+    Args:
+        x: Gradient leaf (a :class:`jax.Array`; ``float0``/``None`` leaves
+            must be filtered by the caller since they cannot be jit inputs).
+        scalar: Scalar multiplier (typically ``1/M``).
+
+    Returns:
+        ``x * scalar`` with ``x``'s dtype, reusing ``x``'s buffer.
+    """
+    with jax.named_scope("spectrax/mpmd/grad/scale_grad_donate"):
+        return _scale_grad(x, scalar)
+
+
+_scale_grad_donate = jax.jit(_scale_grad_leaf_donate_impl, donate_argnums=(0,))
+
+
 @jax.jit
 def _scale_grad_tree(state, scalar):
     """Scale every leaf of a grad pytree by ``scalar`` under a cached jit.

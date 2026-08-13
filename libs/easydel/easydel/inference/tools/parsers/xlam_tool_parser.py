@@ -138,6 +138,19 @@ class xLAMToolParser(ToolParser):
             "sent_tools": [],
         }
 
+    def get_tool_machinery_hints(self) -> Sequence[str]:
+        """Include the bare-JSON dict prefix alongside the ``[`` start token.
+
+        ``preprocess_model_output`` accepts dict-form payloads (fenced
+        ``\\`\\`\\`json`` blocks, ``<tool_call>``-wrapped dicts, malformed
+        arrays containing ``{"name": ...}``) that carry no ``[``; the
+        delegating parser's machinery gate must engage on ``{`` too.
+        """
+        hints = list(super().get_tool_machinery_hints())
+        if "{" not in hints:
+            hints.append("{")
+        return tuple(hints)
+
     def preprocess_model_output(self, model_output: str) -> tuple[str | None, str | None]:
         """Preprocess model output to extract potential tool calls.
 

@@ -122,9 +122,7 @@ class _Sink:
 
     def all_finished(self):
         with self.lock:
-            return {
-                rid for bundle in self.bundles for co in bundle.values() for rid in (co.finished_requests or ())
-            }
+            return {rid for bundle in self.bundles for co in bundle.values() for rid in (co.finished_requests or ())}
 
 
 class _PlaneHarness:
@@ -191,9 +189,7 @@ class _PlaneHarness:
 
     def tee(self, *outputs, finished=None):
         """Feed one synthetic step bundle through the owner tee."""
-        self.owner.tee_outputs(
-            {0: EngineCoreOutputs(outputs=list(outputs), timestamp=1.0, finished_requests=finished)}
-        )
+        self.owner.tee_outputs({0: EngineCoreOutputs(outputs=list(outputs), timestamp=1.0, finished_requests=finished)})
 
     def __enter__(self):
         self.worker_thread.start()
@@ -488,9 +484,7 @@ def test_coalesce_child_abort_spares_surviving_sample():
         plane.tee(EngineCoreOutput(request_id=f"{scheduled_parent}-1", new_token_ids=[7]))
         _wait_until(lambda: any(o.request_id == f"{AUTO_1}-1" for o in plane.origin_sink.all_outputs()))
         plane.tee(
-            EngineCoreOutput(
-                request_id=f"{scheduled_parent}-1", new_token_ids=[8], finish_reason=FinishReason.STOP
-            )
+            EngineCoreOutput(request_id=f"{scheduled_parent}-1", new_token_ids=[8], finish_reason=FinishReason.STOP)
         )
         _wait_until(lambda: not plane.origin.is_remote(f"{AUTO_1}-1"))
         survivor = [o for o in plane.origin_sink.all_outputs() if o.request_id == f"{AUTO_1}-1"]

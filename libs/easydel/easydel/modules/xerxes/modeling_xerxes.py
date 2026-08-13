@@ -30,7 +30,6 @@ import jax.numpy as jnp
 import spectrax as spx
 from eformer.loggings import get_logger
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 from spectrax import apply_logical_sharding, common_types, nn
 
@@ -52,7 +51,7 @@ from easydel.layers import (
     RMSNorm,
     RowParallelLinear,
     dense_gate_up_layout,
-    split_fused_gate_up_projection,
+    gated_mlp_forward,
 )
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule
@@ -141,7 +140,7 @@ class XerxesMLP(spx.Module):
         self.rngs = rngs
         kernel_init = jax.nn.initializers.normal(config.initializer_range)
 
-        self.act = jax.nn.silu if config.swish_run else functools.partial(jax.nn.gelu, approximate=True)
+        self.act_fn = jax.nn.silu if config.swish_run else functools.partial(jax.nn.gelu, approximate=True)
         self.gate_up_proj = ColumnParallelLinear(
             self.config.hidden_size,
             (self.config.intermediate_size, self.config.intermediate_size),
@@ -183,27 +182,17 @@ class XerxesMLP(spx.Module):
     ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Apply gated feedforward transformation.
 
+        Delegates to :func:`easydel.layers.gated_mlp_forward`, which routes
+        supported layouts through the ejkernel fused MLP kernels and runs
+        the legacy composition otherwise.
+
         Args:
             hidden_states: Input tensor [batch, seq_len, hidden_dim]
 
         Returns:
             Transformed hidden states [batch, seq_len, hidden_dim]
         """
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
-        gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
-        gate = checkpoint_name(self.act(gate_raw), "mlp_gate")
-        hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        return hidden_states
+        return gated_mlp_forward(self, hidden_states)
 
 
 class XerxesAttention(UnifiedAttention):
@@ -803,33 +792,47 @@ class XerxesModel(EasyDeLBaseModule):
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        outputs = None
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
+        trace_layers = self._layer_scan_trace(
+            False,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache,
+        )
+        cache_views = views if trace_layers else None
+        # Hoisted out of the loop body: the caching properties must not be
+        # first materialized inside the lax.scan trace (tracer leak).
+        frequencies = self.frequencies
+        default_frequencies = self.default_frequencies
 
         def _layer_loop(block, carry):
             """Apply a single decoder layer inside the layer-stack scan.
 
-            Body of ``self.layers.scan``; runs ``block`` on the current
-            hidden states, optionally accumulates per-layer hidden
-            states, attention weights and decoder-layer outputs, and
-            returns the updated carry tuple.
+            Body of ``self.layers.scan``; carries ``(hidden_states,
+            cache_views, all_hidden_states, all_attentions, layer_index)``,
+            optionally accumulating per-layer hidden states and attention
+            weights.
             """
-            hidden_states, all_hidden_states, all_attentions, outputs, idx = carry
+            hidden_states, cv, all_hidden_states, all_attentions, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
             with self._layer_stage_context(idx, layers=self.layers):
-                outputs = block(
+                layer_outputs = block(
                     hidden_states=hidden_states,
                     mask_info=mask_info,
                     position_ids=position_ids,
                     mode=mode,
-                    cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
+                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
                     cache_metadata=cache_metadata,
                     output_attentions=output_attentions,
-                    frequencies=self.frequencies,
-                    default_frequencies=self.default_frequencies,
+                    frequencies=frequencies,
+                    default_frequencies=default_frequencies,
                 )
-            hidden_states = self._mark_layer_stage_boundary(outputs.hidden_states, idx, layers=self.layers)
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
             hidden_states = apply_logical_sharding(
                 hidden_states,
@@ -837,23 +840,26 @@ class XerxesModel(EasyDeLBaseModule):
                 partition_manager=self.config.runtime_sharding_resolver,
             )
             if output_attentions:
-                all_attentions += (outputs.attention_weight,)
+                all_attentions += (layer_outputs.attention_weight,)
 
-            self._layer_cache_view_update(None, idx, outputs.cache_view, enabled=True, cache=past_key_values)
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                layer_outputs.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
 
-            return hidden_states, all_hidden_states, all_attentions, outputs, idx + 1
+            return hidden_states, cv, all_hidden_states, all_attentions, idx + 1
 
-        hidden_states, all_hidden_states, all_attentions, outputs, _ = self.layers.scan(
+        hidden_states, _, all_hidden_states, all_attentions, _ = self.layers.scan(
             _layer_loop,
-            (hidden_states, all_hidden_states, all_attentions, outputs, 0),
-            trace=True,
+            (hidden_states, cache_views, all_hidden_states, all_attentions, 0),
+            trace=trace_layers,
         )
         hidden_states = self.norm(hidden_states)
         if output_hidden_states:
-            all_hidden_states = outputs[1] + (hidden_states,)  # pyright: ignore[reportOptionalSubscript]
-            outputs = (hidden_states, all_hidden_states, *outputs[2:])  # pyright: ignore[reportOptionalSubscript]
-        else:
-            outputs = (hidden_states, *outputs[1:])  # pyright: ignore[reportOptionalSubscript]
+            all_hidden_states += (hidden_states,)
 
         return BaseModelOutput(
             last_hidden_state=hidden_states,

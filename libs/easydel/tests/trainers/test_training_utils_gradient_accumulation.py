@@ -16,7 +16,6 @@ import dataclasses
 
 import jax
 import jax.numpy as jnp
-
 from easydel.trainers import training_utils
 from easydel.trainers.training_utils import compile_trainer_step, make_assertions_and_get_sizes, minibatch_call
 
@@ -256,7 +255,9 @@ def test_registered_scheduled_adapter_uses_shared_scheduled_wrapper(monkeypatch)
     monkeypatch.setattr(
         training_utils.spx,
         "sxvalue_and_grad",
-        lambda fn, argnums=0: lambda tree, batch: (fn(tree, batch), (tree + 1,)),
+        lambda fn, argnums=0, has_aux=False, microbatch_weight_fn=None: (
+            lambda tree, batch: (fn(tree, batch), (tree + 1,))
+        ),
     )
     monkeypatch.setattr(
         training_utils,

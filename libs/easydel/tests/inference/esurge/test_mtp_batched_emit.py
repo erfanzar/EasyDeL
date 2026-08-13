@@ -75,8 +75,6 @@ _VOCAB = 256
 _HIDDEN = 128
 
 
-
-
 def _det_hidden(shape, dtype, step):
     """Deterministic forward hidden: a fixed function of (flat token index, feature,
     step) -- no dependence on the noisy real forward, and per-row distinct so the
@@ -105,9 +103,7 @@ def _fake_draft_next(self, *, req_id, seed_token, seed_position, seed_hidden, re
 
 def _fake_draft_next_batched(self, seeds):
     return {
-        str(rid): _fake_draft_next(
-            self, req_id=rid, seed_token=tok, seed_position=pos, seed_hidden=h, req_state=None
-        )
+        str(rid): _fake_draft_next(self, req_id=rid, seed_token=tok, seed_position=pos, seed_hidden=h, req_state=None)
         for (rid, _row, tok, pos, h) in seeds
     }
 
@@ -159,10 +155,21 @@ def _run(model, *, n, k, disable_emit, prompts, project_rows):
     os.environ["EASYDEL_DISABLE_DRAFT_IN_VERIFY"] = "1"
     try:
         runner = eSurgeRunner(
-            model=model, hbm_utilization=0.05, page_size=16, max_cache_tokens=4096,
-            max_model_len=64, max_num_batched_tokens=64, min_input_pad=1, min_token_pad=16,
-            max_num_seqs=n, max_num_seq_buckets=[n], async_scheduling=False, use_aot_forward=False,
-            verbose=False, enable_overlap_execution=False, enable_sampler_metrics=False,
+            model=model,
+            hbm_utilization=0.05,
+            page_size=16,
+            max_cache_tokens=4096,
+            max_model_len=64,
+            max_num_batched_tokens=64,
+            min_input_pad=1,
+            min_token_pad=16,
+            max_num_seqs=n,
+            max_num_seq_buckets=[n],
+            async_scheduling=False,
+            use_aot_forward=False,
+            verbose=False,
+            enable_overlap_execution=False,
+            enable_sampler_metrics=False,
             drafter=Qwen3_5MTPDrafter(model, num_draft_tokens=k, persist_kv=True),
         )
         runner.compile(max_num_batched_tokens=64)
@@ -188,13 +195,17 @@ def _run(model, *, n, k, disable_emit, prompts, project_rows):
         runner.executor_manager.execute = _det_execute
 
         sch = Scheduler.from_runner(
-            runner, max_num_batched_tokens=64, enable_prefix_caching=False,
-            async_scheduling=False, num_draft_tokens=runner.num_draft_tokens,
+            runner,
+            max_num_batched_tokens=64,
+            enable_prefix_caching=False,
+            async_scheduling=False,
+            num_draft_tokens=runner.num_draft_tokens,
         )
         reqs = []
         for i in range(n):
             r = EngineRequest(
-                request_id=f"r-{i}", prompt_token_ids=list(prompts[i]),
+                request_id=f"r-{i}",
+                prompt_token_ids=list(prompts[i]),
                 sampling_params=SamplingParams(max_tokens=14, temperature=0.0, ignore_eos=True),
                 eos_token_id=None,
             )

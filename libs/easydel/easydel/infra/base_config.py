@@ -469,6 +469,11 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
             trade compute for memory.
         scan_layers: Apply ``jax.lax.scan`` over identical model layers.
             Models that opt in expose a stack-of-layers pytree.
+        collective_matmul_impl: Engine for explicit-collective parallel
+            matmuls installed via ``wire_distributed_matmul()`` —
+            ``"auto"`` (default; best measured engine, with a decline
+            protocol falling back to the GSPMD einsum), ``"none"``,
+            ``"xla"``, or ``"pallas_ring"``.
         pipeline_stage_regions: When True, partition the forward graph into
             pipeline regions according to declared stage boundaries.
         pipeline_virtual_stages: Number of virtual pipeline stages per
@@ -588,6 +593,8 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     scan_ring_attention: NotRequired[bool]
     scan_attention_layers: NotRequired[bool]
     scan_layers: NotRequired[bool]
+    use_fused_mlp: NotRequired[bool]
+    collective_matmul_impl: NotRequired[str]
     pipeline_stage_regions: NotRequired[bool]
     pipeline_virtual_stages: NotRequired[int]
     pipeline_stage_layout: NotRequired[tp.Literal["contiguous", "interleaved", "loop"]]
@@ -666,6 +673,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         scan_ring_attention: Use scanning for ring attention implementations.
         scan_attention_layers: Apply scan to attention blocks to save memory.
         scan_layers: Apply scan to repeated model layers when the model supports it.
+        collective_matmul_impl: Explicit-collective matmul engine selector
+            (``"auto"``/``"none"``/``"xla"``/``"pallas_ring"``); see
+            ``wire_distributed_matmul()``.
         use_scan_mlp: Apply scan to MLP blocks.
         scan_mlp_chunk_size: Chunk size when scanning MLPs. Defaults to ``1024``.
         sequence_axis_name: Name of the sequence/attention axis. Defaults to ``"sp"``.
@@ -1053,6 +1063,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         scan_ring_attention: bool = True,
         scan_attention_layers: bool = False,
         scan_layers: bool = False,
+        use_fused_mlp: bool = True,
+        collective_matmul_impl: str = "auto",
         pipeline_stage_regions: bool = False,
         pipeline_virtual_stages: int = 1,
         pipeline_stage_layout: tp.Literal["contiguous", "interleaved", "loop"] = "loop",
@@ -1153,6 +1165,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.scan_attention_layers = getattr(self, "scan_attention_layers", scan_attention_layers)
         self.scan_ring_attention = getattr(self, "scan_ring_attention", scan_ring_attention)
         self.scan_layers = getattr(self, "scan_layers", scan_layers)
+        self.use_fused_mlp = getattr(self, "use_fused_mlp", use_fused_mlp)
+        self.collective_matmul_impl = getattr(self, "collective_matmul_impl", collective_matmul_impl)
         self.pipeline_stage_regions = getattr(self, "pipeline_stage_regions", pipeline_stage_regions)
         self.pipeline_virtual_stages = getattr(self, "pipeline_virtual_stages", pipeline_virtual_stages)
         self.pipeline_stage_layout = getattr(self, "pipeline_stage_layout", pipeline_stage_layout)
@@ -1920,6 +1934,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         scan_ring_attention: bool = NOT_GIVEN,
         scan_attention_layers: bool = NOT_GIVEN,
         scan_layers: bool = NOT_GIVEN,
+        use_fused_mlp: bool = NOT_GIVEN,
+        collective_matmul_impl: str = NOT_GIVEN,
         pipeline_stage_regions: bool = NOT_GIVEN,
         pipeline_virtual_stages: int = NOT_GIVEN,
         pipeline_stage_layout: tp.Literal["contiguous", "interleaved", "loop"] = NOT_GIVEN,
@@ -2060,6 +2076,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         set_attrs_smartly(self, "scan_attention_layers", False, scan_attention_layers)
         set_attrs_smartly(self, "scan_ring_attention", True, scan_ring_attention)
         set_attrs_smartly(self, "scan_layers", False, scan_layers)
+        set_attrs_smartly(self, "use_fused_mlp", True, use_fused_mlp)
+        set_attrs_smartly(self, "collective_matmul_impl", "auto", collective_matmul_impl)
         set_attrs_smartly(self, "pipeline_stage_regions", False, pipeline_stage_regions)
         set_attrs_smartly(self, "pipeline_virtual_stages", 1, pipeline_virtual_stages)
         set_attrs_smartly(self, "pipeline_stage_layout", "loop", pipeline_stage_layout)

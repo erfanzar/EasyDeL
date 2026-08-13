@@ -259,13 +259,16 @@ def _parameter_init_sharding_context(config: tp.Any):
             stack.enter_context(mesh)
         if hasattr(resolver, "logical_axis_rules"):
             stack.enter_context(resolver.logical_axis_rules())
-        # MoE expert weights only shard their expert dim over fsdp when the
-        # config opts in AND fsdp is a batch axis (not folded into expert
-        # parallelism); ep-bound configs already shard experts over fsdp.
+        # The explicit knob is authoritative. Under ep-bound fsdp the expert
+        # weight specs still resolve to P('ep', ...) — at ep=1 that is fully
+        # REPLICATED per device (54.8GB for a 30B MoE), which the previous
+        # `and not fsdp_is_ep_bound` mask made impossible to override: models
+        # too large to hold replicated experts could not train at all. Opting
+        # in trades the zero-comm whole-weight layout for sharded-at-rest +
+        # gather-at-use.
         stack.enter_context(
             moe_expert_param_layout_scope(
                 fsdp_shard_expert_weights=bool(getattr(config, "moe_fsdp_shard_expert_weights", False))
-                and not bool(getattr(config, "fsdp_is_ep_bound", True))
             )
         )
         stack.enter_context(spx.variable_init_placement(place))
@@ -2606,6 +2609,33 @@ class EasyDeLBaseModule(
             ]:
                 return True
         return False
+
+    def wire_distributed_matmul(self: Self) -> Self:
+        """Install collective-matmul engines on all ParallelLinear children.
+
+        Reads ``config.collective_matmul_impl`` and sets each child layer's
+        ``distributed_matmul`` injectable accordingly (``"none"`` clears it,
+        restoring the plain-einsum/GSPMD path).  Call after construction or
+        after changing the config field; wiring before compilation ensures a
+        single jit cache entry.
+
+        Returns:
+            The module itself (wiring mutates layer attributes in place).
+        """
+        from easydel.layers.linears import ColumnParallelLinear, RowParallelLinear
+        from easydel.layers.linears._distributed_matmul import make_distributed_matmul
+
+        impl = self.config.collective_matmul_impl
+        for _, module in spx.iter_modules(self):
+            if isinstance(module, (RowParallelLinear, ColumnParallelLinear)):
+                module.distributed_matmul = make_distributed_matmul(
+                    module._direction,
+                    impl,
+                    precision=module.precision,
+                    config=self.config,
+                    weight_layout=module.sharding_layout,
+                )
+        return self
 
     def apply_lora_to_layers(
         self: Self,

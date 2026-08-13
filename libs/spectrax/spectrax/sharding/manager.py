@@ -234,6 +234,7 @@ class PartitionAxis:
     decode_head_axis: ct.AxisType = ct.NOT_GIVEN
     decode_kv_head_axis: ct.AxisType = ct.NOT_GIVEN
     decode_key_sequence_axis: ct.AxisType = ct.NOT_GIVEN
+    decode_hidden_state_axis: ct.AxisType = ct.NOT_GIVEN
     decode_attention_dim_axis: ct.AxisType = None
     decode_attention_kv_dim_axis: ct.AxisType = None
 
@@ -265,6 +266,7 @@ class PartitionAxis:
         "batch_axis": "decode_batch_axis",
         "query_sequence_axis": "decode_query_sequence_axis",
         "key_sequence_axis": "decode_key_sequence_axis",
+        "hidden_state_axis": "decode_hidden_state_axis",
         "head_axis": "decode_head_axis",
         "kv_head_axis": "decode_kv_head_axis",
         "attention_dim_axis": "decode_attention_dim_axis",
@@ -547,6 +549,11 @@ class PartitionAxis:
         resolve_field("decode_head_axis", lambda: get_resolved("head_axis"))
         resolve_field("decode_kv_head_axis", lambda: get_resolved("kv_head_axis"))
         resolve_field("decode_key_sequence_axis", lambda: get_resolved("key_sequence_axis"))
+        # Decode-mode activations are tiny (a few tokens x hidden); keeping
+        # them sharded costs latency-bound collectives at every consumer.
+        # Default to replicated, mirroring decode_query_sequence_axis; pass
+        # an explicit axis to opt back into sharded decode hidden states.
+        resolve_field("decode_hidden_state_axis", lambda: None)
 
         for field in dataclasses.fields(self):
             if field.name not in resolved_values:
@@ -650,7 +657,15 @@ class PartitionAxis:
                             sub_gen_attr = self._STANDARD_TO_GENERATION_ATTR_MAP.get(sub_standard)
                             if sub_gen_attr and hasattr(self, sub_gen_attr):
                                 sub_gen_val = getattr(self, sub_gen_attr)
-                                if sub_gen_val is not None and sub_gen_val is not ct.NOT_GIVEN:
+                                if sub_gen_val is not ct.NOT_GIVEN:
+                                    # `__post_init__` already collapsed every
+                                    # NOT_GIVEN decode field onto its standard
+                                    # counterpart, so in decode mode the
+                                    # decode attribute is authoritative — a
+                                    # `None` there is a real "replicated in
+                                    # decode" override, not an absent value.
+                                    # Testing for None instead would make the
+                                    # override inexpressible.
                                     sub_target = sub_gen_attr
                                     any_changed = True
                         gen_composite.append(sub_target)
@@ -664,7 +679,17 @@ class PartitionAxis:
                         gen_attr_name = self._STANDARD_TO_GENERATION_ATTR_MAP.get(standard_rule)
                         if gen_attr_name and hasattr(self, gen_attr_name):
                             gen_val = getattr(self, gen_attr_name)
-                            if gen_val is not None and gen_val is not ct.NOT_GIVEN:
+                            if gen_val is not ct.NOT_GIVEN:
+                                # See the composite branch above: after
+                                # `__post_init__` the decode attribute is
+                                # always authoritative in decode mode, and a
+                                # `None` there means replicated. Three fields
+                                # ship `None` by declaration —
+                                # decode_query_sequence_axis,
+                                # decode_attention_dim_axis and
+                                # decode_attention_kv_dim_axis — so decode
+                                # windows keep those axes replicated rather
+                                # than inheriting sp/tp from the standard rule.
                                 target_rule = gen_attr_name
 
             mesh_axis_rule = self._resolve_axis_rule(target_rule)

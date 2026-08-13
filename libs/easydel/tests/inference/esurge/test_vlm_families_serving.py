@@ -204,12 +204,20 @@ def _greedy_teacher_forced(model, prompt_ids: list[int], n: int, **mm_kwargs) ->
     Returns:
         The ``n`` greedily selected continuation token ids.
     """
+    from easydel.utils.inference_mode import set_inference_mode
+
     cur = list(prompt_ids)
     assert len(cur) + n <= _REFERENCE_PAD_LEN, "reference pad length too small for this prompt"
     toks: list[int] = []
     for _ in range(n):
         padded = cur + [0] * (_REFERENCE_PAD_LEN - len(cur))
-        out = model(input_ids=jnp.asarray([padded], dtype=jnp.int32), **mm_kwargs)
+        # Inference-mode scope matches production generate()/eSurge traces:
+        # the fused-MoE batch-spec drop for B=1 batches that cannot divide
+        # the (dp, fsdp) batch group is inference-gated (training keeps the
+        # loud shard_map error), and this dense forward IS an inference
+        # reference.
+        with set_inference_mode():
+            out = model(input_ids=jnp.asarray([padded], dtype=jnp.int32), **mm_kwargs)
         row = out.logits[0, len(cur) - 1]
         assert bool(jnp.isfinite(row).all()), "non-finite logits in teacher-forced reference"
         nxt = int(jnp.argmax(row))

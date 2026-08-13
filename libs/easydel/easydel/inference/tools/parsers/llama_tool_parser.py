@@ -138,6 +138,19 @@ class Llama3JsonToolParser(ToolParser):
             r"{[^{}]*(?:{[^{}]*}[^{}]*)*}(?:\s*;\s*{[^{}]*(?:{[^{}]*}[^{}]*)*})*", re.DOTALL
         )
 
+    def get_tool_machinery_hints(self) -> Sequence[str]:
+        """Include the bare-JSON prefix: this parser accepts markerless calls.
+
+        Both :meth:`extract_tool_calls` (``"{" in model_output``) and
+        :meth:`extract_tool_calls_streaming` (``current_text.startswith("{")``)
+        accept tool calls with no ``<|python_tag|>`` marker, so the
+        delegating parser's machinery gate must engage on a plain ``{``.
+        """
+        hints = list(super().get_tool_machinery_hints())
+        if "{" not in hints:
+            hints.append("{")
+        return tuple(hints)
+
     def extract_tool_calls(self, model_output: str, request: ChatCompletionRequest) -> ExtractedToolCallInformation:
         """Extract tool calls from a complete Llama model response.
 

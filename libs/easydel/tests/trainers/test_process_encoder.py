@@ -184,11 +184,14 @@ def test_trailing_features_are_inert_in_the_merge():
     exact = jnp.asarray(np.random.default_rng(1).normal(size=(3, hidden)), dtype=jnp.float32)
 
     merged_exact = BaseVisionLanguageModule.merge_multimodal_embeddings(
-        input_ids=input_ids, inputs_embeds=inputs_embeds, multimodal_embeddings=exact,
+        input_ids=input_ids,
+        inputs_embeds=inputs_embeds,
+        multimodal_embeddings=exact,
         placeholder_token_id=placeholder,
     )
     merged_padded = BaseVisionLanguageModule.merge_multimodal_embeddings(
-        input_ids=input_ids, inputs_embeds=inputs_embeds,
+        input_ids=input_ids,
+        inputs_embeds=inputs_embeds,
         multimodal_embeddings=pad_features_to_constant(exact, 32),
         placeholder_token_id=placeholder,
     )

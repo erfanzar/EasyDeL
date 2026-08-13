@@ -147,7 +147,7 @@ PROMPT_ONLY_SCORING_MODEL_INPUT_KEYS = frozenset(
 )
 
 _ScheduledLossFn = tp.Callable[[tp.Any, collections.abc.Mapping[str, jax.Array]], jax.Array]
-_ScheduledValueAndGradFn = tp.Callable[[tp.Any, dict], tuple[jax.Array, tp.Any]]
+_ScheduledValueAndGradFn = tp.Callable[[tp.Any, dict], tuple[jax.Array, tp.Any, tp.Any]]
 _SCHEDULED_LOSS_ADAPTERS: dict[tuple[str, str], ScheduledLossAdapter] = {}
 _SCHEDULED_AUXILIARY_CACHE: dict[tuple[int, int], tp.Callable[..., tp.Any]] = {}
 _SCHEDULED_AUX_PIPELINE_EXECUTOR: list[tp.Any] = []
@@ -322,12 +322,27 @@ class ScheduledLossAdapter:
             Optional pre-processor invoked on every call to produce the
             mapping that flows into the compiled loss. ``None`` means the
             untouched ``ScheduledStepCall.batch`` is forwarded as-is.
+        has_aux (bool): When ``True``, ``make_loss`` builds a closure that
+            returns ``(loss, aux_dict)`` where ``aux_dict`` maps metric
+            names (e.g. ``"z_loss"``, ``"accuracy"``) to scalar arrays
+            computed in the terminal pipeline stage. The scheduled VJP
+            reduces them across microbatches with the same weights as the
+            loss and threads them into the step's :class:`LossMetrics`.
+        make_microbatch_weight (Callable | None): Optional factory that,
+            given the call context, returns a ``(tree, batch) -> Array``
+            callable yielding one microbatch's scalar loss weight (its
+            valid-token count for token-mean losses). When provided, the
+            scheduled loss/gradients become the weight-weighted global
+            mean over microbatches — matching the non-pipelined (SPMD)
+            estimator instead of the uniform mean-of-means.
     """
 
     name: str
     make_loss: tp.Callable[[ScheduledStepCall], _ScheduledLossFn]
     make_cache_key: tp.Callable[[ScheduledStepCall], tuple[tp.Any, ...]]
     prepare_batch: tp.Callable[[ScheduledStepCall], collections.abc.Mapping[str, jax.Array]] | None = None
+    has_aux: bool = False
+    make_microbatch_weight: tp.Callable[[ScheduledStepCall], tp.Callable[..., tp.Any]] | None = None
 
 
 @dataclasses.dataclass
@@ -396,6 +411,9 @@ class _ScheduledValueAndGradCompiler:
             return self.cached_value_and_grad
 
         loss_fn = self.adapter.make_loss(call)
+        weight_fn = None
+        if self.adapter.make_microbatch_weight is not None:
+            weight_fn = self.adapter.make_microbatch_weight(call)
         scheduled_loss = spx.jit(
             loss_fn,
             mesh=self.mesh,
@@ -403,7 +421,13 @@ class _ScheduledValueAndGradCompiler:
             static_argnums=(),
             batch_argnums=self.batch_argnums,
         )
-        scheduled_value_and_grad = spx.sxvalue_and_grad(scheduled_loss, argnums=0)
+        has_aux = bool(self.adapter.has_aux)
+        scheduled_value_and_grad = spx.sxvalue_and_grad(
+            scheduled_loss,
+            argnums=0,
+            has_aux=has_aux,
+            microbatch_weight_fn=weight_fn,
+        )
 
         def value_and_grad(tree, batch):
             """Run the scheduled value-and-grad and unwrap the gradient tuple.
@@ -413,11 +437,16 @@ class _ScheduledValueAndGradCompiler:
                 batch: The minibatch dictionary forwarded to the loss.
 
             Returns:
-                A ``(loss, gradients)`` tuple where ``gradients`` matches
-                the structure of ``tree``.
+                A ``(loss, gradients, aux)`` tuple where ``gradients``
+                matches the structure of ``tree`` and ``aux`` is the
+                adapter's auxiliary-metric mapping (``None`` without
+                ``has_aux``).
             """
+            if has_aux:
+                (loss, aux), (gradients,) = scheduled_value_and_grad(tree, batch)
+                return loss, gradients, aux
             loss, (gradients,) = scheduled_value_and_grad(tree, batch)
-            return loss, gradients
+            return loss, gradients, None
 
         self.cached_key = key
         self.cached_value_and_grad = value_and_grad
@@ -644,6 +673,9 @@ class _ScheduledValueAndGradAndApplyCompiler:
             return self.cached_fused
 
         loss_fn = self.adapter.make_loss(call)
+        weight_fn = None
+        if self.adapter.make_microbatch_weight is not None:
+            weight_fn = self.adapter.make_microbatch_weight(call)
         scheduled_loss = spx.jit(
             loss_fn,
             mesh=self.mesh,
@@ -651,7 +683,12 @@ class _ScheduledValueAndGradAndApplyCompiler:
             static_argnums=(),
             batch_argnums=self.batch_argnums,
         )
-        scheduled_vga = spx.sxvalue_and_grad_and_apply(scheduled_loss, argnums=0)
+        scheduled_vga = spx.sxvalue_and_grad_and_apply(
+            scheduled_loss,
+            argnums=0,
+            has_aux=bool(self.adapter.has_aux),
+            microbatch_weight_fn=weight_fn,
+        )
 
         def fused_step(tree, batch, opt_state, learning_rate_fn, apply_fn):
             """Run the scheduled fused value-and-grad-and-apply.
@@ -2265,6 +2302,7 @@ def _apply_stage_local_gradients(
     loss: jax.Array,
     loss_config: LossConfig | None,
     learning_rate_fn: tp.Any,
+    aux: collections.abc.Mapping[str, tp.Any] | None = None,
 ) -> tuple[EasyDeLState, LossMetrics]:
     """Apply stage-local gradients via the optimizer's PP-aware update path.
 
@@ -2280,6 +2318,9 @@ def _apply_stage_local_gradients(
         loss_config: Optional :class:`LossConfig`; ``break_on_nan`` is
             consulted.
         learning_rate_fn: Schedule function for the optimizer.
+        aux: Optional auxiliary-metric mapping from the scheduled VJP
+            (``z_loss``, ``accuracy``, ...) threaded into the returned
+            :class:`LossMetrics`.
 
     Returns:
         ``(new_state, metrics)`` after applying the optimizer update; or
@@ -2290,8 +2331,14 @@ def _apply_stage_local_gradients(
         RuntimeError: If the state's optimizer is missing or does not
             implement :meth:`apply_gradients_stage_local`.
     """
+    aux = aux or {}
     metrics = update_metrics(
-        metrics=LossMetrics(loss=loss),
+        metrics=LossMetrics(
+            loss=loss,
+            z_loss=aux.get("z_loss"),
+            accuracy=aux.get("accuracy"),
+            weight_sum=aux.get("weight_sum"),
+        ),
         learning_rate_fn=learning_rate_fn,
         step=state.step,
         gradients=None,
@@ -2334,11 +2381,12 @@ def _run_scheduled_value_and_grad(
     batch: dict,
     batch_size: int,
     minibatch_size: int,
-) -> tuple[jax.Array, tp.Any]:
+) -> tuple[jax.Array, tp.Any, tp.Any]:
     """Run the scheduled value-and-grad with optional gradient accumulation.
 
     When ``batch_size > minibatch_size``, the input batch is split into
-    equal-sized minibatches and the gradients are averaged.
+    equal-sized minibatches and the gradients (and aux metrics) are
+    averaged — matching the non-scheduled ``minibatch_call`` estimator.
 
     Args:
         value_and_grad: The compiled scheduled value-and-grad callable.
@@ -2348,7 +2396,8 @@ def _run_scheduled_value_and_grad(
         minibatch_size: Size of each accumulation step.
 
     Returns:
-        ``(loss, gradients)`` aggregated across all accumulation steps.
+        ``(loss, gradients, aux)`` aggregated across all accumulation
+        steps (``aux`` is ``None`` for adapters without aux metrics).
     """
     num_accum_steps = batch_size // minibatch_size
     if num_accum_steps == 1:
@@ -2356,6 +2405,7 @@ def _run_scheduled_value_and_grad(
 
     loss_acc = None
     grad_acc = None
+    aux_acc = None
     for accum_idx in range(num_accum_steps):
         minibatch = _slice_batch_for_scheduled_step(
             batch,
@@ -2363,14 +2413,22 @@ def _run_scheduled_value_and_grad(
             accum_idx * minibatch_size,
             minibatch_size,
         )
-        loss_i, gradients_i = value_and_grad(graphstate, minibatch)
+        loss_i, gradients_i, aux_i = value_and_grad(graphstate, minibatch)
         loss_acc = loss_i if loss_acc is None else loss_acc + loss_i
         grad_acc = gradients_i if grad_acc is None else jax.tree_util.tree_map(jnp.add, grad_acc, gradients_i)
+        if aux_i is not None:
+            aux_acc = aux_i if aux_acc is None else jax.tree_util.tree_map(jnp.add, aux_acc, aux_i)
 
     inv_steps = jnp.asarray(1.0 / num_accum_steps, dtype=jnp.float32)
     if loss_acc is None or grad_acc is None:
         raise ValueError("Gradient accumulation produced no minibatches.")
-    return loss_acc * inv_steps, jax.tree_util.tree_map(lambda x: x * inv_steps, grad_acc)
+    if aux_acc is not None:
+        aux_acc = jax.tree_util.tree_map(lambda x: x * inv_steps, aux_acc)
+    return (
+        loss_acc * inv_steps,
+        jax.tree_util.tree_map(lambda x: x * inv_steps, grad_acc),
+        aux_acc,
+    )
 
 
 def _compile_scheduled_training_step(
@@ -2482,7 +2540,7 @@ def _compile_scheduled_training_step(
 
         value_and_grad = scheduled_vag.get(call)
         _t_vag = time.perf_counter()
-        loss, gradients = _run_scheduled_value_and_grad(
+        loss, gradients, aux = _run_scheduled_value_and_grad(
             value_and_grad=value_and_grad,
             graphstate=state.graphstate,
             batch=batch,
@@ -2491,6 +2549,8 @@ def _compile_scheduled_training_step(
         )
         _log_sched_section("value_and_grad (student fwd+bwd)", _t_vag, (loss, gradients))
         loss = _mpmd_host_replicate_scalar(loss)
+        if aux is not None:
+            aux = {key: _mpmd_host_replicate_scalar(value) for key, value in dict(aux).items()}
         _t_opt = time.perf_counter()
         out = _apply_stage_local_gradients(
             state=state,
@@ -2498,6 +2558,7 @@ def _compile_scheduled_training_step(
             loss=loss,
             loss_config=loss_config,
             learning_rate_fn=learning_rate_fn,
+            aux=aux,
         )
         _log_sched_section("apply_stage_local_gradients (opt)", _t_opt, out)
         return out

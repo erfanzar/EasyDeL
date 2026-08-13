@@ -358,8 +358,8 @@ class MixtralSparseMoeBlock(BaseMoeModule):
             hidden_state=hidden_state,
             gate_layer=self.gate,
             expert_layer=self.experts,
-            gate_up_kernel=self.experts.gate_up_proj.weight.value,
-            wd_kernel=self.experts.w2.weight.value,
+            gate_up_kernel=self.experts.gate_up_proj.kernel_view(),
+            wd_kernel=self.experts.w2.kernel_view(),
             act_fn=self.experts.act_fn,
         )
         return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")

@@ -76,7 +76,7 @@ from easydel.caching import (
     UnifiedAttentionCacheView,
 )
 from easydel.infra.base_config import EasyDeLBaseConfig
-from easydel.infra.sharding import StageMesh, resolve_stage_mesh
+from easydel.infra.sharding import StageMesh, inference_mode_forces_decode, resolve_stage_mesh
 from easydel.infra.utils import AttnMaskDetail, AttnMaskType
 from easydel.operations import AttentionOutput, OperationMetadata, OperationRegistry, ScaledDotProductAttn
 
@@ -1541,7 +1541,7 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
         )  # pyright: ignore[reportReturnType]
 
     def shard_attention_prod(
-        self, attn_output: Float[JArray, "batch seq heads dim"]
+        self, attn_output: Float[JArray, "batch seq heads dim"], pre_projection: bool = False
     ) -> Float[JArray, "batch seq heads dim"]:
         """Constrain the attention output to the model's hidden-state sharding.
 
@@ -1553,11 +1553,21 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
             attn_output: Attention output tensor, typically of shape
                 ``[batch, seq, num_heads * head_dim]`` (post-merge) or
                 ``[batch, seq, hidden]`` (post-output-projection).
+            pre_projection: Whether this is the constraint BEFORE the output
+                projection.  That tensor is the projection's TP-contracted
+                operand, not the residual stream — inside a decode-replicated
+                scope forcing the (replicated) hidden layout onto it inserts a
+                wasted head all-gather right before o_proj re-slices, so the
+                constraint is skipped and the kernel's head sharding flows
+                into the projection directly.
 
         Returns:
             ``attn_output`` re-constrained to the configured hidden-state
-            sharding spec.
+            sharding spec (or unchanged for the pre-projection tensor in a
+            decode-replicated scope).
         """
+        if pre_projection and inference_mode_forces_decode():
+            return attn_output
         return tp.cast(
             JArray,
             apply_logical_sharding(

@@ -19,9 +19,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import spectrax as spx
-from jax.sharding import Mesh, NamedSharding, PartitionSpec
-from spectrax.common_types import ColumnWise, RowWise
-
 from easydel.infra.sharding import AxisPolicy, TensorLayout
 from easydel.layers._sharding import resolve_safe_sharding
 from easydel.layers.linears._linear import ColumnParallelLinear
@@ -32,6 +29,8 @@ from easydel.layers.linears._linear_quantized import (
 )
 from easydel.layers.quantization._configs import QuantizationConfig, QuantizationType
 from easydel.layers.quantization._quants import EasyQuantizer
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from spectrax.common_types import ColumnWise, RowWise
 
 
 def _variable_layout_axes(var) -> tuple[object | None, ...] | None:
@@ -77,6 +76,36 @@ def test_column_parallel_nf4_quantized_metadata_layout():
     assert _variable_layout_axes(layer.quant_scales) == TensorLayout.from_any(ColumnWise).axes
     assert _variable_layout_axes(layer.quant_biases) == TensorLayout.from_any(ColumnWise).axes
     assert _variable_layout_axes(layer.bias) == TensorLayout.from_any((None,)).axes
+
+
+@pytest.mark.parametrize(
+    ("cls", "base"),
+    [(RowParallelLinearQuantized, RowWise), (ColumnParallelLinearQuantized, ColumnWise)],
+)
+def test_channelwise_scales_declare_no_contraction_axis_placement(cls, base):
+    """Channelwise scales are ``[1, out]``, so axis 0 must carry no placement.
+
+    The grouped modes store ``[in // group, out]`` scales, where axis 0 is a
+    real reduced contraction axis and the Row/ColumnWise markers are right.
+    Channelwise reduces the whole axis away. ``resolve_safe_sharding``
+    currently rescues the mismatch by refusing to place a size-1 dim on a
+    larger mesh axis, so this pins the *declared* layout — the stacked-expert
+    twin (``ParallelMoELinearQuantized``) declares it correctly and the dense
+    path should not rely on a downstream sanitizer to agree with it.
+    """
+    layer = cls(
+        in_features=128,
+        out_features=256,
+        config=QuantizationConfig(dtype=QuantizationType.CHANNELWISE, bits=8),
+        use_bias=False,
+        rngs=spx.Rngs(0),
+    )
+
+    assert layer.quant_scales.value.shape == (1, 256)
+    base_axes = TensorLayout.from_any(base).axes
+    assert _variable_layout_axes(layer.quant_kernel) == base_axes
+    # Output axis keeps the base placement; the collapsed contraction axis loses it.
+    assert _variable_layout_axes(layer.quant_scales) == (None, base_axes[1])
 
 
 def test_quantized_metadata_layout_keeps_kernel_sharded_when_scales_fallback():

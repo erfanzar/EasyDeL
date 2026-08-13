@@ -82,6 +82,7 @@ from easydel.layers import (
     RowParallelMoELinear,
     dense_gate_up_layout,
     dense_qkv_layout,
+    gated_mlp_forward,
     moe_down_projection_reform_param,
     moe_fused_gate_up_reform_param,
     split_fused_gate_up_projection,
@@ -230,6 +231,8 @@ class MiniMaxM3VLDenseMLP(spx.Module):
         self.precision = precision
         self.swiglu_alpha = config.swiglu_alpha
         self.swiglu_limit = config.swiglu_limit
+        self.fused_act_name = "swiglu_oai"
+        self.fused_act_params = (float(config.swiglu_alpha), float(config.swiglu_limit))
         intermediate_size = intermediate_size if intermediate_size is not None else config.dense_intermediate_size
         self.gate_up_proj = ColumnParallelLinear(
             config.hidden_size,
@@ -266,29 +269,16 @@ class MiniMaxM3VLDenseMLP(spx.Module):
     def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jnp.ndarray:
         """Apply the clamped SwiGLU-OAI feed-forward transformation.
 
+        Delegates to :func:`easydel.layers.gated_mlp_forward`; the declared
+        ``swiglu_oai`` combine runs on both the fused and fallback paths.
+
         Args:
             hidden_states: Input tensor ``[batch, seq_len, hidden_dim]``.
 
         Returns:
             Transformed hidden states ``[batch, seq_len, hidden_dim]``.
         """
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
-        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
-        intermediate = checkpoint_name(
-            _swiglu_oai(gate, up, alpha=self.swiglu_alpha, limit=self.swiglu_limit), "mlp_gate"
-        )
-        hidden_states = checkpoint_name(self.down_proj(intermediate), "mlp_down")
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        return checkpoint_name(hidden_states, "mlp_output")
+        return gated_mlp_forward(self, hidden_states)
 
 
 class MiniMaxM3VLExperts(spx.Module):
@@ -619,8 +609,8 @@ class MiniMaxM3VLSparseMoeBlock(BaseMoeModule):
             hidden_state=hidden_states,
             gate_layer=self.gate,
             expert_layer=self.experts,
-            gate_up_kernel=self.experts.gate_up_proj.weight.value,
-            wd_kernel=self.experts.down_proj.weight.value,
+            gate_up_kernel=self.experts.gate_up_proj.kernel_view(),
+            wd_kernel=self.experts.down_proj.kernel_view(),
             act_fn=self.experts.act_fn,
             ffn_activation=ffn_activation,
             hooks=hooks,
@@ -1309,9 +1299,30 @@ class MiniMaxM3VLTextModel(EasyDeLBaseModule):
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
+        # Router-logit aggregation grows a Python tuple per layer, which
+        # lax.scan cannot carry — collecting it forces the trace path too.
+        trace_layers = self._layer_scan_trace(
+            False,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache or bool(output_router_logits),
+        )
+        cache_views = views if trace_layers else None
+        # Hoisted out of the loop body: the caching property must not be
+        # first materialized inside the lax.scan trace (tracer leak).
+        frequencies = self.frequencies
+
         def _layer_loop(block, carry):
-            """Apply a single decoder layer inside the layer-stack scan."""
-            hidden_states, all_hidden_states, all_attentions, all_router_logits, idx = carry
+            """Apply a single decoder layer inside the layer-stack scan.
+
+            Carry layout: ``(hidden_states, cv, all_hidden_states,
+            all_attentions, all_router_logits, idx)``.
+            """
+            hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -1321,27 +1332,33 @@ class MiniMaxM3VLTextModel(EasyDeLBaseModule):
                     mask_info=mask_info,
                     position_ids=position_ids,
                     mode=mode,
-                    cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
+                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
                     cache_metadata=cache_metadata,
                     output_attentions=output_attentions,
                     output_router_logits=output_router_logits,
-                    frequencies=self.frequencies,
+                    frequencies=frequencies,
                 )
             hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
 
-            self._layer_cache_view_update(None, idx, layer_outputs.cache_view, enabled=True, cache=past_key_values)
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                layer_outputs.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
             if output_router_logits and layer_outputs.router_logits is not None:
                 all_router_logits += (layer_outputs.router_logits,)
 
-            return hidden_states, all_hidden_states, all_attentions, all_router_logits, idx + 1
+            return hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx + 1
 
-        hidden_states, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
+        hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
             _layer_loop,
-            (hidden_states, all_hidden_states, all_attentions, all_router_logits, 0),
-            trace=True,
+            (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
+            trace=trace_layers,
         )
         hidden_states = checkpoint_name(self.norm(hidden_states), "model_output")
 

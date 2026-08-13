@@ -74,6 +74,7 @@ from easydel.layers import (
     RowParallelLinear,
     RowParallelMoELinear,
     dense_gate_up_layout,
+    gated_mlp_forward,
     moe_down_projection_reform_param,
     moe_fused_gate_up_reform_param,
     split_fused_gate_up_projection,
@@ -145,6 +146,39 @@ class KimiRMSNorm(spx.Module):
 SITU_ACTIVATION = "situ"
 
 
+def resolve_situ_params(config: KimiLinearConfig) -> tuple[float, float]:
+    """Return the ``(beta, linear_beta)`` pair every SITU consumer must use.
+
+    Single source of truth for the two SITU scales, because they are read
+    from three places that MUST agree: the dense :class:`KimiMLP` fused
+    declaration, the fallback composition, and the routed experts'
+    ``ffn_activation``. The defaulting is ``is None``, not truthiness — an
+    explicitly configured ``0.0`` is a real value, and coercing it to ``1.0``
+    in one consumer while another honors it made the dense MLP and the
+    experts compute different functions.
+
+    ``linear_beta`` uses ``0.0`` as its "no linear-branch squash" sentinel,
+    matching ejkernel's ``resolve_mlp_combine("situ", ...)`` contract.
+
+    Args:
+        config: Model configuration.
+
+    Returns:
+        ``(beta, linear_beta)`` as plain floats.
+
+    Raises:
+        ValueError: If ``activation_situ_beta`` is non-positive; the gate
+            branch divides by it, so ``0.0`` would yield NaN activations
+            rather than a usable model.
+    """
+    beta = getattr(config, "activation_situ_beta", None)
+    linear_beta = getattr(config, "activation_situ_linear_beta", None)
+    beta = 1.0 if beta is None else float(beta)
+    if beta <= 0.0:
+        raise ValueError(f"activation_situ_beta must be > 0 (the SITU gate divides by it); got {beta}.")
+    return beta, 0.0 if linear_beta is None else float(linear_beta)
+
+
 def situ_and_mul(
     gate: jnp.ndarray,
     up: jnp.ndarray,
@@ -168,8 +202,10 @@ def situ_and_mul(
         gate: Gate branch of the fused projection.
         up: Linear branch of the fused projection.
         beta: Saturation scale for the gate branch.
-        linear_beta: Saturation scale for the linear branch; ``None`` leaves
-            ``up`` untouched.
+        linear_beta: Saturation scale for the linear branch; ``None`` or
+            ``0.0`` leaves ``up`` untouched. The falsy-means-disabled
+            convention matches ejkernel's ``resolve_mlp_combine("situ", ...)``
+            so the fused and fallback paths compute the same function.
 
     Returns:
         The activated product, in ``gate``'s dtype.
@@ -178,7 +214,7 @@ def situ_and_mul(
     gate_f32 = gate.astype(jnp.float32)
     up_f32 = up.astype(jnp.float32)
     activated = beta * jnp.tanh(gate_f32 / beta) * jax.nn.sigmoid(gate_f32)
-    if linear_beta is not None:
+    if linear_beta:
         up_f32 = linear_beta * jnp.tanh(up_f32 / linear_beta)
     return (activated * up_f32).astype(out_dtype)
 
@@ -198,9 +234,8 @@ def resolve_gated_activation(config: KimiLinearConfig) -> typing.Callable[[jnp.n
         A callable combining the gate and linear branches.
     """
     if config.hidden_act == SITU_ACTIVATION:
-        beta = getattr(config, "activation_situ_beta", None) or 1.0
-        linear_beta = getattr(config, "activation_situ_linear_beta", None)
-        return functools.partial(situ_and_mul, beta=float(beta), linear_beta=linear_beta)
+        beta, linear_beta = resolve_situ_params(config)
+        return functools.partial(situ_and_mul, beta=beta, linear_beta=linear_beta)
     act_fn = ACT2FN[config.hidden_act]
     return lambda gate, up: act_fn(gate) * up
 
@@ -263,6 +298,11 @@ class KimiMLP(spx.Module):
             rngs=rngs,
         )
         self.act_fn = resolve_gated_activation(config)
+        if config.hidden_act == SITU_ACTIVATION:
+            # Same resolver `self.act_fn` and the routed experts use, so the
+            # declared combine and the composed one cannot drift apart.
+            self.fused_act_name = "situ"
+            self.fused_act_params = resolve_situ_params(config)
 
     @property
     def reform_param(self):
@@ -285,6 +325,9 @@ class KimiMLP(spx.Module):
         Returns:
             Array: Transformed hidden states of shape (batch, seq_len, hidden_dim).
         """
+        if getattr(self, "fused_act_name", None) is not None:
+            # SITU declared: the same combine runs on fused and fallback paths.
+            return gated_mlp_forward(self, hidden_states)
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -685,8 +728,8 @@ class KimiSparseMoeBlock(BaseMoeModule):
             gate_hidden_state=hidden_states if self.use_latent_moe else None,
             gate_layer=self.gate,
             expert_layer=self.experts,
-            gate_up_kernel=self.experts.gate_up_proj.weight.value,
-            wd_kernel=self.experts.down_proj.weight.value,
+            gate_up_kernel=self.experts.gate_up_proj.kernel_view(),
+            wd_kernel=self.experts.down_proj.kernel_view(),
             # SITU transforms both branches, so the engine gets the fused
             # (gate, up) callable rather than a unary activation.
             ffn_activation=self.experts.act_fn,
@@ -1750,18 +1793,36 @@ class KimiLinearModel(EasyDeLBaseModule):
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
+        # Router-logit aggregation grows a Python tuple per layer, which
+        # lax.scan cannot carry — collecting it forces the trace path too.
+        trace_layers = self._layer_scan_trace(
+            False,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache or bool(output_router_logits),
+        )
+        cache_views = views if trace_layers else None
+        # Hoisted out of the loop body: the caching property must not be
+        # first materialized inside the lax.scan trace (tracer leak).
+        frequencies = self.frequencies
+
         def _layer_loop(block, carry):
             """Body of the hybrid attention scan over Kimi-Linear layers.
 
             Each ``block`` may be either an MLA full-attention or a KDA
             linear-attention decoder layer; the per-layer cache view returned
             by :meth:`_layer_cache_view_at` adapts to the layer kind via
-            :class:`HybridCache`. The carry threads hidden states, optional
-            ``all_hidden_states`` / ``all_attentions`` tuples, MoE router
-            logits (when ``output_router_logits`` is set), and the layer
-            index. Returns the updated carry for the next iteration.
+            :class:`HybridCache`. The carry threads hidden states, the cache
+            view ``cv``, optional ``all_hidden_states`` / ``all_attentions``
+            tuples, MoE router logits (when ``output_router_logits`` is
+            set), and the layer index. Returns the updated carry for the
+            next iteration.
             """
-            hidden_states, all_hidden_states, all_attentions, all_router_logits, idx = carry
+            hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -1771,11 +1832,11 @@ class KimiLinearModel(EasyDeLBaseModule):
                     mask_info=mask_info,
                     position_ids=position_ids,
                     mode=mode,
-                    cache_view=self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values),
+                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
                     cache_metadata=cache_metadata,
                     output_attentions=output_attentions,
                     output_router_logits=output_router_logits,
-                    frequencies=self.frequencies,
+                    frequencies=frequencies,
                 )
 
             hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
@@ -1783,17 +1844,23 @@ class KimiLinearModel(EasyDeLBaseModule):
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
 
-            self._layer_cache_view_update(None, idx, layer_outputs.cache_view, enabled=True, cache=past_key_values)
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                layer_outputs.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
 
             if output_router_logits and layer_outputs.router_logits is not None:
                 all_router_logits += (layer_outputs.router_logits,)
 
-            return hidden_states, all_hidden_states, all_attentions, all_router_logits, idx + 1
+            return hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx + 1
 
-        hidden_states, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
+        hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
             _layer_loop,
-            (hidden_states, all_hidden_states, all_attentions, all_router_logits, 0),
-            trace=True,
+            (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
+            trace=trace_layers,
         )
         hidden_states = checkpoint_name(self.norm(hidden_states), "model_output")
 

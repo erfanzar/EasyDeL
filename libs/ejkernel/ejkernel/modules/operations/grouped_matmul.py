@@ -157,7 +157,12 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
     def create_shard_map_wrapper(
         self,
         lhs: Float[Array, "m k"],
-        rhs: Float[Array, "num_groups k n"] | Float[Array, "num_groups n k"] | Int[Array, "num_groups k n"] | Int[Array, "num_groups n k"],
+        rhs: (
+            Float[Array, "num_groups k n"]
+            | Float[Array, "num_groups n k"]
+            | Int[Array, "num_groups k n"]
+            | Int[Array, "num_groups n k"]
+        ),
         group_sizes: Int[Array, "num_groups_or_shards"],
         preferred_element_type: DTypeLike = jnp.float32,
         group_offset: Int[Array, "..."] | None = None,
@@ -216,7 +221,12 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
 
         def _wrapped_grouped_matmul(
             lhs: Float[Array, "m k"],
-            rhs: Float[Array, "num_groups k n"] | Float[Array, "num_groups n k"] | Int[Array, "num_groups k n"] | Int[Array, "num_groups n k"],
+            rhs: (
+                Float[Array, "num_groups k n"]
+                | Float[Array, "num_groups n k"]
+                | Int[Array, "num_groups k n"]
+                | Int[Array, "num_groups n k"]
+            ),
             group_sizes: Int[Array, "num_groups_or_shards"],
         ) -> Float[Array, "m n"]:
             """Shard-local grouped matmul forwarding to self.run."""
@@ -263,7 +273,12 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
     def run(
         self,
         lhs: Float[Array, "m k"],
-        rhs: Float[Array, "num_groups k n"] | Float[Array, "num_groups n k"] | Int[Array, "num_groups k n"] | Int[Array, "num_groups n k"],
+        rhs: (
+            Float[Array, "num_groups k n"]
+            | Float[Array, "num_groups n k"]
+            | Int[Array, "num_groups k n"]
+            | Int[Array, "num_groups n k"]
+        ),
         group_sizes: Int[Array, "num_groups_or_shards"],
         preferred_element_type: DTypeLike = jnp.float32,
         group_offset: Int[Array, "..."] | None = None,
@@ -355,7 +370,13 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
                 if mSize % cfg.block_m:
                     padded_size = cfg.block_m - mSize % cfg.block_m
                     lhs = jax.lax.pad(lhs, jnp.array(0.0, dtype=lhs.dtype), [(0, padded_size, 0), (0, 0, 0)])
-            tiling = (min(cfg.block_m, mSize), min(cfg.block_k, kSize), min(cfg.block_n, nSize))
+            if cfg.block_k > 0 and cfg.block_n > 0:
+                tiling = (min(cfg.block_m, mSize), min(cfg.block_k, kSize), min(cfg.block_n, nSize))
+            # block_k/block_n <= 0 is a sentinel: leave tiling=None so the
+            # kernel's own tiler runs (grouped_matmulv3's calculate_tiling
+            # handles non-128-aligned contractions the fixed 128 heuristic
+            # cannot). v1/v2 kernels reject tiling=None — only use the
+            # sentinel with use_v3.
 
         impl_kwargs = dict(
             lhs=lhs,
@@ -549,7 +570,12 @@ _grouped_matmul_executor: Executor[GroupedMatmulConfig, Array] = Executor(
 
 def grouped_matmul(
     lhs: Float[Array, "m k"],
-    rhs: Float[Array, "num_groups k n"] | Float[Array, "num_groups n k"] | Int[Array, "num_groups k n"] | Int[Array, "num_groups n k"],
+    rhs: (
+        Float[Array, "num_groups k n"]
+        | Float[Array, "num_groups n k"]
+        | Int[Array, "num_groups k n"]
+        | Int[Array, "num_groups n k"]
+    ),
     group_sizes: Int[Array, "num_groups_or_shards"],
     group_offset: Int[Array, "..."] | None = None,
     existing_out: Float[Array, "m n"] | None = None,
@@ -672,4 +698,44 @@ def grouped_matmul(
         in_specs=in_specs,
         out_specs=out_specs,
         _cfg=cfg,
+    )
+
+
+def grouped_matmul_w8a8(
+    lhs: Array,
+    rhs_codes: Array,
+    rhs_scales: Array,
+    group_sizes: Array,
+    *,
+    preferred_element_type: jnp.dtype = jnp.bfloat16,
+    tiling: tuple[int, int, int] | None = None,
+) -> Array:
+    """Grouped matmul with int8 weights and runtime-int8 activations.
+
+    Resolves the ``grouped_matmul_w8a8`` kernel from the registry (XLA-only
+    by design: TPU's native int8 ragged_dot custom call keeps its
+    near-roofline expert-streaming pipeline while halving weight HBM
+    traffic, so no Pallas variant is needed on the critical path).
+
+    Args:
+        lhs: Activations ``[m, k]``, rows sorted by group.
+        rhs_codes: Per-group int8 weight codes ``[num_groups, k, n]``.
+        rhs_scales: Per-group per-channel float32 scales ``[num_groups, 1, n]``.
+        group_sizes: Rows per group ``[num_groups]`` int32.
+        preferred_element_type: Output dtype.
+        tiling: Optional ``(tm, tk, tn)`` hint forwarded as XLA metadata.
+
+    Returns:
+        Output ``[m, n]``.
+    """
+    from ejkernel.kernels._registry import Platform
+
+    impl = kernel_registry.get("grouped_matmul_w8a8", platform=Platform.XLA, backend=Backend.ANY)
+    return impl(
+        lhs,
+        rhs_codes,
+        rhs_scales,
+        group_sizes,
+        preferred_element_type=preferred_element_type,
+        tiling=tiling,
     )

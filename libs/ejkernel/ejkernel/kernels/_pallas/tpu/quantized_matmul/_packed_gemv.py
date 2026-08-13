@@ -50,6 +50,8 @@ from jax import numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from ...._registry import Backend, Platform, kernel_registry
+
 __all__ = ["pack_int4_adjacent", "pack_int4_split_k", "packed_int4_gemv", "supports_int4_mxu", "w4a4_gemv"]
 
 
@@ -65,7 +67,7 @@ def supports_int4_mxu() -> bool:
     """
     try:
         return bool(pltpu.get_tpu_info().is_matmul_supported(jnp.int4, jnp.int4))
-    except Exception:  # noqa: BLE001 - no TPU / no info: not supported
+    except Exception:
         return False
 
 
@@ -91,6 +93,31 @@ def pack_int4_split_k(codes: jax.Array) -> jax.Array:
     low = unsigned[: k_dim // 2]
     high = unsigned[k_dim // 2 :]
     return low | (high << 4)
+
+
+def _n_tile_grid(n_dim: int, tile_n: int) -> int:
+    """Grid length covering every output column, partial trailing tile included.
+
+    ``n_dim // tile_n`` silently drops the trailing ``n_dim % tile_n`` columns:
+    no grid step ever assigns them, so the caller gets whatever was in the
+    output buffer for that slice. Real MLP widths are routinely non-divisible
+    (11008 with the default ``tile_n=512`` covers only 10752), so the grid
+    rounds up and Pallas clips the last block's loads and stores to the array
+    bounds — the padded lanes are computed and discarded, never written back.
+
+    Args:
+        n_dim: Output width.
+        tile_n: Output columns per grid step.
+
+    Returns:
+        Number of grid steps.
+
+    Raises:
+        ValueError: If ``tile_n`` is not positive.
+    """
+    if tile_n <= 0:
+        raise ValueError(f"tile_n must be positive, got {tile_n}.")
+    return -(-n_dim // tile_n)
 
 
 def _gemv_kernel(x_ref, w_ref, scale_ref, out_ref, *, chunk: int):
@@ -138,6 +165,7 @@ def _gemv_kernel(x_ref, w_ref, scale_ref, out_ref, *, chunk: int):
     out_ref[...] = ((acc - 8.0 * x_row_sum) * scale_ref[...]).astype(out_ref.dtype)
 
 
+@kernel_registry.register("packed_int4_gemv", Platform.PALLAS, Backend.TPU)
 @functools.partial(jax.jit, static_argnames=("tile_n", "chunk", "interpret"))
 def packed_int4_gemv(
     x: jax.Array,
@@ -162,7 +190,8 @@ def packed_int4_gemv(
         interpret: Run in Pallas interpret mode (CPU testing).
 
     Returns:
-        ``[m, n]`` in ``x``'s dtype.
+        ``[m, n]`` bf16 (activations are cast to bf16 before the kernel; the
+        XLA reference matches this output dtype).
 
     Raises:
         ValueError: On shape mismatch between ``x`` and ``w_packed``.
@@ -175,7 +204,7 @@ def packed_int4_gemv(
     scale = channel_scale.reshape(1, n_dim).astype(jnp.float32)
     x = x.astype(jnp.bfloat16)
 
-    grid = (n_dim // tile_n,)
+    grid = (_n_tile_grid(n_dim, tile_n),)
     return pl.pallas_call(
         functools.partial(_gemv_kernel, chunk=chunk),
         grid=grid,
@@ -221,6 +250,7 @@ def _w4a4_kernel(x_ref, w_ref, scale_ref, out_ref):
     out_ref[...] = (acc.astype(jnp.float32) * scale_ref[...]).astype(out_ref.dtype)
 
 
+@kernel_registry.register("w4a4_gemv", Platform.PALLAS, Backend.TPU)
 @functools.partial(jax.jit, static_argnames=("tile_n", "interpret"))
 def w4a4_gemv(
     x: jax.Array,
@@ -274,7 +304,7 @@ def w4a4_gemv(
 
     return pl.pallas_call(
         _w4a4_kernel,
-        grid=(n_dim // tile_n,),
+        grid=(_n_tile_grid(n_dim, tile_n),),
         in_specs=[
             pl.BlockSpec((m, k_dim), lambda j: (0, 0)),
             pl.BlockSpec((packed_k, tile_n), lambda j: (0, j)),

@@ -165,6 +165,24 @@ class DelegatingParser:
 
         self._tool_previous_text: str = ""
         self._tool_previous_token_ids: list[int] = []
+        # Once True, _tool_machinery_needed never bypasses again (see LATCH note there).
+        self._tool_machinery_latched: bool = False
+
+        # Parser-owned tool-start markers used to prescreen text before the
+        # expensive streaming tool machinery runs (which re-tokenizes the full
+        # accumulated text every delta — O(n^2) per request). Prefer the
+        # machinery-specific hints so parsers that accept markerless bare-JSON
+        # payloads (llama3_json, xlam, ...) can include "{" / "[" without
+        # polluting is_buffering_protocol. Empty hints (e.g. custom parsers
+        # without marker attributes) fail OPEN: the machinery always runs,
+        # preserving the historical contract.
+        hints_fn = getattr(tool_parser, "get_tool_machinery_hints", None)
+        if not callable(hints_fn):
+            hints_fn = getattr(tool_parser, "get_streaming_buffer_hints", None)
+        try:
+            self._tool_marker_hints: tuple[str, ...] = tuple(hints_fn()) if callable(hints_fn) else ()
+        except Exception:
+            self._tool_marker_hints = ()
         self._streamed_tool_call_state: dict[int, TrackedToolCallState] = {}
 
         self._content_committed: bool = False
@@ -314,6 +332,48 @@ class DelegatingParser:
             return fallback_content, reasoning
         return content, reasoning
 
+    def _tool_machinery_needed(self, content_text: str) -> bool:
+        """Decide whether the streaming tool machinery must run for this text.
+
+        Returns True when the parser exposes no start-marker hints (fail
+        open), when any full hint substring is present in the cumulative
+        visible text, or when the tail of the text is a proper prefix of a
+        hint (a marker split across streaming deltas). Otherwise the caller
+        takes the cheap pass-through path — the dominant case for outputs
+        that never emit tool syntax.
+
+        Args:
+            content_text: Cumulative visible content (post reasoning split).
+
+        Returns:
+            Whether to run the tool parser for this step.
+        """
+        # LATCH: once the machinery has engaged for this request it must stay
+        # engaged. Stateful parsers may buffer/withhold text during a false
+        # marker-prefix engagement; if the gate flipped off afterwards, the
+        # bypass path would advance the accumulated-content view past the
+        # withheld text and drop it from the client stream permanently (and
+        # ParsePhase could stick in BUFFERING).
+        if self._tool_machinery_latched:
+            return True
+        hints = self._tool_marker_hints
+        if not hints:
+            return True
+        if not content_text:
+            return False
+        for hint in hints:
+            if hint in content_text:
+                self._tool_machinery_latched = True
+                return True
+        tail = content_text[-32:]
+        for hint in hints:
+            limit = min(len(hint) - 1, len(tail))
+            for k in range(1, limit + 1):
+                if tail.endswith(hint[:k]):
+                    self._tool_machinery_latched = True
+                    return True
+        return False
+
     def process_delta(
         self,
         accumulated_text: str,
@@ -353,7 +413,11 @@ class DelegatingParser:
                 prev_token_ids=prev_token_ids,
             )
 
-        if self.tool_parser is not None and self.phase != ParsePhase.REASONING:
+        if (
+            self.tool_parser is not None
+            and self.phase != ParsePhase.REASONING
+            and self._tool_machinery_needed(content_text)
+        ):
             self._process_tool_delta(
                 result=result,
                 content_text=content_text,
@@ -366,6 +430,12 @@ class DelegatingParser:
             )
             if self.phase != ParsePhase.REASONING and content_delta:
                 result.delta_content = content_delta
+            if self.phase != ParsePhase.REASONING:
+                # Keep the tool parser's previous-text view current while the
+                # machinery gate passes text through, so the first engaged
+                # call sees a consistent (previous, current, delta) triple
+                # instead of previous_text="" against the full content.
+                self._tool_previous_text = content_text
 
         self._accumulated_reasoning = result.accumulated_reasoning
         self._raw_content_text = content_text
@@ -424,6 +494,10 @@ class DelegatingParser:
         else:
             result.accumulated_content = accumulated_text
 
+        # No machinery gate here: finalization is a single O(n) batch call
+        # (the gate exists to bound the O(n^2) *streaming* retokenization),
+        # and gating it on marker hints drops markerless bare-JSON tool
+        # calls (e.g. llama3_json's `{"name": ...}`) as plain content.
         if self.tool_parser is not None and content_for_tools:
             self._process_tool_final(result, content_for_tools)
 
@@ -614,6 +688,13 @@ class DelegatingParser:
         try:
             tool_current_token_ids = self._tokenize_for_tool_view(content_text)
             tool_delta_token_ids = self._tokenize_for_tool_view(content_delta) if content_delta else []
+            if self._tool_previous_text and not self._tool_previous_token_ids:
+                # The machinery gate keeps previous_text synced while
+                # bypassing but (deliberately) skips per-delta retokenization;
+                # reconstruct the previous ids ONCE at engagement so parsers
+                # that inspect previous_token_ids (e.g. ernie45's
+                # all-newlines check) see a consistent triple.
+                self._tool_previous_token_ids = self._tokenize_for_tool_view(self._tool_previous_text)
 
             delta_msg = self.tool_parser.extract_tool_calls_streaming(
                 previous_text=self._tool_previous_text,

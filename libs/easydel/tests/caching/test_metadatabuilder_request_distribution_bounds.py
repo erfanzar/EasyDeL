@@ -17,7 +17,6 @@ from types import SimpleNamespace
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from easydel.caching._metadatabuilder import AttentionMetadataBuilder
 from easydel.inference.esurge.runners.executors.batch_preparer import BatchMetadataPreparer
 from easydel.operations.kernels.multi_latent_ragged_page_attention import (
@@ -78,6 +77,17 @@ def test_attention_metadata_builder_paged_fields_use_prefill_end():
 
 
 def test_batch_preparer_packs_prefill_end_into_misc_buffer():
+    """The preparer packs the POSITIONAL distribution, not the counted one.
+
+    Same input as the two builder tests above, deliberately different answer.
+    ``BatchMetadataPreparer`` classifies slot-ordered rows with
+    :func:`compute_request_distribution_prefix`: row 0 is a 4-token prefill and
+    row 1 a decode, so there is no leading decode run and the distribution is
+    ``[0, 1, 2]``. The count-based helpers keep reporting ``[1, 2, 2]`` for the
+    same rows. Only the preparer feeds the live eSurge v3 path, where counting
+    a decode that is not positionally first desyncs the kernel and hangs the
+    device once a freed slot is reused by a prefill.
+    """
     metadata = SimpleNamespace(
         version="v3",
         get_max_num_seqs=lambda: 4,
@@ -114,4 +124,4 @@ def test_batch_preparer_packs_prefill_end_into_misc_buffer():
     )
 
     packed_misc_i32 = host_payload[6]
-    np.testing.assert_array_equal(packed_misc_i32[2:5], np.asarray([1, 2, 2], dtype=np.int32))
+    np.testing.assert_array_equal(packed_misc_i32[2:5], np.asarray([0, 1, 2], dtype=np.int32))

@@ -95,6 +95,7 @@ from .resource_manager import (
     RayResources,
     TpuAcceleratorConfig,
     available_cpu_cores,
+    set_forkify_disabled,
 )
 from .types import (
     DONE,
@@ -160,4 +161,5 @@ __all__ = (
     "run_docker_async",
     "run_docker_multislice",
     "run_docker_on_pod",
+    "set_forkify_disabled",
 )

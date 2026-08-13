@@ -226,14 +226,17 @@ class MambaConfig(EasyDeLBaseConfig):
     def layer_types(self) -> list[str]:
         """Layer-type schedule consumed by ``EasyDeLBaseModule`` for cache routing.
 
-        Pure Mamba models advertise the recurrent ``"mamba"`` layer type for every
-        block, which tells the cache machinery to allocate :class:`RecurrentCache`
-        slots (rolling conv window + SSM state) instead of KV pages.
+        Pure Mamba models advertise the recurrent ``"linear_attention"`` layer type
+        for every block, which tells the cache machinery to allocate
+        :class:`RecurrentCache` slots (rolling conv window + SSM state) instead of
+        KV pages. ``"linear_attention"`` (not ``"mamba"``) is used because it routes
+        identically in EasyDeL's layer-type matcher AND is accepted by upstream
+        ``transformers``' ``layer_types`` validator on HF-parity paths.
 
         Returns:
-            list[str]: ``["mamba"] * num_hidden_layers``.
+            list[str]: ``["linear_attention"] * num_hidden_layers``.
         """
-        return ["mamba"] * self.num_hidden_layers
+        return ["linear_attention"] * self.num_hidden_layers
 
     def get_mask_details(self):
         """Mamba blocks consume no attention mask metadata.

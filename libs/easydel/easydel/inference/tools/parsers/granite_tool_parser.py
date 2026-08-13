@@ -96,6 +96,18 @@ class GraniteToolParser(ToolParser):
         self.bot_token = "<|tool_call|>"
         self.bot_string = "<tool_call>"
 
+    def get_tool_machinery_hints(self) -> Sequence[str]:
+        """Include the bare-JSON array prefix: this parser accepts markerless calls.
+
+        Both extraction paths accept a plain ``[...]`` array with neither
+        ``<|tool_call|>`` nor ``<tool_call>`` present, so the delegating
+        parser's machinery gate must engage on a bare ``[``.
+        """
+        hints = list(super().get_tool_machinery_hints())
+        if "[" not in hints:
+            hints.append("[")
+        return tuple(hints)
+
     def extract_tool_calls(self, model_output: str, request: ChatCompletionRequest) -> ExtractedToolCallInformation:
         """Extract tool calls from complete model output.
 

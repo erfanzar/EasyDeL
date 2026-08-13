@@ -41,8 +41,6 @@ _VOCAB = 256
 _HIDDEN = 128
 
 
-
-
 def test_model_drafter_auto_resolves_mtp_with_tuned_defaults():
     """model.drafter('auto') on an MTP model returns the inline MTP drafter (K=4, persist on)."""
     model = make_tiny_model()
@@ -93,7 +91,9 @@ def test_elarge_drafter_section_chains_to_auto_discovery():
     dc = to_esurge_kwargs(cfg)["drafter_config"]
     assert dc["enabled"] is True
     assert dc["method"] == "auto"
-    drafter = _build_drafter(model=make_tiny_model(), drafter=None, drafter_config=dc, loading_kwargs=None, dtype=jnp.float32)
+    drafter = _build_drafter(
+        model=make_tiny_model(), drafter=None, drafter_config=dc, loading_kwargs=None, dtype=jnp.float32
+    )
     assert isinstance(drafter, Qwen3_5MTPDrafter)
     assert drafter.num_draft_tokens == 4
     assert drafter.persist_kv is True

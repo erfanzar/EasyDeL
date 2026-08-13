@@ -35,7 +35,7 @@ from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
 from easydel.infra.base_state import EasyDeLState
-from easydel.infra.loss_utils import LossConfig, LossMetrics
+from easydel.infra.loss_utils import ForCausalLMLoss, LossConfig, LossMetrics
 
 from ..training_utils import (
     ScheduledLossAdapter,
@@ -312,7 +312,7 @@ def _make_base_scheduled_loss(call):
     loss_type = call.get("loss_type", "nll")
 
     def scheduled_loss(tree, batch):
-        """Compute the base-trainer scalar loss for the scheduled adapter.
+        """Compute the base-trainer scheduled loss and auxiliary metrics.
 
         Args:
             tree: Current model parameter tree.
@@ -320,7 +320,9 @@ def _make_base_scheduled_loss(call):
                 minibatch (with optional ``labels`` field).
 
         Returns:
-            jax.Array: Scalar loss returned by ``module.compute_loss``.
+            tuple: ``(loss, aux)`` where ``loss`` is the scalar loss from
+            ``module.compute_loss`` and ``aux`` maps metric names
+            (``z_loss``, ``accuracy``) to terminal-stage scalars.
         """
         with jax.named_scope("easydel/trainer/base/scheduled_loss"):
             with jax.named_scope("easydel/trainer/base/scheduled_loss/bind_module"):
@@ -339,14 +341,170 @@ def _make_base_scheduled_loss(call):
                     )
                     outputs = outputs.replace(loss=metrics.loss)
                 else:
-                    outputs, _metrics = module.compute_loss(
+                    outputs, metrics = module.compute_loss(
                         labels=labels,
                         loss_config=loss_config,
                         **call_batch,
                     )
-            return outputs.loss
+            aux = {
+                name: value
+                for name, value in (("z_loss", metrics.z_loss), ("accuracy", metrics.accuracy))
+                if value is not None
+            }
+            if not aux:
+                # The scheduled runtime requires at least one aux output when the
+                # adapter declares has_aux; a detached copy of the loss keeps the
+                # output structure stable for loss functions without metrics.
+                aux = {"loss_detached": jax.lax.stop_gradient(outputs.loss)}
+            return outputs.loss, aux
 
     return scheduled_loss
+
+
+def _base_scheduled_weight_semantics(loss_config, loss_type: str) -> str | None:
+    """Classify whether the base-trainer loss is a valid-token mean.
+
+    The scheduled per-microbatch weighting reproduces the SPMD estimator
+    only when each microbatch's loss is ``sum(token_losses) / n_valid`` —
+    the default causal-LM normalization. Any other reduction keeps the
+    historical uniform microbatch mean.
+
+    Args:
+        loss_config: The step's :class:`LossConfig` (or ``None``).
+        loss_type: The base-trainer loss flavor (``"nll"`` or ``"dft"``).
+
+    Returns:
+        ``"valid_only"`` (mask = label validity), ``"masked"``
+        (mask = attention/loss weights AND validity), or ``None`` when
+        the loss is not a token-mean and weighting must stay uniform.
+    """
+    if loss_type == "dft":
+        return "valid_only"
+    if loss_config is None:
+        return "masked"
+    if getattr(loss_config, "mtp_only", False):
+        return None
+    reduction = getattr(loss_config, "reduction", None)
+    if reduction == "mean":
+        return "masked"
+    if reduction is not None:
+        return None
+    if bool(getattr(loss_config, "divide_weight_sum", False)):
+        return None
+    factor = getattr(loss_config, "loss_normalizing_factor", None)
+    name = getattr(factor, "value", factor)
+    if isinstance(name, str) and name in ("NUM_REAL_TARGET_TOKENS", "NO_WEIGHT_NUM_REAL_TARGET_TOKENS"):
+        return "masked"
+    return None
+
+
+def _model_uses_causal_lm_loss(call) -> bool:
+    """Whether the call's model routes ``compute_loss`` to ``ForCausalLMLoss``.
+
+    Resolved once at weight-fn build time (per adapter cache miss) from the
+    live trainer state on the scheduled call. Anything that cannot be
+    positively identified as the causal-LM loss — a non-CLM task head, a
+    custom ``loss_type`` on the config, or a call carrying no state — fails
+    closed so the scheduled reduction keeps the always-correct uniform
+    microbatch weighting.
+
+    Args:
+        call: Scheduled call descriptor (``ScheduledStepCall``-like).
+
+    Returns:
+        bool: ``True`` only when the model's ``loss_function`` is
+        ``ForCausalLMLoss``.
+    """
+    state = getattr(call, "state", None)
+    if state is None:
+        state = call.get("state")
+    try:
+        model = state.model if state is not None else None
+        loss_fn = getattr(model, "loss_function", None)
+    except Exception:
+        return False
+    # Identity first (robust to renames); the __name__ fallback keeps
+    # functools.partial / thin wrappers that preserve __name__ working.
+    if loss_fn is ForCausalLMLoss:
+        return True
+    return getattr(loss_fn, "__name__", None) == "ForCausalLMLoss"
+
+
+def _make_base_scheduled_weight(call):
+    """Build the per-microbatch valid-token weight for the base adapter.
+
+    Mirrors the denominator used by ``ForCausalLMLoss`` /
+    ``causal_lm_loss_chunked_lm_head``: shifted labels, ``ignore_index``
+    validity, ANDed with the shifted attention mask when present.
+
+    The weight only reproduces the causal-LM denominator: models whose
+    ``compute_loss`` routes to a different head loss (question answering,
+    token classification, ...) would get a silently WRONG weight through
+    the ``input_ids`` fallback, so any non-``ForCausalLMLoss`` model keeps
+    the historical uniform microbatch weighting (``None``).
+
+    Args:
+        call: Scheduled call descriptor providing ``loss_config``,
+            ``loss_type``, and the live trainer ``state``.
+
+    Returns:
+        tp.Callable | None: ``(tree, batch) -> Array`` scalar weight
+        callable, or ``None`` when the loss is not a token-mean (uniform
+        microbatch weighting is kept).
+    """
+    loss_config = call.get("loss_config")
+    loss_type = call.get("loss_type", "nll")
+    semantics = _base_scheduled_weight_semantics(loss_config, loss_type)
+    if semantics is None:
+        return None
+    if loss_type != "dft" and not _model_uses_causal_lm_loss(call):
+        # ``dft`` computes its own causal-LM metrics and never consults the
+        # model's loss function, so it keeps the valid-token weight.
+        return None
+    ignore_index = -100 if loss_config is None else int(loss_config.ignore_index)
+    # ``dft`` always shifts inside ``_dft_causal_lm_metrics`` regardless of
+    # ``loss_config.shift_tokens`` — the weight must shift with it.
+    shift = True if (loss_type == "dft" or loss_config is None) else bool(loss_config.shift_tokens)
+
+    def scheduled_weight(tree, batch):
+        """Return this microbatch's valid-token count as a scalar array.
+
+        Args:
+            tree: Model parameter tree (unused).
+            batch: Microbatch-sliced input mapping.
+
+        Returns:
+            jax.Array: Scalar float32 token count.
+        """
+        del tree
+        labels = batch.get("labels")
+        if labels is None:
+            labels = batch.get("input_ids")
+        if labels is None:
+            return jnp.asarray(1.0, dtype=jnp.float32)
+        labels = jnp.asarray(labels)
+        attention_mask = batch.get("attention_mask")
+        if shift and labels.ndim >= 2 and labels.shape[-1] > 1:
+            shift_labels = labels[..., 1:]
+            if attention_mask is not None and jnp.shape(attention_mask) == labels.shape:
+                attention_mask = attention_mask[..., 1:]
+        else:
+            shift_labels = labels
+        valid = (shift_labels != ignore_index).astype(jnp.float32)
+        if semantics == "valid_only":
+            return jnp.sum(valid)
+        # NOTE: ``decoder_loss_weights`` is deliberately NOT consulted here.
+        # The production dense CLM path (``ForCausalLMLoss``) derives its
+        # denominator from the attention mask and label validity only — no
+        # base-trainer batch producer emits ``decoder_loss_weights`` — so
+        # honoring it here would diverge from the loss it must mirror.
+        if attention_mask is not None and jnp.shape(attention_mask) == jnp.shape(shift_labels):
+            base = jnp.asarray(attention_mask, jnp.float32)
+        else:
+            base = valid
+        return jnp.sum(base * valid)
+
+    return scheduled_weight
 
 
 register_scheduled_loss_adapter(
@@ -355,5 +513,7 @@ register_scheduled_loss_adapter(
         name="base",
         make_loss=_make_base_scheduled_loss,
         make_cache_key=_base_scheduled_loss_cache_key,
+        has_aux=True,
+        make_microbatch_weight=_make_base_scheduled_weight,
     ),
 )

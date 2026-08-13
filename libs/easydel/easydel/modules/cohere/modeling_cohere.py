@@ -39,7 +39,6 @@ import jax
 import jax.numpy as jnp
 import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 from spectrax import apply_logical_sharding, common_types, nn
 
@@ -67,7 +66,7 @@ from easydel.layers import (
     Embed,
     RowParallelLinear,
     dense_gate_up_layout,
-    split_fused_gate_up_projection,
+    gated_mlp_forward,
 )
 from easydel.layers.attention import UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
@@ -316,6 +315,7 @@ class CohereMLP(spx.Module):
             precision=self.precision,
             rngs=rngs,
         )
+        self.act_fn = jax.nn.silu
 
     @property
     def reform_param(self):
@@ -340,21 +340,7 @@ class CohereMLP(spx.Module):
         Returns:
             Transformed hidden states [batch, seq_len, hidden_dim]
         """
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), name="mlp_gate_up")
-        gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
-        gate = jax.nn.silu(checkpoint_name(gate_raw, name="mlp_gate"))
-        hidden_states = checkpoint_name(self.down_proj(gate * up), name="mlp_down")
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        return hidden_states
+        return gated_mlp_forward(self, hidden_states)
 
 
 class CohereBlock(spx.Module):

@@ -73,6 +73,7 @@ from easydel.layers import (
     RMSNorm,
     RowParallelLinear,
     dense_gate_up_layout,
+    gated_mlp_forward,
     split_fused_gate_up_projection,
 )
 from easydel.layers.attention import MaskInfo, UnifiedAttention
@@ -921,6 +922,11 @@ class FalconH1MLP(spx.Module):
         )
         self.act_fn = ACT2FN[config.hidden_act]
         self.gate_multiplier, self.down_multiplier = config.mlp_multipliers
+        # muP gate scaling folds into the declared combine; non-silu acts
+        # keep the in-place composition below.
+        if str(config.hidden_act).lower() in ("silu", "swish"):
+            self.fused_act_name = "scaled_silu"
+            self.fused_act_params = (float(self.gate_multiplier),)
 
     @property
     def reform_param(self):
@@ -941,6 +947,8 @@ class FalconH1MLP(spx.Module):
         Returns:
             Array: Transformed tensor of shape (batch, seq_len, hidden_size).
         """
+        if getattr(self, "fused_act_name", None) is not None:
+            return tp.cast(Array, gated_mlp_forward(self, x, output_scale=self.down_multiplier))
         x = apply_logical_sharding(
             x,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -1356,6 +1364,15 @@ class FalconH1Model(EasyDeLBaseModule):
         all_hidden_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
 
+        # The HybridCache is threaded through the python carry via
+        # ``get_view``/``update_view`` — a live cache forces the trace path.
+        trace_layers = self._layer_scan_trace(
+            False,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            extra=past_key_values is not None,
+        )
+
         def _layer_loop(layer, carry):
             """Per-layer step body for :meth:`nn.ModuleList.scan`.
 
@@ -1397,7 +1414,7 @@ class FalconH1Model(EasyDeLBaseModule):
         hidden_states, all_hidden_states, all_attentions, past_key_values, _ = self.layers.scan(
             _layer_loop,
             (hidden_states, all_hidden_states, all_attentions, past_key_values, 0),
-            trace=True,
+            trace=trace_layers,
         )
         hidden_states = self.final_layernorm(hidden_states)
         if output_hidden_states:

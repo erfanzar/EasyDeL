@@ -52,9 +52,12 @@ from __future__ import annotations
 import jax
 from jax import numpy as jnp
 
+from ..._registry import Backend, Platform, kernel_registry
+
 __all__ = ["channelwise_quantized_matmul"]
 
 
+@kernel_registry.register("channelwise_quantized_matmul", Platform.XLA, Backend.ANY)
 def channelwise_quantized_matmul(
     x: jax.Array,
     w_q: jax.Array,
@@ -122,9 +125,9 @@ def channelwise_quantized_matmul(
 
     x_abs = jnp.max(jnp.abs(x), axis=1, keepdims=True).astype(jnp.float32)
     x_scale = x_abs / act_max
-    x_q = jnp.clip(
-        jnp.round(x.astype(jnp.float32) / jnp.where(x_scale == 0, 1, x_scale)), -act_max, act_max
-    ).astype(act_dtype)
+    x_q = jnp.clip(jnp.round(x.astype(jnp.float32) / jnp.where(x_scale == 0, 1, x_scale)), -act_max, act_max).astype(
+        act_dtype
+    )
 
     w_dot = w_q
     if act_dtype == jnp.int8 and w_q.dtype != jnp.int8:
