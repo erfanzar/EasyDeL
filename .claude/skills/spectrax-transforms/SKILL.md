@@ -28,8 +28,7 @@ Read these before editing:
 
 ## Typical Tasks
 
-1. Add support for a new JAX transform or extend `mutable=` semantics across
-   transforms.
+1. Add support for a new JAX transform or extend `mutable=` semantics across transforms.
 2. Debug mutation propagation: why a `Buffer` update under `spx.jit` / `spx.scan`
    is lost or raises `IllegalMutationError`.
 3. Optimize the transform dispatch hot path (identity cache, flattened `State`

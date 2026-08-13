@@ -1,8 +1,7 @@
 # Docstring Style Reference
 
-Concrete templates and worked examples for the swarm in `SKILL.md`. Detect the
-project's existing convention and match it; default to **Google** if none
-dominates. Never mix styles within a file.
+Concrete templates and worked examples for the swarm in `SKILL.md`. Detect the project's existing convention and match
+it; default to **Google** if none dominates. Never mix styles within a file.
 
 ## Detecting the convention
 
@@ -129,8 +128,7 @@ def train(model, data, **kwargs: Unpacked[TrainKwargs]):
     ...
 ```
 
-Open `TrainKwargs`, read its fields, and document **each one** as a keyword
-argument — do not leave `**kwargs` opaque:
+Open `TrainKwargs`, read its fields, and document **each one** as a keyword argument — do not leave `**kwargs` opaque:
 
 ```python
 def train(model, data, **kwargs: Unpacked[TrainKwargs]):
@@ -151,13 +149,12 @@ def train(model, data, **kwargs: Unpacked[TrainKwargs]):
     """
 ```
 
-If any unpacked field changes the return (e.g. a `return_history` flag), note
-that in `Returns:` as well.
+If any unpacked field changes the return (e.g. a `return_history` flag), note that in `Returns:` as well.
 
 ## Updating an outdated docstring
 
-Drift to fix: renamed/removed params, changed return type, stale prose. Example
-— the signature dropped `verbose` and now returns a count, not a bool:
+Drift to fix: renamed/removed params, changed return type, stale prose. Example — the signature dropped `verbose` and
+now returns a count, not a bool:
 
 ```python
 # stale:                                  # corrected:
@@ -172,8 +169,7 @@ Returns:                                  """
 """
 ```
 
-Only rewrite the parts that are wrong; keep accurate prose intact to minimize
-diff noise.
+Only rewrite the parts that are wrong; keep accurate prose intact to minimize diff noise.
 
 ## The forbidden pattern — never introduce this
 
@@ -184,6 +180,5 @@ LEARNING_RATE = 3e-4
                                           #   of scope at every level.
 ```
 
-Instead, if the constant is worth documenting, mention it in the **module
-docstring** (or the class `Attributes:` section for class attributes). Leave
-the assignment itself untouched.
+Instead, if the constant is worth documenting, mention it in the **module docstring** (or the class `Attributes:`
+section for class attributes). Leave the assignment itself untouched.

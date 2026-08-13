@@ -32,8 +32,7 @@ Read these before editing:
    `modules/operations/configs.py`.
 3. Fix layout / axis / transpose contract mismatches using
    `validate_packed_quantized_matmul_layout`.
-4. Tune `QuantRuntimeConfig` defaults or quant/dequant runtime autotuning for a
-   backend / shape.
+4. Tune `QuantRuntimeConfig` defaults or quant/dequant runtime autotuning for a backend / shape.
 
 ## Routing
 
@@ -51,5 +50,4 @@ XLA_FLAGS=--xla_force_host_platform_device_count=8 \
   uv run pytest libs/ejkernel/test/modules/operations/test_quantized_matmul.py
 ```
 
-Also run `libs/ejkernel/test/quantization/` unit tests if the quantization
-container or bitpacking changed.
+Also run `libs/ejkernel/test/quantization/` unit tests if the quantization container or bitpacking changed.

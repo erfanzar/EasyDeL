@@ -1,7 +1,6 @@
 # eJKernel Profiling Reference
 
-Use this when a kernel change makes a performance claim or when a benchmark
-result needs attribution.
+Use this when a kernel change makes a performance claim or when a benchmark result needs attribution.
 
 ## Contents
 
@@ -15,12 +14,10 @@ result needs attribution.
 
 Start with the local tools before writing new harnesses:
 
-- `libs/ejkernel/benchmarks/benchmark_suite.py` runs the registry-driven matrix
-  and writes JSON plus Markdown reports.
+- `libs/ejkernel/benchmarks/benchmark_suite.py` runs the registry-driven matrix and writes JSON plus Markdown reports.
 - `libs/ejkernel/benchmarks/_op_benchmark_registry.py` owns `SPECS`,
   `run_benchmark`, platform wrapping, and `EJKERNEL_BENCH_CONFIG_LIMIT`.
-- `libs/ejkernel/ejkernel/benchmarks.py` owns `Benchmark`, warmup/iteration
-  timing, JSON save, and plots.
+- `libs/ejkernel/ejkernel/benchmarks.py` owns `Benchmark`, warmup/iteration timing, JSON save, and plots.
 - `libs/ejkernel/ejkernel/ops/execution/profiler.py` owns the `Profiler`
   class for JAX trace parsing and function/event timing.
 - `libs/ejkernel/ejkernel/loggings.py` exposes `ignite_profiler`,
@@ -38,8 +35,8 @@ For EasyDeL integration paths:
 
 ## Benchmark Suite Workflow
 
-For TPU Pallas work, run on TPU. Compare `xla` and `pallas` on the same target
-device; CPU/XLA smoke timing is not evidence for TPU behavior.
+For TPU Pallas work, run on TPU. Compare `xla` and `pallas` on the same target device; CPU/XLA smoke timing is not
+evidence for TPU behavior.
 
 ```bash
 ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu \
@@ -77,11 +74,10 @@ uv run python libs/ejkernel/benchmarks/benchmark_gated_delta_rule.py
 ```
 
 The single-op wrappers use fixed `warmup=5` and `iterations=30` through
-`run_benchmark`; use `benchmark_suite.py` when you need env-controlled short
-runs or machine-readable output.
+`run_benchmark`; use `benchmark_suite.py` when you need env-controlled short runs or machine-readable output.
 
-Host-side preflight is allowed only to check that the benchmark harness,
-registry entry, or XLA reference path still imports and runs:
+Host-side preflight is allowed only to check that the benchmark harness, registry entry, or XLA reference path still
+imports and runs:
 
 ```bash
 ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
@@ -95,25 +91,22 @@ EJKERNEL_BENCH_OUTPUT_DIR=/tmp/ejkernel_bench_cpu_preflight \
   uv run python libs/ejkernel/benchmarks/benchmark_suite.py
 ```
 
-Label this as preflight only. Do not use it for TPU correctness, lowering, or
-performance claims.
+Label this as preflight only. Do not use it for TPU correctness, lowering, or performance claims.
 
 ## Embedded JAX Profiler Hooks
 
-Use `ejkernel.loggings.create_step_profiler(...)` when profiling a custom loop
-that already has a step counter. It starts at `start_step - 1`, stops at the
-configured window end, and calls `barrier_sync()` after stopping.
+Use `ejkernel.loggings.create_step_profiler(...)` when profiling a custom loop that already has a step counter. It
+starts at `start_step - 1`, stops at the configured window end, and calls `barrier_sync()` after stopping.
 
 Use `ignite_profiler(profile_path, enable_perfetto)` and
-`extinguish_profiler(enable_perfetto)` for a manual region. Keep the region
-steady-state: run at least one compile/warmup call before profiling.
+`extinguish_profiler(enable_perfetto)` for a manual region. Keep the region steady-state: run at least one
+compile/warmup call before profiling.
 
-Use EasyDeL trainer `profiler_path` for training-loop profiles. The trainer
-starts after step 1, so the profile is steady-state rather than first-compile
-time.
+Use EasyDeL trainer `profiler_path` for training-loop profiles. The trainer starts after step 1, so the profile is
+steady-state rather than first-compile time.
 
-Use an eSurge benchmark harness --xprof-dir <dir>` only for eSurge serving
-throughput/debugging, not for isolated ejkernel microbenchmarks.
+Use an eSurge benchmark harness --xprof-dir <dir>` only for eSurge serving throughput/debugging, not for isolated
+ejkernel microbenchmarks.
 
 ## What To Report
 
@@ -129,16 +122,12 @@ For every headline result include:
 - direct baseline vs candidate numbers
 - failures, skipped platforms, or narrowed scope
 
-If only the suite timing ran, say "steady-state after warmup"; do not call it
-compile-including timing.
+If only the suite timing ran, say "steady-state after warmup"; do not call it compile-including timing.
 
 ## Common Mistakes
 
 - Treating CPU/XLA preflight as TPU Pallas validation.
-- Letting `EJKERNEL_AUTOTUNE_POLICY=autotune` run inside a deterministic unit
-  test.
+- Letting `EJKERNEL_AUTOTUNE_POLICY=autotune` run inside a deterministic unit test.
 - Reporting a single fastest run without the JSON/Markdown benchmark artifact.
-- Changing shape, dtype, platform set, warmup, or iteration count between
-  baseline and candidate.
-- Treating a side benchmark as proof for an EasyDeL training or eSurge path
-  without exercising that path.
+- Changing shape, dtype, platform set, warmup, or iteration count between baseline and candidate.
+- Treating a side benchmark as proof for an EasyDeL training or eSurge path without exercising that path.

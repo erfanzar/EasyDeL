@@ -8,8 +8,7 @@ description: Add or update an optimizer or scheduler in libs/eformer/eformer/opt
 This is a specialization of `.claude/skills/run-research/SKILL.md`.
 
 Load and follow `run-research` first. Use this skill when the work is inside
-`libs/eformer/eformer/optimizers` or when a new optimizer/scheduler must be
-available through `OptimizerFactory`.
+`libs/eformer/eformer/optimizers` or when a new optimizer/scheduler must be available through `OptimizerFactory`.
 
 ## First Reads
 
@@ -28,10 +27,8 @@ Read these before editing:
 
 A new optimizer usually needs:
 
-- a config dataclass in `_config.py` extending the optimizer/scheduler config
-  pattern and `SerializationMixin`
-- a builder subclass in `_builders.py` extending `OptimizerBuilder` and
-  registered with `@register_optimizer`
+- a config dataclass in `_config.py` extending the optimizer/scheduler config pattern and `SerializationMixin`
+- a builder subclass in `_builders.py` extending `OptimizerBuilder` and registered with `@register_optimizer`
 - export from `libs/eformer/eformer/optimizers/__init__.py`
 - if pipeline parallelism is required, a stage-local apply kernel in
   `_stage_local.py` and a `build_mpmd()` path in the builder

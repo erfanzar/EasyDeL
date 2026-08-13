@@ -31,14 +31,13 @@ scripts/tpu_setup.sh --branch vnext
 ```
 
 The script supports `--branch <ref>` and `--branch=<ref>`. It uses
-`EASYDEL_REPO_URL`, `EASYDEL_SRC_DIR`, and `RAY_EXECUTABLE_PATH`, installs the
-workspace packages from `libs/`, and verifies package versions for EasyDeL,
-eformer, ejkernel, spectrax, and JAX.
+`EASYDEL_REPO_URL`, `EASYDEL_SRC_DIR`, and `RAY_EXECUTABLE_PATH`, installs the workspace packages from `libs/`, and
+verifies package versions for EasyDeL, eformer, ejkernel, spectrax, and JAX.
 
 ## Triage Order
 
-1. Find the first remote failure in the setup log: clone, install, Ray, or
-   health check. Later import errors are often fallout.
+1. Find the first remote failure in the setup log: clone, install, Ray, or health check. Later import errors are often
+   fallout.
 2. Confirm editable installs resolve from the workspace `libs/` paths.
 3. Check whether libtpu is already owned by another process.
 4. Check whether exactly one TPU VM is unhealthy or failing accelerator init.
@@ -46,10 +45,9 @@ eformer, ejkernel, spectrax, and JAX.
 
 ## libtpu Lock Rule
 
-TPU is single-process for libtpu. If a job owns the TPU, do not run TPU
-validation in parallel. CPU probes are only for unrelated host-side checks such
-as import paths or package versions; they do not validate TPU kernels, eSurge
-runtime behavior, or performance.
+TPU is single-process for libtpu. If a job owns the TPU, do not run TPU validation in parallel. CPU probes are only for
+unrelated host-side checks such as import paths or package versions; they do not validate TPU kernels, eSurge runtime
+behavior, or performance.
 
 Useful read-only checks from `.claude/ops/OPS.md`:
 
@@ -62,8 +60,8 @@ gcloud compute tpus tpu-vm list --project="$PROJECT_ID" --zone="$ZONE" \
 
 ## Version And Import Checks
 
-When the symptom is "it installed but imports are wrong", verify package
-versions and module locations from the environment used by the TPU job:
+When the symptom is "it installed but imports are wrong", verify package versions and module locations from the
+environment used by the TPU job:
 
 ```bash
 python - <<'PY'
@@ -73,11 +71,10 @@ for name in ["easydel", "eformer", "ejkernel", "spectrax", "jax"]:
 PY
 ```
 
-If imports work on the driver but fail remotely, inspect the Ray environment
-and setup log before changing repo code.
+If imports work on the driver but fail remotely, inspect the Ray environment and setup log before changing repo code.
 
 ## Recovery Boundary
 
-Do not delete TPU VMs, restart slices, or clear shared scratch/checkpoint paths
-without explicit user approval. If recovery is approved, follow the concrete
+Do not delete TPU VMs, restart slices, or clear shared scratch/checkpoint paths without explicit user approval. If
+recovery is approved, follow the concrete
 `gcloud compute tpus tpu-vm ...` commands in `.claude/ops/OPS.md`.

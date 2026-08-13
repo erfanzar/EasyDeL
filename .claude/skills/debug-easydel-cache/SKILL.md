@@ -7,9 +7,8 @@ description: Debug or extend EasyDeL inference caches under libs/easydel/easydel
 
 This is a specialization of `.claude/skills/run-research/SKILL.md`.
 
-Load and follow `run-research` first. Use this skill when the failure or feature
-involves `libs/easydel/easydel/caching`, cache metadata, or an eSurge cache-shape
-error.
+Load and follow `run-research` first. Use this skill when the failure or feature involves
+`libs/easydel/easydel/caching`, cache metadata, or an eSurge cache-shape error.
 
 ## First Reads
 
@@ -33,8 +32,7 @@ Read these before editing:
    `BaseCacheConfig` and registering the view in `OperationsMetadata`.
 2. Add a new cache specification in `_specs.py` for a novel attention pattern.
 3. Fix cache update or view logic for paged, recurrent, or compressed caches.
-4. Ensure `AttentionMetadataBuilder` produces the fields the attention operation
-   requires.
+4. Ensure `AttentionMetadataBuilder` produces the fields the attention operation requires.
 
 ## Routing
 

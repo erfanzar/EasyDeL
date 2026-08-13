@@ -8,8 +8,8 @@ description: Work on SpectraX sharding and mesh abstractions under libs/spectrax
 This is a specialization of `.claude/skills/run-research/SKILL.md`.
 
 Load and follow `run-research` first. Use this skill when the work is inside
-`libs/spectrax/spectrax/sharding` or when `PartitionSpec`, logical axis rules,
-or stage-local mesh resolution must change.
+`libs/spectrax/spectrax/sharding` or when `PartitionSpec`, logical axis rules, or stage-local mesh resolution must
+change.
 
 ## First Reads
 
@@ -28,12 +28,11 @@ Read these before editing:
 
 1. Configure a new parallelism layout using `PartitionAxis` and
    `PartitionManager`, or register a custom symbolic axis.
-2. Debug `with_sharding_constraint` failures on MPMD meshes: stage-local mesh
-   resolution, dropped pipeline axis, divisibility checks.
+2. Debug `with_sharding_constraint` failures on MPMD meshes: stage-local mesh resolution, dropped pipeline axis,
+   divisibility checks.
 3. Generate `PartitionSpec` trees from a module for checkpointing or `jit`
    `in_shardings` / `out_shardings`.
-4. Adapt `create_mesh` for new hardware topologies or fix multi-slice /
-   multi-process device ordering.
+4. Adapt `create_mesh` for new hardware topologies or fix multi-slice / multi-process device ordering.
 
 ## Routing
 

@@ -8,8 +8,7 @@ description: Work on the SpectraX core object model under libs/spectrax/spectrax
 This is a specialization of `.claude/skills/run-research/SKILL.md`.
 
 Load and follow `run-research` first. Use this skill when the work is inside
-`libs/spectrax/spectrax/core` or when module/state semantics, graph export/bind,
-selectors, or variable policies change.
+`libs/spectrax/spectrax/core` or when module/state semantics, graph export/bind, selectors, or variable policies change.
 
 ## First Reads
 
@@ -30,12 +29,10 @@ Read these before editing:
 
 ## Typical Tasks
 
-1. Add a new variable collection or specialized `Variable` subclass and wire it
-   through `export` / `bind`.
-2. Fix graph round-trip bugs: `GraphDef` mismatch after `clone`, shared-variable
-   aliasing, or container reconstruction in `bind`.
-3. Extend `Selector` behavior or fix `partition_state` interaction with tied
-   weights / MPMD stage metadata.
+1. Add a new variable collection or specialized `Variable` subclass and wire it through `export` / `bind`.
+2. Fix graph round-trip bugs: `GraphDef` mismatch after `clone`, shared-variable aliasing, or container reconstruction
+   in `bind`.
+3. Extend `Selector` behavior or fix `partition_state` interaction with tied weights / MPMD stage metadata.
 4. Implement module-level hooks/contexts or debug mutations dropped inside
    `jax.jit` vs `spx.jit`.
 

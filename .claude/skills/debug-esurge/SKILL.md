@@ -39,8 +39,7 @@ For runner/executor failures, open:
   `libs/easydel/tests/inference/esurge/core/test_dp_sharding_pages.py`.
 - Text-only serving accidentally using speculative decode: search for
   `num_speculative_tokens`, `SpeculativeMTPDriver`, and
-  `mtp_num_hidden_layers`. Keep MTP disabled unless the user explicitly asks
-  for speculative decoding.
+  `mtp_num_hidden_layers`. Keep MTP disabled unless the user explicitly asks for speculative decoding.
 - OpenAI API tool or reasoning output mismatches: load
   `.claude/skills/tool-reasoning-parser/SKILL.md` and inspect
   `libs/easydel/easydel/inference/esurge/server/api_server.py`.
@@ -49,8 +48,8 @@ For runner/executor failures, open:
 
 ## Benchmark Harness
 
-an eSurge benchmark harness is the repo harness for eSurge. It defaults to TPU
-and exits if JAX does not report a TPU backend. Useful flags include:
+an eSurge benchmark harness is the repo harness for eSurge. It defaults to TPU and exits if JAX does not report a TPU
+backend. Useful flags include:
 
 - `--model`
 - `--prompt-len`
@@ -74,9 +73,8 @@ and exits if JAX does not report a TPU backend. Useful flags include:
 - `--xprof-host-level`
 - `--xprof-python-level`
 
-The harness constructs a no-MTP workload with `num_speculative_tokens=0` and
-writes `"no_mtp": true` to the JSON output. Do not use it as a speculative
-decoding benchmark.
+The harness constructs a no-MTP workload with `num_speculative_tokens=0` and writes `"no_mtp": true` to the JSON output.
+Do not use it as a speculative decoding benchmark.
 
 ```bash
 ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu \
@@ -89,8 +87,8 @@ ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu \
 
 ## Focused Tests
 
-Host-side tests use the CPU environment below; these do not replace TPU runtime
-validation for performance or libtpu behavior.
+Host-side tests use the CPU environment below; these do not replace TPU runtime validation for performance or libtpu
+behavior.
 
 ```bash
 ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
@@ -106,5 +104,5 @@ XLA_FLAGS=--xla_force_host_platform_device_count=8 \
   uv run pytest libs/easydel/tests/inference/esurge/test_engine_api_authoritative.py
 ```
 
-Set `EASURGE_SYNC_INPUTS_FOR_TIMING=1` only when measuring prep-time accuracy;
-it adds a device round trip and can reduce throughput.
+Set `EASURGE_SYNC_INPUTS_FOR_TIMING=1` only when measuring prep-time accuracy; it adds a device round trip and can
+reduce throughput.

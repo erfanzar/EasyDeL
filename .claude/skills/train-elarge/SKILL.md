@@ -39,8 +39,8 @@ Run eLarge through:
 uv run python -m easydel.scripts.elarge --config <config.yaml>
 ```
 
-The script also accepts a positional config path and `--dry-run`. YAML must
-contain an `actions:` list. Supported actions include `validate`, `print`,
+The script also accepts a positional config path and `--dry-run`. YAML must contain an `actions:` list. Supported
+actions include `validate`, `print`,
 `show`, `dump_config`, `print_config`, `config`, `to_json`, `to_yaml`, `train`,
 `eval`, and `serve`.
 
@@ -70,8 +70,7 @@ XLA_FLAGS=--xla_force_host_platform_device_count=8 \
 `serve` supports parameters such as `host`, `port`, `workers`, `log_level`,
 `ssl_keyfile`, `ssl_certfile`, `tool_parser_name`, `oai_like_processor`,
 `enable_function_calling`, `require_api_key`, `admin_key`, `enable_cors`, and
-`cors_origins`. The current script requires `workers` to be `1` and does not
-support reload mode.
+`cors_origins`. The current script requires `workers` to be `1` and does not support reload mode.
 
 ## Verification
 
@@ -87,5 +86,5 @@ XLA_FLAGS=--xla_force_host_platform_device_count=8 \
   uv run pytest libs/easydel/tests/trainers/test_sequence_packing_flag.py
 ```
 
-Do not infer training success from `--dry-run`. A train/eval claim needs the
-actual affected action or a clearly named skipped-hardware risk.
+Do not infer training success from `--dry-run`. A train/eval claim needs the actual affected action or a clearly named
+skipped-hardware risk.

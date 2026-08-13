@@ -7,15 +7,13 @@ description: Optimize, profile, regress, retune, or diagnose an existing ejkerne
 
 This is a specialization of `.claude/skills/run-research/SKILL.md`.
 
-Load and follow `run-research` first. Use this skill when the operation already
-exists and the job is to make it faster, explain a regression, or validate a
-performance claim. If the task adds a new operation or backend surface, load
+Load and follow `run-research` first. Use this skill when the operation already exists and the job is to make it faster,
+explain a regression, or validate a performance claim. If the task adds a new operation or backend surface, load
 `.claude/skills/add-ejkernel-kernel/SKILL.md` instead.
 
 ## First Reads
 
-Read the real ejkernel docs and the current implementation before changing
-anything:
+Read the real ejkernel docs and the current implementation before changing anything:
 
 - `WORKSPACE.md`
 - `libs/ejkernel/pyproject.toml`
@@ -33,8 +31,7 @@ anything:
 - `docs/reference/profiling.md` before any performance claim.
 - `docs/reference/llo.md` for TPU Pallas structural diagnosis.
 
-Then open the existing operation wrapper, kernel backend, XLA/reference path,
-and tests for the exact operation:
+Then open the existing operation wrapper, kernel backend, XLA/reference path, and tests for the exact operation:
 
 - `libs/ejkernel/ejkernel/modules/operations/<kernel>.py`
 - `libs/ejkernel/ejkernel/kernels/_xla/<kernel>/`
@@ -46,16 +43,14 @@ and tests for the exact operation:
 
 Before editing:
 
-1. Record the exact operation, backend/platform, hardware, device count, shape,
-   dtype, config, and command.
+1. Record the exact operation, backend/platform, hardware, device count, shape, dtype, config, and command.
 2. Run correctness or parity for the current implementation.
 3. Run a baseline benchmark and save the JSON/Markdown artifact.
-4. Identify whether the comparison is XLA vs accelerator, previous commit vs
-   current, config A vs config B, or isolated decomposition vs full kernel.
+4. Identify whether the comparison is XLA vs accelerator, previous commit vs current, config A vs config B, or isolated
+   decomposition vs full kernel.
 
-Do not report a win from a single changed command line or a different shape.
-Keep warmup, iteration count, platform set, config limit, and hardware fixed
-between baseline and candidate.
+Do not report a win from a single changed command line or a different shape. Keep warmup, iteration count, platform set,
+config limit, and hardware fixed between baseline and candidate.
 
 ## Benchmark Workflow
 
@@ -90,8 +85,7 @@ Single-op wrappers under `libs/ejkernel/benchmarks/` call
 uv run python libs/ejkernel/benchmarks/benchmark_gated_delta_rule.py
 ```
 
-Read `docs/reference/profiling.md` for profiler hooks, output artifacts, and
-reporting requirements.
+Read `docs/reference/profiling.md` for profiler hooks, output artifacts, and reporting requirements.
 
 ## Optimization Loop
 
@@ -99,25 +93,21 @@ Use a narrow loop:
 
 1. Freeze one representative shape and dtype.
 2. Compare current backend against XLA/reference or last-known-good baseline.
-3. Attribute the bottleneck before changing code: benchmark JSON, profile
-   trace, HLO/LLO/Mosaic dump, or decomposition variant.
-4. Change one thing: tiling, block size, config choice, memory layout,
-   staging, DMA, masking, or dispatch policy.
+3. Attribute the bottleneck before changing code: benchmark JSON, profile trace, HLO/LLO/Mosaic dump, or decomposition
+   variant.
+4. Change one thing: tiling, block size, config choice, memory layout, staging, DMA, masking, or dispatch policy.
 5. Rerun correctness and the same benchmark.
-6. Keep the change only if it wins on the target hardware and does not break
-   parity or supported shapes.
+6. Keep the change only if it wins on the target hardware and does not break parity or supported shapes.
 
-Do not broad-sweep block sizes before checking structure. If Pallas is slower
-than XLA on one fixed shape, read `docs/reference/llo.md` and dump both paths
-before adding DMA or async complexity.
+Do not broad-sweep block sizes before checking structure. If Pallas is slower than XLA on one fixed shape, read
+`docs/reference/llo.md` and dump both paths before adding DMA or async complexity.
 
 ## TPU Pallas Rules
 
 - Run TPU Pallas validation only when this process owns libtpu.
-- CPU/XLA can be used only for host-side preflight: imports, benchmark harness
-  syntax, registry selection, or simple reference math.
-- CPU timing is not TPU correctness, Mosaic lowering, LLO behavior, DMA/async
-  overlap, or performance evidence.
+- CPU/XLA can be used only for host-side preflight: imports, benchmark harness syntax, registry selection, or simple
+  reference math.
+- CPU timing is not TPU correctness, Mosaic lowering, LLO behavior, DMA/async overlap, or performance evidence.
 - DMA/async only counts when the measured target run shows overlap and a win.
 - If libtpu is busy, stop target validation and say it was not run.
 
@@ -132,8 +122,7 @@ For tunable operations, use the existing ops stack:
 - `libs/ejkernel/ejkernel/ops/execution/executor.py` for `Executor`.
 
 Use `EJKERNEL_AUTOTUNE_POLICY=heuristics` for deterministic checks. Use
-`autotune` only when measuring config candidates, and report cache state when it
-can affect the result.
+`autotune` only when measuring config candidates, and report cache state when it can affect the result.
 
 ## Verification
 
@@ -174,6 +163,5 @@ EJKERNEL_BENCH_OUTPUT_DIR=/tmp/ejkernel_bench \
 - Benchmark artifact paths are reported.
 - Direct baseline vs candidate numbers are reported.
 - Hardware, shape, dtype, config, warmup, iterations, and platform are named.
-- Dump/profile evidence is included when timing alone did not explain the
-  result.
+- Dump/profile evidence is included when timing alone did not explain the result.
 - Losing variants are removed or left behind only as clearly marked references.

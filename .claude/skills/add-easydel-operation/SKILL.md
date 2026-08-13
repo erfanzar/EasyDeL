@@ -8,8 +8,8 @@ description: Add or update an EasyDeL native operation or attention kernel under
 This is a specialization of `.claude/skills/run-research/SKILL.md`.
 
 Load and follow `run-research` first. Use this skill when the change is inside
-`libs/easydel/easydel/operations` and does not involve creating a new ejkernel
-kernel (use the ejkernel skills for that).
+`libs/easydel/easydel/operations` and does not involve creating a new ejkernel kernel (use the ejkernel skills for
+that).
 
 ## First Reads
 
@@ -55,5 +55,4 @@ XLA_FLAGS=--xla_force_host_platform_device_count=8 \
   uv run pytest libs/easydel/tests/operations/
 ```
 
-Backend-specific paths (TPU/GPU) need hardware ownership and focused benchmarks;
-do not claim them from CPU tests alone.
+Backend-specific paths (TPU/GPU) need hardware ownership and focused benchmarks; do not claim them from CPU tests alone.

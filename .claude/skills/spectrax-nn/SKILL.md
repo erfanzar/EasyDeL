@@ -8,8 +8,7 @@ description: Add or update SpectraX neural-network layers and functional primiti
 This is a specialization of `.claude/skills/run-research/SKILL.md`.
 
 Load and follow `run-research` first. Use this skill when the work is inside
-`libs/spectrax/spectrax/nn`, `libs/spectrax/spectrax/functional`, or when a new
-layer primitive is needed.
+`libs/spectrax/spectrax/nn`, `libs/spectrax/spectrax/functional`, or when a new layer primitive is needed.
 
 ## First Reads
 
@@ -30,14 +29,12 @@ Read these before editing:
 
 A new layer usually needs:
 
-- a `Module` subclass in `nn/` following `Parameter` / `Buffer` + axis-names +
-  policy-cast conventions
+- a `Module` subclass in `nn/` following `Parameter` / `Buffer` + axis-names + policy-cast conventions
 - a pure JAX primitive in `functional/` if one does not already exist
 - export from `libs/spectrax/spectrax/nn/__init__.py`
 - tests under `libs/spectrax/tests/nn/` and `libs/spectrax/tests/functional/`
 
-Preserve channels-last conv / pool layout `(N, *spatial, C)` and
-sequence-second attention `(N, T, ...)` conventions.
+Preserve channels-last conv / pool layout `(N, *spatial, C)` and sequence-second attention `(N, T, ...)` conventions.
 
 ## Routing
 

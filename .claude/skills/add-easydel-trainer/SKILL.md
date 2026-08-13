@@ -29,8 +29,8 @@ Read these before editing:
 - `libs/easydel/easydel/trainers/group_relative_policy_optimization/grpo_trainer.py`
 - `libs/easydel/easydel/trainers/__init__.py`
 
-Pick the closest existing trainer (SFT for supervised, DPO for preference,
-GRPO for online RL) and mirror its package shape.
+Pick the closest existing trainer (SFT for supervised, DPO for preference, GRPO for online RL) and mirror its package
+shape.
 
 ## Required Surfaces
 
@@ -41,10 +41,9 @@ A new trainer usually needs:
 - `libs/easydel/easydel/trainers/<name>_trainer/<name>_trainer.py` extending
   `Trainer` or `BaseTrainer`
 - optional `_fn.py` for step functions / loss helpers
-- `libs/easydel/easydel/trainers/<name>_trainer/__init__.py` exporting the
-  public classes and registering with `Registry`
-- `@Registry.register("trainer", "<name>")` or the equivalent registration
-  used by `train-elarge`
+- `libs/easydel/easydel/trainers/<name>_trainer/__init__.py` exporting the public classes and registering with
+  `Registry`
+- `@Registry.register("trainer", "<name>")` or the equivalent registration used by `train-elarge`
 - tests under `libs/easydel/tests/trainers/`
 
 Do not add a side registry or bypass `BaseTrainerProtocol`.
@@ -78,5 +77,5 @@ XLA_FLAGS=--xla_force_host_platform_device_count=8 \
   uv run pytest libs/easydel/tests/trainers/test_training_arguments.py
 ```
 
-Do not claim training readiness from constructor-only tests. A full training
-claim needs a short real run or a clear hardware-risk note.
+Do not claim training readiness from constructor-only tests. A full training claim needs a short real run or a clear
+hardware-risk note.

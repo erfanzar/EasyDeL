@@ -7,8 +7,8 @@ description: Work on EasyDeL fused projection layout, TP-portable checkpoint lay
 
 This is a specialization of `.claude/skills/run-research/SKILL.md`.
 
-Load and follow `run-research` first. If the work is a new or changed ejkernel
-kernel, also load `.claude/skills/add-ejkernel-kernel/SKILL.md`.
+Load and follow `run-research` first. If the work is a new or changed ejkernel kernel, also load
+`.claude/skills/add-ejkernel-kernel/SKILL.md`.
 
 ## First Reads
 
@@ -29,12 +29,10 @@ kernel, also load `.claude/skills/add-ejkernel-kernel/SKILL.md`.
 
 ## Boundary
 
-EasyDeL owns model integration, checkpoint layout, projection packing,
-partition specs, eLarge builder wiring, and linears. eJKernel owns backend
-kernels, operation wrappers, registry, autotune, and kernel benchmarks.
+EasyDeL owns model integration, checkpoint layout, projection packing, partition specs, eLarge builder wiring, and
+linears. eJKernel owns backend kernels, operation wrappers, registry, autotune, and kernel benchmarks.
 
-Only `libs/easydel` may import `ejkernel`. Do not make foundation packages
-import EasyDeL or each other.
+Only `libs/easydel` may import `ejkernel`. Do not make foundation packages import EasyDeL or each other.
 
 ## Fused Layout Rules
 
@@ -57,8 +55,8 @@ Use the existing layout APIs:
 - `build_fused_qkv_projection`
 - `split_fused_qkv_projection`
 
-Do not split fused tensors by ad hoc string or axis assumptions. Preserve
-layout metadata and `fused_param_tp` so checkpoints can move between TP shapes.
+Do not split fused tensors by ad hoc string or axis assumptions. Preserve layout metadata and `fused_param_tp` so
+checkpoints can move between TP shapes.
 
 ## Quantized Linear Rules
 
@@ -70,8 +68,8 @@ Inspect these symbols before editing behavior:
 - `ej_quantized_matmul`
 - `_distributed_quantized_matmul`
 
-When changing quantized matmul behavior, verify both EasyDeL integration tests
-and ejkernel quantized operation tests. Route backend-kernel changes through
+When changing quantized matmul behavior, verify both EasyDeL integration tests and ejkernel quantized operation tests.
+Route backend-kernel changes through
 `.claude/skills/add-ejkernel-kernel/SKILL.md`.
 
 ## Failure Routes
@@ -82,8 +80,8 @@ and ejkernel quantized operation tests. Route backend-kernel changes through
   `_runtime.py` before changing model code.
 - Quantized sharding crash: inspect partition-spec sanitization in
   `_linear_quantized.py`.
-- Performance claim for quantized matmul: use the ejkernel benchmark and
-  profiling routes in `.claude/skills/add-ejkernel-kernel/SKILL.md`.
+- Performance claim for quantized matmul: use the ejkernel benchmark and profiling routes in
+  `.claude/skills/add-ejkernel-kernel/SKILL.md`.
 
 ## Verification
 

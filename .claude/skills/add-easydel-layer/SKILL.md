@@ -35,8 +35,7 @@ A new layer usually needs:
 
 - implementation under the right `layers/<area>/` subpackage
 - export from `libs/easydel/easydel/layers/__init__.py`
-- preservation of existing TP/FSDP sharding contracts (axis names, column/row
-  parallel behavior, `PartitionAxis`)
+- preservation of existing TP/FSDP sharding contracts (axis names, column/row parallel behavior, `PartitionAxis`)
 - tests under `libs/easydel/tests/layers/`
 
 Prefer extending existing classes (`UnifiedAttention`, `ParallelLinear`,

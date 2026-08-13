@@ -31,9 +31,9 @@ Load and follow `run-research` first. Use this skill for parser behavior in
 
 ## Parser Contracts
 
-Tool parsers register through `ToolParserManager.register_module` and are
-retrieved with `ToolParserManager.get_tool_parser`. Implement both batch and
-streaming behavior when the model format supports streaming:
+Tool parsers register through `ToolParserManager.register_module` and are retrieved with
+`ToolParserManager.get_tool_parser`. Implement both batch and streaming behavior when the model format supports
+streaming:
 
 - `extract_tool_calls`
 - `extract_tool_calls_streaming`
@@ -43,8 +43,7 @@ Reasoning parsers register through `ReasoningParserManager` and implement:
 - `extract_reasoning`
 - `extract_reasoning_streaming`
 
-Use `DelegatingParser` when tool and reasoning parsing need to cooperate on the
-same generated text.
+Use `DelegatingParser` when tool and reasoning parsing need to cooperate on the same generated text.
 
 ## eSurge Rules
 
@@ -53,9 +52,8 @@ Inspect `eSurge._auto_detect_tool_parser`,
 `reasoning_parser_name`, `_tool_parser_class`, and `_reasoning_parser_class`
 when parser selection is wrong.
 
-The eSurge API server should honor authoritative `tool_calls` returned by the
-engine. Do not make the API server reparse output that already has structured
-tool calls.
+The eSurge API server should honor authoritative `tool_calls` returned by the engine. Do not make the API server reparse
+output that already has structured tool calls.
 
 For serving or benchmark failures, also load `.claude/skills/debug-esurge/SKILL.md`.
 
@@ -87,5 +85,4 @@ XLA_FLAGS=--xla_force_host_platform_device_count=8 \
   uv run pytest libs/easydel/tests/inference/esurge/test_engine_api_authoritative.py
 ```
 
-Add streaming tests when changing delta assembly. Add final-response tests when
-changing non-streaming parser output.
+Add streaming tests when changing delta assembly. Add final-response tests when changing non-streaming parser output.

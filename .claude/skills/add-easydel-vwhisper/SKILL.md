@@ -8,8 +8,7 @@ description: Add, update, or debug the vWhisper speech-inference engine under li
 This is a specialization of `.claude/skills/run-research/SKILL.md`.
 
 Load and follow `run-research` first. Use this skill when the work is inside
-`libs/easydel/easydel/inference/vwhisper` or when the Whisper-based speech
-inference path changes.
+`libs/easydel/easydel/inference/vwhisper` or when the Whisper-based speech inference path changes.
 
 ## First Reads
 
@@ -50,5 +49,4 @@ XLA_FLAGS=--xla_force_host_platform_device_count=8 \
   uv run pytest libs/easydel/tests/inference/vwhisper/
 ```
 
-Also validate the CLI help and server startup paths on CPU before claiming
-readiness.
+Also validate the CLI help and server startup paths on CPU before claiming readiness.

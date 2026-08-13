@@ -1,9 +1,8 @@
 # Pallas TPU Profiling Cheatsheet
 
 Exact commands, env vars, and dump-reading recipes for the workflow in
-`SKILL.md`. Everything here assumes you own the TPU for the run. CPU is for
-host-side preflight only (imports, shapes, reference math, flag spelling) and is
-never evidence for TPU behavior.
+`SKILL.md`. Everything here assumes you own the TPU for the run. CPU is for host-side preflight only (imports, shapes,
+reference math, flag spelling) and is never evidence for TPU behavior.
 
 ## 1. Predict before you run: static cost model
 
@@ -14,9 +13,8 @@ print(compiled.memory_analysis())   # argument/output/temp/alias sizes
 print(jax.jit(f).lower(*args).as_text())  # StableHLO/HLO inline
 ```
 
-- **Arithmetic intensity** = `flops / bytes accessed`. Compare to the TPU's
-  FLOP:byte ratio (hundreds:1 for modern parts). Below it → memory-bound; above
-  → compute-bound. This tells you which lever class to reach for *before* timing.
+- **Arithmetic intensity** = `flops / bytes accessed`. Compare to the TPU's FLOP:byte ratio (hundreds:1 for modern
+  parts). Below it → memory-bound; above → compute-bound. This tells you which lever class to reach for *before* timing.
 - `memory_analysis()` flags when temporaries blow up — a sign of missing fusion.
 
 ## 2. Timeline / trace (xprof)
@@ -35,9 +33,9 @@ tensorboard --logdir /tmp/tpu_trace        # open the "Profile" tab
 ```
 
 Read, in order:
-- **trace_viewer** — the device timeline. Is time in your kernel, or in
-  surrounding transposes/reshapes/copies? Are DMAs overlapping compute, or is
-  there a serial gap before each step (failed pipeline)?
+
+- **trace_viewer** — the device timeline. Is time in your kernel, or in surrounding transposes/reshapes/copies? Are DMAs
+  overlapping compute, or is there a serial gap before each step (failed pipeline)?
 - **op_profile** — per-op time ranking; find the real hot op.
 - **memory_viewer** — HBM high-water mark and fragmentation.
 
@@ -51,15 +49,15 @@ XLA_FLAGS="--xla_dump_to=/tmp/dumps/xla/hlo --xla_dump_hlo_as_text" \
   python run.py
 ```
 
-Inspect `*after_optimizations.txt`. Confirm the expected custom-call / fusion is
-emitted and your kernel is actually on the path. Add `--xla_dump_hlo_as_html`
+Inspect `*after_optimizations.txt`. Confirm the expected custom-call / fusion is emitted and your kernel is actually on
+the path. Add `--xla_dump_hlo_as_html`
 for a navigable fusion graph. CPU may be used only to check flag *spelling*.
 
 ## 4. TPU LLO / Mosaic dump — structural diagnosis
 
-Use when Pallas is mysteriously slower than XLA on one fixed shape, or sweeps are
-noisy. **Run one tiny TPU smoke compile with these exact flags first** to confirm
-the runtime accepts them. Keep a separate dump root per variant and keep
+Use when Pallas is mysteriously slower than XLA on one fixed shape, or sweeps are noisy. **Run one tiny TPU smoke
+compile with these exact flags first** to confirm the runtime accepts them. Keep a separate dump root per variant and
+keep
 `LIBTPU_INIT_ARGS` identical between compared variants.
 
 ```bash
@@ -83,24 +81,21 @@ ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu python run.py
 
 ### What to read in the dump
 
-- **Schedule bundles** — find `*schedule-analysis_final_bundles.txt`. Compare
-  **total bundle count** and **non-empty bundle count** between Pallas and XLA.
-  Large inflation vs XLA = a structural problem; fix the decomposition before
+- **Schedule bundles** — find `*schedule-analysis_final_bundles.txt`. Compare **total bundle count** and **non-empty
+  bundle count** between Pallas and XLA. Large inflation vs XLA = a structural problem; fix the decomposition before
   touching block sizes.
-- **VPU pressure counters** — grep the LLO for op mnemonics and compare counts
-  between variants:
-  - `vrot` — lane rotations (layout/transpose cost)
-  - `vsel` — selects/masking (boundary/mask cost)
-  - `vpow2` and friends — transcendentals
-  - spill / fill and **static schedule gaps** — stalls and register pressure.
-- **Mosaic source annotations** — map the expensive generated block back to the
-  line of your kernel; check whether the pressure aligns with the block you
-  suspected.
+- **VPU pressure counters** — grep the LLO for op mnemonics and compare counts between variants:
+    - `vrot` — lane rotations (layout/transpose cost)
+    - `vsel` — selects/masking (boundary/mask cost)
+    - `vpow2` and friends — transcendentals
+    - spill / fill and **static schedule gaps** — stalls and register pressure.
+- **Mosaic source annotations** — map the expensive generated block back to the line of your kernel; check whether the
+  pressure aligns with the block you suspected.
 
 ## 5. Debugging vs profiling
 
-- `pl.pallas_call(..., interpret=True)` runs the kernel in pure-JAX on the host
-  for **correctness** debugging — not a performance tool.
+- `pl.pallas_call(..., interpret=True)` runs the kernel in pure-JAX on the host for **correctness** debugging — not a
+  performance tool.
 - `jax.debug.print` / `pl.debug_print` inside the kernel for value inspection.
 
 ## 6. Reporting checklist

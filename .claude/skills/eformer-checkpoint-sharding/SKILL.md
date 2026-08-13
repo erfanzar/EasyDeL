@@ -53,14 +53,13 @@ Use the existing APIs:
 - `create_sharding_tree_from_index`
 - `apply_sharding_tree`
 
-Preserve sharding metadata instead of loading everything unsharded. Relevant
-artifact names include `tensorstore_index.json`, `metadata.json`, and
+Preserve sharding metadata instead of loading everything unsharded. Relevant artifact names include
+`tensorstore_index.json`, `metadata.json`, and
 `checkpoint_metadata.json`.
 
 For distributed remote writes, inspect
 `should_write_shared_checkpoint_files` in
-`libs/eformer/eformer/serialization/fsspec_utils.py`; nonzero processes should
-not race on shared metadata files.
+`libs/eformer/eformer/serialization/fsspec_utils.py`; nonzero processes should not race on shared metadata files.
 
 ## Mesh And Partition Rules
 
@@ -73,8 +72,8 @@ Use existing mesh and partition helpers:
 - partition manager and constraint APIs under
   `libs/eformer/eformer/escale/partition/`
 
-Do not add EasyDeL-specific axis policy to eFormer. Put integration code in
-EasyDeL if it depends on EasyDeL config objects.
+Do not add EasyDeL-specific axis policy to eFormer. Put integration code in EasyDeL if it depends on EasyDeL config
+objects.
 
 ## Verification
 

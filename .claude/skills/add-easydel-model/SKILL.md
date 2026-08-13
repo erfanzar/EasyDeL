@@ -19,13 +19,11 @@ Read these before editing:
 - `libs/easydel/docs/infra/adding_models.md`
 - `libs/easydel/docs/infra/base_config.md`
 - `libs/easydel/docs/infra/base_module.md`
-- `libs/easydel/docs/infra/elarge_model.md` when the model is meant to train
-  or serve through eLarge.
+- `libs/easydel/docs/infra/elarge_model.md` when the model is meant to train or serve through eLarge.
 - `libs/easydel/easydel/infra/factory.py`
 - `libs/easydel/easydel/modules/auto/auto_modeling.py`
 
-Then open a nearby model family with the same task shape. For decoder-only
-causal LM work, start with:
+Then open a nearby model family with the same task shape. For decoder-only causal LM work, start with:
 
 - `libs/easydel/easydel/modules/qwen3/qwen3_configuration.py`
 - `libs/easydel/easydel/modules/qwen3/modeling_qwen3.py`
@@ -55,20 +53,17 @@ If the model maps to Hugging Face weights:
 - inspect `from_torch` and `to_torch` implementations in nearby models
 - add or update conversion tests near
   `libs/easydel/tests/modules/test_conversion_roundtrip.py`
-- verify tensor names, transposes, fused projection packing, and dtype handling
-  from real tensors, not by assuming config names are enough
+- verify tensor names, transposes, fused projection packing, and dtype handling from real tensors, not by assuming
+  config names are enough
 
-When the model uses fused QKV, fused gate/up projections, quantized linears, or
-TP-portable checkpoint layout, load
+When the model uses fused QKV, fused gate/up projections, quantized linears, or TP-portable checkpoint layout, load
 `.claude/skills/quantization-layout/SKILL.md` before editing.
 
 ## Shape And Sharding Rules
 
 - Prefer existing EasyDeL layers and sharding APIs over model-local helpers.
-- Keep mesh and partition semantics compatible with `PartitionAxis` and the
-  model's existing config fields.
-- Derive vocabulary-sensitive behavior from tensor shapes when the tensor is
-  already present.
+- Keep mesh and partition semantics compatible with `PartitionAxis` and the model's existing config fields.
+- Derive vocabulary-sensitive behavior from tensor shapes when the tensor is already present.
 - Preserve public return shapes and cache structures from adjacent model heads.
 
 ## Verification
@@ -89,5 +84,5 @@ XLA_FLAGS=--xla_force_host_platform_device_count=8 \
   uv run pytest libs/easydel/tests/modules/test_conversion_roundtrip.py
 ```
 
-Do not claim training or serving readiness from constructor-only tests. If the
-claim is eLarge training or eSurge serving, also load the matching skill.
+Do not claim training or serving readiness from constructor-only tests. If the claim is eLarge training or eSurge
+serving, also load the matching skill.

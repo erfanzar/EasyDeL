@@ -1,8 +1,7 @@
 # EasyDeL Operations
 
-Read this before treating infrastructure symptoms as code bugs. On a TPU host,
-pin only unrelated host-side probes to CPU. CPU checks are not a substitute for
-TPU kernel, eSurge runtime, Mosaic lowering, or performance validation:
+Read this before treating infrastructure symptoms as code bugs. On a TPU host, pin only unrelated host-side probes to
+CPU. CPU checks are not a substitute for TPU kernel, eSurge runtime, Mosaic lowering, or performance validation:
 
 ```bash
 ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
@@ -36,14 +35,12 @@ fuser /dev/vfio/0 || true
 ls -l /tmp/libtpu_lockfile || true
 ```
 
-If a setup failure ends with an import error, scroll up to the first remote
-install or clone failure. The later import failure is often only fallout from a
-failed Git clone, submodule, or editable install.
+If a setup failure ends with an import error, scroll up to the first remote install or clone failure. The later import
+failure is often only fallout from a failed Git clone, submodule, or editable install.
 
 Bad-node indicators include TPU runtime failures such as
-`FAILED_PRECONDITION`, `Device or resource busy`, or an otherwise healthy code
-path failing to initialize the accelerator on exactly one host. Confirm the
-target node before any destructive action:
+`FAILED_PRECONDITION`, `Device or resource busy`, or an otherwise healthy code path failing to initialize the
+accelerator on exactly one host. Confirm the target node before any destructive action:
 
 ```bash
 gcloud compute tpus tpu-vm describe "$TPU_NAME" --project="$PROJECT_ID" --zone="$ZONE"
@@ -58,8 +55,7 @@ Only delete a specific bad TPU VM when the user has approved node recovery:
 gcloud compute tpus tpu-vm delete "$TPU_NAME" --project="$PROJECT_ID" --zone="$ZONE" --quiet
 ```
 
-Do not delete a whole slice or restart broad infrastructure as a debugging
-shortcut.
+Do not delete a whole slice or restart broad infrastructure as a debugging shortcut.
 
 ## eSurge Debugging
 
@@ -95,9 +91,8 @@ python an eSurge benchmark harness \
   --json-out /tmp/easydel_esurge_bench.json
 ```
 
-Use `--sharding-axis-dims` in `pp,dp,fsdp,ep,tp,sp` order. The benchmark
-constructs a no-MTP workload with `num_speculative_tokens=0`; do not interpret
-it as a speculative-decoding test.
+Use `--sharding-axis-dims` in `pp,dp,fsdp,ep,tp,sp` order. The benchmark constructs a no-MTP workload with
+`num_speculative_tokens=0`; do not interpret it as a speculative-decoding test.
 
 Symptom routes:
 
@@ -109,16 +104,14 @@ Symptom routes:
   `tests/inference/esurge/core/test_dp_sharding_pages.py`.
 - Throughput regressions: compare an eSurge benchmark harness JSON
   `profile_by_total_tokens` buckets, not only aggregate tokens/sec.
-- Text-only serving: keep speculative/MTP disabled unless the user explicitly
-  asks for speculative decoding.
+- Text-only serving: keep speculative/MTP disabled unless the user explicitly asks for speculative decoding.
 
-Set `EASURGE_SYNC_INPUTS_FOR_TIMING=1` only when measuring prep-time accuracy;
-it adds a device round trip and can hurt throughput.
+Set `EASURGE_SYNC_INPUTS_FOR_TIMING=1` only when measuring prep-time accuracy; it adds a device round trip and can hurt
+throughput.
 
 ## Disk-Pressure Cascade
 
-Start with filesystem and cache ownership, then fix the source that filled the
-disk.
+Start with filesystem and cache ownership, then fix the source that filled the disk.
 
 ```bash
 df -h
@@ -131,10 +124,8 @@ Repo-specific sources:
 
 - `scripts/download_hf_repo_chunked_to_gcs.py` has `--staging-dir`,
   `--chunk-gb`, `--keep-staging`, and warns when `/mnt/gcs` is not mounted.
-- `scripts/download_hf_large_weights_to_gcs.py` has `--cache-dir`; set it to a
-  non-root disk or mount.
-- `scripts/mount_gcsfuse.sh` is the intended helper for mounting a GCS bucket
-  before writing under `/mnt/gcs`.
+- `scripts/download_hf_large_weights_to_gcs.py` has `--cache-dir`; set it to a non-root disk or mount.
+- `scripts/mount_gcsfuse.sh` is the intended helper for mounting a GCS bucket before writing under `/mnt/gcs`.
 
 Safe cleanup candidates in this repo are generated caches:
 
@@ -142,5 +133,5 @@ Safe cleanup candidates in this repo are generated caches:
 find . -type d \( -name .pytest_cache -o -name .ruff_cache -o -name __pycache__ \) -prune -print
 ```
 
-Do not delete checkpoints, downloaded model weights, GCS-mounted outputs, or
-user scratch directories without explicit confirmation.
+Do not delete checkpoints, downloaded model weights, GCS-mounted outputs, or user scratch directories without explicit
+confirmation.

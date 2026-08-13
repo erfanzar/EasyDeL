@@ -7,8 +7,7 @@ description: Build, normalize, pretokenize, pack, mix, save, or validate EasyDat
 
 This is a specialization of `.claude/skills/run-research/SKILL.md`.
 
-Load and follow `run-research` first. For disk pressure or staging failures,
-read `.claude/ops/OPS.md`.
+Load and follow `run-research` first. For disk pressure or staging failures, read `.claude/ops/OPS.md`.
 
 ## First Reads
 
@@ -55,8 +54,8 @@ Prefer the existing EasyData APIs:
 - `save_dataset`
 
 `MixedShardedSource` injects `__source__`; the packing path in
-`libs/easydel/easydel/data/transforms/pack.py` forwards source provenance.
-Keep that provenance visible when debugging mixed packed batches.
+`libs/easydel/easydel/data/transforms/pack.py` forwards source provenance. Keep that provenance visible when debugging
+mixed packed batches.
 
 ## Tool-Calling Dataset Normalization
 
@@ -77,8 +76,7 @@ Useful flags:
 - `--push-to-hub` / `--no-push-to-hub`
 - `--private` / `--no-private`
 
-Do a small `--max-rows` run first, then inspect the produced JSONL, Parquet, or
-metadata artifact.
+Do a small `--max-rows` run first, then inspect the produced JSONL, Parquet, or metadata artifact.
 
 ## Output Contract
 
@@ -92,8 +90,8 @@ Before writing code, pin down:
 - tokenizer and sequence length
 - provenance fields that must survive packing
 
-If the user says "all in one", produce one merged output/config label while
-keeping row-level provenance fields where the pipeline supports it.
+If the user says "all in one", produce one merged output/config label while keeping row-level provenance fields where
+the pipeline supports it.
 
 ## Verification
 

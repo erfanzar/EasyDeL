@@ -1,8 +1,7 @@
 # CUDA GPU Profiling Cheatsheet
 
-Exact commands, `ncu` sections/metrics, and correctness tools for the workflow
-in `SKILL.md`. Two rules underpin all of it: **lock clocks before timing**, and
-**`ncu` is for attribution, CUDA events are for timing** (ncu replay times are
+Exact commands, `ncu` sections/metrics, and correctness tools for the workflow in `SKILL.md`. Two rules underpin all of
+it: **lock clocks before timing**, and **`ncu` is for attribution, CUDA events are for timing** (ncu replay times are
 not your benchmark).
 
 ## 0. Stabilize the device first
@@ -24,11 +23,11 @@ Without this, boost and thermal drift will masquerade as a result.
 nvcc -O3 -lineinfo -Xptxas -v kernel.cu -o app
 ```
 
-- `-Xptxas -v` prints per-kernel **registers/thread, shared mem/block, and spill
-  stores/loads**. Spills are silent in source and often the whole story.
+- `-Xptxas -v` prints per-kernel **registers/thread, shared mem/block, and spill stores/loads**. Spills are silent in
+  source and often the whole story.
 - `-lineinfo` lets `ncu` correlate counters back to source lines.
-- Test `__launch_bounds__` / `-maxrregcount=N` and re-read `-v` to confirm you
-  cut registers *without* introducing spills.
+- Test `__launch_bounds__` / `-maxrregcount=N` and re-read `-v` to confirm you cut registers *without* introducing
+  spills.
 
 ## 2. Timing — CUDA events, not wall clock
 
@@ -54,19 +53,17 @@ ncu --launch-skip 5 --launch-count 1 ./app           # skip warmup launches
 
 Read sections in this order:
 
-1. **GPU Speed Of Light Throughput** (`SpeedOfLight`) — the classifier. Compare
-   **Compute (SM) %** vs **Memory %** of peak. Whichever is higher names the
-   bound. Includes the **roofline chart**.
+1. **GPU Speed Of Light Throughput** (`SpeedOfLight`) — the classifier. Compare **Compute (SM) %** vs **Memory %** of
+   peak. Whichever is higher names the bound. Includes the **roofline chart**.
 2. **Memory Workload Analysis** (`MemoryWorkloadAnalysis`) — **sectors/request**
-   (coalescing: 32 = perfect for a 128-byte line, higher = scattered), L1/L2 hit
-   rates, and **shared-memory bank conflicts**.
+   (coalescing: 32 = perfect for a 128-byte line, higher = scattered), L1/L2 hit rates, and **shared-memory bank
+   conflicts**.
 3. **Occupancy** (`Occupancy`) — achieved vs theoretical and the **limiter**
    (registers / shared mem / block size).
-4. **Scheduler / Warp State Statistics** (`SchedulerStats`, `WarpStateStats`) —
-   top **stall reasons** (e.g. `Long Scoreboard` = waiting on global memory;
+4. **Scheduler / Warp State Statistics** (`SchedulerStats`, `WarpStateStats`) — top **stall reasons** (e.g.
+   `Long Scoreboard` = waiting on global memory;
    `MIO Throttle`; `Barrier`).
-5. **Source Counters** (`SourceCounters`) — branch efficiency (divergence) and
-   per-line local-memory traffic (spills).
+5. **Source Counters** (`SourceCounters`) — branch efficiency (divergence) and per-line local-memory traffic (spills).
 
 Useful targeted metrics (`ncu --metrics ...`):
 
@@ -85,9 +82,8 @@ nsys profile --stats=true -o timeline ./app    # prints summary tables
 nsys-ui timeline.nsys-rep                       # GUI timeline
 ```
 
-Use to decide whether the kernel is even the bottleneck: launch overhead,
-serialized H2D/D2H copies, missing stream overlap, or many tiny kernels (→ fuse
-/ CUDA graphs).
+Use to decide whether the kernel is even the bottleneck: launch overhead, serialized H2D/D2H copies, missing stream
+overlap, or many tiny kernels (→ fuse / CUDA graphs).
 
 ## 5. Correctness — `compute-sanitizer`
 
@@ -99,8 +95,7 @@ compute-sanitizer --tool initcheck  ./app   # uninitialized global reads
 compute-sanitizer --tool memcheck --leak-check full ./app
 ```
 
-Run **before** trusting any performance result. A race or OOB makes the timing
-meaningless.
+Run **before** trusting any performance result. A race or OOB makes the timing meaningless.
 
 ## 6. Reporting checklist
 

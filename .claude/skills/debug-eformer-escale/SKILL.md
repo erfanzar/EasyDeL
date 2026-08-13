@@ -7,9 +7,8 @@ description: Debug or extend mesh and sharding orchestration in libs/eformer/efo
 
 This is a specialization of `.claude/skills/run-research/SKILL.md`.
 
-Load and follow `run-research` first. Use this skill when the failure involves
-mesh creation, logical-axis mapping, automatic sharding, or sharding-constraint
-errors coming from `libs/eformer/eformer/escale`.
+Load and follow `run-research` first. Use this skill when the failure involves mesh creation, logical-axis mapping,
+automatic sharding, or sharding-constraint errors coming from `libs/eformer/eformer/escale`.
 
 ## First Reads
 
@@ -31,8 +30,8 @@ Read these before editing:
 2. Register a new logical/semantic axis and its mapping in `PartitionAxis`.
 3. Change automatic sharding behavior in `auto_partition_spec` or add a new
    `ShardingRule`.
-4. Trace sharding-constraint mismatches (wrong axis, non-divisible dims, missing
-   mesh) through `with_sharding_constraint` and `PartitionManager`.
+4. Trace sharding-constraint mismatches (wrong axis, non-divisible dims, missing mesh) through
+   `with_sharding_constraint` and `PartitionManager`.
 
 ## Routing
 

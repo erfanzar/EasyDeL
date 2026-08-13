@@ -6,9 +6,9 @@ workspace:
   kind: uv-workspace monorepo (source of truth; libs mirrored to standalone repos on push)
   layering_contract:
     rule: only easydel may import spectrax/ejkernel/eformer/eray; foundation libs independent of each other
-    enforced_by: [uv run lint-imports, .github/workflows/workspace-ci.yaml]
+    enforced_by: [ uv run lint-imports, .github/workflows/workspace-ci.yaml ]
   test_env_cpu: "ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=8"
-  mesh_axes_easydel: [pp, dp, fsdp, ep, tp, sp]   # EasyDeLBaseConfig order; -1 dim auto-fills
+  mesh_axes_easydel: [ pp, dp, fsdp, ep, tp, sp ]   # EasyDeLBaseConfig order; -1 dim auto-fills
 
 packages:
   easydel:
@@ -18,59 +18,59 @@ packages:
     subsystems:
       infra:
         path: libs/easydel/easydel/infra
-        owns: [EasyDeLBaseConfig, EasyDeLBaseModule, EasyDeLState, TaskType/registry (factory.py),
-               LossConfig/LossMetrics (loss_utils.py), AxisPolicy/RuntimeShardingResolver (sharding.py),
-               HF bridge (mixins/bridge.py), generation mixin, elarge/]
+        owns: [ EasyDeLBaseConfig, EasyDeLBaseModule, EasyDeLState, TaskType/registry (factory.py),
+                LossConfig/LossMetrics (loss_utils.py), AxisPolicy/RuntimeShardingResolver (sharding.py),
+                HF bridge (mixins/bridge.py), generation mixin, elarge/ ]
         extension_points:
           - register_config("<model_type>") / register_module(TaskType, ...)  # factory.py
           - BaseLossStrategy subclasses (loss_utils.py)
           - eLarge config sections (elarge/types/*)
       layers:
         path: libs/easydel/easydel/layers
-        owns: [UnifiedAttention (attention/_unified.py), FlexibleAttentionModule,
-               Column/RowParallelLinear (linears/), fused layouts + reform rules (layouts/),
-               BaseMoeModule (moe/), norms, rotary variants, quantization]
+        owns: [ UnifiedAttention (attention/_unified.py), FlexibleAttentionModule,
+                Column/RowParallelLinear (linears/), fused layouts + reform rules (layouts/),
+                BaseMoeModule (moe/), norms, rotary variants, quantization ]
       operations:
         path: libs/easydel/easydel/operations
-        owns: [OperationRegistry, BaseOperation platform dispatch, OperationMetadata sharding,
-               requirements/ (cache+metadata contracts), kernels/ (ejkernel adapters)]
+        owns: [ OperationRegistry, BaseOperation platform dispatch, OperationMetadata sharding,
+                requirements/ (cache+metadata contracts), kernels/ (ejkernel adapters) ]
         exemplar_adapter: libs/easydel/easydel/operations/kernels/gated_delta_rule.py
       modules:
         path: libs/easydel/easydel/modules
-        owns: ["~74 model families: <family>/{modeling_<family>.py,<family>_configuration.py}",
-               _base/ task wrappers, auto/ factory classes]
+        owns: [ "~74 model families: <family>/{modeling_<family>.py,<family>_configuration.py}",
+                _base/ task wrappers, auto/ factory classes ]
       caching:
         path: libs/easydel/easydel/caching
-        owns: [Transformer, RaggedPages, MLARaggedPages, Recurrent, Linear, Hybrid, Lightning, KDA caches]
+        owns: [ Transformer, RaggedPages, MLARaggedPages, Recurrent, Linear, Hybrid, Lightning, KDA caches ]
       trainers:
         path: libs/easydel/easydel/trainers
-        owns: [base_trainer.py, trainer/trainer.py, training_configurations.py (TrainingArguments),
-               "~40 trainer dirs each: <name>_config.py + <name>_trainer.py + _fn.py",
-               reward_protocol.py, esurge_rollout/, agentic_moshpit/]
+        owns: [ base_trainer.py, trainer/trainer.py, training_configurations.py (TrainingArguments),
+                "~40 trainer dirs each: <name>_config.py + <name>_trainer.py + _fn.py",
+                reward_protocol.py, esurge_rollout/, agentic_moshpit/ ]
         registration: '@Registry.register("trainer-arguments", name) AND @Registry.register("trainer", name)'
       inference:
         path: libs/easydel/easydel/inference
-        owns: [esurge/ (engine, scheduler/, runners/, core/ cache+sampler, server/, distributed/, multimodal/),
-               tools/parsers (35+), reasoning/parsers (15+), vwhisper/, sampling]
+        owns: [ esurge/ (engine, scheduler/, runners/, core/ cache+sampler, server/, distributed/, multimodal/),
+                tools/parsers (35+), reasoning/parsers (15+), vwhisper/, sampling ]
       data:
         path: libs/easydel/easydel/data
-        owns: [Pipeline builder (execution/pipeline.py), sources/, transforms DSL (">>"), distributed/ Ray preprocessing]
+        owns: [ Pipeline builder (execution/pipeline.py), sources/, transforms DSL (">>"), distributed/ Ray preprocessing ]
       utils_workers:
-        paths: [libs/easydel/easydel/utils, libs/easydel/easydel/workers, libs/easydel/easydel/scripts]
-        owns: [parameters_transformation (HF<->EasyDeL), ejit/compiling_utils, jit_context,
-               ZMQ workers + response stores, elarge.py runner]
+        paths: [ libs/easydel/easydel/utils, libs/easydel/easydel/workers, libs/easydel/easydel/scripts ]
+        owns: [ parameters_transformation (HF<->EasyDeL), ejit/compiling_utils, jit_context,
+                ZMQ workers + response stores, elarge.py runner ]
   spectrax:
     path: libs/spectrax
     role: spx.Module object model + MPMD/SPMD pipeline runtime
     import_alias: spx
     tests: libs/spectrax/tests
     owns:
-      core: [Module, Parameter/Buffer/RngStream, GraphDef/State via export()/bind(), Selector]
-      transforms: [spx.jit (mutable-aware), grad/value_and_grad (wrt selector), scan (carry/invariant), vmap, remat]
-      runtime: [mpmd/ (sxcall/sxjit, sxstage_iter/sxstage_region markers, per-rank compile),
-                spmd/ (shard_map path), schedules/ (GPipe, 1F1B, ZeroBubble, Interleaved, DualPipeV, ...)]
-      sharding: [logical axis rules, get_named_sharding, SpxMesh (is_mpmd)]
-      serialization: [Checkpointer, AsyncCheckpointManager (TensorStore)]
+      core: [ Module, Parameter/Buffer/RngStream, GraphDef/State via export()/bind(), Selector ]
+      transforms: [ spx.jit (mutable-aware), grad/value_and_grad (wrt selector), scan (carry/invariant), vmap, remat ]
+      runtime: [ mpmd/ (sxcall/sxjit, sxstage_iter/sxstage_region markers, per-rank compile),
+                 spmd/ (shard_map path), schedules/ (GPipe, 1F1B, ZeroBubble, Interleaved, DualPipeV, ...) ]
+      sharding: [ logical axis rules, get_named_sharding, SpxMesh (is_mpmd) ]
+      serialization: [ Checkpointer, AsyncCheckpointManager (TensorStore) ]
   ejkernel:
     path: libs/ejkernel
     role: hardware kernels behind priority registry with mandatory XLA fallback
@@ -78,27 +78,27 @@ packages:
     benchmarks: libs/ejkernel/benchmarks
     owns:
       modules_operations: "Kernel[Config,Out] subclasses + configs (modules/operations/)"
-      backends: [kernels/_triton, "kernels/_pallas/{tpu,gpu}", kernels/_cuda, kernels/_cute, kernels/_tilelang, kernels/_xla]
+      backends: [ kernels/_triton, "kernels/_pallas/{tpu,gpu}", kernels/_cuda, kernels/_cute, kernels/_tilelang, kernels/_xla ]
       registry: "kernels/_registry.py — @kernel_registry.register(name, Platform, Backend, priority); XLA fallback priority 0"
-      ops: [Executor, autotune, 7-tier config selection, persistent cache ~/ejkernel-presistent-cache/, fingerprinting]
-      callib: [triton_call, pallas_call, cute_call, tilelang_call, ejit]
+      ops: [ Executor, autotune, 7-tier config selection, persistent cache ~/ejkernel-presistent-cache/, fingerprinting ]
+      callib: [ triton_call, pallas_call, cute_call, tilelang_call, ejit ]
   eformer:
     path: libs/eformer
     role: scale infrastructure
     tests: libs/eformer/tests
     owns:
-      escale: [create_mesh (multi-slice DCN), PartitionAxis, PartitionManager, auto_partition_spec]
+      escale: [ create_mesh (multi-slice DCN), PartitionAxis, PartitionManager, auto_partition_spec ]
       optimizers: "OptimizerFactory + @register_optimizer builders; scheduler factories"
-      serialization: [Checkpointer, AsyncCheckpointManager, sharded TensorStore save/load without all-gather]
-      mpric: [Policy, PrecisionHandler, DynamicLossScale]
-      jaximus_ops: [ImplicitArray dispatch, NF4/INT8 quantized arrays]
-      misc: [aparser (dataclass CLI/YAML), pytree utils, ePath (local/GCS), common_types semantic axes]
+      serialization: [ Checkpointer, AsyncCheckpointManager, sharded TensorStore save/load without all-gather ]
+      mpric: [ Policy, PrecisionHandler, DynamicLossScale ]
+      jaximus_ops: [ ImplicitArray dispatch, NF4/INT8 quantized arrays ]
+      misc: [ aparser (dataclass CLI/YAML), pytree utils, ePath (local/GCS), common_types semantic axes ]
   eray:
     path: libs/eray
     role: Ray orchestration for TPU/GPU pods
     tests: libs/eray/tests
-    owns: [cli (eray tpu connect/status/health/list), execution (RayExecutor, autoscale_execute_resumable),
-           pool (SlicePoolManager/SliceActor/DeviceHostActor), resources (accelerator configs), docker]
+    owns: [ cli (eray tpu connect/status/health/list), execution (RayExecutor, autoscale_execute_resumable),
+            pool (SlicePoolManager/SliceActor/DeviceHostActor), resources (accelerator configs), docker ]
   external optimizer package:
     path: external optimizer package
     role: quantization-aware optimizers registered into easydel via @register_optimizer
@@ -132,17 +132,17 @@ ci:
   - publish.yaml: tag-triggered per-package PyPI publish
   - sync-subtrees.yaml: server-side mirror backstop
 
-ownership_routing:  # which .claude/agents expert owns a surface
-  libs/easydel/easydel/infra: [architect, sharding-expert]
-  libs/easydel/easydel/modules: [model-expert]
-  libs/easydel/easydel/layers: [model-expert, quantization-expert]
-  libs/easydel/easydel/operations: [kernel-expert]
-  libs/easydel/easydel/caching: [model-expert, inference-expert]
-  libs/easydel/easydel/trainers: [trainer-expert, rlhf-expert]
-  libs/easydel/easydel/inference: [inference-expert]
-  libs/easydel/easydel/data: [trainer-expert]
-  libs/spectrax: [jax-expert, sharding-expert]
-  libs/ejkernel: [kernel-expert]
-  libs/eformer: [sharding-expert, quantization-expert]
-  libs/eray: [tpu-expert]
-  external optimizer package: [quantization-expert]
+ownership_routing: # which .claude/agents expert owns a surface
+  libs/easydel/easydel/infra: [ architect, sharding-expert ]
+  libs/easydel/easydel/modules: [ model-expert ]
+  libs/easydel/easydel/layers: [ model-expert, quantization-expert ]
+  libs/easydel/easydel/operations: [ kernel-expert ]
+  libs/easydel/easydel/caching: [ model-expert, inference-expert ]
+  libs/easydel/easydel/trainers: [ trainer-expert, rlhf-expert ]
+  libs/easydel/easydel/inference: [ inference-expert ]
+  libs/easydel/easydel/data: [ trainer-expert ]
+  libs/spectrax: [ jax-expert, sharding-expert ]
+  libs/ejkernel: [ kernel-expert ]
+  libs/eformer: [ sharding-expert, quantization-expert ]
+  libs/eray: [ tpu-expert ]
+  external optimizer package: [ quantization-expert ]

@@ -5,8 +5,7 @@ description: Release or publish one of the EasyDeL uv workspace packages. Use fo
 
 # Skill: Release A Workspace Package
 
-Use this when the user asks for a package release, version bump, publish, or
-mirror-sync preparation.
+Use this when the user asks for a package release, version bump, publish, or mirror-sync preparation.
 
 ## First Reads
 
@@ -26,8 +25,8 @@ scripts/release.sh <easydel|spectrax|ejkernel|eformer> <new-version> --dry-run
 scripts/release.sh <easydel|spectrax|ejkernel|eformer> <new-version>
 ```
 
-The script updates the target package version, updates dependent pins when
-needed, refreshes the lockfile, stages release files, and creates a local commit.
+The script updates the target package version, updates dependent pins when needed, refreshes the lockfile, stages
+release files, and creates a local commit.
 
 ## Publish Rule
 
@@ -49,8 +48,8 @@ Foundation packages mirror to standalone repositories via:
 scripts/subtree-sync.sh auto
 ```
 
-The pre-push hook runs subtree sync. `SUBTREE_SYNC_SKIP=1 git push ...` bypasses
-the hook when the user knowingly wants to skip mirror sync.
+The pre-push hook runs subtree sync. `SUBTREE_SYNC_SKIP=1 git push ...` bypasses the hook when the user knowingly wants
+to skip mirror sync.
 
 ## Verification
 
@@ -66,6 +65,5 @@ when the release includes code changes beyond version metadata.
 
 ## Text Policy
 
-Do not include self-credit trailers or generated-by lines in commits, tags,
-release notes, or PR text. Keep release notes about package behavior and user
-impact only.
+Do not include self-credit trailers or generated-by lines in commits, tags, release notes, or PR text. Keep release
+notes about package behavior and user impact only.

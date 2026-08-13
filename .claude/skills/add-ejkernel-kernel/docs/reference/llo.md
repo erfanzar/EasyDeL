@@ -1,7 +1,6 @@
 # TPU Dump Diagnostics Reference
 
-Use this when TPU Pallas performance is unclear and wall-clock timing alone
-does not explain the result.
+Use this when TPU Pallas performance is unclear and wall-clock timing alone does not explain the result.
 
 ## Contents
 
@@ -29,13 +28,12 @@ Keep one fixed shape, dtype, backend, and device count while diagnosing.
 
 ## Verification Status
 
-`XLA_FLAGS=--xla_dump_to=... --xla_dump_hlo_as_text` can be checked on CPU for
-flag spelling, but CPU dumps are not TPU Pallas diagnostics.
+`XLA_FLAGS=--xla_dump_to=... --xla_dump_hlo_as_text` can be checked on CPU for flag spelling, but CPU dumps are not TPU
+Pallas diagnostics.
 
 This workspace does not ship a wrapper for TPU LLO/Mosaic dumps. Treat
-`LIBTPU_INIT_ARGS` dump flags as target-TPU diagnostics: before a large run,
-run one tiny TPU compile with the exact flags and record whether that TPU
-runtime accepts them.
+`LIBTPU_INIT_ARGS` dump flags as target-TPU diagnostics: before a large run, run one tiny TPU compile with the exact
+flags and record whether that TPU runtime accepts them.
 
 ## HLO Dump Setup
 
@@ -57,9 +55,8 @@ EJKERNEL_BENCH_OUTPUT_DIR="${ROOT}/${VARIANT}/bench" \
   uv run python libs/ejkernel/benchmarks/benchmark_suite.py
 ```
 
-Run this only when this process owns the TPU. If you only need to verify HLO
-dump flag spelling on a non-TPU host, you may run a separate CPU preflight, but
-do not include those dumps in TPU diagnosis.
+Run this only when this process owns the TPU. If you only need to verify HLO dump flag spelling on a non-TPU host, you
+may run a separate CPU preflight, but do not include those dumps in TPU diagnosis.
 
 ## TPU LLO/Mosaic Setup
 
@@ -92,9 +89,8 @@ EJKERNEL_BENCH_OUTPUT_DIR="${ROOT}/${VARIANT}/bench" \
   uv run python libs/ejkernel/benchmarks/benchmark_suite.py
 ```
 
-Keep `LIBTPU_INIT_ARGS` identical between compared TPU variants. If scoped
-VMEM flags are part of the experiment, record them and keep them fixed for the
-matrix.
+Keep `LIBTPU_INIT_ARGS` identical between compared TPU variants. If scoped VMEM flags are part of the experiment, record
+them and keep them fixed for the matrix.
 
 ## Variant Matrix
 
@@ -104,9 +100,8 @@ For a high-signal comparison, run at least:
 2. Current Pallas implementation with `EJKERNEL_BENCH_PLATFORMS=pallas`.
 3. One decomposition variant that removes or isolates a suspected stage.
 
-Use the same benchmark spec, config limit, shape, dtype, warmup, iterations,
-and target TPU type. Do not compare CPU XLA against TPU Pallas for correctness,
-lowering, or performance.
+Use the same benchmark spec, config limit, shape, dtype, warmup, iterations, and target TPU type. Do not compare CPU XLA
+against TPU Pallas for correctness, lowering, or performance.
 
 ## What To Inspect
 

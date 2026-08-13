@@ -7,8 +7,7 @@ description: Implement, debug, or benchmark SpectraX module-system and pipeline-
 
 This is a specialization of `.claude/skills/run-research/SKILL.md`.
 
-Load and follow `run-research` first. This skill adds SpectraX-specific package
-ownership and runtime routing.
+Load and follow `run-research` first. This skill adds SpectraX-specific package ownership and runtime routing.
 
 ## First Reads
 
@@ -32,21 +31,18 @@ Examples and benchmarks:
 ## Package Boundary
 
 `libs/spectrax` is a foundation package. It must not import `easydel`,
-`ejkernel`, or `eformer`. Keep examples generic or inside the EasyDeL package
-when EasyDeL integration is required.
+`ejkernel`, or `eformer`. Keep examples generic or inside the EasyDeL package when EasyDeL integration is required.
 
 ## Runtime Decision Tree
 
-- Use `pipeline_step` for SPMD-only staged computation. It rejects MPMD-tagged
-  meshes.
+- Use `pipeline_step` for SPMD-only staged computation. It rejects MPMD-tagged meshes.
 - Use `sxcall` or `sxjit` for true MPMD execution with per-rank executables.
 - Use `sxstage_iter` and `sxstage_region` for inline stage markers.
 - Choose a schedule from the existing runtime: `GPipe`, `Std1F1B`,
-  `ZeroBubbleH1`, `InterleavedH1`, or the documented `DualPipeV` example path
-  when the code path supports it.
+  `ZeroBubbleH1`, `InterleavedH1`, or the documented `DualPipeV` example path when the code path supports it.
 
-Stage-local mesh rule: an MPMD full mesh such as `(pp=2, dp=4, tp=2)` becomes a
-stage-local mesh such as `(dp=4, tp=2)` inside a stage.
+Stage-local mesh rule: an MPMD full mesh such as `(pp=2, dp=4, tp=2)` becomes a stage-local mesh such as `(dp=4, tp=2)`
+inside a stage.
 
 ## What To Inspect
 
@@ -72,5 +68,4 @@ XLA_FLAGS=--xla_force_host_platform_device_count=8 \
 ```
 
 For benchmark claims, run the relevant script under `libs/spectrax/benchmarks/`
-and report hardware, mesh, schedule, microbatch count, compile-including timing
-when relevant, and steady-state timing.
+and report hardware, mesh, schedule, microbatch count, compile-including timing when relevant, and steady-state timing.

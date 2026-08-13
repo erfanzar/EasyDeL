@@ -22,26 +22,21 @@ Use this for commit/PR hygiene. For code review, load
 ## Worktree Discipline
 
 - Do not stage unrelated user changes.
-- If a file has user edits plus your edits, inspect the diff carefully and
-  stage only the intended hunks.
-- Never use destructive reset or checkout commands unless the user explicitly
-  asks for that operation.
-- Do not create or restore `CLAUDE.md` files for this repo unless the user
-  reverses the current instruction.
+- If a file has user edits plus your edits, inspect the diff carefully and stage only the intended hunks.
+- Never use destructive reset or checkout commands unless the user explicitly asks for that operation.
+- Do not create or restore `CLAUDE.md` files for this repo unless the user reverses the current instruction.
 
 ## Checks
 
-Run focused tests selected through `.claude/skills/test-workspace/SKILL.md` for
-the touched package. Also run:
+Run focused tests selected through `.claude/skills/test-workspace/SKILL.md` for the touched package. Also run:
 
 ```bash
 uv run lint-imports
 uv run pre-commit run --all-files
 ```
 
-Pre-commit hooks may auto-fix and return `Failed`. When that happens, review the
-modifications, restage intended files, and rerun. Hook entries should use direct
-repo commands as configured; do not add `uv run` inside hook definitions.
+Pre-commit hooks may auto-fix and return `Failed`. When that happens, review the modifications, restage intended files,
+and rerun. Hook entries should use direct repo commands as configured; do not add `uv run` inside hook definitions.
 
 ## Release And Version Policy
 
@@ -60,13 +55,12 @@ Foundation packages mirror to standalone repos via the pre-push hook:
 scripts/subtree-sync.sh auto
 ```
 
-`SUBTREE_SYNC_SKIP=1 git push ...` bypasses mirror sync when the user knowingly
-wants that path.
+`SUBTREE_SYNC_SKIP=1 git push ...` bypasses mirror sync when the user knowingly wants that path.
 
 ## Commit And PR Text
 
-Do not add self-credit trailers or generated-by lines in commits, PRs, tags, or
-release notes. Forbidden examples include `Co-Authored-By` and
+Do not add self-credit trailers or generated-by lines in commits, PRs, tags, or release notes. Forbidden examples
+include `Co-Authored-By` and
 `Generated with`.
 
 PR summaries should cover:
@@ -77,5 +71,5 @@ PR summaries should cover:
 - skipped hardware or end-to-end checks
 - release or migration notes when relevant
 
-Keep PR claims aligned with verification. Do not claim TPU, eSurge, checkpoint,
-or benchmark validation unless that path actually ran.
+Keep PR claims aligned with verification. Do not claim TPU, eSurge, checkpoint, or benchmark validation unless that path
+actually ran.
