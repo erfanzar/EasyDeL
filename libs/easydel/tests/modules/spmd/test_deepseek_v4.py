@@ -14,14 +14,13 @@
 
 """Tests for the DeepSeek-V4 model (stateless forward + cached decode)."""
 
+import easydel as ed
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 import spectrax as spx
 import transformers
-
-import easydel as ed
 
 try:
     from tests.modules.test_utils import CausalLMTester
@@ -139,7 +138,6 @@ class TestDeepseekV4:
         ``value_and_grad`` + optimizer steps run with finite, changing params.
         """
         import optax
-
         from easydel.infra.base_state import EasyDeLState
         from easydel.modules.deepseek_v4 import modeling_deepseek_v4 as M
 
@@ -245,7 +243,16 @@ class TestDeepseekV4:
         )
 
     def _build_fp32_model(self, small_model_config, sharding_axis_dims=(1, 1, 1, 1, 1, 1), **config_overrides):
-        """Build an fp32 model for cache-parity checks."""
+        """Build an fp32 model for cache-parity checks.
+
+        ``precision=HIGHEST``, not ``None``: on TPU an f32 einsum at the default
+        precision is a single bf16 MXU pass, so "fp32 model" would silently
+        compute at the bf16 floor and every exactness assertion in this class
+        (cached decode vs stateless forward, fused op vs dense ``_attend``)
+        would compare two different precisions -- observed as a deterministic
+        1.8e-2 logits gap against the ejkernel reference, which pins HIGHEST.
+        On CPU this is a no-op.
+        """
         kwargs = _v4_config_kwargs(small_model_config)
         kwargs.update(config_overrides)
         config = ed.DeepseekV4Config(**kwargs)
@@ -257,7 +264,7 @@ class TestDeepseekV4:
                 config=config,
                 dtype=jnp.float32,
                 param_dtype=jnp.float32,
-                precision=None,
+                precision=jax.lax.Precision.HIGHEST,
                 rngs=spx.Rngs(0),
             )
             model.eval()

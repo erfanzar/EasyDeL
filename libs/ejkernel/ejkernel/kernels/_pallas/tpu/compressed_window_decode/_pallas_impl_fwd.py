@@ -72,8 +72,16 @@ def _compressed_window_decode_kernel(q_ref, kv_ref, bias_ref, sink_ref, o_ref, *
     bias = bias_ref[...].astype(jnp.float32)  # [S, L]
     sink = sink_ref[...].astype(jnp.float32)  # [H]
 
+    # Same dtype-aware policy as the full-sequence sibling kernel: the operands
+    # are upcast to f32 above, and an f32 dot at DEFAULT precision is a single
+    # bf16 MXU pass -- which cost this kernel ~3e-3 against the fp32 dense
+    # reference. HIGHEST buys the multi-pass f32 the reference math assumes.
+    # bf16 inputs keep DEFAULT: the data is already at the bf16 floor there, so
+    # extra passes would be pure cost.
+    prec = jax.lax.Precision.HIGHEST if q_ref.dtype == jnp.float32 else jax.lax.Precision.DEFAULT
+
     # logits[h, s, l] = scale * sum_d q[h, s, d] * kv[l, d] + bias[s, l]
-    logits = jax.lax.dot_general(q, kv, (((2,), (1,)), ((), ())), preferred_element_type=jnp.float32)
+    logits = jax.lax.dot_general(q, kv, (((2,), (1,)), ((), ())), preferred_element_type=jnp.float32, precision=prec)
     logits = logits * softmax_scale + bias[None, :, :]  # [H, S, L]
 
     sink_hs = sink[:, None]  # [H, 1] broadcast over S
@@ -84,7 +92,7 @@ def _compressed_window_decode_kernel(q_ref, kv_ref, bias_ref, sink_ref, o_ref, *
     p = p / denom[..., None]
 
     # out[h, s, d] = sum_l p[h, s, l] * kv[l, d]
-    out = jax.lax.dot_general(p, kv, (((2,), (0,)), ((), ())), preferred_element_type=jnp.float32)
+    out = jax.lax.dot_general(p, kv, (((2,), (0,)), ((), ())), preferred_element_type=jnp.float32, precision=prec)
     o_ref[...] = out.astype(o_ref.dtype)
 
 

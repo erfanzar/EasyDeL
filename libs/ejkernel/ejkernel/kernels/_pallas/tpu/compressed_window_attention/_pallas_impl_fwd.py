@@ -80,6 +80,11 @@ from ejkernel.ops import FwdParams
 # the online-softmax recurrence (max/exp/rescale) never evaluates inf - inf.
 _MASK_MIN = float(jnp.finfo(jnp.float32).min)
 
+#: TPU lane-tile width. Mosaic tiles a 2-D+ HBM memref ``(1, 128)`` over its
+#: last two dims, so any partial slice of the last dim must be a multiple of
+#: this. See :func:`_legal_block_kv`.
+_LANE = 128
+
 
 def _round_up(x: int, multiple: int) -> int:
     """Round ``x`` up to the nearest multiple of ``multiple``."""
@@ -529,6 +534,33 @@ def _default_blocks(q_len: int, kv_len: int, fwd_params: FwdParams | None) -> tu
     return int(block_q), int(block_kv)
 
 
+def _legal_block_kv(block_kv: int) -> int:
+    """Round ``block_kv`` up to the lane tile, which the bias DMA requires.
+
+    The per-tile bias copy is
+    ``bias_hbm_ref.at[b, ds(qb * block_q, block_q), ds(tile * block_kv, block_kv)]``.
+    Mosaic tiles that HBM buffer ``(1, 128)`` over its last two dims and
+    rejects a ``memref_slice`` whose extent along the *lane* (last) dim is not
+    a multiple of 128 -- "Slice shape along dimension 2 must be aligned to
+    tiling (128), but is 24". That holds even when the slice spans the whole
+    dimension, so the tile width, not just its alignment, has to be a lane
+    multiple; and because the padded KV extents are built as multiples of
+    ``block_kv``, fixing the tile fixes every offset too.
+
+    This overrides the adaptive default's "don't pad tiny axes to 128" rule
+    (``min(128, round_up(kv_len, 8))``), which produced tile widths like 24
+    and 40 that cannot lower on TPU at all. A user-supplied
+    ``kv_blocksize`` is rounded up for the same reason.
+
+    Args:
+        block_kv: Proposed KV tile width.
+
+    Returns:
+        ``block_kv`` rounded up to a multiple of :data:`_LANE`.
+    """
+    return _round_up(block_kv, _LANE)
+
+
 @ejit(static_argnames=["softmax_scale", "fwd_params", "window", "token_kv_len"])
 def compressed_window_attention_tpu(
     query: Float[Array, "batch num_heads q_len head_dim"],
@@ -567,6 +599,7 @@ def compressed_window_attention_tpu(
     scale = head_dim**-0.5 if softmax_scale is None else float(softmax_scale)
     block_q, block_kv = _default_blocks(q_len, kv_len, fwd_params)
     tkl = kv_len if (window <= 0 or token_kv_len <= 0) else int(token_kv_len)
+    block_kv = _legal_block_kv(block_kv)
 
     use_sink = softmax_aux is not None
     sink = jnp.zeros((num_heads,), jnp.float32) if softmax_aux is None else softmax_aux.astype(jnp.float32)

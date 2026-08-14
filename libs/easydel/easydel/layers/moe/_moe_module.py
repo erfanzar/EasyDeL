@@ -1578,6 +1578,16 @@ class BaseMoeModule(spx.Module, ABC):
         if jnp.dtype(self.dtype) == jnp.float32:
             preferred_element_type = jnp.float32
         gmm_kws = {"preferred_element_type": preferred_element_type}
+        if jnp.dtype(self.dtype) == jnp.float32:
+            # An f32 grouped matmul at the default precision is a single bf16
+            # MXU pass: measured 4e-2 (decode, m=1) and 7e-2 (prefill, m=13)
+            # against an f64 reference on v5p, versus ~1e-6 at HIGHEST. Because
+            # the rounding depends on m, prefill and decode disagree by ~2.6e-3
+            # end-to-end, which is what broke DeepSeek-V4's cached-decode parity
+            # on TPU while CPU (exact f32) stayed clean. bf16 keeps DEFAULT: the
+            # operands are already at the bf16 floor, so extra passes are pure
+            # cost.
+            gmm_kws["precision"] = jax.lax.Precision.HIGHEST
         if self.config.moe_force_xla_gmm:
             gmm_kws.update(cfg=GroupedMatmulConfig(platform="xla", bypass_xla_tiling=True))
         else:
