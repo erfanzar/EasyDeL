@@ -63,7 +63,14 @@ def compressed_window_decode_xla(
         dtype (matching the reference einsum promotion).
     """
     scale = query.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale
-    logits = jnp.einsum("bhsd,bld->bhsl", query, kv).astype(jnp.float32)
+    # HIGHEST precision so this reference is the accurate f32 attention on TPU
+    # (XLA's default matmul precision uses single-pass bf16 on the MXU, ~1e-2
+    # error), which is what the Pallas kernel is validated against. The
+    # full-sequence sibling has carried this since it was written; leaving it
+    # off here put the decode reference ~2.6e-3 from the dense math, and since
+    # this XLA path is the *default* decode platform, that surfaced as
+    # DeepSeek-V4's cached decode diverging from its own stateless forward.
+    logits = jnp.einsum("bhsd,bld->bhsl", query, kv, precision=jax.lax.Precision.HIGHEST).astype(jnp.float32)
     logits = logits * scale + bias[:, None, :, :].astype(jnp.float32)
 
     kv_len = logits.shape[-1]
@@ -79,4 +86,4 @@ def compressed_window_decode_xla(
     combined = combined - jnp.max(combined, axis=-1, keepdims=True)
     probs = jax.nn.softmax(combined, axis=-1)
     scores = probs[..., :kv_len].astype(kv.dtype)
-    return jnp.einsum("bhsl,bld->bhsd", scores, kv)
+    return jnp.einsum("bhsl,bld->bhsd", scores, kv, precision=jax.lax.Precision.HIGHEST)
