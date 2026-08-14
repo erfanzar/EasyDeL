@@ -755,8 +755,13 @@ class eSurgeDistributedConfig(TypedDict, total=False):
             on. Default ``"0.0.0.0"`` accepts connections on all
             interfaces; restrict for security.
         distributed_auth_token: Shared bearer token required on every
-            control-plane RPC. ``None`` disables auth (only safe on
-            isolated networks).
+            control-plane RPC, and identical on every host. **Mandatory
+            whenever** ``coordination="zmq"``: the step coordinator refuses to
+            start without one rather than running the plane unauthenticated,
+            because that plane mirrors the leader's runner calls and anything
+            that can reach the control port can drive the model. ``None`` is
+            accepted only for ``coordination="replicated"``, which has no
+            control plane to authenticate.
         distributed_step_timeout_s: Per-step RPC timeout in seconds. The
             leader aborts a step when no quorum of workers responds before
             this deadline. Default ``30.0``.
