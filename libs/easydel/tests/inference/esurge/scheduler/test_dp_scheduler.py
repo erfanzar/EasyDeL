@@ -4,6 +4,8 @@ import threading
 from types import SimpleNamespace
 
 import jax.numpy as jnp
+import pytest
+
 from easydel.inference.esurge.core.interface import CacheGroupsConfig, CacheGroupSpec, FullAttentionSpec
 from easydel.inference.esurge.outputs import ModelRunnerOutput
 from easydel.inference.esurge.request import EngineRequest
@@ -271,3 +273,45 @@ def test_dp_scheduler_fanout_preserves_rank_order_and_update_pairing() -> None:
         assert list(scheduler.schedulers[1].requests["r1"].output_token_ids) == [101]
     finally:
         scheduler.shutdown()
+
+
+def test_fanout_refuses_to_dispatch_once_closed() -> None:
+    """A closed scheduler names itself rather than surfacing a torn pipe.
+
+    The engine loop retries a generic exception; it cannot retry its way out of
+    workers that no longer exist, so the distinction has to be in the type.
+    """
+
+    from easydel.inference.esurge.scheduler.dp_scheduler import (
+        DPSchedulerClosed,
+        _SchedulerCommand,
+    )
+
+    scheduler = _make_dp_scheduler()
+    scheduler._mark_closed()
+
+    with pytest.raises(DPSchedulerClosed):
+        scheduler._fanout(_SchedulerCommand.SCHEDULE)
+
+
+def test_shutdown_closes_before_stopping_the_workers() -> None:
+    """Ordering, not just outcome: closed first, workers stopped second.
+
+    Reversed, a caller already inside schedule() on the engine's loop thread
+    races the workers' teardown and gets EOFError. On a two-slice run that cost
+    five retries, which delayed rank 0 past jax.distributed's shutdown barrier
+    and made rank 1 abort the job.
+    """
+
+    scheduler = _make_dp_scheduler()
+    observed: list[bool] = []
+
+    class _RecordingWorker:
+        def shutdown(self) -> None:
+            observed.append(scheduler._closed)
+
+    scheduler.schedulers = [_RecordingWorker(), _RecordingWorker()]
+    scheduler.shutdown()
+
+    assert observed == [True, True]
+    assert scheduler._closed is True

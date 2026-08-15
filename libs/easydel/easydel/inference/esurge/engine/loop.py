@@ -36,6 +36,7 @@ from easydel.utils import flags
 
 from ..distributed.coordinator import LocalCoordinator, StepHandle
 from ..logger import logger
+from ..scheduler.dp_scheduler import DPSchedulerClosed
 
 if typing.TYPE_CHECKING:
     from ..scheduler import Scheduler, SchedulerOutput
@@ -623,6 +624,14 @@ class EngineLoop:
                 self._heartbeat()
             except KeyboardInterrupt:
                 self._info("Scheduler loop interrupted by user")
+                break
+            except DPSchedulerClosed:
+                # Not a fault: the scheduler's rank workers are gone because
+                # teardown began. Retrying cannot succeed, and the retries are
+                # not free -- five of them delayed a rank past jax.distributed's
+                # shutdown barrier and its peer aborted the job.
+                pending_execution = None
+                self._info("Scheduler loop stopping: DP scheduler is shut down")
                 break
             except Exception as e:
                 pending_execution = None
