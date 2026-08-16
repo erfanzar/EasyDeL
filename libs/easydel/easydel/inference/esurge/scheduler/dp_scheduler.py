@@ -76,6 +76,15 @@ class _SchedulerCommand(enum.Enum):
     SHUTDOWN = "shutdown"
 
 
+class DPSchedulerClosed(RuntimeError):
+    """The DP scheduler's rank workers are gone; no further RPC is possible.
+
+    Raised instead of letting a closed pipe surface as ``EOFError`` or
+    ``BrokenPipeError``, which the engine loop cannot tell apart from a
+    transient fault and therefore retries.
+    """
+
+
 class _SchedulerWorkerError(Exception):
     def __init__(self, rank: int, message: str) -> None:
         self.rank = rank
@@ -458,7 +467,18 @@ class DPScheduler(SchedulerInterface):
                 scheduler.data_parallel_size = 1
             self.schedulers.append(scheduler)
 
+        self._closed = False
         if self.use_worker_processes:
+            # Registered after every rank client's own atexit hook, so LIFO runs
+            # this one first. That ordering is the whole point: those hooks
+            # SIGKILL the worker processes, and until this flag is set the
+            # engine's background scheduler thread is still calling schedule().
+            # Observed on a 2-slice v6e run -- the workers were killed at
+            # interpreter exit while the loop was live, the loop took five
+            # EOFError/BrokenPipeError retries to give up, rank 0 never reached
+            # jax.distributed's shutdown barrier, and rank 1 aborted the whole
+            # job five minutes later with "Shutdown barrier has failed".
+            atexit.register(self._mark_closed)
             self.policy = policy
             self.max_num_seq_buckets = max_num_seq_buckets or [self.max_num_running_reqs]
         else:
@@ -562,6 +582,8 @@ class DPScheduler(SchedulerInterface):
         Raises:
             Exception: The first rank error, unless ``collect_errors`` is set.
         """
+        if self._closed:
+            raise DPSchedulerClosed(f"DP scheduler is shut down; refusing to dispatch {command.value!r}")
         clients = typing.cast(list[_SchedulerWorkerClient], self.schedulers)
         started: list[_SchedulerWorkerClient] = []
         try:
@@ -1033,6 +1055,17 @@ class DPScheduler(SchedulerInterface):
             return all(bool(ok) for ok in self._fanout(_SchedulerCommand.RESET_PREFIX_CACHE))
         return all(scheduler.reset_prefix_cache() for scheduler in self.schedulers)
 
+    def _mark_closed(self) -> None:
+        """Refuse further fan-out. Safe to call from an atexit hook."""
+
+        self._closed = True
+
     def shutdown(self) -> None:
+        # Closed before the workers are told to stop, not after: a caller on
+        # another thread that is mid-schedule() must get DPSchedulerClosed
+        # rather than a torn pipe.
+        self._mark_closed()
+        if self.use_worker_processes:
+            atexit.unregister(self._mark_closed)
         for scheduler in self.schedulers:
             scheduler.shutdown()

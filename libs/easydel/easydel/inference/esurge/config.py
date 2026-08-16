@@ -717,7 +717,7 @@ class eSurgeVisionConfig(TypedDict, total=False):
         "distributed_control_bind_host": "0.0.0.0",
         "distributed_auth_token": None,
         "distributed_step_timeout_s": 30.0,
-        "distributed_connect_timeout_s": 15.0,
+        "distributed_connect_timeout_s": 600.0,
         "distributed_ready_timeout_s": 600.0,
         "distributed_heartbeat_interval_s": 1.0,
         "distributed_heartbeat_timeout_s": 5.0,
@@ -755,13 +755,30 @@ class eSurgeDistributedConfig(TypedDict, total=False):
             on. Default ``"0.0.0.0"`` accepts connections on all
             interfaces; restrict for security.
         distributed_auth_token: Shared bearer token required on every
-            control-plane RPC. ``None`` disables auth (only safe on
-            isolated networks).
+            control-plane RPC, and identical on every host. **Mandatory
+            whenever** ``coordination="zmq"``: the step coordinator refuses to
+            start without one rather than running the plane unauthenticated,
+            because that plane mirrors the leader's runner calls and anything
+            that can reach the control port can drive the model. ``None`` is
+            accepted only for ``coordination="replicated"``, which has no
+            control plane to authenticate.
         distributed_step_timeout_s: Per-step RPC timeout in seconds. The
             leader aborts a step when no quorum of workers responds before
             this deadline. Default ``30.0``.
         distributed_connect_timeout_s: Timeout for the initial worker→leader
-            connect handshake at engine startup. Default ``15.0``.
+            connect handshake at engine startup. Default ``600.0``, generous
+            for the same reason ``distributed_ready_timeout_s`` is: the leader
+            cannot answer a hello until it has loaded its weights, and that is
+            minutes for any model worth serving on several hosts. The previous
+            ``15.0`` assumed a leader that is listening almost immediately,
+            which describes no real startup -- it failed a 2x v5p-16 multislice
+            run with ``no HelloOk from leader within 15.0s`` while rank 0 was
+            still reading 15GB off disk. Workers boot independently on a
+            multislice allocation, so the skew between a worker's first attempt
+            and the leader being ready is a startup race rather than a fault.
+            A dead leader is caught by the heartbeat once the plane is up, so
+            waiting longer here costs nothing but a slower report of a genuine
+            failure.
         distributed_leader_addr: Explicit leader host/IP for the
             ``coordination="zmq"`` plane. ``None`` falls back to the JAX
             distributed coordinator's host (correct for standard pod
