@@ -987,7 +987,8 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
             mask_info: Container for attention mask.
             mode: Runtime mode (TRAIN, PREFILL, or DECODE).
             cache_view: View into KV cache for position tracking.
-            sliding_window: Window size as int (symmetric) or tuple (left, right).
+            sliding_window: Window size as int (exact number of visible tokens,
+                current one included) or tuple (left, right).
             query_length: Length of query sequence.
             masking_details: Details about mask type from cache.
             cache_metadata: Metadata for cache position tracking.
@@ -1012,7 +1013,7 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
                     f"Invalid sliding_window: expected a non-negative integer, but got {sliding_window}. "
                     f"Window size must be >= 0."
                 )
-            left_window = right_window = sliding_window
+            left_window, right_window = max(sliding_window - 1, 0), 0
         else:
             left_window, right_window = sliding_window
             if left_window < 0 or right_window < 0:
