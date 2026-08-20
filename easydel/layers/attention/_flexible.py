@@ -1003,8 +1003,10 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
             ValueError: If sliding_window contains negative values.
 
         Note:
-            In decode mode, KV tensors are dynamically sliced to the window.
-            In prefill mode, a trailing window is used for efficient processing.
+            In decode mode, KV tensors are dynamically sliced to the window that
+            the active query rows can reach.
+            In prefill mode, the query rows start at position 0, so the leading ``query_length (Q) + right_window`` columns
+            are kept.
         """
         if isinstance(sliding_window, int):
             if sliding_window < 0:
@@ -1034,10 +1036,13 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
             indexs = jnp.zeros((B,), dtype=jnp.int32)
 
         offsets = jnp.zeros((B,), dtype=jnp.int32)
-        width = min(left_window + right_window + 1, K)
+        decode_width = min(Q + left_window + right_window, K)
+        decode_starts = jnp.clip(indexs - Q - left_window, 0, max(K - decode_width, 0))
 
-        @partial(jax.vmap, in_axes=(0, 0, 0, 0, 0, None), out_axes=(0, 0, 0))
-        def _select_slices(ikey, ival, imsk, offset, index, mode_):
+        prefill_width = min(Q + right_window, K)
+
+        @partial(jax.vmap, in_axes=(0, 0, 0, 0, 0, 0, None), out_axes=(0, 0, 0))
+        def _select_slices(ikey, ival, imsk, offset, index, start_k, mode_):
             base_row = offset + jax.lax.broadcasted_iota(jnp.int32, (Q, 1), 0)  # (Q,1)
             if mode_ == common_types.MODE_DECODE:
                 # `index` is the post-update cache length, so the active query rows
@@ -1052,36 +1057,33 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
             imsk = imsk & win[None, :, :]  # (H=1, Q, K)
 
             if mode_ == common_types.MODE_DECODE:
-                # The active query rows are already local to the current decode step
-                # (typically Q=1), so only the KV axis needs window slicing.
-                current_row = index - 1
-                start_k = jnp.clip(current_row - left_window, 0, jnp.maximum(K - width, 0))
-                imsk = jax.lax.dynamic_slice_in_dim(imsk, start_k, width, axis=2)  # (H,1,width)
+                # Only the KV axis needs window slicing
+                # `start_k` is the first column any of the Q active rows can attend to.
+                imsk = jax.lax.dynamic_slice_in_dim(imsk, start_k, decode_width, axis=2)  # (H,Q,decode_width)
                 # Slice KV tensors along K
-                ikey = jax.lax.dynamic_slice_in_dim(ikey, start_k, width, axis=0)  # (width, ...)
-                ival = jax.lax.dynamic_slice_in_dim(ival, start_k, width, axis=0)  # (width, ...)
+                ikey = jax.lax.dynamic_slice_in_dim(ikey, start_k, decode_width, axis=0)  # (decode_width, ...)
+                ival = jax.lax.dynamic_slice_in_dim(ival, start_k, decode_width, axis=0)  # (decode_width, ...)
                 return ikey, ival, imsk
 
             elif mode_ == common_types.MODE_PREFILL:
-                # Trailing window on K, keep full Q
-                start_k = jnp.maximum(K - width, 0)
-                imsk = jax.lax.dynamic_slice_in_dim(imsk, start_k, width, axis=2)  # (H,Q,width)
-                ikey = jax.lax.dynamic_slice_in_dim(ikey, start_k, width, axis=0)  # (width, ...)
-                ival = jax.lax.dynamic_slice_in_dim(ival, start_k, width, axis=0)  # (width, ...)
+                # Leading span on K, keep full Q.
+                imsk = jax.lax.slice_in_dim(imsk, 0, prefill_width, axis=2)  # (H,Q,prefill_width)
+                ikey = jax.lax.slice_in_dim(ikey, 0, prefill_width, axis=0)  # (prefill_width, ...)
+                ival = jax.lax.slice_in_dim(ival, 0, prefill_width, axis=0)  # (prefill_width, ...)
                 return ikey, ival, imsk
 
             else:
                 return ikey, ival, imsk
 
-        key, value, attn = _select_slices(key, value, attn, offsets, indexs, mode)
+        key, value, attn = _select_slices(key, value, attn, offsets, indexs, decode_starts, mode)
 
         mask_info = mask_info.replace(attention_mask=attn, sliding_window_baked_in=True)
 
         if cache_metadata is not None and mode == common_types.MODE_DECODE:
-            passed = cache_metadata.indexs - cache_metadata.starts
+            # Re-base the cache range onto the sliced window
             cache_metadata = TransformerMetadata(
-                starts=jax.lax.max(0, width - passed),
-                indexs=jnp.full((attn.shape[0],), attn.shape[-1]),
+                starts=jnp.maximum(cache_metadata.starts - decode_starts, 0),
+                indexs=jnp.minimum(cache_metadata.indexs - decode_starts, attn.shape[-1]),
             )
 
         return key, value, mask_info, cache_metadata
