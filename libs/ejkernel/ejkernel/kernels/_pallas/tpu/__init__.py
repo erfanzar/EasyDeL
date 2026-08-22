@@ -79,6 +79,8 @@ from .ragged_page_attention_v3 import ragged_page_attention_v3
 from .reduce_scatter import reduce_scatter
 from .reduce_scatter_matmul import reduce_scatter_matmul
 from .ring_attention import ring_attention
+from .sinkhorn_knopp import sinkhorn_knopp
+from .topk import topk as topk
 
 __all__ = (
     "all_gather",
@@ -112,4 +114,5 @@ __all__ = (
     "reduce_scatter",
     "reduce_scatter_matmul",
     "ring_attention",
+    "sinkhorn_knopp",
 )

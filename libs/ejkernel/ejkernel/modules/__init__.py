@@ -278,9 +278,11 @@ from .operations import (
     rwkv7_mul,
     scaled_dot_product_attention,
     set_gdn_kernel_tile_policy,
+    sinkhorn_knopp,
     split_gate_up,
     state_space_v1,
     state_space_v2,
+    topk,
     unified_attention,
 )
 
@@ -457,8 +459,10 @@ __all__ = (
     "rwkv7_mul",
     "scaled_dot_product_attention",
     "set_gdn_kernel_tile_policy",
+    "sinkhorn_knopp",
     "split_gate_up",
     "state_space_v1",
     "state_space_v2",
+    "topk",
     "unified_attention",
 )

@@ -312,8 +312,10 @@ from .rwkv4 import RWKV4, rwkv4
 from .rwkv6 import RWKV6, rwkv6
 from .rwkv7 import RWKV7, RWKV7Mul, rwkv7, rwkv7_mul
 from .scaled_dot_product_attention import ScaledDotProductAttention, scaled_dot_product_attention
+from .sinkhorn_knopp import SinkhornKnopp, sinkhorn_knopp
 from .state_space_v1 import StateSpaceV1, state_space_v1
 from .state_space_v2 import StateSpaceV2, state_space_v2
+from .topk import TopK, topk
 from .unified_attention import UnifiedAttention, unified_attention
 
 gdr_attention = gated_delta_rule
@@ -424,10 +426,12 @@ __all__ = (
     "RingAttentionConfig",
     "ScaledDotProductAttention",
     "ScaledDotProductAttentionConfig",
+    "SinkhornKnopp",
     "StateSpaceV1",
     "StateSpaceV1Config",
     "StateSpaceV2",
     "StateSpaceV2Config",
+    "TopK",
     "UnifiedAttention",
     "UnifiedAttentionConfig",
     "all_gather",
@@ -499,8 +503,10 @@ __all__ = (
     "rwkv7_mul",
     "scaled_dot_product_attention",
     "set_gdn_kernel_tile_policy",
+    "sinkhorn_knopp",
     "split_gate_up",
     "state_space_v1",
     "state_space_v2",
+    "topk",
     "unified_attention",
 )

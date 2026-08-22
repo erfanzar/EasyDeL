@@ -141,8 +141,10 @@ from .rwkv4 import rwkv4
 from .rwkv6 import rwkv6
 from .rwkv7 import rwkv7, rwkv7_mul
 from .scaled_dot_product_attention import scaled_dot_product_attention
+from .sinkhorn_knopp import sinkhorn_knopp
 from .state_space_v1 import state_space_v1
 from .state_space_v2 import state_space_v2
+from .topk import topk as topk
 from .unified_attention import unified_attention
 
 __all__ = [
@@ -201,6 +203,7 @@ __all__ = [
     "rwkv7",
     "rwkv7_mul",
     "scaled_dot_product_attention",
+    "sinkhorn_knopp",
     "state_space_v1",
     "state_space_v2",
     "unified_attention",

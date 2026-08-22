@@ -1438,3 +1438,34 @@ class FusedKLDivergenceConfig(BaseOperationConfig):
     num_stages: int = 2
 
     __hash__ = hash_fn
+
+
+@dataclass
+class SinkhornKnoppConfig(BaseOperationConfig):
+    """Configuration for the Sinkhorn-Knopp doubly-stochastic projection.
+
+    Args:
+        platform: Target platform (pallas/xla/auto). The Pallas TPU kernel runs
+            every iteration inside one program; the XLA path is the unrolled
+            reference loop and the mandatory fallback.
+        backend: Backend specification (default: "any").
+    """
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class TopKConfig(BaseOperationConfig):
+    """Configuration for the fused exact top-k.
+
+    Args:
+        platform: Target platform (pallas/xla/auto). The Pallas TPU path is the
+            blockwise candidate superset, which is exact but costs ``k``
+            reduction passes -- so it is selected only for a wide reduction axis
+            with a small static ``k``. The XLA path serves narrow axes, large
+            ``k``, and the per-row dynamic ``k`` mask mode, where it is the
+            better path rather than merely the fallback.
+        backend: Backend specification (default: "any").
+    """
+
+    __hash__ = hash_fn
