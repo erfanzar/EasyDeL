@@ -30,14 +30,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # paths-filter diffs push events against the main...vnext merge-base,
-          # which sits ~900 commits back: its deepen-by-200 loop on a shallow
-          # clone is slow and races ("shallow file has changed since we read
-          # it"). A full clone resolves the merge-base immediately.
+          # Full clone: paths-filter walks real history, and the deepen loop it
+          # falls back to is slow and races ("shallow file has changed since we
+          # read it").
           fetch-depth: 0
       - uses: dorny/paths-filter@v3
         id: filter
         with:
+          # On push, diff against the previous tip of the SAME branch rather
+          # than paths-filter's default (the repository default branch).
+          # `main` and `vnext` have no merge-base -- the histories are
+          # unrelated -- so a cross-branch base sends paths-filter into its
+          # deepen-by-doubling loop hunting a merge-base that cannot exist;
+          # it walked 4355 -> 6164 commits and then died on `--deepen=1600`
+          # with "shallow file has changed since we read it". Naming the
+          # current branch makes paths-filter use the push's own
+          # before..after range, which is what "what did this push change"
+          # means anyway. Left empty on pull_request so the PR base is used.
+          base: ${{ github.event_name == 'push' && github.ref_name || '' }}
           filters: |
             spectrax: ['libs/spectrax/**']
             ejkernel: ['libs/ejkernel/**']
