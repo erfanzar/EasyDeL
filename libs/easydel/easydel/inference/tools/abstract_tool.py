@@ -199,7 +199,9 @@ class ToolParser:
             attribute or get_vocab() method. Other tokenizer types may
             have different interfaces.
         """
-        return self.model_tokenizer.get_vocab()
+        from easydel.inference.reasoning.abstract_reasoning import shared_vocab
+
+        return shared_vocab(self.model_tokenizer)
 
     def adjust_request(self, request: ChatCompletionRequest) -> ChatCompletionRequest:
         """Adjust request parameters for model-specific requirements.

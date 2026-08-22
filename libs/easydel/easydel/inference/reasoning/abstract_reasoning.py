@@ -67,6 +67,40 @@ ReasoningParserName: TypeAlias = Literal[
 ]
 
 
+
+def shared_vocab(tokenizer) -> dict[str, int]:
+    """``tokenizer.get_vocab()``, computed once per tokenizer.
+
+    ``get_vocab()`` materializes the whole vocabulary as a dict -- ~32 ms for a
+    129k-token tokenizer. Parsers are constructed per request and read it in
+    ``__init__``, so a ``cached_property`` on the parser caches nothing useful:
+    profiling DeepSeek-V4 serving showed 64 ms of vocab building per admitted
+    request, 2.06 s of a 3.91 s run, entirely off the model's critical path.
+
+    The result is cached on the tokenizer, which every parser shares, so it is
+    built once per process and lives exactly as long as the tokenizer does.
+
+    Args:
+        tokenizer: Tokenizer to read the vocabulary from.
+
+    Returns:
+        Mapping of token string to id. Callers must treat it as read-only --
+        it is shared.
+
+    Note:
+        Caching is best-effort: an exotic tokenizer may forbid attribute
+        assignment, in which case the vocabulary is simply rebuilt per call.
+    """
+    cached = getattr(tokenizer, "_easydel_shared_vocab", None)
+    if cached is not None:
+        return cached
+    vocab = tokenizer.get_vocab()
+    try:
+        tokenizer._easydel_shared_vocab = vocab
+    except Exception:
+        pass
+    return vocab
+
 class ReasoningParser:
     """Abstract base class for reasoning content extraction from LLM outputs.
 
@@ -111,7 +145,7 @@ class ReasoningParser:
         Returns:
             Dictionary mapping token strings to their integer IDs.
         """
-        return self.model_tokenizer.get_vocab()
+        return shared_vocab(self.model_tokenizer)
 
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         """Decide whether the reasoning block is closed in the given token sequence.

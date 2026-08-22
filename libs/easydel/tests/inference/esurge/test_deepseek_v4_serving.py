@@ -40,12 +40,11 @@ os.environ.setdefault("ENABLE_DISTRIBUTED_INIT", "0")
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
 
+import easydel as ed
 import jax.numpy as jnp
 import numpy as np
 import pytest
 import spectrax as spx
-
-import easydel as ed
 from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.esurge.runners import eSurgeRunner
 from easydel.inference.esurge.scheduler import Scheduler
@@ -216,11 +215,22 @@ def _assert_matches_stateless_reference(
     and the dense forward). Real slot/position/reset bugs produce logit gaps
     orders of magnitude above the tolerance.
     """
+    from easydel.utils.inference_mode import set_inference_mode
+
     full = [*prompt_ids, *generated_ids]
     assert len(full) <= _REFERENCE_PAD_LEN, "reference pad length too small"
     padded = full + [0] * (_REFERENCE_PAD_LEN - len(full))
     ids = jnp.asarray([padded], dtype=jnp.int32)
-    with model.mesh:
+    # This reference IS an inference forward, so declare it as one. The model
+    # takes the default `(1, 1, -1, 1, 1, 1)` mesh, i.e. fsdp == device_count,
+    # and the batch here is 1: under the CPU trio's 8 fake devices the fused-MoE
+    # `('dp', 'fsdp')` batch spec cannot divide it. `BaseMoeModule` drops the
+    # batch axis in that case only for inference traces -- a TRAINING batch that
+    # cannot divide keeps the loud shard_map error on purpose -- so without this
+    # scope the reference dies with "8 does not evenly divide 1" before eSurge
+    # is ever compared against anything. The engine's own compiles already run
+    # under this scope.
+    with model.mesh, set_inference_mode():
         logits = np.asarray(
             model(input_ids=ids, position_ids=jnp.arange(_REFERENCE_PAD_LEN, dtype=jnp.int32)[None, :]).logits.astype(
                 jnp.float32

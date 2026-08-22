@@ -498,7 +498,7 @@ class MultiModalManager:
     def _supports_flat_patch_inputs(self) -> bool:
         """Best-effort detection for models expecting flattened patch tokens.
 
-        GLM4V/GLM46V and Qwen VL models in EasyDeL expect `pixel_values` shaped
+        GLM4V/GLM46V, Qwen VL and Muse-Glimmer models in EasyDeL expect `pixel_values` shaped
         as flattened spatio-temporal patches: [num_patches_total, patch_features].
         This method checks the model_type to determine if flat-patch format
         is expected.
@@ -513,6 +513,7 @@ class MultiModalManager:
             "glm4v",
             "glm4v_moe",
             "glm46v",
+            "muse_glimmer",
             "qwen2_vl",
             "qwen3_vl",
             "qwen3_vl_moe",
