@@ -189,18 +189,36 @@ from ._communication_utils import (
     MoeRoutingStrategy,
     get_moe_partition_spec,
 )
+from ._expert_stats import (
+    ExpertLoadRecord,
+    ExpertLoadRecorder,
+    active_expert_load_recorder,
+    balancedness,
+    optimal_shard_loads,
+    record_expert_load,
+    shard_active_experts,
+    shard_loads,
+)
 from ._layout_planner import MoeLayoutEstimate, estimate_moe_layout, validate_moe_layout
 from ._moe_module import BaseMoeModule
 
 __all__ = (
     "BaseMoeModule",
+    "ExpertLoadRecord",
+    "ExpertLoadRecorder",
     "MoEMethods",
     "MoeFusedHooks",
     "MoeLayoutEstimate",
     "MoeLoadBalancingStrategy",
     "MoeMetrics",
     "MoeRoutingStrategy",
+    "active_expert_load_recorder",
+    "balancedness",
     "estimate_moe_layout",
     "get_moe_partition_spec",
+    "optimal_shard_loads",
+    "record_expert_load",
+    "shard_active_experts",
+    "shard_loads",
     "validate_moe_layout",
 )

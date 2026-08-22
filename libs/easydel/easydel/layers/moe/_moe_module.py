@@ -101,6 +101,43 @@ if typing.TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+def _expert_tile_m(buffer_rows: int, num_experts: int) -> int:
+    """Grouped-matmul ``block_m`` for stacked experts, from rows-per-expert.
+
+    Every NON-EMPTY expert costs one full m-tile whichever way it is sliced, so
+    what sets the tile is how many rows an expert actually holds — not how tall
+    the permuted buffer is. Those differ by orders of magnitude in MoE: with 256
+    experts and top_k=6, a 2048-token prefill fills a 12288-row buffer but gives
+    each expert only ~48 rows.
+
+    The previous rule (``64 if buffer_rows <= 1024 else 128``) read the buffer
+    height, so it picked 128 for that case and paid for 128-row tiles holding 48
+    rows. Measured on v5p (DeepSeek-V4 shapes, int4 experts), against the tile
+    this returns:
+
+    ==================  =========  ========  ========
+    case                rows/exp   old tile  speedup
+    ==================  =========  ========  ========
+    2048-token prefill  48.0       128       1.77x
+    32-token decode      0.75       64       1.64x
+    8-token decode       0.19       64       1.53x
+    ==================  =========  ========  ========
+
+    Both ends matter: at 48 rows/expert a tile of 8 is 45% SLOWER than 64
+    (the MXU goes idle), so this rounds up to a power of two and clamps rather
+    than simply minimizing.
+
+    Args:
+        buffer_rows: Rows in the permuted dispatch buffer (``tokens * top_k``).
+        num_experts: Routed experts the histogram spans.
+
+    Returns:
+        Tile height in ``[8, 128]``, a power of two.
+    """
+    rows_per_expert = -(-int(buffer_rows) // max(1, int(num_experts)))  # ceil
+    return min(128, max(8, 1 << max(0, int(rows_per_expert) - 1).bit_length()))
+
+
 BATCH = common_types.BATCH
 EMPTY = common_types.EMPTY
 EMBED = common_types.EMBED
@@ -1309,6 +1346,20 @@ class BaseMoeModule(spx.Module, ABC):
             - output: MoE layer output. Shape: [B, S, H].
             - router_logits: Pre-softmax router logits for auxiliary losses. Shape: [B*S, E].
 
+        Raises:
+            ValueError: If neither ``gate_up_kernel`` nor both ``wi_kernel`` and
+                ``wu_kernel`` are given, if ``use_expert_tensor_mode`` is set
+                while the tensor-parallel size is greater than 1, or if
+                ``use_ring_of_experts`` is set with an expert count that the
+                expert-parallel size does not divide.
+
+        Note:
+            ``use_expert_tensor_mode`` makes the EXPERT axis carry the
+            tensor-parallel work (Mixtral-style), so it is mutually exclusive
+            with a separate ``tp`` axis: keep the experts on ``ep`` and set
+            ``tp=1``. The axis the check rejects is the tensor-parallel one, not
+            the expert-parallel one.
+
         Example:
             >>> # Setup MoE layer with 8 experts, top-2 routing
             >>> config.n_routed_experts = 8
@@ -1394,9 +1445,27 @@ class BaseMoeModule(spx.Module, ABC):
         ep_size = expert_mesh.shape[expert_axis_name]
         tp_size = expert_mesh.shape[tensor_axis_name]
 
+        # Quantization-aware training reaches the experts here rather than
+        # through ``ParallelMoELinear.forward``: this fused path reads the
+        # stacked kernels directly and runs the grouped matmul itself, so a
+        # rule stamped on the expert linears alone would never fire. The rule
+        # is resolved from the MoE module, which is the module performing the
+        # ``ragged_dot``. Already-quantized kernels arrive as ``(codes,
+        # scales)`` tuples from ``kernel_view()``; those are post-training
+        # quantized weights for serving and are left alone.
+        quant_rule = spx.quantization.rule_for(self, "ragged_dot")
+        if quant_rule is not None and any(
+            isinstance(k, tuple) for k in (wi_kernel, wu_kernel, wd_kernel, gate_up_kernel)
+        ):
+            quant_rule = None
+
         if self.config.use_expert_tensor_mode:
             if tp_size != 1:
-                raise ValueError("if using `ExpertTensorMode` Expert Parallel size should be 1.")
+                raise ValueError(
+                    f"`use_expert_tensor_mode` requires tensor-parallel size 1, got tp={tp_size} "
+                    f"(ep={ep_size}). ExpertTensorMode shards experts across the expert axis *as* the "
+                    "tensor-parallel split, so it cannot be combined with tp>1."
+                )
 
         if self.config.use_ring_of_experts and self.n_routed_experts % ep_size != 0:
             owned = (self.n_routed_experts // ep_size) * ep_size
@@ -1610,6 +1679,34 @@ class BaseMoeModule(spx.Module, ABC):
                                 block_k=512,
                             )
                         )
+
+        # Two ways to honour a quantization rule on the expert matmul, and
+        # the choice is about what has to be given up.
+        #
+        # Handing the contraction to ``spx.quantization.qragged_dot`` lets
+        # the forward run in the narrow type and the backward quantize the
+        # cotangent -- the regime that can actually be faster -- but it
+        # replaces the tuned grouped-matmul kernel with XLA's ragged_dot, so
+        # it is only taken when that kernel was going to be XLA anyway.
+        #
+        # Otherwise the kernels are discretized in place and the existing
+        # grouped matmul runs unchanged: no speed, but the forward still
+        # carries quantization error, and every backend and tuned tile
+        # configuration keeps working.
+        gmm_is_xla = gmm_kws.get("platform") != "pallas"
+        use_quantized_ragged_dot = quant_rule is not None and quant_rule.act_qtype is not None and gmm_is_xla
+        if quant_rule is not None:
+            # Which regime this is depends on the branch: a narrow-type
+            # contraction is quantized training, discretize-and-reconstruct
+            # is quantization-aware training. Do not label both the latter.
+            logger.info(
+                "MoE %s on %s: %s.",
+                "quantized training" if use_quantized_ragged_dot else "quantization-aware training",
+                type(self).__name__,
+                "quantized ragged_dot (narrow-type contraction)"
+                if use_quantized_ragged_dot
+                else "discretized kernels with the existing grouped matmul (no narrow-type compute)",
+            )
 
         def _chunked_dispatch(
             x: jax.Array,
@@ -1840,6 +1937,63 @@ class BaseMoeModule(spx.Module, ABC):
                 gate_up_bias = _gather_expert_param(gate_up_bias)
                 wd_bias = _gather_expert_param(wd_bias)
 
+            if quant_rule is not None and not use_quantized_ragged_dot:
+
+                def _fake_quant_expert_kernel(t: jax.Array | None, *, tp_sharded_contraction: bool) -> jax.Array | None:
+                    """Discretize one stacked expert kernel for quantization-aware training.
+
+                    Stacked expert kernels are ``[experts, contracted, out]``,
+                    so axis 1 is contracted and axes 0 and 2 are channelwise:
+                    every expert and every output channel keeps its own scale,
+                    which is exactly the ``[E, 1, N]`` layout
+                    :class:`ParallelMoELinearQuantized` stores for serving.
+
+                    The kernel itself is left to the existing grouped matmul.
+                    That is deliberate: the tuned Pallas tiles, the v3 kernel
+                    and the XLA ``ragged_dot`` path all keep working unchanged,
+                    which is what lets quantization-aware training reach the
+                    experts at all — on a large mixture-of-experts model they
+                    are the overwhelming majority of the parameters, and they
+                    never flow through :class:`ParallelLinear`.
+
+                    Args:
+                        t: The stacked expert kernel, or ``None`` when this
+                            projection is not in use.
+                        tp_sharded_contraction: Whether the contracted axis is
+                            split across the tensor-parallel axis. When it is,
+                            a purely local calibration would see one shard of
+                            a logically single tensor and every rank would
+                            derive a different scale, so the statistic is
+                            reduced across the axis first.
+
+                    Returns:
+                        The discretized kernel, or ``None``.
+                    """
+                    if t is None:
+                        return None
+                    transform = None
+                    if tp_sharded_contraction and tp_size > 1:
+                        transform = lambda stats: jax.tree.map(  # noqa: E731
+                            lambda v: jax.lax.pmax(v, tensor_axis_name), stats
+                        )
+                    return spx.quantization.fake_quant(
+                        t,
+                        rule=quant_rule,
+                        contracting_axes=(1,),
+                        is_weight=True,
+                        calibration_transform=transform,
+                    )
+
+                # Gate/up are column-parallel: tensor parallelism splits their
+                # *output* axis, which is channelwise, so each rank already
+                # owns whole channels and its local scales are exact. Down is
+                # row-parallel: tensor parallelism splits its *contracted*
+                # axis, so its calibration needs the collective.
+                wi_kernel = _fake_quant_expert_kernel(wi_kernel, tp_sharded_contraction=False)
+                wu_kernel = _fake_quant_expert_kernel(wu_kernel, tp_sharded_contraction=False)
+                gate_up_kernel = _fake_quant_expert_kernel(gate_up_kernel, tp_sharded_contraction=False)
+                wd_kernel = _fake_quant_expert_kernel(wd_kernel, tp_sharded_contraction=True)
+
             def _mask_dispatch_tail(t: jax.Array, group_sizes: jax.Array) -> jax.Array:
                 """Zero rows past ``sum(group_sizes)`` of a dispatch-buffer tensor.
 
@@ -1887,14 +2041,64 @@ class BaseMoeModule(spx.Module, ABC):
                     ``tp_size == 1``).
                 """
 
-                def _expert_gmm(rows, kernel):
+                def _expert_gmm(rows, kernel, *, tp_sharded_contraction: bool = False):
                     """Dense bf16 grouped matmul, or — when the kernel is a
                     quantized ``(codes, scales)`` pair from ``kernel_view()`` —
                     the v3 grouped matmul's native quantised-weight path:
                     int8/int4 codes dequantised in-VMEM against per-channel
                     scales (measured 1.9-2.1x over bf16 at decode shapes and
                     1.5x at prefill on v5p; the auto-tiler loses to explicit
-                    whole-K/whole-N tiles at MoE shapes, hence the cfg)."""
+                    whole-K/whole-N tiles at MoE shapes, hence the cfg).
+
+                    Under a quantization-aware-training rule that also
+                    quantizes activations, and only where the grouped matmul
+                    was already going to be XLA's ``ragged_dot``, the whole
+                    contraction is handed to the quantized ragged dot so the
+                    forward runs in the narrow type and the backward can
+                    quantize the cotangent.
+
+                    Args:
+                        rows: Expert-sorted token rows.
+                        kernel: The stacked expert kernel, or a
+                            ``(codes, scales)`` pair for a pre-quantized one.
+                        tp_sharded_contraction: Whether the contracted axis is
+                            split across the tensor-parallel axis, which makes
+                            a purely local calibration see one shard of a
+                            logically single tensor.
+
+                    Returns:
+                        The projected rows.
+                    """
+                    collective_axis = tensor_axis_name if (tp_sharded_contraction and tp_size > 1) else None
+                    if use_quantized_ragged_dot and not isinstance(kernel, tuple):
+                        return spx.quantization.qragged_dot(
+                            rows,
+                            kernel,
+                            group_sizes,
+                            rule=quant_rule,
+                            precision=gmm_kws.get("precision"),
+                            preferred_element_type=gmm_kws.get("preferred_element_type", jnp.bfloat16),
+                            calibration_axis_name=collective_axis,
+                        )
+                    if quant_rule is not None and quant_rule.act_qtype is not None:
+                        # The kernels were discretized once, up where they are
+                        # gathered; the activations have to be done here,
+                        # because they only exist inside the dispatch. Without
+                        # this an ``act_qtype`` rule would quantize weights and
+                        # silently leave activations alone whenever the tuned
+                        # kernel keeps us off the quantized ragged dot.
+                        transform = None
+                        if collective_axis is not None:
+                            transform = lambda stats: jax.tree.map(  # noqa: E731
+                                lambda v: jax.lax.pmax(v, collective_axis), stats
+                            )
+                        rows = spx.quantization.fake_quant(
+                            rows,
+                            rule=quant_rule,
+                            contracting_axes=(rows.ndim - 1,),
+                            is_weight=False,
+                            calibration_transform=transform,
+                        )
                     if isinstance(kernel, tuple):
                         codes, scales = kernel
                         n_groups, k_dim, n_dim = codes.shape
@@ -1908,7 +2112,7 @@ class BaseMoeModule(spx.Module, ABC):
                         # slice shapes — non-aligned contractions (e.g. a
                         # tp-sharded down projection with local k=192) must
                         # fall back to the auto-tiler.
-                        tile_m = 64 if rows.shape[0] <= 1024 else 128
+                        tile_m = _expert_tile_m(rows.shape[0], n_groups)
                         if k_dim % 128 == 0 and n_dim % 128 == 0:
                             cfg = GroupedMatmulConfig(block_m=tile_m, block_k=k_dim, block_n=n_dim)
                         else:
@@ -1952,7 +2156,7 @@ class BaseMoeModule(spx.Module, ABC):
 
                 intermediate_layer = _mask_dispatch_tail(ffn_activation(layer_w0, layer_w1), group_sizes)
 
-                intermediate_output = _expert_gmm(intermediate_layer, wd_kernel)
+                intermediate_output = _expert_gmm(intermediate_layer, wd_kernel, tp_sharded_contraction=True)
                 intermediate_output = checkpoint_name(intermediate_output, "mlp_down")
 
                 # TP reduction: psum_scatter to shard output across TP on hidden dimension

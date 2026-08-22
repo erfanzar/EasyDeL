@@ -36,6 +36,8 @@ from spectrax import common_types
 
 from easydel.infra.sharding import MeshLike, RuntimeShardingResolver, coerce_runtime_sharding_resolver
 
+from ._expert_stats import maybe_record_group_sizes
+
 BATCH = common_types.BATCH
 EMPTY = common_types.EMPTY
 EMBED = common_types.EMBED
@@ -884,11 +886,12 @@ def permute(
     num_experts_per_tok: int,
     num_experts: int,
     dtype: jnp.dtype,
+    layer_idx: int | None = None,
     select_hook: typing.Callable[[jax.Array, jax.Array, int], tuple[jax.Array, jax.Array]] | None = None,
     refine_weights_hook: typing.Callable[[jax.Array], jax.Array] | None = None,
     refine_inputs_hook: typing.Callable[[jax.Array, jax.Array, tuple[int]], jax.Array] | None = None,
     scale_replicated_inputs: typing.Callable[[jax.Array, jax.Array], jax.Array] | None = None,
-):
+) -> tuple[Array, Array, Array, Array, Array]:
     """Permute tokens by expert assignment for grouped matmul.
 
     This routine selects top-k experts per token, optionally refines the input or
@@ -920,6 +923,8 @@ def permute(
         num_experts_per_tok: Number of experts selected per token (k).
         num_experts: Total number of experts (E).
         dtype: Output dtype for the sorted inputs.
+        layer_idx: Owning layer index, recorded with the router histogram when
+            an expert-load recording scope is active. Purely observational.
         select_hook: Optional function for top-k selection; otherwise `lax.top_k`.
         refine_weights_hook: Optional function to modify selected weights.
         refine_inputs_hook: Optional function to refine or modify token representations based
@@ -949,6 +954,12 @@ def permute(
         >>> # sorted_inputs: tokens grouped as [tok0_exp0, tok1_exp1, tok0_exp2, tok1_exp3]
         >>> # sizes: [1, 1, 1, 1] - one token per expert
         >>> # expert_ids: [0, 1, 2, 3] - expert ID for each sorted token
+
+    Note:
+        The router histogram is offered to the expert-load recorder for
+        calibration. That is a no-op -- a single ``is None`` check, nothing
+        traced -- unless an ``easydel.layers.moe.record_expert_load`` scope is
+        open.
     """
     # reshape inputs (batch, sequence, emb) to (batch * sequence, emb)
     inputs_shape = inputs.shape
@@ -980,6 +991,12 @@ def permute(
 
     sorted_inputs = sort_activations(replicated_inputs_2d, sorted_selected_experts, use_custom_sort_vjp).astype(dtype)
     group_size = jnp.bincount(flatten_selected_experts, length=num_experts)
+    maybe_record_group_sizes(
+        group_size,
+        num_experts=num_experts,
+        roll_to_expert_id=roll_to_expert_id,
+        layer_idx=layer_idx,
+    )
 
     expert_indices = jnp.arange(num_experts)
     sorted_experts = jnp.repeat(

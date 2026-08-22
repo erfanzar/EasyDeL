@@ -64,6 +64,28 @@ Two execution regimes are supported:
   decode step (:class:`DeepseekV4PackedMeta`), so prefill, chunked prefill,
   and decode all resume from per-slot positions. The XLA scan path is the
   correctness reference; a fused ragged kernel is a planned TPU follow-up.
+
+Note:
+    The fused compressed-window decode kernel stays on the ``"xla"`` platform by
+    default. Measured on v5p-8 at cc32 with A16W4, ``"xla"`` is the faster
+    default end to end even though the Pallas kernel itself is now the faster
+    kernel: in isolation it runs at 1.09x median against XLA (up to 1.60x at
+    kv_len 640, batch 128) after fixing its sublane layout and dropping a
+    redundant KV pad, yet in the model it still loses, 889.7 tok/s against
+    905.4. Two reasons, both structural rather than tuning:
+
+    * a Mosaic custom call cannot be auto-partitioned, so the pallas path is
+      wrapped in ``shard_map`` under a multi-device mesh, and its
+      full-to-shard / shard-to-full conversions cost more than the kernel
+      saves -- the XLA path pays nothing because GSPMD partitions it;
+    * V4 mixes layer types, and the kernel only wins on the
+      ``compressed_sparse`` shape (kv_len 640, 21 layers, 1.27x). The
+      ``heavily_compressed`` shape (kv_len 144, 20 layers) is still 0.90x,
+      roughly cancelling the gain.
+
+    Attention is only ~3.8% of a decode step in any case, so the ceiling here is
+    under a percent. Do not flip this default without re-measuring end to end; a
+    faster kernel is not the same thing as a faster model.
 """
 
 import math
@@ -76,9 +98,11 @@ import spectrax as spx
 from ejkernel.modules import (  # pyright: ignore[reportMissingTypeStubs]
     compressed_window_attention,
     compressed_window_decode,
+    sinkhorn_knopp,
 )
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax.ad_checkpoint import checkpoint_name
+from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as Ps
 from jaxtyping import Array, Bool, Float, Int
 from spectrax import apply_logical_sharding, common_types, nn
@@ -91,6 +115,7 @@ from easydel.infra.modeling_outputs import (
     MoeCausalLMOutput,
     MoeModelOutput,
 )
+from easydel.infra.sharding import inference_mode_forces_decode
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
 from easydel.layers import (
     BaseMoeModule,
@@ -109,10 +134,32 @@ from easydel.layers import (
     split_fused_gate_up_projection,
 )
 from easydel.modules._base import BaseCausalLMModule
+from easydel.modules.deepseek_v4._native_checkpoint import native_key_to_easydel
 
 from .deepseek_v4_configuration import DeepseekV4Config
 
 _MASK_MIN = float(jnp.finfo(jnp.float32).min)
+
+
+class _HyperStreamSharding(common_types.DynamicShardingAxes):
+    """4-D sharding for the hyper-connection residual stream ``[B, T, hc, D]``.
+
+    V4 carries ``hc_mult`` parallel residual streams, so the stream tensor is
+    rank 4 while ``common_types.HiddenStateSharding`` is documented for the
+    rank-3 ``[B, T, D]`` case. Passing the 3-axis spec here did not fail: the
+    sanitizer only collapses a spec to replicated when ``len(spec) >
+    len(shape)``, and 3 <= 4, so it was applied positionally -- putting ``TP``
+    on the ``hc_mult`` stream axis and leaving the hidden feature axis
+    replicated. That is a no-op at tp=1 and silently relayouts the stream at
+    tp>1, which is what let ``DeepseekV4HyperMix``'s Sinkhorn ``shard_map``
+    (declared ``Ps()``, i.e. replicated) receive a sharded ``comb``.
+
+    ``EMPTY`` keeps the stream axis replicated; the feature axis gets ``EMBED``
+    as intended.
+    """
+
+    axes: tp.ClassVar = [common_types.BATCH, common_types.QUERY_LENGTH, common_types.EMPTY, common_types.EMBED]
+    mode: tp.ClassVar = 1
 
 # Platform for the fused compressed-window decode kernel. Default "xla" is the
 # GSPMD-partitionable reference: it lowers correctly under any mesh (single or
@@ -121,6 +168,7 @@ _MASK_MIN = float(jnp.finfo(jnp.float32).min)
 # through the Pallas TPU kernel; under tensor parallelism a Mosaic custom call
 # cannot be auto-partitioned, so the pallas path is wrapped in shard_map (heads
 # sharded on "tp", shared KV replicated). "auto" -> ejkernel platform=None.
+# The module docstring records the measured end-to-end verdict on this default.
 _DECODE_KERNEL_PLATFORM = os.getenv("EASYDEL_COMPRESSED_WINDOW_DECODE_PLATFORM", "xla")
 _DECODE_KERNEL_PLATFORM = None if _DECODE_KERNEL_PLATFORM == "auto" else _DECODE_KERNEL_PLATFORM
 # Mesh axis the query/output heads are sharded over (EasyDeL's 6-axis
@@ -251,11 +299,11 @@ def _rope_cos_sin(
 def _apply_interleaved_rope(x: Array, cos: Array, sin: Array, unsqueeze_dim: int = 1) -> Array:
     """Apply V4's interleaved RoPE to the *trailing* rope slice of ``x``.
 
-    ``cos``/``sin`` come in half-sized (one entry per interleaved pair); they
-    are expanded with ``repeat_interleave(2)`` and the last ``2 * cos.shape[-1]``
-    channels of ``x`` are rotated in fp32 with the interleaved (GLM-style)
-    ``rotate_half``. Leading "nope" channels pass through untouched. Pass
-    ``-sin`` for the inverse rotation applied to the attention output.
+    ``cos``/``sin`` come in half-sized (one entry per interleaved pair) and the
+    last ``2 * cos.shape[-1]`` channels of ``x`` are rotated in fp32 with the
+    interleaved (GLM-style) rotation. Leading "nope" channels pass through
+    untouched. Pass ``-sin`` for the inverse rotation applied to the attention
+    output.
 
     Args:
         x: Input of shape ``[..., seq, head_dim]`` with a broadcastable head
@@ -267,16 +315,36 @@ def _apply_interleaved_rope(x: Array, cos: Array, sin: Array, unsqueeze_dim: int
 
     Returns:
         Array of the same shape and dtype as ``x``.
+
+    Note:
+        The rotation is written in pair-major form. The obvious transcription of
+        the reference formula -- ``repeat_interleave(cos, 2)``, strided
+        ``[..., 0::2]`` / ``[..., 1::2]`` gathers, and a
+        ``stack(...).reshape(...)`` to rebuild the interleave -- costs two
+        full-width interleaves of cos/sin plus two strided reads and a rebuild,
+        all on the rope slice of every q/kv/output tensor, three times per layer
+        across 43 layers. Reshaping the rope slice to explicit pairs expresses
+        the same rotation with cos/sin at their natural half width and no
+        interleave::
+
+            out[2k]   = x1*cos[k] - x2*sin[k]
+            out[2k+1] = x1*sin[k] + x2*cos[k]
+
+        which is exactly what the original computes -- its ``rotate_half``
+        places ``-x2`` at even positions and ``x1`` at odd ones, against
+        repeat-interleaved cos/sin. Ablating rope entirely was measured at
+        6.32 ms of a 29.6 ms decode step when combined with the compressor.
     """
-    cos = jnp.expand_dims(jnp.repeat(cos, 2, axis=-1), unsqueeze_dim).astype(jnp.float32)
-    sin = jnp.expand_dims(jnp.repeat(sin, 2, axis=-1), unsqueeze_dim).astype(jnp.float32)
-    rope_dim = cos.shape[-1]
+    half = cos.shape[-1]
+    rope_dim = 2 * half
+    cos = jnp.expand_dims(cos, unsqueeze_dim).astype(jnp.float32)
+    sin = jnp.expand_dims(sin, unsqueeze_dim).astype(jnp.float32)
     nope, rope = x[..., :-rope_dim], x[..., -rope_dim:]
-    rope_f = rope.astype(jnp.float32)
-    x1 = rope_f[..., 0::2]
-    x2 = rope_f[..., 1::2]
-    rotate_half = jnp.stack((-x2, x1), axis=-1).reshape(rope_f.shape)
-    rotated = (rope_f * cos + rotate_half * sin).astype(x.dtype)
+    pairs = rope.astype(jnp.float32).reshape(*rope.shape[:-1], half, 2)
+    x1 = pairs[..., 0]
+    x2 = pairs[..., 1]
+    rotated = jnp.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), axis=-1)
+    rotated = rotated.reshape(rope.shape).astype(x.dtype)
     return jnp.concatenate([nope, rotated], axis=-1)
 
 
@@ -297,6 +365,27 @@ def _entry_causal_bias(position_ids: Array, n_entries: int, rate: int) -> Array:
     causal_threshold = (position_ids + 1) // rate
     visible = entry_indices[None, None, :] < causal_threshold[..., None]
     return jnp.where(visible, 0.0, _MASK_MIN)[:, None, :, :].astype(jnp.float32)
+
+
+def _indexer_selection_is_vacuous(index_topk: int, n_slots: int) -> bool:
+    """Whether the indexer's ``top_k`` is incapable of excluding any entry.
+
+    Asked for at least as many entries as exist, ``top_k`` returns all of them,
+    merely reordered by score -- and its consumer scatters the indices into a
+    position-indexed bias where order carries no information. The selection is
+    then equivalent to plain visibility, and everything computed to produce it
+    is dead.
+
+    Both arguments are static, so callers branch on this at trace time.
+
+    Args:
+        index_topk: Configured number of entries the indexer selects.
+        n_slots: Compressed entry slots available (``max_length // rate``).
+
+    Returns:
+        ``True`` when the selection cannot exclude anything.
+    """
+    return index_topk >= n_slots
 
 
 def _decode_entry_visibility(position_ids: Array, cache_position: Array, n_entries: int, rate: int) -> Array:
@@ -409,6 +498,7 @@ def _compressor_decode_step(
 
     weights = jax.nn.softmax(slot_gate, axis=1).astype(slot_kv.dtype)
     candidate = kv_norm(jnp.sum(slot_kv * weights, axis=1))  # [B, dim]
+
     rope_positions = (window_index * rate).astype(jnp.int32)[:, None]  # [B, 1]
     cos, sin = _rope_cos_sin(config, "compress", rope_positions, candidate.dtype)
     candidate = _apply_interleaved_rope(candidate[:, None, None, :], cos, sin, unsqueeze_dim=1)[:, 0, 0]
@@ -500,6 +590,25 @@ class DeepseekV4HyperConnection(spx.Module):
             (``[B, S, hc, hc]``, fp32, Sinkhorn-projected), and ``collapsed``
             (``[B, S, D]``, input dtype) — the pre-weighted stream sum fed to
             the sub-layer.
+
+        Note:
+            On a multi-device TPU mesh the Sinkhorn projection runs through the
+            fused ejkernel kernel inside a ``shard_map``: a Mosaic call cannot be
+            auto-partitioned. That wrapper is what made the fused
+            decode-attention kernel a net loss -- there it had to reshard
+            megabytes of KV -- but ``comb`` is ``[batch, seq, hc, hc]``, a couple
+            of KB, so every device redundantly normalising it is cheaper than
+            moving it. ejkernel owns the kernel; the sharding composition lives
+            here.
+
+        Note:
+            The ``Ps()`` in_spec claims ``comb`` is replicated, and that claim is
+            MADE true with an explicit sharding constraint rather than assumed:
+            ``comb`` descends from ``hidden_streams``, and with
+            ``check_vma=False`` a violated in_spec is accepted silently -- each
+            device would Sinkhorn its own shard and ``out_specs=Ps()`` would then
+            publish one device's partial answer as the whole. That is invisible
+            at tp=1 (nothing is split) and corrupts every layer at tp>1.
         """
         hc = self.hc_mult
         eps = self.hc_eps
@@ -521,10 +630,19 @@ class DeepseekV4HyperConnection(spx.Module):
         comb = jax.nn.softmax(comb_logits, axis=-1) + eps
         # Sinkhorn-Knopp: alternate column/row normalization onto the
         # doubly-stochastic manifold (fixed static iteration count).
-        comb = comb / (jnp.sum(comb, axis=-2, keepdims=True) + eps)
-        for _ in range(self.hc_sinkhorn_iters - 1):
-            comb = comb / (jnp.sum(comb, axis=-1, keepdims=True) + eps)
-            comb = comb / (jnp.sum(comb, axis=-2, keepdims=True) + eps)
+        mesh = getattr(self.config, "mesh", None)
+        jax_mesh = getattr(mesh, "jax_mesh", mesh)
+        if jax_mesh is not None and getattr(jax_mesh, "size", 1) > 1 and jax.default_backend() == "tpu":
+            comb = jax.lax.with_sharding_constraint(comb, NamedSharding(jax_mesh, Ps()))
+            comb = jax.shard_map(
+                lambda c: sinkhorn_knopp(c, self.hc_sinkhorn_iters, eps),
+                mesh=jax_mesh,
+                in_specs=(Ps(),),
+                out_specs=Ps(),
+                check_vma=False,
+            )(comb)
+        else:
+            comb = sinkhorn_knopp(comb, self.hc_sinkhorn_iters, eps)
 
         collapsed = jnp.sum(pre[..., None] * hidden_streams.astype(jnp.float32), axis=2)
         return post, comb, collapsed.astype(hidden_streams.dtype)
@@ -1178,11 +1296,39 @@ class DeepseekV4Indexer(spx.Module):
         cache_view: CompressedWindowCacheView,
         valid: Array | None = None,
     ) -> tuple[Array | None, CompressedWindowCacheView]:
-        """Single-token step over the padded indexer-entry axis."""
+        """Single-token step over the padded indexer-entry axis.
+
+        Note:
+            When the selection is vacuous
+            (:func:`_indexer_selection_is_vacuous`) the whole indexer is dead
+            work, not just its sort, and the step short-circuits to plain
+            visibility. Everything feeding the selection is then unreachable:
+            the two projections, the windowed compression state machine, and the
+            five indexer cache tensors it maintains -- whose only consumer is
+            ``_score_queries``, which is skipped as well. Nothing outside the
+            indexer reads that state.
+
+        Note:
+            That short-circuit is the ordinary serving case, not a corner.
+            Entries number ``max_length // rate``, so at ``max_model_len`` 2048
+            EVERY layer qualifies: ``compressed_sparse`` rate 4 gives 512 entries
+            against ``index_topk`` 512, ``heavily_compressed`` rate 128 gives 16.
+            The indexer only starts earning its keep once the context outgrows it
+            (``max_model_len`` > 2048 for the CSA layers). Both operands are
+            static, so the branch collapses at trace time. Measured on a cc32
+            decode step, ``sort`` alone was 3.0 ms of 40.3 ms, before counting
+            the projections and compression feeding it.
+        """
         rate = self.compress_rate
         n_slots = cache_view.num_entry_slots
         if n_slots == 0:
             return None, cache_view
+
+        if _indexer_selection_is_vacuous(self.index_topk, n_slots):
+            visible = _decode_entry_visibility(position_ids, cache_view.cache_position, n_slots, rate)
+            entry_ids = jnp.broadcast_to(jnp.arange(n_slots, dtype=jnp.int32), visible.shape)
+            return jnp.where(visible, entry_ids, -1), cache_view
+
         kv = self.kv_proj(hidden_states)
         gate = self.gate_proj(hidden_states)
         entries, buffer_kv, buffer_gate, overlap_kv, overlap_gate = _compressor_decode_step(
@@ -1208,8 +1354,8 @@ class DeepseekV4Indexer(spx.Module):
             indexer_overlap_kv=overlap_kv,
             indexer_overlap_gate=overlap_gate,
         )
-        index_scores = self._score_queries(hidden_states, q_residual, position_ids, entries)  # [B, 1, n_slots]
         visible = _decode_entry_visibility(position_ids, cache_view.cache_position, n_slots, rate)
+        index_scores = self._score_queries(hidden_states, q_residual, position_ids, entries)  # [B, 1, n_slots]
         index_scores = jnp.where(visible, index_scores, -jnp.inf)
         top_k = min(self.index_topk, n_slots)
         top_k_indices = jax.lax.top_k(index_scores, top_k)[1]
@@ -1976,6 +2122,28 @@ class DeepseekV4Attention(spx.Module):
             Tuple of the attention output ``[1, T, D_model]`` (garbage at
             padded token positions, which downstream never reads) and the
             updated cache view.
+
+        Note:
+            A pure-decode bucket takes a fast path. There every request
+            contributes exactly one token -- the invariant the executor derives
+            the bucket's decode layout from, ``model_executor.py``'s
+            ``decode_mode_specs(num_tokens == padded_num_reqs)`` -- so
+            ``col_of_token`` is 0 everywhere and the ``[num_slots, T, ...]`` grid
+            degenerates to ``[num_slots, ...]``. Building the full grid anyway is
+            quadratic in the request count and dominates the step: profiling a
+            cc128 decode measured 14126 device ops, 59.8% of them data movement,
+            with ``broadcast`` alone at 13.8 ms (210 ops x 65.7 us -- the
+            ``jnp.zeros`` for q_grid/attn_columns is 1.07 GB per layer at cc128)
+            and the column ``while`` at 13.6 ms, against 2.3 ms (3.6%) for the
+            actual expert matmul. Collapsing the token axis removes both: one
+            ``_decode_attend`` on ``[num_slots, ...]`` state, no scratch grid, no
+            loop.
+
+        Note:
+            The general path below covers prefill and chunked prefill, where a
+            slot really can carry several tokens in one step; pure decode is
+            handled by the fast path above, under the static
+            :func:`inference_mode_forces_decode` signal, and never reaches it.
         """
         _, total_tokens, _ = hidden_states.shape
         num_slots = cache_view.cache_position.shape[0]
@@ -1999,6 +2167,29 @@ class DeepseekV4Attention(spx.Module):
 
         slot_tok = packed_meta.slot_of_token  # [T] (== num_slots for padding -> dropped)
         col_tok = packed_meta.col_of_token  # [T]
+        safe_slot = jnp.minimum(slot_tok, num_slots - 1)
+
+        if inference_mode_forces_decode():
+
+            def _to_slots(values: Array) -> Array:
+                """Scatter per-token values ``[T, ...]`` into ``[num_slots, ...]``."""
+                out = jnp.zeros((num_slots, *values.shape[1:]), dtype=values.dtype)
+                return out.at[slot_tok].set(values, mode="drop")
+
+            attn_col, cache_view = self._decode_attend(
+                q=_to_slots(q[0].transpose(1, 0, 2))[:, :, None, :],  # [S, H, 1, head_dim]
+                kv=_to_slots(kv[0])[:, None, :],  # [S, 1, head_dim]
+                hidden_states=_to_slots(hidden_states[0])[:, None, :],  # [S, 1, D]
+                q_residual=_to_slots(q_residual[0])[:, None, :],  # [S, 1, q_lora]
+                position_ids=packed_meta.positions_grid[:, :1],  # [S, 1]
+                cache_view=cache_view,
+                valid=packed_meta.valid_grid[:, 0],  # [S]
+            )
+            attn_packed = attn_col[:, :, 0, :][safe_slot][None, ...]  # [1, T, H, head_dim]
+            attn_output = _apply_interleaved_rope(attn_packed, cos, -sin, unsqueeze_dim=2)
+            grouped = attn_output.reshape(1, total_tokens, self.config.o_groups, -1)
+            grouped = self.o_a_proj(grouped).reshape(1, total_tokens, -1)
+            return checkpoint_name(self.o_b_proj(grouped), "attn_output"), cache_view
 
         def _to_grid(values: Array) -> Array:
             """Scatter per-token values ``[T, ...]`` into ``[num_slots, T, ...]``."""
@@ -2010,14 +2201,12 @@ class DeepseekV4Attention(spx.Module):
         q_grid = _to_grid(q[0].transpose(1, 0, 2))  # [S, T, H, head_dim]
         kv_grid = _to_grid(kv[0])  # [S, T, head_dim]
 
-        # eSurge shares ONE compiled packed path across prefill / chunked-prefill
-        # / decode (no static decode signal). Only the grid columns that carry a
-        # real token do any work: a pure decode step (each slot advances one
-        # token) fills column 0 only, so scanning the full padded bucket width
-        # ``T`` wasted ``T - 1`` columns of full compressor+attention compute per
-        # step (~16x on the decode bucket). Iterate only the occupied columns via
-        # a data-dependent ``while_loop`` (static shapes, one compile per bucket);
-        # columns beyond the last real token stay zero and are never gathered.
+        # Only the grid columns that carry a real token do any work: a chunked
+        # step fills the leading columns only, so scanning the full padded bucket
+        # width ``T`` wastes the remaining columns on full compressor+attention
+        # compute. Iterate only the occupied columns via a data-dependent
+        # ``while_loop`` (static shapes, one compile per bucket); columns beyond
+        # the last real token stay zero and are never gathered.
         col_iota = jnp.arange(total_tokens, dtype=jnp.int32)
         column_has_token = jnp.any(packed_meta.valid_grid, axis=0)  # [T]
         num_used_cols = jnp.max(jnp.where(column_has_token, col_iota + 1, 0))  # 0..T
@@ -2057,7 +2246,6 @@ class DeepseekV4Attention(spx.Module):
             _cond, _body, (jnp.int32(0), cache_view, attn_columns)
         )  # attn_columns: [T, S, H, head_dim]
 
-        safe_slot = jnp.minimum(slot_tok, num_slots - 1)
         attn_packed = attn_columns[col_tok, safe_slot][None, ...]  # [1, T, H, head_dim]
         attn_output = _apply_interleaved_rope(attn_packed, cos, -sin, unsqueeze_dim=2)
 
@@ -2383,6 +2571,12 @@ class DeepseekV4TopKRouter(spx.Module):
     :class:`DeepseekV4SparseMoeBlock`).
     """
 
+    #: Whether this router selects experts with ``e_score_correction_bias``.
+    #: Subclasses that select some other way must clear it so the parameter is
+    #: not declared: an unused parameter is still a REQUIRED one at load time,
+    #: and the published checkpoint has no value for it.
+    uses_score_correction: tp.ClassVar[bool] = True
+
     def __init__(
         self,
         config: DeepseekV4Config,
@@ -2416,12 +2610,13 @@ class DeepseekV4TopKRouter(spx.Module):
             init_kwargs={"stddev": config.initializer_range},
             key=rngs.param,
         )
-        self.e_score_correction_bias = ArrayParam.bound(
-            shape=(self.num_experts,),
-            dtype=param_dtype,
-            init_method="zeros",
-            key=rngs.param,
-        )
+        if self.uses_score_correction:
+            self.e_score_correction_bias = ArrayParam.bound(
+                shape=(self.num_experts,),
+                dtype=param_dtype,
+                init_method="zeros",
+                key=rngs.param,
+            )
 
     def _score(self, logits: Array) -> Array:
         """Apply the configured scoring activation (fp32)."""
@@ -2458,7 +2653,12 @@ class DeepseekV4HashRouter(DeepseekV4TopKRouter):
     experts. ``tid2eid`` is stored in ``param_dtype`` (checkpoint values are
     small integer expert ids, exactly representable) and cast to int32 at
     lookup time.
+
+    Selection never consults ``e_score_correction_bias`` here, and DeepSeek
+    does not ship one for these layers, so the parameter is not declared.
     """
+
+    uses_score_correction: tp.ClassVar[bool] = False
 
     def __init__(
         self,
@@ -3021,7 +3221,7 @@ class DeepseekV4Model(EasyDeLBaseModule):
         ).astype(inputs_embeds.dtype)
         hidden_streams = apply_logical_sharding(
             hidden_streams,
-            dynamic_axes=common_types.HiddenStateSharding,
+            dynamic_axes=_HyperStreamSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
@@ -3183,6 +3383,10 @@ class DeepseekV4ForCausalLM(BaseCausalLMModule[DeepseekV4Model, DeepseekV4Config
     _model_type = "deepseek_v4"
     _config_class = DeepseekV4Config
     esurge_cache_family: tp.ClassVar[str] = "compressed_window"
+    # DeepSeek publishes V4 only in its own inference naming; the transformers
+    # form is `inference/convert.py`'s input and was never released. See
+    # `_native_checkpoint` for the inverse rewrite.
+    _checkpoint_key_normalizer = staticmethod(native_key_to_easydel)
 
     def __init__(
         self,
