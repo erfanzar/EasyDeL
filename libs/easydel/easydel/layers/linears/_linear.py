@@ -378,17 +378,43 @@ class ParallelLinear(spx.Module):
         out_features = self.out_features
         if isinstance(out_features, collections.abc.Sequence):
             out_features = sum(out_features)
+        quant_rule = spx.quantization.rule_for(self, "dot_general")
         with jax.named_scope(f"easydel/linear/{type(self).__name__}/in{self.in_features}/out{out_features}"):
             y: Shaped[Array, "... out_features"] | None = None
             if self.distributed_matmul is not None:
+                if quant_rule is not None:
+                    # The fused collective matmul cannot be handed to the
+                    # quantized contraction -- its whole point is that the
+                    # all-gather and the multiply are one kernel. Discretize
+                    # the operands instead and let it run unchanged; the
+                    # forward still carries quantization error, which is what
+                    # quantization-aware training needs.
+                    kernel_promoted = spx.quantization.fake_quant(
+                        kernel_promoted, rule=quant_rule, contracting_axes=(0,), is_weight=True
+                    )
+                    inputs_promoted = spx.quantization.fake_quant(
+                        inputs_promoted,
+                        rule=quant_rule,
+                        contracting_axes=(inputs_promoted.ndim - 1,),
+                        is_weight=False,
+                    )
                 y = self.distributed_matmul(inputs_promoted, kernel_promoted)
             if y is None:
-                y = jnp.einsum(
-                    "...i,io->...o",
-                    inputs_promoted,
-                    kernel_promoted,
-                    precision=self.precision,
-                )
+                if quant_rule is not None:
+                    y = spx.quantization.qdot_general(
+                        inputs_promoted,
+                        kernel_promoted,
+                        (((inputs_promoted.ndim - 1,), (0,)), ((), ())),
+                        rule=quant_rule,
+                        rhs_is_weight=True,
+                    )
+                else:
+                    y = jnp.einsum(
+                        "...i,io->...o",
+                        inputs_promoted,
+                        kernel_promoted,
+                        precision=self.precision,
+                    )
 
         y_scaled: Shaped[Array, "... out_features"] = self._scale_operator(y)
 

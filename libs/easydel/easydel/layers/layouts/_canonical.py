@@ -219,9 +219,36 @@ def _key_to_string(key: tp.Any) -> str:
     return ".".join(str(part) for part in key) if isinstance(key, tuple) else str(key)
 
 
+#: Leaf suffixes that can hold a fused projection's data.
+#:
+#: ``.weight``/``.bias`` cover a dense linear. A *quantized* linear stores the
+#: same fused axis in ``quant_*`` leaves instead and has no ``.weight`` at all,
+#: so listing only the dense pair silently skipped every quantized fused
+#: projection: ``fused_param_tp`` was still stamped to the live tp, telling the
+#: runtime splitter the weight was interleaved while the stored codes were left
+#: contiguous. That is invisible at tp=1 (the interleave is the identity) and
+#: scrambles gate/up at tp>1 -- observed on DeepSeek-V4-Flash A16W4, where every
+#: shared expert diverged by rel 1.3 at tp=2 while attention (no fused
+#: projections) stayed clean.
+#:
+#: All of these carry the fused axis LAST, including ``quant_kernel_packed``:
+#: ``pack_int4_adjacent`` packs adjacent *rows* (the contraction dim), leaving
+#: the output axis last. ``_transform_last_axis`` re-checks
+#: ``shape[-1] == sum(segment_sizes)`` and no-ops otherwise, so a leaf whose
+#: last axis is not the fused one is skipped rather than corrupted.
+_FUSED_LEAF_SUFFIXES: tp.Final = (
+    ".weight",
+    ".bias",
+    ".quant_kernel",
+    ".quant_scales",
+    ".quant_biases",
+    ".quant_kernel_packed",
+)
+
+
 def _fused_leaf_markers(module_path: str) -> tuple[str, ...]:
     markers = []
-    for suffix in (".weight", ".bias"):
+    for suffix in _FUSED_LEAF_SUFFIXES:
         for prefix in (module_path, f"parameters.{module_path}"):
             marker = f"{prefix}{suffix}"
             markers.extend((marker, f"{marker}.value"))

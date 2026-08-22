@@ -513,6 +513,36 @@ class ParallelMoELinear(spx.Module):
 
         inputs, weight = promote_dtype((inputs, weight), dtype=self.dtype)
 
+        quant_rule = spx.quantization.rule_for(self, "ragged_dot")
+        if quant_rule is not None and quant_rule.act_qtype is not None and not self.out_first:
+            # Both operands are quantized, so hand the whole contraction to
+            # the quantized ragged dot: the forward runs in the narrow type
+            # and the backward can quantize the cotangent. Only valid in the
+            # ``[experts, contracted, out]`` orientation -- ``out_first``
+            # transposes the kernel, which the ragged dot does not accept.
+            return spx.quantization.qragged_dot(
+                inputs,
+                weight,
+                group_sizes,
+                rule=quant_rule,
+                preferred_element_type=jnp.bfloat16,
+            ) + (
+                self._expand_bias_ragged(group_sizes, sorted_experts=sorted_experts)
+                if self.bias is not None
+                else 0
+            )
+
+        if quant_rule is not None:
+            # Stacked expert kernels are ``[experts, contracted, out]``: axis 1
+            # is contracted, so axes 0 and 2 stay channelwise and each expert
+            # keeps an independent range. The grouped matmul below is left
+            # untouched, which is what keeps every backend and tuned tile
+            # configuration working under quantization-aware training.
+            weight = spx.quantization.fake_quant(weight, rule=quant_rule, contracting_axes=(1,), is_weight=True)
+            inputs = spx.quantization.fake_quant(
+                inputs, rule=quant_rule, contracting_axes=(inputs.ndim - 1,), is_weight=False
+            )
+
         output = grouped_matmul(
             inputs,
             weight,

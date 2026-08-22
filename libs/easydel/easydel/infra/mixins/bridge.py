@@ -138,6 +138,185 @@ CHAT_TEMPLATE_NAME = "chat_template.json"
 GENERATION_CONFIG_NAME = "generation_config.json"
 MODEL_CARD_NAME = "modelcard.json"
 
+
+#: Sentinel: this key was a quantization scale, already consumed alongside its
+#: weight. Distinct from ``None`` ("not quantized, pass through unchanged").
+_QUANT_CONSUMED = object()
+
+#: Arrays per read batch when quantizing at load. The callback that converts
+#: weights runs once per batch, so this caps how much dense weight is resident
+#: at once; large enough to keep the reads parallel, small enough that a
+#: stacked MoE expert tensor times this count still fits beside the quantized
+#: model being built.
+_QUANTIZED_LOAD_CHUNK_SIZE = 16
+
+
+def _build_quant_decoder(hf_config: tp.Any, ckpt_keys: tp.Iterable[str]):
+    """Build a decoder for a pre-quantized checkpoint, or ``None``.
+
+    Pre-quantized checkpoints store packed codes plus a sibling scale tensor.
+    Nothing in the streaming converter knew about them, so the codes were cast
+    as if they were ordinary numbers -- valid-looking output, wrong values, no
+    error. This resolves the registered adapter for the checkpoint's
+    ``quant_method`` and returns a callable that turns a (weight, scale) pair
+    into the dense tensor the rest of the pipeline expects.
+
+    Args:
+        hf_config: The checkpoint's HF config; read for ``quantization_config``.
+        ckpt_keys: Every key in the checkpoint, used to find scale siblings.
+
+    Returns:
+        ``decode(key, tensor, fetch) -> tensor | None | _QUANT_CONSUMED``, or
+        ``None`` when the checkpoint is not quantized or declares a scheme no
+        adapter claims (which stays a pass-through rather than an error, so
+        unquantized checkpoints are entirely unaffected).
+    """
+    raw = getattr(hf_config, "quantization_config", None)
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raw = getattr(raw, "to_dict", lambda: None)() or getattr(raw, "__dict__", None)
+    if not isinstance(raw, dict):
+        return None
+    method = str(raw.get("quant_method", "") or "").lower()
+    if not method:
+        return None
+    # Some checkpoints keep part of the quantization description OUTSIDE
+    # `quantization_config`: DeepSeek-V4 puts `expert_dtype: "fp4"` at the top
+    # level, while `quantization_config` describes only the dense fp8 weights.
+    # An adapter only ever sees the config block, so fold those hints in here
+    # or the experts -- 97% of the model -- silently decode as the dense
+    # format and come out at half their true input width.
+    raw = dict(raw)
+    for hint in ("expert_dtype",):
+        value = getattr(hf_config, hint, None)
+        if value is not None:
+            raw.setdefault(hint, value)
+    try:
+        from easydel.layers.quantization.checkpoint import get_adapter
+        from easydel.utils.parameters_transformation import TensorConverter
+
+        adapter = get_adapter(method)
+        parsed = adapter.parse_config(raw)
+    except Exception as exc:  # unknown scheme: leave the checkpoint alone
+        logger.warning(f"No checkpoint-quantization adapter for {method!r} ({exc}); loading tensors verbatim.")
+        return None
+
+    key_set = set(ckpt_keys)
+    scale_suffixes = {".scale", ".weight_scale", ".weight_scale_inv"}
+    scale_keys = {k for k in key_set if any(k.endswith(s) for s in scale_suffixes)}
+
+    def _source_for(key: str):
+        """Pick the per-layer source format, honouring `overrides`."""
+        for pattern, fmt in parsed.overrides:
+            if re.search(pattern, key):
+                return fmt
+        return parsed.default
+
+    def decode(key: str, tensor, fetch):
+        if key in scale_keys:
+            return _QUANT_CONSUMED
+        if not key.endswith(".weight"):
+            return None
+        stem = key[: -len(".weight")]
+        scale_key = next(
+            (f"{stem}{s}" for s in (".scale", ".weight_scale", ".weight_scale_inv") if f"{stem}{s}" in scale_keys), None
+        )
+        if scale_key is None:
+            return None
+        source = _source_for(key)
+        scale = fetch(scale_key)
+        if scale is None:
+            return None
+        # The adapter's canonical form is deliberately still quantized
+        # (`quant_kernel` + `quant_scales`) -- that is the runtime
+        # representation. Conversion needs a DENSE tensor for the streaming
+        # writer, so call the format's codec directly; load-time quantization
+        # is what puts the weights back to 4 bits in HBM.
+        from easydel.layers.quantization.checkpoint._codecs import decode_mxfp4, decode_scaled_elements
+
+        weight = TensorConverter.to_jax_preserving_dtype(tensor)
+        scale_arr = TensorConverter.to_jax_preserving_dtype(scale)
+
+        def _as_torch(arr):
+            """Hand back a torch tensor: the rest of the pipeline still calls
+            torch methods (`.permute`) on whatever this returns."""
+            import numpy as _np
+            import torch as _torch
+
+            return _torch.from_numpy(_np.asarray(arr, dtype=_np.float32))
+
+        if source.quant_method == "mxfp4":
+            if jnp.dtype(weight.dtype) == jnp.int8:
+                # Packed nibble pairs stored signed; identical bits.
+                weight = jax.lax.bitcast_convert_type(weight, jnp.uint8)
+            if jnp.dtype(scale_arr.dtype) != jnp.uint8:
+                scale_arr = jax.lax.bitcast_convert_type(scale_arr, jnp.uint8)
+            return _as_torch(decode_mxfp4(weight, scale_arr, transpose=False, dtype=jnp.float32))
+        return _as_torch(
+            decode_scaled_elements(
+                weight.astype(jnp.float32),
+                scale_arr.astype(jnp.float32),
+                transpose=False,
+                dtype=jnp.float32,
+                block_shape=source.block_shape,
+            )
+        )
+
+    return decode
+
+
+def stage_remote_metadata(
+    pretrained_model_name_or_path: str | os.PathLike,
+    *,
+    subfolder: str = "",
+    filenames: collections.abc.Sequence[str] = (CONFIG_NAME, GENERATION_CONFIG_NAME),
+) -> tuple[str | os.PathLike, tempfile.TemporaryDirectory | None]:
+    """Materialize a remote checkpoint's small metadata files locally.
+
+    ``AutoConfig.from_pretrained`` goes through the HF hub resolver, which
+    understands repo ids and local directories but not object-store URIs -- a
+    ``gs://`` path fails with "Repo id must be in the form 'repo_name'". The
+    weight side of the loader is already ``ePath``-aware and streams shards
+    straight from the bucket, so only these few KB need to land on disk.
+
+    Args:
+        pretrained_model_name_or_path: Checkpoint location. Non-``gs://``
+            values are returned untouched, so callers can apply this
+            unconditionally.
+        subfolder: Optional subfolder within the checkpoint.
+        filenames: Metadata files to stage. Missing ones are skipped -- only
+            the first is required, since a checkpoint without a config is not
+            loadable anyway.
+
+    Returns:
+        ``(config_source, tmpdir)``. ``tmpdir`` is ``None`` for non-remote
+        inputs, and otherwise must be kept alive by the caller until the
+        config has been read.
+
+    Raises:
+        FileNotFoundError: If the first entry of ``filenames`` is absent.
+    """
+    if not str(pretrained_model_name_or_path).startswith("gs://"):
+        return pretrained_model_name_or_path, None
+
+    tmp = tempfile.TemporaryDirectory()
+    base = str(pretrained_model_name_or_path).rstrip("/")
+    normalized = str(subfolder or "").strip("/").replace("\\", "/")
+    if normalized:
+        base = f"{base}/{normalized}"
+    for index, filename in enumerate(filenames):
+        source = ePath(f"{base}/{filename}")
+        try:
+            payload = source.read_bytes()
+        except Exception as exc:
+            if index == 0:
+                raise FileNotFoundError(f"{filename} not found under {base!r}") from exc
+            continue
+        ePath(os.path.join(tmp.name, os.path.basename(filename))).write_bytes(payload)
+    return tmp.name, tmp
+
+
 CANDIDATE_FILENAMES = [
     SAFE_WEIGHTS_INDEX_NAME,
     SAFE_WEIGHTS_NAME,
@@ -1151,10 +1330,52 @@ class EasyBridgeMixin(PushToHubMixin):
 
         Returns:
             EasyDeLBaseModule: The model with loaded parameters.
+
+        Note:
+            When *apply_quantization* is set, kernels are converted as the
+            checkpoint streams in (see ``callback``) and the results are cached
+            per dense-kernel path, so the post-load pass reuses them instead of
+            re-quantizing. In-stream conversion only happens on the loader's
+            CHUNKED read path, because that is the only path that runs the
+            per-array callback: reading the whole checkpoint at once leaves
+            every dense tensor resident before the first one is converted, which
+            defeats the point of quantizing at load. A chunk size is therefore
+            forced when none is given (``checkpoint_load_chunk_size``
+            overrides it) -- chunking is not a tuning preference here, it is
+            what bounds dense residency to a few tensors.
+
+        Note:
+            A layer may decline quantization (``quantization_supported``) and
+            keep dense weights rather than failing the load, so declines are
+            logged by layer type. A silent decline on the expert stack leaves
+            ~97% of a MoE model at full precision, and the only symptom is an
+            out-of-memory error from the allocator with nothing tying it back to
+            the quantization request.
+
+        Note:
+            Fused projections are excluded from in-stream quantization while a
+            tensor-parallel re-interleave is pending. ``retp_fused_state`` runs
+            between the streaming callback and the post-load pass, so for a
+            fused projection the re-interleave would land on a ``.weight`` that
+            is subsequently thrown away: the stored codes would keep the
+            checkpoint's canonical order while ``fused_param_tp`` is stamped to
+            the live tp, telling the runtime splitter they are interleaved. That
+            is the identity at tp=1 and scrambles gate/up at tp>1 -- observed on
+            DeepSeek-V4-Flash A16W4, where every shared expert diverged by rel
+            ~1.3 at tp=2 while attention, which has no fused projections, stayed
+            clean. Deferring only those leaves keeps streaming's bounded dense
+            residency for everything else, and only when an interleave is
+            actually pending.
+
+        Note:
+            The legacy ``.scale`` -> ``.weight`` rewrite is given the model's
+            declared leaf names so it cannot clobber a parameter the current
+            model genuinely calls ``scale``.
         """
         quantized_checkpoint = False
         modules_quantized_on_load = False
         kernel_map: dict[tuple, tuple[tuple, tuple, tuple]] = {}
+        streamed_quant: dict[tuple, dict[str, tp.Any]] = {}
         quantization_config = _normalize_quantization_config(quantization_config)
 
         extraargs = {}
@@ -1207,6 +1428,7 @@ class EasyBridgeMixin(PushToHubMixin):
             quantizer_for_modules = EasyQuantizer(quantization_config=quantization_config)
             pattern_str: str | None = quantizer_for_modules.pattern
             pattern = re.compile(pattern_str) if pattern_str is not None else None
+            unsupported: dict[str, int] = {}
             for path, module in iter_module_search(model, spx.Module):
                 if not hasattr(module, "to_quantized") or not callable(module.to_quantized):
                     continue
@@ -1215,6 +1437,7 @@ class EasyBridgeMixin(PushToHubMixin):
                     continue
                 _supported = getattr(module, "quantization_supported", None)
                 if callable(_supported) and not _supported(quantization_config):
+                    unsupported[type(module).__name__] = unsupported.get(type(module).__name__, 0) + 1
                     continue
                 # iter_module_search yields string path segments; checkpoint
                 # state keys promote digit segments to int (string_key_to_int).
@@ -1222,6 +1445,46 @@ class EasyBridgeMixin(PushToHubMixin):
                 path = tuple(int(p) if isinstance(p, str) and p.isdigit() else p for p in path)
                 kernel_key = (*path, "weight")
                 kernel_map[kernel_key] = ((*path, "quant_kernel"), (*path, "quant_scales"), (*path, "quant_biases"))
+            logger.info(
+                f"apply_quantization: {len(kernel_map)} layer(s) selected for "
+                f"{quantization_config.dtype} (bits={quantization_config.bits})."
+            )
+            if kernel_map and extraargs.get("chunk_size") is None:
+                extraargs["chunk_size"] = _QUANTIZED_LOAD_CHUNK_SIZE
+                logger.info(
+                    f"Loading in chunks of {_QUANTIZED_LOAD_CHUNK_SIZE} arrays so weights are quantized as they "
+                    "stream in (pass checkpoint_load_chunk_size to override)."
+                )
+            if unsupported:
+                detail = ", ".join(f"{n}x{c}" for c, n in sorted(unsupported.items()))
+                logger.warning(
+                    f"{sum(unsupported.values())} layer(s) do not support "
+                    f"{quantization_config.dtype} (bits={quantization_config.bits}) and keep DENSE weights: {detail}. "
+                    f"{len(kernel_map)} layer(s) will be quantized."
+                )
+
+        _fused_defer_paths: set[tuple] = set()
+        if kernel_map:
+            try:
+                from easydel.layers.layouts import fused_layout_param_specs, read_fused_checkpoint_tp
+                from easydel.layers.layouts._runtime import tensor_parallel_size as _fq_tp_size
+
+                _fq_cfg = getattr(model, "config", None)
+                _fq_live_tp = int(_fq_tp_size(_fq_cfg))
+                _fq_saved_tp = read_fused_checkpoint_tp(resolved_archive_file, _fq_cfg)
+                _fq_saved_tp = 1 if _fq_saved_tp is None else int(_fq_saved_tp)
+                if _fq_saved_tp != _fq_live_tp:
+                    _fq_registry = getattr(model, "fused_params", None) or dict(fused_layout_param_specs(model))
+                    for _fq_path in _fq_registry:
+                        _fq_parts = tuple(int(seg) if seg.isdigit() else seg for seg in str(_fq_path).split(".") if seg)
+                        _fused_defer_paths.add(_fq_parts)
+                    if _fused_defer_paths:
+                        logger.info(
+                            f"Deferring in-stream quantization for {len(_fused_defer_paths)} fused projection(s): "
+                            f"they must be re-interleaved from tp={_fq_saved_tp} to tp={_fq_live_tp} first."
+                        )
+            except Exception as exc:  # pragma: no cover - never block a load on this
+                logger.warning(f"Could not determine fused-projection re-interleave state ({exc}).")
 
         def _apply_shard_fn(x, p):
             """Apply a per-path shard function from ``shard_fns``, if any.
@@ -1243,17 +1506,100 @@ class EasyBridgeMixin(PushToHubMixin):
                     x = callable_fn(x)
             return x
 
+        def _canonical_kernel_path(p) -> tuple | None:
+            """Map a checkpoint leaf path to its ``kernel_map`` key, if any.
+
+            Leaf paths arrive either dotted or as tuples, with or without the
+            leading collection segment (``"parameters"``); digits are matched
+            as ints to line up with the module paths ``kernel_map`` is built
+            from.
+            """
+            if not kernel_map:
+                return None
+            key = tuple(p.split(".")) if isinstance(p, str) else tuple(p)
+            key = tuple(int(k) if isinstance(k, str) and k.isdigit() else k for k in key)
+            if key in kernel_map:
+                return key
+            if len(key) > 1 and key[1:] in kernel_map:
+                return key[1:]
+            return None
+
+        def _quantize_kernel(kernel_value) -> dict[str, tp.Any]:
+            """Quantize one dense kernel into its ``quant_*`` leaves.
+
+            Shared by the streaming callback and the post-load fallback so both
+            produce byte-identical leaves.
+            """
+            from easydel.layers.linears._linear_quantized import _effective_ejkernel_group_size
+            from easydel.layers.quantization._configs import resolve_ejkernel_quant_params
+
+            mode, group_size, bits, needs_biases = resolve_ejkernel_quant_params(quantization_config)
+            if mode == "channelwise":
+                from easydel.layers.linears._linear_quantized import (
+                    channelwise_quantize_array,
+                    should_pack_int4_companion,
+                )
+
+                quant_kernel, quant_scales, quant_biases = channelwise_quantize_array(jnp.asarray(kernel_value), bits)
+                out = {"kernel": quant_kernel, "scales": quant_scales, "biases": quant_biases}
+                if bits == 4 and quant_kernel.ndim == 2 and should_pack_int4_companion(*quant_kernel.shape):
+                    from ejkernel.modules import pack_int4_adjacent
+
+                    out["packed"] = pack_int4_adjacent(quant_kernel)
+                return out
+
+            from ejkernel.quantization import prepack_quantized_weights  # pyright: ignore[reportMissingTypeStubs]
+
+            _prepack = ejit(prepack_quantized_weights, static_argnames=["group_size", "bits", "mode", "transpose"])
+            group_size = _effective_ejkernel_group_size(mode, group_size, tuple(kernel_value.shape))
+            if needs_biases:
+                quant_kernel, quant_scales, quant_biases = _prepack(
+                    kernel_value, group_size=group_size, bits=bits, mode=mode, transpose=False
+                )
+            else:
+                quant_kernel, quant_scales = _prepack(
+                    kernel_value, group_size=group_size, bits=bits, mode=mode, transpose=False
+                )
+                quant_biases = None
+            return {"kernel": quant_kernel, "scales": quant_scales, "biases": quant_biases}
+
         def callback(x, p):
-            """Checkpointer per-tensor callback that delegates to ``_apply_shard_fn``.
+            """Checkpointer per-tensor callback: shard, then quantize in-stream.
+
+            Quantizing here rather than after the load is what makes
+            ``apply_quantization`` usable on a model that only fits once
+            quantized. The post-load pass popped dense kernels out of a fully
+            materialized ``state``, so the whole checkpoint had to fit at its
+            stored precision first -- DeepSeek-V4-Flash is 529.6 GiB of bf16
+            against 383 GiB of HBM, so it died before reaching the code meant
+            to shrink it. Converting each kernel as it arrives caps the dense
+            residency at one tensor.
 
             Args:
                 x: Tensor leaf being loaded from the checkpoint.
                 p: Path tuple/string identifying the leaf.
 
             Returns:
-                Any: ``_apply_shard_fn(x, p)``.
+                Any: the sharded leaf, or its packed quantized kernel.
+
+            Note:
+                A fused projection with a pending tensor-parallel re-interleave
+                is left dense here so ``retp_fused_state`` can rewrite it; the
+                post-load pass then quantizes the re-interleaved weight.
             """
-            return _apply_shard_fn(x, p)
+            x = _apply_shard_fn(x, p)
+            lookup = _canonical_kernel_path(p)
+            if lookup is None or lookup in streamed_quant:
+                return x
+            if _fused_defer_paths and tuple(lookup[:-1]) in _fused_defer_paths:
+                return x
+            try:
+                pieces = _quantize_kernel(x)
+            except Exception as exc:  # fall back to the post-load pass
+                logger.warning(f"in-stream quantization failed for {lookup} ({exc}); deferring to post-load pass.")
+                return x
+            streamed_quant[lookup] = pieces
+            return pieces["kernel"]
 
         if resolved_archive_file:
             extraargs["callback"] = callback
@@ -1294,7 +1640,15 @@ class EasyBridgeMixin(PushToHubMixin):
                 if any(isinstance(v, dict) for v in state.values()):
                     state = flatten_dict(state)
                 state = string_key_to_int(state)
-                state = _rename_legacy_checkpoint_leaves(state)
+                _declared_leaf_keys: set[tuple[tp.Any, ...]] = set()
+                try:
+                    for _c, _d in spx.export(model)[1].raw().items():
+                        for _path in flatten_dict(_d):
+                            _declared_leaf_keys.add(tuple(_path))
+                            _declared_leaf_keys.add((_c, *_path))
+                except Exception as exc:  # keep the legacy behaviour on any surprise
+                    logger.debug(f"Could not enumerate model leaves for legacy-rename guard ({exc}).")
+                state = _rename_legacy_checkpoint_leaves(state, known_keys=_declared_leaf_keys)
                 # Drop any saved RNG-state leaves (``...rng.rngs.*``). PRNG keys are
                 # per-run, not weights, and a checkpoint serialized under a
                 # low-precision ``param_dtype`` can store them downcast (e.g. as
@@ -1471,8 +1825,6 @@ class EasyBridgeMixin(PushToHubMixin):
                     prepack_quantized_weights,
                     static_argnames=["group_size", "bits", "mode", "transpose"],
                 )
-                from easydel.layers.linears._linear_quantized import _effective_ejkernel_group_size
-                from easydel.layers.quantization._configs import resolve_ejkernel_quant_params
 
                 if kernel_map:
                     if quantizer_for_modules is None:
@@ -1503,54 +1855,19 @@ class EasyBridgeMixin(PushToHubMixin):
                             prefix = tuple(found)
                             source_key = (*prefix, *kernel_key)
                         kernel_value = state.pop(source_key)
-                        mode, group_size, bits, needs_biases = resolve_ejkernel_quant_params(quantization_config)
-                        if mode == "channelwise":
-                            from easydel.layers.linears._linear_quantized import channelwise_quantize_array
-
-                            quant_kernel, quant_scales, quant_biases = channelwise_quantize_array(
-                                jnp.asarray(kernel_value), bits
-                            )
-                            state[(*prefix, *quant_kernel_key)] = quant_kernel
-                            state[(*prefix, *quant_scales_key)] = quant_scales
-                            state[(*prefix, *quant_biases_key)] = quant_biases
-                            if bits == 4 and quant_kernel.ndim == 2:
-                                from easydel.layers.linears._linear_quantized import should_pack_int4_companion
-
-                                # Same gate the module constructor applies:
-                                # only layers large enough for the fused
-                                # W4A4 pair route declare (and can receive)
-                                # a packed companion leaf.
-                                if should_pack_int4_companion(*quant_kernel.shape):
-                                    from ejkernel.modules import pack_int4_adjacent
-
-                                    packed_key = (*quant_kernel_key[:-1], "quant_kernel_packed")
-                                    state[(*prefix, *packed_key)] = pack_int4_adjacent(quant_kernel)
-                            quantized_on_load_count += 1
-                            if hasattr(quant_kernel, "block_until_ready"):
-                                quant_kernel.block_until_ready()
-                            del kernel_value
-                            continue
-                        group_size = _effective_ejkernel_group_size(mode, group_size, tuple(kernel_value.shape))
-                        if needs_biases:
-                            quant_kernel, quant_scales, quant_biases = prepack_quantized_weights(
-                                kernel_value,
-                                group_size=group_size,
-                                bits=bits,
-                                mode=mode,
-                                transpose=False,
-                            )
-                        else:
-                            quant_kernel, quant_scales = prepack_quantized_weights(
-                                kernel_value,
-                                group_size=group_size,
-                                bits=bits,
-                                mode=mode,
-                                transpose=False,
-                            )
-                            quant_biases = None
+                        pieces = streamed_quant.pop(kernel_key, None)
+                        if pieces is None:
+                            pieces = _quantize_kernel(kernel_value)
+                        quant_kernel = pieces["kernel"]
                         state[(*prefix, *quant_kernel_key)] = quant_kernel
-                        state[(*prefix, *quant_scales_key)] = quant_scales
-                        state[(*prefix, *quant_biases_key)] = quant_biases
+                        state[(*prefix, *quant_scales_key)] = pieces["scales"]
+                        state[(*prefix, *quant_biases_key)] = pieces["biases"]
+                        if "packed" in pieces:
+                            # Same gate the module constructor applies: only
+                            # layers large enough for the fused W4A4 pair route
+                            # declare (and can receive) a packed companion leaf.
+                            packed_key = (*quant_kernel_key[:-1], "quant_kernel_packed")
+                            state[(*prefix, *packed_key)] = pieces["packed"]
                         quantized_on_load_count += 1
                         if hasattr(quant_kernel, "block_until_ready"):
                             quant_kernel.block_until_ready()
@@ -2160,8 +2477,15 @@ class EasyBridgeMixin(PushToHubMixin):
         trust_remote_code = kwargs.get("trust_remote_code", False)
 
         logger.debug(f"Downloading model config from {pretrained_model_name_or_path}")
-        hf_config = AutoConfig.from_pretrained(
+        # `gs://` reaches here for HF-format checkpoints kept in a bucket; the
+        # hub resolver cannot parse an object-store URI, while the weight side
+        # below already streams shards through ePath.
+        _config_source, _staged_meta = stage_remote_metadata(
             pretrained_model_name_or_path,
+            subfolder=str(kwargs.get("subfolder", "") or ""),
+        )
+        hf_config = AutoConfig.from_pretrained(
+            _config_source,
             trust_remote_code=trust_remote_code,
             **load_options.hub_kwargs,
         )
@@ -2738,8 +3062,11 @@ class EasyBridgeMixin(PushToHubMixin):
         moe_path = transformer.keywords.get("moe_path")
         reform_param = transformer.keywords.get("reform_param")
         hf_flattened_wrappers = transformer.keywords.get("hf_flattened_wrappers")
+        # Vendor-layout checkpoints (DeepSeek-V4) rewrite keys before every
+        # other rule; `None` marks a tensor the runtime does not own.
+        _ckpt_key_normalizer = transformer.keywords.get("checkpoint_key_normalizer")
 
-        def _normalize_key(k: str) -> str:
+        def _normalize_key(k: str) -> str | None:
             """Map a checkpoint key to EasyDeL naming (re-insert flattened wrappers).
 
             Args:
@@ -2749,6 +3076,9 @@ class EasyBridgeMixin(PushToHubMixin):
                 str: The key with any transformers >= 5.13 flattened wrapper
                 prefix re-inserted; unchanged when already in EasyDeL layout.
             """
+            k = _ckpt_key_normalizer(k) if _ckpt_key_normalizer is not None else k
+            if k is None:
+                return None
             return StateDictConverter.normalize_flattened_wrapper_key(k, hf_flattened_wrappers)
 
         moe_names_set = set(moe_names or [])
@@ -2775,7 +3105,9 @@ class EasyBridgeMixin(PushToHubMixin):
             if not (moe_block_path and moe_names_set and moe_path):
                 return
             nk = _normalize_key(k)
-            if expert_prefix not in nk:
+            # `None` marks a tensor the runtime does not own (see
+            # `apply_checkpoint_key_normalizer`); it has no expert group.
+            if nk is None or expert_prefix not in nk:
                 return
             for block_path in moe_block_path:
                 block_expert_prefix = block_path + expert_prefix
@@ -2825,7 +3157,7 @@ class EasyBridgeMixin(PushToHubMixin):
             consolidated_moe_keys.add(f"{target_path}.weight")
 
         getattr(model, "config", hf_config)
-        normalized_to_original = {_normalize_key(k): k for k in ckpt_key_to_filename}
+        normalized_to_original = {nk: k for k in ckpt_key_to_filename if (nk := _normalize_key(k)) is not None}
         reform_fusion_groups, reform_fusion_rules = StateDictConverter.collect_reform_param_fusion_groups(
             normalized_to_original.keys(),
             reform_param,
@@ -3322,6 +3654,7 @@ class EasyBridgeMixin(PushToHubMixin):
         torch_streaming_cache: str = "temp",
         torch_streaming_tmp_dir: str | None = None,
         tensorstore_chunk_bytes: int = 2_147_483_648,
+        resume: bool = False,
         verbose: bool = True,
         **kwargs,
     ) -> str:
@@ -3365,12 +3698,37 @@ class EasyBridgeMixin(PushToHubMixin):
                 Only used when torch_streaming_cache="temp". Defaults to None.
             tensorstore_chunk_bytes (int): The chunk size in bytes for TensorStore arrays.
                 Defaults to 2_147_483_648 (2GB).
+            resume (bool): Reuse a partially converted checkpoint in ``save_directory``.
+                Every parameter already listed in its ``tensorstore_index.json`` is
+                left untouched and its source tensors are never read, so only the
+                missing ones are fetched and written. Large conversions take hours
+                and a stall used to mean starting over; this also repairs a
+                checkpoint that a fixed converter bug left incomplete.
+                Defaults to False.
             verbose (bool): Whether to print verbose messages. Defaults to True.
             **kwargs: Additional keyword arguments (e.g., cache_dir, revision, token,
                 local_files_only, force_download, subfolder, proxies).
 
         Returns:
             str: The path to the saved checkpoint directory.
+
+        Note:
+            A resumed run adopts whatever the previous one already wrote: its
+            index entries are carried into the new index verbatim, so the
+            rewritten index still describes the whole checkpoint, and their
+            relative paths gate every read. In particular a group already
+            stacked is never re-read expert by expert -- per-expert tensors are
+            ~97% of a MoE checkpoint's tensors and the whole cost of the
+            conversion.
+
+        Note:
+            On a pre-quantized checkpoint, ``reform_param`` fusion sources are
+            decoded BEFORE they are fused. A fusion source is claimed by the
+            fusion path and never reaches the single-tensor writer, so the
+            fusion would otherwise concatenate packed codes -- and since the
+            fused key has no scale sibling of its own, the result was dropped on
+            the floor instead of erroring, silently costing DeepSeek-V4 every
+            shared-expert ``gate_up_proj``.
         """
         from datetime import datetime
 
@@ -3432,9 +3790,47 @@ class EasyBridgeMixin(PushToHubMixin):
             return f"{base}/{filename}"
 
         def _copy_gcs_file(filename: str, dest_dir: str) -> str:
+            """Stage one remote object locally, streaming in chunks.
+
+            Uses ``ePath`` rather than shelling out to ``gsutil``: the repo's
+            GCS I/O goes through ``ePath`` everywhere else, and ``gsutil``
+            aborts on multi-GB objects when its compiled ``crcmod`` is missing
+            ("check_hashes" warning) -- which is every safetensors shard here,
+            so shard streaming failed on the first file.
+
+            ``ePath`` exposes whole-object reads only, so the shard lands in
+            memory once before being written; the streaming loader keeps just
+            one shard resident at a time, which is the point of staging it.
+            """
             os.makedirs(dest_dir, exist_ok=True)
             local_path = os.path.join(dest_dir, os.path.basename(filename))
-            subprocess.run(["gsutil", "-q", "cp", _gcs_object_uri(filename), local_path], check=True)
+            uri = _gcs_object_uri(filename)
+            # Fast path: `gcloud storage cp` does a parallel/chunked transfer
+            # and measured 877 MB/s against ePath's single-stream 115 MB/s on
+            # a 3.5 GB shard (7.6x) -- ~22 minutes over a 48-shard model. It is
+            # the modern replacement for `gsutil`, which is what used to be
+            # here and which aborts on multi-GB objects when its compiled
+            # crcmod is missing. ePath stays the fallback so nothing depends on
+            # a CLI being installed.
+            if shutil.which("gcloud") is not None:
+                result = subprocess.run(
+                    ["gcloud", "storage", "cp", uri, local_path],
+                    capture_output=True,
+                    check=False,
+                )
+                if result.returncode == 0 and os.path.exists(local_path):
+                    return local_path
+            try:
+                payload = ePath(uri).read_bytes()
+            except Exception as exc:
+                # Callers probe a list of candidate filenames and expect a
+                # miss to be catchable; surface one portable error rather than
+                # the storage backend's own (gsutil raised CalledProcessError,
+                # ePath raises google.api_core NotFound).
+                raise FileNotFoundError(uri) from exc
+            with open(local_path, "wb") as dst:
+                dst.write(payload)
+            del payload
             return local_path
 
         if gcs_source:
@@ -3442,7 +3838,7 @@ class EasyBridgeMixin(PushToHubMixin):
             _copy_gcs_file(CONFIG_NAME, gcs_meta_tmp.name)
             try:
                 _copy_gcs_file(GENERATION_CONFIG_NAME, gcs_meta_tmp.name)
-            except subprocess.CalledProcessError:
+            except FileNotFoundError:
                 pass
             config_source = gcs_meta_tmp.name
 
@@ -3531,8 +3927,11 @@ class EasyBridgeMixin(PushToHubMixin):
         moe_path = transformer.keywords.get("moe_path")
         reform_param = transformer.keywords.get("reform_param")
         hf_flattened_wrappers = transformer.keywords.get("hf_flattened_wrappers")
+        # Vendor-layout checkpoints (DeepSeek-V4) rewrite keys before every
+        # other rule; `None` marks a tensor the runtime does not own.
+        _ckpt_key_normalizer = transformer.keywords.get("checkpoint_key_normalizer")
 
-        def _normalize_key(k: str) -> str:
+        def _normalize_key(k: str) -> str | None:
             """Map a checkpoint key to EasyDeL naming (re-insert flattened wrappers).
 
             Args:
@@ -3542,6 +3941,9 @@ class EasyBridgeMixin(PushToHubMixin):
                 str: The key with any transformers >= 5.13 flattened wrapper
                 prefix re-inserted; unchanged when already in EasyDeL layout.
             """
+            k = _ckpt_key_normalizer(k) if _ckpt_key_normalizer is not None else k
+            if k is None:
+                return None
             return StateDictConverter.normalize_flattened_wrapper_key(k, hf_flattened_wrappers)
 
         uses_tie_word_embedding = getattr(hf_config, "tie_word_embeddings", False)
@@ -3570,7 +3972,9 @@ class EasyBridgeMixin(PushToHubMixin):
             if not (moe_block_path and moe_names_set and moe_path):
                 return
             nk = _normalize_key(k)
-            if expert_prefix not in nk:
+            # `None` marks a tensor the runtime does not own (see
+            # `apply_checkpoint_key_normalizer`); it has no expert group.
+            if nk is None or expert_prefix not in nk:
                 return
             for block_path in moe_block_path:
                 block_expert_prefix = block_path + expert_prefix
@@ -3688,28 +4092,28 @@ class EasyBridgeMixin(PushToHubMixin):
             try:
                 resolved_index_file = _copy_gcs_file(SAFE_WEIGHTS_INDEX_NAME, gcs_meta_tmp.name)
                 ckpt_weight_format = "safetensors"
-            except subprocess.CalledProcessError:
+            except FileNotFoundError:
                 resolved_index_file = None
 
             if resolved_index_file is None:
                 try:
                     resolved_index_file = _copy_gcs_file(WEIGHTS_INDEX_NAME, gcs_meta_tmp.name)
                     ckpt_weight_format = "bin"
-                except subprocess.CalledProcessError:
+                except FileNotFoundError:
                     resolved_index_file = None
 
             if resolved_index_file is None:
                 try:
                     resolved_single_file = _copy_gcs_file(SAFE_WEIGHTS_NAME, gcs_meta_tmp.name)
                     ckpt_weight_format = "safetensors"
-                except subprocess.CalledProcessError:
+                except FileNotFoundError:
                     resolved_single_file = None
 
             if resolved_single_file is None:
                 try:
                     resolved_single_file = _copy_gcs_file(WEIGHTS_NAME, gcs_meta_tmp.name)
                     ckpt_weight_format = "bin"
-                except subprocess.CalledProcessError:
+                except FileNotFoundError:
                     resolved_single_file = None
         elif os.path.isdir(pretrained_model_name_or_path):
             resolved_index_file = _find_local(SAFE_WEIGHTS_INDEX_NAME)
@@ -3836,6 +4240,31 @@ class EasyBridgeMixin(PushToHubMixin):
             return abs_path, rel
 
         array_index: list[dict[str, tp.Any]] = []
+        resume_paths: set[str] = set()
+        if resume:
+            existing_index = save_root / TENSORSTORE_INDEX_NAME
+            if existing_index.exists():
+                try:
+                    existing_entries = json.loads(existing_index.read_text()).get("prefixes", {}).get("model", [])
+                except Exception as exc:
+                    raise ValueError(
+                        f"resume=True but {existing_index} is unreadable ({exc}); "
+                        "delete the directory to convert from scratch."
+                    ) from exc
+                for entry in existing_entries:
+                    path = entry.get("path")
+                    if path is None or path in resume_paths:
+                        continue
+                    resume_paths.add(path)
+                    array_index.append(entry)
+                if verbose:
+                    logger.info(f"Resuming: {len(resume_paths)} parameters already present, skipping their sources.")
+            elif verbose:
+                logger.info(f"resume=True but no {TENSORSTORE_INDEX_NAME} in {save_root}; converting from scratch.")
+
+        def _already_written(key_tuple: tuple) -> bool:
+            """Whether a resumed run already holds this parameter."""
+            return bool(resume_paths) and _tensorstore_path_for_params(key_tuple)[1] in resume_paths
 
         def _write_tensor(key_tuple: tuple, value) -> None:
             """Write a single converted parameter to a TensorStore zarr store.
@@ -3850,6 +4279,8 @@ class EasyBridgeMixin(PushToHubMixin):
             if key_tuple not in required_params:
                 return
             abs_path, rel_path = _tensorstore_path_for_params(key_tuple)
+            if rel_path in resume_paths:
+                return
             spec = jax_ser.get_tensorstore_spec(abs_path)
             chunks = _chunk_shape_for(key_tuple, tuple(int(i) for i in value.shape), value.dtype, moe=False)
             spec["metadata"] = ts_impl._get_tensorstore_metadata_cached(
@@ -4016,7 +4447,18 @@ class EasyBridgeMixin(PushToHubMixin):
         for k, fname in ckpt_key_to_filename.items():
             file_to_keys.setdefault(fname, []).append(k)
 
-        normalized_to_original = {_normalize_key(k): k for k in ckpt_key_to_filename}
+        # Pre-quantized checkpoints ship a scale tensor beside every quantized
+        # weight. Without this the streaming loop casts the packed codes as if
+        # they were ordinary numbers -- DeepSeek-V4's fp4 experts came out as
+        # bf16 with half their true input width, silently. Resolve the adapter
+        # once here; `_decode_quantized` below pairs each weight with its scale
+        # and hands both to the adapter's codec.
+        quant_decode = _build_quant_decoder(hf_config, ckpt_key_to_filename)
+        # Set per shard below; the decoder needs the sibling scale tensor,
+        # which always lives in the same shard as its weight.
+        _shard_getter: dict[str, tp.Any] = {"fn": None}
+
+        normalized_to_original = {nk: k for k in ckpt_key_to_filename if (nk := _normalize_key(k)) is not None}
         fusion_groups, fusion_rules_by_target = StateDictConverter.collect_reform_param_fusion_groups(
             normalized_to_original.keys(),
             reform_param,
@@ -4035,6 +4477,14 @@ class EasyBridgeMixin(PushToHubMixin):
 
         moe_expected: dict[str, int] = {tp: len(expert_key_by_idx) for tp, expert_key_by_idx in moe_groups.items()}
         moe_remaining: dict[str, int] = dict(moe_expected)
+
+        def _moe_target_key_tuple(target_path: str) -> tuple:
+            """The stacked parameter a MoE group consolidates into."""
+            return tuple(int(n) if n.isdigit() else n for n in f"{target_path}.weight".split("."))
+
+        resumed_moe_targets = {t for t in moe_remaining if _already_written(_moe_target_key_tuple(t))}
+        for target in resumed_moe_targets:
+            moe_remaining.pop(target, None)
         moe_handles: dict[str, dict[str, tp.Any]] = {}
 
         def _ensure_moe_group_ready(target_path: str, *, sample_expert_tensor) -> dict[str, tp.Any] | None:
@@ -4112,33 +4562,73 @@ class EasyBridgeMixin(PushToHubMixin):
             if target_path in moe_handles:
                 moe_handles.pop(target_path, None)
 
-        def _process_and_write(key: str, tensor) -> None:
+        def _process_and_write(key: str, tensor, decode_quant: bool = True, pre_normalized: bool = False) -> None:
             """Convert a non-MoE HF tensor and persist it to TensorStore.
 
             Args:
                 key: HF state-dict key.
                 tensor: The torch tensor for that key.
+                decode_quant: Whether to run the pre-quantized decoder. Callers
+                    that already decoded (the reform_param fusion path, which
+                    must decode each source before concatenating them) pass
+                    ``False``; the fused key is synthetic and has no scale
+                    sibling of its own.
+                pre_normalized: Whether ``key`` is already in EasyDeL naming.
+                    Fusion targets are built from normalized source names, so
+                    running a vendor-layout normalizer over one asks it to
+                    translate a key no checkpoint contains. DeepSeek-V4's
+                    answers ``None`` -- "the runtime does not own this" -- and
+                    every fused shared-expert ``gate_up_proj`` was discarded on
+                    that line, silently, because ``None`` is a normal answer.
 
             Returns:
                 None.
             """
+            normalized = key if pre_normalized else _normalize_key(key)
+            # Unowned tensor (e.g. an optional head the runtime does not build).
+            if normalized is None:
+                return
+            if decode_quant and quant_decode is not None:
+                decoded = quant_decode(key, tensor, _shard_getter["fn"])
+                if decoded is _QUANT_CONSUMED:
+                    return
+                if decoded is not None:
+                    tensor = decoded
             with convert_ctx:
-                results = StateDictConverter.process_tensor(_normalize_key(key), tensor, converter_config)
+                results = StateDictConverter.process_tensor(normalized, tensor, converter_config)
             if results is None:
                 return
             for key_tuple, jax_array in results:
                 _write_tensor(key_tuple, jax_array)
 
         def _process_fusion_source(key: str, tensor) -> bool:
-            """Accumulate reform_param source tensors and write fused targets."""
+            """Accumulate reform_param source tensors and write fused targets.
+
+            Note:
+                Sources are decoded before they are fused. A fusion source is
+                claimed here and never reaches ``_process_and_write``, so on a
+                pre-quantized checkpoint the fusion would otherwise concatenate
+                packed codes, and the synthetic fused key has no scale sibling
+                to decode them with.
+            """
             fused_targets = fusion_source_to_targets.get(key)
             if not fused_targets:
                 return False
 
+            if quant_decode is not None:
+                decoded = quant_decode(key, tensor, _shard_getter["fn"])
+                if decoded is _QUANT_CONSUMED:
+                    return True
+                if decoded is not None:
+                    tensor = decoded
+
             for fused_key in fused_targets:
                 rule = fusion_rules_by_target[fused_key]
                 pending = fusion_pending.setdefault(fused_key, {})
-                pending[_normalize_key(key)] = tensor
+                normalized_source = _normalize_key(key)
+                if normalized_source is None:
+                    continue
+                pending[normalized_source] = tensor
                 source_keys = tuple(rule["sources"])
                 if not all(source_key in pending for source_key in source_keys):
                     continue
@@ -4146,7 +4636,7 @@ class EasyBridgeMixin(PushToHubMixin):
                 source_tensors = [pending.pop(source_key) for source_key in source_keys]
                 with convert_ctx:
                     fused_tensor = StateDictConverter.fuse_reform_param_tensors(rule, source_tensors)
-                _process_and_write(fused_key, fused_tensor)
+                _process_and_write(fused_key, fused_tensor, decode_quant=False, pre_normalized=True)
                 label = str(rule.get("log_label", fused_key))
                 fusion_counts[label] = fusion_counts.get(label, 0) + 1
 
@@ -4172,6 +4662,7 @@ class EasyBridgeMixin(PushToHubMixin):
             with _with_resolved_shard(fname) as resolved_path:
                 if ckpt_weight_format == "safetensors":
                     with safe_open(resolved_path, framework="pt", device="cpu") as f:
+                        _shard_getter["fn"] = f.get_tensor
                         for k in keys:
                             if k in fusion_source_to_targets:
                                 _process_fusion_source(k, f.get_tensor(k))
@@ -4179,7 +4670,18 @@ class EasyBridgeMixin(PushToHubMixin):
 
                             if k in expert_key_to_group:
                                 target_path, expert_idx = expert_key_to_group[k]
+                                if target_path in resumed_moe_targets:
+                                    continue
                                 expert_tensor = f.get_tensor(k)
+                                # Experts bypass `_process_and_write`, so the quantized-source
+                                # decode has to happen here too -- this is where 97% of a
+                                # DeepSeek-V4 checkpoint's tensors actually flow.
+                                if quant_decode is not None:
+                                    _decoded = quant_decode(k, expert_tensor, _shard_getter["fn"])
+                                    if _decoded is _QUANT_CONSUMED:
+                                        continue
+                                    if _decoded is not None:
+                                        expert_tensor = _decoded
                                 handle = _ensure_moe_group_ready(target_path, sample_expert_tensor=expert_tensor)
                                 if handle is not None:
                                     pos = handle["pos_by_expert"][expert_idx]
@@ -4195,6 +4697,7 @@ class EasyBridgeMixin(PushToHubMixin):
                                 del expert_tensor
                                 continue
 
+                            _shard_getter["fn"] = f.get_tensor
                             _process_and_write(k, f.get_tensor(k))
                 else:
                     shard = None
@@ -4203,6 +4706,7 @@ class EasyBridgeMixin(PushToHubMixin):
                     except TypeError:
                         shard = torch.load(resolved_path, map_location="cpu")
 
+                    _shard_getter["fn"] = shard.get
                     for k in keys:
                         if k in fusion_source_to_targets:
                             _process_fusion_source(k, shard[k])
@@ -4210,7 +4714,18 @@ class EasyBridgeMixin(PushToHubMixin):
 
                         if k in expert_key_to_group:
                             target_path, expert_idx = expert_key_to_group[k]
+                            if target_path in resumed_moe_targets:
+                                continue
                             expert_tensor = shard[k]
+                            # Experts bypass `_process_and_write`, so the quantized-source
+                            # decode has to happen here too -- this is where 97% of a
+                            # DeepSeek-V4 checkpoint's tensors actually flow.
+                            if quant_decode is not None:
+                                _decoded = quant_decode(k, expert_tensor, _shard_getter["fn"])
+                                if _decoded is _QUANT_CONSUMED:
+                                    continue
+                                if _decoded is not None:
+                                    expert_tensor = _decoded
                             handle = _ensure_moe_group_ready(target_path, sample_expert_tensor=expert_tensor)
                             if handle is not None:
                                 pos = handle["pos_by_expert"][expert_idx]

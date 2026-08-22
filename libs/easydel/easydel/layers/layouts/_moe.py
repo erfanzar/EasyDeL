@@ -92,6 +92,8 @@ class FusedExpertLayout:
     transpose_weight: bool = True
     weight_tp_dim: int = 2
     bias_tp_dim: int = 1
+    source_per_expert: int | None = None
+    per_expert_template: str = "{prefix}.{index}.{name}.weight"
 
     def reform_param(
         self,
@@ -135,6 +137,76 @@ class FusedExpertLayout:
                 Active TP size (``1`` when no TP axis applies).
             """
             return tensor_parallel_size(config, arr=arr)
+
+        if self.source_per_expert is not None:
+            # One tensor PER EXPERT in the checkpoint (DeepSeek's native
+            # `ffn.experts.<i>.w1/w3`, original Mixtral, Grok) rather than one
+            # stacked `[experts, ...]` tensor. Declare all 2N sources on a
+            # single rule so the loader hands them to `_fuser` together and the
+            # stack happens once, in checkpoint order.
+            n = int(self.source_per_expert)
+
+            def _key(index: int, name: str) -> str:
+                return self.per_expert_template.format(prefix=self.source_prefix, index=index, name=name)
+
+            def _weight_fuser(torch: tp.Any, *tensors: tp.Any) -> tp.Any:
+                """Stack per-expert gate/up pairs into one EasyDeL expert tensor.
+
+                Sources arrive as ``gate_0, up_0, gate_1, up_1, ...`` in the
+                order declared below. Each pair is transposed to EasyDeL's
+                ``[hidden, intermediate]`` and TP-interleaved exactly like the
+                stacked-source branch, then stacked on a new leading expert
+                axis.
+                """
+                fused = []
+                for gate, up in zip(tensors[::2], tensors[1::2], strict=True):
+                    if self.transpose_weight:
+                        gate = gate.transpose(-1, -2).contiguous()
+                        up = up.transpose(-1, -2).contiguous()
+                    fused.append(
+                        torch_interleave_segments_for_tp(
+                            torch,
+                            (gate, up),
+                            tp_size=_tp_size(gate),
+                            # per-expert tensors are 2-D, so the interleave axis
+                            # is the expert-stacked axis minus the expert dim
+                            dim=self.weight_tp_dim - 1,
+                        )
+                    )
+                return torch.stack(fused, dim=0)
+
+            def _weight_inverse_fuser(torch: tp.Any, gate_up: tp.Any) -> tuple[tp.Any, ...]:
+                """Split the stacked expert tensor back into 2N per-expert tensors."""
+                out: list[tp.Any] = []
+                for index in range(n):
+                    expert = gate_up[index]
+                    half = int(expert.shape[self.weight_tp_dim - 1]) // 2
+                    gate, up = torch_deinterleave_segments_for_tp(
+                        torch,
+                        expert,
+                        (half, half),
+                        tp_size=_tp_size(gate_up),
+                        dim=self.weight_tp_dim - 1,
+                    )
+                    if self.transpose_weight:
+                        gate = gate.transpose(-1, -2).contiguous()
+                        up = up.transpose(-1, -2).contiguous()
+                    out.extend((gate, up))
+                return tuple(out)
+
+            sources: list[str] = []
+            for index in range(n):
+                sources.append(_key(index, self.gate_prefix))
+                sources.append(_key(index, self.up_prefix))
+            return {
+                f"{self.target_prefix}.weight$": {
+                    "sources": tuple(sources),
+                    "fuser": _weight_fuser,
+                    "inverse_fuser": _weight_inverse_fuser,
+                    "already_converted": True,
+                    "log_label": f"MoE per-expert gate/up weight groups ({n} experts)",
+                }
+            }
 
         if self.source_is_fused:
 
