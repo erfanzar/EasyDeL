@@ -30,6 +30,7 @@ from ..core.variable import DeferredParameter, Parameter
 from ..functional import linear as F_linear
 from ..init import kaiming_uniform, zeros
 from ..rng.rngs import Rngs, resolve_rngs
+from ._quant import quantized_dot_general_for as _quantized_dot_general_for
 
 
 class Linear(Module):
@@ -163,9 +164,10 @@ class Linear(Module):
             W = W.astype(pol.compute_dtype)
             if b is not None:
                 b = b.astype(pol.compute_dtype)
+        dot = _quantized_dot_general_for(self)
         if self.use_bias:
-            return F_linear(xa, W, b)
-        return F_linear(xa, W)
+            return F_linear(xa, W, b, dot_general=dot)
+        return F_linear(xa, W, dot_general=dot)
 
 
 class Bilinear(Module):

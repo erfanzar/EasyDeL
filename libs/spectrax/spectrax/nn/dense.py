@@ -33,6 +33,8 @@ from ..core.sharding import AxisNames, Sharding
 from ..core.variable import Parameter
 from ..init import kaiming_uniform, zeros
 from ..rng.rngs import Rngs, resolve_rngs
+from ._quant import quantized_dot_general_for as _quantized_dot_general_for
+from ._quant import quantized_einsum_for as _quantized_einsum_for
 
 __all__ = ["DenseGeneral", "Einsum"]
 
@@ -167,8 +169,12 @@ class DenseGeneral(Module):
     def forward(self, x: ArrayLike, **_: object) -> Array:
         """Contract ``x`` with the weight along ``axis`` and add the bias.
 
-        Computes ``jnp.tensordot(x, weight, axes=(axis, leading_weight_axes))``
-        and broadcasts the bias along the result's non-feature axes.
+        Contracts ``x``'s ``axis`` dimensions against the weight's
+        leading dimensions and broadcasts the bias along the result's
+        non-feature axes. Expressed as an explicit ``dot_general``
+        rather than :func:`jax.numpy.tensordot` — the two are the same
+        contraction with the same output ordering, but the explicit form
+        is the injection point a stamped quantization rule needs.
 
         Args:
             x: Input tensor whose sizes along ``axis`` must match
@@ -184,7 +190,12 @@ class DenseGeneral(Module):
         contracting = list(axes)
         n_contract = len(contracting)
         n_features = len(self.features)
-        y = jnp.tensordot(xa, self.weight.value, axes=(contracting, list(range(n_contract))))
+        dot = _quantized_dot_general_for(self)
+        y = dot(
+            xa,
+            self.weight.value,
+            ((tuple(contracting), tuple(range(n_contract))), ((), ())),
+        )
         if self.use_bias:
             expand = (None,) * (y.ndim - n_features) + (slice(None),) * n_features
             y = y + self.bias.value[expand]
@@ -291,7 +302,8 @@ class Einsum(Module):
             The einsum result plus :attr:`bias` (broadcast) when
             ``use_bias=True``, otherwise just the einsum result.
         """
-        y = jnp.einsum(self.equation, jnp.asarray(x), self.weight.value)
+        einsum = _quantized_einsum_for(self)
+        y = einsum(self.equation, jnp.asarray(x), self.weight.value)
         if self.use_bias:
             y = y + self.bias.value
         return y

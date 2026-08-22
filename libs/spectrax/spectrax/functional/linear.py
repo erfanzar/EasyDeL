@@ -15,13 +15,21 @@ on its native fast matmul path.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import jax
 import jax.numpy as jnp
 
 from ..core._typing import Array, ArrayLike
 
 
-def linear(x: ArrayLike, w: ArrayLike, b: ArrayLike | None = None) -> Array:
+def linear(
+    x: ArrayLike,
+    w: ArrayLike,
+    b: ArrayLike | None = None,
+    *,
+    dot_general: Callable[..., Array] = jax.lax.dot_general,
+) -> Array:
     """Dense multiply with optional bias: ``y = x @ w + b``.
 
     Contracts the trailing axis of ``x`` with the leading axis of ``w``
@@ -51,6 +59,12 @@ def linear(x: ArrayLike, w: ArrayLike, b: ArrayLike | None = None) -> Array:
             dimension. All leading axes pass through unchanged.
         w: Weight matrix of shape ``(in, out)``.
         b: Optional bias broadcastable to ``(..., out)``.
+        dot_general: The contraction to use. Defaults to
+            :func:`jax.lax.dot_general`; layers substitute a
+            quantization-aware contraction here (see
+            :func:`spectrax.quantization.qdot_general`) so the dtype
+            promotion and bias handling above stay in one place rather
+            than being reimplemented per numeric regime.
 
     Returns:
         The dense product ``x @ w`` (with ``b`` added when supplied),
@@ -65,7 +79,7 @@ def linear(x: ArrayLike, w: ArrayLike, b: ArrayLike | None = None) -> Array:
             wa = wa.astype(x_dtype)
         else:
             xa = xa.astype(w_dtype)
-    y = jax.lax.dot_general(xa, wa, (((xa.ndim - 1,), (0,)), ((), ())))
+    y = dot_general(xa, wa, (((xa.ndim - 1,), (0,)), ((), ())))
     if b is not None:
         ba = jnp.asarray(b)
         if ba.dtype != y.dtype and jnp.issubdtype(ba.dtype, jnp.floating) and jnp.issubdtype(y.dtype, jnp.floating):
