@@ -47,7 +47,9 @@ dependencies = [
 [tool.uv.build-backend]
 module-name = "ejkernel"
 module-root = "."
-source-include = ["csrc/**"]
+# The shipped tuned-kernel table is package data, not source: kernels read it
+# at runtime, so it has to land in the wheel.
+source-include = ["csrc/**", "ejkernel/ops/tuned/*.db"]
 data = { purelib = "csrc" }
 
 [tool.uv.sources]
@@ -60,7 +62,7 @@ package-dir = { "" = "." }
 where = ["."]
 
 [tool.setuptools.package-data]
-"ejkernel" = ["py.typed"]
+"ejkernel" = ["py.typed", "ops/tuned/*.db"]
 
 [project.optional-dependencies]
 

@@ -24,6 +24,10 @@ repos:
       - id: check-added-large-files
         stages: [pre-commit]
         args: ["--maxkb=1000"]
+        # The tuned-kernel table is package data the kernels read at import
+        # time (see libs/ejkernel/pyproject.toml package-data), so it is
+        # committed deliberately and outgrows the general 1 MB guard.
+        exclude: ^libs/ejkernel/ejkernel/ops/tuned/.*\.db$
       - id: check-case-conflict
         stages: [pre-commit]
       - id: check-merge-conflict
