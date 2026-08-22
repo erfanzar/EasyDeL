@@ -14,7 +14,6 @@
 
 import jax
 import jax.numpy as jnp
-
 from easydel.utils.checkpoint_compat import (
     adapt_legacy_checkpoint_collections,
     legacy_checkpoint_key_aliases,
@@ -139,3 +138,37 @@ def test_materialize_tied_lm_head_does_nothing_when_untied_or_existing():
 
     assert target_key not in untied
     assert jnp.allclose(existing_result[target_key], existing)
+
+
+def test_legacy_rename_keeps_a_scale_the_model_actually_declares():
+    """``scale`` is a legacy spelling AND a real current parameter name.
+
+    DeepSeek-V4's hyper-connection blocks own ``attn_hc.scale`` /
+    ``ffn_hc.scale``. Rewriting those to ``weight`` yields a key the model does
+    not have, so the value is discarded as unexpected and the real parameter is
+    left uninitialized -- 86 silently-empty leaves on V4-Flash, reported only
+    much later as "abstract trainable parameter".
+    """
+    hc_scale = ("parameters", "model", "layers", 0, "attn_hc", "scale")
+    legacy_norm = ("parameters", "model", "layers", 0, "input_layernorm", "scale")
+    state = {
+        hc_scale: jnp.ones((3,), dtype=jnp.float32),
+        legacy_norm: jnp.ones((8,), dtype=jnp.float32),
+    }
+    known = {hc_scale, hc_scale[1:]}
+
+    renamed = rename_legacy_checkpoint_leaves(state, known_keys=known)
+
+    # Declared by the model under its own name -> untouched.
+    assert hc_scale in renamed
+    # Not declared -> still gets the legacy rewrite.
+    assert (*legacy_norm[:-1], "weight") in renamed
+    assert legacy_norm not in renamed
+
+
+def test_legacy_rename_without_known_keys_is_unchanged():
+    """Callers that pass no model keys keep the original behaviour."""
+    norm = ("parameters", "model", "norm", "scale")
+    renamed = rename_legacy_checkpoint_leaves({norm: jnp.ones((4,), dtype=jnp.float32)})
+    assert (*norm[:-1], "weight") in renamed
+    assert norm not in renamed

@@ -49,6 +49,8 @@ from __future__ import annotations
 
 import typing as tp
 
+import jax
+import jax.numpy as jnp
 from eformer.loggings import get_logger
 
 from .._configs import QuantizationType
@@ -686,3 +688,109 @@ def re_escape_path(target: str) -> str:
     import re
 
     return rf"(^|\.){re.escape(target)}$"
+
+
+@register_adapter("deepseek_v4_mixed", "fp8", overwrite=True)
+class DeepseekV4MixedAdapter(CheckpointQuantAdapter):
+    """DeepSeek-V4: MXFP4 experts alongside block-scaled fp8 dense weights.
+
+    V4's ``config.json`` advertises a single ``quant_method: "fp8"`` with
+    ``weight_block_size: [128, 128]``, but that describes only the dense
+    tensors. A separate top-level ``expert_dtype: "fp4"`` switches the routed
+    experts -- 97% of the parameters -- to packed E2M1 with block-32 E8M0
+    scales, i.e. plain MXFP4. Read off a real shard:
+
+        layers.0.ffn.experts.0.w1.weight  [2048, 2048] int8   (in_dim 4096)
+        layers.0.ffn.experts.0.w1.scale   [2048,  128] e8m0   (4096/128 = 32)
+        layers.0.attn.wq_a.weight         [1024, 4096] e4m3
+        layers.0.attn.wq_a.scale          [   8,   32] e8m0   (128x128 blocks)
+
+    Handing the whole checkpoint to the plain fp8 adapter therefore decodes
+    the experts as e4m3 elements, which is silently wrong rather than an
+    error: the packed nibbles are valid fp8 bit patterns, so it yields
+    plausible-looking garbage at half the true input width.
+
+    This composes the two existing adapters instead of reimplementing either
+    -- the expert path is exactly :class:`Mxfp4Adapter`, the dense path
+    exactly :class:`ScaledElementsAdapter` -- and selects between them with
+    the per-layer ``overrides`` mechanism ``ConfigParse`` already provides.
+    """
+
+    #: Layer-path fragment identifying a routed-expert weight. Matched against
+    #: the EasyDeL parameter path, after the native-key normalizer has renamed
+    #: `ffn.experts.<i>.w1` to `mlp.experts.<i>.gate_proj`.
+    #: Matches a ROUTED expert only. `shared_experts.` also contains
+    #: "experts." but is stored as block-fp8 like the rest of the dense path,
+    #: so requiring the expert INDEX is what separates the two -- without it
+    #: the shared experts get sent to the MXFP4 codec and fail on dtype.
+    expert_pattern: tp.ClassVar[str] = r"(?:^|\.)experts\.\d+\."
+
+    @classmethod
+    def parse_config(cls, quant_config):
+        """Split the config into a dense default and an expert override."""
+        dense = ScaledElementsAdapter.parse_config(quant_config)
+        expert_dtype = str(quant_config.get("expert_dtype", "") or "").lower()
+        if expert_dtype not in ("fp4", "float4", "mxfp4"):
+            # No expert override declared: behave exactly like plain fp8.
+            return dense
+        expert_source = SourceFormat(
+            quant_method="mxfp4",
+            weight_dtype="float4_e2m1fn",
+            group_size=32,
+            raw=dict(quant_config),
+        )
+        return ConfigParse(
+            default=dense.default,
+            overrides=((cls.expert_pattern, expert_source), *dense.overrides),
+            ignored=dense.ignored,
+        )
+
+    @staticmethod
+    def _is_v4(source: SourceFormat) -> bool:
+        """Whether this came from a V4-style config (mixed expert dtype)."""
+        return bool(source.raw.get("expert_dtype"))
+
+    @classmethod
+    def _delegate(cls, source: SourceFormat) -> type[CheckpointQuantAdapter]:
+        """Pick the adapter that owns ``source``."""
+        return Mxfp4Adapter if source.quant_method == "mxfp4" else ScaledElementsAdapter
+
+    @classmethod
+    def target_spec(cls, source, *, expert_dim=False):
+        """Delegate: MXFP4 experts stay 4-bit, dense follows the fp8 policy."""
+        return cls._delegate(source).target_spec(source, expert_dim=expert_dim)
+
+    @classmethod
+    def source_suffixes(cls, source):
+        """Delegate, then rename to the suffix DeepSeek actually ships.
+
+        Both delegates name their scale ``weight_scale``/``weight_scale_inv``;
+        V4 ships a bare ``scale`` next to every quantized weight. A rule only
+        fires when every declared source key is present, so getting this wrong
+        makes the whole fusion silently never run.
+        """
+        suffixes = cls._delegate(source).source_suffixes(source)
+        if not cls._is_v4(source):
+            # Plain fp8/mxfp4 checkpoints keep their own names; only V4 ships
+            # a bare `scale`, and renaming unconditionally would break every
+            # other checkpoint this adapter now serves.
+            return suffixes
+        return tuple("scale" if suffix.startswith("weight_scale") else suffix for suffix in suffixes)
+
+    @classmethod
+    def to_canonical(cls, tensors, *, source, target):
+        """Delegate, mapping V4's ``scale`` back to the delegate's name."""
+        delegate = cls._delegate(source)
+        renamed = dict(tensors)
+        if "scale" in renamed:
+            for suffix in delegate.source_suffixes(source):
+                if suffix.startswith("weight_scale"):
+                    renamed[suffix] = renamed.pop("scale")
+                    break
+        weight = renamed.get("weight")
+        if delegate is Mxfp4Adapter and weight is not None and jnp.dtype(weight.dtype) == jnp.int8:
+            # DeepSeek stores the packed E2M1 nibble pairs as int8; the codec
+            # requires uint8. Identical bits, different signedness -- reinterpret
+            # rather than convert, which would map the high nibbles to negatives.
+            renamed["weight"] = jax.lax.bitcast_convert_type(weight, jnp.uint8)
+        return delegate.to_canonical(renamed, source=source, target=target)

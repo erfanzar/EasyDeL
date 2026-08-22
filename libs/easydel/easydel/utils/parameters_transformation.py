@@ -170,6 +170,30 @@ class DtypeHandler:
         return tensor
 
 
+#: dtypes NumPy can represent directly. Anything else (bfloat16, the float8
+#: family) has to cross the torch->JAX boundary as raw bytes, because
+#: ``torch.Tensor.numpy()`` refuses to materialize them at all.
+_NUMPY_REPRESENTABLE = frozenset(
+    jnp.dtype(d)
+    for d in (
+        "float16",
+        "float32",
+        "float64",
+        "int8",
+        "int16",
+        "int32",
+        "int64",
+        "uint8",
+        "uint16",
+        "uint32",
+        "uint64",
+        "bool",
+        "complex64",
+        "complex128",
+    )
+)
+
+
 class TensorConverter:
     """Low-level tensor adapters between PyTorch tensors and JAX arrays.
 
@@ -204,7 +228,13 @@ class TensorConverter:
         Returns:
             A JAX array with the same data and the requested dtype.
         """
-        if "bfloat16" in str(tensor.dtype):
+        dtype_name = str(tensor.dtype)
+        # NumPy has no bfloat16 and no float8 variants, so torch's `.numpy()`
+        # rejects them outright ("Got unsupported ScalarType Float8_e8m0fnu").
+        # Upcast to float32 first; the value is preserved exactly, since every
+        # one of these formats is a strict subset of float32. Checkpoints that
+        # store block scales in float8 (DeepSeek-V4's `ue8m0`) reach this path.
+        if "bfloat16" in dtype_name or "float8" in dtype_name.lower():
             tensor = tensor.float()
         npv = tensor.cpu().detach().numpy()
         return jnp.array(npv, dtype=dtype)
@@ -301,12 +331,29 @@ class TensorConverter:
     def pytorch_to_jax(x: tp.Any) -> jnp.ndarray:
         """Convert a PyTorch tensor to a JAX array via NumPy.
 
+        NumPy has no float8 types, so ``.numpy()`` raises on them ("Got
+        unsupported ScalarType Float8_e8m0fnu"). Those are carried across as
+        raw bytes and bitcast back on the JAX side, which keeps this method's
+        dtype-preserving contract: upcasting a block scale to float32 here
+        would both change the leaf's dtype and quadruple its footprint.
+
         Args:
             x: A PyTorch tensor.
 
         Returns:
             A JAX array with the same dtype and shape.
         """
+        dtype_name = str(x.dtype).removeprefix("torch.")
+        target = getattr(jnp, dtype_name, None)
+        if target is not None and jnp.dtype(target) not in _NUMPY_REPRESENTABLE:
+            import torch
+
+            # Carry the bits across in an integer of the same width; both
+            # sides agree on the layout, so the reinterpretation is exact.
+            carrier = {1: torch.uint8, 2: torch.int16, 4: torch.int32}.get(jnp.dtype(target).itemsize)
+            if carrier is not None:
+                raw = x.detach().cpu().view(carrier).numpy()
+                return jnp.asarray(raw).view(target)
         return jnp.asarray(x.detach().cpu().numpy())
 
 
@@ -447,6 +494,53 @@ class StateDictConverter:
                 return key
             return f"{prefix}{wrapper}.{remainder}"
         return key
+
+    @staticmethod
+    def apply_checkpoint_key_normalizer(
+        state_dict: Mapping[str, tp.Any],
+        normalizer: tp.Callable[[str], str | None] | None,
+    ) -> Mapping[str, tp.Any]:
+        """Rewrite checkpoint keys through a model-declared normalizer.
+
+        Runs FIRST, before every other rule, because it exists for vendor
+        layouts whose names share nothing with transformers naming -- the
+        later passes (flattened wrappers, MoE consolidation, ``reform_param``)
+        all pattern-match on EasyDeL-style names and would silently no-op on a
+        raw vendor key.
+
+        A normalizer returning ``None`` marks a tensor the runtime does not own
+        (e.g. DeepSeek-V4's ``mtp.*`` multi-token-prediction stack); those keys
+        are dropped here so the loader's unused-key reporting stays truthful
+        rather than listing them as unexpected.
+
+        Args:
+            state_dict: Raw checkpoint mapping.
+            normalizer: Per-key rewrite, or ``None`` to pass through unchanged.
+
+        Returns:
+            The state dict with keys rewritten, or the original object when no
+            normalizer is declared.
+
+        Raises:
+            ValueError: If two distinct source keys normalize to the same
+                target, which would silently drop one tensor.
+        """
+        if normalizer is None:
+            return state_dict
+        out: dict[str, tp.Any] = {}
+        origin: dict[str, str] = {}
+        for key, value in state_dict.items():
+            mapped = normalizer(key)
+            if mapped is None:
+                continue
+            if mapped in out:
+                raise ValueError(
+                    f"checkpoint key normalizer mapped both {origin[mapped]!r} and {key!r} to {mapped!r}; "
+                    "one tensor would be silently dropped."
+                )
+            origin[mapped] = key
+            out[mapped] = value
+        return out
 
     @staticmethod
     def normalize_flattened_wrapper_keys(
@@ -1133,6 +1227,7 @@ class StateDictConverter:
         uses_tie_word_embedding: bool = False,
         reform_param: dict | None = None,
         hf_flattened_wrappers: Mapping[str, str] | None = None,
+        checkpoint_key_normalizer: tp.Callable[[str], str | None] | None = None,
         **kwargs,
     ) -> dict[str, tp.Any]:
         """Convert a PyTorch state dict to EasyDeL format with MoE support.
@@ -1167,6 +1262,7 @@ class StateDictConverter:
         Returns:
             Nested EasyDeL parameter dictionary.
         """
+        state_dict = StateDictConverter.apply_checkpoint_key_normalizer(state_dict, checkpoint_key_normalizer)
         state_dict = StateDictConverter.normalize_flattened_wrapper_keys(state_dict, hf_flattened_wrappers)
         consolidated_moe_keys = set()
         debug = bool(kwargs.pop("debug", False))

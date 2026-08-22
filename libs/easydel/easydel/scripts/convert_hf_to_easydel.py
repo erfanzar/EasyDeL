@@ -60,6 +60,7 @@ from typing import Literal
 
 import jax.numpy as jnp
 from eformer.aparser import DataClassArgumentParser
+from eformer.paths import ePath
 
 try:
     from eformer.loggings import get_logger
@@ -102,6 +103,7 @@ IMAGE_TEXT_TO_TEXT_MODEL_TYPES = frozenset(
         "llama4",
         "minimax_m3_vl",
         "mistral3",
+        "muse_glimmer",
         "paligemma",
         "qwen2_vl",
         "qwen2_5_vl",
@@ -344,6 +346,14 @@ class ConvertArgs:
         default=2_147_483_648,
         metadata={"help": "Max target chunk size when writing TensorStore chunks (default: 2GiB)"},
     )
+    resume: bool = field(
+        default=False,
+        metadata={
+            "help": "Reuse an existing checkpoint in --out: parameters already in its "
+            "tensorstore_index.json are kept and their source tensors are never read, "
+            "so an interrupted or incomplete conversion only fetches what is missing"
+        },
+    )
 
     dtype: str = field(default="bf16", metadata={"help": "Compute dtype (bf16|fp16|fp32)"})
     param_dtype: str = field(default="bf16", metadata={"help": "Param dtype (bf16|fp16|fp32)"})
@@ -402,8 +412,17 @@ def main(argv: list[str] | None = None) -> None:
         except Exception:
             logger.warning("`hf_transfer` is not installed. Run: pip install -U hf_transfer")
 
-    out_dir = Path(args.out).expanduser().resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # `pathlib.Path` mangles an object-store URI instead of rejecting it:
+    # `gs://bucket/x` becomes the relative path `gs:/bucket/x`, which
+    # `.resolve()` then anchors under the CWD, so a "remote" conversion
+    # silently fills the local disk with a directory literally named `gs:`.
+    # ePath understands the scheme; keep pathlib for genuinely local paths so
+    # `~` expansion and resolution behave as before.
+    if "://" in str(args.out):
+        out_dir = ePath(str(args.out))
+    else:
+        out_dir = Path(args.out).expanduser().resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
 
     # Keep this import after arg parsing so `--help` is fast.
     from transformers import AutoConfig
@@ -425,7 +444,27 @@ def main(argv: list[str] | None = None) -> None:
     }
     hf_kwargs = {k: v for k, v in hf_kwargs.items() if v is not None}
 
-    config = AutoConfig.from_pretrained(args.source, **hf_kwargs)
+    # `args.source` may be an object-store URI, which the HF hub resolver
+    # cannot parse. Stage the small metadata files locally and read config,
+    # tokenizer and processor from there; the weight side streams shards
+    # straight from the remote root.
+    from easydel.infra.mixins.bridge import stage_remote_metadata
+
+    meta_source, _staged_meta = stage_remote_metadata(
+        args.source,
+        filenames=(
+            "config.json",
+            "generation_config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+            "preprocessor_config.json",
+            "processor_config.json",
+            "chat_template.json",
+        ),
+    )
+
+    config = AutoConfig.from_pretrained(meta_source, **hf_kwargs)
 
     task = _infer_task_from_hf_config(config) if args.task == "auto" else args.task
     logger.info(f"Task: {task}")
@@ -449,14 +488,14 @@ def main(argv: list[str] | None = None) -> None:
     try:
         from transformers import AutoProcessor
 
-        processor = AutoProcessor.from_pretrained(args.source, **hf_kwargs)
+        processor = AutoProcessor.from_pretrained(meta_source, **hf_kwargs)
         processor.save_pretrained(str(out_dir))
     except Exception:
         pass
     try:
         from transformers import AutoTokenizer
 
-        tokenizer = AutoTokenizer.from_pretrained(args.source, **hf_kwargs)
+        tokenizer = AutoTokenizer.from_pretrained(meta_source, **hf_kwargs)
         tokenizer.save_pretrained(str(out_dir))
     except Exception:
         pass
@@ -470,7 +509,7 @@ def main(argv: list[str] | None = None) -> None:
     try:
         from transformers import AutoFeatureExtractor
 
-        feature_extractor = AutoFeatureExtractor.from_pretrained(args.source, **hf_kwargs)
+        feature_extractor = AutoFeatureExtractor.from_pretrained(meta_source, **hf_kwargs)
         feature_extractor.save_pretrained(str(out_dir))
     except Exception:
         pass
@@ -503,6 +542,7 @@ def main(argv: list[str] | None = None) -> None:
             torch_streaming_cache=args.torch_streaming_cache,
             torch_streaming_tmp_dir=args.torch_streaming_tmp_dir,
             tensorstore_chunk_bytes=args.tensorstore_chunk_bytes,
+            resume=args.resume,
             verbose=True,
             **hf_kwargs,
         )

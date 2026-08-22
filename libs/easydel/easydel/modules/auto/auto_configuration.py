@@ -378,14 +378,31 @@ class AutoEasyDeLConfig:
 
         Returns:
             EasyDeLBaseConfig: The fully resolved, mesh-aware model config.
+
+        Note:
+            Step 1 reads ``model_type`` and ``architectures`` off the raw JSON
+            rather than instantiating the generic base config, because picking
+            the concrete class only needs those two strings. Instantiating the
+            base config first ran ``transformers``' generic validators against a
+            model-SPECIFIC config -- DeepSeek-V4's ``mlp_layer_types`` is
+            ``["hash_moe", ...]``, which the generic ``validate_layer_type``
+            rejects, so EasyDeL could not read back a config it had just
+            written. The class resolved in step 4 loads it properly, with the
+            family's own validation.
         """
         if partition_axis is None:
             partition_axis = PartitionAxis()
         from transformers import AutoConfig
 
-        cls_main = AutoConfig if from_torch else EasyDeLBaseConfig
-        config = cls_main.from_pretrained(pretrained_model_name_or_path)
-        model_type: str = config.model_type
+        if from_torch:
+            config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
+            model_type: str = config.model_type
+            architectures = config.architectures
+        else:
+            config_dict, _ = EasyDeLBaseConfig.get_config_dict(pretrained_model_name_or_path)
+            config = None
+            model_type: str = config_dict.get("model_type", "") or ""
+            architectures = config_dict.get("architectures")
 
         def _registered(candidate: str) -> bool:
             return bool(candidate) and any(candidate in models for models in registry.task_registry.values())
@@ -417,6 +434,7 @@ class AutoEasyDeLConfig:
                 # would break the registry lookup below).
                 model_type = ovo_model_type
                 config = hf_config
+                architectures = hf_config.architectures
         except Exception:
             ...
 
@@ -424,7 +442,7 @@ class AutoEasyDeLConfig:
             model_task = infer_task_from_hf_config(pretrained_model_name_or_path)
         config_class = get_modules_by_type(
             model_type,
-            cls.bind_model_task(model_task, config.architectures),
+            cls.bind_model_task(model_task, architectures),
         )[0]
         config = config_class.from_pretrained(pretrained_model_name_or_path)
         if hasattr(config, "attach_custom_arguments"):

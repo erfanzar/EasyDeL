@@ -178,7 +178,10 @@ def adapt_legacy_checkpoint_collections(
     return adapted
 
 
-def rename_legacy_checkpoint_leaves(flat_state: dict[tuple[tp.Any, ...], tp.Any]) -> dict[tuple[tp.Any, ...], tp.Any]:
+def rename_legacy_checkpoint_leaves(
+    flat_state: dict[tuple[tp.Any, ...], tp.Any],
+    known_keys: tp.AbstractSet[tuple[tp.Any, ...]] | None = None,
+) -> dict[tuple[tp.Any, ...], tp.Any]:
     """Rename pre-spectrax leaf suffixes (``.kernel``/``.embedding``/``.scale``) to ``.weight``.
 
     Old EasyDeL checkpoints stored linear weights as ``...kernel``, embeddings as
@@ -188,9 +191,18 @@ def rename_legacy_checkpoint_leaves(flat_state: dict[tuple[tp.Any, ...], tp.Any]
     Quantized leaves (``quant_kernel``/``quant_scales``/``quant_biases``) are
     left untouched.
 
+    ``scale`` is not only a legacy spelling, though: a current model may declare
+    a parameter genuinely called ``scale`` -- DeepSeek-V4's hyper-connection
+    blocks have ``attn_hc.scale`` and ``ffn_hc.scale``. Renaming those to
+    ``weight`` produces a key the model does not have, so the value is dropped
+    as unexpected and the real parameter stays uninitialized. Pass *known_keys*
+    to keep any leaf the model declares under its own name.
+
     Args:
         flat_state: Flat dict mapping path tuples to leaf values from a
             legacy checkpoint.
+        known_keys: Parameter paths the target model declares, with or without
+            a leading collection segment. Keys found here are never renamed.
 
     Returns:
         A new dict with the legacy suffixes rewritten to ``"weight"``. When
@@ -199,11 +211,23 @@ def rename_legacy_checkpoint_leaves(flat_state: dict[tuple[tp.Any, ...], tp.Any]
     """
     renamed: dict[tuple[tp.Any, ...], tp.Any] = {}
     legacy_count = 0
+    kept_current: int = 0
     collisions: list[tuple[tp.Any, ...]] = []
+
+    def _model_declares(key: tuple) -> bool:
+        """Whether the target model has this exact leaf name."""
+        if not known_keys:
+            return False
+        return key in known_keys or (len(key) > 1 and key[1:] in known_keys)
+
     for key, value in flat_state.items():
         if isinstance(key, tuple) and key:
             last = str(key[-1])
             new_last = LEGACY_LEAF_RENAMES.get(last)
+            if new_last is not None and _model_declares(key):
+                renamed[key] = value
+                kept_current += 1
+                continue
             if new_last is not None:
                 new_key = (*key[:-1], new_last)
                 if new_key != key and (new_key in renamed or new_key in flat_state):
@@ -218,6 +242,8 @@ def rename_legacy_checkpoint_leaves(flat_state: dict[tuple[tp.Any, ...], tp.Any]
             f"Renamed {legacy_count} legacy .kernel/.embedding/.scale checkpoint "
             "leaves to .weight for backward compatibility."
         )
+    if kept_current:
+        logger.debug(f"Kept {kept_current} leaf/leaves whose name the model declares as-is (no legacy rename).")
     if collisions:
         preview = ", ".join("/".join(str(p) for p in k) for k in collisions[:5])
         suffix = f" (+{len(collisions) - 5} more)" if len(collisions) > 5 else ""
