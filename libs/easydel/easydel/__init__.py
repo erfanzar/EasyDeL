@@ -136,8 +136,11 @@ _import_structure = {
     "layers.quantization": [
         "EasyDeLQuantizationConfig",
         "EasyQuantizer",
+        "QuantizationConfig",
         "QuantizationType",
         "TurboQuantConfig",
+        "apply_quantization_rules",
+        "build_quantization_provider",
     ],
     "operations": [
         "AttentionConfig",
@@ -522,6 +525,15 @@ _import_structure = {
         "MixtralForSequenceClassification",
         "MixtralModel",
     ],
+    "modules.muse_glimmer": [
+        "MuseGlimmerConfig",
+        "MuseGlimmerForConditionalGeneration",
+        "MuseGlimmerModel",
+        "MuseGlimmerTextConfig",
+        "MuseGlimmerTextModel",
+        "MuseGlimmerVisionConfig",
+        "MuseGlimmerVisionModel",
+    ],
     "modules.mosaic_mpt": [
         "MptAttentionConfig",
         "MptConfig",
@@ -900,7 +912,15 @@ if _tp.TYPE_CHECKING:
     from .infra.factory import ConfigType, TaskType, register_config, register_module
     from .layers.attention import AttentionMechanisms, AttentionModule, FlexibleAttentionModule
     from .layers.moe import MoEMethods
-    from .layers.quantization import EasyDeLQuantizationConfig, EasyQuantizer, QuantizationType, TurboQuantConfig
+    from .layers.quantization import (
+        EasyDeLQuantizationConfig,
+        EasyQuantizer,
+        QuantizationConfig,
+        QuantizationType,
+        TurboQuantConfig,
+        apply_quantization_rules,
+        build_quantization_provider,
+    )
     from .modules.arctic import ArcticConfig, ArcticForCausalLM, ArcticModel
     from .modules.auto import (
         AutoEasyDeLAnyToAnyModel,
@@ -1082,6 +1102,15 @@ if _tp.TYPE_CHECKING:
     )
     from .modules.mixtral import MixtralConfig, MixtralForCausalLM, MixtralForSequenceClassification, MixtralModel
     from .modules.mosaic_mpt import MptAttentionConfig, MptConfig, MptForCausalLM, MptModel
+    from .modules.muse_glimmer import (
+        MuseGlimmerConfig,
+        MuseGlimmerForConditionalGeneration,
+        MuseGlimmerModel,
+        MuseGlimmerTextConfig,
+        MuseGlimmerTextModel,
+        MuseGlimmerVisionConfig,
+        MuseGlimmerVisionModel,
+    )
     from .modules.olmo import OlmoConfig, OlmoForCausalLM, OlmoModel
     from .modules.olmo2 import Olmo2Config, Olmo2ForCausalLM, Olmo2ForSequenceClassification, Olmo2Model
     from .modules.olmo3 import Olmo3Config, Olmo3ForCausalLM, Olmo3ForSequenceClassification, Olmo3Model

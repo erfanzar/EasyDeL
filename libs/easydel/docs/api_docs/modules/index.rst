@@ -60,6 +60,7 @@ easydel.modules package
    mistral4/index
    mixtral/index
    mosaic_mpt/index
+   muse_glimmer/index
    olmo/index
    olmo2/index
    olmo3/index
