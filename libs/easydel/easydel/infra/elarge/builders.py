@@ -629,26 +629,81 @@ def build_model(cfg_like: eLMConfig | Mapping[str, Any]) -> EasyDeLBaseModule:
         resolve_task: For task type resolution logic.
     """
     kw = to_from_pretrained_kwargs(cfg_like)
-    task = resolve_task(normalize(cfg_like))
+    normalized = normalize(cfg_like)
+    task = resolve_task(normalized)
     if task == TaskType.CAUSAL_LM:
-        return AutoEasyDeLModelForCausalLM.from_pretrained(**kw)
-    if task == TaskType.SEQUENCE_TO_SEQUENCE:
-        return AutoEasyDeLModelForSeq2SeqLM.from_pretrained(**kw)
-    if task == TaskType.SPEECH_SEQUENCE_TO_SEQUENCE:
-        return AutoEasyDeLModelForSpeechSeq2Seq.from_pretrained(**kw)
-    if task == TaskType.IMAGE_TEXT_TO_TEXT:
-        return AutoEasyDeLModelForImageTextToText.from_pretrained(**kw)
-    if task == TaskType.ZERO_SHOT_IMAGE_CLASSIFICATION:
-        return AutoEasyDeLModelForZeroShotImageClassification.from_pretrained(**kw)
-    if task == TaskType.DIFFUSION_LM:
-        return AutoEasyDeLModelForDiffusionLM.from_pretrained(**kw)
-    if task == TaskType.SEQUENCE_CLASSIFICATION:
-        return AutoEasyDeLModelForSequenceClassification.from_pretrained(**kw)
-    if task == TaskType.EMBEDDING:
-        return AutoEasyDeLModelForEmbedding.from_pretrained(**kw)
-    if task == TaskType.ANY_TO_ANY:
-        return AutoEasyDeLAnyToAnyModel.from_pretrained(**kw)
-    return AutoEasyDeLModel.from_pretrained(**kw)
+        model = AutoEasyDeLModelForCausalLM.from_pretrained(**kw)
+    elif task == TaskType.SEQUENCE_TO_SEQUENCE:
+        model = AutoEasyDeLModelForSeq2SeqLM.from_pretrained(**kw)
+    elif task == TaskType.SPEECH_SEQUENCE_TO_SEQUENCE:
+        model = AutoEasyDeLModelForSpeechSeq2Seq.from_pretrained(**kw)
+    elif task == TaskType.IMAGE_TEXT_TO_TEXT:
+        model = AutoEasyDeLModelForImageTextToText.from_pretrained(**kw)
+    elif task == TaskType.ZERO_SHOT_IMAGE_CLASSIFICATION:
+        model = AutoEasyDeLModelForZeroShotImageClassification.from_pretrained(**kw)
+    elif task == TaskType.DIFFUSION_LM:
+        model = AutoEasyDeLModelForDiffusionLM.from_pretrained(**kw)
+    elif task == TaskType.SEQUENCE_CLASSIFICATION:
+        model = AutoEasyDeLModelForSequenceClassification.from_pretrained(**kw)
+    elif task == TaskType.EMBEDDING:
+        model = AutoEasyDeLModelForEmbedding.from_pretrained(**kw)
+    elif task == TaskType.ANY_TO_ANY:
+        model = AutoEasyDeLAnyToAnyModel.from_pretrained(**kw)
+    else:
+        model = AutoEasyDeLModel.from_pretrained(**kw)
+    return apply_configured_quantization_rules(model, normalized)
+
+
+def apply_configured_quantization_rules(
+    model: EasyDeLBaseModule,
+    normalized_cfg: Mapping[str, Any],
+) -> EasyDeLBaseModule:
+    """Stamp quantized-training rules from ``quantization.training``.
+
+    Applied here, immediately after the model is built, because the rules
+    live on the modules and travel with the ``GraphDef``. Once a state is
+    made from this model every trainer picks them up with no further
+    wiring — but the reverse does not work, since
+    :attr:`EasyDeLState.model` rebuilds the module from the stored
+    ``GraphDef`` on each access, so stamping a state's model mutates a
+    throwaway copy.
+
+    Configuration, alongside the existing post-training ``method`` key::
+
+        quantization:
+          method: nf4                          # post-training: how the checkpoint is compressed
+          training: int8                       # during training: what the matmuls run in
+          training_config_path: mixed.json     # required when training is "intmp"
+          training_module_path: "layers.*"     # optional narrowing
+          training_tile_size: 128              # optional subchannel tiling
+
+    Args:
+        model: The freshly built model. Modified in place.
+        normalized_cfg: The eLarge configuration, already through
+            :func:`normalize`. Taken normalized rather than normalizing
+            again because the caller has done it, and because
+            ``normalize`` demands a complete config — which would make
+            this helper untestable in isolation.
+
+    Returns:
+        ``model``, quantized when ``quantization.training`` is set and
+        unchanged otherwise.
+    """
+    quantization = normalized_cfg.get("quantization") or {}
+    requested = quantization.get("training")
+    if not requested:
+        return model
+
+    from easydel.layers.quantization import apply_quantization_rules
+
+    kwargs: dict[str, Any] = {}
+    if quantization.get("training_config_path"):
+        kwargs["quant_cfg_path"] = quantization["training_config_path"]
+    if quantization.get("training_module_path"):
+        kwargs["module_path"] = quantization["training_module_path"]
+    if quantization.get("training_tile_size"):
+        kwargs["tile_size"] = quantization["training_tile_size"]
+    return apply_quantization_rules(model, requested, **kwargs)
 
 
 def to_esurge_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[str, Any]:

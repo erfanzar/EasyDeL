@@ -103,11 +103,18 @@ See Also:
 """
 
 from ._configs import QuantizationConfig, QuantizationType
+from ._quantized_training import (
+    DEFAULT_QUANTIZED_MODULE_PATH,
+    apply_quantization_rules,
+    build_quantization_provider,
+    quantization_config_to_rule,
+)
 from ._quants import EasyQuantizer, quantize
 from ._straight_through import (
     straight_through,
     straight_through_1bit,
     straight_through_8bit,
+    straight_through_channelwise,
     straight_through_mxfp4,
     straight_through_mxfp8,
     straight_through_nf4,
@@ -119,16 +126,21 @@ from ._turboquant import TurboQuantConfig, TurboQuantConstants
 EasyDeLQuantizationConfig = QuantizationConfig
 
 __all__ = (
+    "DEFAULT_QUANTIZED_MODULE_PATH",
     "EasyDeLQuantizationConfig",
     "EasyQuantizer",
     "QuantizationConfig",
     "QuantizationType",
     "TurboQuantConfig",
     "TurboQuantConstants",
+    "apply_quantization_rules",
+    "build_quantization_provider",
+    "quantization_config_to_rule",
     "quantize",
     "straight_through",
     "straight_through_1bit",
     "straight_through_8bit",
+    "straight_through_channelwise",
     "straight_through_mxfp4",
     "straight_through_mxfp8",
     "straight_through_nf4",

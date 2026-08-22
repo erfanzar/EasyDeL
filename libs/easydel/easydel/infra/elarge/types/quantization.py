@@ -56,7 +56,46 @@ class EasyDeLQuantizationCfg(TypedDict, total=False):
     pattern: NotRequired[str]
 
 
-class QuantizationCfg(TypedDict, total=False):
+class QuantizedTrainingCfg(TypedDict, total=False):
+    """Training-time quantization keys of the ``quantization`` section.
+
+    Distinct from the post-training keys alongside them, which compress a
+    finished checkpoint. These change what happens during training, and
+    which of two regimes you get depends on the preset:
+
+    * ``int8``, ``int4``, ``fp8`` quantize both operands, so the matmul
+      itself runs in the narrow type -- *quantized training*, and the
+      reason to use it is throughput.
+    * ``w8a16``, ``w4a16``, ``nf4``, ``mxfp4`` quantize only the weight
+      and reconstruct it, leaving the matmul in the compute dtype --
+      *quantization-aware training*, whose product is a model that
+      tolerates the quantization applied later at deployment.
+
+    Attributes:
+        training: The numeric regime. A preset name (``"int8"``, ``"int4"``,
+            ``"fp8"``, ``"fp4"``, ``"w4a16"``, ``"w8a16"``, ``"nf4"``), or
+            ``"intmp"`` to read per-module rules from
+            ``training_config_path``. Absent or empty leaves training in
+            full precision.
+        training_config_path: Path to a mixed-precision JSON file mapping
+            module-path patterns to ``{w_bits, a_bits, w_scale, a_scale,
+            tile_size}`` entries. Required when ``training`` is ``"intmp"``.
+            MaxText's files are read verbatim.
+        training_module_path: Regex narrowing which modules the preset applies
+            to. Defaults to every projection except embeddings, norms, the
+            language-model head, and mixture-of-experts routers.
+        training_tile_size: Subchannel tile size on the contracted axis. Use
+            64-256; smaller tiles spend more on scales than they save on
+            values.
+    """
+
+    training: NotRequired[str]
+    training_config_path: NotRequired[str]
+    training_module_path: NotRequired[str]
+    training_tile_size: NotRequired[int]
+
+
+class QuantizationCfg(QuantizedTrainingCfg, total=False):
     """Quantization configuration for model compression and efficiency.
 
     Attributes:
@@ -74,6 +113,11 @@ class QuantizationCfg(TypedDict, total=False):
             kernel selection (e.g., ``"xla"``).
         qmm_tpu_path_override: Override the TPU QMM code path
             (e.g., ``"packed"``).
+
+    The ``training*`` keys inherited from :class:`QuantizedTrainingCfg`
+    change what happens *during training*, which is a different job from
+    the compression keys above: they leave the stored weights at full
+    precision and act on the matmul instead.
     """
 
     platform: NotRequired[EasyDeLPlatforms | None]

@@ -93,8 +93,17 @@ def _ejkernel_dequantized(
     a tensor of the same shape and dtype as the input but with values
     discretized to the chosen quantization grid.
 
+    ``quantize`` maps the weight into ejkernel's *quantization layout*
+    before grouping — with the default ``axis="row"`` that swaps the last
+    two axes, so groups run along the contracted (input-feature) axis,
+    which is what makes the grouping meaningful. ``dequantize`` returns
+    that same layout and documents ``axis`` as unused, so the swap has to
+    be undone here. Without it the round trip silently returns the
+    transpose of its input.
+
     Args:
-        weights: Floating-point weights to round-trip.
+        weights: Floating-point weights to round-trip. Must be at least
+            2-D; ejkernel's grouping is defined over the last two axes.
         mode: ejkernel quantization mode (``"affine"``, ``"nf4"``,
             ``"mxfp4"``, ``"mxfp8"``, ``"nvfp4"``, ``"nvfp8"``).
         group_size: Number of elements that share a single scale/bias.
@@ -103,7 +112,16 @@ def _ejkernel_dequantized(
     Returns:
         Array with the same shape and dtype as ``weights`` but with values
         rounded to the quantization grid.
+
+    Raises:
+        ValueError: If ``weights`` has fewer than two dimensions.
     """
+    if weights.ndim < 2:
+        raise ValueError(
+            f"Quantization-aware training needs a 2-D or higher weight to group over, got shape {weights.shape}. "
+            "1-D tensors (norm gains, biases) are not quantization targets; select layers by module path instead of "
+            "mapping the straight-through estimator over every leaf."
+        )
     if mode == "affine":
         wq, scales, biases = ej_quantize(weights, group_size=group_size, bits=bits, mode=mode)
     else:
@@ -117,10 +135,10 @@ def _ejkernel_dequantized(
         bits=bits,
         mode=mode,
     )
-    return dequantized.astype(weights.dtype)
+    # Undo the quantization-layout swap applied by ``quantize`` (see above).
+    return jnp.swapaxes(dequantized, -2, -1).astype(weights.dtype)
 
 
-@ste
 def _straight_through_ejkernel(
     weights: jax.Array,
     *,
@@ -133,6 +151,12 @@ def _straight_through_ejkernel(
     Forward pass returns the round-tripped (quantized-and-dequantized)
     weights; backward pass returns the upstream gradient unchanged.
 
+    The static settings are closed over rather than passed as arguments.
+    ``ste`` is a :func:`jax.custom_vjp`, and JAX resolves a ``custom_vjp``
+    call's arguments to positions: keyword-only parameters raise
+    ``TypeError``, while passing ``mode`` positionally would hand a Python
+    string to the tracer. A one-array closure sidesteps both.
+
     Args:
         weights: Floating-point weights.
         mode: ejkernel quantization mode.
@@ -143,10 +167,22 @@ def _straight_through_ejkernel(
         Discretized weights with the input dtype preserved; gradients pass
         through to ``weights`` unchanged.
     """
-    return _ejkernel_dequantized(weights, mode=mode, group_size=group_size, bits=bits)
+
+    @ste
+    def round_trip(w: jax.Array) -> jax.Array:
+        """Quantize and immediately dequantize ``w``.
+
+        Args:
+            w: Floating-point weights.
+
+        Returns:
+            The discretized weights.
+        """
+        return _ejkernel_dequantized(w, mode=mode, group_size=group_size, bits=bits)
+
+    return round_trip(weights)
 
 
-@ste
 def _straight_through_cast(weights: jax.Array, *, dtype: jnp.dtype) -> jax.Array:
     """Straight-through cast to a low-precision dtype.
 
@@ -155,6 +191,9 @@ def _straight_through_cast(weights: jax.Array, *, dtype: jnp.dtype) -> jax.Array
     cast tensor; backward passes the gradient through to the original full
     precision weights.
 
+    The dtype is closed over for the same reason as in
+    :func:`_straight_through_ejkernel`.
+
     Args:
         weights: Floating-point weights to cast.
         dtype: JAX-native low-precision dtype.
@@ -162,7 +201,20 @@ def _straight_through_cast(weights: jax.Array, *, dtype: jnp.dtype) -> jax.Array
     Returns:
         ``weights.astype(dtype)`` in the forward pass; identity gradient.
     """
-    return weights.astype(dtype)
+
+    @ste
+    def cast(w: jax.Array) -> jax.Array:
+        """Cast ``w`` to the target narrow dtype.
+
+        Args:
+            w: Floating-point weights.
+
+        Returns:
+            The cast weights.
+        """
+        return w.astype(dtype)
+
+    return cast(weights)
 
 
 def straight_through_mxfp8(weights: jax.Array) -> jax.Array:
@@ -306,17 +358,82 @@ def straight_through_8bit(
 
 
 @ste
+def straight_through_channelwise(weights: jax.Array, bits: int = 8) -> jax.Array:
+    """STE-quantize ``weights`` per output channel over the full contraction axis.
+
+    Channelwise is the only scheme the stacked MoE expert linears accept
+    (:class:`~easydel.layers.linears.ParallelMoELinearQuantized` stores
+    exactly these codes and scales), so without this entry point
+    quantization-aware training cannot cover a mixture-of-experts model's
+    experts — which on a large MoE is the overwhelming majority of its
+    parameters.
+
+    The forward pass reuses :func:`channelwise_quantize_array`, the same
+    function the module-level and quantize-at-load paths use, so a model
+    trained under this estimator sees exactly the discretization it will
+    later be served with rather than an approximation of it.
+
+    Both dense ``[in, out]`` kernels and stacked expert ``[experts, in,
+    out]`` kernels reduce over axis ``-2``, so each expert and each output
+    channel gets an independent scale.
+
+    Args:
+        weights: Floating-point weights, ``[..., in_features, out_features]``.
+        bits: Bit-width of the codes; 8 or 4.
+
+    Returns:
+        Discretized weights with the input shape and dtype preserved;
+        gradients pass through to ``weights`` unchanged.
+
+    Raises:
+        ValueError: If ``bits`` is not 8 or 4, or if ``weights`` is 1-D.
+    """
+    if bits not in (8, 4):
+        raise ValueError(f"Channelwise quantization supports 8 or 4 bits, got {bits}.")
+    if weights.ndim < 2:
+        raise ValueError(
+            f"Channelwise quantization reduces over the contraction axis and needs a 2-D or higher weight, "
+            f"got shape {weights.shape}."
+        )
+
+    from easydel.layers.linears._linear_quantized import channelwise_quantize_array
+
+    @ste
+    def round_trip(w: jax.Array) -> jax.Array:
+        """Quantize ``w`` channelwise and immediately dequantize it.
+
+        Args:
+            w: Floating-point weights.
+
+        Returns:
+            The discretized weights, in the input dtype.
+        """
+        codes, scales, _ = channelwise_quantize_array(w, bits)
+        return (codes.astype(jnp.float32) * scales).astype(w.dtype)
+
+    return round_trip(weights)
+
+
 def straight_through_1bit(weights: jax.Array, axis: int | None = None) -> jax.Array:
     """STE-quantize ``weights`` to 1-bit ``{-1, +1}`` via the sign function.
 
     Implements BinaryConnect-style binarization: the forward pass maps each
     weight to its sign (with the convention that exactly-zero weights become
-    ``+1`` to avoid dead units), and the backward pass — courtesy of the
-    ``@ste`` decorator on this function — passes the upstream gradient
-    through to ``weights`` unchanged. This is the most aggressive of the
-    quantization options here and is dispatched to from
+    ``+1`` to avoid dead units), and the backward pass passes the upstream
+    gradient through to ``weights`` unchanged. This is the most aggressive
+    of the quantization options here and is dispatched to from
     :func:`straight_through` for both ``BINARY`` and ``TERNARY``
     quantization types.
+
+    The straight-through wrapper is load-bearing, not decorative:
+    :func:`jax.numpy.sign` has a derivative of zero almost everywhere, so
+    without it every gradient through a binarized weight is exactly zero
+    and the weight never moves.
+
+    The gradient is the unclipped identity, consistent with the other
+    estimators in this module. BinaryConnect additionally zeroes the
+    gradient for weights outside ``[-1, 1]``; that variant is not applied
+    here.
 
     Args:
         weights: Floating-point weights to binarize. Any shape.
@@ -328,9 +445,21 @@ def straight_through_1bit(weights: jax.Array, axis: int | None = None) -> jax.Ar
         all ``+1`` or ``-1``; gradients flow through unchanged.
     """
     _ = axis
-    quantized = jnp.sign(weights)
-    quantized = jnp.where(quantized == 0, 1, quantized)
-    return quantized.astype(weights.dtype)
+
+    @ste
+    def binarize(w: jax.Array) -> jax.Array:
+        """Map ``w`` to its sign, treating exact zeros as ``+1``.
+
+        Args:
+            w: Floating-point weights.
+
+        Returns:
+            An array of ``+1``/``-1`` in the input dtype.
+        """
+        signs = jnp.sign(w)
+        return jnp.where(signs == 0, 1, signs).astype(w.dtype)
+
+    return binarize(weights)
 
 
 def straight_through(
@@ -436,6 +565,10 @@ def straight_through(
     if dtype in {QuantizationType.BINARY, QuantizationType.TERNARY}:
         return straight_through_1bit(array)
 
+    if dtype is QuantizationType.CHANNELWISE:
+        bits = config.bits if config is not None and config.bits is not None else 8
+        return straight_through_channelwise(array, bits=bits)
+
     if config is not None and config.jax_native:
         jax_dtype = resolve_jax_native_dtype(dtype)
         if jax_dtype is not None:
@@ -447,6 +580,7 @@ def straight_through(
         QuantizationType.NF4,
         QuantizationType.MXFP4,
         QuantizationType.MXFP8,
+        QuantizationType.NVFP4,
         QuantizationType.NVFP8,
     }:
         config_for_ejkernel = config if config is not None else QuantizationConfig(dtype=dtype, group_size=group_size)
