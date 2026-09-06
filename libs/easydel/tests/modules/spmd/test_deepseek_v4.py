@@ -170,6 +170,27 @@ class TestDeepseekV4:
             assert logits_diff < 1e-4, f"fused-op logits diverged from dense: {logits_diff}"
             assert grad_diff < 1e-4, f"fused-op gradients diverged from dense: {grad_diff}"
             assert all(bool(jnp.isfinite(b).all()) for b in gf if b.size)
+            named_fused = [
+                (jax.tree_util.keystr(path), grad)
+                for path, grad in jax.tree_util.tree_flatten_with_path(grads_fused)[0]
+                if hasattr(grad, "size") and grad.size
+            ]
+            assert any("indexer" in name and bool(jnp.any(grad != 0)) for name, grad in named_fused), (
+                "fused attention disconnected the Lightning Indexer from LM loss"
+            )
+
+            if jax.default_backend() == "tpu":
+                monkeypatch.setattr(M, "_TRAIN_KERNEL_PLATFORM", "auto")
+                (_, _), grads_pallas = jax.value_and_grad(loss_fn, has_aux=True)(base_state.graphstate)
+                named_pallas = [
+                    (jax.tree_util.keystr(path), grad)
+                    for path, grad in jax.tree_util.tree_flatten_with_path(grads_pallas)[0]
+                    if hasattr(grad, "size") and grad.size
+                ]
+                assert any("indexer" in name and bool(jnp.any(grad != 0)) for name, grad in named_pallas), (
+                    "Pallas bias VJP disconnected the Lightning Indexer from LM loss"
+                )
+                monkeypatch.setattr(M, "_TRAIN_KERNEL_PLATFORM", "xla")
 
             # A few real train steps through the fused kernel path.
             state = base_state

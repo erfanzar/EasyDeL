@@ -114,6 +114,16 @@ from .sequence_buffer import SequenceBuffer
 
 DEBUG_MODE = False
 
+if typing.TYPE_CHECKING:
+    from easydel.infra import EasyDeLBaseModule
+    from easydel.infra.etils import MpMdSchedulers
+
+logger = get_logger("eSurge-ExecutionManager")
+
+# Syncing inputs after host->device metadata transfer makes `prep_time` more accurate,
+# but it adds a device round-trip that hurts throughput. Keep it opt-in.
+SYNC_INPUTS_FOR_TIMING = flags.get_bool(flags.EASYDEL_SYNC_INPUTS_FOR_TIMING)
+
 
 def _zero_rows_body(arrays: list[jax.Array], keep_mask: jax.Array) -> list[jax.Array]:
     """Zero masked rows of every array in ONE fused dispatch.
@@ -170,15 +180,63 @@ def _jit_permute_rows(output_shardings: tuple[jax.sharding.Sharding, ...]):
     return jax.jit(_permute_rows_body, out_shardings=list(output_shardings))
 
 
-if typing.TYPE_CHECKING:
-    from easydel.infra import EasyDeLBaseModule
-    from easydel.infra.etils import MpMdSchedulers
+@lru_cache(maxsize=128)
+def _jit_slot_sidecar_rows(output_shardings, fill_values):
+    """Transform auxiliary slot leaves together while preserving AOT shardings."""
 
-logger = get_logger("eSurge-ExecutionManager")
+    def transform(arrays, gather, keep):
+        return [
+            jnp.where(keep.reshape(-1, *([1] * (array.ndim - 1))), array[gather], fill)
+            for array, fill in zip(arrays, fill_values, strict=True)
+        ]
 
-# Syncing inputs after host->device metadata transfer makes `prep_time` more accurate,
-# but it adds a device round-trip that hurts throughput. Keep it opt-in.
-SYNC_INPUTS_FOR_TIMING = flags.get_bool(flags.EASYDEL_SYNC_INPUTS_FOR_TIMING)
+    return jax.jit(transform, out_shardings=list(output_shardings))
+
+
+def _transform_recurrent_sidecars(views, make_indices):
+    """Apply the native slot mapping to positions and Qwen PLE continuation.
+
+    Paged attention leaves are intentionally excluded: their leading dimension
+    indexes physical pages, not recurrent request slots. Segment padding uses
+    -1 rather than zero, matching the PLE cache initialization contract.
+    """
+    by_pool = {}
+    for index, view in enumerate(views):
+        rec = view.recurrent if isinstance(view, ParallelHybridCacheView) else view
+        if not isinstance(rec, RecurrentCacheView):
+            continue
+        for name, fill in (
+            ("positions", 0),
+            ("ple_conv_state", 0),
+            ("ple_token_context", 0),
+            ("ple_segment_context", -1),
+        ):
+            array = getattr(rec, name, None)
+            if array is not None:
+                by_pool.setdefault(int(array.shape[0]), []).append((index, name, array, fill))
+    updates = {}
+    for n_slots, entries in by_pool.items():
+        indices = make_indices(n_slots)
+        if indices is None:
+            continue
+        gather, keep = indices
+        arrays = [entry[2] for entry in entries]
+        transform = _jit_slot_sidecar_rows(
+            tuple(array.sharding for array in arrays), tuple(entry[3] for entry in entries)
+        )
+        result = transform(arrays, jnp.asarray(gather, jnp.int32), jnp.asarray(keep, bool))
+        for (index, name, _array, _fill), value in zip(entries, result, strict=True):
+            updates.setdefault(index, {})[name] = value
+    for index, values in updates.items():
+        view = views[index]
+        if isinstance(view, ParallelHybridCacheView):
+            # The wrapper's post-init treats existing mirrored positions as
+            # overrides, so update that handle with the inner recurrent view.
+            mirrors = {"positions": values["positions"]} if "positions" in values else {}
+            views[index] = view.replace(recurrent=view.recurrent.replace(**values), **mirrors)
+        else:
+            views[index] = view.replace(**values)
+    return bool(updates)
 
 
 class ExecutionManager:
@@ -1618,9 +1676,7 @@ class ExecutionManager:
             for slot in slot_indices:
                 if 0 <= int(slot) < base_slots:
                     # Prefix-major candidate layout: base + prefix * base_slots + slot.
-                    slot_indices_to_clear.extend(
-                        base_slots + k * base_slots + int(slot) for k in range(candidate_count)
-                    )
+                    slot_indices_to_clear.extend(base_slots + k * base_slots + int(slot) for k in range(candidate_count))
         # Collect every recurrent leaf first, then zero the masked rows of all
         # of them in ONE fused dispatch per distinct pool size (a python loop of
         # eager wheres cost ~100 host dispatches per slot-clear event).
@@ -1685,6 +1741,15 @@ class ExecutionManager:
                 new_views[idx] = new_recurrent
             changed = True
 
+        def sidecar_clear_indices(n_slots):
+            selected = sorted({int(s) for s in slot_indices_to_clear if 0 <= int(s) < n_slots})
+            if not selected:
+                return None
+            keep = numpy.ones((n_slots,), dtype=bool)
+            keep[numpy.asarray(selected, dtype=numpy.int32)] = False
+            return numpy.arange(n_slots, dtype=numpy.int32), keep
+
+        changed = _transform_recurrent_sidecars(new_views, sidecar_clear_indices) or changed
         if changed:
             self.kv_pages = HybridCache(views=new_views)
 
@@ -1789,9 +1854,7 @@ class ExecutionManager:
                 continue
             gather, keep = gk
             transform = _jit_permute_rows(tuple(array.sharding for array in arrays))
-            moved_by_pool[n_slots] = list(
-                transform(arrays, jnp.asarray(gather, dtype=jnp.int32), jnp.asarray(keep))
-            )
+            moved_by_pool[n_slots] = list(transform(arrays, jnp.asarray(gather, dtype=jnp.int32), jnp.asarray(keep)))
 
         cursors = dict.fromkeys(moved_by_pool, 0)
         for idx, rec, conv_arr, rec_arr, n_slots in entries:
@@ -1818,6 +1881,7 @@ class ExecutionManager:
                 new_views[idx] = new_recurrent
             changed = True
 
+        changed = _transform_recurrent_sidecars(new_views, _gather_keep) or changed
         if changed:
             self.kv_pages = HybridCache(views=new_views)
 

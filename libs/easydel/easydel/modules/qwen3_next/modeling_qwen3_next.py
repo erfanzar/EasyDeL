@@ -2710,8 +2710,7 @@ class Qwen3NextFullAttention(UnifiedAttention):
             sliding_window=self.sliding_window,
         )
 
-        softmax_aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
-        softmax_aux = getattr(softmax_aux, "value", softmax_aux)
+        softmax_aux = self._softmax_aux()
 
         attentions: AttentionLayerOutput = self.attention_performer.forward(
             query_states=query_states,

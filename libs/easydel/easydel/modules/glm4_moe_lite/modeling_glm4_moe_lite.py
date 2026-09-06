@@ -59,7 +59,7 @@ from easydel.caching import (
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import AttentionLayerOutput, DecoderLayerOutput, MoeModelOutput
-from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, blockwise_ffn
 from easydel.layers import (
     BaseMoeModule,
     ColumnParallelLinear,
@@ -78,7 +78,8 @@ from easydel.layers import (
     split_fused_gate_up_projection,
 )
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
-from easydel.layers.rotary import yarn_get_mscale
+from easydel.layers.moe import moe_group_topk_select
+from easydel.layers.rotary import apply_rope_interleaved, yarn_get_mscale
 from easydel.modules._base import BaseCausalLMModule
 
 from .glm4_moe_lite_configuration import Glm4MoeLiteConfig
@@ -277,7 +278,7 @@ class Glm4MoeLiteTopKRouter(spx.Module):
     """fp32 router projection feeding the grouped top-k selector in :class:`Glm4MoeLiteMoE`.
 
     Owns only the *projection* parameters — the actual grouped top-k logic
-    lives in :meth:`Glm4MoeLiteMoE._select_experts_static`. The two stored
+    lives in :func:`easydel.layers.moe.moe_group_topk_select`. The two stored
     parameters are:
 
     - ``weight``: ``(hidden_size, n_routed_experts)`` learned matrix used to
@@ -324,7 +325,16 @@ class Glm4MoeLiteTopKRouter(spx.Module):
                 param_dtype,
             )
         )
-        self.e_score_correction_bias = spx.Parameter(jnp.zeros((self.n_routed_experts,), dtype=jnp.float32))
+        # Declared via ArrayParam.bound (as glm4_moe and hy_v3 do) rather than a
+        # bare spx.Parameter: under sequential_init the bare form stays an
+        # unmaterialised ShapeDtypeStruct, which was harmless only while nothing
+        # read it. Routing reads it now.
+        self.e_score_correction_bias = ArrayParam.bound(
+            shape=(self.n_routed_experts,),
+            dtype=jnp.float32,
+            init_method="zeros",
+            key=rngs.param,
+        )
 
     def forward(self, hidden_states: Float[Array, "tokens hidden_dim"]) -> Array:
         """Project hidden states to per-expert pre-bias logits.
@@ -436,76 +446,30 @@ class Glm4MoeLiteMoE(BaseMoeModule):
         )
         self.moe_hooks = MoeFusedHooks(
             normalize_gate_logits=lambda x: x,
-            select_hook=partial(
-                self._select_experts_static,
-                n_routed_experts=self.n_routed_experts,
-                n_group=self.n_group,
-                topk_group=self.topk_group,
-                group_topk_k=self.group_topk_k,
-                norm_topk_prob=self.norm_topk_prob,
-                routed_scaling_factor=self.routed_scaling_factor,
-            ),
         )
 
-    @staticmethod
-    def _select_experts_static(
-        gate_logits: Array,
-        pre_bias_logits: Array | None,
-        k: int,
-        *,
-        n_routed_experts: int,
-        n_group: int,
-        topk_group: int,
-        group_topk_k: int,
-        norm_topk_prob: bool,
-        routed_scaling_factor: float,
-    ) -> tuple[Array, Array]:
-        """Run the GLM-4-MoE-Lite grouped sigmoid top-k expert selection.
+    def _select_hook(self):
+        """Bind the shared grouped top-k selector to this layer's live bias.
 
-        Identical algorithm to :meth:`Glm4MoeMoE._select_experts_static`:
-        sigmoid the router logits, score each of the ``n_group`` groups by
-        their top-``group_topk_k`` summed scores, keep the ``topk_group``
-        winning groups, mask the rest, then take a flat top-``k`` over the
-        survivors. Optionally renormalise weights and scale by
-        ``routed_scaling_factor``.
-
-        Args:
-            gate_logits: Pre-sigmoid router logits ``(num_tokens,
-                n_routed_experts)``.
-            pre_bias_logits: Unused; kept for hook signature compatibility.
-            k: Number of experts selected per token.
-            n_routed_experts: Total experts.
-            n_group: Number of equal-sized expert groups.
-            topk_group: Groups kept per token before flat top-k.
-            group_topk_k: Within-group top-k whose sum scores each group.
-            norm_topk_prob: Whether to renormalise the selected weights.
-            routed_scaling_factor: Final multiplier on the selected weights.
-
-        Returns:
-            Tuple ``(topk_weights, topk_indices)`` of shape
-            ``(num_tokens, k)``.
+        ``e_score_correction_bias`` is the auxiliary-loss-free load-balancing
+        term: it steers *selection* without touching the combine weights. It
+        has to be read here rather than captured in ``__init__`` -- binding the
+        parameter at construction time freezes the zero-initialised tensor, so
+        the trained bias never reaches routing. That is exactly the bug this
+        replaced: the previous hook took ``pre_bias_logits`` and dropped it.
         """
-        del pre_bias_logits
-        scores = jax.nn.sigmoid(gate_logits.astype(jnp.float32))
-        scores_for_choice = scores
-        batch_size = scores_for_choice.shape[0]
-        group_size = n_routed_experts // n_group
-        group_scores = scores_for_choice.reshape(batch_size, n_group, group_size)
-        top2_per_group = jax.lax.top_k(group_scores, k=group_topk_k)[0]
-        group_scores_sum = jnp.sum(top2_per_group, axis=-1)
-        group_k = min(topk_group, n_group)
-        group_idx = jax.lax.top_k(group_scores_sum, k=group_k)[1]
-        group_mask = jax.nn.one_hot(group_idx, n_group, dtype=scores_for_choice.dtype)
-        group_mask = jnp.sum(group_mask, axis=1)
-        scores_mask = jnp.repeat(group_mask, group_size, axis=1)
-        scores_for_choice = jnp.where(scores_mask > 0, scores_for_choice, 0.0)
-        _, topk_indices = jax.lax.top_k(scores_for_choice, k=k)
-        topk_weights = jnp.take_along_axis(scores, topk_indices, axis=-1)
-        if norm_topk_prob:
-            denominator = jnp.sum(topk_weights, axis=-1, keepdims=True) + 1e-20
-            topk_weights = topk_weights / denominator
-        topk_weights = topk_weights * routed_scaling_factor
-        return topk_weights, topk_indices
+        return partial(
+            moe_group_topk_select,
+            n_routed_experts=self.n_routed_experts,
+            score_fn="sigmoid",
+            e_score_correction_bias=self.gate.e_score_correction_bias.value,
+            n_group=self.config.n_group,
+            topk_group=self.config.topk_group,
+            group_topk_k=self.group_topk_k,
+            group_score="topk_sum",
+            norm_topk_prob=self.config.norm_topk_prob,
+            routed_scaling_factor=self.config.routed_scaling_factor,
+        )
 
     def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
         """Run the sparse FFN with optional shared expert.
@@ -518,6 +482,7 @@ class Glm4MoeLiteMoE(BaseMoeModule):
             shared + routed expert output and ``router_logits`` are the
             raw fp32 logits used for auxiliary load-balancing losses.
         """
+        hooks = self.moe_hooks.replace(select_hook=self._select_hook())
         out, router_logits = self.moe_call(
             hidden_state=hidden_states,
             gate_layer=self.gate,
@@ -525,6 +490,7 @@ class Glm4MoeLiteMoE(BaseMoeModule):
             gate_up_kernel=self.experts.gate_up_proj.kernel_view(),
             wd_kernel=self.experts.down_proj.kernel_view(),
             act_fn=self.experts.act_fn,
+            hooks=hooks,
         )
         if self.shared_experts is not None:
             out = out + self.shared_experts(hidden_states)
@@ -621,132 +587,13 @@ class Glm4MoeLiteAttention(UnifiedAttention):
         precision: jax.lax.Precision,
         rngs: spx.Rngs,
     ):
-        """Build the MLA Q/KV projections, attention performer, and rotary.
+        """Build the MLA projection stack.
 
-        Mirrors HF DeepSeek attribute names via ``projection_mapping`` so
-        that released checkpoints load directly. When ``q_lora_rank`` is
-        unset a single dense ``q_proj`` is used; otherwise a low-rank
-        ``q_a_proj -> q_a_layernorm -> q_b_proj`` chain is materialised.
-
-        Args:
-            config: Model configuration.
-            dtype: Computation dtype.
-            param_dtype: Parameter dtype.
-            precision: JAX matmul precision.
-            rngs: Random number generator collection.
+        The body lived here in four families with byte-identical contents; it
+        is now :meth:`UnifiedAttention._build_mla_projections`, driven by this
+        class's ``projection_mapping`` so the HF attribute names are unchanged.
         """
-        if not self.use_mla_lora:
-            setattr(
-                self,
-                self.projection_mapping["mla_q_proj"],
-                ColumnParallelLinear(
-                    config.hidden_size,
-                    config.num_attention_heads * self.q_head_dim,
-                    rngs=rngs,
-                    use_bias=False,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                    precision=precision,
-                ),
-            )
-        else:
-            setattr(
-                self,
-                self.projection_mapping["mla_q_a_proj"],
-                ColumnParallelLinear(
-                    config.hidden_size,
-                    config.q_lora_rank,
-                    rngs=rngs,
-                    use_bias=config.attention_bias,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                    precision=precision,
-                ),
-            )
-            setattr(
-                self,
-                self.projection_mapping["mla_q_a_layernorm"],
-                RMSNorm(
-                    config.q_lora_rank,
-                    eps=config.rms_norm_eps,
-                    rngs=rngs,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                ),
-            )
-            setattr(
-                self,
-                self.projection_mapping["mla_q_b_proj"],
-                ColumnParallelLinear(
-                    config.q_lora_rank,
-                    config.num_attention_heads * self.q_head_dim,
-                    rngs=rngs,
-                    use_bias=False,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                    precision=precision,
-                ),
-            )
-
-        setattr(
-            self,
-            self.projection_mapping["mla_kv_a_proj_with_mqa"],
-            ColumnParallelLinear(
-                config.hidden_size,
-                config.kv_lora_rank + config.qk_rope_head_dim,
-                rngs=rngs,
-                use_bias=config.attention_bias,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                precision=precision,
-            ),
-        )
-        setattr(
-            self,
-            self.projection_mapping["mla_kv_a_layernorm"],
-            RMSNorm(
-                config.kv_lora_rank,
-                eps=config.rms_norm_eps,
-                rngs=rngs,
-                dtype=dtype,
-                param_dtype=param_dtype,
-            ),
-        )
-        setattr(
-            self,
-            self.projection_mapping["mla_kv_b_proj"],
-            ColumnParallelLinear(
-                config.kv_lora_rank,
-                config.num_attention_heads * (config.qk_nope_head_dim + config.v_head_dim),
-                rngs=rngs,
-                use_bias=False,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                precision=precision,
-            ),
-        )
-        setattr(
-            self,
-            self.projection_mapping["output_projection"],
-            RowParallelLinear(
-                config.num_attention_heads * self.v_head_dim,
-                config.hidden_size,
-                rngs=rngs,
-                use_bias=config.attention_bias,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                precision=precision,
-            ),
-        )
-
-        self.rotary = self._create_rotary(config, dtype)
-        self.attention_performer = self._create_attention_performer(config, rngs)
+        self._build_mla_projections(config, dtype, param_dtype, precision, rngs)
 
     def _create_attention_performer(self, config, rngs):
         """Construct the flexible attention kernel with YaRN-aware scaling.
@@ -776,25 +623,6 @@ class Glm4MoeLiteAttention(UnifiedAttention):
             softmax_scale=softmax_scale,
             dropout_prob=getattr(config, "attention_dropout", 0.0),
         )
-
-    @staticmethod
-    def _apply_rope_interleaved(x: Array, cos: Array, sin: Array) -> Array:
-        """Apply RoPE in the interleaved (DeepSeek) layout.
-
-        Args:
-            x: Tensor whose last axis carries the rotated channels with
-                even/odd interleaving.
-            cos: Per-position cosines broadcastable to ``x``.
-            sin: Per-position sines broadcastable to ``x``.
-
-        Returns:
-            Rotated tensor with the same shape as ``x``.
-        """
-        x1 = x[..., ::2]
-        x2 = x[..., 1::2]
-        o1 = x1 * cos - x2 * sin
-        o2 = x2 * cos + x1 * sin
-        return jnp.stack((o1, o2), axis=-1).reshape(x.shape)
 
     def forward_mla(
         self,
@@ -873,8 +701,8 @@ class Glm4MoeLiteAttention(UnifiedAttention):
             cos = cos[:, None, :, :].astype(q_pe.dtype)
             sin = sin[:, None, :, :].astype(q_pe.dtype)
             if self.config.rope_interleave:
-                q_pe = self._apply_rope_interleaved(q_pe, cos, sin)
-                k_pe = self._apply_rope_interleaved(k_pe, cos, sin)
+                q_pe = apply_rope_interleaved(q_pe, cos, sin)
+                k_pe = apply_rope_interleaved(k_pe, cos, sin)
             else:
                 q1, q2 = jnp.split(q_pe, 2, axis=-1)
                 k1, k2 = jnp.split(k_pe, 2, axis=-1)
@@ -917,8 +745,7 @@ class Glm4MoeLiteAttention(UnifiedAttention):
             mask_info=mask_info,
         )
 
-        softmax_aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
-        softmax_aux = getattr(softmax_aux, "value", softmax_aux)
+        softmax_aux = self._softmax_aux()
 
         # Absorbed MLA: absorb kv_b_proj weights into queries so the kernel
         # works directly on the compressed latent (non-head-aware path).

@@ -80,14 +80,10 @@ def grouped_matmul_w8a8(
         lax.Precision.DEFAULT,
     )
 
-    # Per-row weight-scale view: rows are sorted by group, so repeating each
-    # group's scale row by its group size aligns scales with output rows.
-    w_scales_rows = jnp.repeat(
-        rhs_scales[:, 0, :],
-        group_sizes,
-        axis=0,
-        total_repeat_length=m,
-    )
+    from ._scale_rows import expand_group_scales
+
+    # Preserve repeat's scale alignment without its scatter map for decode.
+    w_scales_rows = expand_group_scales(rhs_scales, group_sizes, m)
     out = acc.astype(jnp.float32) * act_scales * w_scales_rows
     return out.astype(preferred_element_type)
 

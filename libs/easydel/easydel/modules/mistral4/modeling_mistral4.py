@@ -99,6 +99,7 @@ from easydel.layers import (
     split_fused_gate_up_projection,
 )
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
+from easydel.layers.rotary import apply_rope_interleaved
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
 
 from .mistral4_configuration import Mistral4Config
@@ -659,132 +660,13 @@ class Mistral4Attention(UnifiedAttention):
         precision: jax.lax.Precision,
         rngs: spx.Rngs,
     ):
-        """Define the MLA-specific network structure.
+        """Build the MLA projection stack.
 
-        Sets up the query projection (with optional LoRA), the key-value
-        compression projections with layer normalization, and the output
-        projection.
-
-        Args:
-            config (Mistral4Config): Model configuration.
-            dtype (jnp.dtype): Data type for computation.
-            param_dtype (jnp.dtype): Data type for parameters.
-            precision (jax.lax.Precision): Numerical precision.
-            rngs (spx.Rngs): Random number generator state.
+        The body lived here in four families with byte-identical contents; it
+        is now :meth:`UnifiedAttention._build_mla_projections`, driven by this
+        class's ``projection_mapping`` so the HF attribute names are unchanged.
         """
-        if not self.use_mla_lora:
-            setattr(
-                self,
-                self.projection_mapping["mla_q_proj"],
-                ColumnParallelLinear(
-                    config.hidden_size,
-                    config.num_attention_heads * self.q_head_dim,
-                    rngs=rngs,
-                    use_bias=False,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                    precision=precision,
-                ),
-            )
-        else:
-            setattr(
-                self,
-                self.projection_mapping["mla_q_a_proj"],
-                ColumnParallelLinear(
-                    config.hidden_size,
-                    config.q_lora_rank,
-                    rngs=rngs,
-                    use_bias=config.attention_bias,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                    precision=precision,
-                ),
-            )
-            setattr(
-                self,
-                self.projection_mapping["mla_q_a_layernorm"],
-                RMSNorm(
-                    config.q_lora_rank,
-                    eps=config.rms_norm_eps,
-                    rngs=rngs,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                ),
-            )
-            setattr(
-                self,
-                self.projection_mapping["mla_q_b_proj"],
-                ColumnParallelLinear(
-                    config.q_lora_rank,
-                    config.num_attention_heads * self.q_head_dim,
-                    rngs=rngs,
-                    use_bias=False,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                    precision=precision,
-                ),
-            )
-
-        setattr(
-            self,
-            self.projection_mapping["mla_kv_a_proj_with_mqa"],
-            ColumnParallelLinear(
-                config.hidden_size,
-                config.kv_lora_rank + config.qk_rope_head_dim,
-                rngs=rngs,
-                use_bias=config.attention_bias,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                precision=precision,
-            ),
-        )
-        setattr(
-            self,
-            self.projection_mapping["mla_kv_a_layernorm"],
-            RMSNorm(
-                config.kv_lora_rank,
-                eps=config.rms_norm_eps,
-                rngs=rngs,
-                dtype=dtype,
-                param_dtype=param_dtype,
-            ),
-        )
-        setattr(
-            self,
-            self.projection_mapping["mla_kv_b_proj"],
-            ColumnParallelLinear(
-                config.kv_lora_rank,
-                config.num_attention_heads * (config.qk_nope_head_dim + config.v_head_dim),
-                rngs=rngs,
-                use_bias=False,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                precision=precision,
-            ),
-        )
-
-        setattr(
-            self,
-            self.projection_mapping["output_projection"],
-            RowParallelLinear(
-                config.num_attention_heads * self.v_head_dim,
-                config.hidden_size,
-                rngs=rngs,
-                use_bias=config.attention_bias,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                precision=precision,
-            ),
-        )
-
-        self.rotary = self._create_rotary(config, dtype)
-        self.attention_performer = self._create_attention_performer(config, rngs)
+        self._build_mla_projections(config, dtype, param_dtype, precision, rngs)
 
     def _create_attention_performer(self, config, rngs):
         """Create the attention performer with Mistral4's plain softmax scale.
@@ -806,25 +688,6 @@ class Mistral4Attention(UnifiedAttention):
             softmax_scale=float(self.q_head_dim**-0.5),
             dropout_prob=getattr(config, "attention_dropout", 0.0),
         )
-
-    @staticmethod
-    def _apply_rope_interleaved(x: Array, cos: Array, sin: Array) -> Array:
-        """Apply RoPE in the interleaved (GPT-J even/odd) layout.
-
-        Args:
-            x: Tensor whose last axis carries the rotated channels with
-                even/odd interleaving.
-            cos: Per-position cosines broadcastable to ``x``.
-            sin: Per-position sines broadcastable to ``x``.
-
-        Returns:
-            Rotated tensor with the same shape as ``x``.
-        """
-        x1 = x[..., ::2]
-        x2 = x[..., 1::2]
-        o1 = x1 * cos - x2 * sin
-        o2 = x2 * cos + x1 * sin
-        return jnp.stack((o1, o2), axis=-1).reshape(x.shape)
 
     def _llama_4_attn_scale(self, position_ids: Array) -> Array | None:
         """Compute the Llama-4 attention temperature per query position.
@@ -933,8 +796,8 @@ class Mistral4Attention(UnifiedAttention):
             cos = cos[:, None, :, :].astype(q_pe.dtype)
             sin = sin[:, None, :, :].astype(q_pe.dtype)
             if self.config.rope_interleave:
-                q_pe = self._apply_rope_interleaved(q_pe, cos, sin)
-                k_pe = self._apply_rope_interleaved(k_pe, cos, sin)
+                q_pe = apply_rope_interleaved(q_pe, cos, sin)
+                k_pe = apply_rope_interleaved(k_pe, cos, sin)
             else:
                 q1, q2 = jnp.split(q_pe, 2, axis=-1)
                 k1, k2 = jnp.split(k_pe, 2, axis=-1)
@@ -1001,8 +864,7 @@ class Mistral4Attention(UnifiedAttention):
                 mask_info=mask_info,
             )
 
-            softmax_aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
-            softmax_aux = getattr(softmax_aux, "value", softmax_aux)
+            softmax_aux = self._softmax_aux()
 
             attentions = self.attention_performer.forward(
                 query_states=query_for_concat,
@@ -1062,8 +924,7 @@ class Mistral4Attention(UnifiedAttention):
                 mask_info=mask_info,
             )
 
-            softmax_aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
-            softmax_aux = getattr(softmax_aux, "value", softmax_aux)
+            softmax_aux = self._softmax_aux()
 
             attentions = self.attention_performer.forward(
                 query_states=query_states,

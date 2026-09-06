@@ -1461,6 +1461,7 @@ class VLMCausalLMOutput(ModelOutput):
     past_key_values: TransformerCache | None = None
     hidden_states: tuple[Array] | None = None
     last_hidden_state: Array | None = None
+    last_stream_state: Array | None = None
     attentions: tuple[Array] | None = None
     image_hidden_states: Array | None = None
     video_hidden_states: Array | None = None

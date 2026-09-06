@@ -1802,6 +1802,11 @@ def ForCausalLMLoss(
     """
     if logits is None or labels is None:
         raise ValueError("Logits and labels cannot be None")
+    # Callers legitimately hand in NumPy labels (collators build them on the
+    # host). The fused cross-entropy kernels are jaxtyping-checked against
+    # ``Int[Array, ...]``, which rejects ``np.ndarray`` outright, so normalise
+    # here rather than letting the kernel raise several frames down.
+    labels = jnp.asarray(labels)
     if paxis is not None:
         logits = with_sharding_constraint(
             logits,

@@ -49,6 +49,7 @@ Example:
 
 from __future__ import annotations
 
+import dataclasses
 import typing as tp
 
 import jax
@@ -369,15 +370,22 @@ def _resolve_ragged_cache_layout(
 
     if version == "v3":
         try:
-            return (
-                _select_compatible_v3_kv_cache_dtype(
-                    kvdtype,
-                    num_kv_heads=int(num_kv_heads),
-                    k_headdim=int(k_headdim),
-                    kv_head_shards=kv_head_shards,
-                ),
-                kv_head_shards,
+            resolved_dtype = _select_compatible_v3_kv_cache_dtype(
+                kvdtype,
+                num_kv_heads=int(num_kv_heads),
+                k_headdim=int(k_headdim),
+                kv_head_shards=kv_head_shards,
             )
+            if resolved_dtype != kvdtype and jnp.finfo(kvdtype).bits < jnp.finfo(resolved_dtype).bits:
+                logger.warning(
+                    "Replicating ragged-page v3 KV cache across the kv-head axis to preserve requested "
+                    "dtype %s; sharding across %s KV-head shards would widen storage to %s.",
+                    _dtype_to_string(kvdtype),
+                    kv_head_shards,
+                    _dtype_to_string(resolved_dtype),
+                )
+                return kvdtype, 1
+            return resolved_dtype, kv_head_shards
         except ValueError:
             logger.warning(
                 "Replicating ragged-page v3 KV cache across the kv-head axis because "
@@ -398,6 +406,32 @@ def _resolve_ragged_cache_layout(
         return kvdtype, 1
 
     return kvdtype, kv_head_shards
+
+
+def _resolve_v3_kv_head_layout(
+    kvdtype: jnp.dtype,
+    *,
+    logical_num_kv_heads: int,
+    k_headdim: int,
+    physical_kv_head_shards: int,
+) -> tuple[jnp.dtype, int, int]:
+    """Resolve v3 storage dtype, sharding degree, and physical KV-head width.
+
+    KV-head padding exists only to make a sharded cache divisible by TP.  If
+    dtype packing later forces the cache to replicate, keeping that padding
+    changes the model's GQA ratio (for example Qwen's 24 query heads and two
+    KV heads become 24:4). Restore the logical width on replicated storage.
+    """
+    padded_num_kv_heads = _pad_v3_kv_heads_to_shards(logical_num_kv_heads, physical_kv_head_shards)
+    resolved_dtype, effective_shards = _resolve_ragged_cache_layout(
+        kvdtype,
+        version="v3",
+        num_kv_heads=padded_num_kv_heads,
+        k_headdim=k_headdim,
+        kv_head_shards=physical_kv_head_shards,
+    )
+    storage_num_kv_heads = logical_num_kv_heads if effective_shards == 1 else padded_num_kv_heads
+    return resolved_dtype, effective_shards, storage_num_kv_heads
 
 
 def _pad_v3_kv_heads_to_shards(num_kv_heads: int, kv_head_shards: int) -> int:
@@ -677,7 +711,9 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
             raise ValueError("`num_hidden_layers` must be positive")
         if num_kv_heads <= 0:
             raise ValueError("`num_kv_heads` must be positive")
-        if kv_head_dim_size is None or kv_head_dim_size <= 0:
+        if kv_head_dim_size is None:
+            kv_head_dim_size = k_headdim
+        if kv_head_dim_size <= 0:
             raise ValueError("`kv_head_dim_size` must be positive")
         data_parallel_size = mesh_axis_size(
             mesh, resolve_attention_data_parallel_axis(runtime_sharding_resolver, mode=MODE_PREFILL)
@@ -685,26 +721,29 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
         physical_kv_head_size = mesh_axis_size(mesh, runtime_sharding_resolver.paxis.kv_head_axis)
         kvdtype = _canonicalize_dtype(kvdtype)
         logical_num_kv_heads = int(num_kv_heads)
-        padded_num_kv_heads = (
-            _pad_v3_kv_heads_to_shards(logical_num_kv_heads, physical_kv_head_size)
-            if version == "v3"
-            else logical_num_kv_heads
-        )
-        if padded_num_kv_heads != logical_num_kv_heads:
-            logger.info(
-                "Padding ragged-page v3 KV heads from %s to %s to shard the cache across %s TP KV-head shards.",
-                logical_num_kv_heads,
-                padded_num_kv_heads,
-                physical_kv_head_size,
+        if version == "v3":
+            kvdtype, effective_kv_head_shards, storage_num_kv_heads = _resolve_v3_kv_head_layout(
+                kvdtype,
+                logical_num_kv_heads=logical_num_kv_heads,
+                k_headdim=k_headdim,
+                physical_kv_head_shards=physical_kv_head_size,
             )
-            num_kv_heads = padded_num_kv_heads
-        kvdtype, effective_kv_head_shards = _resolve_ragged_cache_layout(
-            kvdtype,
-            version=version,
-            num_kv_heads=num_kv_heads,
-            k_headdim=k_headdim,
-            kv_head_shards=physical_kv_head_size,
-        )
+            if storage_num_kv_heads != logical_num_kv_heads:
+                logger.info(
+                    "Padding ragged-page v3 KV heads from %s to %s to shard the cache across %s TP KV-head shards.",
+                    logical_num_kv_heads,
+                    storage_num_kv_heads,
+                    physical_kv_head_size,
+                )
+            num_kv_heads = storage_num_kv_heads
+        else:
+            kvdtype, effective_kv_head_shards = _resolve_ragged_cache_layout(
+                kvdtype,
+                version=version,
+                num_kv_heads=num_kv_heads,
+                k_headdim=k_headdim,
+                kv_head_shards=physical_kv_head_size,
+            )
         if data_parallel_size > 1:
             logger.info(f"Scaling KV page budget by data-parallel page axis: {data_parallel_size=}.")
         free = cls._compute_free_hbm(
@@ -714,7 +753,8 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
             kv_head_shards=effective_kv_head_shards,
         )
         bytes_av = jnp.finfo(kvdtype).bits // 8
-        page_bytes = 2 * num_hidden_layers * page_size * num_kv_heads * kv_head_dim_size * bytes_av
+        storage_head_dim = align_to_multiple(k_headdim, HEAD_DIM_ALIGNMENT) if version == "v3" else kv_head_dim_size
+        page_bytes = 2 * num_hidden_layers * page_size * num_kv_heads * storage_head_dim * bytes_av
         num_pages = int(free) // page_bytes
         if data_parallel_size > 1:
             num_pages = (num_pages // data_parallel_size) * data_parallel_size
@@ -1171,6 +1211,8 @@ class RaggedPagesCacheView(BaseCacheView):
                 Shape: [num_pages, page_size, num_kv_heads, head_dim]
         """
         flat = self.flattened_kv_pages()
+        if kv_pair_shares_head_dim_axis(self.metadata.k_headdim):
+            return flat[..., : self.metadata.k_headdim]
         return flat[:, :, 0::2, :]
 
     @property
@@ -1182,6 +1224,8 @@ class RaggedPagesCacheView(BaseCacheView):
                 Shape: [num_pages, page_size, num_kv_heads, head_dim]
         """
         flat = self.flattened_kv_pages()
+        if kv_pair_shares_head_dim_axis(self.metadata.k_headdim):
+            return flat[..., self.metadata.k_headdim : self.metadata.k_headdim + self.metadata.v_headdim]
         return flat[:, :, 1::2, :]
 
     def __repr__(self) -> str:
@@ -1318,11 +1362,17 @@ class RaggedPagesCache(BaseCache):
             else:
                 if metadata is None:
                     metadata = view.metadata
+                base_fields = {"metadata", "layer_index", "kv_pages", "runtime_sharding_resolver"}
+                extra_fields = {
+                    f.name: getattr(view, f.name) for f in dataclasses.fields(view) if f.name not in base_fields
+                }
                 cache_data.append(
                     {
                         "is_none": False,
                         "kv_pages": view.kv_pages,
                         "layer_index": view.layer_index,
+                        "view_class": type(view),
+                        "extra_fields": extra_fields,
                     }
                 )
 
@@ -1350,14 +1400,16 @@ class RaggedPagesCache(BaseCache):
 
         for layer_data in cache_data:
             if layer_data.get("is_none", False):
-                # RaggedPagesCache doesn't typically use None views
+                views.append(None)
                 continue
             else:
-                view = RaggedPagesCacheView(
+                view_class = layer_data.get("view_class", RaggedPagesCacheView)
+                view = view_class(
                     kv_pages=layer_data["kv_pages"],
                     metadata=metadata,
                     layer_index=layer_data.get("layer_index", 0),
                     runtime_sharding_resolver=pm,
+                    **layer_data.get("extra_fields", {}),
                 )
                 views.append(view)
 
@@ -1395,13 +1447,24 @@ class RaggedPagesCache(BaseCache):
                     (slot, 0, 0, 0, 0) if self_view.kv_pages.ndim == 5 else (slot, 0, 0, 0),
                 )
 
-                new_view = RaggedPagesCacheView(
-                    kv_pages=new_kv_pages,
-                    metadata=self_view.metadata,
-                    layer_index=self_view.layer_index,
-                    runtime_sharding_resolver=self_view.runtime_sharding_resolver,
-                )
-                new_views.append(new_view)
+                updates: dict[str, tp.Any] = {"kv_pages": new_kv_pages}
+                base_fields = {"metadata", "layer_index", "kv_pages", "runtime_sharding_resolver"}
+                for cache_field in dataclasses.fields(self_view):
+                    if cache_field.name in base_fields:
+                        continue
+                    target = getattr(self_view, cache_field.name)
+                    source = getattr(other_view, cache_field.name, None)
+                    if (
+                        isinstance(target, jax.Array)
+                        and isinstance(source, jax.Array)
+                        and target.ndim > 0
+                        and source.ndim == target.ndim
+                        and target.shape[1:] == source.shape[1:]
+                    ):
+                        updates[cache_field.name] = jax.lax.dynamic_update_slice(
+                            target, source, (slot,) + (0,) * (target.ndim - 1)
+                        )
+                new_views.append(self_view.replace(**updates))
 
         return RaggedPagesCache(views=new_views)
 

@@ -77,6 +77,7 @@ from easydel.layers import (
     split_fused_gate_up_projection,
 )
 from easydel.layers.attention import UnifiedAttention
+from easydel.layers.moe import moe_group_topk_select
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
 
 from .glm4_moe_configuration import Glm4MoeConfig
@@ -475,79 +476,30 @@ class Glm4MoeMoE(BaseMoeModule):
         )
         self.moe_hooks = self.moe_hooks.replace(
             normalize_gate_logits=lambda x: x,
-            select_hook=partial(
-                self._select_experts_static,
-                n_routed_experts=self.n_routed_experts,
-                n_group=self.config.n_group,
-                topk_group=self.config.topk_group,
-                group_topk_k=self.group_topk_k,
-                norm_topk_prob=self.config.norm_topk_prob,
-                routed_scaling_factor=self.config.routed_scaling_factor,
-            ),
         )
 
-    @staticmethod
-    def _select_experts_static(
-        gate_logits: Array,
-        pre_bias_logits: Array | None,
-        k: int,
-        *,
-        n_routed_experts: int,
-        n_group: int,
-        topk_group: int,
-        group_topk_k: int,
-        norm_topk_prob: bool,
-        routed_scaling_factor: float,
-    ) -> tuple[Array, Array]:
-        """Select top-k experts under grouped routing and return their weights.
+    def _select_hook(self):
+        """Bind the shared grouped top-k selector to this layer's live bias.
 
-        Implements the GLM-4-MoE/DeepSeek-style routing pipeline described in
-        :class:`Glm4MoeTopKRouter`: scores are obtained from a sigmoid over
-        ``gate_logits``, the experts are partitioned into ``n_group`` equal
-        groups and the ``topk_group`` groups with the largest sum of their
-        top-``group_topk_k`` scores survive; experts outside the surviving
-        groups are masked to zero before a flat ``top_k=k`` selection. The
-        per-token weights are optionally renormalised
-        (``norm_topk_prob``) and rescaled by ``routed_scaling_factor``.
-
-        Args:
-            gate_logits: Pre-sigmoid router logits, shape
-                ``(num_tokens, n_routed_experts)``.
-            pre_bias_logits: Unused; kept for hook signature compatibility.
-            k: Number of experts to select per token (``num_experts_per_tok``).
-            n_routed_experts: Total number of routed experts.
-            n_group: Number of equal-sized expert groups.
-            topk_group: Number of groups to keep per token.
-            group_topk_k: Within-group top-k whose sum scores each group.
-            norm_topk_prob: Whether to renormalise the selected weights.
-            routed_scaling_factor: Final multiplier on the selected weights.
-
-        Returns:
-            Tuple ``(topk_weights, topk_indices)`` of shape
-            ``(num_tokens, k)`` each.
+        ``e_score_correction_bias`` is the auxiliary-loss-free load-balancing
+        term: it steers *selection* without touching the combine weights. It
+        has to be read here rather than captured in ``__init__`` -- binding the
+        parameter at construction time freezes the zero-initialised tensor, so
+        the trained bias never reaches routing. That is exactly the bug this
+        replaced: the previous hook took ``pre_bias_logits`` and dropped it.
         """
-        del pre_bias_logits
-        scores = jax.nn.sigmoid(gate_logits.astype(jnp.float32))
-        scores_for_choice = scores
-        batch_size = scores_for_choice.shape[0]
-        group_size = n_routed_experts // n_group
-        group_scores = scores_for_choice.reshape(batch_size, n_group, group_size)
-        top2_per_group = jax.lax.top_k(group_scores, k=group_topk_k)[0]
-        group_scores_sum = jnp.sum(top2_per_group, axis=-1)
-        group_k = min(topk_group, n_group)
-        group_idx = jax.lax.top_k(group_scores_sum, k=group_k)[1]
-        group_mask = jax.nn.one_hot(group_idx, n_group, dtype=scores.dtype)
-        group_mask = jnp.sum(group_mask, axis=1)
-        score_mask = jnp.repeat(group_mask, group_size, axis=1)
-        scores_for_choice = jnp.where(score_mask > 0, scores_for_choice, 0.0)
-        topk_indices = jax.lax.top_k(scores_for_choice, k=k)[1]
-        topk_weights = jnp.take_along_axis(scores, topk_indices, axis=-1)
-
-        if norm_topk_prob:
-            denominator = jnp.sum(topk_weights, axis=-1, keepdims=True) + 1e-20
-            topk_weights = topk_weights / denominator
-        topk_weights = topk_weights * routed_scaling_factor
-        return topk_weights, topk_indices
+        return partial(
+            moe_group_topk_select,
+            n_routed_experts=self.n_routed_experts,
+            score_fn="sigmoid",
+            e_score_correction_bias=self.gate.e_score_correction_bias.value,
+            n_group=self.config.n_group,
+            topk_group=self.config.topk_group,
+            group_topk_k=self.group_topk_k,
+            group_score="topk_sum",
+            norm_topk_prob=self.config.norm_topk_prob,
+            routed_scaling_factor=self.config.routed_scaling_factor,
+        )
 
     def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
         """Forward pass through the MoE layer.
@@ -561,6 +513,7 @@ class Glm4MoeMoE(BaseMoeModule):
         Returns:
             Tuple of (output tensor [batch, seq_len, hidden_dim], router_logits).
         """
+        hooks = self.moe_hooks.replace(select_hook=self._select_hook())
         out, router_logits = self.moe_call(
             hidden_state=hidden_states,
             gate_layer=self.gate,
@@ -568,6 +521,7 @@ class Glm4MoeMoE(BaseMoeModule):
             gate_up_kernel=self.experts.gate_up_proj.kernel_view(),
             wd_kernel=self.experts.down_proj.kernel_view(),
             act_fn=self.experts.act_fn,
+            hooks=hooks,
         )
         shared_output, _ = self.shared_experts(hidden_states)
         out = out + shared_output

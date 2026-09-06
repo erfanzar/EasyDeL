@@ -14,7 +14,8 @@
 
 """XLA fallback for grouped matmul over int8 channelwise-quantized weights."""
 
+from ._channelwise import grouped_matmul_channelwise
 from ._interface import grouped_matmul_quant
 from ._w8a8 import grouped_matmul_w8a8
 
-__all__ = ("grouped_matmul_quant", "grouped_matmul_w8a8")
+__all__ = ("grouped_matmul_channelwise", "grouped_matmul_quant", "grouped_matmul_w8a8")

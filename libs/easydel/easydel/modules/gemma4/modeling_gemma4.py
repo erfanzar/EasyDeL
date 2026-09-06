@@ -1965,8 +1965,7 @@ class Gemma4Attention(UnifiedAttention):
         if mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
             sliding_window_for_kernel = None
 
-        softmax_aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
-        softmax_aux = getattr(softmax_aux, "value", softmax_aux)
+        softmax_aux = self._softmax_aux()
 
         attentions = self.attention_performer.forward(
             query_states=query_states,
@@ -2113,8 +2112,7 @@ class Gemma4Attention(UnifiedAttention):
             if mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
                 sliding_window_for_kernel = None
 
-        softmax_aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
-        softmax_aux = getattr(softmax_aux, "value", softmax_aux)
+        softmax_aux = self._softmax_aux()
 
         attentions = self.attention_performer.forward(
             query_states=query_states,

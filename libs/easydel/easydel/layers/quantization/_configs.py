@@ -113,6 +113,25 @@ class QuantizationType(enum.StrEnum):
     TURBOQUANT = "turboquant"
 
 
+def explicit_activation_kwargs(config: tp.Any) -> dict[str, bool | int]:
+    """Kernel overrides for an explicit activation contract; auto returns {}.
+
+    A16 means no activation quantization (not a float dtype cast). A4/A8
+    engage at every token count, including decode. The unused A16 kernel
+    bit-width is 8 because integer backends accept only 4 or 8. Callers
+    retain their own legacy defaults for auto and must suppress packed
+    A4-only routes when explicit activation_bits is not 4.
+    """
+    if getattr(config, "activation_policy", "auto") != "explicit":
+        return {}
+    bits = config.activation_bits
+    return {
+        "quantize_activations": bits != 16,
+        "activation_bits": 8 if bits == 16 else int(bits),
+        "prefill_threshold": 0,
+    }
+
+
 @dataclass
 class QuantizationConfig:
     """Configuration for model weight quantization behavior.
@@ -133,6 +152,13 @@ class QuantizationConfig:
             mxfp4/mxfp8=32, nvfp8=16).
         bits: Bit-width for ejkernel affine quantization (2-8). If not provided,
             defaults are chosen per mode (affine: 4, int8: 8).
+        activation_bits: Optional activation precision: 4, 8, or 16 bits.
+            Defaults to None, leaving precision selection to the caller.
+        activation_policy: ``"auto"`` preserves legacy activation selection,
+            even when activation_bits is set. ``"explicit"`` requires
+            activation_bits and records the requested precision (16 means
+            unquantized activations). This is configuration metadata only;
+            callers must honor the policy when selecting kernel dispatch.
         simulate: If True, uses straight-through estimation without actual bit
             packing. The quantization error is simulated but weights remain in
             original dtype. Useful for quantization-aware training (QAT) where
@@ -198,6 +224,7 @@ class QuantizationConfig:
     jax_native: bool = False
 
     pattern: str = field(default=DEFAULT_QUANTIZATION_PATTERN)
+    activation_policy: tp.Literal["auto", "explicit"] = "auto"
 
     def __post_init__(self):
         """Coerce string ``dtype`` values and integer-cast optional knobs.
@@ -215,6 +242,45 @@ class QuantizationConfig:
         if self.bits is not None:
             self.bits = int(self.bits)
         self.jax_native = bool(self.jax_native)
+        if self.activation_bits not in (None, 4, 8, 16):
+            raise ValueError("activation_bits must be None, 4, 8, or 16.")
+        if self.activation_policy not in ("auto", "explicit"):
+            raise ValueError("activation_policy must be 'auto' or 'explicit'.")
+        if self.activation_policy == "explicit":
+            if self.activation_bits is None:
+                raise ValueError("explicit activation_policy requires activation_bits.")
+            if self.dtype != QuantizationType.CHANNELWISE or self.runtime_dtype not in (
+                None,
+                QuantizationType.CHANNELWISE,
+            ):
+                raise ValueError("explicit activation_policy requires channelwise storage and runtime dispatch.")
+            if self.simulate or self.jax_native:
+                raise ValueError("explicit activation_policy does not support simulate or jax_native dispatch.")
+            weight_bits = 8 if self.bits is None else self.bits
+            if weight_bits not in (4, 8):
+                raise ValueError("explicit channelwise weight bits must be 4 or 8.")
+            if self.activation_bits == 4 and weight_bits != 4:
+                raise ValueError("activation_bits=4 requires channelwise weight bits=4.")
+
+    @classmethod
+    def for_matmul(cls, mode: str) -> "QuantizationConfig":
+        """Record an explicit channelwise integer matmul precision preset.
+
+        Supports W4A16, W8A16, W4A4, and W8A8 via lowercase mode names.
+        A16 requests unquantized activations rather than legacy auto-selection.
+        This factory only creates metadata; it does not wire kernel dispatch
+        or guarantee backend support for the requested precision.
+        """
+        presets = {"w4a16": (4, 16), "w8a16": (8, 16), "w4a4": (4, 4), "w8a8": (8, 8)}
+        if mode not in presets:
+            raise ValueError(f"Unsupported integer matmul mode: {mode!r}. Expected one of {tuple(presets)}.")
+        weight_bits, activation_bits = presets[mode]
+        return cls(
+            dtype=QuantizationType.CHANNELWISE,
+            bits=weight_bits,
+            activation_bits=activation_bits,
+            activation_policy="explicit",
+        )
 
     def to_dict(self) -> dict[str, tp.Any]:
         """Serialize to a JSON-safe mapping.
@@ -241,6 +307,7 @@ class QuantizationConfig:
             "group_size": self.group_size,
             "bits": self.bits,
             "activation_bits": self.activation_bits,
+            "activation_policy": self.activation_policy,
             "simulate": self.simulate,
             "jax_native": self.jax_native,
             "pattern": self.pattern,

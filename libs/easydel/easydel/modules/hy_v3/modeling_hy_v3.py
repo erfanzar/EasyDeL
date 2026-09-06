@@ -82,6 +82,7 @@ from easydel.layers import (
     split_fused_gate_up_projection,
 )
 from easydel.layers.attention import UnifiedAttention
+from easydel.layers.moe import moe_group_topk_select
 from easydel.modules._base import BaseCausalLMModule
 
 from .hy_v3_configuration import HyV3Config
@@ -274,7 +275,8 @@ class HyV3TopKRouter(spx.Module):
 
     Owns only the projection ``weight`` of shape ``(hidden_size, num_experts)``;
     the sigmoid scoring, bias-corrected selection, normalization and
-    ``router_scaling_factor`` live in :meth:`HyV3MoE._select_experts_static`.
+    ``router_scaling_factor`` live in
+    :func:`easydel.layers.moe.moe_group_topk_select`.
     The matmul is forced into float32 regardless of the activation dtype —
     mirroring HF's ``hidden.float() @ weight.float()`` — because gating-score
     gaps can fall below bfloat16 resolution.
@@ -427,51 +429,16 @@ class HyV3MoE(BaseMoeModule):
         self.moe_hooks = MoeFusedHooks(
             normalize_gate_logits=lambda x: x,
             select_hook=partial(
-                self._select_experts_static,
+                moe_group_topk_select,
+                n_routed_experts=config.num_experts,
+                score_fn="sigmoid",
                 e_score_correction_bias=None,
-                router_scaling_factor=config.router_scaling_factor,
+                n_group=1,
+                norm_topk_prob=True,
+                routed_scaling_factor=config.router_scaling_factor,
+                norm_eps=1e-20,
             ),
         )
-
-    @staticmethod
-    def _select_experts_static(
-        gate_logits: Array,
-        pre_bias_logits: Array | None,
-        k: int,
-        *,
-        e_score_correction_bias: Array | None,
-        router_scaling_factor: float,
-    ) -> tuple[Array, Array]:
-        """Run the HYV3 bias-corrected sigmoid top-k expert selection.
-
-        Sigmoid the fp32 router logits, select the top-``k`` experts on
-        ``scores + e_score_correction_bias``, gather the *raw* sigmoid scores
-        at the selected indices, normalize them by their sum (``+ 1e-20``),
-        and scale by ``router_scaling_factor``.
-
-        Args:
-            gate_logits: Pre-sigmoid fp32 router logits
-                ``(num_tokens, num_experts)``.
-            pre_bias_logits: Unused; kept for hook signature compatibility.
-            k: Number of routed experts selected per token.
-            e_score_correction_bias: Per-expert fp32 selection bias, or ``None``
-                for zero bias.
-            router_scaling_factor: Final multiplier on the selected weights.
-
-        Returns:
-            Tuple ``(topk_weights, topk_indices)`` of shape ``(num_tokens, k)``.
-        """
-        del pre_bias_logits
-        scores = jax.nn.sigmoid(gate_logits.astype(jnp.float32))
-        if e_score_correction_bias is None:
-            scores_for_choice = scores
-        else:
-            scores_for_choice = scores + e_score_correction_bias.astype(jnp.float32)
-        topk_indices = jax.lax.top_k(scores_for_choice, k=k)[1]
-        topk_weights = jnp.take_along_axis(scores, topk_indices, axis=-1)
-        topk_weights = topk_weights / (jnp.sum(topk_weights, axis=-1, keepdims=True) + 1e-20)
-        topk_weights = topk_weights * router_scaling_factor
-        return topk_weights, topk_indices
 
     def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
         """Route tokens through the selected experts and add the shared expert.
@@ -486,9 +453,14 @@ class HyV3MoE(BaseMoeModule):
         """
         hooks = self.moe_hooks.replace(
             select_hook=partial(
-                self._select_experts_static,
+                moe_group_topk_select,
+                n_routed_experts=self.config.num_experts,
+                score_fn="sigmoid",
                 e_score_correction_bias=self.e_score_correction_bias.value,
-                router_scaling_factor=self.router_scaling_factor,
+                n_group=1,
+                norm_topk_prob=True,
+                routed_scaling_factor=self.router_scaling_factor,
+                norm_eps=1e-20,
             ),
         )
         out, router_logits = self.moe_call(

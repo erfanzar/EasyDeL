@@ -40,6 +40,7 @@ from ._flexible import (
     AttentionMechanisms,
     AttentionModule,
     FlexibleAttentionModule,
+    block_diagonal_bias,
     get_optimal_config,
     tpu_version_check,
 )
@@ -52,6 +53,7 @@ __all__ = (
     "FlexibleAttentionModule",
     "MaskInfo",
     "UnifiedAttention",
+    "block_diagonal_bias",
     "blockwise_ffn",
     "get_optimal_config",
     "tpu_version_check",

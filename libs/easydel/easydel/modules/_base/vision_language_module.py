@@ -589,7 +589,26 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
         flat_mask = is_multimodal.reshape(-1)
         flat_embeds = inputs_embeds.reshape(-1, hidden)
 
-        dummy_row = jnp.zeros_like(multimodal_embeddings[0:1])
+        # Validate concrete host/eager inputs at the public merge boundary.
+        # Under JIT the placeholder count is data-dependent, so collators must
+        # enforce the same contract before tracing rather than forcing a host
+        # callback into every training step.
+        placeholder_count = jnp.sum(flat_mask, dtype=jnp.int32)
+        if not isinstance(placeholder_count, jax.core.Tracer):
+            expected = int(placeholder_count)
+            provided = int(multimodal_embeddings.shape[0])
+            if expected != provided:
+                raise ValueError(f"Expected {expected} placeholder tokens but got {provided} multimodal embeddings.")
+
+        # The pad row is built at an explicit ``(1, hidden)`` shape rather than
+        # with ``zeros_like(multimodal_embeddings[0:1])``. When a batch carries
+        # no images the collator hands in a literal ``(0, hidden)`` tensor, and
+        # the ``zeros_like`` form would then produce a ``(0, hidden)`` pad --
+        # leaving ``flattened_padded`` empty and turning the cumsum gather below
+        # into an out-of-bounds read. With a real row present the zero-image
+        # case degrades correctly to "every gather lands on the zero pad, and
+        # the mask discards it", so an empty batch is a true no-op.
+        dummy_row = jnp.zeros((1, hidden), dtype=multimodal_embeddings.dtype)
         flattened_padded = jnp.concatenate([dummy_row, multimodal_embeddings], axis=0)
         gather_indices = jnp.cumsum(flat_mask)
         update_values = flattened_padded[gather_indices]
@@ -889,6 +908,7 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             last_hidden_state=outputs.last_hidden_state,
+            last_stream_state=getattr(outputs, "last_stream_state", None),
             attentions=outputs.attentions,
             image_hidden_states=image_hidden_states,
             video_hidden_states=video_hidden_states,

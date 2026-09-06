@@ -25,8 +25,6 @@ Exposes the vision tower components, the LM trunk
 contributes a load-balancing auxiliary loss when training.
 """
 
-import math
-import typing
 from functools import cached_property
 
 import jax
@@ -77,9 +75,12 @@ from easydel.layers import (
     moe_fused_gate_up_reform_param,
     split_fused_gate_up_projection,
 )
-from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
-from easydel.layers.norms import LayerNorm
 from easydel.modules._base import BaseVisionLanguageModule
+from easydel.modules.qwen3_vl.modeling_qwen3_vl import (
+    Qwen3VisionTransformerPretrainedModel,
+    Qwen3VLTextAttention,
+    merge_multimodal_embeddings,
+)
 
 from .qwen3_vl_moe_configuration import Qwen3VLMoeConfig, Qwen3VLMoeTextConfig, Qwen3VLMoeVisionConfig
 
@@ -130,24 +131,6 @@ class Qwen3VLMoeModelOutputWithPast(ModelOutput):
     router_logits: tuple[Array] | None = None
 
 
-def _dbg_tail(x: Array) -> Array:  # pyright: ignore[reportUnusedFunction]
-    """Return the last five flattened elements of an array for debug prints.
-
-    Helper used when iterating on numerical-correctness issues during
-    development: printing the tail of an internal tensor is cheap and
-    surfaces the most commonly mutated positions (e.g. the latest
-    decoded tokens) without dumping the whole tensor.
-
-    Args:
-        x: Any JAX array.
-
-    Returns:
-        A 1-D array containing the final five values of ``ravel(x)``.
-    """
-    flat = jnp.ravel(x)
-    return flat[-5:]
-
-
 def get_rope_index(
     input_ids: np.ndarray,
     image_grid_thw: np.ndarray | None = None,
@@ -187,6 +170,11 @@ def get_rope_index(
     """
     if second_per_grid_ts is None:
         second_per_grid_ts = []
+
+    if video_grid_thw is not None:
+        video_grid_thw = video_grid_thw.copy()
+        video_grid_thw = np.repeat(video_grid_thw, video_grid_thw[:, 0].astype(int), axis=0)
+        video_grid_thw[:, 0] = 1
 
     if input_ids.shape[-1] != 1 and attention_mask is not None:
         attention_mask = attention_mask[:, : input_ids.shape[-1]]
@@ -301,932 +289,28 @@ def get_rope_index(
     return jnp.asarray(position_ids), jnp.asarray(mrope_position_deltas).reshape(-1, 1)
 
 
-def _merge_multimodal_embeddings(
-    inputs_embeds: jax.Array,
-    is_multimodal: jax.Array,
-    multimodal_embeddings: jax.Array,
-) -> jax.Array:
-    """Merge multimodal embeddings into text embeddings at placeholder positions.
-
-    Args:
-        inputs_embeds: Text embeddings with shape (batch, seq_len, hidden)
-        is_multimodal: Boolean mask with shape (batch, seq_len)
-        multimodal_embeddings: Flattened vision embeddings with shape (total_tokens, hidden)
-
-    Returns:
-        Merged embeddings with shape (batch, seq_len, hidden)
-    """
-    batch_size, seq_len, hidden = inputs_embeds.shape
-    flat_embeds = inputs_embeds.reshape(-1, hidden)
-    flat_mask = is_multimodal.reshape(-1)
-    dummy_row = jnp.zeros_like(multimodal_embeddings[0:1])
-    flattened_padded = jnp.concatenate([dummy_row, multimodal_embeddings], axis=0)
-    gather_indices = jnp.cumsum(flat_mask)
-    update_values = flattened_padded[gather_indices]
-    condition = jnp.expand_dims(flat_mask, axis=-1)
-    merged = jnp.where(condition, update_values, flat_embeds)
-
-    return merged.reshape(batch_size, seq_len, hidden)
-
-
-def merge_multimodal_embeddings(
-    input_ids: jax.Array,
-    inputs_embeds: jax.Array,
-    multimodal_embeddings: jax.Array,
-    placeholder_token_id: int | list[int],
-) -> jax.Array:
-    """Splice vision embeddings into a text embedding sequence.
-
-    Wraps the JIT-friendly cumsum-gather core implemented in
-    :func:`_merge_multimodal_embeddings`: positions in ``input_ids``
-    matching one of the placeholder ids are replaced with successive
-    rows from ``multimodal_embeddings`` (scanned left-to-right), and
-    every other position keeps its text embedding.
-
-    Args:
-        input_ids: Token ids of shape ``(batch, seq_len)``.
-        inputs_embeds: Text embeddings of shape
-            ``(batch, seq_len, hidden_size)``.
-        multimodal_embeddings: Concatenated visual tokens of shape
-            ``(num_visual_tokens, hidden_size)`` produced by the vision
-            tower + projector.
-        placeholder_token_id: Single id or list of ids that mark visual
-            slots in ``input_ids`` (e.g. ``image_token_id`` /
-            ``video_token_id``).
-
-    Returns:
-        Merged embeddings with the same shape as ``inputs_embeds``.
-    """
-    if isinstance(placeholder_token_id, list):
-        placeholder_token_id = jnp.array(placeholder_token_id)
-        is_multimodal = jnp.isin(input_ids, placeholder_token_id)
-    else:
-        is_multimodal = input_ids == placeholder_token_id
-    return _merge_multimodal_embeddings(inputs_embeds, is_multimodal, multimodal_embeddings)
-
-
-def rotate_half(x: Array) -> Array:
-    """Rotate the second half of the trailing dim by negation.
-
-    Standard RoPE building block: given ``x = [a, b]`` along the last
-    axis with equal halves, returns ``[-b, a]``. Combined with
-    ``cos``/``sin`` element-wise products this realises a 2-D rotation
-    per pair of channels.
-
-    Args:
-        x: Tensor with an even-sized trailing dimension.
-
-    Returns:
-        Tensor of identical shape with halves swapped and the new
-        lower half negated.
-    """
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return jnp.concatenate([-x2, x1], axis=-1)
-
-
-def apply_rotary_pos_emb_vision(q: Array, k: Array, cos: Array, sin: Array) -> tuple[Array, Array]:
-    """Apply rotary positional embeddings to vision features.
-
-    Used by the Qwen3-VL-MoE vision tower: only the first
-    ``head_dim_ro = head_dim // 2`` channels rotate, while the upper
-    half passes through unchanged. Computation runs in float32 for
-    numerical stability and is cast back to the input dtype.
-
-    Args:
-        q: Query tensor with the rotated channels at the front of the
-            last axis (``head_dim``).
-        k: Key tensor matching ``q`` in the trailing dimensions.
-        cos: Per-position cosines of shape ``(..., head_dim_ro)``;
-            broadcast over the head axis.
-        sin: Per-position sines, same shape as ``cos``.
-
-    Returns:
-        ``(q_embed, k_embed)``: rotated tensors with the same shape and
-        dtype as their inputs.
-    """
-    orig_q_dtype = q.dtype
-    orig_k_dtype = k.dtype
-    q, k = q.astype("f4"), k.astype("f4")
-    cos, sin = jnp.expand_dims(cos, -2).astype("f4"), jnp.expand_dims(sin, -2).astype("f4")
-    rot_dim = cos.shape[-1]
-    q_rot, q_pass = q[..., :rot_dim], q[..., rot_dim:]
-    k_rot, k_pass = k[..., :rot_dim], k[..., rot_dim:]
-    q_rot_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
-    k_rot_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
-    q_embed = jnp.concatenate([q_rot_embed, q_pass], axis=-1)
-    k_embed = jnp.concatenate([k_rot_embed, k_pass], axis=-1)
-    q_embed = q_embed.astype(orig_q_dtype)
-    k_embed = k_embed.astype(orig_k_dtype)
-    return q_embed, k_embed
-
-
-def create_attention_mask(cu_seqlens: Array, seq_length: int, dtype: jnp.dtype) -> Array:
-    """Create block-diagonal attention mask from cumulative sequence lengths.
-
-    Vision-tower utility for the Qwen3-VL-MoE encoder. Turns a packed
-    batch of variable-length segments (described by ``cu_seqlens``)
-    into an additive attention bias where positions only attend within
-    their own segment; the implementation is fully traceable so it
-    works under ``jit`` / ``vmap``.
-
-    Args:
-        cu_seqlens: Cumulative sequence lengths
-            ``(num_segments + 1,)``; segment ``i`` covers
-            ``[cu_seqlens[i], cu_seqlens[i + 1])``.
-        seq_length: Total packed-sequence length (``cu_seqlens[-1]``).
-        dtype: Output dtype; ``jnp.finfo(dtype).min`` is used as the
-            mask-out value.
-
-    Returns:
-        Array of shape ``(1, seq_length, seq_length)`` with ``0.0`` for
-        in-segment pairs and ``finfo(dtype).min`` for cross-segment.
-    """
-    positions = jnp.arange(seq_length)
-    starts = cu_seqlens[:-1]
-    ends = cu_seqlens[1:]
-    in_segment = (positions[:, None] >= starts[None, :]) & (positions[:, None] < ends[None, :])
-
-    segment_ids = jnp.argmax(in_segment.astype(jnp.int32), axis=-1)
-    same_segment = segment_ids[:, None] == segment_ids[None, :]
-    attention_mask = jnp.where(same_segment, 0.0, jnp.finfo(dtype).min).astype(dtype)
-
-    return attention_mask[None, :, :]
-
-
-class Qwen3VLMoeVisionPatchEmbed(spx.Module):
-    """3D convolution-based patch embedding for Qwen3-VL-MoE vision encoder.
-
-    Converts input image/video pixels into patch embeddings using a 3D convolution
-    that operates over temporal and spatial dimensions simultaneously.
-    """
-
-    def __init__(
-        self,
-        config: Qwen3VLMoeVisionConfig,
-        dtype: jnp.dtype = jnp.bfloat16,
-        param_dtype: jnp.dtype = jnp.bfloat16,
-        precision: jax.lax.PrecisionLike = None,
-        *,
-        rngs: spx.Rngs,
-    ) -> None:
-        """Initialize Qwen3-VL-MoE vision patch embedding layer.
-
-        Args:
-            config (Qwen3VLMoeVisionConfig): Vision encoder configuration.
-            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
-            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (spx.Rngs): Random number generator state.
-        """
-        self.dtype = dtype
-        self.config = config
-        self.patch_size = config.patch_size
-        self.temporal_patch_size = config.temporal_patch_size
-        self.in_channels = config.in_channels
-        self.hidden_size = config.hidden_size
-
-        kernel_size = (config.temporal_patch_size, config.patch_size, config.patch_size)
-        self.proj = nn.Conv3d(
-            in_channels=config.in_channels,
-            out_channels=config.hidden_size,
-            kernel_size=kernel_size,
-            stride=kernel_size,
-            use_bias=True,
-            dtype=dtype,
-            rngs=rngs,
-        )
-
-    def forward(self, hidden_states: Array) -> Array:
-        """Apply 3D convolution to extract patch embeddings.
-
-        Args:
-            hidden_states (Array): Input pixel values flattened into patches.
-
-        Returns:
-            Array: Patch embeddings of shape (num_patches, hidden_size).
-        """
-        hidden_states = jnp.transpose(
-            hidden_states.reshape(
-                -1,
-                self.in_channels,
-                self.temporal_patch_size,
-                self.patch_size,
-                self.patch_size,
-            ),
-            (0, 2, 3, 4, 1),
-        )
-        hidden_states = self.proj(hidden_states.astype(self.dtype))
-        hidden_states = hidden_states.reshape(-1, self.hidden_size)
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        return hidden_states
-
-
-class Qwen3VLMoeVisionPatchMerger(spx.Module):
-    """Spatial patch merger with MLP gating for Qwen3-VL-MoE.
-
-    Merges spatially adjacent patches to reduce sequence length while
-    preserving important visual information through a gated MLP.
-    """
-
-    def __init__(
-        self,
-        config: Qwen3VLMoeVisionConfig,
-        dtype: jnp.dtype = jnp.bfloat16,
-        param_dtype: jnp.dtype = jnp.bfloat16,
-        precision: jax.lax.PrecisionLike = None,
-        use_postshuffle_norm: bool = False,
-        *,
-        rngs: spx.Rngs,
-    ) -> None:
-        """Initialize Qwen3-VL-MoE vision patch merger.
-
-        Args:
-            config (Qwen3VLMoeVisionConfig): Vision encoder configuration.
-            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
-            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            use_postshuffle_norm (bool, optional): Whether to apply normalization after
-                spatial shuffling. Defaults to False.
-            rngs (spx.Rngs): Random number generator state.
-        """
-        super().__init__()
-        self.dtype = dtype
-        self.spatial_merge_size = config.spatial_merge_size
-        self.hidden_size = config.hidden_size * (config.spatial_merge_size**2)
-        self.use_postshuffle_norm = use_postshuffle_norm
-
-        self.norm = LayerNorm(
-            self.hidden_size if use_postshuffle_norm else config.hidden_size,
-            epsilon=1e-6,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
-        self.linear_fc1 = ColumnParallelLinear(
-            self.hidden_size,
-            self.hidden_size,
-            use_bias=True,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        self.linear_fc2 = RowParallelLinear(
-            self.hidden_size,
-            config.out_hidden_size,
-            use_bias=True,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-
-    def forward(self, x: Array) -> Array:
-        """Merge patches through normalization and gated MLP.
-
-        Args:
-            x (Array): Input patch embeddings.
-
-        Returns:
-            Array: Merged patch embeddings with reduced spatial dimensions.
-        """
-        x = self.norm(x.reshape(-1, self.hidden_size) if self.use_postshuffle_norm else x).reshape(-1, self.hidden_size)
-        x = self.linear_fc2(jax.nn.gelu(self.linear_fc1(x), approximate=False))
-        return x
-
-
-class Qwen3VLMoeVisionMLP(spx.Module):
-    """Feed-forward network for Qwen3-VL-MoE vision encoder.
-
-    Implements a two-layer MLP with GELU activation for vision feature
-    transformation within the vision transformer blocks.
-    """
-
-    def __init__(
-        self,
-        config: Qwen3VLMoeVisionConfig,
-        layer_idx: int | None = None,
-        dtype: jnp.dtype = jnp.bfloat16,
-        param_dtype: jnp.dtype = jnp.bfloat16,
-        precision: jax.lax.PrecisionLike = None,
-        *,
-        rngs: spx.Rngs,
-    ) -> None:
-        """Initialize Qwen3-VL-MoE vision MLP layer.
-
-        Args:
-            config (Qwen3VLMoeVisionConfig): Vision encoder configuration.
-            layer_idx (int | None, optional): Index of this layer in the encoder.
-                Defaults to None.
-            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
-            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (spx.Rngs): Random number generator state.
-        """
-        super().__init__()
-        self.layer_idx = layer_idx
-        self.linear_fc1 = ColumnParallelLinear(
-            config.hidden_size,
-            config.intermediate_size,
-            use_bias=True,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        self.act = ACT2FN[config.hidden_act]
-        self.linear_fc2 = RowParallelLinear(
-            config.intermediate_size,
-            config.hidden_size,
-            use_bias=True,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-
-    def forward(self, x: Array) -> Array:
-        """Apply feedforward transformation with GELU activation.
-
-        Args:
-            x (Array): Input tensor.
-
-        Returns:
-            Array: Transformed tensor with same shape as input.
-        """
-        return self.linear_fc2(self.act(self.linear_fc1(x)))
-
-
-class Qwen3VLMoeVisionAttention(UnifiedAttention):
-    """Self-attention for Qwen3-VL-MoE vision encoder with rotary embeddings.
-
-    Implements multi-head self-attention with 2D rotary position embeddings
-    for encoding spatial relationships in vision features.
-    """
-
-    def __init__(
-        self,
-        config: Qwen3VLMoeVisionConfig,
-        layer_idx: int,
-        dtype: jnp.dtype = jnp.bfloat16,
-        param_dtype: jnp.dtype = jnp.bfloat16,
-        precision: jax.lax.PrecisionLike = None,
-        *,
-        rngs: spx.Rngs,
-    ):
-        """Initialize Qwen3-VL-MoE vision attention layer.
-
-        Args:
-            config (Qwen3VLMoeVisionConfig): Vision encoder configuration.
-            layer_idx (int): Index of this layer in the encoder.
-            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
-            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (spx.Rngs): Random number generator state.
-        """
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_heads
-        self.head_dim = config.hidden_size // config.num_heads
-        self.layer_idx = layer_idx
-        super().__init__(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-            layer_idx=layer_idx,
-            attention_type="standard",
-            causal=False,
-            use_gqa=False,
-        )
-
-    def define_network(
-        self,
-        config: Qwen3VLMoeVisionConfig,
-        dtype: jnp.dtype,
-        param_dtype: jnp.dtype,
-        precision: jax.lax.PrecisionLike,
-        rngs: spx.Rngs,
-    ) -> None:
-        """Define the QKV and output projection layers for vision attention.
-
-        Args:
-            config: Vision encoder configuration.
-            dtype: Data type for computation.
-            param_dtype: Data type for parameters.
-            precision: Numerical precision for matrix operations.
-            rngs: Random number generator state.
-        """
-        self.qkv = ColumnParallelLinear(
-            self.hidden_size,
-            self.hidden_size * 3,
-            use_bias=True,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        self.proj = RowParallelLinear(
-            self.hidden_size,
-            self.hidden_size,
-            use_bias=True,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        self.attention_performer = self._create_attention_performer(config, rngs)
-
-    def _create_attention_performer(self, config, rngs: spx.Rngs):
-        """Create the attention performer module.
-
-        Args:
-            config: Vision configuration.
-            rngs (spx.Rngs): Random number generator state.
-
-        Returns:
-            FlexibleAttentionModule: Configured attention module.
-        """
-        return FlexibleAttentionModule(
-            rngs=rngs,
-            base_config=config,
-            softmax_scale=self.head_dim**-0.5,
-            dropout_prob=0.0,
-            attn_mechanism="vanilla",
-            requires_cache=False,  # Vision encoder doesn't need KV cache
-        )
-
-    def forward(
-        self,
-        hidden_states: Array,
-        cu_seqlens: Array,
-        rotary_pos_emb: Array = None,
-    ) -> Array:
-        """Apply self-attention with rotary position embeddings.
-
-        Args:
-            hidden_states (Array): Input tensor of shape (seq_len, hidden_size).
-            cu_seqlens (Array): Cumulative sequence lengths for block-diagonal attention.
-            rotary_pos_emb (Array, optional): Precomputed rotary position embeddings.
-                Defaults to None.
-
-        Returns:
-            Array: Attention output of shape (seq_len, hidden_size).
-        """
-        seq_length = hidden_states.shape[0]
-        qkv = self.qkv(hidden_states)
-        q, k, v = map(
-            lambda x: x.squeeze(0),
-            jnp.split(
-                qkv.reshape(seq_length, 3, self.num_heads, -1).transpose(1, 0, 2, 3),
-                3,
-                0,
-            ),
-        )
-        cos = jnp.cos(rotary_pos_emb)
-        sin = jnp.sin(rotary_pos_emb)
-        q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
-        q = jnp.expand_dims(q, axis=0)
-        k = jnp.expand_dims(k, axis=0)
-        v = jnp.expand_dims(v, axis=0)
-        attn_bias = create_attention_mask(cu_seqlens, seq_length, q.dtype)
-        attn_bias = jnp.broadcast_to(attn_bias, (1, self.num_heads, seq_length, seq_length))
-
-        attn_output = self.attention_performer.forward(
-            query_states=q,
-            key_states=k,
-            value_states=v,
-            bias=attn_bias,
-            causal=False,
-            mode=common_types.MODE_TRAIN if seq_length != 1 else common_types.MODE_DECODE,
-        ).attention_outputs
-
-        attn_output = attn_output.squeeze(0)
-        attn_output = attn_output.reshape(seq_length, -1)
-        attn_output = self.shard_attention_prod(attn_output)
-        attn_output = checkpoint_name(self.proj(attn_output), "vision_attn_output")
-        attn_output = self.shard_attention_prod(attn_output)
-        return attn_output
-
-
-class Qwen3VLMoeVisionBlock(spx.Module):
-    """Transformer block for Qwen3-VL-MoE vision encoder.
-
-    Combines self-attention and MLP layers with pre-normalization
-    architecture and residual connections for vision feature processing.
-    """
-
-    def __init__(
-        self,
-        config: Qwen3VLMoeVisionConfig,
-        layer_idx: int,
-        dtype: jnp.dtype = jnp.bfloat16,
-        param_dtype: jnp.dtype = jnp.bfloat16,
-        precision: jax.lax.PrecisionLike = None,
-        *,
-        rngs: spx.Rngs,
-    ) -> None:
-        """Initialize Qwen3-VL-MoE vision transformer block.
-
-        Args:
-            config (Qwen3VLMoeVisionConfig): Vision encoder configuration.
-            layer_idx (int): Index of this layer in the encoder.
-            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
-            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (spx.Rngs): Random number generator state.
-        """
-        super().__init__()
-        self.layer_idx = layer_idx
-        self.norm1 = LayerNorm(
-            config.hidden_size,
-            epsilon=1e-6,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
-        self.norm2 = LayerNorm(
-            config.hidden_size,
-            epsilon=1e-6,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
-        self.attn = Qwen3VLMoeVisionAttention(
-            config=config,
-            layer_idx=layer_idx,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        self.mlp = Qwen3VLMoeVisionMLP(
-            config=config,
-            layer_idx=layer_idx,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-
-    def forward(
-        self,
-        hidden_states: Array,
-        cu_seqlens: Array,
-        rotary_pos_emb: Array,
-    ) -> Array:
-        """Forward pass through the vision transformer block.
-
-        Applies pre-normalization: x + attn(norm(x)) followed by x + mlp(norm(x)).
-
-        Args:
-            hidden_states (Array): Input tensor of shape (seq_len, hidden_size).
-            cu_seqlens (Array): Cumulative sequence lengths for block-diagonal attention.
-            rotary_pos_emb (Array): Precomputed rotary position embeddings.
-
-        Returns:
-            Array: Output tensor of shape (seq_len, hidden_size).
-        """
-        hidden_states = hidden_states + self.attn(
-            self.norm1(hidden_states),
-            cu_seqlens=cu_seqlens,
-            rotary_pos_emb=rotary_pos_emb,
-        )
-        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
-        return hidden_states
-
-
 @register_module(TaskType.BASE_VISION, config=Qwen3VLMoeConfig, model_type="qwen3_vl_moe")
-class Qwen3VLMoeVisionTransformerPretrainedModel(EasyDeLBaseModule):
-    """Vision transformer encoder for Qwen3-VL-MoE.
+class Qwen3VLMoeVisionTransformerPretrainedModel(Qwen3VisionTransformerPretrainedModel):
+    """Qwen3-VL-MoE vision tower.
 
-    Processes images and videos through patch embedding, positional encoding,
-    transformer blocks, and patch merging to produce visual features for the
-    language model.
+    Structurally identical to the Qwen3-VL tower: the patch embed, patch
+    merger, MLP, attention, block and the tower itself compared
+    code-identical (docstrings aside) between the two families, so this
+    subclasses rather than restating them. The MoE variant differs only
+    in its text stack.
 
-    Attributes:
-        config_class: Configuration class for the vision encoder.
-        patch_embed: 3D convolution-based patch embedding.
-        pos_embed: Learnable position embeddings.
-        blocks: List of vision transformer blocks.
-        merger: Patch merger for reducing spatial dimensions.
-        deepstack_merger_list: Additional mergers for deepstack visual features.
+    The name is load-bearing -- ``easydel/__init__.py``,
+    ``modules/qwen3_vl_moe/__init__.py`` and
+    ``modules/qwen3_5_moe/modeling_qwen3_5_moe.py`` all refer to it.
     """
 
     config_class = Qwen3VLMoeVisionConfig
 
-    def __init__(
-        self,
-        config: Qwen3VLMoeVisionConfig,
-        dtype: jnp.dtype = jnp.bfloat16,
-        param_dtype: jnp.dtype = jnp.bfloat16,
-        precision: jax.lax.PrecisionLike = None,
-        *,
-        rngs: spx.Rngs,
-    ):
-        """Initialize Qwen3-VL-MoE vision transformer encoder.
 
-        Args:
-            config (Qwen3VLMoeVisionConfig): Vision encoder configuration.
-            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
-            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (spx.Rngs): Random number generator state.
-        """
-        super().__init__(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-
-        self.patch_embed = Qwen3VLMoeVisionPatchEmbed(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-
-        with self.assign_layer_stage(0, total_layers=config.depth):
-            self.pos_embed = Embed(
-                num_embeddings=config.num_position_embeddings,
-                features=config.hidden_size,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                rngs=rngs,
-            )
-
-        self.spatial_merge_size = config.spatial_merge_size
-        head_dim = config.hidden_size // config.num_heads
-        self._head_dim_ro = head_dim // 2
-
-        self.blocks = nn.ModuleList([])
-        for idx in range(config.depth):
-            with self.assign_layer_stage(idx, total_layers=config.depth):
-                self.blocks.append(
-                    Qwen3VLMoeVisionBlock(
-                        config=config,
-                        layer_idx=idx,
-                        dtype=dtype,
-                        param_dtype=param_dtype,
-                        precision=precision,
-                        rngs=rngs,
-                    )
-                )
-
-        self.merger = Qwen3VLMoeVisionPatchMerger(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-
-        self.deepstack_merger_list = nn.ModuleList(
-            [
-                Qwen3VLMoeVisionPatchMerger(
-                    config=config,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    use_postshuffle_norm=True,
-                    rngs=rngs,
-                )
-                for _ in config.deepstack_visual_indexes
-            ]
-        )
-
-        self.num_grid_per_side = int(math.sqrt(config.num_position_embeddings))
-
-    def get_dtype(self) -> jnp.dtype:
-        """Get the data type used by the model parameters.
-
-        Returns:
-            jnp.dtype: Data type of the model parameters.
-        """
-        return self.blocks[0].mlp.linear_fc2.weight.value.dtype
-
-    def fast_pos_embed_interpolate(self, grid_thw: Array) -> Array:
-        """Compute positional embeddings with bilinear interpolation.
-
-        Args:
-            grid_thw: Grid dimensions (temporal, height, width) per image, shape (num_images, 3)
-
-        Returns:
-            Positional embeddings with shape (total_tokens, hidden_size)
-        """
-        grid_ts = grid_thw[:, 0]
-        grid_hs = grid_thw[:, 1]
-        grid_ws = grid_thw[:, 2]
-        merge_size = self.spatial_merge_size
-
-        idx_list = [[], [], [], []]
-        weight_list = [[], [], [], []]
-
-        for t, h, w in zip(grid_ts, grid_hs, grid_ws, strict=False):
-            t, h, w = int(t), int(h), int(w)
-
-            h_idxs = jnp.linspace(0, self.num_grid_per_side - 1, h)
-            w_idxs = jnp.linspace(0, self.num_grid_per_side - 1, w)
-
-            h_idxs_floor = jnp.floor(h_idxs).astype(jnp.int32)
-            w_idxs_floor = jnp.floor(w_idxs).astype(jnp.int32)
-            h_idxs_ceil = jnp.clip(h_idxs_floor + 1, max=self.num_grid_per_side - 1)
-            w_idxs_ceil = jnp.clip(w_idxs_floor + 1, max=self.num_grid_per_side - 1)
-
-            dh = h_idxs - h_idxs_floor
-            dw = w_idxs - w_idxs_floor
-
-            base_h = h_idxs_floor * self.num_grid_per_side
-            base_h_ceil = h_idxs_ceil * self.num_grid_per_side
-
-            indices = [
-                (base_h[:, None] + w_idxs_floor[None, :]).flatten(),
-                (base_h[:, None] + w_idxs_ceil[None, :]).flatten(),
-                (base_h_ceil[:, None] + w_idxs_floor[None, :]).flatten(),
-                (base_h_ceil[:, None] + w_idxs_ceil[None, :]).flatten(),
-            ]
-
-            weights = [
-                ((1 - dh)[:, None] * (1 - dw)[None, :]).flatten(),
-                ((1 - dh)[:, None] * dw[None, :]).flatten(),
-                (dh[:, None] * (1 - dw)[None, :]).flatten(),
-                (dh[:, None] * dw[None, :]).flatten(),
-            ]
-
-            for i in range(4):
-                idx_list[i].append(indices[i])
-                weight_list[i].append(weights[i])
-
-        idx_arrays = [jnp.concatenate(idx_list[i], axis=0) for i in range(4)]
-        weight_arrays = [jnp.concatenate(weight_list[i], axis=0) for i in range(4)]
-
-        pos_embeds = [self.pos_embed(idx_arrays[i].astype(jnp.int32)) * weight_arrays[i][:, None] for i in range(4)]
-
-        patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
-
-        splits = [int(h * w) for h, w in zip(grid_hs, grid_ws, strict=False)]
-        split_pos = jnp.cumsum(jnp.array(splits[:-1])) if len(splits) > 1 else []
-        patch_pos_embeds_list = jnp.split(patch_pos_embeds, split_pos, axis=0)
-
-        patch_pos_embeds_permute = []
-        for pos_embed, t, h, w in zip(patch_pos_embeds_list, grid_ts, grid_hs, grid_ws, strict=False):
-            t, h, w = int(t), int(h), int(w)
-            if t > 1:
-                pos_embed = jnp.tile(pos_embed, (t, 1))
-            pos_embed = pos_embed.reshape(t, h // merge_size, merge_size, w // merge_size, merge_size, -1)
-            pos_embed = jnp.transpose(pos_embed, (0, 1, 3, 2, 4, 5))
-            pos_embed = pos_embed.reshape(-1, pos_embed.shape[-1])
-            patch_pos_embeds_permute.append(pos_embed)
-
-        return jnp.concatenate(patch_pos_embeds_permute, axis=0)
-
-    def rot_pos_emb(self, grid_thw: Array, max_grid_size: int) -> Array:
-        """Compute rotary position embeddings for vision features.
-
-        Matches HuggingFace's Qwen3VLVisionModel.rot_pos_emb exactly.
-
-        Args:
-            grid_thw (Array): Grid dimensions (temporal, height, width) per image/video.
-            max_grid_size (int): Maximum grid size for embedding computation.
-
-        Returns:
-            Array: Rotary position embeddings.
-        """
-        merge_size = self.spatial_merge_size
-
-        freq_table = jnp.outer(
-            jnp.arange(0, max_grid_size, dtype="f4"),
-            1.0 / (10000 ** (jnp.arange(0, self._head_dim_ro, 2, dtype="f4") / self._head_dim_ro)),
-        )
-
-        pos_ids_list = []
-        for t, h, w in grid_thw:
-            t, h, w = int(t), int(h), int(w)
-            merged_h, merged_w = h // merge_size, w // merge_size
-
-            block_rows = jnp.arange(merged_h)
-            block_cols = jnp.arange(merged_w)
-            intra_row = jnp.arange(merge_size)
-            intra_col = jnp.arange(merge_size)
-
-            row_idx = block_rows[:, None, None, None] * merge_size + intra_row[None, None, :, None]
-            col_idx = block_cols[None, :, None, None] * merge_size + intra_col[None, None, None, :]
-
-            row_idx = jnp.broadcast_to(row_idx, (merged_h, merged_w, merge_size, merge_size)).reshape(-1)
-            col_idx = jnp.broadcast_to(col_idx, (merged_h, merged_w, merge_size, merge_size)).reshape(-1)
-
-            coords = jnp.stack([row_idx, col_idx], axis=-1)
-            if t > 1:
-                coords = jnp.tile(coords, (t, 1))
-
-            pos_ids_list.append(coords)
-
-        pos_ids = jnp.concatenate(pos_ids_list, axis=0)
-        embeddings = freq_table[pos_ids]
-        embeddings = embeddings.reshape(pos_ids.shape[0], -1)
-        return embeddings
-
-    def forward(
-        self,
-        hidden_states: Array,
-        grid_thw: Array,
-        max_grid_size: int,
-    ) -> tuple[Array, list[Array]]:
-        """Forward pass through the vision transformer encoder.
-
-        Processes input pixels through patch embedding, adds positional embeddings,
-        applies transformer blocks with rotary embeddings, and merges patches.
-
-        Args:
-            hidden_states (Array): Input pixel values.
-            grid_thw (Array): Grid dimensions (temporal, height, width) per image/video.
-            max_grid_size (int): Maximum grid size for positional embeddings.
-
-        Returns:
-            tuple[Array, list[Array]]: Tuple of (merged_features, deepstack_features).
-                merged_features: Final vision embeddings after patch merging.
-                deepstack_features: Intermediate features from specified layers.
-        """
-        hidden_states = self.patch_embed(hidden_states)
-        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
-        hidden_states = hidden_states + pos_embeds
-        rotary_pos_emb = self.rot_pos_emb(grid_thw, max_grid_size)
-        rotary_pos_emb = jnp.concatenate([rotary_pos_emb, rotary_pos_emb], axis=-1)
-
-        grid_lens = grid_thw[:, 1] * grid_thw[:, 2]
-        repeated = jnp.repeat(grid_lens, grid_thw[:, 0])
-        cu_seqlens = jnp.cumsum(repeated, dtype="i4")
-        cu_seqlens = jnp.pad(cu_seqlens, (1, 0), constant_values=0)
-
-        deepstack_feature_lists = []
-
-        def _layer_loop(block, carry):
-            """Apply a single vision-encoder block inside the layer-stack scan.
-
-            Body of ``self.blocks.scan``; runs ``block`` on the current
-            visual hidden states and returns the updated carry tuple.
-            """
-            hidden_states, layer_num = carry
-            with self._layer_stage_context(layer_num, layers=self.blocks):
-                hidden_states = block(
-                    hidden_states,
-                    cu_seqlens=cu_seqlens,
-                    rotary_pos_emb=rotary_pos_emb,
-                )
-            hidden_states = self._mark_layer_stage_boundary(hidden_states, layer_num, layers=self.blocks)
-            if layer_num in self.config.deepstack_visual_indexes:
-                merger_idx = self.config.deepstack_visual_indexes.index(layer_num)
-                deepstack_feature = self.deepstack_merger_list[merger_idx](hidden_states)
-                deepstack_feature_lists.append(deepstack_feature)
-
-            return hidden_states, layer_num + 1
-
-        hidden_states, _ = self.blocks.scan(
-            _layer_loop,
-            (hidden_states, 0),
-            trace=not self.config.scan_layers or self._pipeline_stage_count() > 1,
-        )
-        return typing.cast(Array, self.merger(hidden_states)), deepstack_feature_lists
-
-    def get_encoder(self):
-        """Get the encoder component.
-
-        Returns:
-            Qwen3VLMoeVisionTransformerPretrainedModel: The vision encoder itself.
-        """
-        return self
-
-    def get_decoder(self):
-        """Get the decoder component.
-
-        Raises:
-            NotImplementedError: Vision model does not have a decoder.
-        """
-        raise NotImplementedError("Vision model does not have a decoder.")
-
-    def get_lm_head(self):
-        """Get the language model head.
-
-        Raises:
-            NotImplementedError: Vision model does not have a language model head.
-        """
-        raise NotImplementedError("Vision model does not have a language model head.")
-
-    def get_embedding(self):
-        """Get the embedding layer.
-
-        Returns:
-            Qwen3VLMoeVisionPatchEmbed: The patch embedding layer.
-        """
-        return self.patch_embed
+# The MoE text attention was code-identical to the dense one; alias rather
+# than restate it. Kept as a module-level name because the decoder layer
+# below constructs it.
+Qwen3VLMoeTextAttention = Qwen3VLTextAttention
 
 
 class Qwen3VLMoeTextMLP(spx.Module):
@@ -1501,60 +585,6 @@ class Qwen3VLMoeTextSparseBlock(BaseMoeModule):
         return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 
 
-class Qwen3VLMoeTextAttention(UnifiedAttention):
-    """Causal self-attention for Qwen3-VL-MoE text decoder with mRoPE and QK-norm support.
-
-    This attention module supports multi-dimensional rotary position embeddings (mRoPE)
-    for proper handling of multimodal inputs with temporal, height, and width dimensions.
-    """
-
-    def __init__(
-        self,
-        config: Qwen3VLMoeTextConfig,
-        dtype: jnp.dtype = jnp.bfloat16,
-        param_dtype: jnp.dtype = jnp.bfloat16,
-        precision: jax.lax.PrecisionLike = None,
-        *,
-        rngs: spx.Rngs,
-        layer_idx: int,
-    ):
-        """Initialize Qwen3-VL-MoE text attention layer.
-
-        Args:
-            config (Qwen3VLMoeTextConfig): Text decoder configuration.
-            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
-            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
-            rngs (spx.Rngs): Random number generator state.
-            layer_idx (int): Index of this layer in the decoder.
-        """
-        super().__init__(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-            layer_idx=layer_idx,
-            attention_type="standard",
-            causal=True,
-            sliding_window=config.sliding_window if config.use_sliding_window else None,
-            use_qk_norm=True,
-        )
-
-    def _postprocess_qkv(self, query_states, key_states, value_states):
-        """Apply Q/K normalization after computing query, key, and value projections.
-
-        Args:
-            query_states: Query tensor from projection layer.
-            key_states: Key tensor from projection layer.
-            value_states: Value tensor from projection layer.
-
-        Returns:
-            Tuple of normalized query, normalized key, and value tensors.
-        """
-        return self.query_normalization(query_states), self.key_normalization(key_states), value_states
-
-
 class Qwen3VLMoeTextDecoderLayer(spx.Module):
     """Transformer decoder layer for Qwen3-VL-MoE text model with conditional MoE/dense MLP.
 
@@ -1711,7 +741,7 @@ class Qwen3VLMoeTextDecoderLayer(spx.Module):
         )
 
 
-@register_module(TaskType.BASE_MODULE, config=Qwen3VLMoeConfig, model_type="qwen3_vl_moe")
+@register_module(TaskType.BASE_MODULE, config=Qwen3VLMoeTextConfig, model_type="qwen3_vl_moe")
 class Qwen3VLMoeTextModel(EasyDeLBaseModule):
     """Text decoder model for Qwen3-VL-MoE with MoE support.
 
@@ -2023,19 +1053,14 @@ class Qwen3VLMoeTextModel(EasyDeLBaseModule):
         Returns:
             Array: Updated hidden states with visual embeddings added.
         """
+        visual_embeds = visual_embeds.astype(hidden_states.dtype)
         batch_size, seq_len, hidden_dim = hidden_states.shape
         flat_hidden = hidden_states.reshape(-1, hidden_dim)
         flat_mask = visual_pos_masks.reshape(-1)
-
         cumsum_mask = jnp.cumsum(flat_mask) - 1
-
-        visual_update = jnp.where(
-            flat_mask[:, None],
-            visual_embeds[cumsum_mask],
-            jnp.zeros_like(flat_hidden),
-        )
-
-        flat_hidden = flat_hidden + visual_update
+        cumsum_mask = jnp.where(flat_mask, cumsum_mask, 0)
+        visual_updates = visual_embeds[cumsum_mask]
+        flat_hidden = jnp.where(flat_mask[:, None], flat_hidden + visual_updates, flat_hidden)
         return flat_hidden.reshape(batch_size, seq_len, hidden_dim)
 
     def get_encoder(self):
@@ -3049,6 +2074,8 @@ class Qwen3VLMoeForConditionalGeneration(BaseVisionLanguageModule[Qwen3VLMoeMode
             lm_logits = self.compute_lm_logits(hidden_states)
             lm_logits = self.apply_logit_cap(lm_logits)
 
+        aux_loss = self.compute_router_aux_loss(outputs)
+
         return VLMCausalLMOutput(
             logits=lm_logits,
             past_key_values=outputs.past_key_values,
@@ -3058,6 +2085,7 @@ class Qwen3VLMoeForConditionalGeneration(BaseVisionLanguageModule[Qwen3VLMoeMode
             rope_deltas=getattr(outputs, "rope_deltas", None),
             image_hidden_states=None,
             router_logits=getattr(outputs, "router_logits", None) if output_router_logits else None,
+            aux_loss=aux_loss,
         )
 
     def apply_lm_head(self, hidden_states: Array) -> Array:

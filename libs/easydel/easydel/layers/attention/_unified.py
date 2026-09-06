@@ -521,6 +521,157 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         if hasattr(config, "resid_pdrop") and config.resid_pdrop > 0:
             self.resid_dropout = nn.Dropout(rate=config.resid_pdrop)
 
+    def _build_mla_projections(
+        self,
+        config: Cfg,
+        dtype: jnp.dtype,
+        param_dtype: jnp.dtype,
+        precision: jax.lax.Precision,
+        rngs: spx.Rngs,
+    ):
+        """Build the DeepSeek-style MLA projection stack.
+
+        Four families -- ``deepseek_v2``, ``deepseek_v3``, ``glm4_moe_lite`` and
+        ``mistral4`` -- carried this method with byte-identical bodies once the
+        family-name tokens are normalised; ``glm_moe_dsa`` matched at 0.967,
+        differing only by its extra indexer construction. It is parameterised
+        entirely through ``self.projection_mapping``, so the HF attribute names
+        each family expects are already an input rather than a hardcode.
+
+        When ``q_lora_rank`` is unset a single dense ``q_proj`` is built;
+        otherwise the low-rank ``q_a_proj -> q_a_layernorm -> q_b_proj`` chain
+        is materialised. Callers override ``define_network`` and delegate here.
+
+        Required on the caller (set in its ``__init__`` before delegating);
+        this base class does not define them, so calling this on a non-MLA
+        attention layer raises ``AttributeError`` rather than silently
+        misbuilding:
+
+        - ``self.use_mla_lora`` -- selects the dense vs low-rank query path
+        - ``self.q_head_dim`` -- per-head query width (nope + rope halves)
+        - ``self.v_head_dim`` -- per-head value width
+        - ``self.projection_mapping`` -- HF attribute names to bind under
+
+        Args:
+            config: Model configuration.
+            dtype: Computation dtype.
+            param_dtype: Parameter dtype.
+            precision: JAX matmul precision.
+            rngs: Random number generator collection.
+        """
+        if not self.use_mla_lora:
+            setattr(
+                self,
+                self.projection_mapping["mla_q_proj"],
+                ColumnParallelLinear(
+                    config.hidden_size,
+                    config.num_attention_heads * self.q_head_dim,
+                    rngs=rngs,
+                    use_bias=False,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    kernel_init=jax.nn.initializers.normal(config.initializer_range),
+                    precision=precision,
+                ),
+            )
+        else:
+            setattr(
+                self,
+                self.projection_mapping["mla_q_a_proj"],
+                ColumnParallelLinear(
+                    config.hidden_size,
+                    config.q_lora_rank,
+                    rngs=rngs,
+                    use_bias=config.attention_bias,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    kernel_init=jax.nn.initializers.normal(config.initializer_range),
+                    precision=precision,
+                ),
+            )
+            setattr(
+                self,
+                self.projection_mapping["mla_q_a_layernorm"],
+                RMSNorm(
+                    config.q_lora_rank,
+                    eps=config.rms_norm_eps,
+                    rngs=rngs,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                ),
+            )
+            setattr(
+                self,
+                self.projection_mapping["mla_q_b_proj"],
+                ColumnParallelLinear(
+                    config.q_lora_rank,
+                    config.num_attention_heads * self.q_head_dim,
+                    rngs=rngs,
+                    use_bias=False,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    kernel_init=jax.nn.initializers.normal(config.initializer_range),
+                    precision=precision,
+                ),
+            )
+
+        setattr(
+            self,
+            self.projection_mapping["mla_kv_a_proj_with_mqa"],
+            ColumnParallelLinear(
+                config.hidden_size,
+                config.kv_lora_rank + config.qk_rope_head_dim,
+                rngs=rngs,
+                use_bias=config.attention_bias,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                kernel_init=jax.nn.initializers.normal(config.initializer_range),
+                precision=precision,
+            ),
+        )
+        setattr(
+            self,
+            self.projection_mapping["mla_kv_a_layernorm"],
+            RMSNorm(
+                config.kv_lora_rank,
+                eps=config.rms_norm_eps,
+                rngs=rngs,
+                dtype=dtype,
+                param_dtype=param_dtype,
+            ),
+        )
+        setattr(
+            self,
+            self.projection_mapping["mla_kv_b_proj"],
+            ColumnParallelLinear(
+                config.kv_lora_rank,
+                config.num_attention_heads * (config.qk_nope_head_dim + config.v_head_dim),
+                rngs=rngs,
+                use_bias=False,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                kernel_init=jax.nn.initializers.normal(config.initializer_range),
+                precision=precision,
+            ),
+        )
+        setattr(
+            self,
+            self.projection_mapping["output_projection"],
+            RowParallelLinear(
+                config.num_attention_heads * self.v_head_dim,
+                config.hidden_size,
+                rngs=rngs,
+                use_bias=config.attention_bias,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                kernel_init=jax.nn.initializers.normal(config.initializer_range),
+                precision=precision,
+            ),
+        )
+
+        self.rotary = self._create_rotary(config, dtype)
+        self.attention_performer = self._create_attention_performer(config, rngs)
+
     @property
     def reform_param(self) -> dict[str, dict[str, object]]:
         """Derive fused-QKV checkpoint reform rules from the projection layout."""
@@ -1411,8 +1562,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             sliding_window=sliding_window_for_kernel,
         )
 
-        softmax_aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
-        softmax_aux = getattr(softmax_aux, "value", softmax_aux)
+        softmax_aux = self._softmax_aux()
 
         attentions: AttentionLayerOutput = self.attention_performer.forward(
             query_states=query_states,
@@ -1619,8 +1769,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
                 mask_info=mask_info,
             )
 
-            softmax_aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
-            softmax_aux = getattr(softmax_aux, "value", softmax_aux)
+            softmax_aux = self._softmax_aux()
 
             attentions = self.attention_performer.forward(
                 query_states=query_for_concat,
@@ -1688,8 +1837,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
                 mask_info=mask_info,
             )
 
-            softmax_aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
-            softmax_aux = getattr(softmax_aux, "value", softmax_aux)
+            softmax_aux = self._softmax_aux()
 
             attentions = self.attention_performer.forward(
                 query_states=query_states,
@@ -1810,8 +1958,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         else:
             alibi_bias = self._compute_alibi_bias(key_states.shape[1])  # Use full KV length after cache
 
-        softmax_aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
-        softmax_aux = getattr(softmax_aux, "value", softmax_aux)
+        softmax_aux = self._softmax_aux()
 
         attentions = self.attention_performer.forward(
             query_states=query_states,

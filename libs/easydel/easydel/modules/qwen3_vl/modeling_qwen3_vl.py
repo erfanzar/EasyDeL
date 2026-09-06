@@ -70,7 +70,7 @@ from easydel.layers import (
     dense_gate_up_layout,
     gated_mlp_forward,
 )
-from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
+from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention, block_diagonal_bias
 from easydel.layers.norms import LayerNorm
 from easydel.modules._base import BaseVisionLanguageModule
 
@@ -294,77 +294,11 @@ def get_rope_index(
     return jnp.asarray(position_ids), jnp.asarray(mrope_position_deltas).reshape(-1, 1)
 
 
-def _merge_multimodal_embeddings(
-    inputs_embeds: jax.Array,
-    is_multimodal: jax.Array,
-    multimodal_embeddings: jax.Array,
-) -> jax.Array:
-    """Merge multimodal embeddings into text embeddings at placeholder positions.
-
-    Args:
-        inputs_embeds: Text embeddings with shape (batch, seq_len, hidden)
-        is_multimodal: Boolean mask with shape (batch, seq_len)
-        multimodal_embeddings: Flattened vision embeddings with shape (total_tokens, hidden)
-
-    Returns:
-        Merged embeddings with shape (batch, seq_len, hidden)
-    """
-    batch_size, seq_len, hidden = inputs_embeds.shape
-
-    flat_embeds = inputs_embeds.reshape(-1, hidden)
-    flat_mask = is_multimodal.reshape(-1)
-
-    # Pad with an explicit (1, hidden) zero row (not zeros_like(mm[0:1])): on a 0-row
-    # multimodal_embeddings the [0:1] slice is itself (0, hidden), leaving no index-0
-    # slot for the cumsum gather. An all-text batch (0 placeholders -> all-zero indices)
-    # then gathers the dummy row and where() leaves flat_embeds untouched (true no-op).
-    dummy_row = jnp.zeros((1, hidden), dtype=multimodal_embeddings.dtype)
-    flattened_padded = jnp.concatenate([dummy_row, multimodal_embeddings], axis=0)
-
-    gather_indices = jnp.cumsum(flat_mask)
-    update_values = flattened_padded[gather_indices]
-
-    condition = jnp.expand_dims(flat_mask, axis=-1)
-    merged = jnp.where(condition, update_values, flat_embeds)
-
-    return merged.reshape(batch_size, seq_len, hidden)
-
-
-def merge_multimodal_embeddings(
-    input_ids: jax.Array,
-    inputs_embeds: jax.Array,
-    multimodal_embeddings: jax.Array,
-    placeholder_token_id: int | list[int],
-) -> jax.Array:
-    """Splice vision embeddings into a text embedding sequence.
-
-    Replaces every position in ``inputs_embeds`` whose corresponding
-    ``input_ids`` entry equals an image/video placeholder with the next
-    vector from ``multimodal_embeddings``, scanned left-to-right. The
-    cumsum-gather core lives in :func:`_merge_multimodal_embeddings`
-    and is JIT-compatible.
-
-    Args:
-        input_ids: Token ids of shape ``(batch, seq_len)``.
-        inputs_embeds: Text embeddings of shape
-            ``(batch, seq_len, hidden_size)`` produced by the text token
-            embedding.
-        multimodal_embeddings: Concatenated visual tokens of shape
-            ``(num_visual_tokens, hidden_size)`` produced by the vision
-            tower + projector.
-        placeholder_token_id: Single id (or list of ids) marking visual
-            slots in ``input_ids`` (e.g. ``image_token_id``,
-            ``video_token_id``).
-
-    Returns:
-        Merged embedding tensor with the same shape as ``inputs_embeds``.
-    """
-    if isinstance(placeholder_token_id, list):
-        placeholder_token_id = jnp.array(placeholder_token_id)
-        is_multimodal = jnp.isin(input_ids, placeholder_token_id)
-    else:
-        is_multimodal = input_ids == placeholder_token_id
-    return _merge_multimodal_embeddings(inputs_embeds, is_multimodal, multimodal_embeddings)
+# The cumsum-gather merge is shared infrastructure; these families each had
+# their own copy of it. `BaseVisionLanguageModule.merge_multimodal_embeddings`
+# is the same algorithm, so bind the module-level name to it rather than
+# restating it. Keeping the name means call sites (and importers) are unchanged.
+merge_multimodal_embeddings = BaseVisionLanguageModule.merge_multimodal_embeddings
 
 
 def rotate_half(x: Array) -> Array:
@@ -410,45 +344,25 @@ def apply_rotary_pos_emb_vision(q: Array, k: Array, cos: Array, sin: Array) -> t
     orig_k_dtype = k.dtype
     q, k = q.astype("f4"), k.astype("f4")
     cos, sin = jnp.expand_dims(cos, -2).astype("f4"), jnp.expand_dims(sin, -2).astype("f4")
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    # Rotate only the leading ``cos.shape[-1]`` channels and pass the tail
+    # through. The tower builds its tables as ``concatenate([f, f], -1)``, so
+    # ``rot_dim == head_dim`` and the tail is empty -- this is bit-identical to
+    # rotating the whole tensor (verified 0.000e+00 on that path). Slicing
+    # explicitly is what lets the same function serve a half-width ``cos``,
+    # where multiplying the full tensor raises a broadcasting error instead.
+    rot_dim = cos.shape[-1]
+    q_rot, q_pass = q[..., :rot_dim], q[..., rot_dim:]
+    k_rot, k_pass = k[..., :rot_dim], k[..., rot_dim:]
+    q_embed = jnp.concatenate([(q_rot * cos) + (rotate_half(q_rot) * sin), q_pass], axis=-1)
+    k_embed = jnp.concatenate([(k_rot * cos) + (rotate_half(k_rot) * sin), k_pass], axis=-1)
     q_embed = q_embed.astype(orig_q_dtype)
     k_embed = k_embed.astype(orig_k_dtype)
     return q_embed, k_embed
 
 
-def create_attention_mask(cu_seqlens: Array, seq_length: int, dtype: jnp.dtype) -> Array:
-    """Create block-diagonal attention mask from cumulative sequence lengths.
-
-    Vision-tower utility that turns a packed batch of variable-length
-    sequences (described by ``cu_seqlens``) into an additive attention
-    bias where positions only attend within their own segment. Uses a
-    vectorised computation so the result is fully traceable under JAX
-    transformations (``jit``, ``vmap``, etc.).
-
-    Args:
-        cu_seqlens: Cumulative sequence lengths of shape
-            ``(num_segments + 1,)``; segment ``i`` spans the half-open
-            range ``[cu_seqlens[i], cu_seqlens[i + 1])``.
-        seq_length: Total packed-sequence length (``cu_seqlens[-1]``).
-        dtype: Output dtype; ``jnp.finfo(dtype).min`` is used as the
-            mask-out value (additive bias on logits).
-
-    Returns:
-        Array of shape ``(1, seq_length, seq_length)`` containing
-        ``0.0`` for in-segment pairs and ``finfo(dtype).min`` for
-        cross-segment pairs.
-    """
-    positions = jnp.arange(seq_length)
-    starts = cu_seqlens[:-1]
-    ends = cu_seqlens[1:]
-    in_segment = (positions[:, None] >= starts[None, :]) & (positions[:, None] < ends[None, :])
-
-    segment_ids = jnp.argmax(in_segment.astype(jnp.int32), axis=-1)
-    same_segment = segment_ids[:, None] == segment_ids[None, :]
-    attention_mask = jnp.where(same_segment, 0.0, jnp.finfo(dtype).min).astype(dtype)
-
-    return attention_mask[None, :, :]
+# The packed-vision block-diagonal mask is shared infrastructure; this family
+# had its own copy. Bind the module-level name so call sites are unchanged.
+create_attention_mask = block_diagonal_bias
 
 
 class Qwen3VLVisionPatchEmbed(spx.Module):
@@ -1356,7 +1270,11 @@ class Qwen3VLTextAttention(UnifiedAttention):
             layer_idx=layer_idx,
             attention_type="standard",
             causal=True,
-            sliding_window=config.sliding_window if config.use_sliding_window else None,
+            sliding_window=(
+                config.sliding_window
+                if config.use_sliding_window and config.layer_types[layer_idx] == "sliding_attention"
+                else None
+            ),
             use_qk_norm=True,
         )
 

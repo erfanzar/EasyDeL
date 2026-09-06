@@ -466,6 +466,8 @@ def should_dequantize_rhs_before_matmul(
 def inner_kernel(
     tiled_lhs_ref: jax.Array,
     tiled_rhs_ref: RhsRef,
+    tiled_output_row_scale_ref: jax.Array | None,
+    tiled_output_channel_scale_ref: jax.Array | None,
     tiled_out_ref: jax.Array,
     partial_out_ref: jax.Array,
     acc_ref: jax.Array,
@@ -494,6 +496,8 @@ def inner_kernel(
     Args:
         tiled_lhs_ref: Current LHS tile in VMEM.
         tiled_rhs_ref: Current RHS tile bundle (weight + optional scale/bias).
+        tiled_output_row_scale_ref: Optional float32 sublane-aligned row tile.
+        tiled_output_channel_scale_ref: Optional float32 per-group channel tile.
         tiled_out_ref: Output tile in VMEM (written on the last K-step).
         partial_out_ref: VMEM scratch for sub-sublane partial rows.
         acc_ref: VMEM float32 accumulator ``[tile_m, tile_n]``.
@@ -505,13 +509,29 @@ def inner_kernel(
         tiled_lhs = tiled_lhs_ref.reshape(-1, cfgs.tiles.tile_k)[...]
         tiled_rhs = tiled_rhs_ref.get_weight()
         if cfgs.rhs_cfgs.should_bitcast:
-            tiled_rhs = pltpu.bitcast(tiled_rhs, cfgs.rhs_cfgs.dtype)
+            if cfgs.rhs_cfgs.dtype == jnp.int4 and cfgs.dims.size_k % 64:
+                # INT4 bitcast tails require unsupported packed mask vectors.
+                # Unpack the already loaded 32-bit words into INT8 in VMEM;
+                # persistent weights remain packed and K is not enlarged.
+                words = tiled_rhs.astype(jnp.int32)
+                parts = [((words >> (4 * i)) & 15) for i in range(8)]
+                codes = jnp.stack(parts, axis=1).reshape(-1, words.shape[-1])
+                tiled_rhs = ((codes ^ 8) - 8).astype(jnp.int8)
+            else:
+                tiled_rhs = pltpu.bitcast(tiled_rhs, cfgs.rhs_cfgs.dtype)
         rhs_tile_n = tiled_rhs.shape[1]
 
         valid_k = cfgs.dims.size_k % cfgs.tiles.tile_k
         if is_last_k_step and valid_k != 0:
-            mask_rhs = lax.broadcasted_iota(jnp.int32, tiled_rhs.shape, 0) < valid_k
-            tiled_rhs = jnp.where(mask_rhs, tiled_rhs, 0)
+            # DMA padding may contain NaNs. Mask lhs before computing its
+            # quantization scale: a zero rhs alone cannot make NaN * 0 safe.
+            mask_lhs = lax.broadcasted_iota(jnp.int32, tiled_lhs.shape, 1) < valid_k
+            tiled_lhs = jnp.where(mask_lhs, tiled_lhs, 0)
+            if tiled_rhs.dtype != jnp.int4:
+                mask_rhs = lax.broadcasted_iota(jnp.int32, tiled_rhs.shape, 0) < valid_k
+                tiled_rhs = jnp.where(mask_rhs, tiled_rhs, 0)
+            # INT4 has no NaN/Inf and Mosaic cannot mask packed INT4 vectors;
+            # lhs zeroing is sufficient for this finite storage dtype.
 
         acc_list = []
         if cfgs.lhs_cfgs.quant_dtype is None:
@@ -519,6 +539,9 @@ def inner_kernel(
             mxu_size = tpu_info.mxu_column_size
             rhs_qbs = cfgs.rhs_cfgs.quant_block_size
             lhs_dtype = tiled_lhs.dtype
+            # Already-quantized integer inputs require an integer MXU
+            # accumulator, even when the returned/outer accumulator is FP32.
+            dot_acc_dtype = jnp.int32 if jnp.issubdtype(lhs_dtype, jnp.integer) else jnp.float32
             # The MXU only accepts specific dtype pairs; on hardware without
             # native support for (lhs, rhs) — e.g. bf16 x f4E2M1FN, or
             # bf16 x f8 on chips with no fp8 units — feeding the pair directly
@@ -560,7 +583,7 @@ def inner_kernel(
                         jnp.matmul(
                             tiled_lhs,
                             tiled_rhs_lhs_dtype[:, start_n:end_n],
-                            preferred_element_type=jnp.float32,
+                            preferred_element_type=dot_acc_dtype,
                         ).astype(acc_ref.dtype)
                     )
             else:
@@ -576,7 +599,7 @@ def inner_kernel(
                         block_acc = jnp.matmul(
                             tiled_lhs[:, k_start:k_end],
                             tiled_rhs[k_start:k_end, start_n:end_n],
-                            preferred_element_type=jnp.float32,
+                            preferred_element_type=dot_acc_dtype,
                         ).astype(acc_ref.dtype)
 
                         if cfgs.rhs_cfgs.has_scale:
@@ -612,6 +635,10 @@ def inner_kernel(
 
                 acc_n = jnp.zeros((cfgs.tiles.tile_m, col_size), dtype=acc_ref.dtype)
                 for start_k in range(0, cfgs.tiles.tile_k, q_block_size):
+                    if is_last_k_step and valid_k != 0 and start_k >= valid_k:
+                        # Entirely padded blocks have no valid rhs scale.
+                        # Do not read DMA padding or multiply zero by its NaN.
+                        continue
                     end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)
 
                     block_lhs = tiled_lhs[:, start_k:end_k]
@@ -655,6 +682,12 @@ def inner_kernel(
                 acc += tiled_rhs_bias.astype(acc.dtype)
 
             acc = apply_act_fn(acc, cfgs.fuse_act)
+            if tiled_output_row_scale_ref is not None:
+                # Scale only the complete integer contraction, in this order.
+                acc = acc.astype(jnp.float32)
+                row_scale = tiled_output_row_scale_ref[...].reshape(cfgs.tiles.tile_m, -1)[:, :1]
+                acc = acc * row_scale
+                acc = acc * tiled_output_channel_scale_ref[...]
 
             gm_id = pl.program_id(1)
             m_start = metadata_ref.gm_id_to_m_offset[gm_id]
@@ -670,7 +703,17 @@ def inner_kernel(
             tiled_out_ref[...] = acc_masked.astype(tiled_out_ref.dtype)
 
             partial_out_zeros = jnp.zeros_like(partial_out_ref)
-            tiled_out_ref[0] += jnp.where(gm_id == 0, partial_out_zeros, partial_out_ref[...])
+            if tiled_output_row_scale_ref is not None:
+                # Only preceding owned rows come from the previous group.
+                # Adding masked +0 would destroy a valid negative zero.
+                preceding_rows = lax.broadcasted_iota(jnp.int32, partial_out_ref.shape, 0) < m_start_local
+                tiled_out_ref[0] = jnp.where(
+                    (gm_id != 0) & preceding_rows,
+                    partial_out_ref[...],
+                    tiled_out_ref[0],
+                )
+            else:
+                tiled_out_ref[0] += jnp.where(gm_id == 0, partial_out_zeros, partial_out_ref[...])
 
             last_row = m_end_local // cfgs.dims.size_lhs_sublane
             partial_out_ref[...] = jnp.where(
@@ -759,13 +802,15 @@ def fill_metadata(
 
         group_id = lhs_group_id - group_offset
         group_size = lhs_group_sizes_ref[lhs_group_id]
-        end_m_offset = start_m_offset + group_size
 
         local_offset = start_m_offset % cfgs.dims.size_lhs_sublane
         aligned_group_size = group_size + local_offset
         curr_num_gm = pl.cdiv(aligned_group_size, cfgs.tiles.tile_m)
 
         should_process = jnp.logical_and(group_size > 0, group_id >= 0)
+        # Rows only advance for groups this shard actually processes; groups
+        # before ``group_offset`` (and empty groups) must not shift offsets.
+        end_m_offset = jnp.where(should_process, start_m_offset + group_size, start_m_offset)
         curr_num_gm = jnp.where(should_process, curr_num_gm, 0)
         next_num_gm = num_gm + curr_num_gm
 
@@ -892,6 +937,8 @@ def kernel_main(
     group_offset_ref: jax.Array,
     lhs_ref: jax.Array,
     rhs_ref: WeightsRef,
+    output_row_scale_ref: jax.Array | None,
+    output_channel_scale_ref: jax.Array | None,
     out_ref: jax.Array,
     partial_out_ref: jax.Array,
     acc_ref: jax.Array,
@@ -925,6 +972,9 @@ def kernel_main(
         group_offset_ref: Scalar-prefetch int32 array ``[1]``.
         lhs_ref: HBM LHS tensor ``[size_m, size_k]``.
         rhs_ref: HBM RHS bundle (weight + optional scale/bias).
+        output_row_scale_ref: Optional HBM float32 row scales ``[size_m, 1]``.
+        output_channel_scale_ref: Optional HBM float32 channel scales
+            ``[size_group, 1, size_n]``.
         out_ref: HBM output tensor ``[size_m, aligned_n]``.
         partial_out_ref: VMEM scratch for partial sublane rows
             ``[size_lhs_sublane, tile_n]``.
@@ -960,17 +1010,32 @@ def kernel_main(
         rhs_ref = FusedWeightsRef(gate=rhs_ref, up=rhs_up_ref)
         rhs_spec = FusedWeightsRef(gate=rhs_spec, up=rhs_spec)
 
+    output_row_scale_spec = output_channel_scale_spec = None
+    output_row_scale_in = None
+    if output_row_scale_ref is not None:
+        index_map = IndexMaps(metadata_ref, cfgs)
+        row_width = output_row_scale_ref.shape[-1]
+        output_row_scale_spec = pl.BlockSpec(
+            (pl.BoundedSlice(cfgs.tiles.tile_m // cfgs.dims.size_lhs_sublane), cfgs.dims.size_lhs_sublane, row_width),
+            lambda n_id, gm_id, k_id: index_map.lhs_index_map(n_id, gm_id, 0),
+        )
+        output_channel_scale_spec = pl.BlockSpec(
+            (None, 1, cfgs.tiles.tile_n),
+            index_map.rhs_bias_index_map,
+        )
+        output_row_scale_in = output_row_scale_ref.reshape(-1, cfgs.dims.size_lhs_sublane, row_width)
+
     pipeline_fn = pltpu.emit_pipeline(
         functools.partial(inner_kernel, cfgs=cfgs),
         grid=(num_n, num_gm, num_k),
-        in_specs=(lhs_spec, rhs_spec),
+        in_specs=(lhs_spec, rhs_spec, output_row_scale_spec, output_channel_scale_spec),
         out_specs=out_spec,
     )
 
     lhs_in = lhs_ref.reshape(-1, cfgs.dims.size_lhs_sublane, lhs_ref.shape[-1])
     out_in = out_ref.reshape(-1, cfgs.dims.size_lhs_sublane, out_ref.shape[-1])
     scratches = [partial_out_ref, acc_ref, metadata_ref]
-    pipeline_fn(lhs_in, rhs_ref, out_in, scratches=scratches)
+    pipeline_fn(lhs_in, rhs_ref, output_row_scale_in, output_channel_scale_ref, out_in, scratches=scratches)
 
     if cfgs.zero_init:
         zero_out_end(out_ref, semaphore_ref, zero_size, dims=cfgs.dims)
@@ -1104,6 +1169,8 @@ def validate_inputs(
         ValueError: When ``fuse_act`` N-divisibility constraint is not met.
     """
     size_m = lhs.shape[0]
+    if size_m < 1:
+        raise ValueError("grouped_matmulv3 requires at least one LHS row")
     size_group, size_k, size_n = rhs.shape
     size_lhs_group = group_sizes.shape[0]
 
@@ -1114,6 +1181,7 @@ def validate_inputs(
         assert rhs_bias.shape == (size_group, 1, size_n)
     if rhs_scale is not None:
         num_quant_blocks = rhs_scale.shape[1]
+        assert num_quant_blocks > 0, "rhs_scale must have at least one quant block"
         assert rhs_scale.shape == (size_group, num_quant_blocks, 1, size_n)
         assert size_k % num_quant_blocks == 0
 
@@ -1236,6 +1304,8 @@ def make_gmm_configs(
         ``GmmConfigs`` dataclass ready to pass to ``kernel_main``.
     """
     dims = validate_inputs(lhs, rhs, rhs_scale, rhs_bias, group_sizes, group_offset, fuse_act)
+    if jnp.issubdtype(lhs.dtype, jnp.integer) and (rhs_scale is not None or rhs_bias is not None):
+        raise ValueError("integer lhs requires applying RHS scales and bias outside the raw grouped dot")
 
     if rhs_scale is not None:
         has_scale = True
@@ -1353,6 +1423,8 @@ def grouped_matmulv3_pallas_impl(
     zero_initialize: bool = True,
     fuse_act: str | None = None,
     interpret: bool = False,
+    output_row_scale: jax.Array | None = None,
+    output_channel_scale: jax.Array | None = None,
 ) -> jax.Array:
     """Core TPU Pallas grouped matmul v3 using ``pltpu.emit_pipeline``.
 
@@ -1407,12 +1479,48 @@ def grouped_matmulv3_pallas_impl(
             ``"swigluoai"``.  When set, ``rhs`` must have
             ``size_n == 2 * actual_output_n`` (gate + up concatenated).
         interpret: Run in Pallas interpreter mode (for debugging only).
+        output_row_scale: Optional dynamic float32 ``[size_m, 1]`` scale.
+            Must be supplied together with ``output_channel_scale``. Requires
+            int8 LHS, int4/int8 RHS, int32 accumulation (also the default for
+            this epilogue), and explicit float32 or bfloat16 output dtype.
+            Cannot be combined with ``rhs_scale``, ``rhs_bias``, or ``fuse_act``.
+        output_channel_scale: Optional dynamic float32
+            ``[size_group, 1, size_n]`` scale. After the complete raw integer
+            K reduction, computes ``(acc.astype(float32) * output_row_scale)
+            * output_channel_scale`` before the final output cast. Masked
+            rows stay zero; owned NaNs and signed zeros are preserved.
+            Both output scales default to None, leaving the original path
+            unchanged.
 
     Returns:
         Output tensor ``[size_m, out_size_n]`` where ``out_size_n == size_n``
         (or ``size_n // 2`` when ``fuse_act`` is not None).
     """
     del precision
+
+    if (output_row_scale is None) != (output_channel_scale is None):
+        raise ValueError("output_row_scale and output_channel_scale must be provided together")
+    if output_row_scale is not None:
+        if rhs_scale is not None or rhs_bias is not None or fuse_act is not None:
+            raise ValueError("output scaling cannot be combined with rhs_scale, rhs_bias, or fuse_act")
+        if lhs.ndim != 2 or rhs.ndim != 3:
+            raise ValueError("output scaling requires rank-2 lhs and rank-3 rhs")
+        if output_row_scale.shape != (lhs.shape[0], 1):
+            raise ValueError("output_row_scale must have shape [M, 1]")
+        if output_channel_scale.shape != (rhs.shape[0], 1, rhs.shape[2]):
+            raise ValueError("output_channel_scale must have shape [E, 1, N]")
+        if output_row_scale.dtype != jnp.float32 or output_channel_scale.dtype != jnp.float32:
+            raise ValueError("output scales must have dtype float32")
+        if lhs.dtype != jnp.int8 or rhs.dtype not in (jnp.int4, jnp.int8):
+            raise ValueError("output scaling requires int8 lhs and int4 or int8 rhs")
+        if acc_dtype is not None and jnp.dtype(acc_dtype) != jnp.dtype(jnp.int32):
+            raise ValueError("output scaling requires int32 accumulation")
+        acc_dtype = jnp.int32
+        if preferred_element_type is None or jnp.dtype(preferred_element_type) not in (
+            jnp.dtype(jnp.float32),
+            jnp.dtype(jnp.bfloat16),
+        ):
+            raise ValueError("output scaling requires a float32 or bfloat16 preferred_element_type")
 
     if group_offset is None:
         group_offset = jnp.array([0], dtype=jnp.int32)
@@ -1461,6 +1569,9 @@ def grouped_matmulv3_pallas_impl(
     ]
 
     num_lanes = pltpu.get_tpu_info().num_lanes
+    if output_row_scale is not None:
+        # Bounded pipeline DMAs require a lane-aligned minor dimension.
+        output_row_scale = jnp.broadcast_to(output_row_scale, (dims.size_m, num_lanes))
     if cfgs.zero_init:
         target_zero_ref_bytes = 2 * 1024 * 1024
         out_bytes = jnp.dtype(cfgs.out_dtype).itemsize
@@ -1490,6 +1601,8 @@ def grouped_matmulv3_pallas_impl(
                     scale=rhs_scale_spec,
                     bias=rhs_bias_spec,
                 ),
+                pl.BlockSpec(memory_space=pltpu.HBM) if output_row_scale is not None else None,
+                pl.BlockSpec(memory_space=pltpu.HBM) if output_channel_scale is not None else None,
             ],
             out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
             scratch_shapes=scratch_shapes,
@@ -1502,7 +1615,7 @@ def grouped_matmulv3_pallas_impl(
         cost_estimate=get_cost_estimate(cfgs),
         metadata=get_metadata(cfgs),
         interpret=interpret,
-    )(group_sizes, group_offset, lhs, rhs_weights)[:, : cfgs.out_size_n]
+    )(group_sizes, group_offset, lhs, rhs_weights, output_row_scale, output_channel_scale)[:, : cfgs.out_size_n]
 
 
 __all__ = (

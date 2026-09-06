@@ -399,8 +399,7 @@ class OpenELMMultiHeadCausalAttention(UnifiedAttention):
             mask_info=mask_info,
         )
 
-        softmax_aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
-        softmax_aux = getattr(softmax_aux, "value", softmax_aux)
+        softmax_aux = self._softmax_aux()
 
         attentions: AttentionLayerOutput = self.attention_performer.forward(
             query_states=query_states,

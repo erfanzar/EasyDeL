@@ -863,6 +863,52 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
         super().__init__()
         self.config = config
 
+    def _split_heads(self, hidden_states):
+        """Reshape ``[batch, seq, embed_dim]`` into ``[batch, seq, heads, head_dim]``.
+
+        Requires ``self.num_heads`` and ``self.head_dim``. Seven encoder-style
+        attention layers carried this exact body; note that
+        :class:`UnifiedAttention` deliberately overrides ``_merge_heads`` with a
+        different implementation, so decoder layers inheriting through it keep
+        that one.
+
+        Args:
+            hidden_states: Tensor shaped ``[batch, seq, embed_dim]``.
+
+        Returns:
+            Tensor shaped ``[batch, seq, num_heads, head_dim]``.
+        """
+        return hidden_states.reshape((*hidden_states.shape[:2], self.num_heads, self.head_dim))
+
+    def _merge_heads(self, hidden_states):
+        """Collapse ``[batch, seq, heads, head_dim]`` back to ``[batch, seq, embed_dim]``.
+
+        Requires ``self.embed_dim``.
+
+        Args:
+            hidden_states: Tensor shaped ``[batch, seq, num_heads, head_dim]``.
+
+        Returns:
+            Tensor shaped ``[batch, seq, embed_dim]``.
+        """
+        return hidden_states.reshape((*hidden_states.shape[:2], self.embed_dim))
+
+    def _softmax_aux(self) -> JArray | None:
+        """Return this layer's attention-sink logits, or ``None``.
+
+        Sinks are an optional learned per-head logit appended to the softmax
+        denominator. Layers spell the attribute either ``sinks`` (GPT-OSS,
+        DeepSeek-V4) or ``softmax_aux``, and it may be a raw array or a
+        parameter wrapper, so the lookup has to try both names and unwrap
+        ``.value``. That four-way probe was copy-pasted at a dozen call sites;
+        it lives here once instead.
+
+        Returns:
+            The unwrapped sink array, or ``None`` when the layer has no sinks.
+        """
+        aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
+        return getattr(aux, "value", aux)
+
     @staticmethod
     def apply_complex_rotary(
         xq: Float[JArray, "... seq heads dim"],
@@ -1617,3 +1663,35 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
             key = einops.repeat(key, "b s h d -> b s (h r) d", r=num_reps)
             value = einops.repeat(value, "b s h d -> b s (h r) d", r=num_reps)
         return key, value
+
+
+def block_diagonal_bias(cu_seqlens, seq_length: int, dtype):
+    """Additive block-diagonal attention bias from cumulative sequence lengths.
+
+    Vision towers pack several images into one flat token sequence and rely on
+    an additive mask to stop attention crossing image boundaries. Given
+    ``cu_seqlens`` (the usual exclusive-prefix offsets, ``[0, n0, n0+n1, ...]``),
+    positions inside the same segment get ``0.0`` and everything else gets
+    ``finfo(dtype).min``.
+
+    Four families spelled this identically under three different names
+    (``create_attention_mask``, ``_create_block_diagonal_bias``,
+    ``_block_diagonal_bias``).
+
+    Args:
+        cu_seqlens: Cumulative sequence lengths, shape ``(num_segments + 1,)``.
+        seq_length: Total packed sequence length.
+        dtype: Output dtype; also selects the mask-out sentinel.
+
+    Returns:
+        Additive bias of shape ``(1, seq_length, seq_length)``.
+    """
+    positions = jnp.arange(seq_length)
+    starts = cu_seqlens[:-1]
+    ends = cu_seqlens[1:]
+    in_segment = (positions[:, None] >= starts[None, :]) & (positions[:, None] < ends[None, :])
+    valid_position = jnp.any(in_segment, axis=-1)
+    segment_ids = jnp.argmax(in_segment.astype(jnp.int32), axis=-1)
+    same_segment = (segment_ids[:, None] == segment_ids[None, :]) & valid_position[:, None] & valid_position[None, :]
+    attention_mask = jnp.where(same_segment, 0.0, jnp.finfo(dtype).min).astype(dtype)
+    return attention_mask[None, :, :]

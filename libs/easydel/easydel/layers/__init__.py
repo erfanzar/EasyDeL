@@ -81,7 +81,7 @@ from .linears import (
     RowParallelMoELinear,
     eLoRA,
 )
-from .mlp import gated_mlp_forward
+from .mlp import clamped_swiglu, gated_mlp_forward, swiglu_oai
 from .moe import (
     BaseMoeModule,
     MoeFusedHooks,
@@ -112,6 +112,7 @@ from .quantization import (
     straight_through_nf4,
     straight_through_nvfp8,
 )
+from .residual import GatedResidual, expand_streams, inject_streams
 from .rotary import (
     DeepseekScalingRotaryEmbedding,
     DynamicNTKScalingRotaryEmbedding,
@@ -136,9 +137,11 @@ from .rotary import (
     get_inv_frequencies,
     get_rope,
 )
+from .sparse_attention import BlockTopKIndexer
 
 __all__ = [
     "BaseMoeModule",
+    "BlockTopKIndexer",
     "ColumnParallelLinear",
     "ColumnParallelLinearQuantized",
     "ColumnParallelMoELinear",
@@ -150,6 +153,7 @@ __all__ = [
     "FusedColumnLayout",
     "FusedExpertLayout",
     "FusedSegment",
+    "GatedResidual",
     "LinearScalingRotaryEmbedding",
     "Llama3RotaryEmbedding",
     "MoEMethods",
@@ -177,6 +181,7 @@ __all__ = [
     "build_fused_gate_up_projection",
     "build_fused_qkv_projection",
     "build_quantization_provider",
+    "clamped_swiglu",
     "compute_basic_frequencies",
     "compute_basic_inv_frequencies",
     "compute_deepseek_frequencies",
@@ -191,6 +196,7 @@ __all__ = [
     "dense_qkv_layout",
     "eLoRA",
     "estimate_moe_layout",
+    "expand_streams",
     "gate_up_fusion_reform_param",
     "gated_mlp_forward",
     "get_frequencies",
@@ -198,6 +204,7 @@ __all__ = [
     "get_moe_partition_spec",
     "get_rope",
     "hf_per_expert_swiglu_reform_param",
+    "inject_streams",
     "interleave_segments_last_axis",
     "interleaved_fusion_reform_param",
     "keep_interleaved_segments_last_axis",
@@ -220,6 +227,7 @@ __all__ = [
     "straight_through_mxfp8",
     "straight_through_nf4",
     "straight_through_nvfp8",
+    "swiglu_oai",
     "tensor_parallel_axis",
     "tensor_parallel_size",
     "torch_deinterleave_axis_segments_for_tp",

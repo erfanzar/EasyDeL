@@ -691,133 +691,13 @@ class DeepseekV2Attention(UnifiedAttention):
         precision: jax.lax.Precision,
         rngs: spx.Rngs,
     ):
-        """Define MLA-specific network structure.
+        """Build the MLA projection stack.
 
-        Sets up query projection (with optional LoRA), key-value compression
-        projections with layer normalization, and output projection layers.
-
-        Args:
-            config (DeepseekV2Config): Model configuration.
-            dtype (jnp.dtype): Data type for computation.
-            param_dtype (jnp.dtype): Data type for parameters.
-            precision (jax.lax.Precision): Numerical precision.
-            rngs (spx.Rngs): Random number generator state.
+        The body lived here in four families with byte-identical contents; it
+        is now :meth:`UnifiedAttention._build_mla_projections`, driven by this
+        class's ``projection_mapping`` so the HF attribute names are unchanged.
         """
-
-        # Query projection with optional LoRA
-        if not self.use_mla_lora:
-            setattr(
-                self,
-                self.projection_mapping["mla_q_proj"],
-                ColumnParallelLinear(
-                    config.hidden_size,
-                    config.num_attention_heads * self.q_head_dim,
-                    rngs=rngs,
-                    use_bias=False,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                    precision=precision,
-                ),
-            )
-        else:
-            setattr(
-                self,
-                self.projection_mapping["mla_q_a_proj"],
-                ColumnParallelLinear(
-                    config.hidden_size,
-                    config.q_lora_rank,
-                    rngs=rngs,
-                    use_bias=config.attention_bias,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                    precision=precision,
-                ),
-            )
-            setattr(
-                self,
-                self.projection_mapping["mla_q_a_layernorm"],
-                RMSNorm(
-                    config.q_lora_rank,
-                    eps=config.rms_norm_eps,
-                    rngs=rngs,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                ),
-            )
-            setattr(
-                self,
-                self.projection_mapping["mla_q_b_proj"],
-                ColumnParallelLinear(
-                    config.q_lora_rank,
-                    config.num_attention_heads * self.q_head_dim,
-                    rngs=rngs,
-                    use_bias=False,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                    precision=precision,
-                ),
-            )
-
-        setattr(
-            self,
-            self.projection_mapping["mla_kv_a_proj_with_mqa"],
-            ColumnParallelLinear(
-                config.hidden_size,
-                config.kv_lora_rank + config.qk_rope_head_dim,
-                rngs=rngs,
-                use_bias=config.attention_bias,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                precision=precision,
-            ),
-        )
-        setattr(
-            self,
-            self.projection_mapping["mla_kv_a_layernorm"],
-            RMSNorm(
-                config.kv_lora_rank,
-                eps=config.rms_norm_eps,
-                rngs=rngs,
-                dtype=dtype,
-                param_dtype=param_dtype,
-            ),
-        )
-        setattr(
-            self,
-            self.projection_mapping["mla_kv_b_proj"],
-            ColumnParallelLinear(
-                config.kv_lora_rank,
-                config.num_attention_heads * (config.qk_nope_head_dim + config.v_head_dim),
-                rngs=rngs,
-                use_bias=False,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                precision=precision,
-            ),
-        )
-
-        setattr(
-            self,
-            self.projection_mapping["output_projection"],
-            RowParallelLinear(
-                config.num_attention_heads * self.v_head_dim,
-                config.hidden_size,
-                rngs=rngs,
-                use_bias=config.attention_bias,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                precision=precision,
-            ),
-        )
-
-        self.rotary = self._create_rotary(config, dtype)
-        self.attention_performer = self._create_attention_performer(config, rngs)
+        self._build_mla_projections(config, dtype, param_dtype, precision, rngs)
 
     def _create_attention_performer(self, config, rngs):
         """Create attention performer module with custom softmax scale.

@@ -363,28 +363,6 @@ class CLIPAttention(AttentionModule):
     def reform_param(self):
         return self.qkv_proj.build_reform_param("qkv_proj", config=self.config)
 
-    def _split_heads(self, hidden_states):
-        """Split hidden states into multiple attention heads.
-
-        Args:
-            hidden_states: Input tensor of shape (batch, seq_len, embed_dim).
-
-        Returns:
-            Reshaped tensor of shape (batch, seq_len, num_heads, head_dim).
-        """
-        return hidden_states.reshape((*hidden_states.shape[:2], self.num_heads, self.head_dim))
-
-    def _merge_heads(self, hidden_states):
-        """Merge attention heads back into hidden states.
-
-        Args:
-            hidden_states: Input tensor of shape (batch, seq_len, num_heads, head_dim).
-
-        Returns:
-            Merged tensor of shape (batch, seq_len, embed_dim).
-        """
-        return hidden_states.reshape((*hidden_states.shape[:2], self.embed_dim))
-
     def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],

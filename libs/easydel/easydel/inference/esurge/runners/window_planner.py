@@ -140,8 +140,9 @@ class WindowPlanner:
             buckets = sorted({int(b) for b in user_buckets if int(b) > 0})
         else:
             buckets = WindowPlanner.get_request_paddings(min_input_pad, max_num_seqs)
-        if not buckets or buckets[-1] < max_num_seqs:
+        if max_num_seqs not in buckets:
             buckets.append(max_num_seqs)
+            buckets.sort()
         return buckets
 
     def get_current_bucket(self, num_reqs: int, active_buckets: list[int] | None = None) -> int:

@@ -701,6 +701,108 @@ def grouped_matmul(
     )
 
 
+class GroupedMatmulChannelwise(Kernel[GroupedMatmulConfig, Array]):
+    """Explicit CHANNELWISE dispatch using the standard kernel/executor contract."""
+
+    def __init__(self):
+        super().__init__(op_id="grouped_matmul_channelwise")
+
+    def get_impl(self, cfg: GroupedMatmulConfig):
+        return kernel_registry.get(self.op_id, platform=cfg.platform, backend=cfg.backend)
+
+    def heuristic_cfg(self, inv):
+        return GroupedMatmulConfig(block_m=128, block_k=128, block_n=128, platform="xla", backend="any")
+
+    def candidate_cfgs(self, inv):
+        return [self.heuristic_cfg(inv)]
+
+    def run(
+        self,
+        lhs,
+        codes,
+        scales,
+        group_sizes,
+        *,
+        activation_bits=16,
+        preferred_element_type=jnp.bfloat16,
+        tiling=None,
+        cfg: GroupedMatmulConfig,
+    ):
+        return self.get_impl(cfg)(
+            lhs,
+            codes,
+            scales,
+            group_sizes,
+            activation_bits=activation_bits,
+            preferred_element_type=preferred_element_type,
+            tiling=tiling,
+        )
+
+
+_grouped_matmul_channelwise_executor = Executor(
+    ConfigSelectorChain(cache=ConfigCache(), policy=AutotunePolicy(allow_autotune=False))
+)
+
+
+def grouped_matmul_channelwise(
+    lhs: Array,
+    codes: Array,
+    scales: Array,
+    group_sizes: Array,
+    *,
+    activation_bits: int = 16,
+    preferred_element_type: DTypeLike = jnp.bfloat16,
+    tiling: tuple[int, int, int] | None = None,
+    platform: Literal["xla", "pallas"] = "xla",
+) -> Array:
+    """Explicit W4A16/W8A16/W4A4/W8A8 CHANNELWISE grouped matmul.
+
+    Codes are signed int4/int8 [E,K,N], scales floating [E,1,N], lhs [M,K].
+    Group sizes [E] must be nonnegative and sum to at most M. Empty groups
+    and unassigned trailing padding rows are valid; padding outputs are zero.
+    A16 performs no activation quantization. A4 requires int4 codes; A8 also
+    accepts int4 codes via exact upcast. Output defaults to bf16.
+    Integer codes are frozen; activation AD uses a represented-weight STE,
+    while scale AD uses the actual forward (possibly quantized) activations.
+    ``platform='xla'`` remains the default for every mode. Explicit
+    ``platform='pallas'`` streams integer weights on TPU and requires BF16
+    input. A16 accumulates in FP32; A4/A8 use row quantization followed by
+    INT8 arithmetic with INT32 accumulation. A4 values are widened exactly;
+    RHS INT4 storage remains packed in HBM. Scales apply after the dot.
+    Tiling is (M,K,N): an XLA hint or explicit Pallas tiles. A16 uses full K
+    on measured decode matrix families; A4/A8 choose M=32 and full K subject
+    to the RHS buffer budget. Explicit tiles override these heuristics.
+    Pallas AD uses the XLA reference for activation/scale derivatives and
+    may materialize floating weights: no backward memory saving is promised.
+    There is no automatic mode or platform selection.
+    """
+    if platform not in ("xla", "pallas"):
+        raise ValueError("platform must be 'xla' or 'pallas'")
+    kernel = GroupedMatmulChannelwise()
+    cfg = (
+        kernel.heuristic_cfg(None)
+        if platform == "xla"
+        else GroupedMatmulConfig(
+            block_m=16,
+            block_k=512,
+            block_n=1024,
+            platform="pallas",
+            backend="tpu",
+        )
+    )
+    return _grouped_matmul_channelwise_executor(
+        kernel,
+        lhs=lhs,
+        codes=codes,
+        scales=scales,
+        group_sizes=group_sizes,
+        activation_bits=activation_bits,
+        preferred_element_type=preferred_element_type,
+        tiling=tiling,
+        _cfg=cfg,
+    )
+
+
 def grouped_matmul_w8a8(
     lhs: Array,
     rhs_codes: Array,

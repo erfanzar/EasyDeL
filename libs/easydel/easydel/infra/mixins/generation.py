@@ -112,6 +112,41 @@ if tp.TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+def _resolve_recurrent_cache_dtype(text_config, kv_cache_dtype):
+    """Resolve state-cache dtype independently from attention KV storage.
+
+    Hybrid models may safely use narrow attention KV pages while their
+    recurrent convolution/SSM state continues to use a compute-compatible
+    dtype.  Without an explicit override, preserve the historical behavior
+    and reuse the KV-cache dtype.
+    """
+    dtype = getattr(text_config, "recurrent_cache_dtype", None)
+    if dtype is None:
+        dtype = getattr(text_config, "mamba_ssm_dtype", None)
+    if dtype is None:
+        dtype = kv_cache_dtype
+    if isinstance(dtype, str):
+        dtype_name = dtype
+        dtype = getattr(jnp, dtype_name, None)
+        if dtype is None:
+            raise ValueError(f"Unsupported recurrent_cache_dtype: {dtype_name!r}")
+    return jnp.dtype(dtype)
+
+
+def _is_cache_view_subclass(view_class: tp.Any, base_class: type) -> bool:
+    """Return whether a discovered cache view is ``base_class`` or a subclass."""
+    return isinstance(view_class, type) and issubclass(view_class, base_class)
+
+
+def _is_standard_ragged_view_class(view_class: tp.Any) -> bool:
+    """Recognize standard ragged-page views, including model-specific subclasses."""
+    from easydel.caching import MLARaggedPagesCacheView, RaggedPagesCacheView
+
+    return _is_cache_view_subclass(view_class, RaggedPagesCacheView) and not _is_cache_view_subclass(
+        view_class, MLARaggedPagesCacheView
+    )
+
+
 def _normalize_attn_mechanism_value(attn_mechanism: tp.Any) -> str | None:
     """Normalize an attention-mechanism field to a plain string.
 
@@ -260,7 +295,8 @@ def _is_kv_attention_layer_type(layer_type: tp.Any) -> bool:
 
     Returns:
         bool: ``True`` for ``"full"``, ``"sliding"``, ``"attention"``,
-        ``"hybrid"``, and ``"parallel_hybrid"`` family labels.
+        ``"hybrid"``, ``"parallel_hybrid"``, and ``"qwen_sparse_attention"``
+        family labels.
     """
     layer_type_norm = str(layer_type).lower()
     return (
@@ -269,6 +305,7 @@ def _is_kv_attention_layer_type(layer_type: tp.Any) -> bool:
         or layer_type_norm == "attention"
         or layer_type_norm == "hybrid"
         or layer_type_norm == "parallel_hybrid"
+        or layer_type_norm == "qwen_sparse_attention"
     )
 
 
@@ -493,8 +530,8 @@ def _create_mixed_standard_ragged_page_cache_configs(
     from easydel.caching.ragged_page.cache import (
         _canonicalize_dtype,
         _dtype_to_string,
-        _pad_v3_kv_heads_to_shards,
         _resolve_ragged_cache_layout,
+        _resolve_v3_kv_head_layout,
         cdiv,
         get_num_slices_per_kv_cache_update_page,
         get_page_size_bytes,
@@ -511,11 +548,15 @@ def _create_mixed_standard_ragged_page_cache_configs(
     effective_kv_head_shards = physical_kv_head_shards
     storage_geometries: dict[int, tuple[int, int]] = {}
     for layer_idx, (num_kv_heads, head_dim) in geometries.items():
-        storage_num_kv_heads = (
-            _pad_v3_kv_heads_to_shards(int(num_kv_heads), physical_kv_head_shards)
-            if version == "v3"
-            else int(num_kv_heads)
-        )
+        if version == "v3":
+            _layout_dtype, _layout_shards, storage_num_kv_heads = _resolve_v3_kv_head_layout(
+                kvdtype,
+                logical_num_kv_heads=int(num_kv_heads),
+                k_headdim=int(head_dim),
+                physical_kv_head_shards=physical_kv_head_shards,
+            )
+        else:
+            storage_num_kv_heads = int(num_kv_heads)
         if storage_num_kv_heads != int(num_kv_heads):
             logger.info(
                 "Padding mixed ragged-page v3 layer %s KV heads from %s to %s to shard the cache across %s TP shards.",
@@ -528,12 +569,11 @@ def _create_mixed_standard_ragged_page_cache_configs(
 
     if version == "v3":
         for num_kv_heads, head_dim in sorted(set(storage_geometries.values())):
-            next_kvdtype, next_kv_head_shards = _resolve_ragged_cache_layout(
+            next_kvdtype, next_kv_head_shards, _storage_heads = _resolve_v3_kv_head_layout(
                 kvdtype,
-                version=version,
-                num_kv_heads=int(num_kv_heads),
+                logical_num_kv_heads=int(num_kv_heads),
                 k_headdim=int(head_dim),
-                kv_head_shards=physical_kv_head_shards,
+                physical_kv_head_shards=physical_kv_head_shards,
             )
             if next_kv_head_shards == 1:
                 kvdtype = requested_kvdtype
@@ -1463,7 +1503,7 @@ class EasyGenerationMixin:
         cache_view_mapping_by_slot = self.get_operations_cache_view_by_slot()
         indices: list[int] = []
         for layer_idx, view_class in cache_view_mapping.items():
-            if view_class is RaggedPagesCacheView:
+            if _is_standard_ragged_view_class(view_class):
                 indices.append(int(layer_idx))
                 continue
             if view_class is ParallelHybridCacheView and RaggedPagesCacheView in set(
@@ -2566,13 +2606,8 @@ class EasyGenerationMixin:
             attention_view_classes = {
                 cls
                 for cls in slots.values()
-                if cls
-                in (
-                    TransformerCacheView,
-                    RaggedPagesCacheView,
-                    MLARaggedPagesCacheView,
-                    UnifiedAttentionCacheView,
-                )
+                if cls in (TransformerCacheView, MLARaggedPagesCacheView, UnifiedAttentionCacheView)
+                or _is_standard_ragged_view_class(cls)
             }
             if len(attention_view_classes) != 1:
                 raise ValueError(
@@ -2586,16 +2621,16 @@ class EasyGenerationMixin:
         needs_unified = any(view_class is UnifiedAttentionCacheView for view_class in cache_view_mapping.values())
 
         for layer_idx, view_class in cache_view_mapping.items():
-            if view_class is RaggedPagesCacheView:
-                needs_standard_ragged = True
-            elif view_class is MLARaggedPagesCacheView:
+            if view_class is MLARaggedPagesCacheView:
                 needs_mla_ragged = True
+            elif _is_standard_ragged_view_class(view_class):
+                needs_standard_ragged = True
             elif view_class is ParallelHybridCacheView:
                 attn_view_class = _resolve_parallel_hybrid_attention_view_class(layer_idx)
-                if attn_view_class is RaggedPagesCacheView:
-                    needs_standard_ragged = True
-                elif attn_view_class is MLARaggedPagesCacheView:
+                if attn_view_class is MLARaggedPagesCacheView:
                     needs_mla_ragged = True
+                elif _is_standard_ragged_view_class(attn_view_class):
+                    needs_standard_ragged = True
                 elif attn_view_class is UnifiedAttentionCacheView:
                     needs_unified = True
 
@@ -2604,20 +2639,20 @@ class EasyGenerationMixin:
         standard_ragged_layer_indices: list[int] = []
         unified_layer_indices: list[int] = []
         for layer_idx, view_class in cache_view_mapping.items():
-            if view_class is RaggedPagesCacheView:
+            if view_class is MLARaggedPagesCacheView:
+                num_mla_ragged_layers += 1
+            elif _is_standard_ragged_view_class(view_class):
                 num_standard_ragged_layers += 1
                 standard_ragged_layer_indices.append(int(layer_idx))
-            elif view_class is MLARaggedPagesCacheView:
-                num_mla_ragged_layers += 1
             elif view_class is UnifiedAttentionCacheView:
                 unified_layer_indices.append(int(layer_idx))
             elif view_class is ParallelHybridCacheView:
                 attn_view_class = _resolve_parallel_hybrid_attention_view_class(layer_idx)
-                if attn_view_class is RaggedPagesCacheView:
+                if attn_view_class is MLARaggedPagesCacheView:
+                    num_mla_ragged_layers += 1
+                elif _is_standard_ragged_view_class(attn_view_class):
                     num_standard_ragged_layers += 1
                     standard_ragged_layer_indices.append(int(layer_idx))
-                elif attn_view_class is MLARaggedPagesCacheView:
-                    num_mla_ragged_layers += 1
                 elif attn_view_class is UnifiedAttentionCacheView:
                     unified_layer_indices.append(int(layer_idx))
 
@@ -2815,21 +2850,21 @@ class EasyGenerationMixin:
                         layer_idx=idx,
                     )
                     views_config[idx] = config
-                elif view_class is RecurrentCacheView:
+                elif isinstance(view_class, type) and issubclass(view_class, RecurrentCacheView):
                     config = self.create_recurrent_cache_config(batch_size=batch_size)
                     views_config[idx] = config
                 elif view_class is KDACacheView:
                     config = self.create_kda_cache_config(batch_size=batch_size)
                     views_config[idx] = config
-                elif view_class is RaggedPagesCacheView:
-                    config = per_layer_standard_ragged_configs.get(idx, shared_ragged_config)
-                    if config is None:
-                        raise ValueError(f"Missing RaggedPagesCacheConfig for layer {idx}.")
-                    views_config[idx] = config
                 elif view_class is MLARaggedPagesCacheView:
                     if shared_mla_ragged_config is None:
                         raise ValueError(f"Missing MLARaggedPagesCacheConfig for layer {idx}.")
                     views_config[idx] = shared_mla_ragged_config
+                elif _is_standard_ragged_view_class(view_class):
+                    config = per_layer_standard_ragged_configs.get(idx, shared_ragged_config)
+                    if config is None:
+                        raise ValueError(f"Missing RaggedPagesCacheConfig for layer {idx}.")
+                    views_config[idx] = config
                 elif view_class is UnifiedAttentionCacheView:
                     views_config[idx] = per_layer_unified_configs.get(idx, shared_unified_config)
                 elif view_class is LightningCacheView:
@@ -2931,6 +2966,8 @@ class EasyGenerationMixin:
             dtype = getattr(text_config, "kvdtype", jnp.bfloat16)
             if isinstance(dtype, str):
                 dtype = getattr(jnp, dtype, jnp.bfloat16)
+
+        recurrent_cache_dtype = _resolve_recurrent_cache_dtype(text_config, dtype)
 
         with self.mesh:
             num_hidden_layers = getattr(text_config, "num_hidden_layers", None)
@@ -3068,7 +3105,7 @@ class EasyGenerationMixin:
                         recurrent_view = RecurrentCacheView.init(
                             config=config_classes[1],
                             layer_index=idx,
-                            dtype=dtype,
+                            dtype=recurrent_cache_dtype,
                         )
 
                         view = ParallelHybridCacheView(
@@ -3087,11 +3124,11 @@ class EasyGenerationMixin:
                             masking_details=_resolve_masking_details(idx),
                             starts=starts,
                         )
-                    elif view_class is RecurrentCacheView:
+                    elif isinstance(view_class, type) and issubclass(view_class, RecurrentCacheView):
                         view = view_class.init(
                             config=config_classes,
                             layer_index=idx,
-                            dtype=dtype,
+                            dtype=recurrent_cache_dtype,
                         )
                     elif view_class is KDACacheView:
                         view = view_class.init(
@@ -3099,7 +3136,9 @@ class EasyGenerationMixin:
                             layer_index=idx,
                             dtype=dtype,
                         )
-                    elif view_class in (RaggedPagesCacheView, MLARaggedPagesCacheView):
+                    elif isinstance(view_class, type) and issubclass(
+                        view_class, (RaggedPagesCacheView, MLARaggedPagesCacheView)
+                    ):
                         from easydel.caching.turboquant_ragged_page import (
                             TurboQuantRaggedPagesCacheConfig,
                             TurboQuantRaggedPagesCacheView,
@@ -4326,7 +4365,7 @@ class EasyGenerationMixin:
     def _merge_criteria_processor_list(
         self,
         default_list: LogitsProcessorList,
-        custom_list: LogitsProcessorList,
+        custom_list: LogitsProcessorList | None,
     ) -> LogitsProcessorList:
         """Merge default and custom logits processor lists with conflict detection.
 
@@ -4345,7 +4384,11 @@ class EasyGenerationMixin:
         Raises:
             ValueError: If a custom processor has the same type as a default one.
         """
-        if len(custom_list) == 0:
+        # ``_get_logits_processor`` types its ``logits_processor`` argument as
+        # optional and forwards it here unchanged, so ``None`` is a documented
+        # caller value -- not merely an unlikely one. Treat it as "no custom
+        # processors" rather than letting ``len(None)`` raise.
+        if custom_list is None or len(custom_list) == 0:
             return default_list
         for default in default_list:
             for custom in custom_list:

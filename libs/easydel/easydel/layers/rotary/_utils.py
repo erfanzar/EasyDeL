@@ -310,3 +310,48 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     if scale <= 1:
         return 1.0
     return 0.1 * mscale * math.log(scale) + 1.0
+
+
+def apply_rope_interleaved(x, cos, sin):
+    """Apply RoPE where the rotated channels are even/odd interleaved.
+
+    GPT-J-style pairing: channel ``2i`` and ``2i+1`` form one rotation pair, as
+    opposed to the NeoX/split-half layout where ``i`` pairs with ``i + d/2``.
+    DeepSeek-V2/V3 and the GLM/Mistral MLA descendants all use this form, and
+    each had written it out identically.
+
+    Args:
+        x: Tensor whose trailing axis carries interleaved rotated channels.
+        cos: Per-position cosines, broadcastable to ``x``.
+        sin: Per-position sines, broadcastable to ``x``.
+
+    Returns:
+        Rotated tensor with the same shape as ``x``.
+    """
+    x1 = x[..., ::2]
+    x2 = x[..., 1::2]
+    o1 = x1 * cos - x2 * sin
+    o2 = x2 * cos + x1 * sin
+    return jnp.stack((o1, o2), axis=-1).reshape(x.shape)
+
+
+def gather_mla_cos_sin(frequencies, position_ids, dtype):
+    """Split an MLA frequency table into per-position ``(cos, sin)``.
+
+    The stored table is a full-width ``concatenate([freqs, freqs], -1)``; MLA
+    layers gather it at ``position_ids`` and split it back into halves, adding a
+    head axis so it broadcasts over ``[batch, heads, seq, dim]``. Three families
+    carried this block character-for-character.
+
+    Args:
+        frequencies: Frequency table, or a parameter wrapper exposing ``.value``.
+        position_ids: Positions to gather, shape ``[batch, seq]``.
+        dtype: Dtype the returned tables are cast to.
+
+    Returns:
+        ``(cos, sin)``, each ``[batch, 1, seq, dim // 2]``.
+    """
+    table = frequencies.value if hasattr(frequencies, "value") else frequencies
+    freqs = table[position_ids]
+    cos, sin = jnp.split(freqs, 2, -1)
+    return cos[:, None, :, :].astype(dtype), sin[:, None, :, :].astype(dtype)

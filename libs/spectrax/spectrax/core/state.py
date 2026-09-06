@@ -1154,7 +1154,12 @@ class StateCallABI:
         Raises:
             ValueError: If the sharding tree has a different leaf count.
         """
-        leaves = tuple(jax.tree_util.tree_leaves(sharding_tree))
+        # ``None`` is a meaningful ``in_shardings`` value -- it means "unspecified"
+        # for that leaf -- but ``tree_leaves`` discards ``None`` by default. A
+        # state whose arrays carry no sharding annotations (the usual case for a
+        # lazily-initialised model) would otherwise flatten to zero leaves and be
+        # rejected against its own leaf count.
+        leaves = tuple(jax.tree_util.tree_leaves(sharding_tree, is_leaf=lambda x: x is None))
         if len(leaves) != self.num_leaves:
             raise ValueError(
                 f"StateCallABI.flatten_sharding leaf count mismatch: expected {self.num_leaves}, got {len(leaves)}."

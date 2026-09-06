@@ -92,10 +92,16 @@ def _apply_rhs_scale_bias(
         if rhs_scale.shape[0] != num_groups or rhs_scale.shape[3] != size_n:
             raise ValueError("rhs_scale group/out dimensions must match rhs.")
         num_blocks = int(rhs_scale.shape[1])
+        if num_blocks <= 0:
+            raise ValueError("rhs_scale must have at least one quant block")
         if size_k % num_blocks != 0:
             raise ValueError("rhs.shape[1] must be divisible by rhs_scale.shape[1].")
         block_size = size_k // num_blocks
         scale = jnp.repeat(rhs_scale[:, :, 0, :], block_size, axis=1)
+        if jnp.issubdtype(rhs_prepped.dtype, jnp.integer):
+            # Fractional scales must not be truncated into the integer codes.
+            # This path also supplies the differentiable backward reference.
+            rhs_prepped = rhs_prepped.astype(jnp.float32)
         rhs_prepped = rhs_prepped * scale.astype(rhs_prepped.dtype)
 
     if rhs_bias is not None:

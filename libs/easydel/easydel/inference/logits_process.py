@@ -43,7 +43,6 @@ import jax.lax as lax
 import jax.numpy as jnp
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
-from jax.experimental import sparse
 
 from easydel.utils.compiling_utils import hash_fn
 
@@ -1011,107 +1010,66 @@ class NoRepeatNGramLogitsProcessor(LogitsProcessor):
     def forward(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
         """Apply no-repeat n-gram filtering to scores.
 
-        Builds a sparse n-gram index from the generated sequence and masks
-        out any token that would complete a repeated n-gram.
+        For every position whose full n-gram lies inside the first ``cur_len``
+        tokens, the leading ``n - 1`` tokens are compared against the current
+        suffix; where they match, the n-gram's final token is banned.
 
         Args:
-            input_ids: Token IDs generated so far [batch_size, seq_len].
-            scores: Logits to filter [batch_size, vocab_size].
-            cur_len: Current generation position.
+            input_ids: Token IDs generated so far ``[batch, seq_len]``.
+            scores: Logits to filter ``[batch, vocab_size]``.
+            cur_len: Number of valid tokens; may be a traced scalar.
 
         Returns:
-            Filtered scores with repeated n-gram completions set to -inf.
+            Filtered scores with repeated n-gram completions set to ``-inf``.
         """
+        n = self.ngram_size
+        if n <= 0:
+            return scores
 
-        def true_fn():
-            """Compute and apply n-gram ban when sequence is long enough."""
+        batch_size, seq_len = input_ids.shape
+        vocab_size = scores.shape[-1]
+        if seq_len < n:
+            return scores
 
-            def get_previous_ngrams(input_ids: jnp.ndarray, vocab_size: int, cur_len: int):
-                """Build a sparse tensor indexing all previously seen n-grams."""
-                batch_size, seq_len = input_ids.shape
-                seq_ngrams = seq_len - (self.ngram_size - 1)
-                cur_ngrams = cur_len - (self.ngram_size - 1)
+        starts = jnp.arange(seq_len)
+        # An n-gram at `start` is usable only if it lies wholly inside cur_len.
+        usable = (starts + n) <= cur_len
 
-                def body_fun(i, val):
-                    """Record the n-gram at position i in the sparse index tensor."""
-                    b = i % batch_size
-                    pos = i // batch_size
-                    return val.at[i].set(
-                        jnp.array([b] + [jnp.array(input_ids)[b, pos + j] for j in range(self.ngram_size)])
-                    )
+        prefix_pos = jnp.clip(starts[:, None] + jnp.arange(n - 1)[None, :], 0, seq_len - 1)
+        prefixes = input_ids[:, prefix_pos]
+        completions = input_ids[:, jnp.clip(starts + n - 1, 0, seq_len - 1)]
 
-                shape = (batch_size * seq_ngrams, self.ngram_size + 1)
-                all_update_indices = jax.lax.fori_loop(
-                    0,
-                    batch_size * cur_ngrams,
-                    body_fun,
-                    jnp.zeros(shape, dtype=input_ids.dtype),
-                )
+        suffix_pos = jnp.clip(cur_len - (n - 1) + jnp.arange(n - 1), 0, seq_len - 1)
+        suffix = input_ids[:, suffix_pos]
 
-                data = (jnp.arange(batch_size * seq_ngrams) < batch_size * cur_ngrams).astype("float32")
+        matches = jnp.all(prefixes == suffix[:, None, :], axis=-1) & usable[None, :]
 
-                return sparse.BCOO(
-                    (data, all_update_indices),
-                    shape=(batch_size,) + (vocab_size,) * self.ngram_size,
-                )
+        # Non-matching rows are steered one past the vocabulary and dropped, so
+        # the scatter stays [batch, vocab + 1] instead of materialising a
+        # [batch, seq_len, vocab] one-hot.
+        targets = jnp.where(matches, completions, vocab_size)
+        rows = jnp.broadcast_to(jnp.arange(batch_size)[:, None], targets.shape)
+        banned = jnp.zeros((batch_size, vocab_size + 1), dtype=jnp.bool_)
+        banned = banned.at[rows, targets].set(True, mode="drop")[:, :vocab_size]
 
-            def get_banned_tokens_mask(
-                latest_tokens: jnp.ndarray,
-                previous_ngrams,
-            ) -> jnp.ndarray:
-                """
-                Determines which tokens must be banned given latest tokens and the previously seen
-                ngrams.
-                """
-
-                @sparse.sparsify
-                @jax.vmap
-                def inner_fn(latest_tokens, previous_ngrams):
-                    """Look up whether the latest n-1 tokens form a banned n-gram prefix."""
-                    return previous_ngrams[tuple(latest_tokens)]
-
-                return sparse.bcoo_todense(inner_fn(latest_tokens, previous_ngrams))
-
-            _, vocab_size = scores.shape
-            previous_ngrams = get_previous_ngrams(input_ids, vocab_size, cur_len)
-            latest_tokens = jnp.zeros(
-                (input_ids.shape[0], self.ngram_size - 1),
-                dtype=input_ids.dtype,
-            )
-            latest_tokens = jax.lax.dynamic_update_slice(
-                latest_tokens,
-                jax.lax.dynamic_slice(
-                    input_ids,
-                    (0, cur_len - (self.ngram_size - 1)),
-                    (input_ids.shape[0], (self.ngram_size - 1)),
-                ),
-                (0, 0),
-            )
-            banned_tokens_indices_mask = get_banned_tokens_mask(latest_tokens, previous_ngrams).astype("b1")
-            return jnp.where(banned_tokens_indices_mask, -float("inf"), scores)
-
-        output = jax.lax.cond((cur_len >= self.ngram_size - 1), true_fn, lambda: scores)
-        return output
+        return jnp.where(banned, -float("Inf"), scores)
 
     def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
-        """Apply no-repeat n-gram filtering if ngram_size is non-zero.
+        """Apply no-repeat n-gram filtering if ``ngram_size`` warrants it.
 
-        Delegates to forward() when ngram_size > 0, otherwise returns
-        scores unchanged.
+        ``ngram_size`` is a static field, so the disabled case is a plain
+        Python branch. Routing it through ``lax.cond`` would trace ``forward``
+        even when disabled, and ``forward`` cannot be traced at ``ngram_size=0``
+        (it would build a length ``-1`` axis).
 
         Args:
-            input_ids: Token IDs generated so far [batch_size, seq_len].
-            scores: Logits for next token [batch_size, vocab_size].
+            input_ids: Token IDs generated so far ``[batch, seq_len]``.
+            scores: Logits for the next token ``[batch, vocab_size]``.
             cur_len: Current generation length.
 
         Returns:
             Filtered scores with repeated n-gram completions masked.
         """
-        return jax.lax.cond(
-            self.ngram_size != 0,
-            lambda a, b, c: self.forward(a, b, c),
-            lambda a, b, c: b,
-            input_ids,
-            scores,
-            cur_len,
-        )
+        if self.ngram_size <= 0:
+            return scores
+        return self.forward(input_ids, scores, cur_len)

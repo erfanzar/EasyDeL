@@ -43,7 +43,9 @@ visits the ``ceil((block_q+window)/block_kv)+1`` token tiles that can hold a
 visible key (a contiguous window anchored at a q-block-dependent, clamped
 ``tile_lo``) plus every entry tile — O(S*window) rather than O(S^2), a measured
 ~1.35-2.71x forward win that scales with S. Skipped token tiles are provably
-``_MASK_MIN``-masked, so it is numerically identical to the full scan.
+``_MASK_MIN``-masked. Fully masked sink-free rows use a once-per-batch uniform
+weighted sum over all real KVs, so skipping and padding preserve the dense
+reference's uniform-average behavior.
 
 ``K == V`` (the same ``kv`` tensor is both the key in the ``q @ kv^T`` score
 and the value in ``p @ kv``), exactly as the dense reference and the decode
@@ -55,11 +57,11 @@ XLA reference. Matmul precision is dtype-aware: f32 -> ``Precision.HIGHEST``
 
 The forward Pallas kernel is a Mosaic custom call and is therefore not
 auto-differentiable. :func:`compressed_window_attention_tpu` wraps it in a
-``jax.custom_vjp`` whose backward recomputes gradients from the dense reference
-math (``_dense_reference`` below, kept numerically identical to the registered
-XLA fallback) — clean MXU matmuls, exact gradient parity, fast on TPU. A
-gather-free flash-style Pallas backward with the same band-skip (to make the
-TRAINING step, not just the forward, faster) is the remaining follow-up.
+``jax.custom_jvp`` whose derivative uses checkpointed query tiles of the
+reference math. This supports forward and reverse AD without retaining the
+full head-expanded score matrix. Dense bias storage and unrestricted-mask
+quadratic arithmetic remain; this is not a flash-style band-skipping backward.
+A structured sparse-bias interface and band-skipping derivative remain follow-ups.
 """
 
 from __future__ import annotations
@@ -125,7 +127,7 @@ def _dense_reference(
     Numerically identical to the registered XLA fallback
     (``kernels/_xla/compressed_window_attention``); duplicated here so the
     Pallas backend directory stays self-contained (no cross-backend import) and
-    the ``custom_vjp`` backward can recompute the exact reference gradient. The
+    the tiled differentiation rule can recompute reference gradients. The
     gradient-parity test enforces that this stays in sync with the XLA fallback.
 
     Args:
@@ -139,6 +141,10 @@ def _dense_reference(
         Attention output ``[batch, num_heads, q_len, head_dim]``.
     """
     logits = jnp.einsum("bhsd,bld->bhsl", query, kv, precision=jax.lax.Precision.HIGHEST).astype(jnp.float32)
+    # Keep the bf16 dot/f32 softmax boundary explicit under compiled AD.
+    # Without this barrier TPU fusion produces NaN bf16 JVPs for masked rows;
+    # the same expression evaluated eagerly remains finite.
+    logits = jax.lax.optimization_barrier(logits)
     logits = logits * softmax_scale + bias[:, None, :, :].astype(jnp.float32)
     kv_len = logits.shape[-1]
     if softmax_aux is not None:
@@ -156,11 +162,61 @@ def _dense_reference(
     return jnp.einsum("bhsl,bld->bhsd", scores, kv, precision=jax.lax.Precision.HIGHEST)
 
 
+def _tiled_reference(
+    query: Array,
+    kv: Array,
+    bias: Array,
+    softmax_aux: Array | None,
+    softmax_scale: float,
+    *,
+    block_q: int = 64,
+) -> Array:
+    """Exact reference with rematerialized, bounded-query score buffers.
+
+    Query rows are independent. Processing and checkpointing each tile avoids
+    retaining a full ``[batch, heads, q_len, kv_len]`` score/probability tensor
+    in either AD direction. Peak per-tile scores scale with ``block_q*kv_len``.
+    This does not remove the caller's dense ``[batch, q_len, kv_len]`` bias or
+    its cotangent, nor the quadratic arithmetic of an unrestricted mask.
+
+    Args:
+        query: Queries ``[batch, heads, q_len, head_dim]``.
+        kv: Shared keys/values ``[batch, kv_len, head_dim]``.
+        bias: Head-broadcast additive bias ``[batch, q_len, kv_len]``.
+        softmax_aux: Optional per-head sink logits.
+        softmax_scale: Query/key dot-product scale.
+        block_q: Maximum query rows in one rematerialized tile.
+
+    Returns:
+        Attention outputs with the query shape.
+    """
+    batch, heads, q_len, dim = query.shape
+    if q_len == 0:
+        return jnp.zeros_like(query)
+    tile = min(max(1, block_q), q_len)
+    tiles = (q_len + tile - 1) // tile
+    pad = tiles * tile - q_len
+    q_padded = jnp.pad(query, ((0, 0), (0, 0), (0, pad), (0, 0)))
+    # Finite dummy rows avoid NaNs in masked-out padding cotangents when
+    # sinks are disabled. The dummy outputs are discarded below.
+    b_padded = jnp.pad(bias, ((0, 0), (0, pad), (0, 0)))
+
+    @jax.checkpoint
+    def attend_tile(index):
+        q = jax.lax.dynamic_slice_in_dim(q_padded, index * tile, tile, axis=2)
+        b = jax.lax.dynamic_slice_in_dim(b_padded, index * tile, tile, axis=1)
+        return _dense_reference(q, kv, b, softmax_aux, softmax_scale)
+
+    blocks = jax.lax.map(attend_tile, jnp.arange(tiles, dtype=jnp.int32))
+    return blocks.transpose(1, 2, 0, 3, 4).reshape(batch, heads, tiles * tile, dim)[:, :, :q_len]
+
+
 def _flash_fwd_kernel(
     q_ref,
     kv_hbm_ref,
     bias_hbm_ref,
     sink_ref,
+    uniform_ref,
     o_ref,
     kv_x2,
     bias_x2,
@@ -192,7 +248,8 @@ def _flash_fwd_kernel(
     q-block. The ``n_entry_tiles`` compressed-entry tiles (which sit after the
     token region and are always potentially visible) are always scanned. Skipped
     token tiles are provably fully masked (their bias is the ``_MASK_MIN``
-    sentinel), so band-skip is numerically identical to the full scan.
+    sentinel). Fully masked sink-free rows select ``uniform_ref`` to include
+    skipped real KVs and exclude physical padding, matching the dense scan.
 
     Args:
         q_ref: Query block VMEM ref ``[block_h, block_q, head_dim]``.
@@ -200,6 +257,8 @@ def _flash_fwd_kernel(
             region padded to a tile boundary, then the compressed entries).
         bias_hbm_ref: Full bias tensor in HBM ``[batch, q_pad, kv_pad]``.
         sink_ref: This head block's sink logits VMEM ref ``[block_h]`` (fp32).
+        uniform_ref: Uniform weighted sum of all real KV rows ``[1, head_dim]``;
+            used only for fully masked sink-free rows (including skipped tiles).
         o_ref: Output block VMEM ref ``[block_h, block_q, head_dim]``.
         kv_x2: Double-buffered KV VMEM scratch ``[2, block_kv, head_dim]``.
         bias_x2: Double-buffered bias VMEM scratch ``[2, block_q, block_kv]``.
@@ -307,6 +366,12 @@ def _flash_fwd_kernel(
 
     ell = jnp.where(ell == 0.0, 1.0, ell)
     out = acc / ell[..., None]
+    if not use_sink:
+        # Finite masking makes an all-masked row uniform over *real* KVs.
+        # Its online state instead includes physical zero padding and omits
+        # band-skipped real KVs. Correct only these rows, using a single O(KD)
+        # per-batch reduction rather than rescanning all KVs for every query.
+        out = jnp.where(m[..., None] == _MASK_MIN, uniform_ref[...][None, :, :], out)
     o_ref[...] = out.astype(o_ref.dtype)
 
 
@@ -326,7 +391,8 @@ def _flash_forward(
 
     Pads the head dim to a 128 multiple (zeros — inert in the dot products), the
     query length to ``block_q`` (garbage rows sliced off), and the KV length to
-    ``block_kv`` (pad rows carry a ``_MASK_MIN`` bias so they cannot contribute).
+    ``block_kv`` (pad rows carry a ``_MASK_MIN`` bias). Fully masked sink-free
+    rows select a separate uniform weighted sum that excludes physical padding.
 
     When ``window > 0`` the sliding-window token region ``kv[:, :token_kv_len]``
     is padded to a tile boundary and the compressed entries ``kv[:, token_kv_len:]``
@@ -410,6 +476,17 @@ def _flash_forward(
 
     sink_p = sink.astype(jnp.float32).reshape(num_heads)
 
+    # The finite-sentinel dense softmax is uniform on fully masked sink-free
+    # rows. Compute its value over the original (unpadded, unskipped) KV axis.
+    # Cast probabilities before the dot just like _dense_reference, notably
+    # for bf16 where mean(kv) need not equal this quantized weighted sum.
+    if not use_sink:
+        weights = jnp.full((1, kv_len), 1.0 / kv_len, jnp.float32).astype(kv.dtype)
+        uniform = jnp.einsum("sl,bld->bsd", weights, kv, precision=jax.lax.Precision.HIGHEST)
+        uniform_p = _pad_d(uniform)
+    else:
+        uniform_p = jnp.zeros((batch, 1, d_pad), kv.dtype)
+
     # Auto-interpret off TPU: the Mosaic lowering only exists on TPU, so on
     # CPU/GPU the kernel runs in Pallas interpret mode (emulated VMEM + DMA
     # semaphores). This lets the numerics be validated host-side; production
@@ -440,6 +517,7 @@ def _flash_forward(
             pl.BlockSpec(memory_space=pltpu.HBM),  # kv: full tensor in HBM (streamed)
             pl.BlockSpec(memory_space=pltpu.HBM),  # bias: full tensor in HBM (streamed)
             pl.BlockSpec((block_h,), lambda b, hb, qb: (hb,)),  # this head block's sinks
+            pl.BlockSpec((None, 1, d_pad), lambda b, hb, qb: (b, 0, 0)),
         ],
         out_specs=pl.BlockSpec((None, block_h, block_q, d_pad), lambda b, hb, qb: (b, hb, qb, 0)),
         out_shape=jax.ShapeDtypeStruct((batch, num_heads, q_pad, d_pad), kv.dtype),
@@ -451,7 +529,7 @@ def _flash_forward(
         ],
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel", "parallel")),
         interpret=interpret,
-    )(q_p, kv_p, bias_p, sink_p)
+    )(q_p, kv_p, bias_p, sink_p, uniform_p)
 
     out = out[:, :, :q_len, :]
     if d_pad != head_dim:
@@ -459,7 +537,7 @@ def _flash_forward(
     return out
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(4, 5, 6, 7, 8, 9))
+@partial(jax.custom_jvp, nondiff_argnums=(4, 5, 6, 7, 8, 9))
 def _cwa_pallas(
     query: Array,
     kv: Array,
@@ -472,43 +550,48 @@ def _cwa_pallas(
     window: int,
     token_kv_len: int,
 ) -> Array:
-    """Differentiable Pallas compressed-window attention (custom_vjp primal)."""
+    """Pallas primal with an exact XLA differentiation rule.
+
+    The custom JVP makes both forward-mode (``jax.jvp``/``jacfwd``) and
+    reverse-mode (the transpose of this linear tangent rule) available.  The
+    primal remains the tiled Pallas kernel; only the tangent computation uses
+    the numerically equivalent reference expression.
+    """
     return _flash_forward(query, kv, bias, sink, softmax_scale, use_sink, block_q, block_kv, window, token_kv_len)
 
 
-def _cwa_pallas_fwd(query, kv, bias, sink, softmax_scale, use_sink, block_q, block_kv, window, token_kv_len):
-    """custom_vjp forward: run the Pallas kernel and save residuals for the bwd."""
-    out = _flash_forward(query, kv, bias, sink, softmax_scale, use_sink, block_q, block_kv, window, token_kv_len)
-    return out, (query, kv, bias, sink)
+@_cwa_pallas.defjvp
+def _cwa_pallas_jvp(
+    softmax_scale,
+    use_sink,
+    block_q,
+    block_kv,
+    window,
+    token_kv_len,
+    primals,
+    tangents,
+):
+    """Differentiate every trainable operand, including indexer bias and sink."""
+    query, kv, bias, sink = primals
+    dquery, dkv, dbias, dsink = tangents
+    out = _flash_forward(
+        query,
+        kv,
+        bias,
+        sink,
+        softmax_scale,
+        use_sink,
+        block_q,
+        block_kv,
+        window,
+        token_kv_len,
+    )
 
+    def _ref(q, k, b, s):
+        return _tiled_reference(q, k, b, s if use_sink else None, softmax_scale)
 
-def _cwa_pallas_bwd(softmax_scale, use_sink, block_q, block_kv, window, token_kv_len, residuals, grad):
-    """custom_vjp backward: recompute the exact dense-reference gradient.
-
-    Uses the dense reference recompute (clean MXU matmuls, O(S^2) but fast on
-    TPU). A band-limited XLA recompute (O(S*window)) was prototyped and verified
-    correct but is gather-bound on the TPU (``take_along_axis`` diagonal
-    extraction of the O(S^2) bias) and ran ~13x slower than this dense matmul
-    recompute, so it is not used; a gather-free flash-style Pallas backward is
-    the remaining training-side follow-up. The additive ``bias`` is a
-    stop-gradient structural / indexer-gated mask (zero cotangent); gradients
-    flow to ``query``, ``kv`` (both its key and value roles, since ``K == V``),
-    and the per-head ``sink``.
-    """
-    del window, token_kv_len, block_q, block_kv
-    query, kv, bias, sink = residuals
-
-    def _ref(q, k, s):
-        return _dense_reference(q, k, bias, s if use_sink else None, softmax_scale)
-
-    _, vjp_fn = jax.vjp(_ref, query, kv, sink)
-    dq, dkv, dsink = vjp_fn(grad)
-    if not use_sink:
-        dsink = jnp.zeros_like(sink)
-    return dq, dkv, jnp.zeros_like(bias), dsink
-
-
-_cwa_pallas.defvjp(_cwa_pallas_fwd, _cwa_pallas_bwd)
+    _, tangent = jax.jvp(_ref, (query, kv, bias, sink), (dquery, dkv, dbias, dsink))
+    return out, tangent
 
 
 def _default_blocks(q_len: int, kv_len: int, fwd_params: FwdParams | None) -> tuple[int, int]:

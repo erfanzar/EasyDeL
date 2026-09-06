@@ -17,9 +17,9 @@
 The fast TPU path for W8A16/W8A8/W4A16 dense linears, found by measurement
 rather than intuition (autoresearch on TPU v5, 2026-08-03):
 
-* A Pallas kernel is the wrong tool here — the v3 grouped-matmul kernel's
-  **pure bf16** ceiling measured 0.47-0.78x of XLA's plain matmul, so no
-  amount of quantization cleverness inside it can win.
+* The historical v3 grouped-matmul configuration measured only 0.47-0.78x
+  of XLA's plain BF16 matmul. This is not a hardware ceiling or a general
+  limit on Pallas: newer kernels/tiles require fresh device-time comparisons.
 * XLA fuses ``w_q.astype(bf16)`` into the matmul's weight stream, so the
   decode path stays bandwidth-bound on the *packed* bytes — but **any**
   arithmetic on the weight before the dot (scale folds, reshapes) breaks the
@@ -49,6 +49,8 @@ opt-in and belongs behind calibration/smoothing.
 
 from __future__ import annotations
 
+from functools import partial
+
 import jax
 from jax import numpy as jnp
 
@@ -66,6 +68,7 @@ def channelwise_quantized_matmul(
     quantize_activations: bool = False,
     activation_bits: int = 8,
     prefill_threshold: int = 256,
+    platform: str = "xla",
 ) -> jax.Array:
     """Compute ``x @ (w_q * channel_scale)`` without dequantizing the weight.
 
@@ -78,7 +81,14 @@ def channelwise_quantized_matmul(
     * ``m >= prefill_threshold`` (prefill), when ``quantize_activations``:
       activations are quantized per token to the integer width, the dot runs
       on the int MXU path (int8: 2x bf16 rate; int4: 4x), and both scales are
-      applied in the epilogue.
+      applied in the epilogue. Non-TPU backends widen int4 operands to int8
+      for exact arithmetic without changing quantization or stored codes.
+
+    The integer-activation branch uses an explicit straight-through activation
+    derivative ``(dx @ w_q) * channel_scale``. Scale derivatives use the actual
+    forward-quantized activations; integer weight codes are frozen. This is a
+    training surrogate, not the natural derivative of hard quantization.
+    Weight-only and below-threshold decode use ordinary autodiff.
 
     Args:
         x: Activations ``[m, k]``, floating dtype.
@@ -93,6 +103,13 @@ def channelwise_quantized_matmul(
             unsmoothed) — opt-in only.
         prefill_threshold: Token count at which the integer-dot path takes
             over from the fused-upcast path.
+        platform: ``'xla'`` (default) or opt-in ``'pallas'``. Pallas requires
+            active activation quantization, BF16 inputs, matching INT4/INT8
+            weights, M divisible by 64, and K/N divisible by 128 and <=4096.
+            It fuses row quantization with the dot, uses up to a 40 MiB VMEM
+            budget, and retains XLA surrogate autodiff. It is not faster on
+            every shape; notably 4096-square W8A8 remained slower in tests.
+            No automatic platform selection or backward speedup is promised.
 
     Returns:
         ``[m, n]`` in ``x``'s dtype.
@@ -111,26 +128,39 @@ def channelwise_quantized_matmul(
     n_dim = w_q.shape[-1]
     scale = channel_scale.reshape(1, n_dim).astype(jnp.float32)
     tokens = x.shape[0]
+    if platform not in ("xla", "pallas"):
+        raise ValueError("platform must be 'xla' or 'pallas'")
+    if platform == "pallas":
+        if not quantize_activations or tokens < prefill_threshold:
+            raise ValueError("Pallas dense path requires active integer activation quantization")
+        from ..._pallas.tpu.quantized_matmul._channelwise import channelwise_quantized_matmul_pallas
+
+        return channelwise_quantized_matmul_pallas(x, w_q, scale, activation_bits)
 
     if not quantize_activations or tokens < prefill_threshold:
         # Keep the weight expression a bare `astype`: XLA fuses exactly that
         # into the matmul stream; anything more materializes the bf16 weight.
-        out = x @ w_q.astype(x.dtype)
+        precision = jax.lax.Precision.HIGHEST if x.dtype == jnp.float32 else None
+        out = jnp.matmul(x, w_q.astype(x.dtype), precision=precision)
         return (out.astype(jnp.float32) * scale).astype(x.dtype)
 
-    if activation_bits == 4:
-        act_dtype, act_max = jnp.int4, 7.0
-    else:
-        act_dtype, act_max = jnp.int8, 127.0
+    return _quantized_activation_matmul(x, w_q, scale, activation_bits)
 
-    x_abs = jnp.max(jnp.abs(x), axis=1, keepdims=True).astype(jnp.float32)
-    x_scale = x_abs / act_max
-    x_q = jnp.clip(jnp.round(x.astype(jnp.float32) / jnp.where(x_scale == 0, 1, x_scale)), -act_max, act_max).astype(
-        act_dtype
-    )
+
+def _integer_dot(x, w_q, activation_bits):
+    """Return the integer accumulator and per-token activation scale."""
+    from ._integer_quantization import quantize_rows
+
+    act_dtype = jnp.int4 if activation_bits == 4 else jnp.int8
+    x_q, x_scale = quantize_rows(x, activation_bits)
 
     w_dot = w_q
-    if act_dtype == jnp.int8 and w_q.dtype != jnp.int8:
+    if act_dtype == jnp.int4 and jax.default_backend() != "tpu":
+        # Preserve int4 quantization and stored codes, widening only arithmetic.
+        # CPU/GPU XLA cannot lower the native sub-byte integer dot.
+        x_q = x_q.astype(jnp.int8)
+        w_dot = w_q.astype(jnp.int8)
+    elif act_dtype == jnp.int8 and w_q.dtype != jnp.int8:
         # int8 x int4 is not MXU-native; the upcast is exact.
         w_dot = w_q.astype(jnp.int8)
 
@@ -140,4 +170,33 @@ def channelwise_quantized_matmul(
         dimension_numbers=(((1,), (0,)), ((), ())),
         preferred_element_type=jnp.int32,
     )
-    return (out.astype(jnp.float32) * scale * x_scale).astype(x.dtype)
+    return out.astype(jnp.float32), x_scale
+
+
+@partial(jax.custom_jvp, nondiff_argnums=(3,))
+def _quantized_activation_matmul(x, w_q, scale, activation_bits):
+    out, x_scale = _integer_dot(x, w_q, activation_bits)
+    return (out * scale * x_scale).astype(x.dtype)
+
+
+@_quantized_activation_matmul.defjvp
+def _quantized_activation_matmul_jvp(activation_bits, primals, tangents):
+    """Activation STE with frozen integer codes (not hard-rounding's derivative).
+
+    The activation tangent is ``(dx @ w_q) * scale``: multiplication by
+    represented weights, including at zero rows. Scale tangents use the exact
+    forward-quantized activation accumulator, NOT unquantized ``x @ w_q``.
+    Only the integer-activation regime uses this surrogate; A16 and legacy
+    decode retain ordinary autodiff. Integer weight tangents are ignored.
+    """
+    x, w_q, scale = primals
+    dx, _, dscale = tangents
+    out, x_scale = _integer_dot(x, w_q, activation_bits)
+    primal = (out * scale * x_scale).astype(x.dtype)
+    precision = jax.lax.Precision.HIGHEST if x.dtype == jnp.float32 else None
+    # Preserve the BF16 dot rounding boundary when XLA jointly compiles the
+    # integer primal and floating tangent; otherwise fusion can elide it.
+    activation_dot = jax.lax.optimization_barrier(jnp.matmul(dx, w_q.astype(x.dtype), precision=precision))
+    activation_tangent = activation_dot.astype(jnp.float32) * scale
+    scale_tangent = out * x_scale * dscale
+    return primal, (activation_tangent + scale_tangent).astype(x.dtype)

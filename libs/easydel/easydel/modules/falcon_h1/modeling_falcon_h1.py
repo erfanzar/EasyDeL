@@ -77,6 +77,7 @@ from easydel.layers import (
     split_fused_gate_up_projection,
 )
 from easydel.layers.attention import MaskInfo, UnifiedAttention
+from easydel.layers.linear_attention._masking import apply_mask_to_padding_states
 from easydel.modules._base import BaseCausalLMModule
 from easydel.operations import OperationMetadata
 from easydel.operations.kernels import SSM2Op
@@ -123,33 +124,6 @@ def compute_mup_vector(config: FalconH1Config) -> jnp.ndarray:
         zxbcdt_multipliers[4]
     )
     return mup_vector
-
-
-def apply_mask_to_padding_states(hidden_states: Array, attention_mask: Array | None) -> Array:
-    """Apply attention mask to zero out hidden states at padding positions.
-
-    This function ensures that padding tokens don't contribute to the SSM state
-    by multiplying the hidden states with the attention mask. This is critical
-    for Mamba-style SSMs where padding tokens should not affect the recurrent state.
-
-    Args:
-        hidden_states (Array): Hidden states tensor of shape (batch_size, seq_len, hidden_dim).
-        attention_mask (Array | None): Boolean or float mask of shape (batch_size, seq_len)
-            where 1/True indicates valid tokens and 0/False indicates padding.
-
-    Returns:
-        Array: Masked hidden states with padding positions zeroed out, same shape
-            as input. Returns unchanged hidden_states if mask is None or incompatible.
-    """
-    if (
-        attention_mask is not None
-        and attention_mask.shape[0] == hidden_states.shape[0]
-        and attention_mask.shape[1] == hidden_states.shape[1]
-        and attention_mask.shape[1] > 1
-    ):
-        dtype = hidden_states.dtype
-        return (hidden_states * attention_mask[:, :, None]).astype(dtype)
-    return hidden_states
 
 
 class FalconH1Attention(UnifiedAttention):

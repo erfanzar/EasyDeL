@@ -127,6 +127,7 @@ from easydel.layers import (
     RMSNorm,
     RowParallelLinear,
     RowParallelMoELinear,
+    clamped_swiglu,
     compute_basic_inv_frequencies,
     compute_yarn_inv_frequencies,
     dense_gate_up_layout,
@@ -160,6 +161,7 @@ class _HyperStreamSharding(common_types.DynamicShardingAxes):
 
     axes: tp.ClassVar = [common_types.BATCH, common_types.QUERY_LENGTH, common_types.EMPTY, common_types.EMBED]
     mode: tp.ClassVar = 1
+
 
 # Platform for the fused compressed-window decode kernel. Default "xla" is the
 # GSPMD-partitionable reference: it lowers correctly under any mesh (single or
@@ -496,8 +498,13 @@ def _compressor_decode_step(
         new_overlap_kv = jnp.where(closed[:, None, None], buffer_kv[..., :head_dim].astype(overlap_kv.dtype), overlap_kv)
         new_overlap_gate = jnp.where(closed[:, None, None], biased_gate[..., :head_dim], overlap_gate)
 
-    weights = jax.nn.softmax(slot_gate, axis=1).astype(slot_kv.dtype)
-    candidate = kv_norm(jnp.sum(slot_kv * weights, axis=1))  # [B, dim]
+    # Cache buffers may use fp8 storage. Dequantize to the projection's compute
+    # dtype before pooling: JAX does not implicitly promote fp8 with bf16, and
+    # casting softmax probabilities to fp8 would needlessly destroy precision.
+    compute_dtype = kv_t.dtype
+    slot_kv_compute = slot_kv.astype(compute_dtype)
+    weights = jax.nn.softmax(slot_gate, axis=1).astype(compute_dtype)
+    candidate = kv_norm(jnp.sum(slot_kv_compute * weights, axis=1))  # [B, dim]
 
     rope_positions = (window_index * rate).astype(jnp.int32)[:, None]  # [B, 1]
     cos, sin = _rope_cos_sin(config, "compress", rope_positions, candidate.dtype)
@@ -505,9 +512,14 @@ def _compressor_decode_step(
 
     n_slots = entries.shape[1]
     slot = jnp.clip(window_index, 0, n_slots - 1)  # [B]
-    current = entries[rows, slot]  # [B, dim]
-    selected = jnp.where(closed[:, None], candidate.astype(entries.dtype), current)
-    entries = entries.at[rows, slot].set(selected)
+    # Write only the rows whose window actually closed. Reading the old row
+    # back to re-write it unchanged turns this into a read-modify-write of the
+    # whole entry buffer: at a 262,144 window the buffer is [B, 65536, 512], and
+    # `cost_analysis` prices that read at 1.281 GiB per decode step -- spent to
+    # store values that were already there. Steering unclosed rows to an
+    # out-of-bounds index lets `mode="drop"` discard them instead.
+    write_slot = jnp.where(closed, slot, n_slots)
+    entries = entries.at[rows, write_slot].set(candidate.astype(entries.dtype), mode="drop")
     return entries, buffer_kv, buffer_gate, new_overlap_kv, new_overlap_gate
 
 
@@ -538,6 +550,7 @@ class DeepseekV4HyperConnection(spx.Module):
         config: DeepseekV4Config,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
         *,
         rngs: spx.Rngs,
     ):
@@ -549,11 +562,13 @@ class DeepseekV4HyperConnection(spx.Module):
                 ``rms_norm_eps``, ``initializer_range``).
             dtype: Activation dtype (mHC math itself runs in fp32).
             param_dtype: Parameter storage dtype.
+            precision: Matmul precision for the learned stream projection.
             rngs: Random number generators.
         """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
+        self.precision = precision
         self.hc_mult = config.hc_mult
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
         self.hc_eps = config.hc_eps
@@ -616,7 +631,7 @@ class DeepseekV4HyperConnection(spx.Module):
         flat = hidden_streams.reshape(batch, seq, -1).astype(jnp.float32)
         flat = _unweighted_rms_norm(flat, self.rms_norm_eps)
         fn = self.fn.value.astype(jnp.float32)
-        mix_logits = flat @ fn.T
+        mix_logits = jnp.matmul(flat, fn.T, precision=self.precision)
         pre_w = mix_logits[..., :hc]
         post_w = mix_logits[..., hc : 2 * hc]
         comb_w = mix_logits[..., 2 * hc :]
@@ -656,6 +671,7 @@ class DeepseekV4HyperHead(spx.Module):
         config: DeepseekV4Config,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
         *,
         rngs: spx.Rngs,
     ):
@@ -665,11 +681,13 @@ class DeepseekV4HyperHead(spx.Module):
             config: Model configuration.
             dtype: Activation dtype.
             param_dtype: Parameter storage dtype.
+            precision: Matmul precision for the learned stream projection.
             rngs: Random number generators.
         """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
+        self.precision = precision
         self.hc_mult = config.hc_mult
         self.hc_eps = config.hc_eps
         self.rms_norm_eps = config.rms_norm_eps
@@ -704,7 +722,7 @@ class DeepseekV4HyperHead(spx.Module):
         """
         batch, seq = x.shape[:2]
         flat = _unweighted_rms_norm(x.reshape(batch, seq, -1).astype(jnp.float32), self.rms_norm_eps)
-        mixes = flat @ self.hc_fn.value.astype(jnp.float32).T
+        mixes = jnp.matmul(flat, self.hc_fn.value.astype(jnp.float32).T, precision=self.precision)
         pre = jax.nn.sigmoid(mixes * self.hc_scale.value.astype(jnp.float32) + self.hc_base.value.astype(jnp.float32))
         pre = pre + self.hc_eps
         return jnp.sum(pre[..., None] * x.astype(jnp.float32), axis=2).astype(x.dtype)
@@ -767,7 +785,21 @@ class DeepseekV4GroupedLinear(spx.Module):
         """
         kernel = self.weight.value.astype(self.dtype if self.dtype is not None else x.dtype)
         kernel = kernel.reshape(self.in_features_per_group, self.n_groups, self.out_features_per_group)
-        return jnp.einsum("bsgi,igr->bsgr", x.astype(kernel.dtype), kernel, precision=self.precision)
+        x = x.astype(kernel.dtype)
+
+        # This layer contracts its own parameter with an einsum instead of
+        # delegating to ParallelLinear, so nothing intercepts the dot_general on
+        # its behalf: it has to look its own quantization rule up, exactly as
+        # ParallelLinear does. Without this the module is stamped with a plan
+        # and then silently ignores it -- quantized output identical to the
+        # unquantized baseline. Contraction is ``i``: axis 0 of the kernel,
+        # trailing axis of ``x``.
+        quant_rule = spx.quantization.rule_for(self, "dot_general")
+        if quant_rule is not None:
+            kernel = spx.quantization.fake_quant(kernel, rule=quant_rule, contracting_axes=(0,), is_weight=True)
+            x = spx.quantization.fake_quant(x, rule=quant_rule, contracting_axes=(x.ndim - 1,), is_weight=False)
+
+        return jnp.einsum("bsgi,igr->bsgr", x, kernel, precision=self.precision)
 
 
 class DeepseekV4HCACompressor(spx.Module):
@@ -1123,6 +1155,7 @@ class DeepseekV4Indexer(spx.Module):
         hidden_states: Float[Array, "batch seq hidden"],
         q_residual: Float[Array, "batch seq q_lora"],
         position_ids: Int[Array, "batch seq"],
+        return_scores: bool = False,
     ) -> Array | None:
         """Compute per-query top-k compressed-entry indices.
 
@@ -1145,7 +1178,8 @@ class DeepseekV4Indexer(spx.Module):
         gate = self.gate_proj(hidden_states)[:, :usable]
         compressed, _, _ = self._compress_windows(kv, gate)
         index_scores = self._score_queries(hidden_states, q_residual, position_ids, compressed)
-        return self._select_causal_top_k(index_scores, position_ids, n_windows)
+        indices = self._select_causal_top_k(index_scores, position_ids, n_windows)
+        return (indices, index_scores) if return_scores else indices
 
     def _compress_windows(self, kv: Array, gate: Array) -> tuple[Array, Array, Array]:
         """Two-series window compression of raw projections into post-RoPE keys.
@@ -1355,12 +1389,36 @@ class DeepseekV4Indexer(spx.Module):
             indexer_overlap_gate=overlap_gate,
         )
         visible = _decode_entry_visibility(position_ids, cache_view.cache_position, n_slots, rate)
-        index_scores = self._score_queries(hidden_states, q_residual, position_ids, entries)  # [B, 1, n_slots]
-        index_scores = jnp.where(visible, index_scores, -jnp.inf)
         top_k = min(self.index_topk, n_slots)
-        top_k_indices = jax.lax.top_k(index_scores, top_k)[1]
-        picked_visible = jnp.take_along_axis(visible, top_k_indices, axis=-1)
-        return jnp.where(picked_visible, top_k_indices, -1), cache_view
+
+        # Scoring reads the whole `indexer_entries` buffer -- [B, n_slots, head_dim],
+        # 65,536 entries at a 262,144 window. `cost_analysis` puts that at 0.206 GiB
+        # per decode step, a third of the step's entire memory traffic, to rank
+        # entries and keep 512.
+        #
+        # Until the context passes `top_k`, every live entry is selected anyway:
+        # `top_k` over `live <= top_k` candidates returns all of them, so the
+        # ranking cannot exclude anything and the scores are computed only to be
+        # thrown away. Returning the visible prefix is the same *set* of entries,
+        # and attention over a key axis is permutation-invariant given a bias
+        # gathered by the same indices.
+        #
+        # The state update above stays unconditional. Short-circuiting before it
+        # -- which is what the `_indexer_selection_is_vacuous` early return does --
+        # would skip the entry write and leave the buffer stale.
+        def _by_score(_):
+            index_scores = self._score_queries(hidden_states, q_residual, position_ids, entries)
+            index_scores = jnp.where(visible, index_scores, -jnp.inf)
+            idx = jax.lax.top_k(index_scores, top_k)[1]
+            return jnp.where(jnp.take_along_axis(visible, idx, axis=-1), idx, -1)
+
+        def _by_prefix(_):
+            idx = jnp.broadcast_to(jnp.arange(top_k, dtype=jnp.int32), (*visible.shape[:-1], top_k))
+            return jnp.where(visible[..., :top_k], idx, -1)
+
+        live = jnp.max((cache_view.cache_position.astype(jnp.int32) + 1) // rate)
+        top_k_indices = jax.lax.cond(live <= top_k, _by_prefix, _by_score, operand=None)
+        return top_k_indices, cache_view
 
 
 def _two_series_compress(
@@ -1510,8 +1568,8 @@ class DeepseekV4CSACompressor(spx.Module):
         kv = self.kv_proj(hidden_states)[:, :usable]
         gate = self.gate_proj(hidden_states)[:, :usable]
         compressed, _, _ = self._compress_windows(kv, gate)
-        top_k_indices = self.indexer(hidden_states, q_residual, position_ids)  # [B, S, k]
-        block_bias = _indexer_opened_bias(top_k_indices, batch, seq_len, n_windows)
+        top_k_indices, index_scores = self.indexer(hidden_states, q_residual, position_ids, return_scores=True)
+        block_bias = _indexer_opened_bias(top_k_indices, batch, seq_len, n_windows, score_proxy=index_scores)
         return compressed, block_bias
 
     def _compress_windows(self, kv: Array, gate: Array) -> tuple[Array, Array, Array]:
@@ -1622,7 +1680,7 @@ class DeepseekV4CSACompressor(spx.Module):
         valid: Array | None = None,
     ) -> tuple[Array | None, Array | None, CompressedWindowCacheView]:
         """Single-token step: advance both compressor and indexer streams."""
-        batch = hidden_states.shape[0]
+        _batch = hidden_states.shape[0]
         rate = self.compress_rate
         n_slots = cache_view.num_entry_slots
         if n_slots == 0:
@@ -1655,11 +1713,62 @@ class DeepseekV4CSACompressor(spx.Module):
         top_k_indices, cache_view = self.indexer.cached_forward(
             hidden_states, q_residual, position_ids, cache_view, valid=valid
         )
-        block_bias = _indexer_opened_bias(top_k_indices, batch, 1, n_slots)
-        return entries, block_bias, cache_view
+        # Gather the selected entries instead of handing the attention the full
+        # padded entry axis with everything else masked out.
+        #
+        # The indexer picks `index_topk` entries (512); the entry axis is
+        # `max_length / rate` (65536 at a 262144 context). Returning all of
+        # them made the attention compute 65536 columns per head per layer per
+        # step and throw away 99.2% of them via an additive -inf bias. Ablation
+        # put that attention at ~68% of the decode step. The gather moves
+        # ~512x512x2 bytes per layer instead.
+        #
+        # `-1` marks an invalid pick, exactly as `_indexer_opened_bias` treated
+        # it: index 0 is substituted so the gather stays in bounds and the bias
+        # masks the column out, so the attended set is unchanged.
+        picks = top_k_indices[:, 0]  # [B, K]
+        k_sel = picks.shape[-1]
+
+        def _by_gather(_):
+            picked = picks >= 0
+            g = jnp.take_along_axis(entries, jnp.where(picked, picks, 0)[:, :, None], axis=1)
+            b = jnp.where(picked, 0.0, _MASK_MIN)[:, None, None, :].astype(jnp.float32)
+            return g, b
+
+        def _by_prefix(_):
+            # Every live entry is selected, so the picked set IS the live
+            # prefix. Attention is permutation-invariant over the key axis, so
+            # reading that prefix contiguously gives the same result as
+            # gathering the same rows scattered -- at a fraction of the cost.
+            # Computed over the full entry axis and sliced, rather than asked
+            # for at k_sel width: the narrow form is strictly less arithmetic
+            # but measured 15.8 -> 11.1 tok/s, XLA fusing the wide version
+            # better. Identical values either way (visibility of entry i
+            # depends only on i).
+            vis = _decode_entry_visibility(position_ids, cache_view.cache_position, n_slots, rate)
+            g = entries[:, :k_sel]
+            b = jnp.where(vis[:, :, :k_sel], 0.0, _MASK_MIN)[:, None, :, :].astype(jnp.float32)
+            return g, b
+
+        # `index_topk` picks out of `max_length / rate` entries. Until the
+        # context outgrows `index_topk * rate` tokens there are fewer live
+        # entries than picks, so the selection cannot exclude anything and the
+        # scattered gather is buying nothing. Measured: the gather is ~50 ms of
+        # a 92 ms decode step, three orders off the HBM roofline for the bytes
+        # it moves, because 512 separate 1 KB rows is the worst case for the
+        # memory system. The contiguous branch is the same rows in order.
+        live = jnp.max((cache_view.cache_position.astype(jnp.int32) + 1) // rate)
+        gathered, sel_bias = jax.lax.cond(live <= k_sel, _by_prefix, _by_gather, operand=None)
+        return gathered, sel_bias, cache_view
 
 
-def _indexer_opened_bias(top_k_indices: Array, batch: int, seq_len: int, compressed_len: int) -> Array:
+def _indexer_opened_bias(
+    top_k_indices: Array,
+    batch: int,
+    seq_len: int,
+    compressed_len: int,
+    score_proxy: Array | None = None,
+) -> Array:
     """Turn indexer picks into an additive bias over the compressed-entry axis.
 
     Args:
@@ -1679,7 +1788,15 @@ def _indexer_opened_bias(top_k_indices: Array, batch: int, seq_len: int, compres
     batch_idx = jnp.arange(batch)[:, None, None]
     seq_idx = jnp.arange(seq_len)[None, :, None]
     opened = opened.at[batch_idx, seq_idx, safe_indices].set(True)
-    return jnp.where(opened[..., :compressed_len], 0.0, _MASK_MIN)[:, None, :, :].astype(jnp.float32)
+    opened = opened[..., :compressed_len]
+    bias = jnp.where(opened, 0.0, _MASK_MIN).astype(jnp.float32)
+    if score_proxy is not None:
+        # Keep the hard top-k forward exactly unchanged while making selected
+        # score logits differentiable for end-to-end indexer training.
+        score_proxy = score_proxy.astype(jnp.float32)
+        ste = score_proxy - jax.lax.stop_gradient(score_proxy)
+        bias = bias + jnp.where(opened, ste, 0.0)
+    return bias[:, None, :, :]
 
 
 _COMPRESSOR_CLASSES: dict[str, type | None] = {
@@ -1968,8 +2085,8 @@ class DeepseekV4Attention(spx.Module):
         axis (token KVs + compressed entries) may be long.
 
         Gradients flow to ``q``, ``kv`` (both its key and value roles, since
-        ``K == V``) and the per-head sinks; the additive ``bias`` is a
-        stop-gradient structural / indexer-gated mask.
+        ``K == V``), the trainable score-proxy part of ``bias``, and per-head
+        sinks; structural mask entries are constants.
 
         Args:
             q: Rotated queries ``[B, H, S, head_dim]``.
@@ -2084,6 +2201,11 @@ class DeepseekV4Attention(spx.Module):
                 hidden_states, q_residual, position_ids, cache_view, valid=valid
             )
             if compressed_kv is not None:
+                # Rejoin rather than attending twice and merging. The split
+                # existed to avoid concatenating a 65536-wide entry axis; the
+                # selection now returns `index_topk` (512) rows, so the concat
+                # is small and one fused call should beat two plus a softmax
+                # merge.
                 kv_axis = jnp.concatenate([ring, compressed_kv.astype(ring.dtype)], axis=1)
                 attn_bias = jnp.concatenate([attn_bias, block_bias], axis=-1)
         advance = 1 if valid is None else valid.astype(jnp.int32)
@@ -2441,9 +2563,8 @@ class DeepseekV4MLP(spx.Module):
             return gated_mlp_forward(self, hidden_states)
         gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "mlp_gate_up")
         gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
-        gate = jnp.clip(gate, max=self.limit)
-        up = jnp.clip(up, min=-self.limit, max=self.limit)
-        return checkpoint_name(self.down_proj(self.act_fn(gate) * up), "mlp_down")
+        activated = clamped_swiglu(gate, up, limit=self.limit, act_fn=self.act_fn)
+        return checkpoint_name(self.down_proj(activated), "mlp_down")
 
 
 class DeepseekV4Experts(spx.Module):
@@ -2557,9 +2678,8 @@ class DeepseekV4Experts(spx.Module):
         """
         gate = self.gate_proj(hidden_states, group_sizes, sorted_experts)
         up = self.up_proj(hidden_states, group_sizes, sorted_experts)
-        gate = jnp.clip(gate, max=self.limit)
-        up = jnp.clip(up, min=-self.limit, max=self.limit)
-        return self.down_proj(self.act_fn(gate) * up, group_sizes, sorted_experts)
+        activated = clamped_swiglu(gate, up, limit=self.limit, act_fn=self.act_fn)
+        return self.down_proj(activated, group_sizes, sorted_experts)
 
 
 class DeepseekV4TopKRouter(spx.Module):
@@ -2836,9 +2956,7 @@ class DeepseekV4SparseMoeBlock(BaseMoeModule):
 
         def ffn_activation(gate: Array, up: Array) -> Array:
             """Clamped SwiGLU: ``silu(clamp(gate, max=limit)) * clamp(up, +-limit)``."""
-            gate = jnp.clip(gate, max=limit)
-            up = jnp.clip(up, min=-limit, max=limit)
-            return self.experts.act_fn(gate) * up
+            return clamped_swiglu(gate, up, limit=limit, act_fn=self.experts.act_fn)
 
         routed, router_scores = self.moe_call(
             hidden_state=hidden_states,
@@ -2926,8 +3044,12 @@ class DeepseekV4DecoderLayer(spx.Module):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.attn_hc = DeepseekV4HyperConnection(config, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
-        self.ffn_hc = DeepseekV4HyperConnection(config, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+        self.attn_hc = DeepseekV4HyperConnection(
+            config, dtype=dtype, param_dtype=param_dtype, precision=precision, rngs=rngs
+        )
+        self.ffn_hc = DeepseekV4HyperConnection(
+            config, dtype=dtype, param_dtype=param_dtype, precision=precision, rngs=rngs
+        )
 
     def forward(
         self,
@@ -2970,13 +3092,13 @@ class DeepseekV4DecoderLayer(spx.Module):
             packed_meta=packed_meta,
         )
         hidden_streams = post.astype(dtype)[..., None] * attn_output[..., None, :] + jnp.einsum(
-            "bsji,bsjd->bsid", comb.astype(dtype), hidden_streams
+            "bsji,bsjd->bsid", comb.astype(dtype), hidden_streams, precision=self.precision
         )
 
         post, comb, collapsed = self.ffn_hc(hidden_streams)
         mlp_output, router_logits = self.mlp(self.post_attention_layernorm(collapsed), input_ids=input_ids)
         hidden_streams = post.astype(dtype)[..., None] * mlp_output[..., None, :] + jnp.einsum(
-            "bsji,bsjd->bsid", comb.astype(dtype), hidden_streams
+            "bsji,bsjd->bsid", comb.astype(dtype), hidden_streams, precision=self.precision
         )
 
         return DecoderLayerOutput(
@@ -2985,6 +3107,60 @@ class DeepseekV4DecoderLayer(spx.Module):
             cache_view=cache_view,
             router_logits=router_logits if output_router_logits else None,
         )
+
+
+def _raise_if_runtime_true(condition: Array | bool, message: str) -> None:
+    """Raise eagerly or through a JIT-safe host callback when ``condition`` holds."""
+
+    def _check(value):
+        if bool(value):
+            raise ValueError(message)
+
+    if isinstance(condition, jax.core.Tracer):
+        jax.debug.callback(_check, condition, ordered=True)
+    else:
+        _check(condition)
+
+
+def _reject_unsupported_packed_training(
+    mask_info: MaskInfo | None,
+    attention_mask: Array | None = None,
+) -> None:
+    """Reject actual padding/packing that fixed-rate compressors cannot represent."""
+    message = (
+        "DeepSeek-V4 packed-document training or padding-mask prefill is not yet supported: "
+        "CSA/HCA compression follows physical offsets. Use unpacked, unpadded batches."
+    )
+    conditions = []
+    if mask_info is not None:
+        segments = getattr(mask_info, "_q_segment_ids", None)
+        if segments is not None:
+            valid = segments >= 0
+            safe = jnp.where(valid, segments, 0)
+            has_padding = jnp.any(~valid)
+            has_multiple = jnp.max(safe, axis=-1) != jnp.min(jnp.where(valid, safe, jnp.iinfo(safe.dtype).max), axis=-1)
+            has_multiple = jnp.any(has_multiple & jnp.any(valid, axis=-1))
+            conditions.append(has_padding | has_multiple)
+        raw_mask = getattr(mask_info, "_attention_mask", None)
+        if raw_mask is not None and segments is None:
+            conditions.append(jnp.any(~raw_mask.astype(bool)))
+    if attention_mask is not None:
+        conditions.append(jnp.any(~attention_mask.astype(bool)))
+    if conditions:
+        condition = conditions[0]
+        for item in conditions[1:]:
+            condition = condition | item
+        _raise_if_runtime_true(condition, message)
+
+
+def _reject_nonempty_cached_prefill(past_key_values) -> None:
+    """Reject multi-token continuation that would overwrite compressor state."""
+    cache_position = past_key_values[0].cache_position
+    _raise_if_runtime_true(
+        jnp.any(cache_position != 0),
+        "DeepSeek-V4 cached multi-token prefill requires an empty cache; "
+        "use one-token decode or reset the cache before prefill.",
+    )
 
 
 @register_module(TaskType.BASE_MODULE, config=DeepseekV4Config, model_type="deepseek_v4")
@@ -3059,7 +3235,9 @@ class DeepseekV4Model(EasyDeLBaseModule):
 
         final_layer_idx = max(0, config.num_hidden_layers - 1)
         with self.assign_layer_stage(final_layer_idx, total_layers=config.num_hidden_layers):
-            self.hc_head = DeepseekV4HyperHead(config, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+            self.hc_head = DeepseekV4HyperHead(
+                config, dtype=dtype, param_dtype=param_dtype, precision=precision, rngs=rngs
+            )
             self.norm = DeepseekV4RMSNorm(
                 dim=config.hidden_size,
                 eps=config.rms_norm_eps,
@@ -3159,6 +3337,13 @@ class DeepseekV4Model(EasyDeLBaseModule):
         packed_num_seqs = getattr(cache_metadata, "num_seqs", None)
         is_packed = cached and batch == 1 and packed_qsl is not None and packed_num_seqs is not None
         is_decode = cached and sequence_length == 1 and not is_packed
+        if not is_packed and sequence_length > 1:
+            _reject_unsupported_packed_training(mask_info, attention_mask)
+            if cached is None and packed_qsl is not None and packed_num_seqs is not None and batch == 1:
+                raise ValueError(
+                    "DeepSeek-V4 stateless packed-document calls are not supported: pass a cache or an "
+                    "unpacked batch (CSA/HCA compression follows physical offsets)."
+                )
 
         packed_meta = None
         if is_packed:
@@ -3179,6 +3364,7 @@ class DeepseekV4Model(EasyDeLBaseModule):
             token_bias = None  # attention derives the ring mask from the cache state
         else:
             if cached:
+                _reject_nonempty_cached_prefill(past_key_values)
                 # Cached prefill assumes an unpadded, position-0 stream; the
                 # (max-length padded) generation MaskInfo is ignored.
                 if position_ids is None:

@@ -249,7 +249,9 @@ def _flatten_state_in_shardings(in_shardings: object, refs: tuple[_StateArgRef, 
         sharding = flattened[index]
         if sharding is None:
             continue
-        leaves = tuple(jax.tree_util.tree_leaves(sharding))
+        # Count ``None`` as a leaf for the same reason ``flatten_sharding`` does:
+        # an all-unspecified sharding tree is structurally valid, not empty.
+        leaves = tuple(jax.tree_util.tree_leaves(sharding, is_leaf=lambda x: x is None))
         if len(leaves) == 1 and abi.num_leaves != 1:
             continue
         flattened[index] = abi.flatten_sharding(sharding)

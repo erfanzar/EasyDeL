@@ -77,7 +77,7 @@ from easydel.layers import (
     split_fused_gate_up_projection,
     split_interleaved_pair_last_axis,
 )
-from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
+from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention, block_diagonal_bias
 from easydel.layers.norms import LayerNorm
 from easydel.modules._base import BaseVisionLanguageModule
 
@@ -138,29 +138,9 @@ def apply_rotary_pos_emb_vision(q: Array, k: Array, cos: Array, sin: Array) -> t
     return (q * cos) + (_rotate_half(q) * sin), (k * cos) + (_rotate_half(k) * sin)
 
 
-def create_attention_mask(cu_seqlens: Array, seq_length: int, dtype: jnp.dtype) -> Array:
-    """Create block-diagonal attention mask from cumulative sequence lengths.
-
-    Creates a mask where tokens can only attend to other tokens within the same
-    segment, as defined by the cumulative sequence lengths. Tokens in different
-    segments are masked with negative infinity.
-
-    Args:
-        cu_seqlens (Array): Cumulative sequence lengths defining segment boundaries.
-        seq_length (int): Total sequence length.
-        dtype (jnp.dtype): Data type for the output mask.
-
-    Returns:
-        Array: Block-diagonal attention mask of shape (1, seq_length, seq_length).
-    """
-    positions = jnp.arange(seq_length)
-    starts = cu_seqlens[:-1]
-    ends = cu_seqlens[1:]
-    in_segment = (positions[:, None] >= starts[None, :]) & (positions[:, None] < ends[None, :])
-    segment_ids = jnp.argmax(in_segment.astype(jnp.int32), axis=-1)
-    same_segment = segment_ids[:, None] == segment_ids[None, :]
-    attention_mask = jnp.where(same_segment, 0.0, jnp.finfo(dtype).min).astype(dtype)
-    return attention_mask[None, :, :]
+# The packed-vision block-diagonal mask is shared infrastructure; this family
+# had its own copy. Bind the module-level name so call sites are unchanged.
+create_attention_mask = block_diagonal_bias
 
 
 class Glm4vVisionPatchEmbed(spx.Module):

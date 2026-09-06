@@ -389,12 +389,62 @@ class MultiModalRotaryEmbedding(RotaryEmbedding):
         Returns:
             Interleaved frequencies with shape (batch, seq, rotary_dim//2).
         """
-        freqs_t = freqs[0]
+        channels = jnp.arange(freqs.shape[-1], dtype=jnp.int32)
+        out = freqs[0]
         for dim_idx, offset in enumerate((1, 2), start=1):
-            section_size = self.mrope_section[dim_idx] * 3
-            idx = slice(offset, section_size, 3)
-            freqs_t = freqs_t.at[..., idx].set(freqs[dim_idx, ..., idx])
-        return freqs_t
+            section_end = self.mrope_section[dim_idx] * 3
+            take_dim = (channels % 3 == offset) & (channels < section_end)
+            out = jnp.where(take_dim, freqs[dim_idx], out)
+        return out
+
+    def compute_cos_sin(
+        self,
+        positions: jax.Array,
+        dtype: jnp.dtype | None = None,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Compute merged mRoPE cos/sin tables without applying them.
+
+        This is the frequency half of :meth:`forward` (direct-computation
+        path, no frequency cache), exposed for consumers that need the tables
+        themselves rather than rotated tensors -- the Qwen4 QSA indexer ropes
+        queries at their own positions and pooled block keys at block-start
+        positions, which a single rotate-in-place call cannot express.
+
+        Args:
+            positions: Position ids, ``(batch, seq)`` or ``(3, batch, seq)``.
+            dtype: Output dtype; defaults to the module's ``dtype``.
+
+        Returns:
+            ``(cos, sin)``, each ``(batch, seq, rotary_dim)`` in NeoX
+            (split-half, pre-doubled) layout when ``is_neox_style`` is set.
+        """
+        if positions.ndim == 2:
+            positions = jnp.broadcast_to(positions[jnp.newaxis, ...], (3, *positions.shape))
+        elif positions.ndim != 3 or positions.shape[0] != 3:
+            raise ValueError(f"Position IDs must have shape (batch, seq) or (3, batch, seq); got {positions.shape}.")
+
+        inv_freq = compute_basic_inv_frequencies(self.base, self.rotary_dim)  # (rotary_dim//2,)
+        inv_freq = inv_freq[jnp.newaxis, jnp.newaxis, jnp.newaxis, :]
+        freqs = positions[..., jnp.newaxis].astype(jnp.float32) * inv_freq  # (3, b, seq, dim/2)
+
+        if self.mrope_interleaved:
+            # Qwen3-VL style: apply interleaving on half-dim freqs, then double
+            freqs_interleaved = self._apply_interleaved_mrope(freqs)  # (b, seq, dim/2)
+            emb = jnp.concatenate([freqs_interleaved, freqs_interleaved], axis=-1)  # (b, seq, dim)
+        else:
+            # Qwen2-VL style: double first, then apply chunked pattern
+            emb = jnp.concatenate([freqs, freqs], axis=-1)  # (3, b, seq, dim)
+            emb = self._apply_chunked_mrope(emb)  # (b, seq, dim)
+
+        cos = jnp.cos(emb) * self.attention_scaling
+        sin = jnp.sin(emb) * self.attention_scaling
+        if not self.is_neox_style:
+            # GPT-J rotates adjacent channel pairs, so table entries must be
+            # adjacent duplicates rather than NeoX duplicated halves.
+            cos = jnp.repeat(cos[..., : cos.shape[-1] // 2], 2, axis=-1)
+            sin = jnp.repeat(sin[..., : sin.shape[-1] // 2], 2, axis=-1)
+        out_dtype = dtype or self.dtype
+        return cos.astype(out_dtype), sin.astype(out_dtype)
 
     @jax.named_scope("easydel-mrope")
     def forward(
@@ -522,8 +572,9 @@ class MultiModalRotaryEmbedding(RotaryEmbedding):
             k_rot = key[..., :rotary_dim]
             q_rot, k_rot, cos, sin = _promote_rotary_operands(q_rot, k_rot, cos, sin)
 
-            q_embed = (q_rot * cos) + (_rotate_neox(q_rot) * sin)
-            k_embed = (k_rot * cos) + (_rotate_neox(k_rot) * sin)
+            rotate_fn = _rotate_neox if self.is_neox_style else _rotate_gptj
+            q_embed = (q_rot * cos) + (rotate_fn(q_rot) * sin)
+            k_embed = (k_rot * cos) + (rotate_fn(k_rot) * sin)
 
             if rotary_dim < query.shape[-1]:
                 q_embed = jnp.concatenate([q_embed, query[..., rotary_dim:].astype(q_embed.dtype)], axis=-1)

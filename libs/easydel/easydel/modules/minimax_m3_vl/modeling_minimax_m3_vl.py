@@ -86,8 +86,10 @@ from easydel.layers import (
     moe_down_projection_reform_param,
     moe_fused_gate_up_reform_param,
     split_fused_gate_up_projection,
+    swiglu_oai,
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule, UnifiedAttention
+from easydel.layers.moe import moe_group_topk_select
 from easydel.layers.norms import LayerNorm
 from easydel.modules._base import BaseCausalLMModule, BaseVisionLanguageModule
 from easydel.modules.gemma3.modeling_gemma3 import Gemma3RMSNorm
@@ -110,28 +112,9 @@ class MiniMaxM3VLRMSNorm(Gemma3RMSNorm):
     """
 
 
-def _swiglu_oai(gate: Array, up: Array, *, alpha: float, limit: float) -> Array:
-    """Apply the clamped SwiGLU-OAI activation used by MiniMax M3.
-
-    Computes ``(clip(up, -limit, limit) + 1) * glu`` where
-    ``glu = clip(gate, max=limit) * sigmoid(clip(gate, max=limit) * alpha)``.
-    The ``+1`` shift on the up branch keeps the multiplicative path
-    well-defined when ``up`` is exactly zero (same recipe as GPT-OSS, but the
-    gate/up channels are stored as concatenated halves, not interleaved).
-
-    Args:
-        gate: Gate projection output.
-        up: Up projection output.
-        alpha: Sigmoid gain of the Swish-style gate.
-        limit: Clamp bound (gate is clamped from above only; up on both sides).
-
-    Returns:
-        The activated intermediate tensor with the same shape as ``gate``.
-    """
-    gate = jnp.clip(gate, max=limit)
-    up = jnp.clip(up, min=-limit, max=limit)
-    glu = gate * jax.nn.sigmoid(gate * alpha)
-    return (up + 1.0) * glu
+# The OAI-style clamped SwiGLU is shared; this family had the only named copy.
+# Bound to the module-level name so call sites are unchanged.
+_swiglu_oai = swiglu_oai
 
 
 def _apply_partial_rotary(x: Array, cos: Array, sin: Array) -> Array:
@@ -387,7 +370,7 @@ class MiniMaxM3VLTopKRouter(spx.Module):
     and the fp32 ``e_score_correction_bias`` buffer (HF stores it on the
     router: ``mlp.gate.e_score_correction_bias``). The sigmoid scoring,
     bias-corrected selection, normalization and ``routed_scaling_factor``
-    live in :meth:`MiniMaxM3VLSparseMoeBlock._select_experts_static`.
+    live in :func:`easydel.layers.moe.moe_group_topk_select`.
     """
 
     def __init__(
@@ -538,46 +521,16 @@ class MiniMaxM3VLSparseMoeBlock(BaseMoeModule):
         self.moe_hooks = MoeFusedHooks(
             normalize_gate_logits=lambda x: x,
             select_hook=partial(
-                self._select_experts_static,
+                moe_group_topk_select,
+                n_routed_experts=config.num_local_experts,
+                score_fn="sigmoid",
                 e_score_correction_bias=None,
+                n_group=1,
+                norm_topk_prob=True,
                 routed_scaling_factor=config.routed_scaling_factor,
+                norm_eps=0.0,
             ),
         )
-
-    @staticmethod
-    def _select_experts_static(
-        gate_logits: Array,
-        pre_bias_logits: Array | None,
-        k: int,
-        *,
-        e_score_correction_bias: Array | None,
-        routed_scaling_factor: float,
-    ) -> tuple[Array, Array]:
-        """Run the MiniMax M3 bias-corrected sigmoid top-k expert selection.
-
-        Args:
-            gate_logits: Pre-sigmoid router logits ``(num_tokens, num_experts)``.
-            pre_bias_logits: Unused; kept for hook signature compatibility.
-            k: Number of routed experts selected per token.
-            e_score_correction_bias: Per-expert fp32 selection bias, or ``None``
-                for zero bias.
-            routed_scaling_factor: Multiplier applied to the selected weights
-                (algebraically identical to HF scaling the routed output).
-
-        Returns:
-            Tuple ``(topk_weights, topk_indices)`` of shape ``(num_tokens, k)``.
-        """
-        del pre_bias_logits
-        scores = jax.nn.sigmoid(gate_logits.astype(jnp.float32))
-        if e_score_correction_bias is None:
-            scores_for_choice = scores
-        else:
-            scores_for_choice = scores + e_score_correction_bias.astype(jnp.float32)
-        topk_indices = jax.lax.top_k(scores_for_choice, k=k)[1]
-        topk_weights = jnp.take_along_axis(scores, topk_indices, axis=-1)
-        topk_weights = topk_weights / jnp.sum(topk_weights, axis=-1, keepdims=True)
-        topk_weights = topk_weights * routed_scaling_factor
-        return topk_weights, topk_indices
 
     def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
         """Route tokens through the selected experts and add the shared expert.
@@ -592,9 +545,14 @@ class MiniMaxM3VLSparseMoeBlock(BaseMoeModule):
         """
         hooks = self.moe_hooks.replace(
             select_hook=partial(
-                self._select_experts_static,
+                moe_group_topk_select,
+                n_routed_experts=self.config.num_local_experts,
+                score_fn="sigmoid",
                 e_score_correction_bias=self.gate.e_score_correction_bias.value,
+                n_group=1,
+                norm_topk_prob=True,
                 routed_scaling_factor=self.routed_scaling_factor,
+                norm_eps=0.0,
             ),
         )
 

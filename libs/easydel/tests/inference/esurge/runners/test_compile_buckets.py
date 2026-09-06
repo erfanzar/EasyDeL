@@ -16,6 +16,19 @@ import numpy as np
 import pytest
 from easydel.inference.esurge.runners.execution_manager import ExecutionManager
 from easydel.inference.esurge.runners.executors.sampler_executor import SamplerRuntime
+from easydel.inference.esurge.runners.window_planner import WindowPlanner
+
+
+def test_explicit_oversized_request_bucket_keeps_exact_runtime_cap():
+    buckets = WindowPlanner.init_seq_buckets(
+        user_buckets=[32],
+        max_num_seqs=16,
+        min_input_pad=16,
+    )
+
+    assert buckets == [16, 32]
+    planner = WindowPlanner(num_tokens_paddings=[16], max_num_seq_buckets=buckets)
+    assert planner.get_current_bucket(16) == 16
 
 
 class _SpmdMesh:

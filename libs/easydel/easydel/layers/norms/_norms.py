@@ -311,6 +311,10 @@ class RMSNorm(spx.Module):
         dtype: DTypeLike = jnp.bfloat16,
         param_dtype: DTypeLike = jnp.bfloat16,
         *,
+        scale_offset: float = 0.0,
+        with_scale: bool = True,
+        group_size: int | None = None,
+        kernel_init: tp.Callable | None = None,
         rngs: spx.Rngs | None = None,
     ) -> None:
         """Initialize the RMSNorm layer.
@@ -332,6 +336,27 @@ class RMSNorm(spx.Module):
             param_dtype: Data type for storing learnable parameters (scale kernel).
                 Using float32 for parameters while using bfloat16 for computation
                 is a common mixed-precision strategy. Defaults to jnp.bfloat16.
+            scale_offset: Added to the learned weight before it multiplies the
+                normalized output, so the layer applies ``(scale_offset + w)``.
+                Pass ``1.0`` for the Gemma-family ``(1 + w)`` convention, where
+                the stored parameter is zero-centred at init. Defaults to
+                ``0.0``, which is the plain ``w * output`` behaviour.
+            with_scale: When ``False`` the layer is scale-free: no parameter is
+                allocated and the normalized output is returned directly. Use
+                for the unweighted RMS norms some models apply to Q/K. Note the
+                free function :func:`rms_norm` computes the same thing without
+                a module. Defaults to ``True``.
+            group_size: When set, the trailing axis is reshaped to
+                ``(..., dim // group_size, group_size)`` and the mean-square is
+                taken per group rather than over the whole axis. Qwen4's
+                hyper-connection norms use this to normalize each residual
+                stream independently inside the flattened ``hc_count * hidden``
+                vector. Defaults to ``None`` (single group, the classic RMSNorm).
+            kernel_init: Optional initializer override for the scale parameter.
+                Defaults to ``None``, which keeps the class-level ``kernel_init``
+                (ones). Pass ``jax.nn.initializers.zeros`` together with
+                ``scale_offset=1.0`` for the zero-centred ``(1 + w)`` convention
+                where the effective scale starts at identity.
             rngs: spectrax random number generators for parameter initialization.
                 If None, creates a new Rngs instance with seed 0.
 
@@ -352,9 +377,21 @@ class RMSNorm(spx.Module):
         self.eps = eps
         self.dtype = dtype
         self.param_dtype = param_dtype
-        self.weight = spx.Parameter(
-            RMSNorm.kernel_init(rngs.parameters, (self.dim,), self.param_dtype),
-            sharding=sharding_for_layout(Replicated),
+        self.scale_offset = scale_offset
+        self.with_scale = with_scale
+        if group_size is not None and dim % group_size != 0:
+            raise ValueError(f"RMSNorm dim ({dim}) must be divisible by group_size ({group_size}).")
+        self.group_size = group_size
+        init = kernel_init if kernel_init is not None else RMSNorm.kernel_init
+        # ``with_scale=False`` allocates no parameter at all -- a scale-free RMS
+        # norm must not add a phantom leaf to the checkpoint.
+        self.weight = (
+            spx.Parameter(
+                init(rngs.parameters, (self.dim,), self.param_dtype),
+                sharding=sharding_for_layout(Replicated),
+            )
+            if with_scale
+            else None
         )
 
     def _norm(self, x: Float[Array, "... dim"]) -> Float[Array, "... dim"]:
@@ -380,6 +417,10 @@ class RMSNorm(spx.Module):
             typically faster than separate division and sqrt operations on
             accelerator hardware.
         """
+        if self.group_size is not None:
+            grouped = x.reshape(*x.shape[:-1], -1, self.group_size)
+            normed = grouped * lax.rsqrt(jnp.square(grouped).mean(-1, keepdims=True) + self.eps)
+            return normed.reshape(x.shape)
         return x * lax.rsqrt(jnp.square(x).mean(-1, keepdims=True) + self.eps)
 
     @jax.named_scope("easydel-rmsnorm")
@@ -423,7 +464,14 @@ class RMSNorm(spx.Module):
         else:
             x = x.astype(jnp.promote_types(self.dtype, x.dtype))
         output = self._norm(x).astype(self.dtype)
+        if not self.with_scale:
+            return output.astype(org_dtype)
         weight = self.weight.astype(self.dtype)
+        if self.scale_offset:
+            # Gemma-family layers store ``w`` and apply ``(1 + w)`` so the
+            # parameter is zero-centred at init. Folding the offset in here is
+            # what let seven families drop their private RMSNorm subclass.
+            weight = weight + jnp.asarray(self.scale_offset, weight.dtype)
         return (weight * output).astype(org_dtype)
 
 
@@ -482,6 +530,7 @@ class RMSNormGated(spx.Module):
         dtype: DTypeLike = jnp.bfloat16,
         param_dtype: DTypeLike = jnp.bfloat16,
         *,
+        activation: str = "silu",
         rngs: spx.Rngs,
     ):
         """Initialize the gated RMSNorm layer.
@@ -496,9 +545,16 @@ class RMSNormGated(spx.Module):
                 Defaults to ``jnp.bfloat16``.
             param_dtype: Storage dtype for the learnable scale parameter.
                 Defaults to ``jnp.bfloat16``.
+            activation: Gating activation applied to the gate tensor before it
+                multiplies the normalized stream. ``"silu"`` (default) is the
+                GatedDeltaNet/KDA convention; ``"sigmoid"`` is Qwen4's
+                ``output_gate_type: sigmoid`` variant.
             rngs: SpecTrax random number generators used to initialize the
                 scale parameter (default initializer is ones).
         """
+        if activation not in ("silu", "sigmoid"):
+            raise ValueError(f"RMSNormGated activation must be 'silu' or 'sigmoid', got {activation!r}")
+        self.activation = activation
         self.hidden_size = hidden_size
         self.eps = eps
         self.dtype = dtype
@@ -534,7 +590,8 @@ class RMSNormGated(spx.Module):
         variance = jnp.mean(hidden_states**2, axis=-1, keepdims=True)
         hidden_states = hidden_states * lax.rsqrt(variance + self.eps)
         hidden_states = self.weight.value.astype(jnp.float32) * hidden_states
-        hidden_states = hidden_states * jax.nn.silu(gate.astype(jnp.float32))
+        gate_fn = jax.nn.silu if self.activation == "silu" else jax.nn.sigmoid
+        hidden_states = hidden_states * gate_fn(gate.astype(jnp.float32))
         return hidden_states.astype(input_dtype)
 
 
@@ -935,3 +992,48 @@ class LayerNorm(spx.Module):
             self.dtype,
             self.epsilon,
         )
+
+
+def rms_norm(x: Float[Array, "... dim"], eps: float = 1e-6) -> Float[Array, "... dim"]:
+    """Scale-free RMS normalisation over the trailing axis.
+
+    ``x * rsqrt(mean(x**2, -1) + eps)``, computed in float32 and cast back.
+    This is the unweighted norm four families each wrote out by hand
+    (``_unweighted_rms_norm``, ``_scaleless_rms_norm``, ``Llama4TextL2Norm``,
+    ``Gemma4RMSNorm(with_scale=False)``).
+
+    Use :class:`RMSNorm` with ``with_scale=False`` when a module is wanted;
+    this function is for call sites that just need the math.
+
+    Args:
+        x: Input array; normalised along its last axis.
+        eps: Added to the mean square before the reciprocal square root.
+
+    Returns:
+        Normalised array, same shape and dtype as ``x``.
+    """
+    # The scale is reduced in float32 and cast back *before* multiplying, which
+    # is the HF convention every existing caller follows. Multiplying in float32
+    # and casting the product instead diverges by ~1.6e-2 in bfloat16, so this
+    # ordering is load-bearing, not incidental.
+    scale = lax.rsqrt(jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True) + eps)
+    return x * scale.astype(x.dtype)
+
+
+def l2_norm(x: Float[Array, "... dim"], eps: float = 1e-6) -> Float[Array, "... dim"]:
+    """L2 normalisation over the trailing axis.
+
+    ``x * rsqrt(sum(x**2, -1) + eps)`` -- a *sum*, not a mean, which is what
+    distinguishes it from :func:`rms_norm`. Used where a true unit-norm vector
+    is wanted (``gidd`` attention, ``qwen3_next``'s decode path, which holds a
+    bit-parity contract with its ejkernel counterpart).
+
+    Args:
+        x: Input array; normalised along its last axis.
+        eps: Added to the squared sum before the reciprocal square root.
+
+    Returns:
+        Normalised array, same shape and dtype as ``x``.
+    """
+    scale = lax.rsqrt(jnp.sum(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True) + eps)
+    return x * scale.astype(x.dtype)

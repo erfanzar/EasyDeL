@@ -357,14 +357,25 @@ def _quantized_fused_call(mlp, config, x2d: jax.Array) -> jax.Array | None:
     segments = max(1, int(tensor_parallel_size(config, arr=gu_codes)))
     layout = "interleaved" if segments > 1 else "concat"
 
-    act_bits = getattr(getattr(gate_up_proj, "config", None), "activation_bits", None)
-    kwargs: dict = {}
-    if act_bits is not None:
+    from easydel.layers.quantization._configs import explicit_activation_kwargs
+
+    gu_config = getattr(gate_up_proj, "config", None)
+    dn_config = getattr(down_proj, "config", None)
+    act_bits = getattr(gu_config, "activation_bits", None)
+    policy = getattr(gu_config, "activation_policy", "auto")
+    if (policy, act_bits) != (
+        getattr(dn_config, "activation_policy", "auto"),
+        getattr(dn_config, "activation_bits", None),
+    ):
+        return None  # Compose the linears so each honors its own contract.
+    kwargs: dict = explicit_activation_kwargs(gu_config)
+    if not kwargs and act_bits is not None:
         kwargs["quantize_activations"] = True
         kwargs["activation_bits"] = int(act_bits)
     packed_bytes = (gu_packed.size + dn_packed.size) if (gu_packed is not None and dn_packed is not None) else 0
     if (
         gu_bits == 4
+        and (policy != "explicit" or act_bits == 4)
         and gu_packed is not None
         and dn_packed is not None
         and not act_params
@@ -502,3 +513,50 @@ def gated_mlp_forward(
         partition_manager=config.runtime_sharding_resolver,
     )
     return checkpoint_name(out, "mlp_output")
+
+
+def clamped_swiglu(gate, up, *, limit: float, act_fn):
+    """SwiGLU with both branches clamped before the product.
+
+    ``act_fn(clip(gate, max=limit)) * clip(up, -limit, +limit)``.
+
+    Note this is **not** the OAI variant: there is no ``+1`` shift on the up
+    branch and no sigmoid gain. Use :func:`swiglu_oai` for that one -- the two
+    were mistaken for each other during a duplication survey, and they are not
+    interchangeable.
+
+    Args:
+        gate: Gate projection output.
+        up: Up projection output.
+        limit: Clamp bound; gate is clamped from above only, up on both sides.
+        act_fn: Activation applied to the clamped gate.
+
+    Returns:
+        Activated intermediate tensor, same shape as ``gate``.
+    """
+    gate = jnp.clip(gate, max=limit)
+    up = jnp.clip(up, min=-limit, max=limit)
+    return act_fn(gate) * up
+
+
+def swiglu_oai(gate, up, *, alpha: float, limit: float):
+    """OAI-style clamped SwiGLU with a shifted up branch.
+
+    ``(clip(up, -limit, limit) + 1) * (g * sigmoid(g * alpha))`` where
+    ``g = clip(gate, max=limit)``. The ``+1`` keeps the multiplicative path
+    well-defined when ``up`` is exactly zero.
+
+    Distinct from :func:`clamped_swiglu`; see the note there.
+
+    Args:
+        gate: Gate projection output.
+        up: Up projection output.
+        alpha: Sigmoid gain of the Swish-style gate.
+        limit: Clamp bound.
+
+    Returns:
+        Activated intermediate tensor, same shape as ``gate``.
+    """
+    gate = jnp.clip(gate, max=limit)
+    up = jnp.clip(up, min=-limit, max=limit)
+    return (up + 1) * (gate * jax.nn.sigmoid(gate * alpha))

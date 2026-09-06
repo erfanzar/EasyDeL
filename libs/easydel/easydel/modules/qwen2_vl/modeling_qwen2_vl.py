@@ -73,7 +73,7 @@ from easydel.layers import (
     dense_gate_up_layout,
     gated_mlp_forward,
 )
-from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
+from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention, block_diagonal_bias
 from easydel.layers.norms import LayerNorm
 from easydel.modules._base import BaseVisionLanguageModule
 
@@ -275,96 +275,16 @@ class Qwen2VLCausalLMOutputWithPast(ModelOutput):
     rope_deltas: Array | None = None
 
 
-def create_attention_mask(cu_seqlens: Array, seq_length: int, dtype: jnp.dtype) -> Array:
-    """Create block-diagonal attention mask from cumulative sequence lengths.
-
-    Creates a mask that allows attention only within segments defined by
-    cumulative sequence lengths, used for processing multiple images/videos
-    as separate sequences within a batch.
-
-    Args:
-        cu_seqlens (Array): Cumulative sequence lengths of shape (num_segments + 1,).
-            For example, [0, 100, 256] indicates two segments: positions 0-99 and 100-255.
-        seq_length (int): Total sequence length for the output mask.
-        dtype (jnp.dtype): Data type for the output mask (typically float32 or bfloat16).
-
-    Returns:
-        Array: Block-diagonal attention mask of shape (1, seq_length, seq_length).
-            Positions within the same segment have value 0.0, positions across
-            different segments have value -inf (dtype minimum).
-    """
-    positions = jnp.arange(seq_length)
-    starts = cu_seqlens[:-1]
-    ends = cu_seqlens[1:]
-    in_segment = (positions[:, None] >= starts[None, :]) & (positions[:, None] < ends[None, :])
-
-    segment_ids = jnp.argmax(in_segment.astype(jnp.int32), axis=-1)
-    same_segment = segment_ids[:, None] == segment_ids[None, :]
-    attention_mask = jnp.where(same_segment, 0.0, jnp.finfo(dtype).min).astype(dtype)
-
-    return attention_mask[None, :, :]
+# The packed-vision block-diagonal mask is shared infrastructure; this family
+# had its own copy. Bind the module-level name so call sites are unchanged.
+create_attention_mask = block_diagonal_bias
 
 
-def _merge_multimodal_embeddings(
-    inputs_embeds: jax.Array,
-    is_multimodal: jax.Array,
-    multimodal_embeddings: jax.Array,
-) -> jax.Array:
-    """Merge multimodal embeddings into text embeddings at placeholder positions.
-
-    Args:
-        inputs_embeds: Text embeddings with shape (batch, seq_len, hidden)
-        is_multimodal: Boolean mask with shape (batch, seq_len)
-        multimodal_embeddings: Flattened vision embeddings with shape (total_tokens, hidden)
-
-    Returns:
-        Merged embeddings with shape (batch, seq_len, hidden)
-    """
-    batch_size, seq_len, hidden = inputs_embeds.shape
-
-    flat_embeds = inputs_embeds.reshape(-1, hidden)
-    flat_mask = is_multimodal.reshape(-1)
-
-    dummy_row = jnp.zeros_like(multimodal_embeddings[0:1])
-    flattened_padded = jnp.concatenate([dummy_row, multimodal_embeddings], axis=0)
-
-    gather_indices = jnp.cumsum(flat_mask)
-    update_values = flattened_padded[gather_indices]
-
-    condition = jnp.expand_dims(flat_mask, axis=-1)
-    merged = jnp.where(condition, update_values, flat_embeds)
-
-    return merged.reshape(batch_size, seq_len, hidden)
-
-
-def merge_multimodal_embeddings(
-    input_ids: jax.Array,
-    inputs_embeds: jax.Array,
-    multimodal_embeddings: jax.Array,
-    placeholder_token_id: int | list[int],
-) -> jax.Array:
-    """Merge multimodal embeddings into text embeddings at placeholder token positions.
-
-    Replaces embeddings at positions where input_ids match the placeholder token(s)
-    with the corresponding multimodal (image/video) embeddings.
-
-    Args:
-        input_ids (jax.Array): Input token IDs of shape (batch_size, seq_length).
-        inputs_embeds (jax.Array): Text embeddings of shape (batch_size, seq_length, hidden_dim).
-        multimodal_embeddings (jax.Array): Flattened vision embeddings of shape (total_tokens, hidden_dim).
-        placeholder_token_id (int | list[int]): Token ID(s) indicating where to insert vision embeddings.
-            Can be a single int or list of ints for multiple placeholder types.
-
-    Returns:
-        jax.Array: Merged embeddings of shape (batch_size, seq_length, hidden_dim) with vision
-            embeddings inserted at placeholder positions.
-    """
-    if isinstance(placeholder_token_id, list):
-        placeholder_token_id = jnp.array(placeholder_token_id)
-        is_multimodal = jnp.isin(input_ids, placeholder_token_id)
-    else:
-        is_multimodal = input_ids == placeholder_token_id
-    return _merge_multimodal_embeddings(inputs_embeds, is_multimodal, multimodal_embeddings)
+# The cumsum-gather merge is shared infrastructure; these families each had
+# their own copy of it. `BaseVisionLanguageModule.merge_multimodal_embeddings`
+# is the same algorithm, so bind the module-level name to it rather than
+# restating it. Keeping the name means call sites (and importers) are unchanged.
+merge_multimodal_embeddings = BaseVisionLanguageModule.merge_multimodal_embeddings
 
 
 def rotate_half(x):

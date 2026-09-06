@@ -526,11 +526,7 @@ class ParallelMoELinear(spx.Module):
                 group_sizes,
                 rule=quant_rule,
                 preferred_element_type=jnp.bfloat16,
-            ) + (
-                self._expand_bias_ragged(group_sizes, sorted_experts=sorted_experts)
-                if self.bias is not None
-                else 0
-            )
+            ) + (self._expand_bias_ragged(group_sizes, sorted_experts=sorted_experts) if self.bias is not None else 0)
 
         if quant_rule is not None:
             # Stacked expert kernels are ``[experts, contracted, out]``: axis 1
@@ -692,6 +688,9 @@ class ParallelMoELinear(spx.Module):
                     direction=self._direction,
                     use_expert_tensor_mode=self.use_expert_tensor_mode,
                     quantization_bits=bits,
+                    activation_bits=(
+                        config.activation_bits if getattr(config, "activation_policy", "auto") == "explicit" else None
+                    ),
                     rngs=rngs,
                 ),
                 spx.Rngs(0),
@@ -701,18 +700,38 @@ class ParallelMoELinear(spx.Module):
         return lazy_module.restage_from_dense(self.weight.value)
 
 
-class ParallelMoELinearQuantized(ParallelMoELinear):
-    """Stacked expert linear with channelwise-int8 weights (w8a8 runtime).
+@jax.tree_util.register_pytree_node_class
+class _QuantizedExpertKernel(tuple):
+    """Two tensor leaves with static per-projection activation precision.
 
-    Stores per-expert int8 codes ``[E, K, N]`` plus per-expert per-output-
-    channel float32 scales ``[E, 1, N]``. The forward quantizes activations
-    per row at runtime and runs TPU's native int8 ragged_dot via
-    :func:`ejkernel.modules.grouped_matmul_w8a8` — halving expert weight HBM
-    traffic, the dominant cost of decode-shaped MoE steps.
+    This ephemeral kernel view does not change stored checkpoint arrays.
+    Tuple compatibility preserves consumers that unpack ``(codes, scales)``.
     """
 
-    def __init__(self, *args, quantization_bits: int = 8, **kwargs):
+    def __new__(cls, codes, scales, activation_bits):
+        obj = super().__new__(cls, (codes, scales))
+        obj.activation_bits = activation_bits
+        return obj
+
+    def tree_flatten(self):
+        return tuple(self), self.activation_bits
+
+    @classmethod
+    def tree_unflatten(cls, activation_bits, leaves):
+        return cls(*leaves, activation_bits)
+
+
+class ParallelMoELinearQuantized(ParallelMoELinear):
+    """Channelwise INT4/INT8 expert weights with explicit or legacy precision.
+
+    ``activation_bits=None`` retains the legacy runtime INT8 path. Explicit
+    16 preserves floating activations; 4/8 request per-row integer quantization.
+    Codes and per-channel scale checkpoint shapes remain unchanged.
+    """
+
+    def __init__(self, *args, quantization_bits: int = 8, activation_bits: int | None = None, **kwargs):
         self._quantization_bits = int(quantization_bits)
+        self._activation_bits = activation_bits
         super().__init__(*args, **kwargs)
         weight_layout = _moe_parameter_layout(
             direction=self._direction,
@@ -759,7 +778,9 @@ class ParallelMoELinearQuantized(ParallelMoELinear):
         return self
 
     def kernel_view(self) -> tuple[Array, Array]:
-        """Return ``(codes, scales)`` for the fused-MoE w8a8 dispatch."""
+        """Return codes/scales with explicit precision metadata when requested."""
+        if self._activation_bits is not None:
+            return _QuantizedExpertKernel(self.quant_kernel.value, self.quant_scales.value, self._activation_bits)
         return (self.quant_kernel.value, self.quant_scales.value)
 
     def forward(
@@ -768,8 +789,19 @@ class ParallelMoELinearQuantized(ParallelMoELinear):
         group_sizes: Int[Array, "num_groups"],  # noqa
         sorted_experts: Int[Array, "tokens_ragged"] | None = None,  # noqa
     ) -> Float[Array, "tokens_ragged out_dim"]:
-        """Apply the per-expert transformation via the w8a8 grouped matmul."""
+        """Apply each expert with its configured activation precision."""
         del sorted_experts
+        if self._activation_bits is not None:
+            from ejkernel.modules import grouped_matmul_channelwise
+
+            return grouped_matmul_channelwise(
+                inputs,
+                self.quant_kernel.value,
+                self.quant_scales.value,
+                group_sizes,
+                activation_bits=self._activation_bits,
+                preferred_element_type=jnp.bfloat16 if self.dtype != jnp.float32 else jnp.float32,
+            )
         from ejkernel.modules import grouped_matmul_w8a8  # pyright: ignore[reportMissingTypeStubs]
 
         codes = self.quant_kernel.value

@@ -12,7 +12,7 @@
 .dockerignore
 .rayignore
 .claude/
-.claude/
+.xerxes/
 .codex/
 .cursor/
 .cursor-server/

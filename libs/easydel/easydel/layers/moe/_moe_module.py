@@ -89,6 +89,7 @@ from ._communication_utils import (
     get_moe_partition_spec,
     local_permute,
     permute,
+    replicated_expert_combine,
     resolve_eformer_axis,
     sort_activations,
     unpermute,
@@ -99,6 +100,30 @@ if typing.TYPE_CHECKING:
     from easydel.infra.base_config import EasyDeLBaseConfig
 
 logger = get_logger(__name__)
+
+
+def _channelwise_grouped_platform(rows, codes, activation_bits, *, force_xla=False):
+    """Select measured v5p decode and W4A4 prefill matrix families.
+
+    Large native INT4 ragged dots on these v5p shapes were much slower than
+    exact INT8 arithmetic with packed INT4 HBM storage. Keep A16 decode-only,
+    retain forced-XLA, and do not extrapolate past the measured row range.
+    """
+    measured_rows = 0 < rows.shape[0] <= 128 or (activation_bits == 4 and 1280 <= rows.shape[0] <= 81920)
+    if (
+        force_xla
+        or activation_bits not in (4, 16)
+        or rows.dtype != jnp.bfloat16
+        or codes.dtype not in (jnp.int4, jnp.int8)
+        or (activation_bits == 4 and codes.dtype != jnp.int4)
+        or not measured_rows
+        or codes.shape not in ((128, 2560, 1280), (128, 640, 2560))
+        or jax.default_backend() != "tpu"
+    ):
+        return "xla"
+    from jax.experimental.pallas import tpu as pltpu
+
+    return "pallas" if pltpu.get_tpu_info().chip_version.value == "v5p" else "xla"
 
 
 def _expert_tile_m(buffer_rows: int, num_experts: int) -> int:
@@ -840,7 +865,7 @@ class BaseMoeModule(spx.Module, ABC):
         BS = gate_logits.shape[0]
         experts_per_group = self.n_routed_experts // n_groups
         scores_grouped = gate_logits.reshape(BS, n_groups, experts_per_group)
-        top2_vals, _ = jax.lax.top_k(scores_grouped, k=2)
+        top2_vals, _ = jax.lax.top_k(scores_grouped, k=min(2, experts_per_group))
         group_scores = jnp.sum(top2_vals.astype(jnp.float32), axis=-1)
         _, group_idx = jax.lax.top_k(group_scores, k=topk_groups)
         mask_groups = jax.nn.one_hot(group_idx, num_classes=n_groups, dtype=jnp.float32).sum(axis=-2)
@@ -1401,6 +1426,19 @@ class BaseMoeModule(spx.Module, ABC):
         output_weights_hook = hooks.output_weights_hook if hooks else None
         _BS, _SQLN, HD = hidden_state.shape
 
+        # Capture per-projection precision before entering shard_map. Its
+        # array arguments retain the legacy two-tensor tuple/spec structure.
+        # Do not infer this from a global config: projections may differ.
+        def _unpack_precision(kernel):
+            if isinstance(kernel, tuple):
+                return tuple(kernel), getattr(kernel, "activation_bits", None)
+            return kernel, None
+
+        wi_kernel, wi_activation_bits = _unpack_precision(wi_kernel)
+        wu_kernel, wu_activation_bits = _unpack_precision(wu_kernel)
+        wd_kernel, wd_activation_bits = _unpack_precision(wd_kernel)
+        gate_up_kernel, gate_up_activation_bits = _unpack_precision(gate_up_kernel)
+
         hidden_state = hidden_state.astype(self.dtype)
         gate_hidden_state = hidden_state if gate_hidden_state is None else gate_hidden_state.astype(self.dtype)
         if hooks is not None and hooks.before_gate is not None:
@@ -1437,13 +1475,22 @@ class BaseMoeModule(spx.Module, ABC):
         )
         runtime_sharding_resolver = self.runtime_sharding_resolver
 
-        # Resolve axis names from the runtime sharding resolver rather than the mesh directly.
-        dp_axis_name = resolve_eformer_axis(DP, runtime_sharding_resolver)
-        expert_axis_name = resolve_eformer_axis(EP, runtime_sharding_resolver)
-        tensor_axis_name = resolve_eformer_axis(TP, runtime_sharding_resolver)
-
-        ep_size = expert_mesh.shape[expert_axis_name]
-        tp_size = expert_mesh.shape[tensor_axis_name]
+        # Honour ExpertTensorMode's EP/TP axis swap consistently. The generic
+        # status resolver already maps experts onto physical TP and tensor
+        # contraction onto physical EP in that mode; hard-coding EP/TP here
+        # incorrectly rejected the supported tp=4, ep=1 layout.
+        (
+            dp_axis_name,
+            _,
+            expert_axis_name,
+            tensor_axis_name,
+            _,
+            _,
+            _,
+            ep_size,
+            tp_size,
+            _,
+        ) = self._get_sharding_status()
 
         # Quantization-aware training reaches the experts here rather than
         # through ``ParallelMoELinear.forward``: this fused path reads the
@@ -1828,21 +1875,11 @@ class BaseMoeModule(spx.Module, ABC):
                         # matmul garbage tail never propagates (verified by a
                         # masked/unmasked A/B on a v5p-2048 ep=4 mesh).
                         rows = moe_chunk_size * self.num_experts_per_tok
-                        out_buf = jnp.zeros((rows, HD // tp_size), dtype=inter.dtype)
-                        in_off, send_sz, out_off, recv_sz = get_all_to_all_params(
-                            chunk_shard_group_sizes,
-                            expert_shard_id,
-                            ep_size,
-                            is_batch_sharded=False,
-                        )
-                        inter = jax.lax.ragged_all_to_all(
+                        inter = replicated_expert_combine(
                             inter,
-                            out_buf,
-                            in_off,
-                            send_sz,
-                            out_off,
-                            recv_sz,
+                            chunk_shard_group_sizes,
                             axis_name=expert_axis_name,
+                            output_rows=rows,
                         )
                 out = unpermute(
                     inter,
@@ -2041,7 +2078,7 @@ class BaseMoeModule(spx.Module, ABC):
                     ``tp_size == 1``).
                 """
 
-                def _expert_gmm(rows, kernel, *, tp_sharded_contraction: bool = False):
+                def _expert_gmm(rows, kernel, *, tp_sharded_contraction: bool = False, activation_bits=None):
                     """Dense bf16 grouped matmul, or — when the kernel is a
                     quantized ``(codes, scales)`` pair from ``kernel_view()`` —
                     the v3 grouped matmul's native quantised-weight path:
@@ -2101,7 +2138,43 @@ class BaseMoeModule(spx.Module, ABC):
                         )
                     if isinstance(kernel, tuple):
                         codes, scales = kernel
+                        if activation_bits is not None:
+                            from ejkernel.modules import grouped_matmul_channelwise
+
+                            return grouped_matmul_channelwise(
+                                rows,
+                                codes,
+                                scales,
+                                group_sizes,
+                                activation_bits=activation_bits,
+                                platform=_channelwise_grouped_platform(
+                                    rows,
+                                    codes,
+                                    activation_bits,
+                                    force_xla=self.config.moe_force_xla_gmm,
+                                ),
+                                preferred_element_type=gmm_kws.get("preferred_element_type", jnp.bfloat16),
+                            )
                         n_groups, k_dim, n_dim = codes.shape
+                        # Channelwise-int8 codes go through the dedicated w8a8
+                        # op (runtime per-row activation quant + exact int32
+                        # ragged-dot accumulation). The v3 ``rhs_scale`` path
+                        # is a block-float contract: it bakes the scale into
+                        # the rhs, which truncates to zero on int8 codes (and
+                        # cannot express per-row activation quantization).
+                        # Exact dtype check: 4-bit variants also occupy one
+                        # byte per element and must stay on the v3 path, which
+                        # handles int4 codes+scales natively.
+                        if codes.dtype == jnp.int8:
+                            from ejkernel.modules import grouped_matmul_w8a8  # pyright: ignore[reportMissingImports]
+
+                            return grouped_matmul_w8a8(
+                                rows,
+                                codes,
+                                scales,
+                                group_sizes,
+                                preferred_element_type=gmm_kws.get("preferred_element_type", jnp.bfloat16),
+                            )
                         # `moe_force_xla_gmm` is a user-facing override that the
                         # dense branch honours through `gmm_kws`. Re-check it
                         # here or the knob silently applies to dense experts
@@ -2133,21 +2206,21 @@ class BaseMoeModule(spx.Module, ABC):
 
                 x_rows = _mask_dispatch_tail(x_rows, group_sizes)
                 if gate_up_kernel is not None:
-                    layer_gate_up = _expert_gmm(x_rows, gate_up_kernel)
+                    layer_gate_up = _expert_gmm(x_rows, gate_up_kernel, activation_bits=gate_up_activation_bits)
                     layer_gate_up = checkpoint_name(layer_gate_up, "mlp_gate_up")
                     if gate_up_bias is not None:
                         layer_gate_up = layer_gate_up + gate_up_bias[selected_experts]
                     layer_gate_up = _mask_dispatch_tail(layer_gate_up, group_sizes)
                     layer_w0, layer_w1 = jnp.split(layer_gate_up, 2, axis=-1)
                 else:
-                    layer_w0 = _expert_gmm(x_rows, wi_kernel)
+                    layer_w0 = _expert_gmm(x_rows, wi_kernel, activation_bits=wi_activation_bits)
 
                     layer_w0 = checkpoint_name(layer_w0, "mlp_gate")
                     if wi_bias is not None:
                         layer_w0 = layer_w0 + wi_bias[selected_experts]
                     layer_w0 = _mask_dispatch_tail(layer_w0, group_sizes)
 
-                    layer_w1 = _expert_gmm(x_rows, wu_kernel)
+                    layer_w1 = _expert_gmm(x_rows, wu_kernel, activation_bits=wu_activation_bits)
 
                     layer_w1 = checkpoint_name(layer_w1, "mlp_up")
                     if wu_bias is not None:
@@ -2156,7 +2229,9 @@ class BaseMoeModule(spx.Module, ABC):
 
                 intermediate_layer = _mask_dispatch_tail(ffn_activation(layer_w0, layer_w1), group_sizes)
 
-                intermediate_output = _expert_gmm(intermediate_layer, wd_kernel, tp_sharded_contraction=True)
+                intermediate_output = _expert_gmm(
+                    intermediate_layer, wd_kernel, tp_sharded_contraction=True, activation_bits=wd_activation_bits
+                )
                 intermediate_output = checkpoint_name(intermediate_output, "mlp_down")
 
                 # TP reduction: psum_scatter to shard output across TP on hidden dimension
@@ -2515,23 +2590,11 @@ class BaseMoeModule(spx.Module, ABC):
 
                     if sorted_selected_experts.shape[0] != original_inputs_first_dim:
                         raise ValueError("original_inputs_first_dim does not match the original tensor shape!")
-                    output_shape = jnp.zeros((original_inputs_first_dim, HD // tp_size), dtype=intermediate_output.dtype)
-
-                    input_offsets, send_sizes, output_offsets, recv_sizes = get_all_to_all_params(
-                        reshaped_group_sizes,
-                        expert_shard_id,
-                        ep_size,
-                        is_batch_sharded=False,
-                    )
-
-                    intermediate_output = jax.lax.ragged_all_to_all(
+                    intermediate_output = replicated_expert_combine(
                         intermediate_output,
-                        output_shape,
-                        input_offsets,
-                        send_sizes,
-                        output_offsets,
-                        recv_sizes,
+                        reshaped_group_sizes,
                         axis_name=expert_axis_name,
+                        output_rows=original_inputs_first_dim,
                     )
 
                 output = unpermute(

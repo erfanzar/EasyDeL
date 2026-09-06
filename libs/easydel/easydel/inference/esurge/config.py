@@ -52,6 +52,31 @@ ESURGE_MIN_TOKEN_PAD: int = 16
 PPMicrobatchPolicy: TypeAlias = int | Literal["auto"] | None
 
 
+def token_bucket_floor(max_num_seqs: int, limit: int = ESURGE_MIN_TOKEN_PAD) -> int:
+    """Largest power-of-two decode bucket not exceeding concurrency or limit."""
+    capped = min(int(max_num_seqs), int(limit))
+    if capped <= 0:
+        raise ValueError(f"max_num_seqs must be positive, got {max_num_seqs}")
+    return 1 << (capped.bit_length() - 1)
+
+
+def normalize_token_bucket_minimum(value: int, max_model_len: int) -> int:
+    """Round a token-bucket minimum to a supported power of two.
+
+    ``WindowPlanner`` builds a power-of-two ladder.  Explicit non-power-of-two
+    padding minima therefore need normalization too, not only minima derived
+    from request concurrency.  If rounding upward would exceed the model
+    length, use its largest representable power-of-two bucket.
+    """
+    value = min(int(value), int(max_model_len))
+    if value <= 0:
+        raise ValueError(f"token bucket minimum must be positive, got {value}")
+    rounded = 1 << (value - 1).bit_length()
+    if rounded > int(max_model_len):
+        rounded = 1 << (int(max_model_len).bit_length() - 1)
+    return rounded
+
+
 def _normalize_pp_microbatch_policy(value: Any, *, field_name: str) -> PPMicrobatchPolicy:
     """Normalize PP microbatch runtime knobs.
 
@@ -117,10 +142,15 @@ def _validate_esurge_runtime_config(self):
         raise ValueError(f"min_input_pad must be positive, got {self.min_input_pad}")
     if self.min_token_pad is not None and self.min_token_pad <= 0:
         raise ValueError(f"min_token_pad must be positive when specified, got {self.min_token_pad}")
-    if self.min_token_pad is not None and self.max_model_len >= ESURGE_MIN_TOKEN_PAD:
-        self.min_token_pad = max(int(self.min_token_pad), ESURGE_MIN_TOKEN_PAD)
     if self.max_num_seqs <= 0:
         raise ValueError(f"max_num_seqs must be positive, got {self.max_num_seqs}")
+    if self.min_token_pad is not None:
+        # A decode step carries at most one token per active request. Never
+        # force its smallest token graph above the configured concurrency.
+        token_floor = token_bucket_floor(self.max_num_seqs)
+        self.min_token_pad = normalize_token_bucket_minimum(
+            max(int(self.min_token_pad), token_floor), self.max_model_len
+        )
     if self.max_num_batched_tokens is not NOT_GIVEN and self.max_num_batched_tokens is not None:
         if self.max_num_batched_tokens <= 0:
             raise ValueError(f"max_num_batched_tokens must be positive, got {self.max_num_batched_tokens}")
@@ -1109,6 +1139,7 @@ class eSurgeDrafterConfig(TypedDict, total=False):
             A validated ``eSurgeDrafterConfig`` instance.
         """
         ...
+
 
 def _validate_esurge_config(self) -> None:
     """Fill absent sections with their all-defaults instances."""

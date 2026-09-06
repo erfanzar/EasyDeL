@@ -94,7 +94,7 @@ class Qwen3VLMoeVisionConfig(EasyDeLBaseConfig):
         self.temporal_patch_size = temporal_patch_size
         self.out_hidden_size = out_hidden_size
         self.num_position_embeddings = num_position_embeddings
-        self.deepstack_visual_indexes = deepstack_visual_indexes or [8, 16, 24]
+        self.deepstack_visual_indexes = [8, 16, 24] if deepstack_visual_indexes is None else deepstack_visual_indexes
         self.tokens_per_second = tokens_per_second
         self.initializer_range = initializer_range
 
@@ -220,20 +220,21 @@ class Qwen3VLMoeTextConfig(EasyDeLBaseConfig):
             self.layer_types = [
                 (
                     "sliding_attention"
-                    if self.sliding_window is not None and i >= self.max_window_layers
+                    if self.sliding_window is not None and i < self.max_window_layers
                     else "full_attention"
                 )
                 for i in range(self.num_hidden_layers)
             ]
+        if len(self.layer_types) != self.num_hidden_layers:
+            raise ValueError(f"layer_types must have {self.num_hidden_layers} entries, got {len(self.layer_types)}.")
 
     def get_mask_details(self) -> dict[int, AttnMaskDetail]:
         """Build the per-layer sliding-window mask metadata.
 
         In Qwen3-VL-MoE the sliding-window window is applied to the
-        *trailing* decoder layers (``layer_idx >= max_window_layers``)
-        rather than the leading ones, so the mapping returned here
-        targets that range. Earlier layers retain the default full
-        causal mask.
+        leading decoder layers (``layer_idx < max_window_layers``).
+        The serialized ``layer_types`` metadata is authoritative so cache
+        geometry and runtime masks cannot drift apart.
 
         Returns:
             dict[int, AttnMaskDetail]: Per-layer sliding-window mask
@@ -241,8 +242,8 @@ class Qwen3VLMoeTextConfig(EasyDeLBaseConfig):
         """
         mapping = {}
         if self.sliding_window is not None and self.use_sliding_window:
-            for layer_idx in range(self.num_hidden_layers):
-                if layer_idx >= self.max_window_layers:
+            for layer_idx, layer_type in enumerate(self.layer_types):
+                if layer_type == "sliding_attention":
                     mapping[layer_idx] = AttnMaskDetail(
                         mask_type=AttnMaskType.SLIDING,
                         size=self.sliding_window,
@@ -294,15 +295,27 @@ class Qwen3VLMoeConfig(EasyDeLBaseConfig):
         merged into the text token sequence. ``**kwargs`` are forwarded
         to :class:`EasyDeLBaseConfig`.
         """
-        if isinstance(vision_config, dict):
+        if isinstance(vision_config, Mapping):
             self.vision_config = self.sub_configs["vision_config"](**self._fix_parent_kws(vision_config, kwargs))
         elif vision_config is None:
             self.vision_config = self.sub_configs["vision_config"]()
+        else:
+            # The signature documents that an already-built config object is
+            # accepted. Without this branch it fell through both arms and
+            # ``self.vision_config`` was never assigned, so the object was
+            # silently dropped and the next attribute read raised.
+            self.vision_config = vision_config
 
-        if isinstance(text_config, dict):
+        if isinstance(text_config, Mapping):
             self.text_config = self.sub_configs["text_config"](**self._fix_parent_kws(text_config, kwargs))
         elif text_config is None:
             self.text_config = self.sub_configs["text_config"]()
+        else:
+            # The signature documents that an already-built config object is
+            # accepted. Without this branch it fell through both arms and
+            # ``self.text_config`` was never assigned, so the object was
+            # silently dropped and the next attribute read raised.
+            self.text_config = text_config
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id
         self.vision_start_token_id = vision_start_token_id

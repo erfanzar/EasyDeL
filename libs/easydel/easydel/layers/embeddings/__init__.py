@@ -45,5 +45,6 @@ See Also:
 """
 
 from ._embeddings import Embed
+from ._ngram import NGramEmbed
 
-__all__ = ("Embed",)
+__all__ = ("Embed", "NGramEmbed")

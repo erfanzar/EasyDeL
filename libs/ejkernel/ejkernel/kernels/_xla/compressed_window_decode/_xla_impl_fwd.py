@@ -63,6 +63,12 @@ def compressed_window_decode_xla(
         dtype (matching the reference einsum promotion).
     """
     scale = query.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale
+    # Narrow storage dtypes (fp8/int8/int4) are promoted to the query dtype
+    # before the dots: jnp.einsum refuses implicit promotion between bf16 and
+    # 8-bit types, and casting the softmax probabilities down to an 8-bit kv
+    # dtype for the PV product would destroy them.
+    if jnp.dtype(kv.dtype).itemsize < 2 or not jnp.issubdtype(kv.dtype, jnp.floating):
+        kv = kv.astype(query.dtype)
     # HIGHEST precision so this reference is the accurate f32 attention on TPU
     # (XLA's default matmul precision uses single-pass bf16 on the MXU, ~1e-2
     # error), which is what the Pallas kernel is validated against. The
@@ -71,6 +77,9 @@ def compressed_window_decode_xla(
     # this XLA path is the *default* decode platform, that surfaced as
     # DeepSeek-V4's cached decode diverging from its own stateless forward.
     logits = jnp.einsum("bhsd,bld->bhsl", query, kv, precision=jax.lax.Precision.HIGHEST).astype(jnp.float32)
+    # Preserve the bf16-dot/fp32-softmax boundary under TPU compiled AD.
+    # Fusing across it produces NaN JVPs for masked bf16 inputs.
+    logits = jax.lax.optimization_barrier(logits)
     logits = logits * scale + bias[:, None, :, :].astype(jnp.float32)
 
     kv_len = logits.shape[-1]

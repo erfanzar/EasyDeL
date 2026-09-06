@@ -20,6 +20,7 @@ regimes: sink and no-sink paths, single- and multi-query, masked KV positions,
 and the shared-KV (``K == V``) broadcast over heads.
 """
 
+import jax
 import numpy as np
 import pytest
 from ejkernel.kernels._registry import Backend, Platform, kernel_registry
@@ -74,6 +75,23 @@ def test_matches_dense_reference(batch, heads, q_len, head_dim, kv_len, use_sink
     assert got.shape == (batch, heads, q_len, head_dim)
     assert np.isfinite(got).all()
     assert np.abs(got - ref).max() < 1e-4
+
+
+def test_vjp_and_jvp_are_finite_for_training_precision_inputs():
+    """The pure-JAX decode reference retains forward- and reverse-mode AD."""
+    q = jax.random.normal(jax.random.key(10), (1, 2, 1, 16), jnp.float32)
+    kv = jax.random.normal(jax.random.key(11), (1, 7, 16), jnp.float32)
+    bias = jnp.zeros((1, 1, 7), jnp.float32)
+    sinks = jnp.zeros((2,), jnp.float32)
+
+    def fn(qq, kk, ss):
+        return compressed_window_decode(qq, kk, bias, ss, softmax_scale=0.25)
+
+    dq, dkv, ds = jax.grad(lambda qq, kk, ss: jnp.sum(fn(qq, kk, ss) ** 2), argnums=(0, 1, 2))(q, kv, sinks)
+    primal, tangent = jax.jvp(fn, (q, kv, sinks), (jnp.ones_like(q), jnp.ones_like(kv), jnp.ones_like(sinks)))
+    for value in (dq, dkv, ds, primal, tangent):
+        assert jnp.all(jnp.isfinite(value))
+    assert jnp.any(jnp.abs(dq) > 0) and jnp.any(jnp.abs(dkv) > 0)
 
 
 def test_registry_and_signatures():

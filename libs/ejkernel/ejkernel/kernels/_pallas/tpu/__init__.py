@@ -64,6 +64,7 @@ from .gated_delta_rule import gated_delta_rule
 from .gated_delta_rule_grouped_decode import gated_delta_rule_grouped_decode
 from .gdn_spec_window import gdn_spec_window_states
 from .grouped_matmul import grouped_matmul
+from .grouped_matmul_channelwise import grouped_matmul_channelwise
 from .grouped_matmulv2 import grouped_matmulv2
 from .grouped_matmulv3 import grouped_matmulv3
 from .multi_latent_ragged_page_attention import multi_latent_ragged_page_attention
@@ -99,6 +100,7 @@ __all__ = (
     "gated_delta_rule_grouped_decode",
     "gdn_spec_window_states",
     "grouped_matmul",
+    "grouped_matmul_channelwise",
     "grouped_matmulv2",
     "grouped_matmulv3",
     "multi_latent_ragged_page_attention",

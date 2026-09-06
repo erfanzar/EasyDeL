@@ -179,31 +179,6 @@ class OPTAttention(AttentionModule):
         self.dropout_layer = nn.Dropout(rate=self.dropout, rngs=rngs)
         self.attention_module = FlexibleAttentionModule(base_config=config, softmax_scale=self.head_dim**-0.5)
 
-    def _split_heads(self, hidden_states):
-        """Splits the hidden states into multiple attention heads.
-
-        Args:
-            hidden_states (Array): The hidden states tensor of shape
-                (batch_size, sequence_length, embed_dim).
-
-        Returns:
-            Array: The reshaped tensor of shape
-                (batch_size, sequence_length, num_heads, head_dim).
-        """
-        return hidden_states.reshape((*hidden_states.shape[:2], self.num_heads, self.head_dim))
-
-    def _merge_heads(self, hidden_states):
-        """Merges the attention heads back into a single hidden state tensor.
-
-        Args:
-            hidden_states (Array): The hidden states tensor with separate head dimensions
-                of shape (batch_size, sequence_length, num_heads, head_dim).
-
-        Returns:
-            Array: The merged tensor of shape (batch_size, sequence_length, embed_dim).
-        """
-        return hidden_states.reshape((*hidden_states.shape[:2], self.embed_dim))
-
     def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],

@@ -255,7 +255,13 @@ from .gdn_spec_window import (
     gdn_spec_window_states,
     gdn_spec_window_states_op,
 )
-from .grouped_matmul import GroupedMatmul, grouped_matmul, grouped_matmul_w8a8
+from .grouped_matmul import (
+    GroupedMatmul,
+    GroupedMatmulChannelwise,
+    grouped_matmul,
+    grouped_matmul_channelwise,
+    grouped_matmul_w8a8,
+)
 from .kernel_delta_attention import KernelDeltaAttention, kda_attention, kernel_delta_attention
 from .lightning_attention import LightningAttention, lightning_attention
 from .multi_head_latent_attention import FlashMLA, flash_mla
@@ -370,6 +376,7 @@ __all__ = (
     "GdnSpecWindowStates",
     "GdnSpecWindowStatesConfig",
     "GroupedMatmul",
+    "GroupedMatmulChannelwise",
     "GroupedMatmulConfig",
     "KLDivergenceOutput",
     "KernelDeltaAttention",
@@ -463,6 +470,7 @@ __all__ = (
     "gdr_attention",
     "gla_attention",
     "grouped_matmul",
+    "grouped_matmul_channelwise",
     "grouped_matmul_w8a8",
     "kda_attention",
     "kernel_delta_attention",

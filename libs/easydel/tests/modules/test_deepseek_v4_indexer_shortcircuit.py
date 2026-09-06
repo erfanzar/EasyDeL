@@ -129,12 +129,25 @@ def test_end_to_end_model_matches_with_and_without_the_shortcut():
     from easydel.modules.deepseek_v4.deepseek_v4_configuration import DeepseekV4Config
 
     config = DeepseekV4Config(
-        vocab_size=128, hidden_size=128, intermediate_size=256, moe_intermediate_size=64,
-        num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=1,
-        n_routed_experts=4, num_experts_per_tok=2, n_shared_experts=1,
-        max_position_embeddings=256, sliding_window=16,
-        index_topk=32, index_n_heads=4, index_head_dim=16,
-        q_lora_rank=32, o_lora_rank=32, head_dim=32, o_groups=2,
+        vocab_size=128,
+        hidden_size=128,
+        intermediate_size=256,
+        moe_intermediate_size=64,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        n_routed_experts=4,
+        num_experts_per_tok=2,
+        n_shared_experts=1,
+        max_position_embeddings=256,
+        sliding_window=16,
+        index_topk=32,
+        index_n_heads=4,
+        index_head_dim=16,
+        q_lora_rank=32,
+        o_lora_rank=32,
+        head_dim=32,
+        o_groups=2,
     )
     # Pin a single-device mesh: the default fills ep=-1 with every visible
     # device, which is ep=8 under the CPU trio against 4 routed experts, and
@@ -167,3 +180,67 @@ def test_end_to_end_model_matches_with_and_without_the_shortcut():
     assert np.all(np.isfinite(with_shortcut))
     delta = float(np.max(np.abs(with_shortcut - full_path)))
     assert delta < 1e-4, f"skipping the dead indexer changed model output, max|delta|={delta:.3e}"
+
+
+# ---------------------------------------------------------------------------
+# The same argument, made dynamic.
+#
+# The shortcut above is a *static* one: it fires only when `index_topk` is at
+# least `n_slots`, which at a 262,144 window it never is (65,536 entries against
+# `index_topk` 512). But the entries that exist at a given decode step are only
+# the ones the sequence has produced so far. While that live prefix is no longer
+# than `index_topk`, `top_k` again cannot exclude anything, and the scoring
+# matmul -- which reads the whole entry buffer, priced by `cost_analysis` at
+# 1.510 GiB per decode step -- is computed only to be discarded.
+#
+# What is pinned here is that equivalence, against the real consumer, plus its
+# non-vacuity. The buffer state update is deliberately *not* skipped along with
+# the scoring: entries must still be written or later steps read a stale buffer.
+# ---------------------------------------------------------------------------
+
+
+def _live_prefix_path(visible, k):
+    """What the indexer computes while the live prefix fits inside top_k."""
+    idx = jnp.broadcast_to(jnp.arange(k, dtype=jnp.int32), (*visible.shape[:-1], k))
+    return jnp.where(visible[..., :k], idx, -1)
+
+
+@pytest.mark.parametrize(("n_slots", "k", "live"), [(512, 64, 1), (512, 64, 63), (512, 64, 64), (4096, 512, 300)])
+def test_live_prefix_matches_scored_topk(n_slots, k, live):
+    """live <= k: ranking cannot exclude, so the prefix must open the same bias."""
+    rng = np.random.default_rng(live)
+    scores = jnp.asarray(rng.standard_normal((BATCH, SEQ, n_slots)), jnp.float32)
+    # only the first `live` entries exist yet
+    visible = jnp.asarray(np.arange(n_slots)[None, None, :] < live).repeat(BATCH, 0).repeat(SEQ, 1)
+
+    got = _bias(_live_prefix_path(visible, k), n_slots)
+    want = _bias(_topk_path(scores, visible, k), n_slots)
+    np.testing.assert_array_equal(got, want)
+
+
+def test_live_prefix_equivalence_is_not_vacuous():
+    """live > k must genuinely differ, or the test above proves nothing."""
+    n_slots, k, live = 512, 64, 200
+    rng = np.random.default_rng(7)
+    scores = jnp.asarray(rng.standard_normal((BATCH, SEQ, n_slots)), jnp.float32)
+    visible = jnp.asarray(np.arange(n_slots)[None, None, :] < live).repeat(BATCH, 0).repeat(SEQ, 1)
+
+    got = _bias(_live_prefix_path(visible, k), n_slots)
+    want = _bias(_topk_path(scores, visible, k), n_slots)
+    assert not np.array_equal(got, want), "scoring excluded nothing -- the gate would be untested"
+
+
+def test_indexer_opened_bias_score_proxy_is_primal_exact_and_differentiable():
+    indices = jnp.array([[[0, 2]]], jnp.int32)
+    plain = _indexer_opened_bias(indices, 1, 1, 4)
+    scores = jnp.array([[[0.2, -0.1, 0.7, 0.3]]], jnp.float32)
+
+    def loss(s):
+        bias = _indexer_opened_bias(indices, 1, 1, 4, score_proxy=s)
+        assert jnp.array_equal(bias, plain)
+        probs = jax.nn.softmax(bias[:, 0], axis=-1)
+        return jnp.sum(probs * jnp.arange(4, dtype=jnp.float32))
+
+    grad = jax.grad(loss)(scores)
+    assert jnp.all(jnp.isfinite(grad))
+    assert jnp.any(jnp.abs(grad) > 0)

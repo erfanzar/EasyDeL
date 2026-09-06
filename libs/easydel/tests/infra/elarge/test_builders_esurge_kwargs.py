@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
-
 import easydel.inference as inference_module
+import pytest
 from easydel.infra.elarge.builders import to_esurge_kwargs
 from easydel.infra.elarge.model import eLargeModel
 from easydel.scripts.elarge import _run_action
@@ -136,7 +135,10 @@ def test_to_esurge_kwargs_defaults_distributed_controls():
     assert kwargs["distributed"].distributed_control_port == 19666
     assert kwargs["distributed"].distributed_control_bind_host == "0.0.0.0"
     assert kwargs["distributed"].distributed_step_timeout_s == 30.0
-    assert kwargs["distributed"].distributed_connect_timeout_s == 15.0
+    # Raised from 15.0 to 600.0 in ab5ba9d4b, "Give the worker connect timeout
+    # the headroom the ready timeout already has" -- the connect and ready
+    # timeouts are deliberately the same now.
+    assert kwargs["distributed"].distributed_connect_timeout_s == 600.0
     assert kwargs["distributed"].distributed_ready_timeout_s == 600.0
     assert kwargs["distributed"].distributed_heartbeat_interval_s == 1.0
     assert kwargs["distributed"].distributed_heartbeat_timeout_s == 5.0

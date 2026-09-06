@@ -16,9 +16,8 @@
 from __future__ import annotations
 
 import pytest
-from spectrax.common_types import NOT_GIVEN
-
 from easydel.inference.esurge.config import eSurgeCacheRuntimeConfig, eSurgeRuntimeConfig
+from spectrax.common_types import NOT_GIVEN
 
 
 class TestRuntimeConfig:
@@ -49,6 +48,16 @@ class TestRuntimeConfig:
     def test_min_token_pad_zero_raises_when_specified(self):
         with pytest.raises(ValueError, match="min_token_pad must be positive"):
             eSurgeRuntimeConfig.from_dict(min_token_pad=0)
+
+    def test_min_token_pad_does_not_exceed_max_concurrency(self):
+        config = eSurgeRuntimeConfig.from_dict(
+            min_token_pad=8,
+            max_num_seqs=8,
+            max_num_batched_tokens=8192,
+            max_model_len=262144,
+        )
+
+        assert config.min_token_pad == 8
 
     def test_max_num_batched_tokens_zero_raises(self):
         with pytest.raises(ValueError, match="max_num_batched_tokens must be positive"):
@@ -169,3 +178,29 @@ class TestCacheRuntimeConfig:
         config = eSurgeCacheRuntimeConfig.from_dict(max_cache_tokens=4096, page_size=128, enable_prefix_caching=False)
 
         assert config.enable_prefix_caching is False
+
+
+def test_non_power_of_two_concurrency_uses_power_of_two_token_floor():
+    config = eSurgeRuntimeConfig.from_dict(
+        min_token_pad=1,
+        max_num_seqs=6,
+        max_num_batched_tokens=128,
+        max_model_len=128,
+    )
+    assert config.min_token_pad == 4
+
+
+def test_non_power_of_two_explicit_token_pad_is_normalized():
+    config = eSurgeRuntimeConfig.from_dict(
+        min_input_pad=6,
+        min_token_pad=6,
+        max_num_seqs=6,
+        max_num_batched_tokens=128,
+        max_model_len=128,
+    )
+    assert config.min_token_pad == 8
+
+
+def test_short_model_len_normalizes_token_floor():
+    cfg = eSurgeRuntimeConfig.from_dict(max_model_len=10, max_num_seqs=6, min_token_pad=6)
+    assert cfg.min_token_pad == 8

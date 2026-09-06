@@ -155,6 +155,24 @@ def _build_feedback_separator(
     )
 
 
+def _as_chat_history(prompt: str | list[dict[str, str]]) -> list[dict[str, str]]:
+    """Coerce a prompt into chat-history form.
+
+    ``TrainerOutput.completion_prompts`` may carry either decoded prompt text or
+    an already-structured message list. Reward paths that build conversations
+    need the structured form, so raw text becomes a single user turn.
+
+    Args:
+        prompt: Prompt text, or a list of chat message dicts.
+
+    Returns:
+        A list of chat message dicts.
+    """
+    if isinstance(prompt, str):
+        return [{"role": "user", "content": prompt}]
+    return list(prompt)
+
+
 @Registry.register("trainer", "sdpo")
 class SDPOTrainer(GRPOTrainer):
     """Self-Distillation Policy Optimization trainer.
@@ -833,8 +851,16 @@ class SDPOTrainer(GRPOTrainer):
                 ):
                     if isinstance(reward_func, EasyDeLState):
                         if is_conv:
+                            # ``completion_prompts`` is typed
+                            # ``list[str | list[dict[str, str]]]`` -- an entry is
+                            # legitimately either raw text or an already-structured
+                            # chat history. The conversational branch concatenates it
+                            # with the structured completion, so a plain string has to
+                            # be lifted into a one-message history first; otherwise
+                            # ``str + list`` raises "can only concatenate str (not
+                            # list) to str" mid-training.
                             messages = [
-                                {"messages": p + c}
+                                {"messages": _as_chat_history(p) + c}
                                 for p, c in zip(completion_prompts, structured_completions, strict=False)
                             ]
                             texts = [

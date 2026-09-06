@@ -25,7 +25,8 @@ It is a faithful transcription of the dense math in
 and is the correctness *and* gradient reference every backend must match. Unlike
 the decode reference (which targets a single query per slot), this reference is
 written to be cleanly differentiable so that ``jax.grad`` of it defines the
-gradient contract for the Pallas kernel's ``custom_vjp``.
+gradient contract for the Pallas kernel's ``custom_jvp`` (including its
+reverse-mode transpose).
 """
 
 from __future__ import annotations
@@ -52,10 +53,10 @@ def compressed_window_attention_xla(
 
     The single shared KV head is broadcast over all query heads (MQA). The
     softmax and the sink normalisation run in float32. The additive ``bias`` is
-    a structural / indexer-gated mask and is treated as a stop-gradient input by
-    the differentiable kernel contract (it carries no learnable signal); this
-    reference simply adds it, so ``jax.grad`` w.r.t. ``bias`` is defined but the
-    Pallas ``custom_vjp`` returns a zero cotangent for it.
+    structural / indexer-gated input that may carry learnable indexer scores.
+    This reference and the Pallas ``custom_jvp`` differentiate it, along with
+    queries, shared KVs, and optional sinks. Structural masking does not imply
+    a stop-gradient contract or a zero bias cotangent.
 
     Args:
         query: Rotated queries ``[batch, num_heads, q_len, head_dim]``.
@@ -77,6 +78,9 @@ def compressed_window_attention_xla(
     # (XLA's default matmul precision uses single-pass bf16 on the MXU, ~1e-2
     # error), which is what the Pallas kernel is validated against.
     logits = jnp.einsum("bhsd,bld->bhsl", query, kv, precision=jax.lax.Precision.HIGHEST).astype(jnp.float32)
+    # Preserve the bf16-dot/fp32-softmax boundary under TPU compiled AD.
+    # Fusing across it produces NaN JVPs for masked bf16 inputs.
+    logits = jax.lax.optimization_barrier(logits)
     logits = logits * scale + bias[:, None, :, :].astype(jnp.float32)
 
     kv_len = logits.shape[-1]

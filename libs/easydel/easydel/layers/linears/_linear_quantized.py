@@ -1645,13 +1645,18 @@ class ParallelLinearQuantized(spx.Module):
             if mode == "channelwise":
                 from ejkernel.modules import channelwise_quantized_matmul as _cw_qmm
 
+                from easydel.layers.quantization._configs import explicit_activation_kwargs
+
                 act_bits = getattr(self.config, "activation_bits", None)
+                activation_kwargs = explicit_activation_kwargs(self.config) or {
+                    "quantize_activations": act_bits is not None,
+                    "activation_bits": int(act_bits) if act_bits is not None else 8,
+                }
                 out = _cw_qmm(
                     inputs.reshape((-1, inputs.shape[-1])),
                     kernel_value,
                     scale_value,
-                    quantize_activations=act_bits is not None,
-                    activation_bits=int(act_bits) if act_bits is not None else 8,
+                    **activation_kwargs,
                 ).reshape((*inputs.shape[:-1], self.out_features_sum))
             else:
                 out = self._distributed_quantized_matmul(

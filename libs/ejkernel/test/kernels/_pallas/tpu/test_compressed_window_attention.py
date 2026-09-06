@@ -83,7 +83,7 @@ def test_pallas_matches_xla_fwd(batch, heads, q_len, head_dim, kv_len, use_sinks
     [(2, 8, 256, 512, 260), (1, 16, 512, 512, 640)],
 )
 def test_pallas_gradient_matches_xla(batch, heads, q_len, head_dim, kv_len):
-    """Pallas ``jax.grad`` (custom_vjp) matches XLA-reference grad (fp32 tight)."""
+    """Pallas ``jax.grad`` (custom-JVP transpose) matches XLA-reference grad (fp32 tight)."""
     from ejkernel.kernels._pallas.tpu.compressed_window_attention._pallas_impl_fwd import (
         compressed_window_attention_tpu as pallas_impl,
     )
@@ -162,14 +162,14 @@ def test_pallas_band_skip_gradient_matches_xla(s, n_entries):
     rng = np.random.default_rng(2)
     cot = jnp.asarray(rng.standard_normal((batch, heads, s, head_dim)), jnp.float32)
 
-    def _xla(qq, kk, ss):
-        return jnp.sum(xla_impl(qq, kk, bias, ss, softmax_scale=scale) * cot)
+    def _xla(qq, kk, bb, ss):
+        return jnp.sum(xla_impl(qq, kk, bb, ss, softmax_scale=scale) * cot)
 
-    def _band(qq, kk, ss):
-        return jnp.sum(pallas_impl(qq, kk, bias, ss, softmax_scale=scale, window=window, token_kv_len=s) * cot)
+    def _band(qq, kk, bb, ss):
+        return jnp.sum(pallas_impl(qq, kk, bb, ss, softmax_scale=scale, window=window, token_kv_len=s) * cot)
 
-    gx = jax.grad(_xla, argnums=(0, 1, 2))(q, kv, sinks)
-    gb = jax.grad(_band, argnums=(0, 1, 2))(q, kv, sinks)
+    gx = jax.grad(_xla, argnums=(0, 1, 2, 3))(q, kv, bias, sinks)
+    gb = jax.grad(_band, argnums=(0, 1, 2, 3))(q, kv, bias, sinks)
     for a, b in zip(gx, gb, strict=True):
         assert jnp.isfinite(b).all()
         assert float(jnp.max(jnp.abs(a - b))) < 2e-4, float(jnp.max(jnp.abs(a - b)))
@@ -192,3 +192,132 @@ def test_pallas_matches_xla_bf16():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_pallas_forward_mode_jvp_matches_xla():
+    from ejkernel.kernels._pallas.tpu.compressed_window_attention._pallas_impl_fwd import (
+        compressed_window_attention_tpu as pallas_impl,
+    )
+    from ejkernel.kernels._xla.compressed_window_attention import compressed_window_attention as xla_impl
+
+    q, kv, bias, sinks = _inputs(1, 8, 128, 128, 140, jnp.float32, use_sinks=True, seed=41)
+    tangents = tuple(jnp.ones_like(x) * 0.01 for x in (q, kv, bias, sinks))
+    scale = 128**-0.5
+    _, p_tan = jax.jvp(lambda a, b, c, d: pallas_impl(a, b, c, d, softmax_scale=scale), (q, kv, bias, sinks), tangents)
+    _, x_tan = jax.jvp(lambda a, b, c, d: xla_impl(a, b, c, d, softmax_scale=scale), (q, kv, bias, sinks), tangents)
+    assert jnp.isfinite(p_tan).all()
+    assert float(jnp.max(jnp.abs(p_tan - x_tan))) < 2e-4
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("use_sinks", [False, True])
+def test_tiled_training_ad_with_partial_query_tile(dtype, use_sinks):
+    """Exercise both AD directions, storage dtypes, and optional sink gradients."""
+    from ejkernel.kernels._pallas.tpu.compressed_window_attention._pallas_impl_fwd import (
+        compressed_window_attention_tpu as pallas_impl,
+    )
+    from ejkernel.kernels._xla.compressed_window_attention import compressed_window_attention as xla_impl
+
+    q, kv, bias, _ = _inputs(1, 4, 131, 128, 140, dtype, use_sinks=False, seed=17)
+    sinks = jnp.asarray([0.1, -0.2, 0.3, -0.4], jnp.float32)
+    args = (q, kv, bias, sinks)
+    rng = np.random.default_rng(18)
+    tangents = tuple(jnp.asarray(rng.normal(size=x.shape) * 0.01, x.dtype) for x in args)
+
+    def pallas(a, b, c, d):
+        return pallas_impl(a, b, c, d if use_sinks else None, softmax_scale=128**-0.5)
+
+    def reference(a, b, c, d):
+        return xla_impl(a, b, c, d if use_sinks else None, softmax_scale=128**-0.5)
+
+    _, actual_tangent = jax.jvp(pallas, args, tangents)
+    _, expected_tangent = jax.jvp(reference, args, tangents)
+    tolerance = 0.03 if dtype == jnp.bfloat16 else 2e-4
+    np.testing.assert_allclose(actual_tangent, expected_tangent, atol=tolerance, rtol=tolerance)
+    cotangent = jnp.asarray(rng.normal(size=q.shape), dtype)
+    actual_grads = jax.vjp(pallas, *args)[1](cotangent)
+    expected_grads = jax.vjp(reference, *args)[1](cotangent)
+    for actual, expected in zip(actual_grads, expected_grads, strict=True):
+        assert np.isfinite(actual).all()
+        np.testing.assert_allclose(actual, expected, atol=tolerance, rtol=tolerance)
+    if not use_sinks:
+        np.testing.assert_array_equal(actual_grads[-1], jnp.zeros_like(sinks))
+
+
+@pytest.mark.parametrize("layout", ["padded", "band-skipped"])
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("use_sinks", [False, True], ids=["no-sink", "sink"])
+def test_pallas_fully_masked_rows_compiled_output_and_jvp(layout, dtype, use_sinks):
+    """Finite MASK_MIN rows retain dense semantics through Mosaic lowering and AD."""
+    from ejkernel.kernels._pallas.tpu.compressed_window_attention._pallas_impl_fwd import (
+        compressed_window_attention_tpu as pallas_impl,
+    )
+    from ejkernel.kernels._xla.compressed_window_attention import compressed_window_attention as xla_impl
+
+    # The implementation chooses interpret mode from the default backend. Do not
+    # silently turn this hardware regression into another CPU interpret test.
+    assert jax.default_backend() == "tpu"
+    if layout == "padded":
+        q, kv, bias, _ = _inputs(1, 4, 131, 128, 140, dtype, False, seed=71)
+        options = {}
+    else:
+        # Five token tiles exceed the three visited by each default q-block;
+        # both the token region and the compressed-entry region need padding.
+        q, kv, bias, _ = _sliding_inputs(1, 4, 515, 128, 32, 17, dtype, False, seed=71)
+        options = {"window": 32, "token_kv_len": 515}
+    # A nonzero, position-dependent value mean exposes both padding dilution
+    # and averaging only the visited tiles instead of *all real* KVs.
+    kv = kv + jnp.linspace(0.5, 2.0, kv.shape[1], dtype=dtype)[None, :, None]
+    masked_rows = jnp.asarray([0, 127, 128, q.shape[2] - 1])
+    bias = bias.at[:, masked_rows, :].set(_NEG)
+    sinks = jnp.asarray([0.1, -0.2, 0.3, -0.4], jnp.float32)
+    args = (q, kv, bias, sinks)
+    rng = np.random.default_rng(72)
+    tangents = tuple(jnp.asarray(rng.normal(size=x.shape) * 0.01, x.dtype) for x in args)
+
+    def pallas(a, b, c, d):
+        return pallas_impl(a, b, c, d if use_sinks else None, softmax_scale=128**-0.5, **options)
+
+    def reference(a, b, c, d):
+        return xla_impl(a, b, c, d if use_sinks else None, softmax_scale=128**-0.5)
+
+    def pallas_jvp(primals, directions):
+        return jax.jvp(pallas, primals, directions)
+
+    # Keep the primal in the compiled result: tangent-only checks can eliminate
+    # the Pallas call and miss a broken uniform_ref Mosaic lowering entirely.
+    compiled = jax.jit(pallas_jvp).lower(args, tangents).compile()
+    actual_output, actual_tangent = compiled(args, tangents)
+    expected_output, expected_tangent = jax.jvp(reference, args, tangents)
+    for actual, expected in ((actual_output, expected_output), (actual_tangent, expected_tangent)):
+        assert actual.shape == expected.shape
+        assert actual.dtype == expected.dtype
+        assert np.isfinite(np.asarray(actual.astype(jnp.float32))).all()
+    output_error = np.abs(
+        np.asarray(actual_output.astype(jnp.float32)) - np.asarray(expected_output.astype(jnp.float32))
+    )
+    assert output_error.max() < (5e-2 if dtype == jnp.bfloat16 else 2e-4), output_error.max()
+    tolerance = 0.03 if dtype == jnp.bfloat16 else 2e-4
+    np.testing.assert_allclose(
+        actual_tangent.astype(jnp.float32), expected_tangent.astype(jnp.float32), atol=tolerance, rtol=tolerance
+    )
+
+
+@pytest.mark.parametrize("kernel", ["compressed_window_attention", "compressed_window_decode"])
+def test_compiled_xla_bf16_jvp_matches_eager(kernel):
+    """Mixed bf16 dots and fp32 masked softmax must survive compiled AD."""
+    import importlib
+
+    module = importlib.import_module(f"ejkernel.kernels._xla.{kernel}._xla_impl_fwd")
+    operation = getattr(module, f"{kernel}_xla")
+    q, kv, bias, sinks = _inputs(1, 4, 131, 128, 140, jnp.bfloat16, use_sinks=True, seed=17)
+    args = (q, kv, bias, sinks)
+    tangents = tuple(jnp.ones_like(x) * 0.01 for x in args)
+
+    def derivative(*values):
+        return jax.jvp(operation, values, tangents)[1]
+
+    expected = derivative(*args)
+    actual = jax.jit(derivative)(*args)
+    assert np.isfinite(actual).all()
+    np.testing.assert_allclose(actual, expected, atol=0.01, rtol=0.01)

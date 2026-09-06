@@ -4023,51 +4023,11 @@ class Qwen3OmniMoeCode2Wav(EasyDeLBaseModule):
         return self.code_embedding
 
 
-def merge_multimodal_embeddings(
-    input_ids: jax.Array,
-    inputs_embeds: jax.Array,
-    multimodal_embeddings: jax.Array,
-    placeholder_token_id: int | list[int],
-) -> jax.Array:
-    """Splice multimodal embeddings into a text embedding sequence.
-
-    Replaces every position in ``inputs_embeds`` whose corresponding
-    ``input_ids`` value is a registered placeholder token (e.g.
-    ``<image>``, ``<video>``, ``<audio>``) with the next vector from
-    ``multimodal_embeddings``. The fill order follows the natural
-    left-to-right scan of ``input_ids``.
-
-    The implementation uses the cumsum-gather pattern shared by
-    :class:`MultiModalMergeFeature`: we prepend a zero row to the
-    multimodal table so that non-placeholder positions index the dummy
-    row, and then ``jnp.where`` picks the original or replaced
-    embedding per-position. This formulation is JIT-safe and produces
-    O(seq_len * hidden) memory traffic.
-
-    Args:
-        input_ids: Token ids of shape ``(batch, seq_len)``.
-        inputs_embeds: Text embeddings of shape
-            ``(batch, seq_len, hidden_size)``.
-        multimodal_embeddings: Concatenated visual / audio embeddings of
-            shape ``(num_multimodal_tokens, hidden_size)``.
-        placeholder_token_id: Single token id or list of ids that mark
-            multimodal slots in ``input_ids``.
-
-    Returns:
-        Merged embedding tensor with the same shape as ``inputs_embeds``.
-    """
-    if isinstance(placeholder_token_id, list):
-        placeholder_token_id = jnp.array(placeholder_token_id)
-        is_multimodal = jnp.isin(input_ids, placeholder_token_id)
-    else:
-        is_multimodal = input_ids == placeholder_token_id
-
-    dummy_row = jnp.zeros_like(multimodal_embeddings[0:1])
-    flattened_padded = jnp.concatenate([dummy_row, multimodal_embeddings], axis=0)
-    gather_indices = jnp.cumsum(is_multimodal)
-    update_values = flattened_padded[gather_indices]
-    condition = jnp.expand_dims(is_multimodal, axis=-1)
-    return jnp.where(condition, update_values, inputs_embeds)
+# The cumsum-gather merge is shared infrastructure; these families each had
+# their own copy of it. `BaseVisionLanguageModule.merge_multimodal_embeddings`
+# is the same algorithm, so bind the module-level name to it rather than
+# restating it. Keeping the name means call sites (and importers) are unchanged.
+merge_multimodal_embeddings = BaseVisionLanguageModule.merge_multimodal_embeddings
 
 
 class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):

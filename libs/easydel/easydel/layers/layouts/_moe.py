@@ -136,6 +136,12 @@ class FusedExpertLayout:
             Returns:
                 Active TP size (``1`` when no TP axis applies).
             """
+            # ExpertTensorMode uses physical TP for the expert axis, not
+            # the intermediate channels. Each local expert therefore needs
+            # contiguous gate/up halves, including on checkpoint export.
+            # The MoE dispatcher rejects a simultaneous contraction split.
+            if getattr(config, "use_expert_tensor_mode", False):
+                return 1
             return tensor_parallel_size(config, arr=arr)
 
         if self.source_per_expert is not None:
@@ -304,8 +310,9 @@ class FusedExpertLayout:
             Returns:
                 Fused TP-interleaved gate/up weight in EasyDeL layout.
             """
-            gate = gate.transpose(-1, -2).contiguous()
-            up = up.transpose(-1, -2).contiguous()
+            if self.transpose_weight:
+                gate = gate.transpose(-1, -2).contiguous()
+                up = up.transpose(-1, -2).contiguous()
             return torch_interleave_segments_for_tp(torch, (gate, up), tp_size=_tp_size(gate), dim=self.weight_tp_dim)
 
         def _weight_inverse_fuser(torch: tp.Any, gate_up: tp.Any) -> tuple[tp.Any, tp.Any]:
@@ -327,7 +334,9 @@ class FusedExpertLayout:
                 tp_size=_tp_size(gate_up),
                 dim=self.weight_tp_dim,
             )
-            return gate.transpose(-1, -2).contiguous(), up.transpose(-1, -2).contiguous()
+            if self.transpose_weight:
+                return gate.transpose(-1, -2).contiguous(), up.transpose(-1, -2).contiguous()
+            return gate, up
 
         reform_param = {
             f"{self.target_prefix}.weight$": {

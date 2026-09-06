@@ -2290,8 +2290,18 @@ class EasyDeLBaseModule(
         for path, module in iter_module_search(lazy_model, (spx.Module, ArrayParam)):
             if not path:
                 continue
-            weight_var = module.weight if hasattr(module, "weight") and module.weight is not None else None
-            bias_var = module.bias if hasattr(module, "bias") and module.bias is not None else None
+
+            # ``weight``/``bias`` are matched by name, but the name is not
+            # reserved: some layers store a plain flag there (``OPTAttention.bias``
+            # is a bool). Require the parameter protocol -- a ``.value`` -- before
+            # treating the attribute as one, otherwise the shape probe below
+            # raises ``AttributeError`` on an unrelated attribute.
+            def _as_param(owner, name):
+                candidate = getattr(owner, name, None)
+                return candidate if candidate is not None and hasattr(candidate, "value") else None
+
+            weight_var = _as_param(module, "weight")
+            bias_var = _as_param(module, "bias")
             shardings = {
                 "weight": _sharding_for(
                     weight_var,

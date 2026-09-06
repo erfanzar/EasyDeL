@@ -213,18 +213,19 @@ def bincount(x: jax.Array, length: int) -> jax.Array:
 
 
 def sort_activations(inputs: jax.Array, sort_indices: jax.Array, use_custom_vjp: bool = True) -> jax.Array:
-    """Reorder ``inputs[sort_indices]`` along axis 0 with an optional custom VJP.
+    """Reorder ``inputs[sort_indices]`` along axis 0 with optional custom AD.
 
     Permutes the first dimension of ``inputs`` according to ``sort_indices``.
     With ``use_custom_vjp=True`` the operation uses
-    :func:`sort_activations_custom`, which stores only the indices for the
-    backward pass rather than the full permutation matrix.
+    :func:`sort_activations_custom`. The historical flag name is retained,
+    but the rule now supports both JVP and transposed VJP without retaining
+    activation values or constructing a dense Jacobian.
 
     Args:
         inputs: Input activations to sort. Shape: (N, ...).
         sort_indices: Integer array of indices defining the permutation. Shape: (N,).
             Must be a valid permutation of range(N).
-        use_custom_vjp: If True, uses custom VJP for memory-efficient gradients.
+        use_custom_vjp: If True, uses the custom JVP/transposed-VJP rule.
             If False, uses standard JAX autodiff. Defaults to True.
 
     Returns:
@@ -249,14 +250,13 @@ def sort_activations(inputs: jax.Array, sort_indices: jax.Array, use_custom_vjp:
         return inputs[sort_indices, ...]
 
 
-@jax.custom_vjp
+@jax.custom_jvp
 def sort_activations_custom(inputs: jax.Array, sort_indices: jax.Array) -> jax.Array:
-    """Custom VJP implementation for sorting activations.
+    """Sort activations with forward and reverse autodiff support.
 
-    This function provides a custom vector-Jacobian product (VJP) for the sorting
-    operation, which is more memory-efficient than the default automatic differentiation.
-    The custom VJP avoids materializing the full Jacobian matrix by directly computing
-    the inverse permutation during the backward pass.
+    The tangent undergoes the same gather. JAX transposes that linear gather
+    for reverse mode without materializing a dense Jacobian or retaining
+    activation values. Integer routing indices are nondifferentiable.
 
     Args:
         inputs: Input tensor to be sorted. Shape: (N, ...).
@@ -264,10 +264,6 @@ def sort_activations_custom(inputs: jax.Array, sort_indices: jax.Array) -> jax.A
 
     Returns:
         Sorted tensor where output[i] = inputs[sort_indices[i]].
-
-        This function is decorated with @jax.custom_vjp, which means it has custom
-        forward and backward implementations defined in _sort_activations_custom_fwd
-        and _sort_activations_custom_bwd.
     """
     return inputs[sort_indices, ...]
 
@@ -312,7 +308,11 @@ def sort_activations_custom_bwd(residuals: jax.Array, grads: jax.Array) -> tuple
     return input_grads, None
 
 
-sort_activations_custom.defvjp(sort_activations_custom_fwd, sort_activations_custom_bwd)
+@sort_activations_custom.defjvp
+def _sort_activations_custom_jvp(primals, tangents):
+    inputs, sort_indices = primals
+    input_tangent, _ = tangents
+    return sort_activations_custom(inputs, sort_indices), input_tangent[sort_indices, ...]
 
 
 @dataclass(frozen=True)
@@ -708,6 +708,40 @@ def get_all_to_all_params(
     out_off = transform(matrix, shard_id, _Transform.OUTPUT_OFFSET, is_batch_sharded)
     recv = transform(matrix, shard_id, _Transform.RECV_SIZE, is_batch_sharded)
     return in_off, send, out_off, recv
+
+
+def replicated_expert_combine(inputs, counts, *, axis_name, output_rows):
+    """Fan out disjoint expert prefixes with a correct additive transpose.
+
+    The primal retains ragged-all-to-all. With replicated batches every peer
+    reads the same local prefix. Its transpose therefore needs to SUM peer
+    cotangents; overlapping ragged receive writes do not implement that sum.
+    A gather-plus-psum tangent gives the same linear map and a valid transpose.
+    Counts must be replicated, nonnegative, and sum to at most output_rows;
+    each local prefix must fit inputs. This is not the batch-sharded exchange.
+    """
+
+    @jax.custom_jvp
+    def combine(x, sizes):
+        rank = jax.lax.axis_index(axis_name)
+        params = get_all_to_all_params(sizes, rank, sizes.shape[0], is_batch_sharded=False)
+        return jax.lax.ragged_all_to_all(
+            x, jnp.zeros((output_rows, *x.shape[1:]), x.dtype), *params, axis_name=axis_name
+        )
+
+    @combine.defjvp
+    def combine_jvp(primals, tangents):
+        x, sizes = primals
+        dx, _ = tangents
+        rank = jax.lax.axis_index(axis_name)
+        start = jnp.sum(jnp.where(jnp.arange(sizes.shape[0]) < rank, sizes, 0))
+        index = jnp.arange(output_rows) - start
+        valid = (index >= 0) & (index < sizes[rank])
+        local = jnp.take(dx, index, axis=0, mode="clip")
+        local = jnp.where(valid.reshape((output_rows,) + (1,) * (x.ndim - 1)), local, 0)
+        return combine(x, sizes), jax.lax.psum(local, axis_name)
+
+    return combine(inputs, counts)
 
 
 def build_ep_traffic_matrix(global_group_sizes: jax.Array, ep_size: int, local_expert_size: int) -> jax.Array:

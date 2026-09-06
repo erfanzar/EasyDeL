@@ -74,10 +74,11 @@ from jax import numpy as jnp
 from jax.experimental import multihost_utils
 
 from easydel.inference.esurge.config import (
-    ESURGE_MIN_TOKEN_PAD,
     KernelTilePolicy,
     normalize_draft_schedule,
+    normalize_token_bucket_minimum,
     resolve_num_draft_tokens,
+    token_bucket_floor,
 )
 from easydel.inference.speculative import DrafterProtocol, accept_or_reject, resample_rejected
 from easydel.infra.sharding import replicated_named_sharding
@@ -205,8 +206,7 @@ def derive_spec_token_buckets(
                     if prev_bucket < boundary <= reqs:
                         probes.add(boundary)
             k_candidates = {
-                resolve_num_draft_tokens(draft_schedule, batch_size=probe, num_draft_tokens=static_k)
-                for probe in probes
+                resolve_num_draft_tokens(draft_schedule, batch_size=probe, num_draft_tokens=static_k) for probe in probes
             }
         for k in k_candidates:
             if k <= 0:
@@ -550,16 +550,14 @@ class eSurgeRunner:
         self.max_pages_per_req = int(self.metadata.max_num_pages_per_req)
 
         if min_token_pad is None:
-            # Keep the token bucket floor aligned with the public runtime
-            # padding floor unless the caller explicitly requests a different
-            # min_token_pad. This keeps startup/runtime bucket logs consistent:
-            # min_input_pad=4 means the first token bucket is b4, not b1.
-            min_token_pad_i = self.min_input_pad
+            # Request-count padding and token-count padding are independent.
+            # A non-power-of-two request floor (for example CC=6) must not be
+            # forwarded to WindowPlanner's power-of-two token ladder.
+            min_token_pad_i = token_bucket_floor(max_num_seqs)
         else:
             min_token_pad_i = int(min_token_pad)
-        if int(self.max_model_len) >= ESURGE_MIN_TOKEN_PAD:
-            min_token_pad_i = max(min_token_pad_i, ESURGE_MIN_TOKEN_PAD)
-        min_token_pad_i = min(min_token_pad_i, int(self.max_model_len))
+        token_floor = token_bucket_floor(max_num_seqs)
+        min_token_pad_i = normalize_token_bucket_minimum(max(min_token_pad_i, token_floor), self.max_model_len)
         self.num_tokens_paddings = self._get_token_paddings(
             min_token_size=min_token_pad_i,
             # Compile token buckets up to the per-step batched-token budget, not
@@ -2593,8 +2591,10 @@ class eSurgeRunner:
         step_batch_candidate_count = 0
         if self.drafter is not None and scheduler_output.scheduled_spec_decode_tokens:
             for _spec_rid, _spec_toks in scheduler_output.scheduled_spec_decode_tokens.items():
-                if _spec_toks and all(int(_t) >= 0 for _t in _spec_toks) and self.spec.can_batch_draft(
-                    self.requests.get(_spec_rid)
+                if (
+                    _spec_toks
+                    and all(int(_t) >= 0 for _t in _spec_toks)
+                    and self.spec.can_batch_draft(self.requests.get(_spec_rid))
                 ):
                     step_batch_candidate_count += 1
         step_allows_batch = step_batch_candidate_count >= 2
@@ -3294,9 +3294,7 @@ class eSurgeRunner:
                     _sched_n = int(scheduled_list[_rp])
                     _spec_toks = scheduler_output.scheduled_spec_decode_tokens.get(_rid, [])
                     if not (
-                        bool(_spec_toks)
-                        and all(int(_t) >= 0 for _t in _spec_toks)
-                        and self.spec.is_spec_request(_rs)
+                        bool(_spec_toks) and all(int(_t) >= 0 for _t in _spec_toks) and self.spec.is_spec_request(_rs)
                     ):
                         continue
                     if int(_rp) in sequential_greedy_spec_rows and len(_spec_toks) == 1:
@@ -3750,9 +3748,7 @@ class eSurgeRunner:
                                 corrected_token = int(target_token)
                                 seed_hidden = target_hidden
                                 if want_trace_logits:
-                                    trace_logits_rows.append(
-                                        self.spec.project_hidden_rows(target_hidden[None, :])[0]
-                                    )
+                                    trace_logits_rows.append(self.spec.project_hidden_rows(target_hidden[None, :])[0])
                                 if int(target_token) != int(draft_token):
                                     break
                                 accepted += 1
@@ -4092,9 +4088,16 @@ class eSurgeRunner:
                     )
                 ]
             )
-            for rid, req_idx, _seed_token, _seed_position, _seed_hidden, _req_state, known_len, spec_idx in (
-                pending_batched_drafts
-            ):
+            for (
+                rid,
+                req_idx,
+                _seed_token,
+                _seed_position,
+                _seed_hidden,
+                _req_state,
+                known_len,
+                spec_idx,
+            ) in pending_batched_drafts:
                 next_drafts = batched_drafts.get(rid, [])
                 if next_drafts:
                     draft_start = known_len
