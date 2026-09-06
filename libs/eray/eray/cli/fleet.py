@@ -22,6 +22,7 @@ cluster once; the autonomous recovery loop lives in ``eray fleet watch``.
 
 from __future__ import annotations
 
+import dataclasses
 import json as json_lib
 
 import click
@@ -103,10 +104,15 @@ def register(cli: click.Group) -> None:
     @click.option(
         "--capacity",
         type=click.Choice(["spot", "on-demand", "reserved", "guaranteed"]),
-        default="spot",
-        show_default=True,
+        default=None,
+        help="Capacity tier [default: spot for new records; kept as-is on re-add].",
     )
     @click.option("--runtime-version", default=None)
+    @click.option(
+        "--node-id",
+        default=None,
+        help="TPU node id when it differs from NAME (default: adopted from the live QR, else NAME).",
+    )
     @click.option(
         "--bootstrap-cmd", default=None, help="Shell command run on every host before first connect of each generation."
     )
@@ -123,7 +129,9 @@ def register(cli: click.Group) -> None:
         metavar="REF",
         help="EasyDeL branch/tag/SHA for --setup-easydel.",
     )
-    def add(name, accelerator_type, zone, project, capacity, runtime_version, bootstrap_cmd, setup_easydel, branch):
+    def add(
+        name, accelerator_type, zone, project, capacity, runtime_version, node_id, bootstrap_cmd, setup_easydel, branch
+    ):
         """Register a cluster (adopts an existing TPU/QR with the same name).
 
         \b
@@ -139,26 +147,65 @@ def register(cli: click.Group) -> None:
             bootstrap_cmd = easydel_setup_cmd(branch or "main")
         elif branch is not None:
             raise click.ClickException("--branch only makes sense with --setup-easydel.")
+        registry = ClusterRegistry.from_config()
+        existing = registry.get(name)
+        if existing is not None:
+            # Re-add is a PATCH: never let this machine's gcloud defaults
+            # silently re-home a live record to another project/zone, and
+            # don't demand fields the record already carries.
+            project = project or existing.project
+            zone = zone or existing.zone
+            accelerator_type = accelerator_type or existing.accelerator_type
         project, zone = _resolve_project_zone(project, zone)
         adopted = describe_queued_resource(name, project=project, zone=zone)
         if adopted is not None:
             accelerator_type = accelerator_type or adopted.accelerator_type
-            info(f"adopting existing queued resource {adopted.qr_id} ({adopted.state}, {accelerator_type})")
+            # Hand-created QRs often name the node differently (QR `foo`,
+            # node `foo-node`); keep that node id stable across re-queues.
+            # An explicit --node-id wins over the adopted one (e.g. when the
+            # live QR itself was created with the wrong node name).
+            if node_id is None and adopted.node_ids and adopted.node_ids[0] != name:
+                node_id = adopted.node_ids[0]
+            info(
+                f"adopting existing queued resource {adopted.qr_id} "
+                f"({adopted.state}, {accelerator_type}, node {node_id or name})"
+            )
+        if node_id == name:
+            node_id = None
         if not accelerator_type:
             raise click.ClickException("--type is required (no existing queued resource to adopt it from).")
-        registry = ClusterRegistry.from_config()
-        record = ClusterRecord(
-            name=name,
-            kind="qr",
-            project=project,
-            zone=zone,
-            accelerator_type=accelerator_type,
-            runtime_version=runtime_version,
-            capacity=capacity,
-            qr_id=adopted.qr_id if adopted else None,
-            bootstrap_cmd=bootstrap_cmd,
-            state="ADOPTED" if adopted else "UNKNOWN",
-        )
+        if existing is not None:
+            # Re-adding is a config PATCH. Declarative fields update, but
+            # live reconciliation state — generation counter, the current
+            # qr_id, recreate budget ring, watcher FSM state — must survive:
+            # losing the qr_id pointer makes the watcher double-queue
+            # capacity, and losing the generation reuses spent QR names.
+            record = dataclasses.replace(
+                existing,
+                project=project,
+                zone=zone,
+                accelerator_type=accelerator_type,
+                runtime_version=runtime_version if runtime_version is not None else existing.runtime_version,
+                capacity=capacity if capacity is not None else existing.capacity,
+                node_id=node_id if node_id is not None else existing.node_id,
+                bootstrap_cmd=bootstrap_cmd if bootstrap_cmd is not None else existing.bootstrap_cmd,
+                qr_id=existing.qr_id or (adopted.qr_id if adopted else None),
+            )
+            info(f"updating existing record (generation {existing.generation}, qr_id {existing.qr_id or '-'} kept)")
+        else:
+            record = ClusterRecord(
+                name=name,
+                kind="qr",
+                project=project,
+                zone=zone,
+                accelerator_type=accelerator_type,
+                runtime_version=runtime_version,
+                capacity=capacity or "spot",
+                node_id=node_id,
+                qr_id=adopted.qr_id if adopted else None,
+                bootstrap_cmd=bootstrap_cmd,
+                state="ADOPTED" if adopted else "UNKNOWN",
+            )
         registry.upsert(record)
         success(f"registered {name} ({accelerator_type}, {capacity}, {zone})")
 

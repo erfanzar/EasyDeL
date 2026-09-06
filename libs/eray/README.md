@@ -434,6 +434,85 @@ resubmits; `eray fleet status` shows the new generation. Non-restartable
 one-off jobs can be submitted straight from the laptop through the tunnel
 (`eray run -a http://127.0.0.1:8265 -- ...`).
 
+## Capacity pools — hold N slices across zones
+
+Where `eray fleet` manages **named** clusters (one record = one stable node
+name = one Ray cluster), `eray tpu provision` manages **counted** capacity:
+"hold 2 × v5p-64 spot slices, from these zones in this order." It talks to
+the TPU API through the typed `google.cloud.tpu_v2alpha1` client (install
+the extra: `pip install eray[gcp]`) instead of shelling `gcloud`, and its
+reconcile loop closes the two gaps queued resources have on spot:
+
+- **A `SUSPENDED` QR never self-heals** — the pool deletes it and requests a
+  replacement immediately (the replacement is even requested while the old
+  one is still `SUSPENDING`). Fresh unique names, so recreation never waits
+  on the dead name freeing up; ownership lives in labels
+  (`eray-capacity-pool=<name>`), so a restarted loop rediscovers everything
+  from cloud state alone.
+- **A stocked-out zone usually doesn't error** — a spot request just sits in
+  `WAITING_FOR_RESOURCES` forever. Requests stuck past `--zone-wait-timeout`
+  are rotated to the next declared zone; loud stockouts
+  (`RESOURCE_EXHAUSTED`) block the zone for 5 minutes and fall through to
+  the next zone on the spot.
+
+```bash
+# hold 2 slices + 1 warm spare, preferring us-central2-b, falling back to us-central1-a
+eray tpu provision -a v5p-64 --zones us-central2-b,us-central1-a --count 2 --buffer 1
+
+# the recovery loop: delete SUSPENDED/FAILED, re-create, rotate stuck zones
+eray tpu reclaim                # one pass over every saved pool (cron-friendly)
+eray tpu reclaim --watch        # daemon mode (systemd/tmux, run it off the TPUs)
+eray tpu reclaim --dry-run      # shadow mode: print decisions, touch nothing
+
+# adopt an existing hand-made fleet by name prefix and migrate it to labels
+eray tpu provision -a v5p-64 --zones us-central2-b --count 2 --adopt-prefix demo-qr
+
+# keep only a warm spare between jobs; release everything when done
+eray tpu provision -a v5p-64 --zones us-central2-b --count 0 --buffer 1
+eray tpu release --name eray-v5p-64
+```
+
+Pool specs persist in `~/.eray/capacity.json` (desired state only; observed
+state always comes from the cloud). `--buffer` spares are held even at
+`--count 0`, which is what keeps hard-won spot capacity across job
+boundaries. Once a pool slice is `ACTIVE`, connect it into a Ray cluster
+with the usual `eray tpu connect -n <node-id>` / `eray fleet add <name>`
+(the QR's node id equals its QR name). The capacity layer is adapted from
+the Iris cluster manager (marin-community/marin, Apache-2.0), extended with
+spot scheduling blocks and quiet-stockout zone rotation.
+
+## Managed runs — training-aware babysitting
+
+`eray runs` closes the loop above capacity and clusters: declare a training
+run once, and a single watcher keeps it alive — launching with deterministic
+attempt ids (`{name}-a{N}`), watching **step progress** extracted from job
+logs (not just process liveness), restarting crashes and stalls within
+explicit budgets, and waiting out preemptions without burning the failure
+budget (iris task-state semantics: failures and preemptions are separate
+ledgers).
+
+```bash
+# declare a run against a fleet cluster (or a direct address ip:8265)
+eray runs add my-arm -c fleet:trainer1 -x "python train_arm.py" \
+    --workdir ~/runs/my-arm -e WANDB_MODE offline \
+    --compile-grace 2100 --step-timeout 600 --max-failures 10 --max-futile 5
+
+eray runs watch            # THE babysitter loop (lease-guarded: a second
+                           # instance refuses to start instead of fighting)
+eray runs list             # states, attempts, steps, budgets at a glance
+eray runs status my-arm
+eray runs stop / retry / rm / logs
+```
+
+Health is progress-based: no step advance is fine during `--compile-grace`
+(a cold XLA compile can take many minutes); after the grace window the
+first step must already have landed, and each subsequent step must arrive
+within `--step-timeout` of the last. Repairs that never beat the previous attempt's
+step are *futile*; `--max-futile` of those in a row parks the run in
+QUARANTINED for a human (`eray runs retry` re-arms it) instead of
+repair-looping forever. A run whose *cluster* died goes PREEMPTED and
+relaunches when the fleet/capacity layer brings the slice back.
+
 ## Elastic autoscale clusters
 
 `eray autoscale` wraps Ray's own cluster-launcher (`ray up/down/dashboard`)

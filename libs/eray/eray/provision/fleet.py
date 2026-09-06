@@ -116,6 +116,7 @@ def _spec_from_record(record: ClusterRecord) -> QrSpec:
         project=record.project,
         runtime_version=record.runtime_version,
         capacity=record.capacity,  # type: ignore[arg-type]
+        node_id=record.node_id,  # None → node id defaults to the record name
         labels={"eray-cluster": record.name.replace("_", "-").lower()},
     )
 
@@ -168,7 +169,7 @@ def ensure_tpu(
     if record.kind != "qr":
         return report(record.state, f"kind={record.kind} is not reconciled by ensure_tpu")
 
-    node = describe_node(record.name, project=record.project, zone=record.zone)
+    node = describe_node(record.resolved_node_id(), project=record.project, zone=record.zone)
 
     # Node exists and is READY → this is a Ray-level concern from here on.
     if node is not None and node.state == "READY":
@@ -281,7 +282,7 @@ def qr_tunnel_argv(
         "tpus",
         "tpu-vm",
         "ssh",
-        record.name,
+        record.resolved_node_id(),  # the SSH target is the node, not the record/QR name
         "--project",
         record.project,
         "--zone",

@@ -67,8 +67,9 @@ class ClusterRecord:
     """One managed cluster's identity, desired state, and watcher state.
 
     Attributes:
-        name: Registry key; also the stable TPU node id (survives re-queues,
-            so ``eray tpu connect -n <name>`` always resolves).
+        name: Registry key and the base for QR ids. Also the TPU node id
+            unless ``node_id`` overrides it (adopted split-name fleets);
+            resolve node-facing operations through ``resolved_node_id()``.
         kind: ``"qr"`` (queued-resource managed slice) or ``"launcher"``
             (Ray cluster-launcher config).
         project: GCP project id.
@@ -77,6 +78,11 @@ class ClusterRecord:
         runtime_version: TPU runtime version override, or None for the
             generation default.
         capacity: ``"spot"`` / ``"on-demand"`` / ``"reserved"`` / ``"guaranteed"``.
+        node_id: TPU node id when it differs from ``name`` — set when
+            adopting a QR whose node was created under a different name
+            (e.g. QR ``foo`` with node ``foo-node``). None means the node id
+            equals ``name`` (eray's own convention). Like ``name``, it is
+            stable across re-queues.
         qr_id: Current queued-resource id (``{name}-r{generation}`` once the
             watcher has re-queued at least once; initially ``name`` when
             adopting a hand-created QR).
@@ -114,6 +120,7 @@ class ClusterRecord:
     accelerator_type: str | None = None
     runtime_version: str | None = None
     capacity: str = "spot"
+    node_id: str | None = None
     qr_id: str | None = None
     generation: int = 0
     desired_state: str = "up"
@@ -155,6 +162,10 @@ class ClusterRecord:
     def next_qr_id(self) -> str:
         """The deterministic QR id for the next generation."""
         return f"{self.name}-r{self.generation + 1}"
+
+    def resolved_node_id(self) -> str:
+        """The TPU node id this record's capacity is (re)created under."""
+        return self.node_id or self.name
 
 
 class LocalBackend:

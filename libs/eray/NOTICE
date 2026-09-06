@@ -18,6 +18,13 @@ limitations under the License.
 eray was extracted from the eFormer project:
   https://github.com/erfanzar/eFormer
 
+The eray.capacity package contains code adapted from the Iris cluster
+manager in the Marin project (Copyright The Marin Authors), and the
+eray.runs package adapts its task-state semantics (separate failure and
+preemption retry budgets, terminal-state rollup):
+  https://github.com/marin-community/marin
+  (lib/iris — Apache License 2.0)
+
 This product includes software developed by the Ray project:
   https://github.com/ray-project/ray
   (Apache License 2.0)

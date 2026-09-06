@@ -318,7 +318,9 @@ class TestFleetCli:
         return reg
 
     def test_add_with_adoption(self, local_registry):
-        adopted = SimpleNamespace(qr_id="n_server_spot_m", state="ACTIVE", accelerator_type="v5p-8")
+        adopted = SimpleNamespace(
+            qr_id="n_server_spot_m", state="ACTIVE", accelerator_type="v5p-8", node_ids=("n_server_spot_m",)
+        )
         runner = CliRunner()
         with mock.patch("eray.cli.fleet.describe_queued_resource", return_value=adopted):
             result = runner.invoke(
@@ -329,6 +331,97 @@ class TestFleetCli:
         assert record.accelerator_type == "v5p-8"
         assert record.qr_id == "n_server_spot_m"
         assert record.state == "ADOPTED"
+        assert record.node_id is None  # node name matches the record name
+
+    def test_add_with_adoption_captures_split_node_id(self, local_registry):
+        adopted = SimpleNamespace(
+            qr_id="demo-qr-a", state="ACTIVE", accelerator_type="v5p-128",
+            node_ids=("demo-qr-a-node",),
+        )
+        runner = CliRunner()
+        with mock.patch("eray.cli.fleet.describe_queued_resource", return_value=adopted):
+            result = runner.invoke(
+                cli, ["fleet", "add", "demo-qr-a", "--zone", "us-east5-a", "--project", "proj"]
+            )
+        assert result.exit_code == 0, result.output
+        record = local_registry.get("demo-qr-a")
+        assert record.node_id == "demo-qr-a-node"
+        assert record.resolved_node_id() == "demo-qr-a-node"
+
+    def test_re_add_keeps_capacity_project_zone_without_flags(self, local_registry):
+        # Re-adding from a machine with different gcloud defaults must not
+        # re-home a live record: capacity/project/zone are kept unless the
+        # flags are explicitly passed.
+        live = make_record(
+            name="demo-qr-b", accelerator_type="v5p-128", capacity="reserved",
+            project="prod-project", zone="us-east5-a", qr_id="demo-qr-b-r8", generation=8,
+        )
+        local_registry.upsert(live)
+        runner = CliRunner()
+        with mock.patch("eray.cli.fleet.describe_queued_resource", return_value=None):
+            result = runner.invoke(
+                cli, ["fleet", "add", "demo-qr-b", "--bootstrap-cmd", "pip install ray || true"]
+            )
+        assert result.exit_code == 0, result.output
+        record = local_registry.get("demo-qr-b")
+        assert record.capacity == "reserved"
+        assert record.project == "prod-project"
+        assert record.zone == "us-east5-a"
+        assert record.qr_id == "demo-qr-b-r8"
+        assert record.bootstrap_cmd == "pip install ray || true"
+
+    def test_tunnel_argv_targets_the_node_id(self):
+        from eray.provision.fleet import qr_tunnel_argv
+
+        record = make_record(name="demo-qr-b", node_id="demo-qr-b-node")
+        argv = qr_tunnel_argv(record, remote_port=8265, local_port=8265)
+        assert "demo-qr-b-node" in argv
+        assert "demo-qr-b" not in [a for a in argv if a != "demo-qr-b-node"]
+
+    def test_add_node_id_override_beats_adopted(self, local_registry):
+        adopted = SimpleNamespace(
+            qr_id="demo-qr-b", state="WAITING_FOR_RESOURCES", accelerator_type="v5p-128",
+            node_ids=("demo-qr-b-node-alt",),  # wrong-convention live QR
+        )
+        runner = CliRunner()
+        with mock.patch("eray.cli.fleet.describe_queued_resource", return_value=adopted):
+            result = runner.invoke(
+                cli,
+                ["fleet", "add", "demo-qr-b", "--zone", "us-east5-a", "--project", "proj",
+                 "--node-id", "demo-qr-b-node"],
+            )
+        assert result.exit_code == 0, result.output
+        assert local_registry.get("demo-qr-b").node_id == "demo-qr-b-node"
+
+    def test_re_add_patches_config_but_keeps_live_state(self, local_registry):
+        # A record mid-recovery: generation 8, qr_id pointing at the live
+        # in-flight QR. Re-adding (e.g. to wire a bootstrap-cmd) must not
+        # reset the counter or orphan the QR pointer.
+        live = make_record(
+            name="demo-qr-b",
+            accelerator_type="v5p-128",
+            node_id="demo-qr-b-node",
+            generation=8,
+            qr_id="demo-qr-b-r8",
+            recreate_ts=[1.0, 2.0],
+            state="WAITING",
+        )
+        local_registry.upsert(live)
+        runner = CliRunner()
+        with mock.patch("eray.cli.fleet.describe_queued_resource", return_value=None):
+            result = runner.invoke(
+                cli,
+                ["fleet", "add", "demo-qr-b", "--type", "v5p-128", "--zone", "us-east5-a",
+                 "--project", "proj", "--bootstrap-cmd", "pip install ray || true"],
+            )
+        assert result.exit_code == 0, result.output
+        record = local_registry.get("demo-qr-b")
+        assert record.generation == 8
+        assert record.qr_id == "demo-qr-b-r8"
+        assert record.recreate_ts == [1.0, 2.0]
+        assert record.state == "WAITING"
+        assert record.node_id == "demo-qr-b-node"  # kept without re-passing
+        assert record.bootstrap_cmd == "pip install ray || true"  # patched in
 
     def test_add_requires_type_when_nothing_to_adopt(self, local_registry):
         runner = CliRunner()
@@ -585,3 +678,50 @@ class TestRunClusterFlag:
         assert captured["submit"]["metadata"]["cluster"] == "trainer1"
         assert captured["submit"]["metadata"]["restartable"] == "1"
         assert captured["history"]["cluster"] == "trainer1"
+
+
+class TestNodeIdThreading:
+    """Adopted fleets may have node ids that differ from the QR/record name
+    (QR `foo` with node `foo-node`); everything that touches the node must
+    resolve through record.resolved_node_id()."""
+
+    def test_record_node_id_roundtrip_and_old_doc_default(self, tmp_path):
+        reg = make_registry(tmp_path)
+        reg.upsert(make_record(node_id="trainer1-node"))
+        assert reg.get("trainer1").node_id == "trainer1-node"
+        assert reg.get("trainer1").resolved_node_id() == "trainer1-node"
+        # Docs written before the field existed load as None → name.
+        old = ClusterRecord.from_dict({"name": "old1", "project": "p", "zone": "z", "accelerator_type": "v4-8"})
+        assert old.node_id is None
+        assert old.resolved_node_id() == "old1"
+
+    def test_spec_from_record_threads_node_id(self):
+        spec = fleet_module._spec_from_record(make_record(node_id="trainer1-node"))
+        assert spec.resolved_node_id() == "trainer1-node"
+        assert spec.name == "trainer1"  # QR id base stays the record name
+        default = fleet_module._spec_from_record(make_record())
+        assert default.resolved_node_id() == "trainer1"
+
+    def test_ensure_describes_the_node_id(self, tmp_path, monkeypatch):
+        reg = make_registry(tmp_path)
+        reg.upsert(make_record(node_id="trainer1-node"))
+        seen = []
+        monkeypatch.setattr(
+            fleet_module, "describe_node", lambda name, **k: seen.append(name) or fake_node()
+        )
+        monkeypatch.setattr(fleet_module, "describe_queued_resource", lambda *a, **k: None)
+        monkeypatch.setattr(fleet_module, "head_reachable", lambda *a, **k: True)
+        fleet_module.ensure_tpu("trainer1", registry=reg, connect=False)
+        assert seen == ["trainer1-node"]
+
+    def test_watcher_observe_describes_the_node_id(self, monkeypatch):
+        import eray.provision.watcher as watcher_module
+
+        seen = []
+        monkeypatch.setattr(
+            watcher_module, "describe_node", lambda name, **k: seen.append(name) or None
+        )
+        monkeypatch.setattr(watcher_module, "describe_queued_resource", lambda *a, **k: None)
+        watcher_module.observe(make_record(node_id="trainer1-node"))
+        assert seen == ["trainer1-node"]
+

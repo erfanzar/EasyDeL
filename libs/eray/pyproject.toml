@@ -44,7 +44,8 @@ module-name = "eray"
 module-root = "."
 
 [project.optional-dependencies]
-dev = ["pytest"]
+gcp = ["google-cloud-tpu>=1.19.0"]
+dev = ["pytest", "google-cloud-tpu>=1.19.0"]
 
 [tool.setuptools]
 package-dir = { "" = "." }
