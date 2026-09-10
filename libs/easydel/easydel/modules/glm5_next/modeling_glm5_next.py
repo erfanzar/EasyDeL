@@ -106,6 +106,7 @@ from easydel.layers import (
     split_fused_gate_up_projection,
 )
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
+from easydel.layers.indexer import IndexerConfig, IndexerKind, SparseIndexer
 from easydel.layers.linear_attention import apply_conv_with_state, apply_mask_to_padding_states
 from easydel.layers.moe import moe_group_topk_select
 from easydel.layers.norms import lowfloats
@@ -145,62 +146,6 @@ def _unweighted_rms_norm(x: Array, eps: float) -> Array:
     """
     scale = jax.lax.rsqrt(jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True) + eps)
     return x * scale.astype(x.dtype)
-
-
-class Glm5NextLayerNorm(spx.Module):
-    """Standard LayerNorm with HF-compatible ``weight``/``bias`` parameter names.
-
-    Used by the DSA indexer's ``k_norm`` (eps 1e-6).
-
-    Args:
-        hidden_size: Feature dimension to normalise over.
-        eps: Epsilon for numerical stability.
-        dtype: Computation dtype.
-        param_dtype: Parameter storage dtype.
-        rngs: PRNG key container.
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        eps: float = 1e-6,
-        dtype: jnp.dtype = jnp.bfloat16,
-        param_dtype: jnp.dtype = jnp.bfloat16,
-        *,
-        rngs: spx.Rngs,
-    ):
-        """Initialize a LayerNorm whose parameter names match HF checkpoints.
-
-        Args:
-            hidden_size: Feature dim to normalise over.
-            eps: Numerical stability epsilon.
-            dtype: Computation dtype.
-            param_dtype: Parameter storage dtype.
-            rngs: Random number generator collection.
-        """
-        self.hidden_size = hidden_size
-        self.eps = eps
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.weight = spx.Parameter(jnp.ones((hidden_size,), dtype=param_dtype))
-        self.bias = spx.Parameter(jnp.zeros((hidden_size,), dtype=param_dtype))
-
-    def forward(self, hidden_states: Float[Array, "... hidden_size"]) -> Float[Array, "... hidden_size"]:
-        """Apply LayerNorm in fp32 and return in the input dtype.
-
-        Args:
-            hidden_states: Tensor whose last axis has length ``hidden_size``.
-
-        Returns:
-            Normalised tensor with the same shape and dtype as the input.
-        """
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.astype(jnp.float32)
-        mean = jnp.mean(hidden_states, axis=-1, keepdims=True)
-        variance = jnp.mean((hidden_states - mean) ** 2, axis=-1, keepdims=True)
-        normed = (hidden_states - mean) * jax.lax.rsqrt(variance + self.eps)
-        out = normed * self.weight.value.astype(jnp.float32) + self.bias.value.astype(jnp.float32)
-        return out.astype(input_dtype)
 
 
 class Glm5NextTextMLP(spx.Module):
@@ -1463,64 +1408,29 @@ class Glm5NextLinearAttention(spx.Module):
         )
 
 
-def _batched_take(x: Array, indices: Array) -> Array:
-    """Gather rows of a batched array with per-batch indices.
+class Glm5NextIndexer(SparseIndexer):
+    """GLM-5 k-pool DSA indexer on the unified :class:`SparseIndexer` layer.
 
-    Args:
-        x: Source array ``[batch, n, ...]``.
-        indices: Integer index tensor ``[batch, t, k]`` with values into the
-            ``n`` axis.
-
-    Returns:
-        Array of shape ``[batch, t, k, ...]`` gathered along axis 1 of ``x``.
-    """
-    batch_size = x.shape[0]
-    flat = jnp.take_along_axis(x.reshape(batch_size, x.shape[1], -1), indices.reshape(batch_size, -1)[..., None], axis=1)
-    return flat.reshape(indices.shape + x.shape[2:])
-
-
-class Glm5NextIndexer(spx.Module):
-    """DeepSeek Sparse Attention indexer with k-pool compression (GLM-5).
-
-    Scores *pools* of keys instead of individual tokens: keys are grouped
-    into pools of ``index_kpool`` starting at the first valid (unpadded)
-    token; each pool is summarised by a softmax-gated learned average
-    (``index_kpool_compress_gate`` scores pooled per-channel plus a learned
-    ``index_kpool_compress_ape`` position bias); pools are scored with per-head
-    ReLU dot products against the indexer query, weighted by a learned
-    per-head importance projection, and the top ``index_topk / index_kpool``
-    pools whose *final* token is causally visible are expanded back to raw
-    token indices. The incomplete trailing pool can be appended as raw token
-    indices (``index_kpool_always_select_tail``).
-
-    The packed per-token state ``[key | gate_scores | valid]`` (width
-    ``2 * index_head_dim + 1``) rides the cache view's ``recurrent_state``
-    slot on full-attention layers so decode steps can score cached tokens.
-
-    The whole selection runs under ``jax.lax.stop_gradient`` (HF wraps the
-    indexer in ``@torch.no_grad``): the mask is a routing decision, not a
-    learned pathway.
-
-    Args:
-        config: Model configuration.
-        layer_idx: Index of this layer in the decoder stack.
-        dtype: Computation dtype.
-        param_dtype: Parameter storage dtype.
-        precision: JAX matmul precision.
-        rngs: PRNG key container.
+    Thin configuration adapter: the projection plumbing, pool compression,
+    ReLU-weighted scoring, top-k selection and tail-pool expansion all live in
+    the shared :class:`~easydel.layers.indexer.SparseIndexer`; this subclass
+    only maps the model config onto :class:`IndexerConfig`. Checkpoint
+    parameter names (``wq_b`` / ``wk`` / ``k_norm`` / ``weights_proj`` /
+    ``index_kpool_compress_ape`` / ``index_kpool_compress_gate``) are owned by
+    the parent class and are unchanged.
     """
 
     def __init__(
         self,
         config: Glm5NextTextConfig,
-        layer_idx: int,
+        layer_idx: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: spx.Rngs,
     ):
-        """Initialize the k-pool DSA indexer.
+        """Map the model config onto the unified indexer configuration.
 
         Args:
             config: Model configuration carrying ``index_n_heads``,
@@ -1532,310 +1442,31 @@ class Glm5NextIndexer(spx.Module):
             precision: JAX matmul precision.
             rngs: Random number generator collection.
         """
-        self.config = config
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.layer_idx = layer_idx
-        self.n_heads = config.index_n_heads
-        self.head_dim = config.index_head_dim
-        self.index_topk = config.index_topk
-        self.index_kpool = config.index_kpool
-        self.index_kpool_always_select_tail = config.index_kpool_always_select_tail
-        self.softmax_scale = self.head_dim**-0.5
-        q_input_dim = config.q_lora_rank if config.q_lora_rank is not None else config.hidden_size
-
-        column_linear = partial(
-            ColumnParallelLinear,
+        super().__init__(
+            IndexerConfig(
+                kind=IndexerKind.POOL,
+                index_n_heads=config.index_n_heads,
+                index_head_dim=config.index_head_dim,
+                index_topk=config.index_topk,
+                hidden_size=config.hidden_size,
+                q_input_dim=config.q_lora_rank if config.q_lora_rank is not None else config.hidden_size,
+                score_activation="relu",
+                head_reduction="weighted",
+                query_source="q_lora",
+                rope_style="none",
+                norm_eps=1e-6,
+                packed_state="key_gate_valid",
+                stop_gradient=True,
+                kpool_size=config.index_kpool,
+                select_tail=config.index_kpool_always_select_tail,
+                initializer_range=config.initializer_range,
+            ),
+            layer_idx=layer_idx,
             dtype=dtype,
             param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
         )
-        self.wq_b = column_linear(q_input_dim, self.n_heads * self.head_dim)
-        self.wk = column_linear(config.hidden_size, self.head_dim)
-        self.k_norm = Glm5NextLayerNorm(
-            self.head_dim,
-            eps=1e-6,
-            rngs=rngs,
-            dtype=dtype,
-            param_dtype=param_dtype,
-        )
-        self.weights_proj = column_linear(config.hidden_size, self.n_heads)
-
-        # HF stores both raw (Parameter, no `.weight` suffix): torch layouts
-        # are kept as-is on load (gate stays transposed for matmul).
-        # ArrayParam.bound (not bare spx.Parameter): values must re-materialize
-        # through sequential_init / checkpoint resure with their init metadata.
-        self.index_kpool_compress_ape = ArrayParam.bound(
-            shape=(self.index_kpool, self.head_dim),
-            dtype=param_dtype,
-            init_method="zeros",
-            key=rngs.param,
-        )
-        self.index_kpool_compress_gate = ArrayParam.bound(
-            shape=(self.head_dim, config.hidden_size),
-            dtype=param_dtype,
-            init_method="ones",
-            key=rngs.param,
-        )
-
-    @property
-    def packed_state_dim(self) -> int:
-        """Width of the per-token packed indexer state.
-
-        Returns:
-            ``2 * index_head_dim + 1`` (key, gate scores, validity flag).
-        """
-        return 2 * self.head_dim + 1
-
-    def forward(
-        self,
-        hidden_states: Float[Array, "batch seq hidden"],
-        q_resid: Float[Array, "batch seq q_rank"],
-        attention_mask: Bool[Array, "batch seq"] | None,
-        cached_packed_states: Float[Array, "batch cached_seq packed"] | None = None,
-    ) -> tuple[Array, Float[Array, "batch total_seq packed"]]:
-        """Score k-pool candidates and expand them into top-k token indices.
-
-        Args:
-            hidden_states: Layer input ``(batch, seq, hidden_size)`` (K side).
-            q_resid: MLA Q low-rank residual
-                ``(batch, seq, q_lora_rank)`` (Q side of the indexer).
-            attention_mask: Boolean padding mask ``(batch, seq)``; treated as
-                all-valid when ``None``.
-            cached_packed_states: Packed indexer states of previously cached
-                tokens ``(batch, cached_seq, 2 * index_head_dim + 1)`` from
-                the layer's cache view; ``None`` during training prefill.
-
-        Returns:
-            Tuple of the int32 top-k token indices ``(batch, seq, width)``
-            (``width = index_topk + index_kpool - 1`` with the tail pool,
-            else ``index_topk``; ``-1`` marks invalid entries) and the
-            updated packed states covering every scored token.
-        """
-        batch_size, seq_len, _ = hidden_states.shape
-        if attention_mask is None:
-            attention_mask = jnp.ones((batch_size, seq_len), dtype=jnp.bool_)
-
-        query = self.wq_b(q_resid).reshape(batch_size, seq_len, self.n_heads, self.head_dim)
-        key = self.k_norm(self.wk(hidden_states))
-        gate_scores = jnp.einsum(
-            "bsh,gh->bsg",
-            hidden_states.astype(jnp.float32),
-            self.index_kpool_compress_gate.value.astype(jnp.float32),
-        )
-        valid_channel = attention_mask.astype(key.dtype)[..., None]
-
-        packed_states = jnp.concatenate([key, gate_scores.astype(key.dtype), valid_channel], axis=-1)
-        if cached_packed_states is not None:
-            packed_states = jnp.concatenate([cached_packed_states, packed_states], axis=1)
-
-        # HF wraps the whole indexer in @torch.no_grad: the mask is a routing
-        # decision, not a learned pathway, so indexer params receive no grads.
-        topk_indices = jax.lax.stop_gradient(self._select_topk(hidden_states, query, packed_states, attention_mask))
-        return topk_indices, packed_states
-
-    def _select_topk(
-        self,
-        hidden_states: Float[Array, "batch seq hidden"],
-        query: Float[Array, "batch seq heads head_dim"],
-        packed_states: Float[Array, "batch kv packed"],
-        attention_mask: Bool[Array, "batch seq"],
-    ) -> Array:
-        """Run the pool-score / top-k / expand selection.
-
-        Args:
-            hidden_states: Current-step layer input, used for the per-head
-                importance weighting.
-            query: Indexer queries ``(batch, seq, heads, head_dim)``.
-            packed_states: Packed ``[key | gate | valid]`` states over the
-                full KV range.
-            attention_mask: Current-step padding mask ``(batch, seq)``.
-
-        Returns:
-            Int32 top-k token indices ``(batch, seq, width)`` with ``-1`` for
-            invalid entries.
-        """
-        batch_size, seq_len, _ = hidden_states.shape
-        kv_len = packed_states.shape[1]
-        kpool = self.index_kpool
-
-        valid_keys = packed_states[..., -1] >= 0.5
-        visible_tokens = self._visible_tokens(valid_keys, seq_len, kv_len)
-
-        pool_keys, pool_indices, pool_valid = self._pooled_states(packed_states)
-        num_pools = pool_keys.shape[1]
-
-        # Per-head ReLU dot products between queries and pool summaries.
-        scores = jnp.einsum(
-            "bshd,bpd->bshp",
-            query.astype(jnp.float32),
-            pool_keys.astype(jnp.float32),
-        )
-        scores = jax.nn.relu(scores * self.softmax_scale)
-        weights = self.weights_proj(hidden_states).astype(jnp.float32) * (self.n_heads**-0.5)
-        index_scores = jnp.einsum("bsh,bshp->bsp", weights, scores)
-
-        # A pool is selectable only when its final token is visible to the
-        # query (causality + padding).
-        pool_end = jnp.clip(pool_indices[..., -1], 0, kv_len - 1)
-        pool_end_q = jnp.broadcast_to(pool_end[:, None, :], (batch_size, seq_len, num_pools))
-        pool_visible = jnp.take_along_axis(visible_tokens, pool_end_q.astype("i4"), axis=2)
-        valid_candidates = pool_visible & pool_valid[:, None, :]
-
-        min_score = jnp.finfo(jnp.float32).min
-        index_scores = jnp.where(valid_candidates, index_scores, min_score)
-
-        select_k = min(self.index_topk // kpool, num_pools)
-        selected = jax.lax.top_k(index_scores, select_k)[1]
-
-        selected_valid = jnp.take_along_axis(valid_candidates, selected, axis=2)
-        # pool_indices is [B, P, kpool]: gather the member indices of each
-        # selected pool and flatten pool members into token candidates.
-        selected_pool_indices = _batched_take(pool_indices, selected)  # [B, S, K, kpool]
-        selected_indices = selected_pool_indices.reshape(batch_size, seq_len, select_k * kpool)
-        selected_valid_flat = jnp.broadcast_to(
-            selected_valid[..., None], (batch_size, seq_len, select_k, kpool)
-        ).reshape(batch_size, seq_len, select_k * kpool)
-
-        topk_indices = jnp.where(selected_valid_flat, selected_indices, -1)
-
-        output_width = self.index_topk
-        if self.index_kpool_always_select_tail:
-            tail = self._append_visible_tail(topk_indices, visible_tokens, valid_keys)
-            topk_indices = tail
-            output_width += kpool - 1
-
-        pad_width = output_width - topk_indices.shape[-1]
-        if pad_width > 0:
-            topk_indices = jnp.pad(topk_indices, [(0, 0), (0, 0), (0, pad_width)], constant_values=-1)
-        topk_indices = topk_indices[..., :output_width]
-        topk_indices = jnp.where(attention_mask[..., None], topk_indices, -1)
-        return topk_indices.astype("i4")
-
-    def _visible_tokens(
-        self,
-        valid_keys: Bool[Array, "batch kv"],
-        q_length: int,
-        current_length: int,
-    ) -> Bool[Array, "batch q kv"]:
-        """Combine causality with the padding-based key validity.
-
-        Args:
-            valid_keys: Boolean key validity ``(batch, kv)`` (cached mask).
-            q_length: Number of query positions in this step.
-            current_length: Total KV length (cache included).
-
-        Returns:
-            Boolean ``(batch, q_length, kv)`` visibility matrix.
-        """
-        kv_positions = jnp.arange(valid_keys.shape[-1])
-        q_positions = current_length - q_length + jnp.arange(q_length)
-        causal = kv_positions[None, None, :] <= q_positions[None, :, None]
-        return causal & valid_keys[:, None, :]
-
-    def _pooled_states(
-        self,
-        packed_states: Float[Array, "batch kv packed"],
-    ) -> tuple[Array, Array, Array]:
-        """Build compressed k-pool candidates from the packed state.
-
-        Pooling starts at the first valid token so padded prefixes do not
-        misalign the groups. Incomplete pools (index beyond the sequence or
-        an invalid member) are marked invalid and masked out of selection.
-
-        Args:
-            packed_states: Packed ``[key | gate | valid]`` states
-                ``(batch, kv, 2 * index_head_dim + 1)``.
-
-        Returns:
-            Tuple of pool summary keys ``(batch, pools, head_dim)``, raw
-            member token indices ``(batch, pools, kpool)`` (``-1`` for
-            invalid members), and pool validity ``(batch, pools)``.
-        """
-        keys, gate_scores, valid_flags = jnp.split(packed_states, [self.head_dim, 2 * self.head_dim], axis=-1)
-        valid_keys = valid_flags[..., 0] >= 0.5
-
-        _, kv_len = valid_keys.shape
-        kpool = self.index_kpool
-        num_pools = (kv_len + kpool - 1) // kpool
-
-        first_key = jnp.where(
-            jnp.any(valid_keys, axis=-1),
-            jnp.argmax(valid_keys, axis=-1),
-            kv_len,
-        )
-        offsets = jnp.arange(num_pools * kpool).reshape(1, num_pools, kpool)
-        pool_indices = first_key[:, None, None] + offsets  # [B, P, kpool]
-
-        safe_indices = jnp.clip(pool_indices, 0, kv_len - 1)
-        in_range = pool_indices < kv_len
-
-        grouped_keys = _batched_take(keys, safe_indices)
-        grouped_gate_scores = _batched_take(gate_scores, safe_indices).astype(jnp.float32)
-        grouped_valid = _batched_take(valid_keys[..., None].astype("i4"), safe_indices)[..., 0].astype(bool)
-        grouped_valid = grouped_valid & in_range
-
-        pool_valid = jnp.all(grouped_valid, axis=-1)  # [B, P]
-        pool_indices = jnp.where(grouped_valid, pool_indices, -1)
-
-        # Softmax-gated learned average over each complete pool.
-        ape = self.index_kpool_compress_ape.value.astype(jnp.float32)
-        logits = grouped_gate_scores + ape[None, None]
-        logits = jnp.where(grouped_valid[..., None], logits, -1e30)
-        probabilities = jax.nn.softmax(logits, axis=2)
-        probabilities = jnp.nan_to_num(probabilities, nan=0.0)
-        pool_keys = jnp.sum(probabilities * grouped_keys.astype(jnp.float32), axis=2).astype(keys.dtype)
-
-        return pool_keys, pool_indices, pool_valid
-
-    def _append_visible_tail(
-        self,
-        topk_indices: Array,
-        token_visible: Bool[Array, "batch q kv"],
-        key_valid: Bool[Array, "batch kv"],
-    ) -> Array:
-        """Append the current incomplete pool as raw token indices.
-
-        With ``index_kpool=4`` and visible keys ``[A B C D E F]`` the selected
-        full pool covers ``[A B C D]``; the tail appends ``[E F]``.
-
-        Args:
-            topk_indices: Selected pool-expanded indices ``(batch, q, w)``.
-            token_visible: Query visibility ``(batch, q, kv)``.
-            key_valid: Key validity ``(batch, kv)``.
-
-        Returns:
-            Indices ``(batch, q, w + index_kpool - 1)`` with the tail
-            appended (``-1`` where invalid).
-        """
-        max_tail_width = self.index_kpool - 1
-        if max_tail_width == 0:
-            return topk_indices
-
-        _, _, kv_length = token_visible.shape
-        first_key = jnp.where(
-            jnp.any(key_valid, axis=-1),
-            jnp.argmax(key_valid, axis=-1),
-            kv_length,
-        )
-        visible_count = jnp.sum(token_visible, axis=-1)  # [B, q]
-        tail_count = visible_count % self.index_kpool
-        tail_offsets = jnp.arange(max_tail_width)
-
-        tail_start = first_key[:, None] + visible_count - tail_count
-        tail_indices = tail_start[..., None] + tail_offsets  # [B, q, max_tail]
-
-        tail_valid = (tail_offsets[None, None, :] < tail_count[..., None]) & (tail_indices < kv_length)
-        safe_tail = jnp.clip(tail_indices, 0, kv_length - 1)
-        tail_visible = jnp.take_along_axis(token_visible, safe_tail.astype("i4"), axis=2).astype(bool) & (
-            tail_indices >= 0
-        )
-        tail_indices = jnp.where(tail_valid & tail_visible, tail_indices, -1)
-        return jnp.concatenate([topk_indices, tail_indices], axis=-1)
 
 
 class Glm5NextDSAAttention(UnifiedAttention):
@@ -2135,12 +1766,13 @@ class Glm5NextDSAAttention(UnifiedAttention):
                 q_mask = q_mask[:, :q_len]
             q_mask = q_mask.astype(bool)
 
-        topk_indices, packed_states = self.indexer(
+        indexer_out = self.indexer(
             hidden_states=hidden_states,
             q_resid=q_resid,
             attention_mask=q_mask,
-            cached_packed_states=cached_packed_states,
+            cached_packed=cached_packed_states,
         )
+        topk_indices, packed_states = indexer_out.topk_indices, indexer_out.packed_state
 
         if has_recurrent_slot and hasattr(cache_view, "replace"):
             try:
