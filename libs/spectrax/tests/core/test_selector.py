@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 import pytest
-
 from spectrax.core.errors import SelectorError
 from spectrax.core.selector import Selector, as_selector, select
 from spectrax.core.state import State

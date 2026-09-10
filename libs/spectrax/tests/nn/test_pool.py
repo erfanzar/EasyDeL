@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 import pytest
-
 from spectrax.functional.pool import avg_pool, max_pool, pool
 from spectrax.nn.pool import (
     AdaptiveAvgPool1d,

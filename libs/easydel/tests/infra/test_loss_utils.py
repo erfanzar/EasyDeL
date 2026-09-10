@@ -15,10 +15,9 @@
 import functools
 import types
 
+import easydel.infra.loss_utils as loss_utils_module
 import jax
 import jax.numpy as jnp
-
-import easydel.infra.loss_utils as loss_utils_module
 from easydel.infra.loss_utils import (
     ForCausalLMLoss,
     ForSequenceClassificationLoss,

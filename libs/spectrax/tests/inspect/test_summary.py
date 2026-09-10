@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import jax.numpy as jnp
-
 from spectrax.inspect.summary import summary
 from spectrax.nn.linear import Linear
 from spectrax.rng.rngs import Rngs

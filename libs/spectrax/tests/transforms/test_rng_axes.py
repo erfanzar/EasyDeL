@@ -9,7 +9,6 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import pytest
-
 from spectrax.rng.rngs import Rngs
 from spectrax.transforms.rng_axes import StateAxes, split_rngs, split_stream_keys
 

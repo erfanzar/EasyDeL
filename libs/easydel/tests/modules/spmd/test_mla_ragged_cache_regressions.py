@@ -16,12 +16,10 @@
 
 import types
 
+import easydel as ed
 import jax.numpy as jnp
 import pytest
 import spectrax as spx
-from spectrax import common_types
-
-import easydel as ed
 from easydel.caching import (
     MLARaggedPagesCacheConfig,
     MLARaggedPagesCacheView,
@@ -30,6 +28,7 @@ from easydel.caching import (
 )
 from easydel.caching.mla_ragged_page import cache as mla_ragged_cache_mod
 from easydel.modules.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaAttention
+from spectrax import common_types
 
 
 def _capture_create(monkeypatch: pytest.MonkeyPatch, cache_cls: type):

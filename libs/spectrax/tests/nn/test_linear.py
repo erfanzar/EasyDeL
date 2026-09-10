@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 import pytest
-
 from spectrax.core.variable import Parameter
 from spectrax.init import normal, zeros
 from spectrax.nn.linear import Bilinear, Linear

@@ -2736,13 +2736,28 @@ class EasyDeLBaseConfig(PretrainedConfig):
         cls._set_token_in_kwargs(kwargs, token)
 
         config_dict, kwargs = cls.get_config_dict(pretrained_model_name_or_path, **kwargs)
+        # Composite checkpoints (e.g. `zai-org/GLM-5.3-Flash`: a
+        # `Glm5NextForConditionalGeneration` wrapper around
+        # `text_config` + `vision_config`) keep the quantization recipe at the
+        # OUTER level — it quantizes the language-model weights, not the
+        # modality split. When resolution descends into a sub-config below,
+        # carry `quantization_config` along so quantized serving finds it.
+        outer_config_dict = dict(config_dict)
         if cls.base_config_key and cls.base_config_key in config_dict:
             config_dict = config_dict[cls.base_config_key]
 
         if "model_type" in config_dict and hasattr(cls, "model_type") and config_dict["model_type"] != cls.model_type:
-            for v in config_dict.values():
+            for v in outer_config_dict.values():
                 if isinstance(v, dict) and v.get("model_type") == cls.model_type:
                     config_dict = v
+                    break
+
+        if (
+            config_dict is not outer_config_dict
+            and "quantization_config" in outer_config_dict
+            and "quantization_config" not in config_dict
+        ):
+            config_dict["quantization_config"] = outer_config_dict["quantization_config"]
 
         return cls.from_dict(config_dict, **kwargs)
 

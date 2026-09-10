@@ -15,7 +15,6 @@
 import json
 
 import pytest
-
 from easydel.inference.openai_api_modules import ChatCompletionRequest, ChatMessage
 from easydel.inference.tools.abstract_tool import ToolParserManager
 from easydel.inference.tools.auto_detect import detect_tool_parser

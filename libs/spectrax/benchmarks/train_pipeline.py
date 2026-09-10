@@ -44,9 +44,8 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh
-
 import spectrax as spx
+from jax.sharding import Mesh
 from spectrax import functional as F
 from spectrax import nn
 from spectrax.nn import PipelineSequential
@@ -183,7 +182,6 @@ def run_spmd(cfg: ModelConfig, schedule_name: str, microbatches: int, iters: int
     latency. Returns ``(compile_ms, median_step_ms, final_loss)``.
     """
     from jax.sharding import Mesh
-
     from spectrax.runtime.schedules import DualPipeV, Eager1F1B, Interleaved1F1BPlusOne, InterleavedGPipe, KimiK2
 
     schedule_cls = {

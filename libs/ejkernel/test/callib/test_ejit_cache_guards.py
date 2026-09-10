@@ -20,11 +20,10 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import warnings
 
+import ejkernel.callib._ejit as ej
 import jax
 import jax.numpy as jnp
 import pytest
-
-import ejkernel.callib._ejit as ej
 
 
 def _tiny_compiled():

@@ -1,13 +1,12 @@
 import jax
 import numpy as np
 import spectrax as spx
-from jax.sharding import Mesh, PartitionSpec
-from spectrax import common_types
-from spectrax.sharding import current_axis_rules
-
 from easydel.infra.etils import EasyDeLPlatforms
 from easydel.infra.sharding import CANONICAL_MESH_AXIS_NAMES, AxisPolicy, coerce_runtime_sharding_resolver
 from easydel.operations._operation_meta import OperationMetadata
+from jax.sharding import Mesh, PartitionSpec
+from spectrax import common_types
+from spectrax.sharding import current_axis_rules
 
 
 def _single_device_mesh() -> Mesh:

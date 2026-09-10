@@ -86,8 +86,10 @@ def test_mocked_streaming_jit_ad_operands_and_exact_scales(monkeypatch, bits):
     f = jax.jit(
         lambda a, b, c, d: grouped_matmul_channelwise(a, b, c, d, platform="pallas", preferred_element_type=jnp.float32)
     )
+
     def ref(a, b, c, d):
         return reference(a, b, c, d, preferred_element_type=jnp.float32)
+
     np.testing.assert_allclose(f(x, q, s, groups), ref(x, q, s, groups), rtol=1e-6, atol=1e-6)
     assert seen and all(t == (16, 128, 128) for t in seen)
     dx, ds = jnp.ones_like(x), jnp.ones_like(s) * 0.17

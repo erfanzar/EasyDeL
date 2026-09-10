@@ -16,7 +16,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from ejkernel.kernels._triton.mean_pooling import mean_pooling as triton_mean_pooling
 
 pytestmark = pytest.mark.skipif(jax.devices()[0].platform != "gpu", reason="Triton tests require GPU backend")

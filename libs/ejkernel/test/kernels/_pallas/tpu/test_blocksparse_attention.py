@@ -19,7 +19,6 @@ import random
 import jax
 import jax.numpy as jnp
 import pytest
-
 from ejkernel.kernels._pallas.tpu.blocksparse_attention import blocksparse_attention
 from ejkernel.kernels._xla.blocksparse_attention import blocksparse_attention as blocksparse_attention_xla
 from ejkernel.types.mask import MaskInfo

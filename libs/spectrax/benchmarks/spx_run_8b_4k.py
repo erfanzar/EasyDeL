@@ -26,7 +26,6 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import jax
 import jax.numpy as jnp
-
 import spectrax as spx
 from examples.models.llama import FSDP_TP_RULES, Llama3, Llama3Block, Llama3Config
 from spectrax import nn

@@ -10,9 +10,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.sharding import Mesh, PartitionSpec
-
 import spectrax as spx
+from jax.sharding import Mesh, PartitionSpec
 from spectrax import nn
 from spectrax.core.stage_assignment import assign_stage
 from spectrax.runtime.mpmd import sxjit, sxstage_iter, treduce

@@ -14,14 +14,13 @@
 
 from types import SimpleNamespace
 
-from spectrax import PartitionAxis, PartitionManager
-
 from easydel.axis import (
     register_attention_data_parallel_axis,
     reset_attention_data_parallel_axis,
     resolve_attention_data_parallel_axis,
 )
 from easydel.inference.esurge.esurge_engine import eSurge
+from spectrax import PartitionAxis, PartitionManager
 
 
 def test_attention_data_parallel_axis_resolves_independently_from_model_dp():

@@ -15,7 +15,6 @@
 """Tests for eray.resources.topology — host chip-split planning."""
 
 import pytest
-
 from eray.resources.topology import (
     DEFAULT_HOST_CHIP_GRIDS,
     DEFAULT_SPLIT_BASE_PORT,

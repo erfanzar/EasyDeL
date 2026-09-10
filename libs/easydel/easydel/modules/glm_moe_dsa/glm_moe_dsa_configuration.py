@@ -383,14 +383,11 @@ class GlmMoeDsaConfig(EasyDeLBaseConfig):
                 freq = max(index_topk_freq, 1)
                 offset = index_skip_topk_offset
                 self.indexer_types = [
-                    "full" if (max(i - offset + 1, 0) % freq) == 0 else "shared"
-                    for i in range(self.num_hidden_layers)
+                    "full" if (max(i - offset + 1, 0) % freq) == 0 else "shared" for i in range(self.num_hidden_layers)
                 ]
 
         if len(self.indexer_types) != self.num_hidden_layers:
-            raise ValueError(
-                f"indexer_types must have length {self.num_hidden_layers}, got {len(self.indexer_types)}."
-            )
+            raise ValueError(f"indexer_types must have length {self.num_hidden_layers}, got {len(self.indexer_types)}.")
         for indexer_type in self.indexer_types:
             if indexer_type not in ("full", "shared"):
                 raise ValueError(f"Invalid indexer type {indexer_type}. Expected 'full' or 'shared'.")

@@ -14,10 +14,10 @@
 
 """Tests for DeepSeek V2 model."""
 
-import pytest
-
 import easydel as ed
+import pytest
 from easydel.infra.etils import EasyDeLGradientCheckPointers
+
 from tests.modules.mpmd._scheduler_utils import GENERATION_SCHEDULE_KIND, LOSS_SCHEDULE_KINDS
 from tests.modules.test_utils import CausalLMTester, get_hf_model_from_hub
 

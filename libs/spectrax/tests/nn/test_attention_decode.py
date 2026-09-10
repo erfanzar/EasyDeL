@@ -9,7 +9,6 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import pytest
-
 from spectrax.core.variable import Buffer
 from spectrax.nn.attention import MultiheadAttention
 from spectrax.rng.rngs import Rngs

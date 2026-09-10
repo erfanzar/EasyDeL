@@ -5,7 +5,6 @@ from types import SimpleNamespace
 
 import jax.numpy as jnp
 import pytest
-
 from easydel.inference.esurge.core.interface import CacheGroupsConfig, CacheGroupSpec, FullAttentionSpec
 from easydel.inference.esurge.outputs import ModelRunnerOutput
 from easydel.inference.esurge.request import EngineRequest

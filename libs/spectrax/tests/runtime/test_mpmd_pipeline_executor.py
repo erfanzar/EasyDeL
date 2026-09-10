@@ -6,7 +6,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from spectrax.runtime.mpmd import MpmdPipelineExecutor
 from spectrax.runtime.mpmd.pipeline_executor import _PreparedCall
 

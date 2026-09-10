@@ -263,13 +263,9 @@ def _ragged_dot_qt_fwd(
     quantized_lhs: MaybeQArray = lhs
     quantized_rhs: MaybeQArray = rhs
     if rule.act_qtype is not None and numerics.should_quantize(lhs.dtype):
-        quantized_lhs = _quantize_across_axis(
-            lhs, _how_to_quantize_lhs(rule.act_qtype, rule), calibration_axis_name
-        )
+        quantized_lhs = _quantize_across_axis(lhs, _how_to_quantize_lhs(rule.act_qtype, rule), calibration_axis_name)
     if rule.weight_qtype is not None and numerics.should_quantize(rhs.dtype):
-        quantized_rhs = _quantize_across_axis(
-            rhs, _how_to_quantize_rhs(rule.weight_qtype, rule), calibration_axis_name
-        )
+        quantized_rhs = _quantize_across_axis(rhs, _how_to_quantize_rhs(rule.weight_qtype, rule), calibration_axis_name)
 
     out = _ragged_dot_maybe_quantized(
         quantized_lhs,

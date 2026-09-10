@@ -4,7 +4,6 @@ import math
 
 import jax
 import jax.numpy as jnp
-
 from ejkernel.modules.operations import unified_attention
 
 

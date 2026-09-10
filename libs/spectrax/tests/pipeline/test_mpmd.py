@@ -25,9 +25,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.sharding import Mesh, NamedSharding, PartitionSpec
-
 import spectrax as spx
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from spectrax import nn
 from spectrax.nn import PipelineSequential
 from spectrax.runtime.mpmd import collect_task_times_ms, sxcall, sxgrad, sxjit, sxstage_iter, sxvalue_and_grad

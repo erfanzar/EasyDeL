@@ -14,10 +14,9 @@
 
 from types import SimpleNamespace
 
+import easydel.operations.kernels.ragged_page_attention as ragged_page_mod
 import numpy as np
 from spectrax import common_types as ct
-
-import easydel.operations.kernels.ragged_page_attention as ragged_page_mod
 
 
 class _FakePartitionManager:

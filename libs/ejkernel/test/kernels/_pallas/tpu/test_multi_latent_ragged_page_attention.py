@@ -19,7 +19,6 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import pytest
-
 from ejkernel.kernels._pallas.tpu.multi_latent_ragged_page_attention import (
     multi_latent_ragged_page_attention,
 )

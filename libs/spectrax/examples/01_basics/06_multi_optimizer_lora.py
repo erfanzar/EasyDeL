@@ -25,7 +25,6 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 import jax
 import jax.numpy as jnp
 import optax
-
 import spectrax as spx
 from spectrax import nn
 from spectrax.contrib.optimizer import MultiOptimizer

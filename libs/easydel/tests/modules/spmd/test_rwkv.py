@@ -14,10 +14,9 @@
 
 """Tests for RWKV model."""
 
+import easydel as ed
 import pytest
 import transformers
-
-import easydel as ed
 from easydel.modules.rwkv import RwkvConfig
 
 try:

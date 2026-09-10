@@ -19,7 +19,6 @@ import os
 import jax
 import jax.numpy as jnp
 import pytest
-
 from ejkernel.kernels._pallas.tpu.prefill_page_attention import prefill_page_attention as prefill_tpu
 from ejkernel.kernels._xla.prefill_page_attention import prefill_page_attention as prefill_xla
 

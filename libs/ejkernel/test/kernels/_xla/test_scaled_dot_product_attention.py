@@ -16,7 +16,6 @@
 
 import jax
 import jax.numpy as jnp
-
 from ejkernel.kernels._xla.scaled_dot_product_attention import scaled_dot_product_attention
 
 

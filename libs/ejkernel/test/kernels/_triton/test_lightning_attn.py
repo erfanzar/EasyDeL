@@ -23,7 +23,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from einops import rearrange
-
 from ejkernel.kernels._triton import lightning_attn
 from ejkernel.kernels._xla.lightning_attn import lightning_attn as xla_lightning_attn
 from ejkernel.utils import numeric_gen

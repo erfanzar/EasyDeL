@@ -20,14 +20,13 @@ configurations, attention mechanisms, and hardware setups.
 
 import gc
 
+import easydel as ed
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 import spectrax as spx
 import torch
-
-import easydel as ed
 from easydel.infra.etils import EasyDeLGradientCheckPointers
 
 

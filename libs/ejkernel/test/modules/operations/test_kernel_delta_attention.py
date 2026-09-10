@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-
 from ejkernel.modules.operations import kernel_delta_attention
 
 from ._utils import assert_allclose

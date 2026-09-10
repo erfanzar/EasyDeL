@@ -2357,6 +2357,16 @@ class EasyGenerationMixin:
         if qk_rope_head_dim is None or int(qk_rope_head_dim) < 0:
             raise ValueError("MLA ragged cache requires non-negative `qk_rope_head_dim` on text config.")
 
+        # NoPE MLA models (``qk_rope_head_dim == 0``) may request a zero-padded
+        # cache rope width (``mla_cache_rope_width``): the Pallas MLA kernel
+        # needs a 128-aligned rope component, so the cache stores
+        # ``kv_lora_rank + mla_cache_rope_width`` while the model itself feeds
+        # rope tensors padded with zeros. Zero padding contributes nothing to
+        # the attention scores, so numerics are unchanged.
+        cache_rope_width = getattr(text_config, "mla_cache_rope_width", None)
+        if cache_rope_width is not None:
+            qk_rope_head_dim = int(cache_rope_width)
+
         mla_num_heads = getattr(text_config, "num_attention_heads", None)
         if mla_num_heads is None:
             mla_num_heads = getattr(text_config, "num_key_value_heads", None)

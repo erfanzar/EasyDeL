@@ -39,13 +39,12 @@ os.environ.setdefault("ENABLE_DISTRIBUTED_INIT", "0")
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
 
+import easydel as ed
 import jax
 import numpy as np
 import optax
 import pytest
 from jax import numpy as jnp
-
-import easydel as ed
 
 if jax.device_count() < 4:
     pytest.skip(
@@ -257,7 +256,6 @@ def _path_matches_fused_param(path: str, module_path: str) -> bool:
 
 def _canonical_fused_parameter_leaves(model):
     import spectrax as spx
-
     from easydel.layers.layouts import canonicalize_fused_state, fused_layout_param_specs
     from easydel.utils.traversals import flatten_dict
 
@@ -277,7 +275,6 @@ def _canonical_fused_parameter_leaves(model):
 
 def _runtime_fused_parameter_leaves(model):
     import spectrax as spx
-
     from easydel.layers.layouts import fused_layout_param_specs
     from easydel.utils.traversals import flatten_dict
 

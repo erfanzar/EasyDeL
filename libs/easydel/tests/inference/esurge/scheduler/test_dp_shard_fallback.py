@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import jax.numpy as jnp
-
 from easydel.inference.esurge.core.interface import CacheGroupsConfig, CacheGroupSpec, FullAttentionSpec
 from easydel.inference.esurge.outputs import ModelRunnerOutput
 from easydel.inference.esurge.request import EngineRequest

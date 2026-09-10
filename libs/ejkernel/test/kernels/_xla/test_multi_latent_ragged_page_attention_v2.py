@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-
 from ejkernel.kernels._xla.multi_latent_ragged_page_attention_v2 import (
     multi_latent_ragged_page_attention_v2,
 )

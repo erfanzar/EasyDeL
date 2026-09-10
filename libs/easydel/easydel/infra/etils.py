@@ -351,7 +351,19 @@ AVAILABLE_SCHEDULERS = tp.Literal["linear", "cosine", "none"]
 
 # Type alias for valid optimizer options.
 # Maps to the values in EasyDeLOptimizers enum.
-AVAILABLE_OPTIMIZERS = tp.Literal["adafactor", "adamw", "mars", "muon", "rmsprop", "lion", "skew", "quad"]
+AVAILABLE_OPTIMIZERS = tp.Literal[
+    "adafactor",
+    "adamw",
+    "mars",
+    "muon",
+    "rmsprop",
+    "lion",
+    "skew",
+    "quad",
+    "fused_adamw",
+    "fused_lion",
+    "fused_rmsprop",
+]
 
 # Type alias for mixture-of-experts implementation methods.
 # fused_moe: Uses fused kernels for efficiency
@@ -371,9 +383,11 @@ AVAILABLE_ATTENTION_MECHANISMS = tp.Literal[
     "blockwise",
     "sdpa",
     "autoregressive_decodeattn",
+    "cuda_flash_attn2",
     "ragged_page_attention_v2",
     "ragged_page_attention_v3",
     "multi_latent_ragged_page_attention_v1",
+    "multi_latent_ragged_page_attention_v2",
     "page_attention",
     "unified_attention",
     "paged_flash_attention",

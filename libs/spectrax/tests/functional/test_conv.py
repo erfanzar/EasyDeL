@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import jax.numpy as jnp
-
 from spectrax.functional.conv import conv
 
 

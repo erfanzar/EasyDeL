@@ -15,14 +15,13 @@
 import jax
 import numpy as np
 import pytest
-from jax import numpy as jnp
-
 from easydel.data.transforms.pack import PackedShardedSource
 from easydel.infra.loss_utils import LossConfig
 from easydel.trainers.prompt_transforms import SFTPreprocessTransform
 from easydel.trainers.supervised_fine_tuning_trainer.sft_config import SFTConfig
 from easydel.trainers.supervised_fine_tuning_trainer.sft_trainer import SFTTrainer
 from easydel.trainers.trainer._fn import _dft_causal_lm_metrics
+from jax import numpy as jnp
 
 
 class _TinySource:

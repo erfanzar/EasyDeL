@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import optax
-
 from easydel.trainers.training_configurations import TrainingArguments
 
 

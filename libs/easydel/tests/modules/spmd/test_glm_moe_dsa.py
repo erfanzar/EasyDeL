@@ -14,12 +14,11 @@
 
 """Tests for GLM-MoE-DSA model."""
 
+import easydel as ed
 import jax.numpy as jnp
 import pytest
 import spectrax as spx
 import transformers
-
-import easydel as ed
 from easydel.operations.kernels.glm_moe_dsa_indexer import GlmMoeDsaIndexerOp
 
 try:

@@ -20,6 +20,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import easydel as ed
 import jax
 from spectrax.runtime import (
     DualPipeV,
@@ -33,8 +34,6 @@ from spectrax.runtime import (
     Std1F1B,
     ZeroBubbleH1,
 )
-
-import easydel as ed
 
 if str(Path(__file__).resolve().parents[3]) not in sys.path:
     sys.path.append(str(Path(__file__).resolve().parents[3]))

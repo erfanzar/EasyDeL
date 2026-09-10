@@ -18,8 +18,6 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
-from fastapi import HTTPException, Request
-
 from easydel.inference.esurge.server.auth_endpoints import AuthEndpointsMixin, UpdateApiKeyRequest
 from easydel.workers.esurge.auth.auth_models import (
     ApiKeyMetadata,
@@ -28,6 +26,7 @@ from easydel.workers.esurge.auth.auth_models import (
     QuotaConfig,
     RateLimitConfig,
 )
+from fastapi import HTTPException, Request
 
 
 def _make_request() -> Request:

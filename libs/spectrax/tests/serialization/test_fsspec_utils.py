@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import jax
-
 from spectrax.serialization.fsspec_utils import should_write_shared_checkpoint_files
 
 

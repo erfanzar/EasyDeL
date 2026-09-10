@@ -14,9 +14,9 @@
 
 """Tests for Qwen3 embedding model."""
 
+import easydel as ed
 import pytest
 
-import easydel as ed
 from tests.modules.mpmd._scheduler_utils import LOSS_SCHEDULE_KINDS
 from tests.modules.test_utils import EmbeddingTester
 

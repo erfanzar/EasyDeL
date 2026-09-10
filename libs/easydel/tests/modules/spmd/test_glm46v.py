@@ -14,11 +14,10 @@
 
 """Tests for GLM46V model."""
 
+import easydel as ed
 import numpy as np
 import pytest
 import transformers
-
-import easydel as ed
 
 try:
     from tests.modules.test_utils import CausalLMTester, VisionLanguageTester

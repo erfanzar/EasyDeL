@@ -27,10 +27,12 @@ def _data(bits):
 def test_integer_forward_and_jitted_ste(bits):
     x, w, s, dx, ds, cot, base = _data(bits)
     wq = jnp.asarray(w, dtype=jnp.int4 if bits == 4 else jnp.int8)
+
     def fn(a, b):
         return channelwise_quantized_matmul(
             a, wq, b, quantize_activations=True, activation_bits=bits, prefill_threshold=0
         )
+
     args = (jnp.asarray(x), jnp.asarray(s))
     for forward in (fn, jax.jit(fn)):
         np.testing.assert_allclose(forward(*args), base * s, rtol=3e-6, atol=3e-6)
@@ -54,10 +56,12 @@ def test_integer_forward_and_jitted_ste(bits):
 def test_weight_only_and_legacy_decode_unchanged(bits, quantize, threshold):
     x, w, s, dx, ds, _, _ = _data(bits)
     wq = jnp.asarray(w, dtype=jnp.int4 if bits == 4 else jnp.int8)
+
     def fn(a, b):
         return channelwise_quantized_matmul(
             a, wq, b, quantize_activations=quantize, activation_bits=bits, prefill_threshold=threshold
         )
+
     y, dy = jax.jit(lambda a, b, da, db: jax.jvp(fn, (a, b), (da, db)))(x, s, dx, ds)
     base = x @ w.astype(np.float32)
     np.testing.assert_allclose(y, base * s, rtol=3e-6, atol=3e-6)

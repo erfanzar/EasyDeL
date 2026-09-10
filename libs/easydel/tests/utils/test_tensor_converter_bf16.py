@@ -28,7 +28,6 @@ from __future__ import annotations
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from easydel.utils.parameters_transformation import TensorConverter
 
 torch = pytest.importorskip("torch")

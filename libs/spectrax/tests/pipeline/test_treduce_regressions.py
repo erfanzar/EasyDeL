@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 import pytest
-
 from spectrax.runtime.mpmd.treduce import Add, Concat, _HashableOps, treduce_i
 from spectrax.runtime.schedules import GPipe
 

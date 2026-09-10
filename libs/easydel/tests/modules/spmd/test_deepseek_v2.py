@@ -14,9 +14,8 @@
 
 """Tests for DeepSeek V2 model."""
 
-import pytest
-
 import easydel as ed
+import pytest
 from easydel.infra.etils import EasyDeLGradientCheckPointers
 
 try:

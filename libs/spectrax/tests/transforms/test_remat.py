@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 import pytest
-
 import spectrax as spx
 from spectrax.core.module import Module
 from spectrax.nn.linear import Linear

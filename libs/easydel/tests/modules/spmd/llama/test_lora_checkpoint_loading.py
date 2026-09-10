@@ -14,13 +14,12 @@
 
 from __future__ import annotations
 
+import easydel  # noqa: F401
 import jax.numpy as jnp
 import spectrax as spx
-from spectrax import nn
-
-import easydel  # noqa: F401
 from easydel.modules.llama.llama_configuration import LlamaConfig
 from easydel.modules.llama.modeling_llama import LlamaForCausalLM
+from spectrax import nn
 
 
 def _make_model(*, tie_word_embeddings: bool) -> LlamaForCausalLM:

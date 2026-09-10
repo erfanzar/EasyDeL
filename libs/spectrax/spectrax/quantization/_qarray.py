@@ -239,9 +239,7 @@ def validate_qarray(array: QArray) -> None:
                 f"zero_point {array.zero_point.shape} is not generic-broadcastable to qvalue {array.qvalue.shape}."
             )
         if array.zero_point.dtype != array.qvalue.dtype:
-            raise ValueError(
-                f"zero_point dtype {array.zero_point.dtype} must match qvalue dtype {array.qvalue.dtype}."
-            )
+            raise ValueError(f"zero_point dtype {array.zero_point.dtype} must match qvalue dtype {array.qvalue.dtype}.")
 
 
 def resolve_tile_size(dim: int, tile_size: int | float) -> int:

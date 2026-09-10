@@ -30,9 +30,8 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.sharding import Mesh
-
 import spectrax as spx
+from jax.sharding import Mesh
 from spectrax.runtime.mpmd.markers import stage_region_specs
 from spectrax.runtime.types import MpMdMesh
 

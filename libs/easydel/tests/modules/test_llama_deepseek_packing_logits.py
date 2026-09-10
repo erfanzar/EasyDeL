@@ -33,7 +33,6 @@ def _packed_equivalence(model, *, vocab_size: int):
 
 def _llama_model():
     import spectrax as spx
-
     from easydel.modules.llama.llama_configuration import LlamaConfig
     from easydel.modules.llama.modeling_llama import LlamaForCausalLM
 
@@ -54,7 +53,6 @@ def _llama_model():
 
 def _deepseek_v2_model():
     import spectrax as spx
-
     from easydel.modules.deepseek_v2.deepseek_configuration import DeepseekV2Config
     from easydel.modules.deepseek_v2.modeling_deepseek import DeepseekV2ForCausalLM
 
@@ -85,7 +83,6 @@ def _deepseek_v2_model():
 
 def _deepseek_v3_model():
     import spectrax as spx
-
     from easydel.modules.deepseek_v3.deepseek_configuration import DeepseekV3Config
     from easydel.modules.deepseek_v3.modeling_deepseek import DeepseekV3ForCausalLM
 

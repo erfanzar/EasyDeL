@@ -14,11 +14,11 @@
 
 """Tests for MiniMax Text V1 model."""
 
+import easydel as ed
 import pytest
 import transformers
-
-import easydel as ed
 from easydel.modules.minimax import MiniMaxConfig
+
 from tests.modules.mpmd._scheduler_utils import GENERATION_SCHEDULE_KIND, LOSS_SCHEDULE_KINDS
 from tests.modules.test_utils import CausalLMTester
 

@@ -14,11 +14,10 @@
 
 """Tests for FalconMamba model."""
 
+import easydel as ed
 import pytest
 import transformers
 from jax import numpy as jnp
-
-import easydel as ed
 
 try:
     from tests.modules.test_utils import CausalLMTester

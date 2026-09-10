@@ -35,12 +35,11 @@ Run:
 import jax
 import numpy as np
 import pytest
-from jax import numpy as jnp
-from jax import random as jr
-
 from easydel.infra import EasyDeLBaseConfig
 from easydel.operations._operation_impl import OperationMetadata
 from easydel.operations.kernels.ring_attention import RingAttn
+from jax import numpy as jnp
+from jax import random as jr
 
 pytestmark = pytest.mark.skipif(
     len(jax.devices()) < 8,

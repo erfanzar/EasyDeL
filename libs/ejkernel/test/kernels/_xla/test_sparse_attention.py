@@ -18,7 +18,6 @@
 import jax
 import jax.numpy as jnp
 import pytest
-
 from ejkernel.kernels._xla import apply_native_sparse_attention
 
 

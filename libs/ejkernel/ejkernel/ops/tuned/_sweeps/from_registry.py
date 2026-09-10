@@ -60,14 +60,12 @@ TUNABLES: dict[str, dict[str, list]] = {
     # heuristic defaults to 128/128 for both passes.
     "blocksparse_attention": {
         "fwd_params": [
-            {"q_blocksize": q, "kv_blocksize": kv}
-            for q, kv in itertools.product(_ATTN_BLOCKS, _ATTN_BLOCKS)
+            {"q_blocksize": q, "kv_blocksize": kv} for q, kv in itertools.product(_ATTN_BLOCKS, _ATTN_BLOCKS)
         ],
     },
     "blocksparse_attention_bwd": {
         "bwd_params": [
-            {"q_blocksize": q, "kv_blocksize": kv}
-            for q, kv in itertools.product(_ATTN_BLOCKS, _ATTN_BLOCKS)
+            {"q_blocksize": q, "kv_blocksize": kv} for q, kv in itertools.product(_ATTN_BLOCKS, _ATTN_BLOCKS)
         ],
     },
 }
@@ -352,7 +350,6 @@ def make_points(
         baseline = None
         default = _default_knobs(op, config)
         if default is not None:
-
             baseline = Candidate(
                 platforms[0],
                 dict(default),

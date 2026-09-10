@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import numpy as np
-
 from easydel.inference.esurge.runners.executors.model_executor import ModelStepExecutor
 
 

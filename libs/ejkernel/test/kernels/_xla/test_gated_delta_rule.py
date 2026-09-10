@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-
 from ejkernel.kernels._xla.gated_delta_rule import gated_delta_rule
 
 

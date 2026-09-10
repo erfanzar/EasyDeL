@@ -14,9 +14,8 @@
 
 """Tests for Qwen3 embedding model."""
 
-import pytest
-
 import easydel as ed
+import pytest
 
 try:
     from tests.modules.test_utils import EmbeddingTester

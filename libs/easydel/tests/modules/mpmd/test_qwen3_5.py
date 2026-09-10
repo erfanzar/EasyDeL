@@ -14,11 +14,11 @@
 
 """Tests for Qwen3.5 text and multimodal models."""
 
+import easydel as ed
 import numpy as np
 import pytest
 import transformers
 
-import easydel as ed
 from tests.modules.mpmd._scheduler_utils import (
     GENERATION_SCHEDULE_KIND,
     LOSS_SCHEDULE_KINDS,

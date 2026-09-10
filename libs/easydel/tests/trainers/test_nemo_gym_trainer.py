@@ -15,9 +15,8 @@
 import json
 from pathlib import Path
 
-import pytest
-
 import easydel as ed
+import pytest
 from easydel.trainers.nemo_gym_trainer._fn import _environment_reward_func
 
 

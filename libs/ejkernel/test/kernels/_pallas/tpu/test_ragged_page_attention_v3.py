@@ -16,7 +16,6 @@
 import jax
 import jax.numpy as jnp
 import pytest
-
 from ejkernel.kernels._pallas.tpu.ragged_page_attention_v3._interface import ragged_page_attention_v3
 from ejkernel.kernels._pallas.tpu.ragged_page_attention_v3._pallas_impl_fwd import (
     get_kv_cache_shape as get_kv_cache_shape_hd128,

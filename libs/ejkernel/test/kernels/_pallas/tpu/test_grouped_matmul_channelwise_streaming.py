@@ -49,8 +49,10 @@ def test_streaming_jvp_vjp_after_cached_jit(bits):
     f = jax.jit(
         lambda a, b, c, d: grouped_matmul_channelwise(a, b, c, d, platform="pallas", preferred_element_type=jnp.float32)
     )
+
     def ref(a, b, c, d):
         return grouped_matmul_channelwise(a, b, c, d, platform="xla", preferred_element_type=jnp.float32)
+
     f(x, codes, scales, groups).block_until_ready()
     dx = jnp.ones_like(x) * 0.375
     ds = jnp.ones_like(scales) * 0.01712345

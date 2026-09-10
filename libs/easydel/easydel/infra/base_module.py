@@ -3644,7 +3644,10 @@ class EasyDeLBaseModule(
         from easydel.layers import QuantizationConfig
 
         if isinstance(quantization_config, dict):
-            quantization_config = QuantizationConfig(**quantization_config)
+            # Lenient on purpose: checkpoints converted from Hugging Face can
+            # inherit a descriptor block (quant_method/activation_scheme/...);
+            # coercion drops those instead of raising on every rebuild.
+            quantization_config = QuantizationConfig.coerce(quantization_config, strict=False)
             config.quantization_config = quantization_config
         return quantization_config
 

@@ -17,15 +17,14 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import pytest
-from jax import numpy as jnp
-
 import easydel as ed
+import pytest
 from easydel.infra.elarge.model import eLargeModel
 from easydel.trainers.group_relative_policy_optimization.grpo_trainer import (
     GRPOTrainer,
     _clip_rewards_if_configured,
 )
+from jax import numpy as jnp
 
 if __package__ in {None, ""}:
     sys.path.append(str(Path(__file__).resolve().parent))

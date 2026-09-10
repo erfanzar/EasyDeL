@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-
 import spectrax as spx
 from spectrax.sharding import logical_axis_rules, with_sharding_constraint_by_name
 

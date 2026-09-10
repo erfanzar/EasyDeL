@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-
 from spectrax.functional.attention import scaled_dot_product_attention as sdpa
 
 

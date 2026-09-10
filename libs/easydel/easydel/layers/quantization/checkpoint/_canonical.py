@@ -309,8 +309,7 @@ class CanonicalQuantizedWeight:
             raise ValueError("A static activation policy requires activation_scale.")
         if not is_static and self.activation_scale is not None:
             raise ValueError(
-                f"activation_scale is only valid for a static activation policy, "
-                f"got kind={self.spec.activation.kind}."
+                f"activation_scale is only valid for a static activation policy, got kind={self.spec.activation.kind}."
             )
 
     @classmethod

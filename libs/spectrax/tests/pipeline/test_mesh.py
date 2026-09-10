@@ -10,7 +10,6 @@ import jax
 import numpy as np
 import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
-
 from spectrax.runtime.types import MpMdMesh
 
 

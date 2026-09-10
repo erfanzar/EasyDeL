@@ -37,7 +37,6 @@ from typing import cast
 
 import jax.numpy as jnp
 import pytest
-
 from easydel.inference.esurge.core.coordinator import (
     CacheCoordinator,
     CacheCoordinatorNoPrefixCache,

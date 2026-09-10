@@ -19,7 +19,6 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 import pytest
-
 from easydel.utils.jit_context import (
     CompilationContext,
     clear_jit_context,

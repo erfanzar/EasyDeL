@@ -23,7 +23,6 @@ read-only assertions.
 from __future__ import annotations
 
 import pytest
-
 from easydel.infra.base_config import EasyDeLBaseConfig
 from easydel.infra.factory import (
     ConfigType,

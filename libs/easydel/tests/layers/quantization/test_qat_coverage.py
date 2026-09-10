@@ -43,9 +43,7 @@ import re
 
 import easydel
 
-_CONTRACTION = re.compile(
-    r"(jnp\.einsum|jnp\.matmul|jax\.numpy\.einsum|lax\.dot_general|jax\.lax\.dot_general|@)"
-)
+_CONTRACTION = re.compile(r"(jnp\.einsum|jnp\.matmul|jax\.numpy\.einsum|lax\.dot_general|jax\.lax\.dot_general|@)")
 _OWN_PARAMETER = re.compile(r"self\.([A-Za-z_][A-Za-z0-9_]*)\.value|self\.(weight|kernel)\b")
 
 _EXEMPT: dict[tuple[str, str], str] = {
@@ -56,9 +54,7 @@ _EXEMPT: dict[tuple[str, str], str] = {
     ("modules/glm4_moe_lite/modeling_glm4_moe_lite.py", "weight"): (
         "MoE router gate: routing decisions, kept in float32."
     ),
-    ("modules/glm_moe_dsa/modeling_glm_moe_dsa.py", "weight"): (
-        "MoE router gate: routing decisions, kept in float32."
-    ),
+    ("modules/glm_moe_dsa/modeling_glm_moe_dsa.py", "weight"): ("MoE router gate: routing decisions, kept in float32."),
     ("modules/deepseek_v4/modeling_deepseek_v4.py", "hc_fn"): (
         "Hyper-connection mixing matrix: a tiny float32 projection whose output feeds a sigmoid to become "
         "blend weights, not features."

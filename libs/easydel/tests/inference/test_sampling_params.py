@@ -17,7 +17,6 @@
 import copy
 
 import pytest
-
 from easydel.inference.sampling_params import SamplingParams, SamplingType
 
 

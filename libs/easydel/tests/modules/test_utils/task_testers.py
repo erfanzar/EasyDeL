@@ -24,12 +24,11 @@ import types
 from dataclasses import dataclass, field
 from typing import Any
 
+import easydel as ed
 import jax
 import jax.numpy as jnp
 import numpy as np
 import spectrax as spx
-
-import easydel as ed
 
 from .comparators import ComparisonResult, compare_hidden_states, compare_logits
 from .input_generators import (

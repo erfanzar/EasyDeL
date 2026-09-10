@@ -19,8 +19,6 @@ import threading
 import jax
 import numpy as np
 import pytest
-from jax.sharding import Mesh, PartitionSpec
-
 from eformer.common_types import (
     BATCH,
     MODE_DECODE,
@@ -38,6 +36,7 @@ from eformer.escale.partition import (
 )
 from eformer.escale.partition.auto_spec import auto_partition_spec
 from eformer.escale.partition.manager import get_safe_hash_int
+from jax.sharding import Mesh, PartitionSpec
 
 
 @pytest.fixture(autouse=True)

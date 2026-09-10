@@ -9,7 +9,6 @@ from __future__ import annotations
 import jax
 import numpy as np
 import pytest
-
 import spectrax as spx
 from spectrax import nn
 from spectrax.runtime.mpmd.runtime import _place_state_on_rank

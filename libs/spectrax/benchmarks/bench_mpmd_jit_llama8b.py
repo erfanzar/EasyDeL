@@ -25,9 +25,8 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.sharding import Mesh, NamedSharding, PartitionSpec
-
 import spectrax as spx
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from spectrax import nn
 from spectrax.nn import PipelineSequential
 from spectrax.runtime.mpmd import sxcall, sxjit, sxstage_iter

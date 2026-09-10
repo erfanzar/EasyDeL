@@ -2479,9 +2479,7 @@ class DrafterSpeculation:
             replay_active.fill(False)
             replay_active[int(row_pos)] = True
             replay_num_computed[int(row_pos)] = int(num_computed_tokens_window_cpu[int(row_pos)]) + int(step_idx)
-            replay_req_num_tokens[int(row_pos)] = (
-                int(num_computed_tokens_window_cpu[int(row_pos)]) + int(step_idx) + 1
-            )
+            replay_req_num_tokens[int(row_pos)] = int(num_computed_tokens_window_cpu[int(row_pos)]) + int(step_idx) + 1
 
             out_tokens_replay, _, _, _, hidden_replay, _, _ = self._runner.executor_manager.execute(
                 num_tokens=one_token_static,

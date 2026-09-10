@@ -17,7 +17,6 @@ from types import SimpleNamespace
 import jax
 import jax.numpy as jnp
 import numpy as np
-
 from easydel.trainers.nash_md_trainer.nash_md_trainer import GeometricMixtureLogitsProcessor
 
 

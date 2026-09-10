@@ -1,6 +1,5 @@
 import jax.numpy as jnp
 import pytest
-
 from easydel.trainers import _logprob_utils
 
 

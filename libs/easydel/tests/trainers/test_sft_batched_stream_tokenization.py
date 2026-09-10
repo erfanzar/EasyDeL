@@ -40,7 +40,6 @@ from collections.abc import Iterator, Sequence
 
 import numpy as np
 import pytest
-
 from easydel.data.core.protocols import ShardedDataSource
 from easydel.trainers.prompt_transforms import SFTPreprocessTransform
 

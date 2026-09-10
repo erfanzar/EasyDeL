@@ -55,9 +55,8 @@ SWEEP_RUNS = [
 )
 def train(learning_rate: float, warmup_steps: int, run_name: str) -> dict:
     """One sweep job. Runs in its own process owning one TPU chip."""
-    import jax
-
     import easydel as ed
+    import jax
 
     assert len(jax.devices()) == 1, "each sweep job should only see its own chip"
 

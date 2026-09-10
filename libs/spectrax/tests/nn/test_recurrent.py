@@ -9,7 +9,6 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import pytest
-
 from spectrax.nn.recurrent import (
     RNN,
     Bidirectional,

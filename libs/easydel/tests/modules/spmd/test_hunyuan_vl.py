@@ -20,11 +20,10 @@ config; if a transformers build without the class is installed the tests run
 EasyDeL-only.
 """
 
+import easydel as ed
 import numpy as np
 import pytest
 import transformers
-
-import easydel as ed
 
 try:
     from tests.modules.test_utils import CausalLMTester, VisionLanguageTester

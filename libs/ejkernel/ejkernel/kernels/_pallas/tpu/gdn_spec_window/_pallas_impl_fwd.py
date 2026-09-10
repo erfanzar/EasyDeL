@@ -135,9 +135,7 @@ def gdn_spec_window_states(
     beta_f = beta.transpose(0, 2, 1).reshape(bh, num_steps, 1)
     gate_f = gate.transpose(0, 2, 1).reshape(bh, num_steps, 1)
     valid_f = (
-        jnp.broadcast_to(step_valid[:, None, :], (batch, n_v, num_steps))
-        .reshape(bh, num_steps, 1)
-        .astype(jnp.int32)
+        jnp.broadcast_to(step_valid[:, None, :], (batch, n_v, num_steps)).reshape(bh, num_steps, 1).astype(jnp.int32)
     )
     state_f = recurrent_state.reshape(bh, d_k, d_v)
 

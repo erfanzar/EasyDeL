@@ -252,9 +252,7 @@ def create_step_coordinator(
     if not leader_addr and distributed_config.distributed_service_name:
         from .discovery import resolve_service_hosts
 
-        leader_addr = resolve_service_hosts(
-            distributed_config.distributed_service_name, world_size=world_size
-        ).hosts[0]
+        leader_addr = resolve_service_hosts(distributed_config.distributed_service_name, world_size=world_size).hosts[0]
     if not leader_addr:
         raise StepCoordinationError(
             "coordination='zmq' worker cannot resolve the leader address: set "

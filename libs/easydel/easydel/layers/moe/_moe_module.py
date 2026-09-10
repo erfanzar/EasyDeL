@@ -1431,13 +1431,17 @@ class BaseMoeModule(spx.Module, ABC):
         # Do not infer this from a global config: projections may differ.
         def _unpack_precision(kernel):
             if isinstance(kernel, tuple):
-                return tuple(kernel), getattr(kernel, "activation_bits", None)
-            return kernel, None
+                return (
+                    tuple(kernel),
+                    getattr(kernel, "activation_bits", None),
+                    getattr(kernel, "grouped_platform", None),
+                )
+            return kernel, None, None
 
-        wi_kernel, wi_activation_bits = _unpack_precision(wi_kernel)
-        wu_kernel, wu_activation_bits = _unpack_precision(wu_kernel)
-        wd_kernel, wd_activation_bits = _unpack_precision(wd_kernel)
-        gate_up_kernel, gate_up_activation_bits = _unpack_precision(gate_up_kernel)
+        wi_kernel, wi_activation_bits, wi_grouped_platform = _unpack_precision(wi_kernel)
+        wu_kernel, wu_activation_bits, wu_grouped_platform = _unpack_precision(wu_kernel)
+        wd_kernel, wd_activation_bits, wd_grouped_platform = _unpack_precision(wd_kernel)
+        gate_up_kernel, gate_up_activation_bits, gate_up_grouped_platform = _unpack_precision(gate_up_kernel)
 
         hidden_state = hidden_state.astype(self.dtype)
         gate_hidden_state = hidden_state if gate_hidden_state is None else gate_hidden_state.astype(self.dtype)
@@ -2078,7 +2082,14 @@ class BaseMoeModule(spx.Module, ABC):
                     ``tp_size == 1``).
                 """
 
-                def _expert_gmm(rows, kernel, *, tp_sharded_contraction: bool = False, activation_bits=None):
+                def _expert_gmm(
+                    rows,
+                    kernel,
+                    *,
+                    tp_sharded_contraction: bool = False,
+                    activation_bits=None,
+                    grouped_platform=None,
+                ):
                     """Dense bf16 grouped matmul, or — when the kernel is a
                     quantized ``(codes, scales)`` pair from ``kernel_view()`` —
                     the v3 grouped matmul's native quantised-weight path:
@@ -2147,7 +2158,8 @@ class BaseMoeModule(spx.Module, ABC):
                                 scales,
                                 group_sizes,
                                 activation_bits=activation_bits,
-                                platform=_channelwise_grouped_platform(
+                                platform=grouped_platform
+                                or _channelwise_grouped_platform(
                                     rows,
                                     codes,
                                     activation_bits,
@@ -2206,21 +2218,36 @@ class BaseMoeModule(spx.Module, ABC):
 
                 x_rows = _mask_dispatch_tail(x_rows, group_sizes)
                 if gate_up_kernel is not None:
-                    layer_gate_up = _expert_gmm(x_rows, gate_up_kernel, activation_bits=gate_up_activation_bits)
+                    layer_gate_up = _expert_gmm(
+                        x_rows,
+                        gate_up_kernel,
+                        activation_bits=gate_up_activation_bits,
+                        grouped_platform=gate_up_grouped_platform,
+                    )
                     layer_gate_up = checkpoint_name(layer_gate_up, "mlp_gate_up")
                     if gate_up_bias is not None:
                         layer_gate_up = layer_gate_up + gate_up_bias[selected_experts]
                     layer_gate_up = _mask_dispatch_tail(layer_gate_up, group_sizes)
                     layer_w0, layer_w1 = jnp.split(layer_gate_up, 2, axis=-1)
                 else:
-                    layer_w0 = _expert_gmm(x_rows, wi_kernel, activation_bits=wi_activation_bits)
+                    layer_w0 = _expert_gmm(
+                        x_rows,
+                        wi_kernel,
+                        activation_bits=wi_activation_bits,
+                        grouped_platform=wi_grouped_platform,
+                    )
 
                     layer_w0 = checkpoint_name(layer_w0, "mlp_gate")
                     if wi_bias is not None:
                         layer_w0 = layer_w0 + wi_bias[selected_experts]
                     layer_w0 = _mask_dispatch_tail(layer_w0, group_sizes)
 
-                    layer_w1 = _expert_gmm(x_rows, wu_kernel, activation_bits=wu_activation_bits)
+                    layer_w1 = _expert_gmm(
+                        x_rows,
+                        wu_kernel,
+                        activation_bits=wu_activation_bits,
+                        grouped_platform=wu_grouped_platform,
+                    )
 
                     layer_w1 = checkpoint_name(layer_w1, "mlp_up")
                     if wu_bias is not None:
@@ -2230,7 +2257,11 @@ class BaseMoeModule(spx.Module, ABC):
                 intermediate_layer = _mask_dispatch_tail(ffn_activation(layer_w0, layer_w1), group_sizes)
 
                 intermediate_output = _expert_gmm(
-                    intermediate_layer, wd_kernel, tp_sharded_contraction=True, activation_bits=wd_activation_bits
+                    intermediate_layer,
+                    wd_kernel,
+                    tp_sharded_contraction=True,
+                    activation_bits=wd_activation_bits,
+                    grouped_platform=wd_grouped_platform,
                 )
                 intermediate_output = checkpoint_name(intermediate_output, "mlp_down")
 

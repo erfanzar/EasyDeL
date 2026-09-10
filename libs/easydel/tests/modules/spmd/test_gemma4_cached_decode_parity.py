@@ -16,9 +16,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import spectrax as spx
-from jax.sharding import Mesh
-
 from easydel.modules.gemma4 import Gemma4ForCausalLM, Gemma4TextConfig
+from jax.sharding import Mesh
 
 
 def _make_mesh():

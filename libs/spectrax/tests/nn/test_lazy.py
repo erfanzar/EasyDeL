@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 import pytest
-
 import spectrax as spx
 from spectrax.nn import Conv1d, Conv2d, Conv3d, Embed, Linear
 from spectrax.rng.rngs import Rngs

@@ -4,9 +4,8 @@ import math
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh, PartitionSpec
-
 from ejkernel.modules.operations import chunked_prefill_paged_decode
+from jax.sharding import Mesh, PartitionSpec
 
 
 def test_chunked_prefill_paged_decode_module_runs_xla():

@@ -92,9 +92,7 @@ class _StepLedger:
         with self.cond:
             self.deadlines.pop((ack.step_id, ack.rank), None)
             if not ack.ok:
-                self.failure = (
-                    f"worker rank={ack.rank} failed step {ack.step_id}: {ack.error}\n{ack.traceback or ''}"
-                )
+                self.failure = f"worker rank={ack.rank} failed step {ack.step_id}: {ack.error}\n{ack.traceback or ''}"
                 self.cond.notify_all()
                 return
             self.last_acked[ack.rank] = max(self.last_acked.get(ack.rank, 0), ack.step_id)
@@ -285,9 +283,7 @@ class ZmqLeaderCoordinator:
             raise StepCoordinationError(self._hello_error)
         logger.info("eSurge coordinator: %d worker(s) ready.", self.world_size - 1)
 
-    def set_plane_handler(
-        self, handler: typing.Callable[[bytes, wire.WireMessage, bytes | None], None] | None
-    ) -> None:
+    def set_plane_handler(self, handler: typing.Callable[[bytes, wire.WireMessage, bytes | None], None] | None) -> None:
         """Install the request-plane inbound handler (Admit/AbortReq/StopHit/...)."""
         self._plane_handler = handler
 
@@ -394,21 +390,17 @@ class ZmqLeaderCoordinator:
             # no world/fingerprint requirements, never counted toward Ready.
             self._client_identities[message.client_id] = identity
             authed.add(identity)
-            sock.send_multipart(
-                [identity, wire.encode_message(wire.HelloOk(rank=-1, engine_spec=self._engine_spec))]
-            )
+            sock.send_multipart([identity, wire.encode_message(wire.HelloOk(rank=-1, engine_spec=self._engine_spec))])
             return
         if message.world_size != self.world_size:
             self._hello_error = (
-                f"worker rank={message.rank} reports world_size={message.world_size}, "
-                f"leader expects {self.world_size}"
+                f"worker rank={message.rank} reports world_size={message.world_size}, leader expects {self.world_size}"
             )
             self._ready_event.set()
             return
         if message.config_fingerprint != self._config_fingerprint:
             self._hello_error = (
-                f"worker rank={message.rank} config mismatch: "
-                f"{message.config_fingerprint} != {self._config_fingerprint}"
+                f"worker rank={message.rank} config mismatch: {message.config_fingerprint} != {self._config_fingerprint}"
             )
             self._ready_event.set()
             return
@@ -635,8 +627,7 @@ class ZmqWorkerCoordinator:
             sock.close(linger=0)
             self._sock = None
             raise StepCoordinationError(
-                f"worker rank={self.rank}: no HelloOk from leader at {self._endpoint} "
-                f"within {self._connect_timeout_s}s"
+                f"worker rank={self.rank}: no HelloOk from leader at {self._endpoint} within {self._connect_timeout_s}s"
             )
         frames = sock.recv_multipart()
         message = wire.decode_message(frames[0])
@@ -738,9 +729,7 @@ class ZmqWorkerCoordinator:
                             inflight[message.step_id] = self._runner.execute_model_async(scheduler_output)
                         else:
                             model_output = self._runner.execute_model(scheduler_output)
-                            self._ack(
-                                sock, message.step_id, wire.ACK_PHASE_SYNC_DONE, model_output, message.want_digest
-                            )
+                            self._ack(sock, message.step_id, wire.ACK_PHASE_SYNC_DONE, model_output, message.want_digest)
                     except Exception as exc:
                         self._nack(sock, message.step_id, wire.ACK_PHASE_SYNC_DONE, exc)
                         raise

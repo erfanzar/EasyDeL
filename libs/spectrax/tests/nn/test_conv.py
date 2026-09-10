@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 import pytest
-
 from spectrax.nn.conv import Conv, Conv1d, Conv2d, Conv3d
 from spectrax.rng.rngs import Rngs
 

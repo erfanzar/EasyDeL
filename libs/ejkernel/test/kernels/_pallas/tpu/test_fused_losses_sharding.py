@@ -10,10 +10,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from ejkernel.modules.operations import fused_cross_entropy, fused_kl_divergence
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
-
-from ejkernel.modules.operations import fused_cross_entropy, fused_kl_divergence
 
 
 def _has_tpu_devices() -> bool:

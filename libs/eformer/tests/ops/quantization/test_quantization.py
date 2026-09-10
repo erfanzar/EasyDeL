@@ -18,7 +18,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from eformer.ops.quantization import Array1B, Array8B, ArrayNF4
 from eformer.ops.quantization.quantization_functions import nf4xf32_to_f32
 

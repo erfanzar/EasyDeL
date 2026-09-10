@@ -20,10 +20,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import spectrax as spx
 from jax.extend.core import Jaxpr, Var
 from jax.sharding import PartitionSpec, SingleDeviceSharding
-
-import spectrax as spx
 from spectrax.runtime.mpmd import MpmdPipelineExecutor, cluster_jaxpr_by_markers, sxstage_iter
 from spectrax.runtime.mpmd.markers import (
     has_stage_regions,

@@ -19,7 +19,6 @@ import math
 import jax
 import jax.numpy as jnp
 import pytest
-
 from ejkernel.modules.operations import unified_attention
 
 from ._utils import assert_allclose, device_platform, has_cutlass

@@ -81,9 +81,7 @@ def _quantized_operands(lhs, rhs, rule):
 def test_unquantized_path_is_bit_exact(rule):
     """No rule, or a rule that quantizes nothing, must not perturb the result."""
     lhs, rhs, group_sizes = _operands()
-    assert jnp.array_equal(
-        qragged_dot(lhs, rhs, group_sizes, rule=rule), jax.lax.ragged_dot(lhs, rhs, group_sizes)
-    )
+    assert jnp.array_equal(qragged_dot(lhs, rhs, group_sizes, rule=rule), jax.lax.ragged_dot(lhs, rhs, group_sizes))
 
 
 def test_unquantized_gradients_are_bit_exact():

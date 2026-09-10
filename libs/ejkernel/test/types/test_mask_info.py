@@ -17,7 +17,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from ejkernel.types.mask import (
     MaskInfo,
     cu_seqlens_to_mask,

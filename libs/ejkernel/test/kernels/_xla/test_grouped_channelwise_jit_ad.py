@@ -19,12 +19,15 @@ def test_autodiff_after_compiling_grouped_call(bits):
         )
     )
     f(x, codes, scales, groups).block_until_ready()
+
     def actual(a):
         return f(a, codes, scales, groups)
+
     def direct(a):
         return grouped_matmul_channelwise(
             a, codes, scales, groups, activation_bits=bits, preferred_element_type=jnp.float32
         )
+
     _, got = jax.jvp(actual, (x,), (jnp.ones_like(x),))
     _, want = jax.jvp(direct, (x,), (jnp.ones_like(x),))
     np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-6)

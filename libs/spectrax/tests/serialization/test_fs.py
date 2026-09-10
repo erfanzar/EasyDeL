@@ -9,7 +9,6 @@ from __future__ import annotations
 import uuid
 
 import pytest
-
 from spectrax.serialization._fs import (
     exists,
     is_dir,

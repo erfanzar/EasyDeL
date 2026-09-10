@@ -26,9 +26,8 @@ import os
 import sys
 from pathlib import Path
 
-import jax
-
 import easydel as ed
+import jax
 
 REWARD_MODEL_REPO = os.environ.get("EASYDEL_RUNTIME_REWARD_MODEL_REPO", "Ray2333/Gemma-2B-rewardmodel-baseline")
 

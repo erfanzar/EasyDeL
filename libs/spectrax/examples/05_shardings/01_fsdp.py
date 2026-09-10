@@ -21,7 +21,6 @@ Run from the repo root::
 from __future__ import annotations
 
 import jax
-
 import spectrax as spx
 from spectrax.sharding import get_named_sharding, get_partition_spec, logical_axis_rules
 

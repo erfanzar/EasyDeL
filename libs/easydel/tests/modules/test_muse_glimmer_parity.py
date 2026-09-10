@@ -387,9 +387,10 @@ def _ref_vision_features(config, state, pixel_values, grid_thw):
     cu_seqlens = mg.get_vision_cu_seqlens(grid_thw)
     window_index, cu_window = mg.get_vision_window_index(grid_thw, 1, vision.window_size, vision.patch_size)
 
-    hidden = pixel_values.astype(np.float64) @ state[
-        "model.vision_tower.patch_embedder.patch_embedding.weight"
-    ].astype(np.float64).T
+    hidden = (
+        pixel_values.astype(np.float64)
+        @ state["model.vision_tower.patch_embedder.patch_embedding.weight"].astype(np.float64).T
+    )
     indices, weights = mg.get_vision_interpolation_indices_and_weights(grid_thw, vision.pos_emb_height, 1)
     table = state["model.vision_tower.patch_embedder.position_embedding_table.weight"].astype(np.float64)
     hidden = hidden + (table[indices] * weights[:, :, None].astype(np.float64)).sum(axis=1)
@@ -426,9 +427,7 @@ def _ref_vision_features(config, state, pixel_values, grid_thw):
 
     for layer in range(vision.num_hidden_layers):
         prefix = f"model.vision_tower.layers.{layer}"
-        normed = _ref_layer_norm(
-            hidden, state[f"{prefix}.norm1.weight"], state[f"{prefix}.norm1.bias"], 1e-5
-        )
+        normed = _ref_layer_norm(hidden, state[f"{prefix}.norm1.weight"], state[f"{prefix}.norm1.bias"], 1e-5)
 
         def project(name, x=normed, p=prefix):
             weight = state[f"{p}.attn.{name}.weight"].astype(np.float64)
@@ -450,16 +449,14 @@ def _ref_vision_features(config, state, pixel_values, grid_thw):
         ].astype(np.float64)
         hidden = hidden + attn_out
 
-        normed = _ref_layer_norm(
-            hidden, state[f"{prefix}.norm2.weight"], state[f"{prefix}.norm2.bias"], 1e-5
+        normed = _ref_layer_norm(hidden, state[f"{prefix}.norm2.weight"], state[f"{prefix}.norm2.bias"], 1e-5)
+        inner = normed @ state[f"{prefix}.mlp.fc1.weight"].astype(np.float64).T + state[f"{prefix}.mlp.fc1.bias"].astype(
+            np.float64
         )
-        inner = normed @ state[f"{prefix}.mlp.fc1.weight"].astype(np.float64).T + state[
-            f"{prefix}.mlp.fc1.bias"
-        ].astype(np.float64)
         inner = _ref_gelu(inner)
-        outer = inner @ state[f"{prefix}.mlp.fc2.weight"].astype(np.float64).T + state[
-            f"{prefix}.mlp.fc2.bias"
-        ].astype(np.float64)
+        outer = inner @ state[f"{prefix}.mlp.fc2.weight"].astype(np.float64).T + state[f"{prefix}.mlp.fc2.bias"].astype(
+            np.float64
+        )
         hidden = hidden + outer
 
     hidden = hidden[np.argsort(window_index)]
@@ -786,9 +783,7 @@ def test_cached_decode_matches_full_forward():
         input_ids=jnp.asarray(input_ids[:, :-1]),
         **{key: value for key, value in inputs.items() if key != "input_ids"},
     )
-    np.testing.assert_allclose(
-        np.asarray(prefill.logits, dtype=np.float64), full[:, :-1], rtol=RTOL, atol=ATOL
-    )
+    np.testing.assert_allclose(np.asarray(prefill.logits, dtype=np.float64), full[:, :-1], rtol=RTOL, atol=ATOL)
 
     next_inputs = model.update_inputs_for_generation(prefill, dict(inputs))
     step = model(
@@ -838,8 +833,7 @@ def test_sliding_window_span():
     assert affected[0] == position, "a causal model must not change outputs before the perturbed token"
     span = int(affected[-1] - position + 1)
     assert span == window + 1, (
-        f"expected a {window + 1}-token span for sliding_window={window} "
-        f"(EasyDeL radius convention), measured {span}"
+        f"expected a {window + 1}-token span for sliding_window={window} (EasyDeL radius convention), measured {span}"
     )
 
 
@@ -863,16 +857,12 @@ def test_window_index_partitions_all_patches():
 def test_layer_schedules_follow_reference_pattern():
     """Default text/vision layer schedules must match the reference derivations."""
     text = _text_config(num_hidden_layers=12)
-    expected_text = [
-        "full_attention" if (12 - 1 - i) % 4 == 0 else "sliding_attention" for i in range(12)
-    ]
+    expected_text = ["full_attention" if (12 - 1 - i) % 4 == 0 else "sliding_attention" for i in range(12)]
     assert text.layer_types == expected_text
     assert text.layer_rope_theta == [0.0 if t == "full_attention" else text.rope_theta for t in expected_text]
 
     vision = _vision_config(num_hidden_layers=10)
-    expected_vision = [
-        "full_attention" if (i + 1) % 4 == 0 or i == 9 else "window_attention" for i in range(10)
-    ]
+    expected_vision = ["full_attention" if (i + 1) % 4 == 0 or i == 9 else "window_attention" for i in range(10)]
     assert vision.layer_types == expected_vision
 
 
@@ -947,8 +937,10 @@ def test_mask_details_track_layer_types():
     for index, layer_type in enumerate(text.layer_types):
         detail = details[index]
         assert detail.size == 13
-        expected = ed.infra.utils.AttnMaskType.SLIDING if layer_type == "sliding_attention" else (
-            ed.infra.utils.AttnMaskType.FULL
+        expected = (
+            ed.infra.utils.AttnMaskType.SLIDING
+            if layer_type == "sliding_attention"
+            else (ed.infra.utils.AttnMaskType.FULL)
         )
         assert detail.mask_type == expected
 

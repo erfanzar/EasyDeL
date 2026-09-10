@@ -17,7 +17,6 @@
 import jax
 import jax.numpy as jnp
 import pytest
-
 from ejkernel.kernels._pallas.gpu.ragged_decode_attention import (
     ragged_decode_attention as ragged_decode_gpu,
 )

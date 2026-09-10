@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import pytest
-
 from easydel.inference.esurge.engine.output_pipeline import OutputPipeline
 from easydel.inference.esurge.engine.registry import RequestRecord, RequestRegistry
 from easydel.inference.openai_api_modules import DeltaFunctionCall, DeltaMessage, DeltaToolCall
@@ -1156,11 +1155,13 @@ def test_esurge_output_parsers_hide_reasoning_delta_for_prompt_context(dummy_tok
     parser.configure_prompt_context(prompt_text="...<think>", prompt_token_ids=[1])
     engine = _make_parsing_harness()
 
-    rd = RequestRecord(**{
-        "delegating_parser": DelegatingParser(reasoning_parser=parser),
-        "parser_previous_text": "",
-        "parser_previous_token_ids": [],
-    })
+    rd = RequestRecord(
+        **{
+            "delegating_parser": DelegatingParser(reasoning_parser=parser),
+            "parser_previous_text": "",
+            "parser_previous_token_ids": [],
+        }
+    )
 
     first = engine._run_output_parsers(
         rd=rd,
@@ -1189,11 +1190,13 @@ def test_esurge_output_parsers_dont_leak_standalone_start_token(dummy_tokenizer)
     parser = DeepSeekR1ReasoningParser(dummy_tokenizer)
     engine = _make_parsing_harness()
 
-    rd = RequestRecord(**{
-        "delegating_parser": DelegatingParser(reasoning_parser=parser),
-        "parser_previous_text": "",
-        "parser_previous_token_ids": [],
-    })
+    rd = RequestRecord(
+        **{
+            "delegating_parser": DelegatingParser(reasoning_parser=parser),
+            "parser_previous_text": "",
+            "parser_previous_token_ids": [],
+        }
+    )
 
     result = engine._run_output_parsers(
         rd=rd,
@@ -1211,11 +1214,13 @@ def test_esurge_output_parsers_step3_reasoning_only_delta_is_not_text(dummy_toke
     parser = Step3ReasoningParser(dummy_tokenizer)
     engine = _make_parsing_harness()
 
-    rd = RequestRecord(**{
-        "delegating_parser": DelegatingParser(reasoning_parser=parser),
-        "parser_previous_text": "",
-        "parser_previous_token_ids": [],
-    })
+    rd = RequestRecord(
+        **{
+            "delegating_parser": DelegatingParser(reasoning_parser=parser),
+            "parser_previous_text": "",
+            "parser_previous_token_ids": [],
+        }
+    )
 
     result = engine._run_output_parsers(
         rd=rd,
@@ -1235,14 +1240,16 @@ def test_esurge_output_parsers_do_not_expose_reasoning_token_ids_to_tool_parser(
     tool_parser = _TokenAwareToolParser(trigger_token_id=99)
     engine = _make_parsing_harness()
 
-    rd = RequestRecord(**{
-        "delegating_parser": DelegatingParser(
-            reasoning_parser=reasoning_parser,
-            tool_parser=tool_parser,
-        ),
-        "parser_previous_text": "",
-        "parser_previous_token_ids": [],
-    })
+    rd = RequestRecord(
+        **{
+            "delegating_parser": DelegatingParser(
+                reasoning_parser=reasoning_parser,
+                tool_parser=tool_parser,
+            ),
+            "parser_previous_text": "",
+            "parser_previous_token_ids": [],
+        }
+    )
 
     first = engine._run_output_parsers(
         rd=rd,
@@ -1277,14 +1284,16 @@ def test_esurge_output_parsers_minimax_tool_calls_survive_finished_parse_without
         }
     )
     engine = _make_parsing_harness()
-    rd = RequestRecord(**{
-        "delegating_parser": DelegatingParser(
-            reasoning_parser=MiniMaxM2ReasoningParser(tokenizer),
-            tool_parser=MinimaxM2ToolParser(tokenizer),
-        ),
-        "parser_previous_text": "",
-        "parser_previous_token_ids": [],
-    })
+    rd = RequestRecord(
+        **{
+            "delegating_parser": DelegatingParser(
+                reasoning_parser=MiniMaxM2ReasoningParser(tokenizer),
+                tool_parser=MinimaxM2ToolParser(tokenizer),
+            ),
+            "parser_previous_text": "",
+            "parser_previous_token_ids": [],
+        }
+    )
 
     result = engine._run_output_parsers(
         rd=rd,
@@ -1312,14 +1321,16 @@ def test_esurge_output_parsers_step3_tool_calls_survive_finished_parse_without_e
         }
     )
     engine = _make_parsing_harness()
-    rd = RequestRecord(**{
-        "delegating_parser": DelegatingParser(
-            reasoning_parser=Step3ReasoningParser(tokenizer),
-            tool_parser=Step3ToolParser(tokenizer),
-        ),
-        "parser_previous_text": "",
-        "parser_previous_token_ids": [],
-    })
+    rd = RequestRecord(
+        **{
+            "delegating_parser": DelegatingParser(
+                reasoning_parser=Step3ReasoningParser(tokenizer),
+                tool_parser=Step3ToolParser(tokenizer),
+            ),
+            "parser_previous_text": "",
+            "parser_previous_token_ids": [],
+        }
+    )
 
     result = engine._run_output_parsers(
         rd=rd,

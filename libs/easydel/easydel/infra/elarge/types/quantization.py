@@ -47,13 +47,18 @@ class EasyDeLQuantizationCfg(TypedDict, total=False):
             (e.g., ``".*dense.*"``).
     """
 
-    dtype: NotRequired[tp.Literal["nf4", "int8", "affine", "ternary", "binary", "mxfp8", "nvfp8", "mxfp4"]]
-    runtime_dtype: NotRequired[tp.Literal["nf4", "int8", "affine", "ternary", "binary", "mxfp8", "nvfp8", "mxfp4"]]
+    dtype: NotRequired[
+        tp.Literal["nf4", "int8", "affine", "ternary", "binary", "mxfp8", "nvfp8", "mxfp4", "nvfp4", "channelwise"]
+    ]
+    runtime_dtype: NotRequired[
+        tp.Literal["nf4", "int8", "affine", "ternary", "binary", "mxfp8", "nvfp8", "mxfp4", "nvfp4", "channelwise"]
+    ]
     group_size: NotRequired[int]
     bits: NotRequired[int]
     simulate: NotRequired[bool]
     jax_native: NotRequired[bool]
     pattern: NotRequired[str]
+    activation_policy: NotRequired[tp.Literal["auto", "explicit"]]
 
 
 class QuantizedTrainingCfg(TypedDict, total=False):

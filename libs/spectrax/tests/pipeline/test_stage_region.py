@@ -10,9 +10,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.sharding import Mesh
-
 import spectrax as spx
+from jax.sharding import Mesh
 from spectrax.runtime.mpmd import sxjit, sxvalue_and_grad
 from spectrax.runtime.mpmd.markers import (
     cluster_jaxpr_by_markers,

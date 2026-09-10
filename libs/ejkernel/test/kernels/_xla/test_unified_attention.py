@@ -16,7 +16,6 @@ import math
 
 import jax
 import jax.numpy as jnp
-
 from ejkernel.kernels._xla import unified_attention
 
 

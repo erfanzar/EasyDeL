@@ -16,7 +16,6 @@
 
 import jax.numpy as jnp
 import pytest
-
 from eformer.mpric.dtypes.precision_types import get_platform_default_half, put_dtype
 from eformer.mpric.handler.precision_handler import PrecisionHandler
 from eformer.mpric.loss_scaling.loss_scaler import DynamicLossScale, LossScaleConfig, NoOpLossScale

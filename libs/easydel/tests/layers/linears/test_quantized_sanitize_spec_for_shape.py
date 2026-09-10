@@ -14,9 +14,8 @@
 
 from types import SimpleNamespace
 
-from jax.sharding import PartitionSpec
-
 from easydel.infra.sharding import mesh_partition_product, sanitize_partition_spec_for_shape
+from jax.sharding import PartitionSpec
 
 
 def _fake_mesh(shape: dict):

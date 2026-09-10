@@ -16,11 +16,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from ejkernel.types import MaskInfo
-from jax.sharding import PartitionSpec
-
 from easydel.operations import _operation_meta as op_meta
 from easydel.operations.kernels._mask_info import align_mask_info_to_qkv_specs
+from ejkernel.types import MaskInfo
+from jax.sharding import PartitionSpec
 
 
 def test_operation_metadata_mesh_uses_spectrax_stage_mesh(monkeypatch):

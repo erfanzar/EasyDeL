@@ -21,14 +21,13 @@ os.environ["ENABLE_DISTRIBUTED_INIT"] = "1"
 os.environ["HF_DATASETS_OFFLINE"] = "0"
 os.environ["EASYDEL_AUTO"] = "1"
 
+import easydel as ed
 import jax
 import spectrax as spx
 from huggingface_hub import HfApi
 from jax import numpy as jnp
 from jax import sharding
 from transformers import AutoTokenizer
-
-import easydel as ed
 
 PartitionSpec, api = sharding.PartitionSpec, HfApi()
 

@@ -19,7 +19,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from ejkernel.kernels._cuda.unified_attention import unified_attention as cuda_unified_attention
 from ejkernel.kernels._xla.unified_attention import unified_attention as xla_unified_attention
 

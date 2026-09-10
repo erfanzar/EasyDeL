@@ -14,11 +14,10 @@
 
 """Tests for Mistral3 model."""
 
+import easydel as ed
 import jax.numpy as jnp
 import pytest
 import transformers
-
-import easydel as ed
 
 try:
     from tests.modules.test_utils import CausalLMTester

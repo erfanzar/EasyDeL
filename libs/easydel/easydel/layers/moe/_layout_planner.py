@@ -330,7 +330,9 @@ def estimate_moe_layout(
             f"fsdp_shard_expert_weights={fsdp_shard_expert_weights}, "
             f"ep_carries_batch={ep_carries_batch_active})"
         ),
-        f"{local_tokens:,} tokens/core (x{ep} ring-gathered)" if use_ring_of_experts else f"{local_tokens:,} tokens/core",
+        f"{local_tokens:,} tokens/core (x{ep} ring-gathered)"
+        if use_ring_of_experts
+        else f"{local_tokens:,} tokens/core",
         (
             f"a2a worst-case receive buffer {_fmt_bytes(dispatch_buffer_bytes)}/core "
             f"(~x{FWD_BWD_LIVE_BUFFER_MULTIPLIER} live fwd+bwd = {_fmt_bytes(live_dispatch_bytes)})"

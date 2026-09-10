@@ -65,10 +65,7 @@ def main():
     # in-pod rank would, renders tokens locally, and exposes the engine
     # surface (generate/stream/chat/limits). Construction blocks until the
     # replica's plane answers the handshake.
-    handles = [
-        RemoteEngineHandle(host, port, auth_token=AUTH, tokenizer_source=TOKENIZER)
-        for host, port in REPLICAS
-    ]
+    handles = [RemoteEngineHandle(host, port, auth_token=AUTH, tokenizer_source=TOKENIZER) for host, port in REPLICAS]
 
     # Front the replicas with prefix-affinity + join-shortest-queue routing.
     # RoutedEngine is duck-typed as an engine, so the API server accepts it

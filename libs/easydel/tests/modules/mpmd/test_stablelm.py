@@ -16,10 +16,10 @@
 
 import copy
 
+import easydel as ed
 import pytest
 import transformers
 
-import easydel as ed
 from tests.modules.mpmd._scheduler_utils import GENERATION_SCHEDULE_KIND, LOSS_SCHEDULE_KINDS
 from tests.modules.test_utils import CausalLMTester
 

@@ -18,7 +18,6 @@ import jax
 import jax.numpy as jnp
 import numpy.testing as npt
 import pytest
-
 from ejkernel.kernels._xla.deepseek_attn import deepseek_attn
 
 

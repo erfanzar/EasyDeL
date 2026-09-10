@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import pytest
-
 from easydel.trainers.training_utils import resolve_total_steps
 
 

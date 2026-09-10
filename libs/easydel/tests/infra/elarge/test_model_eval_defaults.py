@@ -18,7 +18,6 @@ import sys
 from types import ModuleType
 
 import pytest
-
 from easydel.inference.sampling_params import SamplingParams
 from easydel.infra.elarge.model import eLargeModel
 

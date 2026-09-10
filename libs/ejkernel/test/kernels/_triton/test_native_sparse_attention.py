@@ -19,7 +19,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from ejkernel.kernels._triton.native_sparse_attention import (
     apply_native_sparse_attention,
     native_sparse_attention,

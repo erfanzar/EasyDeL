@@ -14,10 +14,8 @@
 
 """Tests for partition axis mappings."""
 
-import pytest
-from jax.sharding import PartitionSpec
-
 import eformer.escale.partition.manager as partition_manager_module
+import pytest
 from eformer.common_types import (
     BATCH,
     DATA_PARALLEL,
@@ -33,6 +31,7 @@ from eformer.escale.partition import (
     get_current_partition_manager,
     get_partition_manager,
 )
+from jax.sharding import PartitionSpec
 
 
 def test_kv_head_dim_maps_to_attention_kv_dim_axis():

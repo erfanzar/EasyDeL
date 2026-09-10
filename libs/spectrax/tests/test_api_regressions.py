@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 import pytest
-
 import spectrax as spx
 from spectrax.api import _place_state, _run_mpmd
 

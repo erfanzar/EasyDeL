@@ -15,7 +15,6 @@
 """Tests that _effective_ejkernel_group_size logs a warning when falling back."""
 
 import pytest
-
 from easydel.layers.linears._linear_quantized import _effective_ejkernel_group_size
 
 

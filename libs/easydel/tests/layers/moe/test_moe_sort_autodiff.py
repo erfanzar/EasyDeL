@@ -11,10 +11,13 @@ from easydel.layers.moe._communication_utils import sort_activations_custom
 def test_sort_activation_autodiff_matches_gather(kind):
     x = jnp.arange(32, dtype=jnp.float32).reshape(8, 4) / 7
     order = jnp.array([6, 1, 4, 0, 7, 3, 2, 5], jnp.int32)
+
     def f(a):
         return sort_activations_custom(a, order)
+
     def ref(a):
         return a[order]
+
     if kind == "jvp":
         dx = jnp.cos(x)
         got = jax.jit(lambda a, d: jax.jvp(f, (a,), (d,)))(x, dx)

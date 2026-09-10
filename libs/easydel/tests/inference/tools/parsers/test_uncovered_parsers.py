@@ -33,7 +33,6 @@ from __future__ import annotations
 import json
 
 import pytest
-
 from easydel.inference.openai_api_modules import ChatCompletionRequest, ChatMessage
 from easydel.inference.tools.parsers import (
     HunyuanA13BToolParser,

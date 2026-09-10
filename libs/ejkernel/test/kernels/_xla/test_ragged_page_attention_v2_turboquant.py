@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 import pytest
-
 from ejkernel.kernels import Platform, kernel_registry
 from ejkernel.kernels._xla import ragged_page_attention_v2_turboquant
 

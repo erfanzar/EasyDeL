@@ -10,7 +10,6 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
-
 from spectrax.loggers import ConsoleBackend, Logger, TensorBoardBackend, WandBBackend
 from spectrax.loggers.base import _NullBackend
 

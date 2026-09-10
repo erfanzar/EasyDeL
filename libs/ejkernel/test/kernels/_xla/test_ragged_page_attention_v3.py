@@ -1,7 +1,6 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
-
 from ejkernel.kernels._pallas.tpu.ragged_page_attention_v3._pallas_impl_fwd import ref_ragged_paged_attention
 from ejkernel.kernels._xla.ragged_page_attention_v3 import ragged_page_attention_v3
 

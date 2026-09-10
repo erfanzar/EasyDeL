@@ -123,9 +123,7 @@ def test_config_extends_activation_batch_axis_with_ep():
     assert off.config.partition_axis.batch_axis == ("fsdp", "dp")
 
     # ep-bound folding contradicts ep-carried batch: the lever must not fire.
-    bound = _build_gptoss_block(
-        sharding_axis_dims=(1, 1, 2, 2, 2, 1), ep_carries_batch=True, fsdp_is_ep_bound=True
-    )
+    bound = _build_gptoss_block(sharding_axis_dims=(1, 1, 2, 2, 2, 1), ep_carries_batch=True, fsdp_is_ep_bound=True)
     assert bound.config.partition_axis.batch_axis == ("fsdp", "dp")
 
 
@@ -156,9 +154,7 @@ def test_batch_axis_names_resolution():
     assert batch_axes(ep1) == ("dp", "fsdp")
 
     # folded 3-D expert mesh (fsdp ep-bound): no distinct fsdp axis, gate off.
-    folded = _build_gptoss_block(
-        sharding_axis_dims=(1, 1, 2, 2, 2, 1), ep_carries_batch=True, fsdp_is_ep_bound=True
-    )
+    folded = _build_gptoss_block(sharding_axis_dims=(1, 1, 2, 2, 2, 1), ep_carries_batch=True, fsdp_is_ep_bound=True)
     assert batch_axes(folded) == ("dp",)
 
 

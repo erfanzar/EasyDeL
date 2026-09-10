@@ -14,7 +14,6 @@
 
 import jax
 import jax.numpy as jnp
-
 from easydel.operations.kernels.kda import _single_step_kda_fwd, _single_step_kda_fwd_bthd
 
 

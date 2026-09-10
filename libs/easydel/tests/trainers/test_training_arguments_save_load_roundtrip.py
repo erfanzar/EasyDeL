@@ -30,13 +30,12 @@ from typing import Any
 
 import jax.numpy as jnp
 import pytest
-from jax.sharding import PartitionSpec
-
 from easydel.infra.etils import EasyDeLOptimizers, EasyDeLSchedulers
 from easydel.infra.loss_utils import LossConfig
 from easydel.trainers.metrics import LogWatcher
 from easydel.trainers.pose import PoSEConfig
 from easydel.trainers.training_configurations import TrainingArguments
+from jax.sharding import PartitionSpec
 
 
 def _full_training_arguments_kwargs() -> dict[str, Any]:

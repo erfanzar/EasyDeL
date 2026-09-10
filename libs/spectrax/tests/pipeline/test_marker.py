@@ -11,7 +11,6 @@ import jax.numpy as jnp
 import numpy as np
 from jax.extend.core import Var
 from jax.sharding import Mesh, PartitionSpec
-
 from spectrax.runtime.mpmd import (
     cluster_jaxpr_by_markers,
     split_by_markers,

@@ -20,7 +20,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from ejkernel.modules.operations import quantized_matmul
 from ejkernel.quantization import (
     QuantizedArray,

@@ -25,9 +25,8 @@ from __future__ import annotations
 import jax
 import numpy as np
 import pytest
-from jax.sharding import Mesh, NamedSharding, PartitionSpec
-
 from easydel.trainers.training_utils import constrain_batch_sharding
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 pytestmark = pytest.mark.skipif(len(jax.devices()) < 8, reason="needs 8 (fake) devices")
 

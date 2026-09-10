@@ -727,7 +727,9 @@ class PipelineMicrobatchExecutor:
             for key, value in self._manager._batch_preparer.last_prep_stats.items():
                 prep_stats_accum[key] = prep_stats_accum.get(key, 0.0) + float(value)
 
-            input_batches.append((self._manager.graphstate, self._manager.graphother, self._manager.kv_pages, batch_metadata))
+            input_batches.append(
+                (self._manager.graphstate, self._manager.graphother, self._manager.kv_pages, batch_metadata)
+            )
             metadata_batches.append(batch_metadata)
             original_positions.append(numpy.asarray(chunk, dtype=numpy.int32))
 
@@ -832,7 +834,9 @@ class PipelineMicrobatchExecutor:
                 padded_num_reqs=padded_num_reqs,
                 part_rows=tuple(int(positions.shape[0]) for positions in original_positions),
             )
-            logits = lm_head_fn(self._manager.graphstate, self._manager.graphother, tuple(hidden_parts), tuple(logits_index_parts))
+            logits = lm_head_fn(
+                self._manager.graphstate, self._manager.graphother, tuple(hidden_parts), tuple(logits_index_parts)
+            )
         else:
             combined_hidden = self._manager._model_executor._place_lm_head_hidden(combined_hidden)
             lm_head_fn = self._manager._model_executor.get_lm_head(padded_num_reqs=padded_num_reqs)

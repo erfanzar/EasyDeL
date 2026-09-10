@@ -14,13 +14,13 @@
 
 """Tests for GLM-MoE-DSA model."""
 
+import easydel as ed
 import jax.numpy as jnp
 import pytest
 import spectrax as spx
 import transformers
-
-import easydel as ed
 from easydel.operations.kernels.glm_moe_dsa_indexer import GlmMoeDsaIndexerOp
+
 from tests.modules.mpmd._scheduler_utils import GENERATION_SCHEDULE_KIND, LOSS_SCHEDULE_KINDS
 from tests.modules.test_utils import CausalLMTester
 from tests.modules.test_utils.model_factory import setup_config

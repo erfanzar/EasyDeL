@@ -19,7 +19,6 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import pytest
-
 from ejkernel.kernels._pallas.tpu.ragged_gated_delta_rule_v2 import (
     ragged_gated_delta_rule_v2 as pallas_gdn_v2,
 )

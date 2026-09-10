@@ -17,7 +17,6 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import pytest
-
 from easydel import is_inference_mode, set_inference_mode
 
 

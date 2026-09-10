@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-
 from ejkernel.kernels._xla.ragged_gated_delta_rule_v2._xla_impl_fwd import (
     ragged_gated_delta_rule_mixed_prefill,
 )

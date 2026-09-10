@@ -11,7 +11,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
-
 from spectrax.runtime.schedules import GPipe, Std1F1B, ZeroBubbleH1
 from spectrax.runtime.spmd.shard_map import make_scheduled_body
 

@@ -18,7 +18,6 @@
 import jax
 import jax.numpy as jnp
 import pytest
-
 from ejkernel.kernels._pallas.tpu.blocksparse_attention import (
     CausalMask,
     ChunkedCausalMask,

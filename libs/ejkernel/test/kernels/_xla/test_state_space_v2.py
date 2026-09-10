@@ -18,7 +18,6 @@
 import jax
 import jax.numpy as jnp
 import pytest
-
 from ejkernel.kernels._xla import state_space_v2
 
 

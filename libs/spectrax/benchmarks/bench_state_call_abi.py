@@ -15,7 +15,6 @@ from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
-
 import spectrax as spx
 
 

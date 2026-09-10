@@ -779,12 +779,20 @@ def _parse_torch_load_options(kwargs: dict[str, tp.Any]) -> TorchLoadOptions:
 
 def _normalize_quantization_config(
     quantization_config: QuantizationConfig | dict[str, tp.Any] | None,
+    *,
+    strict: bool = True,
 ) -> QuantizationConfig | None:
     """Coerce a quantization-config dict into a :class:`QuantizationConfig`.
 
     Args:
         quantization_config: ``None``, an existing config, or a dict of
             field overrides.
+        strict: Forwarded to :meth:`QuantizationConfig.coerce`. Strict mode
+            (explicitly user-supplied overrides) raises on unknown keys;
+            lenient mode (dicts inherited from a checkpoint's
+            ``config.json``) drops Hugging Face checkpoint-format
+            descriptors such as ``{"quant_method": "fp8", ...}`` instead of
+            raising.
 
     Returns:
         QuantizationConfig | None: A typed config or ``None``.
@@ -794,7 +802,7 @@ def _normalize_quantization_config(
     if isinstance(quantization_config, QuantizationConfig):
         return quantization_config
     if isinstance(quantization_config, dict):
-        return QuantizationConfig(**quantization_config)
+        return QuantizationConfig.coerce(quantization_config, strict=strict)
     return quantization_config
 
 
@@ -1411,7 +1419,9 @@ class EasyBridgeMixin(PushToHubMixin):
         quantizer_for_modules = None
         if itwas_tensorstore and apply_quantization:
             if quantization_config is None:
-                quantization_config = _normalize_quantization_config(getattr(model.config, "quantization_config", None))
+                quantization_config = _normalize_quantization_config(
+                    getattr(model.config, "quantization_config", None), strict=False
+                )
             if quantization_config is None:
                 from easydel.layers import QuantizationConfig as _QConfig
                 from easydel.layers import QuantizationType as _QType
@@ -1781,7 +1791,7 @@ class EasyBridgeMixin(PushToHubMixin):
                 quantized_checkpoint = True
                 if quantization_config is None:
                     quantization_config = _normalize_quantization_config(
-                        getattr(model.config, "quantization_config", None)
+                        getattr(model.config, "quantization_config", None), strict=False
                     )
                 if quantization_config is None:
                     from easydel.layers import QuantizationConfig as _QConfig
@@ -1807,7 +1817,7 @@ class EasyBridgeMixin(PushToHubMixin):
             elif itwas_tensorstore and apply_quantization:
                 if quantization_config is None:
                     quantization_config = _normalize_quantization_config(
-                        getattr(model.config, "quantization_config", None)
+                        getattr(model.config, "quantization_config", None), strict=False
                     )
                 if quantization_config is None:
                     from easydel.layers import QuantizationConfig as _QConfig
@@ -2156,7 +2166,9 @@ class EasyBridgeMixin(PushToHubMixin):
             **config_kwargs,
         )
         if quantization_config is None:
-            quantization_config = _normalize_quantization_config(getattr(config, "quantization_config", None))
+            quantization_config = _normalize_quantization_config(
+                getattr(config, "quantization_config", None), strict=False
+            )
         else:
             quantization_config = _normalize_quantization_config(quantization_config)
 

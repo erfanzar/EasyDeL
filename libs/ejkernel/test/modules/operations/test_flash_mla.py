@@ -5,7 +5,6 @@ import math
 import jax
 import jax.numpy as jnp
 import pytest
-
 from ejkernel.kernels._xla.flash_mla import flash_mla as xla_flash_mla
 from ejkernel.modules.operations import flash_mla
 

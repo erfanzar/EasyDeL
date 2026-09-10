@@ -17,7 +17,6 @@
 import jax
 import jax.numpy as jnp
 import pytest
-
 from ejkernel.kernels._pallas.tpu.ragged_page_attention_v2._pallas_impl_fwd import ref_ragged_page_attention
 from ejkernel.kernels._xla.ragged_page_attention_v2 import ragged_page_attention_v2
 

@@ -17,7 +17,6 @@ from types import SimpleNamespace
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from easydel.trainers.direct_preference_optimization_trainer._fn import (
     _ld_logp_weights,
     compute_dpo_losses,

@@ -509,9 +509,7 @@ def _dot_general_qt(
     Returns:
         The contraction's floating-point result.
     """
-    result, _residuals = _dot_general_qt_fwd(
-        lhs, rhs, lhs_calibration, rhs_calibration, dimension_numbers, config
-    )
+    result, _residuals = _dot_general_qt_fwd(lhs, rhs, lhs_calibration, rhs_calibration, dimension_numbers, config)
     return result
 
 

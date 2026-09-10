@@ -33,14 +33,13 @@ Assertions target observable behavior, not wiring internals:
 
 from __future__ import annotations
 
+import easydel as ed
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 import spectrax as spx
 from datasets import Dataset  # pyright: ignore[reportMissingTypeStubs]
-
-import easydel as ed
 from easydel.utils.traversals import deepcopy_model
 
 VOCAB = 64

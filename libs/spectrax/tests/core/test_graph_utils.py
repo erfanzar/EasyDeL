@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-
 from spectrax.core.containers import ModuleList, ParameterList
 from spectrax.core.graph import iter_modules, pop
 from spectrax.core.module import Module

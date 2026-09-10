@@ -4,9 +4,8 @@ import math
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh, PartitionSpec
-
 from ejkernel.modules.operations import decode_attention
+from jax.sharding import Mesh, PartitionSpec
 
 
 def test_decode_attention_module_runs_xla():

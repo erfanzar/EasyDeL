@@ -9,7 +9,6 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import pytest
-
 from spectrax.runtime.mpmd.per_rank import (
     compile_per_rank_bwd,
     compile_per_rank_fwd,

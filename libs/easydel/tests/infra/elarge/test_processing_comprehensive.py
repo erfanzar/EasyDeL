@@ -15,9 +15,8 @@
 """Comprehensive tests for elarge processing utilities."""
 
 import jax
-from jax import numpy as jnp
-
 from easydel.infra.elarge.processing import coerce_dtype, coerce_precision
+from jax import numpy as jnp
 
 
 class TestCoerceDtype:

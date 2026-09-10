@@ -17,7 +17,6 @@
 import jax
 import jax.numpy as jnp
 import pytest
-
 from ejkernel.kernels._xla.attention import attention
 from ejkernel.kernels._xla.blocksparse_attention import blocksparse_attention
 

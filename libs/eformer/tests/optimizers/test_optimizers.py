@@ -18,7 +18,6 @@ import jax
 import jax.numpy as jnp
 import optax
 import pytest
-
 from eformer.optimizers import (
     AdafactorConfig,
     AdafactorOptimizer,

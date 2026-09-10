@@ -222,9 +222,8 @@ def test_sft_legacy_packing_uses_shared_wrapper():
 
 def test_sequence_packing_segments_fold_into_mask_info_before_filtering():
     import numpy as np
-    from jax import numpy as jnp
-
     from easydel.trainers.training_utils import filter_kwargs_for_callable, sanitize_model_call_kwargs
+    from jax import numpy as jnp
 
     def forward(input_ids, attention_mask=None, mask_info=None):
         del input_ids, attention_mask
@@ -251,9 +250,8 @@ def test_sequence_packing_segments_fold_into_mask_info_before_filtering():
 
 def test_sequence_packing_folds_off_by_one_segment_ids_to_input_length():
     import numpy as np
-    from jax import numpy as jnp
-
     from easydel.trainers.training_utils import sanitize_model_call_kwargs
+    from jax import numpy as jnp
 
     batch = {
         "input_ids": jnp.asarray([[10, 11, 12, 13]], dtype=jnp.int32),
@@ -268,9 +266,8 @@ def test_sequence_packing_folds_off_by_one_segment_ids_to_input_length():
 
 
 def test_generic_filter_preserves_explicit_segment_ids_argument():
-    from jax import numpy as jnp
-
     from easydel.trainers.training_utils import filter_kwargs_for_callable
+    from jax import numpy as jnp
 
     def reward(segment_ids):
         return segment_ids

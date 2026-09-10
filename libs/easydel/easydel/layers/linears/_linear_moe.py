@@ -642,14 +642,20 @@ class ParallelMoELinear(spx.Module):
 
         Args:
             config: Quantization configuration.
-            **kwargs: Ignored runtime knobs (accepted for quantizer
-                compatibility).
+            **kwargs: Runtime knobs forwarded by the quantizer. Recognized:
+                ``qmm_platform`` (``"xla"`` or ``"pallas"``) selects the
+                grouped-matmul backend the quantized twin uses at call time;
+                ``"pallas"`` streams integer weights on TPU instead of
+                materializing dequantized bf16 kernels. All other keys are
+                ignored for compatibility.
 
         Returns:
             A :class:`ParallelMoELinearQuantized` (lazy when weights are
             abstract; quantized in place when concrete).
         """
-        del kwargs
+        grouped_platform = kwargs.get("qmm_platform")
+        if grouped_platform is not None and grouped_platform not in ("xla", "pallas"):
+            raise ValueError(f"qmm_platform must be 'xla' or 'pallas' for MoE experts, got {grouped_platform!r}.")
         from easydel.layers.quantization import QuantizationType
 
         if config.dtype != QuantizationType.CHANNELWISE:
@@ -691,6 +697,7 @@ class ParallelMoELinear(spx.Module):
                     activation_bits=(
                         config.activation_bits if getattr(config, "activation_policy", "auto") == "explicit" else None
                     ),
+                    grouped_platform=grouped_platform,
                     rngs=rngs,
                 ),
                 spx.Rngs(0),
@@ -706,19 +713,23 @@ class _QuantizedExpertKernel(tuple):
 
     This ephemeral kernel view does not change stored checkpoint arrays.
     Tuple compatibility preserves consumers that unpack ``(codes, scales)``.
+    ``grouped_platform`` optionally pins the grouped-matmul backend
+    (``"xla"``/``"pallas"``), overriding the measured-shape auto-selection.
     """
 
-    def __new__(cls, codes, scales, activation_bits):
+    def __new__(cls, codes, scales, activation_bits, grouped_platform=None):
         obj = super().__new__(cls, (codes, scales))
         obj.activation_bits = activation_bits
+        obj.grouped_platform = grouped_platform
         return obj
 
     def tree_flatten(self):
-        return tuple(self), self.activation_bits
+        return tuple(self), (self.activation_bits, self.grouped_platform)
 
     @classmethod
-    def tree_unflatten(cls, activation_bits, leaves):
-        return cls(*leaves, activation_bits)
+    def tree_unflatten(cls, aux, leaves):
+        activation_bits, grouped_platform = aux
+        return cls(*leaves, activation_bits, grouped_platform)
 
 
 class ParallelMoELinearQuantized(ParallelMoELinear):
@@ -729,9 +740,19 @@ class ParallelMoELinearQuantized(ParallelMoELinear):
     Codes and per-channel scale checkpoint shapes remain unchanged.
     """
 
-    def __init__(self, *args, quantization_bits: int = 8, activation_bits: int | None = None, **kwargs):
+    def __init__(
+        self,
+        *args,
+        quantization_bits: int = 8,
+        activation_bits: int | None = None,
+        grouped_platform: str | None = None,
+        **kwargs,
+    ):
         self._quantization_bits = int(quantization_bits)
         self._activation_bits = activation_bits
+        if grouped_platform not in (None, "xla", "pallas"):
+            raise ValueError(f"grouped_platform must be None, 'xla', or 'pallas'; got {grouped_platform!r}.")
+        self._grouped_platform = grouped_platform
         super().__init__(*args, **kwargs)
         weight_layout = _moe_parameter_layout(
             direction=self._direction,
@@ -780,7 +801,12 @@ class ParallelMoELinearQuantized(ParallelMoELinear):
     def kernel_view(self) -> tuple[Array, Array]:
         """Return codes/scales with explicit precision metadata when requested."""
         if self._activation_bits is not None:
-            return _QuantizedExpertKernel(self.quant_kernel.value, self.quant_scales.value, self._activation_bits)
+            return _QuantizedExpertKernel(
+                self.quant_kernel.value,
+                self.quant_scales.value,
+                self._activation_bits,
+                self._grouped_platform,
+            )
         return (self.quant_kernel.value, self.quant_scales.value)
 
     def forward(
@@ -801,6 +827,7 @@ class ParallelMoELinearQuantized(ParallelMoELinear):
                 group_sizes,
                 activation_bits=self._activation_bits,
                 preferred_element_type=jnp.bfloat16 if self.dtype != jnp.float32 else jnp.float32,
+                platform=self._grouped_platform or "xla",
             )
         from ejkernel.modules import grouped_matmul_w8a8  # pyright: ignore[reportMissingTypeStubs]
 

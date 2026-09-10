@@ -17,7 +17,6 @@
 import jax
 import jax.numpy as jnp
 import pytest
-
 from easydel.operations.kernels.kda import (
     _single_step_kda_core,
     _single_step_kda_fwd,

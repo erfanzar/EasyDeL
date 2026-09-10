@@ -3,9 +3,8 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.sharding import Mesh
-
 import spectrax as spx
+from jax.sharding import Mesh
 from spectrax import nn
 from spectrax.nn import PipelineSequential
 from spectrax.runtime.mpmd import sxcall, sxjit, sxstage_iter

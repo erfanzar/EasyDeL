@@ -9,7 +9,6 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import pytest
-
 import spectrax as spx
 from spectrax.core.graph import export
 from spectrax.core.stage_assignment import PIPELINE_STAGE_METADATA_KEY, assign_stage

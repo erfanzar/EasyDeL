@@ -238,7 +238,6 @@ def test_optimizer_state_mirrors_fsdp_sharding():
     size.
     """
     import optax
-
     from easydel.infra.base_state import EasyDeLState
     from easydel.modules.gpt_oss.modeling_gpt_oss import GptOssForCausalLM
 

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import pytest
 from jax.sharding import PartitionSpec
-
 from spectrax.core.sharding import Sharding, normalize_sharding
 
 

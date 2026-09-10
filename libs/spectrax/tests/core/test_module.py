@@ -11,7 +11,6 @@ import contextlib
 import jax
 import jax.numpy as jnp
 import pytest
-
 from spectrax.core.context import get as scope_get
 from spectrax.core.module import Module, Opaque
 from spectrax.core.policy import Policy

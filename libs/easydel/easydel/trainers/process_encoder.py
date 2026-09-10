@@ -140,13 +140,9 @@ class ProcessEncoderConfig:
 
     def __post_init__(self) -> None:
         if self.row_bucket_multiple < 1:
-            raise ValueError(
-                f"process_encoder.row_bucket_multiple must be >= 1, got {self.row_bucket_multiple}."
-            )
+            raise ValueError(f"process_encoder.row_bucket_multiple must be >= 1, got {self.row_bucket_multiple}.")
         if self.max_rows_per_step is not None and self.max_rows_per_step < 1:
-            raise ValueError(
-                f"process_encoder.max_rows_per_step must be None or >= 1, got {self.max_rows_per_step}."
-            )
+            raise ValueError(f"process_encoder.max_rows_per_step must be None or >= 1, got {self.max_rows_per_step}.")
         if self.feature_dtype is not None:
             try:
                 jnp.dtype(self.feature_dtype)

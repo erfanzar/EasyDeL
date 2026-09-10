@@ -18,10 +18,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from ejkernel.kernels._xla.all_gather_matmul import all_gather_matmul
 from jax import lax, shard_map
 from jax.sharding import Mesh, PartitionSpec
-
-from ejkernel.kernels._xla.all_gather_matmul import all_gather_matmul
 
 
 def _candidate_tp_sizes() -> tuple[int, ...]:

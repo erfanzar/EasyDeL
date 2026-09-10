@@ -62,6 +62,14 @@ import jax.numpy as jnp
 from eformer.aparser import DataClassArgumentParser
 from eformer.paths import ePath
 
+# Import the model-family registry eagerly: importing ``easydel.modules``
+# triggers every family package (including ones absent from the installed
+# transformers release) to run, and families register their config classes
+# with ``transformers.AutoConfig`` on import. Without this, an
+# ``AutoConfig.from_pretrained`` on a checkpoint whose architecture is newer
+# than the host's transformers fails before model resolution ever happens.
+import easydel.modules  # noqa: F401
+
 try:
     from eformer.loggings import get_logger
 except ModuleNotFoundError:  # pragma: no cover

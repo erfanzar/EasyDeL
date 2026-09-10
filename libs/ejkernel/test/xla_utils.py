@@ -21,7 +21,6 @@ sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from ejkernel.xla_utils.utils import (
     prepare_chunk_indices,
     prepare_chunk_offsets,

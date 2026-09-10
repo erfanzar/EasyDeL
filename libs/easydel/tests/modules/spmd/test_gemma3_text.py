@@ -14,12 +14,11 @@
 
 """Tests for Gemma3 text-only model."""
 
+import easydel as ed
 import pytest
 import spectrax as spx
 import transformers
 from jax import numpy as jnp
-
-import easydel as ed
 
 try:
     from tests.modules.test_utils import CausalLMTester

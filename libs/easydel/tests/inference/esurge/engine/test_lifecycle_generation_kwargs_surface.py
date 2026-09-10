@@ -19,8 +19,6 @@ from inspect import signature
 from types import SimpleNamespace
 
 import jax.numpy as jnp
-from transformers.generation.configuration_utils import GenerationConfig
-
 from easydel.inference.esurge.engine.loop import EngineLoop
 from easydel.inference.esurge.esurge_engine import eSurge
 from easydel.inference.esurge.request import EngineRequest
@@ -35,6 +33,7 @@ from easydel.inference.logits_process import (
 from easydel.inference.sampling_params import SamplingParams
 from easydel.infra.mixins import generation as generation_module
 from easydel.infra.mixins.generation import EasyGenerationMixin
+from transformers.generation.configuration_utils import GenerationConfig
 
 
 def test_esurge_generation_surface_includes_required_engine_kwargs():
@@ -343,9 +342,7 @@ def test_lifecycle_split_graph_components_prefers_compatible_model_for_wrapper_d
         def esurge_compatible_model(self):
             return self.model
 
-    split_model, graphdef, graphstate, graphother = eSurge._split_graph_components_for_weight_update(
-        WrapperLike()
-    )
+    split_model, graphdef, graphstate, graphother = eSurge._split_graph_components_for_weight_update(WrapperLike())
 
     assert split_model.__class__.__name__ == "CompatibleModel"
     assert (graphdef, graphstate, graphother) == (

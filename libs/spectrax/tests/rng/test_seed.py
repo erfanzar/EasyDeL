@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import pytest
-
 from spectrax.rng.rngs import Rngs
 from spectrax.rng.seed import default_rngs, has_default_rngs, seed
 

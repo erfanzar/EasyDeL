@@ -15,7 +15,6 @@
 import jax
 import jax.numpy as jnp
 import pytest
-
 from ejkernel.callib._cute_call import CAN_USE_CUTE, cute_call
 from ejkernel.callib._cute_ffi import build_cute_ffi_call, has_cute_ffi_support
 

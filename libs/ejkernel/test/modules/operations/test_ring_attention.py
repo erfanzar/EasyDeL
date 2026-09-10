@@ -4,9 +4,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.sharding import Mesh, PartitionSpec
-
 from ejkernel.modules.operations import RingAttentionConfig, ring_attention
+from jax.sharding import Mesh, PartitionSpec
 
 from ._utils import assert_allclose, dense_attention_reference, device_platform, rand_qkv
 

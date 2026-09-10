@@ -1421,9 +1421,7 @@ class BaseTrainer(BaseTrainerProtocol):
             return
 
         raw_list = list(raw_texts or [])
-        nonempty_raw = sum(
-            1 for i in empty_indices if i < len(raw_list) and (raw_list[i] or "").strip()
-        )
+        nonempty_raw = sum(1 for i in empty_indices if i < len(raw_list) and (raw_list[i] or "").strip())
         truncated_list = list(truncated or [])
         truncated_count = sum(1 for i in empty_indices if i < len(truncated_list) and truncated_list[i])
 

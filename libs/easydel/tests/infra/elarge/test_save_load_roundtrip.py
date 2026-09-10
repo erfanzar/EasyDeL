@@ -29,7 +29,6 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-
 from easydel.infra.elarge import eLargeModel
 from easydel.infra.elarge.processing import (
     load_elm_config,

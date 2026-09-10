@@ -29,8 +29,10 @@ def test_scale_row_expansion(sizes, count):
     s = jnp.arange(len(sizes) * 128, dtype=jnp.float32).reshape(len(sizes), 1, 128) / 128
     gs = jnp.array(sizes, jnp.int32)
     f = jax.jit(lambda a, b: expand(a, b, count))
+
     def ref(a, b):
         return jnp.repeat(a[:, 0, :], b, axis=0, total_repeat_length=count)
+
     np.testing.assert_array_equal(f(s, gs), ref(s, gs))
     np.testing.assert_array_equal(jax.grad(lambda a: f(a, gs).sum())(s), jax.grad(lambda a: ref(a, gs).sum())(s))
     hlo = f.lower(s, gs).compiler_ir(dialect="stablehlo").operation.get_asm()

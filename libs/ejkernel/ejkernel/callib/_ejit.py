@@ -97,9 +97,7 @@ CACHE_DIR = get_cache_dir()
 # volume to escape a full root filesystem does nothing for this directory,
 # which is the one worth moving.
 COMPILE_FUNC_DIR = Path(
-    os.getenv("EJKERNEL_COMPILE_CACHE_DIR")
-    or os.getenv("COMPILE_FUNC_DIR")
-    or (CACHE_DIR / "ejit_compiled_functions")
+    os.getenv("EJKERNEL_COMPILE_CACHE_DIR") or os.getenv("COMPILE_FUNC_DIR") or (CACHE_DIR / "ejit_compiled_functions")
 ).expanduser()
 
 

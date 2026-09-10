@@ -16,9 +16,8 @@
 
 import jax
 import pytest
-from jax.sharding import AxisType
-
 from eformer.escale import create_mesh
+from jax.sharding import AxisType
 
 
 def _has_multiple_slices() -> bool:

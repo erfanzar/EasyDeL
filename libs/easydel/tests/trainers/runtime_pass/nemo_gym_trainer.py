@@ -8,9 +8,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from datasets import Dataset
-
 import easydel as ed
+from datasets import Dataset
 
 if __package__ in {None, ""}:
     sys.path.append(str(Path(__file__).resolve().parent.parent))

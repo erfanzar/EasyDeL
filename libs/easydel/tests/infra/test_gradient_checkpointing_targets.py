@@ -16,17 +16,16 @@
 
 from __future__ import annotations
 
+import easydel  # noqa: F401
 import jax
 import jax.numpy as jnp
 import pytest
 import spectrax as spx
-from jax.ad_checkpoint import checkpoint_name, print_saved_residuals
-
-import easydel  # noqa: F401
 from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.utils import get_gradient_checkpoint_policy
 from easydel.modules.llama import modeling_llama
 from easydel.modules.llama.llama_configuration import LlamaConfig
+from jax.ad_checkpoint import checkpoint_name, print_saved_residuals
 
 TARGETS = ["mlp_output", "residual"]
 

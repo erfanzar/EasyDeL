@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 import pytest
-
 from spectrax.nn.norm import GroupNorm, InstanceNorm, LayerNorm
 
 

@@ -12,7 +12,6 @@ Exercises all three filtering styles on a small but non-trivial model
 from __future__ import annotations
 
 import pytest
-
 import spectrax as spx
 import spectrax.nn as spx_nn
 

@@ -33,7 +33,6 @@ if os.path.isdir("/dev/shm/mdl"):
 
 import jax
 import jax.numpy as jnp
-
 import spectrax as spx
 from spectrax.runtime.mpmd import sxjit
 from spectrax.runtime.mpmd.markers import sxstage_iter

@@ -32,7 +32,6 @@ from __future__ import annotations
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from easydel.inference.esurge.page_table import (
     PAGE_TABLE_PADDING_VAL,
     MultiGroupPageTable,

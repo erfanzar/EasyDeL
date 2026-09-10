@@ -16,7 +16,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from ejkernel.kernels._cuda.ragged_page_attention_v3 import (
     ragged_page_attention_v3 as cuda_ragged_page_attention_v3,
 )

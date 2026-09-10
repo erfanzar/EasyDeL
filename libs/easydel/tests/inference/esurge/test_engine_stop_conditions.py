@@ -287,21 +287,23 @@ def test_process_engine_outputs_keeps_raw_text_before_reasoning_split():
     )
     reasoning_parser = DeepSeekR1ReasoningParser(_DummyTokenizer())
     request_id = "req-raw-before-parse"
-    pipeline._active_requests[request_id] = RequestRecord(**{
-        "parent_request_id": request_id,
-        "sample_index": 0,
-        "generated_tokens": [],
-        "last_decoded_index": 0,
-        "last_decode_time": 0.0,
-        "start_time": time.perf_counter(),
-        "first_token_time": None,
-        "reported_generated_count": 0,
-        "sampling_params": SamplingParams(max_tokens=16),
-        "prompt_token_ids": [1, 2],
-        "delegating_parser": DelegatingParser(reasoning_parser=reasoning_parser),
-        "parser_previous_text": "",
-        "parser_previous_token_ids": [],
-    })
+    pipeline._active_requests[request_id] = RequestRecord(
+        **{
+            "parent_request_id": request_id,
+            "sample_index": 0,
+            "generated_tokens": [],
+            "last_decoded_index": 0,
+            "last_decode_time": 0.0,
+            "start_time": time.perf_counter(),
+            "first_token_time": None,
+            "reported_generated_count": 0,
+            "sampling_params": SamplingParams(max_tokens=16),
+            "prompt_token_ids": [1, 2],
+            "delegating_parser": DelegatingParser(reasoning_parser=reasoning_parser),
+            "parser_previous_text": "",
+            "parser_previous_token_ids": [],
+        }
+    )
     pipeline._request_outputs[request_id] = RequestOutput(
         request_id=request_id,
         prompt="hi",
@@ -334,22 +336,24 @@ def test_process_engine_outputs_uses_engine_timestamp_for_generation_metrics():
     pipeline = _make_pipeline(decoded_text="xy", delta_text="y")
     request_id = "req-engine-timestamp-metrics"
     start_time = 100.0
-    pipeline._active_requests[request_id] = RequestRecord(**{
-        "parent_request_id": request_id,
-        "sample_index": 0,
-        "generated_tokens": [],
-        "decodable_tokens": [],
-        "last_decoded_index": 0,
-        "last_decode_time": start_time,
-        "start_time": start_time,
-        "first_token_time": None,
-        "reported_generated_count": 0,
-        "sampling_params": SamplingParams(max_tokens=16),
-        "prompt_token_ids": [1, 2],
-        "delegating_parser": DelegatingParser(),
-        "parser_previous_text": "",
-        "parser_previous_token_ids": [],
-    })
+    pipeline._active_requests[request_id] = RequestRecord(
+        **{
+            "parent_request_id": request_id,
+            "sample_index": 0,
+            "generated_tokens": [],
+            "decodable_tokens": [],
+            "last_decoded_index": 0,
+            "last_decode_time": start_time,
+            "start_time": start_time,
+            "first_token_time": None,
+            "reported_generated_count": 0,
+            "sampling_params": SamplingParams(max_tokens=16),
+            "prompt_token_ids": [1, 2],
+            "delegating_parser": DelegatingParser(),
+            "parser_previous_text": "",
+            "parser_previous_token_ids": [],
+        }
+    )
     pipeline._request_outputs[request_id] = RequestOutput(
         request_id=request_id,
         prompt="hi",
@@ -389,22 +393,24 @@ def test_process_engine_outputs_queues_parser_stop_without_scheduler_lock():
         on_stop_strings=lambda stops: queued_stops.append(dict(stops)),
     )
     request_id = "req-parser-stop-queued"
-    pipeline._active_requests[request_id] = RequestRecord(**{
-        "parent_request_id": request_id,
-        "sample_index": 0,
-        "generated_tokens": [],
-        "decodable_tokens": [],
-        "last_decoded_index": 0,
-        "last_decode_time": 0.0,
-        "start_time": time.perf_counter(),
-        "first_token_time": None,
-        "reported_generated_count": 0,
-        "sampling_params": SamplingParams(max_tokens=16, stop=["STOP"]),
-        "prompt_token_ids": [1, 2],
-        "delegating_parser": DelegatingParser(),
-        "parser_previous_text": "",
-        "parser_previous_token_ids": [],
-    })
+    pipeline._active_requests[request_id] = RequestRecord(
+        **{
+            "parent_request_id": request_id,
+            "sample_index": 0,
+            "generated_tokens": [],
+            "decodable_tokens": [],
+            "last_decoded_index": 0,
+            "last_decode_time": 0.0,
+            "start_time": time.perf_counter(),
+            "first_token_time": None,
+            "reported_generated_count": 0,
+            "sampling_params": SamplingParams(max_tokens=16, stop=["STOP"]),
+            "prompt_token_ids": [1, 2],
+            "delegating_parser": DelegatingParser(),
+            "parser_previous_text": "",
+            "parser_previous_token_ids": [],
+        }
+    )
     pipeline._request_outputs[request_id] = RequestOutput(
         request_id=request_id,
         prompt="hi",
@@ -431,21 +437,23 @@ def test_process_engine_outputs_marks_finished_requests_without_token_output():
     request_id = "req-finished-only"
     event = threading.Event()
     pipeline._request_events[request_id] = event
-    pipeline._active_requests[request_id] = RequestRecord(**{
-        "parent_request_id": request_id,
-        "sample_index": 0,
-        "generated_tokens": [],
-        "last_decoded_index": 0,
-        "last_decode_time": 0.0,
-        "start_time": time.perf_counter(),
-        "first_token_time": None,
-        "reported_generated_count": 0,
-        "sampling_params": SamplingParams(max_tokens=16),
-        "prompt_token_ids": [1, 2],
-        "delegating_parser": DelegatingParser(),
-        "parser_previous_text": "",
-        "parser_previous_token_ids": [],
-    })
+    pipeline._active_requests[request_id] = RequestRecord(
+        **{
+            "parent_request_id": request_id,
+            "sample_index": 0,
+            "generated_tokens": [],
+            "last_decoded_index": 0,
+            "last_decode_time": 0.0,
+            "start_time": time.perf_counter(),
+            "first_token_time": None,
+            "reported_generated_count": 0,
+            "sampling_params": SamplingParams(max_tokens=16),
+            "prompt_token_ids": [1, 2],
+            "delegating_parser": DelegatingParser(),
+            "parser_previous_text": "",
+            "parser_previous_token_ids": [],
+        }
+    )
     pipeline._request_outputs[request_id] = RequestOutput(
         request_id=request_id,
         prompt="hi",
@@ -530,15 +538,17 @@ def test_decode_and_parse_skips_when_interval_not_reached():
         decode_interval_tokens=100,  # Very high threshold
         decode_interval_secs=100.0,  # Very high timeout
     )
-    rd = RequestRecord(**{
-        "last_decoded_index": 0,
-        "last_decode_time": time.perf_counter(),
-        "sampling_params": SamplingParams(max_tokens=16),
-        "delegating_parser": DelegatingParser(),
-        "parser_previous_text": "",
-        "parser_previous_token_ids": [],
-        "decoder_visible_text": "",
-    })
+    rd = RequestRecord(
+        **{
+            "last_decoded_index": 0,
+            "last_decode_time": time.perf_counter(),
+            "sampling_params": SamplingParams(max_tokens=16),
+            "delegating_parser": DelegatingParser(),
+            "parser_previous_text": "",
+            "parser_previous_token_ids": [],
+            "decoder_visible_text": "",
+        }
+    )
     parsed, _raw, _raw_delta, _stop_hit, _stop_reason = pipeline._decode_and_parse(
         "req-1", rd, [1], time.perf_counter(), finished=False
     )

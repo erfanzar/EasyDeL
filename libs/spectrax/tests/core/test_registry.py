@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import pytest
-
 from spectrax.core.module import Module
 from spectrax.core.registry import qualified_name, resolve_class
 from spectrax.core.variable import Parameter, Variable

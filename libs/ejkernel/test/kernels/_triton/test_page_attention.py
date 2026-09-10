@@ -22,7 +22,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from ejkernel.kernels._triton import page_attention
 from ejkernel.kernels._xla.page_attention import page_attention as xla_page_attention
 

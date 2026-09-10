@@ -29,10 +29,9 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import easydel as ed
 import jax
 from datasets import load_dataset
-
-import easydel as ed
 
 if __package__ in {None, ""}:
     sys.path.append(str(Path(__file__).resolve().parent))

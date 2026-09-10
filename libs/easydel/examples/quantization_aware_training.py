@@ -137,16 +137,12 @@ def main() -> None:
 
     baseline_ms, baseline_losses = train(None, tokens, labels)
     print(
-        f"{'bfloat16':24s} {baseline_ms * 1e3:8.2f}m {1.0:7.2f}x   "
-        f"{baseline_losses[0]:7.3f} {baseline_losses[-1]:9.4f}"
+        f"{'bfloat16':24s} {baseline_ms * 1e3:8.2f}m {1.0:7.2f}x   {baseline_losses[0]:7.3f} {baseline_losses[-1]:9.4f}"
     )
 
     for preset in ("int8", "int4"):
         step_ms, losses = train(preset, tokens, labels)
-        print(
-            f"{preset:24s} {step_ms * 1e3:8.2f}m {baseline_ms / step_ms:7.2f}x   "
-            f"{losses[0]:7.3f} {losses[-1]:9.4f}"
-        )
+        print(f"{preset:24s} {step_ms * 1e3:8.2f}m {baseline_ms / step_ms:7.2f}x   {losses[0]:7.3f} {losses[-1]:9.4f}")
 
     print("\nBoth quantized runs should track the bfloat16 loss curve.")
     print("Serving the result: model.quantize(...) applies the matching post-training format.")

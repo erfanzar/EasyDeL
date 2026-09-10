@@ -19,7 +19,6 @@ import os
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import jax
-
 import spectrax as spx
 from spectrax.runtime.schedules import (
     DualPipeV,

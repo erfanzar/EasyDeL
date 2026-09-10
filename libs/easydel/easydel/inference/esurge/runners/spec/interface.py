@@ -231,7 +231,9 @@ class SpeculativeStrategy(typing.Protocol):
         """Replay the executor step over the committed speculative prefix."""
         ...
 
-    def run_suffix_sample(self, row_pos: int, start_len: int, suffix_len: int = 1, **kwargs: typing.Any) -> tuple[int, jax.Array]:
+    def run_suffix_sample(
+        self, row_pos: int, start_len: int, suffix_len: int = 1, **kwargs: typing.Any
+    ) -> tuple[int, jax.Array]:
         """Execute a one-row suffix forward pass; return sampled token + hidden row."""
         ...
 
