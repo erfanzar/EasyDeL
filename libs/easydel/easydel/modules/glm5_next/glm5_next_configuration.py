@@ -203,6 +203,7 @@ class Glm5NextTextConfig(EasyDeLBaseConfig):
         q_lora_rank: int | None = 1536,
         qk_rope_head_dim: int = 0,
         mla_cache_rope_width: int = 128,
+        use_paged_indexer_gather: bool = False,
         indexer_max_rows: int = 8,
         qk_nope_head_dim: int = 256,
         v_head_dim: int = 256,
@@ -301,10 +302,16 @@ class Glm5NextTextConfig(EasyDeLBaseConfig):
         # ``_create_mla_ragged_page_cache_config``): zero information, keeps
         # the Pallas rope component 128-aligned for NoPE serving.
         self.mla_cache_rope_width = mla_cache_rope_width
-        # Per-token indexer packed-state width ([key | gate | valid]); read by
-        # ``_create_mla_ragged_page_cache_config`` to size the per-request
-        # indexer-state sidecar on the MLA ragged cache views.
-        self.indexer_packed_dim = 2 * index_head_dim + 1
+        # Per-token indexer packed-state width ([key | gate | valid]); when
+        # set, ``_create_mla_ragged_page_cache_config`` sizes a per-request
+        # indexer-state sidecar on the MLA ragged cache views and the DSA
+        # serving decode switches to full-context top-k gather attention.
+        # OFF by default: the gather path materializes the padded
+        # [rows, max_model_len, packed_dim] window per DSA layer per decode
+        # step, which measured 145x slower decode than the dense ragged
+        # kernel (3.05 s/step vs 21 ms at 262k ctx on v5p-4). Re-enable only
+        # with the incremental pool-summary redesign.
+        self.indexer_packed_dim = 2 * index_head_dim + 1 if use_paged_indexer_gather else None
         # Request slots covered by the sidecar; must be >= eSurge
         # ``max_num_seqs`` (the serving batch width).
         self.indexer_max_rows = indexer_max_rows
