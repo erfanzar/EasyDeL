@@ -2366,6 +2366,10 @@ class EasyGenerationMixin:
         cache_rope_width = getattr(text_config, "mla_cache_rope_width", None)
         if cache_rope_width is not None:
             qk_rope_head_dim = int(cache_rope_width)
+            if qk_rope_head_dim < 0:
+                raise ValueError(
+                    f"`mla_cache_rope_width` must be non-negative, got {cache_rope_width}."
+                )
 
         mla_num_heads = getattr(text_config, "num_attention_heads", None)
         if mla_num_heads is None:

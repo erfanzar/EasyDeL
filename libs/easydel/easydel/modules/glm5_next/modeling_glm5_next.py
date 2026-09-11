@@ -1288,9 +1288,15 @@ class Glm5NextLinearAttention(spx.Module):
         q_row, k_row, v_row = query[0], key[0], value[0]
         b_row, g_row = beta[0], decay[0]
 
+        # Index-clamped gather (NOT start-clamped slicing): the token bucket
+        # is padded to the compile width, so `starts[i] + seq` routinely
+        # overruns the buffer and a start-clamped dynamic_slice would clamp
+        # back to 0, silently feeding row 0's tokens to every later row.
         def gather(x):
-            return jax.vmap(lambda s: jax.lax.dynamic_slice_in_dim(x, s, seq, axis=0))(starts)
+            idx = jnp.clip(starts[:, None] + ar_post[None, :], 0, x.shape[0] - 1)
+            return x[idx]
 
+        ar_post = jnp.arange(seq)
         q_r, k_r, v_r = gather(q_row), gather(k_row), gather(v_row)
         b_r, g_r = gather(b_row), gather(g_row)
 
@@ -1335,7 +1341,11 @@ class Glm5NextLinearAttention(spx.Module):
                 out = out + stream[:, m : m + seq, :] * kern[:, m][None, None, :]
             out = jax.nn.silu(out).astype(conv_dtype)
             conv_outs[name] = out
-            candidate = stream[:, -d_conv:, :].transpose(0, 2, 1)  # [rows, d, d_conv] trailing window
+            # New state = the trailing window ending at this row's LAST real
+            # token (stream offset dc-1+lens), not the padded bucket tail.
+            win_start = jnp.clip(lens - 1, 0, seq - 1)  # [rows]
+            win_idx = win_start[:, None] + jnp.arange(d_conv)[None, :]
+            candidate = stream[jnp.arange(rows)[:, None], win_idx].transpose(0, 2, 1)  # [rows, d, d_conv]
             keep = (lens > 0)[:, None, None]
             new_conv[name] = jnp.where(keep, candidate, st).astype(conv_states[name].dtype)
 
@@ -1353,12 +1363,15 @@ class Glm5NextLinearAttention(spx.Module):
         all_single = jnp.all(lens <= 1)
 
         def _single_path():
+            # qh/kh/vh are [R, H, T, D]; the kernel contract is BTHD
+            # [batch, seq=1, heads, dim] — take seq position 0 (each row's
+            # only token) and transpose the head axis into place.
             out1, new_state = _single_step_kda_per_channel_fwd_bthd(
-                query=qh[:, :, :1, :],
-                key=kh[:, :, :1, :],
-                value=vh[:, :, :1, :],
-                beta=bh[:, :, :1],
-                decay=gh[:, :, :1, :],
+                query=qh[:, :, :1, :].transpose(0, 2, 1, 3),
+                key=kh[:, :, :1, :].transpose(0, 2, 1, 3),
+                value=vh[:, :, :1, :].transpose(0, 2, 1, 3),
+                beta=bh[:, :, :1].transpose(0, 2, 1),
+                decay=gh[:, :, :1, :].transpose(0, 2, 1, 3),
                 recurrent_state=init_state,
                 use_qk_l2norm=True,
             )

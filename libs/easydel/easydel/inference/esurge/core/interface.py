@@ -791,9 +791,17 @@ def create_kv_cache_specs_from_config(
             default_num_kv_heads=num_kv_heads,
             default_head_size=head_size,
         )
+        # Linear-attention layers keep no token KV pages of their own; per
+        # ``AttnMaskType.from_hf`` (and the enum docstring) they group with
+        # full-attention layers for scheduler compatibility. Normalized
+        # BEFORE grouping so geometry-equal LINEAR and FULL layers merge
+        # into one cache group instead of inflating page demand.
+        mask_type = detail.mask_type
+        if mask_type == AttnMaskType.LINEAR:
+            mask_type = AttnMaskType.FULL
         groups[
             (
-                detail.mask_type,
+                mask_type,
                 detail.size,
                 detail.chunks,
                 layer_num_kv_heads,

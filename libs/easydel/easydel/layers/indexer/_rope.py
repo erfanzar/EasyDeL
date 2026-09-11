@@ -95,7 +95,12 @@ def apply_indexer_rope(
         raise ValueError(f"rope style must be 'split_half', 'interleaved' or 'none', got {style!r}.")
 
     rotary_dim = cos.shape[-1]
-    if style == "split_half" and rotary_dim <= x.shape[-1]:
+    if style == "split_half":
+        if rotary_dim > x.shape[-1]:
+            raise ValueError(
+                f"split_half RoPE received a cos table (width {rotary_dim}) wider than the feature dim "
+                f"({x.shape[-1]}); truncate the table or use a narrower rope_dim."
+            )
         # Pre-doubled tables ([half | half]) carry the full rotated width.
         x_rot, x_pass = x[..., :rotary_dim], x[..., rotary_dim:]
         rotated = x_rot * cos + _rotate_half(x_rot) * sin
