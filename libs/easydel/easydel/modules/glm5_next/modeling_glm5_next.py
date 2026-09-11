@@ -1773,8 +1773,9 @@ class Glm5NextDSAAttention(UnifiedAttention):
         value_states = value_states.transpose(0, 2, 1, 3)
 
         cached_packed_states = None
-        has_recurrent_slot = cache_view is not None and hasattr(cache_view, "recurrent_state")
-        if has_recurrent_slot:
+        if cache_view is not None and hasattr(cache_view, "recurrent_state") and not isinstance(
+            cache_view, MLARaggedPagesCacheView
+        ):
             maybe_cached = getattr(cache_view, "recurrent_state", None)
             if (
                 maybe_cached is not None
@@ -1791,23 +1792,6 @@ class Glm5NextDSAAttention(UnifiedAttention):
                 q_mask = q_mask[:, :q_len]
             q_mask = q_mask.astype(bool)
 
-        indexer_out = self.indexer(
-            hidden_states=hidden_states,
-            q_resid=q_resid,
-            attention_mask=q_mask,
-            cached_packed=cached_packed_states,
-        )
-        topk_indices, packed_states = indexer_out.topk_indices, indexer_out.packed_state
-
-        if has_recurrent_slot and hasattr(cache_view, "replace"):
-            try:
-                cache_view = cache_view.replace(recurrent_state=packed_states.astype(cache_view.key.dtype))
-            except TypeError:
-                logger.warning_once(
-                    "Failed to store indexer packed states in cache_view.recurrent_state; "
-                    "cache structure may not support recurrent_state."
-                )
-
         causal_for_kernel = self.causal
         if mask_info is not None and getattr(mask_info, "_causal_baked", False):
             causal_for_kernel = False
@@ -1823,7 +1807,9 @@ class Glm5NextDSAAttention(UnifiedAttention):
         # cache rope width (``mla_cache_rope_width``, 128-aligned for the
         # Pallas MLA kernel), which contributes nothing to the scores.
         absorbed_w_v = None
-        mla_kwargs: dict = {}
+        q_absorbed = None
+        mla_softmax_scale = None
+        rope_width = 0
         if isinstance(cache_view, MLARaggedPagesCacheView):
             w = self.mla_kv_b_proj.weight.value
             local_heads = w.shape[1] // (self.qk_nope_head_dim + self.v_head_dim)
@@ -1846,69 +1832,239 @@ class Glm5NextDSAAttention(UnifiedAttention):
             )
             value_states = key_states
 
+            mla_softmax_scale = (self.qk_nope_head_dim + self.config.qk_rope_head_dim) ** -0.5
+
             mla_kwargs = {
                 "queries_nope": query_states,
                 "queries_pe": jnp.zeros((bsz, q_len, self.num_heads, rope_width), query_states.dtype),
                 "keys_values": compressed_kv,
                 "keys_pe": jnp.zeros((bsz, q_len, rope_width), compressed_kv.dtype),
-                "softmax_scale": (self.qk_nope_head_dim + self.config.qk_rope_head_dim) ** -0.5,
+                "softmax_scale": mla_softmax_scale,
             }
-
-        (
-            key_states,
-            value_states,
-            mask_info,
-            init_attention_bias,
-            cache_view,
-            cache_metadata,
-        ) = self.concatenate(
-            query=query_states,
-            key=key_states,
-            value=value_states,
-            cache_view=cache_view,
-            cache_metadata=cache_metadata,
-            mask_info=mask_info,
-        )
-
-        if topk_indices is not None:
-            kv_len = key_states.shape[1]
-            if q_len == kv_len or cached_packed_states is not None:
-                topk_mask = jnp.any(jax.nn.one_hot(topk_indices, kv_len, dtype=jnp.bool_), axis=-2)
-                attention_mask = (
-                    pairwise_attention_mask_from_mask_info(mask_info, q_len, kv_len) if mask_info is not None else None
-                )
-                if attention_mask is not None:
-                    mask_info = mask_info.replace(attention_mask=(attention_mask & topk_mask)[:, None, :, :])
-
-        softmax_aux = self._softmax_aux()
-
-        attentions = self.attention_performer.forward(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            mode=mode,
-            bias=None,
-            cache_metadata=cache_metadata,
-            cache_view=cache_view,
-            init_bias=init_attention_bias,
-            mask_info=mask_info,
-            causal=causal_for_kernel,
-            sliding_window=sliding_window_for_kernel,
-            softmax_aux=softmax_aux,
-            **mla_kwargs,
-        )
-
-        attn_out = attentions.attention_outputs
-        if absorbed_w_v is not None and attn_out.ndim == 3:
-            # Kernel output: [total_tokens, N, kv_lora_rank] -> project W_v.
-            attn_out = jnp.einsum(
-                "thk,khv->thv",
-                attn_out.astype(jnp.float32),
-                absorbed_w_v.astype(jnp.float32),
-            ).astype(attn_out.dtype)
-            attn_output = attn_out.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
         else:
-            attn_output = self._merge_heads(attentions.attention_outputs)
+            mla_kwargs = {}
+
+        # ---- persistent per-request indexer state (paged serving) --------
+        # The MLA ragged view may carry a ``recurrent_state`` sidecar
+        # ``[rows, max_len, packed_dim]`` (allocated when the model config
+        # sets ``indexer_packed_dim``). Decode steps then run the indexer
+        # per request row with the sidecar-cached prefix and select top-k
+        # via a gather over the page table — the HF deepseek-sparse
+        # semantics — instead of dense attention over every cached token.
+        sidecar = (
+            cache_view.recurrent_state
+            if isinstance(cache_view, MLARaggedPagesCacheView) and cache_view is not None
+            else None
+        )
+        qsl = getattr(cache_metadata, "query_start_loc", None) if cache_metadata is not None else None
+        pages_tables = getattr(cache_metadata, "pages_tables", None) if cache_metadata is not None else None
+        paged_indexer = (
+            sidecar is not None
+            and qsl is not None
+            and pages_tables is not None
+            and int(qsl.shape[0] - 1) <= min(int(sidecar.shape[0]), int(pages_tables.shape[0]))
+        )
+        decode_path = jnp.asarray(False)
+        row_lens = ctx_lens = None
+        if paged_indexer:
+            rows = int(qsl.shape[0] - 1)
+            row_lens = qsl[1:] - qsl[:-1]
+            ctx_lens = jnp.asarray(cache_metadata.context_lens, dtype=jnp.int32)[:rows]
+            decode_path = jnp.all(row_lens <= 1)
+
+        def _write_sidecar_packed(sc, fresh_packed):
+            """Scatter packed-stream fresh states ``[1, T, packed_dim]`` into
+            the sidecar: token ``t`` belongs to row ``seg_ids[t]`` at context
+            position ``ctx_start[row] + t - qsl[row]``."""
+            max_len = int(sc.shape[1])
+            tokens = int(fresh_packed.shape[1])
+            ar_t = jnp.arange(tokens)
+            seg = jnp.clip(jnp.sum(qsl[1:, None] <= ar_t[None, :], axis=0), 0, sc.shape[0] - 1)
+            ctx_start = jnp.clip(ctx_lens - row_lens, 0, max_len - 1)
+            pos = ctx_start[seg] + (ar_t - qsl[seg])
+            idx = jnp.clip(seg * max_len + pos, 0, sc.shape[0] * max_len - 1)
+            flat = sc.reshape(sc.shape[0] * max_len, sc.shape[2])
+            return flat.at[idx].set(fresh_packed[0].astype(sc.dtype)).reshape(sc.shape)
+
+        def _write_sidecar_rows(sc, fresh_rows):
+            """Scatter per-row fresh states ``[rows, 1, packed_dim]`` into the
+            sidecar at each active row's latest context position."""
+            max_len = int(sc.shape[1])
+            pos = jnp.clip(ctx_lens - 1, 0, max_len - 1)
+            idx = jnp.clip(
+                jnp.arange(sc.shape[0]) * max_len + pos,
+                0,
+                sc.shape[0] * max_len - 1,
+            )
+            flat = sc.reshape(sc.shape[0] * max_len, sc.shape[2])
+            old = flat[idx]
+            keep = (row_lens > 0)[:, None]
+            payload = jnp.where(keep, fresh_rows[:, 0, :].astype(sc.dtype), old.astype(sc.dtype))
+            return flat.at[idx].set(payload).reshape(sc.shape)
+
+        def _dense_attention_path():
+            """Prefill / chunked prefill: ragged kernel over the packed
+            stream (dense scoring), indexer on the packed window, fresh
+            states persisted to the sidecar for subsequent decode steps."""
+            indexer_out = self.indexer(
+                hidden_states=hidden_states,
+                q_resid=q_resid,
+                attention_mask=q_mask,
+                cached_packed=cached_packed_states,
+            )
+            topk_dense, packed_dense = indexer_out.topk_indices, indexer_out.packed_state
+
+            new_sidecar = sidecar
+            if sidecar is not None:
+                new_sidecar = _write_sidecar_packed(sidecar, packed_dense)
+
+            (
+                key_s,
+                value_s,
+                mask_s,
+                bias_s,
+                view_s,
+                metadata_s,
+            ) = self.concatenate(
+                query=query_states,
+                key=key_states,
+                value=value_states,
+                cache_view=cache_view,
+                cache_metadata=cache_metadata,
+                mask_info=mask_info,
+            )
+            if topk_dense is not None:
+                kv_len = key_s.shape[1]
+                if q_len == kv_len or cached_packed_states is not None:
+                    topk_mask = jnp.any(jax.nn.one_hot(topk_dense, kv_len, dtype=jnp.bool_), axis=-2)
+                    attention_mask = (
+                        pairwise_attention_mask_from_mask_info(mask_s, q_len, kv_len) if mask_s is not None else None
+                    )
+                    if attention_mask is not None:
+                        mask_s = mask_s.replace(attention_mask=(attention_mask & topk_mask)[:, None, :, :])
+
+            attentions = self.attention_performer.forward(
+                query_states=query_states,
+                key_states=key_s,
+                value_states=value_s,
+                mode=mode,
+                bias=None,
+                cache_metadata=metadata_s,
+                cache_view=view_s,
+                init_bias=bias_s,
+                mask_info=mask_s,
+                causal=causal_for_kernel,
+                sliding_window=sliding_window_for_kernel,
+                softmax_aux=self._softmax_aux(),
+                **mla_kwargs,
+            )
+            attn_out = attentions.attention_outputs
+            if absorbed_w_v is not None and attn_out.ndim == 3:
+                # Kernel output: [total_tokens, N, kv_lora_rank] -> project W_v.
+                attn_out = jnp.einsum(
+                    "thk,khv->thv",
+                    attn_out.astype(jnp.float32),
+                    absorbed_w_v.astype(jnp.float32),
+                ).astype(attn_out.dtype)
+                out = attn_out.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
+            else:
+                out = self._merge_heads(attentions.attention_outputs)
+            return out, view_s, new_sidecar, attentions.attention_weights
+
+        def _paged_decode_path():
+            """Decode: per-request indexer over the full sidecar-backed
+            context, top-k gather from the page table, restricted attention.
+            Restores HF deepseek-sparse scoring (each query attends only to
+            its selected ``index_topk`` tokens) at 1-token-per-row steps."""
+            max_len = int(sidecar.shape[1])
+            ctx_prev = jnp.clip(ctx_lens - row_lens, 0, max_len)
+            ar_c = jnp.arange(max_len)
+            gather_idx = jnp.minimum(ar_c[None, :], jnp.maximum(ctx_prev[:, None] - 1, 0))
+            cached_states = sidecar[jnp.arange(rows)[:, None], gather_idx]
+            cached_states = jnp.where((ar_c[None, :] < ctx_prev[:, None])[..., None], cached_states, 0)
+
+            safe_pos = jnp.clip(qsl[:-1], 0, q_len - 1)
+            new_hidden = hidden_states[0, safe_pos][:, None, :]
+            new_qresid = q_resid[0, safe_pos][:, None, :]
+            indexer_out = self.indexer(
+                hidden_states=new_hidden,
+                q_resid=new_qresid,
+                attention_mask=jnp.ones((rows, 1), dtype=jnp.bool_),
+                cached_packed=cached_states,
+            )
+            topk = indexer_out.topk_indices[:, 0, :]  # [rows, K]; -1 padded
+            fresh = indexer_out.packed_state[:, max_len:, :]  # [rows, 1, packed_dim]
+            new_sidecar = _write_sidecar_rows(sidecar, fresh)
+
+            kv_pages = cache_view.flattened_kv_pages()
+            num_pages, psp, packing, kv_dim = kv_pages.shape
+            page_tokens = psp * packing
+            kv_lora = int(self.kv_lora_rank)
+
+            # scatter this step's latent into the page table
+            write_pos = jnp.clip(ctx_lens - 1, 0, max_len - 1)
+            row_ar = jnp.arange(rows)
+            flat_write = (
+                pages_tables[row_ar, write_pos // page_tokens] * page_tokens + write_pos % page_tokens
+            )
+            new_latent = compressed_kv[0, safe_pos]  # [rows, kv_lora_rank]
+            new_kv_row = jnp.concatenate(
+                [new_latent, jnp.zeros((rows, kv_dim - kv_lora), new_latent.dtype)],
+                axis=-1,
+            )
+            kv_flat = kv_pages.reshape(num_pages * page_tokens, kv_dim)
+            kv_flat = kv_flat.at[flat_write].set(new_kv_row.astype(kv_pages.dtype))
+            kv_pages = kv_flat.reshape(num_pages, psp, packing, kv_dim)
+
+            # gather the selected tokens (HF top-k scoring)
+            tk = jnp.clip(topk, 0, jnp.maximum(ctx_lens[:, None] - 1, 0))  # [rows, K]
+            tk_valid = topk >= 0
+            flat_tk = pages_tables[row_ar[:, None], tk // page_tokens] * page_tokens + tk % page_tokens
+            gathered = kv_flat[flat_tk]  # [rows, K, kv_dim]
+            latent = gathered[..., :kv_lora].astype(jnp.float32)
+
+            scores = jnp.einsum(
+                "rhd,rkd->rhk",
+                q_absorbed[0, safe_pos].astype(jnp.float32),  # [rows, H, kv_lora]
+                latent,
+                precision=self.precision,
+            ) * jnp.asarray(mla_softmax_scale, jnp.float32)
+            neg = jnp.finfo(jnp.float32).min
+            scores = jnp.where(tk_valid[:, None, :], scores, neg)
+            probs = jax.nn.softmax(scores, axis=-1)
+            v_gathered = jnp.einsum(
+                "rkd,dhv->rkhv",
+                latent,
+                absorbed_w_v.astype(jnp.float32),
+                precision=self.precision,
+            )
+            attn_out = jnp.einsum("rhk,rkhv->rhv", probs, v_gathered).astype(hidden_states.dtype)
+
+            # scatter per-row outputs back into the packed stream
+            out_rows = jnp.zeros((1, q_len, self.num_heads, self.v_head_dim), dtype=hidden_states.dtype)
+            active = (row_lens > 0)[:, None, None]
+            upd = jnp.where(active, attn_out, 0)
+            out_rows = out_rows.at[0, safe_pos].add(upd)
+            out = out_rows.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
+
+            view_s = MLARaggedPagesCacheView(
+                metadata=cache_view.metadata,
+                layer_index=cache_view.layer_index,
+                kv_pages=kv_pages,
+                recurrent_state=new_sidecar,
+                runtime_sharding_resolver=cache_view.runtime_sharding_resolver,
+            )
+            return out, view_s, new_sidecar, None
+
+        if paged_indexer:
+            attn_output, cache_view, _, attn_weights = jax.lax.cond(
+                decode_path,
+                _paged_decode_path,
+                _dense_attention_path,
+            )
+        else:
+            attn_output, cache_view, _, attn_weights = _dense_attention_path()
+
         expected_attn_dim = self.num_heads * self.v_head_dim
         if attn_output.shape[-1] != expected_attn_dim:
             actual_attn_dim = int(attn_output.shape[-1])
@@ -1923,7 +2079,7 @@ class Glm5NextDSAAttention(UnifiedAttention):
 
         return AttentionLayerOutput(
             attention_output=attn_output,
-            attention_weight=attentions.attention_weights if output_attentions else None,
+            attention_weight=attn_weights if output_attentions else None,
             cache_view=cache_view,
         )
 

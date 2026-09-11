@@ -203,6 +203,7 @@ class Glm5NextTextConfig(EasyDeLBaseConfig):
         q_lora_rank: int | None = 1536,
         qk_rope_head_dim: int = 0,
         mla_cache_rope_width: int = 128,
+        indexer_max_rows: int = 8,
         qk_nope_head_dim: int = 256,
         v_head_dim: int = 256,
         n_group: int = 1,
@@ -300,6 +301,13 @@ class Glm5NextTextConfig(EasyDeLBaseConfig):
         # ``_create_mla_ragged_page_cache_config``): zero information, keeps
         # the Pallas rope component 128-aligned for NoPE serving.
         self.mla_cache_rope_width = mla_cache_rope_width
+        # Per-token indexer packed-state width ([key | gate | valid]); read by
+        # ``_create_mla_ragged_page_cache_config`` to size the per-request
+        # indexer-state sidecar on the MLA ragged cache views.
+        self.indexer_packed_dim = 2 * index_head_dim + 1
+        # Request slots covered by the sidecar; must be >= eSurge
+        # ``max_num_seqs`` (the serving batch width).
+        self.indexer_max_rows = indexer_max_rows
         self.qk_nope_head_dim = qk_nope_head_dim
         # HF convention: `head_dim` tracks the RoPE dim (0 here); the effective
         # Q/K width lives on `qk_head_dim`.

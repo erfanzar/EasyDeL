@@ -29,7 +29,7 @@ import spectrax as spx
 from eformer.jaximus import ImplicitArray
 from eformer.loggings import get_logger
 from eformer.mpric import DTYPE_TO_STRING_MAP
-from eformer.pytree import auto_pytree
+from eformer.pytree import auto_pytree, field
 from jax.sharding import NamedSharding as Ns
 from jaxtyping import Array, Float
 from spectrax import common_types
@@ -69,17 +69,17 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
 
     Extends :class:`RaggedPagesCacheConfig` for architectures (e.g. DeepSeek-V2/v1)
     that compress key-value projections into a single low-rank latent per token.
-    Instead of separate K and V page buffers, each page stores a unified compressed
-    KV state with shape
-    ``[num_pages, page_size_per_kv_packing, kv_packing, kv_dim_padded]``.
 
-    The compressed dimension (``kv_dim_padded``) is composed of two independently
-    128-aligned components: ``kv_lora_rank`` (the low-rank projection size) and
-    ``qk_rope_head_dim`` (the RoPE-specific head dimension).
-
-    Use :meth:`create` to build a config from model hyperparameters; the factory
-    automatically computes page counts from available HBM.
+    Attributes:
+        indexer_packed_dim: Optional per-token indexer state width. When set,
+            layer views allocate a ``recurrent_state`` sidecar so sparse
+            indexer layers can persist packed states across serving steps.
+        indexer_max_rows: Row (request-slot) count of the indexer sidecar.
+            Only used when ``indexer_packed_dim`` is set.
     """
+
+    indexer_packed_dim: int | None = field(pytree_node=False, default=None)
+    indexer_max_rows: int = field(pytree_node=False, default=8)
 
     @staticmethod
     def _compute_free_hbm(
@@ -127,6 +127,8 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
         page_size: int = 128,
         version: tp.Literal["v1"] = "v1",
         max_cache_tokens: int | None = None,
+        indexer_packed_dim: int | None = None,
+        indexer_max_rows: int = 8,
     ) -> "MLARaggedPagesCacheConfig":
         """Create an MLA ragged-page cache config from model hyperparameters.
 
@@ -162,6 +164,13 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
                 page pool may hold (``num_pages * page_size``); the final page
                 count is ``min(hbm_utilization-derived, this)``. ``None`` keeps
                 pure HBM sizing.
+            indexer_packed_dim: Optional per-token indexer state width. When
+                set, every layer view allocates an extra ``recurrent_state``
+                sidecar ``[max_num_reqs, max_model_length, indexer_packed_dim]``
+                (bf16) so sparse-indexer layers (e.g. GLM-5 DSA, DeepSeek
+                sparse attention) can persist their packed key/gate/valid
+                states across serving steps. ``None`` (default) allocates no
+                sidecar — zero impact on non-indexer MLA families.
 
         Returns:
             A fully initialized :class:`MLARaggedPagesCacheConfig`.
@@ -261,6 +270,8 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
             ),
             version="v1",
             _kvdtype_str=DTYPE_TO_STRING_MAP[kvdtype.type if hasattr(kvdtype, "type") else kvdtype],
+            indexer_packed_dim=indexer_packed_dim,
+            indexer_max_rows=int(indexer_max_rows),
         )
 
     @property
@@ -334,10 +345,16 @@ class MLARaggedPagesCacheView(RaggedPagesCacheView):
         kv_pages: Compressed KV page buffer of shape
             ``[num_pages, page_size_per_kv_packing, kv_packing, kv_dim_padded]``,
             or an ``ImplicitArray`` when quantization is applied.
+        recurrent_state: Optional per-request indexer state sidecar of shape
+            ``[indexer_max_rows, max_model_length, indexer_packed_dim]``.
+            Allocated only when the config sets ``indexer_packed_dim``; sparse
+            indexer layers persist their packed key/gate/valid states here so
+            top-k scoring sees the full context on every serving step.
     """
 
     metadata: MLARaggedPagesCacheConfig
     kv_pages: Float[Array, "num_pages page_size_per_kv_packing kv_packing kv_dim_padded"] | ImplicitArray
+    recurrent_state: Float[Array, "max_num_reqs max_model_length indexer_packed_dim"] | None = None
 
     @classmethod
     def init(
@@ -379,10 +396,31 @@ class MLARaggedPagesCacheView(RaggedPagesCacheView):
         with jax.named_scope("easydel-mla-ragged-cache-init"):
             kv_pages = quantizer(jnp.zeros(shape=kv_pages_shape, dtype=config.kvdtype, device=kv_pages_sharding))
 
+        recurrent_state = None
+        if getattr(config, "indexer_packed_dim", None):
+            rows = int(getattr(config, "indexer_max_rows", 8) or 8)
+            sidecar_shape = (rows, int(config.max_model_length), int(config.indexer_packed_dim))
+            sidecar_sharding = Ns(
+                mesh=mesh,
+                spec=runtime_sharding_resolver.resolve(
+                    axes=[ATTN_DP if config.data_parallel_size > 1 else common_types.EMPTY]
+                    + [common_types.EMPTY] * (len(sidecar_shape) - 1),
+                    mode=common_types.MODE_PREFILL,
+                    shape=sidecar_shape,
+                ),
+            )
+            recurrent_state = jnp.zeros(shape=sidecar_shape, dtype=jnp.bfloat16, device=sidecar_sharding)
+            logger.info(
+                "Allocated MLA indexer state sidecar %s (%.2f GiB/layer)",
+                sidecar_shape,
+                rows * int(config.max_model_length) * int(config.indexer_packed_dim) * 2 / 2**30,
+            )
+
         return cls(
             metadata=config,
             layer_index=layer_index or 0,
             kv_pages=kv_pages,
+            recurrent_state=recurrent_state,
             runtime_sharding_resolver=runtime_sharding_resolver,
         )
 
