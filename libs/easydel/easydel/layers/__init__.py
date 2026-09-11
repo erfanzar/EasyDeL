@@ -38,6 +38,7 @@ Submodules:
 """
 
 from .embeddings import Embed
+from .indexer import IndexerConfig, IndexerKind, IndexerOutput, SparseIndexer
 from .layouts import (
     FusedColumnLayout,
     FusedExpertLayout,
@@ -154,6 +155,9 @@ __all__ = [
     "FusedExpertLayout",
     "FusedSegment",
     "GatedResidual",
+    "IndexerConfig",
+    "IndexerKind",
+    "IndexerOutput",
     "LinearScalingRotaryEmbedding",
     "Llama3RotaryEmbedding",
     "MoEMethods",
@@ -176,6 +180,7 @@ __all__ = [
     "RowParallelLinear",
     "RowParallelLinearQuantized",
     "RowParallelMoELinear",
+    "SparseIndexer",
     "YaRNScalingRotaryEmbedding",
     "apply_quantization_rules",
     "build_fused_gate_up_projection",
