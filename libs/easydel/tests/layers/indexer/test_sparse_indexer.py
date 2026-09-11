@@ -171,6 +171,72 @@ def test_shared_indexer_short_circuit():
     assert out.packed_state is None
 
 
+def test_pool_decode_matches_full_forward():
+    """Decode (q_len=1) with carried state must select the same tokens as the
+    trailing row of a full forward over the concatenated stream: scores are
+    deterministic, so this is an exact oracle for the decode path."""
+    kpool = 4
+    config = IndexerConfig(
+        kind=IndexerKind.POOL,
+        index_n_heads=H,
+        index_head_dim=D,
+        index_topk=TOPK,
+        hidden_size=HID,
+        q_input_dim=HID,
+        score_activation="relu",
+        head_reduction="weighted",
+        packed_state="key_gate_valid",
+        stop_gradient=True,
+        kpool_size=kpool,
+        select_tail=True,
+    )
+    _indexer, _params, bound = _make(config)
+    hidden = jax.random.normal(jax.random.PRNGKey(0), (1, 2 * S, HID), dtype=jnp.float32)
+    q_resid = jax.random.normal(jax.random.PRNGKey(1), (1, 2 * S, HID), dtype=jnp.float32)
+
+    full = bound(hidden_states=hidden, q_resid=q_resid, attention_mask=None, cached_packed=None)
+    # decode: last token only, carrying everything before it
+    step_hidden = hidden[:, -1:]
+    step_q = q_resid[:, -1:]
+    cached = first.packed_state if (first := bound(hidden_states=hidden[:, : 2 * S - 1], q_resid=q_resid[:, : 2 * S - 1], attention_mask=None, cached_packed=None)) else None
+    dec = bound(hidden_states=step_hidden, q_resid=step_q, attention_mask=None, cached_packed=cached)
+
+    ref = full.topk_indices[0, -1]
+    got = dec.topk_indices[0, 0]
+    # both select the same token set (order can differ between top-k calls on
+    # ties, but scores are continuous random — ties are measure-zero)
+    ref_set = set(int(x) for x in ref if x != -1)
+    got_set = set(int(x) for x in got if x != -1)
+    assert ref_set == got_set
+
+
+def test_rope_split_half_matches_hand_reference():
+    """split_half RoPE vs a hand-rotated reference (rotate-half pairing)."""
+    from easydel.layers.indexer import apply_indexer_rope
+
+    dim, rotary = 8, 4
+    x = jax.random.normal(jax.random.PRNGKey(0), (2, 5, dim), dtype=jnp.float32)
+    cos = jnp.asarray(np.tile(np.cos(np.arange(rotary // 2)), 2).reshape(1, 1, rotary), dtype=jnp.float32)
+    sin = jnp.asarray(np.tile(np.sin(np.arange(rotary // 2)), 2).reshape(1, 1, rotary), dtype=jnp.float32)
+
+    out = apply_indexer_rope(x, cos, sin, style="split_half")
+    x1, x2 = x[..., : rotary // 2], x[..., rotary // 2 : rotary]
+    c, s = cos[..., : rotary // 2], sin[..., : rotary // 2]
+    ref = jnp.concatenate([x1 * c - x2 * s, x2 * c + x1 * s, x[..., rotary:]], axis=-1)
+    np.testing.assert_allclose(np.asarray(out), np.asarray(ref), atol=1e-6)
+
+
+def test_config_rejects_bad_rope_and_pool_state():
+    with pytest.raises(ValueError):
+        IndexerConfig(rope_dim=HID + 1)  # wider than head dim
+    with pytest.raises(ValueError):
+        IndexerConfig(rope_dim=7)  # odd
+    with pytest.raises(ValueError):
+        IndexerConfig(kind=IndexerKind.POOL, packed_state="keys")
+    with pytest.raises(ValueError):
+        IndexerConfig(kind=IndexerKind.POOL, packed_state="none")
+
+
 def test_config_validation():
     with pytest.raises(ValueError):
         IndexerConfig(kind="bogus")

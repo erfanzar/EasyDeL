@@ -86,7 +86,10 @@ from easydel.infra.modeling_outputs import (
     DecoderLayerOutput,
     MoeModelOutput,
 )
-from easydel.infra.sequence_packing import pairwise_attention_mask_from_mask_info
+from easydel.infra.sequence_packing import (
+    packed_segment_ids_from_mask_info,
+    pairwise_attention_mask_from_mask_info,
+)
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, blockwise_ffn
 from easydel.layers import (
     BaseMoeModule,
@@ -1102,11 +1105,16 @@ class Glm5NextLinearAttention(spx.Module):
             if q_mask is not None and q_mask.shape[1] != hidden_states.shape[1]:
                 q_mask = q_mask[:, : hidden_states.shape[1]]
             hidden_states = apply_mask_to_padding_states(hidden_states, q_mask)
-        # NOTE: packed-segment conv resets (kimi's ``segment_ids`` threading)
-        # are intentionally not wired here yet: the generation loop's mask
-        # spans the full window, which mis-shapes the segmented conv scan.
-        # Unpacked-batch training/decode is unaffected (padding is zeroed
-        # above; the delta rule is causal by construction).
+        # Packed-segment resets (kimi's ``segment_ids`` threading): when the
+        # batch carries packing metadata, both the depthwise conv and the
+        # delta-rule recurrence reset their state at document boundaries so
+        # document n+1 never attends to document n's state. Unpacked batches
+        # derive no segment ids and keep today's plain (faster chunked)
+        # paths; decode (seq_len == 1) is unaffected — the conv decode branch
+        # ignores segment ids and the single-step kernel never sees them.
+        segment_ids = None
+        if mask_info is not None:
+            segment_ids = packed_segment_ids_from_mask_info(mask_info, hidden_states.shape[1])
 
         batch_size, seq_len, _ = hidden_states.shape
         is_inference = seq_len == 1 and cache_view is not None
@@ -1148,6 +1156,7 @@ class Glm5NextLinearAttention(spx.Module):
             d_conv=self.d_conv,
             output_dtype=conv_output_dtype,
             reuse_partial_state=True,
+            segment_ids=segment_ids,
         )
         key, new_k_conv_state = apply_conv_with_state(
             key,
@@ -1157,6 +1166,7 @@ class Glm5NextLinearAttention(spx.Module):
             d_conv=self.d_conv,
             output_dtype=conv_output_dtype,
             reuse_partial_state=True,
+            segment_ids=segment_ids,
         )
         value, new_v_conv_state = apply_conv_with_state(
             value,
@@ -1166,6 +1176,7 @@ class Glm5NextLinearAttention(spx.Module):
             d_conv=self.d_conv,
             output_dtype=conv_output_dtype,
             reuse_partial_state=True,
+            segment_ids=segment_ids,
         )
 
         query = query.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
@@ -1207,6 +1218,7 @@ class Glm5NextLinearAttention(spx.Module):
             recurrent_state=recurrent_state,
             chunk_size=self.chunk_size,
             per_channel_decay=True,
+            segment_ids=segment_ids,
         )
 
         output = kda_output.attention_outputs
