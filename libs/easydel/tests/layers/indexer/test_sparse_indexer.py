@@ -228,7 +228,7 @@ def test_rope_split_half_matches_hand_reference():
 
 def test_config_rejects_bad_rope_and_pool_state():
     with pytest.raises(ValueError):
-        IndexerConfig(rope_dim=HID + 1)  # wider than head dim
+        IndexerConfig(index_head_dim=D, rope_dim=D + 2)  # wider than head dim (even)
     with pytest.raises(ValueError):
         IndexerConfig(rope_dim=7)  # odd
     with pytest.raises(ValueError):
