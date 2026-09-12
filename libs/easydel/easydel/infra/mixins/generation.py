@@ -2389,8 +2389,6 @@ class EasyGenerationMixin:
             hbm_utilization=hbm_utilization,
             page_size=page_size,
             max_cache_tokens=max_cache_tokens,
-            indexer_packed_dim=getattr(text_config, "indexer_packed_dim", None),
-            indexer_max_rows=int(getattr(text_config, "indexer_max_rows", 8) or 8),
         )
 
     def create_ragged_page_cache_config(
