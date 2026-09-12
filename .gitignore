@@ -27,6 +27,8 @@ memory_log_dir/
 wandb
 .ruff_cache/*
 launch_test.py
+# no leaks on internal stuff hehehe
+.xerxes/projects
 .gradio
 *.easy
 tmp-files
