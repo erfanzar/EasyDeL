@@ -49,4 +49,3 @@ void LaunchDequantNf4BF16Gs1024(const uint32_t *wq, const __nv_bfloat16 *scales,
   (void)group_size;
   dequant_nf4_int_gs<4, 1024, __nv_bfloat16><<<grid, block, 0, stream>>>(wq, scales, out, K, N, n_words, n_groups);
 }
-

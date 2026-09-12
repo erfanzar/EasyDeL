@@ -600,4 +600,3 @@ inline DequantNf4BF16Fn ResolveLaunchDequantNf4BF16(int64_t group_size) {
   default: return &LaunchDequantNf4BF16;
   }
 }
-
