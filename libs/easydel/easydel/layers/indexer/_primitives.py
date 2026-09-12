@@ -110,6 +110,10 @@ def indices_to_bool_mask(
     """
     safe = jnp.clip(topk_indices, 0, kv_length - 1)
     one_hot = jax.nn.one_hot(safe, kv_length, dtype=jnp.bool_)
+    # ``-1`` slots must select nothing: clip alone would map them to
+    # position 0, so mask those lanes out before the reduction.
+    valid = topk_indices >= 0
+    one_hot = jnp.where(valid[..., None], one_hot, False)
     return jnp.any(one_hot, axis=-2)
 
 

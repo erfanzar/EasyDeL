@@ -302,7 +302,10 @@ class Glm5NextTextExperts(spx.Module):
         moe_kwargs = dict(
             rngs=rngs,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(),
+            # HF `_init_weights` uses `initializer_range` (0.02) for the
+            # expert stacks; the JAX default stddev of 1.0 would hard-saturate
+            # the ±swiglu_limit clamp at from-scratch init.
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
             partition_manager=config.runtime_sharding_resolver,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
             dtype=dtype,
@@ -1609,7 +1612,9 @@ class Glm5NextDSAAttention(UnifiedAttention):
             self.projection_mapping["mla_q_a_layernorm"],
             RMSNorm(
                 config.q_lora_rank,
-                eps=1e-6,
+                # HF builds these RMSNorms with `config.rms_norm_eps` (1e-5);
+                # the indexer's k_norm below keeps its own LayerNorm eps 1e-6.
+                eps=config.rms_norm_eps,
                 rngs=rngs,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -1648,7 +1653,7 @@ class Glm5NextDSAAttention(UnifiedAttention):
             self.projection_mapping["mla_kv_a_layernorm"],
             RMSNorm(
                 config.kv_lora_rank,
-                eps=1e-6,
+                eps=config.rms_norm_eps,
                 rngs=rngs,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -1870,7 +1875,12 @@ class Glm5NextDSAAttention(UnifiedAttention):
             mask_info=mask_info,
         )
 
-        if topk_indices is not None:
+        if topk_indices is not None and not isinstance(cache_view, MLARaggedPagesCacheView):
+            # The ragged-pages MLA kernel has no per-query mask input, so a
+            # top-k mask built here is dead weight on the serving path — and
+            # its indices span the full cached context while kv_len is only
+            # the packed window (garbage mask). Restrict the mask build to
+            # dense (non-ragged) cache consumers, which do honor mask_info.
             kv_len = key_states.shape[1]
             if q_len == kv_len or cached_packed_states is not None:
                 topk_mask = jnp.any(jax.nn.one_hot(topk_indices, kv_len, dtype=jnp.bool_), axis=-2)

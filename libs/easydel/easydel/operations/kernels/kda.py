@@ -1399,6 +1399,14 @@ class KernelDeltaAttnOp(OperationImpl):
             KDAOutput containing attention outputs and updated states
         """
         per_channel = per_channel_decay or (decay is not None and decay.ndim == 4)
+        if per_channel and decay is None:
+            # The per-channel kernels have no zero-decay fallback (zero decay
+            # would mean "no memory decay", a different operation). The
+            # per-head family zero-fills None; keep that contract there.
+            raise ValueError(
+                "per_channel_decay=True requires explicit `decay`"
+                " [batch, seq_len, num_heads, head_dim]; got None."
+            )
         seq_len = query.shape[1]
         shardings = None
         mesh = self.metadata.mesh
@@ -1418,7 +1426,11 @@ class KernelDeltaAttnOp(OperationImpl):
 
         beta = beta.astype(runtime_dtype)
         if decay is not None:
-            decay = decay.astype(runtime_dtype)
+            # Keep the log-decay in fp32 (HF passes it un-cast): g in [-5, 0)
+            # at bf16 precision biases exp(g_cumsum) by up to ~0.02 absolute
+            # per chunk, compounding over long recurrences. The per-channel
+            # kernels upcast to f32 internally regardless.
+            decay = decay.astype(jnp.float32)
 
         is_inference = seq_len == 1
 

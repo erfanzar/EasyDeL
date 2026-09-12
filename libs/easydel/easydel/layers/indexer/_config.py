@@ -124,6 +124,14 @@ class IndexerConfig:
                 raise ValueError(
                     f"index_topk ({self.index_topk}) must be divisible by kpool_size ({self.kpool_size})."
                 )
+            # Without the tail pool, queries seeing fewer than kpool visible
+            # tokens (the first kpool-1 rows of every prefill, and all rows
+            # when kv < kpool) select nothing -> all-masked attention.
+            if not self.select_tail:
+                raise ValueError(
+                    "kind='pool' requires select_tail=True: without the tail pool, queries with fewer"
+                    " than kpool_size visible tokens select nothing (all-masked attention rows)."
+                )
             # Pooling reads the gate/valid channels of the packed state; a
             # keys-only or stateless layout structurally cannot pool.
             if self.packed_state != "key_gate_valid":
