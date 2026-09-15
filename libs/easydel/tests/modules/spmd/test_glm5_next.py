@@ -27,6 +27,7 @@ import numpy as np
 import pytest
 import spectrax as spx
 import torch
+from easydel.infra.sequence_packing import fold_sequence_packing_segments
 
 try:
     from tests.modules.test_utils import CausalLMTester
@@ -172,6 +173,75 @@ class TestGlm5Next:
         flat = [g for g in jax.tree.leaves(grads) if jnp.issubdtype(g.dtype, jnp.floating)]
         assert flat, "no floating gradients produced"
         assert all(bool(jnp.isfinite(g).all()) for g in flat), "non-finite gradients"
+
+    def test_packed_kda_segment_isolation(self, glm5_config, glm5_small_config):
+        """Packed segment threading must isolate documents inside the KDA layers.
+
+        Two documents are packed into one row and routed through the model via
+        ``fold_sequence_packing_segments`` (the trainer → model contract). The
+        KDA conv + delta-rule state must reset at the document boundary, so the
+        second document's first-token output is bit-identical to running that
+        document alone from zero state. As a control, the same packed row
+        *without* segment ids leaks document 1's state into document 2 and
+        must diverge.
+        """
+        config = glm5_config
+        config.sharding_axis_dims = glm5_small_config["sharding_axis_dims"]
+        batch_size = glm5_small_config["batch_size"]
+        len_doc1, len_doc2 = 4, 5
+
+        with config.mesh:
+            model = ed.Glm5NextForCausalLM(
+                config=config,
+                dtype=jnp.float32,
+                param_dtype=jnp.float32,
+                precision=jax.lax.Precision.HIGHEST,
+                rngs=spx.Rngs(0),
+            )
+            graphdef, params = spx.export(model)
+            module = spx.bind(graphdef, params)
+
+            generator = np.random.default_rng(7)
+            doc1 = generator.integers(10, 1000, size=(batch_size, len_doc1))
+            doc2 = generator.integers(10, 1000, size=(batch_size, len_doc2))
+            packed_ids = jnp.asarray(np.concatenate([doc1, doc2], axis=1), dtype="i4")
+            doc2_ids = jnp.asarray(doc2, dtype="i4")
+            segment_ids = jnp.concatenate(
+                [
+                    jnp.zeros((batch_size, len_doc1), dtype="i4"),
+                    jnp.ones((batch_size, len_doc2), dtype="i4"),
+                ],
+                axis=1,
+            )
+
+            packed_kwargs = fold_sequence_packing_segments(
+                {"input_ids": packed_ids, "segment_ids": segment_ids}
+            )
+            assert "mask_info" in packed_kwargs, "segment ids must fold into mask_info"
+            assert "segment_ids" not in packed_kwargs
+
+            logits_packed = np.asarray(module(**packed_kwargs).logits)
+            logits_alone = np.asarray(module(input_ids=doc2_ids).logits)
+            logits_unthreaded = np.asarray(module(input_ids=packed_ids).logits)
+
+        doc2_packed = logits_packed[:, len_doc1:]
+        # The boundary resets conv + recurrent state to zero, so document 2's
+        # first token is computed from the exact same state as an isolated run.
+        first_token_diff = float(np.abs(doc2_packed[:, :1] - logits_alone[:, :1]).max())
+        assert first_token_diff == 0.0, (
+            f"document 2's first token must be identical to an isolated run, got diff {first_token_diff}"
+        )
+
+        # Control: without threading, document 1 leaks into document 2.
+        leak = float(np.abs(logits_unthreaded[:, len_doc1:] - logits_alone).max())
+        assert leak > 0.0, "control run shows no leak — the probe cannot detect a regression"
+
+        # Threaded doc2 stays far closer to the isolated run than the leaky one.
+        # (Later doc2 tokens differ slightly even when threaded: the DSA k-pool
+        # indexer pools over the full context, so pool membership depends on
+        # packing. That is indexer context sensitivity, not state leakage.)
+        threaded = float(np.abs(doc2_packed - logits_alone).max())
+        assert threaded < 0.5 * leak, f"threaded diff {threaded} not clearly below leak {leak}"
 
 
 def _conversion_config(glm5_config):
