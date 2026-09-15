@@ -20,18 +20,10 @@ to optimize memory usage and computation during inference.
 Cache Types:
     TransformerCache: Standard KV-cache for transformer models
     RaggedPagesCache: Paged cache for efficient memory management
-    RecurrentCache/LinearCache: Unified cache for state-space and linear attention models
+    RecurrentCache: Unified cache for state-space and linear attention models
         (Mamba, Mamba2, GatedDeltaNet, RWKV, RetNet)
     HybridCache: Cache for hybrid models mixing attention types (e.g., Qwen3Next)
-    LightningCache: Cache for Lightning attention
     KDACache: Cache for KDA (Key-Driven Attention) models
-
-Cache Specifications:
-    FullAttentionSpec: Specification for full attention caching
-    SlidingWindowSpec: Specification for sliding window attention
-    ChunkedLocalAttentionSpec: Specification for chunked local attention
-    MambaSpec: Specification for Mamba model caching
-    KVCacheSpec: Base specification for KV caches
 
 Key Features:
     - Memory-efficient caching strategies
@@ -74,7 +66,6 @@ Note:
 
 from ._abstracts import OperationsMetadata, unwrap_metadata
 from ._metadatabuilder import AttentionMetadataBuilder
-from ._specs import ChunkedLocalAttentionSpec, FullAttentionSpec, KVCacheSpec, MambaSpec, SlidingWindowSpec
 from .compressed_window import (
     CompressedWindowCache,
     CompressedWindowCacheConfig,
@@ -89,14 +80,9 @@ from .hybrid import (
     ParallelHybridCacheView,
 )
 from .kda import KDACache, KDACacheConfig, KDACacheView, KDAMetadata
-from .lightning import LightningCache, LightningCacheConfig, LightningCacheView, LightningMetadata
 from .mla_ragged_page import MLARaggedPagesCache, MLARaggedPagesCacheConfig, MLARaggedPagesCacheView
 from .ragged_page import RaggedPagesCache, RaggedPagesCacheConfig, RaggedPagesCacheView, RaggedPagesMetadata
 from .recurrent import (
-    LinearCache,
-    LinearCacheConfig,
-    LinearCacheView,
-    LinearMetadata,
     RecurrentCache,
     RecurrentCacheConfig,
     RecurrentCacheView,
@@ -112,12 +98,10 @@ from .unified_attention import UnifiedAttentionCache, UnifiedAttentionCacheConfi
 
 __all__ = (
     "AttentionMetadataBuilder",
-    "ChunkedLocalAttentionSpec",
     "CompressedWindowCache",
     "CompressedWindowCacheConfig",
     "CompressedWindowCacheView",
     "CompressedWindowMetadata",
-    "FullAttentionSpec",
     "HybridCache",
     "HybridCacheConfig",
     "HybridCacheView",
@@ -126,19 +110,9 @@ __all__ = (
     "KDACacheConfig",
     "KDACacheView",
     "KDAMetadata",
-    "KVCacheSpec",
-    "LightningCache",
-    "LightningCacheConfig",
-    "LightningCacheView",
-    "LightningMetadata",
-    "LinearCache",
-    "LinearCacheConfig",
-    "LinearCacheView",
-    "LinearMetadata",
     "MLARaggedPagesCache",
     "MLARaggedPagesCacheConfig",
     "MLARaggedPagesCacheView",
-    "MambaSpec",
     "OperationsMetadata",
     "ParallelHybridCacheView",
     "RaggedPagesCache",
@@ -149,7 +123,6 @@ __all__ = (
     "RecurrentCacheConfig",
     "RecurrentCacheView",
     "RecurrentMetadata",
-    "SlidingWindowSpec",
     "TransformerCache",
     "TransformerCacheConfig",
     "TransformerCacheView",

@@ -772,26 +772,12 @@ class eSurgeRunner:
         """
         return self.slot_pool.rows_per_dp_rank()
 
-    def _reset_recurrent_slot_pools(self) -> None:
-        """Initialize physical recurrent-state slots partitioned by DP rank.
-
-        Delegates to :meth:`RecurrentSlotPool.reset`.
-        """
-        self.slot_pool.reset()
-
     def _assign_recurrent_slot(self, req_id: str, dp_rank: int | None) -> int | None:
         """Assign or return the stable physical recurrent-state slot for a request.
 
         Delegates to :meth:`RecurrentSlotPool.assign_slot`.
         """
         return self.slot_pool.assign_slot(req_id, dp_rank)
-
-    def _release_recurrent_slot(self, req_id: str, *, forget_rank: bool) -> int | None:
-        """Release a request's physical recurrent-state slot and return it for clearing.
-
-        Delegates to :meth:`RecurrentSlotPool.release_slot`.
-        """
-        return self.slot_pool.release_slot(req_id, forget_rank=forget_rank)
 
     @property
     def _recurrent_slot_by_req(self) -> dict[str, int]:
@@ -802,11 +788,6 @@ class eSurgeRunner:
     def _request_dp_rank_by_req(self) -> dict[str, int]:
         """Live request-id to DP-rank map (see :class:`RecurrentSlotPool`)."""
         return self.slot_pool.dp_rank_by_req
-
-    @property
-    def _free_recurrent_slots_by_rank(self) -> list[list[int]]:
-        """Per-rank free-lists of physical slots (see :class:`RecurrentSlotPool`)."""
-        return self.slot_pool.free_slots_by_rank
 
     def _build_kv_cache_groups(self):
         """Build cache-group specs for runtime-cap and scheduler estimation.
@@ -1206,14 +1187,6 @@ class eSurgeRunner:
         Delegates to :meth:`WindowPlanner.get_token_paddings`.
         """
         return WindowPlanner.get_token_paddings(min_token_size, max_token_size, padding_gap)
-
-    @staticmethod
-    def _get_request_paddings(min_bucket: int, max_bucket: int) -> list[int]:
-        """Generate request count buckets using exponential growth.
-
-        Delegates to :meth:`WindowPlanner.get_request_paddings`.
-        """
-        return WindowPlanner.get_request_paddings(min_bucket, max_bucket)
 
     def _init_seq_buckets(
         self,

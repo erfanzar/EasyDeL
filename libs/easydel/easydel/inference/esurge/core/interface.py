@@ -25,7 +25,6 @@ Classes:
     FullAttentionSpec: Specification for full/causal attention.
     SlidingWindowSpec: Specification for sliding window attention.
     ChunkedLocalAttentionSpec: Specification for chunked local attention.
-    MambaSpec: Specification for Mamba state-space model caching.
     CacheGroupSpec: Groups layers sharing the same cache page table.
     CacheGroupsConfig: Complete KV-cache configuration for a model.
 
@@ -46,7 +45,6 @@ Example:
 import copy
 from collections import defaultdict
 from dataclasses import dataclass
-from math import prod
 from typing import TYPE_CHECKING, Self
 
 from jax import numpy as jnp
@@ -399,74 +397,6 @@ class SlidingWindowSpec(AttentionSpec):
         num_tokens = min(self.sliding_window - 1 + max_num_batched_tokens, max_model_len)
 
         return (cdiv(num_tokens, self.page_size) + 1) * self.page_size_bytes
-
-
-@dataclass
-class MambaSpec(CacheSpec):
-    """Cache specification for Mamba state-space model layers.
-
-    Describes state caching requirements for Mamba layers, which use
-    recurrent state-space models instead of attention. Mamba layers
-    maintain fixed-size state tensors regardless of sequence length.
-
-    Attributes:
-        shapes: Tuple of shapes for each state tensor component.
-        dtype: JAX dtype for state tensors.
-        page_size_padded: Optional padded page size for alignment.
-
-    Example:
-        >>> spec = MambaSpec(
-        ...     page_size=1,
-        ...     shapes=((16, 64), (16, 32)),
-        ...     dtype=jnp.float16
-        ... )
-    """
-
-    shapes: tuple[tuple[int, ...], ...]
-    dtype: jnp.dtype
-    page_size_padded: int | None = None
-
-    def __post_init__(self) -> None:
-        """Calculate total number of elements across all state shapes."""
-        self.num_elements = sum(prod(shape) for shape in self.shapes)
-
-    @property
-    def type_id(self) -> str:
-        """Get the type identifier for Mamba state caching.
-
-        Returns:
-            String including shapes and dtype.
-        """
-        return f"mamba_{self.shapes}_{self.dtype}"
-
-    @property
-    def page_size_bytes(self) -> int:
-        """Calculate page size in bytes for Mamba state.
-
-        Returns padded size if specified, otherwise computes from
-        total elements and dtype.
-
-        Returns:
-            Number of bytes per page.
-        """
-        page_size = self.num_elements * get_dtype_size(self.dtype)
-        if self.page_size_padded is not None:
-            assert self.page_size_padded >= page_size
-            return self.page_size_padded
-        return page_size
-
-    def max_memory_usage_bytes(self, **kwargs) -> int:
-        """Calculate maximum memory for Mamba state (constant).
-
-        Mamba uses fixed-size state, so max memory equals page size.
-
-        Args:
-            **kwargs: Ignored (sequence length doesn't affect Mamba memory).
-
-        Returns:
-            Maximum memory in bytes (equals page_size_bytes).
-        """
-        return self.page_size_bytes
 
 
 @dataclass

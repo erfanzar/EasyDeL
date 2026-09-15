@@ -78,12 +78,12 @@ from spectrax import (
 
 from easydel.caching import (
     HybridCache,
-    LinearCacheView,
-    LinearMetadata,
     OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
+    RecurrentCacheView,
+    RecurrentMetadata,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
@@ -2632,7 +2632,7 @@ class Qwen3NextFullAttention(UnifiedAttention):
         mask_info: MaskInfo | None,
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
-        cache_view: TransformerCacheView | RaggedPagesCacheView | LinearCacheView | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | RecurrentCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesCacheView | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
@@ -2648,7 +2648,7 @@ class Qwen3NextFullAttention(UnifiedAttention):
             mask_info (MaskInfo | None): Attention mask information including causal masks.
             position_ids (Array): Position indices for tokens, shape (batch, seq_len).
             mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode) for optimization.
-            cache_view (TransformerCacheView | RaggedPagesCacheView | LinearCacheView | None, optional):
+            cache_view (TransformerCacheView | RaggedPagesCacheView | RecurrentCacheView | None, optional):
                 Cache view for KV caching. Defaults to None.
             cache_metadata (TransformerMetadata | RaggedPagesCacheView | OperationsMetadata | None, optional):
                 Cache metadata. Defaults to None.
@@ -3132,8 +3132,8 @@ class Qwen3NextLinearAttention(spx.Module):
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
-        cache_view: LinearCacheView | None = None,
-        cache_metadata: LinearMetadata | None = None,
+        cache_view: RecurrentCacheView | None = None,
+        cache_metadata: RecurrentMetadata | None = None,
     ) -> AttentionLayerOutput:
         """Forward pass through the linear attention layer.
 
@@ -3145,9 +3145,9 @@ class Qwen3NextLinearAttention(spx.Module):
         Args:
             hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_dim).
             mask_info (MaskInfo): Mask information for padding handling.
-            cache_view (LinearCacheView | None, optional): Cache view for incremental
+            cache_view (RecurrentCacheView | None, optional): Cache view for incremental
                 decoding with conv and recurrent states. Defaults to None.
-            cache_metadata (LinearMetadata | None, optional): Cache metadata. Defaults to None.
+            cache_metadata (RecurrentMetadata | None, optional): Cache metadata. Defaults to None.
 
         Returns:
             AttentionLayerOutput: Contains attention output and updated cache view.
@@ -3678,7 +3678,7 @@ class Qwen3NextDecoderLayer(spx.Module):
         mask_info: MaskInfo,
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
-        cache_view: TransformerCacheView | RaggedPagesCacheView | LinearCacheView | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | RecurrentCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesCacheView | OperationsMetadata | None = None,
         output_attentions: bool = False,
         output_router_logits: bool = False,
@@ -3694,7 +3694,7 @@ class Qwen3NextDecoderLayer(spx.Module):
             mask_info (MaskInfo): Attention mask information including causal masks.
             position_ids (Array): Position indices for tokens, shape (batch, seq_len).
             mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode) for optimization.
-            cache_view (TransformerCacheView | RaggedPagesCacheView | LinearCacheView | None, optional):
+            cache_view (TransformerCacheView | RaggedPagesCacheView | RecurrentCacheView | None, optional):
                 Cache view for KV or recurrent state caching. Defaults to None.
             cache_metadata (TransformerMetadata | RaggedPagesCacheView | OperationsMetadata | None, optional):
                 Cache metadata. Defaults to None.

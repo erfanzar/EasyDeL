@@ -229,7 +229,6 @@ class BaseModuleProtocol(metaclass=ABCMeta):
     Generation:
         - generate: Autoregressive text generation
         - init_cache: Initialize KV cache
-        - init_ragged_pages: Initialize paged attention cache
         - prepare_inputs_for_generation: Setup generation inputs
         - update_inputs_for_generation: Update inputs between steps
 
@@ -3380,27 +3379,6 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 
         Returns:
             An initialized standard TransformerCache object.
-        """
-        ...
-
-    @abstractmethod
-    def init_ragged_pages(
-        self,
-        metadata: tp.Any | None = None,
-        page_size: int | None = None,
-        hbm_utilization: float | None = None,
-        max_model_length: int | None = None,
-    ):
-        """Initializes and returns the actual Paged Attention KV Cache tensors.
-
-        Args:
-            metadata: An optional pre-configured metadata object.
-            page_size: Number of tokens per page. Required if metadata is None.
-            hbm_utilization: Target HBM usage. Required if metadata is None.
-            max_model_length: Maximum model sequence length. Required if metadata is None.
-
-        Returns:
-            An initialized RaggedPagesCache object containing the allocated cache tensors.
         """
         ...
 

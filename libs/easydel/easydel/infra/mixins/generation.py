@@ -19,8 +19,7 @@ This module is the heart of EasyDeL's inference path. It contains
 generation entry point in the project:
 
 * KV-cache lifecycle for transformer / paged-attention / hybrid /
-  Mamba / RWKV models (``init_cache``, ``init_ragged_pages``,
-  ``init_unified_attention_cache``), including the mixed-architecture
+  Mamba / RWKV models (``init_cache``), including the mixed-architecture
   fast paths for models that interleave MLA, standard attention and SSM
   blocks.
 * Per-layer cache-config builders
@@ -74,7 +73,6 @@ from transformers.generation.configuration_utils import GenerationConfig
 
 from easydel.axis import resolve_attention_data_parallel_axis
 from easydel.caching import (
-    MLARaggedPagesCache,
     MLARaggedPagesCacheConfig,
     RaggedPagesCache,
     RaggedPagesCacheConfig,
@@ -106,7 +104,6 @@ from ..modeling_outputs import BeamSearchOutput, GreedySearchOutput, SampleOutpu
 if tp.TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
-    from easydel.caching import OperationsMetadata
     from easydel.inference.sampling_params import SamplingParams
 
 logger = get_logger(__name__)
@@ -1281,30 +1278,6 @@ class BeamSearchState:
     model_kwargs: dict[str, Array]
 
 
-def _safepick(config, pickname):  # pyright: ignore[reportUnusedFunction]
-    """Safely retrieve an attribute from a config, falling back to text_config.
-
-    This utility function attempts to get an attribute from the given config object.
-    If the attribute is None or doesn't exist, it tries to retrieve it from the
-    config's text_config attribute (if present), which is common in multimodal models.
-
-    Args:
-        config: The configuration object to retrieve the attribute from.
-        pickname: The name of the attribute to retrieve.
-
-    Returns:
-        The attribute value if found, None otherwise.
-
-    Example:
-        >>> vocab_size = _safepick(model_config, "vocab_size")
-        >>> # If model_config.vocab_size is None, tries model_config.text_config.vocab_size
-    """
-    vari = getattr(config, pickname, None)
-    if vari is None and hasattr(config, "text_config"):
-        vari = getattr(config.text_config, pickname, None)
-    return vari
-
-
 def _resolve_backend_for_esurge(config: EasyDeLBaseConfig) -> str:
     """Resolve the JAX backend label for eSurge helpers, with safe fallbacks.
 
@@ -1512,243 +1485,6 @@ class EasyGenerationMixin:
                 indices.append(int(layer_idx))
         return sorted(set(indices))
 
-    def init_ragged_pages(
-        self,
-        config: RaggedPagesCacheConfig | MLARaggedPagesCacheConfig | UnifiedAttentionCacheConfig | None = None,
-        page_size: int | None = None,
-        hbm_utilization: float | None = None,
-        max_model_length: int | None = None,
-        max_cache_tokens: int | None = None,
-    ) -> RaggedPagesCache | MLARaggedPagesCache | UnifiedAttentionCache:
-        """
-        Initializes and returns the actual Paged Attention KV Cache tensors.
-
-        This method orchestrates the creation of the `RaggedPagesCache`. It either uses
-        a pre-existing `RaggedPagesCacheConfig` object passed via the `config`
-        argument, or if `config` is None, it first creates the config by calling
-        `self.create_ragged_page_cache_config` using the other provided arguments (page_size,
-        batch_size, etc.).
-
-        Finally, it calls `RaggedPagesCache.init_cache` to allocate the necessary
-        paged tensors (`key_pages`, `value_pages` for each layer) based on the
-        config, model's mesh, dtype, partition manager, and quantization settings.
-
-        Args:
-            config (tp.Optional[RaggedPagesCacheConfig]): An optional pre-configured
-                config object. If provided, other arguments like page_size, batch_size etc.,
-                are ignored for config creation.
-            page_size (tp.Optional[int]): Number of tokens per page. Required if `config` is None.
-            hbm_utilization (tp.Optional[float]): Target HBM usage. Required if `config` is None.
-
-        Returns:
-            RaggedPagesCache: An initialized RaggedPagesCache object containing the allocated
-                cache tensors (views) for all layers.
-
-        Raises:
-            AssertionError: If `config` is None and any of the required arguments
-                (page_size, batch_size, max_sequences, dtype, hbm_utilization) are also None.
-        """
-        text_config = self.config.get_text_config()
-        if config is None:
-            _validate_paged_cache_init_args(
-                page_size=page_size,
-                hbm_utilization=hbm_utilization,
-                max_model_length=max_model_length,
-            )
-
-            config = self.create_ragged_page_cache_config(
-                max_length=max_model_length,
-                hbm_utilization=hbm_utilization,
-                page_size=page_size,
-                max_cache_tokens=max_cache_tokens,
-            )
-        quantizer = self._quant_class(
-            quantization_config=text_config.kv_cache_quantization_config,
-        )
-        uses_mixed_standard_geometry = _has_mixed_standard_ragged_geometry(text_config=text_config)
-
-        if isinstance(config, UnifiedAttentionCacheConfig):
-            if uses_mixed_standard_geometry:
-                _, per_layer_configs = _create_mixed_standard_unified_attention_cache_configs(
-                    text_config=text_config,
-                    max_length=int(getattr(config, "max_model_length", max_model_length)),
-                    page_size=int(getattr(config, "page_size", page_size)),
-                    hbm_utilization=float(getattr(config, "hbm_utilization", hbm_utilization)),
-                    dtype=getattr(config, "kvdtype", getattr(text_config, "kvdtype", jnp.bfloat16)),
-                    num_pages_override=getattr(config, "num_pages", None),
-                )
-                return _materialize_mixed_unified_attention_cache(
-                    text_config=text_config,
-                    per_layer_configs=per_layer_configs,
-                    quantizer=quantizer,
-                )
-            return UnifiedAttentionCache.init_cache(
-                mesh=text_config.mesh,
-                config=config,
-                runtime_sharding_resolver=text_config.runtime_sharding_resolver,
-                quantizer=quantizer,
-            )
-        if isinstance(config, MLARaggedPagesCacheConfig):
-            return MLARaggedPagesCache.init_cache(
-                mesh=text_config.mesh,
-                config=config,
-                runtime_sharding_resolver=text_config.runtime_sharding_resolver,
-                quantizer=quantizer,
-            )
-
-        try:
-            from easydel.caching.turboquant_ragged_page import (
-                TurboQuantRaggedPagesCache,
-                TurboQuantRaggedPagesCacheConfig,
-            )
-            from easydel.layers.quantization import TurboQuantConfig
-        except ImportError:
-            TurboQuantRaggedPagesCache = None
-            TurboQuantRaggedPagesCacheConfig = None
-            TurboQuantConfig = None
-
-        if TurboQuantRaggedPagesCacheConfig is not None and isinstance(config, TurboQuantRaggedPagesCacheConfig):
-            if uses_mixed_standard_geometry:
-                _, per_layer_configs = _create_mixed_turboquant_ragged_page_cache_configs(
-                    text_config=text_config,
-                    max_length=int(getattr(config, "max_model_length", max_model_length)),
-                    page_size=int(getattr(config, "page_size", page_size)),
-                    hbm_utilization=float(getattr(config, "hbm_utilization", hbm_utilization)),
-                    turboquant_config=config.turboquant_config,
-                    num_pages_override=getattr(config, "num_pages", None),
-                )
-                return _materialize_mixed_turboquant_ragged_cache(
-                    text_config=text_config,
-                    per_layer_configs=per_layer_configs,
-                )
-            return TurboQuantRaggedPagesCache.init_cache(
-                mesh=text_config.mesh,
-                config=config,
-                runtime_sharding_resolver=text_config.runtime_sharding_resolver,
-                quantizer=quantizer,
-            )
-
-        if (
-            uses_mixed_standard_geometry
-            and TurboQuantConfig is not None
-            and isinstance(
-                text_config.kv_cache_quantization_config,
-                TurboQuantConfig,
-            )
-        ):
-            _, per_layer_configs = _create_mixed_turboquant_ragged_page_cache_configs(
-                text_config=text_config,
-                max_length=int(getattr(config, "max_model_length", max_model_length)),
-                page_size=int(getattr(config, "page_size", page_size)),
-                hbm_utilization=float(getattr(config, "hbm_utilization", hbm_utilization)),
-                turboquant_config=text_config.kv_cache_quantization_config,
-                num_pages_override=getattr(config, "num_pages", None),
-            )
-            return _materialize_mixed_turboquant_ragged_cache(
-                text_config=text_config,
-                per_layer_configs=per_layer_configs,
-            )
-
-        if uses_mixed_standard_geometry:
-            per_layer_configs = _get_cached_mixed_standard_ragged_configs(config)
-            if per_layer_configs is None:
-                _, per_layer_configs = _create_mixed_standard_ragged_page_cache_configs(
-                    text_config=text_config,
-                    max_length=int(getattr(config, "max_model_length", max_model_length)),
-                    page_size=int(getattr(config, "page_size", page_size)),
-                    hbm_utilization=float(getattr(config, "hbm_utilization", hbm_utilization)),
-                    dtype=getattr(config, "kvdtype", getattr(text_config, "kvdtype", jnp.bfloat16)),
-                    version=getattr(config, "version", "v3"),
-                    num_pages_override=getattr(config, "num_pages", None),
-                )
-            return _materialize_mixed_standard_ragged_cache(
-                text_config=text_config,
-                per_layer_configs=per_layer_configs,
-                quantizer=quantizer,
-            )
-
-        return RaggedPagesCache.init_cache(
-            mesh=text_config.mesh,
-            config=config,
-            runtime_sharding_resolver=text_config.runtime_sharding_resolver,
-            quantizer=quantizer,
-        )
-
-    def init_unified_attention_cache(
-        self,
-        config: UnifiedAttentionCacheConfig | None = None,
-        page_size: int | None = None,
-        hbm_utilization: float | None = None,
-        max_model_length: int | None = None,
-    ) -> UnifiedAttentionCache:
-        """Initialize and return the unified-attention paged KV cache tensors.
-
-        Creates a UnifiedAttentionCache for use with serving-style unified attention
-        kernels. The cache layout matches ejkernel's Triton UnifiedAttention kernel:
-        `[num_blocks, block_size, num_kv_heads, head_dim]` for both K and V.
-
-        This method either uses a pre-existing UnifiedAttentionCacheConfig or creates
-        one using the provided parameters.
-
-        Args:
-            config: Optional pre-configured cache config. If provided, other
-                arguments are ignored.
-            page_size: Number of tokens per page. Required if config is None.
-            hbm_utilization: Target HBM memory utilization (0.0-1.0). Required
-                if config is None.
-            max_model_length: Maximum sequence length. Required if config is None.
-
-        Returns:
-            UnifiedAttentionCache: Initialized cache with allocated tensors.
-
-        Raises:
-            AssertionError: If config is None and required parameters are missing.
-
-        Example:
-            >>> cache = model.init_unified_attention_cache(
-            ...     page_size=128,
-            ...     hbm_utilization=0.9,
-            ...     max_model_length=4096
-            ... )
-        """
-        text_config = self.config.get_text_config()
-        if config is None:
-            _validate_paged_cache_init_args(
-                page_size=page_size,
-                hbm_utilization=hbm_utilization,
-                max_model_length=max_model_length,
-            )
-
-            config = self.create_unified_attention_cache_config(
-                max_length=max_model_length,
-                hbm_utilization=hbm_utilization,
-                page_size=page_size,
-            )
-
-        quantizer = self._quant_class(quantization_config=text_config.kv_cache_quantization_config)
-
-        if _has_mixed_standard_ragged_geometry(text_config=text_config):
-            _, per_layer_configs = _create_mixed_standard_unified_attention_cache_configs(
-                text_config=text_config,
-                max_length=int(getattr(config, "max_model_length", max_model_length)),
-                page_size=int(getattr(config, "page_size", page_size)),
-                hbm_utilization=float(getattr(config, "hbm_utilization", hbm_utilization)),
-                dtype=getattr(config, "kvdtype", getattr(text_config, "kvdtype", jnp.bfloat16)),
-                num_pages_override=getattr(config, "num_pages", None),
-            )
-            return _materialize_mixed_unified_attention_cache(
-                text_config=text_config,
-                per_layer_configs=per_layer_configs,
-                quantizer=quantizer,
-            )
-
-        return UnifiedAttentionCache.init_cache(
-            mesh=text_config.mesh,
-            config=config,
-            runtime_sharding_resolver=text_config.runtime_sharding_resolver,
-            quantizer=quantizer,
-        )
-
     def init_cache(
         self,
         batch_size: int,
@@ -1830,8 +1566,6 @@ class EasyGenerationMixin:
         Example:
             >>> cache_type = model.get_inference_cache_type()
             >>> if cache_type == "ragged":
-            ...     cache = model.init_ragged_pages(...)
-            ... else:
             ...     cache = model.init_operations_cache(...)
         """
         cache_info = self.get_operations_cache_info()
@@ -2146,51 +1880,6 @@ class EasyGenerationMixin:
             value_dim=value_dim,
             d_conv=d_conv,
             recurrent_state_shape=recurrent_shape,
-        )
-
-    def create_lightning_cache_config(self, batch_size: int):
-        """Create LightningCacheConfig from model configuration.
-
-        Creates cache configuration for models using Lightning Attention mechanisms.
-
-        Args:
-            batch_size (int): Batch size for inference.
-
-        Returns:
-            LightningCacheConfig: Cache configuration for Lightning Attention layers.
-        """
-
-        from easydel.caching import LightningCacheConfig
-
-        text_config = self.config.get_text_config()
-
-        partition_axis = getattr(text_config, "partition_axis", None)
-        if partition_axis is None:
-            partition_axis = PartitionAxis()
-
-        num_heads = getattr(text_config, "num_attention_heads", None)
-        head_dim = getattr(text_config, "head_dim", None)
-        if head_dim is None:
-            hidden_size = getattr(text_config, "hidden_size", None)
-            if hidden_size and num_heads:
-                head_dim = hidden_size // num_heads
-
-        key_heads = getattr(text_config, "num_key_value_heads", num_heads)
-        value_heads = getattr(text_config, "num_key_value_heads", num_heads)
-
-        # Key/value dims (can be different from head_dim in some architectures)
-        key_dim = getattr(text_config, "key_dim", head_dim)
-        value_dim = getattr(text_config, "value_dim", head_dim)
-
-        return LightningCacheConfig.create(
-            partition_axis=partition_axis,
-            batch_size=batch_size,
-            num_heads=num_heads,
-            head_dim=head_dim,
-            key_heads=key_heads,
-            value_heads=value_heads,
-            key_dim=key_dim,
-            value_dim=value_dim,
         )
 
     def _create_standard_ragged_page_cache_config(
@@ -2575,7 +2264,6 @@ class EasyGenerationMixin:
         """
         from easydel.caching import (
             KDACacheView,
-            LightningCacheView,
             MLARaggedPagesCacheConfig,
             MLARaggedPagesCacheView,
             ParallelHybridCacheView,
@@ -2881,9 +2569,6 @@ class EasyGenerationMixin:
                     views_config[idx] = config
                 elif view_class is UnifiedAttentionCacheView:
                     views_config[idx] = per_layer_unified_configs.get(idx, shared_unified_config)
-                elif view_class is LightningCacheView:
-                    config = self.create_lightning_cache_config(batch_size=batch_size)
-                    views_config[idx] = config
                 else:
                     raise ValueError(f"Unknown cache view class: {view_class}")
         return views_config
@@ -2913,7 +2598,6 @@ class EasyGenerationMixin:
         - KDA operations -> KDACacheView
         - RaggedPageAttention operations -> RaggedPagesCacheView
         - UnifiedAttention operations -> UnifiedAttentionCacheView
-        - Lightning attention operations -> LightningCacheView
 
         Args:
             batch_size (int): Batch size for inference.
@@ -2938,7 +2622,6 @@ class EasyGenerationMixin:
         from easydel.caching import (
             HybridCache,
             KDACacheView,
-            LightningCacheView,
             MLARaggedPagesCacheView,
             ParallelHybridCacheView,
             RaggedPagesCacheView,
@@ -3181,12 +2864,6 @@ class EasyGenerationMixin:
                             runtime_sharding_resolver=text_config.runtime_sharding_resolver,
                             quantizer=quantizer,
                         )
-                    elif view_class is LightningCacheView:
-                        view = view_class.init(
-                            config=config_classes,
-                            layer_index=idx,
-                            dtype=dtype,
-                        )
                     else:
                         raise ValueError(f"Unknown cache view class: {view_class}")
 
@@ -3198,75 +2875,6 @@ class EasyGenerationMixin:
 
             return HybridCache(views=views)
 
-    def create_operations_metadata(
-        self,
-        *,
-        postpadded: bool = False,
-        starts: jnp.ndarray | None = None,
-        indexes: jnp.ndarray | None = None,
-        pages_tables: jnp.ndarray | None = None,
-        context_lens: jnp.ndarray | None = None,
-        query_start_loc: jnp.ndarray | None = None,
-        num_seqs: jnp.ndarray | None = None,
-        slot_mapping: jnp.ndarray | None = None,
-        position_ids: jnp.ndarray | None = None,
-        page_size: int = 128,
-    ) -> "OperationsMetadata":
-        """Create OperationsMetadata for use with cache operations.
-
-        This method creates OperationsMetadata that works with either:
-        - HybridCache: Uses HybridMetadata with embedded transformer fields
-        - RaggedPagesCache: Uses RaggedPagesMetadata (when ragged params provided)
-
-        For HybridCache (the default), the metadata includes fields needed by
-        TransformerCacheView layers (postpadded, starts, indexes). Recurrent
-        layers use their own internal state management.
-
-        Args:
-            postpadded: Whether sequences are post-padded (for transformer views).
-            starts: Starting positions for sequences (for transformer views).
-            indexes: Current position indices (for transformer views).
-            pages_tables: Page tables mapping (for ragged pages).
-            context_lens: Context lengths per sequence (for ragged pages).
-            query_start_loc: Query start locations (for ragged pages).
-            num_seqs: Number of sequences (for ragged pages).
-            slot_mapping: Slot mapping (for ragged pages).
-            position_ids: Position IDs (for ragged pages).
-            page_size: Page size (for ragged pages).
-
-        Returns:
-            OperationsMetadata configured for the cache type.
-
-        Example:
-            >>> # For HybridCache (default)
-            >>> metadata = model.create_operations_metadata(
-            ...     starts=jnp.zeros((batch_size,), dtype=jnp.int32)
-            ... )
-            >>>
-            >>> # For RaggedPagesCache
-            >>> metadata = model.create_operations_metadata(
-            ...     pages_tables=..., context_lens=...
-            ... )
-        """
-        from easydel.caching import OperationsMetadata
-
-        if pages_tables is not None and context_lens is not None:
-            return OperationsMetadata.for_ragged(
-                pages_tables=pages_tables,
-                context_lens=context_lens,
-                query_start_loc=query_start_loc,
-                num_seqs=num_seqs,
-                slot_mapping=slot_mapping,
-                position_ids=position_ids,
-                page_size=page_size,
-            )
-
-        # Default to hybrid metadata (works with HybridCache)
-        return OperationsMetadata.for_hybrid(
-            postpadded=postpadded,
-            starts=starts,
-            indexes=indexes,
-        )
 
     @cached_property
     def _quant_class(self):

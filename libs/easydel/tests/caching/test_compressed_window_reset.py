@@ -68,9 +68,10 @@ def _cache(n_layers: int = 3) -> CompressedWindowCache:
 
 def _eager_reset(cache: CompressedWindowCache, slots) -> CompressedWindowCache:
     """The per-view path the compiled whole-cache reset replaced."""
-    return CompressedWindowCache(
-        views=[None if v is None else v.reset_slots(jnp.asarray(slots, jnp.int32)) for v in cache.views]
-    )
+    slot_arr = jnp.asarray(slots, jnp.int32).reshape(-1)
+    batch = cache.views[0].cache_position.shape[0]
+    reset_mask = jnp.zeros((batch,), dtype=jnp.bool_).at[slot_arr].set(True, mode="drop")
+    return CompressedWindowCache(views=[None if v is None else v.reset_rows(reset_mask) for v in cache.views])
 
 
 @pytest.mark.parametrize("slots", [[0], [1, 3], [0, 1, 2, 3], []])

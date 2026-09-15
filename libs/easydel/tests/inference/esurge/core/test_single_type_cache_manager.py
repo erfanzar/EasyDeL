@@ -25,9 +25,6 @@ Coverage:
 * ``free`` returns pages to the pool and clears tracking maps
 * ``save_new_computed_pages`` / ``rollback_new_computed_pages`` round-trip
 * ``find_longest_cache_hit`` returns empty pages on a cold pool
-* ``MambaManager.allocate_new_pages`` enforces the 1-page-per-request invariant
-* Cross-manager: ``SlidingWindowManager`` / ``MambaManager`` report 0 common
-  prefix pages by design
 """
 
 from __future__ import annotations
@@ -40,14 +37,12 @@ import pytest
 from easydel.inference.esurge.core.interface import (
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
-    MambaSpec,
     SlidingWindowSpec,
 )
 from easydel.inference.esurge.core.page_pool import PagePool
 from easydel.inference.esurge.core.single_type_cache_manager import (
     ChunkedLocalAttentionManager,
     FullAttentionManager,
-    MambaManager,
     SingleTypeCacheManager,
     SlidingWindowManager,
     get_manager_for_kv_cache_spec,
@@ -87,14 +82,6 @@ def _chunked_spec(*, page_size: int = 16, chunk: int = 64) -> ChunkedLocalAttent
     )
 
 
-def _mamba_spec() -> MambaSpec:
-    return MambaSpec(
-        page_size=1,
-        shapes=((16, 64),),
-        dtype=jnp.float16,
-    )
-
-
 def _make_pool(num_pages: int = 32, *, enable_caching: bool = True) -> PagePool:
     return PagePool(num_pages=num_pages, enable_caching=enable_caching)
 
@@ -111,9 +98,8 @@ def test_single_type_cache_manager_is_abstract():
         (_full_spec, FullAttentionManager),
         (_sliding_spec, SlidingWindowManager),
         (_chunked_spec, ChunkedLocalAttentionManager),
-        (_mamba_spec, MambaManager),
     ],
-    ids=["full", "sliding", "chunked-local", "mamba"],
+    ids=["full", "sliding", "chunked-local"],
 )
 def test_factory_dispatches_by_spec_type(spec_factory, manager_cls):
     pool = _make_pool()
@@ -126,7 +112,6 @@ def test_spec_manager_map_includes_all_known_specs():
     assert FullAttentionSpec in spec_manager_map
     assert SlidingWindowSpec in spec_manager_map
     assert ChunkedLocalAttentionSpec in spec_manager_map
-    assert MambaSpec in spec_manager_map
 
 
 def test_factory_unknown_spec_type_raises():
@@ -277,24 +262,8 @@ def test_full_manager_find_longest_cache_hit_empty_on_cold_pool():
     assert pages == ([],)
 
 
-def test_mamba_manager_find_longest_cache_hit_always_empty():
-    """Mamba layers do not participate in prefix caching."""
-    pool = _make_pool()
-    spec = _mamba_spec()
-    pages = MambaManager.find_longest_cache_hit(
-        page_hashes=[],
-        max_length=128,
-        kv_cache_group_ids=[0, 1],
-        page_pool=pool,
-        kv_cache_spec=spec,
-        use_eagle=False,
-    )
-
-    assert pages == ([], [])
-
-
 def test_full_manager_find_longest_cache_hit_rejects_wrong_spec_type():
-    """Asserts the spec is full or chunked-local; passing a mamba spec raises."""
+    """Asserts the spec is full or chunked-local; passing a sliding spec raises."""
     pool = _make_pool()
     with pytest.raises(AssertionError):
         FullAttentionManager.find_longest_cache_hit(
@@ -302,20 +271,7 @@ def test_full_manager_find_longest_cache_hit_rejects_wrong_spec_type():
             max_length=128,
             kv_cache_group_ids=[0],
             page_pool=pool,
-            kv_cache_spec=_mamba_spec(),
-            use_eagle=False,
-        )
-
-
-def test_mamba_manager_find_longest_cache_hit_rejects_wrong_spec_type():
-    pool = _make_pool()
-    with pytest.raises(AssertionError):
-        MambaManager.find_longest_cache_hit(
-            page_hashes=[],
-            max_length=128,
-            kv_cache_group_ids=[0],
-            page_pool=pool,
-            kv_cache_spec=_full_spec(),
+            kv_cache_spec=_sliding_spec(),
             use_eagle=False,
         )
 
@@ -335,13 +291,6 @@ def test_sliding_window_manager_common_prefix_always_zero():
     assert mgr.get_num_common_prefix_pages("r1", num_scheduled_requests=2) == 0
 
 
-def test_mamba_manager_common_prefix_always_zero():
-    """Mamba layers don't share state across requests."""
-    pool = _make_pool()
-    mgr = MambaManager(_mamba_spec(), pool, kv_cache_group_id=0)
-    assert mgr.get_num_common_prefix_pages("r1", num_scheduled_requests=4) == 0
-
-
 def test_full_manager_remove_skipped_pages_is_noop():
     pool = _make_pool()
     mgr = FullAttentionManager(_full_spec(), pool, kv_cache_group_id=0)
@@ -349,30 +298,6 @@ def test_full_manager_remove_skipped_pages_is_noop():
     pages_before = list(mgr.req_to_pages["r1"])
     mgr.remove_skipped_pages("r1", num_computed_tokens=32)
     assert mgr.req_to_pages["r1"] == pages_before
-
-
-def test_mamba_manager_remove_skipped_pages_is_noop():
-    pool = _make_pool()
-    mgr = MambaManager(_mamba_spec(), pool, kv_cache_group_id=0)
-    mgr.remove_skipped_pages("r1", num_computed_tokens=100)
-
-
-def test_mamba_manager_allocates_single_page_for_request():
-    pool = _make_pool()
-    mgr = MambaManager(_mamba_spec(), pool, kv_cache_group_id=0)
-    pages = mgr.allocate_new_pages("r1", num_tokens=1)
-    assert len(pages) == 1
-    assert len(mgr.req_to_pages["r1"]) == 1
-
-
-def test_mamba_manager_re_allocate_keeps_one_page():
-    pool = _make_pool()
-    mgr = MambaManager(_mamba_spec(), pool, kv_cache_group_id=0)
-    mgr.allocate_new_pages("r1", num_tokens=1)
-    new = mgr.allocate_new_pages("r1", num_tokens=1)
-
-    assert new == []
-    assert len(mgr.req_to_pages["r1"]) == 1
 
 
 def test_sliding_window_manager_records_window():

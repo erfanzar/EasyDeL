@@ -24,7 +24,6 @@ Classes:
     FullAttentionManager: Manager for standard full/causal attention.
     SlidingWindowManager: Manager for sliding window attention.
     ChunkedLocalAttentionManager: Manager for chunked local attention.
-    MambaManager: Manager for Mamba state-space models.
 
 Functions:
     get_manager_for_kv_cache_spec: Factory function to create the appropriate manager.
@@ -39,7 +38,7 @@ from collections import defaultdict
 
 from ..request import EngineRequest
 from ..utils import cdiv
-from .interface import CacheSpec, ChunkedLocalAttentionSpec, FullAttentionSpec, MambaSpec, SlidingWindowSpec
+from .interface import CacheSpec, ChunkedLocalAttentionSpec, FullAttentionSpec, SlidingWindowSpec
 from .page_pool import PagePool
 from .utils import CachePage, PageHash
 
@@ -782,127 +781,12 @@ class ChunkedLocalAttentionManager(SingleTypeCacheManager):
         return 0
 
 
-class MambaManager(SingleTypeCacheManager):
-    """Cache manager for Mamba state-space model layers.
-
-    This manager handles state caching for Mamba layers, which use recurrent
-    state-space models instead of attention. Mamba layers maintain a fixed-size
-    state per request, regardless of sequence length.
-
-    Unlike attention-based managers, MambaManager allocates exactly one page
-    per request to store the recurrent state.
-
-    Example:
-        >>> spec = MambaSpec(shapes=((16, 64),), dtype=jnp.float16, page_size=1)
-        >>> manager = MambaManager(spec, page_pool, kv_cache_group_id=0)
-    """
-
-    @classmethod
-    def find_longest_cache_hit(
-        cls,
-        page_hashes: list[PageHash],
-        max_length: int,
-        kv_cache_group_ids: list[int],
-        page_pool: PagePool,
-        kv_cache_spec: CacheSpec,
-        use_eagle: bool,
-        dp_shard_hint: int | None = None,
-        data_parallel_size: int | None = None,
-    ) -> tuple[list[CachePage], ...]:
-        """Return empty pages (Mamba state is never prefix-cached).
-
-        Mamba uses a fixed-size recurrent state, which cannot meaningfully
-        share a prefix across requests.
-
-        Args:
-            page_hashes: The page hashes of the request (ignored).
-            max_length: The maximum length of the cache hit prefix (ignored).
-            kv_cache_group_ids: The ids of the kv cache groups.
-            page_pool: The page pool (ignored).
-            kv_cache_spec: The kv cache spec (must be :class:`MambaSpec`).
-            use_eagle: Whether to use eagle speculative decoding (ignored).
-            dp_shard_hint: Optional DP shard hint (ignored).
-            data_parallel_size: Total number of DP shards (ignored).
-
-        Returns:
-            Tuple of empty page lists, one per cache group.
-
-        Raises:
-            AssertionError: If the spec is not :class:`MambaSpec`.
-        """
-        assert isinstance(kv_cache_spec, MambaSpec), "MambaManager can only be used for mamba groups"
-
-        computed_pages: tuple[list[CachePage], ...] = tuple([] for _ in range(len(kv_cache_group_ids)))
-        return computed_pages
-
-    def remove_skipped_pages(self, request_id: str, num_computed_tokens: int) -> None:
-        """Remove skipped pages (no-op for Mamba).
-
-        Mamba maintains a fixed state size, so no pages are ever skipped.
-
-        Args:
-            request_id: The request ID.
-            num_computed_tokens: The number of tokens that have been computed.
-        """
-        pass
-
-    def get_num_common_prefix_pages(self, request_id: str, num_scheduled_requests: int) -> int:
-        """Get number of common prefix pages (always 0 for Mamba).
-
-        Mamba layers don't use attention-style prefix sharing.
-
-        Args:
-            request_id: The request ID.
-            num_scheduled_requests: Total number of scheduled requests.
-
-        Returns:
-            Always returns 0 for Mamba layers.
-        """
-        return 0
-
-    def allocate_new_pages(
-        self,
-        request_id: str,
-        num_tokens: int,
-        *,
-        dp_shard_hint: int | None = None,
-        data_parallel_size: int | None = None,
-    ) -> list[CachePage]:
-        """Allocate a single page for Mamba state storage.
-
-        Mamba layers always require exactly one page per request to store
-        the recurrent state, regardless of sequence length.
-
-        Args:
-            request_id: The request ID.
-            num_tokens: The number of tokens (effectively ignored — Mamba
-                state size is fixed).
-            dp_shard_hint: Optional DP shard hint forwarded to the page pool.
-            data_parallel_size: Total number of DP shards.
-
-        Returns:
-            List containing the single allocated page (empty if the request
-            already has its page).
-
-        Raises:
-            AssertionError: If more than one page would be allocated.
-        """
-        new_pages = super().allocate_new_pages(
-            request_id,
-            num_tokens,
-            dp_shard_hint=dp_shard_hint,
-            data_parallel_size=data_parallel_size,
-        )
-        assert len(self.req_to_pages[request_id]) == 1, "MambaManager should only allocate 1 page for each request."
-        return new_pages
-
 
 # Mapping from cache specification types to their corresponding manager classes.
 spec_manager_map: dict[type[CacheSpec], type[SingleTypeCacheManager]] = {
     FullAttentionSpec: FullAttentionManager,
     SlidingWindowSpec: SlidingWindowManager,
     ChunkedLocalAttentionSpec: ChunkedLocalAttentionManager,
-    MambaSpec: MambaManager,
 }
 
 
@@ -922,7 +806,6 @@ def get_manager_for_kv_cache_spec(kv_cache_spec: CacheSpec, **kwargs) -> SingleT
         - FullAttentionManager for FullAttentionSpec
         - SlidingWindowManager for SlidingWindowSpec
         - ChunkedLocalAttentionManager for ChunkedLocalAttentionSpec
-        - MambaManager for MambaSpec
 
     Raises:
         KeyError: If the cache specification type is not in the spec_manager_map.

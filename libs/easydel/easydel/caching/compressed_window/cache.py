@@ -341,31 +341,10 @@ class CompressedWindowCacheView(BaseCacheView):
             **state,
         )
 
-    def reset_slots(self, slot_indices: Array) -> CompressedWindowCacheView:
-        """Reset the given batch rows (slots) to their freshly-initialized state.
-
-        Used by serving engines that map one request per batch row: when a
-        request finishes, its row is wiped so the next request assigned to
-        the same slot starts from an empty stream. KV/buffer/entry state is
-        zeroed, overlap gates return to ``-inf`` (zero pre-first-window
-        softmax weight), and the row's ``cache_position`` returns to 0.
-
-        Args:
-            slot_indices: Int array of row indices to reset (out-of-range
-                indices are ignored).
-
-        Returns:
-            CompressedWindowCacheView: View with the selected rows reset.
-        """
-        slot_arr = jnp.asarray(slot_indices, dtype=jnp.int32).reshape(-1)
-        batch = self.cache_position.shape[0]
-        reset_mask = jnp.zeros((batch,), dtype=jnp.bool_).at[slot_arr].set(True, mode="drop")
-        return self.reset_rows(reset_mask)
-
     def reset_rows(self, reset_mask: Array) -> CompressedWindowCacheView:
         """Reset the rows selected by a boolean mask to empty-stream state.
 
-        Traced-value form of :meth:`reset_slots` (safe inside ``jit``/``scan``):
+        Traced-value reset primitive (safe inside ``jit``/``scan``):
         rows with ``True`` are re-initialized (zero state, ``-inf`` overlap
         gates, position 0), rows with ``False`` are untouched.
 

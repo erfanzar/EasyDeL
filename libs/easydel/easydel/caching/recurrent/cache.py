@@ -29,11 +29,8 @@ By parameterizing the shapes flexibly, we can support all variants with one impl
 
 from __future__ import annotations
 
-import typing as tp
-
 from eformer.jaximus import ImplicitArray
 from eformer.pytree import auto_pytree, field
-from jax import lax
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from jaxtyping import Array, Float, Int
@@ -356,29 +353,6 @@ class RecurrentCacheView(BaseCacheView):
 
         return new_conv_state, new_recurrent_state, new_view
 
-    def update_conv_state(
-        self,
-        new_conv_state: Float[Array, "batch conv_dim"],
-        cache_position: Int[Array, "..."] | None = None,
-    ) -> RecurrentCacheView:
-        """Update the convolutional state with new values.
-
-        Implements a rolling buffer for convolutional states.
-
-        Args:
-            new_conv_state: New convolutional state to insert.
-                Shape: [batch, conv_dim]
-            cache_position: Position index for insertion.
-
-        Returns:
-            RecurrentCacheView: Updated view with new conv state.
-        """
-        _, _, new_view = self.concatenate_to_cache(
-            conv_state=new_conv_state,
-            cache_position=cache_position,
-        )
-        return new_view
-
     def update_recurrent_state(
         self,
         new_recurrent_state: Float[Array, "batch ..."],
@@ -396,24 +370,6 @@ class RecurrentCacheView(BaseCacheView):
         """
         _, _, new_view = self.concatenate_to_cache(recurrent_state=new_recurrent_state)
         return new_view
-
-    # Aliases for backward compatibility with Mamba/Mamba2
-    def update_ssm_state(
-        self,
-        new_ssm_state: Float[Array, "batch ..."],
-    ) -> RecurrentCacheView:
-        """Alias for update_recurrent_state (backward compatibility)."""
-        return self.update_recurrent_state(new_ssm_state)
-
-    @property
-    def ssm_states(self) -> Float[Array, "batch ..."] | ImplicitArray | None:
-        """Alias for recurrent_state (backward compatibility with MambaCache)."""
-        return self.recurrent_state
-
-    @property
-    def conv_states(self) -> Float[Array, "batch conv_dim conv_kernel_size"] | ImplicitArray | None:
-        """Alias for conv_state (backward compatibility with MambaCache)."""
-        return self.conv_state
 
     def reset(self) -> RecurrentCacheView:
         """Reset all cache states to zeros.
@@ -493,67 +449,6 @@ class RecurrentCache(BaseCache):
             ]
         )
 
-    def update_conv_state(
-        self,
-        layer_idx: int,
-        new_conv_state: Float[Array, "batch conv_dim"],
-        cache_position: Int[Array, "..."] | None = None,
-    ) -> RecurrentCache:
-        """Update convolutional state for a specific layer.
-
-        Args:
-            layer_idx: Index of the layer to update.
-            new_conv_state: New convolutional state.
-            cache_position: Position for insertion.
-
-        Returns:
-            RecurrentCache: New cache instance with updated layer.
-        """
-        if self.views[layer_idx] is None:
-            raise ValueError(f"Cache view for layer {layer_idx} is None")
-
-        updated_view = self.views[layer_idx].update_conv_state(
-            new_conv_state=new_conv_state,
-            cache_position=cache_position,
-        )
-
-        new_views = list(self.views)
-        new_views[layer_idx] = updated_view
-        return RecurrentCache(views=new_views)
-
-    def update_recurrent_state(
-        self,
-        layer_idx: int,
-        new_recurrent_state: Float[Array, "batch ..."],
-    ) -> RecurrentCache:
-        """Update recurrent state for a specific layer.
-
-        Args:
-            layer_idx: Index of the layer to update.
-            new_recurrent_state: New recurrent state tensor.
-
-        Returns:
-            RecurrentCache: New cache instance with updated layer.
-        """
-        if self.views[layer_idx] is None:
-            raise ValueError(f"Cache view for layer {layer_idx} is None")
-
-        updated_view = self.views[layer_idx].update_recurrent_state(
-            new_recurrent_state=new_recurrent_state,
-        )
-
-        new_views = list(self.views)
-        new_views[layer_idx] = updated_view
-        return RecurrentCache(views=new_views)
-
-    def update_ssm_state(
-        self,
-        layer_idx: int,
-        new_ssm_state: Float[Array, "batch ..."],
-    ) -> RecurrentCache:
-        """Alias for update_recurrent_state (backward compatibility)."""
-        return self.update_recurrent_state(layer_idx, new_ssm_state)
-
     def reset(self) -> RecurrentCache:
         """Reset all cache layers to zero states.
 
@@ -587,113 +482,6 @@ class RecurrentCache(BaseCache):
                     view.positions = view.positions + num
                 view.seqlen_offset = view.seqlen_offset + num
 
-    def to_pure(self) -> tuple[list[dict[str, tp.Any]], RecurrentCacheConfig | None]:
-        """Convert cache to pure Python data structure for serialization.
-
-        Extracts raw tensors and metadata for checkpointing or transfer.
-
-        Returns:
-            tuple: Pair of (cache_data, metadata) where:
-                - cache_data: List of dicts with conv_state, recurrent_state, positions
-                - metadata: Cache configuration metadata (from first non-None view)
-        """
-        cache_data = []
-        metadata = None
-
-        for view in self.views:
-            if view is None:
-                cache_data.append(None)
-            else:
-                cache_data.append(
-                    {
-                        "conv_state": view.conv_state,
-                        "recurrent_state": view.recurrent_state,
-                        "positions": view.positions,
-                    }
-                )
-                if metadata is None:
-                    metadata = view.metadata
-
-        return cache_data, metadata
-
-    @classmethod
-    def from_pure(
-        cls,
-        cache_data: list[dict[str, tp.Any] | None],
-        metadata: RecurrentCacheConfig | None = None,
-    ) -> "RecurrentCache":
-        """Reconstruct cache from pure Python data structure.
-
-        Restores a cache from serialized tensors and metadata,
-        typically after loading from disk or receiving from transfer.
-
-        Args:
-            cache_data: List of dicts with conv_state, recurrent_state, positions per layer.
-            metadata: Cache configuration metadata.
-
-        Returns:
-            RecurrentCache: Reconstructed cache instance.
-        """
-        views = []
-
-        for idx, data in enumerate(cache_data):
-            if data is None:
-                views.append(None)
-            else:
-                views.append(
-                    RecurrentCacheView(
-                        conv_state=data["conv_state"],
-                        recurrent_state=data["recurrent_state"],
-                        positions=data.get("positions", jnp.zeros((data["conv_state"].shape[0],), dtype=jnp.int32)),
-                        metadata=metadata,
-                        layer_index=idx,
-                    )
-                )
-
-        return cls(views=views)
-
-    def insert(
-        self,
-        other: "RecurrentCache",
-        slot: int,
-    ) -> "RecurrentCache":
-        """Insert another cache's contents at specified batch slot.
-
-        Copies conv_state and recurrent_state from another cache into
-        this cache at the specified batch position.
-
-        Args:
-            other: Source cache to copy from.
-            slot: Batch slot index to insert into.
-
-        Returns:
-            RecurrentCache: Updated cache instance.
-        """
-        new_views = list(self.views)
-
-        for idx in range(len(self.views)):
-            view = self.views[idx]
-            oview = other.views[idx]
-
-            if view is None or oview is None:
-                continue
-
-            update_dict = {}
-
-            if view.conv_state is not None and oview.conv_state is not None:
-                update_dict["conv_state"] = lax.dynamic_update_slice_in_dim(view.conv_state, oview.conv_state, slot, 0)
-
-            if view.recurrent_state is not None and oview.recurrent_state is not None:
-                update_dict["recurrent_state"] = lax.dynamic_update_slice_in_dim(
-                    view.recurrent_state, oview.recurrent_state, slot, 0
-                )
-
-            if view.positions is not None and oview.positions is not None:
-                update_dict["positions"] = lax.dynamic_update_slice_in_dim(view.positions, oview.positions, slot, 0)
-
-            new_views[idx] = view.replace(**update_dict)
-
-        return self.replace(views=new_views)
 
     def __repr__(self) -> str:
         """Return a multi-line ``repr`` listing each layer view.
@@ -715,52 +503,9 @@ class RecurrentMetadata(BaseRunTimeMetadata):
     state), and there is no padded KV table to mask. This class is therefore
     intentionally empty and exists only so the unified
     :class:`OperationsMetadata` wrapper has a typed slot to populate via
-    :meth:`OperationsMetadata.for_recurrent`. New fields can be added here
-    later (segment boundaries, layer-skip flags, …) without touching
+    :class:`OperationsMetadata` wrapper has a typed slot to populate.
+    New fields can be added here
     :class:`HybridCache` or eSurge.
     """
 
     ...
-
-
-# Convenience aliases for backward compatibility
-@auto_pytree
-class LinearCache(RecurrentCache):
-    """Backward-compatibility alias for :class:`RecurrentCache`.
-
-    Older EasyDeL releases shipped a separate ``LinearCache`` for linear
-    attention variants (RWKV, RetNet, GatedDeltaNet) before they were
-    unified with the SSM cache implementation. The class is preserved as
-    a thin subclass so existing user code that imports ``LinearCache`` —
-    and pickled checkpoints that name the class — keep working without a
-    rename.
-    """
-
-
-@auto_pytree
-class LinearCacheConfig(RecurrentCacheConfig):
-    """Backward-compatibility alias for :class:`RecurrentCacheConfig`.
-
-    Mirrors :class:`LinearCache`. New code should construct
-    :class:`RecurrentCacheConfig` directly; this subclass is kept so that
-    serialized configs still resolve.
-    """
-
-
-@auto_pytree
-class LinearCacheView(RecurrentCacheView):
-    """Backward-compatibility alias for :class:`RecurrentCacheView`.
-
-    Mirrors :class:`LinearCache`; preserved purely for import-path
-    stability after the linear-attention/SSM cache unification.
-    """
-
-
-@auto_pytree
-class LinearMetadata(RecurrentMetadata):
-    """Backward-compatibility alias for :class:`RecurrentMetadata`.
-
-    Same role as the other ``Linear*`` aliases — it lets older runner
-    code that referenced ``LinearMetadata`` keep importing the symbol
-    after the recurrent/linear cache merger.
-    """
