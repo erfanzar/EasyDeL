@@ -446,7 +446,8 @@ def test_qwen35_mtp_drafter():
         target_hidden_states=hidden,
         return_full_log_probs=True,
     )
-    assert_shape(step.log_probs, (B,), "drafter.log_probs")
+    # External-resample path: raw last-position logits, no per-token log-prob.
+    assert step.log_probs is None, "return_full_log_probs path should skip per-token log_probs"
     assert step.full_log_probs is not None, "full_log_probs should be provided by MTP drafter"
     assert_shape(step.full_log_probs, (B, cfg.vocab_size), "drafter.full_log_probs")
 
