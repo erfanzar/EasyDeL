@@ -12,58 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""``process_encoder`` -- run a VLM's vision tower on the fly, outside the train step.
+"""Run a frozen vision tower eagerly before the compiled training step.
 
-A vision-language batch normally carries ``pixel_values`` straight into the jitted
-train step, where the model runs its vision tower, merges the resulting patch embeddings
-into the text embeddings at placeholder positions, and backpropagates through the whole
-thing. ``process_encoder`` lifts the tower out of the step: it runs it once under
-``stop_gradient`` and hands the resulting patch embeddings to the step as a precomputed
-tensor. Every VLM family in the zoo already accepts precomputed features -- their merge
-sites read ``if image_features is None and pixel_values is not None:`` -- so no modeling
-code changes; this module only has to find the right keyword per family.
+Inputs may be bucketed by repeating the last genuine image row. Feature validity is
+computed from the raw encoder output's explicit image axis (or per-image list), never
+from the number of text placeholders. Padded already-flat outputs are ambiguous and
+retain the original in-model path. Grid-described patch inputs are never row-padded.
 
-What that buys, on the current data path:
+Consumers explicitly accepting ``<feature_kwarg>_valid_length`` receive a flat capacity
+buffer plus an int32 scalar identifying its genuine prefix. Only these consumers can
+retain bucket/high-water output capacity across steps; a larger bucket still grows that
+capacity. Other consumers receive exactly the genuine features, without historical
+padding, and their step signature can change with image count.
 
-1. **No vision backward.** Tower activations are not retained for a backward pass that is
-   discarded whenever the tower is not the thing being trained. On a 300-400M tower this
-   is the dominant saving, and it applies to every step.
-2. **A fixed step signature.** ``pixel_values`` is image-major and dense (one row per real
-   image), so its leading dimension moves with the number of images in the batch and the
-   jitted step recompiles per distinct count. Bucketing the tower's input and zero-padding
-   the emitted features to a constant width collapses that to one signature.
-
-What it does *not* currently buy: skipping "dead" rows. That would need a batch carrying
-images for only some of its sequences, and the collators do not produce one -- mixed
-presence is either rejected outright (``"GRPO batches must not mix present and missing
-generation kwargs"``) or the key is dropped for the whole batch. Row packing is therefore
-implemented and tested but reachable only via an explicit ``presence_key``, for a data path
-that can represent mixed batches; :class:`PixelLayout` records which case a batch is in.
-
-Correctness rests on how :meth:`BaseVisionLanguageModule.merge_multimodal_embeddings`
-places features. It is purely positional::
-
-    gather_indices = jnp.cumsum(flat_mask)          # k-th placeholder <- features[k - 1]
-    update_values = flattened_padded[gather_indices]
-
-Two properties follow, and this module is built on both:
-
-* **Dropping text-only rows is exact.** Such rows contain no placeholder tokens, so they
-  consume no features. Preserving the relative order of the surviving rows is the only
-  requirement.
-* **Trailing features are never read.** ``gather_indices`` never exceeds the total
-  placeholder count, so any feature rows past the last placeholder are inert.
-
-The second property is what keeps compilation bounded. The tower runs on a *bucketed*
-row count (few distinct shapes, real work saved), while the tensor handed to the train
-step is zero-padded back to a *constant* shape, so the step itself never sees a new
-signature and never recompiles. Padding costs a little bandwidth and no compute.
-
-Gradient semantics: the tower is a frozen feature extractor for any step this runs on.
-That is the point -- it is what buys the skipped backward -- but it means a run that
-intends to *train* the vision tower must leave ``process_encoder`` disabled and use the
-normal in-model path. :func:`validate_process_encoder` refuses the combination rather
-than silently freezing a tower the optimizer was told to update.
+Processing freezes the tower for processed steps. To train the vision tower, leave this
+feature disabled. Flattened full-batch features currently cannot be sliced correctly
+for gradient accumulation or scheduled MPMD microbatching; setup rejects those active
+combinations rather than silently associating features with the wrong text sequence.
 """
 
 from __future__ import annotations
@@ -111,10 +76,9 @@ class ProcessEncoderConfig:
     Attributes:
         enabled: Master switch; when ``False`` every entry point is a no-op.
         row_bucket_multiple: Packed vision-row counts are rounded up to a multiple of
-            this before the tower runs, so the encoder compiles a handful of shapes
-            instead of one per distinct image count. Coarser means fewer compilations
-            and more wasted rows; ``1`` disables bucketing (and invites a compilation
-            per distinct count). Ignored when the batch is fully vision-bearing.
+            this before the eager tower call. Coarser buckets mean fewer input shapes
+            and more wasted rows; ``1`` disables bucketing. Grid-described patch
+            inputs are not padded.
         max_rows_per_step: Optional hard cap on packed rows per step. Rows past the cap
             keep their in-model path (``pixel_values`` is retained) rather than being
             silently dropped, so no image is lost.
@@ -195,12 +159,15 @@ class EncoderBinding:
         feature_fn_name: Name of the method that runs the tower (``get_image_features``).
         accepted_kwargs: Parameter names ``feature_fn_name`` accepts, so only the batch
             keys a family actually wants are forwarded.
+        feature_valid_length_kwarg: Explicit forward parameter for the genuine token
+            prefix length; absent for consumers requiring exact-sized features.
     """
 
     tower_attr: str
     feature_kwarg: str
     feature_fn_name: str
     accepted_kwargs: frozenset[str]
+    feature_valid_length_kwarg: str | None = None
 
 
 def _unwrap(model: tp.Any) -> tp.Any:
@@ -257,7 +224,10 @@ def _forward_accepts(model: tp.Any, name: str) -> bool:
             params = inspect.signature(fn).parameters
         except (TypeError, ValueError):
             continue
-        if name in params:
+        if name in params and params[name].kind not in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
             return True
     return False
 
@@ -297,6 +267,9 @@ def resolve_encoder_binding(model: tp.Any) -> EncoderBinding | None:
         feature_kwarg=feature_kwarg,
         feature_fn_name="get_image_features",
         accepted_kwargs=accepted,
+        feature_valid_length_kwarg=(
+            f"{feature_kwarg}_valid_length" if _forward_accepts(model, f"{feature_kwarg}_valid_length") else None
+        ),
     )
 
 
@@ -372,8 +345,8 @@ def vision_row_presence(batch: tp.Mapping[str, tp.Any], presence_key: str | None
 def bucket_row_count(count: int, multiple: int, ceiling: int) -> int:
     """Round ``count`` up to a multiple of ``multiple``, never past ``ceiling``.
 
-    Bucketing keeps the encoder's compiled shape set small. The ceiling is the original
-    batch row count -- padding past it would do more work than not packing at all.
+    Bucketing bounds the encoder's input shape set. Row-major callers cap at the
+    original batch size; image-major callers may pad beyond the incoming image count.
     """
     if count <= 0:
         return 0
@@ -476,9 +449,9 @@ def pack_vision_inputs(
 
     Rows are taken in ascending original order and the tail is padded by repeating the
     last selected row. Repetition rather than zeros keeps any per-row grid metadata
-    self-consistent (a zero grid would describe an image of no patches); the features
-    those padding rows produce are never gathered by the merge, so their content is
-    irrelevant -- only their shape matters.
+    self-consistent. Grid-described inputs are selected without row padding. Features
+    from repeated padding rows are either trimmed before the step or excluded by the
+    consumer's explicit valid-prefix contract.
     """
     take = selection.indices
     if selection.padded_rows > take.size:
@@ -501,10 +474,8 @@ def pack_vision_inputs(
 def pad_features_to_constant(features: jnp.ndarray, target_rows: int) -> jnp.ndarray:
     """Zero-pad flattened features up to ``target_rows`` so the step's shape is constant.
 
-    Safe because the merge gathers by ``cumsum`` over placeholder positions and therefore
-    never indexes past the final placeholder: trailing rows are inert. This is what lets
-    the tower run on a small bucketed shape while the jitted train step keeps a single
-    input signature.
+    The caller must carry the genuine prefix length to a consumer explicitly supporting
+    capacity buffers. Exact-count consumers must not receive this padding.
     """
     current = features.shape[0]
     if current >= target_rows:
@@ -526,12 +497,32 @@ def flatten_features(features: tp.Any) -> jnp.ndarray:
     return array.reshape(-1, array.shape[-1])
 
 
+def _genuine_feature_length(features: tp.Any, selection: VisionSelection) -> int | None:
+    """Count genuine tokens before flattening erases explicit image boundaries.
+
+    An unpadded call owns its entire output. A padded call must retain either an
+    explicit image axis or exactly one list entry per encoded image; otherwise the
+    original batch must use its in-model path.
+    """
+    padded = selection.padded_rows != selection.selected_rows
+    if isinstance(features, list | tuple):
+        if padded and len(features) != selection.padded_rows:
+            return None
+        parts = features[: selection.selected_rows] if padded else features
+        return sum(int(np.prod(part.shape[:-1])) for part in parts)
+    if padded:
+        if features.ndim < 3 or features.shape[0] != selection.padded_rows:
+            return None
+        return selection.selected_rows * int(np.prod(features.shape[1:-1]))
+    return int(np.prod(features.shape[:-1]))
+
+
 class EncoderProcessor:
     """Runs a model's vision tower out of band and injects the result into batches.
 
-    Holds the resolved :class:`EncoderBinding` and the per-shape compiled encode
-    functions. One instance lives on the trainer; :meth:`process` is called once per
-    microbatch, immediately before the jitted train step.
+    Holds the resolved :class:`EncoderBinding` and output-capacity high-water mark.
+    One instance lives on the trainer; :meth:`process` runs eagerly on the full batch
+    immediately before the compiled train step.
     """
 
     def __init__(self, model: tp.Any, config: ProcessEncoderConfig, binding: EncoderBinding | None = None):
@@ -582,7 +573,7 @@ class EncoderProcessor:
         :func:`validate_process_encoder`'s job at construction time.
 
         Args:
-            batch: The collated microbatch.
+            batch: The collated full batch.
             model: Model to encode with; defaults to the one bound at construction.
             bucket_index: Training bucket this step is routed to, for ``only_buckets``.
 
@@ -614,21 +605,42 @@ class EncoderProcessor:
         model = model if model is not None else self._model
 
         packed = pack_vision_inputs(batch, selection)
-        features = flatten_features(self._encode(model, packed))
+        raw_features = self._encode(model, packed)
+        valid_length = _genuine_feature_length(raw_features, selection)
+        if valid_length is None:
+            # An already-flat padded output has lost the image boundaries. Dividing
+            # by padded_rows would guess incorrectly for variable-sized images.
+            return batch
+        features = flatten_features(raw_features)
+
+        # Cross-check the encoder-derived feature count against the merge site's
+        # placeholder tokens.
+        merge_feature = getattr(model, "_multimodal_merge_feature", None)
+        if merge_feature is None:
+            merge_feature = getattr(getattr(model, "base_model", None), "_multimodal_merge_feature", None)
+        image_token_id = getattr(merge_feature, "image_token_id", None)
+        input_ids = batch.get("input_ids")
+        if binding.feature_valid_length_kwarg is not None and (image_token_id is None or input_ids is None):
+            return batch
+        if image_token_id is not None and input_ids is not None:
+            host_ids = np.asarray(jax.device_get(input_ids))
+            placeholder_count = int(np.count_nonzero(np.isin(host_ids, image_token_id)))
+            if placeholder_count != valid_length:
+                raise ValueError(
+                    f"process_encoder: Expected {placeholder_count} image placeholder tokens "
+                    f"but got {valid_length} genuine image features."
+                )
 
         if config.feature_dtype is not None:
             features = features.astype(jnp.dtype(config.feature_dtype))
 
-        # Hold the step's input signature constant across steps: the first processed
-        # batch fixes the target, and later batches (which encode a different bucketed
-        # row count) are zero-padded up to it. Inert trailing rows make this free.
-        per_row_tokens = max(1, features.shape[0] // max(1, selection.padded_rows))
-        target_rows = selection.padded_rows * per_row_tokens
-        if self._feature_rows_target is None or target_rows > self._feature_rows_target:
-            self._feature_rows_target = target_rows
-        features = pad_features_to_constant(features, self._feature_rows_target)
-
         processed = dict(batch)
+        if binding.feature_valid_length_kwarg is not None:
+            self._feature_rows_target = max(self._feature_rows_target or 0, features.shape[0])
+            features = pad_features_to_constant(features, self._feature_rows_target)
+            processed[binding.feature_valid_length_kwarg] = jnp.asarray(valid_length, dtype=jnp.int32)
+        else:
+            features = features[:valid_length]
         processed[binding.feature_kwarg] = features
         # Drop the pixels so the family's `if features is None and pixel_values is not
         # None` guard takes the precomputed branch and the tower does not run twice.
@@ -640,26 +652,36 @@ def validate_process_encoder(
     config: ProcessEncoderConfig,
     model: tp.Any,
     trainable_selector: tp.Any = None,
+    *,
+    gradient_accumulation_steps: int = 1,
+    mpmd_scheduler: tp.Any = None,
+    bucket_gradient_accumulation_steps: tp.Sequence[int | None] | None = None,
 ) -> EncoderBinding | None:
     """Validate a ``process_encoder`` setup at trainer construction, returning the binding.
 
-    Raises rather than silently degrading, because both failure modes are quiet in
-    training: an unsupported model would keep paying the full vision cost the flag was
-    set to avoid, and a tower listed as trainable would stop receiving gradients while
-    the loss curve kept looking plausible.
+    Unsupported models can explicitly fall back to their in-model path. Active
+    microbatch slicing is rejected because flattened features are not sequence-major.
+    Processing freezes the tower; a trainable selector is logged, not enforced here.
 
     Args:
         config: The trainer's process-encoder config.
         model: The model to be trained.
         trainable_selector: The state's trainable selector, if any, used to detect a
             vision tower that the optimizer was told to update.
+        gradient_accumulation_steps: Number of full-batch gradient-accumulation slices.
+        mpmd_scheduler: Optional pipeline schedule; only an active multi-stage MPMD
+            mesh with more than one scheduled microbatch is incompatible.
+        bucket_gradient_accumulation_steps: Overrides from the trainer's resolved
+            bucket list, in bucket-index order. None entries inherit the global
+            count. Only buckets selected by ``config.only_buckets`` are checked.
+            None or an empty sequence means the trainer has no training buckets.
 
     Returns:
         The resolved binding, or ``None`` when disabled.
 
     Raises:
         ValueError: If enabled for a model that cannot accept precomputed features
-            (and ``require_support``), or if the vision tower appears trainable.
+            (and ``require_support``), or active microbatch slicing is requested.
     """
     if not config.enabled:
         return None
@@ -678,6 +700,29 @@ def validate_process_encoder(
             raise ValueError(message)
         logger.warning(message)
         return None
+
+    if bucket_gradient_accumulation_steps:
+        active_accumulation = [
+            (index, gradient_accumulation_steps if override is None else override)
+            for index, override in enumerate(bucket_gradient_accumulation_steps)
+            if config.applies_to_bucket(index)
+        ]
+    else:
+        active_accumulation = [(None, gradient_accumulation_steps)] if config.applies_to_bucket(None) else []
+    for bucket_index, accumulation_steps in active_accumulation:
+        if accumulation_steps > 1:
+            location = "" if bucket_index is None else f" for bucket {bucket_index}"
+            raise ValueError(
+                f"process_encoder requires gradient_accumulation_steps=1{location}: flattened full-batch "
+                "image features cannot be sliced into text microbatches."
+            )
+    if active_accumulation and mpmd_scheduler is not None and getattr(mpmd_scheduler, "microbatches", 1) > 1:
+        mesh = getattr(model, "mesh", None)
+        if bool(getattr(mesh, "is_mpmd", False)) or int(getattr(mesh, "mpmd_dim", 1)) > 1:
+            raise ValueError(
+                "process_encoder does not support scheduled MPMD microbatching: flattened "
+                "full-batch image features cannot be sliced into text microbatches."
+            )
 
     if isinstance(trainable_selector, str) and trainable_selector not in ("parameters", ""):
         logger.info(

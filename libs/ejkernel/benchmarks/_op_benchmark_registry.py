@@ -39,6 +39,7 @@ from ejkernel.benchmarks import Benchmark
 from ejkernel.kernels._pallas.tpu.quantized_matmul._packed_gemv import pack_int4_adjacent, pack_int4_split_k
 from ejkernel.kernels._registry import Backend, kernel_registry
 from ejkernel.modules import operations as ops
+from ejkernel.modules.operations.configs import TopKConfig
 from ejkernel.quantization import prepack_quantized_weights
 from ejkernel.utils import make_dummy_rpa_inputs
 
@@ -878,6 +879,47 @@ def _cfgs_grouped_matmul_quant():
         k=[256, 512],
         n=[512],
     )
+    return _limit_configs(configs)
+
+
+def _cfgs_grouped_matmul_channelwise():
+    """Exercise explicit W8A16, W4A16, W8A8, and W4A4 grouped matmuls."""
+    configs = [
+        dict(config, weight_bits=weight_bits, activation_bits=activation_bits, dtype="bfloat16")
+        for config in _grid(groups=[8, 16], m_per_group=[32], k=[256, 512], n=[512])
+        for weight_bits, activation_bits in ((8, 16), (4, 16), (8, 8), (4, 4))
+    ]
+    return _limit_configs(configs)
+
+
+def _cfgs_sinkhorn_knopp():
+    """Benchmark fp32 4-stream mHC projection at decode and prefill sizes."""
+    # Assign dtype after _grid: its TPU override is inappropriate for mixer math.
+    configs = [
+        dict(config, dtype="float32")
+        for config in _grid(batch=[1], seq=[8, 128, 1024], streams=[4], n_iters=[20], eps=[1e-6])
+    ]
+    return _limit_configs(configs)
+
+
+def _cfgs_mhc_coefficients():
+    """Benchmark fp32 4-stream mHC gates and mixer from decode to training token counts."""
+    # Assign dtype after _grid: its TPU override is inappropriate for mixer math.
+    configs = [
+        dict(config, dtype="float32")
+        for config in _grid(batch=[1], seq=[8, 128, 1024, 8192], hc_mult=[4], n_iters=[20], eps=[1e-6])
+    ]
+    return _limit_configs(configs)
+
+
+def _cfgs_topk():
+    """Router, DSA, and vocabulary/filter top-k workloads."""
+    configs = [
+        dict(rows=32, width=256, k=6, mode="values", dtype="float32"),
+        dict(rows=32, width=2048, k=512, mode="values", dtype="float32"),
+        *[dict(rows=32, width=129280, k=k, mode="values", dtype="float32") for k in (8, 20, 50)],
+        dict(rows=32, width=129280, k=99, mode="filter", dtype="float32"),
+    ]
     return _limit_configs(configs)
 
 
@@ -1988,7 +2030,7 @@ def _gen_w4a4_gemv_inputs(config: dict[str, Any]):
 
 
 def _gen_grouped_matmul_quant_inputs(config: dict[str, Any]):
-    """Generate LHS, per-group int8 codes, scales, and group sizes for quantized grouped matmul."""
+    """Generate LHS, signed int8 (or int4) channelwise codes, scales, and group sizes."""
     groups = config.get("groups", 8)
     m_per = config.get("m_per_group", 32)
     k = config.get("k", 512)
@@ -1996,13 +2038,56 @@ def _gen_grouped_matmul_quant_inputs(config: dict[str, Any]):
     m = groups * m_per
     key = jax.random.PRNGKey(config.get("seed", 0))
     k1, k2 = jax.random.split(key, 2)
-    lhs = jax.random.normal(k1, (m, k), dtype=_default_dtype())
+    dtype = _as_jax_dtype(config.get("dtype", _default_dtype()))
+    weight_bits = config.get("weight_bits", 8)
+    bound = float(2 ** (weight_bits - 1) - 1)
+    lhs = jax.random.normal(k1, (m, k), dtype=dtype)
     w = jax.random.normal(k2, (groups, k, n), dtype=jnp.float32)
     absmax = jnp.max(jnp.abs(w), axis=1, keepdims=True)
-    scales = jnp.where(absmax == 0, 1.0, absmax / 127.0).astype(jnp.float32)
-    codes = jnp.clip(jnp.round(w / scales), -127, 127).astype(jnp.int8)
+    scales = jnp.where(absmax == 0, 1.0, absmax / bound).astype(jnp.float32)
+    codes = jnp.clip(jnp.round(w / scales), -bound, bound).astype(jnp.int4 if weight_bits == 4 else jnp.int8)
     group_sizes = jnp.full((groups,), m_per, dtype=jnp.int32)
     return lhs, codes, scales, group_sizes
+
+
+def _gen_grouped_matmul_channelwise_inputs(config: dict[str, Any]):
+    """Reuse channelwise weight quantization, appending static activation precision."""
+    return (*_gen_grouped_matmul_quant_inputs(config), config["activation_bits"])
+
+
+def _gen_mhc_coefficients_inputs(config: dict[str, Any]):
+    """Generate fp32 projection logits, offsets and the three gate/mixer scales."""
+    hc = config["hc_mult"]
+    width = hc * (hc + 2)
+    key_logits, key_base = jax.random.split(jax.random.PRNGKey(config.get("seed", 0)))
+    dtype = _as_jax_dtype(config["dtype"])
+    logits = jax.random.normal(key_logits, (config["batch"], config["seq"], width), dtype=dtype)
+    base = jax.random.normal(key_base, (width,), dtype=dtype) * 0.1
+    scale = jnp.asarray([0.7, 1.3, 1.1], dtype=dtype)
+    return logits, base, scale, hc, config["n_iters"], config["eps"]
+
+
+def _gen_sinkhorn_knopp_inputs(config: dict[str, Any]):
+    """Generate positive fp32 matrices; input construction is outside timed projection."""
+    shape = (config["batch"], config["seq"], config["streams"], config["streams"])
+    matrix = jax.random.uniform(
+        jax.random.PRNGKey(config.get("seed", 0)),
+        shape,
+        dtype=_as_jax_dtype(config["dtype"]),
+        minval=0.01,
+        maxval=1.0,
+    )
+    return matrix, config["n_iters"], config["eps"]
+
+
+def _gen_topk_inputs(config: dict[str, Any]):
+    """Generate logits and either static k or traced per-row filter counts (1..k)."""
+    rng = np.random.default_rng(config.get("seed", 0))
+    operand = jnp.asarray(rng.normal(size=(config["rows"], config["width"])), _as_jax_dtype(config["dtype"]))
+    if config["mode"] == "filter":
+        per_row_k = jnp.asarray(rng.integers(1, config["k"] + 1, size=(config["rows"],)), jnp.int32)
+        return operand, None, config["mode"], per_row_k
+    return operand, config["k"], config["mode"], None
 
 
 def _gen_fused_mlp_inputs(config: dict[str, Any]):
@@ -2327,6 +2412,70 @@ def _lightning_wrapper(op_fn: Callable[..., Any], platform: str):
             The first element when ``op_fn`` returns a tuple, otherwise the attention output.
         """
         out = op_fn(q, k, v, layer_idx=layer_idx, num_layers=num_layers, platform=platform)
+        return out[0] if isinstance(out, tuple) else out
+
+    return _fn
+
+
+def _grouped_matmul_channelwise_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Force the platform and static activation precision, with bf16 output."""
+
+    def _fn(lhs, codes, scales, group_sizes, activation_bits):
+        """Multiply grouped activations by signed codes, then apply channel scales."""
+        return op_fn(
+            lhs,
+            codes,
+            scales,
+            group_sizes,
+            activation_bits=activation_bits,
+            preferred_element_type=jnp.bfloat16,
+            platform=platform,
+        )
+
+    return _fn
+
+
+def _mhc_coefficients_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Pin platform and static settings; return every output so backward covers all three."""
+
+    def _fn(logits, base, scale, hc_mult, n_iters, eps):
+        """Concatenate read gates, write gates and the flattened mixer into one array."""
+        pre, post, mixer = op_fn(logits, base, scale, hc_mult=hc_mult, n_iters=n_iters, eps=eps, platform=platform)
+        return jnp.concatenate([pre, post, mixer.reshape(*mixer.shape[:-2], -1)], axis=-1)
+
+    return _fn
+
+
+def _sinkhorn_knopp_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Keep iteration count and denominator epsilon static for each platform."""
+
+    def _fn(matrix, n_iters, eps):
+        """Project positive matrices with identical row/column normalization math."""
+        return op_fn(matrix, n_iters=n_iters, eps=eps, platform=platform)
+
+    return _fn
+
+
+def _topk_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Pin top-k's config (its public API has no platform keyword).
+
+    Values mode measures the value output, like the registry's other tuple
+    operations; returning an array lets Benchmark synchronize correctly.
+    Filter mode returns the whole filtered input. The Pallas implementation
+    explicitly delegates dynamic-k filtering to XLA, so that row is not a
+    fused Pallas measurement.
+    """
+    cfg = TopKConfig(platform=platform, backend="any" if platform == "xla" else jax.default_backend())
+
+    def _fn(operand, k, mode, per_row_k):
+        """Run static-k values or dynamic per-row filtering with finite fill."""
+        out = op_fn(
+            operand,
+            per_row_k if mode == "filter" else k,
+            mode=mode,
+            mask_fill=float(jnp.finfo(operand.dtype).min),
+            cfg=cfg,
+        )
         return out[0] if isinstance(out, tuple) else out
 
     return _fn
@@ -3706,6 +3855,35 @@ SPECS: dict[str, OpBenchmarkSpec] = {
         static_kwargs=["mode"],
         bench_bwd=True,
     ),
+    "mhc_coefficients": OpBenchmarkSpec(
+        op_name="mhc_coefficients",
+        algorithm="mhc_coefficients",
+        op_fn=ops.mhc_coefficients,
+        input_generator=_gen_mhc_coefficients_inputs,
+        configs=_cfgs_mhc_coefficients(),
+        wrapper_factory=_mhc_coefficients_wrapper,
+        static_kwargs=["hc_mult", "n_iters", "eps"],
+        bench_bwd=True,
+    ),
+    "sinkhorn_knopp": OpBenchmarkSpec(
+        op_name="sinkhorn_knopp",
+        algorithm="sinkhorn_knopp",
+        op_fn=ops.sinkhorn_knopp,
+        input_generator=_gen_sinkhorn_knopp_inputs,
+        configs=_cfgs_sinkhorn_knopp(),
+        wrapper_factory=_sinkhorn_knopp_wrapper,
+        static_kwargs=["n_iters", "eps"],
+        bench_bwd=True,
+    ),
+    "topk": OpBenchmarkSpec(
+        op_name="topk",
+        algorithm="topk",
+        op_fn=ops.topk,
+        input_generator=_gen_topk_inputs,
+        configs=_cfgs_topk(),
+        wrapper_factory=_topk_wrapper,
+        static_kwargs=["k", "mode"],
+    ),
     "mean_pooling": OpBenchmarkSpec(
         op_name="mean_pooling",
         algorithm="mean_pooling",
@@ -3858,6 +4036,15 @@ SPECS: dict[str, OpBenchmarkSpec] = {
         input_generator=_gen_w4a4_gemv_inputs,
         configs=_cfgs_packed_int4_gemv(),
         wrapper_factory=_registry_wrapper("w4a4_gemv"),
+    ),
+    "grouped_matmul_channelwise": OpBenchmarkSpec(
+        op_name="grouped_matmul_channelwise",
+        algorithm="grouped_matmul_channelwise",
+        op_fn=ops.grouped_matmul_channelwise,
+        input_generator=_gen_grouped_matmul_channelwise_inputs,
+        configs=_cfgs_grouped_matmul_channelwise(),
+        wrapper_factory=_grouped_matmul_channelwise_wrapper,
+        static_kwargs=["activation_bits"],
     ),
     "grouped_matmul_quant": OpBenchmarkSpec(
         op_name="grouped_matmul_quant",

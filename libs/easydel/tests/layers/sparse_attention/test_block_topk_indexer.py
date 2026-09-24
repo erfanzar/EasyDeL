@@ -107,6 +107,8 @@ def _make_indexer(seed=0):
         indexer_compress_ratio=RATIO,
         dtype=jnp.float32,
         param_dtype=jnp.float32,
+        # The independent NumPy scoring reference uses full-fp32 multiplies.
+        precision=jax.lax.Precision.HIGHEST,
         rngs=spx.Rngs(seed),
     )
     w = rng.standard_normal(((N_HEADS + 1) * HEAD_DIM, HIDDEN)).astype(np.float32) * 0.08
@@ -449,3 +451,115 @@ def test_left_padding_score_proxy_tracks_actual_block_members():
     )
     np.testing.assert_allclose(np.asarray(padded_score[:, :, pad:, pad:]), np.asarray(score), rtol=1e-5, atol=1e-5)
     np.testing.assert_array_equal(np.asarray(padded_score[..., :pad]), 0.0)
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+def test_paged_block_scores_and_selection_match_independent_reference(dtype):
+    """Physical-page reordering must not change logical QSA ranking or tail."""
+    mod, *_ = _make_indexer(seed=23)
+    rng = np.random.default_rng(24)
+    q = jnp.asarray(rng.normal(size=(3, N_HEADS, HEAD_DIM)), dtype)
+    keys = jnp.asarray(rng.normal(size=(12, HEAD_DIM)), dtype)
+    mapping = jnp.asarray([[8, 9, 2, 3, 6], [4, 5, 0, 1, 7], [11, 10, 6, 7, 0]], jnp.int32)
+    qpos = np.asarray([18, 15, 10], np.int32)
+    valid = np.asarray([True, True, False])
+    q_np, k_np = np.asarray(q, np.float32), np.asarray(keys, np.float32)
+    # Keep the independently written head-by-head accumulation: do not obtain
+    # the reference from dense selection or the production scoring methods.
+    physical_scores = np.zeros((3, 12), np.float32)
+    for head in range(N_HEADS):
+        physical_scores += np.maximum(q_np[:, head] @ k_np.T, 0)
+    expected_scores = np.take_along_axis(physical_scores, np.asarray(mapping), axis=1) / np.sqrt(HEAD_DIM)
+    scores = jax.jit(mod.score_paged_blocks)(q, keys, mapping)
+    np.testing.assert_allclose(np.asarray(scores), expected_scores, rtol=2e-6, atol=2e-6)
+
+    selected = jax.jit(mod.select_paged)(q, keys, mapping, jnp.asarray(qpos), jnp.asarray(valid))
+    expected = np.full((3, BUDGET + RATIO - 1), -1, np.int32)
+    for row in range(3):
+        eligible = [block for block in range(5) if valid[row] and (block + 1) * RATIO - 1 <= qpos[row]]
+        order = sorted(eligible, key=lambda block: (-expected_scores[row, block], block))[: BUDGET // RATIO]
+        for slot, block in enumerate(order):
+            expected[row, slot * RATIO : (slot + 1) * RATIO] = np.arange(block * RATIO, (block + 1) * RATIO)
+        # Invalid execution padding retains the historical tail behavior; the
+        # attention adapter gates these rows using the live-token metadata.
+        tail = np.arange(((qpos[row] + 1) // RATIO) * RATIO, qpos[row] + 1)
+        expected[row, BUDGET : BUDGET + len(tail)] = tail
+    np.testing.assert_array_equal(np.asarray(selected.indices), expected)
+
+
+def test_block_selection_preserves_infinity_ties_and_empty_candidates():
+    from easydel.layers.indexer import BaseIndexer, IndexerSelection
+    from easydel.layers.indexer._block_topk import BlockTopKIndexer as CanonicalIndexer
+
+    mod, *_ = _make_indexer(seed=25)
+    assert isinstance(mod, BaseIndexer)
+    assert CanonicalIndexer is BlockTopKIndexer
+    assert mod.selection_spec.candidate_unit == "block"
+    assert mod.selection_spec.output_unit == "token"
+    scores = jnp.asarray([[[jnp.inf, 3, jnp.inf, -jnp.inf]], [[-jnp.inf] * 4]])
+    selected = mod.select_blocks(
+        scores,
+        first_visible=jnp.asarray([0, 2]),
+        q_indices=jnp.asarray([[16], [0]]),
+        q_live=jnp.asarray([[True], [False]]),
+    )
+    assert isinstance(selected, IndexerSelection)
+    np.testing.assert_array_equal(np.asarray(selected.indices[0, 0]), [0, 1, 2, 3, 8, 9, 10, 11, 16, -1, -1])
+    np.testing.assert_array_equal(np.asarray(selected.indices[1]), -np.ones((1, BUDGET + RATIO - 1)))
+    np.testing.assert_array_equal(
+        np.asarray(mod.build_mask(selected.indices, 20)[:, 0]), np.asarray(selected.to_mask(20))
+    )
+
+
+@pytest.mark.parametrize(("seq", "prefix", "left_pad"), [(24, 0, 0), (23, 0, 5), (13, 0, 2), (7, 17, 3)])
+def test_forward_dense_mask_matches_selected_indices(seq, prefix, left_pad):
+    """The scatter-free forward mask equals scattering ``select``'s token indices."""
+    mod, *_ = _make_indexer(seed=seq + prefix)
+    rng = np.random.default_rng(seq)
+    kv_len = prefix + seq
+    hidden = jnp.asarray(rng.standard_normal((2, kv_len, HIDDEN)).astype(np.float32) * 0.5)
+    visible = np.ones((2, kv_len), bool)
+    visible[0, :left_pad] = False
+    visible = jnp.asarray(visible)
+    cos, sin = _cos_sin_table(np.arange(kv_len))
+    k_cos, k_sin = jnp.asarray(cos[None].repeat(2, 0)), jnp.asarray(sin[None].repeat(2, 0))
+    cached_raw_k = mod.project(hidden[:, :prefix])[1] if prefix else None
+    current = hidden[:, prefix:]
+    kwargs = dict(q_cos=k_cos[:, prefix:], q_sin=k_sin[:, prefix:], k_cos=k_cos, k_sin=k_sin, visible=visible)
+
+    mask, raw_k_full = jax.jit(lambda h, c: mod(h, cached_raw_k=c, **kwargs))(current, cached_raw_k)
+    indices = mod.select(mod.project(current)[0], raw_k_full, **kwargs)
+    assert mask.shape == (2, 1, seq, kv_len)
+    np.testing.assert_array_equal(np.asarray(mask[:, 0]), _as_mask_set(np.asarray(indices), kv_len))
+
+
+@pytest.mark.parametrize("kv_len", [16, 13, 1])
+def test_blocks_to_tokens_matches_block_lookup(kv_len):
+    mod, *_ = _make_indexer()
+    blocks = -(-kv_len // RATIO)
+    rng = np.random.default_rng(kv_len)
+    per_block = rng.standard_normal((3, 2, blocks)).astype(np.float32)
+    first_visible = np.array([0, min(3, kv_len - 1), kv_len - 1], np.int32)
+    got = np.asarray(mod._blocks_to_tokens(jnp.asarray(per_block), jnp.asarray(first_visible), kv_len))
+    want = np.zeros((3, 2, kv_len), np.float32)
+    for b in range(3):
+        for t in range(first_visible[b], kv_len):
+            want[b, :, t] = per_block[b, :, (t - first_visible[b]) // RATIO]
+    np.testing.assert_array_equal(got, want)
+
+
+def test_blocks_to_tokens_gradient_sums_each_blocks_tokens():
+    """Reverse mode: each block receives the sum of its visible tokens' cotangents."""
+    mod, *_ = _make_indexer()
+    kv_len, blocks = 14, 4
+    rng = np.random.default_rng(3)
+    per_block = jnp.asarray(rng.standard_normal((2, 3, blocks)), jnp.float32)
+    first_visible = jnp.asarray([0, 5], jnp.int32)
+    weights = rng.standard_normal((2, 3, kv_len))
+
+    grad = jax.grad(lambda x: jnp.sum(mod._blocks_to_tokens(x, first_visible, kv_len) * weights))(per_block)
+    want = np.zeros((2, 3, blocks))
+    for b, start in enumerate(np.asarray(first_visible)):
+        for t in range(start, kv_len):
+            want[b, :, (t - start) // RATIO] += weights[b, :, t]
+    np.testing.assert_allclose(np.asarray(grad), want, rtol=1e-6, atol=1e-6)

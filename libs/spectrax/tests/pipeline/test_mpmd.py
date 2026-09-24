@@ -435,10 +435,10 @@ def test_mpmd_jit_marker_fn_forward(mpmd_mesh):
     assert jnp.allclose(out, ref, atol=1e-5)
 
 
-def _ref_forward(w0, b0, w1, b1, x, y):
+def _ref_forward(w0, b0, w1, b1, x, y, *, precision=None):
     """Single-device reference forward (same ops as the pipelined version)."""
-    h = jnp.maximum(x @ w0 + b0, 0)
-    h = jnp.maximum(h @ w1 + b1, 0)
+    h = jnp.maximum(jnp.matmul(x, w0, precision=precision) + b0, 0)
+    h = jnp.maximum(jnp.matmul(h, w1, precision=precision) + b1, 0)
     return ((h - y) ** 2).mean()
 
 
@@ -448,6 +448,7 @@ def _make_pipe_forward(
     static_argnums=(),
     batch_argnums=(4, 5),
     microbatches=_M,
+    precision=None,
     **schedule_kwargs,
 ):
     """Build a decorated ``pipe_forward`` for schedule-driven sxjit tests."""
@@ -460,9 +461,9 @@ def _make_pipe_forward(
     )
     def pipe_forward(w0, b0, w1, b1, x, y):
         """Pipelined forward implementation."""
-        h = jnp.maximum(x @ w0 + b0, 0)
+        h = jnp.maximum(jnp.matmul(x, w0, precision=precision) + b0, 0)
         h = sxstage_iter(h)
-        h = jnp.maximum(h @ w1 + b1, 0)
+        h = jnp.maximum(jnp.matmul(h, w1, precision=precision) + b1, 0)
         return ((h - y) ** 2).mean()
 
     return pipe_forward
@@ -949,13 +950,21 @@ def test_mpmd_schedule_default_uses_fused_async(mpmd_mesh, pipe_args):
 
 def test_mpmd_schedule_terminal_backward_mode_scheduled_runs_bwd_slot(mpmd_mesh, pipe_args):
     """Scheduled terminal mode moves terminal VJP work from FWD into the BWD slot."""
+    # Single-row microbatches and the full batch can use different TPU DEFAULT
+    # multiplier precision. Test scheduling against a consistently fp32 reference.
+    precision = jax.lax.Precision.HIGHEST
     pipe_forward = _make_pipe_forward(
         mpmd_mesh,
         Std1F1B,
         microbatches=4,
+        precision=precision,
         terminal_backward_mode="scheduled",
     )
-    ref_loss, ref_grads = jax.value_and_grad(_ref_forward, argnums=(0, 1, 2, 3))(*pipe_args)
+
+    def reference(*args):
+        return _ref_forward(*args, precision=precision)
+
+    ref_loss, ref_grads = jax.value_and_grad(reference, argnums=(0, 1, 2, 3))(*pipe_args)
 
     with collect_task_times_ms() as times:
         loss, grads = sxvalue_and_grad(pipe_forward, argnums=(0, 1, 2, 3))(*pipe_args)

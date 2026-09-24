@@ -1389,6 +1389,7 @@ class Glm4MoeLiteForCausalLM(BaseCausalLMModule[Glm4MoeLiteModel, Glm4MoeLiteCon
         hbm_utilization: float = 0.9,
         dtype: jnp.dtype | None = None,
         num_hidden_layers_override: int | None = None,
+        max_cache_tokens: int | None = None,
     ):
         """Create the MLA ragged cache using GLM4-MoE-Lite's compressed KV width.
 
@@ -1405,6 +1406,7 @@ class Glm4MoeLiteForCausalLM(BaseCausalLMModule[Glm4MoeLiteModel, Glm4MoeLiteCon
             num_hidden_layers_override: Optional override for the layer
                 count, useful when fewer layers are materialised on this
                 shard than the config declares.
+            max_cache_tokens: Optional ceiling on the total page-pool token capacity.
 
         Returns:
             An :class:`MLARaggedPagesCacheConfig` ready to be allocated.
@@ -1430,6 +1432,7 @@ class Glm4MoeLiteForCausalLM(BaseCausalLMModule[Glm4MoeLiteModel, Glm4MoeLiteCon
             qk_rope_head_dim=self.config.qk_rope_head_dim,
             hbm_utilization=hbm_utilization,
             page_size=page_size,
+            max_cache_tokens=max_cache_tokens,
         )
 
 

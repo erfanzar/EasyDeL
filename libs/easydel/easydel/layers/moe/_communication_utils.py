@@ -212,21 +212,29 @@ def bincount(x: jax.Array, length: int) -> jax.Array:
     return jnp.bincount(x, length=length)
 
 
-def sort_activations(inputs: jax.Array, sort_indices: jax.Array, use_custom_vjp: bool = True) -> jax.Array:
+def sort_activations(
+    inputs: jax.Array,
+    sort_indices: jax.Array,
+    use_custom_vjp: bool = True,
+    inverse_indices: jax.Array | None = None,
+) -> jax.Array:
     """Reorder ``inputs[sort_indices]`` along axis 0 with optional custom AD.
 
     Permutes the first dimension of ``inputs`` according to ``sort_indices``.
     With ``use_custom_vjp=True`` the operation uses
-    :func:`sort_activations_custom`. The historical flag name is retained,
-    but the rule now supports both JVP and transposed VJP without retaining
-    activation values or constructing a dense Jacobian.
+    :func:`sort_activations_custom`, whose reverse mode is a gather with the
+    inverse permutation instead of the scatter-add JAX derives for a gather.
+    The historical flag name is retained; forward mode, reverse mode, batching
+    and higher-order derivatives are all supported.
 
     Args:
         inputs: Input activations to sort. Shape: (N, ...).
         sort_indices: Integer array of indices defining the permutation. Shape: (N,).
             Must be a valid permutation of range(N).
-        use_custom_vjp: If True, uses the custom JVP/transposed-VJP rule.
+        use_custom_vjp: If True, uses the gather-transpose permutation.
             If False, uses standard JAX autodiff. Defaults to True.
+        inverse_indices: Optional inverse of ``sort_indices``. Callers that
+            unsort with ``argsort(p)`` should pass ``p`` to avoid recomputing it.
 
     Returns:
         Sorted activations where output[i] = inputs[sort_indices[i]].
@@ -245,74 +253,48 @@ def sort_activations(inputs: jax.Array, sort_indices: jax.Array, use_custom_vjp:
         raise ValueError("Input and indices dimensions must match")
 
     if use_custom_vjp:
-        return sort_activations_custom(inputs, sort_indices)
+        return sort_activations_custom(inputs, sort_indices, inverse_indices)
     else:
         return inputs[sort_indices, ...]
 
 
-@jax.custom_jvp
-def sort_activations_custom(inputs: jax.Array, sort_indices: jax.Array) -> jax.Array:
-    """Sort activations with forward and reverse autodiff support.
+def _inverse_permutation(sort_indices: jax.Array) -> jax.Array:
+    """Invert a permutation via argsort (cheaper than an index scatter on TPU)."""
+    return jnp.argsort(sort_indices).astype(sort_indices.dtype)
 
-    The tangent undergoes the same gather. JAX transposes that linear gather
-    for reverse mode without materializing a dense Jacobian or retaining
-    activation values. Integer routing indices are nondifferentiable.
+
+def sort_activations_custom(
+    inputs: jax.Array,
+    sort_indices: jax.Array,
+    inverse_indices: jax.Array | None = None,
+) -> jax.Array:
+    """Permute rows with gather-only derivatives in every autodiff mode.
+
+    The permutation ``y = inputs[sort_indices]`` is posed as the linear solve
+    ``y[inverse] = inputs``. Its solve is the forward gather and, because a
+    permutation matrix is orthogonal, its transpose solve is the inverse gather.
+    Reverse mode therefore gathers with ``inverse_indices`` rather than
+    lowering the transpose of a gather, a row scatter-add, which on TPU costs
+    roughly as much as the rest of the unpermute. JVP, batching and higher
+    derivatives follow from :func:`jax.lax.custom_linear_solve`'s rules.
+    Integer routing indices are nondifferentiable.
 
     Args:
         inputs: Input tensor to be sorted. Shape: (N, ...).
-        sort_indices: Integer array containing the sorting order. Shape: (N,).
+        sort_indices: Permutation of ``range(N)``. Shape: (N,).
+        inverse_indices: Inverse of ``sort_indices``; computed when omitted.
 
     Returns:
         Sorted tensor where output[i] = inputs[sort_indices[i]].
     """
-    return inputs[sort_indices, ...]
-
-
-def sort_activations_custom_fwd(inputs: jax.Array, sort_indices: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """Forward pass for custom VJP sorting.
-
-    Computes the sorted output and stores the sort indices as residuals for the
-    backward pass.
-
-    Args:
-        inputs: Input tensor to be sorted.
-        sort_indices: Sorting indices.
-
-    Returns:
-        Tuple of (sorted_output, residuals) where residuals contains the sort_indices
-        needed for the backward pass.
-    """
-    sorted_output: jax.Array = inputs[sort_indices, ...]
-    residuals: jax.Array = sort_indices
-    return sorted_output, residuals
-
-
-def sort_activations_custom_bwd(residuals: jax.Array, grads: jax.Array) -> tuple[jax.Array, None]:
-    """Backward pass for custom VJP sorting.
-
-    Applies the inverse permutation to gradients to route them back to their
-    original positions.
-
-    Args:
-        residuals: Stored sort_indices from the forward pass.
-        grads: Gradients flowing backward from the sorted output.
-
-    Returns:
-        Tuple of (input_grads, None) where input_grads are the gradients with
-        respect to the original unsorted inputs, and None indicates no gradient
-        for sort_indices.
-    """
-    sort_indices: jax.Array = residuals
-    inverse_indices: jax.Array = jnp.argsort(sort_indices)
-    input_grads: jax.Array = grads[inverse_indices, ...]
-    return input_grads, None
-
-
-@sort_activations_custom.defjvp
-def _sort_activations_custom_jvp(primals, tangents):
-    inputs, sort_indices = primals
-    input_tangent, _ = tangents
-    return sort_activations_custom(inputs, sort_indices), input_tangent[sort_indices, ...]
+    if inverse_indices is None:
+        inverse_indices = _inverse_permutation(sort_indices)
+    return jax.lax.custom_linear_solve(
+        lambda sorted_rows: sorted_rows[inverse_indices, ...],
+        inputs,
+        solve=lambda _, rows: rows[sort_indices, ...],
+        transpose_solve=lambda _, rows: rows[inverse_indices, ...],
+    )
 
 
 @dataclass(frozen=True)
@@ -1115,7 +1097,12 @@ def unpermute(
         >>> # output[0,1] = 0.4*expert1_out + 0.3*expert3_out  # token 1's combined output
     """
 
-    unsort_intermediate = sort_activations(intermediate, jnp.argsort(sorted_selected_experts), use_custom_sort_vjp)
+    unsort_intermediate = sort_activations(
+        intermediate,
+        jnp.argsort(sorted_selected_experts),
+        use_custom_sort_vjp,
+        inverse_indices=sorted_selected_experts,
+    )
     reshaped_weights = jnp.reshape(weights, (-1, num_experts_per_tok))
     reshaped_intermediate = jnp.reshape(unsort_intermediate, (reshaped_weights.shape[0], num_experts_per_tok, -1))
     with jax.named_scope("weight_sum"):

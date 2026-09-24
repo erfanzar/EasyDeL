@@ -723,15 +723,21 @@ def test_grouped_gdr_decode_preserves_state_dtype():
     assert grouped_state.dtype == jnp.float32
 
 
-def test_packed_updates_match_reference_loop_for_decode_like_schedule():
-    """Packed updates match the per-request reference on a decode-like schedule.
+@pytest.mark.parametrize("candidate_count", [0, 1])
+def test_packed_updates_match_reference_loop_for_decode_like_schedule(candidate_count):
+    """Decode works with zero/one candidate prefix, preserving unused cache rows.
 
     Runs ``_apply_qwen3_next_packed_updates`` and ``_reference_packed_updates`` on the 3-active-slot
     decode schedule and asserts the conv state, recurrent state, and token outputs all match within
-    tolerance. Also asserts the inactive slots (index 3 onward) are left byte-identical to their
-    inputs and that outputs for unowned token positions are exactly zero.
+    tolerance. Also asserts the inactive slots and any unused candidate rows (index 3 onward) are
+    left byte-identical to their inputs and that unowned token positions output exactly zero.
+    The zero-capacity case must not trace a speculative branch with no prefix states to stack.
     """
     packed_inputs = _make_packed_decode_inputs()
+    for name in ("conv_states", "recurrent_states"):
+        states = packed_inputs[name]
+        candidates = jnp.full((candidate_count * states.shape[0], *states.shape[1:]), -7, dtype=states.dtype)
+        packed_inputs[name] = jnp.concatenate([states, candidates], axis=0)
     mesh = _make_runtime_mesh()
 
     with mesh:
@@ -768,6 +774,94 @@ def test_packed_updates_match_reference_loop_for_decode_like_schedule():
         rtol=0.0,
         atol=0.0,
     )
+
+
+def test_packed_spec_window_candidates_and_commit_match_reference_decode():
+    """One active window stores each prefix and commits an accepted prefix before decoding."""
+    packed_inputs = _make_packed_decode_inputs()
+    packed_inputs["recurrent_states"] = packed_inputs["recurrent_states"].astype(jnp.float32)
+    base_slots = packed_inputs["conv_states"].shape[0]
+    reference_inputs = dict(packed_inputs)
+    for name in ("conv_states", "recurrent_states"):
+        states = packed_inputs[name]
+        # Two prefix-major blocks: real decode token, then the first draft token.
+        candidates = jnp.full((2 * base_slots, *states.shape[1:]), -7, dtype=states.dtype)
+        packed_inputs[name] = jnp.concatenate([states, candidates], axis=0)
+    packed_inputs["query_start_loc"] = jnp.array([0, 2, 2, 2, 2], dtype=jnp.int32)
+    packed_inputs["num_requests"] = jnp.array(1, dtype=jnp.int32)
+    packed_inputs["context_lens"] = jnp.array([10, 0, 0, 0], dtype=jnp.int32)
+    single_offsets = jnp.array([0, 1, 1, 1, 1], dtype=jnp.int32)
+    mesh = _make_runtime_mesh()
+
+    with mesh:
+        gdr_op = _make_gdr_op(mesh)
+        window_conv, window_rec, window_out = _apply_qwen3_next_packed_updates(
+            **packed_inputs,
+            gdr_op=gdr_op,
+            ragged_gdr_op=object(),
+            use_ragged_gdr=False,
+        )
+        ref_conv = reference_inputs["conv_states"]
+        ref_rec = reference_inputs["recurrent_states"]
+        prefixes = []
+        for token_idx in range(2):
+            step_inputs = {
+                **reference_inputs,
+                "conv_states": ref_conv,
+                "recurrent_states": ref_rec,
+                "query_start_loc": single_offsets,
+                "num_requests": jnp.array(1, dtype=jnp.int32),
+            }
+            for name in ("conv_input", "beta", "decay"):
+                step_inputs[name] = reference_inputs[name][:, token_idx : token_idx + 1]
+            ref_conv, ref_rec, ref_out = _reference_packed_updates(**step_inputs, gdr_op=gdr_op)
+            prefixes.append((ref_conv, ref_rec))
+            candidate_row = base_slots + token_idx * base_slots
+            np.testing.assert_allclose(
+                window_conv[candidate_row].astype(jnp.float32), ref_conv[0].astype(jnp.float32), rtol=0, atol=0
+            )
+            np.testing.assert_allclose(window_rec[candidate_row], ref_rec[0], rtol=0.02, atol=0.05)
+            np.testing.assert_allclose(window_out[token_idx], ref_out[0], rtol=0.02, atol=0.05)
+
+        np.testing.assert_allclose(
+            window_conv[:base_slots].astype(jnp.float32), ref_conv.astype(jnp.float32), rtol=0, atol=0
+        )
+        np.testing.assert_allclose(window_rec[:base_slots], ref_rec, rtol=0.02, atol=0.05)
+        np.testing.assert_array_equal(window_conv[1:base_slots], reference_inputs["conv_states"][1:])
+        np.testing.assert_array_equal(window_rec[1:base_slots], reference_inputs["recurrent_states"][1:])
+        np.testing.assert_array_equal(window_out[2:], jnp.zeros_like(window_out[2:]))
+
+        # Reject the second token: rewind to prefix one, then consume a replacement token.
+        next_inputs = {
+            **packed_inputs,
+            "conv_states": window_conv,
+            "recurrent_states": window_rec,
+            "query_start_loc": single_offsets,
+            "context_lens": jnp.array([10, 0, 0, 0], dtype=jnp.int32),
+            "spec_recurrent_commit": jnp.array([[1, 0, 0, 0], [1, 0, 0, 0]], dtype=jnp.int32),
+        }
+        for name in ("conv_input", "beta", "decay"):
+            next_inputs[name] = reference_inputs[name][:, 2:3]
+        committed_conv, committed_rec, committed_out = _apply_qwen3_next_packed_updates(
+            **next_inputs,
+            gdr_op=gdr_op,
+            ragged_gdr_op=object(),
+            use_ragged_gdr=False,
+        )
+        ref_conv, ref_rec, ref_out = _reference_packed_updates(
+            **{**next_inputs, "conv_states": prefixes[0][0], "recurrent_states": prefixes[0][1]},
+            gdr_op=gdr_op,
+        )
+
+    np.testing.assert_allclose(
+        committed_conv[:base_slots].astype(jnp.float32), ref_conv.astype(jnp.float32), rtol=0, atol=0
+    )
+    np.testing.assert_allclose(committed_rec[:base_slots], ref_rec, rtol=0.02, atol=0.05)
+    np.testing.assert_allclose(committed_out, ref_out, rtol=0.02, atol=0.05)
+    np.testing.assert_array_equal(committed_conv[1:base_slots], reference_inputs["conv_states"][1:])
+    np.testing.assert_array_equal(committed_rec[1:base_slots], reference_inputs["recurrent_states"][1:])
+    np.testing.assert_array_equal(committed_conv[base_slots:], window_conv[base_slots:])
+    np.testing.assert_array_equal(committed_rec[base_slots:], window_rec[base_slots:])
 
 
 def test_packed_updates_match_reference_loop_for_large_bucket_decode_like_schedule():

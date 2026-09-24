@@ -304,8 +304,8 @@ def _train_step(state):
     return state.apply_gradients(grads=grads), float(jax.device_get(loss))
 
 
-def _train_state(family: str, tp: int):
-    model = FAMILIES[family](tp)
+def _train_state(family: str, tp: int, *, precision=None):
+    model = FAMILIES[family](tp, **({} if precision is None else {"precision": precision}))
     tx = optax.adamw(learning_rate=1e-3)
     state = ed.EasyDeLState.create(model=model, tx=tx, init_opt_state=True)
     state, _ = _train_step(state)
@@ -313,10 +313,12 @@ def _train_state(family: str, tp: int):
     return state, tx
 
 
-def _llama(tp):
+def _llama(tp, *, precision=None):
     import spectrax as spx
 
-    return ed.LlamaForCausalLM(config=_config(tp), rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
+    return ed.LlamaForCausalLM(
+        config=_config(tp), rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32, precision=precision
+    )
 
 
 def _phi3(tp):
@@ -380,7 +382,7 @@ def _openelm(tp):
     return ed.OpenELMForCausalLM(config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
 
 
-def _qwen3_moe(tp):
+def _qwen3_moe(tp, *, precision=None):
     """Fused MoE expert gate_up (ColumnParallelMoELinear) + dense fused layers."""
     import spectrax as spx
 
@@ -404,11 +406,13 @@ def _qwen3_moe(tp):
         moe_method="standard_moe",
     )
     cfg.sharding_axis_dims = (1, 1, -1, 1, tp, 1)
-    return ed.Qwen3MoeForCausalLM(config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
+    return ed.Qwen3MoeForCausalLM(
+        config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32, precision=precision
+    )
 
 
-def _qwen3_next(tp):
-    """GDR linear attention (packed qkvz/ba) + gated full attention."""
+def _qwen3_next(tp, *, precision=None):
+    """GDR linear attention (packed qkvz/ba) with routed and shared experts."""
     import spectrax as spx
 
     cfg = ed.Qwen3NextConfig(
@@ -429,7 +433,9 @@ def _qwen3_next(tp):
         moe_method="standard_moe",  # see _qwen3_moe
     )
     cfg.sharding_axis_dims = (1, 1, -1, 1, tp, 1)
-    return ed.Qwen3NextForCausalLM(config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
+    return ed.Qwen3NextForCausalLM(
+        config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32, precision=precision
+    )
 
 
 def _qwen3_next_dense(tp):
@@ -472,7 +478,12 @@ TRAIN_STATE_FAMILIES = {"llama": _llama, "qwen3_moe": _qwen3_moe}
 @pytest.mark.parametrize("load_tp", [1, 2, 4])
 def test_fused_checkpoint_is_tp_portable(tmp_path, load_tp, family):
     save_tp = 2
-    model = FAMILIES[family](save_tp)
+    # This structural round-trip compares different TPU contraction shapes.
+    # Request the same explicit precision at both endpoints for Qwen3-Next/MoE:
+    # float32 storage alone permits reduced-precision products, and the loader
+    # normalizes None to DEFAULT instead of inheriting an ambient override.
+    precision_kwargs = {"precision": jax.lax.Precision.HIGHEST} if family in {"qwen3_next", "qwen3_moe"} else {}
+    model = FAMILIES[family](save_tp, **precision_kwargs)
     reference = _logits(model)
     reference_fused = _canonical_fused_parameter_leaves(model)
     model.save_pretrained(str(tmp_path / "ckpt"))
@@ -483,14 +494,10 @@ def test_fused_checkpoint_is_tp_portable(tmp_path, load_tp, family):
         param_dtype=jnp.float32,
         sharding_axis_dims=(1, 1, -1, 1, load_tp, 1),
         auto_shard_model=True,
+        **precision_kwargs,
     )
-    restored = _logits(loaded)
-
-    err = float(np.max(np.abs(reference - restored)))
-    assert err < _model_logit_tolerance(family), (
-        f"[{family}] save_tp={save_tp} -> load_tp={load_tp} changed the model (max|Δlogits|={err}); "
-        "fused projections were not layout-normalized across meshes"
-    )
+    # Check layout integrity before arithmetic parity to distinguish corruption
+    # from topology-dependent floating-point execution.
     restored_fused = _canonical_fused_parameter_leaves(loaded)
     assert restored_fused.keys() == reference_fused.keys()
     for path, expected in reference_fused.items():
@@ -499,6 +506,12 @@ def test_fused_checkpoint_is_tp_portable(tmp_path, load_tp, family):
             f"[{family}] fused parameter leaf {path} changed after save_tp={save_tp} -> load_tp={load_tp} "
             f"(max|Δ|={fused_err})"
         )
+
+    restored = _logits(loaded)
+    err = float(np.max(np.abs(reference - restored)))
+    assert err < _model_logit_tolerance(family), (
+        f"[{family}] save_tp={save_tp} -> load_tp={load_tp} changed the model (max|Δlogits|={err})"
+    )
 
 
 @pytest.mark.parametrize("save_tp", [1, 2, 4])
@@ -509,7 +522,10 @@ def test_fused_checkpoint_save_load_tp_matrix(tmp_path, save_tp, load_tp):
     re-interleaves on load and overwrites the recorded tp with its own."""
     import json as _json
 
-    model = _llama(save_tp)
+    # Compare checkpoint layouts, not TPU DEFAULT's shape-dependent reduced
+    # products. Both ends request fp32 products; the global policy is untouched.
+    model = _llama(save_tp, precision=jax.lax.Precision.HIGHEST)
+    canonical_before = _canonical_fused_parameter_leaves(model)
     reference = _logits(model)
     ckpt = tmp_path / "ckpt"
     model.save_pretrained(str(ckpt))
@@ -521,9 +537,14 @@ def test_fused_checkpoint_save_load_tp_matrix(tmp_path, save_tp, load_tp):
         pretrained_model_name_or_path=str(ckpt),
         dtype=jnp.float32,
         param_dtype=jnp.float32,
+        precision=jax.lax.Precision.HIGHEST,
         sharding_axis_dims=(1, 1, -1, 1, load_tp, 1),
         auto_shard_model=True,
     )
+    canonical_after = _canonical_fused_parameter_leaves(loaded)
+    assert canonical_before.keys() == canonical_after.keys()
+    for key in canonical_before:
+        np.testing.assert_array_equal(canonical_before[key], canonical_after[key], err_msg=key)
     restored = _logits(loaded)
     err = float(np.max(np.abs(reference - restored)))
     assert err < _model_logit_tolerance("llama"), (
@@ -992,8 +1013,12 @@ def test_fused_train_state_checkpoint_is_tp_portable(tmp_path, load_tp, family):
     from easydel.layers.layouts import read_fused_checkpoint_tp
 
     save_tp = 2
-    state, tx = _train_state(family, save_tp)
+    # Keep the trained-MoE comparison on the same explicit precision policy at
+    # both ends, rather than measuring TPU DEFAULT's shape-dependent products.
+    precision = jax.lax.Precision.HIGHEST if family == "qwen3_moe" else None
+    state, tx = _train_state(family, save_tp, precision=precision)
     reference_logits = _state_logits(state)
+    reference_params = _canonical_fused_parameter_leaves(state.model)
     reference_opt = _canonical_fused_optimizer_leaves(state)
 
     ckpt = tmp_path / "trainer-ckpt"
@@ -1004,18 +1029,16 @@ def test_fused_train_state_checkpoint_is_tp_portable(tmp_path, load_tp, family):
         load_directory=str(ckpt),
         dtype=jnp.float32,
         param_dtype=jnp.float32,
+        precision=precision,
         sharding_axis_dims=(1, 1, -1, 1, load_tp, 1),
         auto_shard_model=True,
         tx_template=tx,
     ).replace(tx=tx)
 
-    restored_logits = _state_logits(loaded)
-    logits_err = float(np.max(np.abs(reference_logits - restored_logits)))
-    logit_tol = _train_state_logit_tolerance(family)
-    direction = f"[{family}] train-state save_tp={save_tp} -> load_tp={load_tp}"
-    msg = f"{direction} changed logits (max|Δlogits|={logits_err})"
-    assert logits_err < logit_tol, msg
-
+    restored_params = _canonical_fused_parameter_leaves(loaded.model)
+    assert restored_params.keys() == reference_params.keys()
+    for path, expected in reference_params.items():
+        np.testing.assert_array_equal(restored_params[path], expected, err_msg=path)
     restored_opt = _canonical_fused_optimizer_leaves(loaded)
     assert restored_opt.keys() == reference_opt.keys()
     for path, expected in reference_opt.items():
@@ -1024,6 +1047,13 @@ def test_fused_train_state_checkpoint_is_tp_portable(tmp_path, load_tp, family):
             f"[{family}] optimizer leaf {path} changed after canonical/runtime round-trip "
             f"save_tp={save_tp} -> load_tp={load_tp} (max|Δ|={err})"
         )
+
+    restored_logits = _state_logits(loaded)
+    logits_err = float(np.max(np.abs(reference_logits - restored_logits)))
+    logit_tol = _train_state_logit_tolerance(family)
+    direction = f"[{family}] train-state save_tp={save_tp} -> load_tp={load_tp}"
+    msg = f"{direction} changed logits (max|Δlogits|={logits_err})"
+    assert logits_err < logit_tol, msg
 
     reference_next, reference_loss = _train_step(state)
     loaded_next, loaded_loss = _train_step(loaded)

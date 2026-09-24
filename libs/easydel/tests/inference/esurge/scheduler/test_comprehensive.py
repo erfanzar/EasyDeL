@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 
-os.environ["JAX_PLATFORMS"] = "cpu"
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import jax.numpy as jnp
 from easydel.inference.esurge.core.interface import (

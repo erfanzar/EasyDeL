@@ -582,6 +582,89 @@ class TestBuilderPattern:
         _assert_tree_allclose(actual_params, expected_params, atol=1e-6, rtol=1e-6)
         _assert_tree_allclose(actual_state, expected_state, atol=1e-6, rtol=1e-6)
 
+    @pytest.mark.parametrize("optimizer_type", ["quad", "skew"])
+    @pytest.mark.parametrize("zero_gradient", [False, True])
+    def test_white_kron_rank_deficient_gradients_remain_finite(self, optimizer_type, zero_gradient):
+        """Nullspace power vectors must not poison updates or preconditioner state."""
+        params = {
+            "w": jnp.array([[1.0, -2.0], [0.5, -0.25]], dtype=jnp.float32),
+            "b": jnp.array([0.25, -0.5], dtype=jnp.float32),
+        }
+        grads = {
+            "w": jnp.array([[0.25, -0.5], [0.125, -0.25]], dtype=jnp.float32),
+            "b": jnp.array([0.05, -0.1], dtype=jnp.float32),
+        }
+        if zero_gradient:
+            grads = jax.tree.map(jnp.zeros_like, grads)
+        tx, _ = OptimizerFactory.create(
+            optimizer_type,
+            SchedulerConfig(learning_rate=0.01),
+            WhiteKronConfig(dtype=jnp.float32, block_size=4, noise_scale=0.0, weight_decay=0.0),
+            weight_decay=0.0,
+        )
+        state = tx.init(params)
+        step = jax.jit(tx.update)
+        initial_params = params
+        for _ in range(3):
+            updates, state = step(grads, state, params)
+            params = optax.apply_updates(params, updates)
+            for leaf in jax.tree.leaves((params, state)):
+                if jnp.issubdtype(leaf.dtype, jnp.inexact):
+                    assert jnp.all(jnp.isfinite(leaf))
+            if zero_gradient:
+                _assert_tree_allclose(params, initial_params, atol=0.0, rtol=0.0)
+            else:
+                # Independent linear-objective check: the update is a descent
+                # direction for f(params) = sum(grads * params).
+                directional_change = sum(jnp.vdot(grads[name], updates[name]) for name in grads)
+                assert directional_change < 0
+
+    @pytest.mark.parametrize("nesterov", [False, True])
+    @pytest.mark.parametrize("adaptive", [False, True])
+    def test_muon_stage_local_multistep_state_roundtrip(self, nesterov, adaptive):
+        """Muon preserves Optax state layout and both geometry-dependent updates."""
+        params = {
+            "wide": jnp.array([[1.0, -2.0, 0.5], [0.25, 0.75, -1.0]], dtype=jnp.float32),
+            "tall": jnp.array([[0.5, -1.0], [1.0, 0.25], [-0.75, 2.0]], dtype=jnp.float32),
+            "bias": jnp.array([0.25, -0.5], dtype=jnp.float32),
+        }
+        grads = jax.tree.map(lambda p: p * 0.125, params)
+        tx, scheduler = OptimizerFactory.create(
+            "muon",
+            SchedulerConfig(learning_rate=0.01),
+            MuonConfig(
+                nesterov=nesterov,
+                adaptive=adaptive,
+                weight_decay=0.02,
+                weight_decay_mask={"wide": True, "tall": False, "bias": False},
+                adam_weight_decay=0.03,
+            ),
+            weight_decay=0.01,
+        )
+        expected_params = params
+        actual_params = params
+        expected_state = tx.init(params)
+        actual_state = tx.init(params)
+        for _ in range(3):
+            updates, expected_state = tx.update(grads, expected_state, expected_params)
+            expected_params = optax.apply_updates(expected_params, updates)
+            actual_params, actual_state = tx.apply_gradients_stage_local(
+                params=actual_params,
+                grads=grads,
+                opt_state=actual_state,
+                learning_rate_fn=scheduler,
+            )
+            assert jax.tree.structure(actual_state) == jax.tree.structure(expected_state)
+            _assert_tree_allclose(actual_params, expected_params)
+            _assert_tree_allclose(actual_state, expected_state)
+
+        # A stage-local state must remain directly usable by ordinary Optax
+        # updates, as when restoring a checkpoint without pipeline parallelism.
+        actual_updates, actual_state = tx.update(grads, actual_state, actual_params)
+        expected_updates, expected_state = tx.update(grads, expected_state, expected_params)
+        _assert_tree_allclose(actual_updates, expected_updates)
+        _assert_tree_allclose(actual_state, expected_state)
+
     def test_factory_stage_local_global_clip_matches_optax_update(self):
         """Global clipping is applied explicitly before leafwise PP updates."""
         scheduler_config = SchedulerConfig(learning_rate=0.1)

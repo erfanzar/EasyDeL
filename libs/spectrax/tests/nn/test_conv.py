@@ -6,8 +6,11 @@
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
+import spectrax as spx
 from spectrax.nn.conv import Conv, Conv1d, Conv2d, Conv3d
 from spectrax.rng.rngs import Rngs
 
@@ -116,3 +119,68 @@ def test_conv_generic_3d_from_tuple():
     assert c.kernel_size == (2, 3, 3)
     x = jnp.zeros((1, 4, 4, 4, 2))
     assert c(x).shape == (1, 3, 2, 2, 2)
+
+
+@pytest.mark.parametrize("layer_type,rank", [(Conv1d, 1), (Conv2d, 2), (Conv3d, 3), (Conv, 2)])
+def test_conv_precision_roundtrip_matches_numpy(layer_type, rank):
+    """All direct layer APIs retain explicit precision through export/bind."""
+    rng = np.random.default_rng(12)
+    x = rng.normal(size=(1, *((2,) * rank), 32)).astype(np.float32)
+    weight = rng.normal(size=(*((1,) * rank), 32, 5)).astype(np.float32)
+    bias = rng.normal(size=(5,)).astype(np.float32)
+    layer = layer_type(32, 5, kernel_size=(1,) * rank, precision=jax.lax.Precision.HIGHEST, rngs=Rngs(0))
+    layer.weight.value = jnp.asarray(weight)
+    layer.bias.value = jnp.asarray(bias)
+    graphdef, state = spx.export(layer)
+    rebuilt = spx.bind(graphdef, state)
+    expected = np.einsum("...c,co->...o", x.astype(np.float64), weight.reshape(32, 5).astype(np.float64)) + bias
+    with jax.default_matmul_precision("bfloat16"):
+        actual = spx.jit(lambda module, inputs: module(inputs))(rebuilt, jnp.asarray(x))
+    assert actual.dtype == jnp.float32
+    np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5)
+
+
+@pytest.mark.parametrize("layer_type", [Conv2d, Conv])
+def test_conv_legacy_graphdef_defaults_to_ambient_precision(layer_type):
+    """Graphs without the ``precision`` static field still bind and execute correctly."""
+    rng = np.random.default_rng(18)
+    x = rng.normal(size=(1, 2, 3, 16)).astype(np.float32)
+    weight = rng.normal(size=(1, 1, 16, 4)).astype(np.float32)
+    bias = rng.normal(size=(4,)).astype(np.float32)
+    expected = np.einsum("bhwc,co->bhwo", x.astype(np.float64), weight.reshape(16, 4).astype(np.float64)) + bias
+    outputs = []
+    for mode in ("omitted", "none", "legacy"):
+        kwargs = {"precision": None} if mode == "none" else {}
+        layer = layer_type(16, 4, kernel_size=(1, 1), rngs=Rngs(0), **kwargs)
+        layer.weight.value = jnp.asarray(weight)
+        layer.bias.value = jnp.asarray(bias)
+        if mode == "legacy":
+            del layer.precision
+        graphdef, state = spx.export(layer)
+        rebuilt = spx.bind(graphdef, state)
+        if mode == "legacy":
+            assert not hasattr(rebuilt, "precision")
+        with jax.default_matmul_precision("float32"):
+            actual = spx.jit(lambda module, inputs: module(inputs))(rebuilt, jnp.asarray(x))
+        np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5)
+        outputs.append(np.asarray(actual))
+    np.testing.assert_array_equal(outputs[0], outputs[1])
+    np.testing.assert_array_equal(outputs[0], outputs[2])
+
+
+@pytest.mark.parametrize("layer_type", [Conv2d, Conv])
+@pytest.mark.parametrize("param_dtype", [jnp.float32, jnp.bfloat16])
+def test_conv_precision_preserves_parameter_leaves(layer_type, param_dtype):
+    """Precision is static configuration, not a change to checkpoint leaves or storage."""
+    kwargs = dict(in_channels=3, out_channels=4, kernel_size=(2, 2), param_dtype=param_dtype)
+    original = layer_type(**kwargs, rngs=Rngs(0))
+    precise = layer_type(**kwargs, rngs=Rngs(0), precision=jax.lax.Precision.HIGHEST)
+    _, original_state = spx.export(original)
+    _, precise_state = spx.export(precise)
+    original_params = original_state.raw()["parameters"]
+    precise_params = precise_state.raw()["parameters"]
+    assert set(original_params) == set(precise_params) == {"weight", "bias"}
+    for name in original_params:
+        assert original_params[name].dtype == precise_params[name].dtype == param_dtype
+        np.testing.assert_array_equal(original_params[name], precise_params[name])
+        assert getattr(original, name).axis_names == getattr(precise, name).axis_names

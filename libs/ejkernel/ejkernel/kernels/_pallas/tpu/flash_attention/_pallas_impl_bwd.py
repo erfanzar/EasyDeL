@@ -179,7 +179,7 @@ def _flash_attention_dkv_kernel(
                 if rem:
                     raise NotImplementedError()
                 q_segment_ids = q_segment_ids_tile_ref[0, pl.ds(start_q, block_q), :]
-                q_segment_ids = pltpu.repeat(q_segment_ids, repeats, axis=1)
+                q_segment_ids = jnp.tile(q_segment_ids, (1, repeats))
                 kv_segment_ids = kv_segment_ids_tile_ref[:, 0, pl.ds(start_k, block_k)]
                 mask = jnp.equal(q_segment_ids, kv_segment_ids).astype(jnp.bool_)
 
@@ -204,13 +204,13 @@ def _flash_attention_dkv_kernel(
 
             logits = logits if mask is None else logits + jnp.where(mask, 0.0, mask_value)
 
-            p = jnp.exp(logits - pltpu.repeat(m, block_k // MIN_BLOCK_SIZE, axis=1))
-            p = p * pltpu.repeat(1 / l, block_k // MIN_BLOCK_SIZE, axis=1)
+            p = jnp.exp(logits - jnp.tile(m, (1, block_k // MIN_BLOCK_SIZE)))
+            p = p * jnp.tile(1 / l, (1, block_k // MIN_BLOCK_SIZE))
             dv = lax.dot(p.T.astype(do.dtype), do, preferred_element_type=jnp.float32)
             dv_scratch_ref[pl.ds(start_k, block_k), :] += dv.astype(dv_scratch_ref.dtype)
 
             dp = lax.dot_general(do, v, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32)
-            ds = (dp - pltpu.repeat(di, block_k // MIN_BLOCK_SIZE, axis=1)) * p
+            ds = (dp - jnp.tile(di, (1, block_k // MIN_BLOCK_SIZE))) * p
 
             if logits_soft_cap is not None:
                 ds = ds * (1.0 - softcap_tanh * softcap_tanh)
@@ -548,7 +548,7 @@ def _flash_attention_dq_kernel(
             repeats, rem = divmod(block_k, NUM_LANES)
             if rem:
                 raise NotImplementedError(f"kv block size must be a multiple of {NUM_LANES}")
-            q_segment_ids = pltpu.repeat(q_segment_ids_tile_ref[0], repeats, axis=1)
+            q_segment_ids = jnp.tile(q_segment_ids_tile_ref[0], (1, repeats))
             kv_segment_ids = kv_segment_ids_tile_ref[:, 0, k_slice]
             mask = jnp.equal(q_segment_ids, kv_segment_ids).astype(jnp.bool_)
 
@@ -573,8 +573,8 @@ def _flash_attention_dq_kernel(
 
         logits = logits if mask is None else logits + jnp.where(mask, 0.0, mask_value)
 
-        p = jnp.exp(logits - pltpu.repeat(m, block_k // MIN_BLOCK_SIZE, axis=1))
-        p = p * pltpu.repeat(1 / l, block_k // MIN_BLOCK_SIZE, axis=1)
+        p = jnp.exp(logits - jnp.tile(m, (1, block_k // MIN_BLOCK_SIZE)))
+        p = p * jnp.tile(1 / l, (1, block_k // MIN_BLOCK_SIZE))
 
         dp = jax.lax.dot_general(
             do,
@@ -582,7 +582,7 @@ def _flash_attention_dq_kernel(
             TRANS_B_DIM_NUMBERS,
             preferred_element_type=jnp.float32,
         )
-        ds = (dp - pltpu.repeat(di, block_k // MIN_BLOCK_SIZE, axis=1)) * p
+        ds = (dp - jnp.tile(di, (1, block_k // MIN_BLOCK_SIZE))) * p
 
         if logits_soft_cap is not None:
             ds = ds * (1.0 - softcap_tanh * softcap_tanh)

@@ -38,7 +38,22 @@ Submodules:
 """
 
 from .embeddings import Embed
-from .indexer import IndexerConfig, IndexerKind, IndexerOutput, SparseIndexer
+from .indexer import (
+    BaseIndexer,
+    BlockMaxIndexer,
+    BlockMaxIndexerConfig,
+    BlockTopKIndexer,
+    CompressedIndexer,
+    CompressedIndexerConfig,
+    IndexerConfig,
+    IndexerKind,
+    IndexerOutput,
+    IndexerSelection,
+    SelectionSpec,
+    SparseIndexer,
+    TokenIndexer,
+    TokenIndexerConfig,
+)
 from .layouts import (
     FusedColumnLayout,
     FusedExpertLayout,
@@ -113,7 +128,17 @@ from .quantization import (
     straight_through_nf4,
     straight_through_nvfp8,
 )
-from .residual import GatedResidual, expand_streams, inject_streams
+from .residual import (
+    GatedResidual,
+    ManifoldHyperConnection,
+    ManifoldHyperConnectionConfig,
+    ManifoldHyperHead,
+    MeanHyperHead,
+    expand_streams,
+    inject_streams,
+    manifold_residual_write,
+    mean_hyper_head,
+)
 from .rotary import (
     DeepseekScalingRotaryEmbedding,
     DynamicNTKScalingRotaryEmbedding,
@@ -138,14 +163,18 @@ from .rotary import (
     get_inv_frequencies,
     get_rope,
 )
-from .sparse_attention import BlockTopKIndexer
 
 __all__ = [
+    "BaseIndexer",
     "BaseMoeModule",
+    "BlockMaxIndexer",
+    "BlockMaxIndexerConfig",
     "BlockTopKIndexer",
     "ColumnParallelLinear",
     "ColumnParallelLinearQuantized",
     "ColumnParallelMoELinear",
+    "CompressedIndexer",
+    "CompressedIndexerConfig",
     "DeepseekScalingRotaryEmbedding",
     "DynamicNTKScalingRotaryEmbedding",
     "EasyDeLQuantizationConfig",
@@ -158,8 +187,13 @@ __all__ = [
     "IndexerConfig",
     "IndexerKind",
     "IndexerOutput",
+    "IndexerSelection",
     "LinearScalingRotaryEmbedding",
     "Llama3RotaryEmbedding",
+    "ManifoldHyperConnection",
+    "ManifoldHyperConnectionConfig",
+    "ManifoldHyperHead",
+    "MeanHyperHead",
     "MoEMethods",
     "MoeFusedHooks",
     "MoeLayoutEstimate",
@@ -180,7 +214,10 @@ __all__ = [
     "RowParallelLinear",
     "RowParallelLinearQuantized",
     "RowParallelMoELinear",
+    "SelectionSpec",
     "SparseIndexer",
+    "TokenIndexer",
+    "TokenIndexerConfig",
     "YaRNScalingRotaryEmbedding",
     "apply_quantization_rules",
     "build_fused_gate_up_projection",
@@ -213,6 +250,8 @@ __all__ = [
     "interleave_segments_last_axis",
     "interleaved_fusion_reform_param",
     "keep_interleaved_segments_last_axis",
+    "manifold_residual_write",
+    "mean_hyper_head",
     "moe_down_projection_reform_param",
     "moe_fused_gate_up_reform_param",
     "moe_gate_up_fusion_reform_param",

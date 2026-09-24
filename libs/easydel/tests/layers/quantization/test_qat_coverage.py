@@ -31,8 +31,9 @@ categories that legitimately stay in full precision:
   to, which is a discrete change to the computation rather than a small
   numerical perturbation, and they are tiny enough that the memory saved
   is irrelevant.
-* **Mixing coefficient projections.** Same argument: the output feeds a
-  sigmoid and becomes a blend weight.
+* **Mixing coefficient projections.** Their narrow outputs feed sigmoid
+  gates or a softmax/Sinkhorn residual-stream mixer, not feature channels.
+  Preserve the explicit fp32 mixing math rather than quantizing it.
 * **Everything else** — which must be empty.
 """
 
@@ -55,9 +56,13 @@ _EXEMPT: dict[tuple[str, str], str] = {
         "MoE router gate: routing decisions, kept in float32."
     ),
     ("modules/glm_moe_dsa/modeling_glm_moe_dsa.py", "weight"): ("MoE router gate: routing decisions, kept in float32."),
-    ("modules/deepseek_v4/modeling_deepseek_v4.py", "hc_fn"): (
-        "Hyper-connection mixing matrix: a tiny float32 projection whose output feeds a sigmoid to become "
-        "blend weights, not features."
+    ("modules/glm5_next/modeling_glm5_next.py", "weight"): (
+        "MoE router gate: fp32 logits feed sigmoid/grouped top-k expert selection and combine weights; "
+        "quantization can change the discrete expert assignment, not just feature accuracy."
+    ),
+    ("layers/residual/_manifold.py", "hc_fn"): (
+        "Learned mHC head: only hc outputs become sigmoid read gates for the final weighted stream sum. "
+        "Preserve the original DeepSeek-V4 fp32 gate projection and accumulation, not a quantized feature projection."
     ),
 }
 """Reviewed exemptions, keyed by ``(package-relative path, parameter name)``.
@@ -134,18 +139,23 @@ _CONV_EXEMPT: dict[str, tuple[int, str]] = {
     "modules/falcon_mamba/modeling_falcon_mamba.py": (1, "depthwise causal conv1d"),
     "modules/falcon_h1/modeling_falcon_h1.py": (1, "depthwise causal conv1d"),
     "modules/qwen3_next/modeling_qwen3_next.py": (2, "depthwise causal conv1d"),
+    "modules/qwen4_exp/modeling_qwen4_exp.py": (
+        1,
+        "PLE dilated causal depthwise conv1d: [K, 1, hc*hidden] weights (K=4 by default), not a dense "
+        "channel projection. Preserve fp32 inputs, kernel and carried history across the convolution, "
+        "segment-masked tap sum and packed-request tap sum; quantizing only the lax conv would split their semantics.",
+    ),
 }
 """Convolutions that deliberately stay in full precision, with their call counts.
 
-Every convolution in the model zoo is the depthwise causal ``conv1d`` of a
-state-space or linear-attention layer. Three things make them a poor
-quantization target and a needless one:
+The reviewed convolutions are depthwise causal ``conv1d`` operations in
+state-space, linear-attention or PLE layers. Three things make them poor
+quantization targets:
 
-* they are depthwise with a kernel width of about four, so the weight is a
-  few thousand values against billions in the projections — quantizing
-  them saves nothing measurable;
-* they are computed in float32 on purpose, because the recurrence that
-  consumes them is numerically delicate;
+* they are depthwise with a kernel width of about four, so their weights
+  grow linearly with channel count, not quadratically like dense projections;
+* they explicitly compute in float32; preserve the recurrence arithmetic
+  and, for PLE, the matching convolution and manual tap-sum paths;
 * the ones that matter for performance do not go through
   ``jax.lax.conv_general_dilated`` at all in production, but through
   ejkernel Pallas kernels, which op-level interception cannot reach.

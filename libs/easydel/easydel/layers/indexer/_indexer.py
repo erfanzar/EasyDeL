@@ -22,6 +22,7 @@ from functools import partial
 import jax
 import spectrax as spx
 from jax import numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float
 
 from easydel.layers.linears import ColumnParallelLinear
@@ -29,6 +30,7 @@ from easydel.layers.linears import ColumnParallelLinear
 from ._config import IndexerConfig, IndexerKind
 from ._primitives import indices_to_bool_mask, is_vacuous_selection, visible_causal_mask
 from ._rope import apply_indexer_rope, truncate_cos_sin
+from ._selection import BaseIndexer, IndexerSelection, SelectionSpec, top_k_indices
 
 __all__ = ("IndexerLayerNorm", "IndexerOutput", "SparseIndexer")
 
@@ -103,20 +105,29 @@ class IndexerOutput(tp.NamedTuple):
         score_proxy: Indexer scores ``[batch, seq, n_candidates]`` float32
             for the straight-through training bias; ``None`` when selection
             ran under ``stop_gradient``.
+        topk_mask: The selection as a dense ``[batch, seq, kv]`` boolean mask
+            over the packed-state range, equal to
+            ``selection.to_mask(kv)``. Built without scattering the token
+            indices (pool strategy only); ``None`` otherwise.
     """
 
     topk_indices: Array
     packed_state: Array | None = None
     score_proxy: Array | None = None
+    topk_mask: Array | None = None
+
+    @property
+    def selection(self) -> IndexerSelection:
+        """Common attention-consumer view, without changing the cache tuple."""
+        return IndexerSelection(self.topk_indices, self.score_proxy, self.topk_mask)
 
 
-class SparseIndexer(spx.Module):
-    """Unified dynamic sparse-attention token indexer.
+class SparseIndexer(BaseIndexer):
+    """GLM-style token and learned-pool indexer strategies.
 
-    One module for every "score candidates, keep top-k, mask the attention"
-    layer in the model zoo. Selection strategy and numerics are entirely
-    :class:`IndexerConfig`-driven; see the config for the knob-by-knob
-    mapping to the published families (GLM-MoE-DSA, GLM-5-Next).
+    Selection and cache packing are :class:`IndexerConfig`-driven. Other
+    compression/projection layouts specialize :class:`BaseIndexer` instead
+    of pretending to have the same checkpoint structure or pooling math.
 
     Submodule names match the GLM checkpoints (``wq_b`` / ``wk`` /
     ``k_norm`` / ``weights_proj`` / ``index_kpool_compress_ape`` /
@@ -215,6 +226,11 @@ class SparseIndexer(spx.Module):
             )
 
     @property
+    def selection_spec(self) -> SelectionSpec:
+        """Static ranked/output units; learned pools expand to token offsets."""
+        return SelectionSpec("block" if self.config.kind == IndexerKind.POOL else "token", "token")
+
+    @property
     def packed_state_dim(self) -> int:
         """Width of the per-token packed state (0 when stateless)."""
         return self._packed_dim
@@ -264,8 +280,10 @@ class SparseIndexer(spx.Module):
         query, key, gate_scores = self._project(hidden_states, q_resid, frequencies, position_ids)
         packed_state = self._pack_state(key, gate_scores, attention_mask, cached_packed)
 
+        topk_mask = None
         if self.config.kind == IndexerKind.POOL:
-            topk_indices, score_proxy = self._select_pool(hidden_states, query, packed_state, attention_mask)
+            topk_indices, topk_mask = self._select_pool(hidden_states, query, packed_state, attention_mask)
+            score_proxy = None
         else:
             topk_indices, score_proxy = self._select_token(
                 hidden_states, query, key, packed_state, attention_mask, pairwise_mask
@@ -274,7 +292,16 @@ class SparseIndexer(spx.Module):
         if self.config.stop_gradient:
             topk_indices = jax.lax.stop_gradient(topk_indices)
             score_proxy = None
-        return IndexerOutput(topk_indices=topk_indices, packed_state=packed_state, score_proxy=score_proxy)
+        # Small, but recomputing it replays scoring and the full top-k.
+        topk_indices = checkpoint_name(topk_indices, "indexer_topk")
+        if topk_mask is not None:
+            topk_mask = checkpoint_name(topk_mask, "indexer_topk")
+        return IndexerOutput(
+            topk_indices=topk_indices,
+            packed_state=packed_state,
+            score_proxy=score_proxy,
+            topk_mask=topk_mask,
+        )
 
     def _project(
         self,
@@ -435,7 +462,7 @@ class SparseIndexer(spx.Module):
                 index_scores = index_scores + mask.astype(jnp.float32)
 
         select_k = min(self.index_topk, index_scores.shape[-1])
-        topk_indices = jax.lax.top_k(index_scores, select_k)[1].astype("i4")
+        topk_indices = top_k_indices(index_scores, select_k, self.mesh_source).astype("i4")
         return topk_indices, index_scores
 
     def _select_pool(
@@ -455,9 +482,10 @@ class SparseIndexer(spx.Module):
             attention_mask: Current-token padding mask.
 
         Returns:
-            ``(topk_indices [batch, seq, width], None)`` — ``width`` is
-            ``index_topk`` plus ``kpool_size - 1`` when the tail pool is
-            selected; ``-1`` marks invalid entries.
+            ``(topk_indices [batch, seq, width], topk_mask [batch, seq, kv])``
+            — ``width`` is ``index_topk`` plus ``kpool_size - 1`` when the
+            tail pool is selected; ``-1`` marks invalid entries. The mask
+            holds the same selection in dense form.
         """
         batch_size, seq_len, _ = hidden_states.shape
         kv_len = packed_state.shape[1]
@@ -486,11 +514,13 @@ class SparseIndexer(spx.Module):
         index_scores = jnp.where(valid_candidates, index_scores, min_score)
 
         select_k = min(self.index_topk // kpool, num_pools)
-        selected = jax.lax.top_k(index_scores, select_k)[1]
+        selection = self.select_candidates(index_scores, select_k, valid_candidates, self.mesh_source)
+        selected = selection.indices
 
-        selected_valid = jnp.take_along_axis(valid_candidates, selected, axis=2)
+        selected_valid = selected >= 0
         expanded_pools = jnp.broadcast_to(pool_indices[:, None], (batch_size, seq_len, num_pools, kpool))
-        selected_pool_indices = jnp.take_along_axis(expanded_pools, selected[..., None].astype("i4"), axis=2)
+        safe_selected = jnp.maximum(selected, 0)
+        selected_pool_indices = jnp.take_along_axis(expanded_pools, safe_selected[..., None], axis=2)
         selected_indices = selected_pool_indices.reshape(batch_size, seq_len, select_k * kpool)
         selected_valid_flat = jnp.broadcast_to(
             selected_valid[..., None], (batch_size, seq_len, select_k, kpool)
@@ -498,9 +528,24 @@ class SparseIndexer(spx.Module):
 
         topk_indices = jnp.where(selected_valid_flat, selected_indices, -1)
 
+        # Dense form of the same selection. Selected pools are complete, so
+        # pool ``p`` covers tokens ``first_key + p*kpool + [0, kpool)``: mark
+        # the pools, repeat each over its members and shift by ``first_key``.
+        # This avoids scattering the token indices, which is slow on TPU.
+        pool_mask = selection.mask
+        if pool_mask is None:
+            pool_mask = jnp.zeros(index_scores.shape, dtype=jnp.bool_)
+        token_mask = jnp.repeat(pool_mask, kpool, axis=-1)
+        token_mask = jnp.pad(token_mask, [(0, 0), (0, 0), (kv_len, 0)])
+        first_key = self._first_valid_key(valid_keys)
+        topk_mask = jax.vmap(lambda row, start: jax.lax.dynamic_slice_in_dim(row, start, kv_len, axis=-1))(
+            token_mask, kv_len - first_key
+        )
+
         output_width = self.index_topk
         if self.config.select_tail:
             topk_indices = self._append_visible_tail(topk_indices, visible_tokens, valid_keys)
+            topk_mask = topk_mask | self._visible_tail_mask(visible_tokens, valid_keys)
             output_width += kpool - 1
 
         pad_width = output_width - topk_indices.shape[-1]
@@ -508,7 +553,14 @@ class SparseIndexer(spx.Module):
             topk_indices = jnp.pad(topk_indices, [(0, 0), (0, 0), (0, pad_width)], constant_values=-1)
         topk_indices = topk_indices[..., :output_width]
         topk_indices = jnp.where(attention_mask[..., None], topk_indices, -1)
-        return topk_indices.astype("i4"), None
+        topk_mask = topk_mask & attention_mask[..., None]
+        return topk_indices.astype("i4"), topk_mask
+
+    @staticmethod
+    def _first_valid_key(key_valid: Bool[Array, "batch kv"]) -> Array:
+        """Index of each row's first valid key; ``kv`` for an all-invalid row."""
+        kv_length = key_valid.shape[-1]
+        return jnp.where(jnp.any(key_valid, axis=-1), jnp.argmax(key_valid, axis=-1), kv_length)
 
     def _pooled_states(
         self,
@@ -535,11 +587,7 @@ class SparseIndexer(spx.Module):
         kpool = self.config.kpool_size
         num_pools = (kv_len + kpool - 1) // kpool
 
-        first_key = jnp.where(
-            jnp.any(valid_keys, axis=-1),
-            jnp.argmax(valid_keys, axis=-1),
-            kv_len,
-        )
+        first_key = self._first_valid_key(valid_keys)
         offsets = jnp.arange(num_pools * kpool).reshape(1, num_pools, kpool)
         pool_indices = first_key[:, None, None] + offsets
 
@@ -595,16 +643,8 @@ class SparseIndexer(spx.Module):
             return topk_indices
 
         _, _, kv_length = token_visible.shape
-        first_key = jnp.where(
-            jnp.any(key_valid, axis=-1),
-            jnp.argmax(key_valid, axis=-1),
-            kv_length,
-        )
-        visible_count = jnp.sum(token_visible, axis=-1)
-        tail_count = visible_count % self.config.kpool_size
+        tail_start, tail_count = self._visible_tail_range(token_visible, key_valid)
         tail_offsets = jnp.arange(max_tail_width)
-
-        tail_start = first_key[:, None] + visible_count - tail_count
         tail_indices = tail_start[..., None] + tail_offsets
 
         tail_valid = (tail_offsets[None, None, :] < tail_count[..., None]) & (tail_indices < kv_length)
@@ -614,6 +654,31 @@ class SparseIndexer(spx.Module):
         )
         tail_indices = jnp.where(tail_valid & tail_visible, tail_indices, -1)
         return jnp.concatenate([topk_indices, tail_indices], axis=-1)
+
+    def _visible_tail_range(
+        self,
+        token_visible: Bool[Array, "batch q kv"],
+        key_valid: Bool[Array, "batch kv"],
+    ) -> tuple[Array, Array]:
+        """Start and length ``(batch, q)`` of each query's incomplete tail pool."""
+        first_key = self._first_valid_key(key_valid)
+        visible_count = jnp.sum(token_visible, axis=-1)
+        tail_count = visible_count % self.config.kpool_size
+        return first_key[:, None] + visible_count - tail_count, tail_count
+
+    def _visible_tail_mask(
+        self,
+        token_visible: Bool[Array, "batch q kv"],
+        key_valid: Bool[Array, "batch kv"],
+    ) -> Bool[Array, "batch q kv"]:
+        """Dense form of :meth:`_append_visible_tail`'s appended indices."""
+        if self.config.kpool_size == 1:
+            return jnp.zeros_like(token_visible, dtype=jnp.bool_)
+        tail_start, tail_count = self._visible_tail_range(token_visible, key_valid)
+        position = jax.lax.broadcasted_iota(jnp.int32, token_visible.shape, 2)
+        start = tail_start[..., None]
+        in_tail = (position >= start) & (position < start + tail_count[..., None])
+        return in_tail & token_visible.astype(jnp.bool_)
 
 
 # convenience re-exports for callers that mask attention from indices

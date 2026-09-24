@@ -15,7 +15,8 @@ def test_orthogonal_square_matrix_orthogonal():
     """For a square shape, the weight is approximately orthogonal."""
     init = orthogonal()
     y = init(jax.random.PRNGKey(0), (6, 6))
-    identity = y @ y.T
+    # Check orthogonality in full fp32; TPU DEFAULT rounds dot operands to bf16.
+    identity = jnp.matmul(y, y.T, precision=jax.lax.Precision.HIGHEST)
     assert jnp.allclose(identity, jnp.eye(6), atol=1e-4)
 
 
@@ -23,21 +24,21 @@ def test_orthogonal_tall_matrix_has_orthonormal_columns():
     """Tall matrices have orthonormal columns ``Q^T Q == I``."""
     init = orthogonal()
     y = init(jax.random.PRNGKey(0), (8, 4))
-    assert jnp.allclose(y.T @ y, jnp.eye(4), atol=1e-4)
+    assert jnp.allclose(jnp.matmul(y.T, y, precision=jax.lax.Precision.HIGHEST), jnp.eye(4), atol=1e-4)
 
 
 def test_orthogonal_wide_matrix_has_orthonormal_rows():
     """Wide matrices have orthonormal rows ``Q Q^T == I``."""
     init = orthogonal()
     y = init(jax.random.PRNGKey(0), (4, 8))
-    assert jnp.allclose(y @ y.T, jnp.eye(4), atol=1e-4)
+    assert jnp.allclose(jnp.matmul(y, y.T, precision=jax.lax.Precision.HIGHEST), jnp.eye(4), atol=1e-4)
 
 
 def test_orthogonal_gain_scales():
     """``gain`` multiplies the resulting matrix."""
     init = orthogonal(gain=2.0)
     y = init(jax.random.PRNGKey(0), (4, 4))
-    assert jnp.allclose(y @ y.T, 4.0 * jnp.eye(4), atol=1e-4)
+    assert jnp.allclose(jnp.matmul(y, y.T, precision=jax.lax.Precision.HIGHEST), 4.0 * jnp.eye(4), atol=1e-4)
 
 
 def test_orthogonal_rank_below_two_falls_back_to_gaussian():

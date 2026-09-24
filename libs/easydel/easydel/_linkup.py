@@ -37,14 +37,16 @@ _TPU_FLAGS_BY_GENERATION = {
         "--xla_tpu_overlap_compute_collective_tc=true "
         "--xla_enable_async_all_gather=true "
     ),
+    # libtpu 0.0.48 rejects continuation fusion on v5p (viperfish).
+    # Keep ordinary async collectives enabled; this restriction concerns fusion.
     "v5p": (
-        "--xla_tpu_enable_async_collective_fusion_fuse_all_gather=true "
+        "--xla_tpu_enable_async_collective_fusion_fuse_all_gather=false "
         "--xla_tpu_megacore_fusion_allow_ags=false "
         "--xla_enable_async_collective_permute=true "
         "--xla_tpu_enable_ag_backward_pipelining=true "
         "--xla_tpu_enable_data_parallel_all_reduce_opt=true "
         "--xla_tpu_data_parallel_opt_different_sized_ops=true "
-        "--xla_tpu_enable_async_collective_fusion=true "
+        "--xla_tpu_enable_async_collective_fusion=false "
         "--xla_tpu_enable_async_collective_fusion_multiple_steps=true "
         "--xla_tpu_overlap_compute_collective_tc=true "
         "--xla_enable_async_all_gather=true "
@@ -147,7 +149,7 @@ def _detect_tpu_generation_without_jax() -> str | None:
 
 
 def _maybe_apply_targeted_tpu_flags() -> None:
-    """Apply TPU flags for an explicit or lazily detected generation."""
+    """Apply generation-specific TPU defaults without replacing explicit flags."""
     explicit_generation = _os.getenv("EASYDEL_TARGETED_TPU_GENERATION")
     generation = _normalize_tpu_generation(explicit_generation)
     if explicit_generation is None or not explicit_generation.strip():
@@ -159,7 +161,13 @@ def _maybe_apply_targeted_tpu_flags() -> None:
         return
     if explicit_generation is None or not explicit_generation.strip():
         _os.environ["EASYDEL_TARGETED_TPU_GENERATION"] = generation
-    _os.environ["LIBTPU_INIT_ARGS"] = (_os.getenv("LIBTPU_INIT_ARGS", "") + " " + flags).strip()
+    existing_flags = _os.getenv("LIBTPU_INIT_ARGS", "")
+    # Treat generation flags as defaults, not overrides. Keep the original
+    # strings intact (including quoted values), and recognize both --name=value
+    # and --name value in either libtpu's or XLA's existing arguments.
+    configured_names = {flag.split("=", 1)[0] for flag in (existing_flags + " " + _os.getenv("XLA_FLAGS", "")).split()}
+    defaults = " ".join(flag for flag in flags.split() if flag.split("=", 1)[0] not in configured_names)
+    _os.environ["LIBTPU_INIT_ARGS"] = (existing_flags + " " + defaults).strip()
 
 
 def _ensure_optional_deepspeed_stub() -> None:

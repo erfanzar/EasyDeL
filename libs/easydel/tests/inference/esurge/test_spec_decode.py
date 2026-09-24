@@ -17,20 +17,15 @@ from __future__ import annotations
 
 import gc
 import os
-import traceback
 
 os.environ.setdefault("ENABLE_DISTRIBUTED_INIT", "0")
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
-# This test asserts bit-identical greedy (spec == baseline). Only the exact
-# sequential-replay recurrent path guarantees that; the default fast path is
-# coherent but not bit-identical on recurrent models (see model_runner
-# spec_decode_recurrent_replay). Force the exact path here.
-os.environ.setdefault("EASYDEL_SPEC_RECURRENT_REPLAY", "1")
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.esurge.runners import eSurgeRunner
 from easydel.inference.esurge.scheduler import Scheduler
@@ -41,6 +36,12 @@ try:
     from ._common import make_tiny_qwen35 as make_tiny_model
 except ImportError:  # standalone `python test_x.py`
     from _common import make_tiny_qwen35 as make_tiny_model
+
+
+@pytest.fixture(autouse=True)
+def _exact_recurrent_replay(monkeypatch):
+    """Greedy baseline parity requires exact replay, scoped to each test."""
+    monkeypatch.setenv("EASYDEL_SPEC_RECURRENT_REPLAY", "1")
 
 
 class BaselineSequenceDrafter:
@@ -132,7 +133,9 @@ def run_generation(model, *, drafter, max_new_tokens: int = 8) -> tuple[list[int
 
 def test_esurge_runner_spec_decode():
     print("\n[test] eSurge runner-native greedy speculative decoding")
-    model = make_tiny_model(mtp_layers=1)
+    # Exact-token parity compares differently shaped projections; TPU DEFAULT
+    # rounding can flip near-tied logits independently of replay correctness.
+    model = make_tiny_model(mtp_layers=1, precision=jax.lax.Precision.HIGHEST)
     assert model.has_mtp(), "tiny Qwen3.5 model must expose MTP for this integration test"
 
     baseline_tokens, baseline_runner = run_generation(model, drafter=None)
@@ -162,8 +165,6 @@ def test_esurge_runner_spec_decode():
 
 
 if __name__ == "__main__":
-    try:
-        test_esurge_runner_spec_decode()
-    except Exception:
-        traceback.print_exc()
-        raise
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

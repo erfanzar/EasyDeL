@@ -99,15 +99,33 @@ def test_nf4_round_trip_hits_the_code_book():
 
 def test_int8_absmax_matches_numpy_reference():
     """Per-channel absmax scale and dequantization match an independent NumPy computation."""
-    w = _weights()
+    wn = np.array(_weights())
+    # A negative absmax lies exactly at -127.5 mathematically. CPU division
+    # and TPU reciprocal multiplication can land on opposite sides of that
+    # tie, legitimately choosing -128 or -127. Make extrema positive here:
+    # both neighboring rounded codes then saturate to 127. Test the actual
+    # round-to-nearest-even contract separately on exactly represented ties.
+    maxima = np.max(np.abs(wn), axis=0, keepdims=True)
+    wn = np.where(np.abs(wn) == maxima, maxima, wn)
+    w = jnp.asarray(wn)
     q = quantize(w, HowToQuantize(qtype=jnp.int8, channelwise_axes=(1,)))
 
-    wn = np.asarray(w)
     scale_ref = np.max(np.abs(wn), axis=0, keepdims=True) / 127.5
     deq_ref = np.round(wn / scale_ref).clip(-128, 127) * scale_ref
 
     np.testing.assert_allclose(np.asarray(q.scale), scale_ref, rtol=1e-6)
     np.testing.assert_allclose(np.asarray(dequantize(q)), deq_ref, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("qtype", [jnp.int8, jnp.int4, "int3"])
+def test_integer_conversion_rounds_ties_to_even_and_saturates(qtype):
+    """Exactly representable ties pin rounding independently of scale division."""
+    values = np.array([-129, -128.5, -127.5, -8.5, -7.5, -3.5, -2.5, -0.5, 0.5, 1.5, 2.5, 7.5, 127.5, 128])
+    low, high = numerics.asymmetric_bound(qtype)
+    expected = np.clip(np.round(values), low, high).astype(np.int8)
+    for convert in (lambda x: numerics.convert_to(x, qtype), jax.jit(lambda x: numerics.convert_to(x, qtype))):
+        actual = convert(jnp.asarray(values, dtype=jnp.float32)).astype(jnp.int8)
+        np.testing.assert_array_equal(np.asarray(actual), expected)
 
 
 def test_minmax_is_asymmetric_and_matches_numpy_reference():

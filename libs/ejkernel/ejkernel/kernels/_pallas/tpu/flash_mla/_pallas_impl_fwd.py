@@ -256,7 +256,7 @@ def _flash_mla_kernel_single_batch(
         block_k_repeats, rem = divmod(block_k, MIN_BLOCK_SIZE)
         if rem:
             raise NotImplementedError(f"block_k={block_k} must be a multiple of {MIN_BLOCK_SIZE}")
-        p = jnp.exp(s - pltpu.repeat(m_next, block_k_repeats, 1))
+        p = jnp.exp(s - jnp.tile(m_next, (1, block_k_repeats)))
 
         alpha = jnp.exp(m_prev - m_next)
         l_corr = alpha * l_prev
@@ -265,7 +265,7 @@ def _flash_mla_kernel_single_batch(
         head_dim_repeats, head_dim_rem = divmod(v_head_dim, MIN_BLOCK_SIZE)
 
         def l_broadcast(val):
-            return pltpu.repeat(val, head_dim_repeats, 1)
+            return jnp.tile(val, (1, head_dim_repeats))
 
         if head_dim_rem:
             if head_dim_repeats == 0:

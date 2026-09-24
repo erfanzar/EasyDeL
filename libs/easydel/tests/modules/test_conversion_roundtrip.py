@@ -33,13 +33,14 @@ Run all:             ``pytest tests/modules/test_conversion_roundtrip.py``
 
 from __future__ import annotations
 
+import os
+
+os.environ.setdefault("JAX_PLATFORMS", os.environ.get("JAX_PLATFORM_NAME", "cpu"))
+
 import easydel as ed
-import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
-jax.config.update("jax_platform_name", "cpu")
 
 # Every registered ``CAUSAL_LM`` ``model_type`` with a HuggingFace torch equivalent
 # (i.e. ``module.get_torch_loader()._model_mapping`` contains its config class), so the

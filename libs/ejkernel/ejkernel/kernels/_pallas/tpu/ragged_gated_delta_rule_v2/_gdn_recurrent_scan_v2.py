@@ -364,7 +364,13 @@ def inner_kernel(
 
                         state_h = current_state[h]  # (d_k, d_v)
 
-                        k_state_h = pl.dot(k_h, state_h, precision=jax.lax.Precision.HIGHEST)  # (1, d_v)
+                        k_state_h = jax.lax.dot_general(
+                            k_h,
+                            state_h,
+                            (((1,), (0,)), ((), ())),
+                            precision=jax.lax.Precision.HIGHEST,
+                            preferred_element_type=jnp.float32,
+                        )  # (1, d_v)
 
                         decay_k_state = jnp.where(
                             jnp.isinf(k_state_h),
@@ -374,7 +380,13 @@ def inner_kernel(
                         v_diff_h = v_h - decay_k_state
                         v_new_h = curr_beta[h].astype(jnp.float32) * v_diff_h
 
-                        q_state_h = pl.dot(q_h, state_h, precision=jax.lax.Precision.HIGHEST)  # (1, d_v)
+                        q_state_h = jax.lax.dot_general(
+                            q_h,
+                            state_h,
+                            (((1,), (0,)), ((), ())),
+                            precision=jax.lax.Precision.HIGHEST,
+                            preferred_element_type=jnp.float32,
+                        )  # (1, d_v)
 
                         q_k_h = jnp.sum(q_h * k_h, axis=-1, keepdims=True)  # (1, 1)
 
@@ -382,8 +394,12 @@ def inner_kernel(
                         out_h = decay_q_state + q_k_h * v_new_h
                         out_list.append(out_h)
 
-                        k_v_new_h = pl.dot(
-                            k_h, v_new_h, trans_a=True, precision=jax.lax.Precision.HIGHEST
+                        k_v_new_h = jax.lax.dot_general(
+                            k_h,
+                            v_new_h,
+                            (((0,), (0,)), ((), ())),
+                            precision=jax.lax.Precision.HIGHEST,
+                            preferred_element_type=jnp.float32,
                         )  # (d_k, 1) @ (1, d_v) -> (d_k, d_v)
                         decay_state = jnp.where(jnp.isinf(state_h), 0.0, state_h * decay[h])
                         new_state_h = decay_state + k_v_new_h

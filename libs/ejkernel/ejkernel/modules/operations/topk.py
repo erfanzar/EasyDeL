@@ -25,12 +25,12 @@ DSA indexer           ``[b, s, entries]``   large     indices
 sampling top-k filter ``[reqs, vocab]``     per-row   keep-mask
 ===================== ===================== ======== ==========================
 
-The blockwise-superset Pallas path is exact but costs ``k`` reduction passes,
-so :meth:`TopK.heuristic_cfg` only selects it where that trade wins: a wide
-reduction axis with a small static ``k``. Everything else -- a narrow axis
-(where a Pallas launch costs more than the reduction), a large ``k``, or a
-per-row dynamic ``k`` -- routes to the XLA reference, which is not a fallback
-for lack of a kernel but the measured-better path for those regimes.
+XLA lowers ``jax.lax.top_k`` on TPU to a full sort of the reduction axis. The
+Pallas path finds the exact ``k``-th key by bisection, compacts the survivors
+and sorts only those, bit-identical to ``top_k``. :meth:`TopK.heuristic_cfg`
+selects it for ``k >= 32`` over at least 768 candidates and 256 rows. Tiny ``k``
+(the MoE router), narrow axes, few rows (sampling) and per-row dynamic ``k``
+stay on the XLA reference, which is faster there.
 """
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ import os
 import typing as tp
 
 import jax
+import jax.numpy as jnp
 from jaxtyping import Array
 
 from ejkernel.kernels._registry import Backend, Platform, kernel_registry
@@ -47,11 +48,10 @@ from ejkernel.ops.config.persistent import PersistentCache
 
 from .configs import TopKConfig
 
-#: Below this reduction width a Pallas launch costs more than the reduction.
-_MIN_WIDTH_FOR_PALLAS = 4096
-
-#: The superset costs ``k`` passes, so it stops paying once ``k`` grows.
-_MAX_K_FOR_PALLAS = 32
+#: Below these sizes XLA's sort-based ``top_k`` beats the threshold kernel.
+_MIN_WIDTH_FOR_PALLAS = 768
+_MIN_K_FOR_PALLAS = 32
+_MIN_ROWS_FOR_PALLAS = 256
 
 
 class TopK(Kernel[TopKConfig, tp.Any]):
@@ -113,16 +113,19 @@ class TopK(Kernel[TopKConfig, tp.Any]):
         mode = inv.kwargs.get("mode", "values")
         axis = inv.kwargs.get("axis", -1)
 
-        width = 0
+        width = rows = 0
         if operand is not None and getattr(operand, "ndim", 0):
             axis_n = axis if axis >= 0 else operand.ndim + axis
             width = int(operand.shape[axis_n])
+            rows = int(operand.size) // max(width, 1)
 
         use_pallas = (
             mode == "values"
             and isinstance(k, int)
-            and 0 < k <= _MAX_K_FOR_PALLAS
+            and _MIN_K_FOR_PALLAS <= k <= width
             and width >= _MIN_WIDTH_FOR_PALLAS
+            and rows >= _MIN_ROWS_FOR_PALLAS
+            and jnp.issubdtype(operand.dtype, jnp.floating)
             # Mosaic only lowers for real on TPU; on CPU/GPU the Pallas path
             # would fall into interpret mode, which is slower and not the point.
             and jax.default_backend() == "tpu"

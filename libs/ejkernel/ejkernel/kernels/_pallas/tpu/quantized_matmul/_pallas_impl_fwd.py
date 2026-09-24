@@ -103,6 +103,16 @@ def _pallas_qmm_transpose_false_packed(
         raise ValueError(f"TPU packed fused path currently supports modes {sorted(_PACKED_SUPPORTED_MODES)}.")
 
     block_m, block_n, block_k = _normalize_tpu_blocks(block_m, block_n, block_k)
+    # Packed-word and scale BlockSpecs can require the full N dimension. In
+    # particular, N=4096/group_size=128 cannot simply use a smaller N tile:
+    # the scale tile would neither span the trailing dimension nor be a
+    # multiple of 128. Bound K instead. The statically unrolled N-subtiles
+    # also need unpack/dequant temporaries that the IO-only VMEM estimate
+    # below does not account for; K=256, N=4096 exceeds 32 MiB on TPU v5
+    # with JAX 0.11.2. Apply this at launch so cached/manual configs are
+    # covered too, without falling back to a materialized dense weight.
+    if block_n >= 4096:
+        block_k = min(block_k, 128)
     value_alignment = _bit_aligned_values(bits)
     if block_n % value_alignment != 0:
         raise ValueError("block_n must start and end on packed-word boundaries for TPU packed path.")

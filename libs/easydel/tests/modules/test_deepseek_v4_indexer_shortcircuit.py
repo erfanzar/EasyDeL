@@ -59,7 +59,7 @@ def _shortcircuit_path(visible, n_slots):
 
 
 def _bias(indices, n_slots):
-    return np.asarray(_indexer_opened_bias(indices, BATCH, SEQ, n_slots), np.float32)
+    return np.asarray(_indexer_opened_bias(indices, n_slots), np.float32)
 
 
 @pytest.mark.parametrize("n_slots", [16, 64, 512])
@@ -232,11 +232,11 @@ def test_live_prefix_equivalence_is_not_vacuous():
 
 def test_indexer_opened_bias_score_proxy_is_primal_exact_and_differentiable():
     indices = jnp.array([[[0, 2]]], jnp.int32)
-    plain = _indexer_opened_bias(indices, 1, 1, 4)
+    plain = _indexer_opened_bias(indices, 4)
     scores = jnp.array([[[0.2, -0.1, 0.7, 0.3]]], jnp.float32)
 
     def loss(s):
-        bias = _indexer_opened_bias(indices, 1, 1, 4, score_proxy=s)
+        bias = _indexer_opened_bias(indices, 4, score_proxy=s)
         assert jnp.array_equal(bias, plain)
         probs = jax.nn.softmax(bias[:, 0], axis=-1)
         return jnp.sum(probs * jnp.arange(4, dtype=jnp.float32))

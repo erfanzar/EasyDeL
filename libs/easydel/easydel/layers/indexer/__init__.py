@@ -12,42 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unified dynamic sparse-attention indexer layer.
+"""Composable sparse-attention indexer layers.
 
-An indexer sits beside a full-attention layer and decides, per query, which
-past tokens the softmax may see. Historically every model family implemented
-its own variant (DeepSeek-V4 Lightning indexer, GLM-MoE-DSA per-token top-k,
-GLM-5-Next k-pool, MiniMax-M3 block-sparse, Qwen4-Exp block top-k) with
-near-identical plumbing: projections, per-key norms, partial RoPE, causal +
-padding visibility, top-k with ``-1`` padding, packed per-token cache state,
-straight-through score proxies and vacuous-selection fast paths.
+:class:`BaseIndexer` and :class:`IndexerSelection` define shared ranking and
+attention-consumer contracts. Concrete strategies keep their own projection
+layout, compression, cache protocol and gradient policy. Static
+:class:`SelectionSpec` metadata distinguishes raw-token offsets from
+compressed-entry offsets and shared selections from per-group selections.
 
-:class:`SparseIndexer` unifies all of that behind one dynamic module driven by
-:class:`IndexerConfig`, so adding an indexer to a future model is a
-constructor call instead of a few hundred lines. Submodule names
-(``wq_b`` / ``wk`` / ``k_norm`` / ``weights_proj`` and the k-pool
-``index_kpool_compress_ape`` / ``index_kpool_compress_gate`` parameters)
-match the published GLM checkpoints so families can adopt the layer without
-renaming loaded weights.
+:class:`SparseIndexer` implements GLM-style token and learned-pool strategies;
+it is not a replacement for mean-key pooling, max-score pooling or two-series
+compressed-entry indexing. Model adapters retain checkpoint-native parameter
+names without nesting a second parameter-owning implementation module.
 
-Selection strategies:
-
-- ``kind="token"``: score every key token directly (GLM-MoE-DSA, DeepSeek-V3/V2
-  Lightning-style, after optional external compression).
-- ``kind="pool"``: group keys into pools of ``kpool_size`` starting at the
-  first valid token, summarise each pool with a softmax-gated learned average
-  (``ape`` position bias), top-k over pools and expand back to token indices
-  with the optional always-selected tail pool (GLM-5-Next).
-
-Shared knobs cover the observed zoo variance: score activation
-(``none`` / ``relu``), head reduction (``weighted`` / ``uniform``), query
-source (``q_lora`` residual vs raw ``hidden``), RoPE style (``split_half`` /
-``interleaved`` / ``none``) with width truncation, packed cache layout
-(``keys`` / ``key_gate_valid`` / ``none``), straight-through gradient
-suppression, and the ``prev_topk_indices`` carry for ``shared`` indexer
-layers that reuse another layer's selection.
+Cache adapters own request/physical-page mapping; indexers return logical
+selection offsets. The presence of a shared selection contract does not imply
+that every strategy supports cached decode, packed training or shared-layer
+reuse. Each implementation preserves its explicit capability checks.
 """
 
+from ._block_max import BlockMaxIndexer, BlockMaxIndexerConfig
+from ._block_topk import BlockTopKIndexer
+from ._compressed import CompressedIndexer, CompressedIndexerAdapter, CompressedIndexerConfig, CompressedIndexerScorer
 from ._config import IndexerConfig, IndexerKind
 from ._indexer import IndexerOutput, SparseIndexer
 from ._primitives import (
@@ -55,19 +41,35 @@ from ._primitives import (
     is_vacuous_selection,
     ste_score_proxy,
     topk_select,
+    topk_selection_mask,
     visible_causal_mask,
 )
+from ._selection import BaseIndexer, IndexerSelection, SelectionSpec
+from ._token import TokenIndexer, TokenIndexerConfig
 
 __all__ = (
+    "BaseIndexer",
+    "BlockMaxIndexer",
+    "BlockMaxIndexerConfig",
+    "BlockTopKIndexer",
+    "CompressedIndexer",
+    "CompressedIndexerAdapter",
+    "CompressedIndexerConfig",
+    "CompressedIndexerScorer",
     "IndexerConfig",
     "IndexerKind",
     "IndexerOutput",
+    "IndexerSelection",
+    "SelectionSpec",
     "SparseIndexer",
+    "TokenIndexer",
+    "TokenIndexerConfig",
     "apply_indexer_rope",
     "indices_to_bool_mask",
     "is_vacuous_selection",
     "ste_score_proxy",
     "topk_select",
+    "topk_selection_mask",
     "visible_causal_mask",
 )
 

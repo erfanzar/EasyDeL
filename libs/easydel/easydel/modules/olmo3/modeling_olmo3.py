@@ -28,6 +28,8 @@ Exports:
     - ``Olmo3ForSequenceClassification``: classification head wrapper.
 """
 
+from functools import cached_property
+
 import jax
 import jax.numpy as jnp
 import spectrax as spx
@@ -227,6 +229,10 @@ class Olmo3Attention(UnifiedAttention):
             sliding_window=sliding_window,
             use_qk_norm=True,  # Enable Q/K normalization
         )
+
+    def _create_rotary(self, config: Olmo3Config, dtype: jnp.dtype):
+        """Build RoPE using this layer's local or global parameters."""
+        return super()._create_rotary(config.get_layer_rope_config(self.attention_type_name), dtype)
 
     def _create_q_norm(self, config: Olmo3Config, dtype: jnp.dtype, param_dtype: jnp.dtype, rngs: spx.Rngs):
         """Create query normalization layer using RMSNorm.
@@ -542,6 +548,14 @@ class Olmo3Model(EasyDeLBaseModule):
                 rngs=rngs,
             )
 
+    @cached_property
+    def frequencies(self):
+        """Cache frequency tables separately for each configured attention type."""
+        return {
+            layer_type: self.config.get_layer_rope_config(layer_type).get_basic_frequencies()
+            for layer_type in dict.fromkeys(self.config.layer_types)
+        }
+
     def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
@@ -690,7 +704,7 @@ class Olmo3Model(EasyDeLBaseModule):
                     cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
                     cache_metadata=cache_metadata,
                     output_attentions=output_attentions,
-                    frequencies=self.frequencies,
+                    frequencies=self.frequencies[block.self_attn.attention_type_name],
                 )
             hs = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
             cv = self._layer_cache_view_update(

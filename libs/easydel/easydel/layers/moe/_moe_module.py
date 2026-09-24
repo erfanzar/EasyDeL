@@ -1495,6 +1495,14 @@ class BaseMoeModule(spx.Module, ABC):
             tp_size,
             _,
         ) = self._get_sharding_status()
+        # The shard_map below runs on ``expert_mesh``. When fsdp/sp are bound
+        # into experts it is the folded (dp, ep, tp) mesh whose expert axis
+        # spans ep*fsdp*sp devices, while the model mesh above reports the
+        # physical ep axis alone. Local expert counts must follow the mesh the
+        # weights are actually partitioned over.
+        expert_mesh_sizes = dict(expert_mesh.jax_mesh.shape)
+        ep_size = int(expert_mesh_sizes.get(expert_axis_name, ep_size))
+        tp_size = int(expert_mesh_sizes.get(tensor_axis_name, tp_size))
 
         # Quantization-aware training reaches the experts here rather than
         # through ``ParallelMoELinear.forward``: this fused path reads the
@@ -2434,7 +2442,9 @@ class BaseMoeModule(spx.Module, ABC):
                 # Mask the gmm output tail before the unsort moves it around,
                 # and the unsorted buffer before the combine reads from it.
                 intermediate = _mask_row_tail(intermediate)
-                local_output = sort_activations(intermediate, jnp.argsort(local_sorted_indices), True)
+                local_output = sort_activations(
+                    intermediate, jnp.argsort(local_sorted_indices), True, inverse_indices=local_sorted_indices
+                )
                 local_output = _mask_row_tail(local_output)
 
                 c_in_off, c_send_sz, c_out_off, c_recv_sz = get_all_to_all_params(
@@ -3278,7 +3288,7 @@ class BaseMoeModule(spx.Module, ABC):
         ) = self._replicate_and_sort_tokens(hidden_state_flat, selected_experts)
 
         out_sorted = expert_layer(sorted_inputs, group_sizes, sorted_experts)
-        out_unsorted = sort_activations(out_sorted, jnp.argsort(sort_order))
+        out_unsorted = sort_activations(out_sorted, jnp.argsort(sort_order), inverse_indices=sort_order)
         out_unflat = out_unsorted.reshape(batch_size * seq_len, self.num_experts_per_tok, hidden_size)
 
         if hooks.before_combine is not None:

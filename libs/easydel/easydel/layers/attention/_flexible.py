@@ -480,8 +480,9 @@ class FlexibleAttentionModule(spx.Module):
             output_attentions: When ``True`` instructs the backend to
                 materialise softmax weights. Falls back to
                 ``config.output_attentions`` when ``None``.
-            precision: JAX matmul precision. Defaults to
-                ``lax.Precision.DEFAULT`` when ``None``.
+            precision: JAX matmul precision, forwarded to the vanilla backend
+                only. There ``None`` inherits the ambient JAX precision and an
+                explicit value (including ``DEFAULT``) is used as given.
             prevent_cse: Whether to prevent common-subexpression elimination
                 inside the kernel.
             cum_seqlens_q: Optional cumulative sequence lengths for query
@@ -671,6 +672,10 @@ class FlexibleAttentionModule(spx.Module):
             if impl_names & weight_aware_impls:
                 call_kwargs = dict(input_kwargs)
                 call_kwargs["return_attention_weights"] = output_attentions_computed
+            if AttentionMechanisms.VANILLA.value in impl_names:
+                # None inherits ambient JAX precision; explicit values (including
+                # DEFAULT) are forwarded.
+                call_kwargs["precision"] = precision
             return callable_attn(**call_kwargs)
 
         with _attention_mesh_context(self.config):  # pyright: ignore[reportOptionalContextManager]

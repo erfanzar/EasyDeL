@@ -34,8 +34,6 @@ try:
 except ImportError:
     from tests.modules.test_utils import CausalLMTester  # pyright: ignore[reportImplicitRelativeImport]
 
-MODULE_NAME = "glm5_next_text"
-
 
 def _tiny_kwargs(small_model_config):
     """Tiny GLM-5-Next kwargs (2 KDA layers + 2 DSA layers, mHC=2, MoE)."""
@@ -130,7 +128,7 @@ class TestGlm5Next:
         """Test Glm5NextForCausalLM forward (logits + loss present, finite)."""
         tester = CausalLMTester()
         result = tester.run(
-            module_name=MODULE_NAME,
+            module_name="glm5_next_text",
             hf_class=None,  # transformers has no glm5_next port
             task=ed.TaskType.CAUSAL_LM,
             config=glm5_config,
@@ -142,7 +140,7 @@ class TestGlm5Next:
         """Test GLM-5-Next autoregressive generation through HybridCache."""
         tester = CausalLMTester()
         result = tester.test_generation(
-            module_name=MODULE_NAME,
+            module_name="glm5_next_text",
             hf_class=None,
             config=glm5_config,
             small_model_config=glm5_small_config,
@@ -179,11 +177,14 @@ class TestGlm5Next:
 
         Two documents are packed into one row and routed through the model via
         ``fold_sequence_packing_segments`` (the trainer → model contract). The
-        KDA conv + delta-rule state must reset at the document boundary, so the
-        second document's first-token output is bit-identical to running that
-        document alone from zero state. As a control, the same packed row
-        *without* segment ids leaks document 1's state into document 2 and
-        must diverge.
+        KDA conv + delta-rule state must reset at the document boundary, so
+        changing only document 1 must leave document 2's first-token output
+        exactly unchanged. Both runs keep the same sequence shape and segment
+        boundaries: an isolated run has a different shape and unsegmented
+        conv/recurrence paths, so it need not be bit-identical even at HIGHEST
+        matmul precision. Without segment ids, the same counterfactual must
+        change document 2's first token. The standalone-document comparison
+        remains as a relative-error check over all of document 2.
         """
         config = glm5_config
         config.sharding_axis_dims = glm5_small_config["sharding_axis_dims"]
@@ -205,6 +206,10 @@ class TestGlm5Next:
             doc1 = generator.integers(10, 1000, size=(batch_size, len_doc1))
             doc2 = generator.integers(10, 1000, size=(batch_size, len_doc2))
             packed_ids = jnp.asarray(np.concatenate([doc1, doc2], axis=1), dtype="i4")
+            # Change every doc1 token while staying in the original token range.
+            # Doc2 and its absolute positions/pool boundaries are unchanged.
+            counterfactual_doc1 = 10 + (doc1 - 10 + 495) % 990
+            counterfactual_ids = jnp.asarray(np.concatenate([counterfactual_doc1, doc2], axis=1), dtype="i4")
             doc2_ids = jnp.asarray(doc2, dtype="i4")
             segment_ids = jnp.concatenate(
                 [
@@ -214,23 +219,32 @@ class TestGlm5Next:
                 axis=1,
             )
 
-            packed_kwargs = fold_sequence_packing_segments(
-                {"input_ids": packed_ids, "segment_ids": segment_ids}
-            )
+            packed_kwargs = fold_sequence_packing_segments({"input_ids": packed_ids, "segment_ids": segment_ids})
             assert "mask_info" in packed_kwargs, "segment ids must fold into mask_info"
             assert "segment_ids" not in packed_kwargs
 
+            counterfactual_kwargs = fold_sequence_packing_segments(
+                {"input_ids": counterfactual_ids, "segment_ids": segment_ids}
+            )
             logits_packed = np.asarray(module(**packed_kwargs).logits)
+            logits_counterfactual = np.asarray(module(**counterfactual_kwargs).logits)
             logits_alone = np.asarray(module(input_ids=doc2_ids).logits)
             logits_unthreaded = np.asarray(module(input_ids=packed_ids).logits)
+            logits_unthreaded_counterfactual = np.asarray(module(input_ids=counterfactual_ids).logits)
 
         doc2_packed = logits_packed[:, len_doc1:]
-        # The boundary resets conv + recurrent state to zero, so document 2's
-        # first token is computed from the exact same state as an isolated run.
-        first_token_diff = float(np.abs(doc2_packed[:, :1] - logits_alone[:, :1]).max())
+        first_token = slice(len_doc1, len_doc1 + 1)
+        first_token_diff = float(np.abs(logits_packed[:, first_token] - logits_counterfactual[:, first_token]).max())
         assert first_token_diff == 0.0, (
-            f"document 2's first token must be identical to an isolated run, got diff {first_token_diff}"
+            f"document 2's first token must be invariant to document 1, got diff {first_token_diff}"
         )
+
+        # Same-shape negative control: this exact prefix perturbation must be
+        # observable at the boundary when segment threading is omitted.
+        counterfactual_leak = float(
+            np.abs(logits_unthreaded[:, first_token] - logits_unthreaded_counterfactual[:, first_token]).max()
+        )
+        assert counterfactual_leak > 0.0, "unthreaded first token is insensitive to the prefix perturbation"
 
         # Control: without threading, document 1 leaks into document 2.
         leak = float(np.abs(logits_unthreaded[:, len_doc1:] - logits_alone).max())

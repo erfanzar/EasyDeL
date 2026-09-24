@@ -88,7 +88,6 @@ tensorflow = ["tensorflow~=2.19.0", "tensorflow-datasets~=4.9.9"]
 lm_eval = ["lm_eval~=0.4.11"]
 profile = [
 	"protobuf>=6.31.1",
-	"setuptools>=70,<81",
 	"xprof>=2.20.6",
 	"tb-nightly>=2.21.0a20250820",
 	"xprof-nightly>=2.21.6a20250820",

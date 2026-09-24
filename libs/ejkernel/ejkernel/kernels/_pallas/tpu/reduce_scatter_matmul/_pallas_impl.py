@@ -90,6 +90,7 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+from jax.extend.core import concrete_or_error
 
 Ref = Any
 
@@ -97,7 +98,7 @@ Ref = Any
 def _infer_axis_size(axis_name: str) -> int | None:
     """Infer collective axis size from the active mapped context when available."""
     try:
-        return jax.core.concrete_or_error(
+        return concrete_or_error(
             int,
             lax.psum(jnp.array(1, dtype=jnp.int32), axis_name=axis_name),
             f"collective axis '{axis_name}' size must be static.",
@@ -407,52 +408,52 @@ def _kernel(
         """Barrier with both neighbors using double-barrier pattern."""
         barrier_sem = pltpu.get_barrier_semaphore()
 
-        pltpu.semaphore_signal(
+        pl.semaphore_signal(
             barrier_sem,
             inc=1,
             device_id=(left_neighbor,),
-            device_id_type=pltpu.DeviceIdType.MESH,
+            device_id_type=pl.DeviceIdType.MESH,
         )
-        pltpu.semaphore_signal(
+        pl.semaphore_signal(
             barrier_sem,
             inc=1,
             device_id=(right_neighbor,),
-            device_id_type=pltpu.DeviceIdType.MESH,
+            device_id_type=pl.DeviceIdType.MESH,
         )
-        pltpu.semaphore_wait(barrier_sem, 2)
+        pl.semaphore_wait(barrier_sem, 2)
 
         @functools.partial(pl.run_scoped, second_barrier=pltpu.SemaphoreType.REGULAR)
         def _(second_barrier):
-            pltpu.semaphore_signal(
+            pl.semaphore_signal(
                 second_barrier,
                 inc=1,
                 device_id=(left_neighbor,),
-                device_id_type=pltpu.DeviceIdType.MESH,
+                device_id_type=pl.DeviceIdType.MESH,
             )
-            pltpu.semaphore_signal(
+            pl.semaphore_signal(
                 second_barrier,
                 inc=1,
                 device_id=(right_neighbor,),
-                device_id_type=pltpu.DeviceIdType.MESH,
+                device_id_type=pl.DeviceIdType.MESH,
             )
-            pltpu.semaphore_wait(second_barrier, 2)
+            pl.semaphore_wait(second_barrier, 2)
 
     def signal_left_neighbor():
         """Signal left neighbor that we are ready to receive from them."""
-        pltpu.semaphore_signal(
+        pl.semaphore_signal(
             left_capacity_sem,
             inc=1,
             device_id=(left_neighbor,),
-            device_id_type=pltpu.DeviceIdType.MESH,
+            device_id_type=pl.DeviceIdType.MESH,
         )
 
     def signal_right_neighbor():
         """Signal right neighbor that we are ready to receive from them."""
-        pltpu.semaphore_signal(
+        pl.semaphore_signal(
             right_capacity_sem,
             inc=1,
             device_id=(right_neighbor,),
-            device_id_type=pltpu.DeviceIdType.MESH,
+            device_id_type=pl.DeviceIdType.MESH,
         )
 
     left_target_block = get_left_target_block(ring_step)
@@ -473,8 +474,8 @@ def _kernel(
         signal_left_neighbor()
         signal_right_neighbor()
 
-        pltpu.semaphore_wait(left_capacity_sem, 1)
-        pltpu.semaphore_wait(right_capacity_sem, 1)
+        pl.semaphore_wait(left_capacity_sem, 1)
+        pl.semaphore_wait(right_capacity_sem, 1)
 
         remote_copy_to_left = pltpu.make_async_remote_copy(
             src_ref=scratch_ref.at[left_receiving_slot],
@@ -482,7 +483,7 @@ def _kernel(
             send_sem=send_left_sem,
             recv_sem=recv_left_sem,
             device_id=(left_neighbor,),
-            device_id_type=pltpu.DeviceIdType.MESH,
+            device_id_type=pl.DeviceIdType.MESH,
         )
         remote_copy_to_left.start()
 
@@ -492,7 +493,7 @@ def _kernel(
             send_sem=send_right_sem,
             recv_sem=recv_right_sem,
             device_id=(right_neighbor,),
-            device_id_type=pltpu.DeviceIdType.MESH,
+            device_id_type=pl.DeviceIdType.MESH,
         )
         remote_copy_to_right.start()
 

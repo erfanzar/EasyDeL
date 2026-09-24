@@ -57,12 +57,13 @@ from jax import lax
 from jax._src import dtypes
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+from jax.extend.core import concrete_or_error
 
 
 def _infer_axis_size(axis_name: str) -> int | None:
     """Infer collective axis size from the active mapped context when available."""
     try:
-        return jax.core.concrete_or_error(
+        return concrete_or_error(
             int,
             lax.psum(jnp.array(1, dtype=jnp.int32), axis_name=axis_name),
             f"collective axis '{axis_name}' size must be static.",
@@ -83,25 +84,25 @@ def _local_barrier(left_neighbor, right_neighbor, double_barrier: bool = True):
     """Barrier with neighbors using TPU semaphores."""
     barrier_sem = pltpu.get_barrier_semaphore()
     for neighbor in (left_neighbor, right_neighbor):
-        pltpu.semaphore_signal(
+        pl.semaphore_signal(
             barrier_sem,
             inc=1,
             device_id=(neighbor,),
-            device_id_type=pltpu.DeviceIdType.MESH,
+            device_id_type=pl.DeviceIdType.MESH,
         )
-    pltpu.semaphore_wait(barrier_sem, 2)
+    pl.semaphore_wait(barrier_sem, 2)
     if double_barrier:
 
         @functools.partial(pl.run_scoped, second_barrier=pltpu.SemaphoreType.REGULAR)
         def _(second_barrier):
             for neighbor in (left_neighbor, right_neighbor):
-                pltpu.semaphore_signal(
+                pl.semaphore_signal(
                     second_barrier,
                     inc=1,
                     device_id=(neighbor,),
-                    device_id_type=pltpu.DeviceIdType.MESH,
+                    device_id_type=pl.DeviceIdType.MESH,
                 )
-            pltpu.semaphore_wait(second_barrier, 2)
+            pl.semaphore_wait(second_barrier, 2)
 
 
 def _all_gather_kernel(
@@ -228,7 +229,7 @@ def _all_gather_kernel(
             send_sem=send_sems.at[0, outer_step],
             recv_sem=recv_sems.at[0, outer_step],
             device_id=(left_neighbor,),
-            device_id_type=pltpu.DeviceIdType.MESH,
+            device_id_type=pl.DeviceIdType.MESH,
         )
         _start_or_wait_copy(left_remote_copy_op, wait)
 
@@ -239,7 +240,7 @@ def _all_gather_kernel(
             send_sem=send_sems.at[1, outer_step],
             recv_sem=recv_sems.at[1, outer_step],
             device_id=(right_neighbor,),
-            device_id_type=pltpu.DeviceIdType.MESH,
+            device_id_type=pl.DeviceIdType.MESH,
         )
         _start_or_wait_copy(right_remote_copy_op, wait)
 
@@ -250,7 +251,7 @@ def _all_gather_kernel(
             send_sem=send_sems.at[0, outer_step],
             recv_sem=recv_sems.at[0, outer_step],
             device_id=(left_neighbor,),
-            device_id_type=pltpu.DeviceIdType.MESH,
+            device_id_type=pl.DeviceIdType.MESH,
         )
         _start_or_wait_copy(left_remote_copy_op, wait)
 
@@ -261,7 +262,7 @@ def _all_gather_kernel(
             send_sem=send_sems.at[1, outer_step],
             recv_sem=recv_sems.at[1, outer_step],
             device_id=(right_neighbor,),
-            device_id_type=pltpu.DeviceIdType.MESH,
+            device_id_type=pl.DeviceIdType.MESH,
         )
         _start_or_wait_copy(right_remote_copy_op, wait)
 

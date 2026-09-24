@@ -328,7 +328,9 @@ def chunked_prefill_attention_kernel(
         def body():
             buffer_index = buffer_index_ref[0]
 
-            @pl.when((i == 0) & (h == 0))
+            # Each head owns its DMA pipeline; no prefetch crosses the head grid.
+            # Start in the carried slot, which may be 0 or 1 after the previous head.
+            @pl.when(i == 0)
             def prefetch_first_kv():
                 async_copy_k, async_copy_v = create_kv_async_copy_descriptors(0, buffer_index)
                 async_copy_k.start()

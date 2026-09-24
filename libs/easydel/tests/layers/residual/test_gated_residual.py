@@ -27,6 +27,7 @@ to match it, for both the combining (sub-layer) form and the ``use_combine``
 ``False`` (model-entry/exit mixer) form.
 """
 
+import jax
 import numpy as np
 import pytest
 import spectrax as spx
@@ -83,6 +84,8 @@ def _make_module(use_combine, seed=0):
         use_combine=use_combine,
         dtype=jnp.float32,
         param_dtype=jnp.float32,
+        # Match the NumPy reference's fp32 multiplies on TPU as well as CPU.
+        precision=jax.lax.Precision.HIGHEST,
         rngs=spx.Rngs(seed),
     )
     w_norm = rng.standard_normal(HC * HIDDEN).astype(np.float32) * 0.02

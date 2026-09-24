@@ -26,9 +26,10 @@ scales cannot broadcast, because which scale a row needs depends on which
 expert that row was routed to. The fix is a row-to-expert gather, derived
 from ``group_sizes`` once and reused by the forward and both gradients.
 
-Rows past ``sum(group_sizes)`` belong to no expert. ``ragged_dot`` writes
-zeros there, and zero times any scale is still zero, so the gather is
-clamped into range rather than masked.
+Rows past ``sum(group_sizes)`` belong to no expert. Native ``ragged_dot``
+backends need not initialize those rows, so the quantized path explicitly
+zeros them after rescaling (and in the activation gradient). The scale
+gather is clamped into range, but is not itself a padding mask.
 """
 
 from __future__ import annotations
@@ -82,6 +83,36 @@ def _gather_group_scale(scale: Array, row_groups: Array) -> Array:
         The scale aligned with the output rows, shape ``[M, N]``.
     """
     return jnp.take(jnp.squeeze(scale, axis=1), row_groups, axis=0)
+
+
+def _zero_padding_rows(array: Array, group_sizes: Array) -> Array:
+    """Zero rows not assigned to an expert, without reading their values.
+
+    Args:
+        array: Row-major output or cotangent, shape ``[M, D]``.
+        group_sizes: Rows per expert, shape ``[G]``.
+
+    Returns:
+        The array with rows past ``sum(group_sizes)`` set to zero. A select
+        is required: multiplying uninitialized values (possibly NaNs) by
+        zero does not reliably produce zero.
+    """
+    valid = jnp.arange(array.shape[0], dtype=group_sizes.dtype) < jnp.sum(group_sizes)
+    return jnp.where(valid[:, None], array, jnp.zeros((), array.dtype))
+
+
+def _ragged_compute_value(array: Array) -> Array:
+    """Losslessly widen signed four-bit storage for the ragged kernel.
+
+    Args:
+        array: A raw contraction operand, not a code-book index array.
+
+    Returns:
+        Signed int4 values represented as int8, or the unchanged operand.
+        TPU ragged kernels do not support S4; this preserves the quantized
+        grid and int32 accumulation without changing stored QArrays.
+    """
+    return array.astype(jnp.int8) if array.dtype == jnp.dtype(jnp.int4) else array
 
 
 def _how_to_quantize_lhs(qtype: numerics.QType, rule: QuantRule) -> HowToQuantize:
@@ -161,7 +192,8 @@ def _ragged_dot_maybe_quantized(
         lhs: Token rows ``[M, K]``, quantized or plain.
         rhs: Stacked expert weights ``[G, K, N]``, quantized or plain.
         group_sizes: Rows per expert, shape ``[G]``.
-        precision: Forwarded to :func:`jax.lax.ragged_dot`.
+        precision: Floating-point contraction precision. Quantized integer
+            products use DEFAULT precision with int32 accumulation.
         preferred_element_type: Requested output dtype.
         group_offset: Forwarded to :func:`jax.lax.ragged_dot`.
 
@@ -171,30 +203,36 @@ def _ragged_dot_maybe_quantized(
     if not (_is_output_dequantizable(lhs) and _is_output_dequantizable(rhs)):
         lhs_float = dequantize(lhs) if isinstance(lhs, QArray) else lhs
         rhs_float = dequantize(rhs) if isinstance(rhs, QArray) else rhs
-        return jax.lax.ragged_dot(
-            lhs_float,
-            rhs_float,
+        out = jax.lax.ragged_dot(
+            _ragged_compute_value(lhs_float),
+            _ragged_compute_value(rhs_float),
             group_sizes,
             precision=precision,
             preferred_element_type=preferred_element_type,
             group_offset=group_offset,
         )
+        return _zero_padding_rows(out, group_sizes)
 
-    lhs_value = lhs.qvalue if isinstance(lhs, QArray) else lhs
-    rhs_value = rhs.qvalue if isinstance(rhs, QArray) else rhs
+    lhs_value = _ragged_compute_value(lhs.qvalue if isinstance(lhs, QArray) else lhs)
+    rhs_value = _ragged_compute_value(rhs.qvalue if isinstance(rhs, QArray) else rhs)
     result_type = preferred_element_type
     if result_type is None:
         result_type = jnp.bfloat16
         for operand in (lhs, rhs):
             if isinstance(operand, QArray):
                 result_type = jnp.result_type(result_type, operand.scale.dtype)
-    accumulator = jnp.int32 if all("int" in jnp.dtype(v.dtype).name for v in (lhs_value, rhs_value)) else result_type
+    integer_contraction = all(jnp.issubdtype(v.dtype, jnp.integer) for v in (lhs_value, rhs_value))
+    accumulator = jnp.int32 if integer_contraction else result_type
+    # Integer products accumulate exactly in int32. A floating-point precision
+    # hint (including an ambient HIGHEST) selects an invalid TPU GMM lowering
+    # for int8 operands; retain the caller's hint only for floating products.
+    contraction_precision = jax.lax.Precision.DEFAULT if integer_contraction else precision
 
     out = jax.lax.ragged_dot(
         lhs_value,
         rhs_value,
         group_sizes,
-        precision=precision,
+        precision=contraction_precision,
         preferred_element_type=accumulator,
         group_offset=group_offset,
     ).astype(result_type)
@@ -204,7 +242,7 @@ def _ragged_dot_maybe_quantized(
     if isinstance(rhs, QArray):
         row_groups = _row_group_ids(group_sizes, lhs_value.shape[0])
         out = out * _gather_group_scale(rhs.scale, row_groups).astype(result_type)
-    return out
+    return _zero_padding_rows(out, group_sizes)
 
 
 def _quantize_across_axis(array: Array, how: HowToQuantize, axis_name: str | None) -> QArray:
@@ -251,7 +289,8 @@ def _ragged_dot_qt_fwd(
         rhs: Stacked expert weights ``[G, K, N]``.
         group_sizes: Rows per expert.
         rule: The governing rule.
-        precision: Forwarded to :func:`jax.lax.ragged_dot`.
+        precision: Floating-point contraction precision. Quantized integer
+            products use DEFAULT precision with int32 accumulation.
         preferred_element_type: Requested output dtype.
         group_offset: Forwarded to :func:`jax.lax.ragged_dot`.
         calibration_axis_name: Mesh axis the contracted dimension is
@@ -310,6 +349,8 @@ def _ragged_dot_qt_bwd(
     """
     lhs, rhs, group_sizes = residuals
     num_rows = lhs.shape[0]
+    # Padding has no derivative and must not affect backward calibration.
+    cotangent = _zero_padding_rows(cotangent, group_sizes)
 
     # --- gradient of the token rows: dlhs[m, k] = sum_n g[m, n] * rhs[e(m), k, n]
     lhs_cotangent = cotangent
@@ -399,7 +440,8 @@ def _ragged_dot_qt(
         rhs: Stacked expert weights ``[G, K, N]``.
         group_sizes: Rows per expert.
         rule: The governing rule.
-        precision: Forwarded to :func:`jax.lax.ragged_dot`.
+        precision: Floating-point contraction precision. Quantized integer
+            products use DEFAULT precision with int32 accumulation.
         preferred_element_type: Requested output dtype.
         group_offset: Forwarded to :func:`jax.lax.ragged_dot`.
         calibration_axis_name: Mesh axis the contracted dimension is
@@ -444,7 +486,8 @@ def qragged_dot(
         rhs: Stacked expert weights ``[G, K, N]``.
         group_sizes: Rows per expert, shape ``[G]``.
         rule: The governing rule, or ``None`` for full precision.
-        precision: Forwarded to :func:`jax.lax.ragged_dot`.
+        precision: Floating-point contraction precision. Quantized integer
+            products use DEFAULT precision with int32 accumulation.
         preferred_element_type: Requested output dtype.
         group_offset: Forwarded to :func:`jax.lax.ragged_dot`.
         calibration_axis_name: Mesh axis the contracted dimension is sharded
@@ -454,7 +497,9 @@ def qragged_dot(
             callable so it stays hashable and does not defeat the jit cache.
 
     Returns:
-        The contraction result ``[M, N]``.
+        The contraction result ``[M, N]``. The quantized path explicitly
+        zeros rows past ``sum(group_sizes)``; the unquantized fall-through
+        retains the native backend's padding semantics.
 
     Raises:
         ValueError: If the operands do not have the ragged-dot ranks.

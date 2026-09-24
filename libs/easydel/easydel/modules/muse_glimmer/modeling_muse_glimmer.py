@@ -762,6 +762,7 @@ class MuseGlimmerTextAttention(UnifiedAttention):
             causal=causal_for_kernel,
             sliding_window=sliding_window_for_kernel,
             output_attentions=output_attentions,
+            precision=self.precision,
         )
 
         if attentions.cache_view is not None:
@@ -1459,6 +1460,7 @@ class MuseGlimmerVisionAttention(UnifiedAttention):
             bias=attention_bias,
             causal=False,
             mode=common_types.MODE_TRAIN,
+            precision=self.precision,
         ).attention_outputs
 
         attn_output = attn_output.reshape(seq_length, -1)

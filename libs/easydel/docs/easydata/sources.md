@@ -192,9 +192,20 @@ source = HuggingFaceShardedSource(
 )
 ```
 
+When EasyData loads a **streaming Parquet** dataset through this source or the legacy
+`DatasetMixture` loader, it reads synchronous `ParquetFile` batches instead of using an Arrow
+dataset scanner. This avoids scanner-owned background reads of Python-backed remote files that
+can survive early-stopped iteration and block interpreter shutdown. Disabling pre-buffering alone
+was insufficient in the tested HF/Arrow stack. HF still owns file discovery, dataset transforms,
+sharding and resume; selected row groups, filters, projection and feature casting are preserved.
+Other formats, non-streaming loads, and specialized high-level encrypted Parquet scans retain
+normal HF behavior. This trades Arrow-level read-ahead for predictable shutdown; it does not
+disable EasyData/trainer prefetching or change row limits.
+
 ## HFDatasetShardedSource
 
-Wraps an existing HuggingFace Dataset as ShardedDataSource.
+Wraps an existing HuggingFace Dataset as ShardedDataSource. Its reader configuration remains
+that of the dataset supplied by the caller; the wrapper does not retrofit the loading policy above.
 
 ```python
 from datasets import load_dataset

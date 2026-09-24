@@ -22,6 +22,7 @@ Mistral-Nemo. QK normalization and post-norm residual layout are inherited
 from OLMo-2.
 """
 
+import copy
 import typing
 
 from easydel.infra.base_module import EasyDeLBaseConfig
@@ -141,6 +142,8 @@ class Olmo3Config(EasyDeLBaseConfig):
         use_scan_mlp: bool = False,
         scan_mlp_chunk_size: int = 1024,
         bits: int | None = None,
+        rope_parameters: dict | None = None,
+        rope_theta_is_shared: bool | None = None,
         **kwargs,
     ):
         """Initializes an Olmo3Config object.
@@ -173,6 +176,12 @@ class Olmo3Config(EasyDeLBaseConfig):
                 use_scan_mlp (bool, optional): Whether to use scan for MLP layers. Defaults to False.
                 scan_mlp_chunk_size (int, optional): Chunk size for scan MLP. Defaults to 1024.
                 bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
+                rope_parameters (dict, optional): Canonical RoPE settings keyed by attention type.
+                        Explicit per-type settings take precedence over legacy shared rope fields.
+                        A flat mapping retains the legacy shared local/global RoPE behavior.
+                rope_theta_is_shared (bool, optional): Persisted provenance for legacy shared theta.
+                        Inferred from the input format when omitted: legacy/flat settings follow late
+                        rope_theta overrides, while explicit per-type mappings retain their own theta.
                 **kwargs: Additional keyword arguments.
         """
         self.gradient_checkpointing = gradient_checkpointing
@@ -202,8 +211,9 @@ class Olmo3Config(EasyDeLBaseConfig):
         self.initializer_range = initializer_range
         self.use_cache = use_cache
         self.rope_theta = rope_theta
-        self.rope_scaling = rope_scaling
-        self._rope_scaling_validation()
+        # HF 5.13 aliases rope_scaling to rope_parameters. Validate the raw
+        # legacy input before any assignment can expand it into a nested map.
+        rope_scaling = self._rope_scaling_validation(rope_scaling)
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
         self.rms_norm_eps = rms_norm_eps
@@ -219,34 +229,139 @@ class Olmo3Config(EasyDeLBaseConfig):
             self.layer_types = layer_types
         self._validate_layer_types()
 
-    def _rope_scaling_validation(self):
-        """
-        Validates the `rope_scaling` configuration dictionary to ensure it meets the expected format and values.
-        Raises:
-                ValueError: If `rope_scaling` is not a dictionary with the correct fields (`type`, `factor`)
-                        or if the values are invalid (type not 'linear' or 'dynamic', factor not a float > 1.0).
-        """
-        if self.rope_scaling is None:
-            return
+        # HF OLMo3 reads RoPE by attention type, even when both types share
+        # the same parameters. Keep old EasyDeL checkpoints' shared math and
+        # theta (10000 by default), rather than substituting HF's newer default.
+        shared_rope = rope_scaling or {"rope_type": "default", "rope_theta": rope_theta}
+        if rope_parameters is not None and not any(
+            key in rope_parameters for key in ("sliding_attention", "full_attention")
+        ):
+            # Older saved configs could carry a stale flat default payload
+            # alongside the actual scaling used by EasyDeL's rotary builders.
+            # Only an explicitly supplied legacy argument can override it;
+            # self.rope_scaling is the canonical alias, not that argument.
+            if rope_scaling is not None:
+                rope_parameters = shared_rope
+        self.rope_parameters = shared_rope if rope_parameters is None else rope_parameters
+        # Do not infer provenance from numerical equality: an explicit nested
+        # map can deliberately use the same theta for both attention types.
+        self.rope_theta_is_shared = (
+            rope_parameters is None or not any(key in rope_parameters for key in ("sliding_attention", "full_attention"))
+            if rope_theta_is_shared is None
+            else rope_theta_is_shared
+        )
 
-        if not isinstance(self.rope_scaling, dict):
-            raise ValueError(
-                f"`rope_scaling` must be a dictionary with two fields, `type` and `factor`, got {self.rope_scaling}"
+    def __setattr__(self, key, value):
+        """Propagate late legacy theta overrides without overwriting explicit maps."""
+        if key == "rope_parameters" and hasattr(self, "rope_theta_is_shared"):
+            # Replacing the canonical map explicitly establishes new provenance.
+            # Internal normalization/backfill bypasses this assignment hook.
+            self.rope_theta_is_shared = isinstance(value, dict) and not any(
+                layer_type in value for layer_type in ("sliding_attention", "full_attention")
+            )
+        super().__setattr__(key, value)
+        if key == "rope_theta" and getattr(self, "rope_theta_is_shared", False):
+            parameters = getattr(self, "rope_parameters", None)
+            if isinstance(parameters, dict):
+                # Use the base setter: this is synchronization of a legacy map,
+                # not a new explicit per-type assignment.
+                super().__setattr__(
+                    "rope_parameters",
+                    {
+                        layer_type: {**layer_parameters, "rope_theta": value}
+                        for layer_type, layer_parameters in parameters.items()
+                    },
+                )
+
+    def to_diff_dict(self) -> dict:
+        """Persist shared-theta provenance even when it equals the class default."""
+        result = super().to_diff_dict()
+        result["rope_theta_is_shared"] = self.rope_theta_is_shared
+        return result
+
+    def _normalize_rope_assignment(self, rope_parameters: dict) -> dict:
+        """Normalize per-type mappings independently of the active layer schedule.
+
+        Both entries must survive serialization even for an all-local or
+        all-global reduced model. Legacy flat mappings remain flat here because
+        ``rope_scaling`` is also normalized through this hook.
+        """
+        layer_types = {"sliding_attention", "full_attention"}
+        if rope_parameters and set(rope_parameters).issubset(layer_types):
+            return {
+                layer_type: self._normalize_rope_parameters_dict(
+                    rope_parameters.get(layer_type) or {},
+                    rope_theta=getattr(self, "rope_theta", 10000.0),
+                )
+                for layer_type in ("sliding_attention", "full_attention")
+            }
+        return super()._normalize_rope_assignment(rope_parameters)
+
+    def _backfill_rope_parameters(self) -> None:
+        """Keep the canonical HF mapping nested after construction and mutation."""
+        super()._backfill_rope_parameters()
+        parameters = getattr(self, "rope_parameters", None)
+        if isinstance(parameters, dict) and "rope_type" in parameters:
+            # Bypass our assignment hook to avoid recursively backfilling.
+            object.__setattr__(
+                self,
+                "rope_parameters",
+                {layer_type: dict(parameters) for layer_type in ("sliding_attention", "full_attention")},
             )
 
-        rope_scaling_type = self.rope_scaling.get("type", self.rope_scaling.get("rope_type"))
+    def get_layer_rope_config(self, layer_type: str) -> "Olmo3Config":
+        """Return a shallow config view for the existing flat RoPE builders.
+
+        The original config and its persisted per-type parameters are untouched.
+        """
+        config = copy.copy(self)
+        parameters = self.rope_parameters[layer_type]
+        # This detached builder view must stay flat. Attribute assignment would
+        # run OLMo3's canonical backfill, including through HF's rope_scaling
+        # property setter. Populate both spellings directly so old independent
+        # fields and the new HF alias expose the same selected-layer settings.
+        config.__dict__.update(
+            rope_theta=parameters["rope_theta"],
+            rope_parameters=dict(parameters),
+            rope_scaling=dict(parameters),
+        )
+        return config
+
+    @staticmethod
+    def _rope_scaling_validation(rope_scaling: dict | None) -> dict | None:
+        """Validate and copy the raw legacy shared RoPE scaling argument.
+
+        Args:
+            rope_scaling: Legacy constructor input, not the HF property alias.
+
+        Returns:
+            A copied scaling dictionary, or None for default/unscaled RoPE.
+
+        Raises:
+            ValueError: If the input is not a dictionary or its scaling type
+                or factor is invalid.
+        """
+        if rope_scaling is None:
+            return None
+
+        if not isinstance(rope_scaling, dict):
+            raise ValueError(
+                f"`rope_scaling` must be a dictionary with two fields, `type` and `factor`, got {rope_scaling}"
+            )
+
+        rope_scaling_type = rope_scaling.get("type", rope_scaling.get("rope_type"))
         # Base config compatibility can inject a default rope payload; treat it as no scaling.
         if rope_scaling_type in (None, "default"):
-            self.rope_scaling = None
-            return
+            return None
 
-        rope_scaling_factor = self.rope_scaling.get("factor", None)
+        rope_scaling_factor = rope_scaling.get("factor", None)
         if rope_scaling_type is None or rope_scaling_type not in ["linear", "dynamic"]:
             raise ValueError(
                 f"`rope_scaling`'s type field must be one of ['linear', 'dynamic'], got {rope_scaling_type}"
             )
         if rope_scaling_factor is None or not isinstance(rope_scaling_factor, float) or rope_scaling_factor <= 1.0:
             raise ValueError(f"`rope_scaling`'s factor field must be a float > 1, got {rope_scaling_factor}")
+        return dict(rope_scaling)
 
     def _validate_layer_types(self):
         """

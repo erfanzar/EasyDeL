@@ -1,7 +1,7 @@
-easydel.caching.lightning.cache
+easydel.layers.indexer._indexer
 ===============================
 
-.. automodule:: easydel.caching.lightning.cache
+.. automodule:: easydel.layers.indexer._indexer
    :members:
    :undoc-members:
    :show-inheritance:

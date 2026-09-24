@@ -20,6 +20,7 @@ from typing import ClassVar, TypeVar, cast, overload
 
 import jax
 import jax.numpy as jnp
+from jax._src.core import is_concrete
 
 from ..sharding.mesh import current_mesh
 from .graph import GraphDef, ModuleNode, VarNode, iter_variables, strip_pipeline_stage_metadata
@@ -1250,7 +1251,7 @@ class ModuleList(_ListContainer):
         """
         if isinstance(idx, slice):
             return type(self)(self._spx_items[idx])
-        if not jax.core.is_concrete(idx):
+        if not is_concrete(idx):
             return self._get_traced(idx)
         return self._spx_items[idx]
 
@@ -1650,7 +1651,7 @@ class StackedModuleList(Module):
         graph_defs = getattr(self, "_spx_item_gdefs", ())
         if not graph_defs:
             raise IndexError("Cannot index an empty StackedModuleList")
-        if jax.core.is_concrete(idx):
+        if is_concrete(idx):
             gdef = graph_defs[int(idx)]
         elif self._spx_item_gdef is not None:
             gdef = self._spx_item_gdef

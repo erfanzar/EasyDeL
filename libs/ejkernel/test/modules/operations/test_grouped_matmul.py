@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+import pytest
 from ejkernel.modules.operations import grouped_matmul
+from ejkernel.modules.operations.configs import GroupedMatmulConfig
 
 from ._utils import assert_allclose
 
@@ -163,3 +166,173 @@ def test_grouped_matmul_rejects_rhs_scale_without_v3():
         assert "grouped_matmulv3" in str(exc)
     else:
         raise AssertionError("Expected ValueError when rhs_scale is used without grouped_matmulv3.")
+
+
+@pytest.mark.parametrize("use_v2", [False, True])
+@pytest.mark.parametrize("transpose_rhs", [False, True])
+def test_grouped_matmul_xla_bypass_preserves_ragged_rows(use_v2, transpose_rhs):
+    """The public bypass path still gets backend safety padding, not tile hints."""
+    m, k, n = 24, 8, 4
+    lhs = ((jnp.arange(m * k).reshape(m, k) % 5) - 2).astype(jnp.float32) / 8
+    rhs = ((jnp.arange(4 * k * n).reshape(4, k, n) % 7) - 3).astype(jnp.float32) / 8
+    if transpose_rhs:
+        rhs = rhs.swapaxes(1, 2)
+    existing = ((jnp.arange(m * n).reshape(m, n) % 3) - 1).astype(jnp.float32) / 16
+    cfg = GroupedMatmulConfig(bypass_xla_tiling=True)
+
+    @jax.jit
+    def run(lhs, rhs, sizes, existing):
+        return grouped_matmul(
+            lhs,
+            rhs,
+            sizes,
+            None,
+            existing,
+            preferred_element_type=jnp.bfloat16,
+            precision=jax.lax.Precision.DEFAULT,
+            transpose_rhs=transpose_rhs,
+            platform="xla",
+            cfg=cfg,
+            use_v2=use_v2,
+        )
+
+    for sizes in ((3, 0, 21, 0), (0, 19, 0, 5)):
+        out = run(lhs, rhs, jnp.asarray(sizes, dtype=jnp.int32), existing)
+        start = 0
+        chunks = []
+        for expert, rows in enumerate(sizes):
+            if rows:
+                weight = rhs[expert].T if transpose_rhs else rhs[expert]
+                chunks.append(
+                    jnp.matmul(
+                        lhs[start : start + rows],
+                        weight,
+                        precision=jax.lax.Precision.DEFAULT,
+                        preferred_element_type=jnp.bfloat16,
+                    )
+                )
+            start += rows
+        expected = jnp.concatenate(chunks, axis=0) + existing.astype(jnp.bfloat16)
+        assert out.shape == (m, n)
+        assert out.dtype == jnp.bfloat16
+        assert np.isfinite(np.asarray(out, dtype=np.float32)).all()
+        np.testing.assert_array_equal(np.asarray(out), np.asarray(expected))
+
+
+def test_grouped_matmul_xla_bypass_tp4_global_rows_match_numpy():
+    """Global-jit TP4 gate-up preserves all 120 rows and output-column placement.
+
+    Keep the global RHS width at 1024: slicing it to 256 before the call would
+    only test an unsharded local-shaped operation, not SPMD partitioning. This
+    exercises the public untiled XLA path with float32 operands and bf16 output.
+    """
+    devices = jax.local_devices()
+    if len(devices) < 4:
+        pytest.skip("requires at least four local devices for TP4 grouped matmul")
+
+    mesh = jax.sharding.Mesh(
+        np.asarray(devices[:4]).reshape(1, 1, 1, 1, 4, 1),
+        ("pp", "dp", "fsdp", "ep", "tp", "sp"),
+        axis_types=(jax.sharding.AxisType.Auto,) * 6,
+    )
+    replicated = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    rhs_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(None, None, "tp"))
+    out_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(None, "tp"))
+
+    m, k, n, groups = 120, 64, 1024, 512
+    rng = np.random.default_rng(79)
+    # Products sum to integer multiples of 1/64 in [-1, 1], exactly representable
+    # in bf16. This isolates row/group placement from DEFAULT-precision drift.
+    lhs_host = rng.integers(-1, 2, (m, k), dtype=np.int8).astype(np.float32) / np.float32(8)
+    rhs_host = rng.integers(-1, 2, (groups, k, n), dtype=np.int8).astype(np.float32) / np.float32(8)
+    sizes_host = np.zeros(groups, dtype=np.int32)
+    sizes_host[np.arange(0, 100, 10)] = 12
+
+    expected = np.zeros((m, n), dtype=np.float32)
+    start = 0
+    for expert, size in enumerate(sizes_host):
+        end = start + int(size)
+        if size:
+            expected[start:end] = lhs_host[start:end] @ rhs_host[expert]
+        start = end
+    assert start == m
+
+    cfg = GroupedMatmulConfig(bypass_xla_tiling=True)
+
+    def run(lhs, rhs, sizes):
+        return grouped_matmul(
+            lhs,
+            rhs,
+            sizes,
+            preferred_element_type=jnp.bfloat16,
+            precision=jax.lax.Precision.DEFAULT,
+            platform="xla",
+            cfg=cfg,
+        )
+
+    compiled = jax.jit(
+        run,
+        in_shardings=(replicated, rhs_sharding, replicated),
+        out_shardings=out_sharding,
+    )
+    with mesh:
+        out = compiled(
+            jax.device_put(lhs_host, replicated),
+            jax.device_put(rhs_host, rhs_sharding),
+            jax.device_put(sizes_host, replicated),
+        )
+        out.block_until_ready()
+
+    assert out.shape == (m, n)
+    assert out.dtype == jnp.bfloat16
+    assert out.sharding.is_equivalent_to(out_sharding, ndim=2)
+    assert len(out.addressable_shards) == 4
+    assert all(shard.data.shape == (m, n // 4) for shard in out.addressable_shards)
+    actual = np.asarray(out, dtype=np.float32)
+    assert np.isfinite(actual).all()
+    np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("sizes", [(4, 8), (4, 6, 10, 4)])
+@pytest.mark.parametrize("output_dtype", [jnp.bfloat16, jnp.float32])
+def test_grouped_matmul_eager_tp4_narrow_columns_match_numpy(sizes, output_dtype):
+    """Eager global-array dispatch must populate every narrow TP output shard.
+
+    An enclosing test jit hides a native TPU eager pad/dot/slice failure on
+    JAX 0.11.2: finite operands yield corrupt output values. Keep this
+    call eager, including the partial 32-row tile and 32-column local output.
+    Dyadic operands make the independent reference exact at DEFAULT precision.
+    """
+    devices = jax.devices()
+    if len(devices) < 4:
+        pytest.skip("requires four devices for narrow TP4 output shards")
+    mesh = jax.sharding.Mesh(
+        np.asarray(devices[:4]).reshape(1, 1, 1, 1, 4, 1),
+        ("pp", "dp", "fsdp", "ep", "tp", "sp"),
+        axis_types=(jax.sharding.AxisType.Auto,) * 6,
+    )
+    lhs_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(None, "tp"))
+    rhs_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("ep", None, "tp"))
+    replicated = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    output_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(None, "tp"))
+    rng = np.random.default_rng(132)
+    lhs = rng.integers(-1, 2, size=(sum(sizes), 64)).astype(np.float32) / 8
+    rhs = rng.integers(-1, 2, size=(len(sizes), 64, 128)).astype(np.float32) / 8
+    expected = np.concatenate([lhs[sum(sizes[:i]) : sum(sizes[: i + 1])] @ rhs[i] for i in range(len(sizes))], axis=0)
+    with mesh:
+        out = grouped_matmul(
+            jax.device_put(lhs, lhs_sharding),
+            jax.device_put(rhs, rhs_sharding),
+            jax.device_put(np.asarray(sizes, dtype=np.int32), replicated),
+            preferred_element_type=output_dtype,
+            precision=jax.lax.Precision.DEFAULT,
+            platform="xla",
+            cfg=GroupedMatmulConfig(bypass_xla_tiling=True),
+        )
+        actual = np.asarray(out, dtype=np.float32)
+    assert out.shape == expected.shape
+    assert out.dtype == output_dtype
+    assert out.sharding.is_equivalent_to(output_sharding, ndim=2)
+    assert all(shard.data.shape == (sum(sizes), 32) for shard in out.addressable_shards)
+    assert np.isfinite(actual).all()
+    np.testing.assert_array_equal(actual, expected)

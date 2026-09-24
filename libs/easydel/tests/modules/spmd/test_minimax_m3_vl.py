@@ -69,6 +69,10 @@ class TestMiniMaxM3VL:
         local_cfg = dict(small_model_config)
         dims = local_cfg["sharding_axis_dims"]
         local_cfg["sharding_axis_dims"] = (dims[0], dims[1], dims[3], 1, dims[4], dims[5])
+        # The fused MoE shards the training batch over (dp, fsdp) and rejects a
+        # batch that group cannot divide; the folded fsdp axis is 4 on the
+        # 8-fake-device CPU mesh, so the shared batch of 2 must grow to fit.
+        local_cfg["batch_size"] = max(local_cfg["batch_size"], 4)
         return local_cfg
 
     @pytest.fixture
@@ -169,9 +173,9 @@ class TestMiniMaxM3VL:
         )
 
     @pytest.fixture
-    def vlm_config(self, vlm_model_config, small_model_config):
+    def vlm_config(self, vlm_model_config, m3_small_config):
         """VLM tester inputs: flattened patches + per-image (t, h, w) grids."""
-        batch_size = small_model_config["batch_size"]
+        batch_size = m3_small_config["batch_size"]
         num_images_per_batch = 1
         grid_t, grid_h, grid_w = 1, 4, 4
         vision_cfg = vlm_model_config.vision_config

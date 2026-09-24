@@ -104,10 +104,11 @@ def test_xerxes2_generic_mla_cache_uses_kv_lora_dim_for_v2(monkeypatch: pytest.M
     assert mla_calls[0]["kv_lora_rank"] != config.qk_nope_head_dim
 
 
-def test_glm4_moe_lite_routes_v2_to_mla_cache(monkeypatch: pytest.MonkeyPatch):
-    mla_calls = _capture_create(monkeypatch, MLARaggedPagesCacheConfig)
-    standard_calls = _capture_create(monkeypatch, RaggedPagesCacheConfig)
-
+@pytest.mark.parametrize("version", ["v1", "v2"])
+@pytest.mark.parametrize("max_cache_tokens", [None, 512, 1024])
+def test_glm4_moe_lite_routes_v2_to_mla_cache(monkeypatch: pytest.MonkeyPatch, version, max_cache_tokens):
+    # Control the external memory budget, but build the real public cache config.
+    monkeypatch.setattr(MLARaggedPagesCacheConfig, "_compute_free_hbm", staticmethod(lambda **kwargs: 16 * 1024**2))
     config = ed.Glm4MoeLiteConfig(
         hidden_size=256,
         intermediate_size=512,
@@ -125,13 +126,23 @@ def test_glm4_moe_lite_routes_v2_to_mla_cache(monkeypatch: pytest.MonkeyPatch):
         n_routed_experts=4,
         num_experts_per_tok=2,
     )
-    config.attn_mechanism = "multi_latent_ragged_page_attention_v2"
+    config.attn_mechanism = f"multi_latent_ragged_page_attention_{version}"
 
     dummy = _make_dummy_module(ed.Glm4MoeLiteForCausalLM, config)
-    ed.Glm4MoeLiteForCausalLM.create_ragged_page_cache_config(dummy, max_length=128)
+    cache = ed.Glm4MoeLiteForCausalLM.create_ragged_page_cache_config(
+        dummy, max_length=128, dtype=jnp.float32, max_cache_tokens=max_cache_tokens
+    )
 
-    assert not standard_calls
-    assert mla_calls[0]["kv_lora_rank"] == config.kv_lora_rank
+    assert isinstance(cache, MLARaggedPagesCacheConfig)
+    assert cache.k_headdim == 96
+    assert cache.v_headdim == 32
+    assert cache.num_hidden_layers == 4
+    assert cache.max_model_length == 128
+    assert cache.kvdtype == jnp.float32
+    if max_cache_tokens is None:
+        assert cache.num_pages * cache.page_size > 1024
+    else:
+        assert cache.num_pages * cache.page_size == max_cache_tokens
 
 
 def test_deepseek_v2_routes_v2_to_mla_cache(monkeypatch: pytest.MonkeyPatch):

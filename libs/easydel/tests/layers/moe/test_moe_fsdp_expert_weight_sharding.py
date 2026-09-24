@@ -57,6 +57,14 @@ def _require_fake_mesh():
         pytest.skip("needs XLA_FLAGS=--xla_force_host_platform_device_count=8")
 
 
+def _ep1_mesh_dims():
+    """Keep FSDP and TP nontrivial on four devices; retain fsdp4/tp2 on eight."""
+    if jax.device_count() < 4:
+        pytest.skip("needs at least 4 devices for fsdp2 x tp2")
+    fsdp = 4 if jax.device_count() >= 8 else 2
+    return (1, 1, fsdp, 1, 2, 1)
+
+
 def _make_config(*, sharding_axis_dims, ring: bool, fsdp_shard: bool, num_experts: int = 8):
     """Build a GptOssConfig with the fused MoE + the flag under test."""
     from easydel.modules.gpt_oss.gpt_oss_configuration import GptOssConfig
@@ -120,10 +128,10 @@ def _dim0_axes(array) -> tuple[str, ...]:
 
 def test_rest_sharding_includes_fsdp_only_when_enabled():
     """Expert kernels/biases at rest: P(('ep','fsdp'),...) on, P('ep',...) off."""
-    _require_fake_mesh()
+    dims = _ep1_mesh_dims()
 
-    on = _build_gptoss_block(sharding_axis_dims=(1, 1, 4, 1, 2, 1), ring=False, fsdp_shard=True)
-    off = _build_gptoss_block(sharding_axis_dims=(1, 1, 4, 1, 2, 1), ring=False, fsdp_shard=False)
+    on = _build_gptoss_block(sharding_axis_dims=dims, ring=False, fsdp_shard=True)
+    off = _build_gptoss_block(sharding_axis_dims=dims, ring=False, fsdp_shard=False)
 
     for name in ("gate_proj", "up_proj", "down_proj"):
         w_on = getattr(on.experts, name).weight.value
@@ -142,7 +150,7 @@ def test_rest_sharding_includes_fsdp_only_when_enabled():
 @pytest.mark.parametrize(
     ("candidate_dims", "ring"),
     [
-        pytest.param((1, 1, 4, 1, 2, 1), False, id="noring-fsdp4-tp2-ep1"),
+        pytest.param(None, False, id="noring-fsdp-tp2-ep1"),
         pytest.param((1, 1, 2, 2, 2, 1), True, id="ring-fsdp2-ep2-tp2"),
     ],
 )
@@ -154,7 +162,10 @@ def test_gather_at_use_matches_replicated_weights(candidate_dims, ring):
     the all_gather transpose (psum_scatter over fsdp), which must reproduce
     the replicated-weight gradient values while landing them fsdp-sharded.
     """
-    _require_fake_mesh()
+    if ring:
+        _require_fake_mesh()
+    else:
+        candidate_dims = _ep1_mesh_dims()
 
     off = _build_gptoss_block(sharding_axis_dims=candidate_dims, ring=ring, fsdp_shard=False)
     on = _build_gptoss_block(sharding_axis_dims=candidate_dims, ring=ring, fsdp_shard=True)
@@ -190,10 +201,10 @@ def test_gather_at_use_matches_replicated_weights(candidate_dims, ring):
 
 def test_flag_off_is_bit_identical_to_knob_absent():
     """Flag-off must equal a config that predates the knob, bitwise."""
-    _require_fake_mesh()
+    dims = _ep1_mesh_dims()
 
-    explicit_off = _build_gptoss_block(sharding_axis_dims=(1, 1, 4, 1, 2, 1), ring=False, fsdp_shard=False)
-    legacy = _build_gptoss_block(sharding_axis_dims=(1, 1, 4, 1, 2, 1), ring=False, fsdp_shard=False)
+    explicit_off = _build_gptoss_block(sharding_axis_dims=dims, ring=False, fsdp_shard=False)
+    legacy = _build_gptoss_block(sharding_axis_dims=dims, ring=False, fsdp_shard=False)
     delattr(legacy.config, "moe_fsdp_shard_expert_weights")
     x = _input()
 
@@ -206,17 +217,20 @@ def test_flag_off_is_bit_identical_to_knob_absent():
 
 
 def test_non_divisible_expert_count_falls_back_safely():
-    """E=6 with ep*fsdp=4: the runtime gather must disable itself, math intact.
+    """An indivisible expert count disables the runtime gather without changing math.
 
-    6 % 4 != 0, so the weight in-specs cannot carry (ep, fsdp); the module
+    Use E=6 with ep*fsdp=4, or E=3 with ep*fsdp=2 on four devices.
+    Neither divides, so the weight in-specs cannot carry (ep, fsdp); the module
     logs a warning and keeps the fsdp-replicated in-specs (any at-rest fsdp
     sharding is gathered at the shard_map boundary instead). Output must
     match the flag-off block bit-for-bit wherever specs sanitize away.
     """
-    _require_fake_mesh()
+    dims = _ep1_mesh_dims()
+    num_experts = 6 if dims[2] == 4 else 3
+    assert num_experts % (dims[2] * dims[3]) != 0
 
-    off = _build_gptoss_block(sharding_axis_dims=(1, 1, 4, 1, 2, 1), ring=False, fsdp_shard=False, num_experts=6)
-    on = _build_gptoss_block(sharding_axis_dims=(1, 1, 4, 1, 2, 1), ring=False, fsdp_shard=True, num_experts=6)
+    off = _build_gptoss_block(sharding_axis_dims=dims, ring=False, fsdp_shard=False, num_experts=num_experts)
+    on = _build_gptoss_block(sharding_axis_dims=dims, ring=False, fsdp_shard=True, num_experts=num_experts)
     x = _input()
 
     with off.config.mesh:
@@ -241,9 +255,9 @@ def test_optimizer_state_mirrors_fsdp_sharding():
     from easydel.infra.base_state import EasyDeLState
     from easydel.modules.gpt_oss.modeling_gpt_oss import GptOssForCausalLM
 
-    _require_fake_mesh()
+    dims = _ep1_mesh_dims()
 
-    config = _make_config(sharding_axis_dims=(1, 1, 4, 1, 2, 1), ring=False, fsdp_shard=True)
+    config = _make_config(sharding_axis_dims=dims, ring=False, fsdp_shard=True)
     with config.mesh:
         model = GptOssForCausalLM(config=config, dtype=jnp.float32, param_dtype=jnp.float32, rngs=spx.Rngs(0))
 

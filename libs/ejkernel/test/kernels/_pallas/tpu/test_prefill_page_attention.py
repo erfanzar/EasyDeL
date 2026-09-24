@@ -76,3 +76,25 @@ def test_sliding_window_vs_xla():
     out_xla = prefill_xla(query, key_cache, value_cache, context_len, page_indices, sliding_window=64)
 
     assert jnp.allclose(out_tpu, out_xla, rtol=0.0, atol=0.15)
+
+
+@pytest.mark.parametrize(
+    "context_length", [16, 24, 40, 56], ids=["one-chunk", "two-chunks", "three-chunks", "four-chunks"]
+)
+def test_multihead_dma_chunk_parity_vs_xla(context_length: int):
+    """Every head must start its first DMA for either parity of the carried slot."""
+    query, key_cache, value_cache, _, _ = _build_inputs(seed=2)
+    # Keep four addressable chunks while varying the number actually visited.
+    # Noncontiguous pages and distinct head values expose stale-buffer reads.
+    page_indices = jnp.array([3, 0, 2, 1], dtype=jnp.int32)
+    context_len = jnp.array([context_length], dtype=jnp.int32)
+    head_offsets = 2.0 * jnp.arange(value_cache.shape[0], dtype=value_cache.dtype)
+    value_cache = value_cache + head_offsets[:, None, None, None]
+
+    out_tpu = prefill_tpu(query, key_cache, value_cache, context_len, page_indices)
+    out_xla = prefill_xla(query, key_cache, value_cache, context_len, page_indices)
+
+    assert out_tpu.shape == query.shape
+    assert out_tpu.dtype == query.dtype
+    assert jnp.isfinite(out_tpu).all()
+    assert jnp.allclose(out_tpu, out_xla, rtol=0.0, atol=0.15)

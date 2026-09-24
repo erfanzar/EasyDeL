@@ -46,6 +46,7 @@ def conv(
     padding: PaddingSpec = "VALID",
     dilation: int | Sequence[int] = 1,
     groups: int = 1,
+    precision: jax.lax.PrecisionLike = None,
 ) -> Array:
     """Apply an N-D convolution.
 
@@ -63,6 +64,8 @@ def conv(
         padding: See :data:`PaddingSpec`.
         dilation: Per-axis kernel dilation (atrous convolution).
         groups: Depthwise-style grouping. Must divide ``C_in``.
+        precision: Convolution precision forwarded to JAX. ``None`` follows
+            the ambient ``jax.default_matmul_precision`` setting.
 
     Returns:
         The convolved tensor with optional bias.
@@ -87,6 +90,7 @@ def conv(
         rhs_dilation=tuple(dilation),
         dimension_numbers=dim_numbers,
         feature_group_count=groups,
+        precision=precision,
     )
     if b is not None:
         y = y + jnp.asarray(b)

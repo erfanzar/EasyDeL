@@ -31,6 +31,7 @@ __all__ = (
     "is_vacuous_selection",
     "ste_score_proxy",
     "topk_select",
+    "topk_selection_mask",
     "visible_causal_mask",
 )
 
@@ -92,6 +93,42 @@ def topk_select(
         picked = jnp.take_along_axis(scores, idx, axis=-1)
         idx = jnp.where(picked > invalid_value, idx, -1)
     return idx.astype("i4")
+
+
+def topk_selection_mask(
+    scores: Float[Array, "... n"],
+    values: Float[Array, "... k"],
+    indices: Int[Array, "... k"],
+) -> Bool[Array, "... n"]:
+    """Boolean form of a ``jax.lax.top_k(scores, k)`` selection, without scattering.
+
+    ``top_k`` keeps every score above its ``k``-th value plus the
+    lowest-index scores tied with it, so the kept ties are exactly those at or
+    below the largest selected tie index. Scores are compared by IEEE
+    totalOrder (signed zeros, infinities and NaN payloads ordered), as
+    ``top_k`` orders them, so the mask equals the one-hot of ``indices``. It
+    costs elementwise passes instead of a ``[..., k, n]`` one-hot reduction or
+    a scatter, both of which are slow on TPU.
+
+    Args:
+        scores: The exact array ``top_k`` ranked.
+        values: ``top_k`` values ``[..., k]`` (descending), ``k >= 1``.
+        indices: ``top_k`` indices ``[..., k]``.
+
+    Returns:
+        Boolean ``[..., n]``; ``True`` where ``indices`` selected the position.
+    """
+
+    def order_key(x):
+        bits = jax.lax.bitcast_convert_type(x.astype(jnp.float32), jnp.int32)
+        return jnp.where(bits < 0, bits ^ jnp.int32(0x7FFFFFFF), bits)
+
+    keys = order_key(scores)
+    value_keys = order_key(values)
+    kth = value_keys[..., -1:]
+    tie_cut = jnp.max(jnp.where(value_keys == kth, indices, -1), axis=-1, keepdims=True)
+    position = jax.lax.broadcasted_iota(jnp.int32, scores.shape, scores.ndim - 1)
+    return (keys > kth) | ((keys == kth) & (position <= tie_cut))
 
 
 def indices_to_bool_mask(

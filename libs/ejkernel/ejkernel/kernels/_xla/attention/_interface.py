@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import jaxtyping
 from beartype import beartype
+from jax import lax
 
 from ejkernel.ops import BwdParams, FwdParams
 
@@ -54,6 +55,7 @@ def attention(
     *,
     weights_block_q: int = 64,
     weights_block_k: int = 64,
+    precision: lax.PrecisionLike = None,
 ) -> tuple[Float[Array, "batch seq_len num_q_heads vhead_dim"], Float[Array, "batch num_heads seq_len kv_len"]]:
     """Compute multi-head attention using standard JAX operations.
     This function implements scaled dot-product attention with support for
@@ -101,6 +103,8 @@ def attention(
             When specified, each query position can only attend to keys within the window.
         fwd_params: Operation-level tuning hint accepted for API parity; ignored by XLA.
         bwd_params: Operation-level tuning hint accepted for API parity; ignored by XLA.
+        precision: JAX matmul precision for both contractions. None inherits the
+            ambient JAX setting; an explicit ``Precision.DEFAULT`` does not.
     Returns:
         A tuple containing:
             - attention_output: Float[Array, "batch seq_len num_q_heads head_dim"]
@@ -143,6 +147,7 @@ def attention(
         dropout_prob,
         causal,
         sliding_window,
+        precision=precision,
     )
 
 

@@ -20,7 +20,7 @@ import jax.numpy as jnp
 from jaxtyping import Array
 
 from ...._registry import Backend, Platform, kernel_registry
-from ._pallas_impl_fwd import topk_superset_tpu
+from ._pallas_impl_fwd import topk_threshold_tpu
 
 
 @kernel_registry.register("topk", Platform.PALLAS, Backend.TPU)
@@ -31,16 +31,15 @@ def topk(
     mode: str = "values",
     mask_fill: float | None = None,
 ) -> tuple[Array, Array] | Array:
-    """Blockwise-superset top-k on TPU; see the XLA reference for semantics.
+    """Threshold-and-compact top-k on TPU; see the XLA reference for semantics.
 
-    Only ``mode="values"`` with a static ``k`` is accelerated here. ``mask``
-    and ``filter`` need a per-row dynamic ``k`` and a threshold rather than a
-    sorted result, which the superset does not produce, so they delegate to the
-    XLA reference instead of pretending to be fused.
+    Only ``mode="values"`` with a static ``k`` on floating inputs is
+    accelerated here. ``mask`` and ``filter`` take a per-row dynamic ``k`` and
+    integer inputs have no float key, so those delegate to the XLA reference.
     """
     from ejkernel.kernels._xla.topk._interface import topk as topk_xla
 
-    if mode != "values" or not isinstance(k, int):
+    if mode != "values" or not isinstance(k, int) or not jnp.issubdtype(operand.dtype, jnp.floating):
         return topk_xla(operand, k, axis=axis, mode=mode, mask_fill=mask_fill)
 
     axis_n = axis if axis >= 0 else operand.ndim + axis
@@ -48,7 +47,7 @@ def topk(
     lead = moved.shape[:-1]
     flat = moved.reshape(-1, moved.shape[-1])
 
-    values, indices = topk_superset_tpu(flat, k=int(k))
+    values, indices = topk_threshold_tpu(flat, k=int(k))
     values = values.reshape(*lead, int(k))
     indices = indices.reshape(*lead, int(k))
     if axis_n != operand.ndim - 1:

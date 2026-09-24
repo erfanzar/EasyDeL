@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 import spectrax as spx
 
@@ -49,6 +50,14 @@ def _require_fake_mesh():
     """Skip unless the fake 8-device CPU host mesh is available."""
     if jax.device_count() < 8:
         pytest.skip("needs XLA_FLAGS=--xla_force_host_platform_device_count=8")
+
+
+def _ep1_mesh_dims():
+    """Keep FSDP and TP nontrivial on four devices; retain fsdp4/tp2 on eight."""
+    if jax.device_count() < 4:
+        pytest.skip("needs at least 4 devices for fsdp2 x tp2")
+    fsdp = 4 if jax.device_count() >= 8 else 2
+    return (1, 1, fsdp, 1, 2, 1)
 
 
 def _build_gptoss_block(
@@ -146,7 +155,7 @@ def test_stage_mesh_batch_axes_include_fsdp():
 @pytest.mark.parametrize(
     ("candidate_dims", "ring"),
     [
-        pytest.param((1, 1, 4, 1, 2, 1), False, id="noring-fsdp4-tp2"),
+        pytest.param(None, False, id="noring-fsdp-tp2"),
         pytest.param((1, 1, 2, 2, 2, 1), True, id="ring-fsdp2-ep2-tp2"),
     ],
 )
@@ -160,7 +169,10 @@ def test_fused_moe_local_batch_sharded_over_fsdp(candidate_dims, ring):
     """
     from easydel.layers.moe._communication_utils import MoeFusedHooks
 
-    _require_fake_mesh()
+    if ring:
+        _require_fake_mesh()
+    else:
+        candidate_dims = _ep1_mesh_dims()
 
     block = _build_gptoss_block(sharding_axis_dims=candidate_dims, ring=ring)
     seen: list[tuple[int, ...]] = []
@@ -192,13 +204,13 @@ def test_fused_moe_local_batch_sharded_over_fsdp(candidate_dims, ring):
 @pytest.mark.parametrize(
     ("candidate_dims", "ring"),
     [
-        pytest.param((1, 1, 4, 1, 2, 1), False, id="noring-fsdp4-tp2"),
+        pytest.param(None, False, id="noring-fsdp-tp2"),
         pytest.param((1, 1, 2, 2, 2, 1), True, id="ring-fsdp2-ep2-tp2"),
         pytest.param((1, 1, 2, 2, 1, 2), True, id="ring-fsdp2-ep2-sp2-tp1"),
     ],
 )
 def test_fsdp_batch_sharding_matches_dp_reference(candidate_dims, ring):
-    """dp=8 reference vs fsdp-carried batch: identical weights, identical outputs.
+    """All-device dp reference vs fsdp-carried batch: identical weights and outputs.
 
     Batch parallelism is pure sharding: moving it from dp to fsdp must not
     change the math or the global output shape. The reference mesh (dp=all)
@@ -207,7 +219,10 @@ def test_fsdp_batch_sharding_matches_dp_reference(candidate_dims, ring):
     so the non-ring case covers ep=1 with fsdp>1/tp>1 and ring covers ep>1
     with tp in {1, 2}; the sp>1 case locks sp's replicated batch behavior.
     """
-    _require_fake_mesh()
+    if ring:
+        _require_fake_mesh()
+    else:
+        candidate_dims = _ep1_mesh_dims()
 
     ref = _build_gptoss_block(sharding_axis_dims=(1, -1, 1, 1, 1, 1), ring=ring)
     shd = _build_gptoss_block(sharding_axis_dims=candidate_dims, ring=ring)
@@ -222,7 +237,9 @@ def test_fsdp_batch_sharding_matches_dp_reference(candidate_dims, ring):
     assert out_shd.shape == out_ref.shape, f"global output shape drifted: {out_shd.shape} vs {out_ref.shape}"
     assert bool(jnp.all(jnp.isfinite(out_ref)))
     assert bool(jnp.all(jnp.isfinite(out_shd)))
-    max_abs_diff = float(jnp.max(jnp.abs(out_ref - out_shd)))
+    # Different mesh shapes may order the same devices differently; compare global values on the host.
+    out_ref_host, out_shd_host = jax.device_get((out_ref, out_shd))
+    max_abs_diff = float(np.max(np.abs(out_ref_host - out_shd_host)))
     assert max_abs_diff < 1e-3, (
         f"fsdp-carried batch diverges from dp reference on {candidate_dims}: max_abs_diff={max_abs_diff:.3e}"
     )
@@ -251,7 +268,9 @@ def test_ring_tp_output_shape_on_folded_mesh():
     assert out_folded.shape == out_ref.shape, (
         f"ring+tp>1 combine misfolded hidden into batch: {out_folded.shape} vs {out_ref.shape}"
     )
-    max_abs_diff = float(jnp.max(jnp.abs(out_ref - out_folded)))
+    # Compare on the host rather than combining arrays from differently ordered meshes.
+    out_ref_host, out_folded_host = jax.device_get((out_ref, out_folded))
+    max_abs_diff = float(np.max(np.abs(out_ref_host - out_folded_host)))
     assert max_abs_diff < 1e-3, f"ring+tp>1 folded-mesh output diverges: max_abs_diff={max_abs_diff:.3e}"
 
 
@@ -275,7 +294,9 @@ def test_fsdp_batch_grad_matches_dp_reference():
     assert grad_shd.shape == grad_ref.shape
     assert bool(jnp.all(jnp.isfinite(grad_ref)))
     assert bool(jnp.all(jnp.isfinite(grad_shd)))
-    max_abs_diff = float(jnp.max(jnp.abs(grad_ref - grad_shd)))
+    # Keep both gradient executions distributed, but compare their global values on the host.
+    grad_ref_host, grad_shd_host = jax.device_get((grad_ref, grad_shd))
+    max_abs_diff = float(np.max(np.abs(grad_ref_host - grad_shd_host)))
     assert max_abs_diff < 1e-4, (
         f"fsdp-carried batch gradient diverges from dp reference: max_abs_diff={max_abs_diff:.3e}"
     )
@@ -295,11 +316,13 @@ def test_indivisible_batch_drop_is_inference_gated():
     from easydel.infra.sharding import decode_mode_specs
     from easydel.utils.inference_mode import set_inference_mode
 
-    _require_fake_mesh()
+    dims = _ep1_mesh_dims()
 
-    block = _build_gptoss_block(sharding_axis_dims=(1, 1, 4, 1, 2, 1), ring=False)
-    # B=2 is indivisible by the (dp=1, fsdp=4) batch group.
-    x = jax.random.normal(jax.random.PRNGKey(0), (2, 4, 32), dtype=jnp.float32)
+    block = _build_gptoss_block(sharding_axis_dims=dims, ring=False)
+    # Preserve a genuinely indivisible batch: B=2 for fsdp4, B=3 for fsdp2.
+    batch = 2 if dims[2] == 4 else 3
+    assert batch % dims[2] != 0
+    x = jax.random.normal(jax.random.PRNGKey(0), (batch, 4, 32), dtype=jnp.float32)
 
     with block.config.mesh:
         with pytest.raises(Exception):  # noqa: B017 - loud shard_map divisibility error

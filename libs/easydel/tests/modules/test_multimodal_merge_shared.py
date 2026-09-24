@@ -31,6 +31,7 @@ delegation and the batch behaviour that the drifted copy got wrong.
 
 import importlib
 
+import jax
 import numpy as np
 import pytest
 from easydel.modules._base.vision_language_module import BaseVisionLanguageModule
@@ -167,3 +168,133 @@ def test_merge_rejects_placeholder_feature_count_mismatch(feature_count):
     visual = jnp.zeros((feature_count, 8), jnp.float32)
     with pytest.raises(ValueError, match=rf"2 placeholder.*{feature_count} multimodal"):
         BaseVisionLanguageModule.merge_multimodal_embeddings(ids, text, visual, 9)
+
+
+def _prefix_merge_inputs(placeholder_count, capacity=6):
+    """Build nonzero padding plus an independent flattened NumPy scatter oracle."""
+    ids = np.zeros((2, 5), dtype=np.int32)
+    positions = np.array([1, 4, 5, 7, 8, 9])[:placeholder_count]
+    ids.reshape(-1)[positions] = PLACEHOLDER
+    text = np.arange(40, dtype=np.float32).reshape(2, 5, 4) / 8
+    features = np.full((capacity, 4), -1234.5, dtype=np.float32)
+    features[:placeholder_count] = np.arange(placeholder_count * 4, dtype=np.float32).reshape(-1, 4) + 100
+    expected = text.copy()
+    expected.reshape(-1, 4)[positions] = features[:placeholder_count]
+    return ids, text, features, expected
+
+
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "jit-dynamic-length"])
+def test_explicit_valid_prefix_matches_numpy_scatter(compiled):
+    """Only genuine prefix rows replace placeholders; nonzero tail rows never do."""
+
+    def merge(ids, text, features, valid_length):
+        return BaseVisionLanguageModule.merge_multimodal_embeddings(
+            ids,
+            text,
+            features,
+            PLACEHOLDER,
+            multimodal_embeddings_valid_length=valid_length,
+        )
+
+    run = jax.jit(merge) if compiled else merge
+    # Same capacity and shapes, changing data-dependent lengths (including no
+    # images) through the same jitted callable. Preprocessing owns validation
+    # of dynamic metadata, so only valid length/count pairs enter this path.
+    for count in (3, 1, 0, 6):
+        ids, text, features, expected = _prefix_merge_inputs(count)
+        merged = run(jnp.asarray(ids), jnp.asarray(text), jnp.asarray(features), jnp.asarray(count, dtype=jnp.int32))
+        assert merged.shape == text.shape
+        assert merged.dtype == text.dtype
+        np.testing.assert_array_equal(np.asarray(merged), expected)
+
+
+@pytest.mark.parametrize("valid_length", [2, np.int32(2), np.int64(2), np.asarray(2, dtype=np.int32)])
+def test_explicit_valid_prefix_accepts_concrete_integer_scalars(valid_length):
+    ids, text, features, expected = _prefix_merge_inputs(2)
+    merged = BaseVisionLanguageModule.merge_multimodal_embeddings(
+        jnp.asarray(ids),
+        jnp.asarray(text),
+        jnp.asarray(features),
+        PLACEHOLDER,
+        multimodal_embeddings_valid_length=valid_length,
+    )
+    np.testing.assert_array_equal(np.asarray(merged), expected)
+
+
+@pytest.mark.parametrize("valid_length", [0, 1, 3, 6])
+def test_valid_prefix_rejects_genuine_count_mismatch_despite_spare_capacity(valid_length):
+    """Capacity is not evidence of real features: two placeholders need n == 2."""
+    ids, text, features, _ = _prefix_merge_inputs(2)
+    with pytest.raises(ValueError, match=rf"2 placeholder.*{valid_length} multimodal"):
+        BaseVisionLanguageModule.merge_multimodal_embeddings(
+            jnp.asarray(ids),
+            jnp.asarray(text),
+            jnp.asarray(features),
+            PLACEHOLDER,
+            multimodal_embeddings_valid_length=jnp.asarray(valid_length, dtype=jnp.int32),
+        )
+
+
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "traced-inputs-concrete-metadata"])
+@pytest.mark.parametrize(
+    "valid_length, message",
+    [
+        (-1, "between 0 and capacity 6"),
+        (7, "between 0 and capacity 6"),
+        (np.uint64(2**63), "between 0 and capacity 6"),
+        ([2], "scalar integer"),
+        (np.asarray([[2]], dtype=np.int32), "scalar integer"),
+        (2.0, "scalar integer"),
+        (np.float32(2), "scalar integer"),
+        (True, "scalar integer"),
+        (np.bool_(False), "scalar integer"),
+        (2 + 0j, "scalar integer"),
+        ("2", "scalar integer"),
+    ],
+)
+def test_valid_prefix_rejects_invalid_concrete_metadata(compiled, valid_length, message):
+    """A traced placeholder count must not suppress concrete metadata checks."""
+    ids, text, features, _ = _prefix_merge_inputs(2)
+
+    def merge(ids, text, features):
+        return BaseVisionLanguageModule.merge_multimodal_embeddings(
+            ids,
+            text,
+            features,
+            PLACEHOLDER,
+            multimodal_embeddings_valid_length=valid_length,
+        )
+
+    run = jax.jit(merge) if compiled else merge
+    with pytest.raises(ValueError, match=message):
+        run(jnp.asarray(ids), jnp.asarray(text), jnp.asarray(features))
+
+
+@pytest.mark.parametrize(
+    "valid_length",
+    [np.asarray([2], dtype=np.int32), np.asarray(2, dtype=np.float32), np.asarray(True)],
+)
+def test_valid_prefix_rejects_invalid_traced_metadata_shape_or_dtype(valid_length):
+    ids, text, features, _ = _prefix_merge_inputs(2)
+
+    @jax.jit
+    def merge(ids, text, features, length):
+        return BaseVisionLanguageModule.merge_multimodal_embeddings(
+            ids,
+            text,
+            features,
+            PLACEHOLDER,
+            multimodal_embeddings_valid_length=length,
+        )
+
+    with pytest.raises(ValueError, match="scalar integer"):
+        merge(jnp.asarray(ids), jnp.asarray(text), jnp.asarray(features), jnp.asarray(valid_length))
+
+
+def test_padded_no_image_features_still_require_explicit_zero_length():
+    """Opting out of prefix metadata retains the old exact-count contract."""
+    ids, text, features, _ = _prefix_merge_inputs(0)
+    with pytest.raises(ValueError, match=r"0 placeholder.*6 multimodal"):
+        BaseVisionLanguageModule.merge_multimodal_embeddings(
+            jnp.asarray(ids), jnp.asarray(text), jnp.asarray(features), PLACEHOLDER
+        )

@@ -881,7 +881,7 @@ def create_mesh(
             total_devices = len(devices)
             axis_dims, mesh_device_count = _resolve_axis_dims_for_devices(axis_dims, total_devices)
             jm = jax.make_mesh(
-                axis_shapes=axis_dims,
+                axis_dims,
                 axis_names=axis_names,
                 axis_types=axis_types_norm,
                 devices=devices[:mesh_device_count],

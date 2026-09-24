@@ -3256,6 +3256,10 @@ class eSurgeRunner:
                 spec_decode_active_window
                 and self.drafter is not None
                 and hidden_states_for_spec is not None
+                # Exact recurrent replay re-derives the corrected token and seed
+                # hidden in the per-request path. Batched argmax consumption
+                # would bypass that replay and its live recurrent-state update.
+                and not (self.spec_decode_recurrent_candidates and self.spec_decode_recurrent_replay)
                 and not flags.get_bool(flags.EASYDEL_DISABLE_BATCHED_EMIT)
             )
             if batched_emit_enabled:

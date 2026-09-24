@@ -38,18 +38,11 @@ import types
 os.environ.setdefault("ENABLE_DISTRIBUTED_INIT", "0")
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
-# The runner-level greedy-exactness check needs the exact sequential-replay
-# recurrent path (the tiny model has linear_attention layers); the default fast
-# path is coherent but not bit-identical to the no-spec baseline on recurrent
-# models. ``_run_generation`` forces EASYDEL_SPEC_RECURRENT_REPLAY=1 for its own
-# runs (overriding any ambient fast-path setting) rather than relying on this
-# process default, so the greedy==baseline assertion can't be made flaky by the
-# caller's environment. This ``setdefault`` only sets a default for the rest.
-os.environ.setdefault("EASYDEL_SPEC_RECURRENT_REPLAY", "1")
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.esurge.runners import eSurgeRunner
 from easydel.inference.esurge.runners.spec.strategy import DrafterSpeculation
@@ -64,6 +57,12 @@ except ImportError:  # standalone `python test_x.py`
 
 _VOCAB = 256
 _HIDDEN = 128
+
+
+@pytest.fixture(autouse=True)
+def _exact_recurrent_replay(monkeypatch):
+    """Keep these tests in exact replay mode without leaking into other modules."""
+    monkeypatch.setenv("EASYDEL_SPEC_RECURRENT_REPLAY", "1")
 
 
 def _hidden(seed: int) -> jnp.ndarray:
@@ -436,7 +435,5 @@ def test_batched_persist_keeps_a_row_per_request():
 
 if __name__ == "__main__":
     import sys
-
-    import pytest
 
     sys.exit(pytest.main([__file__, "-v"]))

@@ -623,6 +623,7 @@ class MuonOptimizer(OptimizerBuilder):
             adam_b1=self.config.adam_b1,
             adam_b2=self.config.adam_b2,
             adam_eps_root=self.config.adam_eps_root,
+            adam_weight_decay=self.config.adam_weight_decay,
         )
 
     def build_mpmd(

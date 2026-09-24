@@ -2483,9 +2483,9 @@ def _make_batched_stage_local_muon_2d(
                 ) * _bias_correction(grad, beta, muon_count_inc)
             else:
                 mu_hat = _bias_correction(mu_next, beta, muon_count_inc)
-            update = orthogonalize_via_newton_schulz(mu_hat, ns_coeffs, ns_steps, eps)
+            update = orthogonalize_via_newton_schulz(mu_hat, ns_coeffs, ns_steps=ns_steps, eps=eps)
             if adaptive:
-                update = jnp.einsum("ij,ij,ab->ab", mu_hat, update, update)
+                update = jnp.sum(mu_hat.conj() * update) * update
             update = jnp.sqrt(jnp.maximum(1.0, update.shape[-1] / update.shape[-2])).astype(update.dtype) * update
             if internal_weight_decay != 0.0 and int_flag:
                 update = update + jnp.asarray(internal_weight_decay, update.dtype) * param
@@ -2600,7 +2600,9 @@ def _apply_muon_stage_local(
         inner_states = dict(partition_state.inner_states)
         muon_masked_state = inner_states["muon"]
         adam_masked_state = inner_states["adam"]
-        muon_state, muon_empty_state, muon_schedule_state = muon_masked_state.inner_state
+        # Optax may insert stateless transforms (e.g. scale_by_shape)
+        # between the momentum and schedule states. Preserve their layout.
+        muon_state, *muon_stateless_states, muon_schedule_state = muon_masked_state.inner_state
         adam_state, adam_empty_state, adam_schedule_state = adam_masked_state.inner_state
 
         wd_state = states[weight_decay_index] if weight_decay_index is not None else None
@@ -2737,7 +2739,7 @@ def _apply_muon_stage_local(
         inner_states["muon"] = muon_masked_state._replace(
             inner_state=(
                 muon_state._replace(count=muon_count_inc, mu=new_muon_mu),
-                muon_empty_state,
+                *muon_stateless_states,
                 muon_schedule_state._replace(count=_safe_increment(muon_schedule_state.count)),
             )
         )
@@ -2797,7 +2799,9 @@ def _apply_muon_stage_local_per_leaf(
         inner_states = dict(partition_state.inner_states)
         muon_masked_state = inner_states["muon"]
         adam_masked_state = inner_states["adam"]
-        muon_state, muon_empty_state, muon_schedule_state = muon_masked_state.inner_state
+        # Optax may insert stateless transforms (e.g. scale_by_shape)
+        # between the momentum and schedule states. Preserve their layout.
+        muon_state, *muon_stateless_states, muon_schedule_state = muon_masked_state.inner_state
         adam_state, adam_empty_state, adam_schedule_state = adam_masked_state.inner_state
     except (TypeError, ValueError, KeyError, AttributeError) as exc:
         raise NotImplementedError("eFormer stage-local Muon requires the standard optax.contrib.muon state.") from exc
@@ -2835,11 +2839,11 @@ def _apply_muon_stage_local_per_leaf(
             update = orthogonalize_via_newton_schulz(
                 mu_hat,
                 _place_array_like(muon_state.ns_coeffs, grad),
-                int(config.ns_steps),
-                float(config.eps),
+                ns_steps=int(config.ns_steps),
+                eps=float(config.eps),
             )
             if bool(config.adaptive):
-                update = jnp.einsum("ij,ij,ab->ab", mu_hat, update, update)
+                update = jnp.sum(mu_hat.conj() * update) * update
             update = jnp.sqrt(jnp.maximum(1.0, update.shape[-1] / update.shape[-2])).astype(update.dtype) * update
             if float(config.weight_decay) != 0.0:
                 update = (
@@ -2918,7 +2922,7 @@ def _apply_muon_stage_local_per_leaf(
     inner_states["muon"] = muon_masked_state._replace(
         inner_state=(
             muon_state._replace(count=muon_count_inc, mu=new_muon_mu),
-            muon_empty_state,
+            *muon_stateless_states,
             muon_schedule_state._replace(count=_safe_increment(muon_schedule_state.count)),
         )
     )

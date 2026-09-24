@@ -36,6 +36,7 @@ import jax.numpy as jnp
 import jaxtyping
 from beartype import beartype
 from jax import lax
+from jax.extend.core import concrete_or_error
 from jaxtyping import Array, Float
 
 from ...._registry import Backend, Platform, kernel_registry
@@ -45,7 +46,7 @@ from ._pallas_impl import all_gather_matmul as _all_gather_matmul_impl
 def _infer_axis_size(axis_name: str) -> int | None:
     """Infer collective axis size from the active mapped context when available."""
     try:
-        return jax.core.concrete_or_error(
+        return concrete_or_error(
             int,
             lax.psum(jnp.array(1, dtype=jnp.int32), axis_name=axis_name),
             f"collective axis '{axis_name}' size must be static.",

@@ -29,7 +29,7 @@ from types import SimpleNamespace
 
 from ejkernel.modules.operations.configs import GatedDeltaRuleConfig
 from ejkernel.modules.operations.gated_delta_rule import GatedDeltaRule, _sanitize_persistent_gdr_cfg
-from ejkernel.ops.config.persistent import PersistentCache
+from ejkernel.ops.config.persistent import PROVENANCE_AUTOTUNE, PersistentCache
 
 
 def _all_candidates():
@@ -56,7 +56,8 @@ def test_persistent_cache_sanitizes_stale_dtype_flags(tmp_path):
         loader=_sanitize_persistent_gdr_cfg,
         cfg_type=GatedDeltaRuleConfig,
     )
-    # entry persisted before the defaults were flipped: flags stored as True
+    # Model an old autotune winner with flags stored as True, not an
+    # unprovenanced legacy entry (which must remain a cache miss).
     stale = GatedDeltaRuleConfig(
         platform="pallas",
         backend="tpu",
@@ -64,22 +65,32 @@ def test_persistent_cache_sanitizes_stale_dtype_flags(tmp_path):
         use_input_dtype_phase1_outputs=True,
         use_input_dtype_state=True,
     )
-    cache.put("tpu-v5p", "gated_delta_rule", "callkey", stale)
-    loaded = cache.get("tpu-v5p", "gated_delta_rule", "callkey")
+    cache.put("tpu-v5p", "gated_delta_rule", "callkey", stale, provenance=PROVENANCE_AUTOTUNE)
+
+    # An older config payload with a removed key still loads inside a trusted
+    # envelope; this does not grant trust to pre-provenance cache files.
+    cache.put(
+        "tpu-v5p",
+        "gated_delta_rule",
+        "legacy",
+        {"chunk_size": 128, "use_input_dtype_phase1_outputs": True, "legacy_knob": 1},
+        provenance=PROVENANCE_AUTOTUNE,
+    )
+    # A fresh reader proves a disk round-trip, not just in-memory sanitization.
+    reloaded = PersistentCache(
+        "gated_delta_rule",
+        path=cache.path,
+        loader=_sanitize_persistent_gdr_cfg,
+        cfg_type=GatedDeltaRuleConfig,
+    )
+    loaded = reloaded.get("tpu-v5p", "gated_delta_rule", "callkey")
     assert isinstance(loaded, GatedDeltaRuleConfig)
     assert loaded.chunk_size == 256
     assert loaded.platform == "pallas"
     assert loaded.use_input_dtype_phase1_outputs is False
     assert loaded.use_input_dtype_state is False
 
-    # entry from an even older schema with a since-removed key still loads
-    cache.put(
-        "tpu-v5p",
-        "gated_delta_rule",
-        "legacy",
-        {"chunk_size": 128, "use_input_dtype_phase1_outputs": True, "legacy_knob": 1},
-    )
-    legacy = cache.get("tpu-v5p", "gated_delta_rule", "legacy")
+    legacy = reloaded.get("tpu-v5p", "gated_delta_rule", "legacy")
     assert isinstance(legacy, GatedDeltaRuleConfig)
     assert legacy.chunk_size == 128
     assert legacy.use_input_dtype_phase1_outputs is False

@@ -22,10 +22,12 @@ KV cache layout:
     ``kv_cache[page_id, token_in_page, kv_head_pair // pack, pack, head_dim_padded]``
 
     Packing is determined by the cache dtype bit-width:
-    ``pack = 32 // dtype.itemsize * 8``.  ``head_dim_padded`` is the
-    smallest multiple of 128 that is >= the true ``head_dim``.  Keys are
-    at KV-pair index 0 and values at index 1 within the innermost 2-position
-    dimension after unpacking.
+    ``pack = 32 // (dtype.itemsize * 8)``. For ``head_dim == 64``, the
+    packed head axis is ``align_to(num_kv_heads, pack) // pack`` and the
+    last axis stores K(64) followed by V(64). For all other head dimensions,
+    the packed head axis is ``align_to(2 * num_kv_heads, pack) // pack``:
+    adjacent head slots store K then V, and the last axis is padded to the
+    smallest multiple of 128 that is >= the true ``head_dim``.
 
     Use ``merge_kv(k, v)`` to convert separate key/value tensors into this
     format before inserting into the cache.
@@ -148,10 +150,11 @@ def kv_pair_in_head_dim(actual_head_dim: int) -> bool:
 def merge_kv(k: jax.Array, v: jax.Array) -> jax.Array:
     """Interleave and pack key and value tensors into the merged paged-cache format.
 
-    Concatenates K and V along the per-head axis, pads the combined-head
-    count to ``align_to(num_kv_heads * 2, pack)`` and ``head_dim`` to
-    ``align_to(head_dim, 128)``, then reshapes into the 4-D packed layout
-    expected by the paged KV cache.
+    For ``head_dim == 64``, concatenates K and V in the last axis and pads
+    the head count to ``align_to(num_kv_heads, pack)``. Otherwise, interleaves
+    K and V on the head axis, pads that count to
+    ``align_to(num_kv_heads * 2, pack)`` and ``head_dim`` to
+    ``align_to(head_dim, 128)``. Reshapes into the 4-D packed cache layout.
 
     The packing factor ``pack = 32 // (dtype.itemsize * 8)`` is derived from
     the dtype bit-width so that the innermost two axes form aligned 32-bit
@@ -163,16 +166,12 @@ def merge_kv(k: jax.Array, v: jax.Array) -> jax.Array:
 
     Returns:
         Merged KV tensor of shape
-        ``[max_num_tokens, num_kv_heads_x2_aligned // pack, pack, head_dim_padded]``
-        where ``num_kv_heads_x2_aligned = align_to(num_kv_heads * 2, pack)``
-        and ``head_dim_padded = align_to(head_dim, 128)``.
-        Padding elements are zero.
-
-    Note:
-        Keys are at KV-pair slot 0 along the original axis-2 before packing;
-        values are at slot 1.  After packing, individual K/V entries are
-        recovered by reshaping axis-1 back to ``[num_kv_heads_x2, ...]`` and
-        slicing at ``[:, :, 0, :]`` / ``[:, :, 1, :]``.
+        ``[max_num_tokens, aligned_heads // pack, pack, head_dim_padded]``.
+        For ``head_dim == 64``, ``aligned_heads = align_to(num_kv_heads, pack)``
+        and K/V occupy the low/high 64 elements of the last axis. Otherwise,
+        ``aligned_heads = align_to(num_kv_heads * 2, pack)`` and K/V occupy
+        adjacent head slots. In both cases,
+        ``head_dim_padded = align_to(head_dim, 128)`` and padding is zero.
     """
     with jax.named_scope("rpa_v3_xla.merge_kv"):
         assert k.shape == v.shape
@@ -276,13 +275,22 @@ def static_validate_inputs(
     if Hq % Hkv != 0:
         raise ValueError("num_q_heads must be divisible by num_kv_heads")
 
-    _, page_size, _Hx2_per_pack, pack, Dalign = kv_cache.shape
+    _, page_size, heads_per_pack, pack, Dalign = kv_cache.shape
     if Dalign != align_to(D, 128):
         raise ValueError("cache last dim must be align_to(D,128)")
     if not jnp.issubdtype(kv_cache.dtype, jnp.floating):
         raise ValueError("kv_cache must be float")
     if pack != get_dtype_packing(kv_cache.dtype):
         raise ValueError("packing mismatch")
+    # The h64 layout already stores K|V in the last axis; only other head
+    # dimensions double the head count. Include dtype-induced head padding.
+    combined_heads = Hkv if kv_pair_in_head_dim(D) else 2 * Hkv
+    expected_heads_per_pack = align_to(combined_heads, pack) // pack
+    if heads_per_pack != expected_heads_per_pack:
+        raise ValueError(
+            f"cache packed head axis must be {expected_heads_per_pack} for "
+            f"num_kv_heads={Hkv}, head_dim={D}, packing={pack}; got {heads_per_pack}"
+        )
 
     if not (kv_lens.dtype == block_tables.dtype == query_start_loc.dtype == distribution.dtype == jnp.int32):
         raise ValueError("index arrays must be int32")

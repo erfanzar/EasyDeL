@@ -54,6 +54,14 @@ def _require_fake_mesh():
         pytest.skip("needs XLA_FLAGS=--xla_force_host_platform_device_count=8")
 
 
+def _ep1_mesh_dims():
+    """Keep FSDP and TP nontrivial on four devices; retain fsdp4/tp2 on eight."""
+    if jax.device_count() < 4:
+        pytest.skip("needs at least 4 devices for fsdp2 x tp2")
+    fsdp = 4 if jax.device_count() >= 8 else 2
+    return (1, 1, fsdp, 1, 2, 1)
+
+
 def _build_gptoss_block(
     *,
     sharding_axis_dims,
@@ -120,10 +128,10 @@ def test_chunk_none_is_bit_identical_to_knob_absent():
     existed: the module reads the knob via ``getattr(..., None)``, so both
     blocks must take the identical single-pass dispatch trace.
     """
-    _require_fake_mesh()
+    dims = _ep1_mesh_dims()
 
-    explicit_none = _build_gptoss_block(sharding_axis_dims=(1, 1, 4, 1, 2, 1), ring=False, moe_chunk_size=None)
-    legacy = _build_gptoss_block(sharding_axis_dims=(1, 1, 4, 1, 2, 1), ring=False, moe_chunk_size=None)
+    explicit_none = _build_gptoss_block(sharding_axis_dims=dims, ring=False, moe_chunk_size=None)
+    legacy = _build_gptoss_block(sharding_axis_dims=dims, ring=False, moe_chunk_size=None)
     delattr(legacy.config, "moe_chunk_size")
     x = _input()
 
@@ -149,10 +157,10 @@ def test_chunked_shard_map_body_sees_chunk_sized_buffers():
     """
     from easydel.layers.moe._communication_utils import MoeFusedHooks
 
-    _require_fake_mesh()
+    dims = _ep1_mesh_dims()
 
     chunk = 4
-    block = _build_gptoss_block(sharding_axis_dims=(1, 1, 4, 1, 2, 1), ring=False, moe_chunk_size=chunk)
+    block = _build_gptoss_block(sharding_axis_dims=dims, ring=False, moe_chunk_size=chunk)
     seen: list[tuple[int, ...]] = []
 
     def spy(inputs_2d, weights, inputs_shape):
@@ -166,7 +174,7 @@ def test_chunked_shard_map_body_sees_chunk_sized_buffers():
         out, _ = block(x)
 
     assert out.shape == x.shape
-    # Local stream is (8/(1*4))*4 = 8 tokens; the hook must never see it.
+    # Full local stream is 8 (fsdp4) or 16 (fsdp2) tokens; the hook must never see it.
     assert set(seen) == {(chunk, x.shape[-1])}, (
         f"chunked dispatch must permute (chunk={chunk}, H) buffers, saw {set(seen)}"
     )
@@ -175,10 +183,10 @@ def test_chunked_shard_map_body_sees_chunk_sized_buffers():
 @pytest.mark.parametrize(
     ("candidate_dims", "ring", "chunk"),
     [
-        # ep=1 all-to-all-free mesh: local stream is 8 tokens per shard.
-        pytest.param((1, 1, 4, 1, 2, 1), False, 4, id="noring-fsdp4-tp2-chunk4"),
-        pytest.param((1, 1, 4, 1, 2, 1), False, 3, id="noring-fsdp4-tp2-chunk3-tailpad"),
-        pytest.param((1, 1, 4, 1, 2, 1), False, 999, id="noring-fsdp4-tp2-chunk-gt-T"),
+        # ep=1: fsdp4/tp2 on eight devices, fsdp2/tp2 on four (8 or 16 local tokens).
+        pytest.param(None, False, 4, id="noring-fsdp-tp2-chunk4"),
+        pytest.param(None, False, 3, id="noring-fsdp-tp2-chunk3-tailpad"),
+        pytest.param(None, False, 999, id="noring-fsdp-tp2-chunk-gt-T"),
         # ring mesh: post-gather stream is (8/2)*4*2 = 32 tokens per shard.
         pytest.param((1, 1, 2, 2, 2, 1), True, 8, id="ring-fsdp2-ep2-tp2-chunk8"),
         pytest.param((1, 1, 2, 2, 2, 1), True, 5, id="ring-fsdp2-ep2-tp2-chunk5-tailpad"),
@@ -195,7 +203,10 @@ def test_chunked_matches_unchunked_outputs_and_grads(candidate_dims, ring, chunk
     ``jax.checkpoint`` body, the tail slice, and (in ring mode) the
     expert-axis ``psum_scatter`` combine.
     """
-    _require_fake_mesh()
+    if ring:
+        _require_fake_mesh()
+    else:
+        candidate_dims = _ep1_mesh_dims()
 
     single = _build_gptoss_block(sharding_axis_dims=candidate_dims, ring=ring, moe_chunk_size=None)
     chunked = _build_gptoss_block(sharding_axis_dims=candidate_dims, ring=ring, moe_chunk_size=chunk)
@@ -247,9 +258,9 @@ def test_chunked_nonring_ep2_traces():
 
 def test_chunk_size_must_be_positive():
     """A non-positive chunk size must fail loudly at config or dispatch time."""
-    _require_fake_mesh()
+    dims = _ep1_mesh_dims()
 
-    block = _build_gptoss_block(sharding_axis_dims=(1, 1, 4, 1, 2, 1), ring=False, moe_chunk_size=None)
+    block = _build_gptoss_block(sharding_axis_dims=dims, ring=False, moe_chunk_size=None)
     block.config.moe_chunk_size = 0  # bypass config validation on purpose
     x = _input()
 

@@ -222,6 +222,56 @@ def _atomic_pickle_dump(obj: tp.Any, path: Path) -> None:
     os.replace(tmp, path)
 
 
+def _serialize_compiled(fn: Compiled) -> tuple:
+    """Serialize an executable with its ordered, global execution-device IDs.
+
+    JAX's deserializer defaults to *all* backend devices, not the devices used
+    at compilation. Its native executable and restored argument shardings can
+    then disagree even for a single-device jit on a multi-device host.
+    """
+    serialized, in_tree, out_tree = serialize(fn)
+    # Use the same unloaded executable that JAX serializes. Unlike the runtime
+    # executable's local_devices(), this includes remote devices and preserves
+    # assignment order; it also works for functions without array arguments.
+    unloaded = fn._executable._unloaded_executable
+    devices = tuple(unloaded.device_list)
+    if not devices:
+        raise ValueError("Cannot serialize compiled function without an execution-device assignment")
+    metadata = {
+        "version": 1,
+        "environment": _env_fingerprint(),
+        "platform": devices[0].platform,
+        "devices": tuple((d.id, d.process_index, d.device_kind) for d in devices),
+    }
+    return serialized, in_tree, out_tree, metadata
+
+
+def _deserialize_compiled(payload: tuple) -> Compiled:
+    """Validate cache metadata before loading on the original ordered devices.
+
+    The first three fields retain JAX's serialized bytes and pytree metadata.
+    Legacy three-field entries lack an unambiguous execution assignment and
+    must be recompiled (or explicitly saved again), never loaded speculatively.
+    """
+    if len(payload) == 3:
+        raise ValueError("Legacy ejit cache lacks execution-device metadata; recompile and save it again")
+    if len(payload) != 4:
+        raise ValueError("Invalid ejit compiled-cache payload")
+    serialized, in_tree, out_tree, metadata = payload
+    if not isinstance(metadata, dict) or metadata.get("version") != 1:
+        raise ValueError("Unsupported ejit compiled-cache metadata version; recompile and save it again")
+    if metadata.get("environment") != _env_fingerprint():
+        raise ValueError("Incompatible ejit compilation environment; recompile and save it again")
+    device_ids = metadata.get("devices")
+    if not device_ids or not metadata.get("platform"):
+        raise ValueError("Invalid ejit execution-device metadata")
+    available = {(d.id, d.process_index, d.device_kind): d for d in jax.devices(metadata["platform"])}
+    if len(set(device_ids)) != len(device_ids) or any(key not in available for key in device_ids):
+        raise ValueError("Cached ejit execution devices are unavailable; recompile and save it again")
+    devices = tuple(available[key] for key in device_ids)
+    return deserialize_and_load(serialized, in_tree, out_tree, backend=devices[0].client, execution_devices=devices)
+
+
 def _get_hardware_signature() -> str:
     """Create signature for current JAX hardware environment.
 
@@ -450,8 +500,7 @@ def ejit(
             try:
                 if not _entry_too_large(filepath.stat().st_size, f"load of '{filepath}'"):
                     with open(filepath, "rb") as f:
-                        serialized, in_tree, out_tree = pickle.load(f)
-                    compiled_func = deserialize_and_load(serialized, in_tree, out_tree)
+                        compiled_func = _deserialize_compiled(pickle.load(f))
                     COMPILED_CACHE[compilation_key] = compiled_func
                     return compiled_func
             except Exception as e:
@@ -462,10 +511,10 @@ def ejit(
             compiled_func = lowered_func.compile()
 
             try:
-                serialized, in_tree, out_tree = serialize(compiled_func)
-                if not _entry_too_large(len(serialized), f"save for '{func.__name__}'"):
+                payload = _serialize_compiled(compiled_func)
+                if not _entry_too_large(len(payload[0]), f"save for '{func.__name__}'"):
                     func_dir.mkdir(parents=True, exist_ok=True)
-                    _atomic_pickle_dump((serialized, in_tree, out_tree), filepath)
+                    _atomic_pickle_dump(payload, filepath)
             except Exception:
                 pass
 
@@ -540,8 +589,7 @@ def load_cached_functions(verbose: bool = True) -> None:
                 if _entry_too_large(filepath.stat().st_size, f"pre-load of '{filepath}'", verbose=verbose):
                     continue
                 with open(filepath, "rb") as f:
-                    serialized, in_tree, out_tree = pickle.load(f)
-                compiled_func = deserialize_and_load(serialized, in_tree, out_tree)
+                    compiled_func = _deserialize_compiled(pickle.load(f))
                 COMPILED_CACHE[cache_key] = compiled_func
                 loaded_count += 1
             except Exception as e:
@@ -556,7 +604,8 @@ def save_compiled_fn(path: str | os.PathLike, fn: Compiled, prefix: str | None =
     """Save a compiled JAX function to disk for later reuse.
 
     Serializes a compiled function along with its input/output tree structures,
-    allowing it to be loaded and executed in future Python sessions.
+    compilation environment, and ordered global device assignment, allowing it
+    to be loaded and executed in compatible future Python sessions.
 
     Args:
         path: Directory path where the compiled function will be saved.
@@ -593,11 +642,11 @@ def save_compiled_fn(path: str | os.PathLike, fn: Compiled, prefix: str | None =
     path.mkdir(parents=True, exist_ok=True)
     prefix = prefix or ""
     filename = path / (prefix + "-" + COMPILED_FILE_NAME if prefix else COMPILED_FILE_NAME)
-    serialized, in_tree, out_tree = serialize(fn)
-    if _entry_too_large(len(serialized), f"save to '{filename}'"):
+    payload = _serialize_compiled(fn)
+    if _entry_too_large(len(payload[0]), f"save to '{filename}'"):
         return
     try:
-        _atomic_pickle_dump((serialized, in_tree, out_tree), filename)
+        _atomic_pickle_dump(payload, filename)
     except Exception as e:
         warnings.warn(f"Could not save compiled function to {filename}: {e}", stacklevel=2)
 
@@ -622,11 +671,15 @@ def load_compiled_fn(path: str | os.PathLike, prefix: str | None = None):
         FileNotFoundError: If the compiled function file doesn't exist at
             the resolved path.
         pickle.UnpicklingError: If the file is corrupt or incompatible.
+        ValueError: If the entry is oversized, lacks execution-device metadata,
+            or its environment/device assignment is incompatible. Legacy
+            three-field entries must be recompiled and saved again.
 
     Note:
-        Compiled functions are hardware- and XLA-version-specific.  Loading
-        a file produced on a different GPU model or JAX version will likely
-        raise an error inside ``deserialize_and_load``.
+        Compiled functions are hardware- and XLA-version-specific. The saved
+        environment and ordered device assignment are validated before native
+        deserialization; device IDs are not remapped to arbitrary substitutes.
+        Only load trusted files: pickle and native executables can execute code.
     """
     path = Path(path)
     prefix = prefix or ""
@@ -636,12 +689,8 @@ def load_compiled_fn(path: str | os.PathLike, prefix: str | None = None):
             f"Refusing to deserialize '{filename}': {filename.stat().st_size / 1e9:.2f} GB exceeds the "
             "safe protobuf parse ceiling (readers can crash natively on such entries)."
         )
-    serialized, in_tree, out_tree = pickle.load(open(filename, "rb"))
-    return deserialize_and_load(
-        serialized=serialized,
-        in_tree=in_tree,
-        out_tree=out_tree,
-    )
+    with open(filename, "rb") as f:
+        return _deserialize_compiled(pickle.load(f))
 
 
 def get_hash_of_lowering(lowered_func: Lowered) -> str:

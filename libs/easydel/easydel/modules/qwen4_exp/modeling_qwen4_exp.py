@@ -84,7 +84,6 @@ from easydel.infra.sharding import resolve_stage_mesh
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
 from easydel.layers import (
     BaseMoeModule,
-    BlockTopKIndexer,
     ColumnParallelLinear,
     ColumnParallelMoELinear,
     Embed,
@@ -102,8 +101,9 @@ from easydel.layers import (
     split_fused_gate_up_projection,
 )
 from easydel.layers.embeddings import NGramEmbed
+from easydel.layers.indexer import BlockTopKIndexer
+from easydel.layers.indexer._block_topk import apply_partial_rope
 from easydel.layers.norms import lowfloats
-from easydel.layers.sparse_attention import apply_partial_rope
 from easydel.modules._base import BaseCausalLMModule, BaseVisionLanguageModule
 from easydel.modules.qwen3_5.modeling_qwen3_5 import _get_rope_index_from_mm_token_types
 from easydel.modules.qwen3_next.modeling_qwen3_next import (
@@ -560,6 +560,9 @@ class Qwen4ExpAttention(Qwen3NextFullAttention):
             if config.qsa_enabled
             else None
         )
+        if self.indexer is not None:
+            # Row-parallel TPU top-k resolves its layout from the model mesh.
+            self.indexer.mesh_source = config
 
     def _paged_indexer_select(
         self,
@@ -597,12 +600,9 @@ class Qwen4ExpAttention(Qwen3NextFullAttention):
         tables = meta.pages_tables.reshape(meta.query_start_loc.shape[0] - 1, -1)
         blocks_per_page = page_size // ratio
         max_blocks = min(tables.shape[1] * blocks_per_page, num_pages * blocks_per_page)
-        member = jnp.arange(ratio, dtype=jnp.int32)
-        width = self.indexer.token_budget + ratio - 1
 
         def _select_all(_):
-            token = jnp.arange(width, dtype=jnp.int32)[None, :]
-            return jnp.where(token <= logical[:, None], token, -1)
+            return self.indexer.select_prefix(logical).indices
 
         def _rank_blocks(_):
             block = jnp.arange(max_blocks, dtype=jnp.int32)[None, :]
@@ -618,38 +618,8 @@ class Qwen4ExpAttention(Qwen3NextFullAttention):
             physical_keys = apply_partial_rope(physical_pooled[None], block_cos, block_sin)[0]
             q_cos, q_sin = self.rotary.compute_cos_sin(rows.transpose(1, 0)[:, :, None], dtype=jnp.float32)
             q_flat = apply_partial_rope(q.reshape(total, self.indexer.index_n_heads, -1), q_cos, q_sin)
-            q_score = q_flat.astype(jnp.float32)
-            k_score = physical_keys.astype(jnp.float32)
-
-            def _score_head(head, accum):
-                head_scores = jnp.einsum("td,pd->tp", q_score[:, head], k_score)
-                return accum + jax.nn.relu(head_scores)
-
-            physical_scores = jax.lax.fori_loop(
-                0,
-                self.indexer.index_n_heads,
-                _score_head,
-                jnp.zeros((total, physical_keys.shape[0]), dtype=jnp.float32),
-            )
             physical_block = phys_block_page * blocks_per_page + block_in_page
-            scores = jnp.take_along_axis(physical_scores, physical_block, axis=1)
-            scores = scores / np.sqrt(self.indexer.index_head_dim)
-            complete = (block * ratio + ratio - 1) <= logical[:, None]
-            scores = jnp.where(complete & valid[:, None], scores, -jnp.inf)
-            k_pick = min(self.indexer.block_topk, max_blocks)
-            top_scores, top_blocks = jax.lax.top_k(scores, k_pick)
-            picked = jnp.where(top_scores > -jnp.inf, top_blocks, -1)
-            selected_blocks = picked[..., None] * ratio + member
-            selected_blocks = jnp.where(picked[..., None] >= 0, selected_blocks, -1).reshape(total, -1)
-            tail_start = ((logical + 1) // ratio) * ratio
-            tail = tail_start[:, None] + jnp.arange(ratio - 1, dtype=jnp.int32)[None, :]
-            tail = jnp.where(tail <= logical[:, None], tail, -1)
-            selected = jnp.concatenate([selected_blocks, tail], axis=-1)
-            return jnp.pad(
-                selected,
-                ((0, 0), (0, max(0, width - selected.shape[-1]))),
-                constant_values=-1,
-            )[:, :width]
+            return self.indexer.select_paged(q_flat, physical_keys, physical_block, logical, valid).indices
 
         selected = jax.lax.cond(
             jnp.all((logical + 1 <= self.indexer.token_budget) | ~valid),

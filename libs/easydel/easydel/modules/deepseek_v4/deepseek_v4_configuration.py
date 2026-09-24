@@ -97,6 +97,9 @@ class DeepseekV4Config(EasyDeLBaseConfig):
         hc_sinkhorn_iters: Sinkhorn-Knopp iterations projecting the mHC
             combine matrix onto doubly-stochastic matrices.
         hc_eps: Numerical floor used throughout the mHC math.
+        hc_use_fused_coefficients: Opt into packed TPU mHC coefficients with
+            first-order reverse AD. Leave disabled when forward-mode or higher
+            derivatives are needed. Parameters are unchanged.
         mlp_layer_types: Per-layer MoE schedule from
             ``DEEPSEEK_V4_MLP_LAYER_TYPES``; defaults to 3x ``hash_moe`` then
             ``moe``.
@@ -183,6 +186,7 @@ class DeepseekV4Config(EasyDeLBaseConfig):
         hc_mult: int = 4,
         hc_sinkhorn_iters: int = 20,
         hc_eps: float = 1.0e-6,
+        hc_use_fused_coefficients: bool = False,
         mlp_layer_types: list[str] | None = None,
         swiglu_limit: float = 10.0,
         sliding_window: int = 128,
@@ -235,6 +239,7 @@ class DeepseekV4Config(EasyDeLBaseConfig):
         self.hc_mult = hc_mult
         self.hc_sinkhorn_iters = hc_sinkhorn_iters
         self.hc_eps = hc_eps
+        self.hc_use_fused_coefficients = hc_use_fused_coefficients
         self.swiglu_limit = swiglu_limit
         self.sliding_window = sliding_window
         self.o_groups = o_groups

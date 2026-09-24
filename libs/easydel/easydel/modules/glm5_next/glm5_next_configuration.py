@@ -166,6 +166,9 @@ class Glm5NextTextConfig(EasyDeLBaseConfig):
             Numerical floor used by mHC Sinkhorn normalisation.
         hc_sinkhorn_iters (`int`, *optional*, defaults to 20):
             Sinkhorn iterations used by mHC stream routing.
+        hc_use_fused_coefficients (`bool`, *optional*, defaults to ``False``):
+            Opt into packed TPU mHC coefficients with first-order reverse AD.
+            Leave disabled when forward-mode or higher derivatives are needed.
         output_router_logits (`bool`, *optional*, defaults to ``False``):
             Whether MoE layers should return router logits for aux losses.
         router_aux_loss_coef (`float`, *optional*, defaults to 0.001):
@@ -239,6 +242,7 @@ class Glm5NextTextConfig(EasyDeLBaseConfig):
         hc_mult: int = 4,
         hc_eps: float = 1e-6,
         hc_sinkhorn_iters: int = 20,
+        hc_use_fused_coefficients: bool = False,
         output_router_logits: bool = False,
         router_aux_loss_coef: float = 0.001,
         linear_attn_config: dict[str, typing.Any] | None = None,
@@ -330,6 +334,7 @@ class Glm5NextTextConfig(EasyDeLBaseConfig):
         self.hc_mult = hc_mult
         self.hc_eps = hc_eps
         self.hc_sinkhorn_iters = hc_sinkhorn_iters
+        self.hc_use_fused_coefficients = hc_use_fused_coefficients
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef
         self.rope_theta = rope_theta

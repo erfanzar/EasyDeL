@@ -207,7 +207,8 @@ class TestPaliGemma:
 
         small = {
             "dtype": jnp.float32,
-            "precision": None,
+            # Compare against Torch fp32 products, not TPU default bf16 products.
+            "precision": "highest",
             "sharding_axis_dims": (1, 1, 1, -1, 1, 1),
             "attn_mechanism": "vanilla",
             "blocksize_k": 64,

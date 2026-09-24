@@ -480,10 +480,29 @@ def dot_general_8bit_lhs_rhs(primitive: Primitive, lhs: ArrayType, rhs: ArrayTyp
         jax.Array: The result of the dot_general operation.
 
     Note:
-        The optimized path is triggered when: lhs is regular Array, rhs is Array8B.
-        This enables efficient inference without full weight dequantization.
+        The optimized path requires bf16 operands with lhs shape (..., M, K),
+        rhs shape (K, N), contraction over lhs's last and rhs's first axis,
+        and no batch axes. Precision must be unspecified and the preferred
+        output dtype must be unspecified or bf16 (as supplied by jnp.matmul).
+        Explicit output or quantized-array sharding requires materialization.
+        Other contracts, including positional precision/dtype overrides, are
+        forwarded unchanged to lax.dot_general after materialization.
     """
-    if isinstance(lhs, Array) and isinstance(rhs, Array8B):
+    dimension_numbers = kwargs.get("dimension_numbers", args[0] if args else None)
+    if (
+        isinstance(lhs, Array)
+        and isinstance(rhs, Array8B)
+        and lhs.dtype == jnp.bfloat16
+        and rhs.dtype == jnp.bfloat16
+        and lhs.ndim >= 2
+        and len(rhs.shape) == 2
+        and dimension_numbers == (((lhs.ndim - 1,), (0,)), ((), ()))
+        and len(args) <= 1
+        and kwargs.get("precision") is None
+        and kwargs.get("preferred_element_type") in (None, jnp.bfloat16)
+        and kwargs.get("out_sharding") is None
+        and rhs.sharding is None
+    ):
         return matmul_bf16_int8_weight_only(
             lhs_bf16=lhs,
             rhs_q_int8=rhs.weight,

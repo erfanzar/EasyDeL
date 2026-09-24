@@ -37,7 +37,7 @@ from dataclasses import dataclass
 import jax
 import numpy as np
 from jax import core
-from jax.extend.core import Jaxpr, JaxprEqn, Primitive, Var
+from jax.extend.core import Jaxpr, JaxprEqn, Primitive, Var, no_effects
 from jax.interpreters import ad, batching, mlir
 from jax.sharding import NamedSharding, PartitionSpec
 
@@ -919,7 +919,7 @@ def _prune_stage_jaxpr(sub: Jaxpr) -> Jaxpr:
     kept_rev: list[JaxprEqn] = []
     for eqn in reversed(sub.eqns):
         eqn_outvars = [v for v in eqn.outvars if isinstance(v, Var)]
-        effects = getattr(eqn, "effects", core.no_effects)
+        effects = getattr(eqn, "effects", no_effects)
         keep = bool(effects) or any(id(v) in needed for v in eqn_outvars)
         if not keep:
             continue
@@ -932,13 +932,9 @@ def _prune_stage_jaxpr(sub: Jaxpr) -> Jaxpr:
     pruned_invars = [v for v in sub.invars if not isinstance(v, Var) or id(v) in needed]
     if len(pruned_eqns) == len(sub.eqns) and len(pruned_invars) == len(sub.invars):
         return sub
-    return Jaxpr(
-        constvars=list(sub.constvars),
-        invars=pruned_invars,
-        outvars=list(sub.outvars),
-        eqns=pruned_eqns,
-        effects=sub.effects,
-    )
+    # Keep attached constants: in JAX 0.11, constvars without their values
+    # become ordinary invars. replace also works on JAX 0.10's open Jaxpr.
+    return sub.replace(invars=pruned_invars, eqns=pruned_eqns, debug_info=None)
 
 
 def _stage_region_spans(jaxpr: Jaxpr) -> tuple[tuple[int, int], ...]:
@@ -1232,7 +1228,7 @@ def _normalize_marker_flows(jaxpr: Jaxpr) -> Jaxpr:
             in_stages = [var_stage[id(v)] for v in eqn.invars if isinstance(v, Var) and id(v) in var_stage]
             s = max(in_stages) if in_stages else 0
             out_s = s
-            pure = not getattr(eqn, "effects", core.no_effects) and all(
+            pure = not getattr(eqn, "effects", no_effects) and all(
                 (not isinstance(v, Var)) or id(v) in const_derived_ids for v in eqn.invars
             )
             const_pure[i] = pure
@@ -1323,14 +1319,7 @@ def _normalize_marker_flows(jaxpr: Jaxpr) -> Jaxpr:
             len(marker_idxs) // max(1, len(set(stage_values))),
             n_markers_after,
         )
-    return Jaxpr(
-        constvars=list(jaxpr.constvars),
-        invars=list(jaxpr.invars),
-        outvars=list(jaxpr.outvars),
-        eqns=new_eqns,
-        effects=jaxpr.effects,
-        debug_info=jaxpr.debug_info,
-    )
+    return jaxpr.replace(eqns=new_eqns)
 
 
 def cluster_jaxpr_by_markers(
@@ -1438,11 +1427,7 @@ def cluster_jaxpr_by_markers(
             remat_cache[var_id] = False
             return False
         eqn = producer_by_var_id.get(var_id)
-        if (
-            eqn is None
-            or eqn_index_by_id[id(eqn)] in boundary_marker_positions
-            or getattr(eqn, "effects", core.no_effects)
-        ):
+        if eqn is None or eqn_index_by_id[id(eqn)] in boundary_marker_positions or getattr(eqn, "effects", no_effects):
             remat_cache[var_id] = False
             return False
         remat_cache[var_id] = False
@@ -1587,12 +1572,14 @@ def cluster_jaxpr_by_markers(
                 dedup_outvars.append(v)
                 seen.add(id(v))
 
-        sub = Jaxpr(
-            constvars=list(jaxpr.constvars),
+        # Inherit both constant variables and attached values (unified Jaxpr
+        # in JAX 0.11). Reconstructing from constvars alone loses that boundary.
+        sub = jaxpr.replace(
             invars=invars,
             outvars=dedup_outvars,
             eqns=eqns,
-            effects=core.no_effects,
+            effects=no_effects,
+            debug_info=None,
         )
         pruned = _prune_stage_jaxpr(sub)
         dropped_eqns_total += len(sub.eqns) - len(pruned.eqns)

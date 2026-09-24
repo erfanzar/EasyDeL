@@ -50,12 +50,13 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+from jax.extend.core import concrete_or_error
 
 
 def _infer_axis_size(axis_name: str) -> int | None:
     """Infer collective axis size from the active mapped context when available."""
     try:
-        return jax.core.concrete_or_error(
+        return concrete_or_error(
             int,
             lax.psum(jnp.array(1, dtype=jnp.int32), axis_name=axis_name),
             f"collective axis '{axis_name}' size must be static.",
@@ -81,7 +82,7 @@ def _all_peer_barrier(my_id, tp_size: int):
             barrier_sem,
             inc=1,
             device_id=(peer,),
-            device_id_type=pltpu.DeviceIdType.MESH,
+            device_id_type=pl.DeviceIdType.MESH,
         )
     pl.semaphore_wait(barrier_sem, tp_size - 1)
 
@@ -93,7 +94,7 @@ def _all_peer_barrier(my_id, tp_size: int):
                 second_barrier,
                 inc=1,
                 device_id=(peer,),
-                device_id_type=pltpu.DeviceIdType.MESH,
+                device_id_type=pl.DeviceIdType.MESH,
             )
         pl.semaphore_wait(second_barrier, tp_size - 1)
 
@@ -149,7 +150,7 @@ def _one_shot_reduce_scatter_kernel(
             send_sem=send_sems.at[offset - 1],
             recv_sem=recv_sems.at[offset - 1],
             device_id=(peer,),
-            device_id_type=pltpu.DeviceIdType.MESH,
+            device_id_type=pl.DeviceIdType.MESH,
         )
 
     for offset in range(1, tp_size):

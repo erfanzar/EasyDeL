@@ -495,13 +495,15 @@ def _filtered_cluster(cluster: Jaxpr, used_constvars: list[Var]) -> Jaxpr:
     Returns:
         Return a copy of ``cluster`` whose ``constvars`` are restricted to ``used_constvars``.
     """
-    return Jaxpr(
-        constvars=used_constvars,
-        invars=list(cluster.invars),
-        outvars=list(cluster.outvars),
-        eqns=list(cluster.eqns),
-        effects=cluster.effects,
-    )
+    # JAX 0.11 stores the const/invar boundary via attached constant values;
+    # replacing constvars alone clears those values and promotes them to inputs.
+    # Keep the selected values in first-use order, without copying their buffers
+    # or sharding. JAX 0.10's open Jaxpr has no consts attribute/replace keyword.
+    const_kwargs = {}
+    if hasattr(cluster, "consts"):
+        const_by_id = {id(v): c for v, c in zip(cluster.constvars, cluster.consts, strict=True)}
+        const_kwargs["consts"] = [const_by_id[id(v)] for v in used_constvars]
+    return cluster.replace(constvars=used_constvars, **const_kwargs)
 
 
 def _place_cluster_consts(
@@ -621,7 +623,9 @@ def _collect_mesh_fingerprints(value: object, out: list[tuple[object, ...]]) -> 
         value: Value consumed by the helper.
         out: Output value from an earlier call or transform.
     """
-    if isinstance(value, ClosedJaxpr):
+    # JAX 0.11 aliases ClosedJaxpr to Jaxpr, whose legacy .jaxpr is itself.
+    # Only unwrap a distinct wrapper (JAX 0.10); otherwise visit its equations.
+    if isinstance(value, ClosedJaxpr) and value.jaxpr is not value:
         _collect_mesh_fingerprints(value.jaxpr, out)
         return
     if isinstance(value, Jaxpr):

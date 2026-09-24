@@ -41,7 +41,7 @@ if not jax.config.jax_platforms:
 ATOL = 2e-3
 
 
-def _build(layer_types):
+def _build(layer_types, *, precision=None):
     import spectrax as spx
     from easydel.modules.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
     from easydel.modules.qwen3_5.qwen3_5_configuration import Qwen3_5TextConfig
@@ -61,7 +61,9 @@ def _build(layer_types):
         partial_rotary_factor=0.25,
         scan_layers=False,
     )
-    return Qwen3_5ForCausalLM(config=config, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
+    return Qwen3_5ForCausalLM(
+        config=config, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32, precision=precision
+    )
 
 
 def _logits(model, ids):
@@ -92,7 +94,9 @@ def _packed_logits(model, packed, seg):
 )
 def test_packed_equals_unpacked(layer_types):
     """Packed [docA, docB] per-token logits must equal the unpacked per-doc logits."""
-    model = _build(layer_types)
+    # Compare document isolation, not shape-dependent reduced-precision TPU products.
+    # Float32 storage alone does not request full-precision attention contractions.
+    model = _build(layer_types, precision=jax.lax.Precision.HIGHEST)
 
     doc_a = np.array([[5, 9, 2, 7, 1]], dtype="int32")  # len 5
     doc_b = np.array([[3, 8, 4]], dtype="int32")  # len 3

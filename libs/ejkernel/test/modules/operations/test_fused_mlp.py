@@ -232,11 +232,18 @@ class TestPublicWrapperDispatch:
 class TestShardedRouting:
     """Sharding-aware dense routing: plan policy + sharded-path numerics."""
 
-    def _mesh(self, shape):
+    def _mesh(self):
+        """Keep row and TP axes nontrivial on both four- and eight-device hosts."""
         import numpy as _np
         from jax.sharding import Mesh
 
-        devs = _np.array(jax.devices()[: shape[0] * shape[1]]).reshape(shape)
+        devices = jax.devices()
+        if len(devices) < 4:
+            pytest.skip("Sharded routing requires at least four devices for nontrivial row and TP axes")
+        # Use (4, 2) on eight devices; (2, 2) still exercises every routing,
+        # collective, and layout contract.
+        shape = (4, 2) if len(devices) >= 8 else (2, 2)
+        devs = _np.array(devices[: shape[0] * shape[1]]).reshape(shape)
         return Mesh(devs, ("fsdp", "tp"))
 
     def _resolve(self, monkeypatch, x, wf, wd, mesh, specs, **kw):
@@ -248,7 +255,7 @@ class TestShardedRouting:
     def test_rows_accepted(self, monkeypatch):
         from jax.sharding import PartitionSpec as P
 
-        mesh = self._mesh((4, 2))
+        mesh = self._mesh()
         x = jnp.zeros((4096, 256), jnp.bfloat16)
         wf = jnp.zeros((256, 1024), jnp.bfloat16)
         wd = jnp.zeros((512, 256), jnp.bfloat16)
@@ -268,7 +275,7 @@ class TestShardedRouting:
         """tp measured a tie/loss at 4B — resolver rejects (never-slower)."""
         from jax.sharding import PartitionSpec as P
 
-        mesh = self._mesh((4, 2))
+        mesh = self._mesh()
         x = jnp.zeros((4096, 256), jnp.bfloat16)
         wf = jnp.zeros((256, 1024), jnp.bfloat16)
         wd = jnp.zeros((512, 256), jnp.bfloat16)
@@ -288,7 +295,7 @@ class TestShardedRouting:
         """Global-concat [gate|up] sharded on I is locally garbage — reject."""
         from jax.sharding import PartitionSpec as P
 
-        mesh = self._mesh((4, 2))
+        mesh = self._mesh()
         x = jnp.zeros((4096, 256), jnp.bfloat16)
         wf = jnp.zeros((256, 1024), jnp.bfloat16)
         wd = jnp.zeros((512, 256), jnp.bfloat16)
@@ -299,7 +306,7 @@ class TestShardedRouting:
         """fsdp storage sharding on K must fall back to the XLA composition."""
         from jax.sharding import PartitionSpec as P
 
-        mesh = self._mesh((4, 2))
+        mesh = self._mesh()
         x = jnp.zeros((4096, 256), jnp.bfloat16)
         wf = jnp.zeros((256, 1024), jnp.bfloat16)
         wd = jnp.zeros((512, 256), jnp.bfloat16)
@@ -310,7 +317,7 @@ class TestShardedRouting:
         """Sub-prefill row counts stay on the XLA composition (decode roofline)."""
         from jax.sharding import PartitionSpec as P
 
-        mesh = self._mesh((4, 2))
+        mesh = self._mesh()
         x = jnp.zeros((64, 256), jnp.bfloat16)
         wf = jnp.zeros((256, 1024), jnp.bfloat16)
         wd = jnp.zeros((512, 256), jnp.bfloat16)
@@ -323,7 +330,7 @@ class TestShardedRouting:
         from jax.sharding import NamedSharding
         from jax.sharding import PartitionSpec as P
 
-        mesh = self._mesh((4, 2))
+        mesh = self._mesh()
         rng = np.random.default_rng(0)
         m, k, i, tp = 512, 128, 256, 2
         seg = i // tp
@@ -382,7 +389,7 @@ class TestShardedRouting:
         from jax.sharding import NamedSharding
         from jax.sharding import PartitionSpec as P
 
-        mesh = self._mesh((4, 2))
+        mesh = self._mesh()
         rng = np.random.default_rng(1)
         m, k, i = 512, 128, 256
         x = jax.device_put(jnp.asarray(rng.normal(size=(m, k)), jnp.bfloat16), NamedSharding(mesh, P("fsdp", None)))

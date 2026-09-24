@@ -540,7 +540,7 @@ def _operate(
     x,
     w,
     scales,
-    biases,
+    zeros,
     transpose,
     group_size,
     bits,
@@ -565,8 +565,9 @@ def _operate(
         x: Activation matrix ``[M, K]``.
         w: Packed uint32 weights.
         scales: Per-group scale parameters.
-        biases: Per-group affine additive biases (``-zero * scale``), or
-            ``None`` for non-affine modes.
+        zeros: Canonical per-group affine zero-points, or ``None`` for
+            non-affine modes. The blocked path converts them to additive
+            biases; the dense fallback decodes them directly.
         transpose: ``True`` → NxK weight layout; ``False`` → KxN.
         group_size: Elements per quantization group.
         bits: Bit-width per quantized element.
@@ -590,6 +591,10 @@ def _operate(
     can_fuse = can_fuse and block_m > 0 and block_n > 0 and block_k > 0
 
     if can_fuse:
+        biases = None
+        if mode == "affine":
+            safe_scale = jnp.where(scales == 0, jnp.ones_like(scales), scales)
+            biases = -zeros * safe_scale
         try:
             return _blocked_quantized_matmul(
                 x,
@@ -618,12 +623,8 @@ def _operate(
             "dense dequantize+matmul fallback is disabled (allow_dense_fallback=False)."
         )
 
-    zeros = None
-    if mode == "affine":
-        if biases is None:
-            raise ValueError("affine fallback dequantization requires affine metadata.")
-        safe_scale = jnp.where(scales == 0, jnp.ones_like(scales), scales)
-        zeros = -biases / safe_scale
+    # A zero -> additive-bias -> zero round-trip is lossy for reduced-precision
+    # metadata (notably bf16). Dense fallback must decode the stored zeros.
     w_f = dequantize(w, scales, zeros, group_size=group_size, bits=bits, mode=mode)
     return x @ w_f.T if transpose else x @ w_f
 
@@ -675,7 +676,8 @@ def quantized_matmul(
             - ``nvfp4``/``nvfp8``: ``uint8`` E4M3 per-group scales.
         zeros: Per-group affine zero-points (canonical ``(q - zero) * scale``
             form).  Must match ``scales`` shape.  ``None`` for non-affine modes.
-            Internally converted to additive bias ``-zero * scale``.
+            Converted to additive bias ``-zero * scale`` only for blocked
+            execution; dense fallback uses the original zero-points.
         transpose: If ``True``, weights are in NxK layout (compute ``x @ w.T``).
             If ``False``, weights are in KxN layout (compute ``x @ w``).
         group_size: Quantization group size.  Mode defaults:
@@ -724,18 +726,14 @@ def quantized_matmul(
     if mode == "affine":
         if zeros is None:
             raise ValueError("affine quantized_matmul requires `zeros`.")
-        safe_scale = jnp.where(scales == 0, jnp.ones_like(scales), scales)
-        affine_biases = -zeros * safe_scale
-    else:
-        if zeros is not None:
-            raise ValueError("zeros must be None for non-affine modes.")
-        affine_biases = None
+    elif zeros is not None:
+        raise ValueError("zeros must be None for non-affine modes.")
 
     return _operate(
         x,
         w,
         scales,
-        affine_biases,
+        zeros,
         transpose=transpose,
         group_size=group_size,
         bits=bits,

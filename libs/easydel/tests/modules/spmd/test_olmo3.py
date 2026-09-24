@@ -40,8 +40,26 @@ class TestOLMo3:
             max_position_embeddings=small_model_config["max_position_embeddings"],
         )
 
-    def test_causal_lm(self, olmo3_config, small_model_config):
-        """Test Olmo3ForCausalLM."""
+    @pytest.mark.parametrize(
+        "rope_parameters",
+        [
+            None,
+            {
+                "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
+                "full_attention": {"rope_type": "linear", "rope_theta": 500000.0, "factor": 2.0},
+            },
+        ],
+        ids=["shared_rope", "per_type_rope"],
+    )
+    def test_causal_lm(self, olmo3_config, small_model_config, rope_parameters):
+        """Test Olmo3ForCausalLM, including distinct local/global RoPE math."""
+        if rope_parameters is not None:
+            # The small model may have fewer than four layers; exercise both
+            # attention types rather than leaving the global settings unused.
+            olmo3_config.layer_types = [
+                "sliding_attention" if i % 2 == 0 else "full_attention" for i in range(olmo3_config.num_hidden_layers)
+            ]
+            olmo3_config.rope_parameters = rope_parameters
         tester = CausalLMTester()
         result = tester.run(
             module_name="olmo3",

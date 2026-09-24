@@ -10,7 +10,8 @@ from jax.experimental.pallas import tpu
 
 
 def ragged_operand_dtypes(value):
-    if hasattr(value, "jaxpr"):
+    # JAX 0.11 unifies ClosedJaxpr/Jaxpr: the compatibility property can be self.
+    if hasattr(value, "jaxpr") and value.jaxpr is not value:
         yield from ragged_operand_dtypes(value.jaxpr)
     elif hasattr(value, "eqns"):
         for eqn in value.eqns:

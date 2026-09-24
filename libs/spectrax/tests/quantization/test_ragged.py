@@ -103,13 +103,23 @@ def test_unquantized_gradients_are_bit_exact():
 def test_forward_matches_dequantize_then_contract(rule):
     """The quantized forward must equal contracting the reconstructed operands."""
     lhs, rhs, group_sizes = _operands()
-    actual = qragged_dot(lhs, rhs, group_sizes, rule=rule)
+    # Float DEFAULT on TPU can truncate multiplicands; integer accumulation
+    # does not. State precision on both paths when checking the algebra.
+    actual = qragged_dot(lhs, rhs, group_sizes, rule=rule, precision=jax.lax.Precision.HIGHEST)
     lhs_ref, rhs_ref = _quantized_operands(lhs, rhs, rule)
-    reference = jax.lax.ragged_dot(lhs_ref, rhs_ref, group_sizes)
+    reference = jax.lax.ragged_dot(lhs_ref, rhs_ref, group_sizes, precision=jax.lax.Precision.HIGHEST)
+    assert actual.dtype == reference.dtype == jnp.float32
     np.testing.assert_allclose(np.asarray(actual), np.asarray(reference), rtol=2e-2, atol=2e-2)
 
 
-@pytest.mark.parametrize("rule", [QuantRule(weight_qtype="int8"), QuantRule(weight_qtype="int8", act_qtype="int8")])
+@pytest.mark.parametrize(
+    "rule",
+    [
+        QuantRule(weight_qtype="int8"),
+        QuantRule(weight_qtype="int8", act_qtype="int8"),
+        QuantRule(weight_qtype="int4", act_qtype="int8"),
+    ],
+)
 def test_backward_matches_float_vjp_on_quantized_residuals(rule):
     """Both gradients equal the float VJP of the reconstructed operands.
 
@@ -120,8 +130,12 @@ def test_backward_matches_float_vjp_on_quantized_residuals(rule):
     lhs, rhs, group_sizes = _operands()
     lhs_ref, rhs_ref = _quantized_operands(lhs, rhs, rule)
 
-    _, reference_vjp = jax.vjp(lambda a, b: jax.lax.ragged_dot(a, b, group_sizes), lhs_ref, rhs_ref)
-    _, actual_vjp = jax.vjp(lambda a, b: qragged_dot(a, b, group_sizes, rule=rule), lhs, rhs)
+    _, reference_vjp = jax.vjp(
+        lambda a, b: jax.lax.ragged_dot(a, b, group_sizes, precision=jax.lax.Precision.HIGHEST), lhs_ref, rhs_ref
+    )
+    _, actual_vjp = jax.vjp(
+        lambda a, b: qragged_dot(a, b, group_sizes, rule=rule, precision=jax.lax.Precision.HIGHEST), lhs, rhs
+    )
 
     cotangent = jax.random.normal(jax.random.key(9), (_ROWS, _N), jnp.float32)
     for reference, actual in zip(reference_vjp(cotangent), actual_vjp(cotangent), strict=True):
@@ -167,14 +181,52 @@ def test_a_shared_scale_would_destroy_the_quiet_expert():
     assert float(jnp.abs(per_expert[0]).max()) > 0.0
 
 
-def test_padding_rows_stay_zero():
-    """Rows past the last group belong to no expert and must not be scaled into life."""
+@pytest.mark.parametrize(
+    "rule",
+    [
+        QuantRule(weight_qtype="int8"),
+        QuantRule(weight_qtype="int8", act_qtype="int8"),
+        QuantRule(weight_qtype="int4", act_qtype="int8"),
+    ],
+)
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("sizes", [(4, 4), (0, 8)])
+def test_padding_rows_stay_zero(rule, compiled, sizes):
+    """Both execution paths initialize padding, including the activation VJP."""
     lhs, rhs, _ = _operands(rows=16, k=32, n=8, groups=2)
-    group_sizes = jnp.array([4, 4], dtype=jnp.int32)  # only 8 of 16 rows are routed
-    out = qragged_dot(lhs, rhs, group_sizes, rule=QuantRule(weight_qtype="int8", act_qtype="int8"))
-    reference = jax.lax.ragged_dot(lhs, rhs, group_sizes)
-    assert bool(jnp.all(out[8:] == 0)), "padding rows became non-zero"
-    assert bool(jnp.all(reference[8:] == 0))
+    # Avoid division-sensitive negative absmax ties in eager/jit comparisons.
+    lhs, rhs = jnp.abs(lhs), jnp.abs(rhs)
+    group_sizes = jnp.array(sizes, dtype=jnp.int32)
+
+    def run(a, b):
+        return qragged_dot(a, b, group_sizes, rule=rule, precision=jax.lax.Precision.HIGHEST)
+
+    if compiled:
+        run = jax.jit(run)
+    out, vjp = jax.vjp(run, lhs, rhs)
+    cotangent = jnp.ones_like(out)
+    dlhs, drhs = vjp(cotangent)
+    lhs_ref, rhs_ref = (np.asarray(x) for x in _quantized_operands(lhs, rhs, rule))
+    expected = np.zeros(out.shape, dtype=np.float32)
+    expected_dlhs = np.zeros(lhs.shape, dtype=np.float32)
+    expected_drhs = np.zeros(rhs.shape, dtype=np.float32)
+    start = 0
+    for expert, size in enumerate(sizes):
+        end = start + size
+        expected[start:end] = lhs_ref[start:end] @ rhs_ref[expert]
+        expected_dlhs[start:end] = np.ones((size, out.shape[1]), np.float32) @ rhs_ref[expert].T
+        expected_drhs[expert] = lhs_ref[start:end].T @ np.ones((size, out.shape[1]), np.float32)
+        start = end
+    np.testing.assert_allclose(np.asarray(out), expected, rtol=2e-2, atol=2e-2)
+    np.testing.assert_allclose(np.asarray(dlhs), expected_dlhs, rtol=2e-2, atol=2e-2)
+    np.testing.assert_allclose(np.asarray(drhs), expected_drhs, rtol=2e-2, atol=2e-2)
+    np.testing.assert_array_equal(np.asarray(out[start:]), np.zeros_like(expected[start:]))
+    np.testing.assert_array_equal(np.asarray(dlhs[start:]), np.zeros_like(expected_dlhs[start:]))
+
+    # A loss on padding alone has no dependence on either operand.
+    padding_cotangent = jnp.zeros_like(out).at[start:].set(1)
+    for grad in vjp(padding_cotangent):
+        np.testing.assert_array_equal(np.asarray(grad), np.zeros(grad.shape, np.float32))
 
 
 def test_uneven_group_sizes():
@@ -182,9 +234,11 @@ def test_uneven_group_sizes():
     lhs, rhs, _ = _operands(rows=16, k=32, n=8, groups=4)
     group_sizes = jnp.array([1, 7, 0, 8], dtype=jnp.int32)
     rule = QuantRule(weight_qtype="int8", act_qtype="int8")
-    actual = qragged_dot(lhs, rhs, group_sizes, rule=rule)
+    # Float DEFAULT on TPU can truncate multiplicands; integer accumulation
+    # does not. State precision on both paths when checking the algebra.
+    actual = qragged_dot(lhs, rhs, group_sizes, rule=rule, precision=jax.lax.Precision.HIGHEST)
     lhs_ref, rhs_ref = _quantized_operands(lhs, rhs, rule)
-    reference = jax.lax.ragged_dot(lhs_ref, rhs_ref, group_sizes)
+    reference = jax.lax.ragged_dot(lhs_ref, rhs_ref, group_sizes, precision=jax.lax.Precision.HIGHEST)
     np.testing.assert_allclose(np.asarray(actual), np.asarray(reference), rtol=3e-2, atol=3e-2)
 
 

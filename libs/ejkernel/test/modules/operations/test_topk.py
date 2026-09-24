@@ -27,6 +27,7 @@ import numpy as np
 import pytest
 from ejkernel.kernels._registry import Backend, Platform, kernel_registry
 from ejkernel.modules import topk
+from ejkernel.modules.operations.configs import TopKConfig
 
 
 def _rand(shape, seed=0, dtype=jnp.float32):
@@ -155,31 +156,96 @@ def test_gradient_matches_lax_top_k():
     assert np.array_equal((np.asarray(g_ours) != 0).sum(-1), np.full(3, 4))
 
 
-@pytest.mark.skipif(jax.default_backend() != "tpu", reason="pallas top-k path is TPU-only")
+_PALLAS = TopKConfig(platform="pallas", backend="tpu")
+_tpu_only = pytest.mark.skipif(jax.default_backend() != "tpu", reason="pallas top-k path is TPU-only")
+
+
+def _special_rows(shape, seed):
+    """Heavy ties, signed zeros, infinities and both NaN signs, at random spots."""
+    rng = np.random.default_rng(seed)
+    x = rng.integers(-3, 4, size=shape).astype(np.float32)
+    for value, frac in ((np.inf, 0.05), (-np.inf, 0.2), (np.nan, 0.03), (0.0, 0.1), (-0.0, 0.1)):
+        x[rng.random(shape) < frac] = value
+    bits = x.view(np.int32)
+    negative_nan = rng.random(shape) < 0.02
+    bits[negative_nan] = np.int32(-4194304)  # 0xFFC00000: a NaN with the sign bit set
+    return jnp.asarray(x)
+
+
+@_tpu_only
+@pytest.mark.parametrize(
+    ("name", "shape", "k"),
+    [
+        ("normal", (256, 16384), 2048),
+        ("normal-small-k", (256, 4096), 32),
+        ("specials", (64, 1024), 300),
+        ("specials-wide", (64, 4096), 1500),  # k > 1024: bounded output merge
+        ("ties-wide", (64, 4096), 1500),
+        ("all-equal", (16, 512), 77),
+        ("unaligned", (13, 1000), 999),
+        ("k=1", (8, 128), 1),
+        ("k=width", (8, 256), 256),
+        ("leading-dims", (2, 3, 7, 640), 200),
+    ],
+)
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+def test_pallas_threshold_path_is_bit_identical_to_lax(name, shape, k, dtype):
+    """Forced Pallas path: same values bits and same indices as ``lax.top_k``."""
+    if name.startswith("ties"):
+        x = jnp.asarray(np.random.default_rng(k).integers(0, 6, size=shape).astype(np.float32)).astype(dtype)
+    elif name.startswith("specials") or name == "all-equal":
+        x = _special_rows(shape, seed=k) if name.startswith("specials") else jnp.zeros(shape, jnp.float32)
+        x = x.astype(dtype)
+    else:
+        x = _rand(shape, seed=k, dtype=dtype)
+    values, indices = topk(x, k=k, cfg=_PALLAS)
+    ref_values, ref_indices = jax.jit(lambda a: jax.lax.top_k(a, k))(x)
+    assert values.dtype == ref_values.dtype
+    assert np.array_equal(np.asarray(indices), np.asarray(ref_indices))
+    got = np.asarray(values.astype(jnp.float32))
+    want = np.asarray(ref_values.astype(jnp.float32))
+    assert np.array_equal(np.isnan(got), np.isnan(want))
+    assert np.array_equal(
+        np.where(np.isnan(got), 0, got).view(np.int32), np.where(np.isnan(want), 0, want).view(np.int32)
+    )
+
+
+@_tpu_only
 def test_pallas_gradient_matches_lax_top_k():
-    """Same, forced through the Pallas superset path on a wide axis."""
+    """Value cotangents land on exactly the positions ``lax.top_k`` sends them to."""
+    weights = jnp.linspace(-1.0, 2.0, 64)
 
     def ours(a):
-        v, _ = topk(a, k=8)
-        return (v**2).sum()
+        v, _ = topk(a, k=64, cfg=_PALLAS)
+        return (v * weights).sum()
 
     def ref(a):
-        v, _ = jax.lax.top_k(a, 8)
-        return (v**2).sum()
+        v, _ = jax.lax.top_k(a, 64)
+        return (v * weights).sum()
 
-    x = _rand((4, 8192), seed=13)
-    assert np.allclose(np.asarray(jax.grad(ours)(x)), np.asarray(jax.grad(ref)(x)), atol=0, rtol=0)
+    x = _rand((256, 2048), seed=13)
+    assert np.array_equal(np.asarray(jax.jit(jax.grad(ours))(x)), np.asarray(jax.jit(jax.grad(ref))(x)))
 
 
-@pytest.mark.skipif(jax.default_backend() != "tpu", reason="pallas top-k path is TPU-only")
-@pytest.mark.parametrize("k", [1, 8, 32])
-def test_pallas_values_match_lax_on_wide_axis(k):
-    """The Pallas superset must be exact, not approximate, at every k it takes."""
-    x = _rand((8, 16384), seed=k)
-    v, i = topk(x, k=k)
-    rv, ri = jax.lax.top_k(x, k)
-    assert np.array_equal(np.asarray(v), np.asarray(rv))
-    assert np.array_equal(np.asarray(i), np.asarray(ri))
+@_tpu_only
+@pytest.mark.parametrize(
+    ("shape", "k", "platform"),
+    [
+        ((8192, 16384), 2048, "pallas"),  # DSA indexer
+        ((1024, 2048), 256, "pallas"),
+        ((16384, 128), 8, "xla"),  # MoE router: narrow, tiny k
+        ((8, 131072), 50, "xla"),  # sampling: few rows
+        ((8192, 16384), 8, "xla"),  # tiny k
+        ((8192, 512), 128, "xla"),  # 512 candidates: below the Pallas width floor
+    ],
+)
+def test_heuristic_routes_by_measured_regime(shape, k, platform):
+    from ejkernel.modules.operations.topk import TopK
+    from ejkernel.ops import Invocation
+
+    operand = jax.ShapeDtypeStruct(shape, jnp.float32)
+    inv = Invocation(op_id="topk", args=(operand, k), kwargs={"mode": "values", "axis": -1})
+    assert TopK().heuristic_cfg(inv).platform == platform
 
 
 if __name__ == "__main__":

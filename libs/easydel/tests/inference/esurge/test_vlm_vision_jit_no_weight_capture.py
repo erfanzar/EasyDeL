@@ -37,7 +37,7 @@ from jax import numpy as jnp
 _HIDDEN = 64
 
 
-def make_tiny_vlm() -> ed.Qwen3_5ForConditionalGeneration:
+def make_tiny_vlm(*, precision=None) -> ed.Qwen3_5ForConditionalGeneration:
     text_config = ed.Qwen3_5TextConfig(
         vocab_size=256,
         hidden_size=_HIDDEN,
@@ -72,7 +72,7 @@ def make_tiny_vlm() -> ed.Qwen3_5ForConditionalGeneration:
         image_token_id=255,
     )
     return ed.Qwen3_5ForConditionalGeneration(
-        config=config, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32
+        config=config, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32, precision=precision
     )
 
 
@@ -95,7 +95,9 @@ def _helper_stub(model) -> types.SimpleNamespace:
 
 
 def test_image_features_jit_matches_eager():
-    model = make_tiny_vlm()
+    # Compare full-fp32 products: TPU DEFAULT may round differently when
+    # projections are fused into one JIT versus dispatched eagerly.
+    model = make_tiny_vlm(precision=jax.lax.Precision.HIGHEST)
     stub = _helper_stub(model)
     fn = VlmPrefillHelper.get_image_features_jit(stub)
     pixels, grid_thw, max_grid = _pixels_and_grid(model)

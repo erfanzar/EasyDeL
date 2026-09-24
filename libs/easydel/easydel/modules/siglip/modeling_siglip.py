@@ -210,6 +210,7 @@ class SiglipVisionEmbeddings(EasyDeLLayerStackMixin, spx.Module):
             stride=self.patch_size,
             padding="VALID",
             dtype=dtype,
+            precision=precision,
             rngs=rngs,
         )
 
@@ -470,6 +471,7 @@ class SiglipAttention(AttentionModule):
             mode=common_types.MODE_TRAIN,
             mask_info=mask_info,
             causal=self.causal,
+            precision=self.precision,
         )
 
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))

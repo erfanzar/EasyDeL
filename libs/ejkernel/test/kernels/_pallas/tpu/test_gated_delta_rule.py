@@ -612,11 +612,15 @@ def test_segmented_gdr_ignores_high_t_padding_tail():
     """Verify a long padding tail (negative segment ids) emits no output and does not corrupt the state.
 
     Builds a 16,384-step sequence with only the first ``valid_len=128`` steps marked as a real segment
-    (id 0) and the rest marked as padding (id ``-1``) via ``seg_ids``. Runs the Pallas kernel over the full
-    padded sequence and the XLA kernel over just the valid prefix, then asserts: the Pallas outputs over the
-    valid prefix match the prefix reference (atol ``1e-5``); the Pallas outputs over the padding tail are
-    exactly zero; and the final recurrent states agree (atol ``1e-5``), confirming the padding tail is
-    fully ignored.
+    (id 0) and the rest marked as padding (id ``-1``) via ``seg_ids``. Runs the Pallas kernel over both the
+    full padded sequence and just the valid prefix, then asserts: the valid outputs are unchanged (atol
+    ``1e-5``); the outputs over the padding tail are exactly zero; and the final recurrent states agree
+    (atol ``1e-5``), confirming the padding tail is fully ignored.
+
+    This is a padding-invariance test, not cross-backend numerical parity: Pallas uses DEFAULT MXU dot
+    precision while XLA explicitly uses HIGHEST, so a tight comparison between those backends would
+    conflate padding corruption with expected dot-rounding differences. Independent XLA parity is
+    covered by ``test_pallas_chunked_matches_xla_recurrent`` and ``test_pallas_realistic_dims_matches_xla``.
     """
     batch, seq_len, valid_len, heads, qk_dim, v_dim = 1, 16_384, 128, 1, 8, 8
     q, k, v, beta, decay = _make_inputs(
@@ -638,7 +642,7 @@ def test_segmented_gdr_ignores_high_t_padding_tail():
     prefix_seg_ids = jnp.zeros((batch, valid_len), dtype=jnp.int32)
 
     out_full, state_full = gated_delta_rule_pallas(q, k, v, beta, decay, chunk_size=256, seg_ids=seg_ids)
-    out_prefix, state_prefix = gated_delta_rule_xla(
+    out_prefix, state_prefix = gated_delta_rule_pallas(
         q[:, :valid_len],
         k[:, :valid_len],
         v[:, :valid_len],

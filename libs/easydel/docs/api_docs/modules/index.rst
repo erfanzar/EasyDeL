@@ -36,6 +36,7 @@ easydel.modules package
    glm4_moe_lite/index
    glm4v/index
    glm4v_moe/index
+   glm5_next/index
    glm_moe_dsa/index
    gpt2/index
    gpt_j/index
@@ -82,6 +83,7 @@ easydel.modules package
    qwen3_omni_moe/index
    qwen3_vl/index
    qwen3_vl_moe/index
+   qwen4_exp/index
    roberta/index
    rwkv/index
    seed_oss/index

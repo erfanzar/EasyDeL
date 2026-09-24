@@ -6,7 +6,7 @@ import sys
 sys.path.insert(0, os.path.abspath(".."))
 
 project = "SpectraX"
-copyright = "2026, Erfan Zare Chavoshi - SpectraX"
+copyright = "2026, Erfan Zare Chavoshi - SpectraX"  # noqa: A001
 author = "Erfan Zare Chavoshi"
 
 extensions = [

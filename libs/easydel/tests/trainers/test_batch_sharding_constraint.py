@@ -28,11 +28,13 @@ import pytest
 from easydel.trainers.training_utils import constrain_batch_sharding
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
-pytestmark = pytest.mark.skipif(len(jax.devices()) < 8, reason="needs 8 (fake) devices")
+pytestmark = pytest.mark.skipif(len(jax.devices()) < 4, reason="needs at least 4 devices for dp2 x fsdp2")
 
 
 def _mesh() -> Mesh:
-    devices = np.asarray(jax.devices()[:8]).reshape(1, 2, 2, 1, 2, 1)
+    # TP is unused by the batch specs; keep dp*fsdp=4 on either topology.
+    tp = 2 if len(jax.devices()) >= 8 else 1
+    devices = np.asarray(jax.devices()[: 4 * tp]).reshape(1, 2, 2, 1, tp, 1)
     return Mesh(devices, axis_names=("pp", "dp", "fsdp", "ep", "tp", "sp"))
 
 

@@ -121,9 +121,7 @@ class IndexerConfig:
             if self.kpool_size < 1:
                 raise ValueError(f"kpool_size must be >= 1 for pool indexers, got {self.kpool_size}.")
             if self.index_topk % self.kpool_size:
-                raise ValueError(
-                    f"index_topk ({self.index_topk}) must be divisible by kpool_size ({self.kpool_size})."
-                )
+                raise ValueError(f"index_topk ({self.index_topk}) must be divisible by kpool_size ({self.kpool_size}).")
             # Without the tail pool, queries seeing fewer than kpool visible
             # tokens (the first kpool-1 rows of every prefill, and all rows
             # when kv < kpool) select nothing -> all-masked attention.
@@ -135,14 +133,10 @@ class IndexerConfig:
             # Pooling reads the gate/valid channels of the packed state; a
             # keys-only or stateless layout structurally cannot pool.
             if self.packed_state != "key_gate_valid":
-                raise ValueError(
-                    f"kind='pool' requires packed_state='key_gate_valid', got {self.packed_state!r}."
-                )
+                raise ValueError(f"kind='pool' requires packed_state='key_gate_valid', got {self.packed_state!r}.")
         if self.rope_dim is not None:
             if self.rope_dim > self.index_head_dim:
-                raise ValueError(
-                    f"rope_dim ({self.rope_dim}) must be <= index_head_dim ({self.index_head_dim})."
-                )
+                raise ValueError(f"rope_dim ({self.rope_dim}) must be <= index_head_dim ({self.index_head_dim}).")
             if self.rope_dim % 2:
                 raise ValueError(f"rope_dim must be even for split-half/interleaved RoPE, got {self.rope_dim}.")
         if self.index_n_heads < 1 or self.index_head_dim < 1 or self.index_topk < 1:

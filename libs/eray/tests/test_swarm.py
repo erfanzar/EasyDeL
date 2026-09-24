@@ -25,7 +25,6 @@ import pytest
 ray = pytest.importorskip("ray")
 
 import eray.swarm as swarm_module  # noqa: E402
-from eray.pool.device_host import DeviceHostActor  # noqa: E402
 from eray.resources.topology import plan_host_partition  # noqa: E402
 from eray.swarm import (  # noqa: E402
     GpuSwarmConfig,
@@ -296,20 +295,6 @@ class TestSwarmedDecorator:
             serve()
 
 
-@pytest.fixture(scope="module")
-def local_ray():
-    ray.init(
-        num_cpus=8,
-        num_gpus=4,
-        resources={"TPU": 4},
-        include_dashboard=False,
-        ignore_reinit_error=True,
-        log_to_driver=False,
-    )
-    yield
-    ray.shutdown()
-
-
 def _make_run_fn(tag):
     """Build a per-run function as a closure so Ray pickles it by value."""
 
@@ -318,6 +303,8 @@ def _make_run_fn(tag):
 
         return {
             "tag": tag,
+            "jax_platforms": os.environ.get("JAX_PLATFORMS"),
+            "jax_platform_name": os.environ.get("JAX_PLATFORM_NAME"),
             "run_id": os.environ.get("ERAY_RUN_ID"),
             "run_name": os.environ.get("ERAY_RUN_NAME"),
             "run_chips": os.environ.get("ERAY_RUN_CHIPS"),
@@ -330,7 +317,7 @@ def _make_run_fn(tag):
 
 class TestRunSwarmRemoteFn:
     def test_heterogeneous_swarm_on_one_host(self, local_ray):
-        actor = DeviceHostActor.options(num_cpus=0).remote(0, "swarm-slice", 4)
+        actor = local_ray.options(num_cpus=0).remote(0, "swarm-slice", 4)
         payloads = [
             {"fn": _make_run_fn("train"), "chips": 2, "name": "train"},
             {"fn": _make_run_fn("serve"), "chips": 1, "name": "serve"},
@@ -340,6 +327,7 @@ class TestRunSwarmRemoteFn:
         assert len(refs) == 3
         results = ray.get(refs)
         assert [r["tag"] for r in results] == ["train", "serve", "eval"]
+        assert all(r["jax_platforms"] == r["jax_platform_name"] == "cpu" for r in results)
         assert [r["run_id"] for r in results] == ["0", "1", "2"]
         assert [r["run_name"] for r in results] == ["train", "serve", "eval"]
         assert [r["run_chips"] for r in results] == ["2", "1", "1"]
@@ -353,7 +341,7 @@ class TestRunSwarmRemoteFn:
         ray.kill(actor)
 
     def test_even_split_when_no_chips_given(self, local_ray):
-        actor = DeviceHostActor.options(num_cpus=0).remote(1, "swarm-slice", 4)
+        actor = local_ray.options(num_cpus=0).remote(1, "swarm-slice", 4)
         payloads = [{"fn": _make_run_fn(i)} for i in range(4)]
         refs = ray.get(actor.run_swarm_remote_fn.remote(payloads, num_cpus=0.1, memory_bytes=int(50e6)))
         results = ray.get(refs)
@@ -361,7 +349,7 @@ class TestRunSwarmRemoteFn:
         ray.kill(actor)
 
     def test_oversubscribed_plan_raises(self, local_ray):
-        actor = DeviceHostActor.options(num_cpus=0).remote(2, "swarm-slice", 4)
+        actor = local_ray.options(num_cpus=0).remote(2, "swarm-slice", 4)
         payloads = [
             {"fn": _make_run_fn(0), "chips": 2},
             {"fn": _make_run_fn(1), "chips": 2},
@@ -372,7 +360,7 @@ class TestRunSwarmRemoteFn:
         ray.kill(actor)
 
     def test_mixed_chips_specification_raises(self, local_ray):
-        actor = DeviceHostActor.options(num_cpus=0).remote(3, "swarm-slice", 4)
+        actor = local_ray.options(num_cpus=0).remote(3, "swarm-slice", 4)
         payloads = [{"fn": _make_run_fn(0), "chips": 2}, {"fn": _make_run_fn(1)}]
         with pytest.raises(Exception, match="every run or no run"):
             ray.get(actor.run_swarm_remote_fn.remote(payloads))
@@ -380,7 +368,7 @@ class TestRunSwarmRemoteFn:
 
     def test_fractional_chips_rejected_not_truncated(self, local_ray):
         # Regression: chips=1.5 must raise, not silently launch with 1 chip.
-        actor = DeviceHostActor.options(num_cpus=0).remote(6, "swarm-slice", 4)
+        actor = local_ray.options(num_cpus=0).remote(6, "swarm-slice", 4)
         payloads = [{"fn": _make_run_fn(0), "chips": 1.5}, {"fn": _make_run_fn(1), "chips": 1.5}]
         with pytest.raises(Exception, match="whole chips"):
             ray.get(actor.run_swarm_remote_fn.remote(payloads))
@@ -412,7 +400,7 @@ def _make_runtime_class():
 
 class TestNamedActorRuns:
     def test_class_runs_become_named_actors(self, local_ray):
-        actor = DeviceHostActor.options(num_cpus=0).remote(0, "swarm-slice", 4)
+        actor = local_ray.options(num_cpus=0).remote(0, "swarm-slice", 4)
         cls = _make_runtime_class()
         payloads = [
             {"fn": cls, "is_class": True, "chips": 1, "name": "serve-a", "f_args": (10,)},
@@ -451,14 +439,14 @@ class TestNamedActorRuns:
         ray.kill(actor)
 
     def test_class_run_without_namespace_raises(self, local_ray):
-        actor = DeviceHostActor.options(num_cpus=0).remote(1, "swarm-slice", 4)
+        actor = local_ray.options(num_cpus=0).remote(1, "swarm-slice", 4)
         payloads = [{"fn": _make_runtime_class(), "is_class": True, "chips": 1, "name": "rt", "f_args": (0,)}]
         with pytest.raises(Exception, match="namespace"):
             ray.get(actor.run_swarm_remote_fn.remote(payloads))
         ray.kill(actor)
 
     def test_actors_survive_host_actor_death(self, local_ray):
-        actor = DeviceHostActor.options(num_cpus=0).remote(2, "swarm-slice", 4)
+        actor = local_ray.options(num_cpus=0).remote(2, "swarm-slice", 4)
         payloads = [{"fn": _make_runtime_class(), "is_class": True, "chips": 1, "name": "survivor", "f_args": (5,)}]
         refs = ray.get(
             actor.run_swarm_remote_fn.remote(
@@ -472,7 +460,7 @@ class TestNamedActorRuns:
         assert shutdown_swarm("swarm-ns-detached") == 1
 
     def test_per_run_num_cores_reserved(self, local_ray):
-        actor = DeviceHostActor.options(num_cpus=0).remote(5, "swarm-slice", 4)
+        actor = local_ray.options(num_cpus=0).remote(5, "swarm-slice", 4)
         payloads = [
             {"fn": _make_resources_fn(), "chips": 2, "num_cores": 2},
             {"fn": _make_resources_fn(), "chips": 2, "num_cores": None},
@@ -503,6 +491,8 @@ def _make_gpu_env_fn(tag):
 
         return {
             "tag": tag,
+            "jax_platforms": os.environ.get("JAX_PLATFORMS"),
+            "jax_platform_name": os.environ.get("JAX_PLATFORM_NAME"),
             "run_id": os.environ.get("ERAY_RUN_ID"),
             "run_name": os.environ.get("ERAY_RUN_NAME"),
             "run_gpus": os.environ.get("ERAY_RUN_GPUS"),
@@ -526,6 +516,7 @@ class TestGpuSwarm:
         assert status.__class__.__name__ == "JobSucceeded"
         results = status.result
         assert [r["tag"] for r in results] == ["train", "serve", "eval"]
+        assert all(r["jax_platforms"] == r["jax_platform_name"] == "cpu" for r in results)
         assert [r["run_gpus"] for r in results] == ["2", "1", "1"]
         assert [r["run_name"] for r in results] == ["train", "serve", "eval"]
         assert all(r["num_runs"] == "3" for r in results)

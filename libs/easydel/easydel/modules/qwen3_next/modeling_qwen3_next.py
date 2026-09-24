@@ -53,6 +53,7 @@ Public surface:
       computes the routed-MoE auxiliary load-balancing loss.
 """
 
+import math
 import typing
 from dataclasses import dataclass
 
@@ -104,7 +105,7 @@ from easydel.infra.sharding import (
     mesh_axis_size,
     resolve_stage_mesh,
 )
-from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, blockwise_ffn
 from easydel.layers import (
     BaseMoeModule,
     ColumnParallelLinear,
@@ -1212,14 +1213,23 @@ def _apply_qwen3_next_packed_updates_unified(
         recurrent_states_i = jnp.where(spec_slot_mask[:, None, None, None], rolling_recurrent, recurrent_states_i)
         return token_outputs_i, conv_states_i, recurrent_states_i, candidate_conv_i, candidate_recurrent_i
 
-    token_outputs, base_conv_states, base_recurrent_states, candidate_conv_states, candidate_recurrent_states = (
-        jax.lax.cond(
-            jnp.any(spec_slot_mask),
-            _apply_spec_decode_windows,
-            lambda operand: operand,
-            (token_outputs, base_conv_states, base_recurrent_states, candidate_conv_states, candidate_recurrent_states),
+    # lax.cond traces both branches even when the runtime mask is all false.
+    # Without candidate rows, the window branch has no prefix states to stack.
+    if has_spec_candidates:
+        token_outputs, base_conv_states, base_recurrent_states, candidate_conv_states, candidate_recurrent_states = (
+            jax.lax.cond(
+                jnp.any(spec_slot_mask),
+                _apply_spec_decode_windows,
+                lambda operand: operand,
+                (
+                    token_outputs,
+                    base_conv_states,
+                    base_recurrent_states,
+                    candidate_conv_states,
+                    candidate_recurrent_states,
+                ),
+            )
         )
-    )
 
     prefill_slot_mask = multi_slot_mask & ~spec_slot_mask
     packed_slots = jnp.where(
@@ -2725,6 +2735,7 @@ class Qwen3NextFullAttention(UnifiedAttention):
             causal=self.causal,
             sliding_window=self.sliding_window,
             softmax_aux=softmax_aux,
+            precision=self.precision,
         )
 
         if attentions.cache_view is not None:
@@ -2953,8 +2964,14 @@ class Qwen3NextLinearAttention(spx.Module):
             use_bias=False,
         )
 
-        self.A_log = spx.Parameter(
-            jnp.log(
+        # ``init_method`` is what ``sequential_init`` uses, since it cannot
+        # replay the log-uniform draw: the log of the draw's midpoint.
+        self.A_log = ArrayParam.bound(
+            shape=(self.num_v_heads,),
+            dtype=param_dtype,
+            init_method="constant",
+            init_kwargs={"value": math.log(8.5)},
+            value=jnp.log(
                 jax.random.uniform(
                     rngs.parameters,
                     (self.num_v_heads,),
@@ -2962,10 +2979,15 @@ class Qwen3NextLinearAttention(spx.Module):
                     minval=1.0,
                     maxval=16.0,
                 )
-            )
+            ),
         )
 
-        self.dt_bias = spx.Parameter(jnp.ones((self.num_v_heads,), dtype=param_dtype))
+        self.dt_bias = ArrayParam.bound(
+            shape=(self.num_v_heads,),
+            dtype=param_dtype,
+            init_method="ones",
+            value=jnp.ones((self.num_v_heads,), dtype=param_dtype),
+        )
 
         metadata = OperationMetadata(
             runtime_dtype=self.dtype,

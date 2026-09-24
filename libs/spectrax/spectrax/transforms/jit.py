@@ -24,6 +24,7 @@ doubt use the ``*_argnames`` variants.
 from __future__ import annotations
 
 import functools
+import inspect
 import weakref
 from collections.abc import Callable, Iterable, Sequence
 from typing import TypeVar, cast
@@ -136,6 +137,43 @@ def _normalize_static_argnames_set(argnames: str | Iterable[str] | None) -> set[
     return set(argnames)
 
 
+def _infer_static_args(
+    fn: Callable[..., object],
+    argnums: int | Sequence[int] | None,
+    argnames: str | Iterable[str] | None,
+) -> tuple[tuple[int, ...], tuple[str, ...]]:
+    """Mirror JAX's signature inference without changing its validation contract.
+
+    Inference only fills an unspecified (``None``) option, not an explicitly
+    empty one. Negative indices are normalized later against the actual call,
+    and do not infer names, matching ``jax.jit``.
+    """
+    nums = _normalize_static_argnums_set(argnums)
+    names = _normalize_static_argnames_set(argnames)
+    if (argnums is None) != (argnames is None):
+        try:
+            parameters = inspect.signature(fn).parameters.items()
+        except (TypeError, ValueError):
+            pass  # JAX likewise leaves static options uninferred without a signature.
+        else:
+            for index, (name, parameter) in enumerate(parameters):
+                if parameter.kind != inspect.Parameter.POSITIONAL_OR_KEYWORD:
+                    continue
+                if argnums is None and name in names:
+                    nums.add(index)
+                elif argnames is None and index in nums:
+                    names.add(name)
+    return tuple(sorted(nums)), tuple(sorted(names))
+
+
+def _call_static_argnums(argnums: Sequence[int], num_args: int) -> tuple[int, ...]:
+    """Return static positions present in this call; JAX validates invalid indices."""
+    if not argnums:
+        return ()
+    normalized = {index if index >= 0 else num_args + index for index in argnums}
+    return tuple(sorted(index for index in normalized if 0 <= index < num_args))
+
+
 def _flatten_state_call_args(
     args: tuple[object, ...],
     kwargs: dict[str, object],
@@ -231,8 +269,14 @@ def _with_unflattened_state_args(fn: Callable[..., object], refs: tuple[_StateAr
     return inner
 
 
-def _flatten_state_in_shardings(in_shardings: object, refs: tuple[_StateArgRef, ...]) -> object:
-    """Adapt top-level state shardings to the flattened call ABI when possible."""
+def _flatten_state_in_shardings(
+    in_shardings: object, refs: tuple[_StateArgRef, ...], static_nums: tuple[int, ...]
+) -> object:
+    """Adapt State shardings, whose positions exclude the call's static arguments.
+
+    ``refs`` retain original positional locators for reconstructing user arguments;
+    only the index into JAX's dynamic-only ``in_shardings`` is shifted here.
+    """
     if in_shardings is _UNSET or not refs:
         return in_shardings
     if not isinstance(in_shardings, (tuple, list)):
@@ -243,7 +287,8 @@ def _flatten_state_in_shardings(in_shardings: object, refs: tuple[_StateArgRef, 
     for kind, locator, abi in refs:
         if kind != "arg":
             continue
-        index = int(locator)
+        original_index = int(locator)
+        index = original_index - sum(static_index < original_index for static_index in static_nums)
         if index >= len(flattened):
             continue
         sharding = flattened[index]
@@ -437,6 +482,9 @@ def jit(
         raise ValueError("spx.jit(..., batch_argnums=...) requires an MPMD mesh with schedule=.")
 
     mutable_sel = resolve_mutable(mutable)
+    if static_argnames is not None and not isinstance(static_argnames, str):
+        # Both ABI adaptation and JAX consume this iterable.
+        static_argnames = tuple(static_argnames)
 
     jit_kwargs: dict[str, object] = {
         "static_argnums": static_argnums,
@@ -473,12 +521,13 @@ def jit(
     _ctx_stack_get = _CTX_STACK.get
     _empty_kwargs: dict[str, object] = {}
     _direct_guarded = make_direct_readonly(fn)
+    state_static_argnums, state_static_argnames = _infer_static_args(fn, static_argnums, static_argnames)
 
-    def _jit_kwargs_for_state_refs(refs: tuple[_StateArgRef, ...]) -> dict[str, object]:
+    def _jit_kwargs_for_state_refs(refs: tuple[_StateArgRef, ...], static_nums: tuple[int, ...]) -> dict[str, object]:
         """Return JAX jit kwargs adapted to any flattened State arguments."""
         if not refs or in_shardings is _UNSET:
             return jit_kwargs
-        flattened_in_shardings = _flatten_state_in_shardings(in_shardings, refs)
+        flattened_in_shardings = _flatten_state_in_shardings(in_shardings, refs, static_nums)
         if flattened_in_shardings is in_shardings:
             return jit_kwargs
         updated = dict(jit_kwargs)
@@ -526,29 +575,30 @@ def jit(
             return _wrapped_with_ctx(ctx_stack, args, kwargs)
 
         if mutable_sel is None:
+            static_nums = _call_static_argnums(state_static_argnums, len(args))
             state_refs, call_args, call_kwargs = _flatten_state_call_args(
                 args,
                 kwargs,
-                static_argnums,
-                static_argnames,
+                static_nums,
+                state_static_argnames,
                 donate_argnums,
                 donate_argnames,
                 _state_arg_cache,
             )
             state_key = _state_refs_key(state_refs)
             layout_key, gdef_key, id_key = _live_module_refs(args, kwargs)
-            call_layout_key = (layout_key, state_key)
+            call_layout_key = (layout_key, static_nums, state_key)
             if len(id_key) == 1:
                 id_hit = _id_cache_one.get(id_key[0])
                 if id_hit is not None and id_hit[0] == _epoch_fn() and id_hit[1] == call_layout_key:
                     jitted = id_hit[2]
                 else:
                     epoch = _epoch_fn()
-                    key = ("direct", layout_key, gdef_key, state_key)
+                    key = ("direct", layout_key, gdef_key, static_nums, state_key)
                     jitted = _compile_cache.get(key)
                     if jitted is None:
                         direct = _with_unflattened_state_args(_direct_guarded, state_refs)
-                        jitted = _jax_jit(direct, **_jit_kwargs_for_state_refs(state_refs))
+                        jitted = _jax_jit(direct, **_jit_kwargs_for_state_refs(state_refs, static_nums))
                         _compile_cache[key] = jitted
                     _id_cache_one[id_key[0]] = (epoch, call_layout_key, jitted)
                 return jitted(*call_args, **call_kwargs)
@@ -558,11 +608,11 @@ def jit(
                 jitted = id_hit[2]
             else:
                 epoch = _epoch_fn()
-                key = ("direct", layout_key, gdef_key, state_key)
+                key = ("direct", layout_key, gdef_key, static_nums, state_key)
                 jitted = _compile_cache.get(key)
                 if jitted is None:
                     direct = _with_unflattened_state_args(_direct_guarded, state_refs)
-                    jitted = _jax_jit(direct, **_jit_kwargs_for_state_refs(state_refs))
+                    jitted = _jax_jit(direct, **_jit_kwargs_for_state_refs(state_refs, static_nums))
                     _compile_cache[key] = jitted
                 _id_cache[id_key] = (epoch, call_layout_key, jitted)
             return jitted(*call_args, **call_kwargs)
@@ -713,23 +763,24 @@ def jit(
             return jitted.lower(states_in, traced_ctx, stripped_args, stripped_kwargs)
 
         if mutable_sel is None:
+            static_nums = _call_static_argnums(state_static_argnums, len(args))
             state_refs, call_args, call_kwargs = _flatten_state_call_args(
                 args,
                 kwargs,
-                static_argnums,
-                static_argnames,
+                static_nums,
+                state_static_argnames,
                 donate_argnums,
                 donate_argnames,
                 _state_arg_cache,
             )
             state_key = _state_refs_key(state_refs)
             layout_key, gdef_key, id_key = _live_module_refs(args, kwargs)
-            call_layout_key = (layout_key, state_key)
-            key = ("direct", layout_key, gdef_key, state_key)
+            call_layout_key = (layout_key, static_nums, state_key)
+            key = ("direct", layout_key, gdef_key, static_nums, state_key)
             jitted = _compile_cache.get(key)
             if jitted is None:
                 direct = _with_unflattened_state_args(_direct_guarded, state_refs)
-                jitted = _jax_jit(direct, **_jit_kwargs_for_state_refs(state_refs))
+                jitted = _jax_jit(direct, **_jit_kwargs_for_state_refs(state_refs, static_nums))
                 _compile_cache[key] = jitted
             epoch = _epoch_fn()
             if len(id_key) == 1:

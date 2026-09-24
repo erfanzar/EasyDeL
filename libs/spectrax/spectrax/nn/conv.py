@@ -37,6 +37,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import ClassVar
 
+import jax
 import jax.numpy as jnp
 
 from ..core._typing import Array, ArrayLike, DType
@@ -105,6 +106,7 @@ class _ConvND(Module):
         padding: PaddingSpec = "VALID",
         dilation: int | Sequence[int] = 1,
         groups: int = 1,
+        precision: jax.lax.PrecisionLike = None,
         use_bias: bool = True,
         rngs: Rngs | int | None = None,
         dtype: DType | None = None,
@@ -133,6 +135,8 @@ class _ConvND(Module):
                 as ``kernel_size``.
             groups: Group count for grouped / depthwise convolutions.
                 Must divide both ``in_channels`` and ``out_channels``.
+            precision: Convolution precision forwarded to JAX. ``None`` follows
+                the ambient ``jax.default_matmul_precision`` setting.
             use_bias: When ``True`` (default), allocate and add an
                 ``(out_channels,)`` zero-initialized bias.
             rngs: Source of PRNG keys for parameter initialization.
@@ -157,6 +161,7 @@ class _ConvND(Module):
         self.padding = padding if isinstance(padding, str) else tuple(tuple(p) for p in padding)
         self.dilation = _tup(dilation, n)
         self.groups = groups
+        self.precision = precision
         self.use_bias = use_bias
         resolved = resolve_rngs(rngs)
         init = kaiming_uniform("linear")
@@ -215,6 +220,8 @@ class _ConvND(Module):
             padding=self.padding,
             dilation=self.dilation,
             groups=self.groups,
+            # GraphDefs exported before precision was configurable lack this field.
+            precision=getattr(self, "precision", None),
         )
 
 
@@ -265,6 +272,7 @@ class Conv(_ConvND):
         padding: PaddingSpec = "VALID",
         dilation: int | Sequence[int] = 1,
         groups: int = 1,
+        precision: jax.lax.PrecisionLike = None,
         use_bias: bool = True,
         rngs: Rngs | int | None = None,
         dtype: DType | None = None,
@@ -290,6 +298,7 @@ class Conv(_ConvND):
             padding: Padding value consumed by this operation.
             dilation: Dilation value consumed by this operation.
             groups: Groups value consumed by this operation.
+            precision: Convolution precision; ``None`` follows JAX's ambient setting.
             use_bias: Use bias value consumed by this operation.
             rngs: Random-number generator collection used to initialize or run the module.
             dtype: Array dtype requested for the produced value.
@@ -309,6 +318,7 @@ class Conv(_ConvND):
             padding=padding,
             dilation=dilation,
             groups=groups,
+            precision=precision,
             use_bias=use_bias,
             rngs=rngs,
             dtype=dtype,

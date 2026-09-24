@@ -99,6 +99,9 @@ else:
         "mask_value",
         "attn_logits_soft_cap",
         "sliding_window",
+        "block_k",
+        "num_warps",
+        "num_stages",
     ],
 )
 @jaxtyping.jaxtyped(typechecker=beartype)

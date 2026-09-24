@@ -1306,6 +1306,57 @@ class TextShardedSource(ShardedDataSource[dict]):
         return f"TextShardedSource(files={len(self._files)}, text_field={self._text_field!r})"
 
 
+def _load_hf_dataset(path: str, *, streaming: bool, **kwargs):
+    """Load HF data without asynchronous Parquet reads outliving a streaming reader.
+
+    Arrow dataset scanners can leave native I/O tasks calling Python-backed files
+    during shutdown after early-stopped training. Use synchronous Parquet batches
+    for streaming while retaining HF discovery, schemas, transforms and sharding.
+    Materialized datasets, other formats, and high-level encrypted Parquet scans
+    retain HF's normal loading behavior.
+
+    Args:
+        path: Hub identifier, local dataset directory, or HF builder name.
+        streaming: Whether to return a lazy iterable dataset.
+        **kwargs: Remaining ``datasets.load_dataset`` arguments used by the source.
+
+    Returns:
+        A Hugging Face Dataset or IterableDataset.
+
+    Raises:
+        NotImplementedError: If streaming is combined with ``num_proc``.
+    """
+    from datasets import load_dataset, load_dataset_builder
+
+    if not streaming:
+        return load_dataset(path, streaming=False, **kwargs)
+    if kwargs.pop("num_proc", None) is not None:
+        raise NotImplementedError("Streaming datasets do not support num_proc.")
+    split = kwargs.pop("split", None)
+    builder = load_dataset_builder(path, **kwargs)
+    if builder.info.builder_name == "parquet":
+        import inspect
+
+        from datasets import DownloadConfig
+
+        from ._hf_parquet import SynchronousParquetTables
+
+        # datasets 3.x has a different, files-only generator protocol. Leave that
+        # supported legacy API intact rather than assuming the current HF layout.
+        if "row_groups_list" not in inspect.signature(builder._generate_tables).parameters:
+            return builder.as_streaming_dataset(split=split)
+        options = builder.config.fragment_scan_options
+        # High-level encryption configs require Arrow's filesystem/key-material
+        # setup. Preserve that specialized HF path rather than dropping options.
+        if options is None or options.decryption_config is None:
+            builder._generate_tables = SynchronousParquetTables(
+                builder.config,
+                builder.info,
+                DownloadConfig(token=builder.token, storage_options=builder.storage_options),
+            )
+    return builder.as_streaming_dataset(split=split)
+
+
 class HuggingFaceShardedSource(ShardedDataSource[dict]):
     """:class:`ShardedDataSource` adapter around ``datasets.load_dataset``.
 
@@ -1381,9 +1432,7 @@ class HuggingFaceShardedSource(ShardedDataSource[dict]):
             The loaded HuggingFace ``Dataset`` or ``IterableDataset``.
         """
         if self._dataset is None:
-            from datasets import load_dataset  # pyright: ignore[reportMissingTypeStubs]
-
-            self._dataset = load_dataset(
+            self._dataset = _load_hf_dataset(
                 self._dataset_name,
                 name=self._subset,
                 split=self._split,
@@ -1690,7 +1739,7 @@ def load_for_inform(inform, mixture):
         ``datasets.Dataset`` or ``datasets.IterableDataset``: The
         loaded dataset, possibly row-limited, ready for the mixer.
     """
-    from datasets import IterableDataset, load_dataset  # pyright: ignore[reportMissingTypeStubs]
+    from datasets import IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 
     t = str(inform.get_str_type())
     df = inform.data_files
@@ -1739,7 +1788,7 @@ def load_for_inform(inform, mixture):
 
     # Create source and convert to HF dataset
     if t in {"huggingface", "hf"} and isinstance(df, str) and not _is_pathlike(df):
-        dataset = load_dataset(
+        dataset = _load_hf_dataset(
             path=df,
             name=inform.dataset_split_name,
             split=inform.split or "train",
@@ -1785,7 +1834,7 @@ def load_for_inform(inform, mixture):
                         yield {k: v[i] for k, v in cols.items()}
 
     try:
-        dataset = load_dataset(
+        dataset = _load_hf_dataset(
             path="json" if builder in {"json", "jsonl"} else builder,
             data_files=files,
             split=inform.split or "train",

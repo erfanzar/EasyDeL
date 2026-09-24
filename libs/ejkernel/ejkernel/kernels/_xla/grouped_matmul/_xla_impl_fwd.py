@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import contextlib
 import typing
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -55,7 +56,22 @@ set_xla_metadata = xla_metadata.set_xla_metadata
 # metadata has no influence on this CHECK.
 _RAGGED_DOT_M_ALIGNMENT = 8
 
+# The native TPU GMM tiler on jax/jaxlib 0.11.2 with libtpu 0.0.48 also rejects
+# an m=120 MoE projection (bf16 preferred output, no tiling hint):
+#     expecting m % mt == 0, got 120 % 32
+# With no explicit hint, align to 32 while retaining the older 8-row alignment.
+# Explicit tiling keeps the original alignment: rounding m=40 to 64 would break
+# a valid tm=40 hint (64 % 40 != 0).
+_UNTILED_RAGGED_DOT_M_ALIGNMENT = 32
 
+
+# Keep pad/dot/slice in one compilation. Separate eager primitive dispatch on
+# JAX 0.11.2/libtpu 0.0.48 corrupts narrow TP4 outputs (local n=32), including
+# nonfinite values from finite operands. An enclosing jit avoids that failure.
+@partial(
+    jax.jit,
+    static_argnames=("preferred_element_type", "tiling", "transpose_rhs", "interpret", "precision"),
+)
 def grouped_matmul(
     lhs: Float[Array, "m k"],
     rhs: Float[Array, "num_groups k n"] | Float[Array, "num_groups n k"],
@@ -120,13 +136,13 @@ def grouped_matmul(
     else:
         manager = set_xla_metadata(ragged_dot_tiling=",".join([str(t) for t in tiling]))
 
-    # Pad the ragged (m) dimension up to a multiple of the TPU sublane size to
-    # avoid a process-fatal ragged_dot_expander CHECK (see _RAGGED_DOT_M_ALIGNMENT
-    # above).  The padding rows sit past ``sum(group_sizes)`` so ragged_dot leaves
-    # them zero and they are stripped from the output before ``existing_out`` is
-    # added; the result is numerically identical to the unpadded computation.
+    # Align the ragged (m) dimension for the TPU expander, and for the native
+    # GMM tiler only when no explicit hint was supplied (see constants above).
+    # Keep group_sizes unchanged: the zero padding rows sit past its sum and
+    # belong to no group. Strip them before adding existing_out.
     m_orig = lhs.shape[0]
-    ragged_pad = (-m_orig) % _RAGGED_DOT_M_ALIGNMENT
+    alignment = _UNTILED_RAGGED_DOT_M_ALIGNMENT if tiling is None else _RAGGED_DOT_M_ALIGNMENT
+    ragged_pad = (-m_orig) % alignment
     if ragged_pad:
         lhs = jax.lax.pad(lhs, jnp.array(0.0, dtype=lhs.dtype), [(0, ragged_pad, 0), (0, 0, 0)])
 

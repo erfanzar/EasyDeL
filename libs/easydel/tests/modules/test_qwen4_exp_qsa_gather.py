@@ -250,20 +250,22 @@ def test_paged_qsa_selection_writes_pages_and_selects_complete_prefix():
     from dataclasses import dataclass, replace
     from types import SimpleNamespace
 
+    import spectrax as spx
     from easydel.caching import RaggedPagesMetadata
+    from easydel.layers.indexer._block_topk import BlockTopKIndexer
 
-    class Indexer:
-        compress_ratio = 2
-        index_n_heads = 1
-        index_head_dim = 2
-        block_topk = 2
-        token_budget = 4
-        k_layernorm = staticmethod(lambda x: x)
-
-        @staticmethod
-        def project(hidden):
-            raw = hidden[..., :2]
-            return raw[..., None, :], raw
+    indexer = BlockTopKIndexer(
+        hidden_size=2,
+        index_n_heads=1,
+        index_kv_heads=1,
+        index_head_dim=2,
+        indexer_budget=4,
+        indexer_compress_ratio=2,
+        dtype=jnp.float32,
+        param_dtype=jnp.float32,
+        rngs=spx.Rngs(0),
+    )
+    indexer.index_qk_proj.weight.value = jnp.concatenate([jnp.eye(2), jnp.eye(2)], axis=1)
 
     class Rotary:
         @staticmethod
@@ -279,7 +281,7 @@ def test_paged_qsa_selection_writes_pages_and_selects_complete_prefix():
         def replace(self, **kwargs):
             return replace(self, **kwargs)
 
-    attn = SimpleNamespace(indexer=Indexer(), rotary=Rotary())
+    attn = SimpleNamespace(indexer=indexer, rotary=Rotary())
     view = View(jnp.zeros((1, 4, 2), jnp.float32), jnp.zeros((1, 4, 3), jnp.int32))
     meta = RaggedPagesMetadata(
         pages_tables=jnp.array([[0]], jnp.int32),
@@ -467,3 +469,102 @@ def test_v3_paged_qsa_writes_current_kv_before_selected_gather():
     expected = np.array([[1, 1], [2, 2], [3, 3]])
     np.testing.assert_array_equal(np.asarray(updated.key_pages[[2, 5, 7], [1, 0, 1], :, 0]), expected)
     np.testing.assert_array_equal(np.asarray(updated.value_pages[[2, 5, 7], [1, 0, 1], :, 0]), expected * 10)
+
+
+def test_paged_qsa_ranked_prefill_and_decode_match_numpy_and_page_history():
+    """Ranked selection is shared while the model preserves permuted page writes."""
+    from dataclasses import dataclass, replace
+
+    import spectrax as spx
+    from easydel.caching import RaggedPagesMetadata
+    from easydel.layers.indexer._block_topk import BlockTopKIndexer
+
+    indexer = BlockTopKIndexer(
+        hidden_size=4,
+        index_n_heads=2,
+        index_kv_heads=1,
+        index_head_dim=4,
+        indexer_budget=4,
+        indexer_compress_ratio=2,
+        dtype=jnp.float32,
+        param_dtype=jnp.float32,
+        # Cached projections are compared with a full-fp32 NumPy reference.
+        precision=jax.lax.Precision.HIGHEST,
+        rngs=spx.Rngs(31),
+    )
+    rng = np.random.default_rng(32)
+    weight = rng.normal(size=(4, 12)).astype(np.float32)
+    indexer.index_qk_proj.weight.value = jnp.asarray(weight)
+    hidden = rng.normal(size=(2, 7, 4)).astype(np.float32)
+    qk = hidden @ weight
+    raw = qk[..., 8:]
+    tables = np.asarray([[2, 0], [3, 1]], np.int32)
+
+    class Rotary:
+        @staticmethod
+        def compute_cos_sin(rows, dtype=None):
+            shape = (*rows.shape[1:], 4)
+            return jnp.ones(shape, jnp.float32), jnp.zeros(shape, jnp.float32)
+
+    @dataclass
+    class View:
+        indexer_key_pages: object
+        mrope_position_pages: object
+
+        def replace(self, **kwargs):
+            return replace(self, **kwargs)
+
+    def metadata(query_len):
+        return RaggedPagesMetadata(
+            pages_tables=jnp.asarray(tables),
+            context_lens=jnp.asarray([7, 7], jnp.int32),
+            query_start_loc=jnp.asarray([0, query_len, 2 * query_len], jnp.int32),
+            num_seqs=jnp.asarray([2], jnp.int32),
+            slot_mapping=jnp.arange(2 * query_len, dtype=jnp.int32),
+            num_kv_update_slices=jnp.asarray([2 * query_len], jnp.int32),
+            version="v2",
+            page_size=4,
+        )
+
+    expected_pages = np.zeros((4, 4, 4), np.float32)
+    expected_pos = np.zeros((4, 4, 3), np.int32)
+    for row in range(2):
+        for token in range(7):
+            page = tables[row, token // 4]
+            expected_pages[page, token % 4] = raw[row, token]
+            expected_pos[page, token % 4] = token
+    seed_pages, seed_pos = expected_pages.copy(), expected_pos.copy()
+    for row in range(2):
+        seed_pages[tables[row, 1], 2] = 0
+        seed_pos[tables[row, 1], 2] = 0
+    attn = SimpleNamespace(indexer=indexer, rotary=Rotary())
+    decoded, decode_view = Qwen4ExpAttention._paged_indexer_select(
+        attn,
+        jnp.asarray(hidden[:, -1].reshape(1, 2, 4)),
+        jnp.asarray([[6, 6]], jnp.int32),
+        View(jnp.asarray(seed_pages), jnp.asarray(seed_pos)),
+        metadata(1),
+    )
+    prefilled, prefill_view = Qwen4ExpAttention._paged_indexer_select(
+        attn,
+        jnp.asarray(hidden.reshape(1, 14, 4)),
+        jnp.asarray(np.tile(np.arange(7), 2)[None], jnp.int32),
+        View(jnp.zeros_like(decode_view.indexer_key_pages), jnp.zeros_like(decode_view.mrope_position_pages)),
+        metadata(7),
+    )
+    for view in (decode_view, prefill_view):
+        np.testing.assert_allclose(np.asarray(view.indexer_key_pages), expected_pages, rtol=1e-6, atol=1e-6)
+        np.testing.assert_array_equal(np.asarray(view.mrope_position_pages), expected_pos)
+    # Independent reference: normalized query heads, complete-block means,
+    # normalized pooled keys, headwise positive dot products, stable top-k.
+    expected = []
+    for row in range(2):
+        q = qk[row, -1, :8].reshape(2, 4)
+        q = q / np.sqrt(np.mean(q**2, axis=-1, keepdims=True) + 1e-6)
+        keys = raw[row, :6].reshape(3, 2, 4).mean(axis=1)
+        keys = keys / np.sqrt(np.mean(keys**2, axis=-1, keepdims=True) + 1e-6)
+        scores = np.maximum(q @ keys.T, 0).sum(axis=0) / 2
+        blocks = np.argsort(-scores, kind="stable")[:2]
+        expected.append([member for block in blocks for member in (2 * block, 2 * block + 1)] + [6])
+    np.testing.assert_array_equal(np.asarray(decoded[0]), expected)
+    np.testing.assert_array_equal(np.asarray(prefilled[0, [6, 13]]), expected)

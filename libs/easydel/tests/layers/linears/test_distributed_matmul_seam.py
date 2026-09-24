@@ -148,8 +148,7 @@ def test_traced_engine_declines_on_fsdp_sharded_weight_layout():
     """
     import easydel as ed
 
-    if len(jax.devices()) < 8:
-        pytest.skip("fsdp x tp layout test needs 8 devices")
+    tp = 4 if len(jax.devices()) >= 8 else 2
 
     config = ed.LlamaConfig(
         hidden_size=64,
@@ -158,7 +157,7 @@ def test_traced_engine_declines_on_fsdp_sharded_weight_layout():
         num_attention_heads=4,
         num_key_value_heads=4,
         vocab_size=128,
-        sharding_axis_dims=(1, 1, 2, 1, 4, 1),
+        sharding_axis_dims=(1, 1, 2, 1, tp, 1),
     )
     mesh = config.mesh
     engine = make_distributed_matmul("row", "auto", config=config)
@@ -312,8 +311,7 @@ def test_model_logits_parity_wired_vs_unwired():
 def test_engine_keeps_fsdp_batch_sharded_and_matches_einsum():
     import easydel as ed
 
-    if len(jax.devices()) < 8:
-        pytest.skip("fsdp x tp layout test needs 8 devices")
+    tp = 4 if len(jax.devices()) >= 8 else 2
 
     config = ed.LlamaConfig(
         hidden_size=64,
@@ -322,7 +320,7 @@ def test_engine_keeps_fsdp_batch_sharded_and_matches_einsum():
         num_attention_heads=4,
         num_key_value_heads=4,
         vocab_size=128,
-        sharding_axis_dims=(1, 1, 2, 1, 4, 1),
+        sharding_axis_dims=(1, 1, 2, 1, tp, 1),
     )
     mesh = config.mesh
     engine = make_distributed_matmul("row", "auto", config=config)

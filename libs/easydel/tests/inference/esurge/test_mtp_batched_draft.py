@@ -21,8 +21,11 @@ batch-1 MTP forwards per decode step. ``draft_next_batched`` /
 ``Qwen3_5MTPDrafter.draft_batched`` draft the whole batch in ONE pooled pass
 (``k`` batched forwards).
 
-These CPU-only tests assert the batched pass is drafting-EQUIVALENT to the
-per-request path it replaces:
+These CPU/TPU tests assert the batched pass is drafting-EQUIVALENT to the
+per-request path it replaces. Exact-token reference cases request HIGHEST
+matmul precision locally: float32 storage alone still permits TPU bf16
+multipliers, whose batch-dependent rounding can flip a near-tie argmax.
+The full-runner integration test retains the default precision:
 
 * the drafted tokens for a batch of requests EQUAL drafting each request
   individually (both first window and a second window that exercises the
@@ -95,7 +98,7 @@ def _reference_drafts(model, reqs, n, k):
 
 def test_batched_draft_equals_per_request_first_window():
     """Batched drafts for B=4 requests EQUAL drafting each request individually."""
-    model = make_tiny_model()
+    model = make_tiny_model(precision=jax.lax.Precision.HIGHEST)
     n, k = 4, 3
     reqs = [
         ("A", 0, 5, 4, _seed_hidden(0)),
@@ -116,7 +119,7 @@ def test_batched_draft_equals_per_request_first_window():
 
 def test_batched_draft_equals_per_request_two_windows():
     """Parity holds across a second window that exercises per-row EAGLE rollback."""
-    model = make_tiny_model()
+    model = make_tiny_model(precision=jax.lax.Precision.HIGHEST)
     n, k = 4, 2
     # Window 1 seeds (base positions) and window 2 seeds (advanced by accepted+1).
     w1 = [
@@ -158,7 +161,7 @@ def test_batched_draft_equals_per_request_two_windows():
 
 def test_batched_draft_leaves_idle_rows_untouched():
     """A row not drafted this step keeps its MTP cache write index (no corruption)."""
-    model = make_tiny_model()
+    model = make_tiny_model(precision=jax.lax.Precision.HIGHEST)
     n, k = 4, 3
     # Only rows 0 and 2 are collected; rows 1 and 3 are idle this step.
     collected = [
@@ -196,7 +199,7 @@ def test_batched_draft_different_committed_lens_per_row():
     that used one uniform cache length would corrupt the rows whose committed length
     differs from the first row's.
     """
-    model = make_tiny_model()
+    model = make_tiny_model(precision=jax.lax.Precision.HIGHEST)
     n, k = 3, 3
     w1 = [("A", 0, 5, 4, _seed_hidden(0)), ("B", 1, 9, 10, _seed_hidden(1)), ("C", 2, 13, 7, _seed_hidden(2))]
     # Advance each row by a different amount -> committed A=2, B=3, C=1.

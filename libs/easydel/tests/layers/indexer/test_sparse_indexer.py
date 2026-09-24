@@ -57,9 +57,7 @@ def test_token_config_shapes_and_validity():
     mask = jnp.ones((B, S), dtype=jnp.bool_)
     mask = mask.at[1, S - 3 :].set(False)
 
-    out = bound(
-        hidden_states=hidden, q_resid=q_resid, attention_mask=mask, cached_packed=None
-    )
+    out = bound(hidden_states=hidden, q_resid=q_resid, attention_mask=mask, cached_packed=None)
     assert isinstance(out, IndexerOutput)
     assert out.topk_indices.shape == (B, S, TOPK)
     assert out.packed_state.shape == (B, S, D)
@@ -99,9 +97,7 @@ def test_pool_config_matches_reference_semantics():
     mask = jnp.ones((B, S), dtype=jnp.bool_)
     mask = mask.at[0, S - 2 :].set(False)
 
-    out = bound(
-        hidden_states=hidden, q_resid=q_resid, attention_mask=mask, cached_packed=None
-    )
+    out = bound(hidden_states=hidden, q_resid=q_resid, attention_mask=mask, cached_packed=None)
     width = TOPK + kpool - 1
     assert out.topk_indices.shape == (B, S, width)
     assert out.packed_state.shape == (B, S, 2 * D + 1)
@@ -151,14 +147,60 @@ def test_pool_state_carry_and_tail():
     q_resid = jax.random.normal(jax.random.PRNGKey(1), (1, S, HID), dtype=jnp.float32)
 
     first = bound(hidden_states=hidden, q_resid=q_resid, attention_mask=None, cached_packed=None)
-    second = bound(
-        hidden_states=hidden, q_resid=q_resid, attention_mask=None, cached_packed=first.packed_state
-    )
+    second = bound(hidden_states=hidden, q_resid=q_resid, attention_mask=None, cached_packed=first.packed_state)
     # carried state grows by the step length
     assert second.packed_state.shape[1] == 2 * S
     # selection width is unchanged by the carry
     assert second.topk_indices.shape[-1] == TOPK + kpool - 1
     assert int(second.topk_indices.min()) >= -1
+
+
+def _indices_to_numpy_mask(indices, kv_len):
+    """Independent reference: mark every non-negative selected index."""
+    indices = np.asarray(indices)
+    mask = np.zeros((*indices.shape[:-1], kv_len), dtype=bool)
+    for row in np.ndindex(indices.shape[:-1]):
+        picked = indices[row]
+        mask[row][picked[picked >= 0]] = True
+    return mask
+
+
+# (2, 40): the budget exceeds the pool count, so the indices are -1 padded.
+@pytest.mark.parametrize(("kpool", "topk"), [(4, TOPK), (3, 9), (1, 5), (2, 40)])
+@pytest.mark.parametrize("cached", [False, True])
+def test_pool_topk_mask_matches_selected_indices(kpool, topk, cached):
+    config = IndexerConfig(
+        kind=IndexerKind.POOL,
+        index_n_heads=H,
+        index_head_dim=D,
+        index_topk=topk,
+        hidden_size=HID,
+        q_input_dim=HID,
+        score_activation="relu",
+        head_reduction="weighted",
+        packed_state="key_gate_valid",
+        stop_gradient=True,
+        kpool_size=kpool,
+        select_tail=True,
+    )
+    _indexer, _params, bound = _make(config)
+    hidden = jax.random.normal(jax.random.PRNGKey(0), (B, S, HID), dtype=jnp.float32)
+    q_resid = jax.random.normal(jax.random.PRNGKey(1), (B, S, HID), dtype=jnp.float32)
+    # Left padding shifts the pool grid (first valid key > 0); right padding
+    # masks whole query rows.
+    mask = jnp.ones((B, S), dtype=jnp.bool_).at[0, :5].set(False).at[1, S - 3 :].set(False)
+    cached_packed = None
+    if cached:
+        cached_packed = bound(hidden_states=hidden, q_resid=q_resid, attention_mask=mask, cached_packed=None)
+        cached_packed = cached_packed.packed_state
+        mask = jnp.ones((B, S), dtype=jnp.bool_)
+
+    out = jax.jit(lambda h, q, m, c: bound(hidden_states=h, q_resid=q, attention_mask=m, cached_packed=c))(
+        hidden, q_resid, mask, cached_packed
+    )
+    kv_len = out.packed_state.shape[1]
+    assert out.topk_mask.shape == (B, S, kv_len)
+    np.testing.assert_array_equal(np.asarray(out.topk_mask), _indices_to_numpy_mask(out.topk_indices, kv_len))
 
 
 def test_shared_indexer_short_circuit():
@@ -198,7 +240,18 @@ def test_pool_decode_matches_full_forward():
     # decode: last token only, carrying everything before it
     step_hidden = hidden[:, -1:]
     step_q = q_resid[:, -1:]
-    cached = first.packed_state if (first := bound(hidden_states=hidden[:, : 2 * S - 1], q_resid=q_resid[:, : 2 * S - 1], attention_mask=None, cached_packed=None)) else None
+    cached = (
+        first.packed_state
+        if (
+            first := bound(
+                hidden_states=hidden[:, : 2 * S - 1],
+                q_resid=q_resid[:, : 2 * S - 1],
+                attention_mask=None,
+                cached_packed=None,
+            )
+        )
+        else None
+    )
     dec = bound(hidden_states=step_hidden, q_resid=step_q, attention_mask=None, cached_packed=cached)
 
     ref = full.topk_indices[0, -1]
@@ -246,3 +299,36 @@ def test_config_validation():
         IndexerConfig(score_activation="gelu")
     cfg = IndexerConfig(index_topk=8)
     assert cfg.with_changes(index_topk=16).index_topk == 16
+
+
+def test_selective_remat_can_retain_topk_indices():
+    """Retaining ``indexer_topk`` saves the small indices instead of re-ranking."""
+    from easydel.infra.utils import get_gradient_checkpoint_policy
+    from jax._src.ad_checkpoint import saved_residuals
+
+    config = IndexerConfig(
+        kind=IndexerKind.TOKEN,
+        index_n_heads=H,
+        index_head_dim=D,
+        index_topk=TOPK,
+        hidden_size=HID,
+        q_input_dim=HID,
+        rope_style="none",
+        packed_state="keys",
+    )
+    _indexer, _params, bound = _make(config)
+    hidden = jax.random.normal(jax.random.PRNGKey(0), (B, S, HID), dtype=jnp.float32)
+    mask = jnp.ones((B, S), dtype=jnp.bool_)
+
+    def attend_selected(h):
+        indices = bound(hidden_states=h, q_resid=h, attention_mask=mask, cached_packed=None).topk_indices
+        picked = jnp.take_along_axis(h[:, None, :, :], jnp.maximum(indices, 0)[..., None], axis=2)
+        return jnp.sum(jnp.tanh(picked))
+
+    def named(policy):
+        residuals = saved_residuals(jax.checkpoint(attend_selected, policy=policy), hidden)
+        return [(tuple(aval.shape), aval.dtype) for aval, source in residuals if "named 'indexer_topk'" in source]
+
+    retain = get_gradient_checkpoint_policy("save_only_these_names", save_names=["indexer_topk"])
+    assert named(retain) == [((B, S, TOPK), jnp.dtype(jnp.int32))]
+    assert named(get_gradient_checkpoint_policy("nothing_saveable")) == []

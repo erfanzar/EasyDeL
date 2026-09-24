@@ -24,21 +24,6 @@ import pytest
 
 ray = pytest.importorskip("ray")
 
-from eray.pool.device_host import DeviceHostActor  # noqa: E402
-
-
-@pytest.fixture(scope="module")
-def local_ray():
-    ray.init(
-        num_cpus=4,
-        resources={"TPU": 4},
-        include_dashboard=False,
-        ignore_reinit_error=True,
-        log_to_driver=False,
-    )
-    yield
-    ray.shutdown()
-
 
 def _make_env_grabber():
     """Build an env-snapshot function as a closure so Ray pickles it by value.
@@ -47,6 +32,8 @@ def _make_env_grabber():
     module, which Ray workers cannot import.
     """
     keys = (
+        "JAX_PLATFORMS",
+        "JAX_PLATFORM_NAME",
         "ERAY_SPLIT_ID",
         "ERAY_NUM_SPLITS",
         "ERAY_SPLIT_MODE",
@@ -107,12 +94,13 @@ class TestSupportedTpuSubset:
 
 class TestRunSplitRemoteFn:
     def test_isolated_split_runs_one_task_per_split(self, local_ray):
-        actor = DeviceHostActor.options(num_cpus=0).remote(0, "test-slice", 4)
+        actor = local_ray.options(num_cpus=0).remote(0, "test-slice", 4)
         refs = ray.get(actor.run_split_remote_fn.remote(_make_env_grabber(), 4, num_cpus=0.1, memory_bytes=int(50e6)))
         assert len(refs) == 4
         envs = ray.get(refs)
         assert sorted(e["ERAY_SPLIT_ID"] for e in envs) == ["0", "1", "2", "3"]
         for e in envs:
+            assert e["JAX_PLATFORMS"] == e["JAX_PLATFORM_NAME"] == "cpu"
             assert e["ERAY_NUM_SPLITS"] == "4"
             assert e["ERAY_SPLIT_MODE"] == "isolated"
             assert e["TPU_HOST_ID"] == "0"
@@ -121,11 +109,11 @@ class TestRunSplitRemoteFn:
         ray.kill(actor)
 
     def test_cooperative_split_injects_process_topology(self, local_ray):
-        actor = DeviceHostActor.options(num_cpus=0).remote(1, "test-slice", 4)
+        actor = local_ray.options(num_cpus=0).remote(1, "test-slice", 4)
         refs = ray.get(
             actor.run_split_remote_fn.remote(
                 _make_env_grabber(), 4, mode="cooperative", base_port=9100, num_cpus=0.1, memory_bytes=int(50e6)
-            )
+            ),
         )
         envs = ray.get(refs)
         # Ray assigns chips in arbitrary order but must cover all four disjointly.
@@ -141,19 +129,19 @@ class TestRunSplitRemoteFn:
         ray.kill(actor)
 
     def test_invalid_split_raises_before_launch(self, local_ray):
-        actor = DeviceHostActor.options(num_cpus=0).remote(2, "test-slice", 4)
+        actor = local_ray.options(num_cpus=0).remote(2, "test-slice", 4)
         with pytest.raises(Exception, match="divide"):
             ray.get(actor.run_split_remote_fn.remote(_make_env_grabber(), 3))
         ray.kill(actor)
 
     def test_unknown_chip_count_raises(self, local_ray):
-        actor = DeviceHostActor.options(num_cpus=0).remote(3, "test-slice", None)
+        actor = local_ray.options(num_cpus=0).remote(3, "test-slice", None)
         with pytest.raises(Exception, match="unknown chip count"):
             ray.get(actor.run_split_remote_fn.remote(_make_env_grabber(), 2))
         ray.kill(actor)
 
     def test_whole_host_run_remote_fn_still_works(self, local_ray):
-        actor = DeviceHostActor.options(num_cpus=0).remote(4, "test-slice", 4)
+        actor = local_ray.options(num_cpus=0).remote(4, "test-slice", 4)
         ref = ray.get(actor.run_remote_fn.remote(_make_env_grabber(), num_cpus=0.1, memory_bytes=int(50e6)))
         env = ray.get(ref)
         assert env["TPU_HOST_ID"] == "4"

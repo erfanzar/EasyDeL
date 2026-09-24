@@ -25,6 +25,7 @@ import jax
 import jax.numpy as jnp
 import jaxtyping
 from beartype import beartype
+from jax import lax
 from jaxtyping import Array, Bool, DTypeLike, Float, PRNGKeyArray
 
 from ejkernel.callib._tilelang_call import build_tilelang_call
@@ -646,6 +647,7 @@ def attention(
     *,
     weights_block_q: int = 64,
     weights_block_k: int = 64,
+    precision: lax.PrecisionLike = None,
 ) -> tuple[
     Float[Array, "batch seq_len num_q_heads vhead_dim"],
     Float[Array, "batch num_heads seq_len kv_len"],
@@ -688,6 +690,9 @@ def attention(
             ``(left, right)``).
         fwd_params: Optional TileLang FlashAttention forward tile hints.
         bwd_params: Optional TileLang FlashAttention backward tile hints.
+        precision: Must be None. Explicit JAX matmul precision, including
+            ``Precision.DEFAULT``, is unsupported by TileLang. Use the XLA
+            implementation for this control.
 
     Returns:
         A tuple ``(output, weights)`` where:
@@ -698,8 +703,11 @@ def attention(
           probability matrix (same dtype as ``query`` after casting).
 
     Raises:
-        EjkernelRuntimeError: if ``vhead_dim != head_dim``.
+        EjkernelRuntimeError: if ``vhead_dim != head_dim`` or an explicit
+            precision is requested.
     """
+    if precision is not None:
+        raise EjkernelRuntimeError("tile-lang attention does not support explicit precision; use XLA instead.")
     if value.shape[-1] != query.shape[-1]:
         raise EjkernelRuntimeError("tile-lang attention requires head_dim == vhead_dim.")
     if bias is None and init_bias is not None:

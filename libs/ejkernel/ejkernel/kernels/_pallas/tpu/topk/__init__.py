@@ -15,6 +15,6 @@
 """Pallas TPU top-k."""
 
 from ._interface import topk
-from ._pallas_impl_fwd import topk_superset_tpu
+from ._pallas_impl_fwd import topk_threshold_tpu
 
-__all__ = ("topk", "topk_superset_tpu")
+__all__ = ("topk", "topk_threshold_tpu")

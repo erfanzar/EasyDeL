@@ -58,11 +58,8 @@ import jax
 import jax.numpy as jnp
 import spectrax as spx
 from eformer.loggings import get_logger
-from ejkernel.modules import sinkhorn_knopp
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax.ad_checkpoint import checkpoint_name
-from jax.sharding import NamedSharding
-from jax.sharding import PartitionSpec as Ps
 from jaxtyping import Array, Bool, Float, Int
 from spectrax import apply_logical_sharding, common_types, nn
 
@@ -113,6 +110,13 @@ from easydel.layers.indexer import IndexerConfig, IndexerKind, SparseIndexer
 from easydel.layers.linear_attention import apply_conv_with_state, apply_mask_to_padding_states
 from easydel.layers.moe import moe_group_topk_select
 from easydel.layers.norms import lowfloats
+from easydel.layers.residual import (
+    HyperStreamSharding,
+    ManifoldHyperConnection,
+    ManifoldHyperConnectionConfig,
+    manifold_residual_write,
+    mean_hyper_head,
+)
 from easydel.modules._base import BaseCausalLMModule
 from easydel.operations import OperationMetadata
 from easydel.operations.kernels import (
@@ -133,22 +137,6 @@ from .glm5_next_configuration import (
 logger = get_logger(__name__)
 
 _KDA_CHUNK_SIZE = 64
-
-
-def _unweighted_rms_norm(x: Array, eps: float) -> Array:
-    """Unweighted RMSNorm: ``x * rsqrt(mean(x^2) + eps)`` with an fp32 moment.
-
-    Mirrors HF ``Glm5NextTextUnweightedRMSNorm`` used by the mHC mapping.
-
-    Args:
-        x: Input array; normalization runs over the last axis.
-        eps: Variance epsilon.
-
-    Returns:
-        Array of the same shape and dtype as ``x``.
-    """
-    scale = jax.lax.rsqrt(jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True) + eps)
-    return x * scale.astype(x.dtype)
 
 
 class Glm5NextTextMLP(spx.Module):
@@ -625,11 +613,11 @@ class Glm5NextTextMoE(BaseMoeModule):
         return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 
 
-class Glm5NextHyperConnection(spx.Module):
-    """Manifold-Constrained Hyper-Connection (mHC) mixing module.
+class Glm5NextHyperConnection(ManifoldHyperConnection):
+    """GLM-5 configuration adapter for shared manifold hyper-connections.
 
-    Owns the learned ``fn`` / ``base`` / ``scale`` parameters that map the
-    flattened ``hc_mult`` residual streams to three fp32 outputs:
+    Preserves direct ``fn`` / ``base`` / ``scale`` checkpoint parameters and
+    maps flattened ``hc_mult`` residual streams to three fp32 mixing factors:
 
     - ``pre`` (``sigmoid + hc_eps``): stream-collapse weights producing the
       sub-layer input.
@@ -662,97 +650,32 @@ class Glm5NextHyperConnection(spx.Module):
         Args:
             config: Model configuration (reads ``hc_mult``,
                 ``hc_sinkhorn_iters``, ``hc_eps``, ``hidden_size``,
-                ``rms_norm_eps``, ``initializer_range``).
+                ``rms_norm_eps``, ``initializer_range``,
+                ``hc_use_fused_coefficients``).
             dtype: Activation dtype (mHC math itself runs in fp32).
             param_dtype: Parameter storage dtype.
             precision: Matmul precision for the learned stream projection.
             rngs: Random number generators.
         """
+        super().__init__(
+            ManifoldHyperConnectionConfig(
+                hidden_size=config.hidden_size,
+                hc_mult=config.hc_mult,
+                eps=config.hc_eps,
+                norm_eps=config.rms_norm_eps,
+                iters=config.hc_sinkhorn_iters,
+                initializer=config.initializer_range,
+                use_fused_coefficients=config.hc_use_fused_coefficients,
+            ),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            mesh_source=config,
+        )
+        # Keep the model configuration public; the shared layer retains scalar
+        # settings and resolves the stage-local mesh through mesh_source.
         self.config = config
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.hc_mult = config.hc_mult
-        self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
-        self.hc_eps = config.hc_eps
-        self.rms_norm_eps = config.rms_norm_eps
-        mix = (2 + self.hc_mult) * self.hc_mult
-        self.fn = ArrayParam.bound(
-            shape=(mix, self.hc_mult * config.hidden_size),
-            dtype=param_dtype,
-            init_method="normal",
-            init_kwargs={"stddev": config.initializer_range},
-            key=rngs.param,
-        )
-        self.base = ArrayParam.bound(
-            shape=(mix,),
-            dtype=param_dtype,
-            init_method="zeros",
-            key=rngs.param,
-        )
-        self.scale = ArrayParam.bound(
-            shape=(3,),
-            dtype=param_dtype,
-            init_method="ones",
-            key=rngs.param,
-        )
-
-    def forward(self, hidden_streams: Float[Array, "batch seq hc hidden"]) -> tuple[Array, Array, Array]:
-        """Compute ``(post, comb, collapsed)`` from the mHC mapping.
-
-        Args:
-            hidden_streams: Residual streams of shape ``[B, S, hc, D]``.
-
-        Returns:
-            Tuple of ``post`` (``[B, S, hc]``, fp32), ``comb``
-            (``[B, S, hc, hc]``, fp32, Sinkhorn-projected), and ``collapsed``
-            (``[B, S, D]``, input dtype) — the pre-weighted stream sum fed to
-            the sub-layer.
-
-        Note:
-            ``comb`` descends from ``hidden_streams``; on multi-device TPU
-            meshes the Sinkhorn projection is pinned to replicated sharding
-            with an explicit constraint before the fused ``shard_map`` call so
-            every device redundantly normalises the (couple-of-KB) matrix
-            rather than moving shards.
-        """
-        hc = self.hc_mult
-        eps = self.hc_eps
-        batch, seq = hidden_streams.shape[:2]
-        flat = hidden_streams.reshape(batch, seq, -1).astype(jnp.float32)
-        flat = _unweighted_rms_norm(flat, self.rms_norm_eps)
-        fn = self.fn.value.astype(jnp.float32)
-        mix_logits = jnp.matmul(flat, fn.T, precision=self.precision)
-        pre_w = mix_logits[..., :hc]
-        post_w = mix_logits[..., hc : 2 * hc]
-        comb_w = mix_logits[..., 2 * hc :]
-        base = self.base.value.astype(jnp.float32)
-        pre_b, post_b, comb_b = base[:hc], base[hc : 2 * hc], base[2 * hc :]
-        scale = self.scale.value.astype(jnp.float32)
-
-        pre = jax.nn.sigmoid(pre_w * scale[0] + pre_b) + eps
-        post = 2.0 * jax.nn.sigmoid(post_w * scale[1] + post_b)
-        comb_logits = comb_w.reshape(batch, seq, hc, hc) * scale[2] + comb_b.reshape(hc, hc)
-        comb = jax.nn.softmax(comb_logits, axis=-1) + eps
-        # Sinkhorn knopp: alternate column/row normalization onto the
-        # doubly-stochastic manifold (fixed static iteration count).
-        # TODO: write akernel for this one aswell ffs that indexing for b takes a lot of time
-        mesh = self.config.mesh
-        jax_mesh = getattr(mesh, "jax_mesh", mesh)
-        if jax_mesh is not None and getattr(jax_mesh, "size", 1) > 1 and jax.default_backend() == "tpu":
-            comb = jax.lax.with_sharding_constraint(comb, NamedSharding(jax_mesh, Ps()))
-            comb = jax.shard_map(
-                lambda c: sinkhorn_knopp(c, self.hc_sinkhorn_iters, eps),
-                mesh=jax_mesh,
-                in_specs=(Ps(),),
-                out_specs=Ps(),
-                check_vma=False,
-            )(comb)
-        else:
-            comb = sinkhorn_knopp(comb, self.hc_sinkhorn_iters, eps)
-
-        collapsed = jnp.sum(pre[..., None] * hidden_streams.astype(jnp.float32), axis=2)
-        return post, comb, collapsed.astype(hidden_streams.dtype)
 
 
 def _hc_head_collapse(hidden_streams: Float[Array, "batch seq hc hidden"]) -> Array:
@@ -762,12 +685,12 @@ def _hc_head_collapse(hidden_streams: Float[Array, "batch seq hc hidden"]) -> Ar
     averages the streams before the final RMSNorm.
 
     Args:
-        hidden_states: Residual streams ``[B, S, hc, D]``.
+        hidden_streams: Residual streams ``[B, S, hc, D]``.
 
     Returns:
         Collapsed hidden states ``[B, S, D]`` in the input dtype.
     """
-    return jnp.mean(hidden_streams, axis=2)
+    return mean_hyper_head(hidden_streams)
 
 
 class Glm5NextForgetGate(spx.Module):
@@ -1495,6 +1418,8 @@ class Glm5NextIndexer(SparseIndexer):
             precision=precision,
             rngs=rngs,
         )
+        # Row-parallel TPU top-k resolves its layout from the model mesh.
+        self.mesh_source = config
 
 
 class Glm5NextDSAAttention(UnifiedAttention):
@@ -1883,7 +1808,7 @@ class Glm5NextDSAAttention(UnifiedAttention):
             # dense (non-ragged) cache consumers, which do honor mask_info.
             kv_len = key_states.shape[1]
             if q_len == kv_len or cached_packed_states is not None:
-                topk_mask = jnp.any(jax.nn.one_hot(topk_indices, kv_len, dtype=jnp.bool_), axis=-2)
+                topk_mask = indexer_out.selection.to_mask(kv_len)
                 attention_mask = (
                     pairwise_attention_mask_from_mask_info(mask_info, q_len, kv_len) if mask_info is not None else None
                 )
@@ -2110,8 +2035,6 @@ class Glm5NextDecoderLayer(spx.Module):
             :class:`DecoderLayerOutput` with the updated streams, optional
             attention weights, updated cache view, and optional router logits.
         """
-        dtype = hidden_states.dtype
-
         post, comb, collapsed = self.attn_hc(hidden_states)
         attn_input = self.input_layernorm(collapsed)
         attn_input = apply_logical_sharding(
@@ -2137,11 +2060,8 @@ class Glm5NextDecoderLayer(spx.Module):
                 output_attentions,
                 frequencies,
             )
-        hidden_states = post.astype(dtype)[..., None] * attn_outputs.attention_output[..., None, :] + jnp.einsum(
-            "bsji,bsjd->bsid",
-            comb.astype(dtype),
-            hidden_states,
-            precision=self.precision,
+        hidden_states = manifold_residual_write(
+            hidden_states, attn_outputs.attention_output, post, comb, precision=self.precision
         )
 
         post, comb, collapsed = self.ffn_hc(hidden_states)
@@ -2157,15 +2077,12 @@ class Glm5NextDecoderLayer(spx.Module):
         router_logits = None
         if isinstance(feed_forward_hidden_states, tuple):
             feed_forward_hidden_states, router_logits = feed_forward_hidden_states
-        hidden_states = post.astype(dtype)[..., None] * feed_forward_hidden_states[..., None, :] + jnp.einsum(
-            "bsji,bsjd->bsid",
-            comb.astype(dtype),
-            hidden_states,
-            precision=self.precision,
+        hidden_states = manifold_residual_write(
+            hidden_states, feed_forward_hidden_states, post, comb, precision=self.precision
         )
         hidden_states = apply_logical_sharding(
             hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
+            dynamic_axes=HyperStreamSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
@@ -2359,7 +2276,7 @@ class Glm5NextTextModel(EasyDeLBaseModule):
 
         hidden_states = apply_logical_sharding(
             hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
+            dynamic_axes=HyperStreamSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
 

@@ -79,6 +79,41 @@ Notes:
   (e.g. a callable, a dict of strings) so spectrax doesn't try to
   introspect it.
 
+## Direct convolution precision
+
+`nn.Conv`, `nn.Conv1d`, `nn.Conv2d`, `nn.Conv3d`, and
+`spectrax.functional.conv` accept the keyword-only `precision` argument.
+The default, `precision=None`, inherits the ambient
+`jax.default_matmul_precision` setting. An explicit
+`jax.lax.Precision.DEFAULT` is different: it requests JAX's default
+primitive precision rather than inheriting an ambient override.
+
+```python
+import jax
+import jax.numpy as jnp
+from spectrax import nn, functional as F
+
+x = jnp.ones((1, 8, 8, 3), dtype=jnp.float32)  # channels last
+layer = nn.Conv2d(3, 16, 3, padding="SAME", rngs=0, precision=None)
+with jax.default_matmul_precision("highest"):
+    y = layer(x)  # inherits the ambient precision
+    y_default = F.conv(
+        x, layer.weight.value, layer.bias.value,
+        padding="SAME", precision=jax.lax.Precision.DEFAULT,
+    )  # explicitly overrides it
+```
+
+Precision controls the convolution primitive, not parameter storage dtype.
+`param_dtype` still takes precedence over `dtype` for parameter allocation;
+weight/bias leaf names and shapes are unchanged. Module precision is static
+GraphDef metadata, not a new checkpoint array; older GraphDefs without that
+field use `None` on forward. This control applies only to **direct**
+convolutions: `nn.ConvTranspose1d/2d/3d` and `functional.conv_transpose`
+do not accept a `precision` argument.
+
+API details: [convolution modules](../api_docs/nn/conv.rst) and
+[functional convolution](../api_docs/functional/conv.rst).
+
 ## Container types
 
 Containers wrap collections of submodules so they're individually

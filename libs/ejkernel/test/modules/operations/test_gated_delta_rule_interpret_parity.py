@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU (interpret-mode) parity lock for the grouped chunked GDR Pallas paths.
+"""Interpret-mode algorithm-parity lock for the grouped chunked GDR Pallas paths.
 
 Runs the real Pallas TPU kernels under ``force_tpu_interpret_mode`` against the
 XLA recurrent reference, for both the packed (``seg_ids`` set) and non-packed
@@ -37,8 +37,20 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import pytest
+from ejkernel.kernels._pallas.tpu.gated_delta_rule import _pallas_impl_fwd as pallas_fwd
 from ejkernel.kernels._pallas.tpu.gated_delta_rule._interface import gated_delta_rule
 from jax.experimental.pallas import tpu as pltpu
+
+
+@pytest.fixture
+def full_precision_interpret_math(monkeypatch):
+    # These are strict fp32 algorithm/gradient checks, not native TPU precision
+    # checks. The XLA reference requests HIGHEST, while Pallas _dot explicitly
+    # requests DEFAULT (also used by backward), which can round fp32 operands
+    # on TPU. The context alone cannot override an explicit precision argument.
+    monkeypatch.setattr(pallas_fwd, "_P", jax.lax.Precision.HIGHEST)
+    with jax.default_matmul_precision("highest"):
+        yield
 
 
 def _make_packed_grouped_inputs(seg_period: int, batch=2, seq_len=1024, hq=2, hv=6, k_dim=16, v_dim=16):
@@ -68,7 +80,7 @@ def _make_packed_grouped_inputs(seg_period: int, batch=2, seq_len=1024, hq=2, hv
         pytest.param(None, id="nonpacked_fused_groups"),
     ],
 )
-def test_grouped_chunked_matches_recurrent_fwd_and_grad(seg_period):
+def test_grouped_chunked_matches_recurrent_fwd_and_grad(seg_period, full_precision_interpret_math):
     q, k, v, beta, decay, seg_ids = _make_packed_grouped_inputs(seg_period or 512)
     if seg_period is None:
         seg_ids = None

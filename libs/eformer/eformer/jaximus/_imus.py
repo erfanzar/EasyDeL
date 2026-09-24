@@ -985,10 +985,10 @@ def _bind_primitive(primitive: core.Primitive, args: Sequence[tp.Any], params):
     bind_spec = primitive.get_bind_params(params)
     if isinstance(bind_spec, tuple) and len(bind_spec) == 2:
         subfuns, bind_params = bind_spec
-    else:
-        bind_params = dict(bind_spec)
-        subfuns = bind_params.pop("subfuns", ())
-    return primitive.bind(*subfuns, *args, **bind_params)
+        return primitive.bind(*subfuns, *args, **bind_params)
+    # Modern JAX carries wrapped functions in keyword parameters, not operands.
+    # Keep `subfuns` intact for custom derivatives and shard_map.
+    return primitive.bind(*args, **bind_spec)
 
 
 def _materialize_values(values: Sequence[chex.Array | ImplicitArray]) -> list[tp.Any]:
@@ -1181,12 +1181,17 @@ class _CustomTrace(core.Trace):
         Shard maps require concrete arrays, so ImplicitArrays are materialized
         before execution.
         """
-        tracers = [(arr.materialize() if _is_value(arr) else arr) for arr in [self.to_value(t) for t in tracers]]
-        out = primitive.bind_with_trace(self.parent_trace, (fun, *tracers), params)
-        if primitive.multiple_results:
-            return [_CustomTracer(self, x) for x in out]
-        else:
-            return _CustomTracer(self, out)
+        in_values = [self.to_value(t) for t in tracers]
+        with core.set_current_trace(self.parent_trace):
+            arrays = _materialize_values(in_values)
+            out = primitive.bind_with_trace(
+                self.parent_trace,
+                tuple(arrays),
+                tuple(core.typeof(x) for x in arrays),
+                {**params, "subfuns": (fun,)},
+            )
+        # JAX 0.10 and 0.11 return a FlatTree; preserve its output structure.
+        return out.map(lambda x: _CustomTracer(self, x))
 
     def process_map(self, map_primitive, f, tracers, params=None, /, **kwargs):
         """Process map primitives (pmap, etc.) by materializing inputs."""
@@ -1475,7 +1480,7 @@ def _(
         _jaxpr = jax.make_jaxpr(flat__call)(flat_args)
         _branches.append(_jaxpr)
 
-    if tp.Any(tree_outs_i != out_trees[0] for tree_outs_i in out_trees[1:]):
+    if any(tree_outs_i != out_trees[0] for tree_outs_i in out_trees[1:]):
         raise TypeError("all branches output must have the same pytree.")
 
     if linear is _sentinel:

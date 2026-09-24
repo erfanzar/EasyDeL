@@ -1578,6 +1578,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             sliding_window=sliding_window_for_kernel,
             softmax_aux=softmax_aux,
             output_attentions=output_attentions,
+            precision=self.precision,
         )
 
         if attentions.cache_view is not None:

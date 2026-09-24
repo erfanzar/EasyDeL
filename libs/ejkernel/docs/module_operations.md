@@ -34,7 +34,7 @@ ejkernel/modules/
 
 ### Attention Variants
 
-- **Attention**: Standard multi-head attention with XLA optimization
+- **Attention**: Standard multi-head attention with XLA/TileLang dispatch (explicit precision selects XLA)
 
 - **FlashAttention**: Memory-efficient O(N) complexity attention
 
@@ -69,6 +69,42 @@ ejkernel/modules/
 - **GroupedMatmul**: Efficient grouped matrix multiplication
 
 - **MeanPooling**: Sequence mean pooling operation
+
+## Dense Attention Precision
+
+`ejkernel.modules.attention(query, key, value, *, precision=None, ...)`
+returns `(output, weights)`. The registered XLA implementation applies
+`precision` to both contractions: query-times-key and attention-times-value.
+
+- `precision=None` preserves automatic XLA/TileLang dispatch. On XLA, it
+  inherits the ambient `jax.default_matmul_precision` setting.
+- Any explicit value, including `jax.lax.Precision.DEFAULT`, restricts
+  heuristic and autotune selection to **XLA**. `DEFAULT` requests the
+  primitive default; it does not inherit an ambient override.
+- TileLang does not support this control. A manual or cached non-XLA
+  `AttentionConfig.platform` combined with explicit precision raises
+  `ValueError` rather than silently ignoring the request. Use `"auto"`
+  or `"xla"` for that configuration.
+
+```python
+import jax
+import jax.numpy as jnp
+from ejkernel.modules import attention
+
+q = k = v = jnp.ones((1, 8, 2, 16), dtype=jnp.float32)
+output, weights = attention(
+    q, k, v, causal=True, dtype=jnp.float32,
+    softmax_dtype=jnp.float32, precision=jax.lax.Precision.HIGHEST,
+)  # registered XLA path, not TileLang
+```
+
+`precision` is independent of `dtype` (computation) and `softmax_dtype`
+(softmax); it does not change tensor storage types or checkpoint layout.
+This contract is specific to dense `attention`, not a promise that every
+attention operation or backend honors JAX precision. The dense weight
+matrix still requires quadratic memory.
+
+See the [dense attention API](api_docs/modules/operations/attention.rst).
 
 ## Base Configuration Classes
 

@@ -10,7 +10,9 @@ microbatch's loss is itself a weighted mean with a *different* denominator
 (SFT valid-token counts), that estimator diverges from the single-program
 global weighted mean. ``sxvalue_and_grad(..., microbatch_weight_fn=...)``
 must reproduce the global estimator exactly; the uniform behavior must stay
-bit-compatible for callers that do not opt in.
+bit-compatible for callers that do not opt in. The toy model requests full
+fp32 dot precision so TPU shape-dependent multiplier rounding does not confound
+comparisons between full-batch and microbatch gradient estimators.
 """
 
 from __future__ import annotations
@@ -63,8 +65,8 @@ def wdata():
 
 def _forward(w0, b0, w1, b1, x):
     """Two-layer reference forward."""
-    h = jnp.maximum(x @ w0 + b0, 0)
-    return h @ w1 + b1
+    h = jnp.maximum(jnp.matmul(x, w0, precision=jax.lax.Precision.HIGHEST) + b0, 0)
+    return jnp.matmul(h, w1, precision=jax.lax.Precision.HIGHEST) + b1
 
 
 def _global_weighted_loss(w0, b0, w1, b1, x, y, mask):
@@ -91,9 +93,9 @@ def _make_scheduled(mesh, schedule, *, with_aux: bool = False):
     @sxjit(mesh=mesh, schedule=schedule, batch_argnums=(4, 5, 6))
     def pipe_loss(w0, b0, w1, b1, x, y, mask):
         """Two-stage pipelined weighted-mean loss."""
-        h = jnp.maximum(x @ w0 + b0, 0)
+        h = jnp.maximum(jnp.matmul(x, w0, precision=jax.lax.Precision.HIGHEST) + b0, 0)
         h = sxstage_iter(h)
-        out = h @ w1 + b1
+        out = jnp.matmul(h, w1, precision=jax.lax.Precision.HIGHEST) + b1
         loss = jnp.sum(((out - y) ** 2) * mask) / jnp.sum(mask)
         if with_aux:
             sq_err = jnp.sum(((out - y) ** 2) * mask) / jnp.sum(mask)
@@ -245,9 +247,9 @@ def test_aux_outputs_require_explicit_two_tuple(mesh, wdata):
     @sxjit(mesh=mesh, schedule=Std1F1B(microbatches=_M), batch_argnums=(4, 5, 6))
     def flat_triple(w0, b0, w1, b1, x, y, mask):
         """Returns a flat 3-tuple instead of (loss, aux)."""
-        h = jnp.maximum(x @ w0 + b0, 0)
+        h = jnp.maximum(jnp.matmul(x, w0, precision=jax.lax.Precision.HIGHEST) + b0, 0)
         h = sxstage_iter(h)
-        out = h @ w1 + b1
+        out = jnp.matmul(h, w1, precision=jax.lax.Precision.HIGHEST) + b1
         loss = jnp.sum(((out - y) ** 2) * mask) / jnp.sum(mask)
         return loss, loss * 2.0, jnp.sum(mask)
 
@@ -257,9 +259,9 @@ def test_aux_outputs_require_explicit_two_tuple(mesh, wdata):
     @sxjit(mesh=mesh, schedule=Std1F1B(microbatches=_M), batch_argnums=(4, 5, 6))
     def dict_return(w0, b0, w1, b1, x, y, mask):
         """Returns a dict whose first flattened scalar would silently become the loss."""
-        h = jnp.maximum(x @ w0 + b0, 0)
+        h = jnp.maximum(jnp.matmul(x, w0, precision=jax.lax.Precision.HIGHEST) + b0, 0)
         h = sxstage_iter(h)
-        out = h @ w1 + b1
+        out = jnp.matmul(h, w1, precision=jax.lax.Precision.HIGHEST) + b1
         loss = jnp.sum(((out - y) ** 2) * mask) / jnp.sum(mask)
         return {"loss": loss, "count": jnp.sum(mask)}
 
@@ -273,9 +275,9 @@ def test_aux_two_tuple_with_multi_leaf_loss_element_rejected(mesh, wdata):
     @sxjit(mesh=mesh, schedule=Std1F1B(microbatches=_M), batch_argnums=(4, 5, 6))
     def tuple_loss(w0, b0, w1, b1, x, y, mask):
         """First element is itself a 2-leaf pytree."""
-        h = jnp.maximum(x @ w0 + b0, 0)
+        h = jnp.maximum(jnp.matmul(x, w0, precision=jax.lax.Precision.HIGHEST) + b0, 0)
         h = sxstage_iter(h)
-        out = h @ w1 + b1
+        out = jnp.matmul(h, w1, precision=jax.lax.Precision.HIGHEST) + b1
         loss = jnp.sum(((out - y) ** 2) * mask) / jnp.sum(mask)
         return (loss, loss * 2.0), jnp.sum(mask)
 

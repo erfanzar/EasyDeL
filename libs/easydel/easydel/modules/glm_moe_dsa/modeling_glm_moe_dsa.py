@@ -82,11 +82,10 @@ from easydel.layers import (
     split_fused_gate_up_projection,
 )
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
+from easydel.layers.indexer import TokenIndexer, TokenIndexerConfig
 from easydel.layers.moe import moe_group_topk_select
 from easydel.layers.rotary import apply_rope_interleaved, yarn_get_mscale
 from easydel.modules._base import BaseCausalLMModule
-from easydel.operations import OperationMetadata
-from easydel.operations.kernels import GlmMoeDsaIndexerOp, GlmMoeDsaIndexerOutput
 
 from .glm_moe_dsa_configuration import GlmMoeDsaConfig
 
@@ -549,42 +548,8 @@ class GlmMoeDsaMoE(BaseMoeModule):
         return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 
 
-class GlmMoeDsaIndexer(spx.Module):
-    """Lightweight per-query top-k key selector that drives Dynamic Sparse Attention.
-
-    DSA splits the attention computation into two phases. First this indexer,
-    a tiny attention-flavoured network, scores every (query, key) pair using
-    its own ``index_n_heads``/``index_head_dim`` projections (much smaller than
-    the main attention) and selects the ``index_topk`` highest-scoring keys
-    per query. The main attention then evaluates softmax(Q · K^T) only over
-    those selected keys, turning the inner attention from O(N^2) to
-    O(N · index_topk).
-
-    Architecture details:
-
-    - **Q projection** ``wq_b`` consumes the *low-rank query residual*
-      ``q_resid`` produced upstream by the MLA query LoRA, or falls back to
-      the raw hidden state when ``q_lora_rank`` is disabled.
-    - **K projection** ``wk`` projects the full hidden state into a single
-      shared key per token (no per-head split — the indexer is a *cheap*
-      bidirectional matcher), followed by a layernorm ``k_norm`` to stabilise
-      the score scale across positions.
-    - **Per-head weights** ``kernels_proj`` outputs a learned weight per
-      query-head per token (scaled by ``1 / sqrt(index_n_heads)``) so the
-      indexer can softly upweight or downweight individual indexer heads in
-      the final score reduction. This is computed in fp32 to keep the
-      relative head balance well-defined.
-    - **RoPE** is shared with the main attention via ``frequencies``; the
-      ``indexer_rope_interleave`` flag selects between half-rotation and
-      interleaved layouts.
-    - **KV cache** for autoregressive decoding is stored on the indexer
-      itself (``cached_keys``); the indexer signals ``reset_cache`` whenever
-      it sees a multi-token sequence (prefill).
-
-    The actual top-k scoring and gather are delegated to
-    :class:`GlmMoeDsaIndexerOp` (a kernel-fused op) so the entire indexer is
-    one fused launch on TPU/GPU.
-    """
+class GlmMoeDsaIndexer(TokenIndexer):
+    """GLM-MoE-DSA config/norm adapter for the operation-backed token indexer."""
 
     def __init__(
         self,
@@ -595,142 +560,28 @@ class GlmMoeDsaIndexer(spx.Module):
         *,
         rngs: spx.Rngs,
     ):
-        """Initialize the DSA per-query top-k key indexer.
-
-        Args:
-            config: Model configuration carrying the indexer hyper-params
-                (``index_n_heads``, ``index_head_dim``, ``index_topk``,
-                ``indexer_rope_interleave``, ``q_lora_rank``).
-            dtype: Computation dtype.
-            param_dtype: Parameter dtype.
-            precision: JAX matmul precision.
-            rngs: Random number generator collection.
-        """
-        self.config = config
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.index_n_heads = config.index_n_heads
-        self.index_head_dim = config.index_head_dim
-        self.index_topk = config.index_topk
-        self.softmax_scale = self.index_head_dim**-0.5
-        self.indexer_rope_interleave = bool(getattr(config, "indexer_rope_interleave", False))
-        q_input_dim = config.q_lora_rank if config.q_lora_rank is not None else config.hidden_size
-
-        self.wq_b = ColumnParallelLinear(
-            q_input_dim,
-            self.index_n_heads * self.index_head_dim,
-            rngs=rngs,
-            use_bias=False,
+        """Preserve the GLM checkpoint layout and registered operation dispatch."""
+        super().__init__(
+            TokenIndexerConfig(
+                hidden_size=config.hidden_size,
+                q_input_dim=config.q_lora_rank if config.q_lora_rank is not None else config.hidden_size,
+                num_heads=config.index_n_heads,
+                head_dim=config.index_head_dim,
+                topk=config.index_topk,
+                rope_dim=config.qk_rope_head_dim,
+                rope_interleave=bool(getattr(config, "indexer_rope_interleave", False)),
+                initializer_range=config.initializer_range,
+            ),
             dtype=dtype,
             param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
-        )
-        self.wk = ColumnParallelLinear(
-            config.hidden_size,
-            self.index_head_dim,
             rngs=rngs,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-        )
-        self.k_norm = GlmMoeDsaLayerNorm(
-            self.index_head_dim,
-            eps=1e-6,
-            rngs=rngs,
-            dtype=dtype,
-            param_dtype=param_dtype,
-        )
-        self.kernels_proj = ColumnParallelLinear(
-            config.hidden_size,
-            self.index_n_heads,
-            rngs=rngs,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-        )
-
-        metadata = OperationMetadata(
-            runtime_dtype=dtype,
-            runtime_softmax_dtype=jnp.float32,
             base_config=config,
+            norm_factory=partial(
+                GlmMoeDsaLayerNorm, config.index_head_dim, eps=1e-6, rngs=rngs, dtype=dtype, param_dtype=param_dtype
+            ),
         )
-        self.indexer_op = GlmMoeDsaIndexerOp(metadata)
-
-    @property
-    def reform_param(self):
-        return {
-            "weights_proj.weight$": {
-                "splits": [
-                    {"name": "kernels_proj.weight", "spliter": lambda x: x.swapaxes(-1, -2)},
-                ],
-                "inverse_spliter": lambda x: x.swapaxes(-1, -2),
-            },
-        }
-
-    def forward(
-        self,
-        hidden_states: Float[Array, "batch seq hidden_dim"],
-        q_resid: Float[Array, "batch seq q_rank"] | None,
-        position_ids: Int[Array, "batch seq"],
-        frequencies: Float[Array, "max_seq rope_dim_x2"] | None = None,
-        attention_mask: Bool[Array, "batch seq kv"] | Float[Array, "batch seq kv"] | None = None,
-        cached_keys: Float[Array, "batch cached_seq head_dim"] | None = None,
-        use_cache: bool = False,
-    ) -> GlmMoeDsaIndexerOutput:
-        """Score every (query, key) pair and select the top ``index_topk`` keys.
-
-        Args:
-            hidden_states: Token activations
-                ``(batch, seq, hidden_size)`` providing the K side of the
-                index.
-            q_resid: MLA Q low-rank residual
-                ``(batch, seq, q_lora_rank)``; falls back to
-                ``hidden_states`` when ``q_lora_rank`` is disabled.
-            position_ids: Position indices used by RoPE.
-            frequencies: Optional pre-computed RoPE table shared with the
-                main attention.
-            attention_mask: Optional bidirectional mask threaded into the
-                fused indexer kernel.
-            cached_keys: Optional indexer K cache
-                ``(batch, cached_seq, index_head_dim)`` for autoregressive
-                decoding.
-            use_cache: Whether to update / read the indexer's own KV cache.
-
-        Returns:
-            :class:`GlmMoeDsaIndexerOutput` with the top-k key indices
-            and the gathered scores consumed by the main MLA attention.
-        """
-        q_input = q_resid if q_resid is not None else hidden_states
-        query_states = self.wq_b(q_input).reshape(
-            hidden_states.shape[0],
-            hidden_states.shape[1],
-            self.index_n_heads,
-            self.index_head_dim,
-        )
-        key_states = self.k_norm(self.wk(hidden_states))
-        head_weights = self.kernels_proj(hidden_states).astype(jnp.float32) * (self.index_n_heads**-0.5)
-
-        return self.indexer_op(
-            query_states=query_states,
-            key_states=key_states,
-            head_weights=head_weights,
-            position_ids=position_ids,
-            qk_rope_head_dim=self.config.qk_rope_head_dim,
-            index_topk=self.index_topk,
-            softmax_scale=self.softmax_scale,
-            frequencies=frequencies,
-            attention_mask=attention_mask,
-            cached_keys=cached_keys,
-            use_cache=use_cache,
-            reset_cache=hidden_states.shape[1] > 1,
-            indexer_rope_interleave=self.indexer_rope_interleave,
-        )
+        self.config = config
 
 
 class GlmMoeDsaAttention(UnifiedAttention):
@@ -1205,7 +1056,9 @@ class GlmMoeDsaAttention(UnifiedAttention):
                 else int(hidden_states.shape[1])
             )
             if topk_kv_len == kv_len and mask_info is not None:
-                topk_mask = jnp.any(jax.nn.one_hot(topk_indices, kv_len, dtype=jnp.bool_), axis=-2)
+                topk_mask = indexer_output.topk_mask
+                if topk_mask is None or topk_mask.shape[-1] != kv_len:
+                    topk_mask = jnp.any(jax.nn.one_hot(topk_indices, kv_len, dtype=jnp.bool_), axis=-2)
                 attention_mask = pairwise_attention_mask_from_mask_info(mask_info, q_len, kv_len)
                 if attention_mask is not None:
                     mask_info = mask_info.replace(attention_mask=(attention_mask & topk_mask)[:, None, :, :])

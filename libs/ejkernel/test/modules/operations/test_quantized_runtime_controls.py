@@ -780,3 +780,42 @@ def test_quantized_matmul_affine_non_power_two_bits_match_reference(bits: int):
         fuse=False,
     )
     np.testing.assert_allclose(np.asarray(y_auto), np.asarray(y_ref), rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("bits", [4, 8])
+@pytest.mark.parametrize(
+    "block_m,block_n",
+    [pytest.param(0, 128, id="blocked-disabled"), pytest.param(128, 16, id="blocked-rejected")],
+)
+def test_xla_affine_fallback_preserves_canonical_zeros(bits: int, block_m: int, block_n: int):
+    """Supported widths falling back to dense decode must retain stored metadata."""
+    from ejkernel.kernels._xla.quantized_matmul import quantized_matmul as xla_quantized_matmul
+
+    # Hand-pack known codes instead of deriving the oracle with production
+    # quantization/dequantization. All expected weights are exactly representable
+    # in both bf16 and fp16, so backend dequant defaults need not be overridden.
+    codes = [2, 3, 4, 5] * 8
+    values_per_word = 32 // bits
+    words = [
+        sum(code << (bits * index) for index, code in enumerate(codes[start : start + values_per_word]))
+        for start in range(0, len(codes), values_per_word)
+    ]
+    w_q = jnp.asarray([words, words], dtype=jnp.uint32)
+    # In bf16, 3 * (254/128) = 5.953125 ties and rounds to 5.9375;
+    # dividing back rounds to 2.984375, not 3. The second K row also checks
+    # finite zero-scale metadata.
+    scale = 254 / 128
+    scales = jnp.asarray([[scale], [0.0]], dtype=jnp.bfloat16)
+    zeros = jnp.asarray([[3.0], [7.0]], dtype=jnp.bfloat16)
+    x = jnp.eye(2, dtype=jnp.float32)
+    expected = np.stack([(np.asarray(codes, dtype=np.float32) - 3.0) * scale, np.zeros(32, dtype=np.float32)])
+
+    kwargs = dict(mode="affine", bits=bits, group_size=32, axis="row", block_m=block_m, block_n=block_n)
+    actual = xla_quantized_matmul(x, w_q, scales, zeros, allow_dense_fallback=True, **kwargs)
+    assert actual.shape == (2, 32)
+    assert actual.dtype == jnp.float32
+    np.testing.assert_allclose(np.asarray(actual), expected, rtol=1e-6, atol=1e-6)
+
+    # These configurations must still fail when dense fallback is forbidden.
+    with pytest.raises(ValueError, match="allow_dense_fallback=False"):
+        xla_quantized_matmul(x, w_q, scales, zeros, allow_dense_fallback=False, **kwargs)
