@@ -151,10 +151,14 @@ def ste(func):
 
     def _fwd(x, *args, **kwargs):
         y = func(x, *args, **kwargs)
-        return y, (len(args), tuple(kwargs.keys()))
+        # A zero-size array carries ``x``'s dtype as a valid JAX residual so the
+        # backward pass can return the cotangent in the input dtype (e.g. fp32
+        # master weights) instead of the quantized output dtype (e.g. fp4/fp8).
+        x_dtype = None if isinstance(x, ImplicitArray) else jnp.zeros((0,), dtype=jnp.result_type(x))
+        return y, (len(args), tuple(kwargs.keys()), x_dtype)
 
     def _bwd(res, g):
-        num_args, kw_keys = res
+        num_args, kw_keys, x_dtype = res
 
         def _materialize_if_needed(val):
             if isinstance(val, ImplicitArray):
@@ -165,6 +169,8 @@ def ste(func):
             g = g.materialize()
         else:
             g = tu.tree_map(_materialize_if_needed, g)
+        if x_dtype is not None:
+            g = tu.tree_map(lambda v: v.astype(x_dtype.dtype), g)
         cot_args = (g,) + (None,) * num_args
         if kw_keys:
             cot_kwargs = {k: None for k in kw_keys}

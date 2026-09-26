@@ -243,3 +243,32 @@ def test_int8_dot_general_preserves_dtype_precision_and_input_gradients(dtype, d
         return {"projection": y, "summary": (jnp.sum(y, axis=-1),)}
 
     _assert_int8_projection_and_grad(projection, x, quantized)
+
+
+@pytest.mark.parametrize("use_jit", [False, True])
+@pytest.mark.parametrize("narrow_dtype", [jnp.float8_e4m3fn, jnp.float4_e2m1fn, jnp.bfloat16])
+def test_ste_returns_cotangent_in_input_dtype(narrow_dtype, use_jit):
+    from eformer.jaximus import ste
+
+    @ste
+    def cast(w):
+        return w.astype(narrow_dtype)
+
+    weights = jnp.linspace(-1.0, 1.0, 16, dtype=jnp.float32)
+    # Cotangent values that are not representable in the narrow dtype.
+    upstream = jnp.linspace(0.1234567, 0.9876543, 16, dtype=jnp.float32)
+
+    def loss(w):
+        return jnp.sum(cast(w).astype(jnp.float32) * upstream)
+
+    grad_fn = jax.grad(loss)
+    if use_jit:
+        grad_fn = jax.jit(grad_fn)
+    grads = grad_fn(weights)
+
+    assert grads.dtype == jnp.float32
+    # The STE backward is the identity on the upstream cotangent. The cotangent reaching
+    # the STE is ``upstream`` cast to the narrow output dtype (by ``astype``'s transpose);
+    # it must come back as float32 rather than staying in the narrow dtype.
+    expected = upstream.astype(narrow_dtype).astype(jnp.float32)
+    np.testing.assert_array_equal(np.asarray(grads), np.asarray(expected))

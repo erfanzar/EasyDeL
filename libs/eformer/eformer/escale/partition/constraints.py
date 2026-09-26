@@ -84,7 +84,7 @@ def names_in_current_mesh(*names: str) -> bool:
     Returns:
         True if all given names are present in the current mesh, False otherwise.
     """
-    mesh_axis_names = pxla.thread_resources.env.physical_mesh.axis_names
+    mesh_axis_names = get_incontext_mesh(raise_error=False).axis_names
     return set(names) <= set(mesh_axis_names)
 
 
@@ -711,8 +711,9 @@ def get_incontext_mesh(raise_error: bool = True) -> Mesh:
     """Retrieve the mesh object active in the current execution context.
 
     This function accesses the physical mesh defined within the thread's
-    resource environment (pxla.thread_resources.env.physical_mesh). It is
-    commonly used to get the mesh when inside a `with mesh:` context.
+    resource environment (pxla.thread_resources.env.physical_mesh), falling
+    back to the concrete mesh installed by `jax.set_mesh`. It is commonly
+    used to get the mesh inside a `with mesh:` or `jax.set_mesh` context.
 
     Args:
         raise_error: If True (default), raises an AssertionError when no
@@ -733,6 +734,17 @@ def get_incontext_mesh(raise_error: bool = True) -> Mesh:
         ('dp', 'tp')
     """
     mesh = pxla.thread_resources.env.physical_mesh
+    if mesh.empty:
+        # ``jax.set_mesh`` installs a concrete mesh without touching the legacy
+        # thread resources; it stays readable while tracing under ``jax.jit``.
+        try:
+            from jax._src.mesh import get_concrete_mesh
+
+            concrete = get_concrete_mesh()
+        except Exception:
+            concrete = None
+        if isinstance(concrete, Mesh) and not concrete.empty:
+            return concrete
     if mesh.empty:
         if raise_error:
             raise AssertionError("No mesh found under this context manager.")

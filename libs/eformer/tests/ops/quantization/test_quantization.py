@@ -77,9 +77,24 @@ class TestNF4Quantization:
             ]
         )
 
-        max_error = jnp.max(jnp.abs(approx_values - nf4_expected))
-        # Polynomial approximation has some error, but should be < 1.5% for NF4 values
-        assert max_error < 0.015, f"Polynomial approximation error {max_error:.6f} too high"
+        # Dequantization must reproduce the quantizer's codebook exactly (code 7 -> 0.0).
+        np.testing.assert_array_equal(np.asarray(approx_values), np.asarray(nf4_expected, dtype=np.float32))
+
+    def test_nf4_codebook_points_round_trip_exactly(self):
+        """Values on the codebook grid survive quantize -> dequantize bit-exactly."""
+        codebook = np.asarray(
+            [
+                -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
+                -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
+                0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224,
+                0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0,
+            ],
+            dtype=np.float32,
+        )  # fmt: skip
+        # One 64-wide block per row; the row absmax is 1.0 so the scale is exact.
+        rows = np.stack([np.roll(np.tile(codebook, 4), r) for r in range(4)]).astype(np.float32)
+        reconstructed = ArrayNF4.quantize(jnp.asarray(rows), block_size=64).materialize()
+        np.testing.assert_allclose(np.asarray(reconstructed, np.float32), rows, rtol=0, atol=1e-7)
 
     def test_nf4_block_sizes(self, random_matrix):
         """Test different block sizes for quantization."""

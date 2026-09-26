@@ -582,6 +582,56 @@ class TestBuilderPattern:
         _assert_tree_allclose(actual_params, expected_params, atol=1e-6, rtol=1e-6)
         _assert_tree_allclose(actual_state, expected_state, atol=1e-6, rtol=1e-6)
 
+    @pytest.mark.parametrize(
+        ("optimizer_type", "optimizer_config"),
+        [
+            ("adamw", AdamWConfig()),
+            ("lion", LionConfig()),
+            ("rmsprop", RMSPropConfig()),
+            ("adafactor", AdafactorConfig()),
+            ("mars", MarsConfig(max_grad_norm=None)),
+            ("muon", MuonConfig()),
+            ("quad", WhiteKronConfig(dtype=jnp.float32, block_size=4, noise_scale=0.0)),
+            ("skew", WhiteKronConfig(dtype=jnp.float32, block_size=4, noise_scale=0.0)),
+        ],
+    )
+    def test_factory_stage_local_masked_weight_decay_matches_optax_update(self, optimizer_type, optimizer_config):
+        """A factory ``weight_decay_mask`` wraps decay in ``optax.masked`` (``MaskedState``)."""
+        scheduler_config = SchedulerConfig(learning_rate=0.1)
+        params = {
+            "w": jnp.array([[1.0, -2.0], [0.5, -0.25]], dtype=jnp.float32),
+            "b": jnp.array([0.25, -0.5], dtype=jnp.float32),
+        }
+        grads = {
+            "w": jnp.array([[0.25, -0.5], [0.125, -0.25]], dtype=jnp.float32),
+            "b": jnp.array([0.05, -0.1], dtype=jnp.float32),
+        }
+
+        tx, scheduler = OptimizerFactory.create(
+            optimizer_type,
+            scheduler_config,
+            optimizer_config,
+            weight_decay=0.5,
+            weight_decay_mask={"w": True, "b": False},
+        )
+        expected_params = params
+        actual_params = params
+        expected_state = tx.init(params)
+        actual_state = tx.init(params)
+        assert any(isinstance(s, optax.MaskedState) for s in expected_state)
+        for _ in range(2):
+            updates, expected_state = tx.update(grads, expected_state, expected_params)
+            expected_params = optax.apply_updates(expected_params, updates)
+            actual_params, actual_state = tx.apply_gradients_stage_local(
+                params=actual_params,
+                grads=jax.tree_util.tree_map(lambda x: x + jnp.asarray(0, x.dtype), grads),
+                opt_state=actual_state,
+                learning_rate_fn=scheduler,
+            )
+            assert jax.tree.structure(actual_state) == jax.tree.structure(expected_state)
+            _assert_tree_allclose(actual_params, expected_params, atol=1e-6, rtol=1e-6)
+            _assert_tree_allclose(actual_state, expected_state, atol=1e-6, rtol=1e-6)
+
     @pytest.mark.parametrize("optimizer_type", ["quad", "skew"])
     @pytest.mark.parametrize("zero_gradient", [False, True])
     def test_white_kron_rank_deficient_gradients_remain_finite(self, optimizer_type, zero_gradient):
