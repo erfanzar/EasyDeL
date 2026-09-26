@@ -46,26 +46,53 @@ class TestSliceHosts:
         assert slice_hosts("v4-32") == 4  # 16 chips
 
     def test_single_core_generations(self):
-        assert slice_hosts("v5litepod-8") == 1  # 8 chips, 8 per host
-        assert slice_hosts("v5litepod-16") == 2
-        assert slice_hosts("v6e-16") == 4  # 16 chips, 4 per host
+        # <=8-chip v5e/v6e slices are one VM; multi-host slices use 4-chip VMs.
+        for acc_type in ("v5litepod-1", "v5litepod-4", "v5litepod-8", "v6e-1", "v6e-4", "v6e-8"):
+            assert slice_hosts(acc_type) == 1, acc_type
+        assert slice_hosts("v5litepod-16") == 4  # 16 chips, 4 per host
+        assert slice_hosts("v5litepod-256") == 64
+        assert slice_hosts("v6e-16") == 4
+        assert slice_hosts("v6e-256") == 64
+
+    def test_v5p_resource_is_physical_chips(self):
+        # v5p semantics are unchanged: TPU resource = physical chips per host.
+        assert make_node_type("v5p-8", spot=True)["resources"]["TPU"] == 4
+        assert make_node_type("v5p-1024", spot=True)["resources"]["TPU"] == 4
+        assert slice_hosts("v5p-1024") * make_node_type("v5p-1024", spot=True)["resources"]["TPU"] == 512
 
 
 class TestResourceLabelDrift:
     """The generator and connect-mode must advertise identical labels."""
 
     def test_generator_matches_build_ray_resource_flags(self):
-        for acc_type in ("v5p-8", "v5p-64", "v4-32", "v5litepod-16", "v6e-16"):
+        # Per-host labels are identical to connect-mode workers, plus the one
+        # slice-head label Ray's TPU command runner strips from workers != 0.
+        for acc_type in ("v5p-8", "v5p-64", "v4-32", "v5litepod-16", "v6e-8", "v6e-16"):
             hosts = slice_hosts(acc_type)
             node = make_node_type(acc_type, spot=True)
-            connect_mode = json.loads(
+            connect_worker = json.loads(
                 build_ray_resource_flags(
                     TpuInfo.from_ips(["10.0.0.1"] * hosts, acc_type),
-                    is_head=True,
+                    is_head=False,
                 )
             )
             generator_labels = {k: v for k, v in node["resources"].items() if k != "CPU"}
-            assert generator_labels == connect_mode, acc_type
+            assert generator_labels == {**connect_worker, f"TPU-{acc_type}-head": 1}, acc_type
+
+    def test_only_the_ray_strippable_head_label_is_advertised(self):
+        # Ray applies node-type resources to every host of a pod and strips
+        # only TPU-{type}-head from workers != 0 (tpu_command_runner.
+        # _maybe_remove_head_resource); any other head-ish label would land
+        # on every host.
+        from ray._private import ray_constants
+        from ray.autoscaler._private.gcp.tpu_command_runner import _maybe_remove_head_resource
+
+        resources = make_node_type("v5p-64", spot=True)["resources"]
+        env = {ray_constants.RESOURCES_ENVIRONMENT_VARIABLE: resources}
+        worker3 = _maybe_remove_head_resource(env, 3, "v5p-64")[ray_constants.RESOURCES_ENVIRONMENT_VARIABLE]
+        assert not any("head" in k for k in worker3), worker3
+        worker0 = _maybe_remove_head_resource(env, 0, "v5p-64")[ray_constants.RESOURCES_ENVIRONMENT_VARIABLE]
+        assert worker0["TPU-v5p-64-head"] == 1
 
     def test_head_label_casing_matches_pool_scheduler(self):
         # SlicePoolManager schedules on TPU-{type}-head; casing is load-bearing.
@@ -75,7 +102,8 @@ class TestResourceLabelDrift:
 
     def test_physical_chip_counts(self):
         assert make_node_type("v5p-64", spot=True)["resources"]["TPU"] == 4
-        assert make_node_type("v5litepod-16", spot=True)["resources"]["TPU"] == 8
+        assert make_node_type("v5litepod-16", spot=True)["resources"]["TPU"] == 4  # 4 hosts x 4 chips
+        assert make_node_type("v6e-8", spot=True)["resources"]["TPU"] == 8  # 1 host x 8 chips
 
     def test_labels_helper_consistency(self):
         labels = tpu_resource_labels("v5p-8", 1, is_head=True)

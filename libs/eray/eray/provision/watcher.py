@@ -42,14 +42,16 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from .fleet import describe_node, head_reachable
 from .qr import QueuedResource, create_queued_resource, delete_queued_resource, describe_queued_resource
-from .registry import ClusterRecord, ClusterRegistry
+from .registry import LEASE_TTL_S, ClusterRecord, ClusterRegistry
 
 EVENTS_PATH = Path("~/.eray/events.jsonl").expanduser()
 PAUSE_DIR = Path("~/.eray").expanduser()
@@ -191,7 +193,10 @@ def plan(record: ClusterRecord, obs: Observed, policy: WatchPolicy) -> list[Acti
 
     # ── Definitive preemption / capacity loss ───────────────────
     if dead_node or (not healthy_node and obs.node_state is None and qr_gone_or_dead):
-        if obs.qr_state == "FAILED" and _is_quota_failure(obs.qr_error):
+        acknowledged = record.extra.get("resumed_qr") == (record.qr_id or record.name)
+        if obs.qr_state == "FAILED" and _is_quota_failure(obs.qr_error) and not acknowledged:
+            # A `fleet resume` of HALTED_QUOTA acknowledges this QR's failure:
+            # fall through to recovery (delete + re-queue) instead of re-halting.
             return [
                 Action("event", {"event": "qr_failed_quota", "detail": obs.qr_error[:300]}),
                 Action("halt", {"state": "HALTED_QUOTA"}),
@@ -233,9 +238,16 @@ def _recovery_actions(record: ClusterRecord, obs: Observed, policy: WatchPolicy,
             Action("event", {"event": "halted_budget", "detail": "daily recreate budget exhausted"}),
             Action("halt", {"state": "HALTED_BUDGET"}),
         ]
+    # The incident counters (unreach_ticks / repair_attempted) belong to the
+    # slice being replaced: reset them, or generation N+1 — READY before its
+    # Ray head is up — would inherit "repair already attempted" and be
+    # recreated on sight. The attempt is budgeted *before* any mutating call,
+    # so a delete/create that fails immediately still counts toward the
+    # budget and halts instead of looping.
     actions = [
         Action("event", {"event": "preemption_detected", "detail": reason}),
-        Action("set_state", {"state": "DEGRADED"}),
+        Action("set_state", {"state": "DEGRADED", "reset_incident": True}),
+        Action("record_recreate", {"ts": obs.now}),
     ]
     # Delete only a QR the record owns, and only when it is not serving live
     # capacity (dead/suspended/failed — or lingering under a dead node, which
@@ -243,8 +255,7 @@ def _recovery_actions(record: ClusterRecord, obs: Observed, policy: WatchPolicy,
     if obs.qr_state is not None:
         actions.append(Action("delete_qr", {"qr_id": record.qr_id or record.name, "force": obs.node_state is not None}))
     actions.append(Action("create_qr", {"qr_id": record.next_qr_id()}))
-    actions.append(Action("record_recreate", {"ts": obs.now}))
-    actions.append(Action("set_state", {"state": "WAITING"}))
+    actions.append(Action("set_state", {"state": "WAITING", "reset_incident": True}))
     return actions
 
 
@@ -327,7 +338,7 @@ def _qr_error(qr: QueuedResource | None) -> str:
     return json.dumps(qr.raw["state"].get("failedData", "")) if qr.raw["state"].get("failedData") else ""
 
 
-def _list_jobs(head_ip: str) -> list[dict]:
+def _list_jobs(head_ip: str) -> list[dict] | None:
     """Snapshot running/pending jobs from a live head's Jobs API.
 
     Args:
@@ -335,8 +346,9 @@ def _list_jobs(head_ip: str) -> list[dict]:
 
     Returns:
         One dict per RUNNING/PENDING job: submission_id, entrypoint,
-        metadata, status. Empty on any API failure (snapshotting must never
-        break the health path).
+        metadata, runtime_env, status. None on any API failure — "could not
+        ask" must not overwrite the last good snapshot with an empty one
+        (and snapshotting must never break the health path).
     """
     try:
         from ray.job_submission import JobSubmissionClient
@@ -351,12 +363,37 @@ def _list_jobs(head_ip: str) -> list[dict]:
                         "submission_id": job.submission_id,
                         "entrypoint": job.entrypoint,
                         "metadata": dict(job.metadata or {}),
+                        "runtime_env": dict(getattr(job, "runtime_env", None) or {}),
                         "status": status,
                     }
                 )
         return out
     except Exception:
-        return []
+        return None
+
+
+def _portable_runtime_env(runtime_env: dict | None) -> dict[str, Any]:
+    """The part of a snapshotted runtime_env that survives a slice loss.
+
+    Uploaded packages (``working_dir`` / ``py_modules`` entries) were
+    rewritten to ``gcs://_ray_pkg_*`` URIs that lived in the dead head's GCS,
+    so they are dropped; everything else (``env_vars``, ``pip``, ...) is kept.
+
+    Args:
+        runtime_env: The job's runtime_env as reported by the Jobs API.
+
+    Returns:
+        A fresh dict safe to submit to a new cluster.
+    """
+    out = {k: v for k, v in (runtime_env or {}).items() if k != "working_dir"}
+    modules = out.pop("py_modules", None)
+    if modules:
+        kept = [m for m in modules if not str(m).startswith("gcs://")]
+        if kept:
+            out["py_modules"] = kept
+    if "env_vars" in out:
+        out["env_vars"] = dict(out["env_vars"] or {})
+    return out
 
 
 def resubmit_jobs(record: ClusterRecord, head_ip: str, policy: WatchPolicy, *, emit) -> list[str]:
@@ -365,9 +402,11 @@ def resubmit_jobs(record: ClusterRecord, head_ip: str, policy: WatchPolicy, *, e
     Eligibility: the job carried ``restartable=1`` metadata (``eray run
     --restartable``) and was RUNNING/PENDING in the last healthy snapshot.
     Resubmissions get deterministic ids ``{base}-p{n}`` (idempotent: the Jobs
-    API rejects duplicates) and the ERAY_* restart env contract; the
-    working_dir is re-packaged from the recorded cwd when it still exists on
-    this machine (same-box model).
+    API rejects duplicates), the original runtime_env (env vars such as
+    HF_TOKEN/WANDB_*/``--env``, pip, ...) plus the ERAY_* restart env
+    contract; the working_dir is re-packaged from the directory ``eray run``
+    packaged (``working_dir`` metadata; legacy jobs fall back to the recorded
+    cwd) when it still exists on this machine (same-box model).
 
     Args:
         record: Cluster record (source of the snapshot + generation).
@@ -404,14 +443,17 @@ def resubmit_jobs(record: ClusterRecord, head_ip: str, policy: WatchPolicy, *, e
         new_id = f"{base}-p{restart_count}"
         if new_id in existing:
             continue  # crash-replay: already resubmitted
-        runtime_env: dict[str, Any] = {}
-        cwd = meta.get("cwd")
-        if cwd and os.path.isdir(cwd):
-            runtime_env["working_dir"] = cwd
-        elif cwd:
-            emit("job_skipped", f"{new_id}: recorded cwd {cwd} missing on this machine")
+        runtime_env = _portable_runtime_env(job.get("runtime_env"))
+        # `eray run` records the packaged dir ("" for --no-working-dir);
+        # jobs submitted before that key existed only carry the cwd.
+        working_dir = meta["working_dir"] if "working_dir" in meta else meta.get("cwd")
+        if working_dir and os.path.isdir(working_dir):
+            runtime_env["working_dir"] = working_dir
+        elif working_dir:
+            emit("job_skipped", f"{new_id}: recorded working dir {working_dir} missing on this machine")
             continue
         runtime_env["env_vars"] = {
+            **(runtime_env.get("env_vars") or {}),
             "ERAY_RESTART_COUNT": str(restart_count),
             "ERAY_PREEMPTED_FROM": str(job.get("submission_id")),
             "ERAY_CLUSTER_GENERATION": str(record.generation),
@@ -445,6 +487,7 @@ def execute_actions(
     resubmit: bool = False,
     dry_run: bool = False,
     emit=None,
+    lease_ok: Callable[[], bool] | None = None,
 ) -> None:
     """Apply planned actions for one cluster.
 
@@ -457,6 +500,10 @@ def execute_actions(
         dry_run: Log actions without executing anything mutating.
         emit: Optional ``emit(event, detail)`` override; defaults to the
             event log.
+        lease_ok: Optional ownership check consulted before every action;
+            when it returns False the remaining actions are abandoned (a
+            watcher that lost the fleet lease must stop acting — the new
+            holder re-plans from the persisted state).
     """
     name = record.name
 
@@ -470,6 +517,9 @@ def execute_actions(
         if dry_run:
             _emit("dry_run", f"{action.kind} {action.args}")
             continue
+        if lease_ok is not None and not lease_ok():
+            _emit("lease_lost", f"fleet lease lost; not executing {action.kind}")
+            return
         if action.kind == "event":
             _emit(action.args["event"], action.args.get("detail", ""))
         elif action.kind == "set_state":
@@ -509,11 +559,24 @@ def execute_actions(
                 r.intent = {"action": "qr_create", "target": qid}
                 r.generation += 1
                 r.qr_id = qid
+                r.extra.pop("resumed_qr", None)  # a resume acknowledged the previous QR only
 
             registry.mutate_record(name, _pre)
             fresh = registry.get(name)
-            if describe_queued_resource(qr_id, project=record.project, zone=record.zone) is None:
-                create_queued_resource(_spec_from_record(fresh), qr_id=qr_id)
+            try:
+                if describe_queued_resource(qr_id, project=record.project, zone=record.zone) is None:
+                    create_queued_resource(_spec_from_record(fresh), qr_id=qr_id)
+            except Exception as exc:
+                # The attempt is already budgeted (record_recreate runs
+                # first), so a transient failure re-plans next tick and halts
+                # at the budget; a quota/permission rejection halts now.
+                registry.mutate_record(name, lambda r: setattr(r, "intent", None))
+                if _is_quota_failure(str(exc)):
+                    _emit("qr_failed_quota", str(exc)[:300])
+                    _emit("halted", "HALTED_QUOTA")
+                    registry.mutate_record(name, lambda r: setattr(r, "state", "HALTED_QUOTA"))
+                    return
+                raise
             registry.mutate_record(name, lambda r: setattr(r, "intent", None))
         elif action.kind == "record_recreate":
 
@@ -557,6 +620,74 @@ def execute_actions(
             registry.mutate_record(name, lambda r, a=action: setattr(r, "state", a.args["state"]))
 
 
+class LeaseKeeper:
+    """Keeps the fleet lease alive while a tick runs long operations.
+
+    A single tick can block far longer than the lease TTL (QR delete waits up
+    to 10 minutes, connect/bootstrap longer), so renewing once per tick lets
+    the lease expire mid-action and a second watcher take over while this
+    one is still acting. The keeper renews from a daemon thread every
+    ``interval`` seconds and exposes :meth:`held`, which turns False as soon
+    as another holder is observed or renewals have failed long enough that
+    the lease may have expired.
+    """
+
+    def __init__(self, registry: ClusterRegistry, *, ttl: float = LEASE_TTL_S, interval: float | None = None):
+        """Initialize the keeper (call right after a successful acquire).
+
+        Args:
+            registry: The registry holding the lease.
+            ttl: Lease validity per renewal, in seconds.
+            interval: Renewal period (default ``ttl / 4``).
+        """
+        self.registry = registry
+        self.ttl = float(ttl)
+        self.interval = self.ttl / 4 if interval is None else float(interval)
+        self._last_ok = time.time()
+        self._lost = threading.Event()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def held(self) -> bool:
+        """Whether this process can still be sure it holds the lease."""
+        return not self._lost.is_set() and time.time() - self._last_ok < self.ttl - self.interval
+
+    def renew(self) -> bool:
+        """Renew the lease once.
+
+        Returns:
+            :meth:`held` after the attempt. A live lease held elsewhere marks
+            the lease lost for good; a transient registry error only counts
+            against the expiry margin.
+        """
+        try:
+            ok = self.registry.acquire_lease(ttl=self.ttl)
+        except Exception:
+            return self.held()
+        if ok:
+            self._last_ok = time.time()
+        else:
+            self._lost.set()
+        return self.held()
+
+    def start(self) -> None:
+        """Start the background renewal thread."""
+
+        def _loop() -> None:
+            while not self._stop.wait(self.interval):
+                if not self.renew() and self._lost.is_set():
+                    return
+
+        self._thread = threading.Thread(target=_loop, name="eray-lease-keeper", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop the renewal thread (does not release the lease)."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+
+
 def watch_and_reconnect(
     names: list[str] | None = None,
     *,
@@ -582,18 +713,28 @@ def watch_and_reconnect(
             addition to the event log.
 
     Raises:
-        RuntimeError: If another live watcher holds the fleet lease.
+        RuntimeError: If another live watcher holds the fleet lease, or this
+            watcher loses it while running (it stops acting immediately).
     """
     registry = registry or ClusterRegistry.from_config()
     policy = policy or WatchPolicy()
     interval = float(os.getenv("ERAY_WATCH_INTERVAL", "30")) if interval is None else interval
 
-    if not dry_run and not registry.acquire_lease():
-        raise RuntimeError(f"another watcher holds the fleet lease ({registry.lease_holder()})")
+    keeper: LeaseKeeper | None = None
+    if not dry_run:
+        if not registry.acquire_lease():
+            raise RuntimeError(f"another watcher holds the fleet lease ({registry.lease_holder()})")
+        keeper = LeaseKeeper(registry)
+        keeper.start()
+
+    def _lease_lost() -> RuntimeError:
+        return RuntimeError(f"lost the fleet lease (now held by {registry.lease_holder()}); stopping")
 
     try:
         while True:
             for name, record in sorted(registry.load().items()):
+                if keeper is not None and not keeper.held():
+                    raise _lease_lost()
                 if names and name not in names:
                     continue
                 if paused(name):
@@ -609,15 +750,26 @@ def watch_and_reconnect(
                 try:
                     obs = observe(record, snapshot_jobs=resubmit)
                     actions = plan(record, obs, policy)
-                    execute_actions(record, actions, registry, policy, resubmit=resubmit, dry_run=dry_run, emit=_emit)
+                    execute_actions(
+                        record,
+                        actions,
+                        registry,
+                        policy,
+                        resubmit=resubmit,
+                        dry_run=dry_run,
+                        emit=_emit,
+                        lease_ok=keeper.held if keeper is not None else None,
+                    )
                 except Exception as exc:  # one cluster's failure must not stop the loop
                     _emit("watch_error", f"{type(exc).__name__}: {exc}")
             if once:
                 return
-            if not dry_run:
-                registry.acquire_lease()  # heartbeat
+            if keeper is not None and not keeper.renew():  # heartbeat
+                raise _lease_lost()
             time.sleep(interval)
     finally:
+        if keeper is not None:
+            keeper.stop()
         if not dry_run:
             try:
                 registry.release_lease()

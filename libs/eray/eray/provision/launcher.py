@@ -53,16 +53,26 @@ DEFAULT_IMAGE = "ghcr.io/erfanzar/easydel:latest-tpu"
 DEFAULT_FAMILIES = ("v4", "v5e", "v5p", "v6e")
 DEFAULT_OUTPUT_DIR = Path("~/.eray/autoscale").expanduser()
 
-#: Physical chips per host by family (drives node-type host math). v2-v5p
-#: hosts carry 4 chips; v5e hosts carry 8; v6e ships in 4-chip host machines.
+#: Physical chips per host of a *multi-host* slice by family (drives
+#: node-type host math). Every generation uses 4-chip hosts once a slice
+#: spans several VMs (v5e/v6e multi-host slices are 4-chip ct5lp/ct6e VMs).
 CHIPS_PER_HOST_BY_FAMILY: dict[str, int] = {
     "v2": 4,
     "v3": 4,
     "v4": 4,
     "v5p": 4,
+    "v5e": 4,
+    "v5litepod": 4,
+    "v6e": 4,
+}
+
+#: Largest slice (in chips) served by a single VM, for families whose
+#: single-host machines carry more chips than their multi-host VMs:
+#: v5litepod-1/4/8 and v6e-1/4/8 are one host with 1/4/8 chips.
+SINGLE_HOST_MAX_CHIPS_BY_FAMILY: dict[str, int] = {
     "v5e": 8,
     "v5litepod": 8,
-    "v6e": 4,
+    "v6e": 8,
 }
 
 #: Family name as it appears in accelerator types (v5e is "v5litepod-N").
@@ -81,15 +91,18 @@ def slice_hosts(accelerator_type: str) -> int:
     """Worker hosts in a slice of the given accelerator type.
 
     Args:
-        accelerator_type: e.g. ``"v5p-64"`` (8 hosts) or ``"v5litepod-16"``
-            (2 hosts).
+        accelerator_type: e.g. ``"v5p-64"`` (8 hosts), ``"v5litepod-16"``
+            (4 hosts x 4 chips) or ``"v6e-8"`` (1 host x 8 chips).
 
     Returns:
         Host count (minimum 1).
     """
     family = accelerator_type.split("-")[0].lower()
+    chips = _total_chips(accelerator_type)
+    if chips <= SINGLE_HOST_MAX_CHIPS_BY_FAMILY.get(family, 0):
+        return 1
     per_host = CHIPS_PER_HOST_BY_FAMILY.get(family, 4)
-    return max(_total_chips(accelerator_type) // per_host, 1)
+    return max(chips // per_host, 1)
 
 
 def list_zone_accelerator_types(project: str, zone: str) -> list[str]:
@@ -136,6 +149,15 @@ def list_tpu_zones(project: str) -> list[str]:
 def make_node_type(accelerator_type: str, *, spot: bool, min_workers: int = 0, max_workers: int = 1024) -> dict:
     """Build one launcher node type for a TPU slice size.
 
+    Ray's TPU command runner applies a node type's ``resources`` to *every*
+    host of a pod and strips only ``TPU-{type}-head`` from workers other than
+    worker 0. So the node type carries the per-host worker labels plus that
+    one slice-head label (which also tells the autoscaler which node type
+    satisfies SliceActor demand) — never the connect-mode Ray-cluster-head
+    extras (``-global-head``/``head-node``/``ray-cluster-head``), which Ray
+    would not strip and which would mark every host of every slice as the
+    head (the launcher's Ray head is the separate CPU ``head_default`` node).
+
     Args:
         accelerator_type: e.g. ``"v5p-64"``.
         spot: Request preemptible capacity.
@@ -148,7 +170,12 @@ def make_node_type(accelerator_type: str, *, spot: bool, min_workers: int = 0, m
     from ..cli.utils import tpu_resource_labels
 
     hosts = slice_hosts(accelerator_type)
-    resources = {"CPU": 120, **tpu_resource_labels(accelerator_type, hosts, is_head=True)}
+    family, size = accelerator_type.split("-")[0], accelerator_type.split("-")[1]
+    resources = {
+        "CPU": 120,
+        **tpu_resource_labels(accelerator_type, hosts, is_head=False),
+        f"TPU-{family}-{size}-head": 1,
+    }
     return {
         "min_workers": min_workers,
         "max_workers": max_workers,
