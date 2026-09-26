@@ -257,10 +257,27 @@ class Gemma3TextConfig(EasyDeLBaseConfig):
         self.bits = bits
 
         # ``rope_parameters`` is derived state (rebuilt below from rope_theta /
-        # rope_local_base_freq / rope_scaling, all of which serialize). On
-        # reload the serialized dict lands in **kwargs and trips transformers'
-        # flat-dict rope validation — consume it before super().__init__.
-        kwargs.pop("rope_parameters", None)
+        # rope_local_base_freq / rope_scaling). On reload the serialized dict
+        # lands in **kwargs and trips transformers' flat-dict rope validation —
+        # consume it before super().__init__. transformers v5 serializes Gemma3
+        # RoPE *only* as this per-layer-type mapping (no top-level rope_theta /
+        # rope_local_base_freq / rope_scaling) and gives it priority, so recover
+        # the legacy fields from it (e.g. the x8 linear scaling of the 4B/12B/27B
+        # global layers).
+        rope_parameters = kwargs.pop("rope_parameters", None)
+        if isinstance(rope_parameters, dict):
+            full_attention_params = rope_parameters.get("full_attention")
+            sliding_attention_params = rope_parameters.get("sliding_attention")
+            if full_attention_params is None and sliding_attention_params is None:
+                full_attention_params = rope_parameters
+            if isinstance(full_attention_params, dict):
+                full_attention_params = {k: v for k, v in full_attention_params.items() if not isinstance(v, dict)}
+                rope_theta = full_attention_params.get("rope_theta", rope_theta)
+                full_rope_type = full_attention_params.get("rope_type", full_attention_params.get("type", "default"))
+                if rope_scaling is None and full_rope_type != "default":
+                    rope_scaling = {k: v for k, v in full_attention_params.items() if k != "rope_theta"}
+            if isinstance(sliding_attention_params, dict):
+                rope_local_base_freq = sliding_attention_params.get("rope_theta", rope_local_base_freq)
         super().__init__(
             bos_token_id=bos_token_id,
             scan_layers=scan_layers,
@@ -308,8 +325,11 @@ class Gemma3TextConfig(EasyDeLBaseConfig):
             "rope_type": "default",
             "rope_theta": self.rope_theta,
         }
-        if isinstance(self.rope_scaling, dict):
-            full_attention_rope_params.update(self.rope_scaling)
+        # Merge the *legacy argument*: ``self.rope_scaling`` aliases the (already
+        # per-layer-expanded) ``rope_parameters`` in transformers v5, which would
+        # nest the layer-type map inside ``full_attention`` and drop the scaling.
+        if isinstance(rope_scaling, dict):
+            full_attention_rope_params.update(rope_scaling)
         if "type" in full_attention_rope_params and "rope_type" not in full_attention_rope_params:
             full_attention_rope_params["rope_type"] = full_attention_rope_params["type"]
         full_attention_rope_params.setdefault("type", full_attention_rope_params["rope_type"])
@@ -351,6 +371,18 @@ class Gemma3TextConfig(EasyDeLBaseConfig):
                     size=self.sliding_window,
                 )
         return mapping
+
+    def to_dict(self) -> dict:
+        """Serialize with the checkpoint's ``sliding_window``.
+
+        Bidirectional attention shrinks the window to ``sliding_window // 2 + 1`` on
+        construction (as transformers does), so the stored value is widened back to one
+        that shrinks to the same window; otherwise every save/load round trip halves it again.
+        """
+        out = super().to_dict()
+        if out.get("use_bidirectional_attention") and out.get("sliding_window") is not None:
+            out["sliding_window"] = (out["sliding_window"] - 1) * 2
+        return out
 
 
 @register_config("gemma3")

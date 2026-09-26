@@ -849,6 +849,17 @@ class GPTJForCausalLM(BaseCausalLMModule[GPTJModel, GPTJConfig]):  # type: ignor
         lm_head (nn.Linear): Linear layer projecting hidden states to vocabulary logits.
     """
 
+    def _upgrade_legacy_native_state(self, state: dict, expected_leaves: dict) -> dict:
+        """Give native saves from before the ``lm_head`` bias existed a zero bias.
+
+        Those checkpoints ran without the bias, so zeros reproduce them exactly.
+        """
+        for key, leaf in expected_leaves.items():
+            if key not in state and tuple(str(part) for part in key[-2:]) == ("lm_head", "bias"):
+                state[key] = jnp.zeros(leaf.shape, leaf.dtype)
+                logger.warning("Native GPT-J checkpoint has no lm_head bias (saved before it was loaded); using zeros.")
+        return state
+
     _task_type = TaskType.CAUSAL_LM
     _model_type = "gptj"
     _config_class = GPTJConfig
@@ -879,5 +890,5 @@ class GPTJForCausalLM(BaseCausalLMModule[GPTJModel, GPTJConfig]):  # type: ignor
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-            lm_head_bias=False,
+            lm_head_bias=True,  # HF GPT-J lm_head is nn.Linear with bias
         )

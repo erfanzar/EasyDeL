@@ -807,8 +807,11 @@ class RwkvModel(EasyDeLBaseModule):
         self.layers_are_rescaled = False
         self.deterministic = True
         with self.assign_layer_stage(config.num_hidden_layers - 1, total_layers=config.num_hidden_layers):
+            # HF builds ``ln_out`` as ``nn.LayerNorm(hidden_size)``: torch's default
+            # eps=1e-5, independent of ``config.layer_norm_epsilon``.
             self.ln_out = LayerNorm(
                 config.hidden_size,
+                epsilon=1e-5,
                 dtype=dtype,
                 param_dtype=param_dtype,
                 rngs=rngs,

@@ -282,7 +282,8 @@ class Glm4vMoeVisionConfig(EasyDeLBaseConfig):
             temporal_patch_size: Temporal patch length for video inputs.
             out_hidden_size: Width to which the merger projects vision
                 features before they enter the text decoder.
-            intermediate_size: Inner width of the vision MLP.
+            intermediate_size: Inner width of the patch-merger MLP (the vision
+                blocks' MLP width is ``out_hidden_size``, as in HF).
             initializer_range: Stddev for truncated-normal init.
             **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
         """

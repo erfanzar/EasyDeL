@@ -294,7 +294,13 @@ class Qwen2MoeAttention(UnifiedAttention):
             layer_idx=layer_idx,
             attention_type="standard",
             causal=True,
-            sliding_window=config.sliding_window if config.use_sliding_window else None,
+            sliding_window=(
+                config.sliding_window
+                if config.use_sliding_window
+                and config.layer_types is not None
+                and config.layer_types[layer_idx] == "sliding_attention"
+                else None
+            ),
         )
 
     def _create_fused_qkv_proj(self, config, dtype, param_dtype, precision, rngs):
@@ -612,12 +618,16 @@ class Qwen2MoeDecoderLayer(spx.Module):
             layer_idx=layer_idx,
         )
 
+        # Dense layers (``mlp_only_layers`` / ``decoder_sparse_step``) use the
+        # full ``intermediate_size``, as in HF.
+        mlp_kwargs = {} if mlp_block is Qwen2MoeSparseBlock else {"intermediate_size": config.intermediate_size}
         self.mlp = mlp_block(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            **mlp_kwargs,
         )
         self.input_layernorm = RMSNorm(
             dim=self.config.hidden_size,

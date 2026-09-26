@@ -127,6 +127,9 @@ class DeepseekV3Config(EasyDeLBaseConfig):
             Whether to use a bias in the query, key, value and output projection layers during self-attention.
         attention_dropout (`float`, *optional*, defaults to 0.0):
             The dropout ratio for the attention probabilities.
+        rope_interleave (`bool`, *optional*, defaults to `True`):
+            Whether the RoPE slice pairs channels ``(2i, 2i+1)`` as DeepSeek checkpoints do,
+            rather than the split-half ``(i, i + d/2)`` pairing.
     ```python
     >>> from transformers import DeepseekV3Model, DeepseekV3Config
     >>> # Initializing a Deepseek-V3 style configuration
@@ -136,6 +139,8 @@ class DeepseekV3Config(EasyDeLBaseConfig):
     ```"""
 
     model_type = "deepseek_v3"
+    # Native checkpoints saved before `rope_interleave` existed ran split-half RoPE.
+    _legacy_native_defaults: typing.ClassVar[dict[str, typing.Any]] = {"rope_interleave": False}
     keys_to_ignore_at_inference: typing.ClassVar = ["past_key_values"]
 
     def __setattr__(self, key, value):
@@ -202,6 +207,7 @@ class DeepseekV3Config(EasyDeLBaseConfig):
         rope_scaling: dict | None = None,
         attention_bias: bool = False,
         attention_dropout: float = 0.0,
+        rope_interleave: bool = True,
         layer_types: list[str] | None = None,
         **kwargs,
     ):
@@ -248,6 +254,7 @@ class DeepseekV3Config(EasyDeLBaseConfig):
           rope_theta (float, optional): Base value for RoPE. Defaults to 10000.0.
           rope_scaling (Dict, optional): RoPE scaling configuration. Defaults to None.
           attention_bias (bool, optional): Whether to use bias in attention. Defaults to False.
+          rope_interleave (bool, optional): Interleaved (2i, 2i+1) RoPE pairing. Defaults to True.
           attention_dropout (float, optional): Dropout rate for attention. Defaults to 0.0.
           **kwargs: Additional arguments.
         """
@@ -293,6 +300,7 @@ class DeepseekV3Config(EasyDeLBaseConfig):
         self.rope_scaling = rope_scaling
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
+        self.rope_interleave = rope_interleave
         self.layer_types = layer_types
         if self.layer_types is None:
             self.layer_types = ["full_attention"] * self.num_hidden_layers

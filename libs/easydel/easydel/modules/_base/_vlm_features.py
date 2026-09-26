@@ -65,8 +65,76 @@ See Also:
     - easydel.layers.rotary_embedding.MultiModalRotaryEmbedding: mRoPE implementation
 """
 
+import jax
 import jax.numpy as jnp
+import numpy as np
 from jaxtyping import Array, Float, Int
+
+
+def _torch_bicubic_resize_weights(in_size: int, out_size: int) -> np.ndarray:
+    """Build the 1-D resampling matrix of torch's bicubic ``F.interpolate``.
+
+    Mirrors ``aten/src/ATen/native/UpSample.h`` for ``mode="bicubic"`` with
+    ``align_corners=False`` and an explicit output ``size``: source coordinate
+    ``(dst + 0.5) * in / out - 0.5`` (no clamping for cubic), Keys cubic
+    convolution with ``A = -0.75`` over the 4 neighbours, and out-of-range
+    neighbour indices clamped to the border. No antialiasing is applied when
+    downsampling (unlike ``jax.image.resize``).
+
+    Args:
+        in_size: Input length along the resized axis.
+        out_size: Output length along the resized axis.
+
+    Returns:
+        np.ndarray: ``(out_size, in_size)`` float64 interpolation matrix.
+    """
+    a = -0.75
+    real = (np.arange(out_size, dtype=np.float64) + 0.5) * (in_size / out_size) - 0.5
+    base = np.floor(real)
+    t = real - base
+
+    def near(x):
+        return ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0
+
+    def far(x):
+        return ((a * x - 5.0 * a) * x + 8.0 * a) * x - 4.0 * a
+
+    coefficients = (far(t + 1.0), near(t), near(1.0 - t), far(2.0 - t))
+    weights = np.zeros((out_size, in_size), dtype=np.float64)
+    rows = np.arange(out_size)
+    for offset, coefficient in enumerate(coefficients):
+        cols = np.clip(base.astype(np.int64) - 1 + offset, 0, in_size - 1)
+        np.add.at(weights, (rows, cols), coefficient)
+    return weights
+
+
+def torch_bicubic_resize(x: Array, height: int, width: int) -> Array:
+    """Resize the two leading axes exactly like torch bicubic ``F.interpolate``.
+
+    Equivalent to ``F.interpolate(x.permute(C, H, W)[None], size=(height, width),
+    mode="bicubic", align_corners=False)`` (the HF default used for ViT/SigLIP
+    and MoonViT position-embedding interpolation). The separable resampling is
+    expressed as two small static matmuls, so ``height``/``width`` must be
+    concrete Python ints.
+
+    Args:
+        x: Array of shape ``(H, W, *rest)``.
+        height: Output height.
+        width: Output width.
+
+    Returns:
+        Array: Resized array of shape ``(height, width, *rest)`` in ``x.dtype``
+        (computed in float32).
+    """
+    in_h, in_w = int(x.shape[0]), int(x.shape[1])
+    height, width = int(height), int(width)
+    if (in_h, in_w) == (height, width):
+        return x
+    weights_h = jnp.asarray(_torch_bicubic_resize_weights(in_h, height), dtype=jnp.float32)
+    weights_w = jnp.asarray(_torch_bicubic_resize_weights(in_w, width), dtype=jnp.float32)
+    out = jnp.einsum("oh,hw...->ow...", weights_h, x.astype(jnp.float32), precision=jax.lax.Precision.HIGHEST)
+    out = jnp.einsum("pw,ow...->op...", weights_w, out, precision=jax.lax.Precision.HIGHEST)
+    return out.astype(x.dtype)
 
 
 class VisionEncoderFeature:

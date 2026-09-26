@@ -2869,6 +2869,7 @@ class EasyDeLBaseModule(
             reform_param=self._get_reform_param(),
             hf_flattened_wrappers=self._get_hf_flattened_wrappers(),
             checkpoint_key_normalizer=self._get_checkpoint_key_normalizer(),
+            hf_model_type=getattr(self.config, "model_type", None),
         )
         if shard_fns is not None:
             kwargs["shard_fns"] = shard_fns

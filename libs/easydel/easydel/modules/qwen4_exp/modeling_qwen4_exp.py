@@ -673,9 +673,13 @@ class Qwen4ExpAttention(Qwen3NextFullAttention):
         # Current padding visibility for this forward.
         visible_current = None
         if mask_info is not None:
-            kv_mask = getattr(mask_info, "kv_attention_mask", None)
-            if kv_mask is not None and kv_mask.ndim == 2:
-                visible_current = kv_mask[:, -seq_len:].astype(jnp.bool_)
+            # MaskInfo marks padding with segment id -1.
+            try:
+                q_segment_ids, _ = mask_info.get_or_compute_segment_ids()
+            except ValueError:  # neither a mask nor segment ids: nothing is padded
+                q_segment_ids = None
+            if q_segment_ids is not None and q_segment_ids.ndim == 2:
+                visible_current = q_segment_ids[:, -seq_len:] >= 0
         if visible_current is None:
             visible_current = jnp.ones((batch, seq_len), jnp.bool_)
 

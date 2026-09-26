@@ -107,8 +107,9 @@ def _slice_decode_window_for_vanilla_fallback(
             ids and positions are sliced in lockstep with the KV tensors.
         cache_metadata: Per-batch cache metadata; only ``indexes`` (current
             lengths) is consulted to compute the slice start.
-        sliding_window: Either an ``int`` for symmetric window, a tuple
-            ``(left, right)``, or ``None`` to skip slicing.
+        sliding_window: Either an ``int`` window size (HF convention, i.e.
+            ``(W - 1, W - 1)``), an inclusive tuple ``(left, right)``, or
+            ``None`` to skip slicing.
 
     Returns:
         tuple: ``(key, value, mask_info)`` where each tensor is reduced along
@@ -121,7 +122,8 @@ def _slice_decode_window_for_vanilla_fallback(
         return key, value, mask_info
 
     if isinstance(sliding_window, int):
-        left_window = right_window = int(sliding_window)
+        # An int is a window *size* (HF convention): the query plus its ``W - 1`` neighbours.
+        left_window = right_window = max(int(sliding_window) - 1, 0)
     else:
         left_window, right_window = map(int, sliding_window)
 
@@ -363,7 +365,8 @@ class AutoRegressiveDecodeAttn(OperationImpl):
         )
         if sliding_window is not None:
             if isinstance(sliding_window, int):
-                sliding_window = (sliding_window, sliding_window)
+                # An int is a window *size* (HF convention): the query plus its ``W - 1`` neighbours.
+                sliding_window = (max(sliding_window - 1, 0), max(sliding_window - 1, 0))
         attn_output: Float[Array, "batch num_q_heads head_dim"] = ragged_decode_attention(
             query_squeezed,
             key,

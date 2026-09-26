@@ -28,7 +28,6 @@ import math
 
 import easydel as ed
 import jax
-import ml_dtypes
 import numpy as np
 import pytest
 import spectrax as spx
@@ -41,14 +40,13 @@ RTOL = 1e-5
 ATOL = 1e-5
 
 
-def _bfloat16_round(values: np.ndarray) -> np.ndarray:
-    """Round through bfloat16, then back to float64.
+def _float32_round(values: np.ndarray) -> np.ndarray:
+    """Round through float32, then back to float64.
 
-    ``EasyDeLBaseConfig.get_basic_frequencies`` deliberately stores the RoPE
-    cos/sin table in bfloat16 for memory efficiency (shared by every family in
-    the zoo), so the reference has to model that rounding to stay comparable.
+    ``EasyDeLBaseConfig.get_basic_frequencies`` stores the RoPE cos/sin table in
+    float32, so the reference models that rounding to stay comparable.
     """
-    return np.asarray(values, dtype=ml_dtypes.bfloat16).astype(np.float64)
+    return np.asarray(values, dtype=np.float32).astype(np.float64)
 
 
 def _text_config(**overrides):
@@ -254,20 +252,17 @@ def _ref_rope_tables(positions, head_dim, base):
     inv_freq = 1.0 / (base ** (np.arange(0, head_dim, 2, dtype=np.float64) / head_dim))
     freqs = positions.astype(np.float64)[:, None] * inv_freq[None, :]
     emb = np.concatenate([freqs, freqs], axis=-1)
-    return _bfloat16_round(np.cos(emb)), _bfloat16_round(np.sin(emb))
+    return _float32_round(np.cos(emb)), _float32_round(np.sin(emb))
 
 
-# EasyDeL's shared attention path treats `sliding_window` as a per-side radius
-# (`easydel/layers/attention/_flexible.py::_apply_sliding_window` computes
-# `width = left + right + 1`), so a causal layer configured with window `w`
-# attends to `w + 1` tokens. HuggingFace treats it as a span: its
-# `sliding_window_overlay` keeps `kv_idx > q_idx - w`, i.e. `w` tokens.
-# Every sliding-window family in the zoo forwards `config.sliding_window`
-# unchanged, so this port does too and the reference below follows the runtime
-# convention. `test_sliding_window_span` pins the resulting span on its own, so
-# the discrepancy is visible and this suite fails loudly if the shared path
-# changes.
-_EASYDEL_SLIDING_WINDOW_IS_RADIUS = True
+# EasyDeL's shared attention path reads an integer `sliding_window` with the
+# HuggingFace convention: `sliding_window_overlay` keeps `kv_idx > q_idx - w`,
+# i.e. a causal layer configured with window `w` attends to `w` tokens (itself
+# plus the previous `w - 1`). Every sliding-window family in the zoo forwards
+# `config.sliding_window` unchanged. `test_sliding_window_span` pins the
+# resulting span on its own, so this suite fails loudly if the shared path
+# drifts from that convention.
+_EASYDEL_SLIDING_WINDOW_IS_RADIUS = False
 
 
 def _ref_causal_masks(seq_len, sliding_window):
@@ -802,12 +797,11 @@ def test_sliding_window_span():
     token at position ``p`` can only change outputs at positions ``p`` through
     ``p + span - 1``.
 
-    EasyDeL's shared attention path treats ``sliding_window`` as a per-side
-    radius, so the span is ``sliding_window + 1``; HuggingFace's
-    ``sliding_window_overlay`` treats it as a span of ``sliding_window`` tokens.
-    This port forwards ``config.sliding_window`` unchanged, matching every other
-    sliding-window family in the zoo. If the shared convention is ever aligned
-    with HuggingFace, this test — and the reference masks above — must move
+    EasyDeL's shared attention path follows HuggingFace's
+    ``sliding_window_overlay``: the span is ``sliding_window`` tokens (the
+    query plus the previous ``sliding_window - 1``). This port forwards
+    ``config.sliding_window`` unchanged, matching every other sliding-window
+    family in the zoo; this test and the reference masks above must move
     together.
     """
     window = 4
@@ -832,8 +826,8 @@ def test_sliding_window_span():
 
     assert affected[0] == position, "a causal model must not change outputs before the perturbed token"
     span = int(affected[-1] - position + 1)
-    assert span == window + 1, (
-        f"expected a {window + 1}-token span for sliding_window={window} (EasyDeL radius convention), measured {span}"
+    assert span == window, (
+        f"expected a {window}-token span for sliding_window={window} (HuggingFace convention), measured {span}"
     )
 
 

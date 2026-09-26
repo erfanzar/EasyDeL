@@ -127,6 +127,7 @@ from ._vlm_features import (
     MultiModalMergeFeature,
     VideoProcessingFeature,
     VisionEncoderFeature,
+    torch_bicubic_resize,
 )
 
 # Task-specific base modules
@@ -171,4 +172,5 @@ __all__ = [
     "create_sequence_classification_class",
     "create_task_model_class",
     "create_token_classification_class",
+    "torch_bicubic_resize",
 ]

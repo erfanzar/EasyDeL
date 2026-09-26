@@ -41,7 +41,7 @@ class Phi3Config(EasyDeLBaseConfig):
       forward pass.
     * **RMSNorm** throughout (replacing Phi's LayerNorm) with epsilon
       ``rms_norm_eps``, and **bias-free linear layers** in attention/MLP.
-    * **Full rotary embeddings** with ``rope_theta`` and optional
+    * **Rotary embeddings** (partial via ``partial_rotary_factor``) with ``rope_theta`` and optional
       ``rope_scaling`` — the legacy ``"su"`` / ``"yarn"`` scaling types
       are silently rewritten to ``"longrope"`` by
       :meth:`_rope_scaling_validation` for backward compatibility.
@@ -133,6 +133,7 @@ class Phi3Config(EasyDeLBaseConfig):
         tie_word_embeddings=False,
         rope_theta=10000.0,
         rope_scaling=None,
+        partial_rotary_factor: float = 1.0,
         bos_token_id=1,
         eos_token_id=32000,
         pad_token_id=32000,
@@ -163,6 +164,8 @@ class Phi3Config(EasyDeLBaseConfig):
             tie_word_embeddings (bool, optional): Whether to tie input/output embeddings. Defaults to False.
             rope_theta (float, optional): Base value for RoPE. Defaults to 10000.0.
             rope_scaling (dict, optional): RoPE scaling configuration. Defaults to None.
+            partial_rotary_factor (float, optional): Fraction of each head that is rotated
+                (Phi-4-mini uses 0.75). Defaults to 1.0.
             bos_token_id (int, optional): Beginning-of-sequence token ID. Defaults to 1.
             eos_token_id (int, optional): End-of-sequence token ID. Defaults to 32000.
             pad_token_id (int, optional): Padding token ID. Defaults to 32000.
@@ -192,6 +195,7 @@ class Phi3Config(EasyDeLBaseConfig):
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
         self.rope_theta = rope_theta
+        self.partial_rotary_factor = partial_rotary_factor
         self.rope_scaling = rope_scaling
         self._rope_scaling_validation()
         self.sliding_window = sliding_window
@@ -236,7 +240,9 @@ class Phi3Config(EasyDeLBaseConfig):
 
         # For backward compatibility if previous version used "su" or "yarn"
         if rope_scaling_type is not None and rope_scaling_type in ["su", "yarn"]:
+            # Rewrite both spellings: the rotary builders dispatch on ``rope_type``.
             self.rope_scaling["type"] = "longrope"
+            self.rope_scaling["rope_type"] = "longrope"
 
     @property
     def granted_freq_max_position_embedding(self) -> int:

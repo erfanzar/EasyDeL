@@ -242,7 +242,12 @@ class FalconConfig(EasyDeLBaseConfig):
         """Alias for ``num_kv_heads`` exposed under the standard GQA name.
 
         Returns:
-            int: Same value as :attr:`num_kv_heads`. UnifiedAttention reads
-            ``num_key_value_heads``; Falcon stores it as ``num_kv_heads``.
+            int: :attr:`num_kv_heads`, except for the classic multi-query layout
+            (``multi_query=True`` without ``new_decoder_architecture``), which HF
+            always runs with a single KV head regardless of ``num_kv_heads``
+            (Falcon-7B's config omits it, so it defaults to ``num_attention_heads``).
+            UnifiedAttention reads ``num_key_value_heads``; Falcon stores it as ``num_kv_heads``.
         """
+        if self.multi_query and not self.new_decoder_architecture:
+            return 1
         return self.num_kv_heads

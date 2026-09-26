@@ -58,9 +58,9 @@ class SeedOssConfig(EasyDeLBaseConfig):
         num_key_value_heads (`int`, *optional*):
             Number of key/value heads (GQA). Defaults to
             ``num_attention_heads`` (MHA) when not provided.
-        head_dim (`int`, *optional*):
-            Dimensionality of each attention head. Defaults to
-            ``hidden_size // num_attention_heads`` when not provided.
+        head_dim (`int`, *optional*, defaults to 128):
+            Dimensionality of each attention head (HF default). ``None`` resolves
+            to ``hidden_size // num_attention_heads``.
         hidden_act (`str`, *optional*, defaults to ``"silu"``):
             Activation function used in the gated MLP.
         max_position_embeddings (`int`, *optional*, defaults to 131072):
@@ -132,7 +132,7 @@ class SeedOssConfig(EasyDeLBaseConfig):
         num_hidden_layers: int = 36,
         num_attention_heads: int = 56,
         num_key_value_heads: int | None = None,
-        head_dim: int | None = None,
+        head_dim: int | None = 128,
         hidden_act: str = "silu",
         max_position_embeddings: int = 131072,
         initializer_range: float = 0.02,
@@ -165,7 +165,7 @@ class SeedOssConfig(EasyDeLBaseConfig):
         See the class docstring for parameter semantics. Defaults are
         chosen to match the public Seed-OSS checkpoints; in particular
         ``num_key_value_heads`` defaults to ``num_attention_heads``,
-        ``head_dim`` defaults to ``hidden_size // num_attention_heads``,
+        ``head_dim`` defaults to ``128`` (``None`` -> ``hidden_size // num_attention_heads``),
         and ``max_window_layers`` defaults to ``num_hidden_layers`` when
         not provided. ``**kwargs`` are forwarded to
         :class:`EasyDeLBaseConfig`.

@@ -92,6 +92,9 @@ from easydel.utils.checkpoint_compat import (
     adapt_legacy_checkpoint_collections as _adapt_legacy_checkpoint_collections,
 )
 from easydel.utils.checkpoint_compat import (
+    apply_legacy_native_config_defaults as _apply_legacy_native_config_defaults,
+)
+from easydel.utils.checkpoint_compat import (
     materialize_tied_lm_head_from_embeddings as _materialize_tied_lm_head_from_embeddings,
 )
 from easydel.utils.checkpoint_compat import (
@@ -1915,6 +1918,11 @@ class EasyBridgeMixin(PushToHubMixin):
                 # Old EasyDeL saves either omitted the collection wrapper or used
                 # the legacy `params` collection name; align them to the live model.
                 state = _adapt_legacy_checkpoint_collections(state, required_params)
+                # Model-specific reshaping of leaves from older native saves
+                # (e.g. Kimi-Linear's per-head KDA gates).
+                _upgrade_legacy = getattr(model, "_upgrade_legacy_native_state", None)
+                if callable(_upgrade_legacy):
+                    state = _upgrade_legacy(state, required_param_leaves)
                 model_config = getattr(model, "config", None)
                 tie_word_embeddings = bool(getattr(model_config, "tie_word_embeddings", False))
                 text_config = getattr(model_config, "text_config", None)
@@ -2155,6 +2163,7 @@ class EasyBridgeMixin(PushToHubMixin):
                 platform=platform,
                 model_task=cls._model_task,
             )
+            _apply_legacy_native_config_defaults(config, config_path)
         config_kwargs = {} if config_kwargs is None else config_kwargs
         config.add_basic_configurations(
             sharding_axis_dims=sharding_axis_dims,
@@ -2387,7 +2396,9 @@ class EasyBridgeMixin(PushToHubMixin):
         total_elapsed = time.perf_counter() - total_start
         breakdown = ", ".join(f"{k}={v:.2f}s" for k, v in sorted(timings.items(), key=lambda kv: -kv[1]))
         logger.debug(f"[from_pretrained] TOTAL={total_elapsed:.2f}s  ({breakdown})")
-        return model
+        # Loaded models are for inference unless a trainer switches them back:
+        # training mode would leave dropout live (GPT-2/OPT ship p=0.1).
+        return model.eval()
 
     @classmethod
     def _from_torch_pretrained(
@@ -2516,6 +2527,7 @@ class EasyBridgeMixin(PushToHubMixin):
                 torch_loader=cls.get_torch_loader(),
                 clear_fn=_clear,
                 kwargs=kwargs,
+                param_dtype=param_dtype,
             )
         else:
             ckpt_info = cls._resolve_streaming_checkpoint(
@@ -2618,6 +2630,7 @@ class EasyBridgeMixin(PushToHubMixin):
                 device=device,
                 clear_fn=_clear,
             )
+            parameters_flat = cls._fill_tied_lm_head_from_embeddings(model, parameters_flat)
             params = unflatten_dict(parameters_flat)
 
         if is_flatten(params):
@@ -2643,7 +2656,37 @@ class EasyBridgeMixin(PushToHubMixin):
         model = model.wire_distributed_matmul()
 
         logger.debug("returning model.")
-        return model
+        # Inference mode, as in the native loader and transformers' from_pretrained.
+        return model.eval()
+
+    @staticmethod
+    def _fill_tied_lm_head_from_embeddings(model, parameters_flat: dict[tuple, tp.Any]) -> dict[tuple, tp.Any]:
+        """Give a tied model its ``lm_head`` leaf when the checkpoint stores only the embeddings.
+
+        Hugging Face tied checkpoints (Gemma, Cohere, ...) omit ``lm_head.weight``;
+        the full loader gets it from the torch model's shared tensor, while a
+        streaming load only sees what is on disk.
+        """
+        config = getattr(model, "config", None)
+        tied = bool(getattr(config, "tie_word_embeddings", False))
+        text_config = getattr(config, "text_config", None)
+        if not tied and text_config is not None:
+            tied = bool(getattr(text_config, "tie_word_embeddings", False))
+        if not tied:
+            return parameters_flat
+        required = {
+            (collection, *path): leaf
+            for collection, tree in spx.export(model)[1].raw().items()
+            for path, leaf in flatten_dict(tree).items()
+        }
+        state = {("parameters", *key): value for key, value in parameters_flat.items()}
+        lm_head_names = tuple(dict.fromkeys(("lm_head", str(getattr(model, "_lm_head_name", "lm_head")))))
+        filled = _materialize_tied_lm_head_from_embeddings(
+            state, required, tie_word_embeddings=True, lm_head_names=lm_head_names
+        )
+        if filled is state:
+            return parameters_flat
+        return {key[1:]: value for key, value in filled.items()}
 
     @staticmethod
     def _parameter_path_to_string(path: str | tuple[tp.Any, ...]) -> str:
@@ -3055,7 +3098,13 @@ class EasyBridgeMixin(PushToHubMixin):
         import torch
         from safetensors.torch import safe_open
 
-        from easydel.utils.parameters_transformation import StateDictConverter
+        from easydel.utils.parameters_transformation import (
+            HFCheckpointKeyMapper,
+            StateDictConverter,
+            canonical_expert_leaf,
+            hf_rename_key,
+            resolve_expert_merge,
+        )
 
         ckpt_weight_format = ckpt_info.ckpt_weight_format
         ckpt_key_to_filename = ckpt_info.ckpt_key_to_filename
@@ -3078,6 +3127,12 @@ class EasyBridgeMixin(PushToHubMixin):
         # other rule; `None` marks a tensor the runtime does not own.
         _ckpt_key_normalizer = transformer.keywords.get("checkpoint_key_normalizer")
 
+        def _resolve_merge(k: str, nk: str):
+            """Place a per-expert key in transformers' merged expert layout (see ``resolve_expert_merge``)."""
+            if hf_key_mapper is not None:
+                return hf_key_mapper.expert_merge(k)
+            return resolve_expert_merge(nk, hf_model_type, apply_renamings=_ckpt_key_normalizer is not None)
+
         def _normalize_key(k: str) -> str | None:
             """Map a checkpoint key to EasyDeL naming (re-insert flattened wrappers).
 
@@ -3088,7 +3143,13 @@ class EasyBridgeMixin(PushToHubMixin):
                 str: The key with any transformers >= 5.13 flattened wrapper
                 prefix re-inserted; unchanged when already in EasyDeL layout.
             """
-            k = _ckpt_key_normalizer(k) if _ckpt_key_normalizer is not None else k
+            # A model's own normalizer encodes its on-disk layout; otherwise use
+            # transformers' load-time renames, so keys match what the full loader
+            # sees (e.g. VLMs saved under legacy ``language_model.model.*``).
+            if _ckpt_key_normalizer is not None:
+                k = _ckpt_key_normalizer(k)
+            else:
+                k = hf_rename_key(k, hf_model_type, mapper=hf_key_mapper)
             if k is None:
                 return None
             return StateDictConverter.normalize_flattened_wrapper_key(k, hf_flattened_wrappers)
@@ -3096,6 +3157,43 @@ class EasyBridgeMixin(PushToHubMixin):
         moe_names_set = set(moe_names or [])
         expected_expert_name = moe_path[0].split(".")[-2] if moe_path else "experts"
         expert_prefix = f".{expected_expert_name}."
+        # Like the full loader's `apply_moe_transformations`, per-expert tensors
+        # that feed a reform fusion (DeepSeek's `experts.<i>.gate_proj`) stack
+        # too, even though the runtime leaf is the fused `gate_up_proj`.
+        expert_fusion_sources = {
+            (source[:-7] if source.endswith(".weight") else source)
+            for rule in (reform_param or {}).values()
+            if "sources" in rule
+            for source in rule["sources"]
+            if expert_prefix in source
+        }
+        # Rules sourcing a tensor transformers>=5 builds in memory by merging
+        # per-expert checkpoint tensors (`mlp.experts.gate_up_proj` from
+        # `experts.<i>.{w1,w3}` / `{gate,up}_proj`); `resolve_expert_merge`
+        # reads that merge from transformers' own conversion mapping.
+        hf_model_type = transformer.keywords.get("hf_model_type") or getattr(hf_config, "model_type", None)
+        # transformers' own key mapping for this model (scoped renames + merges),
+        # unless the model normalizes its checkpoint keys itself.
+        hf_key_mapper = (
+            HFCheckpointKeyMapper.for_config(hf_config, trust_remote_code=bool(getattr(hf_config, "auto_map", None)))
+            if _ckpt_key_normalizer is None
+            else None
+        )
+        merged_expert_rules = {
+            rule["sources"][0]: (rule_key, rule)
+            for rule_key, rule in (reform_param or {}).items()
+            if "fuser" in rule and len(rule.get("sources", ())) == 1 and expert_prefix in rule["sources"][0]
+        }
+        # Tensors transformers builds in memory from per-expert checkpoint keys
+        # that a rule consumes: as a fusion source (above) or by name through a
+        # rename/split rule (Mixtral `mlp.experts.down_proj`). Each part is
+        # stacked as a synthetic group, then merged exactly like transformers.
+        hf_merge_targets = set(merged_expert_rules) | {
+            (rule_key[:-1] if rule_key.endswith("$") else rule_key)
+            for rule_key, rule in (reform_param or {}).items()
+            if "splits" in rule and expert_prefix in rule_key
+        }
+        hf_merge_specs: dict[str, tp.Any] = {}  # merged key -> ExpertMergeSpec
 
         consolidated_moe_keys: set[str] = set()
         moe_groups: dict[str, dict[int, str]] = {}
@@ -3121,6 +3219,7 @@ class EasyBridgeMixin(PushToHubMixin):
             # `apply_checkpoint_key_normalizer`); it has no expert group.
             if nk is None or expert_prefix not in nk:
                 return
+            merge = _resolve_merge(k, nk)
             for block_path in moe_block_path:
                 block_expert_prefix = block_path + expert_prefix
                 if not nk.startswith(block_expert_prefix):
@@ -3135,12 +3234,28 @@ class EasyBridgeMixin(PushToHubMixin):
                 expert_idx = int(expert_part)
                 moe_name_part = remainder[dot_idx + 1 :]
                 moe_name = moe_name_part[:-7] if moe_name_part.endswith(".weight") else moe_name_part
-                if moe_name not in moe_names_set:
-                    continue
+                if merge is not None and moe_name not in moe_names_set:
+                    merged_key, _, spec, part = merge
+                    canonical = canonical_expert_leaf(spec, part)
+                    if canonical in moe_names_set:
+                        # One runtime leaf per part under transformers' names
+                        # (Mixtral `w2` -> `down_proj`, DeepSeek-V4 `w1` -> `gate_proj`).
+                        moe_name = canonical
+                    elif len(spec.parts) == 1 and spec.target in moe_names_set:
+                        moe_name = spec.target
                 target_path = f"{block_path}.{expected_expert_name}.{moe_name}"
+                if moe_name not in moe_names_set and target_path not in expert_fusion_sources:
+                    continue
                 moe_groups.setdefault(target_path, {})[expert_idx] = k
                 moe_expert_keys.add(k)
                 return
+            # Nothing on the runtime's own expert paths claims this key: build the
+            # tensor transformers merges in memory, if a rule consumes it.
+            if merge is not None and merge[0] in hf_merge_targets:
+                merged_key, expert_idx, spec, part = merge
+                hf_merge_specs[merged_key] = spec
+                moe_groups.setdefault(f"{merged_key}#part{part}", {})[expert_idx] = k
+                moe_expert_keys.add(k)
 
         if not ckpt_key_to_filename:
             filename = next(iter(ckpt_filename_to_path.keys()))
@@ -3181,6 +3296,44 @@ class EasyBridgeMixin(PushToHubMixin):
         reform_fusion_source_keys = {
             source_key for source_keys in reform_fusion_groups.values() for source_key in source_keys
         }
+        # Fusions whose sources are stacked expert tensors (``experts.gate_proj``
+        # + ``experts.up_proj`` -> ``experts.gate_up_proj``) only exist once the
+        # per-expert keys are stacked, as in the full loader's stack-then-fuse.
+        stacked_moe_keys = {f"{target_path}.weight" for target_path in moe_groups}
+        stacked_fusion_groups, stacked_fusion_rules = StateDictConverter.collect_reform_param_fusion_groups(
+            set(normalized_to_original) | stacked_moe_keys,
+            reform_param,
+        )
+        stacked_fusion_groups = {
+            fused_key: source_keys
+            for fused_key, source_keys in stacked_fusion_groups.items()
+            if fused_key not in reform_fusion_groups and all(k in stacked_moe_keys for k in source_keys)
+        }
+        for merged_key, spec in hf_merge_specs.items():
+            part_keys = tuple(f"{merged_key}#part{part}.weight" for part in range(len(spec.parts)))
+            if merged_key in normalized_to_original or not all(k in stacked_moe_keys for k in part_keys):
+                continue
+            if merged_key in merged_expert_rules:
+                rule_key, rule = merged_expert_rules[merged_key]
+                target_key = rule_key[:-1] if rule_key.endswith("$") else rule_key
+
+                def _merge(torch, *parts, _rule=rule, _dim=spec.concat_dim):
+                    return StateDictConverter.fuse_reform_param_tensors(_rule, [torch.cat(parts, dim=_dim)])
+
+            else:  # consumed by name, like the full loader's in-memory tensor
+                target_key = merged_key
+
+                def _merge(torch, *parts, _dim=spec.concat_dim):
+                    return parts[0] if len(parts) == 1 else torch.cat(parts, dim=_dim)
+
+            stacked_fusion_groups[target_key] = part_keys
+            stacked_fusion_rules[target_key] = {"fuser": _merge}
+        stacked_fusion_by_source = {
+            source_key: fused_key
+            for fused_key, source_keys in stacked_fusion_groups.items()
+            for source_key in source_keys
+        }
+        pending_stacked: dict[str, tp.Any] = {}
 
         uses_tie_word_embedding = getattr(hf_config, "tie_word_embeddings", False)
         converter_config = {
@@ -3214,18 +3367,23 @@ class EasyBridgeMixin(PushToHubMixin):
                 arr = callback(arr, key_tuple)
             return arr
 
-        def _process_tensor(key: str, tensor):
+        def _process_tensor(key: str, tensor, pre_normalized: bool = False):
             """Convert one HF tensor and store the result(s) in ``parameters_flat``.
 
             Args:
                 key: HF state-dict key.
                 tensor: The torch tensor for that key.
+                pre_normalized: ``key`` is already in normalized form (fused,
+                    stacked or merged keys built here); normalizing again could
+                    re-apply renames to a runtime name.
 
             Returns:
                 None. Side-effect: populates the ``parameters_flat`` dict
                 in the enclosing scope.
             """
-            results = StateDictConverter.process_tensor(_normalize_key(key), tensor, converter_config)
+            results = StateDictConverter.process_tensor(
+                key if pre_normalized else _normalize_key(key), tensor, converter_config
+            )
             if results is None:
                 return
             for key_tuple, jax_array in results:
@@ -3267,6 +3425,22 @@ class EasyBridgeMixin(PushToHubMixin):
                 os.makedirs(torch_streaming_tmp_dir, exist_ok=True)
             with tempfile.TemporaryDirectory(dir=torch_streaming_tmp_dir) as tmpdir:
                 yield resolve_shard(fname, tmpdir)
+
+        def _emit_stacked(stacked_key: str, stacked_tensor):
+            """Convert a stacked expert tensor, or hold it until its fusion group is complete."""
+            fused_key = stacked_fusion_by_source.get(stacked_key)
+            if fused_key is None:
+                _process_tensor(stacked_key, stacked_tensor, pre_normalized=True)
+                return
+            pending_stacked[stacked_key] = stacked_tensor
+            source_keys = stacked_fusion_groups[fused_key]
+            if all(k in pending_stacked for k in source_keys):
+                fused_tensor = StateDictConverter.fuse_reform_param_tensors(
+                    stacked_fusion_rules[fused_key],
+                    [pending_stacked.pop(k) for k in source_keys],
+                )
+                _process_tensor(fused_key, fused_tensor, pre_normalized=True)
+                del fused_tensor
 
         def _run_streaming_conversion():
             """Stream HF shards into JAX parameters with MoE consolidation.
@@ -3328,7 +3502,7 @@ class EasyBridgeMixin(PushToHubMixin):
                                     reform_fusion_rules[fused_key],
                                     [f.get_tensor(source_key) for source_key in source_keys],
                                 )
-                                _process_tensor(fused_key, fused_tensor)
+                                _process_tensor(fused_key, fused_tensor, pre_normalized=True)
                                 del fused_tensor
                                 clear_fn()
 
@@ -3347,7 +3521,7 @@ class EasyBridgeMixin(PushToHubMixin):
                                 )
                                 for pos, expert_idx in enumerate(expert_indices):
                                     stacked_tensor[pos] = f.get_tensor(expert_key_by_idx[expert_idx])
-                                _process_tensor(stacked_key, stacked_tensor)
+                                _emit_stacked(stacked_key, stacked_tensor)
                                 del stacked_tensor
                                 clear_fn()
                     else:
@@ -3365,7 +3539,7 @@ class EasyBridgeMixin(PushToHubMixin):
                                 reform_fusion_rules[fused_key],
                                 [shard[source_key] for source_key in source_keys],
                             )
-                            _process_tensor(fused_key, fused_tensor)
+                            _process_tensor(fused_key, fused_tensor, pre_normalized=True)
                             del fused_tensor
                             clear_fn()
 
@@ -3384,7 +3558,7 @@ class EasyBridgeMixin(PushToHubMixin):
                             )
                             for pos, expert_idx in enumerate(expert_indices):
                                 stacked_tensor[pos] = shard[expert_key_by_idx[expert_idx]]
-                            _process_tensor(stacked_key, stacked_tensor)
+                            _emit_stacked(stacked_key, stacked_tensor)
                             del stacked_tensor
                             clear_fn()
 
@@ -3414,7 +3588,7 @@ class EasyBridgeMixin(PushToHubMixin):
                         reform_fusion_rules[fused_key],
                         tensors,
                     )
-                    _process_tensor(fused_key, fused_tensor)
+                    _process_tensor(fused_key, fused_tensor, pre_normalized=True)
                     del tensors
                     del fused_tensor
                     clear_fn()
@@ -3479,7 +3653,7 @@ class EasyBridgeMixin(PushToHubMixin):
                                 del shard
                                 clear_fn()
 
-                    _process_tensor(stacked_key, stacked_tensor)
+                    _emit_stacked(stacked_key, stacked_tensor)
                     del stacked_tensor
                     clear_fn()
 
@@ -3488,6 +3662,8 @@ class EasyBridgeMixin(PushToHubMixin):
                 _run_streaming_conversion()
         else:
             _run_streaming_conversion()
+        if pending_stacked:
+            raise ValueError(f"Stacked expert tensors never completed their fusion group: {sorted(pending_stacked)}")
 
         return parameters_flat
 
@@ -3608,6 +3784,7 @@ class EasyBridgeMixin(PushToHubMixin):
         torch_loader: tp.Any,
         clear_fn: tp.Callable[[], None],
         kwargs: dict[str, tp.Any],
+        param_dtype: jnp.dtype | None = None,
     ) -> tuple[tp.Any, tp.Any, dict[str, tp.Any]]:
         """Load full PyTorch checkpoint into memory (for torch_load_mode='full').
 
@@ -3620,6 +3797,9 @@ class EasyBridgeMixin(PushToHubMixin):
             clear_fn (Callable[[], None]): Function to call for memory cleanup after loading.
             kwargs (dict[str, Any]): Additional keyword arguments for model loading
                 (e.g., torch_dtype).
+            param_dtype (jnp.dtype | None): Target parameter dtype. Without an explicit
+                ``torch_dtype`` the torch model loads in this dtype (or the checkpoint's own
+                dtype when torch has no match), so weights are rounded once, to the target.
 
         Returns:
             tuple[Any, Any, dict[str, Any]]: A tuple of (ed_config, generation_config, state_dict)
@@ -3630,13 +3810,29 @@ class EasyBridgeMixin(PushToHubMixin):
 
         logger.debug(f"Downloading hf_model weights from {pretrained_model_name_or_path}")
         if "torch_dtype" not in kwargs:
-            kwargs["torch_dtype"] = torch.float16
+            target = jnp.dtype(param_dtype).name if param_dtype is not None else None
+            kwargs["torch_dtype"] = getattr(torch, target, "auto") if target else "auto"
         torch_dtype = kwargs.pop("torch_dtype")
-        hf_model = torch_loader.from_pretrained(
-            pretrained_model_name_or_path,
-            dtype=torch_dtype,
-            **kwargs,
-        )
+        try:
+            hf_model = torch_loader.from_pretrained(
+                pretrained_model_name_or_path,
+                dtype=torch_dtype,
+                **kwargs,
+            )
+        except ValueError as err:
+            # Remote-code repos register only the Auto classes in their
+            # ``auto_map`` (Kimi-VL maps AutoModelForCausalLM, not
+            # AutoModelForImageTextToText); load through one of those instead.
+            if "Unrecognized configuration class" not in str(err):
+                raise
+            fallback = cls._auto_map_torch_loader(pretrained_model_name_or_path, hub_kwargs, kwargs)
+            if fallback is None:
+                raise
+            hf_model = fallback.from_pretrained(
+                pretrained_model_name_or_path,
+                dtype=torch_dtype,
+                **kwargs,
+            )
         generation_config = getattr(hf_model, "generation_config", None)
         ed_config = config_class.from_pretrained(pretrained_model_name_or_path, **hub_kwargs)
         state_dict = hf_model.state_dict()
@@ -3644,6 +3840,46 @@ class EasyBridgeMixin(PushToHubMixin):
         del hf_model
         clear_fn()
         return ed_config, generation_config, state_dict
+
+    @staticmethod
+    def _auto_map_torch_loader(
+        pretrained_model_name_or_path: str,
+        hub_kwargs: dict[str, tp.Any],
+        kwargs: dict[str, tp.Any],
+    ) -> tp.Any | None:
+        """Pick a transformers Auto class able to build this checkpoint's config.
+
+        Remote-code repos register only the classes in their ``auto_map``
+        (Kimi-VL: ``AutoModelForCausalLM``), and transformers itself files some
+        built-in models under another Auto mapping (5.13 lists
+        ``Mistral4ForCausalLM`` only for image-text-to-text).
+        """
+        import transformers
+        from transformers import AutoConfig
+
+        hf_config = AutoConfig.from_pretrained(
+            pretrained_model_name_or_path,
+            trust_remote_code=kwargs.get("trust_remote_code", False),
+            **hub_kwargs,
+        )
+        auto_map = getattr(hf_config, "auto_map", None) or {}
+        for name in (
+            "AutoModelForImageTextToText",
+            "AutoModelForVision2Seq",
+            "AutoModelForCausalLM",
+            "AutoModelForSeq2SeqLM",
+        ):
+            auto_class = getattr(transformers, name, None)
+            if auto_class is None:
+                continue
+            if name in auto_map:
+                return auto_class
+            try:
+                if type(hf_config) in auto_class._model_mapping:
+                    return auto_class
+            except Exception:  # lazy mapping could not resolve this config type
+                continue
+        return None
 
     @classmethod
     def huggingface_to_easydel_sequential(
@@ -3751,7 +3987,14 @@ class EasyBridgeMixin(PushToHubMixin):
         from transformers import AutoConfig
 
         from easydel.modules.auto.auto_configuration import get_modules_by_type
-        from easydel.utils.parameters_transformation import StateDictConverter, TensorConverter
+        from easydel.utils.parameters_transformation import (
+            HFCheckpointKeyMapper,
+            StateDictConverter,
+            TensorConverter,
+            canonical_expert_leaf,
+            hf_rename_key,
+            resolve_expert_merge,
+        )
 
         if jax.process_count() > 1 and jax.process_index() != 0:
             logger.info("Skipping sequential conversion on non-zero process index.")
@@ -3943,6 +4186,12 @@ class EasyBridgeMixin(PushToHubMixin):
         # other rule; `None` marks a tensor the runtime does not own.
         _ckpt_key_normalizer = transformer.keywords.get("checkpoint_key_normalizer")
 
+        def _resolve_merge(k: str, nk: str):
+            """Place a per-expert key in transformers' merged expert layout (see ``resolve_expert_merge``)."""
+            if hf_key_mapper is not None:
+                return hf_key_mapper.expert_merge(k)
+            return resolve_expert_merge(nk, hf_model_type, apply_renamings=_ckpt_key_normalizer is not None)
+
         def _normalize_key(k: str) -> str | None:
             """Map a checkpoint key to EasyDeL naming (re-insert flattened wrappers).
 
@@ -3953,7 +4202,13 @@ class EasyBridgeMixin(PushToHubMixin):
                 str: The key with any transformers >= 5.13 flattened wrapper
                 prefix re-inserted; unchanged when already in EasyDeL layout.
             """
-            k = _ckpt_key_normalizer(k) if _ckpt_key_normalizer is not None else k
+            # A model's own normalizer encodes its on-disk layout; otherwise use
+            # transformers' load-time renames, so keys match what the full loader
+            # sees (e.g. VLMs saved under legacy ``language_model.model.*``).
+            if _ckpt_key_normalizer is not None:
+                k = _ckpt_key_normalizer(k)
+            else:
+                k = hf_rename_key(k, hf_model_type, mapper=hf_key_mapper)
             if k is None:
                 return None
             return StateDictConverter.normalize_flattened_wrapper_key(k, hf_flattened_wrappers)
@@ -3963,6 +4218,14 @@ class EasyBridgeMixin(PushToHubMixin):
         moe_names_set = set(moe_names or [])
         expected_expert_name = moe_path[0].split(".")[-2] if moe_path else "experts"
         expert_prefix = f".{expected_expert_name}."
+        hf_model_type = transformer.keywords.get("hf_model_type") or getattr(hf_config, "model_type", None)
+        # transformers' own key mapping for this model (scoped renames + merges),
+        # unless the model normalizes its checkpoint keys itself.
+        hf_key_mapper = (
+            HFCheckpointKeyMapper.for_config(hf_config, trust_remote_code=bool(getattr(hf_config, "auto_map", None)))
+            if _ckpt_key_normalizer is None
+            else None
+        )
 
         consolidated_moe_keys: set[str] = set()
         moe_groups: dict[str, dict[int, str]] = {}
@@ -4003,7 +4266,16 @@ class EasyBridgeMixin(PushToHubMixin):
                 moe_name_part = remainder[dot_idx + 1 :]
                 moe_name = moe_name_part[:-7] if moe_name_part.endswith(".weight") else moe_name_part
                 if moe_name not in moe_names_set:
-                    continue
+                    # Per-part runtime leaves under transformers' names (Mixtral
+                    # `w2` -> `down_proj`, DeepSeek-V4 `w1` -> `gate_proj`).
+                    merge = _resolve_merge(k, nk)
+                    canonical = canonical_expert_leaf(merge[2], merge[3]) if merge is not None else None
+                    if canonical in moe_names_set:
+                        moe_name = canonical
+                    elif merge is not None and len(merge[2].parts) == 1 and merge[2].target in moe_names_set:
+                        moe_name = merge[2].target
+                    else:
+                        continue
                 target_path = f"{block_path}.{expected_expert_name}.{moe_name}"
                 moe_groups.setdefault(target_path, {})[expert_idx] = k
                 expert_key_to_group[k] = (target_path, expert_idx)
@@ -4499,6 +4771,32 @@ class EasyBridgeMixin(PushToHubMixin):
             moe_remaining.pop(target, None)
         moe_handles: dict[str, dict[str, tp.Any]] = {}
 
+        def _open_stacked_expert_store(key_tuple: tuple, global_shape: tuple[int, ...]):
+            """Create the zarr store for one ``[experts, ...]`` parameter and index it.
+
+            Returns:
+                tuple: ``(abs_path, rel_path, tensorstore_array)``.
+            """
+            abs_path, rel_path = _tensorstore_path_for_params(key_tuple)
+            chunks = _chunk_shape_for(key_tuple, global_shape, model.param_dtype, moe=True)
+            ts_spec = jax_ser.get_tensorstore_spec(abs_path)
+            ts_spec["metadata"] = ts_impl._get_tensorstore_metadata_cached(
+                global_shape,
+                model.param_dtype,
+                tuple(chunks),
+                driver="zarr",
+            )
+            ts_spec["dtype"] = jnp.dtype(model.param_dtype).name
+            ts_arr = ts.open(ts.Spec(ts_spec), create=True, open=True).result()
+            array_index.append(
+                {
+                    "path": rel_path,
+                    "shape": [int(d) for d in global_shape],
+                    "dtype": str(jnp.dtype(model.param_dtype)),
+                }
+            )
+            return abs_path, rel_path, ts_arr
+
         def _ensure_moe_group_ready(target_path: str, *, sample_expert_tensor) -> dict[str, tp.Any] | None:
             """Lazily allocate a TensorStore handle for a consolidated MoE weight.
 
@@ -4524,22 +4822,9 @@ class EasyBridgeMixin(PushToHubMixin):
             if key_tuple not in required_params:
                 return None
 
-            abs_path, rel_path = _tensorstore_path_for_params(key_tuple)
-
             out_features, in_features = tuple(int(i) for i in sample_expert_tensor.shape)
             num_experts = int(moe_expected[target_path])
-            global_shape = (num_experts, in_features, out_features)
-            chunks = _chunk_shape_for(key_tuple, global_shape, model.param_dtype, moe=True)
-
-            ts_spec = jax_ser.get_tensorstore_spec(abs_path)
-            ts_spec["metadata"] = ts_impl._get_tensorstore_metadata_cached(
-                global_shape,
-                model.param_dtype,
-                tuple(chunks),
-                driver="zarr",
-            )
-            ts_spec["dtype"] = jnp.dtype(model.param_dtype).name
-            ts_arr = ts.open(ts.Spec(ts_spec), create=True, open=True).result()
+            abs_path, rel_path, ts_arr = _open_stacked_expert_store(key_tuple, (num_experts, in_features, out_features))
 
             handle = {
                 "key_tuple": key_tuple,
@@ -4552,13 +4837,6 @@ class EasyBridgeMixin(PushToHubMixin):
                 "ts": ts_arr,
             }
             moe_handles[target_path] = handle
-            array_index.append(
-                {
-                    "path": rel_path,
-                    "shape": [num_experts, in_features, out_features],
-                    "dtype": str(jnp.dtype(model.param_dtype)),
-                }
-            )
             return handle
 
         def _finalize_moe_group(target_path: str) -> None:
@@ -4612,6 +4890,134 @@ class EasyBridgeMixin(PushToHubMixin):
                 return
             for key_tuple, jax_array in results:
                 _write_tensor(key_tuple, jax_array)
+
+        # Per-expert checkpoint tensors feeding a fused expert leaf through a
+        # rule that consumes either stacked parts named by its ``sources``
+        # (DeepSeek: ``experts.gate_proj.weight`` + ``experts.up_proj.weight``)
+        # or the tensor transformers>=5 merges in memory (``experts.gate_up_proj``,
+        # resolved from transformers' conversion mapping). Each expert is fused
+        # on its own through that rule and written into its slot, so memory
+        # stays one expert deep.
+        # fused_key -> (rule, number of parts, concat dim or ``None`` for separate sources)
+        expert_part_rules: dict[str, tuple[dict[str, tp.Any], int, int | None]] = {}
+        separate_expert_parts: dict[str, tuple[str, int]] = {}  # "<base><leaf>" -> (fused_key, part)
+        merged_expert_sources: dict[str, tuple[str, dict[str, tp.Any]]] = {}  # source -> (fused_key, rule)
+        source_leaf_re = re.compile(rf"^(.*\.{re.escape(expected_expert_name)}\.)([^.]+)\.weight$")
+        for rule_key, rule in (reform_param or {}).items():
+            sources = tuple(rule.get("sources", ()))
+            if "fuser" not in rule:
+                continue
+            fused_key = rule_key[:-1] if rule_key.endswith("$") else rule_key
+            if tuple(int(n) if n.isdigit() else n for n in fused_key.split(".")) not in required_params:
+                continue
+            leaves = [source_leaf_re.match(source) for source in sources]
+            if len(sources) >= 2 and all(leaves) and len({m.group(1) for m in leaves}) == 1:
+                expert_part_rules[fused_key] = (rule, len(sources), None)
+                for part, match in enumerate(leaves):
+                    separate_expert_parts[match.group(1) + match.group(2)] = (fused_key, part)
+            elif len(sources) == 1 and expert_prefix in sources[0] and sources[0] not in normalized_to_original:
+                merged_expert_sources[sources[0]] = (fused_key, rule)
+        per_expert_re = re.compile(rf"^(.*\.{re.escape(expected_expert_name)}\.)(\d+)\.([^.]+)\.weight$")
+        expert_part_key_to_group: dict[str, tuple[str, int, int]] = {}  # key -> (fused_key, expert, part)
+        expert_part_indices: dict[str, set[int]] = {}
+        # Merged tensors a rename/split rule consumes by name (Mixtral's
+        # ``experts.<i>.w2`` -> ``mlp.experts.down_proj``): stacked per layer and
+        # written through the normal rule path, as the full loader would.
+        by_name_targets = {
+            (rule_key[:-1] if rule_key.endswith("$") else rule_key)
+            for rule_key, rule in (reform_param or {}).items()
+            if "splits" in rule and expert_prefix in rule_key
+        } - set(normalized_to_original)
+        stack_key_to_group: dict[str, tuple[str, int, int]] = {}  # key -> (merged key, expert, part)
+        stack_groups: dict[str, tuple[tp.Any, list[set[int]]]] = {}  # merged key -> (spec, experts per part)
+        if expert_part_rules or merged_expert_sources or by_name_targets:
+            for k in ckpt_key_to_filename:
+                if k in fusion_source_to_targets or k in expert_key_to_group:
+                    continue
+                nk = _normalize_key(k)
+                match = per_expert_re.match(nk) if nk is not None else None
+                if match is None:
+                    continue
+                hit = separate_expert_parts.get(match.group(1) + match.group(3))
+                if hit is None and by_name_targets:
+                    merge = _resolve_merge(k, nk)
+                    if merge is not None and merge[0] in by_name_targets:
+                        spec = merge[2]
+                        stack_groups.setdefault(merge[0], (spec, [set() for _ in spec.parts]))[1][merge[3]].add(merge[1])
+                        stack_key_to_group[k] = (merge[0], merge[1], merge[3])
+                        continue
+                if hit is None:
+                    merge = _resolve_merge(k, nk)
+                    if merge is None or merge[0] not in merged_expert_sources or len(merge[2].parts) < 2:
+                        continue
+                    fused_key, rule = merged_expert_sources[merge[0]]
+                    expert_part_rules.setdefault(fused_key, (rule, len(merge[2].parts), merge[2].concat_dim))
+                    hit = (fused_key, merge[3])
+                expert_part_key_to_group[k] = (hit[0], int(match.group(2)), hit[1])
+                expert_part_indices.setdefault(hit[0], set()).add(int(match.group(2)))
+        expert_part_remaining = {
+            fused_key: len(indices)
+            for fused_key, indices in expert_part_indices.items()
+            if not _already_written(tuple(int(n) if n.isdigit() else n for n in fused_key.split(".")))
+        }
+        expert_part_pending: dict[str, dict[int, dict[int, tp.Any]]] = {}
+        expert_part_handles: dict[str, tp.Any] = {}
+
+        stack_pending: dict[str, list[dict[int, tp.Any]]] = {}
+
+        def _process_stack_part(key: str, tensor) -> None:
+            """Collect one per-expert tensor; write the merged tensor once its layer is complete."""
+            merged_key, idx, part = stack_key_to_group[key]
+            if quant_decode is not None:
+                decoded = quant_decode(key, tensor, _shard_getter["fn"])
+                if decoded is _QUANT_CONSUMED:
+                    return
+                if decoded is not None:
+                    tensor = decoded
+            spec, expected = stack_groups[merged_key]
+            parts = stack_pending.setdefault(merged_key, [{} for _ in spec.parts])
+            parts[part][idx] = tensor
+            if any(set(got) != want for got, want in zip(parts, expected, strict=True)):
+                return
+            with convert_ctx:
+                stacked = [torch.stack([got[e] for e in sorted(got)]) for got in stack_pending.pop(merged_key)]
+                merged = stacked[0] if len(stacked) == 1 else torch.cat(stacked, dim=spec.concat_dim)
+            _process_and_write(merged_key, merged, decode_quant=False, pre_normalized=True)
+
+        def _process_expert_part(key: str, tensor) -> None:
+            """Hold one expert part until the expert is complete, then fuse and write that expert."""
+            fused_key, idx, part = expert_part_key_to_group[key]
+            if fused_key not in expert_part_remaining:
+                return
+            if quant_decode is not None:
+                decoded = quant_decode(key, tensor, _shard_getter["fn"])
+                if decoded is _QUANT_CONSUMED:
+                    return
+                if decoded is not None:
+                    tensor = decoded
+            rule, num_parts, concat_dim = expert_part_rules[fused_key]
+            slot = expert_part_pending.setdefault(fused_key, {}).setdefault(idx, {})
+            slot[part] = tensor
+            if len(slot) < num_parts:
+                return
+            parts = [slot.pop(p)[None] for p in range(num_parts)]
+            del expert_part_pending[fused_key][idx]
+            with convert_ctx:
+                inputs = parts if concat_dim is None else [torch.cat(parts, dim=concat_dim)]
+                fused = StateDictConverter.fuse_reform_param_tensors(rule, inputs)
+                expert_slice = TensorConverter.convert_pytorch_to_jnp(fused[0].contiguous(), model.param_dtype)
+            if fused_key not in expert_part_handles:
+                indices = sorted(expert_part_indices[fused_key])
+                key_tuple = tuple(int(n) if n.isdigit() else n for n in fused_key.split("."))
+                _, _, ts_arr = _open_stacked_expert_store(key_tuple, (len(indices), *expert_slice.shape))
+                expert_part_handles[fused_key] = (ts_arr, {ei: pos for pos, ei in enumerate(indices)})
+            ts_arr, pos_by_expert = expert_part_handles[fused_key]
+            ts_arr[pos_by_expert[idx]].write(expert_slice).result()
+            expert_part_remaining[fused_key] -= 1
+            if expert_part_remaining[fused_key] <= 0:
+                expert_part_handles.pop(fused_key, None)
+                label = str(rule.get("log_label", fused_key))
+                fusion_counts[label] = fusion_counts.get(label, 0) + 1
 
         def _process_fusion_source(key: str, tensor) -> bool:
             """Accumulate reform_param source tensors and write fused targets.
@@ -4679,6 +5085,12 @@ class EasyBridgeMixin(PushToHubMixin):
                             if k in fusion_source_to_targets:
                                 _process_fusion_source(k, f.get_tensor(k))
                                 continue
+                            if k in expert_part_key_to_group:
+                                _process_expert_part(k, f.get_tensor(k))
+                                continue
+                            if k in stack_key_to_group:
+                                _process_stack_part(k, f.get_tensor(k))
+                                continue
 
                             if k in expert_key_to_group:
                                 target_path, expert_idx = expert_key_to_group[k]
@@ -4722,6 +5134,12 @@ class EasyBridgeMixin(PushToHubMixin):
                     for k in keys:
                         if k in fusion_source_to_targets:
                             _process_fusion_source(k, shard[k])
+                            continue
+                        if k in expert_part_key_to_group:
+                            _process_expert_part(k, shard[k])
+                            continue
+                        if k in stack_key_to_group:
+                            _process_stack_part(k, shard[k])
                             continue
 
                         if k in expert_key_to_group:
@@ -4771,6 +5189,8 @@ class EasyBridgeMixin(PushToHubMixin):
             )
 
         incomplete = {k: v for k, v in moe_remaining.items() if v > 0}
+        incomplete.update({fused_key: v for fused_key, v in expert_part_remaining.items() if v > 0})
+        incomplete.update({merged_key: "partial" for merged_key in stack_pending})
         if incomplete:
             raise RuntimeError(
                 "Some MoE expert groups were incomplete after processing all shards: "

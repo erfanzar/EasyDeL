@@ -27,6 +27,7 @@ Exports:
     - ``LlavaForConditionalGeneration``: full model with LM head for generation.
 """
 
+import inspect
 import typing as tp
 
 import jax
@@ -283,21 +284,30 @@ class LlavaModel(EasyDeLBaseModule):
         self.vision_feature_layer = config.vision_feature_layer
         self.vision_feature_select_strategy = getattr(config, "vision_feature_select_strategy", "default")
 
-    def get_image_features(self, pixel_values: Array) -> Array:
+    def get_image_features(self, pixel_values: Array, image_sizes: Array | None = None) -> Array:
         """Extracts and projects image features from the vision tower.
 
         Args:
             pixel_values (Array): Input pixel values for the images.
+            image_sizes (Array | None, optional): Per-image ``(height, width)``; forwarded to
+                vision towers that crop padded images (Pixtral), like HF. Defaults to None.
 
         Returns:
             Array: Processed image features ready for the language model.
         """
-        image_features = self.vision_tower(pixel_values, output_hidden_states=True)
-        selected_image_feature = image_features.hidden_states[self.vision_feature_layer]
-        if self.vision_feature_select_strategy == "default":
-            selected_image_feature = selected_image_feature[:, 1:]
-        elif self.vision_feature_select_strategy == "full":
-            selected_image_feature = selected_image_feature
+        vision_kwargs = {}
+        if image_sizes is not None and "image_sizes" in inspect.signature(self.vision_tower.forward).parameters:
+            vision_kwargs["image_sizes"] = image_sizes
+        image_features = self.vision_tower(pixel_values, output_hidden_states=True, **vision_kwargs)
+        if isinstance(self.vision_feature_layer, int):
+            selected_image_feature = image_features.hidden_states[self.vision_feature_layer]
+            if self.vision_feature_select_strategy == "default":
+                selected_image_feature = selected_image_feature[:, 1:]
+        else:
+            hs_pool = [image_features.hidden_states[layer_idx] for layer_idx in self.vision_feature_layer]
+            if self.vision_feature_select_strategy == "default":
+                hs_pool = [hs[:, 1:] for hs in hs_pool]
+            selected_image_feature = jnp.concatenate(hs_pool, axis=-1)
         image_features = tp.cast(Array, self.multi_modal_projector(selected_image_feature))
 
         return image_features
@@ -308,6 +318,7 @@ class LlavaModel(EasyDeLBaseModule):
         *,
         image_features: Array | None = None,
         pixel_values: Array | None = None,
+        image_sizes: Array | None = None,
         **kwargs,
     ) -> Array:
         """Compute input embeddings with merged image and text features.
@@ -321,6 +332,8 @@ class LlavaModel(EasyDeLBaseModule):
                 If None and pixel_values provided, features are extracted. Defaults to None.
             pixel_values (Array | None, optional): Raw pixel values for image extraction.
                 Defaults to None.
+            image_sizes (Array | None, optional): Per-image sizes forwarded to the vision
+                tower (Pixtral crop). Defaults to None.
             **kwargs: Additional keyword arguments (unused).
 
         Returns:
@@ -343,7 +356,7 @@ class LlavaModel(EasyDeLBaseModule):
         inputs_embeds = super().compute_embedding(llm_input_ids)
 
         if image_features is None and pixel_values is not None:
-            image_features = self.get_image_features(pixel_values)
+            image_features = self.get_image_features(pixel_values, image_sizes=image_sizes)
 
         if image_features is not None:
             multimodal_embeddings = image_features.reshape(-1, image_features.shape[-1]).astype(inputs_embeds.dtype)
@@ -369,6 +382,7 @@ class LlavaModel(EasyDeLBaseModule):
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
+        image_sizes: Array | None = None,
         **lm_kwargs,
     ):
         """Forward pass through the LLaVA base model.
@@ -381,6 +395,8 @@ class LlavaModel(EasyDeLBaseModule):
                 Must be provided if inputs_embeds is None.
             pixel_values (Array | None, optional): Input pixel values for images of shape
                 (batch_size, num_channels, height, width). Defaults to None.
+            image_sizes (Array | None, optional): Per-image ``(height, width)`` forwarded to
+                the vision tower (Pixtral crops padded images to these sizes). Defaults to None.
             attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
                 shape (batch_size, sequence_length). Defaults to None.
             mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
@@ -421,7 +437,7 @@ class LlavaModel(EasyDeLBaseModule):
 
         image_features = None
         if pixel_values is not None:
-            image_features = self.get_image_features(pixel_values)
+            image_features = self.get_image_features(pixel_values, image_sizes=image_sizes)
 
         if inputs_embeds is None:
             inputs_embeds = self.compute_embedding(
@@ -533,6 +549,7 @@ class LlavaModel(EasyDeLBaseModule):
         """
         model_kwargs = self.language_model.update_inputs_for_generation(model_outputs, model_kwargs)
         model_kwargs.pop("pixel_values", None)  # only effect first iter
+        model_kwargs.pop("image_sizes", None)  # only effect first iter
         return model_kwargs
 
     def get_encoder(self):
@@ -656,12 +673,12 @@ class LlavaForConditionalGeneration(BaseVisionLanguageModule[LlavaModel, LlavaCo
 
         Args:
             pixel_values: Input image pixel values
-            **kwargs: Additional arguments (unused for LLaVA)
+            **kwargs: Additional arguments; ``image_sizes`` is forwarded to the vision tower.
 
         Returns:
             Projected image features ready for merging with text embeddings
         """
-        return self.base_model.get_image_features(pixel_values)
+        return self.base_model.get_image_features(pixel_values, image_sizes=kwargs.get("image_sizes"))
 
     def compute_embedding(self, input_ids, *args, **kwargs):
         """Compute input embeddings with merged image and text features.
@@ -692,6 +709,7 @@ class LlavaForConditionalGeneration(BaseVisionLanguageModule[LlavaModel, LlavaCo
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
+        image_sizes: Array | None = None,
         **lm_kwargs,
     ) -> VLMCausalLMOutput:
         """Forward pass for image-conditioned text generation.
@@ -704,6 +722,8 @@ class LlavaForConditionalGeneration(BaseVisionLanguageModule[LlavaModel, LlavaCo
                 Must be provided if inputs_embeds is None.
             pixel_values (Array | None, optional): Input pixel values for images of shape
                 (batch_size, num_channels, height, width). Defaults to None.
+            image_sizes (Array | None, optional): Per-image ``(height, width)`` forwarded to
+                the vision tower (Pixtral crops padded images to these sizes). Defaults to None.
             attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
                 shape (batch_size, sequence_length). Defaults to None.
             mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
@@ -753,6 +773,7 @@ class LlavaForConditionalGeneration(BaseVisionLanguageModule[LlavaModel, LlavaCo
             cache_metadata=cache_metadata,
             inputs_embeds=inputs_embeds,
             pixel_values=pixel_values,
+            image_sizes=image_sizes,
             **lm_kwargs,
         )
 
@@ -801,20 +822,6 @@ class LlavaForConditionalGeneration(BaseVisionLanguageModule[LlavaModel, LlavaCo
             TransformerCache: Initialized cache for the language model.
         """
         return self.base_model.init_cache(batch_size, max_length, starts, shardings, pad_token_id)
-
-    def apply_lm_head(self, hidden_states: Array) -> Array:
-        """Apply the language modeling head to hidden states.
-
-        Projects hidden states to vocabulary logits for next-token prediction.
-
-        Args:
-            hidden_states (Array): Hidden states of shape
-                (batch_size, sequence_length, hidden_size).
-
-        Returns:
-            Array: Logits of shape (batch_size, sequence_length, vocab_size).
-        """
-        return self.lm_head(hidden_states)
 
     def get_vision_tower(self) -> spx.Module:
         """Return the vision tower component.

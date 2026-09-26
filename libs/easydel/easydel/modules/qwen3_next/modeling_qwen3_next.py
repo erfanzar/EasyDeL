@@ -1589,12 +1589,14 @@ def _apply_qwen3_next_packed_updates_ragged(
         or its chunked mixed-prefill branch.
 
     The ``distribution`` tensor is built as
-    ``(decode_count, num_active, num_active)``. The middle slot is identical
-    to the last slot because in Qwen3-Next every non-decode slot is a pure
-    prefill — there is no chunked-prefill-mixed-with-decode class that would
-    need a separate index. The ragged GDN branch predicate
-    ``distribution[0] == distribution[2]`` then selects decode-only vs.
-    mixed-prefill correctly.
+    ``(decode_count, num_rows, num_rows)`` where ``num_rows`` is the positional
+    row prefix (``min(num_requests, num_slots)``, empty rows included — the
+    kernels skip them). The middle slot is identical to the last slot because
+    in Qwen3-Next every non-decode slot is a pure prefill — there is no
+    chunked-prefill-mixed-with-decode class that would need a separate index.
+    ``decode_count`` is ``num_rows`` when no row carries more than one token,
+    so the ragged GDN branch predicate ``distribution[0] == distribution[2]``
+    selects decode-only vs. mixed-prefill correctly.
 
     Args:
         conv_states: Rolling conv state pool,
@@ -1683,10 +1685,15 @@ def _apply_qwen3_next_packed_updates_ragged(
     else:
         context_lens_i = jnp.asarray(context_lens, dtype=jnp.int32)[:num_slots]
         has_initial_state = ((context_lens_i - scheduled_tokens) > 0) & active_slots
-    single_slot_mask = active_slots & (scheduled_tokens == 1)
-    decode_count = jnp.sum(single_slot_mask)
-    num_active = jnp.sum(active_slots)
-    distribution = jnp.stack([decode_count, num_active, num_active])
+    # Rows are positional: the kernels treat ``distribution[2]`` as the row
+    # prefix ``[0, num_rows)`` and skip empty (q_len == 0) rows inside it, so it
+    # must count rows, not active rows. Empty rows count as decode rows when no
+    # row carries more than one token, keeping such batches on the decode path.
+    num_rows = jnp.clip(jnp.asarray(num_requests, dtype=jnp.int32), 0, num_slots)
+    has_multi_token_row = jnp.any(active_slots & (scheduled_tokens > 1))
+    single_count = jnp.sum(active_slots & (scheduled_tokens == 1), dtype=jnp.int32)
+    decode_count = jnp.where(has_multi_token_row, single_count, num_rows)
+    distribution = jnp.stack([decode_count, num_rows, num_rows]).astype(jnp.int32)
 
     gdr_metadata = ragged_gdr_op.get_impl_metadata()
     gdr_mode = ragged_gdr_op.get_mode(query=jnp.expand_dims(conv_input[0], 0), BTHD=False)
@@ -2962,6 +2969,7 @@ class Qwen3NextLinearAttention(spx.Module):
             dtype=dtype,
             rngs=rngs,
             use_bias=False,
+            precision=precision,
         )
 
         # ``init_method`` is what ``sequential_init`` uses, since it cannot
@@ -3047,6 +3055,7 @@ class Qwen3NextLinearAttention(spx.Module):
             rhs_dilation=self.conv1d.dilation,
             dimension_numbers=dim_numbers,
             feature_group_count=self.conv1d.groups,
+            precision=self.conv1d.precision,
         )
         return typing.cast(Array, with_sharding_constraint(conv_output, replicated_3d, mesh=stage_mesh))
 

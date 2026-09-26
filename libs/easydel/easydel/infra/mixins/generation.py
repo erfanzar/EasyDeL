@@ -1858,9 +1858,12 @@ class EasyGenerationMixin:
         linear_config = getattr(text_config, "linear_attn_config", None) or {}
 
         num_heads = int(linear_config.get("num_heads", getattr(text_config, "num_attention_heads", 0) or 0))
-        head_k_dim = int(linear_config.get("head_k_dim", 128))
-        head_v_dim = int(linear_config.get("head_v_dim", 128))
-        d_conv = int(linear_config.get("d_conv", getattr(text_config, "d_conv", 4)))
+        head_dim = int(linear_config.get("head_dim", 128))
+        head_k_dim = int(linear_config.get("head_k_dim", head_dim))
+        head_v_dim = int(linear_config.get("head_v_dim", head_dim))
+        d_conv = int(
+            linear_config.get("d_conv", linear_config.get("short_conv_kernel_size", getattr(text_config, "d_conv", 4)))
+        )
 
         if num_heads <= 0:
             raise ValueError(
@@ -2056,9 +2059,7 @@ class EasyGenerationMixin:
         if cache_rope_width is not None:
             qk_rope_head_dim = int(cache_rope_width)
             if qk_rope_head_dim < 0:
-                raise ValueError(
-                    f"`mla_cache_rope_width` must be non-negative, got {cache_rope_width}."
-                )
+                raise ValueError(f"`mla_cache_rope_width` must be non-negative, got {cache_rope_width}.")
 
         mla_num_heads = getattr(text_config, "num_attention_heads", None)
         if mla_num_heads is None:
@@ -2874,7 +2875,6 @@ class EasyGenerationMixin:
             # at runtime. This avoids duplicate JAX buffer donation errors.
 
             return HybridCache(views=views)
-
 
     @cached_property
     def _quant_class(self):

@@ -569,11 +569,13 @@ class Gemma4AssistantQOnlyAttention(spx.Module):
             key_states = jnp.repeat(key_states, repeats, axis=-2)
             value_states = jnp.repeat(value_states, repeats, axis=-2)
 
-        scale = 1.0 / jnp.sqrt(jnp.float32(self.head_dim))
+        # Gemma4 attention uses ``scaling=1.0`` (HF ``Gemma4TextAttention`` and
+        # EasyDeL's own Gemma4 attention): the Q/K RMS norms already bound the
+        # logit scale, so no ``1/sqrt(head_dim)`` factor is applied here either.
         q_bhsd = jnp.transpose(q, (0, 2, 1, 3)).astype(jnp.float32)
         k_bhsd = jnp.transpose(key_states, (0, 2, 1, 3)).astype(jnp.float32)
         v_bhsd = jnp.transpose(value_states, (0, 2, 1, 3)).astype(jnp.float32)
-        scores = jnp.einsum("bhsd,bhtd->bhst", q_bhsd, k_bhsd) * scale
+        scores = jnp.einsum("bhsd,bhtd->bhst", q_bhsd, k_bhsd)
         if attention_mask is not None:
             scores = scores + attention_mask.astype(jnp.float32)
         attn = jax.nn.softmax(scores, axis=-1)
@@ -744,7 +746,7 @@ class Gemma4AssistantModel(EasyDeLBaseModule):
         pre_projection: ColumnParallelLinear,
         target_key_value_pairs: list[tuple[Array, Array] | None] | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        attention_mask: Float[Array, "batch 1 q_len kv_len"] | None = None,
+        attention_mask: Float[Array, "batch 1 q_len kv_len"] | dict[str, Array] | None = None,
     ) -> BaseModelOutput:
         """Run the drafter trunk.
 
@@ -767,7 +769,11 @@ class Gemma4AssistantModel(EasyDeLBaseModule):
                 self-K/V — only correct shape, not correct semantics
                 (see module docstring for the proposer contract).
             position_ids: Position IDs for Q-side RoPE.
-            attention_mask: Optional float-additive attention mask.
+            attention_mask: Optional float-additive attention mask, either
+                one array shared by every layer or a dict keyed by attention
+                type (``"full_attention"`` / ``"sliding_attention"``), like
+                HF's per-layer-type mask mapping; each layer picks the entry
+                for its own ``layer_type``.
 
         Returns:
             :class:`BaseModelOutput` with ``last_hidden_state``
@@ -783,7 +789,10 @@ class Gemma4AssistantModel(EasyDeLBaseModule):
         for i, layer in enumerate(self.layers):
             kv = target_key_value_pairs[i] if target_key_value_pairs else None
             k_in, v_in = kv if kv is not None else (None, None)
-            h = layer(h, k_in, v_in, position_ids, attention_mask)
+            layer_mask = (
+                attention_mask.get(layer.self_attn.layer_type) if isinstance(attention_mask, dict) else attention_mask
+            )
+            h = layer(h, k_in, v_in, position_ids, layer_mask)
             h = checkpoint_name(h, f"gemma4_assistant_layer_{i}")
         h = self.norm(h)
         return BaseModelOutput(last_hidden_state=h)
@@ -898,7 +907,7 @@ class Gemma4AssistantForCausalLM(EasyDeLBaseModule):
         target_token_embeds: Float[Array, "batch seq_len backbone_hidden"],
         target_key_value_pairs: list[tuple[Array, Array] | None] | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        attention_mask: Float[Array, "batch 1 q_len kv_len"] | None = None,
+        attention_mask: Float[Array, "batch 1 q_len kv_len"] | dict[str, Array] | None = None,
         return_dense_logits: bool = False,
     ) -> Gemma4AssistantOutput:
         """Run the drafter end-to-end.
@@ -912,7 +921,8 @@ class Gemma4AssistantForCausalLM(EasyDeLBaseModule):
                 KV cache. ``None`` → self-K/V fallback (NOT
                 semantically correct; for shape sanity only).
             position_ids: Position IDs for Q-side RoPE.
-            attention_mask: Optional float-additive mask.
+            attention_mask: Optional float-additive mask, or a dict of masks
+                keyed by attention type (see :meth:`Gemma4AssistantModel.forward`).
             return_dense_logits: Whether the centroid head should
                 also produce a dense ``(B, S, V)`` logits tensor with
                 ``-inf`` outside selected centroids.

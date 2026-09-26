@@ -470,3 +470,54 @@ def test_dspark_model_drafter_registry_path():
     from easydel.infra import DrafterRegistry
 
     assert DrafterRegistry.resolve("dspark") is DrafterRegistry.resolve("DSpark")
+
+
+def test_dspark_draft_matches_block_training_forward():
+    """``DSparkModel.draft`` evaluates the DeepSpec block-training function.
+
+    The runner calls the drafter with the anchor (last verified token) followed
+    by the tokens drafted so far and target context that precedes the anchor.
+    Row ``j`` of that single-anchor block must equal row ``j`` of the training
+    block forward at the same anchor — including the recurrent Markov head,
+    whose state is carried across the block's rows.
+    """
+    cfg = ed.DSparkConfig(
+        vocab_size=32,
+        hidden_size=16,
+        target_hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=4,
+        max_position_embeddings=16,
+        target_layer_ids=(0,),
+        block_size=3,
+        num_anchors=1,
+        mask_token_id=31,
+        markov_rank=4,
+        markov_head_type="rnn",
+        confidence_head_alpha=0.0,
+    )
+    model = ed.DSparkModel(config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
+    input_ids = _input_ids(batch_size=2, seq_len=6, vocab_size=32)
+    hidden = _target_hidden_states(1, batch_size=2, seq_len=6, hidden_size=16)[0]
+    anchor = 2
+
+    train = model(
+        input_ids=input_ids,
+        target_hidden_states=hidden,
+        anchor_positions=jnp.full((2, 1), anchor, dtype=jnp.int32),
+        block_keep_mask=jnp.ones((2, 1), dtype=bool),
+    )
+    block_logits = np.asarray(train.block_logits[:, 0])  # (batch, block, vocab)
+
+    # Anchor + the (teacher-forced) previous tokens, context strictly before the anchor.
+    prev_tokens = input_ids[:, anchor : anchor + cfg.block_size]
+    logits, _hidden = model._draft_logits(prev_tokens, target_hidden_states=hidden[:, :anchor])
+    np.testing.assert_allclose(np.asarray(logits), block_logits, rtol=1e-4, atol=1e-5)
+
+    # The shared ``draft`` tail proposes the last row's argmax.
+    for rows in range(1, cfg.block_size + 1):
+        step = model.draft(input_ids=prev_tokens[:, :rows], target_hidden_states=hidden[:, :anchor])
+        np.testing.assert_array_equal(np.asarray(step.token_ids), block_logits[:, rows - 1].argmax(-1))

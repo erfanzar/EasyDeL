@@ -95,6 +95,12 @@ class RopeConfig:
             (interpolates between linear-PI and NTK regimes).
         attn_factor (float | None): YaRN attention temperature multiplier
             applied after rotation; compensates for log-scaled softmax.
+        attention_factor (float | None): HF ``attention_factor`` for YaRN /
+            LongRoPE. When set it *replaces* the inferred magnitude scale
+            (YaRN ``mscale`` / LongRoPE ``sqrt(1 + log(s)/log(orig))``)
+            instead of multiplying it, matching transformers.
+        truncate (bool | None): HF YaRN ``truncate`` flag; ``False`` keeps the
+            fractional correction band (gpt-oss). ``None`` means ``True``.
         beta_fast (int | None): YaRN/DeepSeek "fast" boundary in
             wavelengths-per-original-context (rotations beyond which we
             extrapolate as-is).
@@ -126,6 +132,8 @@ class RopeConfig:
     short_mscale: float | None = None
     extrapolation_factor: float | None = None
     attn_factor: float | None = None
+    attention_factor: float | None = None
+    truncate: bool | None = None
     beta_fast: int | None = None
     beta_slow: int | None = None
     mscale: float | None = None
@@ -173,6 +181,8 @@ class RopeConfig:
             short_mscale=config_dict.get("short_mscale"),
             extrapolation_factor=config_dict.get("extrapolation_factor"),
             attn_factor=config_dict.get("attn_factor"),
+            attention_factor=config_dict.get("attention_factor"),
+            truncate=config_dict.get("truncate"),
             beta_fast=config_dict.get("beta_fast"),
             beta_slow=config_dict.get("beta_slow"),
             mscale=config_dict.get("mscale"),

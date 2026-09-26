@@ -387,6 +387,7 @@ class Qwen2VLPatchEmbed(spx.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
+            precision=precision,
         )
 
     def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> Array:
@@ -841,6 +842,7 @@ class Qwen2VLVisionBlock(spx.Module):
             config=config,
             layer_idx=layer_idx,
             dim=config.embed_dim,
+            num_heads=config.num_heads,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
@@ -990,6 +992,27 @@ class Qwen2VLAttention(UnifiedAttention):
             attention_type="standard",
             causal=True,
             sliding_window=config.sliding_window if config.use_sliding_window else None,
+        )
+
+    def _create_o_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Build the bias-free output projection.
+
+        Qwen2-VL (like Qwen2) biases the Q/K/V projections
+        (``config.attention_bias``) but never the output projection.
+
+        Returns:
+            RowParallelLinear: O projection mapping
+            ``num_attention_heads * head_dim`` -> ``hidden_size``.
+        """
+        return RowParallelLinear(
+            self.num_heads * self.head_dim,
+            config.hidden_size,
+            rngs=rngs,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
         )
 
     def forward(
@@ -2470,23 +2493,6 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
         model_kwargs.pop("pixel_values_videos", None)
         model_kwargs.pop("token_type_ids", None)
         return model_kwargs
-
-    def apply_lm_head(self, hidden_states: Array) -> Array:
-        """Project text hidden states to vocabulary logits.
-
-        Overrides the base implementation to skip weight-tying logic
-        (Qwen2-VL's LM head is unconditionally an independent
-        ``ColumnParallelLinear``) and avoid a redundant config lookup
-        in the hot generation loop.
-
-        Args:
-            hidden_states: Final-layer hidden states of shape
-                ``(batch, seq_len, hidden_size)``.
-
-        Returns:
-            Logits of shape ``(batch, seq_len, vocab_size)``.
-        """
-        return self.lm_head(hidden_states)
 
     def get_vision_tower(self) -> spx.Module:
         """Return the vision tower (VLM protocol method).

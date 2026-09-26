@@ -2958,7 +2958,13 @@ class BaseMoeModule(spx.Module, ABC):
         if hooks.after_gate is not None:
             gate_logits = hooks.after_gate(gate_logits)
 
-        router_probs = jax.nn.softmax(gate_logits.astype(jnp.float32), axis=-1).astype(self.dtype)
+        # Same gate contract as the fused path: a model's ``normalize_gate_logits``
+        # (identity for sigmoid / pre-scored routers) replaces the default softmax,
+        # and selection runs in float32.
+        if hooks.normalize_gate_logits is not None:
+            router_probs = hooks.normalize_gate_logits(gate_logits)
+        else:
+            router_probs = jax.nn.softmax(gate_logits.astype(jnp.float32), axis=-1)
         if hooks.before_topk is not None:
             router_probs = hooks.before_topk(router_probs)
 
@@ -2978,9 +2984,9 @@ class BaseMoeModule(spx.Module, ABC):
             experts_shaped = experts.reshape(batch_size, seq_len, self.num_experts_per_tok)
             weights_shaped = self._apply_capacity_mask(experts_shaped, weights_shaped, capacity_factor)
             weights = weights_shaped.reshape(tokens, self.num_experts_per_tok)
-
-        weight_sum = jnp.sum(weights, axis=-1, keepdims=True)
-        weights = jnp.where(weight_sum > 0, weights / weight_sum, weights)
+        # No blanket renormalization here: the routing hooks decide (TOP_K
+        # renormalizes, TOP_K_NDIV and custom select hooks keep scaled or
+        # unnormalized weights), exactly as on the fused path.
 
         if ffn_activation is None:
 
@@ -3224,14 +3230,17 @@ class BaseMoeModule(spx.Module, ABC):
 
         router_logits = gate_layer(hidden_state_flat).astype(jnp.promote_types(self.dtype, jnp.float32))
 
-        # Store original logits BEFORE any hooks - used for expert selection (matching HF behavior).
-        prein_gate_logits = router_logits
-
-        # after_gate hook produces scattered probs for aux loss/logging, but we use original logits for selection.
+        # Same gate contract as the fused and dense paths: ``after_gate`` edits the
+        # logits, the model's ``normalize_gate_logits`` (identity for sigmoid /
+        # pre-scored routers) replaces the default softmax, and selection runs on
+        # those normalized scores (top-k of raw logits picks the right experts but
+        # combines them with logit-valued weights).
         if hooks.after_gate is not None:
-            router_probs = hooks.after_gate(router_logits)
+            router_logits = hooks.after_gate(router_logits)
+        if hooks.normalize_gate_logits is not None:
+            router_probs = hooks.normalize_gate_logits(router_logits)
         else:
-            router_probs = jax.nn.softmax(router_logits, axis=-1)
+            router_probs = jax.nn.softmax(router_logits.astype(jnp.float32), axis=-1)
 
         if reform_router_probs_fn is not None:
             router_probs = reform_router_probs_fn(router_probs)
@@ -3242,10 +3251,8 @@ class BaseMoeModule(spx.Module, ABC):
         if validate_inputs:
             self._validate_routing_inputs(hidden_state, router_logits)
 
-        # Use original logits for expert selection (top-k on logits, then softmax on k selected via refine_weights_hook).
-        # This matches HuggingFace behavior where top-k is done on pre-softmax logits.
         selected_weights, selected_experts = get_experts_location(
-            gate_logits=prein_gate_logits,
+            gate_logits=router_probs,
             pre_bias_logits=None,
             select_hook=hooks.select_hook,
             refine_weights_hook=hooks.refine_weights_hook,
@@ -3254,8 +3261,8 @@ class BaseMoeModule(spx.Module, ABC):
 
         if layer_idx is not None:
             # Get top-k logits (before softmax) for comparison
-            top_k_logits_pre, _ = jax.lax.top_k(prein_gate_logits, self.num_experts_per_tok)
-            jax.debug.print("  [ED Router L{}] logits[0]: {}", layer_idx, prein_gate_logits[0])
+            top_k_logits_pre, _ = jax.lax.top_k(router_logits, self.num_experts_per_tok)
+            jax.debug.print("  [ED Router L{}] logits[0]: {}", layer_idx, router_logits[0])
             jax.debug.print(
                 "  [ED Router L{}] top_idx[0]: {}, top_logits[0]: {}",
                 layer_idx,

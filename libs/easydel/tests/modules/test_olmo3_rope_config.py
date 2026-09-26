@@ -25,16 +25,19 @@ from transformers import Olmo3Config as HFOlmo3Config
 @pytest.mark.parametrize("rope_theta", [10000.0, 123456.0])
 @pytest.mark.parametrize("rope_scaling", [None, {"type": "linear", "factor": 2.0}])
 def test_legacy_shared_rope_roundtrip(rope_theta, rope_scaling):
-    """Legacy shared settings keep their frequencies on both attention types."""
+    """Legacy settings share theta; like HF, scaling only applies to full attention."""
     config = Olmo3Config(num_hidden_layers=4, rope_theta=rope_theta, rope_scaling=rope_scaling)
     restored = Olmo3Config.from_dict(json.loads(config.to_json_string(use_diff=False)))
     assert restored.rope_parameters == config.rope_parameters
     assert set(restored.rope_parameters) == {"sliding_attention", "full_attention"}
-    for params in restored.rope_parameters.values():
+    for layer_type, params in restored.rope_parameters.items():
         assert params["rope_theta"] == rope_theta
-        assert params["rope_type"] == ("default" if rope_scaling is None else "linear")
-        if rope_scaling is not None:
+        scaled = rope_scaling is not None and layer_type == "full_attention"
+        assert params["rope_type"] == ("linear" if scaled else "default")
+        if scaled:
             assert params["factor"] == 2.0
+        else:
+            assert "factor" not in params
 
 
 @pytest.mark.parametrize(
@@ -72,7 +75,7 @@ def test_canonical_per_type_rope_roundtrip(layer_types):
 
 
 def test_flat_rope_parameters_are_migrated_without_changing_theta():
-    """Older serialized flat mappings must not acquire HF's new default theta."""
+    """Older serialized flat mappings keep their theta; scaling stays on full attention."""
     config = Olmo3Config(
         num_hidden_layers=4,
         rope_parameters={"rope_type": "linear", "rope_theta": 32100.0, "factor": 3.0},
@@ -80,12 +83,16 @@ def test_flat_rope_parameters_are_migrated_without_changing_theta():
     for layer_type in ("sliding_attention", "full_attention"):
         params = config.rope_parameters[layer_type]
         assert params["rope_theta"] == 32100.0
-        assert params["rope_type"] == "linear"
-        assert params["factor"] == 3.0
+        if layer_type == "full_attention":
+            assert params["rope_type"] == "linear"
+            assert params["factor"] == 3.0
+        else:
+            assert params["rope_type"] == "default"
+            assert "factor" not in params
 
 
 def test_legacy_scaling_overrides_stale_flat_default_payload():
-    """Old persisted compatibility fields must not erase actual shared scaling."""
+    """Old persisted compatibility fields must not erase actual (global) scaling."""
     config = Olmo3Config(
         num_hidden_layers=4,
         rope_theta=32100.0,
@@ -94,8 +101,37 @@ def test_legacy_scaling_overrides_stale_flat_default_payload():
     )
     for params in config.rope_parameters.values():
         assert params["rope_theta"] == 32100.0
-        assert params["rope_type"] == "linear"
-        assert params["factor"] == 3.0
+    assert config.rope_parameters["full_attention"]["rope_type"] == "linear"
+    assert config.rope_parameters["full_attention"]["factor"] == 3.0
+    assert config.rope_parameters["sliding_attention"]["rope_type"] == "default"
+
+
+def test_official_yarn_scaling_applies_to_full_attention_only():
+    """OLMo-3 ships YaRN ``rope_scaling``; HF scales only the global layers."""
+    rope_scaling = {
+        "rope_type": "yarn",
+        "factor": 8.0,
+        "original_max_position_embeddings": 8192,
+        "attention_factor": 1.2079441541679836,
+        "beta_fast": 32,
+        "beta_slow": 1,
+    }
+    config = Olmo3Config(
+        num_hidden_layers=4, max_position_embeddings=65536, rope_theta=500000.0, rope_scaling=dict(rope_scaling)
+    )
+    hf_config = HFOlmo3Config(
+        num_hidden_layers=4, max_position_embeddings=65536, rope_theta=500000.0, rope_scaling=dict(rope_scaling)
+    )
+    for layer_type in ("sliding_attention", "full_attention"):
+        ours = config.rope_parameters[layer_type]
+        theirs = hf_config.rope_parameters[layer_type]
+        assert ours["rope_type"] == theirs["rope_type"]
+        assert ours["rope_theta"] == theirs["rope_theta"] == 500000.0
+        layer_rope = config.get_layer_rope_config(layer_type)._get_rope_config()
+        assert layer_rope.rope_type == theirs["rope_type"]
+    full_rope = config.get_layer_rope_config("full_attention")._get_rope_config()
+    assert full_rope.factor == 8.0
+    assert full_rope.attention_factor == rope_scaling["attention_factor"]
 
 
 @pytest.mark.parametrize(
@@ -127,7 +163,7 @@ def test_shared_theta_override_survives_serialization(override_path, rope_scalin
     for layer_type in ("sliding_attention", "full_attention"):
         assert config.rope_parameters[layer_type]["rope_theta"] == 32100.0
         assert config.get_layer_rope_config(layer_type).rope_theta == 32100.0
-        if rope_scaling is not None:
+        if rope_scaling is not None and layer_type == "full_attention":
             assert config.rope_parameters[layer_type]["factor"] == 2.0
     # The new value and its shared provenance both survive another roundtrip.
     restored = Olmo3Config.from_dict(json.loads(config.to_json_string()))

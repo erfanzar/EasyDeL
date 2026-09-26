@@ -768,8 +768,9 @@ class Glm4MoeLiteAttention(UnifiedAttention):
             # layernorm output, so the cached latent must match.
             mla_kwargs["keys_values"] = self.mla_kv_a_layernorm(compressed_kv)  # [bsz, seq, kv_lora_rank]
             mla_kwargs["keys_pe"] = k_pe[:, 0, :, :]  # [bsz, seq, rope_dim]
-            # Explicit softmax_scale: must use original q_head_dim, not absorbed dim
-            mla_kwargs["softmax_scale"] = (self.qk_nope_head_dim + self.qk_rope_head_dim) ** -0.5
+            # Same scale as the dense path: original q_head_dim (not the absorbed
+            # dim) with any YaRN mscale**2.
+            mla_kwargs["softmax_scale"] = self.attention_performer.softmax_scale
 
         attentions = self.attention_performer.forward(
             query_states=query_states,

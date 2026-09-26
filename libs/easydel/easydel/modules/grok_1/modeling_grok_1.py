@@ -142,10 +142,12 @@ class Grok1Attention(AttentionModule):
         )
 
         self.rotary = self.config.get_basic_rope(self.dtype, self.head_dim, self.head_dim, True)
+        # Grok-1 scales scores by ``attn_output_multiplier`` alone (0.0884 on the
+        # release, not head_dim**-0.5) and soft-caps them at ``max_attn_value``.
         self.attention_performer = FlexibleAttentionModule(
             rngs=rngs,
             base_config=config,
-            softmax_scale=self.head_dim**-0.5,
+            softmax_scale=float(config.attn_output_multiplier),
             dropout_prob=config.attention_dropout,
         )
         self.resid_dropout = nn.Dropout(rate=config.resid_pdrop, rngs=rngs)
@@ -238,6 +240,7 @@ class Grok1Attention(AttentionModule):
             init_bias=init_attention_bias,
             mask_info=mask_info,
             causal=True,
+            logits_soft_cap=float(self.config.max_attn_value),
         )
 
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
@@ -263,7 +266,7 @@ class Grok1BLockSparseMLP(spx.Module):
     - ``linear_v``: ColumnParallel "up" projection ``hidden -> intermediate``.
     - ``linear_1``: RowParallel "down" projection ``intermediate -> hidden``.
 
-    GeLU (exact, not the approximate variant) is applied to the gate stream
+    GeLU (the tanh approximation, as in xAI's original JAX model) is applied to the gate stream
     only. There is **no shared expert** in Grok-1 — every layer's
     feedforward branch is a pure top-k mixture, so each instance of this
     class is invoked solely on the tokens routed to it by
@@ -472,8 +475,10 @@ class Grok1SparseMoeBlock(spx.Module):
         router_logits = checkpoint_name(
             self.gate(hidden_states).astype(jnp.promote_types(self.dtype, jnp.float32)), "moe_router_logits"
         )
-        routing_weights, selected_experts = jax.lax.top_k(router_logits, k=self.config.num_experts_per_tok)
-        routing_weights = jax.nn.softmax(routing_weights.astype(jnp.promote_types(self.dtype, jnp.float32)), axis=-1)
+        # Softmax over all experts, then top-k without renormalizing (xAI / HF Grok-1).
+        routing_probs = jax.nn.softmax(router_logits.astype(jnp.float32), axis=-1)
+        routing_weights, selected_experts = jax.lax.top_k(routing_probs, k=self.config.num_experts_per_tok)
+        routing_weights = routing_weights.astype(jnp.promote_types(self.dtype, jnp.float32))
         final_hidden_state = jnp.zeros_like(hidden_states)
 
         for index in range(self.config.num_experts):
@@ -816,6 +821,7 @@ class Grok1Model(EasyDeLBaseModule):
             )
         if inputs_embeds is None:
             inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
+            inputs_embeds = inputs_embeds * self.config.embedding_multiplier_scale
         sequence_length = inputs_embeds.shape[1]
         mask_info = MaskInfo.dynamic_init(
             mask_info=mask_info,

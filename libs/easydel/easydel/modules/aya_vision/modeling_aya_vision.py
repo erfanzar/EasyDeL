@@ -919,21 +919,6 @@ class AyaVisionForConditionalGeneration(BaseVisionLanguageModule[AyaVisionModel,
         """
         return self.base_model.init_cache(batch_size, max_length, starts, shardings, pad_token_id)
 
-    def apply_lm_head(self, hidden_states: Array) -> Array:
-        """Apply the language modeling head to produce logits.
-
-        Projects the final hidden states to vocabulary size for next-token prediction.
-
-        Args:
-            hidden_states (Array): Final layer hidden states from the language model.
-                Shape: (batch_size, sequence_length, hidden_size).
-
-        Returns:
-            Array: Logits over the vocabulary for each position.
-                Shape: (batch_size, sequence_length, vocab_size).
-        """
-        return self.lm_head(hidden_states)
-
     def get_vision_tower(self) -> spx.Module:
         """Return the vision encoder component.
 

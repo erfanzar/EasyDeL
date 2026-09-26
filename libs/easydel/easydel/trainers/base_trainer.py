@@ -574,7 +574,8 @@ class BaseTrainer(BaseTrainerProtocol):
             except Exception as e:
                 logger.warning(f"Resuming from checkpoint failed: {e}. Starting fresh training.")
 
-        self.model_state = model_state
+        # Train with dropout etc. live: `from_pretrained` hands back eval-mode models.
+        self.model_state = self._in_training_mode(model_state)
         self._apply_runtime_model_config_overrides()
         self._apply_step_start_point()
         self._model = jax.eval_shape(lambda: self.model_state.model)
@@ -731,6 +732,16 @@ class BaseTrainer(BaseTrainerProtocol):
         self._runtime_trace("__init__.end")
 
     @staticmethod
+    @staticmethod
+    def _in_training_mode(state: EasyDeLState) -> EasyDeLState:
+        """Return ``state`` with its graph in training mode (only the static graphdef changes)."""
+        import spectrax as spx
+
+        module = state.model
+        if getattr(module, "_spx_training", True):
+            return state
+        return state.replace(graphdef=spx.export(module.train())[0])
+
     def _apply_runtime_model_config_overrides_to_state(
         state: EasyDeLState | None,
         arguments: TrainingArguments,

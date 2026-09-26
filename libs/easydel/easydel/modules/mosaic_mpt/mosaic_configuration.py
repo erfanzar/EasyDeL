@@ -199,8 +199,9 @@ class MptConfig(EasyDeLBaseConfig):
             The activation function to use.
         qk_ln (`bool`, *optional*, defaults to `False`):
             Whether to apply layer normalization to the query and key tensors.
-        use_lm_head (`bool`, *optional*, defaults to `False`):
-            Whether to use a language modeling head.
+        use_lm_head (`bool`, *optional*, defaults to `True`):
+            Whether the LM logits reuse the input embedding (aliased as
+            ``tie_word_embeddings``; HF MPT ties by default and ships no ``lm_head`` weight).
         use_norm_bias (`bool`, *optional*, defaults to `False`):
             Whether to use bias in the layer normalization layers.
         gradient_checkpointing (`str`, *optional*, defaults to `"nothing_saveable"`):
@@ -243,7 +244,7 @@ class MptConfig(EasyDeLBaseConfig):
         use_bias: bool = False,
         act_fn: str = "gelu",
         qk_ln: bool = False,
-        use_lm_head: bool = False,
+        use_lm_head: bool = True,
         use_norm_bias: bool = False,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         bits: int | None = None,
@@ -276,7 +277,8 @@ class MptConfig(EasyDeLBaseConfig):
             use_bias (bool, optional): Whether to use bias in linear layers. Defaults to False.
             act_fn (str, optional): Activation function. Defaults to "gelu".
             qk_ln (bool, optional): Whether to apply LayerNorm to Q and K. Defaults to False.
-            use_lm_head (bool, optional): Whether to use a language modeling head (tied embeddings). Defaults to False.
+            use_lm_head (bool, optional): Whether to use a language modeling head (tied embeddings). Defaults to True
+                (HF MPT's ``tie_word_embeddings`` default).
             use_norm_bias (bool, optional): Whether to use bias in layer normalization. Defaults to False.
             gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
                 Defaults to EasyDeLGradientCheckPointers.NONE.

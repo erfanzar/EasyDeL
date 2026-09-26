@@ -88,8 +88,11 @@ def fused_adamw(
     """
 
     def init(params):
+        # Like optax.scale_by_adam: ``mu_dtype`` applies to the first moment only; the
+        # second moment stays in the param dtype (a bf16 ``nu`` cannot decay by b2=0.999
+        # per step, so it would never shrink after a gradient spike).
         z = (lambda p: jnp.zeros_like(p, mu_dtype)) if mu_dtype is not None else jnp.zeros_like
-        return {"mu": _tree_map(z, params), "nu": _tree_map(z, params), "count": jnp.zeros((), jnp.int32)}
+        return {"mu": _tree_map(z, params), "nu": _tree_map(jnp.zeros_like, params), "count": jnp.zeros((), jnp.int32)}
 
     def update(grads, state, params=None):
         if params is None and weight_decay != 0.0:
@@ -103,14 +106,13 @@ def fused_adamw(
         bc2 = 1.0 - b2**cf
 
         def upd(g, m, v, p):
-            store = m.dtype
             g32 = g.astype(jnp.float32)
             m32 = b1 * m.astype(jnp.float32) + (1.0 - b1) * g32
             v32 = b2 * v.astype(jnp.float32) + (1.0 - b2) * (g32 * g32)
             step = (m32 / bc1) / (jnp.sqrt(v32 / bc2 + eps_root) + eps)
             if weight_decay != 0.0:
                 step = step + weight_decay * p.astype(jnp.float32)
-            return ((-lr_t * step).astype(g.dtype), m32.astype(store), v32.astype(store))
+            return ((-lr_t * step).astype(g.dtype), m32.astype(m.dtype), v32.astype(v.dtype))
 
         leaves = (grads, state["mu"], state["nu"], params) if params is not None else (grads, state["mu"], state["nu"])
         if params is None:
@@ -201,8 +203,9 @@ def fused_rmsprop(
         )
 
     def init(params):
+        # Second moment in the param dtype, like optax.scale_by_rms.
         return {
-            "nu": _tree_map(lambda p: jnp.full_like(p, initial_scale, jnp.float32), params),
+            "nu": _tree_map(lambda p: jnp.full_like(p, initial_scale), params),
             "count": jnp.zeros((), jnp.int32),
         }
 

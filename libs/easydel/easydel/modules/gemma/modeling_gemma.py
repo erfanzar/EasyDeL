@@ -137,12 +137,11 @@ class GemmaRMSNorm(spx.Module):
             Tensor of the same shape as the input, with the last axis
             re-scaled to unit RMS and modulated by ``(1 + weight)``.
         """
-        variance = hidden_states.astype(jnp.float32)
-        variance = jnp.power(variance, 2)
-        variance = variance.mean(-1, keepdims=True)
+        hidden_states = hidden_states.astype(jnp.float32)
+        variance = jnp.power(hidden_states, 2).mean(-1, keepdims=True)
         hidden_states = hidden_states / jnp.sqrt(variance + self.epsilon)
-
-        return (1 + self.weight.value.astype(self.dtype)) * jnp.asarray(hidden_states, dtype=self.dtype)
+        # HF multiplies by ``(1 + weight)`` in float32 and casts once at the end.
+        return ((1 + self.weight.value.astype(jnp.float32)) * hidden_states).astype(self.dtype)
 
 
 class GemmaAttention(UnifiedAttention):

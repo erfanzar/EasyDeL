@@ -66,6 +66,234 @@ if tp.TYPE_CHECKING:
 
 mem_ops = SMPMemoryMonitor(5)
 logger = get_logger(__name__)
+
+
+class ExpertMergeSpec(tp.NamedTuple):
+    """How per-expert checkpoint tensors merge into one stacked expert tensor.
+
+    ``parts`` are the per-expert leaf names in concatenation order (``("w1",
+    "w3")`` or ``("gate_proj", "up_proj")``); each is stacked on a new leading
+    expert axis, then the parts are concatenated along ``concat_dim`` of the
+    stacked tensor to form ``experts.<target>``.
+    """
+
+    parts: tuple[str, ...]
+    target: str
+    concat_dim: int
+
+
+# transformers>=5's own MoE convention, used when it has no mapping for a model.
+DEFAULT_EXPERT_MERGE_SPECS = (
+    ExpertMergeSpec(("gate_proj", "up_proj"), "gate_up_proj", 1),
+    ExpertMergeSpec(("down_proj",), "down_proj", 0),
+)
+_PER_EXPERT_KEY = re.compile(r"^(.*\.experts)\.(\d+)\.([^.]+)\.weight$")
+
+
+@functools.cache
+def hf_expert_layout(model_type: str | None) -> tuple[tuple[tp.Any, ...], tuple[ExpertMergeSpec, ...]]:
+    """The per-expert merges (and key renames) transformers applies when loading ``model_type``.
+
+    Read from ``transformers.conversion_mapping.get_checkpoint_conversion_mapping``:
+    every ``WeightConverter`` built only from ``MergeModulelist``/``Concatenate``
+    over ``experts.*.<leaf>.weight`` sources becomes an :class:`ExpertMergeSpec`,
+    and every ``WeightRenaming`` is kept so a checkpoint key can be moved into
+    the namespace transformers (and EasyDeL's rules) use in memory.
+
+    Returns:
+        ``(renamings, specs)``; ``specs`` falls back to
+        :data:`DEFAULT_EXPERT_MERGE_SPECS` when transformers has none.
+    """
+    renamings: list[tp.Any] = []
+    specs: list[ExpertMergeSpec] = []
+    try:
+        from transformers.conversion_mapping import get_checkpoint_conversion_mapping
+        from transformers.core_model_loading import Concatenate, MergeModulelist, WeightConverter, WeightRenaming
+
+        mapping = get_checkpoint_conversion_mapping(model_type) if model_type else None
+    except Exception:  # older transformers, or an unknown model type
+        mapping = None
+    for transform in mapping or ():
+        if isinstance(transform, WeightRenaming):
+            renamings.append(transform)
+            continue
+        if not isinstance(transform, WeightConverter):
+            continue
+        ops = list(transform.operations or ())
+        if not ops or not isinstance(ops[0], MergeModulelist):
+            continue
+        if not all(isinstance(op, (MergeModulelist, Concatenate)) for op in ops):
+            continue
+        sources = transform.source_patterns
+        targets = transform.target_patterns
+        sources = [sources] if isinstance(sources, str) else list(sources)
+        targets = [targets] if isinstance(targets, str) else list(targets)
+        parts = [re.fullmatch(r".*experts\.\*\.([^.]+)\.weight", src) for src in sources]
+        target = re.fullmatch(r".*experts\.([^.]+)", targets[0]) if len(targets) == 1 else None
+        if target is None or not all(parts):
+            continue
+        concat_dim = next((op.dim for op in ops if isinstance(op, Concatenate)), 0)
+        specs.append(ExpertMergeSpec(tuple(m.group(1) for m in parts), target.group(1), int(concat_dim)))
+    return tuple(renamings), tuple(specs) or DEFAULT_EXPERT_MERGE_SPECS
+
+
+def canonical_expert_leaf(spec: ExpertMergeSpec, part: int) -> str | None:
+    """Name transformers' own convention gives ``spec``'s ``part`` (``w1`` -> ``gate_proj``, ``w2`` -> ``down_proj``).
+
+    Lets a checkpoint's per-expert names reach runtimes that keep one leaf per
+    part (``experts.gate_proj``/``up_proj``/``down_proj``) instead of the merged tensor.
+    """
+    for default in DEFAULT_EXPERT_MERGE_SPECS:
+        if default.target == spec.target and len(default.parts) == len(spec.parts):
+            return default.parts[part]
+    return None
+
+
+class HFCheckpointKeyMapper:
+    """Map checkpoint keys to transformers' in-memory names exactly as a transformers load does.
+
+    Built from the model skeleton on the ``meta`` device: transformers' full
+    conversion mapping for that model (per-submodule scoped renames and
+    merges, see ``get_model_conversion_mapping``) plus its base-model-prefix
+    fix-up against the real parameter names. Key-by-key loaders use it so they
+    see what the full loader gets from the torch model.
+    """
+
+    def __init__(self, renamings, converters, base_model_prefix, meta_state_dict):
+        self.renamings = renamings
+        self.converters = converters
+        self.base_model_prefix = base_model_prefix
+        self.meta_state_dict = meta_state_dict
+        self._specs: dict[int, ExpertMergeSpec | None] = {}
+
+    @classmethod
+    def for_config(cls, hf_config: tp.Any, trust_remote_code: bool = False) -> HFCheckpointKeyMapper | None:
+        """Build the mapper for ``hf_config``; ``None`` when transformers cannot build its skeleton."""
+        try:
+            import torch
+            import transformers
+            from transformers.conversion_mapping import get_model_conversion_mapping
+            from transformers.core_model_loading import WeightConverter, WeightRenaming
+        except Exception:
+            return None
+        auto_map = getattr(hf_config, "auto_map", None) or {}
+        for name in (
+            "AutoModelForCausalLM",
+            "AutoModelForImageTextToText",
+            "AutoModelForVision2Seq",
+            "AutoModelForSeq2SeqLM",
+            "AutoModel",
+        ):
+            auto_class = getattr(transformers, name, None)
+            if auto_class is None:
+                continue
+            try:
+                if name not in auto_map and type(hf_config) not in auto_class._model_mapping:
+                    continue
+                with torch.device("meta"):
+                    model = auto_class.from_config(hf_config, trust_remote_code=trust_remote_code)
+                transforms = get_model_conversion_mapping(model)
+            except Exception:
+                continue
+            return cls(
+                [t for t in transforms if isinstance(t, WeightRenaming)],
+                [t for t in transforms if isinstance(t, WeightConverter)],
+                getattr(model, "base_model_prefix", None),
+                dict.fromkeys(model.state_dict()),
+            )
+        return None
+
+    def rename(self, key: str) -> str:
+        """Checkpoint key -> in-memory name, applying renames only (per-expert keys keep their index)."""
+        from transformers.core_model_loading import rename_source_key
+
+        return rename_source_key(key, self.renamings, [], self.base_model_prefix, self.meta_state_dict)[0]
+
+    def expert_merge(self, key: str) -> tuple[str, int, ExpertMergeSpec, int] | None:
+        """Like :func:`resolve_expert_merge`, from this model's own converters."""
+        from transformers.core_model_loading import Concatenate, MergeModulelist, rename_source_key
+
+        merged, pattern = rename_source_key(
+            key, self.renamings, self.converters, self.base_model_prefix, self.meta_state_dict
+        )
+        if pattern is None:
+            return None
+        converter = next(c for c in self.converters if pattern in c.source_patterns)
+        if id(converter) not in self._specs:
+            ops = list(converter.operations or ())
+            parts = [re.fullmatch(r".*experts\.\*\.([^.]+)\.weight", src) for src in converter.source_patterns]
+            target = re.fullmatch(r".*experts\.([^.]+)", converter.target_patterns[0])
+            ok = (
+                ops
+                and isinstance(ops[0], MergeModulelist)
+                and all(isinstance(o, (MergeModulelist, Concatenate)) for o in ops)
+            )
+            self._specs[id(converter)] = (
+                ExpertMergeSpec(
+                    tuple(m.group(1) for m in parts),
+                    target.group(1),
+                    int(next((o.dim for o in ops if isinstance(o, Concatenate)), 0)),
+                )
+                if ok and target is not None and all(parts)
+                else None
+            )
+        spec = self._specs[id(converter)]
+        match = _PER_EXPERT_KEY.match(self.rename(key))
+        if spec is None or match is None or match.group(3) not in spec.parts:
+            return None
+        return merged, int(match.group(2)), spec, spec.parts.index(match.group(3))
+
+
+def hf_rename_key(key: str, model_type: str | None, mapper: HFCheckpointKeyMapper | None = None) -> str:
+    """Apply transformers' load-time ``WeightRenaming`` rules for ``model_type`` to one checkpoint key.
+
+    transformers>=5 saves some models under legacy on-disk names (e.g. VLMs'
+    ``language_model.model.*``) and renames them on load; key-by-key loaders
+    use this to see the same names the in-memory model (and so the full
+    loader) has.
+    """
+    if mapper is not None:
+        return mapper.rename(key)
+    renamings, _ = hf_expert_layout(model_type)
+    for renaming in renamings:
+        key, _ = renaming.rename_source_key(key)
+    return key
+
+
+def resolve_expert_merge(
+    key: str,
+    model_type: str | None,
+    *,
+    apply_renamings: bool = True,
+    mapper: HFCheckpointKeyMapper | None = None,
+) -> tuple[str, int, ExpertMergeSpec, int] | None:
+    """Place one per-expert checkpoint key inside transformers' stacked expert layout.
+
+    Args:
+        key: Checkpoint key such as ``model.layers.3.block_sparse_moe.experts.5.w1.weight``.
+        model_type: The model's ``model_type`` (selects transformers' mapping).
+        apply_renamings: ``False`` when ``key`` already went through :func:`hf_rename_key`
+            (renamings are not guaranteed idempotent).
+
+    Returns:
+        ``(merged_key, expert_index, spec, part_index)`` where ``merged_key`` is
+        the in-memory transformers name (``model.layers.3.mlp.experts.gate_up_proj``),
+        or ``None`` when ``key`` is not a per-expert tensor any merge covers.
+    """
+    if mapper is not None and apply_renamings:
+        return mapper.expert_merge(key)
+    _, specs = hf_expert_layout(model_type)
+    if apply_renamings:
+        key = hf_rename_key(key, model_type)
+    match = _PER_EXPERT_KEY.match(key)
+    if match is None:
+        return None
+    for spec in specs:
+        if match.group(3) in spec.parts:
+            return f"{match.group(1)}.{spec.target}", int(match.group(2)), spec, spec.parts.index(match.group(3))
+    return None
+
+
 EASYDEL_PREFERRED_HOST_COPY_INDEX = int(
     os.getenv("EASYDEL_PREFERRED_HOST_COPY_INDEX", os.getenv("EASYDEL_PERFRED_HOST_COPY_INDEX", "0"))
 )
@@ -616,6 +844,88 @@ class StateDictConverter:
                 rules_by_fused_key[target_key] = value
 
         return groups, rules_by_fused_key
+
+    @staticmethod
+    def merge_hf_expert_tensors(
+        state_dict: dict[str, tp.Any],
+        reform_param: dict | None,
+        model_type: str | None = None,
+    ) -> None:
+        """Build transformers>=5 merged expert tensors from per-expert keys where rules source them.
+
+        The inverse of :meth:`unfuse_hf_expert_tensors`: a state dict with
+        per-expert tensors (remote-code models, or checkpoints read key by key)
+        meets a rule whose single source is the in-memory merged tensor
+        (``experts.gate_up_proj``). Parts are stacked over experts and
+        concatenated as transformers does (see :func:`resolve_expert_merge`).
+        Mutates *state_dict* in place.
+        """
+        import torch
+
+        wanted = {
+            rule["sources"][0]
+            for rule in (reform_param or {}).values()
+            if "fuser" in rule and len(rule.get("sources", ())) == 1 and ".experts." in rule["sources"][0]
+        }
+        wanted -= set(state_dict)
+        if not wanted:
+            return
+        groups: dict[str, tuple[ExpertMergeSpec, list[dict[int, str]]]] = {}
+        for key in list(state_dict):
+            # Full-mode keys are transformers' in-memory names: already renamed.
+            merge = resolve_expert_merge(key, model_type, apply_renamings=False)
+            if merge is None or merge[0] not in wanted or len(merge[2].parts) < 2:
+                continue
+            merged_key, expert, spec, part = merge
+            groups.setdefault(merged_key, (spec, [{} for _ in spec.parts]))[1][part][expert] = key
+        for merged_key, (spec, parts) in groups.items():
+            experts = sorted(parts[0])
+            if any(sorted(part) != experts for part in parts):
+                continue  # incomplete group: leave the keys for the strict materialization check
+            stacked = [torch.stack([state_dict.pop(part[e]) for e in experts]) for part in parts]
+            state_dict[merged_key] = torch.cat(stacked, dim=spec.concat_dim)
+
+    @staticmethod
+    def unfuse_hf_expert_tensors(
+        state_dict: dict[str, tp.Any],
+        reform_param: dict | None,
+        model_type: str | None = None,
+    ) -> None:
+        """Restore per-expert keys from transformers>=5 fused experts where rules expect them.
+
+        transformers>=5 builds MoE experts pre-merged (see :func:`hf_expert_layout`:
+        e.g. ``experts.gate_up_proj`` = ``cat(gate, up)`` over stacked experts,
+        ``experts.down_proj`` stacked), while rules written for the per-expert
+        checkpoint layout (DeepSeek) fuse stacked halves named by their
+        ``sources``. Splitting the merged tensors back to
+        ``experts.<i>.<leaf>.weight`` sends them through the same stacking path
+        as an on-disk checkpoint. Mutates *state_dict* in place.
+        """
+        _, specs = hf_expert_layout(model_type)
+        for rule in (reform_param or {}).values():
+            sources = tuple(rule.get("sources", ()))
+            if "fuser" not in rule or len(sources) < 2:
+                continue
+            leaves = [re.fullmatch(r"(.*\.experts\.)([^.]+)\.weight", source) for source in sources]
+            if not all(leaves) or len({m.group(1) for m in leaves}) != 1:
+                continue
+            base, names = leaves[0].group(1), tuple(m.group(2) for m in leaves)
+            spec = next((spec for spec in specs if spec.parts == names), None)
+            fused = state_dict.get(f"{base}{spec.target}") if spec is not None else None
+            if fused is None or getattr(fused, "ndim", 0) != 3 or any(source in state_dict for source in sources):
+                continue
+            pieces = state_dict.pop(f"{base}{spec.target}").chunk(len(names), dim=spec.concat_dim)
+            for name, piece in zip(names, pieces, strict=True):
+                for index in range(piece.shape[0]):
+                    state_dict[f"{base}{index}.{name}.weight"] = piece[index]
+            # The experts' other merged tensors (down) follow the same per-expert layout.
+            for other in specs:
+                merged = state_dict.get(f"{base}{other.target}")
+                if len(other.parts) != 1 or merged is None or getattr(merged, "ndim", 0) != 3:
+                    continue
+                state_dict.pop(f"{base}{other.target}")
+                for index in range(merged.shape[0]):
+                    state_dict[f"{base}{index}.{other.parts[0]}.weight"] = merged[index]
 
     @staticmethod
     def fuse_reform_param_tensors(rule: dict[str, tp.Any], tensors: list[tp.Any]) -> tp.Any:
@@ -1264,6 +1574,9 @@ class StateDictConverter:
         """
         state_dict = StateDictConverter.apply_checkpoint_key_normalizer(state_dict, checkpoint_key_normalizer)
         state_dict = StateDictConverter.normalize_flattened_wrapper_keys(state_dict, hf_flattened_wrappers)
+        hf_model_type = kwargs.pop("hf_model_type", None)
+        StateDictConverter.merge_hf_expert_tensors(state_dict, reform_param, hf_model_type)
+        StateDictConverter.unfuse_hf_expert_tensors(state_dict, reform_param, hf_model_type)
         consolidated_moe_keys = set()
         debug = bool(kwargs.pop("debug", False))
         if moe_block_names is not None and moe_names is not None:
@@ -1691,6 +2004,41 @@ class StateDictConverter:
         return torch_state_dict
 
 
+def _fit_hf_config_dict(config_class: type, config_dict: dict, torch_module: tp.Any, nested: bool = False) -> None:
+    """Fit an EasyDeL config dict to a transformers>=5 config class, recursing into sub-configs.
+
+    Those configs are strict dataclasses: ``1`` in a ``float | None`` field is rejected, and some
+    sub-configs (e.g. DBRX's ``ffn_config``) reject keys they do not declare, which an EasyDeL
+    sub-config always carries (its runtime settings); such sub-configs keep only their fields.
+    """
+    try:
+        hints = tp.get_type_hints(config_class, localns={"torch": torch_module})
+    except Exception:
+        return
+    for key, value in config_dict.items():
+        if key not in hints:
+            continue
+        allowed = set(tp.get_args(hints[key])) or {hints[key]}
+        if type(value) is int and int not in allowed:
+            if float in allowed:
+                config_dict[key] = float(value)
+            elif bool in allowed:
+                config_dict[key] = bool(value)
+        elif isinstance(value, dict):
+            for sub in allowed:
+                if isinstance(sub, type) and hasattr(sub, "from_dict") and sub is not dict:
+                    _fit_hf_config_dict(sub, value, torch_module, nested=True)
+                    break
+    if nested:
+        try:
+            config_class.from_dict(dict(config_dict))
+        except (TypeError, ValueError) as err:
+            if "unknown" not in str(err).lower():
+                raise
+            for key in [k for k in config_dict if k not in hints]:
+                config_dict.pop(key)
+
+
 class ModelConverter:
     """High-level orchestrator for two-way EasyDeL ↔ HuggingFace model conversion.
 
@@ -1746,7 +2094,15 @@ class ModelConverter:
             base_huggingface_module_kwarguments = {}
 
         state_dict = StateDictConverter.easydel_to_torch(module=module, dtype=dtype, reform_param=reform_param)
-        base_config = base_huggingface_module.config_class.from_dict(config.to_dict())
+        config_class = base_huggingface_module.config_class
+        config_dict = config.to_dict()
+        # Values HF derives through read-only properties (e.g. Falcon's ``head_dim``) cannot be passed back in.
+        for key in list(config_dict):
+            attr = inspect.getattr_static(config_class, key, None)
+            if isinstance(attr, property) and attr.fset is None:
+                config_dict.pop(key)
+        _fit_hf_config_dict(config_class, config_dict, torch)
+        base_config = config_class.from_dict(config_dict)
         with torch.device("meta") if use_meta_torch else contextlib.nullcontext():
             model: torch.nn.Module = base_huggingface_module(config=base_config, **base_huggingface_module_kwarguments)
             target_shapes = {k: tuple(v.shape) for k, v in model.state_dict().items() if hasattr(v, "shape")}

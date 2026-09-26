@@ -970,7 +970,8 @@ class GlmMoeDsaAttention(UnifiedAttention):
             mla_kwargs["queries_pe"] = q_pe.transpose(0, 2, 1, 3)
             mla_kwargs["keys_values"] = compressed_kv
             mla_kwargs["keys_pe"] = k_pe[:, 0, :, :]
-            mla_kwargs["softmax_scale"] = (self.qk_nope_head_dim + self.qk_rope_head_dim) ** -0.5
+            # Same scale as the dense path (includes any YaRN mscale**2).
+            mla_kwargs["softmax_scale"] = self.attention_performer.softmax_scale
         else:
             query_states = jnp.zeros((bsz, self.num_heads, q_len, self.q_head_dim), q_pe.dtype)
             query_states = query_states.at[..., : self.qk_nope_head_dim].set(q_nope)

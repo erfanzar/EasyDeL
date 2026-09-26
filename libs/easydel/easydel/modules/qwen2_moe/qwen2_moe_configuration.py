@@ -116,7 +116,7 @@ class Qwen2MoeConfig(EasyDeLBaseConfig):
         rms_norm_eps: float = 1e-6,
         use_cache: bool = True,
         tie_word_embeddings: bool = False,
-        qkv_bias: bool = False,
+        qkv_bias: bool = True,
         rope_theta: float = 10000.0,
         use_sliding_window: bool = False,
         sliding_window: int | None = 4096,
@@ -151,7 +151,8 @@ class Qwen2MoeConfig(EasyDeLBaseConfig):
             rms_norm_eps (float, optional): Epsilon for RMS normalization. Defaults to 1e-6.
             use_cache (bool, optional): Whether to use KV cache. Defaults to True.
             tie_word_embeddings (bool, optional): Whether to tie input/output embeddings. Defaults to False.
-            qkv_bias (bool, optional): Whether to include bias in QKV projections. Defaults to False.
+            qkv_bias (bool, optional): Whether to include bias in QKV projections. Defaults to True (released
+                Qwen1.5/Qwen2 MoE configs omit the key and rely on it).
             rope_theta (float, optional): Base value for RoPE. Defaults to 10000.0.
             use_sliding_window (bool, optional): Whether to use sliding window attention. Defaults to False.
             sliding_window (int, optional): Sliding window size. Defaults to 4096.
@@ -205,10 +206,12 @@ class Qwen2MoeConfig(EasyDeLBaseConfig):
         self.mlp_only_layers = mlp_only_layers or []
         self.layer_types = layer_types
         if self.layer_types is None:
+            # HF Qwen2-MoE schedule: every other layer (even indices) below
+            # ``max_window_layers`` slides, and only when ``use_sliding_window``.
             self.layer_types = [
                 (
                     "sliding_attention"
-                    if self.sliding_window is not None and i >= self.max_window_layers
+                    if bool((i + 1) % 2) and i < self.max_window_layers and self.use_sliding_window
                     else "full_attention"
                 )
                 for i in range(self.num_hidden_layers)
@@ -256,6 +259,11 @@ class Qwen2MoeConfig(EasyDeLBaseConfig):
         """
         mapping = {}
         for layer_idx in range(self.num_hidden_layers):
-            if self.sliding_window is not None and self.use_sliding_window:
+            if (
+                self.sliding_window is not None
+                and self.use_sliding_window
+                and self.layer_types is not None
+                and self.layer_types[layer_idx] == "sliding_attention"
+            ):
                 mapping[layer_idx] = AttnMaskDetail(mask_type=AttnMaskType.SLIDING, size=self.sliding_window)
         return mapping

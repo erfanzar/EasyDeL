@@ -102,7 +102,9 @@ def _get_rope_index_from_mm_token_types(
         input_ids: Input token ids of shape ``(batch, seq_len)``.
         mm_token_type_ids: Per-token modality type ids (0=text, 1=image, 2=video).
         image_grid_thw: Grid dimensions ``(T, H, W)`` for each image.
-        video_grid_thw: Grid dimensions ``(T, H, W)`` for each video.
+        video_grid_thw: Grid dimensions ``(T, H, W)`` for each video; each is
+            consumed as ``T`` single-frame grids (one per timestamp-separated
+            frame group), matching HF ``Qwen3_5Model.get_rope_index``.
         attention_mask: Boolean attention mask of shape ``(batch, seq_len)``.
         spatial_merge_size: Spatial merge factor from the vision config.
         return_jax_arrays: When ``False``, return NumPy arrays without touching
@@ -117,7 +119,15 @@ def _get_rope_index_from_mm_token_types(
     attention_mask_np = np.asarray(attention_mask).astype(bool) if attention_mask is not None else None
 
     image_iter = iter(np.asarray(image_grid_thw)) if image_grid_thw is not None else None
-    video_iter = iter(np.asarray(video_grid_thw)) if video_grid_thw is not None else None
+    video_iter = None
+    if video_grid_thw is not None:
+        # Qwen3.5 separates video frames with timestamp tokens, so every video grid
+        # is split into ``T`` single-frame grids (HF ``repeat_interleave`` + ``[:, 0] = 1``).
+        # Idempotent for callers that already split.
+        video_grid_np = np.array(video_grid_thw, copy=True).reshape(-1, 3)
+        video_grid_np = np.repeat(video_grid_np, video_grid_np[:, 0].astype(np.int64), axis=0)
+        video_grid_np[:, 0] = 1
+        video_iter = iter(video_grid_np)
 
     batch_size, seq_len = input_ids_np.shape
     position_ids = np.zeros((3, batch_size, seq_len), dtype=np.int32)
@@ -154,15 +164,17 @@ def _get_rope_index_from_mm_token_types(
                 llm_grid_h = int(grid_thw[1]) // spatial_merge_size
                 llm_grid_w = int(grid_thw[2]) // spatial_merge_size
 
-                image_seq_length = llm_grid_h * llm_grid_w * llm_grid_t
-                position_width = np.arange(current_pos, current_pos + llm_grid_w, dtype=np.int32).repeat(
-                    llm_grid_h * llm_grid_t
+                # HF ``get_vision_position_ids``: ``meshgrid(t, h, w, indexing="ij")``
+                # flattened row-major, i.e. width varies fastest, then height, then time.
+                position_temporal, position_height, position_width = np.meshgrid(
+                    np.arange(llm_grid_t, dtype=np.int32) + current_pos,
+                    np.arange(llm_grid_h, dtype=np.int32) + current_pos,
+                    np.arange(llm_grid_w, dtype=np.int32) + current_pos,
+                    indexing="ij",
                 )
-                position_height = np.arange(current_pos, current_pos + llm_grid_h, dtype=np.int32).repeat(
-                    llm_grid_w * llm_grid_t
+                llm_pos_ids_list.append(
+                    np.stack([position_temporal, position_height, position_width], axis=0).reshape(3, -1)
                 )
-                position_temporal = np.full((image_seq_length,), current_pos, dtype=np.int32)
-                llm_pos_ids_list.append(np.stack([position_temporal, position_height, position_width], axis=0))
 
                 current_pos += max(int(grid_thw[1]), int(grid_thw[2])) // spatial_merge_size
 

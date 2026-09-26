@@ -133,12 +133,49 @@ class Gemma2RMSNorm(spx.Module):
             Tensor of the same shape, with each ``hidden_dim`` slice having
             unit RMS prior to the learned ``(1 + weight)`` rescaling.
         """
-        variance = hidden_states.astype(jnp.float32)
-        variance = jnp.power(variance, 2)
-        variance = variance.mean(-1, keepdims=True)
+        hidden_states = hidden_states.astype(jnp.float32)
+        variance = jnp.power(hidden_states, 2).mean(-1, keepdims=True)
         hidden_states = hidden_states / jnp.sqrt(variance + self.epsilon)
+        # HF multiplies by ``(1 + weight)`` in float32 and casts once at the end.
+        return ((1 + self.weight.value.astype(jnp.float32)) * hidden_states).astype(self.dtype)
 
-        return (1 + self.weight.value.astype(self.dtype)) * jnp.asarray(hidden_states, dtype=self.dtype)
+
+class Gemma2SoftCappedAttentionModule(FlexibleAttentionModule):
+    """:class:`FlexibleAttentionModule` with a fixed default attention-logit soft cap.
+
+    Gemma2 (and Gemma3 when ``attn_logit_softcapping`` is set) squashes the
+    scaled attention scores with ``cap * tanh(scores / cap)`` before the
+    softmax. :class:`UnifiedAttention` does not forward a soft cap to its
+    performer, so this subclass supplies ``logits_soft_cap`` whenever the
+    caller leaves it unset.
+    """
+
+    def __init__(self, *args, logits_soft_cap: float | None = None, **kwargs):
+        """Build the performer and remember the default soft cap.
+
+        Args:
+            *args: Forwarded to :class:`FlexibleAttentionModule`.
+            logits_soft_cap: Soft-cap value applied when a call does not pass
+                one; ``None`` disables soft capping.
+            **kwargs: Forwarded to :class:`FlexibleAttentionModule`.
+        """
+        super().__init__(*args, **kwargs)
+        self.logits_soft_cap = None if logits_soft_cap is None else float(logits_soft_cap)
+
+    def forward(self, *args, logits_soft_cap: float | None = None, **kwargs):
+        """Run attention, defaulting ``logits_soft_cap`` to the configured cap.
+
+        Args:
+            *args: Forwarded to :meth:`FlexibleAttentionModule.forward`.
+            logits_soft_cap: Per-call override; ``None`` uses ``self.logits_soft_cap``.
+            **kwargs: Forwarded to :meth:`FlexibleAttentionModule.forward`.
+
+        Returns:
+            The :class:`AttentionOutput` produced by the base performer.
+        """
+        if logits_soft_cap is None:
+            logits_soft_cap = self.logits_soft_cap
+        return super().forward(*args, logits_soft_cap=logits_soft_cap, **kwargs)
 
 
 class Gemma2Attention(UnifiedAttention):
@@ -231,13 +268,15 @@ class Gemma2Attention(UnifiedAttention):
         ``1/sqrt(config.query_pre_attn_scalar)``. This is the key knob that
         lets Gemma2's larger sizes share head dimensions with smaller variants
         without rebalancing the attention temperature. ``dropout_prob`` is
-        wired through from ``config.attention_dropout``.
+        wired through from ``config.attention_dropout``, and the scaled scores
+        are tanh-soft-capped at ``config.attn_logit_softcapping`` as in HF.
         """
-        return FlexibleAttentionModule(
+        return Gemma2SoftCappedAttentionModule(
             rngs=rngs,
             base_config=config,
             softmax_scale=config.query_pre_attn_scalar**-0.5,
             dropout_prob=config.attention_dropout,
+            logits_soft_cap=getattr(config, "attn_logit_softcapping", None),
         )
 
     def _merge_heads(self, hidden_states):

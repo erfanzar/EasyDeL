@@ -197,7 +197,7 @@ def get_rope(
             extra_kwargs = {
                 k: v
                 for k, v in rope_scaling.items()
-                if k in ("extrapolation_factor", "attn_factor", "beta_fast", "beta_slow")
+                if k in ("extrapolation_factor", "attn_factor", "attention_factor", "beta_fast", "beta_slow", "truncate")
             }
             rotary_emb = YaRNScalingRotaryEmbedding(
                 head_size=head_size,
@@ -328,13 +328,16 @@ def get_frequencies(
             low_freq_factor = rope_scaling["low_freq_factor"]
             high_freq_factor = rope_scaling["high_freq_factor"]
             original_max_position = rope_scaling["original_max_position_embeddings"]
+            # The cache must cover every served position (HF rotates any
+            # position); ``original_max_position`` only sets the wavelength bands.
             frequencies = compute_llama3_frequencies(
                 base=base,
                 rotary_dim=rotary_dim,
                 low_freq_factor=low_freq_factor,
                 high_freq_factor=high_freq_factor,
                 scaling_factor=scaling_factor,
-                max_position_embeddings=original_max_position,
+                max_position_embeddings=max_position,
+                orig_max_position=original_max_position,
             )
 
         elif scaling_type == "default":
@@ -367,6 +370,11 @@ def get_frequencies(
                 for k, v in rope_scaling.items()
                 if k in ("extrapolation_factor", "attn_factor", "beta_fast", "beta_slow", "mscale", "mscale_all_dim")
             }
+            # An explicit HF ``attention_factor`` replaces the inferred mscale.
+            attention_factor = rope_scaling.get("attention_factor")
+            # Never stop the cache short of the served context.
+            max_positions = max(int(max_position), int(original_max_position * scaling_factor))
+            truncate = bool(rope_scaling.get("truncate", True))
 
             # Check if this is DeepSeek-style YaRN (has mscale and mscale_all_dim parameters)
             if "mscale" in extra_kwargs and "mscale_all_dim" in extra_kwargs:
@@ -380,7 +388,10 @@ def get_frequencies(
                     original_max_position,
                     extra_kwargs["mscale"],
                     extra_kwargs["mscale_all_dim"],
-                    extra_kwargs.get("attn_factor", extra_kwargs.get("attention_factor", 1)),
+                    extra_kwargs.get("attn_factor", 1),
+                    attention_factor=attention_factor,
+                    max_positions=max_positions,
+                    truncate=truncate,
                 )
             else:
                 frequencies = compute_yarn_frequencies(
@@ -391,7 +402,10 @@ def get_frequencies(
                     max_position_embeddings=original_max_position,
                     scaling_factor=scaling_factor,
                     extrapolation_factor=extra_kwargs.get("extrapolation_factor", 1.0),
-                    attn_factor=extra_kwargs.get("attn_factor", extra_kwargs.get("attention_factor", 1)),
+                    attn_factor=extra_kwargs.get("attn_factor", 1),
+                    truncate=truncate,
+                    attention_factor=attention_factor,
+                    max_positions=max_positions,
                 )
         elif scaling_type == "deepseek_yarn":
             scaling_factor = rope_scaling["factor"]
@@ -411,14 +425,14 @@ def get_frequencies(
                 original_max_position,
                 extra_kwargs["mscale"],
                 extra_kwargs["mscale_all_dim"],
-                extra_kwargs.get("attn_factor", extra_kwargs.get("attention_factor", 1)),
+                extra_kwargs.get("attn_factor", 1),
+                attention_factor=rope_scaling.get("attention_factor"),
+                max_positions=max(int(max_position), int(original_max_position * scaling_factor)),
             )
         elif scaling_type == "longrope":
             short_factor = rope_scaling["short_factor"]
             long_factor = rope_scaling["long_factor"]
             original_max_position = rope_scaling["original_max_position_embeddings"]
-            extra_kwargs = {k: v for k, v in rope_scaling.items() if k in ("short_mscale", "long_mscale")}
-
             frequencies = compute_phi3_frequencies(
                 base=base,
                 head_size=head_size,
@@ -427,6 +441,10 @@ def get_frequencies(
                 original_max_position_embeddings=original_max_position,
                 short_factor=short_factor,
                 long_factor=long_factor,
+                factor=rope_scaling.get("factor"),
+                attention_factor=rope_scaling.get("attention_factor"),
+                short_mscale=rope_scaling.get("short_mscale"),
+                long_mscale=rope_scaling.get("long_mscale"),
             )
         elif scaling_type == "mrope":
             # Use basic cache; interleaving handled inside the MRoPE class
@@ -465,8 +483,8 @@ def get_inv_frequencies(
     positions and the cos/sin transformation. Some callers (notably ones that
     apply RoPE on-the-fly inside a fused attention kernel) want just the
     ``θ_i`` vector and build the cache themselves. The Phi-3 (``longrope``)
-    branch uses ``head_size`` rather than ``rotary_dim`` to size the inverse-
-    frequency layout, matching :func:`compute_phi3_frequencies`.
+    branch sizes the inverse frequencies by ``rotary_dim`` (partial rotary
+    aware), matching :func:`compute_phi3_frequencies`.
 
     Args:
         head_size: Per-head attention dimension (needed by the Phi-3 path).
@@ -480,7 +498,7 @@ def get_inv_frequencies(
 
     Returns:
         Float32 JAX array of inverse frequencies, typically of shape
-        ``(rotary_dim // 2,)`` (Phi-3 uses ``head_size // 2``).
+        ``(rotary_dim // 2,)``.
 
     Raises:
         ValueError: If ``rope_scaling["rope_type"]`` is not registered.
@@ -534,6 +552,7 @@ def get_inv_frequencies(
                 max_position_embeddings=original_max_position,
                 scaling_factor=scaling_factor,
                 extrapolation_factor=extrapolation_factor,
+                truncate=bool(rope_scaling.get("truncate", True)),
             )
         elif scaling_type == "deepseek_yarn":
             scaling_factor = rope_scaling["factor"]
@@ -561,7 +580,7 @@ def get_inv_frequencies(
             else:
                 ext_factors = jnp.array(short_factor, dtype=jnp.float32)
 
-            inv_freq_shape = jnp.arange(0, head_size, 2, dtype=jnp.int32).astype(jnp.float32) / head_size
+            inv_freq_shape = jnp.arange(0, rotary_dim, 2, dtype=jnp.int32).astype(jnp.float32) / rotary_dim
             inv_frequencies = 1.0 / (ext_factors * (base**inv_freq_shape))
         else:
             raise ValueError(f"Unknown RoPE scaling type {scaling_type}")

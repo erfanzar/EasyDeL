@@ -132,6 +132,20 @@ class DrafterProtocol(typing.Protocol):
         uses_mtp_cache: The drafter keeps an internal MTP KV cache that the
             runner should account for (default ``False``).
         num_draft_tokens: Speculative tokens proposed per verify window.
+        draft_position_offset: Offset added to the runner's seed position (the
+            seed hidden's position, ``L - 2``) to get the first draft query
+            position (default ``0``; the Gemma4 assistant uses ``1``).
+        advance_draft_position: Whether the query position advances by one per
+            draft step (default ``True``; the Gemma4 assistant drafts a whole
+            window from one constant position).
+        block_draft: The drafter predicts a whole block from a fixed anchor +
+            target context (DSpark / DFlash): each call receives the anchor
+            followed by the tokens drafted so far, the unchanged target seed
+            hidden, and never its own hidden state (default ``False``).
+
+    Drafters that set ``requires_target_kv_cache`` may also expose
+    ``build_target_attention_mask(kv_len=..., context_len=...)`` to supply
+    their own (e.g. per-attention-type) mask over the gathered target K/V.
     """
 
     supports_return_full_log_probs: bool
@@ -1814,6 +1828,12 @@ class Gemma4AssistantDrafter:
         self.layer_mapping = list(layer_mapping) if layer_mapping is not None else None
         self.target_config = target_config
         self.requires_target_kv_cache = True
+        # HF ``SinglePositionMultiTokenCandidateGenerator`` drafts every token of a
+        # window from ONE constant query position: the last seen token's position
+        # ``L - 1`` — one past the seed hidden's position (the runner's
+        # ``seed_position`` is ``L - 2``) — and never advances it between steps.
+        self.draft_position_offset = 1
+        self.advance_draft_position = False
         backbone_h = int(assistant_model.config.backbone_hidden_size)
         self._embed_scale = jnp.sqrt(jnp.array(backbone_h, dtype=jnp.float32))
         # Thread the assistant AND the target embedding through the jit as
@@ -1831,9 +1851,13 @@ class Gemma4AssistantDrafter:
     def resolve_layer_mapping(self, target_cache: typing.Any | None = None) -> list[int]:
         """Return the assistant-layer to target-layer K/V mapping.
 
-        Uses the explicit ``layer_mapping`` if provided, otherwise derives a
-        default mapping from the assistant's number of layers and the target's
-        number of layers (inferred from ``target_config`` or ``target_cache``).
+        Uses the explicit ``layer_mapping`` if provided. Otherwise follows the
+        HF reference: each assistant layer reads the K/V of the target's last
+        non-KV-shared layer with the same attention type (resolved from the
+        assistant's and ``target_config``'s ``layer_types`` and the target's
+        ``num_kv_shared_layers``). Without target layer types it falls back to
+        the legacy last-``N``-layers heuristic, with the target's layer count
+        inferred from ``target_config`` or ``target_cache``.
 
         Args:
             target_cache: Optional target KV cache used to infer the target's
@@ -1846,11 +1870,16 @@ class Gemma4AssistantDrafter:
         if self.layer_mapping is not None:
             return list(self.layer_mapping)
 
-        assistant_layers = int(self.assistant.config.text_config.num_hidden_layers)
+        assistant_text_config = self.assistant.config.text_config
+        assistant_layers = int(assistant_text_config.num_hidden_layers)
         target_layers = None
+        target_layer_types = None
+        num_kv_shared_layers = 0
         if self.target_config is not None:
             text_config = getattr(self.target_config, "text_config", self.target_config)
             target_layers = getattr(text_config, "num_hidden_layers", None)
+            target_layer_types = getattr(text_config, "layer_types", None)
+            num_kv_shared_layers = int(getattr(text_config, "num_kv_shared_layers", 0) or 0)
         if target_layers is None and target_cache is not None:
             views = getattr(target_cache, "views", None)
             if views is not None:
@@ -1860,7 +1889,45 @@ class Gemma4AssistantDrafter:
 
         from easydel.inference.esurge.runners.spec import default_assistant_layer_mapping
 
-        return default_assistant_layer_mapping(assistant_layers, int(target_layers))
+        return default_assistant_layer_mapping(
+            assistant_layers,
+            int(target_layers),
+            assistant_layer_types=getattr(assistant_text_config, "layer_types", None),
+            target_layer_types=target_layer_types,
+            num_kv_shared_layers=num_kv_shared_layers,
+        )
+
+    def build_target_attention_mask(self, *, kv_len: int, context_len: int) -> dict[str, jax.Array]:
+        """Build the per-attention-type additive masks over gathered target K/V.
+
+        Mirrors HF ``Gemma4AssistantForCausalLM.create_attention_masks``: the
+        full-attention layer sees every committed target position, while
+        sliding-attention layers only see the last ``sliding_window + 1``
+        committed positions (HF's bidirectional window ``|q - kv| <= window``
+        over the kv-axis-flipped states).
+
+        Args:
+            kv_len: Static length of the gathered target K/V (key axis).
+            context_len: Number of committed target positions (``0 ..
+                context_len - 1`` are visible).
+
+        Returns:
+            ``{"full_attention": mask, "sliding_attention": mask}`` with each
+            mask a ``[1, 1, 1, kv_len]`` float32 additive mask.
+        """
+        text_config = self.assistant.config.text_config
+        sliding_window = int(getattr(text_config, "sliding_window", 0) or 0)
+        positions = jnp.arange(int(kv_len), dtype=jnp.int32)[None, None, None, :]
+        visible = positions < int(context_len)
+        sliding_visible = visible
+        if sliding_window > 0:
+            sliding_visible = visible & (positions >= int(context_len) - 1 - sliding_window)
+        zero = jnp.asarray(0.0, dtype=jnp.float32)
+        neg = jnp.asarray(-1.0e10, dtype=jnp.float32)
+        return {
+            "full_attention": jnp.where(visible, zero, neg),
+            "sliding_attention": jnp.where(sliding_visible, zero, neg),
+        }
 
     def reset(self, batch_size: int) -> None:
         """Drafter is stateless within JAX-functional forward.
@@ -1877,7 +1944,7 @@ class Gemma4AssistantDrafter:
         target_hidden_states: Float[Array, "batch seq backbone_hidden"],
         target_kv_cache: list[tuple[Array, Array] | None] | None,
         position_ids: Int[Array, "batch seq"] | None,
-        attention_mask: Float[Array, "batch 1 q_len kv_len"] | None,
+        attention_mask: Float[Array, "batch 1 q_len kv_len"] | dict[str, Array] | None,
         *,
         return_dense_logits: bool,
     ) -> typing.Any:
@@ -1903,7 +1970,7 @@ class Gemma4AssistantDrafter:
         target_hidden_states: Float[Array, "batch seq backbone_hidden"],
         target_kv_cache: list[tuple[Array, Array] | None] | None,
         position_ids: Int[Array, "batch seq"] | None,
-        attention_mask: Float[Array, "batch 1 q_len kv_len"] | None,
+        attention_mask: Float[Array, "batch 1 q_len kv_len"] | dict[str, Array] | None,
         return_dense_logits: bool,
     ) -> typing.Any:
         """Weight-safe JIT Gemma4 Assistant forward.
@@ -1929,7 +1996,7 @@ class Gemma4AssistantDrafter:
         target_hidden_states: Float[Array, "batch seq backbone_hidden"] | None = None,
         target_kv_cache: list[tuple[Array, Array] | None] | None = None,
         position_ids: Int[Array, "batch seq"] | None = None,
-        attention_mask: Float[Array, "batch 1 q_len kv_len"] | None = None,
+        attention_mask: Float[Array, "batch 1 q_len kv_len"] | dict[str, Array] | None = None,
         return_full_log_probs: bool = False,
         sample: bool = False,
         rng_key: jax.Array | None = None,
@@ -1949,7 +2016,9 @@ class Gemma4AssistantDrafter:
                 drafts.
             position_ids: Position IDs for Q-side RoPE.
             attention_mask: Optional mask used when K/V is padded to a
-                static length by the runner.
+                static length by the runner; either one array or a dict
+                keyed by attention type (see
+                :meth:`build_target_attention_mask`).
             return_full_log_probs: Materialize dense candidate
                 log-probs for distribution-correct sampled spec decode.
             sample: Whether to sample from the centroid distribution.
@@ -2148,8 +2217,11 @@ def _build_model_native_drafter(
         The configured drafter instance.
 
     Raises:
-        ValueError: If no drafter instance is supplied, or it is a multi-layer
-            standalone drafter (which the single-hidden runner seed cannot feed).
+        ValueError: If no drafter instance is supplied, it is a multi-layer
+            standalone drafter (which the single-hidden runner seed cannot feed —
+            this includes every EAGLE3 drafter), or its single target layer is
+            not the target's last decoder layer (the runner seeds the FINAL
+            hidden state).
         TypeError: If the supplied drafter is not a :class:`SpecDecodeBase`.
     """
     del target_embed_module, layer_mapping, kwargs
@@ -2170,15 +2242,33 @@ def _build_model_native_drafter(
     # gather in the recurrent / hidden-gather path of model_runner.py, which is
     # not supported.
     n_layers = _drafter_target_layer_count(drafter)
+    drafter_config = getattr(drafter, "config", None)
+    layer_ids = tuple(getattr(drafter_config, "target_layer_ids", None) or ())
     if n_layers > 1:
         raise ValueError(
             f"{type(drafter).__name__} is configured with {n_layers} target layers "
-            "(target_layer_ids), but eSurge runner-native speculative decoding seeds the "
-            "drafter with a single target hidden state per window. Configure the drafter "
-            "with a single target layer, or pre-concatenate the target hidden states. "
-            "Multi-layer runner seeding is not yet wired."
+            f"(target_layer_ids={layer_ids}), but the eSurge runner only exposes the target's FINAL "
+            "hidden state to runner-native drafters, so multi-layer target features cannot be fed "
+            "(capturing intermediate target layers per verify window is not implemented). EAGLE3 "
+            "always requires 5 target layers and therefore cannot be served through eSurge "
+            "speculative decoding yet; DSpark/DFlash drafters must be trained with a single target "
+            "layer equal to the target's last decoder layer (target_layer_ids=(num_hidden_layers - 1,))."
         )
-    drafter.target_config = target_config if target_config is not None else getattr(target_model, "config", None)
+    resolved_target_config = target_config if target_config is not None else getattr(target_model, "config", None)
+    if layer_ids:
+        target_text_config = getattr(resolved_target_config, "text_config", None) or resolved_target_config
+        num_target_layers = getattr(target_text_config, "num_hidden_layers", None)
+        if num_target_layers is None:
+            num_target_layers = getattr(drafter_config, "target_num_hidden_layers", None)
+        if num_target_layers is not None and int(layer_ids[0]) != int(num_target_layers) - 1:
+            raise ValueError(
+                f"{type(drafter).__name__} reads target layer {int(layer_ids[0])} "
+                f"(target_layer_ids={layer_ids}), but the eSurge runner seeds drafters with the target's "
+                f"FINAL hidden state (layer {int(num_target_layers) - 1} of {int(num_target_layers)}). Serving "
+                "it would feed the drafter features it was never trained on; train it with "
+                f"target_layer_ids=({int(num_target_layers) - 1},)."
+            )
+    drafter.target_config = resolved_target_config
     if hasattr(drafter, "set_num_draft_tokens"):
         drafter.set_num_draft_tokens(int(num_draft_tokens))
     else:

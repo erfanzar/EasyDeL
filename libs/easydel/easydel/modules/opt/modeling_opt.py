@@ -274,11 +274,9 @@ class OPTDecoderLayer(spx.Module):
           x = LN(x + dropout(self_attn(x)))
           x = LN(x + dropout(fc2(act(fc1(x)))))
 
-    The FFN is the classic ``up -> ReLU -> down`` of width ``embed_dim``
-    (note: ``fc1`` is sized ``embed_dim -> embed_dim`` here in JAX rather
-    than ``embed_dim -> 4*embed_dim``; the actual expansion factor is
-    expressed via ``ffn_dim`` on the parent decoder, kept under the
-    ``intermediate_size`` alias). All linears carry biases, the activation
+    The FFN is the classic ``up -> ReLU -> down`` with ``fc1: embed_dim ->
+    ffn_dim`` and ``fc2: ffn_dim -> embed_dim`` (``ffn_dim`` is also exposed
+    under the ``intermediate_size`` alias). All linears carry biases, the activation
     is plain ReLU (or the function named by ``activation_function``), and
     dropout is applied on both the attention output and the FFN output.
 
@@ -343,7 +341,7 @@ class OPTDecoderLayer(spx.Module):
         )
         self.fc1 = ColumnParallelLinear(
             self.embed_dim,
-            self.embed_dim,
+            self.config.ffn_dim,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
@@ -351,7 +349,7 @@ class OPTDecoderLayer(spx.Module):
             rngs=rngs,
         )
         self.fc2 = RowParallelLinear(
-            self.embed_dim,
+            self.config.ffn_dim,
             self.embed_dim,
             dtype=dtype,
             param_dtype=param_dtype,

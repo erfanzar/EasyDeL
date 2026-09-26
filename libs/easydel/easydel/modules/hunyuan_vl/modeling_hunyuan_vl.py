@@ -86,7 +86,7 @@ from easydel.layers import (
 )
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
 from easydel.layers.norms import LayerNorm
-from easydel.modules._base import BaseVisionLanguageModule
+from easydel.modules._base import BaseVisionLanguageModule, torch_bicubic_resize
 
 from .hunyuan_vl_configuration import HunYuanVLConfig, HunYuanVLTextConfig, HunYuanVLVisionConfig
 
@@ -282,6 +282,7 @@ class HunYuanVLVisionEmbeddings(spx.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
+            precision=precision,
         )
         self.position_embedding = Embed(
             num_embeddings=self.num_positions,
@@ -304,12 +305,16 @@ class HunYuanVLVisionEmbeddings(spx.Module):
         """
         grid = self.position_embedding.weight.value[1:, :].astype(jnp.float32)
         grid = grid.reshape(self.position_edge, self.position_edge, self.embed_dim)
-        resized = jax.image.resize(
-            grid,
-            shape=(height, width, self.embed_dim),
-            method=self.config.interpolate_mode,
-            antialias=False,
-        )
+        if self.config.interpolate_mode in ("bicubic", "cubic"):
+            # jax.image.resize's cubic kernel (A=-0.5) differs from torch's.
+            resized = torch_bicubic_resize(grid, height, width)
+        else:
+            resized = jax.image.resize(
+                grid,
+                shape=(height, width, self.embed_dim),
+                method=self.config.interpolate_mode,
+                antialias=False,
+            )
         return resized.reshape(height * width, self.embed_dim)
 
     def forward(self, pixel_values: Float[Array, "num_patches patch_features"], grid_thw: np.ndarray) -> Array:
@@ -624,6 +629,7 @@ class HunYuanVLVisionPatchMerger(spx.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
+            precision=precision,
         )
         self.proj_act = ACT2FN[config.hidden_act]
         self.proj_out = nn.Conv(
@@ -634,6 +640,7 @@ class HunYuanVLVisionPatchMerger(spx.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
+            precision=precision,
         )
         self.mlp = ColumnParallelLinear(
             config.hidden_size * 4,

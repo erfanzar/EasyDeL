@@ -54,8 +54,9 @@ class MistralConfig(EasyDeLBaseConfig):
             Dimensionality of the encoder layers and the pooler layer.
         intermediate_size (`int`, *optional*, defaults to 14336):
             Dimensionality of the "intermediate" (i.e., feed-forward) layer in the Transformer encoder.
-        head_dim (`int`, defaults to 128):
-            Dimensionality of the head for attention.
+        head_dim (`int`, *optional*):
+            Dimensionality of the head for attention. Defaults to
+            ``hidden_size // num_attention_heads`` when not provided (as in HF).
         num_hidden_layers (`int`, *optional*, defaults to 32):
             Number of hidden layers in the Transformer encoder.
         num_attention_heads (`int`, *optional*, defaults to 32):
@@ -112,7 +113,7 @@ class MistralConfig(EasyDeLBaseConfig):
         vocab_size: int = 32000,
         hidden_size: int = 4096,
         intermediate_size: int = 14336,
-        head_dim: int = 128,
+        head_dim: int | None = None,
         num_hidden_layers: int = 32,
         num_attention_heads: int = 32,
         num_key_value_heads: int | None = 8,
@@ -144,7 +145,8 @@ class MistralConfig(EasyDeLBaseConfig):
             vocab_size (int, optional): Vocabulary size. Defaults to 32000.
             hidden_size (int, optional): Hidden dimension. Defaults to 4096.
             intermediate_size (int, optional): MLP intermediate dimension. Defaults to 14336.
-            head_dim (int, optional): Per-head attention dimension. Defaults to 128.
+            head_dim (int | None, optional): Per-head attention dimension. ``None`` (the default)
+                resolves to ``hidden_size // num_attention_heads`` as in HF.
             num_hidden_layers (int, optional): Number of decoder layers. Defaults to 32.
             num_attention_heads (int, optional): Number of attention heads. Defaults to 32.
             num_key_value_heads (int | None, optional): Number of key/value heads for
@@ -186,7 +188,7 @@ class MistralConfig(EasyDeLBaseConfig):
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.num_hidden_layers = num_hidden_layers
-        self.head_dim = head_dim
+        self.head_dim = head_dim if head_dim is not None else hidden_size // num_attention_heads
         self.num_attention_heads = num_attention_heads
         self.sliding_window = sliding_window
         self.bits = bits

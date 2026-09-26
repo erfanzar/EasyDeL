@@ -28,7 +28,9 @@ multimodal models.
 
 import functools
 
+import jax
 import jax.lax
+import numpy as np
 import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
@@ -74,37 +76,46 @@ def position_ids_in_meshgrid(patch_embeds_list, max_width):
     return jnp.concatenate(positions)
 
 
-def generate_block_attention_mask(patch_embeds_list, tensor):
-    """Generates a block-diagonal attention mask for multi-image processing.
+def generate_block_segment_ids(patch_embeds_list, tensor):
+    """Generates per-patch image segment IDs for block-diagonal multi-image attention.
 
-    This mask ensures that attention is only computed within each image's patches,
-    preventing cross-image attention.
+    Pixtral flattens every image of a batch into one patch sequence; attention
+    must stay inside each image (HF builds an additive block-diagonal mask for
+    this). EasyDeL expresses the same restriction as segment IDs so the
+    resulting :class:`MaskInfo` is exact for every attention backend (the
+    boolean mask is derived as ``segment_q == segment_kv``).
 
     Args:
-        patch_embeds_list (list[int]): A list containing the number of patches for each image.
-        tensor (Array): The input tensor (e.g., hidden states) with shape
+        patch_embeds_list (list[int]): Number of patches for each image.
+        tensor (Array): The flattened patch tensor with shape
             (batch_size, sequence_length, ...).
 
     Returns:
-        Array: A block-diagonal attention mask of shape
-            (batch_size, 1, sequence_length, sequence_length).
-            The mask contains 0.0 for allowed attention positions and a large negative number
-            (minimum float value) for masked positions.
+        Array: int32 segment IDs of shape (batch_size, sequence_length); patches of
+            the ``i``-th image carry segment ``i``.
     """
-    dtype = tensor.dtype
     seq_len = tensor.shape[1]
-    d_min = jnp.finfo(dtype).min
     patch_lengths = jnp.asarray(patch_embeds_list, dtype=jnp.int32)
     block_end_idx = jnp.cumsum(patch_lengths)
 
     positions = jnp.arange(seq_len, dtype=jnp.int32)
-    block_ids = jnp.sum(positions[:, None] >= block_end_idx[None, :], axis=-1)
-    same_block = block_ids[:, None] == block_ids[None, :]
+    block_ids = jnp.sum(positions[:, None] >= block_end_idx[None, :], axis=-1).astype(jnp.int32)
+    return jnp.broadcast_to(block_ids[None, :], (tensor.shape[0], seq_len))
 
-    block_mask = jnp.where(same_block, jnp.array(0, dtype=dtype), d_min)
-    block_mask = jnp.expand_dims(block_mask, axis=(0, 1))
-    block_mask = jnp.broadcast_to(block_mask, (tensor.shape[0], 1, seq_len, seq_len))
-    return block_mask
+
+def _concrete_image_sizes(image_sizes) -> list[tuple[int, int]] | None:
+    """Return ``image_sizes`` as host ``(height, width)`` ints, or ``None`` when traced/absent.
+
+    The per-image patch crop (like the Mistral3 patch merger) needs static sizes;
+    under ``jit`` with traced ``image_sizes`` the full padded grid is kept.
+    """
+    if image_sizes is None:
+        return None
+    try:
+        sizes = np.asarray(jax.device_get(image_sizes))
+    except (jax.errors.ConcretizationTypeError, jax.errors.TracerArrayConversionError):
+        return None
+    return [(int(h), int(w)) for h, w in sizes.reshape(-1, 2)]
 
 
 def compute_frequencies(dim: int, max_patches_per_side: int, theta: float = 10000.0):
@@ -427,7 +438,7 @@ class PixtralAttention(AttentionModule):
             cache_metadata=None,
             init_bias=init_attention_bias,
             mask_info=mask_info,
-            causal=True,
+            causal=False,
         )
 
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
@@ -732,6 +743,7 @@ class PixtralVisionModel(EasyDeLBaseModule):
             use_bias=False,
             dtype=dtype,
             rngs=rngs,
+            precision=precision,
         )
         self.ln_pre = RMSNorm(
             config.hidden_size,
@@ -767,6 +779,7 @@ class PixtralVisionModel(EasyDeLBaseModule):
         output_hidden_states: bool | None = False,
         output_attentions: bool | None = None,
         *args,
+        image_sizes: Array | None = None,
         **kwargs,
     ) -> BaseModelOutput:
         """Forward pass through the Pixtral vision model.
@@ -782,6 +795,11 @@ class PixtralVisionModel(EasyDeLBaseModule):
             output_attentions (bool | None, optional): Whether to return attention weights.
                 Defaults to None.
             *args: Additional positional arguments (unused, for compatibility).
+            image_sizes (Array | None, optional): Per-image ``(height, width)`` in pixels.
+                When given (and concrete), each image's patch grid is cropped to
+                ``(height // patch_size, width // patch_size)`` exactly like HF, so
+                padded batches of differently sized images yield the right patch
+                counts. Traced sizes under ``jit`` keep the full padded grid.
             **kwargs: Additional keyword arguments (unused, for compatibility).
 
         Returns:
@@ -792,6 +810,13 @@ class PixtralVisionModel(EasyDeLBaseModule):
             self.patch_conv(jnp.expand_dims(img, 0).astype(self.dtype).transpose(0, 2, 3, 1)) for img in pixel_values
         ]
         patch_embeds_list = [p.transpose(0, 3, 1, 2) for p in patch_embeds_list]
+        concrete_sizes = _concrete_image_sizes(image_sizes)
+        if concrete_sizes is not None:
+            patch_size = self.config.patch_size
+            patch_embeds_list = [
+                p[..., : size[0] // patch_size, : size[1] // patch_size]
+                for p, size in zip(patch_embeds_list, concrete_sizes, strict=True)
+            ]
         patch_embeds = jnp.concatenate(
             [jnp.transpose(jnp.reshape(p, (p.shape[0], p.shape[1], -1)), (0, 2, 1)) for p in patch_embeds_list],
             axis=1,
@@ -803,13 +828,13 @@ class PixtralVisionModel(EasyDeLBaseModule):
             max_width=self.config.image_size // self.config.patch_size,
         )
 
-        attention_mask = generate_block_attention_mask(
-            [p.shape[-2] * p.shape[-1] for p in patch_embeds_list], patch_embeds
-        )
+        segment_ids = generate_block_segment_ids([p.shape[-2] * p.shape[-1] for p in patch_embeds_list], patch_embeds)
         transformer_output = self.transformer(
             inputs_embeds=patch_embeds,
-            attention_mask=attention_mask,
+            mask_info=MaskInfo.from_segments(segment_ids),
             position_embeddings=self.frequencies[position_ids],
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
         )
         return BaseModelOutput(
             last_hidden_state=checkpoint_name(transformer_output.last_hidden_state, "model_output"),

@@ -214,12 +214,13 @@ class Exaone4Config(EasyDeLBaseConfig):
 
         Accepts ``None`` or a dict with ``type`` / ``rope_type`` plus a
         ``factor`` (>= 1.0). ``"default"`` types are collapsed to ``None``.
-        Sets ``self.rope_scaling`` to a normalized
-        ``{"type": ..., "factor": ...}`` dict.
+        Sets ``self.rope_scaling`` to the input dict with normalized
+        ``type`` / ``rope_type`` / ``factor`` keys (other keys, e.g. the
+        ``llama3`` frequency bands, are kept).
 
         Raises:
             ValueError: If ``rope_scaling`` is not a dict, the ``type`` is not
-                one of ``{"linear", "dynamic"}``, or ``factor`` is not a float
+                one of ``{"linear", "dynamic", "yarn", "llama3"}``, or ``factor`` is not a float
                 ``>= 1.0``.
         """
         if self.rope_scaling is None:
@@ -235,9 +236,12 @@ class Exaone4Config(EasyDeLBaseConfig):
             self.rope_scaling = None
             return
 
-        if rope_scaling_type not in {"linear", "dynamic"}:
+        # Official checkpoints ship ``llama3`` (EXAONE-4.0) / ``yarn`` (long-context
+        # SmolLM3); their extra keys must survive normalization below.
+        if rope_scaling_type not in {"linear", "dynamic", "yarn", "llama3"}:
             raise ValueError(
-                f"`rope_scaling`'s type field must be one of ['linear', 'dynamic'], got {rope_scaling_type}"
+                "`rope_scaling`'s type field must be one of ['linear', 'dynamic', 'yarn', 'llama3'], "
+                f"got {rope_scaling_type}"
             )
 
         rope_scaling_factor = self.rope_scaling.get("factor", 1.0)
@@ -249,7 +253,12 @@ class Exaone4Config(EasyDeLBaseConfig):
         if rope_scaling_factor < 1.0:
             raise ValueError(f"`rope_scaling`'s factor field must be a float >= 1, got {rope_scaling_factor}")
 
-        self.rope_scaling = {"type": rope_scaling_type, "factor": rope_scaling_factor}
+        self.rope_scaling = {
+            **self.rope_scaling,
+            "type": rope_scaling_type,
+            "rope_type": rope_scaling_type,
+            "factor": rope_scaling_factor,
+        }
 
     def _validate_layer_types(self):
         """Validate ``self.layer_types`` matches the model depth and known kinds.

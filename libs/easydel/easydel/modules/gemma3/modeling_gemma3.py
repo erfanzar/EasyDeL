@@ -80,14 +80,34 @@ from easydel.layers import (
     dense_gate_up_layout,
     gated_mlp_forward,
 )
-from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
+from easydel.layers.attention import UnifiedAttention
 from easydel.layers.norms._norms import lowfloats
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule, BaseVisionLanguageModule
 from easydel.modules.auto.auto_modeling import AutoEasyDeLVisionModel
+from easydel.modules.gemma2.modeling_gemma2 import Gemma2SoftCappedAttentionModule
 
 from .gemma3_configuration import Gemma3Config, Gemma3TextConfig
 
 logger = get_logger(__name__)
+
+
+def _gemma3_embed_scale(embed_tokens: tp.Any, hidden_size: int, inputs_embeds: Array) -> Array:
+    """Return the ``sqrt(hidden_size)`` embedding scale as HF Gemma3 applies it.
+
+    HF ``Gemma3TextScaledWordEmbedding`` multiplies by
+    ``embed_scale.to(self.weight.dtype)``, i.e. the scale is first rounded to the
+    embedding weight dtype (e.g. ``sqrt(2560) -> 50.5`` in bf16).
+
+    Args:
+        embed_tokens: Token embedding module (its ``param_dtype`` is the weight dtype).
+        hidden_size: Text hidden size.
+        inputs_embeds: Looked-up embeddings; the scale is returned in their dtype.
+
+    Returns:
+        Array: Scalar scale rounded through the weight dtype.
+    """
+    weight_dtype = getattr(embed_tokens, "param_dtype", None) or inputs_embeds.dtype
+    return jnp.asarray(hidden_size**0.5, dtype=weight_dtype).astype(inputs_embeds.dtype)
 
 
 @auto_pytree
@@ -227,8 +247,9 @@ class Gemma3RMSNorm(spx.Module):
             jax.Array: Normalized and scaled hidden states. If output dtype is Float8,
                 automatically casts to bfloat16 for compatibility.
         """
-        variance = self._norm(hidden_states.astype(jnp.float32)).astype(self.param_dtype)
-        out = (1 + self.weight.value.astype(self.param_dtype)) * variance
+        # HF multiplies by ``(1 + weight)`` in float32 and casts once at the end.
+        normed = self._norm(hidden_states.astype(jnp.float32))
+        out = ((1 + self.weight.value.astype(jnp.float32)) * normed).astype(self.param_dtype)
 
         if out.dtype in lowfloats:
             out = out.astype(jnp.bfloat16)
@@ -278,6 +299,9 @@ class Gemma3Attention(UnifiedAttention):
             rngs (spx.Rngs): Random number generator state.
         """
         self.is_sliding = config.layer_types is not None and config.layer_types[layer_idx] == "sliding_attention"
+        # EmbeddingGemma (``use_bidirectional_attention``) attends in both directions; its
+        # sliding layers then use a symmetric window (HF ``_bidirectional_window_overlay``).
+        causal = causal and not getattr(config, "use_bidirectional_attention", False)
 
         super().__init__(
             config=config,
@@ -287,7 +311,7 @@ class Gemma3Attention(UnifiedAttention):
             rngs=rngs,
             layer_idx=layer_idx,
             attention_type="standard",
-            causal=True,
+            causal=causal,
             sliding_window=config.sliding_window if self.is_sliding else None,
             use_qk_norm=True,
         )
@@ -337,20 +361,22 @@ class Gemma3Attention(UnifiedAttention):
 
         Replaces the default ``1/sqrt(head_dim)`` softmax scale with
         ``1/sqrt(config.query_pre_attn_scalar)``, matching Gemma2/3's
-        decoupled-temperature recipe, and wires through ``attention_dropout``.
+        decoupled-temperature recipe, wires through ``attention_dropout`` and,
+        when ``config.attn_logit_softcapping`` is set, tanh-soft-caps the scores.
 
         Args:
             config: Source ``Gemma3TextConfig``.
             rngs: Random number generator state for the attention dropout.
 
         Returns:
-            FlexibleAttentionModule: Configured attention backend.
+            Gemma2SoftCappedAttentionModule: Configured attention backend.
         """
-        return FlexibleAttentionModule(
+        return Gemma2SoftCappedAttentionModule(
             rngs=rngs,
             base_config=config,
             softmax_scale=config.query_pre_attn_scalar**-0.5,
             dropout_prob=config.attention_dropout,
+            logits_soft_cap=getattr(config, "attn_logit_softcapping", None),
         )
 
     def _postprocess_qkv(self, query_states, key_states, value_states):
@@ -780,8 +806,9 @@ class Gemma3TextModel(EasyDeLBaseModule):
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
         if inputs_embeds is None:
-            inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings") * (
-                self.config.hidden_size**0.5
+            inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
+            inputs_embeds = inputs_embeds * _gemma3_embed_scale(
+                self.embed_tokens, self.config.hidden_size, inputs_embeds
             )
         sequence_length = inputs_embeds.shape[1]
 
@@ -1603,7 +1630,8 @@ class Gemma3Model(EasyDeLBaseModule):
             llm_input_ids = input_ids
 
         hidden_size = self.config.get_text_config().hidden_size
-        inputs_embeds = super().compute_embedding(llm_input_ids) * (hidden_size**0.5)
+        inputs_embeds = super().compute_embedding(llm_input_ids)
+        inputs_embeds = inputs_embeds * _gemma3_embed_scale(self.get_embedding(), hidden_size, inputs_embeds)
 
         if image_features is None and pixel_values is not None:
             image_features = self.get_image_features(pixel_values)

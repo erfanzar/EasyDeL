@@ -65,7 +65,7 @@ from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
 from easydel.layers import ColumnParallelLinear, RowParallelLinear, dense_qkv_layout
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.norms import LayerNorm, RMSNorm
-from easydel.modules._base import BaseVisionLanguageModule
+from easydel.modules._base import BaseVisionLanguageModule, torch_bicubic_resize
 
 from ..auto.auto_modeling import AutoEasyDeLModel, AutoEasyDeLVisionModel
 from .internvl_configuration import InternVLConfig, InternVLVisionConfig
@@ -141,6 +141,7 @@ class InternVLVisionPatchEmbeddings(spx.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
+            precision=precision,
         )
 
     def forward(self, pixel_values: Float[Array, "batch height width channels"]) -> Array:
@@ -230,9 +231,9 @@ class InternVLVisionEmbeddings(EasyDeLLayerStackMixin, spx.Module):
         """Interpolate trained position encodings to a new spatial grid.
 
         Mirrors the HF/timm behavior: the CLS position is kept and the patch
-        grid is resized bicubically. Note ``jax.image.resize`` bicubic uses a
-        slightly different cubic kernel than ``torch.nn.functional.interpolate``;
-        this path only fires for non-square or resolution-mismatched inputs.
+        grid is resized with torch-exact bicubic interpolation
+        (``F.interpolate(mode="bicubic", align_corners=False)``); this path only
+        fires for non-square or resolution-mismatched inputs.
 
         Args:
             embeddings: Token embeddings of shape (batch, num_patches + 1, dim).
@@ -257,11 +258,8 @@ class InternVLVisionEmbeddings(EasyDeLLayerStackMixin, spx.Module):
         new_width = width // self.patch_size[1]
         sqrt_num_positions = int(num_positions**0.5)
         patch_pos_embed = patch_pos_embed.reshape(1, sqrt_num_positions, sqrt_num_positions, dim)
-        patch_pos_embed = jax.image.resize(
-            patch_pos_embed.astype(jnp.float32),
-            shape=(1, new_height, new_width, dim),
-            method="bicubic",
-        ).astype(position_embeddings.dtype)
+        patch_pos_embed = torch_bicubic_resize(patch_pos_embed[0].astype(jnp.float32), new_height, new_width)
+        patch_pos_embed = patch_pos_embed.astype(position_embeddings.dtype)
         patch_pos_embed = patch_pos_embed.reshape(1, -1, dim)
         return jnp.concatenate([class_pos_embed, patch_pos_embed], axis=1)
 

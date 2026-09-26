@@ -57,6 +57,7 @@ from easydel.layers import (
     ColumnParallelLinear,
     Embed,
     RowParallelLinear,
+    build_fused_qkv_projection,
     dense_gate_up_layout,
     gated_mlp_forward,
     split_fused_qkv_projection,
@@ -202,15 +203,16 @@ class StableLmLayerNormPerHead(spx.Module):
         """Apply layer normalization independently to each head.
 
         Args:
-            hidden_states: Input tensor with shape (..., num_heads * head_dim)
+            hidden_states: Input tensor with shape (batch, num_heads, seq_len, head_dim)
 
         Returns:
             Normalized hidden states with same shape as input
         """
-        # hidden_states: [batch, seq_len, num_heads * head_dim]
-        states_per_heads = jnp.split(hidden_states, 1, axis=1)
+        # hidden_states: [batch, num_heads, seq_len, head_dim]; one size-1 chunk per head
+        # (HF ``torch.split(x, 1, dim=1)``) so head ``h`` uses ``norms[h]``.
+        states_per_heads = jnp.split(hidden_states, len(self.norms), axis=1)
         return jnp.concatenate(
-            [norm(hidden_states) for norm, hidden_states in zip(self.norms, states_per_heads, strict=False)],
+            [norm(hidden_states) for norm, hidden_states in zip(self.norms, states_per_heads, strict=True)],
             axis=1,
         )
 
@@ -263,6 +265,37 @@ class StableLmAttention(UnifiedAttention):
             attention_type="standard",
             causal=True,
             use_qk_norm=config.qk_layernorm,
+        )
+
+    def _create_fused_qkv_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Build the fused QKV projection with StableLM's ``use_qkv_bias`` bias.
+
+        StableLM configs carry ``use_qkv_bias`` (not ``attention_bias``), so the
+        default builder would drop the q/k/v biases that HF applies.
+        """
+        return build_fused_qkv_projection(
+            config=config,
+            q_size=self.num_heads * self.head_dim,
+            kv_size=self.num_key_value_heads * self.head_dim,
+            rngs=rngs,
+            use_bias=bool(getattr(config, "use_qkv_bias", False)),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            target_prefix=self._projection_attr("query_key_value_projection"),
+            query_prefix=self.projection_mapping["query_projection"],
+            key_prefix=self.projection_mapping["key_projection"],
+            value_prefix=self.projection_mapping["value_projection"],
+        )
+
+    @property
+    def reform_param(self) -> dict[str, dict[str, object]]:
+        """Fused-QKV reform rules, carrying the q/k/v biases when ``use_qkv_bias`` is set."""
+        qkv_attr = self._projection_attr("query_key_value_projection")
+        return self.query_key_value_projection.build_reform_param(
+            qkv_attr,
+            config=self.config,
+            include_bias=bool(getattr(self.config, "use_qkv_bias", False)),
         )
 
     def _create_q_norm(self, config, dtype, param_dtype, rngs):

@@ -883,6 +883,7 @@ class Glm5NextLinearAttention(spx.Module):
             dtype=dtype,
             rngs=rngs,
             use_bias=False,
+            precision=precision,
         )
         self.k_conv1d = nn.Conv1d(
             in_channels=self.key_dim,
@@ -893,6 +894,7 @@ class Glm5NextLinearAttention(spx.Module):
             dtype=dtype,
             rngs=rngs,
             use_bias=False,
+            precision=precision,
         )
         self.v_conv1d = nn.Conv1d(
             in_channels=self.value_dim,
@@ -903,6 +905,7 @@ class Glm5NextLinearAttention(spx.Module):
             dtype=dtype,
             rngs=rngs,
             use_bias=False,
+            precision=precision,
         )
 
         self.forget_gate = Glm5NextForgetGate(
@@ -1291,9 +1294,9 @@ class Glm5NextLinearAttention(spx.Module):
         num_heads = b_r.shape[-1]
         head_k = q_r.shape[-1] // num_heads
         head_v = v_r.shape[-1] // num_heads
-        qh = q_r.reshape(rows, seq, num_heads, head_k).transpose(0, 2, 1, 3)  # [R, H, T, K]
-        kh = k_r.reshape(rows, seq, num_heads, head_k).transpose(0, 2, 1, 3)
-        vh = v_r.reshape(rows, seq, num_heads, head_v).transpose(0, 2, 1, 3)
+        qh = conv_outs["q"].reshape(rows, seq, num_heads, head_k).transpose(0, 2, 1, 3)  # [R, H, T, K]
+        kh = conv_outs["k"].reshape(rows, seq, num_heads, head_k).transpose(0, 2, 1, 3)
+        vh = conv_outs["v"].reshape(rows, seq, num_heads, head_v).transpose(0, 2, 1, 3)
         bh = b_r.transpose(0, 2, 1)  # [R, H, T]
         gh = g_r.reshape(rows, seq, num_heads, head_k).transpose(0, 2, 1, 3)
         init_state = cache_view.recurrent_state  # [R, H, K, V]
@@ -1781,7 +1784,7 @@ class Glm5NextDSAAttention(UnifiedAttention):
                 "queries_pe": jnp.zeros((bsz, q_len, self.num_heads, rope_width), query_states.dtype),
                 "keys_values": compressed_kv,
                 "keys_pe": jnp.zeros((bsz, q_len, rope_width), compressed_kv.dtype),
-                "softmax_scale": (self.qk_nope_head_dim + self.config.qk_rope_head_dim) ** -0.5,
+                "softmax_scale": self.attention_performer.softmax_scale,
             }
 
         (

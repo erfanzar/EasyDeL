@@ -1412,8 +1412,11 @@ def causal_lm_loss_chunked_lm_head(
         global_loss_batch["decoder_target_tokens"] = shift_labels
     else:
         global_loss_batch["decoder_target_tokens"] = jnp.asarray(global_loss_batch["decoder_target_tokens"])
+    # Per-token loss weights and the normalizing factor stay fp32 regardless of ``compute_dtype``: a
+    # bf16 token-count sum rounds (65535 -> 65536) and the FLCE kernel accumulates in fp32 anyway.
+    # Only the [B, chunk, V] logits math runs in ``compute_dtype``.
     if "decoder_loss_weights" in global_loss_batch:
-        shift_loss_weights = jnp.asarray(global_loss_batch["decoder_loss_weights"], compute_dtype)
+        shift_loss_weights = jnp.asarray(global_loss_batch["decoder_loss_weights"], jnp.float32)
         if config.shift_tokens and shift_loss_weights.shape == labels.shape:
             shift_loss_weights = shift_loss_weights[:, 1:]
         elif shift_loss_weights.shape != shift_labels.shape:
@@ -1424,21 +1427,21 @@ def causal_lm_loss_chunked_lm_head(
         global_loss_batch["decoder_loss_weights"] = shift_loss_weights
     else:
         if shift_attn_m is not None:
-            global_loss_batch["decoder_loss_weights"] = shift_attn_m.astype(compute_dtype)
+            global_loss_batch["decoder_loss_weights"] = shift_attn_m.astype(jnp.float32)
         else:
-            global_loss_batch["decoder_loss_weights"] = (shift_labels != config.ignore_index).astype(compute_dtype)
+            global_loss_batch["decoder_loss_weights"] = (shift_labels != config.ignore_index).astype(jnp.float32)
 
     # ignore_index tokens must never contribute to the loss or its normalizer; AND the weights with label
     # validity so a raw ``attention_mask`` that is 1 over ``-100`` (completion-only SFT) drops those tokens
     # from both. Idempotent when the weights already exclude them (explicit completion mask / attn=None).
     global_loss_batch["decoder_loss_weights"] = global_loss_batch["decoder_loss_weights"] * (
         shift_labels != config.ignore_index
-    ).astype(compute_dtype)
+    ).astype(jnp.float32)
 
     global_loss_factor, _ = get_factor_and_weight(
         config.loss_normalizing_factor,
         global_loss_batch,
-        compute_dtype=compute_dtype,
+        compute_dtype=jnp.float32,
     )
     chunk_size = token_chunk_size or resolve_causal_lm_chunk_token_size(
         hidden_states=shift_hidden_states,
@@ -1472,7 +1475,7 @@ def causal_lm_loss_chunked_lm_head(
         def projection_fn(chunk_hidden_states):
             return logit_cap_fn(lm_head_fn(chunk_hidden_states))
 
-    loss_weights = jnp.asarray(global_loss_batch["decoder_loss_weights"], compute_dtype)
+    loss_weights = jnp.asarray(global_loss_batch["decoder_loss_weights"], jnp.float32)
 
     flce_out = _fused_ce(
         hidden=shift_hidden_states,

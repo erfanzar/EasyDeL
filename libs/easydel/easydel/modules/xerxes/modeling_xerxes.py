@@ -231,13 +231,8 @@ class XerxesAttention(UnifiedAttention):
             is_cross_attention (bool, optional): Whether this is cross-attention. Defaults to False.
             rngs (spx.Rngs): Random number generator state.
         """
-        self.is_local_attn = False
-        sliding_window = None
-        if not config.xe_kvnorm:
-            sliding_window = 4096 if bool((layer_idx % 2) == 0) else None
-        if config.window_pattern is not None:
-            self.is_local_attn = bool((layer_idx + 1) % config.window_pattern)
-            sliding_window = config.sliding_window if self.is_local_attn else None
+        self.is_local_attn = config.window_pattern is not None and bool((layer_idx + 1) % config.window_pattern)
+        sliding_window = config.layer_sliding_window(layer_idx)
 
         self.xe_kvnorm = config.xe_kvnorm
 
@@ -1014,12 +1009,32 @@ class XerxesForCausalLM(BaseCausalLMModule[XerxesModel, XerxesConfig]):  # type:
         if apply_lm_head:
             lm_logits = self.compute_lm_logits(hidden_states)
         return CausalLMOutput(
-            logits=self.post_pross(lm_logits),
+            logits=lm_logits,
             hidden_states=outputs.hidden_states,
             last_hidden_state=outputs.last_hidden_state,
             attentions=outputs.attentions,
             past_key_values=outputs.past_key_values,
         )
+
+    def compute_lm_logits(self, hidden_states: Array) -> Array:
+        """Project to vocabulary logits and apply the ``post_pross`` soft cap.
+
+        The cap lives here (not in ``forward``) so every logits path -- plain
+        forward, eSurge's ``apply_lm_head=False`` + ``compute_lm_logits`` and the
+        chunked loss via :meth:`make_lm_head_fn` -- sees the same function.
+        """
+        return self.post_pross(super().compute_lm_logits(hidden_states))
+
+    def make_lm_head_fn(self, vocab_shard_stage: int | None = None):
+        """Trace-safe LM-head projection with the same soft cap as :meth:`compute_lm_logits`."""
+        base_fn = super().make_lm_head_fn(vocab_shard_stage=vocab_shard_stage)
+        if isinstance(self.post_pross, Identity):
+            return base_fn
+
+        def _project(hidden_states):
+            return 30 * jnp.tanh(base_fn(hidden_states) / 30)
+
+        return _project
 
     def get_encoder(self):
         """

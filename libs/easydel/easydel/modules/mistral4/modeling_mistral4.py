@@ -839,7 +839,7 @@ class Mistral4Attention(UnifiedAttention):
             mla_keys_values = compressed_kv
             mla_keys_pe = k_pe[:, 0, :, :]
 
-            mla_softmax_scale = (self.qk_nope_head_dim + self.qk_rope_head_dim) ** -0.5
+            mla_softmax_scale = self.attention_performer.softmax_scale
 
             key_for_cache = jnp.concatenate(
                 [compressed_kv[:, :, None, :], k_pe.transpose(0, 2, 1, 3)],

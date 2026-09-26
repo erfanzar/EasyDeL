@@ -178,7 +178,9 @@ class Olmo3Config(EasyDeLBaseConfig):
                 bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
                 rope_parameters (dict, optional): Canonical RoPE settings keyed by attention type.
                         Explicit per-type settings take precedence over legacy shared rope fields.
-                        A flat mapping retains the legacy shared local/global RoPE behavior.
+                        A flat mapping (like legacy ``rope_scaling``) applies to ``full_attention``
+                        layers only; ``sliding_attention`` layers keep unscaled RoPE with the same
+                        theta, matching transformers.
                 rope_theta_is_shared (bool, optional): Persisted provenance for legacy shared theta.
                         Inferred from the input format when omitted: legacy/flat settings follow late
                         rope_theta overrides, while explicit per-type mappings retain their own theta.
@@ -229,9 +231,11 @@ class Olmo3Config(EasyDeLBaseConfig):
             self.layer_types = layer_types
         self._validate_layer_types()
 
-        # HF OLMo3 reads RoPE by attention type, even when both types share
-        # the same parameters. Keep old EasyDeL checkpoints' shared math and
-        # theta (10000 by default), rather than substituting HF's newer default.
+        # HF OLMo3 reads RoPE by attention type. Legacy ``rope_scaling`` (e.g. the
+        # official YaRN x8) only scales ``full_attention`` layers; sliding layers
+        # stay unscaled with the shared theta (see ``_backfill_rope_parameters``).
+        # Keep old EasyDeL checkpoints' theta (10000 by default) rather than
+        # substituting HF's newer default.
         shared_rope = rope_scaling or {"rope_type": "default", "rope_theta": rope_theta}
         if rope_parameters is not None and not any(
             key in rope_parameters for key in ("sliding_attention", "full_attention")
@@ -298,15 +302,24 @@ class Olmo3Config(EasyDeLBaseConfig):
         return super()._normalize_rope_assignment(rope_parameters)
 
     def _backfill_rope_parameters(self) -> None:
-        """Keep the canonical HF mapping nested after construction and mutation."""
+        """Keep the canonical HF mapping nested after construction and mutation.
+
+        A flat mapping is legacy shared ``rope_scaling``: transformers applies it
+        to ``full_attention`` only, while ``sliding_attention`` keeps default RoPE
+        with the same theta.
+        """
         super()._backfill_rope_parameters()
         parameters = getattr(self, "rope_parameters", None)
         if isinstance(parameters, dict) and "rope_type" in parameters:
+            sliding_parameters = {
+                key: parameters[key] for key in ("rope_theta", "partial_rotary_factor") if key in parameters
+            }
+            sliding_parameters.update(rope_type="default", type="default")
             # Bypass our assignment hook to avoid recursively backfilling.
             object.__setattr__(
                 self,
                 "rope_parameters",
-                {layer_type: dict(parameters) for layer_type in ("sliding_attention", "full_attention")},
+                {"sliding_attention": sliding_parameters, "full_attention": dict(parameters)},
             )
 
     def get_layer_rope_config(self, layer_type: str) -> "Olmo3Config":
@@ -355,11 +368,18 @@ class Olmo3Config(EasyDeLBaseConfig):
             return None
 
         rope_scaling_factor = rope_scaling.get("factor", None)
-        if rope_scaling_type is None or rope_scaling_type not in ["linear", "dynamic"]:
+        # Official OLMo-3 checkpoints ship YaRN; transformers accepts every rope type.
+        if rope_scaling_type is None or rope_scaling_type not in ["linear", "dynamic", "yarn", "llama3"]:
             raise ValueError(
-                f"`rope_scaling`'s type field must be one of ['linear', 'dynamic'], got {rope_scaling_type}"
+                "`rope_scaling`'s type field must be one of ['linear', 'dynamic', 'yarn', 'llama3'], "
+                f"got {rope_scaling_type}"
             )
-        if rope_scaling_factor is None or not isinstance(rope_scaling_factor, float) or rope_scaling_factor <= 1.0:
+        if (
+            rope_scaling_factor is None
+            or isinstance(rope_scaling_factor, bool)
+            or not isinstance(rope_scaling_factor, (int, float))
+            or rope_scaling_factor <= 1.0
+        ):
             raise ValueError(f"`rope_scaling`'s factor field must be a float > 1, got {rope_scaling_factor}")
         return dict(rope_scaling)
 

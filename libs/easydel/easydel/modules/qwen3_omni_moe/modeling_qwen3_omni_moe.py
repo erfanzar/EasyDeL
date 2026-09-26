@@ -488,6 +488,7 @@ class Qwen3OmniMoeAudioEncoder(EasyDeLBaseModule):
             padding=((1, 1), (1, 1)),
             dtype=dtype,
             rngs=rngs,
+            precision=precision,
         )
         self.conv2d2 = nn.Conv2d(
             in_channels=config.downsample_hidden_size,
@@ -497,6 +498,7 @@ class Qwen3OmniMoeAudioEncoder(EasyDeLBaseModule):
             padding=((1, 1), (1, 1)),
             dtype=dtype,
             rngs=rngs,
+            precision=precision,
         )
         self.conv2d3 = nn.Conv2d(
             in_channels=config.downsample_hidden_size,
@@ -506,6 +508,7 @@ class Qwen3OmniMoeAudioEncoder(EasyDeLBaseModule):
             padding=((1, 1), (1, 1)),
             dtype=dtype,
             rngs=rngs,
+            precision=precision,
         )
 
         mel_after_conv = (((config.num_mel_bins + 1) // 2 + 1) // 2 + 1) // 2
@@ -803,6 +806,7 @@ class Qwen3OmniMoeVisionPatchEmbed(spx.Module):
             use_bias=True,
             dtype=dtype,
             rngs=rngs,
+            precision=precision,
         )
 
     def forward(self, hidden_states: Array) -> Array:
@@ -1572,6 +1576,9 @@ class Qwen3OmniMoeTextSparseBlock(BaseMoeModule):
             routing_strategy=MoeRoutingStrategy.TOP_K if config.norm_topk_prob else MoeRoutingStrategy.TOP_K_NDIV,
             load_balancing_strategy=MoeLoadBalancingStrategy.STANDARD,
         )
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
         self.config = config
         self.gate = ColumnParallelLinear(
             config.hidden_size,
@@ -2063,6 +2070,9 @@ class Qwen3OmniMoeTalkerTextSparseMoeBlock(BaseMoeModule):
             routing_strategy=MoeRoutingStrategy.TOP_K if config.norm_topk_prob else MoeRoutingStrategy.TOP_K_NDIV,
             load_balancing_strategy=MoeLoadBalancingStrategy.STANDARD,
         )
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
         self.config = config
 
         self.gate = ColumnParallelLinear(

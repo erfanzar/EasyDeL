@@ -47,6 +47,7 @@ import collections.abc
 import copy
 import dataclasses
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -172,6 +173,11 @@ _REMOVED_BASE_CONFIG_KEYS = frozenset(
         "pallas_n_block_size",
     }
 )
+
+# Instance flag set once ``EasyDeLBaseConfig.__init__`` finishes; afterwards late
+# ``rope_theta`` / ``partial_rotary_factor`` assignments are mirrored into the flat
+# ``rope_parameters`` dict. Runtime-only: never serialized.
+_ROPE_FIELDS_SYNCED_ATTR = "_rope_fields_synced"
 
 
 def is_remote_url(url_or_filename: str) -> bool:
@@ -772,13 +778,25 @@ class EasyDeLBaseConfig(PretrainedConfig):
         """
         # HF v5 expects `rope_parameters` to include `rope_theta`.
         # Keep late assignments (e.g. tests mutating `config.rope_scaling`) compatible.
+        raw_rope_parameters = None
         if key in {"rope_scaling", "rope_parameters"} and isinstance(value, dict):
+            raw_rope_parameters = value
             value = self._normalize_rope_assignment(value)
         super().__setattr__(key, value)
         # Keep common MoE expert-count aliases in sync for late config mutations.
         # Several HF MoE implementations read `num_local_experts` directly.
         if key in {"n_routed_experts", "num_experts"}:
             super().__setattr__("num_local_experts", value)
+        if self.__dict__.get(_ROPE_FIELDS_SYNCED_ATTR, False):
+            # After construction the scalar fields and the flat HF v5 mapping must
+            # stay one source of truth: late overrides (``from_dict(..., rope_theta=...)``,
+            # ``config_kwargs``) update both, so a save/reload cannot resurrect a stale value.
+            if key in {"rope_theta", "partial_rotary_factor"} and value is not None:
+                rope_parameters = self.__dict__.get("rope_parameters")
+                if self._is_flat_rope_parameters(rope_parameters) and rope_parameters.get(key) != value:
+                    super().__setattr__("rope_parameters", {**rope_parameters, key: value})
+            elif raw_rope_parameters is not None:
+                self._sync_rope_fields_from_parameters(raw_rope_parameters)
         if key in self._rope_relevant_keys:
             self._backfill_rope_parameters()
 
@@ -799,6 +817,89 @@ class EasyDeLBaseConfig(PretrainedConfig):
         # must remain hashable for graph definitions to compile.
         if cls.__dict__.get("__hash__") is None:
             cls.__hash__ = hash_fn
+
+    @staticmethod
+    def _is_flat_rope_parameters(rope_parameters: tp.Any) -> bool:
+        """Return whether ``rope_parameters`` is one flat RoPE dict (not keyed by layer type).
+
+        Args:
+            rope_parameters: Candidate ``rope_parameters`` / ``rope_scaling`` value.
+
+        Returns:
+            bool: ``True`` for a non-empty dict whose values are all scalars/lists.
+        """
+        return (
+            isinstance(rope_parameters, dict)
+            and bool(rope_parameters)
+            and not any(isinstance(value, dict) for value in rope_parameters.values())
+        )
+
+    def _sync_rope_fields_from_parameters(self, rope_parameters: tp.Any) -> None:
+        """Mirror ``rope_theta`` / ``partial_rotary_factor`` from a flat ``rope_parameters`` dict.
+
+        transformers v5 serializes these only inside ``rope_parameters`` and gives
+        that dict priority over top-level fields, while EasyDeL's rotary builders
+        read ``self.rope_theta`` / ``self.partial_rotary_factor``. Without this a
+        v5-saved Llama-3 (theta 5e5) silently falls back to the class default.
+        ``partial_rotary_factor`` is only mirrored onto configs that declare it, so
+        families that size partial RoPE themselves (e.g. GPT-NeoX ``rotary_pct``)
+        are not rotated twice.
+
+        Args:
+            rope_parameters: Raw ``rope_parameters`` value; per-layer-type
+                (nested) mappings are ignored.
+        """
+        if not self._is_flat_rope_parameters(rope_parameters):
+            return
+        rope_theta = rope_parameters.get("rope_theta")
+        if rope_theta is not None and getattr(self, "rope_theta", None) != rope_theta:
+            super().__setattr__("rope_theta", rope_theta)
+        partial_rotary_factor = rope_parameters.get("partial_rotary_factor")
+        if (
+            partial_rotary_factor is not None
+            and hasattr(self, "partial_rotary_factor")
+            and self.partial_rotary_factor != partial_rotary_factor
+        ):
+            super().__setattr__("partial_rotary_factor", partial_rotary_factor)
+
+    @classmethod
+    def from_dict(cls, config_dict: dict[str, tp.Any], **kwargs):
+        """Instantiate a config, lifting v5-only RoPE fields to their legacy top-level keys.
+
+        transformers v5 saves ``rope_theta`` (and, for some families,
+        ``partial_rotary_factor``) only inside ``rope_parameters``. Constructors
+        that take ``rope_theta=<default>`` would otherwise never see the saved
+        value, including families that assign it after ``super().__init__``.
+        When both spellings are present, a transformers-written config follows
+        transformers (``rope_parameters`` wins), while an EasyDeL-saved config
+        keeps the top-level value it ran with (older EasyDeL saves could leave
+        a stale ``rope_parameters`` theta behind) and the dict is aligned to it.
+        ``partial_rotary_factor`` is only lifted for constructors that accept it
+        (or when it is already top-level).
+
+        Args:
+            config_dict: Serialized configuration mapping.
+            **kwargs: Forwarded to :meth:`transformers.PretrainedConfig.from_dict`.
+
+        Returns:
+            The instantiated configuration (or ``(config, unused_kwargs)``
+            when ``return_unused_kwargs=True``).
+        """
+        rope_parameters = config_dict.get("rope_parameters") if isinstance(config_dict, dict) else None
+        if cls._is_flat_rope_parameters(rope_parameters):
+            config_dict = dict(config_dict)
+            rope_parameters = dict(rope_parameters)
+            init_parameters = inspect.signature(cls.__init__).parameters
+            easydel_saved = any(key in config_dict for key in ("attn_mechanism", "sharding_axis_dims"))
+            for key in ("rope_theta", "partial_rotary_factor"):
+                if rope_parameters.get(key) is None:
+                    continue
+                if easydel_saved and config_dict.get(key) is not None:
+                    rope_parameters[key] = config_dict[key]
+                elif key == "rope_theta" or key in init_parameters or key in config_dict:
+                    config_dict[key] = rope_parameters[key]
+            config_dict["rope_parameters"] = rope_parameters
+        return super().from_dict(config_dict, **kwargs)
 
     @staticmethod
     def _normalize_rope_parameters_dict(
@@ -1111,6 +1212,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         """
         for key in _REMOVED_BASE_CONFIG_KEYS:
             kwargs.pop(key, None)
+        kwargs.pop(_ROPE_FIELDS_SYNCED_ATTR, None)
 
         self.sharding_axis_dims = getattr(self, "sharding_axis_dims", sharding_axis_dims)
         self.sharding_dcn_axis_dims = getattr(self, "sharding_dcn_axis_dims", sharding_dcn_axis_dims)
@@ -1257,6 +1359,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         # don't pass them explicitly to super().__init__.
         self._ensure_hf_compat_fields(kwargs)
         self._ensure_rope_context_fields(kwargs)
+        self._sync_rope_fields_from_parameters(kwargs.get("rope_parameters"))
         self._ensure_rope_parameters(kwargs)
 
         if self.kv_cache_quantization_config is not None and self.use_sharded_kv_caching:
@@ -1269,6 +1372,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
         self._external_rope_config_kwargs = getattr(self, "_external_rope_config_kwargs", {})
         super().__init__(**kwargs)
+        object.__setattr__(self, _ROPE_FIELDS_SYNCED_ATTR, True)
 
     @staticmethod
     def create_mesh(
@@ -2560,6 +2664,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
         try:
             result = copy.deepcopy(self.__dict__)
+            result.pop(_ROPE_FIELDS_SYNCED_ATTR, None)
             if hasattr(self.__class__, "model_type"):
                 result["model_type"] = self.__class__.model_type
 
@@ -3072,10 +3177,23 @@ class EasyDeLBaseConfig(PretrainedConfig):
         """
         from easydel.layers import RopeConfig
 
-        if not hasattr(self, "rope_scaling") or self.rope_scaling is None:
+        rope_scaling = getattr(self, "rope_scaling", None)
+        if isinstance(rope_scaling, dict) and rope_scaling and not self._is_flat_rope_parameters(rope_scaling):
+            # Per-layer-type mapping (HF v5 Gemma3/OLMo3 style): the shared rotary
+            # builders serve the global layers, so use the ``full_attention`` entry.
+            # Local layers build their own (unscaled) tables. Types the shared
+            # builders do not implement (e.g. Gemma4 ``proportional``, built by the
+            # model itself) keep the previous unscaled fallback.
+            full_attention = rope_scaling.get("full_attention")
+            rope_scaling = None
+            if isinstance(full_attention, dict):
+                full_rope_type = full_attention.get("rope_type", full_attention.get("type", "default"))
+                if full_rope_type in {"default", "linear", "dynamic", "yarn", "deepseek_yarn", "llama3", "longrope"}:
+                    rope_scaling = full_attention
+        if not isinstance(rope_scaling, dict) or not rope_scaling:
             config = RopeConfig()
         else:
-            config = RopeConfig.from_dict(self.rope_scaling)
+            config = RopeConfig.from_dict(rope_scaling)
 
         if config.original_max_position_embeddings is None:
             config.original_max_position_embeddings = getattr(self, "original_max_position_embeddings", None)
@@ -3202,8 +3320,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         tensors (cos and sin of position * inv_freq) and places them on the
         configured device mesh with appropriate sharding.
 
-        The frequencies are cast to bfloat16 and sharded with a replicated
-        PartitionSpec for efficient distributed access.
+        The frequencies are kept in float32 (a bfloat16 cos/sin table costs
+        ~1e-3 relative attention error at every position past the first) and
+        sharded with a replicated PartitionSpec.
 
         Args:
             head_size (int, optional): Attention head dimension size.
@@ -3218,8 +3337,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
                 on the device mesh with NamedSharding for efficient distributed access.
 
         Note:
-            The returned frequencies are in bfloat16 format for memory efficiency
-            and are replicated across all devices (PartitionSpec()).
+            The returned frequencies are float32 and replicated across all
+            devices (PartitionSpec()); the rotary kernels cast their outputs back
+            to the activation dtype.
         """
         from easydel.layers import get_frequencies
 
@@ -3237,7 +3357,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             base=base or self.rope_theta,
             rope_scaling=rope_config.to_dict(),
             partial_rotary_factor=partial_rotary_factor,
-        ).astype(jnp.bfloat16)
+        ).astype(jnp.float32)
 
         return ModuleCaches(spx.with_sharding_constraint(frequencies, Ps(), mesh=self.mesh, ignore_mpmd=True))
 

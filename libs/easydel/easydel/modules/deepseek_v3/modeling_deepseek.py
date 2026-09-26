@@ -537,6 +537,7 @@ class DeepseekV3MoE(BaseMoeModule):
         n_routed_experts: int,
         norm_topk_prob: bool,
         routed_scaling_factor: float,
+        e_score_correction_bias: Array | None = None,
     ) -> tuple[Array, Array]:
         """DeepSeek-V3 ``noaux_tc`` grouped top-k over the gate's full-expert choice scores.
 
@@ -557,6 +558,11 @@ class DeepseekV3MoE(BaseMoeModule):
         score_mask = jnp.repeat(group_mask[:, :, None], n_routed_experts // n_group, axis=2).reshape(token_count, -1)
         masked_scores = jnp.where(score_mask > 0, scores_for_choice, 0.0)
         topk_weight, topk_idx = jax.lax.top_k(masked_scores, k=k)
+        if e_score_correction_bias is not None:
+            # The bias steers selection only; combine weights are the raw sigmoid scores.
+            topk_weight = jnp.take_along_axis(
+                scores_for_choice - e_score_correction_bias.astype(jnp.float32), topk_idx, axis=-1
+            )
         if k > 1 and norm_topk_prob:
             topk_weight = topk_weight / (jnp.sum(topk_weight, axis=-1, keepdims=True) + 1e-20)
         topk_weight = topk_weight * routed_scaling_factor
@@ -573,6 +579,12 @@ class DeepseekV3MoE(BaseMoeModule):
                 - Expert output tensor of shape (batch_size, sequence_length, hidden_dim)
                 - Router logits for auxiliary loss computation
         """
+        # Bind the live correction bias per call (a value captured in __init__
+        # would freeze the initial one).
+        select_hook = functools.partial(
+            self.moe_hooks.select_hook,
+            e_score_correction_bias=self.gate.e_score_correction_bias.value,
+        )
         out, router_logits = self.moe_call(
             hidden_state=hidden_states,
             gate_layer=self.gate,
@@ -580,6 +592,7 @@ class DeepseekV3MoE(BaseMoeModule):
             gate_up_kernel=self.experts.gate_up_proj.kernel_view(),
             wd_kernel=self.experts.down_proj.kernel_view(),
             act_fn=self.experts.act_fn,
+            hooks=self.moe_hooks.replace(select_hook=select_hook),
         )
         if self.config.n_shared_experts is not None:
             out = out + self.shared_experts(hidden_states)

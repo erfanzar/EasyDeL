@@ -213,6 +213,107 @@ class TestCLIP:
 
         cleanup_models(hf_model)
 
+    def test_clip_model_forward_with_attention_mask(self, small_model_config):
+        """CLIPModel.forward / get_text_features accept a padded ``attention_mask`` and match HF.
+
+        Regression: both passed ``attention_mask=`` to ``CLIPTextTransformer.forward``
+        (no such parameter -> TypeError) and built positions as
+        ``cumsum(mask) - 1`` instead of HF's ``arange``.
+        """
+        config = ed.CLIPConfig(
+            text_config=dict(
+                vocab_size=small_model_config["vocab_size"],
+                hidden_size=128,
+                intermediate_size=256,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                max_position_embeddings=77,
+                eos_token_id=small_model_config["vocab_size"] - 1,
+            ),
+            vision_config=dict(
+                hidden_size=128,
+                intermediate_size=256,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                image_size=56,
+                patch_size=14,
+            ),
+            projection_dim=64,
+        )
+        setup_config(config.text_config, small_model_config)
+        setup_config(config.vision_config, small_model_config)
+        config = setup_config(config, small_model_config)
+        hf_model = create_hf_model(transformers.CLIPModel, config)
+
+        batch_size = small_model_config["batch_size"]
+        seq_len = 16
+        rng = np.random.default_rng(42)
+        vocab_size = config.text_config.vocab_size
+        eos_marker = config.text_config.eos_token_id
+        assert eos_marker == vocab_size - 1
+        input_ids_np = rng.integers(3, vocab_size - 1, size=(batch_size, seq_len), dtype=np.int64)
+        attention_mask_np = np.ones((batch_size, seq_len), dtype=np.int64)
+        attention_mask_np[1, 10:] = 0  # right-padded second row
+        input_ids_np[1, 10:] = 0
+        input_ids_np[0, -1] = eos_marker
+        input_ids_np[1, 9] = eos_marker  # pooled token sits on a valid (unpadded) position
+        pixel_values_np = rng.standard_normal(
+            (batch_size, 3, config.vision_config.image_size, config.vision_config.image_size), dtype=np.float32
+        )
+
+        with torch.no_grad():
+            hf_out = hf_model(
+                input_ids=torch.from_numpy(input_ids_np),
+                attention_mask=torch.from_numpy(attention_mask_np),
+                pixel_values=torch.from_numpy(pixel_values_np),
+            )
+            hf_text_features = hf_model.get_text_features(
+                input_ids=torch.from_numpy(input_ids_np),
+                attention_mask=torch.from_numpy(attention_mask_np),
+            )
+        hf_text_features = getattr(hf_text_features, "pooler_output", hf_text_features).numpy()
+
+        with config.mesh:
+            ed_model = create_ed_model(
+                module_name="clip",
+                task=ed.TaskType.ZERO_SHOT_IMAGE_CLASSIFICATION,
+                config=config,
+                small_model_config=small_model_config,
+                hf_model=hf_model,
+            )
+            ed_out = ed_model(
+                input_ids=jnp.asarray(input_ids_np),
+                attention_mask=jnp.asarray(attention_mask_np, dtype=jnp.bool_),
+                pixel_values=jnp.asarray(pixel_values_np),
+            )
+            ed_text_features = ed_model.get_text_features(
+                input_ids=jnp.asarray(input_ids_np),
+                attention_mask=jnp.asarray(attention_mask_np, dtype=jnp.bool_),
+            )
+
+            _, position_ids = ed_model._prepare_text_inputs(
+                jnp.asarray(input_ids_np), jnp.asarray(attention_mask_np, dtype=jnp.bool_), None, None
+            )
+            np.testing.assert_array_equal(
+                np.asarray(position_ids), np.broadcast_to(np.arange(seq_len), (batch_size, seq_len))
+            )
+
+            valid = attention_mask_np.astype(bool)
+            np.testing.assert_allclose(
+                np.asarray(ed_out.text_model_output.last_hidden_state)[valid],
+                hf_out.text_model_output.last_hidden_state.numpy()[valid],
+                atol=5e-2,
+                rtol=0,
+            )
+            np.testing.assert_allclose(np.asarray(ed_out.text_embeds), hf_out.text_embeds.numpy(), atol=2e-2, rtol=0)
+            np.testing.assert_allclose(np.asarray(ed_out.image_embeds), hf_out.image_embeds.numpy(), atol=2e-2, rtol=0)
+            np.testing.assert_allclose(
+                np.asarray(ed_out.logits_per_image), hf_out.logits_per_image.numpy(), atol=0.25, rtol=0
+            )
+            np.testing.assert_allclose(np.asarray(ed_text_features), hf_text_features, atol=5e-2, rtol=0)
+
+        cleanup_models(hf_model)
+
 
 if __name__ == "__main__":
     import pytest

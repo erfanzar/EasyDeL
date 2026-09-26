@@ -363,7 +363,8 @@ class VanillaAttn(OperationImpl):
             if isinstance(sliding_window, tuple):
                 left_window, right_window = sliding_window
             else:
-                left_window = right_window = sliding_window
+                # An int is a window *size* (HF convention): the query plus its ``W - 1`` neighbours.
+                left_window = right_window = max(sliding_window - 1, 0)
             valid = valid & (kv_positions[:, None, :] >= q_positions[:, :, None] - int(left_window))
             valid = valid & (kv_positions[:, None, :] <= q_positions[:, :, None] + int(right_window))
 

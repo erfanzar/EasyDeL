@@ -2088,17 +2088,6 @@ class Qwen3VLMoeForConditionalGeneration(BaseVisionLanguageModule[Qwen3VLMoeMode
             aux_loss=aux_loss,
         )
 
-    def apply_lm_head(self, hidden_states: Array) -> Array:
-        """Apply the language modeling head.
-
-        Args:
-            hidden_states (Array): Hidden states from the model.
-
-        Returns:
-            Array: Logits over vocabulary.
-        """
-        return self.lm_head(hidden_states)
-
     def get_vision_tower(self) -> spx.Module:
         """Get the vision tower component.
 

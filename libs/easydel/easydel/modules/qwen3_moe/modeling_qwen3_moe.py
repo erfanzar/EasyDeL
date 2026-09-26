@@ -360,12 +360,9 @@ class Qwen3MoeAttention(UnifiedAttention):
             rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the model for sliding window configuration.
         """
+        # HF Qwen3-MoE applies the window to every layer when ``use_sliding_window``.
         sliding_window = config.sliding_window
-        if not (
-            config.use_sliding_window
-            and getattr(config, "sliding_window", None) is not None
-            and layer_idx >= config.max_window_layers
-        ):
+        if not (config.use_sliding_window and getattr(config, "sliding_window", None) is not None):
             sliding_window = None
 
         super().__init__(

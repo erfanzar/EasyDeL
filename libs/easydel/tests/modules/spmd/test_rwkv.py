@@ -16,13 +16,19 @@
 
 import easydel as ed
 import pytest
+import spectrax as spx
 import transformers
 from easydel.modules.rwkv import RwkvConfig
 
 try:
-    from tests.modules.test_utils import CausalLMTester
+    from tests.modules.test_utils import CausalLMTester, setup_config
+    from tests.modules.test_utils.model_factory import cleanup_models, create_hf_model
 except ImportError:
-    from tests.modules.test_utils import CausalLMTester  # pyright: ignore[reportImplicitRelativeImport]
+    from tests.modules.test_utils import CausalLMTester, setup_config  # pyright: ignore[reportImplicitRelativeImport]
+    from tests.modules.test_utils.model_factory import (  # pyright: ignore[reportImplicitRelativeImport]
+        cleanup_models,
+        create_hf_model,
+    )
 
 
 class TestRWKV:
@@ -63,6 +69,26 @@ class TestRWKV:
             max_new_tokens=16,
         )
         assert result.success, f"RWKV generation failed: {result.error_message}"
+
+    def test_ln_out_uses_torch_default_eps(self, rwkv_config, small_model_config):
+        """``ln_out`` mirrors HF's bare ``nn.LayerNorm(hidden_size)`` (eps=1e-5), not ``layer_norm_epsilon``."""
+        rwkv_config.layer_norm_epsilon = 1e-3
+        config = setup_config(rwkv_config, small_model_config)
+        hf_model = create_hf_model(transformers.RwkvModel, config)
+        assert hf_model.ln_out.eps == 1e-5
+
+        _, module_class = ed.get_modules_by_type("rwkv", ed.TaskType.BASE_MODULE)
+        with config.mesh:
+            ed_model = module_class.lazy_init(
+                config=config,
+                dtype=small_model_config["dtype"],
+                param_dtype=small_model_config["dtype"],
+                precision=small_model_config["precision"],
+                rngs=spx.Rngs(0),
+            )
+        assert ed_model.ln_out.epsilon == hf_model.ln_out.eps
+
+        cleanup_models(hf_model)
 
 
 if __name__ == "__main__":

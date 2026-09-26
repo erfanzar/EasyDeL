@@ -539,11 +539,17 @@ class ParallelMoELinear(spx.Module):
                 inputs, rule=quant_rule, contracting_axes=(inputs.ndim - 1,), is_weight=False
             )
 
+        # Accumulate in the compute dtype: a hard bf16 output rounded every f32
+        # expert projection to bf16. An f32 grouped matmul at the default
+        # precision is also a single bf16 MXU pass, so f32 runs at HIGHEST (the
+        # fused MoE path does the same); bf16 operands keep the default.
+        compute_f32 = jnp.dtype(inputs.dtype) == jnp.float32
         output = grouped_matmul(
             inputs,
             weight,
             group_sizes,
-            preferred_element_type=jnp.bfloat16,
+            preferred_element_type=jnp.float32 if compute_f32 else jnp.bfloat16,
+            precision=jax.lax.Precision.HIGHEST if compute_f32 else jax.lax.Precision.DEFAULT,
             transpose_rhs=self.out_first,
             platform="xla",
             cfg=GroupedMatmulConfig(bypass_xla_tiling=True),

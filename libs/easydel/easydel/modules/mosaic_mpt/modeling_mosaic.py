@@ -169,8 +169,9 @@ class MptAttention(UnifiedAttention):
       before softmax. The slopes ``m_h`` form a geometric sequence capped
       by ``alibi_bias_max`` and are precomputed once per model in
       :func:`build_mpt_alibi_tensor`.
-    * **Optional QK-LayerNorm** (``qk_ln``) applied to Q and K before the
-      score computation for training stability.
+    * **Optional QKV clipping** (``attn_config.clip_qkv``): the fused QKV
+      activations are clamped to ``[-clip_qkv, clip_qkv]`` as in HF.
+      (``attn_config.qk_ln`` is ignored, as it is by HF's MPT port.)
     * **No bias** on Wqkv / out_proj when ``no_bias`` is set (the default).
 
     The module overrides ``forward_alibi`` on :class:`UnifiedAttention` so
@@ -334,6 +335,10 @@ class MptAttention(UnifiedAttention):
         batch_size, sequence_length = hidden_states.shape[:2]
 
         mixed_qkv = checkpoint_name(self.Wqkv(hidden_states), "attn_qkv")
+        clip_qkv = getattr(self.config.attn_config, "clip_qkv", None)
+        if clip_qkv:
+            # HF MPT clamps the fused QKV activations to ``[-clip_qkv, clip_qkv]``.
+            mixed_qkv = jnp.clip(mixed_qkv, -clip_qkv, clip_qkv)
         query_states, key_states, value_states = jnp.split(mixed_qkv, 3, -1)
 
         query_states = rearrange(query_states, "b s (h d) -> b s h d", h=self.config.n_heads)
@@ -367,27 +372,12 @@ class MptAttention(UnifiedAttention):
         else:
             alibi_bias = alibi
 
-        alibi_bias = jnp.asarray(alibi_bias, dtype=self.dtype)
-        if alibi_bias.ndim == 3:
-            alibi_bias = alibi_bias[None, ...]
-        elif alibi_bias.ndim == 2:
-            alibi_bias = alibi_bias[None, :, None, :]
-
-        q_len = query_states.shape[1]
-        kv_len = key_states.shape[1]
-
-        if alibi_bias.shape[-1] != kv_len:
-            start_k = max(0, alibi_bias.shape[-1] - kv_len)
-            alibi_bias = alibi_bias[..., start_k:]
-
-        if alibi_bias.shape[0] == 1 and batch_size != 1:
-            alibi_bias = jnp.broadcast_to(alibi_bias, (batch_size, *alibi_bias.shape[1:]))
-
-        if alibi_bias.shape[-2] == 1 and q_len != 1:
-            alibi_bias = jnp.broadcast_to(alibi_bias, (*alibi_bias.shape[:-2], q_len, kv_len))
-        elif alibi_bias.shape[-2] != q_len:
-            start_q = max(0, alibi_bias.shape[-2] - q_len)
-            alibi_bias = alibi_bias[..., start_q:, :]
+        alibi_bias = self._fit_alibi_bias(
+            alibi_bias,
+            batch_size=batch_size,
+            q_len=query_states.shape[1],
+            kv_len=key_states.shape[1],
+        )
 
         attention = self.attention_performer.forward(
             query_states=query_states,

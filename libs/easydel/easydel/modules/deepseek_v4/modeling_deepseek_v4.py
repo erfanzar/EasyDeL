@@ -2284,9 +2284,9 @@ class DeepseekV4HashRouter(DeepseekV4TopKRouter):
 
     Expert *indices* come from the frozen ``tid2eid[input_ids]`` lookup table;
     the learned gate still provides the scores that weight the selected
-    experts. ``tid2eid`` is stored in ``param_dtype`` (checkpoint values are
-    small integer expert ids, exactly representable) and cast to int32 at
-    lookup time.
+    experts. ``tid2eid`` is stored in float32 (expert ids are exact up to
+    2**24; bf16 would round odd ids above 256) and cast to int32 at lookup
+    time.
 
     Selection never consults ``e_score_correction_bias`` here, and DeepSeek
     does not ship one for these layers, so the parameter is not declared.
@@ -2313,9 +2313,11 @@ class DeepseekV4HashRouter(DeepseekV4TopKRouter):
             rngs: Random number generators.
         """
         super().__init__(config, dtype=dtype, param_dtype=param_dtype, precision=precision, rngs=rngs)
+        # float32, not param_dtype: bf16 holds only even integers past 256, and
+        # V4-Pro routes over 384 experts.
         self.tid2eid = ArrayParam.bound(
             shape=(config.vocab_size, self.top_k),
-            dtype=param_dtype,
+            dtype=jnp.float32,
             init_method="zeros",
             key=rngs.param,
         )

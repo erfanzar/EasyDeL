@@ -178,6 +178,7 @@ class CLIPVisionEmbeddings(EasyDeLLayerStackMixin, spx.Module):
             use_bias=False,
             dtype=dtype,
             rngs=rngs,
+            precision=precision,
         )
 
         self.num_patches = (image_size // patch_size) ** 2
@@ -1585,7 +1586,7 @@ class CLIPModel(EasyDeLBaseModule):
             mask_info: Pre-computed mask information for text. If provided, overrides
                 `attention_mask`.
             position_ids: Explicit position indices of shape (batch_size, sequence_length)
-                for text. Auto-generated from attention_mask if not provided.
+                for text. Defaults to ``arange(sequence_length)`` (HF CLIP semantics).
             output_attentions: Whether to return attention weights from vision and text encoders.
             output_hidden_states: Whether to return hidden states from all layers of both encoders.
 
@@ -1599,10 +1600,7 @@ class CLIPModel(EasyDeLBaseModule):
                 - text_model_output: Full output from text encoder including hidden states
                 - vision_model_output: Full output from vision encoder including hidden states
         """
-        if attention_mask is None and input_ids is not None:
-            attention_mask = jnp.ones_like(input_ids)
-        if position_ids is None and attention_mask is not None:
-            position_ids = attention_mask.cumsum(-1) - 1
+        mask_info, position_ids = self._prepare_text_inputs(input_ids, attention_mask, mask_info, position_ids)
 
         vision_outputs = self.vision_model(
             pixel_values=pixel_values,
@@ -1612,7 +1610,6 @@ class CLIPModel(EasyDeLBaseModule):
 
         text_outputs = self.text_model(
             input_ids=input_ids,
-            attention_mask=attention_mask,
             mask_info=mask_info,
             position_ids=position_ids,
             output_attentions=output_attentions,
@@ -1641,6 +1638,27 @@ class CLIPModel(EasyDeLBaseModule):
             vision_model_output=vision_outputs,
         )
 
+    @staticmethod
+    def _prepare_text_inputs(
+        input_ids: Int[Array, "batch seq_len"],
+        attention_mask: Bool[Array, "batch seq_len"] | None,
+        mask_info: MaskInfo | None,
+        position_ids: Int[Array, "batch seq_len"] | None,
+    ) -> tuple[MaskInfo, Int[Array, "batch seq_len"]]:
+        """Build the text tower's ``mask_info``/``position_ids`` like :class:`CLIPTextModel`.
+
+        HF CLIP always uses ``arange`` positions (independent of padding) and
+        folds ``attention_mask`` into the causal text mask.
+        """
+        batch_size, seq_len = input_ids.shape
+        if position_ids is None:
+            position_ids = jnp.broadcast_to(jnp.arange(seq_len, dtype=jnp.int32)[None, :], (batch_size, seq_len))
+        if mask_info is None:
+            if attention_mask is None:
+                attention_mask = jnp.ones((batch_size, seq_len), dtype=jnp.bool_)
+            mask_info = MaskInfo.from_attention_mask(attention_mask.astype(jnp.bool_))
+        return mask_info, position_ids
+
     def get_text_features(
         self,
         input_ids: Int[Array, "batch seq_len"],
@@ -1662,9 +1680,9 @@ class CLIPModel(EasyDeLBaseModule):
         Returns:
             Projected text features of shape (batch_size, projection_dim).
         """
+        mask_info, position_ids = self._prepare_text_inputs(input_ids, attention_mask, mask_info, position_ids)
         text_outputs = self.text_model(
             input_ids=input_ids,
-            attention_mask=attention_mask,
             mask_info=mask_info,
             position_ids=position_ids,
         )

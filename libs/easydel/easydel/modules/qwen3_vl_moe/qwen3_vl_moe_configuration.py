@@ -122,7 +122,8 @@ class Qwen3VLMoeTextConfig(EasyDeLBaseConfig):
         rms_norm_eps: RMSNorm epsilon. Defaults to 1e-6.
         use_cache: Whether to use KV cache. Defaults to True.
         tie_word_embeddings: Whether to tie embeddings. Defaults to False.
-        rope_theta: RoPE base frequency. Defaults to 1000000.0.
+        rope_theta: RoPE base frequency. Defaults to ``rope_scaling["rope_theta"]``
+            (or ``rope_parameters["rope_theta"]``), else 1000000.0.
         attention_bias: Whether to use attention bias. Defaults to False.
         attention_dropout: Attention dropout rate. Defaults to 0.0.
         rope_scaling: RoPE scaling configuration. Defaults to None.
@@ -158,7 +159,7 @@ class Qwen3VLMoeTextConfig(EasyDeLBaseConfig):
         rms_norm_eps: float = 1e-6,
         use_cache: bool = True,
         tie_word_embeddings: bool = False,
-        rope_theta: float = 1000000.0,
+        rope_theta: float | None = None,
         attention_bias: bool = False,
         attention_dropout: float = 0.0,
         rope_scaling: dict | None = None,
@@ -185,6 +186,13 @@ class Qwen3VLMoeTextConfig(EasyDeLBaseConfig):
         instead of the routed MoE block. ``**kwargs`` are forwarded to
         :class:`EasyDeLBaseConfig`.
         """
+        # transformers>=5 serializes the RoPE dict (incl. ``mrope_section``,
+        # ``mrope_interleaved`` and ``rope_theta``) as ``rope_parameters``; and
+        # ``rope_scaling`` is a property aliasing it, so it must not be reset below.
+        if rope_scaling is None and isinstance(kwargs.get("rope_parameters"), dict):
+            rope_scaling = dict(kwargs["rope_parameters"])
+        if rope_theta is None:
+            rope_theta = (rope_scaling or {}).get("rope_theta") or 1000000.0
         super().__init__(**kwargs)
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
@@ -210,7 +218,8 @@ class Qwen3VLMoeTextConfig(EasyDeLBaseConfig):
         self.decoder_sparse_step = decoder_sparse_step
         self.moe_intermediate_size = moe_intermediate_size
         self.num_experts_per_tok = num_experts_per_tok
-        self.num_experts = num_experts
+        # transformers>=5 serializes the expert count as `num_local_experts`.
+        self.num_experts = kwargs.pop("num_local_experts", num_experts)
         self.norm_topk_prob = norm_topk_prob
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef

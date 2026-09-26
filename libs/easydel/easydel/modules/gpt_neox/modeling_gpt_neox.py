@@ -55,7 +55,7 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput, DecoderLayerOutput
 from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
-from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear, dense_qkv_layout
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
 from easydel.layers.norms import LayerNorm
 from easydel.modules._base import BaseCausalLMModule
@@ -131,6 +131,65 @@ class GPTNeoXAttention(UnifiedAttention):
             attention_type="standard",
             causal=True,
         )
+
+    def _create_fused_qkv_proj(self, config: GPTNeoXConfig, dtype, param_dtype, precision, rngs):
+        """Build the fused ``query_key_value`` projection over HF's single fused tensor.
+
+        HF GPT-NeoX stores one ``query_key_value`` tensor (not separate q/k/v),
+        so the layout is declared ``source_is_fused``; :attr:`reform_param`
+        reorders its per-head packing into the contiguous ``[Q | K | V]``
+        runtime layout.
+        """
+        qkv_layout = dense_qkv_layout(
+            self.num_heads * self.head_dim,
+            self.num_key_value_heads * self.head_dim,
+            source_is_fused=True,
+        )
+        return ColumnParallelLinear(
+            config.hidden_size,
+            qkv_layout.segment_sizes,
+            rngs=rngs,
+            use_bias=bool(getattr(config, "attention_bias", True)),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            layout=qkv_layout,
+        )
+
+    @property
+    def reform_param(self):
+        """Reorder HF's per-head ``query_key_value`` into EasyDeL's ``[Q | K | V]``.
+
+        HF views the fused output as ``(num_heads, 3 * head_dim)`` and chunks each
+        head into q/k/v, i.e. the checkpoint rows are ordered ``(head, {q,k,v}, dim)``.
+        The runtime splits one contiguous ``[Q_all | K_all | V_all]`` tensor, so
+        rows are permuted on load (and back on export) around the prefused layout
+        rule, which owns the TP interleave and the transpose.
+        """
+        qkv_attr = self._projection_attr("query_key_value_projection")
+        rules = self.query_key_value_projection.build_reform_param(
+            qkv_attr,
+            config=self.config,
+            include_bias=bool(getattr(self.config, "attention_bias", True)),
+        )
+        heads, head_dim = self.num_heads, self.head_dim
+
+        def _per_head_to_contiguous(tensor):
+            rest = tensor.shape[1:]
+            return tensor.reshape(heads, 3, head_dim, *rest).transpose(0, 1).reshape(tensor.shape)
+
+        def _contiguous_to_per_head(tensor):
+            rest = tensor.shape[1:]
+            return tensor.reshape(3, heads, head_dim, *rest).transpose(0, 1).reshape(tensor.shape)
+
+        for rule in rules.values():
+            split, inverse = rule["splits"][0]["spliter"], rule["inverse_spliter"]
+            rule["splits"][0]["spliter"] = lambda tensor, split=split: split(_per_head_to_contiguous(tensor))
+            rule["inverse_spliter"] = lambda torch, tensor, inverse=inverse: _contiguous_to_per_head(
+                inverse(torch, tensor)
+            ).contiguous()
+        return rules
 
     def _create_rotary(self, config: GPTNeoXConfig, dtype: jnp.dtype):
         """Create GPT-NeoX specific rotary embedding with partial RoPE.

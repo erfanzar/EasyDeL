@@ -625,9 +625,13 @@ class SequenceLengthPoolingFeature:
         elif self.strategy == "last":
             # Use last non-padding token
             if attention_mask is not None:
-                lengths = jnp.sum(attention_mask.astype("i4"), axis=-1) - 1
-                lengths = jnp.maximum(lengths, 0)
-                return hidden_states[jnp.arange(batch_size), lengths]
+                # Rightmost attended position, so left- and right-padded rows both
+                # pool their final real token (``sum(mask) - 1`` is only right for right padding).
+                valid = attention_mask.astype(bool)
+                seq_len = valid.shape[-1]
+                last = (seq_len - 1) - jnp.argmax(valid[:, ::-1], axis=-1)
+                last = jnp.where(jnp.any(valid, axis=-1), last, 0)
+                return hidden_states[jnp.arange(batch_size), last]
 
             if input_ids is None:
                 raise ValueError("input_ids required for 'last' pooling strategy")

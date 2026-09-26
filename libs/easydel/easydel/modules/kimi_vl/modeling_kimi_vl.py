@@ -56,7 +56,7 @@ from easydel.infra.utils import auto_remat
 from easydel.layers import ParallelLinear
 from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.norms import LayerNorm
-from easydel.modules._base import BaseVisionLanguageModule
+from easydel.modules._base import BaseVisionLanguageModule, torch_bicubic_resize
 
 from ..deepseek_v3.modeling_deepseek import DeepseekV3ForCausalLM
 from .kimi_vl_configuration import KimiVLConfig, MoonViTConfig
@@ -144,14 +144,15 @@ class Learnable2DInterpPosEmb(spx.Module):
     """Learnable 2D positional embeddings with resolution interpolation.
 
     This module provides learnable position embeddings that can be interpolated
-    to different spatial resolutions. Uses cubic interpolation by default for
-    smooth scaling to arbitrary image sizes.
+    to different spatial resolutions. Resizing matches the reference MoonViT
+    ``F.interpolate(mode="bicubic")`` exactly (see :func:`torch_bicubic_resize`).
 
     Attributes:
         height (int): Base height for learned position embeddings.
         width (int): Base width for learned position embeddings.
         dim (int): Embedding dimension for each position.
-        interpolation_mode: Interpolation method for resizing (default: CUBIC).
+        interpolation_mode: Retained for API compatibility; resizing always uses
+            torch-exact bicubic interpolation.
     """
 
     def __init__(
@@ -171,8 +172,9 @@ class Learnable2DInterpPosEmb(spx.Module):
             height (int): Base height for the position embedding grid.
             width (int): Base width for the position embedding grid.
             dim (int): Embedding dimension for each spatial position.
-            interpolation_mode (jax.image.ResizeMethod, optional): Method for
-                interpolating to different resolutions. Defaults to CUBIC.
+            interpolation_mode (jax.image.ResizeMethod, optional): Retained for
+                API compatibility; resizing always uses torch-exact bicubic
+                interpolation (the reference MoonViT behavior).
             dtype (jnp.dtype, optional): Data type for computation.
                 Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters.
@@ -211,12 +213,10 @@ class Learnable2DInterpPosEmb(spx.Module):
             if (h, w) == (self.height, self.width):
                 pos_embs.append(kernel.reshape(-1, self.dim))
             else:
-                resized = jax.image.resize(
-                    kernel,
-                    shape=(h, w, self.dim),
-                    method=self.interpolation_mode,
-                    antialias=True,
-                )
+                # MoonViT uses torch ``F.interpolate(mode="bicubic")`` (A=-0.75,
+                # align_corners=False, no antialias); ``jax.image.resize`` uses a
+                # different cubic kernel and antialiases when downsampling.
+                resized = torch_bicubic_resize(kernel, h, w)
                 pos_embs.append(resized.reshape(-1, self.dim))
         return x + jnp.concatenate(pos_embs, axis=0).astype(x.dtype)
 
@@ -281,6 +281,7 @@ class MoonVisionPatchEmbed(spx.Module):
             use_bias=True,
             dtype=dtype,
             rngs=rngs,
+            precision=precision,
         )
 
         self.pos_emb = Learnable2DInterpPosEmb(

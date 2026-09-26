@@ -209,10 +209,11 @@ class Exaone4Attention(UnifiedAttention):
     def _create_rotary(self, config: Exaone4Config, dtype: jnp.dtype):
         """Create rotary embedding based on layer type (NoPE for full attention).
 
-        This implements the key NoPE (No Position Embedding) feature: full attention
-        layers return a dummy function that passes query/key unchanged, effectively
-        skipping RoPE entirely in those layers. Sliding attention layers use standard
-        RoPE for local position awareness.
+        This implements the key NoPE (No Position Embedding) feature: in hybrid
+        models (``config.sliding_window`` set) full attention layers return a dummy
+        function that passes query/key unchanged, effectively skipping RoPE entirely
+        in those layers. Sliding attention layers, and every layer of a model with
+        no sliding window, use standard RoPE (as in HF).
 
         Args:
             config (Exaone4Config): Model configuration containing RoPE parameters.
@@ -227,8 +228,9 @@ class Exaone4Attention(UnifiedAttention):
             """Dummy RoPE function that returns query/key unchanged (NoPE)."""
             return query, key
 
-        if not self.is_sliding:
-            # Full attention layer: Return dummy function (NoPE - No Position Embedding)
+        if not self.is_sliding and getattr(config, "sliding_window", None) is not None:
+            # Full attention layer of a hybrid (sliding + global) model: NoPE. Without a
+            # sliding window (e.g. EXAONE-4.0-1.2B) HF applies RoPE on every layer.
             return _dummy
         # Sliding attention layer: Use standard RoPE
         return super()._create_rotary(config, dtype)

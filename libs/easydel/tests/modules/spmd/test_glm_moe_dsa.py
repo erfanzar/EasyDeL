@@ -85,14 +85,14 @@ class TestGLMMoeDSA:
             pretraining_tp=1,
             tie_word_embeddings=small_model_config["tie_word_embeddings"],
             rope_theta=small_model_config["rope_theta"],
-            rope_interleave=False,
+            rope_interleave=True,
             mlp_layer_types=None,
             attention_bias=small_model_config["attention_bias"],
             attention_dropout=small_model_config["attention_dropout"],
             index_topk=128,
             index_head_dim=16,
             index_n_heads=4,
-            indexer_rope_interleave=False,
+            indexer_rope_interleave=True,
         )
 
     def test_causal_lm(self, glm_moe_dsa_config, small_model_config, hf_glm_moe_dsa_class):
