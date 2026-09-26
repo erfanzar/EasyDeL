@@ -14,11 +14,11 @@
 
 """Tests for Mistral3 model."""
 
+import easydel as ed
 import jax.numpy as jnp
 import pytest
 import transformers
 
-import easydel as ed
 from tests.modules.mpmd._scheduler_utils import GENERATION_SCHEDULE_KIND, LOSS_SCHEDULE_KINDS
 from tests.modules.test_utils import CausalLMTester
 

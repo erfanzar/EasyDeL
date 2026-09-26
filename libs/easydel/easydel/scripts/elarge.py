@@ -390,9 +390,10 @@ def _serve_replicated(
 
     base_control_port = int(replicas_params.get("base_control_port", 19700))
     ready_timeout_s = float(replicas_params.get("ready_timeout_s", 1800.0))
-    auth_token = replicas_params.get("auth_token") or hashlib.sha256(
-        json.dumps(elm.to_dict(), sort_keys=True, default=str).encode()
-    ).hexdigest()
+    auth_token = (
+        replicas_params.get("auth_token")
+        or hashlib.sha256(json.dumps(elm.to_dict(), sort_keys=True, default=str).encode()).hexdigest()
+    )
 
     # The replicas own the accelerator; any incidental JAX use in this
     # router process must never grab the TPU (libtpu locks per chip).
@@ -756,13 +757,13 @@ def _run_action(elm: Any, name: str, value: Any | None) -> None:
                 import hashlib
                 import json as _json
 
-                auth = dist_section.get("distributed_auth_token") or hashlib.sha256(
-                    _json.dumps(elm.config, sort_keys=True, default=str).encode()
-                ).hexdigest()
+                auth = (
+                    dist_section.get("distributed_auth_token")
+                    or hashlib.sha256(_json.dumps(elm.config, sort_keys=True, default=str).encode()).hexdigest()
+                )
                 elm.set_esurge(coordination="zmq", distributed_auth_token=auth)
                 logger.info(
-                    "Multi-process serve: enabled esurge step coordination "
-                    "(coordination='zmq', %d processes, rank %d).",
+                    "Multi-process serve: enabled esurge step coordination (coordination='zmq', %d processes, rank %d).",
                     int(jax.process_count()),
                     int(jax.process_index()),
                 )

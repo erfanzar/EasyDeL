@@ -331,9 +331,7 @@ def quantize(array: Array, how: HowToQuantize) -> QArray:
         The quantized array.
     """
     calibration = calibrate(array, how)
-    scale, zero_point = compute_scale_zero_point(
-        calibration, how.qtype, power_of_two_scale=how.power_of_two_scale
-    )
+    scale, zero_point = compute_scale_zero_point(calibration, how.qtype, power_of_two_scale=how.power_of_two_scale)
     return quantize_with_scale_zero_point(array, how.qtype, scale, zero_point, how.noise_fn)
 
 

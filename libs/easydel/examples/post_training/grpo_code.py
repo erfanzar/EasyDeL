@@ -48,11 +48,10 @@ import re
 import subprocess
 from dataclasses import dataclass, field
 
-from datasets import load_dataset
-from eformer.aparser import DataClassArgumentParser
-
 import easydel as ed
+from datasets import load_dataset
 from easydel.infra.elarge import eLargeModel
+from eformer.aparser import DataClassArgumentParser
 
 
 @dataclass

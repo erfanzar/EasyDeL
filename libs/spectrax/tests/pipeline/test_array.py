@@ -10,7 +10,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from spectrax.runtime.types import StagesArray
 
 

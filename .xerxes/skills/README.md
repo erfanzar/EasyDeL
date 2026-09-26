@@ -79,8 +79,8 @@ Runbooks: `.xerxes/ops/OPS.md`. See also XERXES.md.
   SpxMesh, create_mesh, PartitionAxis, Partitio
 - **spectrax-transforms** — Work on SpectraX module-aware JAX transforms under libs/spectrax/spectrax/transforms. Use
   for spx.jit, grad, vmap, scan, remat, rng_axes, sp
-- **test-workspace** — Select and run correct EasyDeL workspace checks. Use for affected-package test planning, CPU JAX
-  env setup, import-layering checks, pre-comm
+- **test-workspace** — Select and run correct EasyDeL workspace checks. Use for affected-package test planning,
+  accelerator (TPU/GPU) test env setup, CPU-computation guard, import-layer
 - **tool-reasoning-parser** — Add, debug, or test EasyDeL tool-call and reasoning parsers for OpenAI-compatible
   inference. Use for ToolParserManager, ReasoningParserManag
 - **train-elarge** — Create, validate, run, or debug EasyDeL eLarge YAML training, evaluation, or serving configs. Use

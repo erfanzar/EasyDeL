@@ -68,6 +68,7 @@ import jax
 import numpy as np
 from jax import numpy as jnp
 from jax import random
+from jax._src.core import is_concrete
 from jax.interpreters import pxla
 from jax.sharding import PartitionSpec, Sharding, SingleDeviceSharding
 
@@ -705,7 +706,7 @@ def _try_hash_input(args, kws, must_be_concrete: bool = True):
         - Hashing fails for any reason (e.g. unhashable leaf types).
     """
     flat_vals, struct = jax.tree.flatten((args, kws))
-    all_concrete = all(jax.core.is_concrete(x) for x in flat_vals if isinstance(x, jax.Array))
+    all_concrete = all(is_concrete(x) for x in flat_vals if isinstance(x, jax.Array))
     if not all_concrete and must_be_concrete:
         return None
 
@@ -1096,7 +1097,7 @@ class FNAutotuner:
             """Extract the abstract type of a JAX array, or pass through non-array values."""
             return x if not isinstance(x, jax.Array) else jax.typeof(x)
 
-        if len(args) == 0 or all(x is None or jax.core.is_concrete(x) for x in jax.tree.leaves(args)):
+        if len(args) == 0 or all(x is None or is_concrete(x) for x in jax.tree.leaves(args)):
             resolved_args = args
         elif example_args is not None:
             if in_shardings is not None or device is not None:
@@ -1119,7 +1120,7 @@ class FNAutotuner:
                 lambda x, s: _get_random_value(_extract_array_type(x), s), args, normalized_shardings
             )
 
-        if len(kwargs) == 0 or all(v is None or jax.core.is_concrete(v) for v in kwargs.values()):
+        if len(kwargs) == 0 or all(v is None or is_concrete(v) for v in kwargs.values()):
             resolved_kwargs = kwargs
         elif example_kws is not None:
             resolved_kwargs = example_kws
@@ -1342,7 +1343,7 @@ class FNAutotuner:
 
             if optimal_hyperparams is None:
                 flat_vals = jax.tree.leaves((args, kws))
-                has_tracers = any(not jax.core.is_concrete(x) for x in flat_vals if isinstance(x, jax.Array))
+                has_tracers = any(not is_concrete(x) for x in flat_vals if isinstance(x, jax.Array))
                 if has_tracers:
                     if wrapped.optimal_hyperparams:
                         optimal_hyperparams = wrapped.optimal_hyperparams.copy()

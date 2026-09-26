@@ -17,7 +17,6 @@
 import jax
 import jax.numpy as jnp
 import pytest
-
 from ejkernel.kernels._xla.lightning_attn import lightning_attn
 
 

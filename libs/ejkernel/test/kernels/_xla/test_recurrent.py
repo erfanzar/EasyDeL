@@ -19,7 +19,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from ejkernel.kernels._xla import lightning_attn, recurrent, recurrent_gla
 from ejkernel.kernels._xla.recurrent._xla_impl_fwd import _recurrent_attention_fwd
 

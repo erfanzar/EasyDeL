@@ -20,13 +20,12 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 import pytest
-from jax import shard_map
-from jax.sharding import PartitionSpec
-
 from ejkernel.kernels import pallas
 from ejkernel.kernels._xla.attention import attention as vanilla_attention
 from ejkernel.ops import FwdParams
 from ejkernel.utils import numeric_gen
+from jax import shard_map
+from jax.sharding import PartitionSpec
 
 
 def _has_tpu() -> bool:

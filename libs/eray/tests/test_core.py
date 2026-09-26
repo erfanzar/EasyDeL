@@ -17,7 +17,6 @@
 import dataclasses
 
 import pytest
-
 from eray.core.cluster import HostInfo, MultisliceInfo, SliceInfo
 from eray.core.exceptions import ExceptionInfo
 from eray.core.sentinels import DONE, DoneSentinel, RefBox

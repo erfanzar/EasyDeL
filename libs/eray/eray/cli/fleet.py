@@ -375,13 +375,33 @@ def register(cli: click.Group) -> None:
             if name and cluster_name != name:
                 continue
             if record.state.startswith("HALTED") or record.state == "NEEDS_BOOTSTRAP":
-                registry.mutate_record(cluster_name, lambda r: setattr(r, "state", "UNKNOWN"))
+                registry.mutate_record(cluster_name, _clear_park_state)
                 cleared.append(cluster_name)
         success(
             "resumed"
             + (f" cluster {name}" if name else "")
             + (f"; cleared park state on {', '.join(cleared)}" if cleared else "")
         )
+
+
+def _clear_park_state(record: ClusterRecord) -> None:
+    """Un-park a cluster so the watcher acts on it again.
+
+    Resetting the state alone is not enough: the next tick would re-derive
+    the same halt from unchanged inputs. HALTED_BUDGET is re-tripped by the
+    recreate ring still inside the window, so an explicit resume clears it;
+    HALTED_QUOTA is re-tripped by the same FAILED queued resource, so the
+    resume acknowledges that QR and the watcher replaces it once (a fresh
+    quota failure on the replacement halts again).
+
+    Args:
+        record: The cluster record (mutated in place).
+    """
+    if record.state == "HALTED_BUDGET":
+        record.recreate_ts = []
+    elif record.state == "HALTED_QUOTA":
+        record.extra["resumed_qr"] = record.qr_id or record.name
+    record.state = "UNKNOWN"
 
 
 def _emit_result(result: dict, as_json: bool) -> None:

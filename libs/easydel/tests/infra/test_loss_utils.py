@@ -15,10 +15,9 @@
 import functools
 import types
 
+import easydel.infra.loss_utils as loss_utils_module
 import jax
 import jax.numpy as jnp
-
-import easydel.infra.loss_utils as loss_utils_module
 from easydel.infra.loss_utils import (
     ForCausalLMLoss,
     ForSequenceClassificationLoss,
@@ -131,10 +130,12 @@ def test_cross_entropy_blockwise_logits_respects_bf16_compute_dtype():
     )
     gradients = jax.grad(loss_fn)(logits)
 
-    assert total_loss.dtype == jnp.bfloat16
-    assert total_z_loss.dtype == jnp.bfloat16
-    assert weight_sum.dtype == jnp.bfloat16
-    assert accuracy.dtype == jnp.bfloat16
+    # The [N, V] math runs in bf16 (bf16 gradient), but token-reduced metrics are fp32
+    # accumulators regardless of the compute dtype (a bf16 running sum saturates).
+    assert total_loss.dtype == jnp.float32
+    assert total_z_loss.dtype == jnp.float32
+    assert weight_sum.dtype == jnp.float32
+    assert accuracy.dtype == jnp.float32
     assert gradients.dtype == jnp.bfloat16
 
 
@@ -257,6 +258,43 @@ def test_causal_lm_loss_chunked_lm_head_supports_fp32_compute_dtype_with_bf16_hi
     assert metrics.z_loss.dtype == jnp.float32
     assert metrics.weight_sum.dtype == jnp.float32
     assert metrics.accuracy.dtype == jnp.float32
+
+
+def test_causal_lm_loss_chunked_lm_head_bf16_large_t_normalizes_in_fp32():
+    """bf16 hidden states (compute_dtype=None -> bf16 CE math) at T=65536 shifted tokens.
+
+    The token-count normalizer and the FLCE accumulators must be fp32: with bf16 carries the
+    running weight sum saturates at 32768 and the reported loss drifts by several percent.
+    Reference: plain fp32 log-softmax CE over the same bf16 logits.
+    """
+    batch, seq_len, hidden_dim, vocab = 1, 65537, 8, 16
+    keys = jax.random.split(jax.random.PRNGKey(3), 3)
+    hidden_states = (jax.random.normal(keys[0], (batch, seq_len, hidden_dim)) * 0.5).astype(jnp.bfloat16)
+    kernel = (jax.random.normal(keys[1], (hidden_dim, vocab)) * 0.5).astype(jnp.bfloat16)
+    labels = jax.random.randint(keys[2], (batch, seq_len), 0, vocab).at[:, ::7].set(-100)
+
+    def lm_head_fn(x):
+        return jnp.matmul(x, kernel)
+
+    metrics = causal_lm_loss_chunked_lm_head(
+        hidden_states=hidden_states,
+        labels=labels,
+        lm_head_fn=lm_head_fn,
+        vocab_size=vocab,
+        config=LossConfig(),
+        token_chunk_size=256,
+    )
+
+    targets = labels[:, 1:].reshape(-1)
+    valid = targets != -100
+    logits = lm_head_fn(hidden_states[:, :-1]).reshape(-1, vocab).astype(jnp.float32)
+    log_probs = jax.nn.log_softmax(logits, axis=-1)
+    nll = -jnp.take_along_axis(log_probs, jnp.where(valid, targets, 0)[:, None], axis=-1)[:, 0]
+    num_valid = jnp.sum(valid.astype(jnp.float32))
+    expected = jnp.sum(jnp.where(valid, nll, 0.0)) / num_valid
+
+    assert float(metrics.weight_sum) == float(num_valid)
+    assert jnp.allclose(metrics.loss, expected, rtol=1e-3)
 
 
 def test_causal_lm_loss_chunked_lm_head_preserves_decoder_loss_weights():

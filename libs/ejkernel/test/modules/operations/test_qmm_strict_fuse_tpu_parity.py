@@ -17,7 +17,6 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import pytest
-
 from ejkernel.modules.operations import quantized_matmul
 from ejkernel.quantization import prepack_quantized_weights
 
@@ -108,7 +107,7 @@ def test_qmm_strict_fuse_tpu_parity_smoke(monkeypatch):
 
                 for platform in ("xla", "pallas"):
                     fn_fused = jax.jit(
-                        lambda xi, wi, si, zi, mode=mode, bits=bits, group_size=group_size, axis=axis, transpose=transpose, platform=platform: (  # noqa
+                        lambda xi, wi, si, zi, mode=mode, bits=bits, group_size=group_size, axis=axis, transpose=transpose, platform=platform: (  # noqa: E501
                             quantized_matmul(
                                 xi,
                                 wi,

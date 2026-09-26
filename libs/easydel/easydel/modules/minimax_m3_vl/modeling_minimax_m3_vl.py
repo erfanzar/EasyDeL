@@ -89,6 +89,7 @@ from easydel.layers import (
     swiglu_oai,
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule, UnifiedAttention
+from easydel.layers.indexer import BlockMaxIndexer, BlockMaxIndexerConfig
 from easydel.layers.moe import moe_group_topk_select
 from easydel.layers.norms import LayerNorm
 from easydel.modules._base import BaseCausalLMModule, BaseVisionLanguageModule
@@ -578,22 +579,8 @@ class MiniMaxM3VLSparseMoeBlock(BaseMoeModule):
         return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 
 
-class MiniMaxM3VLIndexer(spx.Module):
-    """Lightning Indexer for MiniMax M3 block-sparse attention (prefill path).
-
-    Scores each query against every key with a small ``index_n_heads``-head
-    dot-product branch (one head per KV/GQA group), max-pools the per-key
-    scores into blocks of ``index_block_size`` keys, and keeps the
-    top-``index_topk_blocks`` key blocks per query plus the
-    ``index_local_blocks`` blocks immediately preceding the query. The
-    selection is expanded into a dense additive attention bias (0 at every
-    allowed (query, key) pair; dtype-min elsewhere) — the eager/SDPA reference
-    semantics of HF's ``build_block_mask``. Like DeepSeek-V4's indexer this is
-    purely a selection branch: no value projection and no residual output.
-
-    Only the stateless (no KV cache) path is implemented; decode caching of
-    the indexer keys is not supported.
-    """
+class MiniMaxM3VLIndexer(BlockMaxIndexer):
+    """MiniMax norm/RoPE adapter for grouped max-pooled block selection."""
 
     def __init__(
         self,
@@ -604,117 +591,28 @@ class MiniMaxM3VLIndexer(spx.Module):
         *,
         rngs: spx.Rngs,
     ):
-        """Initialize the indexer.
-
-        Args:
-            config (MiniMaxM3VLTextConfig): Model configuration carrying the
-                ``index_*`` hyperparameters.
-            dtype (jnp.dtype, optional): Computation dtype. Defaults to jnp.bfloat16.
-            param_dtype (jnp.dtype, optional): Parameter dtype. Defaults to jnp.bfloat16.
-            precision (jax.lax.PrecisionLike, optional): Matmul precision. Defaults to None.
-            rngs (spx.Rngs): Random number generator state.
-        """
-        self.config = config
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.head_dim = config.index_head_dim
-        self.num_heads = config.index_n_heads
-        self.block_size = config.index_block_size
-        self.topk_blocks = config.index_topk_blocks
-        self.local_blocks = config.index_local_blocks
-        linear = partial(
-            ColumnParallelLinear,
-            use_bias=False,
+        """Keep MiniMax's parameter names, Gemma-style norms and rotary layout."""
+        super().__init__(
+            BlockMaxIndexerConfig(
+                hidden_size=config.hidden_size,
+                num_heads=config.index_n_heads,
+                head_dim=config.index_head_dim,
+                block_size=config.index_block_size,
+                topk_blocks=config.index_topk_blocks,
+                local_blocks=config.index_local_blocks,
+                initializer_range=config.initializer_range,
+            ),
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
             rngs=rngs,
+            norm_factory=partial(MiniMaxM3VLRMSNorm, config, param_dtype=param_dtype, dim=config.index_head_dim),
+            gather_cos_sin=_gather_cos_sin,
+            apply_rotary=_apply_partial_rotary,
         )
-        self.q_proj = linear(config.hidden_size, config.index_n_heads * config.index_head_dim)
-        self.k_proj = linear(config.hidden_size, config.index_head_dim)
-        self.q_norm = MiniMaxM3VLRMSNorm(config, param_dtype=param_dtype, dim=config.index_head_dim)
-        self.k_norm = MiniMaxM3VLRMSNorm(config, param_dtype=param_dtype, dim=config.index_head_dim)
-
-    def compute_block_bias(
-        self,
-        hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        position_ids: Int[Array, "batch seq_len"],
-        frequencies: Array,
-        num_attention_heads: int,
-        bias_dtype: jnp.dtype,
-    ) -> Float[Array, "batch num_attention_heads seq_len seq_len"]:
-        """Select key blocks per query and expand them into an additive bias.
-
-        Args:
-            hidden_states: Pre-attention residual stream ``[B, S, H]``.
-            position_ids: Per-token content positions ``[B, S]`` (the block of
-                a query is ``position_ids // index_block_size``).
-            frequencies: The decoder's RoPE frequency cache (the indexer reuses
-                the main rotary table, truncated to ``index_head_dim``).
-            num_attention_heads: Full query-head count to broadcast the
-                per-KV-group selection onto.
-            bias_dtype: Output dtype of the additive bias.
-
-        Returns:
-            Additive attention bias ``[B, num_attention_heads, S, S]`` with
-            ``0`` at selected causally-valid (query, key) pairs and the
-            dtype's minimum elsewhere.
-        """
-        batch, seq_len, _ = hidden_states.shape
-        idx_q = self.q_norm(self.q_proj(hidden_states).reshape(batch, seq_len, self.num_heads, self.head_dim))
-        idx_k = self.k_norm(self.k_proj(hidden_states).reshape(batch, seq_len, 1, self.head_dim))
-
-        cos, sin = _gather_cos_sin(frequencies, position_ids, width=self.head_dim)
-        cos = cos[:, :, None, :].astype(idx_q.dtype)
-        sin = sin[:, :, None, :].astype(idx_q.dtype)
-        idx_q = _apply_partial_rotary(idx_q, cos, sin)
-        idx_k = _apply_partial_rotary(idx_k, cos, sin)
-
-        # Per-key scores; fp32 like HF.
-        scores = jnp.einsum(
-            "bqhd,bkd->bhqk",
-            idx_q.astype(jnp.float32),
-            idx_k[:, :, 0, :].astype(jnp.float32),
-            precision=self.precision,
-        )
-        k_positions = jnp.arange(seq_len)
-        token_future = k_positions[None, None, None, :] > position_ids[:, None, :, None]
-        scores = jnp.where(token_future, -jnp.inf, scores)
-
-        pad = (-seq_len) % self.block_size
-        if pad:
-            scores = jnp.pad(scores, ((0, 0), (0, 0), (0, 0), (0, pad)), constant_values=-jnp.inf)
-        num_key_blocks = (seq_len + pad) // self.block_size
-        block_scores = scores.reshape(batch, self.num_heads, seq_len, num_key_blocks, self.block_size).max(-1)
-
-        q_block = position_ids // self.block_size  # [B, S]
-        if self.local_blocks > 0:
-            local = jnp.arange(self.local_blocks)
-            local_idx = jnp.clip(q_block[:, :, None] - local[None, None, :], min=0)  # [B, S, L]
-            local_idx = jnp.broadcast_to(local_idx[:, None, :, :], (batch, self.num_heads, seq_len, self.local_blocks))
-            block_scores = jnp.put_along_axis(block_scores, local_idx, jnp.inf, axis=-1, inplace=False)
-
-        topk = min(self.topk_blocks, num_key_blocks)
-        topk_scores, topk_indices = jax.lax.top_k(block_scores, topk)
-        # Future/empty blocks keep their -inf score; tag them -1 (dropped).
-        topk_indices = jnp.where(topk_scores == -jnp.inf, -1, topk_indices)
-
-        safe = jnp.where(topk_indices < 0, num_key_blocks, topk_indices)
-        block_bias = jnp.full((batch, self.num_heads, seq_len, num_key_blocks + 1), -jnp.inf, dtype=jnp.float32)
-        block_bias = jnp.put_along_axis(block_bias, safe, 0.0, axis=-1, inplace=False)
-        block_keep = block_bias[..., :num_key_blocks] == 0.0
-
-        # Block verdict back onto keys; indexer heads carry one selection per
-        # KV/GQA group — expand up to the full query-head count.
-        keep = jnp.repeat(block_keep, self.block_size, axis=-1)[..., :seq_len]
-        keep = jnp.repeat(keep, num_attention_heads // self.num_heads, axis=1)
-        # Compose with token-level causality (HF composes with the causal /
-        # padding mask; padding is applied independently by the kernel).
-        keep = keep & ~token_future
-        min_value = jnp.finfo(bias_dtype).min
-        return jnp.where(keep, jnp.asarray(0.0, bias_dtype), jnp.asarray(min_value, bias_dtype))
+        # Row-parallel TPU top-k resolves its layout from the model mesh.
+        self.mesh_source = config
+        self.config = config
 
 
 class MiniMaxM3VLAttention(UnifiedAttention):

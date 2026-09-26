@@ -14,11 +14,11 @@
 
 """Tests for RWKV model."""
 
+import easydel as ed
 import pytest
 import transformers
-
-import easydel as ed
 from easydel.modules.rwkv import RwkvConfig
+
 from tests.modules.mpmd._scheduler_utils import GENERATION_SCHEDULE_KIND, LOSS_SCHEDULE_KINDS
 from tests.modules.test_utils import CausalLMTester
 

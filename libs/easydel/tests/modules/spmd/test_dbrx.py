@@ -14,10 +14,10 @@
 
 """Tests for DBRX MoE model."""
 
+import easydel as ed
 import pytest
 import transformers
-
-import easydel as ed
+from packaging import version
 
 try:
     from tests.modules.test_utils import CausalLMTester
@@ -31,12 +31,18 @@ class TestDBRX:
     @pytest.fixture
     def dbrx_config(self, small_model_config):
         """Create DBRX-specific config."""
+        # transformers < 5.17 applies DBRX's expert matrices transposed, which only
+        # type-checks when ffn_hidden_size == d_model; newer releases (and EasyDeL)
+        # use the checkpoint orientation, so they get the real, wider FFN.
+        ffn_hidden_size = small_model_config["intermediate_size"]
+        if version.parse(transformers.__version__) < version.parse("5.17"):
+            ffn_hidden_size = small_model_config["hidden_size"]
         return ed.DbrxConfig(
             d_model=small_model_config["hidden_size"],
             n_heads=small_model_config["num_attention_heads"],
             n_layers=small_model_config["num_hidden_layers"],
             ffn_config=ed.DbrxFFNConfig(
-                ffn_hidden_size=small_model_config["intermediate_size"],
+                ffn_hidden_size=ffn_hidden_size,
                 moe_top_k=small_model_config.get("num_experts_per_tok", 4),
                 moe_num_experts=small_model_config.get("num_local_experts", 16),
             ),
@@ -44,6 +50,10 @@ class TestDBRX:
             max_seq_len=small_model_config["max_position_embeddings"],
         )
 
+    @pytest.mark.skipif(
+        version.parse(transformers.__version__) < version.parse("5.17"),
+        reason="transformers<5.17 applies DBRX expert matrices transposed; EasyDeL follows the checkpoint layout",
+    )
     def test_causal_lm(self, dbrx_config, small_model_config):
         """Test DbrxForCausalLM."""
         # Use XLA GMM to avoid Pallas TPU grouped_matmul kernel constraints

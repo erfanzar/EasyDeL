@@ -17,8 +17,6 @@ from types import SimpleNamespace
 import jax
 import pandas as pd
 import pytest
-from jax import numpy as jnp
-
 from easydel.trainers.group_relative_policy_optimization._fn import (
     _compute_grpo_policy_loss_terms,
     _compute_importance_weights,
@@ -27,6 +25,7 @@ from easydel.trainers.group_relative_policy_optimization._fn import (
 )
 from easydel.trainers.group_relative_policy_optimization.grpo_config import GRPOConfig
 from easydel.trainers.group_relative_policy_optimization.grpo_trainer import GRPOTrainer, _compute_rewards_and_advantages
+from jax import numpy as jnp
 
 
 def test_grpo_sapo_policy_terms_match_soft_advantage_formula():

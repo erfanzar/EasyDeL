@@ -80,7 +80,6 @@ class InternLM2Attention(UnifiedAttention):
         "output_projection": "wo",
         "query_key_value_projection": "wqkv",
     }
-    fused_qkv_layout: ClassVar = "gqa_grouped"
 
     def __init__(
         self,
@@ -132,6 +131,7 @@ class InternLM2Attention(UnifiedAttention):
         qkv_layout = dense_qkv_layout(
             config.num_attention_heads * self.head_dim,
             config.num_key_value_heads * self.head_dim,
+            source_is_fused=True,
         )
         return ColumnParallelLinear(
             config.hidden_size,
@@ -144,6 +144,60 @@ class InternLM2Attention(UnifiedAttention):
             precision=precision,
             layout=qkv_layout,
         )
+
+    @property
+    def reform_param(self):
+        """Reorder the checkpoint's grouped ``wqkv`` into EasyDeL's ``[Q | K | V]``.
+
+        The InternLM2 remote code views ``wqkv``'s output as
+        ``(num_kv_heads, num_key_value_groups + 2, head_dim)``: per KV group the
+        rows are ``[q_0 .. q_{g-1}, k, v]``. The runtime splits one contiguous
+        ``[Q_all | K_all | V_all]`` tensor through the fused layout, so rows are
+        permuted on load (and back on export) around the prefused layout rule,
+        which owns the TP interleave and the transpose.
+        """
+        qkv_attr = self._projection_attr("query_key_value_projection")
+        rules = self.query_key_value_projection.build_reform_param(
+            qkv_attr,
+            config=self.config,
+            include_bias=bool(self.config.bias),
+        )
+        heads, kv_heads, head_dim = self.num_heads, self.num_key_value_heads, self.head_dim
+        groups = heads // kv_heads
+
+        def _grouped_to_contiguous(tensor):
+            import torch
+
+            rest = tensor.shape[1:]
+            grouped = tensor.reshape(kv_heads, groups + 2, head_dim, *rest)
+            return torch.cat(
+                [
+                    grouped[:, :groups].reshape(heads * head_dim, *rest),
+                    grouped[:, groups].reshape(kv_heads * head_dim, *rest),
+                    grouped[:, groups + 1].reshape(kv_heads * head_dim, *rest),
+                ],
+                dim=0,
+            )
+
+        def _contiguous_to_grouped(torch, tensor):
+            rest = tensor.shape[1:]
+            query, key, value = torch.split(tensor, [heads * head_dim, kv_heads * head_dim, kv_heads * head_dim])
+            return torch.cat(
+                [
+                    query.reshape(kv_heads, groups, head_dim, *rest),
+                    key.reshape(kv_heads, 1, head_dim, *rest),
+                    value.reshape(kv_heads, 1, head_dim, *rest),
+                ],
+                dim=1,
+            ).reshape(tensor.shape)
+
+        for rule in rules.values():
+            split, inverse = rule["splits"][0]["spliter"], rule["inverse_spliter"]
+            rule["splits"][0]["spliter"] = lambda tensor, split=split: split(_grouped_to_contiguous(tensor))
+            rule["inverse_spliter"] = lambda torch, tensor, inverse=inverse: _contiguous_to_grouped(
+                torch, inverse(torch, tensor)
+            ).contiguous()
+        return rules
 
     def _create_o_proj(self, config, dtype, param_dtype, precision, rngs):
         """Create the attention output projection (HF ``wo``).

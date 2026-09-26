@@ -168,6 +168,28 @@ model.float()  # Convert to float32
 current_dtype = model.module_dtype
 ```
 
+### Convolution and vanilla-attention precision
+
+Keep `precision` separate from activation/softmax dtypes and parameter
+storage dtype. SigLIP forwards its constructor precision to the vision
+patch convolution and to its attention performer; `UnifiedAttention`
+also forwards its constructor precision to `FlexibleAttentionModule`.
+These controls do not change checkpoint parameter names, shapes, or storage
+dtypes.
+
+For the `VanillaAttn` path, `FlexibleAttentionModule.forward(...,
+precision=None)` preserves `None`: its JAX contractions inherit the ambient
+`jax.default_matmul_precision` setting. An explicit
+`jax.lax.Precision.DEFAULT` instead overrides that ambient setting.
+Precision reaches both query-times-key and attention-times-value, including
+the segmented vanilla path. When vanilla attention delegates to ejkernel's
+dense `attention`, explicit precision selects XLA rather than TileLang.
+Do not assume other attention mechanisms support the same precision control.
+
+See the [flexible attention API](../api_docs/layers/attention/_flexible.rst)
+and [vanilla attention API](../api_docs/operations/kernels/vanilla_attention.rst)
+for the call surfaces.
+
 ## Quantization
 
 ### Applying Quantization

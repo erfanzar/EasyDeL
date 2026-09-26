@@ -101,13 +101,13 @@ def test_backward_matches_float_vjp_on_quantized_residuals(
     quantized_rhs = dequantize(quantize(rhs, HowToQuantize(qtype=jnp.int8, channelwise_axes=rhs_channelwise)))
 
     _, reference_vjp = jax.vjp(lambda a, b: jax.lax.dot_general(a, b, dimension_numbers), quantized_lhs, quantized_rhs)
-    _, actual_vjp = jax.vjp(
-        lambda a, b: qdot_general(a, b, dimension_numbers, rule=rule, rhs_is_weight=True), lhs, rhs
-    )
+    _, actual_vjp = jax.vjp(lambda a, b: qdot_general(a, b, dimension_numbers, rule=rule, rhs_is_weight=True), lhs, rhs)
 
-    cotangent = jax.random.normal(jax.random.key(3), jax.eval_shape(
-        lambda a, b: jax.lax.dot_general(a, b, dimension_numbers), lhs, rhs
-    ).shape, jnp.float32)
+    cotangent = jax.random.normal(
+        jax.random.key(3),
+        jax.eval_shape(lambda a, b: jax.lax.dot_general(a, b, dimension_numbers), lhs, rhs).shape,
+        jnp.float32,
+    )
     for reference, actual in zip(reference_vjp(cotangent), actual_vjp(cotangent), strict=True):
         np.testing.assert_allclose(np.asarray(reference), np.asarray(actual), rtol=1e-5, atol=1e-5)
 
@@ -116,11 +116,14 @@ def test_forward_matches_dequantize_then_dot():
     """The quantized forward equals dequantizing both operands and contracting."""
     lhs, rhs = _pair((5, 256), (256, 32))
     rule = QuantRule(weight_qtype="int8", act_qtype="int8")
-    actual = qdot_general(lhs, rhs, _MATMUL, rule=rule, rhs_is_weight=True)
+    # TPU DEFAULT may truncate float32 multiplicands, unlike the exact
+    # integer contraction. Compare the algebra at explicitly full precision.
+    actual = qdot_general(lhs, rhs, _MATMUL, rule=rule, rhs_is_weight=True, precision=jax.lax.Precision.HIGHEST)
     reference = jax.lax.dot_general(
         dequantize(quantize(lhs, HowToQuantize(qtype=jnp.int8, channelwise_axes=(0,)))),
         dequantize(quantize(rhs, HowToQuantize(qtype=jnp.int8, channelwise_axes=(1,)))),
         _MATMUL,
+        precision=jax.lax.Precision.HIGHEST,
     )
     np.testing.assert_allclose(np.asarray(actual), np.asarray(reference), rtol=2e-3, atol=2e-3)
 
@@ -129,11 +132,12 @@ def test_subchannel_forward_matches_dequantize_then_dot():
     """Tiling the contracted axis stays equivalent to the dequantized contraction."""
     lhs, rhs = _pair((5, 256), (256, 32))
     rule = QuantRule(weight_qtype="int8", act_qtype="int8", tile_size=128)
-    actual = qdot_general(lhs, rhs, _MATMUL, rule=rule, rhs_is_weight=True)
+    actual = qdot_general(lhs, rhs, _MATMUL, rule=rule, rhs_is_weight=True, precision=jax.lax.Precision.HIGHEST)
     reference = jax.lax.dot_general(
         dequantize(quantize(lhs, HowToQuantize(qtype=jnp.int8, channelwise_axes=(0,), tiled_axes={1: 128}))),
         dequantize(quantize(rhs, HowToQuantize(qtype=jnp.int8, channelwise_axes=(1,), tiled_axes={0: 128}))),
         _MATMUL,
+        precision=jax.lax.Precision.HIGHEST,
     )
     np.testing.assert_allclose(np.asarray(actual), np.asarray(reference), rtol=2e-3, atol=2e-3)
 
@@ -248,9 +252,7 @@ def test_qeinsum_handles_an_equation_that_transposes_the_weight():
 
     # The contracted axis is 1 here, so axis 0 is the channelwise one.
     quantized_weight = dequantize(quantize(weight, HowToQuantize(qtype=jnp.int8, channelwise_axes=(0,))))
-    np.testing.assert_allclose(
-        np.asarray(actual), np.asarray(activation @ quantized_weight.T), rtol=2e-2, atol=2e-2
-    )
+    np.testing.assert_allclose(np.asarray(actual), np.asarray(activation @ quantized_weight.T), rtol=2e-2, atol=2e-2)
     assert not jnp.allclose(actual, activation @ weight.T, rtol=1e-6, atol=1e-6)
 
 

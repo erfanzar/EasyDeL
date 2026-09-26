@@ -14,12 +14,11 @@
 
 from types import SimpleNamespace
 
+import easydel as ed
 import jax
 import jax.numpy as jnp
 import pytest
 import spectrax as spx
-
-import easydel as ed
 from easydel.inference.esurge.core.interface import CacheGroupsConfig, CacheGroupSpec, FullAttentionSpec
 from easydel.inference.esurge.engine.admission import RequestAdmission
 from easydel.inference.esurge.engine.output_pipeline import OutputPipeline

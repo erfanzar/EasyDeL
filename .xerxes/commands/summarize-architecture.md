@@ -15,7 +15,7 @@ Cover, in order:
 3. How pipeline parallelism differs here from stock JAX (spectrax true-MPMD per-rank executables vs the SPMD path).
 4. The extension-point philosophy: registries everywhere (models, trainers, operations, kernels, parsers, optimizers) —
    adding ≠ modifying.
-5. The development loop: uv sync, the CPU test env trio, lint-imports, pre-commit, and the release/mirror flow in two
-   sentences.
+5. The development loop: uv sync, the accelerator test env (CPU trio only for non-computation tests), lint-imports,
+   pre-commit, and the release/mirror flow in two sentences.
 
 Keep it under a page. Link file paths for every load-bearing claim.

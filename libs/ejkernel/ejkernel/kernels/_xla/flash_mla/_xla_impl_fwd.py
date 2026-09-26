@@ -299,7 +299,11 @@ def _flash_mla_xla(
         logits = logits_soft_cap * jnp.tanh(logits / logits_soft_cap)
 
     if sliding_window is not None:
-        left_w, right_w = (sliding_window, sliding_window) if isinstance(sliding_window, int) else sliding_window
+        # An int is a window *size* (HF convention): the query plus its ``W - 1`` neighbours.
+        if isinstance(sliding_window, int):
+            left_w = right_w = max(sliding_window - 1, 0)
+        else:
+            left_w, right_w = sliding_window
         q_pos = jnp.arange(seq_len_q)[:, None]
         k_pos = jnp.arange(seq_len_k)[None, :]
         win_mask = (k_pos >= q_pos - left_w) & (k_pos <= q_pos + right_w)
@@ -416,7 +420,7 @@ def flash_mla(
             ``deterministic=False`` and ``dropout_prob > 0``.
         dropout_prob: Dropout probability applied to attention weights.
         sliding_window: Optional sliding window attention constraint.
-            - int: Symmetric window of that radius
+            - int: Window size ``W`` (HF convention; same as ``(W - 1, W - 1)``)
             - (left, right): Asymmetric window
         softmax_dtype: Dtype for softmax accumulation.  Defaults to float32
             for numerical stability.

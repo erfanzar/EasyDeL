@@ -25,14 +25,12 @@ Classes:
     FullAttentionManager: Standard attention cache
     SlidingWindowManager: Sliding window attention cache
     ChunkedLocalAttentionManager: Chunked local attention
-    MambaManager: Mamba model cache management
 
 Specifications:
     AttentionSpec: Base attention specification
     FullAttentionSpec: Full attention pattern
     SlidingWindowSpec: Sliding window pattern
     ChunkedLocalAttentionSpec: Chunked local pattern
-    MambaSpec: Mamba model specification
 
 Example:
     >>> from easydel.inference.esurge.core import CacheCoordinator, CacheGroupsConfig
@@ -54,7 +52,6 @@ from .interface import (
     CacheSpec,
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
-    MambaSpec,
     SlidingWindowSpec,
     create_kv_cache_specs_from_config,
 )
@@ -63,7 +60,6 @@ from .page_pool import PagePool
 from .single_type_cache_manager import (
     ChunkedLocalAttentionManager,
     FullAttentionManager,
-    MambaManager,
     SingleTypeCacheManager,
     SlidingWindowManager,
 )
@@ -82,8 +78,6 @@ __all__ = (
     "FullAttentionManager",
     "FullAttentionSpec",
     "HybridCacheCoordinator",
-    "MambaManager",
-    "MambaSpec",
     "PagePool",
     "SingleTypeCacheManager",
     "SlidingWindowManager",

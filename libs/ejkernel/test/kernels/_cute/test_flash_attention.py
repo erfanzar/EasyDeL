@@ -19,7 +19,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from ejkernel.errors import EjkernelRuntimeError
 
 _has_cutlass = importlib.util.find_spec("cutlass") is not None

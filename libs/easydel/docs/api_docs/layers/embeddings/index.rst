@@ -5,3 +5,5 @@ easydel.layers.embeddings package
    :maxdepth: 2
 
    _embeddings
+   _ngram
+   _u64

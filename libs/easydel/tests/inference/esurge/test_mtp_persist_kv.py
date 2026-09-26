@@ -38,24 +38,17 @@ import types
 os.environ.setdefault("ENABLE_DISTRIBUTED_INIT", "0")
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
-# The runner-level greedy-exactness check needs the exact sequential-replay
-# recurrent path (the tiny model has linear_attention layers); the default fast
-# path is coherent but not bit-identical to the no-spec baseline on recurrent
-# models. ``_run_generation`` forces EASYDEL_SPEC_RECURRENT_REPLAY=1 for its own
-# runs (overriding any ambient fast-path setting) rather than relying on this
-# process default, so the greedy==baseline assertion can't be made flaky by the
-# caller's environment. This ``setdefault`` only sets a default for the rest.
-os.environ.setdefault("EASYDEL_SPEC_RECURRENT_REPLAY", "1")
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.esurge.runners import eSurgeRunner
 from easydel.inference.esurge.runners.spec.strategy import DrafterSpeculation
 from easydel.inference.esurge.scheduler import Scheduler
 from easydel.inference.sampling_params import SamplingParams
-from easydel.inference.speculative import Qwen3_5MTPDrafter
+from easydel.inference.speculative import DraftStep, Qwen3_5MTPDrafter
 
 try:
     from ._common import make_tiny_qwen35 as make_tiny_model
@@ -64,6 +57,12 @@ except ImportError:  # standalone `python test_x.py`
 
 _VOCAB = 256
 _HIDDEN = 128
+
+
+@pytest.fixture(autouse=True)
+def _exact_recurrent_replay(monkeypatch):
+    """Keep these tests in exact replay mode without leaking into other modules."""
+    monkeypatch.setenv("EASYDEL_SPEC_RECURRENT_REPLAY", "1")
 
 
 def _hidden(seed: int) -> jnp.ndarray:
@@ -434,9 +433,83 @@ def test_batched_persist_keeps_a_row_per_request():
     assert c_reuse == c_fresh, "(c) drafts on a reused slot equal a truly-fresh request's (no stale K/V leak)"
 
 
+class _SlotTrackingMTPDrafter:
+    """Host-only stand-in for the inline-MTP drafter's per-row cache write index.
+
+    Each ``draft`` call appends one slot at the current index and records the
+    absolute position it was drafted at; ``rollback_to`` truncates like
+    ``Qwen3_5MTPDrafter.rollback_to`` (clamped to the written extent).
+    """
+
+    persist_kv = True
+
+    def __init__(self):
+        self.slot_positions: list[int] = []
+        self.rollbacks: list[int] = []
+
+    def rollback_to(self, committed_len: int, row_pos: int | None = None) -> int:
+        del row_pos
+        committed_len = max(0, int(committed_len))
+        self.rollbacks.append(committed_len)
+        del self.slot_positions[committed_len:]
+        return committed_len
+
+    def draft(self, input_ids, target_hidden_states, position_ids, sample=False, rng_key=None, row_pos=None, **kw):
+        del input_ids, sample, rng_key, row_pos, kw
+        self.slot_positions.append(int(np.asarray(position_ids).reshape(-1)[-1]))
+        return DraftStep(token_ids=jnp.asarray([3], dtype=jnp.int32), hidden_states=target_hidden_states)
+
+
+def _bookkeeping_strategy(k: int) -> tuple[DrafterSpeculation, _SlotTrackingMTPDrafter]:
+    drafter = _SlotTrackingMTPDrafter()
+    runner = types.SimpleNamespace(max_num_reqs=1, max_num_seqs=1, requests={})
+    return DrafterSpeculation(runner=runner, drafter=drafter, num_draft_tokens=k), drafter
+
+
+def test_rollback_bookkeeping_survives_fully_accepted_windows(monkeypatch):
+    """A fully accepted window must not make ``slot = position - base`` drift.
+
+    A window seeded at ``s`` writes ``k`` slots (positions ``s .. s+k-1``); full
+    acceptance advances the next seed to ``s + k + 1``, so one position never
+    enters the MTP cache. The committed length must count only written slots —
+    before the fix it was ``seed - base`` forever after, keeping one rejected
+    draft slot per earlier full-accept window.
+    """
+    monkeypatch.delenv("EASYDEL_MTP_PERSIST_KV", raising=False)
+    monkeypatch.delenv("EASYDEL_SPEC_ADAPTIVE_CONF", raising=False)
+    k = 3
+    strategy, drafter = _bookkeeping_strategy(k)
+    hidden = jnp.zeros((_HIDDEN,), dtype=jnp.float32)
+
+    _draft(strategy, "R", 0, 5, 10, hidden)  # fresh: slots at 10, 11, 12
+    _draft(strategy, "R", 0, 5, 14, hidden)  # all 3 accepted (+bonus): keep all 3 slots
+    _draft(strategy, "R", 0, 5, 16, hidden)  # 1 accepted: keep slots for 14, 15
+    _draft(strategy, "R", 0, 5, 17, hidden)  # 0 accepted: keep the slot for 16
+
+    assert drafter.rollbacks == [0, 3, 5, 6]
+    # Every retained slot is a committed position: no rejected-draft slot survives.
+    assert drafter.slot_positions[:6] == [10, 11, 12, 14, 15, 16]
+
+
+def test_rollback_bookkeeping_across_reject_backoff(monkeypatch):
+    """A backoff-skipped window still drops the previous window's rejected slots."""
+    monkeypatch.delenv("EASYDEL_MTP_PERSIST_KV", raising=False)
+    monkeypatch.delenv("EASYDEL_SPEC_ADAPTIVE_CONF", raising=False)
+    k = 3
+    strategy, drafter = _bookkeeping_strategy(k)
+    hidden = jnp.zeros((_HIDDEN,), dtype=jnp.float32)
+
+    _draft(strategy, "R", 0, 5, 10, hidden)  # slots at 10, 11, 12
+    _draft(strategy, "R", 0, 5, 14, hidden)  # full accept -> slots at 14, 15, 16
+    strategy._backoff_by_req["R"] = 1
+    assert _draft(strategy, "R", 0, 5, 15, hidden) == []  # all rejected -> backoff skip
+    _draft(strategy, "R", 0, 5, 16, hidden)  # plain decode advanced one position
+
+    assert drafter.rollbacks == [0, 3, 4]
+    assert drafter.slot_positions[:4] == [10, 11, 12, 14]
+
+
 if __name__ == "__main__":
     import sys
-
-    import pytest
 
     sys.exit(pytest.main([__file__, "-v"]))

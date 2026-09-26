@@ -17,7 +17,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from ejkernel.types.mask import (
     MaskInfo,
     cu_seqlens_to_mask,
@@ -443,6 +442,24 @@ def test_maskinfo_apply_sliding_window():
     print("  ✓ apply_sliding_window (JIT): OK")
 
 
+def test_maskinfo_apply_sliding_window_int_is_hf_window_size():
+    """An int window ``W`` follows HF: a causal query sees itself plus the previous ``W - 1`` tokens."""
+    window = 3
+    segment_ids = jnp.ones((1, 8), dtype=jnp.int32)
+    attn = MaskInfo.from_segments(segment_ids).apply_causal().apply_sliding_window(window).attention_mask[0, 0]
+
+    q_idx = jnp.arange(8)[:, None]
+    kv_idx = jnp.arange(8)[None, :]
+    expected = (kv_idx <= q_idx) & (kv_idx > q_idx - window)  # transformers.masking_utils.sliding_window_overlay
+    assert jnp.array_equal(attn, expected)
+    assert int(attn[7].sum()) == window
+
+    tuple_attn = (
+        MaskInfo.from_segments(segment_ids).apply_causal().apply_sliding_window((window - 1, 0)).attention_mask[0, 0]
+    )
+    assert jnp.array_equal(tuple_attn, expected)
+
+
 def test_maskinfo_apply_sliding_window_right_window():
     """Test MaskInfo.apply_sliding_window() honors right_window."""
     print("\nTesting MaskInfo.apply_sliding_window() right_window...")
@@ -565,13 +582,14 @@ def test_maskinfo_composable():
     @jax.jit
     def run_composed(segment_ids):
         mask_info = MaskInfo.from_segments(segment_ids)
-        return mask_info.apply_causal().apply_sliding_window(2)
+        return mask_info.apply_causal().apply_sliding_window(3)
 
     segment_ids = jnp.array([[1, 1, 1, 1, 1, 1]])
     composed = run_composed(segment_ids)
 
     attn = composed.attention_mask[0, 0]
 
+    # Window size 3 (HF convention): row 4 sees itself plus the previous 2 tokens.
     assert not attn[4, 0]
     assert not attn[4, 1]
     assert attn[4, 2]

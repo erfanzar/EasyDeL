@@ -49,6 +49,7 @@ Example Usage:
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import pathlib
@@ -65,6 +66,16 @@ PROVENANCE_KEY = "__ejk_provenance__"
 
 PROVENANCE_AUTOTUNE = "autotune"
 """Provenance recorded for configurations measured by the autotuner."""
+
+CFG_CLASS_KEY = "__ejk_cfg_class__"
+"""Envelope key recording the ``module:qualname`` of a persisted dataclass / pydantic config.
+
+JSON has no tuples and no types, so without it a fresh process can only rebuild an
+``argparse.Namespace`` whose tuple fields came back as lists (e.g. the per-mode
+``(decode, prefill, mixed)`` block sizes of ``MultiLatentRaggedPageAttentionV2Config``),
+which kernels then fail to consume. Only classes under the ``ejkernel`` package are
+re-imported from this key.
+"""
 
 TRUSTED_PROVENANCE: frozenset[str] = frozenset({PROVENANCE_AUTOTUNE})
 """Provenance values that :meth:`PersistentCache.get` will return.
@@ -109,9 +120,13 @@ class PersistentCache(Generic[Cfg]):
         1. Custom ``loader`` function (if provided at construction).
         2. If the stored value is a ``dict`` and ``cfg_type`` was given,
            ``cfg_type(**stored_dict)`` is called to reconstruct the object.
-        3. If the stored value is a ``dict`` and no ``cfg_type`` was given,
-           it is wrapped in ``argparse.Namespace(**stored_dict)``.
-        4. Otherwise the raw JSON value is returned.
+        3. If the stored value is a ``dict``, no ``cfg_type`` was given, and
+           the entry recorded an ``ejkernel`` config class at :meth:`put`
+           time, that class is re-imported and called with the stored dict.
+        4. Otherwise a ``dict`` is wrapped in ``argparse.Namespace``.
+        5. Otherwise the raw JSON value is returned.
+
+        JSON lists inside dict payloads are converted back to tuples first.
 
     Type Parameters:
         Cfg: Configuration type to be cached.
@@ -245,13 +260,24 @@ class PersistentCache(Generic[Cfg]):
         # instead of letting a malformed entry crash every reader of this key.
         if not isinstance(provenance, str) or provenance not in TRUSTED_PROVENANCE:
             return None
+        cfg_class = raw.get(CFG_CLASS_KEY)
         raw = raw.get("cfg")
         out = None if raw is None else (self.loader(raw) if self.loader else raw)
         if out is not None and isinstance(out, dict):
-            if self.cfg_type is None:
-                out = Namespace(**out)
+            fields = {k: _lists_to_tuples(v) for k, v in out.items()}
+            if self.cfg_type is not None:
+                out = self.cfg_type(**fields)
             else:
-                out = self.cfg_type(**out)
+                recorded_type = _resolve_cfg_class(cfg_class) if self.loader is None else None
+                out = None
+                if recorded_type is not None:
+                    try:
+                        out = recorded_type(**fields)
+                    except (TypeError, ValueError):
+                        # Schema drift since the entry was written: fall back to the untyped view.
+                        out = None
+                if out is None:
+                    out = Namespace(**fields)
         return out
 
     def put(self, device: str, op_id: str, call_key: str, cfg: Cfg, *, provenance: str):
@@ -287,17 +313,21 @@ class PersistentCache(Generic[Cfg]):
         """
         if self._disabled:
             return
+        entry: dict[str, Any] = {PROVENANCE_KEY: provenance}
         if self.dumper is not None:
             val = self.dumper(cfg)
         else:
-            if is_dataclass(cfg):
+            if is_dataclass(cfg) and not isinstance(cfg, type):
                 val = asdict(cfg)
+                entry[CFG_CLASS_KEY] = _cfg_class_path(cfg)
             elif hasattr(cfg, "model_dump"):
                 val = cfg.model_dump()
+                entry[CFG_CLASS_KEY] = _cfg_class_path(cfg)
             else:
                 val = cfg
+        entry["cfg"] = val
 
-        self._data[self._key(device, op_id, call_key)] = {PROVENANCE_KEY: provenance, "cfg": val}
+        self._data[self._key(device, op_id, call_key)] = entry
 
         try:
             dir_name = os.path.dirname(os.path.abspath(self.path)) or "."
@@ -307,3 +337,39 @@ class PersistentCache(Generic[Cfg]):
             os.replace(tmp_path, self.path)
         except (PermissionError, OSError):
             self._disabled = True
+
+
+def _cfg_class_path(cfg: Any) -> str:
+    """Return ``module:qualname`` for ``cfg``'s class (recorded in the cache envelope)."""
+    cls = type(cfg)
+    return f"{cls.__module__}:{cls.__qualname__}"
+
+
+def _resolve_cfg_class(path: Any) -> type | None:
+    """Re-import a config class recorded by :meth:`PersistentCache.put`.
+
+    Returns ``None`` for anything that is not an ``ejkernel`` dataclass / pydantic
+    model (the cache file is shared across processes, so it must not drive
+    arbitrary imports) or cannot be resolved.
+    """
+    if not isinstance(path, str) or ":" not in path:
+        return None
+    module_name, _, qualname = path.partition(":")
+    if module_name != "ejkernel" and not module_name.startswith("ejkernel."):
+        return None
+    try:
+        obj: Any = importlib.import_module(module_name)
+        for part in qualname.split("."):
+            obj = getattr(obj, part)
+    except (ImportError, AttributeError):
+        return None
+    if isinstance(obj, type) and (is_dataclass(obj) or hasattr(obj, "model_validate")):
+        return obj
+    return None
+
+
+def _lists_to_tuples(value: Any) -> Any:
+    """Recursively convert JSON lists back to tuples (configs hold hashable tuples)."""
+    if isinstance(value, list):
+        return tuple(_lists_to_tuples(v) for v in value)
+    return value

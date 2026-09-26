@@ -14,9 +14,8 @@
 
 from types import SimpleNamespace
 
-from spectrax import PartitionAxis, PartitionManager
-
 from easydel.infra.base_config import _mesh_shape_ep
+from spectrax import PartitionAxis, PartitionManager
 
 
 def test_mesh_shape_ep_matches_folded_expert_layout_without_aliases():

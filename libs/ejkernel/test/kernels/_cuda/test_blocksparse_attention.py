@@ -20,7 +20,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from ejkernel.kernels._cuda.blocksparse_attention import blocksparse_attention as cuda_blocksparse_attention
 from ejkernel.kernels._xla.blocksparse_attention import blocksparse_attention as xla_blocksparse_attention
 from ejkernel.ops import BwdParams, FwdParams

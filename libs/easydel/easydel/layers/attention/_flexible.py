@@ -456,8 +456,8 @@ class FlexibleAttentionModule(spx.Module):
             mask_info: Container with the attention mask plus per-token
                 segment IDs and positions; ``None`` for full visibility.
             bias: Additive attention bias ``[batch, heads, seq_q, seq_k]``.
-            sliding_window: Local-window size (int for symmetric, tuple
-                for asymmetric ``(left, right)``).
+            sliding_window: Local-window size (int ``W`` = HF window size, i.e.
+                ``(W - 1, W - 1)``; tuple for inclusive ``(left, right)``).
             cache_metadata: Companion metadata for the cache view (page
                 tables, cumulative lengths). Auto-derived from ``cache_view``
                 when ``None``.
@@ -480,8 +480,9 @@ class FlexibleAttentionModule(spx.Module):
             output_attentions: When ``True`` instructs the backend to
                 materialise softmax weights. Falls back to
                 ``config.output_attentions`` when ``None``.
-            precision: JAX matmul precision. Defaults to
-                ``lax.Precision.DEFAULT`` when ``None``.
+            precision: JAX matmul precision, forwarded to the vanilla backend
+                only. There ``None`` inherits the ambient JAX precision and an
+                explicit value (including ``DEFAULT``) is used as given.
             prevent_cse: Whether to prevent common-subexpression elimination
                 inside the kernel.
             cum_seqlens_q: Optional cumulative sequence lengths for query
@@ -671,6 +672,10 @@ class FlexibleAttentionModule(spx.Module):
             if impl_names & weight_aware_impls:
                 call_kwargs = dict(input_kwargs)
                 call_kwargs["return_attention_weights"] = output_attentions_computed
+            if AttentionMechanisms.VANILLA.value in impl_names:
+                # None inherits ambient JAX precision; explicit values (including
+                # DEFAULT) are forwarded.
+                call_kwargs["precision"] = precision
             return callable_attn(**call_kwargs)
 
         with _attention_mesh_context(self.config):  # pyright: ignore[reportOptionalContextManager]
@@ -1254,7 +1259,8 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
             mask_info: Container for attention mask.
             mode: Runtime mode (TRAIN, PREFILL, or DECODE).
             cache_view: View into KV cache for position tracking.
-            sliding_window: Window size as int (symmetric) or tuple (left, right).
+            sliding_window: Window size as int (HF convention: the query plus
+                ``W - 1`` neighbours each side) or inclusive tuple (left, right).
             query_length: Length of query sequence.
             masking_details: Details about mask type from cache.
             cache_metadata: Metadata for cache position tracking.
@@ -1279,7 +1285,8 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
                     f"Invalid sliding_window: expected a non-negative integer, but got {sliding_window}. "
                     f"Window size must be >= 0."
                 )
-            left_window = right_window = sliding_window
+            # An int is a window *size* (HF convention): the query plus its ``W - 1`` neighbours.
+            left_window = right_window = max(sliding_window - 1, 0)
         else:
             left_window, right_window = sliding_window
             if left_window < 0 or right_window < 0:

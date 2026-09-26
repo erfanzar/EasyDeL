@@ -277,9 +277,15 @@ class Rngs(Module):
         items = self._spx_items
         if name in items:
             return items[name]
+        if _inside_transform():
+            # A new graph child cannot be added mid-trace (it would not be part
+            # of the exported state, so its counter would restart every call and
+            # repeat its key). Derive a one-off stream from the *advancing*
+            # default stream instead, mirroring :meth:`key`.
+            key = items["default"].next_key()
+            return RngStream(jax.random.fold_in(key, jnp.int32(_str_hash(name))))
         items[name] = items["default"].fold_in(name)
-        if not _inside_transform():
-            _bump_graph_epoch()
+        _bump_graph_epoch()
         return items[name]
 
     def key(self, name: str = "default") -> PRNGKey:

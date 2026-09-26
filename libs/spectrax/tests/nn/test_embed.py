@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import jax.numpy as jnp
-
 from spectrax.init import constant, normal
 from spectrax.nn.embed import Embed
 from spectrax.rng.rngs import Rngs

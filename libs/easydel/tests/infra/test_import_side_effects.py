@@ -18,6 +18,8 @@ import os
 import subprocess
 import sys
 
+import pytest
+
 
 def _run_import_probe(env_overrides: dict[str, str] | None = None) -> tuple[int, str, str]:
     env = os.environ.copy()
@@ -150,6 +152,78 @@ def test_import_easydel_detects_tpu_generation_from_env_without_explicit_selecto
     flags = _last_stdout_line(stdout)
     assert "--xla_tpu_scoped_vmem_limit_kib=98304" in flags
     assert "--xla_tpu_enable_async_collective_fusion=true" in flags
+
+
+@pytest.mark.parametrize("selector", ["EASYDEL_TARGETED_TPU_GENERATION", "TPU_TYPE"])
+def test_import_easydel_disables_v5p_continuation_fusion_without_disabling_async_collectives(selector):
+    returncode, stdout, stderr = _run_libtpu_env_probe(
+        {
+            "ENABLE_DISTRIBUTED_INIT": "0",
+            "XLA_FLAGS": "",
+            selector: "v5p-8",
+        },
+        code=(
+            "import os\n"
+            "from jax._src import xla_bridge\n"
+            "assert not xla_bridge.backends_are_initialized()\n"
+            "import easydel\n"
+            "assert not xla_bridge.backends_are_initialized()\n"
+            "print(os.environ.get('LIBTPU_INIT_ARGS', ''))\n"
+        ),
+    )
+    assert returncode == 0, stderr
+    flags = _last_stdout_line(stdout).split()
+    assert "--xla_tpu_enable_async_collective_fusion=false" in flags
+    assert "--xla_tpu_enable_async_collective_fusion=true" not in flags
+    assert "--xla_tpu_enable_async_collective_fusion_fuse_all_gather=false" in flags
+    assert "--xla_tpu_enable_async_collective_fusion_fuse_all_gather=true" not in flags
+    assert "--xla_enable_async_all_gather=true" in flags
+    assert "--xla_enable_async_collective_permute=true" in flags
+    assert "--xla_tpu_enable_ag_backward_pipelining=true" in flags
+
+
+def test_import_easydel_keeps_v5e_continuation_fusion_defaults():
+    returncode, stdout, stderr = _run_libtpu_env_probe(
+        {
+            "ENABLE_DISTRIBUTED_INIT": "0",
+            "XLA_FLAGS": "",
+            "EASYDEL_TARGETED_TPU_GENERATION": "v5e",
+        }
+    )
+    assert returncode == 0, stderr
+    flags = _last_stdout_line(stdout).split()
+    assert "--xla_tpu_enable_async_collective_fusion=true" in flags
+    assert "--xla_tpu_enable_async_collective_fusion_fuse_all_gather=true" in flags
+    assert "--xla_enable_async_all_gather=true" in flags
+
+
+@pytest.mark.parametrize("source", ["LIBTPU_INIT_ARGS", "XLA_FLAGS"])
+@pytest.mark.parametrize("generation,value", [("v5p", "true"), ("v5e", "false"), ("v6e", "false")])
+def test_import_easydel_preserves_explicit_tpu_fusion_flags(source, generation, value):
+    overrides = (
+        f"--xla_tpu_enable_async_collective_fusion={value} "
+        f"--xla_tpu_enable_async_collective_fusion_fuse_all_gather={value}"
+    )
+    returncode, stdout, stderr = _run_libtpu_env_probe(
+        {
+            "ENABLE_DISTRIBUTED_INIT": "0",
+            "EASYDEL_TARGETED_TPU_GENERATION": generation,
+            "XLA_FLAGS": "",
+            source: overrides,
+        },
+        code=(
+            "import os\n"
+            "import easydel\n"
+            f"assert os.environ[{source!r}].startswith({overrides!r})\n"
+            "print(os.environ.get('LIBTPU_INIT_ARGS', ''))\n"
+        ),
+    )
+    assert returncode == 0, stderr
+    flags = _last_stdout_line(stdout).split()
+    for name in ("--xla_tpu_enable_async_collective_fusion", "--xla_tpu_enable_async_collective_fusion_fuse_all_gather"):
+        matching_flags = [flag for flag in flags if flag.split("=", 1)[0] == name]
+        assert matching_flags == ([f"{name}={value}"] if source == "LIBTPU_INIT_ARGS" else [])
+    assert "--xla_enable_async_all_gather=true" in flags
 
 
 def test_import_easydel_exports_detected_tpu_generation():

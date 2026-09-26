@@ -3,7 +3,6 @@ from types import SimpleNamespace
 import jax
 import jax.numpy as jnp
 import numpy as np
-
 from easydel.inference.esurge.runners.async_types import AsyncPreResults, AsyncWindowResult, DeviceInputTokenHandoff
 from easydel.inference.esurge.runners.execution_manager import ExecutionManager
 from easydel.inference.esurge.runners.execution_types import BatchMetadata

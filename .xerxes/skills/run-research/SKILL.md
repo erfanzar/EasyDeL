@@ -75,17 +75,20 @@ already depends on it.
 
 ## Environment Defaults
 
-CPU JAX checks use:
+Computation tests (anything that executes JAX numerics) run on the accelerator — TPU shown; GPU uses
+`JAX_PLATFORMS=cuda,cpu JAX_PLATFORM_NAME=gpu`:
 
 ```bash
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
-XLA_FLAGS=--xla_force_host_platform_device_count=8 \
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
   uv run pytest <path>
 ```
 
-TPU uses a single-process libtpu lock. If the machine is busy, run only unrelated host-side probes with
-`JAX_PLATFORMS=cpu`. CPU checks do not validate TPU kernels, Mosaic lowering, eSurge runtime behavior, or performance
-claims.
+The CPU trio (`ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=8`) is only
+for tests that do no array computation (eray, parsers, config/CLI parsing, data text transforms). A CPU run of a
+computation test is not validation; with no accelerator, report the result as unverified on hardware.
+
+TPU uses a single-process libtpu lock: run one accelerator test process at a time. If the machine is busy, only
+non-computation probes may use `JAX_PLATFORMS=cpu`; computation tests wait for the TPU.
 
 ## Reporting
 

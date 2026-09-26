@@ -28,6 +28,7 @@ References:
 """
 
 import functools
+import re
 import typing
 from functools import cached_property, partial
 from typing import ClassVar
@@ -35,6 +36,7 @@ from typing import ClassVar
 import jax
 import jax.numpy as jnp
 import spectrax as spx
+from eformer.loggings import get_logger
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -81,12 +83,15 @@ from easydel.layers import (
 )
 from easydel.layers.attention import UnifiedAttention
 from easydel.layers.linear_attention import apply_conv_with_state, apply_mask_to_padding_states
+from easydel.layers.moe import moe_group_topk_select
 from easydel.layers.norms import lowfloats
 from easydel.modules._base import BaseCausalLMModule
 from easydel.operations import OperationMetadata
-from easydel.operations.kernels import KDAOutput, KernelDeltaAttnOp, fused_kda_gate
+from easydel.operations.kernels import KDAOutput, KernelDeltaAttnOp, fused_kda_gate_per_channel
 
 from .kimi_linear_configuration import KimiLinearConfig
+
+logger = get_logger(__name__)
 
 
 class KimiRMSNorm(spx.Module):
@@ -411,69 +416,27 @@ class KimiMoEGate(spx.Module):
             key=rngs.parameters,
         )
 
-    def forward(self, hidden_states: Float[Array, "tokens hidden_dim"]):
-        """Pick the top-``top_k`` experts per token using DeepSeek-V3 grouped routing.
+    def forward(self, hidden_states: Float[Array, "tokens hidden_dim"]) -> Array:
+        """Compute raw fp32 router logits ``(tokens, num_experts)``.
 
-        Algorithm (per token):
-
-        1. Score every expert with ``sigmoid(W x)``.
-        2. Add the static ``e_score_correction_bias`` (a per-expert offset that
-           the trainer can nudge to keep utilization balanced — analogous to
-           the "expert priority" trick in Mixtral/DeepSeek-V3).
-        3. Reshape into ``num_expert_group`` groups, score each group by the
-           sum of its top-2 experts, and select the ``topk_group`` highest
-           groups. Mask all experts outside the selected groups to ``-inf``
-           so subsequent ``top_k`` only picks within them — this is the
-           "expert grouping" load-balance trick.
-        4. Take the global ``top_k`` of the masked scores; if
-           ``moe_renormalize`` is on, renormalize the kept weights so they
-           sum to 1, then multiply by ``routed_scaling_factor``.
+        Selection runs in :meth:`KimiSparseMoeBlock._select_hook`: DeepSeek-V3
+        grouped top-k over ``sigmoid(logits) + e_score_correction_bias``, with
+        the combine weights taken from the un-biased scores, renormalized when
+        ``moe_renormalize`` and scaled by ``routed_scaling_factor``. Returning
+        the full per-expert logits (rather than collapsed top-k values) lets
+        the dispatcher see which experts were picked.
 
         Args:
-            hidden_states: Per-token features ``(num_tokens, hidden_size)``;
-                expected to be already flattened across batch/seq.
+            hidden_states: Per-token features ``(num_tokens, hidden_size)``.
 
         Returns:
-            jax.Array: ``(num_tokens, top_k)`` array of expert-routing
-            weights, ready to be multiplied with the matching expert outputs.
-            Indices are not returned here — the parent
-            :class:`KimiSparseMoeBlock` derives them from the same scores.
+            jax.Array: Router logits ``(num_tokens, num_experts)`` in float32.
         """
-        num_tokens, _ = hidden_states.shape
-
-        logits = jnp.dot(
+        return jnp.dot(
             hidden_states.astype(jnp.float32),
             self.weight.value.astype(jnp.float32),
             precision=self.precision,
         )
-
-        scores = jax.nn.sigmoid(logits)
-
-        scores_for_choice = scores + self.e_score_correction_bias.value
-        group_scores = scores_for_choice.reshape(num_tokens, self.n_group, -1)
-        top2_scores = jax.lax.top_k(group_scores, k=2)[0]
-        group_scores_sum = jnp.sum(top2_scores, axis=-1)
-
-        group_idx = jax.lax.top_k(group_scores_sum, k=self.topk_group)[1]
-
-        group_mask = jnp.zeros_like(group_scores_sum)
-        indices = jnp.arange(group_mask.shape[0])[:, None]
-        group_mask = group_mask.at[indices, group_idx].set(1.0)
-
-        score_mask = jnp.repeat(
-            group_mask[:, :, None],
-            self.n_routed_experts // self.n_group,
-            axis=2,
-        ).reshape(num_tokens, -1)
-
-        masked_scores = jnp.where(score_mask > 0, scores_for_choice, 0.0)
-        topk_weight, _ = jax.lax.top_k(masked_scores, k=self.top_k)
-
-        if self.top_k > 1 and self.norm_topk_prob:
-            denominator = jnp.sum(topk_weight, axis=-1, keepdims=True) + 1e-20
-            topk_weight = topk_weight / denominator
-
-        return topk_weight * self.routed_scaling_factor
 
 
 class KimiMLPMoE(spx.Module):
@@ -544,8 +507,8 @@ class KimiMLPMoE(spx.Module):
     @property
     def reform_param(self):
         return {
-            **moe_fused_gate_up_reform_param(config=self.config, transpose_weight=False),
-            **moe_down_projection_reform_param(transpose_weight=False),
+            **moe_fused_gate_up_reform_param(config=self.config),
+            **moe_down_projection_reform_param(),
         }
 
     def forward(
@@ -648,7 +611,8 @@ class KimiSparseMoeBlock(BaseMoeModule):
             precision=precision,
             rngs=rngs,
         )
-
+        # The gate emits raw logits; `_select_hook` scores and selects.
+        self.moe_hooks = self.moe_hooks.replace(normalize_gate_logits=lambda x: x)
         self.use_latent_moe = use_latent_moe
         self.moe_hidden_size = moe_hidden_size
 
@@ -721,6 +685,21 @@ class KimiSparseMoeBlock(BaseMoeModule):
                 Output has shape (batch, seq_len, hidden_dim).
         """
         expert_input = self.routed_expert_down_proj(hidden_states) if self.use_latent_moe else hidden_states
+        n_group = self.gate.n_group if getattr(self.config, "use_grouped_topk", True) else 1
+        # Bound per call so a trained correction bias reaches routing.
+        select_hook = partial(
+            moe_group_topk_select,
+            n_routed_experts=self.gate.n_routed_experts,
+            score_fn=self.config.moe_router_activation_func,
+            e_score_correction_bias=self.gate.e_score_correction_bias.value,
+            n_group=n_group,
+            topk_group=self.gate.topk_group if n_group > 1 else 1,
+            group_topk_k=min(2, self.gate.n_routed_experts // max(n_group, 1)),
+            group_score="topk_sum",
+            # HF renormalizes only when more than one expert is kept.
+            norm_topk_prob=bool(self.gate.norm_topk_prob) and self.gate.top_k > 1,
+            routed_scaling_factor=self.gate.routed_scaling_factor,
+        )
         out, router_logits = self.moe_call(
             hidden_state=expert_input,
             # Routing is scored on the full-width hidden state even when the
@@ -734,6 +713,7 @@ class KimiSparseMoeBlock(BaseMoeModule):
             # (gate, up) callable rather than a unary activation.
             ffn_activation=self.experts.act_fn,
             act_fn=jax.nn.silu,
+            hooks=self.moe_hooks.replace(select_hook=select_hook),
         )
 
         if self.use_latent_moe:
@@ -1038,12 +1018,12 @@ class KimiDeltaAttention(spx.Module):
               + \\beta_t \\, k_t v_t^\\top, \\qquad
         o_t = S_t^\\top q_t
 
-    where :math:`\\alpha_t = \\exp(-\\Delta_t \\, \\text{softplus}(A))` is a
-    per-head data-independent decay (a la Mamba-2), :math:`\\beta_t =
+    where :math:`\\alpha_t = \\exp(-e^{A} \\, \\text{softplus}(\\Delta_t))` is a
+    per-channel (one rate per head and key channel) data-dependent decay, :math:`\\beta_t =
     \\sigma(W_b x_t)` is the per-token *write strength* (the "delta" of the
     delta rule — large :math:`\\beta` overwrites the existing memory at
     direction :math:`k_t`, small :math:`\\beta` blends), and :math:`\\Delta_t`
-    is a low-rank scalar produced by ``f_a_proj -> f_b_proj``. Q/K/V are first
+    is the low-rank ``f_a_proj -> f_b_proj`` output plus ``dt_bias``. Q/K/V are first
     passed through *separate* causal depthwise 1-D convolutions of width
     ``d_conv`` so each head still sees a small local window, and the output
     is fed through a low-rank gate (``g_a_proj -> g_b_proj``) and a gated
@@ -1060,16 +1040,16 @@ class KimiDeltaAttention(spx.Module):
         q_proj, k_proj, v_proj: Linear projections to Q/K/V before the convs.
         q_conv1d, k_conv1d, v_conv1d: Per-stream causal depthwise 1-D
             convolutions (``feature_group_count == channels``) of width ``d_conv``.
-        f_a_proj, f_b_proj: Low-rank MLP producing the per-head decay
-            factor :math:`\\Delta`.
+        f_a_proj, f_b_proj: Low-rank projection producing the per-channel
+            decay input :math:`\\Delta` (``num_heads * head_k_dim`` outputs).
         b_proj: Per-head linear producing the delta-rule write strength
             :math:`\\beta` (sigmoid-activated).
         g_a_proj, g_b_proj: Low-rank MLP producing the output gate.
-        o_norm (RMSNormGated): Gated RMS normalization on the head outputs.
+        o_norm (RMSNormGated): Sigmoid-gated RMS normalization on the head outputs.
         o_proj: Final output projection back to ``hidden_size``.
-        A_log (ArrayParam): Log-scale per-head decay base; the actual decay
-            uses ``-softplus(A_log)`` to stay non-positive.
-        dt_bias (ArrayParam): Per-head bias on :math:`\\Delta` after the
+        A_log (ArrayParam): Per-head log decay rate; the decay is
+            ``-exp(A_log) * softplus(f_b(f_a(x)) + dt_bias)``, non-positive.
+        dt_bias (ArrayParam): Per-channel bias on :math:`\\Delta` after the
             low-rank projection.
         kda_op (KernelDeltaAttnOp): Fused chunked kernel that runs the
             recurrence.
@@ -1105,11 +1085,14 @@ class KimiDeltaAttention(spx.Module):
 
         linear_config = config.linear_attn_config or {}
         self.num_heads = linear_config.get("num_heads", config.num_attention_heads)
-        self.head_k_dim = linear_config.get("head_k_dim", 128)
-        self.head_v_dim = linear_config.get("head_v_dim", 128)
-        self.d_conv = linear_config.get("d_conv", 4)
+        # Moonshot's config names one ``head_dim`` (and ``short_conv_kernel_size``);
+        # the fla-style ``head_k_dim``/``head_v_dim``/``d_conv`` keys override it.
+        head_dim = linear_config.get("head_dim", 128)
+        self.head_k_dim = linear_config.get("head_k_dim", head_dim)
+        self.head_v_dim = linear_config.get("head_v_dim", head_dim)
+        self.d_conv = linear_config.get("d_conv", linear_config.get("short_conv_kernel_size", 4))
         self.expand_ratio = linear_config.get("expand_ratio", 1)
-        self.gate_low_rank_dim = linear_config.get("gate_low_rank_dim", 128)
+        self.gate_low_rank_dim = linear_config.get("gate_low_rank_dim", head_dim)
         self.chunk_size = linear_config.get("chunk_size", 64)
 
         self.key_dim = self.num_heads * self.head_k_dim
@@ -1138,6 +1121,7 @@ class KimiDeltaAttention(spx.Module):
             dtype=dtype,
             rngs=rngs,
             use_bias=False,
+            precision=precision,
         )
         self.k_conv1d = nn.Conv1d(
             in_channels=self.key_dim,
@@ -1148,6 +1132,7 @@ class KimiDeltaAttention(spx.Module):
             dtype=dtype,
             rngs=rngs,
             use_bias=False,
+            precision=precision,
         )
         self.v_conv1d = nn.Conv1d(
             in_channels=self.value_dim,
@@ -1158,10 +1143,12 @@ class KimiDeltaAttention(spx.Module):
             dtype=dtype,
             rngs=rngs,
             use_bias=False,
+            precision=precision,
         )
 
         self.f_a_proj = column_linear(config.hidden_size, self.gate_low_rank_dim)
-        self.f_b_proj = column_linear(self.gate_low_rank_dim, self.num_heads)
+        # Per-channel decay: one rate per (head, key channel).
+        self.f_b_proj = column_linear(self.gate_low_rank_dim, self.key_dim)
 
         self.b_proj = column_linear(config.hidden_size, self.num_heads)
 
@@ -1184,6 +1171,7 @@ class KimiDeltaAttention(spx.Module):
             eps=config.rms_norm_eps,
             dtype=dtype,
             param_dtype=param_dtype,
+            activation="sigmoid",
             rngs=rngs,
         )
 
@@ -1195,7 +1183,7 @@ class KimiDeltaAttention(spx.Module):
             key=rngs.parameters,
         )
         self.dt_bias = ArrayParam.bound(
-            shape=(self.num_heads,),
+            shape=(self.key_dim,),
             dtype=param_dtype,
             init_method="constant",
             init_kwargs={"value": 1.0},
@@ -1212,6 +1200,11 @@ class KimiDeltaAttention(spx.Module):
     @property
     def reform_param(self):
         return {
+            # Checkpoints store ``A_log`` as ``[1, 1, num_heads, 1]``.
+            "A_log$": {
+                "splits": [{"name": "A_log", "spliter": lambda x: x.reshape(-1)}],
+                "inverse_spliter": lambda torch, a_log: a_log.reshape(1, 1, -1, 1),
+            },
             "q_conv1d.weight$": {
                 "splits": [{"name": "q_conv1d.weight", "spliter": lambda x: x.permute(2, 1, 0)}],
                 "inverse_spliter": lambda torch, kernel: kernel.permute(2, 1, 0),
@@ -1334,14 +1327,12 @@ class KimiDeltaAttention(spx.Module):
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        f_hidden = jax.nn.silu(self.f_a_proj(hidden_states))
-        gate = self.f_b_proj(f_hidden)
-        decay = fused_kda_gate(gate, self.A_log.value, self.dt_bias.value)
+        gate = self.f_b_proj(self.f_a_proj(hidden_states))
+        decay = fused_kda_gate_per_channel(gate, self.A_log.value, self.dt_bias.value, lower_bound=None)
 
         beta = jax.nn.sigmoid(self.b_proj(hidden_states))
 
-        g_hidden = jax.nn.silu(self.g_a_proj(hidden_states))
-        output_gate = self.g_b_proj(g_hidden)
+        output_gate = self.g_b_proj(self.g_a_proj(hidden_states))
         output_gate = output_gate.reshape(batch_size, seq_len, self.num_heads, self.head_v_dim)
 
         recurrent_state = cache_view.recurrent_state if cache_view is not None else None
@@ -1358,6 +1349,7 @@ class KimiDeltaAttention(spx.Module):
             recurrent_state=recurrent_state,
             segment_ids=segment_ids,
             chunk_size=self.chunk_size,
+            per_channel_decay=True,
         )
 
         output = kda_output.attention_outputs
@@ -1586,6 +1578,63 @@ class KimiDecoderLayer(spx.Module):
         )
 
 
+def _kimi_checkpoint_key_normalizer(key: str) -> str | None:
+    """Rewrite Moonshot's published Kimi-Linear keys to the runtime names.
+
+    The hub checkpoint keeps MoE layers under ``block_sparse_moe`` with
+    per-expert ``w1``/``w3``/``w2`` (gate/up/down); the runtime (like
+    transformers' built-in port) names the block ``mlp``. Renamed
+    per-expert tensors are then stacked and fused by the loader.
+    Idempotent on already-converted keys.
+    """
+    key = key.replace(".block_sparse_moe.", ".mlp.")
+    match = _KIMI_EXPERT_KEY.match(key)
+    if match is not None:
+        key = f"{match.group(1)}{_KIMI_EXPERT_NAMES[match.group(2)]}{match.group(3)}"
+    return key
+
+
+def _upgrade_legacy_kda_gate_state(self, state: dict, expected_leaves: dict) -> dict:
+    """Widen per-head KDA gate leaves from native checkpoints saved before the per-channel fix.
+
+    Older saves of this port kept one decay rate per head: ``f_b_proj`` produced
+    ``num_heads`` outputs and ``dt_bias`` had ``num_heads`` entries. Repeating each
+    head across its ``head_k_dim`` channels gives the per-channel leaves the same
+    ``f_b(f_a(x)) + dt_bias`` term. The rest of that old KDA layer also changed (no
+    SiLU on the low-rank gates, sigmoid output gate), so outputs are not identical
+    to what the checkpoint produced before.
+
+    Args:
+        state: Flat native state ``{(collection, *path): array}``; updated in place.
+        expected_leaves: The model's leaves under the same keys.
+
+    Returns:
+        dict: ``state``.
+    """
+    upgraded = []
+    for key, value in list(state.items()):
+        expected = expected_leaves.get(key)
+        shape = getattr(value, "shape", None)
+        if expected is None or shape is None or tuple(shape) == tuple(expected.shape):
+            continue
+        tail = tuple(str(part) for part in key[-2:])
+        if tail[-1] != "dt_bias" and tail != ("f_b_proj", "weight"):
+            continue
+        want = tuple(expected.shape)
+        if len(shape) != len(want) or tuple(shape[:-1]) != want[:-1] or not shape[-1] or want[-1] % shape[-1]:
+            continue
+        state[key] = jnp.repeat(value, want[-1] // shape[-1], axis=-1)
+        upgraded.append(key)
+    if upgraded:
+        logger.warning(
+            f"Widened {len(upgraded)} per-head KDA gate leaves (f_b_proj/dt_bias) from a checkpoint saved before "
+            "Kimi-Linear used per-channel decay. The old layer also applied SiLU to its low-rank gates and a SiLU "
+            "output gate; those now match Moonshot's model, so this checkpoint's outputs change -- fine-tune or "
+            "re-convert it from the Hugging Face weights."
+        )
+    return state
+
+
 @register_module(TaskType.BASE_MODULE, config=KimiLinearConfig, model_type="kimi_linear")
 class KimiLinearModel(EasyDeLBaseModule):
     """Kimi Linear base transformer model.
@@ -1607,6 +1656,9 @@ class KimiLinearModel(EasyDeLBaseModule):
         param_dtype (jnp.dtype): Data type for parameters.
         precision: Precision setting for JAX operations.
     """
+
+    _upgrade_legacy_native_state = _upgrade_legacy_kda_gate_state
+    _checkpoint_key_normalizer = staticmethod(_kimi_checkpoint_key_normalizer)
 
     def __init__(
         self,
@@ -1905,6 +1957,10 @@ class KimiLinearModel(EasyDeLBaseModule):
         return self.embed_tokens
 
 
+_KIMI_EXPERT_KEY = re.compile(r"^(.*\.experts\.\d+\.)(w1|w2|w3)(\.weight)$")
+_KIMI_EXPERT_NAMES = {"w1": "gate_proj", "w3": "up_proj", "w2": "down_proj"}
+
+
 @register_module(TaskType.CAUSAL_LM, config=KimiLinearConfig, model_type="kimi_linear")
 class KimiLinearForCausalLM(BaseCausalLMModule[KimiLinearModel, KimiLinearConfig]):  # type: ignore
     """Kimi Linear model with a causal language modeling head.
@@ -1923,9 +1979,13 @@ class KimiLinearForCausalLM(BaseCausalLMModule[KimiLinearModel, KimiLinearConfig
         precision: Precision setting for JAX operations.
     """
 
+    _upgrade_legacy_native_state = _upgrade_legacy_kda_gate_state
+
     _task_type = TaskType.CAUSAL_LM
     _model_type = "kimi_linear"
     _config_class = KimiLinearConfig
+
+    _checkpoint_key_normalizer = staticmethod(_kimi_checkpoint_key_normalizer)
 
     def __init__(
         self,

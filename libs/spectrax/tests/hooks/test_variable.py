@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import jax.numpy as jnp
-
 from spectrax.core.variable import Parameter
 from spectrax.hooks.variable import register_variable_hook
 

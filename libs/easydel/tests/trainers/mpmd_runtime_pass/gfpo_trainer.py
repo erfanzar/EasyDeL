@@ -25,9 +25,8 @@ import os
 import sys
 from pathlib import Path
 
-import jax
-
 import easydel as ed
+import jax
 
 if __package__ in {None, ""}:
     sys.path.append(str(Path(__file__).resolve().parent))

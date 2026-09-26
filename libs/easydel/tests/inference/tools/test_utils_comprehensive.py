@@ -14,8 +14,6 @@
 
 """Comprehensive tests for tool parsing utility functions."""
 
-from partial_json_parser.core.options import Allow
-
 from easydel.inference.tools.utils import (
     consume_space,
     extract_intermediate_diff,
@@ -25,6 +23,7 @@ from easydel.inference.tools.utils import (
     is_complete_json,
     partial_json_loads,
 )
+from partial_json_parser.core.options import Allow
 
 
 class TestFindCommonPrefix:

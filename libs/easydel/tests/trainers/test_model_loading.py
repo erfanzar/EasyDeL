@@ -15,7 +15,6 @@
 from types import SimpleNamespace
 
 import pytest
-
 from easydel.infra.loss_utils import LossMetrics
 from easydel.trainers import model_loading
 from easydel.trainers.binary_classifier_optimization_trainer.bco_trainer import BCOTrainer

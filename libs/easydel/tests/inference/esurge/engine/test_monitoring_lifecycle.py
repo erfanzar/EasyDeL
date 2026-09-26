@@ -35,7 +35,6 @@ import time
 from types import SimpleNamespace
 
 import pytest
-
 from easydel.inference.esurge.engine.loop import EngineLoop
 from easydel.inference.esurge.engine.monitoring_stack import (
     MonitoringStack,
@@ -162,13 +161,8 @@ def test_is_nonrecoverable_scheduler_error_unrelated_value_error():
 
 def test_is_nonrecoverable_scheduler_error_non_value_error():
     """RuntimeError, KeyError, etc. are recoverable per the predicate's contract."""
-    assert (
-        eSurge._is_nonrecoverable_scheduler_error(RuntimeError("Non-DP-local page IDs detected")) is False
-    )
-    assert (
-        eSurge._is_nonrecoverable_scheduler_error(KeyError("Distributed step synchronization failure"))
-        is False
-    )
+    assert eSurge._is_nonrecoverable_scheduler_error(RuntimeError("Non-DP-local page IDs detected")) is False
+    assert eSurge._is_nonrecoverable_scheduler_error(KeyError("Distributed step synchronization failure")) is False
 
 
 def test_model_overrides_esurge_graphdef_returns_false_for_plain_class():

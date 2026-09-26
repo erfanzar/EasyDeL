@@ -781,7 +781,7 @@ class ParallelLinearQuantized(spx.Module):
         kernel_init: Initializer = default_kernel_init,
         bias_init: Initializer = default_bias_init,
         config: QuantizationConfig,
-        qmm_platform: tp.Literal["triton", "pallas", "cuda", "cute", "xla", "auto"] | None = None,
+        qmm_platform: tp.Literal["triton", "pallas", "cuda", "cute", "tilelang", "xla", "auto"] | None = None,
         qmm_use_best_config: bool | None = None,
         qmm_fuse: bool | None = None,
         qmm_strict_fuse: bool | None = None,

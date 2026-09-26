@@ -35,8 +35,8 @@ from typing import TypeVar, cast
 
 import jax
 
-from ..core.graph import bind, export
-from ..core.module import Module, _set_inside_transform
+from ..core.graph import bind, export, live_variables
+from ..core.module import Module, _graph_epoch, _set_inside_transform
 from ..core.selector import SelectorSugar, as_selector
 from ..core.state import State
 from .split_merge import (
@@ -171,23 +171,27 @@ def value_and_grad(
             out, grads_module = vg(*args, **kwargs)
             return out, _module_like_to_state(grads_module)
         other_args = tuple(args[:idx]) + tuple(args[idx + 1 :])
+        target_keys = set(target.paths())
 
         def pure(
             target_state: State,
             rest_state: State,
             other: tuple[object, ...],
             kw: dict[str, object],
-        ) -> tuple[object, object | None]:
+        ) -> tuple[object, tuple[object | None, State]]:
             """Pure closure fed to :func:`jax.value_and_grad`.
 
             Overlays the differentiation target on top of the captured
             non-target state, rebinds a fresh module, splices it into
             the user's positional arguments at ``idx``, and runs ``fn``
             inside the inside-transform thread-local. Returns
-            ``(value, aux_or_None)`` — the wrapper always sets
-            ``has_aux=True`` on the inner :func:`jax.value_and_grad`
-            call so it can pass ``rest_state`` and ``aux`` through
-            uniformly.
+            ``(value, (aux_or_None, rest_mutations))`` — the wrapper
+            always sets ``has_aux=True`` on the inner
+            :func:`jax.value_and_grad` call so it can pass ``aux`` and
+            the writes ``fn`` made to non-differentiated variables
+            (RNG counters, buffers, batch statistics, …) through
+            uniformly; those writes are applied to the live module
+            afterwards instead of being dropped.
 
             Args:
                 target_state: Target state value consumed by this operation.
@@ -200,6 +204,7 @@ def value_and_grad(
             """
             merged = target_state.overlay(rest_state)
             m = bind(gdef, merged)
+            snapshot = [(var.kind, path, var, var._value) for path, var in live_variables(m)]
             spliced = list(other)
             spliced.insert(idx, m)
             _set_inside_transform(True)
@@ -207,10 +212,14 @@ def value_and_grad(
                 out = fn(*spliced, **kw)
             finally:
                 _set_inside_transform(False)
+            changed: dict[str, dict[str, object]] = {}
+            for kind, path, var, initial in snapshot:
+                if var._value is not initial and (kind, path) not in target_keys:
+                    changed.setdefault(kind, {})[path] = var._value
             if has_aux:
                 val, aux = out
-                return val, aux
-            return out, None
+                return val, (aux, State(changed))
+            return out, (None, State(changed))
 
         vg_kwargs: dict[str, object] = {
             "has_aux": True,
@@ -220,12 +229,37 @@ def value_and_grad(
         if reduce_axes:
             vg_kwargs["reduce_axes"] = reduce_axes
         vg = jax.value_and_grad(pure, **vg_kwargs)
-        (value, aux), grads_target = vg(target, rest, other_args, kwargs)
+        (value, (aux, rest_mutations)), grads_target = vg(target, rest, other_args, kwargs)
+        _write_back_rest_mutations(model, rest_mutations)
         if has_aux:
             return (value, aux), grads_target
         return value, grads_target
 
     return cast(F, wrapped)
+
+
+def _write_back_rest_mutations(model: Module, mutations: State) -> None:
+    """Apply writes made under :func:`value_and_grad` to non-differentiated variables.
+
+    Mirrors :func:`~spectrax.transforms.split_merge.apply_mutations`: the
+    new values land on the live :class:`~spectrax.Variable` storage so an
+    enclosing transform observes them as ordinary module mutations.
+
+    Args:
+        model: The live module that was differentiated.
+        mutations: ``{collection: {path: value}}`` of changed leaves.
+    """
+    if not mutations:
+        return
+    cache = model._spx_export_cache
+    if cache is None or cache[0] != _graph_epoch():
+        export(model)
+        cache = model._spx_export_cache
+    vars_by_path = cache[3]
+    for collection, path, value in mutations.items():
+        var = vars_by_path.get((collection, path))
+        if var is not None:
+            var._raw_set(value)
 
 
 def grad(

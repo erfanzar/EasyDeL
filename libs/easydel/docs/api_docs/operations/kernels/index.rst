@@ -10,6 +10,7 @@ easydel.operations.kernels package
    compressed_window_decode
    decode_attention
    flash_attention
+   fused_mlp
    gated_delta_rule
    gdn_compute_schedule_v2
    glm_moe_dsa_indexer

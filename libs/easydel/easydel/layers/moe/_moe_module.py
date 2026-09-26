@@ -1431,13 +1431,17 @@ class BaseMoeModule(spx.Module, ABC):
         # Do not infer this from a global config: projections may differ.
         def _unpack_precision(kernel):
             if isinstance(kernel, tuple):
-                return tuple(kernel), getattr(kernel, "activation_bits", None)
-            return kernel, None
+                return (
+                    tuple(kernel),
+                    getattr(kernel, "activation_bits", None),
+                    getattr(kernel, "grouped_platform", None),
+                )
+            return kernel, None, None
 
-        wi_kernel, wi_activation_bits = _unpack_precision(wi_kernel)
-        wu_kernel, wu_activation_bits = _unpack_precision(wu_kernel)
-        wd_kernel, wd_activation_bits = _unpack_precision(wd_kernel)
-        gate_up_kernel, gate_up_activation_bits = _unpack_precision(gate_up_kernel)
+        wi_kernel, wi_activation_bits, wi_grouped_platform = _unpack_precision(wi_kernel)
+        wu_kernel, wu_activation_bits, wu_grouped_platform = _unpack_precision(wu_kernel)
+        wd_kernel, wd_activation_bits, wd_grouped_platform = _unpack_precision(wd_kernel)
+        gate_up_kernel, gate_up_activation_bits, gate_up_grouped_platform = _unpack_precision(gate_up_kernel)
 
         hidden_state = hidden_state.astype(self.dtype)
         gate_hidden_state = hidden_state if gate_hidden_state is None else gate_hidden_state.astype(self.dtype)
@@ -1491,6 +1495,14 @@ class BaseMoeModule(spx.Module, ABC):
             tp_size,
             _,
         ) = self._get_sharding_status()
+        # The shard_map below runs on ``expert_mesh``. When fsdp/sp are bound
+        # into experts it is the folded (dp, ep, tp) mesh whose expert axis
+        # spans ep*fsdp*sp devices, while the model mesh above reports the
+        # physical ep axis alone. Local expert counts must follow the mesh the
+        # weights are actually partitioned over.
+        expert_mesh_sizes = dict(expert_mesh.jax_mesh.shape)
+        ep_size = int(expert_mesh_sizes.get(expert_axis_name, ep_size))
+        tp_size = int(expert_mesh_sizes.get(tensor_axis_name, tp_size))
 
         # Quantization-aware training reaches the experts here rather than
         # through ``ParallelMoELinear.forward``: this fused path reads the
@@ -2078,7 +2090,14 @@ class BaseMoeModule(spx.Module, ABC):
                     ``tp_size == 1``).
                 """
 
-                def _expert_gmm(rows, kernel, *, tp_sharded_contraction: bool = False, activation_bits=None):
+                def _expert_gmm(
+                    rows,
+                    kernel,
+                    *,
+                    tp_sharded_contraction: bool = False,
+                    activation_bits=None,
+                    grouped_platform=None,
+                ):
                     """Dense bf16 grouped matmul, or — when the kernel is a
                     quantized ``(codes, scales)`` pair from ``kernel_view()`` —
                     the v3 grouped matmul's native quantised-weight path:
@@ -2147,7 +2166,8 @@ class BaseMoeModule(spx.Module, ABC):
                                 scales,
                                 group_sizes,
                                 activation_bits=activation_bits,
-                                platform=_channelwise_grouped_platform(
+                                platform=grouped_platform
+                                or _channelwise_grouped_platform(
                                     rows,
                                     codes,
                                     activation_bits,
@@ -2206,21 +2226,36 @@ class BaseMoeModule(spx.Module, ABC):
 
                 x_rows = _mask_dispatch_tail(x_rows, group_sizes)
                 if gate_up_kernel is not None:
-                    layer_gate_up = _expert_gmm(x_rows, gate_up_kernel, activation_bits=gate_up_activation_bits)
+                    layer_gate_up = _expert_gmm(
+                        x_rows,
+                        gate_up_kernel,
+                        activation_bits=gate_up_activation_bits,
+                        grouped_platform=gate_up_grouped_platform,
+                    )
                     layer_gate_up = checkpoint_name(layer_gate_up, "mlp_gate_up")
                     if gate_up_bias is not None:
                         layer_gate_up = layer_gate_up + gate_up_bias[selected_experts]
                     layer_gate_up = _mask_dispatch_tail(layer_gate_up, group_sizes)
                     layer_w0, layer_w1 = jnp.split(layer_gate_up, 2, axis=-1)
                 else:
-                    layer_w0 = _expert_gmm(x_rows, wi_kernel, activation_bits=wi_activation_bits)
+                    layer_w0 = _expert_gmm(
+                        x_rows,
+                        wi_kernel,
+                        activation_bits=wi_activation_bits,
+                        grouped_platform=wi_grouped_platform,
+                    )
 
                     layer_w0 = checkpoint_name(layer_w0, "mlp_gate")
                     if wi_bias is not None:
                         layer_w0 = layer_w0 + wi_bias[selected_experts]
                     layer_w0 = _mask_dispatch_tail(layer_w0, group_sizes)
 
-                    layer_w1 = _expert_gmm(x_rows, wu_kernel, activation_bits=wu_activation_bits)
+                    layer_w1 = _expert_gmm(
+                        x_rows,
+                        wu_kernel,
+                        activation_bits=wu_activation_bits,
+                        grouped_platform=wu_grouped_platform,
+                    )
 
                     layer_w1 = checkpoint_name(layer_w1, "mlp_up")
                     if wu_bias is not None:
@@ -2230,7 +2265,11 @@ class BaseMoeModule(spx.Module, ABC):
                 intermediate_layer = _mask_dispatch_tail(ffn_activation(layer_w0, layer_w1), group_sizes)
 
                 intermediate_output = _expert_gmm(
-                    intermediate_layer, wd_kernel, tp_sharded_contraction=True, activation_bits=wd_activation_bits
+                    intermediate_layer,
+                    wd_kernel,
+                    tp_sharded_contraction=True,
+                    activation_bits=wd_activation_bits,
+                    grouped_platform=wd_grouped_platform,
                 )
                 intermediate_output = checkpoint_name(intermediate_output, "mlp_down")
 
@@ -2403,7 +2442,9 @@ class BaseMoeModule(spx.Module, ABC):
                 # Mask the gmm output tail before the unsort moves it around,
                 # and the unsorted buffer before the combine reads from it.
                 intermediate = _mask_row_tail(intermediate)
-                local_output = sort_activations(intermediate, jnp.argsort(local_sorted_indices), True)
+                local_output = sort_activations(
+                    intermediate, jnp.argsort(local_sorted_indices), True, inverse_indices=local_sorted_indices
+                )
                 local_output = _mask_row_tail(local_output)
 
                 c_in_off, c_send_sz, c_out_off, c_recv_sz = get_all_to_all_params(
@@ -2917,7 +2958,13 @@ class BaseMoeModule(spx.Module, ABC):
         if hooks.after_gate is not None:
             gate_logits = hooks.after_gate(gate_logits)
 
-        router_probs = jax.nn.softmax(gate_logits.astype(jnp.float32), axis=-1).astype(self.dtype)
+        # Same gate contract as the fused path: a model's ``normalize_gate_logits``
+        # (identity for sigmoid / pre-scored routers) replaces the default softmax,
+        # and selection runs in float32.
+        if hooks.normalize_gate_logits is not None:
+            router_probs = hooks.normalize_gate_logits(gate_logits)
+        else:
+            router_probs = jax.nn.softmax(gate_logits.astype(jnp.float32), axis=-1)
         if hooks.before_topk is not None:
             router_probs = hooks.before_topk(router_probs)
 
@@ -2937,9 +2984,9 @@ class BaseMoeModule(spx.Module, ABC):
             experts_shaped = experts.reshape(batch_size, seq_len, self.num_experts_per_tok)
             weights_shaped = self._apply_capacity_mask(experts_shaped, weights_shaped, capacity_factor)
             weights = weights_shaped.reshape(tokens, self.num_experts_per_tok)
-
-        weight_sum = jnp.sum(weights, axis=-1, keepdims=True)
-        weights = jnp.where(weight_sum > 0, weights / weight_sum, weights)
+        # No blanket renormalization here: the routing hooks decide (TOP_K
+        # renormalizes, TOP_K_NDIV and custom select hooks keep scaled or
+        # unnormalized weights), exactly as on the fused path.
 
         if ffn_activation is None:
 
@@ -3183,14 +3230,17 @@ class BaseMoeModule(spx.Module, ABC):
 
         router_logits = gate_layer(hidden_state_flat).astype(jnp.promote_types(self.dtype, jnp.float32))
 
-        # Store original logits BEFORE any hooks - used for expert selection (matching HF behavior).
-        prein_gate_logits = router_logits
-
-        # after_gate hook produces scattered probs for aux loss/logging, but we use original logits for selection.
+        # Same gate contract as the fused and dense paths: ``after_gate`` edits the
+        # logits, the model's ``normalize_gate_logits`` (identity for sigmoid /
+        # pre-scored routers) replaces the default softmax, and selection runs on
+        # those normalized scores (top-k of raw logits picks the right experts but
+        # combines them with logit-valued weights).
         if hooks.after_gate is not None:
-            router_probs = hooks.after_gate(router_logits)
+            router_logits = hooks.after_gate(router_logits)
+        if hooks.normalize_gate_logits is not None:
+            router_probs = hooks.normalize_gate_logits(router_logits)
         else:
-            router_probs = jax.nn.softmax(router_logits, axis=-1)
+            router_probs = jax.nn.softmax(router_logits.astype(jnp.float32), axis=-1)
 
         if reform_router_probs_fn is not None:
             router_probs = reform_router_probs_fn(router_probs)
@@ -3201,10 +3251,8 @@ class BaseMoeModule(spx.Module, ABC):
         if validate_inputs:
             self._validate_routing_inputs(hidden_state, router_logits)
 
-        # Use original logits for expert selection (top-k on logits, then softmax on k selected via refine_weights_hook).
-        # This matches HuggingFace behavior where top-k is done on pre-softmax logits.
         selected_weights, selected_experts = get_experts_location(
-            gate_logits=prein_gate_logits,
+            gate_logits=router_probs,
             pre_bias_logits=None,
             select_hook=hooks.select_hook,
             refine_weights_hook=hooks.refine_weights_hook,
@@ -3213,8 +3261,8 @@ class BaseMoeModule(spx.Module, ABC):
 
         if layer_idx is not None:
             # Get top-k logits (before softmax) for comparison
-            top_k_logits_pre, _ = jax.lax.top_k(prein_gate_logits, self.num_experts_per_tok)
-            jax.debug.print("  [ED Router L{}] logits[0]: {}", layer_idx, prein_gate_logits[0])
+            top_k_logits_pre, _ = jax.lax.top_k(router_logits, self.num_experts_per_tok)
+            jax.debug.print("  [ED Router L{}] logits[0]: {}", layer_idx, router_logits[0])
             jax.debug.print(
                 "  [ED Router L{}] top_idx[0]: {}, top_logits[0]: {}",
                 layer_idx,
@@ -3247,7 +3295,7 @@ class BaseMoeModule(spx.Module, ABC):
         ) = self._replicate_and_sort_tokens(hidden_state_flat, selected_experts)
 
         out_sorted = expert_layer(sorted_inputs, group_sizes, sorted_experts)
-        out_unsorted = sort_activations(out_sorted, jnp.argsort(sort_order))
+        out_unsorted = sort_activations(out_sorted, jnp.argsort(sort_order), inverse_indices=sort_order)
         out_unflat = out_unsorted.reshape(batch_size * seq_len, self.num_experts_per_tok, hidden_size)
 
         if hooks.before_combine is not None:

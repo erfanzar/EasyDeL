@@ -129,9 +129,7 @@ def test_adam_moments_must_be_wide_or_the_step_diverges():
     narrow_state = tx.init(params)  # moments in fp8 -- the wrong way
     broken = params
     for _ in range(10):
-        broken, narrow_state = narrow_storage_update(
-            broken, grads, narrow_state, tx, compute_dtype=_FP8
-        )
+        broken, narrow_state = narrow_storage_update(broken, grads, narrow_state, tx, compute_dtype=_FP8)
 
     wide_state = tx.init(jax.tree.map(lambda p: p.astype(jnp.float32), params))
     healthy = params

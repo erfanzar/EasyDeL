@@ -33,10 +33,9 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from transformers import PreTrainedTokenizerBase
-
 import easydel as ed
 from easydel.infra.elarge.processing import make_serializable, write_text_atomic
+from transformers import PreTrainedTokenizerBase
 
 
 def parse_args() -> argparse.Namespace:

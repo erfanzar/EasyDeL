@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import jax.numpy as jnp
-
 from ejkernel import modules
 from ejkernel.modules import operations
 from ejkernel.modules.operations import (

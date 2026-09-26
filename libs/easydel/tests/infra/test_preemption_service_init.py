@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import jax
-
 from easydel.infra import init_cluster
 from easydel.trainers import utils as trainer_utils
 

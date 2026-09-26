@@ -88,7 +88,7 @@ class GPT2Config(EasyDeLBaseConfig):
             Whether to reorder and upcast attention.
         gradient_checkpointing (`str`, *optional*, defaults to `"nothing_saveable"`):
             The gradient checkpointing configuration.
-        tie_word_embeddings (`bool`, *optional*, defaults to `False`):
+        tie_word_embeddings (`bool`, *optional*, defaults to `True`):
             Whether to tie the weights of the input embeddings and the output embeddings.
         bits (`int`, *optional*):
             The number of bits to quantize the model to.
@@ -129,7 +129,7 @@ class GPT2Config(EasyDeLBaseConfig):
         scale_attn_by_inverse_layer_idx: bool = False,
         reorder_and_upcast_attn: bool = False,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
-        tie_word_embeddings: bool = False,
+        tie_word_embeddings: bool = True,
         bits: int | None = None,
         layer_types: list[str] | None = None,
         **kwargs,
@@ -163,7 +163,8 @@ class GPT2Config(EasyDeLBaseConfig):
             reorder_and_upcast_attn (bool, optional): Whether to reorder and upcast attention. Defaults to False.
             gradient_checkpointing (EasyDeLGradientCheckPointers, optional):
                 Gradient checkpointing strategy. Defaults to EasyDeLGradientCheckPointers.NONE.
-            tie_word_embeddings (bool, optional): Whether to tie input/output embeddings. Defaults to False.
+            tie_word_embeddings (bool, optional): Whether to tie input/output embeddings. Defaults to True
+                (HF default; hub GPT-2 configs omit the key and ship no ``lm_head`` weight).
             bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
             **kwargs: Additional keyword arguments.
         """

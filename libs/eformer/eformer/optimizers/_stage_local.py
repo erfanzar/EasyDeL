@@ -422,6 +422,27 @@ def _chain_parts(metadata: StageLocalOptimizerMetadata, opt_state: optax.OptStat
     return states, base_index, weight_decay_index
 
 
+def _weight_decay_count(state: tp.Any) -> jax.Array:
+    """Return the step count of the scheduled weight-decay chain entry.
+
+    With a ``weight_decay_mask`` the factory wraps the scheduled decay in
+    :func:`optax.masked`, whose state is a ``MaskedState`` holding the real
+    state in ``inner_state``.
+    """
+
+    if isinstance(state, optax.MaskedState):
+        return state.inner_state.count
+    return state.count
+
+
+def _replace_weight_decay_count(state: tp.Any, count: jax.Array) -> tp.Any:
+    """Return ``state`` with its step count replaced, preserving an ``optax.masked`` wrapper."""
+
+    if isinstance(state, optax.MaskedState):
+        return state._replace(inner_state=state.inner_state._replace(count=count))
+    return state._replace(count=count)
+
+
 def _scheduled_scalar(
     learning_rate_fn: optax.Schedule | None,
     fallback: optax.Schedule,
@@ -946,7 +967,9 @@ def _apply_adamw_stage_local(
         mu = adam_state.mu
         nu = adam_state.nu
         weight_decay_state = states[weight_decay_index] if weight_decay_index is not None else None
-        weight_decay_count = weight_decay_state.count if weight_decay_state is not None else schedule_count
+        weight_decay_count = (
+            _weight_decay_count(weight_decay_state) if weight_decay_state is not None else schedule_count
+        )
 
         mu_dtype = None if metadata.adamw_mu_dtype is None else jnp.dtype(metadata.adamw_mu_dtype).name
         batched_run = _make_batched_stage_local_adamw(
@@ -1018,8 +1041,8 @@ def _apply_adamw_stage_local(
         new_schedule_state = schedule_state._replace(count=optax.safe_int32_increment(schedule_count))
         states[base_index] = (new_adam_state, empty_state, new_schedule_state)
         if weight_decay_state is not None:
-            states[weight_decay_index] = weight_decay_state._replace(
-                count=optax.safe_int32_increment(weight_decay_state.count)
+            states[weight_decay_index] = _replace_weight_decay_count(
+                weight_decay_state, optax.safe_int32_increment(_weight_decay_count(weight_decay_state))
             )
         if delete_grads:
             _delete_tree_arrays(grads)
@@ -1073,7 +1096,7 @@ def _apply_adamw_stage_local_per_leaf(
         ) from exc
 
     weight_decay_state = states[weight_decay_index] if weight_decay_index is not None else None
-    weight_decay_count = weight_decay_state.count if weight_decay_state is not None else schedule_count
+    weight_decay_count = _weight_decay_count(weight_decay_state) if weight_decay_state is not None else schedule_count
 
     mu_dtype = None if metadata.adamw_mu_dtype is None else jnp.dtype(metadata.adamw_mu_dtype).name
     leaf_update = _make_stage_local_adamw_leaf_update(
@@ -1127,7 +1150,9 @@ def _apply_adamw_stage_local_per_leaf(
     states[base_index] = new_base_state
 
     if weight_decay_state is not None:
-        new_weight_decay_state = weight_decay_state._replace(count=optax.safe_int32_increment(weight_decay_state.count))
+        new_weight_decay_state = _replace_weight_decay_count(
+            weight_decay_state, optax.safe_int32_increment(_weight_decay_count(weight_decay_state))
+        )
         states[weight_decay_index] = new_weight_decay_state
 
     if delete_grads:
@@ -1297,7 +1322,7 @@ def _apply_lion_stage_local(
         mu = lion_state.mu
 
         wd_state = states[weight_decay_index] if weight_decay_index is not None else None
-        wd_count = wd_state.count if wd_state is not None else schedule_state.count
+        wd_count = _weight_decay_count(wd_state) if wd_state is not None else schedule_state.count
         lr = _scheduled_scalar(learning_rate_fn, metadata.scheduler, schedule_state.count)
         external_wd = _external_weight_decay(metadata, learning_rate_fn, wd_count)
         weight_decay_is_zero = float(metadata.weight_decay) == 0.0
@@ -1354,7 +1379,7 @@ def _apply_lion_stage_local(
             schedule_state._replace(count=optax.safe_int32_increment(schedule_state.count)),
         )
         if wd_state is not None:
-            states[weight_decay_index] = wd_state._replace(count=optax.safe_int32_increment(wd_count))
+            states[weight_decay_index] = _replace_weight_decay_count(wd_state, optax.safe_int32_increment(wd_count))
         if delete_grads:
             _delete_tree_arrays(grads)
         return new_params, tuple(states)
@@ -1400,7 +1425,7 @@ def _apply_lion_stage_local_per_leaf(
         raise NotImplementedError("eFormer stage-local Lion requires the standard optax.lion state.") from exc
 
     wd_state = states[weight_decay_index] if weight_decay_index is not None else None
-    wd_count = wd_state.count if wd_state is not None else schedule_state.count
+    wd_count = _weight_decay_count(wd_state) if wd_state is not None else schedule_state.count
     lr = _scheduled_scalar(learning_rate_fn, metadata.scheduler, schedule_state.count)
     external_wd = _external_weight_decay(metadata, learning_rate_fn, wd_count)
     external_mask = _mask_or_true(metadata, params)
@@ -1434,7 +1459,7 @@ def _apply_lion_stage_local_per_leaf(
         schedule_state._replace(count=optax.safe_int32_increment(schedule_state.count)),
     )
     if wd_state is not None:
-        states[weight_decay_index] = wd_state._replace(count=optax.safe_int32_increment(wd_count))
+        states[weight_decay_index] = _replace_weight_decay_count(wd_state, optax.safe_int32_increment(wd_count))
     if delete_grads:
         _delete_tree_arrays(grads)
     return new_params, tuple(states)
@@ -1551,7 +1576,7 @@ def _apply_rmsprop_stage_local(
         trace = getattr(trace_state, "trace", jax.tree_util.tree_map(jnp.zeros_like, params))
 
         wd_state = states[weight_decay_index] if weight_decay_index is not None else None
-        wd_count = wd_state.count if wd_state is not None else schedule_state.count
+        wd_count = _weight_decay_count(wd_state) if wd_state is not None else schedule_state.count
         lr = _scheduled_scalar(learning_rate_fn, metadata.scheduler, schedule_state.count)
         external_wd = _external_weight_decay(metadata, learning_rate_fn, wd_count)
         weight_decay_is_zero = float(metadata.weight_decay) == 0.0
@@ -1612,7 +1637,7 @@ def _apply_rmsprop_stage_local(
             new_trace_state,
         )
         if wd_state is not None:
-            states[weight_decay_index] = wd_state._replace(count=optax.safe_int32_increment(wd_count))
+            states[weight_decay_index] = _replace_weight_decay_count(wd_state, optax.safe_int32_increment(wd_count))
         if delete_grads:
             _delete_tree_arrays(grads)
         return new_params, tuple(states)
@@ -1654,7 +1679,7 @@ def _apply_rmsprop_stage_local_per_leaf(
     trace = getattr(trace_state, "trace", jax.tree_util.tree_map(jnp.zeros_like, params))
 
     wd_state = states[weight_decay_index] if weight_decay_index is not None else None
-    wd_count = wd_state.count if wd_state is not None else schedule_state.count
+    wd_count = _weight_decay_count(wd_state) if wd_state is not None else schedule_state.count
     lr = _scheduled_scalar(learning_rate_fn, metadata.scheduler, schedule_state.count)
     external_wd = _external_weight_decay(metadata, learning_rate_fn, wd_count)
     external_mask = _mask_or_true(metadata, params)
@@ -1691,7 +1716,7 @@ def _apply_rmsprop_stage_local_per_leaf(
         new_trace_state,
     )
     if wd_state is not None:
-        states[weight_decay_index] = wd_state._replace(count=optax.safe_int32_increment(wd_count))
+        states[weight_decay_index] = _replace_weight_decay_count(wd_state, optax.safe_int32_increment(wd_count))
     if delete_grads:
         _delete_tree_arrays(grads)
     return new_params, tuple(states)
@@ -1870,7 +1895,7 @@ def _apply_adafactor_stage_local(
             raise NotImplementedError("eFormer stage-local Adafactor requires a scheduled learning-rate state.")
 
         wd_state = states[weight_decay_index] if weight_decay_index is not None else None
-        wd_count = wd_state.count if wd_state is not None else schedule_state.count
+        wd_count = _weight_decay_count(wd_state) if wd_state is not None else schedule_state.count
         lr = _scheduled_scalar(learning_rate_fn, metadata.scheduler, schedule_state.count)
         external_wd = _external_weight_decay(metadata, learning_rate_fn, wd_count)
         weight_decay_is_zero = float(metadata.weight_decay) == 0.0
@@ -1960,7 +1985,7 @@ def _apply_adafactor_stage_local(
                 new_base.append(state)
         states[base_index] = tuple(new_base)
         if wd_state is not None:
-            states[weight_decay_index] = wd_state._replace(count=optax.safe_int32_increment(wd_count))
+            states[weight_decay_index] = _replace_weight_decay_count(wd_state, optax.safe_int32_increment(wd_count))
         if delete_grads:
             _delete_tree_arrays(grads)
         return new_params, tuple(states)
@@ -2012,7 +2037,7 @@ def _apply_adafactor_stage_local_per_leaf(
         raise NotImplementedError("eFormer stage-local Adafactor requires a scheduled learning-rate state.")
 
     wd_state = states[weight_decay_index] if weight_decay_index is not None else None
-    wd_count = wd_state.count if wd_state is not None else schedule_state.count
+    wd_count = _weight_decay_count(wd_state) if wd_state is not None else schedule_state.count
     lr = _scheduled_scalar(learning_rate_fn, metadata.scheduler, schedule_state.count)
     external_wd = _external_weight_decay(metadata, learning_rate_fn, wd_count)
     external_mask = _mask_or_true(metadata, params)
@@ -2075,7 +2100,7 @@ def _apply_adafactor_stage_local_per_leaf(
             new_base.append(state)
     states[base_index] = tuple(new_base)
     if wd_state is not None:
-        states[weight_decay_index] = wd_state._replace(count=optax.safe_int32_increment(wd_count))
+        states[weight_decay_index] = _replace_weight_decay_count(wd_state, optax.safe_int32_increment(wd_count))
     if delete_grads:
         _delete_tree_arrays(grads)
     return new_params, tuple(states)
@@ -2193,7 +2218,7 @@ def _apply_mars_stage_local(
         mu, nu, mog = mars_state.mu, mars_state.nu, mars_state.mog
 
         wd_state = states[weight_decay_index] if weight_decay_index is not None else None
-        wd_count = wd_state.count if wd_state is not None else schedule_state.count
+        wd_count = _weight_decay_count(wd_state) if wd_state is not None else schedule_state.count
         lr = _scheduled_scalar(learning_rate_fn, metadata.scheduler, schedule_state.count)
         external_wd = _external_weight_decay(metadata, learning_rate_fn, wd_count)
         weight_decay_is_zero = float(metadata.weight_decay) == 0.0
@@ -2288,7 +2313,7 @@ def _apply_mars_stage_local(
             schedule_state._replace(count=optax.safe_int32_increment(schedule_state.count)),
         )
         if wd_state is not None:
-            states[weight_decay_index] = wd_state._replace(count=optax.safe_int32_increment(wd_count))
+            states[weight_decay_index] = _replace_weight_decay_count(wd_state, optax.safe_int32_increment(wd_count))
         if delete_grads:
             _delete_tree_arrays(grads)
         return new_params, tuple(states)
@@ -2329,7 +2354,7 @@ def _apply_mars_stage_local_per_leaf(
         raise NotImplementedError("eFormer stage-local Mars requires the standard eFormer Mars state.") from exc
 
     wd_state = states[weight_decay_index] if weight_decay_index is not None else None
-    wd_count = wd_state.count if wd_state is not None else schedule_state.count
+    wd_count = _weight_decay_count(wd_state) if wd_state is not None else schedule_state.count
     lr = _scheduled_scalar(learning_rate_fn, metadata.scheduler, schedule_state.count)
     external_wd = _external_weight_decay(metadata, learning_rate_fn, wd_count)
     external_mask = _mask_or_true(metadata, params)
@@ -2396,7 +2421,7 @@ def _apply_mars_stage_local_per_leaf(
         schedule_state._replace(count=optax.safe_int32_increment(schedule_state.count)),
     )
     if wd_state is not None:
-        states[weight_decay_index] = wd_state._replace(count=optax.safe_int32_increment(wd_count))
+        states[weight_decay_index] = _replace_weight_decay_count(wd_state, optax.safe_int32_increment(wd_count))
     if delete_grads:
         _delete_tree_arrays(grads)
     return new_params, tuple(states)
@@ -2483,9 +2508,9 @@ def _make_batched_stage_local_muon_2d(
                 ) * _bias_correction(grad, beta, muon_count_inc)
             else:
                 mu_hat = _bias_correction(mu_next, beta, muon_count_inc)
-            update = orthogonalize_via_newton_schulz(mu_hat, ns_coeffs, ns_steps, eps)
+            update = orthogonalize_via_newton_schulz(mu_hat, ns_coeffs, ns_steps=ns_steps, eps=eps)
             if adaptive:
-                update = jnp.einsum("ij,ij,ab->ab", mu_hat, update, update)
+                update = jnp.sum(mu_hat.conj() * update) * update
             update = jnp.sqrt(jnp.maximum(1.0, update.shape[-1] / update.shape[-2])).astype(update.dtype) * update
             if internal_weight_decay != 0.0 and int_flag:
                 update = update + jnp.asarray(internal_weight_decay, update.dtype) * param
@@ -2600,11 +2625,13 @@ def _apply_muon_stage_local(
         inner_states = dict(partition_state.inner_states)
         muon_masked_state = inner_states["muon"]
         adam_masked_state = inner_states["adam"]
-        muon_state, muon_empty_state, muon_schedule_state = muon_masked_state.inner_state
+        # Optax may insert stateless transforms (e.g. scale_by_shape)
+        # between the momentum and schedule states. Preserve their layout.
+        muon_state, *muon_stateless_states, muon_schedule_state = muon_masked_state.inner_state
         adam_state, adam_empty_state, adam_schedule_state = adam_masked_state.inner_state
 
         wd_state = states[weight_decay_index] if weight_decay_index is not None else None
-        external_wd_count = wd_state.count if wd_state is not None else muon_schedule_state.count
+        external_wd_count = _weight_decay_count(wd_state) if wd_state is not None else muon_schedule_state.count
         external_wd = _external_weight_decay(metadata, learning_rate_fn, external_wd_count)
         external_mask = _mask_or_true(metadata, params)
         muon_wd_mask = _resolve_mask_or_true(getattr(config, "weight_decay_mask", None), params)
@@ -2737,7 +2764,7 @@ def _apply_muon_stage_local(
         inner_states["muon"] = muon_masked_state._replace(
             inner_state=(
                 muon_state._replace(count=muon_count_inc, mu=new_muon_mu),
-                muon_empty_state,
+                *muon_stateless_states,
                 muon_schedule_state._replace(count=_safe_increment(muon_schedule_state.count)),
             )
         )
@@ -2750,7 +2777,9 @@ def _apply_muon_stage_local(
         )
         states[base_index] = partition_state._replace(inner_states=inner_states)
         if wd_state is not None:
-            states[weight_decay_index] = wd_state._replace(count=_safe_increment(wd_state.count))
+            states[weight_decay_index] = _replace_weight_decay_count(
+                wd_state, _safe_increment(_weight_decay_count(wd_state))
+            )
         if delete_grads:
             _delete_tree_arrays(grads)
         return new_params, tuple(states)
@@ -2797,13 +2826,15 @@ def _apply_muon_stage_local_per_leaf(
         inner_states = dict(partition_state.inner_states)
         muon_masked_state = inner_states["muon"]
         adam_masked_state = inner_states["adam"]
-        muon_state, muon_empty_state, muon_schedule_state = muon_masked_state.inner_state
+        # Optax may insert stateless transforms (e.g. scale_by_shape)
+        # between the momentum and schedule states. Preserve their layout.
+        muon_state, *muon_stateless_states, muon_schedule_state = muon_masked_state.inner_state
         adam_state, adam_empty_state, adam_schedule_state = adam_masked_state.inner_state
     except (TypeError, ValueError, KeyError, AttributeError) as exc:
         raise NotImplementedError("eFormer stage-local Muon requires the standard optax.contrib.muon state.") from exc
 
     wd_state = states[weight_decay_index] if weight_decay_index is not None else None
-    external_wd_count = wd_state.count if wd_state is not None else muon_schedule_state.count
+    external_wd_count = _weight_decay_count(wd_state) if wd_state is not None else muon_schedule_state.count
     external_wd = _external_weight_decay(metadata, learning_rate_fn, external_wd_count)
     external_mask = _mask_or_true(metadata, params)
     muon_wd_mask = _resolve_mask_or_true(getattr(config, "weight_decay_mask", None), params)
@@ -2835,11 +2866,11 @@ def _apply_muon_stage_local_per_leaf(
             update = orthogonalize_via_newton_schulz(
                 mu_hat,
                 _place_array_like(muon_state.ns_coeffs, grad),
-                int(config.ns_steps),
-                float(config.eps),
+                ns_steps=int(config.ns_steps),
+                eps=float(config.eps),
             )
             if bool(config.adaptive):
-                update = jnp.einsum("ij,ij,ab->ab", mu_hat, update, update)
+                update = jnp.sum(mu_hat.conj() * update) * update
             update = jnp.sqrt(jnp.maximum(1.0, update.shape[-1] / update.shape[-2])).astype(update.dtype) * update
             if float(config.weight_decay) != 0.0:
                 update = (
@@ -2918,7 +2949,7 @@ def _apply_muon_stage_local_per_leaf(
     inner_states["muon"] = muon_masked_state._replace(
         inner_state=(
             muon_state._replace(count=muon_count_inc, mu=new_muon_mu),
-            muon_empty_state,
+            *muon_stateless_states,
             muon_schedule_state._replace(count=_safe_increment(muon_schedule_state.count)),
         )
     )
@@ -2931,7 +2962,9 @@ def _apply_muon_stage_local_per_leaf(
     )
     states[base_index] = partition_state._replace(inner_states=inner_states)
     if wd_state is not None:
-        states[weight_decay_index] = wd_state._replace(count=_safe_increment(wd_state.count))
+        states[weight_decay_index] = _replace_weight_decay_count(
+            wd_state, _safe_increment(_weight_decay_count(wd_state))
+        )
     if delete_grads:
         _delete_tree_arrays(grads)
     return new_params, tuple(states)
@@ -3084,7 +3117,9 @@ def _apply_white_kron_stage_local(
 
         lr = _scheduled_scalar(learning_rate_fn, metadata.scheduler, schedule_state.count)
         external_wd_state = states[weight_decay_index] if weight_decay_index is not None else None
-        external_wd_count = external_wd_state.count if external_wd_state is not None else schedule_state.count
+        external_wd_count = (
+            _weight_decay_count(external_wd_state) if external_wd_state is not None else schedule_state.count
+        )
         external_wd = _external_weight_decay(metadata, learning_rate_fn, external_wd_count)
         external_mask = _mask_or_true(metadata, params)
         internal_mask = _resolve_mask_or_true(getattr(config, "weight_decay_mask", None), params)
@@ -3130,7 +3165,9 @@ def _apply_white_kron_stage_local(
         new_schedule_state = schedule_state._replace(count=_safe_increment(schedule_state.count))
         states[base_index] = (new_precond_state, *base_state[1:-1], new_schedule_state)
         if external_wd_state is not None:
-            states[weight_decay_index] = external_wd_state._replace(count=_safe_increment(external_wd_state.count))
+            states[weight_decay_index] = _replace_weight_decay_count(
+                external_wd_state, _safe_increment(_weight_decay_count(external_wd_state))
+            )
         if delete_grads:
             _delete_tree_arrays(grads)
         return new_params, tuple(states)
@@ -3194,7 +3231,7 @@ def _apply_white_kron_stage_local_per_leaf(
 
     lr = _scheduled_scalar(learning_rate_fn, metadata.scheduler, schedule_state.count)
     external_wd_state = states[weight_decay_index] if weight_decay_index is not None else None
-    external_wd_count = external_wd_state.count if external_wd_state is not None else schedule_state.count
+    external_wd_count = _weight_decay_count(external_wd_state) if external_wd_state is not None else schedule_state.count
     external_wd = _external_weight_decay(metadata, learning_rate_fn, external_wd_count)
     external_mask = _mask_or_true(metadata, params)
     internal_mask = _resolve_mask_or_true(getattr(config, "weight_decay_mask", None), params)
@@ -3237,7 +3274,9 @@ def _apply_white_kron_stage_local_per_leaf(
     new_schedule_state = schedule_state._replace(count=_safe_increment(schedule_state.count))
     states[base_index] = (new_precond_state, *base_state[1:-1], new_schedule_state)
     if external_wd_state is not None:
-        states[weight_decay_index] = external_wd_state._replace(count=_safe_increment(external_wd_state.count))
+        states[weight_decay_index] = _replace_weight_decay_count(
+            external_wd_state, _safe_increment(_weight_decay_count(external_wd_state))
+        )
     if delete_grads:
         _delete_tree_arrays(grads)
     return new_params, tuple(states)

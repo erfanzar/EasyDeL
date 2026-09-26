@@ -20,7 +20,6 @@ from dataclasses import dataclass
 import jax
 import jax.numpy as jnp
 import pytest
-
 from ejkernel.ops import (
     AutotunePolicy,
     ConfigCache,

@@ -10,9 +10,8 @@ from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
-from flax import nnx
-
 import spectrax as spx
+from flax import nnx
 
 from .. import models
 

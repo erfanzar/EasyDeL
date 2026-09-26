@@ -56,7 +56,11 @@ import enum
 import typing as tp
 from dataclasses import dataclass, field
 
+from eformer.loggings import get_logger
+
 from easydel.utils.compiling_utils import hash_fn
+
+logger = get_logger(__name__)
 
 DEFAULT_QUANTIZATION_PATTERN = r"^(?!.*(?:embedding|norm|lm_head)).*$"
 
@@ -263,6 +267,73 @@ class QuantizationConfig:
                 raise ValueError("activation_bits=4 requires channelwise weight bits=4.")
 
     @classmethod
+    def coerce(
+        cls,
+        data: QuantizationConfig | dict[str, tp.Any] | None,
+        *,
+        strict: bool = True,
+    ) -> QuantizationConfig | None:
+        """Coerce a mapping into a :class:`QuantizationConfig` without guessing.
+
+        Checkpoints converted from Hugging Face inherit the source repo's
+        ``quantization_config`` block into their ``config.json``. That block
+        (keys like ``quant_method``, ``activation_scheme``,
+        ``weight_block_size``) describes how the SOURCE checkpoint stored its
+        weights; it is consumed by the checkpoint-decoding path, and it is
+        NOT an EasyDeL load-time quantization request. ``coerce`` therefore
+        never turns a descriptor into a quantization instruction: lenient
+        mode drops it (returns ``None``), strict mode rejects it with an
+        explanation.
+
+        Args:
+            data: ``None``, an existing :class:`QuantizationConfig`, or a
+                dict of field overrides.
+            strict: If True, unknown keys raise ``ValueError`` (right for
+                explicitly user-supplied overrides). If False, Hugging Face
+                descriptors return ``None`` and other unknown keys are
+                dropped with a warning (right for dicts inherited from a
+                checkpoint's ``config.json``).
+
+        Returns:
+            QuantizationConfig | None: The coerced config. ``None`` only when
+            *data* is ``None`` or, in lenient mode, a Hugging Face
+            checkpoint-format descriptor.
+
+        Raises:
+            ValueError: In strict mode, when *data* is a dict carrying keys
+                that are not :class:`QuantizationConfig` fields.
+        """
+        if data is None or isinstance(data, cls):
+            return data
+        if not isinstance(data, dict):
+            return data
+        fields = {f.name for f in dataclasses.fields(cls)}
+        known = {key: value for key, value in data.items() if key in fields}
+        unknown = sorted(set(data) - fields)
+        if not unknown:
+            return cls(**known)
+        if "quant_method" in data:
+            if strict:
+                raise ValueError(
+                    "quantization_config looks like a Hugging Face checkpoint-format descriptor "
+                    f"(keys {unknown}); it cannot be used as an EasyDeL load-time quantization request. "
+                    f"Pass a dict with QuantizationConfig fields ({sorted(fields)}) instead."
+                )
+            logger.info(
+                "Dropping quantization_config keys %s: a Hugging Face checkpoint-format descriptor "
+                "(quant_method=%r) describing how the source checkpoint stored its weights, not an "
+                "EasyDeL load-time quantization request. Pass quantization_config=QuantizationConfig(...) "
+                "with apply_quantization=True to quantize on load.",
+                unknown,
+                data["quant_method"],
+            )
+            return None
+        if strict:
+            raise ValueError(f"Unknown quantization_config keys {unknown}; expected a subset of {sorted(fields)}.")
+        logger.warning("Dropping unknown quantization_config keys %s; keeping %s.", unknown, sorted(known))
+        return cls(**known)
+
+    @classmethod
     def for_matmul(cls, mode: str) -> "QuantizationConfig":
         """Record an explicit channelwise integer matmul precision preset.
 
@@ -336,7 +407,8 @@ def resolve_ejkernel_quant_params(config: QuantizationConfig) -> tuple[str, int,
     """Map an EasyDeL :class:`QuantizationConfig` onto the ejkernel quantizer.
 
     The ejkernel quantization API expects four positional knobs: a mode string
-    (``"affine" | "nf4" | "mxfp4" | "nvfp4" | "mxfp8" | "nvfp8"``), a
+    (``"affine" | "nf4" | "mxfp4" | "nvfp4" | "mxfp8" | "nvfp8" |
+    "channelwise"``), a
     ``group_size`` (number of contiguous weights that share one scale), a
     ``bits`` count, and a ``needs_biases`` flag indicating whether the scheme
     stores per-group zero-points in addition to scales. This function
@@ -351,6 +423,8 @@ def resolve_ejkernel_quant_params(config: QuantizationConfig) -> tuple[str, int,
       power-of-two set; no biases (zero-mean lookup table).
     * ``MXFP4`` / ``NVFP4`` — group_size pinned to 32 / 16, bits=4; no biases.
     * ``MXFP8`` / ``NVFP8`` — group_size pinned to 32 / 16, bits=8; no biases.
+    * ``CHANNELWISE`` — per-output-channel symmetric integer codes with bits
+      in ``{4, 8}``; group_size reported as 0 (full-K sentinel); no biases.
 
     Args:
         config: Resolved :class:`QuantizationConfig` whose ``dtype`` selects

@@ -17,7 +17,6 @@ import importlib
 import jax
 import jax.numpy as jnp
 import pytest
-
 from ejkernel.modules.operations import quantized_matmul
 from ejkernel.modules.operations.quantized_matmul import QuantizedMatmulConfig
 from ejkernel.quantization import prepack_quantized_weights

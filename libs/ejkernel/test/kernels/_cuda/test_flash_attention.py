@@ -18,7 +18,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from ejkernel.errors import EjkernelRuntimeError
 from ejkernel.kernels._cuda.flash_attention import flash_attention as cuda_flash_attention
 from ejkernel.kernels._xla.flash_attention import flash_attention as xla_flash_attention

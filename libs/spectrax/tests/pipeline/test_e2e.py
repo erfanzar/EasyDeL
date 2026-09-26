@@ -20,9 +20,8 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import pytest
-from jax.sharding import Mesh
-
 import spectrax as spx
+from jax.sharding import Mesh
 from spectrax import nn
 from spectrax.nn import PipelineSequential
 from spectrax.runtime.mpmd import sxcall

@@ -67,6 +67,11 @@ Use `--max-rows` for a small validation run before producing the final dataset.
 
 ## Verification
 
+These parser and API-server tests do no array computation, so they are a non-computation exception and may run under
+the CPU trio (they must be allow-listed or marked `cpu_ok`). Any test that drives a real model or eSurge engine is a
+computation test and runs on the accelerator instead (`env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0
+JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu uv run pytest <path>`).
+
 ```bash
 ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
 XLA_FLAGS=--xla_force_host_platform_device_count=8 \

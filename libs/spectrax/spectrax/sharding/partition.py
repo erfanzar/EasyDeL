@@ -168,7 +168,10 @@ def _iter_variables(module: Module):
     yield from select().apply(module)
 
 
-def get_partition_spec(module: Module) -> dict[str, dict[str, PartitionSpec | None]]:
+def get_partition_spec(
+    module: Module,
+    mesh: "Mesh | SpxMesh | MpMdMesh | None" = None,
+) -> dict[str, dict[str, PartitionSpec | None]]:
     """Return ``{collection: {path: PartitionSpec}}`` derived from variable metadata.
 
     Walks every :class:`~spectrax.Variable` reachable from ``module``
@@ -182,15 +185,20 @@ def get_partition_spec(module: Module) -> dict[str, dict[str, PartitionSpec | No
     Resolution honors the currently-active
     :func:`~spectrax.sharding.logical_axis_rules` so the same module
     can produce different specs depending on the enclosing rule
-    context.
+    context. Raw mesh-axis names of ``mesh`` (or of the active mesh
+    context when ``mesh`` is ``None``) resolve to themselves, matching
+    :func:`get_named_sharding`.
 
     Args:
         module: The :class:`~spectrax.Module` to walk.
+        mesh: Optional mesh whose axis names are accepted verbatim.
+            Defaults to the active SpectraX / JAX mesh, if any.
 
     Returns:
         Nested mapping ``{collection_name: {path: PartitionSpec | None}}``.
     """
-    rules = _semantic_axis_rules()
+    rules = _active_mesh_identity_axis_rules(mesh)
+    rules.update(_semantic_axis_rules())
     rules.update(current_axis_rules())
     out: dict[str, dict[str, PartitionSpec | None]] = {}
     for p, v in _iter_variables(module):
@@ -252,17 +260,29 @@ def to_jax_mesh(mesh: "Mesh | SpxMesh | MpMdMesh | None") -> "Mesh | None":
 
 
 def _physical_mesh_or_none() -> "Mesh | None":
-    """Return the JAX physical mesh from thread-local pxla state, or ``None``.
+    """Return the active JAX physical mesh, or ``None``.
 
-    Reads ``jax.interpreters.pxla.thread_resources.env.physical_mesh``
-    and converts the empty-mesh sentinel into a plain ``None`` so
-    callers can do a simple null check.
+    Reads the legacy ``with mesh:`` state
+    (``jax.interpreters.pxla.thread_resources.env.physical_mesh``) first
+    and falls back to the concrete mesh installed by ``jax.set_mesh``,
+    which does not populate the legacy thread resources. The concrete
+    mesh stays readable while tracing under ``jax.jit`` (unlike the
+    public ``jax.sharding.get_mesh``). Empty-mesh sentinels become a
+    plain ``None`` so callers can do a simple null check.
 
     Returns:
-        Return the JAX physical mesh from thread-local pxla state, or ``None``.
+        Return the active JAX physical mesh, or ``None``.
     """
     mesh = jax.interpreters.pxla.thread_resources.env.physical_mesh
-    if getattr(mesh, "empty", False):
+    if not getattr(mesh, "empty", False):
+        return mesh
+    try:
+        from jax._src.mesh import get_concrete_mesh
+
+        mesh = get_concrete_mesh()
+    except Exception:
+        return None
+    if mesh is None or getattr(mesh, "empty", True):
         return None
     return mesh
 
@@ -1025,6 +1045,20 @@ def with_sharding_constraint(
         constraint was determined to be a safe no-op.
     """
     resolved_mesh = mesh
+    if resolved_mesh is None and isinstance(sharding, NamedSharding) and isinstance(sharding.mesh, Mesh):
+        # An explicit concrete NamedSharding names its own mesh; re-binding its
+        # spec to a different active mesh would strip axes that mesh lacks. The
+        # exception is the active MPMD mesh over the same devices: its metadata
+        # is what resolves the stage-local submesh.
+        active = _query_mesh(raise_error=False)
+        if (
+            active is not None
+            and _mpmd_axis_name(active) is not None
+            and _same_mesh_devices(sharding.mesh, getattr(active, "jax_mesh", active))
+        ):
+            resolved_mesh = active
+        else:
+            resolved_mesh = sharding.mesh
     if resolved_mesh is None:
         resolved_mesh = _query_mesh(raise_error=False)
     if resolved_mesh is None and isinstance(sharding, NamedSharding):
@@ -1074,6 +1108,9 @@ def with_sharding_constraint(
             shape=tuple(getattr(arr, "shape", ())),
         )
         constraint = NamedSharding(target_mesh, spec)
+        memory_kind = getattr(sharding, "memory_kind", None) if isinstance(sharding, NamedSharding) else None
+        if memory_kind is not None and hasattr(constraint, "with_memory_kind"):
+            constraint = constraint.with_memory_kind(memory_kind)
     try:
         return jax.lax.with_sharding_constraint(arr, constraint)
     except RuntimeError as exc:
@@ -1665,6 +1702,28 @@ def _identity_mesh_axis_rules(base_mesh: "Mesh", mpmd_mesh: "MpMdMesh | None") -
     return {name: name for name in axis_names}
 
 
+def _active_mesh_identity_axis_rules(mesh: "Mesh | SpxMesh | MpMdMesh | None" = None) -> dict[str, str]:
+    """Identity axis rules for ``mesh`` or, when ``None``, the active mesh context.
+
+    Lets mesh-free resolvers (:func:`get_partition_spec`,
+    :func:`with_sharding_constraint_by_name`) accept raw mesh-axis names
+    the same way :func:`named_sharding_for_metadata` does. Returns an
+    empty mapping when no mesh is known.
+
+    Args:
+        mesh: Optional explicit mesh; defaults to the active SpectraX /
+            JAX mesh context.
+
+    Returns:
+        ``{axis_name: axis_name}`` for every SPMD axis on the mesh.
+    """
+    resolved = _query_mesh(mesh, raise_error=False)
+    if resolved is None:
+        return {}
+    base_mesh, mpmd_mesh = _resolve_named_sharding_mesh(resolved)
+    return _identity_mesh_axis_rules(base_mesh, mpmd_mesh)
+
+
 def _normalize_axis_rule_value(value: object) -> object:
     """Coerce resolver outputs into values accepted by ``Sharding``.
 
@@ -1726,7 +1785,13 @@ def _axis_rules_for_mesh(base_mesh: "Mesh", mpmd_mesh: "MpMdMesh | None") -> dic
 
 
 def _named_sharding_with_shape_sanitized(sharding: NamedSharding, shape: tuple[int, ...] | None) -> NamedSharding:
-    """Return ``sharding`` with a shape-divisible spec when ``shape`` is known."""
+    """Return ``sharding`` with a shape-divisible spec when ``shape`` is known.
+
+    Dims whose size does not divide the partition product are replicated
+    on the *same* mesh (see :func:`sanitize_partition_spec_for_mesh_and_shape`).
+    The mesh is never narrowed to a device subset: a leaf living on fewer
+    devices than its siblings cannot enter the same ``jit`` computation.
+    """
     if shape is None:
         return sharding
     try:
@@ -1735,75 +1800,12 @@ def _named_sharding_with_shape_sanitized(sharding: NamedSharding, shape: tuple[i
     except Exception:
         pass
 
-    narrowed = _narrow_named_sharding_mesh_for_shape(sharding, shape)
-    if narrowed is not None:
-        return narrowed
-
     spec = sanitize_partition_spec_for_mesh_and_shape(sharding.spec, mesh=sharding.mesh, shape=shape)
     named = NamedSharding(sharding.mesh, spec)
     memory_kind = getattr(sharding, "memory_kind", None)
     if memory_kind is not None and hasattr(named, "with_memory_kind"):
         return named.with_memory_kind(memory_kind)
     return named
-
-
-def _largest_positive_divisor_at_most(value: int, limit: int) -> int:
-    """Return the largest positive divisor of ``value`` no larger than ``limit``."""
-    for candidate in range(min(value, limit), 0, -1):
-        if value % candidate == 0:
-            return candidate
-    return 1
-
-
-def _narrow_named_sharding_mesh_for_shape(
-    sharding: NamedSharding,
-    shape: tuple[int, ...],
-) -> NamedSharding | None:
-    """Try to preserve a spec by narrowing oversized mesh axes to a device subset."""
-    mesh = sharding.mesh
-    axis_names = tuple(getattr(mesh, "axis_names", ()) or ())
-    if not axis_names or len(sharding.spec) > len(shape):
-        return None
-
-    axis_sizes = {axis: int(mesh.shape[axis]) for axis in axis_names}
-    new_axis_sizes = dict(axis_sizes)
-    spec_parts = list(tuple(sharding.spec))
-    changed = False
-
-    for dim, axis_part in enumerate(spec_parts):
-        product = _axis_partition_product(axis_part, mesh)
-        if product <= 1 or int(shape[dim]) % product == 0:
-            continue
-        axes = (axis_part,) if isinstance(axis_part, str) else tuple(axis_part) if isinstance(axis_part, tuple) else ()
-        if len(axes) != 1:
-            return None
-        axis = axes[0]
-        if axis not in new_axis_sizes:
-            return None
-        narrowed_size = _largest_positive_divisor_at_most(int(shape[dim]), new_axis_sizes[axis])
-        if narrowed_size <= 1:
-            return None
-        new_axis_sizes[axis] = narrowed_size
-        changed = True
-
-    if not changed:
-        return None
-
-    device_grid = np.asarray(mesh.devices)
-    slices = tuple(slice(0, new_axis_sizes[axis]) for axis in axis_names)
-    try:
-        narrowed_mesh = Mesh(device_grid[slices], axis_names, axis_types=getattr(mesh, "axis_types", None))
-    except Exception:
-        return None
-    narrowed = NamedSharding(narrowed_mesh, sharding.spec)
-    memory_kind = getattr(sharding, "memory_kind", None)
-    if memory_kind is not None and hasattr(narrowed, "with_memory_kind"):
-        narrowed = narrowed.with_memory_kind(memory_kind)
-    try:
-        narrowed.shard_shape(shape)
-    except Exception:
-        return None
-    return narrowed
 
 
 def named_sharding_for_metadata(
@@ -1921,8 +1923,8 @@ def with_sharding_constraint_by_name(x: ArrayLike, axis_names: AxisNames) -> Arr
     """Apply a sharding constraint using the active logical -> mesh rules.
 
     Inside an active :func:`logical_axis_rules` context the logical names
-    are resolved to physical mesh axes; outside one the constraint is a
-    no-op replicate.
+    are resolved to physical mesh axes; raw axis names of the active
+    mesh resolve to themselves. Names with no rule replicate.
 
     Args:
         x: Input value consumed by the operation.
@@ -1932,7 +1934,8 @@ def with_sharding_constraint_by_name(x: ArrayLike, axis_names: AxisNames) -> Arr
         Result described by this helper.
     """
 
-    rules = _semantic_axis_rules()
+    rules = _active_mesh_identity_axis_rules()
+    rules.update(_semantic_axis_rules())
     rules.update(current_axis_rules())
     resolved = _resolve_axis_names(tuple(axis_names), rules)
     spec = PartitionSpec(*resolved)

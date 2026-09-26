@@ -45,10 +45,9 @@ Read these before editing:
 ## Verification
 
 ```bash
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
-XLA_FLAGS=--xla_force_host_platform_device_count=8 \
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
   uv run pytest libs/ejkernel/test/ops/
 ```
 
-Autotune and profiling paths often need real hardware; document which behaviors were validated on CPU and which require
-a GPU/TPU run.
+Run on the accelerator (GPU: `JAX_PLATFORMS=cuda,cpu JAX_PLATFORM_NAME=gpu`); a CPU run of these tests is not
+validation. Without an accelerator, report the change as unverified on hardware.

@@ -60,6 +60,7 @@ easydel.trainers package
    model_loading
    packer
    pose
+   process_encoder
    prompt_transforms
    prompt_utils
    reward_protocol

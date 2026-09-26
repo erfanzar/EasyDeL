@@ -18,7 +18,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from ejkernel.kernels._triton.chunked_prefill_paged_decode import chunked_prefill_paged_decode
 from ejkernel.kernels._xla.chunked_prefill_paged_decode import (
     chunked_prefill_paged_decode as xla_chunked_prefill_paged_decode,

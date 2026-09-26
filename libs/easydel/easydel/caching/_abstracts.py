@@ -199,14 +199,6 @@ class OperationsMetadata(BaseRunTimeMetadata):
         recurrent: RecurrentMetadata for recurrent/linear attention models.
 
     Example:
-        >>> # Create for transformer cache
-        >>> metadata = OperationsMetadata.for_transformer(
-        ...     starts=jnp.zeros((batch_size,), dtype=jnp.int32)
-        ... )
-        >>>
-        >>> # Create for hybrid cache
-        >>> metadata = OperationsMetadata.for_hybrid()
-        >>>
         >>> # Access type-specific metadata
         >>> if metadata.transformer is not None:
         ...     print(metadata.transformer.starts)
@@ -216,114 +208,6 @@ class OperationsMetadata(BaseRunTimeMetadata):
     hybrid: tp.Any | None = None  # HybridMetadata
     ragged: tp.Any | None = None  # RaggedPagesMetadata
     recurrent: tp.Any | None = None  # RecurrentMetadata
-
-    @classmethod
-    def for_transformer(
-        cls,
-        postpadded: bool = False,
-        starts: tp.Any | None = None,
-        indexes: tp.Any | None = None,
-    ) -> "OperationsMetadata":
-        """Create OperationsMetadata for transformer cache.
-
-        Args:
-            postpadded: Whether sequences are post-padded.
-            starts: Starting positions for sequences.
-            indexes: Current position indices.
-
-        Returns:
-            OperationsMetadata with transformer field populated.
-        """
-        from easydel.caching.transformer import TransformerMetadata
-
-        return cls(transformer=TransformerMetadata(postpadded=postpadded, starts=starts, indexes=indexes))
-
-    @classmethod
-    def for_hybrid(
-        cls,
-        postpadded: bool = False,
-        starts: tp.Any | None = None,
-        indexes: tp.Any | None = None,
-    ) -> "OperationsMetadata":
-        """Create OperationsMetadata for hybrid cache.
-
-        Since HybridCache contains multiple view types, the metadata includes
-        fields needed by TransformerCacheView layers (postpadded, starts, indexes).
-        Recurrent layers don't need additional metadata during inference.
-
-        Args:
-            postpadded: Whether sequences are post-padded.
-            starts: Starting positions for sequences.
-            indexes: Current position indices.
-
-        Returns:
-            OperationsMetadata with hybrid field populated.
-        """
-        from easydel.caching.hybrid import HybridMetadata
-
-        return cls(hybrid=HybridMetadata(postpadded=postpadded, starts=starts, indexes=indexes))
-
-    @classmethod
-    def for_ragged(
-        cls,
-        pages_tables: tp.Any,
-        context_lens: tp.Any,
-        query_start_loc: tp.Any,
-        num_seqs: tp.Any,
-        slot_mapping: tp.Any | None = None,
-        position_ids: tp.Any | None = None,
-        request_distribution: tp.Any | None = None,
-        num_kv_update_slices: tp.Any | None = None,
-        version: str = "v3",
-        page_size: int = 128,
-        prefill_chunk_size: int = 512,
-    ) -> "OperationsMetadata":
-        """Create OperationsMetadata for ragged pages cache.
-
-        Args:
-            pages_tables: Page tables mapping.
-            context_lens: Context lengths per sequence.
-            query_start_loc: Query start locations.
-            num_seqs: Number of sequences.
-            slot_mapping: Slot mapping for v2.
-            position_ids: Position IDs.
-            request_distribution: Request distribution for v3.
-            num_kv_update_slices: KV update slices for v2.
-            version: Version "v2" or "v3".
-            page_size: Page size.
-            prefill_chunk_size: Prefill chunk size.
-
-        Returns:
-            OperationsMetadata with ragged field populated.
-        """
-        from easydel.caching.ragged_page import RaggedPagesMetadata
-
-        return cls(
-            ragged=RaggedPagesMetadata(
-                pages_tables=pages_tables,
-                context_lens=context_lens,
-                query_start_loc=query_start_loc,
-                num_seqs=num_seqs,
-                slot_mapping=slot_mapping,
-                position_ids=position_ids,
-                request_distribution=request_distribution,
-                num_kv_update_slices=num_kv_update_slices,
-                version=version,
-                page_size=page_size,
-                prefill_chunk_size=prefill_chunk_size,
-            )
-        )
-
-    @classmethod
-    def for_recurrent(cls) -> "OperationsMetadata":
-        """Create OperationsMetadata for recurrent cache.
-
-        Returns:
-            OperationsMetadata with recurrent field populated.
-        """
-        from easydel.caching.recurrent import RecurrentMetadata
-
-        return cls(recurrent=RecurrentMetadata())
 
     @property
     def cache_type(self) -> str:

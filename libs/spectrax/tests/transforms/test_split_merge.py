@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import jax.numpy as jnp
-
 from spectrax.nn.linear import Linear
 from spectrax.rng.rngs import Rngs
 from spectrax.transforms.split_merge import (

@@ -43,9 +43,9 @@ def _gated_delta_rule_grouped_decode_kernel(
 
     Per (key head, expansion) pair the recurrence applies log-space decay to
     the previous state, computes the delta-rule update
-    ``delta = (value - k @ state) * beta``, rebuilds the state column-by-column
-    as ``state + outer(k, delta)`` (Mosaic lacks scatter, so columns are
-    stacked), and reads out ``output = (scale * q) @ state``. The query is
+    ``delta = (value - k @ state) * beta``, updates the state with the
+    broadcasted rank-2 outer product ``state + outer(k, delta)``, and reads
+    out ``output = (scale * q) @ state``. The query is
     scaled by ``head_dim ** -0.5``. Matmuls use float32 accumulation as
     required by the TPU matrix unit; the working dtype is the state ref dtype.
 
@@ -100,14 +100,11 @@ def _gated_delta_rule_grouped_decode_kernel(
                 preferred_element_type=jnp.float32,
             )[0].astype(compute_dtype)
             delta_e = (v_e - kv_mem) * beta_e
-            # Mosaic can only squeeze 32-bit arrays to scalars, and does not
-            # support scatter updates, so rebuild the updated state by stacking
-            # per-column rank-1 updates.
-            delta_e_fp32 = delta_e.astype(jnp.float32)
-            updated_cols = []
-            for v in range(s_e.shape[1]):
-                updated_cols.append(s_e[:, v] + k * delta_e_fp32[v].astype(compute_dtype))
-            s_e = jnp.stack(updated_cols, axis=1)
+            # Keep the update rank-2: extracting and stacking individual columns
+            # unrolls value_dim layout conversions per head, exhausting scoped
+            # VMEM at head_dim=value_dim=128. Broadcasting needs neither scatter
+            # nor scalar extraction and preserves the state-dtype arithmetic.
+            s_e = s_e + k[:, None] * delta_e[None, :]
             out_e = jax.lax.dot_general(
                 q[None, :],
                 s_e,

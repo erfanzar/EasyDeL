@@ -18,7 +18,6 @@ from types import SimpleNamespace
 
 import jax.numpy as jnp
 import pytest
-
 from eformer.paths import LocalPath
 from eformer.serialization import serialization as ser
 from eformer.serialization import utils as ser_utils

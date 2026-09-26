@@ -129,9 +129,22 @@ def test_mtp_stack_is_reported_unowned(native):
     loader's unused-key reporting truthful for the 45 ``mtp.*`` patterns.
     """
     assert native_key_to_easydel(native) is None
+    assert native_key_to_easydel(f"model.{native}") is None
 
 
-def test_native_per_expert_tensors_consolidate_through_from_pretrained():
+@pytest.mark.parametrize("key", [expected for _, expected in CASES + INDEXER_CASES])
+def test_hf_and_already_normalized_keys_are_preserved(key):
+    """Normalizing twice must neither drop a tensor nor reapply native aliases."""
+    assert native_key_to_easydel(key) == key
+
+
+@pytest.mark.parametrize("key", ["optimizer.step", "unknown.weight", "model_not_a_prefix.weight"])
+def test_unknown_native_keys_remain_unowned(key):
+    assert native_key_to_easydel(key) is None
+
+
+@pytest.mark.parametrize("checkpoint_format", ["native", "hf"])
+def test_native_per_expert_tensors_consolidate_through_from_pretrained(checkpoint_format):
     """The published per-expert tensors must reach the runtime's stacked params.
 
     DeepSeek ships one tensor per expert (``ffn.experts.<i>.w1``); the runtime
@@ -172,14 +185,27 @@ def test_native_per_expert_tensors_consolidate_through_from_pretrained():
     with cfg.mesh:
         model = ed.DeepseekV4ForCausalLM(config=cfg, dtype=jnp.float32, param_dtype=jnp.float32, rngs=spx.Rngs(0))
 
+    templates = (
+        (
+            "layers.0.ffn.experts.{e}.w1.weight",
+            "layers.0.ffn.experts.{e}.w3.weight",
+            "layers.0.ffn.experts.{e}.w2.weight",
+        )
+        if checkpoint_format == "native"
+        else (
+            "model.layers.0.mlp.experts.{e}.gate_proj.weight",
+            "model.layers.0.mlp.experts.{e}.up_proj.weight",
+            "model.layers.0.mlp.experts.{e}.down_proj.weight",
+        )
+    )
     state_dict = {}
     for e in range(experts):
         # a per-expert constant offset makes a permutation detectable
-        state_dict[f"layers.0.ffn.experts.{e}.w1.weight"] = (
+        state_dict[templates[0].format(e=e)] = (
             torch.arange(inter * hidden, dtype=torch.float32).reshape(inter, hidden) + e * 1000
         )
-        state_dict[f"layers.0.ffn.experts.{e}.w3.weight"] = torch.randn(inter, hidden)
-        state_dict[f"layers.0.ffn.experts.{e}.w2.weight"] = torch.randn(hidden, inter)
+        state_dict[templates[1].format(e=e)] = torch.randn(inter, hidden)
+        state_dict[templates[2].format(e=e)] = torch.randn(hidden, inter)
 
     converted = model.pure_transform_fn(state_dict=state_dict)
     flat = {
@@ -194,10 +220,11 @@ def test_native_per_expert_tensors_consolidate_through_from_pretrained():
     assert np.shape(up) == (experts, hidden, inter)
     assert np.shape(down) == (experts, inter, hidden)
 
-    gate = np.asarray(gate)
-    for e in range(experts):
-        source = np.asarray(state_dict[f"layers.0.ffn.experts.{e}.w1.weight"]).T
-        assert np.allclose(gate[e], source), f"expert {e} landed in the wrong slot"
+    for template, converted_weight in zip(templates, (gate, up, down), strict=True):
+        assert converted_weight.dtype == jnp.float32
+        for e in range(experts):
+            source = state_dict[template.format(e=e)].numpy().T
+            np.testing.assert_array_equal(np.asarray(converted_weight[e]), source)
 
 
 def test_hash_moe_layers_do_not_declare_a_score_correction_bias():

@@ -142,8 +142,10 @@ class GlmMoeDsaConfig(EasyDeLBaseConfig):
             Whether to return past key/values for caching.
         rope_theta (`float`, *optional*, defaults to 10000.0):
             Base period for rotary position embeddings.
-        rope_interleave (`bool`, *optional*, defaults to ``False``):
+        rope_interleave (`bool`, *optional*, defaults to ``True``):
             Whether to use interleaved RoPE layout for the main attention.
+            GLM-MoE-DSA checkpoints and the HF implementation use interleaved
+            pairs; ``False`` is a non-HF variant.
         index_topk (`int`, *optional*, defaults to 2048):
             Number of top-k tokens selected by the dynamic sparse attention indexer.
         index_head_dim (`int`, *optional*, defaults to 128):
@@ -151,8 +153,9 @@ class GlmMoeDsaConfig(EasyDeLBaseConfig):
         index_n_heads (`int`, *optional*, defaults to 32):
             Number of heads in the sparse attention indexer (auto-calculated as
             ``num_attention_heads // 2`` when ``None``).
-        indexer_rope_interleave (`bool`, *optional*, defaults to ``False``):
-            Whether to use interleaved RoPE layout for the indexer.
+        indexer_rope_interleave (`bool`, *optional*, defaults to ``True``):
+            Whether to use interleaved RoPE layout for the indexer (``True``
+            in GLM-MoE-DSA checkpoints and the HF implementation).
         indexer_types (`list[str]`, *optional*):
             Per-layer DSA indexer mode (``"full"`` runs the layer's own indexer, ``"shared"``
             reuses the previous ``"full"`` layer's top-k selection). Defaults to the schedule
@@ -216,11 +219,11 @@ class GlmMoeDsaConfig(EasyDeLBaseConfig):
         rope_theta: float | None = None,
         rope_parameters: dict[str, typing.Any] | None = None,
         rope_scaling: dict[str, typing.Any] | None = None,
-        rope_interleave: bool = False,
+        rope_interleave: bool = True,
         index_topk: int = 2048,
         index_head_dim: int = 128,
         index_n_heads: int | None = 32,
-        indexer_rope_interleave: bool = False,
+        indexer_rope_interleave: bool = True,
         indexer_types: list[str] | None = None,
         index_topk_pattern: str | list[str] | None = None,
         index_topk_freq: int = 1,
@@ -383,14 +386,11 @@ class GlmMoeDsaConfig(EasyDeLBaseConfig):
                 freq = max(index_topk_freq, 1)
                 offset = index_skip_topk_offset
                 self.indexer_types = [
-                    "full" if (max(i - offset + 1, 0) % freq) == 0 else "shared"
-                    for i in range(self.num_hidden_layers)
+                    "full" if (max(i - offset + 1, 0) % freq) == 0 else "shared" for i in range(self.num_hidden_layers)
                 ]
 
         if len(self.indexer_types) != self.num_hidden_layers:
-            raise ValueError(
-                f"indexer_types must have length {self.num_hidden_layers}, got {len(self.indexer_types)}."
-            )
+            raise ValueError(f"indexer_types must have length {self.num_hidden_layers}, got {len(self.indexer_types)}.")
         for indexer_type in self.indexer_types:
             if indexer_type not in ("full", "shared"):
                 raise ValueError(f"Invalid indexer type {indexer_type}. Expected 'full' or 'shared'.")

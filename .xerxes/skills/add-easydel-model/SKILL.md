@@ -68,19 +68,19 @@ When the model uses fused QKV, fused gate/up projections, quantized linears, or 
 
 ## Verification
 
-Use this CPU environment for host-side and SPMD unit tests:
+Model tests execute JAX numerics, so run them on the accelerator (TPU shown; GPU:
+`JAX_PLATFORMS=cuda,cpu JAX_PLATFORM_NAME=gpu`). A CPU run is not validation — with no accelerator, report the change
+as unverified on hardware:
 
 ```bash
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
-XLA_FLAGS=--xla_force_host_platform_device_count=8 \
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
   uv run pytest libs/easydel/tests/modules/spmd/test_<family>.py
 ```
 
 For conversion work, add or run a focused roundtrip check:
 
 ```bash
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
-XLA_FLAGS=--xla_force_host_platform_device_count=8 \
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
   uv run pytest libs/easydel/tests/modules/test_conversion_roundtrip.py
 ```
 

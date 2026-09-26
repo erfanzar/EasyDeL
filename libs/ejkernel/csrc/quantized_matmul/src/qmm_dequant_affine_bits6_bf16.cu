@@ -49,4 +49,3 @@ void LaunchDequantAffineBits6BF16Gs1024(const uint32_t *wq, const __nv_bfloat16 
   (void)group_size;
   dequant_affine_int_gs<6, 1024, __nv_bfloat16, __nv_bfloat16><<<grid, block, 0, stream>>>(wq, scales, biases, out, K, N, n_words, n_groups);
 }
-

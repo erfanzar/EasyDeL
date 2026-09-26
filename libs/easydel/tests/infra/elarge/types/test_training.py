@@ -35,7 +35,6 @@ import warnings
 from copy import deepcopy
 
 import pytest
-
 from easydel.infra.elarge.types import training as training_mod
 from easydel.infra.elarge.types.training import (
     BASE_TRAINER_DEFAULTS,

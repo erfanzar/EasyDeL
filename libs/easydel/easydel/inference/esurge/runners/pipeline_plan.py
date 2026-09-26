@@ -38,7 +38,6 @@ from eformer.loggings import get_logger
 
 from easydel.caching import (
     KDACacheView,
-    LightningCacheView,
     MLARaggedPagesCacheView,
     ParallelHybridCacheView,
     RaggedPagesCacheView,
@@ -147,7 +146,6 @@ def _cache_bearing_layer_indices(model: tp.Any) -> set[int]:
     """
     cache_views = {
         KDACacheView,
-        LightningCacheView,
         MLARaggedPagesCacheView,
         ParallelHybridCacheView,
         RaggedPagesCacheView,

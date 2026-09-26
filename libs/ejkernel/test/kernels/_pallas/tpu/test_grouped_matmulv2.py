@@ -17,7 +17,6 @@
 import jax
 import jax.numpy as jnp
 import pytest
-
 from ejkernel.kernels._pallas.tpu.grouped_matmulv2 import grouped_matmulv2
 from ejkernel.kernels._xla.grouped_matmul import grouped_matmul as grouped_matmul_xla
 

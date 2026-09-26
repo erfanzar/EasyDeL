@@ -59,6 +59,46 @@ args = TrainingArguments(
 # trainer.train()
 ```
 
+## Out-of-step vision encoding
+
+`TrainingArguments.process_encoder` optionally runs a supported model's vision tower before the compiled
+training step. It is disabled by default. For example:
+
+```python
+from easydel.trainers import TrainingArguments
+
+args = TrainingArguments(
+    process_encoder={"enabled": True, "row_bucket_multiple": 8},
+    gradient_accumulation_steps=1,
+)
+```
+
+On processed steps, the tower is a **frozen feature extractor**; leave this option disabled to train it.
+The processor calls the tower eagerly. Row bucketing pads eligible image-major inputs before that call;
+it does not create a separately compiled encoder. Grid-described patch inputs are not padded.
+
+PaliGemma explicitly accepts `image_features` together with scalar int32 `image_features_valid_length`.
+This separates the number of genuine feature rows from the capacity of a padded buffer. For example,
+two images producing 16 tokens each may occupy a `[128, hidden_size]` buffer with valid length `32`.
+The processor derives that length from the encoder output and selected image rows, then checks it against
+the image-placeholder count **before tracing**. Trailing rows are inert padding, not additional images.
+Bucket/high-water capacity can be retained for metadata-aware consumers; larger buckets can still change
+the compiled step's input shape. Other supported consumers receive exactly the genuine features and no
+valid-length keyword, so their feature shape may change with image count.
+
+Direct PaliGemma callers may pass the same metadata for precomputed features, but not alongside raw
+`pixel_values` or `inputs_embeds`. Omitting it preserves strict exact-count merging. Concrete metadata
+must be a scalar integer within buffer capacity and match the placeholder count. Under JIT, callers
+must validate dynamic counts on the host; the merge does not add runtime host callbacks. The shared
+`BaseVisionLanguageModule.merge_multimodal_embeddings` equivalent is the keyword-only
+`multimodal_embeddings_valid_length` argument.
+
+Flattened full-batch features cannot currently be sliced safely into text microbatches. Setup therefore
+rejects gradient accumulation greater than one on encoder-applicable buckets, including bucket overrides,
+and scheduled MPMD execution with more than one microbatch on an active pipeline mesh. `only_buckets`
+exclusions are respected. These are feature-layout limitations, not general restrictions on gradient
+accumulation or MPMD training.
+
 ## Customization
 
 While `BaseTrainer` handles most standard scenarios, you can customize its behavior:

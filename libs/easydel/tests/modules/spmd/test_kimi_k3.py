@@ -161,9 +161,9 @@ def test_latent_moe_runs_experts_in_the_latent_width():
     assert block.gate.weight.value.shape[0] == config.hidden_size
     assert out.shape == hidden.shape
     assert bool(jnp.all(jnp.isfinite(out)))
-    # The block returns per-selected-expert routing weights, so the trailing
-    # axis is top-k rather than the full expert count.
-    assert router_logits.shape[-1] == config.num_experts_per_token
+    # The router emits per-expert logits; selection happens in the dispatcher.
+    # (Collapsed top-k values here once routed every token to experts 0..k-1.)
+    assert router_logits.shape[-1] == config.num_experts
 
 
 def test_latent_moe_is_off_without_the_expert_width():

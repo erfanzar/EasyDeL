@@ -335,6 +335,9 @@ class GptOssMLP(BaseMoeModule):
             routing_strategy=MoeRoutingStrategy.TOP_K,
             load_balancing_strategy=MoeLoadBalancingStrategy.STANDARD,
         )
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
 
         self.router = ColumnParallelLinear(
             config.hidden_size,
@@ -354,34 +357,22 @@ class GptOssMLP(BaseMoeModule):
             rngs=rngs,
         )
 
-        def _scatter_topk_probs(logits: jax.Array) -> jax.Array:
-            """Softmax over the top-k logits and scatter back into a dense matrix.
+        def _select_topk_softmax(
+            gate_logits: jax.Array, pre_bias_logits: jax.Array | None, k: int
+        ) -> tuple[jax.Array, jax.Array]:
+            """GPT-OSS routing: top-k of the raw router logits, softmax over those k.
 
-            GPT-OSS routes through a sparse softmax: only the top
-            ``num_experts_per_tok`` logits are exponentiated and
-            normalised, with all other entries left at zero. This hook
-            runs after the router gate and produces the dense
-            ``(num_tokens, num_experts)`` weight matrix consumed by
-            ``moe_call``.
+            Matches HF ``GptOssTopKRouter``. The gate output reaches this hook
+            unnormalized (``normalize_gate_logits`` is the identity), so no
+            other softmax touches the combine weights.
             """
-            top_vals, top_idx = jax.lax.top_k(logits, k=self.num_experts_per_tok)
-            top_probs = jax.nn.softmax(top_vals, axis=-1)
-            out = jnp.zeros_like(logits)
-            row_idx = jnp.arange(logits.shape[0])[:, None]
-            return out.at[row_idx, top_idx].set(top_probs)
-
-        def _softmax_topk_weights(weights: jax.Array) -> jax.Array:
-            """Re-normalise the gathered top-k weights with a final softmax.
-
-            Hook used by :class:`BaseMoeModule` to refine the
-            already-gathered top-k routing weights before they are used
-            to combine expert outputs.
-            """
-            return jax.nn.softmax(weights, axis=-1)
+            del pre_bias_logits
+            top_vals, top_idx = jax.lax.top_k(gate_logits.astype(jnp.float32), k=k)
+            return jax.nn.softmax(top_vals, axis=-1), top_idx
 
         self.moe_hooks = self.moe_hooks.replace(
-            after_gate=_scatter_topk_probs,
-            refine_weights_hook=_softmax_topk_weights,
+            normalize_gate_logits=lambda x: x,
+            select_hook=_select_topk_softmax,
         )
 
     def forward(self, hidden_states, training=False, layer_idx=None):

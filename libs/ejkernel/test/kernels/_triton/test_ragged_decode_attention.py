@@ -17,7 +17,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from ejkernel.kernels._triton.ragged_decode_attention import ragged_decode_attention as ragged_decode_triton
 from ejkernel.kernels._xla.ragged_decode_attention import ragged_decode_attention as ragged_decode_xla
 

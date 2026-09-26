@@ -201,15 +201,15 @@ def _flash_mla_dkv_kernel(
             logits = logits + jnp.where(mask, 0.0, mask_value)
 
         kv_repeats = block_k // MIN_BLOCK_SIZE
-        p = jnp.exp(logits - pltpu.repeat(m, kv_repeats, axis=1))
-        p = p * pltpu.repeat(1.0 / l, kv_repeats, axis=1)
+        p = jnp.exp(logits - jnp.tile(m, (1, kv_repeats)))
+        p = p * jnp.tile(1.0 / l, (1, kv_repeats))
 
         dv = lax.dot(p.T.astype(do.dtype), do, preferred_element_type=jnp.float32)
         dv_scratch_ref[:, :] += dv.astype(dv_scratch_ref.dtype)
 
         dp = lax.dot_general(do, v, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32)
 
-        ds = (dp - pltpu.repeat(di, kv_repeats, axis=1)) * p
+        ds = (dp - jnp.tile(di, (1, kv_repeats))) * p
 
         if logits_soft_cap is not None:
             ds = ds * (1.0 - softcap_tanh * softcap_tanh)
@@ -610,12 +610,12 @@ def _flash_mla_dq_kernel(
             logits = logits + jnp.where(mask, 0.0, mask_value)
 
         kv_repeats = block_k // MIN_BLOCK_SIZE
-        p = jnp.exp(logits - pltpu.repeat(m, kv_repeats, axis=1))
-        p = p * pltpu.repeat(1.0 / l, kv_repeats, axis=1)
+        p = jnp.exp(logits - jnp.tile(m, (1, kv_repeats)))
+        p = p * jnp.tile(1.0 / l, (1, kv_repeats))
 
         dp = lax.dot_general(do, v, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32)
 
-        ds = (dp - pltpu.repeat(di, kv_repeats, axis=1)) * p
+        ds = (dp - jnp.tile(di, (1, kv_repeats))) * p
 
         if dbias_tile_ref is not None:
             dbias_tile_ref[0, 0, :, :] = ds.astype(dbias_tile_ref.dtype)

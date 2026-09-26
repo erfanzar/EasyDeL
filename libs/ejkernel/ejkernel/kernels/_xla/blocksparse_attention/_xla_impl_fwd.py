@@ -316,7 +316,7 @@ def blocksparse_attention(
         bwd_params: Unused in XLA backend.
         mask_builder: Unused in XLA backend.
         sliding_window: Optional local attention window. Can be:
-            - int: Symmetric window (same left and right)
+            - int: Window size ``W`` (HF convention; same as ``(W - 1, W - 1)``)
             - tuple[int, int]: Asymmetric (left_window, right_window)
         chunk_size: Unused in XLA backend.
         causal: If True, applies causal masking based on positions. Default True.
@@ -382,7 +382,8 @@ def blocksparse_attention(
     if sliding_window is None:
         window_left = window_right = None
     elif isinstance(sliding_window, int):
-        window_left = window_right = int(sliding_window)
+        # An int is a window *size* (HF convention): the query plus its ``W - 1`` neighbours.
+        window_left = window_right = max(int(sliding_window) - 1, 0)
     else:
         window_left, window_right = int(sliding_window[0]), int(sliding_window[1])
 

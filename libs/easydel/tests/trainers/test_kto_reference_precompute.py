@@ -16,7 +16,6 @@ from types import SimpleNamespace
 
 import jax.numpy as jnp
 import pytest
-
 from easydel.trainers.kto_trainer._fn import _prepare_kto_scheduled_batch
 from easydel.trainers.kto_trainer.kto_config import KTOConfig
 from easydel.trainers.kto_trainer.kto_trainer import KTOTrainer

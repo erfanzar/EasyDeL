@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-
 from ejkernel.kernels._xla.gated_delta_rule import gated_delta_rule
 
 
@@ -132,3 +131,45 @@ def test_chunk_fwd_backward():
     for i, g in enumerate(grads):
         assert g.shape == inputs[i].shape, f"grad {i} shape mismatch"
         assert jnp.all(jnp.isfinite(g)), f"grad {i} has non-finite values"
+
+
+def _naive_gdr_reference(q, k, v, beta, decay):
+    """Float64 token-by-token gated delta rule (public [B, T, H, D] layout, qk L2-normalised).
+
+    S_t = S_{t-1} * exp(g_t) + k_t (beta_t (v_t - S_{t-1}' k_t))^T,  o_t = S_t^T q_t / sqrt(K).
+    """
+    import numpy as np
+
+    q, k, v, beta, decay = (np.asarray(jnp.asarray(x, jnp.float32), np.float64) for x in (q, k, v, beta, decay))
+    B, T, H, K = q.shape
+    q = q / np.sqrt((q * q).sum(-1, keepdims=True) + 1e-6) / np.sqrt(K)
+    k = k / np.sqrt((k * k).sum(-1, keepdims=True) + 1e-6)
+    state = np.zeros((B, H, K, v.shape[-1]))
+    out = np.zeros(v.shape)
+    for t in range(T):
+        state = state * np.exp(decay[:, t])[..., None, None]
+        pred = np.einsum("bhk,bhkv->bhv", k[:, t], state)
+        delta = beta[:, t][..., None] * (v[:, t] - pred)
+        state = state + np.einsum("bhk,bhv->bhkv", k[:, t], delta)
+        out[:, t] = np.einsum("bhk,bhkv->bhv", q[:, t], state)
+    return out
+
+
+def test_bf16_decay_cumsum_runs_in_fp32():
+    """bf16 inputs with strong decay: the in-chunk log-decay cumsum must not be rounded to bf16.
+
+    With g_t ~ -1 over a 64-token chunk the cumsum reaches ~-64..-96 where bf16 spacing is
+    0.25-0.5, so exp(g_i - g_j) between neighbours was off by tens of percent.
+    """
+    import numpy as np
+
+    batch, seq_len, heads, qk_dim, v_dim = 1, 128, 2, 16, 16
+    q, k, v, beta, _ = _make_inputs(batch, seq_len, heads, qk_dim, v_dim, dtype=jnp.float32, seed=3)
+    decay = -jax.random.uniform(jax.random.PRNGKey(5), (batch, seq_len, heads), minval=0.5, maxval=1.5)
+    q, k, v, beta, decay = (x.astype(jnp.bfloat16) for x in (q, k, v, beta, decay))
+
+    out, _ = gated_delta_rule(q, k, v, beta, decay, chunk_size=64)
+    ref = _naive_gdr_reference(q, k, v, beta, decay)
+
+    err = np.abs(np.asarray(out, np.float32) - ref).max() / np.abs(ref).max()
+    assert err < 0.05, f"relative max error vs float64 recurrence: {err}"

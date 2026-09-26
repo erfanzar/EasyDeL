@@ -43,9 +43,8 @@ from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
-from jax import lax
-
 import spectrax as spx
+from jax import lax
 from spectrax import nn
 
 __all__ = [

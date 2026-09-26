@@ -61,7 +61,7 @@ def scaled_dot_product_attention(
         causal: If True, applies causal (autoregressive) masking where each position
             can only attend to earlier positions.
         sliding_window: Optional local attention window size. Can be:
-            - int: symmetric window size (past and future)
+            - int: Window size ``W`` (HF convention; same as ``(W - 1, W - 1)``)
             - tuple[int, int]: (past_window, future_window) for asymmetric windows
             When set, limits attention to local context.
         cum_seqlens_q: Optional per-example query sequence lengths, shape [batch].

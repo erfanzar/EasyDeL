@@ -201,7 +201,7 @@ def ref_ragged_paged_attention_hd64(
         kv_len = kv_lens[i]
         kv_start = 0
         if sliding_window is not None:
-            kv_start = jnp.maximum(kv_len - sliding_window, 0)
+            kv_start = jnp.maximum(kv_len - q_len - sliding_window, 0)
             kv_start = (kv_start // bkv_sz) * bkv_sz
         kv_len_eff = kv_len - kv_start
         if kv_len_eff < q_len:
@@ -553,17 +553,21 @@ def _ragged_paged_attention_kernel(
 
         return lax.while_loop(cond, lambda j: j + 1, idx)
 
-    def bkv_idx_start_of(s):
+    def get_start_bkv_idx(processed_q_len):
+        # First KV block that can hold a key in the window of the query at
+        # absolute position ``processed_q_len`` (and of every later query).
         if sliding_window is None:
             return 0
-        return jnp.maximum(kv_lens_ref[s] - sliding_window, 0) // bkv_sz
+        return jnp.maximum(processed_q_len - sliding_window, 0) // bkv_sz
+
+    def bkv_idx_start_of(s):
+        return get_start_bkv_idx(kv_lens_ref[s] - q_len_of(s))
 
     q_start = cu_q_lens_ref[seq_idx]
     q_end = cu_q_lens_ref[seq_idx + 1]
     q_len = q_end - q_start
     kv_len = kv_lens_ref[seq_idx]
-
-    bkv_idx_start = bkv_idx_start_of(seq_idx)
+    kv_q_gap = kv_len - q_len
 
     if sliding_window is None:
         next_bkv_idx_start = 0
@@ -580,6 +584,7 @@ def _ragged_paged_attention_kernel(
         *,
         bq_idx,
         bkv_idx,
+        start_bkv_idx,
         kv_head_idx,
     ):
         assert len(q.shape) == 2
@@ -591,7 +596,7 @@ def _ragged_paged_attention_kernel(
         head_acc_ref = acc_ref.at[kv_head_idx, : q.shape[0]]
 
         def load_with_init(ref, init_val):
-            return jnp.where(bkv_idx == bkv_idx_start, jnp.full_like(ref, init_val), ref[...])
+            return jnp.where(bkv_idx == start_bkv_idx, jnp.full_like(ref, init_val), ref[...])
 
         if q_scale is not None:
             q = q / q_scale
@@ -624,7 +629,7 @@ def _ragged_paged_attention_kernel(
             sinks = attention_sink_ref[kv_head_idx]
             actual_bq_sz = q.shape[0] // num_q_heads_per_kv_head
             m_prev_init = jnp.concat([sinks] * actual_bq_sz, axis=0)
-            m_prev = jnp.where(bkv_idx == bkv_idx_start, m_prev_init, head_m_ref[...])
+            m_prev = jnp.where(bkv_idx == start_bkv_idx, m_prev_init, head_m_ref[...])
         else:
             m_prev = load_with_init(head_m_ref, -jnp.inf)
 
@@ -879,14 +884,16 @@ def _ragged_paged_attention_kernel(
             next_seq_idx = lax.select(is_last_bq, next_nonempty_seq(seq_idx + 1), seq_idx)
             next_bkv_sem_idx = lax.select(bkv_sem_idx == 0, 1, 0)
 
+            next_bq_start_bkv_idx = get_start_bkv_idx(kv_q_gap + (bq_idx + 1) * actual_bq_sz)
             next_bkv_idx = lax.select(
                 is_last_bkv,
-                lax.select(is_last_bq, next_bkv_idx_start, bkv_idx_start),
+                lax.select(is_last_bq, next_bkv_idx_start, next_bq_start_bkv_idx),
                 next_bkv_idx,
             )
             return next_seq_idx, next_bq_idx, next_bkv_idx, next_bkv_sem_idx
 
         def compute_with_bq(bq_idx, _):
+            start_bkv_idx = get_start_bkv_idx(kv_q_gap + bq_idx * actual_bq_sz)
             bq_sem_idx = sem_ids_ref[0]
             next_seq_idx, next_bq_idx, next_bq_sem_idx = get_next_bq_ids(seq_idx, bq_idx, bq_sem_idx)
 
@@ -909,7 +916,7 @@ def _ragged_paged_attention_kernel(
                     sem_ids_ref[1] = next_bkv_sem_idx
                     start_fetch_bkv(next_seq_idx, next_bkv_idx, next_bkv_sem_idx)
 
-                @pl.when(bkv_idx == bkv_idx_start)
+                @pl.when(bkv_idx == start_bkv_idx)
                 def wait_cur_bq():
                     wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx)
 
@@ -938,10 +945,11 @@ def _ragged_paged_attention_kernel(
                             bkv,
                             bq_idx=bq_idx,
                             bkv_idx=bkv_idx,
+                            start_bkv_idx=start_bkv_idx,
                             kv_head_idx=kv_head_idx,
                         )
 
-            lax.fori_loop(bkv_idx_start, num_bkv, compute_with_bkv, None, unroll=False)
+            lax.fori_loop(start_bkv_idx, num_bkv, compute_with_bkv, None, unroll=False)
 
             acc = acc_ref[...]
             l = broadcast_minor(l_ref[...], acc.shape)

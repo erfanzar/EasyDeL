@@ -194,7 +194,7 @@ class SmolLM3Config(EasyDeLBaseConfig):
     def _rope_scaling_validation(self):
         """Validate and normalise the ``rope_scaling`` configuration.
 
-        SmolLM3 supports ``"linear"`` and ``"dynamic"`` scaling. The
+        SmolLM3 supports ``"linear"``, ``"dynamic"``, ``"yarn"`` and ``"llama3"`` scaling. The
         validator (a) accepts ``"rope_type"`` as an alias for
         ``"type"`` for forward-compat with newer HF schemas, (b)
         clears ``rope_scaling`` to ``None`` when the requested type is
@@ -219,9 +219,12 @@ class SmolLM3Config(EasyDeLBaseConfig):
             self.rope_scaling = None
             return
 
-        if rope_scaling_type not in {"linear", "dynamic"}:
+        # Official checkpoints ship ``llama3`` (EXAONE-4.0) / ``yarn`` (long-context
+        # SmolLM3); their extra keys must survive normalization below.
+        if rope_scaling_type not in {"linear", "dynamic", "yarn", "llama3"}:
             raise ValueError(
-                f"`rope_scaling`'s type field must be one of ['linear', 'dynamic'], got {rope_scaling_type}"
+                "`rope_scaling`'s type field must be one of ['linear', 'dynamic', 'yarn', 'llama3'], "
+                f"got {rope_scaling_type}"
             )
 
         rope_scaling_factor = self.rope_scaling.get("factor", 1.0)
@@ -233,7 +236,12 @@ class SmolLM3Config(EasyDeLBaseConfig):
         if rope_scaling_factor < 1.0:
             raise ValueError(f"`rope_scaling`'s factor field must be a float >= 1, got {rope_scaling_factor}")
 
-        self.rope_scaling = {"type": rope_scaling_type, "factor": rope_scaling_factor}
+        self.rope_scaling = {
+            **self.rope_scaling,
+            "type": rope_scaling_type,
+            "rope_type": rope_scaling_type,
+            "factor": rope_scaling_factor,
+        }
 
     def _validate_no_rope_layers(self):
         """Sanity-check the per-layer NoPE flag list.

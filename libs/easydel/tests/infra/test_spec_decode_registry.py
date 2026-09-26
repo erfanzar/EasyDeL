@@ -153,7 +153,33 @@ def test_model_native_multi_layer_seed_gate():
     builder = DrafterRegistry.resolve("eagle3")
     with pytest.raises(ValueError) as excinfo:
         builder(object(), drafter_model=_FakeMultiLayerDrafter(), num_draft_tokens=2)
-    assert "target layers" in str(excinfo.value)
+    message = str(excinfo.value)
+    assert "target layers" in message
+    # The error must not suggest a fix EAGLE3 cannot apply (its config requires 5 layers).
+    assert "EAGLE3" in message
+    assert "pre-concatenate" not in message
+
+
+def test_model_native_builder_rejects_non_final_single_target_layer():
+    """eSurge seeds the target's FINAL hidden state; a drafter trained on another layer is rejected."""
+
+    class _FakeConfig:
+        target_layer_ids = (1,)
+
+    class _FakeDrafter(SpecDecodeBase):
+        config = _FakeConfig()
+
+    class _TargetConfig:
+        num_hidden_layers = 4
+
+    builder = DrafterRegistry.resolve("dspark")
+    with pytest.raises(ValueError) as excinfo:
+        builder(object(), drafter_model=_FakeDrafter(), num_draft_tokens=2, target_config=_TargetConfig())
+    assert "FINAL hidden state" in str(excinfo.value)
+
+    _FakeConfig.target_layer_ids = (3,)
+    drafter = _FakeDrafter()
+    assert builder(object(), drafter_model=drafter, num_draft_tokens=2, target_config=_TargetConfig()) is drafter
 
 
 def test_model_native_builder_requires_spec_decode_base():

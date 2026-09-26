@@ -156,7 +156,7 @@ class DbrxFFNConfig(EasyDeLBaseConfig):
         moe_top_k: int = 1,
         moe_jitter_eps: float | None = None,
         moe_loss_weight: float = 0.01,
-        moe_normalize_expert_weights: float | None = 1,
+        moe_normalize_expert_weights: float | None = 1.0,
         uniform_expert_assignment: bool = False,
         **kwargs: tp.Any,
     ):
@@ -348,8 +348,6 @@ class DbrxConfig(EasyDeLBaseConfig):
         self.layer_types = layer_types
         if self.layer_types is None:
             self.layer_types = ["full_attention"] * self.n_layers
-        if getattr(self.ffn_config, "ffn_hidden_size", None) != d_model:
-            self.ffn_config.ffn_hidden_size = d_model
         if not hasattr(self.ffn_config, "hidden_size"):
             self.ffn_config.hidden_size = d_model
         self.rope_theta = getattr(self.attn_config, "rope_theta", 10000.0)

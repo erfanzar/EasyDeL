@@ -35,9 +35,6 @@ from types import SimpleNamespace
 
 import pytest
 import spectrax as spx
-from spectrax import PartitionAxis
-from spectrax.common_types import EMPTY, MODE_DECODE, MODE_TRAIN
-
 from easydel.infra.sharding import (
     AxisPolicy,
     TensorLayout,
@@ -50,6 +47,8 @@ from easydel.infra.sharding import (
     sanitize_partition_spec_for_shape,
     sharding_for_layout,
 )
+from spectrax import PartitionAxis
+from spectrax.common_types import EMPTY, MODE_DECODE, MODE_TRAIN
 
 
 @pytest.mark.parametrize(

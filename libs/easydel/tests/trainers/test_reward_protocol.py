@@ -18,7 +18,6 @@ from types import SimpleNamespace
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from easydel.trainers.group_relative_policy_optimization.grpo_trainer import (
     GRPOTrainer,
     _compute_rewards_and_advantages,

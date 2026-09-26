@@ -62,6 +62,7 @@ from typing import Literal
 import jax
 import jax.numpy as jnp
 from jax import shard_map
+from jax.extend.core import concrete_or_error
 from jax.sharding import Mesh, PartitionSpec
 from jaxtyping import Array, Float
 
@@ -118,7 +119,7 @@ def _infer_axis_size(axis_name: str) -> int | None:
         not currently mapped, or the value is not statically concrete).
     """
     try:
-        return jax.core.concrete_or_error(
+        return concrete_or_error(
             int,
             jax.lax.psum(jnp.array(1, dtype=jnp.int32), axis_name=axis_name),
             f"collective axis '{axis_name}' size must be static.",

@@ -97,6 +97,8 @@ Rules that make this work:
   `gs://` to a temp dir for the HF `Auto*` loaders and rsyncs tokenizer assets to the `gs://` output; weight shards
   never fully land on disk.
 - On a TPU host, keep the process CPU-pinned so it cannot grab the libtpu lock from a running pod job.
+- CPU-pinning is for the conversion job only; it is not validation. The artifact check and roundtrip tests below
+  compute logits/parity and run on the accelerator.
 
 ## Download And Staging
 
@@ -118,11 +120,12 @@ Use `scripts/mount_gcsfuse.sh` before writing to a GCS mount path.
 
 ## Verification
 
-Every conversion needs an artifact check, not only a completed script:
+Every conversion needs an artifact check, not only a completed script. The check runs a forward pass, so it runs on the
+accelerator (wait for the TPU if a job holds the libtpu lock; without an accelerator the checkpoint is unverified on
+hardware):
 
 ```bash
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
-XLA_FLAGS=--xla_force_host_platform_device_count=8 \
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
   uv run python a checkpoint verification harness <checkpoint> \
     --tokenizer <tokenizer-or-source> --tp 1 --seq 64
 ```
@@ -130,11 +133,10 @@ XLA_FLAGS=--xla_force_host_platform_device_count=8 \
 a checkpoint verification harness also accepts `--max-real-entropy` and
 `--min-repeat-acc`. It builds an `eLargeModel` state, disables MTP in config, and exits nonzero on failed checks.
 
-For conversion code changes, run the focused roundtrip test:
+For conversion code changes, run the focused roundtrip test on the accelerator:
 
 ```bash
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
-XLA_FLAGS=--xla_force_host_platform_device_count=8 \
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
   uv run pytest libs/easydel/tests/modules/test_conversion_roundtrip.py
 ```
 

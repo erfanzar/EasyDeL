@@ -367,9 +367,7 @@ class RoutedEngine:
     def _chat_routing_key(self, messages: list[dict]) -> str:
         """A stable prompt-shaped key for affinity routing of chat calls."""
         try:
-            return str(
-                self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            )
+            return str(self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True))
         except Exception:
             return repr(messages)
 

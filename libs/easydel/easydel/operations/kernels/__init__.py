@@ -117,7 +117,7 @@ from .gdn_compute_schedule_v2 import GDNComputeScheduleV2, GDNComputeScheduleV2C
 from .glm_moe_dsa_indexer import GlmMoeDsaIndexerOp, GlmMoeDsaIndexerOutput
 from .inference_conv1d import RaggedCausalConv1D, ragged_causal_conv1d, ragged_causal_conv1d_head_sharded
 from .inference_gdn import RaggedGatedDeltaRule
-from .kda import KDAOutput, KernelDeltaAttnOp, fused_kda_gate
+from .kda import KDAOutput, KernelDeltaAttnOp, fused_kda_gate, fused_kda_gate_per_channel
 from .multi_latent_ragged_page_attention import MultiLatentRaggedPageAttn
 from .paged_flash_attention import PagedFlashAttn
 from .ragged_page_attention import RaggedPageAttnV2, RaggedPageAttnV3

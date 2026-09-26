@@ -18,7 +18,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from easydel.trainers.reward_trainer._fn import _reward_pair_loss, _reward_scores_from_logits
 from easydel.trainers.reward_trainer.reward_config import RewardConfig
 from easydel.trainers.reward_trainer.reward_trainer import RewardTrainer

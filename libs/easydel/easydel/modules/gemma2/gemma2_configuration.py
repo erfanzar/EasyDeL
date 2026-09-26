@@ -126,7 +126,7 @@ class Gemma2Config(EasyDeLBaseConfig):
         layer_types: list[str] | None = None,
         bits: int | None = None,
         scan_layers: bool = False,
-        attn_logit_softcapping: bool | None = None,
+        attn_logit_softcapping: float | None = 50.0,
         **kwargs,
     ):
         """Initialize a :class:`Gemma2Config`.
@@ -171,8 +171,9 @@ class Gemma2Config(EasyDeLBaseConfig):
             bits (int | None, optional): Quantization bit-width. Defaults to ``None``.
             scan_layers (bool, optional): Use ``lax.scan`` for shared decoder weights.
                 Defaults to ``False``.
-            attn_logit_softcapping (bool | None, optional): Optional per-attention
-                softcapping value (forwarded to the attention kernel).
+            attn_logit_softcapping (float | None, optional): Tanh-softcap value applied
+                to the scaled attention scores (forwarded to the attention kernel).
+                Defaults to ``50.0`` as in HF; ``None`` disables it.
             **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
         """
         self.gradient_checkpointing = gradient_checkpointing

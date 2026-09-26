@@ -44,9 +44,9 @@ Read these before editing:
 ## Verification
 
 ```bash
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
-XLA_FLAGS=--xla_force_host_platform_device_count=8 \
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
   uv run pytest libs/easydel/tests/inference/vwhisper/
 ```
 
-Also validate the CLI help and server startup paths on CPU before claiming readiness.
+Also validate the CLI help (non-computation; the CPU trio is fine) and the server startup path (loads a model — on the
+accelerator) before claiming readiness.

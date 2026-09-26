@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import pytest
-
 from spectrax.serialization._compat import PyTree, flatten_dict
 
 

@@ -14,9 +14,8 @@
 
 """Tests for EXAONE model."""
 
-import pytest
-
 import easydel as ed
+import pytest
 
 try:
     from tests.modules.test_utils import CausalLMTester, get_hf_model_from_hub

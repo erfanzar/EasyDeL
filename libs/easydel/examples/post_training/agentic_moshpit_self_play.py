@@ -55,8 +55,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from eformer.aparser import DataClassArgumentParser
-
 import easydel as ed
 from easydel.infra.elarge import eLargeModel
 from easydel.trainers.agentic_moshpit import (
@@ -64,6 +62,7 @@ from easydel.trainers.agentic_moshpit import (
     PythonCodeTool,
     SelfPlayEnvironment,
 )
+from eformer.aparser import DataClassArgumentParser
 
 
 @dataclass

@@ -35,7 +35,6 @@ from types import SimpleNamespace
 import jax
 import numpy as np
 import pytest
-
 from easydel.inference.esurge.runners.executors.batch_preparer import BatchMetadataPreparer
 
 MAX_NUM_TOKENS = 8

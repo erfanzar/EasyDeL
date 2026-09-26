@@ -14,13 +14,16 @@
 
 """Tests for the spot watcher: pure plan() truth table, effects, resubmission."""
 
+import time
 from types import SimpleNamespace
+from unittest import mock
 
 import eray.provision.watcher as watcher_module
 import pytest
 from eray.provision.registry import ClusterRecord, ClusterRegistry, LocalBackend
 from eray.provision.watcher import (
     Action,
+    LeaseKeeper,
     Observed,
     WatchPolicy,
     plan,
@@ -106,11 +109,36 @@ class TestPlanTruthTable:
 
     def test_preempted_node_triggers_recovery_sequence(self):
         actions = plan(make_record(generation=3, qr_id="trainer1-r3"), obs(node_state="PREEMPTED"), WatchPolicy())
-        assert kinds(actions) == ["event", "set_state", "delete_qr", "create_qr", "record_recreate", "set_state"]
+        assert kinds(actions) == ["event", "set_state", "record_recreate", "delete_qr", "create_qr", "set_state"]
         assert actions[0].args["event"] == "preemption_detected"
         assert actions[1].args["state"] == "DEGRADED"
-        assert actions[3].args["qr_id"] == "trainer1-r4"
+        assert actions[4].args["qr_id"] == "trainer1-r4"
         assert actions[-1].args["state"] == "WAITING"
+
+    def test_recovery_resets_incident_counters(self):
+        # The replaced slice's repair_attempted/unreach_ticks must not carry
+        # over to generation N+1.
+        record = make_record(extra={"unreach_ticks": 5, "repair_attempted": True})
+        actions = plan(record, obs(head_up=False), WatchPolicy())
+        states = [a for a in actions if a.kind == "set_state"]
+        assert [a.args["state"] for a in states] == ["DEGRADED", "WAITING"]
+        assert all(a.args.get("reset_incident") for a in states)
+
+    def test_recovery_is_budgeted_before_any_mutation(self):
+        # record_recreate precedes delete/create, so a mutation that fails
+        # immediately still counts toward the budget.
+        actions = kinds(plan(make_record(), obs(node_state="PREEMPTED"), WatchPolicy()))
+        assert actions.index("record_recreate") < actions.index("delete_qr") < actions.index("create_qr")
+
+    def test_resumed_quota_failure_is_replaced_once(self):
+        failed = obs(node_state=None, qr_state="FAILED", qr_error="quota exceeded")
+        acked = make_record(state="UNKNOWN", qr_id="trainer1-r2", generation=2, extra={"resumed_qr": "trainer1-r2"})
+        actions = plan(acked, failed, WatchPolicy())
+        assert "halt" not in kinds(actions)
+        assert next(a for a in actions if a.kind == "create_qr").args["qr_id"] == "trainer1-r3"
+        # The acknowledgement covers that QR only: a fresh quota failure halts.
+        replaced = make_record(state="WAITING", qr_id="trainer1-r3", generation=3, extra={"resumed_qr": "trainer1-r2"})
+        assert plan(replaced, failed, WatchPolicy())[-1].args["state"] == "HALTED_QUOTA"
 
     def test_suspended_qr_without_node_recovers_without_force(self):
         actions = plan(make_record(), obs(node_state=None, qr_state="SUSPENDED"), WatchPolicy())
@@ -250,6 +278,80 @@ class TestExecuteActions:
         self._run(registry, [Action("halt", {"state": "HALTED_BUDGET"})], monkeypatch)
         assert registry.get("trainer1").state == "HALTED_BUDGET"
 
+    def test_replacement_slice_is_not_recreated_on_sight(self, registry, monkeypatch):
+        # Gen N went dark, the one repair failed → recreate. Gen N+1 then
+        # comes up READY before Ray is started on it: it must get its own
+        # blip/repair cycle, not inherit "repair already attempted".
+        registry.mutate_record("trainer1", lambda r: r.extra.update(unreach_ticks=5, repair_attempted=True))
+        actions = plan(registry.get("trainer1"), obs(head_up=False), WatchPolicy())
+        assert "create_qr" in kinds(actions)
+        self._run(registry, actions, monkeypatch)
+        record = registry.get("trainer1")
+        assert record.generation == 1 and record.state == "WAITING"
+        assert "repair_attempted" not in record.extra and "unreach_ticks" not in record.extra
+        policy = WatchPolicy()
+        first = plan(record, obs(head_up=False), policy)
+        assert kinds(first) == ["set_state"]  # blip count, not a recreate
+        self._run(registry, first, monkeypatch)
+        second = plan(registry.get("trainer1"), obs(head_up=False), policy)
+        assert kinds(second) == ["event", "set_state", "bootstrap", "connect"]  # repair (connect) gen N+1
+
+    def _failing_create(self, monkeypatch, message):
+        def boom(spec, qr_id=None):
+            raise RuntimeError(message)
+
+        monkeypatch.setattr(watcher_module, "delete_queued_resource", lambda qr_id, **k: None)
+        monkeypatch.setattr(watcher_module, "create_queued_resource", boom)
+        monkeypatch.setattr(watcher_module, "describe_queued_resource", lambda qr_id, **k: None)
+
+    def test_immediate_create_failure_counts_toward_budget_and_halts(self, registry, monkeypatch):
+        self._failing_create(monkeypatch, "gcloud compute tpus failed: INTERNAL error")
+        policy = WatchPolicy(max_recreates_per_hour=3)
+        gone = obs(node_state=None, qr_state=None, head_up=None)
+        for attempt in range(3):
+            actions = plan(registry.get("trainer1"), gone, policy)
+            assert "create_qr" in kinds(actions), attempt
+            with pytest.raises(RuntimeError, match="INTERNAL"):
+                watcher_module.execute_actions(registry.get("trainer1"), actions, registry, policy, emit=lambda *a: None)
+            record = registry.get("trainer1")
+            assert len(record.recreate_ts) == attempt + 1
+            assert record.intent is None
+        final = plan(registry.get("trainer1"), gone, policy)
+        assert kinds(final) == ["event", "halt"]
+        assert final[-1].args["state"] == "HALTED_BUDGET"
+
+    def test_quota_create_failure_halts_immediately(self, registry, monkeypatch):
+        self._failing_create(monkeypatch, "gcloud compute tpus failed: Quota 'TPUV5P' exceeded")
+        events = []
+        actions = plan(registry.get("trainer1"), obs(node_state="PREEMPTED"), WatchPolicy())
+        watcher_module.execute_actions(
+            registry.get("trainer1"), actions, registry, WatchPolicy(), emit=lambda e, d="": events.append(e)
+        )
+        record = registry.get("trainer1")
+        assert record.state == "HALTED_QUOTA"
+        assert record.intent is None
+        assert "qr_failed_quota" in events
+
+    def test_lost_lease_stops_before_next_action(self, registry, monkeypatch):
+        answers = iter([True, True, False])
+        actions = plan(registry.get("trainer1"), obs(node_state="PREEMPTED"), WatchPolicy())
+        deleted, created, events = [], [], []
+        monkeypatch.setattr(watcher_module, "delete_queued_resource", lambda qr_id, **k: deleted.append(qr_id))
+        monkeypatch.setattr(watcher_module, "create_queued_resource", lambda *a, **k: created.append(1))
+        monkeypatch.setattr(watcher_module, "describe_queued_resource", lambda qr_id, **k: None)
+        watcher_module.execute_actions(
+            registry.get("trainer1"),
+            actions,
+            registry,
+            WatchPolicy(),
+            emit=lambda e, d="": events.append(e),
+            lease_ok=lambda: next(answers),
+        )
+        # event + set_state ran; the lease was gone before record_recreate.
+        assert deleted == [] and created == []
+        assert registry.get("trainer1").generation == 0
+        assert events == ["preemption_detected", "lease_lost"]
+
 
 class FakeJobsClient:
     def __init__(self, existing=()):
@@ -274,14 +376,55 @@ class TestResubmitJobs:
         monkeypatch.setitem(__import__("sys").modules, "ray.job_submission", fake_module)
         return client
 
-    def snapshot_entry(self, sid="train-abc", *, restartable="1", cwd=None, restart_count=None):
+    def snapshot_entry(
+        self, sid="train-abc", *, restartable="1", cwd=None, restart_count=None, working_dir=None, runtime_env=None
+    ):
         meta = {"restartable": restartable}
         if cwd is not None:
             meta["cwd"] = cwd
+        if working_dir is not None:
+            meta["working_dir"] = working_dir
         if restart_count is not None:
             meta["restart_count"] = str(restart_count)
             meta["resume_of"] = sid
-        return {"submission_id": sid, "entrypoint": "python train.py", "metadata": meta, "status": "RUNNING"}
+        entry = {"submission_id": sid, "entrypoint": "python train.py", "metadata": meta, "status": "RUNNING"}
+        if runtime_env is not None:
+            entry["runtime_env"] = runtime_env
+        return entry
+
+    def test_original_runtime_env_is_preserved(self, monkeypatch, tmp_path):
+        client = self._client(monkeypatch)
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        entry = self.snapshot_entry(
+            cwd=str(tmp_path),
+            working_dir=str(pkg),
+            runtime_env={
+                "working_dir": "gcs://_ray_pkg_dead.zip",
+                "py_modules": ["gcs://_ray_pkg_mod.zip", "s3://bucket/mod.zip"],
+                "pip": ["einops"],
+                "env_vars": {"HF_TOKEN": "hf_x", "WANDB_PROJECT": "p", "ERAY_RESTART_COUNT": "stale"},
+            },
+        )
+        assert resubmit_jobs(self._record([entry]), "10.0.0.5", WatchPolicy(), emit=lambda e, d="": None) == [
+            "train-abc-p1"
+        ]
+        env = client.submitted[0]["runtime_env"]
+        # The packaged dir, not the dead cluster's gcs:// package or the cwd.
+        assert env["working_dir"] == str(pkg)
+        assert env["py_modules"] == ["s3://bucket/mod.zip"]
+        assert env["pip"] == ["einops"]
+        assert env["env_vars"]["HF_TOKEN"] == "hf_x"
+        assert env["env_vars"]["WANDB_PROJECT"] == "p"
+        assert env["env_vars"]["ERAY_RESTART_COUNT"] == "1"  # restart contract wins
+        # The snapshot itself is not mutated.
+        assert entry["runtime_env"]["env_vars"]["ERAY_RESTART_COUNT"] == "stale"
+
+    def test_no_working_dir_job_is_not_repackaged(self, monkeypatch, tmp_path):
+        client = self._client(monkeypatch)
+        record = self._record([self.snapshot_entry(cwd=str(tmp_path), working_dir="")])
+        assert resubmit_jobs(record, "10.0.0.5", WatchPolicy(), emit=lambda e, d="": None) == ["train-abc-p1"]
+        assert "working_dir" not in client.submitted[0]["runtime_env"]
 
     def test_restartable_job_resubmitted_with_contract(self, monkeypatch, tmp_path):
         client = self._client(monkeypatch)
@@ -395,3 +538,111 @@ class TestWatchLoop:
         monkeypatch.setattr(watcher_module, "create_queued_resource", lambda *a, **k: pytest.fail("must not mutate"))
         watch_and_reconnect(once=True, dry_run=True, registry=registry)
         assert registry.get("a").generation == 0
+
+
+class TestListJobs:
+    def _module(self, monkeypatch, client_factory):
+        fake_module = SimpleNamespace(JobSubmissionClient=client_factory)
+        monkeypatch.setitem(__import__("sys").modules, "ray.job_submission", fake_module)
+
+    def test_api_failure_is_none_not_empty(self, monkeypatch):
+        def broken(addr):
+            raise ConnectionError("dashboard down")
+
+        self._module(monkeypatch, broken)
+        assert watcher_module._list_jobs("10.0.0.5") is None
+        # ... so plan() keeps the last good snapshot instead of wiping it.
+        assert "snapshot_jobs" not in kinds(plan(make_record(), obs(jobs=None), WatchPolicy()))
+
+    def test_snapshot_captures_runtime_env(self, monkeypatch):
+        job = SimpleNamespace(
+            submission_id="j1",
+            entrypoint="python t.py",
+            metadata={"restartable": "1"},
+            runtime_env={"env_vars": {"HF_TOKEN": "x"}},
+            status="RUNNING",
+        )
+        done = SimpleNamespace(submission_id="j0", entrypoint="x", metadata={}, runtime_env=None, status="SUCCEEDED")
+        self._module(monkeypatch, lambda addr: SimpleNamespace(list_jobs=lambda: [job, done]))
+        jobs = watcher_module._list_jobs("10.0.0.5")
+        assert [j["submission_id"] for j in jobs] == ["j1"]
+        assert jobs[0]["runtime_env"] == {"env_vars": {"HF_TOKEN": "x"}}
+
+
+class TestLeaseKeeper:
+    @pytest.fixture
+    def registry(self, tmp_path):
+        return ClusterRegistry(LocalBackend(tmp_path / "clusters.json"))
+
+    def test_background_renewal_outlives_the_ttl(self, registry):
+        # A long action (QR delete: up to 10 min) must not let the lease lapse.
+        assert registry.acquire_lease(ttl=1.0)
+        keeper = LeaseKeeper(registry, ttl=1.0, interval=0.1)
+        keeper.start()
+        try:
+            time.sleep(2.0)  # "long operation", 2x the TTL
+            assert keeper.held()
+            assert registry.lease_holder() == ClusterRegistry._holder()
+        finally:
+            keeper.stop()
+
+    def test_other_holder_marks_lost(self, registry):
+        assert registry.acquire_lease()
+        keeper = LeaseKeeper(registry)
+        assert keeper.held()
+        registry.backend.update(lambda doc: doc.update(lease={"holder": "other:1", "expires": time.time() + 600}))
+        assert keeper.renew() is False
+        assert not keeper.held()
+
+    def test_transient_errors_expire_the_margin(self, registry, monkeypatch):
+        assert registry.acquire_lease()
+        keeper = LeaseKeeper(registry, ttl=120, interval=30)
+        monkeypatch.setattr(registry, "acquire_lease", mock.Mock(side_effect=RuntimeError("gcs 503")))
+        assert keeper.renew() is True  # recent success still inside the margin
+        keeper._last_ok -= 100  # renewals kept failing for 100s of a 120s lease
+        assert keeper.renew() is False
+
+
+class TestWatchLoopLease:
+    @pytest.fixture
+    def registry(self, tmp_path, monkeypatch):
+        reg = ClusterRegistry(LocalBackend(tmp_path / "clusters.json"))
+        monkeypatch.setattr(watcher_module, "EVENTS_PATH", tmp_path / "events.jsonl")
+        monkeypatch.setattr(watcher_module, "PAUSE_DIR", tmp_path)
+        return reg
+
+    @staticmethod
+    def _steal(registry):
+        registry.backend.update(lambda doc: doc.update(lease={"holder": "other:1", "expires": time.time() + 600}))
+
+    def test_lease_lost_mid_tick_stops_acting(self, registry, monkeypatch):
+        class EagerKeeper(LeaseKeeper):
+            def held(self):  # as if the renewal thread had just run
+                if not self.registry.acquire_lease(ttl=self.ttl):
+                    self._lost.set()
+                return super().held()
+
+        monkeypatch.setattr(watcher_module, "LeaseKeeper", EagerKeeper)
+        registry.upsert(make_record(name="a", state="UNKNOWN"))
+        registry.upsert(make_record(name="b"))
+        observed = []
+
+        def stealing_observe(record, **k):
+            observed.append(record.name)
+            self._steal(registry)  # another watcher took over during a's long step
+            return obs()
+
+        monkeypatch.setattr(watcher_module, "observe", stealing_observe)
+        with pytest.raises(RuntimeError, match="lost the fleet lease"):
+            watch_and_reconnect(once=True, registry=registry)
+        assert observed == ["a"]
+        assert registry.get("a").state == "UNKNOWN"  # a's planned actions were gated, none ran
+        assert "lease_lost" in (registry.backend.path.parent / "events.jsonl").read_text()
+        assert registry.lease_holder() == "other:1"  # never released someone else's lease
+
+    def test_heartbeat_result_is_checked(self, registry, monkeypatch):
+        registry.upsert(make_record(name="a"))
+        monkeypatch.setattr(watcher_module, "observe", lambda r, **k: self._steal(registry) or obs())
+        monkeypatch.setattr(watcher_module.time, "sleep", lambda s: pytest.fail("must not keep looping"))
+        with pytest.raises(RuntimeError, match="lost the fleet lease"):
+            watch_and_reconnect(registry=registry)

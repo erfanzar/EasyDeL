@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import jax.numpy as jnp
-
 from spectrax.hooks.forward import (
     Handle,
     register_forward_hook,

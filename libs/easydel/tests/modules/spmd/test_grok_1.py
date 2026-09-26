@@ -14,9 +14,8 @@
 
 """Tests for Grok-1 model."""
 
-import pytest
-
 import easydel as ed
+import pytest
 
 try:
     from tests.modules.test_utils import CausalLMTester

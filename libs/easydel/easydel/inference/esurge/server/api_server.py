@@ -326,9 +326,7 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         for name, esurge in esurge_map.items():
             missing = [attr for attr in engine_surface if not hasattr(esurge, attr)]
             if missing:
-                raise TypeError(
-                    f"Value for key '{name}' does not expose the eSurge engine surface; missing: {missing}"
-                )
+                raise TypeError(f"Value for key '{name}' does not expose the eSurge engine surface; missing: {missing}")
             coordinator = getattr(esurge, "_step_coordinator", None)
             if coordinator is not None and not getattr(coordinator, "is_leader", True):
                 raise ValueError(

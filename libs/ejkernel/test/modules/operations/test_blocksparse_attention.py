@@ -3,7 +3,6 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import pytest
-
 from ejkernel.errors import EjkernelRuntimeError
 from ejkernel.modules.operations import BlockSparseAttention, blocksparse_attention
 from ejkernel.modules.operations.configs import BlockSparseAttentionConfig

@@ -435,6 +435,7 @@ class _StateDictProxy(MutableMapping[object, object]):
             key: Logical key, path segment, or PRNG key used by the operation.
         """
         del self._target()[key]
+        self._state._touch()
         self._state._restrict_writers()
 
     def __iter__(self) -> Iterator[object]:

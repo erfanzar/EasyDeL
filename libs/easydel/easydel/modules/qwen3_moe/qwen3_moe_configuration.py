@@ -78,7 +78,8 @@ class Qwen3MoeConfig(EasyDeLBaseConfig):
         sliding_window (`int`, *optional*, defaults to 4096):
             Sliding window size (only effective when ``use_sliding_window=True``).
         max_window_layers (`int`, *optional*, defaults to 28):
-            Layers at or above this index use sliding window attention.
+            Kept for config compatibility; like HF, Qwen3-MoE slides every layer when
+            ``use_sliding_window=True``.
         attention_dropout (`float`, *optional*, defaults to 0.0):
             Dropout rate for attention weights.
         decoder_sparse_step (`int`, *optional*, defaults to 1):
@@ -167,20 +168,19 @@ class Qwen3MoeConfig(EasyDeLBaseConfig):
         self.decoder_sparse_step = decoder_sparse_step
         self.moe_intermediate_size = moe_intermediate_size
         self.num_experts_per_tok = num_experts_per_tok
-        self.num_experts = num_experts
+        # transformers>=5 serializes the expert count as `num_local_experts`.
+        self.num_experts = kwargs.pop("num_local_experts", num_experts)
         self.norm_topk_prob = norm_topk_prob
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef
         self.mlp_only_layers = [] if mlp_only_layers is None else mlp_only_layers
         self.layer_types = layer_types
         if self.layer_types is None:
+            # HF Qwen3-MoE slides every layer once ``use_sliding_window`` is set
+            # (``max_window_layers`` is not consulted).
             self.layer_types = [
-                (
-                    "sliding_attention"
-                    if self.sliding_window is not None and i >= self.max_window_layers
-                    else "full_attention"
-                )
-                for i in range(self.num_hidden_layers)
+                "sliding_attention" if self.sliding_window is not None else "full_attention"
+                for _ in range(self.num_hidden_layers)
             ]
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
@@ -201,7 +201,7 @@ class Qwen3MoeConfig(EasyDeLBaseConfig):
         """
         mapping = {}
         for layer_idx in range(self.num_hidden_layers):
-            if self.sliding_window is not None and self.use_sliding_window and layer_idx >= self.max_window_layers:
+            if self.sliding_window is not None and self.use_sliding_window:
                 mapping[layer_idx] = AttnMaskDetail(mask_type=AttnMaskType.SLIDING, size=self.sliding_window)
         return mapping
 

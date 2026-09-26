@@ -29,10 +29,17 @@ Exports:
 
 from __future__ import annotations
 
+import math
+import typing as tp
+
 import jax
 from eformer.pytree import auto_pytree
 from jax import numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
+from jax.sharding import PartitionSpec
 from jaxtyping import Array, Bool, Float, Int
+
+from easydel.layers.indexer._primitives import topk_selection_mask
 
 from .._operation_impl import OperationImpl, OperationOutput, OperationRegistry
 from ..requirements import CacheType, ExecutionMode, MetadataField, OperationRequirements, RequirementsBuilder
@@ -45,6 +52,8 @@ class GlmMoeDsaIndexerOutput(OperationOutput):
     Attributes:
         topk_indices: Selected per-query token indices of shape
             ``(batch, seq, topk)``, or ``None`` before the operation runs.
+        topk_mask: The same selection as a boolean mask over the scored keys,
+            ``(batch, seq, total_seq)``; equal to scattering ``topk_indices``.
         cached_keys: Optional cached key tensor of shape
             ``(batch, total_seq, head_dim)``. Populated only when
             ``use_cache=True`` was passed to the operator; ``None`` otherwise.
@@ -52,6 +61,7 @@ class GlmMoeDsaIndexerOutput(OperationOutput):
 
     topk_indices: Int[Array, "batch seq topk"] | None = None
     cached_keys: Float[Array, "batch total_seq head_dim"] | None = None
+    topk_mask: Bool[Array, "batch seq total_seq"] | None = None
 
 
 @OperationRegistry.register
@@ -164,6 +174,9 @@ class GlmMoeDsaIndexerOp(OperationImpl):
         use_cache: bool = False,
         reset_cache: bool = False,
         indexer_rope_interleave: bool = False,
+        *,
+        precision: jax.lax.PrecisionLike = None,
+        select_topk: tp.Callable[[Array, int, Array], tuple[Array, Array]] | None = None,
         **ignore,
     ) -> GlmMoeDsaIndexerOutput:
         """Compute DSA top-k token indices for dynamic sparse attention.
@@ -187,6 +200,11 @@ class GlmMoeDsaIndexerOp(OperationImpl):
             use_cache: Whether to update and return cached keys.
             reset_cache: Whether to discard existing cached keys.
             indexer_rope_interleave: Use interleaved RoPE layout if True.
+            precision: Matmul precision for query-key scoring and head weighting.
+                None inherits JAX's ambient policy; fp32 operands alone do not
+                imply full-fp32 multiplication on TPU.
+            select_topk: Backend row selector ``(scores, k, query) -> (values, indices)``
+                with ``jax.lax.top_k`` semantics; ``None`` uses ``jax.lax.top_k``.
             **ignore: Additional ignored keyword arguments.
 
         Returns:
@@ -241,8 +259,8 @@ class GlmMoeDsaIndexerOp(OperationImpl):
             all_keys = key_states_f32
             new_cached_keys = cached_keys_local
 
-        scores = jnp.einsum("bshd,btd->bsht", query_states_f32, all_keys) * softmax_scale
-        index_scores = jnp.einsum("bsht,bsh->bst", scores, head_weights.astype(jnp.float32))
+        scores = jnp.einsum("bshd,btd->bsht", query_states_f32, all_keys, precision=precision) * softmax_scale
+        index_scores = jnp.einsum("bsht,bsh->bst", scores, head_weights.astype(jnp.float32), precision=precision)
 
         total_len = int(index_scores.shape[-1])
 
@@ -275,16 +293,56 @@ class GlmMoeDsaIndexerOp(OperationImpl):
                 index_scores = index_scores + attention_mask.astype(index_scores.dtype)
 
         topk = min(max(int(index_topk), 1), total_len)
-        topk_indices = jax.lax.top_k(index_scores, k=topk)[1]
+        if select_topk is None:
+            topk_values, topk_indices = jax.lax.top_k(index_scores, k=topk)
+        else:
+            topk_values, topk_indices = select_topk(index_scores, topk, query_states)
+        topk_mask = topk_selection_mask(index_scores, topk_values, topk_indices)
 
         return GlmMoeDsaIndexerOutput(
-            topk_indices=topk_indices,
+            topk_indices=checkpoint_name(topk_indices, "indexer_topk"),
+            topk_mask=checkpoint_name(topk_mask, "indexer_topk"),
             cached_keys=None if new_cached_keys is None else new_cached_keys.astype(key_states.dtype),
         )
 
+    def _select_topk_tpu(self, index_scores: Array, topk: int, query_states: Array) -> tuple[Array, Array]:
+        """Row-parallel exact top-k on TPU, identical to ``jax.lax.top_k``.
+
+        ``jax.lax.top_k`` lowers to a full sort of every score row on TPU; the
+        registered ejkernel operation bisects for the ``k``-th key instead. A
+        Pallas call is not SPMD-partitionable, so rows are split explicitly
+        with the query's batch/sequence layout and the candidate axis kept
+        whole; each shard selects over complete rows, as XLA's own top-k does.
+        """
+        from ejkernel.modules import topk as ejkernel_topk  # pyright: ignore[reportMissingTypeStubs]
+
+        def select(scores: Array) -> tuple[Array, Array]:
+            return ejkernel_topk(scores, topk)
+
+        mesh = self.metadata.mesh
+        if mesh is None:
+            return select(index_scores)
+        with mesh:
+            query_spec = self.metadata.get_shardings(self.get_mode(query=query_states, BTHD=True), layout="bthd").query
+        jax_mesh = getattr(mesh, "jax_mesh", mesh)
+        sizes = dict(jax_mesh.shape)
+        rows = []
+        for dim, entry in zip(index_scores.shape[:2], query_spec[:2], strict=True):
+            axes = entry if isinstance(entry, tuple) else (() if entry is None else (entry,))
+            # Keep only a placement that divides the row dimension (e.g. batch 1).
+            rows.append(entry if dim % math.prod(sizes[axis] for axis in axes) == 0 else None)
+        row_spec = PartitionSpec(*rows, None)
+        return jax.shard_map(
+            select,
+            mesh=jax_mesh,
+            in_specs=(row_spec,),
+            out_specs=(row_spec, row_spec),
+            check_vma=False,
+        )(index_scores)
+
     def forward_tpu(self, *args, **kwargs) -> GlmMoeDsaIndexerOutput:
-        """TPU forward pass. Delegates to ``forward_native``."""
-        return self.forward_native(*args, **kwargs)
+        """TPU forward pass: ``forward_native`` with the row-parallel top-k."""
+        return self.forward_native(*args, select_topk=self._select_topk_tpu, **kwargs)
 
     def forward_gpu(self, *args, **kwargs) -> GlmMoeDsaIndexerOutput:
         """GPU forward pass. Delegates to ``forward_native``."""
@@ -317,6 +375,8 @@ class GlmMoeDsaIndexerOp(OperationImpl):
         use_cache: bool = False,
         reset_cache: bool = False,
         indexer_rope_interleave: bool = False,
+        *,
+        precision: jax.lax.PrecisionLike = None,
         **kwargs,
     ) -> GlmMoeDsaIndexerOutput:
         """Execute the DSA indexer by dispatching to the appropriate backend.
@@ -335,6 +395,9 @@ class GlmMoeDsaIndexerOp(OperationImpl):
             use_cache: Whether to maintain a key cache.
             reset_cache: Whether to discard existing cache.
             indexer_rope_interleave: Use interleaved RoPE layout.
+            precision: Matmul precision for both score contractions. None
+                preserves the ambient JAX policy. Capture this argument in a
+                JIT closure or mark it static when compiling the operation.
             **kwargs: Additional keyword arguments passed to the backend.
 
         Returns:
@@ -354,6 +417,7 @@ class GlmMoeDsaIndexerOp(OperationImpl):
             use_cache=use_cache,
             reset_cache=reset_cache,
             indexer_rope_interleave=indexer_rope_interleave,
+            precision=precision,
             **kwargs,
         )
 

@@ -14,9 +14,8 @@
 
 """Tests for Qwen3OmniMoe model."""
 
-import pytest
-
 import easydel as ed
+import pytest
 
 try:
     from tests.modules.test_utils import EasyDeLOnlyTester

@@ -29,10 +29,10 @@ def test_public_integer_weight_forward_and_input_gradient(dtype):
     scales = jnp.array([[[[0.25, 0.5]]]], jnp.float32)
     x = jnp.ones((2, 4), dtype)
     sizes = jnp.array([2], jnp.int32)
+
     def f(a):
-        return grouped_matmul(
-            a, q, sizes, rhs_scale=scales, use_v3=True, platform="xla", preferred_element_type=dtype
-        )
+        return grouped_matmul(a, q, sizes, rhs_scale=scales, use_v3=True, platform="xla", preferred_element_type=dtype)
+
     got = jax.jit(f)(x)
     np.testing.assert_array_equal(got, np.array([[2.0, 0.5], [2.0, 0.5]], np.float32))
     grad = jax.grad(lambda a: f(a).astype(jnp.float32).sum())(x)

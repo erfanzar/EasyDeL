@@ -10,9 +10,9 @@ Act as the `debugger` agent (`.xerxes/agents/debugger.md`). Before treating the 
 
 Process:
 
-1. Reproduce with the smallest probe. Logic/shape/sharding bugs reproduce under the CPU env trio with tiny configs
-   (`libs/easydel/tests/modules/conftest.py` fixtures); lowering/runtime/ perf bugs need hardware — say so explicitly if
-   unavailable.
+1. Reproduce with the smallest probe on the accelerator, using tiny configs (`libs/easydel/tests/modules/conftest.py`
+   fixtures); the CPU trio only for non-computation logic (parsers, config/CLI, eray). If no accelerator is available,
+   say so explicitly and report the result as unverified on hardware — never substitute a CPU run.
 2. State a falsifiable hypothesis; run the one experiment that tests it; iterate. One variable per experiment.
 3. Use the domain triage routes: NaN → softmax dtype → loss scale → kernel parity (`FORCE_NATIVE_RUNTIME=1`); sharding
    errors → active mesh + spec divisibility + fused-layout splitters; silently-lost state →

@@ -15,10 +15,9 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-from flax import nnx
-
 import spectrax as spx
 import spectrax.nn as spx_nn
+from flax import nnx
 
 
 class SpxMLP(spx.Module):

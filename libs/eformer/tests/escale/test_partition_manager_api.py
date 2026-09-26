@@ -19,8 +19,6 @@ import threading
 import jax
 import numpy as np
 import pytest
-from jax.sharding import Mesh, PartitionSpec
-
 from eformer.common_types import (
     BATCH,
     MODE_DECODE,
@@ -38,6 +36,7 @@ from eformer.escale.partition import (
 )
 from eformer.escale.partition.auto_spec import auto_partition_spec
 from eformer.escale.partition.manager import get_safe_hash_int
+from jax.sharding import Mesh, PartitionSpec
 
 
 @pytest.fixture(autouse=True)
@@ -221,3 +220,18 @@ def test_auto_partition_spec_deduplicates_repeated_names():
     spec = auto_partition_spec(np.ones((8, 8)), mesh=mesh, names=["dp", "dp"], min_sharding_size=1)
 
     assert spec == PartitionSpec("dp", None)
+
+
+def test_get_incontext_mesh_reads_jax_set_mesh():
+    """``jax.set_mesh`` leaves the legacy thread resources empty; the mesh must still be found."""
+    from eformer.escale.partition import get_incontext_mesh
+    from eformer.escale.partition.constraints import get_corrected_named_sharding, names_in_current_mesh
+
+    mesh = Mesh(np.asarray(jax.devices()[:1]), ("tp",))
+    with jax.set_mesh(mesh):
+        found = get_incontext_mesh()
+        assert tuple(found.axis_names) == ("tp",)
+        assert tuple(found.devices.flat) == tuple(mesh.devices.flat)
+        assert names_in_current_mesh("tp")
+        corrected = get_corrected_named_sharding((4,), PartitionSpec("tp"))
+        assert tuple(corrected.spec) == ("tp",)

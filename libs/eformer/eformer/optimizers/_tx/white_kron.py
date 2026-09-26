@@ -1318,16 +1318,20 @@ def _norm_lower_bound(key, A, k=4, iters=5, skh=False):
         scale = jnp.max(jnp.abs(A))
     else:
         scale = jnp.max(jnp.diag(A))
-    A /= scale
+    # Zero matrices and power vectors in a rank-deficient matrix's nullspace
+    # contribute a zero lower bound. Keep them zero rather than producing 0/0.
+    A /= jnp.where(scale == 0, 1, scale)
     mean_energies = jnp.mean(A * A, axis=1, keepdims=False)
     j = jnp.argmax(mean_energies)
     power = jax.lax.dynamic_index_in_dim(mean_energies, j, 0, keepdims=False)
     max_vec = jax.lax.dynamic_index_in_dim(A, j, 0, keepdims=False)
-    x = (max_vec * jax.lax.rsqrt(power) + jax.random.normal(key, (k, A.shape[1]), A.dtype)) @ A
+    x = (max_vec * jax.lax.rsqrt(jnp.where(power == 0, 1, power)) + jax.random.normal(key, (k, A.shape[1]), A.dtype)) @ A
     for _ in range(iters):
-        x = x / jnp.max(jnp.abs(x))
+        max_abs = jnp.max(jnp.abs(x))
+        x = x / jnp.where(max_abs == 0, 1, max_abs)
         x = x @ A
-    x = (x / jnp.linalg.vector_norm(x, axis=1, keepdims=True)) @ A
+    norms = jnp.linalg.vector_norm(x, axis=1, keepdims=True)
+    x = (x / jnp.where(norms == 0, 1, norms)) @ A
     return jnp.max(jnp.linalg.vector_norm(x, axis=1, keepdims=False)) * scale
 
 

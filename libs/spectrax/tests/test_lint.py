@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import jax.numpy as jnp
-
 from spectrax.core.module import Module
 from spectrax.core.variable import Parameter
 from spectrax.lint import check_unintentional_sharing

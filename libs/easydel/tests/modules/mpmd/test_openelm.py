@@ -14,9 +14,9 @@
 
 """Tests for OpenELM model."""
 
+import easydel as ed
 import pytest
 
-import easydel as ed
 from tests.modules.mpmd._scheduler_utils import GENERATION_SCHEDULE_KIND, LOSS_SCHEDULE_KINDS
 from tests.modules.test_utils import CausalLMTester, get_hf_model_from_hub
 from tests.modules.test_utils.model_factory import _build_openelm_config_from_raw

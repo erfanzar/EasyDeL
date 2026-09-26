@@ -14,12 +14,11 @@
 
 """Tests for Kimi-VL model."""
 
+import easydel as ed
 import numpy as np
 import pytest
 import transformers
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
-
-import easydel as ed
 
 try:
     from tests.modules.test_utils import CausalLMTester, VisionLanguageTester

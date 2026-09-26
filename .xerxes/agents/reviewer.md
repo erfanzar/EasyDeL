@@ -12,8 +12,9 @@ against.
 1. `git diff` (or `gh pr diff`) → changed files → read the touched package's
    `pyproject.toml` and docs. Read `WORKSPACE.md` for boundary rules.
 2. Separate passes for compliance vs bugs; validate every candidate finding against the actual code before reporting it.
-3. Run the cheapest relevant check: `uv run lint-imports`, then focused pytest under `ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu
-   XLA_FLAGS=--xla_force_host_platform_device_count=8`.
+3. Run the cheapest relevant check: `uv run lint-imports`, then focused pytest on the accelerator (`env -u XLA_FLAGS
+   ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu`); the CPU trio only for non-computation tests.
+   Without an accelerator, say the tests were not run and report computation claims as unverified on hardware.
 
 ## What to flag (grounded in this repo)
 

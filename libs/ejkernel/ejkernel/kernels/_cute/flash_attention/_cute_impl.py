@@ -121,8 +121,9 @@ def _normalize_window(
     if sliding_window is None:
         return None
     if isinstance(sliding_window, int):
-        left = int(sliding_window)
-        right = 0 if causal else int(sliding_window)
+        # An int is a window *size* (HF convention): the query plus its ``W - 1`` neighbours.
+        left = max(int(sliding_window) - 1, 0)
+        right = 0 if causal else left
     else:
         left, right = int(sliding_window[0]), int(sliding_window[1])
     if left < 0 or right < 0:

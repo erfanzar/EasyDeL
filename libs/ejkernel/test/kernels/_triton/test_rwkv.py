@@ -17,7 +17,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from einops import rearrange
-
 from ejkernel.kernels._triton import rwkv4 as triton_rwkv4
 from ejkernel.kernels._triton import rwkv6 as triton_rwkv6
 from ejkernel.kernels._triton import rwkv7 as triton_rwkv7

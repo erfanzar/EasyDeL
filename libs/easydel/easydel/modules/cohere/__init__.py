@@ -22,12 +22,11 @@ unique design choices optimized for commercial applications:
   layer outputs before computing next-token probabilities, providing finer control over
   prediction sharpness and calibration.
 
-- RMSNorm (Root Mean Square Normalization): Uses RMS normalization instead of LayerNorm
-  throughout the model, normalizing activations by their RMS without mean centering,
-  which is more stable and efficient for large-scale training.
+- Bias-free LayerNorm: Uses a mean-centred LayerNorm with a learned scale and no bias
+  (HF ``CohereLayerNorm``) for the input and final norms.
 
-- Optional Q/K Normalization: When `use_qk_norm=True`, applies RMSNorm to query and key
-  projections before attention computation, improving training stability and model quality
+- Optional Q/K Normalization: When `use_qk_norm=True`, applies per-head LayerNorm to query
+  and key projections before attention computation, improving training stability and model quality
   especially at larger scales.
 
 - Gated Feed-Forward Networks: Uses SwiGLU-style gated activations in the MLP layers
@@ -37,7 +36,7 @@ unique design choices optimized for commercial applications:
 - Grouped-Query Attention (GQA): Supports independent configuration of query and key/value
   head counts via `num_key_value_heads` for memory-efficient inference.
 
-- Standard RoPE: Uses full rotary position embeddings (unlike Phi's partial RoPE) with
+- Interleaved RoPE: Uses full rotary position embeddings with GPT-J-style (even, odd) pairing (unlike Phi's partial RoPE) with
   configurable `rope_theta` for position encoding.
 
 Usage Example:

@@ -55,6 +55,7 @@ os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.esurge.runners import eSurgeRunner
 from easydel.inference.esurge.runners.spec.strategy import DrafterSpeculation, _SpecVerifyMetadata
@@ -71,6 +72,16 @@ _VOCAB = 256
 _HIDDEN = 128
 
 _REQ_STATE = types.SimpleNamespace(sampling_params=SamplingParams(temperature=0.0, max_tokens=32))
+
+
+@pytest.fixture(autouse=True)
+def _fast_recurrent_mode(monkeypatch):
+    """Test fusion in its supported mode, independently of collection-time leaks."""
+    # Exact replay intentionally disables draft-in-verify. Exact-greedy test
+    # modules set this flag during collection; restore the production default
+    # only for this test, otherwise engagement fails (and parity can compare
+    # two unfused runs without actually exercising fusion).
+    monkeypatch.setenv("EASYDEL_SPEC_RECURRENT_REPLAY", "0")
 
 
 # --------------------------------------------------------------------------- #
@@ -623,7 +634,5 @@ def test_runner_fused_dynamic_k_uses_live_budget(monkeypatch):
 
 if __name__ == "__main__":
     import sys
-
-    import pytest
 
     sys.exit(pytest.main([os.path.abspath(__file__), "-v"]))

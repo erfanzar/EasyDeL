@@ -171,6 +171,7 @@ class MiniMaxLightningAttention(spx.Module):
             layout=dense_qkv_layout(
                 self.num_attention_heads * self.head_dim,
                 self.num_attention_heads * self.head_dim,
+                source_is_fused=True,
             ),
         )
         self.out_proj = RowParallelLinear(
@@ -200,6 +201,33 @@ class MiniMaxLightningAttention(spx.Module):
             param_dtype=param_dtype,
             rngs=rngs,
         )
+
+    @property
+    def reform_param(self):
+        """Reorder the checkpoint's per-head ``qkv_proj`` into EasyDeL's ``[Q | K | V]``.
+
+        HF MiniMax packs the lightning-attention projection per head
+        (``reshape(heads, 3 * head_dim)`` then split), while the runtime splits
+        one contiguous ``[Q_all | K_all | V_all]`` tensor. The prefused layout
+        rule then handles the TP interleave and transpose (and their inverse
+        on export).
+        """
+        heads, head_dim = self.num_attention_heads, self.head_dim
+        rules = self.qkv_proj.build_reform_param("qkv_proj", config=self.config)
+        rule = rules["qkv_proj.weight$"]
+        split, inverse = rule["splits"][0]["spliter"], rule["inverse_spliter"]
+
+        def _per_head_to_contiguous(tensor):
+            rest = tensor.shape[1:]
+            return tensor.reshape(heads, 3, head_dim, *rest).transpose(0, 1).reshape(3 * heads * head_dim, *rest)
+
+        def _contiguous_to_per_head(tensor):
+            rest = tensor.shape[1:]
+            return tensor.reshape(3, heads, head_dim, *rest).transpose(0, 1).reshape(3 * heads * head_dim, *rest)
+
+        rule["splits"][0]["spliter"] = lambda tensor: split(_per_head_to_contiguous(tensor))
+        rule["inverse_spliter"] = lambda torch, tensor: _contiguous_to_per_head(inverse(torch, tensor)).contiguous()
+        return rules
 
     def _get_slope_rate(self) -> Array:
         """Build the per-head exponential decay scalar :math:`\\lambda`.

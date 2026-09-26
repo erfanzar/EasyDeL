@@ -44,7 +44,8 @@ actions include `validate`, `print`,
 `show`, `dump_config`, `print_config`, `config`, `to_json`, `to_yaml`, `train`,
 `eval`, and `serve`.
 
-Start with validation:
+Start with validation. `--dry-run` only parses and prints the config/actions (no array computation), so it is a
+non-computation exception that may run under the CPU trio:
 
 ```bash
 ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
@@ -74,15 +75,15 @@ XLA_FLAGS=--xla_force_host_platform_device_count=8 \
 
 ## Verification
 
-Use focused config tests and builder tests before long runs:
+Use focused config tests and builder tests before long runs. The builder-kwargs test is pure config (CPU trio is
+allowed); the packing test builds JAX batches and runs on the accelerator:
 
 ```bash
 ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
 XLA_FLAGS=--xla_force_host_platform_device_count=8 \
   uv run pytest libs/easydel/tests/infra/elarge/test_builders_quantization_qmm_kwargs.py
 
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
-XLA_FLAGS=--xla_force_host_platform_device_count=8 \
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
   uv run pytest libs/easydel/tests/trainers/test_sequence_packing_flag.py
 ```
 

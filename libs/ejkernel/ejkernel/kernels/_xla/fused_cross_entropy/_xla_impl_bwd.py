@@ -47,8 +47,9 @@ def _ce_fwd(logits, targets, weights, ignore_index):
     del ignore_index
     vocab = logits.shape[-1]
     safe_targets = jnp.clip(targets, 0, vocab - 1)
-    lse = jax.nn.logsumexp(logits, axis=-1)
-    target_logit = jnp.take_along_axis(logits, safe_targets[..., None], axis=-1)[..., 0]
+    # fp32 row statistics regardless of the logits dtype (the upcast fuses into the reduction).
+    lse = jax.nn.logsumexp(logits.astype(jnp.float32), axis=-1)
+    target_logit = jnp.take_along_axis(logits, safe_targets[..., None], axis=-1)[..., 0].astype(jnp.float32)
     per_row = (lse - target_logit) * weights
     residual = (logits, lse, safe_targets, weights)
     return per_row.astype(jnp.float32), residual
@@ -61,7 +62,7 @@ def _ce_bwd(ignore_index, residual, dy):
     """
     del ignore_index
     logits, lse, safe_targets, weights = residual
-    probs = jnp.exp(logits - lse[..., None])
+    probs = jnp.exp(logits.astype(jnp.float32) - lse[..., None])
     onehot = jax.nn.one_hot(safe_targets, probs.shape[-1], dtype=probs.dtype)
     factor = (weights.astype(probs.dtype) * dy.astype(probs.dtype))[..., None]
     dlogits = (probs - onehot) * factor
@@ -80,14 +81,16 @@ def _ce_tp_fwd(logits_local, targets, weights, ignore_index, vocab_axis):
     tp_idx = jax.lax.axis_index(vocab_axis)
     vocab_start = tp_idx * v_local
 
-    local_max = jnp.max(logits_local, axis=-1)
-    local_se = jnp.sum(jnp.exp(logits_local - local_max[..., None]), axis=-1)
+    # Softmax statistics (and the cross-shard pmax/psum) in fp32 regardless of the logits dtype.
+    logits_f32 = logits_local.astype(jnp.float32)
+    local_max = jnp.max(logits_f32, axis=-1)
+    local_se = jnp.sum(jnp.exp(logits_f32 - local_max[..., None]), axis=-1)
 
     is_local = (targets >= vocab_start) & (targets < vocab_start + v_local)
     local_idx = jnp.where(is_local, targets - vocab_start, 0)
     local_target_logit = jnp.where(
         is_local,
-        jnp.take_along_axis(logits_local, local_idx[..., None], axis=-1)[..., 0],
+        jnp.take_along_axis(logits_local, local_idx[..., None], axis=-1)[..., 0].astype(jnp.float32),
         0.0,
     )
 
@@ -112,7 +115,7 @@ def _ce_tp_bwd(ignore_index, vocab_axis, residual, dy):
     """
     del ignore_index, vocab_axis
     logits_local, global_max, global_se, is_local, local_idx, weights = residual
-    probs_local = jnp.exp(logits_local - global_max[..., None]) / global_se[..., None]
+    probs_local = jnp.exp(logits_local.astype(jnp.float32) - global_max[..., None]) / global_se[..., None]
     onehot_local = is_local[..., None].astype(probs_local.dtype) * jax.nn.one_hot(
         local_idx, probs_local.shape[-1], dtype=probs_local.dtype
     )
@@ -130,15 +133,16 @@ def _soft_ce_tp_fwd(logits_local, soft_local, vocab_axis):
     multiplies by the token weights. Caches the per-shard softmax state + global soft mass for a fully
     local backward.
     """
-    local_max = jnp.max(logits_local, axis=-1)
-    local_se = jnp.sum(jnp.exp(logits_local - local_max[..., None]), axis=-1)
+    logits_f32 = logits_local.astype(jnp.float32)
+    local_max = jnp.max(logits_f32, axis=-1)
+    local_se = jnp.sum(jnp.exp(logits_f32 - local_max[..., None]), axis=-1)
     global_max = jax.lax.pmax(local_max, vocab_axis)
     scaled_local_se = local_se * jnp.exp(local_max - global_max)
     global_se = jax.lax.psum(scaled_local_se, vocab_axis)
     lse = jnp.log(global_se) + global_max
-    local_dot = jnp.sum(soft_local * (logits_local - lse[..., None]), axis=-1)
+    local_dot = jnp.sum(soft_local.astype(jnp.float32) * (logits_f32 - lse[..., None]), axis=-1)
     per_row = -jax.lax.psum(local_dot, vocab_axis)
-    soft_mass = jax.lax.psum(jnp.sum(soft_local, axis=-1), vocab_axis)
+    soft_mass = jax.lax.psum(jnp.sum(soft_local, axis=-1, dtype=jnp.float32), vocab_axis)
     residual = (logits_local, global_max, global_se, soft_local, soft_mass)
     return per_row.astype(jnp.float32), residual
 
@@ -151,9 +155,9 @@ def _soft_ce_tp_bwd(vocab_axis, residual, dy):
     """
     del vocab_axis
     logits_local, global_max, global_se, soft_local, soft_mass = residual
-    probs_local = jnp.exp(logits_local - global_max[..., None]) / global_se[..., None]
+    probs_local = jnp.exp(logits_local.astype(jnp.float32) - global_max[..., None]) / global_se[..., None]
     factor = dy.astype(probs_local.dtype)[..., None]
-    dlogits_local = (probs_local * soft_mass[..., None] - soft_local) * factor
+    dlogits_local = (probs_local * soft_mass[..., None] - soft_local.astype(jnp.float32)) * factor
     return (dlogits_local.astype(logits_local.dtype), None)
 
 

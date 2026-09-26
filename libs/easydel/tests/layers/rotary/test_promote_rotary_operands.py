@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import jax.numpy as jnp
-
 from easydel.layers.rotary._modules import _promote_rotary_operands
 
 

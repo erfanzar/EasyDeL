@@ -4,7 +4,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from eformer.pytree import FrozenPyTree, PyTree, auto_pytree, field
 
 

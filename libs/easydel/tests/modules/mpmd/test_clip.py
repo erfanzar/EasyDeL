@@ -14,13 +14,13 @@
 
 """Tests for CLIP model."""
 
+import easydel as ed
 import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
 import transformers
 
-import easydel as ed
 from tests.modules.mpmd._scheduler_utils import LOSS_SCHEDULE_KINDS
 from tests.modules.test_utils import compare_hidden_states, setup_config
 from tests.modules.test_utils.model_factory import cleanup_models, create_ed_model, create_hf_model

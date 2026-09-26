@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-
 import spectrax as spx
 from spectrax.sharding import get_partition_spec, logical_axis_rules
 

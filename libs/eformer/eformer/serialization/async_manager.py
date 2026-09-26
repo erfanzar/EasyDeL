@@ -1122,6 +1122,7 @@ class AsyncCheckpointManager:
 
         self.global_manager.wait_until_finished()
         if not write_shared_files:
+            _sync_remote_checkpoint_visibility(root, scope=f"save-pytree:{prefix}")
             return str(root)
 
         index_path = root / "tensorstore_index.json"
@@ -1168,6 +1169,7 @@ class AsyncCheckpointManager:
 
         meta = CheckpointMetadata(timestamp=datetime.now().isoformat(), custom_metadata=extras)
         (root / "checkpoint_metadata.json").write_text(json.dumps(meta.to_dict(), indent=2))
+        _sync_remote_checkpoint_visibility(root, scope=f"save-pytree:{prefix}")
 
         return str(root)
 

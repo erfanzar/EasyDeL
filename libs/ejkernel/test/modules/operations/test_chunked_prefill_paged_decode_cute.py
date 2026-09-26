@@ -19,7 +19,6 @@ import math
 import jax
 import jax.numpy as jnp
 import pytest
-
 from ejkernel.callib._cute_ffi import has_cute_ffi_support
 from ejkernel.modules.operations import chunked_prefill_paged_decode
 

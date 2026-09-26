@@ -132,6 +132,13 @@ class GPTNeoXConfig(EasyDeLBaseConfig):
                 Defaults to EasyDeLGradientCheckPointers.NONE.
             **kwargs: Additional keyword arguments.
         """
+        # transformers v5 serializes the rotary base / fraction only inside
+        # ``rope_parameters`` and gives it priority over ``rotary_emb_base`` /
+        # ``rotary_pct`` (``GPTNeoXConfig.convert_rope_params_to_dict``).
+        rope_parameters = kwargs.get("rope_parameters")
+        if isinstance(rope_parameters, dict):
+            rotary_emb_base = rope_parameters.get("rope_theta", rotary_emb_base)
+            rotary_pct = rope_parameters.get("partial_rotary_factor", rotary_pct)
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size

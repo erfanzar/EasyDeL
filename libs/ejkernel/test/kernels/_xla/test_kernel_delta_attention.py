@@ -21,7 +21,6 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 import jax
 import jax.numpy as jnp
 import pytest
-
 from ejkernel.kernels._xla import kda, kda_decay, kernel_delta_attention
 from ejkernel.kernels._xla.kernel_delta_attention._xla_impl_fwd import _recurrent_kda_fwd
 from ejkernel.modules.operations import KernelDeltaAttention, KernelDeltaAttentionConfig

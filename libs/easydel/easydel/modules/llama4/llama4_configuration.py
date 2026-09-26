@@ -303,7 +303,7 @@ class Llama4TextConfig(EasyDeLBaseConfig):
             Every N-th layer uses RoPE; others skip it.
         attention_chunk_size (`int`, *optional*, defaults to 8192):
             Chunk size for chunked attention layers.
-        attn_temperature_tuning (`int`, *optional*, defaults to 4):
+        attn_temperature_tuning (`bool`, *optional*, defaults to `True`):
             Temperature tuning factor for attention scaling.
         floor_scale (`int`, *optional*, defaults to 8192):
             Floor scale factor for attention temperature computation.
@@ -349,7 +349,7 @@ class Llama4TextConfig(EasyDeLBaseConfig):
         no_rope_layers: list[int] | None = None,
         no_rope_layer_interval: int = 4,
         attention_chunk_size: int = 8192,
-        attn_temperature_tuning: int = 4,
+        attn_temperature_tuning: bool = True,
         floor_scale: int = 8192,
         attn_scale: float = 0.1,
         layer_types: list[str] | None = None,
@@ -408,8 +408,8 @@ class Llama4TextConfig(EasyDeLBaseConfig):
                 Defaults to 4.
             attention_chunk_size (int, optional): Chunk size for chunked attention.
                 Defaults to 8192.
-            attn_temperature_tuning (int, optional): Attention temperature tuning
-                factor. Defaults to 4.
+            attn_temperature_tuning (bool, optional): Enable attention temperature
+                tuning on the NoPE layers. Defaults to True.
             floor_scale (int, optional): Floor scale for attention temperature.
                 Defaults to 8192.
             attn_scale (float, optional): Attention-logit scale. Defaults to 0.1.

@@ -21,6 +21,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+import easydel as ed
 import jax
 import numpy as np
 import spectrax as spx
@@ -28,8 +29,6 @@ from datasets import Dataset, IterableDataset, load_dataset  # pyright: ignore[r
 from jax import lax
 from jax import numpy as jnp
 from transformers import AutoTokenizer
-
-import easydel as ed
 
 _LIGHTWEIGHT = os.environ.get("EASYDEL_RUNTIME_LIGHTWEIGHT", "0").lower() in {"1", "true", "yes", "on"}
 _DEFAULT_MODEL_REPO = (

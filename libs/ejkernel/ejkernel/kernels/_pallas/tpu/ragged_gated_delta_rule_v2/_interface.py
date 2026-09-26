@@ -57,7 +57,7 @@ def ragged_gated_delta_rule_v2(
     """Run the packed-inference ragged GDN v2 TPU Pallas kernel.
 
     Registry entry point for the v2 ragged Gated Delta Rule (GDN) forward pass on TPU. It casts the
-    floating-point inputs to ``runtime_dtype`` (inside the underlying implementation), supplies a default
+    activations to ``runtime_dtype`` (inside the underlying implementation), supplies a default
     ``has_initial_state`` mask when one is not given, and delegates to the packed-inference forward
     implementation. The call handles a ragged batch of variable-length requests packed contiguously into
     ``num_tokens`` rows, where the prefill and decode segments are distinguished by ``distribution``.
@@ -79,7 +79,8 @@ def ragged_gated_delta_rule_v2(
         state_indices: Mapping from request index to its slot in ``recurrent_state``, shape
             ``(num_requests,)`` in ``int32``.
         distribution: Three-element ``int32`` vector describing the prefill/decode split of the packed
-            batch used to schedule the ragged kernel.
+            batch used to schedule the ragged kernel. ``distribution[2]`` bounds the positional row prefix;
+            empty (``q_len == 0``) rows inside it are skipped.
         has_initial_state: Optional boolean mask, shape ``(num_requests,)``, marking requests whose
             ``recurrent_state`` slot already holds a valid carry-in state. When ``None``, every request is
             assumed to have a valid initial state.
@@ -99,8 +100,9 @@ def ragged_gated_delta_rule_v2(
         kernel_tile_policy: TPU Pallas token tile policy for decode.
         use_fused_gdn_decode: Whether to use the fused TPU decode kernel when
             the shape is supported.
-        runtime_dtype: Optional dtype to which the floating-point inputs are cast before computation. When
-            ``None``, the dtype of ``mixed_qkv`` is used. Defaults to ``None``.
+        runtime_dtype: Optional dtype for ``mixed_qkv``, ``a`` and ``b``. When ``None``, the dtype of
+            ``mixed_qkv`` is used. ``recurrent_state`` keeps its dtype in and out and ``A_log``/``dt_bias``
+            are used in float32. Defaults to ``None``.
 
     Returns:
         tuple: ``(updated_state, output)`` where ``updated_state`` has shape

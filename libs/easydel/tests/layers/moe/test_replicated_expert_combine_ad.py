@@ -20,8 +20,10 @@ def test_replicated_expert_combine_primal_jvp_and_transpose():
 
     x = jnp.arange(48, dtype=jnp.float32).reshape(16, 3)
     f = jax.jit(f)
+
     def reference(a):
         return a[jnp.array([0, 4, 5, 12])]
+
     np.testing.assert_array_equal(f(x), reference(x))
     _, got = jax.jvp(f, (x,), (jnp.cos(x),))
     _, want = jax.jvp(reference, (x,), (jnp.cos(x),))

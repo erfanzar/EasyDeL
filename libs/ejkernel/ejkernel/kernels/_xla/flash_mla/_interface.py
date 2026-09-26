@@ -103,7 +103,7 @@ def flash_mla(
             ``deterministic=False`` and ``dropout_prob > 0``.
         dropout_prob: Dropout probability applied to attention weights.
         sliding_window: Optional sliding window attention constraint.
-            - int: Symmetric window of that radius
+            - int: Window size ``W`` (HF convention; same as ``(W - 1, W - 1)``)
             - (left, right): Asymmetric window
         softmax_dtype: Dtype for softmax accumulation.  Defaults to float32
             for numerical stability.

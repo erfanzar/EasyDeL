@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 import pytest
-
 from easydel.inference.esurge.config import (
     eSurgeRuntimeConfig,
     normalize_kernel_tile_policy,

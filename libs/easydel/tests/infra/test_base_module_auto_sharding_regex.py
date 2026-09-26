@@ -18,11 +18,6 @@ import jax
 import numpy as np
 import pytest
 import spectrax as spx
-from jax import numpy as jnp
-from jax.sharding import Mesh, NamedSharding, PartitionSpec
-from spectrax import nn
-from spectrax.common_types import ColumnWise
-
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.sharding import (
     TensorLayout,
@@ -31,6 +26,10 @@ from easydel.infra.sharding import (
     sharding_for_layout,
 )
 from easydel.infra.utils import ArrayParam
+from jax import numpy as jnp
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from spectrax import nn
+from spectrax.common_types import ColumnWise
 
 
 class _DummyConfig:

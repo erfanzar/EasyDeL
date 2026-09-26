@@ -200,7 +200,8 @@ class Qwen2Config(EasyDeLBaseConfig):
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
         self.use_sliding_window = use_sliding_window
-        self.sliding_window = sliding_window
+        # HF Qwen2: the window only exists when ``use_sliding_window`` is set.
+        self.sliding_window = sliding_window if use_sliding_window else None
         self.max_window_layers = max_window_layers
 
         # for backward compatibility

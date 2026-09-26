@@ -218,6 +218,25 @@ class TestRunCommand:
             assert "working_dir" not in sub["runtime_env"]
             assert sub["runtime_env"]["env_vars"]["HF_TOKEN"] == "override"
             assert sub["submission_id"] == "myjob"
+            # Resubmission must not re-package the cwd for a --no-working-dir job.
+            assert sub["metadata"]["working_dir"] == ""
+
+    def test_records_packaged_working_dir_not_just_cwd(self, monkeypatch, tmp_path):
+        # The watcher re-packages the dir that was actually shipped
+        # (--working-dir), which can differ from the submitting shell's cwd.
+        fake = FakeClient()
+        monkeypatch.setattr(jobs, "make_client", lambda address: fake)
+        monkeypatch.setattr(jobs, "_history_append", lambda record: None)
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        runner = CliRunner()
+        with runner.isolated_filesystem(temp_dir=tmp_path) as fs:
+            result = runner.invoke(jobs.run, ["--restartable", "--working-dir", str(pkg), "--", "python", "x.py"])
+            assert result.exit_code == 0, result.output
+            meta = fake.submitted["metadata"]
+            assert meta["working_dir"] == str(pkg)
+            assert meta["cwd"] == fs
+            assert meta["restartable"] == "1"
 
 
 class TestStatusCommand:

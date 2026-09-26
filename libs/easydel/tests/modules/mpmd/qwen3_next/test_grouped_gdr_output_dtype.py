@@ -17,7 +17,6 @@
 import jax
 import jax.numpy as jnp
 import pytest
-
 from easydel.modules.qwen3_next.modeling_qwen3_next import apply_grouped_single_step_gdr
 
 

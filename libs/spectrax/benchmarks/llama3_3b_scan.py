@@ -35,9 +35,8 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import jax
 import jax.numpy as jnp
-from flax import nnx
-
 import spectrax as spx
+from flax import nnx
 from spectrax import nn
 
 

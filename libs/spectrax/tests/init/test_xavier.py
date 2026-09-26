@@ -10,7 +10,6 @@ import math
 
 import jax
 import jax.numpy as jnp
-
 from spectrax.init.xavier import _fan_in_fan_out, xavier_normal, xavier_uniform
 
 

@@ -16,7 +16,6 @@ import json
 
 import jax
 import jax.numpy as jnp
-
 from easydel.infra.base_state import RESUME_MODEL_SUBDIR, EasyDeLState
 
 

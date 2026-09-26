@@ -29,7 +29,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from ejkernel.kernels._xla.fused_cross_entropy._xla_impl_chunked import (
     blockwise_cross_entropy,
     chunked_token_cross_entropy,
@@ -354,3 +353,116 @@ def test_flce_rejects_bad_args():
         fused_linear_cross_entropy(hidden, targets)  # neither
     with pytest.raises(ValueError):
         fused_linear_cross_entropy(hidden, targets, lm_head_weight=W, reduction="none")  # unsupported
+
+
+# --------------------------------------------------------------------------------------------------
+# Precision / masking regressions. References are float64 NumPy CE over the exact (bf16-rounded)
+# logits the kernel sees, so they are independent of every ejkernel code path.
+# --------------------------------------------------------------------------------------------------
+
+
+def _f64_ce_reference(logits, targets, weights=None, ignore_index=-100):
+    """Per-row float64 CE and effective weights (``valid * weights``) over the given logits."""
+    lg = np.asarray(jnp.asarray(logits, jnp.float32), dtype=np.float64).reshape(-1, logits.shape[-1])
+    t = np.asarray(targets).reshape(-1)
+    valid = (t != ignore_index).astype(np.float64)
+    w = valid if weights is None else valid * np.asarray(weights, np.float64).reshape(-1)
+    m = lg.max(-1, keepdims=True)
+    lse = np.log(np.exp(lg - m).sum(-1)) + m[:, 0]
+    ty = np.take_along_axis(lg, np.where(t != ignore_index, t, 0)[:, None], axis=-1)[:, 0]
+    return (lse - ty) * w, w
+
+
+def _large_t_bf16_logits(n=65536, v=16, seed=31):
+    """[n, v] bf16 logits with every 7th target ignored (an odd valid count far above 2**15)."""
+    k = jax.random.split(jax.random.PRNGKey(seed), 2)
+    logits = (jax.random.normal(k[0], (n, v), jnp.float32) * 2.0).astype(jnp.bfloat16)
+    targets = jax.random.randint(k[1], (n,), 0, v).at[::7].set(-100)
+    return logits, targets
+
+
+def test_flce_bf16_large_t_accumulates_in_fp32():
+    """bf16 FLCE over 65536 tokens: weight_sum is exact and the loss is not biased.
+
+    With bf16 fori_loop carries the running weight_sum saturates at 32768 and the loss sum
+    stops growing the same way (~8% off at T=65536).
+    """
+    B, T, H, V = 1, 65536, 8, 16
+    k = jax.random.split(jax.random.PRNGKey(29), 3)
+    hidden = (jax.random.normal(k[0], (B, T, H), jnp.float32) * 0.5).astype(jnp.bfloat16)
+    W = (jax.random.normal(k[1], (H, V), jnp.float32) * 0.5).astype(jnp.bfloat16)
+    targets = jax.random.randint(k[2], (B, T), 0, V).at[:, ::7].set(-100)
+
+    loss_sum, _z, wsum, acc = fused_linear_cross_entropy(
+        hidden, targets, lm_head_weight=W, reduction="sum", token_chunk_size=256
+    )
+    loss_mean = fused_linear_cross_entropy(hidden, targets, lm_head_weight=W, reduction="mean", token_chunk_size=256)[0]
+
+    per_row, w = _f64_ce_reference(jnp.matmul(hidden, W), targets)
+    assert loss_sum.dtype == jnp.float32 and wsum.dtype == jnp.float32 and acc.dtype == jnp.float32
+    assert float(wsum) == float(w.sum())
+    np.testing.assert_allclose(float(loss_sum), per_row.sum(), rtol=1e-3)
+    np.testing.assert_allclose(float(loss_mean), per_row.sum() / w.sum(), rtol=1e-3)
+
+
+@pytest.mark.parametrize("strategy,chunk", [("token", 256), ("vocab", 8), ("block", 8)])
+def test_chunked_logits_bf16_large_n_accumulates_in_fp32(strategy, chunk):
+    """bf16 compute dtype on the chunked-logits paths: fp32 weight_sum / loss accumulators."""
+    logits, targets = _large_t_bf16_logits()
+    out = fused_cross_entropy(
+        logits,
+        targets,
+        chunk_size=chunk,
+        chunk_strategy=strategy,
+        reduction="sum",
+        compute_dtype=jnp.bfloat16,
+    )
+    per_row, w = _f64_ce_reference(logits, targets)
+    assert out.weight_sum.dtype == jnp.float32
+    assert float(out.weight_sum) == float(w.sum())
+    np.testing.assert_allclose(float(out.loss), per_row.sum(), rtol=1e-4)
+
+
+def test_dense_xla_ce_bf16_logits_use_fp32_row_statistics():
+    """Large-magnitude bf16 logits: the row max / log-sum-exp must not be rounded to bf16.
+
+    Around |logit| ~ 100 bf16 spacing is 0.5, so a bf16 lse is off by up to 0.25 nats per row.
+    """
+    from ejkernel.kernels._xla.fused_cross_entropy import fused_cross_entropy as xla_fused_ce
+
+    N, V = 64, 4096
+    k = jax.random.split(jax.random.PRNGKey(41), 2)
+    logits = (100.0 + jax.random.normal(k[0], (N, V), jnp.float32) * 2.0).astype(jnp.bfloat16)
+    targets = jax.random.randint(k[1], (N,), 0, V)
+
+    per_row, _ = xla_fused_ce(logits, targets, reduction="none")
+    ref, _ = _f64_ce_reference(logits, targets)
+    assert per_row.dtype == jnp.float32
+    np.testing.assert_allclose(np.asarray(per_row), ref, atol=1e-3)
+
+    # Custom-VJP forward (under grad) and analytic backward share the fp32 statistics.
+    loss, grad = jax.value_and_grad(lambda x: xla_fused_ce(x, targets, reduction="sum")[0])(logits)
+    np.testing.assert_allclose(float(loss), ref.sum(), rtol=1e-5)
+    lg = np.asarray(jnp.asarray(logits, jnp.float32), np.float64)
+    probs = np.exp(lg - lg.max(-1, keepdims=True))
+    probs /= probs.sum(-1, keepdims=True)
+    probs[np.arange(N), np.asarray(targets)] -= 1.0
+    assert grad.dtype == jnp.bfloat16
+    np.testing.assert_allclose(np.asarray(grad, np.float32), probs, atol=4e-3)
+
+
+@pytest.mark.parametrize("reduction", ["sum", "mean"])
+def test_attention_mask_without_weights_keeps_ignore_index_excluded(reduction):
+    """``attention_mask`` must be combined with ``targets != ignore_index``, not replace it.
+
+    ``_data`` puts ``ignore_index`` on ~15% of rows where the mask is 1; those rows must not
+    enter the loss (with a clipped-to-0 target) nor the mean normalizer.
+    """
+    logits, targets, _ = _data(N=96, V=512, seed=7)
+    mask = jnp.ones_like(targets, dtype=jnp.int32).at[-10:].set(0)
+
+    out = fused_cross_entropy(logits, targets, attention_mask=mask, reduction=reduction, platform="xla")
+    per_row, w = _f64_ce_reference(logits, targets, mask)
+    expected = per_row.sum() if reduction == "sum" else per_row.sum() / w.sum()
+    np.testing.assert_allclose(float(out.loss), expected, rtol=1e-5)
+    assert float(out.weight_sum) == float(w.sum())

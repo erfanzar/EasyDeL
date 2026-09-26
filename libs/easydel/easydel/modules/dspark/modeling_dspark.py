@@ -211,6 +211,11 @@ class DSparkModel(EasyDeLBaseModule, SpecDecodeBase):
     _task_type = TaskType.BASE_MODULE
     _model_type = "dspark"
     _config_class = DSparkConfig
+    # Runner contract: DSpark drafts a whole block from a FIXED anchor + target
+    # context, so the eSurge strategy passes the anchor followed by the tokens
+    # drafted so far on every call, keeps the target seed hidden fixed, and never
+    # feeds the drafter's own hidden state back (see ``_draft_logits``).
+    block_draft = True
 
     def _draft_logits(
         self,
@@ -221,30 +226,62 @@ class DSparkModel(EasyDeLBaseModule, SpecDecodeBase):
         target_kv_cache: tp.Any | None = None,
         attention_mask: tp.Any | None = None,
     ) -> tuple[jax.Array, jax.Array | None]:
-        """Produce DSpark draft logits + hidden rows for :meth:`SpecDecodeBase.draft`.
+        """Produce DSpark block-draft logits + hidden rows for :meth:`SpecDecodeBase.draft`.
 
-        Runs the sequence-mode :meth:`forward` (no ``loss_mask`` /
-        ``return_block_outputs``) so it returns ``[batch, seq, vocab]`` logits
-        instead of the block-mode training output.
+        Evaluates the same function as the DeepSpec block training path
+        (:meth:`_block_forward`) for ONE anchor: the draft block is
+        ``[anchor, mask_token, ..., mask_token]`` (``block_size`` rows, or more
+        when more drafts were requested), every block row attends to the whole
+        target context (all of it precedes the anchor) and to every row of its
+        own block, and RoPE positions place the context immediately before the
+        anchor. Row ``j`` predicts the ``j + 1``-th token after the anchor; the
+        Markov head consumes ``input_ids[:, j]`` as row ``j``'s previous token
+        (the anchor for row 0, then the drafted tokens), carrying the RNN head's
+        state across rows exactly as in training.
 
         Args:
-            input_ids: ``(batch, seq)`` seed/verified tokens.
-            target_hidden_states: Target hidden state(s) to project (single
-                layer or pre-concatenated target features).
-            position_ids: Ignored (sequence-mode forward builds its own).
+            input_ids: ``(batch, n)`` — the anchor (last verified token) followed
+                by the ``n - 1`` tokens drafted so far in this window.
+            target_hidden_states: Target context ``(batch, ctx, hidden)`` (single
+                layer or pre-concatenated target features); all rows precede the
+                anchor, the last one immediately.
+            position_ids: Ignored — DSpark attention is RoPE-relative, so the
+                block is laid out at relative positions ``ctx, ctx + 1, ...``
+                after context positions ``0 .. ctx - 1``.
             target_kv_cache: Ignored (DSpark does not cross-attend to target K/V).
-            attention_mask: Optional attention mask.
+            attention_mask: Ignored (the single-anchor block mask is all-visible).
 
         Returns:
-            Tuple ``(logits, hidden_states)``.
+            Tuple ``(logits, hidden_states)`` for the first ``n`` block rows, so
+            the last row's logits are the next draft.
         """
-        del position_ids, target_kv_cache
-        out = self.forward(
-            input_ids=input_ids,
-            target_hidden_states=target_hidden_states,
-            attention_mask=attention_mask,
+        del position_ids, target_kv_cache, attention_mask
+        context = self.project_target_hidden_states(target_hidden_states)
+        batch_size, num_context = context.shape[:2]
+        input_ids = jnp.asarray(input_ids, dtype=jnp.int32)
+        num_prev = int(input_ids.shape[1])
+        num_rows = max(int(self.config.block_size), num_prev)
+        noise_ids = jnp.full((batch_size, num_rows), int(self.config.mask_token_id), dtype=jnp.int32)
+        noise_ids = noise_ids.at[:, 0].set(input_ids[:, 0])
+        context_position_ids = make_position_ids(inputs_embeds=context)
+        draft_position_ids = jnp.broadcast_to(
+            num_context + jnp.arange(num_rows, dtype=jnp.int32)[None, :], (batch_size, num_rows)
         )
-        return out.logits, out.hidden_states
+        hidden_states = self._forward_backbone(
+            noise_embedding=self.embed_tokens(noise_ids),
+            target_hidden_states=context,
+            attention_mask=None,
+            q_position_ids=draft_position_ids,
+            kv_position_ids=jnp.concatenate((context_position_ids, draft_position_ids), axis=1),
+        )[:, :num_prev]
+        logits = self.compute_logits(hidden_states)
+        if self.markov_head is not None:
+            logits = self.markov_head.apply_logits(
+                logits[:, None],
+                token_ids=input_ids[:, None],
+                hidden_states=hidden_states[:, None],
+            )[:, 0]
+        return logits, hidden_states
 
     def __init__(
         self,

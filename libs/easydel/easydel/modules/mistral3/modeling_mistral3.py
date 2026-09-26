@@ -201,9 +201,11 @@ class Mistral3PatchMerger(spx.Module):
         for image_tokens, (h, w) in zip(image_features_split, image_sizes, strict=False):
             image_grid = image_tokens.reshape(h, w, d)
             grid = image_grid.reshape(h // k, k, w // k, k, d)
-            grid = grid.transpose(0, 2, 1, 3, 4)
+            # Channel order must match HF's ``F.unfold`` (channel-major: ``(c, ki, kj)``)
+            # because ``merging_layer`` weights are loaded without permutation.
+            grid = grid.transpose(0, 2, 4, 1, 3)
             num_new_tokens = (h // k) * (w // k)
-            merged_tokens = grid.reshape(num_new_tokens, k * k * d)
+            merged_tokens = grid.reshape(num_new_tokens, d * k * k)
             permuted_tensors.append(merged_tokens)
 
         image_features = jnp.concatenate(permuted_tensors, axis=0)
@@ -407,8 +409,14 @@ class Mistral3Model(EasyDeLBaseModule):
         Returns:
             Array: Projected image features ready for merging with text embeddings.
         """
-        image_features = self.vision_tower(pixel_values, output_hidden_states=True)
-        selected_image_feature = image_features.hidden_states[self.vision_feature_layer]
+        image_features = self.vision_tower(pixel_values, output_hidden_states=True, image_sizes=image_sizes)
+        if isinstance(self.vision_feature_layer, int):
+            selected_image_feature = image_features.hidden_states[self.vision_feature_layer]
+        else:
+            selected_image_feature = jnp.concatenate(
+                [image_features.hidden_states[layer_idx] for layer_idx in self.vision_feature_layer],
+                axis=-1,
+            )
         image_features = self.multi_modal_projector(selected_image_feature.squeeze(0), image_sizes)
         return image_features.squeeze(0)
 
@@ -902,20 +910,6 @@ class Mistral3ForConditionalGeneration(BaseVisionLanguageModule[Mistral3Model, M
             TransformerCache: Initialized empty cache for key-value storage.
         """
         return self.base_model.init_cache(batch_size, max_length, starts, shardings, pad_token_id)
-
-    def apply_lm_head(self, hidden_states: Array) -> Array:
-        """Apply the language modeling head to hidden states.
-
-        Projects the final hidden states to vocabulary logits for next token prediction.
-
-        Args:
-            hidden_states (Array): Hidden states from the model of shape
-                (batch_size, sequence_length, hidden_size).
-
-        Returns:
-            Array: Logits over vocabulary of shape (batch_size, sequence_length, vocab_size).
-        """
-        return self.lm_head(hidden_states)
 
     def get_vision_tower(self) -> spx.Module:
         """Get the vision tower component.

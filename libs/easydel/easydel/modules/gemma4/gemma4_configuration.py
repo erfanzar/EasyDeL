@@ -367,13 +367,25 @@ class Gemma4TextConfig(EasyDeLBaseConfig):
                 )
         return mapping
 
+    def to_dict(self) -> dict:
+        """Serialize with the checkpoint's ``sliding_window``.
+
+        Bidirectional attention shrinks the window to ``sliding_window // 2 + 1`` on
+        construction (as transformers does), so the stored value is widened back to one
+        that shrinks to the same window; otherwise every save/load round trip halves it again.
+        """
+        out = super().to_dict()
+        if out.get("use_bidirectional_attention") == "all" and out.get("sliding_window") is not None:
+            out["sliding_window"] = (out["sliding_window"] - 1) * 2
+        return out
+
 
 @register_config("gemma4_vision")
 class Gemma4VisionConfig(EasyDeLBaseConfig):
     """Configuration for the Gemma4 vision encoder.
 
     Parameterises a ViT-style vision transformer with 2-D RoPE, spatial
-    pooling after patch embedding, and optional weight-clipped linear layers
+    pooling after patch embedding, and optional activation-clipped linear layers
     for numerical stability.
 
     The vision encoder processes images by splitting them into non-overlapping
@@ -416,9 +428,10 @@ class Gemma4VisionConfig(EasyDeLBaseConfig):
             Defaults to 16.
         position_embedding_size: Maximum number of entries in the learned 2-D
             position embedding table.  Defaults to 10 240.
-        use_clipped_linears: Whether to clamp linear layer weights to a
-            fixed range during the forward pass for numerical stability.
-            Defaults to ``False``.
+        use_clipped_linears: Whether vision linears clamp their input and
+            output activations to learned per-projection ranges
+            (``input_min``/``input_max``/``output_min``/``output_max``), as in
+            HF ``Gemma4ClippableLinear``. Defaults to ``False``.
         standardize: Whether to apply a learned bias and scale to the pooled
             vision tokens before projection.  Defaults to ``False``.
         initializer_range: Standard deviation for weight initialisation.

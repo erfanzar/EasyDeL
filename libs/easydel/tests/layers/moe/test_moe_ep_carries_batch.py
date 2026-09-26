@@ -58,6 +58,14 @@ def _require_fake_mesh():
         pytest.skip("needs XLA_FLAGS=--xla_force_host_platform_device_count=8")
 
 
+def _ep1_mesh_dims():
+    """Keep FSDP and TP nontrivial on four devices; retain fsdp4/tp2 on eight."""
+    if jax.device_count() < 4:
+        pytest.skip("needs at least 4 devices for fsdp2 x tp2")
+    fsdp = 4 if jax.device_count() >= 8 else 2
+    return (1, 1, fsdp, 1, 2, 1)
+
+
 def _build_gptoss_block(
     *,
     sharding_axis_dims,
@@ -123,9 +131,7 @@ def test_config_extends_activation_batch_axis_with_ep():
     assert off.config.partition_axis.batch_axis == ("fsdp", "dp")
 
     # ep-bound folding contradicts ep-carried batch: the lever must not fire.
-    bound = _build_gptoss_block(
-        sharding_axis_dims=(1, 1, 2, 2, 2, 1), ep_carries_batch=True, fsdp_is_ep_bound=True
-    )
+    bound = _build_gptoss_block(sharding_axis_dims=(1, 1, 2, 2, 2, 1), ep_carries_batch=True, fsdp_is_ep_bound=True)
     assert bound.config.partition_axis.batch_axis == ("fsdp", "dp")
 
 
@@ -156,9 +162,7 @@ def test_batch_axis_names_resolution():
     assert batch_axes(ep1) == ("dp", "fsdp")
 
     # folded 3-D expert mesh (fsdp ep-bound): no distinct fsdp axis, gate off.
-    folded = _build_gptoss_block(
-        sharding_axis_dims=(1, 1, 2, 2, 2, 1), ep_carries_batch=True, fsdp_is_ep_bound=True
-    )
+    folded = _build_gptoss_block(sharding_axis_dims=(1, 1, 2, 2, 2, 1), ep_carries_batch=True, fsdp_is_ep_bound=True)
     assert batch_axes(folded) == ("dp",)
 
 
@@ -169,10 +173,10 @@ def test_knob_inactive_is_bit_identical():
     batch spec splits over a size-1 axis — a placement no-op. Any numeric
     drift here means the knob is not gated purely.
     """
-    _require_fake_mesh()
+    dims = _ep1_mesh_dims()
 
-    off = _build_gptoss_block(sharding_axis_dims=(1, 1, 4, 1, 2, 1), ep_carries_batch=False)
-    on = _build_gptoss_block(sharding_axis_dims=(1, 1, 4, 1, 2, 1), ep_carries_batch=True)
+    off = _build_gptoss_block(sharding_axis_dims=dims, ep_carries_batch=False)
+    on = _build_gptoss_block(sharding_axis_dims=dims, ep_carries_batch=True)
     x = _input()
 
     with off.config.mesh:

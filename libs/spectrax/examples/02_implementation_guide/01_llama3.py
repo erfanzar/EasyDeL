@@ -27,7 +27,6 @@ import os
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import jax
-
 import spectrax as spx
 
 from ..models.llama import Llama3, Llama3Config

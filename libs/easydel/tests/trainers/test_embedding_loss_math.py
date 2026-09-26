@@ -17,7 +17,6 @@ from types import SimpleNamespace
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from easydel.trainers.embedding_trainer._fn import _embedding_loss_values
 from easydel.trainers.embedding_trainer.embedding_config import EmbeddingConfig
 from easydel.trainers.embedding_trainer.embedding_trainer import EmbeddingTrainer

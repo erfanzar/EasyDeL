@@ -36,8 +36,6 @@ import pickle
 import jax
 import jax.numpy as jnp
 import pytest
-from eformer.pytree import auto_pytree
-
 from easydel.infra.modeling_outputs import (
     AttentionLayerOutput,
     BaseModelOutput,
@@ -57,6 +55,7 @@ from easydel.infra.modeling_outputs import (
     TokenClassifierOutput,
     VLMCausalLMOutput,
 )
+from eformer.pytree import auto_pytree
 
 
 def test_modeloutput_is_ordered_dict_subclass():

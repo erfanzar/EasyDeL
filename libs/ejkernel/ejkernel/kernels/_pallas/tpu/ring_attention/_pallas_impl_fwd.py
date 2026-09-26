@@ -188,7 +188,8 @@ def _build_mask(
 
     if sliding_window is not None:
         if isinstance(sliding_window, int):
-            window = (sliding_window, sliding_window)
+            # An int is a window *size* (HF convention): the query plus its ``W - 1`` neighbours.
+            window = (max(sliding_window - 1, 0), max(sliding_window - 1, 0))
         else:
             window = sliding_window
         local_mask = mask_lib.LocalMask(shape=shape, window_size=window, offset=0)

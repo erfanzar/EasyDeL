@@ -89,9 +89,7 @@ def _make_candidates(rows, kernel, scales, group_sizes, k_dim, n_dim, num_groups
         import jax as _jax
         from jax import numpy as _jnp
 
-        fn = _jax.jit(
-            lambda r, g: grouped_matmul(r, kernel, g, preferred_element_type=_jnp.bfloat16, platform="xla")
-        )
+        fn = _jax.jit(lambda r, g: grouped_matmul(r, kernel, g, preferred_element_type=_jnp.bfloat16, platform="xla"))
         return lambda: fn(rows, group_sizes)
 
     # Only meaningful for dense weights: the XLA path has no quantized variant.

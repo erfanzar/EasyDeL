@@ -26,7 +26,6 @@ Key Features:
     - Separate Q/K/V convolution states for short-range dependencies
     - Recurrent state for long-range linear attention
     - Composable design for use within HybridCache
-    - Full serialization support via to_pure/from_pure
 
 Key Components:
     - KDACacheConfig: Configuration for cache dimensions
@@ -48,8 +47,6 @@ Example:
 """
 
 from __future__ import annotations
-
-import typing as tp
 
 from eformer.jaximus import ImplicitArray
 from eformer.pytree import auto_pytree, field
@@ -422,110 +419,6 @@ class KDACache(BaseCache):
             A human-readable representation of the cache container.
         """
         return f"KDACache(layers={len(self.views)})"
-
-    def to_pure(self) -> tuple[list[dict[str, tp.Any]], KDACacheConfig | None]:
-        """Convert cache to pure Python data for serialization.
-
-        Returns:
-            Tuple of (cache_data, metadata) where cache_data is a list of dicts
-            containing serialized view data and metadata is the shared KDACacheConfig.
-        """
-        cache_data: list[dict[str, tp.Any]] = []
-        metadata: KDACacheConfig | None = None
-
-        for view in self.views:
-            if view is None:
-                cache_data.append({"is_none": True})
-            else:
-                if metadata is None:
-                    metadata = view.metadata
-                cache_data.append(
-                    {
-                        "is_none": False,
-                        "q_conv_state": view.q_conv_state,
-                        "k_conv_state": view.k_conv_state,
-                        "v_conv_state": view.v_conv_state,
-                        "recurrent_state": view.recurrent_state,
-                        "positions": view.positions,
-                        "layer_index": view.layer_index,
-                    }
-                )
-
-        return cache_data, metadata
-
-    @classmethod
-    def from_pure(
-        cls,
-        cache_data: list[dict[str, tp.Any]],
-        metadata: KDACacheConfig | None = None,
-    ) -> "KDACache":
-        """Reconstruct cache from pure Python data.
-
-        Args:
-            cache_data: List of dicts containing serialized view data.
-            metadata: Shared KDACacheConfig for reconstruction.
-
-        Returns:
-            Reconstructed KDACache instance.
-        """
-        views: list[KDACacheView | None] = []
-
-        for layer_data in cache_data:
-            if layer_data.get("is_none", False):
-                views.append(None)
-            else:
-                view = KDACacheView(
-                    q_conv_state=layer_data["q_conv_state"],
-                    k_conv_state=layer_data["k_conv_state"],
-                    v_conv_state=layer_data["v_conv_state"],
-                    recurrent_state=layer_data["recurrent_state"],
-                    positions=layer_data["positions"],
-                    metadata=metadata,
-                    layer_index=layer_data.get("layer_index"),
-                )
-                views.append(view)
-
-        return cls(views=views)
-
-    def insert(
-        self,
-        other: "KDACache",
-        slot: int,
-    ) -> "KDACache":
-        """Insert another cache's contents at a specific batch slot.
-
-        Args:
-            other: Source KDACache to copy from (typically batch size 1).
-            slot: Batch index to insert at.
-
-        Returns:
-            New KDACache with the inserted content.
-        """
-        new_views: list[KDACacheView | None] = []
-
-        for self_view, other_view in zip(self.views, other.views, strict=False):
-            if self_view is None or other_view is None:
-                new_views.append(self_view)
-            else:
-                # Insert states at the specified slot
-                new_q_conv = self_view.q_conv_state.at[slot].set(other_view.q_conv_state[0])
-                new_k_conv = self_view.k_conv_state.at[slot].set(other_view.k_conv_state[0])
-                new_v_conv = self_view.v_conv_state.at[slot].set(other_view.v_conv_state[0])
-                new_recurrent = self_view.recurrent_state.at[slot].set(other_view.recurrent_state[0])
-                new_positions = self_view.positions.at[slot].set(other_view.positions[0])
-
-                new_view = KDACacheView(
-                    q_conv_state=new_q_conv,
-                    k_conv_state=new_k_conv,
-                    v_conv_state=new_v_conv,
-                    recurrent_state=new_recurrent,
-                    positions=new_positions,
-                    metadata=self_view.metadata,
-                    layer_index=self_view.layer_index,
-                )
-                new_views.append(new_view)
-
-        return KDACache(views=new_views)
 
     __str__ = __repr__
 

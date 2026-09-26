@@ -148,9 +148,7 @@ def cmd_sweep(args) -> int:
         print(f"  {label}\n      -> {entry.platform} {entry.config}  {entry.ms:.4f}ms{tail}", flush=True)
 
     print(f"sweeping {spec.kernel} ...", flush=True)
-    entries = run_sweep(
-        spec, reps=args.reps, min_gain=args.min_gain, provenance=provenance, on_point=progress, **extra
-    )
+    entries = run_sweep(spec, reps=args.reps, min_gain=args.min_gain, provenance=provenance, on_point=progress, **extra)
     if not entries:
         print("no measurable points", file=sys.stderr)
         return 1

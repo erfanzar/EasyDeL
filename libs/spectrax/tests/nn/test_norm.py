@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import jax.numpy as jnp
-
 from spectrax.nn.norm import BatchNorm1d, BatchNorm2d, LayerNorm, RMSNorm
 
 

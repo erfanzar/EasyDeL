@@ -52,6 +52,11 @@ def test_no_duplicate_benchmark_entrypoints():
             "_op_benchmark_registry.py",
             "benchmark_quantized_matmul_native_vs_gemlite.py",
             "benchmark_suite.py",
+            # Arithmetic probes, not registered-operation benchmark entrypoints:
+            # exact integer planes for already-FP4 operands versus approximate
+            # BF16 activation requantization with packed FP4 weights.
+            "mxfp4_integer_probe.py",
+            "mxfp4_bf16_activations_probe.py",
             "plot_qmm_native_vs_gemlite.py",
         }
     )

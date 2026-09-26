@@ -1,7 +1,9 @@
 # EasyDeL Operations
 
-Read this before treating infrastructure symptoms as code bugs. On a TPU host, pin only unrelated host-side probes to
-CPU. CPU checks are not a substitute for TPU kernel, eSurge runtime, Mosaic lowering, or performance validation:
+Read this before treating infrastructure symptoms as code bugs. TPU hosts hold a single libtpu process lock: run one
+accelerator test process at a time. While a TPU job runs, only non-computation probes (like the device listing below)
+may be pinned to CPU; computation tests wait for the TPU. A CPU run of a computation test is never validation — with no
+accelerator, report the result as unverified on hardware:
 
 ```bash
 ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
@@ -69,15 +71,13 @@ Start from these files:
 - `libs/easydel/docs/esurge.rst`
 - an eSurge benchmark harness
 
-Focused tests:
+Focused tests (computation tests — accelerator only):
 
 ```bash
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
-XLA_FLAGS=--xla_force_host_platform_device_count=8 \
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
   uv run pytest libs/easydel/tests/inference/esurge
 
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
-XLA_FLAGS=--xla_force_host_platform_device_count=8 \
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
   uv run pytest libs/easydel/tests/inference/esurge/runners/test_model_executor_prepare_signature.py
 ```
 

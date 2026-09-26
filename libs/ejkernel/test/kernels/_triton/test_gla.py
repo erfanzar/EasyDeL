@@ -23,7 +23,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from einops import rearrange
-
 from ejkernel.kernels._triton import recurrent_gla
 from ejkernel.kernels._xla.gla import recurrent_gla as xla_recurrent_gla
 from ejkernel.utils import numeric_gen

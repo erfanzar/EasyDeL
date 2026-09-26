@@ -110,7 +110,6 @@ def _versions() -> dict[str, str]:
     """Return a dictionary of installed library versions."""
     import flax
     import jax
-
     import spectrax
 
     return {

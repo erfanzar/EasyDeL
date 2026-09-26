@@ -94,11 +94,7 @@ class DualPipeV(Schedule):
             )
 
         per_rank_tasks = [dualpipev_tasks(n, rank, m, zero_bubble=self.zero_bubble) for rank in range(n)]
-        max_len = max((len(tasks) for tasks in per_rank_tasks), default=0)
-        grid: list[list[Action | FusedTask | None]] = []
-        for row_idx in range(max_len):
-            grid.append([tasks[row_idx] if row_idx < len(tasks) else None for tasks in per_rank_tasks])
-        return grid
+        return _time_align_rank_tasks(self, per_rank_tasks, n)
 
     def virtual_stages_per_rank(self) -> int:
         """Always ``2`` for the V-shape topology (forward and reverse virtuals).
@@ -178,6 +174,74 @@ class DualPipeV(Schedule):
             ``2 * n_stages``.
         """
         return 2 * n_stages
+
+
+def _time_align_rank_tasks(
+    schedule: Schedule,
+    per_rank_tasks: list[list[Action | FusedTask]],
+    n_stages: int,
+) -> list[list[Action | FusedTask | None]]:
+    """Place rank-centric task lists on a dependency-respecting time grid.
+
+    DualPipe-V is defined per rank; naively padding the per-rank lists
+    into rows puts a consumer in the same or an earlier row than its
+    cross-rank producer, which breaks every runtime that walks the grid
+    row by row (the pscan dispatcher, the serial dispatcher and the
+    ``shard_map`` bodies). Each rank's order is kept unchanged; a task is
+    placed in the first row where every dependency of each of its halves
+    completed in a strictly earlier row, idling (``None``) otherwise.
+
+    Args:
+        schedule: Schedule providing the ``(rank, virt) -> logical`` map.
+        per_rank_tasks: Ordered task list per physical rank.
+        n_stages: Number of physical pipeline ranks.
+
+    Returns:
+        The time-aligned ``(T, n_stages)`` grid.
+
+    Raises:
+        RuntimeError: If the per-rank lists cannot make progress.
+    """
+    n_logical = n_stages * schedule.virtual_stages_per_rank()
+    done: set[tuple[str, int, int]] = set()
+
+    def _halves(task: Action | FusedTask) -> tuple[Action, ...]:
+        return task.split() if isinstance(task, FusedTask) else (task,)
+
+    def _ready(rank: int, action: Action) -> bool:
+        logical = schedule.logical_at(rank, action.virtual_stage, n_stages)
+        mb = action.microbatch
+        if action.phase is Phase.FWD:
+            return logical == 0 or ("F", logical - 1, mb) in done
+        if action.phase is Phase.BWD_W:
+            return ("B", logical, mb) in done
+        return ("F", logical, mb) in done and (logical == n_logical - 1 or ("B", logical + 1, mb) in done)
+
+    def _mark(rank: int, action: Action) -> None:
+        logical = schedule.logical_at(rank, action.virtual_stage, n_stages)
+        tag = "F" if action.phase is Phase.FWD else ("W" if action.phase is Phase.BWD_W else "B")
+        done.add((tag, logical, action.microbatch))
+
+    ptrs = [0] * n_stages
+    grid: list[list[Action | FusedTask | None]] = []
+    while any(ptrs[rank] < len(per_rank_tasks[rank]) for rank in range(n_stages)):
+        row: list[Action | FusedTask | None] = [None] * n_stages
+        for rank in range(n_stages):
+            if ptrs[rank] >= len(per_rank_tasks[rank]):
+                continue
+            task = per_rank_tasks[rank][ptrs[rank]]
+            if all(_ready(rank, action) for action in _halves(task)):
+                row[rank] = task
+        if all(cell is None for cell in row):
+            raise RuntimeError(f"DualPipeV internal schedule error: per-rank task lists deadlock at positions {ptrs}.")
+        for rank, cell in enumerate(row):
+            if cell is None:
+                continue
+            for action in _halves(cell):
+                _mark(rank, action)
+            ptrs[rank] += 1
+        grid.append(row)
+    return grid
 
 
 def dualpipev_tasks(

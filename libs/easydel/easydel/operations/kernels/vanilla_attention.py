@@ -162,6 +162,7 @@ class VanillaAttn(OperationImpl):
         dropout_prob: float = 0.0,
         causal: bool = False,
         sliding_window: int | tuple[int, int] | None = None,
+        precision: jax.lax.PrecisionLike = None,
         **ignore,
     ) -> AttentionOutput:
         """
@@ -182,6 +183,7 @@ class VanillaAttn(OperationImpl):
             dropout_prob: Dropout probability.
             causal: Apply causal masking.
             sliding_window: Sliding window size for local attention.
+            precision: QK and value-product precision. None inherits JAX's ambient setting.
             **ignore: Additional ignored arguments.
 
         Returns:
@@ -233,6 +235,7 @@ class VanillaAttn(OperationImpl):
                     sliding_window=sliding_window,
                     runtime_dtype=runtime_dtype,
                     softmax_dtype=softmax_dtype,
+                    precision=precision,
                 )
                 outputs_sharded = with_sharding_constraint(arr=outputs, sharding=shardings.output, mesh=mesh)
                 return AttentionOutput(attention_weights=weights, attention_outputs=outputs_sharded)
@@ -262,6 +265,7 @@ class VanillaAttn(OperationImpl):
                 init_bias=None,
                 causal=causal_computed,
                 logits_soft_cap=logits_soft_cap,
+                precision=precision,
             )
             if isinstance(attn_result, tuple):
                 outputs, weights = attn_result
@@ -300,6 +304,7 @@ class VanillaAttn(OperationImpl):
         sliding_window: int | tuple[int, int] | None,
         runtime_dtype: jnp.dtype,
         softmax_dtype: jnp.dtype | None,
+        precision: jax.lax.PrecisionLike = None,
     ) -> tuple[Array, Array]:
         batch_size, q_len, num_q_heads, head_dim = query.shape
         kv_len = key.shape[1]
@@ -318,6 +323,7 @@ class VanillaAttn(OperationImpl):
             query.astype(compute_dtype),
             key.astype(compute_dtype),
             preferred_element_type=compute_dtype,
+            precision=precision,
         )
         logits = logits * jnp.asarray(scale, dtype=compute_dtype)
         if logits_soft_cap is not None:
@@ -357,7 +363,8 @@ class VanillaAttn(OperationImpl):
             if isinstance(sliding_window, tuple):
                 left_window, right_window = sliding_window
             else:
-                left_window = right_window = sliding_window
+                # An int is a window *size* (HF convention): the query plus its ``W - 1`` neighbours.
+                left_window = right_window = max(sliding_window - 1, 0)
             valid = valid & (kv_positions[:, None, :] >= q_positions[:, :, None] - int(left_window))
             valid = valid & (kv_positions[:, None, :] <= q_positions[:, :, None] + int(right_window))
 
@@ -385,6 +392,7 @@ class VanillaAttn(OperationImpl):
             weights.astype(runtime_dtype),
             value.astype(runtime_dtype),
             preferred_element_type=runtime_dtype,
+            precision=precision,
         )
         return outputs.astype(runtime_dtype), weights
 
@@ -464,6 +472,7 @@ class VanillaAttn(OperationImpl):
         dropout_prob: float = 0.0,
         causal: bool = False,
         sliding_window: int | tuple[int, int] | None = None,
+        precision: jax.lax.PrecisionLike = None,
         **ignore,
     ) -> AttentionOutput:
         """
@@ -482,6 +491,7 @@ class VanillaAttn(OperationImpl):
             init_bias: Optional callable to initialize bias.
             deterministic: If True, disables dropout.
             dropout_rng: JAX PRNG key for dropout if deterministic is False.
+            precision: QK and value-product precision. None inherits JAX's ambient setting.
             **ignore: Additional ignored keyword arguments.
 
         Returns:
@@ -502,6 +512,7 @@ class VanillaAttn(OperationImpl):
             init_bias=init_bias,
             logits_soft_cap=logits_soft_cap,
             causal=causal,
+            precision=precision,
             **ignore,
         )
 

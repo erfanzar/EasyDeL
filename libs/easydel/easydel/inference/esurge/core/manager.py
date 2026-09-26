@@ -65,23 +65,6 @@ class CachePages:
 
     pages: tuple[list[CachePage], ...]
 
-    def __add__(self, other: "CachePages") -> "CachePages":
-        """Concatenate two CachePages instances.
-
-        Combines the pages from two CachePages instances by concatenating
-        the page lists for each corresponding KV cache group.
-
-        Args:
-            other: Another CachePages instance to add.
-
-        Returns:
-            A new CachePages instance with concatenated page lists.
-
-        Example:
-            >>> combined = cache_pages1 + cache_pages2
-        """
-        return CachePages(tuple(blk1 + blk2 for blk1, blk2 in zip(self.pages, other.pages, strict=False)))
-
     def get_page_ids(self) -> tuple[list[int], ...]:
         """Convert CachePages to page IDs.
 
@@ -99,23 +82,6 @@ class CachePages:
         """
         return tuple([blk.page_id for blk in group] for group in self.pages)
 
-    def get_unhashed_page_ids(self) -> list[int]:
-        """Get page IDs of pages without computed hashes.
-
-        Returns the IDs of pages that haven't been hashed yet, which are
-        typically newly allocated pages that haven't been filled with tokens.
-
-        Returns:
-            A list of page IDs for unhashed pages.
-
-        Raises:
-            AssertionError: If there is more than one KV cache group.
-
-        Note:
-            This method only supports single-group configurations.
-        """
-        assert len(self.pages) == 1, "Only one group is supported"
-        return [page.page_id for page in self.pages[0] if page.page_hash is None]
 
     def new_empty(self) -> "CachePages":
         """Create an empty CachePages instance with the same structure.

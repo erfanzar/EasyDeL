@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 import pytest
-
 import spectrax as spx
 from spectrax.nn import Conv1d, Conv2d, Conv3d, Embed, Linear
 from spectrax.rng.rngs import Rngs
@@ -162,3 +161,21 @@ def test_sequential_init_materializes_deferred():
     model.sequential_init(jnp.zeros((2, 4)))
     assert model.fc1.in_features == 4
     assert not isinstance(model.fc1.weight, spx.DeferredParameter) or model.fc1.weight.is_materialized
+
+
+def test_materialized_deferred_linear_survives_jit_grad_and_clone():
+    """A materialized ``DeferredParameter`` must stay readable after ``bind`` (jit / grad / clone)."""
+    m = Linear(None, 4, rngs=Rngs(0))
+    x = jnp.ones((2, 3))
+    expected = m(x)
+    assert isinstance(m.weight, spx.DeferredParameter) and m.weight.is_materialized
+
+    jitted = spx.jit(lambda mod, inp: mod(inp))(m, x)
+    assert jnp.allclose(jitted, expected)
+
+    cloned = spx.clone(m)
+    assert jnp.allclose(cloned(x), expected)
+
+    grads = spx.grad(lambda mod: jnp.sum(mod(x)))(m)
+    expected_weight_grad = jnp.broadcast_to(jnp.sum(x, axis=0)[:, None], (3, 4))
+    assert jnp.allclose(grads["parameters"]["weight"], expected_weight_grad)

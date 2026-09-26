@@ -39,7 +39,6 @@ import jax.numpy as jnp
 import spectrax as spx
 from eformer.pytree import auto_pytree
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-from jax import image as jimg
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 from spectrax import apply_logical_sharding, common_types, nn
@@ -63,7 +62,7 @@ from easydel.layers import (
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.norms import LayerNorm
-from easydel.modules._base import BaseImageClassificationModule
+from easydel.modules._base import BaseImageClassificationModule, torch_bicubic_resize
 
 from .configuration_siglip import SiglipConfig, SiglipTextConfig, SiglipVisionConfig
 
@@ -210,6 +209,7 @@ class SiglipVisionEmbeddings(EasyDeLLayerStackMixin, spx.Module):
             stride=self.patch_size,
             padding="VALID",
             dtype=dtype,
+            precision=precision,
             rngs=rngs,
         )
 
@@ -233,7 +233,7 @@ class SiglipVisionEmbeddings(EasyDeLLayerStackMixin, spx.Module):
                     dtype="i4",
                 ).reshape(1, -1)
             )
-        patch_pos_embed = self.position_embedding.weight.unsqueeze(0)
+        patch_pos_embed = jnp.asarray(self.position_embedding.weight.value)
 
         dim = embeddings.shape[-1]
         new_height = height // self.patch_size
@@ -241,16 +241,12 @@ class SiglipVisionEmbeddings(EasyDeLLayerStackMixin, spx.Module):
 
         sqrt_num_positions = int(num_positions**0.5)
 
-        patch_pos_embed = jnp.reshape(patch_pos_embed, (1, sqrt_num_positions, sqrt_num_positions, dim))
-        patch_pos_embed = jnp.transpose(patch_pos_embed, (0, 3, 1, 2))
+        patch_pos_embed = jnp.reshape(patch_pos_embed, (sqrt_num_positions, sqrt_num_positions, dim))
+        # HF: F.interpolate(mode="bicubic", align_corners=False) — torch's cubic
+        # kernel (A=-0.75, no antialias), not jax.image.resize's.
+        patch_pos_embed = torch_bicubic_resize(patch_pos_embed, new_height, new_width)
 
-        patch_pos_embed = jimg.resize(
-            patch_pos_embed,
-            (1, dim, new_height, new_width),
-            method="cubic",
-        )
-
-        return jnp.reshape(jnp.transpose(patch_pos_embed, (0, 2, 3, 1)), (1, -1, dim))
+        return jnp.reshape(patch_pos_embed, (1, -1, dim))
 
     def forward(self, pixel_values: Array, interpolate_pos_encoding=False):
         """Create vision embeddings from pixel values.
@@ -470,6 +466,7 @@ class SiglipAttention(AttentionModule):
             mode=common_types.MODE_TRAIN,
             mask_info=mask_info,
             causal=self.causal,
+            precision=self.precision,
         )
 
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
@@ -1235,8 +1232,11 @@ class MultiheadAttention(spx.Module):
         self.head_dim = embed_dim // num_heads
         assert self.head_dim * num_heads == self.embed_dim, "embed_dim must be divisible by num_heads"
 
+        # Stored transposed relative to torch's ``(3 * embed_dim, embed_dim)``
+        # ``in_proj_weight``: the generic HF converter transposes every 2-D
+        # ``*weight`` leaf, and ``forward`` computes ``x @ w`` per q/k/v slice.
         self.in_proj_weight = ArrayParam.bound(
-            shape=(embed_dim * 3, embed_dim),
+            shape=(embed_dim, embed_dim * 3),
             dtype=param_dtype,
             init_method="xavier_uniform",
             key=rngs.param,

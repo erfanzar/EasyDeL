@@ -67,6 +67,7 @@ from .grouped_matmul import grouped_matmul
 from .grouped_matmul_channelwise import grouped_matmul_channelwise
 from .grouped_matmulv2 import grouped_matmulv2
 from .grouped_matmulv3 import grouped_matmulv3
+from .mhc_coefficients import mhc_coefficients
 from .multi_latent_ragged_page_attention import multi_latent_ragged_page_attention
 from .multi_latent_ragged_page_attention_v2 import multi_latent_ragged_page_attention_v2
 from .page_attention import page_attention
@@ -103,6 +104,7 @@ __all__ = (
     "grouped_matmul_channelwise",
     "grouped_matmulv2",
     "grouped_matmulv3",
+    "mhc_coefficients",
     "multi_latent_ragged_page_attention",
     "multi_latent_ragged_page_attention_v2",
     "page_attention",

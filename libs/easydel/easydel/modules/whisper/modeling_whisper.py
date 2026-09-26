@@ -763,22 +763,26 @@ class WhisperEncoder(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
+        # HF uses symmetric ``padding=1`` on both convs. ``"SAME"`` would pad the
+        # stride-2 conv2 as (0, 1) for L=3000, shifting every frame by half a step.
         self.conv1 = nn.Conv1d(
-            self.config.d_model,
+            self.config.num_mel_bins,
             self.config.d_model,
             kernel_size=3,
-            padding="SAME",
+            padding=((1, 1),),
             dtype=dtype,
             rngs=rngs,
+            precision=precision,
         )
         self.conv2 = nn.Conv1d(
             self.config.d_model,
             self.config.d_model,
             kernel_size=3,
             stride=2,
-            padding="SAME",
+            padding=((1, 1),),
             dtype=dtype,
             rngs=rngs,
+            precision=precision,
         )
 
         self.dropout_layer = nn.Dropout(
@@ -824,7 +828,7 @@ class WhisperEncoder(EasyDeLBaseModule):
                 epsilon=1e-05,
                 rngs=rngs,
             )
-        self.layerdrop = self.config.decoder_layerdrop
+        self.layerdrop = self.config.encoder_layerdrop
 
     def forward(
         self,
@@ -891,7 +895,7 @@ class WhisperEncoder(EasyDeLBaseModule):
                 all_hidden_states = (*all_hidden_states, hidden_states)
             dropout_probability = random.uniform(0, 1)
             if self.training and (dropout_probability < self.layerdrop):
-                layer_outputs = (None, None)
+                layer_outputs = (hidden_states, None)
             else:
                 with self._layer_stage_context(idx, layers=self.layers):
                     layer_outputs = encoder_layer(
@@ -911,10 +915,9 @@ class WhisperEncoder(EasyDeLBaseModule):
             (hidden_states, all_hidden_states, all_attentions, 0),
             trace=trace_layers,
         )
-        if output_hidden_states:
-            all_hidden_states += (hidden_states,)
-
         hidden_states = checkpoint_name(self.layer_norm(hidden_states), "model_output")
+        # HF parity: num_layers + 1 states (layer inputs, then the post-norm
+        # output in place of the last layer's pre-norm output).
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
@@ -1135,7 +1138,7 @@ class WhisperDecoder(EasyDeLBaseModule):
                 # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
             dropout_probability = random.uniform(0, 1)
             if self.training and (dropout_probability < self.layerdrop):
-                layer_outputs = (None, None, None, None)
+                layer_outputs = (hidden_states, None, None, None)
             else:
                 with self._layer_stage_context(idx, layers=self.layers):
                     layer_outputs = decoder_layer(
@@ -1169,10 +1172,9 @@ class WhisperDecoder(EasyDeLBaseModule):
             (hidden_states, cache_views, all_hidden_states, all_self_attns, all_cross_attentions, 0),
             trace=trace_layers,
         )
-        if output_hidden_states:
-            all_hidden_states += (hidden_states,)
-
         hidden_states = checkpoint_name(self.layer_norm(hidden_states), "model_output")
+        # HF parity: num_layers + 1 states (layer inputs, then the post-norm
+        # output in place of the last layer's pre-norm output).
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
@@ -2123,7 +2125,7 @@ class WhisperForAudioClassification(EasyDeLBaseModule):
 
     Attributes:
         encoder (WhisperEncoder): The Whisper encoder stack.
-        layer_weights (jnp.ndarray, optional): Learned weights for combining encoder layers
+        layer_weights (spx.Parameter, optional): Learned weights for combining encoder layers
             when use_weighted_layer_sum=True.
         projector (ColumnParallelLinear): Dimension reduction layer before classification.
         classifier (ColumnParallelLinear): Final classification layer.
@@ -2170,9 +2172,9 @@ class WhisperForAudioClassification(EasyDeLBaseModule):
             rngs=rngs,
         )
         config.is_encoder_decoder = False
-        num_layers = config.num_hidden_layers + 1
+        num_layers = config.num_hidden_layers + 1  # transformer layers + input embeddings
         if config.use_weighted_layer_sum:
-            self.layer_weights = jnp.repeat(1 / num_layers, num_layers)
+            self.layer_weights = spx.Parameter(jnp.full((num_layers,), 1.0 / num_layers, dtype=param_dtype))
         self.projector = ColumnParallelLinear(
             config.d_model,
             config.classifier_proj_size,
@@ -2237,6 +2239,9 @@ class WhisperForAudioClassification(EasyDeLBaseModule):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
+        if self.config.use_weighted_layer_sum:
+            output_hidden_states = True
+
         if encoder_outputs is None:
             encoder_outputs = self.encoder(
                 input_features,
@@ -2245,8 +2250,9 @@ class WhisperForAudioClassification(EasyDeLBaseModule):
             )
 
         if self.config.use_weighted_layer_sum:
-            hidden_states = jnp.stack(encoder_outputs, axis=1)
-            norm_weights = jax.nn.softmax(self.layer_weights, axis=-1)
+            hidden_states = jnp.stack(encoder_outputs.hidden_states, axis=1)
+            norm_weights = jax.nn.softmax(self.layer_weights.value.astype(jnp.float32), axis=-1)
+            norm_weights = norm_weights.astype(hidden_states.dtype)
             hidden_states = jnp.sum(hidden_states * jnp.reshape(norm_weights, [-1, 1, 1]), axis=1)
         else:
             hidden_states = encoder_outputs[0]

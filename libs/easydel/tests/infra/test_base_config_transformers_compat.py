@@ -16,7 +16,6 @@ import json
 
 import jax.numpy as jnp
 import pytest
-
 from easydel.infra.base_config import EasyDeLBaseConfig
 
 

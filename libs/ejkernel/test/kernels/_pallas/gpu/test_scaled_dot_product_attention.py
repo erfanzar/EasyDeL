@@ -17,7 +17,6 @@
 import jax
 import jax.numpy as jnp
 import pytest
-
 from ejkernel.kernels._pallas.gpu.scaled_dot_product_attention import (
     scaled_dot_product_attention as sdpa_gpu,
 )

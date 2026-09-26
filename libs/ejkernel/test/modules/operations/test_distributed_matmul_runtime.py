@@ -4,11 +4,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax import lax, shard_map
-from jax.sharding import Mesh, PartitionSpec
-
 from ejkernel.modules.operations import all_gather_matmul, reduce_scatter_matmul
 from ejkernel.modules.operations.configs import AllGatherMatmulConfig, ReduceScatterMatmulConfig
+from jax import lax, shard_map
+from jax.sharding import Mesh, PartitionSpec
 
 
 def _has_multi_tpu_on_host() -> bool:

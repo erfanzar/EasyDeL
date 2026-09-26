@@ -3,7 +3,6 @@ from __future__ import annotations
 import importlib
 
 import jax.numpy as jnp
-
 from ejkernel.ops import BwdParams, FwdParams
 
 tpu_kernel = importlib.import_module("ejkernel.kernels._pallas.tpu.blocksparse_attention._kernel")

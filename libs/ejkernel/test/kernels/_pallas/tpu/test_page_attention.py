@@ -16,7 +16,6 @@
 import jax
 import jax.numpy as jnp
 import pytest
-
 from ejkernel.kernels._pallas.tpu.page_attention import page_attention
 from ejkernel.kernels._xla.page_attention import page_attention as page_attention_xla
 

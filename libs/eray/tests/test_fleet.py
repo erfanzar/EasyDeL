@@ -349,6 +349,41 @@ class TestFleetCli:
         assert down.exit_code == 0
         assert local_registry.get("trainer1").desired_state == "down"
 
+    @pytest.fixture
+    def pause_dir(self, tmp_path, monkeypatch):
+        import eray.provision.watcher as watcher_module
+
+        monkeypatch.setattr(watcher_module, "PAUSE_DIR", tmp_path)
+        return tmp_path
+
+    def test_resume_from_budget_halt_actually_recovers(self, local_registry, pause_dir):
+        from eray.provision.watcher import Observed, WatchPolicy, plan
+
+        now = 1_000_000.0
+        local_registry.upsert(make_record(state="HALTED_BUDGET", recreate_ts=[now - 60 * i for i in range(4)]))
+        result = CliRunner().invoke(cli, ["fleet", "resume", "trainer1"])
+        assert result.exit_code == 0, result.output
+        record = local_registry.get("trainer1")
+        assert record.state == "UNKNOWN"
+        assert record.recreate_ts == []
+        gone = Observed(None, None, 0, None, "", None, None, now)
+        actions = plan(record, gone, WatchPolicy(max_recreates_per_hour=4))
+        assert "create_qr" in [a.kind for a in actions]  # not re-halted by the stale budget window
+
+    def test_resume_from_quota_halt_replaces_the_failed_qr(self, local_registry, pause_dir):
+        from eray.provision.watcher import Observed, WatchPolicy, plan
+
+        local_registry.upsert(make_record(state="HALTED_QUOTA", qr_id="trainer1-r2", generation=2))
+        result = CliRunner().invoke(cli, ["fleet", "resume", "trainer1"])
+        assert result.exit_code == 0, result.output
+        record = local_registry.get("trainer1")
+        assert record.state == "UNKNOWN"
+        assert record.extra["resumed_qr"] == "trainer1-r2"
+        failed = Observed(None, None, 0, "FAILED", '"quota exceeded"', None, None, 1_000_000.0)
+        kinds = [a.kind for a in plan(record, failed, WatchPolicy())]
+        assert "halt" not in kinds
+        assert "delete_qr" in kinds and "create_qr" in kinds
+
     def test_status_table(self, local_registry):
         local_registry.upsert(make_record(state="HEALTHY", head_ip="10.0.0.5"))
         runner = CliRunner()

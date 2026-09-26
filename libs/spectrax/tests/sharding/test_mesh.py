@@ -106,9 +106,10 @@ def test_create_mesh_rejects_length_mismatch():
 
 
 def test_create_cpu_mesh_is_cpu():
-    """create_cpu_mesh returns a mesh whose devices are all CPU."""
-    mesh = create_cpu_mesh((1, 1, 4, 1, 1, 1))
+    """create_cpu_mesh returns a mesh spanning all available CPU devices."""
+    mesh = create_cpu_mesh((1, 1, -1, 1, 1, 1))
     assert isinstance(mesh, SpxMesh)
+    assert mesh.size == len(jax.devices("cpu"))
     for d in mesh.devices.flatten():
         assert d.platform == "cpu"
 

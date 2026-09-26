@@ -30,7 +30,6 @@ from __future__ import annotations
 import json
 
 import pytest
-
 from easydel.inference.typed_models import (
     FunctionCallStreamState,
     MessageStreamState,

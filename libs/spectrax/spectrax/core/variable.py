@@ -1000,6 +1000,10 @@ class Buffer(Variable):
         )
 
 
+_DEFERRED_PENDING_KEY = "deferred_pending"
+"""Metadata flag on a deferred variable that has not been materialized; it survives ``bind``."""
+
+
 class DeferredParameter(Parameter):
     """Parameter whose shape is resolved lazily during the first forward pass.
 
@@ -1064,6 +1068,7 @@ class DeferredParameter(Parameter):
             meta["sharding"] = normalize_sharding(sharding)
         if axis_names is not None:
             meta["axis_names"] = tuple(axis_names)
+        meta[_DEFERRED_PENDING_KEY] = True
         super().__init__(jnp.zeros(1, dtype=dtype), dtype=dtype, metadata=meta, ref_id=ref_id, trainable=trainable)
         self._deferred_shape_spec = tuple(shape_spec)
         self._deferred_init = init
@@ -1076,10 +1081,17 @@ class DeferredParameter(Parameter):
     def is_materialized(self) -> bool:
         """Whether this deferred parameter has been materialized.
 
+        A copy rebuilt by :func:`~spectrax.bind` (under ``jit`` / ``grad`` /
+        ``clone`` …) never runs ``__init__`` and carries no deferred
+        bookkeeping, only the stored array and the metadata. It counts as
+        materialized unless the metadata still carries the pending flag, so a
+        real array is readable while an unmaterialized placeholder still
+        refuses to be used under a transform.
+
         Returns:
             Result described by this helper.
         """
-        return getattr(self, "_deferred_materialized", False)
+        return getattr(self, "_deferred_materialized", not self.metadata.get(_DEFERRED_PENDING_KEY, False))
 
     def resolve_shape(self, shape: tuple[int, ...]) -> None:
         """Set the concrete shape.
@@ -1126,6 +1138,7 @@ class DeferredParameter(Parameter):
         arr = _initialize_value(arr, None, metadata=self.metadata, explicit_sharding="sharding" in self.metadata)
         self._raw_set(arr)
         self._deferred_materialized = True
+        self.metadata.pop(_DEFERRED_PENDING_KEY, None)
 
     @property
     def value(self) -> Array:
@@ -1152,6 +1165,7 @@ class DeferredParameter(Parameter):
             new: The new array value to store.
         """
         self._deferred_materialized = True
+        self.metadata.pop(_DEFERRED_PENDING_KEY, None)
         super(DeferredParameter, self.__class__).value.fset(self, new)
 
 
@@ -1199,6 +1213,7 @@ class DeferredBuffer(Buffer):
             meta["sharding"] = normalize_sharding(sharding)
         if axis_names is not None:
             meta["axis_names"] = tuple(axis_names)
+        meta[_DEFERRED_PENDING_KEY] = True
         super().__init__(jnp.zeros(1, dtype=dtype), dtype=dtype, kind=kind, metadata=meta, ref_id=ref_id)
         self._deferred_shape_spec = tuple(shape_spec)
         self._deferred_init = init
@@ -1211,10 +1226,17 @@ class DeferredBuffer(Buffer):
     def is_materialized(self) -> bool:
         """Whether this deferred buffer has been materialized.
 
+        A copy rebuilt by :func:`~spectrax.bind` (under ``jit`` / ``grad`` /
+        ``clone`` …) never runs ``__init__`` and carries no deferred
+        bookkeeping, only the stored array and the metadata. It counts as
+        materialized unless the metadata still carries the pending flag, so a
+        real array is readable while an unmaterialized placeholder still
+        refuses to be used under a transform.
+
         Returns:
             Result described by this helper.
         """
-        return getattr(self, "_deferred_materialized", False)
+        return getattr(self, "_deferred_materialized", not self.metadata.get(_DEFERRED_PENDING_KEY, False))
 
     def resolve_shape(self, shape: tuple[int, ...]) -> None:
         """Set the concrete shape; rank must match the original ``shape_spec``.
@@ -1254,6 +1276,7 @@ class DeferredBuffer(Buffer):
         arr = _initialize_value(arr, None, metadata=self.metadata, explicit_sharding="sharding" in self.metadata)
         self._raw_set(arr)
         self._deferred_materialized = True
+        self.metadata.pop(_DEFERRED_PENDING_KEY, None)
 
     @property
     def value(self) -> Array:
@@ -1276,6 +1299,7 @@ class DeferredBuffer(Buffer):
             new: The new array value to store.
         """
         self._deferred_materialized = True
+        self.metadata.pop(_DEFERRED_PENDING_KEY, None)
         super(DeferredBuffer, self.__class__).value.fset(self, new)
 
 

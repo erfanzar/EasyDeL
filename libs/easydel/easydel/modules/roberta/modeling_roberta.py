@@ -734,7 +734,6 @@ class RobertaOutput(spx.Module):
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             dtype=dtype,
             precision=precision,
-            param_dtype=param_dtype,
             rngs=rngs,
         )
         self.dropout = nn.Dropout(
@@ -834,7 +833,7 @@ class RobertaLayer(spx.Module):
         if self.config.add_cross_attention:
             self.crossattention = RobertaAttention(
                 config=config,
-                causal=True,
+                causal=False,
                 dtype=dtype,
                 param_dtype=param_dtype,
                 precision=precision,
@@ -876,7 +875,8 @@ class RobertaLayer(spx.Module):
             DecoderLayerOutput: Named tuple containing:
                 - hidden_states: Output hidden states of shape (batch, seq_len, hidden_dim)
                 - attention_weight: Self-attention weights if output_attentions=True
-                - cross_attention: Cross-attention output if encoder_hidden_states provided
+                - cross_attention: Cross-attention weights if encoder_hidden_states provided
+                  and output_attentions=True
                 - cache_view: Updated cache view
         """
         attention_outputs = self.attention(
@@ -902,7 +902,10 @@ class RobertaLayer(spx.Module):
                 key_value_states=encoder_hidden_states,
                 output_attentions=output_attentions,
             )
-            cross_attention = cross_attention_outputs.attention_output
+            # HF feeds the cross-attention output (not the self-attention
+            # output) into the feed-forward block.
+            attention_output = cross_attention_outputs.attention_output
+            cross_attention = cross_attention_outputs.attention_weight
 
         if self.config.use_scan_mlp:
             hidden_states = blockwise_ffn(
@@ -1019,14 +1022,15 @@ class RobertaEncoder(EasyDeLLayerStackMixin, spx.Module):
                 - past_key_values: Updated cache for next generation step
                 - hidden_states: Tuple of all layer outputs if output_hidden_states=True
                 - attentions: Tuple of attention weights if output_attentions=True
-                - cross_attentions: Tuple of cross-attention outputs if applicable
+                - cross_attentions: Tuple of cross-attention weights if output_attentions=True
+                  and encoder_hidden_states is provided
 
         Raises:
             ValueError: If head_mask has incorrect number of layers specified.
         """
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
-        all_cross_attentions = () if encoder_hidden_states is not None else None
+        all_cross_attentions = () if (output_attentions and encoder_hidden_states is not None) else None
 
         if head_mask is not None:
             if head_mask.shape[0] != (len(self.layer)):
@@ -1091,7 +1095,7 @@ class RobertaEncoder(EasyDeLLayerStackMixin, spx.Module):
                 cache=past_key_values,
             )
 
-            if encoder_hidden_states is not None:
+            if output_attentions and encoder_hidden_states is not None:
                 all_cross_attentions += (layer_outputs.cross_attention,)
 
             return hidden_states, cv, all_hidden_states, all_attentions, all_cross_attentions, i + 1
@@ -1503,11 +1507,12 @@ class RobertaModel(EasyDeLBaseModule):
         else:
             attention_mask = attention_mask.astype(jnp.bool_)
         if position_ids is None:
-            # Match HuggingFace RoBERTa's position id scheme:
-            # position_ids start at `padding_idx + 1` for non-padding tokens.
+            # Match HuggingFace RoBERTa's `create_position_ids_from_input_ids`:
+            # non-padding tokens (input_ids != padding_idx) count up from
+            # `padding_idx + 1`; padding tokens stay at `padding_idx`.
             padding_idx = getattr(self.config, "pad_token_id", 0) or 0
-            position_ids = jnp.cumsum(attention_mask.astype("i4"), axis=1) + jnp.asarray(padding_idx, dtype="i4")
-            position_ids = jnp.where(attention_mask, position_ids, jnp.asarray(padding_idx, dtype="i4"))
+            not_pad = (input_ids != padding_idx).astype("i4")
+            position_ids = jnp.cumsum(not_pad, axis=1) * not_pad + jnp.asarray(padding_idx, dtype="i4")
 
         hidden_states = self.embeddings(
             input_ids=input_ids,

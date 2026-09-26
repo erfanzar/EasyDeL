@@ -16,9 +16,8 @@ from pathlib import Path
 
 import jax
 import numpy as np
-from jax import numpy as jnp
-
 from easydel.infra.mixins.bridge import EasyBridgeMixin
+from jax import numpy as jnp
 
 
 class _ConfigStub:

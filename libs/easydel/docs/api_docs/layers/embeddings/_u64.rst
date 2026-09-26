@@ -1,0 +1,7 @@
+easydel.layers.embeddings._u64
+==============================
+
+.. automodule:: easydel.layers.embeddings._u64
+   :members:
+   :undoc-members:
+   :show-inheritance:

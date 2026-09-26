@@ -369,6 +369,14 @@ _import_structure = {
         "GlmMoeDsaForCausalLM",
         "GlmMoeDsaModel",
     ],
+    "modules.glm5_next": [
+        "Glm5NextCompositeCausalLM",
+        "Glm5NextConfig",
+        "Glm5NextForCausalLM",
+        "Glm5NextTextConfig",
+        "Glm5NextTextModel",
+        "Glm5NextVisionConfig",
+    ],
     "modules.glm4v": [
         "Glm4vConfig",
         "Glm4vForConditionalGeneration",

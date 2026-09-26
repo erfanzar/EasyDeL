@@ -768,8 +768,9 @@ class Glm4MoeLiteAttention(UnifiedAttention):
             # layernorm output, so the cached latent must match.
             mla_kwargs["keys_values"] = self.mla_kv_a_layernorm(compressed_kv)  # [bsz, seq, kv_lora_rank]
             mla_kwargs["keys_pe"] = k_pe[:, 0, :, :]  # [bsz, seq, rope_dim]
-            # Explicit softmax_scale: must use original q_head_dim, not absorbed dim
-            mla_kwargs["softmax_scale"] = (self.qk_nope_head_dim + self.qk_rope_head_dim) ** -0.5
+            # Same scale as the dense path: original q_head_dim (not the absorbed
+            # dim) with any YaRN mscale**2.
+            mla_kwargs["softmax_scale"] = self.attention_performer.softmax_scale
 
         attentions = self.attention_performer.forward(
             query_states=query_states,
@@ -1389,6 +1390,7 @@ class Glm4MoeLiteForCausalLM(BaseCausalLMModule[Glm4MoeLiteModel, Glm4MoeLiteCon
         hbm_utilization: float = 0.9,
         dtype: jnp.dtype | None = None,
         num_hidden_layers_override: int | None = None,
+        max_cache_tokens: int | None = None,
     ):
         """Create the MLA ragged cache using GLM4-MoE-Lite's compressed KV width.
 
@@ -1405,6 +1407,7 @@ class Glm4MoeLiteForCausalLM(BaseCausalLMModule[Glm4MoeLiteModel, Glm4MoeLiteCon
             num_hidden_layers_override: Optional override for the layer
                 count, useful when fewer layers are materialised on this
                 shard than the config declares.
+            max_cache_tokens: Optional ceiling on the total page-pool token capacity.
 
         Returns:
             An :class:`MLARaggedPagesCacheConfig` ready to be allocated.
@@ -1430,6 +1433,7 @@ class Glm4MoeLiteForCausalLM(BaseCausalLMModule[Glm4MoeLiteModel, Glm4MoeLiteCon
             qk_rope_head_dim=self.config.qk_rope_head_dim,
             hbm_utilization=hbm_utilization,
             page_size=page_size,
+            max_cache_tokens=max_cache_tokens,
         )
 
 

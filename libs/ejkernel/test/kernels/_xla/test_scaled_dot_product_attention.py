@@ -16,7 +16,6 @@
 
 import jax
 import jax.numpy as jnp
-
 from ejkernel.kernels._xla.scaled_dot_product_attention import scaled_dot_product_attention
 
 
@@ -44,7 +43,8 @@ def _naive_sdpa(
 
     if sliding_window is not None:
         if isinstance(sliding_window, int):
-            left, right = sliding_window, sliding_window
+            # int ``W`` = HF window size (query plus ``W - 1`` neighbours).
+            left, right = sliding_window - 1, sliding_window - 1
         else:
             left, right = sliding_window
         q_pos = jnp.arange(tq)[:, None]

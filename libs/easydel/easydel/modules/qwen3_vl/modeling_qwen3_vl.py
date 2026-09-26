@@ -406,6 +406,7 @@ class Qwen3VLVisionPatchEmbed(spx.Module):
             use_bias=True,
             dtype=dtype,
             rngs=rngs,
+            precision=precision,
         )
 
     def forward(self, hidden_states: Array) -> Array:
@@ -2722,17 +2723,6 @@ class Qwen3VLForConditionalGeneration(BaseVisionLanguageModule[Qwen3VLModel, Qwe
             rope_deltas=getattr(outputs, "rope_deltas", None),
             image_hidden_states=None,
         )
-
-    def apply_lm_head(self, hidden_states: Array) -> Array:
-        """Apply the language modeling head to hidden states.
-
-        Args:
-            hidden_states (Array): Hidden states from the model.
-
-        Returns:
-            Array: Logits over the vocabulary.
-        """
-        return self.lm_head(hidden_states)
 
     def get_vision_tower(self) -> spx.Module:
         """Get the vision tower component.

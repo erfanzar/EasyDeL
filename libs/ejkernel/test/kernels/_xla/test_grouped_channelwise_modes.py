@@ -68,10 +68,12 @@ def test_ad_contract(weight_bits, bits):
     s = rng.uniform(0.01, 0.3, (3, 1, 4)).astype(np.float32)
     sizes = np.array([2, 0, 3], np.int32)
     codes = jnp.asarray(c, jnp.int4 if weight_bits == 4 else jnp.int8)
+
     def fn(x, s):
         return grouped_matmul_channelwise(
             x, codes, s, jnp.asarray(sizes), activation_bits=bits, preferred_element_type=jnp.float32
         )
+
     dx = rng.normal(size=x.shape).astype(np.float32)
     ds = rng.normal(size=s.shape).astype(np.float32)
     _, tangent = jax.jit(lambda x, s, dx, ds: jax.jvp(fn, (x, s), (dx, ds)))(

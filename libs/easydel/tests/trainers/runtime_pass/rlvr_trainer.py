@@ -29,9 +29,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from datasets import load_dataset
-
 import easydel as ed
+from datasets import load_dataset
 
 if __package__ in {None, ""}:
     sys.path.append(str(Path(__file__).resolve().parent.parent))

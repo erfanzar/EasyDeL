@@ -61,20 +61,20 @@ Do not add a side registry or bypass `BaseTrainerProtocol`.
 
 ## Verification
 
-Run the affected trainer's own CPU smoke tests:
+Run the affected trainer's own smoke tests on the accelerator (GPU: `JAX_PLATFORMS=cuda,cpu JAX_PLATFORM_NAME=gpu`).
+A CPU run of a trainer test is not validation; without an accelerator, report the change as unverified on hardware:
 
 ```bash
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
-XLA_FLAGS=--xla_force_host_platform_device_count=8 \
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
   uv run pytest libs/easydel/tests/trainers/test_<name>.py
 ```
 
 If you changed `TrainingArguments` or the trainer registry, also run:
 
 ```bash
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
-XLA_FLAGS=--xla_force_host_platform_device_count=8 \
-  uv run pytest libs/easydel/tests/trainers/test_training_arguments.py
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
+  uv run pytest libs/easydel/tests/trainers/test_training_arguments_save_load_roundtrip.py \
+    libs/easydel/tests/trainers/test_training_arguments_tx_template.py
 ```
 
 Do not claim training readiness from constructor-only tests. A full training claim needs a short real run or a clear

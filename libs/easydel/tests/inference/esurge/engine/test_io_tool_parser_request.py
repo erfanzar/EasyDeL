@@ -175,15 +175,17 @@ def test_run_output_parsers_uses_request_tools_for_batch_tool_parsing():
     pipeline = _make_pipeline()
     parser = _RecordingToolParser()
     request = _make_request()
-    rd = RequestRecord(**{
-        "delegating_parser": DelegatingParser(
-            reasoning_parser=None,
-            tool_parser=parser,
-            tool_request=request,
-        ),
-        "parser_previous_text": "",
-        "parser_previous_token_ids": [],
-    })
+    rd = RequestRecord(
+        **{
+            "delegating_parser": DelegatingParser(
+                reasoning_parser=None,
+                tool_parser=parser,
+                tool_request=request,
+            ),
+            "parser_previous_text": "",
+            "parser_previous_token_ids": [],
+        }
+    )
 
     result = pipeline._run_output_parsers(
         rd=rd,
@@ -203,15 +205,17 @@ def test_run_output_parsers_uses_request_tools_for_streaming_tool_parsing():
     pipeline = _make_pipeline()
     parser = _RecordingToolParser()
     request = _make_request()
-    rd = RequestRecord(**{
-        "delegating_parser": DelegatingParser(
-            reasoning_parser=None,
-            tool_parser=parser,
-            tool_request=request,
-        ),
-        "parser_previous_text": "",
-        "parser_previous_token_ids": [],
-    })
+    rd = RequestRecord(
+        **{
+            "delegating_parser": DelegatingParser(
+                reasoning_parser=None,
+                tool_parser=parser,
+                tool_request=request,
+            ),
+            "parser_previous_text": "",
+            "parser_previous_token_ids": [],
+        }
+    )
 
     result = pipeline._run_output_parsers(
         rd=rd,
@@ -337,11 +341,13 @@ def test_build_tool_parser_request_normalizes_nested_function():
 def test_run_output_parsers_no_delegating_parser():
     """When rd has no delegating_parser, should return passthrough result."""
     pipeline = _make_pipeline()
-    rd = RequestRecord(**{
-        "delegating_parser": None,
-        "parser_previous_text": "",
-        "parser_previous_token_ids": [],
-    })
+    rd = RequestRecord(
+        **{
+            "delegating_parser": None,
+            "parser_previous_text": "",
+            "parser_previous_token_ids": [],
+        }
+    )
     result = pipeline._run_output_parsers(
         rd=rd,
         accumulated_text="hello world",

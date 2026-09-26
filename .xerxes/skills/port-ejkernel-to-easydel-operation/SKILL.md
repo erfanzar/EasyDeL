@@ -54,7 +54,7 @@ Before editing, read the concrete source and call graph:
 - focused ejkernel and EasyDeL tests for the affected operation
 
 For target-hardware performance claims, also use `optimize-ejkernel-kernel` and read its profiling/LLO references. CPU
-checks are not TPU or GPU performance evidence.
+runs are never correctness or performance evidence.
 
 ## Correct EasyDeL Adapter Shape
 
@@ -184,28 +184,27 @@ Add or update tests that directly validate:
 - cache-backed operations preserve cache metadata and fallback behavior
 - model/runtime call sites use the adapter or registry path after the port
 
-For CPU-safe adapter work, host tests may validate structure, registry wiring, requirements, metadata mapping, and
-XLA/reference math.
+Adapter tests that execute numerics (XLA/reference math included) are computation tests and run on the accelerator;
+only pure structure checks with no array computation (registry wiring, requirements, metadata mapping) may use the CPU
+trio. For TPU Pallas or GPU/Triton behavior, run target-hardware smoke/parity tests. Never present a CPU run as
+correctness, lowering, or performance evidence; without an accelerator, report the port as unverified on hardware.
 
-For TPU Pallas or GPU/Triton behavior, run target-hardware smoke/parity tests. Do not present CPU tests as TPU/GPU
-lowering or performance evidence.
-
-Useful focused commands, adjusted to the touched files:
+Useful focused commands, adjusted to the touched files (GPU: `JAX_PLATFORMS=cuda,cpu JAX_PLATFORM_NAME=gpu`):
 
 ```bash
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
-  uv run pytest libs/easydel/test/<focused-easydel-test>.py
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
+  uv run pytest libs/easydel/tests/<focused-easydel-test>.py
 ```
 
 ```bash
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
   uv run pytest libs/ejkernel/test/<focused-ejkernel-test>.py
 ```
 
 For TPU Pallas behavior:
 
 ```bash
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu \
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
   uv run pytest libs/ejkernel/test/kernels/_pallas/tpu/<focused-test>.py
 ```
 

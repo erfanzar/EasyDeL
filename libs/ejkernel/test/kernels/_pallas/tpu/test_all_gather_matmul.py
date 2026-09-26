@@ -18,11 +18,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax import shard_map
-from jax.sharding import Mesh, PartitionSpec
-
 from ejkernel.kernels._pallas.tpu.all_gather_matmul import all_gather_matmul as all_gather_matmul_pallas
 from ejkernel.kernels._xla.all_gather_matmul import all_gather_matmul as all_gather_matmul_xla
+from jax import shard_map
+from jax.sharding import Mesh, PartitionSpec
 
 
 def _has_tpu() -> bool:

@@ -19,7 +19,6 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import pytest
-
 from ejkernel.quantization import prepack_quantized_weights
 
 from ._helpers import (

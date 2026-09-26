@@ -37,7 +37,7 @@ Key Functions:
 
     Utilities:
         - get_nf4(): Get NF4 lookup table
-        - nf4xf32_to_f32(): Polynomial approximation for NF4 dequantization
+        - nf4xf32_to_f32(): Exact NF4 codebook dequantization
         - i8tou8, u4toi4, i4tou4: Bit conversion utilities
 
 Environment Variables:
@@ -136,6 +136,26 @@ def nf4_use_kernel(value: bool):
     _USE_KERNEL_ON_TPU = old
 
 
+_NF4_CODEBOOK = (
+    -1.0,
+    -0.6961928009986877,
+    -0.5250730514526367,
+    -0.39491748809814453,
+    -0.28444138169288635,
+    -0.18477343022823334,
+    -0.09105003625154495,
+    0.0,
+    0.07958029955625534,
+    0.16093020141124725,
+    0.24611230194568634,
+    0.33791524171829224,
+    0.44070982933044434,
+    0.5626170039176941,
+    0.7229568362236023,
+    1.0,
+)
+
+
 def get_nf4():
     """
     Get the NF4 (4-bit NormalFloat) lookup table.
@@ -156,50 +176,30 @@ def get_nf4():
         network weights which tend to follow Gaussian distributions.
     """
 
-    return jnp.asarray(
-        [
-            -1.0,
-            -0.6961928009986877,
-            -0.5250730514526367,
-            -0.39491748809814453,
-            -0.28444138169288635,
-            -0.18477343022823334,
-            -0.09105003625154495,
-            0.0,
-            0.07958029955625534,
-            0.16093020141124725,
-            0.24611230194568634,
-            0.33791524171829224,
-            0.44070982933044434,
-            0.5626170039176941,
-            0.7229568362236023,
-            1.0,
-        ],
-    )
+    return jnp.asarray(_NF4_CODEBOOK, dtype=jnp.float32)
 
 
 def nf4xf32_to_f32(x):
     """
-    Fast polynomial approximation for NF4 dequantization.
+    Exact NF4 dequantization (code index -> codebook value).
 
-    This is significantly faster than table lookups and provides
-    accurate approximation of the NF4 codebook values.
+    Maps each code through the same codebook the quantizer rounds to
+    (:func:`get_nf4`), so quantize/dequantize round-trips are exact at the
+    codebook points (code 7 is exactly ``0.0``). Implemented as a chain of
+    elementwise selects against scalar constants rather than a table gather,
+    so it lowers inside Pallas kernels and stays a pure VPU op.
 
     Args:
             x: Integer array (0-15) representing NF4 quantized values
 
     Returns:
-            Float32 array with approximated NF4 values
+            Float32 array with the NF4 codebook values
     """
-    x = x.astype(jnp.float32)
-    return (
-        x
-        * (
-            x * (x * (x * (1.82943132356953e-5 * x - 0.00068587779130373) + 0.0100420261313669) - 0.0722703570217226)
-            + 0.346075459755188
-        )
-        - 0.994166218659335
-    )
+    x = x.astype(jnp.int32)
+    out = jnp.full(x.shape, _NF4_CODEBOOK[0], dtype=jnp.float32)
+    for code in range(1, len(_NF4_CODEBOOK)):
+        out = jnp.where(x == code, jnp.float32(_NF4_CODEBOOK[code]), out)
+    return out
 
 
 sr = jax.lax.shift_right_logical  # Logical right shift (zero-fill)
@@ -397,7 +397,7 @@ def single_dequantize_nf4(packed_values, absmax, block_size):
 
     This function reverses the NF4 quantization by:
     1. Unpacking two 4-bit values from each uint8 byte
-    2. Converting 4-bit indices to NF4 codebook values using polynomial approximation
+    2. Converting 4-bit indices to NF4 codebook values (exact codebook lookup)
     3. Scaling by per-block absmax values
     4. Flattening back to original feature dimension
 
@@ -419,8 +419,8 @@ def single_dequantize_nf4(packed_values, absmax, block_size):
         >>> reconstructed.shape  # Original shape restored
 
     Note:
-        Uses a polynomial approximation (nf4xf32_to_f32) instead of table lookup
-        for faster dequantization on accelerators.
+        Uses :func:`nf4xf32_to_f32` (select chain over the exact codebook)
+        instead of a table gather.
     """
     high = (packed_values >> 4) & 0xF  # (..., num_blocks, block_size // 2)
     low = packed_values & 0xF  # (..., num_blocks, block_size // 2)

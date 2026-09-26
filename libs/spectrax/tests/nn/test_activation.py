@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import jax.numpy as jnp
-
 from spectrax.functional import activation as F
 from spectrax.nn.activation import GELU, ReLU, Sigmoid, SiLU, Tanh
 

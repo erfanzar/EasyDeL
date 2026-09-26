@@ -571,6 +571,9 @@ def run(
 
     sid = submission_id or generate_submission_id(entrypoint)
     metadata = {"cwd": os.getcwd(), "user": getpass.getuser(), **git_metadata()}
+    # What was actually packaged ("" = --no-working-dir): the watcher re-packages
+    # this on resubmission, since the uploaded gcs:// package dies with the head.
+    metadata["working_dir"] = runtime_env.get("working_dir", "")
     if cluster:
         metadata["cluster"] = cluster
     if restartable:

@@ -35,7 +35,6 @@ if os.path.isdir("/dev/shm/mdl"):
 
 import jax
 import jax.numpy as jnp
-
 import spectrax as spx
 from spectrax.sharding import logical_axis_rules
 

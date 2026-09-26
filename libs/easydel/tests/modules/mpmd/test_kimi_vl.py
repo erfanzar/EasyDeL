@@ -14,12 +14,12 @@
 
 """Tests for Kimi-VL model."""
 
+import easydel as ed
 import numpy as np
 import pytest
 import transformers
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
-import easydel as ed
 from tests.modules.mpmd._scheduler_utils import GENERATION_SCHEDULE_KIND, LOSS_SCHEDULE_KINDS
 from tests.modules.test_utils import CausalLMTester, VisionLanguageTester
 

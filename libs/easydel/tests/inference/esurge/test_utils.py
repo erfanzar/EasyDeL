@@ -33,7 +33,6 @@ from types import SimpleNamespace
 
 import jax.numpy as jnp
 import pytest
-
 from easydel.inference.esurge.utils import (
     ConstantList,
     _rope_scaling_uses_mrope,

@@ -17,8 +17,6 @@
 import typing
 
 import pytest
-from jax import numpy as jnp
-
 from easydel.inference.esurge.utils import (
     ConstantList,
     _get_text_config,
@@ -34,6 +32,7 @@ from easydel.inference.esurge.utils import (
     round_up,
     truncate_tokens,
 )
+from jax import numpy as jnp
 
 
 class TestConstantList:

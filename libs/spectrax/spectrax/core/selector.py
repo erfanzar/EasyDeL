@@ -27,7 +27,7 @@ from typing import TypeAlias
 
 from ._typing import Path
 from .errors import SelectorError
-from .module import Module
+from .module import Module, _graph_epoch
 from .paths import path_to_str, str_to_path
 from .state import State, _nested_set
 from .variable import Variable
@@ -78,8 +78,8 @@ class Selector:
     """Composable filter over a module graph.
 
     Fields are combined with AND semantics. Use ``|`` to construct a
-    union and ``~`` to invert the *variable* predicate (module
-    predicates are left intact). Instances are frozen dataclasses; all
+    union and ``~`` for the complement (every variable the selector
+    does not pick, honouring module filters). Instances are frozen dataclasses; all
     builder methods return fresh selectors.
 
     Attributes:
@@ -308,7 +308,10 @@ class Selector:
         return self & ~other
 
     def __invert__(self) -> Selector:
-        """Build a selector whose variable match is inverted.
+        """Build the complement selector: every variable this one does not match.
+
+        Module filters are honoured by :meth:`apply`, so ``~at_instances_of(T)``
+        selects the variables *outside* every ``T`` subtree.
 
         Returns:
             Result described by this helper.
@@ -430,8 +433,17 @@ class Selector:
 
         has_module_filter = bool(self.module_types) or bool(self.exclude_module_types) or bool(self.module_where)
 
+        if self.invert and has_module_filter:
+            # ``~`` is a set complement over the whole graph. A module filter
+            # decides which subtrees are admitted at all, so flipping only the
+            # variable predicate would return the inverted variables *inside*
+            # the admitted subtrees (usually nothing) instead of everything
+            # outside them.
+            matched_ids = {v.ref_id for _, v in replace(self, invert=False).apply(module)}
+            return [(p, v) for p, v in select().apply(module) if v.ref_id not in matched_ids]
+
         cache = module._spx_export_cache
-        if not has_module_filter and cache is not None:
+        if not has_module_filter and cache is not None and cache[0] == _graph_epoch():
             out: list[tuple[str, Variable]] = []
             seen_refs: set[int] = set()
             for _kind, path_str, var in cache[2]:

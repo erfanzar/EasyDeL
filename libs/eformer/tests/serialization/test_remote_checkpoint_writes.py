@@ -16,7 +16,6 @@ import json
 
 import numpy as np
 import pytest
-
 from eformer.serialization import async_manager as async_mod
 from eformer.serialization import checkpointer as checkpointer_mod
 from eformer.serialization import serialization as serialization_mod

@@ -14,20 +14,23 @@ def test_bf16_half_ties_round_to_even(grouped):
     x = jnp.asarray(h, jnp.bfloat16)
     q = jnp.eye(32, dtype=jnp.int4)
     if grouped:
+
         def f(a):
             return grouped_matmul_channelwise(
-                    a,
-                    q[None],
-                    jnp.ones((1, 1, 32)),
-                    jnp.array([8], jnp.int32),
-                    activation_bits=4,
-                    preferred_element_type=jnp.float32,
-                )
+                a,
+                q[None],
+                jnp.ones((1, 1, 32)),
+                jnp.array([8], jnp.int32),
+                activation_bits=4,
+                preferred_element_type=jnp.float32,
+            )
     else:
+
         def f(a):
             return channelwise_quantized_matmul(
-                    a, q, jnp.ones((1, 32)), quantize_activations=True, activation_bits=4, prefill_threshold=0
-                )
+                a, q, jnp.ones((1, 32)), quantize_activations=True, activation_bits=4, prefill_threshold=0
+            )
+
     got = np.asarray(jax.jit(f)(x)).astype(np.float32)
     want = np.zeros_like(h)
     want[:, :5] = np.array([7, 4, -4, -7, 0], np.float32) * (3.515625 / 7)

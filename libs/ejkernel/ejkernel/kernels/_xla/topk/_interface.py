@@ -131,12 +131,17 @@ def topk(
 
     width = moved.shape[-1]
     ks = jnp.asarray(k)
-    # A per-row k has one axis per leading dim of `moved`; give it the trailing
-    # singleton so it broadcasts against the reduction axis. Keying off ndim
-    # rather than the trailing extent matters when there is exactly one row,
-    # where shape (1,) is otherwise indistinguishable from an already-expanded k.
-    if ks.ndim == moved.ndim - 1:
-        ks = ks[..., None]
+    # Normalise k to one entry per row with a trailing singleton, i.e. shape
+    # ``moved.shape[:-1] + (1,)``, so it broadcasts against the reduction axis
+    # and the bisection carry below keeps a fixed shape (a scalar k on a rank>=2
+    # operand would otherwise grow the fori_loop carry from () to [rows, 1]).
+    # Keying off ndim rather than the trailing extent matters when there is
+    # exactly one row, where shape (1,) is otherwise indistinguishable from an
+    # already-expanded k.
+    if ks.ndim == moved.ndim:
+        ks = jnp.broadcast_to(ks, (*moved.shape[:-1], 1))
+    else:
+        ks = jnp.broadcast_to(ks, moved.shape[:-1])[..., None]
     ks = jnp.clip(ks, 0, width)
 
     keys = _sortable_key(moved)
@@ -148,7 +153,7 @@ def topk(
     def _step(_, bounds):
         lo_i, hi_i = bounds
         mid = lo_i + ((hi_i - lo_i) >> jnp.uint32(1))
-        count = (keys >= mid[..., None] if mid.ndim == keys.ndim - 1 else keys >= mid).sum(-1, keepdims=True)
+        count = (keys >= mid).sum(-1, keepdims=True)
         feasible = count >= ks
         return jnp.where(feasible, mid, lo_i), jnp.where(feasible, hi_i, mid)
 

@@ -325,8 +325,7 @@ class RemoteEngineHandle:
         if spec is None or (not spec.tokenizer_source and not tokenizer_source):
             self._channel.close()
             raise RequestPlaneError(
-                "engine owner returned no usable EngineSpec (missing tokenizer source); "
-                "cannot bootstrap a remote handle"
+                "engine owner returned no usable EngineSpec (missing tokenizer source); cannot bootstrap a remote handle"
             )
         self._spec = spec
 
@@ -610,11 +609,7 @@ class RemoteEngineHandle:
                             delta_seq=output.delta_seq,
                         )
                 if snapshot is not None:
-                    if (
-                        not snapshot.finished
-                        and snapshot.num_generated_tokens == 0
-                        and not snapshot.delta_text
-                    ):
+                    if not snapshot.finished and snapshot.num_generated_tokens == 0 and not snapshot.delta_text:
                         continue
                     yield snapshot
                     if snapshot.finished:

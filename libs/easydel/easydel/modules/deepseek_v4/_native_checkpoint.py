@@ -105,22 +105,23 @@ _LAYER_RE = re.compile(r"^layers\.(\d+)\.")
 
 
 def native_key_to_easydel(key: str) -> str | None:
-    """Rewrite one native DeepSeek-V4 checkpoint key to its EasyDeL name.
+    """Normalize native or Hugging Face DeepSeek-V4 checkpoint keys.
 
     Args:
-        key: Key as published in the checkpoint, e.g.
-            ``layers.3.attn.wq_a.weight`` or
-            ``layers.3.ffn.experts.17.w1.weight``.
+        key: Native checkpoint key, e.g. ``layers.3.attn.wq_a.weight``,
+            or an HF/already-normalized key such as
+            ``model.layers.3.self_attn.q_a_proj.weight``.
 
     Returns:
-        The EasyDeL parameter name, or ``None`` for tensors the runtime does
-        not own (the ``mtp.*`` multi-token-prediction stack, which is a
-        separate optional head and is not part of the causal-LM parameter
-        tree). Returning ``None`` rather than raising keeps the loader's
-        "unused checkpoint key" reporting meaningful.
+        The EasyDeL parameter name, or ``None`` for unrecognized native keys
+        and the unowned ``mtp.*``/``model.mtp.*`` multi-token-prediction stack.
+        HF/already-normalized ``model.*`` and ``lm_head.*`` keys pass through
+        unchanged so importing an HF state dict does not discard its weights.
     """
-    if key.startswith("mtp."):
+    if key.startswith(("mtp.", "model.mtp.")):
         return None
+    if key.startswith(("model.", "lm_head.")):
+        return key
     if key in ROOT_ALIASES:
         return ROOT_ALIASES[key]
 

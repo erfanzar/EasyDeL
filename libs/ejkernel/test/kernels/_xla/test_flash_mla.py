@@ -18,7 +18,6 @@ import math
 
 import jax
 import jax.numpy as jnp
-
 from ejkernel.kernels._xla.flash_mla import flash_mla
 
 

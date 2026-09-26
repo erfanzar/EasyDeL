@@ -594,23 +594,25 @@ class DbrxExpertGLU(spx.Module):
         expert_v1 = checkpoint_name(self.v1.value.reshape(expert_shape)[expert_idx], name="moe_expert_v1")
         expert_w2 = checkpoint_name(self.w2.value.reshape(expert_shape)[expert_idx], name="moe_expert_w2")
 
-        # Match HF DBRX expert projection orientation:
-        # gate/up use raw expert matrices and down uses transposed expert_w2.
+        # DBRX stores every expert matrix as ``[ffn_hidden_size, d_model]``:
+        # gate/up project with the transpose, down with the matrix itself
+        # (original DBRX and transformers>=5.17; 5.13 had these flipped, which
+        # only type-checks when ffn_hidden_size == d_model).
         x1 = jnp.matmul(
             x,
-            jnp.expand_dims(expert_w1, 0),
+            jnp.expand_dims(expert_w1.T, 0),
             precision=self.precision,
         )
         x2 = jnp.matmul(
             x,
-            jnp.expand_dims(expert_v1, 0),
+            jnp.expand_dims(expert_v1.T, 0),
             precision=self.precision,
         )
         x1 = self.activation_fn(x1)
         x1 = x1 * x2
         x1 = jnp.matmul(
             x1,
-            jnp.expand_dims(expert_w2.T, 0),
+            jnp.expand_dims(expert_w2, 0),
             precision=self.precision,
         )
         return x1

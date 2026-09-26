@@ -23,6 +23,8 @@ those knobs (head splits for nope/rope, expert counts, group routing,
 auxiliary loss coefficients, optional YaRN-style RoPE scaling).
 """
 
+import typing as tp
+
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.factory import register_config
@@ -118,6 +120,9 @@ class DeepseekV2Config(EasyDeLBaseConfig):
             Whether to use attention bias.
         attention_dropout (`float`, *optional*, defaults to 0.0):
             The dropout ratio for the attention probabilities.
+        rope_interleave (`bool`, *optional*, defaults to `True`):
+            Whether the RoPE slice pairs channels ``(2i, 2i+1)`` as DeepSeek checkpoints do,
+            rather than the split-half ``(i, i + d/2)`` pairing.
         gradient_checkpointing (`str`, *optional*, defaults to `"nothing_saveable"`):
             The gradient checkpointing configuration.
         use_scan_mlp (`bool`, *optional*, defaults to `False`):
@@ -131,6 +136,8 @@ class DeepseekV2Config(EasyDeLBaseConfig):
     """
 
     model_type: str = "deepseek_v2"
+    # Native checkpoints saved before `rope_interleave` existed ran split-half RoPE.
+    _legacy_native_defaults: tp.ClassVar[dict[str, tp.Any]] = {"rope_interleave": False}
 
     def __setattr__(self, key, value):
         """Normalize ``rope_scaling`` assignments before storing them.
@@ -194,6 +201,7 @@ class DeepseekV2Config(EasyDeLBaseConfig):
         rope_theta: float = 10000.0,
         attention_bias: bool = False,
         attention_dropout: float = 0.0,
+        rope_interleave: bool = True,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         use_scan_mlp: bool = False,
         scan_mlp_chunk_size: int = 1024,
@@ -243,6 +251,7 @@ class DeepseekV2Config(EasyDeLBaseConfig):
           tie_word_embeddings (bool, optional): Whether to tie input/output embeddings. Defaults to False.
           rope_theta (float, optional): Base value for RoPE. Defaults to 10000.0.
           attention_bias (bool, optional): Whether to use bias in attention. Defaults to False.
+          rope_interleave (bool, optional): Interleaved (2i, 2i+1) RoPE pairing. Defaults to True.
           attention_dropout (float, optional): Dropout rate for attention. Defaults to 0.0.
           gradient_checkpointing (EasyDeLGradientCheckPointers, optional):
             Checkpointing strategy. Defaults to EasyDeLGradientCheckPointers.NONE.
@@ -293,6 +302,7 @@ class DeepseekV2Config(EasyDeLBaseConfig):
         self.rope_scaling = rope_scaling
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
+        self.rope_interleave = rope_interleave
         self.gradient_checkpointing = gradient_checkpointing
         self.layer_types = layer_types
         if self.layer_types is None:

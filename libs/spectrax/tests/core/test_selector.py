@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 import pytest
-
 from spectrax.core.errors import SelectorError
 from spectrax.core.selector import Selector, as_selector, select
 from spectrax.core.state import State
@@ -257,3 +256,36 @@ def test_partition_state_returns_two_states(fixture):
     _, state = export(fixture.model)
     matched, rest = select().variables("parameters").partition_state(fixture.model, state)
     assert isinstance(matched, State) and isinstance(rest, State)
+
+
+def test_invert_module_type_selector_is_set_complement(fixture):
+    """``~at_instances_of(T)`` picks every variable outside ``T`` subtrees."""
+    all_paths = {p for p, _ in select().apply(fixture.model)}
+    linear = {p for p, _ in select().at_instances_of(Linear).apply(fixture.model)}
+    inverted = {p for p, _ in (~select().at_instances_of(Linear)).apply(fixture.model)}
+    assert linear and all(p.startswith("fc.") for p in linear)
+    assert inverted == all_paths - linear
+    assert inverted and not any(p.startswith("fc.") for p in inverted)
+
+
+def test_subtract_module_type_selector(fixture):
+    """``everything - at_instances_of(T)`` removes exactly the ``T`` subtree."""
+    all_paths = {p for p, _ in select().apply(fixture.model)}
+    linear = {p for p, _ in select().at_instances_of(Linear).apply(fixture.model)}
+    diff = {p for p, _ in (select() - select().at_instances_of(Linear)).apply(fixture.model)}
+    assert diff == all_paths - linear
+    bn_minus_linear = select().at_instances_of(BatchNorm1d) - select().at_instances_of(Linear)
+    bn = {p for p, _ in select().at_instances_of(BatchNorm1d).apply(fixture.model)}
+    assert {p for p, _ in bn_minus_linear.apply(fixture.model)} == bn
+
+
+def test_apply_sees_variable_added_after_previous_export(fixture):
+    """A stale root export cache must not hide a variable added to a child later."""
+    from spectrax.core.graph import export
+
+    export(fixture.model)
+    before = {p for p, _ in select().variables("buffers").apply(fixture.model)}
+    fixture.model.fc.extra = Buffer(jnp.zeros(2))
+    after = {p for p, _ in select().variables("buffers").apply(fixture.model)}
+    assert "fc.extra" in after
+    assert after == before | {"fc.extra"}

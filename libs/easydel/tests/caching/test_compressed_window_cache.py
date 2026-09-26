@@ -16,9 +16,8 @@
 
 import jax.numpy as jnp
 import pytest
-from spectrax import PartitionAxis
-
 from easydel.caching import CompressedWindowCache, CompressedWindowCacheConfig
+from spectrax import PartitionAxis
 
 LAYER_TYPES = (
     "sliding_attention",

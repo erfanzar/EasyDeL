@@ -9,3 +9,4 @@ easydel.inference.esurge.runners.executors package
    model_executor
    pipeline_microbatch
    sampler_executor
+   state_packing

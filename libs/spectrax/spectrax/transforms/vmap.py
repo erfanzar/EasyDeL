@@ -76,6 +76,24 @@ def _specialized_in_axes(in_axes: object, nargs: int, locator: int) -> tuple[obj
     return axes[:locator] + axes[locator + 1 :]
 
 
+def _kwargs_in_axes(kwargs: dict[str, object]) -> dict[str, object]:
+    """Return the ``in_axes`` prefix for keyword arguments.
+
+    Matches :func:`jax.vmap`, which always maps keyword arguments over
+    their leading axis: every array leaf with at least one dimension is
+    mapped over axis ``0``. Leaves that have no axis to map (Python
+    scalars, flags, ``None`` placeholders left by module stripping,
+    0-d arrays) are broadcast instead of raising.
+
+    Args:
+        kwargs: Keyword arguments with module values already stripped.
+
+    Returns:
+        A pytree prefix of ``kwargs`` with ``0`` / ``None`` axis entries.
+    """
+    return jax.tree_util.tree_map(lambda leaf: 0 if getattr(leaf, "ndim", 0) >= 1 else None, kwargs)
+
+
 def vmap(
     fn: F | None = None,
     *,
@@ -122,7 +140,9 @@ def vmap(
             collections may be written back after the transform.
         in_axes: Forwarded to :func:`jax.vmap`; refers to non-module
             argument positions only. Modules are always handled with
-            ``in_axes=None``.
+            ``in_axes=None``. As in :func:`jax.vmap`, keyword arguments
+            are mapped over their leading axis (array leaves with at
+            least one dimension); axis-less leaves are broadcast.
         out_axes: Forwarded to :func:`jax.vmap`; the captured
             ``new_states`` are independently mapped with
             ``out_axes=None``.
@@ -201,7 +221,7 @@ def vmap(
             apply_mutations([ref], [new_state], mutable_sel)
             return out
         pure = make_pure_readonly(fn, refs) if mutable_sel is None else make_pure(fn, refs)
-        pure_in_axes = (None, in_axes, None)
+        pure_in_axes = (None, tuple(in_axes) if isinstance(in_axes, list) else in_axes, _kwargs_in_axes(stripped_kwargs))
         states_in = tuple(r.state for r in refs)
         if mutable_sel is None:
             vmapped = jax.vmap(

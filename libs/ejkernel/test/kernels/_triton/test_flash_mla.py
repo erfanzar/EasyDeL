@@ -15,7 +15,6 @@
 import jax
 import jax.numpy as jnp
 import pytest
-
 from ejkernel.kernels._triton.flash_mla._interface import flash_mla
 
 pytestmark = pytest.mark.skipif(jax.devices()[0].platform != "gpu", reason="Triton tests require GPU backend")

@@ -23,7 +23,6 @@ Run from the repo root::
 from __future__ import annotations
 
 import jax
-
 import spectrax as spx
 from spectrax.sharding import current_axis_rules, get_partition_spec, logical_axis_rules
 

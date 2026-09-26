@@ -26,7 +26,6 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 import jax
 import numpy as np
 from jax.sharding import Mesh, PartitionSpec
-
 from spectrax.runtime.types import MpMdMesh
 
 

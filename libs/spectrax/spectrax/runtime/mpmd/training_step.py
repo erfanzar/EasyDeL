@@ -21,6 +21,14 @@ tied-embed model is the canonical example), ranks 1-7 can run their
 stage-local optimizer update **in parallel with rank-0's backward
 tail**, instead of all eight ranks waiting at a global barrier.
 
+.. note::
+    The APPLY unit currently only records its rank; the ``apply_fn`` calls
+    run inside the dispatch right after the final gradient fold. Until then
+    parameter grads live in stage-local/const accumulators and pending
+    reducer futures, so applying at unit time would hand ``apply_fn`` empty
+    or partial grads. Restoring the overlap needs a per-rank fold of those
+    accumulators before each rank's apply.
+
 Design notes (kept here so future readers don't have to reverse-engineer
 the runtime):
 

@@ -9,9 +9,8 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import jax
-from flax import nnx
-
 import spectrax as spx
+from flax import nnx
 
 from .. import models
 

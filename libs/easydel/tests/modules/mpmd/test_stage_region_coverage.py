@@ -6,20 +6,19 @@ import ast
 from dataclasses import dataclass
 from pathlib import Path
 
+import easydel as ed
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 import spectrax as spx
+from easydel.infra.base_config import EasyDeLBaseConfig
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.modules.llama.llama_configuration import LlamaConfig
 from jax.sharding import Mesh
 from spectrax.runtime.mpmd import sxjit
 from spectrax.runtime.mpmd.markers import stage_region_specs
 from spectrax.runtime.types import MpMdMesh
-
-import easydel as ed
-from easydel.infra.base_config import EasyDeLBaseConfig
-from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.modules.llama.llama_configuration import LlamaConfig
 
 _SPMD_ROOT = Path(__file__).resolve().parents[1] / "spmd"
 _DEFAULT_TASK = "CAUSAL_LM"

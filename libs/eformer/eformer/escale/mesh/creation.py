@@ -457,7 +457,7 @@ def create_mesh(
             total_devices = len(devices)
             axis_dims = np.arange(total_devices).reshape(axis_dims).shape
             return jax.make_mesh(
-                axis_shapes=axis_dims,
+                axis_dims,
                 axis_names=axis_names,
                 axis_types=axis_types,
                 devices=devices,

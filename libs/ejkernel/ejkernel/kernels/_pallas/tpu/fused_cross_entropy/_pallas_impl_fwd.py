@@ -178,7 +178,6 @@ def _ce_fwd_kernel(
     target = target_ref[...].astype(jnp.int32)
     safe_target = jnp.clip(target, 0, vocab_size - 1)
     weight = weight_ref[...].astype(jnp.float32)
-    weight_abs = jnp.abs(weight)
     valid = row_active & (target != ignore_index) & (weight != 0.0)
 
     loss_ref[...] = jnp.zeros((block_m,), dtype=jnp.float32)
@@ -224,7 +223,8 @@ def _ce_fwd_kernel(
         low_conf = float(label_smoothing) / float(vocab_size - 1) if vocab_size > 1 and label_smoothing > 0.0 else 0.0
         eff_target_w = confidence - low_conf
         base = lse - eff_target_w * target_logit - low_conf * sum_logits - float(normalizing_constant)
-        per_row = weight_abs * (base + float(z_loss) * lse * lse)
+        # Signed weight: matches the analytic backward (``weight * dy * ...``) and the XLA path.
+        per_row = weight * (base + float(z_loss) * lse * lse)
 
         loss_ref[...] = jnp.where(valid, per_row, 0.0).astype(jnp.float32)
         lse_ref[...] = jnp.where(row_active, lse, 0.0).astype(jnp.float32)
@@ -518,7 +518,7 @@ def _ce_tp_loss_and_lse(
     normalizing_constant = 0.0
     eff_target_w = confidence - low_conf
     base = lse - eff_target_w * target_logit - low_conf * sum_logits - normalizing_constant
-    per_row = jnp.where(valid, jnp.abs(weights_1d) * (base + float(z_loss) * lse * lse), 0.0)
+    per_row = jnp.where(valid, weights_1d * (base + float(z_loss) * lse * lse), 0.0)
     return per_row.astype(jnp.float32), lse.astype(jnp.float32), local_targets.astype(jnp.int32)
 
 

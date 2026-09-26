@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-
 from ejkernel.modules.operations import attention, flash_attention, mean_pooling, scaled_dot_product_attention
 
 from ._utils import assert_allclose, rand_qkv

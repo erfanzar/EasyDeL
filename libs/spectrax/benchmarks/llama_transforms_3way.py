@@ -62,9 +62,8 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
-from flax import nnx  # noqa: E402
-
 import spectrax as spx  # noqa: E402
+from flax import nnx  # noqa: E402
 from spectrax import nn  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent

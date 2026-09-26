@@ -18,9 +18,8 @@ import json
 from dataclasses import dataclass
 from typing import ClassVar, get_args
 
-import pytest
-
 import easydel.inference.tools.parsers  # noqa: F401
+import pytest
 from easydel.inference.esurge.engine.output_pipeline import OutputPipeline
 from easydel.inference.esurge.engine.registry import RequestRecord, RequestRegistry
 from easydel.inference.esurge.esurge_engine import CompletionOutput, RequestOutput
@@ -375,11 +374,13 @@ def _simulate_engine_stream(case: _ToolParserStreamCase) -> tuple[RequestOutput,
         tool_parser=parser,
         tool_request=request,
     )
-    request_data = RequestRecord(**{
-        "delegating_parser": delegating_parser,
-        "parser_previous_text": "",
-        "parser_previous_token_ids": [],
-    })
+    request_data = RequestRecord(
+        **{
+            "delegating_parser": delegating_parser,
+            "parser_previous_text": "",
+            "parser_previous_token_ids": [],
+        }
+    )
     request_output = RequestOutput(
         request_id=f"req_{case.name}",
         prompt="hi",

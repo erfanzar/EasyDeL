@@ -1441,6 +1441,17 @@ class FusedKLDivergenceConfig(BaseOperationConfig):
 
 
 @dataclass
+class MHCCoefficientsConfig(BaseOperationConfig):
+    """mHC coefficient dispatch settings (pallas/TPU or xla/any).
+
+    Inherited ``platform`` and ``backend`` select the implementation. The packed
+    TPU path has fixed 128-token tiles and supports first-order reverse AD only.
+    """
+
+    __hash__ = hash_fn
+
+
+@dataclass
 class SinkhornKnoppConfig(BaseOperationConfig):
     """Configuration for the Sinkhorn-Knopp doubly-stochastic projection.
 
@@ -1459,12 +1470,12 @@ class TopKConfig(BaseOperationConfig):
     """Configuration for the fused exact top-k.
 
     Args:
-        platform: Target platform (pallas/xla/auto). The Pallas TPU path is the
-            blockwise candidate superset, which is exact but costs ``k``
-            reduction passes -- so it is selected only for a wide reduction axis
-            with a small static ``k``. The XLA path serves narrow axes, large
-            ``k``, and the per-row dynamic ``k`` mask mode, where it is the
-            better path rather than merely the fallback.
+        platform: Target platform (pallas/xla/auto). The Pallas TPU path
+            bisects for the exact ``k``-th key and compacts the survivors,
+            bit-identical to ``jax.lax.top_k``; it is selected for ``k >= 32``
+            over wide, many-row inputs. The XLA path serves tiny ``k``, narrow
+            axes, few rows, and the per-row dynamic ``k`` mask mode, where it is
+            faster.
         backend: Backend specification (default: "any").
     """
 

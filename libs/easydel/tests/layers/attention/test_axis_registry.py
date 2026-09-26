@@ -12,13 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from spectrax import PartitionAxis, common_types
-
 from easydel.axis import (
     ATTN_DP,
     register_attention_data_parallel_axis,
     reset_attention_data_parallel_axis,
 )
+from spectrax import PartitionAxis, common_types
 
 
 def test_attn_dp_defaults_to_partition_axis_data_parallel_axis():

@@ -42,7 +42,6 @@ from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
-
 import spectrax as spx
 from spectrax import nn
 

@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import jax
 import pytest
-
 from easydel.inference.esurge.runners.sequence_buffer import SequenceBuffer
 from easydel.inference.esurge.runners.states import CachedRequestState
 from easydel.inference.sampling_params import SamplingParams

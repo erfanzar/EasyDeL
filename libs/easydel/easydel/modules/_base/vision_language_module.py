@@ -70,6 +70,7 @@ from abc import abstractmethod
 from collections.abc import Callable
 
 import jax
+import numpy as np
 import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
@@ -537,6 +538,8 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
         inputs_embeds: Float[Array, "batch seq_len hidden"],
         multimodal_embeddings: Float[Array, "num_tokens hidden"],
         placeholder_token_id: int | list[int],
+        *,
+        multimodal_embeddings_valid_length: int | Int[Array, ""] | None = None,
     ) -> Float[Array, "batch seq_len hidden"]:
         """Merge vision embeddings into text embeddings at placeholder positions.
 
@@ -558,10 +561,19 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
                 Flattened vision features from all images/videos in the batch.
             placeholder_token_id: Token ID(s) marking placeholder positions.
                 Can be a single int or list of ints for multiple modalities.
+            multimodal_embeddings_valid_length: Optional scalar integer count of genuine
+                feature rows at the start of a capacity-padded feature array. Must be
+                between zero and num_tokens and equal the total placeholder count.
+                Trailing rows are padding, regardless of their values. None requires
+                every feature row to correspond to a placeholder (the strict default).
 
         Returns:
             Float[Array, "batch seq_len hidden"]: Merged embeddings with vision
                 features inserted at placeholder positions.
+
+        Raises:
+            ValueError: If concrete feature and placeholder counts disagree, or the
+                valid length is non-scalar, non-integer, negative, or exceeds capacity.
 
         Example:
             Merging image features::
@@ -576,8 +588,11 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
                 )
 
         Note:
-            The number of multimodal_embeddings must match the total number
-            of placeholder tokens across all sequences in the batch.
+            Without explicit valid-length metadata, the number of multimodal_embeddings
+            must exactly match the total placeholder count across the batch. Under JIT,
+            dynamic counts must be validated by preprocessing before tracing: no host
+            callbacks, clipping, or data-dependent slicing are introduced here. Each
+            concrete metadata value is still validated even when input_ids is traced.
         """
         batch_size, seq_len, hidden = inputs_embeds.shape
         if isinstance(placeholder_token_id, list):
@@ -593,10 +608,28 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
         # Under JIT the placeholder count is data-dependent, so collators must
         # enforce the same contract before tracing rather than forcing a host
         # callback into every training step.
+        capacity = int(multimodal_embeddings.shape[0])
+        provided = capacity
+        if multimodal_embeddings_valid_length is not None:
+            valid_length = multimodal_embeddings_valid_length
+            # Inspect concrete metadata before any JAX conversion: otherwise a
+            # static invalid value can become a tracer and evade the range check.
+            if not isinstance(valid_length, jax.core.Tracer):
+                valid_length = np.asarray(valid_length)
+            if valid_length.ndim != 0 or not np.issubdtype(valid_length.dtype, np.integer):
+                raise ValueError("`multimodal_embeddings_valid_length` must be a scalar integer.")
+            provided = None
+            if not isinstance(valid_length, jax.core.Tracer):
+                provided = int(valid_length)
+                if not 0 <= provided <= capacity:
+                    raise ValueError(
+                        f"`multimodal_embeddings_valid_length` must be between 0 and capacity {capacity}; "
+                        f"got {provided}."
+                    )
+
         placeholder_count = jnp.sum(flat_mask, dtype=jnp.int32)
-        if not isinstance(placeholder_count, jax.core.Tracer):
+        if provided is not None and not isinstance(placeholder_count, jax.core.Tracer):
             expected = int(placeholder_count)
-            provided = int(multimodal_embeddings.shape[0])
             if expected != provided:
                 raise ValueError(f"Expected {expected} placeholder tokens but got {provided} multimodal embeddings.")
 

@@ -24,10 +24,12 @@ Key differences from ``grouped_matmul``:
     - A custom VJP (``_grouped_matmulv3_core``) ensures that gradients for all
       optional tensors (``rhs_scale``, ``rhs_bias``, ``existing_out``) are
       computed correctly.
-    - When ``rhs_scale`` or ``rhs_bias`` is provided the forward path falls back
-      to a vmap-based pure-JAX reference (``grouped_matmulv3_autodiff_reference``)
-      rather than ``ragged_dot_general``, so that scale/bias are fused into the
-      weight before the matmul.
+    - ``rhs_scale`` is folded into the ``[num_groups, k, n]`` weight before a
+      single ``ragged_dot_general``; ``rhs_bias`` is added per row afterwards.
+      ``group_offset`` is honoured by slicing the active ``group_sizes`` window
+      (``ragged_dot_general`` itself does not implement ``group_offset``).
+    - Rows past ``sum(active group_sizes)`` belong to no group: they are zero in
+      the forward (no bias) and contribute nothing to any gradient.
 
 Registered kernel keys: ``"grouped_matmulv3"`` (XLA platform, any backend).
 """
@@ -114,17 +116,47 @@ def _apply_rhs_scale_bias(
     return rhs_prepped, bias
 
 
+def _active_group_sizes(
+    group_sizes: jax.Array,
+    num_groups: int,
+    group_offset: jax.Array | None,
+) -> jax.Array:
+    """Return the ``num_groups`` group sizes starting at ``group_offset``.
+
+    Rows are assigned to the active groups from row 0 onward (groups before
+    ``group_offset`` do not shift the row offsets), matching the Pallas v3
+    kernel's metadata.
+
+    Args:
+        group_sizes: Per-group row counts. Shape: [num_groups_or_shards].
+        num_groups: Number of active groups to process (typically
+            ``rhs.shape[0]``).
+        group_offset: Optional scalar (or 1-element array) indicating the
+            starting offset into ``group_sizes`` for sharded execution.
+
+    Returns:
+        Integer array of shape [num_groups].
+    """
+    offset = (
+        group_offset.reshape(-1)[0].astype(group_sizes.dtype)
+        if group_offset is not None
+        else jnp.array(0, dtype=group_sizes.dtype)
+    )
+    return jax.lax.dynamic_slice_in_dim(group_sizes, offset, num_groups, axis=0)
+
+
 def _active_group_ids(
     group_sizes: jax.Array,
     num_groups: int,
     total_rows: int,
     group_offset: jax.Array | None,
-) -> jax.Array:
-    """Build a per-row group-index vector for use with ``jax.vmap`` dispatch.
+) -> tuple[jax.Array, jax.Array]:
+    """Build a per-row group-index vector and a row-validity mask.
 
     For each row in ``lhs[0:total_rows]`` returns the index of the group it
-    belongs to.  Used by the pure-JAX autodiff reference to select the
-    appropriate ``rhs`` slice for each row.
+    belongs to. Rows past ``sum(active group sizes)`` belong to no group:
+    ``jnp.repeat`` would assign them to the last group, so callers must mask
+    them with the returned ``row_valid``.
 
     Args:
         group_sizes: Per-group row counts. Shape: [num_groups_or_shards].
@@ -135,20 +167,21 @@ def _active_group_ids(
             starting offset into ``group_sizes`` for sharded execution.
 
     Returns:
-        Integer array of shape [total_rows] where ``result[i]`` is the group
-        index for row ``i``.
+        ``(group_ids, row_valid)``: integer ``[total_rows]`` group index per
+        row and boolean ``[total_rows]`` mask that is False for tail rows.
     """
-    offset = (
-        group_offset.reshape(-1)[0].astype(group_sizes.dtype)
-        if group_offset is not None
-        else jnp.array(0, dtype=group_sizes.dtype)
-    )
-    active_sizes = jax.lax.dynamic_slice_in_dim(group_sizes, offset, num_groups, axis=0)
-    return jnp.repeat(
+    active_sizes = _active_group_sizes(group_sizes, num_groups, group_offset)
+    group_ids = jnp.repeat(
         jnp.arange(num_groups, dtype=group_sizes.dtype),
         active_sizes,
         total_repeat_length=total_rows,
     )
+    return group_ids, _tail_row_mask(active_sizes, total_rows)
+
+
+def _tail_row_mask(active_sizes: jax.Array, total_rows: int) -> jax.Array:
+    """Boolean ``[total_rows]`` mask, False for rows past ``sum(active_sizes)``."""
+    return jnp.arange(total_rows, dtype=active_sizes.dtype) < jnp.sum(active_sizes)
 
 
 def grouped_matmulv3_autodiff_reference(
@@ -165,12 +198,12 @@ def grouped_matmulv3_autodiff_reference(
     interpret: bool = False,
     precision: jax.lax.PrecisionLike = jax.lax.Precision.DEFAULT,
 ) -> jax.Array:
-    """Pure-JAX vmap reference for GMM v3, used as the autodiff-compatible path.
+    """Pure-JAX per-row vmap reference for GMM v3 (testing / parity only).
 
-    When ``rhs_scale`` or ``rhs_bias`` is non-None, ``ragged_dot_general``
-    cannot track gradients through the quantisation parameters.  This function
-    uses a ``jax.vmap`` over rows instead, keeping all operations differentiable
-    by standard JAX autodiff.
+    Gathers ``rhs[group_id]`` per row, i.e. materialises an ``[m, k, n]``
+    tensor, so it is only suitable for small shapes. Production paths use
+    :func:`grouped_matmulv3_reference` (a single ``ragged_dot_general``).
+    Rows past ``sum(active group_sizes)`` produce zero output and gradient.
 
     ``tiling`` and ``interpret`` are accepted but ignored (they only affect
     the Pallas backend).
@@ -199,7 +232,7 @@ def grouped_matmulv3_autodiff_reference(
         rhs_bias,
         transpose_rhs=transpose_rhs,
     )
-    group_ids = _active_group_ids(group_sizes, rhs_prepped.shape[0], lhs.shape[0], group_offset)
+    group_ids, row_valid = _active_group_ids(group_sizes, rhs_prepped.shape[0], lhs.shape[0], group_offset)
     out = jax.vmap(
         lambda row, mat: jnp.matmul(
             row,
@@ -210,6 +243,7 @@ def grouped_matmulv3_autodiff_reference(
     )(lhs, rhs_prepped[group_ids])
     if bias is not None:
         out = out + bias[group_ids].astype(out.dtype)
+    out = jnp.where(row_valid[:, None], out, jnp.zeros((), dtype=out.dtype))
     if existing_out is not None:
         out = out + jnp.asarray(existing_out, dtype=out.dtype)
     return out
@@ -231,23 +265,24 @@ def grouped_matmulv3_reference(
 ) -> jax.Array:
     """Forward pass for GMM v3 used by both XLA execution and the TPU backward helpers.
 
-    Dispatches to one of two implementations:
-        - ``grouped_matmulv3_autodiff_reference`` (vmap-based): when
-          ``rhs_scale`` or ``rhs_bias`` is provided, so that quantisation
-          parameters remain differentiable.
-        - ``_grouped_matmul_impl`` (``ragged_dot_general``): when no scale/bias
-          is set, taking advantage of the optimised XLA primitive.
+    ``rhs_scale`` is folded into the ``[num_groups, k, n]`` weight, then one
+    ``ragged_dot_general`` runs over the active ``group_sizes`` window (sliced
+    at ``group_offset``, which ``ragged_dot_general`` does not implement
+    itself). The whole function is differentiable by standard JAX autodiff
+    w.r.t. ``lhs``, ``rhs``, ``rhs_scale`` and ``rhs_bias`` without ever
+    materialising a per-row ``[m, k, n]`` weight gather.
 
-    After the core matmul, any ``rhs_bias`` and ``existing_out`` are added
-    in the output dtype.
+    After the core matmul, any ``rhs_bias`` (valid rows only) and
+    ``existing_out`` are added in the output dtype. Rows past
+    ``sum(active group_sizes)`` are zero (before ``existing_out``).
 
     Args:
         lhs: [m, k] left-hand side matrix.
         rhs: [num_groups, k, n] (or [num_groups, n, k]) weight matrices.
         group_sizes: [num_groups] per-group row counts.
         preferred_element_type: Output dtype.
-        tiling: Tile-size hint for ``ragged_dot_general`` via XLA metadata.
-            Ignored when falling back to the vmap reference.
+        tiling: Tile-size hint for ``ragged_dot_general`` via XLA metadata
+            (tuple form, forwarded only when neither scale nor bias is set).
         group_offset: Optional starting group index for sharded execution.
         existing_out: Optional [m, n] accumulation tensor.
         rhs_scale: Optional [num_groups, num_blocks, 1, n] block-float scale.
@@ -259,42 +294,45 @@ def grouped_matmulv3_reference(
     Returns:
         Output matrix of shape [m, n].
     """
-    if rhs_scale is not None or rhs_bias is not None:
-        return grouped_matmulv3_autodiff_reference(
-            lhs,
-            rhs,
-            group_sizes,
-            preferred_element_type,
-            tiling,
-            group_offset,
-            existing_out,
-            rhs_scale,
-            rhs_bias,
-            transpose_rhs,
-            interpret,
-            precision,
-        )
     rhs_prepped, bias = _apply_rhs_scale_bias(
         rhs,
         rhs_scale,
         rhs_bias,
         transpose_rhs=transpose_rhs,
     )
+    lhs_mm = lhs
+    if rhs_scale is not None:
+        # The dequantised weight is floating (fp32 for integer codes); match the
+        # promotion ``jnp.matmul`` would apply instead of relying on mixed-dtype
+        # ragged_dot lowering.
+        common_dtype = jnp.promote_types(lhs.dtype, rhs_prepped.dtype)
+        lhs_mm = lhs.astype(common_dtype)
+        rhs_prepped = rhs_prepped.astype(common_dtype)
+    num_groups = rhs_prepped.shape[0]
+    active_sizes = _active_group_sizes(group_sizes, num_groups, group_offset)
+    # Forward the XLA tile hint only on the plain path (the only one that used ragged_dot before):
+    # the scale/bias path is also reached from the Pallas backward with Pallas-tuned (or callable)
+    # tiling, which is not a valid ragged_dot hint for arbitrary m.
+    plain = rhs_scale is None and rhs_bias is None
+    ragged_tiling = tiling if plain and isinstance(tiling, tuple) else None
     out = _grouped_matmul_impl(
-        lhs,
+        lhs_mm,
         rhs_prepped,
-        group_sizes,
+        active_sizes,
         preferred_element_type,
-        tiling,
-        group_offset,
+        ragged_tiling,
+        None,
         existing_out=None,
         transpose_rhs=False,
         interpret=interpret,
         precision=precision,
     )
     if bias is not None:
-        group_ids = _active_group_ids(group_sizes, bias.shape[0], lhs.shape[0], group_offset)
+        group_ids, _ = _active_group_ids(group_sizes, num_groups, lhs.shape[0], group_offset)
         out = out + bias[group_ids].astype(out.dtype)
+    # Rows past ``sum(active_sizes)`` belong to no group. ragged_dot leaves them unspecified on TPU
+    # (not guaranteed zero), and ``bias[group_ids]`` would give them the last group's bias: zero them.
+    out = jnp.where(_tail_row_mask(active_sizes, lhs.shape[0])[:, None], out, jnp.zeros((), dtype=out.dtype))
     if existing_out is not None:
         out = out + jnp.asarray(existing_out, dtype=out.dtype)
     return out
@@ -409,11 +447,10 @@ def _grouped_matmulv3_bwd(
     """Backward rule for ``_grouped_matmulv3_core``'s custom VJP.
 
     Computes gradients for all differentiable inputs:
-        - ``grad_lhs``, ``grad_rhs``: from ``jax.vjp`` through
-          ``grouped_matmulv3_autodiff_reference`` (pure JAX, always
-          differentiable).
-        - ``grad_rhs_scale``, ``grad_rhs_bias``: separate ``jax.vjp`` calls
-          when those optional tensors are non-None.
+        - ``grad_lhs``, ``grad_rhs``, ``grad_rhs_scale``, ``grad_rhs_bias``:
+          one ``jax.vjp`` through the same ``ragged_dot_general`` forward
+          (:func:`grouped_matmulv3_reference`), so forward and backward agree
+          on every row, including tail rows past ``sum(group_sizes)`` (zero).
         - ``grad_existing_out``: equal to ``grad`` when ``existing_out`` is
           non-None (addition is the identity in the backward).
         - ``grad_group_sizes``, ``grad_group_offset``: always ``None``
@@ -437,7 +474,7 @@ def _grouped_matmulv3_bwd(
     lhs, rhs, group_sizes, group_offset, existing_out, rhs_scale, rhs_bias = residual
 
     _, pullback = jax.vjp(
-        lambda lhs, rhs: grouped_matmulv3_autodiff_reference(
+        lambda lhs, rhs, scale, bias: grouped_matmulv3_reference(
             lhs,
             rhs,
             group_sizes,
@@ -445,61 +482,25 @@ def _grouped_matmulv3_bwd(
             tiling,
             group_offset,
             existing_out,
-            rhs_scale,
-            rhs_bias,
+            scale,
+            bias,
             transpose_rhs,
             interpret,
             precision,
         ),
         lhs,
         rhs,
+        rhs_scale,
+        rhs_bias,
     )
-    grad_lhs, grad_rhs = pullback(grad)
+    grad_lhs, grad_rhs, grad_rhs_scale, grad_rhs_bias = pullback(grad)
+    # grad_lhs is itself a ragged_dot output over the same groups: zero its (unspecified) tail rows.
+    active_sizes = _active_group_sizes(group_sizes, rhs.shape[0], group_offset)
+    grad_lhs = jnp.where(
+        _tail_row_mask(active_sizes, lhs.shape[0])[:, None], grad_lhs, jnp.zeros((), dtype=grad_lhs.dtype)
+    )
 
     grad_existing_out = grad if existing_out is not None else None
-    grad_rhs_scale = None
-    grad_rhs_bias = None
-
-    if rhs_scale is not None:
-        _, pullback = jax.vjp(
-            lambda scale: grouped_matmulv3_autodiff_reference(
-                lhs,
-                rhs,
-                group_sizes,
-                preferred_element_type,
-                tiling,
-                group_offset,
-                existing_out,
-                scale,
-                rhs_bias,
-                transpose_rhs,
-                interpret,
-                precision,
-            ),
-            rhs_scale,
-        )
-        (grad_rhs_scale,) = pullback(grad)
-
-    if rhs_bias is not None:
-        _, pullback = jax.vjp(
-            lambda bias: grouped_matmulv3_autodiff_reference(
-                lhs,
-                rhs,
-                group_sizes,
-                preferred_element_type,
-                tiling,
-                group_offset,
-                existing_out,
-                rhs_scale,
-                bias,
-                transpose_rhs,
-                interpret,
-                precision,
-            ),
-            rhs_bias,
-        )
-        (grad_rhs_bias,) = pullback(grad)
-
     return grad_lhs, grad_rhs, None, None, grad_existing_out, grad_rhs_scale, grad_rhs_bias
 
 
@@ -551,8 +552,11 @@ def grouped_matmulv3(
         preferred_element_type: Accumulation and output dtype.
             Defaults to ``float32``.
         tiling: XLA tile-size hint as ``(tm, tk, tn)``, a ``LutFn``, or None.
-            Ignored when ``rhs_scale`` / ``rhs_bias`` is provided (vmap path).
-        group_offset: Optional scalar starting group index for sharded runs.
+            Only a tuple hint is forwarded, and only when ``rhs_scale`` /
+            ``rhs_bias`` are both None.
+        group_offset: Optional scalar starting group index for sharded runs:
+            ``lhs`` rows are assigned to groups
+            ``group_offset .. group_offset + num_groups - 1`` from row 0.
         existing_out: Optional [m, n] tensor to add to the result.
         rhs_scale: Optional block-float scale.
             Shape: [num_groups, num_blocks, 1, n].  ``num_blocks`` must evenly

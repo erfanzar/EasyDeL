@@ -486,23 +486,35 @@ class BaseTrainerCfg(TypedDict, total=False):
             "speculative_decoding",
             "agentic-moshpit",
             "agentic_moshpit",
+            "async-grpo",
             "async_grpo",
+            "bema_dpo",
             "compaction-rl",
             "compaction_rl",
             "compaction_reinforcement_learning",
             "dppo",
+            "dppo-trainer",
             "gold",
+            "grpo-replay-buffer",
+            "grpo-with-replay-buffer",
+            "grpo_replay_buffer",
+            "grpo_replay_buffer_trainer",
             "grpo_with_replay_buffer",
+            "gspo-token",
             "gspo_token",
             "minillm",
+            "nemo-gym",
             "nemo_gym",
+            "online-dpo",
             "online_dpo",
             "papo",
             "prm",
             "rlvr",
+            "rlvr_trainer",
             "rloo",
             "sao",
             "sdft",
+            "self_distillation",
             "ssd",
             "tpo",
             "embedding",
@@ -758,8 +770,12 @@ class DPOTrainerCfg(BaseTrainerCfg):
             "sppo_hard",
             "aot",
             "aot_pair",
+            "aot_unpaired",
             "apo_zero",
             "apo_down",
+            "discopop",
+            "sft",
+            "sigmoid_norm",
         ]
     ]
     use_weighting: NotRequired[bool]
@@ -884,9 +900,11 @@ class GRPOTrainerCfg(BaseTrainerCfg):
             when ``None``.
         delta: Optional two-sided dynamic clipping bound (DAPO).
         loss_type: GRPO loss variant. One of ``"grpo"``, ``"bnpo"``,
-            ``"dr_grpo"``, ``"dapo"``, ``"cispo"``.
+            ``"dr_grpo"``, ``"dapo"``, ``"cispo"``, ``"sapo"``, ``"luspo"``,
+            ``"vespo"``, ``"dppo"``.
         importance_sampling_level: Aggregate the importance-sampling ratio
-            per ``"token"`` or per ``"sequence"``.
+            per ``"token"``, per ``"sequence"``, or GSPO-token
+            ``"sequence_token"``.
         num_iterations: Number of optimizer updates per generated batch.
         num_generations: Alias for ``num_return_sequences`` kept for TRL
             parity.
@@ -941,8 +959,8 @@ class GRPOTrainerCfg(BaseTrainerCfg):
     epsilon: NotRequired[float]
     epsilon_high: NotRequired[float | None]
     delta: NotRequired[float | None]
-    loss_type: NotRequired[Literal["grpo", "bnpo", "dr_grpo", "dapo", "cispo"]]
-    importance_sampling_level: NotRequired[Literal["token", "sequence"]]
+    loss_type: NotRequired[Literal["grpo", "bnpo", "dr_grpo", "dapo", "cispo", "sapo", "luspo", "vespo", "dppo"]]
+    importance_sampling_level: NotRequired[Literal["token", "sequence", "sequence_token"]]
     num_iterations: NotRequired[int]
     num_generations: NotRequired[int | None]
     reward_weights: NotRequired[list[float] | None]

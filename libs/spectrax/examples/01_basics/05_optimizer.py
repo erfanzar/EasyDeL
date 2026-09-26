@@ -28,7 +28,6 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import optax
-
 import spectrax as spx
 from spectrax.contrib.optimizer import Optimizer
 

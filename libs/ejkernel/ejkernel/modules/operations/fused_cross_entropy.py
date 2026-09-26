@@ -172,12 +172,17 @@ class FusedCrossEntropy(Kernel[FusedCrossEntropyConfig, Array]):
         and gradient zeroed out and triggers the kernel's per-block
         sparse early-exit — saving the full ``O(V)`` softmax pass for
         inactive rows). Combining order:
-        ``effective_weights = (weights or 1.0) * attention_mask``.
+        ``effective_weights = (weights or valid) * attention_mask`` where
+        ``valid = targets != ignore_index`` in sparse mode (``1.0`` in dense
+        mode) — the mask must not re-enable ``ignore_index`` rows, which the
+        kernels only drop implicitly when ``weights`` is ``None``.
         """
         if attention_mask is not None:
             mask_f32 = attention_mask.astype(jnp.float32)
             if weights is None:
                 weights = mask_f32
+                if soft_targets is None and targets is not None:
+                    weights = weights * (targets != ignore_index).astype(jnp.float32)
             else:
                 weights = weights.astype(jnp.float32) * mask_f32
         n_rows = 1
@@ -527,19 +532,21 @@ _executor: Executor[FusedCrossEntropyConfig, Array] = Executor(
 )
 
 
-def _combine_weights(targets, weights, attention_mask, ignore_index, compute_dtype):
-    """Build effective per-token float weights: ``(weights or valid) * mask``.
+def _combine_weights(targets, weights, attention_mask, ignore_index):
+    """Build effective per-token fp32 weights: ``(weights or valid) * mask``.
 
     ``valid`` is the ``targets != ignore_index`` indicator when no explicit
     ``weights`` are supplied; ``attention_mask`` (sparse padding/completion
-    mask) is multiplied in afterwards.
+    mask) is multiplied in afterwards. Always fp32 regardless of the CE compute
+    dtype: the weights feed fp32 token accumulators, and bf16 would round
+    fractional weights.
     """
     if weights is None:
-        eff = (targets != ignore_index).astype(compute_dtype)
+        eff = (targets != ignore_index).astype(jnp.float32)
     else:
-        eff = weights.astype(compute_dtype)
+        eff = weights.astype(jnp.float32)
     if attention_mask is not None:
-        eff = eff * attention_mask.astype(compute_dtype)
+        eff = eff * attention_mask.astype(jnp.float32)
     return eff
 
 
@@ -568,7 +575,7 @@ def _chunked_cross_entropy_dispatch(
     if logits is None or targets is None:
         raise ValueError("chunked cross-entropy requires `logits` and `targets`.")
     cdtype = jnp.dtype(compute_dtype) if compute_dtype is not None else logits.dtype
-    eff_weights = _combine_weights(targets, weights, attention_mask, ignore_index, cdtype)
+    eff_weights = _combine_weights(targets, weights, attention_mask, ignore_index)
 
     common = dict(
         ignore_index=ignore_index,
@@ -635,7 +642,7 @@ def _fused_linear_cross_entropy_dispatch(
     if targets is None:
         raise ValueError("FLCE mode requires integer `targets`.")
     cdtype = jnp.dtype(compute_dtype) if compute_dtype is not None else hidden.dtype
-    eff_weights = _combine_weights(targets, weights, attention_mask, ignore_index, cdtype)
+    eff_weights = _combine_weights(targets, weights, attention_mask, ignore_index)
     per_chunk_ce_fn = None
     if platform is not None:
         resolved_platform = detect_platform("fused_cross_entropy", platform)
@@ -740,7 +747,7 @@ def _fused_linear_cross_entropy_vp_dispatch(
         raise ValueError("vocab-parallel FLCE: pass `lm_head_weight`, not `lm_head_fn`.")
 
     cdtype = jnp.dtype(compute_dtype) if compute_dtype is not None else hidden.dtype
-    eff_weights = _combine_weights(targets, weights, attention_mask, ignore_index, cdtype)
+    eff_weights = _combine_weights(targets, weights, attention_mask, ignore_index)
 
     hidden_spec = in_specs[0]
     weight_spec = in_specs[1]
@@ -871,7 +878,9 @@ def fused_cross_entropy(
         chunk_size: Chunk length (>0 enables chunked/FLCE streaming).
         chunk_strategy: Which axis to stream in chunked-logits mode.
         compute_dtype: CE math dtype for the chunked / FLCE paths
-            (defaults to the input dtype — no forced fp32).
+            (defaults to the input dtype — no forced fp32). Token weights,
+            row softmax statistics and the reduced (``sum`` / ``mean``) loss,
+            ``z_loss``, ``weight_sum`` and ``accuracy`` are fp32 regardless.
         checkpoint: For the FLCE and ``"block"`` chunked paths, whether to wrap
             each chunk/block body in :func:`jax.checkpoint` so the backward
             recomputes its logits instead of storing them (default ``True`` —

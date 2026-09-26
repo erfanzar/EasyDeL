@@ -1,11 +1,10 @@
 from __future__ import annotations
 
+import easydel as ed
 import jax
 import jax.numpy as jnp
 import pytest
 import spectrax as spx
-
-import easydel as ed
 
 AXIS_NAMES = ("pp", "dp", "fsdp", "ep", "tp", "sp")
 

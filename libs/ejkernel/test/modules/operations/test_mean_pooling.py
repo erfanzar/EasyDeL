@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-
 from ejkernel.modules.operations import mean_pooling
 
 from ._utils import assert_allclose

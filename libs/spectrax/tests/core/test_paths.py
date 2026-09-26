@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import pytest
-
 from spectrax.core.paths import is_prefix, join, path_to_str, str_to_path
 
 

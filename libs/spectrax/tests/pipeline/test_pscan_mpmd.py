@@ -10,9 +10,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.sharding import Mesh, PartitionSpec
-
 import spectrax as spx
+from jax.sharding import Mesh, PartitionSpec
 from spectrax import nn
 from spectrax.core.stage_assignment import assign_stage
 from spectrax.runtime.mpmd import sxjit, sxstage_iter, treduce
@@ -240,6 +239,7 @@ def test_pscan_mpmd_matches_reference(schedule_cls, body_mode, mesh, model, xy, 
         ("InterleavedGPipe", lambda m: InterleavedGPipe(microbatches=m, virtual_stages=2)),
         ("KimiK2", lambda m: KimiK2(microbatches=m, virtual_stages=2)),
         ("DualPipeV", lambda m: DualPipeV(microbatches=m)),
+        ("DualPipeVNoZeroBubble", lambda m: DualPipeV(microbatches=m, zero_bubble=False)),
     ],
 )
 @pytest.mark.parametrize("body_mode", ["scalar_loss", "prediff"])
@@ -278,6 +278,37 @@ def test_pscan_mpmd_virtual_schedules_match_reference(
     got_leaves = jax.tree.leaves(grads)
     assert len(got_leaves) == len(ref_leaves)
     for got, ref in zip(got_leaves, ref_leaves, strict=True):
+        assert jnp.allclose(got, ref, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("body_mode", ["scalar_loss", "prediff"])
+def test_pscan_mpmd_repeat_call_uses_live_params_and_batch(body_mode, mesh, xy):
+    """A cached pscan plan must rebind the captured params and batch on every call."""
+    x, y = xy
+    model_a = TwoStage(_D, rngs=spx.Rngs(21))
+    model_b = TwoStage(_D, rngs=spx.Rngs(22))
+    x2 = x * 2.0 + 1.0
+    y2 = y - 0.5
+    schedule = Std1F1B(microbatches=_M)
+
+    @sxjit(mesh=mesh)
+    def step(model, x, y):
+        """Execute one training step and return the result."""
+
+        def body(mb):
+            """Loop body function."""
+            if body_mode == "scalar_loss":
+                return _micro_loss(model, mb)
+            return spx.value_and_grad(_micro_loss)(model, mb)
+
+        return treduce(body, (x, y), schedule=schedule)
+
+    step(model_a, x, y)
+    losses, grads = step(model_b, x2, y2)
+
+    ref_losses, ref_grads = _microbatch_reference(model_b, x2, y2)
+    assert jnp.allclose(losses, ref_losses, atol=1e-4, rtol=1e-4)
+    for got, ref in zip(jax.tree.leaves(grads), jax.tree.leaves(ref_grads), strict=True):
         assert jnp.allclose(got, ref, atol=1e-4, rtol=1e-4)
 
 

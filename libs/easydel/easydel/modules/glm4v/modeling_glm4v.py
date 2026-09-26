@@ -35,6 +35,7 @@ Exports:
 """
 
 import math
+from functools import partial
 from itertools import groupby
 
 import jax
@@ -105,6 +106,46 @@ class Glm4vModelOutputWithPast(ModelOutput):
     hidden_states: tuple[Array] | None = None
     attentions: tuple[Array] | None = None
     rope_deltas: Array | None = None
+
+
+def bicubic_border_resample_matrix(num_out: int, num_in: int) -> np.ndarray:
+    """1-D resampling matrix reproducing HF GLM-4V's position-embedding interpolation.
+
+    HF ``Glm4vVisionEmbeddings`` samples the learned ``num_in x num_in``
+    position grid at the patch centres ``(i + 0.5) / num_out`` with
+    ``F.grid_sample(mode="bicubic", align_corners=False, padding_mode="border")``.
+    That operation is separable, so each axis is a ``(num_out, num_in)`` matrix:
+    the sample coordinate is un-normalised with ``align_corners=False``, the
+    four cubic-convolution weights (``A = -0.75``) use the *unclamped*
+    fractional offset, and the four tap indices are clamped to
+    ``[0, num_in - 1]`` (border padding). Arithmetic is done in float32 like
+    torch.
+
+    Args:
+        num_out: Number of output samples along the axis (patch-grid size).
+        num_in: Number of learned position rows along the axis.
+
+    Returns:
+        np.ndarray: float32 matrix ``M`` with ``out = M @ in`` along that axis.
+    """
+    f32 = np.float32
+    coords = ((np.arange(num_out, dtype=f32) + f32(0.5)) / f32(num_out)) * f32(2) - f32(1)
+    src = ((coords + f32(1)) * f32(num_in) - f32(1)) / f32(2)
+    base = np.floor(src)
+    t = (src - base).astype(f32)
+    a = f32(-0.75)
+    x1 = t + f32(1)
+    w0 = ((a * x1 - f32(5) * a) * x1 + f32(8) * a) * x1 - f32(4) * a
+    w1 = ((a + f32(2)) * t - (a + f32(3))) * t * t + f32(1)
+    x2 = f32(1) - t
+    w2 = ((a + f32(2)) * x2 - (a + f32(3))) * x2 * x2 + f32(1)
+    x3 = x2 + f32(1)
+    w3 = ((a * x3 - f32(5) * a) * x3 + f32(8) * a) * x3 - f32(4) * a
+    weights = np.stack([w0, w1, w2, w3], axis=-1).astype(f32)
+    taps = np.clip(base.astype(np.int64)[:, None] + np.arange(-1, 3)[None, :], 0, num_in - 1)
+    matrix = np.zeros((num_out, num_in), dtype=f32)
+    np.add.at(matrix, (np.repeat(np.arange(num_out), 4), taps.reshape(-1)), weights.reshape(-1))
+    return matrix
 
 
 def _rotate_half(x: Array) -> Array:
@@ -195,6 +236,7 @@ class Glm4vVisionPatchEmbed(spx.Module):
             use_bias=True,
             dtype=dtype,
             rngs=rngs,
+            precision=precision,
         )
 
     def forward(self, hidden_states: Array) -> Array:
@@ -231,7 +273,8 @@ class Glm4vVisionMLP(spx.Module):
 
     Same gated-MLP recipe used in the text side
     (``down(act(gate(x)) * up(x))``), but instantiated against the vision
-    config's ``hidden_size`` and ``intermediate_size``. The activation is
+    config's ``hidden_size`` and ``out_hidden_size`` (matching HF
+    ``Glm4VisionMlp``; ``intermediate_size`` belongs to the patch merger). The activation is
     read from ``config.hidden_act`` (typically ``"silu"`` so the gated form
     becomes SwiGLU). All three projections are biasless. Gate and up are
     column-parallel (output-sharded), down is row-parallel (input-sharded)
@@ -258,20 +301,22 @@ class Glm4vVisionMLP(spx.Module):
         """
         self.config = config
         self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
+        # HF ``Glm4VisionMlp`` sizes the vision MLP by ``out_hidden_size``;
+        # ``intermediate_size`` is the width of the patch merger's MLP.
+        self.intermediate_size = config.out_hidden_size
         self.act = ACT2FN[config.hidden_act]
         self.gate_up_proj = ColumnParallelLinear(
             config.hidden_size,
-            (config.intermediate_size, config.intermediate_size),
+            (self.intermediate_size, self.intermediate_size),
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-            layout=dense_gate_up_layout(config.intermediate_size),
+            layout=dense_gate_up_layout(self.intermediate_size),
         )
         self.down_proj = RowParallelLinear(
-            config.intermediate_size,
+            self.intermediate_size,
             config.hidden_size,
             use_bias=False,
             dtype=dtype,
@@ -610,8 +655,9 @@ class Glm4vVisionPatchMerger(spx.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.norm = LayerNorm(dim, epsilon=1e-6, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
-        self.act1 = jax.nn.gelu
+        # HF uses ``torch.nn.LayerNorm(dim)`` (eps=1e-5) and exact (erf) ``nn.GELU()``.
+        self.norm = LayerNorm(dim, epsilon=1e-5, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+        self.act1 = partial(jax.nn.gelu, approximate=False)
         self.act = ACT2FN[hidden_act]
         self.gate_up_proj = ColumnParallelLinear(
             dim,
@@ -769,6 +815,7 @@ class Glm4vVisionModel(EasyDeLBaseModule):
             use_bias=True,
             dtype=dtype,
             rngs=rngs,
+            precision=precision,
         )
         self.merger = Glm4vVisionPatchMerger(
             dim=config.out_hidden_size,
@@ -804,10 +851,14 @@ class Glm4vVisionModel(EasyDeLBaseModule):
         return self.pos_embed.weight.value.dtype
 
     def fast_pos_embed_interpolate(self, grid_thw: Array) -> Array:
-        """Bilinear-interpolate 2D position embeddings and apply merge-size permutation.
+        """Bicubic-interpolate 2D position embeddings and apply merge-size permutation.
 
-        Interpolates learned position embeddings to match the input grid dimensions
-        and rearranges them according to the spatial merge pattern.
+        Matches HF ``Glm4vVisionEmbeddings``: the learned ``side x side`` grid
+        is resampled (in float32) at every patch centre with
+        ``grid_sample(mode="bicubic", align_corners=False, padding_mode="border")``
+        semantics, cast back to the embedding dtype, and rearranged according
+        to the spatial merge pattern. The separable resampling is expressed
+        as two host-built matrices (see :func:`bicubic_border_resample_matrix`).
 
         Args:
             grid_thw (Array): Grid dimensions of shape (num_images, 3) containing
@@ -816,59 +867,20 @@ class Glm4vVisionModel(EasyDeLBaseModule):
         Returns:
             Array: Interpolated position embeddings for all patches.
         """
-        grid_ts = grid_thw[:, 0]
-        grid_hs = grid_thw[:, 1]
-        grid_ws = grid_thw[:, 2]
         merge_size = self.spatial_merge_size
-
-        idx_list = [[], [], [], []]
-        weight_list = [[], [], [], []]
-        for t, h, w in zip(grid_ts, grid_hs, grid_ws, strict=False):
-            t, h, w = int(t), int(h), int(w)
-            h_idxs = jnp.linspace(0, self.num_grid_per_side - 1, h)
-            w_idxs = jnp.linspace(0, self.num_grid_per_side - 1, w)
-
-            h_floor = jnp.floor(h_idxs).astype(jnp.int32)
-            w_floor = jnp.floor(w_idxs).astype(jnp.int32)
-            h_ceil = jnp.clip(h_floor + 1, max=self.num_grid_per_side - 1)
-            w_ceil = jnp.clip(w_floor + 1, max=self.num_grid_per_side - 1)
-
-            dh = h_idxs - h_floor
-            dw = w_idxs - w_floor
-
-            base_h = h_floor * self.num_grid_per_side
-            base_h_ceil = h_ceil * self.num_grid_per_side
-
-            indices = [
-                (base_h[:, None] + w_floor[None, :]).flatten(),
-                (base_h[:, None] + w_ceil[None, :]).flatten(),
-                (base_h_ceil[:, None] + w_floor[None, :]).flatten(),
-                (base_h_ceil[:, None] + w_ceil[None, :]).flatten(),
-            ]
-            weights = [
-                ((1 - dh)[:, None] * (1 - dw)[None, :]).flatten(),
-                ((1 - dh)[:, None] * dw[None, :]).flatten(),
-                (dh[:, None] * (1 - dw)[None, :]).flatten(),
-                (dh[:, None] * dw[None, :]).flatten(),
-            ]
-
-            for i in range(4):
-                idx_list[i].append(indices[i])
-                weight_list[i].append(weights[i])
-
-        idx_arrays = [jnp.concatenate(idx_list[i], axis=0) for i in range(4)]
-        weight_arrays = [jnp.concatenate(weight_list[i], axis=0) for i in range(4)]
-
-        pos_embeds = [self.pos_embed(idx_arrays[i].astype(jnp.int32)) * weight_arrays[i][:, None] for i in range(4)]
-        patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
-
-        splits = [int(h * w) for h, w in zip(grid_hs, grid_ws, strict=False)]
-        split_pos = jnp.cumsum(jnp.array(splits[:-1])) if len(splits) > 1 else []
-        patch_pos_embeds_list = jnp.split(patch_pos_embeds, split_pos, axis=0)
+        side = self.num_grid_per_side
+        pos_weight = self.pos_embed.weight.value
+        pos_grid = pos_weight.astype(jnp.float32).reshape(side, side, pos_weight.shape[-1])
+        highest = jax.lax.Precision.HIGHEST
 
         patch_pos_embeds_permute = []
-        for pos_embed, t, h, w in zip(patch_pos_embeds_list, grid_ts, grid_hs, grid_ws, strict=False):
+        for t, h, w in np.asarray(grid_thw).tolist():
             t, h, w = int(t), int(h), int(w)
+            rows = jnp.asarray(bicubic_border_resample_matrix(h, side))
+            cols = jnp.asarray(bicubic_border_resample_matrix(w, side))
+            pos_embed = jnp.einsum("hs,swd->hwd", rows, pos_grid, precision=highest)
+            pos_embed = jnp.einsum("hwd,xw->hxd", pos_embed, cols, precision=highest)
+            pos_embed = pos_embed.astype(pos_weight.dtype).reshape(h * w, -1)
             if t > 1:
                 pos_embed = jnp.tile(pos_embed, (t, 1))
             pos_embed = pos_embed.reshape(t, h // merge_size, merge_size, w // merge_size, merge_size, -1)
@@ -942,7 +954,7 @@ class Glm4vVisionModel(EasyDeLBaseModule):
         hidden_states = self.post_conv_layernorm(hidden_states)
 
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
-        hidden_states = hidden_states + pos_embeds
+        hidden_states = hidden_states + pos_embeds.astype(hidden_states.dtype)
 
         grid_lens = grid_thw[:, 1] * grid_thw[:, 2]
         repeated = jnp.repeat(grid_lens, grid_thw[:, 0])
@@ -1932,11 +1944,19 @@ class Glm4vModel(EasyDeLBaseModule):
                 video_embeds = jnp.concatenate(video_embeds, axis=0)
 
         if video_embeds is not None:
+            # GLM-4.1V/4.5V/4.6V processors spell every video frame as
+            # ``<|begin_of_image|><|image|>...<|end_of_image|>``, so HF's
+            # ``get_placeholder_mask`` scatters video features at
+            # ``image_token_id``. ``video_token_id`` is kept as a fallback for
+            # prompts expanded with the raw ``<|video|>`` token.
+            video_placeholders = [self.config.image_token_id]
+            if self.config.video_token_id is not None:
+                video_placeholders.append(self.config.video_token_id)
             inputs_embeds = BaseVisionLanguageModule.merge_multimodal_embeddings(
                 input_ids=input_ids,
                 inputs_embeds=inputs_embeds,
                 multimodal_embeddings=video_embeds.astype(inputs_embeds.dtype),
-                placeholder_token_id=self.config.video_token_id,
+                placeholder_token_id=video_placeholders,
             )
 
         return inputs_embeds

@@ -10,10 +10,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.sharding import Mesh
-
 import spectrax.runtime.spmd as spmd
 import spectrax.runtime.spmd.api as spmd_api
+from jax.sharding import Mesh
 from spectrax.runtime.spmd.hybrid import hybrid_linear_run
 from spectrax.runtime.types import MpMdMesh
 from spectrax.sharding.mesh import SpxMesh

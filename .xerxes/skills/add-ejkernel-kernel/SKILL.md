@@ -234,30 +234,31 @@ Use `autotune` only when the task is explicitly measuring config candidates.
 - DMA/async only counts when there is measured overlap and a measured win.
 - If Pallas is slower than XLA on one fixed shape, dump XLA and Pallas before broad block-size sweeps. Use
   `docs/reference/llo.md`.
-- If the TPU is busy, stop TPU validation and say it was not run. CPU/XLA may be used only for host-side preflight such
-  as imports, registry shape, simple reference math, or benchmark harness syntax. It does not validate TPU Pallas
-  correctness, Mosaic lowering, LLO behavior, DMA/async overlap, or performance.
+- If the TPU is busy, stop TPU validation and say it was not run. Kernel tests (XLA fallbacks included) execute
+  numerics and run on the accelerator only; with the TPU busy or absent, report them as unverified on hardware. CPU may
+  be used only for non-computation preflight such as imports, registry shape, or benchmark harness syntax — never as
+  validation of correctness, Mosaic lowering, LLO behavior, DMA/async overlap, or performance.
 
 ## Useful Commands
 
-Host-side preflight only:
+XLA-path tests (still computation tests — accelerator only):
 
 ```bash
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
-XLA_FLAGS=--xla_force_host_platform_device_count=8 \
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
   uv run pytest libs/ejkernel/test/kernels/_xla
 
-uv run python libs/ejkernel/test/run_tests.py --xla
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
+  uv run python libs/ejkernel/test/run_tests.py --xla
 ```
 
 Target TPU validation:
 
 ```bash
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu \
-uv run python libs/ejkernel/test/run_tests.py --pallas -k <kernel>
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
+  uv run python libs/ejkernel/test/run_tests.py --pallas -k <kernel>
 
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu \
-uv run pytest libs/ejkernel/test/modules/operations/test_<kernel>.py
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
+  uv run pytest libs/ejkernel/test/modules/operations/test_<kernel>.py
 ```
 
 If a TPU benchmark cannot start because libtpu is busy, do not report performance. Route through `.xerxes/ops/OPS.md`.

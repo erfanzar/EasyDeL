@@ -22,8 +22,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.sharding import Mesh, PartitionSpec
-
 from ejkernel import modules
 from ejkernel.kernels._xla.gated_delta_rule import gated_delta_rule as gated_delta_rule_xla
 from ejkernel.modules import operations
@@ -33,6 +31,7 @@ from ejkernel.modules.operations import (
     gated_delta_rule,
     gdr_attention,
 )
+from jax.sharding import Mesh, PartitionSpec
 
 from ._utils import assert_allclose, device_platform
 

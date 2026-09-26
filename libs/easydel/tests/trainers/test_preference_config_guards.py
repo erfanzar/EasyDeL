@@ -15,7 +15,6 @@
 from types import SimpleNamespace
 
 import pytest
-
 from easydel.trainers.binary_classifier_optimization_trainer.bco_config import BCOConfig
 from easydel.trainers.binary_classifier_optimization_trainer.bco_trainer import BCOTrainer
 from easydel.trainers.contrastive_preference_optimization_trainer.cpo_config import CPOConfig

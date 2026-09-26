@@ -39,6 +39,7 @@ import numpy as np
 import optax  # pyright: ignore[reportMissingTypeStubs]
 import pytest
 from easydel.infra.base_state import EasyDeLState
+from easydel.trainers.process_encoder import EncoderProcessor, ProcessEncoderConfig
 from easydel.trainers.trainer._fn import training_step
 
 try:
@@ -324,6 +325,53 @@ def test_vlm_head_sft_step_finite(family: str):
     assert np.isfinite(loss), f"{family}: non-finite SFT loss {loss}"
     assert np.isfinite(mean_grad_norm), f"{family}: non-finite gradient norm {mean_grad_norm}"
     assert mean_grad_norm > 0.0, f"{family}: gradients did not flow (mean_grad_norm={mean_grad_norm})"
+
+
+def test_paligemma_bucketed_encoder_features_compiled_sft_update():
+    """A capacity buffer survives input preparation and a real compiled SGD update."""
+    sc = _small_cfg()
+    sc["sharding_axis_dims"] = (1, 1, 1, 1, 1, 1)
+    cfg = setup_config(_build_paligemma(sc), sc)
+    with cfg.mesh:
+        model = create_ed_model_only("paligemma", ed.TaskType.IMAGE_TEXT_TO_TEXT, cfg, sc)
+        rng = np.random.default_rng(31)
+        ids = rng.integers(1, 100, size=(2, 32), dtype=np.int32)
+        ids[:, :16] = cfg.image_token_index
+        input_ids = jnp.asarray(ids)
+        completion_mask = jnp.asarray(np.tile([0] * 16 + [1] * 16, (2, 1)), dtype=jnp.int32)
+        batch = {
+            "input_ids": input_ids,
+            "attention_mask": jnp.ones_like(input_ids),
+            "labels": jnp.where(completion_mask == 0, -100, input_ids),
+            "completion_mask": completion_mask,
+            "pixel_values": jnp.asarray(rng.normal(size=(2, 3, 56, 56)), dtype=jnp.float32),
+        }
+        processor = EncoderProcessor(model, ProcessEncoderConfig(enabled=True, row_bucket_multiple=8))
+        batch = processor.process(batch)
+        assert "pixel_values" not in batch
+        assert batch["image_features"].shape == (128, sc["hidden_size"])
+        assert int(batch["image_features_valid_length"]) == 32
+        prepared = model.prepare_inputs_for_call(**batch)
+        assert prepared["image_features_valid_length"].shape == ()
+        assert int(prepared["image_features_valid_length"]) == 32
+
+        state = EasyDeLState.create(model=model, tx=optax.sgd(1e-3), init_opt_state=True)
+        before = [np.asarray(leaf).copy() for leaf in jax.tree_util.tree_leaves(state.graphstate)]
+        learning_rate_fn = optax.constant_schedule(1e-3)
+
+        @ed.ejit(static_argnums=(2, 3, 4, 5, 6, 7))
+        def step(st, b, loss_config, lr_fn, partition_spec, grad_accum, ste, loss_type):
+            return training_step(st, b, loss_config, lr_fn, partition_spec, grad_accum, ste, loss_type)
+
+        new_state, metrics = step(state, batch, None, learning_rate_fn, None, 1, None, "nll")
+        after = [np.asarray(leaf) for leaf in jax.tree_util.tree_leaves(new_state.graphstate)]
+        assert np.isfinite(float(metrics.loss))
+        assert np.isfinite(float(metrics.mean_grad_norm))
+        assert float(metrics.mean_grad_norm) > 0
+        assert int(new_state.step) == int(state.step) + 1
+        assert len(before) == len(after)
+        assert all(np.all(np.isfinite(leaf)) for leaf in after)
+        assert any(not np.array_equal(old, new) for old, new in zip(before, after, strict=True))
 
 
 if __name__ == "__main__":

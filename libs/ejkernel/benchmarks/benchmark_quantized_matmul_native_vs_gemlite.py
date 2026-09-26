@@ -38,7 +38,6 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import torch
-
 from ejkernel.modules.operations.configs import QuantizedMatmulConfig
 from ejkernel.modules.operations.quantized_matmul import quantized_matmul
 from ejkernel.quantization._utils.bitpack import _pack_bits

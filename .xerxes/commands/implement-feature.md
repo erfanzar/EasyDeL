@@ -15,15 +15,16 @@ Follow the implementation flow from XERXES.md:
 3. Implement the smallest complete change. Match surrounding code style (tp/jnp/spx aliases, ruff line length 121,
    Google docstrings). Never bypass a registry or hand-edit generated api_docs or version pins.
 4. Write the tests the skill requires (patterns:
-   `.xerxes/skills/generate-tests/SKILL.md`), then verify:
+   `.xerxes/skills/generate-tests/SKILL.md`), then verify on the accelerator (GPU:
+   `JAX_PLATFORMS=cuda,cpu JAX_PLATFORM_NAME=gpu`; the CPU trio only for non-computation tests):
 
    ```bash
-   ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
-   XLA_FLAGS=--xla_force_host_platform_device_count=8 \
+   env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
      uv run pytest <focused targets>
    uv run lint-imports
    ```
 
-5. Report files changed, verification commands with outcomes, and remaining risk (especially anything only validatable
-   on TPU/GPU). Do not claim training/serving readiness from constructor-only checks, and do not commit unless asked —
-   and never with self-credit trailers.
+5. Report files changed, verification commands with outcomes, and remaining risk. Without an accelerator, computation
+   tests were not run — report the change as unverified on hardware, never as validated by a CPU run. Do not claim
+   training/serving readiness from constructor-only checks, and do not commit unless asked — and never with self-credit
+   trailers.

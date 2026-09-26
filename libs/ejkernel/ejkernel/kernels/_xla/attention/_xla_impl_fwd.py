@@ -160,6 +160,8 @@ def attention(
     dropout_prob: float = 0.0,
     causal: bool = False,
     sliding_window: int | tuple[int, int] | None = None,
+    *,
+    precision: jax.lax.PrecisionLike = None,
 ) -> tuple[Float[Array, "batch seq_len num_q_heads vhead_dim"], Float[Array, "batch num_heads seq_len kv_len"]]:
     """Compute multi-head attention using standard JAX operations.
 
@@ -203,10 +205,13 @@ def attention(
         causal: If True, applies causal masking where each query position can only
             attend to previous key positions.
         sliding_window: Optional sliding window attention constraint. Can be:
-            - int: Symmetric window (same left and right window size)
+            - int: Window size ``W`` (HF convention; same as ``(W - 1, W - 1)``)
             - tuple[int, int]: Asymmetric window (left_window, right_window)
             - None: No window constraint (full attention)
             When specified, each query position can only attend to keys within the window.
+        precision: JAX matmul precision used for QK and attention-times-value.
+            None inherits the ambient JAX setting, while an explicit
+            ``Precision.DEFAULT`` overrides it. Does not change any tensor dtype.
 
     Returns:
         A tuple containing:
@@ -252,15 +257,15 @@ def attention(
     query = jnp.reshape(query, (b, qs, kh, num_reps, d))
     query, key, value = query.astype(dtype), key.astype(dtype), value.astype(dtype)
 
-    aw = jnp.einsum("bskhd,bmkd->bkhsm", query * softmax_scale, key, optimize=True)
+    aw = jnp.einsum("bskhd,bmkd->bkhsm", query * softmax_scale, key, optimize=True, precision=precision)
 
     if logits_soft_cap is not None:
         aw = logits_soft_cap * jnp.tanh(aw / logits_soft_cap)
 
     if sliding_window is not None:
         if isinstance(sliding_window, int):
-            left_window = sliding_window
-            right_window = sliding_window
+            # An int is a window *size* (HF convention): the query plus its ``W - 1`` neighbours.
+            left_window = right_window = max(sliding_window - 1, 0)
         else:
             left_window, right_window = sliding_window
 
@@ -327,5 +332,5 @@ def attention(
         multiplier = keep.astype(dtype) / jnp.asarray(keep_prob, dtype=dtype)
         aw = aw * multiplier
 
-    attention = jnp.einsum("bkhsm,bmkd->bskhd", aw, value, optimize=True).reshape(b, qs, qh, vd)
+    attention = jnp.einsum("bkhsm,bmkd->bskhd", aw, value, optimize=True, precision=precision).reshape(b, qs, qh, vd)
     return attention, aw.reshape(b, kh * num_reps, qs, ks)

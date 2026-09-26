@@ -7,7 +7,6 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import pytest
-
 import spectrax as spx
 
 from ._dynamic_helpers import (

@@ -95,36 +95,58 @@ class SpecDecodeStats:
 def default_assistant_layer_mapping(
     num_assistant_layers: int,
     num_target_layers: int,
+    *,
+    assistant_layer_types: typing.Sequence[str] | None = None,
+    target_layer_types: typing.Sequence[str] | None = None,
+    num_kv_shared_layers: int = 0,
 ) -> list[int]:
-    """Heuristic assistant-layer → target-layer mapping.
+    """Assistant-layer → target-layer K/V mapping.
 
     The Gemma4 Assistant's Q-only attention reads K/V from the target
-    model. Each assistant layer must be told which target layer's K/V
-    to attend to. Google's training defines the canonical mapping; it
-    is **not** published in the open ``Gemma4Assistant`` config, so
-    this heuristic is used until a reference is available:
+    model. With both layer-type lists available this follows the HF
+    reference (``Gemma4TextAttention.store_full_length_kv`` +
+    ``SinglePositionMultiTokenCandidateGenerator``): the target publishes,
+    per attention type, the K/V of its **last non-KV-shared layer of that
+    type**, and every assistant layer of type ``T`` reads that one entry.
+    Targets with KV sharing (Gemma4 E2B/E4B) therefore map to the donor
+    layers below ``num_hidden_layers - num_kv_shared_layers``, which are
+    the only layers that own a cache view.
 
-    Map the ``i``-th assistant layer to the ``i``-th target layer
-    counting from the END of the target stack — i.e. the assistant's
-    final layer attends to the target's final layer, and earlier
-    assistant layers attend to progressively earlier target layers.
-    Rationale: the assistant is a shallow drafter whose job is to
-    mimic the target's *late* representations, which carry the
-    next-token signal.
+    Without layer types it falls back to the legacy heuristic that maps the
+    ``i``-th assistant layer to the ``i``-th of the target's last
+    ``num_assistant_layers`` layers (only meaningful when those layers are
+    not KV-shared and happen to have matching attention types).
 
     Args:
         num_assistant_layers: Drafter layer count (4 for published
             Gemma4 assistants).
         num_target_layers: Target model decoder layer count.
+        assistant_layer_types: Optional per-assistant-layer attention types.
+        target_layer_types: Optional per-target-layer attention types.
+        num_kv_shared_layers: Number of trailing target layers that reuse a
+            donor layer's K/V (``0`` when the target has no KV sharing).
 
     Returns:
         A list of length ``num_assistant_layers`` mapping each
         assistant layer index to a target layer index.
     """
     if num_target_layers < num_assistant_layers:
-        return [num_target_layers - 1] * num_assistant_layers
-    base = num_target_layers - num_assistant_layers
-    return [base + i for i in range(num_assistant_layers)]
+        heuristic = [num_target_layers - 1] * num_assistant_layers
+    else:
+        base = num_target_layers - num_assistant_layers
+        heuristic = [base + i for i in range(num_assistant_layers)]
+    if not assistant_layer_types or not target_layer_types:
+        return heuristic
+
+    target_layer_types = list(target_layer_types)[: int(num_target_layers)]
+    num_kv_shared = max(0, int(num_kv_shared_layers or 0))
+    first_kv_shared = len(target_layer_types) - num_kv_shared if num_kv_shared > 0 else len(target_layer_types)
+    donor_candidates = target_layer_types[: max(0, first_kv_shared)]
+    last_of_type = {layer_type: idx for idx, layer_type in enumerate(donor_candidates)}
+    return [
+        int(last_of_type.get(str(layer_type), heuristic[i]))
+        for i, layer_type in enumerate(list(assistant_layer_types)[:num_assistant_layers])
+    ] + heuristic[len(assistant_layer_types) :]
 
 
 def build_target_kv_pairs(

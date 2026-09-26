@@ -16,7 +16,6 @@
 
 import jax
 import jax.numpy as jnp
-
 from ejkernel.kernels._xla.rwkv4 import rwkv4
 from ejkernel.kernels._xla.rwkv6 import rwkv6
 from ejkernel.kernels._xla.rwkv7 import rwkv7

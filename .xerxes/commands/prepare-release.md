@@ -8,9 +8,8 @@ Prepare a release for: $ARGUMENTS
 Follow `.xerxes/skills/release-workspace/SKILL.md` as the governing skill. The flow is two explicit stages — nothing
 leaves the machine in stage 1:
 
-1. **Pre-flight**: clean working tree for the released package; changelog/ version sanity; affected tests green under
-   the CPU env trio;
-   `uv run lint-imports` passes.
+1. **Pre-flight**: clean working tree for the released package; changelog/ version sanity; affected tests
+   green on the accelerator (the CPU trio only for non-computation suites such as eray); `uv run lint-imports` passes.
 2. **Release (local)**: `scripts/release.sh <lib> <version>` — bumps the version, syncs easydel's pins on sibling libs,
    refreshes locks, commits locally. Never hand-edit version pins.
 3. **Publish (outward-facing — confirm with the user before running)**:

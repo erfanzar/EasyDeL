@@ -18,7 +18,6 @@
 import jax
 import jax.numpy as jnp
 import pytest
-
 from ejkernel.kernels._xla.attention._interface import attention
 
 
@@ -40,8 +39,8 @@ def naive_attention_with_window(q, k, v, softmax_scale=None, sliding_window=None
 
     if sliding_window is not None:
         if isinstance(sliding_window, int):
-            left_window = sliding_window
-            right_window = sliding_window
+            # int ``W`` = HF window size (query plus ``W - 1`` neighbours).
+            left_window = right_window = sliding_window - 1
         else:
             left_window, right_window = sliding_window
 

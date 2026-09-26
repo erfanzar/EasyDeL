@@ -105,9 +105,9 @@ Do not broad-sweep block sizes before checking structure. If Pallas is slower th
 ## TPU Pallas Rules
 
 - Run TPU Pallas validation only when this process owns libtpu.
-- CPU/XLA can be used only for host-side preflight: imports, benchmark harness syntax, registry selection, or simple
-  reference math.
-- CPU timing is not TPU correctness, Mosaic lowering, LLO behavior, DMA/async overlap, or performance evidence.
+- Kernel tests (XLA reference paths included) are computation tests and run on the accelerator only.
+- CPU can be used only for non-computation preflight: imports, benchmark harness syntax, or registry selection.
+- A CPU run is never correctness, Mosaic lowering, LLO behavior, DMA/async overlap, or performance evidence.
 - DMA/async only counts when the measured target run shows overlap and a win.
 - If libtpu is busy, stop target validation and say it was not run.
 
@@ -126,7 +126,7 @@ Use `EJKERNEL_AUTOTUNE_POLICY=heuristics` for deterministic checks. Use
 
 ## Verification
 
-Host-side preflight only:
+Host-side harness preflight only (checks that the benchmark wiring imports and runs; not a test, not validation):
 
 ```bash
 ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
@@ -143,7 +143,7 @@ EJKERNEL_BENCH_OUTPUT_DIR=/tmp/ejkernel_bench_cpu_preflight \
 Target TPU correctness and benchmark:
 
 ```bash
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu \
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
   uv run pytest libs/ejkernel/test/kernels/_pallas/tpu/test_<kernel>.py
 
 ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu \

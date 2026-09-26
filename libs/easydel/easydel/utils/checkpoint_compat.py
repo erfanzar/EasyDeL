@@ -423,3 +423,48 @@ __all__ = [
     "materialize_tied_lm_head_from_embeddings",
     "rename_legacy_checkpoint_leaves",
 ]
+
+
+def apply_legacy_native_config_defaults(config: tp.Any, config_path: tp.Any) -> None:
+    """Keep natively-saved checkpoints behaving as they did before a config key existed.
+
+    A config class lists ``_legacy_native_defaults`` (``{key: value}``): the
+    behaviour its runtime had before ``key`` was introduced. EasyDeL writes
+    every such key into ``config.json`` (they are not base ``PretrainedConfig``
+    fields, so ``to_diff_dict`` keeps them), so a native ``config.json`` that
+    lacks one was saved by an older EasyDeL and gets that value back. Nested
+    sub-configs (e.g. a VLM's ``text_config``) are handled recursively. Only
+    call this for EasyDeL-native checkpoints; Hugging Face configs never carry
+    these keys and must keep the class defaults.
+
+    Args:
+        config: The loaded EasyDeL config; mutated in place.
+        config_path: Path or hub id whose ``config.json`` was loaded.
+    """
+    from transformers import PretrainedConfig
+
+    from easydel.infra.base_config import EasyDeLBaseConfig
+
+    try:
+        raw, _ = EasyDeLBaseConfig.get_config_dict(config_path)
+    except Exception as exc:  # nothing to compare against; keep the loaded values
+        logger.debug(f"Could not read raw config for legacy defaults ({exc}).")
+        return
+
+    def _apply(cfg: tp.Any, raw_cfg: dict[str, tp.Any], where: str) -> None:
+        for key, value in (getattr(type(cfg), "_legacy_native_defaults", None) or {}).items():
+            current = getattr(cfg, key, value)
+            if key in raw_cfg or current == value:
+                continue
+            setattr(cfg, key, value)
+            logger.warning(
+                f"Native checkpoint config{where} predates `{key}`; keeping its original behaviour "
+                f"`{key}={value!r}`. If this checkpoint was converted from Hugging Face weights, "
+                f"pass config_kwargs={{{key!r}: {current!r}}} or stamp that value into its "
+                "config.json (metadata only, no weight rewrite)."
+            )
+        for name, sub in vars(cfg).items():
+            if isinstance(sub, PretrainedConfig) and isinstance(raw_cfg.get(name), dict):
+                _apply(sub, raw_cfg[name], f"{where}.{name}")
+
+    _apply(config, raw, "")

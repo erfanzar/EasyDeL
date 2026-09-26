@@ -21,7 +21,7 @@ Specialization of `.xerxes/skills/run-research/SKILL.md`. The quality bar and ru
 | ejkernel kernels               | `libs/ejkernel/test/kernels/<backend>/` — parity vs the `_xla` reference                                                                                                                 |
 | eSurge scheduler/cache/sampler | `libs/easydel/tests/inference/esurge/{core,runners}/`                                                                                                                                    |
 | data pipeline                  | `libs/easydel/tests/data/` (packing determinism, source row limits)                                                                                                                      |
-| infra/sharding                 | `libs/easydel/tests/infra/` (spec resolution on the fake 8-device mesh)                                                                                                                  |
+| infra/sharding                 | `libs/easydel/tests/infra/` (spec resolution on the accelerator's multi-device mesh)                                                                                                     |
 | spectrax / eformer / eray      | `libs/<pkg>/tests/` mirroring the package layout                                                                                                                                         |
 
 ## Authoring Rules
@@ -35,10 +35,13 @@ Specialization of `.xerxes/skills/run-research/SKILL.md`. The quality bar and ru
    `@pytest.mark.slow`.
 3. Numerical assertions compare against an **independent reference** (HF model, XLA kernel, hand-computed constants)
    with explicit atol/rtol — never production code against itself.
-4. Sharding-sensitive tests run on the fake 8-device mesh; assert the resolved spec or the output equivalence across
-   mesh shapes, not internals.
+4. Sharding-sensitive tests run on the accelerator's multi-device mesh; assert the resolved spec or the output
+   equivalence across mesh shapes, not internals.
 5. Test what the change claims: a bugfix gets a test that fails on the pre-fix code; verify by reverting mentally or
    with `git stash`.
+6. Tests that execute JAX numerics are computation tests and run on the accelerator; the suite `conftest.py` refuses
+   them on a CPU backend. Only a test that does no array computation (config/CLI parsing, parsers, text transforms,
+   paths) may be marked `@pytest.mark.cpu_ok` (or allow-listed) so it can run under the CPU trio.
 
 ## Rejected Patterns
 
@@ -47,10 +50,10 @@ comparisons, tests that require hardware but don't skip cleanly without it.
 
 ## Verification
 
-Run the new tests under the CPU trio, then the surrounding directory to catch fixture interference:
+Run the new tests on the accelerator, then the surrounding directory to catch fixture interference (GPU:
+`JAX_PLATFORMS=cuda,cpu JAX_PLATFORM_NAME=gpu`; the CPU trio only for `cpu_ok` non-computation tests):
 
 ```bash
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
-XLA_FLAGS=--xla_force_host_platform_device_count=8 \
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
   uv run pytest <new-test-file> <its-directory>
 ```

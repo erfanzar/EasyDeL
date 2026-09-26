@@ -32,8 +32,8 @@ dependencies = [
     "beartype>=0.22.2",
     "chex>=0.1.91",
     "einops>=0.8.1",
-    "jax~=0.10.0",
-    "jaxlib~=0.10.0",
+    "jax>=0.10.0,<0.12.0",
+    "jaxlib>=0.10.0,<0.12.0",
     "jaxtyping>=0.3.2",
     "pydantic>=2.11.10",
     "tqdm>=4.67.1",
@@ -67,9 +67,9 @@ where = ["."]
 [project.optional-dependencies]
 
 cuda = [
-    "jax[cuda13]~=0.10.0 ; sys_platform == 'linux'",
-    "jax-cuda13-plugin[with-cuda]~=0.10.0 ; sys_platform == 'linux'",
-    "jax-cuda13-pjrt~=0.10.0 ; sys_platform == 'linux'",
+    "jax[cuda13]>=0.10.0,<0.12.0 ; sys_platform == 'linux'",
+    "jax-cuda13-plugin[with-cuda]>=0.10.0,<0.12.0 ; sys_platform == 'linux'",
+    "jax-cuda13-pjrt>=0.10.0,<0.12.0 ; sys_platform == 'linux'",
     "triton==3.6.0 ; sys_platform == 'linux'",
     "nvidia-cutlass-dsl[cu13]==4.5.2 ; sys_platform == 'linux'",
     "nvidia-cutlass-dsl-libs-base==4.5.2 ; sys_platform == 'linux'",
@@ -77,7 +77,7 @@ cuda = [
     "jax-tvm-ffi==0.1.2 ; sys_platform == 'linux'",
     "apache-tvm-ffi==0.1.8.post2 ; sys_platform == 'linux'",
 ]
-tpu = ["jax[tpu]~=0.10.0 ; sys_platform == 'linux'"]
+tpu = ["jax[tpu]>=0.10.0,<0.12.0 ; sys_platform == 'linux'"]
 triton = ["triton==3.6.0 ; sys_platform == 'linux'"]
 tilelang = [
     "tilelang==0.1.9 ; sys_platform == 'linux'",

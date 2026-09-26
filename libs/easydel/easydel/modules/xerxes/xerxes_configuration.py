@@ -150,19 +150,10 @@ class XerxesConfig(EasyDeLBaseConfig):
         self.rope_scaling = rope_scaling
         self.layer_types = layer_types
         if self.layer_types is None:
-            self.layer_types = ["full_attention" for _ in range(self.num_hidden_layers)]
-            for layer_idx in range(self.num_hidden_layers):
-                sliding_window = None
-
-                if not self.xe_kvnorm:
-                    sliding_window = 4096 if bool((layer_idx % 2) == 0) else None
-                if self.window_pattern is not None:
-                    sliding_window = self.sliding_window if bool((layer_idx + 1) % self.window_pattern) else None
-
-                if sliding_window is not None:
-                    self.layer_types[layer_idx] = "sliding_attention"
-                else:
-                    self.layer_types[layer_idx] = "full_attention"
+            self.layer_types = [
+                "sliding_attention" if self.layer_sliding_window(layer_idx) is not None else "full_attention"
+                for layer_idx in range(self.num_hidden_layers)
+            ]
 
         super().__init__(
             bos_token_id=bos_token_id,
@@ -174,6 +165,20 @@ class XerxesConfig(EasyDeLBaseConfig):
             **kwargs,
         )
         self.cache_implementation = "hybrid"
+
+    def layer_sliding_window(self, layer_idx: int) -> int | None:
+        """The attention window of ``layer_idx`` (``None`` for full attention).
+
+        Without ``xe_kvnorm`` even layers use a fixed 4096-token window; a
+        ``window_pattern`` overrides that with ``sliding_window`` on every layer
+        except each pattern's last.
+        """
+        sliding_window = None
+        if not self.xe_kvnorm:
+            sliding_window = 4096 if layer_idx % 2 == 0 else None
+        if self.window_pattern is not None:
+            sliding_window = self.sliding_window if (layer_idx + 1) % self.window_pattern else None
+        return sliding_window
 
     def get_mask_details(self) -> dict[int, AttnMaskDetail]:
         """Retrieve attention mask details for each layer in the model.
@@ -196,6 +201,6 @@ class XerxesConfig(EasyDeLBaseConfig):
             for layer_idx in range(self.num_hidden_layers):
                 mapping[layer_idx] = AttnMaskDetail(
                     mask_type=AttnMaskType.from_hf(self.layer_types[layer_idx]),
-                    size=self.sliding_window,
+                    size=self.layer_sliding_window(layer_idx),
                 )
         return mapping

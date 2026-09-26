@@ -29,7 +29,6 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import pytest
-
 from easydel.inference.logits_process import (
     EmptyProcessor,
     ForcedBOSTokenLogitsProcessor,

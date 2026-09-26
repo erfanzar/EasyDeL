@@ -364,6 +364,162 @@ class TestDeepseekV4:
             if view.rate:
                 assert view.compressor_entries.shape[1] >= total // view.rate
 
+    @pytest.mark.parametrize("mask_kind", ["attention_mask", "segments"])
+    def test_multidevice_mask_validation(self, small_model_config, mask_kind):
+        """Valid dynamic masks compile on TP; invalid padding/packing still raises."""
+        from ejkernel.types import MaskInfo
+
+        if jax.device_count() < 2:
+            pytest.skip("mask validation regression requires at least two devices")
+        config, model = self._build_fp32_model(
+            small_model_config,
+            sharding_axis_dims=(1, 1, 1, 1, 2, 1),
+            num_hidden_layers=2,
+            layer_types=["sliding_attention", "compressed_sparse_attention"],
+            mlp_layer_types=["moe", "moe"],
+        )
+        graphdef, params = spx.export(model)
+        # Use the model's mesh and committed replicated inputs to ensure this
+        # really lowers a multi-device program, not a single-device callback.
+        weight = next(iter(model.parameter_values().values()))
+        assert len(weight.sharding.device_set) == 2
+        replicated = jax.sharding.NamedSharding(weight.sharding.mesh, jax.sharding.PartitionSpec())
+        ids = jax.device_put(np.arange(16, dtype=np.int32).reshape(2, 8) + 2, replicated)
+        valid = np.ones((2, 8), np.int32) if mask_kind == "attention_mask" else np.zeros((2, 8), np.int32)
+        valid = jax.device_put(valid, replicated)
+
+        def forward(state, input_ids, mask):
+            module = spx.bind(graphdef, state)
+            kwargs = (
+                {"attention_mask": mask}
+                if mask_kind == "attention_mask"
+                else {"mask_info": MaskInfo.from_segments(mask)}
+            )
+            return module(input_ids=input_ids, **kwargs).logits
+
+        compiled = jax.jit(forward)
+        with config.mesh:
+            reference = model(input_ids=ids).logits
+            actual = compiled(params, ids, valid)
+            actual.block_until_ready()
+            jax.effects_barrier()
+            assert len(actual.sharding.device_set) == 2
+            assert np.isfinite(np.asarray(actual)).all()
+            np.testing.assert_allclose(np.asarray(actual), np.asarray(reference), rtol=1e-4, atol=1e-4)
+
+            invalid = valid.at[1, -1].set(0 if mask_kind == "attention_mask" else 1)
+            with pytest.raises(ValueError, match="packed-document training or padding-mask"):
+                forward(params, ids, invalid)
+            if jax.default_backend() == "cpu":
+                # XLA:CPU abandons a device thread whose host callback raised,
+                # so its TP peer waits at the next all-gather until the
+                # runtime's 40 s rendezvous timeout aborts the process. The
+                # runtime rejection below is exercised on TPU.
+                return
+            # Reuse the valid executable with new mask VALUES: rejection must
+            # happen at runtime, not merely when tracing a constant bad mask.
+            # JAX wraps a callback's ValueError in a backend-specific exception.
+            with pytest.raises(Exception, match="packed-document training or padding-mask"):
+                compiled(params, ids, invalid).block_until_ready()
+                jax.effects_barrier()
+            # A valid call must still work after rejection. It also replaces
+            # the failed unordered-effect token before JAX's exit barrier.
+            recovered = compiled(params, ids, valid)
+            recovered.block_until_ready()
+            jax.effects_barrier()
+            np.testing.assert_allclose(np.asarray(recovered), np.asarray(reference), rtol=1e-4, atol=1e-4)
+
+    def test_hf_import_materializes_parameters(self, small_model_config):
+        """HF import fills every required leaf, including mHC and both compressors."""
+        from easydel.utils.traversals import flatten_dict
+
+        if HF_DEEPSEEK_V4_CLASS is None:
+            pytest.skip("transformers does not ship DeepseekV4ForCausalLM")
+        model_config = {
+            **small_model_config,
+            "sharding_axis_dims": (1, 1, 1, 1, 1, 1),
+            "dtype": jnp.float32,
+        }
+        config = ed.DeepseekV4Config(**_v4_config_kwargs(model_config))
+        config.moe_force_xla_gmm = True
+        config = setup_config(config, model_config)
+        hf_model = create_hf_model(HF_DEEPSEEK_V4_CLASS, config)
+        with config.mesh:
+            model = create_ed_model(
+                module_name="deepseek_v4",
+                task=ed.TaskType.CAUSAL_LM,
+                config=config,
+                small_model_config=model_config,
+                hf_model=hf_model,
+            )
+        # Inspect all exported collections, not just the trainable selector:
+        # hash-router tables and other required non-trainables must load too.
+        weights = {}
+        for collection, tree in spx.export(model)[1].raw().items():
+            for path, value in flatten_dict(tree).items():
+                name = ".".join(str(part) for part in path)
+                value = value.value if hasattr(value, "value") else value
+                assert not isinstance(value, jax.ShapeDtypeStruct), f"unmaterialized {collection}:{name}"
+                weights[name] = value
+        hf_weights = hf_model.state_dict()
+        direct = [
+            ("model.embed_tokens.weight", False),
+            ("model.norm.weight", False),
+            ("model.layers.0.self_attn.q_a_proj.weight", True),
+            ("lm_head.weight", True),
+        ]
+        # These are the actual HF Parameter names (no trailing .weight).
+        # In particular, fn/hc_fn already have the runtime [mix, hc*hidden]
+        # orientation and must NOT receive the dense projection transpose.
+        direct.extend((f"model.hc_head.{leaf}", False) for leaf in ("hc_fn", "hc_base", "hc_scale"))
+        for idx, layer_type in enumerate(config.layer_types):
+            prefix = f"model.layers.{idx}"
+            for branch in ("attn_hc", "ffn_hc"):
+                direct.extend((f"{prefix}.{branch}.{leaf}", False) for leaf in ("fn", "base", "scale"))
+            if config.mlp_layer_types[idx] == "hash_moe":
+                direct.append((f"{prefix}.mlp.gate.tid2eid", False))
+            else:
+                direct.append((f"{prefix}.mlp.gate.e_score_correction_bias", False))
+            if layer_type != "sliding_attention":
+                compressor = f"{prefix}.self_attn.compressor"
+                branches = [compressor]
+                if layer_type == "compressed_sparse_attention":
+                    indexer = f"{compressor}.indexer"
+                    branches.append(indexer)
+                    direct.extend(
+                        [(f"{indexer}.q_b_proj.weight", True), (f"{indexer}.scorer.weights_proj.weight", True)]
+                    )
+                for branch in branches:
+                    direct.extend(
+                        [
+                            (f"{branch}.kv_proj.weight", True),
+                            (f"{branch}.gate_proj.weight", True),
+                            (f"{branch}.kv_norm.weight", False),
+                            (f"{branch}.position_bias", False),
+                        ]
+                    )
+        for name, transpose in direct:
+            assert name in hf_weights, f"HF source no longer declares {name}"
+            assert name in weights, f"missing required runtime leaf {name}"
+            expected = hf_weights[name].detach().cpu().numpy()
+            if transpose:
+                expected = expected.T
+            actual = np.asarray(weights[name])
+            # V4 deliberately stores tid2eid in param_dtype and casts at
+            # lookup; exact value comparison still pins every routing id.
+            assert actual.dtype == np.float32, name
+            np.testing.assert_array_equal(actual, expected, err_msg=name)
+
+        # HF uses bare, fused/stacked expert Parameters. Verify all experts and
+        # both halves, not just per-expert input aliases from synthetic states.
+        for idx in range(config.num_hidden_layers):
+            prefix = f"model.layers.{idx}.mlp.experts"
+            gate, up = np.split(hf_weights[f"{prefix}.gate_up_proj"].detach().cpu().numpy(), 2, axis=1)
+            down = hf_weights[f"{prefix}.down_proj"].detach().cpu().numpy()
+            for projection, source in (("gate_proj", gate), ("up_proj", up), ("down_proj", down)):
+                name = f"{prefix}.{projection}.weight"
+                np.testing.assert_array_equal(np.asarray(weights[name]), source.transpose(0, 2, 1), err_msg=name)
+
     def test_cached_greedy_matches_hf_generate(self, small_model_config):
         """SECONDARY parity: greedy tokens must match HF cached generation.
 

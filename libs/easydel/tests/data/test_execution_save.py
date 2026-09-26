@@ -6,7 +6,6 @@ from collections.abc import Iterator, Sequence
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-
 from easydel.data.core.protocols import ShardedDataSource
 from easydel.data.execution.save import save_dataset
 

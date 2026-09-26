@@ -13,10 +13,9 @@
 # limitations under the License.
 
 import pytest
-from jax import numpy as jnp
-
 from easydel.trainers.training_configurations import TrainingArguments
 from easydel.trainers.training_utils import resolve_straight_through_emulator
+from jax import numpy as jnp
 
 
 def _base_training_args() -> dict:

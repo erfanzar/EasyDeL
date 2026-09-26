@@ -14,16 +14,15 @@
 
 import json
 
+import easydel as ed
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
 import spectrax as spx
-from spectrax.serialization import Checkpointer
-
-import easydel as ed
 from easydel.infra.base_state import RESUME_MODEL_SUBDIR, EasyDeLState, _is_optimizer_template_incompatibility
+from spectrax.serialization import Checkpointer
 
 
 def _build_tiny_llama(rng_seed: int = 0):

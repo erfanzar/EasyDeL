@@ -25,13 +25,39 @@ those architectures:
   element-wise read mixer plus a per-branch scalar write gate.
 - :func:`inject_streams` applies the write side back onto the streams.
 
-DeepSeek-V4's ``DeepseekV4HyperConnection`` is deliberately NOT folded into
-this package: it shares the N-stream plumbing concept but its mixing law is a
-Sinkhorn-projected doubly-stochastic matrix rather than low-rank gates, and
-forcing one law onto both families would distort each. See
-``.claude/projects/qwen4-port.md`` (Tier 2b) for the rationale.
+- :class:`ManifoldHyperConnection` is the DeepSeek/GLM-style scalar read/write
+  gate and Sinkhorn-projected doubly-stochastic stream mixer, configured by
+  :class:`ManifoldHyperConnectionConfig` without model dependencies.
+- :func:`manifold_residual_write` applies its transposed mixer and write gates
+  to explicit ``[batch, seq, hc, hidden]`` streams.
+- :class:`ManifoldHyperHead` learns the final collapse; :class:`MeanHyperHead`
+  and :func:`mean_hyper_head` provide a parameter-free mean alternative.
+
+The gated and manifold variants belong to a common residual family, but their
+mixing laws and stream layouts remain distinct rather than forced into one
+parameterization.
 """
 
 from ._gated import GatedResidual, expand_streams, inject_streams
+from ._manifold import (
+    HyperStreamSharding,
+    ManifoldHyperConnection,
+    ManifoldHyperConnectionConfig,
+    ManifoldHyperHead,
+    MeanHyperHead,
+    manifold_residual_write,
+    mean_hyper_head,
+)
 
-__all__ = ("GatedResidual", "expand_streams", "inject_streams")
+__all__ = (
+    "GatedResidual",
+    "HyperStreamSharding",
+    "ManifoldHyperConnection",
+    "ManifoldHyperConnectionConfig",
+    "ManifoldHyperHead",
+    "MeanHyperHead",
+    "expand_streams",
+    "inject_streams",
+    "manifold_residual_write",
+    "mean_hyper_head",
+)

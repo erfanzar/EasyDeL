@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 import pytest
-
 from easydel.infra.factory import TaskType
 from easydel.infra.utils import (
     ACT2FN,

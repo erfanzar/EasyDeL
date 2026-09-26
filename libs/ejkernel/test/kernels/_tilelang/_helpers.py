@@ -16,10 +16,9 @@
 
 from __future__ import annotations
 
+import ejkernel.kernels._tilelang  # noqa: F401
 import jax
 import jax.numpy as jnp
-
-import ejkernel.kernels._tilelang  # noqa: F401
 from ejkernel.kernels._registry import Backend, Platform, kernel_registry
 
 _SEED = 1234

@@ -819,6 +819,8 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         attn_factor: float = 1.0,
         beta_fast: int = 32,
         beta_slow: int = 1,
+        truncate: bool = True,
+        attention_factor: float | None = None,
     ):
         """Initialize the YaRNScalingRotaryEmbedding module.
 
@@ -842,6 +844,9 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
                 Defaults to 32.
             beta_slow: YaRN parameter for low-frequency dimensions correction range.
                 Defaults to 1.
+            truncate: HF YaRN ``truncate`` flag for the correction band.
+            attention_factor: HF ``attention_factor``; when given it replaces
+                the inferred mscale (times ``attn_factor``).
         """
         super().__init__(
             head_size=head_size,
@@ -857,6 +862,9 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         self.attn_factor = attn_factor
         self.beta_fast = beta_fast
         self.beta_slow = beta_slow
+        # HF `truncate`: floor/ceil the correction band (gpt-oss ships False).
+        self.truncate = truncate
+        self.attention_factor = attention_factor
 
     @jax.named_scope("easydel-rope-yarn-scaling")
     def forward(
@@ -898,6 +906,8 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
                     beta_slow=self.beta_slow,
                     extrapolation_factor=self.extrapolation_factor,
                     attn_factor=self.attn_factor,
+                    truncate=self.truncate,
+                    attention_factor=self.attention_factor,
                 )
             if hasattr(frequencies, "value"):
                 frequencies = frequencies.value
@@ -1075,11 +1085,12 @@ class Phi3LongRoPEScaledRotaryEmbedding(spx.Module):
     raw ``base**(2i/d)`` denominators before the cos/sin cache is built, and
     a ``sqrt(1 + log(scale)/log(orig_max))`` magnitude rescale is applied
     afterwards. Implementation differs from the YaRN family in that there is
-    no smooth ramp — the selection is binary on context length. Requires
-    ``rotary_dim == head_size``.
+    no smooth ramp — the selection is binary on position (see
+    :func:`compute_phi3_frequencies`). Partial rotary
+    (``rotary_dim < head_size``) rotates only the leading channels.
 
     Attributes:
-        head_size (int): Per-head attention dimension; must equal ``rotary_dim``.
+        head_size (int): Per-head attention dimension.
         rotary_dim (int): Rotary feature dimension.
         max_position_embeddings (int): Post-scaling target context length.
         original_max_position_embeddings (int): Original training context.
@@ -1111,8 +1122,8 @@ class Phi3LongRoPEScaledRotaryEmbedding(spx.Module):
         target sequence length exceeds the original maximum length.
 
         Args:
-            head_size: The dimension size of each attention head. Must equal rotary_dim.
-            rotary_dim: The dimension size of the rotary embeddings. Must equal head_size.
+            head_size: The dimension size of each attention head.
+            rotary_dim: The dimension size of the rotary embeddings (<= head_size).
             max_position_embeddings: The target maximum sequence length after scaling.
             original_max_position_embeddings: The original maximum sequence length
                 before scaling, used to determine which factor to apply.
@@ -1292,7 +1303,8 @@ class Llama3RotaryEmbedding(RotaryEmbedding):
                     low_freq_factor=self.low_freq_factor,
                     high_freq_factor=self.high_freq_factor,
                     scaling_factor=self.scaling_factor,
-                    max_position_embeddings=self.orig_max_position,
+                    max_position_embeddings=self.max_position_embeddings,
+                    orig_max_position=self.orig_max_position,
                 )
             if hasattr(frequencies, "value"):
                 frequencies = frequencies.value

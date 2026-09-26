@@ -67,7 +67,6 @@ ReasoningParserName: TypeAlias = Literal[
 ]
 
 
-
 def shared_vocab(tokenizer) -> dict[str, int]:
     """``tokenizer.get_vocab()``, computed once per tokenizer.
 
@@ -100,6 +99,7 @@ def shared_vocab(tokenizer) -> dict[str, int]:
     except Exception:
         pass
     return vocab
+
 
 class ReasoningParser:
     """Abstract base class for reasoning content extraction from LLM outputs.

@@ -13,7 +13,6 @@ import jax
 import jax.numpy as jnp
 import pytest
 from jax.sharding import NamedSharding, PartitionSpec
-
 from spectrax import State
 from spectrax.serialization.serialization import (
     _fs_paths_from_key_paths,

@@ -14,9 +14,8 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel
-
 from easydel.inference.oai_proxies import InferenceApiRouter
+from pydantic import BaseModel
 
 
 class _Meta(BaseModel):

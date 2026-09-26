@@ -2793,7 +2793,6 @@ class eSurge:
         if self._profiling_steps_remaining <= 0:
             self.stop_profiling()
 
-
     def _ensure_scheduler_running(self, *, context: str) -> None:
         """Fail fast when the scheduler is not actually running.
 
@@ -3939,7 +3938,6 @@ class eSurge:
             with self._output_lock:
                 self._track_finished_output(request_id)
         return output
-
 
     def start_monitoring(self, **kwargs) -> dict[str, str]:
         """Start Prometheus-based monitoring for the engine.

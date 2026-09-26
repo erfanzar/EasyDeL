@@ -165,9 +165,13 @@ class Qwen2VLTextConfig(EasyDeLBaseConfig):
         layer_types (`list[str]`, *optional*):
             Per-layer attention type. Auto-derived from sliding window settings
             if not provided.
+        attention_bias (`bool`, *optional*, defaults to `True`):
+            Whether the Q/K/V projections use a bias (the output projection never does).
     """
 
     model_type = "qwen2_vl_text"
+    # Native checkpoints saved before `attention_bias` existed built q/k/v without bias.
+    _legacy_native_defaults: typing.ClassVar[dict[str, typing.Any]] = {"attention_bias": False}
     base_config_key = "text_config"
     keys_to_ignore_at_inference: typing.ClassVar = ["past_key_values"]
 
@@ -193,6 +197,7 @@ class Qwen2VLTextConfig(EasyDeLBaseConfig):
         rope_scaling: dict | None = None,
         rope_parameters: dict | None = None,
         layer_types: list[str] | None = None,
+        attention_bias: bool = True,
         **kwargs,
     ):
         """Initialize the Qwen2-VL text decoder configuration.
@@ -223,9 +228,15 @@ class Qwen2VLTextConfig(EasyDeLBaseConfig):
             rope_parameters: Alias for ``rope_scaling`` (HF compatibility).
             layer_types: Per-layer attention type. Auto-derived from
                 sliding-window settings when ``None``.
+            attention_bias: Whether the Q/K/V projections carry a bias. HF
+                Qwen2-VL hard-codes ``bias=True`` for Q/K/V (the output
+                projection is always bias-free).
             **kwargs: Additional arguments forwarded to
                 :class:`EasyDeLBaseConfig`.
         """
+        # HF Qwen2-VL splits the doubled cos/sin by ``mrope_section * 2`` and
+        # takes chunk ``i`` from axis ``i % 3`` (T/H/W in each rotary half).
+        self._external_rope_config_kwargs = {"repetition_style": True}
         super().__init__(**kwargs)
 
         self.vocab_size = vocab_size
@@ -249,6 +260,7 @@ class Qwen2VLTextConfig(EasyDeLBaseConfig):
         self.rope_theta = rope_theta
         self.attention_dropout = attention_dropout
         self.tie_word_embeddings = tie_word_embeddings
+        self.attention_bias = attention_bias
 
         self.rope_scaling = rope_scaling or rope_parameters
         if self.rope_scaling is not None:

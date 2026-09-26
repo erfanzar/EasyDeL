@@ -18,7 +18,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from ejkernel.kernels._triton import decode_attention
 from ejkernel.kernels._xla.decode_attention import decode_attention as xla_decode_attention
 

@@ -16,12 +16,12 @@
 
 Cohere Command is a Llama-shaped causal transformer with the following
 characteristic choices: a learnable logit scale (default ``1/16``), optional
-RMSNorm of query/key projections (``use_qk_norm``), SwiGLU MLPs, full RoPE,
+LayerNorm of query/key projections (``use_qk_norm``), SwiGLU MLPs, full RoPE,
 grouped-query attention, and tied input/output embeddings by default.
 
 Building blocks:
 
-- :class:`RMSNorm` — module-local RMS normalization with optional weight
+- :class:`CohereLayerNorm` — module-local bias-free LayerNorm with optional weight
   transpose.
 - :class:`CohereAttention` — :class:`UnifiedAttention` subclass with optional
   QK norm and a custom RoPE.
@@ -74,20 +74,24 @@ from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassification
 from .cohere_configuration import CohereConfig as CohereConfig
 
 
-class RMSNorm(spx.Module):
-    """Cohere-flavoured RMSNorm with learned scale and per-head shape support.
+class CohereLayerNorm(spx.Module):
+    """Cohere-flavoured bias-free LayerNorm with per-head shape support.
 
-    Differs from the layer in :mod:`easydel.layers` in two ways needed by
-    Cohere's Q/K normalization:
+    Matches HF ``CohereLayerNorm``: the input is mean-centred and
+    variance-normalised over the last axis (a real LayerNorm, not RMSNorm),
+    then scaled by a learned ``weight`` with no bias. Everything is computed
+    in ``float32`` and cast back to ``self.dtype`` at the end.
 
     * ``dim`` may be a tuple (e.g. ``(head_dim, num_heads)``) so a single
-      RMSNorm can normalise a per-head tensor without reshaping.
-    * ``do_t`` transposes the learned ``weight`` before scaling, matching the
-      layout HF Cohere checkpoints store Q/K-norm parameters in.
+      norm can carry a per-head scale for Cohere's Q/K normalization.
+    * ``do_t`` transposes the learned ``weight`` before scaling. The HF
+      Q/K-norm weight is ``(num_heads, head_dim)``; the checkpoint converter
+      transposes every 2-D ``weight`` on load (and back on export), so the
+      stored parameter is ``(head_dim, num_heads)`` and ``do_t`` restores the
+      ``(num_heads, head_dim)`` orientation that broadcasts against
+      ``[..., num_heads, head_dim]`` activations.
 
-    Computation: ``y = x * rsqrt(mean(x ** 2) + eps) * weight``, with the
-    accumulator promoted to ``float32`` (or kept ``float32`` for any FP8
-    activation dtype) before being cast back to ``self.dtype``.
+    Computation: ``y = (x - mean(x)) * rsqrt(var(x) + eps) * weight``.
     """
 
     kernel_init = staticmethod(jax.nn.initializers.ones)
@@ -95,20 +99,20 @@ class RMSNorm(spx.Module):
     def __init__(
         self,
         dim: int | tuple,
-        eps: float = 1e-6,
+        eps: float = 1e-5,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         do_t: bool = False,
         rngs: spx.Rngs | None = None,
     ):
-        """Initialize RMSNorm layer.
+        """Initialize the LayerNorm.
 
         Args:
-            dim (int | tuple): Dimension(s) of the normalization layer.
-            eps (float, optional): Small constant for numerical stability. Defaults to 1e-6.
-            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            dim (int | tuple): Dimension(s) of the normalization weight.
+            eps (float, optional): Small constant for numerical stability. Defaults to 1e-5.
+            dtype (jnp.dtype, optional): Data type for the output. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            do_t (bool, optional): Whether to transpose the kernel weight. Defaults to False.
+            do_t (bool, optional): Whether to transpose the weight before scaling. Defaults to False.
             rngs (spx.Rngs, optional): Random number generator state. Defaults to None.
         """
         super().__init__()
@@ -128,40 +132,32 @@ class RMSNorm(spx.Module):
         )
 
     def _norm(self, x: jnp.ndarray) -> jnp.ndarray:
-        """Compute RMS normalization.
+        """Mean-centre and variance-normalise ``x`` over its last axis.
 
         Args:
             x (jnp.ndarray): Input tensor to normalize.
 
         Returns:
-            jnp.ndarray: RMS-normalized tensor.
+            jnp.ndarray: Normalized tensor.
         """
-        return x * jax.lax.rsqrt(jnp.square(x).mean(-1, keepdims=True) + self.eps)
+        mean = jnp.mean(x, -1, keepdims=True)
+        variance = jnp.mean(jnp.square(x - mean), -1, keepdims=True)
+        return (x - mean) * jax.lax.rsqrt(variance + self.eps)
 
     def forward(self, x: jnp.ndarray) -> jnp.ndarray:
-        """Apply RMS normalization with learnable scale.
+        """Apply LayerNorm with learnable scale.
 
         Args:
             x (jnp.ndarray): Input tensor to normalize.
 
         Returns:
-            jnp.ndarray: Normalized and scaled tensor.
+            jnp.ndarray: Normalized and scaled tensor in ``self.dtype``.
         """
-        if self.dtype in [
-            jnp.float8_e4m3b11fnuz,
-            jnp.float8_e4m3fn,
-            jnp.float8_e4m3fnuz,
-            jnp.float8_e5m2,
-            jnp.float8_e5m2fnuz,
-        ]:
-            x = x.astype(jnp.float32)
-        else:
-            x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
-        output = self._norm(x).astype(self.dtype)
-        weight = self.weight.value.astype(self.dtype)
+        x = x.astype(jnp.float32)
+        weight = self.weight.value.astype(jnp.float32)
         if self.do_t:
             weight = weight.T
-        return output * weight
+        return (self._norm(x) * weight).astype(self.dtype)
 
 
 class CohereAttention(UnifiedAttention):
@@ -172,12 +168,12 @@ class CohereAttention(UnifiedAttention):
     Cohere-specific bits are:
 
     * **Q/K-norm.** When ``config.use_qk_norm`` is set, applies a
-      per-head :class:`RMSNorm` (``dim = (head_dim, num_heads)``) to the Q
-      and K projections *after* RoPE but before the dot product. Stabilises
-      training of larger Cohere variants.
+      per-head :class:`CohereLayerNorm` (``dim = (head_dim, num_heads)``) to the Q
+      and K projections *before* RoPE (as HF does). Stabilises training of
+      larger Cohere variants.
     * **RoPE.** ``_create_rotary`` always builds the basic RoPE with the
-      Cohere ``rope_theta`` and ``head_dim``; rotation is applied to the
-      full per-head dimension.
+      Cohere ``rope_theta`` and ``head_dim`` in the interleaved (GPT-J)
+      pairing; rotation is applied to the full per-head dimension.
     """
 
     def __init__(
@@ -212,14 +208,14 @@ class CohereAttention(UnifiedAttention):
         )
 
         if config.use_qk_norm:
-            self.q_norm = RMSNorm(
+            self.q_norm = CohereLayerNorm(
                 dim=(self.head_dim, self.config.num_attention_heads),
                 eps=config.layer_norm_eps,
                 dtype=self.dtype,
                 param_dtype=self.param_dtype,
                 do_t=True,
             )
-            self.k_norm = RMSNorm(
+            self.k_norm = CohereLayerNorm(
                 dim=(
                     self.head_dim,
                     self.config.num_key_value_heads,
@@ -240,7 +236,8 @@ class CohereAttention(UnifiedAttention):
         Returns:
             Rotary embedding module configured for Cohere architecture.
         """
-        return config.get_basic_rope(dtype, self.head_dim, self.head_dim, True)
+        # HF Cohere rotates interleaved (even, odd) pairs (GPT-J style), not NeoX halves.
+        return config.get_basic_rope(dtype, self.head_dim, self.head_dim, False)
 
     def _postprocess_qkv(self, query_states, key_states, value_states):
         """Apply Q/K normalization if configured.
@@ -403,7 +400,7 @@ class CohereBlock(spx.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.input_layernorm = RMSNorm(
+        self.input_layernorm = CohereLayerNorm(
             self.config.hidden_size,
             eps=self.config.layer_norm_eps,
             dtype=dtype,
@@ -559,7 +556,7 @@ class CohereModel(EasyDeLBaseModule):
                 )
         final_layer_idx = max(0, config.num_hidden_layers - 1)
         with self.assign_layer_stage(final_layer_idx, total_layers=config.num_hidden_layers):
-            self.norm = RMSNorm(
+            self.norm = CohereLayerNorm(
                 self.config.hidden_size,
                 eps=self.config.layer_norm_eps,
                 dtype=dtype,
@@ -582,7 +579,7 @@ class CohereModel(EasyDeLBaseModule):
     ) -> BaseModelOutput:
         """Performs forward pass through the Cohere transformer model.
 
-        Processes input tokens through embeddings, stacked Cohere decoder blocks with RMSNorm,
+        Processes input tokens through embeddings, stacked Cohere decoder blocks with LayerNorm,
         optional Q/K normalization, SwiGLU gated FFNs, and RoPE position encoding.
 
         Args:
@@ -603,7 +600,7 @@ class CohereModel(EasyDeLBaseModule):
 
         Returns:
             BaseModelOutput containing:
-                - last_hidden_state: Final RMSNorm output of shape (batch, seq_len, hidden_size)
+                - last_hidden_state: Final LayerNorm output of shape (batch, seq_len, hidden_size)
                 - hidden_states: Tuple of all layer outputs if output_hidden_states=True
                 - attentions: Tuple of all attention weights if output_attentions=True
                 - past_key_values: Updated cache for next generation step

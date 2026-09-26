@@ -527,9 +527,12 @@ class Gemma4VisionClippableLinear(spx.Module):
 
     Wraps either a :class:`ColumnParallelLinear` or :class:`RowParallelLinear`
     inside a ``self.linear`` attribute so that checkpoint parameter paths match
-    Hugging Face's Gemma4 layout (``*.linear.weight``). The "clippable" name
-    derives from the optional weight-clipping behaviour controlled by
-    ``Gemma4VisionConfig.use_clipped_linears``.
+    Hugging Face's Gemma4 layout (``*.linear.weight``). When
+    ``Gemma4VisionConfig.use_clipped_linears`` is set, the input and output
+    activations are clamped to the learned scalar ranges ``input_min``/
+    ``input_max`` and ``output_min``/``output_max`` (HF ``Gemma4ClippableLinear``
+    buffers, loaded from the checkpoint under the same names). Clipping is
+    per projection, so it is only supported on unfused projections.
     """
 
     def __init__(
@@ -577,9 +580,31 @@ class Gemma4VisionClippableLinear(spx.Module):
             rngs=rngs,
             layout=layout,
         )
+        self.use_clipped_linears = bool(getattr(config, "use_clipped_linears", False))
+        if self.use_clipped_linears:
+            if layout is not None:
+                raise ValueError("Clipped Gemma4 linears carry per-projection bounds and cannot be fused.")
+            for name, bound in (
+                ("input_min", -float("inf")),
+                ("input_max", float("inf")),
+                ("output_min", -float("inf")),
+                ("output_max", float("inf")),
+            ):
+                setattr(
+                    self,
+                    name,
+                    ArrayParam.bound(
+                        shape=(),
+                        dtype=param_dtype,
+                        init_method="constant",
+                        init_kwargs={"value": bound},
+                        key=None,
+                        value=jnp.full((), bound, dtype=param_dtype),
+                    ),
+                )
 
     def forward(self, hidden_states: Array) -> Array:
-        """Apply the wrapped linear projection.
+        """Apply the wrapped linear projection, clamping activations if enabled.
 
         Args:
             hidden_states (Array): Input tensor of shape ``(..., in_features)``.
@@ -587,7 +612,20 @@ class Gemma4VisionClippableLinear(spx.Module):
         Returns:
             Array: Output tensor of shape ``(..., out_features)``.
         """
-        return self.linear(hidden_states)
+        if self.use_clipped_linears:
+            hidden_states = jnp.clip(
+                hidden_states,
+                self.input_min.value.astype(hidden_states.dtype),
+                self.input_max.value.astype(hidden_states.dtype),
+            )
+        hidden_states = self.linear(hidden_states)
+        if self.use_clipped_linears:
+            hidden_states = jnp.clip(
+                hidden_states,
+                self.output_min.value.astype(hidden_states.dtype),
+                self.output_max.value.astype(hidden_states.dtype),
+            )
+        return hidden_states
 
 
 class Gemma4VisionRotaryEmbedding(spx.Module):
@@ -746,25 +784,46 @@ class Gemma4VisionAttention(spx.Module):
 
         q_size = self.num_attention_heads * self.head_dim
         kv_size = self.num_key_value_heads * self.head_dim
-        qkv_layout = dense_qkv_layout(
-            q_size,
-            kv_size,
-            query_prefix="q_proj.linear",
-            key_prefix="k_proj.linear",
-            value_prefix="v_proj.linear",
-        )
-        self.qkv_proj = Gemma4VisionClippableLinear(
-            config,
-            config.hidden_size,
-            qkv_layout.segment_sizes,
-            parallel_mode="column",
-            use_bias=bool(config.attention_bias),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-            layout=qkv_layout,
-        )
+        # HF clamps q/k/v inputs and outputs with separate per-projection bounds,
+        # which a single fused matmul cannot express; keep them unfused then.
+        self.use_clipped_linears = bool(config.use_clipped_linears)
+        if self.use_clipped_linears:
+            for name, out_size in (("q_proj", q_size), ("k_proj", kv_size), ("v_proj", kv_size)):
+                setattr(
+                    self,
+                    name,
+                    Gemma4VisionClippableLinear(
+                        config,
+                        config.hidden_size,
+                        out_size,
+                        parallel_mode="column",
+                        use_bias=bool(config.attention_bias),
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    ),
+                )
+        else:
+            qkv_layout = dense_qkv_layout(
+                q_size,
+                kv_size,
+                query_prefix="q_proj.linear",
+                key_prefix="k_proj.linear",
+                value_prefix="v_proj.linear",
+            )
+            self.qkv_proj = Gemma4VisionClippableLinear(
+                config,
+                config.hidden_size,
+                qkv_layout.segment_sizes,
+                parallel_mode="column",
+                use_bias=bool(config.attention_bias),
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+                layout=qkv_layout,
+            )
         self.o_proj = Gemma4VisionClippableLinear(
             config,
             self.num_attention_heads * self.head_dim,
@@ -796,6 +855,8 @@ class Gemma4VisionAttention(spx.Module):
 
     @property
     def reform_param(self):
+        if self.use_clipped_linears:
+            return {}
         return self.qkv_proj.linear.build_reform_param("qkv_proj.linear", config=self.config)
 
     def forward(
@@ -834,8 +895,13 @@ class Gemma4VisionAttention(spx.Module):
 
         self.num_attention_heads * self.head_dim
         self.num_key_value_heads * self.head_dim
-        qkv_states = self.qkv_proj(hidden_states)
-        query_states, key_states, value_states = self.qkv_proj.linear.split(qkv_states, config=self.config)
+        if self.use_clipped_linears:
+            query_states = self.q_proj(hidden_states)
+            key_states = self.k_proj(hidden_states)
+            value_states = self.v_proj(hidden_states)
+        else:
+            qkv_states = self.qkv_proj(hidden_states)
+            query_states, key_states, value_states = self.qkv_proj.linear.split(qkv_states, config=self.config)
         query_states = query_states.reshape(batch_size, sequence_length, self.num_attention_heads, self.head_dim)
         key_states = key_states.reshape(batch_size, sequence_length, self.num_key_value_heads, self.head_dim)
         value_states = value_states.reshape(
@@ -910,22 +976,42 @@ class Gemma4VisionMLP(spx.Module):
         """
         self.config = config
         self.act = ACT2FN[config.hidden_activation]
-        self.gate_up_proj = Gemma4VisionClippableLinear(
-            config,
-            config.hidden_size,
-            (config.intermediate_size, config.intermediate_size),
-            parallel_mode="column",
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-            layout=dense_gate_up_layout(
-                config.intermediate_size,
-                gate_prefix="gate_proj.linear",
-                up_prefix="up_proj.linear",
-            ),
-        )
+        # Clipped linears carry per-projection bounds, so gate/up stay unfused then.
+        self.use_clipped_linears = bool(config.use_clipped_linears)
+        if self.use_clipped_linears:
+            for name in ("gate_proj", "up_proj"):
+                setattr(
+                    self,
+                    name,
+                    Gemma4VisionClippableLinear(
+                        config,
+                        config.hidden_size,
+                        config.intermediate_size,
+                        parallel_mode="column",
+                        use_bias=False,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    ),
+                )
+        else:
+            self.gate_up_proj = Gemma4VisionClippableLinear(
+                config,
+                config.hidden_size,
+                (config.intermediate_size, config.intermediate_size),
+                parallel_mode="column",
+                use_bias=False,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+                layout=dense_gate_up_layout(
+                    config.intermediate_size,
+                    gate_prefix="gate_proj.linear",
+                    up_prefix="up_proj.linear",
+                ),
+            )
         self.down_proj = Gemma4VisionClippableLinear(
             config,
             config.intermediate_size,
@@ -940,6 +1026,8 @@ class Gemma4VisionMLP(spx.Module):
 
     @property
     def reform_param(self):
+        if self.use_clipped_linears:
+            return {}
         return self.gate_up_proj.linear.build_reform_param("gate_up_proj.linear", config=self.config)
 
     def forward(self, hidden_states: Array) -> Array:
@@ -957,8 +1045,12 @@ class Gemma4VisionMLP(spx.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
-        gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "vision_mlp_gate_up")
-        gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        if self.use_clipped_linears:
+            gate_raw = checkpoint_name(self.gate_proj(hidden_states), "vision_mlp_gate_up")
+            up = checkpoint_name(self.up_proj(hidden_states), "vision_mlp_gate_up")
+        else:
+            gate_up = checkpoint_name(self.gate_up_proj(hidden_states), "vision_mlp_gate_up")
+            gate_raw, up = split_fused_gate_up_projection(gate_up, config=self.config)
         gate = checkpoint_name(self.act(gate_raw), "vision_mlp_gate")
         hidden_states = checkpoint_name(self.down_proj(gate * up), "vision_mlp_down")
         hidden_states = apply_logical_sharding(
@@ -1324,7 +1416,10 @@ class Gemma4VisionPooler(spx.Module):
         if hidden_states.shape[1] != output_length:
             hidden_states, valid_mask = self._avg_pool_by_positions(hidden_states, pixel_position_ids, output_length)
 
-        hidden_states = hidden_states * self.root_hidden_size
+        # Scale in float32 and return float32 (HF ``Gemma4VisionPooler``): the
+        # sqrt(hidden_size) scaling can overflow low-precision ranges, so the
+        # magnitude stays in float32 until the caller standardizes it.
+        hidden_states = hidden_states.astype(jnp.float32) * self.root_hidden_size
         return hidden_states, valid_mask
 
 
@@ -1428,9 +1523,10 @@ class Gemma4VisionModel(EasyDeLBaseModule):
                 per-layer hidden states. Defaults to None (False).
 
         Returns:
-            BaseModelOutput: Flattened soft-token embeddings as
-            ``last_hidden_state`` plus optional per-layer hidden states and
-            attentions.
+            BaseModelOutput: Flattened ``(batch * num_soft_tokens, hidden)``
+            soft-token embeddings as ``last_hidden_state`` -- all valid rows
+            first in HF order, zeroed padding rows at the end -- plus optional
+            per-layer hidden states and attentions.
         """
         output_attentions = output_attentions if output_attentions is not None else False
         output_hidden_states = output_hidden_states if output_hidden_states is not None else False
@@ -1460,9 +1556,21 @@ class Gemma4VisionModel(EasyDeLBaseModule):
             padding_positions=padding_positions,
             output_length=output_length,
         )
-        hidden_states = jnp.where(pooler_mask[..., None], hidden_states, 0).reshape(-1, hidden_states.shape[-1])
+        # The pooler returns float32 features; standardize in float32 (the bias
+        # subtraction cancels large values) and only then cast back, like HF.
         if self.config.standardize:
-            hidden_states = (hidden_states - self.std_bias.value) * self.std_scale.value
+            hidden_states = (hidden_states - self.std_bias.value.astype(jnp.float32)) * self.std_scale.value.astype(
+                jnp.float32
+            )
+        hidden_states = hidden_states.astype(inputs_embeds.dtype)
+        # HF strips padded pooled rows (``hidden_states[pooler_mask]``), so soft
+        # token ``k`` of the whole batch is the ``k``-th valid row in row-major
+        # (image, position) order. Keep the static shape by stably moving the
+        # valid rows to the front (padding rows, zeroed, trail at the end) so the
+        # sequential placeholder merge consumes exactly the rows HF would.
+        flat_valid = pooler_mask.reshape(-1)
+        hidden_states = jnp.where(flat_valid[:, None], hidden_states.reshape(-1, hidden_states.shape[-1]), 0)
+        hidden_states = hidden_states[jnp.argsort(jnp.logical_not(flat_valid).astype(jnp.int32), stable=True)]
         hidden_states = checkpoint_name(hidden_states, "vision_model_output")
         return BaseModelOutput(
             last_hidden_state=hidden_states,
@@ -1605,53 +1713,19 @@ class Gemma4Attention(UnifiedAttention):
             with_scale=False,
         )
 
-    @staticmethod
-    def _hf_sliding_window(sliding_window: int | None) -> tuple[int, int] | None:
-        """Convert HF Gemma4 sliding-window size to EasyDeL's inclusive tuple form.
+    def _kernel_sliding_window(self) -> int | None:
+        """Return the sliding-window size handed to the attention kernels.
 
-        Hugging Face's Gemma4 expresses the window as the total number of
-        tokens (current + previous). EasyDeL's mask builders expect a
-        ``(left, right)`` inclusive offset tuple, so a HF window of ``N``
-        becomes ``(N - 1, 0)``.
-
-        Args:
-            sliding_window (int | None): HF-style window size.
+        Every EasyDeL/ejkernel attention path reads an integer window with the
+        Hugging Face convention (a window of ``N`` is the current token plus
+        the previous ``N - 1`` positions), so the raw config value is passed
+        through unchanged.
 
         Returns:
-            tuple[int, int] | None: ``(left, right)`` tuple for EasyDeL, or
-            ``None`` when ``sliding_window`` is ``None``.
+            int | None: HF-style window size, or ``None`` when this layer is
+            not sliding.
         """
-        if sliding_window is None:
-            return None
-        return (max(int(sliding_window) - 1, 0), 0)
-
-    def _kernel_sliding_window(self) -> int | tuple[int, int] | None:
-        """Choose the sliding-window representation expected by the active attention kernel.
-
-        Some ejkernel backends (ragged/page/decode/unified) accept a single
-        integer window count while the generic masked kernels expect the
-        inclusive ``(left, right)`` tuple produced by
-        :meth:`_hf_sliding_window`. This helper inspects the active
-        attention performer and returns whichever form the kernel needs.
-
-        Returns:
-            int | tuple[int, int] | None: Integer window size for ragged/page
-            backends, ``(left, right)`` tuple for the generic path, or
-            ``None`` when this layer is not sliding.
-        """
-        if self.sliding_window is None:
-            return None
-
-        impl = getattr(getattr(self, "attention_performer", None), "impl", None)
-        impl_name = type(impl).__name__.lower() if impl is not None else ""
-
-        # ejkernel ragged/page backends accept an integer window size, but they
-        # still follow Gemma4's HF semantics where a window of N means the
-        # current token plus the previous N-1 cache positions.
-        if any(token in impl_name for token in ("ragged", "page", "decode", "unified")):
-            return max(int(self.sliding_window) - 1, 0)
-
-        return self._hf_sliding_window(self.sliding_window)
+        return self.sliding_window
 
     @property
     def head_dim(self):
@@ -3100,6 +3174,8 @@ class Gemma4TextModel(EasyDeLBaseModule):
                 if nope_angles > 0
                 else inv_freq_rotated
             )
+            # HF `_compute_proportional_rope_parameters` divides by the optional `factor`.
+            inv_freq = inv_freq / global_params.get("factor", 1.0)
             positions = jnp.arange(self.config.granted_freq_max_position_embedding, dtype=jnp.float32)[:, None]
             phase = positions * inv_freq[None, :]
             frequencies = jnp.concatenate((jnp.cos(phase), jnp.sin(phase)), axis=-1)
@@ -3222,9 +3298,9 @@ class Gemma4TextModel(EasyDeLBaseModule):
 
             causal_mask_info = mask_info.apply_causal()
             mask_info_full = causal_mask_info.apply_token_type_ids(grouped_token_types)
-            mask_info_sliding = causal_mask_info.apply_sliding_window(
-                Gemma4Attention._hf_sliding_window(self.config.sliding_window)
-            ).apply_token_type_ids(grouped_token_types)
+            mask_info_sliding = causal_mask_info.apply_sliding_window(self.config.sliding_window).apply_token_type_ids(
+                grouped_token_types
+            )
             object.__setattr__(mask_info_full, "_causal_baked", True)
             object.__setattr__(mask_info_sliding, "_causal_baked", True)
 
@@ -3760,9 +3836,14 @@ class Gemma4Model(EasyDeLBaseModule):
             Merged embeddings ``[batch, seq_len, hidden_size]`` with vision
             features at image token positions and text embeddings elsewhere.
         """
-        inputs_embeds = self.language_model.embed_tokens(input_ids.astype("i4")) * (
-            self.config.text_config.hidden_size**0.5
+        embed_tokens = self.language_model.embed_tokens
+        inputs_embeds = embed_tokens(input_ids.astype("i4"))
+        # HF ``Gemma4TextScaledWordEmbedding`` rounds the scale to the weight dtype first.
+        embed_scale = jnp.asarray(
+            self.config.text_config.hidden_size**0.5,
+            dtype=getattr(embed_tokens, "param_dtype", None) or inputs_embeds.dtype,
         )
+        inputs_embeds = inputs_embeds * embed_scale.astype(inputs_embeds.dtype)
 
         if pixel_values is not None:
             self._require_vision_tower()

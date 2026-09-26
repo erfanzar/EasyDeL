@@ -139,6 +139,7 @@ def inner_kernel(
     d_k: int,
     d_v: int,
     use_qk_norm_in_gdn: bool,
+    apply_silu: bool,
     sublanesize: int,
     prefill_only: bool,
     prefill_scratch,
@@ -195,6 +196,7 @@ def inner_kernel(
         d_k: Key dimension.
         d_v: Value dimension.
         use_qk_norm_in_gdn: Whether to L2-normalize Q/K before the recurrence.
+        apply_silu: Whether to apply SiLU to the packed QKV rows before splitting.
         sublanesize: TPU sublane size used for alignment / row math.
         prefill_only: When ``True``, skip the decode branch entirely.
         prefill_scratch: Double-buffered VMEM scratch holding the live
@@ -310,7 +312,8 @@ def inner_kernel(
                     lane = b % sublanesize
                     lane_mask = (jnp.arange(sublanesize) == lane).astype(jnp.float32)[:, None]
                     qkv_row = jnp.sum(qkv_block_data * lane_mask, axis=0, keepdims=True)
-                    qkv_row = jax.nn.silu(qkv_row)
+                    if apply_silu:
+                        qkv_row = jax.nn.silu(qkv_row)
                     q = qkv_row[:, :key_dim].reshape(n_kq, d_k)
                     k = qkv_row[:, key_dim : 2 * key_dim].reshape(n_kq, d_k)
                     v = qkv_row[:, 2 * key_dim :].reshape(n_v, d_v)
@@ -364,7 +367,13 @@ def inner_kernel(
 
                         state_h = current_state[h]  # (d_k, d_v)
 
-                        k_state_h = pl.dot(k_h, state_h, precision=jax.lax.Precision.HIGHEST)  # (1, d_v)
+                        k_state_h = jax.lax.dot_general(
+                            k_h,
+                            state_h,
+                            (((1,), (0,)), ((), ())),
+                            precision=jax.lax.Precision.HIGHEST,
+                            preferred_element_type=jnp.float32,
+                        )  # (1, d_v)
 
                         decay_k_state = jnp.where(
                             jnp.isinf(k_state_h),
@@ -374,7 +383,13 @@ def inner_kernel(
                         v_diff_h = v_h - decay_k_state
                         v_new_h = curr_beta[h].astype(jnp.float32) * v_diff_h
 
-                        q_state_h = pl.dot(q_h, state_h, precision=jax.lax.Precision.HIGHEST)  # (1, d_v)
+                        q_state_h = jax.lax.dot_general(
+                            q_h,
+                            state_h,
+                            (((1,), (0,)), ((), ())),
+                            precision=jax.lax.Precision.HIGHEST,
+                            preferred_element_type=jnp.float32,
+                        )  # (1, d_v)
 
                         q_k_h = jnp.sum(q_h * k_h, axis=-1, keepdims=True)  # (1, 1)
 
@@ -382,8 +397,12 @@ def inner_kernel(
                         out_h = decay_q_state + q_k_h * v_new_h
                         out_list.append(out_h)
 
-                        k_v_new_h = pl.dot(
-                            k_h, v_new_h, trans_a=True, precision=jax.lax.Precision.HIGHEST
+                        k_v_new_h = jax.lax.dot_general(
+                            k_h,
+                            v_new_h,
+                            (((0,), (0,)), ((), ())),
+                            precision=jax.lax.Precision.HIGHEST,
+                            preferred_element_type=jnp.float32,
                         )  # (d_k, 1) @ (1, d_v) -> (d_k, d_v)
                         decay_state = jnp.where(jnp.isinf(state_h), 0.0, state_h * decay[h])
                         new_state_h = decay_state + k_v_new_h
@@ -484,7 +503,8 @@ def inner_kernel(
             key_dim = n_kq * d_k
 
             qkv_chunk = prefill_qkv_ref[...].astype(jnp.float32)  # (C, d)
-            qkv_chunk = jax.nn.silu(qkv_chunk)
+            if apply_silu:
+                qkv_chunk = jax.nn.silu(qkv_chunk)
             q = qkv_chunk[:, :key_dim]
             k = qkv_chunk[:, key_dim : 2 * key_dim]
             v = qkv_chunk[:, 2 * key_dim :]
@@ -655,7 +675,8 @@ def inner_kernel(
             key_dim = n_kq * d_k
 
             qkv_chunk = prefill_qkv_ref[:C_trans, :].astype(jnp.float32)
-            qkv_chunk = jax.nn.silu(qkv_chunk)
+            if apply_silu:
+                qkv_chunk = jax.nn.silu(qkv_chunk)
             q = qkv_chunk[:, :key_dim]
             k = qkv_chunk[:, key_dim : 2 * key_dim]
             v = qkv_chunk[:, 2 * key_dim :]
@@ -1090,6 +1111,7 @@ def fused_kernel(
     d_k: int,
     d_v: int,
     use_qk_norm_in_gdn: bool,
+    apply_silu: bool,
     sublanesize: int,
     prefill_only: bool,
 ):
@@ -1127,6 +1149,7 @@ def fused_kernel(
         d_k: Key dimension.
         d_v: Value dimension.
         use_qk_norm_in_gdn: Whether to apply QK L2 normalization.
+        apply_silu: Whether to apply SiLU to the packed QKV rows.
         sublanesize: TPU sublane size used for alignment.
         prefill_only: When ``True``, skip decode dispatch entirely.
     """
@@ -1188,6 +1211,7 @@ def fused_kernel(
                 d_k=d_k,
                 d_v=d_v,
                 use_qk_norm_in_gdn=use_qk_norm_in_gdn,
+                apply_silu=apply_silu,
                 sublanesize=sublanesize,
                 prefill_only=prefill_only,
                 prefill_scratch=scratch_ref,
@@ -1242,6 +1266,7 @@ def fused_kernel(
         "chunk_size",
         "BT",
         "use_qk_norm_in_gdn",
+        "apply_silu",
         "prefill_only",
     ],
 )
@@ -1263,6 +1288,7 @@ def recurrent_scan(
     chunk_size: int = 128,
     BT: int = 128,
     use_qk_norm_in_gdn: bool = True,
+    apply_silu: bool = True,
     has_initial_state: jax.Array | None = None,
     prefill_only: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
@@ -1296,6 +1322,9 @@ def recurrent_scan(
         BT: Token block size used for decode batches.
         use_qk_norm_in_gdn: Whether to apply QK L2 normalization inside
             the recurrence.
+        apply_silu: Whether the kernel applies SiLU to ``mixed_qkv`` before
+            splitting it into Q/K/V. Pass ``False`` when the caller already
+            activated the projections.
         has_initial_state: Optional ``int32`` per-request flag indicating
             that the existing recurrent state should be loaded from HBM.
             Defaults to zeros (cold start) when ``None``.
@@ -1370,6 +1399,7 @@ def recurrent_scan(
             d_k=d_k,
             d_v=d_v,
             use_qk_norm_in_gdn=use_qk_norm_in_gdn,
+            apply_silu=apply_silu,
             sublanesize=sublanesize,
             prefill_only=prefill_only,
         ),

@@ -16,7 +16,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from ejkernel.kernels._triton.ring_attention._interface import ring_attention as triton_ring_attention
 from ejkernel.kernels._xla.ring_attention._interface import ring_attention as xla_ring_attention
 from ejkernel.ops import BwdParams, FwdParams

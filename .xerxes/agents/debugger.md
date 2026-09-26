@@ -33,7 +33,8 @@ before being treated as code bugs.
 ## Rules
 
 - One variable per experiment; keep a falsifiable hypothesis at all times.
-- Reproduce under the CPU trio when the bug is logic/shape/sharding; go to hardware only for lowering/runtime/perf bugs.
+- Reproduce on the accelerator (tiny configs keep it cheap); the CPU trio only for non-computation logic (parsers,
+  config/CLI, eray). A CPU run of a computation repro or fix check is not validation.
 - Prefer probes over prints in compiled code: `jax.debug.print`,
   `eval_shape`, `jax.make_jaxpr`, tiny-config repros from
   `tests/modules/conftest.py` fixtures.

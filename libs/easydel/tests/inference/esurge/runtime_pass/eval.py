@@ -15,12 +15,11 @@
 
 import json
 
+import easydel as ed
+from easydel.inference.esurge.config import eSurgeContextConfig, eSurgeRuntimeConfig
 from jax import numpy as jnp
 from lm_eval import evaluator  # pyright: ignore[reportMissingImports]
 from transformers import AutoTokenizer
-
-import easydel as ed
-from easydel.inference.esurge.config import eSurgeContextConfig, eSurgeRuntimeConfig
 
 
 def main():

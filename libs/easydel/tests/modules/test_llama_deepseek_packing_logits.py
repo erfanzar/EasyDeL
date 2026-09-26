@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import os
+
+os.environ.setdefault("JAX_PLATFORMS", os.environ.get("JAX_PLATFORM_NAME", "cpu"))
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
-jax.config.update("jax_platform_name", "cpu")
 
 ATOL = 1e-3
 
@@ -33,7 +35,6 @@ def _packed_equivalence(model, *, vocab_size: int):
 
 def _llama_model():
     import spectrax as spx
-
     from easydel.modules.llama.llama_configuration import LlamaConfig
     from easydel.modules.llama.modeling_llama import LlamaForCausalLM
 
@@ -54,7 +55,6 @@ def _llama_model():
 
 def _deepseek_v2_model():
     import spectrax as spx
-
     from easydel.modules.deepseek_v2.deepseek_configuration import DeepseekV2Config
     from easydel.modules.deepseek_v2.modeling_deepseek import DeepseekV2ForCausalLM
 
@@ -85,7 +85,6 @@ def _deepseek_v2_model():
 
 def _deepseek_v3_model():
     import spectrax as spx
-
     from easydel.modules.deepseek_v3.deepseek_configuration import DeepseekV3Config
     from easydel.modules.deepseek_v3.modeling_deepseek import DeepseekV3ForCausalLM
 
@@ -111,7 +110,16 @@ def _deepseek_v3_model():
         scan_layers=False,
         layer_types=["full_attention", "full_attention"],
     )
-    return DeepseekV3ForCausalLM(config=config, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32), 128
+    # Compare segment isolation across sequence lengths, not shape-dependent
+    # TPU DEFAULT products.
+    model = DeepseekV3ForCausalLM(
+        config=config,
+        rngs=spx.Rngs(0),
+        dtype=jnp.float32,
+        param_dtype=jnp.float32,
+        precision=jax.lax.Precision.HIGHEST,
+    )
+    return model, 128
 
 
 @pytest.mark.parametrize(

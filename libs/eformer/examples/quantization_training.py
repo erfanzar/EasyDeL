@@ -9,7 +9,6 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
-
 from eformer.jaximus import implicit
 from eformer.ops.quantization import QuantizationConfig, QuantizationType, quantize, straight_through
 

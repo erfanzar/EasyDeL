@@ -13,9 +13,8 @@
 # limitations under the License.
 
 import jax.numpy as jnp
-from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
-
 from easydel.caching.transformer.cache import _expand_mask_kv_dim
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 
 
 def test_expand_mask_kv_dim_preserves_padding_mask():

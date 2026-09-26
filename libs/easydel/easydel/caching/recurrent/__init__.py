@@ -63,10 +63,6 @@ Example:
 """
 
 from .cache import (
-    LinearCache,
-    LinearCacheConfig,
-    LinearCacheView,
-    LinearMetadata,
     RecurrentCache,
     RecurrentCacheConfig,
     RecurrentCacheView,
@@ -74,10 +70,6 @@ from .cache import (
 )
 
 __all__ = (
-    "LinearCache",
-    "LinearCacheConfig",
-    "LinearCacheView",
-    "LinearMetadata",
     "RecurrentCache",
     "RecurrentCacheConfig",
     "RecurrentCacheView",

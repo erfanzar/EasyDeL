@@ -244,9 +244,9 @@ def test_quantization_reaches_a_jitted_train_step():
 
     assert set(quantized_grads) == set(reference_grads)
     assert all(bool(jnp.all(jnp.isfinite(value))) for value in quantized_grads.values())
-    assert any(
-        not jnp.array_equal(quantized_grads[path], reference_grads[path]) for path in quantized_grads
-    ), "gradients through the jitted step are identical to the unquantized model"
+    assert any(not jnp.array_equal(quantized_grads[path], reference_grads[path]) for path in quantized_grads), (
+        "gradients through the jitted step are identical to the unquantized model"
+    )
 
 
 def test_weight_only_preset_with_subchannel_tiling(dense_baseline):
@@ -273,14 +273,12 @@ def test_mixed_precision_config_applies_per_module_overrides(tmp_path):
     int4_paths = [
         path
         for path, module in spx.iter_modules(model)
-        if (rule := spx.quantization.rule_for(module, "dot_general")) is not None
-        and rule.weight_qtype == jnp.int4
+        if (rule := spx.quantization.rule_for(module, "dot_general")) is not None and rule.weight_qtype == jnp.int4
     ]
     int8_paths = [
         path
         for path, module in spx.iter_modules(model)
-        if (rule := spx.quantization.rule_for(module, "dot_general")) is not None
-        and rule.weight_qtype == jnp.int8
+        if (rule := spx.quantization.rule_for(module, "dot_general")) is not None and rule.weight_qtype == jnp.int8
     ]
 
     assert int4_paths and all("proj" in path for path in int4_paths), int4_paths
@@ -303,9 +301,7 @@ def test_a_weight_projection_written_as_an_einsum_still_honours_rules():
     x = jax.random.normal(jax.random.key(1), (2, 3, 4, 16), jnp.float32)
     baseline = layer(x)
 
-    spx.quantization.quantize_model(
-        layer, spx.quantization.QuantProvider.from_preset("int8", op_names=("dot_general",))
-    )
+    spx.quantization.quantize_model(layer, spx.quantization.QuantProvider.from_preset("int8", op_names=("dot_general",)))
     quantized = layer(x)
 
     assert quantized.shape == baseline.shape
@@ -338,9 +334,7 @@ def test_standalone_expert_linear_honours_a_ragged_dot_rule(direction):
     sorted_experts = jnp.repeat(jnp.arange(4), 2)
 
     baseline = layer(rows, group_sizes, sorted_experts)
-    spx.quantization.quantize_model(
-        layer, spx.quantization.QuantProvider.from_preset("int8", op_names=("ragged_dot",))
-    )
+    spx.quantization.quantize_model(layer, spx.quantization.QuantProvider.from_preset("int8", op_names=("ragged_dot",)))
     quantized = layer(rows, group_sizes, sorted_experts)
 
     assert quantized.shape == baseline.shape
@@ -391,9 +385,7 @@ def test_elarge_config_enables_quantization_aware_training(dense_baseline):
     assert jnp.array_equal(untouched(input_ids=_ids()).logits, baseline), (
         "a post-training-only quantization section must not enable quantized training"
     )
-    assert jnp.array_equal(
-        apply_configured_quantization_rules(_llama(), {})(input_ids=_ids()).logits, baseline
-    )
+    assert jnp.array_equal(apply_configured_quantization_rules(_llama(), {})(input_ids=_ids()).logits, baseline)
 
     quantized = apply_configured_quantization_rules(_llama(), {"quantization": {"training": "int8"}})
     assert _stamped_paths(quantized)
@@ -431,8 +423,7 @@ def test_elarge_intmp_config_path(tmp_path):
     int4 = [
         path
         for path, module in spx.iter_modules(model)
-        if (rule := spx.quantization.rule_for(module, "dot_general")) is not None
-        and rule.weight_qtype == jnp.int4
+        if (rule := spx.quantization.rule_for(module, "dot_general")) is not None and rule.weight_qtype == jnp.int4
     ]
     assert int4 and all("qkv_proj" in path for path in int4), int4
 

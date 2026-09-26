@@ -293,6 +293,15 @@ class DrafterSpeculation:
         # detected and re-based (its stale K/V dropped) instead of leaking.
         self._mtp_persist_base_pos_by_row: dict[int, int] = {}
         self._mtp_persist_req_by_row: dict[int, str] = {}
+        # Per-row record of the last window: its seed position and how many MTP
+        # cache slots it wrote from the seed slot onward. A fully accepted window
+        # commits one more position than it wrote slots for, so the next window
+        # re-bases ``_mtp_persist_base_pos_by_row`` by that gap (see
+        # ``_mtp_persist_committed_len``) instead of letting ``slot = pos - base``
+        # drift and keep rejected-draft K/V.
+        self._mtp_persist_last_seed_by_row: dict[int, int] = {}
+        self._mtp_persist_written_by_row: dict[int, int] = {}
+        self._warned_missing_target_kv = False
         # STABLE per-request drafter rows. The runner's ``req_idx`` is NOT
         # stable: ``condense``/``reorder_decode_first`` relocate surviving
         # requests to different sequence-buffer rows, and while the paged KV
@@ -352,6 +361,64 @@ class DrafterSpeculation:
             if self._mtp_persist_req_by_row.get(row) == str(rid):
                 self._mtp_persist_req_by_row.pop(row, None)
                 self._mtp_persist_base_pos_by_row.pop(row, None)
+                self._mtp_persist_last_seed_by_row.pop(row, None)
+                self._mtp_persist_written_by_row.pop(row, None)
+
+    def _mtp_persist_committed_len(self, row: int, seed_position: int) -> int:
+        """Return ``row``'s committed MTP slot count for a window seeded at ``seed_position``.
+
+        Persisted MTP slots map to sequence positions as ``slot = position - base``.
+        A window seeded at ``s`` writes one slot per draft step for positions
+        ``s, s + 1, ...``. When the verify accepts every draft the sequence
+        advances ``k + 1`` positions while only ``k`` slots were written, so the
+        position after the last written slot never enters the cache. Without
+        re-basing, every later window would compute a committed length one slot
+        too large per such gap — ``rollback_to`` clamps only the current window,
+        so the offset grows and retains rejected-draft K/V. Here ``base`` is
+        advanced by the gap, keeping ``slot = position - base`` exact.
+
+        Records this window's seed as the new reference (nothing written yet);
+        callers update ``_mtp_persist_written_by_row`` after drafting.
+
+        Args:
+            row: The request's stable drafter row.
+            seed_position: Seed position of the window about to be drafted.
+
+        Returns:
+            Number of leading slots of ``row`` that hold committed context.
+        """
+        seed_position = int(seed_position)
+        base = int(self._mtp_persist_base_pos_by_row.get(row, seed_position))
+        last_seed = self._mtp_persist_last_seed_by_row.get(row)
+        written = self._mtp_persist_written_by_row.get(row)
+        if last_seed is not None and written is not None:
+            gap = (seed_position - int(last_seed)) - int(written)
+            if gap > 0:
+                base += gap
+        self._mtp_persist_base_pos_by_row[row] = base
+        self._mtp_persist_last_seed_by_row[row] = seed_position
+        self._mtp_persist_written_by_row[row] = 0
+        return max(0, seed_position - base)
+
+    def _mtp_persist_checkpoint_skipped_window(self, req_id: str, seed_position: int) -> None:
+        """Record a window whose draft was skipped (reject backoff) for persist bookkeeping.
+
+        The skipped call's ``seed_position`` is the first post-verify seed of the
+        previous drafted window, i.e. the only point where that window's accepted
+        count is known. Checkpointing it (host-only; the device rollback happens
+        at the next real draft) lets the next window drop the previous window's
+        rejected-draft slots instead of keeping its whole written extent.
+
+        Args:
+            req_id: Request whose draft was skipped.
+            seed_position: Seed position of the skipped window.
+        """
+        if not self._mtp_persist_enabled():
+            return
+        row = self._mtp_row_by_req.get(str(req_id))
+        if row is None or self._mtp_persist_req_by_row.get(row) != str(req_id):
+            return
+        self._mtp_persist_committed_len(row, int(seed_position))
 
     @property
     def uses_recurrent_candidates(self) -> bool:
@@ -403,6 +470,8 @@ class DrafterSpeculation:
         self._backoff_by_req.clear()
         self._mtp_persist_base_pos_by_row.clear()
         self._mtp_persist_req_by_row.clear()
+        self._mtp_persist_last_seed_by_row.clear()
+        self._mtp_persist_written_by_row.clear()
         self._mtp_row_by_req.clear()
         self._mtp_row_free = []
         self._mtp_row_capacity = 0
@@ -1123,7 +1192,9 @@ class DrafterSpeculation:
         Returns:
             Tuple ``(pairs, attention_mask)`` where ``pairs`` is one
             ``(keys, values)`` tuple (or ``None``) per drafter layer and
-            ``attention_mask`` is a ``[1, 1, 1, kv_len]`` additive float mask, or
+            ``attention_mask`` is a ``[1, 1, 1, kv_len]`` additive float mask (or
+            the drafter's ``build_target_attention_mask`` result, e.g. a dict of
+            per-attention-type masks), or
             ``None`` when the drafter does not require a target K/V cache, the
             request is unknown, the cache has no views, or no layer yielded K/V.
         """
@@ -1182,6 +1253,11 @@ class DrafterSpeculation:
 
         if not any(pair is not None for pair in pairs):
             return None
+        mask_builder = getattr(self.drafter, "build_target_attention_mask", None)
+        if callable(mask_builder):
+            # Per-attention-type masks (e.g. the Gemma4 assistant's sliding
+            # layers only see the last ``sliding_window + 1`` positions).
+            return pairs, mask_builder(kv_len=kv_len, context_len=target_context_len)
         mask_positions = jnp.arange(kv_len, dtype=jnp.int32)[None, None, None, :]
         attention_mask = jnp.where(
             mask_positions < jnp.asarray(target_context_len, dtype=jnp.int32),
@@ -1285,6 +1361,7 @@ class DrafterSpeculation:
         backoff = int(self._backoff_by_req.get(str(req_id), 0))
         if backoff > 0:
             self._backoff_by_req[str(req_id)] = backoff - 1
+            self._mtp_persist_checkpoint_skipped_window(str(req_id), int(seed_position))
             return []
         use_prefix = (
             prefix_input_ids is not None
@@ -1292,12 +1369,18 @@ class DrafterSpeculation:
             and prefix_position_ids is not None
             and bool(getattr(self.drafter, "supports_prefix_draft", False))
         )
+        # Block drafters (DSpark / DFlash) predict the whole window from a FIXED
+        # anchor + target context: every call gets the anchor followed by the
+        # tokens drafted so far (the Markov head's previous tokens), the same
+        # target seed hidden, and never its own hidden state fed back.
+        block_draft = bool(getattr(self.drafter, "block_draft", False)) and not use_prefix
+        advance_position = bool(getattr(self.drafter, "advance_draft_position", True))
         cur_token = (
             jnp.asarray(prefix_input_ids, dtype=jnp.int32)
             if use_prefix
             else jnp.asarray([[int(seed_token)]], dtype=jnp.int32)
         )
-        cur_position = int(seed_position)
+        cur_position = int(seed_position) + int(getattr(self.drafter, "draft_position_offset", 0))
         seed_hidden_bsh = jnp.asarray(prefix_hidden_states) if use_prefix else jnp.asarray(seed_hidden)[None, None, :]
         drafted_dev: list[jax.Array] = []
         draft_fulls: list[jax.Array] = []
@@ -1307,7 +1390,13 @@ class DrafterSpeculation:
             seed_position=seed_position,
         )
         if bool(getattr(self.drafter, "requires_target_kv_cache", False)) and target_kv_payload is None:
-            logger.debug("Speculative assistant drafter has no target K/V payload; skipping drafts.")
+            if not self._warned_missing_target_kv:
+                self._warned_missing_target_kv = True
+                logger.warning(
+                    "Speculative assistant drafter got no target K/V payload (the mapped target layers own no "
+                    "cache view — e.g. KV-shared layers — or the request is unknown); drafting is skipped. "
+                    "Check the drafter's `layer_mapping`."
+                )
             return []
         # Per-verify-window drafter cache boundary. Two policies:
         #
@@ -1350,6 +1439,8 @@ class DrafterSpeculation:
                     self._mtp_persist_base_pos_by_row[row] = int(np.asarray(prefix_position_ids).reshape(-1)[0])
                 else:
                     self._mtp_persist_base_pos_by_row[row] = int(seed_position)
+                self._mtp_persist_last_seed_by_row[row] = int(seed_position)
+                self._mtp_persist_written_by_row[row] = 0
                 self.drafter.rollback_to(0, row_pos=row)
             else:
                 # Same request, later window: roll only this request's row back to
@@ -1357,10 +1448,8 @@ class DrafterSpeculation:
                 # K/V is dropped while the accepted context is retained.
                 # ``seed_position`` advances with the accepted sequence; the
                 # compacted committed length is its offset from that request's
-                # first written slot. ``rollback_to`` clamps this down to the
-                # written extent, so an all-accepted window cannot over-advance.
-                base = int(self._mtp_persist_base_pos_by_row.get(row, int(seed_position)))
-                committed_len = max(0, int(seed_position) - base)
+                # (gap-adjusted) base, see ``_mtp_persist_committed_len``.
+                committed_len = self._mtp_persist_committed_len(row, int(seed_position))
                 self.drafter.rollback_to(committed_len, row_pos=row)
         elif callable(reset_request):
             reset_request(request_id=str(req_id))
@@ -1399,6 +1488,9 @@ class DrafterSpeculation:
             # count; slice the valid prefix on the host (variable-length window).
             drafts_host, valid_host = jax.device_get((drafts_dev, valid_count_dev))
             valid = max(0, int(np.asarray(valid_host).reshape(-1)[0]))
+            if persist_on:
+                # One MTP cache slot per executed loop iteration.
+                self._mtp_persist_written_by_row[row] = valid
             drafted = [int(t) for t in np.asarray(drafts_host).reshape(-1)[:valid]]
             self.num_drafts_generated += len(drafted)
             return drafted
@@ -1434,6 +1526,10 @@ class DrafterSpeculation:
             except Exception:
                 logger.warning("Speculative drafter failed; disabling drafts for this request.", exc_info=True)
                 return []
+            if persist_on:
+                # Each chained draft call wrote one more slot at/after the seed slot
+                # (the prefix call writes the prefix through the seed slot).
+                self._mtp_persist_written_by_row[row] = draft_idx + 1
             if greedy:
                 # Keep the drafted token on-device: the next chained MTP step
                 # consumes it as a device array, so the K drafts pipeline back to
@@ -1447,8 +1543,12 @@ class DrafterSpeculation:
                 draft_fulls.append(filtered[0])
                 tok_dev = sampled_ids.reshape(-1)[:1].astype(jnp.int32)
             drafted_dev.append(tok_dev)
+            if block_draft:
+                cur_token = jnp.concatenate([cur_token, tok_dev.reshape(1, 1)], axis=1)
+                continue
             cur_token = tok_dev.reshape(1, 1)
-            cur_position += 1
+            if advance_position:
+                cur_position += 1
             step_hidden = getattr(step, "hidden_states", None)
             if step_hidden is not None:
                 seed_hidden_bsh = step_hidden[:, -1:, :]
@@ -1591,6 +1691,7 @@ class DrafterSpeculation:
                 # Reject-backoff: skip drafting this request this step (mirrors the
                 # early-return branch of ``draft_next``).
                 self._backoff_by_req[rid] = backoff - 1
+                self._mtp_persist_checkpoint_skipped_window(rid, int(seed_position))
                 continue
             if persist_on:
                 if self._mtp_persist_req_by_row.get(row) != rid:
@@ -1598,10 +1699,12 @@ class DrafterSpeculation:
                     # this row's committed origin and drop its stale K/V (roll to 0).
                     self._mtp_persist_req_by_row[row] = rid
                     self._mtp_persist_base_pos_by_row[row] = int(seed_position)
+                    self._mtp_persist_last_seed_by_row[row] = int(seed_position)
                     committed = 0
                 else:
-                    base = int(self._mtp_persist_base_pos_by_row.get(row, int(seed_position)))
-                    committed = max(0, int(seed_position) - base)
+                    committed = self._mtp_persist_committed_len(row, int(seed_position))
+                # ``draft_batched`` writes ``k_live`` slots for every collected row.
+                self._mtp_persist_written_by_row[row] = k_live
             else:
                 committed = 0
             seed_tokens[row] = int(seed_token)
@@ -1826,6 +1929,8 @@ class DrafterSpeculation:
                     # in-program. The base is re-recorded post-readback.
                     self._mtp_persist_req_by_row[row] = rid
                     self._mtp_persist_base_pos_by_row.pop(row, None)
+                    self._mtp_persist_last_seed_by_row.pop(row, None)
+                    self._mtp_persist_written_by_row.pop(row, None)
                     fresh_mask[row] = True
                 else:
                     base = int(self._mtp_persist_base_pos_by_row.get(row, base_known))
@@ -1860,6 +1965,7 @@ class DrafterSpeculation:
             "active": active,
             "fresh": fresh_mask,
             "persist_on": persist_on,
+            "k_live": k_live,
         }
 
     def finish_draft_in_verify(self, handle: dict) -> dict[str, dict[str, typing.Any]]:
@@ -1894,8 +2000,17 @@ class DrafterSpeculation:
         total = 0
         for rid, row, _off, cnt in handle["active"]:
             drafted = [int(t) for t in drafts_np[row, :]]
-            if persist_on and bool(fresh[row]):
-                self._mtp_persist_base_pos_by_row[row] = int(pos_np[row])
+            if persist_on:
+                seed_pos = int(pos_np[row])
+                if bool(fresh[row]):
+                    self._mtp_persist_base_pos_by_row[row] = seed_pos
+                    self._mtp_persist_last_seed_by_row[row] = seed_pos
+                else:
+                    # The in-program rollback already clamped this window to the
+                    # written extent; re-base for any fully-accepted gap so the
+                    # NEXT window's ``committed_base`` stays exact.
+                    self._mtp_persist_committed_len(row, seed_pos)
+                self._mtp_persist_written_by_row[row] = int(handle.get("k_live", len(drafted)))
             out[rid] = {
                 "argmaxes": [int(t) for t in arg_np[row, : int(cnt)]],
                 "accepted": int(acc_np[row]),
@@ -2479,9 +2594,7 @@ class DrafterSpeculation:
             replay_active.fill(False)
             replay_active[int(row_pos)] = True
             replay_num_computed[int(row_pos)] = int(num_computed_tokens_window_cpu[int(row_pos)]) + int(step_idx)
-            replay_req_num_tokens[int(row_pos)] = (
-                int(num_computed_tokens_window_cpu[int(row_pos)]) + int(step_idx) + 1
-            )
+            replay_req_num_tokens[int(row_pos)] = int(num_computed_tokens_window_cpu[int(row_pos)]) + int(step_idx) + 1
 
             out_tokens_replay, _, _, _, hidden_replay, _, _ = self._runner.executor_manager.execute(
                 num_tokens=one_token_static,

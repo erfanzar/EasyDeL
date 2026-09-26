@@ -38,7 +38,6 @@ from dataclasses import asdict, dataclass
 import jax
 import jax.numpy as jnp
 import pytest
-
 from ejkernel.ops import (
     AutotunePolicy,
     ConfigCache,
@@ -250,3 +249,36 @@ def test_non_hashable_provenance_value_degrades_to_miss_not_crash(tmp_path):
     path.write_text(json.dumps({"dev|op@v0|key": {PROVENANCE_KEY: ["autotune"], "cfg": {"block_size": 999}}}))
     cache = PersistentCache("test-provenance-op", path=str(path), cfg_type=DummyConfig)
     assert cache.get("dev", "op@v0", "key") is None
+
+
+def test_typed_config_round_trips_across_processes_without_cfg_type(tmp_path):
+    """An ejkernel dataclass config comes back typed (tuples intact) in a fresh process.
+
+    JSON has no tuples, so ops constructed without ``cfg_type`` used to get an ``argparse.Namespace``
+    whose ``(decode, prefill, mixed)`` block sizes were lists, which the MLA ragged v2 kernel
+    cannot consume on a persistent-cache hit.
+    """
+    from argparse import Namespace
+
+    from ejkernel.modules.operations.configs import MultiLatentRaggedPageAttentionV2Config
+
+    path = tmp_path / "mla-v2.json"
+    cfg = MultiLatentRaggedPageAttentionV2Config(
+        num_kv_pages_per_block=(8, 16, 32), num_queries_per_block=(1, 32, 16), platform="pallas"
+    )
+    PersistentCache("mla-v2", path=str(path)).put("dev", "op@v0", "key", cfg, provenance=PROVENANCE_AUTOTUNE)
+
+    loaded = PersistentCache("mla-v2", path=str(path)).get("dev", "op@v0", "key")
+    assert isinstance(loaded, MultiLatentRaggedPageAttentionV2Config)
+    assert loaded == cfg
+    assert loaded.num_kv_pages_per_block == (8, 16, 32)
+    hash(loaded)
+
+    # Configs defined outside ejkernel are never re-imported from the shared file: they fall back
+    # to a Namespace, still with JSON lists restored to tuples.
+    PersistentCache("dummy", path=str(tmp_path / "dummy.json")).put(
+        "dev", "op@v0", "key", {"sizes": [1, 2, 3]}, provenance=PROVENANCE_AUTOTUNE
+    )
+    fallback = PersistentCache("dummy", path=str(tmp_path / "dummy.json")).get("dev", "op@v0", "key")
+    assert isinstance(fallback, Namespace)
+    assert fallback.sizes == (1, 2, 3)

@@ -52,11 +52,13 @@ def _spec_decode_axis_dims() -> tuple[int, int, int, int, int, int]:
     return (1, 1, -1, 1, tp, 1)
 
 
-def make_tiny_qwen35(mtp_layers: int = 1) -> Qwen3_5ForCausalLM:
+def make_tiny_qwen35(mtp_layers: int = 1, *, precision: jax.lax.PrecisionLike = None) -> Qwen3_5ForCausalLM:
     """Build the tiny Qwen3.5 + MTP model used across the spec-decode tests.
 
     Args:
         mtp_layers: Number of MTP head layers (``mtp_num_hidden_layers``).
+        precision: Matmul precision; exact fp32 reference tests request HIGHEST
+            locally instead of changing the process-wide TPU precision.
 
     Returns:
         A float32 ``Qwen3_5ForCausalLM`` with a 4-layer (3 linear + 1 full)
@@ -79,4 +81,6 @@ def make_tiny_qwen35(mtp_layers: int = 1) -> Qwen3_5ForCausalLM:
         partial_rotary_factor=0.25,
         sharding_axis_dims=_spec_decode_axis_dims(),
     )
-    return Qwen3_5ForCausalLM(config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
+    return Qwen3_5ForCausalLM(
+        config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32, precision=precision
+    )

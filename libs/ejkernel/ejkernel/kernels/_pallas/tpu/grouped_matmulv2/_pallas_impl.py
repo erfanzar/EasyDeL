@@ -356,7 +356,9 @@ def grouped_matmul(
                 out = dot_general(lhs, rhs, acc_dtype)
 
                 for scale, axis in scales:
-                    out *= pltpu.repeat(scale, out.shape[axis] // scale.shape[axis], axis)
+                    repeats = [1] * scale.ndim
+                    repeats[axis] = out.shape[axis] // scale.shape[axis]
+                    out *= jnp.tile(scale, repeats)
 
                 acc_scratch[...] += out.astype(acc_scratch.dtype)
 
@@ -561,7 +563,9 @@ def transposed_grouped_matmul(
             out = dot(lhs.T, rhs, acc_dtype)
 
             for scale, axis in scales:
-                out *= pltpu.repeat(scale, out.shape[axis] // scale.shape[axis], axis)
+                repeats = [1] * scale.ndim
+                repeats[axis] = out.shape[axis] // scale.shape[axis]
+                out *= jnp.tile(scale, repeats)
 
             acc_scratch[...] += out.astype(acc_scratch.dtype)
 

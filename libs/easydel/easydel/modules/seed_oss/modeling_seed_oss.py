@@ -519,7 +519,7 @@ class SeedOssModel(EasyDeLBaseModule):
         if inputs_embeds is None:
             inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
 
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
         assert sequence_length <= self.config.max_position_embeddings, (
             f"Maximum sequence length exceeded: got {sequence_length}, "
             f"but config.max_position_embeddings={self.config.max_position_embeddings}"
@@ -536,10 +536,7 @@ class SeedOssModel(EasyDeLBaseModule):
         )
 
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            ).astype(jnp.int32)
+            position_ids = mask_info.q_position_ids
 
         hidden_states = self.dropout(inputs_embeds)
         if mode is None:

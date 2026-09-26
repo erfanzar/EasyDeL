@@ -123,9 +123,13 @@ def _fake_finish_batched_draft(self, handle):
     return handle["fake"]
 
 
-def _run(model, *, n, k, disable_emit, prompts, project_rows):
-    """Fully-deterministic generation (faked forward/project/drafter); returns
-    {rid: emitted tokens}. Only the emission batching differs by ``disable_emit``."""
+def _run(model, *, n, k, disable_emit, prompts, project_rows, replay=False, state_trace=None):
+    """Run deterministic generation, optionally recording public request state.
+
+    Returns {rid: emitted tokens}. Within each replay mode, only the emission
+    batching differs by ``disable_emit``; the sequential replay forward uses
+    the same deterministic executor seam as the initial verify forward.
+    """
     saved = {
         "proj": _strategy.DrafterSpeculation.project_hidden_rows,
         "dn": _strategy.DrafterSpeculation.draft_next,
@@ -135,6 +139,7 @@ def _run(model, *, n, k, disable_emit, prompts, project_rows):
         "emit": os.environ.get("EASYDEL_DISABLE_BATCHED_EMIT"),
         "persist": os.environ.get("EASYDEL_MTP_PERSIST_KV"),
         "fused": os.environ.get("EASYDEL_DISABLE_DRAFT_IN_VERIFY"),
+        "replay": os.environ.get("EASYDEL_SPEC_RECURRENT_REPLAY"),
     }
 
     def _spy_project(self, hr):
@@ -153,6 +158,11 @@ def _run(model, *, n, k, disable_emit, prompts, project_rows):
     # both arms run the faked project/draft seams it compares. The fused path
     # has its own parity coverage in ``test_mtp_draft_in_verify.py``.
     os.environ["EASYDEL_DISABLE_DRAFT_IN_VERIFY"] = "1"
+    # Default to isolated fast-path emission batching even when the caller has
+    # enabled replay. The replay regression opts in explicitly: it re-executes
+    # the forward, advancing the deterministic step counter and replacing the
+    # projected corrected token with a replay sample in BOTH emission modes.
+    os.environ["EASYDEL_SPEC_RECURRENT_REPLAY"] = "1" if replay else "0"
     try:
         runner = eSurgeRunner(
             model=model,
@@ -215,6 +225,18 @@ def _run(model, *, n, k, disable_emit, prompts, project_rows):
             so = sch.schedule()
             out = runner.execute_model(so)
             sch.update_from_output(so, out)
+            if state_trace is not None:
+                state_trace.append(
+                    {
+                        r.request_id: {
+                            "tokens": tuple(r.output_token_ids),
+                            "drafts": tuple(r.spec_token_ids),
+                            "computed": r.num_computed_tokens,
+                            "status": r.status,
+                        }
+                        for r in reqs
+                    }
+                )
             if all(r.is_finished() for r in reqs):
                 break
         else:
@@ -233,6 +255,7 @@ def _run(model, *, n, k, disable_emit, prompts, project_rows):
             ("EASYDEL_DISABLE_BATCHED_EMIT", saved["emit"]),
             ("EASYDEL_MTP_PERSIST_KV", saved["persist"]),
             ("EASYDEL_DISABLE_DRAFT_IN_VERIFY", saved["fused"]),
+            ("EASYDEL_SPEC_RECURRENT_REPLAY", saved["replay"]),
         ):
             if val is None:
                 os.environ.pop(key, None)
@@ -240,9 +263,11 @@ def _run(model, *, n, k, disable_emit, prompts, project_rows):
                 os.environ[key] = val
 
 
-def test_batched_emit_equals_per_request_b3_k3():
-    """B=3, k=3: batched emission == per-request emission, token-exact, on identical
-    deterministic inputs."""
+def test_batched_emit_equals_per_request_b3_k3(monkeypatch):
+    """B=3, k=3: token-exact emission parity even with ambient replay enabled."""
+    # Reproduce the setting leaked by exact-greedy tests during collection.
+    # _run must isolate its deterministic inputs and restore the caller's mode.
+    monkeypatch.setenv("EASYDEL_SPEC_RECURRENT_REPLAY", "1")
     model = make_tiny_model()
     n, k = 3, 3
     prompts = [[3, 1, 4, 1, 5, 9, 2, 6], [7, 7, 1, 2, 3, 8, 8, 4, 10, 5], [10, 20, 30, 40, 11, 21, 31]]
@@ -257,6 +282,7 @@ def test_batched_emit_equals_per_request_b3_k3():
     # per-request only ever projects k+1 rows.
     assert any(c > (k + 1) for c in bcalls), f"batched emission never engaged: {sorted(set(bcalls))}"
     assert all(c <= (k + 1) for c in pcalls), f"per-request unexpectedly batched: {sorted(set(pcalls))}"
+    assert os.environ["EASYDEL_SPEC_RECURRENT_REPLAY"] == "1"
 
 
 def test_batched_emit_equals_per_request_b3_k2():
@@ -271,6 +297,30 @@ def test_batched_emit_equals_per_request_b3_k2():
     for rid in bat:
         assert bat[rid] == per[rid], f"{rid}: batched {bat[rid]} != per-request {per[rid]}"
     assert any(c > (k + 1) for c in bcalls), f"batched emission never engaged: {sorted(set(bcalls))}"
+
+
+def test_replay_batched_emit_equals_per_request(monkeypatch):
+    """Batched emission must not bypass exact replay's token/state updates.
+
+    The deterministic executor returns different samples on each forward, so
+    skipping sequential replay changes both the emitted stream and subsequent
+    draft/commit boundaries. Compare public scheduler-visible request state at
+    every step, not private replay calls or projection batching.
+    """
+    monkeypatch.setenv("EASYDEL_SPEC_RECURRENT_REPLAY", "0")
+    model = make_tiny_model()
+    prompts = [[3, 1, 4, 1, 5, 9, 2, 6], [7, 7, 1, 2, 3, 8, 8, 4, 10, 5], [10, 20, 30, 40, 11, 21, 31]]
+    bat_state, per_state = [], []
+    bat = _run(model, n=3, k=2, disable_emit=False, prompts=prompts, project_rows=[], replay=True, state_trace=bat_state)
+    per = _run(model, n=3, k=2, disable_emit=True, prompts=prompts, project_rows=[], replay=True, state_trace=per_state)
+    assert set(bat) == {"r-0", "r-1", "r-2"}
+    assert all(len(tokens) == 14 for tokens in bat.values())
+    assert bat == per, f"replay output changed with batched emission: {bat} != {per}"
+    assert bat_state == per_state, "replay draft/commit state changed with batched emission"
+    assert any(sum(len(state["drafts"]) == 2 for state in step.values()) >= 2 for step in bat_state), (
+        "regression must exercise concurrent speculative requests"
+    )
+    assert os.environ["EASYDEL_SPEC_RECURRENT_REPLAY"] == "0"
 
 
 if __name__ == "__main__":

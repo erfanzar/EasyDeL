@@ -104,7 +104,6 @@ def build_spx_train_step(
     import jax
     import jax.numpy as jnp
     import optax
-
     import spectrax as spx
     import spectrax.contrib as spx_contrib
 

@@ -103,7 +103,9 @@ def _reshape_query_tensor(x, name: str):
     if x is None:
         return None
     if x.ndim == 4:
-        return x.reshape(-1, x.shape[-2], x.shape[-1])
+        # Avoid ``-1`` here: a zero-width trailing dim (NoPE MLA, rope_dim=0)
+        # makes ``math.prod`` return 0 and JAX's -1 inference divide by zero.
+        return x.reshape(x.shape[0] * x.shape[1], x.shape[2], x.shape[3])
     if x.ndim == 3:
         return x
     raise ValueError(f"`{name}` must be rank-3 or rank-4, got rank-{x.ndim}.")
@@ -135,9 +137,10 @@ def _reshape_feature_tensor(x, name: str):
         return None
     if x.ndim == 4:
         # Keep per-head features for kernels that support head-aware KV tensors.
-        return x.reshape(-1, x.shape[-2], x.shape[-1])
+        # No ``-1``: zero-width dims (NoPE MLA) break JAX's -1 inference.
+        return x.reshape(x.shape[0] * x.shape[1], x.shape[2], x.shape[3])
     if x.ndim == 3:
-        return x.reshape(-1, x.shape[-1])
+        return x.reshape(x.shape[0] * x.shape[1], x.shape[2])
     if x.ndim == 2:
         return x
     raise ValueError(f"`{name}` must be rank-2, rank-3, or rank-4, got rank-{x.ndim}.")

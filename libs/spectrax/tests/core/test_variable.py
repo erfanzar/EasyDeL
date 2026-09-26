@@ -10,7 +10,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from spectrax.core.sharding import Sharding
 from spectrax.core.stage_assignment import (
     PIPELINE_STAGE_METADATA_KEY,

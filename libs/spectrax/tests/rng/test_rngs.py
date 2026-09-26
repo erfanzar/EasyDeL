@@ -9,7 +9,6 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import pytest
-
 import spectrax as spx
 from spectrax.core.graph import export
 from spectrax.core.stage_assignment import PIPELINE_STAGE_METADATA_KEY, assign_stage
@@ -117,6 +116,27 @@ def test_rngs_missing_named_key_advances_state_under_jit():
     assert ("rng", "custom") not in {(c, p) for c, p, _ in export(r)[1].items()}
     _, _, lo = r.stream("default")._unpack()
     assert int(lo) == 2
+
+
+def test_rngs_undeclared_stream_does_not_repeat_under_jit():
+    """``Rngs.stream`` for an undeclared name inside a transform must not replay its key."""
+    r = Rngs(0)
+
+    @spx.jit(mutable="rng")
+    def draw(rngs):
+        """Draw two keys from an undeclared stream."""
+        stream = rngs.stream("custom")
+        first = jax.random.key_data(stream.next_key())
+        second = jax.random.key_data(rngs.stream("custom").next_key())
+        return first, second
+
+    a1, a2 = draw(r)
+    b1, b2 = draw(r)
+
+    assert not jnp.array_equal(a1, a2)
+    assert not jnp.array_equal(a1, b1)
+    assert not jnp.array_equal(a2, b2)
+    assert ("rng", "custom") not in {(c, p) for c, p, _ in export(r)[1].items()}
 
 
 def test_rngs_same_seed_same_keys():

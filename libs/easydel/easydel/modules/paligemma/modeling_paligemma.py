@@ -250,6 +250,7 @@ class PaliGemmaModel(EasyDeLBaseModule):
         *,
         image_features: Array | None = None,
         pixel_values: Array | None = None,
+        image_features_valid_length: int | Int[Array, ""] | None = None,
         **kwargs,
     ) -> Array:
         """Compute input embeddings with merged image and text features.
@@ -268,6 +269,10 @@ class PaliGemmaModel(EasyDeLBaseModule):
                 extracted. Defaults to None.
             pixel_values (Array | None, optional): Raw pixel values for image
                 extraction. Defaults to None.
+            image_features_valid_length: Optional scalar integer count of genuine rows
+                in the flattened precomputed image_features prefix. Remaining rows are
+                capacity padding. Requires image_features and no pixel_values; None
+                preserves strict exact-count merging.
             **kwargs: Additional keyword arguments (unused).
 
         Returns:
@@ -275,10 +280,16 @@ class PaliGemmaModel(EasyDeLBaseModule):
                 with image features merged at image-token positions.
 
         Raises:
-            ValueError: If input_ids is None.
+            ValueError: If input_ids is None, or valid-length metadata is supplied
+                without precomputed features or alongside raw pixels. Also raised for
+                invalid concrete metadata or mismatched placeholder/feature counts.
         """
         if input_ids is None:
             raise ValueError("`input_ids` must be provided when calling `compute_embedding`.")
+        if image_features_valid_length is not None and (image_features is None or pixel_values is not None):
+            raise ValueError(
+                "`image_features_valid_length` requires precomputed `image_features` and no `pixel_values`."
+            )
 
         text_config = self.config.get_text_config()
         image_token_id = self.config.image_token_id
@@ -302,6 +313,7 @@ class PaliGemmaModel(EasyDeLBaseModule):
                 inputs_embeds=inputs_embeds,
                 multimodal_embeddings=multimodal_embeddings,
                 placeholder_token_id=image_token_id,
+                multimodal_embeddings_valid_length=image_features_valid_length,
             )
 
         return inputs_embeds
@@ -321,6 +333,8 @@ class PaliGemmaModel(EasyDeLBaseModule):
         image_features: Array | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
+        *,
+        image_features_valid_length: int | Int[Array, ""] | None = None,
         **lm_kwargs,
     ) -> PaliGemmaModelOutputWithPast:
         """Forward pass through the PaliGemma base model.
@@ -353,6 +367,12 @@ class PaliGemmaModel(EasyDeLBaseModule):
                 optional): Metadata for cache management. Defaults to None.
             inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
                 (batch_size, sequence_length, hidden_size). Defaults to None.
+            image_features: Precomputed projected image features, optionally padded
+                along the flattened token dimension. Defaults to None.
+            image_features_valid_length: Optional scalar integer genuine-prefix length
+                for image_features. Requires input_ids, precomputed image_features, and
+                no pixel_values or inputs_embeds. None preserves strict exact counts.
+                Dynamic values must be host-validated before tracing.
             output_attentions (bool | None, optional): Whether to return attention weights.
                 Defaults to None.
             output_hidden_states (bool | None, optional): Whether to return hidden states.
@@ -365,10 +385,19 @@ class PaliGemmaModel(EasyDeLBaseModule):
 
         Raises:
             ValueError: If both or neither of input_ids and inputs_embeds are provided.
-            ValueError: If pixel_values is provided without input_ids.
+            ValueError: If pixel_values is provided without input_ids, or valid-length
+                metadata is supplied without precomputed features and input_ids, with
+                raw pixels, or with invalid concrete values.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+        if image_features_valid_length is not None:
+            if image_features is None or pixel_values is not None:
+                raise ValueError(
+                    "`image_features_valid_length` requires precomputed `image_features` and no `pixel_values`."
+                )
+            if input_ids is None:
+                raise ValueError("`input_ids` must be provided when `image_features_valid_length` is not None.")
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -384,6 +413,7 @@ class PaliGemmaModel(EasyDeLBaseModule):
             inputs_embeds = self.compute_embedding(
                 input_ids,
                 image_features=image_features,
+                image_features_valid_length=image_features_valid_length,
             )
 
         mask_info = MaskInfo.dynamic_init(
@@ -635,7 +665,14 @@ class PaliGemmaForConditionalGeneration(BaseVisionLanguageModule[PaliGemmaModel,
         """
         return self.base_model.get_image_features(pixel_values)
 
-    def compute_embedding(self, input_ids, *args, **kwargs):
+    def compute_embedding(
+        self,
+        input_ids,
+        *args,
+        image_features: Array | None = None,
+        image_features_valid_length: int | Int[Array, ""] | None = None,
+        **kwargs,
+    ):
         """Compute input embeddings with merged image and text features.
 
         Delegates to the base model's compute_embedding method.
@@ -643,12 +680,22 @@ class PaliGemmaForConditionalGeneration(BaseVisionLanguageModule[PaliGemmaModel,
         Args:
             input_ids (Array): Input token IDs of shape (batch_size, sequence_length).
             *args: Additional positional arguments passed to base model.
-            **kwargs: Additional keyword arguments including pixel_values and image_features.
+            image_features: Precomputed projected image features. Defaults to None.
+            image_features_valid_length: Optional scalar integer genuine-prefix length
+                in flattened image_features. Requires precomputed features and no raw
+                pixels; None preserves strict exact counts.
+            **kwargs: Additional keyword arguments including pixel_values.
 
         Returns:
             Array: Combined embeddings with image features merged at image token positions.
         """
-        return self.base_model.compute_embedding(input_ids, *args, **kwargs)
+        return self.base_model.compute_embedding(
+            input_ids,
+            *args,
+            image_features=image_features,
+            image_features_valid_length=image_features_valid_length,
+            **kwargs,
+        )
 
     def forward(
         self,
@@ -665,6 +712,9 @@ class PaliGemmaForConditionalGeneration(BaseVisionLanguageModule[PaliGemmaModel,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
+        *,
+        image_features: Array | None = None,
+        image_features_valid_length: int | Int[Array, ""] | None = None,
         **lm_kwargs,
     ) -> VLMCausalLMOutput:
         """Forward pass for image-conditioned text generation.
@@ -692,6 +742,11 @@ class PaliGemmaForConditionalGeneration(BaseVisionLanguageModule[PaliGemmaModel,
                 Defaults to True.
             inputs_embeds (Array | None, optional): Pre-computed input embeddings.
                 Defaults to None.
+            image_features: Precomputed projected image features. Defaults to None.
+            image_features_valid_length: Optional scalar integer genuine-prefix length
+                in flattened image_features. Requires input_ids, precomputed features,
+                and no raw pixels or inputs_embeds. None preserves strict exact counts.
+                Dynamic values must be host-validated before tracing.
             output_attentions (bool | None, optional): Whether to return attention weights.
                 Defaults to None.
             output_hidden_states (bool | None, optional): Whether to return hidden states.
@@ -716,6 +771,8 @@ class PaliGemmaForConditionalGeneration(BaseVisionLanguageModule[PaliGemmaModel,
         outputs = self.base_model(
             input_ids=input_ids,
             pixel_values=pixel_values,
+            image_features=image_features,
+            image_features_valid_length=image_features_valid_length,
             attention_mask=attention_mask,
             mask_info=mask_info,
             position_ids=position_ids,

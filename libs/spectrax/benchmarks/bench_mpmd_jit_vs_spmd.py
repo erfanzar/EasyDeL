@@ -22,7 +22,6 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh
-
 from spectrax.runtime.mpmd import sxjit, sxstage_iter
 from spectrax.runtime.schedules import GPipe, Std1F1B, ZeroBubbleH1
 from spectrax.runtime.spmd.api import pipeline_call

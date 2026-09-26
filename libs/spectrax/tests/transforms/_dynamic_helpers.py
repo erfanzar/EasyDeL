@@ -8,7 +8,6 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
-
 import spectrax as spx
 
 FEATURE_DIM = 4

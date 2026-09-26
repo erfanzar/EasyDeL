@@ -109,7 +109,8 @@ def dense_attention_reference(
 
     if sliding_window is not None:
         if isinstance(sliding_window, int):
-            left, right = int(sliding_window), int(sliding_window)
+            # int ``W`` = HF window size (query plus ``W - 1`` neighbours).
+            left, right = int(sliding_window) - 1, int(sliding_window) - 1
         else:
             left, right = int(sliding_window[0]), int(sliding_window[1])
         q_pos = jnp.arange(q_len)[:, None]

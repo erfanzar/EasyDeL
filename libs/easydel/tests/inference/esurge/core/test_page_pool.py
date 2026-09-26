@@ -30,7 +30,6 @@ prefix caching. The tests cover:
 from __future__ import annotations
 
 import pytest
-
 from easydel.inference.esurge.core.page_pool import PagePool
 from easydel.inference.esurge.core.utils import PageHash, PageHashWithGroupId
 

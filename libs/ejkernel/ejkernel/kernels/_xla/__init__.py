@@ -117,6 +117,7 @@ from .grouped_matmulv3 import grouped_matmulv3
 from .kernel_delta_attention import kda, kda_decay, kernel_delta_attention
 from .lightning_attn import lightning_attn
 from .mean_pooling import mean_pooling
+from .mhc_coefficients import mhc_coefficients
 from .multi_latent_ragged_page_attention import multi_latent_ragged_page_attention
 from .multi_latent_ragged_page_attention_v2 import multi_latent_ragged_page_attention_v2
 from .native_sparse_attention import apply_native_sparse_attention
@@ -178,6 +179,7 @@ __all__ = [
     "kernel_delta_attention",
     "lightning_attn",
     "mean_pooling",
+    "mhc_coefficients",
     "multi_latent_ragged_page_attention",
     "multi_latent_ragged_page_attention_v2",
     "page_attention",

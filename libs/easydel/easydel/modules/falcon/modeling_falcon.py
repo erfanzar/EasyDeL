@@ -219,6 +219,7 @@ class FalconAttention(UnifiedAttention):
         qkv_layout = dense_qkv_layout(
             self.num_heads * self.head_dim,
             self.num_key_value_heads * self.head_dim,
+            source_is_fused=True,
         )
         return ColumnParallelLinear(
             config.hidden_size,
@@ -231,6 +232,79 @@ class FalconAttention(UnifiedAttention):
             precision=precision,
             layout=qkv_layout,
         )
+
+    @property
+    def reform_param(self):
+        """Reorder HF Falcon's fused ``query_key_value`` into EasyDeL's ``[Q | K | V]``.
+
+        HF packs the fused projection in one of three ways (``FalconAttention._split_heads``):
+
+        * ``new_decoder_architecture``: grouped per KV head,
+          ``(num_kv_heads, heads_per_kv + 2, head_dim)`` = ``[q_0..q_{g-1}, k, v]`` per group;
+        * classic MHA (``multi_query=False``): interleaved per head, ``(num_heads, 3, head_dim)``;
+        * classic MQA (``multi_query=True``): already contiguous ``[Q_all | K | V]``.
+
+        The runtime splits one contiguous ``[Q_all | K_all | V_all]`` tensor, so the
+        first two layouts are permuted on load (and back on export) around the
+        prefused layout rule, which owns the TP interleave and the transpose.
+        """
+        qkv_attr = self._projection_attr("query_key_value_projection")
+        rules = self.query_key_value_projection.build_reform_param(
+            qkv_attr,
+            config=self.config,
+            include_bias=bool(self.config.bias),
+        )
+        heads, kv_heads, head_dim = self.num_heads, self.num_key_value_heads, self.head_dim
+
+        if self.config.new_decoder_architecture:
+            groups = heads // kv_heads
+
+            def _to_contiguous(tensor):
+                import torch
+
+                rest = tensor.shape[1:]
+                grouped = tensor.reshape(kv_heads, groups + 2, head_dim, *rest)
+                return torch.cat(
+                    [
+                        grouped[:, :groups].reshape(heads * head_dim, *rest),
+                        grouped[:, groups].reshape(kv_heads * head_dim, *rest),
+                        grouped[:, groups + 1].reshape(kv_heads * head_dim, *rest),
+                    ],
+                    dim=0,
+                )
+
+            def _from_contiguous(torch, tensor):
+                rest = tensor.shape[1:]
+                query, key, value = torch.split(tensor, [heads * head_dim, kv_heads * head_dim, kv_heads * head_dim])
+                return torch.cat(
+                    [
+                        query.reshape(kv_heads, groups, head_dim, *rest),
+                        key.reshape(kv_heads, 1, head_dim, *rest),
+                        value.reshape(kv_heads, 1, head_dim, *rest),
+                    ],
+                    dim=1,
+                ).reshape(tensor.shape)
+
+        elif not self.config.multi_query:
+
+            def _to_contiguous(tensor):
+                rest = tensor.shape[1:]
+                return tensor.reshape(heads, 3, head_dim, *rest).transpose(0, 1).reshape(tensor.shape)
+
+            def _from_contiguous(torch, tensor):
+                rest = tensor.shape[1:]
+                return tensor.reshape(3, heads, head_dim, *rest).transpose(0, 1).reshape(tensor.shape)
+
+        else:
+            return rules
+
+        for rule in rules.values():
+            split, inverse = rule["splits"][0]["spliter"], rule["inverse_spliter"]
+            rule["splits"][0]["spliter"] = lambda tensor, split=split: split(_to_contiguous(tensor))
+            rule["inverse_spliter"] = lambda torch, tensor, inverse=inverse: _from_contiguous(
+                torch, inverse(torch, tensor)
+            ).contiguous()
+        return rules
 
     def _create_o_proj(
         self,
@@ -500,6 +574,7 @@ class FalconBlock(spx.Module):
             mlp_layernorm_out = self.ln_mlp(hidden_states)
         else:
             attention_layernorm_out = self.input_layernorm(hidden_states)
+            mlp_layernorm_out = attention_layernorm_out
 
         attn_outputs = self.self_attention(
             attention_layernorm_out,
@@ -513,8 +588,7 @@ class FalconBlock(spx.Module):
             alibi,
         )
 
-        # Match HuggingFace logic for mlp_layernorm_out assignment
-        mlp_layernorm_out = attention_layernorm_out
+        # Match HuggingFace logic for mlp_layernorm_out assignment (the dual-LN path keeps ``ln_mlp(x)``).
         if not self.config.new_decoder_architecture:
             if self.config.parallel_attn:
                 mlp_layernorm_out = attention_layernorm_out
@@ -698,10 +772,13 @@ class FalconModel(EasyDeLBaseModule):
 
         alibi = None
         if self.config.alibi:
+            # HF folds the ALiBi bias into the mask pre-divided by sqrt(head_dim)
+            # (``softmax((QK^T + alibi) / sqrt(head_dim))``); the kernel only scales QK^T.
+            alibi_mask = attention_mask if attention_mask is not None else mask_info.q_attention_mask
             alibi = built_bloom_alibi(
-                mask_info,
+                jnp.asarray(alibi_mask, dtype=jnp.int32),
                 self.config.num_attention_heads,
-            ).astype(inputs_embeds.dtype)
+            ).astype(inputs_embeds.dtype) / jnp.asarray(math.sqrt(self.config.head_dim), dtype=inputs_embeds.dtype)
         if mode is None:
             mode = (
                 common_types.MODE_DECODE
@@ -773,7 +850,7 @@ class FalconModel(EasyDeLBaseModule):
         hidden_states = self.ln_f(hidden_states)
 
         if all_hidden_states is not None:
-            all_hidden_states += hidden_states
+            all_hidden_states += (hidden_states,)
 
         return BaseModelOutput(
             last_hidden_state=hidden_states,

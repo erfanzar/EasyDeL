@@ -3,7 +3,6 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import pytest
-
 from ejkernel.modules.operations import flash_attention
 from ejkernel.types import MaskInfo
 
@@ -145,3 +144,48 @@ def test_flash_attention_cuda_matches_triton(head_dim: int, sliding_window: tupl
     out_triton = flash_attention(q, k, v, causal=True, sliding_window=sliding_window, platform="triton")
 
     assert_allclose(out_cuda, out_triton, atol=0.2, rtol=0.1)
+
+
+def _hf_sliding_window_mask(batch: int, length: int, window: int) -> jax.Array:
+    """``transformers.masking_utils`` causal sliding window: the query plus the previous ``window - 1`` keys."""
+    q_idx = jnp.arange(length)[:, None]
+    kv_idx = jnp.arange(length)[None, :]
+    mask = (kv_idx <= q_idx) & (kv_idx > q_idx - window)
+    return jnp.broadcast_to(mask[None, None], (batch, 1, length, length))
+
+
+@pytest.mark.parametrize("sliding_window", [1, 3, 8])
+def test_flash_attention_int_sliding_window_is_hf_window_size_xla(sliding_window: int):
+    """An int window ``W`` keeps exactly ``W`` keys (itself + ``W - 1`` previous), like HF and the paged kernels."""
+    q, k, v = rand_qkv(
+        jax.random.PRNGKey(20), batch=2, q_len=24, kv_len=24, q_heads=4, kv_heads=2, head_dim=32, dtype=jnp.float32
+    )
+    with jax.default_matmul_precision("highest"):
+        out = flash_attention(
+            q,
+            k,
+            v,
+            causal=True,
+            sliding_window=sliding_window,
+            softmax_scale=0.5,
+            precision=jax.lax.Precision.HIGHEST,
+            platform="xla",
+        )
+        ref_out, _ = dense_attention_reference(
+            q, k, v, attention_mask=_hf_sliding_window_mask(2, 24, sliding_window), softmax_scale=0.5
+        )
+    assert_allclose(out, ref_out, atol=2e-3)
+
+
+@pytest.mark.skipif(device_platform() != "tpu", reason="TPU-only Pallas flash attention")
+@pytest.mark.parametrize("sliding_window", [1, 17, 64])
+def test_flash_attention_pallas_int_sliding_window_is_hf_window_size(sliding_window: int):
+    q, k, v = rand_qkv(
+        jax.random.PRNGKey(21), batch=1, q_len=256, kv_len=256, q_heads=4, kv_heads=2, head_dim=128, dtype=jnp.float32
+    )
+    out = flash_attention(q, k, v, causal=True, sliding_window=sliding_window, softmax_scale=0.1, platform="pallas")
+    with jax.default_matmul_precision("highest"):
+        ref_out, _ = dense_attention_reference(
+            q, k, v, attention_mask=_hf_sliding_window_mask(1, 256, sliding_window), softmax_scale=0.1
+        )
+    assert_allclose(out, ref_out, atol=3e-2)

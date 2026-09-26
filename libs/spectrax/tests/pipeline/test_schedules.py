@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import pytest
-
 from spectrax.runtime.schedules import (
     Action,
     DualPipeV,
@@ -364,6 +363,37 @@ class TestDualPipeV:
             for row in g
             for cell in row
         )
+
+    @pytest.mark.parametrize("zero_bubble", [True, False])
+    @pytest.mark.parametrize(("n_stages", "microbatches"), [(2, 4), (2, 8), (3, 7), (4, 8), (4, 12)])
+    def test_grid_rows_respect_cross_rank_dependencies(self, zero_bubble, n_stages, microbatches):
+        """Every action's producers run in a strictly earlier row, so row-by-row walkers are legal."""
+        from spectrax.runtime.schedules import dualpipev_tasks
+
+        sch = DualPipeV(microbatches=microbatches, zero_bubble=zero_bubble)
+        grid = sch.build(n_stages)
+        n_logical = 2 * n_stages
+        done: set[tuple[str, int, int]] = set()
+        for row in grid:
+            finished: set[tuple[str, int, int]] = set()
+            for rank, cell in enumerate(row):
+                for action in _iter_actions_in_cell(cell):
+                    logical = sch.logical_at(rank, action.virtual_stage, n_stages)
+                    mb = action.microbatch
+                    if action.phase is Phase.FWD:
+                        assert logical == 0 or ("F", logical - 1, mb) in done
+                        finished.add(("F", logical, mb))
+                    elif action.phase is Phase.BWD_W:
+                        assert ("B", logical, mb) in done
+                    else:
+                        assert ("F", logical, mb) in done
+                        assert logical == n_logical - 1 or ("B", logical + 1, mb) in done
+                        finished.add(("B", logical, mb))
+            done |= finished
+
+        for rank in range(n_stages):
+            column = [row[rank] for row in grid if row[rank] is not None]
+            assert column == dualpipev_tasks(n_stages, rank, microbatches, zero_bubble=zero_bubble)
 
     def test_zero_bubble_can_be_disabled_for_full_bwd_chunks(self):
         """The V pairing can run without split BWD-I/BWD-W slots on runtimes where split VJPs are costly."""

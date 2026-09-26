@@ -390,11 +390,15 @@ def _same_setup_sharding(value: object, sharding: object) -> bool:
         return True
     if type(current) is not type(sharding):
         return False
-    if getattr(current, "spec", None) != getattr(sharding, "spec", None):
-        return False
     if getattr(current, "memory_kind", None) != getattr(sharding, "memory_kind", None):
         return False
-    return _device_set_from_sharding(current) == _device_set_from_sharding(sharding)
+    # Same spec + same device *set* is not enough: a different device order or
+    # mesh shape maps shards to different devices. ``is_equivalent_to`` compares
+    # the ordered device assignment and the per-device index mapping.
+    try:
+        return bool(current.is_equivalent_to(sharding, len(getattr(value, "shape", ()))))
+    except Exception:
+        return False
 
 
 def _path_to_string(path: tuple[object, ...]) -> str:

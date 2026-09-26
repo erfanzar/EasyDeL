@@ -15,9 +15,8 @@
 import jax
 import jax.numpy as jnp
 import spectrax as spx
-from spectrax import nn
-
 from easydel.layers.linear_attention import apply_conv_with_state, apply_mask_to_padding_states
+from spectrax import nn
 
 
 def _make_depthwise_conv(

@@ -14,13 +14,13 @@
 
 """Tests for GLM-MoE-DSA model."""
 
+import easydel as ed
 import jax.numpy as jnp
 import pytest
 import spectrax as spx
 import transformers
-
-import easydel as ed
 from easydel.operations.kernels.glm_moe_dsa_indexer import GlmMoeDsaIndexerOp
+
 from tests.modules.mpmd._scheduler_utils import GENERATION_SCHEDULE_KIND, LOSS_SCHEDULE_KINDS
 from tests.modules.test_utils import CausalLMTester
 from tests.modules.test_utils.model_factory import setup_config
@@ -82,14 +82,14 @@ class TestGLMMoeDSA:
             pretraining_tp=1,
             tie_word_embeddings=small_model_config["tie_word_embeddings"],
             rope_theta=small_model_config["rope_theta"],
-            rope_interleave=False,
+            rope_interleave=True,
             mlp_layer_types=None,
             attention_bias=small_model_config["attention_bias"],
             attention_dropout=small_model_config["attention_dropout"],
             index_topk=128,
             index_head_dim=16,
             index_n_heads=4,
-            indexer_rope_interleave=False,
+            indexer_rope_interleave=True,
         )
 
     @pytest.mark.parametrize("mpmd_schedule_kind", LOSS_SCHEDULE_KINDS, indirect=True)

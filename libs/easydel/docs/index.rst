@@ -111,6 +111,8 @@ Zare Chavoshi, Erfan. "EasyDeL, an open-source library, is specifically designed
    infra/base_module.md
    infra/customization.md
    infra/adding_models.md
+   infra/indexers_and_hyper_connections.md
+   infra/tpu_training_optimizations.md
    infra/elarge_model.md
 
 .. toctree::

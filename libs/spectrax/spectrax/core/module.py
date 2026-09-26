@@ -570,6 +570,15 @@ class Module:
             if value is not None and not isinstance(value, Policy):
                 raise TypeError("`.policy` must be a spectrax.Policy or None")
             object.__setattr__(self, "_spx_policy", value)
+            # Mirror into the opaque map (like the training flag) so the
+            # policy is part of the GraphDef and survives export/bind for
+            # submodules, not only the pytree root.
+            if value is None:
+                self._spx_opaque.pop("_spx_policy", None)
+            else:
+                self._spx_opaque["_spx_policy"] = value
+            object.__setattr__(self, "_spx_export_cache", None)
+            _bump_graph_epoch()
             return
 
         is_module = isinstance(value, Module)

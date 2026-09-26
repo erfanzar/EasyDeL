@@ -21,7 +21,7 @@ entry with the forward-pass building blocks it dispatches to.
 
 Public symbols:
     - ``ragged_gated_delta_rule_v2``: Registered (Platform.XLA, Backend.ANY)
-      entry point that casts inputs to a runtime dtype and forwards to the
+      entry point that casts activations to a runtime dtype and forwards to the
       unsharded packed-inference GDN kernel.
     - ``ragged_gated_delta_rule_decode_only``: Per-token recurrent update used
       when every active request consumes exactly one new token.

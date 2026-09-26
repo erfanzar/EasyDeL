@@ -17,7 +17,6 @@
 import dataclasses
 
 import pytest
-
 from eray.resources.configs import (
     CpuAcceleratorConfig,
     GpuAcceleratorConfig,

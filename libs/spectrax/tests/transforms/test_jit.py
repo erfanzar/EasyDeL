@@ -9,7 +9,6 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import pytest
-
 import spectrax as spx
 from spectrax.nn.linear import Linear
 from spectrax.nn.norm import BatchNorm1d

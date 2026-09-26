@@ -20,7 +20,6 @@ import math
 
 import jax
 import jax.numpy as jnp
-
 from ejkernel.ops import FwdParams
 
 from ._helpers import (

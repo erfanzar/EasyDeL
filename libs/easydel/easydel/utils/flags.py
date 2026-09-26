@@ -165,60 +165,102 @@ def render_markdown() -> str:
 # --------------------------------------------------------------------------- #
 
 EASYDEL_MAX_SCHEDULER_ERRORS = _register(
-    "EASYDEL_MAX_SCHEDULER_ERRORS", "int", 5, "eSurge engine",
+    "EASYDEL_MAX_SCHEDULER_ERRORS",
+    "int",
+    5,
+    "eSurge engine",
     "Max consecutive scheduler errors before the eSurge engine loop stops.",
 )
 EASYDEL_HEARTBEAT_WARN_S = _register(
-    "EASYDEL_HEARTBEAT_WARN_S", "float", 120.0, "eSurge engine",
+    "EASYDEL_HEARTBEAT_WARN_S",
+    "float",
+    120.0,
+    "eSurge engine",
     "Seconds without a scheduler heartbeat before a stall warning is logged.",
 )
 EASYDEL_HEARTBEAT_WARN_INTERVAL_S = _register(
-    "EASYDEL_HEARTBEAT_WARN_INTERVAL_S", "float", 30.0, "eSurge engine",
+    "EASYDEL_HEARTBEAT_WARN_INTERVAL_S",
+    "float",
+    30.0,
+    "eSurge engine",
     "Minimum seconds between repeated scheduler-stall warnings.",
 )
 EASYDEL_TOKENIZER_ENDPOINT = _register(
-    "EASYDEL_TOKENIZER_ENDPOINT", "str", None, "eSurge engine",
+    "EASYDEL_TOKENIZER_ENDPOINT",
+    "str",
+    None,
+    "eSurge engine",
     "Overrides the tokenizer worker ZeroMQ endpoint.",
 )
 EASYDEL_DETOKENIZER_ENDPOINT = _register(
-    "EASYDEL_DETOKENIZER_ENDPOINT", "str", None, "eSurge engine",
+    "EASYDEL_DETOKENIZER_ENDPOINT",
+    "str",
+    None,
+    "eSurge engine",
     "Overrides the detokenizer worker ZeroMQ endpoint.",
 )
 EASYDEL_WORKER_STARTUP_TIMEOUT = _register(
-    "EASYDEL_WORKER_STARTUP_TIMEOUT", "float", 120.0, "eSurge engine",
+    "EASYDEL_WORKER_STARTUP_TIMEOUT",
+    "float",
+    120.0,
+    "eSurge engine",
     "Seconds to wait for a tokenizer/detokenizer worker to bind before timing out.",
 )
 
 EASYDEL_SYNC_INPUTS_FOR_TIMING = _register(
-    "EASYDEL_SYNC_INPUTS_FOR_TIMING", "bool", False, "eSurge runner",
+    "EASYDEL_SYNC_INPUTS_FOR_TIMING",
+    "bool",
+    False,
+    "eSurge runner",
     "Sync step inputs for accurate timing (adds a device round-trip).",
 )
 EASYDEL_ENABLE_DP_LOCAL_PAGE_PATH = _register(
-    "EASYDEL_ENABLE_DP_LOCAL_PAGE_PATH", "bool", True, "eSurge runner",
+    "EASYDEL_ENABLE_DP_LOCAL_PAGE_PATH",
+    "bool",
+    True,
+    "eSurge runner",
     "Enable the data-parallel local-page attention path when the request count divides evenly.",
 )
 
 EASYDEL_SPEC_RECURRENT_REPLAY = _register(
-    "EASYDEL_SPEC_RECURRENT_REPLAY", "bool", False, "eSurge spec-decode",
+    "EASYDEL_SPEC_RECURRENT_REPLAY",
+    "bool",
+    False,
+    "eSurge spec-decode",
     "Bit-exact greedy under spec-decode via sequential-GDN replay of the accepted prefix (slower; opt-in).",
 )
 EASYDEL_DISABLE_BATCHED_DRAFT = _register(
-    "EASYDEL_DISABLE_BATCHED_DRAFT", "bool", False, "eSurge spec-decode",
+    "EASYDEL_DISABLE_BATCHED_DRAFT",
+    "bool",
+    False,
+    "eSurge spec-decode",
     "A/B fallback: force the per-request MTP draft path instead of the batched drafter.",
 )
 EASYDEL_DISABLE_BATCHED_EMIT = _register(
-    "EASYDEL_DISABLE_BATCHED_EMIT", "bool", False, "eSurge spec-decode",
+    "EASYDEL_DISABLE_BATCHED_EMIT",
+    "bool",
+    False,
+    "eSurge spec-decode",
     "A/B fallback: force the per-request MTP emit path instead of the batched emit.",
 )
 EASYDEL_MTP_PERSIST_KV = _register(
-    "EASYDEL_MTP_PERSIST_KV", "bool", False, "eSurge spec-decode",
+    "EASYDEL_MTP_PERSIST_KV",
+    "bool",
+    False,
+    "eSurge spec-decode",
     "Persist the MTP drafter KV cache across verify windows.",
 )
 EASYDEL_DISABLE_DYNAMIC_SPEC = _register(
-    "EASYDEL_DISABLE_DYNAMIC_SPEC", "bool", False, "eSurge spec-decode",
+    "EASYDEL_DISABLE_DYNAMIC_SPEC",
+    "bool",
+    False,
+    "eSurge spec-decode",
     "A/B escape hatch: force the static num_draft_tokens (ignore num_draft_tokens_per_batch_size schedules).",
 )
 EASYDEL_DISABLE_DRAFT_IN_VERIFY = _register(
-    "EASYDEL_DISABLE_DRAFT_IN_VERIFY", "bool", False, "eSurge spec-decode",
+    "EASYDEL_DISABLE_DRAFT_IN_VERIFY",
+    "bool",
+    False,
+    "eSurge spec-decode",
     "A/B escape hatch: force the two-dispatch verify->draft flow instead of the fused draft-in-verify program.",
 )

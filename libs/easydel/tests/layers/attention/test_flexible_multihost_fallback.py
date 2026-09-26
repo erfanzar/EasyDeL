@@ -17,7 +17,6 @@ from types import SimpleNamespace
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from easydel.layers.attention._flexible import AttentionMechanisms, FlexibleAttentionModule, get_optimal_config
 from easydel.operations import AttentionOutput
 from easydel.operations.kernels.flash_attention import FlashAttn

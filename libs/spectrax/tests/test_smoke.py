@@ -9,7 +9,6 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import pytest
-
 import spectrax as spx
 from spectrax import functional as F
 from spectrax import nn

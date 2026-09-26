@@ -66,6 +66,7 @@ from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from einops import rearrange
 from jax import numpy as jnp
+from jax.extend.core import jaxprs_in_params
 from jaxtyping import Array, DTypeLike, PRNGKeyArray
 from spectrax import nn, with_sharding_constraint
 from tqdm.auto import tqdm
@@ -1317,7 +1318,7 @@ def count_flop_jaxpr(jaxpr) -> int:
             else:
                 warnings.warn(f"Unhandled primitive {primitive_name}", stacklevel=1)
 
-            for subjaxpr in jax.core.jaxprs_in_params(eqn.params):
+            for subjaxpr in jaxprs_in_params(eqn.params):
                 visit_jaxpr(subjaxpr)
 
     visit_jaxpr(jaxpr)

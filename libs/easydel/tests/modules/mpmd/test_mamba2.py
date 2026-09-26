@@ -14,11 +14,11 @@
 
 """Tests for Mamba2 model."""
 
+import easydel as ed
 import pytest
 import transformers
 from jax import numpy as jnp
 
-import easydel as ed
 from tests.modules.mpmd._scheduler_utils import GENERATION_SCHEDULE_KIND, LOSS_SCHEDULE_KINDS
 from tests.modules.test_utils import CausalLMTester
 

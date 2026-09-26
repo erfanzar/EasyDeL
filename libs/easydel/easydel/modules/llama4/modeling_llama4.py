@@ -710,7 +710,7 @@ class Llama4TextAttention(UnifiedAttention):
             attention_type="standard",
             causal=False,
         )
-        self.qk_norm = Llama4TextL2Norm() if config.use_qk_norm and self.use_rope else None
+        self.qk_norm = Llama4TextL2Norm(config.rms_norm_eps) if config.use_qk_norm and self.use_rope else None
         self._cached_position_ids: Int[Array, "batch seq_len"] | None = None
 
     def _create_attention_performer(self, config: Llama4TextConfig, rngs: spx.Rngs):

@@ -18,7 +18,6 @@
 import inspect
 
 import pytest
-
 from ejkernel.kernels._pallas.tpu.ring_attention import _interface as pallas_interface
 from ejkernel.kernels._registry import kernel_registry
 from ejkernel.kernels._xla.ring_attention import _interface as xla_interface

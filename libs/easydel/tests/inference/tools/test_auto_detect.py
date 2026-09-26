@@ -15,7 +15,6 @@
 """Tests for tool parser auto-detection logic."""
 
 import pytest
-
 from easydel.inference.tools.auto_detect import (
     _DEFAULT_PARSER,
     _TEMPLATE_HINTS,

@@ -370,6 +370,13 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
                 if mSize % cfg.block_m:
                     padded_size = cfg.block_m - mSize % cfg.block_m
                     lhs = jax.lax.pad(lhs, jnp.array(0.0, dtype=lhs.dtype), [(0, padded_size, 0), (0, 0, 0)])
+                    if existing_out is not None:
+                        # Keep the accumulator row count in lockstep with the padded lhs.
+                        existing_out = jax.lax.pad(
+                            existing_out,
+                            jnp.array(0.0, dtype=existing_out.dtype),
+                            [(0, padded_size, 0), (0, 0, 0)],
+                        )
             if cfg.block_k > 0 and cfg.block_n > 0:
                 tiling = (min(cfg.block_m, mSize), min(cfg.block_k, kSize), min(cfg.block_n, nSize))
             # block_k/block_n <= 0 is a sentinel: leave tiling=None so the
@@ -530,6 +537,27 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
                 )
         return candidates or self.candidate_cfgs(inv)
 
+    def heuristic_cfg_tpu(self, inv: Invocation[GroupedMatmulConfig, Array]) -> GroupedMatmulConfig:
+        """Default TPU config: XLA ``ragged_dot`` with its own tiler (no tiling hint).
+
+        On TPU the unhinted XLA tiler outperforms fixed Pallas and XLA tiles,
+        forward and backward, from decode to training row counts. Explicit
+        ``platform="pallas"`` requests keep the block sizes below. The v2/v3
+        Pallas-only variants keep their generic default.
+        """
+        if self.op_id != "grouped_matmul":
+            return self.heuristic_cfg(inv)
+        return GroupedMatmulConfig(
+            block_m=128,
+            block_n=128,
+            block_k=128,
+            num_warps=None,
+            num_stages=None,
+            platform="xla",
+            backend="any",
+            bypass_xla_tiling=True,
+        )
+
     def candidate_cfgs_tpu(self, inv: Invocation[GroupedMatmulConfig, Array]):
         """Generate TPU candidates for Pallas and XLA grouped matmul."""
         block_configs = [
@@ -539,7 +567,8 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
             (512, 512, 256),
             (1024, 1024, 256),
         ]
-        return [
+        native = [self.heuristic_cfg_tpu(inv)] if self.op_id == "grouped_matmul" else []
+        return native + [
             GroupedMatmulConfig(
                 block_m=block_m,
                 block_n=block_n,

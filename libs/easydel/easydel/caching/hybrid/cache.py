@@ -82,7 +82,6 @@ from easydel.utils.helpers import check_bool_flag
 from .._abstracts import BaseCache, BaseCacheConfig, BaseCacheView, BaseRunTimeMetadata
 
 if tp.TYPE_CHECKING:
-    from spectrax import PartitionManager
 
     from ..kda.cache import KDACacheView
     from ..ragged_page.cache import RaggedPagesCacheView
@@ -726,29 +725,6 @@ class HybridCacheView(BaseCacheView):
         else:
             raise ValueError(f"Unknown layer_type: {self.layer_type}")
 
-    def update_recurrent_state(
-        self,
-        new_conv_state: Float[Array, "batch d_inner d_conv"] | None = None,
-        new_recurrent_state: Float[Array, "batch num_heads head_dim d_state"] | None = None,
-    ) -> HybridCacheView:
-        """Update recurrent state for linear attention layers.
-
-        This is a convenience wrapper around concatenate_to_cache for
-        linear attention layers.
-
-        Args:
-            new_conv_state: New convolution state.
-            new_recurrent_state: New recurrent state.
-
-        Returns:
-            Updated HybridCacheView.
-        """
-        _, _, updated_view = self.concatenate_to_cache(
-            conv_state=new_conv_state,
-            recurrent_state=new_recurrent_state,
-        )
-        return updated_view
-
     def update_conv_state(
         self,
         new_hidden_state: Float[Array, "batch d_inner"],
@@ -1217,69 +1193,6 @@ class HybridCache(BaseCache):
         """
         return cls(views=[None] * num_hidden_layers)
 
-    def update_kv_cache(
-        self,
-        layer_idx: int,
-        key_states: Float[Array, "batch seq_len num_kv_heads head_dim"],
-        value_states: Float[Array, "batch seq_len num_kv_heads head_dim"],
-        cache_position: Int[Array, "batch"] | None = None,  # noqa
-    ) -> tuple[
-        Float[Array, "batch seq num_kv_heads head_dim"] | ImplicitArray | None,
-        Float[Array, "batch seq num_kv_heads head_dim"] | ImplicitArray | None,
-        HybridCache,
-    ]:
-        """Update KV cache for a full attention layer.
-
-        Args:
-            layer_idx: Index of the layer to update.
-            key_states: New key states.
-            value_states: New value states.
-            cache_position: Position in cache to update.
-
-        Returns:
-            Tuple of (key_cache, value_cache, updated_cache).
-        """
-        if self.views[layer_idx] is None:
-            raise ValueError(f"Cache view for layer {layer_idx} is None")
-
-        key_cache, value_cache, updated_view = self.views[layer_idx].concatenate_to_cache(
-            key_states=key_states,
-            value_states=value_states,
-            cache_position=cache_position,
-        )
-
-        new_views = list(self.views)
-        new_views[layer_idx] = updated_view
-        return key_cache, value_cache, self.replace(views=new_views)
-
-    def update_recurrent_state(
-        self,
-        layer_idx: int,
-        new_conv_state: Float[Array, "batch d_inner d_conv"] | None = None,
-        new_recurrent_state: Float[Array, "batch num_heads head_dim d_state"] | None = None,
-    ) -> HybridCache:
-        """Update recurrent state for a linear attention layer.
-
-        Args:
-            layer_idx: Index of the layer to update.
-            new_conv_state: New convolution state.
-            new_recurrent_state: New recurrent state.
-
-        Returns:
-            Updated HybridCache.
-        """
-        if self.views[layer_idx] is None:
-            raise ValueError(f"Cache view for layer {layer_idx} is None")
-
-        updated_view = self.views[layer_idx].update_recurrent_state(
-            new_conv_state=new_conv_state,
-            new_recurrent_state=new_recurrent_state,
-        )
-
-        new_views = list(self.views)
-        new_views[layer_idx] = updated_view
-        return self.replace(views=new_views)
-
     def reset(self) -> HybridCache:
         """Reset all cache layers to zero states.
 
@@ -1288,19 +1201,6 @@ class HybridCache(BaseCache):
         """
         new_views = [view.reset() if view is not None else None for view in self.views]
         return self.replace(views=new_views)
-
-    def get_layer_type(self, layer_idx: int) -> str | None:
-        """Get the attention type for a specific layer.
-
-        Args:
-            layer_idx: Index of the layer.
-
-        Returns:
-            Layer type string or None if view is not initialized.
-        """
-        if self.views[layer_idx] is None:
-            return None
-        return self.views[layer_idx].layer_type
 
     def get_view(
         self, layer_idx: int
@@ -1327,225 +1227,6 @@ class HybridCache(BaseCache):
         """
         new_views = list(self.views)
         new_views[layer_idx] = view
-        return self.replace(views=new_views)
-
-    def get_cache_position(self) -> Array:
-        """Get the current cache position (number of tokens cached).
-
-        Returns:
-            Array of shape [batch_size] with current position for each sequence.
-        """
-        for view in self.views:
-            if view is not None and view.positions is not None:
-                return view.positions
-        return jnp.zeros((1,), dtype=jnp.int32)
-
-    def to_pure(self) -> tuple[list[dict[str, tp.Any] | None], list[str]]:
-        """Convert cache to pure Python data structure for serialization.
-
-        Extracts raw tensors and metadata for checkpointing or transfer.
-        Since HybridCache can contain different view types, each layer's
-        data is stored as a dictionary with type information.
-
-        Returns:
-            tuple: Pair of (cache_data, layer_types) where:
-                - cache_data: List of dicts with layer-specific data
-                - layer_types: List of layer type strings for reconstruction
-        """
-        cache_data = []
-        layer_types = []
-
-        for view in self.views:
-            if view is None:
-                cache_data.append(None)
-                layer_types.append("none")
-            elif hasattr(view, "key") and view.key is not None:
-                cache_data.append(
-                    {
-                        "key": view.key,
-                        "value": view.value,
-                        "indexes": getattr(view, "indexes", None),
-                        "starts": getattr(view, "starts", None),
-                        "positions": getattr(view, "positions", None),
-                    }
-                )
-                layer_types.append(FULL_ATTENTION)
-            elif hasattr(view, "conv_state"):
-                # RecurrentCacheView-like or HybridCacheView with linear attention
-                cache_data.append(
-                    {
-                        "conv_state": view.conv_state,
-                        "recurrent_state": view.recurrent_state,
-                        "positions": getattr(view, "positions", None),
-                        "q_conv_state": getattr(view, "q_conv_state", None),
-                        "k_conv_state": getattr(view, "k_conv_state", None),
-                        "v_conv_state": getattr(view, "v_conv_state", None),
-                    }
-                )
-                layer_type = getattr(view, "layer_type", LINEAR_ATTENTION)
-                layer_types.append(layer_type)
-            else:
-                cache_data.append(None)
-                layer_types.append("unknown")
-
-        return cache_data, layer_types
-
-    @classmethod
-    def from_pure(
-        cls,
-        cache_data: list[dict[str, tp.Any] | None],
-        layer_types: list[str],
-    ) -> HybridCache:
-        """Reconstruct cache from pure Python data structure.
-
-        Restores a cache from serialized tensors and type info,
-        typically after loading from disk or receiving from transfer.
-
-        Args:
-            cache_data: List of dicts with layer-specific tensors.
-            layer_types: List of layer type strings.
-
-        Returns:
-            HybridCache: Reconstructed cache instance.
-        """
-        views = []
-
-        for idx, (data, layer_type) in enumerate(zip(cache_data, layer_types, strict=True)):
-            if data is None or layer_type == "none":
-                views.append(None)
-            elif layer_type == FULL_ATTENTION:
-                # Create TransformerCacheView-like structure
-                # Note: This creates a minimal view; for full functionality,
-                # use layer_configs to create proper views
-                views.append(
-                    TransformerCacheView(
-                        key=data["key"],
-                        value=data["value"],
-                        indexes=data.get("indexes"),
-                        starts=data.get("starts"),
-                        metadata=None,  # Metadata needs to be provided separately
-                        layer_index=idx,
-                    )
-                )
-            elif layer_type == LINEAR_ATTENTION:
-                from easydel.caching.recurrent import RecurrentCacheView
-
-                views.append(
-                    RecurrentCacheView(
-                        conv_state=data["conv_state"],
-                        recurrent_state=data["recurrent_state"],
-                        positions=data.get("positions", jnp.zeros((data["conv_state"].shape[0],), dtype=jnp.int32)),
-                        metadata=None,
-                        layer_index=idx,
-                    )
-                )
-            elif layer_type == KDA_LINEAR_ATTENTION:
-                views.append(
-                    KDACacheView(
-                        q_conv_state=data["q_conv_state"],
-                        k_conv_state=data["k_conv_state"],
-                        v_conv_state=data["v_conv_state"],
-                        recurrent_state=data["recurrent_state"],
-                        positions=data.get("positions", jnp.zeros((data["q_conv_state"].shape[0],), dtype=jnp.int32)),
-                        metadata=None,
-                        layer_index=idx,
-                    )
-                )
-            else:
-                views.append(None)
-
-        return cls(views=views)
-
-    def insert(
-        self,
-        other: HybridCache,
-        slot: int,
-        partition_manager: PartitionManager | None = None,
-        quantizer: tp.Any | None = None,
-    ) -> HybridCache:
-        """Insert another cache's contents at specified batch slot.
-
-        Copies states from another cache into this cache at the specified
-        batch position. Works with all view types (Transformer, Recurrent, KDA).
-
-        Args:
-            other: Source cache to copy from.
-            slot: Batch slot index to insert into.
-            partition_manager: Optional sharding configuration (for transformer views).
-            quantizer: Optional quantization configuration (for transformer views).
-
-        Returns:
-            HybridCache: Updated cache instance.
-        """
-        new_views = list(self.views)
-
-        for idx in range(len(self.views)):
-            view = self.views[idx]
-            oview = other.views[idx]
-
-            if view is None or oview is None:
-                continue
-
-            layer_type = getattr(view, "layer_type", FULL_ATTENTION)
-
-            if layer_type == FULL_ATTENTION and hasattr(view, "key"):
-                new_key = lax.dynamic_update_slice(
-                    view.key,
-                    oview.key.astype(view.key.dtype),
-                    (slot, 0, 0, 0),
-                )
-                new_value = lax.dynamic_update_slice(
-                    view.value,
-                    oview.value.astype(view.value.dtype),
-                    (slot, 0, 0, 0),
-                )
-
-                update_dict = {"key": new_key, "value": new_value}
-
-                if hasattr(view, "indexes") and view.indexes is not None:
-                    update_dict["indexes"] = lax.dynamic_update_slice_in_dim(view.indexes, oview.indexes, slot, 0)
-                if hasattr(view, "starts") and view.starts is not None:
-                    update_dict["starts"] = lax.dynamic_update_slice_in_dim(view.starts, oview.starts, slot, 0)
-
-                new_views[idx] = view.replace(**update_dict)
-
-            elif layer_type == LINEAR_ATTENTION and hasattr(view, "conv_state"):
-                new_conv = (
-                    lax.dynamic_update_slice_in_dim(view.conv_state, oview.conv_state, slot, 0)
-                    if view.conv_state is not None
-                    else None
-                )
-
-                new_recurrent = (
-                    lax.dynamic_update_slice_in_dim(view.recurrent_state, oview.recurrent_state, slot, 0)
-                    if view.recurrent_state is not None
-                    else None
-                )
-
-                update_dict = {
-                    "conv_state": new_conv,
-                    "recurrent_state": new_recurrent,
-                }
-
-                if hasattr(view, "positions") and view.positions is not None:
-                    update_dict["positions"] = lax.dynamic_update_slice_in_dim(view.positions, oview.positions, slot, 0)
-
-                new_views[idx] = view.replace(**update_dict)
-
-            elif layer_type == KDA_LINEAR_ATTENTION:
-                update_dict = {}
-
-                for field in ["q_conv_state", "k_conv_state", "v_conv_state", "recurrent_state"]:
-                    view_val = getattr(view, field, None)
-                    oview_val = getattr(oview, field, None)
-                    if view_val is not None and oview_val is not None:
-                        update_dict[field] = lax.dynamic_update_slice_in_dim(view_val, oview_val, slot, 0)
-
-                if hasattr(view, "positions") and view.positions is not None:
-                    update_dict["positions"] = lax.dynamic_update_slice_in_dim(view.positions, oview.positions, slot, 0)
-
-                new_views[idx] = view.replace(**update_dict)
-
         return self.replace(views=new_views)
 
     def __repr__(self):
@@ -1618,16 +1299,3 @@ if __name__ == "__main__":
     print("\nTesting KV cache update on layer 3 (full_attention)...")
     key_states = jnp.ones((2, 10, 8, 64))
     value_states = jnp.ones((2, 10, 8, 64))
-    key_cache, value_cache, cache = cache.update_kv_cache(3, key_states, value_states)
-    print(f"  Updated key cache shape: {key_cache.shape}")
-    print(f"  Updated value cache shape: {value_cache.shape}")
-
-    # Test recurrent state update on a linear attention layer (layer 0)
-    print("\nTesting recurrent state update on layer 0 (linear_attention)...")
-    new_conv_state = jnp.ones((2, 1024, 4))
-    new_recurrent_state = jnp.ones((2, 8, 64, 64))
-    cache = cache.update_recurrent_state(0, new_conv_state, new_recurrent_state)
-    print(f"  Updated conv state: {cache.views[0].conv_state.shape}")
-    print(f"  Updated recurrent state: {cache.views[0].recurrent_state.shape}")
-
-    print("\nAll tests passed!")

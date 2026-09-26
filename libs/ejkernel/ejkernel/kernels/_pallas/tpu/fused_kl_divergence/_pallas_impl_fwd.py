@@ -202,7 +202,7 @@ def _kl_fwd_kernel(
         teacher_ref: HBM input ref of teacher logits, shape ``(rows, vocab)``.
         weights_ref: HBM input ref of per-row weights, shape ``(rows,)``.
         loss_ref: VMEM output ref of shape ``(block_m,)`` receiving the
-            ``abs(weight) * per_row_kl`` for active rows (0 elsewhere).
+            ``weight * per_row_kl`` for active rows (0 elsewhere).
         lse_t_ref: VMEM output ref of shape ``(block_m,)`` receiving the teacher
             log-sum-exp for in-range rows (0 for padded rows).
         lse_s_ref: VMEM output ref of shape ``(block_m,)`` receiving the student
@@ -234,7 +234,6 @@ def _kl_fwd_kernel(
     is_reverse = direction == "reverse"
     _copy_rows_hbm_to_vmem(weights_ref, weight_ref, dma_sem_ref, row_start, block_m)
     weight = weight_ref[...].astype(jnp.float32)
-    weight_abs = jnp.abs(weight)
     active = row_active & (weight != 0.0)
 
     loss_ref[...] = jnp.zeros((block_m,), dtype=jnp.float32)
@@ -323,7 +322,8 @@ def _kl_fwd_kernel(
             acc = acc + jnp.sum(jnp.where(in_vocab[None, :], contrib, 0.0), axis=1)
 
         per_row = jnp.where(is_reverse, acc + lse_t - lse_s, acc + lse_s - lse_t)
-        loss_ref[...] = jnp.where(active, weight_abs * per_row, 0.0).astype(jnp.float32)
+        # Signed weight: matches the analytic backward (``weight * dy * ...``) and the XLA path.
+        loss_ref[...] = jnp.where(active, weight * per_row, 0.0).astype(jnp.float32)
         lse_t_ref[...] = jnp.where(row_active, lse_t, 0.0).astype(jnp.float32)
         lse_s_ref[...] = jnp.where(row_active, lse_s, 0.0).astype(jnp.float32)
         acc_ref[...] = jnp.where(row_active, acc, 0.0).astype(jnp.float32)
@@ -929,7 +929,7 @@ def _kl_tp_loss_and_aux(
     )
     acc = jax.lax.psum(local_acc, vocab_parallel_axis)
     per_row = jnp.where(direction == "reverse", acc + lse_t - lse_s, acc + lse_s - lse_t)
-    loss = jnp.where(active, jnp.abs(weights_1d) * per_row, 0.0)
+    loss = jnp.where(active, weights_1d * per_row, 0.0)
     return loss.astype(jnp.float32), lse_t.astype(jnp.float32), lse_s.astype(jnp.float32), acc.astype(jnp.float32)
 
 
@@ -1079,18 +1079,20 @@ def fused_kl_divergence_pallas(
     statistics and KL mass across the full vocabulary. Gradients flow only to
     ``student_logits``; ``teacher_logits`` are treated as detached targets.
 
-    The per-row KL is scaled by ``abs(weights)`` and, when ``temperature != 1.0``,
+    The per-row KL is scaled by ``weights`` and, when ``temperature != 1.0``,
     by ``temperature**2`` (the standard distillation temperature correction).
 
     Args:
         student_logits: Student logits of shape ``(..., vocab)`` with rank >= 2.
             Leading dims are flattened to rows. ``float16`` is rejected; use
             ``bfloat16`` or ``float32``.
-        teacher_logits: Teacher logits, same shape as ``student_logits``. Cast to
-            the student dtype before the kernel runs.
+        teacher_logits: Teacher logits, same shape as ``student_logits``. Kept in
+            its own dtype (an fp32 teacher is not rounded to a bf16 student
+            dtype); tiles are upcast to fp32 inside the kernel.
         weights: Optional per-row weights of shape ``logits.shape[:-1]``. Rows with
             zero weight are skipped. Defaults to all-ones (every row contributes).
-            The KL contribution uses ``abs(weights)``; ``mean`` reduction divides
+            The KL contribution uses the signed ``weights`` (as the backward
+            does); ``mean`` reduction divides
             by ``sum(weights)``.
         reduction: How to reduce the per-row loss. ``"none"`` returns per-row loss
             reshaped to ``logits.shape[:-1]``; ``"sum"`` returns the scalar sum;
@@ -1153,7 +1155,6 @@ def fused_kl_divergence_pallas(
             "Use bfloat16 or float32; Mosaic rejects f16 VMEM vector loads in this kernel."
         )
 
-    teacher_logits = teacher_logits.astype(student_logits.dtype)
     flat_student, leading = _flatten_logits(student_logits)
     flat_teacher = teacher_logits.reshape(-1, teacher_logits.shape[-1])
     if weights is None:

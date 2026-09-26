@@ -50,9 +50,10 @@ A new operation usually needs:
 ## Verification
 
 ```bash
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
-XLA_FLAGS=--xla_force_host_platform_device_count=8 \
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
   uv run pytest libs/easydel/tests/operations/
 ```
 
-Backend-specific paths (TPU/GPU) need hardware ownership and focused benchmarks; do not claim them from CPU tests alone.
+Operation tests execute attention numerics, so they run on the accelerator only; a CPU run is not validation. Without
+an accelerator, report the change as unverified on hardware. Backend-specific performance claims (TPU/GPU) also need
+focused benchmarks on the target hardware.

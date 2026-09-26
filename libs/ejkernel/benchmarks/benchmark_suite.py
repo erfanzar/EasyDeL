@@ -24,10 +24,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import ejkernel.kernels  # noqa: F401
 import jax
 from _op_benchmark_registry import SPECS, _build_algorithms, _ignored_platforms
-
-import ejkernel.kernels  # noqa: F401
 from ejkernel.benchmarks import Benchmark
 from ejkernel.kernels._registry import kernel_registry
 

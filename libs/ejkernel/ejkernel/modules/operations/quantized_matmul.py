@@ -63,6 +63,7 @@ from typing import Literal
 
 import jax
 import jax.numpy as jnp
+from jax.extend.core import concrete_or_error
 from jaxtyping import Array, Float
 
 from ejkernel.kernels._registry import Platform, kernel_registry
@@ -120,7 +121,7 @@ def _static_bool(value, name: str) -> bool:
     Returns:
         The concrete boolean value.
     """
-    return jax.core.concrete_or_error(bool, value, f"{name} must be static.")
+    return concrete_or_error(bool, value, f"{name} must be static.")
 
 
 def _static_int(value, name: str) -> int:
@@ -133,7 +134,7 @@ def _static_int(value, name: str) -> int:
     Returns:
         The concrete integer value.
     """
-    return jax.core.concrete_or_error(int, value, f"{name} must be static.")
+    return concrete_or_error(int, value, f"{name} must be static.")
 
 
 def _lcm(a: int, b: int) -> int:

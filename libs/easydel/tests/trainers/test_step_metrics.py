@@ -17,7 +17,6 @@ from types import SimpleNamespace
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from easydel.infra.loss_utils import LossMetrics
 from easydel.trainers.metrics import JSONProgressBar, MetricsTracker, StepMetrics
 

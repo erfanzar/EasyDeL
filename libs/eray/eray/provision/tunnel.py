@@ -240,9 +240,7 @@ def open_tunnel(name: str, argv: list[str], *, kind: str, local_port: int, remot
     # and reporting "opening" for a tunnel that will never answer.
     time.sleep(_STARTUP_PROBE_S)
     if process.poll() is not None:
-        raise RuntimeError(
-            f"port-forward for {name!r} exited immediately (code {process.returncode}); see {log_path}"
-        )
+        raise RuntimeError(f"port-forward for {name!r} exited immediately (code {process.returncode}); see {log_path}")
     session = TunnelSession(
         name=name,
         kind=kind,

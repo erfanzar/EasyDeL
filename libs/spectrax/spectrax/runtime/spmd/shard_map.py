@@ -105,6 +105,30 @@ def _prev_logical_loc(schedule: Schedule, rank: int, virt: int, n_stages: int) -
     return None
 
 
+def _expand_fused_rows(grid_raw: list[list[object]]) -> list[list[Action | None]]:
+    """Split every row holding a :class:`FusedTask` into a FWD row then a BWD row.
+
+    The ``shard_map`` bodies execute one action per rank per time step, so a
+    paired FWD+BWD cell must occupy two consecutive steps. Expanding the whole
+    row (other ranks idle in the second sub-step) keeps each rank's column
+    aligned with its rank index and preserves the grid's cross-rank ordering.
+
+    Args:
+        grid_raw: Schedule grid from :meth:`Schedule.build`.
+
+    Returns:
+        A grid of plain :class:`Action` / ``None`` cells.
+    """
+    grid: list[list[Action | None]] = []
+    for row in grid_raw:
+        if not any(isinstance(cell, FusedTask) for cell in row):
+            grid.append(list(row))
+            continue
+        grid.append([cell.fwd if isinstance(cell, FusedTask) else cell for cell in row])
+        grid.append([cell.bwd if isinstance(cell, FusedTask) else None for cell in row])
+    return grid
+
+
 def _encode_grid(
     schedule: Schedule, n_stages: int
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, int]:
@@ -133,7 +157,7 @@ def _encode_grid(
         ``(phase_grid, mb_grid, virt_grid, logical_grid,
         fwd_dest_grid, fwd_dv_grid, bwd_dest_grid, bwd_dv_grid, T)``.
     """
-    grid_raw = schedule.build(n_stages)
+    grid_raw = _expand_fused_rows(schedule.build(n_stages))
     T = len(grid_raw)
     phase_arr = [[_PHASE_SKIP] * n_stages for _ in range(T)]
     mb_arr = [[0] * n_stages for _ in range(T)]
@@ -147,8 +171,6 @@ def _encode_grid(
         for r, cell in enumerate(row):
             if cell is None:
                 continue
-            if isinstance(cell, FusedTask):
-                cell = cell.fwd
             phase_arr[t][r] = _PHASE_MAP.get(cell.phase, _PHASE_SKIP)
             mb_arr[t][r] = cell.microbatch
             virt_arr[t][r] = cell.virtual_stage
@@ -700,19 +722,7 @@ def _make_unrolled_body(
     """
     m = microbatches
 
-    grid_raw = schedule.build(n_stages)
-    grid: list[list[Action | None]] = []
-    for row in grid_raw:
-        new_row: list[Action | None] = []
-        for cell in row:
-            if cell is None:
-                new_row.append(None)
-            elif isinstance(cell, FusedTask):
-                new_row.append(cell.fwd)
-                new_row.append(cell.bwd)
-            else:
-                new_row.append(cell)
-        grid.append(new_row[:n_stages])
+    grid = _expand_fused_rows(schedule.build(n_stages))
 
     def body(stacked_params, xs, *targets):
         """Shard-map body: walk the schedule grid as Python-unrolled time steps.

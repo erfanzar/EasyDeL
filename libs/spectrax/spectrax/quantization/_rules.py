@@ -293,9 +293,7 @@ class QuantRule:
         for field in ("weight_qtype", "act_qtype", "bwd_qtype"):
             object.__setattr__(self, field, resolve_qtype(getattr(self, field)))
         if self.bwd_stochastic_rounding not in (None, "uniform"):
-            raise ValueError(
-                f"bwd_stochastic_rounding must be 'uniform' or None, got {self.bwd_stochastic_rounding!r}."
-            )
+            raise ValueError(f"bwd_stochastic_rounding must be 'uniform' or None, got {self.bwd_stochastic_rounding!r}.")
         self._validate_reciprocal("tile_size", self.tile_size)
         self._validate_reciprocal("bwd_weight_grad_tile_size", self.bwd_weight_grad_tile_size)
         self._validate_tile_size()
@@ -803,11 +801,7 @@ def quantize_model(
             raise ValueError(message)
         warnings.warn(message, stacklevel=2)
     else:
-        narrow = sum(
-            1
-            for rule in provider.rules
-            if rule.weight_qtype is not None and rule.trains_in_narrow_precision
-        )
+        narrow = sum(1 for rule in provider.rules if rule.weight_qtype is not None and rule.trains_in_narrow_precision)
         regime = (
             "quantized training (the matmul itself runs in the narrow type)"
             if narrow

@@ -735,8 +735,7 @@ class OwnerRequestPlane:
                         suffix not in entry.finished_suffixes
                         and suffix not in entry.scheduler_finished
                         and not any(
-                            value[0] is entry and value[1] == suffix
-                            for value in self._subscriber_children.values()
+                            value[0] is entry and value[1] == suffix for value in self._subscriber_children.values()
                         )
                     ):
                         # Subscribers remain, but none still wants this sample:

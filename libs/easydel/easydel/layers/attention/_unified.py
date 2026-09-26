@@ -133,6 +133,7 @@ from ..linears import (
     RowParallelLinear,
 )
 from ..norms._norms import RMSNorm
+from ..rotary import apply_rope_interleaved, yarn_get_mscale
 from ._flexible import AttentionModule, FlexibleAttentionModule
 
 if TYPE_CHECKING:
@@ -1052,6 +1053,35 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         )
         return alibi_bias
 
+    def _fit_alibi_bias(
+        self,
+        alibi_bias: Array,
+        batch_size: int,
+        q_len: int,
+        kv_len: int,
+    ) -> Float[Array, "batch num_heads q_len kv_len"]:
+        """Shape an ALiBi bias to the ``[batch, heads, q_len, kv_len]`` the attention kernels take.
+
+        Accepts ``[heads, K]`` (per-key), ``[heads, Q, K]`` (square) or
+        ``[batch|1, heads, Q|1, K]`` biases. Keys are aligned to the end of the
+        window (the newest ``kv_len`` columns; missing columns are zero-padded on
+        the right, where the mask hides them), and queries to the last ``q_len``
+        rows.
+        """
+        alibi_bias = jnp.asarray(alibi_bias, dtype=self.dtype)
+        if alibi_bias.ndim == 3:
+            alibi_bias = alibi_bias[None, ...]
+        elif alibi_bias.ndim == 2:
+            alibi_bias = alibi_bias[None, :, None, :]
+        if alibi_bias.shape[-1] > kv_len:
+            alibi_bias = alibi_bias[..., alibi_bias.shape[-1] - kv_len :]
+        elif alibi_bias.shape[-1] < kv_len:
+            pad = [(0, 0)] * (alibi_bias.ndim - 1) + [(0, kv_len - alibi_bias.shape[-1])]
+            alibi_bias = jnp.pad(alibi_bias, pad)
+        if alibi_bias.shape[-2] > q_len:
+            alibi_bias = alibi_bias[..., alibi_bias.shape[-2] - q_len :, :]
+        return jnp.broadcast_to(alibi_bias, (batch_size, alibi_bias.shape[1], q_len, kv_len))
+
     def _create_attention_performer(self, config: Cfg, rngs: spx.Rngs) -> FlexibleAttentionModule:
         """Build the :class:`FlexibleAttentionModule` that runs the kernel.
 
@@ -1093,13 +1123,30 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
                     performer_config.attn_dtype = mla_attn_dtype
                 if mla_attn_softmax_dtype is not None:
                     performer_config.attn_softmax_dtype = mla_attn_softmax_dtype
+        softmax_scale = self.head_dim**-0.5
+        if self.attention_type == "mla":
+            softmax_scale = self._mla_softmax_scale(config)
         return FlexibleAttentionModule(
             rngs=rngs,
             base_config=performer_config,
-            softmax_scale=self.head_dim**-0.5,
+            softmax_scale=float(softmax_scale),
             dropout_prob=getattr(config, "attention_dropout", 0.0),
             attn_mechanism=attn_mechanism,
         )
+
+    def _mla_softmax_scale(self, config: Cfg) -> float:
+        """MLA score scale: the full ``qk_nope + qk_rope`` query width, with YaRN ``mscale**2``.
+
+        MLA sets ``head_dim`` to the value width for output merging, so the
+        generic ``head_dim**-0.5`` would scale scores by the wrong width.
+        """
+        q_head_dim = getattr(self, "q_head_dim", None) or (config.qk_nope_head_dim + config.qk_rope_head_dim)
+        scale = q_head_dim**-0.5
+        rope_scaling = getattr(config, "rope_scaling", None)
+        if isinstance(rope_scaling, dict) and rope_scaling.get("mscale_all_dim"):
+            mscale = yarn_get_mscale(rope_scaling["factor"], rope_scaling["mscale_all_dim"])
+            scale = scale * mscale * mscale
+        return scale
 
     def _create_q_norm(self, config: Cfg, dtype: DTypeLike, param_dtype: DTypeLike, rngs: spx.Rngs) -> RMSNorm:
         """Build the per-head query RMSNorm (Gemma3, Olmoe-style QK norm).
@@ -1578,6 +1625,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             sliding_window=sliding_window_for_kernel,
             softmax_aux=softmax_aux,
             output_attentions=output_attentions,
+            precision=self.precision,
         )
 
         if attentions.cache_view is not None:
@@ -1699,11 +1747,16 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             # Expand for heads dimension: [batch, 1, seq, rope_dim]
             cos = cos[:, None, :, :].astype(q_pe.dtype)
             sin = sin[:, None, :, :].astype(q_pe.dtype)
-            # Apply neox-style (split) rotation
-            q1, q2 = jnp.split(q_pe, 2, axis=-1)
-            k1, k2 = jnp.split(k_pe, 2, axis=-1)
-            q_pe = jnp.concatenate([q1 * cos - q2 * sin, q2 * cos + q1 * sin], axis=-1)
-            k_pe = jnp.concatenate([k1 * cos - k2 * sin, k2 * cos + k1 * sin], axis=-1)
+            # DeepSeek checkpoints pair channels (2i, 2i+1); configs without
+            # ``rope_interleave`` keep the split-half (NeoX) pairing.
+            if getattr(self.config, "rope_interleave", False):
+                q_pe = apply_rope_interleaved(q_pe, cos, sin)
+                k_pe = apply_rope_interleaved(k_pe, cos, sin)
+            else:
+                q1, q2 = jnp.split(q_pe, 2, axis=-1)
+                k1, k2 = jnp.split(k_pe, 2, axis=-1)
+                q_pe = jnp.concatenate([q1 * cos - q2 * sin, q2 * cos + q1 * sin], axis=-1)
+                k_pe = jnp.concatenate([k1 * cos - k2 * sin, k2 * cos + k1 * sin], axis=-1)
 
         causal_for_kernel = self.causal
         if mask_info is not None and getattr(mask_info, "_causal_baked", False):
@@ -1740,7 +1793,8 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             mla_keys_pe = k_pe[:, 0, :, :]
 
             # Use correct softmax_scale based on original qk dimensions, not latent dims
-            mla_softmax_scale = (self.qk_nope_head_dim + self.qk_rope_head_dim) ** -0.5
+            # Same scale as the dense path (includes any YaRN mscale**2).
+            mla_softmax_scale = self.attention_performer.softmax_scale
 
             # Build dummy query/key/value for concatenate (cache update)
             # The MLA cache concatenate needs compressed_kv and k_pe
@@ -1957,6 +2011,12 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             alibi_bias = alibi
         else:
             alibi_bias = self._compute_alibi_bias(key_states.shape[1])  # Use full KV length after cache
+        alibi_bias = self._fit_alibi_bias(
+            alibi_bias,
+            batch_size=query_states.shape[0],
+            q_len=query_states.shape[1],
+            kv_len=key_states.shape[1],
+        )
 
         softmax_aux = self._softmax_aux()
 

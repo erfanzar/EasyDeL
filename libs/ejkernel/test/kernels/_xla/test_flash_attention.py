@@ -18,7 +18,6 @@
 import jax
 import jax.numpy as jnp
 import pytest
-
 from ejkernel.kernels._xla.attention._interface import attention
 from ejkernel.kernels._xla.flash_attention import flash_attention
 from ejkernel.ops import FwdParams

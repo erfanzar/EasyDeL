@@ -1,10 +1,9 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.sharding import Mesh, NamedSharding, PartitionSpec
-
 from easydel.infra.mixins.sharding import EasyShardingMixin
 from easydel.infra.sharding import device_put_if_sharding_mismatch, sharding_matches
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 
 def _single_axis_mesh() -> Mesh:

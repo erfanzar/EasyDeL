@@ -3,7 +3,6 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import pytest
-
 from ejkernel.modules.operations import ragged_page_attention_v2
 
 from ._utils import assert_allclose, dense_attention_reference, device_platform

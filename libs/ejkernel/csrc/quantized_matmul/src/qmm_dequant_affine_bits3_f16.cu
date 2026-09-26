@@ -49,4 +49,3 @@ void LaunchDequantAffineBits3F16Gs1024(const uint32_t *wq, const half *scales, c
   (void)group_size;
   dequant_affine_int_gs<3, 1024, half, half><<<grid, block, 0, stream>>>(wq, scales, biases, out, K, N, n_words, n_groups);
 }
-

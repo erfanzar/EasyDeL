@@ -74,6 +74,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from jax import lax
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, DTypeLike, Float, PRNGKeyArray
 
@@ -102,8 +103,9 @@ class Attention(Kernel[AttentionConfig, tuple[Array, Array]]):
     Supports causal masking, dropout, sliding windows, and variable-length sequences.
 
     Features:
-        - Automatic platform/backend selection (XLA-only; no Triton/Pallas dispatch
-          is registered for this op — see FlashAttention for GPU/TPU alternatives).
+        - Automatic platform/backend selection (XLA or TileLang).
+        - Explicit matmul precision selects XLA; an explicitly configured non-XLA
+          platform is rejected rather than silently ignoring precision.
         - Configuration caching for consistent performance.
         - Optional autotuning to find optimal implementation.
         - Custom gradient support for efficient backpropagation.
@@ -172,6 +174,7 @@ class Attention(Kernel[AttentionConfig, tuple[Array, Array]]):
         sliding_window: int | tuple[int, int] | None = None,
         *,
         cfg: AttentionConfig,
+        precision: lax.PrecisionLike = None,
     ) -> tuple[
         Float[Array, "batch seq_len num_q_heads vhead_dim"],
         Float[Array, "batch num_heads seq_len kv_len"],
@@ -205,11 +208,19 @@ class Attention(Kernel[AttentionConfig, tuple[Array, Array]]):
             sliding_window: Local attention window.  An ``int`` applies a
                 symmetric window; a ``(left, right)`` tuple is asymmetric.
             cfg: Kernel configuration (platform/backend selection).
+            precision: JAX matmul precision for both QK and attention-times-value.
+                None preserves automatic dispatch and, on XLA, the ambient JAX
+                precision. Any explicit value, including ``Precision.DEFAULT``,
+                selects XLA when ``cfg.platform`` is auto or xla.
 
         Returns:
             Tuple of:
                 - output: Attention output [batch, seq_len, num_q_heads, vhead_dim]
                 - weights: Attention probabilities [batch, num_heads, seq_len, kv_len]
+
+        Raises:
+            ValueError: If explicit precision is combined with a non-XLA platform
+                in ``cfg``. Use auto or xla; TileLang does not support this control.
         """
         cfg_platform = getattr(cfg, "platform", "auto")
         cfg_backend = getattr(cfg, "backend", "any")
@@ -220,7 +231,15 @@ class Attention(Kernel[AttentionConfig, tuple[Array, Array]]):
         weights_block_q = int(getattr(cfg, "weights_block_q", self._heuristic_weights_block(int(query.shape[1]))))
         weights_block_k = int(getattr(cfg, "weights_block_k", self._heuristic_weights_block(int(key.shape[1]))))
 
-        resolved_platform = detect_platform("attention", cfg_platform)
+        if precision is not None:
+            if cfg_platform not in (None, "auto", "xla"):
+                raise ValueError(
+                    "Explicit attention precision requires platform='auto' or 'xla'; "
+                    f"platform={cfg_platform!r} does not support this control."
+                )
+            resolved_platform = Platform.XLA
+        else:
+            resolved_platform = detect_platform("attention", cfg_platform)
         impl = kernel_registry.get(
             algorithm="attention",
             platform=resolved_platform,
@@ -244,6 +263,8 @@ class Attention(Kernel[AttentionConfig, tuple[Array, Array]]):
             softmax_aux=softmax_aux,
             causal=causal,
         )
+        if precision is not None:
+            impl_kwargs["precision"] = precision
         if resolved_platform == Platform.TILELANG:
             impl_kwargs["fwd_params"] = FwdParams(
                 q_blocksize=block_q,
@@ -288,12 +309,14 @@ class Attention(Kernel[AttentionConfig, tuple[Array, Array]]):
             weights_block_k=self._heuristic_weights_block(k_len),
             num_warps=4,
             num_stages=2,
-            platform="auto",
+            platform="xla" if inv.kwargs.get("precision") is not None else "auto",
             backend="any",
         )
 
     def candidate_cfgs(self, inv: Invocation[AttentionConfig, Array]):
-        """Generate candidate configurations for autotuning."""
+        """Generate candidates, restricting explicit precision to XLA."""
+        if inv.kwargs.get("precision") is not None:
+            return [self.heuristic_cfg(inv)]
         return [
             self.heuristic_cfg(inv),
             AttentionConfig(
@@ -320,7 +343,12 @@ class Attention(Kernel[AttentionConfig, tuple[Array, Array]]):
         * Weights tiles ∈ {32, 64} — smaller than FA because the dense
           ``(Sq, Sk)`` matrix is the bottleneck.
         * ``num_warps`` ∈ {4, 8}, ``num_stages`` ∈ {2, 3}.
+
+        Explicit precision uses only XLA: do not benchmark XLA under a TileLang
+        configuration or cache TileLang tuning parameters for that invocation.
         """
+        if inv.kwargs.get("precision") is not None:
+            return [self.heuristic_cfg(inv)]
         q_len, k_len = self._seqlens_from_inv(inv)
         query = inv.kwargs.get("query")
         head_dim = int(query.shape[-1]) if getattr(query, "shape", None) else 64
@@ -414,6 +442,7 @@ def attention(
     dropout_prob: float = 0.0,
     causal: bool = False,
     sliding_window: int | tuple[int, int] | None = None,
+    precision: lax.PrecisionLike = None,
 ) -> tuple[Float[Array, "batch seq_len num_q_heads vhead_dim"], Float[Array, "batch num_heads seq_len kv_len"]]:
     """Execute standard multi-head attention with automatic optimization.
 
@@ -445,6 +474,10 @@ def attention(
         dropout_prob: Dropout probability (default: 0.0).
         causal: Apply causal masking (default: False).
         sliding_window: Local attention window (int or (left, right) tuple).
+        precision: JAX matmul precision for both QK and attention-times-value.
+            None preserves existing dispatch and XLA's ambient precision semantics.
+            An explicit value (including ``Precision.DEFAULT``) selects registered
+            XLA instead of TileLang, which does not support this control.
 
     Returns:
         Tuple of:
@@ -452,8 +485,11 @@ def attention(
             - weights: Attention probabilities [batch, num_heads, seq_len, kv_len]
 
     Note:
-        This operation is XLA-only; it does not dispatch to Triton or Pallas
-        backends. For hardware-efficient fused attention use ``flash_attention``.
+        Automatic dispatch can use XLA or TileLang when precision is None.
+        Explicit precision restricts heuristic and autotune selection to XLA.
+        A non-XLA manual/cache override with explicit precision is rejected rather
+        than silently changed. No Triton or Pallas implementation is registered;
+        for hardware-efficient fused attention use ``flash_attention``.
 
     Example:
         >>> out, weights = attention(query, key, value)
@@ -468,6 +504,9 @@ def attention(
     if mask_info is not None:
         attention_mask = mask_info.get_or_compute_attention_mask()
 
+    # Preserve the historical invocation/cache key and backend call surface for
+    # omitted precision. Non-None values enter the key as static invocation data.
+    precision_kwargs = {} if precision is None else {"precision": precision}
     out, w = _executor(
         Attention(),
         query=query,
@@ -486,5 +525,6 @@ def attention(
         sliding_window=sliding_window,
         softmax_aux=softmax_aux,
         causal=causal,
+        **precision_kwargs,
     )
     return out, w

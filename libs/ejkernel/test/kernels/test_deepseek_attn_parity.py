@@ -19,7 +19,6 @@ from __future__ import annotations
 import inspect
 
 import pytest
-
 from ejkernel import modules
 from ejkernel.kernels import _xla as xla_kernels
 from ejkernel.kernels._pallas import tpu as pallas_tpu_kernels

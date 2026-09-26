@@ -264,6 +264,7 @@ from .grouped_matmul import (
 )
 from .kernel_delta_attention import KernelDeltaAttention, kda_attention, kernel_delta_attention
 from .lightning_attention import LightningAttention, lightning_attention
+from .mhc_coefficients import MHCCoefficients, MHCCoefficientsConfig, mhc_coefficients
 from .multi_head_latent_attention import FlashMLA, flash_mla
 from .multi_latent_ragged_page_attention import (
     MultiLatentRaggedPageAttention,
@@ -384,6 +385,8 @@ __all__ = (
     "KernelTilePolicy",
     "LightningAttention",
     "LightningAttentionConfig",
+    "MHCCoefficients",
+    "MHCCoefficientsConfig",
     "MeanPooling",
     "MeanPoolingConfig",
     "MultiLatentRaggedPageAttention",
@@ -476,6 +479,7 @@ __all__ = (
     "kernel_delta_attention",
     "lightning_attention",
     "mean_pooling",
+    "mhc_coefficients",
     "multi_latent_ragged_page_attention",
     "multi_latent_ragged_page_attention_v2",
     "native_sparse_attention",

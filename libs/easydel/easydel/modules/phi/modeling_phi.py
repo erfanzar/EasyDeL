@@ -209,8 +209,8 @@ class PhiAttention(UnifiedAttention):
     def _create_q_norm(self, config, dtype, param_dtype, rngs):
         """Create query normalization layer.
 
-        Overrides base implementation to use standard LayerNorm on full hidden_size
-        instead of per-head normalization when qk_layernorm is enabled.
+        Overrides base implementation to use a per-head LayerNorm (with bias) over
+        ``head_dim`` when qk_layernorm is enabled, matching HF Phi.
 
         Args:
             config: Model configuration.
@@ -222,7 +222,7 @@ class PhiAttention(UnifiedAttention):
             LayerNorm applied to query states before attention.
         """
         return LayerNorm(
-            config.hidden_size,
+            self.head_dim,
             epsilon=config.layer_norm_eps,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -233,8 +233,8 @@ class PhiAttention(UnifiedAttention):
     def _create_k_norm(self, config, dtype, param_dtype, rngs):
         """Create key normalization layer.
 
-        Overrides base implementation to use standard LayerNorm on full hidden_size
-        instead of per-head normalization when qk_layernorm is enabled.
+        Overrides base implementation to use a per-head LayerNorm (with bias) over
+        ``head_dim`` when qk_layernorm is enabled, matching HF Phi.
 
         Args:
             config: Model configuration.
@@ -246,7 +246,7 @@ class PhiAttention(UnifiedAttention):
             LayerNorm applied to key states before attention.
         """
         return LayerNorm(
-            config.hidden_size,
+            self.head_dim,
             epsilon=config.layer_norm_eps,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -273,15 +273,16 @@ class PhiAttention(UnifiedAttention):
             rotary_dim=self.head_dim,
         )
 
-    def _preprocess_qkv(self, query_states, key_states, value_states):
-        """Preprocess query, key, and value states before attention computation.
+    def _postprocess_qkv(self, query_states, key_states, value_states):
+        """Apply the optional per-head Q/K LayerNorm after the head reshape, before RoPE.
 
-        Applies optional Q/K layer normalization when qk_layernorm is enabled.
+        HF Phi normalizes each head over ``head_dim`` (``[..., heads, head_dim]``),
+        not the flattened projection.
 
         Args:
-            query_states: Query tensor from Q projection.
-            key_states: Key tensor from K projection.
-            value_states: Value tensor from V projection.
+            query_states: Query tensor ``[batch, seq_len, num_heads, head_dim]``.
+            key_states: Key tensor ``[batch, seq_len, num_kv_heads, head_dim]``.
+            value_states: Value tensor ``[batch, seq_len, num_kv_heads, head_dim]``.
 
         Returns:
             Tuple of (query, key, value) with optional normalization applied.

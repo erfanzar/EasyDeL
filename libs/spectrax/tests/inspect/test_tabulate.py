@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import jax.numpy as jnp
-
 from spectrax.core.module import Module
 from spectrax.inspect.display import display
 from spectrax.inspect.tabulate import count_bytes, count_parameters, hlo_cost, tabulate

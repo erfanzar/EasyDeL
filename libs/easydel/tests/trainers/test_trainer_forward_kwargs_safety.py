@@ -19,7 +19,6 @@ from types import SimpleNamespace
 import jax
 import jax.numpy as jnp
 import pytest
-
 from easydel.trainers.binary_classifier_optimization_trainer._fn import (
     concatenated_forward as bco_concatenated_forward,
 )

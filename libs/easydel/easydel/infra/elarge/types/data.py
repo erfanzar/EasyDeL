@@ -167,7 +167,7 @@ class DatasetSaveCfg(TypedDict, total=False):
     output_path: Required[str]
     format: NotRequired[Literal["parquet", "arrow", "json", "jsonl"]]
     num_shards: NotRequired[int | None]
-    compression: NotRequired[Literal["snappy", "gzip", "zstd"] | None]
+    compression: NotRequired[Literal["snappy", "gzip", "lz4", "zstd"] | None]
     max_shard_size: NotRequired[str | int]
     overwrite: NotRequired[bool]
     push_to_hub: NotRequired[bool]

@@ -1,6 +1,5 @@
 import jax
 import jax.numpy as jnp
-
 from easydel.infra.sequence_packing import segmented_depthwise_causal_conv1d
 from easydel.operations.kernels.kda import _recurrent_kda_fwd
 from easydel.operations.kernels.ssm1 import _segmented_ssm1_fwd

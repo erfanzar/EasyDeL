@@ -574,7 +574,8 @@ class BaseTrainer(BaseTrainerProtocol):
             except Exception as e:
                 logger.warning(f"Resuming from checkpoint failed: {e}. Starting fresh training.")
 
-        self.model_state = model_state
+        # Train with dropout etc. live: `from_pretrained` hands back eval-mode models.
+        self.model_state = self._in_training_mode(model_state)
         self._apply_runtime_model_config_overrides()
         self._apply_step_start_point()
         self._model = jax.eval_shape(lambda: self.model_state.model)
@@ -585,7 +586,6 @@ class BaseTrainer(BaseTrainerProtocol):
         self.finetune = finetune
         self.processing_class = processing_class
         self._pose_image_token_id, self._pose_pad_id = self._setup_pose()
-        self._encoder_processor = self._setup_process_encoder()
 
         if self.data_collator is None and getattr(self.arguments, "use_data_collator", True):
             base_collator = self.create_collect_function(
@@ -722,6 +722,9 @@ class BaseTrainer(BaseTrainerProtocol):
                     f"pose.only_buckets {out_of_range} out of range for {len(self._buckets)} configured bucket(s)."
                 )
 
+        # Resolve constructor/argument buckets first: their accumulation overrides
+        # must not bypass the full-batch encoder-feature slicing guard.
+        self._encoder_processor = self._setup_process_encoder()
         self._apply_preprocess_transforms()
 
         self._initialize_attributes()
@@ -729,6 +732,16 @@ class BaseTrainer(BaseTrainerProtocol):
         self._runtime_trace("__init__.end")
 
     @staticmethod
+    @staticmethod
+    def _in_training_mode(state: EasyDeLState) -> EasyDeLState:
+        """Return ``state`` with its graph in training mode (only the static graphdef changes)."""
+        import spectrax as spx
+
+        module = state.model
+        if getattr(module, "_spx_training", True):
+            return state
+        return state.replace(graphdef=spx.export(module.train())[0])
+
     def _apply_runtime_model_config_overrides_to_state(
         state: EasyDeLState | None,
         arguments: TrainingArguments,
@@ -1421,9 +1434,7 @@ class BaseTrainer(BaseTrainerProtocol):
             return
 
         raw_list = list(raw_texts or [])
-        nonempty_raw = sum(
-            1 for i in empty_indices if i < len(raw_list) and (raw_list[i] or "").strip()
-        )
+        nonempty_raw = sum(1 for i in empty_indices if i < len(raw_list) and (raw_list[i] or "").strip())
         truncated_list = list(truncated or [])
         truncated_count = sum(1 for i in empty_indices if i < len(truncated_list) and truncated_list[i])
 
@@ -2723,10 +2734,10 @@ class BaseTrainer(BaseTrainerProtocol):
     def _setup_process_encoder(self) -> EncoderProcessor | None:
         """Resolve the vision-encoder binding once, at construction.
 
-        Returns ``None`` when the feature is disabled, so the per-microbatch hook costs a
-        single ``None`` check on text-only runs. Validation happens here rather than mid-
-        training so an unsupported model or a trainable-tower conflict fails before the
-        first step instead of quietly training the wrong thing.
+        Returns ``None`` when the feature is disabled, so the full-batch preprocessing hook
+        costs a single ``None`` check on text-only runs. Validation happens here rather than mid-
+        training so unsupported models and incompatible full-batch feature slicing
+        fail before the first step.
         """
         config = getattr(self.arguments, "process_encoder", None)
         if config is None or not config.enabled:
@@ -2736,6 +2747,9 @@ class BaseTrainer(BaseTrainerProtocol):
             config,
             model,
             trainable_selector=getattr(self.arguments, "trainable_selector", None),
+            gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
+            mpmd_scheduler=self.arguments.mpmd_scheduler,
+            bucket_gradient_accumulation_steps=[bucket.gradient_accumulation_steps for bucket in self._buckets],
         )
         if binding is None:
             return None

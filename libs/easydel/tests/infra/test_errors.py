@@ -30,7 +30,6 @@ from __future__ import annotations
 import pickle
 
 import pytest
-
 from easydel.infra import errors as ed_errors
 
 ERROR_CLASSES = [

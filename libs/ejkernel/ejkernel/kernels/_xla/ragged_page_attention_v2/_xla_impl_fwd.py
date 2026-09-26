@@ -120,6 +120,12 @@ def _ragged_paged_attention(
     queries = queries.reshape(total_query_tokens, num_kv_heads, q_heads_per_group, head_size)
     qblocks = 8 if total_query_tokens >= 8 else max(1, total_query_tokens)
     kvblocks = 64 if max_pages_per_sequence >= 64 else max(1, max_pages_per_sequence)
+    # Pad the page table to whole KV blocks: `dynamic_slice` clamps a window that
+    # runs past the end, so the last block would read shifted pages. The padded
+    # entries sit past `context_lens` and are masked out.
+    pad_pages = -max_pages_per_sequence % kvblocks
+    if pad_pages:
+        block_tables = jnp.pad(block_tables, ((0, 0), (0, pad_pages)))
 
     padd = (-total_query_tokens) % qblocks
     if padd > 0:
@@ -134,6 +140,12 @@ def _ragged_paged_attention(
     )
 
     attention_output = jnp.zeros_like(padded_queries)
+
+    window_size = None
+    if sliding_window is not None:
+        # An int is a window *size* (HF convention: the query plus ``W - 1`` previous tokens);
+        # a ``(left, right)`` tuple holds inclusive distances, so its window size is ``left + 1``.
+        window_size = int(sliding_window) if isinstance(sliding_window, int) else int(sliding_window[0]) + 1
 
     have_sinks = softmax_aux is not None
     if have_sinks:
@@ -199,6 +211,9 @@ def _ragged_paged_attention(
                 kv_tokens_per_block = page_size * kvblocks
                 base_k_ids = jnp.arange(kv_tokens_per_block, dtype=jnp.int32)
                 num_kv_blocks = (kv_cache_len_for_seq + kv_tokens_per_block - 1) // kv_tokens_per_block
+                kv_block_start = jnp.int32(0)
+                if sliding_window is not None:
+                    kv_block_start = jnp.maximum(q_start_tok - window_size + 1, 0) // kv_tokens_per_block
 
                 def _process_kv_block(kv_block_idx, online_softmax_carry):
                     """Process one KV block and update the online softmax state.
@@ -244,9 +259,8 @@ def _ragged_paged_attention(
 
                     causal_mask = jnp.expand_dims(query_token_indices, 1) >= jnp.expand_dims(kv_token_indices, 0)
                     if sliding_window is not None:
-                        left_window = int(sliding_window) if isinstance(sliding_window, int) else int(sliding_window[0])
                         left_keep = jnp.expand_dims(kv_token_indices, 0) > jnp.expand_dims(
-                            query_token_indices - left_window, 1
+                            query_token_indices - window_size, 1
                         )
                         causal_mask = jnp.logical_and(causal_mask, left_keep)
                     kv_bound = jnp.expand_dims(kv_token_indices, 0) < kv_cache_len_for_seq
@@ -256,11 +270,15 @@ def _ragged_paged_attention(
 
                     current_max = jnp.max(attention_scores_block, axis=3)
                     new_max = jnp.maximum(max_score_block, current_max)
+                    # Rows with no attendable key so far (e.g. a KV block entirely left of the
+                    # sliding window) keep ``new_max == -inf``; subtract 0 instead so the exps
+                    # below give 0 rather than ``exp(-inf - -inf) = NaN``.
+                    safe_max = jnp.where(jnp.isneginf(new_max), jnp.zeros_like(new_max), new_max)
 
-                    probs = jnp.exp(attention_scores_block - jnp.expand_dims(new_max, axis=3))
+                    probs = jnp.exp(attention_scores_block - jnp.expand_dims(safe_max, axis=3))
                     probs = jnp.where(attention_mask, probs, 0.0)
 
-                    rescale = jnp.exp(max_score_block - new_max)
+                    rescale = jnp.exp(max_score_block - safe_max)
                     sum_exp_block = (rescale * sum_exp_block) + jnp.sum(probs, axis=3)
                     value_update = jnp.einsum("bihk,kid->bihd", probs, value_block.astype(compute_dtype), optimize=True)
                     output_block = jnp.expand_dims(rescale, 3) * output_block + value_update
@@ -279,7 +297,7 @@ def _ragged_paged_attention(
                     init_max = jnp.full((qblocks, num_kv_heads, q_heads_per_group), -jnp.inf, dtype=compute_dtype)
 
                 output_block, sum_exp_block, _max_block = jax.lax.fori_loop(
-                    0,
+                    kv_block_start,
                     num_kv_blocks,
                     _process_kv_block,
                     (init_output_block, init_sum_exp, init_max),

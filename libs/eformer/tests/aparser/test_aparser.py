@@ -19,7 +19,6 @@ from enum import Enum
 from typing import Literal
 
 import pytest
-
 from eformer.aparser._aparser import Argu, DataClassArgumentParser, string_to_bool
 
 

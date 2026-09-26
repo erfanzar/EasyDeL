@@ -87,6 +87,7 @@ from jax.sharding import NamedSharding, PartitionSpec
 from easydel.axis import resolve_attention_data_parallel_axis
 from easydel.caching import (
     HybridCache,
+    KDACacheView,
     ParallelHybridCacheView,
     RaggedPagesCache,
     RaggedPagesCacheConfig,
@@ -193,16 +194,108 @@ def _jit_slot_sidecar_rows(output_shardings, fill_values):
     return jax.jit(transform, out_shardings=list(output_shardings))
 
 
+def _recurrent_leaf_entries(views):
+    """Collect the per-slot state leaves row maintenance must move or zero.
+
+    Returns ``(view_index, inner_view, leaves, n_slots)`` tuples where
+    ``leaves`` is an ordered ``(field_name, array)`` sequence:
+    ``conv_state``/``recurrent_state`` for a :class:`RecurrentCacheView` (or
+    its ParallelHybridCacheView wrapper) and the q/k/v conv windows plus
+    ``recurrent_state`` for a :class:`KDACacheView`, which extends
+    BaseCacheView directly and owns four per-slot leaves. Order is
+    significant: the fused dispatches bucket leaves in exactly this order and
+    results are written back positionally.
+
+    Args:
+        views: HybridCache view list to scan.
+
+    Returns:
+        Collected entries; empty when no view carries per-slot state.
+    """
+    entries: list[tuple[int, typing.Any, tuple[tuple[str, jax.Array | None], ...], int]] = []
+    for idx, view in enumerate(views):
+        rec = None
+        if isinstance(view, RecurrentCacheView):
+            rec = view
+        elif isinstance(view, ParallelHybridCacheView) and view.recurrent is not None:
+            rec = view.recurrent
+        elif isinstance(view, KDACacheView):
+            rec = view
+        else:
+            continue
+        if isinstance(rec, KDACacheView):
+            leaves: tuple[tuple[str, jax.Array | None], ...] = (
+                ("q_conv_state", rec.q_conv_state),
+                ("k_conv_state", rec.k_conv_state),
+                ("v_conv_state", rec.v_conv_state),
+                ("recurrent_state", rec.recurrent_state),
+            )
+        else:
+            leaves = (("conv_state", rec.conv_state), ("recurrent_state", rec.recurrent_state))
+        n_slots = None
+        for _name, arr in leaves:
+            if arr is not None:
+                n_slots = int(typing.cast(jax.Array, arr).shape[0])
+                break
+        if n_slots is None:
+            continue
+        entries.append((idx, rec, leaves, n_slots))
+    return entries
+
+
+def _bucket_leaf_arrays(entries):
+    """Group entry leaves by pool size, preserving per-entry leaf order."""
+    by_pool: dict[int, list[jax.Array]] = {}
+    for _idx, _rec, leaves, n_slots in entries:
+        bucket = by_pool.setdefault(n_slots, [])
+        for _name, arr in leaves:
+            if arr is not None:
+                bucket.append(arr)
+    return by_pool
+
+
+def _write_back_leaf_results(new_views, entries, results_by_pool) -> bool:
+    """Rebuild views from transformed leaf pools; True when anything changed."""
+    cursors = dict.fromkeys(results_by_pool, 0)
+    changed = False
+    for idx, rec, leaves, n_slots in entries:
+        results = results_by_pool.get(n_slots)
+        if results is None:
+            continue
+        updates: dict[str, jax.Array] = {}
+        for name, arr in leaves:
+            if arr is not None:
+                updates[name] = results[cursors[n_slots]]
+                cursors[n_slots] += 1
+        view = new_views[idx]
+        if isinstance(view, ParallelHybridCacheView):
+            new_views[idx] = view.replace(
+                recurrent=rec.replace(**updates),
+                conv_state=updates.get("conv_state"),
+                recurrent_state=updates.get("recurrent_state"),
+            )
+        else:
+            new_views[idx] = rec.replace(**updates)
+        changed = True
+    return changed
+
+
 def _transform_recurrent_sidecars(views, make_indices):
     """Apply the native slot mapping to positions and Qwen PLE continuation.
 
     Paged attention leaves are intentionally excluded: their leading dimension
     indexes physical pages, not recurrent request slots. Segment padding uses
-    -1 rather than zero, matching the PLE cache initialization contract.
+    -1 rather than zero, matching the PLE cache initialization contract. KDA
+    views contribute only their ``positions`` sidecar here — their state
+    leaves ride the fused zero/permute dispatches instead.
     """
     by_pool = {}
     for index, view in enumerate(views):
         rec = view.recurrent if isinstance(view, ParallelHybridCacheView) else view
+        if isinstance(rec, KDACacheView):
+            if rec.positions is not None:
+                by_pool.setdefault(int(rec.positions.shape[0]), []).append((index, "positions", rec.positions, 0))
+            continue
         if not isinstance(rec, RecurrentCacheView):
             continue
         for name, fill in (
@@ -1641,8 +1734,10 @@ class ExecutionManager:
         the new request must start from clean state — otherwise the new
         request inherits stale activations from the previous occupant.
         This method writes zeros into those tensors at the indicated
-        rows for every recurrent or hybrid layer present, leaving
-        attention layers untouched.
+        rows for every recurrent, hybrid, or KDA layer present, leaving
+        attention layers untouched. KDA layers zero all four per-slot
+        leaves (q/k/v conv windows + recurrent state); their ``positions``
+        sidecar is reset through the shared sidecar transform below.
 
         Compressed-window caches (DeepSeek-V4) reset the freed rows across
         every layer's ring/compressor/indexer state via
@@ -1679,33 +1774,11 @@ class ExecutionManager:
                     slot_indices_to_clear.extend(base_slots + k * base_slots + int(slot) for k in range(candidate_count))
         # Collect every recurrent leaf first, then zero the masked rows of all
         # of them in ONE fused dispatch per distinct pool size (a python loop of
-        # eager wheres cost ~100 host dispatches per slot-clear event).
-        entries: list[tuple[int, typing.Any, jax.Array | None, jax.Array | None, int]] = []
-        for idx, view in enumerate(new_views):
-            rec = None
-            if isinstance(view, RecurrentCacheView):
-                rec = view
-            elif isinstance(view, ParallelHybridCacheView) and view.recurrent is not None:
-                rec = view.recurrent
-            else:
-                continue
-            conv_arr = rec.conv_state
-            rec_arr = rec.recurrent_state
-            if conv_arr is not None:
-                n_slots = int(typing.cast(jax.Array, conv_arr).shape[0])
-            elif rec_arr is not None:
-                n_slots = int(typing.cast(jax.Array, rec_arr).shape[0])
-            else:
-                continue
-            entries.append((idx, rec, conv_arr, rec_arr, n_slots))
-
-        by_pool: dict[int, list[jax.Array]] = {}
-        for _idx, _rec, conv_arr, rec_arr, n_slots in entries:
-            bucket = by_pool.setdefault(n_slots, [])
-            if conv_arr is not None:
-                bucket.append(conv_arr)
-            if rec_arr is not None:
-                bucket.append(rec_arr)
+        # eager wheres cost ~100 host dispatches per slot-clear event). KDA
+        # layers contribute four leaves (q/k/v conv windows + recurrent state):
+        # all four must be zeroed or the next slot occupant inherits them.
+        entries = _recurrent_leaf_entries(new_views)
+        by_pool = _bucket_leaf_arrays(entries)
         cleared_by_pool: dict[int, list[jax.Array]] = {}
         for n_slots, arrays in by_pool.items():
             filtered_slots = sorted({int(s) for s in slot_indices_to_clear if 0 <= int(s) < n_slots})
@@ -1716,30 +1789,7 @@ class ExecutionManager:
             transform = _jit_zero_rows(tuple(array.sharding for array in arrays))
             cleared_by_pool[n_slots] = list(transform(arrays, jnp.asarray(keep_np)))
 
-        cursors = dict.fromkeys(cleared_by_pool, 0)
-        for idx, rec, conv_arr, rec_arr, n_slots in entries:
-            cleared = cleared_by_pool.get(n_slots)
-            if cleared is None:
-                continue
-            new_conv = conv_arr
-            new_rec = rec_arr
-            if conv_arr is not None:
-                new_conv = cleared[cursors[n_slots]]
-                cursors[n_slots] += 1
-            if rec_arr is not None:
-                new_rec = cleared[cursors[n_slots]]
-                cursors[n_slots] += 1
-            new_recurrent = rec.replace(conv_state=new_conv, recurrent_state=new_rec)
-            view = new_views[idx]
-            if isinstance(view, ParallelHybridCacheView):
-                new_views[idx] = view.replace(
-                    recurrent=new_recurrent,
-                    conv_state=new_conv,
-                    recurrent_state=new_rec,
-                )
-            else:
-                new_views[idx] = new_recurrent
-            changed = True
+        changed = _write_back_leaf_results(new_views, entries, cleared_by_pool) or changed
 
         def sidecar_clear_indices(n_slots):
             selected = sorted({int(s) for s in slot_indices_to_clear if 0 <= int(s) < n_slots})
@@ -1764,7 +1814,9 @@ class ExecutionManager:
         row (e.g. after a mid-stream request finishes), its device-side
         ``conv_state``/``recurrent_state`` must move in lockstep or the request
         reads a freed/zeroed neighbour's state and emits garbage. This method
-        applies that row permutation to every recurrent or hybrid layer.
+        applies that row permutation to every recurrent, hybrid, or KDA layer
+        (for KDA layers all four per-slot leaves move together, and their
+        ``positions`` sidecar follows through the shared sidecar transform).
 
         No-op unless the cache is a :class:`HybridCache`. Rank-major SPMD DP and
         slot-indexed compressed-window families never use this path — they pin
@@ -1796,23 +1848,9 @@ class ExecutionManager:
         # in ONE fused dispatch per distinct pool size (the previous per-view
         # python loop cost ~100 eager gather+where dispatches per row-move
         # event, which scales with request churn and thus with concurrency).
-        entries: list[tuple[int, typing.Any, jax.Array | None, jax.Array | None, int]] = []
-        for idx, view in enumerate(new_views):
-            if isinstance(view, RecurrentCacheView):
-                rec = view
-            elif isinstance(view, ParallelHybridCacheView) and view.recurrent is not None:
-                rec = view.recurrent
-            else:
-                continue
-            conv_arr = rec.conv_state
-            rec_arr = rec.recurrent_state
-            if conv_arr is not None:
-                n_slots = int(typing.cast(jax.Array, conv_arr).shape[0])
-            elif rec_arr is not None:
-                n_slots = int(typing.cast(jax.Array, rec_arr).shape[0])
-            else:
-                continue
-            entries.append((idx, rec, conv_arr, rec_arr, n_slots))
+        # KDA layers contribute their q/k/v conv windows + recurrent state so
+        # all four leaves move in lockstep with the row permutation.
+        entries = _recurrent_leaf_entries(new_views)
 
         def _gather_keep(n_slots: int) -> tuple[numpy.ndarray, numpy.ndarray] | None:
             """Full-pool gather index + keep mask for one pool size (or None if identity)."""
@@ -1840,13 +1878,7 @@ class ExecutionManager:
                 return None
             return gather, keep
 
-        by_pool: dict[int, list[jax.Array]] = {}
-        for _idx, _rec, conv_arr, rec_arr, n_slots in entries:
-            bucket = by_pool.setdefault(n_slots, [])
-            if conv_arr is not None:
-                bucket.append(conv_arr)
-            if rec_arr is not None:
-                bucket.append(rec_arr)
+        by_pool = _bucket_leaf_arrays(entries)
         moved_by_pool: dict[int, list[jax.Array]] = {}
         for n_slots, arrays in by_pool.items():
             gk = _gather_keep(n_slots)
@@ -1856,30 +1888,7 @@ class ExecutionManager:
             transform = _jit_permute_rows(tuple(array.sharding for array in arrays))
             moved_by_pool[n_slots] = list(transform(arrays, jnp.asarray(gather, dtype=jnp.int32), jnp.asarray(keep)))
 
-        cursors = dict.fromkeys(moved_by_pool, 0)
-        for idx, rec, conv_arr, rec_arr, n_slots in entries:
-            moved = moved_by_pool.get(n_slots)
-            if moved is None:
-                continue
-            new_conv = conv_arr
-            new_rec = rec_arr
-            if conv_arr is not None:
-                new_conv = moved[cursors[n_slots]]
-                cursors[n_slots] += 1
-            if rec_arr is not None:
-                new_rec = moved[cursors[n_slots]]
-                cursors[n_slots] += 1
-            new_recurrent = rec.replace(conv_state=new_conv, recurrent_state=new_rec)
-            view = new_views[idx]
-            if isinstance(view, ParallelHybridCacheView):
-                new_views[idx] = view.replace(
-                    recurrent=new_recurrent,
-                    conv_state=new_conv,
-                    recurrent_state=new_rec,
-                )
-            else:
-                new_views[idx] = new_recurrent
-            changed = True
+        changed = _write_back_leaf_results(new_views, entries, moved_by_pool) or changed
 
         changed = _transform_recurrent_sidecars(new_views, _gather_keep) or changed
         if changed:

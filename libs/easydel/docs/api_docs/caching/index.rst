@@ -7,7 +7,6 @@ easydel.caching package
    compressed_window/index
    hybrid/index
    kda/index
-   lightning/index
    mla_ragged_page/index
    ragged_page/index
    recurrent/index
@@ -16,4 +15,3 @@ easydel.caching package
    unified_attention/index
    _abstracts
    _metadatabuilder
-   _specs

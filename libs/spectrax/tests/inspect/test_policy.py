@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import jax.numpy as jnp
-
 from spectrax.core.policy import Policy, current_policy, push_policy
 from spectrax.functional.util import promote_dtype
 from spectrax.nn.linear import Linear

@@ -10,7 +10,6 @@ import math
 
 import jax
 import jax.numpy as jnp
-
 from spectrax.init.kaiming import _gain, kaiming_normal, kaiming_uniform
 
 

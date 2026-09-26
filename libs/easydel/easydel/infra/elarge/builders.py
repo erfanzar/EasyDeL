@@ -422,7 +422,7 @@ def to_from_pretrained_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[s
     if "num_labels" in extra_kwargs:
         config_kwargs["num_labels"] = extra_kwargs.pop("num_labels")
     quant_model = quant.get("model")
-    if quant_model is not None:
+    if quant_model is not None and not isinstance(quant_model, QuantizationConfig):
         quant_model = QuantizationConfig(**quant_model)
     dcn_axis_dims = sharding.get("dcn_axis_dims")
     return dict(
@@ -544,7 +544,7 @@ def to_load_state_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[str, A
     if "num_labels" in extra_kwargs:
         config_kwargs["num_labels"] = extra_kwargs.pop("num_labels")
     quant_model = quant.get("model")
-    if quant_model is not None:
+    if quant_model is not None and not isinstance(quant_model, QuantizationConfig):
         quant_model = QuantizationConfig(**quant_model)
     dcn_axis_dims = sharding.get("dcn_axis_dims")
     device = loader["device"] if "device" in loader else "cpu"

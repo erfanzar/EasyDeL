@@ -25,9 +25,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.sharding import Mesh, NamedSharding, PartitionSpec
-
 import spectrax as spx
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from spectrax import nn
 from spectrax.nn import PipelineSequential
 from spectrax.runtime.mpmd import collect_task_times_ms, sxcall, sxgrad, sxjit, sxstage_iter, sxvalue_and_grad
@@ -436,10 +435,10 @@ def test_mpmd_jit_marker_fn_forward(mpmd_mesh):
     assert jnp.allclose(out, ref, atol=1e-5)
 
 
-def _ref_forward(w0, b0, w1, b1, x, y):
+def _ref_forward(w0, b0, w1, b1, x, y, *, precision=None):
     """Single-device reference forward (same ops as the pipelined version)."""
-    h = jnp.maximum(x @ w0 + b0, 0)
-    h = jnp.maximum(h @ w1 + b1, 0)
+    h = jnp.maximum(jnp.matmul(x, w0, precision=precision) + b0, 0)
+    h = jnp.maximum(jnp.matmul(h, w1, precision=precision) + b1, 0)
     return ((h - y) ** 2).mean()
 
 
@@ -449,6 +448,7 @@ def _make_pipe_forward(
     static_argnums=(),
     batch_argnums=(4, 5),
     microbatches=_M,
+    precision=None,
     **schedule_kwargs,
 ):
     """Build a decorated ``pipe_forward`` for schedule-driven sxjit tests."""
@@ -461,9 +461,9 @@ def _make_pipe_forward(
     )
     def pipe_forward(w0, b0, w1, b1, x, y):
         """Pipelined forward implementation."""
-        h = jnp.maximum(x @ w0 + b0, 0)
+        h = jnp.maximum(jnp.matmul(x, w0, precision=precision) + b0, 0)
         h = sxstage_iter(h)
-        h = jnp.maximum(h @ w1 + b1, 0)
+        h = jnp.maximum(jnp.matmul(h, w1, precision=precision) + b1, 0)
         return ((h - y) ** 2).mean()
 
     return pipe_forward
@@ -950,13 +950,21 @@ def test_mpmd_schedule_default_uses_fused_async(mpmd_mesh, pipe_args):
 
 def test_mpmd_schedule_terminal_backward_mode_scheduled_runs_bwd_slot(mpmd_mesh, pipe_args):
     """Scheduled terminal mode moves terminal VJP work from FWD into the BWD slot."""
+    # Single-row microbatches and the full batch can use different TPU DEFAULT
+    # multiplier precision. Test scheduling against a consistently fp32 reference.
+    precision = jax.lax.Precision.HIGHEST
     pipe_forward = _make_pipe_forward(
         mpmd_mesh,
         Std1F1B,
         microbatches=4,
+        precision=precision,
         terminal_backward_mode="scheduled",
     )
-    ref_loss, ref_grads = jax.value_and_grad(_ref_forward, argnums=(0, 1, 2, 3))(*pipe_args)
+
+    def reference(*args):
+        return _ref_forward(*args, precision=precision)
+
+    ref_loss, ref_grads = jax.value_and_grad(reference, argnums=(0, 1, 2, 3))(*pipe_args)
 
     with collect_task_times_ms() as times:
         loss, grads = sxvalue_and_grad(pipe_forward, argnums=(0, 1, 2, 3))(*pipe_args)
@@ -1124,3 +1132,114 @@ def test_mpmd_grad_requires_schedule(mpmd_mesh, pipe_args):
 
     with pytest.raises(TypeError, match="schedule"):
         sxgrad(fwd_only)
+
+
+def _ref_forward_skip(w0, b0, w1, b1, x, y):
+    """Reference where the batch input also feeds the second stage."""
+    h = jnp.maximum(x @ w0 + b0, 0)
+    h = jnp.maximum(h @ w1 + b1 + x, 0)
+    return ((h - y) ** 2).mean()
+
+
+@pytest.mark.parametrize(
+    "schedule_factory",
+    [
+        lambda m: GPipe(microbatches=m),
+        lambda m: Std1F1B(microbatches=m),
+        lambda m: Std1F1B(microbatches=m, lazy_bwd_batching=True),
+    ],
+    ids=["gpipe", "std1f1b", "std1f1b_lazy"],
+)
+def test_mpmd_schedule_microbatched_input_grad_sums_every_consuming_stage(schedule_factory, mpmd_mesh, pipe_args):
+    """A microbatched input read by two stages gets the sum of both stages' grads, not the last writer's."""
+
+    @sxjit(mesh=mpmd_mesh, schedule=schedule_factory(_M), batch_argnums=(4, 5))
+    def pipe_forward(w0, b0, w1, b1, x, y):
+        """Two-stage forward whose second stage also reads ``x``."""
+        h = jnp.maximum(x @ w0 + b0, 0)
+        h = sxstage_iter(h)
+        h = jnp.maximum(h @ w1 + b1 + x, 0)
+        return ((h - y) ** 2).mean()
+
+    argnums = (0, 1, 2, 3, 4)
+    grads = sxgrad(pipe_forward, argnums=argnums)(*pipe_args)
+    ref_grads = jax.grad(_ref_forward_skip, argnums=argnums)(*pipe_args)
+    for got, ref in zip(grads, ref_grads, strict=True):
+        assert jnp.allclose(got, ref, atol=1e-4, rtol=1e-4)
+
+
+def test_mpmd_jit_schedule_plain_grad_after_restricted_sxgrad(mpmd_mesh, pipe_args):
+    """``jax.grad`` must not reuse the argnum-restricted plan a prior ``sxgrad`` call left behind."""
+    pipe_forward = _make_pipe_forward(mpmd_mesh, Std1F1B)
+    argnums = (0, 1, 2, 3)
+    ref_grads = jax.grad(_ref_forward, argnums=argnums)(*pipe_args)
+
+    (only_w0,) = sxgrad(pipe_forward, argnums=(0,))(*pipe_args)
+    assert jnp.allclose(only_w0, ref_grads[0], atol=1e-4, rtol=1e-4)
+
+    pipe_grads = jax.grad(pipe_forward, argnums=argnums)(*pipe_args)
+    for pg, rg in zip(pipe_grads, ref_grads, strict=True):
+        assert jnp.allclose(pg, rg, atol=1e-4, rtol=1e-4)
+
+
+def test_mpmd_value_and_grad_and_apply_hands_final_grads_to_apply_fn(mpmd_mesh, pipe_args):
+    """Every rank's ``apply_fn`` sees the fully accumulated parameter grads."""
+    from spectrax.runtime.mpmd.training_step import sxvalue_and_grad_and_apply
+
+    pipe_forward = _make_pipe_forward(mpmd_mesh, Std1F1B)
+    argnums = (0, 1, 2, 3)
+    ref_grads = jax.grad(_ref_forward, argnums=argnums)(*pipe_args)
+    seen: dict[int, dict[int, object]] = {}
+
+    def apply_fn(rank, *, grad_accums, state):
+        """Record the grads visible to this rank and pass params through."""
+        seen[rank] = dict(grad_accums)
+        state["new_params_buf"][rank] = state["params"]
+        state["new_opt_state_buf"][rank] = state["opt_state"]
+
+    loss, _new_params, _new_opt_state = sxvalue_and_grad_and_apply(pipe_forward, argnums=argnums)(
+        *pipe_args,
+        apply_fn=apply_fn,
+        opt_state=(),
+    )
+
+    assert jnp.allclose(loss, _ref_forward(*pipe_args), atol=1e-5)
+    assert set(seen) == set(range(_N))
+    for rank_grads in seen.values():
+        for flat_idx, ref in enumerate(ref_grads):
+            assert flat_idx in rank_grads
+            assert jnp.allclose(rank_grads[flat_idx], ref, atol=1e-4, rtol=1e-4)
+
+
+def test_mpmd_call_forward_uses_updated_model_params(mpmd_mesh):
+    """The cached ``sxcall`` forward setup is refreshed after an in-place parameter update."""
+    stages = [_Block(_D, rngs=spx.Rngs(31)), _Block(_D, rngs=spx.Rngs(32))]
+    model = PipelineSequential(*stages)
+    x = jax.random.normal(jax.random.PRNGKey(33), (_BATCH, _D))
+
+    first = sxcall(model, (x,), mesh=mpmd_mesh, schedule=GPipe(microbatches=_M), mode="forward")
+    assert jnp.allclose(first, stages[1](stages[0](x)), atol=1e-5)
+
+    stages[0].fc.weight.value = stages[0].fc.weight.value * 1.5 + 0.25
+    second = sxcall(model, (x,), mesh=mpmd_mesh, schedule=GPipe(microbatches=_M), mode="forward")
+    assert jnp.allclose(second, stages[1](stages[0](x)), atol=1e-5)
+    assert not jnp.allclose(first, second)
+
+
+def test_mpmd_jit_forward_uses_updated_model_params(mpmd_mesh):
+    """Forward-only ``sxjit`` re-places model leaves that changed since the plan was built."""
+    stage0 = _Block(_D, rngs=spx.Rngs(41))
+    stage1 = _Block(_D, rngs=spx.Rngs(42))
+    x = jax.random.normal(jax.random.PRNGKey(43), (_BATCH, _D))
+
+    @sxjit(mesh=mpmd_mesh)
+    def forward(stage0, stage1, x):
+        """Two-stage forward with an explicit pipeline marker."""
+        return stage1(sxstage_iter(stage0(x)))
+
+    first = forward(stage0, stage1, x)
+    stage0.fc.weight.value = stage0.fc.weight.value * 1.5 + 0.25
+    second = forward(stage0, stage1, x)
+
+    assert jnp.allclose(second, stage1(stage0(x)), atol=1e-5)
+    assert not jnp.allclose(first, second)
