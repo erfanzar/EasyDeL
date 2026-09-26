@@ -7,7 +7,9 @@ workspace:
   layering_contract:
     rule: only easydel may import spectrax/ejkernel/eformer/eray; foundation libs independent of each other
     enforced_by: [ uv run lint-imports, .github/workflows/workspace-ci.yaml ]
-  test_env_cpu: "ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=8"
+  # Computation tests MUST run on an accelerator (XERXES.md golden rule 5); conftest guards refuse them on CPU.
+  test_env_accelerator: "env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu"
+  test_env_cpu_non_computation: "ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=8"  # eray, parsers, configs, or @pytest.mark.cpu_ok
   mesh_axes_easydel: [ pp, dp, fsdp, ep, tp, sp ]   # EasyDeLBaseConfig order; -1 dim auto-fills
 
 packages:

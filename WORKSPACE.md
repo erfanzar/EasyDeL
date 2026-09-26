@@ -140,18 +140,36 @@ spectrax    ejkernel    eformer    eray  <- independent of each other and of eas
 ## Testing
 
 Workspace CI runs affected-only *smoke* checks (imports + a tiny easydel
-forward) plus the layering contract. The deep suites are hardware-bound and
-run locally:
+forward on CPU, which only catches import/crash regressions and is not
+validation) plus the layering contract. The deep suites are hardware-bound and
+run locally. Every test that executes JAX numerics runs on an accelerator (TPU
+shown; for GPU use `JAX_PLATFORMS=cuda,cpu JAX_PLATFORM_NAME=gpu`), one test
+process at a time on a TPU host (single libtpu lock):
+
+```bash
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
+  uv run pytest libs/easydel/tests -m "not slow"
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
+  uv run pytest libs/spectrax/tests
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
+  uv run pytest libs/eformer/tests
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
+  uv run pytest libs/ejkernel/test
+```
+
+The CPU trio is only for tests that do no array computation (eray, tool/reasoning
+parsers, config/CLI/YAML parsing, data text transforms, loggers, paths, docs):
 
 ```bash
 ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
 XLA_FLAGS=--xla_force_host_platform_device_count=8 \
-  uv run pytest libs/easydel/tests -m "not slow"
-uv run pytest libs/spectrax/tests
-uv run pytest libs/eformer/tests
-uv run pytest libs/eray/tests
-uv run pytest libs/ejkernel/test        # kernels: most need GPU/TPU
+  uv run pytest libs/eray/tests
 ```
+
+Each library's tests `conftest.py` refuses to run computation tests on a CPU
+backend; pure-Python test files are allow-listed or marked `@pytest.mark.cpu_ok`.
+A CPU run of a computation test is never validation — with no accelerator
+available, report the change as unverified on hardware.
 
 ## Releasing
 

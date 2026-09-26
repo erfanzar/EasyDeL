@@ -86,20 +86,16 @@ Route backend-kernel changes through
 ## Verification
 
 ```bash
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
-XLA_FLAGS=--xla_force_host_platform_device_count=8 \
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
   uv run pytest libs/easydel/tests/modules/test_fused_layout_tp_portability.py libs/easydel/tests/modules/test_projection_layout.py
 
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
-XLA_FLAGS=--xla_force_host_platform_device_count=8 \
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
   uv run pytest libs/easydel/tests/layers/linears/test_quantized_sanitize_spec_for_shape.py libs/easydel/tests/layers/linears/test_quantized_sharding.py
 
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
-XLA_FLAGS=--xla_force_host_platform_device_count=8 \
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
   uv run pytest libs/easydel/tests/layers/quantization/test_base_module_rebuild.py libs/easydel/tests/trainers/test_quantization_group_size_compat.py
 
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
-XLA_FLAGS=--xla_force_host_platform_device_count=8 \
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
   uv run pytest libs/ejkernel/test/modules/operations/test_quantized_matmul.py
 ```
 

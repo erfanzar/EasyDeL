@@ -28,9 +28,8 @@ belongs to:
 
 ## Review checklist for any sharding change
 
-1. Does every spec still resolve on a 1-device mesh AND the fake 8-device CPU mesh?
-   (`XLA_FLAGS=--xla_force_host_platform_device_count=8`; tests in
-   `libs/easydel/tests/infra/` e.g. test_state_sharding_regressions.py).
+1. Does every spec still resolve on a 1-device mesh AND the multi-device accelerator mesh? (tests in
+   `libs/easydel/tests/infra/` e.g. test_state_sharding_regressions.py, run on TPU/GPU — a CPU run is not validation).
 2. Divisibility: does the sharded dim divide by the mesh axis size for the real target topology (v4-8 vs v5e-256), not
    just the test mesh?
 3. Fused layouts: TP interleaving means fused QKV/gate-up axes are NOT contiguous per head — only
@@ -53,4 +52,4 @@ belongs to:
   `PartitionAxis`/AxisPolicy (custom meshes rename axes).
 - Constraining with a spec built from a different mesh than the active one.
 - "Fixing" a divisibility error by silently replicating a large tensor.
-- Treating spec-resolution success on CPU as communication-efficiency proof.
+- Treating spec-resolution success as communication-efficiency proof.

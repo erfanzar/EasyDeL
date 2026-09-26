@@ -53,15 +53,13 @@ Prefer extending existing classes (`UnifiedAttention`, `ParallelLinear`,
 ## Verification
 
 ```bash
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
-XLA_FLAGS=--xla_force_host_platform_device_count=8 \
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
   uv run pytest libs/easydel/tests/layers/<area>/
 ```
 
 For attention or linears, also run sharding/layout tests:
 
 ```bash
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
-XLA_FLAGS=--xla_force_host_platform_device_count=8 \
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
   uv run pytest libs/easydel/tests/layers/linears libs/easydel/tests/layers/attention
 ```

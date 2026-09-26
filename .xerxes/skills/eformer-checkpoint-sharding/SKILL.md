@@ -78,16 +78,13 @@ objects.
 ## Verification
 
 ```bash
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
-XLA_FLAGS=--xla_force_host_platform_device_count=8 \
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
   uv run pytest libs/eformer/tests/serialization/test_remote_checkpoint_writes.py
 
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
-XLA_FLAGS=--xla_force_host_platform_device_count=8 \
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
   uv run pytest libs/eformer/tests/serialization/test_serialization_utils.py
 
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
-XLA_FLAGS=--xla_force_host_platform_device_count=8 \
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
   uv run pytest libs/eformer/tests/escale/test_mesh_creation.py libs/eformer/tests/escale/test_partition_manager_api.py
 ```
 

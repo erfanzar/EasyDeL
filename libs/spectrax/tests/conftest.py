@@ -1,4 +1,18 @@
-"""Test-suite compatibility hooks."""
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Test-suite hooks."""
 
 from __future__ import annotations
 
@@ -6,30 +20,6 @@ import re
 from pathlib import Path
 
 import pytest
-
-
-def _patch_removed_jax_config_flags() -> None:
-    try:
-        import jax
-    except Exception:
-        return
-    update = getattr(jax.config, "update", None)
-    if update is None or getattr(update, "_easydel_tests_removed_flag_patch", False):
-        return
-
-    removed_flags = {"jax_pmap_shmap_merge"}
-
-    def _patched_update(name, value):
-        if name in removed_flags:
-            return None
-        return update(name, value)
-
-    _patched_update._easydel_tests_removed_flag_patch = True  # type: ignore[attr-defined]
-    jax.config.update = _patched_update
-
-
-_patch_removed_jax_config_flags()
-
 
 # --- Computation tests run on an accelerator (XERXES.md golden rule 5) ---------------------------
 # A test file that imports an array / accelerator library is a computation test and must run on a

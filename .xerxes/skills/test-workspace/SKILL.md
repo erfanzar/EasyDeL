@@ -1,6 +1,6 @@
 ---
 name: test-workspace
-description: Select and run correct EasyDeL workspace checks. Use for affected-package test planning, CPU JAX env setup, import-layering checks, pre-commit behavior, hardware-bound test selection, and rejecting weak tests across libs/easydel, libs/spectrax, libs/ejkernel, and libs/eformer.
+description: Select and run correct EasyDeL workspace checks. Use for affected-package test planning, accelerator (TPU/GPU) test env setup, the conftest guard that refuses computation tests on CPU (cpu_ok marker), import-layering checks, pre-commit behavior, hardware-bound test selection, and rejecting weak tests across libs/easydel, libs/spectrax, libs/ejkernel, libs/eformer, and libs/eray.
 ---
 
 # Skill: Test The EasyDeL Workspace
@@ -16,9 +16,31 @@ first and use this as the verification layer.
 - touched package `pyproject.toml`
 - touched package docs under `libs/<package>/docs/`
 
-## CPU JAX Environment
+## Accelerator Environment (computation tests)
 
-For CPU JAX tests, use the full trio:
+Every test that executes JAX numerics — models, layers, attention, MoE, kernels, losses, optimizers, trainers, caches,
+eSurge, spectrax transforms/runtime/nn/core, eformer escale/mpric/ops/optimizers, conversion parity — runs on an
+accelerator: TPU, or GPU where that is the target hardware.
+
+```bash
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
+  uv run pytest <path>
+```
+
+For GPU use `JAX_PLATFORMS=cuda,cpu JAX_PLATFORM_NAME=gpu`. `ENABLE_DISTRIBUTED_INIT=0` prevents local tests from
+joining a real distributed runtime; unsetting `XLA_FLAGS` drops a stray `--xla_force_host_platform_device_count` from
+the shell.
+
+TPU hosts hold a single libtpu process lock: run one accelerator test process at a time. While a TPU job runs, only
+non-computation probes may use `JAX_PLATFORMS=cpu`; computation tests wait for the TPU.
+
+A CPU run of a computation test is never validation. With no accelerator available, do not run it on CPU as a stand-in —
+report the change as **unverified on hardware**.
+
+## CPU Trio (non-computation tests only)
+
+Tests that do no array computation — eray, tool/reasoning parsers, config/CLI/YAML parsing, data text transforms,
+loggers, paths, docs — may use the CPU trio:
 
 ```bash
 ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
@@ -26,11 +48,11 @@ XLA_FLAGS=--xla_force_host_platform_device_count=8 \
   uv run pytest <path>
 ```
 
-The fake host-device count is load-bearing for multi-device sharding tests.
-`ENABLE_DISTRIBUTED_INIT=0` prevents local tests from joining a real distributed runtime.
+## Conftest Enforcement
 
-CPU checks are not substitutes for TPU kernel correctness, Mosaic lowering, eSurge TPU runtime behavior, or benchmark
-claims.
+Each library's tests `conftest.py` refuses to run computation tests on a CPU backend. Pure-Python test files are
+allow-listed in the conftest or marked `@pytest.mark.cpu_ok`. Mark a test `cpu_ok` only when it does no array
+computation; never add the marker (or an allow-list entry) to get a computation test past the guard.
 
 ## Workspace Gates
 
@@ -50,28 +72,30 @@ intended edits, and rerun. Do not put
 
 ```bash
 # EasyDeL
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
-XLA_FLAGS=--xla_force_host_platform_device_count=8 \
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
   uv run pytest libs/easydel/tests -m "not slow"
 
 # SpectraX
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
-XLA_FLAGS=--xla_force_host_platform_device_count=8 \
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
   uv run pytest libs/spectrax/tests
 
 # eFormer
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
-XLA_FLAGS=--xla_force_host_platform_device_count=8 \
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
   uv run pytest libs/eformer/tests
 
-# eJKernel XLA/host-side
+# eJKernel (note: test/, not tests/)
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
+  uv run pytest libs/ejkernel/test
+
+# eRay: orchestration, no array compute — CPU trio
 ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
 XLA_FLAGS=--xla_force_host_platform_device_count=8 \
-  uv run pytest libs/ejkernel/test/kernels/_xla
+  uv run pytest libs/eray/tests
 ```
 
-eJKernel Pallas TPU tests under `libs/ejkernel/test/kernels/_pallas/tpu` need a TPU backend and an available libtpu
-process lock.
+Run the accelerator targets one at a time (libtpu lock). eJKernel Pallas TPU tests under
+`libs/ejkernel/test/kernels/_pallas/tpu` need a TPU backend; GPU kernel trees need a GPU with
+`JAX_PLATFORMS=cuda,cpu JAX_PLATFORM_NAME=gpu`.
 
 ## Test Quality
 

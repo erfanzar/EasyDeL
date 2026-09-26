@@ -42,5 +42,6 @@ description: Update EasyDeL workspace documentation when APIs change — regener
 
 - Docs state what the code does now; verify before writing.
 - Prefer "first reads" pointer lists over paraphrasing other docs.
-- Examples must be runnable (CPU env trio for tests, real registry names, real dataclass fields).
+- Examples must be runnable (accelerator env for computation tests, CPU trio only for non-computation tests, real
+  registry names, real dataclass fields).
 - No self-credit trailers in any committed text.

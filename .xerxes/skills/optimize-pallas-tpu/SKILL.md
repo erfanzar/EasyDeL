@@ -64,8 +64,9 @@ Before editing:
 Keep warmup count, iteration count, shape, dtype, and device fixed between baseline and candidate. A "win" from a
 changed command line or a different shape is not a win. Lock TPU state by owning the device for the whole run.
 
-CPU/XLA may only be used for host-side preflight — imports, shape checks, reference math, harness syntax. **CPU timing
-is never evidence for TPU behavior, Mosaic lowering, or DMA overlap.** If you cannot get the TPU, say the target run was
+CPU may only be used for non-computation preflight — imports, harness syntax. Parity tests (reference math included)
+run on the accelerator. **A CPU run is never evidence for correctness, TPU behavior, Mosaic lowering, or DMA
+overlap.** If you cannot get the TPU, say the target run was
 not performed rather than substituting CPU numbers.
 
 ## Measure, Don't Guess

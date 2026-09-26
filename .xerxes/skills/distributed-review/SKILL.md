@@ -25,8 +25,8 @@ contract or correctness violations, not preferences.
 
 ## Review Checklist
 
-1. **Resolution**: every new/changed spec resolves on a 1-device mesh and the fake 8-device CPU mesh. Regression
-   surface:
+1. **Resolution**: every new/changed spec resolves on a 1-device mesh and the accelerator's multi-device mesh.
+   Regression surface:
    `libs/easydel/tests/infra/` (state sharding, pipeline stage regions, scan stage config).
 2. **Divisibility**: sharded dims divide the mesh axis size for realistic topologies, not just the test mesh; `-1`
    auto-fill assumptions stated.
@@ -51,8 +51,7 @@ contract or correctness violations, not preferences.
 
 ```bash
 uv run lint-imports
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
-XLA_FLAGS=--xla_force_host_platform_device_count=8 \
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
   uv run pytest libs/easydel/tests/infra <plus the touched surface>
 ```
 

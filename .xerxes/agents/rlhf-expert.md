@@ -38,8 +38,8 @@ generation.
 
 ## Verification
 
-Loss math on constants (CPU trio) first; then a tiny end-to-end step with a 2-layer model and a trivial reward asserting
-advantage signs. Throughput or rollout-overlap claims are hardware claims → perf-engineer/tpu-expert.
+Loss math on constants (on the accelerator) first; then a tiny end-to-end step with a 2-layer model and a trivial
+reward asserting advantage signs. Throughput or rollout-overlap claims are hardware claims → perf-engineer/tpu-expert.
 
 ## Boundaries
 

@@ -42,8 +42,13 @@ These apply to every agent and every session, without exception.
 4. **Never hand-edit version pins.** `scripts/release.sh <lib> <version>`
    bumps versions and syncs easydel's pins; `scripts/publish.sh <lib>` tags for CI publish. Two separate steps by
    design.
-5. **CPU checks are not TPU validation.** CPU runs validate logic/shapes/ sharding math, not Pallas/Mosaic lowering,
-   eSurge TPU runtime, or any performance claim.
+5. **Computation tests run on an accelerator — always.** Any test that executes JAX numerics (models, layers,
+   attention, MoE, kernels, losses, optimizers, trainers, caches, eSurge, spectrax transforms/runtime, eformer escale /
+   mpric / ops) must run on TPU (or GPU where that is the target hardware). CPU is allowed only for tests that do no
+   array computation (config/CLI parsing, tool/reasoning parsers, data text transforms, loggers, paths, eray). A CPU run
+   of a computation test is not validation and must never be reported as such; with no accelerator available, report
+   the change as **unverified on hardware**. The test suites enforce this: their `conftest.py` refuses to run
+   computation tests on a CPU backend (pure-Python files are allow-listed or marked `cpu_ok`).
 6. **Don't bypass registries.** Models go through `register_config`/
    `register_module`, trainers through `Registry.register("trainer", ...)`, attention through `OperationRegistry`,
    kernels through ejkernel's
@@ -59,30 +64,33 @@ uv sync --extra cuda             # + CUDA extras
 uv run pre-commit install --hook-type pre-commit --hook-type pre-push   # once per clone
 ```
 
-The CPU JAX test environment trio — all three parts are load-bearing (fake 8-device host enables sharding tests;
-`ENABLE_DISTRIBUTED_INIT=0`
-prevents joining a real distributed runtime):
+The accelerator test environment — use it for every computation test (TPU shown; for GPU use
+`JAX_PLATFORMS=cuda,cpu JAX_PLATFORM_NAME=gpu`). `ENABLE_DISTRIBUTED_INIT=0` prevents joining a real distributed
+runtime; unsetting `XLA_FLAGS` drops a stray `--xla_force_host_platform_device_count` from the shell:
 
 ```bash
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
-XLA_FLAGS=--xla_force_host_platform_device_count=8 \
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
   uv run pytest <path>
 ```
+
+The CPU trio (`JAX_PLATFORMS=cpu` + `XLA_FLAGS=--xla_force_host_platform_device_count=8`) is only for tests that do
+no array computation, e.g. `libs/eray/tests`, parser and config tests.
 
 Standard targets:
 
 ```bash
 uv run lint-imports                                   # layering contract
 uv run pre-commit run --all-files                     # per-lib ruff + hygiene
-<trio> uv run pytest libs/easydel/tests -m "not slow" # easydel suite
-<trio> uv run pytest libs/spectrax/tests              # spectrax
-<trio> uv run pytest libs/eformer/tests               # eformer
-<trio> uv run pytest libs/ejkernel/test/kernels/_xla  # ejkernel host-side (note: test/, not tests/)
+<accel> uv run pytest libs/easydel/tests -m "not slow" # easydel suite
+<accel> uv run pytest libs/spectrax/tests              # spectrax
+<accel> uv run pytest libs/eformer/tests               # eformer
+<accel> uv run pytest libs/ejkernel/test               # ejkernel (note: test/, not tests/)
+<trio>  uv run pytest libs/eray/tests                  # eray: orchestration, no array compute
 uv run python scripts/format_and_generate_docs.py --libs easydel --fix   # format + regenerate API docs
 ```
 
-ejkernel Pallas-TPU tests (`libs/ejkernel/test/kernels/_pallas/tpu`) need a real TPU and the libtpu process lock (single
-process per host).
+`<accel>` is the accelerator environment above, `<trio>` the CPU trio. TPU hosts hold a single libtpu process lock: run
+one accelerator test process at a time.
 
 Key runners (repo root `scripts/`): `python -m easydel.scripts.elarge
 --config <yaml>` (eLarge train/eval/serve runner), `convert_hf_to_easydel.py`
@@ -215,8 +223,8 @@ path (single jit + shard_map) exists alongside.
 - Autotuned kernel configs are cached per device+sharding fingerprint, persisted under `~/ejkernel-presistent-cache/`
   (override with
   `EJKERNEL_PERSISTENT_CACHE_DIR`); a stale cache can mask a regression or carry a bad config across code changes.
-- TPU hosts hold a single libtpu process lock — pin unrelated probes to
-  `JAX_PLATFORMS=cpu` while a TPU job runs.
+- TPU hosts hold a single libtpu process lock — while a TPU job runs, only non-computation probes may use
+  `JAX_PLATFORMS=cpu`; computation tests wait for the TPU.
 - `-1` mesh dims resolve against visible devices; multi-slice needs
   `sharding_dcn_axis_dims`.
 - Donated buffers (`donate_argnums`) apply to the flattened state the compiler sees, not your Python signature.
@@ -241,7 +249,8 @@ path (single jit + shard_map) exists alongside.
 Before calling a change done (full flow: `.xerxes/skills/review-pr`):
 
 1. Layering intact (`uv run lint-imports`), no registry bypasses.
-2. Focused tests pass under the CPU trio; new behavior has a non-tautological test at the right layer.
+2. Focused tests pass on TPU/GPU (the CPU trio only for non-computation tests); new behavior has a non-tautological
+   test at the right layer.
 3. Sharding/shape/dtype: partition specs still resolve on 1-device and 8-fake-device meshes; softmax/accumulation dtypes
    preserved.
 4. Kernel changes have an XLA-reference parity path and don't regress other backends' registered signatures.
@@ -304,9 +313,9 @@ not themselves register agents, commands, or tools. Legacy Claude-specific setti
    violations after coding.
 3. **Implement** — smallest change that tests the hypothesis; follow the skill's "required surfaces" list
    (registrations, tests, docs, exports).
-4. **Verify** — `test-engineer` selects the focused tests (CPU trio), then
-   `uv run lint-imports` and pre-commit. Hardware-bound claims go to
-   `tpu-expert`/`perf-engineer` or are explicitly reported as unverified.
+4. **Verify** — `test-engineer` selects the focused tests and runs them on TPU/GPU (CPU only for non-computation
+   tests), then `uv run lint-imports` and pre-commit. Without an accelerator the change is reported as unverified —
+   never validated on CPU.
 5. **Review** — `reviewer` on the final diff (flow below).
 
 ### Review flow
@@ -319,9 +328,8 @@ partition specs → sharding-expert; cache shapes or bucket compilation → infe
 
 ### Escalation rules
 
-- **CPU-unverifiable claims** (Pallas lowering, TPU perf, eSurge runtime on device): stop at "unverified on hardware" or
-  hand to `tpu-expert` /
-  `perf-engineer` with a run plan. Never extrapolate CPU timings.
+- **No accelerator available**: computation tests cannot be run, so stop at "unverified on hardware" or hand to
+  `tpu-expert` / `perf-engineer` with a run plan. Never substitute a CPU run or extrapolate CPU timings.
 - **Infrastructure symptoms** (bad TPU node, libtpu lock, disk pressure):
   route to `.xerxes/ops/OPS.md` before treating as a code bug; destructive recovery (deleting TPU VMs) requires explicit
   user approval.

@@ -22,7 +22,8 @@ planned file path with `rg` or by opening it.
   a plan that needs a foundation lib to know about easydel is a wrong plan.
 - Name which domain experts must sign off before coding (sharding-expert for anything with a PartitionSpec,
   quantization-expert for fused/quantized layouts, inference-expert for cache shapes).
-- Define the verification ladder up front: which CPU-trio pytest targets, whether hardware validation is required, what
+- Define the verification ladder up front: which accelerator pytest targets (CPU trio only for
+  non-computation tests), whether further hardware validation is required, what
   the perf baseline is.
 
 ## Decision boundaries
@@ -45,5 +46,5 @@ planned file path with `rg` or by opening it.
 1. Goal restated in one sentence, with the chosen extension point (s).
 2. Ordered steps, each with files and the registration/tests it must add.
 3. Cross-package impact + expert consultations required.
-4. Verification commands (exact pytest paths under the CPU trio).
+4. Verification commands (exact pytest paths on the accelerator; CPU trio only for non-computation tests).
 5. Risks: sharding, recompilation, checkpoint compatibility, HF conversion.

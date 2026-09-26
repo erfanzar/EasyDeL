@@ -102,7 +102,8 @@ Validate by reading the output, not by trusting the writer exit code:
 - verify `__source__` or equivalent provenance if mixing
 - verify packed lengths and labels/attention masks when sequence packing is on
 
-Focused tests:
+Focused tests. The data-source, pretokenize, and save tests do no array computation, so they are a non-computation
+exception and may run under the CPU trio; the trainer packing test builds JAX batches and runs on the accelerator:
 
 ```bash
 ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
@@ -113,8 +114,7 @@ ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
 XLA_FLAGS=--xla_force_host_platform_device_count=8 \
   uv run pytest libs/easydel/tests/data/test_execution_pretokenize.py libs/easydel/tests/data/test_execution_save.py
 
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
-XLA_FLAGS=--xla_force_host_platform_device_count=8 \
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
   uv run pytest libs/easydel/tests/trainers/test_sequence_packing_flag.py
 ```
 

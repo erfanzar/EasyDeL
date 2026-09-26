@@ -70,12 +70,13 @@ Run the cheapest relevant command after identifying likely issues:
 
 ```bash
 uv run lint-imports
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
-XLA_FLAGS=--xla_force_host_platform_device_count=8 \
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
   uv run pytest <focused-test-path>
 ```
 
-Do not use TPU for review verification unless the PR's claim depends on TPU and the TPU is available to this process.
+Computation tests run on the accelerator only (GPU: `JAX_PLATFORMS=cuda,cpu JAX_PLATFORM_NAME=gpu`); the CPU trio is
+for non-computation tests (parsers, config/CLI, eray). If the accelerator is not available to this process, say the
+tests were not run and report the PR's computation claims as unverified on hardware — never substitute a CPU run.
 
 ## Output
 

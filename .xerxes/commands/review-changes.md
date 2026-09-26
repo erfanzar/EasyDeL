@@ -16,7 +16,8 @@ Ground rules:
 - Findings must be real bugs, broken contracts, boundary violations, or testing-policy violations — cite file:line and
   the rule or failure path.
 - Validate every finding against the actual code before reporting it.
-- Run the cheapest relevant verification (`uv run lint-imports`, focused pytest under the CPU env trio).
+- Run the cheapest relevant verification (`uv run lint-imports`, focused pytest on the accelerator; CPU trio only for
+  non-computation tests — without an accelerator, report computation claims as unverified on hardware).
 - No style nits, no speculative concerns, no lint-catchable issues.
 
 Output findings ordered by severity with the smallest credible fix direction each. If clean, say so and name residual

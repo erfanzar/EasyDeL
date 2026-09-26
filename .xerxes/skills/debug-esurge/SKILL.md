@@ -87,16 +87,16 @@ ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu \
 
 ## Focused Tests
 
-Host-side tests use the CPU environment below; these do not replace TPU runtime validation for performance or libtpu
-behavior.
+eSurge tests execute JAX numerics and run on the accelerator only; a CPU run is not validation, and without an
+accelerator the change is unverified on hardware. Test runs do not replace benchmark evidence for performance or libtpu
+behavior. The API-server test (`test_engine_api_authoritative.py`) does no array computation and is the one
+non-computation exception that may use the CPU trio.
 
 ```bash
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
-XLA_FLAGS=--xla_force_host_platform_device_count=8 \
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
   uv run pytest libs/easydel/tests/inference/esurge
 
-ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
-XLA_FLAGS=--xla_force_host_platform_device_count=8 \
+env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \
   uv run pytest libs/easydel/tests/inference/esurge/runners/test_model_executor_prepare_signature.py
 
 ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \

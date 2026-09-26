@@ -17,8 +17,8 @@ Deliver:
 3. Ordered implementation steps, each listing files, registrations, and the test it must add. Name the matching skill
    for each step (add-easydel-model, add-easydel-trainer, add-ejkernel-kernel, ...).
 4. Domain experts to consult before coding (sharding/quantization/inference invariants).
-5. Verification ladder: exact pytest targets under the CPU env trio, plus any hardware-bound validation that must be
-   scheduled or reported as unverified.
+5. Verification ladder: exact pytest targets on the accelerator (CPU trio only for non-computation tests), plus any
+   hardware validation that must be scheduled or reported as unverified on hardware.
 6. Risks: sharding, recompilation, checkpoint compatibility, HF conversion.
 
 Do not write implementation code. If the feature is ambiguous, state the interpretation you chose and why.
