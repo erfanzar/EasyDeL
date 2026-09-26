@@ -519,3 +519,129 @@ def test_containers_have_no_static_fields():
     assert Sequential()._spx_static_fields() == {}
     assert ModuleDict()._spx_static_fields() == {}
     assert ParameterList()._spx_static_fields() == {}
+
+
+class _NoisyBlock(Module):
+    """Adds uniform noise drawn from a (possibly shared) :class:`Rngs`."""
+
+    def __init__(self, rngs):
+        """Keep a reference to ``rngs`` (shared across layers in the tests)."""
+        super().__init__()
+        self.rngs = rngs
+
+    def forward(self, x):
+        """Draw a fresh key from the default stream."""
+        return x + jax.random.uniform(self.rngs.default, x.shape)
+
+
+class _CountingBlock(Module):
+    """Increments a per-layer buffer on every call."""
+
+    def __init__(self, scale: float):
+        """Initialize the weight and the call counter."""
+        from spectrax.core.variable import Buffer
+
+        super().__init__()
+        self.w = Parameter(jnp.full((4,), scale, dtype=jnp.float32))
+        self.count = Buffer(jnp.zeros((), dtype=jnp.float32))
+
+    def forward(self, x):
+        """Count the call and apply the layer."""
+        self.count.value = self.count.value + 1.0
+        return x * self.w.value + self.count.value
+
+
+def _noisy_layers(n: int):
+    """``n`` noisy layers sharing one :class:`Rngs`."""
+    from spectrax.rng.rngs import Rngs
+
+    rngs = Rngs(0)
+    return ModuleList([_NoisyBlock(rngs) for _ in range(n)]), rngs
+
+
+def _counter(rngs) -> int:
+    """Low word of the default stream counter."""
+    return int(rngs.stream("default")._unpack()[2])
+
+
+@pytest.mark.parametrize("use_jit", [False, True])
+def test_modulelist_scan_threads_shared_rng_like_python_loop(use_jit):
+    """``scan(trace=False)`` must advance a shared Rngs per layer and per call, like the Python loop."""
+    scanned_layers, scanned_rngs = _noisy_layers(3)
+    looped_layers, looped_rngs = _noisy_layers(3)
+    x = jnp.zeros((2, 4))
+
+    def run_scan(layers, inp):
+        """Lowered scan."""
+        return layers.scan(lambda layer, carry: layer(carry), inp)
+
+    if use_jit:
+        run_scan = spx.jit(run_scan, mutable="rng")
+
+    for _ in range(2):
+        out_scan = run_scan(scanned_layers, x)
+        out_loop = looped_layers.scan(lambda layer, carry: layer(carry), x, trace=True)
+        assert jnp.allclose(out_scan, out_loop, atol=1e-6)
+    assert _counter(scanned_rngs) == _counter(looped_rngs) == 6
+
+
+def test_modulelist_scan_and_fori_loop_write_back_per_layer_buffers():
+    """Per-layer buffer writes inside ``scan`` / ``fori_loop`` reach the live items."""
+    layers = ModuleList([_CountingBlock(float(i + 1)) for i in range(3)])
+    x = jnp.ones((4,))
+
+    expected = x
+    for i in range(3):
+        expected = expected * (i + 1) + 1.0
+    out = layers.scan(lambda layer, carry: layer(carry), x)
+    assert jnp.allclose(out, expected)
+    assert [float(layer.count.value) for layer in layers] == [1.0, 1.0, 1.0]
+
+    expected = x
+    for i in range(3):
+        expected = expected * (i + 1) + 2.0
+    out = layers.fori_loop(lambda _i, layer, carry: layer(carry), x)
+    assert jnp.allclose(out, expected)
+    assert [float(layer.count.value) for layer in layers] == [2.0, 2.0, 2.0]
+
+
+def test_stacked_modulelist_scan_writes_back_stacked_buffers():
+    """``StackedModuleList.scan`` / ``fori_loop`` write per-layer buffers into the stacked rows."""
+    stacked = ModuleList([_CountingBlock(float(i + 1)) for i in range(3)]).stack()
+    x = jnp.ones((4,))
+    stacked.scan(lambda layer, carry: layer(carry), x)
+    stacked.fori_loop(lambda _i, layer, carry: layer(carry), x)
+    counts = [float(stacked[i].count.value) for i in range(3)]
+    assert counts == [2.0, 2.0, 2.0]
+
+
+def test_modulelist_traced_index_writes_through_under_fori_loop():
+    """``m[i]`` with a traced ``i`` inside ``spx.fori_loop`` must not drop buffer writes."""
+    layers = ModuleList([_CountingBlock(float(i + 1)) for i in range(3)])
+    x = jnp.ones((4,))
+    out = spx.fori_loop(0, 3, lambda i, m, carry: m[i](carry), layers, x, mutable="buffers")
+    expected = x
+    for i in range(3):
+        expected = expected * (i + 1) + 1.0
+    assert jnp.allclose(out, expected)
+    assert [float(layer.count.value) for layer in layers] == [1.0, 1.0, 1.0]
+
+
+def test_modulelist_scan_inside_fori_loop_covers_every_layer():
+    """With the fori_loop stacked cache injected, ``ModuleList.scan`` still runs all layers."""
+
+    class Holder(Module):
+        """Owns a nested ModuleList so ``spx.fori_loop`` injects its stacked cache."""
+
+        def __init__(self):
+            """Create three linear layers."""
+            super().__init__()
+            self.layers = ModuleList([_linear(i) for i in range(3)])
+
+    holder = Holder()
+    x = jnp.ones((2, 4))
+    expected = x
+    for layer in holder.layers:
+        expected = layer(expected)
+    out = spx.fori_loop(0, 1, lambda _i, m, carry: m.layers.scan(lambda layer, c: layer(c), carry), holder, x)
+    assert jnp.allclose(out, expected, atol=1e-5)

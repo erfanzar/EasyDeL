@@ -176,6 +176,41 @@ def test_vjp_mutable_primal_updates_live_module():
     assert grads_x.shape == ()
 
 
+class _StatefulNet(Module):
+    """Parameter + batch-stat buffer + RNG: the non-``wrt`` state ``grad`` must carry out."""
+
+    def __init__(self) -> None:
+        """Initialize the layer, the running statistic and the RNG."""
+        super().__init__()
+        self.fc = Linear(4, 4, rngs=Rngs(0))
+        self.running = Buffer(jnp.zeros((4,), dtype=jnp.float32), kind="batch_stats")
+        self.rngs = Rngs(1)
+
+    def forward(self, x):
+        """Update the running mean, draw a dropout-style mask, apply the layer."""
+        y = self.fc(x)
+        self.running.value = 0.5 * self.running.value + 0.5 * jnp.mean(y, axis=0)
+        keep = jax.random.bernoulli(self.rngs.key("dropout"), 0.5, y.shape)
+        return jnp.where(keep, y, 0.0)
+
+
+def test_grad_carries_out_buffer_and_rng_writes_outside_wrt():
+    """Writes to buffers / rng made inside ``spx.grad`` reach the live module (not dropped)."""
+    m = _StatefulNet()
+    x = jnp.arange(64.0, dtype=jnp.float32).reshape(16, 4) / 64.0
+
+    counter_before = int(m.rngs.stream("dropout")._unpack()[2])
+    g1 = spx.grad(lambda mod: jnp.sum(mod(x)))(m)
+    expected_running = 0.5 * jnp.mean(m.fc(x), axis=0)
+    assert jnp.allclose(m.running.value, expected_running)
+    assert int(m.rngs.stream("dropout")._unpack()[2]) == counter_before + 1
+
+    g2 = spx.grad(lambda mod: jnp.sum(mod(x)))(m)
+    assert int(m.rngs.stream("dropout")._unpack()[2]) == counter_before + 2
+    # A fresh mask per step: the two weight gradients must differ.
+    assert not jnp.allclose(g1["parameters"]["fc"]["weight"], g2["parameters"]["fc"]["weight"])
+
+
 def test_vjp_decorator_rejects_kwargs():
     """Wrapped ``vjp`` keeps a JAX-like positional-arguments API."""
 

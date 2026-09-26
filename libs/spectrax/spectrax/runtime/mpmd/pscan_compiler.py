@@ -461,6 +461,47 @@ class PscanPlan:
 
     grid: list[list[object]] = field(default_factory=list)
 
+    const_flat_arg_indices: tuple[int | None, ...] = ()
+    leaf_shardings: list[dict[int, object]] = field(default_factory=list)
+
+
+def _pscan_per_call_consts(
+    plan: PscanPlan,
+    outer_flat_args: tuple[object, ...] | None,
+) -> dict[tuple[int, int], tuple[object, ...]]:
+    """Return ``plan.per_loc_consts`` rebound to the live call's argument leaves.
+
+    The plan is cached per shape signature, but body consts that were traced
+    from the decorated function's inputs (model parameters, the batch captured
+    by :func:`treduce`) change every call. Only consts that came from outer
+    ``jaxpr`` constvars are genuinely trace-time constant.
+
+    Args:
+        plan: Cached pscan plan.
+        outer_flat_args: Flattened positional args of the current call, or
+            ``None`` to reuse the consts captured at build time.
+
+    Returns:
+        Per-location const tuples placed on each stage's sub-mesh.
+    """
+    if outer_flat_args is None or not plan.const_flat_arg_indices:
+        return plan.per_loc_consts
+    rebound: dict[tuple[int, int], tuple[object, ...]] = {}
+    for loc, planned_consts in plan.per_loc_consts.items():
+        rank = loc[0]
+        rank_leaf_shardings = plan.leaf_shardings[rank] if rank < len(plan.leaf_shardings) else {}
+        consts = list(planned_consts)
+        changed = False
+        for local_idx, const_idx in enumerate(plan.const_indices_per_loc.get(loc, ())):
+            flat_arg_idx = plan.const_flat_arg_indices[const_idx]
+            if flat_arg_idx is None:
+                continue
+            sharding = rank_leaf_shardings.get(flat_arg_idx) or plan.stage_shardings[rank]
+            consts[local_idx] = jax.device_put(outer_flat_args[flat_arg_idx], sharding)
+            changed = True
+        rebound[loc] = tuple(consts) if changed else planned_consts
+    return rebound
+
 
 def _collect_used_constvars(cluster: Jaxpr) -> list[Var]:
     """Return constvars of ``cluster`` referenced by any of its equations.
@@ -2097,6 +2138,8 @@ def build_pscan_plan(
         invar_sources=invar_sources,
         edge_shardings=edge_shardings,
         grid=grid,
+        const_flat_arg_indices=tuple(const_flat_arg_indices),
+        leaf_shardings=leaf_shardings,
     )
 
 
@@ -2120,7 +2163,7 @@ def _iter_actions(row: list[object]):
             yield rank, cell.virtual_stage, cell
 
 
-def dispatch_pscan(plan: PscanPlan) -> list[object]:
+def dispatch_pscan(plan: PscanPlan, outer_flat_args: tuple[object, ...] | None = None) -> list[object]:
     """Run the schedule-driven dispatch loop and return accumulator values.
 
     Walks ``plan.grid`` step by step, firing the per-rank cluster jit
@@ -2133,6 +2176,9 @@ def dispatch_pscan(plan: PscanPlan) -> list[object]:
 
     Args:
         plan: Plan value consumed by this operation.
+        outer_flat_args: Flattened positional args of the current call. When
+            given, input-derived body consts (parameters, captured batch) are
+            rebound to these live values instead of the build-time snapshot.
 
     Returns:
         Result described by this helper.
@@ -2140,6 +2186,7 @@ def dispatch_pscan(plan: PscanPlan) -> list[object]:
     n = plan.n
     ops = plan.ops
     grid = plan.grid
+    per_loc_consts = _pscan_per_call_consts(plan, outer_flat_args)
 
     fwd_inputs: dict[tuple[int, int, int], tuple[object, ...]] = {}
     fwd_outputs: dict[tuple[int, int, int], tuple[object, ...]] = {}
@@ -2156,7 +2203,7 @@ def dispatch_pscan(plan: PscanPlan) -> list[object]:
             logical = plan.logical_for_loc[loc]
             submesh = plan.rank_submeshes[rank]
             mb_idx = jnp.asarray(mb, dtype=jnp.int32)
-            consts = plan.per_loc_consts[loc]
+            consts = per_loc_consts[loc]
             key = (rank, virt, mb)
 
             if phase is Phase.FWD:

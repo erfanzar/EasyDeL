@@ -338,6 +338,59 @@ class TestScheduledBodyVirtualStages:
                 f"mismatch at ({r},{v}): got {grads['w'][r, v]}, ref {ref}"
             )
 
+    @pytest.mark.parametrize("use_scan", [False, True])
+    @pytest.mark.parametrize("zero_bubble", [True, False])
+    def test_dualpipev_matches_analytic_reference(self, zero_bubble, use_scan):
+        """DualPipeV FWD+BWD pairs keep their backward half and every rank stays in its column."""
+        from spectrax.runtime.schedules import DualPipeV
+
+        m = 8
+        sch = DualPipeV(microbatches=m, zero_bubble=zero_bubble)
+        per_mb = 2
+        xs = jnp.arange(m * per_mb, dtype=jnp.float32).reshape(m, per_mb) + 1.0
+        tgt = jnp.ones((m, per_mb), dtype=jnp.float32)
+
+        weights = ((2.0, 5.0), (3.0, 7.0))
+        per_rank_virt_params = [[{"w": jnp.asarray(weights[r][v])} for v in range(2)] for r in range(2)]
+
+        loss, grads = _run_shardmap_virtual(sch, m, per_rank_virt_params, xs, tgt, use_scan=use_scan)
+
+        # DualPipeV chains (0, 0) -> (1, 0) -> (1, 1) -> (0, 1); permute into the
+        # reference helper's (0, 0) -> (1, 0) -> (0, 1) -> (1, 1) order.
+        (w00, w01), (w10, w11) = weights
+        ref_loss, ref_grads = _analytic_reference_vstage(((w00, w11), (w10, w01)), xs, tgt, m)
+        expected = {
+            (0, 0): ref_grads[(0, 0)],
+            (1, 0): ref_grads[(1, 0)],
+            (1, 1): ref_grads[(0, 1)],
+            (0, 1): ref_grads[(1, 1)],
+        }
+        assert jnp.allclose(loss, ref_loss, atol=1e-3, rtol=1e-4)
+        for (r, v), ref in expected.items():
+            assert jnp.allclose(grads["w"][r, v], ref, atol=1e-3, rtol=1e-4), (
+                f"mismatch at ({r},{v}): got {grads['w'][r, v]}, ref {ref}"
+            )
+
+
+class TestExpandFusedRows:
+    """Unit tests for the shard_map grid expansion of :class:`FusedTask` cells."""
+
+    def test_fused_cells_split_into_aligned_fwd_then_bwd_rows(self):
+        """A fused cell becomes FWD then BWD in consecutive rows without shifting other ranks."""
+        from spectrax.runtime.schedules import Action, FusedTask, Phase
+        from spectrax.runtime.spmd.shard_map import _expand_fused_rows
+
+        fwd = Action(Phase.FWD, 3, 0)
+        bwd = Action(Phase.BWD, 1, 1)
+        other = Action(Phase.FWD, 2, 0)
+        grid = [[FusedTask(fwd=fwd, bwd=bwd), other, None], [None, other, None]]
+
+        assert _expand_fused_rows(grid) == [
+            [fwd, other, None],
+            [bwd, None, None],
+            [None, other, None],
+        ]
+
 
 class TestScheduledBodyVirtualStageSmoke:
     """Smoke tests — every remaining virtual-stage schedule compiles and runs finite.

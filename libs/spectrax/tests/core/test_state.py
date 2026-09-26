@@ -326,3 +326,19 @@ def test_collections_skips_empty():
     """``collections()`` only reports non-empty collections."""
     s = State({"parameters": {"w": 1}, "empty": {}})
     assert s.collections() == {"parameters"}
+
+
+def test_delete_marks_state_changed_for_jit_argument_cache():
+    """Deleting a key must invalidate ``spx.jit``'s cached flat State leaves."""
+    import spectrax as spx
+
+    s = State({"parameters": {"a": jnp.ones(()), "b": jnp.full((), 2.0)}})
+    version = s._version
+    del s["parameters"]["b"]
+    assert s._version != version
+
+    s = State({"parameters": {"a": jnp.ones(()), "b": jnp.full((), 2.0)}})
+    total = spx.jit(lambda st: sum(leaf for _c, _p, leaf in st.items()))
+    assert float(total(s)) == 3.0
+    del s["parameters"]["b"]
+    assert float(total(s)) == 1.0

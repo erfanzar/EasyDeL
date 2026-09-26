@@ -619,6 +619,34 @@ def test_output_dtype_policy_casts_result():
     assert out.dtype == jnp.bfloat16
 
 
+def test_submodule_policy_survives_bind_pytree_and_jit():
+    """A policy on a *child* module must survive export/bind, pytree round-trips and jit."""
+    from spectrax.core.graph import bind, export
+
+    parent = Parent()
+    policy = Policy(output_dtype=jnp.bfloat16)
+    parent.a.policy = policy
+
+    gdef, state = export(parent)
+    rebound = bind(gdef, state)
+    assert rebound.a._spx_policy == policy
+    assert rebound.b._spx_policy is None
+
+    leaves, treedef = jax.tree_util.tree_flatten(parent)
+    unflattened = jax.tree_util.tree_unflatten(treedef, leaves)
+    assert unflattened.a._spx_policy == policy
+
+    # ``a`` casts its output to bf16; ``b`` adds a float32 zero vector, so the
+    # final dtype reveals whether ``a``'s cast actually ran inside the transform.
+    eager = parent.a(jnp.ones(3, jnp.float32))
+    traced = jit(lambda m, x: m.a(x))(parent, jnp.ones(3, jnp.float32))
+    assert eager.dtype == jnp.bfloat16
+    assert traced.dtype == jnp.bfloat16
+
+    parent.a.policy = None
+    assert bind(*export(parent)).a._spx_policy is None
+
+
 def test_sow_creates_variable_on_first_call():
     """First ``sow`` creates a sow-slot :class:`Variable`."""
     m = Leaf()

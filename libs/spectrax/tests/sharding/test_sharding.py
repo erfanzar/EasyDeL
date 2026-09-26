@@ -711,3 +711,133 @@ def test_with_partitioning_accepts_various_axis_shapes(axis_names):
     init = with_partitioning(zeros, axis_names)
     arr = init(jax.random.key(0), (2,) * (len(axis_names) or 1), jnp.float32)
     assert arr.shape == (2,) * (len(axis_names) or 1)
+
+
+def _mesh_from_devices(indices, axis_names):
+    """Build a 1-D mesh from ``jax.devices()`` indices, skipping when unavailable."""
+    devices = jax.devices()
+    if max(indices) >= len(devices):
+        pytest.skip(f"needs >= {max(indices) + 1} devices")
+    return jax.sharding.Mesh(np.asarray([devices[i] for i in indices]), axis_names)
+
+
+def test_get_incontext_mesh_reads_jax_set_mesh():
+    """``jax.set_mesh`` does not populate the legacy thread resources; it must still be found."""
+    mesh = _mesh_from_devices([0], ("tp",))
+    with jax.set_mesh(mesh):
+        found = spx.get_incontext_mesh()
+        assert tuple(found.jax_mesh.axis_names) == ("tp",)
+        assert tuple(found.jax_mesh.devices.flat) == tuple(mesh.devices.flat)
+        corrected = spx.get_corrected_named_sharding((4,), jax.sharding.PartitionSpec("tp"), raise_mesh_error=False)
+        assert tuple(corrected.spec) == ("tp",)
+        assert tuple(corrected.mesh.axis_names) == ("tp",)
+
+
+def test_partition_manager_shard_does_not_replicate_under_jax_set_mesh():
+    """``PartitionManager.shard`` under ``jax.set_mesh`` keeps the requested axis."""
+    mesh = _mesh_from_devices([0, 1], ("tp",))
+    manager = PartitionManager(PartitionAxis())
+    x = jnp.arange(8.0)
+    with jax.set_mesh(mesh):
+        y = jax.jit(lambda v: manager.shard(v, axes=(ct.TP,), mode=ct.MODE_TRAIN))(x)
+    assert tuple(y.sharding.spec) == ("tp",)
+    assert np.array_equal(np.asarray(y), np.asarray(x))
+
+
+def test_named_sharding_for_metadata_replicates_non_divisible_dim_on_full_mesh():
+    """A non-divisible dim is replicated on the full mesh, never narrowed to a device subset."""
+    from spectrax.sharding.partition import named_sharding_for_metadata
+
+    mesh = _mesh_from_devices([0, 1, 2, 3], ("ep",))
+    named = named_sharding_for_metadata({"axis_names": ("ep", None)}, mesh, shape=(6, 2))
+
+    assert set(named.device_set) == set(mesh.devices.flat)
+    assert tuple(named.spec) == (None, None)
+
+    divisible = named_sharding_for_metadata({"axis_names": ("ep", None)}, mesh, shape=(8, 2))
+    assert tuple(divisible.spec) == ("ep", None)
+    assert set(divisible.device_set) == set(mesh.devices.flat)
+
+
+def test_with_sharding_constraint_keeps_explicit_namedsharding_mesh(monkeypatch):
+    """An explicit NamedSharding is not re-bound to (and stripped by) the active mesh."""
+    from spectrax.sharding import partition as partition_mod
+
+    seen = {}
+
+    def fake_constraint(x, constraint):
+        """Record the constraint."""
+        seen["constraint"] = constraint
+        return x
+
+    active = _mesh_from_devices([0], ("dp",))
+    explicit = _mesh_from_devices([0], ("tp",))
+    target = jax.sharding.NamedSharding(explicit, jax.sharding.PartitionSpec("tp"))
+    monkeypatch.setattr(jax.lax, "with_sharding_constraint", fake_constraint)
+    with active:
+        partition_mod.with_sharding_constraint(jnp.ones((2,)), target)
+
+    constraint = seen["constraint"]
+    assert isinstance(constraint, jax.sharding.NamedSharding)
+    assert tuple(constraint.mesh.axis_names) == ("tp",)
+    assert tuple(constraint.spec) == ("tp",)
+
+
+def test_place_setup_leaf_moves_value_when_only_device_order_differs():
+    """Same spec + same device set but a different device order is a different placement."""
+    from spectrax.sharding.placement import _same_setup_sharding, place_setup_leaf_with_sharding
+
+    forward = _mesh_from_devices([0, 1], ("x",))
+    reverse = _mesh_from_devices([1, 0], ("x",))
+    spec = jax.sharding.PartitionSpec("x")
+    source = jax.sharding.NamedSharding(forward, spec)
+    target = jax.sharding.NamedSharding(reverse, spec)
+    leaf = jax.device_put(jnp.arange(4.0), source)
+
+    assert _same_setup_sharding(leaf, source)
+    assert not _same_setup_sharding(leaf, target)
+    assert place_setup_leaf_with_sharding(leaf, source) is leaf
+
+    placed = place_setup_leaf_with_sharding(leaf, target)
+    assert placed.sharding.is_equivalent_to(target, 1)
+    assert np.array_equal(np.asarray(placed), np.arange(4.0))
+    for shard in placed.addressable_shards:
+        expected = target.addressable_devices_indices_map((4,))[shard.device]
+        assert np.array_equal(np.asarray(shard.data), np.arange(4.0)[expected])
+
+
+def test_get_partition_spec_keeps_raw_mesh_axis_names():
+    """Raw mesh-axis names resolve to themselves, matching ``get_named_sharding``."""
+
+    class Model(spx.Module):
+        """Fixture model module for testing."""
+
+        def __init__(self):
+            """Initialize with weight."""
+            super().__init__()
+            self.weight = spx.Parameter(jnp.ones((4, 4), dtype=jnp.float32), axis_names=("fsdp", "tp"))
+
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:1]).reshape((1, 1)), ("fsdp", "tp"))
+    model = Model()
+
+    assert tuple(get_partition_spec(model, mesh)["parameters"]["weight"]) == ("fsdp", "tp")
+    with mesh:
+        assert tuple(get_partition_spec(model)["parameters"]["weight"]) == ("fsdp", "tp")
+    assert tuple(get_named_sharding(model, mesh)["parameters"]["weight"].spec) == ("fsdp", "tp")
+
+
+def test_with_sharding_constraint_by_name_keeps_raw_mesh_axis_names(monkeypatch):
+    """Raw mesh-axis names are honored instead of silently replicated."""
+    seen = {}
+
+    def fake_constraint(x, spec):
+        """Record the spec."""
+        seen["spec"] = spec
+        return x
+
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:1]).reshape((1,)), ("dp",))
+    monkeypatch.setattr(jax.lax, "with_sharding_constraint", fake_constraint)
+    with mesh:
+        with_sharding_constraint_by_name(jnp.ones((2, 3)), ("dp", "features"))
+
+    assert tuple(seen["spec"]) == ("dp", None)

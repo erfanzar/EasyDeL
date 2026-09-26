@@ -1000,38 +1000,257 @@ def _apply_scan_state_constraints(state: State, specs: State | None) -> State:
     return State._from_raw(constrained)
 
 
-def _scan_segment_with_explicit_unroll(segment: _ScanSegment, fn, carry, bind, unroll: int | None):
+def _layer_write_snapshot(live: Module) -> list[tuple[tuple[str, str], Variable, object]]:
+    """Record ``((kind, path), var, value)`` for every variable of a freshly bound layer.
+
+    Args:
+        live: Layer module bound inside a scan / loop body.
+
+    Returns:
+        Snapshot consumed by :func:`_layer_writes`.
+    """
+    from .graph import live_variables
+
+    return [((var.kind, path), var, var._value) for path, var in live_variables(live)]
+
+
+def _layer_writes(snapshot: list[tuple[tuple[str, str], Variable, object]]) -> dict[tuple[str, str], object]:
+    """Return ``{(kind, path): new_value}`` for variables written since ``snapshot``.
+
+    Args:
+        snapshot: Output of :func:`_layer_write_snapshot`.
+
+    Returns:
+        Changed leaves keyed by ``(collection, canonical_path)``.
+    """
+    return {key: var._value for key, var, initial in snapshot if var._value is not initial}
+
+
+def _keyed_values_to_state(values: dict[tuple[str, str], object]) -> State:
+    """Build a :class:`State` from ``{(collection, path): leaf}``.
+
+    Args:
+        values: Leaves keyed by ``(collection, dotted_path)``.
+
+    Returns:
+        The equivalent nested :class:`State`.
+    """
+    data: dict[str, dict[str, object]] = {}
+    for (collection, path), value in values.items():
+        _nested_set(data.setdefault(collection, {}), str_to_path(path), value)
+    return State._from_raw(data)
+
+
+def _item_variable_tables(items: list[Module]) -> list[dict[tuple[str, str], Variable]]:
+    """Return each item's ``{(collection, canonical_path): Variable}`` table.
+
+    Args:
+        items: Live container items.
+
+    Returns:
+        One lookup table per item, read from (or refreshing) its export cache.
+    """
+    from .graph import export
+
+    tables: list[dict[tuple[str, str], Variable]] = []
+    for item in items:
+        cache = item._spx_export_cache
+        if cache is None or cache[0] != _graph_epoch():
+            export(item)
+            cache = item._spx_export_cache
+        tables.append(cache[3])
+    return tables
+
+
+def _shared_segment_variables(
+    tables: list[dict[tuple[str, str], Variable]],
+    start: int,
+    stop: int,
+) -> dict[tuple[str, str], Variable]:
+    """Return variables that are one shared object across items, for ``[start, stop)``.
+
+    An RNG stream referenced by several items (one :class:`~spectrax.Rngs`
+    handed to every layer) must be threaded sequentially through the scan
+    carry so layer ``i + 1`` observes layer ``i``'s draw. Stacking it
+    would hand every layer the same initial key (identical dropout masks
+    per layer) and let only one layer's counter advance survive. Other
+    shared variables keep the stacked lowering; if several layers write
+    one of them, the last layer's write wins.
+
+    Args:
+        tables: Per-item tables from :func:`_item_variable_tables`.
+        start: First item of the segment.
+        stop: One past the last item of the segment.
+
+    Returns:
+        ``{(collection, path): Variable}`` for the segment's carried variables.
+    """
+    owners: dict[int, int] = {}
+    for table in tables:
+        for var in {id(v): v for v in table.values()}.values():
+            owners[id(var)] = owners.get(id(var), 0) + 1
+    shared: dict[tuple[str, str], Variable] = {}
+    for key, var in tables[start].items():
+        # Only RNG streams are carried. Other shared variables (tied weights,
+        # shared RoPE / mask buffers, ...) stay on the stacked path as before:
+        # moving large read-mostly leaves into the carry would only add
+        # per-step AD residuals.
+        if owners.get(id(var), 0) < 2 or var.kind != "rng":
+            continue
+        if all(tables[k].get(key) is var for k in range(start + 1, stop)):
+            shared[key] = var
+    return shared
+
+
+def _scan_segment_with_explicit_unroll(
+    segment: _ScanSegment,
+    fn,
+    carry,
+    bind,
+    unroll: int | None,
+    *,
+    shared: dict[tuple[str, str], Variable] | None = None,
+    indexed: bool = False,
+):
     """Run one segment with the direct layer-wise ``lax.scan`` lowering.
+
+    Variable writes made by ``fn`` on the bound layer (RNG counters,
+    buffers, batch statistics, ...) are carried out of the scan instead of
+    being dropped: ``shared`` variables ride in the scan carry (so every
+    layer sees its predecessor's write), every other written variable is
+    emitted per layer as a stacked scan output.
 
     Args:
         segment: Segment value consumed by this operation.
-        fn: Callable being wrapped, traced, transformed, or executed.
+        fn: ``(module, carry) -> carry`` or, with ``indexed``,
+            ``(i, module, carry) -> carry``.
         carry: Loop or scan carry value.
         bind: Bind value consumed by this operation.
         unroll: Unroll value consumed by this operation.
+        shared: Variables shared by every layer of the segment (see
+            :func:`_shared_segment_variables`); their current values seed
+            the carry.
+        indexed: Pass the absolute layer index as the first argument of ``fn``.
+
+    Returns:
+        ``(final_carry, final_shared, layer_writes)`` where ``final_shared``
+        maps each ``shared`` key to its value after the last layer and
+        ``layer_writes`` maps every other written ``(collection, path)`` to
+        its per-layer values stacked on a leading ``segment.length`` axis.
     """
     gdef = segment.gdef
     effective_unroll = _scan_effective_unroll(unroll, segment.length)
     constraint_specs = _scan_state_constraint_specs(gdef)
+    shared = shared or {}
+    shared_init = {key: var._raw_get() for key, var in shared.items()}
 
-    def body(carry, layer_state, *, gdef=gdef):
+    def body(loop_carry, xs, *, gdef=gdef):
         """``lax.scan`` body: bind a layer's state to the segment graphdef and apply ``fn``.
 
         Args:
-            carry: Loop or scan carry value.
-            layer_state: Layer state value consumed by this operation.
+            loop_carry: ``(user_carry, shared_values)``.
+            xs: The layer's state slice (``(index, state)`` when ``indexed``).
             gdef: Gdef value consumed by this operation.
         """
+        user_carry, shared_values = loop_carry
+        index, layer_state = xs if indexed else (None, xs)
         layer_state = _apply_scan_state_constraints(layer_state, constraint_specs)
+        if shared_values:
+            layer_state = layer_state.overlay(_keyed_values_to_state(shared_values))
         live = bind(gdef, layer_state)
-        return fn(live, carry), None
+        snapshot = _layer_write_snapshot(live)
+        new_carry = fn(index, live, user_carry) if indexed else fn(live, user_carry)
+        writes = _layer_writes(snapshot)
+        new_shared = {key: writes.pop(key, value) for key, value in shared_values.items()}
+        return (new_carry, new_shared), writes
 
-    return jax.lax.scan(
+    xs = (jnp.arange(segment.start, segment.stop), segment.stacked) if indexed else segment.stacked
+    (carry, shared_final), writes = jax.lax.scan(
         body,
-        carry,
-        segment.stacked,
+        (carry, shared_init),
+        xs,
         unroll=effective_unroll,
-    )[0]
+    )
+    return carry, shared_final, writes
+
+
+def _write_back_item_writes(
+    tables: list[dict[tuple[str, str], Variable]],
+    segment: _ScanSegment,
+    shared: dict[tuple[str, str], Variable],
+    shared_final: dict[tuple[str, str], object],
+    writes: dict[tuple[str, str], object],
+) -> None:
+    """Write a segment's carried-out values back onto the live container items.
+
+    Args:
+        tables: Per-item variable tables.
+        segment: The segment that produced the values.
+        shared: Carried shared variables.
+        shared_final: Their values after the segment.
+        writes: Per-layer stacked values of the other written variables.
+    """
+    for key, var in shared.items():
+        var.value = shared_final[key]
+    for key, stacked_value in writes.items():
+        for offset, item_index in enumerate(range(segment.start, segment.stop)):
+            var = tables[item_index].get(key)
+            if var is not None:
+                var.value = stacked_value[offset]
+
+
+def _install_item_write_through(live: Module, idx: object, tables: list[dict[tuple[str, str], Variable]]) -> None:
+    """Route writes on a tracer-indexed layer view back into the container items.
+
+    ``ModuleList[i]`` with a traced ``i`` binds a *copy* of layer ``i``;
+    without this, writes to that copy (RNG counters, buffers) are lost.
+    Each bound variable gets an observer that writes the new value into
+    the item variables at the matching path, selected by ``idx``.
+
+    Args:
+        live: The bound layer view.
+        idx: The (traced) layer index.
+        tables: Per-item variable tables of the container.
+    """
+    from .graph import live_variables
+
+    num_items = len(tables)
+    for path, var in live_variables(live):
+        key = (var.kind, path)
+        groups: dict[int, tuple[Variable, list[int]]] = {}
+        for item_index, table in enumerate(tables):
+            target = table.get(key)
+            if target is None:
+                groups = {}
+                break
+            groups.setdefault(id(target), (target, []))[1].append(item_index)
+        if groups:
+            var.add_observer(_item_write_through_observer(idx, tuple(groups.values()), num_items))
+
+
+def _item_write_through_observer(idx: object, groups: tuple[tuple[Variable, list[int]], ...], num_items: int):
+    """Build the observer used by :func:`_install_item_write_through`.
+
+    Args:
+        idx: The (traced) layer index.
+        groups: ``(target_variable, item_indices)`` pairs.
+        num_items: Number of container items.
+
+    Returns:
+        A ``(var, old, new) -> None`` observer.
+    """
+
+    def observer(_var: Variable, _old: object, new: object) -> None:
+        for target, positions in groups:
+            if len(positions) == num_items:
+                target.value = new
+                continue
+            mask = idx == positions[0]
+            for position in positions[1:]:
+                mask = jnp.logical_or(mask, idx == position)
+            target.value = jnp.where(mask, new, target.value)
+
+    return observer
 
 
 class _ListContainer(Module):
@@ -1269,12 +1488,12 @@ class ModuleList(_ListContainer):
         cache = getattr(self, "_spx_traced_cache", None)
         if cache is not None:
             gdef, stacked = cache
-            layer_state = jax.tree.map(lambda leaf: leaf[idx], stacked)
-            return bind(gdef, layer_state)
-
-        gdef, stacked = _stack_module_states(self._spx_items, context="ModuleList traced indexing")
+        else:
+            gdef, stacked = _stack_module_states(self._spx_items, context="ModuleList traced indexing")
         layer_state = jax.tree.map(lambda leaf: leaf[idx], stacked)
-        return bind(gdef, layer_state)
+        live = bind(gdef, layer_state)
+        _install_item_write_through(live, idx, _item_variable_tables(self._spx_items))
+        return live
 
     def scan(self, fn, init_carry, *, trace: bool = False, unroll: int | None = None):
         """Scan over modules: ``fn(module, carry) -> new_carry``.
@@ -1292,6 +1511,12 @@ class ModuleList(_ListContainer):
           static differences) share a single template graphdef; runs of
           incompatible modules are emitted as separate scan segments.
           This is the high-throughput path used by transformer stacks.
+
+        In both modes, variable writes made by ``fn`` (RNG draws, buffer /
+        batch-statistic updates) land on the live items. On the lowered
+        path a :class:`~spectrax.Rngs` shared by several layers is threaded
+        through the scan carry, so each layer draws a fresh key exactly as
+        in the Python loop.
 
         Args:
             fn: Body callable ``(module, carry) -> new_carry``. The
@@ -1321,16 +1546,25 @@ class ModuleList(_ListContainer):
 
         cache = getattr(self, "_spx_traced_cache", None)
         if cache is not None:
-            plan = _build_cached_scan_plan_from_stacked(self, (cache[0],), cache[1], context="ModuleList.scan")
+            # The cache stacks every item under one template graphdef; pass one
+            # graphdef per item so the plan covers all of them.
+            plan = _build_cached_scan_plan_from_stacked(
+                self, (cache[0],) * len(self._spx_items), cache[1], context="ModuleList.scan"
+            )
         else:
             from .graph import export
 
             exports = [export(m) for m in self._spx_items]
             plan = _build_cached_scan_plan_from_exports(self, exports, context="ModuleList.scan")
 
+        tables = _item_variable_tables(self._spx_items)
         carry = init_carry
         for segment in plan.segments:
-            carry = _scan_segment_with_explicit_unroll(segment, fn, carry, bind, unroll)
+            shared = _shared_segment_variables(tables, segment.start, segment.stop)
+            carry, shared_final, writes = _scan_segment_with_explicit_unroll(
+                segment, fn, carry, bind, unroll, shared=shared
+            )
+            _write_back_item_writes(tables, segment, shared, shared_final, writes)
         return carry
 
     def stack(self) -> StackedModuleList:
@@ -1365,7 +1599,8 @@ class ModuleList(_ListContainer):
         the stacked pytree and binds it to the shared graphdef before
         calling ``fn``. Items must therefore share a compatible graph
         structure; for heterogeneous layers use :meth:`scan` with
-        ``trace=True``.
+        ``trace=True``. Variable writes made by ``fn`` are written back to
+        the live items, as in :meth:`scan`.
 
         Args:
             fn: Body callable ``(i, module, carry) -> new_carry``.
@@ -1382,18 +1617,16 @@ class ModuleList(_ListContainer):
         else:
             gdef, stacked = _stack_module_states(self._spx_items, context="ModuleList.fori_loop")
 
-        def body(i, carry):
-            """``fori_loop`` body: bind the i-th layer's state and apply ``fn(i, layer, carry)``.
-
-            Args:
-                i: I value consumed by this operation.
-                carry: Loop or scan carry value.
-            """
-            layer_state = jax.tree.map(lambda leaf: leaf[i], stacked)
-            live = bind(gdef, layer_state)
-            return fn(i, live, carry)
-
-        return jax.lax.fori_loop(0, len(self), body, init_carry)
+        # Lowered as an indexed ``lax.scan`` (what ``lax.fori_loop`` does for static
+        # bounds anyway) so per-layer variable writes can be emitted and written back.
+        segment = _ScanSegment(start=0, stop=len(self), gdef=gdef, stacked=stacked, family_id=0)
+        tables = _item_variable_tables(self._spx_items)
+        shared = _shared_segment_variables(tables, 0, len(self))
+        carry, shared_final, writes = _scan_segment_with_explicit_unroll(
+            segment, fn, init_carry, bind, 1, shared=shared, indexed=True
+        )
+        _write_back_item_writes(tables, segment, shared, shared_final, writes)
+        return carry
 
 
 def _prepend_stacked_axis_metadata(metadata: dict[str, object]) -> dict[str, object]:
@@ -1661,7 +1894,50 @@ class StackedModuleList(Module):
                 "or trace=True for Python debugging."
             )
         state = jax.tree.map(lambda leaf: leaf[idx], self._stacked_state())
-        return bind(gdef, state)
+        live = bind(gdef, state)
+        self._install_stacked_write_through(live, idx)
+        return live
+
+    def _install_stacked_write_through(self, live: Module, idx: object) -> None:
+        """Route writes on a bound layer view into row ``idx`` of the stacked variables.
+
+        Args:
+            live: The layer view returned by :meth:`_bind_index`.
+            idx: Concrete or traced layer index.
+        """
+        from .graph import live_variables
+
+        spec_index = {spec: i for i, spec in enumerate(self._spx_leaf_specs)}
+        for path, var in live_variables(live):
+            leaf_index = spec_index.get((var.kind, path))
+            if leaf_index is None or not hasattr(self, f"v{leaf_index}"):
+                continue
+            stacked_var = getattr(self, f"v{leaf_index}")
+
+            def observer(_var, _old, new, stacked_var=stacked_var):
+                stacked_var.value = stacked_var.value.at[idx].set(new)
+
+            var.add_observer(observer)
+
+    def _write_back_segment_writes(self, segment: _ScanSegment, writes: dict[tuple[str, str], object]) -> None:
+        """Write a scan segment's per-layer written values into the stacked variables.
+
+        Args:
+            segment: The segment that produced ``writes``.
+            writes: ``{(collection, path): values}`` stacked over the segment.
+        """
+        if not writes:
+            return
+        spec_index = {spec: i for i, spec in enumerate(self._spx_leaf_specs)}
+        for key, stacked_value in writes.items():
+            leaf_index = spec_index.get(key)
+            if leaf_index is None or not hasattr(self, f"v{leaf_index}"):
+                continue
+            stacked_var = getattr(self, f"v{leaf_index}")
+            if segment.start == 0 and segment.stop == len(self):
+                stacked_var.value = stacked_value
+            else:
+                stacked_var.value = stacked_var.value.at[segment.start : segment.stop].set(stacked_value)
 
     def forward(self, *args: object, **kwargs: object) -> object:
         """Always raises — :class:`StackedModuleList` is not callable.
@@ -1718,7 +1994,8 @@ class StackedModuleList(Module):
 
         carry = init_carry
         for segment in plan.segments:
-            carry = _scan_segment_with_explicit_unroll(segment, fn, carry, bind, unroll)
+            carry, _shared, writes = _scan_segment_with_explicit_unroll(segment, fn, carry, bind, unroll)
+            self._write_back_segment_writes(segment, writes)
         return carry
 
     def fori_loop(self, fn, init_carry):
@@ -1750,18 +2027,10 @@ class StackedModuleList(Module):
         stacked = self._stacked_state()
         gdef: GraphDef = self._spx_item_gdef
 
-        def body(i, carry):
-            """``fori_loop`` body: bind the i-th layer's state and apply ``fn(i, layer, carry)``.
-
-            Args:
-                i: I value consumed by this operation.
-                carry: Loop or scan carry value.
-            """
-            layer_state = jax.tree.map(lambda leaf: leaf[i], stacked)
-            live = bind(gdef, layer_state)
-            return fn(i, live, carry)
-
-        return jax.lax.fori_loop(0, len(self), body, init_carry)
+        segment = _ScanSegment(start=0, stop=len(self), gdef=gdef, stacked=stacked, family_id=0)
+        carry, _shared, writes = _scan_segment_with_explicit_unroll(segment, fn, init_carry, bind, 1, indexed=True)
+        self._write_back_segment_writes(segment, writes)
+        return carry
 
 
 class Sequential(_ListContainer):

@@ -533,7 +533,8 @@ def fori_loop(
       iteration with cache injection but verify the entire state stays
       identical.
     * ``mutable!=()``: full carry+invariant split with write-back to
-      ``init_module`` after the loop.
+      ``init_module`` after the loop. The ``ModuleList`` cache is not
+      injected on this path so traced indexing sees the current carry.
 
     Args:
         lower: Inclusive lower bound for the loop counter.
@@ -559,7 +560,7 @@ def fori_loop(
     from ..core.containers import _stack_module_states
 
     modulelist_caches: dict[tuple[str, ...], tuple[object]] = {}
-    for path, ml in _find_modulelists(init_module):
+    for path, ml in _find_modulelists(init_module) if mutable_sel is None else ():
         if not ml._spx_items:
             continue
         gdef_ml, stacked = _stack_module_states(ml._spx_items, context="fori_loop ModuleList cache")
@@ -611,8 +612,7 @@ def fori_loop(
         """``fori_loop`` body for the mutable-state path.
 
         Unpacks ``(state_carry, user_carry)``, binds a fresh module
-        from the merged state with :class:`~spectrax.ModuleList` caches
-        injected, runs ``body_fn(i, module, user_carry)``, and
+        from the merged state, runs ``body_fn(i, module, user_carry)``, and
         re-partitions the resulting state into a new carry plus
         invariant. Verifies the invariant did not drift before
         returning the new ``(state_carry, user_carry)`` tuple.
@@ -627,8 +627,11 @@ def fori_loop(
         c_state, uc = loop_carry
         full = c_state.overlay(invariant)
         m = bind(gdef, full)
-        if modulelist_caches:
-            _inject_traced_caches(m, modulelist_caches)
+        # No pre-stacked ModuleList cache here: it was stacked from the
+        # pre-loop state, so traced ``m.blocks[i]`` would read stale values of
+        # the carried (mutable) leaves every iteration. Stacking from the
+        # rebound items sees the current carry; the parameter stacking is
+        # loop-invariant.
         _set_inside_transform(True)
         try:
             new_uc = body_fn(i, m, uc)

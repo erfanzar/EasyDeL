@@ -232,6 +232,7 @@ _MPMD_SETUP_CACHE: dict[
         dict[tuple[int, int], State],
         list[object],
         list[object],
+        tuple[object, ...],
     ],
 ] = {}
 _INV_M_CACHE: dict[tuple[int, int], jax.Array] = {}
@@ -3892,7 +3893,7 @@ def _grad_add_sharding_key(sharding: object) -> tuple[object, ...]:
         type(sharding).__name__,
         _sharding_mesh_signature(sharding),
         _device_id_tuple(_sharding_device_set(sharding)),
-        tuple(_mesh_axis_names(sharding)),
+        tuple(_mesh_axis_names(sharding) or ()),
         repr(getattr(sharding, "spec", None)),
         getattr(sharding, "memory_kind", None),
     )
@@ -4115,6 +4116,63 @@ def _accumulate_flat_grad(
         accums[flat_idx] = _place_grad_on_target(grad, target, flat_idx=flat_idx)
         return
     accums[flat_idx] = _add_grad_on_common_sharding(accums[flat_idx], grad, target, flat_idx=flat_idx)
+
+
+class _MicrobatchGradParts(list):
+    """Deferred per-microbatch grad partials from several consuming stages."""
+
+
+def _accumulate_microbatch_grad(
+    accums: dict[int, object],
+    flat_idx: int,
+    mb: int,
+    m: int,
+    grad: object,
+    *,
+    defer: bool = False,
+) -> None:
+    """Accumulate one microbatched input grad slot.
+
+    A microbatched body input can be consumed by several logical stages
+    (e.g. a mask or position tensor fed to every stage); each consumer
+    contributes a partial gradient for the same ``(flat_idx, mb)`` slot, so
+    partials must be summed rather than overwritten.
+
+    Args:
+        accums: Flat-index keyed accumulator holding per-microbatch slot lists.
+        flat_idx: Flat argument index of the microbatched input.
+        mb: Microbatch index.
+        m: Number of microbatches.
+        grad: Partial gradient for this slot (``None`` is ignored).
+        defer: When True, record partials without launching device work;
+            :func:`_resolve_microbatch_grad_slot` sums them later.
+    """
+    slots = accums.get(flat_idx)
+    if slots is None:
+        slots = [None] * m
+        accums[flat_idx] = slots
+    if grad is None:
+        return
+    prev = slots[mb]
+    if prev is None:
+        slots[mb] = grad
+    elif defer:
+        if isinstance(prev, _MicrobatchGradParts):
+            prev.append(grad)
+        else:
+            slots[mb] = _MicrobatchGradParts((prev, grad))
+    else:
+        slots[mb] = _add_grad_on_common_sharding(prev, grad)
+
+
+def _resolve_microbatch_grad_slot(slot: object) -> object:
+    """Sum deferred :class:`_MicrobatchGradParts` partials into one grad."""
+    if not isinstance(slot, _MicrobatchGradParts):
+        return slot
+    total = slot[0]
+    for part in slot[1:]:
+        total = _add_grad_on_common_sharding(total, part)
+    return total
 
 
 _MICROBATCH_WEIGHT_FN_VAR: contextvars.ContextVar["Callable[..., object] | None"] = contextvars.ContextVar(
@@ -4480,9 +4538,7 @@ def _dispatch_gpipe_bwd(
                     continue
                 grad = g_invars[invar_idx]
                 if microbatch_mask[flat_idx]:
-                    if flat_idx not in grad_accums:
-                        grad_accums[flat_idx] = [None] * m
-                    grad_accums[flat_idx][mb] = grad
+                    _accumulate_microbatch_grad(grad_accums, flat_idx, mb, m, grad)
                 else:
                     _accumulate_flat_grad(grad_accums, flat_idx, grad, grad_targets)
 
@@ -4792,9 +4848,7 @@ def _dispatch_schedule_faithful_serial(
                                 continue
                             grad = g_invars[invar_idx]
                             if microbatch_mask[flat_idx]:
-                                if flat_idx not in grad_accums:
-                                    grad_accums[flat_idx] = [None] * m
-                                grad_accums[flat_idx][mb] = grad
+                                _accumulate_microbatch_grad(grad_accums, flat_idx, mb, m, grad)
                             else:
                                 _accumulate_flat_grad(grad_accums, flat_idx, grad, grad_targets)
 
@@ -4888,9 +4942,7 @@ def _dispatch_schedule_faithful_serial(
                             continue
                         grad = g_invars[invar_idx]
                         if microbatch_mask[flat_idx]:
-                            if flat_idx not in grad_accums:
-                                grad_accums[flat_idx] = [None] * m
-                            grad_accums[flat_idx][mb] = grad
+                            _accumulate_microbatch_grad(grad_accums, flat_idx, mb, m, grad)
                         else:
                             _accumulate_flat_grad(grad_accums, flat_idx, grad, grad_targets)
                     for invar_idx, (source_kind, source_a, source_b) in enumerate(invar_sources[logical]):
@@ -4995,10 +5047,8 @@ def _dispatch_schedule_faithful_serial(
                     if grad is None:
                         continue
                     if microbatch_mask[flat_idx]:
-                        if flat_idx not in grad_accums:
-                            grad_accums[flat_idx] = [None] * m
                         for idx, mb in enumerate(mbs):
-                            grad_accums[flat_idx][mb] = grad[idx]
+                            _accumulate_microbatch_grad(grad_accums, flat_idx, mb, m, grad[idx])
                     else:
                         summed_grad = grad.sum(axis=0)
                         _accumulate_flat_grad(grad_accums, flat_idx, summed_grad, grad_targets)
@@ -5266,6 +5316,7 @@ def _dispatch_schedule_fused_async(
     rank_grad_sync: dict[int, tuple[object, ...]] = {}
     _STAGE_LOCAL_MISSING = object()
     deferred_flat_grad_updates: list[tuple[int, object]] = []
+    deferred_apply_ranks: list[int] = []
     const_tuple_accums: dict[tuple[int, ...], object] = {}
     terminal_const_tuple_accums: dict[tuple[int, ...], object] = {}
     requested_grad_flat_indices = plan.get("grad_flat_indices")
@@ -7066,9 +7117,7 @@ def _dispatch_schedule_fused_async(
                     if grad is None:
                         continue
                     if microbatch_mask[flat_idx]:
-                        if flat_idx not in grad_accums:
-                            grad_accums[flat_idx] = [None] * m
-                        grad_accums[flat_idx][mb] = grad
+                        _accumulate_microbatch_grad(grad_accums, flat_idx, mb, m, grad, defer=True)
                     else:
                         flat_grad_updates.append((flat_idx, grad))
 
@@ -7983,7 +8032,11 @@ def _dispatch_schedule_fused_async(
                 "SpectraX MPMD apply unit fired without an apply_context attached to the plan. "
                 "Use sxvalue_and_grad_and_apply instead of sxvalue_and_grad when emitting apply units."
             )
-        apply_fn = apply_context["apply_fn"]
+        # While units are still running, parameter grads live in
+        # stage-local / per-location const accumulators and pending reducer
+        # futures; they only reach ``grad_accums`` in the final fold. Handing
+        # ``grad_accums`` to ``apply_fn`` here would give it empty or partial
+        # grads, so the apply itself runs once the grads are final.
         with rank_submeshes[rank]:
             gate = _ORDERED_SCHEDULE_TRANSPORT_GATE.get()
             slot = (
@@ -7992,11 +8045,8 @@ def _dispatch_schedule_fused_async(
                 else None
             )
             try:
-                apply_fn(
-                    rank=rank,
-                    grad_accums=grad_accums,
-                    state=apply_context,
-                )
+                with state_lock:
+                    deferred_apply_ranks.append(rank)
             finally:
                 if slot is not None:
                     slot.release()
@@ -9548,6 +9598,7 @@ def _dispatch_schedule_fused_async(
             grad = grad_accums.get(i)
             if microbatch_mask[i]:
                 if isinstance(grad, list):
+                    grad = [_resolve_microbatch_grad_slot(g) for g in grad]
                     template = next(g for g in grad if g is not None)
                     for mb in range(m):
                         if grad[mb] is None:
@@ -9562,6 +9613,16 @@ def _dispatch_schedule_fused_async(
             final_grads.append(None)
             symbolic_zero_count += 1
     phase_timings_ms["final_grad_pack_ms"] = (time.perf_counter_ns() - phase_start_ns) / 1e6
+
+    if deferred_apply_ranks:
+        phase_start_ns = time.perf_counter_ns()
+        apply_context = plan["apply_context"]
+        apply_fn = apply_context["apply_fn"]
+        final_grad_map = {i: grad for i, grad in enumerate(final_grads) if grad is not None}
+        for rank in sorted(deferred_apply_ranks):
+            with rank_submeshes[rank]:
+                apply_fn(rank=rank, grad_accums=final_grad_map, state=apply_context)
+        phase_timings_ms["apply_ms"] = (time.perf_counter_ns() - phase_start_ns) / 1e6
 
     phase_start_ns = time.perf_counter_ns()
     mean_loss = _weighted_terms_sum(loss_terms, mb_loss_scales, m)
@@ -10417,6 +10478,12 @@ def sxjit(
             _state["compiled"] = cluster_plans
             _state["logical_to_rank"] = logical_to_rank
             _state["placed"] = placed
+            if use_legacy_path:
+                # Model leaves are traced inputs on this path, so a later call
+                # with updated arrays must re-place them (see ``_dispatch``).
+                _state["placed_sources"] = tuple(None if idx in dynamic else leaf for idx, leaf in enumerate(flat_init))
+                _state["leaf_shardings"] = leaf_shardings
+                _state["leaf_stage_owners"] = leaf_stage_owners
             _state["dynamic"] = dynamic
             _state["explicit_in_sh"] = explicit_in_sh
             _state["fn_outvar_map"] = fn_outvar_map
@@ -10443,7 +10510,7 @@ def sxjit(
                 args: Positional arguments forwarded to the wrapped callable.
             """
             if "pscan_plan" in _state:
-                results = dispatch_pscan(_state["pscan_plan"])
+                results = dispatch_pscan(_state["pscan_plan"], tuple(jax.tree.leaves(args)))
                 if len(results) == 1:
                     return _restore_result_treedef(results[0], _state.get("result_treedef"))
                 return _restore_result_treedef(tuple(results), _state.get("result_treedef"))
@@ -10453,6 +10520,28 @@ def sxjit(
             dynamic = _state["dynamic"]
             explicit_in_sh = _state["explicit_in_sh"]
             flat_args = jax.tree.leaves(args)
+            placed_sources = _state.get("placed_sources")
+            if placed_sources is not None and len(placed_sources) == len(flat_args):
+                stale = {
+                    idx
+                    for idx, (old, new) in enumerate(zip(placed_sources, flat_args, strict=True))
+                    if idx not in dynamic and old is not new
+                }
+                if stale:
+                    refreshed = _place_static_args(
+                        compiled,
+                        flat_args,
+                        set(range(len(flat_args))) - stale,
+                        explicit_in_sh,
+                        _state["leaf_shardings"],
+                        _state["leaf_stage_owners"],
+                        rank_submeshes,
+                    )
+                    placed = {**placed, **refreshed}
+                    _state["placed"] = placed
+                    _state["placed_sources"] = tuple(
+                        None if idx in dynamic else leaf for idx, leaf in enumerate(flat_args)
+                    )
             all_cluster_outputs: list[tuple] = []
             prev_outputs: tuple = ()
             stage_launches = 0
@@ -10620,6 +10709,11 @@ def sxjit(
                         pass
                     _previous_schedule_result["value"] = None
                 plan = _state["schedule_plan"]
+                if plan.get("grad_argnums_key") is not None:
+                    # ``sxgrad``/``sxvalue_and_grad`` leave an argnum-restricted
+                    # plan in ``_state``; ``jax.grad`` of this call must see
+                    # gradients for every dynamic argument, not zeros.
+                    plan = _ensure_schedule_plan(wrapped, args)
                 result = _schedule_forward(plan, *args)
                 _previous_schedule_result["value"] = result
                 if int(plan.get("terminal_n_aux", 0)) and isinstance(result, tuple):
@@ -10627,7 +10721,7 @@ def sxjit(
                 return result
 
             if "pscan_plan" in _state:
-                results = dispatch_pscan(_state["pscan_plan"])
+                results = dispatch_pscan(_state["pscan_plan"], tuple(jax.tree.leaves(args)))
                 if len(results) == 1:
                     return _restore_result_treedef(results[0], _state.get("result_treedef"))
                 return _restore_result_treedef(tuple(results), _state.get("result_treedef"))
@@ -13092,7 +13186,16 @@ def sxcall(
     stage_shardings: list[object]
     rank_submeshes: list[object]
     setup_key = (id(model), id(mpmd_mesh), V, type(schedule).__name__, donate_fwd, donate_bwd)
+    # The placed stage states are snapshots of the model's leaves. ``model``
+    # is mutable (in-place optimizer updates keep its ``id``), so the cached
+    # placement is only valid while every source leaf is still the same array.
+    source_leaves = tuple(jax.tree.leaves(model))
     cached_setup = _MPMD_SETUP_CACHE.get(setup_key)
+    if cached_setup is not None and (
+        len(cached_setup[6]) != len(source_leaves)
+        or any(a is not b for a, b in zip(cached_setup[6], source_leaves, strict=True))
+    ):
+        cached_setup = None
     if cached_setup is not None:
         (
             fwd_jits,
@@ -13101,6 +13204,7 @@ def sxcall(
             stage_rest,
             stage_shardings,
             rank_submeshes,
+            _cached_source_leaves,
         ) = cached_setup
     else:
         stage_shardings = [mpmd_mesh.sub_sharding(i) for i in range(n)]
@@ -13157,6 +13261,7 @@ def sxcall(
             stage_rest,
             stage_shardings,
             rank_submeshes,
+            source_leaves,
         )
         weak_invalidate(model, _MPMD_SETUP_CACHE, setup_key)
         weak_invalidate(mpmd_mesh, _MPMD_SETUP_CACHE, setup_key)

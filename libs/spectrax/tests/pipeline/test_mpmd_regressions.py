@@ -17,12 +17,14 @@ import spectrax as spx
 from spectrax.runtime.mpmd.compiler import compile_ranked_executables, run_ranked_pipeline
 from spectrax.runtime.mpmd.pscan_compiler import PscanPlan, _pack_grad_tree
 from spectrax.runtime.mpmd.runtime import (
+    _accumulate_microbatch_grad,
     _build_schedule_unit_dependencies,
     _build_schedule_units_from_plan,
     _dependency_topological_schedule_units,
     _infer_schedule_static_argnums,
     _normalize_argnums,
     _resolve_explicit_shardings,
+    _resolve_microbatch_grad_slot,
     sxcall,
 )
 from spectrax.runtime.schedules import (
@@ -292,6 +294,19 @@ def test_sxvalue_and_grad_argnums_validation_happens_at_call_time():
 
     with pytest.raises(ValueError, match="argnum"):
         sxvalue_and_grad(plain, argnums=2)(jnp.ones((2,)))
+
+
+@pytest.mark.parametrize("defer", [False, True])
+def test_microbatch_input_grad_partials_from_several_stages_are_summed(defer):
+    """Two stages writing the same ``(flat_idx, mb)`` slot must add, not overwrite."""
+    accums: dict[int, object] = {}
+    _accumulate_microbatch_grad(accums, 3, 1, 2, jnp.ones((2,)), defer=defer)
+    _accumulate_microbatch_grad(accums, 3, 1, 2, jnp.full((2,), 2.0), defer=defer)
+    _accumulate_microbatch_grad(accums, 3, 1, 2, None, defer=defer)
+
+    slots = accums[3]
+    assert slots[0] is None
+    assert jnp.allclose(_resolve_microbatch_grad_slot(slots[1]), jnp.full((2,), 3.0))
 
 
 def test_dualpipev_build_units_preserves_mixed_fused_logicals():

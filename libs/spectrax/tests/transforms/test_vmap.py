@@ -62,3 +62,21 @@ def test_vmap_axis_name_reducer():
     assert out.shape == (3, 4)
     assert jnp.allclose(out[0], out[1])
     assert jnp.allclose(out[0], out[2])
+
+
+def test_vmap_maps_keyword_array_arguments_like_jax():
+    """Keyword array arguments are mapped over their leading axis, as in :func:`jax.vmap`."""
+    import jax
+
+    m = Linear(3, 2, rngs=Rngs(0))
+    x = jnp.arange(12.0).reshape(4, 3)
+    bias = jnp.arange(8.0).reshape(4, 2)
+
+    def f(mod, x, *, bias, scale):
+        """Apply the layer, add a per-row bias, then scale."""
+        return (mod(x) + bias) * scale
+
+    out = spx.vmap(f, in_axes=(None, 0))(m, x, bias=bias, scale=2.0)
+    reference = jax.vmap(lambda xi, bi: (m(xi) + bi) * 2.0)(x, bias)
+    assert out.shape == (4, 2)
+    assert jnp.allclose(out, reference, atol=1e-5, rtol=1e-5)

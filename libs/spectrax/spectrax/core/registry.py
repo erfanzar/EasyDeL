@@ -25,6 +25,9 @@ process-wide and grows bounded by the number of spectrax classes the
 user constructs (typically a few dozen).
 """
 
+_CLASS_BY_QNAME: dict[str, type] = {}
+"""Reverse of :data:`_QNAME_CACHE`: every exported class by its qualified name."""
+
 
 def qualified_name(cls: type) -> str:
     """Return the fully-qualified ``module.Qualname`` string for ``cls``.
@@ -52,6 +55,7 @@ def qualified_name(cls: type) -> str:
         return cached
     name = f"{cls.__module__}.{cls.__qualname__}"
     _QNAME_CACHE[cls] = name
+    _CLASS_BY_QNAME[name] = cls
     return name
 
 
@@ -75,6 +79,12 @@ def resolve_class(qualified: str) -> type:
             attribute chain does not resolve.
         TypeError: If the resolved object is not a class.
     """
+    known = _CLASS_BY_QNAME.get(qualified)
+    if known is not None:
+        # Every class that went through ``export`` is known by name, including
+        # ones defined in a local scope (``f.<locals>.Cls``) that no import
+        # path can reach.
+        return known
     if "." not in qualified:
         raise ImportError(f"Cannot resolve class: {qualified!r}")
     parts = qualified.split(".")
