@@ -86,7 +86,8 @@ def _normalize_window(sliding_window: int | tuple[int, int] | None) -> tuple[int
     if sliding_window is None:
         return None
     if isinstance(sliding_window, int):
-        return int(sliding_window), int(sliding_window)
+        # An int is a window *size* (HF convention): the query plus its ``W - 1`` neighbours.
+        return max(int(sliding_window) - 1, 0), max(int(sliding_window) - 1, 0)
     left, right = sliding_window
     if left < 0 or right < 0:
         raise ValueError("Window bounds must be non-negative.")

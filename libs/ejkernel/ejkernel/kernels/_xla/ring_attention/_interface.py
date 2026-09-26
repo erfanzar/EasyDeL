@@ -282,7 +282,7 @@ def ring_attention(
             Additive bias applied to attention scores before softmax.
         mask_builder: Optional mask builder function (unused in XLA backend).
         sliding_window: Optional local attention window. Can be:
-            - int: Symmetric window (same left and right)
+            - int: Window size ``W`` (HF convention; same as ``(W - 1, W - 1)``)
             - tuple[int, int]: Asymmetric (left_window, right_window)
             - None: Full attention (default)
         chunk_size: Size for both query and key chunks. If None, uses

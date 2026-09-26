@@ -557,7 +557,7 @@ def flash_attention(
         cum_seqlens_q: Not implemented in XLA backend.
         cum_seqlens_k: Not implemented in XLA backend.
         sliding_window: Local attention window. Can be:
-            - int: Symmetric window (same left and right)
+            - int: Window size ``W`` (HF convention; same as ``(W - 1, W - 1)``)
             - tuple[int, int]: Asymmetric (left_window, right_window)
             - None: Full attention (default)
         fwd_params: Forward pass parameters (q_blocksize, kv_blocksize, etc.).
@@ -617,7 +617,8 @@ def flash_attention(
         dropout_key = jax.random.PRNGKey(dropout_seed)
 
     if isinstance(sliding_window, int):
-        window_tuple = (int(sliding_window), int(sliding_window))
+        # An int is a window *size* (HF convention): the query plus its ``W - 1`` neighbours.
+        window_tuple = (max(int(sliding_window) - 1, 0), max(int(sliding_window) - 1, 0))
     elif sliding_window is None:
         window_tuple = None
     else:

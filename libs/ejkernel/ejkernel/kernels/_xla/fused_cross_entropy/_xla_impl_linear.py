@@ -103,7 +103,10 @@ def fused_linear_cross_entropy(
             token chunking).
         token_chunk_size: Tokens per chunk; ``0`` picks a ~1 GiB-budget default.
         compute_dtype: CE math dtype; defaults to ``hidden.dtype`` (no forced
-            fp32). The projection runs in its native dtype.
+            fp32). The projection runs in its native dtype. Token weights,
+            the per-row softmax statistics and the cross-chunk accumulators
+            are always fp32 regardless (a bf16 carry saturates: at
+            ``T=65536`` a bf16 ``weight_sum`` sticks at ``32768``).
         checkpoint: When ``True`` (default) each chunk body is wrapped in
             :func:`jax.checkpoint` so the backward recomputes that chunk's
             logits instead of storing them — the memory-bounded behaviour that
@@ -115,9 +118,10 @@ def fused_linear_cross_entropy(
             ``(per_row_loss, per_row_z_loss, per_row_correct)`` with
             ``reduction="none"`` semantics. ``None`` uses the native XLA CE core.
     Returns:
-        ``(total_loss, total_z_loss, weight_sum, accuracy)``. ``total_loss`` /
-        ``total_z_loss`` follow ``reduction`` (the global normalizing factor is
-        the caller's responsibility); ``accuracy`` is weight-weighted.
+        ``(total_loss, total_z_loss, weight_sum, accuracy)`` as fp32 scalars.
+        ``total_loss`` / ``total_z_loss`` follow ``reduction`` (the global
+        normalizing factor is the caller's responsibility); ``accuracy`` is
+        weight-weighted.
     """
     if reduction not in ("sum", "mean"):
         raise ValueError(f"fused_linear_cross_entropy supports reduction sum/mean, got {reduction!r}")
@@ -154,14 +158,16 @@ def fused_linear_cross_entropy(
         logits = _project(chunk_hidden).astype(compute_dtype)
         valid = chunk_targets != ignore_index
         safe = jnp.where(valid, chunk_targets, 0).astype(jnp.int32)
-        w = valid.astype(compute_dtype) if chunk_weights is None else valid.astype(compute_dtype) * chunk_weights
+        w = valid.astype(jnp.float32)
+        if chunk_weights is not None:
+            w = w * chunk_weights.astype(jnp.float32)
         if per_chunk_ce_fn is not None and vocab_parallel_axis is None:
             per_row, z_row, per_row_correct = per_chunk_ce_fn(logits, chunk_targets, w)
             if z_row.shape == ():
                 z_row = jnp.zeros_like(per_row, dtype=per_row.dtype) + z_row.astype(per_row.dtype)
             if per_row_correct is None:
-                per_row_correct = (jnp.argmax(logits, axis=-1) == chunk_targets).astype(compute_dtype)
-            correct = jnp.sum(per_row_correct.astype(compute_dtype) * jax.lax.stop_gradient(w))
+                per_row_correct = (jnp.argmax(logits, axis=-1) == chunk_targets).astype(jnp.float32)
+            correct = jnp.sum(per_row_correct.astype(jnp.float32) * jax.lax.stop_gradient(w))
         elif vocab_parallel_axis is not None:
             # Vocab-parallel FLCE: each ``_project`` produced the per-shard ``[chunk, V_local]`` slice
             # (column-parallel LM head); the TP core merges the softmax normalizer + gathers the (possibly
@@ -182,7 +188,7 @@ def fused_linear_cross_entropy(
             # into a bogus id. Take the smallest winning id via ``pmin`` (losers carry a large sentinel).
             cand_id = jnp.where(is_winner, local_best_id, jnp.int32(2**30))
             global_best_id = jax.lax.pmin(cand_id, vocab_parallel_axis)
-            correct = jnp.sum((global_best_id == chunk_targets).astype(compute_dtype) * jax.lax.stop_gradient(w))
+            correct = jnp.sum((global_best_id == chunk_targets).astype(jnp.float32) * jax.lax.stop_gradient(w))
         else:
             # Base CE via the analytic custom-VJP core (``softmax - onehot``). Under the
             # outer ``jax.checkpoint`` this hand-written backward schedules markedly
@@ -192,17 +198,18 @@ def fused_linear_cross_entropy(
             per_row = _fused_ce_core(logits, safe, w, ignore_index)
             z_row = jnp.zeros_like(per_row)
             if label_smoothing > 0.0 or z_loss > 0.0:
-                lse = jax.scipy.special.logsumexp(logits, axis=-1)
+                lse = jax.scipy.special.logsumexp(logits.astype(jnp.float32), axis=-1)
                 if label_smoothing > 0.0:
                     per_row = per_row + _label_smoothing_correction(logits, lse, safe, w, label_smoothing) * w
                 if z_loss > 0.0:
                     z_row = z_loss * lse * lse * w
                     per_row = per_row + z_row
-            correct = jnp.sum((jnp.argmax(logits, axis=-1) == chunk_targets).astype(compute_dtype) * w)
-        # _fused_ce_core returns fp32 per-row; cast the sums back to compute_dtype
-        # so the fori_loop carry types match and the output contract is preserved.
-        loss_sum = jnp.sum(per_row).astype(compute_dtype)
-        z_sum = jnp.sum(z_row).astype(compute_dtype)
+            correct = jnp.sum((jnp.argmax(logits, axis=-1) == chunk_targets).astype(jnp.float32) * w)
+        # Per-chunk sums and the cross-chunk fori_loop carries are fp32 regardless of
+        # ``compute_dtype``: a bf16 running sum stops growing once it is ~256x the per-chunk
+        # increment (e.g. ``weight_sum`` saturates at 32768 for T=65536), biasing the loss.
+        loss_sum = jnp.sum(per_row.astype(jnp.float32))
+        z_sum = jnp.sum(z_row.astype(jnp.float32))
         w_sum = jnp.sum(w)
         return loss_sum, z_sum, w_sum, correct
 
@@ -246,7 +253,7 @@ def fused_linear_cross_entropy(
         if sparse_skip:
 
             def _skip():
-                zr = jnp.zeros((), compute_dtype) * jnp.sum(ch.astype(compute_dtype))
+                zr = jnp.zeros((), jnp.float32) * jnp.sum(ch.astype(jnp.float32))
                 return zr, zr, zr, zr
 
             return lax.cond(i < sparse_upper, lambda: _chunk_loss(ch, ct, cw), _skip)
@@ -266,20 +273,20 @@ def fused_linear_cross_entropy(
         loss_sum, z_sum, w_sum, correct = _chunk_step(ch, ct, cw, i)
         return (carry[0] + loss_sum, carry[1] + z_sum, carry[2] + w_sum, carry[3] + correct)
 
-    zero = jnp.array(0.0, dtype=compute_dtype)
+    zero = jnp.array(0.0, dtype=jnp.float32)
     if vocab_parallel_axis is not None:
         # Seed the accumulators with the varying-manual-axis (VMA) type of the (possibly batch/seq-sharded)
         # inputs so the fori_loop carry-in matches the carry-out under shard_map(check_vma=True) -- the
         # per-chunk loss varies over the batch/seq mesh axes, the bare scalar zero does not. The
         # ``0 * sum(hidden)`` term contributes neither value nor gradient; it only carries the VMA tag.
-        zero = zero + jnp.zeros((), compute_dtype) * jnp.sum(hidden.astype(compute_dtype))
+        zero = zero + jnp.zeros((), jnp.float32) * jnp.sum(hidden.astype(jnp.float32))
     total_loss, total_z_loss, weight_sum, correct_sum = lax.fori_loop(
         0, num_chunks, _accumulate, (zero, zero, zero, zero)
     )
 
     if reduction == "mean":
-        total_loss = total_loss / jnp.maximum(weight_sum, jnp.asarray(1e-8, dtype=compute_dtype))
-    accuracy = correct_sum / jnp.maximum(weight_sum, jnp.asarray(1e-8, dtype=compute_dtype))
+        total_loss = total_loss / jnp.maximum(weight_sum, jnp.asarray(1e-8, dtype=jnp.float32))
+    accuracy = correct_sum / jnp.maximum(weight_sum, jnp.asarray(1e-8, dtype=jnp.float32))
     return total_loss, total_z_loss, weight_sum, accuracy
 
 

@@ -112,7 +112,7 @@ def blocksparse_attention(
             Takes precedence over ``causal`` / ``sliding_window`` /
             ``chunk_size`` when provided.
         sliding_window: Local attention window size.  Options:
-            - ``int``: symmetric window (same left and right size).
+            - ``int``: window size ``W`` (HF convention; same as ``(W - 1, W - 1)``).
             - ``tuple[int, int]``: ``(left_window, right_window)`` for
               asymmetric windows.
             - ``None``: disabled.

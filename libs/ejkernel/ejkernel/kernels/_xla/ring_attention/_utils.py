@@ -182,7 +182,8 @@ def _chunk_attention_bias(
         if isinstance(sliding_window, tuple):
             left_window, right_window = sliding_window
         else:
-            left_window = right_window = sliding_window
+            # An int is a window *size* (HF convention): the query plus its ``W - 1`` neighbours.
+            left_window = right_window = max(sliding_window - 1, 0)
 
         pos_diff = query_idx - key_idx
         window_mask = (pos_diff >= -right_window) & (pos_diff <= left_window)

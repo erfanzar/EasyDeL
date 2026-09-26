@@ -254,6 +254,15 @@ def stable_json(obj: Any) -> str:
             func = default(o.func)
             kws = tuple(sorted((o.keywords or {}).items()))
             return {"__partial__": True, "func": func, "args": o.args, "kwargs": kws}
+        # Dtype scalar classes (``jnp.float32``, ``jnp.bfloat16``, ``np.int8``, ...) are callable;
+        # serialize them as their dtype before the generic callable branch, which would hash
+        # every one of them to the same metaclass name (so f32 and bf16 cache keys collided).
+        if isinstance(o, type) and issubclass(o, np.generic):
+            return np.dtype(o).name
+        if callable(o) and isinstance(getattr(o, "dtype", None), np.dtype):
+            return o.dtype.name
+        if isinstance(o, type):
+            return {"__class__": f"{o.__module__}.{o.__qualname__}"}
         if callable(o):
             cls = o.__class__
             return {"__callable_obj__": f"{cls.__module__}.{cls.__qualname__}"}

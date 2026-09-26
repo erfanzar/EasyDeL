@@ -205,7 +205,7 @@ def attention(
         causal: If True, applies causal masking where each query position can only
             attend to previous key positions.
         sliding_window: Optional sliding window attention constraint. Can be:
-            - int: Symmetric window (same left and right window size)
+            - int: Window size ``W`` (HF convention; same as ``(W - 1, W - 1)``)
             - tuple[int, int]: Asymmetric window (left_window, right_window)
             - None: No window constraint (full attention)
             When specified, each query position can only attend to keys within the window.
@@ -264,8 +264,8 @@ def attention(
 
     if sliding_window is not None:
         if isinstance(sliding_window, int):
-            left_window = sliding_window
-            right_window = sliding_window
+            # An int is a window *size* (HF convention): the query plus its ``W - 1`` neighbours.
+            left_window = right_window = max(sliding_window - 1, 0)
         else:
             left_window, right_window = sliding_window
 

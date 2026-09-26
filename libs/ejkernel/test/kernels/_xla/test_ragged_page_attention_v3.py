@@ -143,3 +143,107 @@ def test_ragged_page_attention_v3_rejects_wrong_cache_layout(head_dim, stored_he
             jnp.array([0, 1], dtype=jnp.int32),
             jnp.array([1, 1, 1], dtype=jnp.int32),
         )
+
+
+def _dense_sliding_window_reference(q, k, v, q_pos, sliding_window, sinks, softmax_scale):
+    """Dense masked softmax with HF sliding-window semantics (query plus ``W - 1`` previous keys).
+
+    Args:
+        q: ``[q_len, num_q_heads, head_dim]`` queries.
+        k: ``[kv_len, num_kv_heads, head_dim]`` keys for every cached position.
+        v: ``[kv_len, num_kv_heads, head_dim]`` values for every cached position.
+        q_pos: ``[q_len]`` absolute query positions.
+        sliding_window: Window size ``W`` or ``None`` for full causal attention.
+        sinks: ``[num_q_heads]`` sink logits (``-inf`` disables).
+        softmax_scale: Logit scale.
+    """
+    kv_pos = np.arange(k.shape[0])
+    visible = kv_pos[None, :] <= q_pos[:, None]
+    if sliding_window is not None:
+        visible &= kv_pos[None, :] > q_pos[:, None] - sliding_window  # transformers sliding_window_overlay
+    group = q.shape[1] // k.shape[1]
+    out = np.empty(q.shape, dtype=np.float64)
+    for head in range(q.shape[1]):
+        scores = q[:, head] @ k[:, head // group].T * softmax_scale
+        scores = np.where(visible, scores, -np.inf)
+        maximum = np.maximum(scores.max(axis=-1), sinks[head])
+        weights = np.exp(scores - maximum[:, None])
+        denominator = weights.sum(axis=-1) + np.exp(sinks[head] - maximum)
+        out[:, head] = weights @ v[:, head // group] / denominator[:, None]
+    return out
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("sliding_window", [1, 4, 8, 16, 33])
+@pytest.mark.parametrize("with_sink", [False, True])
+def test_ragged_page_attention_v3_sliding_window_matches_dense(head_dim, sliding_window, with_sink):
+    """Every query of a prefill chunk keeps its own ``W``-key window.
+
+    Covers decode over a long context, a full prefill (``q_len == kv_len``), a chunked prefill
+    (``kv_len > q_len``) and a long chunk whose early KV blocks lie entirely outside the window
+    (8-token KV blocks), for windows smaller than, equal to and larger than a KV block.
+    """
+    rng = np.random.default_rng(sliding_window + 100 * head_dim + int(with_sink))
+    num_kv_heads, num_q_heads = 2, 4
+    page_size = 4
+    q_lens = np.array([1, 24, 13, 37], dtype=np.int32)
+    kv_lens = np.array([70, 24, 45, 97], dtype=np.int32)
+    pages_per_seq = int(-(-kv_lens.max() // page_size))
+    query_start_loc = np.concatenate([np.zeros(1, dtype=np.int32), np.cumsum(q_lens, dtype=np.int32)])
+    total_q = int(query_start_loc[-1])
+    total_pages = len(q_lens) * pages_per_seq
+    block_tables = rng.permutation(total_pages).astype(np.int32).reshape(len(q_lens), pages_per_seq)
+
+    queries = rng.normal(size=(total_q, num_q_heads, head_dim)).astype(np.float32)
+    keys = rng.normal(size=(total_q, num_kv_heads, head_dim)).astype(np.float32)
+    values = rng.normal(size=(total_q, num_kv_heads, head_dim)).astype(np.float32)
+    combined_heads = num_kv_heads if head_dim == 64 else 2 * num_kv_heads
+    padded_dim = (head_dim + 127) // 128 * 128
+    kv_cache = rng.normal(size=(total_pages, page_size, combined_heads, 1, padded_dim)).astype(np.float32)
+    sinks = rng.normal(size=(num_q_heads,)) if with_sink else np.full(num_q_heads, -np.inf)
+    softmax_scale = head_dim**-0.5
+
+    expected = np.empty(queries.shape, dtype=np.float64)
+    for seq, (q_len, kv_len) in enumerate(zip(q_lens, kv_lens, strict=True)):
+        q_start, write_start = query_start_loc[seq], kv_len - q_len
+        dense_k = np.empty((kv_len, num_kv_heads, head_dim), dtype=np.float64)
+        dense_v = np.empty_like(dense_k)
+        for pos in range(write_start):  # cached prefix, read back from the (unchanged) pages
+            row = kv_cache[block_tables[seq, pos // page_size], pos % page_size, :, 0]
+            for head in range(num_kv_heads):
+                if head_dim == 64:
+                    dense_k[pos, head], dense_v[pos, head] = row[head, :64], row[head, 64:]
+                else:
+                    dense_k[pos, head] = row[2 * head, :head_dim]
+                    dense_v[pos, head] = row[2 * head + 1, :head_dim]
+        dense_k[write_start:] = keys[q_start : q_start + q_len]
+        dense_v[write_start:] = values[q_start : q_start + q_len]
+        expected[q_start : q_start + q_len] = _dense_sliding_window_reference(
+            queries[q_start : q_start + q_len].astype(np.float64),
+            dense_k,
+            dense_v,
+            write_start + np.arange(q_len),
+            sliding_window,
+            sinks,
+            softmax_scale,
+        )
+
+    with jax.default_matmul_precision("highest"):
+        out, _ = ragged_page_attention_v3(
+            jnp.asarray(queries),
+            jnp.asarray(keys),
+            jnp.asarray(values),
+            jnp.asarray(kv_cache),
+            jnp.asarray(kv_lens),
+            jnp.asarray(block_tables.reshape(-1)),
+            jnp.asarray(query_start_loc),
+            jnp.array([0, 0, len(q_lens)], dtype=jnp.int32),
+            softmax_aux=jnp.asarray(sinks, dtype=jnp.float32) if with_sink else None,
+            softmax_scale=softmax_scale,
+            sliding_window=sliding_window,
+            num_kv_pages_per_block=2,
+        )
+
+    out = np.asarray(out, dtype=np.float32)
+    assert np.isfinite(out).all()
+    np.testing.assert_allclose(out, expected, rtol=2e-3, atol=2e-3)

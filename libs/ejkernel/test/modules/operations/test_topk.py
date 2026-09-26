@@ -110,6 +110,29 @@ def test_filter_mode_replaces_dropped_entries():
     assert np.array_equal(np.asarray(out)[0], np.array([3.0, -1e9, 2.0, -1e9], np.float32))
 
 
+@pytest.mark.parametrize("shape", [(4, 64), (2, 3, 50)])
+@pytest.mark.parametrize("mode", ["mask", "filter"])
+@pytest.mark.parametrize("k_kind", ["int", "scalar_array"])
+def test_scalar_k_on_rank_ge2_operand(shape, mode, k_kind):
+    """A scalar k applies to every row; the bisection carry must not change shape.
+
+    Reference: the k-th largest value per row from ``jax.lax.top_k``; keep ``x >= kth``.
+    """
+    x = _rand(shape, seed=19)
+    k = 5 if k_kind == "int" else jnp.asarray(5, jnp.int32)
+    out = topk(x, k, mode=mode)
+
+    kth = jax.lax.top_k(x, 5)[0][..., -1:]
+    ref_keep = np.asarray(x >= kth)
+    assert out.shape == x.shape
+    if mode == "mask":
+        assert np.array_equal(np.asarray(out), ref_keep)
+        assert np.all(np.asarray(out).sum(-1) == 5)
+    else:
+        ref = np.where(ref_keep, np.asarray(x), np.finfo(np.float32).min)
+        assert np.array_equal(np.asarray(out), ref)
+
+
 def test_values_mode_rejects_traced_k():
     """A sorted top-k needs a static output width; say so instead of guessing."""
     x = _rand((2, 32))

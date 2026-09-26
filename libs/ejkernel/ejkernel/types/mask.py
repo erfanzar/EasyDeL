@@ -2362,7 +2362,7 @@ class MaskInfo:
 
         Args:
             sliding_window: Window size specification:
-                - int: Symmetric window (same size left and right)
+                - int: Window size ``W`` (HF convention; same as ``(W - 1, W - 1)``)
                 - tuple[int, int]: (left_window, right_window) for asymmetric windows
                   - left_window: How many positions to the left can be attended to
                   - right_window: How many positions to the right can be attended to
@@ -2389,8 +2389,8 @@ class MaskInfo:
             >>> segment_ids = jnp.array([[1, 1, 1, 1, 1, 1]])
             >>> mask_info = MaskInfo.from_segments(segment_ids)
             >>>
-            >>> # Symmetric window: each position attends to 2 positions left and 2 right
-            >>> windowed_mask = mask_info.apply_sliding_window(2)
+            >>> # Window size 3 (HF convention): each position attends to itself plus 2 left / 2 right
+            >>> windowed_mask = mask_info.apply_sliding_window(3)
             >>>
             >>> # Asymmetric window: 3 left, 1 right
             >>> windowed_mask = mask_info.apply_sliding_window((3, 1))
@@ -2412,7 +2412,8 @@ class MaskInfo:
                     f"Invalid sliding_window: expected a non-negative integer, but got {sliding_window}. "
                     f"Window size must be >= 0."
                 )
-            left_window = right_window = sliding_window
+            # An int is a window *size* (HF convention): the query plus its ``W - 1`` neighbours.
+            left_window = right_window = max(int(sliding_window) - 1, 0)
         else:
             left_window, right_window = sliding_window
             if isinstance(left_window, (int, np.integer)) and isinstance(right_window, (int, np.integer)):

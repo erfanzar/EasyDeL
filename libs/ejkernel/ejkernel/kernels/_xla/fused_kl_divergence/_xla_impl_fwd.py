@@ -229,7 +229,8 @@ def fused_kl_divergence(
             f"fused_kl_divergence: shape mismatch student={student_logits.shape} vs teacher={teacher_logits.shape}"
         )
 
-    teacher_logits = teacher_logits.astype(student_logits.dtype)
+    # The teacher keeps its own dtype: every path upcasts to fp32, so rounding an fp32 teacher to a
+    # bf16 student's dtype would only shift the target distribution.
     leading = student_logits.shape[:-1]
     if weights is None:
         wts = jnp.ones(leading, dtype=jnp.float32)

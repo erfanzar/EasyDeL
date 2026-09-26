@@ -15,6 +15,7 @@
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from ejkernel.kernels._pallas.tpu.ragged_page_attention_v3._interface import ragged_page_attention_v3
 from ejkernel.kernels._pallas.tpu.ragged_page_attention_v3._pallas_impl_fwd import (
@@ -227,3 +228,75 @@ class TestRaggedPageAttentionV3TPU:
         assert cache_p.shape == cache_x.shape
         assert jnp.allclose(out_p, out_x, rtol=0, atol=0.25)
         assert jnp.allclose(cache_p, cache_x, rtol=0, atol=0.25)
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("sliding_window", [1, 16, 17, 64])
+@pytest.mark.parametrize("with_attention_sink", [False, True])
+def test_sliding_window_matches_dense_reference(head_dim, sliding_window, with_attention_sink):
+    """Pallas v3 (hd128 and h64 kernels) against an independent dense HF-window softmax.
+
+    One-page (16-token) KV blocks and 8-query blocks make early KV blocks fall entirely outside
+    the window of later query blocks. Covers decode over a long context, ``q_len == kv_len`` and
+    chunked prefill (``kv_len > q_len``), with windows below, at and just above a KV block.
+    """
+    rng = np.random.default_rng(sliding_window + 1000 * head_dim + int(with_attention_sink))
+    num_q_heads, num_kv_heads, page_size, pages_per_seq = 8, 2, 16, 16
+    q_lens = np.array([1, 40, 29, 64], dtype=np.int32)
+    kv_lens = np.array([200, 40, 150, 256], dtype=np.int32)
+    query_start_loc = np.concatenate([np.zeros(1, dtype=np.int32), np.cumsum(q_lens, dtype=np.int32)])
+    num_seqs, total_q = len(q_lens), int(query_start_loc[-1])
+    total_pages = num_seqs * pages_per_seq
+    get_shape = get_kv_cache_shape_hd64 if head_dim == 64 else get_kv_cache_shape_hd128
+    kv_cache_shape = get_shape(total_pages, page_size, num_kv_heads, head_dim, jnp.float32)
+
+    queries = rng.normal(size=(total_q, num_q_heads, head_dim)).astype(np.float32)
+    keys = rng.normal(size=(total_q, num_kv_heads, head_dim)).astype(np.float32)
+    values = rng.normal(size=(total_q, num_kv_heads, head_dim)).astype(np.float32)
+    kv_cache = rng.normal(size=kv_cache_shape).astype(np.float32)
+    block_tables = rng.permutation(total_pages).astype(np.int32).reshape(num_seqs, pages_per_seq)
+    sinks = rng.normal(size=(num_q_heads,)) if with_attention_sink else np.full(num_q_heads, -np.inf)
+    softmax_scale = head_dim**-0.5
+
+    expected = np.empty(queries.shape, dtype=np.float64)
+    group = num_q_heads // num_kv_heads
+    for seq in range(num_seqs):
+        q_start, q_len, kv_len = query_start_loc[seq], q_lens[seq], kv_lens[seq]
+        write_start = kv_len - q_len
+        rows = kv_cache[block_tables[seq]].reshape(pages_per_seq * page_size, -1, kv_cache_shape[-1])[:write_start]
+        if head_dim == 64:  # K|V share one 128-lane row per kv head
+            old_k, old_v = rows[:, :num_kv_heads, :64], rows[:, :num_kv_heads, 64:]
+        else:  # K and V on alternating combined heads
+            old_k, old_v = rows[:, 0 : 2 * num_kv_heads : 2, :head_dim], rows[:, 1 : 2 * num_kv_heads : 2, :head_dim]
+        dense_k = np.concatenate([old_k, keys[q_start : q_start + q_len]]).astype(np.float64)
+        dense_v = np.concatenate([old_v, values[q_start : q_start + q_len]]).astype(np.float64)
+        q_pos = write_start + np.arange(q_len)
+        kv_pos = np.arange(kv_len)
+        visible = (kv_pos[None, :] <= q_pos[:, None]) & (kv_pos[None, :] > q_pos[:, None] - sliding_window)
+        for head in range(num_q_heads):
+            scores = queries[q_start : q_start + q_len, head].astype(np.float64) @ dense_k[:, head // group].T
+            scores = np.where(visible, scores * softmax_scale, -np.inf)
+            maximum = np.maximum(scores.max(axis=-1), sinks[head])
+            weights = np.exp(scores - maximum[:, None])
+            denominator = weights.sum(axis=-1) + np.exp(sinks[head] - maximum)
+            expected[q_start : q_start + q_len, head] = weights @ dense_v[:, head // group] / denominator[:, None]
+
+    out, _ = ragged_page_attention_v3(
+        jnp.asarray(queries),
+        jnp.asarray(keys),
+        jnp.asarray(values),
+        jnp.asarray(kv_cache),
+        jnp.asarray(kv_lens),
+        jnp.asarray(block_tables.reshape(-1)),
+        jnp.asarray(query_start_loc),
+        jnp.array([0, 0, num_seqs], dtype=jnp.int32),
+        softmax_aux=jnp.asarray(sinks, dtype=jnp.float32) if with_attention_sink else None,
+        softmax_scale=softmax_scale,
+        sliding_window=sliding_window,
+        num_kv_pages_per_block=1,
+        num_queries_per_block=8,
+    )
+
+    out = np.asarray(out, dtype=np.float32)
+    assert np.isfinite(out).all()
+    np.testing.assert_allclose(out, expected, rtol=0, atol=5e-2)

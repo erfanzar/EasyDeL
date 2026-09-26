@@ -915,7 +915,8 @@ def blocksparse_attention(
     if sliding_window is None:
         window_left = window_right = -1
     elif isinstance(sliding_window, int):
-        window_left = window_right = sliding_window
+        # An int is a window *size* (HF convention): the query plus its ``W - 1`` neighbours.
+        window_left = window_right = max(sliding_window - 1, 0)
     else:
         window_left, window_right = sliding_window
 

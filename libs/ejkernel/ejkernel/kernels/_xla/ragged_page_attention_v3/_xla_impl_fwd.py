@@ -476,8 +476,6 @@ def ragged_paged_attention(
         arange_q = jnp.arange(qblocks, dtype=jnp.int32)
         arange_kv = jnp.arange(kv_tokens_per_block, dtype=jnp.int32)
 
-        bkv_sz = page_size if sliding_window is not None else None
-
         sinks_h = None
         if softmax_aux is not None:
             sinks_h = softmax_aux.reshape(actual_num_kv_heads, actual_num_q_heads_per_kv_head).astype(jnp.float32)
@@ -499,11 +497,6 @@ def ragged_paged_attention(
             q_end = query_start_loc[seq_idx + 1]
             q_len = q_end - q_start
             kv_len = kv_lens[seq_idx]
-
-            kv_start = jnp.int32(0)
-            if sliding_window is not None:
-                kv_start = jnp.maximum(kv_len - jnp.int32(sliding_window), 0)
-                kv_start = (kv_start // jnp.int32(bkv_sz)) * jnp.int32(bkv_sz)
 
             write_start = kv_len - q_len
             num_q_blocks = (q_len + qblocks - 1) // qblocks
@@ -580,7 +573,6 @@ def ragged_paged_attention(
             )
 
             num_kv_blocks = (kv_len + kv_tokens_per_block - 1) // kv_tokens_per_block
-            kv_block_start = kv_start // jnp.int32(kv_tokens_per_block)
 
         def _process_query_block(qb, o_inner):
             """Compute attention for one query block against the full KV cache.
@@ -614,6 +606,13 @@ def ragged_paged_attention(
                 q_tok = q_off + arange_q
                 q_valid = q_tok < q_len
                 q_pos = write_start + q_tok
+
+                # The earliest query of this block sees keys ``> q_pos - sliding_window``;
+                # every KV block ending before that is fully masked for the whole block.
+                kv_block_start = jnp.int32(0)
+                if sliding_window is not None:
+                    kv_lo = jnp.maximum(write_start + q_off - jnp.int32(sliding_window) + 1, 0)
+                    kv_block_start = kv_lo // jnp.int32(kv_tokens_per_block)
 
                 init_acc = jnp.zeros(
                     (qblocks, actual_num_kv_heads, actual_num_q_heads_per_kv_head, actual_head_dim),
@@ -691,7 +690,7 @@ def ragged_paged_attention(
 
                     with jax.named_scope("mask"):
                         kv_pos = kb * jnp.int32(kv_tokens_per_block) + arange_kv
-                        kv_valid = jnp.logical_and(kv_pos >= kv_start, kv_pos < kv_len)
+                        kv_valid = kv_pos < kv_len
                         mask = jnp.logical_or(kv_pos[None, :] > q_pos[:, None], jnp.logical_not(kv_valid[None, :]))
                         if sliding_window is not None:
                             mask = jnp.logical_or(

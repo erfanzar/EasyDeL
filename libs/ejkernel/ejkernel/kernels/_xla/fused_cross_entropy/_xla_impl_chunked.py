@@ -46,7 +46,8 @@ def _logsumexp_chunked(x: jnp.ndarray, chunk_size: int) -> jnp.ndarray:
 
     Two-pass (running max, then running sum of shifted exponentials) so the
     intermediate ``exp`` buffer is ``[..., chunk_size]`` rather than ``[..., V]``.
-    Mathematically identical to :func:`jax.scipy.special.logsumexp`.
+    Mathematically identical to :func:`jax.scipy.special.logsumexp`. The running
+    max / sum carries (and the result) are fp32 regardless of ``x.dtype``.
     """
     V: int = x.shape[-1]
     n_full = V // chunk_size
@@ -55,26 +56,26 @@ def _logsumexp_chunked(x: jnp.ndarray, chunk_size: int) -> jnp.ndarray:
     def max_body(i, m):
         start = i * chunk_size
         chunk = lax.dynamic_slice_in_dim(x, start, chunk_size, axis=-1)
-        return jnp.maximum(m, jnp.max(chunk, axis=-1))
+        return jnp.maximum(m, jnp.max(chunk, axis=-1).astype(jnp.float32))
 
-    m = jnp.full(x.shape[:-1], -jnp.inf, dtype=x.dtype)
+    m = jnp.full(x.shape[:-1], -jnp.inf, dtype=jnp.float32)
     m = lax.fori_loop(0, n_full, max_body, m)
     if tail:
         start = n_full * chunk_size
         chunk = lax.dynamic_slice_in_dim(x, start, tail, axis=-1)
-        m = jnp.maximum(m, jnp.max(chunk, axis=-1))
+        m = jnp.maximum(m, jnp.max(chunk, axis=-1).astype(jnp.float32))
 
     def sum_body(i, s):
         start = i * chunk_size
         chunk = lax.dynamic_slice_in_dim(x, start, chunk_size, axis=-1)
-        return s + jnp.sum(jnp.exp(chunk - m[..., None]), axis=-1)
+        return s + jnp.sum(jnp.exp(chunk.astype(jnp.float32) - m[..., None]), axis=-1)
 
     s = jnp.zeros_like(m)
     s = lax.fori_loop(0, n_full, sum_body, s)
     if tail:
         start = n_full * chunk_size
         chunk = lax.dynamic_slice_in_dim(x, start, tail, axis=-1)
-        s = s + jnp.sum(jnp.exp(chunk - m[..., None]), axis=-1)
+        s = s + jnp.sum(jnp.exp(chunk.astype(jnp.float32) - m[..., None]), axis=-1)
 
     return jnp.log(s) + m
 
@@ -156,18 +157,19 @@ def chunked_vocab_cross_entropy(
         nll = _apply_sparse_label_smoothing(
             lse,
             logit_y,
-            jnp.sum(logits, axis=-1),
+            jnp.sum(logits, axis=-1, dtype=jnp.float32),
             vocab_size=logits.shape[-1],
             label_smoothing=label_smoothing,
-            dtype=compute_dtype,
+            dtype=jnp.float32,
         )
 
     z_term = (z_loss * jnp.square(lse)) if z_loss > 0.0 else jnp.zeros_like(lse)
     nll = nll + z_term
 
-    w = valid.astype(compute_dtype) if weights is None else valid.astype(compute_dtype) * weights.astype(compute_dtype)
+    # Token weights and every reduction over tokens stay fp32 regardless of ``compute_dtype``.
+    w = valid.astype(jnp.float32) if weights is None else valid.astype(jnp.float32) * weights.astype(jnp.float32)
     weight_sum = jnp.sum(w)
-    correct = (jnp.argmax(logits, axis=-1) == targets).astype(compute_dtype) * w
+    correct = (jnp.argmax(logits, axis=-1) == targets).astype(jnp.float32) * w
     accuracy = jnp.sum(correct) / jnp.maximum(weight_sum, 1e-8)
 
     if reduction == "none":
@@ -210,25 +212,27 @@ def blockwise_cross_entropy(
         L = B * T
         logits2d = logits.reshape(L, V)
         y = targets.reshape(L)
-        w = None if weights is None else weights.reshape(L).astype(compute_dtype)
+        w = None if weights is None else weights.reshape(L).astype(jnp.float32)
     elif logits.ndim == 2:
         L, V = logits.shape
         logits2d = logits
         y = targets
-        w = None if weights is None else weights.astype(compute_dtype)
+        w = None if weights is None else weights.astype(jnp.float32)
     else:
         raise ValueError(f"logits must be [B, T, V] or [N, V], got {logits.shape}")
 
     logits2d = logits2d.astype(compute_dtype)
     valid = y != ignore_index
     y_safe = jnp.where(valid, y, 0)
-    w = valid.astype(compute_dtype) if w is None else valid.astype(compute_dtype) * w
+    w = valid.astype(jnp.float32) if w is None else valid.astype(jnp.float32) * w
 
-    neg_inf = jnp.array(-jnp.inf, dtype=compute_dtype)
+    # Online-softmax carries are fp32 regardless of ``compute_dtype`` (a bf16 running
+    # log-sum-exp / logit sum accumulates rounding error across every vocab block).
+    neg_inf = jnp.array(-jnp.inf, dtype=jnp.float32)
     m = jnp.full((L,), neg_inf)
     log_z = jnp.full((L,), neg_inf)
-    o = jnp.zeros((L,), dtype=compute_dtype)
-    sum_logits = jnp.zeros((L,), dtype=compute_dtype)
+    o = jnp.zeros((L,), dtype=jnp.float32)
+    sum_logits = jnp.zeros((L,), dtype=jnp.float32)
     best_logit = jnp.full((L,), neg_inf)
     best_id = jnp.zeros((L,), dtype=jnp.int32)
 
@@ -236,7 +240,7 @@ def blockwise_cross_entropy(
     tail = V - n_full * block_size
 
     def process_block(start, size, m, log_z, o, sum_logits, best_logit, best_id):
-        chunk = lax.dynamic_slice_in_dim(logits2d, start, size, axis=1)
+        chunk = lax.dynamic_slice_in_dim(logits2d, start, size, axis=1).astype(jnp.float32)
         chunk_max = jnp.max(chunk, axis=1)
         new_m = jnp.maximum(m, chunk_max)
         log_z = new_m + jnp.log(jnp.exp(log_z - new_m) + jnp.sum(jnp.exp(chunk - new_m[:, None]), axis=1))
@@ -279,14 +283,14 @@ def blockwise_cross_entropy(
             sum_logits,
             vocab_size=V,
             label_smoothing=label_smoothing,
-            dtype=compute_dtype,
+            dtype=jnp.float32,
         )
 
     zterm = (z_loss * (log_z**2)) if (z_loss and z_loss != 0.0) else jnp.zeros_like(log_z)
     per_tok = nll + zterm
     weight_sum = jnp.sum(w)
-    acc = jnp.sum((best_id == y_safe).astype(compute_dtype) * w) / jnp.maximum(
-        weight_sum, jnp.asarray(1e-8, dtype=compute_dtype)
+    acc = jnp.sum((best_id == y_safe).astype(jnp.float32) * w) / jnp.maximum(
+        weight_sum, jnp.asarray(1e-8, dtype=jnp.float32)
     )
 
     if reduction == "none":
@@ -294,7 +298,7 @@ def blockwise_cross_entropy(
     total_loss = jnp.sum(per_tok * w)
     total_z_loss = jnp.sum(zterm * w)
     if reduction == "mean":
-        total_loss = total_loss / jnp.maximum(weight_sum, jnp.asarray(1e-8, dtype=compute_dtype))
+        total_loss = total_loss / jnp.maximum(weight_sum, jnp.asarray(1e-8, dtype=jnp.float32))
     return total_loss, total_z_loss, weight_sum, acc
 
 
@@ -324,14 +328,14 @@ def chunked_token_cross_entropy(
     V = logits.shape[-1]
     logits2d = logits.reshape(-1, V)
     targets1d = targets.reshape(-1)
-    weights1d = None if weights is None else weights.reshape(-1).astype(compute_dtype)
+    weights1d = None if weights is None else weights.reshape(-1).astype(jnp.float32)
     N: int = logits2d.shape[0]
     token_chunk_size = max(1, min(int(token_chunk_size), N))
     n_full = N // token_chunk_size
     tail = N - n_full * token_chunk_size
 
     def _chunk(chunk_logits, chunk_targets, chunk_weights):
-        lse = jax.scipy.special.logsumexp(chunk_logits, axis=-1)
+        lse = jax.scipy.special.logsumexp(chunk_logits.astype(jnp.float32), axis=-1)
         valid = chunk_targets != ignore_index
         safe = jnp.where(valid, chunk_targets, 0)
         logit_y = jnp.take_along_axis(chunk_logits, safe[:, None], axis=-1)[:, 0]
@@ -340,18 +344,18 @@ def chunked_token_cross_entropy(
             nll = _apply_sparse_label_smoothing(
                 lse,
                 logit_y,
-                jnp.sum(chunk_logits, axis=-1),
+                jnp.sum(chunk_logits, axis=-1, dtype=jnp.float32),
                 vocab_size=V,
                 label_smoothing=label_smoothing,
-                dtype=compute_dtype,
+                dtype=jnp.float32,
             )
         zterm = (z_loss * jnp.square(lse)) if z_loss > 0.0 else jnp.zeros_like(lse)
         nll = nll + zterm
-        w = valid.astype(compute_dtype) if chunk_weights is None else valid.astype(compute_dtype) * chunk_weights
+        w = valid.astype(jnp.float32) if chunk_weights is None else valid.astype(jnp.float32) * chunk_weights
         loss_sum = jnp.sum(nll * w)
         w_sum = jnp.sum(w)
         z_sum = jnp.sum(zterm * w)
-        acc = jnp.sum((jnp.argmax(chunk_logits, axis=-1) == chunk_targets).astype(compute_dtype) * w)
+        acc = jnp.sum((jnp.argmax(chunk_logits, axis=-1) == chunk_targets).astype(jnp.float32) * w)
         return loss_sum, w_sum, acc, z_sum
 
     def body(i, carry):
@@ -363,11 +367,13 @@ def chunked_token_cross_entropy(
         loss_sum, w_sum, acc, z_sum = _chunk(cl, ct, cw)
         return (tot + loss_sum, wsum + w_sum, acc_sum + acc, zsum + z_sum)
 
+    # fp32 carries regardless of ``compute_dtype``: a bf16 running sum saturates once it is
+    # ~256x the per-chunk increment (``weight_sum`` sticks at 32768 for 65536 tokens).
     init = (
-        jnp.array(0.0, compute_dtype),
-        jnp.array(0.0, compute_dtype),
-        jnp.array(0.0, compute_dtype),
-        jnp.array(0.0, compute_dtype),
+        jnp.array(0.0, jnp.float32),
+        jnp.array(0.0, jnp.float32),
+        jnp.array(0.0, jnp.float32),
+        jnp.array(0.0, jnp.float32),
     )
     carry = lax.fori_loop(0, n_full, body, init)
 

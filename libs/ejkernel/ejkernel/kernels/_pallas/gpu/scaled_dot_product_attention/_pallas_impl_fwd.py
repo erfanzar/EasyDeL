@@ -78,7 +78,7 @@ def scaled_dot_product_attention(
         causal: If ``True``, applies causal (lower-triangular) masking.
             Passed as ``is_causal`` to ``jax.nn.dot_product_attention``.
         sliding_window: Optional local-attention window.  Can be:
-            - ``int``: symmetric window of that size.
+            - ``int``: window size ``W`` (HF convention; same as ``(W - 1, W - 1)``).
             - ``tuple[int, int]``: ``(left_window, right_window)`` for
               asymmetric windows.
             Passed as ``local_window_size`` to cuDNN.
@@ -110,6 +110,10 @@ def scaled_dot_product_attention(
     """
     if bias is None and init_bias is not None:
         bias = init_bias()
+    if isinstance(sliding_window, int):
+        # An int is a window *size* (HF convention): the query plus its ``W - 1`` neighbours.
+        # ``jax.nn.dot_product_attention`` reads an int as inclusive distances ``(W, W)``.
+        sliding_window = (max(sliding_window - 1, 0), max(sliding_window - 1, 0))
     return jax.nn.dot_product_attention(
         query=query,
         key=key,

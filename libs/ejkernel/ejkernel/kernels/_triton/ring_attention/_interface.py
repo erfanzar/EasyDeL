@@ -89,7 +89,7 @@ def ring_attention(
         mask_builder: Optional callable to build custom sparse mask patterns.
             Currently unused in this implementation.
         sliding_window: Sliding window size for local attention. Can be:
-            - int: symmetric window (same size left and right)
+            - int: Window size ``W`` (HF convention; same as ``(W - 1, W - 1)``)
             - tuple[int, int]: (left_window, right_window) for asymmetric
             - None: no sliding window (full attention)
         chunk_size: Optional chunk size for block processing.

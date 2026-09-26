@@ -54,15 +54,18 @@ def _fused_ce_core(logits, targets, weights, ignore_index):
 
     No reshape is performed: every op is either elementwise on ``V`` or a
     reduction along ``V``. Sharding on the leading dims propagates through
-    XLA SPMD without any explicit constraints.
+    XLA SPMD without any explicit constraints. The row max / log-sum-exp are
+    computed in fp32 regardless of ``logits.dtype`` (the upcast fuses into the
+    reductions, so no ``[..., V]`` fp32 buffer is materialised).
     """
     del ignore_index
     vocab = logits.shape[-1]
     safe_targets = jnp.clip(targets, 0, vocab - 1)
-    max_logit = jnp.max(logits, axis=-1, keepdims=True)
-    shifted = logits - max_logit
+    logits_f32 = logits.astype(jnp.float32)
+    max_logit = jnp.max(logits_f32, axis=-1, keepdims=True)
+    shifted = logits_f32 - max_logit
     lse = jnp.log(jnp.sum(jnp.exp(shifted), axis=-1)) + max_logit[..., 0]
-    target_logit = jnp.take_along_axis(logits, safe_targets[..., None], axis=-1)[..., 0]
+    target_logit = jnp.take_along_axis(logits, safe_targets[..., None], axis=-1)[..., 0].astype(jnp.float32)
     per_row = lse - target_logit
     return (per_row * weights).astype(jnp.float32)
 
@@ -82,14 +85,16 @@ def _fused_ce_core_tp(logits_local, targets, weights, ignore_index, vocab_axis):
     tp_idx = jax.lax.axis_index(vocab_axis)
     vocab_start = tp_idx * v_local
 
-    local_max = jnp.max(logits_local, axis=-1)
-    local_se = jnp.sum(jnp.exp(logits_local - local_max[..., None]), axis=-1)
+    # Softmax statistics (and the cross-shard pmax/psum) in fp32 regardless of the logits dtype.
+    logits_f32 = logits_local.astype(jnp.float32)
+    local_max = jnp.max(logits_f32, axis=-1)
+    local_se = jnp.sum(jnp.exp(logits_f32 - local_max[..., None]), axis=-1)
 
     is_local = (targets >= vocab_start) & (targets < vocab_start + v_local)
     local_idx = jnp.where(is_local, targets - vocab_start, 0)
     local_target_logit = jnp.where(
         is_local,
-        jnp.take_along_axis(logits_local, local_idx[..., None], axis=-1)[..., 0],
+        jnp.take_along_axis(logits_local, local_idx[..., None], axis=-1)[..., 0].astype(jnp.float32),
         0.0,
     )
 
@@ -114,13 +119,14 @@ def _fused_soft_ce_core_tp(logits_local, soft_local, vocab_axis):
     *unweighted* per-row loss ``-Σ_v soft_v·log_softmax_v`` (global softmax via ``pmax``/``psum``). The
     custom VJP keeps ``pmax`` out of autodiff and emits a fully local ``(softmax·S - soft)`` backward.
     """
-    local_max = jnp.max(logits_local, axis=-1)
-    local_se = jnp.sum(jnp.exp(logits_local - local_max[..., None]), axis=-1)
+    logits_f32 = logits_local.astype(jnp.float32)
+    local_max = jnp.max(logits_f32, axis=-1)
+    local_se = jnp.sum(jnp.exp(logits_f32 - local_max[..., None]), axis=-1)
     global_max = jax.lax.pmax(local_max, vocab_axis)
     scaled_local_se = local_se * jnp.exp(local_max - global_max)
     global_se = jax.lax.psum(scaled_local_se, vocab_axis)
     lse = jnp.log(global_se) + global_max
-    local_dot = jnp.sum(soft_local * (logits_local - lse[..., None]), axis=-1)
+    local_dot = jnp.sum(soft_local.astype(jnp.float32) * (logits_f32 - lse[..., None]), axis=-1)
     per_row = -jax.lax.psum(local_dot, vocab_axis)
     return per_row.astype(jnp.float32)
 
@@ -147,8 +153,8 @@ def _label_smoothing_correction(logits, lse, targets, weights, label_smoothing):
         confidence * math.log(max(confidence, 1e-20)) + (vocab - 1) * low_conf * math.log(max(low_conf, 1e-20))
     )
     safe_targets = jnp.clip(targets, 0, vocab - 1)
-    target_logit = jnp.take_along_axis(logits, safe_targets[..., None], axis=-1)[..., 0]
-    sum_logits = jnp.sum(logits, axis=-1)
+    target_logit = jnp.take_along_axis(logits, safe_targets[..., None], axis=-1)[..., 0].astype(jnp.float32)
+    sum_logits = jnp.sum(logits, axis=-1, dtype=jnp.float32)
     return (1.0 - eff_target_w) * target_logit - low_conf * sum_logits - norm_const
 
 

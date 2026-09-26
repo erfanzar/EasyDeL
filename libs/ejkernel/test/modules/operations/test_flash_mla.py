@@ -90,7 +90,8 @@ def _mla_dense_reference(
         logits = logits_soft_cap * jnp.tanh(logits / logits_soft_cap)
 
     if sliding_window is not None:
-        left_w, right_w = (sliding_window, sliding_window) if isinstance(sliding_window, int) else sliding_window
+        # int ``W`` = HF window size (query plus ``W - 1`` neighbours); tuples are inclusive distances.
+        left_w, right_w = (sliding_window - 1, sliding_window - 1) if isinstance(sliding_window, int) else sliding_window
         q_pos = jnp.arange(seq_q)[:, None]
         k_pos = jnp.arange(kv_len)[None, :]
         win = (k_pos >= q_pos - left_w) & (k_pos <= q_pos + right_w)

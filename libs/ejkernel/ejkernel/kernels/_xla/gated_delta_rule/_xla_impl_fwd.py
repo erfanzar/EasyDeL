@@ -229,10 +229,12 @@ def _recurrent_gdr_fwd(
     else:
         initial_state = initial_state.astype(jnp.float32)
 
+    # Log-decay and its per-chunk cumsum stay fp32: a bf16 cumsum over a chunk loses
+    # ~1 unit at magnitude ~100-300, which exp(g_i - g_j) turns into O(1) relative error.
     if decay is None:
-        decay = jnp.zeros((B, H, L), dtype=input_dtype)
+        decay = jnp.zeros((B, H, L), dtype=jnp.float32)
     else:
-        decay = decay.astype(input_dtype)
+        decay = decay.astype(jnp.float32)
 
     seg_hc = None
     valid_hc = None

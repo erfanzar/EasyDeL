@@ -1223,14 +1223,15 @@ def _bwd_attention_kernel_call(
         sliding_flag = False
     else:
         if isinstance(sliding_window, int):
-            window_left = int(sliding_window)
-            window_right = 0 if causal else int(sliding_window)
+            # An int is a window *size* (HF convention): the query plus its ``W - 1`` neighbours.
+            window_left = max(int(sliding_window) - 1, 0)
+            window_right = 0 if causal else window_left
         else:
             wl, wr = sliding_window
             window_left = int(wl)
             window_right = int(wr)
         assert window_left >= 0 and window_right >= 0
-        sliding_flag = (window_left > 0) or (window_right > 0)
+        sliding_flag = isinstance(sliding_window, int) or (window_left > 0) or (window_right > 0)
 
     if logits_soft_cap is None:
         logits_soft_cap_val = 0.0

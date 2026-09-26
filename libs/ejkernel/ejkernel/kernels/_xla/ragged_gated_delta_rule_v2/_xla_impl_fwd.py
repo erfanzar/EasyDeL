@@ -408,7 +408,8 @@ def ragged_gated_delta_rule_mixed_prefill(
         state_indices: Per-request mapping into ``recurrent_state``,
             shape ``(num_requests,)``.
         distribution: Triple ``[decode_end, prefill_end, total]``; the
-            third entry gates which slots have outputs to write.
+            third entry bounds the positional row prefix whose slots are
+            written. Empty (``q_len == 0``) rows in it keep their slot.
         has_initial_state: Boolean tensor marking requests whose recurrent
             state slot should be used as the initial prefill state. Requests
             without initial state start from zeros even if the slot contains
@@ -451,7 +452,7 @@ def ragged_gated_delta_rule_mixed_prefill(
         packed_value,
         packed_g,
         packed_beta,
-        reset_mask,
+        _,
         new_query_start_loc,
         padded_indices_valid,
     ) = pack_inputs_single_stream(
@@ -575,8 +576,17 @@ def ragged_gated_delta_rule_mixed_prefill(
     g_i_last_exp_scan = g_i_last_exp_chunks
     k_i_g_diff_scan = k_i_g_diff_chunks
 
-    init_h_per_chunk = jnp.zeros((num_chunks, H, K_dim, V_dim), dtype=recurrent_state.dtype)
-    start_chunk_indices = new_query_start_loc[:-1] // chunk_size
+    # Empty (q_len == 0) rows own no chunk: their start chunk aliases the next
+    # row's, so they are routed out of range and dropped from the scatters.
+    num_seqs = new_query_start_loc.shape[0] - 1
+    seq_is_nonempty = new_query_start_loc[1:] > new_query_start_loc[:-1]
+    start_chunk_indices = jnp.where(seq_is_nonempty, new_query_start_loc[:-1] // chunk_size, num_chunks)
+    reset_mask = jnp.zeros((num_chunks,), dtype=bool).at[start_chunk_indices].set(True, mode="drop")
+    init_seq_per_chunk = (
+        jnp.zeros((num_chunks,), dtype=jnp.int32)
+        .at[start_chunk_indices]
+        .set(jnp.arange(num_seqs, dtype=jnp.int32), mode="drop")
+    )
     init_states_for_seqs = recurrent_state[state_indices]
     if mask_initial_state:
         init_states_for_seqs = jnp.where(
@@ -584,7 +594,6 @@ def ragged_gated_delta_rule_mixed_prefill(
             init_states_for_seqs,
             jnp.zeros_like(init_states_for_seqs),
         )
-    init_h_per_chunk = init_h_per_chunk.at[start_chunk_indices].set(init_states_for_seqs)
 
     h_init = jnp.zeros((H, K_dim, V_dim), dtype=jnp.float32)
 
@@ -596,22 +605,22 @@ def ragged_gated_delta_rule_mixed_prefill(
         g_i_last_exp_scan,
         k_i_g_diff_scan,
         reset_mask,
-        init_h_per_chunk,
+        init_seq_per_chunk,
     )
 
     def scan_body(h, args):
         """Inter-chunk recurrence body for the chunked GDR prefill scan.
 
-        For each chunk, optionally resets the state to the per-request
-        initial state (``init_h``), applies the carried-over recurrent
-        contribution to produce the chunk output, and advances the state
-        through the chunk using the accumulated gated decay.
+        For each chunk, optionally resets the state to the owning request's
+        initial state (``init_states_for_seqs[init_seq]``), applies the
+        carried-over recurrent contribution to produce the chunk output, and
+        advances the state through the chunk using the accumulated gated decay.
 
         Args:
             h: Current recurrent state of shape ``(H, K_dim, V_dim)``.
             args: Tuple of per-chunk tensors and flags
                 ``(w, u, q_g, attn_i, g_i_last_exp, k_i_g_diff, reset,
-                init_h)`` produced by the surrounding chunked algorithm.
+                init_seq)`` produced by the surrounding chunked algorithm.
 
         Returns:
             tuple: ``(h_new, (o_c, h_new))`` — ``h_new`` is the updated
@@ -619,9 +628,9 @@ def ragged_gated_delta_rule_mixed_prefill(
             ``(H, chunk_size, V_dim)``, and ``h_new`` is also emitted as
             scan output for downstream use.
         """
-        w, u, q_g, attn_i, g_i_last_exp, k_i_g_diff, reset, init_h = args
+        w, u, q_g, attn_i, g_i_last_exp, k_i_g_diff, reset, init_seq = args
 
-        h = jnp.where(reset, init_h, h)
+        h = jnp.where(reset, init_states_for_seqs[init_seq].astype(jnp.float32), h)
 
         attn_inter = jnp.matmul(
             q_g,
@@ -671,15 +680,13 @@ def ragged_gated_delta_rule_mixed_prefill(
     last_chunk_indices = (new_query_start_loc[1:] // chunk_size) - 1
     final_states = h_chunks[last_chunk_indices]
 
-    num_seqs = last_chunk_indices.shape[0]
-    valid_seq_mask = jnp.arange(num_seqs) < distribution[2]
-    current_states = recurrent_state[state_indices]
-    states_to_set = jnp.where(
-        valid_seq_mask[:, None, None, None],
-        final_states.astype(recurrent_state.dtype),
-        current_states,
-    ).astype(recurrent_state.dtype)
-    updated_recurrent_state = recurrent_state.at[state_indices].set(states_to_set)
+    # Inactive and empty rows keep their slot untouched: their writes are
+    # routed out of range and dropped.
+    valid_seq_mask = (jnp.arange(num_seqs) < distribution[2]) & seq_is_nonempty
+    write_indices = jnp.where(valid_seq_mask, state_indices, recurrent_state.shape[0])
+    updated_recurrent_state = recurrent_state.at[write_indices].set(
+        final_states.astype(recurrent_state.dtype), mode="drop"
+    )
 
     return updated_recurrent_state, output
 
@@ -739,6 +746,44 @@ def recurrent_gated_delta_rule_step(
     return out, new_state
 
 
+def _decode_token_slots(
+    query_start_loc: jnp.ndarray,
+    state_indices: jnp.ndarray,
+    num_valid_seqs: jnp.ndarray,
+    num_tokens: int,
+    num_slots: int,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Map every packed decode token to the state slot of the row that owns it.
+
+    Rows ``[0, num_valid_seqs)`` are positional and may be empty
+    (``q_len == 0``): a token belongs to the last row starting at or before it,
+    so empty rows never claim another row's token. Tokens outside
+    ``[query_start_loc[0], query_start_loc[num_valid_seqs])`` are padding.
+
+    Args:
+        query_start_loc: Cumulative per-row token offsets, shape
+            ``(num_rows + 1,)``.
+        state_indices: Row-to-slot mapping, shape ``(num_rows,)``.
+        num_valid_seqs: Scalar number of positional rows in use.
+        num_tokens: Static number of packed tokens.
+        num_slots: Static size of the state pool.
+
+    Returns:
+        tuple: ``(token_slots, write_slots, valid_mask)`` of shape
+        ``(num_tokens,)``. ``token_slots`` is always in range (safe to gather);
+        ``write_slots`` is ``num_slots`` for padding tokens so ``mode="drop"``
+        scatters never write their state.
+    """
+    last_valid_loc = query_start_loc[num_valid_seqs]
+    valid_loc_mask = jnp.arange(query_start_loc.shape[0]) <= num_valid_seqs
+    effective_query_start_loc = jnp.where(valid_loc_mask, query_start_loc, last_valid_loc)
+    token_rows = jnp.searchsorted(effective_query_start_loc, jnp.arange(num_tokens), side="right") - 1
+    valid_mask = (token_rows >= 0) & (token_rows < num_valid_seqs)
+    token_slots = state_indices[jnp.clip(token_rows, 0, state_indices.shape[0] - 1)]
+    write_slots = jnp.where(valid_mask, token_slots, num_slots)
+    return token_slots, write_slots, valid_mask
+
+
 def ragged_gated_delta_rule_decode_only(
     query: jnp.ndarray,
     key: jnp.ndarray,
@@ -753,7 +798,7 @@ def ragged_gated_delta_rule_decode_only(
     distribution: jnp.ndarray,
     use_qk_norm_in_gdn: bool,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Applies gated delta rule for decode-only case (sequence lengths = 1).
+    """Applies gated delta rule for decode-only case (sequence lengths <= 1).
 
     Args:
         query: Per-token queries ``(num_tokens, n_v, d_k)`` (already
@@ -771,66 +816,61 @@ def ragged_gated_delta_rule_decode_only(
             ``(num_requests + 1,)``.
         state_indices: Request-to-slot mapping, shape ``(num_requests,)``.
         distribution: ``[decode_end, prefill_end, total]`` int32 triple;
-            ``distribution[2]`` is consulted to mask outputs of inactive
-            tokens.
+            ``distribution[2]`` bounds the positional row prefix. Rows in it
+            carry at most one token; empty rows are skipped.
         use_qk_norm_in_gdn: Whether to L2-normalize Q and K before the
             decode update.
 
     Returns:
         tuple: ``(updated_recurrent_state, output)`` where the state has
         shape ``(num_blocks, n_v, d_k, d_v)`` and the output has shape
-        ``(num_tokens, n_v * d_v)``. Output rows for tokens with
-        ``token_idx >= distribution[2]`` are zeroed and the corresponding
-        state slots are left untouched.
+        ``(num_tokens, n_v * d_v)``. Output rows for padding tokens (at or
+        past ``query_start_loc[distribution[2]]``) are zeroed; slots of empty,
+        inactive, and padding rows are left untouched.
     """
     num_tokens = query.shape[0]
-    max_reqs = recurrent_state.shape[0]
     d_k = query.shape[-1]
 
-    token_idx = jnp.arange(num_tokens)
-    valid_mask = token_idx < distribution[2]
+    token_slots, write_slots, valid_mask = _decode_token_slots(
+        query_start_loc,
+        state_indices,
+        distribution[2],
+        num_tokens,
+        recurrent_state.shape[0],
+    )
 
-    # Preprocess on-device:
-    #   - sigmoid/softplus/exp
-    #   - L2 normalization + scaling
+    # The whole recurrence stays in float32: rounding the per-step decay to a
+    # low-precision dtype (e.g. bf16 turns exp(-1e-3) into 1.0) silently
+    # removes it and the error compounds across decode steps.
+    query = query.astype(jnp.float32)
+    key = key.astype(jnp.float32)
     if use_qk_norm_in_gdn:
         query = l2norm(query)
         key = l2norm(key)
-    scale = jnp.asarray(d_k**-0.5, dtype=jnp.float32)
-    query = (query.astype(jnp.float32) * scale).astype(query.dtype)
-    beta = jax.nn.sigmoid(b_reshaped.astype(jnp.float32)).astype(b_reshaped.dtype)
+    query = query * jnp.asarray(d_k**-0.5, dtype=jnp.float32)
+    beta = jax.nn.sigmoid(b_reshaped.astype(jnp.float32))
     g = -jnp.exp(A_log.astype(jnp.float32)) * jax.nn.softplus(
         a_reshaped.astype(jnp.float32) + dt_bias.astype(jnp.float32)[None, :]
     )
+    exp_g = jnp.exp(g)
 
-    exp_g = jnp.exp(g).astype(query.dtype)
-
-    # Generic fallback (non-identity state map, smaller D_K/D_V, or non-TPU):
-    # original gather-compute-scatter implementation.
-    req_indices = jnp.clip(token_idx, 0, max_reqs - 1)
-    req_state_indices = state_indices[req_indices]
-    current_states = recurrent_state[req_state_indices]
-
-    state_f = current_states.astype(jnp.float32)
-    k_f = key.astype(jnp.float32)
-    q_f = query.astype(jnp.float32)
+    state_f = recurrent_state[token_slots].astype(jnp.float32)
     v_f = value.astype(jnp.float32)
-    exp_g_f = exp_g.astype(jnp.float32)
+    precision = jax.lax.Precision.HIGHEST
 
-    k_state = jnp.einsum("bhd,bhdm->bhm", k_f, state_f)
-    q_state = jnp.einsum("bhd,bhdm->bhm", q_f, state_f)
-    v_new = beta.astype(jnp.float32)[..., None] * (v_f - exp_g_f[..., None] * k_state)
-    q_k = jnp.sum(q_f * k_f, axis=-1, keepdims=True)
-    outputs = exp_g_f[..., None] * q_state + q_k * v_new
-    k_v_new = k_f[..., :, None] * v_new[..., None, :]
-    new_states = state_f * exp_g_f[..., None, None] + k_v_new
+    k_state = jnp.einsum("bhd,bhdm->bhm", key, state_f, precision=precision)
+    q_state = jnp.einsum("bhd,bhdm->bhm", query, state_f, precision=precision)
+    v_new = beta[..., None] * (v_f - exp_g[..., None] * k_state)
+    q_k = jnp.sum(query * key, axis=-1, keepdims=True)
+    outputs = exp_g[..., None] * q_state + q_k * v_new
+    k_v_new = key[..., :, None] * v_new[..., None, :]
+    new_states = state_f * exp_g[..., None, None] + k_v_new
 
     outputs = jnp.where(valid_mask[:, None, None], outputs, 0.0)
     outputs = outputs.reshape(num_tokens, -1)
-    states_to_set = jnp.where(valid_mask[:, None, None, None], new_states, state_f).astype(recurrent_state.dtype)
-    updated_recurrent_state = recurrent_state.at[req_state_indices].set(states_to_set)
+    updated_recurrent_state = recurrent_state.at[write_slots].set(new_states.astype(recurrent_state.dtype), mode="drop")
 
-    return updated_recurrent_state.astype(recurrent_state.dtype), outputs
+    return updated_recurrent_state, outputs
 
 
 @jax.jit(
@@ -895,6 +935,8 @@ def ragged_gated_delta_rule(
         distribution: ``int32[3]`` ``(decode_end, prefill_end, mixed_end)``
             classifying scheduled requests; controls the
             ``decode_only_branch`` / ``mixed_prefill_branch`` selection.
+            ``mixed_end`` bounds the positional row prefix; empty
+            (``q_len == 0``) rows inside it are skipped by both branches.
         has_initial_state: Optional boolean array of shape
             ``(num_requests,)`` flagging which requests carry a non-empty
             initial recurrent state. Defaults to all-``True`` when ``None``;
@@ -1036,8 +1078,10 @@ def ragged_gated_delta_rule_v2(
     """Run the unsharded packed-inference GDN v2 XLA kernel.
 
     Thin entry wrapper around :func:`ragged_gated_delta_rule` that first
-    casts every floating input to a common ``runtime_dtype`` and defaults
+    casts the activations to a common ``runtime_dtype`` and defaults
     ``has_initial_state`` before dispatching to the (jitted) chunked kernel.
+    The recurrent state keeps its storage dtype in and out, and the gate
+    parameters are used in float32.
     Use this for the single-device / unsharded path.
 
     Args:
@@ -1071,8 +1115,8 @@ def ragged_gated_delta_rule_v2(
             unchanged; not consumed by the implementation. Defaults to False.
         mask_initial_state: When True, use ``has_initial_state`` to zero stale
             recurrent slots for fresh prefill requests. Defaults to False.
-        runtime_dtype: Common dtype to cast all floating inputs into before
-            running the kernel. Defaults to ``mixed_qkv.dtype`` when ``None``.
+        runtime_dtype: Common dtype for ``mixed_qkv``, ``a`` and ``b``.
+            Defaults to ``mixed_qkv.dtype`` when ``None``.
 
     Returns:
         tuple: ``(updated_recurrent_state, output)`` with state of shape
@@ -1084,9 +1128,8 @@ def ragged_gated_delta_rule_v2(
     mixed_qkv = mixed_qkv.astype(runtime_dtype)
     b = b.astype(runtime_dtype)
     a = a.astype(runtime_dtype)
-    recurrent_state = recurrent_state.astype(runtime_dtype)
-    A_log = A_log.astype(runtime_dtype)
-    dt_bias = dt_bias.astype(runtime_dtype)
+    A_log = A_log.astype(jnp.float32)
+    dt_bias = dt_bias.astype(jnp.float32)
     if has_initial_state is None:
         has_initial_state = jnp.ones(state_indices.shape[0], dtype=jnp.bool_)
 

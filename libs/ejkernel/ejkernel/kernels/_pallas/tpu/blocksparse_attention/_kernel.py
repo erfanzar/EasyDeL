@@ -2730,7 +2730,7 @@ def blocksparse_attention(
         softmax_scale: Attention score scaling factor (default: 1/sqrt(head_dim))
         mask_builder: Custom mask builder function
         sliding_window: Sliding window size. Can be:
-            - int: symmetric window (same size left and right)
+            - int: Window size ``W`` (HF convention; same as ``(W - 1, W - 1)``)
             - tuple[int, int]: (left_window, right_window) for asymmetric
             - None: no sliding window
         chunk_size: Size of chunks for chunked causal attention (like Llama4)
@@ -2784,7 +2784,8 @@ def blocksparse_attention(
 
             elif sliding_window is not None:
                 if isinstance(sliding_window, int):
-                    left_window = right_window = sliding_window
+                    # An int is a window *size* (HF convention): the query plus its ``W - 1`` neighbours.
+                    left_window = right_window = max(sliding_window - 1, 0)
                 else:
                     left_window, right_window = sliding_window
 

@@ -393,7 +393,8 @@ def _window_to_bounds(sliding_window: int | tuple[int, int] | None) -> tuple[int
     if sliding_window is None:
         return -1, -1
     if isinstance(sliding_window, int):
-        w = int(sliding_window)
+        # An int is a window *size* (HF convention): the query plus its ``W - 1`` neighbours.
+        w = max(int(sliding_window) - 1, 0)
         return w, w
     left, right = sliding_window
     return int(left), int(right)

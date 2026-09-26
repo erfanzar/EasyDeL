@@ -370,6 +370,13 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
                 if mSize % cfg.block_m:
                     padded_size = cfg.block_m - mSize % cfg.block_m
                     lhs = jax.lax.pad(lhs, jnp.array(0.0, dtype=lhs.dtype), [(0, padded_size, 0), (0, 0, 0)])
+                    if existing_out is not None:
+                        # Keep the accumulator row count in lockstep with the padded lhs.
+                        existing_out = jax.lax.pad(
+                            existing_out,
+                            jnp.array(0.0, dtype=existing_out.dtype),
+                            [(0, padded_size, 0), (0, 0, 0)],
+                        )
             if cfg.block_k > 0 and cfg.block_n > 0:
                 tiling = (min(cfg.block_m, mSize), min(cfg.block_k, kSize), min(cfg.block_n, nSize))
             # block_k/block_n <= 0 is a sentinel: leave tiling=None so the

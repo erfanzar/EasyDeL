@@ -107,7 +107,8 @@ def flash_mla(
         if isinstance(sliding_window, int):
             if sliding_window < 0:
                 raise ValueError("sliding_window must be non-negative.")
-            window_tuple = (int(sliding_window), int(sliding_window))
+            # An int is a window *size* (HF convention): the query plus its ``W - 1`` neighbours.
+            window_tuple = (max(int(sliding_window) - 1, 0), max(int(sliding_window) - 1, 0))
         else:
             wl, wr = sliding_window
             if wl < 0 or wr < 0:

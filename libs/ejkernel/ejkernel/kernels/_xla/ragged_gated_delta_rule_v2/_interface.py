@@ -67,8 +67,8 @@ def ragged_gated_delta_rule_v2(
     Gated Delta Rule recurrence over a ragged, continuous-batching token buffer
     where many requests of heterogeneous lengths share one contiguous stream.
     Inputs are jaxtyping/beartype checked, then forwarded verbatim to the
-    underlying XLA forward implementation, which casts everything to a runtime
-    dtype and routes to either the decode-only fast path (all requests advance
+    underlying XLA forward implementation, which casts the activations to a
+    runtime dtype (the state keeps its dtype) and routes to either the decode-only fast path (all requests advance
     by one token) or the chunked mixed-prefill path (some request has more than
     one new token).
 
@@ -97,7 +97,8 @@ def ragged_gated_delta_rule_v2(
             ``(num_requests,)``.
         distribution: ``int32`` triple ``(decode_end, prefill_end, total)``;
             ``decode_end == total`` selects the decode-only branch and
-            ``total`` gates which slots have valid outputs/state writes.
+            ``total`` bounds the positional row prefix whose slots are written.
+            Empty (``q_len == 0``) rows inside it are skipped.
         has_initial_state: Optional boolean flags per request indicating which
             carry a non-empty initial recurrent state, shape
             ``(num_requests,)``. Defaults to all-``True`` when ``None``;
@@ -121,8 +122,9 @@ def ragged_gated_delta_rule_v2(
             ignored by the XLA implementation.
         use_fused_gdn_decode: Accepted for API compatibility with TPU Pallas;
             ignored by the XLA implementation.
-        runtime_dtype: Optional dtype that all float inputs are cast to before
-            the recurrence. When ``None``, ``mixed_qkv.dtype`` is used.
+        runtime_dtype: Optional dtype for ``mixed_qkv``, ``a`` and ``b``. When
+            ``None``, ``mixed_qkv.dtype`` is used. ``recurrent_state`` keeps its
+            dtype in and out and ``A_log``/``dt_bias`` are used in float32.
 
     Returns:
         tuple: ``(updated_recurrent_state, output)`` where

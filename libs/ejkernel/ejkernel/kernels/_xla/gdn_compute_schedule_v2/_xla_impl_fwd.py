@@ -203,8 +203,12 @@ def compute_schedule_table_v2(
 
     valid_mask = glob_idxs < num_tokens
     t_reqs = jnp.sum(glob_idxs[:, :, None] >= fixed_query_start_loc[None, None, :], axis=-1) - 1
-    last_valid_seq = jnp.max(jnp.where(total_blocks_per_seq > 0, jnp.arange(num_seqs), -1))
-    t_reqs = jnp.where(valid_mask, t_reqs, last_valid_seq)
+    # Padding rows past the last token belong to the request that owns that
+    # token, so they arrive after its last-token flag and stay inert. (The last
+    # request with blocks of its own can be an earlier one whose transition
+    # block swallowed the tail; reopening it would corrupt its final state.)
+    last_token_seq = jnp.sum((num_tokens - 1) >= fixed_query_start_loc) - 1
+    t_reqs = jnp.where(valid_mask, t_reqs, last_token_seq)
     t_reqs = jnp.minimum(jnp.maximum(t_reqs, 0), num_seqs - 1)
 
     is_first_tok = (glob_idxs == query_start_loc[t_reqs]).astype(jnp.int32)

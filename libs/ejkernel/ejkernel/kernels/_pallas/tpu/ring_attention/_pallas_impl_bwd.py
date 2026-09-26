@@ -194,7 +194,8 @@ def _ring_attention_forward(
 
     if sliding_window is not None:
         if isinstance(sliding_window, int):
-            sw_left, sw_right = sliding_window, sliding_window
+            # An int is a window *size* (HF convention): the query plus its ``W - 1`` neighbours.
+            sw_left = sw_right = max(sliding_window - 1, 0)
         else:
             sw_left, sw_right = sliding_window
 
