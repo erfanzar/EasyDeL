@@ -56,28 +56,51 @@ def scaled_dot_product_attention(
 
     Returns:
         Attention output of shape ``(..., seq_q, head_dim)``.
+
+    Raises:
+        ValueError: If dropout is enabled without a PRNG key, or the
+            dropout probability is outside ``[0, 1)``.
     """
+    if not 0.0 <= dropout_rate < 1.0:
+        raise ValueError("dropout_rate must be in [0, 1)")
+    if dropout_rate > 0.0 and key is None:
+        raise ValueError("dropout_rate > 0 requires a PRNG key")
     qa = jnp.asarray(q)
     ka = jnp.asarray(k)
     va = jnp.asarray(v)
     d = qa.shape[-1]
     s = scale if scale is not None else 1.0 / math.sqrt(d)
-    logits = jnp.einsum("...qd,...kd->...qk", qa, ka) * s
-    mask_fill = jnp.asarray(DEFAULT_MASK_VALUE, dtype=logits.dtype)
+    out_dtype = jnp.result_type(qa.dtype, ka.dtype, va.dtype)
+    # Logits, softmax and the value reduction accumulate in at least float32, never in a
+    # bf16/fp16 activation dtype; the result is cast back to the input dtype.
+    acc_dtype = jnp.promote_types(out_dtype, jnp.float32)
+    if not jnp.issubdtype(out_dtype, jnp.inexact):
+        # Integral / bool inputs: attention outputs are fractional averages, so return the
+        # floating accumulation dtype instead of truncating to an integer (r11 S14-1).
+        out_dtype = acc_dtype
+    logits = jnp.einsum("...qd,...kd->...qk", qa, ka, preferred_element_type=acc_dtype).astype(acc_dtype) * s
+    mask_fill = jnp.asarray(DEFAULT_MASK_VALUE, dtype=acc_dtype)
+    allowed = None
     if is_causal:
         q_len = qa.shape[-2]
         k_len = ka.shape[-2]
-        causal = jnp.tril(jnp.ones((q_len, k_len), dtype=jnp.bool_), k=k_len - q_len)
-        logits = jnp.where(causal, logits, mask_fill)
+        allowed = jnp.tril(jnp.ones((q_len, k_len), dtype=jnp.bool_), k=k_len - q_len)
     if mask is not None:
         m = jnp.asarray(mask)
         if m.dtype == jnp.bool_:
-            logits = jnp.where(m, logits, mask_fill)
+            allowed = m if allowed is None else jnp.logical_and(allowed, m)
         else:
-            logits = logits + m
+            logits = logits + m.astype(acc_dtype)
+    if allowed is not None:
+        logits = jnp.where(allowed, logits, mask_fill)
     attn = jax.nn.softmax(logits, axis=-1)
+    if allowed is not None:
+        # A row with no allowed key would otherwise softmax the uniform fill value and
+        # average disallowed values; it must produce zero context instead.
+        attn = jnp.where(jnp.any(allowed, axis=-1, keepdims=True), attn, 0.0)
     if dropout_rate > 0.0 and key is not None:
         keep_rate = 1.0 - dropout_rate
         drop_mask = jax.random.bernoulli(key, keep_rate, shape=attn.shape)
         attn = jnp.where(drop_mask, attn / keep_rate, 0.0)
-    return jnp.einsum("...qk,...kd->...qd", attn, va)
+    out = jnp.einsum("...qk,...kd->...qd", attn, va.astype(acc_dtype))
+    return out.astype(out_dtype)

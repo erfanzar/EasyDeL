@@ -432,6 +432,14 @@ class LocalPath(UniversalPath):
         """
         self.path = Path(path)
 
+    def __fspath__(self) -> str:
+        """Return the filesystem path so ``LocalPath`` is ``os.PathLike``.
+
+        Libraries that call ``os.path``/``os.stat`` on a path argument (for example transformers'
+        ``resolve_revision`` in ``get_config_dict``) reject objects without ``__fspath__``.
+        """
+        return str(self.path)
+
     def exists(self) -> bool:
         return self.path.exists()
 
@@ -534,6 +542,14 @@ class LocalPath(UniversalPath):
             new_path = self.path.rename(target.path)
         else:
             new_path = self.path.rename(Path(str(target)))
+        return LocalPath(new_path)
+
+    def replace(self, target: "LocalPath") -> "LocalPath":
+        """Atomically replace a local target even when it already exists."""
+        if isinstance(target, LocalPath):
+            new_path = self.path.replace(target.path)
+        else:
+            new_path = self.path.replace(Path(str(target)))
         return LocalPath(new_path)
 
     def stat(self) -> dict[str, Any]:

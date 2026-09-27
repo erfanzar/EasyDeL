@@ -627,6 +627,11 @@ def bind(graphdef: GraphDef, state: State) -> Module:
                 if not isinstance(key, str):
                     raise GraphStructureError(f"Module node has non-str key {key!r}")
                 object.__setattr__(instance, key, child_obj)
+                # Purge stale static/opaque entries recorded under the same
+                # name by an older `__setattr__` (pre-purge checkpoints) so
+                # they cannot shadow the child on the next export.
+                instance._spx_static.pop(key, None)
+                instance._spx_opaque.pop(key, None)
                 if key not in instance._spx_attr_order:
                     instance._spx_attr_order.append(key)
 

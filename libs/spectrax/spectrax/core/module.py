@@ -607,14 +607,22 @@ class Module:
 
         if is_static and not (is_module or is_variable or is_opaque):
             self._spx_static[name] = value
+            self._spx_opaque.pop(name, None)
             object.__setattr__(self, name, _public_value(value))
             return
 
         if is_opaque:
             self._spx_opaque[name] = value
+            self._spx_static.pop(name, None)
             object.__setattr__(self, name, _public_value(value))
             return
 
+        # Modules and Variables are graph children: purge any bookkeeping a
+        # previous assignment recorded under this name (static/opaque) so the
+        # stale entry cannot shadow the child during export/bind or pytree
+        # unflatten.
+        self._spx_static.pop(name, None)
+        self._spx_opaque.pop(name, None)
         object.__setattr__(self, name, value)
 
     def __delattr__(self, name: str) -> None:
@@ -1540,8 +1548,16 @@ def _module_unflatten(aux: _ModuleAux, leaves: object) -> Module:
     object.__setattr__(m, "_spx_policy", aux.policy)
     object.__setattr__(m, "_spx_opaque", dict(aux.opaque))
     for opaque_name, opaque_value in aux.opaque.items():
-        if not opaque_name.startswith("_") and opaque_name not in m._spx_attr_order:
-            m._spx_attr_order.append(opaque_name)
+        if not opaque_name.startswith("_"):
+            if isinstance(getattr(m, opaque_name, None), Module | Variable):
+                # Stale opaque bookkeeping for a name that is a graph child
+                # (recorded before `__setattr__` purged cross-kind entries,
+                # e.g. in an older checkpoint): drop it instead of clobbering
+                # the child restored by `bind`.
+                m._spx_opaque.pop(opaque_name, None)
+                continue
+            if opaque_name not in m._spx_attr_order:
+                m._spx_attr_order.append(opaque_name)
         object.__setattr__(m, opaque_name, _public_value(opaque_value))
     return m
 

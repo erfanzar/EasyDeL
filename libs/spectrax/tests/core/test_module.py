@@ -854,3 +854,75 @@ def test_module_dict_setitem_invalidates_parent_export_cache():
     _g, s = export(m)
 
     assert ("parameters", "layers.b.w") in set(s.paths())
+
+
+def test_setattr_opaque_to_module_survives_export_bind_and_pytree():
+    """Replacing an opaque attribute with a submodule keeps it a child through export/bind and pytree."""
+    from spectrax.core.graph import bind, export
+
+    class M(Module):
+        """Fixture module for testing."""
+
+        def __init__(self):
+            """Initialize with an opaque ``cfg`` and a child ``head``."""
+            super().__init__()
+            self.cfg = {"depth": 1}
+            self.head = Leaf()
+
+        def forward(self, x):
+            """Run the forward pass."""
+            return self.head(x)
+
+    m = M()
+    m.cfg = Leaf()
+
+    rebound = bind(*export(m))
+    assert isinstance(rebound.cfg, Leaf)
+    assert ("parameters", "cfg.w") in set(export(rebound)[1].paths())
+
+    leaves, treedef = jax.tree_util.tree_flatten(m)
+    restored = jax.tree_util.tree_unflatten(treedef, leaves)
+    assert isinstance(restored.cfg, Leaf)
+    assert ("parameters", "cfg.w") in set(export(restored)[1].paths())
+
+
+def test_setattr_static_to_module_does_not_resurface_as_static():
+    """A name reassigned from a static scalar to a submodule must not reappear as the old static."""
+    from spectrax.core.graph import bind, export
+
+    class M(Module):
+        """Fixture module for testing."""
+
+        def __init__(self):
+            """Initialize with a static ``size``."""
+            super().__init__()
+            self.size = 3
+
+        def forward(self, x):
+            """Run the forward pass."""
+            return x
+
+    m = M()
+    m.size = Leaf()
+
+    rebound = bind(*export(m))
+    assert isinstance(rebound.size, Leaf)
+    leaves, treedef = jax.tree_util.tree_flatten(m)
+    restored = jax.tree_util.tree_unflatten(treedef, leaves)
+    assert isinstance(restored.size, Leaf)
+    assert ("parameters", "size.w") in set(export(restored)[1].paths())
+
+
+def test_setattr_module_to_static_keeps_static_binding():
+    """A name reassigned from a submodule to a static scalar binds back as the scalar."""
+    from spectrax.core.graph import bind, export
+
+    m = Parent()
+    m.a = 7
+
+    rebound = bind(*export(m))
+    assert rebound.a == 7
+    leaves, treedef = jax.tree_util.tree_flatten(m)
+    restored = jax.tree_util.tree_unflatten(treedef, leaves)
+    assert restored.a == 7
+    assert ("parameters", "a.w") not in set(export(restored)[1].paths())

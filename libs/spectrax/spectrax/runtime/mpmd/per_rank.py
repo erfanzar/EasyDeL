@@ -53,6 +53,7 @@ import jax
 import jax.numpy as jnp
 
 from ..schedules import Action, FusedTask, GPipe, Phase, Schedule
+from .utils.tree import _scale_grad
 
 __all__ = [
     "compile_per_rank_bwd",
@@ -365,5 +366,5 @@ def run_gpipe_per_rank(
 
     inv_m = 1.0 / jnp.asarray(microbatches, dtype=loss_sum.dtype)
     mean_loss = loss_sum * inv_m
-    mean_grads = jax.tree.map(lambda g: g * inv_m, tuple(grads))
+    mean_grads = jax.tree.map(lambda g: _scale_grad(g, inv_m), tuple(grads))
     return mean_loss, mean_grads

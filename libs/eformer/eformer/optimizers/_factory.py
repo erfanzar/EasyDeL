@@ -17,6 +17,7 @@ import dataclasses
 import difflib
 import inspect
 import typing as tp
+import warnings
 from dataclasses import fields
 
 import jax
@@ -262,6 +263,20 @@ class OptimizerFactory:
         if scheduler_config is None:
             scheduler_config = SchedulerConfig()
         cls._convert_dtypes(optimizer_config)
+        # Warn on kwargs that were not consumed into the config instead of
+        # silently dropping them (e.g. a misspelled optimizer setting). Some
+        # generic keys (e.g. `mu_dtype`) legitimately apply to only a subset
+        # of optimizers, so this stays a warning rather than an error.
+        for kwarg, value in kwargs.items():
+            if value is None:
+                # Unset generic keys (easydel always forwards e.g. `mu_dtype=None`)
+                # carry no setting, so dropping them loses nothing.
+                continue
+            warnings.warn(
+                f"Key {kwarg!r} is not used by {type(optimizer_config).__name__} "
+                f"(optimizer {optimizer_type!r}); it will be ignored.",
+                stacklevel=2,
+            )
 
         if not isinstance(optimizer_config, config_cls):
             raise TypeError(

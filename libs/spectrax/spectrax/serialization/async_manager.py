@@ -62,6 +62,14 @@ def _is_array_like(x):
     return hasattr(x, "shape") and hasattr(x, "dtype")
 
 
+def _dtype_name(dtype) -> str | None:
+    """Return a canonical dtype name for the structure sidecar, or ``None`` if unrepresentable."""
+    try:
+        return str(jnp.dtype(dtype))
+    except TypeError:
+        return None
+
+
 def _leaf_target_dtype(target_dtype, storage_dtype):
     """Resolve the read dtype for one leaf, preserving non-float storage.
 
@@ -890,25 +898,37 @@ class AsyncCheckpointManager:
             return root
 
         index_path = _fs.joinpath(root, "tensorstore_index.json")
-        if not _fs.exists(index_path):
+        if not array_keys:
+            # Array-free tree (only ints / strings / None / empty containers): no TensorStore
+            # arrays and no index entry exist, so the structure sidecar alone is the checkpoint.
+            array_relpaths = []
+        elif not write_index:
+            # ``write_index=False``: the index was intentionally skipped, so any
+            # index already on disk (another prefix, or an older save) is not
+            # authoritative for this save. Derive the TensorStore relative paths
+            # in memory — they are a deterministic function of the leaf keys
+            # (dots become path separators, mirroring ``_fs_paths_from_key_paths``).
+            array_relpaths = [key.replace(".", "/") for key in array_keys]
+        elif _fs.exists(index_path):
+            idx = json.loads(_fs.read_text(index_path))
+            arrays_info = idx.get("prefixes", {}).get(prefix, [])
+            if not arrays_info:
+                raise ValueError(f"No arrays recorded in index for prefix={prefix!r}")
+
+            relpaths_from_index = [str(info["path"]) for info in arrays_info]
+            keys_from_index = [".".join(p.split("/")) for p in relpaths_from_index]
+            if set(keys_from_index) != set(array_keys):
+                missing = set(array_keys) - set(keys_from_index)
+                extra = set(keys_from_index) - set(array_keys)
+                raise ValueError(
+                    f"TensorStore index keys mismatch for prefix={prefix!r}. "
+                    f"Missing: {sorted(missing)}; Extra: {sorted(extra)}"
+                )
+
+            key_to_rel = dict(zip(keys_from_index, relpaths_from_index, strict=False))
+            array_relpaths = [key_to_rel[k] for k in array_keys]
+        else:
             raise FileNotFoundError(f"Missing tensorstore_index.json in {root}")
-        idx = json.loads(_fs.read_text(index_path))
-        arrays_info = idx.get("prefixes", {}).get(prefix, [])
-        if not arrays_info:
-            raise ValueError(f"No arrays recorded in index for prefix={prefix!r}")
-
-        relpaths_from_index = [str(info["path"]) for info in arrays_info]
-        keys_from_index = [".".join(p.split("/")) for p in relpaths_from_index]
-        if set(keys_from_index) != set(array_keys):
-            missing = set(array_keys) - set(keys_from_index)
-            extra = set(keys_from_index) - set(array_keys)
-            raise ValueError(
-                f"TensorStore index keys mismatch for prefix={prefix!r}. "
-                f"Missing: {sorted(missing)}; Extra: {sorted(extra)}"
-            )
-
-        key_to_rel = dict(zip(keys_from_index, relpaths_from_index, strict=False))
-        array_relpaths = [key_to_rel[k] for k in array_keys]
 
         if sum(arr_mask) != len(array_relpaths):
             raise ValueError(
@@ -925,6 +945,9 @@ class AsyncCheckpointManager:
             "arr_mask": arr_mask,
             "array_keys": array_keys,
             "array_relpaths": array_relpaths,
+            # Stored dtypes, so loads without a tensorstore index (``write_index=False``) can still
+            # keep integer / quantized leaves out of a requested floating ``dtype`` cast.
+            "array_dtypes": [_dtype_name(x.dtype) for x, m in zip(leaves, arr_mask, strict=False) if m],
             "nonarray_payload": nonarray_payload,
             "safetensors_file": None,
             "extras": extras or {},
@@ -1093,6 +1116,14 @@ class AsyncCheckpointManager:
         index_info_by_key = {_key_from_relpath(str(info.get("path", ""))): info for info in index_arrays}
         saved_shapes = [_shape_from_index(index_info_by_key.get(key, {}).get("shape")) for key in array_keys]
         storage_dtypes = [_dtype_from_index(index_info_by_key.get(key, {}).get("dtype")) for key in array_keys]
+        # Fall back to the dtypes recorded in the structure sidecar when the index lacks them
+        # (index-free saves); otherwise an unknown storage dtype would let ``dtype=`` cast ints.
+        struct_dtypes = struct.get("array_dtypes") or []
+        if len(struct_dtypes) == len(storage_dtypes):
+            storage_dtypes = [
+                stored if stored is not None else _dtype_from_index(recorded)
+                for stored, recorded in zip(storage_dtypes, struct_dtypes, strict=True)
+            ]
         tensorstore_metadata = (
             _zarr_metadata_for_paths(abs_paths, workers=tensorstore_metadata_workers)
             if tensorstore_assume_metadata

@@ -54,6 +54,29 @@ class TestAsyncCheckpointManager:
         assert loaded["name"] == sample_pytree["name"]
         assert isinstance(meta, dict)
 
+    def test_save_pytree_write_index_false_roundtrip(self, tmp_checkpoint_dir, mesh, sample_pytree):
+        """``write_index=False`` skips the index file yet still saves a loadable checkpoint."""
+        mgr = AsyncCheckpointManager()
+        mgr.save_pytree(sample_pytree, tmp_checkpoint_dir, mesh=mesh, prefix="model", write_index=False)
+
+        assert not (Path(str(tmp_checkpoint_dir)) / "tensorstore_index.json").exists()
+        assert (Path(str(tmp_checkpoint_dir)) / "model_structure.json").exists()
+
+        loaded, _ = mgr.load_pytree(tmp_checkpoint_dir, mesh, prefix="model")
+        assert jnp.allclose(loaded["layer0"]["weight"], sample_pytree["layer0"]["weight"])
+        assert loaded["step"] == sample_pytree["step"]
+
+    def test_save_pytree_write_index_false_ignores_existing_index(self, tmp_checkpoint_dir, mesh):
+        """A pre-existing index for another prefix must not break a ``write_index=False`` save."""
+        mgr = AsyncCheckpointManager()
+        mgr.save_pytree({"w": jnp.ones(2)}, tmp_checkpoint_dir, mesh=mesh, prefix="model")
+        mgr.save_pytree({"mu": jnp.arange(2.0)}, tmp_checkpoint_dir, mesh=mesh, prefix="tx", write_index=False)
+
+        loaded, _ = mgr.load_pytree(tmp_checkpoint_dir, mesh, prefix="tx")
+        assert jnp.allclose(loaded["mu"], jnp.arange(2.0))
+        index = json.loads((Path(str(tmp_checkpoint_dir)) / "tensorstore_index.json").read_text())
+        assert "tx" not in index.get("prefixes", {})
+
     def test_default_path_dtype_preserves_integer_leaves(self, tmp_checkpoint_dir, mesh):
         """The DEFAULT (non-custom) load path must not value-cast integer leaves.
 
@@ -80,6 +103,34 @@ class TestAsyncCheckpointManager:
         assert loaded["scales"].dtype == jnp.uint8
         np.testing.assert_array_equal(np.asarray(loaded["codes"]), np.asarray(tree["codes"]))
         np.testing.assert_array_equal(np.asarray(loaded["scales"]), np.asarray(tree["scales"]))
+
+    def test_index_free_save_dtype_load_preserves_integer_leaves(self, tmp_checkpoint_dir, mesh):
+        """``write_index=False`` saves record dtypes in the structure sidecar, so ``dtype=`` still
+        skips integer / quantized leaves when no tensorstore index exists (r10 S14-03)."""
+        tree = {
+            "weight": jnp.arange(8, dtype=jnp.float32).reshape(2, 4),
+            "codes": jnp.arange(70000, 70016, dtype=jnp.uint32).reshape(4, 4),
+            "scales": jnp.arange(16, dtype=jnp.uint8).reshape(4, 4),
+        }
+        mgr = AsyncCheckpointManager()
+        mgr.save_pytree(tree, tmp_checkpoint_dir, mesh=mesh, prefix="model", write_index=False)
+        assert not (Path(str(tmp_checkpoint_dir)) / "tensorstore_index.json").exists()
+
+        loaded, _ = mgr.load_pytree(tmp_checkpoint_dir, mesh, prefix="model", dtype=jnp.bfloat16)
+
+        assert loaded["weight"].dtype == jnp.bfloat16
+        assert loaded["codes"].dtype == jnp.uint32
+        assert loaded["scales"].dtype == jnp.uint8
+        np.testing.assert_array_equal(np.asarray(loaded["codes"]), np.asarray(tree["codes"]))
+        np.testing.assert_array_equal(np.asarray(loaded["scales"]), np.asarray(tree["scales"]))
+
+    @pytest.mark.parametrize("tree", [{"step": 3, "name": "run", "none": None}, {}], ids=["scalars", "empty"])
+    def test_array_free_tree_saves_and_loads(self, tmp_checkpoint_dir, mesh, tree):
+        """Trees without array leaves must save with the default index path (r10 S14-06)."""
+        mgr = AsyncCheckpointManager()
+        mgr.save_pytree(tree, tmp_checkpoint_dir, mesh=mesh, prefix="meta")
+        loaded, _ = mgr.load_pytree(tmp_checkpoint_dir, mesh, prefix="meta")
+        assert loaded == tree
 
     def test_nonarray_payload_preserved(self, tmp_checkpoint_dir, mesh):
         """Ints, strings, and None survive the roundtrip."""

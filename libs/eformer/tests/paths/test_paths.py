@@ -14,8 +14,11 @@
 
 """Tests for path utilities."""
 
+import os
+
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from eformer.paths import GCSPath, LocalPath, MLUtilPath, PathManager, is_local_path, is_remote_path, path_protocol
 
 
@@ -137,3 +140,15 @@ def test_mlutilpath_save_load_and_copy(tmp_path):
     (src / "sub" / "file.txt").write_text("payload", encoding="utf-8")
     manager.copy_tree(str(src), str(dst))
     assert (dst / "sub" / "file.txt").read_text(encoding="utf-8") == "payload"
+
+
+@pytest.mark.cpu_ok
+def test_local_path_is_os_pathlike(tmp_path):
+    """``LocalPath`` must be ``os.PathLike``: transformers' ``resolve_revision`` calls ``os.path.exists`` on it."""
+    existing = LocalPath(tmp_path)
+    missing = LocalPath(tmp_path / "absent")
+    assert isinstance(existing, os.PathLike)
+    assert os.fspath(existing) == str(tmp_path)
+    assert os.path.exists(existing) is True
+    assert os.path.exists(missing) is False
+    assert os.path.isdir(existing) is True

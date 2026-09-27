@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -66,3 +67,51 @@ def pytest_collection_modifyitems(config, items) -> None:
         "  env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu uv run pytest ...\n"
         "Mark a test that does no array computation with @pytest.mark.cpu_ok."
     )
+
+
+# Runtime complement to the collection guard above: a test that reaches JAX only through another
+# package (no direct array-library import line) escapes the import scan. Listen during setup/call
+# without initializing the backend first (pure-Python tests must not acquire the TPU lock).
+# A CPU compilation fails unless marked ``cpu_ok``. Programs already compiled earlier in the process
+# (in-memory jit cache) emit no event, so this catches the first computing test rather than every one.
+_COMPILE_EVENTS = frozenset(
+    {"/jax/core/compile/backend_compile_duration", "/jax/compilation_cache/cache_retrieval_time_sec"}
+)
+
+
+def _cpu_compile_guard(item):
+    if item.config.option.collectonly or item.get_closest_marker("cpu_ok") is not None:
+        return (yield)
+    from jax import monitoring
+
+    compiled: list[str] = []
+
+    def _on_duration(event, duration_secs, **kwargs):
+        del duration_secs, kwargs
+        if event in _COMPILE_EVENTS:
+            compiled.append(event)
+
+    monitoring.register_event_duration_secs_listener(_on_duration)
+    try:
+        result = yield
+    finally:
+        monitoring.unregister_event_duration_listener(_on_duration)
+    if compiled:
+        backend = sys.modules["jax"].default_backend()
+        if backend not in _ACCELERATOR_BACKENDS:
+            pytest.fail(
+                f"{item.nodeid} compiled an XLA program on the '{backend}' JAX backend. Computation tests must run "
+                "on TPU/GPU; mark a test that does no array computation with @pytest.mark.cpu_ok.",
+                pytrace=False,
+            )
+    return result
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_setup(item):
+    return (yield from _cpu_compile_guard(item))
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_call(item):
+    return (yield from _cpu_compile_guard(item))

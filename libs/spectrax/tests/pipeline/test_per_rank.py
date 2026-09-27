@@ -213,6 +213,43 @@ class TestRunGpipePerRank:
         assert jnp.allclose(grads[0]["w"], g_w0_ref, atol=1e-4)
         assert jnp.allclose(grads[1]["w"], g_w1_ref, atol=1e-4)
 
+    def test_bf16_parameter_grads_preserve_dtype_with_float32_loss(self):
+        """Scaling a bf16 gradient by the fp32 mean-loss factor must not widen its storage."""
+        dtype = jnp.bfloat16
+        weights = [{"w": jnp.asarray(2, dtype)}, {"w": jnp.asarray(3, dtype)}]
+        xs = jnp.ones((2, 2), dtype=dtype)
+        tgt = jnp.zeros_like(xs)
+        dev = jax.devices()[0]
+
+        def fwd(params, rest, x):
+            return x * params["w"]
+
+        def bwd(params, rest, x, g_y):
+            return {"w": (x * g_y).sum()}, g_y * params["w"]
+
+        def loss_and_g_y(y, target):
+            diff = y - target
+            return 0.5 * jnp.sum(diff.astype(jnp.float32) ** 2), diff
+
+        loss, grads = run_gpipe_per_rank(
+            n_stages=2,
+            microbatches=2,
+            schedule=GPipe(microbatches=2),
+            fwd_fns=[fwd, fwd],
+            bwd_fns=[bwd, bwd],
+            loss_and_g_y=loss_and_g_y,
+            stage_params=weights,
+            stage_rest=[{}, {}],
+            stage_shardings=[dev, dev],
+            xs=xs,
+            target_args=(tgt,),
+        )
+        # Per microbatch: y = 1 * 2 * 3 = 6, loss_mb = 0.5 * (6**2 + 6**2) = 36; mean over M=2 is 36.
+        assert jnp.allclose(loss, 36.0)
+        assert [grad["w"].dtype for grad in grads] == [dtype, dtype]
+        assert jnp.allclose(grads[0]["w"], 36.0)
+        assert jnp.allclose(grads[1]["w"], 24.0)
+
 
 class TestRejectsUnsupportedSchedules:
     """Driver refuses non-GPipe schedules with a clear error."""

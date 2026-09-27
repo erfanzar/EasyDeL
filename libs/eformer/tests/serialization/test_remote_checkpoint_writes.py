@@ -30,6 +30,10 @@ class FakePath:
     def __truediv__(self, other):
         return FakePath(f"{self.path.rstrip('/')}/{other}", self.store, self.mkdir_calls)
 
+    @property
+    def parent(self) -> "FakePath":
+        return FakePath(self.path.rsplit("/", 1)[0], self.store, self.mkdir_calls)
+
     def exists(self) -> bool:
         return self.path in self.store
 
@@ -44,6 +48,17 @@ class FakePath:
     def mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:
         del parents, exist_ok
         self.mkdir_calls.append(self.path)
+
+    def rename(self, target) -> "FakePath":
+        self.store[str(target)] = self.store.pop(self.path)
+        return FakePath(str(target), self.store, self.mkdir_calls)
+
+    def replace(self, target) -> "FakePath":
+        return self.rename(target)
+
+    def unlink(self, missing_ok: bool = False) -> None:
+        if self.store.pop(self.path, None) is None and not missing_ok:
+            raise FileNotFoundError(self.path)
 
     def __str__(self) -> str:
         return self.path
@@ -118,7 +133,7 @@ def test_tree_serialize_leaves_remote_nonzero_skips_shared_index_write(monkeypat
     assert mkdir_calls == []
 
 
-def test_tree_serialize_leaves_local_nonzero_still_writes_index(monkeypatch):
+def test_tree_serialize_leaves_local_nonzero_still_writes_index(monkeypatch, tmp_path):
     store = {}
     mkdir_calls = []
     manager = RecordingSerializeManager()
@@ -127,7 +142,7 @@ def test_tree_serialize_leaves_local_nonzero_still_writes_index(monkeypatch):
     monkeypatch.setattr(serialization_mod.fsspec_utils.jax, "process_index", lambda: 1)
 
     serialization_mod.tree_serialize_leaves(
-        checkpoint_dir="/tmp/run-local",
+        checkpoint_dir=str(tmp_path),
         pytree={"params": np.arange(4)},
         manager=manager,
         prefix="model",
@@ -135,9 +150,9 @@ def test_tree_serialize_leaves_local_nonzero_still_writes_index(monkeypatch):
     )
 
     assert len(manager.calls) == 1
-    index = json.loads(store["/tmp/run-local/tensorstore_index.json"])
+    index = json.loads(store[f"{tmp_path}/tensorstore_index.json"])
     assert index["prefixes"]["model"][0]["path"] == "model/params"
-    assert mkdir_calls == []
+    assert mkdir_calls == [str(tmp_path)]
 
 
 def test_async_save_pytree_remote_nonzero_skips_shared_writes_but_still_serializes(monkeypatch):

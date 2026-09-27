@@ -13,6 +13,7 @@ directly, producing paths like ``"blocks.0.fc.weight"``.
 
 from __future__ import annotations
 
+import inspect
 import types
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, fields, is_dataclass
@@ -2077,10 +2078,28 @@ class Sequential(_ListContainer):
             The output of the final child in the chain.
         """
         for m in self._spx_items:
+            if not kwargs:
+                x = m(x)
+                continue
             try:
                 x = m(x, **kwargs)
-            except TypeError:
-                x = m(x)
+            except TypeError as call_error:
+                # Only retry when the keyword arguments cannot bind to the
+                # child's forward signature. An error *inside* forward must
+                # propagate rather than executing the child a second time.
+                try:
+                    signature = inspect.signature(m.forward)
+                except (TypeError, ValueError):
+                    # The signature cannot be introspected (builtin/partial
+                    # forward), so binding cannot be checked. Surface the
+                    # child's own TypeError instead of an unbound-name error.
+                    raise call_error from None
+                try:
+                    signature.bind(x, **kwargs)
+                except TypeError:
+                    x = m(x)
+                else:
+                    raise
         return x
 
 

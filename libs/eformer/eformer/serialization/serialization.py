@@ -15,9 +15,18 @@
 
 import json
 import os
+import socket
+import threading
+import uuid
 from collections.abc import Callable, Sequence
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any
+
+try:
+    import fcntl
+except ImportError:  # Windows has no flock; retain the previous local atomic-write behavior.
+    fcntl = None
 
 import jax
 import numpy as np
@@ -38,6 +47,35 @@ logger = get_logger(__name__)
 
 
 GLOBAL_CHECKPOINT_TIMEOUT = int(os.getenv("GLOBAL_CHECKPOINT_TIMEOUT", "400"))
+_LOCAL_INDEX_THREAD_LOCK = threading.Lock()
+
+
+def _reset_local_index_thread_lock():
+    """Discard an inherited lock whose owning thread may not survive fork."""
+    global _LOCAL_INDEX_THREAD_LOCK
+    _LOCAL_INDEX_THREAD_LOCK = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_local_index_thread_lock)
+
+
+@contextmanager
+def _local_index_lock(index_path):
+    """Serialize the local index's entire read-modify-write across threads and processes."""
+    with _LOCAL_INDEX_THREAD_LOCK:
+        if fcntl is None:
+            yield
+        else:
+            # A separate persistent file is needed: locking the index inode itself
+            # would stop protecting writers as soon as a rename replaces that inode.
+            with open(f"{index_path}.lock", "a+b") as lock_file:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
 
 __all__ = [
     "is_array_like",
@@ -235,27 +273,66 @@ def tree_serialize_leaves(
 
     if write_index and array_info and fsspec_utils.should_write_shared_checkpoint_files(checkpoint_dir):
         index_path = ePath(checkpoint_dir) / "tensorstore_index.json"
-        if index_path.exists():
-            index_data = json.loads(index_path.read_text())
-        else:
-            index_data = {
-                "format": "tensorstore",
-                "version": __version__,
-                "prefixes": {},
-            }
-
-        if prefix:
-            if "prefixes" not in index_data:
+        remote = fsspec_utils.is_remote_path(checkpoint_dir)
+        # Remote paths have only one metadata writer. Local saves require the
+        # lock across read, merge AND replace, not just during the atomic rename.
+        if not remote:
+            # A supplied serialization manager may not create this directory.
+            # It must exist before opening the persistent sibling lock file.
+            index_path.parent.mkdir(parents=True, exist_ok=True)
+        lock = nullcontext() if remote else _local_index_lock(index_path)
+        with lock:
+            if index_path.exists():
+                index_data = json.loads(index_path.read_text())
+            else:
                 index_data = {
                     "format": "tensorstore",
                     "version": __version__,
                     "prefixes": {},
                 }
-            index_data["prefixes"][prefix] = array_info
-        else:
-            index_data["arrays"] = array_info
 
-        index_path.write_text(json.dumps(index_data, indent=2))
+            if prefix:
+                if "prefixes" not in index_data:
+                    index_data = {
+                        "format": "tensorstore",
+                        "version": __version__,
+                        "prefixes": {},
+                    }
+                index_data["prefixes"][prefix] = array_info
+            else:
+                index_data["arrays"] = array_info
+
+            payload = json.dumps(index_data, indent=2)
+            if remote:
+                # Object stores have a single writer (process 0, see
+                # should_write_shared_checkpoint_files) and no portable atomic
+                # rename, so write in place.
+                index_path.write_text(payload)
+            else:
+                # Use ePath for the local atomic replacement. Each writer has
+                # its own temporary file; readers never observe a partial JSON.
+                # The name carries the hostname and a random token, not just
+                # pid/thread id: on a shared mount (NFS, FUSE) two hosts can
+                # have identical pid/thread ids, and the flock above is only
+                # host-local, so a pid-based name could be shared and the
+                # second ``replace`` would fail with FileNotFoundError.
+                # The name carries the hostname and a random token, not just
+                # pid/thread id: on a shared mount (NFS, FUSE) two hosts can
+                # have identical pid/thread ids, and the flock above is only
+                # host-local, so a pid-based name could be shared and the
+                # second ``replace`` would fail with FileNotFoundError.
+                tmp_path = ePath(
+                    f"{index_path}.tmp-{socket.gethostname()}-{os.getpid()}-{threading.get_ident()}-{uuid.uuid4().hex}"
+                )
+                try:
+                    tmp_path.write_text(payload)
+                    tmp_path.replace(index_path)
+                except OSError:
+                    try:
+                        tmp_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    raise
 
 
 def _fs_paths_from_key_paths(checkpoint_dir, leaf_path):

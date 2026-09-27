@@ -627,6 +627,62 @@ def test_modulelist_traced_index_writes_through_under_fori_loop():
     assert [float(layer.count.value) for layer in layers] == [1.0, 1.0, 1.0]
 
 
+def test_sequential_does_not_retry_forward_internal_type_error():
+    """A child TypeError is not a signal to drop supported kwargs and invoke it twice."""
+
+    class Failing(Module):
+        """Child with observable invocation count."""
+
+        def __init__(self):
+            """Initialize the counter."""
+            super().__init__()
+            self.calls = []
+
+        def forward(self, x, *, factor=1):
+            """Fail inside the implementation, not during argument binding."""
+            self.calls.append(factor)
+            raise TypeError("bad input in forward")
+
+    child = Failing()
+    with pytest.raises(TypeError, match="bad input in forward"):
+        Sequential(child)(1, factor=2)
+    assert child.calls == [2]
+
+
+@pytest.mark.cpu_ok
+@pytest.mark.parametrize("signature_error", [TypeError, ValueError])
+def test_sequential_surfaces_child_type_error_when_signature_is_unavailable(monkeypatch, signature_error):
+    """An un-introspectable ``forward`` must not turn the child's TypeError into UnboundLocalError."""
+    from spectrax.core import containers
+
+    class Failing(Module):
+        """Child whose forward raises a TypeError."""
+
+        def forward(self, x, **kwargs):
+            """Always fail."""
+            raise TypeError("child boom")
+
+    def no_signature(_obj):
+        raise signature_error("no signature found for builtin")
+
+    monkeypatch.setattr(containers.inspect, "signature", no_signature)
+    with pytest.raises(TypeError, match="child boom"):
+        Sequential(Failing())(1, factor=2)
+
+
+def test_sequential_ignores_only_unsupported_kwargs():
+    """Children without the forwarded keyword still run once positionally."""
+
+    class Positional(Module):
+        """Child accepting only the input."""
+
+        def forward(self, x):
+            """Increment an integer input."""
+            return x + 1
+
+    assert Sequential(Positional())(3, factor=2) == 4
+
+
 def test_modulelist_scan_inside_fori_loop_covers_every_layer():
     """With the fori_loop stacked cache injected, ``ModuleList.scan`` still runs all layers."""
 

@@ -91,8 +91,8 @@ def _analytic_reference(w0, w1, xs, tgt, m):
     diff = y1 - tgt
     total_loss = 0.5 * jnp.sum(diff * diff)
     mean_loss = total_loss / m
-    g_w1 = (y0 * diff).sum()
-    g_w0 = (xs * diff * w1).sum()
+    g_w1 = (y0 * diff).sum() / m
+    g_w0 = (xs * diff * w1).sum() / m
     return mean_loss, g_w0, g_w1
 
 
@@ -115,6 +115,22 @@ class TestScheduledBodyGPipe:
         assert grads["w"].shape == (2,)
         assert jnp.allclose(grads["w"][0], ref_g_w0, atol=1e-3)
         assert jnp.allclose(grads["w"][1], ref_g_w1, atol=1e-3)
+
+    @pytest.mark.parametrize("use_scan", [False, True])
+    def test_grads_match_derivative_of_reported_loss(self, use_scan):
+        """Both lowering modes return gradients of their mean loss, not a microbatch sum."""
+        m = 4
+        xs = jnp.arange(m * 2, dtype=jnp.float32).reshape(m, 2) + 1.0
+        tgt = jnp.ones_like(xs)
+        weights = jnp.asarray([2.0, 3.0])
+        params = [{"w": weights[0]}, {"w": weights[1]}]
+        loss, grads = _run_shardmap_scheduled(GPipe(microbatches=m), m, params, xs, tgt, use_scan=use_scan)
+
+        def mean_loss(ws):
+            return jax.vmap(lambda x, y: _mse_loss_and_g_y(x * ws[0] * ws[1], y)[0])(xs, tgt).mean()
+
+        assert jnp.allclose(loss, mean_loss(weights))
+        assert jnp.allclose(grads["w"], jax.grad(mean_loss)(weights), rtol=1e-5, atol=1e-3)
 
 
 class TestScheduledBodyStd1F1B:
@@ -167,6 +183,21 @@ class TestScheduledBodyZeroBubble:
 class TestScheduledBodyRejections:
     """Builder rejects unsupported inputs with a clear error."""
 
+    @pytest.mark.cpu_ok
+    @pytest.mark.parametrize(("schedule_count", "buffer_count"), [(4, 2), (2, 4)])
+    def test_microbatch_count_must_match_schedule(self, schedule_count, buffer_count):
+        """Reject counts that would index outside the scheduled buffers or omit work."""
+        with pytest.raises(ValueError, match=r"must match schedule\.microbatches"):
+            make_scheduled_body(
+                schedule=GPipe(microbatches=schedule_count),
+                n_stages=2,
+                microbatches=buffer_count,
+                pp_axis="pp",
+                fwd_fn=_toy_stage_fn,
+                bwd_fn=_toy_bwd_fn,
+                loss_and_g_y=_mse_loss_and_g_y,
+            )
+
     def test_forward_mode_not_supported(self):
         """``mode='forward'`` falls outside this builder's scope (use GPipe primitive instead)."""
         with pytest.raises(NotImplementedError, match="mode='train'"):
@@ -205,7 +236,7 @@ def _analytic_reference_vstage(weights, xs, tgt, m):
     g_w10 = (y0 * g_y1).sum()
     g_y0 = g_y1 * w10
     g_w00 = (xs * g_y0).sum()
-    return mean_loss, {(0, 0): g_w00, (0, 1): g_w01, (1, 0): g_w10, (1, 1): g_w11}
+    return mean_loss, {(0, 0): g_w00 / m, (0, 1): g_w01 / m, (1, 0): g_w10 / m, (1, 1): g_w11 / m}
 
 
 def _run_shardmap_virtual(schedule, m, per_rank_virt_params, xs, tgt, *, use_scan=False):

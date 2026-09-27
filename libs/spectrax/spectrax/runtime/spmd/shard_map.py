@@ -228,10 +228,20 @@ def make_scheduled_body(
                 Python-unrolled (small-scale only). Default ``False``.
 
     Returns:
-        Result described by this helper.
+        A shard-map body ``(stacked_params, xs, *targets) -> (mean_loss,
+        stacked_params_grads)``. Both outputs are averaged over the ``M``
+        microbatches (gradients are the gradient of the reported mean loss,
+        not the sum over microbatches).
+
+    Raises:
+        NotImplementedError: If ``mode`` is not ``"train"``.
+        ValueError: If ``microbatches`` differs from
+            ``schedule.microbatches``.
     """
     if mode != "train":
         raise NotImplementedError(f"make_scheduled_body only supports mode='train'; got {mode}.")
+    if microbatches != schedule.microbatches:
+        raise ValueError(f"microbatches={microbatches} must match schedule.microbatches={schedule.microbatches}.")
 
     V = schedule.virtual_stages_per_rank()
     n_logical = n_stages * V
@@ -679,7 +689,8 @@ def _make_scan_body(
 
         total_loss = jax.lax.psum(la_f, pp_axis)
         mean_loss = total_loss / jnp.asarray(m, dtype=total_loss.dtype)
-        return mean_loss, _add0(gp_f)
+        mean_grads = jax.tree.map(lambda grad: (grad * (1.0 / m)).astype(grad.dtype), gp_f)
+        return mean_loss, _add0(mean_grads)
 
     return body
 
@@ -907,6 +918,7 @@ def _make_unrolled_body(
 
         total_loss = jax.lax.psum(loss_acc, pp_axis)
         mean_loss = total_loss / jnp.asarray(m, dtype=total_loss.dtype)
-        return mean_loss, _add0(g_params)
+        mean_grads = jax.tree.map(lambda grad: (grad * (1.0 / m)).astype(grad.dtype), g_params)
+        return mean_loss, _add0(mean_grads)
 
     return body
