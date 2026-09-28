@@ -109,6 +109,26 @@ def test_matches_naive(transpose_rhs, use_jit):
 
 
 @pytest.mark.parametrize("transpose_rhs", [False, True])
+@pytest.mark.parametrize("return_none", [False, True])
+def test_callable_tiling_matches_dense_reference(transpose_rhs, return_none):
+    """A LutFn hint must resolve for both rhs layouts and the untiled fallback."""
+    lhs = jnp.arange(63, dtype=jnp.float32).reshape(9, 7) / 64
+    rhs = jnp.arange(3 * 7 * 4, dtype=jnp.float32).reshape(3, 7, 4) / 128
+    group_sizes = jnp.asarray([3, 0, 6], dtype=jnp.int32)
+    if transpose_rhs:
+        rhs = rhs.swapaxes(1, 2)
+
+    def tiling(m, k, n):
+        # The TPU native GMM requires the padded m (16 here) to be a multiple of the m tile.
+        return None if return_none else (16, 128, 128)
+
+    result = grouped_matmul(lhs, rhs, group_sizes, tiling=tiling, transpose_rhs=transpose_rhs)
+    expected = _naive_grouped_matmul(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs)
+    assert result.shape == (9, 4)
+    assert jnp.allclose(result, expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("transpose_rhs", [False, True])
 @pytest.mark.parametrize(
     ("group_sizes", "k", "n"),
     [

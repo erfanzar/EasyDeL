@@ -229,3 +229,29 @@ def test_sliding_window_long_context_matches_dense(sliding_window, with_softmax_
     out = np.asarray(out, dtype=np.float32)
     assert np.isfinite(out).all()
     np.testing.assert_allclose(out, expected, rtol=2e-3, atol=2e-3)
+
+
+def test_float16_long_uniform_context_does_not_overflow():
+    """float16 ``compute_dtype`` must still accumulate the softmax in float32 (r11 S04-1).
+
+    One decode query over 65536 keys with zero logits: the denominator is 65536 > float16 max
+    (65504). Unit values make the exact output all ones; a float16 accumulator gives inf/inf.
+    """
+    page_size, num_pages, head_dim = 1024, 64, 8
+    kv_pages = jnp.zeros((num_pages, page_size, 2, head_dim), dtype=jnp.float16)
+    kv_pages = kv_pages.at[:, :, 1, :].set(1.0)  # K = 0 (even slot), V = 1 (odd slot)
+    queries = jnp.zeros((1, 1, head_dim), dtype=jnp.float16)
+    out = ragged_page_attention_v2(
+        queries,
+        kv_pages,
+        jnp.array([num_pages * page_size], dtype=jnp.int32),
+        jnp.arange(num_pages, dtype=jnp.int32).reshape(1, num_pages),
+        jnp.array([0, 1], dtype=jnp.int32),
+        jnp.array(1, dtype=jnp.int32),
+        softmax_scale=1.0,
+        compute_dtype=jnp.float16,
+    )
+    assert out.dtype == jnp.float16
+    out = np.asarray(out, dtype=np.float32)
+    assert np.isfinite(out).all(), out
+    np.testing.assert_allclose(out, np.ones_like(out), rtol=1e-3, atol=1e-3)

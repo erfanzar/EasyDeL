@@ -85,7 +85,7 @@ from ejkernel.errors import EjkernelRuntimeError
 from ejkernel.ops import BwdParams, FwdParams
 
 from ..._registry import Backend, Platform, kernel_registry
-from ._triton_impl_bwd import _bwd_attention_kernel_call
+from ._triton_impl_bwd import _bwd_attention_kernel_call, _softmax_aux_gradient
 from ._triton_impl_fwd import _fwd_attention_kernel_call
 
 PagedKV = Float[Array, "num_blocks block_size num_kv_heads head_dim"]
@@ -113,7 +113,7 @@ def _jax_fwd_attention_call(
     cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
     sliding_window: int | tuple[int, int] | None = None,
     logits_soft_cap: float | None = None,
-    softmax_aux: Float[Array, "num_sinks"] | Float[Array, "num_heads num_sinks"] | None = None,
+    softmax_aux: Float[Array, "num_sinks"] | Float[Array, "sink_heads num_sinks"] | None = None,
     q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
 ) -> tuple[Float[Array, "batch seq_len_q num_heads head_dim"], tuple[Float[Array, "..."], ...]]:
@@ -176,6 +176,7 @@ def _jax_fwd_attention_call(
         cum_seqlens_k,
         q_segment_ids,
         kv_segment_ids,
+        softmax_aux,
     )
 
 
@@ -223,14 +224,15 @@ def _jax_bwd_attention_call(
         logits_soft_cap: Soft cap value for logits (non-differentiable).
         residual: Saved tensors from forward pass: (query, key, value, bias,
             attention_mask, output, lse, dropout_seed, cum_seqlens_q,
-            cum_seqlens_k, q_segment_ids, kv_segment_ids).
+            cum_seqlens_k, q_segment_ids, kv_segment_ids, softmax_aux).
         dO: Gradient of loss with respect to attention output.
 
     Returns:
-        Tuple of 11 gradients: (dq, dk, dv, None, None, None, None, None, None, None, None)
-        where only dq, dk, dv are non-None; the remaining Nones correspond to
-        attention_mask, bias, softmax_aux, q_segment_ids, kv_segment_ids and
-        other non-differentiable inputs.
+        Tuple of 11 gradients, one per differentiable input slot of
+        ``flash_attention_call``: (dq, dk, dv, attention_mask, bias, dropout_seed,
+        cum_seqlens_q, cum_seqlens_k, softmax_aux, q_segment_ids, kv_segment_ids).
+        Only dq, dk, dv and the sink gradient (``None`` when no sinks were used)
+        are non-None.
     """
     (
         query,
@@ -245,6 +247,7 @@ def _jax_bwd_attention_call(
         cum_seqlens_k,
         q_segment_ids,
         kv_segment_ids,
+        softmax_aux,
     ) = residual
     dq, dk, dv = _bwd_attention_kernel_call(
         dO=dO,
@@ -267,8 +270,22 @@ def _jax_bwd_attention_call(
         cum_seqlens_k=cum_seqlens_k,
         cum_seqlens_q=cum_seqlens_q,
         logits_soft_cap=logits_soft_cap,
+        softmax_aux=softmax_aux,
     )
-    return dq, dk, dv, None, None, None, None, None, None, None, None
+    dsoftmax_aux = None
+    if softmax_aux is not None:
+        dsoftmax_aux = _softmax_aux_gradient(
+            dO,
+            out,
+            lse,
+            softmax_aux,
+            num_q_heads=query.shape[2],
+            num_kv_heads=key.shape[2],
+            q_dtype=query.dtype,
+            logits_soft_cap=logits_soft_cap,
+            cum_seqlens_q=cum_seqlens_q if (cum_seqlens_q is not None and cum_seqlens_k is not None) else None,
+        )
+    return dq, dk, dv, None, None, None, None, None, dsoftmax_aux, None, None
 
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7, 9, 10, 13, 14))
@@ -293,7 +310,7 @@ def flash_attention_call(
     cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
     sliding_window: int | tuple[int, int] | None = None,
     logits_soft_cap: float | None = None,
-    softmax_aux: Float[Array, "num_sinks"] | Float[Array, "num_heads num_sinks"] | None = None,
+    softmax_aux: Float[Array, "num_sinks"] | Float[Array, "sink_heads num_sinks"] | None = None,
     q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
@@ -383,7 +400,7 @@ def flash_attention(
     fwd_params: FwdParams | None = None,
     bwd_params: BwdParams | None = None,
     logits_soft_cap: float | None = None,
-    softmax_aux: Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "num_sinks"] | Float[Array, "sink_heads num_sinks"] | None = None,
     normalize_output: bool = True,
     precision: lax.PrecisionLike = jax.lax.Precision.DEFAULT,
     logits_dtype: DTypeLike = jnp.float32,

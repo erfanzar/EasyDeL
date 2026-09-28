@@ -58,6 +58,7 @@ from jax import numpy as jnp
 from jaxtyping import DTypeLike, PRNGKeyArray
 
 from ._utils import _chunk_attention_bias, below_or_on_diag
+from ._xla_impl_fwd import _sink_lse_per_head
 
 
 def _blockwise_attention_bwd(
@@ -396,6 +397,9 @@ def _ring_attention_bwd(
         inputs).
     """
     del float32_logits
+    # Same default as the primal body / forward rule: the backward also gets the raw static args.
+    if causal and causal_block_size is None:
+        causal_block_size = query_chunk_size
     (
         output,
         query,
@@ -408,6 +412,7 @@ def _ring_attention_bwd(
         kv_position_ids,
         denominator,
         max_score,
+        softmax_aux,
     ) = res
     _, q_len, _, _ = query.shape
     _, kv_len, _, _ = key.shape
@@ -502,4 +507,22 @@ def _ring_attention_bwd(
     )
     dq, dk, dv = dq.astype(query.dtype), dk.astype(key.dtype), dv.astype(value.dtype)
 
-    return dq, dk, dv, None, None, None, None, None, None
+    d_softmax_aux = None
+    if softmax_aux is not None:
+        # r11 S03-1/S04-2: the sinks only enter the softmax normalizer, whose full log-value
+        # L = max + log(denom) already includes them. For O = sum_k exp(s_k - L) v_k,
+        # dO / d sink_lse[h] = -exp(sink_lse[h] - L) * O, so the per-head gradient is
+        # -sum_{b,q} exp(sink_lse[h] - L[b,h,q]) * sum_d g * O. It is pulled back through the
+        # sink layout (1-D, (1, S), (H, S)) by the same helper the forward used. The value is the
+        # local (per-shard) contribution; shard_map's transpose sums a replicated input's cotangent.
+        num_heads = query.shape[2]
+        sink_lse, sink_vjp = jax.vjp(lambda aux: _sink_lse_per_head(aux, num_heads), softmax_aux)
+        eps = jnp.finfo(jnp.float32).tiny
+        log_norm = max_score + jnp.log(jnp.maximum(denominator, eps))  # (b, h, q)
+        weight = jnp.exp(sink_lse[None, :, None] - log_norm)
+        weight = jnp.where(jnp.isfinite(weight), weight, 0.0)
+        g_dot_o = jnp.sum(g.astype(jnp.float32) * output.astype(jnp.float32), axis=-1)  # (b, q, h)
+        d_sink_lse = -jnp.sum(weight * rearrange(g_dot_o, "b q h -> b h q"), axis=(0, 2))
+        (d_softmax_aux,) = sink_vjp(d_sink_lse.astype(sink_lse.dtype))
+
+    return dq, dk, dv, None, None, None, None, None, d_softmax_aux

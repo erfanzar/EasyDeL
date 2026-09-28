@@ -353,23 +353,17 @@ def _positions_from_segments_2d(segment_ids: jnp.ndarray, *, pad_value: int) -> 
         >>> # Padding tokens get -1
     """
     segment_ids = jnp.asarray(segment_ids, jnp.int32)
-
-    def _scan_1d(ids_1d):
-        def step(carry, seg_i):
-            prev_seg, cnt = carry
-            is_pad = seg_i < 0
-            is_new = (~is_pad) & (seg_i != prev_seg)
-            cnt_candidate = jnp.where(is_new, jnp.int32(0), cnt + 1)
-
-            pos_i = jnp.where(is_pad, jnp.int32(pad_value), cnt_candidate)
-            next_prev = jnp.where(is_pad, jnp.int32(-2), seg_i)
-            next_cnt = jnp.where(is_pad, jnp.int32(-1), cnt_candidate)
-            return (next_prev, next_cnt), pos_i
-
-        (_, _), pos = jax.lax.scan(step, (jnp.int32(-2), jnp.int32(-1)), ids_1d)
-        return pos
-
-    return jax.vmap(_scan_1d, in_axes=0, out_axes=0)(segment_ids)
+    if segment_ids.shape[-1] == 0:
+        return segment_ids
+    # Vectorized run-length positions (no per-token serial scan, whose launch latency grows with the sequence): a
+    # non-padding token opens a run when its segment differs from the previous token's (a padding predecessor always
+    # differs, since padding ids are negative); its position is its index minus the latest run start at or before it.
+    is_pad = segment_ids < 0
+    prev = jnp.pad(segment_ids[:, :-1], ((0, 0), (1, 0)), constant_values=-1)
+    is_new = (~is_pad) & (segment_ids != prev)
+    idx = jnp.broadcast_to(jnp.arange(segment_ids.shape[1], dtype=jnp.int32)[None, :], segment_ids.shape)
+    start = jax.lax.cummax(jnp.where(is_new, idx, jnp.int32(-1)), axis=1)
+    return jnp.where(is_pad, jnp.int32(pad_value), idx - start)
 
 
 @_debug_trace

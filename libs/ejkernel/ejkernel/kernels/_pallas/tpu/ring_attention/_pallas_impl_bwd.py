@@ -127,6 +127,61 @@ def _update_out_and_lse(
     return new_out, new_lse
 
 
+def _ring_needs_position_offset(causal, sliding_window, chunk_size, mask_function) -> bool:
+    """Whether ring iterations need the global-position mask (anything but a full mask)."""
+    return causal or sliding_window is not None or chunk_size is not None or mask_function is not None
+
+
+def _check_ring_chunk_size(chunk_size: int | None, kv_seq_len: int) -> None:
+    """Chunk ids are compared in coordinates shifted by ``kv_source * kv_seq_len``; that shift keeps
+    ``x // C`` consistent only when ``kv_seq_len`` is a multiple of ``C`` (r15 S03-3)."""
+    if chunk_size is not None and int(kv_seq_len) % int(chunk_size) != 0:
+        raise NotImplementedError(
+            f"Pallas ring attention with chunk_size={chunk_size} requires the local KV length "
+            f"({kv_seq_len}) to be a multiple of chunk_size."
+        )
+
+
+def _make_ring_mask_fn(causal: bool, sliding_window, chunk_size: int | None):
+    """Mask function shared by the ring forward and backward (r15 S03-1 / S03-3).
+
+    ``q_ids`` are query positions shifted into the coordinates of the current KV shard, ``kv_ids``
+    are local KV positions, so differences equal global differences. Chunked (Llama4) attention is
+    causal within a chunk: ``k <= q`` and ``k // C == q // C``.
+    """
+    if sliding_window is not None:
+        if isinstance(sliding_window, int):
+            # An int is a window *size* (HF convention): the query plus its ``W - 1`` neighbours.
+            sw_left = sw_right = max(sliding_window - 1, 0)
+        else:
+            sw_left, sw_right = sliding_window
+
+    def ring_mask_fn(q_ids, kv_ids):
+        """Dynamic mask for ring rotation combining causal, chunk-local and sliding-window terms."""
+        mask = jnp.ones((q_ids.shape[0], kv_ids.shape[1]), dtype=jnp.bool_)
+        if causal or chunk_size is not None:
+            mask = mask & (q_ids >= kv_ids)
+        if chunk_size is not None:
+            mask = mask & ((q_ids // chunk_size) == (kv_ids // chunk_size))
+        if sliding_window is not None:
+            mask = mask & (q_ids - sw_left <= kv_ids) & (q_ids + sw_right >= kv_ids)
+        return mask
+
+    return ring_mask_fn
+
+
+def _ring_iter_mask_info(q_seq_len: int, kv_seq_len: int, device_idx, kv_source_device) -> MaskInfo:
+    """Per-iteration mask info carrying query positions shifted into the current KV shard's frame."""
+    offset = device_idx * q_seq_len - kv_source_device * kv_seq_len
+    return MaskInfo(
+        data_next=None,
+        mask_next=None,
+        block_mask=None,
+        partial_mask_blocks=None,
+        q_sequence=jnp.arange(q_seq_len, dtype=jnp.int32) + offset,
+    )
+
+
 def _ring_attention_forward(
     fwd_mask_info: MaskInfo,
     q: jax.Array,
@@ -142,6 +197,7 @@ def _ring_attention_forward(
     ring_axis: str = RING_AXIS,
     causal: bool = False,
     sliding_window: int | tuple[int, int] | None = None,
+    chunk_size: int | None = None,
 ) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
     """Forward pass for ring attention over distributed devices.
 
@@ -185,45 +241,27 @@ def _ring_attention_forward(
     o_init = jnp.zeros(o_shape, dtype=jnp.float32)
     lse_init = jnp.full((num_heads, q_seq_len), -jnp.inf, dtype=jnp.float32)
 
-    splash_segment_ids = None
-    if segment_ids is not None:
-        splash_segment_ids = splash_kernel.SegmentIds(q=segment_ids.q, kv=segment_ids.kv)
+    # KV segment ids travel around the ring with K/V; query ids stay local. Reusing the local KV labels
+    # for remote keys compared queries against the wrong document ids (r13 S03-2).
+    q_seg_local = None if segment_ids is None else segment_ids.q
+    kv_seg_init = None if segment_ids is None else segment_ids.kv
 
-    needs_position_offset = causal or sliding_window is not None or mask_function is not None
-    base_q_sequence = jnp.arange(q_seq_len, dtype=jnp.int32)
-
-    if sliding_window is not None:
-        if isinstance(sliding_window, int):
-            # An int is a window *size* (HF convention): the query plus its ``W - 1`` neighbours.
-            sw_left = sw_right = max(sliding_window - 1, 0)
-        else:
-            sw_left, sw_right = sliding_window
-
-    def ring_mask_fn(q_ids, kv_ids):
-        """Dynamic mask function for ring rotation combining causal + sliding window."""
-        mask = jnp.ones((q_ids.shape[0], kv_ids.shape[1]), dtype=jnp.bool_)
-        if causal:
-            mask = mask & (q_ids >= kv_ids)
-        if sliding_window is not None:
-            mask = mask & (q_ids - sw_left <= kv_ids) & (q_ids + sw_right >= kv_ids)
-        return mask
+    needs_position_offset = _ring_needs_position_offset(causal, sliding_window, chunk_size, mask_function)
+    _check_ring_chunk_size(chunk_size, kv_seq_len)
+    ring_mask_fn = _make_ring_mask_fn(causal, sliding_window, chunk_size)
 
     def body(carry, iteration):
-        o_prev, lse_prev, k_current, v_current, kv_source_device = carry
+        o_prev, lse_prev, k_current, v_current, kv_seg_current, kv_source_device = carry
         k_next = shift(k_current)
         v_next = shift(v_current)
+        kv_seg_next = None if kv_seg_current is None else shift(kv_seg_current)
+        splash_segment_ids = (
+            None if kv_seg_current is None else splash_kernel.SegmentIds(q=q_seg_local, kv=kv_seg_current)
+        )
         is_first_iteration = iteration == 0
 
         if needs_position_offset:
-            offset = device_idx * q_seq_len - kv_source_device * kv_seq_len
-            modified_q_sequence = base_q_sequence + offset
-            fwd_mask_info_iter = MaskInfo(
-                data_next=None,
-                mask_next=None,
-                block_mask=None,
-                partial_mask_blocks=None,
-                q_sequence=modified_q_sequence,
-            )
+            fwd_mask_info_iter = _ring_iter_mask_info(q_seq_len, kv_seq_len, device_idx, kv_source_device)
             mask_function_iter = ring_mask_fn
         else:
             fwd_mask_info_iter = fwd_mask_info
@@ -254,11 +292,11 @@ def _ring_attention_forward(
         o_next, lse_next = _update_out_and_lse(o_prev, lse_prev, out_curr, lse_curr)
         kv_source_next = (kv_source_device - 1) % ring_axis_size
 
-        return (o_next, lse_next, k_next, v_next, kv_source_next), None
+        return (o_next, lse_next, k_next, v_next, kv_seg_next, kv_source_next), None
 
     initial_kv_source = device_idx.astype(jnp.int32)
-    initial_carry = (o_init, lse_init, k, v, initial_kv_source)
-    (o_final, lse_final, _, _, _), _ = lax.scan(
+    initial_carry = (o_init, lse_init, k, v, kv_seg_init, initial_kv_source)
+    (o_final, lse_final, _, _, _, _), _ = lax.scan(
         body,
         initial_carry,
         xs=jnp.arange(0, ring_axis_size),
@@ -280,6 +318,9 @@ def _ring_attention_backward(
     mask_function: MaskFunctionType | None,
     logits_soft_cap: float | None,
     ring_axis: str,
+    causal: bool = False,
+    sliding_window: int | tuple[int, int] | None = None,
+    chunk_size: int | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array | None]:
     """Backward pass for ring attention with distributed gradient accumulation.
 
@@ -306,6 +347,9 @@ def _ring_attention_backward(
     do_main = do.astype(jnp.float32)
 
     ring_axis_size = lax.psum(1, ring_axis)
+    device_idx = lax.axis_index(ring_axis)
+    q_seq_len = q.shape[1]
+    kv_seq_len = k.shape[0] if is_mqa else k.shape[1]
 
     shift = partial(
         lax.ppermute,
@@ -320,14 +364,29 @@ def _ring_attention_backward(
     if sinks is not None:
         dsinks_accum = jnp.zeros_like(sinks, dtype=jnp.float32)
 
-    splash_segment_ids = None
-    if segment_ids is not None:
-        splash_segment_ids = splash_kernel.SegmentIds(q=segment_ids.q, kv=segment_ids.kv)
+    # KV segment ids rotate with K/V exactly as in the forward (r13 S03-2).
+    q_seg_local = None if segment_ids is None else segment_ids.q
+    kv_seg_init = None if segment_ids is None else segment_ids.kv
 
-    def body(carry, _: int):
-        dq_accum, dk_accum, dv_accum, k_cur, v_cur, dsinks = carry
+    # The backward must see the same global-position mask as the forward for every rotated KV shard;
+    # the static local mask applied local causality to remote blocks (r15 S03-1).
+    needs_position_offset = _ring_needs_position_offset(causal, sliding_window, chunk_size, mask_function)
+    ring_mask_fn = _make_ring_mask_fn(causal, sliding_window, chunk_size)
+
+    def body(carry, iteration):
+        dq_accum, dk_accum, dv_accum, k_cur, v_cur, kv_seg_cur, dsinks, kv_source_device = carry
         k_next = shift(k_cur)
         v_next = shift(v_cur)
+        kv_seg_next = None if kv_seg_cur is None else shift(kv_seg_cur)
+        splash_segment_ids = None if kv_seg_cur is None else splash_kernel.SegmentIds(q=q_seg_local, kv=kv_seg_cur)
+
+        if needs_position_offset:
+            iter_mask_info = _ring_iter_mask_info(q_seq_len, kv_seq_len, device_idx, kv_source_device)
+            dq_mask_iter = iter_mask_info if dq_mask_info is not None else None
+            dkv_mask_iter = iter_mask_info
+            mask_function_iter = ring_mask_fn
+        else:
+            dq_mask_iter, dkv_mask_iter, mask_function_iter = dq_mask_info, dkv_mask_info, mask_function
 
         residuals_for_chunk = (
             q,
@@ -337,8 +396,8 @@ def _ring_attention_backward(
             sinks,
             out,
             logsumexp,
-            dq_mask_info,
-            dkv_mask_info,
+            dq_mask_iter,
+            dkv_mask_iter,
         )
 
         grads = splash_kernel._splash_attention_bwd(
@@ -347,7 +406,7 @@ def _ring_attention_backward(
             is_mqa=is_mqa,
             block_sizes=block_sizes,
             residual_checkpoint_name=None,
-            mask_function=mask_function,
+            mask_function=mask_function_iter,
             logits_soft_cap=logits_soft_cap,
             interpret=False,
             res=residuals_for_chunk,
@@ -366,12 +425,15 @@ def _ring_attention_backward(
         dq_accum = dq_accum + dq_i
 
         if dsinks is not None and dsinks_i is not None:
-            dsinks = dsinks + dsinks_i.astype(jnp.float32)
+            # dsinks depends only on (sinks, final lse, out, do), not on the KV block: it is the same in
+            # every iteration, so take it once (r15 S03-2: it was summed ring_axis_size times).
+            dsinks = dsinks + jnp.where(iteration == 0, dsinks_i.astype(jnp.float32), 0.0)
+        kv_source_next = (kv_source_device - 1) % ring_axis_size
 
-        return (dq_accum, dk_next, dv_next, k_next, v_next, dsinks), None
+        return (dq_accum, dk_next, dv_next, k_next, v_next, kv_seg_next, dsinks, kv_source_next), None
 
-    initial_carry = (dq_accum, dk_accum, dv_accum, k, v, dsinks_accum)
-    (dq_final, dk_final, dv_final, _, _, dsinks_final), _ = lax.scan(
+    initial_carry = (dq_accum, dk_accum, dv_accum, k, v, kv_seg_init, dsinks_accum, device_idx.astype(jnp.int32))
+    (dq_final, dk_final, dv_final, _, _, _, dsinks_final, _), _ = lax.scan(
         body,
         initial_carry,
         xs=jnp.arange(0, ring_axis_size),
@@ -379,8 +441,9 @@ def _ring_attention_backward(
         unroll=True,
     )
 
-    if sinks is not None and dsinks_final is not None:
-        dsinks_final = jax.lax.psum(dsinks_final, axis_name=ring_axis)
+    # dsinks_final is this device's partial (its own queries). It must NOT be psum'd here: shard_map's
+    # transpose already sums the cotangent of a replicated sink input across the ring, so an explicit
+    # psum counted it ring_axis_size times (r15 S03-2, measured 2x on a 2-device ring).
 
     dq_final = dq_final.astype(q.dtype)
     dk_final = dk_final.astype(k.dtype)
@@ -407,6 +470,7 @@ def _ring_attention_fwd_rule(
     ring_axis: str = RING_AXIS,
     causal: bool = False,
     sliding_window: int | tuple[int, int] | None = None,
+    chunk_size: int | None = None,
 ) -> tuple[jax.Array, tuple]:
     """Custom VJP forward rule for ring attention.
 
@@ -448,6 +512,7 @@ def _ring_attention_fwd_rule(
         ring_axis=ring_axis,
         causal=causal,
         sliding_window=sliding_window,
+        chunk_size=chunk_size,
     )
     residuals_for_bwd = (
         q,
@@ -473,6 +538,9 @@ def _ring_attention_bwd_rule(
     ring_axis: str,
     res: tuple,
     do: jax.Array,
+    causal: bool = False,
+    sliding_window: int | tuple[int, int] | None = None,
+    chunk_size: int | None = None,
 ):
     """Custom VJP backward rule for ring attention.
 
@@ -502,13 +570,16 @@ def _ring_attention_bwd_rule(
         mask_function=mask_function,
         logits_soft_cap=logits_soft_cap,
         ring_axis=ring_axis,
+        causal=causal,
+        sliding_window=sliding_window,
+        chunk_size=chunk_size,
     )
     return (None, None, None, dq, dk, dv, None, dsinks)
 
 
 @partial(
     jax.custom_vjp,
-    nondiff_argnums=(8, 9, 10, 11, 12, 13, 14, 15),
+    nondiff_argnums=(8, 9, 10, 11, 12, 13, 14, 15, 16),
 )
 def _ring_attention_custom(
     fwd_mask_info: MaskInfo,
@@ -527,6 +598,7 @@ def _ring_attention_custom(
     ring_axis: str = RING_AXIS,
     causal: bool = False,
     sliding_window: int | tuple[int, int] | None = None,
+    chunk_size: int | None = None,
 ) -> jax.Array:
     """Ring attention with custom VJP for efficient gradient computation.
 
@@ -569,6 +641,7 @@ def _ring_attention_custom(
         ring_axis=ring_axis,
         causal=causal,
         sliding_window=sliding_window,
+        chunk_size=chunk_size,
     )
     return out
 
@@ -590,6 +663,7 @@ def _ring_attention_custom_fwd(
     ring_axis: str = RING_AXIS,
     causal: bool = False,
     sliding_window: int | tuple[int, int] | None = None,
+    chunk_size: int | None = None,
 ):
     """VJP forward implementation for _ring_attention_custom."""
     return _ring_attention_fwd_rule(
@@ -609,6 +683,7 @@ def _ring_attention_custom_fwd(
         ring_axis=ring_axis,
         causal=causal,
         sliding_window=sliding_window,
+        chunk_size=chunk_size,
     )
 
 
@@ -621,13 +696,15 @@ def _ring_attention_custom_bwd(
     ring_axis: str,
     causal: bool,
     sliding_window: int | tuple[int, int] | None,
+    chunk_size: int | None,
     res: tuple,
     do: jax.Array,
 ):
     """VJP backward implementation for _ring_attention_custom.
 
     Delegates to _ring_attention_bwd_rule to compute gradients using
-    the ring communication pattern.
+    the ring communication pattern. ``causal`` / ``sliding_window`` / ``chunk_size`` are forwarded so
+    the backward rebuilds the same per-iteration global-position mask as the forward (r15 S03-1).
     """
     return _ring_attention_bwd_rule(
         mask_value=mask_value,
@@ -638,6 +715,9 @@ def _ring_attention_custom_bwd(
         ring_axis=ring_axis,
         res=res,
         do=do,
+        causal=causal,
+        sliding_window=sliding_window,
+        chunk_size=chunk_size,
     )
 
 
@@ -675,6 +755,7 @@ def _has_axis(axis_name: str) -> bool:
         "ring_axis",
         "causal",
         "sliding_window",
+        "chunk_size",
     ],
 )
 def ring_splash_attention(
@@ -694,6 +775,7 @@ def ring_splash_attention(
     ring_axis: str = RING_AXIS,
     causal: bool = False,
     sliding_window: int | tuple[int, int] | None = None,
+    chunk_size: int | None = None,
 ) -> jax.Array:
     """Compute ring attention using Splash Attention kernels.
 
@@ -744,6 +826,7 @@ def ring_splash_attention(
         ring_axis,
         causal,
         sliding_window,
+        chunk_size,
     )
 
 

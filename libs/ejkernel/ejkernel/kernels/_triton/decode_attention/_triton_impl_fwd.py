@@ -252,6 +252,7 @@ def _decode_stage2(
     stride_lse1: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     NUM_KV_SPLITS: tl.constexpr,
+    NUM_KV_SPLITS_PADDED: tl.constexpr,
     HEAD_DIM: tl.constexpr,
 ):
     """Stage 2 Triton kernel: combine partial results from all KV splits.
@@ -282,7 +283,9 @@ def _decode_stage2(
     b_i64 = b.to(tl.int64)
     h_i64 = h.to(tl.int64)
 
-    offs_s = tl.arange(0, NUM_KV_SPLITS).to(tl.int64)
+    # tl.arange requires a power-of-2 bound; NUM_KV_SPLITS may be any positive
+    # int, so iterate over the padded bound and mask down to the real count.
+    offs_s = tl.arange(0, NUM_KV_SPLITS_PADDED).to(tl.int64)
     lse_off = b_i64 * stride_pl0 + h_i64 * stride_pl1 + offs_s * stride_pl2
     lse_s = tl.load(partial_lse_ptr + lse_off, mask=offs_s < NUM_KV_SPLITS, other=float("-inf")).to(tl.float32)
 
@@ -490,6 +493,7 @@ def decode_attention_triton(
         stride_lse1=stride_lse1,
         BLOCK_DMODEL=block_d,
         NUM_KV_SPLITS=num_kv_splits,
+        NUM_KV_SPLITS_PADDED=int(next_power_of_2(num_kv_splits)),
         HEAD_DIM=head_dim,
     )
 

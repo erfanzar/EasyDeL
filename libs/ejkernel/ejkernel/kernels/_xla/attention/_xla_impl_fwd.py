@@ -97,9 +97,9 @@ def _normalize_softmax_aux(
 
     Args:
         softmax_aux: Attention sink logits in one of these formats:
-            - 1D (num_sinks,): Shared across all heads
-            - 1D (num_q_heads,) or (num_kv_heads,): Per-head single sink
-            - 2D (num_q_heads, num_sinks) or (num_kv_heads, num_sinks): Per-head multiple sinks
+            - 1D (num_q_heads,): One sink per query head
+            - 1D (num_sinks,) of any other length: Shared across all heads
+            - 2D (num_q_heads, num_sinks), (num_kv_heads, num_sinks) or (1, num_sinks): Per-head sinks
         num_q_heads: Number of query heads.
         num_kv_heads: Number of key/value heads (may be fewer for GQA/MQA).
         dtype: Target dtype for the output tensor.
@@ -118,10 +118,10 @@ def _normalize_softmax_aux(
     num_reps = num_q_heads // num_kv_heads
 
     if aux.ndim == 1:
+        # 1-D is unambiguous only as per-query-head (len == Hq) or shared; a length equal to Hkv is
+        # indistinguishable from Hkv shared sinks, so per-KV-head sinks must be passed as 2-D (Hkv, S).
         if aux.shape[0] == num_q_heads:
             per_head = aux[:, None]
-        elif aux.shape[0] == num_kv_heads:
-            per_head = jnp.repeat(aux, repeats=num_reps, axis=0)[:, None]
         else:
             per_head = jnp.broadcast_to(aux[None, :], (num_q_heads, aux.shape[0]))
         return per_head.reshape(num_kv_heads, num_reps, per_head.shape[-1])
@@ -180,10 +180,9 @@ def attention(
             Values to aggregate based on attention weights.
         attention_mask: Optional boolean attention_mask with shape [batch, 1, seq_len, kv_len].
             True values indicate positions to attend to, False positions are masked.
-            Used if `bias` is not provided.
+            Applied together with `bias` when both are given.
         bias: Optional attention bias with shape [batch, num_heads, seq_len, kv_len].
             Additive bias applied to attention scores before softmax.
-            Takes precedence over `attention_mask`.
         init_bias: Optional callable that returns bias tensor.
             Used to lazily initialize bias if both attention_mask and bias are None.
         deterministic: If True, disables dropout (default). If False, applies dropout.
@@ -289,7 +288,10 @@ def attention(
             raise NotImplementedError("bias heads wont match!")
         aw = jnp.add(aw, bias.astype(aw.dtype))
 
-    elif attention_mask is not None:
+    # Apply the mask even when a bias is given: a positional bias (e.g. ALiBi) does not mask
+    # invalid keys such as empty decode-cache slots. For a bias that already encodes the mask
+    # this is a no-op (masked positions are finfo.min either way).
+    if attention_mask is not None:
         if attention_mask.dtype != jnp.bool_:
             attention_mask = attention_mask.astype(jnp.bool_)
 

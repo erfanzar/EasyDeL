@@ -25,6 +25,7 @@ import jaxtyping
 from beartype import beartype
 
 from ..._registry import Backend, Platform, kernel_registry
+from ..._sinks import reduce_sinks_to_per_head
 from ._xla_impl_fwd import Array, Bool, BwdParams, Callable, Float, FwdParams, Int
 from ._xla_impl_fwd import blocksparse_attention as _blocksparse_attention_impl
 
@@ -39,7 +40,7 @@ def blocksparse_attention(
     kv_segment_ids: Int[Array, "batch kv_len"] | None = None,
     q_positions: Int[Array, "batch seq_len"] | None = None,
     kv_positions: Int[Array, "batch kv_len"] | None = None,
-    softmax_aux: Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "..."] | None = None,
     bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
     attention_mask: (
         Bool[Array, "batch num_heads_or_1 seq_len kv_len"] | Int[Array, "batch num_heads_or_1 seq_len kv_len"] | None
@@ -122,6 +123,10 @@ def blocksparse_attention(
         This fallback materializes O(seq_len²) mask, which is memory-intensive.
         For production, use Pallas (TPU) or Triton (GPU) implementations.
     """
+    if softmax_aux is not None:
+        softmax_aux = reduce_sinks_to_per_head(softmax_aux, num_q_heads=query.shape[1], num_kv_heads=key.shape[1])[
+            :, None
+        ]
     return _blocksparse_attention_impl(
         query,
         key,

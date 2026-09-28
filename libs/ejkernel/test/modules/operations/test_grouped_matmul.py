@@ -118,6 +118,8 @@ def test_grouped_matmul_v3_supports_rhs_scale_and_bias():
         rhs_bias=rhs_bias,
         use_v3=True,
         platform="xla",
+        # DEFAULT precision is bf16 passes on TPU; the fp32 reference needs HIGHEST for atol=1e-5.
+        precision=jax.lax.Precision.HIGHEST,
     )
     ref = _grouped_matmul_v3_ref(
         lhs,

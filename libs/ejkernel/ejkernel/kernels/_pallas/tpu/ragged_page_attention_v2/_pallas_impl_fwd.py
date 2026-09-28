@@ -615,7 +615,9 @@ def ragged_page_attention_kernel(
                 qk = logits_soft_cap * jnp.tanh(qk / logits_soft_cap)
             qk += jnp.where(causal_mask, mask_value, 0.0)
             m_curr = jnp.max(qk, axis=1, keepdims=True)
-            s_curr = jnp.exp(qk - m_curr)
+            # With mask_value=-inf a KV block fully outside the window leaves m_curr == -inf; shift by 0
+            # there so the block contributes exp(-inf) == 0 instead of exp(-inf - -inf) == NaN (r13 S02-1).
+            s_curr = jnp.exp(qk - jnp.where(m_curr == -jnp.inf, 0.0, m_curr))
             qkv = jnp.dot(s_curr, v, preferred_element_type=jnp.float32)
             lm_store_shape = head_m_ref.shape
             m_curr = jnp.broadcast_to(m_curr, lm_store_shape)
@@ -624,8 +626,10 @@ def ragged_page_attention_kernel(
             l_prev = load_with_init(head_l_ref, l_aux)
             m_next = jnp.maximum(m_prev, m_curr)
             masked_store(head_m_ref, m_next, store_start, store_end, num_q_heads_per_kv_head)
-            alpha = jnp.exp(m_prev - m_next)
-            beta = jnp.exp(m_curr - m_next)
+            # Same guard for the rescale: both maxima -inf (no visible key, no sink yet) gives 0, not NaN.
+            m_next_shift = jnp.where(m_next == -jnp.inf, 0.0, m_next)
+            alpha = jnp.exp(m_prev - m_next_shift)
+            beta = jnp.exp(m_curr - m_next_shift)
             l_alpha = alpha * l_prev
             l_next = l_alpha + beta * l_curr
             l_next_safe = jnp.where(l_next == 0.0, 1.0, l_next)
@@ -732,7 +736,10 @@ def ragged_page_attention_kernel(
 
     seq_buf_idx_ref[0] = lax.select(seq_idx < num_seqs, seq_idx, 0)
     seq_buf_idx_ref[1] = buf_idx
-    o_ref[...] = acc_ref[...].astype(q_ref.dtype)
+    # Full-shape iota (same idiom as ``masked_store``): Mosaic lowers N-D iota
+    # reliably, whereas a 1-D ``jnp.arange`` + reshape broadcast may not.
+    row_ids = q_len_start + lax.broadcasted_iota(jnp.int32, acc_ref.shape, 0)
+    o_ref[...] = jnp.where(row_ids < cu_q_lens_ref[num_seqs], acc_ref[...], 0).astype(q_ref.dtype)
 
 
 def cdiv(a, b):

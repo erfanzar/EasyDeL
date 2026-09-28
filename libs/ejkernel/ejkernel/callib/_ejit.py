@@ -55,13 +55,17 @@ Example:
 
 from __future__ import annotations
 
+import dataclasses
+import enum
 import functools
 import hashlib
 import importlib.metadata
 import inspect
+import logging
 import os
 import pickle
 import platform
+import re
 import typing as tp
 import warnings
 from pathlib import Path
@@ -74,6 +78,8 @@ from ._utils import check_bool_flag, get_cache_dir
 
 if tp.TYPE_CHECKING:
     from jax._src.stages import Compiled, Lowered
+
+logger = logging.getLogger(__name__)
 
 P = tp.ParamSpec("P")
 R = tp.TypeVar("R")
@@ -289,30 +295,192 @@ def _get_leaf_signature(leaf: tp.Any) -> tp.Hashable:
 
     Returns:
         Hashable signature including shape, dtype, and sharding.
+
+    Note:
+        Static ``jax.jit`` arguments are baked into the compiled executable.
+        Their values (including enum, dtype, and configuration fields) must
+        participate in the persistent key. Objects without a stable textual
+        representation cannot safely share an on-disk executable.
     """
     if isinstance(leaf, jax.Array | np.ndarray):
         if hasattr(leaf, "sharding"):
             return (leaf.shape, str(jax.dtypes.canonicalize_dtype(leaf.dtype)), repr(leaf.sharding))
         return (leaf.shape, str(jax.dtypes.canonicalize_dtype(leaf.dtype)))
-    return type(leaf)
+    if isinstance(leaf, enum.Enum):
+        return (type(leaf), leaf.name)
+    if isinstance(leaf, bool | int | float | complex | str | bytes | type(None)):
+        return (type(leaf), leaf)
+    if isinstance(leaf, np.generic):
+        return (type(leaf), leaf.item())
+    if isinstance(leaf, np.dtype):
+        return (type(leaf), leaf.name)
+    if isinstance(leaf, type):
+        try:
+            leaf_dtype = np.dtype(leaf)
+        except TypeError:
+            leaf_dtype = None
+        # ``np.dtype`` maps every non-scalar class to ``object``; only accept real dtype-like classes
+        # so distinct user classes fall through to their (address-free) qualified-name repr.
+        if leaf_dtype is not None and (leaf_dtype != np.dtype(object) or leaf in (object, np.object_)):
+            return (type(leaf), leaf_dtype.name)
+    if dataclasses.is_dataclass(leaf) and not isinstance(leaf, type):
+        return (
+            type(leaf),
+            tuple((field.name, _get_leaf_signature(getattr(leaf, field.name))) for field in dataclasses.fields(leaf)),
+        )
+    if isinstance(leaf, tuple) and hasattr(leaf, "_fields"):
+        return (
+            type(leaf),
+            tuple((name, _get_leaf_signature(value)) for name, value in zip(leaf._fields, leaf, strict=True)),
+        )
+    if isinstance(leaf, set | frozenset):
+        return (type(leaf), tuple(sorted((_get_leaf_signature(value) for value in leaf), key=repr)))
+    representation = repr(leaf)
+    if re.search(r"0x[0-9a-fA-F]+", representation):
+        raise ValueError(f"No process-stable ejit cache signature for {type(leaf).__name__}")
+    return (type(leaf), representation)
 
 
-def _get_args_signature(args: tuple, kwargs: dict) -> str:
-    """Create signature for function arguments.
-
-    Generates a unique signature based on the PyTree structure,
-    shapes, and dtypes of arguments.
+def _get_args_signature(
+    args: tuple,
+    kwargs: dict,
+    static_argnums: tp.Collection[int] = (),
+    static_argnames: tp.Collection[str] = (),
+) -> str:
+    """Create a process-stable signature for JIT arguments.
 
     Args:
         args: Positional arguments.
         kwargs: Keyword arguments.
+        static_argnums: Positional indices baked into the executable.
+        static_argnames: Keyword names baked into the executable.
 
     Returns:
-        String signature of the arguments.
+        String signature of argument trees and dynamic avals or static values.
+
+    Raises:
+        ValueError: If a dynamic leaf cannot be traced or a static leaf has no stable key.
     """
-    arg_leaves, arg_tree = jax.tree_util.tree_flatten((args, kwargs))
-    leaf_signatures = tuple(map(_get_leaf_signature, arg_leaves))
-    return str((arg_tree, leaf_signatures))
+    static_indices = {index if index >= 0 else len(args) + index for index in static_argnums}
+    static_names = set(static_argnames)
+    _, arg_tree = jax.tree_util.tree_flatten((args, kwargs))
+    leaf_signatures = []
+    for index, arg in enumerate(args):
+        leaves = jax.tree_util.tree_leaves(arg)
+        if index in static_indices:
+            leaf_signatures.extend(_get_leaf_signature(leaf) for leaf in leaves)
+        else:
+            leaf_signatures.extend(_get_dynamic_leaf_signature(leaf) for leaf in leaves)
+    for name, arg in sorted(kwargs.items()):
+        leaves = jax.tree_util.tree_leaves(arg)
+        if name in static_names:
+            leaf_signatures.extend(_get_leaf_signature(leaf) for leaf in leaves)
+        else:
+            leaf_signatures.extend(_get_dynamic_leaf_signature(leaf) for leaf in leaves)
+    return str((arg_tree, tuple(leaf_signatures)))
+
+
+def _get_dynamic_leaf_signature(leaf: tp.Any) -> tp.Hashable:
+    """Key traceable dynamic leaves by abstract type, never their runtime value."""
+    if isinstance(leaf, jax.Array | np.ndarray):
+        return _get_leaf_signature(leaf)
+    if type(leaf) in (bool, int, float, complex):
+        return (type(leaf), True)
+    if isinstance(leaf, np.generic) and leaf.dtype.kind in "biufc":
+        return (type(leaf), False)
+    raise ValueError(f"No traceable dynamic ejit cache signature for {type(leaf).__name__}")
+
+
+class _UnstableClosureError(ValueError):
+    """Raised when a function's closure has no process-stable persistent-cache fingerprint."""
+
+
+def _get_closure_signature(func: tp.Callable) -> tuple:
+    """Fingerprint the values a function captured from its enclosing scopes.
+
+    Closure cell values are baked into the compiled executable, but ``inspect.getsource`` does not
+    see them, so two functions with identical source built by a factory with different captures
+    would otherwise share one persistent cache entry.
+
+    Args:
+        func: The function being wrapped by ``ejit``.
+
+    Returns:
+        A hashable tuple of ``(name, treedef, leaf signatures)`` per free variable, empty when the
+        function has no closure.
+
+    Raises:
+        _UnstableClosureError: If a captured value is unbound, unhashable, an array (its contents
+            would be baked in but are not keyed), or has no process-stable representation.
+    """
+    cells = getattr(func, "__closure__", None)
+    if not cells:
+        return ()
+    names = getattr(getattr(func, "__code__", None), "co_freevars", ())
+    signature = []
+    for name, cell in zip(names, cells, strict=False):
+        try:
+            value = cell.cell_contents
+        except ValueError as e:
+            raise _UnstableClosureError(f"closure variable '{name}' is unbound") from e
+        try:
+            hash(value)
+        except TypeError as e:
+            raise _UnstableClosureError(f"closure variable '{name}' is unhashable") from e
+        leaves, treedef = jax.tree_util.tree_flatten(value)
+        if any(isinstance(leaf, jax.Array | np.ndarray) for leaf in leaves):
+            raise _UnstableClosureError(f"closure variable '{name}' captures array values")
+        try:
+            leaf_signatures = tuple(_get_leaf_signature(leaf) for leaf in leaves)
+        except ValueError as e:
+            raise _UnstableClosureError(f"closure variable '{name}': {e}") from e
+        signature.append((name, str(treedef), leaf_signatures))
+    return tuple(signature)
+
+
+def _is_named_module_function(value) -> bool:
+    """True for a plain module-level function (no closure, importable qualified name)."""
+    if not inspect.isfunction(value) and not inspect.isbuiltin(value):
+        return False
+    qualname = getattr(value, "__qualname__", "") or ""
+    module = getattr(value, "__module__", None)
+    if not module or not qualname or "<locals>" in qualname or "<lambda>" in qualname:
+        return False
+    return not getattr(value, "__closure__", None)
+
+
+def _get_defaults_signature(func) -> tuple:
+    """Key positional and keyword-only default values under the closure stability policy.
+
+    A factory that captures a value through a default parameter (``def f(x, k=scale)``) has no
+    closure cells, and omitted defaults are absent from the call-argument signature, so without
+    this two such functions shared one persistent cache entry (r12 S06-1).
+
+    Raises:
+        _UnstableClosureError: If a default is unhashable, an array, or has no stable representation.
+    """
+    entries = [(f"__defaults__[{i}]", v) for i, v in enumerate(getattr(func, "__defaults__", None) or ())]
+    entries += [(f"__kwdefaults__[{k}]", v) for k, v in sorted((getattr(func, "__kwdefaults__", None) or {}).items())]
+    signature = []
+    for name, value in entries:
+        if _is_named_module_function(value):
+            # e.g. ``policy=jax.checkpoint_policies.nothing_saveable``: its repr carries an address,
+            # but a module-level function is identified stably by its import path.
+            signature.append((name, "callable", f"{value.__module__}.{value.__qualname__}"))
+            continue
+        try:
+            hash(value)
+        except TypeError as e:
+            raise _UnstableClosureError(f"default '{name}' is unhashable") from e
+        leaves, treedef = jax.tree_util.tree_flatten(value)
+        if any(isinstance(leaf, jax.Array | np.ndarray) for leaf in leaves):
+            raise _UnstableClosureError(f"default '{name}' captures array values")
+        try:
+            leaf_signatures = tuple(_get_leaf_signature(leaf) for leaf in leaves)
+        except ValueError as e:
+            raise _UnstableClosureError(f"default '{name}': {e}") from e
+        signature.append((name, str(treedef), leaf_signatures))
+    return tuple(signature)
 
 
 def ejit(
@@ -424,7 +592,23 @@ def ejit(
         inline=inline,
         keep_unused=keep_unused,
     )
-    jit_options_sig = str((static_argnums, static_argnames, donate_argnums, in_shardings, out_shardings))
+    jit_options_sig = str(
+        (
+            static_argnums,
+            static_argnames,
+            donate_argnums,
+            donate_argnames,
+            in_shardings,
+            out_shardings,
+            backend,
+            keep_unused,
+            inline,
+            tuple(sorted((str(k), repr(v)) for k, v in compiler_options.items())) if compiler_options else None,
+        )
+    )
+    # Diagnostics must not assume ``__name__``: functools.partial objects and callable instances lack it,
+    # and reading it turned the intended fallback to plain jit into an AttributeError (r14 S06-1).
+    _func_label = getattr(func, "__name__", None) or type(func).__qualname__
     static_key_part: str | None = None
     static_key_disabled = False
 
@@ -436,14 +620,27 @@ def ejit(
         if static_key_part is not None:
             return static_key_part
         try:
+            # Default argument values are baked in exactly like closure cells, and omitted defaults
+            # never appear in the call-argument signature (r12 S06-1).
+            if inspect.ismethod(func):
+                # A bound method bakes receiver state (``self.scale``) into its program, but the
+                # receiver is neither source, closure, default nor a call argument: two instances would
+                # share one executable (r13 S06-1). It has no stable fingerprint, so skip the cache.
+                raise _UnstableClosureError("bound method receiver state cannot be keyed")
+            closure_sig = str(_get_closure_signature(func)) + str(_get_defaults_signature(func))
+        except _UnstableClosureError as e:
+            static_key_disabled = True
+            logger.debug("ejit persistent cache skipped for '%s': %s", getattr(func, "__name__", func), e)
+            return None
+        try:
             func_source = inspect.getsource(func)
             hardware_sig = _get_hardware_signature()
-            static_key_part = "".join([func_source, hardware_sig, jit_options_sig])
+            static_key_part = "".join([func_source, closure_sig, hardware_sig, jit_options_sig])
             return static_key_part
         except Exception as e:
             static_key_disabled = True
             warnings.warn(
-                f"Could not create static cache key for ejit function '{func.__name__}'. "
+                f"Could not create static cache key for ejit function '{_func_label}'. "
                 f"Falling back to regular jit. Error: {e}",
                 stacklevel=2,
             )
@@ -463,6 +660,23 @@ def ejit(
         if static_argnames is not None
         else set()
     )
+    # JAX infers the other form when only one of static_argnums/static_argnames
+    # is supplied (``jax._src.api_util.infer_argnums_and_argnames``): only
+    # POSITIONAL_OR_KEYWORD parameters, and never from negative indices.
+    if (static_argnums is None) != (static_argnames is None):
+        try:
+            keyword_positions = [
+                (index, name)
+                for index, (name, parameter) in enumerate(inspect.signature(func).parameters.items())
+                if parameter.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD
+            ]
+            if static_argnames is None:
+                static_arg_names_set.update(name for index, name in keyword_positions if index in static_arg_indices)
+            else:
+                static_arg_indices.update(index for index, name in keyword_positions if name in static_arg_names_set)
+        except (TypeError, ValueError):
+            # Without a signature JAX cannot infer the complementary form either.
+            pass
 
     def get_compiled_and_cache(static_key: str, args_sig: str, args, kwargs) -> Compiled | None:
         """Retrieve or compile a function with the given argument signature.
@@ -512,7 +726,7 @@ def ejit(
 
             try:
                 payload = _serialize_compiled(compiled_func)
-                if not _entry_too_large(len(payload[0]), f"save for '{func.__name__}'"):
+                if not _entry_too_large(len(payload[0]), f"save for '{_func_label}'"):
                     func_dir.mkdir(parents=True, exist_ok=True)
                     _atomic_pickle_dump(payload, filepath)
             except Exception:
@@ -521,7 +735,7 @@ def ejit(
             COMPILED_CACHE[compilation_key] = compiled_func
             return compiled_func
         except Exception as e:
-            warnings.warn(f"ejit compilation failed for '{func.__name__}'. Error: {e}", stacklevel=2)
+            warnings.warn(f"ejit compilation failed for '{_func_label}'. Error: {e}", stacklevel=2)
             return None
 
     @functools.wraps(func)
@@ -543,17 +757,18 @@ def ejit(
             local_static_key_part = _resolve_static_key_part()
             if local_static_key_part is None:
                 return jitted_function(*args, **kwargs)
-            args_sig = _get_args_signature(args, kwargs)
+            args_sig = _get_args_signature(args, kwargs, static_arg_indices, static_arg_names_set)
             compiled_func = get_compiled_and_cache(local_static_key_part, args_sig, args, kwargs)
 
         except Exception as e:
             warnings.warn(
-                f"ejit signature generation failed for '{func.__name__}'. Falling back. Error: {e}", stacklevel=2
+                f"ejit signature generation failed for '{_func_label}'. Falling back. Error: {e}", stacklevel=2
             )
             return jitted_function(*args, **kwargs)
         if compiled_func is None:
             return jitted_function(*args, **kwargs)
-        dynamic_args = tuple(arg for i, arg in enumerate(args) if i not in static_arg_indices)
+        static_positions = {index if index >= 0 else len(args) + index for index in static_arg_indices}
+        dynamic_args = tuple(arg for i, arg in enumerate(args) if i not in static_positions)
         dynamic_kwargs = {k: v for k, v in kwargs.items() if k not in static_arg_names_set}
         return compiled_func(*dynamic_args, **dynamic_kwargs)
 

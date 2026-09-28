@@ -80,6 +80,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jaxtyping import Array, DTypeLike, Float, Int
 
 from ejkernel.callib import ejit
+from ejkernel.kernels._xla.ragged_page_attention_v3._sinks import reduce_sinks_to_heads
 
 from ...._registry import Backend, Platform, kernel_registry
 from ._pallas_impl_fwd import (
@@ -259,7 +260,7 @@ def ragged_page_attention_v2(
     compute_dtype: DTypeLike = jnp.bfloat16,
     optimized: bool = False,
     sliding_window: int | None = None,
-    softmax_aux: Float[Array, "num_q_heads"] | None = None,
+    softmax_aux: Float[Array, "..."] | None = None,
     mask_value: float | None = None,
     num_kv_pages_per_block: int | None = None,
     num_queries_per_block: int | None = None,
@@ -290,7 +291,10 @@ def ragged_page_attention_v2(
         compute_dtype: Dtype for computation (ignored in this implementation).
         optimized: Whether to use optimized kernel (ignored in this implementation).
         sliding_window: Size of sliding window for local attention.
-        softmax_aux: Optional attention sink logits [num_q_heads] for streaming.
+        softmax_aux: Optional attention sink logits. Accepts ``[num_q_heads]``, a
+            shared ``[num_sinks]``, or 2-D ``[num_q_heads|num_kv_heads|1, num_sinks]``;
+            several sinks of one head are reduced with ``logsumexp`` to one per-head
+            sink before the kernel (exactly equivalent).
         mask_value: Value for masked positions in attention matrix.
         num_kv_pages_per_block: Number of KV pages per compute block in kernel.
         num_queries_per_block: Number of queries per compute block in kernel.
@@ -316,9 +320,11 @@ def ragged_page_attention_v2(
     if softmax_scale is None:
         softmax_scale = queries.shape[-1] ** -0.5
 
+    num_q_heads = queries.shape[1]
     if softmax_aux is None:
-        num_q_heads = queries.shape[1]
         softmax_aux = jnp.full((num_q_heads,), -jnp.inf, dtype=jnp.float32)
+    else:
+        softmax_aux = reduce_sinks_to_heads(softmax_aux, num_q_heads, kv_pages.shape[2] // 2)
 
     return _ragged_page_attention(
         queries,

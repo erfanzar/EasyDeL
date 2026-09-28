@@ -46,6 +46,7 @@ Available kernels:
     ragged_page_attention_v3: Variable-length paged attention v3 (VMEM-safe).
     reduce_scatter_matmul: Matmul fused with reduce-scatter collective.
     ring_attention: Distributed attention using ring all-reduce collectives.
+    sparse_multi_latent_ragged_page_attention: MLA ragged paged attention over selected chunks.
 """
 
 from .all_gather import all_gather
@@ -67,10 +68,12 @@ from .grouped_matmul import grouped_matmul
 from .grouped_matmul_channelwise import grouped_matmul_channelwise
 from .grouped_matmulv2 import grouped_matmulv2
 from .grouped_matmulv3 import grouped_matmulv3
+from .kda_chunk_local import kda_chunk_local
 from .mhc_coefficients import mhc_coefficients
 from .multi_latent_ragged_page_attention import multi_latent_ragged_page_attention
 from .multi_latent_ragged_page_attention_v2 import multi_latent_ragged_page_attention_v2
 from .page_attention import page_attention
+from .paged_pool_topk import paged_pool_topk
 from .prefill_page_attention import prefill_page_attention
 from .quantized_matmul import quantized_matmul
 from .ragged_decode_attention import ragged_decode_attention
@@ -82,6 +85,8 @@ from .reduce_scatter import reduce_scatter
 from .reduce_scatter_matmul import reduce_scatter_matmul
 from .ring_attention import ring_attention
 from .sinkhorn_knopp import sinkhorn_knopp
+from .sparse_multi_latent_ragged_page_attention import sparse_multi_latent_ragged_page_attention
+from .sparse_selected_attention import sparse_selected_attention
 from .topk import topk as topk
 
 __all__ = (
@@ -104,10 +109,12 @@ __all__ = (
     "grouped_matmul_channelwise",
     "grouped_matmulv2",
     "grouped_matmulv3",
+    "kda_chunk_local",
     "mhc_coefficients",
     "multi_latent_ragged_page_attention",
     "multi_latent_ragged_page_attention_v2",
     "page_attention",
+    "paged_pool_topk",
     "prefill_page_attention",
     "quantized_matmul",
     "ragged_decode_attention",
@@ -119,4 +126,6 @@ __all__ = (
     "reduce_scatter_matmul",
     "ring_attention",
     "sinkhorn_knopp",
+    "sparse_multi_latent_ragged_page_attention",
+    "sparse_selected_attention",
 )

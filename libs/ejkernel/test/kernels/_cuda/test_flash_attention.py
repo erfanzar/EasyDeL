@@ -91,6 +91,16 @@ class TestFlashAttentionCuda:
         with pytest.raises(EjkernelRuntimeError):
             _ = cuda_flash_attention(q, k, v, attention_mask=mask, causal=False)
 
+    def test_paged_kv_rejects_length_mask_even_with_alibi(self):
+        q = jnp.ones((2, 1, 2, 32), dtype=jnp.float16)
+        cache = jnp.ones((4, 16, 2, 32), dtype=jnp.float16)
+        tables = jnp.array([[0, 1], [2, 3]], dtype=jnp.int32)
+        mask = jnp.ones((2, 1, 1, 32), dtype=jnp.bool_)
+        mask = mask.at[0, :, :, 17:].set(False)
+        alibi = jnp.ones((2,), dtype=jnp.float32)
+        with pytest.raises(EjkernelRuntimeError, match="per-sequence KV lengths"):
+            cuda_flash_attention(q, cache, cache, attention_mask=mask, bias=alibi, block_tables=tables)
+
     def test_rejects_softmax_aux(self):
         key = jax.random.PRNGKey(6)
         kq, kk, kv, ks = jax.random.split(key, 4)

@@ -89,6 +89,8 @@ class CompressedWindowAttention(Kernel[CompressedWindowAttentionConfig, Array]):
         platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         *,
         cfg: CompressedWindowAttentionConfig,
+        token_valid: Array | None = None,
+        entry_topk: Array | None = None,
     ) -> Float[Array, "batch num_heads q_len head_dim"]:
         """Execute compressed-window full-sequence attention.
 
@@ -100,6 +102,10 @@ class CompressedWindowAttention(Kernel[CompressedWindowAttentionConfig, Array]):
             softmax_scale: Logit scale; defaults to ``head_dim ** -0.5``.
             platform: Optional platform override.
             cfg: Kernel configuration.
+            token_valid: Optional per-key token validity ``[batch, token_kv_len]``;
+                ``bias`` then holds only the compressed-entry columns.
+            entry_topk: Optional selected entry ids ``[batch, q_len, k]`` replacing
+                the entry columns of ``bias`` (requires ``token_valid``).
 
         Returns:
             Attention output ``[batch, num_heads, q_len, head_dim]``.
@@ -123,6 +129,8 @@ class CompressedWindowAttention(Kernel[CompressedWindowAttentionConfig, Array]):
             fwd_params=getattr(cfg, "fwd_params", None),
             window=getattr(cfg, "window", 0),
             token_kv_len=getattr(cfg, "token_kv_len", 0),
+            token_valid=token_valid,
+            entry_topk=entry_topk,
         )
 
     def heuristic_cfg(self, inv: Invocation[CompressedWindowAttentionConfig, Array]) -> CompressedWindowAttentionConfig:
@@ -147,13 +155,17 @@ class CompressedWindowAttention(Kernel[CompressedWindowAttentionConfig, Array]):
         in_specs: tuple[PartitionSpec, ...] | None = None,
         out_specs: PartitionSpec | None = None,
         check_vma: bool = False,
+        token_valid: Array | None = None,
+        entry_topk: Array | None = None,
     ):
         """Build a ``shard_map`` wrapper for head-parallel (TP) execution.
 
         The single shared KV head is replicated across the tensor-parallel axis
         and the query/output heads are sharded, so each device runs the kernel
         over its local heads with no in-kernel collectives. The wrapper is
-        differentiable (``shard_map`` composes with ``jax.grad``).
+        differentiable (``shard_map`` composes with ``jax.grad``). When
+        ``token_valid`` is given it is a fifth ``shard_map`` operand and
+        ``in_specs`` must carry a fifth spec for it.
 
         Args:
             query: Queries ``[batch, num_heads, q_len, head_dim]``.
@@ -164,9 +176,12 @@ class CompressedWindowAttention(Kernel[CompressedWindowAttentionConfig, Array]):
             platform: Optional platform override.
             cfg: Kernel configuration.
             mesh: Device mesh.
-            in_specs: Partition specs for ``(query, kv, bias, softmax_aux)``.
+            in_specs: Partition specs for ``(query, kv, bias, softmax_aux)``,
+                plus ``token_valid`` when it is given.
             out_specs: Partition spec for the output.
             check_vma: Whether to check for valid memory access patterns.
+            token_valid: Optional per-key token validity ``[batch, token_kv_len]``.
+            entry_topk: Optional selected entry ids ``[batch, q_len, k]``.
 
         Returns:
             Tuple ``(shard_map_fn, call_args)``.
@@ -174,8 +189,20 @@ class CompressedWindowAttention(Kernel[CompressedWindowAttentionConfig, Array]):
         assert mesh is not None, "mesh must be provided for shard_map execution"
         assert in_specs is not None, "in_specs must be provided for shard_map execution"
         assert out_specs is not None, "out_specs must be provided for shard_map execution"
+        # Optional array operands ride after the four fixed ones, in this order, only when given.
+        extras = [
+            (name, value)
+            for name, value in (("token_valid", token_valid), ("entry_topk", entry_topk))
+            if value is not None
+        ]
+        n_operands = 4 + len(extras)
+        if len(in_specs) != n_operands:
+            raise ValueError(
+                f"in_specs must have {n_operands} entries (optional operands given: {[n for n, _ in extras]})."
+            )
+        extra_names = tuple(name for name, _ in extras)
 
-        def _wrapper(query, kv, bias, softmax_aux):
+        def _wrapper(query, kv, bias, softmax_aux, *rest):
             """Shard-map body delegating to ``run`` with captured static params."""
             return self.run(
                 query=query,
@@ -185,6 +212,7 @@ class CompressedWindowAttention(Kernel[CompressedWindowAttentionConfig, Array]):
                 softmax_scale=softmax_scale,
                 platform=platform,
                 cfg=cfg or self.heuristic_cfg(None),
+                **dict(zip(extra_names, rest, strict=True)),
             )
 
         shard_map_fn = shard_map(
@@ -194,7 +222,7 @@ class CompressedWindowAttention(Kernel[CompressedWindowAttentionConfig, Array]):
             out_specs=out_specs,
             check_vma=check_vma,
         )
-        call_args = (query, kv, bias, softmax_aux)
+        call_args = (query, kv, bias, softmax_aux, *(value for _, value in extras))
         return shard_map_fn, call_args
 
 
@@ -227,6 +255,8 @@ def compressed_window_attention(
     mesh: Mesh | None = None,
     in_specs: tuple[PartitionSpec | None, ...] | None = None,
     out_specs: PartitionSpec | None = None,
+    token_valid: Array | None = None,
+    entry_topk: Array | None = None,
 ) -> Float[Array, "batch num_heads q_len head_dim"]:
     """Fused differentiable shared-KV sink-augmented attention (DeepSeek-V4).
 
@@ -258,12 +288,30 @@ def compressed_window_attention(
             the KV axis (the rest are always-visible compressed entries). Only
             used when ``window > 0``.
         mesh: Optional device mesh for ``shard_map`` (tensor-parallel) execution.
-        in_specs: Partition specs for ``(query, kv, bias, softmax_aux)``.
+        in_specs: Partition specs for ``(query, kv, bias, softmax_aux)``, plus a
+            fifth spec for ``token_valid`` when it is given.
         out_specs: Output partition spec.
+        token_valid: Optional per-key token validity ``[batch, token_kv_len]``.
+            When given, ``bias`` holds only the compressed-entry columns
+            ``[batch, q_len, kv_len - token_kv_len]`` and the token-region
+            window / causal / padding mask is built by the backend (no dense
+            ``[q_len, token_kv_len]`` bias or bias cotangent). Requires
+            ``window > 0`` and ``token_kv_len == q_len``.
+        entry_topk: Optional selected entry ids ``[batch, q_len, k]`` (``-1``
+            padded; repeats count once) replacing the entry columns of ``bias``
+            (pass a zero-width ``bias``), so no ``[q_len, entries]`` selection
+            bias is built by the caller. Requires ``token_valid``. With a sink,
+            long sequences run a sparse ``O(S * (window + k))`` attend in both
+            directions. ``in_specs`` takes one more spec for it (after
+            ``token_valid``).
 
     Returns:
         Attention output ``[batch, num_heads, q_len, head_dim]``.
     """
+    if token_valid is not None and (not window or int(token_kv_len) != query.shape[2]):
+        raise ValueError("token_valid requires window > 0 and token_kv_len == q_len.")
+    if entry_topk is not None and token_valid is None:
+        raise ValueError("entry_topk requires token_valid (the implicit token mask).")
     method = None
     if mesh is not None and in_specs is not None and out_specs is not None:
         method = "shard_map"
@@ -295,4 +343,6 @@ def compressed_window_attention(
         in_specs=in_specs,
         out_specs=out_specs,
         _cfg=cfg,
+        token_valid=token_valid,
+        entry_topk=entry_topk,
     )

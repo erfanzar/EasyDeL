@@ -84,6 +84,31 @@ def _build_test_inputs(seed=0, *, with_softmax_aux=False):
 
 
 class TestRaggedPageAttentionTPU:
+    def test_padded_query_rows_are_zero(self):
+        queries, kv_pages, context_lens, block_tables, query_start_loc, num_seqs, scale, _ = _build_test_inputs()
+        padded_queries = jnp.pad(queries, ((0, 7), (0, 0), (0, 0)), constant_values=5)
+        out = ragged_page_attention_v2(
+            padded_queries,
+            kv_pages,
+            context_lens,
+            block_tables,
+            query_start_loc,
+            num_seqs,
+            softmax_scale=scale,
+        )
+        ref = ragged_page_attention_v2_xla(
+            padded_queries,
+            kv_pages,
+            context_lens,
+            block_tables,
+            query_start_loc,
+            num_seqs,
+            softmax_scale=scale,
+        )
+        assert out.shape == padded_queries.shape
+        assert jnp.allclose(out[-7:], jnp.zeros_like(out[-7:]))
+        assert jnp.allclose(out, ref, atol=0.125, rtol=0)
+
     def test_matches_reference_pure(self):
         (
             queries,
@@ -276,3 +301,39 @@ class TestRaggedPageAttentionTPU:
 
         assert out_tpu.shape == out_xla.shape
         assert jnp.allclose(out_tpu, out_xla, rtol=0, atol=0.15)
+
+    @pytest.mark.parametrize("with_sink", [False, True])
+    def test_infinite_mask_value_with_window_skipped_block_is_finite(self, with_sink):
+        """``mask_value=-inf`` must not turn a KV block fully outside the window into NaN (r13 S02-1).
+
+        Queries sit at positions 224..255 with ``sliding_window=32``, so KV block 0 (tokens 0..127) is
+        invisible to every row. Zero Q/K and unit V make the exact output all ones.
+        """
+        num_q_heads, num_kv_heads, head_dim, page_size = 8, 2, 128, 128
+        queries = jnp.zeros((32, num_q_heads, head_dim), jnp.float32)
+        kv_pages = jnp.zeros((2, page_size, 2 * num_kv_heads, head_dim), jnp.float32)
+        kv_pages = kv_pages.at[:, :, 1::2, :].set(1.0)  # K = 0 (even slots), V = 1 (odd slots)
+        # A very negative sink keeps the exact answer at one while exercising the finite-sink path.
+        softmax_aux = jnp.full((num_q_heads,), -1e4, jnp.float32) if with_sink else None
+
+        def run(mask_value):
+            kwargs = {} if mask_value is None else {"mask_value": mask_value}
+            return ragged_page_attention_v2(
+                queries,
+                kv_pages,
+                jnp.array([256], jnp.int32),
+                jnp.array([[0, 1]], jnp.int32),
+                jnp.array([0, 32], jnp.int32),
+                jnp.array([1], jnp.int32),
+                softmax_scale=head_dim**-0.5,
+                sliding_window=32,
+                softmax_aux=softmax_aux,
+                num_kv_pages_per_block=1,
+                num_queries_per_block=32,
+                **kwargs,
+            )
+
+        out = run(float("-inf"))
+        assert jnp.all(jnp.isfinite(out)), out
+        assert jnp.allclose(out, 1.0, atol=1e-4), float(jnp.max(jnp.abs(out - 1.0)))
+        assert jnp.allclose(out, run(None), atol=1e-4)

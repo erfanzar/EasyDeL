@@ -2037,7 +2037,9 @@ Error RunCublasLtGemm(const void *w_deq, cudaDataType_t a_type, const void *x,
   cublasOperation_t transb = CUBLAS_OP_N;
 
   if (Error err = CheckCublasLt(
-          cublasLtMatmulDescCreate(&op_desc, compute_type, CUDA_R_32F),
+          cublasLtMatmulDescCreate(
+              &op_desc, compute_type,
+              ComputeTypeUsesHalfScalars(compute_type) ? CUDA_R_16F : CUDA_R_32F),
           "cublasLtMatmulDescCreate");
       err.failure()) {
     return err;
@@ -2170,17 +2172,14 @@ Error RunCublasLtGemm(const void *w_deq, cudaDataType_t a_type, const void *x,
   float beta_f = 0.0f;
   half alpha_h = __float2half_rn(1.0f);
   half beta_h = __float2half_rn(0.0f);
-  const void *alpha_ptr =
-      ComputeTypeUsesHalfScalars(compute_type)
-          ? static_cast<const void *>(&alpha_h)
-          : static_cast<const void *>(&alpha_f);
-  const void *beta_ptr =
-      ComputeTypeUsesHalfScalars(compute_type)
-          ? static_cast<const void *>(&beta_h)
-          : static_cast<const void *>(&beta_f);
-
+  const void *alpha = ComputeTypeUsesHalfScalars(compute_type)
+                          ? static_cast<const void *>(&alpha_h)
+                          : static_cast<const void *>(&alpha_f);
+  const void *beta = ComputeTypeUsesHalfScalars(compute_type)
+                         ? static_cast<const void *>(&beta_h)
+                         : static_cast<const void *>(&beta_f);
   cublasStatus_t status = cublasLtMatmul(
-      lt_handle, op_desc, alpha_ptr, w_deq, layout_a, x, layout_b, beta_ptr, out,
+      lt_handle, op_desc, alpha, w_deq, layout_a, x, layout_b, beta, out,
       layout_c, out, layout_c, &algo, workspace, workspace_size, stream);
 
   cublasLtMatmulPreferenceDestroy(preference);

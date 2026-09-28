@@ -42,7 +42,7 @@ def attention(
     init_bias: Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
     deterministic: bool = True,
     dropout_rng: PRNGKeyArray | None = None,
-    softmax_aux: Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "num_sinks"] | Float[Array, "sink_heads num_sinks"] | None = None,
     softmax_scale: float | None = None,
     logits_soft_cap: float | None = None,
     dtype: DTypeLike | None = jnp.bfloat16,

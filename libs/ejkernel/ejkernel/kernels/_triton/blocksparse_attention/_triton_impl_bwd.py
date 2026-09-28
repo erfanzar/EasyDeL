@@ -210,8 +210,10 @@ def _blocksparse_attn_bwd_dkdv_inner(
             LOG2_CONST: tl.constexpr = 1.4426950408889634
             s = attn_weights_transpose * softmax_scale
             x = s / logits_soft_cap
-            exp_2x = tl.exp(2.0 * x)
-            tanh_x = (exp_2x - 1.0) / (exp_2x + 1.0)
+            # Overflow-free tanh, identical to the forward recompute (r12 S05-1).
+            exp_neg = tl.exp(-2.0 * tl.abs(x))
+            tanh_abs = (1.0 - exp_neg) / (1.0 + exp_neg)
+            tanh_x = tl.where(x >= 0, tanh_abs, -tanh_abs)
             qk_after = (logits_soft_cap * tanh_x) * LOG2_CONST
             jac = (softmax_scale * LOG2_CONST) * (1.0 - tanh_x * tanh_x)
         else:
@@ -353,8 +355,10 @@ def _blocksparse_attn_bwd_dq_inner(
             LOG2_CONST: tl.constexpr = 1.4426950408889634
             s = attention_weights / LOG2_CONST
             x = s / logits_soft_cap
-            exp_2x = tl.exp(2.0 * x)
-            tanh_x = (exp_2x - 1.0) / (exp_2x + 1.0)
+            # Overflow-free tanh, identical to the forward recompute (r12 S05-1).
+            exp_neg = tl.exp(-2.0 * tl.abs(x))
+            tanh_abs = (1.0 - exp_neg) / (1.0 + exp_neg)
+            tanh_x = tl.where(x >= 0, tanh_abs, -tanh_abs)
             qk_after = (logits_soft_cap * tanh_x) * LOG2_CONST
             jac = (softmax_scale * LOG2_CONST) * (1.0 - tanh_x * tanh_x)
         else:

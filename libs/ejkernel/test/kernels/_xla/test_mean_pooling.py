@@ -106,6 +106,33 @@ class TestMeanPooling:
 
         assert dx.shape == x.shape
 
+    def test_jitted_packed_dynamic_boundaries_and_gradient(self):
+        """Runtime-varying boundaries must produce the right means and token gradients."""
+        x = jnp.arange(1, 17, dtype=jnp.float32).reshape(8, 2)
+        boundaries = jnp.asarray([0, 2, 2, 5, 8], dtype=jnp.int32)
+        run = jax.jit(lambda values, starts: mean_pooling(values, cu_seqlens=starts))
+        output = run(x, boundaries)
+        expected = jnp.stack([x[:2].mean(0), jnp.zeros(2), x[2:5].mean(0), x[5:8].mean(0)])
+        assert jnp.allclose(output, expected)
+
+        dx = jax.jit(jax.grad(lambda values, starts: mean_pooling(values, cu_seqlens=starts).sum()))(x, boundaries)
+        expected_dx = jnp.asarray([[1 / 2] * 2] * 2 + [[1 / 3] * 2] * 6)
+        assert jnp.allclose(dx, expected_dx)
+
+        changed = jnp.asarray([0, 1, 4, 4, 8], dtype=jnp.int32)
+        expected_changed = jnp.stack([x[:1].mean(0), x[1:4].mean(0), jnp.zeros(2), x[4:].mean(0)])
+        assert jnp.allclose(run(x, changed), expected_changed)
+
+    def test_varlen_float64_is_not_narrowed(self):
+        """Packed pooling must keep float64 precision (r10 S04-2: it used to accumulate in float32)."""
+        with jax.enable_x64(True):
+            x = jnp.asarray([[1073741824.0], [1073741826.0]], dtype=jnp.float64)
+            cu_seqlens = jnp.asarray([0, 2], dtype=jnp.int32)
+            out = mean_pooling(x, cu_seqlens=cu_seqlens)
+            assert out.dtype == jnp.float64
+            # float32 accumulation rounds 1073741826 to 1073741824 and gives 1073741824.
+            assert float(out[0, 0]) == 1073741825.0
+
     def test_gradient_distribution(self):
         """Test that gradients are correctly distributed in varlen case."""
         hidden_dim = 4

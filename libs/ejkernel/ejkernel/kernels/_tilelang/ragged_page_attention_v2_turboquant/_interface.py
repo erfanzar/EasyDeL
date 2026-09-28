@@ -39,8 +39,8 @@ is:
 
     score ≈ (Q_rot ⊙ centroid) @ orig_norm  +  (Q_proj ⊙ sign) @ res_norm * qjl_factor
 
-where ``Q_rot = q @ Rotation`` and ``Q_proj = q @ QJLProjection.T``, and
-``qjl_factor = sqrt(2π) / qjl_dim``.
+where ``Q_rot = q @ Rotation.T`` and ``Q_proj = Q_rot @ QJLProjection.T``, and
+``qjl_factor = sqrt(π/2) / qjl_dim``.
 """
 
 from __future__ import annotations

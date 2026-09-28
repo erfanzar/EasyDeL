@@ -522,7 +522,9 @@ class Executor(Generic[Cfg, Out]):
             )
             vjp_method = _get_platform_method(kernel, "vjp", platform, context) or kernel.vjp
 
-            full_leaves, treedef = jtu.tree_flatten((args2, kwargs2))
+            # None is flattened as a leaf (is_leaf) so that positions in the grad pytree
+            # line up 1:1 with positions in the input pytree in bwd_arrays below.
+            full_leaves, treedef = jtu.tree_flatten((args2, kwargs2), is_leaf=lambda x: x is None)
             is_arr = [isinstance(x, jax.Array) for x in full_leaves]
 
             const_leaves = [None if m else x for m, x in zip(is_arr, full_leaves, strict=False)]
@@ -537,14 +539,14 @@ class Executor(Generic[Cfg, Out]):
                 """Forward rule: takes only array leaves, rebuilds args/kwargs inside."""
                 a, k = _restore_args_kwargs(array_leaves)
                 y, res = fwd_method(*a, cfg=chosen, **k)
-                return y, (tuple(array_leaves), res)
+                return y, (tuple(array_leaves), y, res)
 
             def bwd_arrays(payload, dy):
                 """Backward rule: rebuild args/kwargs, call kernel.vjp, and map grads to array inputs."""
-                array_leaves, res = payload
+                array_leaves, y, res = payload
                 a, k = _restore_args_kwargs(array_leaves)
 
-                grads = vjp_method(res, dy, *a, cfg=chosen, **k)
+                grads = vjp_method(res, y, dy, *a, cfg=chosen, **k)
                 if isinstance(grads, dict):
                     raise TypeError("kernel.vjp must return a tuple of grads for positional args.")
                 grads = tuple(grads)
@@ -567,7 +569,7 @@ class Executor(Generic[Cfg, Out]):
                 }
 
                 full_grads = (aligned_args_grads, zeros_kwargs)
-                flat_grads, _ = jtu.tree_flatten(full_grads)
+                flat_grads, _ = jtu.tree_flatten(full_grads, is_leaf=lambda x: x is None)
 
                 grad_out = []
                 itg = iter(flat_grads)
@@ -588,7 +590,7 @@ class Executor(Generic[Cfg, Out]):
 
             def fn(*a, **k):
                 """Extract array leaves from args/kwargs and route through the custom VJP wrapper."""
-                flat_call, _ = jtu.tree_flatten((a, k))
+                flat_call, _ = jtu.tree_flatten((a, k), is_leaf=lambda x: x is None)
                 array_in = [x for x, m in zip(flat_call, is_arr, strict=False) if m]
                 return g(*array_in)
 

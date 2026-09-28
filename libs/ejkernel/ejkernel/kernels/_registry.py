@@ -557,10 +557,21 @@ class KernelRegistry:
                 continue
             return spec.implementation
 
-        if platform == Platform.XLA:
-            return self.get(algorithm=algorithm, platform=platform, backend=Backend.ANY)
+        # Fallbacks are iterative (not recursive ``self.get`` calls): a recursive
+        # XLA -> Backend.ANY retry never terminates when the algorithm has XLA
+        # implementations only for specific backends (or none at all), turning a
+        # lookup miss into a RecursionError instead of the documented ValueError.
+        if platform == Platform.XLA and backend != Backend.ANY:
+            for spec in candidates:
+                if spec.platform == Platform.XLA and spec.backend == Backend.ANY:
+                    return spec.implementation
         if backend == Backend.ANY:
-            return self.get(algorithm=algorithm, platform=platform, backend=jax.default_backend())
+            default_backend = Backend(jax.default_backend())
+            for spec in candidates:
+                if platform is not None and spec.platform != platform:
+                    continue
+                if spec.backend == default_backend or spec.backend == Backend.ANY:
+                    return spec.implementation
         raise ValueError(f"No implementation found for algorithm={algorithm}, platform={platform}, backend={backend}")
 
     def list_algorithms(self) -> list[str]:

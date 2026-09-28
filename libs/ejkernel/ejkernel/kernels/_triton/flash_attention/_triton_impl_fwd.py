@@ -47,6 +47,7 @@ from jaxtyping import Array, Bool, Float, Int
 from triton import Config
 
 from ejkernel.callib import triton_call
+from ejkernel.kernels._xla.attention._xla_impl_fwd import _normalize_softmax_aux
 from ejkernel.ops import BwdParams, FwdParams
 from ejkernel.utils import dtype_index, get_strides
 
@@ -219,12 +220,7 @@ def _attn_fwd_inner(
                 other=0.0,
             )
 
-    qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.bfloat16)
-
-    if USE_SINKS:
-        qk += tl.dot(q.to(tl.bfloat16), tl.trans(k.to(tl.bfloat16)))
-    else:
-        qk += tl.dot(q, tl.trans(k))
+    qk = tl.dot(q, tl.trans(k), out_dtype=tl.float32)
 
     if PADDED_COLS:
         qk += tl.where(
@@ -274,8 +270,10 @@ def _attn_fwd_inner(
         qk_natural = qk * (softmax_scale / LN2)
 
         x = qk_natural / logits_soft_cap
-        exp_2x = tl.exp(2.0 * x)
-        tanh_x = (exp_2x - 1.0) / (exp_2x + 1.0)
+        # Overflow-free tanh: exp(2x) overflowed to inf/inf for large positive logits (r12 S05-1).
+        exp_neg = tl.exp(-2.0 * tl.abs(x))
+        tanh_abs = (1.0 - exp_neg) / (1.0 + exp_neg)
+        tanh_x = tl.where(x >= 0, tanh_abs, -tanh_abs)
         qk = (logits_soft_cap * tanh_x) * LN2
     else:
         qk = qk * softmax_scale
@@ -284,8 +282,9 @@ def _attn_fwd_inner(
 
     if USE_SINKS:
         sink_offs = tl.arange(0, 16)
-        sink_mask = sink_offs < num_sinks
-        aux_logits = tl.load(softmax_aux_ptrs + sink_offs, mask=sink_mask, other=float("-inf")).to(tl.bfloat16)
+        # Sink logits contribute to the denominator once per query, not once per KV tile.
+        sink_mask = (sink_offs < num_sinks) & (index_start_n == 0)
+        aux_logits = tl.load(softmax_aux_ptrs + sink_offs, mask=sink_mask, other=float("-inf")).to(tl.float32)
 
         if SOFTCAP:
             x_aux = aux_logits / logits_soft_cap
@@ -333,11 +332,11 @@ def _attn_fwd_inner(
         LA1=headdim,
     )
 
-    acc_o += tl.dot(P_ij.to(tl.bfloat16), v.to(tl.bfloat16))
+    acc_o += tl.dot(P_ij.to(v.dtype), v, out_dtype=tl.float32)
     m_i = m_ij
     l_i_new = tl.exp2(me_i - m_ij_safe) + l_ij
     me_i = m_ij_safe + tl.log2(l_i_new)
-    return m_i, me_i, acc_o.to(tl.bfloat16)
+    return m_i, me_i, acc_o
 
 
 @triton.heuristics(
@@ -503,6 +502,22 @@ def _attn_fwd(
 
     fully_masked_lines = (actual_seqlen_q - actual_seqlen_k) if IS_CAUSAL else 0
     if IS_CAUSAL and fully_masked_lines >= (i_start_m + 1) * BLOCK_M:
+        # Every row of this block sees no key (q_len > kv_len, bottom-right aligned
+        # causal). The output buffers are not zero-initialised, so write what the
+        # regular path stores for fully-masked rows: zero output and a finite lse.
+        tl.store(M + off_zh * max_seqlen_q_rounded + offs_m, tl.zeros([BLOCK_M], dtype=tl.float32))
+        zero_ptrs = (
+            Po
+            + off_z * stride_oz
+            + off_head_q * stride_oh
+            + cu_seq_start_q * stride_om
+            + (offs_m[:, None] * stride_om + offs_d[None, :])
+        )
+        tl.store(
+            zero_ptrs,
+            tl.zeros([BLOCK_M, BLOCK_HEADDIM], dtype=tl.float32),
+            mask=(offs_m[:, None] < actual_seqlen_q) & (offs_d[None, :] < headdim),
+        )
         return
 
     q_ptrs = (
@@ -534,7 +549,7 @@ def _attn_fwd(
         bias_ptrs = (
             B
             + off_z * stride_bz
-            + off_head_kv * stride_bh
+            + off_head_q * stride_bh
             + cu_seq_start_q * stride_bm
             + (offs_m[:, None] * stride_bm + offs_n[None, :])
         )
@@ -554,7 +569,7 @@ def _attn_fwd(
 
     me_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
-    acc_o = tl.zeros([BLOCK_M, BLOCK_HEADDIM], dtype=tl.bfloat16)
+    acc_o = tl.zeros([BLOCK_M, BLOCK_HEADDIM], dtype=tl.float32)
 
     pad_rows = (not EVEN_M) or (VARLEN and (i_start_m * BLOCK_M > actual_seqlen_q))
     q = padded_load(q_ptrs, offs_m, offs_d, PA0=pad_rows, PA1=PADDED_HEADS, LA0=actual_seqlen_q, LA1=headdim)
@@ -779,6 +794,10 @@ def _fwd_attention_kernel_call(
         logits_soft_cap_val = float(logits_soft_cap)
         softcap_flag = True
 
+    # A zero-width sink buffer is equivalent to no attention sinks; use the
+    # no-sink kernel path rather than passing an empty buffer to Triton.
+    if softmax_aux is not None and softmax_aux.size == 0:
+        softmax_aux = None
     if softmax_aux is None:
         use_sinks = False
         num_sinks_val = 0
@@ -786,17 +805,12 @@ def _fwd_attention_kernel_call(
     else:
         use_sinks = True
 
-        if softmax_aux.ndim == 1:
-            num_sinks_val = softmax_aux.shape[0]
-            num_heads = q.shape[2]
-            softmax_aux_tensor = jnp.broadcast_to(softmax_aux[None, :], (num_heads, num_sinks_val))
-        elif softmax_aux.ndim == 2:
-            num_sinks_val = softmax_aux.shape[1]
-            softmax_aux_tensor = softmax_aux
-        else:
-            raise ValueError(f"softmax_aux must be 1D or 2D, got shape {softmax_aux.shape}")
-
-        pass
+        softmax_aux_tensor = _normalize_softmax_aux(
+            softmax_aux, num_q_heads=q.shape[2], num_kv_heads=k.shape[2], dtype=q.dtype
+        ).reshape(q.shape[2], -1)
+        num_sinks_val = softmax_aux_tensor.shape[-1]
+        if num_sinks_val > 16:
+            raise ValueError(f"Triton flash attention supports at most 16 attention sinks, got {num_sinks_val}")
 
     use_segments = (q_segment_ids is not None) or (kv_segment_ids is not None)
     if use_segments:
@@ -862,7 +876,10 @@ def _fwd_attention_kernel_call(
         softmax_scale = 1.0 / math.sqrt(head_dim) if softmax_scale is None else softmax_scale
         BOOL_BIAS = False
 
-        max_seqlen_q_rounded = math.ceil(max_seqlen_q / 128) * 128
+        # Row stride of the lse buffer. A multiple of 128 keeps it valid for any backward
+        # block <= 128; the lcm also covers a larger forward block.
+        stride_quantum = math.lcm(128, block_m)
+        max_seqlen_q_rounded = math.ceil(max_seqlen_q / stride_quantum) * stride_quantum
         BLOCK_HEADDIM = max(triton.next_power_of_2(head_dim), 16)
         PADDED_HEADS = BLOCK_HEADDIM > head_dim
         num_repeats = nheads_q // nheads_kv
@@ -985,7 +1002,9 @@ def _fwd_attention_kernel_call(
 
     bz, bh, bm = calc_bias_strides(bias, batch, nheads_q, QSeq, KSeq)
 
-    max_seqlen_q_rounded = math.ceil(max_seqlen_q / 128) * 128
+    # See the varlen branch: the stride must stay a multiple of 128 for the backward.
+    stride_quantum = math.lcm(128, block_m)
+    max_seqlen_q_rounded = math.ceil(max_seqlen_q / stride_quantum) * stride_quantum
     BLOCK_HEADDIM = max(triton.next_power_of_2(head_dim), 16)
     PADDED_HEADS = BLOCK_HEADDIM > head_dim
     num_repeats = nheads_q // nheads_kv

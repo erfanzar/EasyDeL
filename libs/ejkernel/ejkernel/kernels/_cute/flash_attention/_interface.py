@@ -470,7 +470,7 @@ def flash_attention(
     fwd_params: FwdParams | None = None,
     bwd_params: BwdParams | None = None,
     logits_soft_cap: float | None = None,
-    softmax_aux: Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "num_sinks"] | Float[Array, "sink_heads num_sinks"] | None = None,
     normalize_output: bool = True,
     precision: lax.PrecisionLike = jax.lax.Precision.DEFAULT,
     logits_dtype: DTypeLike = jnp.float32,
@@ -512,7 +512,10 @@ def flash_attention(
         fwd_params: Optional forward-pass tuning parameters.
         bwd_params: Unused; accepted for API compatibility.
         logits_soft_cap: Logits soft-cap value, or ``None``.
-        softmax_aux: Optional attention-sink auxiliary weights.
+        softmax_aux: Optional attention-sink logits: 1-D per-head (length
+            ``num_heads``) or shared (other lengths), or 2-D ``[num_heads |
+            num_kv_heads | 1, num_sinks]``. Expanded to per-query-head
+            ``[num_heads, num_sinks]`` before the kernel.
         normalize_output: Must be ``True`` for CuTe.
         precision: JAX precision enum. Must be ``DEFAULT`` for CuTe.
         logits_dtype: Dtype for logits computation. Must be ``float32``.
@@ -561,8 +564,11 @@ def flash_attention(
         raise EjkernelRuntimeError(
             "flash_attention (platform=cute): block_tables cannot be combined with cum_seqlens_*."
         )
-    if softmax_aux is not None and jnp.asarray(softmax_aux).ndim != 1:
-        raise EjkernelRuntimeError("flash_attention (platform=cute): softmax_aux must be rank-1 [num_sinks].")
+    if softmax_aux is not None and jnp.asarray(softmax_aux).ndim not in (1, 2):
+        raise EjkernelRuntimeError(
+            "flash_attention (platform=cute): softmax_aux must be rank-1 [num_sinks | num_heads] or "
+            "rank-2 [num_heads | num_kv_heads | 1, num_sinks]."
+        )
 
     merged_attention_mask = attention_mask
     effective_causal = causal

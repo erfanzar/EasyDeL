@@ -224,6 +224,7 @@ from .configs import (
     RWKV7Config,
     RWKV7MulConfig,
     ScaledDotProductAttentionConfig,
+    SparseMultiLatentRaggedPageAttentionConfig,
     StateSpaceV1Config,
     StateSpaceV2Config,
     UnifiedAttentionConfig,
@@ -320,6 +321,10 @@ from .rwkv6 import RWKV6, rwkv6
 from .rwkv7 import RWKV7, RWKV7Mul, rwkv7, rwkv7_mul
 from .scaled_dot_product_attention import ScaledDotProductAttention, scaled_dot_product_attention
 from .sinkhorn_knopp import SinkhornKnopp, sinkhorn_knopp
+from .sparse_multi_latent_ragged_page_attention import (
+    SparseMultiLatentRaggedPageAttention,
+    sparse_multi_latent_ragged_page_attention,
+)
 from .state_space_v1 import StateSpaceV1, state_space_v1
 from .state_space_v2 import StateSpaceV2, state_space_v2
 from .topk import TopK, topk
@@ -437,6 +442,8 @@ __all__ = (
     "ScaledDotProductAttention",
     "ScaledDotProductAttentionConfig",
     "SinkhornKnopp",
+    "SparseMultiLatentRaggedPageAttention",
+    "SparseMultiLatentRaggedPageAttentionConfig",
     "StateSpaceV1",
     "StateSpaceV1Config",
     "StateSpaceV2",
@@ -516,6 +523,7 @@ __all__ = (
     "scaled_dot_product_attention",
     "set_gdn_kernel_tile_policy",
     "sinkhorn_knopp",
+    "sparse_multi_latent_ragged_page_attention",
     "split_gate_up",
     "state_space_v1",
     "state_space_v2",

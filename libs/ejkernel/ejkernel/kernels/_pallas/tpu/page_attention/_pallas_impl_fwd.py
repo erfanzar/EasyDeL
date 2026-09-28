@@ -345,6 +345,12 @@ def paged_flash_attention_kernel(
         )
         return async_copy_k, async_copy_v
 
+    @pl.when(i == 0)
+    def init():
+        m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
+        l_ref[...] = jnp.zeros_like(l_ref)
+        o_ref[...] = jnp.zeros_like(o_ref)
+
     @pl.when(i * bk < length)
     def flash_attention():
         init_flag = init_flag_ref[0]
@@ -357,12 +363,6 @@ def paged_flash_attention_kernel(
             async_copy_k, async_copy_v = create_kv_async_copy_descriptors(b, h, i, buffer_index)
             async_copy_k.start()
             async_copy_v.start()
-
-        @pl.when(i == 0)
-        def init():
-            m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
-            l_ref[...] = jnp.zeros_like(l_ref)
-            o_ref[...] = jnp.zeros_like(o_ref)
 
         @pl.when(next_b < batch_size)
         def prefetch_next_block():
@@ -392,20 +392,25 @@ def paged_flash_attention_kernel(
         qk = qk + jnp.where(mask, 0.0, mask_value)
         m_curr = qk.max(axis=-1)
 
-        s_curr = jnp.exp(qk - m_curr[..., None])
+        # With mask_value=-inf a block fully outside the window leaves m == -inf; shift by 0 there so
+        # it contributes exp(-inf) == 0 instead of exp(-inf - -inf) == NaN (r14 S02-1).
+        s_curr = jnp.exp(qk - jnp.where(m_curr == -jnp.inf, 0.0, m_curr)[..., None])
         m_prev, l_prev = m_ref[...], l_ref[...]
         l_curr = jax.lax.broadcast_in_dim(s_curr.sum(axis=-1), l_prev.shape, (0,))
         m_curr = jax.lax.broadcast_in_dim(m_curr, m_prev.shape, (0,))
         m_next = jnp.maximum(m_prev, m_curr)
-        alpha = jnp.exp(m_prev - m_next)
-        beta = jnp.exp(m_curr - m_next)
+        m_next_shift = jnp.where(m_next == -jnp.inf, 0.0, m_next)
+        alpha = jnp.exp(m_prev - m_next_shift)
+        beta = jnp.exp(m_curr - m_next_shift)
         l_next = alpha * l_prev + beta * l_curr
         m_ref[...], l_ref[...] = m_next, l_next
 
         v = async_copy_v.wait_and_get_loaded()
         o_curr = jnp.einsum("gt,td->gd", s_curr, v)
 
-        o_ref[...] = ((l_prev * alpha * o_ref[...] + beta * o_curr) / l_next).astype(o_ref.dtype)
+        # No visible key yet: l_next == 0 and the (zero) output stays zero instead of 0/0.
+        l_safe = jnp.where(l_next == 0.0, 1.0, l_next)
+        o_ref[...] = ((l_prev * alpha * o_ref[...] + beta * o_curr) / l_safe).astype(o_ref.dtype)
 
 
 def paged_flash_attention_kernel_inline_seq_dim(

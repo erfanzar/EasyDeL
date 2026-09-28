@@ -81,7 +81,7 @@ def _tq_unpack_dense(ki, ks, kn, vi, vn, key_codebook, value_codebook, rotation)
     """Decode TurboQuant pages into per-token logit terms with plain NumPy (independent of the kernel).
 
     Returns ``(key_centroids * ||k||, signs * ||r_k||, values)`` so that the kernel's estimator is
-    ``<R q, key_term> + sqrt(pi/2)/qjl_dim * <P q, sign_term>``.
+    ``<R q, key_term> + sqrt(pi/2)/qjl_dim * <P R q, sign_term>``.
     """
     ki, ks, vi = np.asarray(ki), np.asarray(ks), np.asarray(vi)
     kn, vn = np.asarray(kn, dtype=np.float64), np.asarray(vn, dtype=np.float64)
@@ -103,7 +103,7 @@ def _tq_dense_window_attention(q, key_term, sign_term, values, q_pos, sliding_wi
     """Dense TurboQuant attention for one sequence with an HF sliding window (``W`` keys incl. self)."""
     qjl_dim = proj.shape[0]
     q_rot = q @ np.asarray(rotation, dtype=np.float64).T
-    q_proj = q @ np.asarray(proj, dtype=np.float64).T
+    q_proj = q_rot @ np.asarray(proj, dtype=np.float64).T
     kv_pos = np.arange(key_term.shape[0])
     visible = (kv_pos[None, :] <= q_pos[:, None]) & (kv_pos[None, :] > q_pos[:, None] - sliding_window)
     group = q.shape[1] // key_term.shape[1]

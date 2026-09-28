@@ -133,7 +133,7 @@ def flash_attention(
     fwd_params: FwdParams | None = None,
     bwd_params: BwdParams | None = None,
     logits_soft_cap: float | None = None,
-    softmax_aux: Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "num_sinks"] | Float[Array, "sink_heads num_sinks"] | None = None,
     normalize_output: bool = True,
     precision: lax.PrecisionLike = jax.lax.Precision.DEFAULT,
     logits_dtype: DTypeLike = jnp.float32,

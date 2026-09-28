@@ -16,11 +16,9 @@
 """Backward rules for XLA mean pooling custom VJP.
 
 The forward rule ``_mean_pooling_fwd`` and backward rule ``_mean_pooling_bwd``
-are registered on ``_mean_pooling_core`` (imported from ``_xla_impl_fwd``) via
-``defvjp``.  The late binding pattern—``_mean_pooling_bwd_mod._mean_pooling_core
-= _mean_pooling_core``—is used because this module is imported before
-``_mean_pooling_core`` is defined; ``_xla_impl_fwd`` sets the attribute after
-both modules are loaded.
+are registered on ``_mean_pooling_core`` via ``defvjp``. The raw forward
+functions are injected by ``_xla_impl_fwd`` after both modules load to avoid
+recursive custom-VJP calls.
 """
 
 import jax.numpy as jnp
@@ -38,8 +36,8 @@ def _mean_pooling_fwd(
     ``cu_seqlens`` (to determine which branch to use).
 
     Note:
-        ``_mean_pooling_core`` is injected at module-level by ``_xla_impl_fwd``
-        after both modules are loaded (late-binding pattern).
+        The raw forward functions are injected by ``_xla_impl_fwd`` after
+        both modules are loaded (late-binding pattern).
 
     Args:
         x: Input tensor, either ``[total_tokens, hidden_dim]`` (varlen) or
@@ -51,16 +49,15 @@ def _mean_pooling_fwd(
             - ``output``: mean-pooled result ``[batch_or_num_seqs, hidden_dim]``
             - ``residual``: ``(x.shape, cu_seqlens)`` for use in the backward pass
     """
-    out = _mean_pooling_core(x, cu_seqlens)
+    out = _mean_pooling_varlen(x, cu_seqlens) if cu_seqlens is not None else _mean_pooling_fixed(x)
     residual = (x.shape, cu_seqlens)
     return out, residual
 
 
 def _mean_pooling_bwd(
-    cu_seqlens: Int[Array, "num_seqs_plus_one"] | None,
     residual: tuple,
     g: Float[Array, "batch hidden_dim"],
-) -> tuple[Float[Array, "... hidden_dim"]]:
+) -> tuple[Float[Array, "... hidden_dim"], None]:
     """Backward rule for the mean pooling custom VJP.
 
     Computes the gradient of the mean pooling loss w.r.t. ``x``.  The
@@ -68,37 +65,35 @@ def _mean_pooling_bwd(
     back to every token in the sequence.
 
     Args:
-        cu_seqlens: Nondiff arg injected by JAX's custom VJP machinery.
-            Contains cumulative sequence lengths (or None for fixed-length).
         residual: Tuple ``(x_shape, cu_seqlens)`` saved by the forward rule.
             ``x_shape`` is the original shape of the input ``x``.
         g: Upstream gradient of shape ``[num_seqs, hidden_dim]`` (varlen) or
             ``[batch, hidden_dim]`` (fixed-length).
 
     Returns:
-        Single-element tuple ``(dx,)`` where ``dx`` matches the shape of the
-        forward input ``x``:
+        Pair ``(dx, None)`` where ``dx`` matches the shape of the
+        forward input ``x`` and ``None`` denotes no gradient for boundaries:
             - varlen:  ``[total_tokens, hidden_dim]``
             - fixed:   ``[batch, seq_len, hidden_dim]``
     """
-    x_shape, _ = residual
+    x_shape, cu_seqlens = residual
 
     if cu_seqlens is not None:
-        num_seqs = len(cu_seqlens) - 1
-
-        def grad_sequence(i):
-            start = cu_seqlens[i]
-            end = cu_seqlens[i + 1]
-            seq_len = end - start
-            return jnp.tile(g[i] / seq_len, (seq_len, 1))
-
-        dx_list = [grad_sequence(i) for i in range(num_seqs)]
-        dx = jnp.concatenate(dx_list, axis=0)
+        num_seqs = cu_seqlens.shape[0] - 1
+        if num_seqs == 0:
+            dx = jnp.zeros(x_shape, dtype=g.dtype)
+        else:
+            positions = jnp.arange(x_shape[0], dtype=cu_seqlens.dtype)
+            seq_ids = jnp.searchsorted(cu_seqlens[1:], positions, side="right")
+            valid = (positions >= cu_seqlens[0]) & (positions < cu_seqlens[-1])
+            safe_ids = jnp.minimum(seq_ids, num_seqs - 1)
+            lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+            dx = jnp.where(valid[:, None], g[safe_ids] / jnp.maximum(lengths[safe_ids, None], 1), 0)
     else:
         seq_len = x_shape[1]
-        dx = jnp.tile(g[:, None, :], (1, seq_len, 1)) / seq_len
+        dx = jnp.broadcast_to(g[:, None, :] / seq_len, x_shape)
 
-    return (dx,)
+    return dx, None
 
 
 __all__ = ("_mean_pooling_bwd", "_mean_pooling_fwd")

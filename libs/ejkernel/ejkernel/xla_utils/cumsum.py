@@ -196,6 +196,46 @@ def chunk_local_cumsum_vector(
     return result.astype(output_dtype)
 
 
+def _reset_cumsum_at_segments(result: jnp.ndarray, cu_work: jnp.ndarray, time_axis: int) -> jnp.ndarray:
+    """Turn a whole-axis cumsum into per-segment cumsums and zero the padding.
+
+    Segment ``i`` covers ``[cu_work[i], cu_work[i + 1])`` along ``time_axis``. Positions outside
+    ``[cu_work[0], cu_work[-1])`` (leading offset or trailing padding when ``cu_work[-1] < T``)
+    belong to no segment and are returned as zeros.
+
+    Args:
+        result: Cumulative sum along ``time_axis`` over the full axis.
+        cu_work: Non-decreasing segment boundaries in the coordinates of ``result``.
+        time_axis: Axis of ``result`` that holds time.
+
+    Returns:
+        Array shaped like ``result`` with the running total of the preceding segments
+        subtracted inside each segment and zeros outside every segment.
+    """
+    total_len = result.shape[time_axis]
+    num_segments = cu_work.shape[0] - 1
+    starts = cu_work[:-1]
+
+    gather_shape = [1] * result.ndim
+    gather_shape[time_axis] = num_segments
+    prev_idx = jnp.clip(starts - 1, 0, total_len - 1).reshape(gather_shape)
+    correction_values = jnp.take_along_axis(result, prev_idx, axis=time_axis)
+    correction_values = jnp.where(
+        (starts > 0).reshape(gather_shape), correction_values, jnp.zeros_like(correction_values)
+    )
+
+    # ``add`` (not ``set``) keeps empty segments, which repeat a boundary, counted.
+    seq_ids = jnp.cumsum(jnp.zeros(total_len, dtype=jnp.int32).at[cu_work[1:-1]].add(1))
+    seq_ids = jnp.clip(seq_ids, 0, num_segments - 1)
+    id_shape = [1] * result.ndim
+    id_shape[time_axis] = total_len
+    correction_tensor = jnp.take_along_axis(correction_values, seq_ids.reshape(id_shape), axis=time_axis)
+
+    positions = jnp.arange(total_len, dtype=cu_work.dtype).reshape(id_shape)
+    valid = (positions >= cu_work[0]) & (positions < cu_work[-1])
+    return jnp.where(valid, result - correction_tensor, jnp.zeros_like(result))
+
+
 @partial(jit, static_argnames=["reverse", "head_first"])
 def chunk_global_cumsum_scalar(
     s: jnp.ndarray,
@@ -251,28 +291,15 @@ def chunk_global_cumsum_scalar(
         result = jnp.cumsum(s, axis=time_axis)
 
     if cu_seqlens is not None:
-        boundary_indices = cu_seqlens[1:-1] - 1
-        gather_indices_shape = [1] * s.ndim
-        gather_indices_shape[time_axis] = len(boundary_indices)
-        gather_indices = boundary_indices.reshape(gather_indices_shape)
-        correction_values = jnp.take_along_axis(result, gather_indices, axis=time_axis)
-
-        zero_pad_shape = list(correction_values.shape)
-        zero_pad_shape[time_axis] = 1
-        full_correction_map = jnp.concatenate(
-            [jnp.zeros(zero_pad_shape, dtype=result.dtype), correction_values],
-            axis=time_axis,
-        )
-
-        total_len = s.shape[time_axis]
-        seq_ids = jnp.cumsum(jnp.zeros(total_len, dtype=jnp.int32).at[cu_seqlens[1:]].set(1))
-
-        id_shape = [1] * s.ndim
-        id_shape[time_axis] = total_len
-        seq_ids = seq_ids.reshape(id_shape)
-
-        correction_tensor = jnp.take_along_axis(full_correction_map, seq_ids, axis=time_axis)
-        result -= correction_tensor
+        if reverse:
+            # ``result`` currently lives in flipped time coordinates, so the segment
+            # boundaries must be mapped there too: a segment [a, b) of the original
+            # sequence becomes [T - b, T - a) after the flip.
+            total_time = s.shape[time_axis]
+            cu_work = total_time - jnp.flip(cu_seqlens)
+        else:
+            cu_work = cu_seqlens
+        result = _reset_cumsum_at_segments(result, cu_work, time_axis)
 
     if reverse:
         result = jnp.flip(result, axis=time_axis)
@@ -334,30 +361,15 @@ def chunk_global_cumsum_vector(
         result = jnp.cumsum(s, axis=time_axis)
 
     if cu_seqlens is not None:
-        boundary_indices = cu_seqlens[1:-1] - 1
-
-        gather_indices_shape = [1] * s.ndim
-        gather_indices_shape[time_axis] = len(boundary_indices)
-        gather_indices = boundary_indices.reshape(gather_indices_shape)
-
-        correction_values = jnp.take_along_axis(result, gather_indices, axis=time_axis)
-
-        zero_pad_shape = list(correction_values.shape)
-        zero_pad_shape[time_axis] = 1
-        full_correction_map = jnp.concatenate(
-            [jnp.zeros(zero_pad_shape, dtype=result.dtype), correction_values],
-            axis=time_axis,
-        )
-
-        total_len = s.shape[time_axis]
-        seq_ids = jnp.cumsum(jnp.zeros(total_len, dtype=jnp.int32).at[cu_seqlens[1:]].set(1))
-
-        id_shape = [1] * s.ndim
-        id_shape[time_axis] = total_len
-        seq_ids = seq_ids.reshape(id_shape)
-
-        correction_tensor = jnp.take_along_axis(full_correction_map, seq_ids, axis=time_axis)
-        result -= correction_tensor
+        if reverse:
+            # ``result`` currently lives in flipped time coordinates, so the segment
+            # boundaries must be mapped there too: a segment [a, b) of the original
+            # sequence becomes [T - b, T - a) after the flip.
+            total_time = s.shape[time_axis]
+            cu_work = total_time - jnp.flip(cu_seqlens)
+        else:
+            cu_work = cu_seqlens
+        result = _reset_cumsum_at_segments(result, cu_work, time_axis)
 
     if reverse:
         result = jnp.flip(result, axis=time_axis)

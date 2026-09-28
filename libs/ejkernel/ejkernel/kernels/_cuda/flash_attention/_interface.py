@@ -656,7 +656,7 @@ def flash_attention(
     fwd_params: FwdParams | None = None,
     bwd_params: BwdParams | None = None,
     logits_soft_cap: float | None = None,
-    softmax_aux: Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "num_sinks"] | Float[Array, "sink_heads num_sinks"] | None = None,
     normalize_output: bool = True,
     precision: lax.PrecisionLike = jax.lax.Precision.DEFAULT,
     logits_dtype: DTypeLike = jnp.float32,
@@ -750,6 +750,11 @@ def flash_attention(
             kernel does not natively support masks. The mask is either
             converted to a bias or silently dropped.
     """
+    if block_tables is not None and attention_mask is not None:
+        raise EjkernelRuntimeError(
+            "flash_attention (platform=cuda): paged KV does not support attention_mask; "
+            "per-sequence KV lengths cannot be inferred from block_tables."
+        )
     if attention_mask is not None:
         if bias is None:
             warnings.warn(

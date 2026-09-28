@@ -46,6 +46,7 @@ from ejkernel.callib._tilelang_ffi import has_tilelang_ffi_support
 from ejkernel.errors import EjkernelRuntimeError
 
 from ..._registry import Backend, Platform, kernel_registry
+from ..._sinks import reduce_sinks_to_per_head
 from ._kernel import make_rpa_v3_prim_func
 
 _DEFAULT_COMPILE_FLAGS: tuple[str, ...] = ("-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK",)
@@ -164,7 +165,7 @@ def ragged_page_attention_v3(
     block_tables: Int32[Array, "max_num_seqs_times_pages_per_seq"],
     query_start_loc: Int32[Array, "max_num_seqs_plus_1"],
     distribution: Int32[Array, "3"],
-    softmax_aux: Float[Array, "num_q_heads"] | None = None,
+    softmax_aux: Float[Array, "..."] | None = None,
     *,
     softmax_scale: float = 1.0,
     sliding_window: int | None = None,
@@ -176,6 +177,8 @@ def ragged_page_attention_v3(
     num_kv_pages_per_block: int | None = None,
     num_queries_per_block: int | None = None,
     vmem_limit_bytes: int | None = None,
+    chunk_size: int | None = None,
+    alibi_slopes: Float[Array, "num_q_heads"] | None = None,
 ) -> tuple[
     Float[Array, "total_tokens num_q_heads head_dim"],
     Float[Array, "num_pages page_size num_kv_heads_x2_per_kv_packing kv_packing head_dim_padded"],
@@ -237,6 +240,15 @@ def ragged_page_attention_v3(
             ``tilelang``/``jax_tvm_ffi`` are unavailable.
     """
     _ = chunk_prefill_size, vmem_limit_bytes
+    if chunk_size is not None or alibi_slopes is not None:
+        raise EjkernelRuntimeError(
+            "tile-lang ragged_page_attention_v3 does not implement chunk_size/alibi_slopes; the "
+            "RaggedPageAttentionv3 module routes such calls to the XLA implementation."
+        )
+    if softmax_aux is not None:
+        softmax_aux = reduce_sinks_to_per_head(
+            softmax_aux, num_q_heads=queries.shape[1], num_kv_heads=keys.shape[1]
+        ).astype(softmax_aux.dtype)
 
     if not has_tilelang_ffi_support():
         raise EjkernelRuntimeError("tile-lang ragged_page_attention_v3 requires `tilelang` + `jax_tvm_ffi`.")

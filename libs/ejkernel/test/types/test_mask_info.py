@@ -886,6 +886,45 @@ def test_maskinfo_q_position_ids():
     print("  ✓ q_position_ids (clip keyword fix): OK")
 
 
+def _scan_positions_reference(segment_ids: np.ndarray, pad_value: int) -> np.ndarray:
+    """NumPy port of the original per-token serial scan (the contract the vectorized version must keep)."""
+    out = np.empty_like(segment_ids)
+    for b, row in enumerate(segment_ids):
+        prev_seg, cnt = -2, -1
+        for i, seg in enumerate(row):
+            if seg < 0:
+                out[b, i] = pad_value
+                prev_seg, cnt = -2, -1
+                continue
+            cnt = 0 if seg != prev_seg else cnt + 1
+            out[b, i] = cnt
+            prev_seg = seg
+    return out
+
+
+@pytest.mark.parametrize("pad_value", [-1, int(np.iinfo(np.int32).max)])
+def test_positions_from_segments_matches_serial_scan(pad_value):
+    """Vectorized run-length positions equal the serial scan exactly, including runs that resume after padding."""
+    from ejkernel.types.mask import _positions_from_segments_2d
+
+    handcrafted = np.array(
+        [
+            [1, 1, -1, 1, 1, 2, 2, 2],  # same segment resumes after padding -> restarts at 0
+            [-1, -1, 0, 0, 0, 1, 1, -1],  # leading and trailing padding
+            [-1, -1, -1, -1, -1, -1, -1, -1],  # all padding
+            [0, 1, 0, 1, 0, 1, 0, 1],  # every token opens a run
+            [3, 3, 3, 3, 3, 3, 3, 3],  # one run
+        ],
+        dtype=np.int32,
+    )
+    rng = np.random.default_rng(0)
+    random = rng.integers(-1, 3, size=(6, 257)).astype(np.int32)
+    for ids in (handcrafted, random, handcrafted[:1, :1]):
+        got = np.asarray(_positions_from_segments_2d(jnp.asarray(ids), pad_value=pad_value))
+        np.testing.assert_array_equal(got, _scan_positions_reference(ids, pad_value))
+        assert got.dtype == np.int32
+
+
 def _eq_mask(q_types, kv_types, zero_policy="q"):
     """Build expected equality mask (B,1,Q,K) honoring zero_policy."""
     B, _Q = q_types.shape

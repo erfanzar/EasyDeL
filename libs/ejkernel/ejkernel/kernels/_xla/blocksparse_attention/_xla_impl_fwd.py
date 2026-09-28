@@ -441,7 +441,10 @@ def blocksparse_attention(
             dropout_prob=0.0,
             deterministic=True,
             dropout_rng=None,
-            causal=causal,
+            # ``mask`` already carries the position-aware causal term; a second causal flag would
+            # re-mask with a local-index triangle and drop visible keys whenever q_positions are
+            # offset from their array indices (cached decode, chunked prefill).
+            causal=False,
             sliding_window=None,
             bias=None,
             init_bias=None,

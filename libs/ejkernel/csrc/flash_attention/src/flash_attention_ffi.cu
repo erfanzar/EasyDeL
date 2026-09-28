@@ -240,7 +240,11 @@ inline Error DispatchFwdSm80(FLASH_NAMESPACE::Flash_fwd_params &params,
     return Error::Success();
   }
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+// NOTE: no `#if defined(__CUDA_ARCH__)` here. These are host-side dispatch
+// functions; `__CUDA_ARCH__` is only defined in the device compilation pass,
+// so guarding with it would compile away the BF16 dispatch entirely and make
+// every bf16 call fall through to the error below at runtime. Arch gating for
+// the kernels themselves lives in the launch templates (ARCH_SUPPORTS_FLASH).
   if (dtype == xla::ffi::DataType::BF16) {
     using T = cutlass::bfloat16_t;
     if (is_causal) {
@@ -292,7 +296,6 @@ inline Error DispatchFwdSm80(FLASH_NAMESPACE::Flash_fwd_params &params,
     }
     return Error::Success();
   }
-#endif
 
   return MakeInvalid("Unsupported dtype for SM80 flash attention.");
 }
@@ -352,7 +355,7 @@ inline Error DispatchBwdSm80(FLASH_NAMESPACE::Flash_bwd_params &params,
     return Error::Success();
   }
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+// Same as above: host-side dispatch must not be hidden behind __CUDA_ARCH__.
   if (dtype == xla::ffi::DataType::BF16) {
     using T = cutlass::bfloat16_t;
     if (is_causal) {
@@ -404,7 +407,6 @@ inline Error DispatchBwdSm80(FLASH_NAMESPACE::Flash_bwd_params &params,
     }
     return Error::Success();
   }
-#endif
 
   return MakeInvalid("Unsupported dtype for SM80 flash attention.");
 }

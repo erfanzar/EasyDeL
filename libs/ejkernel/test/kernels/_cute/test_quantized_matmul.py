@@ -111,6 +111,18 @@ def test_quantized_matmul_cute_matches_xla(mode: str, bits: int):
     )
 
 
+@pytest.mark.parametrize("input_dtype,use_bf16", [(jnp.float16, True), (jnp.bfloat16, False), (jnp.float32, True)])
+def test_quantized_matmul_cute_preserves_activation_dtype(input_dtype, use_bf16):
+    key = jax.random.PRNGKey(72)
+    x = jax.random.normal(key, (8, 32), dtype=input_dtype)
+    w = jax.random.normal(key, (32, 32), dtype=jnp.float16)
+    w_q, scales, zeros = prepack_quantized_weights(w, mode="affine", bits=4)
+    out = cute_quantized_matmul(x, w_q, scales, zeros, mode="affine", bits=4, use_bf16=use_bf16)
+    assert out.shape == (8, 32)
+    assert out.dtype == x.dtype
+    assert bool(jnp.isfinite(out).all())
+
+
 def test_quantized_matmul_cute_transpose_matches_xla():
     key = jax.random.PRNGKey(42)
     kx, kw = jax.random.split(key, 2)

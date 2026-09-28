@@ -44,6 +44,31 @@ def test_streaming_primal_real_shapes(bits, shape):
 
 
 @pytest.mark.parametrize("bits", [4, 8])
+@pytest.mark.parametrize("shape", [(4, 30, 160, 256), (8, 1950, 256, 256)])
+def test_streaming_a16_rows_not_multiple_of_sublane(bits, shape):
+    """A16 rows that are not a sublane multiple must not crash the zero-fill reshape.
+
+    1950 = 325 tokens x top-6 experts (DeepSeek-V4); the A16 path passed M unpadded into the v3 kernel,
+    whose zero-fill reshapes the output to (-1, sublane, lanes) and raised for M % 8 != 0.
+    """
+    x, codes, scales, groups, host, sizes = make_inputs(bits, shape)
+    expected = np.zeros((shape[1], shape[3]), np.float32)
+    start = 0
+    for g, rows in enumerate(sizes):
+        if rows:
+            expected[start : start + rows] = (
+                np.asarray(x[start : start + rows], np.float32) @ host[g].astype(np.float32) * np.asarray(scales[g])
+            )
+        start += rows
+    f = jax.jit(
+        lambda a, b, c, d: grouped_matmul_channelwise(a, b, c, d, platform="pallas", preferred_element_type=jnp.float32)
+    )
+    got = f(x, codes, scales, groups)
+    assert got.shape == (shape[1], shape[3])
+    np.testing.assert_allclose(got, expected, rtol=1e-4, atol=2e-4)
+
+
+@pytest.mark.parametrize("bits", [4, 8])
 def test_streaming_jvp_vjp_after_cached_jit(bits):
     x, codes, scales, groups, _, _ = make_inputs(bits, (4, 16, 160, 256))
     f = jax.jit(

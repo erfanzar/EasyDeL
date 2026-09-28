@@ -233,8 +233,143 @@ class TestLogitsSoftCap:
         assert jnp.all(jnp.isfinite(output)), "Soft cap should prevent overflow"
 
 
+def test_fully_masked_query_outputs_zero_across_chunks():
+    """An empty attention row cannot borrow probability mass from masked keys."""
+    q = jnp.zeros((1, 3, 1, 4), dtype=jnp.float32)
+    k = jnp.zeros((1, 5, 1, 4), dtype=jnp.float32)
+    v = jnp.broadcast_to(jnp.arange(1, 6, dtype=jnp.float32)[None, :, None, None], (1, 5, 1, 4))
+    attention_mask = jnp.ones((1, 1, 3, 5), dtype=bool).at[:, :, 0, :].set(False)
+    result = flash_attention(
+        q,
+        k,
+        v,
+        attention_mask=attention_mask,
+        fwd_params=FwdParams(q_blocksize=2, kv_blocksize=2),
+    )
+    assert jnp.all(jnp.isfinite(result))
+    assert jnp.allclose(result[0, :, 0, 0], jnp.array([0.0, 3.0, 3.0]), atol=1e-5)
+
+
 class TestSoftmaxAux:
     """Test softmax_aux (attention sinks) feature."""
+
+    @pytest.mark.parametrize("sink_shape", [(0,), (2, 0)])
+    @pytest.mark.parametrize("kv_blocksize", [2, 7])
+    def test_empty_sinks_match_no_sinks(self, sink_shape, kv_blocksize):
+        """Zero sinks must equal no sinks for shared and per-head inputs."""
+        q = jnp.zeros((1, 3, 2, 4), dtype=jnp.float32)
+        k = jnp.zeros((1, 5, 2, 4), dtype=jnp.float32)
+        v = jnp.broadcast_to(jnp.arange(1, 6, dtype=jnp.float32)[None, :, None, None], (1, 5, 2, 4))
+        params = FwdParams(q_blocksize=2, kv_blocksize=kv_blocksize)
+        empty_sinks = jnp.empty(sink_shape, dtype=jnp.float32)
+        # DEFAULT matmul precision is bf16-level on TPU (15 * bf16(0.2) = 3.0029); compare at HIGHEST so the
+        # 1e-5 tolerance measures sink handling, not matmul rounding.
+        highest = jax.lax.Precision.HIGHEST
+
+        no_sinks = flash_attention(q, k, v, softmax_scale=1.0, precision=highest, fwd_params=params)
+        empty_result = flash_attention(
+            q, k, v, softmax_scale=1.0, softmax_aux=empty_sinks, precision=highest, fwd_params=params
+        )
+        vanilla_empty, _ = attention(
+            q, k, v, softmax_aux=empty_sinks, softmax_scale=1.0, dtype=jnp.float32, precision=highest
+        )
+        assert jnp.allclose(no_sinks, jnp.full_like(no_sinks, 3.0), atol=1e-5)
+        assert jnp.allclose(empty_result, no_sinks, atol=1e-5)
+        assert jnp.allclose(vanilla_empty, no_sinks, atol=1e-5)
+
+    @pytest.mark.parametrize("kv_blocksize", [3, 8])
+    def test_sinks_count_once_across_kv_chunks(self, kv_blocksize):
+        """Shared sinks contribute once per query, regardless of KV tiling."""
+        q = jnp.zeros((1, 5, 2, 4), dtype=jnp.float32)
+        k = jnp.zeros((1, 7, 2, 4), dtype=jnp.float32)
+        v = jnp.broadcast_to(jnp.arange(1, 8, dtype=jnp.float32)[None, :, None, None], (1, 7, 2, 4))
+        sinks = jnp.array([0.0, -jnp.inf, jnp.log(2.0)])
+        actual = flash_attention(
+            q,
+            k,
+            v,
+            softmax_scale=1.0,
+            softmax_aux=sinks,
+            fwd_params=FwdParams(q_blocksize=2, kv_blocksize=kv_blocksize),
+        )
+        # Seven unit-logit keys and three shared sinks (weights 1, 0 and 2).
+        expected = jnp.full((1, 5, 2, 4), 28.0 / 10.0)
+        assert jnp.allclose(actual, expected, atol=1e-5)
+
+    @pytest.mark.parametrize("kv_blocksize", [3, 7])
+    @pytest.mark.parametrize(
+        "sinks",
+        [
+            [0.0, 0.7, -0.5, 1.2],  # per-query-head single sinks
+            [0.0, 0.7],  # 1-D length == Hkv: shared sinks (per-KV-head sinks must be 2-D)
+            [0.0, 0.7, -0.5],  # shared sinks (length matches neither head count)
+            [[0.0, 0.7], [-0.5, 1.2]],  # two sinks per KV head under GQA
+        ],
+    )
+    def test_gqa_sinks_match_vanilla_attention(self, sinks, kv_blocksize):
+        """Per-head sinks have identical GQA normalization in flash and vanilla attention."""
+        q = jnp.zeros((1, 3, 4, 4), dtype=jnp.float32)
+        k = jnp.zeros((1, 7, 2, 4), dtype=jnp.float32)
+        v = jnp.broadcast_to(jnp.arange(1, 8, dtype=jnp.float32)[None, :, None, None], (1, 7, 2, 4))
+        aux = jnp.asarray(sinks, dtype=jnp.float32)
+        # DEFAULT matmul precision is bf16-level on TPU; compare both kernels at HIGHEST so a 1e-5
+        # tolerance measures sink handling, not matmul rounding.
+        highest = jax.lax.Precision.HIGHEST
+        expected, _ = attention(q, k, v, softmax_aux=aux, softmax_scale=1.0, dtype=jnp.float32, precision=highest)
+        actual = flash_attention(
+            q,
+            k,
+            v,
+            softmax_aux=aux,
+            softmax_scale=1.0,
+            precision=highest,
+            fwd_params=FwdParams(q_blocksize=2, kv_blocksize=kv_blocksize),
+        )
+        assert jnp.allclose(actual, expected, atol=1e-5)
+
+    @pytest.mark.parametrize(
+        "sinks",
+        [
+            [0.0, 0.7, -0.5, 1.2],  # one sink per query head
+            [0.0, 0.7],  # 1-D length == Hkv: shared sinks (per-KV-head sinks must be 2-D)
+            [0.0, 0.7, -0.5],  # shared sinks under GQA
+            [[0.0, 0.7], [-0.5, 1.2]],  # two sinks per KV head
+            [[0.0, 0.7]] * 4,  # two sinks per query head
+            [[0.0, 0.7]],  # two sinks shared across heads
+        ],
+    )
+    def test_gqa_sink_gradient_matches_vanilla_attention(self, sinks):
+        """Learned sinks receive the same nonzero gradient as dense attention."""
+        q = jnp.zeros((1, 3, 4, 4), dtype=jnp.float32)
+        k = jnp.zeros((1, 7, 2, 4), dtype=jnp.float32)
+        v = jnp.broadcast_to(jnp.arange(1, 8, dtype=jnp.float32)[None, :, None, None], (1, 7, 2, 4))
+        aux = jnp.asarray(sinks, dtype=jnp.float32)
+        highest = jax.lax.Precision.HIGHEST  # see test_gqa_sinks_match_vanilla_attention
+
+        def flash_loss(sink_logits):
+            output = flash_attention(
+                q,
+                k,
+                v,
+                softmax_aux=sink_logits,
+                softmax_scale=1.0,
+                precision=highest,
+                fwd_params=FwdParams(q_blocksize=2, kv_blocksize=3),
+            )
+            return jnp.sum(output)
+
+        def dense_loss(sink_logits):
+            output, _ = attention(
+                q, k, v, softmax_aux=sink_logits, softmax_scale=1.0, dtype=jnp.float32, precision=highest
+            )
+            return jnp.sum(output)
+
+        actual = jax.grad(flash_loss)(aux)
+        expected = jax.grad(dense_loss)(aux)
+        assert actual.shape == aux.shape
+        assert jnp.all(jnp.isfinite(actual))
+        assert jnp.any(jnp.abs(expected) > 1e-3)
+        assert jnp.allclose(actual, expected, atol=1e-5, rtol=1e-5)
 
     def test_attention_sinks_basic(self):
         """Test basic attention sinks functionality."""
@@ -483,7 +618,9 @@ class TestVanillaComparison:
         flash_out = flash_attention(
             q, k, v, sliding_window=(window, window), fwd_params=FwdParams(q_blocksize=32, kv_blocksize=32)
         )
-        vanilla_out, _ = attention(q, k, v, sliding_window=window)
+        # An int window is a window *size* in vanilla attention (W - 1 on each side); pass the same
+        # symmetric (left, right) tuple as flash so both sides use the identical mask.
+        vanilla_out, _ = attention(q, k, v, sliding_window=(window, window))
 
         max_diff = float(jnp.max(jnp.abs(flash_out - vanilla_out)))
         print(f"\nSliding window flash vs vanilla: max_diff={max_diff:.6e}")

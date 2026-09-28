@@ -37,7 +37,7 @@ def ring_attention(
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
     q_position_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_position_ids: Int[Array, "batch seq_len_k"] | None = None,
-    softmax_aux: Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "num_sinks"] | Float[Array, "sink_heads num_sinks"] | None = None,
     bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     mask_builder: Callable[[int, int, int, int, int], Mask] | None = None,
     sliding_window: int | tuple[int, int] | None = None,
@@ -68,9 +68,12 @@ def ring_attention(
         kv_position_ids: Optional KV position IDs [batch, kv_len]. Forwarded
             to the XLA ring-attention fallback; not used by the Pallas splash
             path when ``axis_name`` is set.
-        softmax_aux: Optional attention sink logits [num_sinks] (1-D).
-            Converted to per-head sink weights via ``logsumexp`` and passed
-            to the splash kernel as ``sinks``.
+        softmax_aux: Optional attention sink logits. 1-D ``[num_sinks]`` (shared) is
+            reduced via ``logsumexp`` and passed to the splash kernel as ``sinks``.
+            2-D ``[num_heads | num_kv_heads | 1, num_sinks]`` is reduced exactly to
+            per-head sinks (``logsumexp`` over the sink axis) and also uses the
+            splash kernel when ``axis_name`` is set; without a ring axis 2-D sinks
+            use the XLA ring kernel, which consumes them natively.
         bias: Optional attention bias (not supported in the Pallas splash path;
             only passed through to the XLA fallback).
         mask_builder: Optional custom mask builder function. Forces the XLA

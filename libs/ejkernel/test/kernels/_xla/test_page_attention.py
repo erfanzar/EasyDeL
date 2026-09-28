@@ -38,6 +38,31 @@ class TestPageAttention:
 
         assert output.shape == (num_seqs, num_heads, head_dim)
 
+    def test_zero_context_returns_zero_not_mean_of_cache(self):
+        """Empty rows must not attend to unused pages, including mixed-length batches."""
+        query = jnp.zeros((2, 4, 2), dtype=jnp.float32)
+        key_cache = jnp.zeros((2, 2, 2, 2), dtype=jnp.float32)
+        value_cache = jnp.array([[[[2.0, 3.0], [4.0, 5.0]], [[7.0, 8.0], [9.0, 10.0]]]] * 2)
+        context_lens = jnp.array([0, 1], dtype=jnp.int32)
+        block_tables = jnp.array([[0, 1], [0, 1]], dtype=jnp.int32)
+        output = page_attention(query, key_cache, value_cache, context_lens, block_tables)
+        assert jnp.all(jnp.isfinite(output))
+        assert jnp.array_equal(output[0], jnp.zeros((4, 2)))
+        assert jnp.array_equal(output[1], value_cache[0, :, 0, :].repeat(2, axis=0))
+
+    def test_fp16_softmax_accumulates_in_float32(self):
+        """70k equal fp16 scores: a float16 softmax sum overflows and zeroes the output (r10 S04-3)."""
+        block_size, num_blocks, head_dim = 1024, 70, 8
+        context = 70000
+        query = jnp.zeros((1, 1, head_dim), dtype=jnp.float16)
+        key_cache = jnp.zeros((num_blocks, 1, block_size, head_dim), dtype=jnp.float16)
+        value_cache = jnp.ones((num_blocks, 1, block_size, head_dim), dtype=jnp.float16)
+        context_lens = jnp.array([context], dtype=jnp.int32)
+        block_tables = jnp.arange(num_blocks, dtype=jnp.int32)[None, :]
+        output = page_attention(query, key_cache, value_cache, context_lens, block_tables)
+        assert output.dtype == jnp.float16
+        assert jnp.allclose(output.astype(jnp.float32), 1.0, atol=1e-2), output
+
     def test_gqa_support(self):
         """Test Grouped Query Attention (GQA) with different num_heads and num_kv_heads."""
         num_seqs = 2

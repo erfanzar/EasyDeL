@@ -62,6 +62,41 @@ from jaxtyping import DTypeLike, PRNGKeyArray
 from ._utils import _chunk_attention_bias, below_or_on_diag
 
 
+def _safe_logsumexp(x: chex.Array, axis: int) -> chex.Array:
+    """``logsumexp`` whose value AND gradient are safe for rows without a finite entry.
+
+    A disabled sink row (all ``-inf``) reduces to ``-inf`` with zero gradient. Plain
+    ``jax.nn.logsumexp`` differentiates such a row through ``log(0)`` and returns NaN
+    even for a zero cotangent (r12 S04-1). Rows with any finite entry are unchanged.
+    """
+    # Only all--inf rows are disabled; +inf / NaN rows keep plain logsumexp semantics (r14 S03-1).
+    has_mass = jnp.any(x != -jnp.inf, axis=axis, keepdims=True)
+    x_safe = jnp.where(has_mass, x, 0.0)
+    lse = jax.nn.logsumexp(x_safe, axis=axis)
+    return jnp.where(jnp.squeeze(has_mass, axis=axis), lse, -jnp.inf)
+
+
+def _sink_lse_per_head(softmax_aux: chex.Array, num_heads: int) -> chex.Array:
+    """Reduce a sink layout to one float32 log-normalizer per head, shape ``(num_heads,)``.
+
+    1-D sinks are shared by every head; ``(1, S)`` is shared; ``(num_heads, S)`` is per head.
+    Several sinks per head combine by logsumexp. The forward and the backward (which pulls the
+    per-head sink gradient back through this function with ``jax.vjp``) share it. All-``-inf``
+    (disabled) rows reduce to ``-inf`` with a zero, not NaN, gradient.
+    """
+    aux = jnp.asarray(softmax_aux, dtype=jnp.float32)
+    if aux.ndim == 1:
+        return jnp.broadcast_to(_safe_logsumexp(aux, axis=-1), (num_heads,))
+    if aux.ndim == 2:
+        sink_lse = _safe_logsumexp(aux, axis=-1)
+        if sink_lse.shape[0] == 1:
+            return jnp.broadcast_to(sink_lse[0], (num_heads,))
+        if sink_lse.shape[0] != num_heads:
+            raise ValueError(f"softmax_aux first dim must be 1 or num_heads ({num_heads}); got {aux.shape[0]}")
+        return sink_lse
+    raise ValueError(f"softmax_aux must be 1D or 2D, got shape {aux.shape}")
+
+
 def _blockwise_attention_fwd(
     query: chex.Array,
     key: chex.Array,
@@ -243,7 +278,14 @@ def _blockwise_attention_fwd(
                     sinks = softmax_aux.reshape(1, 1, 1, -1)
                     sinks = jnp.broadcast_to(sinks, (batch, num_heads, 1, softmax_aux.shape[0]))
                 elif softmax_aux.ndim == 2:
-                    sinks = softmax_aux.reshape(1, num_heads, 1, -1)
+                    if softmax_aux.shape[0] == 1:
+                        sinks = softmax_aux.reshape(1, 1, 1, -1)
+                    elif softmax_aux.shape[0] == num_heads:
+                        sinks = softmax_aux.reshape(1, num_heads, 1, -1)
+                    else:
+                        raise ValueError(
+                            f"softmax_aux first dim must be 1 or num_heads ({num_heads}); got {softmax_aux.shape[0]}"
+                        )
                     sinks = jnp.broadcast_to(sinks, (batch, num_heads, 1, softmax_aux.shape[-1]))
                 else:
                     raise ValueError(f"softmax_aux must be 1D or 2D, got {softmax_aux.ndim}D")
@@ -434,10 +476,19 @@ def _ring_attention_fwd(
         Tuple of (output, residuals) where:
             - output: Attention result cast to ``value.dtype``,
               shape (batch, q_len, num_heads, dim_per_head).
-            - residuals: Tuple of 11 tensors saved for the backward pass:
+            - residuals: Tuple of 12 entries saved for the backward pass:
               (output, query, key, value, bias, q_segment_ids, kv_segment_ids,
-              q_position_ids, kv_position_ids, denominator, max_score).
+              q_position_ids, kv_position_ids, denominator, max_score, softmax_aux).
     """
+    # The custom_vjp forward rule receives the raw arguments, not the primal body's normalized ones,
+    # so apply the same defaults here; otherwise a differentiated causal call ran non-causally
+    # (r11 S03-1 follow-up). Normalized segment ids reach the backward through the residuals.
+    if q_segment_ids is None and kv_segment_ids is not None:
+        q_segment_ids = kv_segment_ids
+    elif kv_segment_ids is None and q_segment_ids is not None:
+        kv_segment_ids = q_segment_ids
+    if causal and causal_block_size is None:
+        causal_block_size = query_chunk_size
     if float32_logits:
         query, key = query.astype(jnp.float32), key.astype(jnp.float32)
     batch, q_len, num_heads, dim_per_head = query.shape
@@ -447,19 +498,7 @@ def _ring_attention_fwd(
     prev_max_score = jnp.full((batch, num_heads, q_len), -jnp.inf).astype(jnp.float32)
 
     if softmax_aux is not None:
-        aux = jnp.asarray(softmax_aux, dtype=jnp.float32)
-        if aux.ndim == 1:
-            sink_lse = jax.nn.logsumexp(aux)
-            sink_lse = jnp.broadcast_to(sink_lse, (num_heads,))
-        elif aux.ndim == 2:
-            sink_lse = jax.nn.logsumexp(aux, axis=-1)
-            if sink_lse.shape[0] == 1:
-                sink_lse = jnp.broadcast_to(sink_lse[0], (num_heads,))
-            elif sink_lse.shape[0] != num_heads:
-                raise ValueError(f"softmax_aux first dim must be 1 or num_heads ({num_heads}); got {aux.shape[0]}")
-        else:
-            raise ValueError(f"softmax_aux must be 1D or 2D, got shape {aux.shape}")
-
+        sink_lse = _sink_lse_per_head(softmax_aux, num_heads)
         sink_lse = jnp.broadcast_to(sink_lse[None, :, None], (batch, num_heads, q_len))
         has_sink = jnp.isfinite(sink_lse)
         prev_max_score = jnp.where(has_sink, sink_lse, prev_max_score)
@@ -568,4 +607,5 @@ def _ring_attention_fwd(
         kv_position_ids,
         denominator,
         max_score,
+        softmax_aux,  # kept so the backward can return the sink gradient (r11 S03-1/S04-2)
     )

@@ -230,6 +230,52 @@ class TestRaggedPageAttentionV3TPU:
         assert jnp.allclose(cache_p, cache_x, rtol=0, atol=0.25)
 
 
+@pytest.mark.parametrize(("num_q_heads", "num_kv_heads"), [(1, 1), (6, 2)])
+def test_sinks_with_padded_bf16_query_groups_match_xla(num_q_heads, num_kv_heads):
+    """bf16 packing pads each KV head's query group (1 -> 2, 3 -> 4); sinks must be padded per group
+    too instead of reshaped to the padded width (r10 S02-1: Hq == Hkv == 1 crashed at the reshape,
+    wider groups could regroup sinks across KV heads)."""
+    cfg = dict(
+        rng_seed=3,
+        num_seqs=4,
+        pages_per_seq=4,
+        page_size=16,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=128,
+        kv_dtype=jnp.bfloat16,
+        q_dtype=None,
+        kv_len_max=48,
+        decode_prefill_mixed=None,
+    )
+    softmax_scale = 128**-0.5
+    # Distinct, large sinks so a dropped or regrouped sink moves the output far past bf16 noise.
+    sinks = jnp.linspace(1.0, 4.0, num_q_heads, dtype=jnp.float32)
+
+    def run(impl, softmax_aux):
+        batch = make_dummy_rpa_inputs(**cfg)  # fresh buffers each call (donation-safe)
+        out, _ = impl(
+            batch["queries"],
+            batch["keys"],
+            batch["values"],
+            batch["kv_cache"],
+            batch["kv_lens"],
+            batch["block_tables"],
+            batch["query_start_loc"],
+            batch["distribution"],
+            softmax_aux=softmax_aux,
+            softmax_scale=softmax_scale,
+        )
+        return np.asarray(out, np.float32)
+
+    out_p = run(ragged_page_attention_v3, sinks)
+    out_x = run(xla_ragged_page_attention_v3, sinks)
+    assert np.isfinite(out_p).all()
+    np.testing.assert_allclose(out_p, out_x, rtol=0, atol=0.05)
+    # Negative control: the sinks must visibly change the output.
+    assert np.abs(run(xla_ragged_page_attention_v3, None) - out_x).max() > 0.1
+
+
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("sliding_window", [1, 16, 17, 64])
 @pytest.mark.parametrize("with_attention_sink", [False, True])

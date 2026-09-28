@@ -33,6 +33,59 @@ pytestmark = pytest.mark.skipif(not _has_tpu(), reason="Pallas TPU tests require
 class TestPageAttentionTPU:
     """Test suite for TPU Pallas page attention implementation."""
 
+    @pytest.mark.parametrize("inline_seq_dim", [False, True])
+    def test_zero_context_length_produces_zero_output(self, inline_seq_dim):
+        query = jnp.zeros((2, 8, 128), dtype=jnp.float32)
+        key_cache = jnp.zeros((2, 4, 128, 128), dtype=jnp.float32)
+        value_cache = jnp.full((2, 4, 128, 128), 3.0, dtype=jnp.float32)
+        # The empty row comes AFTER a non-empty row so its output block reuses a VMEM
+        # output buffer that already holds the previous row's result (3.0); a fresh
+        # buffer could read as zero by chance and hide a missing initialisation.
+        context_lens = jnp.array([128, 0], dtype=jnp.int32)
+        block_tables = jnp.array([[1, 0], [0, 0]], dtype=jnp.int32)
+
+        output = page_attention(
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            context_lens=context_lens,
+            block_tables=block_tables,
+            pages_per_compute_block=1,
+            inline_seq_dim=inline_seq_dim,
+        )
+
+        assert jnp.allclose(output[0], 3.0, rtol=0, atol=1e-5)
+        assert jnp.array_equal(output[1], jnp.zeros_like(output[1]))
+
+    @pytest.mark.parametrize("inline_seq_dim", [False, True])
+    def test_infinite_mask_value_with_window_skipped_block_is_finite(self, inline_seq_dim):
+        """``mask_value=-inf`` must not turn a block fully outside the window into NaN (r14 S02-1).
+
+        Context 256 with ``sliding_window=32``: block 0 (tokens 0..127) is invisible to the query at
+        255. Zero Q/K and unit V make the exact output all ones.
+        """
+        query = jnp.zeros((1, 8, 128), dtype=jnp.float32)
+        key_cache = jnp.zeros((1, 2, 128, 128), dtype=jnp.float32)
+        value_cache = jnp.ones((1, 2, 128, 128), dtype=jnp.float32)
+
+        def run(**kwargs):
+            return page_attention(
+                query=query,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                context_lens=jnp.array([256], dtype=jnp.int32),
+                block_tables=jnp.array([[0, 1]], dtype=jnp.int32),
+                pages_per_compute_block=1,
+                inline_seq_dim=inline_seq_dim,
+                sliding_window=32,
+                **kwargs,
+            )
+
+        out = run(mask_value=float("-inf"))
+        assert jnp.all(jnp.isfinite(out)), out
+        assert jnp.allclose(out, 1.0, atol=1e-5), float(jnp.max(jnp.abs(out - 1.0)))
+        assert jnp.allclose(out, run(), atol=1e-5)
+
     def test_basic_forward_shape_and_finite(self):
         """Test basic forward pass with simple configuration."""
         num_seqs = 4

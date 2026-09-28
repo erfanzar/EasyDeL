@@ -903,6 +903,29 @@ class MultiLatentRaggedPageAttentionV2Config(BaseOperationConfig):
 
 
 @dataclass
+class SparseMultiLatentRaggedPageAttentionConfig(BaseOperationConfig):
+    """Configuration for sparse (top-k selected chunks) MLA ragged paged attention.
+
+    Args:
+        num_queries_per_block: Query rows processed per kernel step.
+        num_chunks_per_block: Selected chunks gathered per KV step (Pallas backend).
+        vmem_limit_bytes: Optional TPU VMEM hint for the Pallas backend.
+        num_warps: Kept for API consistency (unused on XLA/Pallas paths).
+        num_stages: Kept for API consistency (unused on XLA/Pallas paths).
+        platform: Target platform (pallas/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    num_queries_per_block: int | None = None
+    num_chunks_per_block: int | None = None
+    vmem_limit_bytes: int | None = None
+    num_warps: int = 4
+    num_stages: int = 1
+
+    __hash__ = hash_fn
+
+
+@dataclass
 class GLAttentionConfig(BaseOperationConfig):
     """Configuration for Gated Linear Attention operation.
 

@@ -40,6 +40,7 @@ Note:
 
 import chex
 import jax
+from jax import numpy as jnp
 
 
 def _flash_attention_bwd(
@@ -61,12 +62,12 @@ def _flash_attention_bwd(
     dropout_key: chex.Array | None,
     res: tuple,
     g: chex.Array,
-) -> tuple[chex.Array, chex.Array, chex.Array]:
+) -> tuple[chex.Array, chex.Array, chex.Array, chex.Array | None]:
     """Backward pass for flash attention using JAX autodiff.
 
     Reconstructs the forward computation from saved residuals and uses
     JAX's VJP (vector-Jacobian product) to compute gradients for query,
-    key, and value tensors. All static parameters (precision, chunk sizes,
+    key, value, and floating-point sink tensors. All static parameters (precision, chunk sizes,
     causal mode, etc.) are provided as encoded integers or plain values
     and decoded internally.
 
@@ -91,8 +92,8 @@ def _flash_attention_bwd(
         g: Gradient of the loss with respect to the attention output.
 
     Returns:
-        Tuple of (dq, dk, dv) where each gradient has the same shape
-        as its corresponding input tensor.
+        Tuple of (dq, dk, dv, dsoftmax_aux). The sink gradient matches
+        the input shape, or is None when the sink is absent/non-floating.
     """
     from ._xla_impl_fwd import _flash_attention_fwd
 
@@ -112,13 +113,14 @@ def _flash_attention_bwd(
     precision = _CODE_TO_PREC[precision_code]
     logits_dtype = _CODE_TO_DTYPE[logits_dtype_code]
 
-    def f(q_, k_, v_):
+    def f(q_, k_, v_, aux_):
         """Reconstruct the forward pass for VJP computation.
 
         Args:
             q_: Query tensor.
             k_: Key tensor.
             v_: Value tensor.
+            aux_: Optional attention sink logits.
 
         Returns:
             Forward pass attention output.
@@ -139,12 +141,17 @@ def _flash_attention_bwd(
             normalize_output=normalize_output,
             precision=precision,
             logits_dtype=logits_dtype,
-            softmax_aux=softmax_aux,
+            softmax_aux=aux_,
             causal=causal,
             dropout_prob=dropout_prob,
             dropout_key=dropout_key,
         )
 
-    _, pullback = jax.vjp(f, q, k, v)
-    dq, dk, dv = pullback(g)
-    return dq, dk, dv
+    if softmax_aux is not None and hasattr(softmax_aux, "dtype") and jnp.issubdtype(softmax_aux.dtype, jnp.floating):
+        _, pullback = jax.vjp(f, q, k, v, softmax_aux)
+        dq, dk, dv, dsoftmax_aux = pullback(g)
+    else:
+        _, pullback = jax.vjp(lambda q_, k_, v_: f(q_, k_, v_, softmax_aux), q, k, v)
+        dq, dk, dv = pullback(g)
+        dsoftmax_aux = None
+    return dq, dk, dv, dsoftmax_aux

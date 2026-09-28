@@ -132,6 +132,7 @@ def _paged_attn_kernel(
         context_range = context_end_idx - context_start_idx
         num_blocks = (context_range + KV_BLOCK_SIZE - 1) // KV_BLOCK_SIZE
     else:
+        context_end_idx = context_len
         num_blocks = (context_len + KV_BLOCK_SIZE - 1) // KV_BLOCK_SIZE
 
     block_offset = tl.arange(0, KV_BLOCK_SIZE)
@@ -163,7 +164,10 @@ def _paged_attn_kernel(
 
         kv_block_offset = block_number * stride_kv0 + kv_offset
         mask_offset = block_idx * KV_BLOCK_SIZE + block_offset
-        kv_mask = mask_offset[:, None] < context_len
+        # Mask against this partition's end, not the full context length, so a
+        # tail block that straddles the partition boundary is not also counted
+        # by the next partition (which would double-weight those positions).
+        kv_mask = mask_offset[:, None] < context_end_idx
 
         k = tl.load(k_cache_ptr + kv_block_offset, mask=kv_mask, other=0.0)
 
@@ -173,7 +177,7 @@ def _paged_attn_kernel(
             qk = tl.dot(q, k.T, out_dtype=tl.float32)
 
         qk *= attn_scale
-        qk = tl.where(mask_offset < context_len, qk, float("-inf"))
+        qk = tl.where(mask_offset < context_end_idx, qk, float("-inf"))
 
         m_i_new = tl.maximum(m_i, tl.max(qk, axis=1))
 

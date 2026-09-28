@@ -72,6 +72,7 @@ from beartype import beartype
 from jaxtyping import Array, Float, Int32
 
 from ..._registry import Backend, Platform, kernel_registry
+from ._sinks import reduce_sinks_to_heads
 from ._xla_impl_fwd import ragged_paged_attention as _ragged_paged_attention
 
 
@@ -86,7 +87,7 @@ def ragged_page_attention_v3(
     block_tables: Int32[Array, "max_num_seqs_times_pages_per_seq"],
     query_start_loc: Int32[Array, "max_num_seqs_plus_1"],
     distribution: Int32[Array, "3"],
-    softmax_aux: Float[Array, "num_q_heads"] | None = None,
+    softmax_aux: Float[Array, "..."] | None = None,
     *,
     softmax_scale: float = 1.0,
     sliding_window: int | None = None,
@@ -98,6 +99,8 @@ def ragged_page_attention_v3(
     num_kv_pages_per_block: int | None = None,
     num_queries_per_block: int | None = None,
     vmem_limit_bytes: int | None = None,
+    chunk_size: int | None = None,
+    alibi_slopes: Float[Array, "num_q_heads"] | None = None,
 ) -> tuple[
     Float[Array, "total_tokens num_q_heads head_dim"],
     Float[Array, "num_pages page_size num_kv_heads_x2_per_kv_packing kv_packing head_dim_padded"],
@@ -126,8 +129,10 @@ def ragged_page_attention_v3(
         distribution: Batch distribution descriptor [3].
             [num_prefill_seqs, num_decode_seqs, num_chunked_prefill_seqs].
             Describes how sequences are partitioned by type.
-        softmax_aux: Optional attention sink logits [num_q_heads].
-            Per-head auxiliary logits for softmax normalization.
+        softmax_aux: Optional attention sink logits. Accepts ``[num_q_heads]``,
+            a shared ``[num_sinks]``, or 2-D ``[num_q_heads|num_kv_heads|1, num_sinks]``.
+            Multiple sinks of one head are reduced with ``logsumexp`` to one
+            per-head sink before the kernel (exactly equivalent).
         softmax_scale: Scaling factor for QK^T. Default 1.0.
         sliding_window: Optional sliding window size for local attention.
         logits_soft_cap: Optional soft cap for attention logits via tanh.
@@ -139,6 +144,11 @@ def ragged_page_attention_v3(
         num_kv_pages_per_block: Unused in XLA backend (Pallas-specific).
         num_queries_per_block: Unused in XLA backend (Pallas-specific).
         vmem_limit_bytes: Unused in XLA backend (Pallas-specific).
+        chunk_size: Optional chunked-local-attention size ``C``: a query at
+            position ``q`` attends key ``k`` only if ``k <= q`` and
+            ``k // C == q // C`` (Llama4).
+        alibi_slopes: Optional per-query-head ALiBi slopes ``[num_q_heads]``;
+            adds ``slope_h * key_position`` to the scaled logits.
 
     Returns:
         Tuple of (attention_output, updated_kv_cache):
@@ -171,6 +181,7 @@ def ragged_page_attention_v3(
     """
     if softmax_scale is None:
         softmax_scale = queries.shape[-1] ** -0.5
+    softmax_aux = reduce_sinks_to_heads(softmax_aux, queries.shape[1], keys.shape[1])
 
     return _ragged_paged_attention(
         queries,
@@ -192,4 +203,6 @@ def ragged_page_attention_v3(
         num_kv_pages_per_block=num_kv_pages_per_block,
         num_queries_per_block=num_queries_per_block,
         vmem_limit_bytes=vmem_limit_bytes,
+        chunk_size=chunk_size,
+        alibi_slopes=alibi_slopes,
     )

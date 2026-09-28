@@ -12,17 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Benchmark the fused top-k against the paths it would replace.
-
-Shapes are the three real call sites, not synthetic sweeps:
+"""Benchmark fused top-k on shapes drawn from real call sites.
 
 * MoE router      -- ``[tokens, experts]``, tiny static k, run 43x per decode step
 * DSA indexer     -- ``[rows, entries]``, large static k
 * sampling filter -- ``[reqs, vocab]``, per-row dynamic k, mask not indices
 
-Baselines are what those sites use today: ``jax.lax.top_k`` for the static-k
-sites, and EasyDeL's threshold binary search for the sampler. Timing is
-steady-state after warmup; compile is measured separately and labelled.
+The static-k baseline is ``jax.lax.top_k``. The sampler uses a standalone
+JAX sort as an independent correctness oracle and timing reference, **not**
+the serving implementation; its sort/topk ratio is not a production speedup.
+Timing is steady-state after warmup; compile is measured separately.
 """
 
 from __future__ import annotations
@@ -97,31 +96,29 @@ def main() -> None:
         label = f"vocab [{args.reqs},{args.vocab}] k={k}"
         print(f"{label:38s} {base:9.4f}m {ours:9.4f}m {base / ours:7.2f}x  {ok!s:>6s}")
 
-    # ---- sampler: per-row dynamic k, mask ------------------------------------
-    try:
-        from easydel.inference.esurge.core.binary_search import apply_topk_mask
-    except Exception as exc:  # pragma: no cover - easydel may not be importable
-        print(f"\n(sampler baseline unavailable: {exc})")
-        return
-
+    # ---- sampler: per-row dynamic k, mask (independent sort reference) -------
     ks = jnp.asarray(rng.integers(1, 100, size=(args.reqs,)), jnp.int32)
     min_val = float(jnp.finfo(jnp.float32).min)
 
-    def baseline(a, kk):
-        return jax.vmap(lambda row, k1: apply_topk_mask(row[None, :], k1, min_val)[0])(a, kk)
+    def sort_reference(a, kk):
+        sorted_rows = jnp.sort(a, axis=-1)
+        cutoff = jnp.take_along_axis(sorted_rows, (a.shape[-1] - kk)[:, None], axis=-1)
+        return jnp.where(a >= cutoff, a, min_val)
 
     def ours_fn(a, kk):
         return topk(a, kk, mode="filter", mask_fill=min_val)
 
-    b = _bench(jax.jit(baseline), z, ks)
+    b = _bench(jax.jit(sort_reference), z, ks)
     o = _bench(jax.jit(ours_fn), z, ks)
-    kept_b = (np.asarray(jax.jit(baseline)(z, ks)) > min_val).sum(-1)
-    kept_o = (np.asarray(jax.jit(ours_fn)(z, ks)) > min_val).sum(-1)
-    agree = bool(np.array_equal(kept_b, kept_o))
+    reference = np.asarray(jax.jit(sort_reference)(z, ks))
+    actual = np.asarray(jax.jit(ours_fn)(z, ks))
+    agree = bool(np.array_equal(reference, actual))
+    print("\nSampler comparison is against JAX sort, NOT the serving-path baseline:")
+    print(f"{'case':38s} {'sort-ref':>10s} {'topk':>10s} {'sort/topk':>10s}  {'exact?':>6s}")
     label = f"sampler filter [{args.reqs},{args.vocab}] dyn-k"
-    print(f"{label:38s} {b:9.4f}m {o:9.4f}m {b / o:7.2f}x  {agree!s:>6s}")
+    print(f"{label:38s} {b:9.4f}m {o:9.4f}m {b / o:9.2f}x  {agree!s:>6s}")
     print(
-        f"\ncompile (first call): baseline {_compile_ms(jax.jit(baseline), z, ks):.0f} ms, "
+        f"\ncompile (first call): sort-ref {_compile_ms(jax.jit(sort_reference), z, ks):.0f} ms, "
         f"topk {_compile_ms(jax.jit(ours_fn), z, ks):.0f} ms"
     )
 

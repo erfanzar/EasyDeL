@@ -214,6 +214,10 @@ def _ragged_paged_attention(
                 kv_block_start = jnp.int32(0)
                 if sliding_window is not None:
                     kv_block_start = jnp.maximum(q_start_tok - window_size + 1, 0) // kv_tokens_per_block
+                # Logits, exponentials, running max, denominator and value sum accumulate in at least
+                # float32 whatever ``compute_dtype`` the Q/K/V operands use (r11 S04-1: a float16
+                # denominator overflowed past 65504 unit exponentials). Only the final output is cast.
+                acc_dtype = jnp.promote_types(compute_dtype, jnp.float32)
 
                 def _process_kv_block(kv_block_idx, online_softmax_carry):
                     """Process one KV block and update the online softmax state.
@@ -251,7 +255,8 @@ def _ragged_paged_attention(
                             query_block.astype(compute_dtype),
                             key_block.astype(compute_dtype),
                             optimize=True,
-                        )
+                            preferred_element_type=acc_dtype,
+                        ).astype(acc_dtype)
                         * softmax_scale
                     )
                     if logits_soft_cap is not None:
@@ -280,21 +285,27 @@ def _ragged_paged_attention(
 
                     rescale = jnp.exp(max_score_block - safe_max)
                     sum_exp_block = (rescale * sum_exp_block) + jnp.sum(probs, axis=3)
-                    value_update = jnp.einsum("bihk,kid->bihd", probs, value_block.astype(compute_dtype), optimize=True)
+                    value_update = jnp.einsum(
+                        "bihk,kid->bihd",
+                        probs.astype(acc_dtype),
+                        value_block.astype(compute_dtype),
+                        optimize=True,
+                        preferred_element_type=acc_dtype,
+                    ).astype(acc_dtype)
                     output_block = jnp.expand_dims(rescale, 3) * output_block + value_update
 
                     return output_block, sum_exp_block, new_max
 
-                init_output_block = jnp.zeros((qblocks, num_kv_heads, q_heads_per_group, head_size), dtype=compute_dtype)
+                init_output_block = jnp.zeros((qblocks, num_kv_heads, q_heads_per_group, head_size), dtype=acc_dtype)
                 if have_sinks:
-                    init_sum_exp = jnp.ones((qblocks, num_kv_heads, q_heads_per_group), dtype=compute_dtype)
+                    init_sum_exp = jnp.ones((qblocks, num_kv_heads, q_heads_per_group), dtype=acc_dtype)
                     init_max = jnp.broadcast_to(
-                        sinks_h[None, :, :].astype(compute_dtype),
+                        sinks_h[None, :, :].astype(acc_dtype),
                         (qblocks, num_kv_heads, q_heads_per_group),
                     )
                 else:
-                    init_sum_exp = jnp.zeros((qblocks, num_kv_heads, q_heads_per_group), dtype=compute_dtype)
-                    init_max = jnp.full((qblocks, num_kv_heads, q_heads_per_group), -jnp.inf, dtype=compute_dtype)
+                    init_sum_exp = jnp.zeros((qblocks, num_kv_heads, q_heads_per_group), dtype=acc_dtype)
+                    init_max = jnp.full((qblocks, num_kv_heads, q_heads_per_group), -jnp.inf, dtype=acc_dtype)
 
                 output_block, sum_exp_block, _max_block = jax.lax.fori_loop(
                     kv_block_start,

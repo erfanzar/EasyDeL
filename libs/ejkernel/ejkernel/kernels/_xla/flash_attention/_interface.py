@@ -370,7 +370,7 @@ def _make_core_func(
             dropout_key,
         ) = ctx
 
-        dq, dk, dv = _flash_attention_bwd(
+        dq, dk, dv, dsoftmax_aux = _flash_attention_bwd(
             bias=bias,
             mask=attention_mask,
             q_segment_ids=q_segment_ids,
@@ -399,7 +399,7 @@ def _make_core_func(
             None,
             None,
             None,
-            None,
+            dsoftmax_aux,
             None,
             None,
             None,
@@ -523,7 +523,7 @@ def flash_attention(
     fwd_params: FwdParams | None = None,
     bwd_params: BwdParams | None = None,
     logits_soft_cap: float | None = None,
-    softmax_aux: Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "num_sinks"] | Float[Array, "sink_heads num_sinks"] | None = None,
     normalize_output: bool = True,
     precision: lax.PrecisionLike = jax.lax.Precision.DEFAULT,
     logits_dtype: DTypeLike = jnp.float32,

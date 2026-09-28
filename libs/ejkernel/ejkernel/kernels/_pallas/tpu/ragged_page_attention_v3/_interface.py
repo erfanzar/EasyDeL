@@ -80,6 +80,8 @@ import jaxtyping
 from beartype import beartype
 from jaxtyping import Array, Float, Int32
 
+from ejkernel.kernels._xla.ragged_page_attention_v3._sinks import reduce_sinks_to_heads
+
 from ...._registry import Backend, Platform, kernel_registry
 from ._pallas_impl_fwd import ragged_paged_attention as _128_ragged_paged_attention
 from ._pallas_impl_fwd_h64 import ragged_paged_attention as _64_ragged_paged_attention
@@ -96,7 +98,7 @@ def ragged_page_attention_v3(
     block_tables: Int32[Array, "max_num_seqs_times_pages_per_seq"],
     query_start_loc: Int32[Array, "max_num_seqs_plus_1"],
     distribution: Int32[Array, "3"],
-    softmax_aux: Float[Array, "num_q_heads"] | None = None,
+    softmax_aux: Float[Array, "..."] | None = None,
     *,
     softmax_scale: float = 1.0,
     sliding_window: int | None = None,
@@ -108,6 +110,8 @@ def ragged_page_attention_v3(
     num_kv_pages_per_block: int | None = None,
     num_queries_per_block: int | None = None,
     vmem_limit_bytes: int | None = None,
+    chunk_size: int | None = None,
+    alibi_slopes: Float[Array, "num_q_heads"] | None = None,
 ) -> tuple[
     Float[Array, "total_tokens num_q_heads head_dim"],
     Float[Array, "num_pages page_size num_kv_heads_x2_per_kv_packing kv_packing head_dim_padded"],
@@ -136,7 +140,10 @@ def ragged_page_attention_v3(
             - [0]: Number of prefill sequences
             - [1]: Number of decode sequences
             - [2]: Total number of sequences
-        softmax_aux: Optional attention sink logits [num_q_heads] for streaming.
+        softmax_aux: Optional attention sink logits. Accepts ``[num_q_heads]``, a
+            shared ``[num_sinks]``, or 2-D ``[num_q_heads|num_kv_heads|1, num_sinks]``;
+            several sinks of one head are reduced with ``logsumexp`` to one per-head
+            sink before the kernel (exactly equivalent).
         softmax_scale: Scaling factor for QK^T (default: 1/sqrt(head_dim)).
         sliding_window: Size of sliding window for local attention.
         logits_soft_cap: Optional soft cap value for attention logits.
@@ -147,6 +154,11 @@ def ragged_page_attention_v3(
         num_kv_pages_per_block: Number of KV pages per compute block in kernel.
         num_queries_per_block: Number of queries per compute block in kernel.
         vmem_limit_bytes: VMEM budget limit for the Pallas kernel.
+        chunk_size: Optional chunked-local-attention size ``C`` (Llama4): a query at
+            ``q`` attends key ``k`` only if ``k <= q`` and ``k // C == q // C``. KV
+            blocks before the query's chunk start are skipped.
+        alibi_slopes: Optional per-query-head ALiBi slopes ``[num_q_heads]``; adds
+            ``slope_h * key_position`` to the scaled logits.
 
     Returns:
         Tuple of:
@@ -160,6 +172,7 @@ def ragged_page_attention_v3(
     """
     if softmax_scale is None:
         softmax_scale = queries.shape[-1] ** -0.5
+    softmax_aux = reduce_sinks_to_heads(softmax_aux, queries.shape[1], keys.shape[1])
     if queries.shape[-1] == 64:
         return _64_ragged_paged_attention(
             queries,
@@ -181,6 +194,8 @@ def ragged_page_attention_v3(
             num_kv_pages_per_block=num_kv_pages_per_block,
             num_queries_per_block=num_queries_per_block,
             vmem_limit_bytes=vmem_limit_bytes,
+            chunk_size=chunk_size,
+            alibi_slopes=alibi_slopes,
         )
     return _128_ragged_paged_attention(
         queries,
@@ -202,4 +217,6 @@ def ragged_page_attention_v3(
         num_kv_pages_per_block=num_kv_pages_per_block,
         num_queries_per_block=num_queries_per_block,
         vmem_limit_bytes=vmem_limit_bytes,
+        chunk_size=chunk_size,
+        alibi_slopes=alibi_slopes,
     )

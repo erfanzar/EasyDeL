@@ -43,20 +43,31 @@ from ..._registry import Backend, Platform, kernel_registry
 
 
 def _sortable_key(x: Array) -> Array:
-    """Map floats to uint32 keys whose integer order matches float order.
-
-    IEEE-754 floats already compare correctly as sign-magnitude integers for
-    non-negatives; negatives run backwards. Flipping all bits of negatives and
-    setting the sign bit on non-negatives makes plain unsigned comparison agree
-    with float comparison over the whole range, which is what lets the
-    threshold search bisect exactly rather than approximately.
+    """Map floats and integers to unsigned keys in their original value order.
 
     Args:
-        x: Float array (f32 or narrower; narrower is upcast).
+        x: Float, integer, or boolean array.
 
     Returns:
-        uint32 keys, same shape as ``x``.
+        Unsigned integer keys, same shape as ``x``.
     """
+    if jnp.issubdtype(x.dtype, jnp.bool_):
+        return x.astype(jnp.uint32)
+    if jnp.issubdtype(x.dtype, jnp.integer):
+        wide = x.dtype.itemsize > 4
+        unsigned = jnp.uint64 if wide else jnp.uint32
+        if jnp.issubdtype(x.dtype, jnp.signedinteger):
+            signed = jnp.int64 if wide else jnp.int32
+            sign_bit = jnp.uint64(1 << 63) if wide else jnp.uint32(1 << 31)
+            return jax.lax.bitcast_convert_type(x.astype(signed), unsigned) ^ sign_bit
+        return x.astype(unsigned)
+    # Flipping negative IEEE-754 bits and setting the sign bit of non-negatives
+    # preserves float order in an unsigned comparison. float64 keeps a 64-bit key:
+    # narrowing it to float32 would merge distinct values into false ties.
+    if x.dtype.itemsize > 4:
+        bits = jax.lax.bitcast_convert_type(x.astype(jnp.float64), jnp.uint64)
+        sign = (bits >> jnp.uint64(63)).astype(jnp.bool_)
+        return jnp.where(sign, ~bits, bits | jnp.uint64(1 << 63))
     bits = jax.lax.bitcast_convert_type(x.astype(jnp.float32), jnp.uint32)
     sign = (bits >> jnp.uint32(31)).astype(jnp.bool_)
     return jnp.where(sign, ~bits, bits | jnp.uint32(0x80000000))
@@ -146,23 +157,32 @@ def topk(
 
     keys = _sortable_key(moved)
     # Largest key t with count(keys >= t) >= k. c(.) is non-increasing in t, so
-    # a plain bisection over the full uint32 range converges in 32 steps.
-    lo = jnp.zeros_like(ks, dtype=jnp.uint32)
-    hi = jnp.full_like(lo, jnp.uint32(0xFFFFFFFF))
+    # a bisection over the full unsigned key range converges in 32 or 64 steps.
+    lo = jnp.zeros_like(ks, dtype=keys.dtype)
+    hi = jnp.full_like(lo, jnp.iinfo(keys.dtype).max)
 
     def _step(_, bounds):
         lo_i, hi_i = bounds
-        mid = lo_i + ((hi_i - lo_i) >> jnp.uint32(1))
+        # Round upward so the maximum representable key can be selected.
+        mid = lo_i + ((hi_i - lo_i) >> 1) + ((hi_i - lo_i) & 1)
         count = (keys >= mid).sum(-1, keepdims=True)
         feasible = count >= ks
-        return jnp.where(feasible, mid, lo_i), jnp.where(feasible, hi_i, mid)
+        return jnp.where(feasible, mid, lo_i), jnp.where(feasible, hi_i, mid - 1)
 
-    lo, hi = jax.lax.fori_loop(0, 32, _step, (lo, hi))
+    lo, hi = jax.lax.fori_loop(0, keys.dtype.itemsize * 8, _step, (lo, hi))
     keep = (keys >= lo) & (ks > 0)
 
     if mode == "mask":
         return jnp.moveaxis(keep, -1, axis) if axis not in (-1, operand.ndim - 1) else keep
 
-    fill = jnp.finfo(operand.dtype).min if mask_fill is None else mask_fill
+    if mask_fill is None:
+        if jnp.issubdtype(operand.dtype, jnp.bool_):
+            fill = False
+        elif jnp.issubdtype(operand.dtype, jnp.integer):
+            fill = jnp.iinfo(operand.dtype).min
+        else:
+            fill = jnp.finfo(operand.dtype).min
+    else:
+        fill = mask_fill
     out = jnp.where(keep, moved, jnp.asarray(fill, operand.dtype))
     return jnp.moveaxis(out, -1, axis) if axis not in (-1, operand.ndim - 1) else out

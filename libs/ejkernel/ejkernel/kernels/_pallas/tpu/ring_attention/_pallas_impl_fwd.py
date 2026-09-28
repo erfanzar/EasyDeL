@@ -75,13 +75,13 @@ from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_ma
 from jax.experimental.pallas.ops.tpu.splash_attention import (
     splash_attention_mask_info as mask_info_lib,
 )
-from jax.scipy.special import logsumexp
 from jaxtyping import Float, Int
 
 from ejkernel.ops import BwdParams, FwdParams
 
 from ...._xla.attention import attention as _xla_attention
 from ...._xla.ring_attention import ring_attention as _xla_ring_attention
+from ..blocksparse_attention import _kernel as splash_kernel
 from ._pallas_impl_bwd import (
     DEFAULT_MASK_VALUE,
     RING_AXIS,
@@ -251,7 +251,7 @@ def ring_attention(
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
     q_position_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_position_ids: Int[Array, "batch seq_len_k"] | None = None,
-    softmax_aux: Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "num_sinks"] | Float[Array, "sink_heads num_sinks"] | None = None,
     bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     mask_builder: Callable[[int, int, int, int, int], Mask] | None = None,
     sliding_window: int | tuple[int, int] | None = None,
@@ -291,9 +291,10 @@ def ring_attention(
         kv_position_ids: Optional KV position IDs [batch, kv_len]. Forwarded
             to the XLA ring-attention fallback; not consumed by the Pallas
             splash path when ``axis_name`` is set.
-        softmax_aux: Optional attention sink logits [num_sinks] (1-D float32).
-            Reduced to a per-head scalar via ``logsumexp`` and passed to
-            ``ring_splash_attention`` as ``sinks``.
+        softmax_aux: Optional attention sink logits: 1-D ``[num_sinks]`` (shared) or 2-D
+            ``[num_heads | num_kv_heads | 1, num_sinks]``. With ``axis_name`` set every
+            layout is reduced exactly to per-head sinks via ``logsumexp`` for the splash
+            kernel; without it 2-D sinks route to the XLA ring kernel.
         bias: Optional attention bias [batch, num_heads, q_len, kv_len].
             Not supported by the Pallas splash path; raises
             ``NotImplementedError`` when ``axis_name`` is set.
@@ -331,8 +332,33 @@ def ring_attention(
     aux = None
     if softmax_aux is not None:
         aux = jnp.asarray(softmax_aux, dtype=jnp.float32)
-        if aux.ndim != 1:
-            raise ValueError(f"softmax_aux must be 1D, got shape {aux.shape}.")
+        if aux.ndim == 2 and axis_name is None:
+            # Single-device path: keep the XLA ring kernel, which consumes 2-D sinks natively.
+            # With a ring axis, 2-D sinks are reduced exactly to per-head sinks below and the
+            # splash kernel is used.
+            return _xla_ring_attention(
+                query=query,
+                key=key,
+                value=value,
+                q_segment_ids=q_segment_ids,
+                kv_segment_ids=kv_segment_ids,
+                q_position_ids=q_position_ids,
+                kv_position_ids=kv_position_ids,
+                softmax_aux=softmax_aux,
+                bias=bias,
+                mask_builder=mask_builder,
+                sliding_window=sliding_window,
+                chunk_size=chunk_size,
+                causal=causal,
+                logits_soft_cap=logits_soft_cap,
+                softmax_scale=softmax_scale,
+                axis_name=axis_name,
+                fwd_params=fwd_params,
+                bwd_params=bwd_params,
+                fused_backward=fused_backward,
+            )
+        if aux.ndim not in (1, 2):
+            raise ValueError(f"softmax_aux must be 1D or 2D, got shape {aux.shape}.")
 
     if axis_name is None:
         needs_ring_semantics = (
@@ -416,13 +442,23 @@ def ring_attention(
 
     sinks = None
     if aux is not None:
-        sinks = jnp.broadcast_to(logsumexp(aux), (num_heads,))
+        if aux.ndim == 1:
+            # 1-D is always a shared sink set for this kernel. Reduce it as a (1, S) layout through the
+            # safe shared reducer so disabled (all -inf) sinks get a zero, not NaN, gradient (r14 S03-2).
+            sinks = splash_kernel.reduce_sinks_to_per_head(
+                aux[None, :], num_q_heads=num_heads, num_kv_heads=num_kv_heads
+            )
+        else:
+            # (Hq, S) / (Hkv, S) / (1, S): logsumexp over the sink axis gives one exact
+            # per-head sink, which is what the splash kernel consumes.
+            sinks = splash_kernel.reduce_sinks_to_per_head(aux, num_q_heads=num_heads, num_kv_heads=num_kv_heads)
 
-    segment_ids = None
+    # Per-row segment ids are mapped alongside Q/K/V: taking row 0 for the whole batch applied
+    # batch 0's packing boundaries to every example (r12 S03-1).
+    q_seg = kv_seg = None
     if q_segment_ids is not None or kv_segment_ids is not None:
         q_seg = q_segment_ids if q_segment_ids is not None else kv_segment_ids
         kv_seg = kv_segment_ids if kv_segment_ids is not None else q_segment_ids
-        segment_ids = SegmentIds(q=q_seg[0], kv=kv_seg[0])
 
     def single_batch_attention(q, k, v, seg_ids, sinks_batch):
         """Process single batch element."""
@@ -468,11 +504,17 @@ def ring_attention(
             ring_axis=ring_axis,
             causal=causal,
             sliding_window=sliding_window,
+            chunk_size=chunk_size,
         )
 
         out = rearrange(out, "h s d -> s h d")
         return out
 
-    outputs = jax.vmap(lambda q, k, v: single_batch_attention(q, k, v, segment_ids, sinks))(query, key, value)
+    if q_seg is None:
+        outputs = jax.vmap(lambda q, k, v: single_batch_attention(q, k, v, None, sinks))(query, key, value)
+    else:
+        outputs = jax.vmap(lambda q, k, v, qs, ks: single_batch_attention(q, k, v, SegmentIds(q=qs, kv=ks), sinks))(
+            query, key, value, q_seg, kv_seg
+        )
 
     return outputs.astype(input_dtype)

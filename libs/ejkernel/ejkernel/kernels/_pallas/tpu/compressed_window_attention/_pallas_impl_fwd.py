@@ -211,12 +211,212 @@ def _tiled_reference(
     return blocks.transpose(1, 2, 0, 3, 4).reshape(batch, heads, tiles * tile, dim)[:, :, :q_len]
 
 
+def implicit_token_bias(entry_bias: Array, token_valid: Array, window: int) -> Array:
+    """Expand the implicit token mask into the dense ``[batch, q_len, q_len + entries]`` bias.
+
+    Token key ``k`` is visible to query ``q`` iff ``k <= q``, ``k > q - window`` and ``token_valid[k]``; visible
+    keys get ``0`` and the rest the finite ``_MASK_MIN`` sentinel, exactly as a caller-built dense bias would.
+
+    Args:
+        entry_bias: Compressed-entry bias ``[batch, q_len, entries]``.
+        token_valid: Per-key validity ``[batch, q_len]`` (bool or 0/1).
+        window: Sliding-window size.
+
+    Returns:
+        The full additive bias ``[batch, q_len, q_len + entries]`` (fp32).
+    """
+    q_len = token_valid.shape[1]
+    qi = jnp.arange(q_len, dtype=jnp.int32)[:, None]
+    ki = jnp.arange(q_len, dtype=jnp.int32)[None, :]
+    allowed = (ki <= qi) & (ki > qi - window)
+    allowed = allowed[None] & (token_valid > 0)[:, None, :]
+    token_bias = jnp.where(allowed, 0.0, _MASK_MIN).astype(jnp.float32)
+    return jnp.concatenate([token_bias, entry_bias.astype(jnp.float32)], axis=2)
+
+
+# Measured crossover (probe_entry_selection.py, TPU v5, 16 heads x 512, window 128, top-k 512, bf16): below
+# q_len * entries = 2**28 the dense-bias Pallas forward + banded backward is faster for fwd+bwd; at and above it the
+# sparse attend matches its time and its memory stays linear (124 MB vs 2.84 GB at 16k x 16k).
+_TOPK_SPARSE_MIN_CELLS = 1 << 28
+
+
+def _selection_bias(entry_topk: Array, num_entries: int) -> Array:
+    """Dense ``[batch, q_len, entries]`` bias opening each query's selected entries (``-1`` = none)."""
+    batch, seq, _ = entry_topk.shape
+    target = jnp.where(entry_topk >= 0, entry_topk, num_entries)
+    opened = jnp.zeros((batch, seq, num_entries), dtype=bool)
+    opened = opened.at[jnp.arange(batch)[:, None, None], jnp.arange(seq)[None, :, None], target].set(True, mode="drop")
+    return jnp.where(opened, 0.0, _MASK_MIN).astype(jnp.float32)
+
+
+def _dedupe_entry_topk(entry_topk: Array) -> Array:
+    """Sort each query's selected entry ids and turn repeats / negatives into ``-1`` (dense-mask semantics)."""
+    ids = jnp.sort(entry_topk.astype(jnp.int32), axis=-1)
+    repeat = jnp.concatenate([jnp.zeros_like(ids[..., :1], dtype=bool), ids[..., 1:] == ids[..., :-1]], axis=-1)
+    return jnp.where(repeat | (ids < 0), -1, ids)
+
+
+def _topk_tiled_reference(
+    query: Array,
+    kv: Array,
+    entry_topk: Array,
+    softmax_aux: Array,
+    token_valid: Array,
+    *,
+    softmax_scale: float,
+    window: int,
+    block_q: int = 64,
+) -> Array:
+    """Sparse top-k attend: each query tile sees its window band plus its ``k`` gathered entries.
+
+    Value- and gradient-identical to the dense path with ``[implicit token mask | selection mask]`` when a sink is
+    present; ``O(S * (window + k))`` time and memory in both AD directions (rematerialized tiles). Duplicated from
+    the XLA backend so this directory stays self-contained.
+    """
+    batch, heads, seq, dim = query.shape
+    n_entries = kv.shape[1] - seq
+    ids = _dedupe_entry_topk(entry_topk)
+    has_entries = n_entries > 0 and ids.shape[-1] > 0
+    tile = max(1, min(block_q, seq))
+    span = min(tile + window - 1, seq)
+    tiles = -(-seq // tile)
+    pad = tiles * tile - seq
+    tokens = kv[:, :seq]
+    entries = kv[:, seq:]
+    q_p = jnp.pad(query, ((0, 0), (0, 0), (0, pad), (0, 0)))
+    ids_p = jnp.pad(ids, ((0, 0), (0, pad), (0, 0)), constant_values=-1)
+    valid = token_valid > 0
+    sink = softmax_aux.astype(jnp.float32).reshape(1, heads, 1, 1)
+    hi = jax.lax.Precision.HIGHEST
+
+    @jax.checkpoint
+    def attend_tile(index):
+        start = index * tile
+        lo = jnp.clip(start - window + 1, 0, seq - span)
+        q_t = jax.lax.dynamic_slice_in_dim(q_p, start, tile, axis=2)
+        k_t = jax.lax.dynamic_slice_in_dim(tokens, lo, span, axis=1)
+        key_ok = jax.lax.dynamic_slice_in_dim(valid, lo, span, axis=1)
+        q_pos = start + jnp.arange(tile, dtype=jnp.int32)[:, None]
+        k_pos = lo + jnp.arange(span, dtype=jnp.int32)[None, :]
+        allowed = ((k_pos <= q_pos) & (k_pos > q_pos - window))[None] & key_ok[:, None, :]
+        tok_logits = jnp.einsum("bhqd,btd->bhqt", q_t, k_t, precision=hi, preferred_element_type=jnp.float32)
+        tok_logits = jax.lax.optimization_barrier(tok_logits)
+        parts = [jnp.where(allowed[:, None], tok_logits * softmax_scale, _MASK_MIN)]
+        gathered = None
+        if has_entries:
+            sel = jax.lax.dynamic_slice_in_dim(ids_p, start, tile, axis=1)
+            gathered = jnp.take_along_axis(entries[:, None], jnp.maximum(sel, 0)[..., None], axis=2)
+            ent_logits = jnp.einsum("bhqd,bqkd->bhqk", q_t, gathered, precision=hi, preferred_element_type=jnp.float32)
+            ent_logits = jax.lax.optimization_barrier(ent_logits)
+            parts.append(jnp.where((sel >= 0)[:, None], ent_logits * softmax_scale, _MASK_MIN))
+        parts.append(jnp.broadcast_to(sink, (batch, heads, tile, 1)))
+        combined = jnp.concatenate(parts, axis=-1)
+        probs = jax.nn.softmax(combined - jnp.max(combined, axis=-1, keepdims=True), axis=-1).astype(kv.dtype)
+        out = jnp.einsum("bhqt,btd->bhqd", probs[..., :span], k_t, precision=hi, preferred_element_type=jnp.float32)
+        if gathered is not None:
+            out = out + jnp.einsum(
+                "bhqk,bqkd->bhqd", probs[..., span:-1], gathered, precision=hi, preferred_element_type=jnp.float32
+            )
+        return out.astype(kv.dtype)
+
+    blocks = jax.lax.map(attend_tile, jnp.arange(tiles, dtype=jnp.int32))
+    return blocks.transpose(1, 2, 0, 3, 4).reshape(batch, heads, tiles * tile, dim)[:, :, :seq]
+
+
+def _banded_tiled_reference(
+    query: Array,
+    kv: Array,
+    bias: Array,
+    softmax_aux: Array,
+    softmax_scale: float,
+    *,
+    window: int,
+    token_kv_len: int,
+    block_q: int = 64,
+    token_valid: Array | None = None,
+) -> Array:
+    """Exact sink-augmented reference that only touches each query tile's window band plus the entries.
+
+    Layout contract (the same one the band-skipping forward relies on): the leading ``token_kv_len`` KV rows are
+    the sequence's own token keys (query ``i`` sits at token position ``i``) and ``bias`` already masks every token
+    key outside ``(i - window, i]`` with the finite ``_MASK_MIN`` sentinel. Query tile ``[t0, t0 + tile)`` can then
+    only see token rows ``[t0 - window + 1, t0 + tile)``, so it slices ``tile + window - 1`` token rows plus all
+    compressed-entry rows. With a sink present every dropped row has probability exactly ``0`` (``exp`` underflows),
+    so values and all cotangents (query, KV, bias, sink) equal :func:`_tiled_reference`; the slices' transposes
+    scatter ``dkv`` / ``dbias`` back to full shape. Cost is ``O(S * (window + entries))`` instead of
+    ``O(S * (S + entries))``.
+
+    Sink-free fully masked rows are uniform over *all* real KVs, which a band cannot reproduce, so callers must only
+    use this with a sink.
+
+    Args:
+        query: Queries ``[batch, heads, q_len, head_dim]`` with ``q_len == token_kv_len``.
+        kv: Shared keys/values ``[batch, kv_len, head_dim]`` (token region first).
+        bias: Head-broadcast additive bias ``[batch, q_len, kv_len]``.
+        softmax_aux: Per-head sink logits ``[heads]``.
+        softmax_scale: Query/key dot-product scale.
+        window: Sliding-window size encoded in ``bias``.
+        token_kv_len: Length of the token region at the front of ``kv``.
+        block_q: Maximum query rows in one rematerialized tile.
+        token_valid: Optional per-key validity ``[batch, token_kv_len]``. When given, ``bias`` holds only the
+            entry columns and each tile rebuilds its token mask from positions (see :func:`implicit_token_bias`).
+
+    Returns:
+        Attention outputs with the query shape.
+    """
+    batch, heads, q_len, dim = query.shape
+    if q_len == 0:
+        return jnp.zeros_like(query)
+    tile = min(max(1, block_q), q_len)
+    span = tile + window - 1
+    if span >= token_kv_len:
+        if token_valid is not None:
+            bias = implicit_token_bias(bias, token_valid, window)
+        return _tiled_reference(query, kv, bias, softmax_aux, softmax_scale, block_q=block_q)
+    tiles = (q_len + tile - 1) // tile
+    pad = tiles * tile - q_len
+    q_padded = jnp.pad(query, ((0, 0), (0, 0), (0, pad), (0, 0)))
+    b_padded = jnp.pad(bias, ((0, 0), (0, pad), (0, 0)))
+    entry_kv = kv[:, token_kv_len:]
+    if token_valid is None:
+        entry_bias = b_padded[:, :, token_kv_len:]
+        token_bias = b_padded[:, :, :token_kv_len]
+        valid = None
+    else:
+        entry_bias = b_padded.astype(jnp.float32)
+        token_bias = None
+        valid = token_valid > 0
+
+    @jax.checkpoint
+    def attend_tile(index):
+        start = index * tile
+        lo = jnp.clip(start - window + 1, 0, token_kv_len - span)
+        q = jax.lax.dynamic_slice_in_dim(q_padded, start, tile, axis=2)
+        k_tok = jax.lax.dynamic_slice_in_dim(kv, lo, span, axis=1)
+        if valid is None:
+            b_tok = jax.lax.dynamic_slice(token_bias, (0, start, lo), (batch, tile, span))
+        else:
+            q_pos = start + jnp.arange(tile, dtype=jnp.int32)[:, None]
+            k_pos = lo + jnp.arange(span, dtype=jnp.int32)[None, :]
+            key_ok = jax.lax.dynamic_slice_in_dim(valid, lo, span, axis=1)[:, None, :]
+            allowed = ((k_pos <= q_pos) & (k_pos > q_pos - window))[None] & key_ok
+            b_tok = jnp.where(allowed, 0.0, _MASK_MIN).astype(jnp.float32)
+        b_ent = jax.lax.dynamic_slice_in_dim(entry_bias, start, tile, axis=1)
+        k = jnp.concatenate([k_tok, entry_kv], axis=1)
+        b = jnp.concatenate([b_tok, b_ent], axis=2)
+        return _dense_reference(q, k, b, softmax_aux, softmax_scale)
+
+    blocks = jax.lax.map(attend_tile, jnp.arange(tiles, dtype=jnp.int32))
+    return blocks.transpose(1, 2, 0, 3, 4).reshape(batch, heads, tiles * tile, dim)[:, :, :q_len]
+
+
 def _flash_fwd_kernel(
     q_ref,
     kv_hbm_ref,
     bias_hbm_ref,
     sink_ref,
     uniform_ref,
+    tv_ref,
     o_ref,
     kv_x2,
     bias_x2,
@@ -231,6 +431,7 @@ def _flash_fwd_kernel(
     n_entry_tiles: int,
     band_skip: bool,
     window: int,
+    implicit_mask: bool,
 ):
     """Tiled online-softmax attention for one ``(batch, head_block, q_block)`` program.
 
@@ -259,6 +460,7 @@ def _flash_fwd_kernel(
         sink_ref: This head block's sink logits VMEM ref ``[block_h]`` (fp32).
         uniform_ref: Uniform weighted sum of all real KV rows ``[1, head_dim]``;
             used only for fully masked sink-free rows (including skipped tiles).
+        tv_ref: Per-key token validity ``[1, token_kv_pad]`` (fp32 1/0); read only when ``implicit_mask``.
         o_ref: Output block VMEM ref ``[block_h, block_q, head_dim]``.
         kv_x2: Double-buffered KV VMEM scratch ``[2, block_kv, head_dim]``.
         bias_x2: Double-buffered bias VMEM scratch ``[2, block_q, block_kv]``.
@@ -273,6 +475,8 @@ def _flash_fwd_kernel(
         n_entry_tiles: Number of compressed-entry tiles (always scanned).
         band_skip: Whether the token window is anchored at a dynamic ``tile_lo``.
         window: Sliding-window size (used to anchor ``tile_lo``).
+        implicit_mask: Build the token-tile mask in-kernel (window + causal + ``tv_ref``) instead of streaming
+            it; ``bias_hbm_ref`` then holds only the compressed-entry columns.
     """
     b = pl.program_id(0)
     qb = pl.program_id(2)
@@ -303,31 +507,54 @@ def _flash_fwd_kernel(
             return tile_lo + p  # token window (dynamic anchor when band_skip)
         return n_token_tiles + (p - n_tok_iter)  # compressed-entry tile (static)
 
-    def _start(tile, buf):
-        """Issue the async HBM->VMEM copies for KV ``tile`` into buffer ``buf``."""
-        pltpu.make_async_copy(
-            kv_hbm_ref.at[b, pl.ds(tile * block_kv, block_kv), :],
-            kv_x2.at[buf],
-            kv_sem.at[buf],
-        ).start()
-        pltpu.make_async_copy(
-            bias_hbm_ref.at[b, pl.ds(qb * block_q, block_q), pl.ds(tile * block_kv, block_kv)],
-            bias_x2.at[buf],
-            bias_sem.at[buf],
-        ).start()
+    def _bias_col(step: int):
+        """Bias column tile streamed for scan position ``step``; ``None`` when the mask is built in-kernel."""
+        if implicit_mask:
+            return None if step < n_tok_iter else step - n_tok_iter  # bias holds only the entry columns
+        return _actual_tile(step)
 
-    def _wait(tile, buf):
-        """Wait for KV ``tile``'s copies into buffer ``buf`` to complete."""
-        pltpu.make_async_copy(
-            kv_hbm_ref.at[b, pl.ds(tile * block_kv, block_kv), :],
-            kv_x2.at[buf],
-            kv_sem.at[buf],
-        ).wait()
-        pltpu.make_async_copy(
-            bias_hbm_ref.at[b, pl.ds(qb * block_q, block_q), pl.ds(tile * block_kv, block_kv)],
-            bias_x2.at[buf],
-            bias_sem.at[buf],
-        ).wait()
+    def _copies(step: int, buf: int):
+        """The async HBM->VMEM copies for scan position ``step`` into buffer ``buf``."""
+        tile = _actual_tile(step)
+        copies = [
+            pltpu.make_async_copy(
+                kv_hbm_ref.at[b, pl.ds(tile * block_kv, block_kv), :],
+                kv_x2.at[buf],
+                kv_sem.at[buf],
+            )
+        ]
+        col = _bias_col(step)
+        if col is not None:
+            copies.append(
+                pltpu.make_async_copy(
+                    bias_hbm_ref.at[b, pl.ds(qb * block_q, block_q), pl.ds(col * block_kv, block_kv)],
+                    bias_x2.at[buf],
+                    bias_sem.at[buf],
+                )
+            )
+        return copies
+
+    def _start(step: int, buf: int):
+        """Issue the copies for scan position ``step``."""
+        for copy in _copies(step, buf):
+            copy.start()
+
+    def _wait(step: int, buf: int):
+        """Wait for the copies of scan position ``step``."""
+        for copy in _copies(step, buf):
+            copy.wait()
+
+    def _token_mask_bias(step: int):
+        """Window + causal + key-validity bias of token tile ``step``, built from positions ``[block_q, block_kv]``."""
+        tile = _actual_tile(step)
+        start = tile * block_kv
+        if not isinstance(start, int):
+            start = pl.multiple_of(start, block_kv)
+        q_pos = qb * block_q + jax.lax.broadcasted_iota(jnp.int32, (block_q, block_kv), 0)
+        k_pos = tile * block_kv + jax.lax.broadcasted_iota(jnp.int32, (block_q, block_kv), 1)
+        key_ok = tv_ref[:, pl.ds(start, block_kv)] > 0.5  # [1, block_kv]; padded keys are 0
+        visible = (k_pos <= q_pos) & (k_pos > q_pos - window) & key_ok
+        return jnp.where(visible, 0.0, _MASK_MIN).astype(jnp.float32)
 
     if use_sink:
         sink = sink_ref[...].astype(jnp.float32)  # [block_h] (static slice, no dynamic index)
@@ -338,14 +565,17 @@ def _flash_fwd_kernel(
         ell = jnp.zeros((block_h, block_q), jnp.float32)
     acc = jnp.zeros((block_h, block_q, head_dim), jnp.float32)
 
-    _start(_actual_tile(0), 0)
-    for p in range(total):
-        cur = p % 2
-        _wait(_actual_tile(p), cur)
-        if p + 1 < total:
-            _start(_actual_tile(p + 1), (p + 1) % 2)
+    _start(0, 0)
+    for step in range(total):
+        cur = step % 2
+        _wait(step, cur)
+        if step + 1 < total:
+            _start(step + 1, (step + 1) % 2)
         kv_t = kv_x2[cur]  # [block_kv, D] (input dtype)
-        bias_t = bias_x2[cur].astype(jnp.float32)  # [block_q, block_kv]
+        if implicit_mask and step < n_tok_iter:
+            bias_t = _token_mask_bias(step)
+        else:
+            bias_t = bias_x2[cur].astype(jnp.float32)  # [block_q, block_kv]
 
         # logits[h, sq, sk] = scale * sum_d q[h, sq, d] * kv_t[sk, d] + bias_t[sq, sk].
         logits = jax.lax.dot_general(
@@ -386,6 +616,7 @@ def _flash_forward(
     block_kv: int,
     window: int,
     token_kv_len: int,
+    token_valid: Array | None = None,
 ) -> Array:
     """Set up and launch the tiled-flash forward Pallas kernel (pure forward).
 
@@ -414,12 +645,19 @@ def _flash_forward(
         token_kv_len: Length of the sliding-window token region at the front of
             the KV axis (the rest are always-visible compressed entries). Only
             used when ``window > 0``.
+        token_valid: Optional per-key token validity ``[batch, token_kv_len]``.
+            When given, ``bias`` holds only the compressed-entry columns
+            ``[batch, q_len, kv_len - token_kv_len]`` and the token-region mask
+            (``k <= q``, ``k > q - window``, ``token_valid[k]``) is built in-kernel,
+            so no ``[q_len, token_kv_len]`` bias is materialised or streamed.
+            Requires ``window > 0`` and ``token_kv_len == q_len``.
 
     Returns:
         Attention output ``[batch, num_heads, q_len, head_dim]``.
     """
     batch, num_heads, q_len, head_dim = query.shape
     kv_len = kv.shape[1]
+    implicit_mask = token_valid is not None
 
     d_pad = _round_up(head_dim, 128)
     # Process all heads in one program: the shared KV / bias are read once per
@@ -437,6 +675,8 @@ def _flash_forward(
         q_p = jnp.pad(q_p, ((0, 0), (0, 0), (0, q_pad - q_len), (0, 0)))
 
     band = window > 0 and 0 < token_kv_len <= kv_len
+    if implicit_mask and not (band and token_kv_len == q_len):
+        raise ValueError("token_valid requires window > 0 and token_kv_len == q_len <= kv_len.")
     tok_len = token_kv_len if band else kv_len  # token-region length
     n_entries = kv_len - tok_len  # compressed-entry rows
 
@@ -452,20 +692,35 @@ def _flash_forward(
     # Token region padded to a tile boundary, then the (tile-boundary-padded)
     # entries -> token tiles and entry tiles are cleanly separated.
     token_kv = _pad_d(kv[:, :tok_len, :])
-    token_bias = bias[:, :, :tok_len]
     token_kv = jnp.pad(token_kv, ((0, 0), (0, token_kv_pad - tok_len), (0, 0)))
-    token_bias = jnp.pad(token_bias, ((0, 0), (0, 0), (0, token_kv_pad - tok_len)), constant_values=_MASK_MIN)
     if n_entry_tiles:
         entry_kv = _pad_d(kv[:, tok_len:, :])
-        entry_bias = bias[:, :, tok_len:]
         entry_kv = jnp.pad(entry_kv, ((0, 0), (0, entries_pad - n_entries), (0, 0)))
-        entry_bias = jnp.pad(entry_bias, ((0, 0), (0, 0), (0, entries_pad - n_entries)), constant_values=_MASK_MIN)
         kv_p = jnp.concatenate([token_kv, entry_kv], axis=1)
-        bias_p = jnp.concatenate([token_bias, entry_bias], axis=2)
     else:
-        kv_p, bias_p = token_kv, token_bias
-    if q_pad != q_len:
-        bias_p = jnp.pad(bias_p, ((0, 0), (0, q_pad - q_len), (0, 0)))
+        kv_p = token_kv
+
+    if implicit_mask:
+        # ``bias`` carries only the entry columns; token tiles rebuild their mask from positions + validity.
+        tv_p = jnp.pad(token_valid.astype(jnp.float32), ((0, 0), (0, token_kv_pad - tok_len)))[:, None, :]
+        if n_entry_tiles:
+            bias_p = jnp.pad(bias, ((0, 0), (0, 0), (0, entries_pad - n_entries)), constant_values=_MASK_MIN)
+            if q_pad != q_len:
+                bias_p = jnp.pad(bias_p, ((0, 0), (0, q_pad - q_len), (0, 0)))
+        else:
+            bias_p = jnp.zeros((1, block_q, block_kv), jnp.float32)  # placeholder, never streamed
+    else:
+        tv_p = jnp.zeros((batch, 1, _LANE), jnp.float32)  # placeholder, never read
+        token_bias = bias[:, :, :tok_len]
+        token_bias = jnp.pad(token_bias, ((0, 0), (0, 0), (0, token_kv_pad - tok_len)), constant_values=_MASK_MIN)
+        if n_entry_tiles:
+            entry_bias = bias[:, :, tok_len:]
+            entry_bias = jnp.pad(entry_bias, ((0, 0), (0, 0), (0, entries_pad - n_entries)), constant_values=_MASK_MIN)
+            bias_p = jnp.concatenate([token_bias, entry_bias], axis=2)
+        else:
+            bias_p = token_bias
+        if q_pad != q_len:
+            bias_p = jnp.pad(bias_p, ((0, 0), (0, q_pad - q_len), (0, 0)))
 
     # Static visible token-tile window width: enough tiles to cover any q-block's
     # (block_q + window)-key span at any alignment. Band-skip only pays off once
@@ -510,6 +765,7 @@ def _flash_forward(
             n_entry_tiles=n_entry_tiles,
             band_skip=band_skip,
             window=window,
+            implicit_mask=implicit_mask,
         ),
         grid=grid,
         in_specs=[
@@ -518,6 +774,7 @@ def _flash_forward(
             pl.BlockSpec(memory_space=pltpu.HBM),  # bias: full tensor in HBM (streamed)
             pl.BlockSpec((block_h,), lambda b, hb, qb: (hb,)),  # this head block's sinks
             pl.BlockSpec((None, 1, d_pad), lambda b, hb, qb: (b, 0, 0)),
+            pl.BlockSpec((None, 1, tv_p.shape[-1]), lambda b, hb, qb: (b, 0, 0)),  # per-key token validity
         ],
         out_specs=pl.BlockSpec((None, block_h, block_q, d_pad), lambda b, hb, qb: (b, hb, qb, 0)),
         out_shape=jax.ShapeDtypeStruct((batch, num_heads, q_pad, d_pad), kv.dtype),
@@ -529,7 +786,7 @@ def _flash_forward(
         ],
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel", "parallel")),
         interpret=interpret,
-    )(q_p, kv_p, bias_p, sink_p, uniform_p)
+    )(q_p, kv_p, bias_p, sink_p, uniform_p, tv_p)
 
     out = out[:, :, :q_len, :]
     if d_pad != head_dim:
@@ -537,27 +794,43 @@ def _flash_forward(
     return out
 
 
-@partial(jax.custom_jvp, nondiff_argnums=(4, 5, 6, 7, 8, 9))
+@partial(jax.custom_jvp, nondiff_argnums=(5, 6, 7, 8, 9, 10, 11))
 def _cwa_pallas(
     query: Array,
     kv: Array,
     bias: Array,
     sink: Array,
+    token_valid: Array,
     softmax_scale: float,
     use_sink: bool,
     block_q: int,
     block_kv: int,
     window: int,
     token_kv_len: int,
+    implicit: bool,
 ) -> Array:
     """Pallas primal with an exact XLA differentiation rule.
 
     The custom JVP makes both forward-mode (``jax.jvp``/``jacfwd``) and
     reverse-mode (the transpose of this linear tangent rule) available.  The
     primal remains the tiled Pallas kernel; only the tangent computation uses
-    the numerically equivalent reference expression.
+    the numerically equivalent reference expression. ``token_valid`` is a
+    non-trainable fp32 0/1 operand (its tangent is ignored); it is read only
+    when ``implicit`` is set.
     """
-    return _flash_forward(query, kv, bias, sink, softmax_scale, use_sink, block_q, block_kv, window, token_kv_len)
+    return _flash_forward(
+        query,
+        kv,
+        bias,
+        sink,
+        softmax_scale,
+        use_sink,
+        block_q,
+        block_kv,
+        window,
+        token_kv_len,
+        token_valid if implicit else None,
+    )
 
 
 @_cwa_pallas.defjvp
@@ -568,12 +841,14 @@ def _cwa_pallas_jvp(
     block_kv,
     window,
     token_kv_len,
+    implicit,
     primals,
     tangents,
 ):
     """Differentiate every trainable operand, including indexer bias and sink."""
-    query, kv, bias, sink = primals
-    dquery, dkv, dbias, dsink = tangents
+    query, kv, bias, sink, token_valid = primals
+    dquery, dkv, dbias, dsink, _ = tangents
+    tv = token_valid if implicit else None
     out = _flash_forward(
         query,
         kv,
@@ -585,9 +860,20 @@ def _cwa_pallas_jvp(
         block_kv,
         window,
         token_kv_len,
+        tv,
     )
 
+    # With a sink and the self-attention token layout, the band is exact (see _banded_tiled_reference): the
+    # backward then matches the forward's O(S * (window + entries)) cost instead of scanning every token key.
+    banded = use_sink and window > 0 and token_kv_len == query.shape[2] and token_kv_len <= kv.shape[1]
+
     def _ref(q, k, b, s):
+        if banded:
+            return _banded_tiled_reference(
+                q, k, b, s, softmax_scale, window=window, token_kv_len=token_kv_len, token_valid=tv
+            )
+        if tv is not None:
+            b = implicit_token_bias(b, tv, window)
         return _tiled_reference(q, k, b, s if use_sink else None, softmax_scale)
 
     _, tangent = jax.jvp(_ref, (query, kv, bias, sink), (dquery, dkv, dbias, dsink))
@@ -648,12 +934,14 @@ def _legal_block_kv(block_kv: int) -> int:
 def compressed_window_attention_tpu(
     query: Float[Array, "batch num_heads q_len head_dim"],
     kv: Float[Array, "batch kv_len head_dim"],
-    bias: Float[Array, "batch q_len kv_len"],
+    bias: Float[Array, "batch q_len bias_len"],
     softmax_aux: Float[Array, "num_heads"] | None = None,
     softmax_scale: float | None = None,
     fwd_params: FwdParams | None = None,
     window: int = 0,
     token_kv_len: int = 0,
+    token_valid: Array | None = None,
+    entry_topk: Array | None = None,
 ) -> Float[Array, "batch num_heads q_len head_dim"]:
     """Pallas TPU compressed-window full-sequence attention (differentiable).
 
@@ -671,6 +959,17 @@ def compressed_window_attention_tpu(
         token_kv_len: Length of the sliding-window token region at the front of
             the KV axis (the rest are always-visible compressed entries). Only
             used when ``window > 0``; defaults to ``kv_len`` (no entries).
+        token_valid: Optional per-key token validity ``[batch, token_kv_len]``
+            (bool or 0/1). When given, ``bias`` holds only the compressed-entry
+            columns and the window / causal / padding mask of the token region is
+            built in-kernel (forward and backward), so no dense token bias is
+            materialised. Requires ``window > 0`` and ``token_kv_len == q_len``.
+        entry_topk: Optional selected entry ids ``[batch, q_len, k]`` (``-1``
+            padded, repeats count once) replacing the entry columns of ``bias``
+            (pass a zero-width ``bias``). Requires ``token_valid``. With a sink and
+            ``q_len * entries >= _TOPK_SPARSE_MIN_CELLS`` the sparse
+            ``O(S * (window + k))`` attend runs; otherwise the selection is
+            expanded to the entry bias and the Pallas kernel runs.
 
     Returns:
         Attention output ``[batch, num_heads, q_len, head_dim]``.
@@ -686,4 +985,20 @@ def compressed_window_attention_tpu(
 
     use_sink = softmax_aux is not None
     sink = jnp.zeros((num_heads,), jnp.float32) if softmax_aux is None else softmax_aux.astype(jnp.float32)
-    return _cwa_pallas(query, kv, bias, sink, scale, use_sink, block_q, block_kv, int(window), tkl)
+    implicit = token_valid is not None
+    if entry_topk is not None and not implicit:
+        raise ValueError("entry_topk requires token_valid (the implicit token mask).")
+    if implicit and (window <= 0 or tkl != q_len):
+        raise ValueError("token_valid requires window > 0 and token_kv_len == q_len.")
+    if entry_topk is not None:
+        n_entries = kv_len - q_len
+        if use_sink and q_len * n_entries >= _TOPK_SPARSE_MIN_CELLS:
+            return _topk_tiled_reference(
+                query, kv, entry_topk, sink, token_valid, softmax_scale=scale, window=int(window)
+            )
+        bias = _selection_bias(entry_topk, n_entries)
+    if implicit:
+        tv = token_valid.astype(jnp.float32)
+    else:
+        tv = jnp.zeros((query.shape[0], 1), jnp.float32)  # placeholder, never read
+    return _cwa_pallas(query, kv, bias, sink, tv, scale, use_sink, block_q, block_kv, int(window), tkl, implicit)

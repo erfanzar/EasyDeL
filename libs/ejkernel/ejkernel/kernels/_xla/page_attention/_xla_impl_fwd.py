@@ -93,6 +93,9 @@ def _page_attention_fwd(
     max_blocks = block_tables.shape[1]
 
     q_heads_per_kv_head = num_heads // num_kv_heads
+    out_dtype = query.dtype
+    # Scores and softmax accumulate in at least float32 (never in bf16/fp16 activation dtype).
+    acc_dtype = jnp.promote_types(jnp.result_type(query.dtype, key_cache.dtype), jnp.float32)
 
     query = query.reshape(num_seqs, num_kv_heads, q_heads_per_kv_head, head_dim)
 
@@ -135,12 +138,12 @@ def _page_attention_fwd(
             k_block = key_cache[physical_block]
             v_block = value_cache[physical_block]
 
-            scores = jnp.einsum("ihd,ikd->ihk", q, k_block)
+            scores = jnp.einsum("ihd,ikd->ihk", q, k_block, preferred_element_type=acc_dtype)
 
             block_start = block_idx * block_size
             token_indices = jnp.arange(block_size) + block_start
             valid_mask = token_indices < context_len
-            scores = jnp.where(valid_mask[None, None, :], scores, -1e9)
+            scores = jnp.where(valid_mask[None, None, :], scores, -jnp.inf)
 
             return scores, v_block
 
@@ -150,11 +153,13 @@ def _page_attention_fwd(
 
         all_values = all_values.transpose(1, 0, 2, 3).reshape(num_kv_heads, max_blocks * block_size, head_dim)
 
-        attn_weights = jax.nn.softmax(all_scores, axis=-1)
+        # softmax(-inf, ..., -inf) is NaN for a zero-length context.
+        safe_scores = jnp.where(context_len > 0, all_scores, 0.0)
+        attn_weights = jnp.where(context_len > 0, jax.nn.softmax(safe_scores, axis=-1), 0.0)
 
-        output = jnp.einsum("ihk,ikd->ihd", attn_weights, all_values)
+        output = jnp.einsum("ihk,ikd->ihd", attn_weights, all_values.astype(acc_dtype))
 
-        return output.reshape(num_heads, head_dim)
+        return output.reshape(num_heads, head_dim).astype(out_dtype)
 
     output = jax.vmap(attend_sequence)(jnp.arange(num_seqs))
 

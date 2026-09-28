@@ -41,7 +41,7 @@ def test_ragged_page_attention_v3_turboquant_native():
     block_tables = jnp.array([0], dtype=jnp.int32)
     query_start_loc = jnp.array([0, 2], dtype=jnp.int32)
     distribution = jnp.array([0, 0, 1], dtype=jnp.int32)
-    rotation = jnp.eye(head_dim, dtype=jnp.float32)
+    rotation = jnp.roll(jnp.eye(head_dim, dtype=jnp.float32), 1, axis=0)
     qjl_projection = jnp.eye(qjl_dim, head_dim, dtype=jnp.float32)
     key_codebook = jnp.linspace(-1.0, 1.0, 8, dtype=jnp.float32)
     value_codebook = jnp.linspace(-1.0, 1.0, 16, dtype=jnp.float32)

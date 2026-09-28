@@ -335,9 +335,22 @@ def make_attention_weights_prim_func(
                     scores[qi, ki] = T.if_then_else(in_bounds, s, pad_neg)
                     p = T.exp(scores[qi, ki] - row_max[qi]) / T.max(row_sum[qi], 1.0e-30)
                     if use_dropout:
-                        linear = T.Cast("int64", (q_idx * NK + k_c))
-                        seed_mix = T.Cast("int64", DropoutSeed[0]) + T.Cast("int64", DropoutSeed[1]) * 65537
-                        rnd_i = (linear * 1103515245 + seed_mix * 12345 + 12345) % 2147483647
+                        # Hash in unsigned 64-bit: wrap-around is well-defined there (signed
+                        # overflow is not), and each operand is widened *before* multiplying
+                        # so the flat index cannot overflow int32 first. The final modulus of
+                        # an unsigned value is always in [0, 2^31 - 2].
+                        linear = T.Cast("uint64", bz)
+                        linear = linear * T.Cast("uint64", H) + T.Cast("uint64", qh)
+                        linear = linear * T.Cast("uint64", NQ) + T.Cast("uint64", q_c)
+                        linear = linear * T.Cast("uint64", NK) + T.Cast("uint64", k_c)
+                        seed_mix = T.Cast("uint64", DropoutSeed[0]) + T.Cast("uint64", DropoutSeed[1]) * T.Cast(
+                            "uint64", 65537
+                        )
+                        rnd_i = (
+                            linear * T.Cast("uint64", 1103515245)
+                            + seed_mix * T.Cast("uint64", 12345)
+                            + T.Cast("uint64", 12345)
+                        ) % T.Cast("uint64", 2147483647)
                         rnd = T.Cast(accum, rnd_i) * 4.656612875245797e-10
                         drop = T.if_then_else(rnd >= float(dropout_prob), inv_keep_prob, 0.0)
                         p = p * drop

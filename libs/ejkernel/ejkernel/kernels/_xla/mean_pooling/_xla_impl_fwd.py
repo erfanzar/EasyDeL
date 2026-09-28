@@ -19,22 +19,15 @@ sequence dimensions.  Two paths are supported:
 
 - **Fixed-length** (``cu_seqlens=None``): ``jnp.mean(x, axis=1)`` over
   a ``[batch, seq_len, hidden_dim]`` tensor.
-- **Variable-length / packed** (``cu_seqlens`` provided): per-sequence
-  ``dynamic_slice`` + mask + sum / seq_len over a 2-D
-  ``[total_tokens, hidden_dim]`` tensor.
+- **Variable-length / packed** (``cu_seqlens`` provided): segment-sum / seq_len
+  over a 2-D ``[total_tokens, hidden_dim]`` tensor.
 
-A ``jax.custom_vjp`` wrapper (``_mean_pooling_core``) enables an analytic
-backward pass (broadcast of upstream gradient / seq_len) without the
-overhead of automatic differentiation through the vmap / dynamic_slice.
+A ``jax.custom_vjp`` wrapper (``_mean_pooling_core``) broadcasts the
+upstream gradient across the tokens of each packed sequence.
 
-Late-binding pattern:
-    ``_xla_impl_bwd`` is imported first by this module.  After
-    ``_mean_pooling_core`` is defined here, it is injected into the backward
-    module via ``_mean_pooling_bwd_mod._mean_pooling_core = _mean_pooling_core``
-    so that ``_mean_pooling_fwd`` can call it.
+The raw forward functions are injected into ``_xla_impl_bwd`` after import
+so the custom-VJP forward rule avoids calling the decorated function again.
 """
-
-from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -54,16 +47,10 @@ def _mean_pooling_varlen(
     in a packed tensor.  Sequences are identified by their cumulative lengths,
     avoiding the need for padding.
 
-    The implementation uses ``jax.vmap`` over sequence indices and
-    ``jax.lax.dynamic_slice`` to extract each sequence's tokens.  Because
-    ``dynamic_slice`` requires a static slice size, all slices are padded to
-    ``max_seq_len`` tokens and a boolean mask is applied before summing.
-
-    Note:
-        ``num_seqs`` and ``max_seq_len`` are computed from ``cu_seqlens`` at
-        trace time using Python-level ``len`` and ``jnp.max``.  This means the
-        output shape is static and the function must be re-traced whenever the
-        number of sequences or the maximum sequence length changes.
+    Tokens are assigned to segments by cumulative boundaries and accumulated
+    into float32 sums. The number of sequences and total token capacity are
+    static shapes, while individual sequence lengths may be traced values.
+    Empty segments return zeros.
 
     Args:
         x: Packed token embeddings ``[total_tokens, hidden_dim]``.
@@ -74,30 +61,18 @@ def _mean_pooling_varlen(
         Mean-pooled embeddings ``[num_seqs, hidden_dim]``, one row per
         sequence.
     """
-    num_seqs = len(cu_seqlens) - 1
-    max_seq_len = jnp.max(cu_seqlens[1:] - cu_seqlens[:-1])
-
-    def pool_sequence(i):
-        """Compute mean-pooled embedding for a single variable-length sequence.
-
-        Args:
-            i: Sequence index within the packed tensor.
-
-        Returns:
-            Mean embedding vector of shape [hidden_dim] for this sequence.
-        """
-        start = cu_seqlens[i]
-        end = cu_seqlens[i + 1]
-        seq_len = end - start
-
-        seq_tokens = jax.lax.dynamic_slice(x, (start, 0), (max_seq_len, x.shape[-1]))
-
-        mask = jnp.arange(max_seq_len) < seq_len
-
-        masked_tokens = jnp.where(mask[:, None], seq_tokens, 0)
-        return jnp.sum(masked_tokens, axis=0) / seq_len
-
-    return jax.vmap(pool_sequence)(jnp.arange(num_seqs))
+    num_seqs = cu_seqlens.shape[0] - 1
+    if num_seqs == 0:
+        return jnp.zeros((0, x.shape[-1]), dtype=x.dtype)
+    positions = jnp.arange(x.shape[0], dtype=cu_seqlens.dtype)
+    seq_ids = jnp.searchsorted(cu_seqlens[1:], positions, side="right")
+    valid = (positions >= cu_seqlens[0]) & (positions < cu_seqlens[-1])
+    # Accumulate in at least float32 (low-precision inputs) without narrowing float64 inputs.
+    acc_dtype = jnp.promote_types(x.dtype, jnp.float32)
+    sums = jnp.zeros((num_seqs, x.shape[-1]), dtype=acc_dtype)
+    sums = sums.at[jnp.minimum(seq_ids, num_seqs - 1)].add(jnp.where(valid[:, None], x.astype(acc_dtype), 0))
+    lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+    return (sums / jnp.maximum(lengths[:, None], 1)).astype(x.dtype)
 
 
 def _mean_pooling_fixed(
@@ -119,7 +94,7 @@ def _mean_pooling_fixed(
     return jnp.mean(x, axis=1)
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(1,))
+@jax.custom_vjp
 def _mean_pooling_core(
     x: Float[Array, "... hidden_dim"],
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
@@ -146,7 +121,8 @@ def _mean_pooling_core(
         return _mean_pooling_fixed(x)
 
 
-_mean_pooling_bwd_mod._mean_pooling_core = _mean_pooling_core
+_mean_pooling_bwd_mod._mean_pooling_varlen = _mean_pooling_varlen
+_mean_pooling_bwd_mod._mean_pooling_fixed = _mean_pooling_fixed
 _mean_pooling_core.defvjp(_mean_pooling_bwd_mod._mean_pooling_fwd, _mean_pooling_bwd)
 
 

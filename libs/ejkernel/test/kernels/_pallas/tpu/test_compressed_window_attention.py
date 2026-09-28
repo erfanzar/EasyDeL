@@ -321,3 +321,137 @@ def test_compiled_xla_bf16_jvp_matches_eager(kernel):
     actual = jax.jit(derivative)(*args)
     assert np.isfinite(actual).all()
     np.testing.assert_allclose(actual, expected, atol=0.01, rtol=0.01)
+
+
+def _implicit_inputs(batch, heads, s, head_dim, window, n_entries, dtype, use_sinks, seed=0):
+    """Sliding inputs plus random padded keys: dense bias, entry-only bias, and the per-key validity."""
+    q, kv, bias, sinks = _sliding_inputs(batch, heads, s, head_dim, window, n_entries, dtype, use_sinks, seed=seed)
+    rng = np.random.default_rng(seed + 100)
+    valid = rng.random((batch, s)) > 0.2
+    valid[:, 0] = True
+    dense = np.asarray(bias).copy()
+    dense[:, :, :s] = np.where(valid[:, None, :], dense[:, :, :s], _NEG)
+    return q, kv, jnp.asarray(dense), jnp.asarray(dense[:, :, s:]), jnp.asarray(valid), sinks
+
+
+@pytest.mark.parametrize(("s", "n_entries", "window"), [(512, 16, 128), (1024, 0, 128), (515, 17, 32)])
+@pytest.mark.parametrize("use_sinks", [True, False])
+def test_implicit_token_mask_matches_dense_bias_fwd(s, n_entries, window, use_sinks):
+    """token_valid (in-kernel window/causal/padding mask) equals the caller-built dense bias, Pallas and XLA."""
+    from ejkernel.kernels._pallas.tpu.compressed_window_attention._pallas_impl_fwd import (
+        compressed_window_attention_tpu as pallas_impl,
+    )
+    from ejkernel.kernels._xla.compressed_window_attention import compressed_window_attention as xla_impl
+
+    q, kv, dense, entry, valid, sinks = _implicit_inputs(2, 8, s, 512, window, n_entries, jnp.float32, use_sinks)
+    scale = 512**-0.5
+    out_dense = np.asarray(xla_impl(q, kv, dense, sinks, softmax_scale=scale))
+    implicit = dict(softmax_scale=scale, window=window, token_kv_len=s, token_valid=valid)
+    out_xla = np.asarray(xla_impl(q, kv, entry, sinks, **implicit))
+    out_pallas = np.asarray(pallas_impl(q, kv, entry, sinks, **implicit))
+    assert np.isfinite(out_pallas).all()
+    assert np.abs(out_xla - out_dense).max() < 1e-6, np.abs(out_xla - out_dense).max()
+    assert np.abs(out_pallas - out_dense).max() < 2e-4, np.abs(out_pallas - out_dense).max()
+
+
+@pytest.mark.parametrize(("s", "n_entries"), [(512, 16), (1024, 0)])
+@pytest.mark.parametrize("use_sinks", [True, False])
+def test_implicit_token_mask_gradient_matches_dense_bias(s, n_entries, use_sinks):
+    """Gradients (query, kv, entry bias, sinks) of the implicit-mask Pallas path equal the dense-bias XLA ones."""
+    from ejkernel.kernels._pallas.tpu.compressed_window_attention._pallas_impl_fwd import (
+        compressed_window_attention_tpu as pallas_impl,
+    )
+    from ejkernel.kernels._xla.compressed_window_attention import compressed_window_attention as xla_impl
+
+    window = 128
+    q, kv, dense, entry, valid, sinks = _implicit_inputs(2, 8, s, 512, window, n_entries, jnp.float32, use_sinks, 3)
+    token_part = dense[:, :, :s]
+    scale = 512**-0.5
+    cot = jnp.asarray(np.random.default_rng(4).standard_normal(q.shape), jnp.float32)
+    args = (q, kv, entry) + ((sinks,) if use_sinks else ())
+
+    def _implicit(*a):
+        out = pallas_impl(
+            a[0], a[1], a[2], a[3] if use_sinks else None,
+            softmax_scale=scale, window=window, token_kv_len=s, token_valid=valid,
+        )  # fmt: skip
+        return jnp.sum(out * cot)
+
+    def _dense(*a):
+        full = jnp.concatenate([token_part, a[2]], axis=2)
+        return jnp.sum(xla_impl(a[0], a[1], full, a[3] if use_sinks else None, softmax_scale=scale) * cot)
+
+    argnums = tuple(range(len(args)))
+    gi = jax.grad(_implicit, argnums=argnums)(*args)
+    gd = jax.grad(_dense, argnums=argnums)(*args)
+    for a, b in zip(gd, gi, strict=True):
+        assert a.shape == b.shape
+        assert jnp.isfinite(b).all()
+        if a.size:
+            assert float(jnp.max(jnp.abs(a - b))) < 2e-4, float(jnp.max(jnp.abs(a - b)))
+
+
+def _topk_inputs(batch, heads, s, head_dim, window, n_entries, k, dtype, seed=0):
+    """Implicit-mask inputs plus per-query entry ids (with repeats and -1 padding) and the matching dense bias."""
+    q, kv, _, _, valid, _ = _implicit_inputs(batch, heads, s, head_dim, window, n_entries, dtype, True, seed=seed)
+    rng = np.random.default_rng(seed + 200)
+    ids = rng.integers(0, n_entries, size=(batch, s, k)).astype(np.int32)
+    ids[:, :, -1] = ids[:, :, 0]  # repeat: must count once
+    ids[rng.random((batch, s, k)) < 0.2] = -1
+    opened = np.zeros((batch, s, n_entries), bool)
+    for b in range(batch):
+        for i in range(s):
+            sel = ids[b, i][ids[b, i] >= 0]
+            opened[b, i, sel] = True
+    qi, ki = np.arange(s)[:, None], np.arange(s)[None, :]
+    token_ok = ((ki <= qi) & (ki > qi - window))[None] & np.asarray(valid)[:, None, :]
+    dense = np.concatenate([np.where(token_ok, 0.0, _NEG), np.where(opened, 0.0, _NEG)], axis=2).astype(np.float32)
+    sinks = jnp.asarray(rng.standard_normal((heads,)), jnp.float32)
+    return q, kv, jnp.asarray(dense), jnp.asarray(ids), valid, sinks
+
+
+@pytest.mark.parametrize(("s", "n_entries", "k"), [(512, 256, 32), (515, 17, 8)])
+def test_entry_topk_matches_dense_bias(s, n_entries, k):
+    """entry_topk (XLA sparse attend, Pallas below the crossover, sparse reference) equals the dense selection bias."""
+    from ejkernel.kernels._pallas.tpu.compressed_window_attention import _pallas_impl_fwd as pallas_mod
+    from ejkernel.kernels._xla.compressed_window_attention import compressed_window_attention as xla_impl
+
+    window = 64
+    q, kv, dense, ids, valid, sinks = _topk_inputs(2, 8, s, 128, window, n_entries, k, jnp.float32, seed=5)
+    scale = 128**-0.5
+    empty = jnp.zeros((2, s, 0), jnp.float32)
+    topk = dict(softmax_scale=scale, window=window, token_kv_len=s, token_valid=valid, entry_topk=ids)
+    ref = np.asarray(xla_impl(q, kv, dense, sinks, softmax_scale=scale))
+    out_xla = np.asarray(xla_impl(q, kv, empty, sinks, **topk))
+    out_pallas = np.asarray(pallas_mod.compressed_window_attention_tpu(q, kv, empty, sinks, **topk))
+    out_sparse = np.asarray(
+        pallas_mod._topk_tiled_reference(q, kv, ids, sinks, valid, softmax_scale=scale, window=window)
+    )
+    for out in (out_xla, out_pallas, out_sparse):
+        assert np.isfinite(out).all()
+        assert np.abs(out - ref).max() < 2e-4, np.abs(out - ref).max()
+
+    cot = jnp.asarray(np.random.default_rng(6).standard_normal(q.shape), jnp.float32)
+
+    def _dense(a, b, c):
+        return jnp.sum(xla_impl(a, b, dense, c, softmax_scale=scale) * cot)
+
+    def _sparse(a, b, c):
+        return jnp.sum(pallas_mod._topk_tiled_reference(a, b, ids, c, valid, softmax_scale=scale, window=window) * cot)
+
+    gd = jax.grad(_dense, argnums=(0, 1, 2))(q, kv, sinks)
+    gs = jax.grad(_sparse, argnums=(0, 1, 2))(q, kv, sinks)
+    for a, b in zip(gd, gs, strict=True):
+        assert jnp.isfinite(b).all()
+        assert float(jnp.max(jnp.abs(a - b))) < 2e-4, float(jnp.max(jnp.abs(a - b)))
+
+
+def test_implicit_token_mask_requires_self_attention_layout():
+    """token_valid without a window (or with token_kv_len != q_len) is rejected, not silently misread."""
+    from ejkernel.modules import compressed_window_attention
+
+    q, kv, _, entry, valid, sinks = _implicit_inputs(1, 4, 128, 128, 32, 8, jnp.float32, True)
+    with pytest.raises(ValueError, match="token_valid"):
+        compressed_window_attention(q, kv, entry, sinks, window=0, token_kv_len=128, token_valid=valid)
+    with pytest.raises(ValueError, match="token_valid"):
+        compressed_window_attention(q, kv, entry, sinks, window=32, token_kv_len=64, token_valid=valid)

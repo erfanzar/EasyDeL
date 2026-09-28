@@ -131,6 +131,12 @@ def grouped_matmul(
     """
     if precision is None:
         precision = jax.lax.Precision.HIGHEST
+    # A ``LutFn`` callable must be resolved to a concrete ``(tm, tk, tn)`` tuple
+    # (or ``None``) before use, mirroring the Pallas backend; iterating a
+    # callable below would raise ``TypeError``.
+    if callable(tiling):
+        n_dim = rhs.shape[1] if transpose_rhs else rhs.shape[2]
+        tiling = tiling(lhs.shape[0], lhs.shape[1], n_dim)
     if tiling is None:
         manager = contextlib.nullcontext()
     else:

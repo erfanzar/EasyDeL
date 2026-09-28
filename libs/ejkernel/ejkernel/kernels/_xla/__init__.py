@@ -114,6 +114,7 @@ from .gla import recurrent_gla
 from .grouped_matmul import grouped_matmul
 from .grouped_matmul_quant import grouped_matmul_quant, grouped_matmul_w8a8
 from .grouped_matmulv3 import grouped_matmulv3
+from .kda_chunk_local import kda_chunk_local
 from .kernel_delta_attention import kda, kda_decay, kernel_delta_attention
 from .lightning_attn import lightning_attn
 from .mean_pooling import mean_pooling
@@ -122,6 +123,7 @@ from .multi_latent_ragged_page_attention import multi_latent_ragged_page_attenti
 from .multi_latent_ragged_page_attention_v2 import multi_latent_ragged_page_attention_v2
 from .native_sparse_attention import apply_native_sparse_attention
 from .page_attention import page_attention
+from .paged_pool_topk import paged_pool_topk
 from .prefill_page_attention import prefill_page_attention
 from .quantized_matmul import quantized_matmul
 from .ragged_causal_conv1d import ragged_causal_conv1d
@@ -143,6 +145,8 @@ from .rwkv6 import rwkv6
 from .rwkv7 import rwkv7, rwkv7_mul
 from .scaled_dot_product_attention import scaled_dot_product_attention
 from .sinkhorn_knopp import sinkhorn_knopp
+from .sparse_multi_latent_ragged_page_attention import sparse_multi_latent_ragged_page_attention
+from .sparse_selected_attention import sparse_selected_attention
 from .state_space_v1 import state_space_v1
 from .state_space_v2 import state_space_v2
 from .topk import topk as topk
@@ -175,6 +179,7 @@ __all__ = [
     "grouped_matmul_w8a8",
     "grouped_matmulv3",
     "kda",
+    "kda_chunk_local",
     "kda_decay",
     "kernel_delta_attention",
     "lightning_attn",
@@ -183,6 +188,7 @@ __all__ = [
     "multi_latent_ragged_page_attention",
     "multi_latent_ragged_page_attention_v2",
     "page_attention",
+    "paged_pool_topk",
     "prefill_page_attention",
     "quantized_matmul",
     "ragged_causal_conv1d",
@@ -206,6 +212,8 @@ __all__ = [
     "rwkv7_mul",
     "scaled_dot_product_attention",
     "sinkhorn_knopp",
+    "sparse_multi_latent_ragged_page_attention",
+    "sparse_selected_attention",
     "state_space_v1",
     "state_space_v2",
     "unified_attention",

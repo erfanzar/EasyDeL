@@ -86,6 +86,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from ejkernel.callib import ejit
+from ejkernel.kernels._xla.ragged_page_attention_v3._sinks import pack_per_head_lanes
 
 from ._utils import align_to, cdiv, get_dtype_bitwidth, get_dtype_packing, get_tuned_block_sizes
 
@@ -500,6 +501,7 @@ def _ragged_paged_attention_kernel_loop(
     kv_hbm_ref,
     kv_cache_hbm_ref,
     attention_sink_ref,
+    alibi_ref,
     o_hbm_ref,
     updated_kv_cache_hbm_ref,
     bkv_x2_ref,
@@ -518,6 +520,7 @@ def _ragged_paged_attention_kernel_loop(
     k_scale: float | None = None,
     v_scale: float | None = None,
     chunk_prefill_size: int | None = None,
+    chunk_size: int | None = None,
     bkv_p,
     bq_sz,
     static_q_len: int | None = None,
@@ -550,6 +553,8 @@ def _ragged_paged_attention_kernel_loop(
         kv_hbm_ref: HBM ref to new KV tokens tensor.
         kv_cache_hbm_ref: HBM ref to existing KV cache (input).
         attention_sink_ref: VMEM ref to attention sink logits or None.
+        alibi_ref: VMEM ref ``[num_kv_heads, num_q_heads_per_kv_head, 128]`` (f32,
+            slope repeated along the lane axis) or None.
         o_hbm_ref: HBM ref to output tensor.
         updated_kv_cache_hbm_ref: HBM ref to updated KV cache (output).
         bkv_x2_ref: VMEM double-buffer for KV cache blocks.
@@ -567,6 +572,8 @@ def _ragged_paged_attention_kernel_loop(
         k_scale: Optional quantization scale for keys.
         v_scale: Optional quantization scale for values.
         chunk_prefill_size: Chunk size for prefill sequences.
+        chunk_size: Optional chunked-local-attention size ``C``; a query at ``q``
+            sees key ``k`` only if ``k <= q`` and ``k // C == q // C``.
         bkv_p: Number of KV pages per attention block.
         bq_sz: Number of query tokens per attention block.
     """
@@ -613,11 +620,22 @@ def _ragged_paged_attention_kernel_loop(
 
         return lax.while_loop(cond, lambda j: j + 1, idx)
 
+    def first_visible_kv(processed_q_len):
+        # Lowest key position that can be visible to the query at ``processed_q_len``
+        # under the sliding window and/or chunked-local mask. Every KV block that
+        # ends before it is fully masked and is skipped (never fetched).
+        lo = 0
+        if sliding_window is not None:
+            lo = jnp.maximum(processed_q_len - sliding_window, 0)
+        if chunk_size is not None:
+            lo = jnp.maximum(lo, (processed_q_len // chunk_size) * chunk_size)
+        return lo
+
     def start_bkv_idx_of(s):
-        if sliding_window is None:
+        if sliding_window is None and chunk_size is None:
             return 0
         gap = kv_lens_ref[s] - q_len_of(s)
-        return jnp.maximum(gap - sliding_window, 0) // bkv_sz
+        return first_visible_kv(gap) // bkv_sz
 
     q_start = cu_q_lens_ref[seq_idx]
     q_end = cu_q_lens_ref[seq_idx + 1]
@@ -626,7 +644,7 @@ def _ragged_paged_attention_kernel_loop(
     kv_q_gap = kv_len - q_len
 
     next_seq_start_bkv_idx = 0
-    if sliding_window is not None:
+    if sliding_window is not None or chunk_size is not None:
         next_seq_start_bkv_idx = start_bkv_idx_of(jnp.minimum(next_nonempty_seq(seq_idx + 1), end_seq_idx - 1))
 
     def flash_attention(
@@ -673,9 +691,17 @@ def _ragged_paged_attention_kernel_loop(
         mask = q_span < k_span
         if sliding_window is not None:
             mask = jnp.logical_or(mask, q_span - sliding_window >= k_span)
+        if chunk_size is not None:
+            mask = jnp.logical_or(mask, q_span // chunk_size != k_span // chunk_size)
 
         if logits_soft_cap is not None:
             s = logits_soft_cap * jnp.tanh(s / logits_soft_cap)
+        if alibi_ref is not None:
+            # Rows are laid out (query token, head-in-group); add slope_h * absolute key position.
+            actual_bq_sz_alibi = q.shape[0] // num_q_heads_per_kv_head
+            slopes = jnp.concat([alibi_ref[kv_head_idx]] * actual_bq_sz_alibi, axis=0)
+            # slope * (k - q) == slope * k under softmax, but stays small at long context.
+            s += broadcast_minor(slopes, s.shape) * (k_span - q_span).astype(jnp.float32)
         s += jnp.where(mask, mask_value, 0.0)
         s_rowmax = jnp.max(s, axis=1, keepdims=True)
 
@@ -689,14 +715,18 @@ def _ragged_paged_attention_kernel_loop(
 
         m_curr = jnp.maximum(m_prev, s_rowmax)
         head_m_ref[...] = m_curr
-        p = jnp.exp(s - broadcast_minor(m_curr, s.shape))
+        # A row with no visible key yet (mask_value=-inf, no sink) has m_curr == -inf; shift by a
+        # finite 0 there so exp(-inf - 0) == 0 instead of exp(-inf - -inf) == NaN (r11 S02-1: the
+        # last query block may traverse fully masked leading KV blocks to write the cache).
+        m_shift = jnp.where(m_curr == -jnp.inf, 0.0, m_curr)
+        p = jnp.exp(s - broadcast_minor(m_shift, s.shape))
 
         pv = jnp.einsum("nm,md->nd", p, v, preferred_element_type=jnp.float32)
         if v_scale is not None:
             pv *= v_scale
 
         p_rowsum = jnp.sum(p, axis=1, keepdims=True)
-        exp_m_diff = jnp.exp(m_prev - m_curr)
+        exp_m_diff = jnp.exp(m_prev - m_shift)
         l_prev = load_with_init(head_l_ref, 1.0)
         l_curr = exp_m_diff * l_prev + p_rowsum
         head_l_ref[...] = l_curr
@@ -964,9 +994,9 @@ def _ragged_paged_attention_kernel_loop(
         return jnp.concatenate([src for _ in range(target_minor // src.shape[-1])], axis=-1)[..., : shape[-1]]
 
     def get_start_bkv_idx(processed_q_len):
-        if sliding_window is None:
+        if sliding_window is None and chunk_size is None:
             return 0
-        return jnp.maximum(processed_q_len - sliding_window, 0) // bkv_sz
+        return first_visible_kv(processed_q_len) // bkv_sz
 
     def process():
         if static_q_len is None:
@@ -975,6 +1005,20 @@ def _ragged_paged_attention_kernel_loop(
         else:
             actual_bq_sz = min(bq_sz, static_q_len)
             num_bq = cdiv(static_q_len, actual_bq_sz)
+
+        def bq_start_bkv_idx(bq_idx):
+            start = get_start_bkv_idx(kv_q_gap + bq_idx * actual_bq_sz)
+            if sliding_window is None and chunk_size is None:
+                return start
+            # The LAST query block writes the new KV tokens to the cache (update_cur_bkv_to_cache),
+            # so it must visit every block holding a new token, even blocks fully masked for its
+            # attention by the window / chunk. Earlier query blocks keep the tight start; block 0
+            # already starts at or before ``kv_q_gap``, so the next-sequence prefetch is unchanged.
+            # A fully masked leading block is harmless: a finite mask value is wiped by
+            # exp(mask_value - m) == 0 once the query's own (always visible) block arrives, and
+            # with mask_value=-inf the flash update shifts by 0 while m == -inf (r11 S02-1), so the
+            # block contributes exactly zero instead of NaN.
+            return jnp.where(bq_idx == num_bq - 1, jnp.minimum(start, kv_q_gap // bkv_sz), start)
 
         def get_next_bq_ids(seq_idx, bq_idx, bq_sem_idx):
             next_bq_idx = bq_idx + 1
@@ -993,7 +1037,7 @@ def _ragged_paged_attention_kernel_loop(
             next_seq_idx = lax.select(is_last_bq, next_nonempty_seq(seq_idx + 1), seq_idx)
             next_bkv_sem_idx = lax.select(bkv_sem_idx == 0, 1, 0)
 
-            next_bq_start_bkv_idx = get_start_bkv_idx(kv_q_gap + (bq_idx + 1) * actual_bq_sz)
+            next_bq_start_bkv_idx = bq_start_bkv_idx(bq_idx + 1)
             next_bkv_idx = lax.select(is_last_bkv, next_bq_start_bkv_idx, next_bkv_idx)
             next_bkv_idx = lax.select(is_last_bq, next_seq_start_bkv_idx, next_bkv_idx)
             return next_seq_idx, next_bq_idx, next_bkv_idx, next_bkv_sem_idx
@@ -1004,7 +1048,7 @@ def _ragged_paged_attention_kernel_loop(
             acc_ref[...] = jnp.full_like(acc_ref, 0.0)
 
             processed_q_len = kv_q_gap + bq_idx * actual_bq_sz
-            start_bkv_idx = get_start_bkv_idx(processed_q_len)
+            start_bkv_idx = bq_start_bkv_idx(bq_idx)
             effective_kv_len = jnp.minimum(kv_len, processed_q_len + actual_bq_sz)
             end_bkv_idx = cdiv(effective_kv_len, bkv_sz)
 
@@ -1215,8 +1259,12 @@ def prepare_inputs(
     kv = merge_kv(k, v)
 
     if softmax_aux is not None:
-        softmax_aux = softmax_aux.reshape((-1, num_q_heads_per_kv_head, 1))
-        softmax_aux = jnp.repeat(softmax_aux, 128, -1)
+        # Pad sinks within each KV head's query group exactly like the queries above; a plain
+        # reshape to the padded group width fails (or regroups sinks across KV heads) whenever
+        # packing pads the group, e.g. Hq == Hkv == 1 with bf16 queries.
+        softmax_aux = pack_per_head_lanes(
+            softmax_aux, actual_num_kv_heads, actual_num_q_heads_per_kv_head, num_q_heads_per_kv_head
+        )
 
     return q, kv, softmax_aux
 
@@ -1535,6 +1583,7 @@ def static_validate_inputs(
         "num_kv_pages_per_block",
         "num_queries_per_block",
         "vmem_limit_bytes",
+        "chunk_size",
     ),
     donate_argnames=("kv_cache",),
 )
@@ -1560,6 +1609,8 @@ def ragged_paged_attention(
     num_kv_pages_per_block: int | None = None,
     num_queries_per_block: int | None = None,
     vmem_limit_bytes: int | None = None,
+    chunk_size: int | None = None,
+    alibi_slopes: jax.Array | None = None,
 ):
     """Ragged paged attention that supports mixed prefill and decode.
 
@@ -1588,11 +1639,20 @@ def ragged_paged_attention(
       num_queries_per_block: number of queries to be processed in one flash
         attention block in the pallas kernel.
       vmem_limit_bytes: the vmem limit for the pallas kernel.
+      chunk_size: optional chunked-local-attention size ``C``; a query at ``q``
+        sees key ``k`` only if ``k <= q`` and ``k // C == q // C``. KV blocks
+        before the query's chunk start are skipped (never fetched).
+      alibi_slopes: optional per-query-head ALiBi slopes ``[num_q_heads]``;
+        adds ``slope_h * key_position`` to the scaled logits.
 
     Returns:
       The output of the attention.
     """
     q, k, v = queries, keys, values
+    if chunk_size is not None and int(chunk_size) <= 0:
+        raise ValueError(f"{chunk_size=} must be positive.")
+    if alibi_slopes is not None and alibi_slopes.shape != (q.shape[1],):
+        raise ValueError(f"Expected {alibi_slopes.shape=} to be ({q.shape[1]},).")
     static_validate_inputs(
         q,
         k,
@@ -1629,6 +1689,14 @@ def ragged_paged_attention(
         q_packing,
         head_dim,
     ) = q.shape
+    alibi_packed = None
+    if alibi_slopes is not None:
+        alibi_packed = pack_per_head_lanes(
+            alibi_slopes,
+            actual_num_kv_heads,
+            actual_num_q_heads_per_kv_head,
+            num_q_heads_per_kv_head_per_q_packing * q_packing,
+        )
     page_size = kv_cache.shape[1]
     max_num_seqs = kv_lens.shape[0]
     num_page_indices = block_tables.shape[0]
@@ -1695,6 +1763,7 @@ def ragged_paged_attention(
             pl.BlockSpec(memory_space=pltpu.HBM),
             pl.BlockSpec(memory_space=pltpu.HBM),
             None if softmax_aux is None else pl.BlockSpec(memory_space=pltpu.VMEM),
+            None if alibi_packed is None else pl.BlockSpec(memory_space=pltpu.VMEM),
         ]
 
         out_specs = [
@@ -1752,6 +1821,7 @@ def ragged_paged_attention(
                     k_scale=k_scale,
                     v_scale=v_scale,
                     chunk_prefill_size=chunk_prefill_size,
+                    chunk_size=chunk_size,
                     bq_sz=bq_sz,
                     bkv_p=bkv_p,
                     static_q_len=static_q_len,
@@ -1778,7 +1848,7 @@ def ragged_paged_attention(
             )
         )
 
-        return kernel(*scalar_prefetches, q, kv, kv_cache, softmax_aux)
+        return kernel(*scalar_prefetches, q, kv, kv_cache, softmax_aux, alibi_packed)
 
     output, updated_kv_cache = run_case(
         q,

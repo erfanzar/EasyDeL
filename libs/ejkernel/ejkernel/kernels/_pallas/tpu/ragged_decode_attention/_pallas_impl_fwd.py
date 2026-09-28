@@ -70,6 +70,8 @@ from jaxtyping import Float, Int
 from ejkernel.callib import ejit
 from ejkernel.ops import FwdParams
 
+from ..blocksparse_attention._kernel import reduce_sinks_to_per_head
+
 
 def get_mha_cost_estimate(shape_dtype):
     """Estimates the cost of MHA computation for use with Pallas.
@@ -96,14 +98,21 @@ def ragged_flash_attention_kernel(
     q_ref,
     k_ref,
     v_ref,
-    o_ref,
-    m_ref,
-    l_ref,
-    *,
+    *refs,
     block_size: int,
     softmax_scale: float,
+    num_blocks: int = 1,
+    has_sink: bool = False,
+    window_left: int | None = None,
+    window_right: int | None = None,
+    logits_soft_cap: float | None = None,
 ):
     """Flash Attention kernel for ragged sequences on TPU via Pallas.
+
+    ``window_left`` / ``window_right`` restrict keys to ``[q_pos - left, q_pos + right]`` with the
+    decode query at ``q_pos = sequence_end - 1``; ``logits_soft_cap`` applies
+    ``cap * tanh(s / cap)`` to the scaled logits (both match the XLA ragged-decode reference).
+
 
     Applies a block-wise attention pattern while respecting per-sequence boundaries.
 
@@ -113,12 +122,23 @@ def ragged_flash_attention_kernel(
         q_ref: Query tensor reference.
         k_ref: Key tensor reference.
         v_ref: Value tensor reference.
-        o_ref: Output tensor reference (written in-place).
-        m_ref: Max logits (intermediate).
-        l_ref: Normalization factors (intermediate).
+        *refs: ``(sink_ref, o_ref, m_ref, l_ref)`` when ``has_sink`` else
+            ``(o_ref, m_ref, l_ref)``. ``sink_ref`` holds the per-head sink logit
+            broadcast to ``[heads, head_dim]`` (float32); ``o_ref`` is the output
+            (written in-place); ``m_ref`` the running max; ``l_ref`` the running
+            normalization factor.
         block_size (int): Size of blocks to compute attention on.
         softmax_scale (float): Scaling factor applied to attention logits.
+        num_blocks (int): Number of KV blocks (grid extent along axis 1).
+        has_sink (bool): Whether a per-head attention-sink logit is folded into the
+            denominator after the last KV block. The sink is a raw logit: it is not
+            scaled by ``softmax_scale``.
     """
+    if has_sink:
+        sink_ref, o_ref, m_ref, l_ref = refs
+    else:
+        o_ref, m_ref, l_ref = refs
+        sink_ref = None
     b, i = pl.program_id(0), pl.program_id(1)
 
     @pl.when(i == 0)
@@ -139,9 +159,14 @@ def ragged_flash_attention_kernel(
         m_prev, l_prev = m_ref[...], l_ref[...]
 
         qk = lax.dot_general(q * softmax_scale, k, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32)
+        if logits_soft_cap is not None:
+            qk = logits_soft_cap * jnp.tanh(qk / logits_soft_cap)
 
         ranges = (i * block_size) + jax.lax.broadcasted_iota(jnp.int32, qk.shape, 1)
         mask = (sequence_start <= ranges) & (ranges < sequence_end)
+        if window_left is not None:
+            q_pos = sequence_end - 1
+            mask = mask & (ranges >= q_pos - window_left) & (ranges <= q_pos + window_right)
 
         qk = jnp.where(mask, qk, jnp.finfo(qk.dtype).min)
         m_curr = qk.max(axis=-1)
@@ -160,6 +185,26 @@ def ragged_flash_attention_kernel(
         m_ref[...], l_ref[...] = m_next, l_next
         o_ref[...] = ((l_prev * alpha * o_ref[...] + beta * o_curr_times_l_curr) / l_next_safe).astype(o_ref.dtype)
 
+    if has_sink:
+
+        @pl.when(i == num_blocks - 1)
+        def fold_sink():
+            # A sink logit adds exp(sink) to the softmax denominator only: with
+            # m_final = max(m, sink), l_final = l*exp(m - m_final) + exp(sink - m_final)
+            # and the normalized running output rescaled by l*exp(m - m_final) / l_final.
+            m_cur, l_cur = m_ref[...], l_ref[...]
+            sink = sink_ref[...]
+            m_fin = jnp.maximum(m_cur, sink)
+            # Shift by a finite max: when neither keys nor the sink carry mass (empty row with a
+            # -inf sink) both exponents are -inf - -inf = NaN otherwise. With the finite shift both
+            # terms are exp(-inf) = 0 and the guarded division keeps the zero output.
+            m_shift = jnp.where(jnp.isfinite(m_fin), m_fin, 0.0)
+            l_scaled = l_cur * jnp.exp(m_cur - m_shift)
+            l_fin = l_scaled + jnp.exp(sink - m_shift)
+            l_fin_safe = jnp.where(l_fin == 0.0, 1.0, l_fin)
+            o_ref[...] = (o_ref[...] * (l_scaled / l_fin_safe)).astype(o_ref.dtype)
+            m_ref[...], l_ref[...] = m_fin, l_fin
+
 
 def ragged_decode_mqa(
     query: chex.Array,
@@ -170,6 +215,9 @@ def ragged_decode_mqa(
     softmax_scale: float | None = None,
     block_size: int = 256,
     cost_estimate: pl.CostEstimate | None = None,
+    sink: chex.Array | None = None,
+    sliding_window: tuple[int, int] | None = None,
+    logits_soft_cap: float | None = None,
 ) -> jax.Array:
     """Run ragged multi-query attention decoding using a Flash Attention Pallas kernel.
 
@@ -193,6 +241,9 @@ def ragged_decode_mqa(
         block_size: Number of KV tokens processed per Pallas grid iteration.
             Clamped to seq_len if larger. Defaults to 256.
         cost_estimate: Optional Pallas cost estimate for scheduling optimization.
+        sink: Optional per-head attention-sink logit of shape [num_heads_per_group].
+            Added to the softmax denominator after the last KV block (raw logit,
+            not scaled by ``softmax_scale``).
 
     Returns:
         Attention output of shape [batch, num_heads_per_group, head_dim] in float32.
@@ -218,19 +269,32 @@ def ragged_decode_mqa(
         key = jnp.pad(key, ((0, 0), (0, pad_len), (0, 0)), mode="constant")
         value = jnp.pad(value, ((0, 0), (0, pad_len), (0, 0)), mode="constant")
 
+    has_sink = sink is not None
+    in_specs = [
+        pl.BlockSpec((None, num_heads, head_dim), lambda b, i, *_: (b, 0, 0)),
+        pl.BlockSpec((None, block_size, head_dim), lambda b, i, *_: (b, i, 0)),
+        pl.BlockSpec((None, block_size, head_dim), lambda b, i, *_: (b, i, 0)),
+    ]
+    extra_inputs = ()
+    if has_sink:
+        sink_tile = jnp.broadcast_to(jnp.asarray(sink, dtype=jnp.float32).reshape(num_heads, 1), (num_heads, head_dim))
+        in_specs.append(pl.BlockSpec((num_heads, head_dim), lambda b, i, *_: (0, 0)))
+        extra_inputs = (sink_tile,)
+
     out, *_ = pl.pallas_call(
         functools.partial(
             ragged_flash_attention_kernel,
             block_size=block_size,
             softmax_scale=softmax_scale,
+            num_blocks=num_blocks,
+            has_sink=has_sink,
+            window_left=None if sliding_window is None else int(sliding_window[0]),
+            window_right=None if sliding_window is None else int(sliding_window[1]),
+            logits_soft_cap=None if logits_soft_cap is None else float(logits_soft_cap),
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
-            in_specs=[
-                pl.BlockSpec((None, num_heads, head_dim), lambda b, i, *_: (b, 0, 0)),
-                pl.BlockSpec((None, block_size, head_dim), lambda b, i, *_: (b, i, 0)),
-                pl.BlockSpec((None, block_size, head_dim), lambda b, i, *_: (b, i, 0)),
-            ],
+            in_specs=in_specs,
             out_specs=[
                 pl.BlockSpec((None, num_heads, head_dim), lambda b, i, *_: (b, 0, 0)),
                 pl.BlockSpec((None, num_heads, head_dim), lambda b, i, *_: (b, 0, 0)),
@@ -245,11 +309,11 @@ def ragged_decode_mqa(
             jax.ShapeDtypeStruct((batch_size, num_heads, head_dim), jnp.float32),
         ],
         cost_estimate=cost_estimate,
-    )(sequence_start, sequence_end, query, key, value)
+    )(sequence_start, sequence_end, query, key, value, *extra_inputs)
     return out
 
 
-@ejit(static_argnames=["fwd_params", "softmax_scale", "logits_soft_cap"])
+@ejit(static_argnames=["fwd_params", "softmax_scale", "logits_soft_cap", "sliding_window"])
 def inner_decode_tpu(
     query: Float[Array, "batch num_q_heads head_dim"],
     key: Float[Array, "batch seq_len num_kv_heads head_dim"],
@@ -260,7 +324,7 @@ def inner_decode_tpu(
     fwd_params: FwdParams | None = None,
     sliding_window: tuple[int, int] | None = None,
     logits_soft_cap: float | None = None,
-    softmax_aux: Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "..."] | None = None,
 ) -> chex.Array:
     """JIT-compiled core implementation of ragged MQA Flash Attention for TPU.
 
@@ -281,7 +345,11 @@ def inner_decode_tpu(
             defaults to q_blocksize=1, kv_blocksize=min(seq_len, 128).
         sliding_window: Optional (left, right) window sizes for local attention.
         logits_soft_cap: Optional soft capping value for attention logits.
-        softmax_aux: Optional auxiliary logits for attention sinks.
+        softmax_aux: Optional attention-sink logits. Accepted layouts: 1-D of length
+            ``num_q_heads`` (per query head), any other 1-D length (shared), 2-D
+            ``(num_q_heads, S)``, ``(num_kv_heads, S)`` or ``(1, S)``. Reduced exactly to
+            one sink per query head via ``logsumexp`` and folded into the softmax
+            denominator (raw logit, not scaled by ``softmax_scale``).
 
     Returns:
         Attention output tensor reshaped to match the input query format,
@@ -308,15 +376,31 @@ def inner_decode_tpu(
     key = jnp.swapaxes(key, 1, 2)
     value = jnp.swapaxes(value, 1, 2)
 
-    o = jax.vmap(
-        functools.partial(
-            ragged_decode_mqa,
+    sink = None
+    if softmax_aux is not None:
+        sink = reduce_sinks_to_per_head(softmax_aux, num_q_heads=num_heads_q, num_kv_heads=num_heads_kv)
+        sink = sink.reshape(num_heads_kv, num_heads_q // num_heads_kv)
+
+    def _decode_group(q_g, k_g, v_g, start, end, sink_g):
+        return ragged_decode_mqa(
+            q_g,
+            k_g,
+            v_g,
+            start,
+            end,
+            softmax_scale=softmax_scale,
             block_size=fwd_params.kv_blocksize,
             cost_estimate=cost_estimate,
-            softmax_scale=softmax_scale,
-        ),
-        in_axes=(1, 1, 1, None, None),
+            sink=sink_g,
+            # Previously accepted but never forwarded: the Pallas path silently ignored both.
+            sliding_window=None if sliding_window is None else tuple(int(w) for w in sliding_window),
+            logits_soft_cap=logits_soft_cap,
+        )
+
+    o = jax.vmap(
+        _decode_group,
+        in_axes=(1, 1, 1, None, None, None if sink is None else 0),
         out_axes=1,
-    )(query, key, value, sequence_start, sequence_end)
+    )(query, key, value, sequence_start, sequence_end, sink)
 
     return jnp.reshape(o, out_shape)

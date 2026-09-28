@@ -242,7 +242,7 @@ def ring_attention(
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
     q_position_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_position_ids: Int[Array, "batch seq_len_k"] | None = None,
-    softmax_aux: Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "num_sinks"] | Float[Array, "sink_heads num_sinks"] | None = None,
     bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     mask_builder: Callable[[int, int, int, int, int], Mask] | None = None,
     sliding_window: int | tuple[int, int] | None = None,
@@ -276,8 +276,11 @@ def ring_attention(
             Used for position-based masking in packed sequences.
         kv_position_ids: Optional key/value position IDs [batch, seq_len_k].
             Used for position-based masking in packed sequences.
-        softmax_aux: Optional attention sink logits [num_sinks].
-            Participate in softmax normalization but don't contribute to output.
+        softmax_aux: Optional attention sink logits. A 1-D ``[num_sinks]`` vector
+            is shared by every head; a 2-D ``[sink_heads, num_sinks]`` array has
+            ``sink_heads == 1`` (shared) or ``sink_heads == num_heads`` (per query
+            head). Participate in softmax normalization but don't contribute to
+            output.
         bias: Optional attention bias [batch, num_heads, seq_len_q, seq_len_k].
             Additive bias applied to attention scores before softmax.
         mask_builder: Optional mask builder function (unused in XLA backend).
@@ -339,6 +342,10 @@ def ring_attention(
         kv_head_reps = num_q_heads // num_kv_heads
         key = jnp.repeat(key, kv_head_reps, axis=2)
         value = jnp.repeat(value, kv_head_reps, axis=2)
+        if softmax_aux is not None and softmax_aux.ndim == 2 and softmax_aux.shape[0] == num_kv_heads:
+            # Per-KV-head sinks (Hkv, S): expand rows over each query group with the same blocked
+            # grouping as K/V. Row repetition is exact (no logsumexp), so per-sink soft-capping holds.
+            softmax_aux = jnp.repeat(softmax_aux, kv_head_reps, axis=0)
 
     if fwd_params is None:
         fwd_params = FwdParams()

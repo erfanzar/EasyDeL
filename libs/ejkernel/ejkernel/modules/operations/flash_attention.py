@@ -915,17 +915,38 @@ def flash_attention(
     method = None
     if mesh is not None and in_specs is not None and out_specs is not None:
         method = "shard_map"
+        # ``in_specs`` follows this function's positional order
+        # (query, key, value, bias, cum_seqlens_q, cum_seqlens_k, softmax_aux[, block_tables]);
+        # the shard_map body takes (query, key, value, bias, softmax_aux, cum_seqlens_q,
+        # cum_seqlens_k, attention_mask, block_tables, q_segment_ids, kv_segment_ids).
+        # Reorder here so sinks get their own spec instead of cum_seqlens_q's.
+        if len(in_specs) not in (7, 8):
+            raise ValueError(
+                "flash_attention in_specs must cover (query, key, value, bias, cum_seqlens_q, "
+                f"cum_seqlens_k, softmax_aux[, block_tables]); got {len(in_specs)} entries."
+            )
+        q_spec, k_spec, v_spec, bias_spec, cu_q_spec, cu_k_spec, aux_spec = in_specs[:7]
+        block_tables_spec = in_specs[7] if len(in_specs) == 8 else None
         if mask_info is None:
-            in_specs = (*in_specs, None, None, None, None)
+            mask_spec = q_seg_spec = kv_seg_spec = None
         else:
             shardings = mask_info.get_shardings(False, mesh=mesh)
-            in_specs = (
-                *in_specs,
-                shardings.attention_mask if attention_mask is not None else None,
-                None,
-                shardings.q_segment_ids if q_segment_ids is not None else None,
-                shardings.kv_segment_ids if kv_segment_ids is not None else None,
-            )
+            mask_spec = shardings.attention_mask if attention_mask is not None else None
+            q_seg_spec = shardings.q_segment_ids if q_segment_ids is not None else None
+            kv_seg_spec = shardings.kv_segment_ids if kv_segment_ids is not None else None
+        in_specs = (
+            q_spec,
+            k_spec,
+            v_spec,
+            bias_spec,
+            aux_spec,
+            cu_q_spec,
+            cu_k_spec,
+            mask_spec,
+            block_tables_spec,
+            q_seg_spec,
+            kv_seg_spec,
+        )
 
     return _flash_executor(
         FlashAttention(),

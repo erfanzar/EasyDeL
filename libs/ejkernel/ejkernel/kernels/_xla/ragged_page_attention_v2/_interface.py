@@ -25,6 +25,7 @@ from beartype import beartype
 from jaxtyping import Array, DTypeLike, Float, Int
 
 from ..._registry import Backend, Platform, kernel_registry
+from ..ragged_page_attention_v3._sinks import reduce_sinks_to_heads
 from ._xla_impl_fwd import _ragged_paged_attention
 
 
@@ -43,7 +44,7 @@ def ragged_page_attention_v2(
     compute_dtype: DTypeLike = jnp.bfloat16,
     optimized: bool = False,
     sliding_window: int | None = None,
-    softmax_aux: Float[Array, "num_q_heads"] | None = None,
+    softmax_aux: Float[Array, "..."] | None = None,
     mask_value: float | None = None,
     num_kv_pages_per_block: int | None = None,
     num_queries_per_block: int | None = None,
@@ -98,9 +99,11 @@ def ragged_page_attention_v2(
         optimized: Accepted for API compatibility; ignored by this backend.
         sliding_window: Optional sliding window size (left window only).
             Limits attention to the most recent ``sliding_window`` tokens.
-        softmax_aux: Optional per-head attention-sink logits.
-            Shape: ``[num_q_heads]``.  Seeds the online-softmax running max
-            and normaliser so the model can absorb probability mass.
+        softmax_aux: Optional attention-sink logits. Accepts ``[num_q_heads]``,
+            a shared ``[num_sinks]``, or 2-D ``[num_q_heads|num_kv_heads|1, num_sinks]``;
+            several sinks of one head are reduced with ``logsumexp`` to a single
+            per-head sink (exactly equivalent). Seeds the online-softmax running
+            max and normaliser so the model can absorb probability mass.
         mask_value: Accepted for API compatibility; ignored by this backend.
         num_kv_pages_per_block: Accepted for API compatibility; ignored.
         num_queries_per_block: Accepted for API compatibility; ignored.
@@ -115,6 +118,7 @@ def ragged_page_attention_v2(
     del mask_value, num_kv_pages_per_block, num_queries_per_block, vmem_limit_bytes
     if softmax_scale is None:
         softmax_scale = queries.shape[-1] ** -0.5
+    softmax_aux = reduce_sinks_to_heads(softmax_aux, queries.shape[1], kv_pages.shape[2] // 2)
     fn = _ragged_paged_attention
     return fn(
         queries=queries,

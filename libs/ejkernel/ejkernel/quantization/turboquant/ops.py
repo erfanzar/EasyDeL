@@ -191,7 +191,7 @@ def turboquant_asymmetric_scores(
 
     Args:
         q_rotated: Pre-rotated queries (Q @ Pi^T), shape [qblocks, kv_heads, q_per_kv, head_dim].
-        q_projected: Pre-projected queries (Q @ S^T), shape [qblocks, kv_heads, q_per_kv, qjl_dim].
+        q_projected: Projected rotated queries ((Q @ Pi^T) @ S^T), shape [qblocks, kv_heads, q_per_kv, qjl_dim].
         k_packed_indices: Packed key codebook indices, shape [kv_tok, kv_heads, head_dim // 2].
         k_norms: Key norms, shape [kv_tok, kv_heads, 2] ([:,0]=original, [:,1]=residual).
         k_packed_signs: Packed QJL signs, shape [kv_tok, kv_heads, qjl_dim // 8].

@@ -69,6 +69,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jaxtyping import Array, Bool, Float, Int
 
 from ejkernel.callib import ejit
+from ejkernel.kernels._sinks import reduce_sinks_to_per_head
 from ejkernel.ops import BwdParams, FwdParams
 
 from . import _info as mask_info_lib
@@ -2690,7 +2691,7 @@ def blocksparse_attention(
     kv_segment_ids: Int[Array, "batch kv_len"] | None = None,
     q_positions: Int[Array, "batch seq_len"] | None = None,
     kv_positions: Int[Array, "batch kv_len"] | None = None,
-    softmax_aux: Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "..."] | None = None,
     bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
     attention_mask: (
         Bool[Array, "batch num_heads_or_1 seq_len kv_len"] | Int[Array, "batch num_heads_or_1 seq_len kv_len"] | None
@@ -2719,7 +2720,11 @@ def blocksparse_attention(
         kv_segment_ids: Optional KV segment ids [batch, kv_len]
         q_positions: Optional query position indices [batch, seq_len] (not implemented for TPU)
         kv_positions: Optional KV position indices [batch, kv_len] (not implemented for TPU)
-        softmax_aux: Optional auxiliary softmax values for attention sinks
+        softmax_aux: Optional attention-sink logits. Any layout accepted by
+            ``reduce_sinks_to_per_head`` (1-D per-head or shared, 2-D
+            ``(Hq, S)`` / ``(Hkv, S)`` / ``(1, S)``); reduced with ``logsumexp`` to
+            one sink per query head using the head counts this call sees (local
+            counts inside ``shard_map``).
         bias: Optional attention bias [batch num_heads seq_len head_dim]
         sequence_parallelism_mesh_axis_name: Optional mesh axis name for sequence parallelism
         logits_soft_cap: Optional soft capping value for attention logits. When specified,
@@ -2817,6 +2822,12 @@ def blocksparse_attention(
         softmax_scale = query.shape[-1] ** -0.5
 
     assert query_length != 1
+    if softmax_aux is not None:
+        softmax_aux = reduce_sinks_to_per_head(
+            softmax_aux,
+            num_q_heads=query.shape[1],
+            num_kv_heads=key.shape[1],
+        )
     mask = MultiHeadMask(
         [mask_builder(query_length, kv_length, query.shape[-3], ox, query.shape[-2]) for ox in range(query.shape[-3])]
     )

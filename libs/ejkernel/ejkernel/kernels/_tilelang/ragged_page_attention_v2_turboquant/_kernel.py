@@ -22,7 +22,7 @@ For each KV token the kernel computes two terms and sums them:
    against the per-dimension codebook centroids scaled by the original L2-norm.
 2. **Residual term** (``S_corr``): dot-product of the projected query ``Q_proj``
    against the binary QJL sign bits scaled by the residual L2-norm and a
-   normalisation factor ``qjl_factor = sqrt(2π) / qjl_dim``.
+   normalisation factor ``qjl_factor = sqrt(π/2) / qjl_dim``.
 
 The combined score approximates the true dot-product between the un-quantised
 query and the compressed key.
@@ -101,7 +101,7 @@ def make_rpa_v2_turboquant_prim_func(
 
     1. Rotate the query: ``Q_rot = Q @ Rotation.T`` (full ``D×D`` matmul in
        register fragments).
-    2. Project the query: ``Q_proj = Q @ QJLProjection.T`` (``QJL×D`` matmul).
+    2. Project the rotated query: ``Q_proj = Q_rot @ QJLProjection.T`` (``QJL×D`` matmul).
     3. For each KV tile iterate ``T.Pipelined(ceil(max_tokens/BK), num_stages)``:
        a. Compute ``S_mse`` via codebook lookup + norm scaling.
        b. Compute ``S_corr`` via sign extraction + residual norm scaling.
@@ -249,7 +249,7 @@ def make_rpa_v2_turboquant_prim_func(
             for m in T.Parallel(QJL):
                 Q_proj[m] = 0.0
                 for d in T.serial(D):
-                    Q_proj[m] = Q_proj[m] + T.Cast(accum, Q[qx, hx, d]) * T.Cast(accum, QJLProjection[m, d])
+                    Q_proj[m] = Q_proj[m] + Q_rot[d] * T.Cast(accum, QJLProjection[m, d])
 
             T.fill(O_local, 0)
             if has_softmax_aux:

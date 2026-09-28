@@ -3093,6 +3093,6 @@ def get_cute_qmm_call(
             )
         if out is not None:
             return out.at[:, :].set(y.astype(out.dtype))
-        return y.astype(out_dtype)
+        return y.astype(x_arr.dtype)
 
     return _call

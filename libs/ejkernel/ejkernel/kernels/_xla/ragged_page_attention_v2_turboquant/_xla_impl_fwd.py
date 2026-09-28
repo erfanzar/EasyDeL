@@ -25,7 +25,7 @@ Outer loop -- sequences (ragged)
 
 Middle loop -- query blocks (``qblocks`` tokens)
     The query block is **pre-rotated** (``Q @ Pi^T``) and **pre-projected**
-    (``Q @ S^T``) before entering the KV loop.  This avoids redundant
+    (``(Q @ Pi^T) @ S^T``) before entering the KV loop.  This avoids redundant
     matrix multiplications inside the inner loop.
 
 Inner loop -- KV blocks (``kvblocks`` pages)
@@ -289,7 +289,7 @@ def ragged_paged_attention_v2_turboquant(
                     kv_block_start = kv_lo // jnp.int32(kv_tokens_per_block)
 
                 q_rotated = jnp.einsum("bihd,dD->bihD", q_block.astype(jnp.float32), rotation_matrix.T)
-                q_projected = jnp.einsum("bihd,md->bihm", q_block.astype(jnp.float32), qjl_projection)
+                q_projected = jnp.einsum("bihd,md->bihm", q_rotated, qjl_projection)
 
                 init_acc = jnp.zeros(
                     (qblocks, actual_num_kv_heads, actual_num_q_heads_per_kv_head, actual_head_dim),

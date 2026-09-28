@@ -331,6 +331,70 @@ class TestAttentionSink:
         assert diff_4_8 > 1e-6
 
 
+def _dense_sink_reference(q, k, v, sinks_per_q_head):
+    """Dense f32 GQA attention; raw sink logits appended ONCE per row to the softmax denominator."""
+    hp = jax.lax.Precision.HIGHEST
+    num_q_heads, num_kv_heads = q.shape[2], k.shape[2]
+    reps = num_q_heads // num_kv_heads
+    kf = jnp.repeat(k.astype(jnp.float32), reps, axis=2)
+    vf = jnp.repeat(v.astype(jnp.float32), reps, axis=2)
+    logits = jnp.einsum("bqhd,bkhd->bhqk", q.astype(jnp.float32) * q.shape[-1] ** -0.5, kf, precision=hp)
+    batch, _, q_len, _ = logits.shape
+    aux = jnp.broadcast_to(sinks_per_q_head[None, :, None, :], (batch, num_q_heads, q_len, sinks_per_q_head.shape[-1]))
+    weights = jax.nn.softmax(jnp.concatenate([logits, aux], axis=-1), axis=-1)[..., : k.shape[1]]
+    return jnp.einsum("bhqk,bkhd->bqhd", weights, vf, precision=hp)
+
+
+def _rel(a, b):
+    a = jnp.asarray(a, jnp.float32)
+    b = jnp.asarray(b, jnp.float32)
+    return float(jnp.max(jnp.abs(a - b)) / jnp.maximum(jnp.max(jnp.abs(b)), 1e-30))
+
+
+class TestAttentionSinkParity:
+    """Sink layouts vs an independent dense reference; sinks must be counted once, not once per KV chunk."""
+
+    B, S, HQ, HKV, D, NS = 2, 256, 8, 2, 64, 3
+    PARITY_REL = 3e-2
+    EFFECT_REL = 0.2
+
+    def _inputs(self):
+        kq, kk, kv = jax.random.split(jax.random.PRNGKey(5), 3)
+        q = jax.random.normal(kq, (self.B, self.S, self.HQ, self.D), dtype=jnp.float32)
+        k = jax.random.normal(kk, (self.B, self.S, self.HKV, self.D), dtype=jnp.float32)
+        v = jax.random.normal(kv, (self.B, self.S, self.HKV, self.D), dtype=jnp.float32)
+        return q, k, v
+
+    def _layouts(self):
+        hq, hkv, ns = self.HQ, self.HKV, self.NS
+        # Sinks in [3, 8] take a large share next to ~256 keys (logsumexp ~6), so ignoring or
+        # double-counting them is far outside the tolerance.
+        per_q = jnp.linspace(3.0, 8.0, hq * ns, dtype=jnp.float32).reshape(hq, ns)
+        per_kv = jnp.linspace(3.0, 8.0, hkv * ns, dtype=jnp.float32).reshape(hkv, ns)
+        shared = jnp.linspace(3.0, 8.0, ns, dtype=jnp.float32)
+        return {
+            "per_q_head_2d": (per_q, per_q),
+            "per_kv_head_2d": (per_kv, jnp.repeat(per_kv, hq // hkv, axis=0)),
+            "shared_2d": (shared[None, :], jnp.broadcast_to(shared[None, :], (hq, ns))),
+            "shared_1d": (shared, jnp.broadcast_to(shared[None, :], (hq, ns))),
+        }
+
+    @pytest.mark.parametrize("layout", ["per_q_head_2d", "per_kv_head_2d", "shared_2d", "shared_1d"])
+    @pytest.mark.parametrize("block", [64, 256])
+    def test_sink_layout_matches_dense_reference(self, layout, block):
+        q, k, v = self._inputs()
+        sinks, expanded = self._layouts()[layout]
+        out = ring_attention(
+            q, k, v, causal=False, softmax_aux=sinks, fwd_params=FwdParams(q_blocksize=block, kv_blocksize=block)
+        )
+        ref = _dense_sink_reference(q, k, v, expanded)
+        nosink = _dense_sink_reference(q, k, v, jnp.full((self.HQ, 1), -1e30, jnp.float32))
+        err, effect = _rel(out, ref), _rel(nosink, ref)
+        print(f"{layout} block={block}: rel err {err:.3e}; sink effect {effect:.3e}")
+        assert effect > self.EFFECT_REL, effect
+        assert err < self.PARITY_REL, err
+
+
 class TestCombinedFeatures:
     """Test combinations of features."""
 
@@ -881,6 +945,118 @@ class TestGradients:
 
         assert jnp.isfinite(loss)
         assert all(jnp.all(jnp.isfinite(g)) for g in grads)
+
+
+@pytest.mark.parametrize("layout", ["shared_1d", "one_by_s", "hq_by_s", "hkv_by_s"])
+def test_sink_gradient_matches_dense_reference(layout):
+    """The XLA ring backward must return the sink gradient, not zero (r11 S03-1/S04-2)."""
+    batch, seq, hq, hkv, dim, num_sinks = 2, 32, 4, 2, 16, 3
+    kq, kk, kv, kw, ks = jax.random.split(jax.random.PRNGKey(7), 5)
+    q = jax.random.normal(kq, (batch, seq, hq, dim), jnp.float32) * 0.5
+    k = jax.random.normal(kk, (batch, seq, hkv, dim), jnp.float32) * 0.5
+    v = jax.random.normal(kv, (batch, seq, hkv, dim), jnp.float32)
+    w = jax.random.normal(kw, (batch, seq, hq, dim), jnp.float32)
+    shape = {
+        "shared_1d": (num_sinks,),
+        "one_by_s": (1, num_sinks),
+        "hq_by_s": (hq, num_sinks),
+        "hkv_by_s": (hkv, num_sinks),
+    }
+    # Sinks near the typical logsumexp of a causal row so they carry a large share of the mass.
+    sinks = jax.random.normal(ks, shape[layout], jnp.float32) + 1.0
+    scale = dim**-0.5
+
+    def per_head_rows(aux):
+        if aux.ndim == 1:
+            return jnp.broadcast_to(aux[None, :], (hq, aux.shape[0]))
+        if aux.shape[0] == 1:
+            return jnp.broadcast_to(aux, (hq, aux.shape[1]))
+        if aux.shape[0] == hkv:
+            return jnp.repeat(aux, hq // hkv, axis=0)
+        return aux
+
+    def dense(aux):
+        kf = jnp.repeat(k, hq // hkv, axis=2)
+        vf = jnp.repeat(v, hq // hkv, axis=2)
+        logits = jnp.einsum("bqhd,bkhd->bhqk", q, kf, precision="highest") * scale
+        causal = jnp.tril(jnp.ones((seq, seq), bool))
+        logits = jnp.where(causal[None, None], logits, -jnp.inf)
+        rows = per_head_rows(aux)
+        sink_cols = jnp.broadcast_to(rows[None, :, None, :], (batch, hq, seq, rows.shape[1]))
+        probs = jax.nn.softmax(jnp.concatenate([logits, sink_cols], -1), axis=-1)[..., :seq]
+        return jnp.einsum("bhqk,bkhd->bqhd", probs, vf, precision="highest")
+
+    def ring(aux):
+        return ring_attention(q, k, v, softmax_aux=aux, causal=True, chunk_size=8)
+
+    ref_grad = jax.grad(lambda a: jnp.sum(dense(a) * w))(sinks)
+    got_grad = jax.grad(lambda a: jnp.sum(ring(a) * w))(sinks)
+    assert got_grad.shape == sinks.shape
+    assert jnp.all(jnp.isfinite(got_grad))
+    # Negative control: the true sink gradient is far from zero, so a dropped cotangent fails.
+    assert float(jnp.max(jnp.abs(ref_grad))) > 0.5, ref_grad
+    err = float(jnp.max(jnp.abs(got_grad - ref_grad)))
+    # Default (bf16-pass) matmul precision inside the ring kernel: tolerance relative to magnitude.
+    assert err < 3e-2 * float(jnp.max(jnp.abs(ref_grad))) + 1e-2, (err, got_grad, ref_grad)
+    # Forward parity as a sanity check on the same layout.
+    assert float(jnp.max(jnp.abs(ring(sinks) - dense(sinks)))) < 2e-2
+
+
+def test_differentiated_causal_ring_attention_stays_causal():
+    """Under jax.grad the custom_vjp rules get raw args; causal must still mask (r11 S03-1 follow-up)."""
+    batch, seq, heads, dim = 2, 32, 2, 16
+    kq, kk, kv, kw = jax.random.split(jax.random.PRNGKey(11), 4)
+    q = jax.random.normal(kq, (batch, seq, heads, dim), jnp.float32)
+    k = jax.random.normal(kk, (batch, seq, heads, dim), jnp.float32)
+    v = jax.random.normal(kv, (batch, seq, heads, dim), jnp.float32)
+    w = jax.random.normal(kw, (batch, seq, heads, dim), jnp.float32)
+    scale = dim**-0.5
+
+    def dense(q, causal):
+        logits = jnp.einsum("bqhd,bkhd->bhqk", q, k, precision="highest") * scale
+        if causal:
+            logits = jnp.where(jnp.tril(jnp.ones((seq, seq), bool))[None, None], logits, -jnp.inf)
+        return jnp.einsum("bhqk,bkhd->bqhd", jax.nn.softmax(logits, -1), v, precision="highest")
+
+    def ring_loss(q):
+        return jnp.sum(ring_attention(q, k, v, causal=True, chunk_size=8) * w)
+
+    loss, dq = jax.value_and_grad(ring_loss)(q)
+    ref_loss, ref_dq = jax.value_and_grad(lambda q: jnp.sum(dense(q, True) * w))(q)
+    _, noncausal_dq = jax.value_and_grad(lambda q: jnp.sum(dense(q, False) * w))(q)
+    assert float(jnp.max(jnp.abs(ref_dq - noncausal_dq))) > 0.5  # negative control
+    tol = 3e-2 * float(jnp.max(jnp.abs(ref_dq))) + 1e-2
+    assert abs(float(loss - ref_loss)) < 3e-2 * abs(float(ref_loss)) + 1e-1
+    assert float(jnp.max(jnp.abs(dq - ref_dq))) < tol
+
+
+def test_disabled_sink_rows_have_zero_not_nan_gradient():
+    """All--inf (disabled) sink rows must give a finite, zero sink gradient (r12 S04-1)."""
+    batch, seq, heads, dim = 1, 16, 2, 8
+    kq, kk, kv, kw = jax.random.split(jax.random.PRNGKey(13), 4)
+    q = jax.random.normal(kq, (batch, seq, heads, dim), jnp.float32)
+    k = jax.random.normal(kk, (batch, seq, heads, dim), jnp.float32)
+    v = jax.random.normal(kv, (batch, seq, heads, dim), jnp.float32)
+    w = jax.random.normal(kw, (batch, seq, heads, dim), jnp.float32)
+
+    def grad_for(aux):
+        return jax.grad(lambda a: jnp.sum(ring_attention(q, k, v, softmax_aux=a, causal=True, chunk_size=4) * w))(aux)
+
+    # Fully disabled: finite zero gradient, and the output equals the no-sink output.
+    disabled = jnp.full((1, 2), -jnp.inf, jnp.float32)
+    g = grad_for(disabled)
+    assert jnp.all(jnp.isfinite(g)) and float(jnp.max(jnp.abs(g))) == 0.0, g
+    out_disabled = ring_attention(q, k, v, softmax_aux=disabled, causal=True, chunk_size=4)
+    out_none = ring_attention(q, k, v, causal=True, chunk_size=4)
+    assert float(jnp.max(jnp.abs(out_disabled - out_none))) < 1e-5
+
+    # Mixed per-head layout: the disabled head row gets zero gradient, the live row a nonzero one,
+    # and the live -inf entry of a mixed row gets zero.
+    mixed = jnp.asarray([[-jnp.inf, -jnp.inf], [0.5, -jnp.inf]], jnp.float32)
+    g = grad_for(mixed)
+    assert jnp.all(jnp.isfinite(g)), g
+    assert float(jnp.max(jnp.abs(g[0]))) == 0.0 and float(g[1, 1]) == 0.0, g
+    assert abs(float(g[1, 0])) > 1e-3, g
 
 
 if __name__ == "__main__":

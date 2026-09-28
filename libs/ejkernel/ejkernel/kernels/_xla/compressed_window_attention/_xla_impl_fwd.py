@@ -97,3 +97,97 @@ def compressed_window_attention_xla(
     probs = jax.nn.softmax(combined, axis=-1)
     scores = probs[..., :kv_len].astype(kv.dtype)
     return jnp.einsum("bhsl,bld->bhsd", scores, kv, precision=jax.lax.Precision.HIGHEST)
+
+
+_MASK_MIN = float(jnp.finfo(jnp.float32).min)
+
+
+def dedupe_entry_topk(entry_topk: Array) -> Array:
+    """Sort each query's selected entry ids and turn repeats / negatives into ``-1`` (dense-mask semantics)."""
+    ids = jnp.sort(entry_topk.astype(jnp.int32), axis=-1)
+    repeat = jnp.concatenate([jnp.zeros_like(ids[..., :1], dtype=bool), ids[..., 1:] == ids[..., :-1]], axis=-1)
+    return jnp.where(repeat | (ids < 0), -1, ids)
+
+
+def compressed_window_attention_topk_xla(
+    query: Float[Array, "batch num_heads q_len head_dim"],
+    kv: Float[Array, "batch kv_len head_dim"],
+    entry_topk: Array,
+    softmax_aux: Float[Array, "num_heads"],
+    token_valid: Array,
+    *,
+    softmax_scale: float | None,
+    window: int,
+    block_q: int = 64,
+) -> Float[Array, "batch num_heads q_len head_dim"]:
+    """Sparse top-k form of the sink-augmented attention: window band + each query's selected entries only.
+
+    Same value as :func:`compressed_window_attention_xla` with the dense bias ``[token mask | selection mask]``
+    where token key ``k`` is visible to query ``q`` iff ``q - window < k <= q`` and ``token_valid[k]``, and entry
+    ``t`` iff ``t`` is in ``entry_topk[q]`` (``-1`` = none; repeats count once). Queries are processed in
+    rematerialized tiles that touch ``block_q + window - 1`` token keys and ``k`` gathered entries, so time and
+    memory are ``O(S * (window + k))`` in both directions and no ``[S, T]`` bias or score tensor exists.
+    Requires a sink (sink-free fully masked rows are uniform over *all* KVs, which a sparse attend cannot see).
+
+    Args:
+        query: Rotated queries ``[batch, num_heads, q_len, head_dim]``.
+        kv: ``[batch, q_len + entries, head_dim]``: the sequence's own token KVs, then the compressed entries.
+        entry_topk: Selected entry ids ``[batch, q_len, k]`` (int, ``-1`` padded).
+        softmax_aux: Per-head sink logits ``[num_heads]``.
+        token_valid: Per-key token validity ``[batch, q_len]``.
+        softmax_scale: Logit scale; defaults to ``head_dim ** -0.5``.
+        window: Sliding-window size.
+        block_q: Queries per rematerialized tile.
+
+    Returns:
+        Attention output ``[batch, num_heads, q_len, head_dim]`` in ``kv``'s dtype.
+    """
+    batch, heads, seq, dim = query.shape
+    scale = dim**-0.5 if softmax_scale is None else float(softmax_scale)
+    n_entries = kv.shape[1] - seq
+    ids = dedupe_entry_topk(entry_topk)
+    has_entries = n_entries > 0 and ids.shape[-1] > 0
+    tile = max(1, min(block_q, seq))
+    span = min(tile + window - 1, seq)
+    tiles = -(-seq // tile)
+    pad = tiles * tile - seq
+    tokens = kv[:, :seq]
+    entries = kv[:, seq:]
+    q_p = jnp.pad(query, ((0, 0), (0, 0), (0, pad), (0, 0)))
+    ids_p = jnp.pad(ids, ((0, 0), (0, pad), (0, 0)), constant_values=-1)
+    valid = token_valid > 0
+    sink = softmax_aux.astype(jnp.float32).reshape(1, heads, 1, 1)
+    hi = jax.lax.Precision.HIGHEST
+
+    @jax.checkpoint
+    def attend_tile(index):
+        start = index * tile
+        lo = jnp.clip(start - window + 1, 0, seq - span)
+        q_t = jax.lax.dynamic_slice_in_dim(q_p, start, tile, axis=2)
+        k_t = jax.lax.dynamic_slice_in_dim(tokens, lo, span, axis=1)
+        key_ok = jax.lax.dynamic_slice_in_dim(valid, lo, span, axis=1)
+        q_pos = start + jnp.arange(tile, dtype=jnp.int32)[:, None]
+        k_pos = lo + jnp.arange(span, dtype=jnp.int32)[None, :]
+        allowed = ((k_pos <= q_pos) & (k_pos > q_pos - window))[None] & key_ok[:, None, :]
+        tok_logits = jnp.einsum("bhqd,btd->bhqt", q_t, k_t, precision=hi, preferred_element_type=jnp.float32)
+        tok_logits = jax.lax.optimization_barrier(tok_logits)
+        parts = [jnp.where(allowed[:, None], tok_logits * scale, _MASK_MIN)]
+        gathered = None
+        if has_entries:
+            sel = jax.lax.dynamic_slice_in_dim(ids_p, start, tile, axis=1)  # [B, tile, k]
+            gathered = jnp.take_along_axis(entries[:, None], jnp.maximum(sel, 0)[..., None], axis=2)
+            ent_logits = jnp.einsum("bhqd,bqkd->bhqk", q_t, gathered, precision=hi, preferred_element_type=jnp.float32)
+            ent_logits = jax.lax.optimization_barrier(ent_logits)
+            parts.append(jnp.where((sel >= 0)[:, None], ent_logits * scale, _MASK_MIN))
+        parts.append(jnp.broadcast_to(sink, (batch, heads, tile, 1)))
+        combined = jnp.concatenate(parts, axis=-1)
+        probs = jax.nn.softmax(combined - jnp.max(combined, axis=-1, keepdims=True), axis=-1).astype(kv.dtype)
+        out = jnp.einsum("bhqt,btd->bhqd", probs[..., :span], k_t, precision=hi, preferred_element_type=jnp.float32)
+        if gathered is not None:
+            out = out + jnp.einsum(
+                "bhqk,bqkd->bhqd", probs[..., span:-1], gathered, precision=hi, preferred_element_type=jnp.float32
+            )
+        return out.astype(kv.dtype)
+
+    blocks = jax.lax.map(attend_tile, jnp.arange(tiles, dtype=jnp.int32))
+    return blocks.transpose(1, 2, 0, 3, 4).reshape(batch, heads, tiles * tile, dim)[:, :, :seq]

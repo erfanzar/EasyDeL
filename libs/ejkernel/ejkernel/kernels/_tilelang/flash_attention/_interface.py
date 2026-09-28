@@ -83,7 +83,7 @@ def flash_attention(
     fwd_params: FwdParams | None = None,
     bwd_params: BwdParams | None = None,
     logits_soft_cap: float | None = None,
-    softmax_aux: Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "num_sinks"] | Float[Array, "sink_heads num_sinks"] | None = None,
     normalize_output: bool = True,
     precision: lax.PrecisionLike = jax.lax.Precision.DEFAULT,
     logits_dtype: DTypeLike = jnp.float32,
@@ -101,22 +101,19 @@ def flash_attention(
 
     See :func:`ejkernel.kernels._xla.flash_attention.flash_attention` for the
     canonical argument documentation. Every argument is honoured natively;
-    the only gated parameters are ``cum_seqlens_*`` (ragged-packed) and
-    ``block_tables`` (paged KV), which the XLA reference also rejects.
+    ``cum_seqlens_*`` (ragged-packed) and ``block_tables`` (paged KV) are
+    unsupported by this backend.
 
     Raises:
-        EjkernelRuntimeError: if ``cum_seqlens_q`` / ``cum_seqlens_k`` is
-            supplied without ``attention_mask``, or if ``block_tables`` is
-            supplied (paged-KV flash attention is not implemented by this
-            backend or the XLA reference).
+        EjkernelRuntimeError: if ``cum_seqlens_q`` / ``cum_seqlens_k`` or
+            ``block_tables`` is supplied (ragged-packed and paged-KV flash
+            attention are not implemented by this backend).
         ValueError: on an unrecognised ``precision`` / ``logits_dtype`` or a
             ``num_kv_heads`` that does not divide ``num_heads``.
     """
     reasons: list[str] = []
-    if cum_seqlens_q is not None and attention_mask is None:
-        reasons.append("cum_seqlens_q requires attention_mask (fold the ragged layout into the mask)")
-    if cum_seqlens_k is not None and attention_mask is None:
-        reasons.append("cum_seqlens_k requires attention_mask (fold the ragged layout into the mask)")
+    if cum_seqlens_q is not None or cum_seqlens_k is not None:
+        reasons.append("cum_seqlens_* is not supported (use attention_mask alone to encode a ragged layout)")
     if block_tables is not None:
         reasons.append("block_tables (paged-KV) is not supported by flash_attention; use a paged-attention kernel")
     if reasons:

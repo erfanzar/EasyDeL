@@ -152,24 +152,32 @@ def forward_kernel(
             """Inner computation function for attention mechanism."""
             current_query = pallas_primitives.load(query_ref, (query_slice, pl.ds(None)), mask=query_mask)
             block_indices = jnp.arange(block_size_k)
+            # The split length need not be a multiple of the key tile, so the last tile can
+            # extend past this split. Its out-of-split rows are masked (loads return 0, scores
+            # are excluded) instead of padding K/V with a full copy on every call.
+            has_tail_tile = split_key_seq_len % block_size_k != 0
 
             def attention_body(key_block_start, carry_state):
                 """Body function for iterating over key blocks."""
                 output_prev, max_prev, logsum_prev = carry_state
                 current_key_slice = pl.ds(key_block_start * block_size_k, block_size_k)
+                local_indices = key_block_start * block_size_k + block_indices
+                tile_mask = (local_indices < split_key_seq_len)[:, None] if has_tail_tile else None
 
                 attention_scores = pl.dot(
                     current_query,
-                    pallas_primitives.load(key_ref, (current_key_slice, slice(None))).T,
+                    pallas_primitives.load(
+                        key_ref, (current_key_slice, slice(None)), mask=tile_mask, other=0.0 if has_tail_tile else None
+                    ).T,
                 )
 
                 if softmax_scale != 1.0:
                     attention_scores *= softmax_scale
-                if sequence_start_ref is not None or sequence_end_ref is not None:
-                    global_indices = (
-                        program_id_splits * split_key_seq_len + key_block_start * block_size_k + block_indices
-                    )
+                if sequence_start_ref is not None or sequence_end_ref is not None or has_tail_tile:
+                    global_indices = program_id_splits * split_key_seq_len + local_indices
                     sequence_mask = ((global_indices >= seq_start) & (global_indices < seq_end))[None, :]
+                    if has_tail_tile:
+                        sequence_mask = sequence_mask & (local_indices < split_key_seq_len)[None, :]
                     attention_scores = jnp.where(sequence_mask, attention_scores, jnp.finfo(attention_scores.dtype).min)
 
                 max_current = attention_scores.max(axis=-1)
@@ -181,7 +189,9 @@ def forward_kernel(
                 logsum_current = softmax_scores.sum(axis=-1)
                 logsum_next = logsum_prev_corrected + logsum_current
 
-                current_values = pallas_primitives.load(value_ref, (current_key_slice, slice(None)))
+                current_values = pallas_primitives.load(
+                    value_ref, (current_key_slice, slice(None)), mask=tile_mask, other=0.0 if has_tail_tile else None
+                )
                 output_current = pl.dot(softmax_scores.astype(current_values.dtype), current_values)
                 output_next = correction_factor[:, None] * output_prev + output_current
 
@@ -189,7 +199,7 @@ def forward_kernel(
 
             max_iterations = jnp.minimum(
                 pl.cdiv((seq_end - program_id_splits * split_key_seq_len), block_size_k),
-                split_key_seq_len // block_size_k,
+                pl.cdiv(split_key_seq_len, block_size_k),
             )
 
             final_output, final_max, final_logsum = lax.fori_loop(
@@ -225,7 +235,6 @@ def forward_kernel(
         pallas_primitives.store(log_sum_exp_ref, query_slice, final_log_sum, mask=vector_query_mask)
         pallas_primitives.store(max_logit_ref, query_slice, final_max_logits, mask=vector_query_mask)
 
-        final_output = final_output.astype(output_ref.dtype)
         pallas_primitives.store(output_ref, (query_slice, pl.ds(None)), final_output, mask=query_mask)
 
     except Exception as e:
@@ -279,10 +288,11 @@ def decode_attn_sequence(
             (typically ``1/sqrt(head_dim)``).
         block_size_heads: Number of heads per Pallas head-tile.  Must be >= 1.
         block_size_keys: Number of key tokens per inner kernel loop iteration.
-            Must be >= 16 and evenly divide the per-split key length.
+            Must be >= 16. The per-split length need not be a multiple of it: the
+            kernel masks the tail tile.
         num_key_splits: Number of groups to split the key sequence into.
-            ``seq_len`` must be divisible by ``num_key_splits`` and each split
-            must be >= 16 tokens.
+            The keys are padded only when they do not split into equal slices
+            (or a slice is narrower than one key tile); padding is masked.
         num_warps: Number of Triton warps for the GPU kernel.  Defaults to 4
             when None.
         num_stages: Number of software pipeline stages for memory prefetching.
@@ -294,10 +304,7 @@ def decode_attn_sequence(
     Raises:
         ValueError: If any tensor is not 2-D, head dimensions do not match,
             or key/value shapes differ.
-        AttentionConfigError: If ``seq_len`` is not divisible by
-            ``num_key_splits``, the per-split length is < 16, or
-            ``block_size_keys`` is < 16 or does not divide the per-split
-            sequence length.
+        AttentionConfigError: If the block sizes or number of key splits are invalid.
     """
     try:
         if query_tensor.ndim != 2:
@@ -315,17 +322,27 @@ def decode_attn_sequence(
         if value_tensor.shape != key_tensor.shape:
             raise ValueError(f"Value tensor shape {value_tensor.shape} must match key tensor shape {key_tensor.shape}")
 
-        if key_sequence_length % num_key_splits != 0:
+        if num_key_splits <= 0 or block_size_heads <= 0 or block_size_keys < 16:
             raise AttentionConfigError(
-                f"Key sequence length {key_sequence_length} must be divisible by num_key_splits {num_key_splits}"
+                "num_key_splits and block_size_heads must be positive; block_size_keys must be >= 16"
             )
 
-        split_key_sequence_length = key_sequence_length // num_key_splits
-        if split_key_sequence_length < 16:
-            raise AttentionConfigError(f"Split key sequence length {split_key_sequence_length} must be >= 16")
-
-        if block_size_keys < 16:
-            raise AttentionConfigError(f"block_size_keys {block_size_keys} must be >= 16")
+        # Splits are equal-sized slices of the keys. A split need not be a multiple of the
+        # key tile: the kernel masks the tail tile, so K/V are only padded when the length
+        # does not divide into ``num_key_splits`` equal slices, or a split is narrower than
+        # one tile (Pallas cannot slice a tile wider than the ref). Never a full-cache copy
+        # for the default ``num_key_splits == 1``.
+        # Keep the original end bound so padding never participates in softmax.
+        if sequence_end is None:
+            sequence_end = jnp.asarray(key_sequence_length, dtype=jnp.int32)
+        else:
+            sequence_end = jnp.minimum(sequence_end, key_sequence_length)
+        split_key_sequence_length = max(pl.cdiv(key_sequence_length, num_key_splits), block_size_keys)
+        padded_length = split_key_sequence_length * num_key_splits
+        if padded_length > key_sequence_length:
+            padding = ((0, padded_length - key_sequence_length), (0, 0))
+            key_tensor = jnp.pad(key_tensor, padding)
+            value_tensor = jnp.pad(value_tensor, padding)
 
         num_head_splits = pl.cdiv(total_num_heads, block_size_heads)
         computation_grid = (num_head_splits, num_key_splits)
@@ -333,12 +350,7 @@ def decode_attn_sequence(
         reshaped_keys = key_tensor.reshape(num_key_splits, split_key_sequence_length, head_dimension)
         reshaped_values = value_tensor.reshape(num_key_splits, split_key_sequence_length, head_dimension)
 
-        effective_block_size_k = min(block_size_keys, split_key_sequence_length)
-        if split_key_sequence_length % effective_block_size_k != 0:
-            raise AttentionConfigError(
-                f"Split sequence length {split_key_sequence_length} must be divisible by "
-                f"effective block size {effective_block_size_k}"
-            )
+        effective_block_size_k = block_size_keys
 
         effective_num_warps = num_warps if num_warps is not None else 4
 
@@ -370,7 +382,7 @@ def decode_attn_sequence(
                 num_stages=num_stages,
             ),
             out_shape=[
-                jax.ShapeDtypeStruct(shape=(num_key_splits, *query_tensor.shape), dtype=query_tensor.dtype),
+                jax.ShapeDtypeStruct(shape=(num_key_splits, *query_tensor.shape), dtype=jnp.float32),
                 jax.ShapeDtypeStruct(shape=(num_key_splits, total_num_heads), dtype=jnp.float32),
                 jax.ShapeDtypeStruct(shape=(num_key_splits, total_num_heads), dtype=jnp.float32),
             ],
@@ -387,15 +399,15 @@ def decode_attn_sequence(
         max_logits_global = lax.optimization_barrier(max_logits_global)
 
         correction_factors = jnp.exp(max_logit_values - max_logits_global[None])
-        corrected_outputs = attention_output * correction_factors[:, :, None].astype(attention_output.dtype)
+        corrected_outputs = attention_output * correction_factors[:, :, None]
 
         corrected_log_sum_exp = (log_sum_exp_values * correction_factors).sum(axis=0)
         numerical_epsilon = jnp.finfo(corrected_log_sum_exp.dtype).eps
 
         final_output = corrected_outputs.sum(axis=0)
-        out_scale = corrected_log_sum_exp[:, None].astype(final_output.dtype) + numerical_epsilon
+        out_scale = corrected_log_sum_exp[:, None] + numerical_epsilon
 
-        return final_output / out_scale
+        return (final_output / out_scale).astype(query_tensor.dtype)
 
     except Exception as e:
         raise RuntimeError(f"Error in decode_attn_sequence: {e!s}") from e
@@ -424,10 +436,8 @@ def _ragged_decode_attention_call(
 
     Kernel parameters (``block_size_heads``, ``kv_blocksize``,
     ``num_key_splits``, ``num_warps``, ``num_stages``) are taken from
-    ``fwd_params`` (a :class:`ejkernel.ops.FwdParams` instance).  When
-    ``fwd_params`` is ``None`` a ``FwdParams()`` with all defaults is used,
-    which may raise ``AttributeError`` because the defaults are ``None``.
-    Callers should always pass an explicit ``FwdParams``.
+    ``fwd_params`` (a :class:`ejkernel.ops.FwdParams` instance).  Missing
+    fields use launch defaults (16 heads, 16 keys, one key split and two stages).
 
     Args:
         query: Query tensor of shape ``[batch, num_q_heads, head_dim]``.
@@ -491,14 +501,16 @@ def _ragged_decode_attention_call(
         sequence_end = sequence_end.reshape(batch_size, 1)
         sequence_end = jnp.broadcast_to(sequence_end, (batch_size, kv_heads))
 
+    if fwd_params is None:
+        fwd_params = FwdParams()
     fn = functools.partial(
         decode_attn_sequence,
         softmax_scale=softmax_scale,
-        block_size_heads=fwd_params.blocksize_heads,
-        block_size_keys=fwd_params.kv_blocksize,
-        num_key_splits=fwd_params.num_key_splits,
+        block_size_heads=fwd_params.blocksize_heads if fwd_params.blocksize_heads is not None else 16,
+        block_size_keys=fwd_params.kv_blocksize if fwd_params.kv_blocksize is not None else 16,
+        num_key_splits=fwd_params.num_key_splits if fwd_params.num_key_splits is not None else 1,
         num_warps=fwd_params.num_warps,
-        num_stages=fwd_params.num_stages,
+        num_stages=fwd_params.num_stages if fwd_params.num_stages is not None else 2,
     )
     o = jax.vmap(jax.vmap(fn))(
         query.reshape(batch_size, kv_heads, q_heads // kv_heads, head_dim),

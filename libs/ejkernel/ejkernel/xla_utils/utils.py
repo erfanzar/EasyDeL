@@ -225,8 +225,10 @@ def prepare_sequence_ids(cu_seqlens: Int[Array, "num_seqs_plus_one"]) -> Int[Arr
         >>> # Returns: [0, 0, 0, 1, 1, 2, 2, 2, 2]
         >>> #          |seq 0 |seq 1| seq 2    |
     """
-    position_ids = prepare_position_ids(cu_seqlens)
-    return (position_ids == 0).cumsum(axis=0) - 1
+    # Count boundaries rather than zero-valued positions: empty sequences have no
+    # tokens at position zero, but still consume a sequence ID.
+    positions = jnp.arange(cu_seqlens[-1], dtype=cu_seqlens.dtype)
+    return jnp.searchsorted(cu_seqlens[1:], positions, side="right").astype(cu_seqlens.dtype)
 
 
 def prepare_token_indices(cu_seqlens: Int[Array, "num_seqs_plus_one"]) -> Int[Array, "total_tokens 2"]:
@@ -256,7 +258,7 @@ def prepare_token_indices(cu_seqlens: Int[Array, "num_seqs_plus_one"]) -> Int[Ar
     """
     position_ids = prepare_position_ids(cu_seqlens)
 
-    sequence_ids = (position_ids == 0).cumsum(axis=0) - 1
+    sequence_ids = prepare_sequence_ids(cu_seqlens)
 
     stacked = jnp.stack([sequence_ids, position_ids], axis=1)
     return stacked.astype(cu_seqlens.dtype)
@@ -299,7 +301,7 @@ def prepare_chunk_indices(cu_seqlens: Int[Array, "num_seqs_plus_one"], chunk_siz
 
     indices = jnp.arange(total_chunks) - start_offsets
 
-    sequence_ids_for_chunks = (indices == 0).cumsum(axis=0) - 1
+    sequence_ids_for_chunks = jnp.searchsorted(cu_chunks[1:], jnp.arange(total_chunks), side="right")
 
     stacked = jnp.stack([sequence_ids_for_chunks, indices], axis=1)
     return stacked.astype(cu_seqlens.dtype)

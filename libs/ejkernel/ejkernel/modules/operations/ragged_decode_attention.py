@@ -50,12 +50,13 @@ import math
 import os
 from typing import Literal
 
+import jax
 from jax import numpy as jnp
 from jax import shard_map
 from jax.sharding import Mesh, PartitionSpec
 from jaxtyping import Array, Float, Int
 
-from ejkernel.kernels._registry import Backend, kernel_registry
+from ejkernel.kernels._registry import Backend, Platform, kernel_registry
 from ejkernel.ops import (
     AutotunePolicy,
     ConfigCache,
@@ -651,6 +652,22 @@ def ragged_decode_attention(
         Block size tuning is exposed via ``cfg.fwd_params`` (``FwdParams``), not a
         ``block_size`` field directly on the config.
     """
+
+    # The GPU Pallas implementation does not implement these optional features.
+    # Route automatic calls to the Triton kernel, which supports all three, when
+    # it is registered, and otherwise to the XLA reference. An explicitly
+    # requested Pallas backend still reports its unsupported inputs.
+    if (
+        platform in (None, "auto")
+        and (cfg is None or cfg.platform in (None, "auto"))
+        and (sliding_window is not None or logits_soft_cap is not None or softmax_aux is not None)
+        and jax.default_backend() == "gpu"
+    ):
+        has_triton = any(
+            spec.platform == Platform.TRITON and spec.backend in (Backend.GPU, Backend.ANY)
+            for spec in kernel_registry.list_implementations("ragged_decode_attention")
+        )
+        platform = "triton" if has_triton else "xla"
 
     method = None
     if mesh is not None and in_specs is not None and out_specs is not None:

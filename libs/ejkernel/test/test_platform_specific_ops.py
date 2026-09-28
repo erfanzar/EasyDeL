@@ -260,8 +260,39 @@ class TestPlatformSpecificKernels:
         assert dx.shape == x.shape
         assert dy.shape == y.shape
 
-        assert jnp.all(jnp.isfinite(dx))
-        assert jnp.all(jnp.isfinite(dy))
+        # grad of sum(x @ y): dx = ones @ y.T, dy = x.T @ ones
+        ones = jnp.ones_like(x)
+        assert jnp.allclose(dx, ones @ y.T)
+        assert jnp.allclose(dy, x.T @ ones)
+
+    def test_custom_vjp_with_static_kwargs(self):
+        """Custom VJP must work when the kernel takes non-array (static) kwargs."""
+        cache = ConfigCache()
+        selector = ConfigSelectorChain(cache)
+        executor = Executor(selector)
+
+        class ScaledMatmulKernel(Kernel[TestConfig, jax.Array]):
+            def run(self, x, y, scale=1.0, cfg: TestConfig = None):
+                return (x @ y) * scale
+
+            def heuristic_cfg(self, inv):
+                return TestConfig(algorithm="generic")
+
+            def fwd_with_residuals(self, x, y, scale=1.0, cfg: TestConfig = None):
+                return (x @ y) * scale, (x, y, scale)
+
+            def vjp(self, residuals, output, dy, *args, cfg: TestConfig, **kwargs):
+                x, y, scale = residuals
+                return (dy * scale) @ y.T, x.T @ (dy * scale)
+
+        kernel = ScaledMatmulKernel()
+        x = jnp.array([[1.0, 2.0], [3.0, 4.0]])
+        y = jnp.array([[5.0, 6.0], [7.0, 8.0]])
+
+        ones = jnp.ones_like(x)
+        dx, dy = jax.grad(lambda a, b: jnp.sum(executor(kernel, a, b, scale=2.0)), argnums=(0, 1))(x, y)
+        assert jnp.allclose(dx, 2.0 * (ones @ y.T))
+        assert jnp.allclose(dy, 2.0 * (x.T @ ones))
 
     def test_forward_autotune_only_disables_backward_autotune_validation(self):
         """forward_autotune_only() should force forward-only autotune timing."""

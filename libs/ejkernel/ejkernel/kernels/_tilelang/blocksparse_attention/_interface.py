@@ -36,6 +36,7 @@ from ejkernel.errors import EjkernelRuntimeError
 from ejkernel.ops import BwdParams, FwdParams
 
 from ..._registry import Backend, Platform, kernel_registry
+from ..._sinks import reduce_sinks_to_per_head
 from ..flash_attention._impl import flash_attention_tilelang
 
 Mask = Any
@@ -52,7 +53,7 @@ def blocksparse_attention(
     kv_segment_ids: Int[Array, "batch kv_len"] | None = None,
     q_positions: Int[Array, "batch seq_len"] | None = None,
     kv_positions: Int[Array, "batch kv_len"] | None = None,
-    softmax_aux: Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "..."] | None = None,
     bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
     attention_mask: (
         Bool[Array, "batch num_heads_or_1 seq_len kv_len"] | Int[Array, "batch num_heads_or_1 seq_len kv_len"] | None
@@ -97,6 +98,10 @@ def blocksparse_attention(
             "supported; pass explicit q_segment_ids / kv_segment_ids / attention_mask / bias."
         )
     _scheduling_hints = (chunk_size, fused_backward, q_positions, kv_positions)
+    if softmax_aux is not None:
+        softmax_aux = reduce_sinks_to_per_head(softmax_aux, num_q_heads=query.shape[1], num_kv_heads=key.shape[1])[
+            :, None
+        ]
 
     q_bnhd = jnp.transpose(query, (0, 2, 1, 3))
     k_bnhd = jnp.transpose(key, (0, 2, 1, 3))

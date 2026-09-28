@@ -70,13 +70,9 @@ def ragged_decode_attention(
         fwd_params: Forward pass parameters controlling kernel execution.
             Contains block sizes, number of splits, warps, and pipeline stages.
             See FwdParams for configuration options.
-        sliding_window: Optional sliding window attention configuration as
-            (past_window, future_window). Currently unused but reserved for
-            future sliding window attention support.
-        logits_soft_cap: Optional soft cap value for attention logits.
-            Currently unused but reserved for logit capping support.
-        softmax_aux: Optional attention sink values of shape [num_sinks].
-            Currently unused but reserved for attention sink support.
+        sliding_window: Not supported by this backend; non-None values raise.
+        logits_soft_cap: Not supported by this backend; non-None values raise.
+        softmax_aux: Not supported by this backend; non-None values raise.
 
     Returns:
         Output tensor of shape [batch, num_q_heads, head_dim] containing
@@ -109,6 +105,10 @@ def ragged_decode_attention(
         generates a single token at a time. For prefill operations with
         multiple query tokens, use the prefill attention variants instead.
     """
+    if sliding_window is not None or logits_soft_cap is not None or softmax_aux is not None:
+        raise NotImplementedError(
+            "Pallas GPU ragged decode does not support sliding_window, logits_soft_cap or softmax_aux"
+        )
     return _ragged_decode_attention_call(
         query=query,
         key=key,

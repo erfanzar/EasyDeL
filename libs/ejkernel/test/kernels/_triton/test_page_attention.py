@@ -87,7 +87,15 @@ def test_page_attention_single_pass():
     print(f"Output std  : {jnp.std(output):.6f}")
     print(f"Output range: [{jnp.min(output):.6f}, {jnp.max(output):.6f}]")
 
-    assert output.shape == query.shape, f"Shape mismatch: {output.shape} != {query.shape}"
+    expected = xla_page_attention(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        context_lens=context_lens,
+        block_tables=block_tables,
+        attn_scale=float(attn_scale),
+    )
+    np.testing.assert_allclose(np.asarray(output), np.asarray(expected), rtol=2e-2, atol=2e-2)
     print("\n✓ Single-pass test passed!")
 
 
@@ -148,7 +156,15 @@ def test_page_attention_multi_pass():
     print(f"Output std  : {jnp.std(output):.6f}")
     print(f"Output range: [{jnp.min(output):.6f}, {jnp.max(output):.6f}]")
 
-    assert output.shape == query.shape, f"Shape mismatch: {output.shape} != {query.shape}"
+    expected = xla_page_attention(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        context_lens=context_lens,
+        block_tables=block_tables,
+        attn_scale=float(attn_scale),
+    )
+    np.testing.assert_allclose(np.asarray(output), np.asarray(expected), rtol=2e-2, atol=2e-2)
     print("\n✓ Multi-pass test passed!")
 
 
@@ -206,7 +222,15 @@ def test_page_attention_auto_split():
     print(f"Output mean : {jnp.mean(output):.6f}")
     print(f"Output std  : {jnp.std(output):.6f}")
 
-    assert output.shape == query.shape, f"Shape mismatch: {output.shape} != {query.shape}"
+    expected = xla_page_attention(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        context_lens=context_lens,
+        block_tables=block_tables,
+        attn_scale=float(attn_scale),
+    )
+    np.testing.assert_allclose(np.asarray(output), np.asarray(expected), rtol=2e-2, atol=2e-2)
     print("\n✓ Auto-split test passed!")
 
 
@@ -261,10 +285,63 @@ def test_page_attention_matches_xla_basic():
     )
 
 
+def test_page_attention_partitioned_matches_single_pass():
+    """Single- and multi-partition decoding match XLA on ragged context lengths."""
+    key = jax.random.PRNGKey(7)
+    kq, kk, kv = jax.random.split(key, 3)
+
+    num_seqs = 2
+    num_kv_heads = 2
+    q_group = 2
+    num_heads = num_kv_heads * q_group
+    head_dim = 64
+    block_size = 16
+    # 16 blocks per sequence (256 tokens) so the 200-token context fits inside its own block-table row.
+    num_blocks = 32
+
+    query = jax.random.normal(kq, (num_seqs, num_heads, head_dim), dtype=jnp.float32)
+    key_cache = jax.random.normal(kk, (num_blocks, num_kv_heads, block_size, head_dim), dtype=jnp.float32)
+    value_cache = jax.random.normal(kv, (num_blocks, num_kv_heads, block_size, head_dim), dtype=jnp.float32)
+
+    # 200 tokens: with num_splits=4 the partition size is next_pow2(50) = 64,
+    # so the final partition holds 200 - 3*64 = 8 tokens (a ragged tail).
+    context_lens = jnp.array([200, 96], dtype=jnp.int32)
+    block_tables = jnp.arange(num_blocks, dtype=jnp.int32).reshape(num_seqs, num_blocks // num_seqs)
+
+    kwargs = dict(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        context_lens=context_lens,
+        block_tables=block_tables,
+        attn_scale=None,
+        max_context_len=None,
+    )
+
+    out_single = jax.block_until_ready(page_attention(**kwargs, num_splits=1))
+    out_multi = jax.block_until_ready(page_attention(**kwargs, num_splits=4))
+    out_xla = jax.block_until_ready(xla_page_attention(**kwargs))
+
+    for output in (out_single, out_multi):
+        np.testing.assert_allclose(
+            np.asarray(output, dtype=np.float32),
+            np.asarray(out_xla, dtype=np.float32),
+            rtol=2e-2,
+            atol=2e-2,
+        )
+    np.testing.assert_allclose(
+        np.asarray(out_single, dtype=np.float32),
+        np.asarray(out_multi, dtype=np.float32),
+        rtol=1e-4,
+        atol=1e-5,
+    )
+
+
 if __name__ == "__main__":
     test_page_attention_single_pass()
     test_page_attention_multi_pass()
     test_page_attention_auto_split()
+    test_page_attention_partitioned_matches_single_pass()
 
     print("\n" + "=" * 60)
     print("ALL TESTS PASSED! ✓")

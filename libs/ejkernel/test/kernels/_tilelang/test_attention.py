@@ -56,6 +56,45 @@ def test_attention_returns_real_weights():
     assert float(jnp.abs(row_sums - 1.0).max()) < 1e-2
 
 
+def test_attention_dropout_weights_match_output():
+    """The returned dropout weights must reconstruct the fused attention output."""
+    batch, seq_len, heads, head_dim = 2, 8, 2, 32
+    ks = jax.random.split(jax.random.PRNGKey(_SEED + 71), 3)
+    shape = (batch, seq_len, heads, head_dim)
+    q, k, v = (_randn(ks[0], shape), _randn(ks[1], shape), _randn(ks[2], shape, scale=1.0))
+    output, weights = _tl("attention")(
+        q, k, v, causal=False, deterministic=False, dropout_rng=jax.random.PRNGKey(17), dropout_prob=0.35
+    )
+    reconstructed = jnp.einsum("bhqk,bkhd->bqhd", weights.astype(jnp.float32), v.astype(jnp.float32))
+    assert _max_abs(output, reconstructed) < 4e-2
+
+
+def test_attention_dropout_keep_rate_and_seed_dependence():
+    """Dropout zeroes ~``dropout_prob`` of the weights, scales survivors, and varies with the seed."""
+    batch, seq_len, heads, head_dim = 2, 64, 2, 32
+    dropout_prob = 0.3
+    ks = jax.random.split(jax.random.PRNGKey(_SEED + 91), 3)
+    shape = (batch, seq_len, heads, head_dim)
+    q, k, v = (_randn(ks[0], shape), _randn(ks[1], shape), _randn(ks[2], shape))
+    attention = _tl("attention")
+    _, w_a = attention(
+        q, k, v, causal=False, deterministic=False, dropout_rng=jax.random.PRNGKey(1), dropout_prob=dropout_prob
+    )
+    _, w_b = attention(
+        q, k, v, causal=False, deterministic=False, dropout_rng=jax.random.PRNGKey(2), dropout_prob=dropout_prob
+    )
+    _, w_ref = attention(q, k, v, causal=False)
+
+    dropped_a = jnp.asarray(w_a.astype(jnp.float32) == 0.0)
+    keep_rate = float(1.0 - dropped_a.mean())
+    # A wrapped/negative hash would drop everything or nothing; ~N(0.7, 0.004) over 16k entries.
+    assert abs(keep_rate - (1.0 - dropout_prob)) < 0.03
+    kept = w_a.astype(jnp.float32)[~dropped_a]
+    expected = (w_ref.astype(jnp.float32) / (1.0 - dropout_prob))[~dropped_a]
+    assert _max_abs(kept, expected) < 1e-2
+    assert bool(jnp.any(w_a != w_b))  # different seeds give different masks
+
+
 def test_attention_weights_bwd():
     """Gradients through the returned dense weights use native dQ/dK kernels."""
     B, N, H, HK, D = 1, 16, 2, 1, 16

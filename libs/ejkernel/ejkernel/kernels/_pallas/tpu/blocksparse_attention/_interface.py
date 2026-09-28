@@ -40,7 +40,7 @@ def blocksparse_attention(
     kv_segment_ids: Int[Array, "batch kv_len"] | None = None,
     q_positions: Int[Array, "batch seq_len"] | None = None,
     kv_positions: Int[Array, "batch kv_len"] | None = None,
-    softmax_aux: Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "..."] | None = None,
     bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
     attention_mask: (
         Bool[Array, "batch num_heads_or_1 seq_len kv_len"] | Int[Array, "batch num_heads_or_1 seq_len kv_len"] | None
@@ -79,9 +79,13 @@ def blocksparse_attention(
             Accepted but currently unused on TPU.
         kv_positions: Optional ``[batch, kv_len]`` position indices.
             Accepted but currently unused on TPU.
-        softmax_aux: Optional ``[num_sinks]`` float array of attention-sink
-            log-values (StreamingLLM-style).  When provided, these values are
-            incorporated into the running online-softmax max and denominator.
+        softmax_aux: Optional float array of attention-sink logits
+            (StreamingLLM-style). Accepted layouts: 1-D of length ``num_heads``
+            (per query head), any other 1-D length (shared), 2-D ``(num_heads, S)``
+            (per query head), ``(kv_num_heads, S)`` (per KV head) or ``(1, S)``
+            (shared). They are reduced exactly to one logit per query head via
+            ``logsumexp`` before the kernel, then folded into the running
+            online-softmax max and denominator.
         bias: Optional additive bias of shape
             ``[batch, num_heads, seq_len, kv_len]``.  Added to attention
             logits before softmax.

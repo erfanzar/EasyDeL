@@ -42,6 +42,7 @@ from jaxtyping import Array, ArrayLike, Bool, Float, Int
 
 from ejkernel.callib import ejit
 from ejkernel.kernels._registry import Backend, Platform, kernel_registry
+from ejkernel.kernels._sinks import reduce_sinks_to_per_head
 from ejkernel.ops import BwdParams, FwdParams
 
 from ._cuda_impl import blocksparse_attention_cuda
@@ -803,7 +804,7 @@ def blocksparse_attention(
     kv_segment_ids: Int[Array, "batch kv_len"] | None = None,
     q_positions: Int[Array, "batch seq_len"] | None = None,
     kv_positions: Int[Array, "batch kv_len"] | None = None,
-    softmax_aux: Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "..."] | None = None,
     bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
     attention_mask: (
         Bool[Array, "batch num_heads_or_1 seq_len kv_len"] | Int[Array, "batch num_heads_or_1 seq_len kv_len"] | None
@@ -954,6 +955,10 @@ def blocksparse_attention(
             window_right=window_right,
         )
 
+    if softmax_aux is not None:
+        softmax_aux = reduce_sinks_to_per_head(softmax_aux, num_q_heads=query.shape[1], num_kv_heads=key.shape[1])[
+            :, None
+        ]
     return _blocksparse_attention_bhtd(
         query=query,
         key=key,

@@ -41,6 +41,7 @@ from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
 
 from ejkernel.callib import triton_call
+from ejkernel.kernels._xla.attention._xla_impl_fwd import _normalize_softmax_aux
 from ejkernel.ops import BwdParams, FwdParams
 from ejkernel.utils import dtype_index, get_sharding, get_strides
 
@@ -114,7 +115,7 @@ def _attn_bwd_preprocess(
     o = tl.load(o_ptrs, mask=mask, other=0.0).to(tl.float32)
     do = tl.load(do_ptrs, mask=mask, other=0.0).to(tl.float32)
     delta = tl.sum(o * do, axis=1)
-    tl.store(Delta + off_zh * max_seqlen_q_rounded + offs_m, delta)
+    tl.store(Delta + off_zh * max_seqlen_q_rounded + offs_m, delta, mask=offs_m < max_seqlen_q_rounded)
 
 
 @triton.jit
@@ -232,7 +233,7 @@ def _attn_bwd_dkdv(
             LA1=actual_seqlen_k,
         )
 
-    qk = tl.dot(q, tl.trans(k)).to(tl.float32)
+    qk = tl.dot(q, tl.trans(k), out_dtype=tl.float32)
 
     if BIAS_ON:
         if BOOL_BIAS:
@@ -285,8 +286,10 @@ def _attn_bwd_dkdv(
     if SOFTCAP:
         s = qk * softmax_scale
         x = s / logits_soft_cap
-        exp_2x = tl.exp(2.0 * x)
-        tanh_x = (exp_2x - 1.0) / (exp_2x + 1.0)
+        # Overflow-free tanh, identical to the forward recompute (r12 S05-1).
+        exp_neg = tl.exp(-2.0 * tl.abs(x))
+        tanh_abs = (1.0 - exp_neg) / (1.0 + exp_neg)
+        tanh_x = tl.where(x >= 0, tanh_abs, -tanh_abs)
 
         qk_after = (logits_soft_cap * tanh_x) * LN2
 
@@ -620,7 +623,7 @@ def _attn_bwd_dq(
             bias_ptrs, offs_m, offs_n_curr, PA0=True, PA1=PAD_COLS, LA0=actual_seqlen_q, LA1=actual_seqlen_k
         )
 
-    qk = tl.dot(q, tl.trans(k))
+    qk = tl.dot(q, tl.trans(k), out_dtype=tl.float32)
 
     if BIAS_ON:
         if BOOL_BIAS:
@@ -673,8 +676,10 @@ def _attn_bwd_dq(
     if SOFTCAP:
         s = qk * softmax_scale
         x = s / logits_soft_cap
-        exp_2x = tl.exp(2.0 * x)
-        tanh_x = (exp_2x - 1.0) / (exp_2x + 1.0)
+        # Overflow-free tanh, identical to the forward recompute (r12 S05-1).
+        exp_neg = tl.exp(-2.0 * tl.abs(x))
+        tanh_abs = (1.0 - exp_neg) / (1.0 + exp_neg)
+        tanh_x = tl.where(x >= 0, tanh_abs, -tanh_abs)
 
         qk_after = (logits_soft_cap * tanh_x) * LN2
 
@@ -1161,6 +1166,79 @@ def _attn_bwd(
         )
 
 
+_LOG2E = 1.44269504089  # the forward kernel's ``LN2`` constant (log2 e)
+
+
+def _softmax_aux_gradient(
+    dO: Float[Array, "batch seq_len_q num_heads head_dim"],
+    o: Float[Array, "batch seq_len_q num_heads head_dim"],
+    M: Float[Array, "batch num_heads max_seqlen_q_rounded"],
+    softmax_aux: Float[Array, "..."],
+    *,
+    num_q_heads: int,
+    num_kv_heads: int,
+    q_dtype: jnp.dtype,
+    logits_soft_cap: float | None = None,
+    cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
+) -> Float[Array, "..."] | None:
+    """Gradient of the loss with respect to the attention-sink logits.
+
+    The sink joins the softmax denominator but carries no value, so with the
+    forward's log-sum-exp ``lse`` (log2 units, sinks included) its probability for
+    query row ``i`` is ``P_sink = exp2(sink * log2(e) - lse_i)`` and
+    ``d out_i / d sink = -P_sink * out_i``. Hence
+    ``d loss / d sink = -sum_i P_sink_i * (dO_i . O_i)``, summed over batch and
+    query rows. This is the same quantity the XLA path gets from autodiff.
+
+    Args:
+        dO: Cotangent of the attention output.
+        o: Attention output saved by the forward pass.
+        M: Forward log-sum-exp buffer (log2 units, row stride ``max_seqlen_q_rounded``).
+        softmax_aux: Sink logits exactly as passed to the forward (any accepted shape).
+        num_q_heads: Number of query heads.
+        num_kv_heads: Number of key/value heads.
+        q_dtype: Query dtype; the forward normalizes the sinks in this dtype.
+        logits_soft_cap: Soft cap applied to the sinks in the forward, if any.
+        cum_seqlens_q: Cumulative query lengths for the varlen path; rows past each
+            sequence length are excluded.
+
+    Returns:
+        Gradient with the shape and dtype of ``softmax_aux``, or ``None`` when the
+        sinks are not floating point.
+    """
+    if not jnp.issubdtype(softmax_aux.dtype, jnp.floating):
+        return None
+    if softmax_aux.size == 0:
+        return jnp.zeros_like(softmax_aux)
+
+    seq_q = dO.shape[1]
+
+    def sink_logits(aux):
+        logits = _normalize_softmax_aux(aux, num_q_heads=num_q_heads, num_kv_heads=num_kv_heads, dtype=q_dtype)
+        logits = logits.reshape(num_q_heads, -1).astype(jnp.float32)
+        if logits_soft_cap is not None:
+            cap = float(logits_soft_cap)
+            logits = cap * jnp.tanh(jnp.clip(logits / cap, -8.0, 8.0))
+        return logits
+
+    logits, pullback = jax.vjp(sink_logits, softmax_aux)
+    delta = jnp.sum(o.astype(jnp.float32) * dO.astype(jnp.float32), axis=-1).transpose(0, 2, 1)
+    lse = M[:, :, :seq_q].astype(jnp.float32)
+    if cum_seqlens_q is not None:
+        lengths = cum_seqlens_q[1:] - cum_seqlens_q[:-1]
+        valid = (jnp.arange(seq_q)[None, :] < lengths[:, None])[:, None, :]
+        delta = jnp.where(valid, delta, 0.0)
+        lse = jnp.where(valid, lse, 0.0)
+    # ``lse`` includes the sink, so a true sink probability is <= 1 and clamping the exponent at 0 is
+    # exact. Rows the forward wrote as zero output with ``lse = 0`` (fully masked causal tiles, padded
+    # varlen rows) would otherwise overflow exp2 and give inf * 0 = NaN (r13 S05-1); clamped they are
+    # bounded and multiply ``delta == 0``.
+    p_sink = jnp.exp2(jnp.minimum(logits[None, :, None, :] * _LOG2E - lse[..., None], 0.0))
+    d_logits = -jnp.sum(p_sink * delta[..., None], axis=(0, 2))
+    (d_aux,) = pullback(d_logits)
+    return d_aux
+
+
 def _bwd_attention_kernel_call(
     dO: Float[Array, "batch seq_len_q num_heads head_dim"],
     q: Float[Array, "batch seq_len_q num_heads head_dim"],
@@ -1217,6 +1295,14 @@ def _bwd_attention_kernel_call(
     num_warps = int(bwd_params.num_warps or 4)
     num_stages = int(bwd_params.num_stages or 0)
 
+    # The backward reads M and Delta without masks for every row up to
+    # cdiv(QSeq, block_m) * block_m, and uses M.shape[-1] as the row stride. The
+    # forward chose that stride from its own block size, so widen it here when the
+    # backward block would read past it. Pad rows are finite (0) and masked out.
+    rows_needed = math.ceil(q.shape[1] / block_m) * block_m
+    if M.shape[-1] < rows_needed:
+        M = jnp.pad(M, ((0, 0), (0, 0), (0, rows_needed - M.shape[-1])))
+
     if sliding_window is None:
         window_left = 0
         window_right = 0
@@ -1240,6 +1326,10 @@ def _bwd_attention_kernel_call(
         logits_soft_cap_val = float(logits_soft_cap)
         softcap_flag = True
 
+    # Empty sinks have no denominator contribution; avoid an empty Triton
+    # buffer and take the same path as a missing sink tensor.
+    if softmax_aux is not None and softmax_aux.size == 0:
+        softmax_aux = None
     if softmax_aux is None:
         use_sinks = False
         num_sinks_val = 0
@@ -1247,21 +1337,19 @@ def _bwd_attention_kernel_call(
     else:
         use_sinks = True
 
-        if softmax_aux.ndim == 1:
-            num_sinks_val = softmax_aux.shape[0]
-            num_heads = q.shape[2]
-            softmax_aux_tensor = jnp.broadcast_to(softmax_aux[None, :], (num_heads, num_sinks_val))
-        elif softmax_aux.ndim == 2:
-            num_sinks_val = softmax_aux.shape[1]
-            softmax_aux_tensor = softmax_aux
-        else:
-            raise ValueError(f"softmax_aux must be 1D or 2D, got shape {softmax_aux.shape}")
+        softmax_aux_tensor = _normalize_softmax_aux(
+            softmax_aux, num_q_heads=q.shape[2], num_kv_heads=k.shape[2], dtype=q.dtype
+        ).reshape(q.shape[2], -1)
+        num_sinks_val = softmax_aux_tensor.shape[-1]
+        if num_sinks_val > 16:
+            raise ValueError(f"Triton flash attention supports at most 16 attention sinks, got {num_sinks_val}")
 
-        head_dim = q.shape[-1]
-        softmax_scale = 1.0 / math.sqrt(float(head_dim)) if softmax_scale is None else softmax_scale
-        softmax_aux_tensor = softmax_aux_tensor * softmax_scale
+        # The forward kernel uses the raw sink logits (soft-capped, never scaled by
+        # softmax_scale); keep the backward buffer identical so the two agree.
         if softcap_flag:
-            softmax_aux_tensor = logits_soft_cap_val * jnp.tanh(softmax_aux_tensor / logits_soft_cap_val)
+            softmax_aux_tensor = logits_soft_cap_val * jnp.tanh(
+                jnp.clip(softmax_aux_tensor / logits_soft_cap_val, -8.0, 8.0)
+            )
 
     use_segments = (q_segment_ids is not None) or (kv_segment_ids is not None)
     if use_segments:
@@ -1298,7 +1386,7 @@ def _bwd_attention_kernel_call(
 
         max_seqlen_q = QSeq_max
         max_seqlen_k = KSeq_max
-        max_seqlen_q_rounded = math.ceil(max_seqlen_q / 128) * 128
+        max_seqlen_q_rounded = M.shape[-1]
         BLOCK_HEADDIM = max(triton.next_power_of_2(head_dim), 16)
 
         from ._utilities import attention_pack_from_cu_static, attention_unpack_with_static_shape
@@ -1314,6 +1402,10 @@ def _bwd_attention_kernel_call(
         qz, qm, qh, _ = get_strides(q_p)
         kz, kn, kh, _ = get_strides(k_p)
         vz, vn, vh, _ = get_strides(v_p)
+        # dk/dv outputs carry the expanded query-head count, so they use the
+        # expanded-head layout strides, not the packed k/v strides.
+        dkz, dkn, dkh, _ = get_strides((*k_p.shape[:2], q_p.shape[2], k_p.shape[3]))
+        dvz, dvn, dvh, _ = get_strides((*v_p.shape[:2], q_p.shape[2], v_p.shape[3]))
 
         (delta,) = triton_call(
             o_p,
@@ -1379,12 +1471,12 @@ def _bwd_attention_kernel_call(
             qz,
             qm,
             qh,
-            kz,
-            kn,
-            kh,
-            vz,
-            vn,
-            vh,
+            dkz,
+            dkn,
+            dkh,
+            dvz,
+            dvn,
+            dvh,
             nheads_q,
             num_repeats,
             window_left,
@@ -1457,7 +1549,7 @@ def _bwd_attention_kernel_call(
 
     batch_size, QSeq, nheads_q, head_dim = q.shape
     _, KSeq, nheads_kv, _ = k.shape
-    max_seqlen_q_rounded = math.ceil(QSeq / 128) * 128
+    max_seqlen_q_rounded = M.shape[-1]
     softmax_scale = 1.0 / math.sqrt(head_dim) if softmax_scale is None else softmax_scale
     assert nheads_q % nheads_kv == 0
     assert M.shape == (batch_size, nheads_q, max_seqlen_q_rounded)
@@ -1498,6 +1590,10 @@ def _bwd_attention_kernel_call(
     qz, qm, qh, _ = get_strides(q)
     kz, kn, kh, _ = get_strides(k)
     vz, vn, vh, _ = get_strides(v)
+    # dk/dv outputs carry the expanded query-head count, so they use the
+    # expanded-head layout strides, not the k/v strides.
+    dkz, dkn, dkh, _ = get_strides((k.shape[0], k.shape[1], q.shape[2], k.shape[3]))
+    dvz, dvn, dvh, _ = get_strides((v.shape[0], v.shape[1], q.shape[2], v.shape[3]))
 
     (delta,) = triton_call(
         o,
@@ -1561,12 +1657,12 @@ def _bwd_attention_kernel_call(
         qz,
         qm,
         qh,
-        kz,
-        kn,
-        kh,
-        vz,
-        vn,
-        vh,
+        dkz,
+        dkn,
+        dkh,
+        dvz,
+        dvn,
+        dvh,
         nheads_q,
         num_repeats,
         window_left,

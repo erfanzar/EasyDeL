@@ -593,8 +593,11 @@ def _operate(
     if can_fuse:
         biases = None
         if mode == "affine":
-            safe_scale = jnp.where(scales == 0, jnp.ones_like(scales), scales)
-            biases = -zeros * safe_scale
+            # Additive form ``q * scale + bias`` with ``bias = -zero * scale``
+            # must use the stored scale verbatim: substituting 1 for a zero
+            # scale would decode the group as ``-zero`` instead of the correct
+            # ``(q - zero) * 0 == 0``, diverging from the dense fallback.
+            biases = -zeros * scales
         try:
             return _blocked_quantized_matmul(
                 x,

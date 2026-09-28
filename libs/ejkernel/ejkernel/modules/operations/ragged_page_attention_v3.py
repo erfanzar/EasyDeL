@@ -75,7 +75,7 @@ from ejkernel.kernels._pallas.tpu.ragged_page_attention_v3._utils import (
     get_tuned_block_sizes,
     get_tuned_block_sizes_h64,
 )
-from ejkernel.kernels._registry import Backend, kernel_registry
+from ejkernel.kernels._registry import Backend, Platform, kernel_registry
 from ejkernel.ops import (
     AutotunePolicy,
     ConfigCache,
@@ -407,6 +407,8 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
         k_scale: float | None = None,
         v_scale: float | None = None,
         vmem_limit_bytes: int | None = None,
+        chunk_size: int | None = None,
+        alibi_slopes: Float[Array, "num_q_heads"] | None = None,
         platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         cfg: RaggedPageAttentionv3Config | None = None,
         mesh: Mesh | None = None,
@@ -488,7 +490,8 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
             block_tables: Int32[Array, "max_num_seqs_times_pages_per_seq"],
             query_start_loc: Int32[Array, "max_num_seqs_plus_1"],
             distribution: Int32[Array, "3"],
-            softmax_aux: Float[Array, "num_q_heads"] | None,
+            softmax_aux: Float[Array, "..."] | None,
+            alibi: Float[Array, "num_q_heads"] | None = None,
         ) -> tuple[
             Float[Array, "total_tokens num_q_heads head_dim"],
             Float[Array, "num_pages page_size num_kv_heads_x2_per_kv_packing kv_packing head_dim_padded"],
@@ -511,6 +514,8 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
                 k_scale=k_scale,
                 v_scale=v_scale,
                 vmem_limit_bytes=vmem_limit_bytes,
+                chunk_size=chunk_size,
+                alibi_slopes=alibi,
                 platform=platform,
                 cfg=cfg,
             )
@@ -526,6 +531,10 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
             distribution,
             softmax_aux,
         )
+        if alibi_slopes is not None:
+            # Optional 10th operand: only present when ALiBi is requested, so the
+            # 9-entry ``in_specs`` contract of existing callers is unchanged.
+            call_args = (*call_args, alibi_slopes)
         assert len(in_specs) == len(call_args), f"in_specs length {len(in_specs)} != call_args length {len(call_args)}"
         shard_map_fn = shard_map(
             _wrapped_ragged_page_attn,
@@ -570,6 +579,8 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
         k_scale: float | None = None,
         v_scale: float | None = None,
         vmem_limit_bytes: int | None = None,
+        chunk_size: int | None = None,
+        alibi_slopes: Float[Array, "num_q_heads"] | None = None,
         *,
         platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         cfg: RaggedPageAttentionv3Config,
@@ -676,7 +687,25 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
                 platform=platform,
                 backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
+        if chunk_size is not None or alibi_slopes is not None:
+            # Only the XLA and Pallas TPU implementations implement chunked-local masking and
+            # ALiBi; GPU backends (CUDA/Triton/TileLang) route such calls to XLA instead of failing.
+            resolved = detect_platform("ragged_page_attention_v3", cfg.platform, prefer_cuda=True)
+            if resolved not in (Platform.PALLAS, Platform.XLA):
+                cfg = RaggedPageAttentionv3Config(
+                    num_kv_pages_per_block=cfg.num_kv_pages_per_block,
+                    num_queries_per_block=cfg.num_queries_per_block,
+                    num_warps=cfg.num_warps,
+                    num_stages=cfg.num_stages,
+                    platform="xla",
+                    backend=Backend.ANY,
+                )
         impl = self.get_impl(cfg)
+        extra_kwargs = {}
+        if chunk_size is not None:
+            extra_kwargs["chunk_size"] = chunk_size
+        if alibi_slopes is not None:
+            extra_kwargs["alibi_slopes"] = alibi_slopes
         return impl(
             queries=queries,
             keys=keys,
@@ -697,6 +726,7 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
             chunk_prefill_size=cfg.chunk_prefill_size,
             num_kv_pages_per_block=cfg.num_kv_pages_per_block,
             num_queries_per_block=cfg.num_queries_per_block,
+            **extra_kwargs,
         )
 
     def _extract_workload(self, inv: Invocation[RaggedPageAttentionv3Config, Array]) -> _RPAWorkload | None:
@@ -1146,6 +1176,8 @@ def ragged_page_attention_v3(
     k_scale: float | None = None,
     v_scale: float | None = None,
     vmem_limit_bytes: int | None = None,
+    chunk_size: int | None = None,
+    alibi_slopes: Float[Array, "num_q_heads"] | None = None,
     platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
     cfg: RaggedPageAttentionv3Config | None = None,
     mesh: Mesh | None = None,
@@ -1216,6 +1248,12 @@ def ragged_page_attention_v3(
         vmem_limit_bytes: Memory limit for vector memory in bytes (TPU-specific).
             Controls VMEM usage on TPU accelerators, particularly important for
             large head dimensions (e.g., 256).
+        chunk_size: Optional chunked-local-attention size ``C`` (Llama4). A query at
+            position ``q`` attends key ``k`` only if ``k <= q`` and ``k // C == q // C``.
+            Supported by the XLA and Pallas TPU implementations.
+        alibi_slopes: Optional per-query-head ALiBi slopes ``[num_q_heads]``; adds
+            ``slope_h * key_position`` to the scaled logits. When set together with
+            shard_map, ``in_specs`` needs a 10th entry for this operand.
         platform: Target platform for kernel execution.
             One of "triton" (GPU), "pallas" (TPU), "cuda" (GPU), "xla" (fallback),
             or "auto" (automatic detection). If None, uses platform from cfg or
@@ -1335,6 +1373,8 @@ def ragged_page_attention_v3(
         k_scale=k_scale,
         v_scale=v_scale,
         vmem_limit_bytes=vmem_limit_bytes,
+        chunk_size=chunk_size,
+        alibi_slopes=alibi_slopes,
         platform=platform,
         method=method,
         mesh=mesh,

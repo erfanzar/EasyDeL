@@ -205,6 +205,49 @@ def _normalize_attention_mask(
     return (mask != 0).astype(jnp.int32)
 
 
+def expand_sinks_per_head(softmax_aux: jax.Array, *, q_heads: int, kv_heads: int) -> jax.Array:
+    """Expand any supported attention-sink layout to a per-query-head ``(q_heads, S)`` array.
+
+    The CuTe kernels soft-cap every sink logit individually, so sinks are expanded
+    (not reduced with ``logsumexp``) to keep soft-capped results exact.
+
+    Layout convention:
+        * 1-D of length ``q_heads``: one sink per query head.
+        * any other 1-D length ``S``: ``S`` sinks shared by all heads.
+        * 2-D ``(q_heads, S)``: per query head; ``(kv_heads, S)``: per KV head
+          (repeated over its query group); ``(1, S)``: shared.
+
+    Args:
+        softmax_aux: Sink logits, rank 1 or 2.
+        q_heads: Query head count.
+        kv_heads: KV head count.
+
+    Returns:
+        ``float32`` array of shape ``(q_heads, S)``.
+
+    Raises:
+        ValueError: If the rank is not 1 or 2 or the leading dim of a 2-D layout
+            is not 1, ``kv_heads`` or ``q_heads``.
+    """
+    aux = jnp.asarray(softmax_aux, dtype=jnp.float32)
+    if aux.ndim == 1:
+        if aux.shape[0] == q_heads:
+            return aux[:, None]
+        return jnp.broadcast_to(aux[None, :], (q_heads, aux.shape[0]))
+    if aux.ndim != 2:
+        raise ValueError(f"softmax_aux must be rank-1 or rank-2, got shape {aux.shape}.")
+    rows = aux.shape[0]
+    if rows == q_heads:
+        return aux
+    if rows == 1:
+        return jnp.broadcast_to(aux, (q_heads, aux.shape[1]))
+    if rows == kv_heads and q_heads % kv_heads == 0:
+        return jnp.repeat(aux, q_heads // kv_heads, axis=0)
+    raise ValueError(
+        f"softmax_aux first dim must be 1, kv_heads ({kv_heads}) or q_heads ({q_heads}); got shape {aux.shape}."
+    )
+
+
 def _flash_call_name(
     *,
     prefix: str,
@@ -395,10 +438,10 @@ def _build_flash_host_fns(
                         l_i = l_new
 
                 if use_sinks and l_i > cutlass.Float32(0.0):
-                    num_sinks = cutlass.Int32(softmax_aux.shape[0])
+                    num_sinks = cutlass.Int32(softmax_aux.shape[1])
                     sink_max = cutlass.Float32(-1.0e30)
                     for sink_i in cutlass.range(0, num_sinks):
-                        sink_score = cutlass.Float32(softmax_aux[(sink_i,)])
+                        sink_score = cutlass.Float32(softmax_aux[(hidx, sink_i)])
                         if use_soft_cap:
                             cap = cutlass.Float32(soft_cap_value)
                             sink_score = cap * cute.math.tanh(sink_score / cap)
@@ -408,7 +451,7 @@ def _build_flash_host_fns(
                     z_k = l_i * cute.math.exp(m_i - m_total)
                     z_sink = cutlass.Float32(0.0)
                     for sink_i in cutlass.range(0, num_sinks):
-                        sink_score = cutlass.Float32(softmax_aux[(sink_i,)])
+                        sink_score = cutlass.Float32(softmax_aux[(hidx, sink_i)])
                         if use_soft_cap:
                             cap = cutlass.Float32(soft_cap_value)
                             sink_score = cap * cute.math.tanh(sink_score / cap)
@@ -559,7 +602,7 @@ def _get_cute_flash_calls(
             dummy_mask = jnp.ones((1, 1, 1, 1), dtype=jnp.int32)
         dummy_softmax_aux = softmax_aux_arr
         if dummy_softmax_aux is None:
-            dummy_softmax_aux = jnp.zeros((1,), dtype=jnp.float32)
+            dummy_softmax_aux = jnp.zeros((1, 1), dtype=jnp.float32)
         return cute_call(
             query_arr,
             key_arr,
@@ -695,17 +738,17 @@ def _build_flash_bwd_host_fns(
                     m_total = max_score
                     sink_lse = cutlass.Float32(0.0)
                     if use_sinks:
-                        num_sinks = cutlass.Int32(softmax_aux.shape[0])
+                        num_sinks = cutlass.Int32(softmax_aux.shape[1])
                         sink_max = cutlass.Float32(-1.0e30)
                         for sink_i in cutlass.range(0, num_sinks):
-                            sink_score = cutlass.Float32(softmax_aux[(sink_i,)])
+                            sink_score = cutlass.Float32(softmax_aux[(hidx, sink_i)])
                             if use_soft_cap:
                                 cap = cutlass.Float32(soft_cap_value)
                                 sink_score = cap * cute.math.tanh(sink_score / cap)
                             sink_max = cutlass.max(sink_max, sink_score)
                         m_total = cutlass.max(m_total, sink_max)
                         for sink_i in cutlass.range(0, num_sinks):
-                            sink_score = cutlass.Float32(softmax_aux[(sink_i,)])
+                            sink_score = cutlass.Float32(softmax_aux[(hidx, sink_i)])
                             if use_soft_cap:
                                 cap = cutlass.Float32(soft_cap_value)
                                 sink_score = cap * cute.math.tanh(sink_score / cap)
@@ -868,17 +911,17 @@ def _build_flash_bwd_host_fns(
                                 m_total = max_score
                                 sink_lse = cutlass.Float32(0.0)
                                 if use_sinks:
-                                    num_sinks = cutlass.Int32(softmax_aux.shape[0])
+                                    num_sinks = cutlass.Int32(softmax_aux.shape[1])
                                     sink_max = cutlass.Float32(-1.0e30)
                                     for sink_i in cutlass.range(0, num_sinks):
-                                        sink_score = cutlass.Float32(softmax_aux[(sink_i,)])
+                                        sink_score = cutlass.Float32(softmax_aux[(hidx, sink_i)])
                                         if use_soft_cap:
                                             cap = cutlass.Float32(soft_cap_value)
                                             sink_score = cap * cute.math.tanh(sink_score / cap)
                                         sink_max = cutlass.max(sink_max, sink_score)
                                     m_total = cutlass.max(m_total, sink_max)
                                     for sink_i in cutlass.range(0, num_sinks):
-                                        sink_score = cutlass.Float32(softmax_aux[(sink_i,)])
+                                        sink_score = cutlass.Float32(softmax_aux[(hidx, sink_i)])
                                         if use_soft_cap:
                                             cap = cutlass.Float32(soft_cap_value)
                                             sink_score = cap * cute.math.tanh(sink_score / cap)
@@ -1047,17 +1090,17 @@ def _build_flash_bwd_host_fns(
                                 m_total = max_score
                                 sink_lse = cutlass.Float32(0.0)
                                 if use_sinks:
-                                    num_sinks = cutlass.Int32(softmax_aux.shape[0])
+                                    num_sinks = cutlass.Int32(softmax_aux.shape[1])
                                     sink_max = cutlass.Float32(-1.0e30)
                                     for sink_i in cutlass.range(0, num_sinks):
-                                        sink_score = cutlass.Float32(softmax_aux[(sink_i,)])
+                                        sink_score = cutlass.Float32(softmax_aux[(hidx, sink_i)])
                                         if use_soft_cap:
                                             cap = cutlass.Float32(soft_cap_value)
                                             sink_score = cap * cute.math.tanh(sink_score / cap)
                                         sink_max = cutlass.max(sink_max, sink_score)
                                     m_total = cutlass.max(m_total, sink_max)
                                     for sink_i in cutlass.range(0, num_sinks):
-                                        sink_score = cutlass.Float32(softmax_aux[(sink_i,)])
+                                        sink_score = cutlass.Float32(softmax_aux[(hidx, sink_i)])
                                         if use_soft_cap:
                                             cap = cutlass.Float32(soft_cap_value)
                                             sink_score = cap * cute.math.tanh(sink_score / cap)
@@ -1250,7 +1293,7 @@ def _get_cute_flash_bwd_calls(
             dummy_mask = jnp.ones((1, 1, 1, 1), dtype=jnp.int32)
         dummy_softmax_aux = softmax_aux_arr
         if dummy_softmax_aux is None:
-            dummy_softmax_aux = jnp.zeros((1,), dtype=jnp.float32)
+            dummy_softmax_aux = jnp.zeros((1, 1), dtype=jnp.float32)
         return cute_call(
             query_arr,
             key_arr,
@@ -1413,9 +1456,7 @@ def flash_attention_cute_forward(
         bias_arr = None
 
     if softmax_aux is not None:
-        softmax_aux_arr = jnp.asarray(softmax_aux, dtype=jnp.float32)
-        if softmax_aux_arr.ndim != 1:
-            raise ValueError(f"softmax_aux must be rank-1 [num_sinks], got shape {softmax_aux_arr.shape}.")
+        softmax_aux_arr = expand_sinks_per_head(softmax_aux, q_heads=q_heads, kv_heads=kv_heads)
     else:
         softmax_aux_arr = None
 
@@ -1521,9 +1562,7 @@ def flash_attention_cute_backward(
         bias_arr = None
 
     if softmax_aux is not None:
-        softmax_aux_arr = jnp.asarray(softmax_aux, dtype=jnp.float32)
-        if softmax_aux_arr.ndim != 1:
-            raise ValueError(f"softmax_aux must be rank-1 [num_sinks], got shape {softmax_aux_arr.shape}.")
+        softmax_aux_arr = expand_sinks_per_head(softmax_aux, q_heads=q_heads, kv_heads=kv_heads)
     else:
         softmax_aux_arr = None
 

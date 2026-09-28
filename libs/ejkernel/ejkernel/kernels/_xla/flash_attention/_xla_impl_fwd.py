@@ -51,6 +51,8 @@ import jax.lax as lax
 from jax import numpy as jnp
 from jaxtyping import DTypeLike, PRNGKeyArray
 
+from ejkernel.kernels._xla.attention._xla_impl_fwd import _normalize_softmax_aux
+
 
 def _maybe_broadcast_kv_to_q_heads(k: chex.Array, v: chex.Array, hq: int) -> tuple[chex.Array, chex.Array]:
     """Broadcast KV heads to match query heads for GQA/MQA support.
@@ -123,8 +125,7 @@ def _apply_logits_transforms(
 
     if mask is not None:
         mask = mask.astype(bool)
-        mask_value = jnp.finfo(logits.dtype).min
-        logits = jnp.where(mask, logits, mask_value)
+        logits = jnp.where(mask, logits, -jnp.inf)
 
     logits = logits.astype(jnp.promote_types(logits.dtype, jnp.float32))
     return logits
@@ -260,14 +261,13 @@ def _attend_chunk(
     precision: lax.PrecisionLike,
     dropout_prob: float = 0.0,
     dropout_key: PRNGKeyArray | None = None,
-    softmax_aux: chex.Array | None = None,
 ) -> tuple[chex.Array, chex.Array, chex.Array, PRNGKeyArray | None]:
     """Process a single KV chunk against a query chunk using online softmax.
 
     Computes attention scores between a query chunk and a KV chunk,
     applies all logits transforms (scaling, bias, soft cap, masking),
     and updates the running online softmax accumulators (output, max,
-    denominator). Optionally incorporates attention sinks and dropout.
+    denominator). Optionally incorporates dropout.
 
     The online softmax maintains running statistics across KV chunks
     to avoid materializing the full attention matrix:
@@ -292,7 +292,6 @@ def _attend_chunk(
         precision: JAX precision for matrix multiplications.
         dropout_prob: Dropout probability for attention weights.
         dropout_key: Optional PRNG key for dropout.
-        softmax_aux: Optional attention sink logits.
 
     Returns:
         Tuple of (accum, x_max, denom, next_dropout_key) with updated
@@ -321,37 +320,15 @@ def _attend_chunk(
         logits_dtype=logits_dtype,
     )
 
-    if softmax_aux is not None:
-        if softmax_aux.ndim == 1:
-            sinks = softmax_aux.reshape(1, 1, 1, -1)
-        elif softmax_aux.ndim == 2:
-            sinks = softmax_aux.reshape(1, -1, 1, softmax_aux.shape[-1])
-        else:
-            raise ValueError(f"softmax_aux must be 1D or 2D, got shape {softmax_aux.shape}")
+    loc_x_max = jnp.max(logits, axis=-1)
+    new_x_max = jnp.maximum(x_max, loc_x_max)
+    safe_max = jnp.where(jnp.isneginf(new_x_max), 0.0, new_x_max)
+    weights = jnp.exp(logits - safe_max[..., None])
+    alpha = jnp.where(jnp.isneginf(x_max), 0.0, jnp.exp(x_max - safe_max))
 
-        B, H, q, k = logits.shape
-        sinks = jnp.broadcast_to(sinks, (B, H, q, sinks.shape[-1]))
-        combined_logits = jnp.concatenate([logits, sinks], axis=-1)
-
-        loc_x_max = jnp.max(combined_logits, axis=-1)
-        new_x_max = jnp.maximum(x_max, loc_x_max)
-        combined_weights = jnp.exp(combined_logits - new_x_max[..., None])
-        alpha = jnp.exp(x_max - new_x_max)
-
-        x_max = new_x_max
-        accum = accum * alpha.swapaxes(-1, -2)[..., None]
-        denom = (denom * alpha) + combined_weights.sum(axis=-1)
-
-        weights = combined_weights[..., :k]
-    else:
-        loc_x_max = jnp.max(logits, axis=-1)
-        new_x_max = jnp.maximum(x_max, loc_x_max)
-        weights = jnp.exp(logits - new_x_max[..., None])
-        alpha = jnp.exp(x_max - new_x_max)
-
-        x_max = new_x_max
-        accum = accum * alpha.swapaxes(-1, -2)[..., None]
-        denom = (denom * alpha) + weights.sum(axis=-1)
+    x_max = new_x_max
+    accum = accum * alpha.swapaxes(-1, -2)[..., None]
+    denom = (denom * alpha) + weights.sum(axis=-1)
 
     next_key = dropout_key
     if dropout_prob > 0.0 and dropout_key is not None:
@@ -438,6 +415,25 @@ def _flash_attention_fwd(
     if q_segment_ids is not None and kv_segment_ids is None:
         kv_segment_ids = q_segment_ids
 
+    # An empty sink list contributes no probability mass and must not enter
+    # the zero-width max reduction in init_softmax_stats.
+    if softmax_aux is not None and softmax_aux.size == 0:
+        softmax_aux = None
+
+    def init_softmax_stats(q_len):
+        """Include each sink exactly once, independently of the KV chunk size."""
+        if softmax_aux is None:
+            return (
+                jnp.full((B, Hq, q_len), -jnp.inf, dtype=jnp.float32),
+                jnp.zeros((B, Hq, q_len), dtype=jnp.float32),
+            )
+        sinks = _normalize_softmax_aux(softmax_aux, num_q_heads=Hq, num_kv_heads=Hk, dtype=jnp.float32)
+        sinks = jnp.broadcast_to(sinks.reshape(1, Hq, -1), (B, Hq, sinks.shape[-1]))
+        sink_max = jnp.max(sinks, axis=-1, keepdims=True)
+        safe_sink_max = jnp.where(jnp.isneginf(sink_max), 0.0, sink_max)
+        sink_denom = jnp.sum(jnp.exp(sinks - safe_sink_max), axis=-1, keepdims=True)
+        return jnp.broadcast_to(sink_max, (B, Hq, q_len)), jnp.broadcast_to(sink_denom, (B, Hq, q_len))
+
     S_Q = min(chunk_size_q, Tq)
     S_K = min(chunk_size_k, Tk)
 
@@ -466,8 +462,7 @@ def _flash_attention_fwd(
         q_chunk = lax.dynamic_slice_in_dim(q, q_chunk_start, q_chunk_len, axis=1)
 
         acc = jnp.zeros((B, q_chunk_len, Hq, d_out), dtype=jnp.float32)
-        x_max = jnp.full((B, Hq, q_chunk_len), -jnp.inf, dtype=jnp.float32)
-        denom = jnp.zeros((B, Hq, q_chunk_len), dtype=jnp.float32)
+        x_max, denom = init_softmax_stats(q_chunk_len)
 
         chunk_dropout_key = dropout_key_i
         if dropout_prob > 0.0 and dropout_key_i is not None:
@@ -524,7 +519,6 @@ def _flash_attention_fwd(
                 precision=precision,
                 dropout_prob=dropout_prob,
                 dropout_key=dk_,
-                softmax_aux=softmax_aux,
             )
             return (acc2, x2, d2, dk2), None
 
@@ -586,7 +580,6 @@ def _flash_attention_fwd(
                 precision=precision,
                 dropout_prob=dropout_prob,
                 dropout_key=chunk_dropout_key,
-                softmax_aux=softmax_aux,
             )
 
         acc, x_max, denom, chunk_dropout_key = lax.cond(
@@ -595,7 +588,7 @@ def _flash_attention_fwd(
             lambda: (acc, x_max, denom, chunk_dropout_key),
         )
 
-        out_chunk = acc / denom.swapaxes(-1, -2)[..., None] if normalize_output else acc
+        out_chunk = acc / jnp.where(denom > 0, denom, 1).swapaxes(-1, -2)[..., None] if normalize_output else acc
         return dropout_key_i, out_chunk.astype(q.dtype)
 
     dropout_key, full_out = lax.scan(q_step, dropout_key, jnp.arange(n_q_full))
@@ -620,8 +613,7 @@ def _flash_attention_fwd(
             q_chunk = lax.dynamic_slice_in_dim(q, q_chunk_start, q_chunk_len, axis=1)
 
             acc = jnp.zeros((B, q_chunk_len, Hq, d_out), dtype=jnp.float32)
-            x_max = jnp.full((B, Hq, q_chunk_len), -jnp.inf, dtype=jnp.float32)
-            denom = jnp.zeros((B, Hq, q_chunk_len), dtype=jnp.float32)
+            x_max, denom = init_softmax_stats(q_chunk_len)
 
             n_k_full = Tk // chunk_size_k
             k_rem = Tk % chunk_size_k
@@ -682,7 +674,6 @@ def _flash_attention_fwd(
                     precision=precision,
                     dropout_prob=dropout_prob,
                     dropout_key=dk_,
-                    softmax_aux=softmax_aux,
                 )
                 return (acc2, x2, d2, dk2), None
 
@@ -728,10 +719,9 @@ def _flash_attention_fwd(
                     precision=precision,
                     dropout_prob=dropout_prob,
                     dropout_key=chunk_dropout_key,
-                    softmax_aux=softmax_aux,
                 )
 
-            rem_out = acc / denom.swapaxes(-1, -2)[..., None] if normalize_output else acc
+            rem_out = acc / jnp.where(denom > 0, denom, 1).swapaxes(-1, -2)[..., None] if normalize_output else acc
             return rem_out.astype(q.dtype)
 
         rem_out = process_remainder()

@@ -1371,6 +1371,22 @@ def flash_attention_tilelang(
         raise ValueError(f"num_kv_heads ({num_kv_heads}) must divide num_heads ({num_heads}).")
     if not 0.0 <= float(dropout_prob) < 1.0:
         raise ValueError("dropout_prob must be in [0, 1).")
+    if q_segment_ids is not None:
+        if int(q_segment_ids.shape[-1]) != seq_len_q:
+            raise ValueError(f"q_segment_ids last dim must be seq_len_q ({seq_len_q}); got {q_segment_ids.shape}.")
+        if kv_segment_ids is None:
+            # The full-path kernels fall back to reading q_segment_ids on the KEY axis; with
+            # seq_len_k > seq_len_q that indexes past the end of the buffer, and with
+            # seq_len_k < seq_len_q it silently compares the wrong positions.
+            if seq_len_k != seq_len_q:
+                raise ValueError(
+                    "kv_segment_ids are required when seq_len_k != seq_len_q "
+                    f"({seq_len_k} != {seq_len_q}); the q_segment_ids fallback only covers packed "
+                    "layouts where both axes have equal length."
+                )
+            kv_segment_ids = q_segment_ids
+    if kv_segment_ids is not None and int(kv_segment_ids.shape[-1]) != seq_len_k:
+        raise ValueError(f"kv_segment_ids last dim must be seq_len_k ({seq_len_k}); got {kv_segment_ids.shape}.")
 
     window = _normalize_window(sliding_window)
 

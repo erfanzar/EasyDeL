@@ -60,6 +60,40 @@ def test_xla_quantized_matmul_allows_dense_fallback_by_default():
     assert bool(jnp.all(jnp.isfinite(y)))
 
 
+def test_affine_zero_scale_block_matches_dense_decode():
+    """A zero-scale group decodes to zero even when its zero-point is nonzero."""
+    x = jnp.ones((2, 32), dtype=jnp.float16)
+    w_q = jnp.full((32, 8), 0x11111111, dtype=jnp.uint32)  # 64 codes of value one per K row.
+    scales = jnp.broadcast_to(jnp.array([0.0, 1.0, 1.0, 1.0], dtype=jnp.float16), (32, 4))
+    zeros = jnp.full((32, 4), 3.0, dtype=jnp.float16)
+
+    def run(block_n):
+        return xla_quantized_matmul(
+            x,
+            w_q,
+            scales,
+            zeros,
+            mode="affine",
+            bits=4,
+            group_size=16,
+            transpose=False,
+            block_m=2,
+            block_n=block_n,
+            block_k=32,
+            use_bf16=False,
+        )
+
+    blocked = run(64)
+    dense = run(8)  # Invalid tile alignment forces dense decode.
+    # Groups run along N: columns 0-15 have scale 0 -> (1 - 3) * 0 = 0; the rest -> 32 * (1 - 3) * 1 = -64.
+    # The pre-fix blocked path decoded the zero-scale group as -zero, giving 32 * -3 = -96 there.
+    expected = jnp.concatenate(
+        [jnp.zeros((2, 16), dtype=jnp.float32), jnp.full((2, 48), -64.0, dtype=jnp.float32)], axis=1
+    )
+    assert jnp.array_equal(dense, expected)
+    assert jnp.array_equal(blocked, dense)
+
+
 def test_xla_quantized_matmul_disallow_dense_fallback_raises():
     x, w_q, scales, zeros = _make_affine_row_group128_inputs()
 

@@ -159,8 +159,10 @@ def _blocksparse_attn_fwd_inner(
         if SOFTCAP:
             softmax_scale_e = softmax_scale / LOG2_CONST
             x = (attn_weights * softmax_scale_e) / logits_soft_cap
-            exp_2x = tl.exp(2.0 * x)
-            tanh_x = (exp_2x - 1.0) / (exp_2x + 1.0)
+            # Overflow-free tanh: exp(2x) overflowed to inf/inf for large positive logits (r12 S05-1).
+            exp_neg = tl.exp(-2.0 * tl.abs(x))
+            tanh_abs = (1.0 - exp_neg) / (1.0 + exp_neg)
+            tanh_x = tl.where(x >= 0, tanh_abs, -tanh_abs)
             attn_weights = (logits_soft_cap * tanh_x) * LOG2_CONST
         else:
             if USE_SEGMENT_MASK or USE_CAUSAL or USE_SLIDING_WINDOW:
@@ -171,30 +173,13 @@ def _blocksparse_attn_fwd_inner(
         if SOFTCAP and (USE_SEGMENT_MASK or USE_CAUSAL or USE_SLIDING_WINDOW):
             attn_weights = tl.where(mask, attn_weights, BIG_NEG)
 
-        if USE_SINKS:
-            sink_offs = tl.arange(0, 16)
-            sink_mask = sink_offs < NUM_SINKS
-            aux_logits = tl.load(softmax_aux_ptrs + sink_offs, mask=sink_mask, other=float("-inf"))
-            aux_log2 = aux_logits * LOG2_CONST
-
-            qk_max = tl.max(attn_weights, 1)
-            aux_max = tl.max(tl.where(sink_mask, aux_log2, float("-inf")))
-            m_new = tl.maximum(tl.maximum(qk_max, aux_max), m)
-            m_new_safe = tl.where(m_new == BIG_NEG, 0.0, m_new)
-
-            attn_weights -= m_new_safe[:, None]
-            p = tl.math.exp2(attn_weights)
-
-            aux_logits_row = tl.where(sink_mask[None, :], aux_log2[None, :], float("-inf"))
-            l_aux_row = tl.sum(tl.exp2(aux_logits_row - m_new_safe[:, None]), axis=1)
-
-            l_new = tl.sum(p, axis=1) + l_aux_row
-        else:
-            m_new = tl.maximum(m, tl.max(attn_weights, axis=1))
-            m_new_safe = tl.where(m_new == BIG_NEG, 0.0, m_new)
-            attn_weights -= m_new_safe[:, None]
-            p = tl.math.exp2(attn_weights)
-            l_new = tl.sum(p, axis=1)
+        # Sinks are folded into (m, l) once by the caller before the first tile; adding them here put the
+        # sink mass into the denominator once per KV tile (r15 S05-1).
+        m_new = tl.maximum(m, tl.max(attn_weights, axis=1))
+        m_new_safe = tl.where(m_new == BIG_NEG, 0.0, m_new)
+        attn_weights -= m_new_safe[:, None]
+        p = tl.math.exp2(attn_weights)
+        l_new = tl.sum(p, axis=1)
 
         m_safe = tl.where(m_new == BIG_NEG, 0.0, m)
         alpha = tl.math.exp2(m_safe - m_new_safe)
@@ -411,6 +396,19 @@ def blocksparse_attn_fwd(
     query_global_span = query_global_offs + query_span
 
     USE_SLIDING_WINDOW_LOCAL: tl.constexpr = WINDOW_LEFT >= 0 or WINDOW_RIGHT >= 0
+
+    if USE_SINKS:
+        # Seed the online softmax with the sink mass exactly once per row (r15 S05-1). Sinks contribute to
+        # the denominator only (zero value), so acc stays zero. All -inf sinks leave m=-inf, l=0.
+        sink_offs = tl.arange(0, 16)
+        sink_mask = sink_offs < NUM_SINKS
+        aux_log2 = tl.load(softmax_aux_ptrs + sink_offs, mask=sink_mask, other=float("-inf")) * LOG2_CONST
+        aux_log2 = tl.where(sink_mask, aux_log2, float("-inf"))
+        aux_max = tl.max(aux_log2, axis=0)
+        aux_max_safe = tl.where(aux_max == float("-inf"), 0.0, aux_max)
+        aux_sum = tl.sum(tl.math.exp2(aux_log2 - aux_max_safe), axis=0)
+        m = tl.zeros([BLOCK_M], dtype=tl.float32) + aux_max
+        l = tl.zeros([BLOCK_M], dtype=tl.float32) + aux_sum
 
     acc, l, m = _blocksparse_attn_fwd_inner(
         acc,

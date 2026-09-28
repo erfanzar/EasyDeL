@@ -37,6 +37,7 @@ from ejkernel.callib._tilelang_ffi import has_tilelang_ffi_support
 from ejkernel.errors import EjkernelRuntimeError
 
 from ..._registry import Backend, Platform, kernel_registry
+from ..._sinks import reduce_sinks_to_per_head
 from ._kernel import make_ragged_page_attention_v2_prim_func
 
 _DEFAULT_COMPILE_FLAGS: tuple[str, ...] = ("-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK",)
@@ -178,7 +179,7 @@ def ragged_page_attention_v2(
     compute_dtype: DTypeLike = jnp.bfloat16,
     optimized: bool = False,
     sliding_window: int | None = None,
-    softmax_aux: Float[Array, "num_q_heads"] | None = None,
+    softmax_aux: Float[Array, "..."] | None = None,
     mask_value: float | None = None,
     num_kv_pages_per_block: int | None = None,
     num_queries_per_block: int | None = None,
@@ -268,6 +269,10 @@ def ragged_page_attention_v2(
     mask = -1e30 if mask_value is None else float(mask_value)
     window = -1 if sliding_window is None else int(sliding_window)
     soft_cap = -1.0 if logits_soft_cap is None else float(logits_soft_cap)
+    if softmax_aux is not None:
+        # Any sink layout (shared 1-D, (Hq|Hkv|1, S)) reduces exactly to one logit per query head, which is
+        # what the kernel primes m_run with; this keeps the signature equal to the other v2 impls (r15 S02-1).
+        softmax_aux = reduce_sinks_to_per_head(softmax_aux, num_q_heads=num_q_heads, num_kv_heads=num_kv_heads)
     aux_buf, has_aux = _softmax_aux_buffer(softmax_aux, queries, num_q_heads)
     stages = 3 if num_stages is None else int(num_stages)
     block_k = 128 if head_dim >= 64 else 64

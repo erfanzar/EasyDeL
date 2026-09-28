@@ -55,6 +55,65 @@ class TestRecurrentAttention:
         assert dk.shape == k.shape
         assert dv.shape == v.shape
 
+    @pytest.mark.parametrize("reverse", [False, True])
+    def test_backward_matches_autodiff_reference(self, reverse):
+        """Custom-VJP gradients (all gates active) match autodiff of the recurrence.
+
+        Reference is a plain ``lax.scan`` implementation of the documented
+        update ``h_t = exp(g)*exp(g_gamma)*exp(gk)*exp(gv) * h_{t-1} + k_t x v_t``
+        differentiated by JAX directly, so the kernel's hand-written reverse
+        scan must reproduce it for dq/dk/dv/dg/dgk/dgv and d(initial_state),
+        in both scan directions.
+        """
+        batch, seq_len, num_heads, head_dim = 2, 7, 3, 5
+        keys = jax.random.split(jax.random.PRNGKey(7), 8)
+        q = jax.random.normal(keys[0], (batch, seq_len, num_heads, head_dim)) * 0.3
+        k = jax.random.normal(keys[1], (batch, seq_len, num_heads, head_dim)) * 0.3
+        v = jax.random.normal(keys[2], (batch, seq_len, num_heads, head_dim)) * 0.3
+        g = -jax.random.uniform(keys[3], (batch, seq_len, num_heads, head_dim)) * 0.5
+        g_gamma = -jax.random.uniform(keys[4], (num_heads,)) * 0.3
+        gk = -jax.random.uniform(keys[5], (batch, seq_len, num_heads, head_dim)) * 0.5
+        gv = -jax.random.uniform(keys[6], (batch, seq_len, num_heads, head_dim)) * 0.5
+        h0 = jax.random.normal(keys[7], (batch, num_heads, head_dim, head_dim)) * 0.1
+        scale = 0.7
+
+        def ref_step(h, xs):
+            q_t, k_t, v_t, g_t, gk_t, gv_t = xs
+            h = h * jnp.exp(g_t)[:, :, None]
+            h = h * jnp.exp(g_gamma)[:, None, None]
+            h = h * jnp.exp(gk_t)[:, :, None]
+            h = h * jnp.exp(gv_t)[:, None, :]
+            h = h + k_t[:, :, None] * v_t[:, None, :]
+            return h, jnp.sum(h * (q_t * scale)[:, :, None], axis=1)
+
+        def ref_loss(q, k, v, g, gk, gv, h0):
+            def per_batch(q_b, k_b, v_b, g_b, gk_b, gv_b, h0_b):
+                hf, outs = jax.lax.scan(ref_step, h0_b, (q_b, k_b, v_b, g_b, gk_b, gv_b))
+                return outs, hf
+
+            maybe_flip = lambda x: jnp.flip(x, axis=1) if reverse else x  # noqa: E731
+            outs, hf = jax.vmap(per_batch)(
+                maybe_flip(q), maybe_flip(k), maybe_flip(v), maybe_flip(g), maybe_flip(gk), maybe_flip(gv), h0
+            )
+            return jnp.sum(maybe_flip(outs) * 1.3) + 0.2 * jnp.sum(hf * hf)
+
+        def kernel_loss(q, k, v, g, gk, gv, h0):
+            o, st = recurrent(
+                q, k, v, g=g, g_gamma=g_gamma, gk=gk, gv=gv, softmax_scale=scale, initial_state=h0, reverse=reverse
+            )
+            return jnp.sum(o * 1.3) + 0.2 * jnp.sum(st * st)
+
+        argnums = (0, 1, 2, 3, 4, 5, 6)
+        grads_kernel = jax.jit(jax.grad(kernel_loss, argnums=argnums))(q, k, v, g, gk, gv, h0)
+        grads_ref = jax.jit(jax.grad(ref_loss, argnums=argnums))(q, k, v, g, gk, gv, h0)
+
+        for grads in (grads_kernel, grads_ref):
+            assert all(bool(jnp.all(jnp.isfinite(x))) for x in grads)
+        for got, want in zip(grads_kernel, grads_ref, strict=True):
+            np.testing.assert_allclose(
+                np.asarray(got, dtype=np.float32), np.asarray(want, dtype=np.float32), rtol=1e-4, atol=1e-5
+            )
+
     def test_orthogonal_vectors(self):
         """Test with orthogonal query/key vectors."""
 

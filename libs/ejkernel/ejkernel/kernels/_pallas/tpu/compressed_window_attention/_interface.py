@@ -29,12 +29,14 @@ from ._pallas_impl_fwd import compressed_window_attention_tpu
 def compressed_window_attention(
     query: Float[Array, "batch num_heads q_len head_dim"],
     kv: Float[Array, "batch kv_len head_dim"],
-    bias: Float[Array, "batch q_len kv_len"],
+    bias: Float[Array, "batch q_len bias_len"],
     softmax_aux: Float[Array, "num_heads"] | None = None,
     softmax_scale: float | None = None,
     fwd_params: FwdParams | None = None,
     window: int = 0,
     token_kv_len: int = 0,
+    token_valid: Array | None = None,
+    entry_topk: Array | None = None,
 ) -> Float[Array, "batch num_heads q_len head_dim"]:
     """Tiled-flash sink-augmented shared-KV attention (Pallas TPU, differentiable).
 
@@ -48,12 +50,17 @@ def compressed_window_attention(
     Args:
         query: Rotated queries ``[batch, num_heads, q_len, head_dim]``.
         kv: Shared key/value axis ``[batch, kv_len, head_dim]`` (``K == V``).
-        bias: Additive fp32 mask ``[batch, q_len, kv_len]`` (head-broadcast).
+        bias: Additive fp32 mask ``[batch, q_len, kv_len]`` (head-broadcast), or
+            only the compressed-entry columns when ``token_valid`` is given.
         softmax_aux: Optional per-head sink logits ``[num_heads]``.
         softmax_scale: Logit scale; defaults to ``head_dim ** -0.5``.
         fwd_params: Optional tiling hints (``q_blocksize`` / ``kv_blocksize``).
         window: Sliding-window size for band-skip (``0`` scans the whole KV).
         token_kv_len: Length of the sliding-window token region (entries follow).
+        token_valid: Optional per-key token validity ``[batch, token_kv_len]``;
+            the token-region window / causal / padding mask is built in-kernel.
+        entry_topk: Optional selected entry ids ``[batch, q_len, k]`` replacing
+            the entry columns of ``bias`` (requires ``token_valid``).
 
     Returns:
         Attention output ``[batch, num_heads, q_len, head_dim]``.
@@ -67,4 +74,6 @@ def compressed_window_attention(
         fwd_params=fwd_params,
         window=window,
         token_kv_len=token_kv_len,
+        token_valid=token_valid,
+        entry_topk=entry_topk,
     )

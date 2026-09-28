@@ -43,7 +43,7 @@ Phase 1 -- KV compression and page update
 
 Phase 2 -- Asymmetric attention (same as V2)
     For each query block, pre-rotate (``Q @ Pi^T``) and pre-project
-    (``Q @ S^T``) queries, then tile over KV blocks:
+    (``(Q @ Pi^T) @ S^T``) queries, then tile over KV blocks:
 
     1. Unpack 4-bit indices and 1-bit signs.
     2. Compute asymmetric logits via codebook lookup + QJL correction.
@@ -437,7 +437,7 @@ def ragged_paged_attention_turboquant(
                     kv_block_start = kv_lo // jnp.int32(kv_tokens_per_block)
 
                 q_rotated = jnp.einsum("bihd,dD->bihD", q_block.astype(jnp.float32), rotation_matrix.T)
-                q_projected = jnp.einsum("bihd,md->bihm", q_block.astype(jnp.float32), qjl_projection)
+                q_projected = jnp.einsum("bihd,md->bihm", q_rotated, qjl_projection)
 
                 init_acc = jnp.zeros(
                     (qblocks, actual_num_kv_heads, actual_num_q_heads_per_kv_head, actual_head_dim),

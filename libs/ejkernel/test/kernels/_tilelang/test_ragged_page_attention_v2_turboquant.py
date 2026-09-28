@@ -49,7 +49,7 @@ def test_ragged_page_attention_v2_turboquant_native():
     value_indices = jax.random.randint(k4, (num_pages, page_size, kv_heads, packed_idx_dim), 0, 256, dtype=jnp.uint8)
     key_norms = jnp.abs(_randn(k5, (num_pages, page_size, kv_heads, 2), dtype=jnp.float32, scale=0.3)) + 0.1
     value_norms = key_norms[..., 0]
-    rotation = jnp.eye(head_dim, dtype=jnp.float32)
+    rotation = jnp.roll(jnp.eye(head_dim, dtype=jnp.float32), 1, axis=0)
     qjl_projection = _randn(k1, (qjl_dim, head_dim), dtype=jnp.float32, scale=0.2)
     key_codebook = jnp.linspace(-0.25, 0.25, 16, dtype=jnp.float32)
     value_codebook = jnp.linspace(-0.2, 0.2, 16, dtype=jnp.float32)
@@ -98,3 +98,40 @@ def test_ragged_page_attention_v2_turboquant_native():
         **kwargs,
     )
     assert _max_abs(out_tl, out_xla) < 8e-2
+
+
+def test_ragged_page_attention_v2_turboquant_rotated_qjl_matches_dense():
+    """A rotated sign difference changes the two-key attention output."""
+    head_dim = qjl_dim = 8
+    queries = jnp.array([4.0] + [0.0] * 7, dtype=jnp.float32)[None, None, :].repeat(2, axis=0)
+    rotation = jnp.roll(jnp.eye(head_dim, dtype=jnp.float32), 1, axis=0)
+    key_indices = jnp.zeros((1, 2, 1, head_dim // 2), dtype=jnp.uint8)
+    key_signs = jnp.array([0xFF, 0xFD], dtype=jnp.uint8).reshape(1, 2, 1, 1)
+    key_norms = jnp.array([0.0, 1.0], dtype=jnp.float32)[None, None, None, :].repeat(2, axis=1)
+    value_indices = jnp.array([0x11, 0x00], dtype=jnp.uint8)[:, None].repeat(head_dim // 2, axis=1)
+    value_indices = value_indices.reshape(1, 2, 1, head_dim // 2)
+    value_norms = jnp.ones((1, 2, 1), dtype=jnp.float32)
+    args = (
+        queries,
+        key_indices,
+        key_signs,
+        key_norms,
+        value_indices,
+        value_norms,
+        jnp.array([2], dtype=jnp.int32),
+        jnp.array([[0]], dtype=jnp.int32),
+        jnp.array([0, 2], dtype=jnp.int32),
+        1,
+        rotation,
+        jnp.eye(qjl_dim, head_dim, dtype=jnp.float32),
+        jnp.array([0.0], dtype=jnp.float32),
+        jnp.array([-1.0, 1.0], dtype=jnp.float32),
+    )
+    scale = 1.0 / math.sqrt(head_dim)
+    out_tl = _tl("ragged_page_attention_v2_turboquant")(*args, qjl_dim=qjl_dim, softmax_scale=scale)
+    out_xla = _xla("ragged_page_attention_v2_turboquant")(*args, qjl_dim=qjl_dim, softmax_scale=scale)
+    # q_rot[1]=4; the projected signs are +4 for key 0, -4 for key 1.
+    expected_last = math.tanh(4.0 * math.sqrt(math.pi / 2.0) / qjl_dim * scale)
+    expected = jnp.ones_like(queries).at[1].set(expected_last)
+    assert _max_abs(out_tl, expected) < 1e-3
+    assert _max_abs(out_xla, expected) < 1e-3

@@ -234,6 +234,8 @@ def static_validate_inputs(
     num_kv_pages_per_block=None,
     num_queries_per_block=None,
     vmem_limit_bytes=None,
+    chunk_size=None,
+    alibi_slopes=None,
 ):
     """Validate input shapes, dtypes, and parameter compatibility.
 
@@ -261,6 +263,8 @@ def static_validate_inputs(
         num_kv_pages_per_block: Optional KV pages per processing block.
         num_queries_per_block: Optional queries per processing block.
         vmem_limit_bytes: Unused, reserved for Pallas backend.
+        chunk_size: Optional chunked-local-attention size (must be positive).
+        alibi_slopes: Optional per-query-head ALiBi slopes ``[num_q_heads]``.
 
     Raises:
         ValueError: If any input fails validation.
@@ -306,6 +310,10 @@ def static_validate_inputs(
         raise ValueError("page_size must be divisible by packing")
     if sliding_window is not None and sliding_window <= 0:
         raise ValueError("sliding_window > 0")
+    if chunk_size is not None and int(chunk_size) <= 0:
+        raise ValueError("chunk_size > 0")
+    if alibi_slopes is not None and alibi_slopes.shape != (Hq,):
+        raise ValueError(f"alibi_slopes must have shape ({Hq},), got {alibi_slopes.shape}")
     if logits_soft_cap is not None and logits_soft_cap == 0.0:
         raise ValueError("soft_cap != 0")
     if num_kv_pages_per_block is not None and int(num_kv_pages_per_block) <= 0:
@@ -327,6 +335,7 @@ def static_validate_inputs(
         "num_kv_pages_per_block",
         "num_queries_per_block",
         "vmem_limit_bytes",
+        "chunk_size",
     ),
     donate_argnums=(3,),
     inline=True,
@@ -353,6 +362,8 @@ def ragged_paged_attention(
     num_kv_pages_per_block: int | None = None,
     num_queries_per_block: int | None = None,
     vmem_limit_bytes: int | None = None,
+    chunk_size: int | None = None,
+    alibi_slopes: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Compute ragged paged attention V3 with in-place KV cache updates.
 
@@ -384,6 +395,15 @@ def ragged_paged_attention(
         num_kv_pages_per_block: Optional number of KV pages per processing block.
         num_queries_per_block: Optional number of queries per processing block.
         vmem_limit_bytes: Unused (reserved for Pallas backend).
+        chunk_size: Optional chunked local attention size ``C``. A query at
+            position ``q`` attends key ``k`` only when ``k <= q`` and
+            ``k // C == q // C`` (Llama4 chunked attention). Combines with
+            ``sliding_window`` by intersection.
+        alibi_slopes: Optional per-query-head ALiBi slopes ``[num_q_heads]``.
+            Adds ``slope_h * key_position`` (absolute key index) to the logits
+            after ``softmax_scale`` and soft-capping. Per-row constants are
+            softmax-invariant, so this equals the usual ``slope * (k - q)``
+            bias unless attention sinks are also used.
 
     Returns:
         Tuple of (output, updated_kv_cache) where output has shape
@@ -413,6 +433,8 @@ def ragged_paged_attention(
             v_scale=v_scale,
             num_kv_pages_per_block=num_kv_pages_per_block,
             num_queries_per_block=num_queries_per_block,
+            chunk_size=chunk_size,
+            alibi_slopes=alibi_slopes,
         )
 
     with jax.named_scope("rpa_v3_xla.setup"):
@@ -479,6 +501,9 @@ def ragged_paged_attention(
         sinks_h = None
         if softmax_aux is not None:
             sinks_h = softmax_aux.reshape(actual_num_kv_heads, actual_num_q_heads_per_kv_head).astype(jnp.float32)
+        alibi_h = None
+        if alibi_slopes is not None:
+            alibi_h = alibi_slopes.reshape(actual_num_kv_heads, actual_num_q_heads_per_kv_head).astype(jnp.float32)
 
     def _seq_body(seq_idx, carry):
         """Process one sequence: update its KV cache pages and compute attention.
@@ -613,6 +638,10 @@ def ragged_paged_attention(
                 if sliding_window is not None:
                     kv_lo = jnp.maximum(write_start + q_off - jnp.int32(sliding_window) + 1, 0)
                     kv_block_start = kv_lo // jnp.int32(kv_tokens_per_block)
+                if chunk_size is not None:
+                    # The earliest query of this block starts at its chunk boundary; earlier KV is masked.
+                    chunk_lo = ((write_start + q_off) // jnp.int32(chunk_size)) * jnp.int32(chunk_size)
+                    kv_block_start = jnp.maximum(kv_block_start, chunk_lo // jnp.int32(kv_tokens_per_block))
 
                 init_acc = jnp.zeros(
                     (qblocks, actual_num_kv_heads, actual_num_q_heads_per_kv_head, actual_head_dim),
@@ -697,17 +726,28 @@ def ragged_paged_attention(
                                 mask,
                                 kv_pos[None, :] <= (q_pos[:, None] - jnp.int32(sliding_window)),
                             )
+                        if chunk_size is not None:
+                            chunk_c = jnp.int32(chunk_size)
+                            mask = jnp.logical_or(mask, kv_pos[None, :] // chunk_c != q_pos[:, None] // chunk_c)
                         mask = jnp.logical_or(mask, jnp.logical_not(q_valid)[:, None])
                         mask = mask[:, None, None, :]
 
+                    if alibi_h is not None:
+                        # slope * (k - q): equals slope * k under softmax (per-row constant) but keeps
+                        # the added term small at long context instead of losing f32 precision.
+                        rel = (kv_pos[None, :] - q_pos[:, None]).astype(jnp.float32)
+                        logits = logits + alibi_h[None, :, :, None] * rel[:, None, None, :]
                     logits = logits + jnp.where(mask, mask_value, 0.0)
 
                     with jax.named_scope("online_softmax"):
                         cur_max = jnp.max(logits, axis=-1)
                         new_m = jnp.maximum(m, cur_max)
-                        exp_logits = jnp.exp(logits - new_m[..., None])
+                        # With mask_value=-inf and no sink a fully masked tile leaves new_m == -inf;
+                        # shift by 0 so it contributes 0 instead of exp(-inf - -inf) == NaN (r14 S04-1).
+                        shift_m = jnp.where(new_m == -jnp.inf, 0.0, new_m)
+                        exp_logits = jnp.exp(logits - shift_m[..., None])
                         exp_logits = jnp.where(mask, 0.0, exp_logits)
-                        rescale = jnp.exp(m - new_m)
+                        rescale = jnp.exp(m - shift_m)
                         l = rescale * l + jnp.sum(exp_logits, axis=-1)
                         acc = rescale[..., None] * acc + jnp.einsum(
                             "bihk,kid->bihd",

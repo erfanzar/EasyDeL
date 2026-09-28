@@ -118,3 +118,12 @@ def test_flash_attention_gates_unsupported():
         tl(q, q, q, block_tables=jnp.zeros((B, 4), jnp.int32))
     with pytest.raises(EjkernelRuntimeError):
         tl(q, q, q, cum_seqlens_q=jnp.array([0, N], jnp.int32))
+    with pytest.raises(EjkernelRuntimeError, match="cum_seqlens"):
+        tl(
+            q,
+            q,
+            q,
+            attention_mask=jnp.ones((B, 1, N, N), dtype=jnp.bool_),
+            cum_seqlens_q=jnp.array([0, N], jnp.int32),
+            cum_seqlens_k=jnp.array([0, N], jnp.int32),
+        )

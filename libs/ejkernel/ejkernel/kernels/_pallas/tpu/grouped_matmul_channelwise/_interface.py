@@ -26,13 +26,42 @@ def _integer_streaming_tiles(k, n, dtype):
     return (32, tk, tn)
 
 
+# Expert-stacked ``(E, K, N)`` families whose full-K decode tiles were measured on TPU; others keep generic tiles.
+# DeepSeek-V4.1 tp=4 per-device families (TPU v5, 48 rows, int4, bit-exact vs XLA): gate/up [96,5120,2304]
+# 127 -> 62 us, fused gate_up [96,5120,4608] 204 -> 110 us, down [96,2304,5120] 107 -> 62 us.
+_MEASURED_DECODE_FAMILIES = frozenset(
+    {
+        (128, 2560, 1280),
+        (128, 640, 2560),
+        (96, 5120, 2304),
+        (96, 5120, 4608),
+        (96, 2304, 5120),
+    }
+)
+
+
+# Families whose full-K prefill tiles were measured on TPU v5 (int4, bit-exact vs XLA) for 129..12288 rows, with
+# tile_m=64: gate/up [96,5120,2304] 2.05 -> 1.18 ms at 1950 rows and 5.43 -> 1.36 ms at 12288 rows; down
+# [96,2304,5120] 1.78 -> 1.21 ms and 4.85 -> 1.63 ms (prior generic (16,512,1024) tiles; XLA 2.55-3.17 ms).
+_MEASURED_PREFILL_FAMILIES = frozenset({(96, 5120, 2304), (96, 2304, 5120)})
+_MEASURED_PREFILL_MAX_ROWS = 12288
+
+
 def _weight_only_streaming_tiles(m, e, k, n, dtype):
-    """Use measured full-K decode tiles without enlarging RHS buffers past 2 MiB."""
-    if 0 < m <= 128 and (e, k, n) in ((128, 2560, 1280), (128, 640, 2560)):
-        tn = n
-        while k * tn * jax.dtypes.itemsize_bits(dtype) // 8 > 2 * 1024 * 1024:
-            tn = max(128, ((tn // 2 + 127) // 128) * 128)
-        return (16, k, tn)
+    """A16 tiles for measured families: full K, N split into the widest 128-multiple that divides N and keeps each
+    RHS buffer within 2 MiB; ``tile_m`` 16 for decode rows (<= 128) and 64 for measured prefill rows. Unmeasured
+    shapes and row ranges (including other expert counts) keep the prior generic tiles."""
+    family = (e, k, n)
+    tile_m = None
+    if 0 < m <= 128 and family in _MEASURED_DECODE_FAMILIES:
+        tile_m = 16
+    elif 128 < m <= _MEASURED_PREFILL_MAX_ROWS and family in _MEASURED_PREFILL_FAMILIES:
+        tile_m = 64
+    if tile_m is not None:
+        budget = (2 * 1024 * 1024 * 8) // (k * jax.dtypes.itemsize_bits(dtype))
+        divisors = [t for t in range(128, min(n, budget) + 1, 128) if n % t == 0]
+        if divisors:
+            return (tile_m, k, divisors[-1])
     return (16, 512 if k >= 512 else 128, 1024 if n >= 1024 else 128)
 
 
@@ -103,15 +132,20 @@ def grouped_matmul_channelwise(
     @jax.custom_jvp
     def apply(x, weights, s, sizes):
         if activation_bits == 16:
+            # Pad rows to the sublane-safe multiple the integer path already uses: the v3 kernel's zero-fill
+            # reshapes its output into (-1, sublane, lanes), which fails when M is not a multiple of the
+            # sublane tiling (e.g. DeepSeek-V4 325 tokens x top-6 = 1950 rows). Padded rows sit past
+            # sum(sizes), so they are zero and sliced off.
+            padded_m = ((x.shape[0] + 31) // 32) * 32
             raw = grouped_matmulv3_pallas_impl(
-                x,
+                jnp.pad(x, ((0, padded_m - x.shape[0]), (0, 0))),
                 weights,
                 sizes,
                 maybe_quantize_lhs=False,
                 tile_info=tiles,
                 preferred_element_type=jnp.float32,
                 acc_dtype=jnp.float32,
-            )
+            )[: x.shape[0]]
         else:
             from ...._xla.quantized_matmul._integer_quantization import quantize_rows
 
