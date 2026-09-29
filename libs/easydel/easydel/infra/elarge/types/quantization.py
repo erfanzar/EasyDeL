@@ -45,10 +45,34 @@ class EasyDeLQuantizationCfg(TypedDict, total=False):
             implementations.
         pattern: Regex pattern to select which layers to quantize
             (e.g., ``".*dense.*"``).
+        activation_bits: Activation precision (4, 8 or 16) for channelwise
+            integer matmuls; used with ``activation_policy="explicit"``.
+        activation_policy: ``"explicit"`` makes kernels honor
+            ``activation_bits``; ``"auto"`` keeps legacy selection.
+
+    The integer matmul presets ``"w4a16"``, ``"w8a16"``, ``"w4a8"``,
+    ``"w4a4"`` and ``"w8a8"`` are accepted as ``dtype`` and expand to
+    channelwise storage with the matching explicit activation precision.
     """
 
     dtype: NotRequired[
-        tp.Literal["nf4", "int8", "affine", "ternary", "binary", "mxfp8", "nvfp8", "mxfp4", "nvfp4", "channelwise"]
+        tp.Literal[
+            "nf4",
+            "int8",
+            "affine",
+            "ternary",
+            "binary",
+            "mxfp8",
+            "nvfp8",
+            "mxfp4",
+            "nvfp4",
+            "channelwise",
+            "w4a16",
+            "w8a16",
+            "w4a8",
+            "w4a4",
+            "w8a8",
+        ]
     ]
     runtime_dtype: NotRequired[
         tp.Literal["nf4", "int8", "affine", "ternary", "binary", "mxfp8", "nvfp8", "mxfp4", "nvfp4", "channelwise"]
@@ -58,6 +82,7 @@ class EasyDeLQuantizationCfg(TypedDict, total=False):
     simulate: NotRequired[bool]
     jax_native: NotRequired[bool]
     pattern: NotRequired[str]
+    activation_bits: NotRequired[tp.Literal[4, 8, 16]]
     activation_policy: NotRequired[tp.Literal["auto", "explicit"]]
 
 

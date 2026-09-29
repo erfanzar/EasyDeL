@@ -126,6 +126,39 @@ def batch_iterator(
         yield collate(batch)
 
 
+def _put_interruptible(buffer: Queue, stop_event: Event, item) -> bool:
+    """Put ``item`` on ``buffer``, giving up once ``stop_event`` is set.
+
+    Returns:
+        bool: ``True`` when enqueued; ``False`` when the stop event fired first.
+    """
+    from queue import Full
+
+    while not stop_event.is_set():
+        try:
+            buffer.put(item, timeout=0.5)
+            return True
+        except Full:
+            continue
+    return False
+
+
+def _prefetch_worker_body(source, buffer: Queue, stop_event: Event, sentinel) -> None:
+    """Producer body for :class:`PrefetchIterator` that holds no reference to the iterator.
+
+    Drains ``source`` into ``buffer``, forwards a source exception as a queue
+    item, and always pushes ``sentinel`` last unless the consumer closed first.
+    """
+    try:
+        for item in source:
+            if not _put_interruptible(buffer, stop_event, item):
+                return  # consumer closed us; skip the sentinel too
+    except Exception as e:
+        _put_interruptible(buffer, stop_event, e)
+    finally:
+        _put_interruptible(buffer, stop_event, sentinel)
+
+
 class PrefetchIterator:
     """Background-thread prefetcher that keeps the trainer-thread fed.
 
@@ -176,14 +209,7 @@ class PrefetchIterator:
         the consumer terminates cleanly regardless of how the source
         ended.
         """
-        try:
-            for item in self._source:
-                if not self._put_interruptible(item):
-                    return  # consumer closed us; skip the sentinel too
-        except Exception as e:
-            self._put_interruptible(e)
-        finally:
-            self._put_interruptible(self._sentinel)
+        _prefetch_worker_body(self._source, self._buffer, self._stop_event, self._sentinel)
 
     def _put_interruptible(self, item) -> bool:
         """Blocking queue put that gives up once :meth:`close` was requested.
@@ -193,15 +219,7 @@ class PrefetchIterator:
             stop event fired first (the consumer is gone, nobody will drain
             the queue, and blocking forever would leak this thread).
         """
-        from queue import Full
-
-        while not self._stop_event.is_set():
-            try:
-                self._buffer.put(item, timeout=0.5)
-                return True
-            except Full:
-                continue
-        return False
+        return _put_interruptible(self._buffer, self._stop_event, item)
 
     def _start(self):
         """Lazily spawn the producer thread on the first call to :meth:`__next__`.
@@ -212,8 +230,13 @@ class PrefetchIterator:
         that never iterate it).
         """
         if not self._started:
+            # The thread must not hold a reference to ``self`` (a bound-method
+            # target would): otherwise an abandoned iterator is kept alive by
+            # its own producer, ``__del__`` never runs, and the blocked thread
+            # leaks together with the upstream iterator and its file handles.
             self._worker = Thread(
-                target=self._prefetch_worker,
+                target=_prefetch_worker_body,
+                args=(self._source, self._buffer, self._stop_event, self._sentinel),
                 daemon=True,
             )
             self._worker.start()
@@ -281,6 +304,18 @@ class PrefetchIterator:
         self._stop_event.set()
         if self._worker is not None:
             self._worker.join(timeout=1.0)
+
+    def __del__(self):
+        # An iterator abandoned mid-stream (e.g. the trainer's per-epoch
+        # factory replacing the loader, or a resume fast-forward that stops
+        # after a few batches) would otherwise leave the producer thread
+        # blocked in `_put_interruptible` on a full queue forever, pinning
+        # the upstream iterator and any file handles it holds. close() is
+        # idempotent and safe on an already-drained iterator.
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 @dataclass

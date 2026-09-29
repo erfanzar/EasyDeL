@@ -172,3 +172,26 @@ class TestPrefetchTeardown:
         while it._worker.is_alive() and time.time() < deadline:
             time.sleep(0.05)
         assert not it._worker.is_alive(), "producer thread leaked after close()"
+
+    def test_abandoned_iterator_releases_upstream_source(self):
+        """Dropping a mid-stream iterator must stop the producer and finalize the source."""
+        import gc
+        import threading
+
+        released = threading.Event()
+
+        def endless_source():
+            try:
+                i = 0
+                while True:
+                    yield i
+                    i += 1
+            finally:
+                released.set()
+
+        it = PrefetchIterator(endless_source(), buffer_size=1)
+        assert next(it) == 0  # producer now blocks on the full queue
+        time.sleep(0.2)
+        del it
+        gc.collect()
+        assert released.wait(timeout=5), "abandoned PrefetchIterator kept its producer and source alive"

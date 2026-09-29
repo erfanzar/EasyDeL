@@ -376,6 +376,15 @@ class TokenizedShardedSource(ShardedDataSource[dict]):
         """Return shard metadata from the underlying source."""
         return self._source.get_shard_info(shard_name)
 
+    @property
+    def delivers_all_metadata_rows(self) -> bool:
+        """Forwarded: the wrapped source decides whether metadata can be trusted.
+
+        Returns:
+            bool: The wrapped source's flag.
+        """
+        return self._source.delivers_all_metadata_rows
+
     def __len__(self) -> int:
         """Return length of the underlying source.
 

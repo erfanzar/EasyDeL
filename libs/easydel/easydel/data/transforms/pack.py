@@ -273,6 +273,12 @@ class GreedyPacker:
         results: list[PackedSequence] = []
         self._stats.total_input_tokens += len(tokens)
 
+        if not tokens:
+            # A zero-length example contributes no tokens; appending the
+            # EOS separator + segment bump below would fabricate an empty
+            # segment (a doubled EOS boundary) in the packed stream.
+            return results
+
         aligned_extra_fields = self._normalize_extra_fields(tokens, extra_fields)
 
         for index, tok in enumerate(tokens):
@@ -283,7 +289,7 @@ class GreedyPacker:
                 self._extra_buffers[field_name].append(values[index])
 
             if len(self._buffer) >= self.seq_length:
-                results.append(self._flush())
+                results.append(self._flush(mid_example=True))
 
         if len(self._buffer) > 0:
             self._buffer.append(self.eos_token_id)
@@ -301,14 +307,23 @@ class GreedyPacker:
 
         return results
 
-    def _flush(self) -> PackedSequence:
+    def _flush(self, mid_example: bool = False) -> PackedSequence:
         """Emit a packed sequence and retain any leftover tokens.
+
+        Args:
+            mid_example: ``True`` when the window was cut while tokens of
+                the current example were still being appended (before its
+                EOS separator and segment bump). Those tokens carry segment
+                id ``_current_segment``, so that example counts as one more
+                segment of this window; otherwise every segment in the
+                window was already closed by an EOS.
 
         Returns:
             ``PackedSequence`` populated from the first ``seq_length``
             tokens of the buffer; remaining tokens are kept for the next
             packing round.
         """
+        num_segments = self._current_segment + int(mid_example)
         # Take exactly seq_length tokens
         input_ids = np.array(self._buffer[: self.seq_length], dtype=np.int32)
 
@@ -323,14 +338,14 @@ class GreedyPacker:
         self._stats.total_packed_tokens += self.seq_length
         self._stats.total_emitted_windows += 1
         self._stats.perfect_fills += 1
-        self._stats.total_segments += self._current_segment
+        self._stats.total_segments += num_segments
 
         result = PackedSequence(
             input_ids=input_ids,
             segment_ids=segment_ids,
             extra_fields=extra_fields,
             source_ids=self._source_ids.copy() if self._source_ids else None,
-            num_segments=self._current_segment,
+            num_segments=num_segments,
         )
 
         self._buffer = self._buffer[self.seq_length :]
@@ -382,7 +397,13 @@ class GreedyPacker:
         self._stats.total_emitted_windows += 1
         if len(self._buffer) == self.seq_length:
             self._stats.perfect_fills += 1
-        self._stats.total_segments += self._current_segment + 1
+        # Segments 0.._current_segment-1 are the real examples in the buffer
+        # (each add() terminated its example with an EOS before bumping the
+        # counter); the padded tail reuses _current_segment as a distinct id
+        # but is attention-masked padding, not a segment. Counting it made
+        # total_segments/num_segments over-report by one on every padded
+        # final window, unlike FirstFitPacker which excludes its padding id.
+        self._stats.total_segments += self._current_segment
 
         result = PackedSequence(
             input_ids=input_ids,
@@ -390,7 +411,7 @@ class GreedyPacker:
             segment_ids=segment_ids,
             extra_fields=extra_fields,
             source_ids=self._source_ids.copy() if self._source_ids else None,
-            num_segments=self._current_segment + 1,
+            num_segments=self._current_segment,
         )
 
         self._buffer = []
@@ -1180,6 +1201,8 @@ class PackStage(BaseStage):
                 seed=context.seed,
                 return_stats=self._stage_config.return_stats,
                 warn_on_padded_input=self._stage_config.warn_on_padded_input,
+                extra_field_pad_values=self._stage_config.extra_field_pad_values,
+                extra_field_separator_values=self._stage_config.extra_field_separator_values,
                 on_iteration_end=on_iteration_end,
             )
             result[ds_name] = packed

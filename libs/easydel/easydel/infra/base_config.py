@@ -964,7 +964,33 @@ class EasyDeLBaseConfig(PretrainedConfig):
         normalized = self._normalize_rope_parameters_dict(rope_parameters, rope_theta=rope_theta)
         if partial_rotary_factor is not None:
             normalized.setdefault("partial_rotary_factor", partial_rotary_factor)
-        return normalized
+        return self._apply_default_rope_type(normalized)
+
+    def _apply_default_rope_type(self, rope_parameters: dict[str, tp.Any]) -> dict[str, tp.Any]:
+        """Honor the class-level ``default_rope_type`` the way transformers' ``standardize_rope_params`` does.
+
+        Configs whose HF counterpart declares a non-default rope type (e.g. ``"axial"`` for 2-D vision towers)
+        set ``default_rope_type`` on the class; a flat ``rope_type="default"`` mapping is then rewritten to it and
+        ``rope_theta`` is filled from the config (or ``default_theta``). Classes keeping ``"default"`` are untouched.
+
+        Args:
+            rope_parameters: Normalized RoPE mapping (flat or nested by layer type).
+
+        Returns:
+            dict[str, Any]: The mapping, retyped when the class declares a non-default rope type.
+        """
+        default_rope_type = getattr(type(self), "default_rope_type", "default")
+        if default_rope_type == "default" or not isinstance(rope_parameters, dict):
+            return rope_parameters
+        if rope_parameters and not self._is_flat_rope_parameters(rope_parameters):
+            return rope_parameters
+        updated = dict(rope_parameters)
+        if updated.get("rope_type", "default") == "default":
+            updated["rope_type"] = default_rope_type
+            updated["type"] = default_rope_type
+        if updated.get("rope_theta") is None:
+            updated["rope_theta"] = getattr(self, "rope_theta", None) or self.default_theta
+        return updated
 
     def _backfill_rope_parameters(self) -> None:
         """Ensure rope parameters remain usable after late attribute mutations.
@@ -1004,6 +1030,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             normalized = {"rope_type": "default", "rope_theta": rope_theta}
             if partial_rotary_factor is not None:
                 normalized["partial_rotary_factor"] = partial_rotary_factor
+            normalized = self._apply_default_rope_type(normalized)
 
         if (
             multi_layer_rope
@@ -1122,7 +1149,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
             or hasattr(self, "rope_theta")
             or partial_rotary_factor is not None
         )
-        if not has_rope_signal:
+        # A class declaring a non-default rope type (2-D vision towers) always carries ``rope_parameters``: its HF
+        # counterpart reads them unconditionally even when the config sets no rope field.
+        if not has_rope_signal and getattr(type(self), "default_rope_type", "default") == "default":
             return
 
         if rope_parameters is None:

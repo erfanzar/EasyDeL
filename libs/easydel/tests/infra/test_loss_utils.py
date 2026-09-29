@@ -110,6 +110,93 @@ class _TextConfigOnlyChunkedCausalLMModule:
         return None
 
 
+def test_all_ignored_causal_lm_batch_has_finite_zero_loss_and_gradient():
+    labels = jnp.full((2, 4), -100, dtype=jnp.int32)
+    logits = jnp.arange(2 * 4 * 8, dtype=jnp.float32).reshape(2, 4, 8) / 10
+    config = LossConfig(z_loss=0.001)
+
+    def dense_loss(values):
+        return ForCausalLMLoss(values, labels, config=config).loss
+
+    metrics = ForCausalLMLoss(logits, labels, config=config)
+    assert float(metrics.loss) == 0.0
+    assert float(metrics.z_loss) == 0.0
+    assert float(metrics.weight_sum) == 0.0
+    assert jnp.all(jnp.isfinite(jax.grad(dense_loss)(logits)))
+    assert jnp.all(jax.grad(dense_loss)(logits) == 0)
+
+    hidden = logits[:, :, :4]
+
+    def chunked_loss(values):
+        return causal_lm_loss_chunked_lm_head(
+            values,
+            labels,
+            lambda x: jnp.concatenate((x, x), axis=-1),
+            vocab_size=8,
+            config=config,
+            token_chunk_size=2,
+        ).loss
+
+    chunked = causal_lm_loss_chunked_lm_head(
+        hidden,
+        labels,
+        lambda x: jnp.concatenate((x, x), axis=-1),
+        vocab_size=8,
+        config=config,
+        token_chunk_size=2,
+    )
+    assert float(chunked.loss) == 0.0
+    assert float(chunked.z_loss) == 0.0
+    assert float(chunked.weight_sum) == 0.0
+    assert jnp.all(jnp.isfinite(jax.grad(chunked_loss)(hidden)))
+    assert jnp.all(jax.grad(chunked_loss)(hidden) == 0)
+
+
+def test_all_ignored_batch_is_finite_for_every_normalization_branch():
+    """An all-ignored batch must give a finite zero loss and gradient in every loss branch."""
+    labels = jnp.full((2, 4), -100, dtype=jnp.int32)
+    logits = jnp.arange(2 * 4 * 8, dtype=jnp.float32).reshape(2, 4, 8) / 10
+    configs = {
+        "no_weight": LossConfig(loss_normalizing_factor="NO_WEIGHT_NUM_REAL_TARGET_TOKENS", z_loss=0.001),
+        "num_total": LossConfig(loss_normalizing_factor="NUM_TOTAL_TARGET_TOKENS"),
+        "average_per_sequence": LossConfig(loss_normalizing_factor="AVERAGE_PER_SEQUENCE"),
+        "divide_weight_sum": LossConfig(divide_weight_sum=True),
+        "reduction_mean": LossConfig(reduction="mean"),
+        "reduction_sum": LossConfig(reduction="sum"),
+    }
+    for name, config in configs.items():
+
+        def dense_loss(values, config=config):
+            return ForCausalLMLoss(values, labels, config=config).loss
+
+        loss = dense_loss(logits)
+        grads = jax.grad(dense_loss)(logits)
+        assert jnp.isfinite(loss) and float(loss) == 0.0, (name, loss)
+        assert jnp.all(jnp.isfinite(grads)) and jnp.all(grads == 0), name
+
+    # Callers may pass a batch-level item count that is zero when every target is ignored.
+    config = LossConfig()
+    hidden = logits[:, :, :4]
+
+    def dense_items_loss(values):
+        return ForCausalLMLoss(values, labels, config=config, num_items_in_batch=jnp.asarray(0.0)).loss
+
+    def chunked_items_loss(values):
+        return causal_lm_loss_chunked_lm_head(
+            values,
+            labels,
+            lambda x: jnp.concatenate((x, x), axis=-1),
+            vocab_size=8,
+            config=config,
+            token_chunk_size=2,
+            num_items_in_batch=jnp.asarray(0.0),
+        ).loss
+
+    for loss_fn, arg in ((dense_items_loss, logits), (chunked_items_loss, hidden)):
+        assert float(loss_fn(arg)) == 0.0
+        assert jnp.all(jnp.isfinite(jax.grad(loss_fn)(arg)))
+
+
 def test_cross_entropy_blockwise_logits_respects_bf16_compute_dtype():
     logits = jnp.arange(2 * 3 * 8, dtype=jnp.bfloat16).reshape(2, 3, 8) / 10
     targets = jnp.array([[1, 2, 3], [4, 5, 6]], dtype=jnp.int32)
@@ -745,6 +832,28 @@ def _assert_metrics_close(actual, expected):
     assert jnp.allclose(actual.z_loss, expected.z_loss, atol=1e-5)
     assert jnp.allclose(actual.weight_sum, expected.weight_sum, atol=1e-5)
     assert jnp.allclose(actual.accuracy, expected.accuracy, atol=1e-5)
+
+
+def test_fixed_cross_entropy_unreduced_accuracy_is_weighted_fraction():
+    """reduction='none' keeps per-token loss but accuracy is the scalar weighted fraction (r12 S10-1)."""
+    logits = jnp.asarray([[[4.0, 0.0], [4.0, 0.0], [4.0, 0.0], [0.0, 4.0]]], dtype=jnp.float32)
+    targets = jnp.asarray([[0, 0, -100, 0]], dtype=jnp.int32)  # 2 of 3 valid tokens correct
+    metrics = fixed_cross_entropy(source=logits, target=targets, config=LossConfig(reduction="none"))
+    assert jnp.shape(metrics.loss) == targets.shape
+    assert jnp.ndim(metrics.accuracy) == 0
+    assert jnp.allclose(metrics.accuracy, 2.0 / 3.0, atol=1e-6), metrics.accuracy
+
+
+def test_fixed_cross_entropy_constant_or_none_factor_without_batch():
+    """Omitted ``batch`` with a numeric / None normalizing factor must not crash on None weights (r13 S10-1)."""
+    logits = jnp.asarray([[[4.0, 0.0], [0.0, 4.0], [4.0, 0.0]]], dtype=jnp.float32)
+    targets = jnp.asarray([[0, 1, -100]], dtype=jnp.int32)  # two valid tokens, one ignored
+    per_token = jnp.log1p(jnp.exp(-4.0))  # CE of each valid token
+    summed = 2.0 * per_token
+    for factor, expected in ((2.0, summed / 2.0), (None, summed)):
+        metrics = fixed_cross_entropy(source=logits, target=targets, config=LossConfig(loss_normalizing_factor=factor))
+        assert jnp.allclose(metrics.loss, expected, rtol=1e-5, atol=1e-6), (factor, metrics.loss, expected)
+        assert jnp.allclose(metrics.accuracy, 1.0, atol=1e-6), metrics.accuracy
 
 
 def test_fixed_cross_entropy_default_blockwise_matches_dense_label_smoothing():

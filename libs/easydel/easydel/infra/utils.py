@@ -653,8 +653,10 @@ def unwrap_lora_to_layers(
     """Merge LoRA adapters into their base linear layers and drop the wrappers.
 
     Walks *model* finding every ``nn.LoRA`` wrapper, computes the merged
-    weight ``W + A @ B`` (using ``float32`` matmul precision so the merge
-    is numerically faithful regardless of the storage dtype), writes the
+    weight ``W + (alpha / rank) * A @ B`` (the ``alpha / rank`` factor is
+    applied only when the wrapper carries an ``alpha``, matching the
+    forward pass; ``float32`` matmul precision is used so the merge is
+    numerically faithful regardless of the storage dtype), writes the
     result back onto the underlying linear's ``weight``, and replaces the
     wrapper in the module tree with its unwrapped ``base_module``.
 
@@ -678,9 +680,13 @@ def unwrap_lora_to_layers(
         for path, _ in iter_module_search(model, nn.LoRA):
             base_module: nn.LoRA = get_module_from_path(model=model, path=path)
             with jax.default_matmul_precision("float32"):
-                base_module.base_module.weight.value = (
-                    base_module.base_module.weight.value + base_module.lora_a.value @ base_module.lora_b.value
-                )
+                delta = base_module.lora_a.value @ base_module.lora_b.value
+                if base_module.has_alpha:
+                    # Mirror the forward pass: ``nn.LoRA``/``eLoRA`` scale the
+                    # delta by ``alpha / rank``, so the merged weight must carry
+                    # the same factor to remain equivalent to the wrapped module.
+                    delta = delta * base_module._scale(delta.dtype)
+                base_module.base_module.weight.value = base_module.base_module.weight.value + delta
             del base_module.lora_a, base_module.lora_b
             set_module_from_path(
                 model=model,
@@ -1613,6 +1619,7 @@ class AttnMaskType(StrEnum):
             "hybrid",
             "parallel_hybrid",
             "qwen_sparse_attention",
+            "indexed_attention",  # transformers>=5.18 name for indexer (DSA/QSA) layers
         ):
             # eSurge cache grouping is page-table based; linear attention layers
             # and parallel hybrid layers (attention+SSM) are treated as

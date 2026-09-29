@@ -161,6 +161,33 @@ def _infer_task_from_hf_config(config) -> TaskType:
     return "causal_lm"
 
 
+def _import_easydel_family(meta_source: str) -> None:
+    """Import ``easydel.modules.<model_type>`` for a local ``config.json`` so its AutoConfig registration runs.
+
+    ``import easydel`` loads model families lazily. Families that transformers does not ship (``deepseek_v41``,
+    ``glm5_next``) register their config with ``transformers.AutoConfig`` when their package is imported, so the
+    package must be imported before ``AutoConfig.from_pretrained``. Hub ids, missing files and unknown model types are
+    ignored (transformers then resolves or reports the config itself).
+
+    Args:
+        meta_source: Local directory (or hub id) holding ``config.json``.
+    """
+    import importlib
+    import json
+
+    path = Path(str(meta_source)) / "config.json"
+    try:
+        model_type = json.loads(path.read_text()).get("model_type")
+    except (OSError, ValueError):
+        return
+    if not isinstance(model_type, str) or not model_type.isidentifier():
+        return
+    try:
+        importlib.import_module(f"easydel.modules.{model_type}")
+    except ModuleNotFoundError:
+        return
+
+
 def _parse_dtype(value: str):
     """Parse a dtype string into a JAX dtype.
 
@@ -472,6 +499,7 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
 
+    _import_easydel_family(meta_source)
     config = AutoConfig.from_pretrained(meta_source, **hf_kwargs)
 
     task = _infer_task_from_hf_config(config) if args.task == "auto" else args.task
@@ -559,11 +587,10 @@ def main(argv: list[str] | None = None) -> None:
 
             api = HfApi(token=args.token)
             api.create_repo(repo_id=args.repo_id, repo_type="model", exist_ok=True, token=args.token)
-            api.upload_folder(
+            api.upload_large_folder(
                 folder_path=str(out_dir),
                 repo_id=args.repo_id,
                 repo_type="model",
-                commit_message="Adding EasyDeL Checkpoints",
             )
     else:
         model = model_cls.from_pretrained(

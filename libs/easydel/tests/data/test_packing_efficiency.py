@@ -207,6 +207,110 @@ def test_pack_stage_records_context_metrics_on_iteration():
     assert 0.0 < stats_dict["efficiency"] <= 1.0
 
 
+def test_greedy_packer_add_empty_tokens_is_noop():
+    """``add([])`` must not fabricate an EOS separator / phantom segment."""
+    baseline = GreedyPacker(seq_length=8, eos_token_id=1, pad_token_id=0, include_segment_ids=True)
+    baseline.add([5, 6])
+    expected = baseline.flush_final()
+
+    packer = GreedyPacker(seq_length=8, eos_token_id=1, pad_token_id=0, include_segment_ids=True)
+    packer.add([5, 6])
+    assert packer.add([]) == []
+    assert packer.stats.total_eos_separators == 1
+    assert packer.stats.total_input_tokens == 2
+
+    got = packer.flush_final()
+    assert got is not None
+    assert got.input_ids.tolist() == expected.input_ids.tolist()
+    assert got.segment_ids.tolist() == expected.segment_ids.tolist()
+    assert got.num_segments == expected.num_segments == 1
+
+    fresh = GreedyPacker(seq_length=8, eos_token_id=1)
+    assert fresh.add([]) == []
+    assert fresh.flush_final() is None
+
+
+def test_first_fit_packer_add_empty_tokens_creates_no_segment():
+    """``FirstFitPacker.add([])`` must not buffer or emit an EOS-only segment."""
+    packer = FirstFitPacker(seq_length=8, eos_token_id=1, pad_token_id=0, buffer_size=4)
+    assert packer.add([]) == []
+    assert packer.stats.total_eos_separators == 0
+    assert packer.flush_all() == []
+
+    packer.add([5, 6])
+    assert packer.add([]) == []
+    (window,) = packer.flush_all()
+    assert window.input_ids.tolist() == [5, 6, 1, 0, 0, 0, 0, 0]
+    assert window.num_segments == 1
+    assert packer.stats.total_eos_separators == 1
+
+
+def test_greedy_packer_num_segments_matches_segment_ids():
+    """``num_segments`` counts every real segment id present in the window, including a
+    trailing example cut by the window boundary."""
+    packer = GreedyPacker(seq_length=4, eos_token_id=9, pad_token_id=0, include_segment_ids=True)
+
+    windows = packer.add([1] * 10)  # two windows cut inside a single long example
+    assert len(windows) == 2
+    for w in windows:
+        assert w.segment_ids.tolist() == [0, 0, 0, 0]
+        assert w.num_segments == 1
+
+    tail = packer.flush_final()
+    assert tail is not None
+    real_ids = {int(s) for s, m in zip(tail.segment_ids, tail.attention_mask, strict=True) if m}
+    assert tail.num_segments == len(real_ids) == 1
+
+    # A short example followed by one cut mid-window: ids [0, 0, 0, 1] -> two segments.
+    packer = GreedyPacker(seq_length=4, eos_token_id=9, pad_token_id=0, include_segment_ids=True)
+    assert packer.add([1, 1]) == []
+    (window,) = packer.add([1] * 2)
+    assert window.segment_ids.tolist() == [0, 0, 0, 1]
+    assert window.num_segments == len(set(window.segment_ids.tolist())) == 2
+    assert packer.stats.total_segments == 2
+
+
+def test_pack_stage_forwards_extra_field_pad_and_separator_values():
+    """PackStage must honour extra_field_* config so token-aligned fields
+    survive pipeline-level packing instead of being silently dropped."""
+    rows = [
+        {"input_ids": [1] * 4, "completion_mask": [1, 1, 0, 0]},
+        {"input_ids": [1] * 4, "completion_mask": [0, 0, 1, 1]},
+    ]
+    source = _ListShardedSource(rows)
+    config = PackStageConfig(
+        enabled=True,
+        seq_length=12,
+        eos_token_id=2,
+        strategy="greedy",
+        shuffle_packed=False,
+        extra_field_pad_values={"completion_mask": 0},
+    )
+    stage = PackStage(config)
+    context = PipelineContext(
+        config=PipelineConfig(datasets=[DatasetConfig(data_files="dummy")]),
+        seed=0,
+    )
+    packed = stage.process({"ds1": source}, context)["ds1"]
+    out = list(packed.open_shard(packed.shard_names[0]))
+
+    assert len(out) == 1
+    ids = out[0]["input_ids"].tolist()
+    mask = out[0]["completion_mask"].tolist()
+    assert len(ids) == len(mask) == 12
+    assert mask[0:4] == [1, 1, 0, 0]
+    assert mask[5:9] == [0, 0, 1, 1]
+    for pos, tok in enumerate(ids):
+        if tok in (2, 0):  # EOS separators and padding carry the pad value
+            assert mask[pos] == 0
+
+    # Historical default: without extra_field config, rows carry no extra fields.
+    default_stage = PackStage(PackStageConfig(enabled=True, seq_length=12, strategy="greedy", shuffle_packed=False))
+    default_out = list(default_stage.process({"ds1": source}, context)["ds1"].open_shard("packed_shard_0"))
+    assert len(default_out) == 1
+    assert "completion_mask" not in default_out[0]
+
+
 def test_pack_stage_respects_record_context_stats_false():
     """When record_context_stats=False, no metric is recorded even after iteration."""
     rows = _make_rows([4] * 50)

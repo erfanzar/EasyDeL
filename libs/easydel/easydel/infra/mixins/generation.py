@@ -303,6 +303,7 @@ def _is_kv_attention_layer_type(layer_type: tp.Any) -> bool:
         or layer_type_norm == "hybrid"
         or layer_type_norm == "parallel_hybrid"
         or layer_type_norm == "qwen_sparse_attention"
+        or layer_type_norm == "indexed_attention"  # transformers>=5.18 name for indexer (DSA/QSA) layers
     )
 
 
@@ -1299,6 +1300,51 @@ def _resolve_backend_for_esurge(config: EasyDeLBaseConfig) -> str:
         return "cpu"
 
 
+def _is_shared_indexer_layer(text_config, layer_idx: int) -> bool:
+    """Return ``True`` when ``layer_idx`` reuses another layer's DSA indexer selection.
+
+    Args:
+        text_config: Text-only model configuration (may lack ``indexer_types``).
+        layer_idx: Model layer index.
+
+    Returns:
+        bool: ``True`` only for an explicit ``"shared"`` entry in ``indexer_types``.
+    """
+    indexer_types = getattr(text_config, "indexer_types", None)
+    if not isinstance(indexer_types, (list, tuple)) or not 0 <= int(layer_idx) < len(indexer_types):
+        return False
+    return str(indexer_types[int(layer_idx)]).lower() == "shared"
+
+
+def _count_full_indexer_kv_layers(text_config, num_kv_layers: int) -> int:
+    """Count the MLA-cached layers that own paged DSA indexer state.
+
+    ``"shared"`` indexer layers are excluded. Layers whose ``layer_types`` entry is a
+    linear-attention type own no MLA view and are ignored. When the schedule cannot be
+    resolved every cached layer is counted, which over-budgets rather than under-budgets.
+
+    Args:
+        text_config: Text-only model configuration.
+        num_kv_layers: Number of layers the MLA cache allocates views for.
+
+    Returns:
+        int: Layers charged for indexer pages, clamped to ``[0, num_kv_layers]``.
+    """
+    indexer_types = getattr(text_config, "indexer_types", None)
+    if not isinstance(indexer_types, (list, tuple)):
+        return int(num_kv_layers)
+    layer_types = getattr(text_config, "layer_types", None)
+    shared = 0
+    for idx, indexer_type in enumerate(indexer_types):
+        if str(indexer_type).lower() != "shared":
+            continue
+        if isinstance(layer_types, (list, tuple)) and idx < len(layer_types):
+            if "linear" in str(layer_types[idx]).lower():
+                continue
+        shared += 1
+    return max(0, min(int(num_kv_layers), int(num_kv_layers) - shared))
+
+
 def _count_kv_layers(text_config) -> int:
     """Count layers that consume KV cache pages.
 
@@ -1991,6 +2037,7 @@ class EasyGenerationMixin:
         dtype: jnp.dtype | None = None,
         num_hidden_layers_override: int | None = None,
         max_cache_tokens: int | None = None,
+        indexer_page_kwargs: dict | None = None,
     ):
         """Create an MLA-specific :class:`MLARaggedPagesCacheConfig`.
 
@@ -2007,6 +2054,10 @@ class EasyGenerationMixin:
                 ``kvdtype``.
             num_hidden_layers_override: Forces a specific number of cache
                 layers (used by per-stage callers).
+            max_cache_tokens: Optional hard cap on cached tokens.
+            indexer_page_kwargs: Explicit paged DSA indexer layout
+                (``indexer_key_dim`` / ``indexer_gate_dim`` / ``indexer_kpool``);
+                ``None`` derives it for pooled indexers (``index_kpool > 1``).
 
         Returns:
             MLARaggedPagesCacheConfig: Ready-to-use MLA cache config.
@@ -2067,6 +2118,25 @@ class EasyGenerationMixin:
         if mla_num_heads is None or int(mla_num_heads) <= 0:
             mla_num_heads = 1
 
+        # Pooled DSA indexers (GLM-5 k-pool) keep their per-token ``key | gate`` state
+        # and completed-pool summaries in pages sharing the KV page table, so the
+        # serving path scores the real history instead of only the current step.
+        # Per-token indexers opt in from their own cache-config builder via ``indexer_page_kwargs``.
+        indexer_kwargs: dict = dict(indexer_page_kwargs or {})
+        index_kpool = int(getattr(text_config, "index_kpool", 1) or 1)
+        index_head_dim = int(getattr(text_config, "index_head_dim", 0) or 0)
+        if not indexer_kwargs and index_kpool > 1 and index_head_dim > 0:
+            indexer_kwargs = dict(
+                indexer_key_dim=index_head_dim,
+                indexer_gate_dim=index_head_dim,
+                indexer_kpool=index_kpool,
+            )
+        if indexer_kwargs and int(indexer_kwargs.get("indexer_key_dim", 0) or 0) > 0:
+            # Only layers with a "full" indexer own indexer pages; "shared" layers reuse the
+            # previous full layer's selection. Linear-attention layers own no MLA view at all.
+            indexer_kwargs.setdefault(
+                "indexer_num_layers", _count_full_indexer_kv_layers(text_config, int(num_hidden_layers))
+            )
         return MLARaggedPagesCacheConfig.create(
             mesh=text_config.mesh,
             runtime_sharding_resolver=text_config.runtime_sharding_resolver,
@@ -2079,6 +2149,7 @@ class EasyGenerationMixin:
             hbm_utilization=hbm_utilization,
             page_size=page_size,
             max_cache_tokens=max_cache_tokens,
+            **indexer_kwargs,
         )
 
     def create_ragged_page_cache_config(
@@ -2771,6 +2842,7 @@ class EasyGenerationMixin:
                                 mesh=text_config.mesh,
                                 runtime_sharding_resolver=text_config.runtime_sharding_resolver,
                                 quantizer=quantizer,
+                                with_indexer_pages=not _is_shared_indexer_layer(text_config, idx),
                             )
                         elif isinstance(t_config, RaggedPagesCacheConfig):
                             attn_view = RaggedPagesCacheView.init(
@@ -2848,6 +2920,15 @@ class EasyGenerationMixin:
                                 layer_index=idx,
                                 mesh=text_config.mesh,
                                 runtime_sharding_resolver=text_config.runtime_sharding_resolver,
+                            )
+                        elif view_class is MLARaggedPagesCacheView:
+                            view = view_class.init(
+                                config=config_classes,
+                                layer_index=idx,
+                                mesh=text_config.mesh,
+                                runtime_sharding_resolver=text_config.runtime_sharding_resolver,
+                                quantizer=quantizer,
+                                with_indexer_pages=not _is_shared_indexer_layer(text_config, idx),
                             )
                         else:
                             view = view_class.init(

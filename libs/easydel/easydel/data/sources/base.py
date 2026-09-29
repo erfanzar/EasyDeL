@@ -349,6 +349,7 @@ class ParquetShardedSource(ShardedDataSource[dict]):
         self._storage_options = storage_options or {}
         self._columns = columns
         self._shard_info_cache: dict[str, ParquetShardInfo] = {}
+        self._guard_exact_cache: dict[tuple[str, int], bool] = {}
         self._warned_projection_fallback = False
         self._force_single_threaded_reads = False
 
@@ -776,23 +777,83 @@ class ParquetShardedSource(ShardedDataSource[dict]):
         """
         yield from self._open_shard_resumable(shard_name, 0)
 
-    def open_shard_at_row(self, shard_name: str, row: int) -> "Iterator[dict]":
-        """Open a Parquet shard starting at a specific row.
+    @property
+    def delivers_all_metadata_rows(self) -> bool:
+        """Whether iteration delivers every physical row counted by ``num_rows``.
 
-        Uses row group metadata to skip directly to the relevant row group,
-        avoiding sequential scanning of earlier rows. Transient I/O failures
-        mid-stream resume at the next unread row.
+        The decode-memory guard skips a row group only when its projected
+        payload exceeds the guard threshold, so exactness is a per-source
+        fact read from the file footers: ``True`` unless some row group of
+        some shard would actually be skipped. Footer results are cached per
+        shard and threshold, so repeated queries do no I/O.
+
+        Returns:
+            bool: ``True`` when the guard is disabled or no row group of any
+            shard exceeds it (delivered rows equal the metadata row count);
+            ``False`` when at least one row group would be skipped, making
+            delivered rows a strict subset of the metadata row count.
+        """
+        max_safe_bytes = _parquet_max_safe_row_group_bytes()
+        if max_safe_bytes <= 0:
+            return True
+        return all(self._shard_has_no_guarded_row_group(name, max_safe_bytes) for name in self._files)
+
+    def _shard_has_no_guarded_row_group(self, shard_name: str, max_safe_bytes: int) -> bool:
+        """Report whether the decode-memory guard leaves every row group of a shard readable.
+
+        Mirrors the skip predicate of :meth:`_iter_row_group_rows`
+        (``0 < max_safe_bytes < projected_bytes``) using footer metadata only.
 
         Args:
             shard_name: Path or URL to the Parquet file.
-            row: Zero-based row index to start from.
+            max_safe_bytes: Positive guard threshold in bytes.
+
+        Returns:
+            bool: ``True`` when no row group of the shard exceeds the guard.
+        """
+        key = (shard_name, max_safe_bytes)
+        cached = self._guard_exact_cache.get(key)
+        if cached is not None:
+            return cached
+
+        import pyarrow.parquet as pq  # pyright: ignore[reportMissingTypeStubs]
+
+        with self._open_file(shard_name) as fh:
+            pf = pq.ParquetFile(fh)
+            exact = True
+            for rg_idx in range(pf.num_row_groups):
+                proj_bytes, _rg_rows = self._projected_row_group_bytes(pf, rg_idx)
+                if max_safe_bytes < proj_bytes:
+                    exact = False
+                    break
+        self._guard_exact_cache[key] = exact
+        return exact
+
+    def open_shard_at_row(self, shard_name: str, row: int) -> "Iterator[dict]":
+        """Open a Parquet shard starting at a specific delivered row.
+
+        Uses row group metadata to skip directly to the relevant row group,
+        avoiding sequential scanning of earlier rows. ``row`` counts rows as
+        DELIVERED by iteration — the unit every resume bookkeeping uses — so
+        row groups dropped by the decode-memory guard are excluded from the
+        count and the offset is translated to the matching physical row
+        before seeking. Transient I/O failures mid-stream resume at the next
+        unread row.
+
+        Args:
+            shard_name: Path or URL to the Parquet file.
+            row: Zero-based delivered-row index to start from.
 
         Yields:
             Rows starting from the specified position.
         """
-        yield from self._open_shard_resumable(shard_name, row)
+        # The delivered->physical translation reads the footer, so it runs inside the retry
+        # boundary: a transient footer-read failure on resume is retried like any other read (r14 S13-1).
+        yield from self._open_shard_resumable(shard_name, None, delivered_row=row)
 
-    def _open_shard_resumable(self, shard_name: str, start_row: int) -> "Iterator[dict]":
+    def _open_shard_resumable(
+        self, shard_name: str, start_row: int | None, *, delivered_row: int = 0
+    ) -> "Iterator[dict]":
         """Stream rows from ``start_row``, reopening at the next unread row on transient I/O errors.
 
         Long-running streaming jobs hold shard file handles open for minutes to
@@ -804,11 +865,14 @@ class ParquetShardedSource(ShardedDataSource[dict]):
         """
         import time as _time
 
-        position = int(start_row)
+        # ``start_row=None``: translate ``delivered_row`` to a physical row on the first attempt.
+        position = None if start_row is None else int(start_row)
         failures_without_progress = 0
         while True:
             made_progress = False
             try:
+                if position is None:
+                    position = self._physical_row_for_delivered_row(shard_name, delivered_row)
                 for abs_row, example in self._iter_shard_rows(shard_name, position):
                     # Track the PHYSICAL row index, not the delivered count:
                     # the decode-memory guard can skip whole row groups, and a
@@ -830,6 +894,48 @@ class ParquetShardedSource(ShardedDataSource[dict]):
                     f"(attempt {failures_without_progress}/{_PARQUET_STREAM_MAX_REOPENS})."
                 )
                 _time.sleep(delay)
+
+    def _physical_row_for_delivered_row(self, shard_name: str, row: int) -> int:
+        """Translate a delivered-row offset into a file-physical row index.
+
+        The decode-memory guard skips whole row groups, so the delivered
+        stream is a subset of the file's physical rows while resume
+        bookkeeping counts delivered examples. This walks the row-group
+        layout (footer metadata only, no data reads) replicating the
+        guard's skip predicate so the offset maps onto the row iteration
+        would actually deliver.
+
+        Args:
+            shard_name: Path or URL to the Parquet file.
+            row: Zero-based delivered-row offset.
+
+        Returns:
+            int: Physical row index whose iteration continues the
+            delivered stream at ``row``. Returns the file's total
+            physical row count when ``row`` is past the delivered end
+            (the resulting iterator yields nothing).
+        """
+        row = max(int(row), 0)
+        if row == 0:
+            return 0
+        max_safe_bytes = _parquet_max_safe_row_group_bytes()
+
+        import pyarrow.parquet as pq  # pyright: ignore[reportMissingTypeStubs]
+
+        with self._open_file(shard_name) as fh:
+            pf = pq.ParquetFile(fh)
+            delivered = 0
+            physical = 0
+            for rg_idx in range(pf.num_row_groups):
+                proj_bytes, rg_rows = self._projected_row_group_bytes(pf, rg_idx)
+                rg_rows = max(int(rg_rows), 0)
+                guarded = 0 < max_safe_bytes < proj_bytes
+                if not guarded:
+                    if delivered + rg_rows > row:
+                        return physical + (row - delivered)
+                    delivered += rg_rows
+                physical += rg_rows
+        return physical
 
     def _iter_shard_rows(self, shard_name: str, row: int) -> "Iterator[tuple[int, dict]]":
         """Single-pass ``(absolute_row_index, row)`` stream starting at ``row``.
@@ -992,12 +1098,16 @@ class JsonShardedSource(ShardedDataSource[dict]):
 
         with self._open_file(shard_name) as fh:
             if self._jsonl:
-                for i, line in enumerate(fh):
-                    if i < row:
-                        continue
+                # ``row`` counts delivered records, and open_shard skips blank lines, so only
+                # non-blank lines advance the seek counter (r11 S13-3).
+                delivered = 0
+                for line in fh:
                     line = line.strip()
-                    if line:
+                    if not line:
+                        continue
+                    if delivered >= row:
                         yield json.loads(line)
+                    delivered += 1
             else:
                 data = json.load(fh)
                 if isinstance(data, list):
@@ -1563,6 +1673,15 @@ class CompositeShardedSource(ShardedDataSource[dict]):
             Sum of shard counts.
         """
         return len(self._shard_names)
+
+    @property
+    def delivers_all_metadata_rows(self) -> bool:
+        """Whether every wrapped source delivers all of its metadata rows.
+
+        Returns:
+            bool: ``all(source.delivers_all_metadata_rows)`` over the wrapped sources.
+        """
+        return all(source.delivers_all_metadata_rows for source in self._sources)
 
     def open_shard(self, shard_name: str) -> "Iterator[dict]":
         """Dispatch to the wrapped source that owns ``shard_name``.

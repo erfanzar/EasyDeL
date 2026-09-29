@@ -39,6 +39,10 @@ if tp.TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Sentinel returned by probe draws in `_empty_constituents`; mixed rows are dicts,
+# so a private object() can never collide with a real example.
+_PROBE_EMPTY = object()
+
 
 class WeightScheduler:
     """Step-indexed interpolator that produces curriculum mixing weights on demand.
@@ -369,6 +373,32 @@ class MixedShardedSource(ShardedDataSource[dict]):
 
         return offsets
 
+    def _empty_constituents(self) -> set[str]:
+        """Identify constituents that can never yield a single row.
+
+        Under ``stop_strategy="restart"`` a constituent is permanently
+        dead exactly when it is empty, and that is decided by its very
+        first draw, so the dead set can be resolved up front:
+        sources with trustworthy positive metadata row counts are
+        provably live, everything else gets one probe draw on a
+        fresh iterator (no shared iteration state is touched).
+
+        Returns:
+            set[str]: Names of constituents with no rows at all.
+        """
+        empty: set[str] = set()
+        for name, source in self._sources.items():
+            known = self._known_source_rows(source, list(source.shard_names))
+            if getattr(source, "delivers_all_metadata_rows", False) and known is not None and known[1] > 0:
+                continue
+            probe = self._chain_shards(source)
+            try:
+                if next(probe, _PROBE_EMPTY) is _PROBE_EMPTY:
+                    empty.add(name)
+            finally:
+                probe.close()
+        return empty
+
     def _known_shard_rows(self, source: ShardedDataSource, shard_name: str) -> int | None:
         """Best-effort exact row count for one constituent shard."""
         try:
@@ -480,6 +510,33 @@ class MixedShardedSource(ShardedDataSource[dict]):
             yield from itertools.islice(self.open_shard(_shard_name), row, None)
             return
 
+        empty = self._empty_constituents()
+        if empty:
+            # The block-offset fast path below assumes every planned id yields exactly
+            # one row. With a dead (empty) constituent the fresh path skips those ids
+            # without emitting, so an emitted-example count no longer lines up with
+            # block boundaries and the fast path would replay rows that were already
+            # served. Replay sequentially instead: it walks the exact fresh path.
+            logger.warning(
+                "MixedShardedSource resume falls back to sequential skip of %d mixed examples "
+                "because constituent(s) %s are empty.",
+                row,
+                sorted(empty),
+            )
+            yield from itertools.islice(self.open_shard(_shard_name), row, None)
+            return
+
+        # For an inexact source without finite shard metadata we cannot
+        # determine its restart period. Replaying the mixed stream preserves
+        # both its per-source offset and the weight schedule's emitted count.
+        if any(
+            not getattr(source, "delivers_all_metadata_rows", False)
+            and self._known_source_rows(source, list(source.shard_names)) is None
+            for source in self._sources.values()
+        ):
+            yield from itertools.islice(self.open_shard(_shard_name), row, None)
+            return
+
         offsets = self._source_offsets_for_row(row)
         iters = {name: self._chain_shards_at_row(self._sources[name], offsets[name]) for name in self._names}
 
@@ -543,7 +600,34 @@ class MixedShardedSource(ShardedDataSource[dict]):
                 type(source).__name__,
                 row,
             )
-            yield from itertools.islice(self._chain_shards(source), row, None)
+
+        # Without metadata, or when metadata may over-count delivered rows, skip lazily. Only this
+        # restart-mode path calls here, so a skip that crosses the end of the constituent must wrap
+        # to ``row % period`` (r11 S13-1: a finite islice restarted the cycle from its first row).
+        if known_rows is None or not getattr(source, "delivers_all_metadata_rows", False):
+            # Skip delivered rows lazily: ordinary seeks must not count the
+            # entire dataset just to learn a restart period they never cross.
+            stream = self._chain_shards(source)
+            consumed = 0
+            try:
+                while consumed < row:
+                    try:
+                        next(stream)
+                    except StopIteration:
+                        if consumed == 0:
+                            return
+                        # We crossed the end of one delivered cycle. Only now
+                        # is its true length known; restart at the residual
+                        # offset rather than trusting physical row metadata.
+                        stream.close()
+                        stream = self._chain_shards(source)
+                        for _ in range(row % consumed):
+                            next(stream)
+                        break
+                    consumed += 1
+                yield from stream
+            finally:
+                stream.close()
             return
 
         rows_by_shard, total_rows = known_rows

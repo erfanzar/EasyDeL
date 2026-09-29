@@ -175,6 +175,25 @@ class ShardedDataSource(ABC, Generic[T_co]):
         """
         return None
 
+    @property
+    def delivers_all_metadata_rows(self) -> bool:
+        """Whether iterating a shard delivers exactly ``num_rows`` rows.
+
+        Seek/split arithmetic in resumable wrappers (shuffle, mix,
+        checkpoint resume) counts DELIVERED examples but locates shard
+        boundaries with ``ShardInfo.num_rows`` metadata; the two only
+        agree when iteration cannot skip data. Sources whose decoders
+        may drop rows (e.g. the Parquet decode-memory guard skipping
+        oversized row groups) override this to ``False`` so wrappers
+        fall back to exact sequential replay instead of trusting
+        metadata that iteration will not match.
+
+        Returns:
+            bool: ``True`` when ``num_rows`` metadata always equals the
+            number of rows iteration will deliver.
+        """
+        return True
+
     def open_shard_at_row(
         self,
         shard_name: str,
@@ -553,6 +572,15 @@ class MappedShardedDataSource(ShardedDataSource[T], Generic[T]):
             int: ``self._source.num_shards()``.
         """
         return self._source.num_shards()
+
+    @property
+    def delivers_all_metadata_rows(self) -> bool:
+        """Forward the wrapped source's flag (the per-row map never drops rows).
+
+        Returns:
+            bool: ``self._source.delivers_all_metadata_rows``.
+        """
+        return self._source.delivers_all_metadata_rows
 
     def open_shard(self, shard_name: str) -> Iterator[T]:
         """Open the underlying shard and yield ``fn(x)`` for each example.

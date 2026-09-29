@@ -42,6 +42,33 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAP_BATCH_SIZE = 32
 
 
+def transform_preserves_row_count(transform: tp.Any) -> bool:
+    """Report whether a transform emits exactly one output row per input row.
+
+    Only one-in/one-out transforms can reuse upstream row offsets. Batched
+    transforms must explicitly promise one output per input by defining
+    ``preserves_row_count = True`` on their own class body (the opt-in is read
+    from ``type(transform).__dict__`` and is not inherited); an arbitrary
+    ``map_batch`` may filter or expand rows.
+
+    Args:
+        transform: Transform (or arbitrary callable) applied to each row.
+
+    Returns:
+        bool: ``True`` only for non-filter, non-expand :class:`Transform`
+        instances that either have no ``map_batch`` or opted in explicitly.
+    """
+    return (
+        isinstance(transform, Transform)
+        and not transform.is_filter
+        and not transform.is_expand
+        and (
+            not callable(getattr(transform, "map_batch", None))
+            or type(transform).__dict__.get("preserves_row_count", False) is True
+        )
+    )
+
+
 class TransformedShardedSource(ShardedDataSource[dict]):
     """:class:`ShardedDataSource` wrapper that applies a transform lazily on iteration.
 
@@ -98,6 +125,10 @@ class TransformedShardedSource(ShardedDataSource[dict]):
         self._source = source
         self._transform = transform
         self._map_batch_size = DEFAULT_MAP_BATCH_SIZE if map_batch_size is None else max(int(map_batch_size), 1)
+        # Only one-in/one-out transforms can preserve upstream row offsets.
+        # Batched transforms must explicitly promise one output for every input;
+        # an arbitrary map_batch implementation may filter or expand rows.
+        self._preserves_row_count = transform_preserves_row_count(transform)
 
     def _iter_transformed(self, rows: Iterator[dict]) -> Iterator[dict]:
         """Apply the transform to a row stream, batching when supported.
@@ -176,8 +207,10 @@ class TransformedShardedSource(ShardedDataSource[dict]):
     def open_shard_at_row(self, shard_name: str, row: int) -> Iterator[dict]:
         """Open a shard at a specific row and apply transforms.
 
-        Note: Row counting is based on the underlying source, not the
-        transformed output. Filtered/expanded examples may affect row alignment.
+        Row counting follows delivered output examples. Cardinality-changing
+        transforms replay and skip the transformed stream. One-in/one-out
+        transforms use upstream seek; batched transforms start at the original
+        batch boundary so output also matches uninterrupted iteration.
 
         Args:
             shard_name: Name of the shard to open.
@@ -186,7 +219,26 @@ class TransformedShardedSource(ShardedDataSource[dict]):
         Yields:
             Transformed examples (filtered examples are skipped).
         """
+        row = max(int(row), 0)
+        if not self._preserves_row_count:
+            return itertools.islice(self.open_shard(shard_name), row, None)
+        if callable(getattr(self._transform, "map_batch", None)):
+            # Even a one-to-one batch map can depend on its other inputs (e.g.
+            # longest-row padding). Keep the same chunk boundaries as a fresh
+            # open_shard so resuming never changes the contents of a row.
+            aligned_row = (row // self._map_batch_size) * self._map_batch_size
+            transformed = self._iter_transformed(self._source.open_shard_at_row(shard_name, aligned_row))
+            return itertools.islice(transformed, row - aligned_row, None)
         return self._iter_transformed(self._source.open_shard_at_row(shard_name, row))
+
+    @property
+    def delivers_all_metadata_rows(self) -> bool:
+        """Whether both the transform and upstream preserve metadata row counts.
+
+        Returns:
+            bool: ``False`` for filtering/expanding transforms or inexact upstreams.
+        """
+        return self._preserves_row_count and self._source.delivers_all_metadata_rows
 
     def get_shard_info(self, shard_name: str) -> tp.Any:
         """Pass through ``ShardInfo`` from the underlying source.
@@ -320,6 +372,19 @@ class ShuffledShardedSource(ShardedDataSource[dict]):
 
         if len(shard_names) == 1:
             yield from self._source.open_shard_at_row(shard_names[0], row)
+            return
+
+        if not self._source.delivers_all_metadata_rows:
+            # Shard boundaries below are derived from num_rows metadata; a source
+            # whose iteration may deliver fewer rows (e.g. the parquet decode-memory
+            # guard skipping oversized row groups) would leave the seek misaligned.
+            logger.warning(
+                "Cannot seek shuffled source through %s by row metadata because its iteration may "
+                "deliver fewer rows than num_rows; falling back to sequential skip of %d rows.",
+                type(self._source).__name__,
+                row,
+            )
+            yield from itertools.islice(self._underlying_stream_from_order(shard_names), row, None)
             return
 
         rows_by_shard: list[tuple[str, int]] = []
@@ -575,6 +640,10 @@ class LimitedShardedSource(ShardedDataSource[dict]):
         """
         if shard_name in self._exact_shard_sizes:
             return self._exact_shard_sizes[shard_name]
+        if not self._source.delivers_all_metadata_rows:
+            # Physical Parquet rows (or rows before a filter) cannot debit a
+            # delivered-row limit; let _resolve_prefix_until count the stream.
+            return None
         info = self._source.get_shard_info(shard_name)
         if info is None or info.num_rows is None:
             return None
@@ -681,6 +750,15 @@ class LimitedShardedSource(ShardedDataSource[dict]):
         if row >= shard_limit:
             return iter(())
         return itertools.islice(self._source.open_shard_at_row(shard_name, row), shard_limit - row)
+
+    @property
+    def delivers_all_metadata_rows(self) -> bool:
+        """Forwarded: row budgets derive from the wrapped source's metadata.
+
+        Returns:
+            bool: The wrapped source's flag.
+        """
+        return self._source.delivers_all_metadata_rows
 
     def get_shard_info(self, shard_name: str) -> ShardInfo | None:
         """Return shard metadata adjusted for this source's row budget.

@@ -2096,6 +2096,10 @@ class ModelConverter:
         state_dict = StateDictConverter.easydel_to_torch(module=module, dtype=dtype, reform_param=reform_param)
         config_class = base_huggingface_module.config_class
         config_dict = config.to_dict()
+        # Configs that alias ``tie_word_embeddings`` through ``attribute_map`` (MPT: ``use_lm_head``) serialize only
+        # the aliased name, so the HF config would fall back to its own default and could flip the head's tying.
+        if "tie_word_embeddings" not in config_dict and hasattr(config, "tie_word_embeddings"):
+            config_dict["tie_word_embeddings"] = bool(config.tie_word_embeddings)
         # Values HF derives through read-only properties (e.g. Falcon's ``head_dim``) cannot be passed back in.
         for key in list(config_dict):
             attr = inspect.getattr_static(config_class, key, None)
@@ -2131,5 +2135,10 @@ class ModelConverter:
                     "not a data problem):\n  " + "\n  ".join(shape_conflicts)
                 )
             model.load_state_dict(state_dict, assign=True, strict=True)
+            # ``assign=True`` swaps in a fresh tensor per key, which unties parameters torch had tied at
+            # construction (e.g. ``lm_head.weight`` -> ``wte.weight``). Re-tie them; ``tie_weights`` only touches
+            # keys the HF config declares tied, so untied models are left alone.
+            if hasattr(model, "tie_weights"):
+                model.tie_weights()
 
         return model

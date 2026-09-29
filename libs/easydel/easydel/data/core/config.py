@@ -467,6 +467,15 @@ class PackStageConfig:
             the first few upstream rows all have length exactly
             ``seq_length``, which strongly suggests they were already
             padded to max length before packing.
+        extra_field_pad_values (dict[str, int] | None): Optional
+            token-aligned row fields (e.g. ``"completion_mask"``) to
+            preserve through packing, mapped to their pad value.
+            ``None`` (default) drops extra fields, matching the
+            historical behaviour.
+        extra_field_separator_values (dict[str, int] | None): Values
+            inserted into each extra field at the synthetic EOS
+            separator between packed examples; defaults to each
+            field's pad value when unset.
     """
 
     enabled: bool = False
@@ -481,6 +490,8 @@ class PackStageConfig:
     return_stats: bool = True
     record_context_stats: bool = True
     warn_on_padded_input: bool = True
+    extra_field_pad_values: dict[str, int] | None = None
+    extra_field_separator_values: dict[str, int] | None = None
 
 
 @dataclass

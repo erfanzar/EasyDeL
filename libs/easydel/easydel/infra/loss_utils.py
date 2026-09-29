@@ -664,8 +664,11 @@ def cross_entropy_loss_and_accuracy(
         valid = valid.astype(compute_dtype)
 
     lse = jax.scipy.special.logsumexp(source, axis=-1)
-    logit_y = jnp.take_along_axis(source, target[..., None], axis=-1)[..., 0]
-    nll = (lse - logit_y) * valid
+    # Ignored positions carry out-of-range labels (e.g. -100); JAX's default gather fills those
+    # with NaN, and NaN * 0 would poison the loss and its gradient. Gather a safe index instead.
+    safe_target = jnp.where((target >= 0) & (target < source.shape[-1]), target, 0)
+    logit_y = jnp.take_along_axis(source, safe_target[..., None], axis=-1)[..., 0]
+    nll = jnp.where(valid > 0, lse - logit_y, 0.0) * valid
     weight_sum = jnp.maximum(jnp.sum(valid), 1e-8)
     loss = jnp.sum(nll) / weight_sum
 
@@ -842,7 +845,8 @@ def get_factor_and_weight(
     if loss_normalizing_factor == SLNF.NUM_REAL_TARGET_TOKENS:
         output_normalizing_factor = jnp.sum(loss_weights)
     elif loss_normalizing_factor == SLNF.NUM_TOTAL_TARGET_TOKENS:
-        output_normalizing_factor = jnp.prod(batch["decoder_target_tokens"].shape)
+        # Static element count; ``jnp.prod`` rejects the shape tuple on current JAX.
+        output_normalizing_factor = jnp.asarray(jnp.asarray(batch["decoder_target_tokens"]).size, jnp.float32)
     elif loss_normalizing_factor == SLNF.AVERAGE_PER_SEQUENCE:
         if "decoder_segment_ids" in batch:
             norm_vec = _sum_weights_per_segment(
@@ -1184,6 +1188,10 @@ def fixed_cross_entropy(
     # Idempotent when the mask already excludes them (attention_mask=None / full-sequence / completion mask).
     mask = mask * (target != config.ignore_index).astype(mask.dtype)
     loss_factor = config.loss_normalizing_factor
+    # String factors (config files / CLI) must select the same branch as the enum; without this,
+    # "NO_WEIGHT_NUM_REAL_TARGET_TOKENS" skipped its branch and crashed in get_factor_and_weight.
+    if isinstance(loss_factor, str):
+        loss_factor = convert_special_loss_normalizing_factor_to_enum(loss_factor)
 
     if config.reduction is not None:
         # PyTorch-style reduction through the fused ejkernel kernel (honors z_loss and
@@ -1204,7 +1212,9 @@ def fixed_cross_entropy(
         weight_sum = norm
         preds = jnp.argmax(source, axis=-1)
         correct = (preds == target).astype(compute_dtype) * w
-        accuracy = jnp.sum(correct) / jnp.maximum(norm, 1e-8)
+        # Accuracy is always the weighted fraction over ALL valid tokens; with reduction="none" ``norm``
+        # is per-token, so dividing by it gave values > 1 (r12 S10-1).
+        accuracy = jnp.sum(correct) / jnp.maximum(jnp.sum(w), 1e-8)
 
     elif (
         loss_factor == SLNF.NO_WEIGHT_NUM_REAL_TARGET_TOKENS
@@ -1229,14 +1239,11 @@ def fixed_cross_entropy(
 
     else:
         if batch is None:
-            lf = config.loss_normalizing_factor
-            if isinstance(lf, str):
-                lf = convert_special_loss_normalizing_factor_to_enum(lf)
-            batch = (
-                {"decoder_target_tokens": target, "decoder_loss_weights": mask.astype(compute_dtype)}
-                if lf == SLNF.NUM_REAL_TARGET_TOKENS
-                else {}
-            )
+            # Named factors read the targets (and derive weights from them when none are given);
+            # constant / None factors return the given ``decoder_loss_weights`` unchanged. Always pass
+            # the real mask as the weights: it keeps token id 0 valid, and an empty batch gave
+            # constant / None factors ``loss_weights=None`` and crashed on ``None.dtype`` (r13 S10-1).
+            batch = {"decoder_target_tokens": target, "decoder_loss_weights": mask.astype(compute_dtype)}
 
         loss_normalizing_factor, loss_weights = get_factor_and_weight(config.loss_normalizing_factor, batch)
 
@@ -1252,11 +1259,14 @@ def fixed_cross_entropy(
             source, target, loss_weights, config, compute_dtype, config.cross_entropy_platform or "xla", paxis=paxis
         )
         if loss_normalizing_factor is not None:
-            total_loss = total_loss / loss_normalizing_factor
-            total_z_loss = total_z_loss / loss_normalizing_factor
+            # NUM_REAL_TARGET_TOKENS is zero when every target is ignored.
+            safe_factor = jnp.where(loss_normalizing_factor == 0, 1, loss_normalizing_factor)
+            total_loss = total_loss / safe_factor
+            total_z_loss = total_z_loss / safe_factor
 
         if num_items_in_batch is not None:
-            loss = total_loss / num_items_in_batch
+            # A fully ignored batch carries a zero item count; keep its loss and gradient finite.
+            loss = total_loss / jnp.where(num_items_in_batch == 0, 1, num_items_in_batch)
         elif config.divide_weight_sum:
             loss = total_loss / jnp.maximum(weight_sum, 1e-8)
         else:
@@ -1498,11 +1508,14 @@ def causal_lm_loss_chunked_lm_head(
     accuracy = flce_out.accuracy
 
     if global_loss_factor is not None:
-        total_loss = total_loss / global_loss_factor
-        total_z_loss = total_z_loss / global_loss_factor
+        # A fully masked batch has zero valid tokens; keep its zero loss and gradient finite.
+        safe_factor = jnp.where(global_loss_factor == 0, 1, global_loss_factor)
+        total_loss = total_loss / safe_factor
+        total_z_loss = total_z_loss / safe_factor
 
     if num_items_in_batch is not None:
-        total_loss = total_loss / num_items_in_batch
+        # A fully ignored batch carries a zero item count; keep its loss and gradient finite.
+        total_loss = total_loss / jnp.where(num_items_in_batch == 0, 1, num_items_in_batch)
 
     return LossMetrics(loss=total_loss, z_loss=total_z_loss, weight_sum=weight_sum, accuracy=accuracy)
 

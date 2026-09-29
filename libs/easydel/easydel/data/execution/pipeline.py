@@ -23,6 +23,7 @@ This module provides:
 
 from __future__ import annotations
 
+import itertools
 import logging
 import multiprocessing as mp
 import os
@@ -873,6 +874,18 @@ class _ParallelTransformedShardedSource(ShardedDataSource[dict]):
         """Forward the shard metadata query to the wrapped source."""
         return self._source.get_shard_info(shard_name)
 
+    @property
+    def delivers_all_metadata_rows(self) -> bool:
+        """Whether the transform and upstream both preserve metadata row counts.
+
+        Returns:
+            bool: ``False`` when the transform may filter or expand rows, or
+            when the wrapped source does not deliver every metadata row.
+        """
+        from ..transforms.source import transform_preserves_row_count
+
+        return transform_preserves_row_count(self._transform) and self._source.delivers_all_metadata_rows
+
     def open_shard(self, shard_name: str) -> tp.Iterator[dict]:
         """Iterate ``shard_name`` with the transform applied in parallel.
 
@@ -888,13 +901,23 @@ class _ParallelTransformedShardedSource(ShardedDataSource[dict]):
     def open_shard_at_row(self, shard_name: str, row: int) -> tp.Iterator[dict]:
         """Resume-aware variant of :meth:`open_shard` skipping leading rows.
 
+        Row counting follows delivered OUTPUT rows. Transforms that may drop
+        or add rows cannot reuse upstream offsets, so they replay the shard
+        and skip ``row`` transformed rows.
+
         Args:
             shard_name: Shard identifier.
-            row: Number of rows to discard before transform application.
+            row: Number of transformed rows to discard.
 
         Yields:
             dict: Transformed rows starting at offset ``row``.
         """
+        from ..transforms.source import transform_preserves_row_count
+
+        row = max(int(row), 0)
+        if not transform_preserves_row_count(self._transform):
+            yield from itertools.islice(self.open_shard(shard_name), row, None)
+            return
         yield from self._iter_parallel(self._source.open_shard_at_row(shard_name, row))
 
     def _iter_parallel(self, examples: tp.Iterator[dict]) -> tp.Iterator[dict]:
@@ -997,6 +1020,11 @@ class _DropFieldsShardedSource(ShardedDataSource[dict]):
     def get_shard_info(self, shard_name: str) -> tp.Any:
         """Forward the shard metadata query to the wrapped source."""
         return self._source.get_shard_info(shard_name)
+
+    @property
+    def delivers_all_metadata_rows(self) -> bool:
+        """Forward the wrapped source's flag (dropping fields never drops rows)."""
+        return self._source.delivers_all_metadata_rows
 
     def open_shard(self, shard_name: str) -> tp.Iterator[dict]:
         """Open a shard and yield rows with the configured fields stripped.
@@ -1142,6 +1170,11 @@ class _ArrayFieldsOnlyShardedSource(ShardedDataSource[dict]):
         """Forward the shard metadata query to the wrapped source."""
         return self._source.get_shard_info(shard_name)
 
+    @property
+    def delivers_all_metadata_rows(self) -> bool:
+        """Forward the wrapped source's flag (field projection never drops rows)."""
+        return self._source.delivers_all_metadata_rows
+
     def open_shard(self, shard_name: str) -> tp.Iterator[dict]:
         """Open a shard yielding rows projected to tensor-compatible fields only.
 
@@ -1211,6 +1244,11 @@ class _ProgressBarShardedSource(ShardedDataSource[dict]):
     def num_shards(self) -> int:
         """Pass-through to the wrapped source's shard count."""
         return self._source.num_shards()
+
+    @property
+    def delivers_all_metadata_rows(self) -> bool:
+        """Forward the wrapped source's flag (progress tracking never drops rows)."""
+        return self._source.delivers_all_metadata_rows
 
     def _get_bar(self):
         """Lazy accessor that creates the tqdm bar on first use.

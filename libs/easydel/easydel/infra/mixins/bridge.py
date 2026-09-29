@@ -1553,7 +1553,11 @@ class EasyBridgeMixin(PushToHubMixin):
                     should_pack_int4_companion,
                 )
 
-                quant_kernel, quant_scales, quant_biases = channelwise_quantize_array(jnp.asarray(kernel_value), bits)
+                quant_kernel, quant_scales, quant_biases = channelwise_quantize_array(
+                    jnp.asarray(kernel_value),
+                    bits,
+                    expert_chunk=getattr(getattr(model, "config", None), "quantize_expert_chunk", None),
+                )
                 out = {"kernel": quant_kernel, "scales": quant_scales, "biases": quant_biases}
                 if bits == 4 and quant_kernel.ndim == 2 and should_pack_int4_companion(*quant_kernel.shape):
                     from ejkernel.modules import pack_int4_adjacent
@@ -1776,6 +1780,8 @@ class EasyBridgeMixin(PushToHubMixin):
                     for _key, _leaf in list(state.items()):
                         if not hasattr(_leaf, "sharding"):
                             continue
+                        if getattr(_leaf.sharding, "memory_kind", None) == "pinned_host":
+                            continue  # host-offloaded leaves (engram tables) keep their host placement
                         _target = _rule_sharding_for(_key)
                         if _target is None or _leaf.sharding == _target:
                             continue
@@ -5122,6 +5128,8 @@ class EasyBridgeMixin(PushToHubMixin):
                                 continue
 
                             _shard_getter["fn"] = f.get_tensor
+                            if _normalize_key(k) is None:
+                                continue  # unowned: skip the read (engram tables are ~100 GB each)
                             _process_and_write(k, f.get_tensor(k))
                 else:
                     shard = None
