@@ -24,6 +24,7 @@ def _make_depthwise_conv(
     in_features: int = 4,
     kernel_size: int = 4,
     dtype: jnp.dtype = jnp.float32,
+    causal: bool = False,
 ) -> nn.Conv1d:
     return nn.Conv1d(
         in_channels=in_features,
@@ -32,6 +33,8 @@ def _make_depthwise_conv(
         groups=in_features,
         use_bias=False,
         dtype=dtype,
+        # Production callers left-pad by kernel_size - 1 (causal, output length == input length).
+        padding=((kernel_size - 1, 0),) if causal else "VALID",
         rngs=spx.Rngs(0),
     )
 
@@ -58,6 +61,25 @@ def test_apply_conv_with_state_decode_matches_manual_cached_depthwise_conv():
     assert jnp.allclose(output, expected_output)
 
 
+def test_apply_conv_with_state_decode_padding_token_keeps_window():
+    """A cached singleton padding token (segment id -1) keeps the conv window and emits zeros (r10 S08-1)."""
+    conv = _make_depthwise_conv()
+    x = jax.random.normal(jax.random.key(2), (2, 1, 4), dtype=jnp.float32)
+    conv_state = jax.random.normal(jax.random.key(3), (2, 4, 4), dtype=jnp.float32)
+    kwargs = dict(is_inference=True, d_conv=4, output_dtype=jnp.float32)
+
+    plain_out, plain_state = apply_conv_with_state(x, conv, conv_state, **kwargs)
+    out, state = apply_conv_with_state(
+        x, conv, conv_state, segment_ids=jnp.asarray([[-1], [0]], dtype=jnp.int32), **kwargs
+    )
+
+    assert jnp.array_equal(out[0], jnp.zeros_like(out[0]))
+    assert jnp.array_equal(state[0], conv_state[0])
+    assert jnp.allclose(out[1], plain_out[1])
+    assert jnp.allclose(state[1], plain_state[1])
+    assert not jnp.allclose(plain_state[0], conv_state[0])  # negative control
+
+
 def test_apply_conv_with_state_prefill_reuses_partial_state_when_requested():
     conv = _make_depthwise_conv()
     x = jax.random.normal(jax.random.key(2), (2, 2, 4), dtype=jnp.float32)
@@ -73,14 +95,16 @@ def test_apply_conv_with_state_prefill_reuses_partial_state_when_requested():
         reuse_partial_state=True,
     )
 
-    expected_output = jax.nn.silu(conv(x))
+    expected_output = jax.nn.silu(conv(jnp.concatenate((conv_state[:, :, 1:].transpose(0, 2, 1), x), axis=1)))[
+        :, -x.shape[1] :, :
+    ]
     expected_state = jnp.concatenate((conv_state[:, :, 2:], x.transpose(0, 2, 1)), axis=-1)
 
     assert jnp.allclose(output, expected_output)
     assert jnp.allclose(new_state, expected_state)
 
 
-def test_apply_conv_with_state_prefill_zero_pads_without_state_reuse():
+def test_apply_conv_with_state_prefill_uses_cached_context_without_partial_reuse():
     conv = _make_depthwise_conv()
     x = jax.random.normal(jax.random.key(4), (2, 2, 4), dtype=jnp.float32)
     conv_state = jax.random.normal(jax.random.key(5), (2, 4, 4), dtype=jnp.float32)
@@ -95,11 +119,61 @@ def test_apply_conv_with_state_prefill_zero_pads_without_state_reuse():
         reuse_partial_state=False,
     )
 
-    expected_output = jax.nn.silu(conv(x))
-    expected_state = jnp.pad(x.transpose(0, 2, 1), ((0, 0), (0, 0), (2, 0)))
+    expected_output = jax.nn.silu(conv(jnp.concatenate((conv_state[:, :, 1:].transpose(0, 2, 1), x), axis=1)))[
+        :, -x.shape[1] :, :
+    ]
+    expected_state = jnp.concatenate((conv_state[:, :, 2:], x.transpose(0, 2, 1)), axis=-1)
 
     assert jnp.allclose(output, expected_output)
     assert jnp.allclose(new_state, expected_state)
+
+
+def test_apply_conv_with_state_split_prefill_matches_unsplit_and_preserves_state():
+    conv = _make_depthwise_conv(causal=True)
+    x = jax.random.normal(jax.random.key(9), (2, 12, 4), dtype=jnp.float32)
+    full, full_state = apply_conv_with_state(x, conv, None, is_inference=False, d_conv=4, output_dtype=jnp.float32)
+
+    for reuse_partial_state in (False, True):
+        first, state = apply_conv_with_state(
+            x[:, :7],
+            conv,
+            jnp.zeros((2, 4, 4)),
+            is_inference=False,
+            d_conv=4,
+            output_dtype=jnp.float32,
+            reuse_partial_state=reuse_partial_state,
+        )
+        assert jnp.allclose(first, full[:, :7], atol=1e-5)
+        second, final_state = apply_conv_with_state(
+            x[:, 7:],
+            conv,
+            state,
+            is_inference=False,
+            d_conv=4,
+            output_dtype=jnp.float32,
+            reuse_partial_state=reuse_partial_state,
+        )
+        assert jnp.allclose(jnp.concatenate((first, second), axis=1), full, atol=1e-5)
+        assert jnp.allclose(final_state, full_state)
+
+
+def test_apply_conv_with_state_split_short_continuation_matches_unsplit():
+    conv = _make_depthwise_conv(causal=True)
+    x = jax.random.normal(jax.random.key(10), (2, 6, 4), dtype=jnp.float32)
+    full, full_state = apply_conv_with_state(x, conv, None, is_inference=False, d_conv=4, output_dtype=jnp.float32)
+    first, state = apply_conv_with_state(
+        x[:, :4],
+        conv,
+        jnp.zeros((2, 4, 4)),
+        is_inference=False,
+        d_conv=4,
+        output_dtype=jnp.float32,
+    )
+    second, final_state = apply_conv_with_state(
+        x[:, 4:], conv, state, is_inference=False, d_conv=4, output_dtype=jnp.float32
+    )
+    assert jnp.allclose(jnp.concatenate((first, second), axis=1), full, atol=1e-5)
+    assert jnp.allclose(final_state, full_state)
 
 
 def test_apply_conv_with_state_prefill_runs_activation_at_output_dtype():

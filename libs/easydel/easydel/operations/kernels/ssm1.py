@@ -104,6 +104,38 @@ def _single_step_ssm1_fwd(
     return y, ssm_state_new
 
 
+def _packed_ssm1_fwd(
+    hidden_states: Float[Array, "slots width intermediate_size"],
+    A_real: Float[Array, "intermediate_size ssm_state_size"],
+    B: Float[Array, "slots width ssm_state_size"],
+    C: Float[Array, "slots width ssm_state_size"],
+    D: Float[Array, "intermediate_size"],  # noqa:F821
+    discrete_time_step: Float[Array, "slots width intermediate_size"],
+    valid: Array,
+    ssm_state: Float[Array, "slots intermediate_size ssm_state_size"],
+) -> tuple[Float[Array, "slots width intermediate_size"], Float[Array, "slots intermediate_size ssm_state_size"]]:
+    """Run the SSM1 recurrence across slot-major packed grids.
+
+    Invalid (padding) cells are identity transitions: they emit zero and keep
+    the incoming state, allowing each slot to have an independent ragged length.
+    """
+    state0 = ssm_state.astype(jnp.float32)
+
+    def step(state, values):
+        x, b, c, dt, is_valid = values
+        y, updated = _single_step_ssm1_fwd(x, A_real, b, c, D, dt, state)
+        next_state = jnp.where(is_valid[:, None, None], updated, state)
+        y = jnp.where(is_valid[:, None], y, jnp.zeros_like(y))
+        return next_state, y
+
+    final_state, outputs = jax.lax.scan(
+        step,
+        state0,
+        tuple(v.swapaxes(0, 1) for v in (hidden_states, B, C, discrete_time_step, valid)),
+    )
+    return outputs.swapaxes(0, 1), final_state
+
+
 def _segmented_ssm1_fwd(
     hidden_states: Float[Array, "batch seq_len intermediate_size"],
     A_real: Float[Array, "intermediate_size ssm_state_size"],

@@ -187,6 +187,22 @@ class ManifoldHyperConnection(spx.Module):
             and the read-weighted sum ``[B, S, D]`` in the input dtype.
             The write helper applies the mixer transposed.
         """
+        pre, post, comb = self.coefficients(hidden_streams)
+        return post, comb, manifold_collapse(pre, hidden_streams)
+
+    def coefficients(self, hidden_streams: Float[Array, "batch seq hc hidden"]) -> tuple[Array, Array, Array]:
+        """Return ``(pre, post, comb)`` in fp32 without collapsing the streams.
+
+        DeepSeek-V4.1 applies each sublayer's ``pre`` one sublayer later (attention collapses with the previous
+        FFN's ``pre``), so it needs the read gates separately from the collapse :meth:`forward` performs.
+
+        Args:
+            hidden_streams: Explicit residual streams ``[B, S, hc, D]``.
+
+        Returns:
+            Read gates ``[B, S, hc]``, write gates ``[B, S, hc]`` and the doubly-stochastic mixer
+            ``[B, S, hc, hc]``, all fp32.
+        """
         hc = self.hc_mult
         eps = self.hc_eps
         batch, seq = hidden_streams.shape[:2]
@@ -244,9 +260,23 @@ class ManifoldHyperConnection(spx.Module):
             else:
                 comb = sinkhorn_knopp(comb, self.hc_sinkhorn_iters, eps)
 
-        pre, post, comb = checkpoint_name((pre, post, comb), "mhc_coefficients")
-        collapsed = jnp.sum(pre[..., None] * hidden_streams.astype(jnp.float32), axis=2)
-        return post, comb, collapsed.astype(hidden_streams.dtype)
+        return checkpoint_name((pre, post, comb), "mhc_coefficients")
+
+
+def manifold_collapse(
+    pre: Float[Array, "batch seq hc"], hidden_streams: Float[Array, "batch seq hc hidden"]
+) -> Float[Array, "batch seq hidden"]:
+    """Read-weighted stream sum ``sum_h pre[..., h] * streams[..., h, :]`` in fp32, cast to the stream dtype.
+
+    Args:
+        pre: Read gates ``[B, S, hc]`` (fp32).
+        hidden_streams: Residual streams ``[B, S, hc, D]``.
+
+    Returns:
+        Collapsed sublayer input ``[B, S, D]`` in ``hidden_streams.dtype``.
+    """
+    collapsed = jnp.sum(pre[..., None] * hidden_streams.astype(jnp.float32), axis=2)
+    return collapsed.astype(hidden_streams.dtype)
 
 
 class ManifoldHyperHead(spx.Module):

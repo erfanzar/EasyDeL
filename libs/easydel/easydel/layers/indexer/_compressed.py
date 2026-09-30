@@ -32,6 +32,7 @@ from jaxtyping import Array, Float, Int
 from easydel.layers.linears import ColumnParallelLinear
 from easydel.layers.norms import RMSNorm
 
+from ._paged import slot_entry_topk
 from ._primitives import topk_selection_mask
 from ._selection import BaseIndexer, IndexerSelection, SelectionSpec, top_k_values_indices
 
@@ -80,6 +81,10 @@ class CompressedIndexerAdapter(tp.Protocol):
 
     def decode_step(self, **kwargs) -> tuple[Array, Array, Array, Array, Array]:
         """Advance cache compression; return entries, buffers and overlap state."""
+        ...
+
+    def extend_step(self, **kwargs) -> tuple[Array, Array, Array, Array, Array]:
+        """Block form of :meth:`decode_step` (``kv_blk``/``gate_blk``/``positions``/``valid``); same returns."""
         ...
 
     def entry_visibility(self, positions: Array, cache_position: Array, capacity: int, rate: int) -> Array:
@@ -336,6 +341,79 @@ class CompressedIndexer(BaseIndexer):
             # Unused masks are dead code under jit.
             mask = topk_selection_mask(masked, values, indices) & valid
         return IndexerSelection(jnp.where(picked, indices, -1), scores, mask)
+
+    def cached_extend(
+        self,
+        hidden_states: Float[Array, "batch block hidden"],
+        q_residual: Float[Array, "batch block q_lora"],
+        positions: Int[Array, "batch block"],
+        valid: Array,
+        cache_view: tp.Any,
+        kernel_mesh: object | None = None,
+    ) -> tuple[Array | None, tp.Any]:
+        """Block form of the cached decode step (batched packed prefill).
+
+        Advances the indexer's own compressed-key stream by a block of tokens per row through the adapter's
+        ``extend_step``, then selects each query's top-``index_topk`` entries below its reach ``(position + 1) //
+        rate`` with the shared context-bounded :func:`~easydel.layers.indexer.slot_entry_topk`. Entries emitted later
+        in the block lie beyond every earlier query's reach, so writing them first is causal.
+
+        Args:
+            hidden_states: ``[B, blk, D_model]``.
+            q_residual: ``[B, blk, q_lora]``.
+            positions: Stream positions ``[B, blk]`` (garbage at invalid cells).
+            valid: ``[B, blk]`` bool, a prefix per row.
+            cache_view: This layer's cache view (indexer stream fields).
+            kernel_mesh: Mesh for the selector's replicated-page kernel dispatch.
+
+        Returns:
+            ``(top_k [B, blk, k] int32 with -1 padding, view)``; ``top_k`` is ``None`` when the selection is vacuous
+            (every reachable entry is attended, the indexer stream is not maintained, as on the decode path).
+        """
+        rate = self.compress_rate
+        n_slots = cache_view.num_entry_slots
+        if n_slots == 0 or self.compressor_adapter.selection_is_vacuous(self.index_topk, n_slots):
+            return None, cache_view
+        batch, block, _ = hidden_states.shape
+        entries, buffer_kv, buffer_gate, overlap_kv, overlap_gate = self.compressor_adapter.extend_step(
+            kv_blk=self.kv_proj(hidden_states),
+            gate_blk=self.gate_proj(hidden_states),
+            buffer_kv=cache_view.indexer_buffer_kv,
+            buffer_gate=cache_view.indexer_buffer_gate,
+            entries=cache_view.indexer_entries,
+            position_bias=self.position_bias.value,
+            kv_norm=self.kv_norm,
+            positions=positions,
+            valid=valid,
+            rate=rate,
+            head_dim=self.head_dim,
+            overlap_kv=cache_view.indexer_overlap_kv,
+            overlap_gate=cache_view.indexer_overlap_gate,
+        )
+        cache_view = cache_view.replace(
+            indexer_buffer_kv=buffer_kv,
+            indexer_buffer_gate=buffer_gate,
+            indexer_entries=entries,
+            indexer_overlap_kv=overlap_kv,
+            indexer_overlap_gate=overlap_gate,
+        )
+        q = self.q_b_proj(q_residual).reshape(batch, block, self.num_heads, self.head_dim)
+        q = self.compressor_adapter.rotate_queries(q, positions, hidden_states.dtype)
+        weights = self.scorer.weights_proj(hidden_states).astype(jnp.float32) * self.scorer.weights_scaling
+        reach = jnp.where(valid, (positions.astype(jnp.int32) + 1) // rate, 0)
+        # sum_h w_h * relu(sm * q.k) == the scorer's sum_h w_h * relu(q.k) * sm (sm > 0).
+        top_k = slot_entry_topk(
+            jax.lax.stop_gradient(q.astype(jnp.float32)),
+            jax.lax.stop_gradient(weights),
+            entries,
+            reach,
+            self.index_topk,
+            sm_scale=float(self.scorer.softmax_scale),
+            relu=True,
+            precision=self.precision,
+            kernel_mesh=kernel_mesh,
+        )
+        return top_k, cache_view
 
     def cached_forward(
         self,

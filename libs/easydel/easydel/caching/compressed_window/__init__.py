@@ -20,10 +20,22 @@ from .cache import (
     CompressedWindowCacheView,
     CompressedWindowMetadata,
 )
+from .shared import (
+    SharedCompressedWindowCache,
+    SharedCompressedWindowCacheConfig,
+    SharedCompressedWindowCacheView,
+    SharedCompressedWindowMetadata,
+    slot_partition_axes,
+)
 
 __all__ = (
     "CompressedWindowCache",
     "CompressedWindowCacheConfig",
     "CompressedWindowCacheView",
     "CompressedWindowMetadata",
+    "SharedCompressedWindowCache",
+    "SharedCompressedWindowCacheConfig",
+    "SharedCompressedWindowCacheView",
+    "SharedCompressedWindowMetadata",
+    "slot_partition_axes",
 )

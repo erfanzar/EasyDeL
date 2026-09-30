@@ -67,7 +67,8 @@ def test_token_precision_controls_close_ranking(contraction, precision, ambient)
         for output in (forward(hidden), jax.jit(forward)(hidden)):
             # In either independent construction key 1 has strictly larger
             # score: respectively the key magnitude or its head's weight.
-            np.testing.assert_array_equal(output.topk_indices, [[[1], [1]]])
+            # Token 0 cannot see key 1 (causal, as in HF), so only row 1 ranks.
+            np.testing.assert_array_equal(output.topk_indices, [[[0], [1]]])
             np.testing.assert_array_equal(output.cached_keys, hidden)
 
 

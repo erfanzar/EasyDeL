@@ -362,6 +362,59 @@ def moe_down_projection_reform_param(
     }
 
 
+def moe_per_expert_down_reform_param(
+    *,
+    num_experts: int,
+    target_prefix: str = "experts.down_proj",
+    source_prefix: str = "experts",
+    down_prefix: str = "down_proj",
+    per_expert_template: str = "{prefix}.{index}.{name}.weight",
+    transpose_weight: bool = True,
+) -> dict[str, dict[str, tp.Any]]:
+    """Build reform rules that stack per-expert down projections into one 3-D kernel.
+
+    The down-projection counterpart of :class:`FusedExpertLayout` with ``source_per_expert``: for checkpoints that
+    store one ``[out, in]`` tensor per expert (``<source_prefix>.<i>.<down_prefix>.weight``) while the runtime
+    grouped matmul consumes a stacked ``[experts, in, out]`` kernel.
+
+    Args:
+        num_experts: Number of per-expert source tensors.
+        target_prefix: Runtime prefix of the stacked down kernel (the rule key is ``<target_prefix>.weight``).
+        source_prefix: Checkpoint prefix that holds the per-expert modules.
+        down_prefix: Per-expert down-projection module name.
+        per_expert_template: Format string for one source key (``prefix``, ``index``, ``name``).
+        transpose_weight: Whether each per-expert tensor is stored ``[out, in]`` (torch ``Linear``) and must be
+            transposed to the runtime ``[in, out]``.
+
+    Returns:
+        :type:`ReformParam` rule whose fuser stacks the sources in expert order and whose inverse splits them back.
+    """
+    n = int(num_experts)
+    sources = tuple(per_expert_template.format(prefix=source_prefix, index=i, name=down_prefix) for i in range(n))
+
+    def _fuser(torch: tp.Any, *tensors: tp.Any) -> tp.Any:
+        if transpose_weight:
+            tensors = tuple(tensor.transpose(-1, -2).contiguous() for tensor in tensors)
+        return torch.stack(tensors, dim=0)
+
+    def _inverse_fuser(torch: tp.Any, down: tp.Any) -> tuple[tp.Any, ...]:
+        del torch
+        experts = tuple(down[index] for index in range(n))
+        if transpose_weight:
+            experts = tuple(tensor.transpose(-1, -2).contiguous() for tensor in experts)
+        return experts
+
+    return {
+        f"{target_prefix}.weight$": {
+            "sources": sources,
+            "fuser": _fuser,
+            "inverse_fuser": _inverse_fuser,
+            "already_converted": True,
+            "log_label": f"MoE per-expert down weight groups ({n} experts)",
+        }
+    }
+
+
 def hf_per_expert_swiglu_reform_param(
     *,
     num_experts: int,

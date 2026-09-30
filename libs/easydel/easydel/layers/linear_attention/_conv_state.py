@@ -189,6 +189,11 @@ def apply_conv_with_state(
             output_dtype=output_dtype,
             activation=activation,
         )[:, None, :]
+        if segment_ids is not None:
+            # Padding tokens (negative segment id) keep the cached window and emit zeros.
+            valid = normalize_packed_segment_ids(segment_ids, 1, pad_from_last=False)[:, 0] >= 0
+            new_state = jnp.where(valid[:, None, None], new_state, conv_state)
+            output = jnp.where(valid[:, None, None], output, 0).astype(output.dtype)
         return output, new_state
 
     if segment_ids is not None:
@@ -207,16 +212,25 @@ def apply_conv_with_state(
         )
         return output, new_state
 
+    # For a cached multi-token continuation, the first d_conv-1 outputs
+    # depend on projections from the preceding chunk. Keep the single-token
+    # and segmented paths above untouched.
+    has_prefix = conv_state is not None and seq_len > 1
+    conv_input = (
+        jnp.concatenate((conv_state[:, :, 1:].transpose(0, 2, 1).astype(x.dtype), x), axis=1) if has_prefix else x
+    )
     # Match the decode path by promoting the conv result before the activation.
-    output = conv_layer(x).astype(output_dtype)
+    output = conv_layer(conv_input).astype(output_dtype)
     if activation is not None:
         output = activation(output).astype(output_dtype)
+    if has_prefix:
+        output = output[:, -seq_len:, :]
 
     if seq_len >= d_conv:
         new_state = x[:, -d_conv:, :].transpose(0, 2, 1)
     else:
         x_transposed = x.transpose(0, 2, 1)
-        if reuse_partial_state and conv_state is not None:
+        if conv_state is not None and (reuse_partial_state or has_prefix):
             new_state = jnp.concatenate(
                 (
                     conv_state[:, :, seq_len:],

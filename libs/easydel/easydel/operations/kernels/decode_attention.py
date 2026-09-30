@@ -57,6 +57,8 @@ Example:
     >>> output = decode_attn(query, cached_keys, cached_values, cache_metadata)
 """
 
+import math
+
 import jax
 from ejkernel.modules import ragged_decode_attention  # pyright: ignore[reportMissingTypeStubs]
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
@@ -69,7 +71,8 @@ from easydel.caching import TransformerCacheView
 from easydel.caching.transformer import TransformerMetadata
 
 from .._attention_outputs import AttentionOutput
-from .._operation_impl import OperationImpl, OperationRegistry
+from .._operation_impl import OperationImpl, OperationRegistry, axis_entry_shard_factor
+from .._operation_meta import normalize_head_sinks
 from ..requirements import (
     CacheType,
     ExecutionMode,
@@ -194,6 +197,32 @@ def _slice_decode_window_for_vanilla_fallback(
     return key, value, mask_info.replace(**replace_kwargs)
 
 
+def _decode_validity_mask(kv_len: int, cache_metadata, sliding_window) -> jax.Array | None:
+    """Absolute-coordinate decode validity ``(B, 1, 1, kv_len)`` for the vanilla fallback.
+
+    A slot ``k`` is valid when ``starts <= k < indexes`` and, with a sliding window, when it lies in
+    ``[q - left, q + right]`` for the decoded query position ``q = indexes - 1``. Returns ``None``
+    when the cache metadata carries no ``indexes``.
+    """
+    indexes = getattr(cache_metadata, "indexes", None)
+    if indexes is None:
+        return None
+    indexes = jnp.asarray(indexes, jnp.int32).reshape(-1, 1)
+    kv_idx = jnp.arange(kv_len, dtype=jnp.int32)[None, :]
+    valid = kv_idx < indexes
+    starts = getattr(cache_metadata, "starts", None)
+    if starts is not None:
+        valid = valid & (kv_idx >= jnp.asarray(starts, jnp.int32).reshape(-1, 1))
+    if sliding_window is not None:
+        if isinstance(sliding_window, int):
+            left = right = max(int(sliding_window) - 1, 0)
+        else:
+            left, right = map(int, sliding_window)
+        q_pos = jnp.maximum(indexes - 1, 0)
+        valid = valid & (kv_idx >= q_pos - left) & (kv_idx <= q_pos + right)
+    return valid[:, None, None, :]
+
+
 @OperationRegistry.register
 class AutoRegressiveDecodeAttn(OperationImpl):
     """
@@ -280,10 +309,35 @@ class AutoRegressiveDecodeAttn(OperationImpl):
                   Attended representation for the current query token.
                 - attention_weights: None (not computed for memory efficiency).
         """
-        if jax.default_backend() != "gpu":
-            mask_info = ignores.pop("mask_info", None)
-            ignores.pop("causal", None)
-            key, value, mask_info = _slice_decode_window_for_vanilla_fallback(
+
+        def _vanilla_fallback() -> AttentionOutput:
+            """Exact decode over the live KV window (handles every sink layout)."""
+            fb_ignores = dict(ignores)
+            mask_info = fb_ignores.pop("mask_info", None)
+            fb_ignores.pop("causal", None)
+            # Vanilla attention ignores ``cache_metadata`` and gets ``sliding_window=None``: bake the
+            # valid cache range ``[starts, indexes)`` AND the absolute sliding window around the
+            # query position into a materialized full-width mask before slicing (r11 S07-1,
+            # r12 S07-1/S07-2). Lazy segment masks are materialized so the bounds are never dropped,
+            # and a slice clipped at the cache end only exposes slots this mask already excludes.
+            validity = _decode_validity_mask(key.shape[1], cache_metadata, sliding_window)
+            if validity is not None:
+                if mask_info is None:
+                    mask_info = MaskInfo(_attention_mask=validity)
+                else:
+                    existing = jnp.asarray(mask_info.get_or_compute_attention_mask(dtype=jnp.bool_), bool)
+                    kv_len = key.shape[1]
+                    if existing.ndim == 4 and existing.shape[-1] < kv_len:
+                        # Same convention as the cache view's ``_expand_mask_kv_dim``: unseen slots pad True.
+                        pad = ((0, 0), (0, 0), (0, 0), (0, kv_len - existing.shape[-1]))
+                        existing = jnp.pad(existing, pad, constant_values=True)
+                    elif existing.ndim == 4 and existing.shape[-1] > kv_len:
+                        existing = existing[..., :kv_len]
+                    if existing.ndim == 4:
+                        mask_info = mask_info.replace(attention_mask=existing & validity)
+                    else:
+                        mask_info = MaskInfo(_attention_mask=validity)
+            fb_key, fb_value, mask_info = _slice_decode_window_for_vanilla_fallback(
                 key=key,
                 value=value,
                 mask_info=mask_info,
@@ -291,10 +345,10 @@ class AutoRegressiveDecodeAttn(OperationImpl):
                 sliding_window=sliding_window,
             )
             vanilla_attn: VanillaAttn = VanillaAttn(self.metadata)
-            fallback_output_1: AttentionOutput = vanilla_attn(
+            return vanilla_attn(
                 query=query,
-                key=key,
-                value=value,
+                key=fb_key,
+                value=fb_value,
                 mask_info=mask_info,
                 cache_metadata=cache_metadata,
                 softmax_scale=softmax_scale,
@@ -302,16 +356,38 @@ class AutoRegressiveDecodeAttn(OperationImpl):
                 logits_soft_cap=logits_soft_cap,
                 softmax_aux=softmax_aux,
                 causal=False,
-                **ignores,
+                **fb_ignores,
             )
-            return fallback_output_1
+
+        if jax.default_backend() != "gpu":
+            return _vanilla_fallback()
         head_dim: int = query.shape[-1]
         softmax_scale_computed: float = softmax_scale if softmax_scale is not None else head_dim**-0.5
         model_mode: common_types.RUNTIME_MODE_TYPES = self.get_mode(query=query, BTHD=True)  # type: ignore
         if model_mode != common_types.MODE_DECODE:
             raise ValueError("AutoRegressiveDecodeAttn requires decode mode")
 
-        shardings = self.metadata.get_shardings(model_mode, layout="bthd")
+        # The ragged-decode kernels read every 1-D aux as shared sinks, so shared sinks stay
+        # 1-D and per-query-head sinks (incl. per-KV rows) become explicit 2-D ``(Hq, S)``.
+        softmax_aux, per_head_sinks = normalize_head_sinks(
+            softmax_aux,
+            num_q_heads=query.shape[2],
+            num_kv_heads=key.shape[2],
+            per_head_2d=True,
+            disambiguate_shared=False,
+        )
+        if per_head_sinks and query.shape[2] != key.shape[2]:
+            # The GPU ragged-decode kernels read sinks per KV head (``softmax_aux[h]`` broadcast
+            # over the h-th query group), so per-query-head sinks with a GQA group > 1 cannot be
+            # expressed there. Use the exact vanilla path instead of silently regrouping them.
+            return _vanilla_fallback()
+        shardings = self.metadata.get_shardings(
+            model_mode,
+            layout="bthd",
+            softmax_aux=softmax_aux,
+            num_q_heads=query.shape[2],
+            num_kv_heads=key.shape[2],
+        )
 
         # Create sharding for cache metadata (batch dimension only)
         views_sharding: Ps = Ps(shardings.query[0])
@@ -329,6 +405,20 @@ class AutoRegressiveDecodeAttn(OperationImpl):
             tensor=query_squeezed,
             preserved_indices=[0, 1],
         )
+        # GQA + shard_map (same repair as FlashAttn): the kernels group LOCAL query heads onto
+        # LOCAL KV heads. When the KV-head count does not divide the query-head shard factor the
+        # KV axis is replicated while queries stay sharded, so shards pair queries with the wrong
+        # KV group. Block-repeat KV heads by the minimal factor; blocked repeat keeps h -> h // G.
+        num_q_heads: int = query.shape[2]
+        num_kv_heads: int = key.shape[2]
+        head_shard_factor = 1
+        if query_sharding is not None and len(query_sharding) > 1:
+            head_shard_factor = axis_entry_shard_factor(self.metadata.mesh, query_sharding[1])
+        if head_shard_factor > 1 and num_kv_heads > 1 and num_kv_heads % head_shard_factor != 0:
+            kv_head_reps = head_shard_factor // math.gcd(num_kv_heads, head_shard_factor)
+            if num_q_heads % (num_kv_heads * kv_head_reps) == 0:
+                key = jnp.repeat(key, kv_head_reps, axis=2)
+                value = jnp.repeat(value, kv_head_reps, axis=2)
         key_sharding: Ps | None = self.create_stable_sharding(
             shardings.key,
             dep=key,
@@ -353,8 +443,13 @@ class AutoRegressiveDecodeAttn(OperationImpl):
             tensor=indexes_flat,
             preserved_indices=[0],
         )
+        # Per-head sinks are 2-D here; a 1-D result is a SHARED sink set and must be replicated
+        # (``get_shardings`` would head-shard a shared vector whose length happens to equal Hq).
+        softmax_aux_spec = shardings.softmax_aux
+        if softmax_aux is not None and not per_head_sinks:
+            softmax_aux_spec = Ps(*([None] * softmax_aux.ndim))
         softmax_aux_sharding: Ps | None = self.create_stable_sharding(
-            shardings.softmax_aux,
+            softmax_aux_spec,
             dep=softmax_aux,
             tensor=softmax_aux,
         )
@@ -513,5 +608,8 @@ class AutoRegressiveDecodeAttn(OperationImpl):
             sliding_window=sliding_window,
             logits_soft_cap=logits_soft_cap,
             softmax_scale=softmax_scale,
+            # Previously dropped here, so every decode backend (incl. the TPU/CPU vanilla
+            # fallback) silently ignored attention sinks.
+            softmax_aux=softmax_aux,
             **ignores,
         )

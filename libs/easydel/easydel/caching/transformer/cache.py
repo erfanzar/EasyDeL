@@ -667,7 +667,11 @@ class TransformerCacheView(BaseCacheView):
         key_shape = self.key.shape if hasattr(self.key, "shape") else None
         cache_kv_len = key_shape[1] if key_shape is not None else 0
         mask_kv_len = mask_info.kv_len
-        if mask_kv_len is not None and mask_kv_len < cache_kv_len:
+        query_local_mask = mask_kv_len is not None and mask_kv_len < cache_kv_len
+        causal_already_baked = bool(
+            getattr(mask_info, "_causal_baked", False) or getattr(mask_info, "causal_mask_baked_in", False)
+        )
+        if query_local_mask:
             mask_info = _expand_mask_kv_dim(mask_info, cache_kv_len, indexes, num_updated_cache_vectors)
 
         def _kv_struct_shard(
@@ -757,6 +761,7 @@ class TransformerCacheView(BaseCacheView):
             value_cache_updated = _update_kv(_maybe_materialize(self.value), value, indexes)
             key_cache_updated = _update_kv(_maybe_materialize(self.key), key, indexes)
 
+        write_index = indexes
         indexes = indexes + num_updated_cache_vectors
         mask_info = mask_info.apply_kv_lengths(
             kv_lengths=indexes,
@@ -764,6 +769,18 @@ class TransformerCacheView(BaseCacheView):
             end_index=indexes,
             sliding_window=sliding_window,
         )
+        if query_local_mask and sliding_window is None and not causal_already_baked:
+            # A query-local mask gives no absolute row positions: kernels then apply a top-left (Q, K) causal
+            # triangle, so row r of a multi-token step written at cache index i saw keys <= r instead of <= i + r
+            # (r15 S10-1, every dense-cache family). Rows sit at absolute slots write_index + r here, so bake
+            # the absolute causal term; callers passing a full-window mask (generate, Llama4, Gemma3) never take
+            # this branch, and sliding caches are skipped because their rolled columns are not absolute.
+            attn = mask_info.get_or_compute_attention_mask(dtype=jnp.bool_)
+            rows = jnp.arange(attn.shape[-2], dtype=jnp.int32)[None, :]
+            pos = jnp.asarray(write_index, jnp.int32).reshape(-1, 1) + rows
+            kv_idx = jnp.arange(attn.shape[-1], dtype=jnp.int32)[None, None, :]
+            causal = kv_idx <= pos[:, :, None]
+            mask_info = mask_info.replace(attention_mask=attn & causal[:, None, :, :], causal_mask_baked_in=True)
 
         # Keep the cache storage dtype stable (matches the cache allocation dtype) while
         # returning KV in runtime dtype for the attention computation.

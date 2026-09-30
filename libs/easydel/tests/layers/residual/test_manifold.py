@@ -23,6 +23,7 @@ from easydel.layers.residual import (
     ManifoldHyperConnectionConfig,
     ManifoldHyperHead,
     MeanHyperHead,
+    manifold_collapse,
     manifold_residual_write,
     mean_hyper_head,
 )
@@ -47,7 +48,7 @@ def _module(cls, dtype):
     return module, tuple(getattr(module, name).value for name in names)
 
 
-def _reference(x, weights, *, xp, head=False):
+def _reference(x, weights, *, xp, head=False, with_read=False):
     """Equation reference using explicit stream sums and no production helpers.
 
     NumPy supplies forward expectations; JAX differentiates the same independent
@@ -71,6 +72,8 @@ def _reference(x, weights, *, xp, head=False):
     comb = exp_scores / xp.sum(exp_scores, axis=-1, keepdims=True) + CONFIG.eps
     for axis in [-2] + [-1, -2] * (CONFIG.iters - 1):
         comb = comb / (xp.sum(comb, axis=axis, keepdims=True) + CONFIG.eps)
+    if with_read:
+        return read, post, comb, collapsed
     return post, comb, collapsed
 
 
@@ -107,6 +110,35 @@ def test_forward_and_jit_against_numpy(cls, dtype):
         tol = 8e-3 if got.dtype == jnp.bfloat16 else 3e-6
         np.testing.assert_allclose(np.asarray(got, np.float32), np.asarray(want, np.float32), atol=tol, rtol=tol)
         np.testing.assert_allclose(np.asarray(jit_got, np.float32), np.asarray(want, np.float32), atol=tol, rtol=tol)
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+def test_coefficients_and_collapse_against_numpy(dtype):
+    """``coefficients`` exposes the read gates (DeepSeek-V4.1 applies them one sublayer late)."""
+    module, weights = _module(ManifoldHyperConnection, dtype)
+    x = _input(dtype)
+    read, post, comb, collapsed = _reference(np.asarray(x), tuple(np.asarray(w) for w in weights), xp=np, with_read=True)
+    pre_got, post_got, comb_got = module.coefficients(x)
+    assert [a.dtype for a in (pre_got, post_got, comb_got)] == [jnp.float32] * 3
+    tol = 8e-3 if dtype == jnp.bfloat16 else 3e-6
+    for got, want in ((pre_got, read), (post_got, post), (comb_got, comb)):
+        np.testing.assert_allclose(np.asarray(got), np.asarray(want, np.float32), atol=tol, rtol=tol)
+    # Collapsing with a *different* stream's gates must use those gates, not recompute them.
+    other = jnp.flip(x, axis=1)
+    delayed = manifold_collapse(pre_got, other)
+    want_delayed = sum(np.asarray(read)[..., i, None] * np.asarray(other, np.float32)[..., i, :] for i in range(3))
+    assert delayed.dtype == dtype
+    np.testing.assert_allclose(np.asarray(delayed, np.float32), want_delayed, atol=tol, rtol=tol)
+    # forward is exactly coefficients + collapse.
+    post_fwd, comb_fwd, collapsed_fwd = module(x)
+    np.testing.assert_array_equal(np.asarray(post_fwd), np.asarray(post_got))
+    np.testing.assert_array_equal(np.asarray(comb_fwd), np.asarray(comb_got))
+    np.testing.assert_array_equal(
+        np.asarray(collapsed_fwd, np.float32), np.asarray(manifold_collapse(pre_got, x), np.float32)
+    )
+    np.testing.assert_allclose(
+        np.asarray(collapsed_fwd, np.float32), np.asarray(collapsed, np.float32), atol=tol, rtol=tol
+    )
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])

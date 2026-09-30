@@ -130,9 +130,11 @@ def test_stage_mesh_batch_axes_include_fsdp():
     stage = _build_gptoss_block(sharding_axis_dims=(1, 1, 2, 2, 2, 1), ring=True, fsdp_is_ep_bound=False)
     with stage.config.mesh:
         expert_mesh = stage._active_auto_expert_mesh(arr=None)
-        assert set(expert_mesh.jax_mesh.axis_names) == {"dp", "fsdp", "ep", "tp", "sp"}, (
-            f"expected the 5-D SPMD stage mesh, got {expert_mesh.jax_mesh.axis_names}"
+        # The stage mesh keeps the size-1 ``pp`` axis so MoE outputs share the model mesh's abstract mesh.
+        assert set(expert_mesh.jax_mesh.axis_names) == {"pp", "dp", "fsdp", "ep", "tp", "sp"}, (
+            f"expected the stage mesh (model mesh incl. size-1 pp), got {expert_mesh.jax_mesh.axis_names}"
         )
+        assert expert_mesh.jax_mesh.abstract_mesh.axis_names == stage.config.mesh.abstract_mesh.axis_names
         dp_axis_name = resolve_eformer_axis(DP, stage.runtime_sharding_resolver)
         batch_axes = stage._moe_batch_axis_names(expert_mesh, dp_axis_name)
     assert batch_axes == ("dp", "fsdp"), (

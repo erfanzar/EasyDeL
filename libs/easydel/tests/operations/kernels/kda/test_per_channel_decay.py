@@ -134,6 +134,35 @@ def test_fused_gate_softplus_variant():
     assert float(out.max()) <= 0.0
 
 
+def test_softplus_gates_have_finite_gradients_for_large_inputs():
+    """Large biased gates must not overflow (r10 S08-2): log1p(exp(100)) gave inf and a NaN gradient,
+    even behind ``where(g > 20, g, ...)`` because the dead branch is still differentiated."""
+    from easydel.operations.kernels.kda import fused_kda_gate
+
+    heads, head_dim = 2, 4
+    qkv_dim = heads * head_dim
+    a_log = jnp.zeros((heads,), jnp.float32)
+    gate = jnp.asarray([[[100.0, -100.0, 0.0, 30.0] * heads]], dtype=jnp.float32)  # (1, 1, qkv_dim)
+
+    def per_channel_loss(g):
+        return jnp.sum(fused_kda_gate_per_channel(g, a_log, jnp.zeros((qkv_dim,), jnp.float32), lower_bound=None))
+
+    value, grad = jax.value_and_grad(per_channel_loss)(gate)
+    assert np.isfinite(float(value))
+    assert np.isfinite(np.asarray(grad)).all()
+    # d softplus / dx = sigmoid(x): ~1 at +100, ~0 at -100, 0.5 at 0; decay = -softplus so grads are negated.
+    np.testing.assert_allclose(np.asarray(grad)[0, 0, :4], [-1.0, 0.0, -0.5, -1.0], atol=1e-6)
+
+    per_head_gate = jnp.asarray([[[100.0, -100.0]]], dtype=jnp.float32)  # (1, 1, heads)
+
+    def per_head_loss(g):
+        return jnp.sum(fused_kda_gate(g, a_log, jnp.zeros((heads,), jnp.float32)))
+
+    value, grad = jax.value_and_grad(per_head_loss)(per_head_gate)
+    assert np.isfinite(float(value))
+    np.testing.assert_allclose(np.asarray(grad)[0, 0], [-1.0, 0.0], atol=1e-6)
+
+
 def test_chunked_matches_recurrent_per_channel():
     """The chunked kernel agrees with the sequential recurrence."""
     query, key, value, beta, decay = _make_inputs(seq=48)
@@ -257,6 +286,39 @@ def test_op_dispatch_decode_per_channel():
     )
 
 
+def test_op_decode_padding_token_keeps_state_and_emits_zero():
+    """A cached singleton padding token (segment id -1) must not advance state (r10 S08-1)."""
+    query, key, value, beta, decay = _make_inputs(seq=1)
+    state_in = jax.random.normal(jax.random.key(22), (2, 3, 8, 6), dtype=jnp.float32)
+    metadata = OperationMetadata(
+        runtime_dtype=jnp.float32,
+        runtime_softmax_dtype=jnp.float32,
+        base_config=EasyDeLBaseConfig(),
+    )
+    op = KernelDeltaAttnOp(metadata)
+    kwargs = dict(
+        query=query.transpose(0, 2, 1, 3),
+        key=key.transpose(0, 2, 1, 3),
+        value=value.transpose(0, 2, 1, 3),
+        beta=beta.transpose(0, 2, 1),
+        decay=decay.transpose(0, 2, 1, 3),
+        recurrent_state=state_in,
+    )
+    plain = op(**kwargs)
+    # Row 0 is padding, row 1 is a real token.
+    masked = op(**kwargs, segment_ids=jnp.asarray([[-1], [0]], dtype=jnp.int32))
+    np.testing.assert_array_equal(np.asarray(masked.attention_outputs[0]), 0.0)
+    np.testing.assert_allclose(np.asarray(masked.recurrent_state[0]), np.asarray(state_in[0]), atol=0)
+    np.testing.assert_allclose(
+        np.asarray(masked.attention_outputs[1]), np.asarray(plain.attention_outputs[1]), atol=ATOL_TIGHT
+    )
+    np.testing.assert_allclose(
+        np.asarray(masked.recurrent_state[1]), np.asarray(plain.recurrent_state[1]), atol=ATOL_TIGHT
+    )
+    # Negative control: the unmasked step does change row 0's state.
+    assert float(jnp.abs(plain.recurrent_state[0] - state_in[0]).max()) > 1e-3
+
+
 def test_per_head_path_untouched():
     """3-dim decay still routes through the original per-head kernels."""
     rng = jax.random.key(31)
@@ -364,9 +426,7 @@ def test_initial_state_actually_advances_outputs():
     _, state_rec_init = _recurrent_kda_per_channel_fwd(
         query, key, value, beta, weak_decay, initial_state=init, use_qk_l2norm=True
     )
-    _, state_rec_zero = _recurrent_kda_per_channel_fwd(
-        query, key, value, beta, weak_decay, use_qk_l2norm=True
-    )
+    _, state_rec_zero = _recurrent_kda_per_channel_fwd(query, key, value, beta, weak_decay, use_qk_l2norm=True)
     assert float(jnp.abs(state_rec_init - state_rec_zero).max()) > 1e-3
 
 
@@ -428,9 +488,7 @@ def test_op_per_head_none_decay_zero_fill_kept():
     op = KernelDeltaAttnOp(metadata)
     bthd = lambda x: x.transpose(0, 2, 1, 3)  # noqa: E731
 
-    out_none = op(
-        query=bthd(query), key=bthd(key), value=bthd(value), beta=beta.transpose(0, 2, 1), decay=None
-    )
+    out_none = op(query=bthd(query), key=bthd(key), value=bthd(value), beta=beta.transpose(0, 2, 1), decay=None)
     out_zero = op(
         query=bthd(query),
         key=bthd(key),
@@ -560,8 +618,9 @@ def test_recurrent_per_head_segment_reset_matches_per_segment_loops():
     segments = [0, 0, 0, 1, 1, 1]
     segment_ids = jnp.asarray([segments], dtype=jnp.int32)
 
-    out_packed, state_packed = _recurrent_kda_fwd(query, key, value, beta, decay, use_qk_l2norm=True,
-                                                  segment_ids=segment_ids)
+    out_packed, state_packed = _recurrent_kda_fwd(
+        query, key, value, beta, decay, use_qk_l2norm=True, segment_ids=segment_ids
+    )
     for start, end in _segment_spans(segments):
         out_seg, _ = _recurrent_kda_fwd(
             query[:, :, start:end],

@@ -42,6 +42,12 @@ import jax.numpy as jnp
 from jaxtyping import Array, Float
 
 
+def rotate_half(x: Array) -> Array:
+    """Return the NeoX split-half rotation partner ``[-x2, x1]``."""
+    half = x.shape[-1] // 2
+    return jnp.concatenate([-x[..., half:], x[..., :half]], axis=-1)
+
+
 @jax.named_scope("easydel-rotary-yarn-find-correction-dim")
 def _yarn_find_correction_dim(
     num_rotations: int,

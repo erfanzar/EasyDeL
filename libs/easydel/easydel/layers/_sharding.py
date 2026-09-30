@@ -20,6 +20,21 @@ implementation.
 
 from __future__ import annotations
 
+import jax
+import jax.numpy as jnp
+from jaxtyping import Array
+
 from easydel.infra.sharding import pick_mesh, resolve_safe_sharding
 
-__all__ = ["pick_mesh", "resolve_safe_sharding"]
+
+def all_gather_then_dot(x: Array, kernel: Array, axis_name: str, *, precision: jax.lax.PrecisionLike) -> Array:
+    """All-gather the trailing feature axis, then dot against a local column shard.
+
+    Intended for use inside ``jax.shard_map`` when ``x`` is feature-sharded
+    and ``kernel`` is sharded on its output axis.
+    """
+    gathered = jax.lax.all_gather(x, axis_name, axis=x.ndim - 1, tiled=True)
+    return jnp.einsum("...i,io->...o", gathered, kernel, precision=precision)
+
+
+__all__ = ["all_gather_then_dot", "pick_mesh", "resolve_safe_sharding"]

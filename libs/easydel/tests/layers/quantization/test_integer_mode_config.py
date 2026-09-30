@@ -25,11 +25,10 @@ import pytest
 from easydel.layers.quantization import QuantizationConfig, QuantizationType
 from easydel.layers.quantization._configs import resolve_ejkernel_quant_params
 
+_PRESETS = [("w4a16", 4, 16), ("w8a16", 8, 16), ("w4a8", 4, 8), ("w4a4", 4, 4), ("w8a8", 8, 8)]
 
-@pytest.mark.parametrize(
-    ("mode", "weight_bits", "activation_bits"),
-    [("w4a16", 4, 16), ("w8a16", 8, 16), ("w4a4", 4, 4), ("w8a8", 8, 8)],
-)
+
+@pytest.mark.parametrize(("mode", "weight_bits", "activation_bits"), _PRESETS)
 def test_integer_matmul_preset(mode, weight_bits, activation_bits):
     config = QuantizationConfig.for_matmul(mode)
 
@@ -44,10 +43,37 @@ def test_integer_matmul_preset(mode, weight_bits, activation_bits):
     assert resolve_ejkernel_quant_params(config) == ("channelwise", 0, weight_bits, False)
 
 
-@pytest.mark.parametrize("mode", ["", "int4", "w4a8", "w8a4", "w4a32", "unknown"])
+@pytest.mark.parametrize("mode", ["", "int4", "w8a4", "w4a32", "unknown"])
 def test_invalid_integer_matmul_preset(mode):
     with pytest.raises(ValueError):
         QuantizationConfig.for_matmul(mode)
+
+
+@pytest.mark.parametrize(("mode", "weight_bits", "activation_bits"), _PRESETS)
+def test_preset_name_as_dtype_matches_for_matmul(mode, weight_bits, activation_bits):
+    """``dtype="w8a8"`` is shorthand for the for_matmul preset; the pattern is kept."""
+    config = QuantizationConfig(dtype=mode, pattern=".*mlp.*")
+    assert config.dtype == QuantizationType.CHANNELWISE
+    assert config.bits == weight_bits
+    assert config.activation_bits == activation_bits
+    assert config.activation_policy == "explicit"
+    assert config.pattern == ".*mlp.*"
+    assert config == QuantizationConfig.for_matmul(mode).__class__(
+        **{**QuantizationConfig.for_matmul(mode).to_dict(), "pattern": ".*mlp.*"}
+    )
+    # The dict form round-trips to plain channelwise fields, so saved configs stay loadable.
+    assert QuantizationConfig.from_dict(json.loads(json.dumps(config.to_dict()))) == config
+
+
+def test_preset_name_as_dtype_accepts_matching_explicit_fields():
+    config = QuantizationConfig(dtype="w4a8", bits=4, activation_bits=8, activation_policy="explicit")
+    assert (config.bits, config.activation_bits) == (4, 8)
+
+
+@pytest.mark.parametrize("overrides", [{"bits": 8}, {"activation_bits": 16}])
+def test_preset_name_as_dtype_rejects_conflicting_fields(overrides):
+    with pytest.raises(ValueError, match="implies"):
+        QuantizationConfig(dtype="w4a8", **overrides)
 
 
 @pytest.mark.parametrize("activation_bits", [None, 4, 8, 16])
@@ -63,7 +89,7 @@ def test_invalid_activation_bits(activation_bits):
         QuantizationConfig(dtype="channelwise", bits=4, activation_bits=activation_bits)
 
 
-@pytest.mark.parametrize("mode", ["w4a16", "w8a16", "w4a4", "w8a8"])
+@pytest.mark.parametrize("mode", [p[0] for p in _PRESETS])
 def test_integer_matmul_preset_json_roundtrip(mode):
     config = QuantizationConfig.for_matmul(mode)
     payload = json.loads(json.dumps(config.to_dict()))

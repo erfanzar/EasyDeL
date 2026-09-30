@@ -114,6 +114,34 @@ def _single_step_ssm2_fwd(
     return y, ssm_state_new
 
 
+def _packed_ssm2_fwd(
+    x: Float[Array, "slots width num_heads head_dim"],
+    A_real: Float[Array, "num_heads"],
+    B: Float[Array, "slots width n_groups ssm_state_size"],
+    C: Float[Array, "slots width n_groups ssm_state_size"],
+    D: Float[Array, "num_heads"],
+    dt: Float[Array, "slots width num_heads"],
+    valid: Array,
+    ssm_state: Float[Array, "slots num_heads head_dim ssm_state_size"],
+    n_groups: int = 1,
+) -> tuple[Float[Array, "slots width num_heads head_dim"], Float[Array, "slots num_heads head_dim ssm_state_size"]]:
+    """Run SSM2 over slot-major packed grids, leaving state unchanged in padding cells."""
+
+    def step(state, values):
+        x_t, b_t, c_t, dt_t, is_valid = values
+        y, updated = _single_step_ssm2_fwd(x_t, A_real, b_t, c_t, D, dt_t, state, n_groups)
+        return jnp.where(is_valid[:, None, None, None], updated, state), jnp.where(
+            is_valid[:, None, None], y, jnp.zeros_like(y)
+        )
+
+    final_state, outputs = jax.lax.scan(
+        step,
+        ssm_state.astype(jnp.float32),
+        tuple(v.swapaxes(0, 1) for v in (x, B, C, dt, valid)),
+    )
+    return outputs.swapaxes(0, 1), final_state
+
+
 def _segmented_ssm2_fwd(
     x: Float[Array, "batch seq_len num_heads head_dim"],
     A_real: Float[Array, "num_heads"],

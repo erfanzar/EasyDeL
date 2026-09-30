@@ -260,6 +260,8 @@ class GlmMoeDsaIndexerOp(OperationImpl):
             new_cached_keys = cached_keys_local
 
         scores = jnp.einsum("bshd,btd->bsht", query_states_f32, all_keys, precision=precision) * softmax_scale
+        # HF GlmMoeDsaIndexer / DeepseekV32Indexer clamp each head's score before weighting.
+        scores = jax.nn.relu(scores)
         index_scores = jnp.einsum("bsht,bsh->bst", scores, head_weights.astype(jnp.float32), precision=precision)
 
         total_len = int(index_scores.shape[-1])
@@ -291,6 +293,15 @@ class GlmMoeDsaIndexerOp(OperationImpl):
                 index_scores = jnp.where(attention_mask, index_scores, -jnp.inf)
             else:
                 index_scores = index_scores + attention_mask.astype(index_scores.dtype)
+
+        # Causality (HF masks future keys before top-k): the current queries are the last
+        # ``q_len`` keys (no-cache prefill or cache append), so query ``i`` sees keys
+        # ``<= total_len - q_len + i``. A non-causal caller mask must not let future keys
+        # take top-k slots that the attention kernel would then hide.
+        q_len = int(index_scores.shape[-2])
+        query_index = total_len - q_len + jnp.arange(q_len, dtype=jnp.int32)
+        future = jnp.arange(total_len, dtype=jnp.int32)[None, :] > query_index[:, None]
+        index_scores = jnp.where(future, -jnp.inf, index_scores)
 
         topk = min(max(int(index_topk), 1), total_len)
         if select_topk is None:

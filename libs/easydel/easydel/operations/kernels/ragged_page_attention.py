@@ -80,6 +80,7 @@ import os
 from functools import partial
 
 import jax
+from ejkernel.kernels._xla.ragged_page_attention_v3._sinks import reduce_sinks_to_heads
 from ejkernel.loggings import get_logger
 from ejkernel.modules import (  # pyright: ignore[reportMissingTypeStubs]
     ragged_page_attention_v2,
@@ -529,6 +530,8 @@ class _RaggedPageAttn(OperationImpl):
         softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,  # noqa
         mask_value: float | None = None,
         vmem_limit_bytes: int | None = None,
+        chunk_size: int | None = None,
+        alibi_slopes: Float[Array, "num_q_heads"] | None = None,  # noqa
         **ignore,
     ) -> AttentionOutput:
         """V2 ragged paged attention (read-only over cached KV pages).
@@ -559,7 +562,14 @@ class _RaggedPageAttn(OperationImpl):
             AttentionOutput: ``attention_outputs`` of shape
             ``(total_tokens, num_q_heads, head_dim)``. ``attention_weights``
             is ``None``.
+
+        Raises:
+            NotImplementedError: If ``chunk_size`` or ``alibi_slopes`` is requested;
+                only ragged v3 implements them, and silently ignoring them would
+                change the model's output.
         """
+        if chunk_size is not None or alibi_slopes is not None:
+            raise NotImplementedError("chunked local attention and ALiBi require ragged_page_attention_v3.")
         if isinstance(cache_view, TurboQuantRaggedPagesCacheView):
             return self._forward_v2_turboquant(
                 query,
@@ -580,11 +590,10 @@ class _RaggedPageAttn(OperationImpl):
 
         aux_spec = PartitionSpec(None)
         if softmax_aux is not None:
-            num_aux_dims: int = softmax_aux.ndim
-            if num_aux_dims == 2:
-                aux_spec = resolve(axes=[ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=softmax_aux.shape)
-            elif num_aux_dims == 1:
-                aux_spec = resolve(axes=[ct.EMPTY], mode=ct.MODE_PREFILL, shape=softmax_aux.shape)
+            # Any supported sink layout collapses (logsumexp over the sink axis) to one
+            # logit per query head, which shards exactly like the query heads.
+            softmax_aux = reduce_sinks_to_heads(softmax_aux, query.shape[1], kv_pages.shape[2] // 2)
+            aux_spec = resolve(axes=[ct.HEAD], mode=ct.MODE_PREFILL, shape=softmax_aux.shape)
 
         if compute_dtype is None:
             dtype_for_compute = jnp.bfloat16
@@ -732,6 +741,8 @@ class _RaggedPageAttn(OperationImpl):
         softmax_scale: float | None = None,
         logits_soft_cap: float | None = None,
         sliding_window: int | None = None,
+        chunk_size: int | None = None,
+        alibi_slopes: Float[Array, "num_q_heads"] | None = None,  # noqa
         **ignore,
     ) -> AttentionOutput:
         """V3 ragged paged attention with cache-update support.
@@ -754,13 +765,23 @@ class _RaggedPageAttn(OperationImpl):
             softmax_scale: Logits scaling factor.
             logits_soft_cap: Optional soft-cap for logits.
             sliding_window: Optional window size for local attention.
+            chunk_size: Optional chunked-local-attention size (Llama4).
+            alibi_slopes: Optional per-query-head ALiBi slopes (Falcon).
             **ignore: Additional kwargs forwarded to the underlying kernel
                 (e.g. ``softmax_aux``, ``vmem_limit_bytes``).
 
         Returns:
             AttentionOutput: Attention output and the (mutated) cache view.
+
+        Raises:
+            NotImplementedError: If ``chunk_size`` or ``alibi_slopes`` is requested
+                with a TurboQuant-compressed cache, which does not implement them.
         """
         if isinstance(cache_view, TurboQuantRaggedPagesCacheView):
+            if chunk_size is not None or alibi_slopes is not None:
+                raise NotImplementedError(
+                    "chunked local attention and ALiBi are not supported with a TurboQuant ragged cache."
+                )
             return self._forward_v3_turboquant(
                 query,
                 key,
@@ -781,6 +802,8 @@ class _RaggedPageAttn(OperationImpl):
             softmax_scale=softmax_scale,
             logits_soft_cap=logits_soft_cap,
             sliding_window=sliding_window,
+            chunk_size=chunk_size,
+            alibi_slopes=alibi_slopes,
             **ignore,
         )
 
@@ -907,8 +930,10 @@ class _RaggedPageAttn(OperationImpl):
         softmax_scale: float | None = None,
         logits_soft_cap: float | None = None,
         sliding_window: int | None = None,
-        softmax_aux: Float[Array, "num_sinks"] | None = None,  # noqa
+        softmax_aux: Float[Array, "num_sinks"] | Float[Array, "num_heads num_sinks"] | None = None,  # noqa
         vmem_limit_bytes: int | None = None,
+        chunk_size: int | None = None,
+        alibi_slopes: Float[Array, "num_q_heads"] | None = None,  # noqa
         **ignore,
     ) -> AttentionOutput:
         """V3 ragged paged attention over a standard (non-TurboQuant) cache.
@@ -927,8 +952,15 @@ class _RaggedPageAttn(OperationImpl):
             softmax_scale: Logits scaling factor.
             logits_soft_cap: Optional soft-cap for logits.
             sliding_window: Optional window size for local attention.
-            softmax_aux: Optional sink-token logits.
+            softmax_aux: Optional sink-token logits: ``(num_q_heads,)``, a shared
+                ``(num_sinks,)``, or 2-D ``(num_q_heads | num_kv_heads | 1, num_sinks)``.
+                Multiple sinks of one head are reduced with ``logsumexp`` to a single
+                per-query-head sink before the kernel, so head sharding is exact.
             vmem_limit_bytes: VMEM budget hint for the kernel.
+            chunk_size: Optional chunked-local-attention size ``C`` (Llama4): a query at
+                ``q`` attends key ``k`` only if ``k <= q`` and ``k // C == q // C``.
+            alibi_slopes: Optional per-query-head ALiBi slopes ``(num_q_heads,)``; the
+                kernel adds ``slope_h * (k - q)`` to the scaled logits.
             **ignore: Forward-compatibility kwargs (ignored).
 
         Returns:
@@ -936,6 +968,7 @@ class _RaggedPageAttn(OperationImpl):
             with the mutated ``kv_pages``.
         """
         kv_pages = cache_view.kv_pages
+        num_model_kv_heads = key.shape[1]
         key, value = _repeat_kv_heads_to_cache_width(key, value, cache_view)
         kv_cache_dtype = getattr(kv_pages, "dtype", None)
         if kv_cache_dtype is not None and (key.dtype != kv_cache_dtype or value.dtype != kv_cache_dtype):
@@ -958,10 +991,16 @@ class _RaggedPageAttn(OperationImpl):
         q_token_axis = ATTN_DP if use_rank_major_dp else ct.EMPTY
 
         sinks_axis = None
+        alibi_axis = None
 
         if softmax_aux is not None:
+            softmax_aux = reduce_sinks_to_heads(softmax_aux, query.shape[1], num_model_kv_heads)
             sinks_axis = resolve(axes=[ct.HEAD], mode=ct.MODE_PREFILL, shape=softmax_aux.shape)
-            softmax_aux = softmax_aux.astype("f4")
+        if alibi_slopes is not None:
+            alibi_slopes = alibi_slopes.astype("f4")
+            alibi_axis = resolve(axes=[ct.HEAD], mode=ct.MODE_PREFILL, shape=alibi_slopes.shape)
+        alibi_args = () if alibi_slopes is None else (alibi_slopes,)
+        alibi_specs = () if alibi_slopes is None else (alibi_axis,)
 
         qaxes = resolve(axes=[q_token_axis, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=query.shape)
         kvaxes = resolve(axes=[q_token_axis, kv_token_axis, ct.EMPTY], mode=ct.MODE_PREFILL, shape=key.shape)
@@ -994,6 +1033,7 @@ class _RaggedPageAttn(OperationImpl):
             logits_soft_cap=logits_soft_cap,
             vmem_limit_bytes=vmem_limit_bytes,
             sliding_window=sliding_window,
+            chunk_size=chunk_size,
             cfg=cfg,
             platform=platform,
         )
@@ -1015,7 +1055,7 @@ class _RaggedPageAttn(OperationImpl):
             @partial(
                 jax.shard_map,
                 mesh=self.metadata.mesh,
-                in_specs=(qaxes, kvaxes, kvaxes, kv_pages_spec, Ps(), Ps(), Ps(), Ps(), sinks_axis),
+                in_specs=(qaxes, kvaxes, kvaxes, kv_pages_spec, Ps(), Ps(), Ps(), Ps(), sinks_axis, *alibi_specs),
                 out_specs=(qaxes, kv_pages_spec),
                 check_vma=False,
             )
@@ -1029,6 +1069,7 @@ class _RaggedPageAttn(OperationImpl):
                 full_query_start_loc,
                 full_distribution,
                 local_softmax_aux,
+                *local_alibi,
             ):
                 shard_idx = axis_index(page_axis_names)
                 row_start = shard_idx * jnp.int32(rows_per_shard)
@@ -1076,6 +1117,7 @@ class _RaggedPageAttn(OperationImpl):
                     local_query_start_loc,
                     local_kernel_distribution,
                     local_softmax_aux,
+                    alibi_slopes=local_alibi[0] if local_alibi else None,
                     **common_call_kwargs,
                 )
 
@@ -1115,6 +1157,7 @@ class _RaggedPageAttn(OperationImpl):
                 cache_metadata.query_start_loc,
                 request_distribution,
                 softmax_aux,
+                *alibi_args,
             )
         else:
             kernel_distribution = _tpu_mixed_request_distribution(request_distribution, cfg)
@@ -1128,7 +1171,19 @@ class _RaggedPageAttn(OperationImpl):
                 cache_metadata.query_start_loc,
                 kernel_distribution,
                 softmax_aux,
-                in_specs=(qaxes, kvaxes, kvaxes, kv_pages_spec_replicated, Ps(), Ps(), Ps(), Ps(), sinks_axis),
+                alibi_slopes=alibi_slopes,
+                in_specs=(
+                    qaxes,
+                    kvaxes,
+                    kvaxes,
+                    kv_pages_spec_replicated,
+                    Ps(),
+                    Ps(),
+                    Ps(),
+                    Ps(),
+                    sinks_axis,
+                    *alibi_specs,
+                ),
                 out_specs=(qaxes, kv_pages_spec_replicated),
                 mesh=self.metadata.mesh,
                 **common_call_kwargs,

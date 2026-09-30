@@ -128,6 +128,78 @@ def test_forward_matches_dense_reference(use_sinks):
     assert np.abs(out - ref).max() < 1e-4
 
 
+@pytest.mark.parametrize("use_sinks", [True, False])
+def test_implicit_token_mask_matches_dense_reference(use_sinks):
+    """token_valid + entry-only bias reproduces the dense reference over the full window/causal/padding bias."""
+    from easydel.operations.kernels import CompressedWindowAttn
+
+    op = CompressedWindowAttn(_metadata())
+    batch, heads, seq, head_dim, window, n_entries = 2, 4, 24, 32, 8, 6
+    rng = np.random.default_rng(5)
+    q = jnp.asarray(rng.standard_normal((batch, heads, seq, head_dim)), jnp.float32)
+    kv = jnp.asarray(rng.standard_normal((batch, seq + n_entries, head_dim)), jnp.float32)
+    valid = rng.random((batch, seq)) > 0.2
+    valid[:, 0] = True
+    qi, ki = np.arange(seq)[:, None], np.arange(seq)[None, :]
+    token_ok = ((ki <= qi) & (ki > qi - window))[None] & valid[:, None, :]
+    token_bias = np.where(token_ok, 0.0, _NEG).astype(np.float32)
+    entry_bias = np.asarray(rng.standard_normal((batch, seq, n_entries)) * 0.5, np.float32)
+    entry_bias[rng.random((batch, seq, n_entries)) < 0.3] = _NEG
+    sinks = jnp.asarray(rng.standard_normal((heads,)), jnp.float32) if use_sinks else None
+    scale = head_dim**-0.5
+
+    out = op(
+        q, kv, jnp.asarray(entry_bias), sinks,
+        softmax_scale=scale, window=window, token_kv_len=seq, token_valid=jnp.asarray(valid),
+    ).attention_outputs  # fmt: skip
+    ref = _dense_reference(
+        np.asarray(q),
+        np.asarray(kv),
+        np.concatenate([token_bias, entry_bias], axis=2),
+        None if sinks is None else np.asarray(sinks),
+        scale,
+    )
+    out = np.asarray(out)
+    assert out.shape == (batch, heads, seq, head_dim)
+    assert np.isfinite(out).all()
+    assert np.abs(out - ref).max() < 1e-4
+
+
+def test_entry_topk_matches_dense_reference():
+    """token_valid + entry_topk (no caller-built bias) reproduces the dense reference, repeats counted once."""
+    from easydel.operations.kernels import CompressedWindowAttn
+
+    op = CompressedWindowAttn(_metadata())
+    batch, heads, seq, head_dim, window, n_entries, k = 2, 4, 24, 32, 8, 6, 3
+    rng = np.random.default_rng(7)
+    q = jnp.asarray(rng.standard_normal((batch, heads, seq, head_dim)), jnp.float32)
+    kv = jnp.asarray(rng.standard_normal((batch, seq + n_entries, head_dim)), jnp.float32)
+    valid = rng.random((batch, seq)) > 0.2
+    valid[:, 0] = True
+    ids = rng.integers(0, n_entries, size=(batch, seq, k)).astype(np.int32)
+    ids[:, :, -1] = ids[:, :, 0]
+    ids[rng.random((batch, seq, k)) < 0.25] = -1
+    qi, ki = np.arange(seq)[:, None], np.arange(seq)[None, :]
+    token_ok = ((ki <= qi) & (ki > qi - window))[None] & valid[:, None, :]
+    opened = np.zeros((batch, seq, n_entries), bool)
+    for b in range(batch):
+        for i in range(seq):
+            opened[b, i, ids[b, i][ids[b, i] >= 0]] = True
+    bias = np.concatenate([np.where(token_ok, 0.0, _NEG), np.where(opened, 0.0, _NEG)], axis=2).astype(np.float32)
+    sinks = jnp.asarray(rng.standard_normal((heads,)), jnp.float32)
+    scale = head_dim**-0.5
+
+    out = op(
+        q, kv, jnp.zeros((batch, seq, 0), jnp.float32), sinks,
+        softmax_scale=scale, window=window, token_kv_len=seq,
+        token_valid=jnp.asarray(valid), entry_topk=jnp.asarray(ids),
+    ).attention_outputs  # fmt: skip
+    ref = _dense_reference(np.asarray(q), np.asarray(kv), bias, np.asarray(sinks), scale)
+    out = np.asarray(out)
+    assert np.isfinite(out).all()
+    assert np.abs(out - ref).max() < 1e-4
+
+
 def test_adapter_is_differentiable():
     """The adapter forward is differentiable w.r.t. query / kv / sinks."""
     from easydel.operations.kernels import CompressedWindowAttn

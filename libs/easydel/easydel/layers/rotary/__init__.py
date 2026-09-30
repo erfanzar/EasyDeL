@@ -89,7 +89,7 @@ from ._modules import (
     YaRNScalingRotaryEmbedding,
 )
 from ._rotary import get_frequencies, get_inv_frequencies, get_rope
-from ._utils import apply_rope_interleaved, gather_mla_cos_sin, yarn_get_mscale
+from ._utils import apply_rope_interleaved, gather_mla_cos_sin, rotate_half, yarn_get_mscale
 
 __all__ = (
     "DeepseekScalingRotaryEmbedding",
@@ -118,5 +118,6 @@ __all__ = (
     "get_frequencies",
     "get_inv_frequencies",
     "get_rope",
+    "rotate_half",
     "yarn_get_mscale",
 )

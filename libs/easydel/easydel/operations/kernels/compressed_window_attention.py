@@ -40,10 +40,12 @@ import jax
 from ejkernel.modules import compressed_window_attention as _ejkernel_compressed_window_attention
 from jax import numpy as jnp
 from jaxtyping import Array, Float
+from spectrax import common_types
 
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationRegistry
 from ..requirements import ExecutionMode, MetadataField, OperationRequirements, RequirementsBuilder
+from ._compressed_window_common import head_parallel_shard_map, resolve_platform
 
 # Platform override for A/B testing the Pallas kernel against the XLA reference
 # in-model. Default "auto" prefers Pallas on TPU; the model wiring defaults to
@@ -93,14 +95,21 @@ class CompressedWindowAttn(OperationImpl):
         bias: Float[Array, "batch q_len kv_len"],
         softmax_aux: Float[Array, "num_heads"] | None = None,  # noqa: F821
         softmax_scale: float | None = None,
+        window: int = 0,
+        token_kv_len: int = 0,
+        platform: str | None = None,
+        token_valid: Array | None = None,
+        entry_topk: Array | None = None,
         **ignores,
     ) -> AttentionOutput:
         """Run compressed-window full-sequence attention via the ejkernel op.
 
         Casts the query/KV to the runtime compute dtype (the additive bias and
         the sink logits stay float32 to preserve the softmax accumulation
-        precision), then delegates to the ejkernel op. Sharding of the
-        head-parallel query/output and the replicated KV is left to GSPMD.
+        precision), then delegates to the ejkernel op. When the op resolves to
+        the TPU Mosaic kernel on a multi-device mesh it runs under a
+        head-parallel ``shard_map`` built from the metadata's ``HEAD`` / ``BATCH``
+        axes; the XLA reference is left to GSPMD.
 
         Args:
             query: Rotated queries ``[batch, num_heads, q_len, head_dim]``.
@@ -108,6 +117,21 @@ class CompressedWindowAttn(OperationImpl):
             bias: Additive fp32 mask ``[batch, q_len, kv_len]`` (head-broadcast).
             softmax_aux: Optional per-head sink logits ``[num_heads]``.
             softmax_scale: Logit scale; defaults to ``head_dim ** -0.5``.
+            window: Sliding-window size of the leading token-KV region; ``> 0``
+                lets the TPU kernel skip out-of-window token tiles. ``0`` scans
+                the whole KV axis. The bias must still encode the window.
+            token_kv_len: Length of the token-KV region at the front of ``kv``
+                (the rest are compressed entries). Used only when ``window > 0``.
+            platform: Per-call platform override (``"pallas"`` / ``"xla"`` /
+                ``None`` = the adapter default).
+            token_valid: Optional per-key token validity ``[batch, q_len]``. When
+                given, ``bias`` holds only the compressed-entry columns and the
+                window / causal / padding mask of the token region is built by
+                the kernel (requires ``window > 0`` and ``token_kv_len == q_len``).
+            entry_topk: Optional selected entry ids ``[batch, q_len, k]`` (``-1``
+                padded) replacing the entry columns of ``bias`` (pass a zero-width
+                ``bias``); no ``[q_len, entries]`` selection bias is built here.
+                Requires ``token_valid``.
             **ignores: Ignored keyword arguments (interface parity).
 
         Returns:
@@ -116,13 +140,30 @@ class CompressedWindowAttn(OperationImpl):
         """
         del ignores
         runtime_dtype = self.metadata.runtime_dtype
+        resolved = resolve_platform(platform, _PLATFORM)
+        sharding = head_parallel_shard_map(
+            self.metadata,
+            mode=common_types.MODE_TRAIN,
+            platform=resolved,
+            batch=int(query.shape[0]),
+            num_heads=int(query.shape[1]),
+            token_valid=token_valid is not None,
+            entry_topk=entry_topk is not None,
+        )
+        if token_valid is not None:
+            sharding["token_valid"] = token_valid.astype(jnp.float32)
+        if entry_topk is not None:
+            sharding["entry_topk"] = entry_topk.astype(jnp.int32)
         out = _ejkernel_compressed_window_attention(
             query.astype(runtime_dtype),
             kv.astype(runtime_dtype),
             bias.astype(jnp.float32),
             None if softmax_aux is None else softmax_aux.astype(jnp.float32),
             softmax_scale=softmax_scale,
-            platform=None if _PLATFORM == "auto" else _PLATFORM,
+            platform=resolved,
+            window=int(window),
+            token_kv_len=int(token_kv_len),
+            **sharding,
         )
         return AttentionOutput(attention_weights=None, attention_outputs=out)
 
@@ -153,6 +194,11 @@ class CompressedWindowAttn(OperationImpl):
         bias: Float[Array, "batch q_len kv_len"],
         softmax_aux: Float[Array, "num_heads"] | None = None,  # noqa: F821
         softmax_scale: float | None = None,
+        window: int = 0,
+        token_kv_len: int = 0,
+        platform: str | None = None,
+        token_valid: Array | None = None,
+        entry_topk: Array | None = None,
         **ignores,
     ) -> AttentionOutput:
         """Dispatch to the backend-specific forward.
@@ -163,6 +209,11 @@ class CompressedWindowAttn(OperationImpl):
             bias: Additive fp32 mask ``[batch, q_len, kv_len]``.
             softmax_aux: Optional per-head sink logits ``[num_heads]``.
             softmax_scale: Logit scale.
+            window: Sliding-window size of the token-KV region (``0`` = full scan).
+            token_kv_len: Length of the token-KV region at the front of ``kv``.
+            platform: Per-call platform override.
+            token_valid: Optional per-key token validity (implicit token mask).
+            entry_topk: Optional selected entry ids (implicit selection mask).
             **ignores: Ignored keyword arguments.
 
         Returns:
@@ -174,5 +225,10 @@ class CompressedWindowAttn(OperationImpl):
             bias=bias,
             softmax_aux=softmax_aux,
             softmax_scale=softmax_scale,
+            window=window,
+            token_kv_len=token_kv_len,
+            platform=platform,
+            token_valid=token_valid,
+            entry_topk=entry_topk,
             **ignores,
         )

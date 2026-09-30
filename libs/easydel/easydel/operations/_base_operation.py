@@ -438,9 +438,9 @@ class OperationRegistry:
 
         Retrieves the class registered for ``impl_name`` via :meth:`get` and
         constructs it with the supplied ``metadata``. When ``requires_cache``
-        is given, the metadata's ``requires_cache`` field is mutated to that
-        value before construction so the new instance reports the override
-        through :meth:`OperationImpl.get_instance_requirements`.
+        is given, the override is stored on the new instance without mutating
+        shared metadata, and is reported by
+        :meth:`OperationImpl.get_instance_requirements`.
 
         Args:
             impl_name: Registered name of the implementation to instantiate.
@@ -459,12 +459,13 @@ class OperationRegistry:
             ValueError: If no implementation is registered under
                 ``impl_name`` (propagated from :meth:`get`).
         """
-        # Apply requires_cache override to metadata if provided
-        if requires_cache is not None:
-            metadata.requires_cache = requires_cache
-
         impl_cls: type[BaseOperation] = cls.get(impl_name)
         instance: BaseOperation = impl_cls(metadata)
+        if requires_cache is not None:
+            # Metadata is shared by operations in the same attention module. Keep
+            # the override local so creating another operation cannot change the
+            # requirements of one that has already been constructed.
+            instance._requires_cache_override = requires_cache
         return instance
 
     @classmethod

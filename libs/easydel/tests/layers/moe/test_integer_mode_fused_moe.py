@@ -22,7 +22,14 @@ def _project(x, layer, expert, bits):
 
 @pytest.mark.parametrize(
     "gate_mode,down_mode",
-    [("w4a16", "w4a16"), ("w8a16", "w8a16"), ("w4a4", "w4a4"), ("w8a8", "w8a8"), ("w4a16", "w8a8")],
+    [
+        ("w4a16", "w4a16"),
+        ("w8a16", "w8a16"),
+        ("w4a8", "w4a8"),
+        ("w4a4", "w4a4"),
+        ("w8a8", "w8a8"),
+        ("w4a16", "w8a8"),
+    ],
 )
 def test_fused_qwen_experts_honor_per_projection_precision(gate_mode, down_mode):
     config = Qwen4ExpTextConfig(

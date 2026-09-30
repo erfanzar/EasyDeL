@@ -18,7 +18,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from easydel.layers.indexer import BaseIndexer, CompressedIndexer, topk_selection_mask
+from easydel.layers.indexer import BaseIndexer, CompressedIndexer, IndexerSelection, topk_selection_mask
 from easydel.operations.kernels.glm_moe_dsa_indexer import GlmMoeDsaIndexerOp
 
 
@@ -46,6 +46,20 @@ def test_selection_mask_matches_scattered_top_k(kind, shape, k):
     values, indices = jax.lax.top_k(scores, k)
     got = jax.jit(topk_selection_mask)(scores, values, indices)
     np.testing.assert_array_equal(np.asarray(got), np.asarray(_one_hot_mask(indices, shape[-1])))
+
+
+def test_indexer_selection_scatter_matches_dense_one_hot_for_long_context():
+    """The DSA fallback scatter is equivalent without allocating a [B,Q,K] one-hot cube."""
+    batch, query_len, kv_len, top_k = 2, 32, 4096, 128
+    rng = np.random.default_rng(14)
+    indices = rng.integers(0, kv_len, size=(batch, query_len, top_k), dtype=np.int32)
+    indices[:, :, -2:] = -1
+    indices[:, :, -3] = indices[:, :, 0]  # duplicate indices collapse identically
+    indices = jnp.asarray(indices)
+
+    got = jax.jit(lambda selected: IndexerSelection(selected).to_mask(kv_len))(indices)
+    expected = _one_hot_mask(indices, kv_len)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
 
 
 def test_operation_returns_mask_consistent_with_its_indices():

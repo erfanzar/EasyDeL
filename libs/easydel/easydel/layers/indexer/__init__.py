@@ -36,6 +36,17 @@ from ._block_topk import BlockTopKIndexer
 from ._compressed import CompressedIndexer, CompressedIndexerAdapter, CompressedIndexerConfig, CompressedIndexerScorer
 from ._config import IndexerConfig, IndexerKind
 from ._indexer import IndexerOutput, SparseIndexer
+from ._paged import (
+    bounded_block_max_topk,
+    bounded_candidate_entry_topk,
+    bounded_entry_topk,
+    paged_pool_select,
+    paged_token_layout,
+    paged_token_select,
+    running_entry_topk,
+    slot_buffer_pages,
+    slot_entry_topk,
+)
 from ._primitives import (
     indices_to_bool_mask,
     is_vacuous_selection,
@@ -45,6 +56,14 @@ from ._primitives import (
     visible_causal_mask,
 )
 from ._selection import BaseIndexer, IndexerSelection, SelectionSpec
+from ._shared_key import (
+    IndexerScoreInputs,
+    SharedKeyIndexer,
+    SharedKeyIndexerConfig,
+    select_candidate_blocks,
+    selection_bias,
+    shared_key_scores,
+)
 from ._token import TokenIndexer, TokenIndexerConfig
 
 __all__ = (
@@ -59,14 +78,29 @@ __all__ = (
     "IndexerConfig",
     "IndexerKind",
     "IndexerOutput",
+    "IndexerScoreInputs",
     "IndexerSelection",
     "SelectionSpec",
+    "SharedKeyIndexer",
+    "SharedKeyIndexerConfig",
     "SparseIndexer",
     "TokenIndexer",
     "TokenIndexerConfig",
     "apply_indexer_rope",
+    "bounded_block_max_topk",
+    "bounded_candidate_entry_topk",
+    "bounded_entry_topk",
     "indices_to_bool_mask",
     "is_vacuous_selection",
+    "paged_pool_select",
+    "paged_token_layout",
+    "paged_token_select",
+    "running_entry_topk",
+    "select_candidate_blocks",
+    "selection_bias",
+    "shared_key_scores",
+    "slot_buffer_pages",
+    "slot_entry_topk",
     "ste_score_proxy",
     "topk_select",
     "topk_selection_mask",

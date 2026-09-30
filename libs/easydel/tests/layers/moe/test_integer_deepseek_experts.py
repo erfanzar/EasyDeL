@@ -18,7 +18,7 @@ def project(x, layer, e, bits):
     return (x @ np.asarray(layer.quant_kernel.value).astype(np.float32)[e]) * np.asarray(layer.quant_scales.value)[e]
 
 
-@pytest.mark.parametrize("mode", ["w4a16", "w8a16", "w4a4", "w8a8"])
+@pytest.mark.parametrize("mode", ["w4a16", "w8a16", "w4a8", "w4a4", "w8a8"])
 @pytest.mark.parametrize("routing", ["moe", "hash_moe"])
 def test_deepseek_split_experts_match_independent_reference(mode, routing):
     cfg = DeepseekV4Config(

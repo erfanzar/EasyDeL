@@ -14,8 +14,9 @@
 
 """Parity tests for the serving packed-row KDA scan.
 
-``_chunked_scan_per_channel_rows`` is the eSurge serving path for GLM-5.3's
-KDA layers: it processes a packed multi-row batch chunk-by-chunk under
+``_chunked_scan_per_channel_rows`` is the row-layout reference for GLM-5.3's
+KDA layers (eSurge serving now goes through ``_packed_segment_kda_per_channel``):
+it processes a packed multi-row batch chunk-by-chunk under
 ``lax.scan`` with per-row validity masks. These tests pin it against the
 sequential recurrent reference (the ground truth) for ragged rows — including
 the zero-pad tail branch the training-path tests never hit.
@@ -63,8 +64,14 @@ def test_scan_matches_recurrent_full_rows(seq):
     init = jax.random.normal(key, (R, H, K, V), dtype=jnp.float32) * 0.1
 
     scan_out, scan_state = _chunked_scan_per_channel_rows(
-        query=q, key=k, value=v, beta=b, decay=g, initial_state=init,
-        token_valid=jnp.ones((R, seq)), chunk_size=16,
+        query=q,
+        key=k,
+        value=v,
+        beta=b,
+        decay=g,
+        initial_state=init,
+        token_valid=jnp.ones((R, seq)),
+        chunk_size=16,
     )
     ref_out, ref_state = _recurrent_kda_per_channel_fwd(
         query=q, key=k, value=v, beta=b, decay=g, initial_state=init, use_qk_l2norm=True
@@ -92,21 +99,28 @@ def test_scan_ragged_rows_match_per_row_recurrent():
         return x * valid[:, None, :, None]
 
     scan_out, scan_state = _chunked_scan_per_channel_rows(
-        query=mask4(q), key=mask4(k), value=mask4(v),
-        beta=b * valid[:, None], decay=mask4(g),
-        initial_state=init, token_valid=valid, chunk_size=16,
+        query=mask4(q),
+        key=mask4(k),
+        value=mask4(v),
+        beta=b * valid[:, None],
+        decay=mask4(g),
+        initial_state=init,
+        token_valid=valid,
+        chunk_size=16,
     )
 
     for r in range(R):
         length = int(lens[r])
         ref_out, ref_state = _recurrent_kda_per_channel_fwd(
-            query=q[r : r + 1, :, :length], key=k[r : r + 1, :, :length], value=v[r : r + 1, :, :length],
-            beta=b[r : r + 1, :, :length], decay=g[r : r + 1, :, :length],
-            initial_state=init[r : r + 1], use_qk_l2norm=True,
+            query=q[r : r + 1, :, :length],
+            key=k[r : r + 1, :, :length],
+            value=v[r : r + 1, :, :length],
+            beta=b[r : r + 1, :, :length],
+            decay=g[r : r + 1, :, :length],
+            initial_state=init[r : r + 1],
+            use_qk_l2norm=True,
         )
-        np.testing.assert_allclose(
-            np.asarray(scan_out[r, :, :length]), np.asarray(ref_out[0]), atol=ATOL
-        )
+        np.testing.assert_allclose(np.asarray(scan_out[r, :, :length]), np.asarray(ref_out[0]), atol=ATOL)
         np.testing.assert_allclose(np.asarray(scan_state[r]), np.asarray(ref_state[0]), atol=ATOL)
         # padded tail outputs must be exactly zero
         if length < T:

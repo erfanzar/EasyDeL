@@ -128,7 +128,7 @@ def _routed(block, hidden):
     )[0]
 
 
-@pytest.mark.parametrize("mode", ["w4a16", "w8a16", "w4a4", "w8a8"])
+@pytest.mark.parametrize("mode", ["w4a16", "w8a16", "w4a8", "w4a4", "w8a8"])
 @pytest.mark.parametrize("check", ["forward", "jvp", "vjp"])
 def test_integer_modes_tp4_and_expert_tensor_forward_and_input_ad(mode, check):
     if jax.default_backend() not in ("cpu", "tpu") or jax.device_count() != TP:

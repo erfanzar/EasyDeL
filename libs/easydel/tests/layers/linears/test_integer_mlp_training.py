@@ -13,7 +13,7 @@ from easydel.layers.mlp import gated_mlp_forward
 from easydel.layers.quantization import QuantizationConfig
 
 
-@pytest.mark.parametrize("mode", ["w4a16", "w8a16", "w4a4", "w8a8"])
+@pytest.mark.parametrize("mode", ["w4a16", "w8a16", "w4a8", "w4a4", "w8a8"])
 def test_integer_mlp_training_jvp_vjp_matches_composition(mode):
     cfg = ed.LlamaConfig(
         hidden_size=16,

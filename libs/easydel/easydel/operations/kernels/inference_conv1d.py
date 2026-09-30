@@ -29,6 +29,10 @@ Exports:
         Public eJKernel functional entry point re-exported for compatibility.
     ``ragged_causal_conv1d_head_sharded``:
         eJKernel helper for feature/head-axis sharded packed conv execution.
+    ``reorder_conv_features_for_sharding``:
+        Rearranges a fused ``[A|B|C]`` feature axis into the per-shard
+        interleaved layout that ``ragged_causal_conv1d_head_sharded`` stores in
+        its conv-state pool.
     ``RaggedCausalConv1D``:
         Registered EasyDeL ``OperationImpl`` wrapper resolved by the operation
         registry under ``"ragged_causal_conv1d"``.
@@ -43,6 +47,9 @@ from ejkernel.modules.operations import (
     ragged_causal_conv1d_head_sharded,
     ragged_causal_conv1d_op,
 )
+from ejkernel.modules.operations.ragged_causal_conv1d import (
+    _reorder_concatenated_tensor_for_sharding,
+)
 
 from .._operation_impl import OperationImpl, OperationRegistry
 from ..requirements import (
@@ -52,6 +59,32 @@ from ..requirements import (
     OperationRequirements,
     RequirementsBuilder,
 )
+
+
+def reorder_conv_features_for_sharding(
+    x: jax.Array,
+    split_sizes: tuple[int, ...],
+    n_shards: int,
+    dim: int = -1,
+) -> jax.Array:
+    """Arrange a fused feature axis into the head-sharded conv-state layout.
+
+    ``ragged_causal_conv1d_head_sharded`` keeps its persistent conv-state pool in
+    a per-shard interleaved feature order. Callers that build conv windows
+    outside the op (for example speculative-decode candidate windows) must bring
+    their token columns into the same order. This delegates to the eJKernel
+    helper that defines that layout, so both sides stay in lockstep.
+
+    Args:
+        x: Tensor whose ``dim`` axis is the concatenation ``[A | B | C | ...]``.
+        split_sizes: Sizes of the concatenated feature groups along ``dim``.
+        n_shards: Number of shards on the head/feature mesh axis.
+        dim: Axis holding the fused features.
+
+    Returns:
+        ``x`` with ``dim`` reordered to ``[A0 | B0 | C0 | A1 | B1 | C1 | ...]``.
+    """
+    return _reorder_concatenated_tensor_for_sharding(x, tuple(split_sizes), int(n_shards), dim)
 
 
 @OperationRegistry.register
@@ -175,4 +208,5 @@ __all__ = (
     "ragged_causal_conv1d",
     "ragged_causal_conv1d_head_sharded",
     "ragged_causal_conv1d_op",
+    "reorder_conv_features_for_sharding",
 )

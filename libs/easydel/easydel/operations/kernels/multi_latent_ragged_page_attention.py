@@ -44,6 +44,7 @@ import jax
 from ejkernel.modules import (
     multi_latent_ragged_page_attention,  # pyright: ignore[reportMissingTypeStubs]
     multi_latent_ragged_page_attention_v2,  # pyright: ignore[reportMissingTypeStubs]
+    sparse_multi_latent_ragged_page_attention,  # pyright: ignore[reportMissingTypeStubs]
 )
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec as Ps
@@ -82,6 +83,50 @@ def _dp_page_axis(cache_view: MLARaggedPagesCacheView):
     """
     dp_size = max(1, int(getattr(cache_view.metadata, "data_parallel_size", 1)))
     return ATTN_DP if dp_size > 1 else ct.EMPTY
+
+
+def _mla_kernel_call(dense_fn, ignore: dict, total_tokens: int, common_call_kwargs: dict):
+    """Return ``(selected, kernel)`` for the shard_map bodies.
+
+    Without ``sparse_selected`` in ``ignore`` the kernel is ``dense_fn`` with the dense
+    call kwargs. With it (DSA top-k serving), the kernel is the sparse MLA op attending
+    only to the selected chunks (``sparse_chunk_size`` tokens each) of every query.
+
+    Args:
+        dense_fn: Dense MLA ragged kernel (v1 or v2 functional API).
+        ignore: Extra forward kwargs; may carry ``sparse_selected`` ``[..., W]`` int chunk
+            ids (``-1`` padded, logical per sequence) and ``sparse_chunk_size``.
+        total_tokens: Packed query token count.
+        common_call_kwargs: Dense call kwargs (scale, soft cap, window, scales, cfg).
+
+    Returns:
+        ``(selected [total_tokens, W] int32 or None, kernel(*args, selected=...))``.
+    """
+    selected = ignore.get("sparse_selected")
+    if selected is None:
+
+        def dense_kernel(*args, selected=None):
+            del selected
+            return dense_fn(*args, **common_call_kwargs)
+
+        return None, dense_kernel
+
+    from ejkernel.modules.operations.configs import SparseMultiLatentRaggedPageAttentionConfig
+
+    selected = jnp.asarray(selected, jnp.int32)
+    selected = selected.reshape(total_tokens, selected.shape[-1])
+    chunk_size = int(ignore.get("sparse_chunk_size") or 1)
+    sparse_kwargs = {k: v for k, v in common_call_kwargs.items() if k != "cfg"}
+    dense_cfg = common_call_kwargs.get("cfg")
+    sparse_kwargs["cfg"] = SparseMultiLatentRaggedPageAttentionConfig(
+        vmem_limit_bytes=getattr(dense_cfg, "vmem_limit_bytes", None),
+        platform="auto",
+    )
+
+    def sparse_kernel(*args, selected):
+        return sparse_multi_latent_ragged_page_attention(*args, selected, chunk_size=chunk_size, **sparse_kwargs)
+
+    return selected, sparse_kernel
 
 
 def _reshape_query_tensor(x, name: str):
@@ -460,6 +505,14 @@ class MultiLatentRaggedPageAttn(OperationImpl):
             and int(cache_metadata.context_lens.shape[0]) % page_axis_size == 0
         )
 
+        sparse_selected, _kernel = _mla_kernel_call(
+            multi_latent_ragged_page_attention, ignore, queries_nope.shape[0], common_call_kwargs
+        )
+        extra_specs, extra_args = (), ()
+        if sparse_selected is not None:
+            extra_specs = (resolve(axes=[ct.EMPTY, ct.EMPTY], mode=ct.MODE_PREFILL, shape=sparse_selected.shape),)
+            extra_args = (sparse_selected,)
+
         if can_use_dp_local:
             rows_per_shard = int(cache_metadata.context_lens.shape[0]) // page_axis_size
             max_pages_per_req = int(cache_metadata.pages_tables.shape[1])
@@ -477,6 +530,7 @@ class MultiLatentRaggedPageAttn(OperationImpl):
                     Ps(),
                     Ps(),
                     Ps(),
+                    *extra_specs,
                 ),
                 out_specs=(qaxes_nope, kv_pages_spec),
                 check_vma=False,
@@ -491,6 +545,7 @@ class MultiLatentRaggedPageAttn(OperationImpl):
                 full_pages_tables,
                 full_query_start_loc,
                 full_distribution,
+                *extra,
             ):
                 del full_distribution
                 shard_idx = axis_index(page_axis_names)
@@ -525,7 +580,7 @@ class MultiLatentRaggedPageAttn(OperationImpl):
                 local_block_tables = local_block_tables - page_offset
                 local_block_tables = jnp.clip(local_block_tables, 0, local_num_pages - 1)
 
-                local_output, local_kv_pages = multi_latent_ragged_page_attention(
+                local_output, local_kv_pages = _kernel(
                     local_queries_nope,
                     local_queries_pe,
                     local_keys_values,
@@ -535,7 +590,7 @@ class MultiLatentRaggedPageAttn(OperationImpl):
                     local_block_tables,
                     local_query_start_loc,
                     local_distribution,
-                    **common_call_kwargs,
+                    selected=extra[0] if extra else None,
                 )
 
                 row_ids = jnp.arange(rows_per_shard, dtype=jnp.int32)[:, None]
@@ -569,6 +624,7 @@ class MultiLatentRaggedPageAttn(OperationImpl):
                 cache_metadata.pages_tables,
                 cache_metadata.query_start_loc,
                 request_distribution,
+                *extra_args,
             )
         else:
 
@@ -585,6 +641,7 @@ class MultiLatentRaggedPageAttn(OperationImpl):
                     Ps(),
                     Ps(),
                     Ps(),
+                    *extra_specs,
                 ),
                 out_specs=(qaxes_nope, kv_pages_spec_replicated),
                 check_vma=False,
@@ -599,8 +656,9 @@ class MultiLatentRaggedPageAttn(OperationImpl):
                 full_pages_tables,
                 full_query_start_loc,
                 full_distribution,
+                *extra,
             ):
-                return multi_latent_ragged_page_attention(
+                return _kernel(
                     local_queries_nope,
                     local_queries_pe,
                     local_keys_values,
@@ -610,7 +668,7 @@ class MultiLatentRaggedPageAttn(OperationImpl):
                     full_pages_tables.reshape(-1),
                     full_query_start_loc,
                     full_distribution,
-                    **common_call_kwargs,
+                    selected=extra[0] if extra else None,
                 )
 
             output, kv_pages = _mapped_global(
@@ -623,6 +681,7 @@ class MultiLatentRaggedPageAttn(OperationImpl):
                 cache_metadata.pages_tables,
                 cache_metadata.query_start_loc,
                 request_distribution,
+                *extra_args,
             )
 
         cache_view.kv_pages = kv_pages
@@ -992,6 +1051,14 @@ class MultiLatentRaggedPageAttnV2(OperationImpl):
         if use_rank_major_dp and not can_use_dp_local:
             raise ValueError("Rank-major DP MLA ragged attention requires the DP-local page path.")
 
+        sparse_selected, _kernel = _mla_kernel_call(
+            multi_latent_ragged_page_attention_v2, ignore, queries_nope.shape[0], common_call_kwargs
+        )
+        extra_specs, extra_args = (), ()
+        if sparse_selected is not None:
+            extra_specs = (resolve(axes=[q_token_axis, ct.EMPTY], mode=ct.MODE_PREFILL, shape=sparse_selected.shape),)
+            extra_args = (sparse_selected,)
+
         if can_use_dp_local:
             rows_per_shard = int(cache_metadata.context_lens.shape[0]) // page_axis_size
             max_pages_per_req = int(cache_metadata.pages_tables.shape[1])
@@ -1009,6 +1076,7 @@ class MultiLatentRaggedPageAttnV2(OperationImpl):
                     Ps(),
                     Ps(),
                     Ps(),
+                    *extra_specs,
                 ),
                 out_specs=(qaxes_nope, kv_pages_spec),
                 check_vma=False,
@@ -1023,6 +1091,7 @@ class MultiLatentRaggedPageAttnV2(OperationImpl):
                 full_pages_tables,
                 full_query_start_loc,
                 full_distribution,
+                *extra,
             ):
                 shard_idx = axis_index(page_axis_names)
                 row_start = shard_idx * jnp.int32(rows_per_shard)
@@ -1059,7 +1128,7 @@ class MultiLatentRaggedPageAttnV2(OperationImpl):
                 local_block_tables = local_block_tables - page_offset
                 local_block_tables = jnp.clip(local_block_tables, 0, local_num_pages - 1)
 
-                local_output, local_kv_pages = multi_latent_ragged_page_attention_v2(
+                local_output, local_kv_pages = _kernel(
                     local_queries_nope,
                     local_queries_pe,
                     local_keys_values,
@@ -1069,7 +1138,7 @@ class MultiLatentRaggedPageAttnV2(OperationImpl):
                     local_block_tables,
                     local_query_start_loc,
                     local_distribution,
-                    **common_call_kwargs,
+                    selected=extra[0] if extra else None,
                 )
 
                 if use_rank_major_dp:
@@ -1102,6 +1171,7 @@ class MultiLatentRaggedPageAttnV2(OperationImpl):
                 cache_metadata.pages_tables,
                 cache_metadata.query_start_loc,
                 request_distribution,
+                *extra_args,
             )
         else:
 
@@ -1118,6 +1188,7 @@ class MultiLatentRaggedPageAttnV2(OperationImpl):
                     Ps(),
                     Ps(),
                     Ps(),
+                    *extra_specs,
                 ),
                 out_specs=(qaxes_nope, kv_pages_spec_replicated),
                 check_vma=False,
@@ -1132,8 +1203,9 @@ class MultiLatentRaggedPageAttnV2(OperationImpl):
                 full_pages_tables,
                 full_query_start_loc,
                 full_distribution,
+                *extra,
             ):
-                return multi_latent_ragged_page_attention_v2(
+                return _kernel(
                     local_queries_nope,
                     local_queries_pe,
                     local_keys_values,
@@ -1143,7 +1215,7 @@ class MultiLatentRaggedPageAttnV2(OperationImpl):
                     full_pages_tables.reshape(-1),
                     full_query_start_loc,
                     full_distribution,
-                    **common_call_kwargs,
+                    selected=extra[0] if extra else None,
                 )
 
             output, kv_pages = _mapped_global(
@@ -1156,6 +1228,7 @@ class MultiLatentRaggedPageAttnV2(OperationImpl):
                 cache_metadata.pages_tables,
                 cache_metadata.query_start_loc,
                 request_distribution,
+                *extra_args,
             )
 
         cache_view.kv_pages = kv_pages

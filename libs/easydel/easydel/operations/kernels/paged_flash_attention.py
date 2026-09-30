@@ -45,6 +45,7 @@ from ejkernel.modules import flash_attention  # pyright: ignore[reportMissingTyp
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax import lax
 from jax import numpy as jnp
+from jax.sharding import PartitionSpec
 from jaxtyping import Array, Float
 from spectrax import common_types as ct
 from spectrax import with_sharding_constraint
@@ -55,6 +56,7 @@ from easydel.utils.helpers import check_bool_flag
 
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationRegistry
+from .._operation_meta import normalize_head_sinks
 from ..requirements import CacheType, ExecutionMode, MetadataField, OperationRequirements, RequirementsBuilder
 
 ENABLE_DP_LOCAL_PAGE_PATH = check_bool_flag("EASYDEL_ENABLE_DP_LOCAL_PAGE_PATH", default=True)
@@ -281,7 +283,20 @@ class PagedFlashAttn(OperationImpl):
         is_decode_mode = model_mode == ct.MODE_DECODE
         causal_computed = causal if not is_decode_mode else False
 
-        shardings = self.metadata.get_shardings(model_mode, layout="bthd")
+        softmax_aux, _ = normalize_head_sinks(
+            softmax_aux,
+            num_q_heads=query.shape[2],
+            num_kv_heads=key_cache.shape[2],
+            per_head_2d=False,
+            head_shard_factor=self.metadata.head_shard_factor(model_mode, query.shape[2]),
+        )
+        shardings = self.metadata.get_shardings(
+            model_mode,
+            layout="bthd",
+            softmax_aux=softmax_aux,
+            num_q_heads=query.shape[2],
+            num_kv_heads=key_cache.shape[2],
+        )
         query_sharding = self.create_stable_sharding(shardings.query, tensor=query, preserved_indices=[0, 2])
         bias_sharding = self.create_stable_sharding(
             shardings.bias,
@@ -307,6 +322,11 @@ class PagedFlashAttn(OperationImpl):
             shape=value_cache.shape,
         )
         output_sharding = self.create_stable_sharding(shardings.output, tensor=query, preserved_indices=[0, 2])
+        # Block-table rows follow the query batch partition (block axis replicated). Without this eighth
+        # spec ejkernel replicated the whole table while the query batch was sharded, so each shard saw
+        # every request's rows and the paged kernel rejected the batch mismatch (r14 S07-2).
+        batch_axis = query_sharding[0] if query_sharding is not None and len(query_sharding) else None
+        block_tables_sharding = PartitionSpec(batch_axis, None)
 
         attn: Float[Array, "batch seq_len_q num_heads head_dim"] = flash_attention(
             query,
@@ -337,6 +357,7 @@ class PagedFlashAttn(OperationImpl):
                 None,
                 None,
                 softmax_aux_sharding,
+                block_tables_sharding,
             ),
             out_specs=output_sharding,
         )

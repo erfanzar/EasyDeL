@@ -80,6 +80,7 @@ from easydel.caching.transformer import TransformerMetadata
 
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry, axis_entry_shard_factor
+from .._operation_meta import normalize_head_sinks
 from ..requirements import (
     CacheType,
     ExecutionMode,
@@ -335,16 +336,30 @@ class BlockSparseAttn(OperationImpl):
         head_dim: int = query.shape[-1]
         softmax_scale_computed: float = softmax_scale if softmax_scale is not None else head_dim**-0.5
         dtype: jnp.dtype = self.metadata.runtime_dtype
-        model_mode = self.get_mode(query=query, BTHD=False)
+        # The query is still BTHD here (it is transposed to BHTD below); reading axis 2 would
+        # mistake a single query head for a single token and drop causality in prefill.
+        model_mode = self.get_mode(query=query, BTHD=True)
         is_decode_mode = model_mode == common_types.MODE_DECODE
         causal_computed: bool = causal if not is_decode_mode else False
-        if softmax_aux is not None:
-            softmax_aux = softmax_aux.reshape(-1)
+        # Never reshape(-1): that flattens multi-sink (Hq, S) layouts. (Hq,) stays 1-D
+        # (the Pallas TPU kernel requires it); per-KV rows expand to (Hq, S); shared
+        # sinks that could collide with a local head count become explicit per-head.
+        softmax_aux, _ = normalize_head_sinks(
+            softmax_aux,
+            num_q_heads=query.shape[2],
+            num_kv_heads=key.shape[2],
+            per_head_2d=False,
+            head_shard_factor=self.metadata.head_shard_factor(model_mode, query.shape[2]),
+        )
         shardings = self.metadata.get_shardings(
             mode=model_mode,
             layout="bhtd",
             qkv_mni_sharding=True,
             softmax_aux=softmax_aux,
+            # Per-query-head (Hq,) sinks must be head-sharded like the query so the
+            # kernel sees local-head-length sinks inside shard_map.
+            num_q_heads=query.shape[2],
+            num_kv_heads=key.shape[2],
         )
 
         # Transpose from BTHD to BHTD format and cast to runtime dtype

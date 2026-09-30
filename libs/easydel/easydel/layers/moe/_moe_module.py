@@ -90,6 +90,7 @@ from ._communication_utils import (
     local_permute,
     permute,
     replicated_expert_combine,
+    replicated_expert_psum_unpermute,
     resolve_eformer_axis,
     sort_activations,
     unpermute,
@@ -124,6 +125,46 @@ def _channelwise_grouped_platform(rows, codes, activation_bits, *, force_xla=Fal
     from jax.experimental.pallas import tpu as pltpu
 
     return "pallas" if pltpu.get_tpu_info().chip_version.value == "v5p" else "xla"
+
+
+# Dense bf16 expert families whose training grouped matmul was measured on TPU v5p (forward + backward, single device,
+# 96 local experts = DeepSeek-V4.1 per-device shapes at ep=4). Wide-K Pallas tiles beat XLA ``ragged_dot`` at every
+# measured row count (1536..49152): gate/up [96,5120,2304] 7.04 -> 4.83 ms at 1536 rows, 10.15 -> 8.16 at 12288,
+# 20.38 -> 17.10 at 49152; down [96,2304,5120] 6.22 -> 4.14, 9.61 -> 7.11, 19.44 -> 14.42. Output and both gradients
+# match XLA within 2.5e-5 relative. block_m 128 wins up to 12288 rows, 256 above (tied at 24576); 512 runs out of
+# VMEM in the backward. Forward-only XLA wins or ties, so inference keeps XLA.
+_TRAINING_GMM_TILES = {(96, 5120, 2304): (1024, 1152), (96, 2304, 5120): (1152, 1280)}
+_TRAINING_GMM_ROWS = (1536, 49152)
+
+
+def _training_gmm_tiles(rows: int, kernel_shape: tuple[int, ...], dtype: tp.Any) -> tuple[int, int, int] | None:
+    """Measured Pallas ``(block_m, block_k, block_n)`` for a dense bf16 training grouped matmul, or ``None``.
+
+    Pure shape policy (no device query): ``None`` outside the measured families, dtype and row range.
+    """
+    tiles = _TRAINING_GMM_TILES.get(tuple(int(d) for d in kernel_shape))
+    if tiles is None or jnp.dtype(dtype) != jnp.dtype(jnp.bfloat16):
+        return None
+    if not _TRAINING_GMM_ROWS[0] <= int(rows) <= _TRAINING_GMM_ROWS[1]:
+        return None
+    return (128 if rows <= 12288 else 256, *tiles)
+
+
+def _training_gmm_config(rows: jax.Array, kernel: jax.Array) -> GroupedMatmulConfig | None:
+    """Pallas config for a measured training grouped matmul on TPU v5p, else ``None`` (keep the caller's choice)."""
+    if is_inference_mode() or jax.default_backend() != "tpu" or rows.dtype != jnp.bfloat16:
+        return None
+    tiles = _training_gmm_tiles(rows.shape[0], kernel.shape, kernel.dtype)
+    if tiles is None:
+        return None
+    from jax.experimental.pallas import tpu as pltpu
+
+    if pltpu.get_tpu_info().chip_version.value != "v5p":
+        return None
+    block_m, block_k, block_n = tiles
+    return GroupedMatmulConfig(
+        platform="pallas", bypass_xla_tiling=True, block_m=block_m, block_k=block_k, block_n=block_n
+    )
 
 
 def _expert_tile_m(buffer_rows: int, num_experts: int) -> int:
@@ -306,8 +347,10 @@ class BaseMoeModule(spx.Module, ABC):
         """Return the active stage-local mesh used by fused MoE kernels.
 
         In an MPMD stage, the safest layout is the stage submesh itself:
-        ``(dp, fsdp, ep, tp, sp)`` with the pipeline axis already removed.
-        The shard-map then marks only ``dp``/``ep``/``tp`` as manual axes.
+        ``(dp, fsdp, ep, tp, sp)`` with the pipeline axis already removed. On a
+        non-MPMD mesh whose ``pp`` axis has size 1 the resolved mesh is used
+        unchanged (``pp`` kept), so MoE outputs share the model mesh's abstract
+        mesh. The shard-map then marks only ``dp``/``ep``/``tp`` as manual axes.
         This avoids lowering a separate 3D concrete mesh inside the stage HLO,
         which can confuse TPU enhanced-barrier validation when other stage
         work is compiled in the same executable.
@@ -328,8 +371,9 @@ class BaseMoeModule(spx.Module, ABC):
                 explicitly.
 
         Returns:
-            A stage-local :class:`spx.SpxMesh`, either the 5D stage submesh or
-            the folded 3D expert mesh when bound axes require folding.
+            A stage-local :class:`spx.SpxMesh`, either the stage mesh (5-D MPMD
+            submesh, or the 6-D model mesh with a size-1 ``pp``) or the folded
+            3D expert mesh when bound axes require folding.
         """
         mesh = resolve_stage_mesh(self._mesh, arr=arr)
         if mesh is None:
@@ -357,7 +401,12 @@ class BaseMoeModule(spx.Module, ABC):
             and (not self.config.sp_is_ep_bound or sp_size == 1)
         )
         if can_use_stage_mesh:
-            stage_axis_names = tuple(axis_name for axis_name in axis_names if axis_name != "pp")
+            # Keep the (size-1) ``pp`` axis when the resolved mesh has one: the stage mesh then shares the model mesh's
+            # abstract mesh, so MoE outputs stay on the same mesh as every other array. Dropping it typed MoE outputs
+            # on a pp-less mesh, which JAX rejects ("mesh should be the same across the entire program") as soon as the
+            # program contains a device-requiring primitive such as a host callback. MPMD stage submeshes already lack
+            # ``pp`` and are unchanged.
+            stage_axis_names = axis_names
             stage_devices = mesh_devices.reshape(tuple(axis_sizes[axis_name] for axis_name in stage_axis_names))
             manual_axis_types = {
                 dpname: axis_types[0],
@@ -827,9 +876,12 @@ class BaseMoeModule(spx.Module, ABC):
         fused = expert_mask.reshape(B, S * k, self.n_routed_experts)
         counts = jnp.cumsum(fused, axis=1)
         counts = counts.reshape(B, S, k, self.n_routed_experts)
-        keep = (counts <= cap).astype(weights.dtype)
-        keep_for_slot = jnp.sum(keep, axis=-1)
-        return weights * keep_for_slot
+        keep = counts <= cap
+        # Gather the keep flag at the expert each slot is actually routed to.
+        # Summing ``keep`` over the expert axis instead would multiply every
+        # in-capacity weight by the number of not-yet-full experts.
+        keep_for_slot = jnp.take_along_axis(keep, selected_experts[..., None], axis=-1)[..., 0]
+        return weights * keep_for_slot.astype(weights.dtype)
 
     def _expert_group_mask(self, gate_logits: jax.Array, n_groups: int, topk_groups: int) -> jax.Array:
         """Build a binary mask selecting only experts within the top-k groups.
@@ -1269,7 +1321,9 @@ class BaseMoeModule(spx.Module, ABC):
         if capacity_factor is None:
             capacity_factor = 1.0
         num_tokens = selected_experts.shape[0]
-        max_capacity = int(capacity_factor * num_tokens / self.n_routed_experts)
+        # Clamp to >= 1: with fewer tokens than experts the raw ratio floors to
+        # 0 and the division below produces inf/nan adjustments (all-zero output).
+        max_capacity = max(int(capacity_factor * num_tokens / self.n_routed_experts), 1)
         expert_counts = jnp.bincount(selected_experts.flatten(), length=self.n_routed_experts)
         over_capacity_ratio = jnp.maximum(expert_counts / max_capacity, 1.0)
         weight_adjustments = 1.0 / over_capacity_ratio[selected_experts]
@@ -1716,6 +1770,9 @@ class BaseMoeModule(spx.Module, ABC):
             # operands are already at the bf16 floor, so extra passes are pure
             # cost.
             gmm_kws["precision"] = jax.lax.Precision.HIGHEST
+        # True only when the configured tiles (not the user's force-XLA knob) sent the dense matmul to XLA; measured
+        # training families may then use their Pallas tiles (see ``_training_gmm_config``).
+        dense_gmm_tile_fallback = False
         if self.config.moe_force_xla_gmm:
             gmm_kws.update(cfg=GroupedMatmulConfig(platform="xla", bypass_xla_tiling=True))
         else:
@@ -1726,6 +1783,7 @@ class BaseMoeModule(spx.Module, ABC):
                 # If the configured tile sizes are incompatible, fall back to XLA.
                 if (moe_block_m % 8 != 0) or (moe_block_n % 128 != 0):
                     gmm_kws.update(dict(cfg=GroupedMatmulConfig(platform="xla", bypass_xla_tiling=True)))
+                    dense_gmm_tile_fallback = True
                 else:
                     gmm_kws.update(platform="pallas")
                     if check_bool_flag("DISABLE_MOE_AUTOTUNE_ON_TPU", False):
@@ -1879,6 +1937,21 @@ class BaseMoeModule(spx.Module, ABC):
                             use_custom_sort_vjp=True,
                         )
                     inter = expert_ffn(xs, group_sizes, selected)
+                    if ep_size > 1 and is_inference_mode():
+                        # Serving: local combine + one psum of [chunk, H] (see replicated_expert_psum_unpermute).
+                        out = replicated_expert_psum_unpermute(
+                            inter,
+                            chunk_shard_group_sizes,
+                            sorted_sel,
+                            weights,
+                            axis_name=expert_axis_name,
+                            batch_size=1,
+                            sequence_length=moe_chunk_size,
+                            num_experts_per_tok=self.num_experts_per_tok,
+                            dtype=self.dtype,
+                            weight_modif_fn=output_weights_hook,
+                        )
+                        return out[0]
                     if ep_size > 1:
                         # Unlike the ring combine, no tail-zeroing is needed
                         # here: ragged_all_to_all sends only the leading
@@ -2222,6 +2295,10 @@ class BaseMoeModule(spx.Module, ABC):
                             platform="pallas" if on_pallas else "xla",
                             cfg=cfg,
                         )
+                    if dense_gmm_tile_fallback and not use_quantized_ragged_dot:
+                        training_cfg = _training_gmm_config(rows, kernel)
+                        if training_cfg is not None:
+                            return grouped_matmul(rows, kernel, group_sizes, **dict(gmm_kws, cfg=training_cfg))
                     return grouped_matmul(rows, kernel, group_sizes, **gmm_kws)
 
                 x_rows = _mask_dispatch_tail(x_rows, group_sizes)
@@ -2631,6 +2708,21 @@ class BaseMoeModule(spx.Module, ABC):
 
                     if sorted_selected_experts.shape[0] != original_inputs_first_dim:
                         raise ValueError("original_inputs_first_dim does not match the original tensor shape!")
+                    if is_inference_mode():
+                        # Serving: combine locally and psum [tokens, H] instead of moving the
+                        # [tokens * k, H] rows through a ragged all-to-all (forward-only path).
+                        return replicated_expert_psum_unpermute(
+                            intermediate_output,
+                            reshaped_group_sizes,
+                            sorted_selected_experts,
+                            weights,
+                            axis_name=expert_axis_name,
+                            batch_size=batch_size,
+                            sequence_length=sequence_length,
+                            num_experts_per_tok=self.num_experts_per_tok,
+                            dtype=self.dtype,
+                            weight_modif_fn=output_weights_hook,
+                        )
                     intermediate_output = replicated_expert_combine(
                         intermediate_output,
                         reshaped_group_sizes,
@@ -2818,6 +2910,7 @@ class BaseMoeModule(spx.Module, ABC):
                         apply_capacity_constraint=False,
                         reform_router_probs_fn=reform_router_probs_fn,
                         layer_idx=layer_idx,
+                        hooks=hooks,
                     )
                 case MoEMethods.FUSED_MOE:
                     return self._sparse_moe_call(
@@ -3190,6 +3283,7 @@ class BaseMoeModule(spx.Module, ABC):
         apply_capacity_constraint: bool = False,
         reform_router_probs_fn: typing.Callable[[jax.Array], jax.Array] | None = None,
         layer_idx: int | None = None,
+        hooks: MoeFusedHooks | None = None,
     ) -> tuple[jax.Array, MoeMetrics | jax.Array]:
         """Standard MoE forward pass: routing, permutation, expert computation, and combining.
 
@@ -3213,13 +3307,15 @@ class BaseMoeModule(spx.Module, ABC):
             validate_inputs: Whether to validate input shapes.
             apply_capacity_constraint: Whether to apply capacity constraints.
             reform_router_probs_fn: Optional function to modify router probabilities.
+            hooks: Per-call hooks; resolved exactly like the fused and dense paths (``None`` falls back to the
+                routing-strategy defaults on ``self.moe_hooks``).
 
         Returns:
             Tuple of (output, metrics_or_logits) where:
             - output: MoE layer output. Shape: [B, S, H].
             - metrics_or_logits: MoeMetrics if output_metrics=True, else router_logits.
         """
-        hooks = self._configure_hooks_for_routing_strategy()
+        hooks = self._configure_hooks_for_routing_strategy() if hooks is None else hooks
 
         hidden_state = hidden_state.astype(self.dtype)
         if hooks.before_gate is not None:

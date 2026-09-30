@@ -47,8 +47,11 @@ References:
 import jax
 import jax.numpy as jnp
 import numpy as np
+from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
+from ejkernel.kernels import Backend, Platform, kernel_registry  # pyright: ignore[reportMissingTypeStubs]
 from jax import lax
+from jax.sharding import PartitionSpec
 from jaxtyping import Array, Float
 from spectrax import with_sharding_constraint
 
@@ -64,6 +67,8 @@ from ..requirements import (
     OperationRequirements,
     RequirementsBuilder,
 )
+
+logger = get_logger(__name__)
 
 _MATMUL_PRECISION = lax.Precision.HIGHEST
 
@@ -123,7 +128,8 @@ def fused_kda_gate(gate: Float[Array, "..."], A_log: Float[Array, "num_heads"], 
     dt_bias = dt_bias.astype(jnp.float32)
     # softplus(gate + dt_bias)
     gate_biased = gate + dt_bias
-    softplus_gate = jnp.log1p(jnp.exp(gate_biased))
+    # Overflow-safe softplus (log1p(exp(x)) is inf for x > ~88 and NaN in the gradient).
+    softplus_gate = jax.nn.softplus(gate_biased)
     decay = A * softplus_gate
     return decay
 
@@ -607,7 +613,10 @@ def fused_kda_gate_per_channel(
     decay_rate = jnp.exp(A_log.astype(jnp.float32)).reshape(1, 1, num_heads, 1)
     if lower_bound is not None:
         return jnp.asarray(lower_bound, jnp.float32) * jax.nn.sigmoid(decay_rate * gate)
-    softplus_gate = jnp.where(gate > 20.0, gate, jnp.log1p(jnp.exp(gate)))
+    # ``jax.nn.softplus`` (logaddexp) is finite in value AND gradient for any finite input.
+    # ``where(gate > 20, gate, log1p(exp(gate)))`` still differentiated the dead branch:
+    # exp overflowed to inf and its cotangent became 0 * inf = NaN.
+    softplus_gate = jax.nn.softplus(gate)
     return -decay_rate * softplus_gate
 
 
@@ -735,6 +744,71 @@ def _recurrent_kda_per_channel_fwd(
     return outputs, final_state
 
 
+def _kda_chunk_local(k_beta, key, query, g_cumsum, *, mesh=None, lead_specs=None, sub_block: int = 16):
+    """Dispatch ejkernel ``kda_chunk_local`` on ``(C, R, H, cs, K)`` chunk tensors.
+
+    A Mosaic (Pallas) call cannot be SPMD-partitioned, so it is used only when that is safe:
+    TPU backend and either a single device (``mesh`` of size 1, or no mesh on a 1-device
+    host) or a multi-device ``mesh`` with ``lead_specs = (batch_axes, head_axes)`` for the
+    inputs, in which case it runs under ``shard_map`` (chunks are independent on every
+    leading axis). Everything else uses the XLA implementation, and each such fallback
+    logs its reason once.
+
+    When traced inside an outer ``shard_map`` with manual axes (e.g. an SPMD pipeline body),
+    a nested ``shard_map`` over the full mesh is invalid: the Pallas kernel then runs
+    directly if every remaining auto axis has size 1, and falls back to XLA otherwise.
+    """
+    args = (k_beta, key, query, g_cumsum)
+    xla = kernel_registry.get("kda_chunk_local", platform=Platform.XLA, backend=Backend.ANY)
+    if jax.default_backend() != "tpu":
+        return xla(*args)
+    pallas = kernel_registry.get("kda_chunk_local", platform=Platform.PALLAS, backend=Backend.TPU)
+    ambient = jax.sharding.get_abstract_mesh()
+    if not ambient.empty and ambient.manual_axes:
+        auto = [n for n in ambient.axis_names if n not in ambient.manual_axes and ambient.shape[n] > 1]
+        if auto:
+            logger.warning_once(
+                f"kda_chunk_local: ambient manual axes {tuple(ambient.manual_axes)} with sharded auto axes "
+                f"{auto}; using the XLA implementation instead of the Pallas kernel."
+            )
+            return xla(*args)
+        return pallas(*args, sub_block=sub_block)
+    size = getattr(mesh, "size", None)
+    if mesh is None:
+        if jax.device_count() == 1:
+            return pallas(*args, sub_block=sub_block)
+        logger.warning_once("kda_chunk_local: no mesh on a multi-device host; using the XLA implementation.")
+        return xla(*args)
+    if size == 1:
+        return pallas(*args, sub_block=sub_block)
+    if lead_specs is None:
+        logger.warning_once(
+            "kda_chunk_local: batch/head sharding of the KDA inputs is not a plain (batch, head) layout; "
+            "using the XLA implementation."
+        )
+        return xla(*args)
+    for axes, dim in ((lead_specs[0], k_beta.shape[1]), (lead_specs[1], k_beta.shape[2])):
+        names = () if axes is None else (axes if isinstance(axes, tuple) else (axes,))
+        n = 1
+        for name in names:
+            n *= int(mesh.shape[name])
+        if int(dim) % n:
+            # A non-dividing batch/head shard would error inside shard_map; keep the XLA path.
+            logger.warning_once(
+                f"kda_chunk_local: dimension {int(dim)} is not divisible by mesh axes {axes} (size {n}); "
+                "using the XLA implementation."
+            )
+            return xla(*args)
+    spec = PartitionSpec(None, lead_specs[0], lead_specs[1], None, None)
+    return jax.shard_map(
+        lambda *a: pallas(*a, sub_block=sub_block),
+        mesh=mesh,
+        in_specs=(spec,) * 4,
+        out_specs=(spec, spec),
+        check_vma=False,
+    )(*args)
+
+
 def _chunk_kda_per_channel_fwd(
     query: Float[Array, "batch num_heads seq_len head_dim"],
     key: Float[Array, "batch num_heads seq_len head_dim"],
@@ -744,11 +818,17 @@ def _chunk_kda_per_channel_fwd(
     chunk_size: int = 64,
     initial_state: Float[Array, "batch num_heads head_dim d_state"] | None = None,
     use_qk_l2norm: bool = True,
+    segment_ids: Array | None = None,
+    kernel_mesh=None,
+    kernel_lead_specs: tuple | None = None,
 ) -> tuple[
     Float[Array, "batch num_heads seq_len d_state"],
     Float[Array, "batch num_heads head_dim d_state"],
 ]:
     """Chunked per-channel-decay KDA forward for training / long decode.
+
+    ``segment_ids`` (packed training) resets the state at segment boundaries and treats
+    negative ids as padding, matching :func:`_recurrent_kda_per_channel_fwd`.
 
     Thin wrapper over :func:`_chunked_scan_per_channel_rows` (rows = batch,
     ``token_valid`` all-ones). The GLM-5-Next chunked algorithm mirrors HF
@@ -763,11 +843,11 @@ def _chunk_kda_per_channel_fwd(
       ``exp(g)`` per channel, and the outer-state update uses
       ``k * exp(g_end - g)``.
 
-    Traversing the chunks under ``lax.scan`` (instead of materializing every
-    chunk's ``(cs, cs, K)`` tensors for the whole sequence at once) keeps
-    peak transient memory at one chunk's worth regardless of sequence
-    length; with all-ones ``token_valid`` the scan is bit-identical to the
-    previous batched-materialization body. All math runs in float32.
+    The chunk-local terms (``g_cumsum``, ``attn``, ``k_cumdecay``, ...) are
+    materialized for every chunk of the whole sequence at once, and only the
+    inter-chunk recurrent state is carried by the scan, so transient memory
+    scales with sequence length (rely on outer remat for large batch x
+    heads x length). All math runs in float32.
 
     Args:
         query: ``(batch, num_heads, seq_len, head_dim)``.
@@ -797,6 +877,9 @@ def _chunk_kda_per_channel_fwd(
         token_valid=jnp.ones((batch, seq_len), dtype=query.dtype),
         chunk_size=chunk_size,
         use_qk_l2norm=use_qk_l2norm,
+        segment_ids=segment_ids,
+        kernel_mesh=kernel_mesh,
+        kernel_lead_specs=kernel_lead_specs,
     )
 
 
@@ -810,21 +893,31 @@ def _chunked_scan_per_channel_rows(
     token_valid: Float[Array, "rows seq_len"],
     chunk_size: int = 64,
     use_qk_l2norm: bool = True,
+    segment_ids: Array | None = None,
+    kernel_mesh=None,
+    kernel_lead_specs: tuple | None = None,
 ) -> tuple[Float[Array, "rows heads seq_len d_state"], Float[Array, "rows heads head_dim d_state"]]:
-    """Memory-bounded chunked per-channel KDA over independent packed rows.
+    """Chunked per-channel KDA over independent rows (training and non-packed prefill).
 
-    Serving counterpart of :func:`_chunk_kda_per_channel_fwd`: instead of
-    materializing every chunk's ``(cs, cs, K)`` tensors for the whole
-    sequence at once (which scales as ``rows * heads * num_chunks`` and OOMs
-    at large packed-prefill buckets), the chunks are traversed with
-    ``lax.scan`` and each iteration re-derives its own chunk-local tensors
-    from a static slice. Peak transient memory is one chunk's
-    ``(rows, heads, cs, cs, K)`` block regardless of sequence length.
+    ``kernel_mesh`` / ``kernel_lead_specs`` (the batch and head mesh axes of the inputs) let
+    the TPU Pallas chunk-local kernel run under ``shard_map``; see :func:`_kda_chunk_local`.
 
-    Rows are independent sequences of a packed serving batch; ``token_valid``
-    masks each row's scheduled window so padded/foreign tokens contribute
-    nothing (their ``g``/``beta``/``k`` are zero, leaving the carried state
-    untouched and the emitted outputs zero).
+    Three phases, all float32:
+
+    1. ``lax.map`` over chunks builds the chunk-local ``attn`` / ``attn_qk`` matrices; the
+       ``(cs, cs, K)`` per-channel decay tensor exists for one chunk at a time.
+    2. ``(I - attn)^-1`` is solved for **every chunk in one batched** ``triangular_solve``.
+       This replaces a ``chunk_size``-step serial forward substitution inside every chunk
+       step (TPU, B=2 H=16 L=8192 K=V=128: fwd+bwd 395 -> 59 ms, temp 44 -> 37 GB).
+    3. ``lax.scan`` over chunks carries only the recurrent state.
+
+    ``token_valid`` masks positions that contribute nothing (their ``q``/``k``/``v``/``g``/
+    ``beta`` are zeroed). With ``segment_ids`` (packed training), the state resets whenever
+    the segment id changes and positions with a negative id are padding, exactly like
+    :func:`_recurrent_kda_per_channel_fwd`'s segment mode (``initial_state`` is then
+    ignored, as there). Boundaries may fall anywhere inside a chunk: pairs across runs are
+    masked out of the intra-chunk matrices, the incoming state only reaches the chunk's
+    first run, and the outgoing state only collects the chunk's last run.
 
     Args:
         query: ``(rows, heads, seq_len, head_dim)`` window queries.
@@ -836,9 +929,9 @@ def _chunked_scan_per_channel_rows(
         token_valid: ``(rows, seq_len)`` validity mask (1.0/0.0 or bool).
         chunk_size: Chunk granularity (must divide nothing in particular;
             the tail chunk is zero-padded).
-        use_qk_l2norm: Whether to L2-normalize Q and K first. The training
-            wrapper (:func:`_chunk_kda_per_channel_fwd`) forwards its flag
-            here; serving callers keep the default ``True``.
+        use_qk_l2norm: Whether to L2-normalize Q and K first.
+        segment_ids: Optional packed-sequence ids ``(rows, seq_len)``; negative ids are
+            padding. See above.
 
     Returns:
         tuple: ``(outputs, final_state)`` — outputs
@@ -847,127 +940,257 @@ def _chunked_scan_per_channel_rows(
     """
     R, H, L, K_dim = query.shape
     V_dim = value.shape[-1]
+    cs = chunk_size
 
     if use_qk_l2norm:
         query = l2norm(query, axis=-1, eps=1e-6)
         key = l2norm(key, axis=-1, eps=1e-6)
 
-    valid = jnp.asarray(token_valid, query.dtype)[:, None, :, None]  # (R, 1, L, 1)
-    valid_l = jnp.asarray(token_valid, query.dtype)[:, None, :]  # (R, 1, L)
-    query = query * valid
-    key = key * valid
-    value = value * valid
-    beta = beta * valid_l
-    decay = decay * valid
+    tok_valid = jnp.asarray(token_valid) > 0  # (R, L)
+    run = None
+    if segment_ids is not None:
+        seg = normalize_packed_segment_ids(segment_ids, L, pad_from_last=False).astype(jnp.int32)
+        tok_valid = tok_valid & (seg >= 0)
+        # Run ids (>= 1): a new run starts whenever the segment id changes, padding included,
+        # which is exactly when the recurrent reference resets its state.
+        change = jnp.concatenate([jnp.ones((R, 1), dtype=bool), seg[:, 1:] != seg[:, :-1]], axis=1)
+        run = jnp.cumsum(change.astype(jnp.int32), axis=1)
+    valid4 = tok_valid[:, None, :, None]
+    query = jnp.where(valid4, query.astype(jnp.float32), 0.0)
+    key = jnp.where(valid4, key.astype(jnp.float32), 0.0)
+    value = jnp.where(valid4, value.astype(jnp.float32), 0.0)
+    decay = jnp.where(valid4, decay.astype(jnp.float32), 0.0)
+    beta = jnp.where(tok_valid[:, None, :], beta.astype(jnp.float32), 0.0)
 
-    query = query.astype(jnp.float32)
-    key = key.astype(jnp.float32)
-    value = value.astype(jnp.float32)
-    beta = beta.astype(jnp.float32)
-    decay = decay.astype(jnp.float32)
-
-    pad_size = (chunk_size - L % chunk_size) % chunk_size
+    pad_size = (cs - L % cs) % cs
     if pad_size > 0:
-        query = jnp.pad(query, ((0, 0), (0, 0), (0, pad_size), (0, 0)))
-        key = jnp.pad(key, ((0, 0), (0, 0), (0, pad_size), (0, 0)))
-        value = jnp.pad(value, ((0, 0), (0, 0), (0, pad_size), (0, 0)))
+        p4 = ((0, 0), (0, 0), (0, pad_size), (0, 0))
+        query, key, value, decay = (jnp.pad(x, p4) for x in (query, key, value, decay))
         beta = jnp.pad(beta, ((0, 0), (0, 0), (0, pad_size)))
-        decay = jnp.pad(decay, ((0, 0), (0, 0), (0, pad_size), (0, 0)))
-        valid = jnp.pad(valid, ((0, 0), (0, 0), (0, pad_size), (0, 0)))
+        if run is not None:
+            # Chunk padding continues the last run (its inputs are zero, so it is inert).
+            run = jnp.pad(run, ((0, 0), (0, pad_size)), mode="edge")
+    num_chunks = (L + pad_size) // cs
+    query = query * (1.0 / (K_dim**0.5))
 
-    num_chunks = (L + pad_size) // chunk_size
-    scale = 1.0 / (K_dim**0.5)
-    query = query * scale
+    def chunks(x):  # (R, H, T, D) -> (C, R, H, cs, D)
+        return x.reshape(R, H, num_chunks, cs, x.shape[-1]).transpose(2, 0, 1, 3, 4)
 
-    mask_triu = jnp.triu(jnp.ones((chunk_size, chunk_size), dtype=bool), k=0)
-    mask_tril = jnp.tril(jnp.ones((chunk_size, chunk_size), dtype=bool), k=0)
-    mask_triu_inner = jnp.triu(jnp.ones((chunk_size, chunk_size), dtype=bool), k=1)
+    q_c, k_c, v_c, g_c = chunks(query), chunks(key), chunks(value), chunks(decay)
+    b_c = beta.reshape(R, H, num_chunks, cs).transpose(2, 0, 1, 3)  # (C, R, H, cs)
+    run_c = None if run is None else run.reshape(R, num_chunks, cs).transpose(1, 0, 2)  # (C, R, cs)
+
+    g_cumsum = jnp.cumsum(g_c, axis=-2)  # (C, R, H, cs, K)
+    k_beta = k_c * b_c[..., None]
+    v_beta = v_c * b_c[..., None]
+
+    eye = jnp.eye(cs, dtype=jnp.float32)
+
+    # Chunk-local per-channel matrices via ejkernel ``kda_chunk_local``: Pallas on TPU
+    # (sub-block rescaled MXU tiles, closed-form backward), rematerialized XLA elsewhere.
+    attn, attn_qk = _kda_chunk_local(
+        k_beta, k_c, q_c, g_cumsum, mesh=kernel_mesh, lead_specs=kernel_lead_specs
+    )  # (C, R, H, cs, cs)
+    if run_c is not None:  # segment mode: no pairs across runs
+        same = (run_c[:, :, :, None] == run_c[:, :, None, :])[:, :, None]  # (C, R, 1, cs, cs)
+        attn = jnp.where(same, attn, 0.0)
+        attn_qk = jnp.where(same, attn_qk, 0.0)
+    # (I - attn)^-1 for every chunk in one call (TPU solve latency is ~fixed per call).
+    lower = eye - attn
+    attn_resolved = lax.linalg.triangular_solve(
+        lower, jnp.broadcast_to(eye, lower.shape), left_side=True, lower=True, unit_diagonal=True
+    )
+    value_local = jnp.einsum("crhij,crhjv->crhiv", attn_resolved, v_beta, precision=_MATMUL_PRECISION)
+    k_cumdecay = jnp.einsum("crhij,crhjk->crhik", attn_resolved, k_beta * jnp.exp(g_cumsum), precision=_MATMUL_PRECISION)
+    q_scaled = q_c * jnp.exp(g_cumsum)
+    g_end = g_cumsum[:, :, :, -1, :]  # (C, R, H, K)
+    k_scaled = k_c * jnp.exp(g_end[:, :, :, None, :] - g_cumsum)
+    decay_end = jnp.exp(g_end)
+
+    if run_c is not None:
+        run_last = run_c[:, :, -1]  # (C, R)
+        # Chunk 0 never continues (the reference starts from a reset, ignoring initial_state).
+        run_prev = jnp.concatenate([jnp.full((1, R), -2, dtype=run_c.dtype), run_last[:-1]], axis=0)
+        continues = (run_c == run_prev[:, :, None]).astype(jnp.float32)[:, :, None, :, None]
+        in_last = (run_c == run_last[:, :, None]).astype(jnp.float32)[:, :, None, :, None]
+        keep = (run_last == run_prev).astype(jnp.float32)[:, :, None, None]
+        k_cumdecay = k_cumdecay * continues  # incoming state reaches only the first run
+        q_scaled = q_scaled * continues
+        k_scaled = k_scaled * in_last  # outgoing state collects only the last run
+        decay_end = decay_end * keep  # carried state survives only a run spanning the chunk
 
     if initial_state is None:
         state0 = jnp.zeros((R, H, K_dim, V_dim), dtype=jnp.float32)
     else:
         state0 = initial_state.astype(jnp.float32)
 
-    def resolve_chunk(attn):
-        """Resolve the strict-lower part of one chunk via forward substitution.
-
-        Kept bit-identical to :func:`_chunk_kda_per_channel_fwd`'s resolve so
-        the serving path and the training path produce the same numbers.
-        """
-        eye = jnp.eye(chunk_size, dtype=attn.dtype)
-
-        def row_step(attn_chunk, i):
-            row = attn_chunk[i, :]
-            idx = jnp.arange(chunk_size)
-            mask_lt_i = idx < i
-            contribution = jnp.sum(row[:, None] * attn_chunk * mask_lt_i[:, None] * mask_lt_i[None, :], axis=0)
-            new_row = jnp.where(mask_lt_i, row + contribution, row)
-            return attn_chunk.at[i].set(new_row), None
-
-        resolved, _ = lax.scan(row_step, attn, jnp.arange(chunk_size))
-        return resolved + eye
-
-    def chunk_step(state, c):
-        q_c = lax.dynamic_slice_in_dim(query, c * chunk_size, chunk_size, axis=2)
-        k_c = lax.dynamic_slice_in_dim(key, c * chunk_size, chunk_size, axis=2)
-        v_c = lax.dynamic_slice_in_dim(value, c * chunk_size, chunk_size, axis=2)
-        b_c = lax.dynamic_slice_in_dim(beta, c * chunk_size, chunk_size, axis=2)
-        g_c = lax.dynamic_slice_in_dim(decay, c * chunk_size, chunk_size, axis=2)
-
-        g_cumsum = jnp.cumsum(g_c, axis=-2)  # (R, H, cs, K)
-        # Pair difference computed *before* exp on purpose: exp(g_i) * exp(-g_j)
-        # is NOT f32-safe here — the column factor exp(-g_cumsum) overflows
-        # once a chunk's cumulative decay passes ~-88 (measured: GLM-style
-        # g = -5 * sigmoid reaches -184 within one cs=64 chunk, and the
-        # underflow*overflow product NaNs *valid* lower-triangle pairs). The
-        # pre-exp `where` zeroes the strictly-upper pairs so their exp can't
-        # overflow, and the post-exp `where` re-zeros them so masked positions
-        # contribute exactly 0.
-        g_diff = g_cumsum[:, :, :, None, :] - g_cumsum[:, :, None, :, :]
-        g_diff = jnp.where(mask_tril[:, :, None], g_diff, 0.0)
-        decay_mask = jnp.where(mask_tril[:, :, None], jnp.exp(g_diff), 0.0)
-
-        v_beta = v_c * b_c[:, :, :, None]
-        k_beta = k_c * b_c[:, :, :, None]
-
-        attn = -jnp.einsum("rhik,rhjk,rhijk->rhij", k_beta, k_c, decay_mask, precision=_MATMUL_PRECISION)
-        attn = jnp.where(mask_triu, 0.0, attn)
-        # resolve_chunk returns the full (I + attn)^-1 (identity included)
-        attn_resolved = jax.vmap(resolve_chunk)(attn.reshape(-1, chunk_size, chunk_size)).reshape(
-            R, H, chunk_size, chunk_size
+    def state_step(state, x):
+        kcd, vl, qs, aqk, ks, de = x
+        v_new = vl - jnp.einsum("rhik,rhkv->rhiv", kcd, state, precision=_MATMUL_PRECISION)
+        out = jnp.einsum("rhik,rhkv->rhiv", qs, state, precision=_MATMUL_PRECISION) + jnp.einsum(
+            "rhij,rhjv->rhiv", aqk, v_new, precision=_MATMUL_PRECISION
         )
+        state = state * de[..., None] + jnp.einsum("rhik,rhiv->rhkv", ks, v_new, precision=_MATMUL_PRECISION)
+        return state, out
 
-        value_local = jnp.einsum("rhij,rhjv->rhiv", attn_resolved, v_beta, precision=_MATMUL_PRECISION)
-        k_cumdecay = jnp.einsum(
-            "rhij,rhjk->rhik",
-            attn_resolved,
-            k_beta * jnp.exp(g_cumsum),
-            precision=_MATMUL_PRECISION,
-        )
-
-        attn_qk = jnp.einsum("rhik,rhjk,rhijk->rhij", q_c, k_c, decay_mask, precision=_MATMUL_PRECISION)
-        attn_qk = jnp.where(mask_triu_inner, 0.0, attn_qk)
-
-        v_prime = jnp.einsum("rhik,rhkv->rhiv", k_cumdecay, state, precision=_MATMUL_PRECISION)
-        v_new = value_local - v_prime
-
-        q_scaled = q_c * jnp.exp(g_cumsum)
-        attn_inter = jnp.einsum("rhik,rhkv->rhiv", q_scaled, state, precision=_MATMUL_PRECISION)
-        core_out = attn_inter + jnp.einsum("rhij,rhjv->rhiv", attn_qk, v_new, precision=_MATMUL_PRECISION)
-
-        g_end = g_cumsum[:, :, -1, :]  # (R, H, K)
-        state_decayed = state * jnp.exp(g_end)[:, :, :, None]
-
-        g_diff_state = g_end[:, :, None, :] - g_cumsum  # (R, H, cs, K)
-        k_scaled = k_c * jnp.exp(g_diff_state)
-        state_update = jnp.einsum("rhik,rhiv->rhkv", k_scaled, v_new, precision=_MATMUL_PRECISION)
-
-        return state_decayed + state_update, core_out
-
-    final_state, core_attn_out = lax.scan(chunk_step, state0, jnp.arange(num_chunks))
+    final_state, core_attn_out = lax.scan(
+        state_step, state0, (k_cumdecay, value_local, q_scaled, attn_qk, k_scaled, decay_end)
+    )
     core_attn_out = core_attn_out.transpose(1, 2, 0, 3, 4)  # (R, H, C, cs, V)
     core_attn_out = core_attn_out.reshape(R, H, -1, V_dim)[:, :, :L, :]
     return core_attn_out, final_state
+
+
+def _packed_segment_kda_per_channel(
+    query: Float[Array, "rows heads seq_len head_dim"],
+    key: Float[Array, "rows heads seq_len head_dim"],
+    value: Float[Array, "rows heads seq_len d_state"],
+    beta: Float[Array, "rows heads seq_len"],
+    decay: Float[Array, "rows heads seq_len head_dim"],
+    initial_state: Float[Array, "rows heads head_dim d_state"] | None,
+    token_valid: Float[Array, "rows seq_len"],
+    chunk_size: int = 64,
+    use_qk_l2norm: bool = True,
+    max_tokens: int | None = None,
+) -> tuple[Float[Array, "rows heads seq_len d_state"], Float[Array, "rows heads head_dim d_state"]]:
+    """Serving prefill for per-channel KDA over packed rows, without per-row bucket padding.
+
+    Same contract and math as :func:`_chunked_scan_per_channel_rows`, restructured for
+    eSurge prefill steps:
+
+    - **Segment-aligned chunks.** The row layout pads every row to the full bucket, so the
+      row scan processes ``rows * seq_len`` token slots for a step holding at most
+      ``max_tokens`` real ones. Here each row's valid tokens are laid out back-to-back, every
+      row starting on a chunk boundary, giving a static budget of
+      ``ceil(max_tokens / chunk_size) + rows`` chunks. Each chunk belongs to exactly one row.
+    - **One batched triangular solve.** The chunk-local ``(I - A)^-1`` is solved for all
+      chunks in a single ``triangular_solve`` instead of a ``chunk_size``-step serial
+      forward substitution inside every chunk step.
+    - **State-only scan.** The chunk scan carries only the recurrent state; it restarts from
+      the row's initial state at the row's first chunk and records the row's final state at
+      its last chunk. Rows with no valid tokens keep their initial state.
+
+    Differs from the row scan only by float32 reassociation. Not intended for differentiation.
+
+    Args:
+        query: ``(rows, heads, seq_len, head_dim)`` window queries.
+        key: ``(rows, heads, seq_len, head_dim)``.
+        value: ``(rows, heads, seq_len, d_state)``.
+        beta: ``(rows, heads, seq_len)`` gating.
+        decay: ``(rows, heads, seq_len, head_dim)`` per-channel log-decay.
+        initial_state: ``(rows, heads, head_dim, d_state)`` starting state, or ``None``.
+        token_valid: ``(rows, seq_len)`` validity mask. Must be prefix-valid per row (each row
+            owns its first ``lens[r]`` positions), as in eSurge packed rows.
+        chunk_size: Chunk granularity.
+        use_qk_l2norm: Whether to L2-normalize Q and K first.
+        max_tokens: Static upper bound on the total valid tokens over all rows. Serving passes
+            the packed stream length, since rows are segments of that stream. Tokens beyond
+            this budget are dropped, so callers must honour the bound. ``None`` means
+            ``rows * seq_len`` (no saving from segment packing).
+
+    Returns:
+        tuple: ``(outputs, final_state)`` — outputs ``(rows, heads, seq_len, d_state)``
+        float32 (zero at invalid positions) and final state
+        ``(rows, heads, head_dim, d_state)`` float32.
+    """
+    R, H, L, K_dim = query.shape
+    V_dim = value.shape[-1]
+    cs = chunk_size
+    if max_tokens is None:
+        max_tokens = R * L
+    num_chunks = min(-(-max_tokens // cs) + R, R * (-(-L // cs)))  # static chunk budget
+
+    lens = jnp.sum(jnp.asarray(token_valid) > 0, axis=1).astype(jnp.int32)  # (R,)
+    row_chunks = (lens + cs - 1) // cs
+    chunk_end = jnp.cumsum(row_chunks)  # exclusive end chunk per row
+    chunk_start = chunk_end - row_chunks
+    c = jnp.arange(num_chunks)
+    chunk_row = jnp.clip(jnp.sum(chunk_end[None, :] <= c[:, None], axis=1), 0, R - 1)  # (C,)
+    chunk_in_row = c - chunk_start[chunk_row]
+    live = c < chunk_end[-1]
+    pos = chunk_in_row[:, None] * cs + jnp.arange(cs)[None, :]  # (C, cs) position within the row
+    tok = live[:, None] & (pos >= 0) & (pos < lens[chunk_row][:, None])  # (C, cs)
+    pos = jnp.clip(pos, 0, L - 1)
+    tok4 = tok[:, None, :, None]
+
+    def gather(x):  # (R, H, L, D) -> (C, H, cs, D), zero outside the row's valid tokens
+        g = x[chunk_row[:, None], :, pos].transpose(0, 2, 1, 3)
+        return jnp.where(tok4, g.astype(jnp.float32), 0.0)
+
+    q = gather(query)
+    k = gather(key)
+    v = gather(value)
+    g = gather(decay)
+    b = jnp.where(tok[:, None, :], beta[chunk_row[:, None], :, pos].transpose(0, 2, 1).astype(jnp.float32), 0.0)
+    if use_qk_l2norm:
+        q = l2norm(q, axis=-1, eps=1e-6)
+        k = l2norm(k, axis=-1, eps=1e-6)
+    q = q * (1.0 / (K_dim**0.5))
+
+    mask_tril = jnp.tril(jnp.ones((cs, cs), dtype=bool), k=0)
+    mask_triu = jnp.triu(jnp.ones((cs, cs), dtype=bool), k=0)
+    mask_triu_inner = jnp.triu(jnp.ones((cs, cs), dtype=bool), k=1)
+    eye = jnp.eye(cs, dtype=jnp.float32)
+
+    g_cumsum = jnp.cumsum(g, axis=-2)  # (C, H, cs, K)
+    k_beta = k * b[..., None]
+    v_beta = v * b[..., None]
+
+    def chunk_local(args):
+        # Pair difference before exp, masked on both sides: see the overflow note in
+        # :func:`_chunked_scan_per_channel_rows`. The (cs, cs, K) decay tensor stays chunk-local.
+        kb, kk, qq, gc = args  # (H, cs, K)
+        g_diff = jnp.where(mask_tril[:, :, None], gc[:, :, None, :] - gc[:, None, :, :], 0.0)
+        decay_mask = jnp.where(mask_tril[:, :, None], jnp.exp(g_diff), 0.0)
+        attn = -jnp.einsum("hik,hjk,hijk->hij", kb, kk, decay_mask, precision=_MATMUL_PRECISION)
+        attn = jnp.where(mask_triu, 0.0, attn)
+        attn_qk = jnp.einsum("hik,hjk,hijk->hij", qq, kk, decay_mask, precision=_MATMUL_PRECISION)
+        attn_qk = jnp.where(mask_triu_inner, 0.0, attn_qk)
+        return attn, attn_qk
+
+    attn, attn_qk = lax.map(chunk_local, (k_beta, k, q, g_cumsum))  # (C, H, cs, cs)
+    # (I - attn)^-1 for every chunk at once; equals the forward-substitution resolve + I.
+    lower = eye - attn
+    attn_resolved = lax.linalg.triangular_solve(
+        lower, jnp.broadcast_to(eye, lower.shape), left_side=True, lower=True, unit_diagonal=True
+    )
+    value_local = jnp.einsum("chij,chjv->chiv", attn_resolved, v_beta, precision=_MATMUL_PRECISION)
+    k_cumdecay = jnp.einsum("chij,chjk->chik", attn_resolved, k_beta * jnp.exp(g_cumsum), precision=_MATMUL_PRECISION)
+    q_scaled = q * jnp.exp(g_cumsum)
+    g_end = g_cumsum[:, :, -1, :]  # (C, H, K)
+    k_scaled = k * jnp.exp(g_end[:, :, None, :] - g_cumsum)
+    decay_end = jnp.exp(g_end)
+
+    is_first = live & (chunk_in_row == 0)
+    is_last = live & (c == chunk_end[chunk_row] - 1)
+    if initial_state is None:
+        init = jnp.zeros((R, H, K_dim, V_dim), dtype=jnp.float32)
+    else:
+        init = initial_state.astype(jnp.float32)
+
+    def state_step(carry, xs):
+        state, finals = carry
+        kcd, vl, qs, aqk, ks, de, row, first, last = xs
+        state = jnp.where(first, init[row], state)
+        v_new = vl - jnp.einsum("hik,hkv->hiv", kcd, state, precision=_MATMUL_PRECISION)
+        out = jnp.einsum("hik,hkv->hiv", qs, state, precision=_MATMUL_PRECISION) + jnp.einsum(
+            "hij,hjv->hiv", aqk, v_new, precision=_MATMUL_PRECISION
+        )
+        state = state * de[..., None] + jnp.einsum("hik,hiv->hkv", ks, v_new, precision=_MATMUL_PRECISION)
+        finals = finals.at[row].set(jnp.where(last, state, finals[row]))
+        return (state, finals), out
+
+    (_, final_state), chunk_out = lax.scan(
+        state_step,
+        (jnp.zeros((H, K_dim, V_dim), jnp.float32), init),
+        (k_cumdecay, value_local, q_scaled, attn_qk, k_scaled, decay_end, chunk_row, is_first, is_last),
+    )  # chunk_out (C, H, cs, V)
+
+    j = jnp.arange(L)
+    out_chunk = jnp.clip(chunk_start[:, None] + j[None, :] // cs, 0, num_chunks - 1)  # (R, L)
+    out = chunk_out[out_chunk, :, (j % cs)[None, :]]  # (R, L, H, V)
+    out = jnp.where((j[None, :] < lens[:, None])[:, :, None, None], out, 0.0)
+    return out.transpose(0, 2, 1, 3), final_state
 
 
 def _single_step_kda_per_channel_fwd_bthd(
@@ -1028,6 +1251,173 @@ def _single_step_kda_per_channel_fwd_bthd(
     new_state = recurrent_state + key[:, 0, :, :, None] * delta[:, :, None, :]
     output = jnp.sum(new_state * query[:, 0, :, :, None], axis=-2)
     return output.astype(input_dtype)[:, None, :, :], new_state
+
+
+def kda_packed_rows_forward(
+    query: Float[Array, "1 seq_len key_dim"],
+    key: Float[Array, "1 seq_len key_dim"],
+    value: Float[Array, "1 seq_len value_dim"],
+    beta: Float[Array, "1 seq_len num_heads"],
+    decay: Float[Array, "1 seq_len num_heads head_dim"],
+    conv_kernels: tuple[Array, Array, Array],
+    cache_view: KDACacheView,
+    query_start_loc: Array,
+    context_lens: Array | None = None,
+    conv_dtype: jnp.dtype = jnp.bfloat16,
+    chunk_size: int = 64,
+) -> tuple[Float[Array, "1 seq_len num_heads d_state"], KDACacheView]:
+    """Advance per-request per-channel KDA state over an eSurge packed token stream.
+
+    Model-agnostic serving driver shared by every per-channel KDA layer (GLM-5-Next,
+    Kimi Linear). The runner flattens all scheduled requests into one token stream
+    ``[1, T, D]``; ``query_start_loc`` gives each request's (row's) segment as
+    ``[start_i, start_{i+1})``, and per-request conv windows and recurrent memory live
+    in per-row cache slots. This function splits the stream into rows, runs the causal
+    depthwise conv per row (with the carried window as prefix for rows that already
+    hold context), advances the delta-rule state per row -- single-step on pure decode
+    steps, :func:`_packed_segment_kda_per_channel` otherwise -- and gathers the per-row
+    outputs back into the packed stream.
+
+    The caller owns the model-specific parts: projections, the decay gate, the output
+    gate/norm and the output projection.
+
+    Args:
+        query: Packed Q projection (pre-conv) ``[1, T, key_dim]``.
+        key: Packed K projection (pre-conv) ``[1, T, key_dim]``.
+        value: Packed V projection (pre-conv) ``[1, T, value_dim]``.
+        beta: Packed per-head gating ``[1, T, heads]`` (sigmoid applied).
+        decay: Packed per-channel log-decay ``[1, T, heads, head_dim]``.
+        conv_kernels: Depthwise causal conv kernels for q, k, v, each ``[dim, d_conv]``
+            (``conv1d.weight.value.squeeze(1).T`` for a grouped ``nn.Conv1d``).
+        cache_view: Per-layer KDA cache view with one slot per row.
+        query_start_loc: Cumulative segment offsets ``[rows + 1]``. Rank-major DP metadata
+            (``[dp, rows + 1]``) is rejected with ``ValueError``.
+        context_lens: Tokens per row *including* this step; a row with
+            ``context_lens > scheduled`` continues from its carried conv window. When
+            ``None``, only single-token rows are treated as continuations.
+        conv_dtype: Output dtype of the causal conv (matches the dense path).
+        chunk_size: Chunk size of the prefill kernel.
+
+    Returns:
+        tuple: ``(outputs, new_cache_view)`` -- outputs ``[1, T, heads, head_v_dim]``
+        float32 (zero at bucket padding), and the cache view with updated conv windows
+        and recurrent states.
+    """
+    if query_start_loc.ndim != 1:
+        # Rank-major DP metadata ([dp, rows + 1]) would need per-rank state scatter and a
+        # ``context_lens`` slice; using only rank 0 would leave every other rank's rows
+        # un-advanced with no error, so refuse instead.
+        raise ValueError(
+            "kda_packed_rows_forward requires 1-D query_start_loc [rows + 1]; rank-major DP metadata "
+            f"(got shape {tuple(query_start_loc.shape)}) is not supported for per-channel KDA layers."
+        )
+    rows = query_start_loc.shape[0] - 1
+    seq = query.shape[1]
+    starts = query_start_loc[:-1]
+    lens = query_start_loc[1:] - starts  # [rows]
+    ar = jnp.arange(seq)
+
+    # Index-clamped gather (NOT start-clamped slicing): the token bucket is padded to the
+    # compile width, so `starts[i] + seq` routinely overruns the buffer and a start-clamped
+    # dynamic_slice would clamp back to 0, silently feeding row 0's tokens to later rows.
+    def gather(x):
+        idx = jnp.clip(starts[:, None] + ar[None, :], 0, x.shape[0] - 1)
+        return x[idx]
+
+    q_r, k_r, v_r = gather(query[0]), gather(key[0]), gather(value[0])
+    b_r, g_r = gather(beta[0]), gather(decay[0])
+    valid = (ar[None, :] < lens[:, None]).astype(q_r.dtype)  # [rows, T]
+
+    def mask(x):
+        shape = valid.shape + (1,) * (x.ndim - 2)
+        return jnp.where(valid.reshape(shape), x, 0.0)
+
+    q_r, k_r, v_r, b_r, g_r = mask(q_r), mask(k_r), mask(v_r), mask(b_r), mask(g_r)
+
+    # ---- causal depthwise conv per row ---------------------------------
+    conv_states = (cache_view.q_conv_state, cache_view.k_conv_state, cache_view.v_conv_state)
+    if context_lens is None:
+        has_prefix = lens <= 1
+    else:
+        has_prefix = context_lens > lens
+    conv_outs = []
+    new_conv = []
+    for x_in, kern, state in zip((q_r, k_r, v_r), conv_kernels, conv_states, strict=True):
+        x_rows = x_in.astype(jnp.float32)
+        st = state.astype(jnp.float32)  # [rows, d, d_conv]
+        d_conv = st.shape[-1]
+        prefix = jnp.where(has_prefix[:, None, None], st[:, :, 1:], 0.0).transpose(0, 2, 1)  # [rows, dc-1, d]
+        stream = jnp.concatenate([prefix, x_rows], axis=1)  # [rows, T + dc - 1, d]
+        out = jnp.zeros_like(stream[:, :seq, :])
+        kern = kern.astype(jnp.float32)
+        for m in range(d_conv):
+            out = out + stream[:, m : m + seq, :] * kern[:, m][None, None, :]
+        conv_outs.append(jax.nn.silu(out).astype(conv_dtype))
+        # New state = the trailing window ending at this row's LAST real token
+        # (stream offset dc-1+lens), not the padded bucket tail.
+        win_start = jnp.clip(lens - 1, 0, seq - 1)
+        win_idx = win_start[:, None] + jnp.arange(d_conv)[None, :]
+        candidate = stream[jnp.arange(rows)[:, None], win_idx].transpose(0, 2, 1)  # [rows, d, d_conv]
+        keep = (lens > 0)[:, None, None]
+        new_conv.append(jnp.where(keep, candidate, st).astype(state.dtype))
+
+    # ---- delta rule per row --------------------------------------------
+    num_heads = b_r.shape[-1]
+    head_k = q_r.shape[-1] // num_heads
+    head_v = v_r.shape[-1] // num_heads
+    qh = conv_outs[0].reshape(rows, seq, num_heads, head_k).transpose(0, 2, 1, 3)  # [R, H, T, K]
+    kh = conv_outs[1].reshape(rows, seq, num_heads, head_k).transpose(0, 2, 1, 3)
+    vh = conv_outs[2].reshape(rows, seq, num_heads, head_v).transpose(0, 2, 1, 3)
+    bh = b_r.transpose(0, 2, 1)  # [R, H, T]
+    gh = g_r.reshape(rows, seq, num_heads, head_k).transpose(0, 2, 1, 3)
+    init_state = cache_view.recurrent_state  # [R, H, K, V]
+
+    def _single_path():
+        out1, new_state = _single_step_kda_per_channel_fwd_bthd(
+            query=qh[:, :, :1, :].transpose(0, 2, 1, 3),
+            key=kh[:, :, :1, :].transpose(0, 2, 1, 3),
+            value=vh[:, :, :1, :].transpose(0, 2, 1, 3),
+            beta=bh[:, :, :1].transpose(0, 2, 1),
+            decay=gh[:, :, :1, :].transpose(0, 2, 1, 3),
+            recurrent_state=init_state,
+            use_qk_l2norm=True,
+        )
+        out1 = jnp.transpose(out1, (0, 2, 1, 3)).astype(jnp.float32)  # [R, H, 1, V]
+        out1 = jnp.pad(out1, ((0, 0), (0, 0), (0, seq - 1), (0, 0)))
+        return out1, new_state.astype(jnp.float32)
+
+    def _chunk_path():
+        # Rows are segments of one packed ``seq``-token stream, so their valid tokens total
+        # at most ``seq``: segment-aligned chunks skip the per-row bucket padding.
+        out, new_state = _packed_segment_kda_per_channel(
+            query=qh,
+            key=kh,
+            value=vh,
+            beta=bh,
+            decay=gh,
+            initial_state=init_state,
+            token_valid=valid,
+            chunk_size=chunk_size,
+            max_tokens=seq,
+        )
+        return out, new_state.astype(jnp.float32)
+
+    out_h, new_recurrent = lax.cond(jnp.all(lens <= 1), _single_path, _chunk_path)
+
+    # Gather per-row outputs back into the packed stream.
+    out_rows = out_h.transpose(0, 2, 1, 3)  # [R, T, H, V]
+    seg_ids = jnp.clip(jnp.sum(query_start_loc[1:, None] <= ar[None, :], axis=0), 0, rows - 1)  # [T]
+    pos_in_row = jnp.clip(ar - query_start_loc[seg_ids], 0, seq - 1)
+    in_stream = ar < query_start_loc[-1]
+    out_packed = jnp.where(in_stream[:, None, None], out_rows[seg_ids, pos_in_row], 0.0)[None]  # [1, T, H, V]
+
+    new_cache_view = cache_view.update_kda_states(
+        new_q_conv_state=new_conv[0],
+        new_k_conv_state=new_conv[1],
+        new_v_conv_state=new_conv[2],
+        new_recurrent_state=new_recurrent.astype(cache_view.recurrent_state.dtype),
+    )
+    return out_packed, new_cache_view
 
 
 @OperationRegistry.register
@@ -1152,8 +1542,7 @@ class KernelDeltaAttnOp(OperationImpl):
             # would mean "no memory decay", a different operation). The
             # per-head family zero-fills None; keep that contract there.
             raise ValueError(
-                "per_channel_decay=True requires explicit `decay`"
-                " [batch, seq_len, num_heads, head_dim]; got None."
+                "per_channel_decay=True requires explicit `decay` [batch, seq_len, num_heads, head_dim]; got None."
             )
         seq_len = query.shape[1]
         shardings = None
@@ -1203,6 +1592,16 @@ class KernelDeltaAttnOp(OperationImpl):
                     recurrent_state=recurrent_state,
                     use_qk_l2norm=True,
                 )
+            if segment_ids is not None:
+                # A padding token (negative segment id) must neither advance the cached state nor
+                # emit output; the single-step kernels above ignore segment ids entirely.
+                valid = normalize_packed_segment_ids(segment_ids, 1, pad_from_last=False)[:, 0] >= 0
+                new_recurrent_state = jnp.where(
+                    valid.reshape((-1,) + (1,) * (new_recurrent_state.ndim - 1)),
+                    new_recurrent_state,
+                    recurrent_state.astype(new_recurrent_state.dtype),
+                )
+                outputs = jnp.where(valid.reshape((-1,) + (1,) * (outputs.ndim - 1)), outputs, 0).astype(outputs.dtype)
         else:
             query = query.transpose(0, 2, 1, 3)
             key = key.transpose(0, 2, 1, 3)
@@ -1216,8 +1615,29 @@ class KernelDeltaAttnOp(OperationImpl):
             elif decay is not None and decay.ndim == 4:
                 decay = decay.transpose(0, 2, 1, 3)
 
-            if segment_ids is None:
+            if segment_ids is None or per_channel:
+                # The per-channel chunked kernel handles packed segments (state resets at
+                # boundaries) directly; only the per-head family falls back to the recurrence.
                 chunk_fwd = _chunk_kda_per_channel_fwd if per_channel else _chunk_kda_fwd
+                extra = {}
+                if per_channel:
+                    extra = {"segment_ids": segment_ids, "kernel_mesh": mesh}
+                    if shardings is not None and mesh is not None:
+
+                        def _eff(axes):
+                            # Axes spanning a single device (e.g. ``sp`` of size 1) are not sharded.
+                            if axes is None:
+                                return None
+                            names = axes if isinstance(axes, tuple) else (axes,)
+                            n = 1
+                            for name in names:
+                                n *= int(mesh.shape[name])
+                            return None if n == 1 else axes
+
+                        qs = tuple(_eff(a) for a in tuple(shardings.query) + (None,) * (4 - len(tuple(shardings.query))))
+                        # BTHD spec -> (batch, head) axes; seq / head_dim must be unsharded.
+                        if qs[1] is None and qs[3] is None:
+                            extra["kernel_lead_specs"] = (qs[0], qs[2])
                 outputs, new_recurrent_state = chunk_fwd(
                     query=query,
                     key=key,
@@ -1227,6 +1647,7 @@ class KernelDeltaAttnOp(OperationImpl):
                     chunk_size=chunk_size,
                     initial_state=recurrent_state,
                     use_qk_l2norm=True,
+                    **extra,
                 )
             else:
                 recurrent_fwd = _recurrent_kda_per_channel_fwd if per_channel else _recurrent_kda_fwd

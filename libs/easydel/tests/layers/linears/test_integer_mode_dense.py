@@ -46,7 +46,7 @@ def _reference(x, linear, bits):
     return (x @ w) * s
 
 
-@pytest.mark.parametrize("mode", ["w4a16", "w8a16", "w4a4", "w8a8"])
+@pytest.mark.parametrize("mode", ["w4a16", "w8a16", "w4a8", "w4a4", "w8a8"])
 @pytest.mark.parametrize("tokens", [8, 256])
 @pytest.mark.parametrize("policy", ["explicit", "auto"])
 def test_integer_dense_and_fused_reference(mode, tokens, policy):
@@ -102,7 +102,7 @@ def test_explicit_a16_never_supplies_packed_weights(monkeypatch):
     assert seen["quantize_activations"] is False
 
 
-@pytest.mark.parametrize("mode", ["w4a16", "w8a16", "w4a4", "w8a8"])
+@pytest.mark.parametrize("mode", ["w4a16", "w8a16", "w4a8", "w4a4", "w8a8"])
 def test_explicit_kernel_contract_at_decode(monkeypatch, mode):
     """Trace real implementations to verify their explicit decode contracts."""
     import ejkernel.modules as kernels

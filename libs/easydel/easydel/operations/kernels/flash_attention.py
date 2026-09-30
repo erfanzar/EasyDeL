@@ -49,6 +49,7 @@ Example:
     >>> output = flash_attn(query, key, value, causal=True)
 """
 
+import math
 import typing as tp
 
 import jax
@@ -65,7 +66,8 @@ from spectrax import common_types, with_sharding_constraint
 from easydel.caching import TransformerCacheView
 
 from .._attention_outputs import AttentionOutput
-from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
+from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry, axis_entry_shard_factor
+from .._operation_meta import normalize_head_sinks
 from ..requirements import (
     CacheType,
     ExecutionMode,
@@ -282,7 +284,23 @@ class FlashAttn(OperationImpl):
 
         dtype: jnp.dtype = getattr(self.metadata, "runtime_dtype", query.dtype)
         model_mode: common_types.RUNTIME_MODE_TYPES = self.get_mode(query=query, BTHD=True)  # type: ignore
-        shardings = self.metadata.get_shardings(model_mode, layout="bthd")
+        # Canonical sinks: (Hq,) per-query-head, other 1-D shared, per-KV rows expanded to
+        # (Hq, S); shared sinks whose length could equal a local head count inside
+        # shard_map are made explicit per-head so no kernel can misread them.
+        softmax_aux, _ = normalize_head_sinks(
+            softmax_aux,
+            num_q_heads=query.shape[2],
+            num_kv_heads=key.shape[2],
+            per_head_2d=False,
+            head_shard_factor=self.metadata.head_shard_factor(model_mode, query.shape[2]),
+        )
+        shardings = self.metadata.get_shardings(
+            model_mode,
+            layout="bthd",
+            softmax_aux=softmax_aux,
+            num_q_heads=query.shape[2],
+            num_kv_heads=key.shape[2],
+        )
 
         is_decode_mode = model_mode == common_types.MODE_DECODE
         causal_computed: bool = causal if not is_decode_mode else False
@@ -299,6 +317,19 @@ class FlashAttn(OperationImpl):
             tensor=query,
             preserved_indices=[0, 2],
         )
+        # GQA under shard_map: the kernel regroups local query heads onto local KV heads
+        # (``local_h // (local_q / local_kv)``). When the KV-head count does not divide the
+        # query-head shard factor, the KV axis is replicated while queries stay sharded and
+        # shards attend to the wrong KV heads. Block-repeat KV heads by the minimal factor
+        # that makes them shard evenly; blocked repeat keeps the global q->kv mapping.
+        num_kv_heads: int = key.shape[2]
+        head_shard_factor = 1
+        if query_sharding is not None and len(query_sharding) > 2:
+            head_shard_factor = axis_entry_shard_factor(self.metadata.mesh, query_sharding[2])
+        if head_shard_factor > 1 and num_kv_heads > 1 and num_kv_heads % head_shard_factor != 0:
+            kv_head_reps = head_shard_factor // math.gcd(num_kv_heads, head_shard_factor)
+            key = jnp.repeat(key, kv_head_reps, axis=2)
+            value = jnp.repeat(value, kv_head_reps, axis=2)
         key_sharding = self.create_stable_sharding(
             shardings.key,
             tensor=key,
@@ -351,6 +382,7 @@ class FlashAttn(OperationImpl):
             cum_seqlens_k,
             softmax_aux,
             mask_info=mask_info,
+            softmax_scale=softmax_scale_computed,
             dropout_prob=dropout_prob,
             causal=causal_computed,
             dropout_seed=dropout_seed,

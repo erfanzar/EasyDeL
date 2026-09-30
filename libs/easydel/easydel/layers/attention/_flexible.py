@@ -722,7 +722,9 @@ class FlexibleAttentionModule(spx.Module):
                 callable_attn = _maybe_route_varlen_multihost_tpu_attention(self.impl)
                 output = _call_attention(callable_attn, input_dict)
 
-        target_dtype: jnp.dtype = self.impl.metadata.runtime_dtype
+        # An explicit per-call ``compute_dtype`` (e.g. an fp32 vision tower inside a bf16-attention model) also sets
+        # the output dtype; otherwise the result would be rounded back to the config's ``attn_dtype``.
+        target_dtype: jnp.dtype = compute_dtype if compute_dtype is not None else self.impl.metadata.runtime_dtype
 
         def cast_to_dtype(x: tp.Any) -> tp.Any:
             """Cast ``x`` to the resolved attention runtime dtype.

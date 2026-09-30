@@ -9,7 +9,7 @@ from easydel.layers.linears import ColumnParallelMoELinear
 from easydel.layers.quantization import QuantizationConfig, QuantizationType
 
 
-@pytest.mark.parametrize("mode", ["w4a16", "w8a16", "w4a4", "w8a8"])
+@pytest.mark.parametrize("mode", ["w4a16", "w8a16", "w4a8", "w4a4", "w8a8"])
 def test_standalone_expert_precision(mode):
     layer = ColumnParallelMoELinear(
         num_experts=3,

@@ -29,7 +29,7 @@ import spectrax as spx
 from eformer.jaximus import ImplicitArray
 from eformer.loggings import get_logger
 from eformer.mpric import DTYPE_TO_STRING_MAP
-from eformer.pytree import auto_pytree
+from eformer.pytree import auto_pytree, field
 from jax.sharding import NamedSharding as Ns
 from jaxtyping import Array, Float
 from spectrax import common_types
@@ -39,7 +39,9 @@ from easydel.infra.sharding import (
     MeshLike,
     RuntimeShardingResolver,
     coerce_runtime_sharding_resolver,
+    is_mpmd_mesh,
     mesh_axis_size,
+    normalize_axis_names,
     resolve_stage_cache_mesh,
 )
 
@@ -79,7 +81,21 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
 
     Use :meth:`create` to build a config from model hyperparameters; the factory
     automatically computes page counts from available HBM.
+
+    Sparse-attention (DSA) models may also keep their indexer state in pages that
+    share the KV page table (``indexer_key_dim > 0``): per-token ``key | gate`` rows
+    and, for pooled indexers (``indexer_kpool > 1``), one summary per completed pool.
+    Those bytes are included in the per-page HBM budget.
     """
+
+    indexer_key_dim: int = field(pytree_node=False, default=0)
+    indexer_gate_dim: int = field(pytree_node=False, default=0)
+    indexer_kpool: int = field(pytree_node=False, default=1)
+    _indexer_dtype_str: str = field(pytree_node=False, default="bf16")
+    # Layers charged for indexer pages by ``create`` (``None`` = every layer) and, optionally,
+    # which cache-view indices own them. ``init_cache`` allocates exactly that set (r11 S09-1).
+    indexer_num_layers: int | None = field(pytree_node=False, default=None)
+    indexer_layer_indices: tuple[int, ...] | None = field(pytree_node=False, default=None)
 
     @staticmethod
     def _compute_free_hbm(
@@ -127,6 +143,12 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
         page_size: int = 128,
         version: tp.Literal["v1"] = "v1",
         max_cache_tokens: int | None = None,
+        indexer_key_dim: int = 0,
+        indexer_gate_dim: int = 0,
+        indexer_kpool: int = 1,
+        indexer_dtype: jnp.dtype | None = None,
+        indexer_num_layers: int | None = None,
+        indexer_layer_indices: tp.Sequence[int] | None = None,
     ) -> "MLARaggedPagesCacheConfig":
         """Create an MLA ragged-page cache config from model hyperparameters.
 
@@ -162,6 +184,20 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
                 page pool may hold (``num_pages * page_size``); the final page
                 count is ``min(hbm_utilization-derived, this)``. ``None`` keeps
                 pure HBM sizing.
+            indexer_key_dim: Paged DSA indexer key width (0 disables indexer pages).
+            indexer_gate_dim: Per-token gate width stored beside each key (pooled
+                indexers; 0 for per-token indexers).
+            indexer_kpool: Tokens per indexer pool; ``> 1`` also allocates pool
+                summary pages and requires ``page_size % indexer_kpool == 0``.
+            indexer_dtype: Storage dtype of the indexer pages (default: ``kvdtype`` when it
+                is at least 16 bits wide, otherwise bf16).
+            indexer_num_layers: Number of layers that own indexer pages (layers with a
+                ``"full"`` indexer). ``None`` charges every cached layer. Only these layers'
+                indexer bytes are counted in the page budget.
+            indexer_layer_indices: Explicit cache-view indices that own indexer pages. When
+                given, it defines ``indexer_num_layers`` and lets :meth:`MLARaggedPagesCache.init_cache`
+                allocate exactly the budgeted owners; a reduced ``indexer_num_layers`` without it
+                can only be allocated by callers that pass ``with_indexer_pages`` per view.
 
         Returns:
             A fully initialized :class:`MLARaggedPagesCacheConfig`.
@@ -213,7 +249,39 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
         packed_page_tokens = page_size_per_kv_packing * kv_packing
 
         page_bytes_per_layer = packed_page_tokens * kv_dim_padded * bytes_av
-        page_bytes = num_hidden_layers * page_bytes_per_layer
+        if indexer_key_dim < 0 or indexer_gate_dim < 0 or indexer_kpool < 1:
+            raise ValueError("indexer dims must be non-negative and indexer_kpool >= 1.")
+        if indexer_dtype is None:
+            # The dense indexer keeps its packed state in the model (KV) dtype. A narrower
+            # (quantized, e.g. fp8) KV cache must not drag the indexer keys down with it:
+            # top-k selection needs the raw scores, so such caches store indexer state in bf16.
+            indexer_dtype = kvdtype if jnp.dtype(kvdtype).itemsize >= 2 else jnp.bfloat16
+        if indexer_key_dim > 0:
+            if page_size % indexer_kpool:
+                raise ValueError(
+                    f"page_size ({page_size}) must be a multiple of indexer_kpool ({indexer_kpool}) "
+                    "so indexer pools never straddle a page."
+                )
+            indexer_bytes = jnp.dtype(indexer_dtype).itemsize
+            indexer_page_bytes = page_size * (indexer_key_dim + indexer_gate_dim) * indexer_bytes
+            if indexer_kpool > 1:
+                indexer_page_bytes += (page_size // indexer_kpool) * indexer_key_dim * indexer_bytes
+        else:
+            indexer_page_bytes = 0
+        if indexer_layer_indices is not None:
+            indexer_layer_indices = tuple(sorted({int(i) for i in indexer_layer_indices}))
+            if any(not 0 <= i < int(num_hidden_layers) for i in indexer_layer_indices):
+                raise ValueError(f"indexer_layer_indices {indexer_layer_indices} must lie in [0, {num_hidden_layers}).")
+            if indexer_num_layers is not None and int(indexer_num_layers) != len(indexer_layer_indices):
+                raise ValueError(
+                    f"indexer_num_layers={indexer_num_layers} disagrees with "
+                    f"{len(indexer_layer_indices)} indexer_layer_indices."
+                )
+            indexer_num_layers = len(indexer_layer_indices)
+        if indexer_num_layers is None:
+            indexer_num_layers = num_hidden_layers
+        indexer_num_layers = max(0, min(int(indexer_num_layers), int(num_hidden_layers)))
+        page_bytes = num_hidden_layers * page_bytes_per_layer + indexer_num_layers * indexer_page_bytes
         num_pages = int(free) // int(page_bytes)
         if data_parallel_size > 1:
             num_pages = (num_pages // data_parallel_size) * data_parallel_size
@@ -261,7 +329,39 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
             ),
             version="v1",
             _kvdtype_str=DTYPE_TO_STRING_MAP[kvdtype.type if hasattr(kvdtype, "type") else kvdtype],
+            indexer_key_dim=int(indexer_key_dim),
+            indexer_gate_dim=int(indexer_gate_dim) if indexer_key_dim > 0 else 0,
+            indexer_kpool=int(indexer_kpool) if indexer_key_dim > 0 else 1,
+            _indexer_dtype_str=DTYPE_TO_STRING_MAP[jnp.dtype(indexer_dtype).type],
+            indexer_num_layers=int(indexer_num_layers) if indexer_key_dim > 0 else None,
+            indexer_layer_indices=indexer_layer_indices if indexer_key_dim > 0 else None,
         )
+
+    @property
+    def has_indexer_pages(self) -> bool:
+        """Whether paged DSA indexer state is allocated beside the KV pages."""
+        return int(self.indexer_key_dim) > 0
+
+    @property
+    def indexer_dtype(self) -> jnp.dtype:
+        """Storage dtype of the indexer pages."""
+        from eformer.mpric import STRING_TO_DTYPE_MAP
+
+        return STRING_TO_DTYPE_MAP[self._indexer_dtype_str]
+
+    def get_indexer_shapes(self) -> tuple[tuple[int, ...] | None, tuple[int, ...] | None]:
+        """Return ``(token_pages_shape, pool_pages_shape)``; ``None`` when not allocated.
+
+        Token pages are ``[num_pages, page_size, key + gate]``; pool pages
+        ``[num_pages, page_size // kpool, key]`` exist only for pooled indexers.
+        """
+        if not self.has_indexer_pages:
+            return None, None
+        token = (self.num_pages, self.page_size, self.indexer_key_dim + self.indexer_gate_dim)
+        pool = None
+        if self.indexer_kpool > 1:
+            pool = (self.num_pages, self.page_size // self.indexer_kpool, self.indexer_key_dim)
+        return token, pool
 
     @property
     def kv_lora_rank(self) -> int:
@@ -338,6 +438,8 @@ class MLARaggedPagesCacheView(RaggedPagesCacheView):
 
     metadata: MLARaggedPagesCacheConfig
     kv_pages: Float[Array, "num_pages page_size_per_kv_packing kv_packing kv_dim_padded"] | ImplicitArray
+    indexer_token_pages: Float[Array, "num_pages page_size indexer_dim"] | None = None
+    indexer_pool_pages: Float[Array, "num_pages pools_per_page indexer_key_dim"] | None = None
 
     @classmethod
     def init(
@@ -348,6 +450,7 @@ class MLARaggedPagesCacheView(RaggedPagesCacheView):
         mesh: MeshLike | None = None,
         runtime_sharding_resolver: RuntimeShardingResolver | None = None,
         quantizer: EasyQuantizer | None = None,
+        with_indexer_pages: bool = True,
     ) -> "MLARaggedPagesCacheView":
         """Allocate a single-layer MLA ragged page cache view.
 
@@ -357,6 +460,11 @@ class MLARaggedPagesCacheView(RaggedPagesCacheView):
             mesh: JAX device mesh used for sharding the page buffer.
             runtime_sharding_resolver: Runtime sharding resolver for page tensors.
             quantizer: Optional quantizer applied to the allocated page buffer.
+            with_indexer_pages: Allocate this layer's paged DSA indexer buffers when the
+                config enables them. Layers that reuse another layer's selection
+                (``"shared"`` indexers) pass ``False``: they never read indexer state.
+                Callers decide the serving path from ``config.has_indexer_pages``, not
+                from these buffers.
 
         Returns:
             An initialized ``MLARaggedPagesCacheView`` with zeroed page storage.
@@ -379,12 +487,114 @@ class MLARaggedPagesCacheView(RaggedPagesCacheView):
         with jax.named_scope("easydel-mla-ragged-cache-init"):
             kv_pages = quantizer(jnp.zeros(shape=kv_pages_shape, dtype=config.kvdtype, device=kv_pages_sharding))
 
+        # Paged DSA indexer state shares the KV page table, so it is sharded on the
+        # same page axis and is never quantized (scores need the raw keys).
+        def _indexer_buffer(shape_: tuple[int, ...] | None) -> jax.Array | None:
+            if shape_ is None:
+                return None
+            spec = runtime_sharding_resolver.resolve(
+                axes=[axes[0], common_types.EMPTY, common_types.EMPTY],
+                mode=common_types.MODE_PREFILL,
+                shape=shape_,
+            )
+            return jnp.zeros(shape_, dtype=config.indexer_dtype, device=Ns(mesh=mesh, spec=spec))
+
+        token_shape, pool_shape = config.get_indexer_shapes() if with_indexer_pages else (None, None)
+        with jax.named_scope("easydel-mla-ragged-indexer-init"):
+            indexer_token_pages = _indexer_buffer(token_shape)
+            indexer_pool_pages = _indexer_buffer(pool_shape)
+
         return cls(
             metadata=config,
             layer_index=layer_index or 0,
             kv_pages=kv_pages,
             runtime_sharding_resolver=runtime_sharding_resolver,
+            indexer_token_pages=indexer_token_pages,
+            indexer_pool_pages=indexer_pool_pages,
         )
+
+    def indexer_kernel_mesh(self):
+        """Mesh for running un-partitionable indexer kernels on replicated pages, or ``None``.
+
+        Returns the resolver mesh only while the page axis is unsharded (DP size 1): the
+        indexer pages are then replicated, so a Pallas call can run per device under a
+        replicated ``shard_map``. Page-sharded caches keep the auto-partitioned XLA path.
+        """
+        resolver = getattr(self, "runtime_sharding_resolver", None)
+        if resolver is None:
+            return None
+        _, axes = self.metadata.get_shape_and_axes()
+        if axes[0] != common_types.EMPTY:
+            return None
+        mesh = getattr(resolver, "mesh", None)
+        # A pipeline (MPMD) mesh spans devices outside the executing stage; a replicated
+        # shard_map over it would be wrong inside a per-stage jit, so keep the XLA path.
+        if mesh is None or is_mpmd_mesh(mesh):
+            return None
+        # Re-resolve against the active stage context: the resolver mesh was captured at cache
+        # init and must match the mesh the attention op itself resolves at call time.
+        mesh = resolve_stage_cache_mesh(mesh)
+        if mesh is None or is_mpmd_mesh(mesh):
+            return None
+        return mesh
+
+    def indexer_dp_sharding(self) -> tuple[tp.Any, tuple[str, ...]] | None:
+        """``(mesh, page_axis_names)`` of DP-sharded indexer pages, or ``None`` when unsharded.
+
+        Rank-major data-parallel serving runs the paged indexer once per DP rank under a
+        ``shard_map`` over these axes (see ``layers.indexer._paged``), on the rank's own page
+        shard, exactly like the DP-local MLA attention path.
+        """
+        resolver = getattr(self, "runtime_sharding_resolver", None)
+        if resolver is None:
+            return None
+        _, axes = self.metadata.get_shape_and_axes()
+        if axes[0] == common_types.EMPTY:
+            return None
+        mesh = getattr(resolver, "mesh", None)
+        if mesh is None or is_mpmd_mesh(mesh):
+            return None
+        mesh = resolve_stage_cache_mesh(mesh)
+        if mesh is None or is_mpmd_mesh(mesh):
+            return None
+        spec = resolver.resolve(axes=[axes[0]], mode=common_types.MODE_PREFILL, shape=(int(self.metadata.num_pages),))
+        names = normalize_axis_names(spec[0] if len(spec) > 0 else None)
+        if not names:
+            return None
+        return mesh, tuple(names)
+
+    def constrain_indexer_pages(self, x: jax.Array) -> jax.Array:
+        """Pin an indexer page buffer (or its flat token view) to its allocation sharding.
+
+        Without this, the tensor-parallel sharding of the indexer projections propagates
+        through the per-step scatter into the (page-axis-only) page buffers, so the layer
+        returns them re-sharded: donation is lost and every step relayouts whole buffers.
+
+        Args:
+            x: Page buffer ``[P, ...]`` or flat view ``[P * rows, D]``.
+
+        Returns:
+            ``x`` constrained to ``P(page_axis, None, ...)``.
+        """
+        resolver = getattr(self, "runtime_sharding_resolver", None)
+        if resolver is None:
+            return x
+        _, axes = self.metadata.get_shape_and_axes()
+        return resolver.shard(x, axes=[axes[0]] + [common_types.EMPTY] * (x.ndim - 1), mode=common_types.MODE_PREFILL)
+
+    def constrain_indexer_rows(self, x: jax.Array) -> jax.Array:
+        """Fully replicate per-token rows before they are scattered into indexer pages.
+
+        Args:
+            x: Update rows ``[T, ...]``.
+
+        Returns:
+            ``x`` constrained to a fully replicated spec (only the small rows move).
+        """
+        resolver = getattr(self, "runtime_sharding_resolver", None)
+        if resolver is None:
+            return x
+        return resolver.shard(x, axes=[common_types.EMPTY] * x.ndim, mode=common_types.MODE_PREFILL)
 
     def flattened_kv_pages(self) -> jax.Array:
         """Materialize and return the KV page buffer as a concrete JAX array.
@@ -480,9 +690,22 @@ class MLARaggedPagesCache(RaggedPagesCache):
         Returns:
             An ``MLARaggedPagesCache`` containing ``config.num_hidden_layers`` views.
         """
+        num_layers = int(config.num_hidden_layers)
+        owners = None  # None: every layer owns indexer pages (what ``create`` budgets by default)
+        if config.has_indexer_pages:
+            charged = config.indexer_num_layers
+            if config.indexer_layer_indices is not None:
+                owners = frozenset(int(i) for i in config.indexer_layer_indices)
+            elif charged is not None and int(charged) < num_layers:
+                # r11 S09-1: allocating every layer would exceed the page budget create() computed.
+                raise ValueError(
+                    f"MLA cache config budgets indexer pages for {charged} of {num_layers} layers but "
+                    "records no owner schedule; pass `indexer_layer_indices` to create(), or build the "
+                    "views with MLARaggedPagesCacheView.init(..., with_indexer_pages=...)."
+                )
         views = []
-        for i in range(config.num_hidden_layers):
-            with spx.assign_stage(total=config.num_hidden_layers, current=i):
+        for i in range(num_layers):
+            with spx.assign_stage(total=num_layers, current=i):
                 views.append(
                     MLARaggedPagesCacheView.init(
                         config=config,
@@ -490,6 +713,7 @@ class MLARaggedPagesCache(RaggedPagesCache):
                         mesh=mesh,
                         runtime_sharding_resolver=runtime_sharding_resolver,
                         quantizer=quantizer,
+                        with_indexer_pages=owners is None or i in owners,
                     )
                 )
         return cls(views=views)

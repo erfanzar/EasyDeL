@@ -310,7 +310,9 @@ def prepack_quantized_weights_jit(array: jax.Array, *, group_size: int, bits: in
     return prepack_quantized_weights(array, group_size=group_size, bits=bits, mode=mode, transpose=False)
 
 
-def channelwise_quantize_array(array: jax.Array, bits: int) -> tuple[jax.Array, jax.Array, None]:
+def channelwise_quantize_array(
+    array: jax.Array, bits: int, expert_chunk: int | None = None
+) -> tuple[jax.Array, jax.Array, None]:
     """Per-output-channel symmetric quantization over the full contraction axis.
 
     Produces the exact format the channelwise/fused-MLP kernels consume
@@ -322,11 +324,28 @@ def channelwise_quantize_array(array: jax.Array, bits: int) -> tuple[jax.Array, 
     Args:
         array: Full-precision weight ``[in_features, out_features]``.
         bits: 8 or 4.
+        expert_chunk: For stacked expert kernels ``[experts, in, out]``, quantize this many experts at a time
+            (experts are independent, so the result is identical) to bound the fp32 temporaries. ``None`` (default)
+            quantizes the whole array in one step.
 
     Returns:
         Tuple of (codes, scales, None) — the trailing None mirrors the
         (kernel, scales, biases) triple of the grouped modes.
     """
+    if expert_chunk is not None and array.ndim == 3 and 0 < int(expert_chunk) < array.shape[0]:
+        step = int(expert_chunk)
+        parts = [channelwise_quantize_array(array[i : i + step], bits) for i in range(0, array.shape[0], step)]
+        codes = jnp.concatenate([p[0] for p in parts], axis=0)
+        scales = jnp.concatenate([p[1] for p in parts], axis=0)
+        sharding = getattr(array, "sharding", None)
+        if isinstance(sharding, jax.sharding.NamedSharding):
+            # Slicing + concatenation may re-shard; restore the layout the unchunked path produces (the scales
+            # reduce the contraction axis, so that dim is unsharded there).
+            spec = list(sharding.spec) + [None] * (array.ndim - len(sharding.spec))
+            spec[-2] = None
+            codes = jax.device_put(codes, sharding)
+            scales = jax.device_put(scales, jax.sharding.NamedSharding(sharding.mesh, jax.sharding.PartitionSpec(*spec)))
+        return codes, scales, None
     qmax = 127.0 if bits == 8 else 7.0
     qdtype = jnp.int8 if bits == 8 else jnp.int4
     w32 = array.astype(jnp.float32)

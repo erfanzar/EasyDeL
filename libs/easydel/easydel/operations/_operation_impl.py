@@ -208,9 +208,11 @@ class OperationImpl(BaseOperation):
         """
         reqs = self.get_requirements(mode)
 
-        # Apply instance-level requires_cache override from metadata
-        if self.metadata is not None and self.metadata.requires_cache is not None:
-            reqs = reqs.with_requires_cache(self.metadata.requires_cache)
+        override = getattr(self, "_requires_cache_override", None)
+        if override is None and self.metadata is not None:
+            override = self.metadata.requires_cache
+        if override is not None:
+            reqs = reqs.with_requires_cache(override)
 
         return reqs
 

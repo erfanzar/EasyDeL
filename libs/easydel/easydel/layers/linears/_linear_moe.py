@@ -710,7 +710,7 @@ class ParallelMoELinear(spx.Module):
             )
         if isinstance(self.weight.value, jax.ShapeDtypeStruct):
             return lazy_module
-        return lazy_module.restage_from_dense(self.weight.value)
+        return lazy_module.restage_from_dense(self.weight.value, expert_chunk=kwargs.get("expert_chunk"))
 
 
 @jax.tree_util.register_pytree_node_class
@@ -795,11 +795,16 @@ class ParallelMoELinearQuantized(ParallelMoELinear):
         del config, kwargs
         return self
 
-    def restage_from_dense(self, dense_kernel: Array) -> "ParallelMoELinearQuantized":
-        """Fill quant leaves by quantizing a concrete dense kernel in place."""
+    def restage_from_dense(self, dense_kernel: Array, expert_chunk: int | None = None) -> "ParallelMoELinearQuantized":
+        """Fill quant leaves by quantizing a concrete dense kernel in place.
+
+        Args:
+            dense_kernel: Concrete dense stack ``[experts, in, out]``.
+            expert_chunk: Quantize this many experts at a time (``None``: all at once); the result is identical.
+        """
         from ._linear_quantized import channelwise_quantize_array
 
-        codes, scales, _ = channelwise_quantize_array(dense_kernel, self._quantization_bits)
+        codes, scales, _ = channelwise_quantize_array(dense_kernel, self._quantization_bits, expert_chunk=expert_chunk)
         self.quant_kernel = spx.Parameter(codes, sharding=self.quant_kernel.sharding)
         self.quant_scales = spx.Parameter(scales, sharding=self.quant_scales.sharding)
         return self

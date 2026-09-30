@@ -73,6 +73,7 @@ from easydel.caching import TransformerCacheView
 
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry, axis_entry_shard_factor
+from .._operation_meta import normalize_head_sinks
 from ..requirements import (
     CacheType,
     ExecutionMode,
@@ -160,8 +161,10 @@ class RingAttn(OperationImpl):
             value: Value tensor of shape ``(B, seq_len_k, num_kv_heads,
                 head_dim)``.
             softmax_aux: Optional sink-token logits, shape
-                ``(num_kv_heads, num_sinks)`` or ``(num_sinks,)``. Reshaped
-                to a flat vector before the kernel call.
+                ``(num_kv_heads, num_sinks)``, ``(num_q_heads, num_sinks)``
+                or ``(num_sinks,)``. A 1-D vector of length ``num_q_heads`` is
+                per-query-head; other 1-D lengths are shared sinks. Per-head
+                sinks are passed to the kernel as 2-D ``(num_q_heads, S)``.
             mask_info: Optional :class:`MaskInfo` describing the attention
                 pattern; axis names are populated from the resolved
                 query/key sharding before the kernel is invoked.
@@ -201,8 +204,17 @@ class RingAttn(OperationImpl):
             )
             return fallback_output
 
-        if softmax_aux is not None:
-            softmax_aux = softmax_aux.reshape(-1)
+        # Canonical sink layouts: shared sinks stay 1-D ``(S,)`` (every ring kernel reads
+        # 1-D as shared); per-query-head sinks become 2-D ``(Hq, S)`` so they are never
+        # mistaken for shared ones. Never ``reshape(-1)``: that flattens multi-sink rows.
+        softmax_aux, per_head_sinks = normalize_head_sinks(
+            softmax_aux,
+            num_q_heads=query.shape[2],
+            num_kv_heads=key.shape[2],
+            per_head_2d=True,
+            expand_kv_rows=True,
+            disambiguate_shared=False,
+        )
 
         model_mode = self.get_mode(query=query, BTHD=True)
         is_decode_mode = model_mode == common_types.MODE_DECODE
@@ -217,6 +229,8 @@ class RingAttn(OperationImpl):
             layout="bthd",
             qkv_mni_sharding=True,
             softmax_aux=softmax_aux,
+            num_q_heads=query.shape[2],
+            num_kv_heads=key.shape[2],
         )
 
         query: Float[Array, "batch seq_len_q num_heads head_dim"] = query.astype(dtype_runtime)
@@ -262,7 +276,13 @@ class RingAttn(OperationImpl):
             tensor=value,
             preserved_indices=[0, 1, 2],
         )
-        softmax_aux_sharding = self.create_stable_sharding(shardings.softmax_aux, dep=softmax_aux, tensor=softmax_aux)
+        # Per-head sinks are 2-D here; any 1-D result is a SHARED sink set and must be replicated.
+        # (``get_shardings`` head-shards every 1-D vector of length Hq, which would hand each head
+        # shard a slice of a shared ``(1, Hq)`` row.)
+        softmax_aux_spec = shardings.softmax_aux
+        if softmax_aux is not None and not per_head_sinks:
+            softmax_aux_spec = jax.sharding.PartitionSpec(*([None] * softmax_aux.ndim))
+        softmax_aux_sharding = self.create_stable_sharding(softmax_aux_spec, dep=softmax_aux, tensor=softmax_aux)
         output_sharding = self.create_stable_sharding(shardings.output, tensor=query, preserved_indices=[0, 1, 2])
         mask_info = align_mask_info_to_qkv_specs(
             mask_info,
@@ -285,6 +305,9 @@ class RingAttn(OperationImpl):
             causal=causal_computed,
             fused_backward=fused_backward,
             cfg=self.metadata.get_operation_config("ring"),
+            # The Pallas TPU ring kernel only accepts rank-1 (shared) sinks, so per-head
+            # 2-D sinks are served by the XLA ring kernel, which reads them per head.
+            platform="xla" if per_head_sinks else None,
             mesh=self.metadata.mesh,
             in_specs=(
                 query_sharding,

@@ -156,8 +156,11 @@ def _token_reference(model, hidden, residual, positions, frequencies, mask, prev
     if previous is not None and hidden.shape[1] == 1:
         k = np.concatenate((previous, k), axis=1)
     dots = np.einsum("bqhd,bkd->bqhk", q, k) / np.sqrt(model.index_head_dim)
-    scores = np.einsum("bqhk,bqh->bqk", dots, weights)
-    scores = np.where(mask, scores, -np.inf)
+    # HF GlmMoeDsaIndexer: relu per head before weighting, then future keys masked before top-k.
+    scores = np.einsum("bqhk,bqh->bqk", np.maximum(dots, 0.0), weights)
+    num_q, num_k = scores.shape[-2:]
+    causal = np.arange(num_k)[None, :] <= (num_k - num_q + np.arange(num_q))[:, None]
+    scores = np.where(mask & causal, scores, -np.inf)
     return np.argsort(-scores, axis=-1, kind="stable")[..., : model.index_topk], k
 
 

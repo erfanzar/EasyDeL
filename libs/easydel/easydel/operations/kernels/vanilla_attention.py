@@ -163,6 +163,7 @@ class VanillaAttn(OperationImpl):
         causal: bool = False,
         sliding_window: int | tuple[int, int] | None = None,
         precision: jax.lax.PrecisionLike = None,
+        compute_dtype: jnp.dtype | None = None,
         **ignore,
     ) -> AttentionOutput:
         """
@@ -184,6 +185,9 @@ class VanillaAttn(OperationImpl):
             causal: Apply causal masking.
             sliding_window: Sliding window size for local attention.
             precision: QK and value-product precision. None inherits JAX's ambient setting.
+            compute_dtype: Optional per-call dtype for the logits, softmax and value product, overriding the
+                config-derived ``runtime_dtype`` / ``runtime_softmax_dtype`` (e.g. fp32 vision towers inside a
+                bf16-attention model). ``None`` keeps the metadata dtypes.
             **ignore: Additional ignored arguments.
 
         Returns:
@@ -215,8 +219,14 @@ class VanillaAttn(OperationImpl):
 
             runtime_dtype: jnp.dtype = self.metadata.runtime_dtype
             softmax_dtype: jnp.dtype | None = self.metadata.runtime_softmax_dtype
+            if compute_dtype is not None:
+                runtime_dtype = softmax_dtype = compute_dtype
             is_decode_mode: bool = model_mode == common_types.MODE_DECODE
             causal_computed: bool = causal if not is_decode_mode else False
+            if mask_info is not None and getattr(mask_info, "causal_mask_baked_in", False):
+                # The mask already carries the (absolute-position) causal term; the kernel's top-left (Q, K)
+                # triangle would re-restrict cached multi-token steps to chunk-relative rows (r15 S10-1).
+                causal_computed = False
             if self._can_use_segmented_attention(mask_info):
                 outputs, weights = self._forward_segmented(
                     query=query,
@@ -372,9 +382,24 @@ class VanillaAttn(OperationImpl):
         logits = jnp.where(valid[:, None, :, :], logits, mask_value)
 
         if softmax_aux is not None:
+            # Settled sink layout (r15 S07-1): 1-D of length Hq is per query head, any other 1-D length is
+            # shared; 2-D rows are Hq (per head), Hkv (per KV head, blocked GQA repeat) or 1 (shared).
             aux = jnp.asarray(softmax_aux, dtype=logits.dtype)
             if aux.ndim == 1:
-                aux = jnp.broadcast_to(aux[None, :], (num_q_heads, aux.shape[0]))
+                aux = aux[:, None] if aux.shape[0] == num_q_heads else aux[None, :]
+            if aux.ndim != 2:
+                raise ValueError(f"softmax_aux must be 1-D or 2-D, got shape {aux.shape}.")
+            if aux.shape[0] == num_q_heads:
+                pass
+            elif aux.shape[0] == 1:
+                aux = jnp.broadcast_to(aux, (num_q_heads, aux.shape[1]))
+            elif aux.shape[0] == num_kv_heads and num_q_heads % num_kv_heads == 0:
+                aux = jnp.repeat(aux, num_q_heads // num_kv_heads, axis=0)
+            else:
+                raise ValueError(
+                    f"softmax_aux rows must be 1, num_kv_heads ({num_kv_heads}) or num_q_heads ({num_q_heads}); "
+                    f"got shape {aux.shape}."
+                )
             aux = jnp.broadcast_to(aux[None, :, None, :], (batch_size, num_q_heads, q_len, aux.shape[-1]))
             weights = jax.nn.softmax(jnp.concatenate([logits, aux], axis=-1), axis=-1)[..., :kv_len]
         else:

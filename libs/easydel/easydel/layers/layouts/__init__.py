@@ -63,6 +63,7 @@ from ._reform import (
     moe_down_projection_reform_param,
     moe_fused_gate_up_reform_param,
     moe_gate_up_fusion_reform_param,
+    moe_per_expert_down_reform_param,
     qkv_fusion_reform_param,
 )
 from ._runtime import (
@@ -104,6 +105,7 @@ __all__ = [
     "moe_down_projection_reform_param",
     "moe_fused_gate_up_reform_param",
     "moe_gate_up_fusion_reform_param",
+    "moe_per_expert_down_reform_param",
     "normalize_segment_sizes",
     "qkv_fusion_reform_param",
     "read_fused_checkpoint_tp",

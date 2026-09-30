@@ -726,6 +726,74 @@ def replicated_expert_combine(inputs, counts, *, axis_name, output_rows):
     return combine(inputs, counts)
 
 
+def replicated_expert_psum_unpermute(
+    local_rows: jax.Array,
+    counts: jax.Array,
+    sorted_selected_experts: jax.Array,
+    weights: jax.Array,
+    *,
+    axis_name: str,
+    batch_size: int,
+    sequence_length: int,
+    num_experts_per_tok: int,
+    dtype: jnp.dtype,
+    weight_modif_fn: typing.Callable[[jax.Array], jax.Array] | None = None,
+) -> jax.Array:
+    """Inference combine for replicated-batch expert parallelism: local unpermute + one ``psum``.
+
+    Same result as ``unpermute(replicated_expert_combine(local_rows, counts, ...), ...)`` without the
+    ``[tokens * k, H]`` ragged all-to-all. With a replicated batch every shard holds the same globally
+    sorted row order, and shard ``r`` owns the contiguous global rows ``[start_r, start_r + counts[r])``,
+    which ``local_permute(is_offset=True)`` leaves at local rows ``[0, counts[r])`` in that order.
+    ``unpermute`` is linear in its rows, so each shard places its rows at their global offset (zeros
+    elsewhere, which also drops the TPU grouped-matmul garbage tail), combines them into an fp32
+    ``[tokens, H]`` partial, and one ``psum`` over ``axis_name`` sums the disjoint partials. The
+    payload is ``[tokens, H]`` fp32 instead of ``[tokens * k, H]`` rows.
+
+    Differentiable as written: every shard's partial is a linear function of its own rows, so the
+    ``psum`` transpose returns each shard exactly its rows' cotangents (input, router and expert-weight
+    gradients match the ragged combine and a dense reference; see
+    ``tests/layers/moe/test_expert_tensor_inference_combine.py``). The MoE block still uses it only
+    under inference mode: measured on four TPU v5 chips, the ``[tokens, H]`` fp32 all-reduce is 5-8%
+    slower than the ragged all-to-all of :func:`replicated_expert_combine` per train step at top-4,
+    and only ~1.5% faster at top-6.
+
+    Args:
+        local_rows: Expert outputs in local sorted order ``[tokens * k, H]`` (static full length).
+        counts: Rows owned by each expert shard ``[ep]`` (replicated).
+        sorted_selected_experts: Global sort permutation from ``permute`` ``[tokens * k]``.
+        weights: Top-k combine weights ``[tokens, k]`` or ``[tokens * k]``.
+        axis_name: Expert mesh axis.
+        batch_size: Local batch size.
+        sequence_length: Local sequence length.
+        num_experts_per_tok: ``k``.
+        dtype: Output dtype.
+        weight_modif_fn: Optional weight post-processing, as in :func:`unpermute`.
+
+    Returns:
+        Combined outputs ``[batch_size, sequence_length, H]`` in ``dtype``, identical on every shard.
+    """
+    total = int(sorted_selected_experts.shape[0])
+    rank = jax.lax.axis_index(axis_name)
+    start = jnp.sum(jnp.where(jnp.arange(counts.shape[0]) < rank, counts, 0))
+    index = jnp.arange(total, dtype=jnp.int32) - start.astype(jnp.int32)
+    valid = (index >= 0) & (index < counts[rank])
+    placed = jnp.take(local_rows, jnp.clip(index, 0, local_rows.shape[0] - 1), axis=0)
+    placed = jnp.where(valid[:, None], placed, jnp.zeros_like(placed))
+    partial = unpermute(
+        placed,
+        sorted_selected_experts,
+        weights,
+        batch_size=batch_size,
+        sequence_length=sequence_length,
+        use_custom_sort_vjp=True,
+        weight_modif_fn=weight_modif_fn,
+        num_experts_per_tok=num_experts_per_tok,
+        dtype=jnp.float32,
+    )
+    return jax.lax.psum(partial, axis_name).astype(dtype)
+
+
 def build_ep_traffic_matrix(global_group_sizes: jax.Array, ep_size: int, local_expert_size: int) -> jax.Array:
     """Fold a per-shard routing table into the EP dispatch traffic matrix.
 

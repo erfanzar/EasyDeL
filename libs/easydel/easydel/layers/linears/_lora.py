@@ -153,10 +153,15 @@ class eLoRA(nn.LoRA):
         lora_a = self._maybe_cast(self.lora_a[...], self.dtype)
         lora_b = self._maybe_cast(self.lora_b[...], self.dtype)
         out = x @ lora_a @ lora_b
-        if self.base_module is not None:
-            if not callable(self.base_module):
+        if self.has_alpha:
+            # Spectrax LoRA semantics: the delta is scaled by ``alpha / rank``.
+            # Dropping it here would silently ignore a user-provided ``alpha``.
+            out = out * self._scale(out.dtype)
+        base_module = getattr(self, "base_module", None)
+        if base_module is not None:
+            if not callable(base_module):
                 raise ValueError("`self.base_module` must be callable.")
-            out += self.base_module(x, *args, **kwargs)
+            out += base_module(x, *args, **kwargs)
         return out
 
     def native_forward(
@@ -187,11 +192,14 @@ class eLoRA(nn.LoRA):
         lora_a = self._maybe_cast(self.lora_a[...], self.dtype)
         lora_b = self._maybe_cast(self.lora_b[...], self.dtype)
         out = inputs @ lora_a @ lora_b
-        if self.base_module is not None:
-            if hasattr(self.base_module, "native_forward"):
-                out += self.base_module.native_forward(inputs=inputs, w=w)
+        if self.has_alpha:
+            out = out * self._scale(out.dtype)
+        base_module = getattr(self, "base_module", None)
+        if base_module is not None:
+            if hasattr(base_module, "native_forward"):
+                out += base_module.native_forward(inputs=inputs, w=w)
             elif w is None:
-                out += self.base_module(inputs)
+                out += base_module(inputs)
             else:
-                out += self.base_module(inputs, w=w)
+                out += base_module(inputs, w=w)
         return out

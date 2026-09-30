@@ -38,10 +38,12 @@ import jax
 from ejkernel.modules import compressed_window_decode as _ejkernel_compressed_window_decode
 from jax import numpy as jnp
 from jaxtyping import Array, Float
+from spectrax import common_types
 
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationRegistry
 from ..requirements import ExecutionMode, MetadataField, OperationRequirements, RequirementsBuilder
+from ._compressed_window_common import head_parallel_shard_map, resolve_platform
 
 # Platform override for A/B testing the Pallas kernel against the XLA reference
 # in-model (see debug-ejkernel-ops). Default "auto" prefers Pallas on TPU.
@@ -91,15 +93,17 @@ class CompressedWindowDecodeAttn(OperationImpl):
         bias: Float[Array, "batch q_len kv_len"],
         softmax_aux: Float[Array, "num_heads"] | None = None,  # noqa: F821
         softmax_scale: float | None = None,
+        platform: str | None = None,
         **ignores,
     ) -> AttentionOutput:
         """Run compressed-window decode attention via the ejkernel operation.
 
         Casts the query/KV to the runtime compute dtype (the additive bias and
         the sink logits stay float32 to preserve the softmax accumulation
-        precision), then delegates to the ejkernel op. Sharding of the
-        head-parallel query/output and the replicated KV is left to GSPMD (both
-        the XLA and Pallas paths partition over the head batch axis).
+        precision), then delegates to the ejkernel op. When the op resolves to
+        the TPU Mosaic kernel on a multi-device mesh it runs under a
+        head-parallel ``shard_map`` built from the metadata's ``HEAD`` / ``BATCH``
+        axes; the XLA reference is left to GSPMD.
 
         Args:
             query: Rotated queries ``[batch, num_heads, q_len, head_dim]``.
@@ -107,6 +111,8 @@ class CompressedWindowDecodeAttn(OperationImpl):
             bias: Additive fp32 mask ``[batch, q_len, kv_len]`` (head-broadcast).
             softmax_aux: Optional per-head sink logits ``[num_heads]``.
             softmax_scale: Logit scale; defaults to ``head_dim ** -0.5``.
+            platform: Per-call platform override (``"pallas"`` / ``"xla"`` /
+                ``None`` = the adapter default).
             **ignores: Ignored keyword arguments (interface parity).
 
         Returns:
@@ -115,13 +121,22 @@ class CompressedWindowDecodeAttn(OperationImpl):
         """
         del ignores
         runtime_dtype = self.metadata.runtime_dtype
+        resolved = resolve_platform(platform, _PLATFORM)
+        sharding = head_parallel_shard_map(
+            self.metadata,
+            mode=common_types.MODE_DECODE,
+            platform=resolved,
+            batch=int(query.shape[0]),
+            num_heads=int(query.shape[1]),
+        )
         out = _ejkernel_compressed_window_decode(
             query.astype(runtime_dtype),
             kv.astype(runtime_dtype),
             bias.astype(jnp.float32),
             None if softmax_aux is None else softmax_aux.astype(jnp.float32),
             softmax_scale=softmax_scale,
-            platform=None if _PLATFORM == "auto" else _PLATFORM,
+            platform=resolved,
+            **sharding,
         )
         return AttentionOutput(attention_weights=None, attention_outputs=out)
 
@@ -152,6 +167,7 @@ class CompressedWindowDecodeAttn(OperationImpl):
         bias: Float[Array, "batch q_len kv_len"],
         softmax_aux: Float[Array, "num_heads"] | None = None,  # noqa: F821
         softmax_scale: float | None = None,
+        platform: str | None = None,
         **ignores,
     ) -> AttentionOutput:
         """Dispatch to the backend-specific forward.
@@ -162,6 +178,7 @@ class CompressedWindowDecodeAttn(OperationImpl):
             bias: Additive fp32 mask ``[batch, q_len, kv_len]``.
             softmax_aux: Optional per-head sink logits ``[num_heads]``.
             softmax_scale: Logit scale.
+            platform: Per-call platform override.
             **ignores: Ignored keyword arguments.
 
         Returns:
@@ -173,5 +190,6 @@ class CompressedWindowDecodeAttn(OperationImpl):
             bias=bias,
             softmax_aux=softmax_aux,
             softmax_scale=softmax_scale,
+            platform=platform,
             **ignores,
         )

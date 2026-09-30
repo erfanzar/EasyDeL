@@ -117,6 +117,17 @@ class QuantizationType(enum.StrEnum):
     TURBOQUANT = "turboquant"
 
 
+MATMUL_PRESETS: dict[str, tuple[int, int]] = {
+    "w4a16": (4, 16),
+    "w8a16": (8, 16),
+    "w4a8": (4, 8),
+    "w4a4": (4, 4),
+    "w8a8": (8, 8),
+}
+"""Integer matmul presets ``name -> (weight_bits, activation_bits)``; each expands to channelwise storage with an
+explicit activation policy. Accepted by :meth:`QuantizationConfig.for_matmul` and as ``QuantizationConfig.dtype``."""
+
+
 def explicit_activation_kwargs(config: tp.Any) -> dict[str, bool | int]:
     """Kernel overrides for an explicit activation contract; auto returns {}.
 
@@ -237,6 +248,23 @@ class QuantizationConfig:
         string form into :class:`QuantizationType`, and ensures
         ``group_size`` / ``bits`` are ``int`` when present.
         """
+        if isinstance(self.dtype, str) and self.dtype.lower() in MATMUL_PRESETS:
+            # ``dtype="w8a8"`` etc. is shorthand for the channelwise explicit-activation preset. Explicitly passed
+            # bits / activation_bits / activation_policy must agree with it rather than be silently overridden.
+            preset = self.dtype.lower()
+            weight_bits, act_bits = MATMUL_PRESETS[preset]
+            if self.bits is not None and int(self.bits) != weight_bits:
+                raise ValueError(f"dtype={preset!r} implies bits={weight_bits}, got bits={self.bits}.")
+            if self.activation_bits is not None and int(self.activation_bits) != act_bits:
+                raise ValueError(
+                    f"dtype={preset!r} implies activation_bits={act_bits}, got activation_bits={self.activation_bits}."
+                )
+            if self.activation_policy not in ("auto", "explicit"):
+                raise ValueError("activation_policy must be 'auto' or 'explicit'.")
+            self.dtype = QuantizationType.CHANNELWISE
+            self.bits = weight_bits
+            self.activation_bits = act_bits
+            self.activation_policy = "explicit"
         if isinstance(self.dtype, str):
             self.dtype = QuantizationType(self.dtype)
         if isinstance(self.runtime_dtype, str):
@@ -337,15 +365,14 @@ class QuantizationConfig:
     def for_matmul(cls, mode: str) -> "QuantizationConfig":
         """Record an explicit channelwise integer matmul precision preset.
 
-        Supports W4A16, W8A16, W4A4, and W8A8 via lowercase mode names.
+        Supports W4A16, W8A16, W4A8, W4A4, and W8A8 via lowercase mode names
+        (the same names are accepted as ``QuantizationConfig(dtype=...)``).
         A16 requests unquantized activations rather than legacy auto-selection.
-        This factory only creates metadata; it does not wire kernel dispatch
-        or guarantee backend support for the requested precision.
+        The dense channelwise and grouped (MoE) kernels honor every preset.
         """
-        presets = {"w4a16": (4, 16), "w8a16": (8, 16), "w4a4": (4, 4), "w8a8": (8, 8)}
-        if mode not in presets:
-            raise ValueError(f"Unsupported integer matmul mode: {mode!r}. Expected one of {tuple(presets)}.")
-        weight_bits, activation_bits = presets[mode]
+        if mode not in MATMUL_PRESETS:
+            raise ValueError(f"Unsupported integer matmul mode: {mode!r}. Expected one of {tuple(MATMUL_PRESETS)}.")
+        weight_bits, activation_bits = MATMUL_PRESETS[mode]
         return cls(
             dtype=QuantizationType.CHANNELWISE,
             bits=weight_bits,

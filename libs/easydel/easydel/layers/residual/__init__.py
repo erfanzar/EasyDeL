@@ -45,6 +45,7 @@ from ._manifold import (
     ManifoldHyperConnectionConfig,
     ManifoldHyperHead,
     MeanHyperHead,
+    manifold_collapse,
     manifold_residual_write,
     mean_hyper_head,
 )
@@ -58,6 +59,7 @@ __all__ = (
     "MeanHyperHead",
     "expand_streams",
     "inject_streams",
+    "manifold_collapse",
     "manifold_residual_write",
     "mean_hyper_head",
 )

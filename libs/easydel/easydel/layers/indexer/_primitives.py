@@ -22,6 +22,8 @@ the vacuous-selection guard every family re-implements slightly differently.
 
 from __future__ import annotations
 
+import math
+
 import jax
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
@@ -145,13 +147,16 @@ def indices_to_bool_mask(
         Boolean ``(batch, q, kv_length)``; ``True`` where the position is
         selected. Duplicate selections collapse (``any``).
     """
-    safe = jnp.clip(topk_indices, 0, kv_length - 1)
-    one_hot = jax.nn.one_hot(safe, kv_length, dtype=jnp.bool_)
-    # ``-1`` slots must select nothing: clip alone would map them to
-    # position 0, so mask those lanes out before the reduction.
+    # One scatter into a ``[rows, kv + 1]`` buffer instead of a ``[..., k, kv]`` one-hot cube. ``-1`` lanes land on
+    # the extra drop column (select nothing); other indices clip into range; duplicates collapse.
     valid = topk_indices >= 0
-    one_hot = jnp.where(valid[..., None], one_hot, False)
-    return jnp.any(one_hot, axis=-2)
+    safe = jnp.where(valid, jnp.clip(topk_indices, 0, kv_length - 1), kv_length)
+    shape = topk_indices.shape[:-1]
+    rows = math.prod(shape)
+    flat = safe.reshape(rows, topk_indices.shape[-1])
+    mask = jnp.zeros((rows, kv_length + 1), dtype=jnp.bool_)
+    mask = mask.at[jnp.arange(rows)[:, None], flat].set(True)
+    return mask[:, :kv_length].reshape(*shape, kv_length)
 
 
 def ste_score_proxy(

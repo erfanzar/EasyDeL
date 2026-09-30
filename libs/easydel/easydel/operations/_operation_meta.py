@@ -81,6 +81,107 @@ BIAS_KV_SEQ = common_types.BIAS_KV_SEQ
 EMPTY = common_types.EMPTY
 
 
+def normalize_head_sinks(
+    softmax_aux: jaxtyping.Array | None,
+    *,
+    num_q_heads: int,
+    num_kv_heads: int,
+    per_head_2d: bool,
+    expand_kv_rows: bool = True,
+    disambiguate_shared: bool = True,
+    head_shard_factor: int = 1,
+) -> tuple[jaxtyping.Array | None, bool]:
+    """Bring sink logits to a canonical shared or per-query-head layout.
+
+    Canonical convention: a 1-D vector of length ``num_q_heads`` is per-query-head;
+    any other 1-D length is shared by all heads; per-KV-head sinks are 2-D
+    ``(num_kv_heads, num_sinks)``; a 2-D leading singleton is shared. Unlike
+    ``reshape(-1)``, this never flattens a multi-sink 2-D layout.
+
+    Args:
+        softmax_aux: Sink logits (1-D or 2-D) or ``None``.
+        num_q_heads: Global query-head count.
+        num_kv_heads: Global KV-head count.
+        per_head_2d: Layout for per-head results. ``True`` keeps ``(Hq, S)``;
+            ``False`` squeezes ``S == 1`` to a 1-D ``(Hq,)`` vector.
+        expand_kv_rows: Expand ``(num_kv_heads, S)`` sinks to ``(num_q_heads, S)``.
+            Needed because adapters may block-repeat KV heads and shard query heads,
+            after which a replicated per-KV row no longer lines up with local query
+            heads. When ``False`` per-KV-head sinks are returned unchanged.
+        disambiguate_shared: Expand shared sinks to an explicit per-query-head
+            ``(num_q_heads, S)`` array when ``S`` equals a global or local
+            (post-``shard_map``) head count, so kernels cannot mistake a shared ``(S,)``
+            vector for per-head sinks. Broadcasting is exact (every head gets the same
+            sinks). ``False`` always keeps ``(S,)`` (kernels that read every 1-D aux as
+            shared, e.g. ring attention).
+        head_shard_factor: Number of shards the query-head axis is split into under
+            ``shard_map`` (see :meth:`OperationMetadata.head_shard_factor`); used to
+            find shared-sink lengths that would collide with a local head count.
+
+    Returns:
+        ``(aux, is_per_head)``. ``aux`` is a shared ``(S,)`` vector or a per-query-head
+        (or per-KV-head when ``expand_kv_rows`` is False) array; ``is_per_head`` tells
+        which.
+
+    Raises:
+        ValueError: If the layout is not 1-D/2-D or a 2-D leading dim is not
+            ``1``, ``num_kv_heads`` or ``num_q_heads``.
+    """
+    if softmax_aux is None:
+        return None, False
+
+    # Lengths a kernel could read as a head count: the global KV-head count and the
+    # per-shard (local) query/KV head counts seen inside ``shard_map``.
+    colliding = {num_kv_heads}
+    if head_shard_factor > 1:
+        if num_q_heads % head_shard_factor == 0:
+            colliding.add(num_q_heads // head_shard_factor)
+        if num_kv_heads % head_shard_factor == 0:
+            colliding.add(num_kv_heads // head_shard_factor)
+
+    def _shared(vec, *, explicit: bool = False):
+        """Return shared sinks, expanded per head when a kernel could mistake ``(S,)`` for per-head.
+
+        ``explicit`` marks sinks that came from a 2-D ``(1, S)`` row: they are shared by
+        construction, so ``S == num_q_heads`` must also be expanded (a bare ``(Hq,)``
+        vector is read as one sink per query head everywhere except ring attention).
+        """
+        n = vec.shape[0]
+        collides = n in colliding or (explicit and n == num_q_heads)
+        ambiguous = disambiguate_shared and n > 1 and (n != num_q_heads or explicit) and collides
+        if ambiguous:
+            return jnp.broadcast_to(vec[None, :], (num_q_heads, n)), True
+        return vec, False
+
+    if softmax_aux.ndim == 1:
+        if num_q_heads > 1 and softmax_aux.shape[0] == num_q_heads:
+            per_head = softmax_aux[:, None]
+        else:
+            return _shared(softmax_aux)
+    elif softmax_aux.ndim == 2:
+        rows = softmax_aux.shape[0]
+        if rows == 1:
+            return _shared(softmax_aux[0], explicit=True)
+        if rows == num_q_heads:
+            per_head = softmax_aux
+        elif rows == num_kv_heads:
+            if not expand_kv_rows:
+                return softmax_aux, True
+            if num_q_heads % num_kv_heads != 0:
+                raise ValueError(f"num_q_heads ({num_q_heads}) is not divisible by num_kv_heads ({num_kv_heads})")
+            per_head = jnp.repeat(softmax_aux, num_q_heads // num_kv_heads, axis=0)
+        else:
+            raise ValueError(
+                f"softmax_aux first dim must be 1, num_kv_heads ({num_kv_heads}) or "
+                f"num_q_heads ({num_q_heads}); got {rows}"
+            )
+    else:
+        raise ValueError(f"softmax_aux must be 1D or 2D, got shape {tuple(softmax_aux.shape)}")
+    if not per_head_2d and per_head.shape[1] == 1:
+        per_head = per_head[:, 0]
+    return per_head, True
+
+
 class AttnShardingRules(NamedTuple):
     """Bundle of :class:`PartitionSpec` entries for every attention tensor.
 
@@ -327,12 +428,37 @@ class OperationMetadata:
         """
         self._stored_mesh = value
 
+    def head_shard_factor(self, mode: RUNTIME_MODE_TYPES, num_q_heads: int) -> int:  # type:ignore
+        """Return how many shards the query-head axis is split into under ``shard_map``.
+
+        Args:
+            mode: Runtime mode used to resolve the ``HEAD`` axis.
+            num_q_heads: Global query-head count (used to sanitize indivisible specs).
+
+        Returns:
+            The product of the mesh sizes the resolved ``HEAD`` axis maps to; ``1`` when
+            the head axis is replicated or no mesh is available.
+        """
+        mesh = self.mesh
+        if mesh is None:
+            return 1
+        resolver = self.runtime_sharding_resolver.with_mesh(mesh)
+        entry = resolver.resolve(axes=[HEAD], mode=mode, shape=(num_q_heads,))[0]
+        if entry is None:
+            return 1
+        factor = 1
+        for name in entry if isinstance(entry, tuple) else (entry,):
+            factor *= int(mesh.shape[name])
+        return factor
+
     def get_shardings(
         self,
         mode: RUNTIME_MODE_TYPES,  # type:ignore
         layout: tp.Literal["bthd", "bhtd", "thd"] = "bthd",
         qkv_mni_sharding: bool = False,
         softmax_aux: jaxtyping.Array | None = None,
+        num_q_heads: int | None = None,
+        num_kv_heads: int | None = None,
     ) -> AttnShardingRules:
         """Resolve PartitionSpecs for every attention tensor.
 
@@ -354,10 +480,15 @@ class OperationMetadata:
                 for the K/V tensors instead of ``KV_HEAD``/``KV_HEAD_DIM``
                 — applicable for MHA where K and V share the query head
                 count rather than the smaller KV head count.
-            softmax_aux: Optional auxiliary softmax tensor (e.g. LSE or
-                row-max). When supplied, a sharding for it is added to the
-                returned rules (2D inputs get an ``[EMPTY, KV_HEAD]``
-                spec, higher rank inputs get an ``[HEAD]`` spec).
+            softmax_aux: Optional sink logits. A 1D vector is sharded over
+                ``HEAD`` only when its length equals the global query-head
+                count; other 1D lengths are shared sink logits and replicated.
+                For 2D sinks, shard the first axis only when it equals the
+                global query- or KV-head count; a leading singleton is shared.
+            num_q_heads: Global number of query heads (from the actual query).
+                Without it, sinks are replicated rather than guessing their
+                head layout from divisibility by the mesh size.
+            num_kv_heads: Global KV-head count, used for 2D KV-head sinks.
 
         Returns:
             AttnShardingRules: A populated NamedTuple of PartitionSpecs for
@@ -403,14 +534,19 @@ class OperationMetadata:
         b_sharding: jax.sharding.PartitionSpec = resolver.resolve(axes=[BATCH, BIAS_HEAD_SEQ, *qk_extern], mode=mode)
         m_sharding: jax.sharding.PartitionSpec = resolver.resolve(axes=[BATCH, None, *qk_extern], mode=mode)
 
-        # Softmax auxiliary output sharding (e.g., LSE, max) - 2D: [batch, num_heads]
+        # 1D logits are per-query-head only when their global length is Hq;
+        # every other length represents sinks SHARED by all query heads.
+        # Likewise a 2D leading singleton is shared; Hkv and Hq select a
+        # head axis (for MQA with Hkv=1 the singleton remains replicated).
         softmax_aux_sharding: jax.sharding.PartitionSpec | None = None
         if softmax_aux is not None:
-            num_dims: int = softmax_aux.ndim
-            if num_dims == 2:
-                softmax_aux_sharding = resolver.resolve(axes=[EMPTY, KV_HEAD], mode=mode)
+            head_sizes = {size for size in (num_q_heads, num_kv_heads) if size is not None and size > 1}
+            if softmax_aux.ndim == 2:
+                first_axis = HEAD if softmax_aux.shape[0] in head_sizes else EMPTY
+                softmax_aux_sharding = resolver.resolve(axes=[first_axis, EMPTY], mode=mode, shape=softmax_aux.shape)
             else:
-                softmax_aux_sharding = resolver.resolve(axes=[HEAD], mode=mode)
+                first_axis = HEAD if num_q_heads is not None and softmax_aux.shape[0] == num_q_heads else EMPTY
+                softmax_aux_sharding = resolver.resolve(axes=[first_axis], mode=mode, shape=softmax_aux.shape)
 
         query3d_sharding: jax.sharding.PartitionSpec = resolver.resolve(axes=[BATCH, HEAD, HEAD_DIM], mode=mode)
         rules: AttnShardingRules = AttnShardingRules(

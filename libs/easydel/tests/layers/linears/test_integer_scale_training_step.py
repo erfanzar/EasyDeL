@@ -12,7 +12,7 @@ from easydel.layers.quantization import QuantizationConfig
 from easydel.layers.quantization._quants import EasyQuantizer
 
 
-@pytest.mark.parametrize("mode", ["w4a16", "w8a16", "w4a4", "w8a8"])
+@pytest.mark.parametrize("mode", ["w4a16", "w8a16", "w4a8", "w4a4", "w8a8"])
 def test_quantized_lm_step_updates_scales_and_preserves_codes(mode):
     cfg = ed.LlamaConfig(
         hidden_size=32,
