@@ -292,6 +292,7 @@ def test_batch_metadata_exposes_penalty_rows():
     np.testing.assert_allclose(np.asarray(metadata.repetition_penalties), np.array([1.4, 1.0], dtype=np.float32))
 
 
+@pytest.mark.cpu_ok
 def test_oai_proxy_forwards_repetition_penalty():
     router = object.__new__(InferenceApiRouter)
 
@@ -302,7 +303,8 @@ def test_oai_proxy_forwards_repetition_penalty():
             repetition_penalty=1.7,
         )
     )
-    assert completion_params["repetition_penalty"] == pytest.approx(1.7)
+    assert "repetition_penalty" not in completion_params
+    assert completion_params["extra_body"]["repetition_penalty"] == pytest.approx(1.7)
 
     chat_params = router.build_oai_params_from_chat_request(
         ChatCompletionRequest(
@@ -311,7 +313,8 @@ def test_oai_proxy_forwards_repetition_penalty():
             repetition_penalty=1.3,
         )
     )
-    assert chat_params["repetition_penalty"] == pytest.approx(1.3)
+    assert "repetition_penalty" not in chat_params
+    assert chat_params["extra_body"]["repetition_penalty"] == pytest.approx(1.3)
 
 
 def test_sampling_params_rejects_non_positive_repetition_penalty():

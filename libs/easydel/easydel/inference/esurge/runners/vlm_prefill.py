@@ -37,6 +37,7 @@ from jax import numpy as jnp
 
 from easydel.utils.graph_jit import module_jit
 
+from ..multimodal.side_inputs import model_needs_token_types, prefill_embeds_dtype
 from ..utils import model_uses_mrope
 
 if typing.TYPE_CHECKING:
@@ -183,7 +184,7 @@ class VlmPrefillHelper:
             model = self.model_getter()
             hidden_size = int(getattr(model.config.get_text_config(), "hidden_size", 0) or 1)
 
-            prefill_embeds_cpu = np.zeros((num_tokens_static, hidden_size), dtype=np.float16)
+            prefill_embeds_cpu = np.zeros((num_tokens_static, hidden_size), dtype=prefill_embeds_dtype(model))
             prefill_embeds_mask_cpu = np.zeros((num_tokens_static,), dtype=bool)
 
             mrope_position_ids_cpu = None
@@ -492,6 +493,33 @@ class VlmPrefillHelper:
                 return
         logger.info("VLM vision feature precompilation finished")
 
+    def _precompute_token_type_prefill(self, req_state: CachedRequestState) -> None:
+        """Prepare the model-specific token-type image prefill using its declared hook.
+
+        The scheduler attaches image features with their placeholder ranges. This hook builds merged prompt embeddings
+        and token types, then the request state carries them through the regular prefill path.
+
+        Raises:
+            RuntimeError: If encoding fails (a request must never be served with raw placeholder embeddings).
+        """
+        model = self.model_getter()
+        compute_prefill_embeddings = getattr(type(model), "esurge_compute_prefill_embeddings", None)
+        if compute_prefill_embeddings is None:
+            raise RuntimeError("The model requires token-type prefill but declares no eSurge prefill hook.")
+        features = [f for f in req_state.mm_features if getattr(f, "pixel_values", None) is not None]
+        if not features:
+            req_state._vision_processed = True
+            return
+        try:
+            embeds, types = compute_prefill_embeddings(model, req_state.prompt_token_ids, features)
+        except Exception as exc:
+            logger.error("Image encode failed for req_id=%s: %s", req_state.req_id, exc)
+            raise RuntimeError(f"Image encode failed for req_id={req_state.req_id}: {exc}") from exc
+        req_state.prefill_inputs_embeds = embeds
+        req_state.token_types = types
+        # The patches stay on the shared features so a request re-created after preemption can re-encode.
+        req_state._vision_processed = True
+
     def precompute_prefill(self, req_state: CachedRequestState) -> None:
         """Precompute prompt embeddings (+ optional mRoPE indices) for VLM requests.
 
@@ -500,6 +528,10 @@ class VlmPrefillHelper:
         those parts eagerly here and store host-side arrays for later reuse.
         """
         if req_state.vision_processed:
+            return
+
+        if model_needs_token_types(self.model_getter()):
+            self._precompute_token_type_prefill(req_state)
             return
 
         uses_mrope = model_uses_mrope(self.model_getter())

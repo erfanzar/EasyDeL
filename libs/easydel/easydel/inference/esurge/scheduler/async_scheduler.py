@@ -57,7 +57,7 @@ from __future__ import annotations
 
 from eformer.loggings import get_logger
 
-from ..request import EngineRequest, EngineRequestStatus
+from ..request import EngineRequest
 from .output import SchedulerOutput
 from .scheduler import Scheduler
 
@@ -172,15 +172,14 @@ class AsyncScheduler(Scheduler):
         """Update request with newly generated tokens and manage placeholders.
 
         This method processes the actual tokens that were generated asynchronously
-        in a previous iteration. It updates the request state, decrements
-        placeholder counts, and caches KV blocks for non-preempted requests.
+        in a previous iteration. It updates the request state and decrements
+        placeholder counts. The caller publishes fully computed KV pages once
+        the model output is applied, including no-sample prefill steps.
 
         The update process:
-            1. Store current request status (may change during parent update)
-            2. Call parent implementation for token appending and stop checking
-            3. Decrement placeholder count by number of actual tokens received
-            4. Assert placeholders are non-negative (sanity check)
-            5. Cache KV blocks for running requests (skip preempted)
+            1. Call parent implementation for token appending and stop checking
+            2. Decrement placeholder count by number of actual tokens received
+            3. Assert placeholders are non-negative (sanity check)
 
         Args:
             request: The engine request to update. Must be a valid request
@@ -199,7 +198,6 @@ class AsyncScheduler(Scheduler):
             - Appends new_token_ids to request.output_token_ids (via parent)
             - Decrements request.num_output_placeholders
             - May update request.status if stop condition is met
-            - Caches KV blocks for running requests via kv_cache_manager
 
         Raises:
             AssertionError: If num_output_placeholders becomes negative,
@@ -209,23 +207,16 @@ class AsyncScheduler(Scheduler):
             Preempted requests are skipped for KV caching to avoid caching
             invalid or incomplete states that would be discarded anyway.
         """
-        # Store status before parent update (which may change it)
-        status_before_update = request.status
-
         new_token_ids, stopped = super()._update_request_with_output(request, new_token_ids)
 
-        # Decrement placeholder count by number of actual tokens received
+        # Decrement placeholder count by number of actual tokens received.
         request.num_output_placeholders -= len(new_token_ids)
 
-        # Sanity check: placeholders should never go negative
+        # Sanity check: placeholders should never go negative.
         assert request.num_output_placeholders >= 0, (
             f"Request {request.request_id} has negative placeholders: {request.num_output_placeholders}"
         )
 
-        # Cache the new tokens for running requests (skip preempted).
-        # Use only the fully materialized token count, excluding any
-        # optimistic placeholders that still belong to prefetched steps.
-        if status_before_update == EngineRequestStatus.RUNNING:
-            self.kv_cache_manager.cache_pages(request, request.num_computed_tokens - request.num_output_placeholders)
-
+        # The base scheduler publishes pages after the model output is applied,
+        # including chunked-prefill steps with no sampled tokens.
         return new_token_ids, stopped

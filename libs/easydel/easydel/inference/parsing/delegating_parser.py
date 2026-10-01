@@ -24,6 +24,7 @@ Design inspired by a delegating parser pattern.
 from __future__ import annotations
 
 import enum
+import json
 import logging
 from dataclasses import dataclass
 
@@ -282,12 +283,18 @@ class DelegatingParser:
             missing_name = function_name if state is None or not state.function_name else None
             if state is None:
                 missing_arguments = function_arguments
+            elif function_arguments == state.function_arguments:
+                missing_arguments = ""
             elif function_arguments.startswith(state.function_arguments):
                 missing_arguments = function_arguments[len(state.function_arguments) :]
-            elif function_arguments != state.function_arguments:
-                missing_arguments = function_arguments
-            else:
+            elif self._arguments_payload_is_equivalent(function_arguments, state.function_arguments):
+                # The streamed deltas already carried the same payload in a
+                # different serialization (e.g. compact vs. default JSON
+                # separators). Re-sending the final text would make the
+                # concatenated argument stream invalid JSON.
                 missing_arguments = ""
+            else:
+                missing_arguments = function_arguments
 
             if not missing_name and not missing_arguments:
                 continue
@@ -305,6 +312,24 @@ class DelegatingParser:
             )
 
         return synthesized or None
+
+    @staticmethod
+    def _arguments_payload_is_equivalent(first: str, second: str) -> bool:
+        """Compare two JSON argument strings by decoded value.
+
+        Args:
+            first: First argument JSON string (final, batch-extracted).
+            second: Second argument JSON string (accumulated stream).
+
+        Returns:
+            ``True`` when both decode to equal payloads. Strings that fail
+            to decode are never considered equivalent, so callers still
+            fall back to text-level catch-up for malformed streams.
+        """
+        try:
+            return json.loads(first) == json.loads(second)
+        except Exception:
+            return False
 
     def _canonicalize_reasoning_content(
         self,

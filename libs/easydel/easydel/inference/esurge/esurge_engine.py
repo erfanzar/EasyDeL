@@ -767,6 +767,7 @@ class eSurge:
             vision_patch_buckets=self.vision_config.vision_patch_buckets,
             drafter=drafter,
         )
+        self._install_side_input_tokenizer_state()
 
         if self.runtime_config.compile_runner:
             # Limit compilation to the scheduler's per-step token budget when provided.
@@ -1052,6 +1053,20 @@ class eSurge:
         """
 
         self._sampling_params_callback = callback
+
+    def _install_side_input_tokenizer_state(self) -> None:
+        """Install optional tokenizer-derived state of a model that declares per-token side inputs."""
+        from .multimodal.side_inputs import model_has_side_inputs
+
+        model = getattr(self.runner, "model", None)
+        if model is None or not model_has_side_inputs(model):
+            return
+        prepare = getattr(type(model), "esurge_prepare_tokenizer", None)
+        if prepare is None:
+            return
+        state = prepare(getattr(self, "tokenizer", None), model.config)
+        if state is not None:
+            self.runner.set_side_input_tokenizer_state(state)
 
     def _apply_data_parallel_axis_to_model(self, model: EasyDeLBaseModule) -> None:
         """Keep model partition axes unchanged.
@@ -1668,6 +1683,9 @@ class eSurge:
         abort. A best-effort log line records the before/after queue
         counts for postmortem.
         """
+        # A finished output may still have live scheduler rows or remote
+        # subscribers; always run cleanup before deciding which output fields
+        # must be preserved.
         plane = getattr(self, "_request_plane", None)
         if plane is not None:
             if plane.owns_scheduling:
@@ -1706,11 +1724,27 @@ class eSurge:
             # Resolve scheduler-side IDs to abort (n=1: request_id; n>1: children of parent)
             if request_id in self.scheduler.requests:
                 abort_ids.add(request_id)
-                parent_request_id = self.scheduler.requests[request_id].parent_request_id or parent_request_id
+                live_request = self.scheduler.requests[request_id]
+                parent_request_id = live_request.parent_request_id or parent_request_id
+                if rd is None:
+                    # A finished n>1 child loses its active record before its row is freed; take the
+                    # sample slot from the live scheduler row instead of defaulting to sibling 0.
+                    sample_index = int(getattr(live_request, "sample_index", 0) or 0)
             abort_ids.update(
                 rid
                 for rid, req in self.scheduler.requests.items()
                 if getattr(req, "parent_request_id", None) == request_id
+            )
+
+            # Terminal output state is independent of scheduler cleanup: a
+            # stop-string can finish the output before its row is released.
+            current_output = self._request_outputs.get(parent_request_id)
+            output_finished = current_output is not None and current_output.finished
+            sample_finished = (
+                current_output is not None
+                and request_id != parent_request_id
+                and 0 <= sample_index < len(current_output.outputs)
+                and current_output.outputs[sample_index].finish_reason is not None
             )
 
             if abort_ids:
@@ -1739,11 +1773,14 @@ class eSurge:
             ro = self._request_outputs.get(parent_request_id)
             ro_present = ro is not None
             n_samples = len(ro.outputs) if ro is not None else 0
-            if ro is not None:
+            if output_finished or sample_finished:
+                logger.debug("Preserving finished output for aborted request %s", request_id)
+            elif ro is not None:
                 if request_id == parent_request_id:
                     ro.finished = True
                     for output in ro.outputs:
-                        output.finish_reason = "abort"
+                        if output.finish_reason is None:
+                            output.finish_reason = "abort"
                     if metrics_collector:
                         metrics_collector.complete_request(parent_request_id, finish_reason="abort")
                 else:
@@ -1759,7 +1796,7 @@ class eSurge:
             after_running = len(self.scheduler.running)
             after_waiting = len(self.scheduler.waiting)
 
-            if not detokenizer_reset_ids:
+            if not detokenizer_reset_ids and not (output_finished or sample_finished):
                 detokenizer_reset_ids.add(request_id)
 
         # Reset detokenizer state (outside locks to avoid blocking)
@@ -1789,6 +1826,9 @@ class eSurge:
                 after_running,
                 after_waiting,
             )
+        elif output_finished or sample_finished:
+            # Repeat/late abort of an already finished request (e.g. an abandoned stream's retry).
+            logger.debug("Abort for already finished request %s; nothing left to cancel", request_id)
         else:
             logger.warning(
                 "Abort requested for %s but no live scheduler requests matched. "

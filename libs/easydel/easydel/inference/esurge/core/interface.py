@@ -727,13 +727,29 @@ def create_kv_cache_specs_from_config(
         # BEFORE grouping so geometry-equal LINEAR and FULL layers merge
         # into one cache group instead of inflating page demand.
         mask_type = detail.mask_type
+        detail_size = detail.size
+        detail_chunks = detail.chunks
         if mask_type == AttnMaskType.LINEAR:
             mask_type = AttnMaskType.FULL
+        # The ragged paged-attention kernels take a sliding window but no
+        # chunk size, and the runner feeds the FULL group's page table to every
+        # layer. A ``ChunkedLocalAttentionSpec`` group would let its manager
+        # free pages of earlier chunks while the kernel still reads them (and
+        # would be the fallback table when no FULL group exists), so chunked
+        # layers keep every page valid by grouping with full attention until
+        # the kernel can honour the chunk mask. ``size``/``chunks`` are
+        # irrelevant to ``FullAttentionSpec`` so they are dropped from the key
+        # to let geometry-equal layers merge into one group.
+        if mask_type == AttnMaskType.CHUNK:
+            mask_type = AttnMaskType.FULL
+        if mask_type == AttnMaskType.FULL:
+            detail_size = None
+            detail_chunks = None
         groups[
             (
                 mask_type,
-                detail.size,
-                detail.chunks,
+                detail_size,
+                detail_chunks,
                 layer_num_kv_heads,
                 layer_head_size,
             )

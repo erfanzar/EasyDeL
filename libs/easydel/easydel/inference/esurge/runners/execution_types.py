@@ -189,6 +189,10 @@ class BatchMetadata:
     visual_pos_masks: jax.Array | None = None
     deepstack_visual_embeds: tuple[jax.Array, ...] | None = None
 
+    # Model-declared per-token side inputs ``{name: [num_tokens, *per_token_shape]}`` (None unless the model declares
+    # ``esurge_side_input_specs``; see ``multimodal/side_inputs.py``). Passed to the forward as ``[1, T, ...]`` kwargs.
+    model_side_inputs: dict[str, jax.Array] | None = None
+
     spec_recurrent_commit: jax.Array | None = None
 
     @property

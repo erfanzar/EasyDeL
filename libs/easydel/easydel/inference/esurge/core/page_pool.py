@@ -192,16 +192,29 @@ class PagePool:
         if num_cached_pages == 0:
             prev_page_hash_value = None
         else:
-            # Find the last page with a hash (skip null pages which don't have hashes)
-            # This is important for sliding window where early pages may be null
-            prev_page_hash_value = None
-            for idx in range(num_cached_pages - 1, -1, -1):
-                prev_page = pages[idx]
-                if prev_page.page_hash is not None:
-                    prev_page_hash_value = prev_page.page_hash.get_hash_value()
-                    break
+            # ``page_hashes`` is index-aligned with the request's pages, so the
+            # parent is always the hash of page ``num_cached_pages - 1``. Do not
+            # walk ``pages`` backward: sliding-window / chunked-local groups may
+            # have replaced that page with ``null_page``, and an earlier page's
+            # (or a ``None``) parent would publish the next page under a wrong
+            # chain that a different prompt can then falsely hit.
+            prev_page_hash_value = page_hashes[num_cached_pages - 1].hash_value
 
         for i, blk in enumerate(new_full_pages):
+            if blk.is_null:
+                # Sliding-window / chunked-local managers may have replaced an
+                # out-of-window page with the shared null placeholder before
+                # this deferred publication ran. Never publish it as a prefix
+                # hit, but keep the hash chain advancing for later pages.
+                if i < len(new_page_hashes):
+                    prev_page_hash_value = new_page_hashes[i].hash_value
+                else:
+                    blk_idx = num_cached_pages + i
+                    page_tokens = request.all_token_ids[blk_idx * page_size : (blk_idx + 1) * page_size]
+                    null_hash = hash_page_tokens(hash, prev_page_hash_value, page_tokens, None)
+                    page_hashes.append(null_hash)
+                    prev_page_hash_value = null_hash.hash_value
+                continue
             if blk.page_hash is not None:
                 raise RuntimeError(
                     f"Expected page_hash to be None for new full page at index {i}, but got {blk.page_hash}"

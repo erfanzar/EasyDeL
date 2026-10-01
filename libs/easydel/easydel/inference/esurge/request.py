@@ -123,6 +123,7 @@ class EngineRequest:
         pixel_values_videos: np.ndarray | None = None,
         video_grid_thw: np.ndarray | None = None,
         mm_features: list["MultiModalFeature"] | None = None,
+        images: list[np.ndarray] | None = None,
     ) -> None:
         """Initialize EngineRequest.
 
@@ -141,6 +142,9 @@ class EngineRequest:
             pixel_values_videos: Video pixel values for VLMs.
             video_grid_thw: Grid shape (T, H, W) for each video.
             mm_features: List of multimodal features with metadata.
+            images: Raw ``uint8 [H, W, 3]`` images for models whose scheduler expands image placeholders
+                (DeepSeek-V4.1). ``prompt_token_ids`` must hold one ``image_token_id`` per image; the scheduler
+                expands each into the full image span at ``add_request``.
         """
         self.request_id = request_id
         self.client_index = client_index
@@ -188,6 +192,33 @@ class EngineRequest:
         self.video_grid_thw = video_grid_thw
         self.mm_features: list["MultiModalFeature"] = mm_features or []
         self._vision_processed = False
+        # Raw images awaiting placeholder expansion plus the layout the expansion produces.
+        self.images = images
+        self.token_types: np.ndarray | None = None
+        self.image_spans: list[tuple[int, int]] = []
+
+    def set_expanded_prompt(
+        self,
+        token_ids: list[int],
+        token_types: np.ndarray,
+        spans: list[tuple[int, int]],
+        features: list["MultiModalFeature"],
+    ) -> None:
+        """Replace the prompt with its image-expanded form (called by the scheduler at admission).
+
+        Args:
+            token_ids: Expanded prompt ids.
+            token_types: ``int64 [len(token_ids)]`` image-span token types (``-1`` text).
+            spans: Half-open ``(start, stop)`` position range of each image span.
+            features: One multimodal feature per image (carries the patches).
+        """
+        self.prompt_token_ids = list(token_ids)
+        self.num_prompt_tokens = len(self.prompt_token_ids)
+        self._all_token_ids[:] = self.prompt_token_ids
+        self.token_types = token_types
+        self.image_spans = list(spans)
+        self.mm_features = list(features)
+        self.images = None
 
     @property
     def has_vision(self) -> bool:

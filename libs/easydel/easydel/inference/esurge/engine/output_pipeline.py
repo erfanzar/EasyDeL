@@ -556,6 +556,12 @@ class OutputPipeline:
 
         if finished:
             result = dp.process_final(accumulated_text, token_ids)
+            # Batch extraction creates fresh ToolCall ids. Preserve the ids
+            # already announced in streaming deltas for the same indices.
+            for index, call in enumerate(result.tool_calls or []):
+                state = dp._streamed_tool_call_state.get(index)
+                if state is not None and state.tool_call_id:
+                    call.id = state.tool_call_id
         else:
             result = dp.process_delta(accumulated_text, delta_text, token_ids, prev_text, prev_token_ids)
 

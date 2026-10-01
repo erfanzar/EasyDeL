@@ -130,6 +130,45 @@ def _recurrent_view_of(view: typing.Any, recurrent_cls: type, parallel_cls: type
     return None
 
 
+class _CompressedWindowSnapshot(typing.NamedTuple):
+    """Device copy of a whole compressed-window cache (every leaf), taken before a speculative verify window."""
+
+    treedef: typing.Any
+    leaves: list[typing.Any]
+    array_indices: list[int]
+    copied: list[jax.Array]
+
+
+def _is_compressed_window_cache(cache: typing.Any) -> bool:
+    """Whether ``cache`` is a per-slot compressed-window cache (DeepSeek-V4 / V4.1)."""
+    from easydel.caching import CompressedWindowCache
+    from easydel.caching.compressed_window import SharedCompressedWindowCache
+
+    return isinstance(cache, CompressedWindowCache | SharedCompressedWindowCache)
+
+
+def _snapshot_compressed_window(cache: typing.Any) -> _CompressedWindowSnapshot:
+    """Copy every array leaf of a compressed-window cache in one fused dispatch.
+
+    Ring / compressor / indexer state advances irreversibly on every consumed token, so rejected draft tokens can only
+    be rolled back by restoring a pre-verify copy and replaying the accepted prefix.
+    """
+    leaves, treedef = jax.tree_util.tree_flatten(cache)
+    indices = [i for i, leaf in enumerate(leaves) if isinstance(leaf, jax.Array)]
+    copied = _jit_copy_arrays([leaves[i] for i in indices])
+    kept = [None if isinstance(leaf, jax.Array) else leaf for leaf in leaves]
+    return _CompressedWindowSnapshot(treedef, kept, indices, copied)
+
+
+def _restore_compressed_window(snapshot: _CompressedWindowSnapshot) -> typing.Any:
+    """Rebuild the cache from fresh copies of the snapshot (it survives the donation of each replay forward)."""
+    fresh = _jit_copy_arrays(snapshot.copied)
+    leaves = list(snapshot.leaves)
+    for index, array in zip(snapshot.array_indices, fresh, strict=True):
+        leaves[index] = array
+    return jax.tree_util.tree_unflatten(snapshot.treedef, leaves)
+
+
 def _snapshot_recurrent_state(kv_pages: typing.Any) -> typing.Any:
     """Snapshot only the recurrent leaves of a hybrid KV cache for spec rollback.
 
@@ -157,6 +196,8 @@ def _snapshot_recurrent_state(kv_pages: typing.Any) -> typing.Any:
     """
     from easydel.caching import ParallelHybridCacheView, RecurrentCacheView
 
+    if _is_compressed_window_cache(kv_pages):
+        return _snapshot_compressed_window(kv_pages)
     views = getattr(kv_pages, "views", None)
     if views is None:
         return None
@@ -202,6 +243,8 @@ def _restore_recurrent_state(live_kv_pages: typing.Any, snapshot: typing.Any) ->
     """
     from easydel.caching import HybridCache
 
+    if isinstance(snapshot, _CompressedWindowSnapshot):
+        return _restore_compressed_window(snapshot)
     if snapshot is None:
         return live_kv_pages
     layout, copied = snapshot
@@ -315,6 +358,10 @@ class DrafterSpeculation:
         self._mtp_row_by_req: dict[str, int] = {}
         self._mtp_row_free: list[int] = []
         self._mtp_row_capacity: int = 0
+        # Whole-block drafters (DSpark): the hidden rows of the step being verified and, per request, its
+        # ``(row offset, first position, token count)`` there; refreshed every step by ``observe_window_hidden``.
+        self._whole_block_hidden: jax.Array | None = None
+        self._whole_block_window: dict[str, tuple[int, int, int]] = {}
 
     def _stable_drafter_row(self, req_id: str, fallback_row: int) -> int:
         """Return this request's lifetime-stable row in the pooled MTP cache.
@@ -475,6 +522,8 @@ class DrafterSpeculation:
         self._mtp_row_by_req.clear()
         self._mtp_row_free = []
         self._mtp_row_capacity = 0
+        self._whole_block_hidden = None
+        self._whole_block_window.clear()
         self.live_num_draft_tokens = int(self.num_draft_tokens)
         if self.drafter is not None:
             try:
@@ -1070,6 +1119,9 @@ class DrafterSpeculation:
         Returns:
             Vocabulary logits of shape ``[num_rows, vocab_size]``.
         """
+        if bool(getattr(self.drafter, "needs_main_hidden", False)):
+            # DSpark: model-step rows are ``last_hidden | main_hidden``; the LM head only sees the first part.
+            hidden_rows = hidden_rows[..., : int(self._runner.model.config.get_text_config().hidden_size)]
         num_rows = int(hidden_rows.shape[0])
         model_executor = self._runner.executor_manager._model_executor
         try:
@@ -1363,6 +1415,15 @@ class DrafterSpeculation:
             self._backoff_by_req[str(req_id)] = backoff - 1
             self._mtp_persist_checkpoint_skipped_window(str(req_id), int(seed_position))
             return []
+        if bool(getattr(self.drafter, "whole_block_draft", False)):
+            return self._draft_next_whole_block(
+                req_id=str(req_id),
+                seed_token=int(seed_token),
+                seed_position=int(seed_position),
+                req_state=req_state,
+                row_pos=int(row_pos),
+                k=k_live,
+            )
         use_prefix = (
             prefix_input_ids is not None
             and prefix_hidden_states is not None
@@ -1561,6 +1622,98 @@ class DrafterSpeculation:
         self.num_drafts_generated += len(drafted)
         if not greedy and draft_fulls:
             self.draft_full_log_probs_by_req[str(req_id)] = jnp.stack(draft_fulls, axis=0)
+        return drafted
+
+    @property
+    def rolls_back_cache(self) -> bool:
+        """Whether rejected drafts need snapshot-restore-replay of the (non-paged) per-slot cache (DSpark)."""
+        return bool(getattr(self.drafter, "rolls_back_cache", False))
+
+    @property
+    def acceptance_rate(self) -> float:
+        """Fraction of proposed draft tokens the target accepted so far (``0.0`` before any draft)."""
+        generated = int(self.num_drafts_generated)
+        return float(self.num_drafts_accepted) / generated if generated else 0.0
+
+    def observe_window_hidden(
+        self,
+        hidden_states: jax.Array | None,
+        *,
+        req_ids_window: list[str | None],
+        scheduled_list: typing.Sequence[int],
+        token_offsets: np.ndarray,
+        start_positions: np.ndarray,
+        scheduled_spec: dict[str, list[int]],
+    ) -> None:
+        """Hand the hidden rows of the step just executed to a whole-block drafter (DSpark).
+
+        Registers, for every greedy spec-eligible request of the window, where its rows sit in ``hidden_states`` and
+        lets the drafter write the main K/V of its committed (real, non-draft) tokens into its rings.
+
+        Args:
+            hidden_states: Full step hidden rows ``[N, (1 + T) * D]`` (``None`` when unavailable).
+            req_ids_window: Window-local request ids (``None`` for idle rows).
+            scheduled_list: Scheduled tokens per window row (real + draft tokens).
+            token_offsets: First hidden row of every window row.
+            start_positions: Position of every window row's first scheduled token.
+            scheduled_spec: Scheduler draft tokens per request id.
+        """
+        self._whole_block_hidden = hidden_states
+        self._whole_block_window = {}
+        if self.drafter is None:
+            return
+        self.drafter.ensure_batch_size(max(1, int(getattr(self._runner, "max_num_reqs", 1))))
+        hidden_len = 0 if hidden_states is None else int(hidden_states.shape[0])
+        entries: list[tuple[str, int, int, int, int, int]] = []
+        for row_pos, rid in enumerate(req_ids_window):
+            if rid is None:
+                continue
+            count = int(scheduled_list[row_pos])
+            req_state = self._runner.requests.get(rid)
+            if count <= 0 or req_state is None:
+                continue
+            if not self.is_spec_request(req_state) or not self.is_greedy_request(req_state):
+                continue
+            offset = int(token_offsets[row_pos])
+            start = int(start_positions[row_pos])
+            real = max(0, count - len(scheduled_spec.get(rid, ())))
+            req_idx = self._runner.sequence_buffer.req_id_to_index.get(rid, row_pos)
+            row = self._stable_drafter_row(str(rid), int(req_idx))
+            self._whole_block_window[str(rid)] = (offset, start, count)
+            entries.append((str(rid), row, offset, start, real if offset + count <= hidden_len else -1, count))
+        self.drafter.observe_window(hidden_states, entries)
+
+    def _draft_next_whole_block(
+        self,
+        *,
+        req_id: str,
+        seed_token: int,
+        seed_position: int,
+        req_state: CachedRequestState | None,
+        row_pos: int,
+        k: int,
+    ) -> list[int]:
+        """Draft a whole window with a whole-block drafter from the hidden rows of the last observed step."""
+        if not self.is_greedy_request(req_state):
+            return []
+        info = self._whole_block_window.get(req_id)
+        hidden = self._whole_block_hidden
+        if info is None or hidden is None:
+            return []
+        offset, start, count = info
+        row = self._stable_drafter_row(req_id, row_pos)
+        drafted = self.drafter.draft_window(
+            req_id=req_id,
+            row=row,
+            seed_token=seed_token,
+            seed_position=seed_position,
+            hidden=hidden,
+            offset=offset,
+            start=start,
+            n=count,
+            k=k,
+        )
+        self.num_drafts_generated += len(drafted)
         return drafted
 
     def can_batch_draft(self, req_state: CachedRequestState | None) -> bool:
@@ -2097,6 +2250,8 @@ class DrafterSpeculation:
         state is a single rolling row, so they need either candidate
         rows or an explicit replay from the pre-verify snapshot.
         """
+        if self.rolls_back_cache:
+            return True
         if not self.cache_has_recurrent_state():
             return False
         return self.recurrent_candidate_count() <= 0

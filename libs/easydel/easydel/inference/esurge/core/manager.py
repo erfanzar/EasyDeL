@@ -82,7 +82,6 @@ class CachePages:
         """
         return tuple([blk.page_id for blk in group] for group in self.pages)
 
-
     def new_empty(self) -> "CachePages":
         """Create an empty CachePages instance with the same structure.
 
@@ -323,7 +322,6 @@ class CacheManager:
         num_new_computed_tokens: int = 0,
         new_computed_pages: CachePages | None = None,
         num_lookahead_tokens: int = 0,
-        delay_cache_pages: bool = False,
         dp_shard_hint: int | None = None,
         data_parallel_size: int | None = None,
     ) -> CachePages | None:
@@ -341,9 +339,6 @@ class CacheManager:
             num_lookahead_tokens: The number of speculative tokens to allocate.
                 This is used by spec decode proposers with kv-cache such
                 as eagle.
-            delay_cache_pages: Whether to skip caching the pages. This is
-                used by P/D when allocating pages used in a KV transfer
-                which will complete in a future step.
             dp_shard_hint: Optional request shard hint for DP-local page
                 allocation. When provided with ``data_parallel_size > 1``,
                 new pages are preferentially allocated from that shard's
@@ -420,16 +415,10 @@ class CacheManager:
                     self.page_pool.free_pages(computed_group_pages)
             return None
 
-        if not self.enable_caching or delay_cache_pages:
-            return CachePages(new_pages)
-
-        num_tokens_to_cache = min(num_computed_tokens + num_new_tokens, request.num_tokens)
-        self.coordinator.cache_pages(
-            request,
-            self.req_to_page_hashes[request.request_id],
-            num_tokens_to_cache,
-        )
-
+        # Do not publish newly allocated pages as prefix hits before the model
+        # has populated them. Another request in this same scheduling cycle may
+        # have an identical prompt and otherwise skip to uninitialized KV data.
+        # Scheduler.update_from_output publishes fully computed pages instead.
         return CachePages(new_pages)
 
     def free(self, request: EngineRequest) -> None:

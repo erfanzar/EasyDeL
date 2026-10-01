@@ -51,7 +51,7 @@ from ...openai_api_modules import (
     ToolCall,
 )
 from ..abstract_tool import ToolParser, ToolParserManager
-from ..utils import extract_intermediate_diff
+from ..utils import stable_json_stream_prefix
 
 logger = get_logger(__name__)
 
@@ -215,34 +215,33 @@ class Internlm2ToolParser(ToolParser):
                 elif not cur_arguments and prev_arguments:
                     logger.error("INVARIANT - impossible to have arguments reset mid-arguments")
                     delta = None
-                elif cur_arguments and not prev_arguments:
-                    cur_arguments_json = json.dumps(cur_arguments, ensure_ascii=False)
-
-                    arguments_delta = cur_arguments_json[: cur_arguments_json.index(delta_text) + len(delta_text)]
-                    delta = DeltaMessage(
-                        tool_calls=[
-                            DeltaToolCall(
-                                index=self.current_tool_id,
-                                function=DeltaFunctionCall(arguments=arguments_delta).model_dump(exclude_none=True),
-                            )
-                        ]
-                    )
-                    self.streamed_args_for_tool[self.current_tool_id] += arguments_delta
-                elif cur_arguments and prev_arguments:
+                elif cur_arguments:
+                    # Stream only the prefix-stable part of the serialized
+                    # arguments. Trailing closing characters are withheld
+                    # because a partial JSON fill can still change them (an
+                    # unterminated string grows, the object may gain keys),
+                    # and the delta is an extension of everything already
+                    # streamed, so concatenating the deltas always yields a
+                    # prefix of valid JSON (completed by the final batch
+                    # extraction catch-up).
                     cur_args_json = json.dumps(cur_arguments, ensure_ascii=False)
-                    prev_args_json = json.dumps(prev_arguments, ensure_ascii=False)
+                    # Also withholds an unfinished trailing number (r12 S12-1).
+                    safe_json = stable_json_stream_prefix(cur_args_json)
 
-                    argument_diff = extract_intermediate_diff(cur_args_json, prev_args_json)
-
-                    delta = DeltaMessage(
-                        tool_calls=[
-                            DeltaToolCall(
-                                index=self.current_tool_id,
-                                function=DeltaFunctionCall(arguments=argument_diff).model_dump(exclude_none=True),
-                            )
-                        ]
-                    )
-                    self.streamed_args_for_tool[self.current_tool_id] += argument_diff
+                    sent = self.streamed_args_for_tool[self.current_tool_id]
+                    arguments_delta = safe_json[len(sent) :] if safe_json.startswith(sent) else ""
+                    if arguments_delta:
+                        delta = DeltaMessage(
+                            tool_calls=[
+                                DeltaToolCall(
+                                    index=self.current_tool_id,
+                                    function=DeltaFunctionCall(arguments=arguments_delta).model_dump(exclude_none=True),
+                                )
+                            ]
+                        )
+                        self.streamed_args_for_tool[self.current_tool_id] += arguments_delta
+                    else:
+                        delta = None
 
             tool_call_arr["arguments"] = self.get_arguments(tool_call_arr)
             self.prev_tool_call_arr = [tool_call_arr]

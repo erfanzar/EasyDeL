@@ -53,7 +53,6 @@ from ...openai_api_modules import (
     ToolCall,
 )
 from ..abstract_tool import ToolParser, ToolParserManager
-from ..utils import extract_intermediate_diff
 
 logger = get_logger(__name__)
 
@@ -427,6 +426,21 @@ class MinimaxToolParser(ToolParser):
             "sent_tools": [],
         }
 
+    @staticmethod
+    def _is_complete_json_object(text: str) -> bool:
+        """Return whether ``text`` is a complete JSON object.
+
+        Args:
+            text: Candidate arguments text.
+
+        Returns:
+            ``True`` when ``text`` parses as a JSON object.
+        """
+        try:
+            return isinstance(json.loads(text), dict)
+        except ValueError:
+            return False
+
     def _advance_to_next_tool(self) -> None:
         """Advance to the next tool in the streaming sequence.
 
@@ -698,41 +712,30 @@ class MinimaxToolParser(ToolParser):
         clean_args = self._clean_duplicate_braces(tool_args)
         sent_args = sent_tools[current_idx]["sent_arguments"]
 
-        if clean_args != sent_args:
-            if sent_args and clean_args.startswith(sent_args):
-                args_delta = extract_intermediate_diff(clean_args, sent_args)
-                if args_delta:
-                    args_delta = self._clean_delta_braces(args_delta)
-                    sent_tools[current_idx]["sent_arguments"] = clean_args
-                    self.streaming_state["sent_tools"] = sent_tools
+        if clean_args != sent_args and clean_args:
+            # Diff against the exact bytes already sent to the client.  A
+            # pretty-printed partial argument may contain repeated substrings
+            # or several closing braces (nested JSON); neither a general diff
+            # nor brace collapsing is safe for append-only argument deltas.
+            args_delta = clean_args[len(sent_args) :] if clean_args.startswith(sent_args) else clean_args
+            sent_tools[current_idx]["sent_arguments"] = clean_args
+            self.streaming_state["sent_tools"] = sent_tools
 
-                    if clean_args.endswith("}"):
-                        self._advance_to_next_tool()
+            # Advance only once the arguments object is complete JSON. A textual
+            # trailing ``}`` also appears mid-object for pretty-printed nested
+            # arguments (``{\n "a": {\n "b": 1\n }\n``), and advancing there would
+            # strand the outer object's remaining text.
+            if self._is_complete_json_object(clean_args):
+                self._advance_to_next_tool()
 
-                    return DeltaMessage(
-                        tool_calls=[
-                            DeltaToolCall(
-                                index=current_idx,
-                                function=DeltaFunctionCall(arguments=args_delta).model_dump(exclude_none=True),
-                            )
-                        ]
+            return DeltaMessage(
+                tool_calls=[
+                    DeltaToolCall(
+                        index=current_idx,
+                        function=DeltaFunctionCall(arguments=args_delta).model_dump(exclude_none=True),
                     )
-            elif not sent_args and clean_args:
-                clean_args_delta = self._clean_delta_braces(clean_args)
-                sent_tools[current_idx]["sent_arguments"] = clean_args
-                self.streaming_state["sent_tools"] = sent_tools
-
-                if clean_args.endswith("}"):
-                    self._advance_to_next_tool()
-
-                return DeltaMessage(
-                    tool_calls=[
-                        DeltaToolCall(
-                            index=current_idx,
-                            function=DeltaFunctionCall(arguments=clean_args_delta).model_dump(exclude_none=True),
-                        )
-                    ]
-                )
+                ]
+            )
 
         return None
 

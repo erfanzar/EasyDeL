@@ -615,6 +615,11 @@ class RemoteEngineHandle:
                     if snapshot.finished:
                         return
         finally:
+            with self._registry.output_lock:
+                output = self._registry.outputs.get(rid)
+                unfinished = output is not None and not output.finished
+            if unfinished:
+                self.abort_request(rid)
             with self._registry.request_lock:
                 self._registry.events.pop(rid, None)
 

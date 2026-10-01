@@ -139,7 +139,7 @@ class FunctionGemmaToolParser(ToolParser):
                 return len(token), True
         return 0, False
 
-    def _split_top_level(self, text: str, separator: str) -> list[str]:
+    def _split_top_level(self, text: str, separator: str, *, complete_only: bool = False) -> list[str]:
         """Split ``text`` on ``separator`` while respecting nested JSON-like syntax.
 
         Brace / bracket nesting depth and escape-delimited string regions are
@@ -150,6 +150,8 @@ class FunctionGemmaToolParser(ToolParser):
         Args:
             text: Argument-block text to segment.
             separator: Single-character delimiter to split on at top level.
+            complete_only: Return only segments terminated by the separator or
+                the call's closing brace, excluding any unfinished last value.
 
         Returns:
             List of top-level segments in their original order.
@@ -174,6 +176,9 @@ class FunctionGemmaToolParser(ToolParser):
                 if char == "{":
                     depth_brace += 1
                 elif char == "}":
+                    if complete_only and depth_brace == 0 and depth_bracket == 0:
+                        segments.append(text[start:index])
+                        return segments
                     depth_brace = max(0, depth_brace - 1)
                 elif char == "[":
                     depth_bracket += 1
@@ -184,7 +189,8 @@ class FunctionGemmaToolParser(ToolParser):
                     start = index + 1
             index += 1
 
-        segments.append(text[start:])
+        if not complete_only:
+            segments.append(text[start:])
         return segments
 
     def _split_key_value(self, text: str) -> tuple[str, str] | None:
@@ -479,24 +485,35 @@ class FunctionGemmaToolParser(ToolParser):
                             )
 
                         if self.current_tool_name_sent and args_part:
-                            current_args = self._parse_arguments(args_part)
+                            # Wait for a top-level delimiter before normalizing
+                            # a value: bare prefixes like "t", "-", or "1e"
+                            # otherwise change from strings/numbers into different
+                            # JSON types or representations as more text arrives.
+                            segments = self._split_top_level(args_part, ",", complete_only=True)
+                            current_args = self._parse_arguments(",".join(segments))
                             if current_args:
                                 current_args_json = json.dumps(current_args, ensure_ascii=False)
+                                # Completed values are stable. Withhold only the
+                                # outer object brace so later arguments can extend
+                                # this exact JSON prefix without replacing text.
+                                safe_json = current_args_json[:-1]
+
                                 prev_streamed = self.streamed_args_for_tool[self.current_tool_id]
-
-                                if len(current_args_json) > len(prev_streamed):
-                                    diff = current_args_json[len(prev_streamed) :]
-                                    self.streamed_args_for_tool[self.current_tool_id] = current_args_json
-                                    self.prev_tool_call_arr[self.current_tool_id]["arguments"] = current_args
-
-                                    return DeltaMessage(
-                                        tool_calls=[
-                                            DeltaToolCall(
-                                                index=self.current_tool_id,
-                                                function=DeltaFunctionCall(arguments=diff).model_dump(exclude_none=True),
-                                            )
-                                        ]
-                                    )
+                                if safe_json and safe_json.startswith(prev_streamed):
+                                    diff = safe_json[len(prev_streamed) :]
+                                    if diff:
+                                        self.streamed_args_for_tool[self.current_tool_id] = safe_json
+                                        self.prev_tool_call_arr[self.current_tool_id]["arguments"] = current_args
+                                        return DeltaMessage(
+                                            tool_calls=[
+                                                DeltaToolCall(
+                                                    index=self.current_tool_id,
+                                                    function=DeltaFunctionCall(arguments=diff).model_dump(
+                                                        exclude_none=True
+                                                    ),
+                                                )
+                                            ]
+                                        )
 
                 return None
 
@@ -515,8 +532,12 @@ class FunctionGemmaToolParser(ToolParser):
                     if args:
                         args_json = json.dumps(args, ensure_ascii=False)
                         prev_streamed = self.streamed_args_for_tool[self.current_tool_id]
-                        if len(args_json) > len(prev_streamed):
-                            diff = args_json[len(prev_streamed) :]
+                        # Only ever extend what was already streamed. If the final
+                        # arguments are not an extension, re-sending them here would
+                        # concatenate into invalid JSON; the terminal catch-up
+                        # (DelegatingParser / the mixin's finished=True) reconciles.
+                        diff = args_json[len(prev_streamed) :] if args_json.startswith(prev_streamed) else ""
+                        if diff:
                             self.streamed_args_for_tool[self.current_tool_id] = args_json
                             return DeltaMessage(
                                 tool_calls=[

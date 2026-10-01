@@ -137,6 +137,9 @@ class CachedRequestState:
     prefill_rope_deltas: np.ndarray | None = field(pytree_node=False, default=None)
     prefill_visual_pos_masks: np.ndarray | None = field(pytree_node=False, default=None)
     prefill_deepstack_visual_embeds: list[np.ndarray] | None = field(pytree_node=False, default=None)
+    # Prompt image-span token types (-1 text, 0..3 span positions) for models that declare
+    # ``esurge_requires_token_types``; ``None`` for text-only prompts.
+    token_types: np.ndarray | None = field(pytree_node=False, default=None)
 
     def __post_init__(self):
         """Initialize computed fields after instance creation.

@@ -970,16 +970,21 @@ class ResponsesStreamAccumulator:
             ``response.output_item.added`` event when this call was
             encountered for the first time and is otherwise empty.
         """
-        if isinstance(call_id, str) and call_id:
-            call_key = call_id
-            resolved_call_id = call_id
-        else:
-            call_key = f"idx:{call_index}"
-            resolved_call_id = f"call_{self.response_id}_{call_index}"
-
+        # Key strictly by positional index: OpenAI tool-call deltas carry the
+        # id only on the first chunk (later chunks carry just ``index``), and
+        # final batch-extracted ToolCall objects mint fresh ids. Keying by id
+        # therefore split one call across several items and duplicated items
+        # at finalize time. The id, when provided, is only used as the
+        # client-visible ``call_id`` announced in ``output_item.added``.
+        call_key = f"idx:{call_index}"
         state = self.function_states.get(call_key)
         if state is not None:
             return state, []
+
+        if isinstance(call_id, str) and call_id:
+            resolved_call_id = call_id
+        else:
+            resolved_call_id = f"call_{self.response_id}_{call_index}"
 
         function_item = ResponseFunctionCallItem(
             call_id=resolved_call_id,

@@ -999,6 +999,15 @@ class MultiModalManager:
 
                         images.append(pil_image.open(io.BytesIO(img)))
                         return
+                    if isinstance(img, str) and img.startswith("data:"):
+                        # The server gate admits inline data: URLs for every image field, so decode them
+                        # here as _append_image_url does (r15 S11-1: they used to raise -> HTTP 500).
+                        import base64
+                        import io
+
+                        _header, data = img.split(",", 1)
+                        images.append(pil_image.open(io.BytesIO(base64.b64decode(data))))
+                        return
                     if isinstance(img, str):
                         path = img
                         if path.startswith("file://"):

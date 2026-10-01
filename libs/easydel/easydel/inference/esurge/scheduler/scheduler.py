@@ -67,6 +67,7 @@ from ..engine_types import EngineCoreOutput, EngineCoreOutputs
 from ..metrics import get_metrics_collector
 from ..outputs import ModelRunnerOutput
 from ..request import EngineRequest, EngineRequestStatus
+from .image_spans import align_prefill_chunk, check_image_spans_fit
 from .interface import SchedulerInterface
 from .output import CachedRequestData, NewRequestData, SchedulerOutput
 from .request_queue import SchedulingPolicy, create_request_queue
@@ -208,6 +209,8 @@ class Scheduler(SchedulerInterface):
         self.async_scheduling = async_scheduling
         self.long_prefill_token_threshold = long_prefill_token_threshold
         self.chunked_prefill_enabled = chunked_prefill_enabled
+        # Set by ``from_runner`` for models that expand image placeholders at admission (DeepSeek-V4.1).
+        self.image_expander: typing.Any | None = None
 
         if token_safety_margin is None:
             self._token_budget_manager = None
@@ -359,6 +362,9 @@ class Scheduler(SchedulerInterface):
         else:
             scheduler = Scheduler(**scheduler_kwargs)
         scheduler.data_parallel_size = int(getattr(metadata, "data_parallel_size", 1) or 1)
+        image_expander_builder = getattr(type(runner.model), "esurge_image_expander_builder", None)
+        if image_expander_builder is not None:
+            scheduler.image_expander = image_expander_builder(model_config)
         return scheduler
 
     def _select_seq_bucket(self, num_reqs: int) -> int:
@@ -570,6 +576,11 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = min(num_new_tokens, token_budget)
 
             num_new_tokens = min(num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens)
+            if num_new_tokens > 0 and getattr(request, "image_spans", None):
+                # A prefill chunk must not end inside an image span (0 = span does not fit this step's budget).
+                num_new_tokens = align_prefill_chunk(
+                    request.image_spans, request.num_computed_tokens, num_new_tokens, token_budget
+                )
 
             if num_new_tokens <= 0:
                 req_index += 1
@@ -764,13 +775,21 @@ class Scheduler(SchedulerInterface):
                         request.status = EngineRequestStatus.FINISHED_ABORTED
                         self._free_request(request)
                         continue
+                if not load_kv_async and getattr(request, "image_spans", None):
+                    aligned_tokens = align_prefill_chunk(
+                        request.image_spans, num_computed_tokens, num_new_tokens, token_budget
+                    )
+                    if aligned_tokens <= 0:
+                        self.waiting.pop_request()
+                        skipped_waiting_requests.add_request(request)
+                        continue
+                    num_new_tokens = aligned_tokens
                 new_pages = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens + num_external_computed_tokens,
                     num_new_local_computed_tokens,
                     new_computed_pages,
                     num_lookahead_tokens=self.num_lookahead_tokens,
-                    delay_cache_pages=load_kv_async,
                     dp_shard_hint=row_shard_hint,
                     data_parallel_size=self.data_parallel_size,
                 )
@@ -1076,6 +1095,13 @@ class Scheduler(SchedulerInterface):
 
             if new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(request, new_token_ids)
+            if status_before_stop == EngineRequestStatus.RUNNING:
+                # Allocation may have happened before another request with the
+                # same prefix was scheduled. Publish pages only after the model
+                # has populated their KV data (also on chunked-prefill steps
+                # which do not produce a sampled token).
+                computed_tokens = request.num_computed_tokens - request.num_output_placeholders
+                self.kv_cache_manager.cache_pages(request, min(computed_tokens, request.num_tokens))
             if stopped:
                 request.spec_token_ids = []
                 self._free_request(request)
@@ -1170,9 +1196,31 @@ class Scheduler(SchedulerInterface):
 
         Args:
             request: The engine request to add. Must have a unique request_id.
+
+        Raises:
+            ValueError: If the request carries images the served model cannot take, an image span exceeds the
+                per-step token budget, or the expanded prompt does not fit ``max_model_len``.
         """
+        images = getattr(request, "images", None)
+        if images is not None and len(images) > 0:
+            self._expand_request_images(request)
         self.waiting.add_request(request)
         self.requests[request.request_id] = request
+
+    def _expand_request_images(self, request: EngineRequest) -> None:
+        """Expand a request's image placeholders into image spans and attach the preprocessed patches."""
+        if self.image_expander is None:
+            raise ValueError(
+                f"Request {request.request_id} carries images but the served model does not declare image support."
+            )
+        expanded = self.image_expander.expand(request.prompt_token_ids, request.images)
+        check_image_spans_fit(expanded.spans, self.max_num_scheduled_tokens, request.request_id)
+        if len(expanded.token_ids) >= self.max_model_len:
+            raise ValueError(
+                f"Request {request.request_id}: image-expanded prompt has {len(expanded.token_ids)} tokens, "
+                f"which does not fit max_model_len={self.max_model_len}."
+            )
+        request.set_expanded_prompt(expanded.token_ids, expanded.token_types, expanded.spans, expanded.features)
 
     def finish_requests(
         self,

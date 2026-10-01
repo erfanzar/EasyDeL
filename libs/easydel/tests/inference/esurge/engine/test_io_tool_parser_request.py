@@ -231,6 +231,23 @@ def test_run_output_parsers_uses_request_tools_for_streaming_tool_parsing():
     assert result["delta_tool_calls"][0].function.name == "lookup"
 
 
+def test_final_tool_call_id_reuses_streamed_delta_id():
+    """A tool's completed call keeps the id first announced in its stream."""
+    pipeline = _make_pipeline()
+    rd = RequestRecord(
+        delegating_parser=DelegatingParser(
+            reasoning_parser=None,
+            tool_parser=_RecordingToolParser(),
+            tool_request=_make_request(),
+        )
+    )
+    text = "<function=lookup><parameter=limit>5</parameter></function>"
+    streamed = pipeline._run_output_parsers(rd, text, text, [], finished=False)
+    final = pipeline._run_output_parsers(rd, text, "", [], finished=True)
+    assert streamed["delta_tool_calls"][0].id == "call_test"
+    assert final["tool_calls"][0].id == streamed["delta_tool_calls"][0].id
+
+
 def test_build_tool_parser_request_wraps_chat_template_tool_dicts():
     request = eSurge._build_tool_parser_request(
         prompt="hi",

@@ -486,3 +486,24 @@ def test_tool_parser_streaming_through_engine_pipeline(case: _ToolParserStreamCa
 
     assert "".join(streamed_names) == "get_weather"
     assert streamed_arguments
+
+
+def test_functiongemma_bare_then_escaped_argument_streams_valid_json():
+    """A bare value followed by an <escape>-wrapped one must not leak wrapper text.
+
+    The escape guard used to inspect only the first ``key:value`` of the whole
+    argument blob, so the still-open ``<escape>`` of a later value streamed as
+    argument text and the concatenated deltas were not valid JSON.
+    """
+    case = _ToolParserStreamCase(
+        "functiongemma",
+        "<start_function_call>call:get_weather{days:5,location:<escape>Paris<escape>}<end_function_call>",
+    )
+    request_output, _, streamed_names, streamed_arguments = _simulate_engine_stream(case)
+
+    expected = {"days": 5, "location": "Paris"}
+    assert json.loads(request_output.tool_calls[0].function.arguments) == expected
+    assert "".join(streamed_names) == "get_weather"
+    concatenated = "".join(streamed_arguments)
+    assert "<" not in concatenated
+    assert json.loads(concatenated) == expected

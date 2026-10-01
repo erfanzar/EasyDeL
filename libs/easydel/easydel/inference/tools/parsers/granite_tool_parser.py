@@ -227,7 +227,7 @@ class GraniteToolParser(ToolParser):
                     return DeltaMessage(content=delta_text)
 
                 is_complete = [True] * len(tool_calls)
-                if not is_complete_json(current_text[start_idx : start_idx + end_idx]):
+                if is_complete and not is_complete_json(current_text[start_idx : start_idx + end_idx]):
                     is_complete[-1] = False
             except partial_json_parser.core.exceptions.MalformedJSON:
                 return None
@@ -239,27 +239,65 @@ class GraniteToolParser(ToolParser):
 
             delta = None
             if len(tool_call_arr) > self.current_tool_id + 1:
+                deltas: list[DeltaToolCall] = []
                 if self.current_tool_id >= 0:
+                    closing_name = current_tool_call.get("name")
+                    # A multi-element jump can close the tool at current_tool_id before its
+                    # name/id was ever streamed (the first call only moves -1 -> 0). Arguments
+                    # must never reach a client for an index that was not announced, so the
+                    # name, id and type travel together with the first arguments.
+                    announce = not self.current_tool_name_sent and bool(closing_name)
                     cur_arguments = current_tool_call.get("arguments")
-                    if cur_arguments:
+                    argument_diff = ""
+                    if cur_arguments and (self.current_tool_name_sent or announce):
                         cur_args_json = json.dumps(cur_arguments, ensure_ascii=False)
                         sent = len(self.streamed_args_for_tool[self.current_tool_id])
                         argument_diff = cur_args_json[sent:]
-
-                        delta = DeltaMessage(
-                            tool_calls=[
-                                DeltaToolCall(
-                                    index=self.current_tool_id,
-                                    function=DeltaFunctionCall(arguments=argument_diff).model_dump(exclude_none=True),
-                                )
-                            ]
+                    if argument_diff or announce:
+                        deltas.append(
+                            DeltaToolCall(
+                                index=self.current_tool_id,
+                                type="function" if announce else None,
+                                id=f"chatcmpl-tool-{uuid4()}" if announce else None,
+                                function=DeltaFunctionCall(
+                                    name=closing_name if announce else None,
+                                    arguments=argument_diff or None,
+                                ).model_dump(exclude_none=True),
+                            )
                         )
                         self.streamed_args_for_tool[self.current_tool_id] += argument_diff
 
-                self.current_tool_id = len(tool_call_arr) - 1
+                # A JSON array element only begins once the previous element closed, so every
+                # element before the newest one is complete. Emit each of them in full instead
+                # of jumping current_tool_id past them, which skipped entire tool calls and
+                # desynchronized streamed_args_for_tool (IndexError on every later delta).
+                while self.current_tool_id < len(tool_call_arr) - 1:
+                    self.current_tool_id += 1
+                    while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                        self.streamed_args_for_tool.append("")
+                    if self.current_tool_id >= len(tool_call_arr) - 1:
+                        break
+                    closed_tool_call: dict = tool_call_arr[self.current_tool_id]
+                    closed_function = DeltaFunctionCall(name=closed_tool_call.get("name"))
+                    closed_arguments = closed_tool_call.get("arguments")
+                    if closed_arguments is not None:
+                        closed_args_json = json.dumps(closed_arguments, ensure_ascii=False)
+                        closed_function = DeltaFunctionCall(
+                            name=closed_tool_call.get("name"), arguments=closed_args_json
+                        )
+                        self.streamed_args_for_tool[self.current_tool_id] = closed_args_json
+                    deltas.append(
+                        DeltaToolCall(
+                            index=self.current_tool_id,
+                            type="function",
+                            id=f"chatcmpl-tool-{uuid4()}",
+                            function=closed_function.model_dump(exclude_none=True),
+                        )
+                    )
+
                 self.current_tool_name_sent = False
-                self.streamed_args_for_tool.append("")
-                return delta
+                self.prev_tool_call_arr = tool_call_arr
+                return DeltaMessage(tool_calls=deltas) if deltas else None
 
             elif not self.current_tool_name_sent:
                 function_name = current_tool_call.get("name")

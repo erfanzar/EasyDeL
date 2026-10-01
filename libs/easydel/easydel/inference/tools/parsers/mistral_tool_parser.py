@@ -65,7 +65,7 @@ from ...openai_api_modules import (
     ToolCall,
 )
 from ..abstract_tool import ToolParser, ToolParserManager
-from ..utils import extract_intermediate_diff
+from ..utils import is_complete_json, stable_json_stream_prefix
 
 logger = get_logger(__name__)
 
@@ -436,31 +436,70 @@ class MistralToolParser(ToolParser):
                 return None
 
             elif len(tool_call_arr) > 0 and len(tool_call_arr) > self.current_tool_id + 1:
+                deltas: list[DeltaToolCall] = []
                 if self.current_tool_id >= 0:
-                    diff: str | None = current_tool_call.get("arguments")
+                    closing_name = current_tool_call.get("name")
+                    # A multi-element jump can close the tool at current_tool_id before its
+                    # name/id was ever streamed (the first call only moves -1 -> 0). Arguments
+                    # must never reach a client for an index that was not announced, so the
+                    # name, id and type travel together with the first arguments.
+                    announce = not self.current_tool_name_sent and bool(closing_name)
+                    closing_arguments = current_tool_call.get("arguments")
+                    remaining = ""
+                    if closing_arguments and (self.current_tool_name_sent or announce):
+                        closing_args_json = json.dumps(closing_arguments, ensure_ascii=False)
+                        already_streamed = self.streamed_args_for_tool[self.current_tool_id]
+                        remaining = (
+                            closing_args_json[len(already_streamed) :]
+                            if closing_args_json.startswith(already_streamed)
+                            else closing_args_json
+                        )
+                    if remaining or announce:
+                        deltas.append(
+                            DeltaToolCall(
+                                index=self.current_tool_id,
+                                type="function" if announce else None,
+                                id=MistralToolCall.generate_random_id() if announce else None,
+                                function=DeltaFunctionCall(
+                                    name=closing_name if announce else None,
+                                    arguments=remaining or None,
+                                ).model_dump(exclude_none=True),
+                            )
+                        )
+                        self.streamed_args_for_tool[self.current_tool_id] += remaining
 
-                    if diff:
-                        diff = json.dumps(diff, ensure_ascii=False).replace(
-                            self.streamed_args_for_tool[self.current_tool_id], ""
+                # A JSON array element only begins once the previous element closed, so every
+                # element before the newest one is complete. Emit each of them in full instead
+                # of jumping current_tool_id past them, which skipped entire tool calls and
+                # desynchronized streamed_args_for_tool.
+                while self.current_tool_id < len(tool_call_arr) - 1:
+                    self.current_tool_id += 1
+                    while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                        self.streamed_args_for_tool.append("")
+                    if self.current_tool_id >= len(tool_call_arr) - 1:
+                        break
+                    closed_tool_call = tool_call_arr[self.current_tool_id]
+                    closed_function = DeltaFunctionCall(name=closed_tool_call.get("name"))
+                    closed_arguments = closed_tool_call.get("arguments")
+                    if closed_arguments is not None:
+                        closed_args_json = json.dumps(closed_arguments, ensure_ascii=False)
+                        closed_function = DeltaFunctionCall(
+                            name=closed_tool_call.get("name"), arguments=closed_args_json
                         )
-                        delta = DeltaMessage(
-                            tool_calls=[
-                                DeltaToolCall(
-                                    index=self.current_tool_id,
-                                    function=DeltaFunctionCall(arguments=diff).model_dump(exclude_none=True),
-                                )
-                            ]
+                        self.streamed_args_for_tool[self.current_tool_id] = closed_args_json
+                    deltas.append(
+                        DeltaToolCall(
+                            index=self.current_tool_id,
+                            type="function",
+                            id=MistralToolCall.generate_random_id(),
+                            function=closed_function.model_dump(exclude_none=True),
                         )
-                        self.streamed_args_for_tool[self.current_tool_id] += diff
-                    else:
-                        delta = None
-                else:
-                    delta = None
-                self.current_tool_id = len(tool_call_arr) - 1
+                    )
+
                 self.current_tool_name_sent = False
-                self.streamed_args_for_tool.append("")
+                self.prev_tool_call_arr = tool_call_arr
                 logger.debug("starting on new tool %d", self.current_tool_id)
-                return delta
+                return DeltaMessage(tool_calls=deltas) if deltas else None
 
             if not self.current_tool_name_sent:
                 function_name = current_tool_call.get("name")
@@ -483,49 +522,41 @@ class MistralToolParser(ToolParser):
                 prev_arguments = self.prev_tool_call_arr[self.current_tool_id].get("arguments")
                 cur_arguments = current_tool_call.get("arguments")
 
-                new_text = delta_text.replace("'", '"')
-                if '"}' in new_text:
-                    new_text = new_text[: new_text.rindex('"}')]
-
                 if not cur_arguments and not prev_arguments:
                     delta = None
                 elif not cur_arguments and prev_arguments:
                     logger.error("INVARIANT - impossible to have arguments reset mid-arguments")
                     delta = None
-                elif cur_arguments and not prev_arguments:
-                    cur_arguments_json = json.dumps(cur_arguments, ensure_ascii=False)[:-2]
-                    logger.debug("finding %s in %s", new_text, cur_arguments_json)
-
-                    if new_text not in cur_arguments_json:
-                        return None
-                    arguments_delta = cur_arguments_json[: cur_arguments_json.rindex(new_text) + len(new_text)]
-                    logger.debug("First tokens in arguments received: %s", arguments_delta)
-                    delta = DeltaMessage(
-                        tool_calls=[
-                            DeltaToolCall(
-                                index=self.current_tool_id,
-                                function=DeltaFunctionCall(arguments=arguments_delta).model_dump(exclude_none=True),
-                            )
-                        ]
-                    )
-                    self.streamed_args_for_tool[self.current_tool_id] += arguments_delta
-
-                elif cur_arguments and prev_arguments:
+                elif cur_arguments:
+                    # Stream only the prefix-stable part of the serialized
+                    # arguments. Trailing closing characters are withheld
+                    # while the section text is still incomplete because a
+                    # partial JSON fill can change them; once the section is
+                    # complete JSON the remaining tail (including the final
+                    # closers) is emitted so concatenated deltas end at
+                    # exactly the final arguments without needing an external
+                    # catch-up.
                     cur_args_json = json.dumps(cur_arguments, ensure_ascii=False)
-                    prev_args_json = json.dumps(prev_arguments, ensure_ascii=False)
-                    logger.debug("Searching for diff between \n%s\n%s", cur_args_json, prev_args_json)
+                    safe_json = cur_args_json
+                    if not is_complete_json(parsable_arr):
+                        # Also withholds an unfinished trailing number (r12 S12-1).
+                        safe_json = stable_json_stream_prefix(safe_json)
 
-                    argument_diff = extract_intermediate_diff(cur_args_json, prev_args_json)
-                    logger.debug("got arguments diff: %s", argument_diff)
-                    delta = DeltaMessage(
-                        tool_calls=[
-                            DeltaToolCall(
-                                index=self.current_tool_id,
-                                function=DeltaFunctionCall(arguments=argument_diff).model_dump(exclude_none=True),
-                            )
-                        ]
-                    )
-                    self.streamed_args_for_tool[self.current_tool_id] += argument_diff
+                    sent = self.streamed_args_for_tool[self.current_tool_id]
+                    arguments_delta = safe_json[len(sent) :] if safe_json.startswith(sent) else ""
+                    if arguments_delta:
+                        logger.debug("streaming argument delta: %s", arguments_delta)
+                        delta = DeltaMessage(
+                            tool_calls=[
+                                DeltaToolCall(
+                                    index=self.current_tool_id,
+                                    function=DeltaFunctionCall(arguments=arguments_delta).model_dump(exclude_none=True),
+                                )
+                            ]
+                        )
+                        self.streamed_args_for_tool[self.current_tool_id] += arguments_delta
+                    else:
+                        delta = None
                 else:
                     delta = None
 

@@ -781,7 +781,6 @@ class ChunkedLocalAttentionManager(SingleTypeCacheManager):
         return 0
 
 
-
 # Mapping from cache specification types to their corresponding manager classes.
 spec_manager_map: dict[type[CacheSpec], type[SingleTypeCacheManager]] = {
     FullAttentionSpec: FullAttentionManager,

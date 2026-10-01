@@ -99,6 +99,7 @@ from easydel.infra.sharding import replicated_named_sharding
 from easydel.layers.quantization import TurboQuantConfig
 from easydel.utils import flags
 
+from ..multimodal.side_inputs import empty_side_inputs, prefill_embeds_dtype
 from ..utils import model_uses_mrope
 from .async_types import DeviceInputTokenHandoff
 from .execution_types import ModelStepOutputs, StepFunctionInputs
@@ -1057,6 +1058,7 @@ class ExecutionManager:
         video_grid_thw: numpy.ndarray | None = None,
         device_token_handoff: DeviceInputTokenHandoff | None = None,
         wait_for_outputs: bool = True,
+        model_side_inputs_cpu: dict[str, numpy.ndarray] | None = None,
     ) -> tuple[
         jax.Array,
         jax.Array,
@@ -1122,6 +1124,8 @@ class ExecutionManager:
             wait_for_outputs: If ``True``, block on the device-side output
                 arrays before returning so the timing metrics reflect full
                 completion; otherwise the returned arrays may still be running.
+            model_side_inputs_cpu: Optional model-declared per-token side inputs ``{name: [num_tokens, ...]}``
+                (models declaring ``esurge_side_input_specs``).
 
         Returns:
             Tuple of 7 elements:
@@ -1241,6 +1245,7 @@ class ExecutionManager:
             image_grid_thw=image_grid_thw,
             pixel_values_videos=pixel_values_videos,
             video_grid_thw=video_grid_thw,
+            model_side_inputs_cpu=model_side_inputs_cpu,
         )
         prep_batch_metadata_took = time.time() - prep_phase_start
         if self._verbose and num_tokens > 0:
@@ -1755,8 +1760,9 @@ class ExecutionManager:
             return
         cache = self.kv_pages
         from easydel.caching import CompressedWindowCache
+        from easydel.caching.compressed_window import SharedCompressedWindowCache
 
-        if isinstance(cache, CompressedWindowCache):
+        if isinstance(cache, CompressedWindowCache | SharedCompressedWindowCache):
             self.kv_pages = cache.reset_slots(numpy.asarray(sorted({int(s) for s in slot_indices}), dtype=numpy.int32))
             return
         if not isinstance(cache, HybridCache):
@@ -2108,7 +2114,7 @@ class ExecutionManager:
 
         if is_vlm_model:
             hidden_size = int(getattr(self.model.config.get_text_config(), "hidden_size", 0) or 1)
-            prefill_embeds_cpu = numpy.zeros((int(num_tokens), hidden_size), dtype=numpy.float16)
+            prefill_embeds_cpu = numpy.zeros((int(num_tokens), hidden_size), dtype=prefill_embeds_dtype(self.model))
             prefill_embeds_mask_cpu = numpy.zeros((int(num_tokens),), dtype=bool)
             if uses_mrope_model:
                 mrope_position_ids_cpu = numpy.zeros((3, int(num_tokens)), dtype=numpy.int32)
@@ -2121,6 +2127,10 @@ class ExecutionManager:
                     deepstack_visual_embeds_cpu = [
                         numpy.zeros((int(num_tokens), hidden_size), dtype=numpy.float16) for _ in range(deepstack_layers)
                     ]
+
+        # Model-declared per-token side inputs: present in every runtime step of such models, so the compiled
+        # signature must carry them too (inert for every other model).
+        model_side_inputs_cpu = empty_side_inputs(self.model, int(num_tokens))
 
         page_table_cpu_dummy = temp_buffer.page_table[0].page_table_cpu
 
@@ -2154,6 +2164,7 @@ class ExecutionManager:
             prefill_embeds_mask_cpu=prefill_embeds_mask_cpu,
             visual_pos_masks_cpu=visual_pos_masks_cpu,
             deepstack_visual_embeds_cpu=deepstack_visual_embeds_cpu,
+            model_side_inputs_cpu=model_side_inputs_cpu,
         )
 
         inputs = StepFunctionInputs(

@@ -218,6 +218,9 @@ class Llama4PythonicToolParser(ToolParser):
             valid_text, added_text = valid_and_added_text
 
             module = ast.parse(valid_text)
+            if not module.body:
+                # Nothing parseable yet (e.g. only the <|python_start|> prefix arrived).
+                return None
             parsed = getattr(module.body[0], "value", None)
             if not isinstance(parsed, ast.List) or not all(isinstance(e, ast.Call) for e in parsed.elts):
                 raise _UnexpectedAstError("Tool output must be a list of function calls")

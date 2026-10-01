@@ -7,6 +7,7 @@ import os
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import jax.numpy as jnp
+import pytest
 from easydel.inference.esurge.core.interface import (
     CacheGroupsConfig,
     CacheGroupSpec,
@@ -435,6 +436,118 @@ class TestPrefixCacheReset:
     def test_reset_returns_bool(self):
         s = make_scheduler(enable_prefix_caching=True)
         assert isinstance(s.reset_prefix_cache(), bool)
+
+
+@pytest.mark.cpu_ok
+class TestPrefixPublication:
+    def test_identical_prompts_in_same_batch_do_not_reuse_uncomputed_pages(self):
+        s = make_scheduler(enable_prefix_caching=True, page_size=4)
+        s.add_request(make_req("first", 8))
+        s.add_request(make_req("second", 8))
+
+        batch = s.schedule()
+        assert [req.num_computed_tokens for req in batch.scheduled_new_reqs] == [0, 0]
+        assert s.kv_cache_manager.probe_num_computed_tokens(make_req("probe", 8)) == 0
+
+        s.update_from_output(batch, fake_output(batch))
+        assert s.kv_cache_manager.probe_num_computed_tokens(make_req("probe", 8)) == 4
+
+    def test_chunked_prefill_publishes_only_after_output_without_sampled_token(self):
+        s = make_scheduler(enable_prefix_caching=True, page_size=4, max_num_batched_tokens=4, chunked_prefill=True)
+        s.add_request(make_req("first", 8))
+        batch = s.schedule()
+        assert batch.num_scheduled_tokens == {"first": 4}
+        assert s.kv_cache_manager.probe_num_computed_tokens(make_req("probe", 8)) == 0
+
+        no_sample = fake_output(batch)
+        no_sample.sampled_token_ids = [[]]
+        s.update_from_output(batch, no_sample)
+        assert s.kv_cache_manager.probe_num_computed_tokens(make_req("probe", 8)) == 4
+
+    def test_sliding_window_prefetch_never_publishes_null_page(self):
+        """Overlap prefetch (schedule N+1 before update N) must not hash the shared null page."""
+        from easydel.inference.esurge.core.interface import SlidingWindowSpec
+
+        kv = CacheGroupsConfig(
+            num_pages=64,
+            kv_cache_groups=[
+                CacheGroupSpec(
+                    kv_cache_spec=SlidingWindowSpec(
+                        page_size=4,
+                        num_kv_heads=1,
+                        head_size=4,
+                        dtype=jnp.float32,
+                        use_mla=False,
+                        sliding_window=4,
+                    )
+                )
+            ],
+        )
+        s = Scheduler(
+            kv_cache_config=kv,
+            max_num_seqs=4,
+            max_num_batched_tokens=8,
+            max_model_len=128,
+            num_pages=64,
+            page_size=4,
+            enable_prefix_caching=True,
+            chunked_prefill_enabled=True,
+        )
+        s.add_request(make_req("a", 24))
+        first = s.schedule()
+        second = s.schedule()
+        for batch in (first, second):
+            no_sample = fake_output(batch)
+            no_sample.sampled_token_ids = [[]]
+            s.update_from_output(batch, no_sample)
+
+        assert s.kv_cache_manager.page_pool.null_page.page_hash is None
+        # Page 0 was nulled out of the window before publication: a request
+        # sharing only that page must not report a prefix hit on it.
+        assert s.kv_cache_manager.probe_num_computed_tokens(make_req("short", 5)) == 0
+
+    def test_sliding_window_decode_page_keeps_chained_parent_hash(self):
+        """A generated page whose predecessors were nulled must still chain to its true parent hash."""
+        from easydel.inference.esurge.core.interface import SlidingWindowSpec
+
+        kv = CacheGroupsConfig(
+            num_pages=64,
+            kv_cache_groups=[
+                CacheGroupSpec(
+                    kv_cache_spec=SlidingWindowSpec(
+                        page_size=4,
+                        num_kv_heads=1,
+                        head_size=4,
+                        dtype=jnp.float32,
+                        use_mla=False,
+                        sliding_window=4,
+                    )
+                )
+            ],
+        )
+        s = Scheduler(
+            kv_cache_config=kv,
+            max_num_seqs=4,
+            max_num_batched_tokens=64,
+            max_model_len=128,
+            num_pages=64,
+            page_size=4,
+            enable_prefix_caching=True,
+            chunked_prefill_enabled=True,
+        )
+        s.add_request(make_req("a", 8))
+        for _ in range(6):
+            step(s)  # prompt pages 0-1 fall out of the window; page 2 holds generated tokens [42] * 4
+
+        # Page 2 was computed after the 8-token prompt. A fresh prompt that merely starts with the same
+        # four generated tokens has a different context and must not reuse that KV.
+        probe = EngineRequest(
+            request_id="probe",
+            prompt_token_ids=[42, 42, 42, 42, 7],
+            sampling_params=SamplingParams(max_tokens=2),
+            eos_token_id=1,
+        )
+        assert s.kv_cache_manager.probe_num_computed_tokens(probe) == 0
 
 
 class TestRequestCounts:

@@ -88,6 +88,7 @@ from easydel.utils import flags
 from ..core.dp_sharding import dp_shard_page_bounds, pages_per_dp_shard
 from ..core.interface import create_kv_cache_specs_from_config, estimate_runtime_page_budget
 from ..metrics import get_metrics_collector
+from ..multimodal.side_inputs import SideInputWindow, build_side_input_provider, model_has_side_inputs
 from ..outputs import ModelRunnerOutput
 from ..scheduler import SchedulerOutput
 from ..utils import model_uses_mrope
@@ -427,11 +428,25 @@ class eSurgeRunner:
         # condensed/moved), so the recurrent slot pool is used even without
         # SPMD DP and the slot ids are threaded to the model each step.
         self._slot_indexed_state = getattr(self.model, "esurge_cache_family", None) == "compressed_window"
-        if self._slot_indexed_state and drafter is not None:
+        # Models declaring ``esurge_side_input_specs`` get per-token side inputs every step (see
+        # ``multimodal/side_inputs.py``); the model's provider is built lazily on first use.
+        self._side_input_tokenizer_state: typing.Any = None
+        self._side_input_provider: typing.Any | None = None
+        if drafter is not None and model_has_side_inputs(self.model):
+            raise ValueError(
+                "Speculative decoding is not wired for models that need per-token side inputs: the draft/replay "
+                "execute paths do not carry model-declared side inputs."
+            )
+        if (
+            self._slot_indexed_state
+            and drafter is not None
+            and not bool(getattr(drafter, "supports_compressed_window_cache", False))
+        ):
             raise ValueError(
                 "Speculative decoding is not supported for compressed-window cache models: "
                 "per-slot ring/compressor state advances on every consumed token and cannot "
-                "roll back rejected draft tokens."
+                "roll back rejected draft tokens (only drafters that set `supports_compressed_window_cache`, "
+                "i.e. DSpark, snapshot the cache and replay the accepted prefix)."
             )
         self.drafter = drafter
         if self.drafter is not None and hasattr(self.drafter, "set_max_length"):
@@ -655,6 +670,11 @@ class eSurgeRunner:
                 int(self.num_draft_tokens) + 1 if self.spec_decode_recurrent_candidates else 0
             ),
         )
+        if drafter is not None and bool(getattr(drafter, "needs_main_hidden", False)):
+            # DSpark: the fused model step must also return the backbone's ``main_hidden`` rows.
+            if self.pipeline_plan.is_enabled:
+                raise ValueError("DSpark speculative decoding does not support MPMD/PP execution.")
+            self.executor_manager._model_executor.main_hidden_enabled = True
         self.log_it = logger.info if verbose else logger.debug
         self._setup_variables()
         self.enable_overlap_execution = enable_overlap_execution
@@ -681,6 +701,21 @@ class eSurgeRunner:
             raise ValueError("Rank-major SPMD DP does not support MPMD/PP execution yet.")
         if self.drafter is not None:
             raise ValueError("Rank-major SPMD DP does not support speculative decoding yet.")
+        # KDA layers advance per-row recurrent state through the packed-row driver, which has no
+        # per-rank scatter for rank-major ([dp, rows + 1]) metadata. The kernel refuses it at trace
+        # time; reject here so the failure is a clear config error at startup instead.
+        text_config = self.model.config.get_text_config()
+        get_layer_types = getattr(text_config, "get_layer_types", None)
+        try:
+            cache_layer_types = tuple(get_layer_types()) if callable(get_layer_types) else ()
+        except TypeError:
+            cache_layer_types = ()
+        cache_layer_types += tuple(getattr(text_config, "layer_types", ()) or ())
+        if any(str(layer_type).lower() == "kda_linear_attention" for layer_type in cache_layer_types):
+            raise ValueError(
+                "Rank-major SPMD DP does not support KDA linear-attention models yet "
+                "(glm5_next / kimi_linear); serve them with data_parallel_size=1."
+            )
         if attn_mechanism not in ("ragged_page_attention_v3", MLA_RAGGED_ATTN_MECHANISM):
             raise ValueError(
                 "Rank-major SPMD DP currently supports "
@@ -1996,6 +2031,56 @@ class eSurgeRunner:
         """Delegates to :meth:`VlmPrefillHelper.precompile_vision_helpers`."""
         self.vlm.precompile_vision_helpers(max_num_batched_tokens=max_num_batched_tokens)
 
+    def set_side_input_tokenizer_state(self, state: typing.Any) -> None:
+        """Set the tokenizer-derived state the model's side-input provider needs (``esurge_prepare_tokenizer``).
+
+        Args:
+            state: Model-defined state (opaque to eSurge).
+        """
+        self._side_input_tokenizer_state = state
+        self._side_input_provider = None
+
+    def _get_side_input_provider(self) -> typing.Any:
+        """Return (building on first use) the served model's side-input provider."""
+        if self._side_input_provider is None:
+            self._side_input_provider = build_side_input_provider(self.model, self._side_input_tokenizer_state)
+        return self._side_input_provider
+
+    def _build_model_side_inputs(
+        self,
+        *,
+        req_ids_window: list[str | None],
+        scheduled_list: list[int],
+        window_row_indices: np.ndarray,
+        num_tokens_static: int,
+    ) -> dict[str, np.ndarray]:
+        """Build the per-token side inputs of models that declare them (aligned with the flat token stream).
+
+        Rows follow the batch preparer's packing: scheduled tokens of the window's requests back to back, padded rows
+        at each spec's fill value. The model's provider rebuilds everything from each request's token history, so
+        chunked prefill, decode, preemption resume and slot reuse need no per-request provider state.
+
+        Args:
+            req_ids_window: Request ids of the window rows.
+            scheduled_list: Tokens scheduled per window row.
+            window_row_indices: Sequence-buffer row of each window row.
+            num_tokens_static: Token bucket of this step.
+
+        Returns:
+            ``{name: [num_tokens_static, *per_token_shape]}`` per declared side input.
+        """
+        windows: list[SideInputWindow] = []
+        for pos, rid in enumerate(req_ids_window):
+            n = int(scheduled_list[pos])
+            if n <= 0:
+                continue
+            row = int(window_row_indices[pos])
+            start = int(self.sequence_buffer.num_computed_tokens[row])
+            req_state = self.requests.get(rid) if rid is not None else None
+            types = None if req_state is None else req_state.token_types
+            windows.append(SideInputWindow(self.sequence_buffer.token_ids[row], types, start, start + n))
+        return self._get_side_input_provider().build(windows, int(num_tokens_static))
+
     def _precompute_vlm_prefill(self, req_state: CachedRequestState) -> None:
         """Precompute prompt embeddings (+ optional mRoPE indices) for VLM requests.
 
@@ -2104,6 +2189,9 @@ class eSurgeRunner:
             return False
         if self._model_uses_vlm_inputs():
             return False
+        if model_has_side_inputs(self.model):
+            # Side inputs are computed from host token history, which still holds async placeholders.
+            return False
         return self._has_default_sampling_penalties()
 
     def _can_delay_async_result_repair(
@@ -2137,7 +2225,7 @@ class eSurgeRunner:
             return False
         if bool(getattr(scheduler_output, "pending_structured_output_tokens", False)):
             return False
-        if is_vlm_model:
+        if is_vlm_model or model_has_side_inputs(self.model):
             return False
         if bool(np.any(frequency_penalties_cpu != 0.0)):
             return False
@@ -2884,6 +2972,16 @@ class eSurgeRunner:
                 page_table_version=page_table_version,
                 row_indices=window_row_indices if packed_window_rows else None,
             )
+            # Built after the async repair above so host token history is final; ``None`` for models that do not
+            # declare ``esurge_side_input_specs``.
+            model_side_inputs_cpu = None
+            if model_has_side_inputs(self.model):
+                model_side_inputs_cpu = self._build_model_side_inputs(
+                    req_ids_window=req_ids_window,
+                    scheduled_list=model_scheduled_list,
+                    window_row_indices=window_row_indices,
+                    num_tokens_static=num_tokens_static,
+                )
 
             total_runner_host_time += time.time() - host_start
             spec_decode_active_window = self.drafter is not None and bool(scheduler_output.scheduled_spec_decode_tokens)
@@ -2998,6 +3096,7 @@ class eSurgeRunner:
                 deepstack_visual_embeds_cpu=deepstack_visual_embeds_cpu,
                 device_token_handoff=device_token_handoff,
                 wait_for_outputs=not needs_async_output,
+                model_side_inputs_cpu=model_side_inputs_cpu,
             )
             if self.spec_decode_recurrent_candidates:
                 self._spec_recurrent_commit_cpu.fill(0)
@@ -3147,6 +3246,16 @@ class eSurgeRunner:
             hidden_np_len = (
                 int(getattr(hidden_states_for_spec, "shape", (0,))[0]) if hidden_states_for_spec is not None else 0
             )
+            if self.drafter is not None and bool(getattr(self.drafter, "whole_block_draft", False)):
+                # DSpark: hand this step's hidden rows to the drafter (rings are fed from committed positions only).
+                self.spec.observe_window_hidden(
+                    hidden_states_for_spec,
+                    req_ids_window=req_ids_window,
+                    scheduled_list=scheduled_list,
+                    token_offsets=window_token_offsets,
+                    start_positions=num_computed_tokens_window_cpu,
+                    scheduled_spec=scheduler_output.scheduled_spec_decode_tokens,
+                )
             _logits_maybe: typing.Any | None = _logits
             logits_np = np.asarray(_logits_maybe) if self.enable_sampler_metrics and _logits_maybe is not None else None
             total_token_materialize_time += time.time() - token_materialize_start
@@ -3871,6 +3980,10 @@ class eSurgeRunner:
                     spec_commit_scheduled_list[row_pos] = int(real_count + accepted)
                     spec_window_needs_commit = True
                     committed_candidate = True
+                    if self.spec.rolls_back_cache and not self.spec_decode_recurrent_candidates:
+                        # DSpark on a per-slot compressed-window cache: nothing commits implicitly, so a rejected
+                        # draft must restore the pre-verify snapshot and replay the accepted prefix.
+                        committed_candidate = False
                     if (
                         self.spec_decode_recurrent_candidates
                         and int(real_count) > 0

@@ -201,6 +201,9 @@ class ModelStepExecutor:
         self.pipeline_plan = pipeline_plan
         self.enable_spec_recurrent_commit = bool(enable_spec_recurrent_commit)
         self._slot_indexed_state = bool(slot_indexed_state)
+        # DSpark speculative decoding: the fused SPMD model step returns ``concat([last_hidden, main_hidden])`` rows.
+        # Set by the runner before the first trace; read inside the traced step.
+        self.main_hidden_enabled = False
         self._input_sharding = input_sharding if input_sharding is not None else empty_sharding
         self._flat_state_args = not self._uses_mpmd_mesh()
         self._graphstate_treedef = jax.tree_util.tree_structure(graphstate_template)
@@ -381,6 +384,17 @@ class ModelStepExecutor:
             return jnp.expand_dims(flat, 0)
         dp_size = int(getattr(self.metadata, "data_parallel_size", 1))
         return flat.reshape((dp_size, int(flat.shape[0]) // dp_size))
+
+    @staticmethod
+    def _model_side_inputs(metadata: BatchMetadata) -> dict[str, tp.Any]:
+        """Model-declared per-token side inputs carried by ``metadata`` as forward kwargs (empty for other models).
+
+        Each ``[T, ...]`` array becomes ``[1, T, ...]`` under its declared name (``multimodal/side_inputs.py``).
+        """
+        side = metadata.model_side_inputs
+        if not side:
+            return {}
+        return {name: jnp.expand_dims(value, 0) for name, value in side.items()}
 
     def _flatten_model_hidden(self, hidden_states: jax.Array) -> jax.Array:
         """Flatten model hidden states back to token-major rows."""
@@ -2199,7 +2213,7 @@ class ModelStepExecutor:
                             version=self._metadata_version,
                         )
 
-                    external_inputs: dict[str, tp.Any] = {}
+                    external_inputs: dict[str, tp.Any] = self._model_side_inputs(metadata)
                     if metadata.pixel_values is not None or metadata.pixel_values_videos is not None:
                         external_inputs.update(
                             dict(
@@ -2385,7 +2399,7 @@ class ModelStepExecutor:
                             version=self._metadata_version,
                         )
 
-                    external_inputs: dict[str, tp.Any] = {}
+                    external_inputs: dict[str, tp.Any] = self._model_side_inputs(metadata)
                     if metadata.pixel_values is not None or metadata.pixel_values_videos is not None:
                         external_inputs.update(
                             dict(
@@ -2556,7 +2570,7 @@ class ModelStepExecutor:
                             version=self._metadata_version,
                         )
 
-                    external_inputs: dict[str, tp.Any] = {}
+                    external_inputs: dict[str, tp.Any] = self._model_side_inputs(metadata)
                     if metadata.pixel_values is not None or metadata.pixel_values_videos is not None:
                         external_inputs.update(
                             dict(
@@ -2596,6 +2610,9 @@ class ModelStepExecutor:
                         else:
                             model_inputs = {"input_ids": self._as_model_batch(input_ids_view)}
 
+                    main_hidden_enabled = bool(self.main_hidden_enabled)
+                    if main_hidden_enabled:
+                        external_inputs["output_dspark_hidden"] = True
                     with jax.named_scope("easydel/esurge/spmd_model_step/model_forward"):
                         with set_inference_mode():
                             output = model(
@@ -2608,13 +2625,22 @@ class ModelStepExecutor:
                             )
                     with jax.named_scope("easydel/esurge/spmd_model_step/gather_hidden"):
                         hidden_states = self._flatten_model_hidden(output.last_hidden_state)
+                        last_hidden_size = int(hidden_states.shape[-1])
+                        if main_hidden_enabled:
+                            hidden_states = jnp.concatenate(
+                                [
+                                    hidden_states,
+                                    self._flatten_model_hidden(output.main_hidden).astype(hidden_states.dtype),
+                                ],
+                                axis=-1,
+                            )
                         gathered_hidden_states = hidden_states[metadata.logits_indices[:padded_num_reqs]]
                     with jax.named_scope("easydel/esurge/spmd_model_step/lm_head"):
                         # Use compute_lm_logits (not raw apply_lm_head) so model-level
                         # final logit post-processing runs (e.g. gemma2 softcap,
                         # cohere logit_scale). No-op for families whose
                         # compute_lm_logits is identity over apply_lm_head.
-                        logits = model.compute_lm_logits(gathered_hidden_states)
+                        logits = model.compute_lm_logits(gathered_hidden_states[..., :last_hidden_size])
                     return_full_hidden = (
                         self.full_hidden_state_max_tokens > 0
                         and int(hidden_states.shape[0]) <= self.full_hidden_state_max_tokens

@@ -260,10 +260,21 @@ class Glm4MoeModelToolParser(ToolParser):
         cur_text = self._buffer
         start_idx = cur_text.find(self.tool_call_start_token)
         if start_idx == -1:
-            self._buffer = ""
+            # Withhold a trailing fragment that could be the start marker split
+            # across deltas instead of dropping it: if the marker completes on a
+            # later delta, a cleared buffer would lose the tool call entirely
+            # (for tokenizers that do not emit <tool_call> as one special token).
+            withheld = ""
+            max_check = min(len(self.tool_call_start_token) - 1, len(cur_text))
+            for size in range(max_check, 0, -1):
+                if cur_text.endswith(self.tool_call_start_token[:size]):
+                    withheld = cur_text[-size:]
+                    break
+            self._buffer = withheld
+            content = cur_text[: len(cur_text) - len(withheld)]
             if self.current_tool_id > 0:
-                cur_text = ""
-            return DeltaMessage(content=cur_text)
+                content = ""
+            return DeltaMessage(content=content)
         end_idx = cur_text.find(self.tool_call_end_token)
         if end_idx != -1:
             if self.current_tool_id == -1:
@@ -302,3 +313,22 @@ class Glm4MoeModelToolParser(ToolParser):
 
         self._buffer = cur_text[start_idx:]
         return DeltaMessage(content=cur_text[:start_idx])
+
+    def flush_streaming_content(self) -> str:
+        """Release text withheld as a possible split start marker.
+
+        ``extract_tool_calls_streaming`` keeps a trailing fragment such as ``<`` or
+        ``<tool_cal`` in its buffer in case the start marker completes on a later
+        delta. When the stream ends without that happening, the fragment is
+        ordinary content and must be delivered. Call once at end of stream.
+
+        Returns:
+            The withheld content (possibly empty). Empty when a tool call is in
+            progress, since the buffer then holds tool-call markup, or once tool
+            calls were emitted (mirrors the streaming path, which suppresses
+            trailing content after a tool call).
+        """
+        buffered, self._buffer = self._buffer, ""
+        if not buffered or self.tool_call_start_token in buffered or self.current_tool_id > 0:
+            return ""
+        return buffered

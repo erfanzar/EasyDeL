@@ -100,7 +100,6 @@ from ...openai_api_modules import (
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
     ChatCompletionStreamResponse,
-    ChatCompletionStreamResponseChoice,
     ChatMessage,
     CompletionRequest,
     CompletionResponse,
@@ -129,6 +128,31 @@ __all__ = (
 _STREAM_DATA = "data"
 _STREAM_ERROR = "error"
 _STREAM_END = "end"
+
+# Content-item fields whose values reach image/video loaders or HF processors.
+_MEDIA_REFERENCE_FIELDS = ("image", "image_url", "input_image", "video", "video_url", "input_video")
+
+
+def _collect_string_references(value: tp.Any, out: list[str]) -> None:
+    """Collect every string media reference inside ``value``, recursing through lists and tuples.
+
+    HF video processors recursively flatten nested lists into string references and load each one,
+    so a reference wrapped in any list depth must be gated (r14 S11-1). For mappings only the URL keys
+    are references (``{"url": ..., "detail": "auto"}`` keeps its non-reference ``detail``).
+
+    Args:
+        value: A media field value (string, URL mapping, nested list, or numeric frames).
+        out: Accumulator the string references are appended to.
+    """
+    if isinstance(value, str):
+        out.append(value)
+    elif isinstance(value, dict):
+        for key in ("url", "image_url", "video_url"):
+            if key in value:
+                _collect_string_references(value[key], out)
+    elif isinstance(value, list | tuple):
+        for element in value:
+            _collect_string_references(element, out)
 
 
 # Type alias for sampling parameter refinement callbacks.
@@ -281,6 +305,7 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         default_store_responses: bool = True,
         max_stored_responses: int = 10_000,
         max_stored_conversations: int = 1_000,
+        allow_local_media_paths: bool = False,
         **kwargs,
     ) -> None:
         """Initialize the eSurge API server.
@@ -307,6 +332,10 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                 clients to set ``stop`` on each call.
             refine_sampling_params: Optional callable to adjust SamplingParams per request.
             refine_chat_request: Optional callable to mutate or replace chat requests before processing.
+            allow_local_media_paths: When ``False`` (default), image references in requests must be inline
+                base64 ``data:`` URLs; server-local file paths and ``file://`` URLs are rejected with 400 so a
+                client cannot make the server read arbitrary files from its filesystem. Enable only for
+                trusted clients.
             **kwargs: Additional arguments passed to BaseInferenceApiServer.
 
         Raises:
@@ -340,6 +369,7 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             self.adapters[name] = eSurgeAdapter(esurge, name)
 
         self.oai_like_processor = oai_like_processor
+        self._allow_local_media_paths = bool(allow_local_media_paths)
         self._refine_sampling_params_callback = refine_sampling_params
         self._refine_chat_request_callback = refine_chat_request
         self._extra_stops = self._normalize_stop_sequences(extra_stops)
@@ -1569,7 +1599,9 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
 
             messages = self._prepare_messages_for_engine(request, esurge)
             is_multimodal = self._messages_have_multimodal_content(messages)
-            if not is_multimodal:
+            if is_multimodal:
+                self._reject_local_media_references(messages)
+            else:
                 messages = self._prepare_text_messages_for_chat(messages)
 
             if request.stream:
@@ -1615,6 +1647,56 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                 if any(k in item for k in ("image", "image_url", "video", "video_url")):
                     return True
         return False
+
+    def _reject_local_media_references(self, messages: list[dict[str, tp.Any]]) -> None:
+        """Reject image references that would make the server read its own filesystem.
+
+        The multimodal loader resolves plain paths and ``file://`` URLs against the
+        server's local filesystem. Over HTTP that lets any client read arbitrary
+        server files, so unless the server was built with
+        ``allow_local_media_paths=True`` every string image reference must be an
+        inline ``data:`` URL. (Remote ``http(s)`` URLs are never fetched and are
+        rejected here too, with a 400 instead of a later 500.)
+
+        Args:
+            messages: Engine-ready message dicts.
+
+        Raises:
+            HTTPException: 400 when a non-``data:`` image reference is present.
+        """
+        allow_local = getattr(self, "_allow_local_media_paths", False)
+        for message in messages:
+            content = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                # The loader rejects every video_url item (it fetches nothing), so answer 400 here instead
+                # of letting the request reach the engine and fail with a 500 (r15 S11-1).
+                if "video" not in item and (item.get("type") == "video_url" or "video_url" in item):
+                    raise HTTPException(
+                        400,
+                        "video_url content is not supported; send video frames or inline data via the `video` field.",
+                    )
+                if allow_local:
+                    continue
+                # Media values are handed to loaders / HF processors that resolve paths and URLs
+                # themselves and recursively flatten nested lists, so every string anywhere inside a
+                # media field is a reference and needs the gate (r14 S11-1: ``["/srv/x.mp4"]`` and
+                # nested URL lists used to bypass it). Numeric frame arrays hold no strings and pass.
+                references: list[str] = []
+                for field in _MEDIA_REFERENCE_FIELDS:
+                    if field in item:
+                        _collect_string_references(item[field], references)
+                for reference in references:
+                    if not reference.startswith("data:"):
+                        raise HTTPException(
+                            400,
+                            "Images and videos must be sent inline as base64 `data:` URLs. Server-local paths "
+                            "and file:// URLs are disabled (start the server with allow_local_media_paths=True "
+                            "to allow them for trusted clients); remote http(s) URLs are not fetched.",
+                        )
 
     def _prepare_messages_for_engine(self, request: ChatCompletionRequest, esurge: eSurge) -> list[dict[str, tp.Any]]:
         """Convert Pydantic request messages into dictionaries for the eSurge engine.
@@ -1806,6 +1888,7 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                 engine_messages.insert(0, ChatMessage(role="system", content=instructions))
 
             engine_messages_payload = [message.model_dump(exclude_none=True) for message in engine_messages]
+            self._reject_local_media_references(engine_messages_payload)
 
             raw_tools, tools_for_template = self._extract_responses_tools(request)
 
@@ -1968,7 +2051,8 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                                 final_response_overrides=final_response_overrides,
                                 created_at=created_at,
                             ),
-                        )
+                        ),
+                        lambda: esurge.abort_request(response_id),
                     )
 
                     try:
@@ -2049,6 +2133,13 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                             "response.error",
                             {"type": "response.error", "error": json.loads(error_response.body.decode())},
                         )
+                    finally:
+                        self._close_stream_queue(queue)
+                        if final_obj is None:
+                            try:
+                                esurge.abort_request(response_id)
+                            except Exception:
+                                logger.debug("Failed to abort unfinished response %s", response_id, exc_info=True)
 
             return StreamingResponse(
                 generate_stream(),
@@ -2309,10 +2400,12 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                             request_id=request_id,
                             chat_template_kwargs=request.chat_template_kwargs,
                         ),
-                    )
+                    ),
+                    lambda: esurge.abort_request(request_id),
                 )
                 last_chunk: ChatCompletionStreamResponse | None = None
                 disconnected = False
+                completed = False
 
                 try:
                     stream_error: Exception | None = None  # pyright: ignore[reportUnusedVariable]
@@ -2326,6 +2419,7 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                             break
                         kind, payload = await queue.get()
                         if kind == _STREAM_END:
+                            completed = True
                             break
                         if kind == _STREAM_ERROR:
                             stream_error = tp.cast(Exception, payload)  # pyright: ignore[reportUnusedVariable]
@@ -2370,6 +2464,13 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                     logger.exception("Error during /v1/chat/completions streaming: %s | context=%s", e, debug_context)
                     error_response = create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e), request_id)
                     yield f"data: {error_response.body.decode()}\n\n"
+                finally:
+                    self._close_stream_queue(queue)
+                    if not completed:
+                        try:
+                            esurge.abort_request(request_id)
+                        except Exception:
+                            logger.debug("Failed to abort unfinished chat %s", request_id, exc_info=True)
 
         return StreamingResponse(
             generate_stream(),
@@ -2580,16 +2681,18 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                 stream=True,
             ):
                 prompt_tokens = len(esurge.tokenizer(prompt)["input_ids"])
-                previous_text = ""
+                previous_texts: dict[int, str] = {}
                 stream_id = f"cmpl-{uuid.uuid4().hex}"
                 created_at = int(time.time())
-                queue = self._start_stream_task(lambda: esurge.stream(prompt, sampling_params, request_id=request_id))
+                queue = self._start_stream_task(
+                    lambda: esurge.stream(prompt, sampling_params, request_id=request_id),
+                    lambda: esurge.abort_request(request_id),
+                )
                 total_generated = 0
                 generation_time = 0.0
                 tokens_per_second = 0.0
                 last_output: RequestOutput | None = None
                 disconnected = False
-                sent_role = False
 
                 try:
                     stream_error: Exception | None = None  # pyright: ignore[reportUnusedVariable]
@@ -2611,35 +2714,26 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                         output = tp.cast(RequestOutput, payload)
                         last_output = output
 
-                        current_text = output.accumulated_text or ""
-                        delta_text = self._compute_delta_text(current_text, previous_text, output.delta_text or "")
-                        previous_text = current_text
-
-                        if not delta_text:
-                            total_generated = output.num_generated_tokens
-                            generation_time = output.processing_time
-                            tokens_per_second = output.tokens_per_second
-                            continue
-
-                        chunk = ChatCompletionStreamResponse(
-                            id=stream_id,
-                            object="chat.completion.chunk",
-                            created=created_at,
-                            model=request.model,
-                            choices=[
-                                ChatCompletionStreamResponseChoice(
-                                    index=0,
-                                    delta=DeltaMessage(
-                                        content=delta_text,
-                                        role=None if sent_role else "assistant",
-                                    ),
-                                    finish_reason=None,
+                        choices = []
+                        for completion in output.outputs:
+                            index = completion.index
+                            current_text = completion.text or ""
+                            previous_text = previous_texts.get(index, "")
+                            delta_text = self._compute_delta_text(current_text, previous_text, "")
+                            previous_texts[index] = current_text
+                            if delta_text:
+                                choices.append(
+                                    {"index": index, "text": delta_text, "logprobs": None, "finish_reason": None}
                                 )
-                            ],
-                            usage=None,
-                        )
-                        sent_role = True
-                        yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                        if choices:
+                            chunk = {
+                                "id": stream_id,
+                                "object": "text_completion",
+                                "created": created_at,
+                                "model": request.model,
+                                "choices": choices,
+                            }
+                            yield f"data: {json.dumps(chunk)}\n\n"
                         total_generated = output.num_generated_tokens
                         generation_time = output.processing_time
                         tokens_per_second = output.tokens_per_second
@@ -2659,22 +2753,28 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                         first_token_time=last_output.first_token_time,
                     )
 
-                    final_chunk = ChatCompletionStreamResponse(
-                        id=stream_id,
-                        object="chat.completion.chunk",
-                        created=created_at,
-                        model=request.model,
-                        choices=[
-                            ChatCompletionStreamResponseChoice(
-                                index=0,
-                                delta=DeltaMessage(content="", role=None if sent_role else "assistant"),
-                                finish_reason="stop",
-                            )
+                    final_chunk = {
+                        "id": stream_id,
+                        "object": "text_completion",
+                        "created": created_at,
+                        "model": request.model,
+                        "choices": [
+                            {
+                                "index": completion.index,
+                                "text": "",
+                                "logprobs": None,
+                                "finish_reason": (
+                                    "stop"
+                                    if completion.finish_reason in (None, "finished")
+                                    else completion.finish_reason
+                                ),
+                            }
+                            for completion in last_output.outputs
                         ],
-                        usage=usage,
-                    )
+                        "usage": usage.model_dump(exclude_none=True),
+                    }
 
-                    yield f"data: {final_chunk.model_dump_json(exclude_none=True)}\n\n"
+                    yield f"data: {json.dumps(final_chunk)}\n\n"
                     yield "data: [DONE]\n\n"
 
                     self.metrics.total_tokens_generated += total_generated
@@ -2698,6 +2798,13 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                     logger.exception("Error during /v1/completions streaming: %s | context=%s", e, debug_context)
                     error_response = create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e), request_id)
                     yield f"data: {error_response.body.decode()}\n\n"
+                finally:
+                    self._close_stream_queue(queue)
+                    if last_output is None or not last_output.finished:
+                        try:
+                            esurge.abort_request(request_id)
+                        except Exception:
+                            logger.debug("Failed to abort unfinished completion %s", request_id, exc_info=True)
 
         return StreamingResponse(
             generate_stream(),

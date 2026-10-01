@@ -1418,6 +1418,7 @@ class BatchMetadataPreparer:
         image_grid_thw: np.ndarray | None = None,
         pixel_values_videos: np.ndarray | None = None,
         video_grid_thw: np.ndarray | None = None,
+        model_side_inputs_cpu: dict[str, np.ndarray] | None = None,
     ) -> tuple[BatchMetadata, jax.Array, jax.Array, jax.Array, jax.Array]:
         """Prepare batch metadata using CPU-first computation strategy.
 
@@ -1455,6 +1456,8 @@ class BatchMetadataPreparer:
             image_grid_thw: Optional image grid shape for VLMs.
             pixel_values_videos: Optional raw video pixel values for VLMs.
             video_grid_thw: Optional video grid shape for VLMs.
+            model_side_inputs_cpu: Optional model-declared per-token side inputs ``{name: [num_tokens, ...]}`` aligned
+                with the flat token stream (see ``multimodal/side_inputs.py``).
 
         Returns:
             Tuple of (batch_metadata, input_ids_buf, position_ids_buf,
@@ -1496,6 +1499,7 @@ class BatchMetadataPreparer:
                     image_grid_thw,
                     pixel_values_videos,
                     video_grid_thw,
+                    model_side_inputs_cpu,
                 )
             ),
         )
@@ -1644,6 +1648,11 @@ class BatchMetadataPreparer:
             pixel_values_videos_dev = jax.device_put(pixel_values_videos, self._empty_sharding)
         if video_grid_thw is not None:
             video_grid_thw_dev = jax.device_put(video_grid_thw, self._empty_sharding)
+        model_side_inputs_dev = None
+        if model_side_inputs_cpu:
+            model_side_inputs_dev = {
+                name: jax.device_put(value, self._empty_sharding) for name, value in model_side_inputs_cpu.items()
+            }
         extra_put_took = time.time() - extra_put_start
 
         # Expose a timing breakdown to the execution manager (for perf logs).
@@ -1697,6 +1706,7 @@ class BatchMetadataPreparer:
             prefill_embeds_mask=prefill_embeds_mask_dev,
             visual_pos_masks=visual_pos_masks_dev,
             deepstack_visual_embeds=deepstack_visual_embeds_dev,
+            model_side_inputs=model_side_inputs_dev,
             spec_recurrent_commit=spec_recurrent_commit_dev,
         )
 
@@ -1717,6 +1727,7 @@ class BatchMetadataPreparer:
             and image_grid_thw is None
             and pixel_values_videos is None
             and video_grid_thw is None
+            and not model_side_inputs_cpu
             and not get_batch_metadata_dump_dir()
             and not host_payload_broadcast_needed()
         ):
@@ -2086,5 +2097,6 @@ class BatchMetadataPreparer:
             prefill_embeds_mask=batch_metadata.prefill_embeds_mask,
             visual_pos_masks=batch_metadata.visual_pos_masks,
             deepstack_visual_embeds=batch_metadata.deepstack_visual_embeds,
+            model_side_inputs=batch_metadata.model_side_inputs,
             spec_recurrent_commit=batch_metadata.spec_recurrent_commit,
         )

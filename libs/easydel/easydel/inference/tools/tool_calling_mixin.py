@@ -43,16 +43,99 @@ See Also:
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import typing as tp
+from collections import OrderedDict
 from http import HTTPStatus
 
 from eformer.loggings import get_logger
 from fastapi.responses import JSONResponse
 
-from ..openai_api_modules import ChatCompletionRequest, ChatMessage, DeltaMessage
+from ..openai_api_modules import (
+    ChatCompletionRequest,
+    ChatMessage,
+    DeltaFunctionCall,
+    DeltaMessage,
+    DeltaToolCall,
+)
 from . import ToolParser, ToolParserManager
 
 logger = get_logger("ToolCallingMixin")
+
+_MAX_TRACKED_TOOL_STREAMS = 512
+"""Soft bound on tracked streams: past it, streams that have emitted nothing are evicted first."""
+
+_HARD_MAX_TRACKED_TOOL_STREAMS_FACTOR = 4
+"""Past ``factor * _MAX_TRACKED_TOOL_STREAMS`` the least recently used streams are dropped even if they
+emitted output, so streams abandoned without a ``finished=True`` call cannot grow the table forever."""
+
+
+@dataclasses.dataclass
+class _ToolStreamState:
+    """Per-stream bookkeeping for :meth:`ToolCallingMixin.extract_tool_calls_streaming`.
+
+    Attributes:
+        parser: The parser instance that owns this stream's parsing state. A fresh
+            instance per stream when the registered parser can be rebuilt from its
+            tokenizer, otherwise the shared registered instance.
+        arguments: Tool index to the concatenation of every argument delta emitted
+            to the client so far (parser-independent).
+        named: Tool indices whose function name has been emitted.
+        call_ids: Tool index to the call id emitted for it, if any.
+        call_types: Tool index to the call type emitted for it, if any.
+    """
+
+    parser: tp.Any
+    arguments: dict[int, str] = dataclasses.field(default_factory=dict)
+    named: set[int] = dataclasses.field(default_factory=set)
+    call_ids: dict[int, str] = dataclasses.field(default_factory=dict)
+    call_types: dict[int, str] = dataclasses.field(default_factory=dict)
+    emitted_content: bool = False
+
+    @property
+    def emitted(self) -> bool:
+        """Whether anything (content or tool output) reached the client; such a stream cannot restart."""
+        return bool(self.emitted_content or self.arguments or self.named or self.call_ids or self.call_types)
+
+    def record(self, tool_calls: tp.Iterable[DeltaToolCall]) -> None:
+        """Fold emitted tool-call deltas into the accumulators.
+
+        Args:
+            tool_calls: Tool-call deltas that were just returned to the caller.
+        """
+        for call in tool_calls:
+            index = call.index if isinstance(call.index, int) else 0
+            if call.id:
+                self.call_ids[index] = call.id
+            if call.type:
+                self.call_types[index] = call.type
+            function = call.function
+            if function is None:
+                continue
+            if function.name:
+                self.named.add(index)
+            if function.arguments:
+                self.arguments[index] = self.arguments.get(index, "") + function.arguments
+
+
+def _json_payloads_equal(first: str, second: str) -> bool:
+    """Compare two JSON argument strings by decoded value.
+
+    Strings that fail to decode are never considered equal, so malformed
+    streams still fall back to text-level catch-up.
+
+    Args:
+        first: First argument JSON string (final, batch-extracted).
+        second: Second argument JSON string (accumulated stream).
+
+    Returns:
+        ``True`` when both decode to equal payloads.
+    """
+    try:
+        return json.loads(first) == json.loads(second)
+    except Exception:
+        return False
 
 
 def build_tool_parser_or_none(
@@ -286,6 +369,8 @@ class ToolCallingMixin:
         current_token_ids: list[int] | None = None,
         delta_token_ids: list[int] | None = None,
         request: ChatCompletionRequest | None = None,
+        finished: bool = False,
+        stream_id: str | None = None,
     ) -> DeltaMessage | None:
         """Extract tool calls from streaming response chunks.
 
@@ -308,6 +393,16 @@ class ToolCallingMixin:
                 current chunk. Defaults to None (treated as empty list).
             request (ChatCompletionRequest | None, optional): The original request
                 containing tool definitions. Defaults to None.
+            finished (bool, optional): Set to ``True`` on the final call of a
+                stream so any argument tail withheld by the parser (trailing
+                JSON closers) is delivered as a catch-up delta. Defaults to
+                False. Requires ``request`` to be provided for the batch
+                comparison.
+            stream_id (str | None, optional): Identifies the stream this chunk
+                belongs to so concurrent streams on the same model do not share
+                parser or catch-up state. Defaults to ``id(request)`` when a
+                request is given, otherwise all streams of the model share one
+                state.
 
         Returns:
             DeltaMessage | None: A DeltaMessage containing incremental tool call
@@ -325,14 +420,23 @@ class ToolCallingMixin:
             ... )
 
         Note:
-            This method is stateful - the parser instance maintains state across
-            calls to track parsing progress. Make sure to use the same model_name
-            consistently for a single streaming session.
+            This method is stateful per stream: each stream (see ``stream_id``)
+            gets its own parser instance and emitted-delta bookkeeping, dropped
+            when ``finished=True`` is seen. Use the same model_name and stream
+            identity for every chunk of one streaming session.
         """
         if not hasattr(self, "tool_parsers") or model_name not in self.tool_parsers:
             return None
 
-        tool_parser = self.tool_parsers[model_name]
+        stream_key = stream_id if stream_id is not None else (id(request) if request is not None else None)
+        # An empty previous_text marks the first chunk of a stream: start from clean state.
+        state = self._tool_stream_state(
+            model_name,
+            stream_key,
+            self.tool_parsers[model_name],
+            restart=not previous_text,
+        )
+        tool_parser = state.parser
 
         previous_token_ids = previous_token_ids or []
         current_token_ids = current_token_ids or []
@@ -354,25 +458,278 @@ class ToolCallingMixin:
                 model_name,
                 exc_info=True,
             )
-            return DeltaMessage(content=delta_text)
+            # Fall through (no early return): a terminal call must still flush, end the stream and run
+            # the catch-up, or the state leaks and the withheld argument tail is lost (r15 S12-1).
+            normalized = DeltaMessage(content=delta_text)
+        else:
+            normalized = self._normalize_streaming_delta(delta, delta_text)
 
+        if normalized is not None:
+            if normalized.tool_calls:
+                state.record(normalized.tool_calls)
+            if normalized.content:
+                state.emitted_content = True
+
+        if finished:
+            flush = getattr(tool_parser, "flush_streaming_content", None)
+            flushed = ""
+            if callable(flush):
+                try:
+                    flushed = flush() or ""
+                except Exception:
+                    logger.debug("Tool parser content flush failed for model %s.", model_name, exc_info=True)
+            if flushed:
+                if normalized is None:
+                    normalized = DeltaMessage(content=flushed)
+                else:
+                    normalized.content = (normalized.content or "") + flushed
+            self._end_tool_stream(model_name, stream_key)
+        if not finished or request is None:
+            return normalized
+
+        catch_up_calls = self._build_final_tool_catch_up(tool_parser, current_text, request, state)
+        if not catch_up_calls:
+            return normalized
+
+        base_calls = list(normalized.tool_calls) if normalized is not None and normalized.tool_calls else []
+        merged = base_calls + catch_up_calls
+        if normalized is None:
+            return DeltaMessage(tool_calls=merged)
+        normalized.tool_calls = merged
+        return normalized
+
+    @staticmethod
+    def _normalize_streaming_delta(delta: tp.Any, delta_text: str) -> DeltaMessage | None:
+        """Convert whatever a parser returned into a ``DeltaMessage`` (raw ``delta_text`` if it cannot).
+
+        Args:
+            delta: The parser's streaming return value.
+            delta_text: The raw text delta, used as the fallback content.
+
+        Returns:
+            The normalized delta, or ``None`` when the parser withheld this chunk.
+        """
         if delta is None or isinstance(delta, DeltaMessage):
             return delta
         if isinstance(delta, str):
             return DeltaMessage(content=delta)
-        if isinstance(delta, dict):
-            try:
-                return DeltaMessage(**delta)
-            except Exception:
-                return DeltaMessage(content=delta_text)
-        if hasattr(delta, "model_dump"):
+        payload = delta
+        if not isinstance(delta, dict) and hasattr(delta, "model_dump"):
             payload = delta.model_dump(exclude_unset=True, exclude_none=True)
-            if isinstance(payload, dict):
-                try:
-                    return DeltaMessage(**payload)
-                except Exception:
-                    return DeltaMessage(content=delta_text)
+        if isinstance(payload, dict):
+            try:
+                return DeltaMessage(**payload)
+            except Exception:
+                pass
         return DeltaMessage(content=delta_text)
+
+    def abort_tool_stream(
+        self,
+        model_name: str,
+        stream_id: tp.Hashable | None = None,
+        request: ChatCompletionRequest | None = None,
+    ) -> None:
+        """Drop a stream's state without the terminal ``finished=True`` call (e.g. client disconnect).
+
+        Args:
+            model_name: Model the stream belongs to.
+            stream_id: The ``stream_id`` passed to :meth:`extract_tool_calls_streaming`.
+            request: The request, when the stream was keyed by request identity (no ``stream_id``).
+        """
+        stream_key = stream_id if stream_id is not None else (id(request) if request is not None else None)
+        self._end_tool_stream(model_name, stream_key)
+
+    @staticmethod
+    def _new_stream_parser(registered: tp.Any) -> tp.Any:
+        """Build an isolated parser instance for one stream.
+
+        Tool parsers keep per-stream parsing state on the instance, so streams
+        must not share the registered one. Parsers that cannot be rebuilt from
+        their tokenizer (no ``model_tokenizer`` or a failing constructor) fall
+        back to the shared registered instance.
+
+        Args:
+            registered: The parser registered for the model.
+
+        Returns:
+            A fresh parser of the same class, or ``registered`` when a fresh one
+            cannot be built.
+        """
+        tokenizer = getattr(registered, "model_tokenizer", None)
+        if tokenizer is None:
+            return registered
+        fresh = build_tool_parser_or_none(type(registered), tokenizer, context="a new tool stream")
+        return fresh if fresh is not None else registered
+
+    def _tool_stream_state(
+        self,
+        model_name: str,
+        stream_key: tp.Hashable | None,
+        registered: tp.Any,
+        *,
+        restart: bool,
+    ) -> _ToolStreamState:
+        """Look up (or create) the state of one stream.
+
+        Args:
+            model_name: Model the stream belongs to.
+            stream_key: Stream identity within the model (``None`` shares one
+                state per model).
+            registered: The parser registered for the model, used as the
+                template for a fresh per-stream parser.
+            restart: Discard any existing state and start clean (first chunk of
+                a stream).
+
+        Returns:
+            The mutable :class:`_ToolStreamState` for this stream.
+        """
+        streams = getattr(self, "_mixin_tool_streams", None)
+        if not isinstance(streams, OrderedDict):
+            streams = OrderedDict()
+            self._mixin_tool_streams = streams
+        key = (model_name, stream_key)
+        state = None if restart else streams.get(key)
+        if state is None:
+            state = _ToolStreamState(parser=self._new_stream_parser(registered))
+            streams[key] = state
+            # Re-assigning an existing key keeps its old position; a restarted stream is the newest (r15 S12-3).
+            streams.move_to_end(key)
+            if len(streams) > _MAX_TRACKED_TOOL_STREAMS:
+                self._evict_idle_tool_streams(streams, keep=key)
+        else:
+            streams.move_to_end(key)
+        return state
+
+    @staticmethod
+    def _evict_idle_tool_streams(streams: OrderedDict, keep: tp.Hashable) -> None:
+        """Evict the oldest streams that have not emitted any tool output yet.
+
+        A stream that already sent content, a name, id, type or argument prefix cannot be restarted: a
+        fresh parser would re-announce its tools or re-emit delivered text, and the final catch-up would
+        resend complete arguments (r14 S12-1, r15 S12-3). Such streams are kept past the soft cap; only
+        idle streams (nothing emitted, so a restart is invisible) are evicted. Past the hard cap the
+        least recently used streams are dropped regardless (r15 S12-2).
+
+        Args:
+            streams: The ordered per-stream state table (oldest first).
+            keep: Key of the stream just created; never evicted.
+        """
+        excess = len(streams) - _MAX_TRACKED_TOOL_STREAMS
+        for key in list(streams):
+            if excess <= 0:
+                return
+            if key == keep:
+                continue
+            if streams[key].emitted:
+                continue
+            del streams[key]
+            excess -= 1
+        if excess <= 0:
+            return
+        hard_cap = _HARD_MAX_TRACKED_TOOL_STREAMS_FACTOR * _MAX_TRACKED_TOOL_STREAMS
+        if len(streams) <= hard_cap:
+            logger.warn_once(
+                f"More than {_MAX_TRACKED_TOOL_STREAMS} tool streams have emitted output and are still open; "
+                "keeping them until they finish instead of evicting live streams."
+            )
+            return
+        # Streams abandoned without ``finished=True`` (and without abort_tool_stream) would otherwise
+        # grow the table forever (r15 S12-2): drop the least recently used ones past the hard cap.
+        logger.warn_once(
+            f"More than {hard_cap} tool streams are open; dropping the least recently used. "
+            "Call abort_tool_stream() for streams that end without a finished=True call."
+        )
+        for key in list(streams):
+            if len(streams) <= hard_cap:
+                return
+            if key != keep:
+                del streams[key]
+
+    def _end_tool_stream(self, model_name: str, stream_key: tp.Hashable | None) -> None:
+        """Drop the state of a finished stream.
+
+        Args:
+            model_name: Model the stream belongs to.
+            stream_key: Stream identity used when the state was created.
+        """
+        streams = getattr(self, "_mixin_tool_streams", None)
+        if isinstance(streams, OrderedDict):
+            streams.pop((model_name, stream_key), None)
+
+    @staticmethod
+    def _build_final_tool_catch_up(
+        tool_parser: ToolParser,
+        current_text: str,
+        request: ChatCompletionRequest,
+        state: _ToolStreamState,
+    ) -> list[DeltaToolCall]:
+        """Synthesize final tool-call deltas for data the streaming parser withheld.
+
+        Several tool parsers deliberately withhold trailing JSON closing
+        characters while a call is in flight and rely on a terminal catch-up to
+        deliver the completing tail. This helper mirrors the production
+        :class:`~easydel.inference.parsing.delegating_parser.DelegatingParser`
+        behavior for direct mixin users: it compares the batch extraction of the
+        final text against the mixin's own accumulator of the argument deltas
+        actually emitted for this stream (independent of any parser-internal
+        bookkeeping) and emits the missing remainder.
+
+        Args:
+            tool_parser: The stream's parser, used for batch extraction.
+            current_text: The complete generated text for the stream.
+            request: The original chat completion request.
+            state: Per-stream record of emitted names, ids, types and arguments.
+                A name is only included in the catch-up when it was never
+                sent, and then together with the call id and type.
+
+        Returns:
+            A list of catch-up :class:`DeltaToolCall` objects (possibly empty).
+        """
+        try:
+            extracted = tool_parser.extract_tool_calls(current_text, request)
+        except Exception:
+            logger.debug("Final tool batch extraction failed; skipping tool stream catch-up.", exc_info=True)
+            return []
+        if not (extracted.tools_called and extracted.tool_calls):
+            return []
+
+        synthesized: list[DeltaToolCall] = []
+        for index, tool_call in enumerate(extracted.tool_calls):
+            final_args = tool_call.function.arguments or ""
+            streamed = state.arguments.get(index, "")
+
+            if final_args == streamed:
+                missing = ""
+            elif streamed and final_args.startswith(streamed):
+                missing = final_args[len(streamed) :]
+            elif streamed and _json_payloads_equal(final_args, streamed):
+                # Same payload in a different serialization; re-sending would
+                # corrupt the concatenated argument stream.
+                missing = ""
+            else:
+                missing = final_args
+
+            include_name = index not in state.named and bool(tool_call.function.name)
+            if not include_name and not missing:
+                continue
+            # A call announced for the first time needs its id and type too, unless
+            # an id/type already went out with earlier deltas for this index.
+            synthesized.append(
+                DeltaToolCall(
+                    index=index,
+                    id=(state.call_ids.get(index) or tool_call.id)
+                    if include_name and index not in state.call_ids
+                    else None,
+                    type=(state.call_types.get(index) or tool_call.type)
+                    if include_name and index not in state.call_types
+                    else None,
+                    function=DeltaFunctionCall(
+                        name=tool_call.function.name if include_name else None,
+                        arguments=missing or None,
+                    ),
+                )
+            )
+        return synthesized
 
     def get_tool_parser_for_model(self, model_name: str) -> ToolParser | None:
         """Get the tool parser instance for a specific model.

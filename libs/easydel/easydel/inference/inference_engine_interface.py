@@ -31,13 +31,14 @@ from __future__ import annotations
 import asyncio
 import json
 import queue as queue_lib
+import threading
 import time
 import traceback
 import typing as tp
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from collections.abc import AsyncGenerator, AsyncIterator, Iterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -282,6 +283,15 @@ class BaseInferenceApiServer(ABC):
             request does not pin a specific format.
     """
 
+    # Class-level default so instances that bypass ``__init__`` (lightweight test harnesses,
+    # subclasses not calling ``super().__init__``) still get a bounded stream queue.
+    stream_queue_maxsize: int = 256
+    # Same reasoning for the stream-producer pool: ``_max_stream_producers`` is the fallback cap and
+    # ``_stream_pool`` is created lazily by :meth:`_get_stream_pool`.
+    _max_stream_producers: int = 64
+    _stream_pool: ThreadPoolExecutor | None = None
+    _stream_pool_lock = threading.Lock()
+
     def __init__(
         self,
         max_workers: int | None = None,
@@ -302,6 +312,8 @@ class BaseInferenceApiServer(ABC):
         max_stored_responses: int = 10_000,
         max_stored_conversations: int = 1_000,
         response_store_client: tp.Any | None = None,
+        stream_queue_maxsize: int = 256,
+        max_stream_producers: int | None = None,
     ) -> None:
         """Initialize the base inference API server.
 
@@ -338,7 +350,26 @@ class BaseInferenceApiServer(ABC):
             response_store_client: Optional external store client (for
                 example a ZMQ worker client) used when in-process storage
                 is not desired.
+            stream_queue_maxsize: Maximum number of undelivered chunks buffered per
+                streaming request between the engine thread and the HTTP response.
+                When full, the engine-side producer waits (backpressure) instead of
+                buffering without bound. Must be positive.
+            max_stream_producers: Maximum number of threads that may run streaming
+                producers at once. Streams beyond the cap wait for a free thread
+                instead of spawning another. Defaults to twice the generation-slot
+                count (headroom for abandoned producers still unwinding from a
+                blocked engine call), or twice ``max_workers`` (16 when unset) when
+                no slot limit is configured. Must be positive when given.
+
+        Raises:
+            ValueError: If ``stream_queue_maxsize`` or ``max_stream_producers``
+                is not positive.
         """
+        if int(stream_queue_maxsize) <= 0:
+            raise ValueError(f"stream_queue_maxsize must be positive, got {stream_queue_maxsize}.")
+        if max_stream_producers is not None and int(max_stream_producers) <= 0:
+            raise ValueError(f"max_stream_producers must be positive, got {max_stream_producers}.")
+        self.stream_queue_maxsize = int(stream_queue_maxsize)
         self.thread_pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="inference-worker")
         self.max_request_size = max_request_size
         self.request_timeout = request_timeout
@@ -362,6 +393,11 @@ class BaseInferenceApiServer(ABC):
             self._generation_slots = asyncio.Queue(self._max_generation_slots)
             for slot in range(self._max_generation_slots):
                 self._generation_slots.put_nowait(slot)
+
+        if max_stream_producers is not None:
+            self._max_stream_producers = int(max_stream_producers)
+        else:
+            self._max_stream_producers = 2 * max(1, self._max_generation_slots or int(max_workers or 16))
 
         self._enable_response_store = bool(enable_response_store)
         self._default_store_responses = bool(default_store_responses)
@@ -747,6 +783,10 @@ class BaseInferenceApiServer(ABC):
             logger.warning(f"Force closing {len(self._active_requests)} active requests")
 
         self.thread_pool.shutdown(wait=True)
+        stream_pool = self._stream_pool
+        if stream_pool is not None:
+            # Producers may be blocked inside the engine iterator; do not wait on them.
+            stream_pool.shutdown(wait=False, cancel_futures=True)
         logger.info("Thread pool shut down")
 
     def extract_tools(self, request: ChatCompletionRequest) -> list[dict] | None:
@@ -922,31 +962,97 @@ class BaseInferenceApiServer(ABC):
             except asyncio.QueueFull:
                 logger.warning("Generation slot queue overfilled while releasing token")
 
+    @staticmethod
+    def _close_stream_queue(stream_queue: tp.Any) -> None:
+        """Release the producer behind a :meth:`_start_stream_task` queue.
+
+        Safe to call on any object; queues without a ``close`` method are ignored.
+        Called from streaming ``finally`` blocks so a disconnected or failed
+        consumer never leaves the engine-side producer blocked on a full queue.
+
+        Args:
+            stream_queue: The object returned by :meth:`_start_stream_task`.
+        """
+        close = getattr(stream_queue, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                logger.debug("Failed to close stream queue", exc_info=True)
+
+    def _get_stream_pool(self) -> ThreadPoolExecutor:
+        """Return the bounded executor that runs streaming producers.
+
+        Streaming producers block inside the engine iterator for the whole
+        generation, so they get their own pool rather than sharing
+        :attr:`thread_pool` (which would starve non-streaming work). The pool is
+        created lazily and capped at ``_max_stream_producers`` threads; extra
+        streams queue until a producer thread frees up.
+
+        Returns:
+            The shared stream-producer :class:`ThreadPoolExecutor`.
+        """
+        pool = self._stream_pool
+        if pool is None:
+            with self._stream_pool_lock:
+                pool = self._stream_pool
+                if pool is None:
+                    pool = ThreadPoolExecutor(
+                        max_workers=max(1, int(self._max_stream_producers)),
+                        thread_name_prefix="stream-producer",
+                    )
+                    self._stream_pool = pool
+        return pool
+
     def _start_stream_task(
         self,
         stream_fn: tp.Callable[[], Iterator[tp.Any]],
+        on_abandon: tp.Callable[[], None] | None = None,
     ) -> tp.Any:
-        """Run blocking ``stream_fn`` in a worker thread and expose async ``get``.
+        """Run blocking ``stream_fn`` on the bounded stream-producer pool and expose async ``get``.
 
         Bridges a synchronous generator (typical of inference engines) to the
-        async world by hosting it on the server's thread pool and shuttling
-        results through a thread-safe queue. The returned object provides an
+        async world without occupying the shared thread pool used for
+        non-streaming requests. Concurrent producers are capped at
+        ``max_stream_producers``; further streams wait in the pool queue. Results travel through a thread-safe queue.
+        The returned object provides an
         ``await get()`` method that yields ``("data", payload)`` tuples,
         ``("error", exc)`` on failure, and ``("end", None)`` when complete.
 
         Args:
             stream_fn: Zero-argument callable returning a synchronous iterator
                 of streaming payloads.
+            on_abandon: Optional cancellation callback. ``close()`` invokes it
+                once for a started stream, and the producer retries it after
+                a blocked iterator returns (for late request registration).
 
         Returns:
             An ``_AsyncStreamQueue``-like object whose ``get`` coroutine
             yields the tagged payload tuples.
         """
 
-        queue: queue_lib.Queue[tuple[str, tp.Any]] = queue_lib.Queue()
+        # Bounded so a slow or stalled client applies backpressure to the producer instead of
+        # letting it buffer the whole generation in memory; ``close()`` releases a producer that
+        # is blocked on a full queue once the consumer is gone.
+        queue: queue_lib.Queue[tuple[str, tp.Any]] = queue_lib.Queue(maxsize=self.stream_queue_maxsize)
+        closed = threading.Event()
+        state_lock = threading.Lock()
+        started = False
+        exhausted = False  # the engine stream ended normally; nothing left to abort
+        aborted_on_close = False
+
+        def _notify_abandon() -> None:
+            if on_abandon is not None:
+                try:
+                    on_abandon()
+                except Exception:
+                    logger.debug("Failed to abort abandoned stream", exc_info=True)
 
         class _AsyncStreamQueue:
             """Async-friendly accessor backed by the synchronous queue."""
+
+            def __init__(self, producer_future: Future[None]) -> None:
+                self._producer_future = producer_future
 
             async def get(self) -> tuple[str, tp.Any]:
                 """Block until a tagged payload is available and return it.
@@ -961,23 +1067,76 @@ class BaseInferenceApiServer(ABC):
                     except queue_lib.Empty:
                         await asyncio.sleep(0.001)
 
-        def _enqueue(kind: str, payload: tp.Any) -> None:
-            """Push ``(kind, payload)`` onto the cross-thread queue."""
-            queue.put((kind, payload))
+            def close(self) -> None:
+                """Stop the producer: pending and future payloads are discarded.
+
+                Call when the consumer stops reading (client disconnect, error, or
+                normal completion). The producer stops iterating and closes the
+                engine generator instead of blocking forever on a full queue.
+                """
+                nonlocal aborted_on_close
+                with state_lock:
+                    closed.set()
+                    notify = started and not exhausted and not aborted_on_close
+                    if notify:
+                        aborted_on_close = True
+                if notify:
+                    _notify_abandon()
+                while True:
+                    try:
+                        queue.get_nowait()
+                    except queue_lib.Empty:
+                        return
+
+        def _enqueue(kind: str, payload: tp.Any) -> bool:
+            """Push ``(kind, payload)``, waiting for space; ``False`` once the consumer closed."""
+            while not closed.is_set():
+                try:
+                    queue.put((kind, payload), timeout=0.05)
+                    return True
+                except queue_lib.Full:
+                    continue
+            return False
 
         def _producer() -> None:
             """Drive ``stream_fn`` in a worker thread, capturing exceptions."""
+            nonlocal started, exhausted
+            iterator: tp.Any = None
             try:
-                for output in stream_fn():
-                    _enqueue("data", output)
+                with state_lock:
+                    if closed.is_set():
+                        return
+                    started = True
+                iterator = stream_fn()
+                while not closed.is_set():
+                    try:
+                        output = next(iterator)
+                    except StopIteration:
+                        with state_lock:
+                            exhausted = True
+                        break
+                    if closed.is_set() or not _enqueue("data", output):
+                        break
             except Exception as exc:
                 exc.__stream_producer_traceback__ = traceback.format_exc()
                 _enqueue("error", exc)
             finally:
+                if closed.is_set() and started:
+                    # Retry after a blocked next(): the request may have registered
+                    # only after close() sent its first abort. A stream that ended
+                    # normally has nothing to abort.
+                    if not exhausted:
+                        _notify_abandon()
+                    close_iterator = getattr(iterator, "close", None)
+                    if callable(close_iterator):
+                        try:
+                            close_iterator()
+                        except Exception:
+                            logger.debug("Failed to close abandoned stream iterator", exc_info=True)
                 _enqueue("end", None)
 
-        self.thread_pool.submit(_producer)
-        return _AsyncStreamQueue()
+        producer_future = self._get_stream_pool().submit(_producer)
+        return _AsyncStreamQueue(producer_future)
 
     @staticmethod
     def _normalize_conversation_id(value: tp.Any) -> str | None:

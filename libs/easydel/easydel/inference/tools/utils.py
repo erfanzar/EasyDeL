@@ -41,6 +41,7 @@ Example:
 """
 
 import json
+import re
 from json import JSONDecodeError, JSONDecoder
 from typing import Any
 
@@ -277,6 +278,38 @@ def is_complete_json(input_str: str) -> bool:
         return True
     except JSONDecodeError:
         return False
+
+
+# A number literal at the end of serialized JSON, right after ``:``, ``,`` or ``[`` (plus spaces).
+_TRAILING_NUMBER = re.compile(r"([:,\[]\s*)(-?(?:\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|Infinity|NaN))$")
+
+
+def stable_json_stream_prefix(serialized: str) -> str:
+    """Return the part of a partial-JSON serialization that later fills cannot change.
+
+    Streaming parsers serialize a partial parse of the arguments and emit only the new suffix.
+    Trailing closers (``"``, ``}``, ``]``) are provisional: a string can grow and the object can
+    gain keys. A trailing number literal is provisional too: ``1`` becomes ``0.01`` once ``e-2``
+    arrives (r12 S12-1), which breaks the append-only contract. Both are withheld; the withheld
+    text reappears as an extension on a later fill or in the final catch-up.
+
+    Args:
+        serialized: ``json.dumps`` of the current partial arguments.
+
+    Returns:
+        str: A prefix of ``serialized`` that every later serialization extends.
+    """
+    safe = serialized
+    while safe and safe[-1] in ('"', "}", "]"):
+        safe = safe[:-1]
+    match = _TRAILING_NUMBER.search(safe)
+    if match is not None:
+        safe = safe[: match.start(2)]
+    # A trailing unmatched high surrogate (from a split ``\ud83d`` + ``\ude00`` escape pair) merges
+    # with the next low surrogate into one character once it arrives (r13 S12-1): withhold it.
+    if safe and "\ud800" <= safe[-1] <= "\udbff":
+        safe = safe[:-1]
+    return safe
 
 
 def consume_space(i: int, s: str) -> int:

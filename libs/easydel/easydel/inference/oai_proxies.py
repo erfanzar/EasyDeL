@@ -369,6 +369,22 @@ class InferenceApiRouter:
                 response_model=endpoint.response_model,
             )
 
+    @staticmethod
+    def _add_repetition_penalty(params: dict[str, tp.Any], repetition_penalty: float | None) -> None:
+        """Forward ``repetition_penalty`` through ``extra_body`` only when it is non-default.
+
+        ``None`` and the neutral value ``1.0`` are omitted so strict OpenAI-compatible
+        upstreams that reject unknown body fields never see the EasyDeL-specific key
+        unless the caller actually asked for a penalty.
+
+        Args:
+            params: OpenAI SDK keyword arguments, mutated in place.
+            repetition_penalty: Requested multiplicative repetition penalty.
+        """
+        if repetition_penalty is None or repetition_penalty == 1.0:
+            return
+        params["extra_body"] = {"repetition_penalty": repetition_penalty}
+
     def build_oai_params_from_request(
         self,
         request: CompletionRequest,
@@ -383,8 +399,15 @@ class InferenceApiRouter:
 
         Returns:
             Dictionary of OpenAI API parameters ready for the completions endpoint.
+
+        Note:
+            ``repetition_penalty`` is an EasyDeL-specific parameter that the
+            OpenAI SDK does not accept as a direct keyword argument, so it is
+            forwarded through ``extra_body`` (the SDK's supported channel for
+            non-standard parameters), and only when it is set to a non-default
+            value (not ``None`` and not ``1.0``).
         """
-        return {
+        params: dict[str, tp.Any] = {
             "model": request.model,
             "prompt": request.prompt,
             "temperature": request.temperature,
@@ -392,11 +415,12 @@ class InferenceApiRouter:
             "top_p": request.top_p,
             "frequency_penalty": request.frequency_penalty,
             "presence_penalty": request.presence_penalty,
-            "repetition_penalty": request.repetition_penalty,
             "stop": request.stop,
             "stream": request.stream,
             "n": request.n,
         }
+        self._add_repetition_penalty(params, request.repetition_penalty)
+        return params
 
     def build_oai_params_from_chat_request(
         self,
@@ -414,8 +438,16 @@ class InferenceApiRouter:
         Returns:
             Dictionary of OpenAI API parameters with optional tool/function
             definitions for the chat completions endpoint.
+
+            Note:
+                ``repetition_penalty`` is an EasyDeL-specific parameter that
+                the OpenAI SDK does not accept as a direct keyword argument,
+                so it is forwarded through ``extra_body`` (the SDK's
+                supported channel for non-standard parameters), and only
+                when it is set to a non-default value (not ``None`` and
+                not ``1.0``).
         """
-        params = {
+        params: dict[str, tp.Any] = {
             "model": request.model,
             "messages": [msg.model_dump() for msg in request.messages],
             "temperature": request.temperature,
@@ -423,11 +455,11 @@ class InferenceApiRouter:
             "top_p": request.top_p,
             "frequency_penalty": request.frequency_penalty,
             "presence_penalty": request.presence_penalty,
-            "repetition_penalty": request.repetition_penalty,
             "stop": request.stop,
             "stream": request.stream,
             "n": request.n,
         }
+        self._add_repetition_penalty(params, request.repetition_penalty)
 
         if request.tools:
             params["tools"] = [tool.model_dump() for tool in request.tools]
