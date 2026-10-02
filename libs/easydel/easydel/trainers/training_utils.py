@@ -2739,9 +2739,19 @@ def minibatch_call(
     batch: dict,
     minibatch_size: int,
     grad_fn: tp.Callable[[jax.Array, dict], tuple[jax.Array, LossMetrics]],
+    microbatch_weight_fn: tp.Callable[[tp.Any, dict], jax.Array] | None = None,
 ) -> tuple[jax.Array, LossMetrics]:
     """
     Processes batch in smaller chunks for gradient accumulation using jax.lax.scan.
+
+    ``microbatch_weight_fn(tree, minibatch) -> scalar`` optionally weights each
+    microbatch (e.g. by its valid-token count). With weights ``w_i`` the result is
+    ``sum_i w_i * g_i / sum_i w_i``, which reproduces the full-batch value of a
+    token-mean loss even when microbatches hold different numbers of valid tokens
+    (the uniform ``1/num_accum_steps`` average does not). This is the same
+    estimator the scheduled MPMD path uses via ``sxvalue_and_grad(...,
+    microbatch_weight_fn=...)``. When every weight is zero the uniform average is
+    used.
 
     Rather than reshaping the whole batch into
     ``(num_accum_steps, minibatch_size, ...)``, this slices minibatches from the
@@ -2750,8 +2760,10 @@ def minibatch_call(
     distillation), where introducing a new leading accumulation axis can confuse
     downstream partitioned computations.
 
-    Contract (IMPORTANT): the accumulated gradients and metrics are **averaged**
-    by ``1/num_accum_steps``. This is correct only for an *intensive* loss — one
+    Contract (IMPORTANT): the accumulated gradients and intensive metrics are
+    **averaged** by ``1/num_accum_steps`` (or the optional normalized weights);
+    ``LossMetrics.weight_sum`` is an additive counter and is summed instead.
+    Averaging gradients is correct only for an *intensive* loss — one
     whose ``grad_fn`` normalizer scales with the microbatch (a per-example mean,
     or a masked mean over the microbatch's own tokens). Such losses reconstruct
     the full-batch value under averaging.
@@ -2814,26 +2826,87 @@ def minibatch_call(
             "grads": jax.tree_util.tree_map(lambda x: jnp.zeros(x.shape, x.dtype), grads_shape),
             "metrics": jax.tree_util.tree_map(lambda x: jnp.zeros(x.shape, x.dtype), metrics_shape),
         }
-
-        def accumulate_gradients(acc, start_index):
-            """Accumulate gradients and metrics for each minibatch."""
-            minibatch = slice_minibatch(batch, start_index)
-            (_, step_aux), step_grads = grad_fn(state.graphstate, minibatch)
-            new_acc = {
-                "grads": jax.tree_util.tree_map(jnp.add, acc["grads"], step_grads),
-                "metrics": jax.tree_util.tree_map(jnp.add, acc["metrics"], step_aux),
-            }
-            return new_acc, step_aux
+        # LossMetrics.weight_sum is an additive token counter, not an intensive
+        # metric. Keep a separate accumulator so neither mean reduction can
+        # scale it. Other pytrees and LossMetrics fields retain their semantics.
+        has_weight_sum = isinstance(metrics_shape, LossMetrics) and metrics_shape.weight_sum is not None
+        if has_weight_sum:
+            init_acc["weight_sum"] = jnp.zeros(metrics_shape.weight_sum.shape, dtype=jnp.float32)
 
         start_indices = jnp.arange(num_accum_steps, dtype=jnp.int32) * minibatch_size
-        final_acc, _aux = jax.lax.scan(
-            accumulate_gradients,
-            init_acc,
-            start_indices,
-            length=num_accum_steps,
-        )
-        gradients = jax.tree_util.tree_map(lambda x: x / num_accum_steps, final_acc["grads"])
-        metrics = jax.tree_util.tree_map(lambda x: x / num_accum_steps, final_acc["metrics"])
+
+        if microbatch_weight_fn is None:
+
+            def accumulate_gradients(acc, start_index):
+                """Accumulate gradients and metrics for each minibatch."""
+                minibatch = slice_minibatch(batch, start_index)
+                (_, step_aux), step_grads = grad_fn(state.graphstate, minibatch)
+                new_acc = {
+                    "grads": jax.tree_util.tree_map(jnp.add, acc["grads"], step_grads),
+                    "metrics": jax.tree_util.tree_map(jnp.add, acc["metrics"], step_aux),
+                }
+                if has_weight_sum:
+                    new_acc["weight_sum"] = acc["weight_sum"] + jnp.asarray(step_aux.weight_sum, jnp.float32)
+                return new_acc, step_aux
+
+            final_acc, _aux = jax.lax.scan(
+                accumulate_gradients,
+                init_acc,
+                start_indices,
+                length=num_accum_steps,
+            )
+            gradients = jax.tree_util.tree_map(lambda x: x / num_accum_steps, final_acc["grads"])
+            metrics = jax.tree_util.tree_map(lambda x: x / num_accum_steps, final_acc["metrics"])
+        else:
+            # Normalized per-microbatch weights w_i / sum(w), computed up front so the scan
+            # accumulates the final weighted mean directly (scale factors stay in [0, 1]).
+            raw_weights = jax.lax.map(
+                lambda s: jnp.asarray(
+                    microbatch_weight_fn(state.graphstate, slice_minibatch(batch, s)), jnp.float32
+                ).reshape(()),
+                start_indices,
+            )
+            total_weight = jnp.sum(raw_weights)
+            safe_total = jnp.where(total_weight > 0, total_weight, jnp.float32(1.0))
+            scales = jnp.where(total_weight > 0, raw_weights / safe_total, jnp.float32(1.0 / num_accum_steps))
+
+            def _scale(x, w):
+                """Scale one leaf by ``w`` (computed in float32, cast back to the leaf dtype)."""
+                return (x * w).astype(x.dtype)
+
+            def _float_zeros(x):
+                """Zero accumulator; non-float leaves accumulate in float32 so weighting cannot truncate."""
+                dtype = x.dtype if jnp.issubdtype(x.dtype, jnp.inexact) else jnp.float32
+                return jnp.zeros(x.shape, dtype)
+
+            init_acc["metrics"] = jax.tree_util.tree_map(_float_zeros, metrics_shape)
+
+            def accumulate_weighted(acc, xs):
+                """Accumulate ``scale_i * (grads_i, metrics_i)`` for one minibatch."""
+                start_index, scale = xs
+                minibatch = slice_minibatch(batch, start_index)
+                (_, step_aux), step_grads = grad_fn(state.graphstate, minibatch)
+                new_acc = {
+                    "grads": jax.tree_util.tree_map(lambda a, g: a + _scale(g, scale), acc["grads"], step_grads),
+                    "metrics": jax.tree_util.tree_map(
+                        lambda a, m: a + (m * scale).astype(a.dtype), acc["metrics"], step_aux
+                    ),
+                }
+                if has_weight_sum:
+                    new_acc["weight_sum"] = acc["weight_sum"] + jnp.asarray(step_aux.weight_sum, jnp.float32)
+                return new_acc, None
+
+            final_acc, _ = jax.lax.scan(
+                accumulate_weighted,
+                init_acc,
+                (start_indices, scales),
+                length=num_accum_steps,
+            )
+            gradients = final_acc["grads"]
+            metrics = final_acc["metrics"]
+
+        if has_weight_sum:
+            metrics = metrics.replace(weight_sum=final_acc["weight_sum"])
 
     else:
         (_, metrics), gradients = grad_fn(state.graphstate, batch)

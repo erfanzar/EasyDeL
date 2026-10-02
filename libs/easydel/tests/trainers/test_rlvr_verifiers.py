@@ -18,15 +18,18 @@ Pure-Python (no JAX / no model), so they run fast and validate the reward
 math and extraction of each verifier at its public callable surface.
 """
 
+import pytest
 from easydel.trainers.rlvr_trainer import (
     CompositeVerifier,
     ContainsVerifier,
     ExactMatchVerifier,
     JSONVerifier,
+    MathVerifier,
     MultipleChoiceVerifier,
     ReasoningFormatVerifier,
     RepetitionPenaltyVerifier,
 )
+from easydel.trainers.rlvr_trainer.reward_verifiers import _get_column
 
 
 def test_exact_match_normalized_and_extracted():
@@ -45,6 +48,28 @@ def test_exact_match_normalized_and_extracted():
     assert out == [1.0]
     # missing gold -> 0.0
     assert v(completions=["paris"], batch=None) == [0.0]
+
+
+def test_verifiers_repeat_prompt_answers_for_each_generation():
+    # GRPO returns prompt-major completions; the dataloader provides one
+    # answer per prompt, not one answer per generated completion.
+    batch = {"answer": ["1", "2"]}
+    completions = [r"\boxed{1}", r"\boxed{1}", r"\boxed{2}", r"\boxed{2}"]
+    assert MathVerifier()(completions=completions, batch=batch) == [1.0] * 4
+    assert ExactMatchVerifier()(completions=["1", "1", "2", "2"], batch=batch) == [1.0] * 4
+    assert MultipleChoiceVerifier()(completions=["A", "A", "B", "B"], batch={"answer": ["A", "B"]}) == [1.0] * 4
+
+
+def test_reward_metadata_that_does_not_divide_completions_is_rejected():
+    # 3 answers for 4 completions cannot be aligned prompt-major; padding with None would silently
+    # score the last completion against no gold answer.
+    batch = {"answer": ["1", "2", "3"]}
+    with pytest.raises(ValueError, match="does not divide"):
+        MathVerifier()(completions=["1", "2", "3", "3"], batch=batch)
+    # Dividing lengths, equal lengths and absent columns keep working.
+    assert _get_column({"answer": ["1", "2"]}, "answer", 4) == ["1", "1", "2", "2"]
+    assert _get_column({"answer": ["1", "2"]}, "answer", 2) == ["1", "2"]
+    assert _get_column({}, "answer", 3) == [None, None, None]
 
 
 def test_multiple_choice_extraction():

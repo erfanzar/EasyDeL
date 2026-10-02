@@ -179,49 +179,28 @@ class GFPOTrainer(GRPOTrainer):
             reflect the filtered group size.
         """
         output = super().configure_functions()
-        straight_through_emulator = self._train_shared_fn_static_args[-1]
 
         if self.arguments.num_remains_in_group is not None:
             effective_generations = self.arguments.num_remains_in_group
-
+            # Only the leading ``num_generations`` static may change: the
+            # parent's tuples must keep their full length and ordering, since
+            # every entry maps positionally onto ``grpo_step``'s static
+            # parameters (beta, loss_config, ..., straight_through_emulator,
+            # dppo knobs). Rebuilding a shorter tuple would silently rebind
+            # the trailing statics (e.g. clip_ratio_c would land on
+            # sapo_temperature_pos and the QAT emulator would be dropped).
             self._train_shared_fn_static_args = (
-                effective_generations,  # Use filtered count instead of original
-                self.arguments.beta,
-                self.arguments.loss_config,
-                self.scheduler,
-                self.arguments.step_partition_spec,
-                self.arguments.gradient_accumulation_steps,
-                True,  # is_train
-                self.loss_type,
-                self.epsilon,
-                self.epsilon_high,
-                self.delta,
-                self.importance_sampling_level,
-                self.top_entropy_quantile,
-                self.arguments.completion_chunk_size,
-                self.arguments.max_loss_completion_tokens,
-                self.arguments.logprob_vocab_chunk_size,
-                straight_through_emulator,
-            )
-
-            self._eval_shared_fn_static_args = (
                 effective_generations,
-                self.arguments.beta,
-                self.arguments.loss_config,
-                self.scheduler,
-                self.arguments.step_partition_spec,
-                self.arguments.gradient_accumulation_steps,
-                False,  # is_train
-                self.loss_type,
-                self.epsilon,
-                self.epsilon_high,
-                self.delta,
-                self.importance_sampling_level,
-                self.top_entropy_quantile,
-                self.arguments.completion_chunk_size,
-                self.arguments.max_loss_completion_tokens,
-                self.arguments.logprob_vocab_chunk_size,
-                straight_through_emulator,
+                *self._train_shared_fn_static_args[1:],
+            )
+            # ``_preprocess_batch_input`` only filters when ``num_remains < generation_factor``.
+            # An eval group already at or below ``num_remains_in_group`` is never filtered, so
+            # the compiled eval step must keep that (smaller) group size or ``grpo_step`` would
+            # mis-shape its per-prompt repeat.
+            eval_generations = self._eval_shared_fn_static_args[0]
+            self._eval_shared_fn_static_args = (
+                min(effective_generations, int(eval_generations)),
+                *self._eval_shared_fn_static_args[1:],
             )
 
         return output

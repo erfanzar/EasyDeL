@@ -127,6 +127,7 @@ class PAPOTrainer(GRPOTrainer):
         self,
         model_batch: dict[str, jax.Array],
         reward_columns: dict[str, object],
+        local_prompt_count: int,
     ) -> tuple[dict[str, jax.Array], dict[str, float | int]]:
         """Add weighted PAPO reward columns into completion advantages.
 
@@ -139,7 +140,7 @@ class PAPOTrainer(GRPOTrainer):
         num_prompts = int(model_batch["prompt_ids"].shape[0])
         num_completions = int(model_batch["completion_ids"].shape[0])
         generation_factor = max(num_completions // max(num_prompts, 1), 1)
-        reward_delta = jnp.zeros((num_completions, 1), dtype=jnp.float32)
+        reward_delta = jnp.zeros((num_completions,), dtype=jnp.float32)
         metrics: dict[str, float | int] = {"papo/reward_columns": 0}
         for name, weight in (
             ("perception", self.arguments.perception_loss_weight),
@@ -150,25 +151,29 @@ class PAPOTrainer(GRPOTrainer):
             if value is None or weight == 0.0:
                 continue
             rewards = jnp.asarray(value, dtype=jnp.float32).reshape(-1)
+            if local_prompt_count != num_prompts and rewards.shape[0] in (
+                local_prompt_count,
+                local_prompt_count * generation_factor,
+            ):
+                rewards = self._all_gather(rewards)
             if rewards.shape[0] == num_prompts:
                 rewards = rewards.repeat(generation_factor, axis=0)
             if rewards.shape[0] != num_completions:
                 metrics[f"papo/{name}_reward_skipped_shape_mismatch"] = 1
                 continue
-            reward_delta = reward_delta + float(weight) * rewards[:, None]
+            reward_delta = reward_delta + float(weight) * rewards
             metrics[f"papo/{name}_reward_mean"] = _host_mean_float(rewards)
             metrics["papo/reward_columns"] += 1
         if metrics["papo/reward_columns"] == 0:
             return model_batch, metrics
         advantages = model_batch["advantages"]
-        if advantages.ndim == 1:
-            advantages = advantages[:, None]
-        return {**model_batch, "advantages": advantages + reward_delta}, metrics
+        return {**model_batch, "advantages": advantages + reward_delta.reshape(advantages.shape)}, metrics
 
     def _apply_papo_objective_shaping(
         self,
         model_batch: dict[str, jax.Array],
         reward_columns: dict[str, object],
+        local_prompt_count: int,
     ) -> tuple[dict[str, jax.Array], dict[str, float | int]]:
         """Apply PAPO completion masking and reward-column shaping.
 
@@ -181,9 +186,10 @@ class PAPOTrainer(GRPOTrainer):
         model_batch = {
             **model_batch,
             "completion_mask": shaped_mask,
+            "completion_attention_mask": model_batch.get("completion_attention_mask", original_mask),
             "num_items_in_batch": jnp.sum(shaped_mask),
         }
-        model_batch, reward_metrics = self._apply_papo_reward_columns(model_batch, reward_columns)
+        model_batch, reward_metrics = self._apply_papo_reward_columns(model_batch, reward_columns, local_prompt_count)
         original_tokens = jnp.maximum(jnp.sum(original_mask), 1)
         kept_tokens = jnp.sum(shaped_mask)
         return model_batch, {
@@ -204,8 +210,17 @@ class PAPOTrainer(GRPOTrainer):
         or transforms it. The shaped batch and PAPO metrics are merged with the
         parent GRPO preprocessing output.
         """
+        if is_train and getattr(self, "_buffered_grpo_remaining", 0) > 0:
+            # GRPO's cache holds the already-shaped PAPO batch (including the
+            # original prompt's reward columns), not the new dataloader row.
+            return super()._preprocess_batch_input(state=state, batch=batch, is_train=is_train)
+
         batch = self._apply_user_data_collator(batch)
         reward_columns = self._extract_papo_reward_columns(batch)
+        local_prompt_count = int(batch["input_ids"].shape[0])
         model_batch, metrics = super()._preprocess_batch_input(state=state, batch=batch, is_train=is_train)
-        model_batch, papo_metrics = self._apply_papo_objective_shaping(model_batch, reward_columns)
-        return model_batch, {**metrics, **papo_metrics}
+        model_batch, papo_metrics = self._apply_papo_objective_shaping(model_batch, reward_columns, local_prompt_count)
+        metrics = {**metrics, **papo_metrics}
+        if is_train and getattr(self, "_buffered_grpo_remaining", 0) > 0:
+            self._buffered_grpo_batch = (dict(model_batch), dict(metrics))
+        return model_batch, metrics

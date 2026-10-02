@@ -464,6 +464,37 @@ class TestSFTPreprocessTransform:
         assert tokenizer.single_tokenizer_calls == 0
         assert tokenizer.template_tools == [tools, other_tools, None]
 
+    def test_map_batch_preserves_row_count_and_order(self):
+        """``preserves_row_count`` is only valid if ``map_batch`` is strictly 1:1 and order-stable."""
+        from easydel.data.transforms.source import transform_preserves_row_count
+
+        transform = SFTPreprocessTransform(tokenizer=MockTokenizer(), max_length=64, text_field="text")
+        assert transform_preserves_row_count(transform) is True
+
+        pretokenized = {"id": 1, "input_ids": [5, 6, 7], "attention_mask": [1, 1, 1]}
+        examples = [
+            {"id": 0, "text": "alpha"},
+            pretokenized,
+            {"id": 2, "text": "gamma delta"},
+            {"id": 3, "unrelated": "passes through untouched"},
+            {"id": 4, "messages": [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Yo"}]},
+        ]
+        results = transform.map_batch([dict(e) for e in examples])
+
+        assert len(results) == len(examples)
+        assert results[1] == pretokenized
+        assert results[3].get("unrelated") == "passes through untouched"
+        assert "input_ids" not in results[3]
+        assert all("input_ids" in results[i] for i in (0, 2, 4))
+        # Plain-text rows must tokenize identically through the batched and per-row paths.
+        for i in (0, 2):
+            single = transform(dict(examples[i]))
+            assert list(map(int, single["input_ids"])) == list(map(int, results[i]["input_ids"])), (
+                i,
+                list(single["input_ids"]),
+                list(results[i]["input_ids"]),
+            )
+
     def test_messages_in_text_field(self):
         tokenizer = MockTokenizer()
         transform = SFTPreprocessTransform(

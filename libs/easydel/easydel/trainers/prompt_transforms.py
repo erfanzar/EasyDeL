@@ -1060,6 +1060,8 @@ class SFTPreprocessTransform(Transform):
         >>> result = transform({"instruction": "Hi", "response": "Hello!"})
     """
 
+    preserves_row_count = True
+
     def __init__(
         self,
         tokenizer: tp.Any,

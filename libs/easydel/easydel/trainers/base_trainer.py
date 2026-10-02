@@ -160,6 +160,12 @@ def _iter_sharded_source_from_example_offset(
         yield from source.open_shard_at_row(shard_names[0], start_row)
         return
 
+    if not source.delivers_all_metadata_rows:
+        # The offset counts delivered examples, but num_rows can include rows
+        # dropped by the decoder (e.g. guarded Parquet row groups).
+        yield from itertools.islice(_iter_sharded_source_from_start(source), start_row, None)
+        return
+
     shard_rows: list[tuple[str, int]] = []
     for shard_name in shard_names:
         try:
@@ -541,12 +547,25 @@ class BaseTrainer(BaseTrainerProtocol):
 
         self._resumed_from_checkpoint = False
         if self.arguments.resume_if_possible:
+            checkpoint_path = None
+            discovery_failed = False
             try:
                 from spectrax.serialization import find_latest_checkpoint
 
                 checkpoint_path = find_latest_checkpoint(str(self.arguments._get_save_directory(create=False)))
-                if checkpoint_path is not None:
-                    logger.info(f"Found latest checkpoint: {checkpoint_path}")
+            except Exception as e:
+                # Nothing was found, so nothing can be overwritten: starting fresh is safe.
+                discovery_failed = True
+                checkpoint_path = None
+                logger.warning(f"Checkpoint discovery failed: {e}. Starting fresh training.")
+            if checkpoint_path is None:
+                if not discovery_failed:
+                    logger.info("No checkpoints found. Starting fresh training.")
+            else:
+                logger.info(f"Found latest checkpoint: {checkpoint_path}")
+                # A discovered but unloadable checkpoint (partial write, corruption) must not
+                # silently restart training: later saves would overwrite the real progress.
+                try:
                     model = model_state.model
                     resumed_state = EasyDeLState.load_state(
                         load_directory=checkpoint_path,
@@ -564,15 +583,19 @@ class BaseTrainer(BaseTrainerProtocol):
                     )
                     actual_step = int(jax.device_get(resumed_state.step))
                     logger.info(f"Successfully resumed from checkpoint at step {actual_step}")
-
                     self._load_auxiliary_states(checkpoint_path)
-                    model_state = resumed_state
-                    self._resumed_from_checkpoint = True
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Failed to resume from checkpoint {checkpoint_path} ({type(e).__name__}: {e}). "
+                        "Repair it or move it away, or set `resume_if_possible=False` to start fresh."
+                    ) from e
+                model_state = resumed_state
+                self._resumed_from_checkpoint = True
+                try:
                     self._maybe_remove_loaded_checkpoint(checkpoint_path)
-                else:
-                    logger.info("No checkpoints found. Starting fresh training.")
-            except Exception as e:
-                logger.warning(f"Resuming from checkpoint failed: {e}. Starting fresh training.")
+                except Exception as e:
+                    # The state is already restored; failing to delete the old copy is not fatal.
+                    logger.warning(f"Could not remove loaded checkpoint {checkpoint_path}: {e}")
 
         # Train with dropout etc. live: `from_pretrained` hands back eval-mode models.
         self.model_state = self._in_training_mode(model_state)
@@ -732,7 +755,6 @@ class BaseTrainer(BaseTrainerProtocol):
         self._runtime_trace("__init__.end")
 
     @staticmethod
-    @staticmethod
     def _in_training_mode(state: EasyDeLState) -> EasyDeLState:
         """Return ``state`` with its graph in training mode (only the static graphdef changes)."""
         import spectrax as spx
@@ -742,6 +764,7 @@ class BaseTrainer(BaseTrainerProtocol):
             return state
         return state.replace(graphdef=spx.export(module.train())[0])
 
+    @staticmethod
     def _apply_runtime_model_config_overrides_to_state(
         state: EasyDeLState | None,
         arguments: TrainingArguments,
@@ -2667,7 +2690,22 @@ class BaseTrainer(BaseTrainerProtocol):
         batch = self._apply_user_data_collator(batch)
         # Purify batch to keep only JAX-compatible array fields
         batch = self._purify_batch(batch)
+        batch = self._apply_model_host_batch_transform(batch)
         return batch, {}
+
+    def _apply_model_host_batch_transform(self, batch: tp.Any) -> tp.Any:
+        """Run the model's optional host-side batch hook on a purified host batch.
+
+        A model class may declare ``host_batch_transform(model, batch) -> batch`` to turn host-computable inputs into
+        what its compiled forward should receive (for example, rows gathered from a host-resident table instead of
+        ids looked up in-program through a host callback). The hook runs on host NumPy arrays before the batch reaches
+        the device; models without it are untouched.
+        """
+        model = getattr(self, "_model", None)
+        hook = getattr(type(model), "host_batch_transform", None) if model is not None else None
+        if hook is None or not isinstance(batch, dict):
+            return batch
+        return hook(model, batch)
 
     def _apply_user_data_collator(self, batch: tp.Any) -> tp.Any:
         """Apply an explicitly supplied data collator to raw list batches."""

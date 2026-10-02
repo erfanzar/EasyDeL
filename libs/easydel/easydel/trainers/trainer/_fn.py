@@ -31,14 +31,21 @@ import typing as tp
 
 import jax
 import optax  # pyright: ignore[reportMissingTypeStubs]
+from eformer.loggings import get_logger
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
+from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
-from easydel.infra.loss_utils import ForCausalLMLoss, LossConfig, LossMetrics
+from easydel.infra.loss_utils import CausalLMLossStrategy, ForCausalLMLoss, LossConfig, LossMetrics
+from easydel.modules._base.causal_lm_module import BaseCausalLMModule
+from easydel.modules.cohere.modeling_cohere import CohereForCausalLM
+from easydel.modules.gemma.modeling_gemma import GemmaForCausalLM
+from easydel.modules.gemma2.modeling_gemma2 import Gemma2ForCausalLM
 
 from ..training_utils import (
     ScheduledLossAdapter,
+    _infer_batch_size,
     bind_scheduled_module,
     constrain_batch_sharding,
     constrain_scheduled_batch,
@@ -49,6 +56,8 @@ from ..training_utils import (
     update_metrics,
     update_state_respectfully,
 )
+
+logger = get_logger(__name__)
 
 
 def _dft_causal_lm_metrics(logits: jax.Array, labels: jax.Array, ignore_index: int = -100) -> LossMetrics:
@@ -112,6 +121,13 @@ def base_step(
         )
         batch = constrain_batch_sharding(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
+    # CE/aux split: only needed when microbatches are averaged (see ``_split_ce_aux_objective``).
+    split_count = (
+        _ce_aux_split_count({"loss_config": loss_config, "loss_type": loss_type, "state": state})
+        if is_training and gradient_accumulation_steps > 1
+        else None
+    )
+
     def loss_fn(tree, minibatch):
         """Compute the base-trainer scalar loss and metrics for one microbatch.
 
@@ -153,6 +169,8 @@ def base_step(
                 if not is_training:
                     module.eval()
             with jax.named_scope(scope_root + "/loss_fn/prepare_inputs"):
+                minibatch = dict(minibatch)
+                ce_scale = minibatch.pop(_CE_TOKEN_SCALE_KEY, None)
                 call_batch = module.prepare_inputs_for_call(**minibatch)
                 labels = call_batch.pop("labels", None)
             with jax.named_scope(scope_root + "/loss_fn/forward_and_loss"):
@@ -170,7 +188,10 @@ def base_step(
                         loss_config=loss_config,
                         **call_batch,
                     )
-            return outputs.loss, metrics
+            loss = outputs.loss
+            if ce_scale is not None and split_count is not None:
+                loss, metrics = _split_ce_aux_objective(loss, metrics, ce_scale, split_count, minibatch)
+            return loss, metrics
 
     if not is_training:
         with jax.named_scope(scope_root + "/eval_call"):
@@ -178,11 +199,24 @@ def base_step(
         return metrics
 
     with jax.named_scope(scope_root + "/grad_and_minibatch"):
+        # Weight microbatches by valid-token count (same estimator as the scheduled MPMD
+        # path) so a token-mean loss matches the full batch when microbatches hold
+        # different numbers of valid tokens. ``None`` keeps the uniform average.
+        microbatch_weight_fn = (
+            _make_base_spmd_weight({"loss_config": loss_config, "loss_type": loss_type, "state": state, "batch": batch})
+            if gradient_accumulation_steps > 1
+            else None
+        )
+        if split_count is not None:
+            # Added after the weight decision so the aux probe sees the original batch.
+            batch = dict(batch)
+            batch[_CE_TOKEN_SCALE_KEY] = _ce_token_scale_leaf(split_count, batch)
         gradients, metrics = minibatch_call(
             state=state,
             batch=batch,
             minibatch_size=minibatch_size,
             grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
+            microbatch_weight_fn=microbatch_weight_fn,
         )
     with jax.named_scope(scope_root + "/update_state"):
         state = update_state_respectfully(
@@ -310,6 +344,7 @@ def _make_base_scheduled_loss(call):
     loss_config = call.get("loss_config")
     partition_spec = call.get("partition_spec")
     loss_type = call.get("loss_type", "nll")
+    split_count = _ce_aux_split_count(call)
 
     def scheduled_loss(tree, batch):
         """Compute the base-trainer scheduled loss and auxiliary metrics.
@@ -327,6 +362,8 @@ def _make_base_scheduled_loss(call):
         with jax.named_scope("easydel/trainer/base/scheduled_loss"):
             with jax.named_scope("easydel/trainer/base/scheduled_loss/bind_module"):
                 module = bind_scheduled_module(call, tree)
+                batch = dict(batch)
+                ce_scale = batch.pop(_CE_TOKEN_SCALE_KEY, None)
                 batch = constrain_scheduled_batch(module, batch, partition_spec)
             with jax.named_scope("easydel/trainer/base/scheduled_loss/prepare_inputs"):
                 call_batch = module.prepare_inputs_for_call(**batch)
@@ -346,6 +383,10 @@ def _make_base_scheduled_loss(call):
                         loss_config=loss_config,
                         **call_batch,
                     )
+            loss = outputs.loss
+            if ce_scale is not None and split_count is not None:
+                # Split before collecting the reported metrics so they match the objective (r11 S13-2).
+                loss, metrics = _split_ce_aux_objective(loss, metrics, ce_scale, split_count, batch)
             aux = {
                 name: value
                 for name, value in (("z_loss", metrics.z_loss), ("accuracy", metrics.accuracy))
@@ -355,8 +396,8 @@ def _make_base_scheduled_loss(call):
                 # The scheduled runtime requires at least one aux output when the
                 # adapter declares has_aux; a detached copy of the loss keeps the
                 # output structure stable for loss functions without metrics.
-                aux = {"loss_detached": jax.lax.stop_gradient(outputs.loss)}
-            return outputs.loss, aux
+                aux = {"loss_detached": jax.lax.stop_gradient(loss)}
+            return loss, aux
 
     return scheduled_loss
 
@@ -405,7 +446,7 @@ def _model_uses_causal_lm_loss(call) -> bool:
     live trainer state on the scheduled call. Anything that cannot be
     positively identified as the causal-LM loss — a non-CLM task head, a
     custom ``loss_type`` on the config, or a call carrying no state — fails
-    closed so the scheduled reduction keeps the always-correct uniform
+    closed so the scheduled reduction keeps the historical uniform
     microbatch weighting.
 
     Args:
@@ -421,13 +462,144 @@ def _model_uses_causal_lm_loss(call) -> bool:
     try:
         model = state.model if state is not None else None
         loss_fn = getattr(model, "loss_function", None)
-    except Exception:
+    except AttributeError:
         return False
     # Identity first (robust to renames); the __name__ fallback keeps
     # functools.partial / thin wrappers that preserve __name__ working.
     if loss_fn is ForCausalLMLoss:
         return True
     return getattr(loss_fn, "__name__", None) == "ForCausalLMLoss"
+
+
+# These exact classes' forward bodies return only logits/hidden states/cache. Their
+# backbones have no router/MTP aux output; Gemma2's softcap and Cohere's logit
+# scaling act on logits, not on the training objective. Do not accept subclasses
+# through this exception: they may override an auxiliary hook or backbone.
+_CE_ONLY_CAUSAL_LM_CLASSES = frozenset((GemmaForCausalLM, Gemma2ForCausalLM, CohereForCausalLM))
+
+
+def _has_reviewed_ce_only_forward(model_type: type) -> bool:
+    """Accept the inherited CLM forward or an exactly reviewed CE-only head."""
+    return model_type.forward is BaseCausalLMModule.forward or model_type in _CE_ONLY_CAUSAL_LM_CLASSES
+
+
+def _make_base_spmd_weight(call):
+    """Use token weights only when the objective provably has no unnormalized aux term.
+
+    Used by both the SPMD base ``training_step`` (``minibatch_call``) and the
+    scheduled MPMD adapter (``make_microbatch_weight``): both reduce the loss
+    returned by ``module.compute_loss``, which adds ``outputs.aux_loss``
+    without token normalization. Token-weighting microbatches would rescale
+    that auxiliary term (and drop it entirely on zero-label microbatches).
+
+    Weighting is enabled when the aux term is absent, decided in two steps:
+    (1) statically, for the inherited ``BaseCausalLMModule.forward`` or a
+    reviewed CE-only head with no router feature; (2) otherwise by abstractly
+    tracing ``compute_loss`` (``jax.eval_shape``, no compute) and checking that
+    no ``aux_loss``/``mtp_loss`` metric is produced. When aux is present, or
+    cannot be ruled out (custom ``compute_loss``/loss strategy, trace failure,
+    no batch), the result is ``None`` (uniform microbatch mean) and a one-time
+    warning names the reason. DFT bypasses compute_loss and explicitly ignores
+    the model's aux output, so it is always weighted.
+
+    Args:
+        call: A ``ScheduledStepCall`` (state on ``.state``) or a plain mapping
+            with ``loss_config``, ``loss_type``, ``state`` and (for the aux
+            probe) ``batch`` keys.
+
+    Returns:
+        tp.Callable | None: The valid-token weight callable, or ``None``.
+    """
+    if call.get("loss_type", "nll") == "dft":
+        return _make_base_scheduled_weight(call)
+    state = getattr(call, "state", None)
+    if state is None:
+        state = call.get("state")
+    try:
+        model = state.model if state is not None else None
+    except AttributeError:
+        model = None
+    reason = _token_weight_blocker(model, call)
+    if reason is not None:
+        model_name = type(model).__name__
+        logger.warn_once(
+            f"Gradient accumulation / pipeline microbatches for {model_name} use the uniform microbatch mean "
+            f"instead of valid-token weighting: {reason}."
+        )
+        return None
+    return _make_base_scheduled_weight(call)
+
+
+def _compute_loss_emits_aux(model, batch, loss_config) -> bool:
+    """Abstractly trace ``compute_loss`` and report whether it adds an auxiliary loss.
+
+    ``EasyDeLBaseModule.compute_loss`` adds ``outputs.aux_loss`` to the loss and records it in
+    ``other_metrics["aux_loss"]`` only when the forward returns a non-None aux loss (router load
+    balancing, MTP). The presence of that key in the traced metrics is therefore an exact,
+    trace-time-static answer, with no numerical compute (``jax.eval_shape``).
+
+    Args:
+        model: Live module whose ``compute_loss`` is probed.
+        batch: Mapping of batch arrays (only shapes/dtypes are used).
+        loss_config: Loss configuration forwarded to ``compute_loss``.
+
+    Returns:
+        bool: ``True`` when the traced metrics carry an ``aux_loss`` or ``mtp_loss`` entry.
+    """
+
+    def _abstract(leaf):
+        if hasattr(leaf, "shape") and hasattr(leaf, "dtype"):
+            return jax.ShapeDtypeStruct(tuple(leaf.shape), leaf.dtype)
+        return leaf
+
+    def probe(minibatch):
+        minibatch = {k: v for k, v in minibatch.items() if k != _CE_TOKEN_SCALE_KEY}
+        call_batch = model.prepare_inputs_for_call(**minibatch)
+        labels = call_batch.pop("labels", None)
+        _, metrics = model.compute_loss(labels=labels, loss_config=loss_config, **call_batch)
+        return dict(metrics.other_metrics or {})
+
+    shapes = jax.eval_shape(probe, jax.tree_util.tree_map(_abstract, dict(batch)))
+    return "aux_loss" in shapes or "mtp_loss" in shapes
+
+
+def _token_weight_blocker(model, call) -> str | None:
+    """Explain why valid-token microbatch weighting is unsafe, or return ``None`` when it is safe.
+
+    Token weighting rescales every term of the loss by the microbatch's valid-token share. That is
+    exact for the token-mean cross-entropy but wrong for an auxiliary term (MoE router / MTP) that
+    ``compute_loss`` adds without token normalization. Weighting is therefore allowed only when the
+    objective provably has no such term: either statically (inherited or reviewed CE-only forward
+    with no router feature) or by abstractly tracing ``compute_loss`` and finding no aux metric.
+
+    Args:
+        model: The trainer state's module (may be ``None``).
+        call: Scheduled call or mapping; supplies ``batch`` and ``loss_config`` for the probe.
+
+    Returns:
+        str | None: Human-readable reason to fall back to uniform weighting, else ``None``.
+    """
+    structural = _structural_clm_blocker(model)
+    if structural is not None:
+        return structural
+    model_type = type(model)
+    if _has_reviewed_ce_only_forward(model_type) and getattr(model, "_router_aux_loss_feature", False) is None:
+        return None
+    batch = call.get("batch")
+    if batch is None:
+        batch = getattr(call, "batch", None)
+    if batch is None:
+        return "the forward may add an unnormalized auxiliary loss and no batch is available to prove otherwise"
+    try:
+        emits_aux = _compute_loss_emits_aux(model, batch, call.get("loss_config"))
+    except (AttributeError, KeyError, NotImplementedError, RuntimeError, TypeError, ValueError) as exc:
+        return (
+            "the forward may add an unnormalized auxiliary loss and tracing compute_loss to check failed "
+            f"({type(exc).__name__}: {exc})"
+        )
+    if emits_aux:
+        return "compute_loss adds an unnormalized auxiliary loss (MoE router / MTP)"
+    return None
 
 
 def _make_base_scheduled_weight(call):
@@ -454,29 +626,39 @@ def _make_base_scheduled_weight(call):
     """
     loss_config = call.get("loss_config")
     loss_type = call.get("loss_type", "nll")
-    semantics = _base_scheduled_weight_semantics(loss_config, loss_type)
-    if semantics is None:
+    count = _valid_token_count_fn(loss_config, loss_type)
+    if count is None:
         return None
     if loss_type != "dft" and not _model_uses_causal_lm_loss(call):
         # ``dft`` computes its own causal-LM metrics and never consults the
         # model's loss function, so it keeps the valid-token weight.
         return None
-    ignore_index = -100 if loss_config is None else int(loss_config.ignore_index)
-    # ``dft`` always shifts inside ``_dft_causal_lm_metrics`` regardless of
-    # ``loss_config.shift_tokens`` — the weight must shift with it.
-    shift = True if (loss_type == "dft" or loss_config is None) else bool(loss_config.shift_tokens)
 
     def scheduled_weight(tree, batch):
-        """Return this microbatch's valid-token count as a scalar array.
-
-        Args:
-            tree: Model parameter tree (unused).
-            batch: Microbatch-sliced input mapping.
-
-        Returns:
-            jax.Array: Scalar float32 token count.
-        """
+        """Return this microbatch's valid-token count as a scalar array."""
         del tree
+        return count(batch)
+
+    return scheduled_weight
+
+
+def _valid_token_count_fn(loss_config, loss_type: str):
+    """Return ``batch -> scalar`` counting the tokens the causal-LM loss normalizes by.
+
+    Mirrors the denominator of ``ForCausalLMLoss``: shifted labels, ``ignore_index``
+    validity, ANDed with the shifted attention mask when present. ``None`` when the
+    loss is not a valid-token mean (see :func:`_base_scheduled_weight_semantics`).
+    """
+    semantics = _base_scheduled_weight_semantics(loss_config, loss_type)
+    if semantics is None:
+        return None
+    ignore_index = -100 if loss_config is None else int(loss_config.ignore_index)
+    # ``dft`` always shifts inside ``_dft_causal_lm_metrics`` regardless of
+    # ``loss_config.shift_tokens`` — the count must shift with it.
+    shift = True if (loss_type == "dft" or loss_config is None) else bool(loss_config.shift_tokens)
+
+    def count(batch):
+        """Return the batch's valid-token count as a float32 scalar."""
         labels = batch.get("labels")
         if labels is None:
             labels = batch.get("input_ids")
@@ -504,7 +686,107 @@ def _make_base_scheduled_weight(call):
             base = valid
         return jnp.sum(base * valid)
 
-    return scheduled_weight
+    return count
+
+
+# Per-row batch leaf carrying ``B / W`` (global rows over global valid tokens). It lets each
+# microbatch rescale ONLY its cross-entropy term so the uniform microbatch mean reproduces the
+# full-batch valid-token CE while the auxiliary (router / MTP) term keeps its uniform mean.
+_CE_TOKEN_SCALE_KEY = "__easydel_ce_token_scale__"
+
+
+def _structural_clm_blocker(model) -> str | None:
+    """Reason the model's loss is not the standard causal-LM ``compute_loss``, else ``None``."""
+    if not isinstance(model, BaseCausalLMModule):
+        return "the model is not a BaseCausalLMModule"
+    model_type = type(model)
+    if model_type.compute_loss is not EasyDeLBaseModule.compute_loss:
+        return "the model overrides compute_loss"
+    if model_type.loss_strategy is not EasyDeLBaseModule.loss_strategy:
+        return "the model overrides loss_strategy"
+    try:
+        if model.loss_function is not ForCausalLMLoss or type(model.loss_strategy) is not CausalLMLossStrategy:
+            return "the model does not use the causal-LM loss"
+    except AttributeError:
+        return "the model does not expose a resolvable loss function"
+    return None
+
+
+def _ce_aux_split_count(call):
+    """Valid-token count fn when the CE term can be token-weighted separately from aux, else ``None``.
+
+    Applies only to the standard causal-LM ``compute_loss`` (loss = token-mean CE + aux) with a
+    valid-token-mean loss config; DFT never adds aux, so it never needs the split.
+    """
+    loss_type = call.get("loss_type", "nll")
+    if loss_type == "dft":
+        return None
+    state = getattr(call, "state", None)
+    if state is None:
+        state = call.get("state")
+    try:
+        model = state.model if state is not None else None
+    except AttributeError:
+        model = None
+    if _structural_clm_blocker(model) is not None:
+        return None
+    return _valid_token_count_fn(call.get("loss_config"), loss_type)
+
+
+def _ce_token_scale_leaf(count, batch) -> jax.Array:
+    """Per-row ``B / W`` leaf for the full batch (``0`` when the batch has no valid tokens)."""
+    rows = _infer_batch_size(batch)
+    total = jnp.asarray(count(batch), jnp.float32)
+    value = jnp.where(total > 0, jnp.float32(rows) / jnp.maximum(total, 1.0), jnp.float32(0.0))
+    return jnp.full((rows,), value, dtype=jnp.float32)
+
+
+def _split_ce_aux_objective(loss, metrics, scale_leaf, count, minibatch):
+    """Rescale only the CE part of ``loss = CE + aux`` by ``w_i * B / (W * rows_i)``.
+
+    Averaging these per-microbatch objectives uniformly over the ``B / rows_i`` equal
+    microbatches gives ``sum_i w_i CE_i / W + mean_i aux_i``: the full-batch valid-token CE plus
+    the uniform-mean auxiliary term. Zero-label microbatches keep their aux gradient.
+
+    The reported metrics are split the same way (r11 S13-2): ``loss`` becomes the split objective
+    and the valid-token-normalized ``accuracy`` / ``z_loss`` take the same CE factor, so their
+    uniform microbatch mean is the full-batch token-weighted value. ``aux_loss`` stays uniform and
+    ``weight_sum`` is untouched. Returns ``(loss, metrics)`` unchanged when no aux term was
+    produced or no scale leaf is present.
+
+    Returns:
+        tuple: ``(objective, metrics)``.
+    """
+    aux = (getattr(metrics, "other_metrics", None) or {}).get("aux_loss")
+    if scale_leaf is None or aux is None:
+        return loss, metrics
+    rows = scale_leaf.shape[0]
+    ce = loss - aux
+    scale = jnp.asarray(count(minibatch), jnp.float32) * jnp.mean(scale_leaf) / jnp.float32(rows)
+    objective = ce * scale.astype(ce.dtype) + aux
+
+    def _scaled(value):
+        if value is None:
+            return None
+        value = jnp.asarray(value)
+        return value * scale.astype(value.dtype)
+
+    metrics = metrics.replace(
+        loss=jax.lax.stop_gradient(objective),
+        accuracy=_scaled(metrics.accuracy),
+        z_loss=_scaled(metrics.z_loss),
+    )
+    return objective, metrics
+
+
+def _base_scheduled_prepare_batch(call):
+    """Attach the CE token-scale leaf when the scheduled loss may need the CE/aux split."""
+    batch = dict(call.batch)
+    batch.pop(_CE_TOKEN_SCALE_KEY, None)
+    count = _ce_aux_split_count(call)
+    if count is not None:
+        batch[_CE_TOKEN_SCALE_KEY] = _ce_token_scale_leaf(count, batch)
+    return batch
 
 
 register_scheduled_loss_adapter(
@@ -514,6 +796,10 @@ register_scheduled_loss_adapter(
         make_loss=_make_base_scheduled_loss,
         make_cache_key=_base_scheduled_loss_cache_key,
         has_aux=True,
-        make_microbatch_weight=_make_base_scheduled_weight,
+        # Adds the CE token-scale leaf so aux-producing models split CE (token-weighted) from aux.
+        prepare_batch=_base_scheduled_prepare_batch,
+        # Same CE-only guard as the SPMD step: models that can add an auxiliary loss use the
+        # uniform microbatch mean, with the CE/aux split restoring valid-token CE weighting.
+        make_microbatch_weight=_make_base_spmd_weight,
     ),
 )

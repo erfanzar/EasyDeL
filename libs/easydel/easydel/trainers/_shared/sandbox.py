@@ -51,7 +51,14 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import typing as tp
+
+# Pipe readers retain only the configured prefix; excess output is drained in
+# fixed-size chunks so neither normal completion nor timeout can exhaust RAM.
+_CAPTURE_CHUNK_SIZE = 8192
+_RUNTIME_PATH = "/usr/local/bin:/usr/bin:/bin"
 
 _POSIX = os.name == "posix"
 # Return code of a child killed by the RLIMIT_CPU backstop. SIGXCPU is POSIX-only,
@@ -61,7 +68,7 @@ _CPU_BUDGET_RETURNCODE: int | None = -signal.SIGXCPU if _POSIX else None
 
 # Environment variables that are safe to expose to sandboxed processes. Anything
 # else (API keys, cloud creds, proxies, JAX/XLA/TPU coordinator vars) is dropped.
-_ENV_ALLOWLIST = ("PATH", "LANG", "LC_ALL", "TZ", "HOME", "TMPDIR")
+_ENV_ALLOWLIST = ("LANG", "LC_ALL", "TZ")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -92,7 +99,7 @@ class Sandbox:
         _timeout (float): Wall-clock budget (seconds) per execution.
         _cpu_seconds (int): ``RLIMIT_CPU`` soft/hard cap.
         _memory_mb (int): ``RLIMIT_AS`` address-space cap (MiB); 0 disables it.
-        _max_output (int): Byte cap applied to captured stdout/stderr.
+        _max_output (int): Character cap applied independently to stdout/stderr.
         _network (bool): Allow network egress (only enforceable under a jail).
         _jail (list[str] | None): Resolved bwrap/nsjail wrapper argv, or None.
     """
@@ -114,7 +121,8 @@ class Sandbox:
                 SIGKILLed when it elapses.
             cpu_seconds: ``RLIMIT_CPU`` cap; defaults to ``ceil(timeout) + 1``.
             memory_mb: ``RLIMIT_AS`` address-space cap in MiB (0 to disable).
-            max_output: Byte cap for captured stdout/stderr.
+            max_output: Character cap for each captured stream. Excess output is
+                drained and discarded without buffering it.
             network: Permit network egress. Only actually enforced when a jail
                 (bwrap/nsjail) is used; without one, egress cannot be blocked.
             use_jail: ``"auto"`` (wrap with bwrap/nsjail if present, else plain
@@ -132,8 +140,9 @@ class Sandbox:
         # plain non-zero exit instead of a timeout.
         self._cpu_seconds = int(cpu_seconds) if cpu_seconds is not None else math.ceil(self._timeout) + 1
         self._memory_mb = int(memory_mb)
-        self._max_output = int(max_output)
+        self._max_output = max(0, int(max_output))
         self._network = bool(network)
+        self._jail_owns_limits = False
         self._jail = self._resolve_jail(use_jail)
 
     def _resolve_jail(self, use_jail: str) -> list[str] | None:
@@ -154,14 +163,51 @@ class Sandbox:
             return None
         bwrap = shutil.which("bwrap")
         if bwrap:
-            argv = [bwrap, "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--die-with-parent"]
+            argv = [
+                bwrap,
+                "--unshare-user",
+                "--unshare-pid",
+                "--unshare-ipc",
+                "--unshare-uts",
+                "--cap-drop",
+                "ALL",
+                "--die-with-parent",
+            ]
+            # Start with bwrap's empty root, not a read-only view of the host.
+            # System executables/libraries and the base Python installation are
+            # sufficient for isolated Python and shell execution. In particular,
+            # never mount the venv prefix: it may contain the trainer repository.
+            runtime_dirs = ["/usr", "/bin", "/sbin", "/lib", "/lib64"]
+            base_prefix = os.path.realpath(sys.base_prefix)
+            if not any(base_prefix == path or base_prefix.startswith(path + "/") for path in runtime_dirs):
+                if base_prefix == "/":
+                    raise RuntimeError("Cannot safely expose a Python runtime rooted at /.")
+                runtime_dirs.append(base_prefix)
+            for path in runtime_dirs:
+                if os.path.exists(path):
+                    argv += ["--ro-bind", path, path]
+            argv += ["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"]
             if not self._network:
                 argv.append("--unshare-net")
+            else:
+                # DNS needs only these configuration files, never all of /etc.
+                for path in ("/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf"):
+                    if os.path.exists(path):
+                        argv += ["--ro-bind", path, path]
             return argv
         nsjail = shutil.which("nsjail")
         if nsjail:
-            argv = [nsjail, "-Mo", "--really_quiet", "--"]
-            return argv if self._network else [nsjail, "-Mo", "--really_quiet", "--disable_clone_newnet", "--"]
+            argv = [nsjail, "-Mo", "--really_quiet"]
+            # nsjail isolates the network namespace by default; --disable_clone_newnet
+            # shares the host network, so it is only passed when egress is allowed.
+            if self._network:
+                argv.append("--disable_clone_newnet")
+            # nsjail resets the child's rlimits to its own defaults, overriding any
+            # inherited ones, so the sandbox caps are passed as nsjail flags.
+            argv += ["--rlimit_cpu", str(self._cpu_seconds)]
+            argv += ["--rlimit_as", str(self._memory_mb) if self._memory_mb > 0 else "inf"]
+            self._jail_owns_limits = True
+            return [*argv, "--"]
         if use_jail == "required":
             raise RuntimeError("Sandbox jail required but neither bwrap nor nsjail is on PATH.")
         return None
@@ -209,10 +255,17 @@ class Sandbox:
         Returns:
             A :class:`SandboxResult`.
         """
-        full_argv = (self._jail + argv) if self._jail else argv
         env = {k: os.environ[k] for k in _ENV_ALLOWLIST if k in os.environ}
-        env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
+        env["PATH"] = _RUNTIME_PATH
         tmp = tempfile.mkdtemp(prefix="edsandbox-")
+        env.update(HOME=tmp, TMPDIR=tmp)
+        if self._jail and not self._jail_owns_limits:
+            # Mount only this execution's writable directory. Resolve the venv
+            # executable to its base interpreter, avoiding a mount of host home
+            # or the repository just to follow the venv's interpreter symlink.
+            full_argv = [*self._jail, "--bind", tmp, tmp, "--chdir", tmp, "--", os.path.realpath(argv[0]), *argv[1:]]
+        else:
+            full_argv = (self._jail + argv) if self._jail else argv
         try:
             proc = subprocess.Popen(
                 full_argv,
@@ -222,38 +275,82 @@ class Sandbox:
                 cwd=tmp,
                 env=env,
                 text=True,
-                preexec_fn=self._limits() if not self._jail else None,  # jail owns its own limits
+                errors="replace",
+                # rlimits survive exec, so they bound a bwrap-wrapped child too; only
+                # nsjail overrides them, and it receives the caps as flags instead.
+                preexec_fn=None if self._jail_owns_limits else self._limits(),
                 start_new_session=_POSIX,
             )
-            try:
-                out, err = proc.communicate(input=stdin, timeout=self._timeout)
-                return SandboxResult(
-                    ok=proc.returncode == 0,
-                    stdout=out[: self._max_output],
-                    stderr=err[: self._max_output],
-                    returncode=proc.returncode,
-                    # RLIMIT_CPU is the backstop for the wall clock, so a child it
-                    # kills has exhausted its time budget just as surely as one the
-                    # timeout path reaps -- and it can win the race whenever this
-                    # thread is slow to observe its own deadline.
-                    timed_out=_CPU_BUDGET_RETURNCODE is not None and proc.returncode == _CPU_BUDGET_RETURNCODE,
-                )
-            except subprocess.TimeoutExpired:
-                self._kill_group(proc)
-                out, err = proc.communicate()
-                return SandboxResult(
-                    ok=False,
-                    stdout=(out or "")[: self._max_output],
-                    stderr=(err or "")[: self._max_output],
-                    returncode=proc.returncode,
-                    timed_out=True,
-                )
+            out, err, timed_out = self._capture(proc, stdin)
+            # RLIMIT_CPU can win the race against the wall-clock deadline.
+            timed_out |= _CPU_BUDGET_RETURNCODE is not None and proc.returncode == _CPU_BUDGET_RETURNCODE
+            return SandboxResult(
+                ok=proc.returncode == 0 and not timed_out,
+                stdout=out,
+                stderr=err,
+                returncode=proc.returncode,
+                timed_out=timed_out,
+            )
         except Exception as exc:  # pragma: no cover - launch failure (e.g. missing interpreter)
             return SandboxResult(
                 ok=False, stdout="", stderr=f"{type(exc).__name__}: {exc}", returncode=None, timed_out=False
             )
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+    def _capture(self, proc: subprocess.Popen, stdin: str | None) -> tuple[str, str, bool]:
+        """Drain both pipes concurrently, retaining at most one prefix per stream.
+
+        Reader and optional stdin-writer threads share the execution deadline.
+        This also times out descendants holding pipes open after the child exits.
+        Excess output is discarded, including after a timeout kill, rather than
+        accumulated by ``communicate()``.
+        """
+        buffers: list[list[str]] = [[], []]
+
+        def read_stream(stream: tp.TextIO, parts: list[str]) -> None:
+            remaining = self._max_output
+            with stream:
+                while chunk := stream.read(_CAPTURE_CHUNK_SIZE):
+                    if remaining:
+                        prefix = chunk[:remaining]
+                        parts.append(prefix)
+                        remaining -= len(prefix)
+
+        def write_stdin() -> None:
+            with proc.stdin:
+                try:
+                    proc.stdin.write(stdin)
+                    proc.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    pass  # The child may exit without consuming its input.
+
+        workers = [
+            threading.Thread(target=read_stream, args=(stream, parts), daemon=True)
+            for stream, parts in zip((proc.stdout, proc.stderr), buffers, strict=True)
+        ]
+        if stdin is not None:
+            workers.append(threading.Thread(target=write_stdin, daemon=True))
+        deadline = time.monotonic() + self._timeout
+        for worker in workers:
+            worker.start()
+        timed_out = False
+        try:
+            proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+            for worker in workers:
+                worker.join(timeout=max(0.0, deadline - time.monotonic()))
+            timed_out = any(worker.is_alive() for worker in workers)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+        if timed_out:
+            self._kill_group(proc)
+            proc.wait()
+            # A descendant could deliberately leave the process group. Do not
+            # let its open pipe defeat the deadline; daemon readers still retain
+            # only the bounded prefix until the remaining descriptors close.
+            for worker in workers:
+                worker.join(timeout=0.1)
+        return "".join(buffers[0]), "".join(buffers[1]), timed_out
 
     @staticmethod
     def _kill_group(proc: subprocess.Popen) -> None:
@@ -266,7 +363,10 @@ class Sandbox:
             proc.kill()
             return
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            # start_new_session makes the child's PID its process-group ID.
+            # Keep using that ID if wait() already reaped the group leader while
+            # grandchildren still hold stdout/stderr open.
+            os.killpg(proc.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             proc.kill()
 

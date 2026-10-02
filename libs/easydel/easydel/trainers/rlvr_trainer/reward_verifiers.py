@@ -198,15 +198,8 @@ class MathVerifier:
         if batch is None:
             return [None] * n
 
-        raw_answers = batch.get(self._answer_key)
-        if raw_answers is None:
-            return [None] * n
-
-        if isinstance(raw_answers, str):
-            raw_answers = [raw_answers] * n
-
         result = []
-        for ans in raw_answers:
+        for ans in _get_column(batch, self._answer_key, n):
             if isinstance(ans, str):
                 match = _HASH_ANSWER_RE.search(ans)
                 if match:
@@ -345,17 +338,7 @@ class CodeVerifier:
             list[str | None]: Test-code strings of length ``n``; entries
             are ``None`` when no test source is provided for that index.
         """
-        if batch is None:
-            return [None] * n
-        tests = batch.get(self._test_key)
-        if tests is None:
-            return [None] * n
-        if isinstance(tests, str):
-            return [tests] * n
-        result = list(tests)
-        while len(result) < n:
-            result.append(None)
-        return result
+        return _get_column(batch, self._test_key, n)
 
 
 class FormatVerifier:
@@ -502,8 +485,9 @@ def _to_text_list(completions: tp.Any) -> list[str]:
 def _get_column(batch: dict[str, tp.Any] | None, key: str, n: int) -> list[tp.Any]:
     """Read a per-example column from the batch, padded/broadcast to length ``n``.
 
-    A scalar column is broadcast to every row; a shorter column is padded
-    with ``None``. Mirrors the gold-answer extraction used by the built-in
+    A scalar column is broadcast to every row; a column whose length divides
+    ``n`` is repeated prompt-major (each prompt's value covers all of its
+    generations). Mirrors the gold-answer extraction used by the built-in
     verifiers so custom verifiers stay aligned with the completion order.
 
     Args:
@@ -512,8 +496,14 @@ def _get_column(batch: dict[str, tp.Any] | None, key: str, n: int) -> list[tp.An
         n: Number of completions the result must cover.
 
     Returns:
-        A list of length ``>= n`` (``None``-padded); ``[None] * n`` when the
-        batch or column is absent.
+        A list of length ``>= n``; ``[None] * n`` when the batch or column is
+        absent or empty.
+
+    Raises:
+        ValueError: If the column is non-empty, shorter than ``n`` and its
+            length does not divide ``n``. Padding with ``None`` there would
+            silently misalign metadata with completions (the tail completions
+            would be scored against no gold answer).
     """
     if batch is None:
         return [None] * n
@@ -523,6 +513,15 @@ def _get_column(batch: dict[str, tp.Any] | None, key: str, n: int) -> list[tp.An
     if isinstance(col, str):
         return [col] * n
     result = list(col)
+    if 0 < len(result) < n and n % len(result) == 0:
+        # GRPO emits prompt-major completions: each prompt's reward metadata
+        # must accompany all of its generations, not only its first row.
+        return [value for value in result for _ in range(n // len(result))]
+    if 0 < len(result) < n:
+        raise ValueError(
+            f"Reward metadata column {key!r} has {len(result)} entries, which does not divide the {n} completions; "
+            "cannot align it prompt-major with the rollout layout."
+        )
     while len(result) < n:
         result.append(None)
     return result

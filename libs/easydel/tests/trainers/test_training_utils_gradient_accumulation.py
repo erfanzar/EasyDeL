@@ -13,10 +13,20 @@
 # limitations under the License.
 
 import dataclasses
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
+from easydel.infra.loss_utils import ForCausalLMLoss, LossConfig, LossMetrics
+from easydel.modules._base.causal_lm_module import BaseCausalLMModule
 from easydel.trainers import training_utils
+from easydel.trainers.trainer._fn import (
+    _CE_TOKEN_SCALE_KEY,
+    _ce_token_scale_leaf,
+    _make_base_spmd_weight,
+    _split_ce_aux_objective,
+    _valid_token_count_fn,
+)
 from easydel.trainers.training_utils import compile_trainer_step, make_assertions_and_get_sizes, minibatch_call
 
 
@@ -82,6 +92,201 @@ def test_minibatch_call_preserves_non_batch_leaves_across_accumulation():
 
     assert jnp.allclose(grads, full_grads)
     assert jnp.allclose(metrics, full_loss)
+
+
+def test_minibatch_call_token_weighted_matches_full_batch_token_mean():
+    # Microbatches hold different numbers of valid tokens (3 vs 1). A uniform average of
+    # per-microbatch token means differs from the full-batch token mean; weighting each
+    # microbatch by its valid-token count must reproduce the full-batch value and gradient.
+    state = _DummyState(graphstate=jnp.asarray(1.5, dtype=jnp.float32))
+    batch = {
+        "x": jnp.asarray([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]], dtype=jnp.float32),
+        "mask": jnp.asarray([[1.0, 1.0], [1.0, 0.0], [0.0, 0.0], [0.0, 1.0]], dtype=jnp.float32),
+    }
+
+    def loss_fn(param, minibatch):
+        per_token = (param * minibatch["x"]) ** 2
+        loss = jnp.sum(per_token * minibatch["mask"]) / jnp.maximum(jnp.sum(minibatch["mask"]), 1.0)
+        return loss, loss
+
+    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+    (full_loss, _), full_grads = grad_fn(state.graphstate, batch)
+
+    uniform_grads, uniform_metrics = minibatch_call(state=state, batch=batch, minibatch_size=2, grad_fn=grad_fn)
+    assert not jnp.allclose(uniform_metrics, full_loss)
+    assert not jnp.allclose(uniform_grads, full_grads)
+
+    grads, metrics = minibatch_call(
+        state=state,
+        batch=batch,
+        minibatch_size=2,
+        grad_fn=grad_fn,
+        microbatch_weight_fn=lambda _tree, mb: jnp.sum(mb["mask"]),
+    )
+    assert jnp.allclose(metrics, full_loss, rtol=1e-6)
+    assert jnp.allclose(grads, full_grads, rtol=1e-6)
+
+
+def test_minibatch_call_sums_weight_sum_in_uniform_and_weighted_branches():
+    state = _DummyState(graphstate=jnp.asarray(1.5, dtype=jnp.float32))
+    batch = {
+        "x": jnp.asarray([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]], dtype=jnp.float32),
+        "mask": jnp.asarray([[1, 1], [1, 0], [0, 0], [0, 1]], dtype=jnp.float32),
+    }
+
+    def loss_fn(param, mb):
+        count = jnp.sum(mb["mask"])
+        loss = jnp.sum(param * mb["x"] * mb["mask"]) / jnp.maximum(count, 1.0)
+        return loss, LossMetrics(loss=loss, weight_sum=count, accuracy=loss)
+
+    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+    (_, full_metrics), full_grads = grad_fn(state.graphstate, batch)
+    uniform_grads, uniform_metrics = minibatch_call(state, batch, 2, grad_fn)
+    weighted_grads, weighted_metrics = minibatch_call(
+        state, batch, 2, grad_fn, microbatch_weight_fn=lambda _tree, mb: jnp.sum(mb["mask"])
+    )
+    assert jnp.allclose(full_metrics.weight_sum, 4.0)
+    assert jnp.allclose(uniform_metrics.weight_sum, full_metrics.weight_sum)
+    assert jnp.allclose(weighted_metrics.weight_sum, full_metrics.weight_sum)
+    assert jnp.allclose(weighted_grads, full_grads)
+    assert jnp.allclose(weighted_metrics.loss, full_metrics.loss)
+    assert jnp.allclose(weighted_metrics.accuracy, full_metrics.accuracy)
+    assert not jnp.allclose(uniform_grads, full_grads)
+
+
+def test_aux_capable_causal_lm_uses_uniform_microbatch_gradients():
+    # The inherited causal-LM forward can add router aux through this feature.
+    # Avoid constructing/forwarding a real model here; the gating decision is
+    # made from the same static model shape before tracing the training step.
+    class _AuxCapableCausalLM(BaseCausalLMModule):
+        loss_function = property(lambda self: ForCausalLMLoss)
+        _router_aux_loss_feature = object()
+
+    model = object.__new__(_AuxCapableCausalLM)
+
+    # The same inherited forward with its router feature absent is provably
+    # CE-only and retains the token-mean weighting improvement.
+    class _PureCausalLM(BaseCausalLMModule):
+        loss_function = property(lambda self: ForCausalLMLoss)
+        _router_aux_loss_feature = None
+
+    pure_call = {"state": SimpleNamespace(model=object.__new__(_PureCausalLM)), "loss_config": LossConfig()}
+    assert _make_base_spmd_weight(pure_call) is not None
+    call = {"state": SimpleNamespace(model=model), "loss_config": LossConfig(), "loss_type": "nll"}
+    weight_fn = _make_base_spmd_weight(call)
+    assert weight_fn is None
+
+    state = _DummyState(graphstate=jnp.asarray(2.0, dtype=jnp.float32))
+    batch = {
+        "x": jnp.asarray([1.0, 2.0, 3.0, 4.0], dtype=jnp.float32),
+        "mask": jnp.asarray([0.0, 0.0, 1.0, 1.0], dtype=jnp.float32),
+    }
+
+    def loss_fn(param, mb):
+        count = jnp.sum(mb["mask"])
+        ce = jnp.sum(param * mb["x"] * mb["mask"]) / jnp.maximum(count, 1.0)
+        aux = jnp.mean(param * mb["x"])
+        loss = ce + aux
+        return loss, LossMetrics(loss=loss, weight_sum=count, other_metrics={"aux_loss": aux})
+
+    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+    (_, first_metrics), first_grad = grad_fn(state.graphstate, {key: val[:2] for key, val in batch.items()})
+    (_, second_metrics), second_grad = grad_fn(state.graphstate, {key: val[2:] for key, val in batch.items()})
+    grads, metrics = minibatch_call(state, batch, 2, grad_fn, microbatch_weight_fn=weight_fn)
+    assert jnp.allclose(grads, (first_grad + second_grad) / 2)
+    assert jnp.allclose(
+        metrics.other_metrics["aux_loss"],
+        (first_metrics.other_metrics["aux_loss"] + second_metrics.other_metrics["aux_loss"]) / 2,
+    )
+    assert jnp.allclose(metrics.weight_sum, 2.0)
+    # If token weights were incorrectly applied, the first aux gradient would
+    # disappear with its zero valid-label count.
+    incorrectly_weighted_grads, _ = minibatch_call(
+        state, batch, 2, grad_fn, microbatch_weight_fn=lambda _tree, mb: jnp.sum(mb["mask"])
+    )
+    assert not jnp.allclose(grads, incorrectly_weighted_grads)
+
+
+def test_ce_aux_split_matches_full_batch_ce_plus_mean_aux():
+    """Uniform mean of split objectives == full-batch valid-token CE + mean aux (S13-4).
+
+    Microbatch 0 has no valid labels: its CE must contribute nothing while its aux still does.
+    """
+    state = _DummyState(graphstate=jnp.asarray(1.5, dtype=jnp.float32))
+    x = jnp.asarray([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0], [1.0, -2.0, 3.0]], dtype=jnp.float32)
+    labels = jnp.asarray([[-100, -100, -100], [-100, -100, -100], [0, 1, 2], [0, 1, -100]], dtype=jnp.int32)
+    count = _valid_token_count_fn(LossConfig(), "nll")
+    batch = {"x": x, "labels": labels}
+    batch[_CE_TOKEN_SCALE_KEY] = _ce_token_scale_leaf(count, batch)
+
+    def parts(param, mb):
+        valid = (mb["labels"][:, 1:] != -100).astype(jnp.float32)
+        per_tok = param * mb["x"][:, 1:]
+        ce = jnp.sum(per_tok * valid) / jnp.maximum(jnp.sum(valid), 1.0)
+        aux = jnp.mean(param * mb["x"])
+        return ce, aux
+
+    def loss_fn(param, mb):
+        mb = dict(mb)
+        scale = mb.pop(_CE_TOKEN_SCALE_KEY)
+        ce, aux = parts(param, mb)
+        valid = (mb["labels"][:, 1:] != -100).astype(jnp.float32)
+        # A token-normalized accuracy stand-in: fraction of valid tokens with positive score.
+        hits = ((param * mb["x"][:, 1:]) > 2.0).astype(jnp.float32)
+        accuracy = jnp.sum(hits * valid) / jnp.maximum(jnp.sum(valid), 1.0)
+        metrics = LossMetrics(loss=ce + aux, accuracy=accuracy, other_metrics={"aux_loss": aux})
+        return _split_ce_aux_objective(ce + aux, metrics, scale, count, mb)
+
+    grads, metrics = minibatch_call(state, batch, 2, jax.value_and_grad(loss_fn, has_aux=True))
+
+    def expected(param):
+        valid = (labels[:, 1:] != -100).astype(jnp.float32)
+        ce_full = jnp.sum(param * x[:, 1:] * valid) / jnp.sum(valid)
+        aux_mean = (jnp.mean(param * x[:2]) + jnp.mean(param * x[2:])) / 2
+        return ce_full + aux_mean
+
+    want = jax.grad(expected)(state.graphstate)
+    assert jnp.allclose(grads, want, rtol=1e-6), (grads, want)
+    # r11 S13-2: the reported loss is the differentiated objective, and the token-normalized
+    # accuracy is the full-batch valid-token value, not the uniform mean of per-microbatch values.
+    assert jnp.allclose(metrics.loss, expected(state.graphstate), rtol=1e-6), metrics.loss
+    valid = (labels[:, 1:] != -100).astype(jnp.float32)
+    hits = ((state.graphstate * x[:, 1:]) > 2.0).astype(jnp.float32)
+    want_acc = jnp.sum(hits * valid) / jnp.sum(valid)
+    assert jnp.allclose(metrics.accuracy, want_acc, rtol=1e-6), (metrics.accuracy, want_acc)
+    assert jnp.allclose(
+        metrics.other_metrics["aux_loss"], (jnp.mean(1.5 * x[:2]) + jnp.mean(1.5 * x[2:])) / 2, rtol=1e-6
+    )
+
+    # Negative control: the old uniform mean of unsplit (CE_i + aux_i) is a different gradient.
+    def unsplit(param, mb):
+        mb = {k: v for k, v in mb.items() if k != _CE_TOKEN_SCALE_KEY}
+        ce, aux = parts(param, mb)
+        return ce + aux, LossMetrics(loss=ce + aux)
+
+    old, _ = minibatch_call(state, batch, 2, jax.value_and_grad(unsplit, has_aux=True))
+    assert not jnp.allclose(old, want, rtol=1e-3)
+
+
+def test_minibatch_call_all_zero_weights_fall_back_to_uniform_average():
+    state = _DummyState(graphstate=jnp.asarray(2.0, dtype=jnp.float32))
+    batch = {"x": jnp.asarray([1.0, -2.0, 3.0, -4.0], dtype=jnp.float32)}
+
+    def loss_fn(param, minibatch):
+        loss = jnp.mean(param * minibatch["x"])
+        return loss, loss
+
+    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+    uniform_grads, uniform_metrics = minibatch_call(state=state, batch=batch, minibatch_size=2, grad_fn=grad_fn)
+    grads, metrics = minibatch_call(
+        state=state,
+        batch=batch,
+        minibatch_size=2,
+        grad_fn=grad_fn,
+        microbatch_weight_fn=lambda _tree, _mb: jnp.float32(0.0),
+    )
+    assert jnp.allclose(grads, uniform_grads)
+    assert jnp.allclose(metrics, uniform_metrics)
 
 
 def test_compile_trainer_step_delegates_to_spx_jit(monkeypatch):

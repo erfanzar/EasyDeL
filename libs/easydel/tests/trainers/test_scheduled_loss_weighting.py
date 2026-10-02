@@ -31,9 +31,12 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 from easydel.infra.loss_utils import ForCausalLMLoss, LossConfig
+from easydel.modules._base.causal_lm_module import BaseCausalLMModule
+from easydel.trainers import training_utils
 from easydel.trainers.trainer._fn import (
     _base_scheduled_weight_semantics,
     _make_base_scheduled_weight,
+    training_step,
 )
 
 _B, _T, _V = 4, 12, 32
@@ -171,3 +174,46 @@ def test_weight_fn_is_none_for_non_causal_lm_heads():
     # dft computes its own causal-LM metrics and keeps the weight regardless
     # of the head's declared loss function.
     assert _make_base_scheduled_weight(_FakeCall(loss_name="ForQuestionAnsweringLoss", loss_type="dft")) is not None
+
+
+class _ScheduledCall:
+    """ScheduledStepCall-shaped stand-in: state is an attribute, bound args via ``get``."""
+
+    def __init__(self, model, **bound):
+        self.state = type("_State", (), {"model": model})()
+        self._bound = bound
+
+    def get(self, name, default=None):
+        return self._bound.get(name, default)
+
+
+def test_registered_mpmd_adapter_uses_uniform_weighting_for_aux_capable_models():
+    """The scheduled (MPMD) adapter must apply the same CE-only guard as the SPMD step.
+
+    ``compute_loss`` adds the model's auxiliary loss (MoE router / MTP) without token
+    normalization; token-weighting microbatches would rescale it and drop it entirely on
+    zero-label microbatches. Aux-capable models must keep the uniform microbatch mean.
+    """
+    adapter = training_utils._SCHEDULED_LOSS_ADAPTERS[training_utils._scheduled_step_key(training_step)]
+    assert adapter.make_microbatch_weight is not None
+
+    class _AuxCapableCausalLM(BaseCausalLMModule):
+        loss_function = property(lambda self: ForCausalLMLoss)
+        _router_aux_loss_feature = object()
+
+    class _PureCausalLM(BaseCausalLMModule):
+        loss_function = property(lambda self: ForCausalLMLoss)
+        _router_aux_loss_feature = None
+
+    aux_call = _ScheduledCall(object.__new__(_AuxCapableCausalLM), loss_config=LossConfig(), loss_type="nll")
+    pure_call = _ScheduledCall(object.__new__(_PureCausalLM), loss_config=LossConfig(), loss_type="nll")
+
+    assert adapter.make_microbatch_weight(aux_call) is None
+    weight_fn = adapter.make_microbatch_weight(pure_call)
+    assert weight_fn is not None
+    _, labels, attention_mask = _make_batch(seed=3)
+    metrics = ForCausalLMLoss(
+        jax.random.normal(jax.random.PRNGKey(4), (_B, _T, _V)), labels, attention_mask=attention_mask
+    )
+    got = weight_fn(None, {"labels": labels, "attention_mask": attention_mask})
+    assert jnp.allclose(got, metrics.weight_sum), (got, metrics.weight_sum)
