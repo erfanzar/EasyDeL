@@ -103,6 +103,7 @@ from easydel.layers import (
 from easydel.layers.embeddings import NGramEmbed
 from easydel.layers.indexer import BlockTopKIndexer
 from easydel.layers.indexer._block_topk import apply_partial_rope
+from easydel.layers.indexer._paged_block_topk import paged_block_topk
 from easydel.layers.norms import lowfloats
 from easydel.modules._base import BaseCausalLMModule, BaseVisionLanguageModule
 from easydel.modules.qwen3_5.modeling_qwen3_5 import _get_rope_index_from_mm_token_types
@@ -263,6 +264,7 @@ class Qwen4ExpPagedQSAView(RaggedPagesCacheView):
 
     indexer_key_pages: Float[Array, "num_pages page_size index_dim"] | None = None
     mrope_position_pages: Int[Array, "num_pages page_size 3"] | None = None
+    indexer_block_pages: Float[Array, "num_pages blocks_per_page index_dim"] | None = None
 
     @classmethod
     def init(
@@ -304,6 +306,11 @@ class Qwen4ExpPagedQSAView(RaggedPagesCacheView):
                 dtype=jnp.int32,
                 device=sidecar_sharding,
             ),
+            indexer_block_pages=jnp.zeros(
+                (config.num_pages, config.page_size // int(config.qwen4_indexer_compress_ratio), index_dim),
+                dtype=jnp.float32,
+                device=sidecar_sharding,
+            ),
         )
 
     def reset(self) -> "Qwen4ExpPagedQSAView":
@@ -311,6 +318,7 @@ class Qwen4ExpPagedQSAView(RaggedPagesCacheView):
             kv_pages=jnp.zeros_like(self.kv_pages),
             indexer_key_pages=jnp.zeros_like(self.indexer_key_pages),
             mrope_position_pages=jnp.zeros_like(self.mrope_position_pages),
+            indexer_block_pages=jnp.zeros_like(self.indexer_block_pages),
         )
 
 
@@ -593,33 +601,61 @@ class Qwen4ExpAttention(Qwen3NextFullAttention):
             jnp.where(valid[:, None], raw_k.astype(key_pages.dtype), 0), mode="drop"
         )
         pos_pages = pos_pages.at[physical, offset].set(jnp.where(valid[:, None], rows.astype(jnp.int32), 0), mode="drop")
+        blocks_per_page = page_size // ratio
+        padded_keys = key_pages
+        padded_positions = pos_pages
+        group_offset = (offset // ratio) * ratio
+        member_offsets = group_offset[:, None] + jnp.arange(ratio, dtype=jnp.int32)[None]
+        member_keys = padded_keys[physical[:, None], member_offsets]
+        pooled = jnp.mean(member_keys.astype(jnp.float32), axis=1).astype(raw_k.dtype)
+        pooled = self.indexer.k_layernorm(pooled)
+        block_rows = padded_positions[physical, group_offset]
+        block_cos, block_sin = self.rotary.compute_cos_sin(block_rows.T[:, None, :], dtype=jnp.float32)
+        pooled_rope = apply_partial_rope(pooled[:, None, :], block_cos, block_sin)[:, 0]
+
+        block_pages = jnp.pad(cache_view.indexer_block_pages, ((0, 1), (0, 0), (0, 0)))
+        complete = valid & ((logical + 1) % ratio == 0)
+        block_in_page = group_offset // ratio
+        block_dst = jnp.where(complete, physical * blocks_per_page + block_in_page, num_pages * blocks_per_page)
+        flat_block_pages = block_pages.reshape((num_pages + 1) * blocks_per_page, -1)
+        flat_block_pages = flat_block_pages.at[block_dst].set(
+            jnp.where(complete[:, None], pooled_rope.astype(block_pages.dtype), 0), mode="drop"
+        )
+        block_pages = flat_block_pages.reshape(num_pages + 1, blocks_per_page, -1)[:-1]
         key_pages = key_pages[:-1]
         pos_pages = pos_pages[:-1]
-        cache_view = cache_view.replace(indexer_key_pages=key_pages, mrope_position_pages=pos_pages)
+        cache_view = cache_view.replace(
+            indexer_key_pages=key_pages,
+            mrope_position_pages=pos_pages,
+            indexer_block_pages=block_pages,
+        )
 
         tables = meta.pages_tables.reshape(meta.query_start_loc.shape[0] - 1, -1)
-        blocks_per_page = page_size // ratio
-        max_blocks = min(tables.shape[1] * blocks_per_page, num_pages * blocks_per_page)
+        q_cos, q_sin = self.rotary.compute_cos_sin(rows.transpose(1, 0)[:, :, None], dtype=jnp.float32)
+        q_flat = apply_partial_rope(q.reshape(total, self.indexer.index_n_heads, -1), q_cos, q_sin)
 
         def _select_all(_):
             return self.indexer.select_prefix(logical).indices
 
         def _rank_blocks(_):
-            block = jnp.arange(max_blocks, dtype=jnp.int32)[None, :]
-            block_page = block // blocks_per_page
-            block_in_page = block % blocks_per_page
-            phys_block_page = jnp.clip(tables[req[:, None], block_page], 0, num_pages - 1)
-            physical_raw = key_pages.reshape(num_pages, blocks_per_page, ratio, key_pages.shape[-1])
-            physical_pooled = self.indexer.k_layernorm(
-                jnp.mean(physical_raw.astype(jnp.float32), axis=2).astype(raw_k.dtype)
-            ).reshape(num_pages * blocks_per_page, -1)
-            physical_rows = pos_pages[:, ::ratio].reshape(num_pages * blocks_per_page, 3)
-            block_cos, block_sin = self.rotary.compute_cos_sin(physical_rows.T[:, None, :], dtype=jnp.float32)
-            physical_keys = apply_partial_rope(physical_pooled[None], block_cos, block_sin)[0]
-            q_cos, q_sin = self.rotary.compute_cos_sin(rows.transpose(1, 0)[:, :, None], dtype=jnp.float32)
-            q_flat = apply_partial_rope(q.reshape(total, self.indexer.index_n_heads, -1), q_cos, q_sin)
-            physical_block = phys_block_page * blocks_per_page + block_in_page
-            return self.indexer.select_paged(q_flat, physical_keys, physical_block, logical, valid).indices
+            block_ids = paged_block_topk(
+                q_flat,
+                block_pages,
+                tables,
+                req,
+                jnp.maximum(logical + 1, 0) // ratio,
+                self.indexer.block_topk,
+                precision=self.indexer.precision,
+                kernel_mesh=None,
+            )
+            expanded = self.indexer._expand_selection(
+                block_ids[:, None],
+                block_ids[:, None] >= 0,
+                jnp.zeros((1,), jnp.int32),
+                logical[:, None],
+                valid[:, None],
+            )
+            return expanded[:, 0]
 
         selected = jax.lax.cond(
             jnp.all((logical + 1 <= self.indexer.token_budget) | ~valid),
@@ -2720,6 +2756,7 @@ class Qwen4ExpForCausalLM(BaseCausalLMModule[Qwen4ExpTextModel, Qwen4ExpTextConf
         for idx, layer_type in enumerate(self.config.layer_types):
             if self.config.qsa_enabled and layer_type == QWEN4_FULL and idx < len(configs) and configs[idx] is not None:
                 object.__setattr__(configs[idx], "qwen4_indexer_head_dim", self.config.indexer_head_dim)
+                object.__setattr__(configs[idx], "qwen4_indexer_compress_ratio", self.config.indexer_compress_ratio)
             if idx in self.config.ple_layer_indices_0based and idx < len(configs) and configs[idx] is not None:
                 object.__setattr__(configs[idx], "qwen4_with_ple", True)
                 object.__setattr__(configs[idx], "qwen4_ple_conv_dim", self.config.hidden_size * self.config.hc_count)
@@ -3317,6 +3354,7 @@ class Qwen4ExpForConditionalGeneration(BaseVisionLanguageModule[Qwen4ExpModel, Q
         for idx, layer_type in enumerate(text.layer_types):
             if text.qsa_enabled and layer_type == QWEN4_FULL and idx < len(configs) and configs[idx] is not None:
                 object.__setattr__(configs[idx], "qwen4_indexer_head_dim", text.indexer_head_dim)
+                object.__setattr__(configs[idx], "qwen4_indexer_compress_ratio", text.indexer_compress_ratio)
             if idx in text.ple_layer_indices_0based and idx < len(configs) and configs[idx] is not None:
                 object.__setattr__(configs[idx], "qwen4_with_ple", True)
                 object.__setattr__(configs[idx], "qwen4_ple_conv_dim", text.hidden_size * text.hc_count)

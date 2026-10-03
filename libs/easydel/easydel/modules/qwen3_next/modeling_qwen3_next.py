@@ -60,11 +60,6 @@ from dataclasses import dataclass
 import jax
 import jax.numpy as jnp
 import spectrax as spx
-from ejkernel.modules import AllGatherConfig as _EjAllGatherConfig
-from ejkernel.modules import all_gather as ej_all_gather
-from ejkernel.modules.operations.ragged_causal_conv1d import (
-    _reorder_concatenated_tensor_for_sharding,
-)
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec
@@ -133,6 +128,7 @@ from easydel.layers import (
     torch_interleave_segments_for_tp,
     with_tp_last_axis_sharding,
 )
+from easydel.layers._sharding import all_gather_then_dot
 from easydel.layers.attention import UnifiedAttention
 from easydel.layers.linear_attention import (
     apply_conv_with_state,
@@ -146,6 +142,7 @@ from easydel.operations.kernels import (
     GatedDeltaRuleOutput,
     RaggedGatedDeltaRule,
     ragged_causal_conv1d_head_sharded,
+    reorder_conv_features_for_sharding,
 )
 from easydel.utils import is_inference_mode
 
@@ -200,9 +197,6 @@ def _qwen3_next_tp_size(config: Qwen3NextConfig) -> int:
     return tensor_parallel_size(config)
 
 
-_QWEN3_NEXT_AG_CFG = _EjAllGatherConfig(mode="ring", platform="xla", backend="any")
-
-
 def _qwen3_next_tp_sharded_column_matmul(
     hidden_states: Array,
     kernel: Array,
@@ -212,8 +206,8 @@ def _qwen3_next_tp_sharded_column_matmul(
 ) -> Array | None:
     """Column matmul over TP-feature-sharded hidden states without changing weight layout.
 
-    Gathers the feature axis inside ``shard_map`` (via the unified ejkernel
-    ``all_gather``) and runs one full-K einsum against the local column shard.
+    Gathers the feature axis inside ``shard_map`` and runs one full-K einsum
+    against the local column shard.
 
     MEASURED (v5p-8, tp=4, bf16): explicit AG+dot beats the previous
     K-streaming ppermute ring at every shape — decode [16,1,2048]x4096:
@@ -249,13 +243,7 @@ def _qwen3_next_tp_sharded_column_matmul(
     out_spec = PartitionSpec(*tuple(hidden_spec[:-1]), tp_axis)
 
     def _gather_dot_body(x_local: Array, w_local: Array) -> Array:
-        x_full = ej_all_gather(x_local, tp_axis, gather_axis=x_local.ndim - 1, cfg=_QWEN3_NEXT_AG_CFG)
-        return jnp.einsum(
-            "...i,io->...o",
-            x_full,
-            w_local,
-            precision=precision,
-        )
+        return all_gather_then_dot(x_local, w_local, tp_axis, precision=precision)
 
     mapped = jax.shard_map(
         _gather_dot_body,
@@ -1520,7 +1508,7 @@ def _qwen3_next_spec_window_prep(
         # The persistent conv-state pool is stored in the interleaved
         # per-shard feature layout (see ragged_causal_conv1d_head_sharded);
         # bring the window token columns into the same layout.
-        token_cols = _reorder_concatenated_tensor_for_sharding(
+        token_cols = reorder_conv_features_for_sharding(
             token_cols, split_sizes, int(mesh_axis_size(mesh, head_axis)), -1
         )
     combined_cols = jnp.concatenate(

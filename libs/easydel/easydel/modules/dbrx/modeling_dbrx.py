@@ -74,8 +74,16 @@ from easydel.infra.modeling_outputs import (
 )
 from easydel.infra.sharding import is_mpmd_mesh
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
-from easydel.layers import ColumnParallelLinear, Embed, ParallelLinear, RowParallelLinear
+from easydel.layers import (
+    ColumnParallelLinear,
+    Embed,
+    MoeLoadBalancingStrategy,
+    MoeRoutingStrategy,
+    ParallelLinear,
+    RowParallelLinear,
+)
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
+from easydel.layers.moe import BaseMoeModule
 from easydel.layers.norms import LayerNorm
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
 
@@ -665,32 +673,32 @@ class DbrxExperts(spx.Module):
             rngs=rngs,
         )
 
-    def forward(
-        self,
-        x: Array,
-        top_weights: Array,
-        top_experts: Array,
-    ):
-        """Forward pass through all experts with weighted aggregation.
+    def forward(self, rows: Array, group_sizes: Array, sorted_experts: Array | None = None) -> Array:
+        """Expert SwiGLU over expert-sorted token rows (the ``BaseMoeModule`` standard-path contract).
 
-        Iterates through all experts, applies each to the input, and aggregates
-        the outputs based on the routing weights assigned by the router.
+        ``DbrxFFN`` normally dispatches through the fused path with stacked kernels built from the same weights; this
+        method serves ``MoEMethods.STANDARD_MOE``, which calls the expert layer directly.
 
         Args:
-            x (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
-            top_weights (Array): Top-k routing weights for selected experts.
-            top_experts (Array): Indices of top-k selected experts.
+            rows (Array): Token rows sorted by expert, shape ``(num_rows, d_model)``.
+            group_sizes (Array): Rows per expert, shape ``(moe_num_experts,)``.
+            sorted_experts (Array | None): Expert id per row (unused; ``group_sizes`` defines the grouping).
 
         Returns:
-            Array: Aggregated expert outputs of shape (batch_size, sequence_length, hidden_dim).
+            Array: Expert outputs per row, shape ``(num_rows, d_model)``.
         """
-        final_hidden_state = jnp.zeros_like(x)
-        for index in range(self.config.ffn_config.moe_num_experts):
-            output_moe_layer = self.mlp(x, index)
-            final_hidden_state += (
-                jnp.sum(jnp.multiply(index == top_experts, top_weights), axis=-1)[:, :, None] * output_moe_layer
-            )
-        return final_hidden_state
+        del sorted_experts
+        experts = self.config.ffn_config.moe_num_experts
+        expert_shape = (experts, self.config.ffn_config.ffn_hidden_size, self.config.d_model)
+        # DBRX stores each expert matrix as ``[ffn_hidden_size, d_model]``: gate/up use the transpose, down the matrix.
+        wi = self.mlp.w1.value.reshape(expert_shape).swapaxes(-1, -2)
+        wu = self.mlp.v1.value.reshape(expert_shape).swapaxes(-1, -2)
+        wd = self.mlp.w2.value.reshape(expert_shape)
+        group_sizes = group_sizes.astype(jnp.int32)
+        gate = jax.lax.ragged_dot(rows, wi.astype(rows.dtype), group_sizes, precision=self.precision)
+        up = jax.lax.ragged_dot(rows, wu.astype(rows.dtype), group_sizes, precision=self.precision)
+        hidden = (self.mlp.activation_fn(gate) * up).astype(rows.dtype)
+        return jax.lax.ragged_dot(hidden, wd.astype(rows.dtype), group_sizes, precision=self.precision)
 
 
 class DbrxRouter(spx.Module):
@@ -835,7 +843,7 @@ class DbrxRouter(spx.Module):
         return router_logits, top_weights, top_experts
 
 
-class DbrxFFN(spx.Module):
+class DbrxFFN(BaseMoeModule):
     """Feedforward network with mixture of experts for DBRX models.
 
     Combines router and expert networks to implement sparse MoE
@@ -870,7 +878,14 @@ class DbrxFFN(spx.Module):
             precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
             rngs (spx.Rngs): Random number generator state.
         """
-        super().__init__()
+        super().__init__(
+            config=config,
+            n_routed_experts=config.ffn_config.moe_num_experts,
+            num_experts_per_tok=config.ffn_config.moe_top_k,
+            hidden_size=config.d_model,
+            routing_strategy=MoeRoutingStrategy.TOP_K_NDIV,
+            load_balancing_strategy=MoeLoadBalancingStrategy.STANDARD,
+        )
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -911,9 +926,47 @@ class DbrxFFN(spx.Module):
                 dynamic_axes=common_types.HiddenStateSharding,
                 partition_manager=self.config.runtime_sharding_resolver,
             )
-        router_logits, top_weights, top_experts = self.router(x)
-        router_logits = checkpoint_name(router_logits, name="moe_router_logits")
-        out = checkpoint_name(self.experts(x, top_weights, top_experts), name="moe_expert_output")
+
+        def select_hook(scores: Array, _pre_bias: Array | None, k: int) -> tuple[Array, Array]:
+            weights, indices = jax.lax.top_k(scores, k=k)
+            norm_order = self.config.ffn_config.moe_normalize_expert_weights
+            if norm_order is not None:
+                order = float(norm_order)
+                denom = (
+                    jnp.sum(weights, axis=-1, keepdims=True)
+                    if order == 1.0
+                    else jnp.linalg.norm(weights, ord=order, axis=-1, keepdims=True)
+                )
+                weights = weights / denom
+            if self.config.ffn_config.uniform_expert_assignment:
+                indices = jax.lax.stop_gradient(
+                    (jnp.arange(indices.size, dtype=indices.dtype) % self.n_routed_experts).reshape(indices.shape)
+                )
+            return weights, indices
+
+        hooks = self.moe_hooks.replace(
+            normalize_gate_logits=lambda logits: jax.nn.softmax(logits.astype(jnp.float32), axis=-1),
+            select_hook=select_hook,
+            refine_weights_hook=None,
+        )
+        experts = self.experts.mlp
+        expert_count = self.config.ffn_config.moe_num_experts
+        intermediate = self.config.ffn_config.ffn_hidden_size
+        wi = experts.w1.value.reshape(expert_count, intermediate, self.config.d_model).swapaxes(-1, -2)
+        wu = experts.v1.value.reshape(expert_count, intermediate, self.config.d_model).swapaxes(-1, -2)
+        wd = experts.w2.value.reshape(expert_count, intermediate, self.config.d_model)
+        out, router_logits = self.moe_call(
+            hidden_state=x,
+            gate_layer=self.router.layer,
+            expert_layer=self.experts,
+            wi_kernel=wi,
+            wu_kernel=wu,
+            wd_kernel=wd,
+            act_fn=experts.activation_fn,
+            hooks=hooks,
+        )
+        router_logits = checkpoint_name(router_logits.reshape(x.shape[0], x.shape[1], -1), name="moe_router_logits")
+        out = checkpoint_name(out, name="moe_expert_output")
         if not _config_uses_mpmd(self.config):
             out = apply_logical_sharding(
                 out,

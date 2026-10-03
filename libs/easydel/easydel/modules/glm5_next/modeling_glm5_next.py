@@ -106,7 +106,7 @@ from easydel.layers import (
     split_fused_gate_up_projection,
 )
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
-from easydel.layers.indexer import IndexerConfig, IndexerKind, SparseIndexer
+from easydel.layers.indexer import IndexerConfig, IndexerKind, IndexerSelection, SparseIndexer, paged_pool_select
 from easydel.layers.linear_attention import apply_conv_with_state, apply_mask_to_padding_states
 from easydel.layers.moe import moe_group_topk_select
 from easydel.layers.norms import lowfloats
@@ -124,10 +124,11 @@ from easydel.operations.kernels import (
     KernelDeltaAttnOp,
     fused_kda_gate_per_channel,
 )
-from easydel.operations.kernels.kda import (
-    _chunked_scan_per_channel_rows,
-    _single_step_kda_per_channel_fwd_bthd,
+from easydel.operations.kernels.dsa_sparse_attention import (
+    sparse_selected_training_attention,
+    use_sparse_training_attention,
 )
+from easydel.operations.kernels.kda import kda_packed_rows_forward
 
 from .glm5_next_configuration import (
     LINEAR_ATTENTION_LAYER_TYPE,
@@ -1077,6 +1078,7 @@ class Glm5NextLinearAttention(spx.Module):
         v_conv_state = cache_view.v_conv_state if cache_view is not None else None
 
         conv_output_dtype = jnp.bfloat16 if self.dtype in lowfloats else self.dtype
+
         query, new_q_conv_state = apply_conv_with_state(
             query,
             self.q_conv1d,
@@ -1219,142 +1221,27 @@ class Glm5NextLinearAttention(spx.Module):
             :class:`AttentionLayerOutput` with the packed output row and the
             updated cache view.
         """
-        if query_start_loc.ndim == 2:  # rank-major DP: [dp, rows + 1]
-            query_start_loc = query_start_loc[0]
-        rows = query_start_loc.shape[0] - 1
         seq = hidden_states.shape[1]
-        starts = query_start_loc[:-1]
-        lens = query_start_loc[1:] - starts  # [rows]
-
-        q_row, k_row, v_row = query[0], key[0], value[0]
-        b_row, g_row = beta[0], decay[0]
-
-        # Index-clamped gather (NOT start-clamped slicing): the token bucket
-        # is padded to the compile width, so `starts[i] + seq` routinely
-        # overruns the buffer and a start-clamped dynamic_slice would clamp
-        # back to 0, silently feeding row 0's tokens to every later row.
-        def gather(x):
-            idx = jnp.clip(starts[:, None] + ar_post[None, :], 0, x.shape[0] - 1)
-            return x[idx]
-
-        ar_post = jnp.arange(seq)
-        q_r, k_r, v_r = gather(q_row), gather(k_row), gather(v_row)
-        b_r, g_r = gather(b_row), gather(g_row)
-
-        ar = jnp.arange(seq)
-        valid = (ar[None, :] < lens[:, None]).astype(q_r.dtype)  # [rows, T]
-
-        def mask(x):
-            shape = valid.shape + (1,) * (x.ndim - 2)
-            return jnp.where(valid.reshape(shape), x, 0.0)
-
-        q_r, k_r, v_r, b_r, g_r = mask(q_r), mask(k_r), mask(v_r), mask(b_r), mask(g_r)
-
-        # ---- causal depthwise conv per row -----------------------------
         conv_dtype = jnp.bfloat16 if self.dtype in lowfloats else self.dtype
-        conv_states = {
-            "q": cache_view.q_conv_state,
-            "k": cache_view.k_conv_state,
-            "v": cache_view.v_conv_state,
-        }
-        windows = {"q": q_r, "k": k_r, "v": v_r}
-        new_conv = {}
-        conv_outs = {}
-        # Carried-window rows: any row scheduled tokens beyond a fresh
-        # prefill (decode steps and chunked prefill continuations).
-        # ``context_lens`` counts tokens *including* this step, so a row
-        # with prior context satisfies context_lens > lens.
-        ctx = getattr(cache_metadata, "context_lens", None)
-        if ctx is None:
-            has_prefix = lens <= 1
-        else:
-            has_prefix = ctx > lens
-        for name in ("q", "k", "v"):
-            conv1d = getattr(self, f"{name}_conv1d")
-            kern = conv1d.weight.value.squeeze(1).T  # [d, d_conv]
-            x_rows = windows[name].astype(jnp.float32)
-            st = conv_states[name].astype(jnp.float32)  # [rows, d, d_conv]
-            d_conv = st.shape[-1]
-            prefix = jnp.where(has_prefix[:, None, None], st[:, :, 1:], 0.0).transpose(0, 2, 1)  # [rows, dc-1, d]
-            stream = jnp.concatenate([prefix, x_rows], axis=1)  # [rows, T + dc - 1, d]
-            out = jnp.zeros_like(stream[:, :seq, :])
-            for m in range(d_conv):
-                out = out + stream[:, m : m + seq, :] * kern[:, m][None, None, :]
-            out = jax.nn.silu(out).astype(conv_dtype)
-            conv_outs[name] = out
-            # New state = the trailing window ending at this row's LAST real
-            # token (stream offset dc-1+lens), not the padded bucket tail.
-            win_start = jnp.clip(lens - 1, 0, seq - 1)  # [rows]
-            win_idx = win_start[:, None] + jnp.arange(d_conv)[None, :]
-            candidate = stream[jnp.arange(rows)[:, None], win_idx].transpose(0, 2, 1)  # [rows, d, d_conv]
-            keep = (lens > 0)[:, None, None]
-            new_conv[name] = jnp.where(keep, candidate, st).astype(conv_states[name].dtype)
-
-        # ---- delta rule per row ----------------------------------------
-        num_heads = b_r.shape[-1]
-        head_k = q_r.shape[-1] // num_heads
-        head_v = v_r.shape[-1] // num_heads
-        qh = conv_outs["q"].reshape(rows, seq, num_heads, head_k).transpose(0, 2, 1, 3)  # [R, H, T, K]
-        kh = conv_outs["k"].reshape(rows, seq, num_heads, head_k).transpose(0, 2, 1, 3)
-        vh = conv_outs["v"].reshape(rows, seq, num_heads, head_v).transpose(0, 2, 1, 3)
-        bh = b_r.transpose(0, 2, 1)  # [R, H, T]
-        gh = g_r.reshape(rows, seq, num_heads, head_k).transpose(0, 2, 1, 3)
-        init_state = cache_view.recurrent_state  # [R, H, K, V]
-
-        all_single = jnp.all(lens <= 1)
-
-        def _single_path():
-            # qh/kh/vh are [R, H, T, D]; the kernel contract is BTHD
-            # [batch, seq=1, heads, dim] — take seq position 0 (each row's
-            # only token) and transpose the head axis into place.
-            out1, new_state = _single_step_kda_per_channel_fwd_bthd(
-                query=qh[:, :, :1, :].transpose(0, 2, 1, 3),
-                key=kh[:, :, :1, :].transpose(0, 2, 1, 3),
-                value=vh[:, :, :1, :].transpose(0, 2, 1, 3),
-                beta=bh[:, :, :1].transpose(0, 2, 1),
-                decay=gh[:, :, :1, :].transpose(0, 2, 1, 3),
-                recurrent_state=init_state,
-                use_qk_l2norm=True,
-            )
-            # unify with the chunk path: [R, H, T, V] float32
-            out1 = jnp.transpose(out1, (0, 2, 1, 3)).astype(jnp.float32)
-            out1 = jnp.pad(out1, ((0, 0), (0, 0), (0, seq - 1), (0, 0)))
-            return out1, new_state.astype(jnp.float32)
-
-        def _chunk_path():
-            return _chunked_scan_per_channel_rows(
-                query=qh,
-                key=kh,
-                value=vh,
-                beta=bh,
-                decay=gh,
-                initial_state=init_state,
-                token_valid=valid,
-                chunk_size=_KDA_CHUNK_SIZE,
-            )
-
-        out_h, new_recurrent = jax.lax.cond(all_single, _single_path, _chunk_path)
-
-        # scatter per-row outputs back into the packed stream via gather
-        head_v_dim = vh.shape[-1]
-        out_rows = out_h.transpose(0, 2, 1, 3).reshape(rows, seq, num_heads, head_v_dim)  # [R, T, H, V]
-        seg_ids = jnp.sum(query_start_loc[1:, None] <= ar[None, :], axis=0)  # [T]
-        seg_ids = jnp.clip(seg_ids, 0, rows - 1)
-        pos_in_row = jnp.clip(ar - query_start_loc[seg_ids], 0, seq - 1)
-        out_packed = out_rows[seg_ids, pos_in_row].astype(hidden_states.dtype)[None]  # [1, T, H, V]
-
+        out_packed, new_cache_view = kda_packed_rows_forward(
+            query=query,
+            key=key,
+            value=value,
+            beta=beta,
+            decay=decay,
+            conv_kernels=tuple(getattr(self, f"{n}_conv1d").weight.value.squeeze(1).T for n in ("q", "k", "v")),
+            cache_view=cache_view,
+            query_start_loc=query_start_loc,
+            context_lens=getattr(cache_metadata, "context_lens", None),
+            conv_dtype=conv_dtype,
+            chunk_size=_KDA_CHUNK_SIZE,
+        )
+        num_heads, head_v_dim = out_packed.shape[2], out_packed.shape[3]
         output_gate = self.g_b_proj(self.g_a_proj(hidden_states))
         output_gate = output_gate.reshape(1, seq, num_heads, head_v_dim)
-        output = self.o_norm(out_packed, output_gate)
+        output = self.o_norm(out_packed.astype(hidden_states.dtype), output_gate)
         output = output.reshape(1, seq, -1)
         output = checkpoint_name(self.o_proj(output), name="attn_output")
-
-        new_cache_view = cache_view.update_kda_states(
-            new_q_conv_state=new_conv["q"],
-            new_k_conv_state=new_conv["k"],
-            new_v_conv_state=new_conv["v"],
-            new_recurrent_state=new_recurrent.astype(cache_view.recurrent_state.dtype),
-        )
         return AttentionLayerOutput(
             attention_output=output,
             attention_weight=None,
@@ -1663,6 +1550,8 @@ class Glm5NextDSAAttention(UnifiedAttention):
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
+        previous_topk_indices: Array | None = None,
+        return_topk_indices: bool = False,
     ):
         """Run the NoPE MLA forward with the k-pool DSA top-k mask.
 
@@ -1724,22 +1613,65 @@ class Glm5NextDSAAttention(UnifiedAttention):
                 q_mask = q_mask[:, :q_len]
             q_mask = q_mask.astype(bool)
 
-        indexer_out = self.indexer(
-            hidden_states=hidden_states,
-            q_resid=q_resid,
-            attention_mask=q_mask,
-            cached_packed=cached_packed_states,
+        # Ragged serving with paged indexer state: selections are chunk (pool) ids over the
+        # real per-request history and attention runs through the sparse MLA op.
+        qsl = getattr(cache_metadata, "query_start_loc", None) if cache_metadata is not None else None
+        # Decided from the shared cache config, not this view's buffers: "shared" indexer
+        # layers own no indexer pages but must still route the reused chunk ids to the sparse op.
+        paged_indexer = (
+            isinstance(cache_view, MLARaggedPagesCacheView)
+            and bool(getattr(getattr(cache_view, "metadata", None), "has_indexer_pages", False))
+            and getattr(cache_metadata, "pages_tables", None) is not None
+            and qsl is not None
+            # 1-D (single replica) or rank-major [dp, rows + 1] (data-parallel serving).
+            and qsl.ndim in (1, 2)
         )
-        topk_indices, packed_states = indexer_out.topk_indices, indexer_out.packed_state
 
-        if has_recurrent_slot and hasattr(cache_view, "replace"):
-            try:
-                cache_view = cache_view.replace(recurrent_state=packed_states.astype(cache_view.key.dtype))
-            except TypeError:
-                logger.warning_once(
-                    "Failed to store indexer packed states in cache_view.recurrent_state; "
-                    "cache structure may not support recurrent_state."
-                )
+        shared_indexer = self.config.indexer_types[self.layer_idx] == "shared"
+        if shared_indexer:
+            if previous_topk_indices is None:
+                raise ValueError("A shared GLM-5 indexer requires a preceding full layer's top-k selection.")
+            topk_indices = previous_topk_indices
+            indexer_out = None
+        elif paged_indexer:
+            from easydel.operations.kernels.multi_latent_ragged_page_attention import _resolve_distribution
+
+            # ``[..., 2]``: the live count, per rank for rank-major ([dp, 3]) distributions.
+            num_seqs = _resolve_distribution(cache_metadata)[..., 2]
+            topk_indices, token_pages, pool_pages = paged_pool_select(
+                self.indexer,
+                hidden_states.reshape(bsz * q_len, hidden_states.shape[-1]),
+                q_resid.reshape(bsz * q_len, q_resid.shape[-1]),
+                cache_view.indexer_token_pages,
+                cache_view.indexer_pool_pages,
+                jnp.asarray(cache_metadata.pages_tables, jnp.int32),
+                jnp.asarray(cache_metadata.context_lens, jnp.int32),
+                jnp.asarray(qsl, jnp.int32),
+                num_seqs,
+                constrain_rows=cache_view.constrain_indexer_rows,
+                constrain_pages=cache_view.constrain_indexer_pages,
+                kernel_mesh=cache_view.indexer_kernel_mesh(),
+                dp_sharding=cache_view.indexer_dp_sharding(),
+            )
+            cache_view = cache_view.replace(indexer_token_pages=token_pages, indexer_pool_pages=pool_pages)
+            indexer_out = None
+        else:
+            indexer_out = self.indexer(
+                hidden_states=hidden_states,
+                q_resid=q_resid,
+                attention_mask=q_mask,
+                cached_packed=cached_packed_states,
+            )
+            topk_indices, packed_states = indexer_out.topk_indices, indexer_out.packed_state
+
+            if has_recurrent_slot and hasattr(cache_view, "replace"):
+                try:
+                    cache_view = cache_view.replace(recurrent_state=packed_states.astype(cache_view.key.dtype))
+                except TypeError:
+                    logger.warning_once(
+                        "Failed to store indexer packed states in cache_view.recurrent_state; "
+                        "cache structure may not support recurrent_state."
+                    )
 
         causal_for_kernel = self.causal
         if mask_info is not None and getattr(mask_info, "_causal_baked", False):
@@ -1786,6 +1718,19 @@ class Glm5NextDSAAttention(UnifiedAttention):
                 "keys_pe": jnp.zeros((bsz, q_len, rope_width), compressed_kv.dtype),
                 "softmax_scale": self.attention_performer.softmax_scale,
             }
+            if paged_indexer and topk_indices is not None:
+                mla_kwargs["sparse_selected"] = topk_indices
+                mla_kwargs["sparse_chunk_size"] = int(self.config.index_kpool)
+            elif topk_indices is not None:
+                # No paged indexer state (cache built without indexer pages, or rank-major DP
+                # metadata): the selection cannot reach the MLA ragged kernel, so DSA layers
+                # attend densely. Say so, as glm_moe_dsa does.
+                logger.warning_once(
+                    "GLM-5-Next: MLA ragged-pages serving without paged indexer state (cache has no "
+                    "indexer pages, or rank-major DP metadata); DSA layers attend densely, which "
+                    "diverges from the reference once the context exceeds index_topk=%s tokens.",
+                    self.config.index_topk,
+                )
 
         (
             key_states,
@@ -1803,6 +1748,8 @@ class Glm5NextDSAAttention(UnifiedAttention):
             mask_info=mask_info,
         )
 
+        topk_mask = None
+        combined_mask = None
         if topk_indices is not None and not isinstance(cache_view, MLARaggedPagesCacheView):
             # The ragged-pages MLA kernel has no per-query mask input, so a
             # top-k mask built here is dead weight on the serving path — and
@@ -1810,13 +1757,44 @@ class Glm5NextDSAAttention(UnifiedAttention):
             # the packed window (garbage mask). Restrict the mask build to
             # dense (non-ragged) cache consumers, which do honor mask_info.
             kv_len = key_states.shape[1]
-            if q_len == kv_len or cached_packed_states is not None:
-                topk_mask = indexer_out.selection.to_mask(kv_len)
+            if q_len == kv_len or cached_packed_states is not None or shared_indexer:
+                selection = IndexerSelection(topk_indices) if shared_indexer else indexer_out.selection
+                topk_mask = selection.to_mask(kv_len)
                 attention_mask = (
                     pairwise_attention_mask_from_mask_info(mask_info, q_len, kv_len) if mask_info is not None else None
                 )
+                combined_mask = topk_mask if attention_mask is None else attention_mask & topk_mask
                 if attention_mask is not None:
-                    mask_info = mask_info.replace(attention_mask=(attention_mask & topk_mask)[:, None, :, :])
+                    mask_info = mask_info.replace(attention_mask=combined_mask[:, None, :, :])
+
+        if combined_mask is not None and use_sparse_training_attention(
+            self,
+            topk_indices,
+            cache_view,
+            mask_info,
+            output_attentions,
+            sliding_window_for_kernel,
+            seq_len=q_len,
+        ):
+            # Training/no-cache: same per-head q/k/v and top-k mask as the dense path, but a
+            # tile-skipping flash kernel instead of materialized [B, H, S, S] masked scores.
+            attn_heads = sparse_selected_training_attention(
+                query=query_states,
+                key=key_states,
+                value=value_states,
+                selection_mask=combined_mask,  # already includes padding / segments
+                mask_info=None,
+                softmax_scale=self.attention_performer.softmax_scale,
+                # Same causal flag as the dense path: False when the mask already bakes causality in.
+                causal=bool(causal_for_kernel),
+                dtype=getattr(self.config, "attn_dtype", None),
+                metadata=getattr(self.attention_performer, "metadata", None),
+            )
+            attn_output = attn_heads.astype(hidden_states.dtype).reshape(bsz, q_len, -1)
+            attn_output = checkpoint_name(self.output_projection(attn_output), name="attn_output")
+            attn_output = self.shard_attention_prod(attn_output)
+            result = AttentionLayerOutput(attention_output=attn_output, attention_weight=None, cache_view=cache_view)
+            return (result, topk_indices) if return_topk_indices else result
 
         softmax_aux = self._softmax_aux()
 
@@ -1859,11 +1837,12 @@ class Glm5NextDSAAttention(UnifiedAttention):
         attn_output = checkpoint_name(self.output_projection(attn_output), name="attn_output")
         attn_output = self.shard_attention_prod(attn_output)
 
-        return AttentionLayerOutput(
+        result = AttentionLayerOutput(
             attention_output=attn_output,
             attention_weight=attentions.attention_weights if output_attentions else None,
             cache_view=cache_view,
         )
+        return (result, topk_indices) if return_topk_indices else result
 
 
 class Glm5NextDecoderLayer(spx.Module):
@@ -2021,6 +2000,8 @@ class Glm5NextDecoderLayer(spx.Module):
         cache_metadata=None,
         output_attentions: bool = False,
         frequencies=None,
+        previous_topk_indices: Array | None = None,
+        return_topk_indices: bool = False,
     ) -> DecoderLayerOutput:
         """Run one GLM-5 decoder block over the residual streams.
 
@@ -2045,12 +2026,26 @@ class Glm5NextDecoderLayer(spx.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
+        topk_indices = previous_topk_indices
         if self.block_type == LINEAR_ATTENTION_LAYER_TYPE:
             attn_outputs = self.self_attn(
                 hidden_states=attn_input,
                 mask_info=mask_info,
                 cache_view=cache_view,
                 cache_metadata=cache_metadata,
+            )
+        elif return_topk_indices:
+            attn_outputs, topk_indices = self.self_attn.forward_mla(
+                attn_input,
+                mask_info,
+                position_ids,
+                mode,
+                cache_view,
+                cache_metadata,
+                output_attentions,
+                frequencies,
+                previous_topk_indices=previous_topk_indices,
+                return_topk_indices=True,
             )
         else:
             attn_outputs = self.self_attn(
@@ -2089,12 +2084,13 @@ class Glm5NextDecoderLayer(spx.Module):
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        return DecoderLayerOutput(
+        result = DecoderLayerOutput(
             hidden_states=hidden_states,
             attention_weight=attn_outputs.attention_weight,
             cache_view=attn_outputs.cache_view,
             router_logits=router_logits,
         )
+        return (result, topk_indices) if return_topk_indices else result
 
 
 @register_module(TaskType.BASE_MODULE, config=Glm5NextTextConfig, model_type="glm5_next_text")
@@ -2143,14 +2139,6 @@ class Glm5NextTextModel(EasyDeLBaseModule):
         self.param_dtype = param_dtype
         self.precision = precision
         self.rngs = rngs
-
-        if any(t == "shared" for t in (getattr(config, "indexer_types", None) or [])):
-            logger.warning_once(
-                "GLM-5-Next config declares 'shared' indexer layers, but this EasyDeL "
-                "implementation runs a full k-pool indexer on every DSA layer and does not "
-                "reuse a previous full layer's top-k selection. Logits match HF only for "
-                "all-'full' indexer schedules (the checkpoint default)."
-            )
 
         with self.assign_layer_stage(0, total_layers=self.config.num_hidden_layers):
             self.embed_tokens = Embed(
@@ -2295,6 +2283,7 @@ class Glm5NextTextModel(EasyDeLBaseModule):
             extra=needs_trace_cache or bool(output_router_logits),
         )
         cache_views = views if trace_layers else None
+        has_shared_indexers = "shared" in self.config.indexer_types
 
         def _layer_loop(block, carry):
             """Run one heterogeneous decoder layer inside the stack loop.
@@ -2310,7 +2299,10 @@ class Glm5NextTextModel(EasyDeLBaseModule):
             Returns:
                 Updated carry ``(streams, cache_views, ..., idx + 1)``.
             """
-            hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx = carry
+            if has_shared_indexers:
+                hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx, prev_topk = carry
+            else:
+                hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -2324,7 +2316,10 @@ class Glm5NextTextModel(EasyDeLBaseModule):
                     cache_metadata=cache_metadata,
                     output_attentions=output_attentions,
                     frequencies=self.frequencies,
+                    **({"previous_topk_indices": prev_topk, "return_topk_indices": True} if has_shared_indexers else {}),
                 )
+                if has_shared_indexers:
+                    layer_outputs, prev_topk = layer_outputs
 
             hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
@@ -2342,13 +2337,14 @@ class Glm5NextTextModel(EasyDeLBaseModule):
                 cache=past_key_values,
             )
 
-            return hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx + 1
+            result = (hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx + 1)
+            return (*result, prev_topk) if has_shared_indexers else result
 
-        hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
-            _layer_loop,
-            (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
-            trace=trace_layers,
-        )
+        initial = (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0)
+        if has_shared_indexers:
+            initial = (*initial, None)
+        final = self.layers.scan(_layer_loop, initial, trace=trace_layers)
+        hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _ = final[:6]
 
         # Unweighted mean over mHC streams, then final norm.
         hidden_states = self.norm(_hc_head_collapse(hidden_states))

@@ -16,7 +16,10 @@
 
 import easydel as ed
 import pytest
+import spectrax as spx
 import transformers
+from easydel.layers.moe import BaseMoeModule
+from easydel.modules.dbrx.modeling_dbrx import DbrxFFN
 from packaging import version
 
 try:
@@ -49,6 +52,46 @@ class TestDBRX:
             attn_config=ed.DbrxAttentionConfig(),
             max_seq_len=small_model_config["max_position_embeddings"],
         )
+
+    def test_sparse_moe_uses_grouped_dispatch(self, dbrx_config):
+        block = DbrxFFN(config=dbrx_config, rngs=spx.Rngs(0))
+        assert isinstance(block, BaseMoeModule)
+        assert block.experts.mlp.w1.value.shape[0] == (
+            dbrx_config.ffn_config.moe_num_experts * dbrx_config.ffn_config.ffn_hidden_size
+        )
+        assert "moe_call" in DbrxFFN.forward.__code__.co_names
+
+    def test_standard_moe_matches_fused_moe(self, dbrx_config):
+        """``MoEMethods.STANDARD_MOE`` (direct expert-layer call) equals the fused path on the same weights.
+
+        Covers the grouped expert forward of ``DbrxExperts`` and the per-call routing hooks (softmax + weight
+        renormalization) reaching the standard path.
+        """
+        import jax
+        import jax.numpy as jnp
+        import numpy as np
+
+        dbrx_config.moe_force_xla_gmm = True
+        x = jnp.asarray(np.random.default_rng(0).standard_normal((4, 8, dbrx_config.d_model)).astype(np.float32))
+        results = {}
+        states = {}
+        with dbrx_config.mesh:
+            for method in ("fused_moe", "standard_moe"):
+                dbrx_config.moe_method = method
+                block = DbrxFFN(
+                    config=dbrx_config,
+                    dtype=jnp.float32,
+                    param_dtype=jnp.float32,
+                    precision=jax.lax.Precision.HIGHEST,
+                    rngs=spx.Rngs(0),
+                )
+                states[method] = jax.tree_util.tree_leaves(spx.export(block)[1])
+                out, logits = block(x)
+                results[method] = (np.asarray(out), np.asarray(logits))
+        for a, b in zip(states["fused_moe"], states["standard_moe"], strict=True):
+            np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+        np.testing.assert_allclose(results["standard_moe"][1], results["fused_moe"][1], rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(results["standard_moe"][0], results["fused_moe"][0], rtol=1e-4, atol=1e-4)
 
     @pytest.mark.skipif(
         version.parse(transformers.__version__) < version.parse("5.17"),

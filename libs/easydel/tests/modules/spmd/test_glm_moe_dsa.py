@@ -154,26 +154,36 @@ class TestGLMMoeDSA:
         assert cache_cfg.head_dim == (config.qk_nope_head_dim + config.qk_rope_head_dim)
         assert cache_cfg.num_kv_heads == config.num_attention_heads
 
-    def test_indexer_preserves_negative_similarity_ranking(self):
-        """Indexer should keep the least-negative key when every similarity is < 0."""
+    @staticmethod
+    def _index(query, keys, weights, topk=1):
         op = object.__new__(GlmMoeDsaIndexerOp)
-        query_states = jnp.array([[[[-1.0]]]], dtype=jnp.float32)
-        key_states = jnp.array([[[1.0], [2.0], [3.0]]], dtype=jnp.float32)
-        head_weights = jnp.array([[[1.0]]], dtype=jnp.float32)
-        position_ids = jnp.array([[0]], dtype=jnp.int32)
-
-        output = GlmMoeDsaIndexerOp.forward_native(
+        q_len = len(query[0])
+        return GlmMoeDsaIndexerOp.forward_native(
             op,
-            query_states=query_states,
-            key_states=key_states,
-            head_weights=head_weights,
-            position_ids=position_ids,
+            query_states=jnp.asarray(query, jnp.float32),
+            key_states=jnp.asarray(keys, jnp.float32),
+            head_weights=jnp.asarray(weights, jnp.float32),
+            position_ids=jnp.arange(q_len, dtype=jnp.int32)[None],
             qk_rope_head_dim=0,
-            index_topk=1,
+            index_topk=topk,
             softmax_scale=1.0,
-        )
+        ).topk_indices.tolist()
 
-        assert output.topk_indices.tolist() == [[[0]]]
+    def test_indexer_clamps_negative_head_scores_like_hf(self):
+        """HF applies relu per head before weighting: a negative head must not cancel a positive one.
+
+        Head 0 scores keys [1, 3]; head 1 scores [-1, -3]. Without relu the weighted sums tie at 0
+        (top-k picks key 0); with relu they are [1, 3] and key 1 wins.
+        """
+        query = [[[[1.0], [-1.0]]]]  # [B=1, S=1, H=2, D=1]
+        keys = [[[1.0], [3.0]]]  # the query is the last key position, so both are visible
+        assert self._index(query, keys, [[[1.0, 1.0]]]) == [[[1]]]
+
+    def test_indexer_never_selects_future_keys(self):
+        """HF masks keys after the query before top-k; the last key scores highest for every query."""
+        query = [[[[1.0]], [[1.0]], [[1.0]]]]  # [B=1, S=3, H=1, D=1]
+        keys = [[[1.0], [2.0], [10.0]]]
+        assert self._index(query, keys, [[[1.0]] * 3]) == [[[0], [1], [2]]]
 
 
 if __name__ == "__main__":

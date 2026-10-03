@@ -16,6 +16,10 @@
 
 import easydel as ed
 import pytest
+import spectrax as spx
+from easydel.layers import ColumnParallelMoELinear, RowParallelMoELinear
+from easydel.layers.moe import BaseMoeModule
+from easydel.modules.grok_1.modeling_grok_1 import Grok1SparseMoeBlock
 
 try:
     from tests.modules.test_utils import CausalLMTester
@@ -40,6 +44,13 @@ class TestGrok1:
             num_experts=small_model_config.get("num_experts", 8),
             num_experts_per_tok=small_model_config.get("num_experts_per_tok", 2),
         )
+
+    def test_sparse_moe_uses_stacked_dispatch(self, grok1_config):
+        block = Grok1SparseMoeBlock(config=grok1_config, rngs=spx.Rngs(0))
+        assert isinstance(block, BaseMoeModule)
+        assert isinstance(block.experts.gate_up_proj, ColumnParallelMoELinear)
+        assert isinstance(block.experts.down_proj, RowParallelMoELinear)
+        assert "moe_call" in block.forward.__code__.co_names
 
     def test_causal_lm(self, grok1_config, small_model_config):
         """Test Grok1ForCausalLM."""

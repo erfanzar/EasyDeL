@@ -80,6 +80,7 @@ from easydel.layers import (
 )
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention, block_diagonal_bias
 from easydel.layers.norms import LayerNorm
+from easydel.layers.rotary import rotate_half as _rotate_half
 from easydel.modules._base import BaseVisionLanguageModule
 
 from .glm4v_configuration import Glm4vConfig, Glm4vTextConfig, Glm4vVisionConfig
@@ -146,20 +147,6 @@ def bicubic_border_resample_matrix(num_out: int, num_in: int) -> np.ndarray:
     matrix = np.zeros((num_out, num_in), dtype=f32)
     np.add.at(matrix, (np.repeat(np.arange(num_out), 4), taps.reshape(-1)), weights.reshape(-1))
     return matrix
-
-
-def _rotate_half(x: Array) -> Array:
-    """Rotate half of the hidden dimensions for rotary position embeddings.
-
-    Args:
-        x (Array): Input tensor with shape (..., hidden_dim).
-
-    Returns:
-        Array: Rotated tensor with the same shape as input.
-    """
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return jnp.concatenate([-x2, x1], axis=-1)
 
 
 def apply_rotary_pos_emb_vision(q: Array, k: Array, cos: Array, sin: Array) -> tuple[Array, Array]:
@@ -1752,7 +1739,6 @@ class Glm4vModel(EasyDeLBaseModule):
                 input_type_group.append((key, start_idx, end_idx))
 
             llm_pos_ids_list: list[np.ndarray] = []
-            video_frame_num = 1
             for modality_type, start_idx, end_idx in input_type_group:
                 st_idx = int(llm_pos_ids_list[-1].max() + 1) if len(llm_pos_ids_list) > 0 else 0
 
@@ -1778,13 +1764,12 @@ class Glm4vModel(EasyDeLBaseModule):
                     )
                     llm_pos_ids_list.append(np.stack([t_index, h_index, w_index], axis=0) + st_idx)
                     image_index += 1
-                    video_frame_num = 1
                 elif modality_type == "video":
                     assert video_grid is not None, "`video_grid_thw` must be provided for video tokens."
-                    _t = video_frame_num
                     h = int(video_grid[video_index][1])
                     w = int(video_grid[video_index][2])
-                    llm_grid_t = int(_t)
+                    # HF splits video_grid_thw into one (1, h, w) grid per frame.
+                    llm_grid_t = 1
                     llm_grid_h = h // spatial_merge_size
                     llm_grid_w = w // spatial_merge_size
 
@@ -1802,11 +1787,9 @@ class Glm4vModel(EasyDeLBaseModule):
                     if video_group_index >= int(video_grid[video_index][0]):
                         video_index += 1
                         video_group_index = 0
-                    video_frame_num += 1
                 else:
                     text_len = end_idx - start_idx
                     llm_pos_ids_list.append(np.arange(text_len, dtype=np.int32)[None, :].repeat(3, axis=0) + st_idx)
-                    video_frame_num = 1
 
             llm_positions = np.concatenate(llm_pos_ids_list, axis=1).reshape(3, -1)
             position_ids[:, i, valid] = llm_positions

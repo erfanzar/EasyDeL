@@ -130,10 +130,10 @@ class TestDeepseekV4:
     def test_training_path_through_fused_kernel(self, small_model_config, monkeypatch):
         """TRAINING PATH: route the stateless forward through the fused op.
 
-        With ``EASYDEL_COMPRESSED_WINDOW_ATTENTION_PLATFORM`` enabled, the
-        stateless training forward runs through the differentiable
-        ``compressed_window_attention`` ejkernel op (XLA reference) instead of
-        the inline dense ``_attend``. Asserts (1) full-model gradient parity vs
+        With ``_TRAIN_KERNEL_ENABLED`` set and ``_TRAIN_KERNEL_PLATFORM="xla"``,
+        the stateless training forward runs through the registered
+        ``CompressedWindowAttn`` adapter (XLA reference) instead of the inline
+        dense ``_attend``. Asserts (1) full-model gradient parity vs
         the dense path (the op's XLA math is the exact reference), and (2) a few
         ``value_and_grad`` + optimizer steps run with finite, changing params.
         """

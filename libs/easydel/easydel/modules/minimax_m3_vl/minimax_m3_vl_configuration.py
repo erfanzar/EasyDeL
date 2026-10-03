@@ -292,6 +292,8 @@ class MiniMaxM3VLTextConfig(EasyDeLBaseConfig):
             raise ValueError(f"`mlp_layer_types` entries must be 'dense' or 'sparse', got {invalid_mlp}.")
         self.mlp_layer_types = list(mlp_layer_types)
 
+        kwargs.setdefault("bos_token_id", 200034)
+        kwargs.setdefault("eos_token_id", 200020)
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
         # HF's rotary embedding reads the partial factor exclusively from
         # ``rope_parameters``; keep the duck-typed surface in sync so parity

@@ -75,6 +75,7 @@ from easydel.layers import (
 )
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention, block_diagonal_bias
 from easydel.layers.norms import LayerNorm
+from easydel.layers.rotary import rotate_half
 from easydel.modules._base import BaseVisionLanguageModule
 
 from .qwen2_vl_configuration import Qwen2VLConfig, Qwen2VLTextConfig, Qwen2VLVisionConfig
@@ -285,24 +286,6 @@ create_attention_mask = block_diagonal_bias
 # is the same algorithm, so bind the module-level name to it rather than
 # restating it. Keeping the name means call sites (and importers) are unchanged.
 merge_multimodal_embeddings = BaseVisionLanguageModule.merge_multimodal_embeddings
-
-
-def rotate_half(x):
-    """Rotate half the hidden dimensions of the input for rotary embeddings.
-
-    Splits the input tensor along the last dimension and swaps the two halves
-    with negation, which is the core operation for applying rotary position embeddings.
-
-    Args:
-        x (Array): Input tensor of shape (..., head_dim) where head_dim is even.
-
-    Returns:
-        Array: Rotated tensor of the same shape, where the first half of the last
-            dimension is negated and swapped with the second half.
-    """
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return jnp.concatenate([-x2, x1], axis=-1)
 
 
 def apply_rotary_pos_emb_vision(

@@ -72,6 +72,7 @@ from easydel.layers import (
 )
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention, block_diagonal_bias
 from easydel.layers.norms import LayerNorm
+from easydel.layers.rotary import rotate_half
 from easydel.modules._base import BaseVisionLanguageModule
 
 from .qwen3_vl_configuration import Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig
@@ -299,26 +300,6 @@ def get_rope_index(
 # is the same algorithm, so bind the module-level name to it rather than
 # restating it. Keeping the name means call sites (and importers) are unchanged.
 merge_multimodal_embeddings = BaseVisionLanguageModule.merge_multimodal_embeddings
-
-
-def rotate_half(x: Array) -> Array:
-    """Rotate the second half of the trailing dim by negation.
-
-    RoPE building block: given ``x = [a, b]`` along the last axis with
-    equal halves, returns ``[-b, a]``. Combining this with
-    ``cos``/``sin`` element-wise products implements the standard RoPE
-    rotation per pair of channels.
-
-    Args:
-        x: Tensor with an even-sized trailing dimension.
-
-    Returns:
-        Tensor of identical shape with halves swapped and the new lower
-        half negated.
-    """
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return jnp.concatenate([-x2, x1], axis=-1)
 
 
 def apply_rotary_pos_emb_vision(q: Array, k: Array, cos: Array, sin: Array) -> tuple[Array, Array]:
@@ -1109,10 +1090,17 @@ class Qwen3VisionTransformerPretrainedModel(EasyDeLBaseModule):
 
             return hidden_states, layer_num + 1
 
+        # Deepstack features are gathered into a Python list keyed by the
+        # traced layer number, which is incompatible with a compiled
+        # lax.scan body (``layer_num in deepstack_visual_indexes`` needs a
+        # concrete value and the append is a Python side effect). Keep the
+        # unrolled (traced) path whenever deepstack is configured.
         hidden_states, _ = self.blocks.scan(
             _layer_loop,
             (hidden_states, 0),
-            trace=not self.config.scan_layers or self._pipeline_stage_count() > 1,
+            trace=not self.config.scan_layers
+            or self._pipeline_stage_count() > 1
+            or bool(self.config.deepstack_visual_indexes),
         )
         hidden_states = self.merger(hidden_states)
         return hidden_states, deepstack_feature_lists
@@ -1630,13 +1618,16 @@ class Qwen3VLTextModel(EasyDeLBaseModule):
         views = past_key_values.views if past_key_values is not None else None
         has_cache_views = views is not None and any(v is not None for v in views)
         needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
+        # DeepStack injection indexes a Python list by layer index, so the stack must run
+        # traced (unrolled, integer ``idx``) whenever features are present (r11 S10-2).
+        has_deepstack = bool(deepstack_visual_embeds)
 
         trace_layers = self._layer_scan_trace(
             trace,
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
             cache_views=views,
-            extra=needs_trace_cache,
+            extra=needs_trace_cache or has_deepstack,
         )
         cache_views = views if trace_layers else None
 
@@ -1664,7 +1655,7 @@ class Qwen3VLTextModel(EasyDeLBaseModule):
                     frequencies=self.frequencies,
                 )
             hs = layer_outputs.hidden_states
-            if deepstack_visual_embeds is not None and idx < len(deepstack_visual_embeds):
+            if has_deepstack and idx < len(deepstack_visual_embeds):
                 hs = self._deepstack_process(
                     hs,
                     visual_pos_masks,

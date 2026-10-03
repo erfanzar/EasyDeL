@@ -782,7 +782,7 @@ class GPTNeoXModel(EasyDeLBaseModule):
 class GPTNeoXForCausalLM(BaseCausalLMModule[GPTNeoXModel, GPTNeoXConfig]):  # type: ignore
     """GPT-NeoX model with a language modeling head for autoregressive text generation.
 
-    This model extends GPTNeoXModel with a linear language modeling head (embed_out) that
+    This model extends GPTNeoXModel with a linear language modeling head (lm_head) that
     projects hidden states to vocabulary logits for next-token prediction. It is suitable
     for causal language modeling tasks including text generation, completion, and chat.
 
@@ -795,8 +795,23 @@ class GPTNeoXForCausalLM(BaseCausalLMModule[GPTNeoXModel, GPTNeoXConfig]):  # ty
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
         gpt_neox (GPTNeoXModel): The base transformer model.
-        embed_out (nn.Linear): Language modeling head projecting to vocabulary size.
+        lm_head (nn.Linear): Language modeling head projecting to vocabulary size
+            (``embed_out`` in checkpoints from before transformers 5.18; both load).
     """
+
+    def _upgrade_legacy_native_state(self, state: dict, expected_leaves: dict) -> dict:
+        """Move native saves' ``embed_out`` head leaves onto ``lm_head``.
+
+        transformers 5.18 renamed ``GPTNeoXForCausalLM.embed_out`` to ``lm_head`` (old hub checkpoints load through
+        its ``WeightRenaming``); EasyDeL follows that name, so EasyDeL checkpoints saved before the rename still
+        carry ``embed_out``. Only keys whose renamed form the model declares, and that are not already present,
+        are moved.
+        """
+        for key in [k for k in state if isinstance(k, tuple) and "embed_out" in (str(p) for p in k)]:
+            new_key = tuple("lm_head" if str(p) == "embed_out" else p for p in key)
+            if new_key in expected_leaves and new_key not in state:
+                state[new_key] = state.pop(key)
+        return state
 
     _task_type = TaskType.CAUSAL_LM
     _model_type = "gpt_neox"
@@ -829,5 +844,5 @@ class GPTNeoXForCausalLM(BaseCausalLMModule[GPTNeoXModel, GPTNeoXConfig]):  # ty
             precision=precision,
             rngs=rngs,
             lm_head_bias=False,
-            lm_head_name="embed_out",
+            lm_head_name="lm_head",
         )

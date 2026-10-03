@@ -94,6 +94,7 @@ from easydel.layers import (
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
 from easydel.layers.layouts import FusedColumnLayout, FusedSegment
 from easydel.layers.norms import LayerNorm, lowfloats
+from easydel.layers.rotary import rotate_half as _rotate_half
 from easydel.modules._base import BaseVisionLanguageModule
 
 from .muse_glimmer_configuration import (
@@ -202,19 +203,6 @@ class MuseGlimmerCenteredRMSNorm(spx.Module):
         if original_dtype in lowfloats:
             return out.astype(jnp.bfloat16)
         return out.astype(original_dtype)
-
-
-def _rotate_half(x: Array) -> Array:
-    """Rotate the trailing axis by swapping and negating halves.
-
-    Args:
-        x: Tensor with an even-sized trailing dimension.
-
-    Returns:
-        Array: ``[-x2, x1]`` where ``x1``/``x2`` are the leading/trailing halves.
-    """
-    half = x.shape[-1] // 2
-    return jnp.concatenate([-x[..., half:], x[..., :half]], axis=-1)
 
 
 def _apply_rotary_pos_emb_vision(q: Array, k: Array, cos: Array, sin: Array) -> tuple[Array, Array]:

@@ -154,6 +154,33 @@ class DeepseekV4Config(EasyDeLBaseConfig):
         # dense-MLP width); HF modeling code reads `config.intermediate_size` through it.
         "intermediate_size": "moe_intermediate_size",
     }
+    # ``rope_parameters`` is keyed by rope-type label, not by ``layer_types``. Transformers >= 5.17 only treats the
+    # dict as nested when its keys are in ``_rope_type_labels`` (``RotaryEmbeddingConfigMixin.nested_rope_parameter_keys``);
+    # without this it validates ``{"main", "compress"}`` as one flat dict and warns about both keys (same as HF V4).
+    _rope_type_labels: tp.ClassVar[tuple[str, ...]] = ("main", "compress")
+
+    def validate_rope(self):
+        """Validate the ``main`` and ``compress`` rope sub-dicts separately (mirrors HF ``DeepseekV4Config``).
+
+        The yarn/llama3/longrope validators read ``self.rope_parameters[...]`` directly, so ``rope_parameters`` points
+        at the sub-dict under validation and is restored afterwards.
+        """
+        rope_parameters_dict = getattr(self, "rope_parameters", None) or {}
+        ignore_keys = getattr(self, "ignore_keys_at_rope_validation", None)
+        for label in self._rope_type_labels:
+            rope_parameters = rope_parameters_dict.get(label)
+            if not isinstance(rope_parameters, dict):
+                continue
+            rope_type = rope_parameters.get("rope_type", rope_parameters.get("type", "default"))
+            rope_parameters["rope_type"] = rope_type
+            validation_fn = getattr(self, f"_validate_{rope_type}_rope_parameters", None)
+            if validation_fn is None:
+                continue
+            self.rope_parameters = rope_parameters
+            try:
+                validation_fn(rope_parameters, ignore_keys=ignore_keys)
+            finally:
+                self.rope_parameters = rope_parameters_dict
 
     _default_compress_rates: tp.ClassVar = {
         "compressed_sparse_attention": 4,

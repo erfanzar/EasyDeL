@@ -60,6 +60,7 @@ from easydel.caching import (
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
+    UnifiedAttentionCacheView,
 )
 from easydel.infra.base_module import EasyDeLBaseModule, EasyDeLLayerStackMixin
 from easydel.infra.factory import TaskType, register_module
@@ -644,6 +645,54 @@ class Llama4TextMoe(BaseMoeModule):
         return final_output, checkpoint_name(router_logits, "moe_router_logits")  # pyright: ignore[reportReturnType]
 
 
+class _Llama4ChunkedAttentionModule(FlexibleAttentionModule):
+    """Attention performer that hands Llama4's chunk size to the ragged paged kernel.
+
+    Dense/training paths express chunked-local attention through the baked mask, but the ragged
+    paged kernels (eSurge serving) build their own causal mask from the page table and ignore
+    ``mask_info``. On chunked layers this performer therefore forwards ``chunk_size`` so the
+    kernel masks ``k // C != q // C`` itself; all other cache types are left untouched.
+
+    Attributes:
+        chunk_size: ``config.attention_chunk_size`` for chunked layers, ``None`` for full-context
+            (NoPE) layers.
+    """
+
+    def __init__(self, *args, chunk_size: int | None = None, **kwargs):
+        """Build the performer and remember this layer's chunk size.
+
+        Args:
+            *args: Forwarded to :class:`FlexibleAttentionModule`.
+            chunk_size: Chunk length for chunked-attention layers, ``None`` otherwise.
+            **kwargs: Forwarded to :class:`FlexibleAttentionModule`.
+        """
+        super().__init__(*args, **kwargs)
+        self.chunk_size = chunk_size
+
+    def forward(self, *args, cache_view=None, **kwargs):
+        """Run attention, adding ``chunk_size`` when the cache is a ragged paged view.
+
+        Args:
+            *args: Forwarded to :meth:`FlexibleAttentionModule.forward`.
+            cache_view: KV cache view; ``chunk_size`` is only injected for
+                :class:`RaggedPagesCacheView`.
+            **kwargs: Forwarded to :meth:`FlexibleAttentionModule.forward`.
+
+        Returns:
+            The :class:`AttentionOutput` of the underlying performer.
+        """
+        if self.chunk_size is not None and isinstance(cache_view, UnifiedAttentionCacheView):
+            # unified_attention / paged_flash_attention read the paged cache, not the baked chunk mask, and
+            # have no chunk_size input: chunked layers would silently attend the full context (r15 S10-2).
+            raise NotImplementedError(
+                "Llama4 chunked local attention is not supported by the unified-attention paged cache; "
+                "serve with attn_mechanism='ragged_page_attention_v3'."
+            )
+        if self.chunk_size is not None and isinstance(cache_view, RaggedPagesCacheView):
+            kwargs["chunk_size"] = self.chunk_size
+        return super().forward(*args, cache_view=cache_view, **kwargs)
+
+
 class Llama4TextAttention(UnifiedAttention):
     """Llama-4 text attention with per-layer NoPE and runtime temperature tuning.
 
@@ -696,7 +745,7 @@ class Llama4TextAttention(UnifiedAttention):
             rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the model (determines RoPE usage).
         """
-        self.use_rope = (layer_idx + 1) % 4 != 0
+        self.use_rope = bool(config.no_rope_layers[layer_idx])
         self.attn_scale = config.attn_scale
         self.floor_scale = config.floor_scale
         self.attn_temperature_tuning = config.attn_temperature_tuning
@@ -723,11 +772,14 @@ class Llama4TextAttention(UnifiedAttention):
         Returns:
             FlexibleAttentionModule: Configured attention performer.
         """
-        return FlexibleAttentionModule(
+        layer_types = getattr(config, "layer_types", None)
+        is_chunked = layer_types is not None and layer_types[self.layer_idx] == "chunked_attention"
+        return _Llama4ChunkedAttentionModule(
             rngs=rngs,
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=0.0,
+            chunk_size=int(config.attention_chunk_size) if is_chunked else None,
         )
 
     def _create_rotary(self, config: Llama4TextConfig, dtype: jnp.dtype):
@@ -815,6 +867,160 @@ class Llama4TextAttention(UnifiedAttention):
             query_states = (query_states * attn_scales).astype(query_states.dtype)
         return query_states, key_states, value_states
 
+    def forward(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo | None,
+        position_ids: Int[Array, "batch seq_len"],
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool = False,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
+        alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
+    ) -> AttentionLayerOutput:
+        """Record the absolute token positions then delegate to the unified attention path.
+
+        HF's ``Llama4TextAttention`` rescales queries on NoPE layers with a
+        log-position temperature computed from ``cache_position``, i.e.
+        ``arange(seq) + past_seen_tokens`` (padding included). ``_postprocess_qkv``
+        needs those positions but the hook signature does not carry them, so they
+        are stashed here (``UnifiedAttention.forward_standard`` applies
+        ``_postprocess_qkv`` before rotary). With a dense ``TransformerCacheView`` the
+        positions are rebuilt from the view's write index exactly like HF, without a cache
+        they are ``arange(seq)`` like HF, and for paged serving ``position_ids`` already are
+        the absolute flat positions.
+        Uses ``object.__setattr__`` because the stash happens outside ``__init__`` on a
+        frozen ``spx.Module``.
+        """
+        cache_position = position_ids
+        indexes = _cache_view_indexes(cache_view)
+        if indexes is not None:
+            cache_position = (
+                jnp.asarray(indexes, jnp.int32).reshape(-1, 1)
+                + jnp.arange(hidden_states.shape[1], dtype=jnp.int32)[None, :]
+            )
+        elif cache_view is None:
+            # No cache: HF's ``cache_position`` is ``arange(seq)`` regardless of padding/packing.
+            cache_position = jnp.arange(hidden_states.shape[1], dtype=jnp.int32)[None, :]
+        object.__setattr__(self, "_cached_position_ids", cache_position)
+        try:
+            return super().forward(
+                hidden_states,
+                mask_info,
+                position_ids,
+                mode,
+                cache_view,
+                cache_metadata,
+                output_attentions,
+                frequencies,
+                alibi,
+            )
+        finally:
+            # Do not keep a (possibly traced) array alive on a persistent layer.
+            object.__setattr__(self, "_cached_position_ids", None)
+
+
+def _cache_view_indexes(cache_view) -> Int[Array, "batch"] | None:
+    """Return the dense-cache write index of ``cache_view`` (tokens already cached), if it has one.
+
+    Args:
+        cache_view: A per-layer cache view (``TransformerCacheView``, a hybrid view wrapping one, a
+            ragged-page view, or ``None``).
+
+    Returns:
+        The per-batch ``indexes`` array before the current step is written, or ``None`` when the view
+        has no dense write index (paged serving, no cache).
+    """
+    if cache_view is None:
+        return None
+    indexes = getattr(cache_view, "indexes", None)
+    if indexes is None:
+        indexes = getattr(getattr(cache_view, "transformer", None), "indexes", None)
+    return indexes
+
+
+def _llama4_layer_mask_infos(
+    mask_info: MaskInfo,
+    past_key_values,
+    attention_chunk_size: int,
+    query_len: int | None = None,
+) -> tuple[MaskInfo, MaskInfo]:
+    """Build the full-context (NoPE) and chunk-local (RoPE) masks handed to the decoder layers.
+
+    ``query_len`` is the number of tokens actually fed this step. A mask whose query rows equal it is
+    query-local (row ``i`` is absolute position ``indexes + i``); a wider, full-window mask already
+    numbers its rows by absolute cache slot, and the cache later slices the current rows out of it.
+
+    ``MaskInfo.apply_causal`` / ``apply_chunked`` number the query rows ``0..Q-1``. That is right for
+    uncached prefill and training, but with a dense cache the current query rows sit at the cache
+    write index onward (single-token decode and multi-token continuation alike). In that case the
+    causal and same-chunk terms are rebuilt from ``indexes + arange(Q)`` over the full cache width,
+    so each token sees exactly its own history and chunk.
+
+    Cost note: both masks are dense ``[B, 1, Q, K]`` booleans. That is the training / dense-cache reference path
+    only; eSurge serving (``RaggedPagesCacheView``) never reads them, because :class:`_Llama4ChunkedAttentionModule`
+    forwards ``chunk_size`` to ``ragged_page_attention_v3``, which applies ``k // C == q // C`` inside the kernel
+    (covered by ejkernel ``test_ragged_page_attention_v3_chunk_alibi_sinks.py``, XLA and Pallas).
+
+    Args:
+        mask_info: Mask handed to the text model.
+        past_key_values: Transformer/hybrid cache (or an empty one) used to find the write index.
+        attention_chunk_size: Llama4 chunk length for RoPE layers.
+
+    Returns:
+        ``(mask_info_full, mask_info_chunked)``.
+    """
+    indexes = None
+    cache_kv_len = None
+    for view in getattr(past_key_values, "views", None) or ():
+        indexes = _cache_view_indexes(view)
+        if indexes is not None:
+            key = getattr(view, "key", None)
+            if key is None:
+                key = getattr(getattr(view, "transformer", None), "key", None)
+            cache_kv_len = None if key is None else int(key.shape[1])
+            break
+    if indexes is None:
+        return mask_info.apply_causal(), mask_info.apply_chunked(attention_chunk_size)
+
+    # Dense cache (decode, cached prefill or multi-token continuation): the current query rows sit
+    # at absolute positions ``indexes + 0..Q-1``, not ``0..Q-1``, so the causal and same-chunk
+    # terms are rebuilt from the cache write index for every query length (r10 S10-1).
+    # Build the mask over the whole cache width. The cache view pads a narrower mask with
+    # ``True`` (``_expand_mask_kv_dim``) and ``apply_kv_lengths`` only limits by length, so any
+    # column left to that padding would lose the same-chunk restriction on chunked layers.
+    base = mask_info.get_or_compute_attention_mask(dtype=jnp.bool_)  # (B, 1, Q, K)
+    if cache_kv_len is not None and base.shape[-1] < cache_kv_len:
+        pad_k = cache_kv_len - base.shape[-1]
+        # ``MaskInfo.kv_len`` reads the KV segment ids first, so widen them together with the
+        # mask (0 = valid future slot, as ``_expand_mask_kv_dim`` does); otherwise the cache
+        # sees the old width and pads the already-widened mask a second time.
+        kv_seg = getattr(mask_info, "_kv_segment_ids", None)
+        if kv_seg is not None and kv_seg.shape[-1] == base.shape[-1]:
+            kv_seg = jnp.pad(jnp.asarray(kv_seg, jnp.int32), ((0, 0), (0, pad_k)), constant_values=0)
+            mask_info = mask_info.replace(kv_segment_ids=kv_seg)
+        base = jnp.pad(base, ((0, 0), (0, 0), (0, 0), (0, pad_k)), constant_values=True)
+    kv_len = base.shape[-1]
+    q_len = base.shape[-2]
+    rows = jnp.arange(q_len, dtype=jnp.int32)[None, :]
+    if query_len is None or q_len == query_len:
+        # Query-local rows: offset by the cache write index.
+        pos = (jnp.asarray(indexes, jnp.int32).reshape(-1, 1) + rows)[:, :, None]
+    else:
+        # Full-window mask: rows are already absolute cache slots (r11 S10-1: do not offset twice).
+        pos = jnp.broadcast_to(rows, (base.shape[0], q_len))[:, :, None]
+    kv_idx = jnp.arange(kv_len, dtype=jnp.int32)[None, None, :]
+    causal = kv_idx <= pos  # (B, Q, K)
+    same_chunk = (kv_idx // attention_chunk_size) == (pos // attention_chunk_size)
+    mask_info_full = mask_info.replace(attention_mask=base & causal[:, None, :, :], causal_mask_baked_in=True)
+    mask_info_chunked = mask_info.replace(
+        attention_mask=base & (causal & same_chunk)[:, None, :, :],
+        causal_mask_baked_in=True,
+        chunked_mask_baked_in=True,
+    )
+    return mask_info_full, mask_info_chunked
+
 
 class Llama4TextDecoderLayer(spx.Module):
     """One Llama-4 text decoder block (pre-norm attention + dense-or-MoE FFN).
@@ -882,7 +1088,7 @@ class Llama4TextDecoderLayer(spx.Module):
             rngs=rngs,
             layer_idx=layer_idx,
         )
-        self.use_chunked_attention = int((layer_idx + 1) % 4 != 0)  # <=> use rope
+        self.use_chunked_attention = int(config.layer_types[layer_idx] == "chunked_attention")
         self.is_moe_layer = layer_idx in config.moe_layers
         if self.is_moe_layer:  # the 128E model interleaves dense / sparse
             self.feed_forward = Llama4TextMoe(
@@ -1158,7 +1364,14 @@ class Llama4TextModel(EasyDeLBaseModule):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
-        mask_info = mask_info.apply_chunked(self.config.attention_chunk_size)
+        # HF builds one causal mask and one chunked mask up front and hands
+        # each layer the mask named by ``layer_types[i]``: RoPE layers run
+        # chunked attention while NoPE layers attend the full context.
+        # Llama4 attention is built with ``causal=False`` (causality comes from the MaskInfo),
+        # so the full-context mask must carry the causal term itself; ``apply_chunked`` adds it.
+        mask_info_full, mask_info_chunked = _llama4_layer_mask_infos(
+            mask_info, past_key_values, self.config.attention_chunk_size, query_len=sequence_length
+        )
         frequencies = self.compute_complex_rotary(position_ids)
 
         views = past_key_values.views if past_key_values is not None else None
@@ -1186,10 +1399,16 @@ class Llama4TextModel(EasyDeLBaseModule):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
+            # ``idx`` is a tracer on the lowered ``lax.scan`` path (training
+            # without cache views), so select via the block's static flag
+            # (same pattern as gemma3's ``block.is_sliding``) instead of
+            # indexing ``config.layer_types`` with the carry.
+            layer_mask_info = mask_info_chunked if block.use_chunked_attention else mask_info_full
+
             with self._layer_stage_context(idx, layers=self.layers):
                 layer_outputs = block(
                     hidden_states=hidden_states,
-                    mask_info=mask_info,
+                    mask_info=layer_mask_info,
                     position_ids=position_ids,
                     mode=mode,
                     cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
@@ -2638,20 +2857,15 @@ class Llama4ForConditionalGeneration(BaseVisionLanguageModule[Llama4ForCausalLM,
             image_features = self.get_image_features(pixel_values, **kwargs)
 
         if image_features is not None:
-            orgshape = inputs_embeds.shape
             vision_flat = image_features.reshape(-1, image_features.shape[-1])
             projected_vision_flat = self.multi_modal_projector(vision_flat).astype(inputs_embeds.dtype)
 
-            image_token_mask_1d = (input_ids == image_token_id).reshape(-1)
-            inputs_embeds_flat = inputs_embeds.reshape(-1, inputs_embeds.shape[-1])
-
-            num_projected_tokens = projected_vision_flat.shape[0]
-            image_token_indices = jnp.where(
-                image_token_mask_1d,
-                size=num_projected_tokens,
-                fill_value=-1,
-            )[0]
-            inputs_embeds = inputs_embeds_flat.at[image_token_indices].set(projected_vision_flat).reshape(orgshape)
+            inputs_embeds = BaseVisionLanguageModule.merge_multimodal_embeddings(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                multimodal_embeddings=projected_vision_flat,
+                placeholder_token_id=image_token_id,
+            )
 
         return inputs_embeds
 

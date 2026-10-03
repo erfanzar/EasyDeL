@@ -34,8 +34,25 @@ from easydel.modules.qwen2_vl.qwen2_vl_configuration import Qwen2VLTextConfig, Q
 from easydel.modules.qwen3_5.modeling_qwen3_5 import _get_rope_index_from_mm_token_types
 from easydel.modules.qwen3_vl.qwen3_vl_configuration import Qwen3VLConfig, Qwen3VLTextConfig
 from easydel.modules.qwen3_vl_moe.qwen3_vl_moe_configuration import Qwen3VLMoeTextConfig
-from transformers.models.qwen2_vl.modeling_qwen2_vl import apply_multimodal_rotary_pos_emb
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Model
+
+
+def _reference_multimodal_rope(q, k, cos, sin, mrope_section):
+    """Chunked Qwen2-VL mRoPE, as in transformers<=5.16 ``apply_multimodal_rotary_pos_emb``.
+
+    transformers 5.17 folded mRoPE into the rotary embedding (huggingface/transformers#48105) and removed
+    the helper, so the reference is kept here as an independent oracle. ``cos``/``sin`` are
+    ``[3, batch, seq, head_dim]`` (T/H/W); section ``i`` of the doubled split takes axis ``i % 3``.
+    """
+    sections = list(mrope_section) * 2
+    cos = torch.cat([m[i % 3] for i, m in enumerate(cos.split(sections, dim=-1))], dim=-1).unsqueeze(1)
+    sin = torch.cat([m[i % 3] for i, m in enumerate(sin.split(sections, dim=-1))], dim=-1).unsqueeze(1)
+
+    def rotate_half(x):
+        x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    return q * cos + rotate_half(q) * sin, k * cos + rotate_half(k) * sin
 
 
 def _hf_qwen3_5_rope_index(input_ids, mm_token_type_ids, image_grid_thw, video_grid_thw, attention_mask, sms):
@@ -144,7 +161,7 @@ def test_qwen2_vl_mrope_layout_matches_hf():
     inv_freq = 1.0 / (config.rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
     freqs = torch.as_tensor(positions, dtype=torch.float32)[..., None] * inv_freq
     emb = torch.cat([freqs, freqs], dim=-1)
-    hf_q, hf_k = apply_multimodal_rotary_pos_emb(
+    hf_q, hf_k = _reference_multimodal_rope(
         torch.as_tensor(q).transpose(1, 2),
         torch.as_tensor(k).transpose(1, 2),
         emb.cos(),

@@ -15,6 +15,9 @@
 """Tests for Falcon model."""
 
 import easydel as ed
+import jax
+import jax.numpy as jnp
+import numpy as np
 import pytest
 import transformers
 
@@ -66,6 +69,121 @@ class TestFalcon:
             max_new_tokens=16,
         )
         assert result.success, f"Falcon generation failed: {result.error_message}"
+
+    def test_alibi_cached_decode_matches_full_forward(self):
+        """Decode must use each cached key's ALiBi offset, not only the query mask."""
+        config = ed.FalconConfig(
+            vocab_size=64,
+            hidden_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_kv_heads=2,
+            ffn_hidden_size=64,
+            max_position_embeddings=64,
+            new_decoder_architecture=True,
+            num_ln_in_parallel_attn=2,
+            parallel_attn=True,
+            alibi=True,
+            attn_dtype=jnp.float32,
+            kvdtype=jnp.float32,
+            attn_mechanism="vanilla",
+            sharding_axis_dims=(1, 1, 1, 1, 1, 1),
+        )
+        model = ed.AutoEasyDeLModelForCausalLM.from_config(
+            config, dtype=jnp.float32, param_dtype=jnp.float32, precision=jax.lax.Precision.HIGHEST
+        )
+        ids = jnp.asarray([[3, 5, 7, 9, 11, 13], [4, 6, 8, 10, 12, 14]], dtype=jnp.int32)
+        full = model(input_ids=ids, output_attentions=True)
+        cache = model.init_cache(batch_size=2, max_length=12)
+        prefill = model(input_ids=ids[:, :-1], past_key_values=cache)
+        decode = model(
+            input_ids=ids[:, -1:],
+            position_ids=jnp.full((2, 1), ids.shape[1] - 1, dtype=jnp.int32),
+            past_key_values=prefill.past_key_values,
+            output_attentions=True,
+        )
+        np.testing.assert_allclose(
+            np.asarray(decode.attentions[0][..., : ids.shape[1]]),
+            np.asarray(full.attentions[0][:, :, -1:, :]),
+            rtol=2e-4,
+            atol=2e-4,
+        )
+        np.testing.assert_allclose(
+            np.asarray(decode.logits[:, -1, :]), np.asarray(full.logits[:, -1, :]), rtol=2e-3, atol=2e-3
+        )
+
+    def test_alibi_decode_explicit_window_mask_matches_full_forward(self):
+        """An explicit full-window decode mask (HF ``generate`` style) keeps ALiBi positions exact."""
+        config = ed.FalconConfig(
+            vocab_size=64,
+            hidden_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_kv_heads=2,
+            ffn_hidden_size=64,
+            max_position_embeddings=64,
+            new_decoder_architecture=True,
+            num_ln_in_parallel_attn=2,
+            parallel_attn=True,
+            alibi=True,
+            attn_dtype=jnp.float32,
+            kvdtype=jnp.float32,
+            attn_mechanism="vanilla",
+            sharding_axis_dims=(1, 1, 1, 1, 1, 1),
+        )
+        model = ed.AutoEasyDeLModelForCausalLM.from_config(
+            config, dtype=jnp.float32, param_dtype=jnp.float32, precision=jax.lax.Precision.HIGHEST
+        )
+        ids = jnp.asarray([[3, 5, 7, 9, 11, 13], [4, 6, 8, 10, 12, 14]], dtype=jnp.int32)
+        full = model(input_ids=ids)
+        cache = model.init_cache(batch_size=2, max_length=12)
+        prefill = model(input_ids=ids[:, :-1], past_key_values=cache)
+        # Prompt plus the token being decoded, padded to the cache width (as HF extends it).
+        window = jnp.zeros((2, 12), dtype=jnp.int32).at[:, : ids.shape[1]].set(1)
+        decode = model(
+            input_ids=ids[:, -1:],
+            attention_mask=window,
+            position_ids=jnp.full((2, 1), ids.shape[1] - 1, dtype=jnp.int32),
+            past_key_values=prefill.past_key_values,
+        )
+        np.testing.assert_allclose(
+            np.asarray(decode.logits[:, -1, :]), np.asarray(full.logits[:, -1, :]), rtol=2e-3, atol=2e-3
+        )
+
+    def test_alibi_multi_token_cached_continuation_matches_full_forward(self):
+        """A multi-token continuation over a populated dense cache keeps absolute ALiBi positions (r15 S10-1)."""
+        config = ed.FalconConfig(
+            vocab_size=64,
+            hidden_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_kv_heads=2,
+            ffn_hidden_size=64,
+            max_position_embeddings=64,
+            new_decoder_architecture=True,
+            num_ln_in_parallel_attn=2,
+            parallel_attn=True,
+            alibi=True,
+            attn_dtype=jnp.float32,
+            kvdtype=jnp.float32,
+            attn_mechanism="vanilla",
+            sharding_axis_dims=(1, 1, 1, 1, 1, 1),
+        )
+        model = ed.AutoEasyDeLModelForCausalLM.from_config(
+            config, dtype=jnp.float32, param_dtype=jnp.float32, precision=jax.lax.Precision.HIGHEST
+        )
+        ids = jnp.asarray([[3, 5, 7, 9, 11, 13, 15], [4, 6, 8, 10, 12, 14, 16]], dtype=jnp.int32)
+        split = 4
+        full = model(input_ids=ids)
+        cache = model.init_cache(batch_size=2, max_length=12)
+        prefill = model(input_ids=ids[:, :split], past_key_values=cache)
+        cont_len = ids.shape[1] - split
+        cont = model(
+            input_ids=ids[:, split:],
+            position_ids=jnp.broadcast_to(jnp.arange(split, ids.shape[1], dtype=jnp.int32), (2, cont_len)),
+            past_key_values=prefill.past_key_values,
+        )
+        np.testing.assert_allclose(np.asarray(cont.logits), np.asarray(full.logits[:, split:, :]), rtol=2e-3, atol=2e-3)
 
 
 if __name__ == "__main__":

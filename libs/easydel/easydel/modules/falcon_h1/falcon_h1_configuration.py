@@ -268,15 +268,20 @@ class FalconH1Config(EasyDeLBaseConfig):
         return ["attention" for _ in range(self.num_hidden_layers)]
 
     @property
-    def layer_types(self) -> tuple[str, ...]:
+    def layer_types(self) -> list[str]:
         """Return layer types for hybrid cache configuration.
 
         FalconH1 uses parallel hybrid layers where both attention and SSM
         run in parallel within each layer. Use the HF-compatible public label
         ``"hybrid"`` here and normalize it to EasyDeL's internal
         ``"parallel_hybrid"`` cache type where needed.
+
+        A list, not a tuple: transformers' ``remap_legacy_layer_types`` (run in
+        ``PreTrainedConfig.__post_init__``) assigns ``layer_types`` whenever its
+        remapped list compares unequal, and a tuple never equals a list, so a
+        tuple would trigger an assignment to this read-only property.
         """
-        return tuple("hybrid" for _ in range(self.num_hidden_layers))
+        return ["hybrid" for _ in range(self.num_hidden_layers)]
 
     @property
     def mamba_intermediate_size(self) -> int:

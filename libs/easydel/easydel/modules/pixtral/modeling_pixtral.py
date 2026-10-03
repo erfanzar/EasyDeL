@@ -51,6 +51,7 @@ from easydel.layers import (
     gated_mlp_forward,
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.rotary import rotate_half
 
 from .pixtral_configuration import PixtralVisionConfig
 
@@ -149,27 +150,6 @@ def compute_frequencies(dim: int, max_patches_per_side: int, theta: float = 1000
 
     inv_freq = jnp.concatenate((inv_freq, inv_freq), axis=-1)
     return inv_freq
-
-
-# Adapted from transformers.models.llama.modeling_llama.rotate_half
-def rotate_half(x):
-    """Rotate the second half of the trailing dim by negation.
-
-    Standard RoPE building block: given ``x = [a, b]`` along the last
-    axis with equal halves, returns ``[-b, a]``. The pairwise rotation
-    ``x * cos + rotate_half(x) * sin`` then realises a 2-D rotation per
-    pair of channels.
-
-    Args:
-        x: Tensor with an even-sized trailing dimension.
-
-    Returns:
-        Tensor of identical shape with halves swapped and the new lower
-        half negated.
-    """
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return jnp.concatenate((-x2, x1), axis=-1)
 
 
 # Adapted from transformers.models.llama.modeling_llama.apply_rotary_pos_emb

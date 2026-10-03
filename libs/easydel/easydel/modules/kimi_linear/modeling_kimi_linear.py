@@ -87,7 +87,12 @@ from easydel.layers.moe import moe_group_topk_select
 from easydel.layers.norms import lowfloats
 from easydel.modules._base import BaseCausalLMModule
 from easydel.operations import OperationMetadata
-from easydel.operations.kernels import KDAOutput, KernelDeltaAttnOp, fused_kda_gate_per_channel
+from easydel.operations.kernels import (
+    KDAOutput,
+    KernelDeltaAttnOp,
+    fused_kda_gate_per_channel,
+    kda_packed_rows_forward,
+)
 
 from .kimi_linear_configuration import KimiLinearConfig
 
@@ -1271,6 +1276,37 @@ class KimiDeltaAttention(spx.Module):
         query = self.q_proj(hidden_states)
         key = self.k_proj(hidden_states)
         value = self.v_proj(hidden_states)
+
+        # eSurge packed-row serving: one flattened token stream [1, T, D] whose
+        # per-request segments are ``cache_metadata.query_start_loc``, with per-request
+        # conv windows / recurrent memory in per-row cache slots. Without this branch the
+        # whole stream would be treated as a single sequence against a per-row cache.
+        qsl = getattr(cache_metadata, "query_start_loc", None) if cache_metadata is not None else None
+        if cache_view is not None and qsl is not None:
+            if batch_size != 1:
+                raise ValueError(
+                    f"Packed-row KDA serving expects one flattened token stream [1, T, D], got batch_size={batch_size}."
+                )
+            gate = self.f_b_proj(self.f_a_proj(hidden_states))
+            out_packed, new_cache_view = kda_packed_rows_forward(
+                query=query,
+                key=key,
+                value=value,
+                beta=jax.nn.sigmoid(self.b_proj(hidden_states)),
+                decay=fused_kda_gate_per_channel(gate, self.A_log.value, self.dt_bias.value, lower_bound=None),
+                conv_kernels=tuple(getattr(self, f"{n}_conv1d").weight.value.squeeze(1).T for n in ("q", "k", "v")),
+                cache_view=cache_view,
+                query_start_loc=qsl,
+                context_lens=getattr(cache_metadata, "context_lens", None),
+                conv_dtype=jnp.bfloat16 if self.dtype in lowfloats else self.dtype,
+                chunk_size=self.chunk_size,
+            )
+            output_gate = self.g_b_proj(self.g_a_proj(hidden_states))
+            output_gate = output_gate.reshape(batch_size, seq_len, self.num_heads, self.head_v_dim)
+            output = self.o_norm(out_packed.astype(hidden_states.dtype), output_gate)
+            output = output.reshape(batch_size, seq_len, -1)
+            output = self.o_proj(output)
+            return AttentionLayerOutput(attention_output=output, attention_weight=None, cache_view=new_cache_view)
 
         q_conv_state = cache_view.q_conv_state if cache_view is not None else None
         k_conv_state = cache_view.k_conv_state if cache_view is not None else None

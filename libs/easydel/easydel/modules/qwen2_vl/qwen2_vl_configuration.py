@@ -63,6 +63,8 @@ class Qwen2VLVisionConfig(EasyDeLBaseConfig):
 
     model_type = "qwen2_vl"
     base_config_key = "vision_config"
+    # Matches HF: the 2-D vision rotary is axial (``rope_parameters`` carries rope_type/rope_theta).
+    default_rope_type = "axial"
 
     def __init__(
         self,
@@ -105,6 +107,8 @@ class Qwen2VLVisionConfig(EasyDeLBaseConfig):
         self.hidden_act = hidden_act
         self.mlp_ratio = mlp_ratio
         self.num_heads = num_heads
+        # HF aliases ``num_attention_heads`` -> ``num_heads`` (its axial vision rope reads the former).
+        self.num_attention_heads = num_heads
         self.in_channels = in_channels
         self.patch_size = patch_size
         self.spatial_merge_size = spatial_merge_size
@@ -346,11 +350,17 @@ class Qwen2VLConfig(EasyDeLBaseConfig):
             self.vision_config = self.sub_configs["vision_config"](**vision_config)
         elif vision_config is None:
             self.vision_config = self.sub_configs["vision_config"]()
+        else:
+            # Already-constructed ``Qwen2VLVisionConfig`` instance: keep it.
+            self.vision_config = vision_config
 
         if isinstance(text_config, dict):
             self.text_config = self.sub_configs["text_config"](**text_config)
         elif text_config is None:
             self.text_config = self.sub_configs["text_config"](**kwargs)
+        else:
+            # Already-constructed ``Qwen2VLTextConfig`` instance: keep it.
+            self.text_config = text_config
 
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id

@@ -202,6 +202,9 @@ class Mistral4Config(EasyDeLBaseConfig):
     model_type = "mistral4"
     keys_to_ignore_at_inference: typing.ClassVar = ["past_key_values"]
     attribute_map: typing.ClassVar = {"num_local_experts": "n_routed_experts"}
+    # Mistral4-specific yarn keys that transformers' rope validator does not know (HF ``Mistral4Config`` passes the
+    # same set as ``ignore_keys_at_rope_validation``); without this transformers >= 5.17 warns on every build.
+    ignore_keys_at_rope_validation: typing.ClassVar[set[str]] = {"llama_4_scaling_beta", "max_position_embeddings"}
 
     def __init__(
         self,

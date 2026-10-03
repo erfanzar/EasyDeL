@@ -82,10 +82,14 @@ from easydel.layers import (
     split_fused_gate_up_projection,
 )
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
-from easydel.layers.indexer import TokenIndexer, TokenIndexerConfig
+from easydel.layers.indexer import IndexerSelection, TokenIndexer, TokenIndexerConfig, paged_token_select
 from easydel.layers.moe import moe_group_topk_select
 from easydel.layers.rotary import apply_rope_interleaved, yarn_get_mscale
 from easydel.modules._base import BaseCausalLMModule
+from easydel.operations.kernels.dsa_sparse_attention import (
+    sparse_selected_training_attention,
+    use_sparse_training_attention,
+)
 
 from .glm_moe_dsa_configuration import GlmMoeDsaConfig
 
@@ -811,9 +815,8 @@ class GlmMoeDsaAttention(UnifiedAttention):
 
         self.rotary = self._create_rotary(config, dtype)
         self.attention_performer = self._create_attention_performer(config, rngs)
-        # A full DSA indexer is created on every layer regardless of ``config.indexer_types``.
-        # This matches HF for "full" layers; "shared"-layer top-k reuse is not implemented here
-        # (see the warning in ``GlmMoeDsaModel.__init__``).
+        # Retain the parameter slot for checkpoint compatibility; shared
+        # layers reuse the previous full layer's selection instead of calling it.
         self.indexer = GlmMoeDsaIndexer(
             config=config,
             dtype=dtype,
@@ -862,6 +865,8 @@ class GlmMoeDsaAttention(UnifiedAttention):
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
+        previous_topk_indices: Array | None = None,
+        return_topk_indices: bool = False,
     ):
         """Run the MLA + DSA attention forward pass.
 
@@ -1008,19 +1013,61 @@ class GlmMoeDsaAttention(UnifiedAttention):
             ):
                 indexer_cached_keys = maybe_cached
 
-        indexer_output = self.indexer(
-            hidden_states=hidden_states,
-            q_resid=q_resid,
-            position_ids=position_ids,
-            frequencies=freq_array,
-            attention_mask=indexer_mask,
-            cached_keys=indexer_cached_keys,
-            use_cache=cache_view is not None,
+        # Ragged serving with paged indexer keys: selections are token ids over the real
+        # per-request history and attention runs through the sparse MLA op (chunk size 1).
+        qsl = getattr(cache_metadata, "query_start_loc", None) if cache_metadata is not None else None
+        # Decided from the shared cache config, not this view's buffers: "shared" indexer
+        # layers own no indexer pages but must still route the reused token ids to the sparse op.
+        paged_indexer = (
+            isinstance(cache_view, MLARaggedPagesCacheView)
+            and bool(getattr(getattr(cache_view, "metadata", None), "has_indexer_pages", False))
+            and getattr(cache_metadata, "pages_tables", None) is not None
+            and qsl is not None
+            # 1-D (single replica) or rank-major [dp, rows + 1] (data-parallel serving).
+            and qsl.ndim in (1, 2)
         )
-        topk_indices = indexer_output.topk_indices
+
+        shared_indexer = self.config.indexer_types[self.layer_idx] == "shared"
+        if shared_indexer:
+            if previous_topk_indices is None:
+                raise ValueError("A shared GLM-MoE-DSA indexer requires a preceding full layer's top-k selection.")
+            topk_indices = previous_topk_indices
+            indexer_output = None
+        elif paged_indexer:
+            from easydel.operations.kernels.multi_latent_ragged_page_attention import _resolve_distribution
+
+            topk_indices, token_pages = paged_token_select(
+                self.indexer,
+                hidden_states.reshape(bsz * q_len, hidden_states.shape[-1]),
+                None if q_resid is None else q_resid.reshape(bsz * q_len, q_resid.shape[-1]),
+                freq_array,
+                cache_view.indexer_token_pages,
+                jnp.asarray(cache_metadata.pages_tables, jnp.int32),
+                jnp.asarray(cache_metadata.context_lens, jnp.int32),
+                jnp.asarray(qsl, jnp.int32),
+                # ``[..., 2]``: the live count, per rank for rank-major ([dp, 3]) distributions.
+                _resolve_distribution(cache_metadata)[..., 2],
+                constrain_rows=cache_view.constrain_indexer_rows,
+                constrain_pages=cache_view.constrain_indexer_pages,
+                dp_sharding=cache_view.indexer_dp_sharding(),
+            )
+            cache_view = cache_view.replace(indexer_token_pages=token_pages)
+            indexer_output = None
+        else:
+            indexer_output = self.indexer(
+                hidden_states=hidden_states,
+                q_resid=q_resid,
+                position_ids=position_ids,
+                frequencies=freq_array,
+                attention_mask=indexer_mask,
+                cached_keys=indexer_cached_keys,
+                use_cache=cache_view is not None,
+            )
+            topk_indices = indexer_output.topk_indices
 
         if (
-            cache_view is not None
+            indexer_output is not None
+            and cache_view is not None
             and indexer_output.cached_keys is not None
             and hasattr(cache_view, "recurrent_state")
             and hasattr(cache_view, "replace")
@@ -1049,20 +1096,70 @@ class GlmMoeDsaAttention(UnifiedAttention):
             mask_info=mask_info,
         )
 
-        if topk_indices is not None:
+        topk_mask = None
+        combined_mask = None
+        if topk_indices is not None and paged_indexer:
+            mla_kwargs["sparse_selected"] = topk_indices.reshape(bsz * q_len, topk_indices.shape[-1])
+            mla_kwargs["sparse_chunk_size"] = 1
+        elif topk_indices is not None:
             kv_len = key_states.shape[1]
             topk_kv_len = (
-                int(indexer_output.cached_keys.shape[1])
-                if indexer_output.cached_keys is not None
-                else int(hidden_states.shape[1])
+                kv_len
+                if shared_indexer
+                else (
+                    int(indexer_output.cached_keys.shape[1])
+                    if indexer_output.cached_keys is not None
+                    else int(hidden_states.shape[1])
+                )
             )
-            if topk_kv_len == kv_len and mask_info is not None:
-                topk_mask = indexer_output.topk_mask
+            if _use_mla_ragged:
+                # Reached only without paged indexer state (cache built without indexer pages, or
+                # rank-major DP metadata). The indexer then sees only the current step, so the
+                # selection cannot be applied; DSA layers attend densely, which matches the top-k
+                # selection only while the context is <= index_topk tokens.
+                logger.warning_once(
+                    "GLM-MoE-DSA: MLA ragged-pages serving without paged indexer state (cache has no "
+                    "indexer pages, or rank-major DP metadata); DSA layers attend densely, which "
+                    "diverges from the reference once the context exceeds index_topk=%s tokens.",
+                    self.index_topk,
+                )
+            elif topk_kv_len == kv_len and mask_info is not None:
+                topk_mask = None if shared_indexer else indexer_output.topk_mask
                 if topk_mask is None or topk_mask.shape[-1] != kv_len:
-                    topk_mask = jnp.any(jax.nn.one_hot(topk_indices, kv_len, dtype=jnp.bool_), axis=-2)
+                    topk_mask = IndexerSelection(topk_indices).to_mask(kv_len)
                 attention_mask = pairwise_attention_mask_from_mask_info(mask_info, q_len, kv_len)
+                combined_mask = topk_mask if attention_mask is None else attention_mask & topk_mask
                 if attention_mask is not None:
-                    mask_info = mask_info.replace(attention_mask=(attention_mask & topk_mask)[:, None, :, :])
+                    mask_info = mask_info.replace(attention_mask=combined_mask[:, None, :, :])
+
+        if combined_mask is not None and use_sparse_training_attention(
+            self,
+            topk_indices,
+            cache_view,
+            mask_info,
+            output_attentions,
+            sliding_window_for_kernel,
+            seq_len=q_len,
+        ):
+            # Training/no-cache: same per-head q/k/v and top-k mask as the dense path, but a
+            # tile-skipping flash kernel instead of materialized [B, H, S, S] masked scores.
+            attn_heads = sparse_selected_training_attention(
+                query=query_states,
+                key=key_states,
+                value=value_states,
+                selection_mask=combined_mask,  # already includes padding / segments
+                mask_info=None,
+                softmax_scale=self.attention_performer.softmax_scale,
+                # Same causal flag as the dense path: False when the mask already bakes causality in.
+                causal=bool(causal_for_kernel),
+                dtype=getattr(self.config, "attn_dtype", None),
+                metadata=getattr(self.attention_performer, "metadata", None),
+            )
+            attn_output = self.shard_attention_prod(attn_heads.astype(hidden_states.dtype).reshape(bsz, q_len, -1))
+            attn_output = checkpoint_name(self.output_projection(attn_output), name="attn_output")
+            attn_output = self.shard_attention_prod(attn_output)
+            result = AttentionLayerOutput(attention_output=attn_output, attention_weight=None, cache_view=cache_view)
+            return (result, topk_indices) if return_topk_indices else result
 
         softmax_aux = self._softmax_aux()
 
@@ -1122,11 +1219,12 @@ class GlmMoeDsaAttention(UnifiedAttention):
         attn_output = checkpoint_name(self.output_projection(attn_output), name="attn_output")
         attn_output = self.shard_attention_prod(attn_output)
 
-        return AttentionLayerOutput(
+        result = AttentionLayerOutput(
             attention_output=attn_output,
             attention_weight=attentions.attention_weights if output_attentions else None,
             cache_view=cache_view,
         )
+        return (result, topk_indices) if return_topk_indices else result
 
 
 class GlmMoeDsaDecoderLayer(spx.Module):
@@ -1233,6 +1331,8 @@ class GlmMoeDsaDecoderLayer(spx.Module):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: tuple[Array, Array] | None = None,
+        previous_topk_indices: Array | None = None,
+        return_topk_indices: bool = False,
     ) -> DecoderLayerOutput:
         """Pre-norm decoder block: ``x + attn(norm(x))`` then ``x + ffn(norm(x))``.
 
@@ -1263,16 +1363,30 @@ class GlmMoeDsaDecoderLayer(spx.Module):
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        attn_outputs = self.self_attn(
-            hidden_states,
-            mask_info,
-            position_ids,
-            mode,
-            cache_view,
-            cache_metadata,
-            output_attentions,
-            frequencies,
-        )
+        if return_topk_indices:
+            attn_outputs, topk_indices = self.self_attn.forward_mla(
+                hidden_states,
+                mask_info,
+                position_ids,
+                mode,
+                cache_view,
+                cache_metadata,
+                output_attentions,
+                frequencies,
+                previous_topk_indices=previous_topk_indices,
+                return_topk_indices=True,
+            )
+        else:
+            attn_outputs = self.self_attn(
+                hidden_states,
+                mask_info,
+                position_ids,
+                mode,
+                cache_view,
+                cache_metadata,
+                output_attentions,
+                frequencies,
+            )
         hidden_states = residual + attn_outputs.attention_output
 
         residual = hidden_states
@@ -1295,12 +1409,13 @@ class GlmMoeDsaDecoderLayer(spx.Module):
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        return DecoderLayerOutput(
+        result = DecoderLayerOutput(
             hidden_states=hidden_states,
             attention_weight=attn_outputs.attention_weight,
             cache_view=attn_outputs.cache_view,
             router_logits=router_logits,
         )
+        return (result, topk_indices) if return_topk_indices else result
 
 
 @register_module(TaskType.BASE_MODULE, config=GlmMoeDsaConfig, model_type="glm_moe_dsa")
@@ -1350,22 +1465,6 @@ class GlmMoeDsaModel(EasyDeLBaseModule):
         self.param_dtype = param_dtype
         self.precision = precision
         self.rngs = rngs
-
-        # NOTE: the decoder stack is built with ``self.layers.scan`` (structurally identical
-        # layers), so every layer instantiates and runs its own DSA indexer. That is exactly
-        # HF's all-"full" schedule, but it does NOT implement HF's cross-layer top-k sharing
-        # where a "shared" layer reuses the previous "full" layer's top-k (``prev_topk_indices``)
-        # and carries no indexer weights. Warn loudly if a checkpoint declares "shared" layers
-        # so the divergence is never silent. Full "shared" support needs an unrolled stack (scan
-        # forbids per-layer structural differences) plus threading the prior top-k through the
-        # carry and dropping indexer params on shared layers.
-        if any(t == "shared" for t in (getattr(config, "indexer_types", None) or [])):
-            logger.warning_once(
-                "GLM-MoE-DSA config declares 'shared' indexer layers, but this EasyDeL "
-                "implementation runs a full DSA indexer on every layer and does not reuse a "
-                "previous full layer's top-k selection. Logits match HF only for all-'full' "
-                "indexer schedules; 'shared'-layer checkpoints will diverge."
-            )
 
         with self.assign_layer_stage(0, total_layers=self.config.num_hidden_layers):
             self.embed_tokens = Embed(
@@ -1515,8 +1614,9 @@ class GlmMoeDsaModel(EasyDeLBaseModule):
         needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
         # Router-logit aggregation grows a Python tuple per layer, which
         # lax.scan cannot carry — collecting it forces the trace path too.
+        has_shared_indexers = "shared" in self.config.indexer_types
         trace_layers = self._layer_scan_trace(
-            False,
+            has_shared_indexers,
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
             cache_views=views,
@@ -1535,7 +1635,10 @@ class GlmMoeDsaModel(EasyDeLBaseModule):
             scan and collects optional outputs requested by the outer
             ``forward``.
             """
-            hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx = carry
+            if has_shared_indexers:
+                hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx, prev_topk = carry
+            else:
+                hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -1549,7 +1652,10 @@ class GlmMoeDsaModel(EasyDeLBaseModule):
                     cache_metadata=cache_metadata,
                     output_attentions=output_attentions,
                     frequencies=frequencies,
+                    **({"previous_topk_indices": prev_topk, "return_topk_indices": True} if has_shared_indexers else {}),
                 )
+                if has_shared_indexers:
+                    layer_outputs, prev_topk = layer_outputs
 
             hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
@@ -1567,13 +1673,14 @@ class GlmMoeDsaModel(EasyDeLBaseModule):
                 cache=past_key_values,
             )
 
-            return hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx + 1
+            result = (hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx + 1)
+            return (*result, prev_topk) if has_shared_indexers else result
 
-        hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
-            _layer_loop,
-            (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
-            trace=trace_layers,
-        )
+        initial = (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0)
+        if has_shared_indexers:
+            initial = (*initial, None)
+        final = self.layers.scan(_layer_loop, initial, trace=trace_layers)
+        hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _ = final[:6]
         hidden_states = self.norm(hidden_states)
 
         if output_hidden_states:
@@ -1691,12 +1798,17 @@ class GlmMoeDsaForCausalLM(BaseCausalLMModule[GlmMoeDsaModel, GlmMoeDsaConfig]):
             "multi_latent_ragged_page_attention_v2",
         )
         if is_mla_ragged:
+            # Post-RoPE indexer keys live in pages sharing the KV page table, so the serving
+            # path scores each request's real history and attends through the sparse MLA op.
             return self._create_mla_ragged_page_cache_config(
                 max_length=max_length,
                 page_size=page_size,
                 max_cache_tokens=max_cache_tokens,
                 hbm_utilization=hbm_utilization,
                 dtype=dtype,
+                indexer_page_kwargs=dict(
+                    indexer_key_dim=int(self.config.index_head_dim), indexer_gate_dim=0, indexer_kpool=1
+                ),
             )
 
         return RaggedPagesCacheConfig.create(

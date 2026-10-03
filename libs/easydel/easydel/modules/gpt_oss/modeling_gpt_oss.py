@@ -1277,7 +1277,7 @@ class GptOssForSequenceClassification(BaseSequenceClassificationModule[GptOssMod
                 top_k=self.config.num_experts_per_tok,
                 attention_mask=attention_mask,
             )
-            aux_loss += aux_loss * self.config.router_aux_loss_coef
+            aux_loss = aux_loss * self.config.router_aux_loss_coef
 
         return SequenceClassifierOutput(
             logits=pooled_logits,

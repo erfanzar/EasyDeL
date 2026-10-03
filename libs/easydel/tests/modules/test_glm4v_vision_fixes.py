@@ -155,3 +155,36 @@ def test_video_features_merge_at_image_token_positions():
     np.testing.assert_array_equal(np.asarray(merged[0, positions]), np.asarray(video_embeds))
     others = np.setdiff1d(np.arange(input_ids.shape[1]), positions)
     assert not np.asarray(merged[0, others]).any()
+
+
+def test_video_mrope_uses_one_temporal_grid_per_frame():
+    # Two frames of a single video: each frame occupies one merged row of two tokens.
+    # The text token between frames mimics the processor's frame timestamp.
+    image_id, video_start, video_end = 5, 7, 8
+    tokens = np.array([[video_start, 3, image_id, image_id, 4, 9, 3, image_id, image_id, 4, video_end]])
+    mm_types = np.array([[0, 0, 2, 2, 0, 0, 0, 2, 2, 0, 0]])
+    video_grid = np.array([[2, 2, 4]])
+    config = SimpleNamespace(
+        vision_config=SimpleNamespace(spatial_merge_size=2),
+        image_token_id=image_id,
+        video_start_token_id=video_start,
+        video_end_token_id=video_end,
+    )
+    ed_stub = SimpleNamespace(config=config)
+    hf_stub = SimpleNamespace(
+        config=config,
+        get_vision_position_ids=lambda *args, **kwargs: hf_glm4v.Glm4vModel.get_vision_position_ids(
+            None, *args, **kwargs
+        ),
+    )
+    expected_positions, expected_deltas = hf_glm4v.Glm4vModel.get_rope_index(
+        hf_stub,
+        torch.tensor(tokens),
+        torch.tensor(mm_types),
+        video_grid_thw=torch.tensor(video_grid),
+    )
+    positions, deltas = Glm4vModel.get_rope_index(
+        ed_stub, input_ids=jnp.asarray(tokens), video_grid_thw=jnp.asarray(video_grid)
+    )
+    np.testing.assert_array_equal(np.asarray(positions), expected_positions.numpy())
+    np.testing.assert_array_equal(np.asarray(deltas), expected_deltas.numpy())

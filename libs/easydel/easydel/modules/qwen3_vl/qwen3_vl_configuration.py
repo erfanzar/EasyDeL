@@ -52,6 +52,8 @@ class Qwen3VLVisionConfig(EasyDeLBaseConfig):
 
     model_type = "qwen3_vl_vision"
     base_config_key = "vision_config"
+    # Matches HF: the 2-D vision rotary is axial (``rope_parameters`` carries rope_type/rope_theta).
+    default_rope_type = "axial"
 
     def __init__(
         self,

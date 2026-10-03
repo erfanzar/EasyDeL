@@ -89,19 +89,13 @@ Note:
 """
 
 import math
-import os
 import typing as tp
 
 import jax
 import jax.numpy as jnp
 import spectrax as spx
-from ejkernel.modules import (  # pyright: ignore[reportMissingTypeStubs]
-    compressed_window_attention,
-    compressed_window_decode,
-)
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax.ad_checkpoint import checkpoint_name
-from jax.sharding import PartitionSpec as Ps
 from jaxtyping import Array, Bool, Float, Int
 from spectrax import apply_logical_sharding, common_types, nn
 
@@ -132,6 +126,22 @@ from easydel.layers import (
     gated_mlp_forward,
     split_fused_gate_up_projection,
 )
+from easydel.layers.compressed_window import (
+    block_group_layout,
+    block_sink_attention,
+    block_token_bias,
+    gather_group_members,
+    gather_selected_entries,
+    grid_to_tokens,
+    last_closed_overlap,
+    occupied_columns,
+    overlap_group_slots,
+    packed_block_size,
+    refresh_group_state,
+    run_column_blocks,
+    sink_attention,
+    tokens_to_grid,
+)
 from easydel.layers.indexer import CompressedIndexer, CompressedIndexerConfig, IndexerSelection
 from easydel.layers.residual import (
     ManifoldHyperConnection,
@@ -141,6 +151,8 @@ from easydel.layers.residual import (
 )
 from easydel.modules._base import BaseCausalLMModule
 from easydel.modules.deepseek_v4._native_checkpoint import native_key_to_easydel
+from easydel.operations import OperationMetadata
+from easydel.operations.kernels import CompressedWindowAttn, CompressedWindowDecodeAttn
 
 from .deepseek_v4_configuration import DeepseekV4Config
 
@@ -168,37 +180,18 @@ class _HyperStreamSharding(common_types.DynamicShardingAxes):
     mode: tp.ClassVar = 1
 
 
-# Platform for the fused compressed-window decode kernel. Default "xla" is the
-# GSPMD-partitionable reference: it lowers correctly under any mesh (single or
-# multi device) and is the numerically-exact contract. Set
-# EASYDEL_COMPRESSED_WINDOW_DECODE_PLATFORM=pallas to route the decode attend
-# through the Pallas TPU kernel; under tensor parallelism a Mosaic custom call
-# cannot be auto-partitioned, so the pallas path is wrapped in shard_map (heads
-# sharded on "tp", shared KV replicated). "auto" -> ejkernel platform=None.
-# The module docstring records the measured end-to-end verdict on this default.
-_DECODE_KERNEL_PLATFORM = os.getenv("EASYDEL_COMPRESSED_WINDOW_DECODE_PLATFORM", "xla")
-_DECODE_KERNEL_PLATFORM = None if _DECODE_KERNEL_PLATFORM == "auto" else _DECODE_KERNEL_PLATFORM
-# Mesh axis the query/output heads are sharded over (EasyDeL's 6-axis
-# convention: ("pp","dp","fsdp","ep","tp","sp")); the shared KV head is replicated.
-_DECODE_HEAD_AXIS = "tp"
+# Platform of the compressed-window decode attend, passed per call to the registered
+# ``CompressedWindowDecodeAttn`` adapter. "xla" is the GSPMD-partitionable, numerically-exact reference; the module
+# docstring records the measured end-to-end verdict on this default. The adapter builds the head-parallel
+# ``shard_map`` itself whenever a Pallas kernel is selected on a multi-device mesh.
+_DECODE_KERNEL_PLATFORM = "xla"
 
-# Platform for the fused compressed-window TRAINING / PREFILL kernel (the
-# full-sequence, differentiable sibling of the decode kernel). DEFAULT (env
-# unset -> "auto"): the stateless / prefill forward routes through the fused
-# ejkernel op, which resolves to the tiled-flash Pallas TPU kernel on TPU
-# (``make_async_copy`` KV streaming + online softmax + sliding-window band-skip,
-# a measured ~1.35-2.71x forward speedup that scales with sequence length) and
-# to the differentiable XLA reference on CPU/GPU (identical f32 math). The
-# forward band-skip is a parity-clean win; the backward is a dense-matmul
-# recompute (fast, exact-gradient), so training is speed-neutral and inference
-# prefill is faster. Set the env var to "xla" to force the dense reference (A/B),
-# "pallas" to force Pallas, or "off"/"none"/"disabled" to fall back to the inline
-# dense ``_attend`` (no fused op at all). Under tensor parallelism the Mosaic
-# custom call cannot be auto-partitioned, so the Pallas path is wrapped in
-# shard_map (heads on "tp", shared KV replicated); the XLA path is left to GSPMD.
-_TRAIN_KERNEL_ENV = os.getenv("EASYDEL_COMPRESSED_WINDOW_ATTENTION_PLATFORM", "auto").lower()
-_TRAIN_KERNEL_ENABLED = _TRAIN_KERNEL_ENV not in ("off", "none", "disabled")
-_TRAIN_KERNEL_PLATFORM = None if _TRAIN_KERNEL_ENV in ("auto", "off", "none", "disabled") else _TRAIN_KERNEL_ENV
+# Training / prefill (full-sequence) attend: routed through the registered ``CompressedWindowAttn`` adapter, which
+# resolves to the tiled-flash Pallas TPU kernel on TPU (KV streaming + online softmax + sliding-window band-skip, a
+# measured ~1.35-2.71x forward speedup that grows with sequence length) and to the differentiable XLA reference
+# elsewhere (identical f32 math). ``None`` = the adapter's own platform choice.
+_TRAIN_KERNEL_ENABLED = True
+_TRAIN_KERNEL_PLATFORM = None
 
 
 def _unweighted_rms_norm(x: Array, eps: float) -> Array:
@@ -525,6 +518,78 @@ def _compressor_decode_step(
     # out-of-bounds index lets `mode="drop"` discard them instead.
     write_slot = jnp.where(closed, slot, n_slots)
     entries = entries.at[rows, write_slot].set(candidate.astype(entries.dtype), mode="drop")
+    return entries, buffer_kv, buffer_gate, new_overlap_kv, new_overlap_gate
+
+
+def _compressor_extend_step(
+    *,
+    kv_blk: Array,
+    gate_blk: Array,
+    buffer_kv: Array,
+    buffer_gate: Array,
+    entries: Array,
+    position_bias: Array,
+    kv_norm: "DeepseekV4RMSNorm",
+    positions: Array,
+    valid: Array,
+    rate: int,
+    head_dim: int,
+    config: "DeepseekV4Config",
+    overlap_kv: Array | None = None,
+    overlap_gate: Array | None = None,
+) -> tuple[Array, Array, Array, Array | None, Array | None]:
+    """Advance one compressor stream by a block of tokens per row (batched packed prefill).
+
+    Same state transition as :func:`_compressor_decode_step` run once per valid column, built on the shared
+    :func:`~easydel.layers.compressed_window.block_group_layout` grouping: every group that closes inside the block
+    is pooled and written in one pass; two-series streams carry the Ca overlap across groups and steps.
+
+    Args:
+        kv_blk: Raw kv projections of the block ``[B, blk, feat]``.
+        gate_blk: Raw gate projections ``[B, blk, feat]`` (position bias NOT applied).
+        buffer_kv: Open-window kv buffer ``[B, rate, feat]``.
+        buffer_gate: Open-window gate buffer ``[B, rate, feat]``.
+        entries: Padded emitted entries ``[B, n_slots, dim]``.
+        position_bias: Learned within-window bias ``[rate, feat]``.
+        kv_norm: Weighted RMSNorm applied to pooled entries.
+        positions: Stream positions ``[B, blk]`` (garbage at invalid cells).
+        valid: ``[B, blk]`` bool, a prefix per row.
+        rate: Compression rate.
+        head_dim: Output entry width (Ca/Cb series width for two-series streams).
+        config: Model config (compress rotary tables).
+        overlap_kv: Two-series only: carried Ca kv ``[B, rate, head_dim]``.
+        overlap_gate: Two-series only: carried biased fp32 Ca gate ``[B, rate, head_dim]``.
+
+    Returns:
+        Tuple ``(entries, buffer_kv, buffer_gate, overlap_kv, overlap_gate)``.
+    """
+    batch = kv_blk.shape[0]
+    layout = block_group_layout(positions, valid, rate)
+    fresh_kv = kv_blk.astype(buffer_kv.dtype)
+    fresh_gate = gate_blk.astype(buffer_gate.dtype)
+    kv_members = gather_group_members(layout, buffer_kv, fresh_kv)  # [B, G, rate, feat]
+    gate_members = gather_group_members(layout, buffer_gate, fresh_gate).astype(jnp.float32) + position_bias.astype(
+        jnp.float32
+    )
+    if overlap_kv is None:
+        slot_kv, slot_gate = kv_members, gate_members
+        new_overlap_kv = new_overlap_gate = None
+    else:
+        slot_kv, slot_gate = overlap_group_slots(kv_members, gate_members, overlap_kv, overlap_gate, head_dim)
+        new_overlap_kv, new_overlap_gate = last_closed_overlap(
+            layout, kv_members, gate_members, overlap_kv, overlap_gate, head_dim
+        )
+    compute_dtype = kv_blk.dtype
+    weights = jax.nn.softmax(slot_gate, axis=2).astype(compute_dtype)
+    candidate = kv_norm(jnp.sum(slot_kv.astype(compute_dtype) * weights, axis=2))  # [B, G, dim]
+    cos, sin = _rope_cos_sin(config, "compress", (layout.entry * rate).astype(jnp.int32), candidate.dtype)
+    candidate = _apply_interleaved_rope(candidate[:, None], cos, sin, unsqueeze_dim=1)[:, 0]
+    n_slots = entries.shape[1]
+    target = jnp.where(layout.closed, jnp.clip(layout.entry, 0, n_slots - 1), n_slots)
+    rows = jnp.arange(batch)[:, None]
+    entries = entries.at[rows, target].set(candidate.astype(entries.dtype), mode="drop")
+    buffer_kv = refresh_group_state(layout, buffer_kv, fresh_kv)
+    buffer_gate = refresh_group_state(layout, buffer_gate, fresh_gate)
     return entries, buffer_kv, buffer_gate, new_overlap_kv, new_overlap_gate
 
 
@@ -856,6 +921,39 @@ class DeepseekV4HCACompressor(spx.Module):
         block_bias = jnp.where(visible, 0.0, _MASK_MIN)[:, None, :, :].astype(jnp.float32)
         return entries, block_bias, cache_view
 
+    def cached_extend(
+        self,
+        hidden_states: Array,
+        q_residual: Array,
+        positions: Array,
+        valid: Array,
+        cache_view: CompressedWindowCacheView,
+    ) -> tuple[None, CompressedWindowCacheView]:
+        """Advance the HCA stream by a block of tokens per row (batched packed prefill).
+
+        Returns ``(None, view)``: HCA attends every reachable entry (no selection).
+        """
+        del q_residual
+        if cache_view.num_entry_slots == 0:
+            return None, cache_view
+        entries, buffer_kv, buffer_gate, _, _ = _compressor_extend_step(
+            kv_blk=self.kv_proj(hidden_states),
+            gate_blk=self.gate_proj(hidden_states),
+            buffer_kv=cache_view.compressor_buffer_kv,
+            buffer_gate=cache_view.compressor_buffer_gate,
+            entries=cache_view.compressor_entries,
+            position_bias=self.position_bias.value,
+            kv_norm=self.kv_norm,
+            positions=positions,
+            valid=valid,
+            rate=self.compress_rate,
+            head_dim=self.head_dim,
+            config=self.config,
+        )
+        return None, cache_view.replace(
+            compressor_buffer_kv=buffer_kv, compressor_buffer_gate=buffer_gate, compressor_entries=entries
+        )
+
 
 class _DeepseekV4IndexerAdapter:
     """Ca/Cb compression and cached stream policy for the shared indexer."""
@@ -900,6 +998,10 @@ class _DeepseekV4IndexerAdapter:
     def decode_step(self, **kwargs):
         """Keep the native compressor's per-row, Ca/Cb overlap state machine."""
         return _compressor_decode_step(config=self.config, **kwargs)
+
+    def extend_step(self, **kwargs):
+        """Block form of :meth:`decode_step` on the shared group layout (batched packed prefill)."""
+        return _compressor_extend_step(config=self.config, **kwargs)
 
     @staticmethod
     def entry_visibility(position_ids, cache_position, n_slots, rate):
@@ -1287,6 +1389,49 @@ class DeepseekV4CSACompressor(spx.Module):
         gathered, sel_bias = jax.lax.cond(live <= k_sel, _by_prefix, _by_gather, operand=None)
         return gathered, sel_bias, cache_view
 
+    def cached_extend(
+        self,
+        hidden_states: Array,
+        q_residual: Array,
+        positions: Array,
+        valid: Array,
+        cache_view: CompressedWindowCacheView,
+    ) -> tuple[Array | None, CompressedWindowCacheView]:
+        """Advance the CSA compressor and indexer streams by a block of tokens per row (batched packed prefill).
+
+        Returns:
+            ``(top_k [B, blk, k] or None, view)``: ``None`` when the indexer selection is vacuous (every reachable
+            entry is attended).
+        """
+        if cache_view.num_entry_slots == 0:
+            return None, cache_view
+        entries, buffer_kv, buffer_gate, overlap_kv, overlap_gate = _compressor_extend_step(
+            kv_blk=self.kv_proj(hidden_states),
+            gate_blk=self.gate_proj(hidden_states),
+            buffer_kv=cache_view.compressor_buffer_kv,
+            buffer_gate=cache_view.compressor_buffer_gate,
+            entries=cache_view.compressor_entries,
+            position_bias=self.position_bias.value,
+            kv_norm=self.kv_norm,
+            positions=positions,
+            valid=valid,
+            rate=self.compress_rate,
+            head_dim=self.head_dim,
+            config=self.config,
+            overlap_kv=cache_view.compressor_overlap_kv,
+            overlap_gate=cache_view.compressor_overlap_gate,
+        )
+        cache_view = cache_view.replace(
+            compressor_buffer_kv=buffer_kv,
+            compressor_buffer_gate=buffer_gate,
+            compressor_entries=entries,
+            compressor_overlap_kv=overlap_kv,
+            compressor_overlap_gate=overlap_gate,
+        )
+        return self.indexer.cached_extend(
+            hidden_states, q_residual, positions, valid, cache_view, kernel_mesh=getattr(self.config, "mesh", None)
+        )
+
 
 def _indexer_opened_bias(
     top_k_indices: Array,
@@ -1507,6 +1652,9 @@ class DeepseekV4Attention(spx.Module):
             )
         else:
             self.compressor = None
+        metadata = OperationMetadata(runtime_dtype=dtype, runtime_softmax_dtype=jnp.float32, base_config=config)
+        self.attn_op = CompressedWindowAttn(metadata)
+        self.decode_op = CompressedWindowDecodeAttn(metadata)
 
     def _attend(self, q: Array, kv: Array, attn_bias: Array) -> Array:
         """Sink-augmented shared-KV attention core.
@@ -1521,18 +1669,8 @@ class DeepseekV4Attention(spx.Module):
         Returns:
             Attention output ``[B, H, S, head_dim]``.
         """
-        batch, _, seq_len, _ = q.shape
-        attn_logits = jnp.einsum("bhsd,btd->bhst", q, kv, precision=self.precision).astype(jnp.float32)
-        attn_logits = attn_logits * self.scaling + attn_bias
-        sinks = jnp.broadcast_to(
-            self.sinks.value.astype(jnp.float32).reshape(1, self.num_heads, 1, 1),
-            (batch, self.num_heads, seq_len, 1),
-        )
-        combined = jnp.concatenate([attn_logits, sinks], axis=-1)
-        combined = combined - jnp.max(combined, axis=-1, keepdims=True)
-        probs = jax.nn.softmax(combined, axis=-1)  # fp32 softmax (attn_softmax_dtype convention)
-        scores = probs[..., :-1].astype(kv.dtype)  # drop the sink column
-        return jnp.einsum("bhst,btd->bhsd", scores, kv, precision=self.precision)
+        # fp32 softmax with the sink column dropped (shared with DeepSeek-V4.1 via layers.compressed_window).
+        return sink_attention(q, kv, attn_bias, self.sinks.value, scaling=self.scaling, precision=self.precision)
 
     def _fused_attend(self, q: Array, kv: Array, attn_bias: Array) -> Array:
         """Sink-augmented shared-KV attention via the fused ejkernel op.
@@ -1551,41 +1689,16 @@ class DeepseekV4Attention(spx.Module):
         Returns:
             Attention output ``[B, H, S, head_dim]``.
         """
-        bias_bsl = attn_bias[:, 0]  # [B, S, L] (head axis is broadcast inside the kernel)
-        sinks = self.sinks.value.astype(jnp.float32)  # [H]
-
-        mesh = getattr(self.config, "mesh", None)
-        jax_mesh = getattr(mesh, "jax_mesh", mesh)
-        multi_device = jax_mesh is not None and getattr(jax_mesh, "size", 1) > 1
-        # A Pallas (Mosaic) custom call cannot be auto-partitioned under a
-        # multi-device mesh; wrap it in shard_map with the head-parallel specs.
-        # The XLA reference is left to GSPMD (correct on any mesh).
-        if _DECODE_KERNEL_PLATFORM != "xla" and multi_device and _DECODE_HEAD_AXIS in jax_mesh.axis_names:
-            head = _DECODE_HEAD_AXIS
-            return compressed_window_decode(
-                q,
-                kv,
-                bias_bsl,
-                sinks,
-                softmax_scale=self.scaling,
-                platform=_DECODE_KERNEL_PLATFORM,
-                mesh=jax_mesh,
-                in_specs=(
-                    Ps(None, head, None, None),  # query: heads sharded
-                    Ps(),  # kv: shared head replicated
-                    Ps(),  # bias: replicated
-                    Ps(head),  # sinks: per-head
-                ),
-                out_specs=Ps(None, head, None, None),
-            )
-        return compressed_window_decode(
+        # The registered adapter casts operands, picks the kernel and (for Pallas on a multi-device mesh) builds the
+        # head-parallel shard_map from the metadata.
+        return self.decode_op(
             q,
             kv,
-            bias_bsl,
-            sinks,
+            attn_bias[:, 0],  # [B, S, L]; the head axis is broadcast inside the kernel
+            self.sinks.value.astype(jnp.float32),
             softmax_scale=self.scaling,
             platform=_DECODE_KERNEL_PLATFORM,
-        )
+        ).attention_outputs
 
     def _fused_attend_full(self, q: Array, kv: Array, attn_bias: Array) -> Array:
         """Sink-augmented shared-KV attention via the fused full-sequence op.
@@ -1611,54 +1724,20 @@ class DeepseekV4Attention(spx.Module):
         Returns:
             Attention output ``[B, H, S, head_dim]``.
         """
-        bias_bsl = attn_bias[:, 0]  # [B, S, T] (head axis is broadcast inside the kernel)
-        sinks = self.sinks.value.astype(jnp.float32)  # [H]
-        # The token-KV region is the sequence (its length); anything beyond it on
-        # the KV axis is the always-visible compressed entries. Passing the
-        # sliding window + this split lets the Pallas kernel band-skip the
-        # out-of-window token tiles (O(S*window)) and recompute its backward
-        # through the matching windowed reference.
-        seq_len = q.shape[2]
-        window = self.sliding_window
-
-        mesh = getattr(self.config, "mesh", None)
-        jax_mesh = getattr(mesh, "jax_mesh", mesh)
-        multi_device = jax_mesh is not None and getattr(jax_mesh, "size", 1) > 1
-        # A Pallas (Mosaic) custom call cannot be auto-partitioned under a
-        # multi-device mesh; wrap it in shard_map with the head-parallel specs.
-        # Only when the op will actually resolve to Pallas (TPU + not forced xla);
-        # the XLA path (CPU/GPU, or forced xla) is left to GSPMD on any mesh.
-        want_pallas = _TRAIN_KERNEL_PLATFORM != "xla" and jax.default_backend() == "tpu"
-        if want_pallas and multi_device and _DECODE_HEAD_AXIS in jax_mesh.axis_names:
-            head = _DECODE_HEAD_AXIS
-            return compressed_window_attention(
-                q,
-                kv,
-                bias_bsl,
-                sinks,
-                softmax_scale=self.scaling,
-                platform=_TRAIN_KERNEL_PLATFORM,
-                window=window,
-                token_kv_len=seq_len,
-                mesh=jax_mesh,
-                in_specs=(
-                    Ps(None, head, None, None),  # query: heads sharded
-                    Ps(),  # kv: shared head replicated
-                    Ps(),  # bias: replicated
-                    Ps(head),  # sinks: per-head
-                ),
-                out_specs=Ps(None, head, None, None),
-            )
-        return compressed_window_attention(
+        # The token-KV region is the sequence (its length); anything beyond it on the KV axis is the always-visible
+        # compressed entries. Passing the sliding window + this split lets the Pallas kernel band-skip out-of-window
+        # token tiles (O(S*window)) and recompute its backward through the matching windowed reference. The registered
+        # adapter builds the head-parallel shard_map when a Pallas kernel runs on a multi-device mesh.
+        return self.attn_op(
             q,
             kv,
-            bias_bsl,
-            sinks,
+            attn_bias[:, 0],  # [B, S, T]; the head axis is broadcast inside the kernel
+            self.sinks.value.astype(jnp.float32),
             softmax_scale=self.scaling,
             platform=_TRAIN_KERNEL_PLATFORM,
-            window=window,
-            token_kv_len=seq_len,
-        )
+            window=self.sliding_window,
+            token_kv_len=q.shape[2],
+        ).attention_outputs
 
     def _decode_attend(
         self,
@@ -1725,6 +1804,77 @@ class DeepseekV4Attention(spx.Module):
         advance = 1 if valid is None else valid.astype(jnp.int32)
         cache_view = cache_view.replace(window_kv=ring, cache_position=stream_position + advance)
         return self._fused_attend(q, kv_axis, attn_bias), cache_view
+
+    def _extend_attend(
+        self,
+        q: Array,
+        kv: Array,
+        hidden_states: Array,
+        q_residual: Array,
+        positions: Array,
+        valid: Array,
+        cache_view: CompressedWindowCacheView,
+    ) -> tuple[Array, CompressedWindowCacheView]:
+        """Advance every row by a block of up to ``sliding_window`` tokens in one pass (batched packed prefill).
+
+        Same visible set as :meth:`_decode_attend` applied column by column: each query sees the pre-block ring slots
+        still inside its window, the block's own keys up to itself, and the compressed entries below its reach
+        (all of them for HCA / a vacuous CSA selection, its indexer picks otherwise). Built on the shared
+        ``layers.compressed_window`` block helpers.
+
+        Args:
+            q: Rotated queries ``[S, H, blk, D]``.
+            kv: Rotated token KV ``[S, blk, D]``.
+            hidden_states: ``[S, blk, D_model]``.
+            q_residual: ``[S, blk, q_lora]``.
+            positions: Stream positions ``[S, blk]`` (garbage at invalid cells).
+            valid: ``[S, blk]`` bool, a prefix per row.
+            cache_view: This layer's cache state.
+
+        Returns:
+            ``(attention [S, H, blk, D] before the inverse output rotation, view)``.
+        """
+        slots, block = positions.shape
+        window = self.sliding_window
+        positions = positions.astype(jnp.int32)
+        n_valid = jnp.sum(valid, axis=1).astype(jnp.int32)
+        rows = jnp.arange(slots)[:, None]
+        ring = cache_view.window_kv
+        token_bias = block_token_bias(positions, valid, window)  # [S, blk, W + blk]
+        token_keys = jnp.concatenate([ring.astype(kv.dtype), kv], axis=1)
+        write_slot = jnp.where(valid, positions % window, window)
+        ring = ring.at[rows, write_slot].set(kv.astype(ring.dtype), mode="drop")
+        gathered = gathered_bias = None
+        if self.compressor is not None:
+            top_k, cache_view = self.compressor.cached_extend(hidden_states, q_residual, positions, valid, cache_view)
+            entries = cache_view.compressor_entries
+            if entries is not None and top_k is None:
+                # Every reachable entry: shared by the block's queries, masked per query by its reach.
+                reach = (positions + 1) // self.compressor.compress_rate
+                visible = jnp.arange(entries.shape[1], dtype=jnp.int32)[None, None, :] < reach[..., None]
+                token_keys = jnp.concatenate([token_keys, entries.astype(kv.dtype)], axis=1)
+                token_bias = jnp.concatenate(
+                    [token_bias, jnp.where(visible, 0.0, _MASK_MIN).astype(jnp.float32)], axis=-1
+                )
+            elif entries is not None and top_k.shape[-1] > 0:
+                k = top_k.shape[-1]
+                flat, flat_bias = gather_selected_entries(entries, top_k.reshape(slots, block * k))
+                gathered = flat.reshape(slots, block, k, -1).astype(kv.dtype)
+                gathered_bias = flat_bias.reshape(slots, block, k)
+        out = block_sink_attention(
+            q,
+            token_keys,
+            token_bias,
+            self.sinks.value,
+            scaling=self.scaling,
+            gathered=gathered,
+            gathered_bias=gathered_bias,
+            # Same numerics as the per-column path this replaces: the registered compressed-window decode op runs
+            # both contractions at HIGHEST (TPU default precision is single-pass bf16, ~1e-2 logit error).
+            precision=jax.lax.Precision.HIGHEST,
+        )
+        new_position = jnp.where(n_valid > 0, positions[:, 0] + n_valid, cache_view.cache_position)
+        return out, cache_view.replace(window_kv=ring, cache_position=new_position)
 
     def _packed_forward(
         self,
@@ -1827,45 +1977,56 @@ class DeepseekV4Attention(spx.Module):
             grouped = self.o_a_proj(grouped).reshape(1, total_tokens, -1)
             return checkpoint_name(self.o_b_proj(grouped), "attn_output"), cache_view
 
+        # Shared packed driver (``layers.compressed_window``, also used by DeepSeek-V4.1): prefill / chunked-prefill
+        # buckets advance a block of columns per loop step through :meth:`_extend_attend`; buckets with at most one
+        # token per slot keep the single-column :meth:`_decode_attend`. Only occupied columns are visited.
+        block = packed_block_size(total_tokens, num_slots, self.sliding_window)
+        width = -(-total_tokens // block) * block
+
         def _to_grid(values: Array) -> Array:
-            """Scatter per-token values ``[T, ...]`` into ``[num_slots, T, ...]``."""
-            grid = jnp.zeros((num_slots, total_tokens, *values.shape[1:]), dtype=values.dtype)
-            return grid.at[slot_tok, col_tok].set(values, mode="drop")
+            """Scatter per-token values ``[T, ...]`` into ``[num_slots, width, ...]``."""
+            return tokens_to_grid(values, slot_tok, col_tok, num_slots, width)
 
-        hidden_grid = _to_grid(hidden_states[0])  # [S, T, D]
-        qres_grid = _to_grid(q_residual[0])  # [S, T, q_lora]
-        q_grid = _to_grid(q[0].transpose(1, 0, 2))  # [S, T, H, head_dim]
-        kv_grid = _to_grid(kv[0])  # [S, T, head_dim]
+        def _pad_cols(grid: Array) -> Array:
+            return grid if width == total_tokens else jnp.pad(grid, ((0, 0), (0, width - total_tokens)))
 
-        # Only the grid columns that carry a real token do any work: a chunked
-        # step fills the leading columns only, so scanning the full padded bucket
-        # width ``T`` wastes the remaining columns on full compressor+attention
-        # compute. Iterate only the occupied columns via a data-dependent
-        # ``while_loop`` (static shapes, one compile per bucket); columns beyond
-        # the last real token stay zero and are never gathered.
-        col_iota = jnp.arange(total_tokens, dtype=jnp.int32)
-        column_has_token = jnp.any(packed_meta.valid_grid, axis=0)  # [T]
-        num_used_cols = jnp.max(jnp.where(column_has_token, col_iota + 1, 0))  # 0..T
+        hidden_grid = _to_grid(hidden_states[0])  # [S, W, D]
+        qres_grid = _to_grid(q_residual[0])  # [S, W, q_lora]
+        q_grid = _to_grid(q[0].transpose(1, 0, 2))  # [S, W, H, head_dim]
+        kv_grid = _to_grid(kv[0])  # [S, W, head_dim]
+        pos_grid = _pad_cols(packed_meta.positions_grid)
+        valid_grid = _pad_cols(packed_meta.valid_grid)
+        num_used = occupied_columns(valid_grid)
+        attn_columns = jnp.zeros((width, num_slots, self.num_heads, self.head_dim), dtype=cache_view.window_kv.dtype)
 
-        attn_columns = jnp.zeros(
-            (total_tokens, num_slots, self.num_heads, self.head_dim),
-            dtype=cache_view.window_kv.dtype,
-        )
+        def _block_step(start: Array, carry):
+            """Advance every slot by the ``block`` columns starting at ``start``."""
+            view, acc = carry
 
-        def _cond(state):
-            """Continue while grid columns still carry unprocessed real tokens."""
-            col, _view, _acc = state
-            return col < num_used_cols
+            def cols(grid: Array) -> Array:
+                return jax.lax.dynamic_slice_in_dim(grid, start, block, axis=1)
 
-        def _body(state):
+            attn, view = self._extend_attend(
+                q=cols(q_grid).transpose(0, 2, 1, 3),
+                kv=cols(kv_grid),
+                hidden_states=cols(hidden_grid),
+                q_residual=cols(qres_grid),
+                positions=cols(pos_grid),
+                valid=cols(valid_grid),
+                cache_view=view,
+            )
+            acc = jax.lax.dynamic_update_slice_in_dim(acc, attn.transpose(2, 0, 1, 3).astype(acc.dtype), start, axis=0)
+            return view, acc
+
+        def _column_step(col: Array, carry):
             """Advance every slot by one grid column (column ``col``)."""
-            col, view, acc = state
+            view, acc = carry
             hidden_col = jax.lax.dynamic_index_in_dim(hidden_grid, col, axis=1, keepdims=False)  # [S, D]
             qres_col = jax.lax.dynamic_index_in_dim(qres_grid, col, axis=1, keepdims=False)  # [S, q_lora]
             q_col = jax.lax.dynamic_index_in_dim(q_grid, col, axis=1, keepdims=False)  # [S, H, head_dim]
             kv_col = jax.lax.dynamic_index_in_dim(kv_grid, col, axis=1, keepdims=False)  # [S, head_dim]
-            pos_col = jax.lax.dynamic_index_in_dim(packed_meta.positions_grid, col, axis=1, keepdims=False)  # [S]
-            valid_col = jax.lax.dynamic_index_in_dim(packed_meta.valid_grid, col, axis=1, keepdims=False)  # [S]
+            pos_col = jax.lax.dynamic_index_in_dim(pos_grid, col, axis=1, keepdims=False)  # [S]
+            valid_col = jax.lax.dynamic_index_in_dim(valid_grid, col, axis=1, keepdims=False)  # [S]
             attn_col, view = self._decode_attend(
                 q=q_col[:, :, None, :],
                 kv=kv_col[:, None, :],
@@ -1876,13 +2037,16 @@ class DeepseekV4Attention(spx.Module):
                 valid=valid_col,
             )
             acc = jax.lax.dynamic_update_index_in_dim(acc, attn_col[:, :, 0, :].astype(acc.dtype), col, axis=0)
-            return col + 1, view, acc
+            return view, acc
 
-        _, cache_view, attn_columns = jax.lax.while_loop(
-            _cond, _body, (jnp.int32(0), cache_view, attn_columns)
-        )  # attn_columns: [T, S, H, head_dim]
+        cache_view, attn_columns = run_column_blocks(
+            _block_step if block > 1 else _column_step,
+            (cache_view, attn_columns),
+            num_used=num_used,
+            block=block,
+        )  # attn_columns: [W, S, H, head_dim]
 
-        attn_packed = attn_columns[col_tok, safe_slot][None, ...]  # [1, T, H, head_dim]
+        attn_packed = grid_to_tokens(attn_columns, slot_tok, col_tok, num_slots)[None, ...]  # [1, T, H, head_dim]
         attn_output = _apply_interleaved_rope(attn_packed, cos, -sin, unsqueeze_dim=2)
 
         grouped = attn_output.reshape(1, total_tokens, self.config.o_groups, -1)

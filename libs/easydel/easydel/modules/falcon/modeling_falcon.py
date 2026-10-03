@@ -65,7 +65,7 @@ from easydel.caching import (
 )
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import BaseModelOutput, DecoderLayerOutput
+from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, DecoderLayerOutput
 from easydel.infra.utils import auto_remat, blockwise_ffn
 from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear, dense_qkv_layout
 from easydel.layers.attention import UnifiedAttention
@@ -73,6 +73,30 @@ from easydel.layers.norms import LayerNorm
 from easydel.modules._base import BaseCausalLMModule
 
 from .falcon_configuration import FalconConfig
+
+
+def bloom_alibi_slopes(num_attention_heads):
+    """Per-head BLOOM/Falcon ALiBi slopes.
+
+    Geometric series with base ``2 ** -(2 ** -(log2(cp2) - 3))`` where ``cp2`` is the largest power of
+    two ``<= num_attention_heads``; heads beyond ``cp2`` use the doubled-base extension (odd powers).
+
+    Args:
+        num_attention_heads: Number of attention heads.
+
+    Returns:
+        Float32 array ``[num_attention_heads]``.
+    """
+    cp2 = 2 ** math.floor(math.log2(num_attention_heads))
+    base = jnp.asarray(2 ** (-(2 ** -(math.log2(cp2) - 3))), dtype=jnp.float32)
+    powers = jnp.arange(1, 1 + cp2, dtype=jnp.float32)
+    slops = jnp.power(base, powers)
+    if cp2 != num_attention_heads:
+        extra_base = jnp.asarray(2 ** (-(2 ** -(math.log2(2 * cp2) - 3))), dtype=jnp.float32)
+        num_rem_heads = min(cp2, num_attention_heads - cp2)
+        extra_power = jnp.arange(1, 1 + 2 * num_rem_heads, 2, dtype=jnp.float32)
+        slops = jnp.concatenate([slops, jnp.power(extra_base, extra_power)], axis=0)
+    return slops
 
 
 def built_bloom_alibi(attention_mask, num_attention_heads):
@@ -98,15 +122,7 @@ def built_bloom_alibi(attention_mask, num_attention_heads):
         sequence_length)`` ready to be broadcast-added to the QK logits.
     """
     batch_size, sequence_length = attention_mask.shape
-    cp2 = 2 ** math.floor(math.log2(num_attention_heads))
-    base = jnp.asarray(2 ** (-(2 ** -(math.log2(cp2) - 3))), dtype=jnp.float32)
-    powers = jnp.arange(1, 1 + cp2, dtype=jnp.float32)
-    slops = jnp.power(base, powers)
-    if cp2 != num_attention_heads:
-        extra_base = jnp.asarray(2 ** (-(2 ** -(math.log2(2 * cp2) - 3))), dtype=jnp.float32)
-        num_rem_heads = min(cp2, num_attention_heads - cp2)
-        extra_power = jnp.arange(1, 1 + 2 * num_rem_heads, 2, dtype=jnp.float32)
-        slops = jnp.concatenate([slops, jnp.power(extra_base, extra_power)], axis=0)
+    slops = bloom_alibi_slopes(num_attention_heads)
     arange_tensor = (((jnp.cumsum(attention_mask, axis=-1)) - 1) * attention_mask)[:, jnp.newaxis, :]
     alibi = slops[..., jnp.newaxis].astype(jnp.bfloat16) * arange_tensor
     return alibi.reshape(batch_size, num_attention_heads, 1, sequence_length)
@@ -194,6 +210,106 @@ class FalconAttention(UnifiedAttention):
             attention_type="alibi" if config.alibi else "standard",
             causal=True,
             use_gqa=use_gqa,
+        )
+
+    def forward_alibi(
+        self,
+        hidden_states,
+        mask_info,
+        position_ids,
+        mode,
+        cache_view=None,
+        cache_metadata=None,
+        output_attentions: bool = False,
+        alibi=None,
+    ) -> AttentionLayerOutput:
+        """ALiBi attention; ragged paged caches hand the slopes to the kernel instead of a dense bias.
+
+        The dense path (:meth:`UnifiedAttention.forward_alibi`) needs a ``[batch, heads, q, kv]`` bias,
+        which the paged kernels cannot consume (and a width-1 decode mask would zero every slope). For a
+        :class:`RaggedPagesCacheView` the per-head slopes ``bf16(slope_h) / sqrt(head_dim)`` (the same
+        values ``FalconModel`` folds into its dense bias) go to ragged paged attention v3, which adds
+        ``slope_h * (k - q)`` to the scaled logits. That equals ``slope_h * k`` up to a per-row constant, so
+        the softmax matches. Every other cache type takes the dense path unchanged.
+
+        Args:
+            hidden_states: Residual stream ``[batch, seq_len, hidden_dim]``.
+            mask_info: Mask information (unused by the paged kernel).
+            position_ids: Position indices (unused by ALiBi).
+            mode: Runtime mode.
+            cache_view: KV cache view.
+            cache_metadata: Cache metadata.
+            output_attentions: Whether to materialize attention weights (dense path only).
+            alibi: Optional precomputed dense bias (dense path only).
+
+        Returns:
+            :class:`AttentionLayerOutput` with the attention output and updated cache view.
+        """
+        if not isinstance(cache_view, RaggedPagesCacheView):
+            return super().forward_alibi(
+                hidden_states,
+                mask_info,
+                position_ids,
+                mode,
+                cache_view,
+                cache_metadata,
+                output_attentions,
+                alibi,
+            )
+        batch_size, sequence_length = hidden_states.shape[:2]
+        query_states, key_states, value_states = self._project_qkv(hidden_states)
+        query_states = query_states.reshape(batch_size, sequence_length, self.num_heads, self.head_dim)
+        key_states = key_states.reshape(batch_size, sequence_length, self.num_key_value_heads, self.head_dim)
+        value_states = value_states.reshape(batch_size, sequence_length, self.num_key_value_heads, self.head_dim)
+        query_states, key_states, value_states = self._postprocess_qkv(query_states, key_states, value_states)
+        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
+
+        causal_for_kernel = self.causal
+        if mask_info is not None and getattr(mask_info, "_causal_baked", False):
+            causal_for_kernel = False
+        (
+            key_states,
+            value_states,
+            mask_info,
+            init_attention_bias,
+            cache_view,
+            cache_metadata,
+        ) = self.concatenate(
+            query=query_states,
+            key=key_states,
+            value=value_states,
+            cache_view=cache_view,
+            cache_metadata=cache_metadata,
+            mask_info=mask_info,
+        )
+        slopes = bloom_alibi_slopes(self.num_heads).astype(jnp.bfloat16).astype(jnp.float32)
+        slopes = slopes / math.sqrt(self.head_dim)
+        attentions = self.attention_performer.forward(
+            query_states=query_states,
+            key_states=key_states,
+            value_states=value_states,
+            mode=mode,
+            bias=None,
+            cache_metadata=cache_metadata,
+            cache_view=cache_view,
+            init_bias=init_attention_bias,
+            mask_info=mask_info,
+            causal=causal_for_kernel,
+            softmax_aux=self._softmax_aux(),
+            output_attentions=output_attentions,
+            alibi_slopes=slopes,
+        )
+        if attentions.cache_view is not None:
+            cache_view = attentions.cache_view
+        attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs), pre_projection=True)
+        attn_output = checkpoint_name(self.output_projection(attn_output), "attn_output")
+        attn_output = self.shard_attention_prod(attn_output)
+        if hasattr(self, "resid_dropout"):
+            attn_output = self.resid_dropout(attn_output)
+        return AttentionLayerOutput(
+            attention_output=attn_output,
+            attention_weight=attentions.attention_weights if output_attentions else None,
+            cache_view=cache_view,
         )
 
     def _create_fused_qkv_proj(
@@ -770,15 +886,6 @@ class FalconModel(EasyDeLBaseModule):
         if position_ids is None:
             position_ids = mask_info.q_position_ids
 
-        alibi = None
-        if self.config.alibi:
-            # HF folds the ALiBi bias into the mask pre-divided by sqrt(head_dim)
-            # (``softmax((QK^T + alibi) / sqrt(head_dim))``); the kernel only scales QK^T.
-            alibi_mask = attention_mask if attention_mask is not None else mask_info.q_attention_mask
-            alibi = built_bloom_alibi(
-                jnp.asarray(alibi_mask, dtype=jnp.int32),
-                self.config.num_attention_heads,
-            ).astype(inputs_embeds.dtype) / jnp.asarray(math.sqrt(self.config.head_dim), dtype=inputs_embeds.dtype)
         if mode is None:
             mode = (
                 common_types.MODE_DECODE
@@ -790,6 +897,49 @@ class FalconModel(EasyDeLBaseModule):
         hidden_states = inputs_embeds
 
         views = past_key_values.views if past_key_values is not None else None
+        alibi = None
+        # Paged serving passes per-head slopes to the ragged kernel (FalconAttention.forward_alibi);
+        # no dense [batch, heads, 1, kv] bias is needed (or buildable from a width-1 query mask).
+        ragged_serving = bool(views) and isinstance(views[0], RaggedPagesCacheView)
+        if self.config.alibi and not ragged_serving:
+            # HF folds ALiBi into the logits before scaling QK^T. On decode,
+            # build the per-key positions over the full static cache capacity:
+            # the query mask alone has width one and would zero every slope.
+            alibi_mask = attention_mask if attention_mask is not None else mask_info.q_attention_mask
+            # Any dense-cache step (decode or a multi-token continuation) attends over the cache width, so
+            # ALiBi needs absolute per-key positions there; a width-S mask restarted positions at 0 and left
+            # cached keys with a zero bias (r15 S10-1, previously only MODE_DECODE was rebuilt).
+            if views and isinstance(views[0], TransformerCacheView):
+                view = views[0]
+                if view.key is not None:
+                    kv_len = view.key.shape[1]
+                    if alibi_mask is not None and alibi_mask.shape[-1] > sequence_length:
+                        # Honor an explicit full-window mask, including interior padding. Like HF,
+                        # the caller's mask is trusted as-is (it must cover the tokens being
+                        # written, as ``generate`` does); the same mask also gates attention, so
+                        # ALiBi positions and visible keys stay consistent.
+                        alibi_mask = jnp.pad(
+                            jnp.asarray(alibi_mask, dtype=jnp.bool_)[:, :kv_len],
+                            ((0, 0), (0, max(0, kv_len - alibi_mask.shape[-1]))),
+                        )
+                    else:
+                        kv_positions = jnp.arange(kv_len)[None, :]
+                        cached = (kv_positions >= view.starts[:, None]) & (kv_positions < view.indexes[:, None])
+                        rel = kv_positions - view.indexes[:, None]
+                        in_new = (rel >= 0) & (rel < sequence_length)
+                        if alibi_mask is not None and alibi_mask.shape[-1] == sequence_length:
+                            # New columns keep the caller's per-token validity (left padding of a prefill).
+                            new_valid = jnp.take_along_axis(
+                                jnp.asarray(alibi_mask, dtype=jnp.bool_),
+                                jnp.clip(rel, 0, sequence_length - 1),
+                                axis=1,
+                            )
+                            in_new = in_new & new_valid
+                        alibi_mask = cached | in_new
+            alibi = built_bloom_alibi(
+                jnp.asarray(alibi_mask, dtype=jnp.int32),
+                self.config.num_attention_heads,
+            ).astype(inputs_embeds.dtype) / jnp.asarray(math.sqrt(self.config.head_dim), dtype=inputs_embeds.dtype)
         has_cache_views = views is not None and any(v is not None for v in views)
         needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
         trace_layers = self._layer_scan_trace(

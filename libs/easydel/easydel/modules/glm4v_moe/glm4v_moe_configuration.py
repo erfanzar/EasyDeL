@@ -244,6 +244,8 @@ class Glm4vMoeVisionConfig(EasyDeLBaseConfig):
 
     model_type = "glm4v_moe_vision"
     base_config_key = "vision_config"
+    # Matches HF: the 2-D vision rotary is axial (theta 10000, the value the GLM-4V vision tower uses).
+    default_rope_type = "axial"
 
     def __init__(
         self,
@@ -485,6 +487,8 @@ class Glm4vMoeTextConfig(EasyDeLBaseConfig):
         self.first_k_dense_replace = first_k_dense_replace
         self.norm_topk_prob = norm_topk_prob
         self.router_aux_loss_coef = router_aux_loss_coef
+        # Declared by HF ``Glm4vMoeTextConfig`` (default False); its forward reads it when the caller passes None.
+        self.output_router_logits = kwargs.pop("output_router_logits", False)
 
         self._external_rope_config_kwargs = {"repetition_style": True}
 

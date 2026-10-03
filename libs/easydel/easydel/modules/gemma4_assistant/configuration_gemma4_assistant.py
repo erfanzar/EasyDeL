@@ -168,8 +168,8 @@ class Gemma4AssistantConfig(EasyDeLBaseConfig):
     Args:
         text_config: Drafter decoder sub-config. ``Gemma4AssistantTextConfig``
             or a dict.
-        backbone_hidden_size: TARGET model's hidden size (2560 for
-            Gemma4-E4B, 2816 for 26B, etc.). Drives
+        backbone_hidden_size: TARGET model's hidden size (defaults to 1536 like HF;
+            pass 2560 for Gemma4-E4B, 2816 for 26B, etc.). Drives
             ``pre_projection``'s input width (``2 * backbone_hidden_size``)
             and ``post_projection``'s output width.
         num_centroids: Number of centroid clusters in the output head.
@@ -202,10 +202,10 @@ class Gemma4AssistantConfig(EasyDeLBaseConfig):
     def __init__(
         self,
         text_config: Mapping[str, typing.Any] | Gemma4AssistantTextConfig | None = None,
-        backbone_hidden_size: int = 2560,
+        backbone_hidden_size: int = 1536,
         num_centroids: int = 2048,
         centroid_intermediate_top_k: int = 32,
-        use_ordered_embeddings: bool = True,
+        use_ordered_embeddings: bool = False,
         image_token_id: int = 258880,
         video_token_id: int | None = None,
         audio_token_id: int | None = 258881,

@@ -16,6 +16,72 @@ import pytest
 from easydel.modules.qwen4_exp.modeling_qwen4_exp import Qwen4ExpAttention
 
 
+@pytest.mark.parametrize("seed", [0, 17])
+def test_paged_qsa_shared_selector_matches_full_page_ranking_over_ragged_decode(seed):
+    """The context-bounded selector preserves old ids across page-permuted ragged schedules."""
+    import spectrax as spx
+    from easydel.layers.indexer import BlockTopKIndexer
+    from easydel.layers.indexer._paged_block_topk import paged_block_topk
+
+    rng = np.random.default_rng(seed)
+    indexer = BlockTopKIndexer(
+        hidden_size=4,
+        index_n_heads=2,
+        index_kv_heads=1,
+        index_head_dim=4,
+        indexer_budget=4,
+        indexer_compress_ratio=2,
+        dtype=jnp.float32,
+        param_dtype=jnp.float32,
+        rngs=spx.Rngs(seed),
+    )
+    # Inject exact ties as well as non-tied scores, pinning lowest-block tie order.
+    physical_keys = jnp.asarray(rng.normal(size=(6, 3, 4)), jnp.float32)
+    physical_keys = physical_keys.at[0].set(jnp.zeros((3, 4), jnp.float32))
+    block_tables = jnp.asarray([[4, 1, 5], [2, 0, 3]], jnp.int32)
+    schedule = ((1, 1), (3, 2), (6, 4), (7, 7), (10, 8))
+
+    for step, context_pair in enumerate(schedule):
+        logical = jnp.asarray(context_pair, jnp.int32) - 1
+        query = jnp.asarray(rng.normal(size=(2, 2, 4)), jnp.float32)
+        if step == 0:
+            query = jnp.zeros_like(query)
+        request_ids = jnp.arange(2, dtype=jnp.int32)
+        reachable = (logical + 1) // 2
+        logical_page = jnp.arange(6, dtype=jnp.int32)[None, :] // 3
+        within_page = jnp.arange(6, dtype=jnp.int32)[None, :] % 3
+        physical_block = block_tables[request_ids[:, None], logical_page] * 3 + within_page
+
+        old_indices = indexer.select_paged(
+            query,
+            physical_keys.reshape(-1, 4),
+            physical_block,
+            logical,
+            jnp.ones((2,), jnp.bool_),
+        ).indices
+        selected_blocks = paged_block_topk(
+            query,
+            physical_keys,
+            block_tables,
+            request_ids,
+            reachable,
+            indexer.block_topk,
+            precision=indexer.precision,
+        )
+        new_indices = indexer._expand_selection(
+            selected_blocks[:, None],
+            selected_blocks[:, None] >= 0,
+            jnp.zeros((2,), jnp.int32),
+            logical[:, None],
+            jnp.ones((2, 1), jnp.bool_),
+        )[:, 0]
+        # The consumer (``_decode_gather_attention``) is a softmax over the gathered set, so the contract is the
+        # selected id set per row (and its padding count), not the order the selector emits them in.
+        np.testing.assert_array_equal(
+            np.sort(np.asarray(new_indices), axis=-1), np.sort(np.asarray(old_indices), axis=-1)
+        )
+
+
 def _full_width_reference(q, key, value, selected, scale):
     """Masked full-width softmax attention over the dense buffer."""
     batch, seq, kv_heads, dim = key.shape
@@ -277,12 +343,17 @@ def test_paged_qsa_selection_writes_pages_and_selects_complete_prefix():
     class View:
         indexer_key_pages: object
         mrope_position_pages: object
+        indexer_block_pages: object
 
         def replace(self, **kwargs):
             return replace(self, **kwargs)
 
     attn = SimpleNamespace(indexer=indexer, rotary=Rotary())
-    view = View(jnp.zeros((1, 4, 2), jnp.float32), jnp.zeros((1, 4, 3), jnp.int32))
+    view = View(
+        jnp.zeros((1, 4, 2), jnp.float32),
+        jnp.zeros((1, 4, 3), jnp.int32),
+        jnp.zeros((1, 2, 2), jnp.float32),
+    )
     meta = RaggedPagesMetadata(
         pages_tables=jnp.array([[0]], jnp.int32),
         context_lens=jnp.array([4], jnp.int32),
@@ -320,6 +391,7 @@ def test_paged_qsa_view_allocates_and_resets_sidecars():
         version="v2",
     )
     object.__setattr__(cfg, "qwen4_indexer_head_dim", 6)
+    object.__setattr__(cfg, "qwen4_indexer_compress_ratio", 2)
     mesh = jax.sharding.Mesh(np.asarray(jax.devices()), ("tp",))
     view = Qwen4ExpPagedQSAView.init(cfg, mesh=mesh)
     assert view.indexer_key_pages.shape == (4, 4, 6)
@@ -414,17 +486,20 @@ def test_ragged_cache_insert_preserves_qwen_sidecars_and_type():
         version="v2",
     )
     object.__setattr__(cfg, "qwen4_indexer_head_dim", 6)
+    object.__setattr__(cfg, "qwen4_indexer_compress_ratio", 2)
     mesh = jax.sharding.Mesh(np.asarray(jax.devices()), ("tp",))
     target = Qwen4ExpPagedQSAView.init(cfg, mesh=mesh)
     source = target.replace(
         kv_pages=jnp.ones_like(target.kv_pages[:2]),
         indexer_key_pages=jnp.ones_like(target.indexer_key_pages[:2]),
         mrope_position_pages=jnp.ones_like(target.mrope_position_pages[:2]),
+        indexer_block_pages=jnp.ones_like(target.indexer_block_pages[:2]),
     )
     result = RaggedPagesCache([target]).insert(RaggedPagesCache([source]), 2).views[0]
     assert isinstance(result, Qwen4ExpPagedQSAView)
     assert bool(jnp.all(result.indexer_key_pages[2:] == 1))
     assert bool(jnp.all(result.mrope_position_pages[2:] == 1))
+    assert bool(jnp.all(result.indexer_block_pages[2:] == 1))
 
 
 def test_v3_paged_qsa_writes_current_kv_before_selected_gather():
@@ -510,6 +585,7 @@ def test_paged_qsa_ranked_prefill_and_decode_match_numpy_and_page_history():
     class View:
         indexer_key_pages: object
         mrope_position_pages: object
+        indexer_block_pages: object
 
         def replace(self, **kwargs):
             return replace(self, **kwargs)
@@ -534,22 +610,31 @@ def test_paged_qsa_ranked_prefill_and_decode_match_numpy_and_page_history():
             expected_pages[page, token % 4] = raw[row, token]
             expected_pos[page, token % 4] = token
     seed_pages, seed_pos = expected_pages.copy(), expected_pos.copy()
+    seed_blocks = np.zeros((4, 2, 4), np.float32)
     for row in range(2):
         seed_pages[tables[row, 1], 2] = 0
         seed_pos[tables[row, 1], 2] = 0
+        for block in range(3):
+            pooled = raw[row, 2 * block : 2 * block + 2].mean(axis=0)
+            pooled = pooled / np.sqrt(np.mean(pooled**2) + 1e-6)
+            seed_blocks[tables[row, (2 * block) // 4], ((2 * block) % 4) // 2] = pooled
     attn = SimpleNamespace(indexer=indexer, rotary=Rotary())
     decoded, decode_view = Qwen4ExpAttention._paged_indexer_select(
         attn,
         jnp.asarray(hidden[:, -1].reshape(1, 2, 4)),
         jnp.asarray([[6, 6]], jnp.int32),
-        View(jnp.asarray(seed_pages), jnp.asarray(seed_pos)),
+        View(jnp.asarray(seed_pages), jnp.asarray(seed_pos), jnp.asarray(seed_blocks)),
         metadata(1),
     )
     prefilled, prefill_view = Qwen4ExpAttention._paged_indexer_select(
         attn,
         jnp.asarray(hidden.reshape(1, 14, 4)),
         jnp.asarray(np.tile(np.arange(7), 2)[None], jnp.int32),
-        View(jnp.zeros_like(decode_view.indexer_key_pages), jnp.zeros_like(decode_view.mrope_position_pages)),
+        View(
+            jnp.zeros_like(decode_view.indexer_key_pages),
+            jnp.zeros_like(decode_view.mrope_position_pages),
+            jnp.zeros_like(decode_view.indexer_block_pages),
+        ),
         metadata(7),
     )
     for view in (decode_view, prefill_view):

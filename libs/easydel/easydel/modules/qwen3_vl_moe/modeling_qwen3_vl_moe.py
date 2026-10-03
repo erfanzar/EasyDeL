@@ -961,7 +961,7 @@ class Qwen3VLMoeTextModel(EasyDeLBaseModule):
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
             cache_views=views,
-            extra=needs_trace_cache or bool(output_router_logits) or deepstack_visual_embeds is not None,
+            extra=needs_trace_cache or bool(output_router_logits) or bool(deepstack_visual_embeds),
         )
         cache_views = views if trace_layers else None
         # Hoisted out of the loop body: the caching property must not be
@@ -995,7 +995,8 @@ class Qwen3VLMoeTextModel(EasyDeLBaseModule):
                 )
             hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
-            if deepstack_visual_embeds is not None and idx < len(deepstack_visual_embeds):
+            # Truthiness so an empty list never compares against a traced scan index (r11 S10-2).
+            if deepstack_visual_embeds and idx < len(deepstack_visual_embeds):
                 hidden_states = self._deepstack_process(
                     hidden_states,
                     visual_pos_masks,

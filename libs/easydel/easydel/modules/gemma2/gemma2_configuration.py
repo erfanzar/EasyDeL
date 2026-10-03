@@ -43,15 +43,15 @@ class Gemma2Config(EasyDeLBaseConfig):
         vocab_size (`int`, *optional*, defaults to 256000):
             Vocabulary size of the Gemma2 model. Defines the number of different tokens that can be represented by the
             `inputs_ids` passed to the forward method.
-        hidden_size (`int`, *optional*, defaults to 3072):
+        hidden_size (`int`, *optional*, defaults to 2304):
             Dimensionality of the encoder layers and the pooler layer.
-        intermediate_size (`int`, *optional*, defaults to 24576):
+        intermediate_size (`int`, *optional*, defaults to 9216):
             Dimensionality of the "intermediate" (i.e., feed-forward) layer in the Transformer encoder.
-        num_hidden_layers (`int`, *optional*, defaults to 28):
+        num_hidden_layers (`int`, *optional*, defaults to 26):
             Number of hidden layers in the Transformer encoder.
-        num_attention_heads (`int`, *optional*, defaults to 16):
+        num_attention_heads (`int`, *optional*, defaults to 8):
             Number of attention heads for each attention layer in the Transformer encoder.
-        num_key_value_heads (`int`, *optional*, defaults to 16):
+        num_key_value_heads (`int`, *optional*, defaults to 4):
             Number of key and value heads for each attention layer in the Transformer encoder.
         head_dim (`int`, *optional*, defaults to 256):
             Dimensionality of the attention head.
@@ -84,7 +84,7 @@ class Gemma2Config(EasyDeLBaseConfig):
             The dropout ratio for the attention probabilities.
         final_logit_softcapping (`float`, *optional*, defaults to 30.0):
             The soft capping value for the final logits.
-        query_pre_attn_scalar (`int`, *optional*, defaults to 224):
+        query_pre_attn_scalar (`int`, *optional*, defaults to 256):
             The scalar value for the query pre-attention layer.
         sliding_window (`int`, *optional*, defaults to 4096):
             The sliding window size.
@@ -101,11 +101,11 @@ class Gemma2Config(EasyDeLBaseConfig):
     def __init__(
         self,
         vocab_size: int = 256000,
-        hidden_size: int = 3072,
-        intermediate_size: int | None = 24576,
-        num_hidden_layers: int = 28,
-        num_attention_heads: int = 16,
-        num_key_value_heads: int = 16,
+        hidden_size: int = 2304,
+        intermediate_size: int | None = 9216,
+        num_hidden_layers: int = 26,
+        num_attention_heads: int = 8,
+        num_key_value_heads: int = 4,
         head_dim: int = 256,
         hidden_activation: str = "gelu_pytorch_tanh",
         max_position_embeddings: int = 8192,
@@ -120,7 +120,7 @@ class Gemma2Config(EasyDeLBaseConfig):
         attention_bias: bool = False,
         attention_dropout: float = 0.0,
         final_logit_softcapping: float = 30.0,
-        query_pre_attn_scalar: int = 224,
+        query_pre_attn_scalar: int = 256,
         sliding_window: int = 4096,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         layer_types: list[str] | None = None,
@@ -133,12 +133,12 @@ class Gemma2Config(EasyDeLBaseConfig):
 
         Args:
             vocab_size (int, optional): Token vocabulary size. Defaults to ``256000``.
-            hidden_size (int, optional): Decoder hidden dimension. Defaults to ``3072``.
+            hidden_size (int, optional): Decoder hidden dimension. Defaults to ``2304``.
             intermediate_size (int | None, optional): MLP intermediate width.
-                Defaults to ``24576``.
-            num_hidden_layers (int, optional): Number of decoder layers. Defaults to ``28``.
-            num_attention_heads (int, optional): Query heads per layer. Defaults to ``16``.
-            num_key_value_heads (int, optional): KV heads (GQA). Defaults to ``16``.
+                Defaults to ``9216``.
+            num_hidden_layers (int, optional): Number of decoder layers. Defaults to ``26``.
+            num_attention_heads (int, optional): Query heads per layer. Defaults to ``8``.
+            num_key_value_heads (int, optional): KV heads (GQA). Defaults to ``4``.
             head_dim (int, optional): Per-head dimension. Defaults to ``256``.
             hidden_activation (str, optional): MLP activation. Defaults to
                 ``"gelu_pytorch_tanh"``.
@@ -160,7 +160,7 @@ class Gemma2Config(EasyDeLBaseConfig):
             final_logit_softcapping (float, optional): Tanh-softcap value applied to
                 LM head logits. Defaults to ``30.0``.
             query_pre_attn_scalar (int, optional): Replaces the default
-                ``1/sqrt(head_dim)`` query scaling. Defaults to ``224``.
+                ``1/sqrt(head_dim)`` query scaling. Defaults to ``256``.
             sliding_window (int, optional): Sliding-window length for the
                 ``"sliding_attention"`` layer slots. Defaults to ``4096``.
             gradient_checkpointing (EasyDeLGradientCheckPointers, optional):

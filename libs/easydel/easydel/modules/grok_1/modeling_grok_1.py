@@ -55,15 +55,23 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import AttentionLayerOutput, DecoderLayerOutput, MoeCausalLMOutput, MoeModelOutput
-from easydel.infra.utils import auto_remat, blockwise_ffn
+from easydel.infra.utils import auto_remat
 from easydel.layers import (
     ColumnParallelLinear,
+    ColumnParallelMoELinear,
     Embed,
+    FusedExpertLayout,
+    MoeLoadBalancingStrategy,
+    MoeRoutingStrategy,
     RowParallelLinear,
+    RowParallelMoELinear,
     dense_qkv_layout,
+    split_fused_gate_up_projection,
 )
 from easydel.layers import RMSNorm as Grok1RMSNorm
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.layouts import moe_per_expert_down_reform_param
+from easydel.layers.moe import BaseMoeModule
 from easydel.modules._base import BaseCausalLMModule
 
 from .grok_1_configuration import Grok1Config
@@ -309,65 +317,38 @@ class Grok1BLockSparseMLP(spx.Module):
         self.precision = precision
         self.rngs = rngs
 
-        self.linear = ColumnParallelLinear(
-            config.hidden_size,
-            config.intermediate_size,
+        self.gate_up_proj = ColumnParallelMoELinear(
+            num_experts=config.num_experts,
+            in_features=config.hidden_size,
+            out_features=2 * config.intermediate_size,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=self.precision,
+            partition_manager=config.runtime_sharding_resolver,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
             rngs=rngs,
         )
-        self.linear_1 = RowParallelLinear(
-            config.intermediate_size,
-            config.hidden_size,
+        self.down_proj = RowParallelMoELinear(
+            num_experts=config.num_experts,
+            in_features=config.intermediate_size,
+            out_features=config.hidden_size,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=self.precision,
-            rngs=rngs,
-        )
-        self.linear_v = ColumnParallelLinear(
-            config.hidden_size,
-            config.intermediate_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=self.precision,
+            partition_manager=config.runtime_sharding_resolver,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
             rngs=rngs,
         )
 
-    def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jnp.ndarray:
-        """Apply gated MLP transformation for expert processing.
-
-        Computes: linear_1(gelu(linear(x)) * linear_v(x))
-
-        Args:
-            hidden_states (Array): Input tensor of shape (batch_size, seq_len, hidden_dim).
-
-        Returns:
-            Array: Transformed hidden states of shape (batch_size, seq_len, hidden_dim).
-        """
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        gate = checkpoint_name(jax.nn.gelu(self.linear(hidden_states)), "mlp_gate")
-        up = checkpoint_name(self.linear_v(hidden_states), "mlp_up")
-        hidden_states = checkpoint_name(self.linear_1(gate * up), "mlp_down")
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.runtime_sharding_resolver,
-        )
-        return checkpoint_name(hidden_states, "mlp_output")
+    def forward(self, hidden_states: Array, group_sizes: Array, sorted_experts: Array | None = None) -> Array:
+        gate_up = self.gate_up_proj(hidden_states, group_sizes, sorted_experts)
+        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        return self.down_proj(jax.nn.gelu(gate) * up, group_sizes, sorted_experts)
 
 
-class Grok1SparseMoeBlock(spx.Module):
+class Grok1SparseMoeBlock(BaseMoeModule):
     """Top-k sparse MoE block: 8 experts, route 2 per token, softmax over selected.
 
     Grok-1's flagship 314B checkpoint uses ``num_experts=8`` and
@@ -422,7 +403,14 @@ class Grok1SparseMoeBlock(spx.Module):
                 Defaults to None.
             rngs (spx.Rngs): Random number generator state.
         """
-        super().__init__()
+        super().__init__(
+            config=config,
+            n_routed_experts=config.num_experts,
+            num_experts_per_tok=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            routing_strategy=MoeRoutingStrategy.TOP_K_NDIV,
+            load_balancing_strategy=MoeLoadBalancingStrategy.STANDARD,
+        )
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -438,18 +426,16 @@ class Grok1SparseMoeBlock(spx.Module):
             kernel_init=jax.nn.initializers.normal(),
             rngs=rngs,
         )
-
-        self.experts = nn.ModuleList(
-            [
-                Grok1BLockSparseMLP(
-                    config=config,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
-                )
-                for _ in range(self.config.num_experts)
-            ]
+        self.experts = Grok1BLockSparseMLP(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.moe_hooks = self.moe_hooks.replace(
+            normalize_gate_logits=lambda logits: jax.nn.softmax(logits.astype(jnp.float32), axis=-1),
+            select_hook=lambda scores, _pre_bias, k: jax.lax.top_k(scores, k),
         )
 
     def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
@@ -472,37 +458,16 @@ class Grok1SparseMoeBlock(spx.Module):
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        router_logits = checkpoint_name(
-            self.gate(hidden_states).astype(jnp.promote_types(self.dtype, jnp.float32)), "moe_router_logits"
+        output, router_logits = self.moe_call(
+            hidden_state=hidden_states,
+            gate_layer=self.gate,
+            expert_layer=self.experts,
+            gate_up_kernel=self.experts.gate_up_proj.kernel_view(),
+            wd_kernel=self.experts.down_proj.kernel_view(),
+            act_fn=jax.nn.gelu,
+            hooks=self.moe_hooks,
         )
-        # Softmax over all experts, then top-k without renormalizing (xAI / HF Grok-1).
-        routing_probs = jax.nn.softmax(router_logits.astype(jnp.float32), axis=-1)
-        routing_weights, selected_experts = jax.lax.top_k(routing_probs, k=self.config.num_experts_per_tok)
-        routing_weights = routing_weights.astype(jnp.promote_types(self.dtype, jnp.float32))
-        final_hidden_state = jnp.zeros_like(hidden_states)
-
-        for index in range(self.config.num_experts):
-            expert_layer_output = (
-                blockwise_ffn(
-                    self.experts[index],
-                    hidden_states,
-                    self.config.scan_mlp_chunk_size,
-                )
-                if self.config.use_scan_mlp
-                else self.experts[index](hidden_states)
-            )
-            expert_layer_output_exp = (
-                jnp.sum(
-                    jnp.multiply(
-                        selected_experts == index,
-                        routing_weights,
-                    ),
-                    axis=-1,
-                )[:, :, None]
-                * expert_layer_output
-            )
-            final_hidden_state += expert_layer_output_exp
-        return (checkpoint_name(final_hidden_state, "moe_expert_output"), router_logits)
+        return checkpoint_name(output, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 
 
 class Grok1DecoderLayer(spx.Module):
@@ -592,6 +557,27 @@ class Grok1DecoderLayer(spx.Module):
             param_dtype=param_dtype,
             rngs=rngs,
         )
+
+    @property
+    def reform_param(self):
+        """Stack the checkpoint's per-expert ``moe_block.experts.<i>.{linear, linear_v, linear_1}.weight`` into the
+        runtime ``moe_block.experts.gate_up_proj`` / ``down_proj`` kernels (and split them back on export)."""
+        num_experts = self.config.num_experts
+        return {
+            **FusedExpertLayout(
+                target_prefix="moe_block.experts.gate_up_proj",
+                source_prefix="moe_block.experts",
+                gate_prefix="linear",
+                up_prefix="linear_v",
+                source_per_expert=num_experts,
+            ).reform_param(config=self.config),
+            **moe_per_expert_down_reform_param(
+                num_experts=num_experts,
+                target_prefix="moe_block.experts.down_proj",
+                source_prefix="moe_block.experts",
+                down_prefix="linear_1",
+            ),
+        }
 
     def forward(
         self,

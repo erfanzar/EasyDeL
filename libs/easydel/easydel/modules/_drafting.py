@@ -647,8 +647,84 @@ class DraftAttention(spx.Module):
         return self.o_proj(output)
 
 
+class WindowRingDraftAttentionMixin:
+    """Shared V4-style draft attention mechanics for a sliding-window KV ring.
+
+    Implementing modules provide their architecture-specific projections and
+    ``draft_rope_cos_sin`` / ``draft_apply_rope`` functions, plus ``sinks`` and
+    output projection modules. This mixin owns ring seeding and the common
+    sink-softmax attention path without changing generic :class:`DraftAttention`.
+    """
+
+    def main_kv(self, main_x: jax.Array, position_ids: jax.Array) -> jax.Array:
+        """Project main hidden states to post-RoPE K/V vectors ``[B, S, D]``."""
+        cos, sin = self.draft_rope_cos_sin(self.config, self.rope_label, position_ids, main_x.dtype)
+        kv = self.kv_norm(self.kv_proj(main_x))[:, None]
+        return self.draft_apply_rope(kv, cos, sin, unsqueeze_dim=1)[:, 0]
+
+    def seed_ring(self, main_x: jax.Array) -> jax.Array:
+        """Seed a ring from prompt states, projecting only positions retained in the window."""
+        batch, seq, _ = main_x.shape
+        window = int(self.sliding_window)
+        start = max(0, seq - window)
+        positions_1d = jnp.arange(start, seq, dtype=jnp.int32)
+        positions = jnp.broadcast_to(positions_1d[None], (batch, positions_1d.shape[0]))
+        kv = self.main_kv(main_x[:, start:, :], positions)
+        ring = jnp.zeros((batch, window, kv.shape[-1]), kv.dtype)
+        if seq <= window:
+            return ring.at[:, :seq].set(kv)
+        slots = positions_1d % window
+        return ring.at[:, slots].set(kv)
+
+    def _attend_ring(self, q: jax.Array, keys: jax.Array, bias: jax.Array) -> jax.Array:
+        """Attend to ring keys with per-head sink logits excluded from the value sum."""
+        batch, _, block, _ = q.shape
+        logits = jnp.einsum("bhsd,btd->bhst", q, keys, precision=self.precision).astype(jnp.float32)
+        logits = logits * self.scaling + bias
+        sinks = jnp.broadcast_to(
+            self.sinks.value.astype(jnp.float32).reshape(1, self.num_heads, 1, 1), (batch, self.num_heads, block, 1)
+        )
+        combined = jnp.concatenate([logits, sinks], axis=-1)
+        probs = jax.nn.softmax(combined - jnp.max(combined, axis=-1, keepdims=True), axis=-1)
+        return jnp.einsum("bhst,btd->bhsd", probs[..., :-1].astype(keys.dtype), keys, precision=self.precision)
+
+    def draft_attend(
+        self,
+        hidden_states: jax.Array,
+        main_x: jax.Array,
+        ring: jax.Array,
+        position: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Write current main K/V, then attend draft queries over ring plus block K/V."""
+        batch, block, _ = hidden_states.shape
+        window = int(self.sliding_window)
+        main_kv = self.main_kv(main_x, position[:, None])
+        ring = ring.at[jnp.arange(batch), position % window].set(main_kv[:, 0].astype(ring.dtype))
+
+        draft_positions = position[:, None] + 1 + jnp.arange(block, dtype=jnp.int32)[None, :]
+        cos, sin = self.draft_rope_cos_sin(self.config, self.rope_label, draft_positions, hidden_states.dtype)
+        q_residual = self.q_a_norm(self.q_a_proj(hidden_states))
+        q = self.q_b_proj(q_residual).reshape(batch, block, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        q = self.draft_apply_rope(q, cos, sin, unsqueeze_dim=1)
+        kv = self.kv_norm(self.kv_proj(hidden_states))[:, None]
+        kv = self.draft_apply_rope(kv, cos, sin, unsqueeze_dim=1)[:, 0]
+
+        keys = jnp.concatenate([ring.astype(kv.dtype), kv], axis=1)
+        valid = jnp.arange(window)[None, :] < jnp.minimum(window, position + 1)[:, None]
+        ring_bias = jnp.where(valid, 0.0, self.draft_mask_min).astype(jnp.float32)
+        bias = jnp.concatenate([ring_bias, jnp.zeros((batch, block), jnp.float32)], axis=1)[:, None, None, :]
+        attn = self._attend_ring(q, keys, bias)
+        attn = self.draft_apply_rope(attn.transpose(0, 2, 1, 3), cos, -sin, unsqueeze_dim=2)
+        grouped = self.o_a_proj(attn.reshape(batch, block, self.config.o_groups, -1)).reshape(batch, block, -1)
+        return self.o_b_proj(grouped), ring
+
+
 class VanillaMarkovHead(spx.Module):
-    """Memoryless low-rank Markov bias over the previous draft token."""
+    """Memoryless low-rank Markov bias over the previous draft token.
+
+    Optional parameter-name and precision overrides let architectures reuse the
+    same computation while preserving native checkpoint paths and storage dtype.
+    """
 
     def __init__(
         self,
@@ -658,6 +734,10 @@ class VanillaMarkovHead(spx.Module):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: spx.Rngs,
+        embedding_name: str = "prev_embed",
+        projection_name: str = "markov_w2",
+        fp32: bool = False,
+        embedding_init: tp.Any | None = None,
     ):
         """Initialize a memoryless Markov bias head.
 
@@ -668,26 +748,46 @@ class VanillaMarkovHead(spx.Module):
             param_dtype: Parameter dtype for the layer. Defaults to ``bfloat16``.
             precision: JAX precision setting for matmuls. Defaults to ``None``.
             rngs: spectrax RNG key manager.
+            embedding_name: Attribute name for the token embedding parameter module.
+            projection_name: Attribute name for the vocabulary projection module.
+            fp32: Store and compute the head in fp32, irrespective of ``dtype`` arguments.
+            embedding_init: Optional embedding initializer; ``None`` keeps the shared default initializer.
         """
-        self.markov_rank = int(config.markov_rank)
-        self.prev_embed = Embed(
-            config.vocab_size,
-            self.markov_rank,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            embedding_init=jax.nn.initializers.normal(config.initializer_range),
-            rngs=rngs,
+        self.markov_rank = int(config.markov_rank if hasattr(config, "markov_rank") else config.dspark_markov_rank)
+        if fp32:
+            dtype = param_dtype = jnp.float32
+        setattr(
+            self,
+            embedding_name,
+            Embed(
+                config.vocab_size,
+                self.markov_rank,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                **(
+                    {"embedding_init": embedding_init}
+                    if embedding_init is not None
+                    else {"embedding_init": jax.nn.initializers.normal(config.initializer_range)}
+                ),
+                rngs=rngs,
+            ),
         )
-        self.markov_w2 = ColumnParallelLinear(
-            self.markov_rank,
-            config.vocab_size,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            rngs=rngs,
+        setattr(
+            self,
+            projection_name,
+            ColumnParallelLinear(
+                self.markov_rank,
+                config.vocab_size,
+                use_bias=False,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                kernel_init=jax.nn.initializers.normal(config.initializer_range),
+                rngs=rngs,
+            ),
         )
+        self._embedding_name = embedding_name
+        self._projection_name = projection_name
 
     def get_prev_embeddings(self, token_ids: jax.Array) -> jax.Array:
         """Embed previous-token IDs into the Markov latent space.
@@ -698,7 +798,16 @@ class VanillaMarkovHead(spx.Module):
         Returns:
             Embedded vectors of shape ``token_ids.shape + (markov_rank,)``.
         """
-        return self.prev_embed(token_ids.astype(jnp.int32))
+        return getattr(self, self._embedding_name)(token_ids.astype(jnp.int32))
+
+    def forward(self, token_ids: jax.Array) -> tuple[jax.Array, jax.Array]:
+        """Return token-conditioned fp32-compatible logit bias and latent embedding.
+
+        The pair-returning interface is useful to confidence predictors while
+        retaining the ordinary ``compute_step_bias`` API used by existing drafters.
+        """
+        latent = self.get_prev_embeddings(token_ids)
+        return self.project_bias(latent), latent
 
     def project_bias(self, latent_states: jax.Array) -> jax.Array:
         """Project Markov latent states to vocabulary-sized logit bias.
@@ -709,7 +818,7 @@ class VanillaMarkovHead(spx.Module):
         Returns:
             Logit bias of shape ``[..., vocab_size]``.
         """
-        return self.markov_w2(latent_states)
+        return getattr(self, self._projection_name)(latent_states)
 
     def compute_step_bias(self, token_ids: jax.Array, hidden_states: jax.Array | None = None) -> jax.Array:
         """Compute a token-only logit bias for one step or teacher-forced block.
@@ -941,6 +1050,9 @@ class AcceptRatePredictor(spx.Module):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: spx.Rngs,
+        use_bias: bool = True,
+        fp32: bool = False,
+        projection_cls: type = ColumnParallelLinear,
     ):
         """Initialize the linear confidence head.
 
@@ -951,11 +1063,16 @@ class AcceptRatePredictor(spx.Module):
             param_dtype: Parameter dtype for the layer. Defaults to ``bfloat16``.
             precision: JAX precision setting for matmuls. Defaults to ``None``.
             rngs: spectrax RNG key manager.
+            use_bias: Whether the scalar projection has a bias (default behavior remains enabled).
+            fp32: Store and compute the predictor in fp32, irrespective of ``dtype`` arguments.
+            projection_cls: Linear layer class; defaults to the existing column-parallel implementation.
         """
-        self.proj = ColumnParallelLinear(
+        if fp32:
+            dtype = param_dtype = jnp.float32
+        self.proj = projection_cls(
             input_dim,
             1,
-            use_bias=True,
+            use_bias=use_bias,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,

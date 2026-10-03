@@ -74,6 +74,7 @@ from easydel.layers import (
 )
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
 from easydel.layers.norms import LayerNorm
+from easydel.layers.rotary import rotate_half
 from easydel.modules._base import BaseConditionalGenerationModule, BaseVisionLanguageModule
 
 from .qwen3_omni_moe_configuration import (
@@ -677,26 +678,6 @@ class Qwen3OmniMoeAudioEncoder(EasyDeLBaseModule):
         return self.conv2d1
 
 
-def rotate_half(x: Array) -> Array:
-    """Rotate the second half of the trailing dim by negation.
-
-    Helper used by the vision RoPE implementation: given a tensor whose
-    last dimension is split into two halves ``[a, b]``, returns
-    ``[-b, a]``. Combined with element-wise ``cos``/``sin``
-    multiplications this realises a 2-D rotation per pair of channels.
-
-    Args:
-        x: Input tensor with an even-sized trailing dimension.
-
-    Returns:
-        Tensor of identical shape with the lower / upper halves swapped
-        and the new lower half negated.
-    """
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return jnp.concatenate([-x2, x1], axis=-1)
-
-
 def apply_rotary_pos_emb_vision(
     q: Array,
     k: Array,
@@ -753,16 +734,15 @@ def create_attention_mask(cu_seqlens: Array, seq_length: int, dtype: jnp.dtype) 
         Additive mask of shape ``(1, seq_length, seq_length)`` ready to
         be broadcast across attention heads.
     """
-    attention_mask = jnp.full((1, seq_length, seq_length), jnp.finfo(dtype).min, dtype=dtype)
-    mask_updates = jnp.zeros((1, seq_length, seq_length), dtype=dtype)
-
-    for i in range(1, len(cu_seqlens)):
-        start_idx = cu_seqlens[i - 1]
-        end_idx = cu_seqlens[i]
-        mask_updates = mask_updates.at[..., start_idx:end_idx, start_idx:end_idx].set(0)
-
-    attention_mask = jax.lax.dynamic_update_slice(attention_mask, mask_updates, (0, 0, 0))
-    return attention_mask
+    # Segment-id comparison instead of slicing by ``cu_seqlens`` values: the values are traced when
+    # the vision blocks run under ``lax.scan``, and dynamic slice bounds cannot be traced.
+    cu_seqlens = jnp.asarray(cu_seqlens, dtype=jnp.int32)
+    positions = jnp.arange(seq_length, dtype=jnp.int32)
+    segment_ids = jnp.searchsorted(cu_seqlens[1:], positions, side="right")
+    segment_ids = jnp.where(positions < cu_seqlens[-1], segment_ids, -1)
+    same_block = (segment_ids[:, None] == segment_ids[None, :]) & (segment_ids[:, None] >= 0)
+    attention_mask = jnp.where(same_block, jnp.zeros((), dtype), jnp.finfo(dtype).min).astype(dtype)
+    return attention_mask[None]
 
 
 class Qwen3OmniMoeVisionPatchEmbed(spx.Module):
@@ -1056,16 +1036,24 @@ class Qwen3OmniMoeVisionAttention(spx.Module):
         sin = jnp.sin(rotary_pos_emb)
         q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
 
+        # Attention ops take [batch, seq, heads, dim]; packed vision tokens form one batch row and
+        # the cu_seqlens block mask is additive (same as the Qwen3-VL vision tower).
+        q = jnp.expand_dims(q, 0)
+        k = jnp.expand_dims(k, 0)
+        v = jnp.expand_dims(v, 0)
+        attn_bias = create_attention_mask(cu_seqlens, seq_length, q.dtype)
+        attn_bias = jnp.broadcast_to(attn_bias, (1, self.num_heads, seq_length, seq_length))
+
         attn_output = self.attention.forward(
             query_states=q,
             key_states=k,
             value_states=v,
+            bias=attn_bias,
             mode=common_types.MODE_TRAIN,
-            attention_mask=create_attention_mask(cu_seqlens, seq_length, q.dtype),
             causal=False,
         ).attention_outputs
 
-        attn_output = attn_output.reshape(seq_length, -1)
+        attn_output = attn_output.squeeze(0).reshape(seq_length, -1)
         attn_output = apply_logical_sharding(
             attn_output,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -1252,6 +1240,34 @@ class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
 
         self.deepstack_visual_indexes = config.deepstack_visual_indexes
 
+    def fast_pos_embed_interpolate(self, grid_thw: Array) -> Array:
+        """Interpolate learned positions and reorder patches into spatial-merge blocks."""
+        merge_size = self.spatial_merge_size
+        side = self.num_grid_per_side
+        positions = []
+        for t, h, w in grid_thw:
+            t, h, w = int(t), int(h), int(w)
+            h_grid = jnp.linspace(0, side - 1, h)
+            w_grid = jnp.linspace(0, side - 1, w)
+            h_floor = jnp.floor(h_grid).astype(jnp.int32)
+            w_floor = jnp.floor(w_grid).astype(jnp.int32)
+            h_ceil = jnp.minimum(h_floor + 1, side - 1)
+            w_ceil = jnp.minimum(w_floor + 1, side - 1)
+            dh = h_grid - h_floor
+            dw = w_grid - w_floor
+
+            corners = (
+                (h_floor[:, None] * side + w_floor[None, :], (1 - dh)[:, None] * (1 - dw)[None, :]),
+                (h_floor[:, None] * side + w_ceil[None, :], (1 - dh)[:, None] * dw[None, :]),
+                (h_ceil[:, None] * side + w_floor[None, :], dh[:, None] * (1 - dw)[None, :]),
+                (h_ceil[:, None] * side + w_ceil[None, :], dh[:, None] * dw[None, :]),
+            )
+            pos_embed = sum(self.pos_embed(idx.reshape(-1)) * weight.reshape(-1, 1) for idx, weight in corners)
+            pos_embed = pos_embed.reshape(h // merge_size, merge_size, w // merge_size, merge_size, -1)
+            pos_embed = jnp.transpose(pos_embed, (0, 2, 1, 3, 4)).reshape(h * w, -1)
+            positions.append(jnp.tile(pos_embed, (t, 1)))
+        return jnp.concatenate(positions, axis=0)
+
     def rot_pos_emb(self, grid_thw: Array, max_grid_size: int) -> Array:
         """Compute 2-D RoPE frequencies for the packed vision tokens.
 
@@ -1297,7 +1313,7 @@ class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
             wpos_ids = jnp.transpose(wpos_ids, (0, 2, 1, 3)).flatten()
 
             stacked = jnp.stack([hpos_ids, wpos_ids], axis=-1)
-            pos_ids.append(jnp.repeat(stacked, t, axis=1))
+            pos_ids.append(jnp.tile(stacked, (int(t), 1)))
 
         pos_ids = jnp.concatenate(pos_ids, axis=0)
         rotary_pos_emb_full = jnp.outer(
@@ -1312,8 +1328,8 @@ class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
         hidden_states: Array,
         grid_thw: Array,
         max_grid_size: int,
-    ) -> Array:
-        """Forward pass through vision encoder.
+    ) -> tuple[Array, list[Array]]:
+        """Encode visual patches and return merged and intermediate DeepStack features.
 
         Args:
             hidden_states: Input pixel values [num_patches, channels * t * h * w].
@@ -1321,36 +1337,40 @@ class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
             max_grid_size: Maximum grid size for rotary embedding computation.
 
         Returns:
-            Encoded vision features [num_merged_patches, out_hidden_size].
+            Merged features and one intermediate feature per configured DeepStack layer.
         """
         hidden_states = self.patch_embed(hidden_states)
+        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+        hidden_states = hidden_states + pos_embeds.astype(hidden_states.dtype)
         rotary_pos_emb = self.rot_pos_emb(grid_thw, max_grid_size)
+        # HF: ``emb = cat((rotary_pos_emb, rotary_pos_emb), -1)`` before cos/sin (full head_dim width).
+        rotary_pos_emb = jnp.concatenate([rotary_pos_emb, rotary_pos_emb], axis=-1)
 
         grid_lens = grid_thw[:, 1] * grid_thw[:, 2]
         repeated = jnp.repeat(grid_lens, grid_thw[:, 0])
         cu_seqlens = jnp.cumsum(repeated, dtype="i4")
         cu_seqlens = jnp.pad(cu_seqlens, (1, 0), constant_values=0)
 
-        def _layer_loop(block, carry):
-            """Apply a single vision-encoder block inside the layer-stack scan.
+        deepstack_features = []
 
-            Body of ``self.blocks.scan``; runs ``block`` on the current
-            vision hidden states with the precomputed ``cu_seqlens`` and
-            ``rotary_pos_emb``, and returns the updated carry tuple.
-            """
+        def _layer_loop(block, carry):
+            """Run a visual block, collecting configured intermediate features."""
             hidden_states, idx = carry
             with self._layer_stage_context(idx, layers=self.blocks):
                 hidden_states = block(hidden_states, cu_seqlens, rotary_pos_emb)
             hidden_states = self._mark_layer_stage_boundary(hidden_states, idx, layers=self.blocks)
-
+            if idx in self.deepstack_visual_indexes:
+                merger_idx = self.deepstack_visual_indexes.index(idx)
+                deepstack_features.append(self.merger_list[merger_idx](hidden_states))
             return hidden_states, idx + 1
 
+        # A compiled scan cannot append intermediate arrays to a Python list.
         hidden_states, _ = self.blocks.scan(
             _layer_loop,
             (hidden_states, 0),
-            trace=not self.config.scan_layers or self._pipeline_stage_count() > 1,
+            trace=not self.config.scan_layers or self._pipeline_stage_count() > 1 or bool(self.deepstack_visual_indexes),
         )
-        return typing.cast(Array, self.merger(hidden_states))
+        return typing.cast(Array, self.merger(hidden_states)), deepstack_features
 
     def get_encoder(self):
         """Return the vision encoder itself.
@@ -4040,6 +4060,69 @@ class Qwen3OmniMoeCode2Wav(EasyDeLBaseModule):
 merge_multimodal_embeddings = BaseVisionLanguageModule.merge_multimodal_embeddings
 
 
+def _visual_deepstack_embeddings(
+    visual: Qwen3OmniMoeVisionEncoder,
+    input_ids: Array,
+    pixel_values: Array | None,
+    image_grid_thw: Array | None,
+    image_max_grid_size: int | None,
+    pixel_values_videos: Array | None,
+    video_grid_thw: Array | None,
+    video_max_grid_size: int | None,
+    image_token_id: int,
+    video_token_id: int,
+) -> tuple[Array | None, Array | None, Array | None, list[Array] | None]:
+    """Collect visual features and align intermediate features to visual token positions."""
+    image_embeds = video_embeds = None
+    image_deepstack = video_deepstack = None
+    image_mask = video_mask = None
+    if pixel_values is not None:
+        if image_grid_thw is None:
+            raise ValueError("`image_grid_thw` must be provided when `pixel_values` is not None.")
+        if image_max_grid_size is None:
+            image_max_grid_size = int(jnp.max(image_grid_thw[:, 1:]).item())
+        image_embeds, image_deepstack = visual(pixel_values, image_grid_thw, image_max_grid_size)
+        image_mask = input_ids == image_token_id
+    if pixel_values_videos is not None:
+        if video_grid_thw is None:
+            raise ValueError("`video_grid_thw` must be provided when `pixel_values_videos` is not None.")
+        if video_max_grid_size is None:
+            video_max_grid_size = int(jnp.max(video_grid_thw[:, 1:]).item())
+        video_embeds, video_deepstack = visual(pixel_values_videos, video_grid_thw, video_max_grid_size)
+        video_mask = input_ids == video_token_id
+
+    if image_mask is not None and video_mask is not None:
+        visual_mask = image_mask | video_mask
+        # Use a fixed output width (from the vision towers) so this also
+        # works when the thinker forward is traced under jax.jit.
+        num_visual = image_embeds.shape[0] + video_embeds.shape[0]
+        visual_indices = jnp.nonzero(visual_mask.reshape(-1), size=num_visual, fill_value=0)[0]
+        image_slots = image_mask.reshape(-1)[visual_indices]
+        video_slots = video_mask.reshape(-1)[visual_indices]
+        deepstack = []
+        for image_layer, video_layer in zip(image_deepstack, video_deepstack, strict=True):
+            image_idx = jnp.where(image_slots, jnp.cumsum(image_slots) - 1, 0)
+            video_idx = jnp.where(video_slots, jnp.cumsum(video_slots) - 1, 0)
+            merged = jnp.where(image_slots[:, None], image_layer[image_idx], 0)
+            merged = jnp.where(video_slots[:, None], video_layer[video_idx], merged)
+            deepstack.append(merged)
+        return image_embeds, video_embeds, visual_mask, deepstack
+    if image_mask is not None:
+        return image_embeds, None, image_mask, image_deepstack
+    if video_mask is not None:
+        return None, video_embeds, video_mask, video_deepstack
+    return None, None, None, None
+
+
+def _inject_visual_deepstack(hidden_states: Array, visual_mask: Array, visual_embeds: Array) -> Array:
+    """Add compact DeepStack embeddings to visual positions of text states."""
+    flattened = hidden_states.reshape(-1, hidden_states.shape[-1])
+    mask = visual_mask.reshape(-1)
+    index = jnp.where(mask, jnp.cumsum(mask) - 1, 0)
+    updated = jnp.where(mask[:, None], flattened + visual_embeds[index].astype(flattened.dtype), flattened)
+    return updated.reshape(hidden_states.shape)
+
+
 class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
     """Text decoder model for Qwen3OmniMoe Thinker.
 
@@ -4128,6 +4211,8 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        visual_pos_masks: Array | None = None,
+        deepstack_visual_embeds: list[Array] | None = None,
     ) -> VLMCausalLMOutput:
         """Forward pass through text decoder.
 
@@ -4143,6 +4228,8 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
             mode: Runtime mode (train, decode, etc.).
             past_key_values: Cached key-value states for generation.
             cache_metadata: Cache metadata for efficient caching.
+            visual_pos_masks: Positions occupied by image or video tokens.
+            deepstack_visual_embeds: Intermediate visual features to inject after early layers.
 
         Returns:
             VLMCausalLMOutput: Model outputs including hidden states, attentions,
@@ -4170,6 +4257,8 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
         all_router_logits = () if output_router_logits else None
 
         hidden_states = inputs_embeds
+        if deepstack_visual_embeds is not None and visual_pos_masks is None:
+            raise ValueError("`visual_pos_masks` must be provided when `deepstack_visual_embeds` is not None.")
 
         views = past_key_values.views if past_key_values is not None else None
         has_cache_views = views is not None and any(v is not None for v in views)
@@ -4181,7 +4270,7 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
             cache_views=views,
-            extra=needs_trace_cache or bool(output_router_logits),
+            extra=needs_trace_cache or bool(output_router_logits) or bool(deepstack_visual_embeds),
         )
 
         def _layer_loop(layer, carry):
@@ -4209,7 +4298,14 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
                     ),
                     cache_metadata=cache_metadata,
                 )
-            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, layer_idx, layers=self.layers)
+            hidden_states = layer_outputs.hidden_states
+            # Truthiness (not ``is not None``) so an empty list never reaches the traced index
+            # comparison: an empty list lets the layer stack take the lax.scan path.
+            if deepstack_visual_embeds and layer_idx < len(deepstack_visual_embeds):
+                hidden_states = _inject_visual_deepstack(
+                    hidden_states, visual_pos_masks, deepstack_visual_embeds[layer_idx]
+                )
+            hidden_states = self._mark_layer_stage_boundary(hidden_states, layer_idx, layers=self.layers)
 
             if output_attentions:
                 all_self_attentions += (layer_outputs.attentions,)
@@ -4440,7 +4536,7 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
                 raise ValueError("`image_grid_thw` must be provided when `pixel_values` is not None.")
             if image_max_grid_size is None:
                 image_max_grid_size = int(jnp.max(image_grid_thw[:, 1:]).item())
-            image_embeds = self.visual(pixel_values, image_grid_thw, image_max_grid_size)
+            image_embeds, _ = self.visual(pixel_values, image_grid_thw, image_max_grid_size)
 
         if image_embeds is not None:
             if image_embeds.ndim > 2:
@@ -4457,7 +4553,7 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
                 raise ValueError("`video_grid_thw` must be provided when `pixel_values_videos` is not None.")
             if video_max_grid_size is None:
                 video_max_grid_size = int(jnp.max(video_grid_thw[:, 1:]).item())
-            video_embeds = self.visual(pixel_values_videos, video_grid_thw, video_max_grid_size)
+            video_embeds, _ = self.visual(pixel_values_videos, video_grid_thw, video_max_grid_size)
 
         if video_embeds is not None:
             if video_embeds.ndim > 2:
@@ -4534,6 +4630,20 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
 
         if input_ids is None and inputs_embeds is None:
             raise ValueError("You must provide either `input_ids` or `inputs_embeds`.")
+        if input_ids is None and (pixel_values is not None or pixel_values_videos is not None):
+            raise ValueError("`input_ids` must be provided to merge multimodal embeddings.")
+        image_embeds, video_embeds, visual_pos_masks, deepstack_visual_embeds = _visual_deepstack_embeddings(
+            self.visual,
+            input_ids,
+            pixel_values,
+            image_grid_thw,
+            image_max_grid_size,
+            pixel_values_videos,
+            video_grid_thw,
+            video_max_grid_size,
+            self.config.image_token_id,
+            self.config.video_token_id,
+        )
 
         if (
             inputs_embeds is None
@@ -4547,6 +4657,8 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
                 input_ids=input_ids,
                 inputs_embeds=inputs_embeds,
                 input_features=input_features,
+                image_embeds=image_embeds,
+                video_embeds=video_embeds,
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
                 image_max_grid_size=image_max_grid_size,
@@ -4591,7 +4703,7 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
             cache_views=views,
-            extra=needs_trace_cache or bool(output_router_logits),
+            extra=needs_trace_cache or bool(output_router_logits) or bool(deepstack_visual_embeds),
         )
         cache_views = views if trace_layers else None
         # Hoisted out of the loop body: the caching property must not be
@@ -4623,7 +4735,11 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
                     output_router_logits=output_router_logits,
                     frequencies=frequencies,
                 )
-            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+            hidden_states = layer_outputs.hidden_states
+            # Truthiness so an empty list never compares against a traced scan index.
+            if deepstack_visual_embeds and idx < len(deepstack_visual_embeds):
+                hidden_states = _inject_visual_deepstack(hidden_states, visual_pos_masks, deepstack_visual_embeds[idx])
+            hidden_states = self._mark_layer_stage_boundary(hidden_states, idx, layers=self.layers)
 
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
@@ -4883,7 +4999,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 raise ValueError("`image_grid_thw` must be provided when `pixel_values` is not None.")
             if image_max_grid_size is None:
                 image_max_grid_size = int(jnp.max(image_grid_thw[:, 1:]).item())
-            image_embeds = self.visual(pixel_values, image_grid_thw, image_max_grid_size)
+            image_embeds, _ = self.visual(pixel_values, image_grid_thw, image_max_grid_size)
 
         if image_embeds is not None:
             if image_embeds.ndim > 2:
@@ -4900,7 +5016,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 raise ValueError("`video_grid_thw` must be provided when `pixel_values_videos` is not None.")
             if video_max_grid_size is None:
                 video_max_grid_size = int(jnp.max(video_grid_thw[:, 1:]).item())
-            video_embeds = self.visual(pixel_values_videos, video_grid_thw, video_max_grid_size)
+            video_embeds, _ = self.visual(pixel_values_videos, video_grid_thw, video_max_grid_size)
 
         if video_embeds is not None:
             if video_embeds.ndim > 2:
@@ -4967,6 +5083,20 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         """
         if input_ids is None and inputs_embeds is None:
             raise ValueError("You must provide either `input_ids` or `inputs_embeds`.")
+        if input_ids is None and (pixel_values is not None or pixel_values_videos is not None):
+            raise ValueError("`input_ids` must be provided to merge multimodal embeddings.")
+        image_embeds, video_embeds, visual_pos_masks, deepstack_visual_embeds = _visual_deepstack_embeddings(
+            self.visual,
+            input_ids,
+            pixel_values,
+            image_grid_thw,
+            image_max_grid_size,
+            pixel_values_videos,
+            video_grid_thw,
+            video_max_grid_size,
+            self.config.image_token_id,
+            self.config.video_token_id,
+        )
 
         if (
             inputs_embeds is None
@@ -4980,6 +5110,8 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 input_ids=input_ids,
                 inputs_embeds=inputs_embeds,
                 input_features=input_features,
+                image_embeds=image_embeds,
+                video_embeds=video_embeds,
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
                 image_max_grid_size=image_max_grid_size,
@@ -5000,6 +5132,8 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             mode=mode,
             past_key_values=past_key_values,
             cache_metadata=cache_metadata,
+            visual_pos_masks=visual_pos_masks,
+            deepstack_visual_embeds=deepstack_visual_embeds,
         )
 
         logits = None
@@ -5107,10 +5241,11 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         Returns:
             Image features ready for merging with text embeddings.
         """
-        return self.visual(
-            pixel_values=pixel_values,
-            grid_thw=image_grid_thw,
-        ).last_hidden_state
+        max_grid_size = kwargs.get("image_max_grid_size")
+        if max_grid_size is None:
+            max_grid_size = int(jnp.max(image_grid_thw[:, 1:]).item())
+        merged, _ = self.visual(pixel_values, image_grid_thw, max_grid_size)
+        return merged
 
     def get_video_features(
         self,
@@ -5128,10 +5263,11 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         Returns:
             Video features ready for merging with text embeddings.
         """
-        return self.visual(
-            pixel_values=pixel_values_videos,
-            grid_thw=video_grid_thw,
-        ).last_hidden_state
+        max_grid_size = kwargs.get("video_max_grid_size")
+        if max_grid_size is None:
+            max_grid_size = int(jnp.max(video_grid_thw[:, 1:]).item())
+        merged, _ = self.visual(pixel_values_videos, video_grid_thw, max_grid_size)
+        return merged
 
     def get_audio_features(
         self,

@@ -151,4 +151,8 @@ class LlavaConfig(EasyDeLBaseConfig):
         self.text_config = text_config
         self.multimodal_projector_bias = multimodal_projector_bias
 
+        kwargs.setdefault("tie_word_embeddings", False)
+        # HF parity: older LLaVA checkpoints store the tie flag only on the text config.
+        if not kwargs["tie_word_embeddings"] and getattr(self.text_config, "tie_word_embeddings", False):
+            kwargs["tie_word_embeddings"] = self.text_config.tie_word_embeddings
         super().__init__(**kwargs)

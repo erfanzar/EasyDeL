@@ -34,6 +34,7 @@ from eformer.loggings import get_logger
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
+from easydel.infra.utils import AttnMaskDetail, AttnMaskType
 
 logger = get_logger(__name__)
 
@@ -474,6 +475,17 @@ class Llama4TextConfig(EasyDeLBaseConfig):
         if layer_types is None:
             layer_types = ["chunked_attention" if no_rope else "full_attention" for no_rope in self.no_rope_layers]
         self.layer_types = layer_types
+
+    def get_mask_details(self) -> dict[int, AttnMaskDetail]:
+        """Return full or chunk-local attention metadata for each text layer."""
+        return {
+            layer_idx: AttnMaskDetail(
+                mask_type=AttnMaskType.from_hf(layer_type),
+                size=self.attention_chunk_size if layer_type == "chunked_attention" else self.max_position_embeddings,
+                chunks=self.attention_chunk_size if layer_type == "chunked_attention" else None,
+            )
+            for layer_idx, layer_type in enumerate(self.layer_types)
+        }
 
 
 @register_config("llama4")

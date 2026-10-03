@@ -16,7 +16,11 @@
 
 import easydel as ed
 import pytest
+import spectrax as spx
 import transformers
+from easydel.layers import ColumnParallelMoELinear, RowParallelMoELinear
+from easydel.layers.moe import BaseMoeModule
+from easydel.modules.phimoe.modeling_phimoe import PhiMoeSparseMoeBlock
 
 try:
     from tests.modules.test_utils import CausalLMTester
@@ -57,6 +61,13 @@ class TestPhiMoE:
             num_experts_per_tok=small_model_config.get("num_experts_per_tok", 2),
             rope_scaling=rope_scaling,
         )
+
+    def test_sparse_moe_uses_stacked_dispatch(self, phimoe_config):
+        block = PhiMoeSparseMoeBlock(config=phimoe_config, rngs=spx.Rngs(0), layer_idx=0)
+        assert isinstance(block, BaseMoeModule)
+        assert isinstance(block.experts.gate_up_proj, ColumnParallelMoELinear)
+        assert isinstance(block.experts.down_proj, RowParallelMoELinear)
+        assert "moe_call" in block.forward.__code__.co_names
 
     def test_causal_lm(self, phimoe_config, small_model_config):
         """Test PhiMoEForCausalLM."""

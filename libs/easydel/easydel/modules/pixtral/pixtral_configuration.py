@@ -78,6 +78,8 @@ class PixtralVisionConfig(EasyDeLBaseConfig):
     ```"""
 
     model_type = "pixtral"
+    # Matches HF: the 2-D vision rotary is axial (``rope_parameters`` carries rope_type/rope_theta).
+    default_rope_type = "axial"
 
     def __init__(
         self,

@@ -45,6 +45,8 @@ from easydel.infra.factory import register_config
 
 LINEAR_ATTENTION_LAYER_TYPE = "linear_attention"
 DEEPSEEK_SPARSE_ATTENTION_LAYER_TYPE = "deepseek_sparse_attention"
+INDEXED_ATTENTION_LAYER_TYPE = "indexed_attention"
+"""transformers>=5.18 name for DSA layers; accepted on input and normalized to the DSA type."""
 
 GLM5_NEXT_TEXT_LAYER_TYPES: tuple[str, str] = (
     LINEAR_ATTENTION_LAYER_TYPE,
@@ -274,8 +276,12 @@ class Glm5NextTextConfig(EasyDeLBaseConfig):
         # multimodal config (`model_type: "glm5_next"`) whose text fields live
         # under a nested `text_config` dict. When this text config is built
         # from such a file (composite→text registry alias), flatten the nested
-        # dict into the flat keyword arguments; explicitly passed flat values
-        # win. Composite-only keys (`vision_config`, image/video token ids)
+        # dict into the flat keyword arguments. Precedence: keys that are NOT
+        # named parameters of this signature are overridden by explicit flat
+        # kwargs; named parameters (``num_hidden_layers``, ``layer_types``,
+        # ...) take the nested value when the dict provides one, because an
+        # explicit flat argument is indistinguishable from its signature
+        # default at this point. Composite-only keys (`vision_config`, image/video token ids)
         # stay in kwargs and land as plain attributes. `quantization_config`
         # (the fp8 recipe, at the composite top level) is captured separately
         # and re-applied after init: the loader field expects an
@@ -286,6 +292,41 @@ class Glm5NextTextConfig(EasyDeLBaseConfig):
             kwargs = {**nested_text, **kwargs}
         kwargs.pop("vision_config", None)
         hf_quantization_config = kwargs.pop("quantization_config", None)
+        # Nested-merge repair: keys arriving through the flattened
+        # ``text_config`` dict land in ``**kwargs`` even when they collide
+        # with named parameters above (Python binds the named defaults before
+        # ``**kwargs`` is built), so without this step the derivations below
+        # would run on the signature defaults instead of the checkpoint's
+        # values. ``mlp_layer_types`` was derived from the default
+        # ``num_hidden_layers`` (45) while the base class later splatted the
+        # checkpoint's value on top, crashing ``validate_layer_type`` for any
+        # non-default-depth checkpoint, and checkpoint-provided
+        # ``layer_types`` / ``indexer_types`` schedules were silently
+        # replaced by the derived ones. Rebind every named parameter that is
+        # consumed before ``super().__init__`` (schedule derivations, the
+        # forget-gate geometry dict, head-dim bookkeeping, token ids) from
+        # the merged kwargs. Nested ``text_config`` values therefore win over
+        # flat named arguments (the checkpoint is authoritative); only
+        # non-named keys let an explicit flat kwarg override the nested one.
+        vocab_size = kwargs.pop("vocab_size", vocab_size)
+        num_hidden_layers = kwargs.pop("num_hidden_layers", num_hidden_layers)
+        mlp_layer_types = kwargs.pop("mlp_layer_types", mlp_layer_types)
+        layer_types = kwargs.pop("layer_types", layer_types)
+        indexer_types = kwargs.pop("indexer_types", indexer_types)
+        index_topk_pattern = kwargs.pop("index_topk_pattern", index_topk_pattern)
+        index_topk_freq = kwargs.pop("index_topk_freq", index_topk_freq)
+        index_skip_topk_offset = kwargs.pop("index_skip_topk_offset", index_skip_topk_offset)
+        linear_attn_config = kwargs.pop("linear_attn_config", linear_attn_config)
+        linear_head_dim = kwargs.pop("linear_head_dim", linear_head_dim)
+        linear_num_heads = kwargs.pop("linear_num_heads", linear_num_heads)
+        linear_conv_kernel_dim = kwargs.pop("linear_conv_kernel_dim", linear_conv_kernel_dim)
+        linear_lower_bound = kwargs.pop("linear_lower_bound", linear_lower_bound)
+        qk_rope_head_dim = kwargs.pop("qk_rope_head_dim", qk_rope_head_dim)
+        qk_nope_head_dim = kwargs.pop("qk_nope_head_dim", qk_nope_head_dim)
+        pad_token_id = kwargs.pop("pad_token_id", pad_token_id)
+        bos_token_id = kwargs.pop("bos_token_id", bos_token_id)
+        eos_token_id = kwargs.pop("eos_token_id", eos_token_id)
+        tie_word_embeddings = kwargs.pop("tie_word_embeddings", tie_word_embeddings)
 
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
@@ -378,20 +419,14 @@ class Glm5NextTextConfig(EasyDeLBaseConfig):
             "d_conv": self.linear_conv_kernel_dim,
         }
 
-        # The nested `text_config` merge above can re-introduce keys that are
-        # also explicit named parameters; keep the explicit value when set,
-        # otherwise adopt the merged one (avoids "multiple values" errors).
+        # Token-id / tying fields were rebound from the merged kwargs above
+        # (the nested-merge repair), so they are forwarded explicitly here.
         explicit = {
             "pad_token_id": pad_token_id,
             "bos_token_id": bos_token_id,
             "eos_token_id": eos_token_id,
             "tie_word_embeddings": tie_word_embeddings,
         }
-        for name, value in list(explicit.items()):
-            if name in kwargs:
-                merged_value = kwargs.pop(name)
-                if value is None:
-                    explicit[name] = merged_value
 
         super().__init__(**explicit, **kwargs)
         # Assigned after ``super().__init__`` for the same reason as
@@ -429,7 +464,10 @@ class Glm5NextTextConfig(EasyDeLBaseConfig):
                 LINEAR_ATTENTION_LAYER_TYPE if idx % 4 != 3 else DEEPSEEK_SPARSE_ATTENTION_LAYER_TYPE
                 for idx in range(self.num_hidden_layers)
             ]
-        return [DEEPSEEK_SPARSE_ATTENTION_LAYER_TYPE if lt == FULL_ATTENTION else lt for lt in layer_types]
+        # transformers>=5.18 renames DSA layers to "indexed_attention" (huggingface/transformers#48974) and
+        # writes that name into saved configs; accept it, plus HF's legacy "full_attention", as aliases.
+        aliases = (FULL_ATTENTION, INDEXED_ATTENTION_LAYER_TYPE)
+        return [DEEPSEEK_SPARSE_ATTENTION_LAYER_TYPE if lt in aliases else lt for lt in layer_types]
 
     def _resolve_indexer_types(
         self,

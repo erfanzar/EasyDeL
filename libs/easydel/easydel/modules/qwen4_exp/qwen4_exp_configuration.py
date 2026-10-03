@@ -266,8 +266,11 @@ class Qwen4ExpTextConfig(EasyDeLBaseConfig):
                 for i in range(num_hidden_layers)
             ]
         else:
-            # The released checkpoint spells sparse layers "full_attention".
-            layer_types = ["qwen_sparse_attention" if lt == "full_attention" else lt for lt in layer_types]
+            # The released checkpoint spells sparse layers "full_attention"; transformers>=5.18 renames them
+            # "indexed_attention" (huggingface/transformers#48974). Both normalize to the QSA type.
+            layer_types = [
+                "qwen_sparse_attention" if lt in ("full_attention", "indexed_attention") else lt for lt in layer_types
+            ]
         if len(layer_types) != num_hidden_layers:
             raise ValueError(
                 f"layer_types length must equal num_hidden_layers ({num_hidden_layers}), got {len(layer_types)}."
@@ -346,7 +349,9 @@ class Qwen4ExpTextConfig(EasyDeLBaseConfig):
         if self.mtp is not None:
             mtp_num_hidden_layers = int(self.mtp.get("num_hidden_layers", mtp_num_hidden_layers))
             mtp_types = self.mtp.get("layer_types")
-            if mtp_types is not None and any(t not in {"qwen_sparse_attention", "full_attention"} for t in mtp_types):
+            if mtp_types is not None and any(
+                t not in {"qwen_sparse_attention", "full_attention", "indexed_attention"} for t in mtp_types
+            ):
                 raise ValueError("Qwen4-Exp MTP currently supports QSA/full_attention layers only.")
             if mtp_types is not None and len(mtp_types) != mtp_num_hidden_layers:
                 raise ValueError("mtp.layer_types length must equal mtp.num_hidden_layers.")

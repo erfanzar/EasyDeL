@@ -49,10 +49,22 @@ from easydel.caching import (
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput, DecoderLayerOutput
-from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
-from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.infra.utils import ACT2FN, auto_remat
+from easydel.layers import (
+    ColumnParallelLinear,
+    ColumnParallelMoELinear,
+    Embed,
+    MoeLoadBalancingStrategy,
+    MoeRoutingStrategy,
+    RowParallelMoELinear,
+)
 from easydel.layers.attention import UnifiedAttention
-from easydel.layers.layouts import hf_per_expert_swiglu_reform_param
+from easydel.layers.layouts import (
+    moe_down_projection_reform_param,
+    moe_fused_gate_up_reform_param,
+    split_fused_gate_up_projection,
+)
+from easydel.layers.moe import BaseMoeModule
 from easydel.layers.norms import LayerNorm
 from easydel.modules._base import BaseCausalLMModule
 
@@ -93,53 +105,36 @@ class PhiMoEBlockSparseTop2MLP(spx.Module):
         ffn_dim = config.intermediate_size
         hidden_dim = config.hidden_size
 
-        self.w1 = ColumnParallelLinear(
-            hidden_dim,
-            ffn_dim,
+        self.gate_up_proj = ColumnParallelMoELinear(
+            num_experts=config.num_local_experts,
+            in_features=hidden_dim,
+            out_features=2 * ffn_dim,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
+            partition_manager=config.runtime_sharding_resolver,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
             rngs=rngs,
         )
-        self.w2 = RowParallelLinear(
-            ffn_dim,
-            hidden_dim,
+        self.down_proj = RowParallelMoELinear(
+            num_experts=config.num_local_experts,
+            in_features=ffn_dim,
+            out_features=hidden_dim,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            rngs=rngs,
-        )
-        self.w3 = ColumnParallelLinear(
-            hidden_dim,
-            ffn_dim,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
+            partition_manager=config.runtime_sharding_resolver,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
             rngs=rngs,
         )
         self.act_fn = ACT2FN[self.config.hidden_act]
 
-    def forward(self, hidden_states: Array) -> Array:
-        """Apply SwiGLU feedforward transformation for expert processing.
-
-        Args:
-            hidden_states (Array): Input tensor for the expert MLP of shape
-                (num_tokens_routed_to_expert, hidden_size).
-
-        Returns:
-            Array: Transformed hidden states after expert MLP processing with shape
-                (num_tokens_routed_to_expert, hidden_size).
-        """
-        gate = checkpoint_name(self.act_fn(self.w1(hidden_states)), "mlp_gate")
-        up = checkpoint_name(self.w3(hidden_states), "mlp_up")
-        down = checkpoint_name(self.w2(gate * up), "mlp_down")
-        return checkpoint_name(down, "mlp_output")
+    def forward(self, hidden_states: Array, group_sizes: Array, sorted_experts: Array | None = None) -> Array:
+        gate_up = self.gate_up_proj(hidden_states, group_sizes, sorted_experts)
+        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        return self.down_proj(self.act_fn(gate) * up, group_sizes, sorted_experts)
 
 
 class PhiMoEAttention(UnifiedAttention):
@@ -192,7 +187,7 @@ class PhiMoEAttention(UnifiedAttention):
         )
 
 
-class PhiMoeSparseMoeBlock(spx.Module):
+class PhiMoeSparseMoeBlock(BaseMoeModule):
     """Sparse Mixture of Experts block for PhiMoE models.
 
     Implements the sparse MoE layer that routes tokens to a subset of expert MLPs.
@@ -221,6 +216,16 @@ class PhiMoeSparseMoeBlock(spx.Module):
             rngs (spx.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the model.
         """
+        super().__init__(
+            config=config,
+            n_routed_experts=config.num_local_experts,
+            # HF ``sparsemixer`` always routes exactly two experts per token, whatever ``num_experts_per_tok`` says;
+            # the dispatcher's token replication must use that width.
+            num_experts_per_tok=2,
+            hidden_size=config.hidden_size,
+            routing_strategy=MoeRoutingStrategy.TOP_K_NDIV,
+            load_balancing_strategy=MoeLoadBalancingStrategy.STANDARD,
+        )
         self.config = config
         self.layer_idx = layer_idx
         self.dtype = dtype
@@ -243,22 +248,30 @@ class PhiMoeSparseMoeBlock(spx.Module):
             kernel_init=jax.nn.initializers.normal(),
         )
 
-        self.experts = nn.ModuleList(
-            [
-                PhiMoEBlockSparseTop2MLP(
-                    config=config,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
-                )
-                for _ in range(self.config.num_local_experts)
-            ]
+        self.experts = PhiMoEBlockSparseTop2MLP(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
         )
 
     @property
     def reform_param(self):
-        return hf_per_expert_swiglu_reform_param(num_experts=self.config.num_local_experts)
+        """HF Phimoe stores stacked experts (``experts.gate_up_proj [E, 2I, H]``, ``experts.down_proj [E, H, I]``),
+        which load straight into the stacked runtime kernels; the router is a transposed linear."""
+        return {
+            "router.weight$": {
+                "splits": [{"name": "router.weight", "spliter": lambda x: x.swapaxes(-1, -2)}],
+                "inverse_spliter": lambda x: x.swapaxes(-1, -2),
+            },
+            **moe_fused_gate_up_reform_param(
+                config=self.config,
+                target_prefix="experts.gate_up_proj",
+                source_prefix="experts.gate_up_proj",
+            ),
+            **moe_down_projection_reform_param(target_prefix="experts.down_proj", source_prefix="experts.down_proj"),
+        }
 
     def forward(
         self,
@@ -281,12 +294,6 @@ class PhiMoeSparseMoeBlock(spx.Module):
                 - Output hidden states after MoE processing (batch, seq_len, hidden_dim).
                 - Router logits for auxiliary loss computation (batch, seq_len, num_experts).
         """
-        batch_size, sequence_length, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.reshape(-1, hidden_dim)
-
-        router_logits = self.router(hidden_states).astype(  # no reshaping is needed
-            jnp.promote_types(self.dtype, jnp.float32)
-        )
 
         def _sparsemixer_eval(scores: Array, jitter_eps: float) -> tuple[Array, Array]:
             """Run the inference-time SparseMixer routing for one expert slot.
@@ -330,40 +337,28 @@ class PhiMoeSparseMoeBlock(spx.Module):
             selected_experts = jnp.concatenate([max_ind, max_ind_2], axis=-1).astype(jnp.int32)
             return multiplier, selected_experts
 
-        if deterministic:
-            routing_weights, selected_experts = _sparsemixer_eval(
-                router_logits,
-                jitter_eps=float(self.router_jitter_noise),
-            )
-        else:
-            routing_weights, selected_experts = jax.lax.top_k(router_logits, k=self.config.num_experts_per_tok)
-            routing_weights = jax.nn.softmax(
-                routing_weights.astype(jnp.promote_types(self.dtype, jnp.float32)),
-                axis=-1,
-            )
-        final_hidden_state = jnp.zeros_like(hidden_states)
-        for index in range(self.config.num_local_experts):
-            expert_layer_output = (
-                blockwise_ffn(
-                    self.experts[index],
-                    hidden_states,
-                    self.config.scan_mlp_chunk_size,
-                )
-                if self.config.use_scan_mlp
-                else self.experts[index](hidden_states)
-            )
-            expert_weight = jnp.zeros((hidden_states.shape[0],), dtype=routing_weights.dtype)
-            for topk_pos in range(selected_experts.shape[-1]):
-                expert_weight = expert_weight + jnp.where(
-                    selected_experts[:, topk_pos] == index,
-                    routing_weights[:, topk_pos],
-                    0.0,
-                )
-            expert_layer_output_exp = expert_layer_output * expert_weight[:, None]
-            final_hidden_state += checkpoint_name(expert_layer_output_exp, "moe_expert_output")
-        final_hidden_state = final_hidden_state.reshape(batch_size, sequence_length, hidden_dim)
-        router_logits = router_logits.reshape(batch_size, sequence_length, -1)
-        return final_hidden_state, checkpoint_name(router_logits, "moe_router_logits")
+        def select_hook(scores: Array, _pre_bias: Array | None, k: int) -> tuple[Array, Array]:
+            if deterministic:
+                return _sparsemixer_eval(scores, jitter_eps=float(self.router_jitter_noise))
+            values, indices = jax.lax.top_k(scores, k=k)
+            return jax.nn.softmax(values.astype(jnp.promote_types(self.dtype, jnp.float32)), axis=-1), indices
+
+        hooks = self.moe_hooks.replace(
+            normalize_gate_logits=lambda logits: logits,
+            select_hook=select_hook,
+            refine_weights_hook=None,
+        )
+        output, router_logits = self.moe_call(
+            hidden_state=hidden_states,
+            gate_layer=self.router,
+            expert_layer=self.experts,
+            gate_up_kernel=self.experts.gate_up_proj.kernel_view(),
+            wd_kernel=self.experts.down_proj.kernel_view(),
+            act_fn=self.experts.act_fn,
+            hooks=hooks,
+        )
+        router_logits = router_logits.reshape(*hidden_states.shape[:2], -1)
+        return checkpoint_name(output, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 
 
 class PhiMoeDecoderLayer(spx.Module):

@@ -149,6 +149,9 @@ class FalconMambaConfig(EasyDeLBaseConfig):
 
         self.use_cache = use_cache
         self.use_falcon_mambapy = use_falcon_mambapy
+        # transformers>=5.18 renamed the field to ``use_mambapy`` (its mixer reads that name); keep both in sync so HF
+        # configs built from this one construct. EasyDeL always runs its JAX scan regardless of the flag.
+        self.use_mambapy = use_falcon_mambapy
         self.use_associative_scan = use_associative_scan
         self.mixer_rms_eps = mixer_rms_eps
         self.gradient_checkpointing = gradient_checkpointing

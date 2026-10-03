@@ -61,9 +61,9 @@ class LlamaConfig(EasyDeLBaseConfig):
         use_cache (`bool`, *optional*, defaults to `True`):
             Whether or not the model should return the last key/values attentions (not used by all models). Only
             relevant if `config.is_decoder=True`.
-        bos_token_id (`int`, *optional*, defaults to 0):
+        bos_token_id (`int`, *optional*, defaults to 1):
             The id of the *beginning-of-sequence* token.
-        eos_token_id (`int`, *optional*, defaults to 1):
+        eos_token_id (`int`, *optional*, defaults to 2):
             The id of the *end-of-sequence* token.
         resid_pdrop (`float`, *optional*, defaults to 0.0):
             The dropout probability for all fully connected layers in the embeddings, encoder, and pooler.
@@ -115,8 +115,8 @@ class LlamaConfig(EasyDeLBaseConfig):
         rms_norm_eps: float = 1e-6,
         initializer_range: float = 0.02,
         use_cache: bool = True,
-        bos_token_id: int = 0,
-        eos_token_id: int = 1,
+        bos_token_id: int = 1,
+        eos_token_id: int = 2,
         resid_pdrop: float = 0.0,
         embd_pdrop: float = 0.0,
         attention_dropout: float = 0.0,

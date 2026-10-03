@@ -136,6 +136,8 @@ class Glm4vVisionConfig(EasyDeLBaseConfig):
 
     model_type = "glm4v_vision"
     base_config_key = "vision_config"
+    # Matches HF: the 2-D vision rotary is axial (theta 10000, the value EasyDeL's vision rotary uses).
+    default_rope_type = "axial"
 
     def __init__(
         self,

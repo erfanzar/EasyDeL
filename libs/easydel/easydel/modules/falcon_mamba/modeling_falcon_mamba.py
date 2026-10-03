@@ -510,92 +510,77 @@ class FalconMambaMixer(spx.Module):
         )
 
         if use_packed_state_updates:
-            from easydel.operations.kernels.ssm1 import _single_step_ssm1_fwd
+            from easydel.layers.compressed_window._packed import grid_to_tokens, tokens_to_grid
+            from easydel.operations.kernels.ssm1 import _packed_ssm1_fwd
 
-            if packed_num_seqs is None:
-                raise ValueError("packed_num_seqs is required for packed state updates.")
-            conv_states = cache_params.conv_state  # [max_seqs, I, d_conv]
-            ssm_states = cache_params.recurrent_state.astype(jnp.float32)  # [max_seqs, I, N]
+            num_slots = conv_states.shape[0]
+            token_index = jnp.arange(seq_len, dtype=jnp.int32)
             token_slots = jnp.clip(
-                jnp.searchsorted(packed_query_start_loc, jnp.arange(seq_len), side="right") - 1,
+                jnp.searchsorted(packed_query_start_loc, token_index, side="right") - 1,
                 0,
-                packed_num_seqs - 1,
+                num_slots - 1,
             )
+            token_cols = token_index - packed_query_start_loc[token_slots]
+            token_valid = token_index < packed_query_start_loc[packed_num_seqs]
+            width = seq_len
 
-            A_real = -jnp.exp(self.A_log.value.astype(jnp.float32))
-            D_val = self.D.value.astype(jnp.float32)
-            conv_kernel = self.conv1d.weight  # [kernel_size, 1, I]
+            def _grid(x):
+                return tokens_to_grid(x, token_slots, token_cols, num_slots, width)
+
+            valid_grid = _grid(token_valid.astype(jnp.bool_))
+            input_grid = _grid(hidden_states[0].swapaxes(0, 1))  # [slots, width, I]
+            gate_grid = _grid(gate[0].swapaxes(0, 1))
+            conv_state = conv_states
+            conv_window = jnp.concatenate((conv_state.transpose(0, 2, 1), input_grid), axis=1)
+            conv_kernel = self.conv1d.weight[:, 0, :].T  # [I, K]
+            conv_out = jnp.einsum(
+                "swki,ik->swi",
+                jnp.stack([conv_window[:, i + 1 : i + 1 + self.conv_kernel_size, :] for i in range(width)], axis=1),
+                conv_kernel,
+            )
             conv_bias = (
                 self.conv1d.bias
                 if self.config.use_conv_bias
-                else jnp.zeros(self.intermediate_size, dtype=conv_kernel.dtype)
+                else jnp.zeros(self.intermediate_size, dtype=conv_out.dtype)
             )
+            conv_out = self.act(conv_out + conv_bias).astype(jnp.float32)
 
-            token_outputs = jnp.zeros((seq_len, self.intermediate_size), dtype=jnp.float32)
-
-            def _body(idx, carry):
-                """Per-token Falcon-Mamba decode step.
-
-                ``carry`` is ``(conv_states, ssm_states, token_outputs)``
-                indexed by the per-token ``slot``: rolls the depthwise conv
-                buffer, computes one selective SSM step, and writes the
-                projected output into ``token_outputs[idx]``.
-                """
-                conv_states_c, ssm_states_c, token_outputs_c = carry
-                slot = token_slots[idx]
-
-                conv_state_i = jax.lax.dynamic_slice_in_dim(conv_states_c, slot, 1, axis=0)  # [1, I, d_conv]
-                new_token = hidden_states[0, :, idx]  # [I]
-                conv_state_i = jnp.roll(conv_state_i, shift=-1, axis=-1)
-                conv_state_i = conv_state_i.at[:, :, -1].set(new_token.astype(conv_state_i.dtype))
-
-                # Manual depthwise conv + bias + activation
-                conv_out = jnp.sum(conv_state_i[0] * conv_kernel[:, 0, :].T, axis=-1) + conv_bias  # [I]
-                conv_out = self.act(conv_out).astype(jnp.float32)
-
-                # 2) x_proj: extract time_step, B, C
-                x_proj_out = self.x_proj(conv_out[None, None, :])  # [1, 1, tr+2N]
-                x_proj_out = x_proj_out[0, 0]  # [tr+2N]
-                time_step_i = x_proj_out[: self.time_step_rank]
-                ssm_b_i = x_proj_out[self.time_step_rank : self.time_step_rank + self.ssm_state_size]
-                ssm_c_i = x_proj_out[self.time_step_rank + self.ssm_state_size :]
-
-                ssm_b_i = rms_forward(ssm_b_i[None], variance_epsilon=self.rms_eps)[0]  # [N]
-                ssm_c_i = rms_forward(ssm_c_i[None], variance_epsilon=self.rms_eps)[0]  # [N]
-                time_step_i = rms_forward(time_step_i[None], variance_epsilon=self.rms_eps)[0]  # [tr]
-
-                dt_i = self.dt_proj(time_step_i[None, None, :])[0, 0]  # [I]
-                dt_i = jax.nn.softplus(dt_i)
-
-                ssm_state_i = jax.lax.dynamic_slice_in_dim(ssm_states_c, slot, 1, axis=0)  # [1, I, N]
-                y_i, new_ssm_state_i = _single_step_ssm1_fwd(
-                    hidden_states=conv_out[None, :],
-                    A=A_real,
-                    B=ssm_b_i[None, :],
-                    C=ssm_c_i[None, :],
-                    D=D_val,
-                    dt=dt_i[None, :],
-                    ssm_state=ssm_state_i,
-                )
-
-                # 6) Apply gate: y * silu(gate)
-                gate_i = gate[0, :, idx]  # [I]
-                y_gated = y_i[0] * jax.nn.silu(gate_i.astype(jnp.float32))
-
-                conv_states_c = jax.lax.dynamic_update_slice_in_dim(conv_states_c, conv_state_i, slot, axis=0)
-                ssm_states_c = jax.lax.dynamic_update_slice_in_dim(
-                    ssm_states_c, new_ssm_state_i.astype(ssm_states_c.dtype), slot, axis=0
-                )
-                token_outputs_c = token_outputs_c.at[idx].set(y_gated)
-                return conv_states_c, ssm_states_c, token_outputs_c
-
-            conv_states, ssm_states, token_outputs = jax.lax.fori_loop(
-                0,
-                seq_len,
-                _body,
-                (conv_states, ssm_states, token_outputs),
+            x_proj_out = self.x_proj(conv_out)
+            time_step_grid = rms_forward(x_proj_out[..., : self.time_step_rank], variance_epsilon=self.rms_eps)
+            b_grid = rms_forward(
+                x_proj_out[..., self.time_step_rank : self.time_step_rank + self.ssm_state_size],
+                variance_epsilon=self.rms_eps,
             )
+            c_grid = rms_forward(
+                x_proj_out[..., self.time_step_rank + self.ssm_state_size :], variance_epsilon=self.rms_eps
+            )
+            dt_grid = jax.nn.softplus(self.dt_proj(time_step_grid).astype(jnp.float32))
+            dt_grid = jnp.where(valid_grid[..., None], dt_grid, 0.0)
+            conv_out = jnp.where(valid_grid[..., None], conv_out, 0.0)
+            b_grid = jnp.where(valid_grid[..., None], b_grid, 0.0)
+            c_grid = jnp.where(valid_grid[..., None], c_grid, 0.0)
 
+            y_grid, ssm_states = _packed_ssm1_fwd(
+                conv_out,
+                -jnp.exp(self.A_log.value.astype(jnp.float32)),
+                b_grid,
+                c_grid,
+                self.D.value.astype(jnp.float32),
+                dt_grid,
+                valid_grid,
+                cache_params.recurrent_state.astype(jnp.float32),
+            )
+            y_grid = y_grid * jax.nn.silu(gate_grid.astype(jnp.float32))
+            token_outputs = grid_to_tokens(y_grid, token_slots, token_cols, num_slots)
+
+            # Preserve slots with no tokens; for populated rows retain the final K inputs.
+            lengths = jnp.sum(valid_grid, axis=1, dtype=jnp.int32)
+            positions = lengths[:, None] + jnp.arange(self.conv_kernel_size, dtype=jnp.int32)[None, :]
+            conv_tail = jnp.take_along_axis(conv_window, positions[..., None], axis=1).transpose(0, 2, 1)
+            conv_states = jnp.where((lengths > 0)[:, None, None], conv_tail, conv_state)
+            ssm_states = jnp.where(
+                (lengths > 0)[:, None, None], ssm_states, cache_params.recurrent_state.astype(jnp.float32)
+            )
             y = token_outputs.reshape(1, seq_len, self.intermediate_size)
             cache_view = cache_params.replace(
                 conv_state=conv_states,

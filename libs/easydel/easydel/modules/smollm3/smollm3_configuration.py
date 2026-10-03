@@ -21,10 +21,16 @@ selected layers omit rotary position embeddings entirely (controlled by
 ``no_rope_layers``).
 """
 
+import math
 import typing
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
+
+# HF ``SmolLM3Config`` default KV-head count, and a sentinel marking "not specified" so the
+# default can adapt to small head counts while an explicit ``None`` still means MHA.
+_HF_DEFAULT_KV_HEADS = 4
+_DEFAULT_KV_HEADS = object()
 
 
 @register_config("smollm3")
@@ -46,8 +52,11 @@ class SmolLM3Config(EasyDeLBaseConfig):
                     Number of hidden layers in the Transformer encoder.
             num_attention_heads (`int`, *optional*, defaults to 16):
                     Number of attention heads for each attention layer.
-            num_key_value_heads (`int`, *optional*):
-                    Number of key_value heads for Grouped Query Attention. Defaults to `num_attention_heads`.
+            num_key_value_heads (`int`, *optional*, defaults to 4):
+                    Number of key_value heads for Grouped Query Attention. ``None`` means `num_attention_heads`
+                    (multi-head attention), matching HF `SmolLM3Config`. When omitted it resolves to
+                    ``gcd(4, num_attention_heads)`` (4 for the default 16 heads). Explicit values must
+                    divide `num_attention_heads`.
             hidden_act (`str`, *optional*, defaults to `"silu"`):
                     The non-linear activation function in the decoder.
             max_position_embeddings (`int`, *optional*, defaults to 32768):
@@ -64,7 +73,7 @@ class SmolLM3Config(EasyDeLBaseConfig):
                     End of stream token id.
             pad_token_id (`int`, *optional*, defaults to 128004):
                     Padding token id.
-            tie_word_embeddings (`bool`, *optional*, defaults to `False`):
+            tie_word_embeddings (`bool`, *optional*, defaults to `True`):
                     Whether to tie weight embeddings.
             rope_theta (`float`, *optional*, defaults to 2000000.0):
                     The base period of the RoPE embeddings.
@@ -106,7 +115,7 @@ class SmolLM3Config(EasyDeLBaseConfig):
         intermediate_size: int = 11008,
         num_hidden_layers: int = 36,
         num_attention_heads: int = 16,
-        num_key_value_heads: int | None = None,
+        num_key_value_heads: int | object | None = _DEFAULT_KV_HEADS,
         hidden_act: str = "silu",
         max_position_embeddings: int = 32768,
         initializer_range: float = 0.02,
@@ -115,7 +124,7 @@ class SmolLM3Config(EasyDeLBaseConfig):
         pad_token_id: int = 128004,
         bos_token_id: int = 128000,
         eos_token_id: int = 128001,
-        tie_word_embeddings: bool = False,
+        tie_word_embeddings: bool = True,
         rope_theta: float = 2000000.0,
         rope_scaling: dict | None = None,
         attention_bias: bool = False,
@@ -156,8 +165,19 @@ class SmolLM3Config(EasyDeLBaseConfig):
         self.rope_scaling = rope_scaling
         self._rope_scaling_validation()
 
-        if num_key_value_heads is None:
+        # HF parity: the default is 4 KV heads and an explicit ``None`` means MHA. When the
+        # KV-head count is left unspecified it resolves to gcd(4, num_attention_heads), which is
+        # 4 for the real 16-head architecture and never exceeds or fails to divide a smaller
+        # head count. Explicit values are kept as given and validated.
+        if num_key_value_heads is _DEFAULT_KV_HEADS:
+            num_key_value_heads = math.gcd(_HF_DEFAULT_KV_HEADS, num_attention_heads)
+        elif num_key_value_heads is None:
             num_key_value_heads = num_attention_heads
+        elif num_key_value_heads <= 0 or num_attention_heads % num_key_value_heads != 0:
+            raise ValueError(
+                f"num_key_value_heads ({num_key_value_heads}) must be positive and divide "
+                f"num_attention_heads ({num_attention_heads})."
+            )
         self.num_key_value_heads = num_key_value_heads
         self.head_dim = hidden_size // num_attention_heads
 

@@ -107,17 +107,12 @@ KNOWN_GAPS = {
     # EasyDeL->HF export: HF receives a [3*hidden] tensor where it wants [hidden].
     "gpt2": "fused Conv1D c_attn/c_fc not split on export",
     "opt": "fc1/fc2 MLP weights not transposed on export",
-    # FalconConfig.head_dim is a read-only property; config round-trip can't set it.
-    "falcon": "FalconConfig.head_dim is read-only on the HF side",
     # roberta export maps ``embeddings.*`` to ``weights.*`` and drops lm_head.decoder.bias,
     # so the HF state_dict fails to load on import.
     "roberta": "embeddings exported under 'weights.*' and lm_head.decoder.bias missing on export",
     # qwen3_next 3-D linear-attn conv1d kernel is not re-oriented on export ([4,1,8192]
     # exported where HF wants [8192,1,4]); 3-D axis mapping is ambiguous from shape alone.
     "qwen3_next": "linear-attn conv1d 3-D kernel orientation not handled on export",
-    # GPT-family fused QKV (gptj rotary qkv, gpt_neox query_key_value) not split on export.
-    "gptj": "fused qkv / lm_head.bias layout not handled on export",
-    "gpt_neox": "fused query_key_value projection not split on export",
 }
 
 ROUNDTRIP_MODELS = DENSE_MODELS
