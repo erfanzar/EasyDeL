@@ -742,7 +742,19 @@ clone_workspace_on_tpu() {
       echo \"[\${host}] \${src_dir} exists but is not a git checkout\"
       exit 1
     else
-      git clone --depth 1 --branch \"\${branch}\" \"\${repo_url}\" \"\${src_dir}\" >\"\${clone_log}\" 2>&1
+      if ! git clone --depth 1 --branch \"\${branch}\" \"\${repo_url}\" \"\${src_dir}\" >\"\${clone_log}\" 2>&1; then
+        # --branch only accepts branch/tag names; raw commit SHAs (advertised by
+        # the usage text) need an explicit fetch + FETCH_HEAD checkout instead.
+        echo \"[\${host}] clone --branch \${branch} failed; retrying via fetch (supports commit SHAs)\"
+        if [ -d \"\${src_dir}/.git\" ]; then
+          rm -rf \"\${src_dir}\"
+        fi
+        git init \"\${src_dir}\" >>\"\${clone_log}\" 2>&1
+        git -C \"\${src_dir}\" remote add origin \"\${repo_url}\" >>\"\${clone_log}\" 2>&1
+        git -C \"\${src_dir}\" fetch --depth 1 origin \"\${branch}\" >>\"\${clone_log}\" 2>&1
+        # Detached: the requested rev may be a commit SHA, which must not become a local branch name.
+        git -C \"\${src_dir}\" checkout --detach FETCH_HEAD >>\"\${clone_log}\" 2>&1
+      fi
     fi
     test -f \"\${src_dir}/libs/easydel/pyproject.toml\" || {
       echo \"[\${host}] clone completed but libs/easydel/pyproject.toml is missing\"

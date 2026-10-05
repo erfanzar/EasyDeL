@@ -2,9 +2,9 @@ name: Lint
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main, vnext]
   pull_request:
-    branches: [main, develop]
+    branches: [main, vnext]
   workflow_dispatch:
 
 jobs:
