@@ -1253,6 +1253,86 @@ def _single_step_kda_per_channel_fwd_bthd(
     return output.astype(input_dtype)[:, None, :, :], new_state
 
 
+#: Longest per-row window (tokens) that :func:`kda_packed_rows_forward` advances with the per-token decode recurrence
+#: instead of the chunked prefill kernel. Speculative-decoding verify windows (``1 + num_draft_tokens``) fall here.
+_SHORT_WINDOW_MAX = 8
+
+
+def _short_window_kda_per_channel(
+    query: Float[Array, "rows heads seq_len head_dim"],
+    key: Float[Array, "rows heads seq_len head_dim"],
+    value: Float[Array, "rows heads seq_len d_state"],
+    beta: Float[Array, "rows heads seq_len"],
+    decay: Float[Array, "rows heads seq_len head_dim"],
+    initial_state: Float[Array, "rows heads head_dim d_state"],
+    lens: Array,
+    max_steps: int,
+    stack_steps: int = 0,
+) -> tuple[Array, ...]:
+    """Advance per-channel KDA rows of at most ``max_steps`` tokens with the per-token decode recurrence.
+
+    Applies :func:`_single_step_kda_per_channel_fwd_bthd` once per position (a ``fori_loop`` whose trip count is
+    the longest row, capped at ``max_steps``), masking each row past its own length. Between steps the carried
+    state is stored in ``initial_state``'s dtype, exactly as decode stores it in the cache, so every token sees
+    plain decode's arithmetic. Used for short windows (speculative verify), where the chunked prefill kernel would
+    build full ``chunk_size`` chunks for a handful of tokens per row.
+
+    Args:
+        query: ``(rows, heads, seq_len, head_dim)`` post-conv queries (row ``r`` owns its first ``lens[r]`` slots).
+        key: ``(rows, heads, seq_len, head_dim)``.
+        value: ``(rows, heads, seq_len, d_state)``.
+        beta: ``(rows, heads, seq_len)`` gating.
+        decay: ``(rows, heads, seq_len, head_dim)`` per-channel log-decay.
+        initial_state: ``(rows, heads, head_dim, d_state)`` carried state (its dtype is the storage dtype).
+        lens: ``(rows,)`` valid tokens per row.
+        max_steps: Static upper bound on ``lens``; positions at or past it are not processed.
+        stack_steps: When positive, also return the state after each of the first ``stack_steps`` tokens
+            (speculative candidate rows), stored in ``initial_state``'s dtype.
+
+    Returns:
+        tuple: ``(outputs, final_state)`` — outputs ``(rows, heads, seq_len, d_state)`` float32 (zero at
+        positions past a row's length) and final state float32. Rows with ``lens == 0`` keep their state. With
+        ``stack_steps > 0`` a third element ``(stack_steps, rows, heads, head_dim, d_state)`` holds the state after
+        ``t + 1`` tokens at index ``t`` (entries past a row's length are unspecified).
+    """
+    rows, heads, seq, _ = query.shape
+    d_state = value.shape[-1]
+    state_dtype = initial_state.dtype
+    trips = jnp.minimum(jnp.max(lens), max_steps).astype(jnp.int32)
+    stack0 = jnp.zeros((stack_steps, *initial_state.shape), state_dtype) if stack_steps > 0 else None
+
+    def body(t, carry):
+        state, out, stack = carry
+
+        def at(x):
+            return lax.dynamic_slice_in_dim(x, t, 1, axis=2)
+
+        o, s = _single_step_kda_per_channel_fwd_bthd(
+            query=at(query).transpose(0, 2, 1, 3),
+            key=at(key).transpose(0, 2, 1, 3),
+            value=at(value).transpose(0, 2, 1, 3),
+            beta=at(beta).transpose(0, 2, 1),
+            decay=at(decay).transpose(0, 2, 1, 3),
+            recurrent_state=state,
+            use_qk_l2norm=True,
+        )
+        live = (t < lens)[:, None, None, None]
+        state = jnp.where(live, s.astype(state_dtype), state)
+        o = jnp.where(live, o.astype(jnp.float32), 0.0).transpose(0, 2, 1, 3)  # (R, H, 1, V)
+        out = lax.dynamic_update_slice_in_dim(out, o, t, axis=2)
+        if stack is not None:
+            idx = jnp.minimum(t, stack_steps - 1)
+            entry = jnp.where(t < stack_steps, state, lax.dynamic_index_in_dim(stack, idx, axis=0, keepdims=False))
+            stack = lax.dynamic_update_index_in_dim(stack, entry, idx, axis=0)
+        return state, out, stack
+
+    out0 = jnp.zeros((rows, heads, seq, d_state), jnp.float32)
+    state, out, stack = lax.fori_loop(0, trips, body, (initial_state, out0, stack0))
+    if stack is None:
+        return out, state.astype(jnp.float32)
+    return out, state.astype(jnp.float32), stack
+
+
 def kda_packed_rows_forward(
     query: Float[Array, "1 seq_len key_dim"],
     key: Float[Array, "1 seq_len key_dim"],
@@ -1265,6 +1345,7 @@ def kda_packed_rows_forward(
     context_lens: Array | None = None,
     conv_dtype: jnp.dtype = jnp.bfloat16,
     chunk_size: int = 64,
+    spec_recurrent_commit: Array | None = None,
 ) -> tuple[Float[Array, "1 seq_len num_heads d_state"], KDACacheView]:
     """Advance per-request per-channel KDA state over an eSurge packed token stream.
 
@@ -1297,6 +1378,11 @@ def kda_packed_rows_forward(
             ``None``, only single-token rows are treated as continuations.
         conv_dtype: Output dtype of the causal conv (matches the dense path).
         chunk_size: Chunk size of the prefill kernel.
+        spec_recurrent_commit: Optional ``[2, >= rows]`` int32 speculative commit (row 0: active flag, row 1:
+            accepted prefix length). Used only when the cache pool holds speculative candidate rows (pool size
+            ``rows * (1 + C)``, prefix-major layout ``rows + (prefix - 1) * rows + row``): the accepted prefix's
+            candidate row is copied into the live row before this step runs. Candidate rows are rewritten for every
+            speculative row (``2 <= lens <= C`` with prior context) with the decode-exact state after each prefix.
 
     Returns:
         tuple: ``(outputs, new_cache_view)`` -- outputs ``[1, T, heads, head_v_dim]``
@@ -1334,8 +1420,36 @@ def kda_packed_rows_forward(
 
     q_r, k_r, v_r, b_r, g_r = mask(q_r), mask(k_r), mask(v_r), mask(b_r), mask(g_r)
 
+    # ---- speculative candidate rows ---------------------------------------
+    # The pool may hold ``C`` candidate rows per request row after the live rows (prefix-major). Apply a pending
+    # commit (accepted prefix -> live row) first, then work on the live rows only.
+    pool_leaves = (cache_view.q_conv_state, cache_view.k_conv_state, cache_view.v_conv_state, cache_view.recurrent_state)
+    pool = int(cache_view.recurrent_state.shape[0])
+    cand = (pool - rows) // rows if rows > 0 and pool > rows else 0
+    if cand > 0 and spec_recurrent_commit is not None:
+        commit = jnp.asarray(spec_recurrent_commit, dtype=jnp.int32)
+        if commit.shape[1] < rows:
+            commit = jnp.pad(commit, ((0, 0), (0, rows - commit.shape[1])))
+        prefix_sel = commit[1, :rows]
+        commit_active = (commit[0, :rows] > 0) & (prefix_sel > 0) & (prefix_sel <= cand)
+        src_rows = jnp.clip(rows + (prefix_sel - 1) * rows + jnp.arange(rows), 0, pool - 1)
+
+        def _apply_commit(leaf):
+            mask_c = commit_active.reshape((rows,) + (1,) * (leaf.ndim - 1))
+            live_rows = jnp.where(mask_c, leaf[src_rows], leaf[:rows]).astype(leaf.dtype)
+            return lax.dynamic_update_slice_in_dim(leaf, live_rows, 0, axis=0)
+
+        pool_leaves = tuple(_apply_commit(leaf) for leaf in pool_leaves)
+    base_leaves = tuple(leaf[:rows] for leaf in pool_leaves) if pool != rows else pool_leaves
+    if context_lens is None:
+        context_before = jnp.zeros_like(lens)
+    else:
+        context_before = jnp.asarray(context_lens, dtype=jnp.int32)[:rows] - lens
+    spec_mask = (lens >= 2) & (lens <= cand) & (context_before > 0)
+
     # ---- causal depthwise conv per row ---------------------------------
-    conv_states = (cache_view.q_conv_state, cache_view.k_conv_state, cache_view.v_conv_state)
+    conv_states = base_leaves[:3]
+    cand_conv = []
     if context_lens is None:
         has_prefix = lens <= 1
     else:
@@ -1360,6 +1474,10 @@ def kda_packed_rows_forward(
         candidate = stream[jnp.arange(rows)[:, None], win_idx].transpose(0, 2, 1)  # [rows, d, d_conv]
         keep = (lens > 0)[:, None, None]
         new_conv.append(jnp.where(keep, candidate, st).astype(state.dtype))
+        if cand > 0:
+            # Window after prefix ``t + 1``: stream offsets ``[t, t + d_conv)`` (decode-exact; raw inputs).
+            c_idx = jnp.clip(jnp.arange(cand)[:, None] + jnp.arange(d_conv)[None, :], 0, stream.shape[1] - 1)
+            cand_conv.append(stream[:, c_idx].transpose(1, 0, 3, 2))  # [cand, rows, d, d_conv]
 
     # ---- delta rule per row --------------------------------------------
     num_heads = b_r.shape[-1]
@@ -1370,7 +1488,14 @@ def kda_packed_rows_forward(
     vh = conv_outs[2].reshape(rows, seq, num_heads, head_v).transpose(0, 2, 1, 3)
     bh = b_r.transpose(0, 2, 1)  # [R, H, T]
     gh = g_r.reshape(rows, seq, num_heads, head_k).transpose(0, 2, 1, 3)
-    init_state = cache_view.recurrent_state  # [R, H, K, V]
+    init_state = base_leaves[3]  # [R, H, K, V]
+    rec_dtype = init_state.dtype
+    zero_stack = jnp.zeros((cand, *init_state.shape), rec_dtype) if cand > 0 else None
+
+    def _spec_stack():
+        # Decode-exact per-prefix states of the speculative rows, for branches whose recurrence does not produce them.
+        spec_lens = jnp.where(spec_mask, jnp.minimum(lens, cand), 0)
+        return _short_window_kda_per_channel(qh, kh, vh, bh, gh, init_state, spec_lens, cand, stack_steps=cand)[2]
 
     def _single_path():
         out1, new_state = _single_step_kda_per_channel_fwd_bthd(
@@ -1384,7 +1509,7 @@ def kda_packed_rows_forward(
         )
         out1 = jnp.transpose(out1, (0, 2, 1, 3)).astype(jnp.float32)  # [R, H, 1, V]
         out1 = jnp.pad(out1, ((0, 0), (0, 0), (0, seq - 1), (0, 0)))
-        return out1, new_state.astype(jnp.float32)
+        return out1, new_state.astype(jnp.float32), zero_stack
 
     def _chunk_path():
         # Rows are segments of one packed ``seq``-token stream, so their valid tokens total
@@ -1400,9 +1525,24 @@ def kda_packed_rows_forward(
             chunk_size=chunk_size,
             max_tokens=seq,
         )
-        return out, new_state.astype(jnp.float32)
+        return out, new_state.astype(jnp.float32), (_spec_stack() if cand > 0 else None)
 
-    out_h, new_recurrent = lax.cond(jnp.all(lens <= 1), _single_path, _chunk_path)
+    short_max = min(_SHORT_WINDOW_MAX, seq)
+    if short_max > 1:
+
+        def _short_path():
+            # Short windows (speculative verify: 1 + draft tokens per row) run the decode recurrence per token:
+            # cheaper than building full chunks, and arithmetically identical to plain decode.
+            if cand > 0:
+                return _short_window_kda_per_channel(qh, kh, vh, bh, gh, init_state, lens, short_max, stack_steps=cand)
+            out_s, state_s = _short_window_kda_per_channel(qh, kh, vh, bh, gh, init_state, lens, short_max)
+            return out_s, state_s, None
+
+        max_len = jnp.max(lens)
+        branch = jnp.where(max_len <= 1, 0, jnp.where(max_len <= short_max, 1, 2))
+        out_h, new_recurrent, cand_states = lax.switch(branch, (_single_path, _short_path, _chunk_path))
+    else:
+        out_h, new_recurrent, cand_states = lax.cond(jnp.all(lens <= 1), _single_path, _chunk_path)
 
     # Gather per-row outputs back into the packed stream.
     out_rows = out_h.transpose(0, 2, 1, 3)  # [R, T, H, V]
@@ -1411,11 +1551,27 @@ def kda_packed_rows_forward(
     in_stream = ar < query_start_loc[-1]
     out_packed = jnp.where(in_stream[:, None, None], out_rows[seg_ids, pos_in_row], 0.0)[None]  # [1, T, H, V]
 
+    def _merge(pool_leaf, new_live, cand_vals):
+        # Live rows <- this step's final state; speculative rows' candidate rows <- per-prefix states; rest kept.
+        new_live = new_live.astype(pool_leaf.dtype)
+        if pool_leaf.shape[0] == rows:
+            return new_live
+        used = rows * (1 + cand)
+        tail_shape = pool_leaf.shape[1:]
+        parts = [new_live]
+        if cand > 0:
+            old = pool_leaf[rows:used].reshape((cand, rows, *tail_shape))
+            m = spec_mask.reshape((1, rows) + (1,) * len(tail_shape))
+            parts.append(jnp.where(m, cand_vals.astype(pool_leaf.dtype), old).reshape((cand * rows, *tail_shape)))
+        if pool_leaf.shape[0] > used:
+            parts.append(pool_leaf[used:])
+        return jnp.concatenate(parts, axis=0)
+
     new_cache_view = cache_view.update_kda_states(
-        new_q_conv_state=new_conv[0],
-        new_k_conv_state=new_conv[1],
-        new_v_conv_state=new_conv[2],
-        new_recurrent_state=new_recurrent.astype(cache_view.recurrent_state.dtype),
+        new_q_conv_state=_merge(pool_leaves[0], new_conv[0], cand_conv[0] if cand > 0 else None),
+        new_k_conv_state=_merge(pool_leaves[1], new_conv[1], cand_conv[1] if cand > 0 else None),
+        new_v_conv_state=_merge(pool_leaves[2], new_conv[2], cand_conv[2] if cand > 0 else None),
+        new_recurrent_state=_merge(pool_leaves[3], new_recurrent, cand_states),
     )
     return out_packed, new_cache_view
 

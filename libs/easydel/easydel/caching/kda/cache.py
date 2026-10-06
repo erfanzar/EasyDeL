@@ -217,9 +217,14 @@ class KDACacheView(BaseCacheView):
         )
 
         recurrent_state_shape = (config.batch_size, *config.recurrent_state_shape)
+        # Shard the recurrent state's head axis (``[batch, heads, head_dim, d_state]``) like the hybrid cache's KDA /
+        # GDN views do: replicating it over the head axis makes every device hold (and rewrite) all heads each step.
+        recurrent_specs = PartitionSpec(
+            paxis.batch_axis, *((paxis.head_axis,) + (None,) * (len(recurrent_state_shape) - 2))
+        )
         recurrent_state = with_sharding_constraint(
             arr=jnp.zeros(shape=recurrent_state_shape, dtype=dtype),
-            sharding=conv_specs,
+            sharding=recurrent_specs,
         )
 
         return cls(

@@ -1300,6 +1300,7 @@ class KimiDeltaAttention(spx.Module):
                 context_lens=getattr(cache_metadata, "context_lens", None),
                 conv_dtype=jnp.bfloat16 if self.dtype in lowfloats else self.dtype,
                 chunk_size=self.chunk_size,
+                spec_recurrent_commit=getattr(cache_metadata, "spec_recurrent_commit", None),
             )
             output_gate = self.g_b_proj(self.g_a_proj(hidden_states))
             output_gate = output_gate.reshape(batch_size, seq_len, self.num_heads, self.head_v_dim)
