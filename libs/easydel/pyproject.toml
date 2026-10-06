@@ -103,6 +103,10 @@ preview = true
 [tool.ruff]
 line-length = 121
 target-version = "py311"
+# No first-party source roots: import grouping must not depend on the working directory. The pre-commit hook runs
+# from the repo root with --config, where the default src=["."] finds no package, while editors run from this
+# directory, where it does; the two disagreed on hundreds of files. Same-package detection still applies.
+src = []
 
 [tool.ruff.lint]
 select = ["A", "B", "E", "F", "I", "NPY", "RUF", "UP", "W"]

@@ -15,7 +15,6 @@
 from types import SimpleNamespace
 
 import pytest
-
 from scripts.convert_hf_to_easydel import _infer_task_from_hf_config
 
 

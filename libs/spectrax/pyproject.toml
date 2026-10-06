@@ -75,6 +75,8 @@ preview = true
 [tool.ruff]
 line-length = 121
 target-version = "py311"
+# Import grouping must not depend on the working directory (repo-root pre-commit hook vs. this directory).
+src = []
 
 [tool.ruff.lint]
 select = ["A", "B", "E", "F", "I", "NPY", "RUF", "UP", "W"]
