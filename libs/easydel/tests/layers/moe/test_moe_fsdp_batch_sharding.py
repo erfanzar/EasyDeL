@@ -146,11 +146,12 @@ def test_stage_mesh_batch_axes_include_fsdp():
     folded = _build_gptoss_block(sharding_axis_dims=(1, 1, 2, 2, 2, 1), ring=True, fsdp_is_ep_bound=True)
     with folded.config.mesh:
         folded_mesh = folded._active_auto_expert_mesh(arr=None)
-        assert tuple(folded_mesh.jax_mesh.axis_names) == ("dp", "ep", "tp")
+        # fsdp bound into experts: stage mesh kept, fsdp joins the compound expert axis instead of the batch.
+        assert folded._expert_axis_group(folded_mesh) == ("ep", "fsdp")
         dp_axis_name = resolve_eformer_axis(DP, folded.runtime_sharding_resolver)
         folded_axes = folded._moe_batch_axis_names(folded_mesh, dp_axis_name)
     assert folded_axes == ("dp",), (
-        f"folded expert mesh already absorbs fsdp into its dp axis; batch axes must stay ('dp',), got {folded_axes}"
+        f"an expert-bound fsdp axis carries experts, not the batch; batch axes must stay ('dp',), got {folded_axes}"
     )
 
 

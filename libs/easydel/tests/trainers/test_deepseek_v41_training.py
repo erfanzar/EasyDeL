@@ -304,14 +304,13 @@ def _release_host_tables(model) -> None:
             layer.engram.release_host_table()
 
 
-@pytest.mark.parametrize("mesh_name", ["ep", "tp"])
+@pytest.mark.parametrize("mesh_name", ["ep", "tp", "fsdp"])
 def test_host_batch_transform_matches_in_program_engram_lookup(mesh_name):
     """Host-table engram: the trainer hook's host-gathered rows give the same loss and gradients as the in-program
     ``pure_callback`` lookup on ``engram_hash_ids``, and the transformed batch's step never traces that lookup.
 
-    Not on the ``fsdp`` mesh: there ``fsdp_is_ep_bound`` folds fsdp into a 3-axis ``(dp, ep, tp)`` expert mesh, and
-    JAX rejects that second abstract mesh in any program holding a host callback, so the callback *reference* cannot
-    compile (the hook's callback-free path trains on fsdp; see the trainer test below).
+    The ``fsdp`` case binds fsdp into the expert axis; it covers the callback reference compiling on a single
+    abstract mesh (previously a separate folded expert mesh made JAX reject the program).
     """
     from easydel.layers.embeddings import GatedEngram
 

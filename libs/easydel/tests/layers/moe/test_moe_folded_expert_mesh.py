@@ -108,10 +108,14 @@ def test_folded_expert_mesh_matches_plain_expert_parallel_layout(dims, plain_dim
     folded = _block(dims, fsdp_is_ep_bound=fsdp_bound, sp_is_ep_bound=sp_bound, ring=ring)
     with folded.config.mesh:
         expert_mesh = folded._active_auto_expert_mesh(arr=None)
-    assert tuple(expert_mesh.jax_mesh.axis_names) == ("dp", "ep", "tp"), "case must take the folded mesh"
+        group = folded._expert_axis_group(expert_mesh)
+    # Bound axes stay on the stage mesh and join the expert axis as a compound name (one abstract mesh per program).
+    assert isinstance(group, tuple) and group[0] == "ep", f"case must use a compound expert axis, got {group}"
+    assert expert_mesh.jax_mesh.abstract_mesh.axis_names == folded.config.mesh.abstract_mesh.axis_names
     with plain.config.mesh:
         plain_mesh = plain._active_auto_expert_mesh(arr=None)
-    assert dict(expert_mesh.jax_mesh.shape)["ep"] == dict(plain_mesh.jax_mesh.shape)["ep"]
+    sizes = dict(expert_mesh.jax_mesh.shape)
+    assert int(np.prod([sizes[name] for name in group])) == dict(plain_mesh.jax_mesh.shape)["ep"]
 
     want_out, want_dx, want_dstate = _output_and_gradients(plain, x)
     got_out, got_dx, got_dstate = _output_and_gradients(folded, x)
@@ -120,3 +124,33 @@ def test_folded_expert_mesh_matches_plain_expert_parallel_layout(dims, plain_dim
     assert got_dstate.keys() == want_dstate.keys()
     for key, want in want_dstate.items():
         np.testing.assert_allclose(got_dstate[key], want, rtol=1e-6, atol=1e-7, err_msg=key)
+
+
+@pytest.mark.parametrize("dims", [(1, 1, 4, 1, 1, 1), (1, 1, 2, 2, 1, 1)], ids=["fsdp4-bound", "fsdp2-ep2-bound"])
+def test_bound_expert_axis_compiles_with_host_callback(dims):
+    """Params as jit arguments + a host callback in the same program on an fsdp-bound mesh.
+
+    The fused MoE used to run on a separate folded ``(dp, ep, tp)`` mesh; JAX rejects two abstract meshes in a program
+    holding a host callback ("mesh should be the same across the entire program"). The output must also match the
+    callback-free program.
+    """
+    if jax.device_count() < 4:
+        pytest.skip("needs four devices")
+    if jax.default_backend() == "cpu":
+        pytest.skip("ragged_all_to_all is not implemented by XLA:CPU")
+    block = _block(dims, fsdp_is_ep_bound=True, sp_is_ep_bound=True)
+    graphdef, state = spx.export(block)
+    x = jax.random.normal(jax.random.PRNGKey(1), (8, 4, 32), dtype=jnp.float32)
+
+    def run(state, x, with_callback):
+        if with_callback:
+            x = x + jax.pure_callback(lambda v: np.zeros_like(np.asarray(v)), jax.ShapeDtypeStruct(x.shape, x.dtype), x)
+        out, _ = spx.bind(graphdef, state)(x)
+        return out + x
+
+    with block.config.mesh:
+        placed = jax.device_put(x, jax.sharding.NamedSharding(block.config.mesh, jax.sharding.PartitionSpec("dp")))
+        plain = np.asarray(jax.jit(run, static_argnums=2)(state, placed, False))
+        with_cb = np.asarray(jax.jit(run, static_argnums=2)(state, placed, True))
+    assert np.isfinite(plain).all()
+    np.testing.assert_allclose(with_cb, plain, rtol=0, atol=0)

@@ -60,6 +60,7 @@ from functools import partial
 from typing import Any
 
 import jax
+import numpy as np
 import spectrax as spx
 from eformer.loggings import get_logger
 from ejkernel.modules import GroupedMatmulConfig, grouped_matmul  # pyright: ignore[reportMissingTypeStubs]
@@ -132,7 +133,8 @@ def _channelwise_grouped_platform(rows, codes, activation_bits, *, force_xla=Fal
 # measured row count (1536..49152): gate/up [96,5120,2304] 7.04 -> 4.83 ms at 1536 rows, 10.15 -> 8.16 at 12288,
 # 20.38 -> 17.10 at 49152; down [96,2304,5120] 6.22 -> 4.14, 9.61 -> 7.11, 19.44 -> 14.42. Output and both gradients
 # match XLA within 2.5e-5 relative. block_m 128 wins up to 12288 rows, 256 above (tied at 24576); 512 runs out of
-# VMEM in the backward. Forward-only XLA wins or ties, so inference keeps XLA.
+# VMEM in the backward. Forward-only XLA wins or ties, so the forward stays on XLA and only the backward uses these
+# tiles (``_xla_forward_pallas_backward_gmm``): eval and other forward-only traces compute exactly the XLA result.
 _TRAINING_GMM_TILES = {(96, 5120, 2304): (1024, 1152), (96, 2304, 5120): (1152, 1280)}
 _TRAINING_GMM_ROWS = (1536, 49152)
 
@@ -148,6 +150,39 @@ def _training_gmm_tiles(rows: int, kernel_shape: tuple[int, ...], dtype: tp.Any)
     if not _TRAINING_GMM_ROWS[0] <= int(rows) <= _TRAINING_GMM_ROWS[1]:
         return None
     return (128 if rows <= 12288 else 256, *tiles)
+
+
+def _xla_forward_pallas_backward_gmm(
+    rows: jax.Array,
+    kernel: jax.Array,
+    group_sizes: jax.Array,
+    *,
+    xla_kws: dict[str, tp.Any],
+    pallas_kws: dict[str, tp.Any],
+) -> jax.Array:
+    """Dense grouped matmul whose forward is XLA ``ragged_dot`` and whose backward runs the Pallas kernel.
+
+    Forward-only traces (eval steps, generation inside training) therefore compute exactly the XLA result, while the
+    two backward matmuls use the measured Pallas tiles. Measured on TPU v5p at the DeepSeek-V4.1 per-device families:
+    the XLA forward is equal or faster up to 12288 rows, and a full gate+up+down layer fwd+bwd stays within -3.4% /
+    +1.3% of the all-Pallas version from 1536 to 49152 rows.
+    """
+
+    @jax.custom_vjp
+    def gmm(x, w, g):
+        return grouped_matmul(x, w, g, **xla_kws)
+
+    def gmm_fwd(x, w, g):
+        return gmm(x, w, g), (x, w, g)
+
+    def gmm_bwd(residual, cotangent):
+        x, w, g = residual
+        _, vjp = jax.vjp(lambda a, b: grouped_matmul(a, b, g, **pallas_kws), x, w)
+        dx, dw = vjp(cotangent)
+        return dx, dw, np.zeros(g.shape, jax.dtypes.float0)
+
+    gmm.defvjp(gmm_fwd, gmm_bwd)
+    return gmm(rows, kernel, group_sizes)
 
 
 def _training_gmm_config(rows: jax.Array, kernel: jax.Array) -> GroupedMatmulConfig | None:
@@ -392,13 +427,15 @@ class BaseMoeModule(spx.Module, ABC):
         pp_size = int(axis_sizes.get("pp", 1)) if "pp" in axis_names else 1
         fsdp_size = int(axis_sizes.get(fsdpname, 1)) if fsdpname is not None else 1
         sp_size = int(axis_sizes.get(spname, 1)) if spname is not None else 1
+        bound_folds = (self.config.fsdp_is_ep_bound and fsdp_size > 1) or (self.config.sp_is_ep_bound and sp_size > 1)
         can_use_stage_mesh = (
             pp_size == 1
             and dpname in axis_names
             and epname in axis_names
             and tpname in axis_names
-            and (not self.config.fsdp_is_ep_bound or fsdp_size == 1)
-            and (not self.config.sp_is_ep_bound or sp_size == 1)
+            # Bound fsdp/sp axes stay on the stage mesh and join the expert axis as a compound name (see
+            # ``_expert_axis_group``). Expert-tensor mode still folds: it puts experts on tp and needs size 1 anyway.
+            and (not bound_folds or not self.config.use_expert_tensor_mode)
         )
         if can_use_stage_mesh:
             # Keep the (size-1) ``pp`` axis when the resolved mesh has one: the stage mesh then shares the model mesh's
@@ -413,6 +450,8 @@ class BaseMoeModule(spx.Module, ABC):
                 epname: axis_types[1],
                 tpname: axis_types[2],
             }
+            for bound_name in self._expert_axis_group_names(axis_sizes)[1:]:
+                manual_axis_types[bound_name] = axis_types[1]
             stage_mesh = jax.sharding.Mesh(
                 stage_devices,
                 axis_names=stage_axis_names,
@@ -458,6 +497,36 @@ class BaseMoeModule(spx.Module, ABC):
             ),
             mpmd_axis=None,
         )
+
+    def _expert_axis_group_names(self, axis_sizes: dict) -> tuple[str, ...]:
+        """Physical axes forming the expert dimension on a stage mesh: ``ep`` then any bound ``sp`` / ``fsdp``.
+
+        Order follows :func:`get_moe_partition_spec`'s ``module_view`` (``ep`` major), so each device's expert block
+        is a sub-block of its at-rest ``P("ep", ...)`` shard and the shard_map boundary only slices locally.
+        Bound axes of size 1 are omitted.
+        """
+        resolver = self.runtime_sharding_resolver
+        names = [typing.cast(str, resolve_eformer_axis(EP, resolver))]
+        for logical, bound in ((SP, self.config.sp_is_ep_bound), (FSDP, self.config.fsdp_is_ep_bound)):
+            name = resolve_eformer_axis(logical, resolver)
+            if bound and isinstance(name, str) and name not in names and int(axis_sizes.get(name, 1)) > 1:
+                names.append(name)
+        return tuple(names)
+
+    def _expert_axis_group(self, expert_mesh: spx.SpxMesh) -> str | tuple[str, ...]:
+        """Collective/partition name of the expert dimension on ``expert_mesh``.
+
+        A plain axis name on the folded 3-D mesh and on stage meshes without bound axes; a compound tuple such as
+        ``("ep", "fsdp")`` when bound fsdp/sp axes stay on the stage mesh. Keeping the stage mesh (instead of a
+        separate folded mesh) keeps one abstract mesh per program, which JAX requires once the program holds a host
+        callback ("mesh should be the same across the entire program").
+        """
+        epname = typing.cast(str, resolve_eformer_axis(EP, self.runtime_sharding_resolver))
+        axis_names = tuple(expert_mesh.jax_mesh.axis_names)
+        if len(axis_names) == 3 or self.config.use_expert_tensor_mode or epname not in axis_names:
+            return epname
+        group = self._expert_axis_group_names(dict(expert_mesh.jax_mesh.shape))
+        return group if len(group) > 1 else epname
 
     def _active_auto_expert_mesh(self, arr: jax.Array | None = None) -> spx.SpxMesh:
         """Build the stage-local 3-D MoE mesh in auto-resharding mode.
@@ -612,6 +681,7 @@ class BaseMoeModule(spx.Module, ABC):
         tensors_are_expert: bool,
         is_bias: bool = False,
         fsdp_shards_experts: bool = False,
+        module_view: bool = False,
     ) -> PartitionSpec:
         """Generate the :class:`PartitionSpec` for an expert weight or bias tensor.
 
@@ -629,6 +699,8 @@ class BaseMoeModule(spx.Module, ABC):
                 placement (matches ``moe_fsdp_shard_expert_weights`` at-rest
                 sharding so the fused ``shard_map`` receives the fsdp-local
                 expert slice instead of gathering at the boundary).
+            module_view: If True, name the compound expert axis ``(ep, sp?, fsdp?)`` for bound sp/fsdp axes (the
+                fused ``shard_map`` on the stage mesh with a compound expert axis).
 
         Returns:
             PartitionSpec appropriate for the tensor.
@@ -652,7 +724,7 @@ class BaseMoeModule(spx.Module, ABC):
             is_bias=is_bias,
             fsdp_is_ep_bound=self.config.fsdp_is_ep_bound,
             sp_is_ep_bound=self.config.sp_is_ep_bound,
-            module_view=False,
+            module_view=module_view,
             fsdp_shards_experts=fsdp_shards_experts,
         )
 
@@ -1554,8 +1626,19 @@ class BaseMoeModule(spx.Module, ABC):
         # spans ep*fsdp*sp devices, while the model mesh above reports the
         # physical ep axis alone. Local expert counts must follow the mesh the
         # weights are actually partitioned over.
+        # On the stage mesh, bound fsdp/sp axes join the expert axis as a compound name instead (one abstract mesh per
+        # program); its size is the product of its members.
         expert_mesh_sizes = dict(expert_mesh.jax_mesh.shape)
-        ep_size = int(expert_mesh_sizes.get(expert_axis_name, ep_size))
+        compound_expert_axis = False
+        if not self.config.use_expert_tensor_mode:
+            expert_axis_name = self._expert_axis_group(expert_mesh)
+            compound_expert_axis = isinstance(expert_axis_name, tuple)
+        if compound_expert_axis:
+            ep_size = 1
+            for _name in expert_axis_name:
+                ep_size *= int(expert_mesh_sizes[_name])
+        else:
+            ep_size = int(expert_mesh_sizes.get(expert_axis_name, ep_size))
         tp_size = int(expert_mesh_sizes.get(tensor_axis_name, tp_size))
 
         # Quantization-aware training reaches the experts here rather than
@@ -1724,7 +1807,11 @@ class BaseMoeModule(spx.Module, ABC):
         # With gather-at-use active the weight in-specs name (ep, fsdp) on the
         # expert dim so each shard receives its fsdp-local expert slice; the
         # shard_map body then all-gathers over fsdp explicitly.
-        wspec = partial(self.get_moe_spec, fsdp_shards_experts=gather_expert_weights_over_fsdp)
+        wspec = partial(
+            self.get_moe_spec,
+            fsdp_shards_experts=gather_expert_weights_over_fsdp,
+            module_view=compound_expert_axis,
+        )
 
         def _wspec_for(kernel_arg, direction):
             """Weight spec; quantized (codes, scales) tuples get a matching
@@ -2298,7 +2385,13 @@ class BaseMoeModule(spx.Module, ABC):
                     if dense_gmm_tile_fallback and not use_quantized_ragged_dot:
                         training_cfg = _training_gmm_config(rows, kernel)
                         if training_cfg is not None:
-                            return grouped_matmul(rows, kernel, group_sizes, **dict(gmm_kws, cfg=training_cfg))
+                            return _xla_forward_pallas_backward_gmm(
+                                rows,
+                                kernel,
+                                group_sizes,
+                                xla_kws=gmm_kws,
+                                pallas_kws=dict(gmm_kws, cfg=training_cfg),
+                            )
                     return grouped_matmul(rows, kernel, group_sizes, **gmm_kws)
 
                 x_rows = _mask_dispatch_tail(x_rows, group_sizes)
