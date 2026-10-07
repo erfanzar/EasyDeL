@@ -52,7 +52,21 @@ from easydel.modules.deepseek_v41 import DeepseekV41Config, DeepseekV41DSpark
 from easydel.modules.deepseek_v41.modeling_deepseek_v41_dspark import DeepseekV41DSparkDrafter
 from easydel.utils import set_inference_mode
 
+try:
+    from tests.modules import _deepseek_v41_reference as ref
+except ImportError:  # pragma: no cover
+    from modules import _deepseek_v41_reference as ref  # pyright: ignore[reportMissingImports]
+
 VOCAB = 256
+_ENGRAM_KEYS = (
+    "engram_layer_ids",
+    "engram_vocab_size",
+    "engram_n_heads",
+    "engram_head_dim",
+    "engram_max_ngram_size",
+    "engram_compressed_vocab_size",
+    "engram_pad_token_id",
+)
 BLOCK = 3
 _REFERENCE_PAD_LEN = 64
 STEP_BUDGET = 256
@@ -68,8 +82,18 @@ WAVE2 = [
 WAVES = (WAVE1, WAVE2)
 
 
-def _make_tiny_v41():
+def _engram_kwargs(engram: bool) -> dict:
+    """Engram fields of the reference ``engram`` case (n-gram hash side inputs every step), or none."""
+    if not engram:
+        return {"engram_layer_ids": []}
+    kwargs = {k: v for k, v in ref.case_config_kwargs("engram").items() if k in _ENGRAM_KEYS}
+    assert kwargs["engram_compressed_vocab_size"] == VOCAB and kwargs["engram_layer_ids"]
+    return kwargs
+
+
+def _make_tiny_v41(engram: bool = False, *, ced: bool = True):
     cfg = DeepseekV41Config(
+        ced_prefill_skip=ced,
         vocab_size=VOCAB,
         hidden_size=64,
         num_hidden_layers=6,
@@ -97,7 +121,7 @@ def _make_tiny_v41():
         hc_sinkhorn_iters=5,
         sliding_window=8,
         rms_norm_eps=1e-6,
-        engram_layer_ids=[],
+        **_engram_kwargs(engram),
         dspark_block_size=BLOCK,
         dspark_target_layer_ids=[3, 4, 5],
         dspark_noise_token_id=VOCAB - 1,
@@ -147,29 +171,50 @@ class _OracleDrafter(DeepseekV41DSparkDrafter):
         self.windows = 0
         self.records: list[tuple[str, int, int, list[int]]] = []
 
-    def draft_window(self, **kwargs) -> list[int]:
-        real = super().draft_window(**kwargs)  # the DSpark network runs and the rings advance as in production
+    def _oracle(self, req_id: str, position: int, seed_token: int, k: int, real: list[int]) -> list[int]:
         if not real:
             return []
-        req_id, position, k = str(kwargs["req_id"]), int(kwargs["seed_position"]), int(kwargs["k"])
-        sequence = self.sequences[req_id]
+        sequence = self.sequences[str(req_id)]
         if position + 1 >= len(sequence):
             # The scheduler can ask for a window seeded by the request's final token; the baseline has no
-            # continuation there, so the oracle proposes nothing (the real DSpark call above already ran).
+            # continuation there, so the oracle proposes nothing (the real DSpark call already ran).
             return []
-        assert int(kwargs["seed_token"]) == sequence[position + 1], "seed is not the baseline token"
-        self.records.append((req_id, position, int(kwargs["seed_token"]), list(real)))
-        oracle = list(sequence[position + 2 : position + 2 + k])
+        assert int(seed_token) == sequence[position + 1], "seed is not the baseline token"
+        self.records.append((str(req_id), int(position), int(seed_token), list(real)))
+        oracle = list(sequence[position + 2 : position + 2 + int(k)])
         self.windows += 1
         if len(oracle) >= 2 and self.windows % self.corrupt_every == 0:
             oracle[1] = (oracle[1] + 1) % VOCAB  # accepted == 1, then a rejection
         return oracle
 
+    def draft_window(self, **kwargs) -> list[int]:
+        real = super().draft_window(**kwargs)  # the DSpark network runs and the rings advance as in production
+        return self._oracle(
+            str(kwargs["req_id"]), int(kwargs["seed_position"]), int(kwargs["seed_token"]), int(kwargs["k"]), real
+        )
+
+    def draft_windows(self, hidden, entries) -> list[list[int]]:
+        self.batched_calls = getattr(self, "batched_calls", 0) + 1
+        reals = super().draft_windows(hidden, entries)  # the batched production path runs
+        return [
+            self._oracle(str(rid), int(pos), int(tok), int(k), real)
+            for (rid, _row, tok, pos, _off, _start, _n, k), real in zip(entries, reals, strict=True)
+        ]
+
 
 class _Harness:
     """Real runner + scheduler, optionally with a drafter."""
 
-    def __init__(self, model, *, drafter=None):
+    def __init__(
+        self,
+        model,
+        *,
+        drafter=None,
+        max_num_seqs: int = 2,
+        min_token_pad: int = 16,
+        min_input_pad: int = 1,
+        use_aot_forward: bool = False,
+    ):
         self.runner = eSurgeRunner(
             model=model,
             hbm_utilization=0.02,
@@ -177,12 +222,12 @@ class _Harness:
             max_cache_tokens=2048,
             max_model_len=128,
             max_num_batched_tokens=64,
-            min_input_pad=1,
-            min_token_pad=16,
-            max_num_seqs=2,
-            max_num_seq_buckets=[2],
+            min_input_pad=min_input_pad,
+            min_token_pad=min_token_pad,
+            max_num_seqs=max_num_seqs,
+            max_num_seq_buckets=[max_num_seqs],
             async_scheduling=False,
-            use_aot_forward=False,
+            use_aot_forward=use_aot_forward,
             verbose=False,
             enable_overlap_execution=False,
             enable_sampler_metrics=False,
@@ -319,6 +364,8 @@ def test_oracle_dspark_drafter_accepts_rejects_and_matches_draft_model(tiny_v41_
         )
         assert accepted > 0, "no draft was ever accepted: the acceptance path was not exercised"
         assert accepted < generated, "no draft was ever rejected: the rollback path was not exercised"
+        assert getattr(drafter, "batched_calls", 0) > 0, "the batched whole-block draft path never ran"
+        assert runner.spec.num_replay_free_commits > 0, "rejected windows never took the replay-free rollback"
     finally:
         harness.close()
     assert served == baseline, {k: (served[k], baseline[k]) for k in baseline if served[k] != baseline[k]}
@@ -341,3 +388,179 @@ def test_oracle_dspark_drafter_accepts_rejects_and_matches_draft_model(tiny_v41_
         assert real == expected, (req_id, position, real, expected)
         checked += 1
     assert checked > 0, "no draft window could be compared with the draft model"
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Eight concurrent requests: verify windows of every slot share one packed step (more tokens than slots), which is the
+# regime where the CED decoder-tail plan is active. Every arm must reproduce plain serving with every layer run.
+# ----------------------------------------------------------------------------------------------------------------------
+
+WAVE8 = [
+    {"id": "c8-0", "prompt_token_ids": [3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5], "max_tokens": 14},
+    {"id": "c8-1", "prompt_token_ids": [10, 11, 12, 13, 14], "max_tokens": 12},
+    {"id": "c8-2", "prompt_token_ids": [42, 7, 99, 5, 23, 55, 8, 13], "max_tokens": 13},
+    {"id": "c8-3", "prompt_token_ids": [21, 34, 2], "max_tokens": 15},
+    {"id": "c8-4", "prompt_token_ids": [200, 17, 64, 128, 31, 77], "max_tokens": 11},
+    {"id": "c8-5", "prompt_token_ids": [9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 19, 29], "max_tokens": 16},
+    {"id": "c8-6", "prompt_token_ids": [150, 151], "max_tokens": 12},
+    {"id": "c8-7", "prompt_token_ids": [88, 44, 22, 11, 66, 33, 99], "max_tokens": 14},
+]
+
+
+@pytest.fixture(scope="module")
+def tiny_v41_model_no_ced():
+    return _make_tiny_v41(ced=False)
+
+
+@pytest.fixture(scope="module")
+def baseline8(tiny_v41_model_no_ced) -> dict[str, list[int]]:
+    """Plain greedy outputs of eight concurrent requests with every decoder layer run (CED off)."""
+    harness = _Harness(tiny_v41_model_no_ced, max_num_seqs=8)
+    try:
+        served = {s["id"]: toks for s, toks in zip(WAVE8, harness.generate_greedy(WAVE8), strict=True)}
+    finally:
+        harness.close()
+    assert all(len(set(toks)) > 1 for toks in served.values()), served
+    return served
+
+
+@pytest.mark.parametrize(
+    ("ced", "spec"),
+    [(True, False), (False, True), (True, True)],
+    ids=["plain-ced", "oracle-no-ced", "oracle-ced"],
+)
+def test_eight_concurrent_requests_match_full_model(tiny_v41_model, tiny_v41_model_no_ced, baseline8, ced, spec):
+    """Eight slots, CED on/off, with and without DSpark verify windows: greedy output equals the full-model baseline."""
+    model = tiny_v41_model if ced else tiny_v41_model_no_ced
+    assert bool(model.config.ced_prefill_skip) is ced
+    drafter = None
+    if spec:
+        prompts = {s["id"]: s["prompt_token_ids"] for s in WAVE8}
+        sequences = {rid: list(prompts[rid]) + baseline8[rid] for rid in baseline8}
+        drafter = _OracleDrafter(
+            target_model=model,
+            dspark=_build_dspark(model),
+            num_draft_tokens=BLOCK,
+            sequences=sequences,
+            corrupt_every=3,
+        )
+    harness = _Harness(model, drafter=drafter, max_num_seqs=8)
+    try:
+        served = {s["id"]: toks for s, toks in zip(WAVE8, harness.generate_greedy(WAVE8), strict=True)}
+        if spec:
+            runner = harness.runner
+            generated = runner.spec_decode_num_drafts_generated
+            accepted = runner.spec_decode_num_drafts_accepted
+            print(f"[dspark c8 ced={ced}] generated={generated} accepted={accepted}")
+            assert 0 < accepted < generated, "both acceptance and rollback must be exercised"
+            assert getattr(drafter, "batched_calls", 0) > 0, "the batched whole-block draft path never ran"
+            assert runner.spec.num_replay_free_commits > 0, "rejected windows never took the replay-free rollback"
+    finally:
+        harness.close()
+    assert served == baseline8, {k: (served[k], baseline8[k]) for k in baseline8 if served[k] != baseline8[k]}
+
+
+def test_single_request_verify_in_slot_sized_bucket_matches_full_model(tiny_v41_model, baseline8):
+    """One request at a time on 8 slots with 8-token and 8-request bucket floors (as eSurge's default
+    ``min_input_pad=16`` pads a single request on an 8-slot engine): each verify window (1 + k tokens on ONE slot)
+    lands in an ``8 tokens / 8 reqs`` bucket, traced under the decode-layout scope, and the packed path walks the
+    slot's columns one at a time (the serving regime of a single request). Greedy output must equal the full-model
+    baseline."""
+    model = tiny_v41_model
+    prompts = {s["id"]: s["prompt_token_ids"] for s in WAVE8}
+    sequences = {rid: list(prompts[rid]) + baseline8[rid] for rid in baseline8}
+    drafter = _OracleDrafter(
+        target_model=model,
+        dspark=_build_dspark(model),
+        num_draft_tokens=BLOCK,
+        sequences=sequences,
+        corrupt_every=3,
+    )
+    # AOT like the real engine: only the AOT executable is the trace made under the decode-layout scope.
+    harness = _Harness(model, drafter=drafter, max_num_seqs=8, min_token_pad=8, min_input_pad=8, use_aot_forward=True)
+    try:
+        assert min(harness.runner.num_tokens_paddings) <= 8, harness.runner.num_tokens_paddings
+        served = {s["id"]: harness.generate_greedy([s])[0] for s in WAVE8}
+        runner = harness.runner
+        generated = runner.spec_decode_num_drafts_generated
+        accepted = runner.spec_decode_num_drafts_accepted
+        print(
+            f"[dspark single-slot verify] generated={generated} accepted={accepted} "
+            f"replay_free={runner.spec.num_replay_free_commits}"
+        )
+        assert 0 < accepted < generated, "both acceptance and rollback must be exercised"
+        assert runner.spec.num_replay_free_commits > 0, "rejected windows never took the replay-free rollback"
+    finally:
+        harness.close()
+    assert served == baseline8, {k: (served[k], baseline8[k]) for k in baseline8 if served[k] != baseline8[k]}
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Engram: per-token side inputs (n-gram hash ids) on the verify window AND on every replay / suffix re-sample forward.
+# Plain engram serving is pinned to the stateless reference by ``test_deepseek_v41_engram_serving.py``; here speculative
+# serving must reproduce plain engram serving exactly.
+# ----------------------------------------------------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def tiny_v41_engram_model():
+    return _make_tiny_v41(engram=True)
+
+
+@pytest.fixture(scope="module")
+def engram_baseline(tiny_v41_engram_model) -> dict[str, list[int]]:
+    """Greedy outputs of every request on the engram model without speculation."""
+    harness = _Harness(tiny_v41_engram_model)
+    try:
+        served = harness.run_waves()
+        assert harness.runner._side_input_provider is not None  # the side-input path actually ran
+    finally:
+        harness.close()
+    assert all(len(set(toks)) > 1 for toks in served.values()), served
+    return served
+
+
+def test_engram_random_dspark_drafter_matches_baseline(tiny_v41_engram_model, engram_baseline):
+    """Engram model, real DSpark proposals (almost all rejected): replays carry the hash side inputs."""
+    model = tiny_v41_engram_model
+    drafter = DeepseekV41DSparkDrafter(target_model=model, dspark=_build_dspark(model), num_draft_tokens=BLOCK)
+    harness = _Harness(model, drafter=drafter)
+    try:
+        served = harness.run_waves()
+        runner = harness.runner
+        assert runner.spec_decode_num_drafts_generated > 0 and runner.spec_decode_num_verify_steps > 0
+        print(
+            f"[dspark engram random] generated={runner.spec_decode_num_drafts_generated} "
+            f"accepted={runner.spec_decode_num_drafts_accepted}"
+        )
+    finally:
+        harness.close()
+    assert served == engram_baseline, {
+        k: (served[k], engram_baseline[k]) for k in engram_baseline if served[k] != engram_baseline[k]
+    }
+
+
+def test_engram_oracle_dspark_drafter_accepts_and_rejects(tiny_v41_engram_model, engram_baseline):
+    """Engram model: accepted, partially accepted and rejected windows all reproduce plain engram serving."""
+    model = tiny_v41_engram_model
+    prompts = {s["id"]: s["prompt_token_ids"] for wave in WAVES for s in wave}
+    sequences = {rid: list(prompts[rid]) + engram_baseline[rid] for rid in engram_baseline}
+    drafter = _OracleDrafter(
+        target_model=model, dspark=_build_dspark(model), num_draft_tokens=BLOCK, sequences=sequences, corrupt_every=3
+    )
+    harness = _Harness(model, drafter=drafter)
+    try:
+        served = harness.run_waves()
+        runner = harness.runner
+        generated = runner.spec_decode_num_drafts_generated
+        accepted = runner.spec_decode_num_drafts_accepted
+        print(f"[dspark engram oracle] generated={generated} accepted={accepted} windows={drafter.windows}")
+        assert accepted > 0, "no draft was ever accepted: the acceptance path was not exercised"
+        assert accepted < generated, "no draft was ever rejected: the rollback path was not exercised"
+        assert getattr(drafter, "batched_calls", 0) > 0, "the batched whole-block draft path never ran"
+        assert runner.spec.num_replay_free_commits > 0, "rejected windows never took the replay-free rollback"
+    finally:
+        harness.close()
+    assert served == engram_baseline, {
+        k: (served[k], engram_baseline[k]) for k in engram_baseline if served[k] != engram_baseline[k]
+    }

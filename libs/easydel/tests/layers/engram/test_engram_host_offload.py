@@ -19,7 +19,7 @@ import jax
 import numpy as np
 import pytest
 import spectrax as spx
-from easydel.layers.embeddings import GatedEngram, GatedEngramConfig
+from easydel.layers.engram import GatedEngram, GatedEngramConfig
 from jax import numpy as jnp
 
 ROWS = 3_000_000

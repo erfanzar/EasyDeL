@@ -26,7 +26,7 @@ Relative to DeepSeek-V4:
 - No per-head query RMSNorm.
 - Hyper-connection read gates are applied one sublayer late: attention collapses the streams with the previous
   layer's FFN ``pre``, the FFN with this layer's attention ``pre``; there is no learned ``hc_head``.
-- Engram n-gram embeddings on ``engram_layer_ids``. The n-gram hashing runs on the host (``_engram_hash``); its ids
+- Engram n-gram embeddings on ``engram_layer_ids``. The n-gram hashing runs on the host (``easydel.layers.engram``); its ids
   are passed in as ``engram_hash_ids``.
 - MoE is V4's learned top-k block on every layer (no hash routing).
 
@@ -96,7 +96,7 @@ from easydel.layers.compressed_window import (
     sink_attention,
     tokens_to_grid,
 )
-from easydel.layers.embeddings import GatedEngram, GatedEngramConfig
+from easydel.layers.engram import EngramModelMixin, GatedEngram
 from easydel.layers.indexer import (
     IndexerScoreInputs,
     SharedKeyIndexer,
@@ -139,6 +139,107 @@ from .modeling_deepseek_v41_vision import (
 
 _SharedState = dict[str, Array | None]
 _SHARED_KEYS = ("compress_kv", "index_k", "topk", "candidates", "indexer_aux")
+
+
+def _ced_decoder_tail(config: DeepseekV41Config) -> tuple[int, int] | None:
+    """``(first_tail_layer, reach)`` of the window-only decoder tail, or ``None`` when there is none.
+
+    The tail is every layer after the last KV source. Those layers read the shared compressed entries / index keys
+    but store nothing beyond their sliding-window ring and stream position, so prompt tokens far from the end of a
+    request only matter through the rings. With window ``W`` and ``k`` tail layers, the last token's output needs tail
+    layer ``j`` (counted from the end, ``j = 0`` the last) at positions ``>= N - W - j * (W - 1)``, so the first tail
+    layer's input is needed only for ``tokens_to_end = N - 1 - p < W + (k - 1) * (W - 1)``. The decode rings that the
+    next steps read lie inside the same range, and the first tail layer's input is the output of the last KV source,
+    which always runs: skipping the tail on steps whose tokens all lie outside ``reach`` is exact for every output a
+    serving engine keeps (the last token's logits, later decode steps, DSpark main hidden of the last window).
+    """
+    num_layers = int(config.num_hidden_layers)
+    sources = [int(s) for s in config.kv_source_layer_ids if int(s) < num_layers]
+    start = max(sources) + 1 if sources else 0
+    if start >= num_layers or any(config.owns_index_keys(i) for i in range(start, num_layers)):
+        return None
+    window = int(config.sliding_window)
+    return start, window + (num_layers - start - 1) * (window - 1)
+
+
+#: A CED step whose live tokens fit in ``bucket // _CED_COMPACT_DIVISOR`` (at least ``num_slots``) runs the decoder
+#: tail on that many compacted tokens instead of the whole bucket.
+_CED_COMPACT_DIVISOR = 8
+
+
+class _CedCompactPlan(tp.NamedTuple):
+    """Packed sub-stream of a step's live tokens (see :func:`_ced_compact_plan`).
+
+    Attributes:
+        token_index: ``[L]`` int32 packed index of each compacted token; ``T`` (out of range) past the live count.
+        meta: Packed token-to-slot mapping of the compacted stream.
+        col_offset: ``[num_slots]`` int32 grid column of each slot's first live token in the full step.
+    """
+
+    token_index: Array
+    meta: DeepseekV4PackedMeta
+    col_offset: Array
+
+
+def _ced_compact_plan(
+    live: Bool[Array, " tokens"],
+    query_start_loc: Array,
+    num_seqs: Array,
+    recurrent_state_indices: Array | None,
+    position_ids: Array,
+    num_slots: int,
+    length: int,
+) -> _CedCompactPlan:
+    """Compact a packed step to its live tokens, keeping each request's tokens contiguous and in order.
+
+    A request's live tokens are a suffix of its scheduled chunk (``tokens_to_end`` falls with position), so the
+    compacted stream is again a valid packed stream: row ``r`` keeps its last ``live_r`` tokens at their real positions,
+    and every per-column grid of the full step maps to it by shifting slot ``s`` left by ``col_offset[s]``.
+
+    Args:
+        live: ``[T]`` bool, real tokens the decoder tail must compute.
+        query_start_loc: ``[R + 1]`` cumulative scheduled-token offsets of the full step.
+        num_seqs: ``[1]`` live request count.
+        recurrent_state_indices: Cache slot per request row, or ``None`` for row identity.
+        position_ids: ``[1, T]`` packed positions.
+        num_slots: Static number of cache slots.
+        length: Static compacted length ``L`` (callers ensure the live count fits).
+
+    Returns:
+        The compaction plan.
+    """
+    total = live.shape[0]
+    qsl = query_start_loc.astype(jnp.int32).reshape(-1)
+    num_rows = qsl.shape[0] - 1
+    token_idx = jnp.arange(total, dtype=jnp.int32)
+    row_of_token = jnp.clip(jnp.searchsorted(qsl, token_idx, side="right") - 1, 0, num_rows - 1)
+    live_per_row = jax.ops.segment_sum(live.astype(jnp.int32), row_of_token, num_segments=num_rows)
+    new_qsl = jnp.concatenate([jnp.zeros((1,), jnp.int32), jnp.cumsum(live_per_row).astype(jnp.int32)])
+    index = jnp.flatnonzero(live, size=length, fill_value=total).astype(jnp.int32)
+    positions = jnp.take(position_ids.astype(jnp.int32).reshape(-1), index, mode="clip")[None]
+    meta = _build_packed_meta(
+        query_start_loc=new_qsl,
+        num_seqs=num_seqs,
+        recurrent_state_indices=recurrent_state_indices,
+        position_ids=positions,
+        num_slots=num_slots,
+    )
+    if recurrent_state_indices is None:
+        slots_by_row = jnp.arange(num_rows, dtype=jnp.int32)
+    else:
+        slots_by_row = recurrent_state_indices.astype(jnp.int32).reshape(-1)[:num_rows]
+    live_rows = jnp.clip(num_seqs.reshape(-1)[0].astype(jnp.int32), 0, num_rows)
+    target = jnp.where(jnp.arange(num_rows, dtype=jnp.int32) < live_rows, slots_by_row, num_slots)
+    dead_prefix = (qsl[1:] - qsl[:-1]) - live_per_row
+    col_offset = jnp.zeros((num_slots,), jnp.int32).at[target].set(dead_prefix, mode="drop")
+    return _CedCompactPlan(index, meta, col_offset)
+
+
+def _ced_shift_grid(grid: Array, col_offset: Array) -> Array:
+    """Shift a per-column ``[num_slots, width, ...]`` grid left by ``col_offset[slot]`` (same width, edge-clipped)."""
+    width = grid.shape[1]
+    cols = jnp.clip(jnp.arange(width, dtype=jnp.int32)[None, :] + col_offset[:, None], 0, width - 1)
+    return jax.vmap(lambda g, c: jnp.take(g, c, axis=0))(grid, cols)
 
 
 def _linear_kwargs(config: DeepseekV41Config, dtype, param_dtype, precision, rngs) -> dict[str, tp.Any]:
@@ -555,8 +656,9 @@ class DeepseekV41Attention(spx.Module):
         ratio = self.ratio
         if live is None:
             live = jnp.ones((batch,), dtype=bool)
+        projections = self.compressor.project(hidden_states) if ratio > 1 else None
         latent, kv_state, score_state, closed, entry = self.compressor.decode_step(
-            hidden_states, view.compressor_kv_state, view.compressor_score_state, position
+            hidden_states, view.compressor_kv_state, view.compressor_score_state, position, projections=projections
         )
         closed = closed & live
         if ratio > 1:
@@ -566,6 +668,7 @@ class DeepseekV41Attention(spx.Module):
             view = view.replace(
                 compressor_kv_state=self._replicate(kv_state), compressor_score_state=self._replicate(score_state)
             )
+            view = self._write_trace(view, projections, position[:, None], live[:, None])
         # A latent stands for the first token of its group: group g is roped at position g * ratio.
         cos_g, sin_g = _rope_cos_sin(self.config, "compress", (entry * ratio)[:, None], dtype)
         target = jnp.where(closed, entry, view.compressed_kv.shape[1])
@@ -586,6 +689,33 @@ class DeepseekV41Attention(spx.Module):
             keys = self._slot(self.indexer.index_keys(latent, cos_g, sin_g)[:, 0].astype(view.index_k.dtype), view)
             updates["index_k"] = self._slot(view.index_k.at[rows, target].set(keys, mode="drop"), view)
         return view.replace(**updates)
+
+    def _write_trace(
+        self,
+        view: SharedCompressedWindowCacheView,
+        projections: tuple[Array, Array],
+        positions: Array,
+        valid: Array,
+    ) -> SharedCompressedWindowCacheView:
+        """Record each valid cell's fp32 compressor projections at trace slot ``position % trace_len`` (opt-in).
+
+        Feeds :func:`~easydel.caching.compressed_window.commit_speculative_window`; a no-op without a trace. Only a
+        verify window (at most ``trace_len`` tokens per row) is ever read back, so wider prefill blocks may alias.
+        """
+        if view.compressor_trace_kv is None:
+            return view
+        kv_t, score_t = projections  # fp32 [S, blk, D]
+        trace_len = view.compressor_trace_kv.shape[1]
+        rows = jnp.arange(positions.shape[0])[:, None]
+        slot = jnp.where(valid, positions.astype(jnp.int32) % trace_len, trace_len)
+        return view.replace(
+            compressor_trace_kv=self._replicate(
+                view.compressor_trace_kv.at[rows, slot].set(kv_t.astype(jnp.float32), mode="drop")
+            ),
+            compressor_trace_score=self._replicate(
+                view.compressor_trace_score.at[rows, slot].set(score_t.astype(jnp.float32), mode="drop")
+            ),
+        )
 
     def _replicate(self, x: Array | None) -> Array | None:
         """Constrain a cache buffer (or its update rows) to the replicated cache layout on the model mesh."""
@@ -780,13 +910,20 @@ class DeepseekV41Attention(spx.Module):
         rows = jnp.arange(slots)[:, None]
         dtype = hidden_states.dtype
         # Block grouping / open-group state refresh is the shared compressor's ``extend_step``.
+        projections = self.compressor.project(hidden_states) if ratio > 1 else None
         latent, kv_state, score_state, closed, entry = self.compressor.extend_step(
-            hidden_states, view.compressor_kv_state, view.compressor_score_state, positions, valid
+            hidden_states,
+            view.compressor_kv_state,
+            view.compressor_score_state,
+            positions,
+            valid,
+            projections=projections,
         )
         if ratio > 1:
             view = view.replace(
                 compressor_kv_state=self._replicate(kv_state), compressor_score_state=self._replicate(score_state)
             )
+            view = self._write_trace(view, projections, positions, valid)
         cos_g, sin_g = _rope_cos_sin(self.config, "compress", entry * ratio, dtype)
         target = jnp.where(closed, entry, view.compressed_kv.shape[1])
         compressed = _apply_interleaved_rope(latent[:, None], cos_g, sin_g, unsqueeze_dim=1)[:, 0]
@@ -927,118 +1064,140 @@ class DeepseekV41Attention(spx.Module):
         slot_tok, col_tok = meta.slot_of_token, meta.col_of_token
         # Shared packed driver: pure decode buckets (at most one token per slot) keep the single-column path (Pallas
         # selector, no wasted cells); prefill / mixed buckets advance blocks of columns at once.
-        block = packed_block_size(total, num_slots, self.sliding_window)
-        width = -(-total // block) * block
+        # Cap the block at one slot's share of the bucket: verify windows (1 + k tokens per slot) otherwise paid a
+        # bucket-wide block of per-cell top-k gathers (~87% padding at k=5 over 8 slots).
+        shared_in = shared
 
-        def to_grid(values: Array) -> Array:
-            return tokens_to_grid(values, slot_tok, col_tok, num_slots, width)
+        def _grid(view: SharedCompressedWindowCacheView, block: int):
+            """Advance every slot through the occupied grid columns, ``block`` columns per loop step."""
+            width = -(-total // block) * block
 
-        def pad_cols(grid: Array) -> Array:
-            return grid if width == total else jnp.pad(grid, ((0, 0), (0, width - total)))
+            def to_grid(values: Array) -> Array:
+                return tokens_to_grid(values, slot_tok, col_tok, num_slots, width)
 
-        hidden_grid = to_grid(hidden_states[0])
-        qres_grid = to_grid(q_residual[0])
-        q_grid = to_grid(q[0].transpose(1, 0, 2))  # [S, T, H, D]
-        kv_grid = to_grid(kv[0])
-        cos_grid = to_grid(cos[0])
-        sin_grid = to_grid(sin[0])
-        pos_grid = pad_cols(meta.positions_grid)
-        valid_grid = pad_cols(meta.valid_grid)
+            def pad_cols(grid: Array) -> Array:
+                return grid if width == total else jnp.pad(grid, ((0, 0), (0, width - total)))
 
-        shared = dict(shared)
-        if self.ratio > 0 and self.compressor is not None:
-            shared["compress_kv"] = view.compressed_kv
-            shared["index_k"] = view.index_k
-        index_k = shared.get("index_k")
-        entries = 0 if index_k is None else index_k.shape[1]
-        has_indexer = self.ratio > 0 and self.indexer is not None
-        publishes = has_indexer and self.indexer.is_candidate_source
-        k = min(self.indexer.index_topk, entries) if has_indexer else 0
-        topk_grid = jnp.full((num_slots, width, k), -1, dtype=jnp.int32)
-        cand_width = self.indexer.candidate_width(entries) if publishes else 0
-        cand_grid = jnp.full((num_slots, width, cand_width), -1, dtype=jnp.int32)
+            hidden_grid = to_grid(hidden_states[0])
+            qres_grid = to_grid(q_residual[0])
+            q_grid = to_grid(q[0].transpose(1, 0, 2))  # [S, T, H, D]
+            kv_grid = to_grid(kv[0])
+            cos_grid = to_grid(cos[0])
+            sin_grid = to_grid(sin[0])
+            pos_grid = pad_cols(meta.positions_grid)
+            valid_grid = pad_cols(meta.valid_grid)
 
-        num_used = occupied_columns(valid_grid)
-        acc = jnp.zeros((width, num_slots, self.num_heads, self.head_dim), dtype=view.window_kv.dtype)
-
-        def column(grid: Array, col: Array) -> Array:
-            return jax.lax.dynamic_slice_in_dim(grid, col, 1, axis=1)
-
-        def block_step(start: Array, carry):
-            v, acc, tgrid, cgrid = carry
-
-            def cols(grid: Array) -> Array:
-                return jax.lax.dynamic_slice_in_dim(grid, start, block, axis=1)
-
-            blk_shared = dict(shared)
-            if self.ratio > 0:
-                if self.indexer is None:
-                    blk_shared["topk"] = cols(shared["topk"])
-                elif self.indexer.uses_candidates:
-                    blk_shared["candidates"] = cols(shared["candidates"])
-            attn, out_shared, v = self._extend(
-                cols(hidden_grid),
-                cols(q_grid).transpose(0, 2, 1, 3),
-                cols(kv_grid),
-                cols(qres_grid),
-                cols(cos_grid),
-                cols(sin_grid),
-                cols(pos_grid),
-                cols(valid_grid),
-                blk_shared,
-                v,
-            )
-            acc = jax.lax.dynamic_update_slice_in_dim(acc, attn.transpose(2, 0, 1, 3).astype(acc.dtype), start, axis=0)
-            if has_indexer:
-                tgrid = jax.lax.dynamic_update_slice_in_dim(tgrid, out_shared["topk"], start, axis=1)
-                if publishes:
-                    cgrid = jax.lax.dynamic_update_slice_in_dim(cgrid, out_shared["candidates"], start, axis=1)
-            return v, acc, tgrid, cgrid
-
-        def column_step(col: Array, carry):
-            v, acc, tgrid, cgrid = carry
-            col_shared = dict(shared)
-            if self.ratio > 0:
-                if self.indexer is None:
-                    col_shared["topk"] = column(shared["topk"], col)
-                elif self.indexer.uses_candidates:
-                    col_shared["candidates"] = column(shared["candidates"], col)
-            q_col = jax.lax.dynamic_index_in_dim(q_grid, col, axis=1, keepdims=False)[:, :, None, :]
-            attn, out_shared, v = self._decode(
-                column(hidden_grid, col),
-                q_col,
-                column(kv_grid, col),
-                column(qres_grid, col),
-                column(cos_grid, col),
-                column(sin_grid, col),
-                column(pos_grid, col),
-                col_shared,
-                v,
-                valid=jax.lax.dynamic_index_in_dim(valid_grid, col, axis=1, keepdims=False),
-            )
-            acc = jax.lax.dynamic_update_index_in_dim(acc, attn[:, :, 0, :].astype(acc.dtype), col, axis=0)
-            if has_indexer:
-                tgrid = jax.lax.dynamic_update_slice_in_dim(tgrid, out_shared["topk"], col, axis=1)
-                if publishes:
-                    cgrid = jax.lax.dynamic_update_slice_in_dim(cgrid, out_shared["candidates"], col, axis=1)
-            return v, acc, tgrid, cgrid
-
-        view, acc, topk_grid, cand_grid = run_column_blocks(
-            block_step if block > 1 else column_step,
-            (view, acc, topk_grid, cand_grid),
-            num_used=num_used,
-            block=block,
-        )
-        if self.ratio > 0:
-            if self.compressor is not None:
+            shared = dict(shared_in)
+            if self.ratio > 0 and self.compressor is not None:
                 shared["compress_kv"] = view.compressed_kv
                 shared["index_k"] = view.index_k
-            if has_indexer:
-                shared["topk"] = topk_grid
-                if publishes:
-                    shared["candidates"] = cand_grid
-        attn = grid_to_tokens(acc, slot_tok, col_tok, num_slots)[None]  # [1, T, H, D]
-        return attn.transpose(0, 2, 1, 3), shared, view
+            index_k = shared.get("index_k")
+            entries = 0 if index_k is None else index_k.shape[1]
+            has_indexer = self.ratio > 0 and self.indexer is not None
+            publishes = has_indexer and self.indexer.is_candidate_source
+            k = min(self.indexer.index_topk, entries) if has_indexer else 0
+            topk_grid = jnp.full((num_slots, width, k), -1, dtype=jnp.int32)
+            cand_width = self.indexer.candidate_width(entries) if publishes else 0
+            cand_grid = jnp.full((num_slots, width, cand_width), -1, dtype=jnp.int32)
+
+            num_used = occupied_columns(valid_grid)
+            acc = jnp.zeros((width, num_slots, self.num_heads, self.head_dim), dtype=view.window_kv.dtype)
+
+            def column(grid: Array, col: Array) -> Array:
+                return jax.lax.dynamic_slice_in_dim(grid, col, 1, axis=1)
+
+            def block_step(start: Array, carry):
+                v, acc, tgrid, cgrid = carry
+
+                def cols(grid: Array) -> Array:
+                    return jax.lax.dynamic_slice_in_dim(grid, start, block, axis=1)
+
+                blk_shared = dict(shared)
+                if self.ratio > 0:
+                    if self.indexer is None:
+                        blk_shared["topk"] = cols(shared["topk"])
+                    elif self.indexer.uses_candidates:
+                        blk_shared["candidates"] = cols(shared["candidates"])
+                attn, out_shared, v = self._extend(
+                    cols(hidden_grid),
+                    cols(q_grid).transpose(0, 2, 1, 3),
+                    cols(kv_grid),
+                    cols(qres_grid),
+                    cols(cos_grid),
+                    cols(sin_grid),
+                    cols(pos_grid),
+                    cols(valid_grid),
+                    blk_shared,
+                    v,
+                )
+                acc = jax.lax.dynamic_update_slice_in_dim(
+                    acc, attn.transpose(2, 0, 1, 3).astype(acc.dtype), start, axis=0
+                )
+                if has_indexer:
+                    tgrid = jax.lax.dynamic_update_slice_in_dim(tgrid, out_shared["topk"], start, axis=1)
+                    if publishes:
+                        cgrid = jax.lax.dynamic_update_slice_in_dim(cgrid, out_shared["candidates"], start, axis=1)
+                return v, acc, tgrid, cgrid
+
+            def column_step(col: Array, carry):
+                v, acc, tgrid, cgrid = carry
+                col_shared = dict(shared)
+                if self.ratio > 0:
+                    if self.indexer is None:
+                        col_shared["topk"] = column(shared["topk"], col)
+                    elif self.indexer.uses_candidates:
+                        col_shared["candidates"] = column(shared["candidates"], col)
+                q_col = jax.lax.dynamic_index_in_dim(q_grid, col, axis=1, keepdims=False)[:, :, None, :]
+                attn, out_shared, v = self._decode(
+                    column(hidden_grid, col),
+                    q_col,
+                    column(kv_grid, col),
+                    column(qres_grid, col),
+                    column(cos_grid, col),
+                    column(sin_grid, col),
+                    column(pos_grid, col),
+                    col_shared,
+                    v,
+                    valid=jax.lax.dynamic_index_in_dim(valid_grid, col, axis=1, keepdims=False),
+                )
+                acc = jax.lax.dynamic_update_index_in_dim(acc, attn[:, :, 0, :].astype(acc.dtype), col, axis=0)
+                if has_indexer:
+                    tgrid = jax.lax.dynamic_update_slice_in_dim(tgrid, out_shared["topk"], col, axis=1)
+                    if publishes:
+                        cgrid = jax.lax.dynamic_update_slice_in_dim(cgrid, out_shared["candidates"], col, axis=1)
+                return v, acc, tgrid, cgrid
+
+            view, acc, topk_grid, cand_grid = run_column_blocks(
+                block_step if block > 1 else column_step,
+                (view, acc, topk_grid, cand_grid),
+                num_used=num_used,
+                block=block,
+            )
+            if self.ratio > 0:
+                if self.compressor is not None:
+                    shared["compress_kv"] = view.compressed_kv
+                    shared["index_k"] = view.index_k
+                if has_indexer:
+                    shared["topk"] = topk_grid
+                    if publishes:
+                        shared["candidates"] = cand_grid
+            attn = grid_to_tokens(acc, slot_tok, col_tok, num_slots)[None]  # [1, T, H, D]
+            return attn.transpose(0, 2, 1, 3), shared, view
+
+        block = packed_block_size(total, num_slots, self.sliding_window, cap_by_slot_share=True)
+        if block == 1 and 1 < total <= self.sliding_window:
+            # A bucket with no more tokens than slots is usually pure decode (one token per slot: the single-column
+            # path). A speculative verify window puts 1 + k tokens on ONE slot of such a bucket, and walking those
+            # columns one at a time ran `_decode` (with its per-layer gathers and all-to-alls) 1 + k times over every
+            # slot. Choose at run time: the column path when at most one column is occupied, else one block of all
+            # columns. Both branches use grid width `total`, so the selections they publish have the same shape.
+            return jax.lax.cond(
+                occupied_columns(meta.valid_grid) <= 1,
+                lambda v: _grid(v, 1),
+                lambda v: _grid(v, total),
+                view,
+            )
+        return _grid(view, block)
 
     def forward(
         self,
@@ -1056,7 +1215,13 @@ class DeepseekV41Attention(spx.Module):
         q_residual = self.q_a_norm(self.q_a_proj(hidden_states))
         q = self.q_b_proj(q_residual).reshape(batch, seq, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
         q = _apply_interleaved_rope(q, cos, sin, unsqueeze_dim=1)
-        kv = self.kv_norm(self.kv_proj(hidden_states))[:, None]
+        kv = self.kv_proj(hidden_states)
+        if cache_view is not None:
+            # Serving: gather the single KV head (a few KB per token) once. Left column-sharded over tp, the RoPE cut at
+            # 448/64 channels falls inside a 128-channel shard and XLA reshuffles it through two tp all-to-alls plus
+            # relayout copies per layer (~0.73 ms of a V4.1 tp=4 decode step). Layout only; the math is unchanged.
+            kv = self._replicate(kv)
+        kv = self.kv_norm(kv)[:, None]
         kv = _apply_interleaved_rope(kv, cos, sin, unsqueeze_dim=1)[:, 0]
 
         if cache_view is not None and packed_meta is not None:
@@ -1078,46 +1243,6 @@ class DeepseekV41Attention(spx.Module):
         attn_output = _apply_interleaved_rope(attn_output.transpose(0, 2, 1, 3), cos, -sin, unsqueeze_dim=2)
         grouped = self.o_a_proj(attn_output.reshape(batch, seq, self.config.o_groups, -1)).reshape(batch, seq, -1)
         return checkpoint_name(self.o_b_proj(grouped), "attn_output"), shared, cache_view
-
-
-class DeepseekV41Engram(GatedEngram):
-    """V4.1 binding of :class:`~easydel.layers.embeddings.GatedEngram` (reference ``Engram``).
-
-    Gated n-gram hash embedding written into the hyper-connection streams.
-
-    The hash ids fetch ``(max_ngram_size - 1) * n_heads`` table rows; ``kv_proj`` maps them to one key per stream
-    plus a shared value; each stream's gate is ``sigmoid(signed_sqrt(normalized <h, w * key>))``.
-    """
-
-    def __init__(
-        self,
-        config: DeepseekV41Config,
-        layer_idx: int,
-        dtype: jnp.dtype = jnp.bfloat16,
-        param_dtype: jnp.dtype = jnp.bfloat16,
-        precision: jax.lax.PrecisionLike = None,
-        *,
-        rngs: spx.Rngs,
-    ):
-        layer_hash_index = list(config.engram_layer_ids).index(layer_idx)
-        super().__init__(
-            GatedEngramConfig(
-                hidden_size=config.hidden_size,
-                hc_mult=config.hc_mult,
-                table_rows=config.engram_table_rows()[layer_hash_index],
-                num_hash_cols=(config.engram_max_ngram_size - 1) * config.engram_n_heads,
-                head_dim=config.engram_head_dim,
-                eps=config.rms_norm_eps,
-                initializer_range=config.initializer_range,
-                table_memory_kind=config.engram_table_memory_kind,
-                table_dtype=config.engram_table_dtype,
-            ),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        self.layer_hash_index = layer_hash_index
 
 
 class DeepseekV41SparseMoeBlock(DeepseekV4SparseMoeBlock):
@@ -1256,7 +1381,7 @@ class DeepseekV41DecoderLayer(spx.Module):
         self.attn_hc = DeepseekV4HyperConnection(config, **layer_kwargs)
         self.ffn_hc = DeepseekV4HyperConnection(config, **layer_kwargs)
         self.engram = (
-            DeepseekV41Engram(config, layer_idx, **layer_kwargs) if layer_idx in config.engram_layer_ids else None
+            GatedEngram.from_config(config, layer_idx, **layer_kwargs) if layer_idx in config.engram_layer_ids else None
         )
 
     def forward(
@@ -1362,7 +1487,7 @@ def _total_aux_loss(config: DeepseekV41Config, base_aux: Array | None, indexer_a
 
 
 @register_module(TaskType.BASE_MODULE, config=DeepseekV41Config, model_type="deepseek_v41")
-class DeepseekV41Model(EasyDeLBaseModule):
+class DeepseekV41Model(EngramModelMixin, EasyDeLBaseModule):
     """DeepSeek-V4.1 decoder backbone (stateless forward, cached prefill/decode, eSurge packed serving)."""
 
     esurge_cache_family: tp.ClassVar[str] = "compressed_window"
@@ -1428,6 +1553,7 @@ class DeepseekV41Model(EasyDeLBaseModule):
         output_dspark_hidden: bool = False,
         engram_rows: Array | None = None,
         engram_scales: Array | None = None,
+        tokens_to_end: Int[Array, "batch seq_len"] | None = None,
     ) -> DeepseekV41ModelOutput:
         """Forward over the V4.1 stack (stateless, cached prefill, or one-token cached decode).
 
@@ -1456,6 +1582,10 @@ class DeepseekV41Model(EasyDeLBaseModule):
             engram_rows: Optional host-gathered fp8 row bytes ``uint8 [B, S, len(engram_layer_ids), cols, head_dim]``
                 (:meth:`gather_engram_rows`); replaces ``engram_hash_ids`` so the program does no table lookup.
             engram_scales: Their e8m0 scale bytes ``uint8 [B, S, len(engram_layer_ids), cols, head_dim // 32]``.
+            tokens_to_end: eSurge packed serving only: ``[1, T]`` distance of each token from its request's last
+                known token (``esurge_requires_tokens_to_end`` side input). With ``config.ced_prefill_skip`` a step
+                whose tokens all lie outside the decoder tail's reach skips that tail (see
+                :func:`_ced_decoder_tail`); ignored elsewhere.
 
         Returns:
             DeepseekV41ModelOutput with the final normalized hidden state, when cached the updated cache, and the
@@ -1488,7 +1618,7 @@ class DeepseekV41Model(EasyDeLBaseModule):
         if config.engram_layer_ids and engram_hash_ids is None and engram_rows is None:
             raise ValueError(
                 "DeepSeek-V4.1 engram layers need host-computed `engram_hash_ids` "
-                "(see easydel.modules.deepseek_v41._engram_hash)."
+                "(see easydel.layers.engram.EngramHasher)."
             )
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
@@ -1552,29 +1682,165 @@ class DeepseekV41Model(EasyDeLBaseModule):
         if output_dspark_hidden and not dspark_targets:
             raise ValueError("output_dspark_hidden requires a non-empty `dspark_target_layer_ids`.")
 
+        base_inputs = dict(
+            position_embeddings=position_embeddings,
+            position_ids=position_ids,
+            engram_hash_ids=engram_hash_ids,
+            engram_rows=engram_rows,
+            engram_scales=engram_scales,
+            packed_meta=packed_meta,
+            image_mask=image_mask,
+        )
+
+        def _call_layer(block, idx, streams, pre, state, cache_view, capture, inputs=None):
+            inputs = base_inputs if inputs is None else inputs
+            with self._layer_stage_context(idx, layers=self.layers):
+                return block(
+                    hidden_streams=streams,
+                    pre_mix=pre,
+                    token_valid=token_valid,
+                    shared=state,
+                    output_router_logits=output_router_logits,
+                    cache_view=cache_view,
+                    capture_main_hidden=capture,
+                    **inputs,
+                )
+
+        # CED prefill skip: the window-only decoder tail runs only on tokens inside its receptive field (exact, see
+        # `_ced_decoder_tail`). Branch 0 skips the tail (no live token), branch 1 runs it on the live tokens compacted
+        # into `compact_len` slots, the last branch runs it on the whole step. Pure-decode buckets never get here.
+        ced_start = None
+        ced_branch = None
+        compact_plan = None
+        num_slots = int(packed_meta.valid_grid.shape[0]) if packed_meta is not None else 0
+        if (
+            packed_meta is not None
+            and tokens_to_end is not None
+            and bool(getattr(config, "ced_prefill_skip", False))
+            and not output_hidden_states
+            and not output_router_logits
+            and self._pipeline_stage_count() <= 1
+            and seq > num_slots
+        ):
+            tail = _ced_decoder_tail(config)
+            if tail is not None:
+                ced_start, reach = tail
+                live = (jnp.asarray(tokens_to_end).reshape(-1) < reach) & (packed_meta.slot_of_token < num_slots)
+                n_live = jnp.sum(live.astype(jnp.int32))
+                compact_len = max(seq // _CED_COMPACT_DIVISOR, num_slots)
+                if compact_len < seq:
+                    compact_plan = _ced_compact_plan(
+                        live,
+                        packed_qsl,
+                        packed_num_seqs,
+                        getattr(cache_metadata, "recurrent_state_indices", None),
+                        position_ids,
+                        num_slots,
+                        compact_len,
+                    )
+                    ced_branch = jnp.where(n_live == 0, 0, jnp.where(n_live <= compact_len, 1, 2))
+                else:
+                    ced_branch = jnp.where(n_live == 0, 0, 1)
+                ced_branch = ced_branch.astype(jnp.int32)
+        tail_targets = tuple(i for i in sorted(dspark_targets) if ced_start is not None and i >= ced_start)
+
+        def _run_tail(streams, pre, tail_views, state, inputs=None):
+            tail_views = list(tail_views)
+            caps = ()
+            for offset, layer_idx in enumerate(range(ced_start, len(self.layers))):
+                capture = layer_idx in dspark_targets
+                streams, pre, state, _router, tail_views[offset], main = _call_layer(
+                    self.layers[layer_idx], layer_idx, streams, pre, state, tail_views[offset], capture, inputs
+                )
+                if capture:
+                    caps += (main,)
+            return streams, pre, tuple(tail_views), caps
+
+        def _advance_tail_positions(tail_views):
+            # Every slot's stream ends where the full step leaves it, as the packed attention would set it.
+            valid = packed_meta.valid_grid
+            end = jnp.max(jnp.where(valid, packed_meta.positions_grid + 1, 0), axis=1)
+            any_valid = jnp.any(valid, axis=1)
+            mesh = getattr(config, "mesh", None)
+            return tuple(
+                view.replace(
+                    cache_position=jnp.where(any_valid, end, view.cache_position).astype(view.cache_position.dtype)
+                ).constrain_layout(mesh)
+                for view in tail_views
+            )
+
+        def _skip_tail(streams, pre, tail_views, state):
+            # Only the stream positions advance (rings untouched).
+            del state
+            caps = tuple(jnp.zeros_like(streams[:, :, 0]) for _ in tail_targets)
+            return streams, pre, _advance_tail_positions(tail_views), caps
+
+        def _compact_tail(streams, pre, tail_views, state):
+            # Live tokens only. Dead tokens keep their last-KV-source streams (never read, like the skip) and write no
+            # ring entry; slots whose chunk is entirely dead still get their stream position advanced.
+            plan = compact_plan
+
+            def take(x):
+                return None if x is None else jnp.take(x, plan.token_index, axis=1, mode="clip")
+
+            inputs = dict(
+                position_embeddings={k: (take(c), take(s)) for k, (c, s) in position_embeddings.items()},
+                position_ids=take(position_ids),
+                engram_hash_ids=take(engram_hash_ids),
+                engram_rows=take(engram_rows),
+                engram_scales=take(engram_scales),
+                packed_meta=plan.meta,
+                image_mask=take(image_mask),
+            )
+            c_state = dict(state)
+            for key in ("topk", "candidates"):
+                if c_state.get(key) is not None:
+                    c_state[key] = _ced_shift_grid(c_state[key], plan.col_offset)
+            c_streams = apply_logical_sharding(
+                take(streams), dynamic_axes=_HyperStreamSharding, partition_manager=config.runtime_sharding_resolver
+            )
+            c_streams, c_pre, tail_views, c_caps = _run_tail(c_streams, take(pre), tail_views, c_state, inputs)
+            idx = plan.token_index
+            streams = streams.at[:, idx].set(c_streams.astype(streams.dtype), mode="drop")
+            streams = apply_logical_sharding(
+                streams, dynamic_axes=_HyperStreamSharding, partition_manager=config.runtime_sharding_resolver
+            )
+            pre = pre.at[:, idx].set(c_pre.astype(pre.dtype), mode="drop")
+            caps = tuple(
+                jnp.zeros_like(streams[:, :, 0]).at[:, idx].set(c.astype(streams.dtype), mode="drop") for c in c_caps
+            )
+            return streams, pre, _advance_tail_positions(tail_views), caps
+
+        def _full_tail(streams, pre, tail_views, state):
+            return _run_tail(streams, pre, tail_views, state)
+
         def _layer_loop(block, carry):
             streams, pre, state, all_hidden, all_router, captures, idx = carry
+            if ced_start is not None and idx >= ced_start:
+                if idx == ced_start:
+                    branches = (
+                        (_skip_tail, _full_tail)
+                        if compact_plan is None
+                        else (
+                            _skip_tail,
+                            _compact_tail,
+                            _full_tail,
+                        )
+                    )
+                    streams, pre, tail_views, tail_caps = jax.lax.switch(
+                        ced_branch, branches, streams, pre, tuple(views[ced_start:]), state
+                    )
+                    views[ced_start:] = list(tail_views)
+                    if captures is not None:
+                        captures += tail_caps
+                return streams, pre, state, all_hidden, all_router, captures, idx + 1
             if output_hidden_states:
                 all_hidden += (streams,)
             capture = idx in dspark_targets
             cache_view = views[idx] if cached else None
-            with self._layer_stage_context(idx, layers=self.layers):
-                streams, pre, state, router, cache_view, main = block(
-                    hidden_streams=streams,
-                    pre_mix=pre,
-                    position_embeddings=position_embeddings,
-                    position_ids=position_ids,
-                    token_valid=token_valid,
-                    shared=state,
-                    engram_hash_ids=engram_hash_ids,
-                    engram_rows=engram_rows,
-                    engram_scales=engram_scales,
-                    output_router_logits=output_router_logits,
-                    cache_view=cache_view,
-                    packed_meta=packed_meta,
-                    image_mask=image_mask,
-                    capture_main_hidden=capture,
-                )
+            streams, pre, state, router, cache_view, main = _call_layer(
+                block, idx, streams, pre, state, cache_view, capture
+            )
             if cached:
                 views[idx] = cache_view
             streams = self._mark_layer_stage_boundary(streams, idx, layers=self.layers)
@@ -1613,24 +1879,13 @@ class DeepseekV41Model(EasyDeLBaseModule):
             indexer_aux_loss=final_shared.get("indexer_aux"),
         )
 
-    def place_engram_tables_on_host(self) -> int:
-        """Move every engram embedding table to pinned host memory (call after loading real weights).
+    def create_cache_config(
+        self, batch_size: int, max_length: int, spec_trace_len: int = 0
+    ) -> SharedCompressedWindowCacheConfig:
+        """Cache layout for this model's ownership schedule (state only on KV sources / index-key owners).
 
-        Switches those engram layers to the host-gather lookup and makes their tables non-trainable ``buffers`` leaves
-        (see :class:`~easydel.layers.embeddings.GatedEngram`). Idempotent.
-
-        Returns:
-            Number of engram layers processed.
+        ``spec_trace_len > 0`` also allocates the projection traces used by replay-free speculative rollback.
         """
-        count = 0
-        for layer in self.layers:
-            if layer.engram is not None:
-                layer.engram.place_table_on_host()
-                count += 1
-        return count
-
-    def create_cache_config(self, batch_size: int, max_length: int) -> SharedCompressedWindowCacheConfig:
-        """Cache layout for this model's ownership schedule (state only on KV sources / index-key owners)."""
         config = self.config
         num_layers = config.num_hidden_layers
         return SharedCompressedWindowCacheConfig.create(
@@ -1645,6 +1900,7 @@ class DeepseekV41Model(EasyDeLBaseModule):
             kv_source_layer_ids=config.kv_source_layer_ids,
             index_key_layer_ids=[i for i in range(num_layers) if config.owns_index_keys(i)],
             slot_axes=slot_partition_axes(getattr(config, "mesh", None), batch_size),
+            spec_trace_len=spec_trace_len,
         )
 
     def init_operations_cache(
@@ -1655,10 +1911,15 @@ class DeepseekV41Model(EasyDeLBaseModule):
         dtype: jnp.dtype | None = None,
         **kwargs,
     ) -> SharedCompressedWindowCache:
-        """Allocate the shared compressed-window decode cache (``starts`` / engine kwargs are ignored)."""
+        """Allocate the shared compressed-window decode cache.
+
+        ``spec_trace_len`` (eSurge, speculative decoding) sizes the replay-free rollback traces; ``starts`` and the
+        other engine kwargs are ignored.
+        """
+        spec_trace_len = int(kwargs.pop("spec_trace_len", 0) or 0)
         del starts, kwargs
         return SharedCompressedWindowCache.init_cache(
-            config=self.create_cache_config(batch_size=batch_size, max_length=max_length),
+            config=self.create_cache_config(batch_size=batch_size, max_length=max_length, spec_trace_len=spec_trace_len),
             dtype=dtype if dtype is not None else self.dtype,
             mesh=getattr(self.config, "mesh", None),
         )
@@ -1689,7 +1950,7 @@ class DeepseekV41Model(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=DeepseekV41Config, model_type="deepseek_v41")
-class DeepseekV41ForCausalLM(BaseCausalLMModule[DeepseekV41Model, DeepseekV41Config]):  # type: ignore
+class DeepseekV41ForCausalLM(EngramModelMixin, BaseCausalLMModule[DeepseekV41Model, DeepseekV41Config]):  # type: ignore
     """DeepSeek-V4.1 with a causal language modeling head."""
 
     _task_type = TaskType.CAUSAL_LM
@@ -1697,7 +1958,12 @@ class DeepseekV41ForCausalLM(BaseCausalLMModule[DeepseekV41Model, DeepseekV41Con
     _config_class = DeepseekV41Config
     _checkpoint_key_normalizer = staticmethod(native_key_to_easydel_v41)
     esurge_cache_family: tp.ClassVar[str] = "compressed_window"
-    # Per-token eSurge side inputs (engram ids / host-gathered rows) are declared in ``_esurge_hooks``.
+    # Engram table management, eSurge side inputs and the trainer host-batch hook come from ``EngramModelMixin``.
+
+    @property
+    def esurge_requires_tokens_to_end(self) -> bool:
+        """eSurge hook: request the ``tokens_to_end`` side input that drives the CED prefill skip."""
+        return bool(getattr(self.config, "ced_prefill_skip", False))
 
     def __init__(
         self,
@@ -1738,6 +2004,7 @@ class DeepseekV41ForCausalLM(BaseCausalLMModule[DeepseekV41Model, DeepseekV41Con
         output_dspark_hidden: bool = False,
         engram_rows: Array | None = None,
         engram_scales: Array | None = None,
+        tokens_to_end: Int[Array, "batch seq_len"] | None = None,
     ) -> DeepseekV41CausalLMOutput:
         """Forward producing vocabulary logits; arguments as :meth:`DeepseekV41Model.forward`.
 
@@ -1763,6 +2030,7 @@ class DeepseekV41ForCausalLM(BaseCausalLMModule[DeepseekV41Model, DeepseekV41Con
             output_dspark_hidden=output_dspark_hidden,
             engram_rows=engram_rows,
             engram_scales=engram_scales,
+            tokens_to_end=tokens_to_end,
         )
         logits = None
         if apply_lm_head:
@@ -1952,6 +2220,7 @@ class DeepseekV41VLModel(DeepseekV41Model):
         output_dspark_hidden: bool = False,
         engram_rows: Array | None = None,
         engram_scales: Array | None = None,
+        tokens_to_end: Int[Array, "batch seq_len"] | None = None,
     ) -> DeepseekV41ModelOutput:
         """Forward with optional images (stateless, cached prefill, or one-token decode with ``token_types=None``).
 
@@ -2013,11 +2282,14 @@ class DeepseekV41VLModel(DeepseekV41Model):
             output_dspark_hidden=output_dspark_hidden,
             engram_rows=engram_rows,
             engram_scales=engram_scales,
+            tokens_to_end=tokens_to_end,
         )
 
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=DeepseekV41Config, model_type="deepseek_v41")
-class DeepseekV41ForConditionalGeneration(BaseVisionLanguageModule[DeepseekV41VLModel, DeepseekV41Config]):  # type: ignore
+class DeepseekV41ForConditionalGeneration(  # type: ignore
+    EngramModelMixin, BaseVisionLanguageModule[DeepseekV41VLModel, DeepseekV41Config]
+):
     """DeepSeek-V4.1 vision-language model (image + text to text).
 
     Owns the text backbone plus ViT, aligner, image delimiters and ``lm_head``. Parameter names match the text model
@@ -2030,12 +2302,30 @@ class DeepseekV41ForConditionalGeneration(BaseVisionLanguageModule[DeepseekV41VL
     _config_class = DeepseekV41Config
     _auto_register = False  # registered explicitly above
     _checkpoint_key_normalizer = staticmethod(native_key_to_easydel_v41_vl)
+
+    @property
+    def esurge_requires_tokens_to_end(self) -> bool:
+        """eSurge hook: request the ``tokens_to_end`` side input that drives the CED prefill skip."""
+        return bool(getattr(self.config, "ced_prefill_skip", False))
+
     _vision_tower_name = "vision"
     _projector_name = "aligner"
     loss_type = "ForCausalLM"
     esurge_cache_family: tp.ClassVar[str] = "compressed_window"
-    # Token-type VLM prefill (image-span routing / engram dead mask); side inputs are declared in ``_esurge_hooks``.
+    # Token-type VLM prefill (image-span routing / engram dead mask): eSurge adds the ``token_types`` side input.
     esurge_requires_token_types: tp.ClassVar[bool] = True
+
+    def esurge_image_expander_builder(self):
+        """eSurge hook: the scheduler-side image placeholder expander."""
+        from .processing_deepseek_v41 import DeepseekV41ImageExpander
+
+        return DeepseekV41ImageExpander(self.config)
+
+    def esurge_compute_prefill_embeddings(self, prompt_token_ids, features):
+        """eSurge hook: encode a request's images and merge them into its prompt embeddings."""
+        from .processing_deepseek_v41 import compute_prefill_embeddings
+
+        return compute_prefill_embeddings(self, prompt_token_ids, features)
 
     def __init__(
         self,
@@ -2089,6 +2379,7 @@ class DeepseekV41ForConditionalGeneration(BaseVisionLanguageModule[DeepseekV41VL
         output_dspark_hidden: bool = False,
         engram_rows: Array | None = None,
         engram_scales: Array | None = None,
+        tokens_to_end: Int[Array, "batch seq_len"] | None = None,
         **kwargs,
     ) -> DeepseekV41VLMOutput:
         """Forward producing vocabulary logits; arguments as :meth:`DeepseekV41VLModel.forward`.
@@ -2117,6 +2408,7 @@ class DeepseekV41ForConditionalGeneration(BaseVisionLanguageModule[DeepseekV41VL
             output_dspark_hidden=output_dspark_hidden,
             engram_rows=engram_rows,
             engram_scales=engram_scales,
+            tokens_to_end=tokens_to_end,
         )
         hidden_states = apply_logical_sharding(
             outputs.last_hidden_state,
@@ -2168,7 +2460,6 @@ __all__ = [
     "DeepseekV41CausalLMOutput",
     "DeepseekV41Compressor",
     "DeepseekV41DecoderLayer",
-    "DeepseekV41Engram",
     "DeepseekV41ForCausalLM",
     "DeepseekV41ForConditionalGeneration",
     "DeepseekV41Indexer",

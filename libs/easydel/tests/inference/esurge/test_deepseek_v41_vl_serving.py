@@ -39,9 +39,9 @@ from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.esurge.runners import eSurgeRunner
 from easydel.inference.esurge.scheduler import Scheduler
 from easydel.inference.sampling_params import SamplingParams
+from easydel.layers.engram import EngramHasher
 from easydel.modules.deepseek_v41 import DeepseekV41Config, DeepseekV41ForConditionalGeneration
-from easydel.modules.deepseek_v41._engram_hash import EngramHasher
-from easydel.modules.deepseek_v41._serving import DeepseekV41ImageExpander
+from easydel.modules.deepseek_v41.processing_deepseek_v41 import DeepseekV41ImageExpander
 
 try:
     from tests.modules import _deepseek_v41_reference as ref

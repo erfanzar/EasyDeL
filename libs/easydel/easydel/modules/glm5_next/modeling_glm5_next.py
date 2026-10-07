@@ -1235,6 +1235,7 @@ class Glm5NextLinearAttention(spx.Module):
             context_lens=getattr(cache_metadata, "context_lens", None),
             conv_dtype=conv_dtype,
             chunk_size=_KDA_CHUNK_SIZE,
+            spec_recurrent_commit=getattr(cache_metadata, "spec_recurrent_commit", None),
         )
         num_heads, head_v_dim = out_packed.shape[2], out_packed.shape[3]
         output_gate = self.g_b_proj(self.g_a_proj(hidden_states))
@@ -2187,6 +2188,14 @@ class Glm5NextTextModel(EasyDeLBaseModule):
         """
         return None
 
+    def get_embedding(self):
+        """Return the token embedding layer.
+
+        Returns:
+            Embed: The token embedding layer (``embed_tokens``).
+        """
+        return self.embed_tokens
+
     def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
@@ -2435,6 +2444,18 @@ class Glm5NextForCausalLM(BaseCausalLMModule[Glm5NextTextModel, Glm5NextTextConf
         if key.startswith("model.language_model."):
             return "model." + key[len("model.language_model.") :]
         return key
+
+    def has_mtp(self) -> bool:
+        """Whether a nextn (MTP) head is attached as ``self.mtp``.
+
+        The head is optional and attached after loading
+        (:func:`easydel.modules.glm5_next.modeling_glm5_next_mtp.attach_glm5_next_mtp`), so plain GLM-5-Next
+        models are unchanged and report ``False``.
+
+        Returns:
+            ``True`` iff an MTP head is attached.
+        """
+        return getattr(self, "mtp", None) is not None
 
 
 @register_module(TaskType.CAUSAL_LM, config=Glm5NextTextConfig, model_type="glm5_next")

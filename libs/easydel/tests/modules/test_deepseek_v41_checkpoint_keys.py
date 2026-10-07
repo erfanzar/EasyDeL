@@ -41,7 +41,7 @@ _UNOWNED_PREFIXES = ("mtp.", "vision.", "aligner.")
 _LAYER_NAME = re.compile(r"^model\.layers\.(\d+)\.(.+)$")
 _EXPERT_NAME = re.compile(r"^(model\.layers\.\d+\.mlp\.experts)\.(\d+)\.(.+)$")
 _EXPERT_PROJS = ("gate_proj", "up_proj", "down_proj")
-# The ~100 GB fp8 engram tables are filled by the dedicated row-chunked loader (``_engram_loader``), so the key mapper
+# The ~100 GB fp8 engram tables are filled by the row-chunked loader (``easydel.layers.engram``), so the key mapper
 # deliberately maps them to None: they must never reach the streaming conversion / fp32 quant decoder.
 _ENGRAM_TABLE = re.compile(r"^layers\.\d+\.engram\.embed\.(weight|scale)$")
 
@@ -232,8 +232,8 @@ def _expected_layer_parameters(config: DeepseekV41Config, i: int) -> set[str]:
         names |= {"self_attn.indexer.q_b_proj.weight", "self_attn.indexer.weights_proj.weight"}
         if config.owns_index_keys(i):
             names |= {"self_attn.indexer.wk.weight", "self_attn.indexer.k_norm.weight"}
-    if i in config.engram_layer_ids:  # DeepseekV41Engram
-        # ``engram.embed.{weight,scale}`` exist on the module but are loaded by ``_engram_loader`` (mapped to None).
+    if i in config.engram_layer_ids:  # GatedEngram
+        # ``engram.embed.{weight,scale}`` exist on the module but are loaded by the engram loader (mapped to None).
         names |= {"engram.kv_proj.weight", "engram.q_weight", "engram.k_weight"}
     return names
 

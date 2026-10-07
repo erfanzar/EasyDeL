@@ -705,6 +705,12 @@ class WindowRingDraftAttentionMixin:
         cos, sin = self.draft_rope_cos_sin(self.config, self.rope_label, draft_positions, hidden_states.dtype)
         q_residual = self.q_a_norm(self.q_a_proj(hidden_states))
         q = self.q_b_proj(q_residual).reshape(batch, block, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        q_head_norm_eps = getattr(self, "draft_q_head_norm_eps", None)
+        if q_head_norm_eps is not None:
+            # Unweighted per-head RMS norm before RoPE (DeepSeek-V4 ``q_b_norm``): fp32 moment, the scale is cast back
+            # to ``q.dtype`` before multiplying (same rounding as the backbone's ``_unweighted_rms_norm``).
+            moment = jnp.mean(jnp.square(q.astype(jnp.float32)), axis=-1, keepdims=True)
+            q = q * jax.lax.rsqrt(moment + q_head_norm_eps).astype(q.dtype)
         q = self.draft_apply_rope(q, cos, sin, unsqueeze_dim=1)
         kv = self.kv_norm(self.kv_proj(hidden_states))[:, None]
         kv = self.draft_apply_rope(kv, cos, sin, unsqueeze_dim=1)[:, 0]

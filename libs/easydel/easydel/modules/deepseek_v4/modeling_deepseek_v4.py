@@ -94,6 +94,7 @@ import typing as tp
 import jax
 import jax.numpy as jnp
 import spectrax as spx
+from eformer.pytree import auto_pytree
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -107,7 +108,7 @@ from easydel.infra.modeling_outputs import (
     MoeCausalLMOutput,
     MoeModelOutput,
 )
-from easydel.infra.sharding import inference_mode_forces_decode
+from easydel.infra.sharding import inference_mode_forces_decode, sharding_for_layout
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
 from easydel.layers import (
     BaseMoeModule,
@@ -141,6 +142,7 @@ from easydel.layers.compressed_window import (
     run_column_blocks,
     sink_attention,
     tokens_to_grid,
+    trace_compressor_stream,
 )
 from easydel.layers.indexer import CompressedIndexer, CompressedIndexerConfig, IndexerSelection
 from easydel.layers.residual import (
@@ -670,8 +672,14 @@ class DeepseekV4GroupedLinear(spx.Module):
         self.precision = precision
         if kernel_init is None:
             kernel_init = jax.nn.initializers.lecun_normal()
+        # Column-parallel like ColumnParallelLinear: group g owns the contiguous columns [g*rank, (g+1)*rank), so a
+        # tp split of the column axis hands every shard whole groups, matching the tp-sharded heads feeding it. A
+        # replicated weight made XLA slice and relayout each shard's groups every step (measured on TPU v5, V4.1
+        # decode cc=8, 40 layers: 120 weight dynamic-slices + 40 copies, 1.63 -> 1.10 ms, weight 2.68 -> 0.67 GB/chip,
+        # bit-identical; probe_grouped_oa_sharding.py).
         self.weight = spx.Parameter(
             kernel_init(rngs.param, (in_features_per_group, n_groups * out_features_per_group), param_dtype),
+            sharding=sharding_for_layout(common_types.ColumnWise),
         )
 
     def forward(self, x: Float[Array, "batch seq groups in_per_group"]) -> Float[Array, "batch seq groups rank"]:
@@ -898,6 +906,16 @@ class DeepseekV4HCACompressor(spx.Module):
         n_slots = cache_view.num_entry_slots
         if n_slots == 0:
             return None, None, cache_view
+        cache_view = trace_compressor_stream(
+            cache_view,
+            "compressor",
+            kv=kv,
+            gate=gate,
+            positions=cache_view.cache_position[:, None],
+            valid=None if valid is None else valid[:, None],
+            rate=rate,
+            head_dim=self.head_dim,
+        )
         entries, buffer_kv, buffer_gate, _, _ = _compressor_decode_step(
             kv_t=kv,
             gate_t=gate,
@@ -936,9 +954,21 @@ class DeepseekV4HCACompressor(spx.Module):
         del q_residual
         if cache_view.num_entry_slots == 0:
             return None, cache_view
+        kv_blk = self.kv_proj(hidden_states)
+        gate_blk = self.gate_proj(hidden_states)
+        cache_view = trace_compressor_stream(
+            cache_view,
+            "compressor",
+            kv=kv_blk,
+            gate=gate_blk,
+            positions=positions,
+            valid=valid,
+            rate=self.compress_rate,
+            head_dim=self.head_dim,
+        )
         entries, buffer_kv, buffer_gate, _, _ = _compressor_extend_step(
-            kv_blk=self.kv_proj(hidden_states),
-            gate_blk=self.gate_proj(hidden_states),
+            kv_blk=kv_blk,
+            gate_blk=gate_blk,
             buffer_kv=cache_view.compressor_buffer_kv,
             buffer_gate=cache_view.compressor_buffer_gate,
             entries=cache_view.compressor_entries,
@@ -1315,6 +1345,17 @@ class DeepseekV4CSACompressor(spx.Module):
             return None, None, cache_view
         kv = self.kv_proj(hidden_states)
         gate = self.gate_proj(hidden_states)
+        cache_view = trace_compressor_stream(
+            cache_view,
+            "compressor",
+            kv=kv,
+            gate=gate,
+            positions=cache_view.cache_position[:, None],
+            valid=None if valid is None else valid[:, None],
+            rate=rate,
+            head_dim=self.head_dim,
+            position_bias=self.position_bias.value,
+        )
         entries, buffer_kv, buffer_gate, overlap_kv, overlap_gate = _compressor_decode_step(
             kv_t=kv,
             gate_t=gate,
@@ -1405,9 +1446,22 @@ class DeepseekV4CSACompressor(spx.Module):
         """
         if cache_view.num_entry_slots == 0:
             return None, cache_view
+        kv_blk = self.kv_proj(hidden_states)
+        gate_blk = self.gate_proj(hidden_states)
+        cache_view = trace_compressor_stream(
+            cache_view,
+            "compressor",
+            kv=kv_blk,
+            gate=gate_blk,
+            positions=positions,
+            valid=valid,
+            rate=self.compress_rate,
+            head_dim=self.head_dim,
+            position_bias=self.position_bias.value,
+        )
         entries, buffer_kv, buffer_gate, overlap_kv, overlap_gate = _compressor_extend_step(
-            kv_blk=self.kv_proj(hidden_states),
-            gate_blk=self.gate_proj(hidden_states),
+            kv_blk=kv_blk,
+            gate_blk=gate_blk,
             buffer_kv=cache_view.compressor_buffer_kv,
             buffer_gate=cache_view.compressor_buffer_gate,
             entries=cache_view.compressor_entries,
@@ -1955,7 +2009,8 @@ class DeepseekV4Attention(spx.Module):
         col_tok = packed_meta.col_of_token  # [T]
         safe_slot = jnp.minimum(slot_tok, num_slots - 1)
 
-        if inference_mode_forces_decode():
+        def _decode_fast(cache_view):
+            """One token per slot (pure decode): a single ``_decode_attend`` over ``[num_slots, ...]`` state."""
 
             def _to_slots(values: Array) -> Array:
                 """Scatter per-token values ``[T, ...]`` into ``[num_slots, ...]``."""
@@ -1977,81 +2032,112 @@ class DeepseekV4Attention(spx.Module):
             grouped = self.o_a_proj(grouped).reshape(1, total_tokens, -1)
             return checkpoint_name(self.o_b_proj(grouped), "attn_output"), cache_view
 
-        # Shared packed driver (``layers.compressed_window``, also used by DeepSeek-V4.1): prefill / chunked-prefill
-        # buckets advance a block of columns per loop step through :meth:`_extend_attend`; buckets with at most one
-        # token per slot keep the single-column :meth:`_decode_attend`. Only occupied columns are visited.
-        block = packed_block_size(total_tokens, num_slots, self.sliding_window)
-        width = -(-total_tokens // block) * block
+        def _grid_path(cache_view, block: int):
+            """Grid path with a static ``block`` of columns per loop step (prefill, chunked prefill, verify)."""
+            # Shared packed driver (``layers.compressed_window``, also used by DeepSeek-V4.1): prefill / chunked-prefill
+            # buckets advance a block of columns per loop step through :meth:`_extend_attend`; buckets with at most one
+            # token per slot keep the single-column :meth:`_decode_attend`. Only occupied columns are visited.
+            width = -(-total_tokens // block) * block
 
-        def _to_grid(values: Array) -> Array:
-            """Scatter per-token values ``[T, ...]`` into ``[num_slots, width, ...]``."""
-            return tokens_to_grid(values, slot_tok, col_tok, num_slots, width)
+            def _to_grid(values: Array) -> Array:
+                """Scatter per-token values ``[T, ...]`` into ``[num_slots, width, ...]``."""
+                return tokens_to_grid(values, slot_tok, col_tok, num_slots, width)
 
-        def _pad_cols(grid: Array) -> Array:
-            return grid if width == total_tokens else jnp.pad(grid, ((0, 0), (0, width - total_tokens)))
+            def _pad_cols(grid: Array) -> Array:
+                return grid if width == total_tokens else jnp.pad(grid, ((0, 0), (0, width - total_tokens)))
 
-        hidden_grid = _to_grid(hidden_states[0])  # [S, W, D]
-        qres_grid = _to_grid(q_residual[0])  # [S, W, q_lora]
-        q_grid = _to_grid(q[0].transpose(1, 0, 2))  # [S, W, H, head_dim]
-        kv_grid = _to_grid(kv[0])  # [S, W, head_dim]
-        pos_grid = _pad_cols(packed_meta.positions_grid)
-        valid_grid = _pad_cols(packed_meta.valid_grid)
-        num_used = occupied_columns(valid_grid)
-        attn_columns = jnp.zeros((width, num_slots, self.num_heads, self.head_dim), dtype=cache_view.window_kv.dtype)
+            hidden_grid = _to_grid(hidden_states[0])  # [S, W, D]
+            qres_grid = _to_grid(q_residual[0])  # [S, W, q_lora]
+            q_grid = _to_grid(q[0].transpose(1, 0, 2))  # [S, W, H, head_dim]
+            kv_grid = _to_grid(kv[0])  # [S, W, head_dim]
+            pos_grid = _pad_cols(packed_meta.positions_grid)
+            valid_grid = _pad_cols(packed_meta.valid_grid)
+            num_used = occupied_columns(valid_grid)
+            attn_columns = jnp.zeros((width, num_slots, self.num_heads, self.head_dim), dtype=cache_view.window_kv.dtype)
 
-        def _block_step(start: Array, carry):
-            """Advance every slot by the ``block`` columns starting at ``start``."""
-            view, acc = carry
+            def _block_step(start: Array, carry):
+                """Advance every slot by the ``block`` columns starting at ``start``."""
+                view, acc = carry
 
-            def cols(grid: Array) -> Array:
-                return jax.lax.dynamic_slice_in_dim(grid, start, block, axis=1)
+                def cols(grid: Array) -> Array:
+                    return jax.lax.dynamic_slice_in_dim(grid, start, block, axis=1)
 
-            attn, view = self._extend_attend(
-                q=cols(q_grid).transpose(0, 2, 1, 3),
-                kv=cols(kv_grid),
-                hidden_states=cols(hidden_grid),
-                q_residual=cols(qres_grid),
-                positions=cols(pos_grid),
-                valid=cols(valid_grid),
-                cache_view=view,
+                attn, view = self._extend_attend(
+                    q=cols(q_grid).transpose(0, 2, 1, 3),
+                    kv=cols(kv_grid),
+                    hidden_states=cols(hidden_grid),
+                    q_residual=cols(qres_grid),
+                    positions=cols(pos_grid),
+                    valid=cols(valid_grid),
+                    cache_view=view,
+                )
+                acc = jax.lax.dynamic_update_slice_in_dim(
+                    acc, attn.transpose(2, 0, 1, 3).astype(acc.dtype), start, axis=0
+                )
+                return view, acc
+
+            def _column_step(col: Array, carry):
+                """Advance every slot by one grid column (column ``col``)."""
+                view, acc = carry
+                hidden_col = jax.lax.dynamic_index_in_dim(hidden_grid, col, axis=1, keepdims=False)  # [S, D]
+                qres_col = jax.lax.dynamic_index_in_dim(qres_grid, col, axis=1, keepdims=False)  # [S, q_lora]
+                q_col = jax.lax.dynamic_index_in_dim(q_grid, col, axis=1, keepdims=False)  # [S, H, head_dim]
+                kv_col = jax.lax.dynamic_index_in_dim(kv_grid, col, axis=1, keepdims=False)  # [S, head_dim]
+                pos_col = jax.lax.dynamic_index_in_dim(pos_grid, col, axis=1, keepdims=False)  # [S]
+                valid_col = jax.lax.dynamic_index_in_dim(valid_grid, col, axis=1, keepdims=False)  # [S]
+                attn_col, view = self._decode_attend(
+                    q=q_col[:, :, None, :],
+                    kv=kv_col[:, None, :],
+                    hidden_states=hidden_col[:, None, :],
+                    q_residual=qres_col[:, None, :],
+                    position_ids=pos_col[:, None],
+                    cache_view=view,
+                    valid=valid_col,
+                )
+                acc = jax.lax.dynamic_update_index_in_dim(acc, attn_col[:, :, 0, :].astype(acc.dtype), col, axis=0)
+                return view, acc
+
+            cache_view, attn_columns = run_column_blocks(
+                _block_step if block > 1 else _column_step,
+                (cache_view, attn_columns),
+                num_used=num_used,
+                block=block,
+            )  # attn_columns: [W, S, H, head_dim]
+
+            attn_packed = grid_to_tokens(attn_columns, slot_tok, col_tok, num_slots)[None, ...]  # [1, T, H, head_dim]
+            attn_output = _apply_interleaved_rope(attn_packed, cos, -sin, unsqueeze_dim=2)
+
+            grouped = attn_output.reshape(1, total_tokens, self.config.o_groups, -1)
+            grouped = self.o_a_proj(grouped).reshape(1, total_tokens, -1)
+            return checkpoint_name(self.o_b_proj(grouped), "attn_output"), cache_view
+
+        def _general(cache_view):
+            """Grid path: any number of tokens per slot, block width chosen at run time.
+
+            The bucket's default block is wide (``min(64, T, window)``). A speculative verify step (``1 + k`` tokens on
+            every slot) occupies few columns, so one bucket-wide block is mostly padding (measured on DeepSeek-V4-Flash:
+            cc=8 verify forward 275.6 ms vs 124.6 ms with a slot-share block). The narrow block (one slot's share of the
+            bucket) is used only when every occupied column fits in ONE narrow block -- the same single loop step,
+            narrower -- so prefill steps keep the original wide-block program (a static narrow block made single-request
+            prefill 196 -> 273 ms median).
+            """
+            wide = packed_block_size(total_tokens, num_slots, self.sliding_window)
+            narrow = packed_block_size(total_tokens, num_slots, self.sliding_window, cap_by_slot_share=True)
+            if narrow >= wide:
+                return _grid_path(cache_view, wide)
+            return jax.lax.cond(
+                occupied_columns(packed_meta.valid_grid) <= narrow,
+                lambda c: _grid_path(c, narrow),
+                lambda c: _grid_path(c, wide),
+                cache_view,
             )
-            acc = jax.lax.dynamic_update_slice_in_dim(acc, attn.transpose(2, 0, 1, 3).astype(acc.dtype), start, axis=0)
-            return view, acc
 
-        def _column_step(col: Array, carry):
-            """Advance every slot by one grid column (column ``col``)."""
-            view, acc = carry
-            hidden_col = jax.lax.dynamic_index_in_dim(hidden_grid, col, axis=1, keepdims=False)  # [S, D]
-            qres_col = jax.lax.dynamic_index_in_dim(qres_grid, col, axis=1, keepdims=False)  # [S, q_lora]
-            q_col = jax.lax.dynamic_index_in_dim(q_grid, col, axis=1, keepdims=False)  # [S, H, head_dim]
-            kv_col = jax.lax.dynamic_index_in_dim(kv_grid, col, axis=1, keepdims=False)  # [S, head_dim]
-            pos_col = jax.lax.dynamic_index_in_dim(pos_grid, col, axis=1, keepdims=False)  # [S]
-            valid_col = jax.lax.dynamic_index_in_dim(valid_grid, col, axis=1, keepdims=False)  # [S]
-            attn_col, view = self._decode_attend(
-                q=q_col[:, :, None, :],
-                kv=kv_col[:, None, :],
-                hidden_states=hidden_col[:, None, :],
-                q_residual=qres_col[:, None, :],
-                position_ids=pos_col[:, None],
-                cache_view=view,
-                valid=valid_col,
-            )
-            acc = jax.lax.dynamic_update_index_in_dim(acc, attn_col[:, :, 0, :].astype(acc.dtype), col, axis=0)
-            return view, acc
-
-        cache_view, attn_columns = run_column_blocks(
-            _block_step if block > 1 else _column_step,
-            (cache_view, attn_columns),
-            num_used=num_used,
-            block=block,
-        )  # attn_columns: [W, S, H, head_dim]
-
-        attn_packed = grid_to_tokens(attn_columns, slot_tok, col_tok, num_slots)[None, ...]  # [1, T, H, head_dim]
-        attn_output = _apply_interleaved_rope(attn_packed, cos, -sin, unsqueeze_dim=2)
-
-        grouped = attn_output.reshape(1, total_tokens, self.config.o_groups, -1)
-        grouped = self.o_a_proj(grouped).reshape(1, total_tokens, -1)
-        return checkpoint_name(self.o_b_proj(grouped), "attn_output"), cache_view
+        if not inference_mode_forces_decode():
+            return _general(cache_view)
+        # The decode-layout scope only says the bucket holds as many tokens as request slots. A speculative verify
+        # window puts 1 + k tokens on ONE slot of such a bucket, so the one-token-per-slot fast path runs only when
+        # at most one grid column is occupied (pure decode); otherwise every token goes through the grid path.
+        return jax.lax.cond(occupied_columns(packed_meta.valid_grid) <= 1, _decode_fast, _general, cache_view)
 
     def forward(
         self,
@@ -2840,6 +2926,24 @@ def _reject_nonempty_cached_prefill(past_key_values) -> None:
     )
 
 
+@auto_pytree
+class DeepseekV4ModelOutput(MoeModelOutput):
+    """:class:`MoeModelOutput` plus the DSpark main hidden states (only with ``output_dspark_hidden=True``).
+
+    Attributes:
+        main_hidden: ``[B, S, len(dspark_target_layer_ids) * D]`` concatenated target-layer output stream means.
+    """
+
+    main_hidden: Array | None = None
+
+
+@auto_pytree
+class DeepseekV4CausalLMOutput(MoeCausalLMOutput):
+    """:class:`MoeCausalLMOutput` plus ``main_hidden`` (see :class:`DeepseekV4ModelOutput`)."""
+
+    main_hidden: Array | None = None
+
+
 @register_module(TaskType.BASE_MODULE, config=DeepseekV4Config, model_type="deepseek_v4")
 class DeepseekV4Model(EasyDeLBaseModule):
     """The base DeepSeek-V4 decoder.
@@ -2936,6 +3040,7 @@ class DeepseekV4Model(EasyDeLBaseModule):
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
         past_key_values: tp.Any = None,
         cache_metadata: tp.Any = None,
+        output_dspark_hidden: bool = False,
     ) -> MoeModelOutput:
         """Forward pass through the V4 decoder stack (stateless or cached).
 
@@ -2967,6 +3072,10 @@ class DeepseekV4Model(EasyDeLBaseModule):
                 ``num_seqs``, i.e. eSurge's ``RaggedPagesMetadata``) with a
                 flat ``[1, T]`` input, the packed multi-request path runs
                 against per-slot cache rows; otherwise unused.
+            output_dspark_hidden: Also return ``main_hidden`` ``[B, S, T * D]``: for every ``i`` in
+                ``config.dspark_target_layer_ids`` (ascending) the stream mean of layer ``i``'s OUTPUT (reference
+                ``Transformer.forward`` ``main_hiddens``; the DSpark draft model's input). The output is then a
+                :class:`DeepseekV4ModelOutput`. Off by default (no extra work, unchanged program).
 
         Returns:
             MoeModelOutput with the collapsed final hidden state and, in
@@ -3001,6 +3110,14 @@ class DeepseekV4Model(EasyDeLBaseModule):
         )
         all_hidden_states = () if output_hidden_states else None
         all_router_logits = () if output_router_logits else None
+        dspark_targets: frozenset[int] = frozenset()
+        if output_dspark_hidden:
+            dspark_targets = frozenset(int(i) for i in (getattr(self.config, "dspark_target_layer_ids", None) or ()))
+            if not dspark_targets or max(dspark_targets) >= len(self.layers) or min(dspark_targets) < 0:
+                raise ValueError(
+                    "output_dspark_hidden requires `dspark_target_layer_ids` inside "
+                    f"[0, {len(self.layers)}); got {sorted(dspark_targets)}."
+                )
 
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
@@ -3090,7 +3207,7 @@ class DeepseekV4Model(EasyDeLBaseModule):
 
         def _layer_loop(block, carry):
             """Run one decoder layer inside the (python-loop) layer scan."""
-            hidden_streams, all_hidden_states, all_router_logits, idx = carry
+            hidden_streams, all_hidden_states, all_router_logits, captures, idx = carry
             if output_hidden_states:
                 all_hidden_states += (hidden_streams,)
             cache_view = self._layer_cache_view_at(None, idx, enabled=cached, cache=past_key_values)
@@ -3109,17 +3226,30 @@ class DeepseekV4Model(EasyDeLBaseModule):
             hidden_streams = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
             if output_router_logits:
                 all_router_logits += (layer_outputs.router_logits,)
-            return hidden_streams, all_hidden_states, all_router_logits, idx + 1
+            if idx in dspark_targets:
+                # DSpark main hidden: the stream mean of the target layer's OUTPUT (V4.1 reads its input instead).
+                captures += (hidden_streams.mean(axis=2),)
+            return hidden_streams, all_hidden_states, all_router_logits, captures, idx + 1
 
         # NOTE: layers are structurally heterogeneous (per-layer compressor /
         # rope selection), so this always uses the python-loop path;
         # `scan_layers=True` is unsupported for this family.
-        hidden_streams, all_hidden_states, all_router_logits, _ = self.layers.scan(
+        hidden_streams, all_hidden_states, all_router_logits, captures, _ = self.layers.scan(
             _layer_loop,
-            (hidden_streams, all_hidden_states, all_router_logits, 0),
+            (hidden_streams, all_hidden_states, all_router_logits, () if output_dspark_hidden else None, 0),
             trace=True,
         )
         hidden_states = self.norm(self.hc_head(hidden_streams))
+
+        if output_dspark_hidden:
+            return DeepseekV4ModelOutput(
+                last_hidden_state=hidden_states,
+                hidden_states=all_hidden_states,
+                attentions=None,
+                router_logits=all_router_logits,
+                past_key_values=past_key_values if cached else None,
+                main_hidden=jnp.concatenate(captures, axis=-1),  # appended in ascending layer order
+            )
 
         return MoeModelOutput(
             last_hidden_state=hidden_states,
@@ -3133,12 +3263,14 @@ class DeepseekV4Model(EasyDeLBaseModule):
         self,
         batch_size: int,
         max_length: int,
+        spec_trace_len: int = 0,
     ) -> CompressedWindowCacheConfig:
         """Build the cache configuration for this model's layer schedule.
 
         Args:
             batch_size: Number of lockstep sequences.
             max_length: Maximum supported stream length (prefill + decode).
+            spec_trace_len: Projection trace length for replay-free speculative rollback (``0`` = no traces).
 
         Returns:
             CompressedWindowCacheConfig: Validated static configuration.
@@ -3155,6 +3287,7 @@ class DeepseekV4Model(EasyDeLBaseModule):
             csa_rate=config.compress_rates["compressed_sparse_attention"],
             hca_rate=config.compress_rates["heavily_compressed_attention"],
             layer_types=tuple(config.layer_types),
+            spec_trace_len=spec_trace_len,
         )
 
     def init_operations_cache(
@@ -3181,15 +3314,19 @@ class DeepseekV4Model(EasyDeLBaseModule):
             max_length: Maximum supported stream length.
             starts: Ignored (interface parity with the generation mixin).
             dtype: Cache storage dtype; defaults to the module compute dtype.
-            **kwargs: Ignored engine-oriented arguments (page_size,
-                hbm_utilization, quantizer, ...).
+            **kwargs: Engine-oriented arguments. ``spec_trace_len`` (eSurge
+                speculative decoding) sizes the replay-free rollback traces;
+                the rest (page_size, hbm_utilization, quantizer, ...) are ignored.
 
         Returns:
             CompressedWindowCache: Initialized cache for all layers.
         """
+        spec_trace_len = int(kwargs.pop("spec_trace_len", 0) or 0)
         del starts, kwargs
         return CompressedWindowCache.init_cache(
-            config=self.create_compressed_window_cache_config(batch_size=batch_size, max_length=max_length),
+            config=self.create_compressed_window_cache_config(
+                batch_size=batch_size, max_length=max_length, spec_trace_len=spec_trace_len
+            ),
             dtype=dtype if dtype is not None else self.dtype,
         )
 
@@ -3295,6 +3432,7 @@ class DeepseekV4ForCausalLM(BaseCausalLMModule[DeepseekV4Model, DeepseekV4Config
         past_key_values: tp.Any = None,
         cache_metadata: tp.Any = None,
         apply_lm_head: bool = True,
+        output_dspark_hidden: bool = False,
     ) -> MoeCausalLMOutput:
         """Forward pass producing vocabulary logits.
 
@@ -3313,10 +3451,42 @@ class DeepseekV4ForCausalLM(BaseCausalLMModule[DeepseekV4Model, DeepseekV4Config
                 cached prefill/decode.
             cache_metadata: Accepted for interface parity (unused).
             apply_lm_head: Whether to project to vocabulary logits.
+            output_dspark_hidden: Also return the DSpark ``main_hidden`` (see :meth:`DeepseekV4Model.forward`); the
+                output is then a :class:`DeepseekV4CausalLMOutput`.
 
         Returns:
             MoeCausalLMOutput with logits and optional per-layer outputs.
         """
+        if output_dspark_hidden:
+            if output_router_logits is None:
+                output_router_logits = getattr(self.config, "output_router_logits", False)
+            outputs = self.model(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                mask_info=mask_info,
+                position_ids=position_ids,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                output_router_logits=output_router_logits,
+                mode=mode,
+                past_key_values=past_key_values,
+                cache_metadata=cache_metadata,
+                output_dspark_hidden=True,
+            )
+            logits = None
+            if apply_lm_head:
+                logits = self.compute_lm_logits(self.prepare_lm_head_inputs(outputs.last_hidden_state))
+            return DeepseekV4CausalLMOutput(
+                aux_loss=self.compute_router_aux_loss(outputs),
+                logits=logits,
+                hidden_states=outputs.hidden_states,
+                last_hidden_state=outputs.last_hidden_state,
+                attentions=None,
+                router_logits=outputs.router_logits,
+                past_key_values=outputs.past_key_values,
+                main_hidden=outputs.main_hidden,
+            )
         return self.forward_moe(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
@@ -3393,8 +3563,10 @@ class DeepseekV4ForCausalLM(BaseCausalLMModule[DeepseekV4Model, DeepseekV4Config
 
 __all__ = [
     "DeepseekV4Attention",
+    "DeepseekV4CausalLMOutput",
     "DeepseekV4DecoderLayer",
     "DeepseekV4ForCausalLM",
     "DeepseekV4Model",
+    "DeepseekV4ModelOutput",
     "DeepseekV4SparseMoeBlock",
 ]

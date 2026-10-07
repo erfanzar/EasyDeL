@@ -22,9 +22,8 @@ import ml_dtypes
 import numpy as np
 import pytest
 import spectrax as spx
-from easydel.layers.embeddings import GatedEngram, GatedEngramConfig
-from easydel.layers.embeddings._engram import _dequantize_rows, engram_table_padded_rows
-from easydel.modules.deepseek_v41._engram_loader import load_engram_tables
+from easydel.layers.engram import GatedEngram, GatedEngramConfig, engram_table_padded_rows, load_engram_tables
+from easydel.layers.engram._layer import _dequantize_rows
 from jax import numpy as jnp
 
 ROWS = 1_000_003  # not divisible by the device count: exercises row padding

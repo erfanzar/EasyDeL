@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Row-chunked loader of the DeepSeek-V4.1 engram tables (fp8 ``embed.weight`` + e8m0 ``embed.scale``).
+"""Row-chunked loader of fp8 engram tables (fp8 ``embed.weight`` + e8m0 ``embed.scale``) from safetensors.
 
-The two tables of the released checkpoint are ~100 GB each (shards 47 / 48) and must never pass through the fp32
+Table tensors are found by their native key ``layers.<id>.engram.embed.{weight,scale}``
+(:func:`engram_table_checkpoint_keys`); model key mappers should map those keys to ``None`` so the streaming weight
+conversion never reads them. Released tables are ~100 GB each and must never pass through the fp32
 quant decoder or a bf16 copy. This module reads them straight from the safetensors files. The header is parsed here
 (``safe_open`` cannot hand back the one-byte ``F8_*`` dtypes through numpy); each device shard's row range is read in
 bounded blocks into one uint8 buffer, placed into that device's memory (pinned host when the module offloads), and
@@ -28,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import struct
 import typing as tp
 from collections.abc import Iterable
@@ -35,11 +38,37 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from easydel.layers.embeddings._engram import FP8_SCALE_BLOCK, engram_table_padded_rows
+from ._layer import FP8_SCALE_BLOCK, engram_table_padded_rows
 
-from ._native_checkpoint import engram_table_checkpoint_keys
+__all__ = [
+    "ENGRAM_TABLE_KEY_RE",
+    "EngramTensorRef",
+    "engram_table_checkpoint_keys",
+    "load_engram_tables",
+    "read_engram_rows",
+    "scan_engram_tensors",
+]
 
-__all__ = ["EngramTensorRef", "load_engram_tables", "read_engram_rows", "scan_engram_tensors"]
+#: Native checkpoint key of an engram table tensor: ``layers.<layer_id>.engram.embed.{weight,scale}``.
+ENGRAM_TABLE_KEY_RE = re.compile(r"^layers\.(\d+)\.engram\.embed\.(weight|scale)$")
+
+
+def engram_table_checkpoint_keys(keys: Iterable[str]) -> dict[int, dict[str, str]]:
+    """Find the engram table tensors (fp8 ``embed.weight`` and e8m0 ``embed.scale``) in a native key list.
+
+    Args:
+        keys: Native checkpoint keys, e.g. the ``weight_map`` of ``model.safetensors.index.json``.
+
+    Returns:
+        ``{layer_id: {"weight": key, "scale": key}}`` for every layer that has table keys.
+    """
+    found: dict[int, dict[str, str]] = {}
+    for key in keys:
+        m = ENGRAM_TABLE_KEY_RE.match(key)
+        if m is not None:
+            found.setdefault(int(m.group(1)), {})[m.group(2)] = key
+    return found
+
 
 _ALLOWED_DTYPES: dict[str, tuple[str, ...]] = {"weight": ("F8_E4M3", "U8"), "scale": ("F8_E8M0", "U8")}
 _PAD_VALUE = {"weight": 0, "scale": 1}

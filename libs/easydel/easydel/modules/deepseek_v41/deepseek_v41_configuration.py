@@ -31,11 +31,11 @@ Semantics follow DeepSeek's reference implementation (``inference/model.py`` in 
 
 from __future__ import annotations
 
-import functools
 import typing as tp
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
+from easydel.layers.engram._hashing import engram_bucket_primes, engram_table_rows
 
 # Released DeepSeek-V4.1-Flash schedule: 40 backbone layers + 3 MTP layers.
 _DEFAULT_COMPRESS_RATIOS: tuple[int, ...] = (0, 0) + (2,) * 18 + (1,) * 20 + (0, 0, 0)
@@ -97,6 +97,7 @@ _TEXT_DEFAULTS: dict[str, tp.Any] = {
     "engram_table_dtype": "param",
     "quantize_expert_chunk": None,
     "indexer_aux_loss_coef": 0.0,
+    "ced_prefill_skip": True,
     "num_nextn_predict_layers": 3,
     "dspark_block_size": 5,
     "dspark_noise_token_id": 128799,
@@ -137,67 +138,6 @@ _LIST_FIELDS = (
 )
 
 
-def _is_prime(n: int) -> bool:
-    """Deterministic Miller-Rabin primality test (exact for ``n < 3.3e24``)."""
-    if n < 2:
-        return False
-    witnesses = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
-    for p in witnesses:
-        if n % p == 0:
-            return n == p
-    d, s = n - 1, 0
-    while d % 2 == 0:
-        d //= 2
-        s += 1
-    for a in witnesses:
-        x = pow(a, d, n)
-        if x in (1, n - 1):
-            continue
-        for _ in range(s - 1):
-            x = x * x % n
-            if x == n - 1:
-                break
-        else:
-            return False
-    return True
-
-
-@functools.lru_cache(maxsize=16)
-def engram_bucket_primes(
-    num_layers: int, max_ngram_size: int, n_heads: int, vocab_size: int
-) -> tuple[tuple[tuple[int, ...], ...], ...]:
-    """Prime bucket moduli ``[layer][ngram_size - 2][head]`` of the engram hash tables.
-
-    Mirrors ``EngramLayout.from_args`` in the reference ``engram.py``: for every (layer, n-gram size, head) the
-    search starts again at ``vocab_size - 1`` and takes the next prime not handed out before, so bucket ranges
-    never repeat across the whole model.
-
-    Args:
-        num_layers: Number of engram layers.
-        max_ngram_size: Largest n-gram size (n-gram sizes ``2..max_ngram_size`` are hashed).
-        n_heads: Hash heads per n-gram size.
-        vocab_size: ``engram_vocab_size``; primes are drawn upward from ``vocab_size - 1``.
-
-    Returns:
-        Nested tuple of primes.
-    """
-    seen: set[int] = set()
-    layers = []
-    for _ in range(num_layers):
-        per_ngram = []
-        for _ in range(max_ngram_size - 1):
-            sizes, current = [], vocab_size - 1
-            for _ in range(n_heads):
-                current += 1
-                while not _is_prime(current) or current in seen:
-                    current += 1
-                seen.add(current)
-                sizes.append(current)
-            per_ngram.append(tuple(sizes))
-        layers.append(tuple(per_ngram))
-    return tuple(layers)
-
-
 @register_config("deepseek_v41")
 class DeepseekV41Config(EasyDeLBaseConfig):
     """Configuration for DeepSeek-V4.1 (text tower; composite HF checkpoints are absorbed).
@@ -224,12 +164,15 @@ class DeepseekV41Config(EasyDeLBaseConfig):
     - ``engram_table_dtype``: ``"param"`` (default) stores each engram table as one ``param_dtype`` parameter;
       ``"fp8"`` keeps the released layout (float8_e4m3fn ``embed.weight`` + uint8 e8m0 ``embed.scale`` buffers,
       row-sharded over all devices, dequantized per looked-up row). Use it with ``engram_table_memory_kind="pinned_host"``
-      and fill the tables with ``easydel.modules.deepseek_v41._engram_loader``.
+      and fill the tables with ``easydel.layers.engram.load_engram_tables``.
     - ``quantize_expert_chunk``: ``None`` (default) quantizes each stacked expert kernel in one step at load; an int
       quantizes that many experts at a time so the fp32 temporaries stay bounded (result is identical).
     - ``indexer_aux_loss_coef``: ``0.0`` (default) leaves the indexer without a training signal (hard top-k). A
       positive value adds ``coef * sum_layers KL(stop_grad(dense head-summed attention over compressed entries) ||
       softmax(indexer scores))`` to the loss (DSA indexer warm-up objective), updating only the indexer parameters.
+    - ``ced_prefill_skip``: ``True`` (default) lets eSurge prefill skip the window-only decoder layers after the last
+      KV source on steps whose tokens all lie outside their receptive field (exact; see
+      ``modeling_deepseek_v41._ced_decoder_tail``). ``False`` always runs every layer.
     """
 
     model_type: str = "deepseek_v41"
@@ -464,12 +407,7 @@ class DeepseekV41Config(EasyDeLBaseConfig):
             ValueError: If ``engram_num_embeddings`` is set and disagrees with the derived layout (the hash
                 offsets would then address the wrong rows).
         """
-        derived = [sum(p for per_ngram in layer for p in per_ngram) for layer in self.engram_primes()]
-        if self.engram_num_embeddings is not None and list(self.engram_num_embeddings) != derived:
-            raise ValueError(
-                f"engram_num_embeddings {self.engram_num_embeddings} disagrees with the prime-bucket layout {derived}."
-            )
-        return derived
+        return engram_table_rows(self)
 
     @property
     def vision_enabled(self) -> bool:
@@ -534,4 +472,4 @@ class DeepseekV41Config(EasyDeLBaseConfig):
         raise KeyError(f"DeepSeek-V4.1 rope parameters for label {label!r} not found.")
 
 
-__all__ = ["DeepseekV41Config", "engram_bucket_primes"]
+__all__ = ["DeepseekV41Config"]

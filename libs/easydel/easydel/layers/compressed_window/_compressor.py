@@ -35,7 +35,9 @@ __all__ = (
     "gather_group_members",
     "last_closed_overlap",
     "overlap_group_slots",
+    "record_stream_trace",
     "refresh_group_state",
+    "trace_compressor_stream",
 )
 
 
@@ -191,6 +193,114 @@ def refresh_group_state(
     return jnp.where(layout.refresh[..., None], src, state)
 
 
+def record_stream_trace(
+    trace_kv: Array | None,
+    trace_gate: Array | None,
+    trace_overlap_kv: Array | None,
+    trace_overlap_gate: Array | None,
+    *,
+    buffer_kv: Array,
+    buffer_gate: Array,
+    kv_blk: Array,
+    gate_blk: Array,
+    positions: Int[Array, "batch block"],
+    valid: Bool[Array, "batch block"] | None,
+    rate: int,
+    head_dim: int,
+    position_bias: Array | None = None,
+) -> tuple[Array | None, Array | None, Array | None, Array | None]:
+    """Record a block of one compressor stream's tokens for replay-free speculative rollback.
+
+    Must see the stream's open-group buffers *before* the block is applied. Writes each valid cell's raw kv / gate row
+    (in buffer dtype: exactly what the buffer stores) at trace slot ``position % L``; for two-series streams also the
+    Ca half of every window that closes inside the block (kv in overlap dtype, gate with ``position_bias`` added in
+    fp32: exactly the overlap state the step leaves) at slot ``window % L``. Read back by
+    :func:`easydel.caching.compressed_window.commit_speculative_window`; a single-token decode step is a block of one.
+
+    Args:
+        trace_kv: Raw kv trace ``[B, L, feat]`` (``None``: nothing is recorded).
+        trace_gate: Raw gate trace ``[B, L, feat]``.
+        trace_overlap_kv: Closed-window Ca kv trace ``[B, L, rate, head_dim]`` (``None`` for single-series streams).
+        trace_overlap_gate: Closed-window biased fp32 Ca gate trace, same shape.
+        buffer_kv: Open-window kv buffer before the block ``[B, rate, feat]``.
+        buffer_gate: Open-window gate buffer before the block ``[B, rate, feat]``.
+        kv_blk: Raw kv projections of the block ``[B, blk, feat]``.
+        gate_blk: Raw gate projections of the block ``[B, blk, feat]`` (position bias NOT applied).
+        positions: Stream positions ``[B, blk]`` (garbage at invalid cells).
+        valid: ``[B, blk]`` bool prefix per row (``None``: every cell is valid).
+        rate: Compression rate.
+        head_dim: Per-series width of a two-series stream.
+        position_bias: Learned within-window bias ``[rate, feat]`` (required with overlap traces).
+
+    Returns:
+        The four updated traces.
+    """
+    if trace_kv is None:
+        return trace_kv, trace_gate, trace_overlap_kv, trace_overlap_gate
+    positions = positions.astype(jnp.int32)
+    if valid is None:
+        valid = jnp.ones(positions.shape, dtype=bool)
+    rows = jnp.arange(positions.shape[0])[:, None]
+    length = trace_kv.shape[1]
+    fresh_kv = kv_blk.astype(buffer_kv.dtype)
+    fresh_gate = gate_blk.astype(buffer_gate.dtype)
+    slot = jnp.where(valid, positions % length, length)
+    trace_kv = trace_kv.at[rows, slot].set(fresh_kv.astype(trace_kv.dtype), mode="drop")
+    trace_gate = trace_gate.at[rows, slot].set(fresh_gate.astype(trace_gate.dtype), mode="drop")
+    if trace_overlap_kv is not None:
+        if position_bias is None:
+            raise ValueError("record_stream_trace needs position_bias to record two-series overlaps.")
+        layout = block_group_layout(positions, valid, rate)
+        kv_members = gather_group_members(layout, buffer_kv, fresh_kv)  # [B, G, rate, feat]
+        gate_members = gather_group_members(layout, buffer_gate, fresh_gate).astype(jnp.float32) + position_bias.astype(
+            jnp.float32
+        )
+        windows = trace_overlap_kv.shape[1]
+        window_slot = jnp.where(layout.closed, layout.entry % windows, windows)  # [B, G]
+        trace_overlap_kv = trace_overlap_kv.at[rows, window_slot].set(
+            kv_members[..., :head_dim].astype(trace_overlap_kv.dtype), mode="drop"
+        )
+        trace_overlap_gate = trace_overlap_gate.at[rows, window_slot].set(
+            gate_members[..., :head_dim].astype(trace_overlap_gate.dtype), mode="drop"
+        )
+    return trace_kv, trace_gate, trace_overlap_kv, trace_overlap_gate
+
+
+def trace_compressor_stream(
+    view: tp.Any,
+    prefix: str,
+    *,
+    kv: Array,
+    gate: Array,
+    positions: Int[Array, "batch block"],
+    valid: Bool[Array, "batch block"] | None,
+    rate: int,
+    head_dim: int,
+    position_bias: Array | None = None,
+) -> tp.Any:
+    """Apply :func:`record_stream_trace` to the ``<prefix>_*`` stream of a cache view (no-op without traces).
+
+    Call with the view *before* the stream's step updates its buffers. Reads ``<prefix>_buffer_kv/gate`` and updates
+    ``<prefix>_trace_kv``, ``<prefix>_trace_gate`` and (two-series) ``<prefix>_trace_overlap_kv/gate``.
+    """
+    if getattr(view, f"{prefix}_trace_kv", None) is None:
+        return view
+    names = (f"{prefix}_trace_kv", f"{prefix}_trace_gate", f"{prefix}_trace_overlap_kv", f"{prefix}_trace_overlap_gate")
+    traces = record_stream_trace(
+        *(getattr(view, name, None) for name in names),
+        buffer_kv=getattr(view, f"{prefix}_buffer_kv"),
+        buffer_gate=getattr(view, f"{prefix}_buffer_gate"),
+        kv_blk=kv,
+        gate_blk=gate,
+        positions=positions,
+        valid=valid,
+        rate=rate,
+        head_dim=head_dim,
+        position_bias=position_bias,
+    )
+    return view.replace(**{name: value for name, value in zip(names, traces, strict=True) if value is not None})
+
+
 @dataclass(frozen=True)
 class GatedPoolCompressorConfig:
     """Scalar settings of :class:`GatedPoolCompressor`, independent of model configs.
@@ -288,6 +398,7 @@ class GatedPoolCompressor(spx.Module):
         kv_state: Float[Array, "batch ratio dim"] | None,
         score_state: Float[Array, "batch ratio dim"] | None,
         position: Int[Array, " batch"],
+        projections: tuple[Array, Array] | None = None,
     ) -> tuple[Array, Array | None, Array | None, Bool[Array, " batch"], Int[Array, " batch"]]:
         """Advance the compressor by one token per row.
 
@@ -300,6 +411,8 @@ class GatedPoolCompressor(spx.Module):
             kv_state: Open-group fp32 kv state ``[B, ratio, head_dim]`` (``None`` for ratio 1).
             score_state: Open-group fp32 gate-score state ``[B, ratio, head_dim]`` (``None`` for ratio 1).
             position: Stream position of the new token per row ``[B]``.
+            projections: Optional precomputed :meth:`project` output ``(kv [B, 1, D], score [B, 1, D])`` (ratio > 1);
+                ``None`` projects ``hidden_states`` here.
 
         Returns:
             ``(latent [B, 1, head_dim], kv_state, score_state, closed [B], entry [B])`` where ``closed`` marks rows
@@ -310,7 +423,7 @@ class GatedPoolCompressor(spx.Module):
             latent = self(hidden_states)  # [B, 1, D]
             return latent, kv_state, score_state, jnp.ones((batch,), dtype=bool), position
         rows = jnp.arange(batch)
-        kv_t, score_t = self.project(hidden_states)
+        kv_t, score_t = self.project(hidden_states) if projections is None else projections
         slot = position % self.ratio
         kv_state = kv_state.at[rows, slot].set(kv_t[:, 0])
         score_state = score_state.at[rows, slot].set(score_t[:, 0])
@@ -325,6 +438,7 @@ class GatedPoolCompressor(spx.Module):
         score_state: Float[Array, "batch ratio dim"] | None,
         positions: Int[Array, "batch block"],
         valid: Bool[Array, "batch block"],
+        projections: tuple[Array, Array] | None = None,
     ) -> tuple[Array, Array | None, Array | None, Bool[Array, "batch groups"], Int[Array, "batch groups"]]:
         """Advance the compressor by a block of tokens per row in one pass (batched packed prefill).
 
@@ -339,6 +453,8 @@ class GatedPoolCompressor(spx.Module):
             score_state: Open-group fp32 gate-score state ``[B, ratio, head_dim]`` (``None`` for ratio 1).
             positions: Stream positions ``[B, blk]`` (garbage at invalid cells).
             valid: ``[B, blk]`` bool, a prefix per row.
+            projections: Optional precomputed :meth:`project` output ``(kv [B, blk, D], score [B, blk, D])``
+                (ratio > 1); ``None`` projects ``hidden_states`` here.
 
         Returns:
             ``(latent [B, G, head_dim], kv_state, score_state, closed [B, G], entry [B, G])``: ``closed`` marks the
@@ -350,7 +466,7 @@ class GatedPoolCompressor(spx.Module):
         positions = positions.astype(jnp.int32)
         if ratio == 1:
             return self(hidden_states), kv_state, score_state, valid, positions
-        kv_t, score_t = self.project(hidden_states)  # fp32 [B, blk, D]
+        kv_t, score_t = self.project(hidden_states) if projections is None else projections  # fp32 [B, blk, D]
         layout = block_group_layout(positions, valid, ratio)
         latent = self.pool(
             gather_group_members(layout, kv_state, kv_t), gather_group_members(layout, score_state, score_t), dtype

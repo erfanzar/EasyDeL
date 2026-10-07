@@ -44,13 +44,11 @@ Deviations from the reference: no fp8/fp4 activation fake-quantization of the wi
 
 from __future__ import annotations
 
-import contextlib
 import copy
 import typing as tp
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 import spectrax as spx
 from jaxtyping import Array, Float, Int
 from spectrax import nn
@@ -60,6 +58,7 @@ from easydel.layers import ColumnParallelLinear, ParallelLinear
 from easydel.layers.embeddings._embeddings import default_embed_init
 from easydel.layers.residual import manifold_collapse, manifold_residual_write
 from easydel.modules._drafting import AcceptRatePredictor, VanillaMarkovHead, WindowRingDraftAttentionMixin
+from easydel.modules._dspark_drafter import DSparkDrafter, DSparkState
 from easydel.modules.deepseek_v4.modeling_deepseek_v4 import (
     _MASK_MIN,
     DeepseekV4HyperConnection,
@@ -75,16 +74,8 @@ EmbedFn = tp.Callable[[Array], Array]
 LmHeadFn = tp.Callable[[Array], Array]
 
 
-class DeepseekV41DSparkState(tp.NamedTuple):
-    """Draft-model state: one sliding-window ring per stage and the next main position.
-
-    Attributes:
-        window_kv: Per stage ``[B, sliding_window, head_dim]`` post-RoPE main K/V ring (token ``p`` at slot ``p % W``).
-        position: ``int32 [B]`` position of the main hidden state the next :meth:`DeepseekV41DSpark.draft` call gets.
-    """
-
-    window_kv: tuple[Array, ...]
-    position: Array
+#: The shared DSpark draft state (one window ring per stage + next main position), kept under its V4.1 name.
+DeepseekV41DSparkState = DSparkState
 
 
 def _draft_config(config: DeepseekV41Config) -> DeepseekV41Config:
@@ -354,291 +345,8 @@ class DeepseekV41DSpark(spx.Module):
         return out_ids, logits, confidence, DeepseekV41DSparkState(tuple(rings), position + 1)
 
 
-def _pad_pow2(count: int, minimum: int = 8) -> int:
-    """Smallest power of two ``>= max(count, minimum)`` (bounds the number of compiled append programs)."""
-    size = minimum
-    while size < count:
-        size *= 2
-    return size
-
-
-class DeepseekV41DSparkDrafter:
-    """eSurge drafter that runs the V4.1 DSpark draft model over the backbone's main hidden states.
-
-    Contract with the eSurge runner (the flags are read through ``getattr`` by the runner / strategy):
-
-    - ``needs_main_hidden``: the model step returns ``concat([last_hidden, main_hidden], -1)`` rows (width
-      ``(1 + T) * D``); the drafter reads the ``main_hidden`` part ``[D:]`` of every row.
-    - ``whole_block_draft``: one :meth:`draft_window` call proposes the whole window (greedy), instead of the
-      per-token loop of the generic strategy.
-    - ``rolls_back_cache``: the target cache (``SharedCompressedWindowCache``) is not paged, so the runner snapshots
-      it before a speculative verify window and, when any draft is rejected, restores it and replays the accepted
-      prefix. The DSpark rings are NOT rolled back: only committed positions are ever written into them.
-    - ``supports_compressed_window_cache``: lifts the runner's compressed-window / drafter incompatibility guard.
-    - ``supports_prefix_draft``: makes the runner return full hidden rows for prompt windows (the rings are seeded
-      from every prompt position).
-
-    Ring bookkeeping (host side, per drafter row ``r``): ``_through[r]`` is the highest main position whose K/V is in
-    the rings of row ``r``. Window hidden rows reach the drafter through :meth:`observe_window` (committed real tokens,
-    written eagerly) and :meth:`draft_window` (accepted draft positions, written lazily once the verify outcome is
-    known, followed by the seed position itself). A row whose positions are not contiguous (missing hidden rows,
-    chunked prefill) is marked broken and simply stops drafting: output stays correct, speculation just turns off.
-
-    Only greedy requests are drafted for (the draft head is greedy).
-    """
-
-    supports_prefix_draft: bool = True
-    supports_return_full_log_probs: bool = False
-    requires_target_kv_cache: bool = False
-    supports_compressed_window_cache: bool = True
-    needs_main_hidden: bool = True
-    whole_block_draft: bool = True
-    rolls_back_cache: bool = True
-
-    def __init__(
-        self,
-        *,
-        target_model: tp.Any,
-        dspark: DeepseekV41DSpark,
-        num_draft_tokens: int | None = None,
-        dtype: jnp.dtype | None = None,
-    ):
-        """Create the drafter.
-
-        Args:
-            target_model: The V4.1 causal LM whose embedding and LM head the draft model shares.
-            dspark: The DSpark draft model (built under ``config.mesh``).
-            num_draft_tokens: Drafted tokens per verify window; clamped to ``dspark.block_size``. ``None`` uses the
-                full block.
-            dtype: Ring storage dtype; defaults to the target model's ``dtype``.
-        """
-        block = int(dspark.block_size)
-        requested = block if num_draft_tokens is None else int(num_draft_tokens)
-        self.target_model = target_model
-        self.dspark = dspark
-        self.config = dspark.config
-        self.block_size = block
-        self.num_draft_tokens = max(1, min(requested, block))
-        self.hidden_size = int(self.config.hidden_size)
-        self.window = int(self.config.sliding_window)
-        self.dtype = dtype if dtype is not None else getattr(target_model, "dtype", jnp.float32)
-        self._capacity = 0
-        self._rings: tuple[jax.Array, ...] | None = None
-        self._owner: dict[int, str] = {}
-        self._through: dict[int, int] = {}
-        self._last_window: dict[int, tuple[jax.Array, int, int, int]] = {}
-        self._broken: set[int] = set()
-        self._programs: tuple[tp.Any, ...] | None = None
-
-    def set_max_length(self, max_length: int) -> None:
-        """Accept the runner's max model length (rings are window-sized, so nothing to size)."""
-        del max_length
-
-    def reset_request(self, request_id: str | None = None) -> None:
-        """No-op: per-request state is reset when a row changes owner (see :meth:`observe_window`)."""
-        del request_id
-
-    def reset(self, batch_size: int) -> None:
-        """Re-allocate zeroed rings for ``batch_size`` rows and forget every row owner."""
-        self._alloc(max(1, int(batch_size)))
-
-    def ensure_batch_size(self, batch_size: int) -> None:
-        """Allocate the ring pool on first use (no-op when already large enough)."""
-        if self._rings is None or self._capacity < int(batch_size):
-            self._alloc(int(batch_size))
-
-    def _alloc(self, rows: int) -> None:
-        head_dim = int(self.config.head_dim)
-        self._rings = tuple(
-            jnp.zeros((rows, self.window, head_dim), self.dtype) for _ in range(int(self.dspark.num_stages))
-        )
-        self._capacity = rows
-        self._owner.clear()
-        self._through.clear()
-        self._last_window.clear()
-        self._broken.clear()
-
-    def _reset_row(self, row: int, req_id: str) -> None:
-        """Hand ``row`` to ``req_id``: zero its rings and restart its position bookkeeping."""
-        self._owner[row] = req_id
-        self._through[row] = -1
-        self._last_window.pop(row, None)
-        self._broken.discard(row)
-        self._rings = tuple(ring.at[row].set(0) for ring in self._rings)
-
-    @contextlib.contextmanager
-    def _context(self) -> tp.Iterator[None]:
-        from easydel.utils import set_inference_mode
-
-        with self.target_model.mesh, set_inference_mode():
-            yield
-
-    def _ensure_programs(self) -> None:
-        """Export both models once and build the jitted append / draft programs."""
-        if self._programs is not None:
-            return
-        dgraphdef, dstate = spx.export(self.dspark)
-        tgraphdef, tstate = spx.export(self.target_model)
-        hidden_size, window = self.hidden_size, self.window
-
-        def append(dstate, rings, hidden, gather, positions, rows):
-            dm = spx.bind(dgraphdef, dstate)
-            main_flat = hidden[gather][:, hidden_size:]
-            main_x = dm._main_x(main_flat[None])
-            slots = positions % window
-            out = []
-            for stage, ring in zip(dm.stages, rings, strict=True):
-                kv = stage.self_attn.main_kv(main_x, positions[None])[0]
-                out.append(ring.at[rows, slots].set(kv.astype(ring.dtype), mode="drop"))
-            return tuple(out)
-
-        def step(dstate, tstate, rings, row, token, main_step, position):
-            dm = spx.bind(dgraphdef, dstate)
-            tm = spx.bind(tgraphdef, tstate)
-            state = DeepseekV41DSparkState(tuple(ring[row][None] for ring in rings), position[None])
-            ids, _logits, _confidence, new_state = dm.draft(
-                token[None], main_step[None, None, :], state, tm.compute_embedding, tm.compute_lm_logits
-            )
-            new_rings = tuple(
-                ring.at[row].set(win[0].astype(ring.dtype)) for ring, win in zip(rings, new_state.window_kv, strict=True)
-            )
-            return ids[0], new_rings
-
-        self._programs = (dstate, tstate, jax.jit(append), jax.jit(step))
-
-    def _write(self, hidden: jax.Array, gather: list[int], rows: list[int], positions: list[int]) -> None:
-        """Write main K/V of ``hidden[gather]`` (positions ``positions``, rows ``rows``) into the rings."""
-        count = len(gather)
-        if count == 0:
-            return
-        self._ensure_programs()
-        dstate, _tstate, append, _step = self._programs
-        pad = _pad_pow2(count) - count
-        gather_a = jnp.asarray(np.asarray(gather + [0] * pad, dtype=np.int32))
-        positions_a = jnp.asarray(np.asarray(positions + [0] * pad, dtype=np.int32))
-        rows_a = jnp.asarray(np.asarray(rows + [self._capacity] * pad, dtype=np.int32))  # out-of-range rows are dropped
-        with self._context():
-            self._rings = append(dstate, self._rings, hidden, gather_a, positions_a, rows_a)
-
-    def _catch_up(self, row: int, start: int) -> None:
-        """Write positions accepted after the previous window (accepted drafts) up to ``start - 1`` from its hidden.
-
-        A window whose verify accepted draft tokens committed positions beyond its real tokens; when no draft was
-        proposed afterwards (:meth:`draft_window` writes them lazily) they are filled here from the remembered hidden
-        rows of that window.
-        """
-        through = self._through.get(row, -1)
-        previous = self._last_window.get(row)
-        if through >= start - 1 or previous is None:
-            return
-        hidden, offset, pstart, pcount = previous
-        if through + 1 < pstart:
-            return  # gap before the remembered window: cannot be recovered, the caller marks the row broken
-        positions = list(range(max(through + 1, start - self.window), min(start, pstart + pcount)))
-        if positions:
-            self._write(hidden, [offset + q - pstart for q in positions], [row] * len(positions), positions)
-            if positions[-1] == start - 1:
-                self._through[row] = start - 1
-
-    def observe_window(self, hidden: jax.Array | None, entries: list[tuple[str, int, int, int, int, int]]) -> None:
-        """Record the committed real tokens of one executed window.
-
-        Args:
-            hidden: Window hidden rows ``[N, (1 + T) * D]`` (last hidden | main hidden), or ``None``.
-            entries: ``(req_id, row, offset, start, n_commit, count)`` per scheduled request: the request's rows start
-                at ``hidden[offset]``, its first token is at position ``start``, ``n_commit`` leading tokens are
-                committed (scheduled draft tokens excluded) and ``count`` tokens were scheduled in total.
-                ``n_commit < 0`` means the hidden rows are unavailable.
-        """
-        if not entries:
-            return
-        self.ensure_batch_size(max(row for _rid, row, *_rest in entries) + 1)
-        gather: list[int] = []
-        rows: list[int] = []
-        positions: list[int] = []
-        for req_id, row, offset, start, n_commit, count in entries:
-            req_id = str(req_id)
-            if self._owner.get(row) != req_id or start == 0:
-                self._reset_row(row, req_id)  # new request on this row, or a request restarted from position 0
-            if row in self._broken:
-                continue
-            self._catch_up(row, start)
-            if n_commit < 0 or hidden is None or self._through[row] != start - 1:
-                self._broken.add(row)
-                continue
-            self._last_window[row] = (hidden, offset, start, int(count))
-            if n_commit == 0:
-                continue
-            last = start + n_commit
-            for q in range(max(start, last - self.window), last):  # only the last window of positions is kept
-                gather.append(offset + q - start)
-                rows.append(row)
-                positions.append(q)
-            self._through[row] = last - 1
-        self._write(hidden, gather, rows, positions)
-
-    def draft_window(
-        self,
-        *,
-        req_id: str,
-        row: int,
-        seed_token: int,
-        seed_position: int,
-        hidden: jax.Array,
-        offset: int,
-        start: int,
-        n: int,
-        k: int,
-    ) -> list[int]:
-        """Greedily draft ``k`` tokens after ``seed_token`` (at position ``seed_position + 1``).
-
-        Args:
-            req_id: Request being drafted for.
-            row: The request's stable drafter row.
-            seed_token: Last accepted token.
-            seed_position: Position of the main hidden state the draft reads (``seed_token``'s position minus one);
-                must lie inside the window ``[start, start + n)`` of the last observed step.
-            hidden: The last observed step's hidden rows ``[N, (1 + T) * D]``.
-            offset: Row of ``hidden`` holding the request's first token of that step.
-            start: Position of that first token.
-            n: Number of tokens the request had in that step.
-            k: Tokens to draft (``<= num_draft_tokens``).
-
-        Returns:
-            ``k`` drafted token ids, or ``[]`` when this row cannot draft (broken / out-of-window seed).
-        """
-        req_id = str(req_id)
-        position = int(seed_position)
-        local = position - int(start)
-        if self._owner.get(row) != req_id or row in self._broken or not 0 <= local < int(n):
-            return []
-        through = self._through.get(row, -1)
-        if through < start - 1:
-            self._broken.add(row)
-            return []
-        missing = list(range(max(through + 1, int(start)), position))[-self.window :]
-        if missing:
-            self._write(hidden, [int(offset) + q - int(start) for q in missing], [row] * len(missing), missing)
-        self._ensure_programs()
-        dstate, tstate, _append, step = self._programs
-        main_step = hidden[int(offset) + local][self.hidden_size :]
-        with self._context():
-            ids, self._rings = step(
-                dstate,
-                tstate,
-                self._rings,
-                jnp.asarray(row, dtype=jnp.int32),
-                jnp.asarray(int(seed_token), dtype=jnp.int32),
-                main_step,
-                jnp.asarray(position, dtype=jnp.int32),
-            )
-        self._through[row] = position
-        return [int(t) for t in np.asarray(ids)[1 : 1 + int(k)]]
-
-    def draft(self, *args: tp.Any, **kwargs: tp.Any) -> tp.NoReturn:
-        """Unsupported: this drafter is driven through :meth:`draft_window` (``whole_block_draft``)."""
-        del args, kwargs
-        raise NotImplementedError("DeepseekV41DSparkDrafter drafts whole windows via `draft_window`.")
+class DeepseekV41DSparkDrafter(DSparkDrafter):
+    """eSurge drafter for the V4.1 DSpark draft model (the shared :class:`~easydel.modules._dspark_drafter.DSparkDrafter`)."""
 
 
 @register_drafter("deepseek_v41_dspark", "v41_dspark")

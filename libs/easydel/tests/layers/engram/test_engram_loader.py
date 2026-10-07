@@ -17,16 +17,12 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from easydel.modules.deepseek_v41._engram_loader import read_engram_rows, scan_engram_tensors
-from easydel.modules.deepseek_v41._native_checkpoint import (
-    engram_table_checkpoint_keys,
-    native_key_to_easydel_v41,
-    native_key_to_easydel_v41_vl,
-)
+from easydel.layers.engram import engram_table_checkpoint_keys, read_engram_rows, scan_engram_tensors
+from easydel.modules.deepseek_v41._native_checkpoint import native_key_to_easydel_v41, native_key_to_easydel_v41_vl
 
 pytestmark = pytest.mark.cpu_ok
 
-_INDEX = Path(__file__).resolve().parents[4] / ".xerxes/projects/deepseek-v41/ref/model.safetensors.index.json"
+_INDEX = Path(__file__).resolve().parents[5] / ".xerxes/projects/deepseek-v41/ref/model.safetensors.index.json"
 
 
 def _write_safetensors(path: Path, tensors: dict[str, tuple[str, np.ndarray]]) -> None:

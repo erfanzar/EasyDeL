@@ -1064,7 +1064,7 @@ class eSurge:
         prepare = getattr(type(model), "esurge_prepare_tokenizer", None)
         if prepare is None:
             return
-        state = prepare(getattr(self, "tokenizer", None), model.config)
+        state = prepare(model, getattr(self, "tokenizer", None))
         if state is not None:
             self.runner.set_side_input_tokenizer_state(state)
 

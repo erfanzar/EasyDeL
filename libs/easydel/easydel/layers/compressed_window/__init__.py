@@ -27,7 +27,9 @@ from ._compressor import (
     gather_group_members,
     last_closed_overlap,
     overlap_group_slots,
+    record_stream_trace,
     refresh_group_state,
+    trace_compressor_stream,
 )
 from ._packed import (
     PACKED_PREFILL_BLOCK,
@@ -63,6 +65,7 @@ __all__ = (
     "occupied_columns",
     "overlap_group_slots",
     "packed_block_size",
+    "record_stream_trace",
     "refresh_group_state",
     "ring_decode_write",
     "ring_prefill_write",
@@ -71,4 +74,5 @@ __all__ = (
     "run_column_blocks",
     "sink_attention",
     "tokens_to_grid",
+    "trace_compressor_stream",
 )

@@ -432,11 +432,6 @@ class eSurgeRunner:
         # ``multimodal/side_inputs.py``); the model's provider is built lazily on first use.
         self._side_input_tokenizer_state: typing.Any = None
         self._side_input_provider: typing.Any | None = None
-        if drafter is not None and model_has_side_inputs(self.model):
-            raise ValueError(
-                "Speculative decoding is not wired for models that need per-token side inputs: the draft/replay "
-                "execute paths do not carry model-declared side inputs."
-            )
         if (
             self._slot_indexed_state
             and drafter is not None
@@ -632,9 +627,14 @@ class eSurgeRunner:
         recurrent_layer_types = {"linear_attention", "kda_linear_attention", "parallel_hybrid", "hybrid"}
         has_recurrent_layers = any(str(layer_type).lower() in recurrent_layer_types for layer_type in layer_types)
         self._has_recurrent_layers = bool(has_recurrent_layers)
-        self.spec_decode_recurrent_candidates = bool(
-            drafter is not None and int(self.num_draft_tokens) > 0 and has_recurrent_layers
-        )
+        # Speculative candidate rows: generic recurrent (GDN) views and KDA views (Kimi-Linear, GLM-5-Next; GLM labels
+        # them ``linear_attention`` at model level, ``kda_linear_attention`` at cache level) both keep the decode-exact
+        # state after every verify prefix in extra prefix-major pool rows, so an accepted prefix is committed by a row
+        # copy instead of snapshot + replay (``kda_packed_rows_forward`` writes and commits the KDA rows).
+        spec_active = drafter is not None and int(self.num_draft_tokens) > 0
+        self.spec_decode_recurrent_candidates = bool(spec_active and has_recurrent_layers)
+        # Replay-only rollback is no longer needed by any recurrent family; kept for the call sites that branch on it.
+        self.spec_decode_recurrent_replay_only = False
         # Greedy recurrent verify: how to advance the live recurrent (GDN) state
         # after a verify window.
         #   fast path (default): reuse the fused verify forward's argmax + the
@@ -668,6 +668,13 @@ class eSurgeRunner:
             full_hidden_state_max_tokens=spec_full_hidden_max_tokens,
             speculative_recurrent_state_tokens=(
                 int(self.num_draft_tokens) + 1 if self.spec_decode_recurrent_candidates else 0
+            ),
+            # Drafters that roll back a per-slot (compressed-window) cache: keep verify-width projection traces so a
+            # partially accepted window commits without a replay forward.
+            speculative_trace_tokens=(
+                int(self.num_draft_tokens) + 1
+                if drafter is not None and bool(getattr(drafter, "rolls_back_cache", False))
+                else 0
             ),
         )
         if drafter is not None and bool(getattr(drafter, "needs_main_hidden", False)):
@@ -1763,6 +1770,28 @@ class eSurgeRunner:
 
         self._precompile_draft_schedule_variants()
         self._precompile_draft_in_verify_variants()
+        self._precompile_whole_block_drafter()
+
+    def _precompile_whole_block_drafter(self) -> None:
+        """Warm a whole-block drafter's (DSpark) programs through its optional ``precompile`` hook.
+
+        Without it the draft programs JIT lazily at every new padded row count, inside serving steps. Failures are
+        logged and skipped; the runtime path still compiles lazily.
+        """
+        if self.drafter is None or int(self.num_draft_tokens) <= 0:
+            return
+        precompile = getattr(self.drafter, "precompile", None)
+        if not bool(getattr(self.drafter, "whole_block_draft", False)) or not callable(precompile):
+            return
+        try:
+            precompile(
+                max_num_reqs=max(1, int(self.max_num_reqs)),
+                max_tokens=int(self.max_num_tokens),
+                hidden_dtype=getattr(self.model, "dtype", None),
+            )
+            logger.debug("Whole-block drafter precompiled")
+        except Exception as e:
+            logger.debug(f"Whole-block drafter precompile skip: {e}")
 
     def update_model_weights(
         self,
@@ -2078,7 +2107,51 @@ class eSurgeRunner:
             start = int(self.sequence_buffer.num_computed_tokens[row])
             req_state = self.requests.get(rid) if rid is not None else None
             types = None if req_state is None else req_state.token_types
-            windows.append(SideInputWindow(self.sequence_buffer.token_ids[row], types, start, start + n))
+            known = int(self.sequence_buffer.num_tokens_no_spec[row])
+            windows.append(SideInputWindow(self.sequence_buffer.token_ids[row], types, start, start + n, known))
+        return self._get_side_input_provider().build(windows, int(num_tokens_static))
+
+    def _side_inputs_for_execute(
+        self,
+        *,
+        token_ids_cpu: np.ndarray,
+        num_computed_tokens_cpu: np.ndarray,
+        scheduled_full_cpu: np.ndarray,
+        window_row_indices_cpu: np.ndarray,
+        num_tokens_static: int,
+    ) -> dict[str, np.ndarray] | None:
+        """Side inputs of one extra executor call (speculative replay / suffix re-sample), or ``None``.
+
+        Built from exactly the arrays the call hands the executor: window position ``pos`` schedules
+        ``scheduled_full_cpu[pos]`` tokens of ``token_ids_cpu[pos]`` starting at ``num_computed_tokens_cpu[pos]``, packed
+        back to back in window order (the batch preparer's packing). The executor and the side inputs therefore read the
+        same token ids even when the window arrays are a pre-verify copy of the sequence buffer.
+
+        Args:
+            token_ids_cpu: Window token-id rows passed to the executor.
+            num_computed_tokens_cpu: Window compute progress passed to the executor.
+            scheduled_full_cpu: Tokens scheduled per window position.
+            window_row_indices_cpu: Sequence-buffer row of each window position.
+            num_tokens_static: Token bucket of the call.
+
+        Returns:
+            ``{name: [num_tokens_static, ...]}`` per declared side input; ``None`` for models without side inputs.
+        """
+        if not model_has_side_inputs(self.model):
+            return None
+        req_ids = self.sequence_buffer.req_ids
+        windows: list[SideInputWindow] = []
+        for pos in range(min(len(token_ids_cpu), len(scheduled_full_cpu))):
+            n = int(scheduled_full_cpu[pos])
+            if n <= 0:
+                continue
+            row = int(window_row_indices_cpu[pos])
+            rid = req_ids[row] if 0 <= row < len(req_ids) else None
+            req_state = self.requests.get(rid) if rid is not None else None
+            types = None if req_state is None else req_state.token_types
+            start = int(num_computed_tokens_cpu[pos])
+            known = int(self.sequence_buffer.num_tokens_no_spec[row]) if 0 <= row < len(req_ids) else -1
+            windows.append(SideInputWindow(token_ids_cpu[pos], types, start, start + n, known))
         return self._get_side_input_provider().build(windows, int(num_tokens_static))
 
     def _precompute_vlm_prefill(self, req_state: CachedRequestState) -> None:
@@ -2639,16 +2712,15 @@ class eSurgeRunner:
         # single readback returned them with the argmaxes), so the post-loop
         # writeback needs no strategy readback call.
         fused_draft_batches: list[tuple[dict[str, list[int]], dict]] = []
-        # Only engage the batched pool draft when >= 2 spec-active requests are being
-        # verified this step. Batching a single request wins no throughput (a pooled
-        # [1, ...] forward is no cheaper than one row-targeted forward) but moves the
-        # draft forward past the window loop, reordering it relative to the recurrent
-        # replay/commit; on a near-tie greedy argmax that XLA:CPU execution-order
-        # change can flip the verify's next token. Below the threshold each request
-        # drafts in-loop through the exact per-request path, so single-request serving
-        # stays bit-identical to the non-batched drafter. (For >= 2 the pooled forward
-        # is used; its batched matmul differs from N separate matmuls by ~1 ULP, the
-        # same near-tie sensitivity any batched-decode inference engine has.)
+        # Engage the batched pool draft when >= 2 spec-active requests are verified this
+        # step, or for a single request when no replay rollback follows the verify (see
+        # ``_single_ok`` below). The pooled pass runs all k draft forwards as one jitted
+        # program; the per-request path issues k separate dispatches. When a replay
+        # rollback (DSpark ``rolls_back_cache`` or exact recurrent replay) follows, the
+        # pooled pass would be reordered relative to that replay, so a single request
+        # keeps the in-loop per-request path there. (For >= 2 the pooled forward's
+        # batched matmul differs from N separate matmuls by ~1 ULP, the same near-tie
+        # sensitivity any batched-decode inference engine has.)
         step_batch_candidate_count = 0
         if self.drafter is not None and scheduler_output.scheduled_spec_decode_tokens:
             for _spec_rid, _spec_toks in scheduler_output.scheduled_spec_decode_tokens.items():
@@ -2658,7 +2730,11 @@ class eSurgeRunner:
                     and self.spec.can_batch_draft(self.requests.get(_spec_rid))
                 ):
                     step_batch_candidate_count += 1
-        step_allows_batch = step_batch_candidate_count >= 2
+        # A single request also takes the pooled path when no replay rollback follows the verify (candidate-row
+        # commits are deferred into the next forward, so the draft pass is not reordered against a replay): its k
+        # forwards then run as ONE jitted program instead of k separate per-token draft dispatches.
+        _single_ok = not bool(getattr(self.spec, "rolls_back_cache", False)) and not self.spec_decode_recurrent_replay
+        step_allows_batch = step_batch_candidate_count >= (1 if _single_ok else 2)
         token_buckets_used: set[int] = set()
         req_buckets_used: set[int] = set()
         request_seq_lens: list[tuple[int, int, CachedRequestState, int]] = []
@@ -3006,6 +3082,10 @@ class eSurgeRunner:
                 and self.spec_decode_recurrent_candidates
                 and not self.spec_decode_recurrent_replay
                 and not sequential_greedy_spec_rows
+                # Only caches that actually carry candidate rows can commit without the snapshot. KDA layers
+                # (Kimi-Linear / GLM-5-Next) enable recurrent candidates by layer type but own no candidate rows,
+                # so their rejected drafts are rolled back by snapshot + replay and the snapshot must be kept.
+                and self.spec.recurrent_candidate_count() > 0
             ):
                 # Steady-state candidate fast path: the pre-step recurrent
                 # snapshot exists only to feed the replay fallbacks
@@ -3407,6 +3487,9 @@ class eSurgeRunner:
                     _idxs = [*_meta.target_local_indices, int(_meta.bonus_local_index)]
                     _pending_bv.append((int(_rp), len(_flat_indices), len(_idxs), _meta))
                     _flat_indices.extend(int(_x) for _x in _idxs)
+                # Kept at >= 2: a lone request routed through the fused draft-in-verify program changed greedy
+                # output vs plain on the real GLM-5.3 checkpoint (in-program LM-head argmax != runner lm_head
+                # executable on near-ties) with no throughput gain over the pooled post-loop draft.
                 if len(_pending_bv) >= 2:
                     _total_rows = len(_flat_indices)
                     # Pad to a stable ``padded_num_reqs * (k+1)`` bucket so the
@@ -3560,6 +3643,10 @@ class eSurgeRunner:
                     early_draft_by_rid.clear()
                 total_spec_draft_time += time.time() - draft_timer_start
 
+            # Whole-block drafters (DSpark): collect this window's verify-path drafts and draft them in one batched call
+            # after the emission loop (before the commit replay), instead of one draft pass + host sync per request.
+            whole_block_batch_ok = self.drafter is not None and self.spec.can_batch_whole_block_draft()
+            pending_whole_block_drafts: list[tuple[str, int, int, int, CachedRequestState, int, int]] = []
             for row_pos, rid, req_state, req_idx, seq_len, is_valid in window_entries:
                 if not is_valid:
                     sampled_token_ids_all.append([])
@@ -3683,6 +3770,9 @@ class eSurgeRunner:
                         spec_commit_scheduled_list[row_pos] = int(real_count + accepted)
                         spec_window_needs_commit = True
                         committed_candidate = True
+                        if self.spec_decode_recurrent_replay_only:
+                            # KDA caches: nothing commits implicitly; a rejected draft is rolled back by replay.
+                            committed_candidate = False
                         if self.spec_decode_recurrent_candidates and int(real_count) > 0:
                             commit_timer_start = time.time()
                             committed_candidate = self.spec.queue_or_commit_recurrent_candidate_state(
@@ -3804,7 +3894,11 @@ class eSurgeRunner:
                                     draft_tokens=draft_tokens_for_verify,
                                     req_state=req_state,
                                 )
-                        seed_hidden = hidden_rows[accepted]
+                        # Whole-block drafters (DSpark) draft after this loop from the rows handed over by
+                        # ``observe_window_hidden`` and never read ``seed_hidden``; skip the per-request device slice.
+                        seed_hidden = (
+                            None if (whole_block_batch_ok and spec_token_ids_all is not None) else hidden_rows[accepted]
+                        )
                         self.spec.record_verify_trace(
                             meta=verify_meta,
                             logits_rows=logits_rows,
@@ -3933,6 +4027,21 @@ class eSurgeRunner:
                         spec_idx = len(spec_token_ids_all)
                         spec_token_ids_all.append([])
                         early_draft_by_rid[str(rid)] = (int(req_idx), int(known_len), spec_idx)
+                    elif whole_block_batch_ok and spec_token_ids_all is not None:
+                        # Reserve the output slot; drafted with the window's other requests after the loop.
+                        spec_idx = len(spec_token_ids_all)
+                        spec_token_ids_all.append([])
+                        pending_whole_block_drafts.append(
+                            (
+                                str(rid),
+                                int(req_idx),
+                                int(emitted[-1]),
+                                max(0, int(known_len) - 2),
+                                req_state,
+                                int(known_len),
+                                spec_idx,
+                            )
+                        )
                     elif self.spec.can_batch_draft(req_state) and step_allows_batch and spec_token_ids_all is not None:
                         # Defer to the post-loop batched draft (see callsite above).
                         spec_idx = len(spec_token_ids_all)
@@ -3980,7 +4089,9 @@ class eSurgeRunner:
                     spec_commit_scheduled_list[row_pos] = int(real_count + accepted)
                     spec_window_needs_commit = True
                     committed_candidate = True
-                    if self.spec.rolls_back_cache and not self.spec_decode_recurrent_candidates:
+                    if (
+                        self.spec.rolls_back_cache or self.spec_decode_recurrent_replay_only
+                    ) and not self.spec_decode_recurrent_candidates:
                         # DSpark on a per-slot compressed-window cache: nothing commits implicitly, so a rejected
                         # draft must restore the pre-verify snapshot and replay the accepted prefix.
                         committed_candidate = False
@@ -4059,20 +4170,36 @@ class eSurgeRunner:
                                         prefix_start + int(scheduled_n),
                                         dtype=jnp.int32,
                                     )[None, :]
-                            draft_timer_start = time.time()
-                            next_drafts = self.spec.draft_next(
-                                req_id=rid,
-                                seed_token=tid,
-                                seed_position=max(0, int(known_len) - 2),
-                                seed_hidden=seed_hidden,
-                                req_state=req_state,
-                                prefix_input_ids=prefix_input_ids,
-                                prefix_hidden_states=prefix_hidden_states,
-                                prefix_position_ids=prefix_position_ids,
-                                # Stable KV-pool slot (see the sequential-greedy call above).
-                                row_pos=int(req_idx),
-                            )
-                            total_spec_draft_time += time.time() - draft_timer_start
+                            if whole_block_batch_ok:
+                                # Whole-block drafters ignore the prefix inputs: draft with the window's other
+                                # requests after the loop; the flush fills the slot reserved by the append below
+                                # (``next_drafts`` stays ``[]`` here) and writes the drafts into the buffer.
+                                pending_whole_block_drafts.append(
+                                    (
+                                        str(rid),
+                                        int(req_idx),
+                                        int(tid),
+                                        max(0, int(known_len) - 2),
+                                        req_state,
+                                        int(known_len),
+                                        len(spec_token_ids_all),
+                                    )
+                                )
+                            else:
+                                draft_timer_start = time.time()
+                                next_drafts = self.spec.draft_next(
+                                    req_id=rid,
+                                    seed_token=tid,
+                                    seed_position=max(0, int(known_len) - 2),
+                                    seed_hidden=seed_hidden,
+                                    req_state=req_state,
+                                    prefix_input_ids=prefix_input_ids,
+                                    prefix_hidden_states=prefix_hidden_states,
+                                    prefix_position_ids=prefix_position_ids,
+                                    # Stable KV-pool slot (see the sequential-greedy call above).
+                                    row_pos=int(req_idx),
+                                )
+                                total_spec_draft_time += time.time() - draft_timer_start
                             self.sequence_buffer.num_tokens_no_spec[req_idx] = min(known_len, self.max_model_len)
                             self.sequence_buffer.num_tokens[req_idx] = min(known_len, self.max_model_len)
                             if next_drafts:
@@ -4094,6 +4221,25 @@ class eSurgeRunner:
                         token_logprobs[rid] = logits_np[row_pos]
                     except Exception:
                         pass
+
+            if pending_whole_block_drafts and spec_token_ids_all is not None:
+                draft_timer_start = time.time()
+                whole_block_drafts = self.spec.draft_whole_block_batched(
+                    [
+                        (rid_, tok_, pos_, rs_, idx_)
+                        for (rid_, idx_, tok_, pos_, rs_, _kl, _si) in pending_whole_block_drafts
+                    ]
+                )
+                for rid_, idx_, _tok, _pos, _rs, known_len_, spec_idx_ in pending_whole_block_drafts:
+                    next_drafts = whole_block_drafts.get(rid_, [])
+                    if next_drafts:
+                        draft_end = min(known_len_ + len(next_drafts), self.max_model_len)
+                        self.sequence_buffer.token_ids[idx_, known_len_:draft_end] = np.asarray(
+                            next_drafts[: draft_end - known_len_], dtype=np.int32
+                        )
+                        self.sequence_buffer.num_tokens[idx_] = draft_end
+                    spec_token_ids_all[spec_idx_] = next_drafts
+                total_spec_draft_time += time.time() - draft_timer_start
 
             if spec_window_needs_commit and spec_window_requires_replay and pre_step_kv_pages is not None:
                 commit_timer_start = time.time()
@@ -4131,9 +4277,9 @@ class eSurgeRunner:
 
         # Draft every collected greedy inline-MTP request in ONE batched pass over
         # the pooled MTP cache (``k`` batched forwards for the whole running batch,
-        # not ``N * k`` batch-1 forwards). Only reached with >= 2 collected requests
-        # (see ``step_allows_batch``); single-request steps drafted in-loop through the
-        # exact per-request path above and never populate this list. Runs after the
+        # not ``N * k`` batch-1 forwards). Only reached when ``step_allows_batch`` (>= 2
+        # collected requests, or 1 when no replay rollback follows the verify); otherwise
+        # requests draft in-loop through the exact per-request path above. Runs after the
         # window loop so all per-request fallback drafts (prefix / first window) have
         # already advanced their pool rows; the batched pass leaves those rows
         # untouched. The drafts are scattered back into each request's reserved output

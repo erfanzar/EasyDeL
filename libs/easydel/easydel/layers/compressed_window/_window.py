@@ -230,6 +230,11 @@ def gather_selected_entries(
     Returns:
         ``(gathered [B, k, D], bias [B, k])``; the fp32 bias is ``0`` for valid picks and the fp32 minimum otherwise.
     """
-    gathered = jnp.take_along_axis(entries, jnp.maximum(topk, 0)[..., None], axis=1)
-    bias = jnp.where(topk >= 0, 0.0, _MASK_MIN).astype(jnp.float32)
+    # Padding picks (``-1``) read distinct rows instead of all hitting row 0: on TPU a gather whose padding cells all
+    # target one address measured ~2.7x slower than the same gather over spread rows (DeepSeek-V4.1 verify block,
+    # [8 slots, 8 cells x 512] over [8, 262144, 512] bf16). Their bias is the fp32 minimum, so the row read is unused.
+    valid = topk >= 0
+    spread = jnp.broadcast_to(jnp.arange(topk.shape[-1], dtype=topk.dtype) % entries.shape[1], topk.shape)
+    gathered = jnp.take_along_axis(entries, jnp.where(valid, topk, spread)[..., None], axis=1)
+    bias = jnp.where(valid, 0.0, _MASK_MIN).astype(jnp.float32)
     return gathered, bias

@@ -51,7 +51,7 @@ def test_import_family_ignores_missing_or_unknown_configs(tmp_path, payload):
 
 def test_engram_hc_weights_keep_checkpoint_layout_while_linears_transpose():
     import torch
-    from easydel.layers.embeddings import GatedEngram
+    from easydel.layers.engram import GatedEngram
     from easydel.utils.parameters_transformation import StateDictConverter
     from jax import numpy as jnp
 

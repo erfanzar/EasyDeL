@@ -29,6 +29,7 @@ from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Float, Int
 
+from easydel.layers.compressed_window import trace_compressor_stream
 from easydel.layers.linears import ColumnParallelLinear
 from easydel.layers.norms import RMSNorm
 
@@ -375,9 +376,22 @@ class CompressedIndexer(BaseIndexer):
         if n_slots == 0 or self.compressor_adapter.selection_is_vacuous(self.index_topk, n_slots):
             return None, cache_view
         batch, block, _ = hidden_states.shape
+        kv_blk = self.kv_proj(hidden_states)
+        gate_blk = self.gate_proj(hidden_states)
+        cache_view = trace_compressor_stream(
+            cache_view,
+            "indexer",
+            kv=kv_blk,
+            gate=gate_blk,
+            positions=positions,
+            valid=valid,
+            rate=rate,
+            head_dim=self.head_dim,
+            position_bias=self.position_bias.value,
+        )
         entries, buffer_kv, buffer_gate, overlap_kv, overlap_gate = self.compressor_adapter.extend_step(
-            kv_blk=self.kv_proj(hidden_states),
-            gate_blk=self.gate_proj(hidden_states),
+            kv_blk=kv_blk,
+            gate_blk=gate_blk,
             buffer_kv=cache_view.indexer_buffer_kv,
             buffer_gate=cache_view.indexer_buffer_gate,
             entries=cache_view.indexer_entries,
@@ -518,6 +532,17 @@ class CompressedIndexer(BaseIndexer):
 
         kv = self.kv_proj(hidden_states)
         gate = self.gate_proj(hidden_states)
+        cache_view = trace_compressor_stream(
+            cache_view,
+            "indexer",
+            kv=kv,
+            gate=gate,
+            positions=cache_view.cache_position[:, None],
+            valid=None if valid is None else valid[:, None],
+            rate=rate,
+            head_dim=self.head_dim,
+            position_bias=self.position_bias.value,
+        )
         entries, buffer_kv, buffer_gate, overlap_kv, overlap_gate = self.compressor_adapter.decode_step(
             kv_t=kv,
             gate_t=gate,

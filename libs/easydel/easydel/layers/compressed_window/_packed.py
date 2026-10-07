@@ -45,15 +45,31 @@ PACKED_PREFILL_BLOCK = 64
 _Carry = tp.TypeVar("_Carry")
 
 
-def packed_block_size(total_tokens: int, num_slots: int, window: int, preferred: int = PACKED_PREFILL_BLOCK) -> int:
+def packed_block_size(
+    total_tokens: int,
+    num_slots: int,
+    window: int,
+    preferred: int = PACKED_PREFILL_BLOCK,
+    *,
+    cap_by_slot_share: bool = False,
+) -> int:
     """Static columns per loop step: ``1`` for pure-decode buckets, else ``min(preferred, total, window)``.
 
     A bucket with ``total_tokens <= num_slots`` can hold at most one token per slot in the common decode case, so the
     single-column path (no wasted block cells) is kept there.
+
+    With ``cap_by_slot_share`` the block is also capped at ``ceil(total_tokens / num_slots)``. Block work (per-cell
+    selected-entry gathers, attention over every cell) scales with ``num_slots * block`` per loop step while the loop
+    only visits occupied columns, so a block no wider than one slot's share of the bucket never adds work: a
+    speculative verify window (``1 + k`` tokens on every slot) then runs one narrow step instead of a bucket-wide one.
+    Large prefill buckets keep ``preferred``.
     """
     if total_tokens <= num_slots:
         return 1
-    return max(1, min(int(preferred), int(total_tokens), int(window)))
+    block = min(int(preferred), int(total_tokens), int(window))
+    if cap_by_slot_share:
+        block = min(block, -(-int(total_tokens) // max(1, int(num_slots))))
+    return max(1, block)
 
 
 def tokens_to_grid(

@@ -14,6 +14,7 @@
 
 """Compressed sliding-window cache (DeepSeek-V4 style attention state)."""
 
+from ._speculative import commit_speculative_window, speculative_commit_limit
 from .cache import (
     CompressedWindowCache,
     CompressedWindowCacheConfig,
@@ -37,5 +38,7 @@ __all__ = (
     "SharedCompressedWindowCacheConfig",
     "SharedCompressedWindowCacheView",
     "SharedCompressedWindowMetadata",
+    "commit_speculative_window",
     "slot_partition_axes",
+    "speculative_commit_limit",
 )

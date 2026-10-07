@@ -364,7 +364,7 @@ class Scheduler(SchedulerInterface):
         scheduler.data_parallel_size = int(getattr(metadata, "data_parallel_size", 1) or 1)
         image_expander_builder = getattr(type(runner.model), "esurge_image_expander_builder", None)
         if image_expander_builder is not None:
-            scheduler.image_expander = image_expander_builder(model_config)
+            scheduler.image_expander = image_expander_builder(runner.model)
         return scheduler
 
     def _select_seq_bucket(self, num_reqs: int) -> int:

@@ -28,6 +28,13 @@ from .modeling_glm5_next import (
     Glm5NextLinearAttention,
     Glm5NextTextModel,
 )
+from .modeling_glm5_next_mtp import (
+    Glm5NextMTPHead,
+    Glm5NextMTPLayer,
+    attach_glm5_next_mtp,
+    load_glm5_next_mtp,
+    native_key_to_glm5_next_mtp,
+)
 
 
 def _register_with_transformers() -> None:
@@ -62,7 +69,12 @@ __all__ = (
     "Glm5NextHyperConnection",
     "Glm5NextIndexer",
     "Glm5NextLinearAttention",
+    "Glm5NextMTPHead",
+    "Glm5NextMTPLayer",
     "Glm5NextTextConfig",
     "Glm5NextTextModel",
     "Glm5NextVisionConfig",
+    "attach_glm5_next_mtp",
+    "load_glm5_next_mtp",
+    "native_key_to_glm5_next_mtp",
 )

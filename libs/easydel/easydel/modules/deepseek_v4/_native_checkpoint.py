@@ -153,3 +153,44 @@ def native_key_to_easydel(key: str) -> str | None:
     else:
         parts[-1] = LEAF_ALIASES.get(parts[-1], parts[-1])
     return f"model.layers.{idx}." + ".".join(parts)
+
+
+_MTP_RE = re.compile(r"^mtp\.(\d+)\.(.+)$")
+#: Stage-owned DSpark tensors that keep their native name under ``stages.N``.
+_MTP_OWN_RE = re.compile(
+    r"^(main_proj\.(weight|scale)|main_norm\.weight|norm\.weight|markov_head\.markov_w[12]\.weight"
+    r"|confidence_head\.proj\.weight)$"
+)
+#: The last stage's own stream-collapse head (bare tensors, like the backbone's ``hc_head_*``).
+_MTP_HC_HEAD = {"hc_head_fn": "hc_head.hc_fn", "hc_head_base": "hc_head.hc_base", "hc_head_scale": "hc_head.hc_scale"}
+
+
+def native_key_to_easydel_v4_mtp(key: str) -> str | None:
+    """Normalize a native DeepSeek-V4 DSpark key (``mtp.N.*``) to :class:`DeepseekV4DSpark` parameter names.
+
+    Block tensors reuse the backbone rules (:func:`native_key_to_easydel` on a ``layers.N`` stand-in). The tied
+    ``mtp.N.embed`` / ``mtp.N.head`` (shared with the backbone) are unowned.
+
+    Args:
+        key: Checkpoint key, e.g. ``mtp.2.markov_head.markov_w1.weight``, or an already normalized ``stages.N.*`` key.
+
+    Returns:
+        The draft-model parameter name, or ``None`` for keys the draft model does not own.
+    """
+    if key.startswith("stages."):
+        return key
+    m = _MTP_RE.match(key)
+    if m is None:
+        return None
+    stage, rest = m.groups()
+    if rest.startswith(("embed.", "head.")):
+        return None
+    if _MTP_OWN_RE.match(rest):
+        return f"stages.{stage}.{rest}"
+    if rest in _MTP_HC_HEAD:
+        return f"stages.{stage}.{_MTP_HC_HEAD[rest]}"
+    mapped = native_key_to_easydel(f"layers.{stage}.{rest}")
+    prefix = f"model.layers.{stage}."
+    if mapped is None or not mapped.startswith(prefix):
+        return None
+    return f"stages.{stage}.{mapped[len(prefix) :]}"

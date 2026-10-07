@@ -98,6 +98,8 @@ class CompressedWindowCacheConfig(BaseCacheConfig):
         layer_types: Per-layer attention regime, one of
             ``("sliding_attention", "compressed_sparse_attention",
             "heavily_compressed_attention")``.
+        spec_trace_len: Length of the per-stream projection traces kept for replay-free speculative rollback
+            (``0`` = no traces; set by eSurge to the verify width ``1 + k``).
     """
 
     num_hidden_layers: int = field(pytree_node=False)
@@ -110,6 +112,7 @@ class CompressedWindowCacheConfig(BaseCacheConfig):
     csa_rate: int = field(pytree_node=False)
     hca_rate: int = field(pytree_node=False)
     layer_types: tuple[str, ...] = field(pytree_node=False)
+    spec_trace_len: int = field(pytree_node=False, default=0)
 
     @classmethod
     def create(
@@ -124,6 +127,7 @@ class CompressedWindowCacheConfig(BaseCacheConfig):
         csa_rate: int,
         hca_rate: int,
         layer_types: tp.Sequence[str],
+        spec_trace_len: int = 0,
     ) -> CompressedWindowCacheConfig:
         """Create and validate a compressed sliding-window cache config.
 
@@ -138,6 +142,7 @@ class CompressedWindowCacheConfig(BaseCacheConfig):
             csa_rate: CSA compression rate.
             hca_rate: HCA compression rate.
             layer_types: Per-layer attention regime.
+            spec_trace_len: Projection trace length for replay-free speculative rollback (``0`` = off).
 
         Returns:
             CompressedWindowCacheConfig: Validated configuration.
@@ -164,6 +169,8 @@ class CompressedWindowCacheConfig(BaseCacheConfig):
         bad = [t for t in layer_types if t not in _ALLOWED_LAYER_TYPES]
         if bad:
             raise ValueError(f"layer_types entries must be one of {_ALLOWED_LAYER_TYPES}; got {bad}")
+        if int(spec_trace_len) < 0:
+            raise ValueError(f"spec_trace_len must be non-negative; got {spec_trace_len}")
         return cls(
             num_hidden_layers=num_hidden_layers,
             partition_axis=partition_axis,
@@ -175,6 +182,7 @@ class CompressedWindowCacheConfig(BaseCacheConfig):
             csa_rate=csa_rate,
             hca_rate=hca_rate,
             layer_types=layer_types,
+            spec_trace_len=int(spec_trace_len),
         )
 
     def rate_for(self, layer_type: str) -> int:
@@ -237,6 +245,17 @@ class CompressedWindowCacheView(BaseCacheView):
         indexer_overlap_kv: Indexer overlap kv ``[batch, rate, Di]``.
         indexer_overlap_gate: Indexer overlap gate (fp32)
             ``[batch, rate, Di]``.
+        compressor_trace_kv: Raw kv row of each consumed position at slot ``position % spec_trace_len``
+            ``[batch, spec_trace_len, feat]`` in buffer dtype (only when ``spec_trace_len > 0``). Read by
+            :func:`~easydel.caching.compressed_window.commit_speculative_window`.
+        compressor_trace_gate: Raw gate analogue of ``compressor_trace_kv``.
+        compressor_trace_overlap_kv: Ca kv half of each window that closed, at slot ``window % spec_trace_len``
+            ``[batch, spec_trace_len, rate, D]`` (CSA only).
+        compressor_trace_overlap_gate: Biased fp32 Ca gate analogue (CSA only).
+        indexer_trace_kv: Indexer-stream analogue of ``compressor_trace_kv`` (CSA only).
+        indexer_trace_gate: Indexer-stream analogue of ``compressor_trace_gate`` (CSA only).
+        indexer_trace_overlap_kv: Indexer-stream analogue of ``compressor_trace_overlap_kv`` (CSA only).
+        indexer_trace_overlap_gate: Indexer-stream analogue of ``compressor_trace_overlap_gate`` (CSA only).
         metadata: Shared static configuration.
         layer_index: Layer index this view belongs to.
     """
@@ -253,6 +272,14 @@ class CompressedWindowCacheView(BaseCacheView):
     indexer_entries: Float[Array, "batch entries index_head_dim"] | None
     indexer_overlap_kv: Float[Array, "batch rate index_head_dim"] | None
     indexer_overlap_gate: Float[Array, "batch rate index_head_dim"] | None
+    compressor_trace_kv: Float[Array, "batch trace feat"] | None = None
+    compressor_trace_gate: Float[Array, "batch trace feat"] | None = None
+    compressor_trace_overlap_kv: Float[Array, "batch trace rate head_dim"] | None = None
+    compressor_trace_overlap_gate: Float[Array, "batch trace rate head_dim"] | None = None
+    indexer_trace_kv: Float[Array, "batch trace ifeat"] | None = None
+    indexer_trace_gate: Float[Array, "batch trace ifeat"] | None = None
+    indexer_trace_overlap_kv: Float[Array, "batch trace rate index_head_dim"] | None = None
+    indexer_trace_overlap_gate: Float[Array, "batch trace rate index_head_dim"] | None = None
     metadata: CompressedWindowCacheConfig = field(default=None)
     layer_index: int | None = field(pytree_node=False, default=None)
 
@@ -333,6 +360,20 @@ class CompressedWindowCacheView(BaseCacheView):
                 state["indexer_entries"] = jnp.zeros((batch, n_entries, index_dim), dtype=dtype)
                 state["indexer_overlap_kv"] = jnp.zeros((batch, rate, index_dim), dtype=dtype)
                 state["indexer_overlap_gate"] = jnp.full((batch, rate, index_dim), -jnp.inf, dtype=jnp.float32)
+            if config.spec_trace_len > 0:
+                length = config.spec_trace_len
+                state["compressor_trace_kv"] = jnp.zeros((batch, length, feat), dtype=dtype)
+                state["compressor_trace_gate"] = jnp.zeros((batch, length, feat), dtype=dtype)
+                if two_series:
+                    index_dim = config.index_head_dim
+                    state["compressor_trace_overlap_kv"] = jnp.zeros((batch, length, rate, head_dim), dtype=dtype)
+                    state["compressor_trace_overlap_gate"] = jnp.zeros(
+                        (batch, length, rate, head_dim), dtype=jnp.float32
+                    )
+                    state["indexer_trace_kv"] = jnp.zeros((batch, length, 2 * index_dim), dtype=dtype)
+                    state["indexer_trace_gate"] = jnp.zeros((batch, length, 2 * index_dim), dtype=dtype)
+                    state["indexer_trace_overlap_kv"] = jnp.zeros((batch, length, rate, index_dim), dtype=dtype)
+                    state["indexer_trace_overlap_gate"] = jnp.zeros((batch, length, rate, index_dim), dtype=jnp.float32)
         return cls(
             window_kv=window_kv,
             cache_position=jnp.zeros((batch,), dtype=jnp.int32),
@@ -485,7 +526,9 @@ class CompressedWindowCache(BaseCache):
         mask[in_range] = True
         if not mask.any():
             return self
-        return _reset_rows_compiled(self, jnp.asarray(mask))
+        # The numpy mask goes straight into the compiled reset: an eager ``jnp.asarray`` first ran a standalone
+        # ``stage`` primitive that measured ~100-320 ms per call inside the serving process (request TTFT).
+        return _reset_rows_compiled(self, mask)
 
     @classmethod
     def init_empty(cls, num_hidden_layers: int) -> CompressedWindowCache:

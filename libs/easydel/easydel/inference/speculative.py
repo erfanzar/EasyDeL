@@ -663,7 +663,33 @@ class Qwen3_5MTPDrafter:
             num_heads = int(getattr(text_cfg, "num_attention_heads", 1) or 1)
             head_dim = int(getattr(text_cfg, "hidden_size", 0)) // max(1, num_heads)
         num_kv_heads = int(getattr(text_cfg, "num_key_value_heads", getattr(text_cfg, "num_attention_heads", 1)))
-        getattr(self.model, "mtp", None)
+        mtp = getattr(self.model, "mtp", None)
+        spec_fn = getattr(mtp, "cache_spec", None)
+        if callable(spec_fn):
+            # Opt-in: heads whose attention writes a non-standard dense cache (GLM-5-Next's NoPE MLA writes
+            # num_heads x qk_nope_head_dim K and num_heads x v_head_dim V) declare the shape and a token cap.
+            spec = dict(spec_fn())
+            max_length = int(spec["max_length"])
+            if self._mtp_cache_max_length is not None:
+                max_length = min(max_length, int(self._mtp_cache_max_length))
+            cache_config = TransformerCacheConfig.create(
+                batch_size=int(batch_size),
+                sequence_length=max(1, max_length),
+                num_hidden_layers=int(spec["num_hidden_layers"]),
+                pad_token_id=0,
+                num_heads=int(spec["num_heads"]),
+                head_dim=int(spec["key_dim"]),
+                key_heads=int(spec["key_heads"]),
+                value_heads=int(spec["value_heads"]),
+                key_dim=int(spec["key_dim"]),
+                value_dim=int(spec["value_dim"]),
+            )
+            return TransformerCache.init_cache(
+                mesh=mesh,
+                config=cache_config,
+                runtime_sharding_resolver=getattr(text_cfg, "runtime_sharding_resolver", None),
+                dtype=getattr(self.model, "dtype", jnp.bfloat16),
+            )
         max_length = self._mtp_cache_max_length
         if max_length is None:
             max_length = int(
@@ -711,6 +737,19 @@ class Qwen3_5MTPDrafter:
             self._mtp_cache = self._init_mtp_cache(batch_size)
             self._mtp_cache_batch_size = batch_size if self._mtp_cache is not None else None
         return self._mtp_cache
+
+    def mtp_cache_capacity(self) -> int | None:
+        """Token capacity of one MTP cache row, or ``None`` when no cache is used or it is not allocated yet.
+
+        The eSurge strategy skips drafting for a persisted window that would write past it (a dense transformer
+        cache clamps out-of-range writes onto its last slots).
+        """
+        if not self.uses_mtp_cache or self._mtp_cache is None:
+            return None
+        for view in self._mtp_cache.views:
+            if view is not None and getattr(view, "key", None) is not None:
+                return int(view.key.shape[1])
+        return None
 
     def ensure_batch_size(self, batch_size: int) -> None:
         """Grow the MTP cache so it can hold at least ``batch_size`` rows.

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import functools
 import itertools
+import typing as tp
 from dataclasses import dataclass
 
 import jax
@@ -31,7 +32,7 @@ import spectrax as spx
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
 
-from ._embeddings import Embed
+from easydel.layers.embeddings._embeddings import Embed
 
 __all__ = (
     "FP8_SCALE_BLOCK",
@@ -152,6 +153,8 @@ class GatedEngramConfig:
             registry keyed by the module's ``_host_table_key``), gathered by row id in NumPy through
             ``jax.pure_callback`` so the per-call cost follows rows looked up, not table size. Fill it with
             :meth:`GatedEngram.set_table` or the checkpoint loader.
+        layer_hash_index: Position of this layer among the model's engram layers, i.e. its index on the
+            ``n_engram_layers`` axis of the host-computed hash ids / gathered rows.
     """
 
     hidden_size: int
@@ -163,6 +166,45 @@ class GatedEngramConfig:
     initializer_range: float = 0.02
     table_memory_kind: str = "device"
     table_dtype: str = "param"
+    layer_hash_index: int = 0
+
+    @classmethod
+    def from_model_config(cls, config: tp.Any, layer_idx: int) -> GatedEngramConfig:
+        """Settings of the engram on decoder layer ``layer_idx`` from a model config's ``engram_*`` fields.
+
+        Reads ``engram_layer_ids``, ``engram_max_ngram_size``, ``engram_n_heads``, ``engram_vocab_size``,
+        ``engram_head_dim``, ``hidden_size``, ``hc_mult``, ``rms_norm_eps``, ``initializer_range`` and optionally
+        ``engram_num_embeddings``, ``engram_table_memory_kind`` and ``engram_table_dtype``.
+
+        Args:
+            config: Model config.
+            layer_idx: Global decoder layer index; must be listed in ``config.engram_layer_ids``.
+
+        Returns:
+            The layer settings.
+
+        Raises:
+            ValueError: If ``layer_idx`` carries no engram, or ``engram_num_embeddings`` disagrees with the layout.
+        """
+        from ._hashing import engram_table_rows
+
+        layer_ids = [int(i) for i in config.engram_layer_ids]
+        if int(layer_idx) not in layer_ids:
+            raise ValueError(f"layer {layer_idx} is not an engram layer (engram_layer_ids={layer_ids}).")
+        index = layer_ids.index(int(layer_idx))
+        rows = engram_table_rows(config)
+        return cls(
+            hidden_size=int(config.hidden_size),
+            hc_mult=int(config.hc_mult),
+            table_rows=rows[index],
+            num_hash_cols=(int(config.engram_max_ngram_size) - 1) * int(config.engram_n_heads),
+            head_dim=int(config.engram_head_dim),
+            eps=float(config.rms_norm_eps),
+            initializer_range=float(config.initializer_range),
+            table_memory_kind=getattr(config, "engram_table_memory_kind", None) or _DEVICE,
+            table_dtype=getattr(config, "engram_table_dtype", None) or _PARAM,
+            layer_hash_index=index,
+        )
 
     def __post_init__(self):
         if self.table_memory_kind not in _MEMORY_KINDS:
@@ -223,6 +265,7 @@ class GatedEngram(spx.Module):
         self.hidden_size = config.hidden_size
         self.hc_mult = config.hc_mult
         self.eps = config.eps
+        self.layer_hash_index = int(config.layer_hash_index)
         self.num_hash_cols = config.num_hash_cols
         self.table_dtype = config.table_dtype
         self.table_rows = config.table_rows
@@ -249,6 +292,27 @@ class GatedEngram(spx.Module):
         self.table_memory_kind = _DEVICE
         if config.table_memory_kind == _PINNED_HOST:
             self.place_table_on_host()
+
+    @classmethod
+    def from_config(
+        cls,
+        config: tp.Any,
+        layer_idx: int,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ) -> GatedEngram:
+        """Build the engram of decoder layer ``layer_idx`` from a model config (see
+        :meth:`GatedEngramConfig.from_model_config`)."""
+        return cls(
+            GatedEngramConfig.from_model_config(config, layer_idx),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
 
     @property
     def reform_param(self) -> dict[str, dict[str, bool]]:

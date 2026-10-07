@@ -425,6 +425,7 @@ class ExecutionManager:
         pp_microbatch_size: int | str | None = "auto",
         full_hidden_state_max_tokens: int = 0,
         speculative_recurrent_state_tokens: int = 0,
+        speculative_trace_tokens: int = 0,
     ):
         """Initialize the executor manager.
 
@@ -454,6 +455,9 @@ class ExecutionManager:
             speculative_recurrent_state_tokens: Number of per-request recurrent
                 candidate rows to allocate for speculative decode. Zero keeps
                 the standard cache shape.
+            speculative_trace_tokens: Verify-window width for which per-slot
+                caches keep projection traces (replay-free speculative rollback
+                of compressed-window caches). Zero allocates none.
         """
         if metadata is None:
             raise ValueError("ExecutionManager requires a paged cache config `metadata`.")
@@ -473,6 +477,7 @@ class ExecutionManager:
         self.pp_microbatch_size = pp_microbatch_size
         self.speculative_recurrent_state_tokens = max(0, int(speculative_recurrent_state_tokens))
         self.enable_spec_recurrent_commit_metadata = self.speculative_recurrent_state_tokens > 0
+        self.speculative_trace_tokens = max(0, int(speculative_trace_tokens))
         # Slot-indexed state families (compressed-window caches) receive the
         # per-row physical state-slot ids in the batch metadata every step.
         self._slot_indexed_state = getattr(model, "esurge_cache_family", None) == "compressed_window"
@@ -637,7 +642,11 @@ class ExecutionManager:
             cache_batch_size = int(self.max_num_reqs)
             if self.speculative_recurrent_state_tokens > 0:
                 cache_batch_size += cache_batch_size * int(self.speculative_recurrent_state_tokens)
+            extra: dict[str, tp.Any] = {}
+            if self.speculative_trace_tokens > 0:
+                extra["spec_trace_len"] = int(self.speculative_trace_tokens)
             return self.model.init_operations_cache(
+                **extra,
                 batch_size=cache_batch_size,
                 max_length=int(self.max_model_len),
                 page_size=int(getattr(self.metadata, "page_size", 128)),

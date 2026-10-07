@@ -42,12 +42,12 @@ import pytest
 import spectrax as spx
 from datasets import Dataset  # pyright: ignore[reportMissingTypeStubs]
 from easydel.infra.base_state import EasyDeLState
+from easydel.layers.engram import EngramHasher
 from easydel.modules.deepseek_v41 import (
     DeepseekV41Config,
     DeepseekV41ForCausalLM,
     DeepseekV41ForConditionalGeneration,
 )
-from easydel.modules.deepseek_v41._engram_hash import EngramHasher
 from easydel.trainers.trainer._fn import training_step
 from spectrax.serialization import find_latest_checkpoint
 
@@ -312,7 +312,7 @@ def test_host_batch_transform_matches_in_program_engram_lookup(mesh_name):
     The ``fsdp`` case binds fsdp into the expert axis; it covers the callback reference compiling on a single
     abstract mesh (previously a separate folded expert mesh made JAX reject the program).
     """
-    from easydel.layers.embeddings import GatedEngram
+    from easydel.layers.engram import GatedEngram
 
     config, model = _host_table_model(mesh_name)
     try:
@@ -369,7 +369,7 @@ def test_host_batch_transform_matches_in_program_engram_lookup(mesh_name):
 def test_host_table_engram_trains_through_trainer_without_callback(tmp_path, monkeypatch):
     """``Trainer.train()`` on host-table engram: batches are host-gathered by the model hook, so the compiled step
     never traces the in-program lookup (patched to raise); losses stay finite and fall."""
-    from easydel.layers.embeddings import GatedEngram
+    from easydel.layers.engram import GatedEngram
 
     steps = 8
     config, model = _host_table_model("fsdp")

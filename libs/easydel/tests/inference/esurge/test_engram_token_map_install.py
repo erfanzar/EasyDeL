@@ -37,19 +37,17 @@ class _Runner:
 
 
 def _engine(*, needs_engram=True, compressed=3, vocab=5, tokenizer="fast"):
+    from easydel.layers.engram import EngramModelMixin
+
     config = SimpleNamespace(engram_layer_ids=[1] if needs_engram else [], engram_compressed_vocab_size=compressed)
     config.vocab_size = vocab
-    from easydel.modules.deepseek_v41._esurge_hooks import prepare_tokenizer
 
-    def specs(model):
-        return {"engram_hash_ids": ((1, 4), np.int32)} if model.config.engram_layer_ids else {}
+    class EngramModel(EngramModelMixin):
+        # specs stubbed: this test has no module tree, only the mixin's tokenizer hook is under test
+        def esurge_side_input_specs(self):
+            return {"engram_hash_ids": ((1, 4), np.int32)} if self.config.engram_layer_ids else {}
 
-    model_type = type(
-        "EngramModel",
-        (),
-        {"esurge_prepare_tokenizer": staticmethod(prepare_tokenizer), "esurge_side_input_specs": staticmethod(specs)},
-    )
-    model = model_type()
+    model = EngramModel()
     model.config = config
     tok = SimpleNamespace(backend_tokenizer=object()) if tokenizer == "fast" else None
     return SimpleNamespace(runner=_Runner(model), tokenizer=tok)
@@ -63,7 +61,7 @@ def _install(engine):
 
 @pytest.fixture
 def fake_map(monkeypatch):
-    import easydel.modules.deepseek_v41._engram_hash as engram_hash
+    import easydel.layers.engram._hashing as engram_hash
 
     token_map = np.asarray([0, 1, 2, 1, 0], dtype=np.int64)  # compressed vocab 3
     monkeypatch.setattr(engram_hash, "build_engram_token_map", lambda tokenizer: token_map)

@@ -14,7 +14,8 @@
 
 """DeepSeek-V4.1 model family (text model and vision-language model; serving of images and MTP pending)."""
 
-from .deepseek_v41_configuration import DeepseekV41Config, engram_bucket_primes
+from ._dspark_loader import load_deepseek_v41_dspark
+from .deepseek_v41_configuration import DeepseekV41Config
 from .modeling_deepseek_v41 import (
     DeepseekV41ForCausalLM,
     DeepseekV41ForConditionalGeneration,
@@ -42,12 +43,6 @@ def _register_with_transformers() -> None:
 
 _register_with_transformers()
 
-from ._esurge_hooks import register_esurge_hooks
-from ._training_hooks import register_training_hooks
-
-register_esurge_hooks()
-register_training_hooks()
-
 __all__ = [
     "DeepseekV41Config",
     "DeepseekV41DSpark",
@@ -56,5 +51,5 @@ __all__ = [
     "DeepseekV41ForConditionalGeneration",
     "DeepseekV41Model",
     "DeepseekV41VLModel",
-    "engram_bucket_primes",
+    "load_deepseek_v41_dspark",
 ]

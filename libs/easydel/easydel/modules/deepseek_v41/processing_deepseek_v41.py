@@ -307,9 +307,124 @@ def image_span_bounds(token_types: np.ndarray) -> list[tuple[int, int]]:
     return bounds
 
 
+@dataclasses.dataclass(frozen=True)
+class ExpandedImagePrompt:
+    """A prompt with its image placeholders expanded.
+
+    Attributes:
+        token_ids: Expanded prompt ids (every span position carries ``image_token_id``).
+        token_types: ``int64 [len(token_ids)]`` token types (``-1`` text, ``0..3`` span positions).
+        spans: Half-open ``(start, stop)`` position range of each image span.
+        features: One eSurge ``MultiModalFeature`` per image (patches, ``[[1, n_vit_h, n_vit_w]]`` grid, placeholder
+            range = the span).
+    """
+
+    token_ids: list[int]
+    token_types: np.ndarray
+    spans: list[tuple[int, int]]
+    features: list[tp.Any]
+
+
+class DeepseekV41ImageExpander:
+    """Expands ``image_token_id`` placeholders of a tokenized prompt (eSurge scheduler admission)."""
+
+    def __init__(self, config: tp.Any) -> None:
+        """Build the expander from a vision-enabled ``DeepseekV41Config``.
+
+        Raises:
+            ValueError: If the config has no vision tower.
+        """
+        if not config.vision_enabled:
+            raise ValueError("DeepSeek-V4.1 image serving needs a config with an enabled `vision_config`.")
+        self.spec = DeepseekV41ImageSpec.from_config(config)
+        self.image_token_id = int(config.image_token_id)
+
+    def expand(self, prompt_token_ids: tp.Sequence[int], images: tp.Sequence[np.ndarray]) -> ExpandedImagePrompt:
+        """Expand placeholders, preprocess the images and wrap each into a ``MultiModalFeature``.
+
+        Args:
+            prompt_token_ids: Prompt holding exactly one ``image_token_id`` per image.
+            images: ``uint8 [H, W, 3]`` arrays in order of appearance.
+
+        Raises:
+            ValueError: On a placeholder/image count mismatch or an invalid image.
+        """
+        from easydel.inference.esurge.multimodal.types import MultiModalFeature, PlaceholderRange
+
+        ids, types, prepared = expand_image_placeholders(prompt_token_ids, images, self.spec, self.image_token_id)
+        spans = image_span_bounds(types)
+        features = [
+            MultiModalFeature.from_image(
+                item.patches,
+                grid_thw=np.asarray([[1, item.grid[0], item.grid[1]]], dtype=np.int32),
+                placeholder_range=PlaceholderRange(offset=start, length=stop - start, modality="image"),
+            )
+            for (start, stop), item in zip(spans, prepared, strict=True)
+        ]
+        return ExpandedImagePrompt(token_ids=ids, token_types=types, spans=spans, features=features)
+
+
+def token_types_from_features(features: tp.Sequence[tp.Any], num_tokens: int, downsample_ratio: int) -> np.ndarray:
+    """Rebuild the prompt token types from image features (placeholder offset + patch grid).
+
+    Raises:
+        ValueError: If a feature's span length disagrees with its grid.
+    """
+    types = np.full((int(num_tokens),), TOKEN_TYPE_TEXT, dtype=np.int64)
+    for feature in features:
+        grid = np.asarray(feature.grid_thw).reshape(-1)
+        n_llm_h, n_llm_w = -(-int(grid[1]) // downsample_ratio), -(-int(grid[2]) // downsample_ratio)
+        span = image_token_types(n_llm_h, n_llm_w)
+        placeholder = feature.placeholder_range
+        if placeholder is None or placeholder.length != span.shape[0]:
+            raise ValueError("image feature span length disagrees with its patch grid.")
+        types[placeholder.offset : placeholder.end] = span
+    return types
+
+
+def compute_prefill_embeddings(
+    model: tp.Any, prompt_token_ids: tp.Sequence[int], features: tp.Sequence[tp.Any]
+) -> tuple[np.ndarray, np.ndarray]:
+    """Eagerly encode the images and merge them into the prompt embeddings.
+
+    Args:
+        model: ``DeepseekV41ForConditionalGeneration``.
+        prompt_token_ids: Expanded prompt ids.
+        features: Image features (pixel values still present), any order.
+
+    Returns:
+        ``(embeds, token_types)``: ``float32 [S, hidden]`` merged embeddings and ``int64 [S]`` token types.
+    """
+    import jax
+    from jax import numpy as jnp
+
+    from easydel.utils import set_inference_mode
+
+    base = getattr(model, "base_model", model)
+    ordered = sorted(features, key=lambda f: f.placeholder_range.offset)
+    num_tokens = len(prompt_token_ids)
+    ratio = int(model.config.vision_params()["downsample_ratio"])
+    types = token_types_from_features(ordered, num_tokens, ratio)
+    dtype = getattr(model, "dtype", jnp.float32)
+    with model.mesh, set_inference_mode():
+        embeds = model.compute_embedding(jnp.asarray(np.asarray(prompt_token_ids, dtype=np.int32))[None, :])
+        rows = []
+        for feature in ordered:
+            grid = np.asarray(feature.grid_thw).reshape(-1)
+            patches = jnp.asarray(feature.pixel_values, dtype=dtype)[None]
+            out = base.get_image_features(patches, image_grid=(int(grid[1]), int(grid[2])))
+            rows.append(out.reshape(-1, out.shape[-1]))
+        merged = base.merge_image_embeddings(embeds, jnp.asarray(types)[None, :], jnp.concatenate(rows, axis=0)[None])
+        host = np.asarray(jax.device_get(merged.astype(jnp.float32)))
+    return host[0], types
+
+
 __all__ = [
+    "DeepseekV41ImageExpander",
     "DeepseekV41ImageSpec",
+    "ExpandedImagePrompt",
     "PreparedImage",
+    "compute_prefill_embeddings",
     "expand_image_placeholders",
     "image_span_bounds",
     "image_token_types",
@@ -318,4 +433,5 @@ __all__ = [
     "plan_image_grid",
     "preprocess_image",
     "solve_resize_ratio",
+    "token_types_from_features",
 ]

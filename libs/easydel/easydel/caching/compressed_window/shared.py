@@ -103,6 +103,8 @@ class SharedCompressedWindowCacheConfig(BaseCacheConfig):
         index_key_layer_ids: Layers that own indexer keys (must be KV sources).
         slot_axes: Mesh axes the slot axis of the compressed entries and index keys is split over (``()`` =
             replicated); see :func:`slot_partition_axes`. Rings and open-group state stay replicated.
+        spec_trace_len: Length of the per-slot projection trace kept by ratio > 1 KV sources for replay-free
+            speculative rollback (``0`` = no trace; set by eSurge to the verify width ``1 + k``).
     """
 
     num_hidden_layers: int = field(pytree_node=False)
@@ -116,6 +118,7 @@ class SharedCompressedWindowCacheConfig(BaseCacheConfig):
     kv_source_layer_ids: tuple[int, ...] = field(pytree_node=False)
     index_key_layer_ids: tuple[int, ...] = field(pytree_node=False)
     slot_axes: tuple[str, ...] = field(pytree_node=False, default=())
+    spec_trace_len: int = field(pytree_node=False, default=0)
 
     @classmethod
     def create(
@@ -132,6 +135,7 @@ class SharedCompressedWindowCacheConfig(BaseCacheConfig):
         kv_source_layer_ids: tp.Sequence[int],
         index_key_layer_ids: tp.Sequence[int],
         slot_axes: tp.Sequence[str] = (),
+        spec_trace_len: int = 0,
     ) -> SharedCompressedWindowCacheConfig:
         """Create and validate a shared compressed sliding-window cache config.
 
@@ -147,6 +151,7 @@ class SharedCompressedWindowCacheConfig(BaseCacheConfig):
             kv_source_layer_ids: Layers owning compressed entries.
             index_key_layer_ids: Layers owning indexer keys.
             slot_axes: Mesh axes for the slot axis of entries / index keys (``()`` = replicated).
+            spec_trace_len: Per-slot projection trace length for replay-free speculative rollback (``0`` = off).
 
         Returns:
             SharedCompressedWindowCacheConfig: Validated configuration.
@@ -164,6 +169,8 @@ class SharedCompressedWindowCacheConfig(BaseCacheConfig):
         ):
             if value <= 0:
                 raise ValueError(f"{name} must be positive; got {value}")
+        if int(spec_trace_len) < 0:
+            raise ValueError(f"spec_trace_len must be non-negative; got {spec_trace_len}")
         ratios = tuple(int(r) for r in compress_ratios)[:num_hidden_layers]
         if len(ratios) != num_hidden_layers or any(r < 0 for r in ratios):
             raise ValueError(f"compress_ratios must give a non-negative ratio for each of {num_hidden_layers} layers")
@@ -186,6 +193,7 @@ class SharedCompressedWindowCacheConfig(BaseCacheConfig):
             kv_source_layer_ids=sources,
             index_key_layer_ids=key_owners,
             slot_axes=tuple(str(a) for a in slot_axes),
+            spec_trace_len=int(spec_trace_len),
         )
 
     def slot_spec(self, ndim: int) -> PartitionSpec:
@@ -216,6 +224,11 @@ class SharedCompressedWindowCacheView(BaseCacheView):
         compressor_score_state: Open-group fp32 gate scores ``[batch, ratio, head_dim]`` (KV sources, ratio > 1).
         compressed_kv: Emitted post-RoPE compressed entries ``[batch, max_length // ratio, head_dim]`` (KV sources).
         index_k: Indexer keys ``[batch, max_length // ratio, index_head_dim]`` (index-key owners).
+        compressor_trace_kv: fp32 kv projection of each consumed position at slot ``position % spec_trace_len``
+            ``[batch, spec_trace_len, head_dim]`` (KV sources with ratio > 1, only when ``spec_trace_len > 0``).
+            Read by :func:`commit_speculative_window` to rebuild the open-group state of a partially accepted
+            speculative window without replaying it.
+        compressor_trace_score: fp32 gate-score analogue of ``compressor_trace_kv``.
         metadata: Shared static configuration.
         layer_index: Layer this view belongs to.
     """
@@ -226,6 +239,8 @@ class SharedCompressedWindowCacheView(BaseCacheView):
     compressor_score_state: Float[Array, "batch ratio head_dim"] | None
     compressed_kv: Float[Array, "batch entries head_dim"] | None
     index_k: Float[Array, "batch entries index_head_dim"] | None
+    compressor_trace_kv: Float[Array, "batch trace head_dim"] | None = None
+    compressor_trace_score: Float[Array, "batch trace head_dim"] | None = None
     metadata: SharedCompressedWindowCacheConfig = field(default=None)
     layer_index: int | None = field(pytree_node=False, default=None)
 
@@ -287,7 +302,14 @@ class SharedCompressedWindowCacheView(BaseCacheView):
             return _zeros(shape, PartitionSpec(), buf_dtype)
 
         state: dict[str, Array | None] = dict.fromkeys(
-            ("compressor_kv_state", "compressor_score_state", "compressed_kv", "index_k")
+            (
+                "compressor_kv_state",
+                "compressor_score_state",
+                "compressed_kv",
+                "index_k",
+                "compressor_trace_kv",
+                "compressor_trace_score",
+            )
         )
         if layer_index in config.kv_source_layer_ids:
             ratio = config.ratio(layer_index)
@@ -296,6 +318,10 @@ class SharedCompressedWindowCacheView(BaseCacheView):
             if ratio > 1:
                 state["compressor_kv_state"] = _rep_zeros((batch, ratio, head_dim), jnp.float32)
                 state["compressor_score_state"] = _rep_zeros((batch, ratio, head_dim), jnp.float32)
+                if config.spec_trace_len > 0:
+                    trace = (batch, config.spec_trace_len, head_dim)
+                    state["compressor_trace_kv"] = _rep_zeros(trace, jnp.float32)
+                    state["compressor_trace_score"] = _rep_zeros(trace, jnp.float32)
             if layer_index in config.index_key_layer_ids:
                 state["index_k"] = _slot_zeros((batch, entries, config.index_head_dim))
         return cls(
@@ -343,6 +369,8 @@ class SharedCompressedWindowCacheView(BaseCacheView):
             cache_position=_pin(self.cache_position, rep),
             compressor_kv_state=_pin(self.compressor_kv_state, rep),
             compressor_score_state=_pin(self.compressor_score_state, rep),
+            compressor_trace_kv=_pin(self.compressor_trace_kv, rep),
+            compressor_trace_score=_pin(self.compressor_trace_score, rep),
             compressed_kv=_slot(self.compressed_kv),
             index_k=_slot(self.index_k),
         )
@@ -447,11 +475,14 @@ class SharedCompressedWindowCache(BaseCache):
         # Pin every output leaf to its input leaf's sharding: the [batch] mask meets slot-sharded entry buffers, and
         # without explicit out_shardings GSPMD propagates that slot layout into the replicated ring / position
         # buffers, which the compiled serving steps then reject (input-sharding mismatch).
+        # The numpy mask goes straight into the compiled reset. Converting it eagerly first (``jnp.asarray``) ran a
+        # standalone ``stage`` primitive that measured ~100-320 ms per call inside the serving process (0.26 ms in
+        # isolation), all of it on a new request's time to first token.
         leaves, treedef = jax.tree_util.tree_flatten(self)
         shardings = tuple(getattr(leaf, "sharding", None) for leaf in leaves)
         if leaves and all(s is not None for s in shardings):
-            return _reset_rows_pinned(treedef, shardings)(self, jnp.asarray(mask))
-        return _reset_rows_compiled(self, jnp.asarray(mask))
+            return _reset_rows_pinned(treedef, shardings)(self, mask)
+        return _reset_rows_compiled(self, mask)
 
     @classmethod
     def init_empty(cls, num_hidden_layers: int) -> SharedCompressedWindowCache:

@@ -12,32 +12,123 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Host-side n-gram hashing for DeepSeek-V4.1 engram layers (pure Python + NumPy).
+"""Host-side n-gram hashing for engram layers (pure Python + NumPy, no JAX).
 
-This is a bit-exact port of ``EngramLayout`` / ``NgramHashState`` / ``build_compressed_token_map`` from the official
-reference ``engram.py``. The hash ids are computed on the host in int64 (awkward on TPU) and then index a per-layer
-table of ``sum(primes)`` rows. No JAX is imported here.
+Bit-exact with ``EngramLayout`` / ``NgramHashState`` / ``build_compressed_token_map`` of DeepSeek's reference
+``engram.py``. Hash ids are int64 arithmetic (awkward on TPU), so they are computed on the host and index a per-layer
+table of ``sum(primes)`` rows.
 
-Two pieces:
-
-* :func:`build_engram_token_map` maps every tokenizer id onto a compressed id space in which tokens that normalise
+* :func:`engram_bucket_primes` / :func:`engram_table_rows`: the prime-bucket table layout.
+* :func:`build_engram_token_map`: maps every tokenizer id onto a compressed id space in which tokens that normalise
   alike (NFKC, NFD, strip accents, lowercase, whitespace collapse) share an id.
-* :class:`EngramHasher` turns ``[B, L]`` token ids into ``[B, L, n_engram_layers, (max_ngram_size - 1) * n_heads]``
-  int32 hash ids, statelessly (:meth:`EngramHasher.hash`) or incrementally with an explicit
-  :class:`EngramHashState` (:meth:`EngramHasher.step`).
+* :class:`EngramHasher`: ``[B, L]`` token ids -> ``[B, L, n_engram_layers, (max_ngram_size - 1) * n_heads]`` int32
+  hash ids, statelessly (:meth:`EngramHasher.hash`) or incrementally (:meth:`EngramHasher.step`).
+* :class:`EngramWindowHasher`: hash ids of one request's scheduled window ``[start, end)``, rebuilt from its token
+  history, so chunked prefill, decode and preemption hash exactly like one pass over the sequence.
+
+A model describes its engram layout with these config fields: ``engram_layer_ids``, ``engram_max_ngram_size``,
+``engram_n_heads``, ``engram_vocab_size``, ``engram_pad_token_id``, ``engram_compressed_vocab_size``, ``vocab_size``
+and optionally ``engram_num_embeddings``.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import functools
 import typing as tp
 
 import numpy as np
 
-from .deepseek_v41_configuration import engram_bucket_primes
 
-if tp.TYPE_CHECKING:
-    from .deepseek_v41_configuration import DeepseekV41Config
+def _is_prime(n: int) -> bool:
+    """Deterministic Miller-Rabin primality test (exact for ``n < 3.3e24``)."""
+    if n < 2:
+        return False
+    witnesses = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
+    for p in witnesses:
+        if n % p == 0:
+            return n == p
+    d, s = n - 1, 0
+    while d % 2 == 0:
+        d //= 2
+        s += 1
+    for a in witnesses:
+        x = pow(a, d, n)
+        if x in (1, n - 1):
+            continue
+        for _ in range(s - 1):
+            x = x * x % n
+            if x == n - 1:
+                break
+        else:
+            return False
+    return True
+
+
+@functools.lru_cache(maxsize=16)
+def engram_bucket_primes(
+    num_layers: int,
+    max_ngram_size: int,
+    n_heads: int,
+    vocab_size: int,
+) -> tuple[tuple[tuple[int, ...], ...], ...]:
+    """Prime bucket moduli ``[layer][ngram_size - 2][head]`` of the engram hash tables.
+
+    Mirrors ``EngramLayout.from_args`` in the reference ``engram.py``: for every (layer, n-gram size, head) the
+    search starts again at ``vocab_size - 1`` and takes the next prime not handed out before, so bucket ranges
+    never repeat across the whole model.
+
+    Args:
+        num_layers: Number of engram layers.
+        max_ngram_size: Largest n-gram size (n-gram sizes ``2..max_ngram_size`` are hashed).
+        n_heads: Hash heads per n-gram size.
+        vocab_size: ``engram_vocab_size``; primes are drawn upward from ``vocab_size - 1``.
+
+    Returns:
+        Nested tuple of primes.
+    """
+    seen: set[int] = set()
+    layers = []
+    for _ in range(num_layers):
+        per_ngram = []
+        for _ in range(max_ngram_size - 1):
+            sizes, current = [], vocab_size - 1
+            for _ in range(n_heads):
+                current += 1
+                while not _is_prime(current) or current in seen:
+                    current += 1
+                seen.add(current)
+                sizes.append(current)
+            per_ngram.append(tuple(sizes))
+        layers.append(tuple(per_ngram))
+    return tuple(layers)
+
+
+def engram_table_rows(config: tp.Any) -> list[int]:
+    """Rows of each engram layer's table (the sum of its prime buckets) for a model config.
+
+    Args:
+        config: Config with the ``engram_*`` fields (see the module docstring).
+
+    Returns:
+        One row count per entry of ``config.engram_layer_ids``.
+
+    Raises:
+        ValueError: If ``config.engram_num_embeddings`` is set and disagrees with the derived layout (the hash offsets
+            would then address the wrong rows).
+    """
+    primes = engram_bucket_primes(
+        len(config.engram_layer_ids),
+        int(config.engram_max_ngram_size),
+        int(config.engram_n_heads),
+        int(config.engram_vocab_size),
+    )
+    derived = [sum(p for per_ngram in layer for p in per_ngram) for layer in primes]
+    declared = getattr(config, "engram_num_embeddings", None)
+    if declared is not None and list(declared) != derived:
+        raise ValueError(f"engram_num_embeddings {list(declared)} disagrees with the prime-bucket layout {derived}.")
+    return derived
+
 
 #: History marker of a position that takes no part in any n-gram (reference ``NgramHashState.DEAD``).
 DEAD = -1
@@ -110,11 +201,12 @@ class EngramHashState:
         history: ``int64[B, max_ngram_size - 1]`` compressed ids of the last ``max_ngram_size - 1`` positions seen
             (oldest first). A dead position (image span) is stored as :data:`DEAD`; positions before the start of the
             sequence are also :data:`DEAD`.
-        position: Number of positions consumed so far (the reference ``start_pos`` of the next call).
+        position: Number of positions consumed so far (the reference ``start_pos`` of the next call): one int shared
+            by every row, or ``int64[B]`` per row (rows of different requests hashed in one call).
     """
 
     history: np.ndarray
-    position: int
+    position: int | np.ndarray
 
 
 class EngramHasher:
@@ -210,29 +302,40 @@ class EngramHasher:
         self.multipliers = np.stack(rows)
 
     @classmethod
-    def from_config(cls, config: DeepseekV41Config, token_map: np.ndarray) -> EngramHasher:
-        """Build a hasher from a :class:`DeepseekV41Config` and a compressed token map.
+    def from_config(cls, config: tp.Any, token_map: np.ndarray | None = None) -> EngramHasher:
+        """Build a hasher from a model config's ``engram_*`` fields and a compressed token map.
 
         Args:
-            config: Config providing the ``engram_*`` fields.
-            token_map: Compressed token map from :func:`build_engram_token_map`.
+            config: Config providing the ``engram_*`` fields (see the module docstring).
+            token_map: Compressed token map from :func:`build_engram_token_map`. ``None`` uses the identity map,
+                which is only valid when ``engram_compressed_vocab_size == vocab_size``.
 
         Returns:
             The configured hasher.
 
         Raises:
-            ValueError: If the map's compressed vocab size differs from ``config.engram_compressed_vocab_size`` (every
-                multiplier derives from it, so a mismatch would silently rehash the whole table), or if
-                ``config.engram_num_embeddings`` disagrees with the derived prime layout.
+            ValueError: If no map is given and the identity map does not fit; if the map's compressed vocab size
+                differs from ``config.engram_compressed_vocab_size`` (every multiplier derives from it, so a mismatch
+                would silently rehash the whole table); or if ``config.engram_num_embeddings`` disagrees with the
+                derived prime layout.
         """
+        if token_map is None:
+            vocab = int(config.vocab_size)
+            if int(config.engram_compressed_vocab_size) != vocab:
+                raise ValueError(
+                    "This model hashes engram n-grams over the tokenizer's compressed vocabulary "
+                    f"(engram_compressed_vocab_size={config.engram_compressed_vocab_size} != vocab_size={vocab}); "
+                    "build it with easydel.layers.engram.build_engram_token_map(tokenizer)."
+                )
+            token_map = np.arange(vocab, dtype=np.int64)
         token_map = np.asarray(token_map)
         size = int(token_map.max()) + 1
-        if size != config.engram_compressed_vocab_size:
+        if size != int(config.engram_compressed_vocab_size):
             raise ValueError(
                 f"token map has compressed vocab size {size}, config.engram_compressed_vocab_size is "
                 f"{config.engram_compressed_vocab_size}."
             )
-        config.engram_table_rows()  # validates engram_num_embeddings against the prime layout
+        engram_table_rows(config)  # validates engram_num_embeddings against the prime layout
         return cls(
             token_map,
             config.engram_layer_ids,
@@ -308,12 +411,15 @@ class EngramHasher:
 
         # window[:, lookback + j] is the new position j; shift s reads window[:, lookback + j - s]
         window = np.concatenate([state.history, compressed], axis=1)
-        positions = state.position + np.arange(seqlen)
+        start = np.asarray(state.position, dtype=np.int64)
+        if start.ndim > 1 or (start.ndim == 1 and start.shape != (batch,)):
+            raise ValueError(f"state position must be a scalar or [{batch}]; got shape {start.shape}.")
+        positions = start.reshape(-1, 1) + np.arange(seqlen)[None, :]  # [1 or B, L]
         blocked = np.zeros((batch, seqlen), dtype=bool)
         columns = []
         for shift in range(self.max_ngram_size):
             source = window[:, lookback - shift : lookback - shift + seqlen]
-            blocked = blocked | (positions < shift)[None, :] | (source == DEAD)
+            blocked = blocked | (positions < shift) | (source == DEAD)
             columns.append(np.where(blocked, self.pad_id, source))
         tokens = np.stack(columns, axis=-1)  # [B, L, max_ngram_size]
 
@@ -356,4 +462,132 @@ class EngramHasher:
         return self.hash(input_ids, dead_mask)
 
 
-__all__ = ["DEAD", "EngramHashState", "EngramHasher", "build_engram_token_map"]
+class EngramWindowHasher:
+    """Hash ids of one request's scheduled token window, rebuilt from its token history.
+
+    The :class:`EngramHasher` state is reconstructed from the last ``max_ngram_size - 1`` tokens before the window
+    (image-span positions dead), which is exactly the state an incremental hasher would carry. Chunked prefill,
+    decode, preemption/resume and speculative rollback therefore hash identically to one pass over the sequence, with
+    no per-request hasher state to keep or reset.
+    """
+
+    def __init__(self, hasher: EngramHasher) -> None:
+        """Wrap a configured hasher.
+
+        Args:
+            hasher: The hasher.
+        """
+        self.hasher = hasher
+        self.lookback = int(hasher.max_ngram_size) - 1
+
+    @classmethod
+    def from_config(cls, config: tp.Any, token_map: np.ndarray | None = None) -> EngramWindowHasher:
+        """Shorthand for ``EngramWindowHasher(EngramHasher.from_config(config, token_map))``."""
+        return cls(EngramHasher.from_config(config, token_map))
+
+    @property
+    def n_layers(self) -> int:
+        """Number of engram layers."""
+        return int(self.hasher.n_layers)
+
+    @property
+    def n_columns(self) -> int:
+        """Hash columns per (position, layer)."""
+        return int(self.hasher.n_columns)
+
+    def hash_window(
+        self,
+        token_ids_row: np.ndarray,
+        token_types: np.ndarray | None,
+        start: int,
+        end: int,
+    ) -> np.ndarray:
+        """Hash positions ``[start, end)`` of one request.
+
+        Args:
+            token_ids_row: The request's token ids (prompt followed by generated tokens); positions
+                ``max(0, start - lookback) .. end`` must be real tokens.
+            token_types: Prompt token types (``>= 0`` marks an image-span position, which is dead), or ``None`` for a
+                text-only request. Positions past its end are text.
+            start: First position of the window.
+            end: One past the last position of the window.
+
+        Returns:
+            ``int32 [end - start, n_layers, n_columns]``.
+        """
+        history, ids, dead = self._window_inputs(token_ids_row, token_types, start, end)
+        state = EngramHashState(history=history[None], position=int(start))
+        out, _ = self.hasher.step(ids[None], state, dead[None])
+        return out[0]
+
+    def hash_windows(self, windows: tp.Sequence[tuple[np.ndarray, np.ndarray | None, int, int]]) -> list[np.ndarray]:
+        """Hash many requests' windows, one :meth:`EngramHasher.step` call per distinct window length.
+
+        Bit-identical to calling :meth:`hash_window` on each window; batching removes the per-call NumPy overhead
+        that dominates decode (every window is one token long).
+
+        Args:
+            windows: ``(token_ids_row, token_types, start, end)`` per request, as for :meth:`hash_window`.
+
+        Returns:
+            ``int32 [end - start, n_layers, n_columns]`` per window, in input order (empty for empty windows).
+        """
+        out: list[np.ndarray | None] = [None] * len(windows)
+        groups: dict[int, list[int]] = {}
+        prepared = []
+        for i, (row, types, start, end) in enumerate(windows):
+            n = int(end) - int(start)
+            if n <= 0:
+                out[i] = np.zeros((0, self.n_layers, self.n_columns), dtype=np.int32)
+                prepared.append(None)
+                continue
+            prepared.append(self._window_inputs(row, types, start, end))
+            groups.setdefault(n, []).append(i)
+        for members in groups.values():
+            if len(members) == 1:  # no batching win; skip the stack/gather overhead (same computation as hash_window)
+                i = members[0]
+                history, ids, dead = prepared[i]
+                state = EngramHashState(history=history[None], position=int(windows[i][2]))
+                out[i] = self.hasher.step(ids[None], state, dead[None])[0][0]
+                continue
+            state = EngramHashState(
+                history=np.stack([prepared[i][0] for i in members]),
+                position=np.asarray([int(windows[i][2]) for i in members], dtype=np.int64),
+            )
+            ids = np.stack([prepared[i][1] for i in members])
+            dead = np.stack([prepared[i][2] for i in members])
+            hashed, _ = self.hasher.step(ids, state, dead)
+            for slot, i in enumerate(members):
+                out[i] = hashed[slot]
+        return out  # type: ignore[return-value]
+
+    def _window_inputs(
+        self, token_ids_row: np.ndarray, token_types: np.ndarray | None, start: int, end: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """``(history [lookback], ids [end - start], dead [end - start])`` of one window."""
+        lo = max(0, int(start) - self.lookback)
+        # negative ids are speculative-draft placeholders; their rows are replaced downstream, hash them as id 0
+        ids = np.maximum(np.asarray(token_ids_row[lo:end], dtype=np.int64), 0)
+        dead = np.zeros(ids.shape, dtype=bool)
+        if token_types is not None:
+            hi = min(int(end), int(token_types.shape[0]))
+            if hi > lo:
+                dead[: hi - lo] = np.asarray(token_types[lo:hi]) >= 0
+        history = np.full((self.lookback,), DEAD, dtype=np.int64)
+        n_history = int(start) - lo
+        if n_history:
+            history[self.lookback - n_history :] = np.where(
+                dead[:n_history], DEAD, self.hasher.token_map[ids[:n_history]]
+            )
+        return history, ids[n_history:], dead[n_history:]
+
+
+__all__ = [
+    "DEAD",
+    "EngramHashState",
+    "EngramHasher",
+    "EngramWindowHasher",
+    "build_engram_token_map",
+    "engram_bucket_primes",
+    "engram_table_rows",
+]

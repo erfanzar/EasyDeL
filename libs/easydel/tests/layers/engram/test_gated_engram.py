@@ -11,7 +11,7 @@
 import jax
 import numpy as np
 import spectrax as spx
-from easydel.layers.embeddings import GatedEngram, GatedEngramConfig
+from easydel.layers.engram import GatedEngram, GatedEngramConfig
 from jax import numpy as jnp
 
 HIDDEN = 6

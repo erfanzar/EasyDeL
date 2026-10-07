@@ -11,14 +11,10 @@
 import jax
 import spectrax as spx
 from easydel.layers.compressed_window import GatedPoolCompressor
-from easydel.layers.embeddings import GatedEngram
+from easydel.layers.engram import GatedEngram
 from easydel.layers.indexer import SharedKeyIndexer
 from easydel.modules.deepseek_v41 import DeepseekV41Config, DeepseekV41ForCausalLM
-from easydel.modules.deepseek_v41.modeling_deepseek_v41 import (
-    DeepseekV41Compressor,
-    DeepseekV41Engram,
-    DeepseekV41Indexer,
-)
+from easydel.modules.deepseek_v41.modeling_deepseek_v41 import DeepseekV41Compressor, DeepseekV41Indexer
 from jax import numpy as jnp
 
 try:
@@ -54,9 +50,13 @@ def test_engram_case_parameter_tree_matches_the_harness_listing():
     assert sorted(set(expected) - set(actual)) == []
     assert sorted(set(actual) - set(expected)) == []
     assert actual == expected
+    # engram layers are the generic layer itself, found and ordered by the model mixin
+    engrams = model.engram_modules()
+    assert engrams and all(type(m) is GatedEngram for m in engrams)
+    assert [m.layer_hash_index for m in engrams] == list(range(len(config.engram_layer_ids)))
+    assert [m.table_rows for m in engrams] == config.engram_table_rows()
 
 
 def test_v41_blocks_are_thin_bindings_of_the_generic_layers():
     assert issubclass(DeepseekV41Compressor, GatedPoolCompressor)
     assert issubclass(DeepseekV41Indexer, SharedKeyIndexer)
-    assert issubclass(DeepseekV41Engram, GatedEngram)

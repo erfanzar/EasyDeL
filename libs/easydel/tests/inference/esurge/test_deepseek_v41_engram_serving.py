@@ -39,8 +39,8 @@ from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.esurge.runners import eSurgeRunner
 from easydel.inference.esurge.scheduler import Scheduler
 from easydel.inference.sampling_params import SamplingParams
+from easydel.layers.engram import EngramHasher
 from easydel.modules.deepseek_v41 import DeepseekV41Config, DeepseekV41ForCausalLM
-from easydel.modules.deepseek_v41._engram_hash import EngramHasher
 
 try:
     from tests.modules import _deepseek_v41_reference as ref
@@ -120,13 +120,13 @@ def _make_tiny_v41_with_engram(**overrides) -> DeepseekV41ForCausalLM:
 
 
 class _ServingHarness:
-    def __init__(self, model, *, long_prefill_token_threshold: int | None = None):
+    def __init__(self, model, *, long_prefill_token_threshold: int | None = None, max_model_len: int = 128):
         self.runner = eSurgeRunner(
             model=model,
             hbm_utilization=0.02,
             page_size=16,
             max_cache_tokens=2048,
-            max_model_len=128,
+            max_model_len=max_model_len,
             max_num_batched_tokens=64,
             min_input_pad=1,
             min_token_pad=16,
@@ -270,6 +270,77 @@ def test_deepseek_v41_engram_esurge_chunked_prefill_parity(tiny_v41_engram_model
         harness.close()
 
 
+_CED_PROMPTS = (
+    [3 + i for i in range(44)],
+    [3 + (7 * i) % 250 for i in range(40)],
+)
+
+
+def test_ced_compact_plan_maps_live_suffixes():
+    """Live tokens (a suffix of each request's chunk) become a packed stream at their real positions; each slot's
+    grid columns shift by its dead prefix."""
+    from easydel.modules.deepseek_v41 import modeling_deepseek_v41 as mod
+
+    # Row 0 (slot 1): tokens 0-4, live from token 3. Row 1 (slot 0): tokens 5-7, all live. Tokens 8-9 are padding.
+    live = jnp.asarray([0, 0, 0, 1, 1, 1, 1, 1, 0, 0], dtype=bool)
+    positions = jnp.asarray([[100, 101, 102, 103, 104, 7, 8, 9, 0, 0]], dtype=jnp.int32)
+    plan = mod._ced_compact_plan(
+        live,
+        query_start_loc=jnp.asarray([0, 5, 8, 8], dtype=jnp.int32),
+        num_seqs=jnp.asarray([2], dtype=jnp.int32),
+        recurrent_state_indices=jnp.asarray([1, 0, 2], dtype=jnp.int32),
+        position_ids=positions,
+        num_slots=3,
+        length=6,
+    )
+    assert np.asarray(plan.token_index).tolist() == [3, 4, 5, 6, 7, 10]
+    assert np.asarray(plan.col_offset).tolist() == [0, 3, 0]
+    valid = np.asarray(plan.meta.valid_grid)
+    pos = np.asarray(plan.meta.positions_grid)
+    assert valid[1, :2].all() and not valid[1, 2:].any() and pos[1, :2].tolist() == [103, 104]
+    assert valid[0, :3].all() and not valid[0, 3:].any() and pos[0, :3].tolist() == [7, 8, 9]
+    assert not valid[2].any()
+    grid = jnp.arange(3 * 6).reshape(3, 6)
+    shifted = np.asarray(mod._ced_shift_grid(grid, plan.col_offset))
+    assert shifted[1, :2].tolist() == [9, 10] and shifted[0, :3].tolist() == [0, 1, 2]
+
+
+def test_ced_prefill_skip_parity_and_negative_control(tiny_v41_engram_model, monkeypatch):
+    """Prompts far longer than the decoder tail's reach, in 3-token chunks: steps whose tokens are all outside the
+    reach skip the window-only tail, steps with at most ``num_slots`` live tokens (every decode step: 2 slots in a
+    16-token bucket, and dead chunks next to a decoding request) run it on the compacted live tokens, the rest run it
+    in full; greedy serving still equals the stateless forward. Negative control: an artificially short reach drops
+    tokens the tail needs, and serving must diverge (the CED path really runs)."""
+    from easydel.inference.esurge.multimodal.side_inputs import TOKENS_TO_END, model_side_input_specs
+    from easydel.modules.deepseek_v41 import modeling_deepseek_v41 as mod
+
+    model = tiny_v41_engram_model
+    assert TOKENS_TO_END in model_side_input_specs(model)
+    start, reach = mod._ced_decoder_tail(model.config)
+    assert (start, reach) == (4, 15), (start, reach)
+    specs = [{"prompt_token_ids": p} for p in _CED_PROMPTS]
+    assert all(len(p) > 2 * reach for p in _CED_PROMPTS)
+
+    harness = _ServingHarness(model, long_prefill_token_threshold=3)
+    try:
+        served = harness.generate_greedy(specs)
+    finally:
+        harness.close()
+    for prompt, generated in zip(_CED_PROMPTS, served, strict=True):
+        _assert_matches_stateless_reference(model, list(prompt), generated)
+
+    # Different max_model_len -> different cache shapes -> a fresh trace that sees the patched reach.
+    monkeypatch.setattr(mod, "_ced_decoder_tail", lambda config: (start, 1))
+    harness = _ServingHarness(model, long_prefill_token_threshold=3, max_model_len=96)
+    try:
+        broken = harness.generate_greedy(specs)
+    finally:
+        harness.close()
+    with pytest.raises(AssertionError):
+        for prompt, generated in zip(_CED_PROMPTS, broken, strict=True):
+            _assert_matches_stateless_reference(model, list(prompt), generated)
+
+
 @pytest.fixture(scope="module")
 def tiny_v41_host_engram_model():
     """The same tiny model with fp8 engram tables in host RAM (the real-checkpoint serving layout)."""
@@ -300,7 +371,7 @@ def test_host_gathered_engram_serving_parity_without_in_program_lookup(tiny_v41_
     the compiled serving program never traces the in-program host lookup (``pure_callback``); greedy tokens still
     equal the stateless forward, which does use that lookup. 3-token chunks cover chunked prefill and decode."""
     from easydel.inference.esurge.multimodal.side_inputs import model_side_input_specs
-    from easydel.layers.embeddings import GatedEngram
+    from easydel.layers.engram import GatedEngram
 
     model = tiny_v41_host_engram_model
     specs = model_side_input_specs(model)

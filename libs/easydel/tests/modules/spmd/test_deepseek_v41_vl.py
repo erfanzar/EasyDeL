@@ -35,12 +35,12 @@ import optax
 import pytest
 import spectrax as spx
 from easydel.infra.base_state import EasyDeLState
+from easydel.layers.engram import EngramHasher
 from easydel.modules.deepseek_v41 import (
     DeepseekV41Config,
     DeepseekV41ForCausalLM,
     DeepseekV41ForConditionalGeneration,
 )
-from easydel.modules.deepseek_v41._engram_hash import EngramHasher
 
 try:
     from tests.modules import _deepseek_v41_reference as ref

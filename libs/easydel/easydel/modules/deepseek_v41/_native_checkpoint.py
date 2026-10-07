@@ -29,34 +29,14 @@ DSpark draft model (``modeling_deepseek_v41_dspark``).
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
 
+from easydel.layers.engram._loader import ENGRAM_TABLE_KEY_RE as _ENGRAM_TABLE_RE
+from easydel.layers.engram._loader import engram_table_checkpoint_keys
 from easydel.modules.deepseek_v4._native_checkpoint import LEAF_ALIASES, native_key_to_easydel
 
 _INDEXER_RE = re.compile(r"^layers\.(\d+)\.attn\.indexer\.([A-Za-z0-9_]+)\.(weight|scale)$")
 _UNOWNED_ROOTS = ("image_start", "image_end", "image_newline")
 _UNOWNED_PREFIXES = ("mtp.", "model.mtp.", "vision.", "aligner.")
-_ENGRAM_TABLE_RE = re.compile(r"^layers\.(\d+)\.engram\.embed\.(weight|scale)$")
-
-
-def engram_table_checkpoint_keys(keys: Iterable[str]) -> dict[int, dict[str, str]]:
-    """Find the engram table tensors (fp8 ``embed.weight`` and e8m0 ``embed.scale``) in a native key list.
-
-    These are mapped to ``None`` by :func:`native_key_to_easydel_v41` so the streaming conversion never reads them
-    (they are ~100 GB each and must not reach the fp32 quant decoder); the engram loader fills them instead.
-
-    Args:
-        keys: Native checkpoint keys, e.g. the ``weight_map`` of ``model.safetensors.index.json``.
-
-    Returns:
-        ``{layer_id: {"weight": key, "scale": key}}`` for every layer that has table keys.
-    """
-    found: dict[int, dict[str, str]] = {}
-    for key in keys:
-        m = _ENGRAM_TABLE_RE.match(key)
-        if m is not None:
-            found.setdefault(int(m.group(1)), {})[m.group(2)] = key
-    return found
 
 
 def native_key_to_easydel_v41(key: str) -> str | None:

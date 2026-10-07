@@ -29,12 +29,19 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-from easydel.modules.deepseek_v41._engram_hash import DEAD, EngramHasher, build_engram_token_map
-from easydel.modules.deepseek_v41.deepseek_v41_configuration import DeepseekV41Config, engram_bucket_primes
+from easydel.layers.engram import (
+    DEAD,
+    EngramHasher,
+    EngramHashState,
+    EngramWindowHasher,
+    build_engram_token_map,
+    engram_bucket_primes,
+)
+from easydel.modules.deepseek_v41.deepseek_v41_configuration import DeepseekV41Config
 
 pytestmark = pytest.mark.cpu_ok
 
-_REF_PATH = Path(__file__).resolve().parents[4] / ".xerxes" / "projects" / "deepseek-v41" / "ref" / "engram.py"
+_REF_PATH = Path(__file__).resolve().parents[5] / ".xerxes" / "projects" / "deepseek-v41" / "ref" / "engram.py"
 
 _PAD_ID = 2
 
@@ -401,3 +408,36 @@ def test_input_validation(token_map):
         hasher.hash(np.array([[1, 2]]), np.array([[True]]))
     with pytest.raises(ValueError, match="state history"):
         hasher.step(np.array([[1, 2]]), hasher.init_state(2))
+    with pytest.raises(ValueError, match="state position"):
+        bad = EngramHashState(history=hasher.init_state(2).history, position=np.zeros(3, np.int64))
+        hasher.step(np.array([[1, 2], [3, 4]]), bad)
+
+
+@pytest.mark.parametrize("seed", [40, 41, 42])
+def test_batched_windows_equal_single_windows_and_full_hash(token_map, seed):
+    """``hash_windows`` (one step per window length, per-row start positions) is bit-identical to hashing each window
+    alone, and both equal the stateless full-sequence hash sliced to the window."""
+    layout = _LAYOUTS[0]
+    hasher = EngramHasher(token_map, layout[0], layout[1], layout[2], layout[3], _PAD_ID)
+    windower = EngramWindowHasher(hasher)
+    rng = np.random.default_rng(seed)
+    windows, expected = [], []
+    for _ in range(12):
+        length = int(rng.integers(1, 20))
+        row = rng.integers(0, len(_WORDS), size=(length,))
+        types = None
+        if rng.random() < 0.5:  # an image span somewhere in the prompt (dead positions)
+            types = np.full((length,), -1, dtype=np.int64)
+            a = int(rng.integers(0, length))
+            types[a : a + int(rng.integers(1, 4))] = 0
+        # decode-shaped (1 token) windows dominate, plus chunked-prefill and from-zero windows
+        start = int(rng.integers(0, length))
+        end = start + 1 if rng.random() < 0.7 else int(rng.integers(start, length + 1))
+        windows.append((row, types, start, end))
+        dead = None if types is None else (types >= 0)[None]
+        expected.append(hasher.hash(row[None], dead)[0, start:end])
+    batched = windower.hash_windows(windows)
+    for (row, types, start, end), got, full in zip(windows, batched, expected, strict=True):
+        np.testing.assert_array_equal(got, windower.hash_window(row, types, start, end))
+        np.testing.assert_array_equal(got, full)
+        assert got.dtype == np.int32 and got.shape == (end - start, hasher.n_layers, hasher.n_columns)

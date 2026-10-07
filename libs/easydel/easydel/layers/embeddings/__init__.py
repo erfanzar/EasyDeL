@@ -45,7 +45,6 @@ See Also:
 """
 
 from ._embeddings import Embed
-from ._engram import GatedEngram, GatedEngramConfig
 from ._ngram import NGramEmbed
 
-__all__ = ("Embed", "GatedEngram", "GatedEngramConfig", "NGramEmbed")
+__all__ = ("Embed", "NGramEmbed")

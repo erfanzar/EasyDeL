@@ -104,6 +104,9 @@ def _copy_kv_tree(kv_pages: typing.Any) -> typing.Any:
 # leaves whose state advances irreversibly inside a fused speculative forward
 # and therefore the only leaves a speculative rollback must restore.
 _REC_ARRAY_FIELDS = ("conv_state", "recurrent_state", "positions", "seqlen_offset")
+# ``KDACacheView`` (Kimi-Linear / GLM-5-Next KDA layers) extends ``BaseCacheView`` directly and keeps separate Q/K/V
+# short-conv windows; none of its per-slot leaves share a name with the generic recurrent view.
+_KDA_ARRAY_FIELDS = ("q_conv_state", "k_conv_state", "v_conv_state", "recurrent_state", "positions")
 
 
 @jax.jit
@@ -131,12 +134,55 @@ def _recurrent_view_of(view: typing.Any, recurrent_cls: type, parallel_cls: type
 
 
 class _CompressedWindowSnapshot(typing.NamedTuple):
-    """Device copy of a whole compressed-window cache (every leaf), taken before a speculative verify window."""
+    """Device copy of a compressed-window cache's per-stream state, taken before a speculative verify window.
+
+    ``live_indices`` are the compressed-entry leaves left out of the copy: the rollback keeps the live arrays.
+    """
 
     treedef: typing.Any
     leaves: list[typing.Any]
     array_indices: list[int]
     copied: list[jax.Array]
+    live_indices: tuple[int, ...] = ()
+
+
+# Compressed-entry / indexer-key buffers of the compressed-window caches (``CompressedWindowCacheView`` and
+# ``SharedCompressedWindowCacheView``). They are the bulk of the cache bytes and need no rollback: entry ``w`` is
+# written by the token that closes its window (``w * rate + rate - 1``) before any read in the same step, and every
+# reader masks entries by reach ``(position + 1) // rate`` (decode visibility, block extend bias, and the indexer's
+# ``select_candidates`` sets unreachable scores to ``-inf`` before its top-k). An entry left behind by a rejected
+# draft therefore sits beyond the reach of every query until the real token at that position overwrites it.
+# The replay-free rollback traces need no rollback either: a commit reads only trace slots the verify window itself
+# wrote, and a replay rewrites every slot it reads.
+_COMPRESSED_WINDOW_LIVE_FIELDS = frozenset(
+    {
+        "compressor_entries",
+        "indexer_entries",
+        "compressed_kv",
+        "index_k",
+        "compressor_trace_kv",
+        "compressor_trace_score",
+        "compressor_trace_gate",
+        "compressor_trace_overlap_kv",
+        "compressor_trace_overlap_gate",
+        "indexer_trace_kv",
+        "indexer_trace_gate",
+        "indexer_trace_overlap_kv",
+        "indexer_trace_overlap_gate",
+    }
+)
+
+
+def _path_field_name(path: tuple[typing.Any, ...]) -> str | None:
+    """Name of the dataclass field (or dict key) that owns a pytree leaf, from its key path."""
+    if not path:
+        return None
+    last = path[-1]
+    for attr in ("name", "key"):
+        value = getattr(last, attr, None)
+        if isinstance(value, str):
+            return value
+    return None
 
 
 def _is_compressed_window_cache(cache: typing.Any) -> bool:
@@ -148,25 +194,59 @@ def _is_compressed_window_cache(cache: typing.Any) -> bool:
 
 
 def _snapshot_compressed_window(cache: typing.Any) -> _CompressedWindowSnapshot:
-    """Copy every array leaf of a compressed-window cache in one fused dispatch.
+    """Copy the per-stream array leaves of a compressed-window cache in one fused dispatch.
 
-    Ring / compressor / indexer state advances irreversibly on every consumed token, so rejected draft tokens can only
-    be rolled back by restoring a pre-verify copy and replaying the accepted prefix.
+    Ring / open-group compressor / overlap state and ``cache_position`` advance irreversibly on every consumed token,
+    so rejected draft tokens are rolled back by restoring a pre-verify copy and replaying the accepted prefix. The
+    compressed-entry buffers (:data:`_COMPRESSED_WINDOW_LIVE_FIELDS`) are not copied: the restore keeps them live.
     """
-    leaves, treedef = jax.tree_util.tree_flatten(cache)
-    indices = [i for i, leaf in enumerate(leaves) if isinstance(leaf, jax.Array)]
+    with_paths, treedef = jax.tree_util.tree_flatten_with_path(cache)
+    leaves = [leaf for _, leaf in with_paths]
+    live = tuple(
+        i
+        for i, (path, leaf) in enumerate(with_paths)
+        if isinstance(leaf, jax.Array) and _path_field_name(path) in _COMPRESSED_WINDOW_LIVE_FIELDS
+    )
+    indices = [i for i, leaf in enumerate(leaves) if isinstance(leaf, jax.Array) and i not in live]
     copied = _jit_copy_arrays([leaves[i] for i in indices])
     kept = [None if isinstance(leaf, jax.Array) else leaf for leaf in leaves]
-    return _CompressedWindowSnapshot(treedef, kept, indices, copied)
+    return _CompressedWindowSnapshot(treedef, kept, indices, copied, live)
 
 
-def _restore_compressed_window(snapshot: _CompressedWindowSnapshot) -> typing.Any:
-    """Rebuild the cache from fresh copies of the snapshot (it survives the donation of each replay forward)."""
-    fresh = _jit_copy_arrays(snapshot.copied)
+def _restore_compressed_window(
+    live_cache: typing.Any, snapshot: _CompressedWindowSnapshot, *, copy: bool = True
+) -> typing.Any:
+    """Rebuild the cache: the snapshot's per-stream leaves, live compressed-entry buffers.
+
+    With ``copy`` (the default) the snapshot is re-copied so it survives the donation of each replay forward. The
+    replay-free commit reads the pre-window cache through a non-donating jit, so it passes ``copy=False`` and saves
+    one full copy of every per-stream leaf per rolled-back step.
+    """
+    fresh = _jit_copy_arrays(snapshot.copied) if copy else snapshot.copied
     leaves = list(snapshot.leaves)
     for index, array in zip(snapshot.array_indices, fresh, strict=True):
         leaves[index] = array
+    if snapshot.live_indices:
+        live_leaves, live_treedef = jax.tree_util.tree_flatten(live_cache)
+        if live_treedef != snapshot.treedef:
+            raise ValueError("compressed-window cache structure changed between snapshot and restore")
+        for index in snapshot.live_indices:
+            leaves[index] = live_leaves[index]
     return jax.tree_util.tree_unflatten(snapshot.treedef, leaves)
+
+
+def _window_exceeds_limit_impl(
+    live_positions: list[jax.Array], pre_positions: list[jax.Array], committed: jax.Array, limit: int
+) -> jax.Array:
+    """Whether any rolled-back row (``committed < live - pre``) of any view has a window longer than ``limit``."""
+    exceeds = jnp.zeros((), dtype=bool)
+    for live_pos, pre_pos in zip(live_positions, pre_positions, strict=True):
+        count = live_pos.astype(jnp.int32) - pre_pos.astype(jnp.int32)
+        exceeds = exceeds | jnp.any((committed < count) & (count > limit))
+    return exceeds
+
+
+_window_exceeds_limit = jax.jit(_window_exceeds_limit_impl, static_argnums=(3,))
 
 
 def _snapshot_recurrent_state(kv_pages: typing.Any) -> typing.Any:
@@ -194,7 +274,7 @@ def _snapshot_recurrent_state(kv_pages: typing.Any) -> typing.Any:
         per-field index into ``copied_arrays`` (or ``None`` for a non-array
         field); or ``None`` when the cache has no recurrent leaves.
     """
-    from easydel.caching import ParallelHybridCacheView, RecurrentCacheView
+    from easydel.caching import KDACacheView, ParallelHybridCacheView, RecurrentCacheView
 
     if _is_compressed_window_cache(kv_pages):
         return _snapshot_compressed_window(kv_pages)
@@ -205,10 +285,13 @@ def _snapshot_recurrent_state(kv_pages: typing.Any) -> typing.Any:
     flat: list[jax.Array] = []
     for idx, view in enumerate(views):
         rec = _recurrent_view_of(view, RecurrentCacheView, ParallelHybridCacheView)
+        fields = _REC_ARRAY_FIELDS
+        if rec is None and isinstance(view, KDACacheView):
+            rec, fields = view, _KDA_ARRAY_FIELDS
         if rec is None:
             continue
         field_map: dict[str, int | None] = {}
-        for field_name in _REC_ARRAY_FIELDS:
+        for field_name in fields:
             val = getattr(rec, field_name, None)
             if isinstance(val, jax.Array):
                 field_map[field_name] = len(flat)
@@ -244,7 +327,7 @@ def _restore_recurrent_state(live_kv_pages: typing.Any, snapshot: typing.Any) ->
     from easydel.caching import HybridCache
 
     if isinstance(snapshot, _CompressedWindowSnapshot):
-        return _restore_compressed_window(snapshot)
+        return _restore_compressed_window(live_kv_pages, snapshot)
     if snapshot is None:
         return live_kv_pages
     layout, copied = snapshot
@@ -316,6 +399,8 @@ class DrafterSpeculation:
         self.num_drafts_generated = 0
         self.num_drafts_accepted = 0
         self.num_verify_steps = 0
+        # Windows rolled back by :meth:`_commit_compressed_window_without_replay` (no replay forward).
+        self.num_replay_free_commits = 0
         self.debug_traces: list[dict[str, typing.Any]] = []
         self.debug_max_traces = int(os.environ.get("EASYDEL_SPEC_DECODE_DEBUG_STEPS", "0") or 0)
         self.draft_full_log_probs_by_req: dict[str, jax.Array] = {}
@@ -1503,6 +1588,7 @@ class DrafterSpeculation:
                 self._mtp_persist_last_seed_by_row[row] = int(seed_position)
                 self._mtp_persist_written_by_row[row] = 0
                 self.drafter.rollback_to(0, row_pos=row)
+                write_from = 0
             else:
                 # Same request, later window: roll only this request's row back to
                 # its committed position so the previous window's rejected-draft
@@ -1512,6 +1598,17 @@ class DrafterSpeculation:
                 # (gap-adjusted) base, see ``_mtp_persist_committed_len``.
                 committed_len = self._mtp_persist_committed_len(row, int(seed_position))
                 self.drafter.rollback_to(committed_len, row_pos=row)
+                write_from = int(committed_len)
+            # Capacity guard: the persisted row is written from ``write_from`` on, and a dense transformer cache
+            # clamps writes past its end onto the last slots (``dynamic_update_slice``), silently corrupting the
+            # drafter context. Skip drafting for a window that would overflow; verification is unaffected and the
+            # persist bookkeeping above already recorded this window (nothing written).
+            capacity_fn = getattr(self.drafter, "mtp_cache_capacity", None)
+            capacity = capacity_fn() if callable(capacity_fn) else None
+            if capacity is not None:
+                prefix_slots = int(np.asarray(prefix_position_ids).size) if use_prefix else 0
+                if write_from + prefix_slots + int(k_live) > int(capacity):
+                    return []
         elif callable(reset_request):
             reset_request(request_id=str(req_id))
         # Adaptive (early-exit) draft length: run the whole K_max recursion as one
@@ -1715,6 +1812,63 @@ class DrafterSpeculation:
         )
         self.num_drafts_generated += len(drafted)
         return drafted
+
+    def can_batch_whole_block_draft(self) -> bool:
+        """Whether whole-block drafts (DSpark) of a window can be collected and drafted in one batched call."""
+        if self.drafter is None or self.num_draft_tokens <= 0:
+            return False
+        if flags.get_bool(flags.EASYDEL_DISABLE_BATCHED_DRAFT):
+            return False
+        return bool(getattr(self.drafter, "whole_block_draft", False)) and callable(
+            getattr(self.drafter, "draft_windows", None)
+        )
+
+    def draft_whole_block_batched(
+        self,
+        seeds: list[tuple[str, int, int, CachedRequestState | None, int]],
+    ) -> dict[str, list[int]]:
+        """Draft many requests with a whole-block drafter in one call (``drafter.draft_windows``).
+
+        Applies, per request and in the same order, the checks :meth:`draft_next` applies before its whole-block branch
+        (live budget, spec eligibility, reject backoff) and :meth:`_draft_next_whole_block`'s (greedy, observed window).
+
+        Args:
+            seeds: ``(req_id, seed_token, seed_position, req_state, row_pos)`` per request (``row_pos`` is the stable
+                sequence-buffer slot, as for :meth:`draft_next`).
+
+        Returns:
+            ``{req_id: drafted token ids}`` for every seed (``[]`` where no draft is proposed).
+        """
+        out: dict[str, list[int]] = {str(seed[0]): [] for seed in seeds}
+        k_live = int(self.live_num_draft_tokens)
+        draft_windows = getattr(self.drafter, "draft_windows", None)
+        hidden = self._whole_block_hidden
+        if self.drafter is None or k_live <= 0 or not callable(draft_windows) or hidden is None:
+            return out
+        entries: list[tuple[str, int, int, int, int, int, int, int]] = []
+        for req_id, seed_token, seed_position, req_state, row_pos in seeds:
+            rid = str(req_id)
+            if not self.is_spec_request(req_state):
+                continue
+            backoff = int(self._backoff_by_req.get(rid, 0))
+            if backoff > 0:
+                self._backoff_by_req[rid] = backoff - 1
+                self._mtp_persist_checkpoint_skipped_window(rid, int(seed_position))
+                continue
+            if not self.is_greedy_request(req_state):
+                continue
+            info = self._whole_block_window.get(rid)
+            if info is None:
+                continue
+            offset, start, count = info
+            row = self._stable_drafter_row(rid, int(row_pos))
+            entries.append((rid, row, int(seed_token), int(seed_position), offset, start, count, k_live))
+        if not entries:
+            return out
+        for entry, drafted in zip(entries, draft_windows(hidden, entries), strict=True):
+            out[entry[0]] = drafted
+            self.num_drafts_generated += len(drafted)
+        return out
 
     def can_batch_draft(self, req_state: CachedRequestState | None) -> bool:
         """Whether ``req_state`` can be drafted through the batched pool path.
@@ -2202,7 +2356,7 @@ class DrafterSpeculation:
         if not getattr(self._runner, "spec_decode_recurrent_candidates", False):
             return 0
         try:
-            from easydel.caching import HybridCache, ParallelHybridCacheView, RecurrentCacheView
+            from easydel.caching import HybridCache, KDACacheView, ParallelHybridCacheView, RecurrentCacheView
         except Exception:
             return 0
         cache = self._runner.executor_manager.kv_pages
@@ -2210,6 +2364,12 @@ class DrafterSpeculation:
             return 0
         base_slots = max(1, int(self._runner.max_num_reqs))
         for view in cache.views:
+            if isinstance(view, KDACacheView):
+                state = view.recurrent_state
+                n_slots = int(getattr(state, "shape", (0,))[0]) if state is not None else 0
+                if n_slots > base_slots:
+                    return max(0, (n_slots - base_slots) // base_slots)
+                continue
             rec = None
             if isinstance(view, RecurrentCacheView):
                 rec = view
@@ -2226,15 +2386,19 @@ class DrafterSpeculation:
         return 0
 
     def cache_has_recurrent_state(self) -> bool:
-        """Whether the current eSurge cache contains recurrent/SSM rows."""
+        """Whether the current eSurge cache contains recurrent/SSM rows (generic recurrent or KDA views)."""
         try:
-            from easydel.caching import HybridCache, ParallelHybridCacheView, RecurrentCacheView
+            from easydel.caching import HybridCache, KDACacheView, ParallelHybridCacheView, RecurrentCacheView
         except Exception:
             return False
         cache = self._runner.executor_manager.kv_pages
         if not isinstance(cache, HybridCache):
             return False
         for view in cache.views:
+            if isinstance(view, KDACacheView):
+                # KDA layers keep a rolling recurrent row and short-conv windows; with speculative candidate rows the
+                # accepted prefix is committed by a row copy, otherwise by snapshot + replay.
+                return True
             if isinstance(view, RecurrentCacheView):
                 return view.conv_state is not None or view.recurrent_state is not None
             if isinstance(view, ParallelHybridCacheView) and view.recurrent is not None:
@@ -2280,7 +2444,7 @@ class DrafterSpeculation:
         if candidate_count <= 0 or prefix_len <= 0 or prefix_len > candidate_count:
             return False
         try:
-            from easydel.caching import HybridCache, ParallelHybridCacheView, RecurrentCacheView
+            from easydel.caching import HybridCache, KDACacheView, ParallelHybridCacheView, RecurrentCacheView
         except Exception:
             return False
         cache = self._runner.executor_manager.kv_pages
@@ -2318,6 +2482,14 @@ class DrafterSpeculation:
                 """JIT-compiled commit copying candidate states across cache views."""
                 new_views = list(cache_in.views)
                 for idx, view in enumerate(new_views):
+                    if isinstance(view, KDACacheView):
+                        new_views[idx] = view.update_kda_states(
+                            new_q_conv_state=_copy_candidate_row(view.q_conv_state, row, prefix),
+                            new_k_conv_state=_copy_candidate_row(view.k_conv_state, row, prefix),
+                            new_v_conv_state=_copy_candidate_row(view.v_conv_state, row, prefix),
+                            new_recurrent_state=_copy_candidate_row(view.recurrent_state, row, prefix),
+                        )
+                        continue
                     rec = None
                     parallel_view = None
                     if isinstance(view, RecurrentCacheView):
@@ -2391,6 +2563,46 @@ class DrafterSpeculation:
             prefix_len=prefix_len,
         )
 
+    def _commit_compressed_window_without_replay(
+        self,
+        *,
+        pre_step_kv_pages: typing.Any,
+        commit_scheduled_list: list[int],
+        recurrent_slot_indices_cpu: np.ndarray | None,
+    ) -> bool:
+        """Replay-free rollback of a traced compressed-window cache (DeepSeek-V4 / V4.1 DSpark).
+
+        Rebuilds only the per-stream state (rejected ring slots, ``cache_position``, open-group compressor state)
+        from the pre-verify snapshot and the verify-time projection traces, with no model forward. Returns ``False``
+        (caller replays) unless the cache is traced and every window row fits the trace and the ring.
+        """
+        from easydel.caching.compressed_window import commit_speculative_window, speculative_commit_limit
+
+        if not isinstance(pre_step_kv_pages, _CompressedWindowSnapshot) or recurrent_slot_indices_cpu is None:
+            return False
+        live = self._runner.executor_manager.kv_pages
+        limit = speculative_commit_limit(live)
+        if limit <= 0:
+            return False
+        views = [v for v in live.views if v is not None]
+        batch = int(views[0].cache_position.shape[0])
+        committed = np.full((batch,), np.iinfo(np.int32).max // 2, dtype=np.int32)
+        for row in range(len(commit_scheduled_list)):
+            slot = int(recurrent_slot_indices_cpu[row])
+            if 0 <= slot < batch:
+                committed[slot] = int(commit_scheduled_list[row])
+        pre = _restore_compressed_window(live, pre_step_kv_pages, copy=False)
+        # Verify widths straight from the cache (every view, one fused reduction, one scalar readback): a rolled-back
+        # row is exact only when its window fits the ring and the projection trace; otherwise the caller replays.
+        live_positions = [lv.cache_position for lv in live.views if lv is not None]
+        pre_positions = [pv.cache_position for pv in pre.views if pv is not None]
+        committed_device = jnp.asarray(committed)
+        if bool(_window_exceeds_limit(live_positions, pre_positions, committed_device, int(limit))):
+            return False
+        self._runner.executor_manager.kv_pages = commit_speculative_window(live, pre, committed_device)
+        self.num_replay_free_commits += 1
+        return True
+
     def commit_cache_replay(
         self,
         *,
@@ -2448,18 +2660,32 @@ class DrafterSpeculation:
             visual_pos_masks_cpu, deepstack_visual_embeds_cpu: VLM helper
                 buffers; passed through to the replay step.
         """
+        if self._commit_compressed_window_without_replay(
+            pre_step_kv_pages=pre_step_kv_pages,
+            commit_scheduled_list=commit_scheduled_list,
+            recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,
+        ):
+            return
         total_commit = int(sum(commit_scheduled_list))
         self._runner.executor_manager.kv_pages = _restore_recurrent_state(
             self._runner.executor_manager.kv_pages, pre_step_kv_pages
         )
         if total_commit <= 0:
             return
-        idx = bisect_left(self._runner.num_tokens_paddings, total_commit)
-        if idx >= len(self._runner.num_tokens_paddings):
-            idx = len(self._runner.num_tokens_paddings) - 1
-        num_tokens_static = int(self._runner.num_tokens_paddings[idx])
-        if num_tokens_static > int(num_tokens_static_original):
+        if self.rolls_back_cache:
+            # Per-slot compressed-window caches advance a slot's columns in blocks sized from the bucket (one slot's
+            # share, ``ceil(bucket / slots)``). The verify bucket's share covers each row's 1 + k verify columns, so
+            # it also covers every row's committed prefix and the replay runs one narrow block step. Re-bucketing to
+            # the smallest fitting bucket shrinks the share below the longest committed row and forces the wide
+            # bucket-wide block instead (measured on DeepSeek-V4-Flash cc=8: replay 205 ms in bucket 32 vs verify 117).
             num_tokens_static = int(num_tokens_static_original)
+        else:
+            idx = bisect_left(self._runner.num_tokens_paddings, total_commit)
+            if idx >= len(self._runner.num_tokens_paddings):
+                idx = len(self._runner.num_tokens_paddings) - 1
+            num_tokens_static = int(self._runner.num_tokens_paddings[idx])
+            if num_tokens_static > int(num_tokens_static_original):
+                num_tokens_static = int(num_tokens_static_original)
 
         commit_scheduled_full_cpu = self._runner._scheduled_full_cpu.copy()
         commit_scheduled_full_cpu.fill(0)
@@ -2472,6 +2698,13 @@ class DrafterSpeculation:
         self._runner.executor_manager.execute(
             num_tokens=num_tokens_static,
             scheduled_full_cpu=commit_scheduled_full_cpu,
+            model_side_inputs_cpu=self._runner._side_inputs_for_execute(
+                token_ids_cpu=token_ids_window_cpu,
+                num_computed_tokens_cpu=num_computed_tokens_window_cpu,
+                scheduled_full_cpu=commit_scheduled_full_cpu,
+                window_row_indices_cpu=window_row_indices,
+                num_tokens_static=num_tokens_static,
+            ),
             req_num_tokens_full_cpu=commit_req_num_tokens,
             active_mask_full_cpu=self._runner._active_mask_full_cpu,
             window_row_indices_cpu=window_row_indices,
@@ -2556,6 +2789,13 @@ class DrafterSpeculation:
         out_tokens_suffix, _, _, _, hidden_suffix, _, _ = self._runner.executor_manager.execute(
             num_tokens=suffix_num_tokens_static,
             scheduled_full_cpu=suffix_scheduled,
+            model_side_inputs_cpu=self._runner._side_inputs_for_execute(
+                token_ids_cpu=token_ids_window_cpu,
+                num_computed_tokens_cpu=suffix_num_computed,
+                scheduled_full_cpu=suffix_scheduled,
+                window_row_indices_cpu=window_row_indices_cpu,
+                num_tokens_static=suffix_num_tokens_static,
+            ),
             req_num_tokens_full_cpu=suffix_req_num_tokens,
             active_mask_full_cpu=suffix_active,
             window_row_indices_cpu=window_row_indices_cpu,
@@ -2649,6 +2889,13 @@ class DrafterSpeculation:
         out_tokens_replay, _, _, _, hidden_replay, _, _ = self._runner.executor_manager.execute(
             num_tokens=num_tokens_static,
             scheduled_full_cpu=replay_scheduled,
+            model_side_inputs_cpu=self._runner._side_inputs_for_execute(
+                token_ids_cpu=token_ids_window_cpu,
+                num_computed_tokens_cpu=num_computed_tokens_window_cpu,
+                scheduled_full_cpu=replay_scheduled,
+                window_row_indices_cpu=window_row_indices_cpu,
+                num_tokens_static=num_tokens_static,
+            ),
             req_num_tokens_full_cpu=replay_req_num_tokens,
             active_mask_full_cpu=replay_active,
             window_row_indices_cpu=window_row_indices_cpu,
@@ -2754,6 +3001,13 @@ class DrafterSpeculation:
             out_tokens_replay, _, _, _, hidden_replay, _, _ = self._runner.executor_manager.execute(
                 num_tokens=one_token_static,
                 scheduled_full_cpu=replay_scheduled,
+                model_side_inputs_cpu=self._runner._side_inputs_for_execute(
+                    token_ids_cpu=token_ids_window_cpu,
+                    num_computed_tokens_cpu=replay_num_computed,
+                    scheduled_full_cpu=replay_scheduled,
+                    window_row_indices_cpu=window_row_indices_cpu,
+                    num_tokens_static=one_token_static,
+                ),
                 req_num_tokens_full_cpu=replay_req_num_tokens,
                 active_mask_full_cpu=replay_active,
                 window_row_indices_cpu=window_row_indices_cpu,
