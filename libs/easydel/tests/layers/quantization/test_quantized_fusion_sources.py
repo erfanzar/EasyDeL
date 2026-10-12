@@ -195,28 +195,32 @@ def test_scale_siblings_do_not_become_parameters(converted):
 # --- vendor-layout checkpoints -------------------------------------------------
 #
 # A family that publishes weights under its own names declares a
-# `_checkpoint_key_normalizer` mapping one raw checkpoint key to its EasyDeL
+# `checkpoint_key_rules` mapping one raw checkpoint key to its EasyDeL
 # parameter name, or `None` for a tensor the runtime does not own. Fusion
 # targets are built from ALREADY-normalized source names, so passing one back
 # through that normalizer asks it about a key no checkpoint contains -- it
 # answers `None`, and the converter drops the tensor as unowned.
 
 
-def _vendor_normalizer(key: str) -> str | None:
-    """A minimal stand-in for DeepSeek-V4's normalizer.
+def _vendor_rules():
+    """A minimal stand-in for DeepSeek-V4's rules.
 
-    Renames the vendor's MLP names and reports anything outside its table as
-    unowned, which is what makes a re-normalized fusion target vanish.
+    Renames the vendor's MLP names and reports anything else under ``.mlp.`` as unowned, which is what makes a
+    re-normalized fusion target vanish.
     """
-    if ".mlp.w1." in key:
-        return key.replace(".mlp.w1.", ".mlp.gate_proj.")
-    if ".mlp.w3." in key:
-        return key.replace(".mlp.w3.", ".mlp.up_proj.")
-    if ".mlp.w2." in key:
-        return key.replace(".mlp.w2.", ".mlp.down_proj.")
-    if ".mlp." in key:
-        return None
-    return key
+    from easydel.utils.checkpoint_keys import KEEP, KeyRuleSet, Map
+
+    return KeyRuleSet(
+        [
+            Map(
+                r"(?P<a>.*?)\.mlp\.(?P<w>w1|w3|w2)\.(?P<b>.*)",
+                "{a}.mlp.{w}.{b}",
+                rename={"w": {"w1": "gate_proj", "w3": "up_proj", "w2": "down_proj"}},
+            ),
+            Map(r".*\.mlp\..*", None),
+        ],
+        otherwise=KEEP,
+    )
 
 
 @pytest.fixture(scope="module")
@@ -233,8 +237,8 @@ def converted_vendor(tmp_path_factory):
         _model_task = TaskType.CAUSAL_LM
 
     module_cls = ed.LlamaForCausalLM
-    had = "_checkpoint_key_normalizer" in vars(module_cls)
-    module_cls._checkpoint_key_normalizer = staticmethod(_vendor_normalizer)
+    had = "checkpoint_key_rules" in vars(module_cls)
+    module_cls.checkpoint_key_rules = _vendor_rules()
     try:
         _Base.huggingface_to_easydel_sequential(
             pretrained_model_name_or_path=str(src),
@@ -243,7 +247,7 @@ def converted_vendor(tmp_path_factory):
         )
     finally:
         if not had:
-            del module_cls._checkpoint_key_normalizer
+            del module_cls.checkpoint_key_rules
     index = json.loads((out / "tensorstore_index.json").read_text())
     return {e["path"]: e for e in index["prefixes"]["model"]}
 

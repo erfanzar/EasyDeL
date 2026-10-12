@@ -129,6 +129,7 @@ from easydel.operations.kernels.dsa_sparse_attention import (
     use_sparse_training_attention,
 )
 from easydel.operations.kernels.kda import kda_packed_rows_forward
+from easydel.utils.checkpoint_keys import KEEP, KeyRuleSet, Map
 
 from .glm5_next_configuration import (
     LINEAR_ATTENTION_LAYER_TYPE,
@@ -659,15 +660,7 @@ class Glm5NextHyperConnection(ManifoldHyperConnection):
             rngs: Random number generators.
         """
         super().__init__(
-            ManifoldHyperConnectionConfig(
-                hidden_size=config.hidden_size,
-                hc_mult=config.hc_mult,
-                eps=config.hc_eps,
-                norm_eps=config.rms_norm_eps,
-                iters=config.hc_sinkhorn_iters,
-                initializer=config.initializer_range,
-                use_fused_coefficients=config.hc_use_fused_coefficients,
-            ),
+            ManifoldHyperConnectionConfig.from_model_config(config),
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
@@ -2370,6 +2363,19 @@ class Glm5NextTextModel(EasyDeLBaseModule):
         )
 
 
+#: The published `zai-org/GLM-5.3-Flash` checkpoint is the multimodal composite: the language model lives under
+#: ``model.language_model.`` (EasyDeL builds it as ``model.``) and the vision tower under ``model.visual.``
+#: (unowned by the text model). Text-only extractions already in ``model.layers...`` pass through.
+GLM5_NEXT_KEY_RULES = KeyRuleSet(
+    [
+        Map(r"model\.visual\..*", None),
+        Map(r"model\.language_model\.(?P<rest>.*)", "model.{rest}"),
+    ],
+    otherwise=KEEP,
+    name="glm5_next",
+)
+
+
 @register_module(TaskType.CAUSAL_LM, config=Glm5NextTextConfig, model_type="glm5_next_text")
 class Glm5NextForCausalLM(BaseCausalLMModule[Glm5NextTextModel, Glm5NextTextConfig]):  # type: ignore
     """GLM-5-Next model with a causal language-modelling head.
@@ -2420,30 +2426,7 @@ class Glm5NextForCausalLM(BaseCausalLMModule[Glm5NextTextModel, Glm5NextTextConf
             router_aux_loss_coef=getattr(config, "router_aux_loss_coef", None),
         )
 
-    @staticmethod
-    def _checkpoint_key_normalizer(key: str) -> str | None:
-        """Rewrite composite `zai-org/GLM-5.3-Flash` checkpoint keys.
-
-        The published checkpoint is the multimodal composite: language-model
-        tensors live under ``model.language_model.`` and the vision tower under
-        ``model.visual.``. EasyDeL builds the text stack as ``model.layers...``,
-        so the ``language_model`` segment is stripped and vision tensors are
-        reported as unowned (``None`` — the converter skips them). Text-only
-        extractions that already use ``model.layers...`` pass through unchanged
-        (idempotent).
-
-        Args:
-            key: Raw HF state-dict key.
-
-        Returns:
-            The EasyDeL-side key, or ``None`` when the runtime does not own
-            the tensor (vision tower).
-        """
-        if key.startswith("model.visual."):
-            return None
-        if key.startswith("model.language_model."):
-            return "model." + key[len("model.language_model.") :]
-        return key
+    checkpoint_key_rules: ClassVar[KeyRuleSet] = GLM5_NEXT_KEY_RULES
 
     def has_mtp(self) -> bool:
         """Whether a nextn (MTP) head is attached as ``self.mtp``.

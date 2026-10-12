@@ -29,6 +29,9 @@ from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
 
 __all__ = (
+    "DECODE_ATTEND_PLATFORM",
+    "MASK_MIN",
+    "TRAIN_ATTEND_PLATFORM",
     "block_sink_attention",
     "block_token_bias",
     "gather_selected_entries",
@@ -39,7 +42,18 @@ __all__ = (
     "sink_attention",
 )
 
-_MASK_MIN = float(jnp.finfo(jnp.float32).min)
+MASK_MIN = float(jnp.finfo(jnp.float32).min)
+"""Additive fp32 bias for keys a query may not see (shared by ring, entry and selection masks)."""
+
+# Platform of the compressed-window decode attend, passed per call to the registered ``CompressedWindowDecodeAttn``
+# adapter. "xla" is the GSPMD-partitionable, numerically exact reference; the adapter builds the head-parallel
+# ``shard_map`` itself whenever a Pallas kernel is selected on a multi-device mesh.
+DECODE_ATTEND_PLATFORM = "xla"
+
+# Platform of the training / prefill (full-sequence) attend through ``CompressedWindowAttn``: ``None`` lets the
+# adapter choose (tiled-flash Pallas on TPU -- KV streaming, online softmax, sliding-window band skip -- and the
+# differentiable XLA reference elsewhere, identical f32 math).
+TRAIN_ATTEND_PLATFORM: str | None = None
 
 
 def sink_attention(
@@ -139,7 +153,7 @@ def ring_slot_positions(position: Int[Array, " batch"], window: int) -> Int[Arra
 
 def ring_visibility_bias(slot_positions: Int[Array, "batch window"]) -> Float[Array, "batch window"]:
     """Additive fp32 bias that hides ring slots which have not been written (``slot_positions < 0``)."""
-    return jnp.where(slot_positions >= 0, 0.0, _MASK_MIN).astype(jnp.float32)
+    return jnp.where(slot_positions >= 0, 0.0, MASK_MIN).astype(jnp.float32)
 
 
 def block_token_bias(
@@ -167,7 +181,7 @@ def block_token_bias(
     ring_vis = (slot_pos[:, None, :] >= 0) & (slot_pos[:, None, :] > positions[:, :, None] - window)
     col = jnp.arange(block, dtype=jnp.int32)
     block_vis = (col[None, None, :] <= col[None, :, None]) & valid[:, None, :]
-    return jnp.where(jnp.concatenate([ring_vis, block_vis], axis=-1), 0.0, _MASK_MIN).astype(jnp.float32)
+    return jnp.where(jnp.concatenate([ring_vis, block_vis], axis=-1), 0.0, MASK_MIN).astype(jnp.float32)
 
 
 def block_sink_attention(
@@ -236,5 +250,5 @@ def gather_selected_entries(
     valid = topk >= 0
     spread = jnp.broadcast_to(jnp.arange(topk.shape[-1], dtype=topk.dtype) % entries.shape[1], topk.shape)
     gathered = jnp.take_along_axis(entries, jnp.where(valid, topk, spread)[..., None], axis=1)
-    bias = jnp.where(valid, 0.0, _MASK_MIN).astype(jnp.float32)
+    bias = jnp.where(valid, 0.0, MASK_MIN).astype(jnp.float32)
     return gathered, bias

@@ -32,8 +32,8 @@ from .modeling_glm5_next_mtp import (
     Glm5NextMTPHead,
     Glm5NextMTPLayer,
     attach_glm5_next_mtp,
+    glm5_next_mtp_key_rules,
     load_glm5_next_mtp,
-    native_key_to_glm5_next_mtp,
 )
 
 
@@ -75,6 +75,6 @@ __all__ = (
     "Glm5NextTextModel",
     "Glm5NextVisionConfig",
     "attach_glm5_next_mtp",
+    "glm5_next_mtp_key_rules",
     "load_glm5_next_mtp",
-    "native_key_to_glm5_next_mtp",
 )

@@ -3157,60 +3157,20 @@ class Gemma4TextModel(EasyDeLBaseModule):
             ``(max_position, rotary_dim // 2)``.
         """
         from easydel.infra.utils import ModuleCaches
-        from easydel.layers import get_frequencies
+        from easydel.layers.rotary import partial_rope_frequencies
 
         global_params = self.config.rope_parameters.get("full_attention", {})
-        base = global_params.get("rope_theta", 1_000_000.0)
-        partial_rotary = global_params.get("partial_rotary_factor", 1.0)
-        rope_type = global_params.get("rope_type", "default")
         head_dim = self.config.global_head_dim if self.config.global_head_dim else self.config.head_dim
-
-        if rope_type == "proportional":
-            rope_angles = int(partial_rotary * head_dim // 2)
-            inv_freq_rotated = 1.0 / (base ** (jnp.arange(0, 2 * rope_angles, 2, dtype=jnp.float32) / head_dim))
-            nope_angles = head_dim // 2 - rope_angles
-            inv_freq = (
-                jnp.concatenate((inv_freq_rotated, jnp.zeros((nope_angles,), dtype=jnp.float32)), axis=0)
-                if nope_angles > 0
-                else inv_freq_rotated
-            )
-            # HF `_compute_proportional_rope_parameters` divides by the optional `factor`.
-            inv_freq = inv_freq / global_params.get("factor", 1.0)
-            positions = jnp.arange(self.config.granted_freq_max_position_embedding, dtype=jnp.float32)[:, None]
-            phase = positions * inv_freq[None, :]
-            frequencies = jnp.concatenate((jnp.cos(phase), jnp.sin(phase)), axis=-1)
-        elif partial_rotary < 1.0:
-            rotated_dim = int(head_dim * partial_rotary)
-            rotated_frequencies = get_frequencies(
-                head_size=rotated_dim,
-                rotary_dim=rotated_dim,
+        return ModuleCaches(
+            partial_rope_frequencies(
+                head_dim=head_dim,
                 max_position=self.config.granted_freq_max_position_embedding,
-                base=base,
-                rope_scaling=None,
-                partial_rotary_factor=1.0,
+                base=global_params.get("rope_theta", 1_000_000.0),
+                partial_rotary_factor=global_params.get("partial_rotary_factor", 1.0),
+                rope_type=global_params.get("rope_type", "default"),
+                factor=global_params.get("factor", 1.0),
             )
-            rotated_cos, rotated_sin = jnp.split(rotated_frequencies, 2, axis=-1)
-            pass_dim = head_dim // 2 - rotated_cos.shape[-1]
-            frequencies = jnp.concatenate(
-                (
-                    jnp.concatenate(
-                        (rotated_cos, jnp.ones((rotated_cos.shape[0], pass_dim), dtype=rotated_cos.dtype)), axis=-1
-                    ),
-                    jnp.concatenate(
-                        (rotated_sin, jnp.zeros((rotated_sin.shape[0], pass_dim), dtype=rotated_sin.dtype)), axis=-1
-                    ),
-                ),
-                axis=-1,
-            )
-        else:
-            frequencies = get_frequencies(
-                head_size=head_dim,
-                rotary_dim=head_dim,
-                max_position=self.config.granted_freq_max_position_embedding,
-                base=base,
-                rope_scaling=None,
-            )
-        return ModuleCaches(frequencies)
+        )
 
     def forward(
         self,

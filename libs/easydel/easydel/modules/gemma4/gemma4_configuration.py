@@ -442,6 +442,8 @@ class Gemma4VisionConfig(EasyDeLBaseConfig):
     """
 
     model_type: str = "gemma4_vision"
+    # Matches HF: the vision rotary module only accepts ``rope_type="axial"``.
+    default_rope_type = "axial"
 
     def __init__(
         self,

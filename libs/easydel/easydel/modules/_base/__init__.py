@@ -127,6 +127,8 @@ from ._vlm_features import (
     MultiModalMergeFeature,
     VideoProcessingFeature,
     VisionEncoderFeature,
+    flatten_mrope_position_ids_for_text,
+    mrope_position_ids_from_mm_token_types,
     torch_bicubic_resize,
 )
 
@@ -172,5 +174,7 @@ __all__ = [
     "create_sequence_classification_class",
     "create_task_model_class",
     "create_token_classification_class",
+    "flatten_mrope_position_ids_for_text",
+    "mrope_position_ids_from_mm_token_types",
     "torch_bicubic_resize",
 ]

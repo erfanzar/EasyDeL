@@ -193,7 +193,7 @@ def converted_checkpoint(tmp_path_factory):
         for hf_key, arr in _easydel_leaf_to_hf(key, leaf).items():
             # The published composite checkpoint nests the language model under
             # model.language_model. (lm_head stays top-level). This exercises
-            # the _checkpoint_key_normalizer end-to-end.
+            # GLM5_NEXT_KEY_RULES end-to-end.
             if hf_key.startswith("model."):
                 hf_key = "model.language_model." + hf_key[len("model.") :]
             hf_state[hf_key] = torch.from_numpy(np.ascontiguousarray(arr.copy()))

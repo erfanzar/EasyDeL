@@ -60,6 +60,9 @@ def _build(layer_types, *, precision=None):
         rms_norm_eps=1e-6,
         partial_rotary_factor=0.25,
         scan_layers=False,
+        # Packed (segmented, f32 logits) and unpacked (q/k cast to attn_dtype) vanilla paths round differently at
+        # the default bf16 attn_dtype; pin f32 so the comparison isolates cross-document leakage.
+        attn_dtype=jnp.float32,
     )
     return Qwen3_5ForCausalLM(
         config=config, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32, precision=precision

@@ -29,10 +29,10 @@ from pathlib import Path
 
 import pytest
 from easydel.modules.deepseek_v41 import DeepseekV41Config
-from easydel.modules.deepseek_v41._native_checkpoint import (
-    native_key_to_easydel_v41,
-    native_key_to_easydel_v41_mtp,
-    native_key_to_easydel_v41_vl,
+from easydel.modules.deepseek_v41.modeling_deepseek_v41 import (
+    DEEPSEEK_V41_KEY_RULES,
+    DEEPSEEK_V41_MTP_KEY_RULES,
+    DEEPSEEK_V41_VL_KEY_RULES,
 )
 
 try:
@@ -73,7 +73,7 @@ def mtp_keys() -> list[str]:
 
 @pytest.fixture(scope="module")
 def mapping(mtp_keys: list[str]) -> dict[str, str | None]:
-    return {k: native_key_to_easydel_v41_mtp(k) for k in mtp_keys}
+    return {k: DEEPSEEK_V41_MTP_KEY_RULES(k) for k in mtp_keys}
 
 
 @pytest.fixture(scope="module")
@@ -133,7 +133,7 @@ def test_unmapped_keys_are_exactly_the_image_router_biases(mapping: dict[str, st
 
 def test_tied_embed_and_head_are_unowned() -> None:
     for key in ("mtp.0.embed.weight", "mtp.2.head.weight"):
-        assert native_key_to_easydel_v41_mtp(key) is None
+        assert DEEPSEEK_V41_MTP_KEY_RULES(key) is None
 
 
 def test_no_two_source_keys_collide(mapped: dict[str, str]) -> None:
@@ -207,12 +207,12 @@ def test_names_match_the_parity_test_parameter_table(mapped: dict[str, str], con
 
 
 def test_normalizer_is_idempotent_and_leaves_other_keys_alone() -> None:
-    assert native_key_to_easydel_v41_mtp("stages.1.mlp.gate.weight") == "stages.1.mlp.gate.weight"
-    assert native_key_to_easydel_v41_mtp("layers.3.attn.wq_a.weight") is None
-    assert native_key_to_easydel_v41_mtp("embed.weight") is None
-    assert native_key_to_easydel_v41_mtp("mtp.0.ffn.gate.bias_vl") is None
+    assert DEEPSEEK_V41_MTP_KEY_RULES("stages.1.mlp.gate.weight") == "stages.1.mlp.gate.weight"
+    assert DEEPSEEK_V41_MTP_KEY_RULES("layers.3.attn.wq_a.weight") is None
+    assert DEEPSEEK_V41_MTP_KEY_RULES("embed.weight") is None
+    assert DEEPSEEK_V41_MTP_KEY_RULES("mtp.0.ffn.gate.bias_vl") is None
 
 
 def test_existing_normalizers_still_leave_mtp_unowned(mtp_keys: list[str]) -> None:
-    assert all(native_key_to_easydel_v41(k) is None for k in mtp_keys)
-    assert all(native_key_to_easydel_v41_vl(k) is None for k in mtp_keys)
+    assert all(DEEPSEEK_V41_KEY_RULES(k) is None for k in mtp_keys)
+    assert all(DEEPSEEK_V41_VL_KEY_RULES(k) is None for k in mtp_keys)

@@ -63,6 +63,8 @@ class Qwen4ExpVisionConfig(EasyDeLBaseConfig):
     """
 
     model_type = "qwen4_exp_vision"
+    # Matches HF: the vision rotary module only accepts ``rope_type="axial"``.
+    default_rope_type = "axial"
     base_config_key = "vision_config"
 
     def __init__(

@@ -80,7 +80,7 @@ from easydel.layers import (
 )
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention, block_diagonal_bias
 from easydel.layers.norms import LayerNorm
-from easydel.layers.rotary import rotate_half as _rotate_half
+from easydel.layers.rotary import apply_rope_split_half
 from easydel.modules._base import BaseVisionLanguageModule
 
 from .glm4v_configuration import Glm4vConfig, Glm4vTextConfig, Glm4vVisionConfig
@@ -147,23 +147,6 @@ def bicubic_border_resample_matrix(num_out: int, num_in: int) -> np.ndarray:
     matrix = np.zeros((num_out, num_in), dtype=f32)
     np.add.at(matrix, (np.repeat(np.arange(num_out), 4), taps.reshape(-1)), weights.reshape(-1))
     return matrix
-
-
-def apply_rotary_pos_emb_vision(q: Array, k: Array, cos: Array, sin: Array) -> tuple[Array, Array]:
-    """Apply rotary position embeddings to query and key tensors for vision attention.
-
-    Args:
-        q (Array): Query tensor of shape (seq_len, num_heads, head_dim).
-        k (Array): Key tensor of shape (seq_len, num_heads, head_dim).
-        cos (Array): Cosine component of rotary embeddings.
-        sin (Array): Sine component of rotary embeddings.
-
-    Returns:
-        tuple[Array, Array]: Rotated query and key tensors with the same shapes.
-    """
-    cos = cos[:, None, :]
-    sin = sin[:, None, :]
-    return (q * cos) + (_rotate_half(q) * sin), (k * cos) + (_rotate_half(k) * sin)
 
 
 # The packed-vision block-diagonal mask is shared infrastructure; this family
@@ -479,7 +462,8 @@ class Glm4vVisionAttention(UnifiedAttention):
 
         cos = jnp.cos(rotary_pos_emb)
         sin = jnp.sin(rotary_pos_emb)
-        q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
+        q = apply_rope_split_half(q, cos, sin, compute_dtype=None)
+        k = apply_rope_split_half(k, cos, sin, compute_dtype=None)
 
         q = jnp.expand_dims(q, 0)
         k = jnp.expand_dims(k, 0)

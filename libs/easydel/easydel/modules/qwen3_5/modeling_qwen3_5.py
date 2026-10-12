@@ -31,19 +31,17 @@ This module exposes the task-specific wrappers for that stack:
   backbone and merging visual embeddings at placeholder token
   positions before invoking the LM head.
 
-Helper functions :func:`_get_rope_index_from_mm_token_types` and
-:func:`_maybe_flatten_position_ids_for_text` compute the multimodal
+The shared helpers :func:`easydel.modules._base.mrope_position_ids_from_mm_token_types` and
+:func:`easydel.modules._base.flatten_mrope_position_ids_for_text` compute the multimodal
 mRoPE indices and bridge between 1-D text-only position IDs and the
 3-D layout expected by the decoder.
 """
 
 import copy
-import itertools
 from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 import spectrax as spx
 from ejkernel.types import MaskInfo
 from jax.ad_checkpoint import checkpoint_name
@@ -64,7 +62,12 @@ from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import MoeCausalLMOutput
 from easydel.infra.utils import auto_remat, blockwise_ffn
 from easydel.layers import ColumnParallelLinear
-from easydel.modules._base import BaseCausalLMModule, BaseVisionLanguageModule
+from easydel.modules._base import (
+    BaseCausalLMModule,
+    BaseVisionLanguageModule,
+    flatten_mrope_position_ids_for_text,
+    mrope_position_ids_from_mm_token_types,
+)
 from easydel.modules.qwen3_next.modeling_qwen3_next import (
     Qwen3NextForCausalLM,
     Qwen3NextFullAttention,
@@ -81,136 +84,6 @@ from easydel.modules.qwen3_vl.modeling_qwen3_vl import (
 from easydel.modules.qwen3_vl.qwen3_vl_configuration import Qwen3VLConfig, Qwen3VLTextConfig
 
 from .qwen3_5_configuration import Qwen3_5Config, Qwen3_5TextConfig
-
-
-def _get_rope_index_from_mm_token_types(
-    input_ids: jax.Array,
-    mm_token_type_ids: jax.Array,
-    image_grid_thw: jax.Array | None = None,
-    video_grid_thw: jax.Array | None = None,
-    attention_mask: jax.Array | None = None,
-    spatial_merge_size: int = 1,
-    return_jax_arrays: bool = True,
-) -> tuple[jax.Array | np.ndarray, jax.Array | np.ndarray]:
-    """Compute 3D mRoPE position ids from modality token-type ids.
-
-    Groups consecutive tokens by modality (0 = text, 1 = image, 2 = video)
-    and assigns separate temporal/height/width position ids for visual tokens
-    according to their spatial grid layout.
-
-    Args:
-        input_ids: Input token ids of shape ``(batch, seq_len)``.
-        mm_token_type_ids: Per-token modality type ids (0=text, 1=image, 2=video).
-        image_grid_thw: Grid dimensions ``(T, H, W)`` for each image.
-        video_grid_thw: Grid dimensions ``(T, H, W)`` for each video; each is
-            consumed as ``T`` single-frame grids (one per timestamp-separated
-            frame group), matching HF ``Qwen3_5Model.get_rope_index``.
-        attention_mask: Boolean attention mask of shape ``(batch, seq_len)``.
-        spatial_merge_size: Spatial merge factor from the vision config.
-        return_jax_arrays: When ``False``, return NumPy arrays without touching
-            JAX dispatch. Host-side data collators should use this mode.
-
-    Returns:
-        Tuple of ``(position_ids, mrope_position_deltas)`` where ``position_ids``
-        has shape ``(3, batch, seq_len)`` and deltas has shape ``(batch, 1)``.
-    """
-    input_ids_np = np.asarray(input_ids)
-    token_types_np = np.asarray(mm_token_type_ids)
-    attention_mask_np = np.asarray(attention_mask).astype(bool) if attention_mask is not None else None
-
-    image_iter = iter(np.asarray(image_grid_thw)) if image_grid_thw is not None else None
-    video_iter = None
-    if video_grid_thw is not None:
-        # Qwen3.5 separates video frames with timestamp tokens, so every video grid
-        # is split into ``T`` single-frame grids (HF ``repeat_interleave`` + ``[:, 0] = 1``).
-        # Idempotent for callers that already split.
-        video_grid_np = np.array(video_grid_thw, copy=True).reshape(-1, 3)
-        video_grid_np = np.repeat(video_grid_np, video_grid_np[:, 0].astype(np.int64), axis=0)
-        video_grid_np[:, 0] = 1
-        video_iter = iter(video_grid_np)
-
-    batch_size, seq_len = input_ids_np.shape
-    position_ids = np.zeros((3, batch_size, seq_len), dtype=np.int32)
-    mrope_position_deltas: list[int] = []
-
-    for batch_idx in range(batch_size):
-        current_input_ids = input_ids_np[batch_idx]
-        current_types = token_types_np[batch_idx]
-        if attention_mask_np is not None:
-            valid_mask = attention_mask_np[batch_idx]
-            current_input_ids = current_input_ids[valid_mask]
-            current_types = current_types[valid_mask]
-
-        groups = []
-        for key, group in itertools.groupby(enumerate(current_types.tolist()), lambda x: x[1]):
-            group = list(group)
-            groups.append((key, group[0][0], group[-1][0] + 1))
-
-        current_pos = 0
-        llm_pos_ids_list: list[np.ndarray] = []
-        for modality_type, start_idx, end_idx in groups:
-            if modality_type == 0:
-                text_len = end_idx - start_idx
-                llm_pos_ids_list.append(
-                    np.arange(text_len, dtype=np.int32).reshape(1, -1).repeat(3, axis=0) + current_pos,
-                )
-                current_pos += text_len
-            else:
-                grid_iter = image_iter if modality_type == 1 else video_iter
-                if grid_iter is None:
-                    continue
-                grid_thw = next(grid_iter)
-                llm_grid_t = int(grid_thw[0])
-                llm_grid_h = int(grid_thw[1]) // spatial_merge_size
-                llm_grid_w = int(grid_thw[2]) // spatial_merge_size
-
-                # HF ``get_vision_position_ids``: ``meshgrid(t, h, w, indexing="ij")``
-                # flattened row-major, i.e. width varies fastest, then height, then time.
-                position_temporal, position_height, position_width = np.meshgrid(
-                    np.arange(llm_grid_t, dtype=np.int32) + current_pos,
-                    np.arange(llm_grid_h, dtype=np.int32) + current_pos,
-                    np.arange(llm_grid_w, dtype=np.int32) + current_pos,
-                    indexing="ij",
-                )
-                llm_pos_ids_list.append(
-                    np.stack([position_temporal, position_height, position_width], axis=0).reshape(3, -1)
-                )
-
-                current_pos += max(int(grid_thw[1]), int(grid_thw[2])) // spatial_merge_size
-
-        if len(llm_pos_ids_list) == 0:
-            llm_positions = np.zeros((3, 0), dtype=np.int32)
-        else:
-            llm_positions = np.concatenate(llm_pos_ids_list, axis=1).reshape(3, -1)
-
-        if attention_mask_np is not None:
-            position_ids[:, batch_idx, attention_mask_np[batch_idx]] = llm_positions
-        else:
-            position_ids[:, batch_idx, : llm_positions.shape[1]] = llm_positions
-        delta = int(llm_positions.max() + 1 - len(current_input_ids)) if llm_positions.shape[1] > 0 else 0
-        mrope_position_deltas.append(delta)
-
-    mrope_position_deltas = np.asarray(mrope_position_deltas, dtype=np.int32).reshape(-1, 1)
-    if not return_jax_arrays:
-        return position_ids, mrope_position_deltas
-    return jnp.asarray(position_ids, dtype=jnp.int32), jnp.asarray(mrope_position_deltas, dtype=jnp.int32)
-
-
-def _maybe_flatten_position_ids_for_text(config: Qwen3_5TextConfig, position_ids: jax.Array) -> jax.Array:
-    """Flatten 3D mRoPE position ids to 1D when the text config does not enable mRoPE.
-
-    Args:
-        config: Text model configuration.
-        position_ids: Position ids, either ``(batch, seq)`` or ``(3, batch, seq)``.
-
-    Returns:
-        Position ids with shape ``(batch, seq)`` (1D) or unchanged if mRoPE is enabled.
-    """
-    rope_scaling = getattr(config, "rope_scaling", None)
-    uses_mrope = isinstance(rope_scaling, dict) and "mrope_section" in rope_scaling
-    if position_ids.ndim == 3 and not uses_mrope:
-        return position_ids[0]
-    return position_ids
 
 
 @dataclass(frozen=True)
@@ -1107,7 +980,7 @@ class Qwen3_5Model(Qwen3VLModel):
             position_ids: Position indices. May be ``(batch, seq_len)``
                 for 1-D RoPE or ``(3, batch, seq_len)`` for 3-D mRoPE
                 (text/height/width); flattened by
-                :func:`_maybe_flatten_position_ids_for_text` when the
+                :func:`flatten_mrope_position_ids_for_text` when the
                 text config disables mRoPE.
             mode: Runtime mode (train/decode). Auto-detected if ``None``.
             past_key_values: KV cache used for autoregressive decoding.
@@ -1180,7 +1053,7 @@ class Qwen3_5Model(Qwen3VLModel):
         rope_deltas = None
         if position_ids is None:
             if mm_token_type_ids is not None:
-                position_ids, rope_deltas = _get_rope_index_from_mm_token_types(
+                position_ids, rope_deltas = mrope_position_ids_from_mm_token_types(
                     input_ids=input_ids,
                     mm_token_type_ids=mm_token_type_ids,
                     image_grid_thw=image_grid_thw,
@@ -1196,7 +1069,7 @@ class Qwen3_5Model(Qwen3VLModel):
                     attention_mask=attention_mask,
                 )
 
-        position_ids = _maybe_flatten_position_ids_for_text(self.config.text_config, position_ids)
+        position_ids = flatten_mrope_position_ids_for_text(self.config.text_config, position_ids)
 
         outputs = self.language_model(
             input_ids=None,

@@ -61,7 +61,7 @@ Two execution regimes are supported:
   (``query_start_loc`` / ``num_seqs`` / ``recurrent_state_indices``). The
   model scatters the stream into a ``[num_slots, T]`` grid and each
   attention layer ``lax.scan``s the grid columns through the single-token
-  decode step (:class:`DeepseekV4PackedMeta`), so prefill, chunked prefill,
+  decode step (:class:`PackedSlotMeta`), so prefill, chunked prefill,
   and decode all resume from per-slot positions. The XLA scan path is the
   correctness reference; a fused ragged kernel is a planned TPU follow-up.
 
@@ -88,7 +88,6 @@ Note:
     faster kernel is not the same thing as a faster model.
 """
 
-import math
 import typing as tp
 
 import jax
@@ -108,7 +107,7 @@ from easydel.infra.modeling_outputs import (
     MoeCausalLMOutput,
     MoeModelOutput,
 )
-from easydel.infra.sharding import inference_mode_forces_decode, sharding_for_layout
+from easydel.infra.sharding import inference_mode_forces_decode
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
 from easydel.layers import (
     BaseMoeModule,
@@ -121,233 +120,50 @@ from easydel.layers import (
     RowParallelLinear,
     RowParallelMoELinear,
     clamped_swiglu,
-    compute_basic_inv_frequencies,
-    compute_yarn_inv_frequencies,
     dense_gate_up_layout,
     gated_mlp_forward,
     split_fused_gate_up_projection,
 )
+from easydel.layers.attention import CompressedWindowAttention
 from easydel.layers.compressed_window import (
-    block_group_layout,
+    DECODE_ATTEND_PLATFORM,
+    MASK_MIN,
+    TRAIN_ATTEND_PLATFORM,
+    PackedSlotMeta,
+    advance_compressor_stream,
     block_sink_attention,
     block_token_bias,
-    gather_group_members,
+    build_packed_slot_meta,
+    compress_windows,
     gather_selected_entries,
     grid_to_tokens,
-    last_closed_overlap,
     occupied_columns,
-    overlap_group_slots,
     packed_block_size,
-    refresh_group_state,
+    raise_if_runtime_true,
+    reject_packed_or_padded_batch,
     run_column_blocks,
-    sink_attention,
     tokens_to_grid,
     trace_compressor_stream,
 )
 from easydel.layers.indexer import CompressedIndexer, CompressedIndexerConfig, IndexerSelection
 from easydel.layers.residual import (
+    HyperStreamSharding,
     ManifoldHyperConnection,
     ManifoldHyperConnectionConfig,
     ManifoldHyperHead,
     manifold_residual_write,
 )
+from easydel.layers.rotary import apply_rope_interleaved_partial, labeled_rope_cos_sin
 from easydel.modules._base import BaseCausalLMModule
-from easydel.modules.deepseek_v4._native_checkpoint import native_key_to_easydel
-from easydel.operations import OperationMetadata
-from easydel.operations.kernels import CompressedWindowAttn, CompressedWindowDecodeAttn
+from easydel.utils.checkpoint_keys import KEEP, KeyRuleSet, Map, Nested, Rewrite
 
 from .deepseek_v4_configuration import DeepseekV4Config
 
-_MASK_MIN = float(jnp.finfo(jnp.float32).min)
-
-
-class _HyperStreamSharding(common_types.DynamicShardingAxes):
-    """4-D sharding for the hyper-connection residual stream ``[B, T, hc, D]``.
-
-    V4 carries ``hc_mult`` parallel residual streams, so the stream tensor is
-    rank 4 while ``common_types.HiddenStateSharding`` is documented for the
-    rank-3 ``[B, T, D]`` case. Passing the 3-axis spec here did not fail: the
-    sanitizer only collapses a spec to replicated when ``len(spec) >
-    len(shape)``, and 3 <= 4, so it was applied positionally -- putting ``TP``
-    on the ``hc_mult`` stream axis and leaving the hidden feature axis
-    replicated. That is a no-op at tp=1 and silently relayouts the stream at
-    tp>1, which is what let ``DeepseekV4HyperMix``'s Sinkhorn ``shard_map``
-    (declared ``Ps()``, i.e. replicated) receive a sharded ``comb``.
-
-    ``EMPTY`` keeps the stream axis replicated; the feature axis gets ``EMBED``
-    as intended.
-    """
-
-    axes: tp.ClassVar = [common_types.BATCH, common_types.QUERY_LENGTH, common_types.EMPTY, common_types.EMBED]
-    mode: tp.ClassVar = 1
-
-
-# Platform of the compressed-window decode attend, passed per call to the registered
-# ``CompressedWindowDecodeAttn`` adapter. "xla" is the GSPMD-partitionable, numerically-exact reference; the module
-# docstring records the measured end-to-end verdict on this default. The adapter builds the head-parallel
-# ``shard_map`` itself whenever a Pallas kernel is selected on a multi-device mesh.
-_DECODE_KERNEL_PLATFORM = "xla"
-
-# Training / prefill (full-sequence) attend: routed through the registered ``CompressedWindowAttn`` adapter, which
-# resolves to the tiled-flash Pallas TPU kernel on TPU (KV streaming + online softmax + sliding-window band-skip, a
-# measured ~1.35-2.71x forward speedup that grows with sequence length) and to the differentiable XLA reference
-# elsewhere (identical f32 math). ``None`` = the adapter's own platform choice.
+# Attend platforms (shared defaults in ``easydel.layers.compressed_window``); module globals so tests can pin a
+# backend per family.
+_DECODE_KERNEL_PLATFORM = DECODE_ATTEND_PLATFORM
 _TRAIN_KERNEL_ENABLED = True
-_TRAIN_KERNEL_PLATFORM = None
-
-
-def _unweighted_rms_norm(x: Array, eps: float) -> Array:
-    """Unweighted RMSNorm: ``x * rsqrt(mean(x^2) + eps)`` with an fp32 moment.
-
-    Mirrors HF ``DeepseekV4UnweightedRMSNorm``: the second moment and rsqrt run
-    in float32, the scale is cast back to ``x.dtype`` before multiplying.
-
-    Args:
-        x: Input array; normalization runs over the last axis.
-        eps: Variance epsilon.
-
-    Returns:
-        Array of the same shape and dtype as ``x``.
-    """
-    scale = jax.lax.rsqrt(jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True) + eps)
-    return x * scale.astype(x.dtype)
-
-
-def _rope_inv_freq(config: DeepseekV4Config, label: str) -> tuple[Array, float]:
-    """Compute half-size interleaved-RoPE inverse frequencies for a rope label.
-
-    V4 pairs consecutive channels, so only ``rope_dim // 2`` unique theta
-    entries exist — exactly the ``arange(0, dim, 2)`` layout the shared
-    rotary compute fns produce, so this only maps V4's per-label rope params
-    onto :func:`~easydel.layers.compute_basic_inv_frequencies` /
-    :func:`~easydel.layers.compute_yarn_inv_frequencies`;
-    :func:`_apply_interleaved_rope` duplicates cos/sin with a
-    ``repeat_interleave(2)`` next to the rotation. Supports the ``default``
-    rope and ``yarn`` (V4 forces ``attention_factor = 1.0`` for the compress
-    rope at config time).
-
-    Args:
-        config: Model configuration.
-        label: Rope-type label, ``"main"`` or ``"compress"``.
-
-    Returns:
-        Tuple of (float32 inverse frequencies of shape ``[rope_dim // 2]``,
-        attention scaling factor).
-
-    Raises:
-        NotImplementedError: For unsupported ``rope_type`` values.
-    """
-    params = config.v4_rope_params(label)
-    base = float(params["rope_theta"])
-    partial_rotary_factor = float(params.get("partial_rotary_factor", 1.0))
-    dim = int(config.head_dim * partial_rotary_factor)
-    rope_type = params.get("rope_type", params.get("type", "default"))
-
-    if rope_type in ("default", None):
-        return compute_basic_inv_frequencies(base, dim), 1.0
-    if rope_type != "yarn":
-        raise NotImplementedError(f"DeepSeek-V4 rope_type {rope_type!r} is not supported (label={label!r}).")
-
-    # transformers `_compute_yarn_parameters` field defaulting, specialised to
-    # V4 (no mscale/mscale_all_dim keys; `factor` falls back to the max/original
-    # position ratio).
-    factor = params.get("factor")
-    original_max = params.get("original_max_position_embeddings", config.max_position_embeddings)
-    if factor is None:
-        factor = config.max_position_embeddings / original_max
-    attention_factor = params.get("attention_factor")
-    if attention_factor is None:
-        attention_factor = 1.0 if factor <= 1 else 0.1 * math.log(factor) + 1.0
-
-    inv_freq = compute_yarn_inv_frequencies(
-        base=base,
-        rotary_dim=dim,
-        beta_fast=params.get("beta_fast") or 32,
-        beta_slow=params.get("beta_slow") or 1,
-        max_position_embeddings=original_max,
-        scaling_factor=factor,
-        extrapolation_factor=1.0,
-        truncate=params.get("truncate", True),
-    )
-    return inv_freq, float(attention_factor)
-
-
-def _rope_cos_sin(
-    config: DeepseekV4Config,
-    label: str,
-    position_ids: Array,
-    dtype: jnp.dtype,
-) -> tuple[Array, Array]:
-    """Compute half-size cos/sin tables for the given positions and rope label.
-
-    Args:
-        config: Model configuration.
-        label: Rope-type label (``"main"`` or ``"compress"``).
-        position_ids: Integer positions of shape ``[batch, seq]``.
-        dtype: Output dtype (the reference casts cos/sin to the activation
-            dtype; the rotation itself upcasts back to fp32).
-
-    Returns:
-        Tuple ``(cos, sin)`` of shape ``[batch, seq, rope_dim // 2]``.
-    """
-    inv_freq, attention_scaling = _rope_inv_freq(config, label)
-    inv = jnp.asarray(inv_freq, dtype=jnp.float32)
-    freqs = position_ids.astype(jnp.float32)[..., None] * inv[None, None, :]
-    cos = jnp.cos(freqs) * attention_scaling
-    sin = jnp.sin(freqs) * attention_scaling
-    return cos.astype(dtype), sin.astype(dtype)
-
-
-def _apply_interleaved_rope(x: Array, cos: Array, sin: Array, unsqueeze_dim: int = 1) -> Array:
-    """Apply V4's interleaved RoPE to the *trailing* rope slice of ``x``.
-
-    ``cos``/``sin`` come in half-sized (one entry per interleaved pair) and the
-    last ``2 * cos.shape[-1]`` channels of ``x`` are rotated in fp32 with the
-    interleaved (GLM-style) rotation. Leading "nope" channels pass through
-    untouched. Pass ``-sin`` for the inverse rotation applied to the attention
-    output.
-
-    Args:
-        x: Input of shape ``[..., seq, head_dim]`` with a broadcastable head
-            axis at ``unsqueeze_dim``.
-        cos: Half-size cosines ``[batch, seq, rope_dim // 2]``.
-        sin: Half-size sines ``[batch, seq, rope_dim // 2]``.
-        unsqueeze_dim: Axis at which to insert the head-broadcast dim into
-            cos/sin (1 for ``[B, H, S, D]`` inputs, 2 for ``[B, S, H, D]``).
-
-    Returns:
-        Array of the same shape and dtype as ``x``.
-
-    Note:
-        The rotation is written in pair-major form. The obvious transcription of
-        the reference formula -- ``repeat_interleave(cos, 2)``, strided
-        ``[..., 0::2]`` / ``[..., 1::2]`` gathers, and a
-        ``stack(...).reshape(...)`` to rebuild the interleave -- costs two
-        full-width interleaves of cos/sin plus two strided reads and a rebuild,
-        all on the rope slice of every q/kv/output tensor, three times per layer
-        across 43 layers. Reshaping the rope slice to explicit pairs expresses
-        the same rotation with cos/sin at their natural half width and no
-        interleave::
-
-            out[2k]   = x1*cos[k] - x2*sin[k]
-            out[2k+1] = x1*sin[k] + x2*cos[k]
-
-        which is exactly what the original computes -- its ``rotate_half``
-        places ``-x2`` at even positions and ``x1`` at odd ones, against
-        repeat-interleaved cos/sin. Ablating rope entirely was measured at
-        6.32 ms of a 29.6 ms decode step when combined with the compressor.
-    """
-    half = cos.shape[-1]
-    rope_dim = 2 * half
-    cos = jnp.expand_dims(cos, unsqueeze_dim).astype(jnp.float32)
-    sin = jnp.expand_dims(sin, unsqueeze_dim).astype(jnp.float32)
-    nope, rope = x[..., :-rope_dim], x[..., -rope_dim:]
-    pairs = rope.astype(jnp.float32).reshape(*rope.shape[:-1], half, 2)
-    x1 = pairs[..., 0]
-    x2 = pairs[..., 1]
-    rotated = jnp.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), axis=-1)
-    rotated = rotated.reshape(rope.shape).astype(x.dtype)
-    return jnp.concatenate([nope, rotated], axis=-1)
+_TRAIN_KERNEL_PLATFORM = TRAIN_ATTEND_PLATFORM
 
 
 def _entry_causal_bias(position_ids: Array, n_entries: int, rate: int) -> Array:
@@ -366,7 +182,7 @@ def _entry_causal_bias(position_ids: Array, n_entries: int, rate: int) -> Array:
     entry_indices = jnp.arange(n_entries)
     causal_threshold = (position_ids + 1) // rate
     visible = entry_indices[None, None, :] < causal_threshold[..., None]
-    return jnp.where(visible, 0.0, _MASK_MIN)[:, None, :, :].astype(jnp.float32)
+    return jnp.where(visible, 0.0, MASK_MIN)[:, None, :, :].astype(jnp.float32)
 
 
 def _indexer_selection_is_vacuous(index_topk: int, n_slots: int) -> bool:
@@ -415,210 +231,66 @@ def _decode_entry_visibility(position_ids: Array, cache_position: Array, n_entri
     return visible & (entry_indices[None, None, :] < emitted[:, None, None])
 
 
-def _compressor_decode_step(
-    *,
-    kv_t: Array,
-    gate_t: Array,
-    buffer_kv: Array,
-    buffer_gate: Array,
-    entries: Array,
-    position_bias: Array,
-    kv_norm: "DeepseekV4RMSNorm",
-    cache_position: Array,
-    rate: int,
-    head_dim: int,
-    config: "DeepseekV4Config",
-    overlap_kv: Array | None = None,
-    overlap_gate: Array | None = None,
-    valid: Array | None = None,
-) -> tuple[Array, Array, Array, Array | None, Array | None]:
-    """Advance one compressor stream by a single token per row (fixed shapes).
+def _entry_finalizer(config: DeepseekV4Config, kv_norm: RMSNorm, rate: int):
+    """Entry norm + RoPE applied to pooled compressor groups (shared by every V4 compressor stream).
 
-    Each row's current token (stream position ``p = cache_position[b]``) is
-    written to buffer slot ``p % rate``. When that fills the window
-    (``(p + 1) % rate == 0``) one compressed entry is emitted for window
-    ``w = p // rate`` — softmax-gated pooling over the window slots (plus the
-    Ca overlap slots for two-series streams), weighted RMSNorm, and
-    interleaved "compress"-RoPE at the deterministic position ``w * rate`` —
-    and written to ``entries[b, w]``. All arithmetic runs unconditionally on
-    the fixed-shape buffers; the emission is selected with ``jnp.where`` so
-    the step stays jit/while_loop/scan safe. Rows advance independently.
-
-    Args:
-        kv_t: Raw kv projection of the current token ``[batch, 1, feat]``.
-        gate_t: Raw gate projection ``[batch, 1, feat]`` (position bias NOT
-            applied).
-        buffer_kv: Open-window kv buffer ``[batch, rate, feat]``.
-        buffer_gate: Open-window gate buffer ``[batch, rate, feat]``.
-        entries: Padded emitted entries ``[batch, n_slots, dim]``.
-        position_bias: Learned within-window bias ``[rate, feat]``.
-        kv_norm: Weighted RMSNorm applied to the pooled entry.
-        cache_position: Per-row int32 stream positions ``[batch]`` of the
-            current token.
-        rate: Compression rate (window width).
-        head_dim: Output entry dimension (Ca/Cb series width for two-series
-            streams; equals ``feat`` for single-series streams).
-        config: Model config (for the "compress" rotary tables).
-        overlap_kv: Two-series only — previous window's Ca kv slice
-            ``[batch, rate, head_dim]``.
-        overlap_gate: Two-series only — previous window's biased Ca gate
-            slice in fp32 ``[batch, rate, head_dim]``.
-        valid: Optional per-row bool mask ``[batch]``; rows with ``False``
-            leave all state untouched (packed serving pads rows).
+    Pooling itself is the registered ``gated_pool_compress`` operation; a pooled group ``g`` is normed with the
+    stream's weighted RMSNorm and rotated with the ``"compress"`` rope at its first token, ``g * rate``.
 
     Returns:
-        Tuple ``(entries, buffer_kv, buffer_gate, overlap_kv, overlap_gate)``
-        of updated state (overlaps are ``None`` for single-series streams).
+        ``finalize(pooled [B, G, D], entry [B, G]) -> [B, G, D]``.
     """
-    batch = kv_t.shape[0]
-    rows = jnp.arange(batch)
-    p = cache_position.astype(jnp.int32)  # [B]
-    fill = jnp.mod(p, rate)  # [B]
-    new_kv_row = kv_t[:, 0].astype(buffer_kv.dtype)  # [B, feat]
-    new_gate_row = gate_t[:, 0].astype(buffer_gate.dtype)
-    if valid is not None:
-        new_kv_row = jnp.where(valid[:, None], new_kv_row, buffer_kv[rows, fill])
-        new_gate_row = jnp.where(valid[:, None], new_gate_row, buffer_gate[rows, fill])
-    buffer_kv = buffer_kv.at[rows, fill].set(new_kv_row)
-    buffer_gate = buffer_gate.at[rows, fill].set(new_gate_row)
-    closed = fill == (rate - 1)  # [B]
-    if valid is not None:
-        closed = closed & valid
-    window_index = p // rate  # [B]
 
-    biased_gate = buffer_gate.astype(jnp.float32) + position_bias.astype(jnp.float32)  # [B, rate, feat]
-    if overlap_kv is None:
-        slot_kv = buffer_kv
-        slot_gate = biased_gate
-        new_overlap_kv = None
-        new_overlap_gate = None
-    else:
-        slot_kv = jnp.concatenate([overlap_kv.astype(buffer_kv.dtype), buffer_kv[..., head_dim:]], axis=1)
-        slot_gate = jnp.concatenate([overlap_gate.astype(jnp.float32), biased_gate[..., head_dim:]], axis=1)
-        new_overlap_kv = jnp.where(closed[:, None, None], buffer_kv[..., :head_dim].astype(overlap_kv.dtype), overlap_kv)
-        new_overlap_gate = jnp.where(closed[:, None, None], biased_gate[..., :head_dim], overlap_gate)
+    def finalize(pooled: Array, entry: Array) -> Array:
+        compressed = kv_norm(pooled)
+        cos, sin = labeled_rope_cos_sin(config, "compress", (entry * rate).astype(jnp.int32), compressed.dtype)
+        return apply_rope_interleaved_partial(compressed[:, None], cos, sin, unsqueeze_dim=1)[:, 0]
 
-    # Cache buffers may use fp8 storage. Dequantize to the projection's compute
-    # dtype before pooling: JAX does not implicitly promote fp8 with bf16, and
-    # casting softmax probabilities to fp8 would needlessly destroy precision.
-    compute_dtype = kv_t.dtype
-    slot_kv_compute = slot_kv.astype(compute_dtype)
-    weights = jax.nn.softmax(slot_gate, axis=1).astype(compute_dtype)
-    candidate = kv_norm(jnp.sum(slot_kv_compute * weights, axis=1))  # [B, dim]
-
-    rope_positions = (window_index * rate).astype(jnp.int32)[:, None]  # [B, 1]
-    cos, sin = _rope_cos_sin(config, "compress", rope_positions, candidate.dtype)
-    candidate = _apply_interleaved_rope(candidate[:, None, None, :], cos, sin, unsqueeze_dim=1)[:, 0, 0]
-
-    n_slots = entries.shape[1]
-    slot = jnp.clip(window_index, 0, n_slots - 1)  # [B]
-    # Write only the rows whose window actually closed. Reading the old row
-    # back to re-write it unchanged turns this into a read-modify-write of the
-    # whole entry buffer: at a 262,144 window the buffer is [B, 65536, 512], and
-    # `cost_analysis` prices that read at 1.281 GiB per decode step -- spent to
-    # store values that were already there. Steering unclosed rows to an
-    # out-of-bounds index lets `mode="drop"` discard them instead.
-    write_slot = jnp.where(closed, slot, n_slots)
-    entries = entries.at[rows, write_slot].set(candidate.astype(entries.dtype), mode="drop")
-    return entries, buffer_kv, buffer_gate, new_overlap_kv, new_overlap_gate
+    return finalize
 
 
-def _compressor_extend_step(
-    *,
-    kv_blk: Array,
-    gate_blk: Array,
-    buffer_kv: Array,
-    buffer_gate: Array,
-    entries: Array,
+def _compress_prefill(
+    config: DeepseekV4Config,
+    kv_norm: RMSNorm,
     position_bias: Array,
-    kv_norm: "DeepseekV4RMSNorm",
-    positions: Array,
-    valid: Array,
+    kv: Array,
+    gate: Array,
     rate: int,
-    head_dim: int,
-    config: "DeepseekV4Config",
-    overlap_kv: Array | None = None,
-    overlap_gate: Array | None = None,
-) -> tuple[Array, Array, Array, Array | None, Array | None]:
-    """Advance one compressor stream by a block of tokens per row (batched packed prefill).
-
-    Same state transition as :func:`_compressor_decode_step` run once per valid column, built on the shared
-    :func:`~easydel.layers.compressed_window.block_group_layout` grouping: every group that closes inside the block
-    is pooled and written in one pass; two-series streams carry the Ca overlap across groups and steps.
+    series_dim: int | None = None,
+) -> tuple[Array, Array | None, Array | None]:
+    """Compress the complete windows of a prefill into post-RoPE entries.
 
     Args:
-        kv_blk: Raw kv projections of the block ``[B, blk, feat]``.
-        gate_blk: Raw gate projections ``[B, blk, feat]`` (position bias NOT applied).
-        buffer_kv: Open-window kv buffer ``[B, rate, feat]``.
-        buffer_gate: Open-window gate buffer ``[B, rate, feat]``.
-        entries: Padded emitted entries ``[B, n_slots, dim]``.
-        position_bias: Learned within-window bias ``[rate, feat]``.
-        kv_norm: Weighted RMSNorm applied to pooled entries.
-        positions: Stream positions ``[B, blk]`` (garbage at invalid cells).
-        valid: ``[B, blk]`` bool, a prefix per row.
+        config: Model config (compress rope).
+        kv_norm: The stream's entry norm.
+        position_bias: Learned within-window bias ``[rate, F]``.
+        kv: Raw kv projections ``[B, n_windows * rate, F]``.
+        gate: Raw gate projections, same shape.
         rate: Compression rate.
-        head_dim: Output entry width (Ca/Cb series width for two-series streams).
-        config: Model config (compress rotary tables).
-        overlap_kv: Two-series only: carried Ca kv ``[B, rate, head_dim]``.
-        overlap_gate: Two-series only: carried biased fp32 Ca gate ``[B, rate, head_dim]``.
+        series_dim: Per-series width of a two-series (Ca/Cb) stream, else ``None``.
 
     Returns:
-        Tuple ``(entries, buffer_kv, buffer_gate, overlap_kv, overlap_gate)``.
+        ``(entries [B, n_windows, D], overlap_kv, overlap_gate)``; the overlaps (two-series only) are the last
+        window's Ca kv and biased fp32 Ca gate ``[B, rate, D]`` a cache carries into the next window.
     """
-    batch = kv_blk.shape[0]
-    layout = block_group_layout(positions, valid, rate)
-    fresh_kv = kv_blk.astype(buffer_kv.dtype)
-    fresh_gate = gate_blk.astype(buffer_gate.dtype)
-    kv_members = gather_group_members(layout, buffer_kv, fresh_kv)  # [B, G, rate, feat]
-    gate_members = gather_group_members(layout, buffer_gate, fresh_gate).astype(jnp.float32) + position_bias.astype(
-        jnp.float32
-    )
-    if overlap_kv is None:
-        slot_kv, slot_gate = kv_members, gate_members
-        new_overlap_kv = new_overlap_gate = None
-    else:
-        slot_kv, slot_gate = overlap_group_slots(kv_members, gate_members, overlap_kv, overlap_gate, head_dim)
-        new_overlap_kv, new_overlap_gate = last_closed_overlap(
-            layout, kv_members, gate_members, overlap_kv, overlap_gate, head_dim
-        )
-    compute_dtype = kv_blk.dtype
-    weights = jax.nn.softmax(slot_gate, axis=2).astype(compute_dtype)
-    candidate = kv_norm(jnp.sum(slot_kv.astype(compute_dtype) * weights, axis=2))  # [B, G, dim]
-    cos, sin = _rope_cos_sin(config, "compress", (layout.entry * rate).astype(jnp.int32), candidate.dtype)
-    candidate = _apply_interleaved_rope(candidate[:, None], cos, sin, unsqueeze_dim=1)[:, 0]
-    n_slots = entries.shape[1]
-    target = jnp.where(layout.closed, jnp.clip(layout.entry, 0, n_slots - 1), n_slots)
-    rows = jnp.arange(batch)[:, None]
-    entries = entries.at[rows, target].set(candidate.astype(entries.dtype), mode="drop")
-    buffer_kv = refresh_group_state(layout, buffer_kv, fresh_kv)
-    buffer_gate = refresh_group_state(layout, buffer_gate, fresh_gate)
-    return entries, buffer_kv, buffer_gate, new_overlap_kv, new_overlap_gate
-
-
-class DeepseekV4RMSNorm(RMSNorm):
-    """Weighted RMSNorm used by DeepSeek-V4 (identical to the shared RMSNorm)."""
-
-    ...
-
-
-def _manifold_config(config: DeepseekV4Config) -> ManifoldHyperConnectionConfig:
-    """Translate V4 settings while preserving learned leaf shapes and names."""
-    return ManifoldHyperConnectionConfig(
-        hidden_size=config.hidden_size,
-        hc_mult=config.hc_mult,
-        eps=config.hc_eps,
-        norm_eps=config.rms_norm_eps,
-        iters=config.hc_sinkhorn_iters,
-        initializer=config.initializer_range,
-        use_fused_coefficients=config.hc_use_fused_coefficients,
-    )
+    out = compress_windows(kv, gate, rate, position_bias=position_bias, series_dim=series_dim)
+    batch, groups = out.pooled.shape[:2]
+    entry = jnp.broadcast_to(jnp.arange(groups, dtype=jnp.int32)[None], (batch, groups))
+    return _entry_finalizer(config, kv_norm, rate)(out.pooled, entry), out.overlap_kv, out.overlap_gate
 
 
 class DeepseekV4HyperConnection(ManifoldHyperConnection):
     """V4 settings adapter for shared manifold-constrained hyper-connections."""
 
     def __init__(self, config, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, precision=None, *, rngs):
-        super().__init__(_manifold_config(config), dtype, param_dtype, precision, rngs=rngs, mesh_source=config)
+        super().__init__(
+            ManifoldHyperConnectionConfig.from_model_config(config),
+            dtype,
+            param_dtype,
+            precision,
+            rngs=rngs,
+            mesh_source=config,
+        )
         self.config = config
 
 
@@ -626,88 +298,10 @@ class DeepseekV4HyperHead(ManifoldHyperHead):
     """V4 settings adapter for the shared learned residual-stream head."""
 
     def __init__(self, config, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, precision=None, *, rngs):
-        super().__init__(_manifold_config(config), dtype, param_dtype, precision, rngs=rngs)
-        self.config = config
-
-
-class DeepseekV4GroupedLinear(spx.Module):
-    """Block-diagonal grouped linear (``o_a_proj`` of the grouped output projection).
-
-    The HF weight has shape ``[o_groups * o_lora_rank, in_per_group]`` and is
-    consumed group-blockwise; after EasyDeL's standard 2D transpose on
-    conversion the kernel is ``[in_per_group, o_groups * o_lora_rank]`` and
-    group ``g`` owns columns ``[g * rank, (g + 1) * rank)``.
-    """
-
-    def __init__(
-        self,
-        in_features_per_group: int,
-        out_features_per_group: int,
-        n_groups: int,
-        dtype: jnp.dtype = jnp.bfloat16,
-        param_dtype: jnp.dtype = jnp.bfloat16,
-        precision: jax.lax.PrecisionLike = None,
-        kernel_init: tp.Callable | None = None,
-        *,
-        rngs: spx.Rngs,
-    ):
-        """Initialize the grouped linear.
-
-        Args:
-            in_features_per_group: Per-group input width
-                (``num_heads * head_dim / o_groups``).
-            out_features_per_group: Per-group output width (``o_lora_rank``).
-            n_groups: Number of head groups.
-            dtype: Activation dtype.
-            param_dtype: Parameter storage dtype.
-            precision: Matmul precision.
-            kernel_init: Weight initializer; defaults to LeCun normal.
-            rngs: Random number generators.
-        """
-        self.in_features_per_group = in_features_per_group
-        self.out_features_per_group = out_features_per_group
-        self.n_groups = n_groups
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        if kernel_init is None:
-            kernel_init = jax.nn.initializers.lecun_normal()
-        # Column-parallel like ColumnParallelLinear: group g owns the contiguous columns [g*rank, (g+1)*rank), so a
-        # tp split of the column axis hands every shard whole groups, matching the tp-sharded heads feeding it. A
-        # replicated weight made XLA slice and relayout each shard's groups every step (measured on TPU v5, V4.1
-        # decode cc=8, 40 layers: 120 weight dynamic-slices + 40 copies, 1.63 -> 1.10 ms, weight 2.68 -> 0.67 GB/chip,
-        # bit-identical; probe_grouped_oa_sharding.py).
-        self.weight = spx.Parameter(
-            kernel_init(rngs.param, (in_features_per_group, n_groups * out_features_per_group), param_dtype),
-            sharding=sharding_for_layout(common_types.ColumnWise),
+        super().__init__(
+            ManifoldHyperConnectionConfig.from_model_config(config), dtype, param_dtype, precision, rngs=rngs
         )
-
-    def forward(self, x: Float[Array, "batch seq groups in_per_group"]) -> Float[Array, "batch seq groups rank"]:
-        """Apply the per-group projection.
-
-        Args:
-            x: Grouped input ``[B, S, o_groups, in_per_group]``.
-
-        Returns:
-            Grouped output ``[B, S, o_groups, o_lora_rank]``.
-        """
-        kernel = self.weight.value.astype(self.dtype if self.dtype is not None else x.dtype)
-        kernel = kernel.reshape(self.in_features_per_group, self.n_groups, self.out_features_per_group)
-        x = x.astype(kernel.dtype)
-
-        # This layer contracts its own parameter with an einsum instead of
-        # delegating to ParallelLinear, so nothing intercepts the dot_general on
-        # its behalf: it has to look its own quantization rule up, exactly as
-        # ParallelLinear does. Without this the module is stamped with a plan
-        # and then silently ignores it -- quantized output identical to the
-        # unquantized baseline. Contraction is ``i``: axis 0 of the kernel,
-        # trailing axis of ``x``.
-        quant_rule = spx.quantization.rule_for(self, "dot_general")
-        if quant_rule is not None:
-            kernel = spx.quantization.fake_quant(kernel, rule=quant_rule, contracting_axes=(0,), is_weight=True)
-            x = spx.quantization.fake_quant(x, rule=quant_rule, contracting_axes=(x.ndim - 1,), is_weight=False)
-
-        return jnp.einsum("bsgi,igr->bsgr", x, kernel, precision=self.precision)
+        self.config = config
 
 
 class DeepseekV4HCACompressor(spx.Module):
@@ -720,8 +314,6 @@ class DeepseekV4HCACompressor(spx.Module):
     window-start absolute position. Only complete windows are compressed; the
     remainder is discarded (stateless semantics).
     """
-
-    rope_layer_type = "compress"
 
     def __init__(
         self,
@@ -763,7 +355,7 @@ class DeepseekV4HCACompressor(spx.Module):
             init_method="zeros",
             key=rngs.param,
         )
-        self.kv_norm = DeepseekV4RMSNorm(
+        self.kv_norm = RMSNorm(
             dim=self.head_dim,
             eps=config.rms_norm_eps,
             dtype=dtype,
@@ -805,27 +397,8 @@ class DeepseekV4HCACompressor(spx.Module):
         return compressed, block_bias
 
     def _compress_windows(self, kv: Array, gate: Array) -> Array:
-        """Compress complete windows of raw projections into post-RoPE entries.
-
-        Args:
-            kv: Raw kv projections ``[batch, n_windows * rate, head_dim]``.
-            gate: Raw gate projections of the same shape.
-
-        Returns:
-            Compressed entries ``[batch, n_windows, head_dim]`` (post-RoPE at
-            positions ``w * rate``).
-        """
-        batch = kv.shape[0]
-        rate = self.compress_rate
-        n_windows = kv.shape[1] // rate
-        chunk_kv = kv.reshape(batch, n_windows, rate, -1)
-        chunk_gate = gate.astype(jnp.float32).reshape(batch, n_windows, rate, -1)
-        chunk_gate = chunk_gate + self.position_bias.value.astype(jnp.float32)
-        weights = jax.nn.softmax(chunk_gate, axis=2).astype(chunk_kv.dtype)
-        compressed = self.kv_norm(jnp.sum(chunk_kv * weights, axis=2))
-        positions = jnp.broadcast_to((jnp.arange(n_windows) * rate)[None, :], (batch, n_windows))
-        cos, sin = _rope_cos_sin(self.config, self.rope_layer_type, positions, compressed.dtype)
-        return _apply_interleaved_rope(compressed[:, None], cos, sin, unsqueeze_dim=1)[:, 0]
+        """Post-RoPE entries ``[B, n_windows, head_dim]`` of complete windows of raw projections."""
+        return _compress_prefill(self.config, self.kv_norm, self.position_bias.value, kv, gate, self.compress_rate)[0]
 
     def cached_forward(
         self,
@@ -916,19 +489,17 @@ class DeepseekV4HCACompressor(spx.Module):
             rate=rate,
             head_dim=self.head_dim,
         )
-        entries, buffer_kv, buffer_gate, _, _ = _compressor_decode_step(
-            kv_t=kv,
-            gate_t=gate,
+        entries, buffer_kv, buffer_gate, _, _ = advance_compressor_stream(
+            kv=kv,
+            gate=gate,
             buffer_kv=cache_view.compressor_buffer_kv,
             buffer_gate=cache_view.compressor_buffer_gate,
             entries=cache_view.compressor_entries,
             position_bias=self.position_bias.value,
-            kv_norm=self.kv_norm,
-            cache_position=cache_view.cache_position,
+            position=cache_view.cache_position,
             rate=rate,
-            head_dim=self.head_dim,
-            config=self.config,
             valid=valid,
+            finalize=_entry_finalizer(self.config, self.kv_norm, rate),
         )
         cache_view = cache_view.replace(
             compressor_buffer_kv=buffer_kv,
@@ -936,7 +507,7 @@ class DeepseekV4HCACompressor(spx.Module):
             compressor_entries=entries,
         )
         visible = _decode_entry_visibility(position_ids, cache_view.cache_position, n_slots, rate)
-        block_bias = jnp.where(visible, 0.0, _MASK_MIN)[:, None, :, :].astype(jnp.float32)
+        block_bias = jnp.where(visible, 0.0, MASK_MIN)[:, None, :, :].astype(jnp.float32)
         return entries, block_bias, cache_view
 
     def cached_extend(
@@ -966,19 +537,17 @@ class DeepseekV4HCACompressor(spx.Module):
             rate=self.compress_rate,
             head_dim=self.head_dim,
         )
-        entries, buffer_kv, buffer_gate, _, _ = _compressor_extend_step(
-            kv_blk=kv_blk,
-            gate_blk=gate_blk,
+        entries, buffer_kv, buffer_gate, _, _ = advance_compressor_stream(
+            kv=kv_blk,
+            gate=gate_blk,
             buffer_kv=cache_view.compressor_buffer_kv,
             buffer_gate=cache_view.compressor_buffer_gate,
             entries=cache_view.compressor_entries,
             position_bias=self.position_bias.value,
-            kv_norm=self.kv_norm,
             positions=positions,
             valid=valid,
             rate=self.compress_rate,
-            head_dim=self.head_dim,
-            config=self.config,
+            finalize=_entry_finalizer(self.config, self.kv_norm, self.compress_rate),
         )
         return None, cache_view.replace(
             compressor_buffer_kv=buffer_kv, compressor_buffer_gate=buffer_gate, compressor_entries=entries
@@ -991,47 +560,14 @@ class _DeepseekV4IndexerAdapter:
     def __init__(self, config: DeepseekV4Config):
         self.config = config
 
-    def compress_windows(self, owner: CompressedIndexer, kv: Array, gate: Array) -> tuple[Array, Array, Array]:
-        """Two-series window compression of raw projections into post-RoPE keys.
-
-        Args:
-            kv: Raw kv projections ``[batch, n_windows * rate, 2 * head_dim]``.
-            gate: Raw gate projections of the same shape.
-
-        Returns:
-            Tuple of post-RoPE compressed keys ``[batch, n_windows, head_dim]``,
-            the last window's Ca kv slice, and its biased fp32 Ca gate slice.
-        """
-        batch = kv.shape[0]
-        rate = owner.compress_rate
-        n_windows = kv.shape[1] // rate
-        compressed, ca_kv, ca_gate = _two_series_compress(
-            kv,
-            gate,
-            owner.position_bias.value,
-            owner.kv_norm,
-            batch,
-            n_windows,
-            rate,
-            owner.head_dim,
-        )
-        positions = jnp.broadcast_to((jnp.arange(n_windows) * rate)[None, :], (batch, n_windows))
-        cos, sin = _rope_cos_sin(self.config, "compress", positions, compressed.dtype)
-        compressed = _apply_interleaved_rope(compressed[:, None], cos, sin, unsqueeze_dim=1)[:, 0]
-        return compressed, ca_kv, ca_gate
+    def finalize_entries(self, owner: CompressedIndexer, pooled: Array, entry: Array) -> Array:
+        """Weighted RMSNorm then compress-RoPE at each entry's first token (``entry * rate``)."""
+        return _entry_finalizer(self.config, owner.kv_norm, owner.compress_rate)(pooled, entry)
 
     def rotate_queries(self, q: Array, position_ids: Array, dtype: jnp.dtype) -> Array:
         """Apply V4's partial interleaved compression RoPE to index queries."""
-        cos, sin = _rope_cos_sin(self.config, "compress", position_ids, dtype)
-        return _apply_interleaved_rope(q.transpose(0, 2, 1, 3), cos, sin, unsqueeze_dim=1).transpose(0, 2, 1, 3)
-
-    def decode_step(self, **kwargs):
-        """Keep the native compressor's per-row, Ca/Cb overlap state machine."""
-        return _compressor_decode_step(config=self.config, **kwargs)
-
-    def extend_step(self, **kwargs):
-        """Block form of :meth:`decode_step` on the shared group layout (batched packed prefill)."""
-        return _compressor_extend_step(config=self.config, **kwargs)
+        cos, sin = labeled_rope_cos_sin(self.config, "compress", position_ids, dtype)
+        return apply_rope_interleaved_partial(q.transpose(0, 2, 1, 3), cos, sin, unsqueeze_dim=1).transpose(0, 2, 1, 3)
 
     @staticmethod
     def entry_visibility(position_ids, cache_position, n_slots, rate):
@@ -1061,8 +597,6 @@ def _compressed_indexer_config(config: DeepseekV4Config) -> CompressedIndexerCon
 class DeepseekV4Indexer(CompressedIndexer):
     """V4's native Ca/Cb cache adapter over shared compressed-entry selection."""
 
-    rope_layer_type = "compress"
-
     def __init__(self, config, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, precision=None, *, rngs):
         super().__init__(
             _compressed_indexer_config(config),
@@ -1077,59 +611,6 @@ class DeepseekV4Indexer(CompressedIndexer):
         self.config = config
 
 
-def _two_series_compress(
-    kv: Array,
-    gate: Array,
-    position_bias: Array,
-    kv_norm: DeepseekV4RMSNorm,
-    batch: int,
-    n_windows: int,
-    rate: int,
-    head_dim: int,
-) -> tuple[Array, Array, Array]:
-    """Shared CSA two-series (Ca/Cb) window compression.
-
-    Each source token contributes two independent series stored in one
-    ``2 * head_dim`` projection: Ca (``[..., :head_dim]``) feeds the *next*
-    window's entry, Cb (``[..., head_dim:]``) the *current* window's entry.
-    Entry ``w`` is the fp32 softmax-gated combination over ``2 * rate`` slots
-    of window ``w - 1``'s Ca and window ``w``'s Cb; window 0's Ca half stays
-    zero-kv / ``-inf``-gate (prefill from an empty stream).
-
-    Args:
-        kv: Projected values ``[B, usable, 2 * head_dim]``.
-        gate: Projected gates ``[B, usable, 2 * head_dim]``.
-        position_bias: Learned bias ``[rate, 2 * head_dim]`` (added in fp32).
-        kv_norm: Weighted RMSNorm applied to each compressed entry.
-        batch: Batch size.
-        n_windows: Number of complete windows.
-        rate: Compression rate (window width).
-        head_dim: Per-series feature width.
-
-    Returns:
-        Tuple of the compressed entries ``[B, n_windows, head_dim]``
-        (pre-RoPE), the last window's Ca kv slice ``[B, rate, head_dim]``,
-        and its biased Ca gate slice in fp32 ``[B, rate, head_dim]`` (the
-        overlap state a cache must carry into the next window).
-    """
-    chunk_kv = kv.reshape(batch, n_windows, rate, -1)
-    chunk_gate = gate.astype(jnp.float32).reshape(batch, n_windows, rate, -1) + position_bias.astype(jnp.float32)
-
-    prev_ca_kv = jnp.concatenate(
-        [jnp.zeros((batch, 1, rate, head_dim), dtype=chunk_kv.dtype), chunk_kv[:, :-1, :, :head_dim]],
-        axis=1,
-    )
-    prev_ca_gate = jnp.concatenate(
-        [jnp.full((batch, 1, rate, head_dim), -jnp.inf, dtype=jnp.float32), chunk_gate[:, :-1, :, :head_dim]],
-        axis=1,
-    )
-    new_kv = jnp.concatenate([prev_ca_kv, chunk_kv[..., head_dim:]], axis=2)
-    new_gate = jnp.concatenate([prev_ca_gate, chunk_gate[..., head_dim:]], axis=2)
-    weights = jax.nn.softmax(new_gate, axis=2).astype(new_kv.dtype)
-    compressed = kv_norm(jnp.sum(new_kv * weights, axis=2))
-    return compressed, chunk_kv[:, -1, :, :head_dim], chunk_gate[:, -1, :, :head_dim]
-
-
 class DeepseekV4CSACompressor(spx.Module):
     """Compressed Sparse Attention compressor (stateless mode).
 
@@ -1137,8 +618,6 @@ class DeepseekV4CSACompressor(spx.Module):
     :class:`DeepseekV4Indexer` that gates per-query visibility of the
     compressed entries down to ``index_topk`` picks.
     """
-
-    rope_layer_type = "compress"
 
     def __init__(
         self,
@@ -1180,7 +659,7 @@ class DeepseekV4CSACompressor(spx.Module):
             init_method="zeros",
             key=rngs.param,
         )
-        self.kv_norm = DeepseekV4RMSNorm(
+        self.kv_norm = RMSNorm(
             dim=self.head_dim,
             eps=config.rms_norm_eps,
             dtype=dtype,
@@ -1231,34 +710,10 @@ class DeepseekV4CSACompressor(spx.Module):
         return compressed, block_bias
 
     def _compress_windows(self, kv: Array, gate: Array) -> tuple[Array, Array, Array]:
-        """Two-series window compression of raw projections into post-RoPE entries.
-
-        Args:
-            kv: Raw kv projections ``[batch, n_windows * rate, 2 * head_dim]``.
-            gate: Raw gate projections of the same shape.
-
-        Returns:
-            Tuple of post-RoPE compressed entries ``[batch, n_windows,
-            head_dim]``, the last window's Ca kv slice, and its biased fp32
-            Ca gate slice.
-        """
-        batch = kv.shape[0]
-        rate = self.compress_rate
-        n_windows = kv.shape[1] // rate
-        compressed, ca_kv, ca_gate = _two_series_compress(
-            kv,
-            gate,
-            self.position_bias.value,
-            self.kv_norm,
-            batch,
-            n_windows,
-            rate,
-            self.head_dim,
+        """Two-series post-RoPE entries plus the last window's Ca kv / biased fp32 Ca gate."""
+        return _compress_prefill(
+            self.config, self.kv_norm, self.position_bias.value, kv, gate, self.compress_rate, self.head_dim
         )
-        positions = jnp.broadcast_to((jnp.arange(n_windows) * rate)[None, :], (batch, n_windows))
-        cos, sin = _rope_cos_sin(self.config, self.rope_layer_type, positions, compressed.dtype)
-        compressed = _apply_interleaved_rope(compressed[:, None], cos, sin, unsqueeze_dim=1)[:, 0]
-        return compressed, ca_kv, ca_gate
 
     def cached_forward(
         self,
@@ -1356,21 +811,19 @@ class DeepseekV4CSACompressor(spx.Module):
             head_dim=self.head_dim,
             position_bias=self.position_bias.value,
         )
-        entries, buffer_kv, buffer_gate, overlap_kv, overlap_gate = _compressor_decode_step(
-            kv_t=kv,
-            gate_t=gate,
+        entries, buffer_kv, buffer_gate, overlap_kv, overlap_gate = advance_compressor_stream(
+            kv=kv,
+            gate=gate,
             buffer_kv=cache_view.compressor_buffer_kv,
             buffer_gate=cache_view.compressor_buffer_gate,
             entries=cache_view.compressor_entries,
             position_bias=self.position_bias.value,
-            kv_norm=self.kv_norm,
-            cache_position=cache_view.cache_position,
+            position=cache_view.cache_position,
             rate=rate,
-            head_dim=self.head_dim,
-            config=self.config,
             overlap_kv=cache_view.compressor_overlap_kv,
             overlap_gate=cache_view.compressor_overlap_gate,
             valid=valid,
+            finalize=_entry_finalizer(self.config, self.kv_norm, rate),
         )
         cache_view = cache_view.replace(
             compressor_buffer_kv=buffer_kv,
@@ -1401,7 +854,7 @@ class DeepseekV4CSACompressor(spx.Module):
         def _by_gather(_):
             picked = picks >= 0
             g = jnp.take_along_axis(entries, jnp.where(picked, picks, 0)[:, :, None], axis=1)
-            b = jnp.where(picked, 0.0, _MASK_MIN)[:, None, None, :].astype(jnp.float32)
+            b = jnp.where(picked, 0.0, MASK_MIN)[:, None, None, :].astype(jnp.float32)
             return g, b
 
         def _by_prefix(_):
@@ -1416,7 +869,7 @@ class DeepseekV4CSACompressor(spx.Module):
             # depends only on i).
             vis = _decode_entry_visibility(position_ids, cache_view.cache_position, n_slots, rate)
             g = entries[:, :k_sel]
-            b = jnp.where(vis[:, :, :k_sel], 0.0, _MASK_MIN)[:, None, :, :].astype(jnp.float32)
+            b = jnp.where(vis[:, :, :k_sel], 0.0, MASK_MIN)[:, None, :, :].astype(jnp.float32)
             return g, b
 
         # `index_topk` picks out of `max_length / rate` entries. Until the
@@ -1459,21 +912,19 @@ class DeepseekV4CSACompressor(spx.Module):
             head_dim=self.head_dim,
             position_bias=self.position_bias.value,
         )
-        entries, buffer_kv, buffer_gate, overlap_kv, overlap_gate = _compressor_extend_step(
-            kv_blk=kv_blk,
-            gate_blk=gate_blk,
+        entries, buffer_kv, buffer_gate, overlap_kv, overlap_gate = advance_compressor_stream(
+            kv=kv_blk,
+            gate=gate_blk,
             buffer_kv=cache_view.compressor_buffer_kv,
             buffer_gate=cache_view.compressor_buffer_gate,
             entries=cache_view.compressor_entries,
             position_bias=self.position_bias.value,
-            kv_norm=self.kv_norm,
             positions=positions,
             valid=valid,
             rate=self.compress_rate,
-            head_dim=self.head_dim,
-            config=self.config,
             overlap_kv=cache_view.compressor_overlap_kv,
             overlap_gate=cache_view.compressor_overlap_gate,
+            finalize=_entry_finalizer(self.config, self.kv_norm, self.compress_rate),
         )
         cache_view = cache_view.replace(
             compressor_buffer_kv=buffer_kv,
@@ -1506,10 +957,10 @@ def _indexer_opened_bias(
 
     Returns:
         Additive fp32 bias ``[B, 1, S, compressed_len]`` that is zero on the
-        selected valid entries and ``_MASK_MIN`` elsewhere.
+        selected valid entries and ``MASK_MIN`` elsewhere.
     """
     selection = IndexerSelection(top_k_indices, score_proxy, mask)
-    return selection.to_bias(compressed_len, dtype=jnp.float32, mask_value=_MASK_MIN)[:, None, :, :]
+    return selection.to_bias(compressed_len, dtype=jnp.float32, mask_value=MASK_MIN)[:, None, :, :]
 
 
 _COMPRESSOR_CLASSES: dict[str, type | None] = {
@@ -1519,87 +970,7 @@ _COMPRESSOR_CLASSES: dict[str, type | None] = {
 }
 
 
-class DeepseekV4PackedMeta(tp.NamedTuple):
-    """Token-to-slot mapping for eSurge packed multi-request serving.
-
-    The engine's flat ``[1, T]`` token stream concatenates each scheduled
-    request's new tokens. This mapping scatters those tokens into a dense
-    ``[num_slots, T]`` grid (one row per cache slot at its own stream
-    position) that the attention layers scan column-by-column.
-
-    Attributes:
-        slot_of_token: ``[T]`` int32 cache-slot row per packed token;
-            padded tokens carry ``num_slots`` (dropped on scatter).
-        col_of_token: ``[T]`` int32 grid column per packed token (the
-            token's index within its request's scheduled chunk).
-        valid_grid: ``[num_slots, T]`` bool; ``True`` where a real token
-            occupies the cell.
-        positions_grid: ``[num_slots, T]`` int32 absolute stream positions
-            (engine-provided; garbage at invalid cells).
-    """
-
-    slot_of_token: Array
-    col_of_token: Array
-    valid_grid: Array
-    positions_grid: Array
-
-
-def _build_packed_meta(
-    query_start_loc: Array,
-    num_seqs: Array,
-    recurrent_state_indices: Array | None,
-    position_ids: Array,
-    num_slots: int,
-) -> DeepseekV4PackedMeta:
-    """Derive the packed token-to-slot grid mapping from ragged metadata.
-
-    Args:
-        query_start_loc: ``[R + 1]`` cumulative scheduled-token offsets per
-            request row (padded with the total beyond the live rows).
-        num_seqs: ``[1]`` int32 live request count.
-        recurrent_state_indices: Optional physical cache-slot id per request
-            row (``[R]`` or ``[1, R]``); ``None`` falls back to row identity.
-        position_ids: Packed absolute positions ``[1, T]``.
-        num_slots: Static number of cache slots (state rows).
-
-    Returns:
-        DeepseekV4PackedMeta: The scatter/gather mapping for this step.
-    """
-    qsl = query_start_loc.astype(jnp.int32).reshape(-1)
-    num_rows = qsl.shape[0] - 1
-    total_tokens = position_ids.shape[-1]
-    token_idx = jnp.arange(total_tokens, dtype=jnp.int32)
-    row_of_token = jnp.clip(jnp.searchsorted(qsl, token_idx, side="right") - 1, 0, num_rows - 1)
-    live_rows = jnp.clip(num_seqs.reshape(-1)[0].astype(jnp.int32), 0, num_rows)
-    total_real_tokens = jnp.take(qsl, live_rows)
-    valid_token = token_idx < total_real_tokens
-    if recurrent_state_indices is None:
-        slots_by_row = jnp.arange(num_rows, dtype=jnp.int32)
-    else:
-        slots_by_row = recurrent_state_indices.astype(jnp.int32).reshape(-1)[:num_rows]
-    slot_of_token = jnp.take(slots_by_row, row_of_token, mode="clip")
-    slot_of_token = jnp.where(valid_token, slot_of_token, num_slots)
-    col_of_token = token_idx - jnp.take(qsl, row_of_token)
-
-    valid_grid = (
-        jnp.zeros((num_slots, total_tokens), dtype=jnp.bool_)
-        .at[slot_of_token, col_of_token]
-        .set(valid_token, mode="drop")
-    )
-    positions_grid = (
-        jnp.zeros((num_slots, total_tokens), dtype=jnp.int32)
-        .at[slot_of_token, col_of_token]
-        .set(position_ids.astype(jnp.int32).reshape(-1), mode="drop")
-    )
-    return DeepseekV4PackedMeta(
-        slot_of_token=slot_of_token,
-        col_of_token=col_of_token,
-        valid_grid=valid_grid,
-        positions_grid=positions_grid,
-    )
-
-
-class DeepseekV4Attention(spx.Module):
+class DeepseekV4Attention(CompressedWindowAttention):
     """DeepSeek-V4 shared-KV MQA attention with sinks and compressed KV.
 
     Differences from classic attention (all mirrored from the HF reference):
@@ -1640,158 +1011,24 @@ class DeepseekV4Attention(spx.Module):
             rngs: Random number generators.
             layer_idx: Layer index (selects ``layer_types[layer_idx]``).
         """
-        self.config = config
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.layer_idx = layer_idx
-        self.layer_type = config.layer_types[layer_idx]
-        self.rope_layer_type = "main" if self.layer_type == "sliding_attention" else "compress"
-        self.num_heads = config.num_attention_heads
-        self.head_dim = config.head_dim
-        self.sliding_window = config.sliding_window
-        self.scaling = self.head_dim**-0.5
-        self.rms_norm_eps = config.rms_norm_eps
-
-        linear_kwargs = dict(
-            use_bias=config.attention_bias,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+        layer_type = config.layer_types[layer_idx]
+        super().__init__(
+            config,
+            dtype,
+            param_dtype,
+            precision,
             rngs=rngs,
+            layer_idx=layer_idx,
+            rope_label="main" if layer_type == "sliding_attention" else "compress",
+            q_head_norm_eps=config.rms_norm_eps,  # HF q_b_norm (unweighted, per head)
         )
-        self.q_a_proj = ColumnParallelLinear(config.hidden_size, config.q_lora_rank, **linear_kwargs)
-        self.q_a_norm = DeepseekV4RMSNorm(
-            dim=config.q_lora_rank,
-            eps=config.rms_norm_eps,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
+        self.layer_type = layer_type
+        compressor_class = _COMPRESSOR_CLASSES[layer_type]
+        self.compressor = (
+            None
+            if compressor_class is None
+            else compressor_class(config, dtype=dtype, param_dtype=param_dtype, precision=precision, rngs=rngs)
         )
-        self.q_b_proj = ColumnParallelLinear(config.q_lora_rank, self.num_heads * self.head_dim, **linear_kwargs)
-        self.kv_proj = ColumnParallelLinear(config.hidden_size, self.head_dim, **linear_kwargs)
-        self.kv_norm = DeepseekV4RMSNorm(
-            dim=self.head_dim,
-            eps=config.rms_norm_eps,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
-        self.o_a_proj = DeepseekV4GroupedLinear(
-            self.num_heads * self.head_dim // config.o_groups,
-            config.o_lora_rank,
-            config.o_groups,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            rngs=rngs,
-        )
-        self.o_b_proj = RowParallelLinear(config.o_groups * config.o_lora_rank, config.hidden_size, **linear_kwargs)
-        self.sinks = ArrayParam.bound(
-            shape=(self.num_heads,),
-            dtype=param_dtype,
-            init_method="zeros",
-            key=rngs.param,
-        )
-        compressor_class = _COMPRESSOR_CLASSES[self.layer_type]
-        if compressor_class is not None:
-            self.compressor = compressor_class(
-                config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-        else:
-            self.compressor = None
-        metadata = OperationMetadata(runtime_dtype=dtype, runtime_softmax_dtype=jnp.float32, base_config=config)
-        self.attn_op = CompressedWindowAttn(metadata)
-        self.decode_op = CompressedWindowDecodeAttn(metadata)
-
-    def _attend(self, q: Array, kv: Array, attn_bias: Array) -> Array:
-        """Sink-augmented shared-KV attention core.
-
-        Args:
-            q: Rotated queries ``[B, H, S, head_dim]``.
-            kv: KV axis (token KVs and/or compressed entries)
-                ``[B, T, head_dim]``.
-            attn_bias: Additive fp32 bias ``[B, 1, S, T]`` (broadcast over
-                heads).
-
-        Returns:
-            Attention output ``[B, H, S, head_dim]``.
-        """
-        # fp32 softmax with the sink column dropped (shared with DeepSeek-V4.1 via layers.compressed_window).
-        return sink_attention(q, kv, attn_bias, self.sinks.value, scaling=self.scaling, precision=self.precision)
-
-    def _fused_attend(self, q: Array, kv: Array, attn_bias: Array) -> Array:
-        """Sink-augmented shared-KV attention via the fused ejkernel op.
-
-        Numerically identical to :meth:`_attend` (its XLA fallback is the exact
-        reference math), but dispatches to the Pallas TPU kernel on device and
-        collapses the per-column ``einsum -> sink softmax -> einsum`` sequence
-        into a single fused custom call. Used on the decode path (single query
-        per slot) where the KV axis is bounded and VMEM-resident.
-
-        Args:
-            q: Rotated queries ``[B, H, S, head_dim]`` (``S == 1`` on decode).
-            kv: Shared KV axis ``[B, L, head_dim]`` (``K == V``): ring + entries.
-            attn_bias: Additive fp32 bias ``[B, 1, S, L]`` (head-broadcast).
-
-        Returns:
-            Attention output ``[B, H, S, head_dim]``.
-        """
-        # The registered adapter casts operands, picks the kernel and (for Pallas on a multi-device mesh) builds the
-        # head-parallel shard_map from the metadata.
-        return self.decode_op(
-            q,
-            kv,
-            attn_bias[:, 0],  # [B, S, L]; the head axis is broadcast inside the kernel
-            self.sinks.value.astype(jnp.float32),
-            softmax_scale=self.scaling,
-            platform=_DECODE_KERNEL_PLATFORM,
-        ).attention_outputs
-
-    def _fused_attend_full(self, q: Array, kv: Array, attn_bias: Array) -> Array:
-        """Sink-augmented shared-KV attention via the fused full-sequence op.
-
-        The training / prefill sibling of :meth:`_fused_attend`: numerically
-        identical to :meth:`_attend` (its XLA fallback is the exact reference
-        math and is differentiable via XLA autodiff), but dispatches to the
-        tiled-flash Pallas TPU kernel on device (``make_async_copy`` KV
-        streaming + online softmax) when opted in. Used on the stateless
-        forward and cached prefill, where the query length is ``> 1`` and the KV
-        axis (token KVs + compressed entries) may be long.
-
-        Gradients flow to ``q``, ``kv`` (both its key and value roles, since
-        ``K == V``), the trainable score-proxy part of ``bias``, and per-head
-        sinks; structural mask entries are constants.
-
-        Args:
-            q: Rotated queries ``[B, H, S, head_dim]``.
-            kv: Shared KV axis ``[B, T, head_dim]`` (``K == V``): token KVs
-                concatenated with the compressed entries.
-            attn_bias: Additive fp32 bias ``[B, 1, S, T]`` (head-broadcast).
-
-        Returns:
-            Attention output ``[B, H, S, head_dim]``.
-        """
-        # The token-KV region is the sequence (its length); anything beyond it on the KV axis is the always-visible
-        # compressed entries. Passing the sliding window + this split lets the Pallas kernel band-skip out-of-window
-        # token tiles (O(S*window)) and recompute its backward through the matching windowed reference. The registered
-        # adapter builds the head-parallel shard_map when a Pallas kernel runs on a multi-device mesh.
-        return self.attn_op(
-            q,
-            kv,
-            attn_bias[:, 0],  # [B, S, T]; the head axis is broadcast inside the kernel
-            self.sinks.value.astype(jnp.float32),
-            softmax_scale=self.scaling,
-            platform=_TRAIN_KERNEL_PLATFORM,
-            window=self.sliding_window,
-            token_kv_len=q.shape[2],
-        ).attention_outputs
 
     def _decode_attend(
         self,
@@ -1838,7 +1075,7 @@ class DeepseekV4Attention(spx.Module):
         # never written yet resolve to negative positions.
         slots = jnp.arange(window, dtype=jnp.int32)
         slot_positions = stream_position[:, None] - jnp.mod(stream_position[:, None] - slots[None, :], window)
-        ring_bias = jnp.where(slot_positions >= 0, 0.0, _MASK_MIN).astype(jnp.float32)  # [B, W]
+        ring_bias = jnp.where(slot_positions >= 0, 0.0, MASK_MIN).astype(jnp.float32)  # [B, W]
         attn_bias = ring_bias[:, None, None, :]  # [B, 1, 1, W]
         kv_axis = ring
         if self.compressor is not None:
@@ -1857,7 +1094,7 @@ class DeepseekV4Attention(spx.Module):
                 attn_bias = jnp.concatenate([attn_bias, block_bias], axis=-1)
         advance = 1 if valid is None else valid.astype(jnp.int32)
         cache_view = cache_view.replace(window_kv=ring, cache_position=stream_position + advance)
-        return self._fused_attend(q, kv_axis, attn_bias), cache_view
+        return self.fused_decode_attend(q, kv_axis, attn_bias[:, 0], platform=_DECODE_KERNEL_PLATFORM), cache_view
 
     def _extend_attend(
         self,
@@ -1908,7 +1145,7 @@ class DeepseekV4Attention(spx.Module):
                 visible = jnp.arange(entries.shape[1], dtype=jnp.int32)[None, None, :] < reach[..., None]
                 token_keys = jnp.concatenate([token_keys, entries.astype(kv.dtype)], axis=1)
                 token_bias = jnp.concatenate(
-                    [token_bias, jnp.where(visible, 0.0, _MASK_MIN).astype(jnp.float32)], axis=-1
+                    [token_bias, jnp.where(visible, 0.0, MASK_MIN).astype(jnp.float32)], axis=-1
                 )
             elif entries is not None and top_k.shape[-1] > 0:
                 k = top_k.shape[-1]
@@ -1936,7 +1173,7 @@ class DeepseekV4Attention(spx.Module):
         position_embeddings: dict[str, tuple[Array, Array]],
         position_ids: Int[Array, "one tokens"],
         cache_view: CompressedWindowCacheView,
-        packed_meta: "DeepseekV4PackedMeta",
+        packed_meta: "PackedSlotMeta",
     ) -> tuple[Array, CompressedWindowCacheView]:
         """Serve a packed multi-request token stream against per-slot state.
 
@@ -1956,7 +1193,7 @@ class DeepseekV4Attention(spx.Module):
             position_ids: Packed absolute positions ``[1, T]``.
             cache_view: Slot-major cache state (``batch = num_slots``).
             packed_meta: Token-to-grid mapping (see
-                :class:`DeepseekV4PackedMeta`).
+                :class:`PackedSlotMeta`).
 
         Returns:
             Tuple of the attention output ``[1, T, D_model]`` (garbage at
@@ -1987,7 +1224,7 @@ class DeepseekV4Attention(spx.Module):
         """
         _, total_tokens, _ = hidden_states.shape
         num_slots = cache_view.cache_position.shape[0]
-        cos, sin = position_embeddings[self.rope_layer_type]
+        cos, sin = position_embeddings[self.rope_label]
 
         # Prefill-from-empty self-heal: a valid chunk whose first token sits
         # at absolute position 0 starts a brand-new stream, so its slot's
@@ -1997,13 +1234,8 @@ class DeepseekV4Attention(spx.Module):
         restart = packed_meta.valid_grid[:, 0] & (packed_meta.positions_grid[:, 0] == 0)
         cache_view = cache_view.reset_rows(restart)
 
-        q_residual = self.q_a_norm(self.q_a_proj(hidden_states))  # [1, T, q_lora]
-        q = self.q_b_proj(q_residual).reshape(1, total_tokens, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        q = _unweighted_rms_norm(q, self.rms_norm_eps)
-        q = _apply_interleaved_rope(q, cos, sin, unsqueeze_dim=1)  # [1, H, T, head_dim]
-
-        kv = self.kv_norm(self.kv_proj(hidden_states))[:, None, :, :]
-        kv = _apply_interleaved_rope(kv, cos, sin, unsqueeze_dim=1)[:, 0]  # [1, T, head_dim]
+        q_residual, q = self.project_query(hidden_states, cos, sin)  # [1, T, q_lora], [1, H, T, head_dim]
+        kv = self.project_kv(hidden_states, cos, sin)  # [1, T, head_dim]
 
         slot_tok = packed_meta.slot_of_token  # [T] (== num_slots for padding -> dropped)
         col_tok = packed_meta.col_of_token  # [T]
@@ -2027,10 +1259,7 @@ class DeepseekV4Attention(spx.Module):
                 valid=packed_meta.valid_grid[:, 0],  # [S]
             )
             attn_packed = attn_col[:, :, 0, :][safe_slot][None, ...]  # [1, T, H, head_dim]
-            attn_output = _apply_interleaved_rope(attn_packed, cos, -sin, unsqueeze_dim=2)
-            grouped = attn_output.reshape(1, total_tokens, self.config.o_groups, -1)
-            grouped = self.o_a_proj(grouped).reshape(1, total_tokens, -1)
-            return checkpoint_name(self.o_b_proj(grouped), "attn_output"), cache_view
+            return self.project_output(attn_packed, cos, sin), cache_view
 
         def _grid_path(cache_view, block: int):
             """Grid path with a static ``block`` of columns per loop step (prefill, chunked prefill, verify)."""
@@ -2105,11 +1334,7 @@ class DeepseekV4Attention(spx.Module):
             )  # attn_columns: [W, S, H, head_dim]
 
             attn_packed = grid_to_tokens(attn_columns, slot_tok, col_tok, num_slots)[None, ...]  # [1, T, H, head_dim]
-            attn_output = _apply_interleaved_rope(attn_packed, cos, -sin, unsqueeze_dim=2)
-
-            grouped = attn_output.reshape(1, total_tokens, self.config.o_groups, -1)
-            grouped = self.o_a_proj(grouped).reshape(1, total_tokens, -1)
-            return checkpoint_name(self.o_b_proj(grouped), "attn_output"), cache_view
+            return self.project_output(attn_packed, cos, sin), cache_view
 
         def _general(cache_view):
             """Grid path: any number of tokens per slot, block width chosen at run time.
@@ -2146,7 +1371,7 @@ class DeepseekV4Attention(spx.Module):
         position_ids: Int[Array, "batch seq"],
         token_bias: Float[Array, "batch 1 seq seq"] | None,
         cache_view: CompressedWindowCacheView | None = None,
-        packed_meta: "DeepseekV4PackedMeta | None" = None,
+        packed_meta: "PackedSlotMeta | None" = None,
     ) -> tuple[Array, CompressedWindowCacheView | None]:
         """Run V4 attention (stateless, cached prefill, decode, or packed).
 
@@ -2177,16 +1402,11 @@ class DeepseekV4Attention(spx.Module):
         if cache_view is not None and packed_meta is not None:
             return self._packed_forward(hidden_states, position_embeddings, position_ids, cache_view, packed_meta)
 
-        batch, seq_len, _ = hidden_states.shape
-        cos, sin = position_embeddings[self.rope_layer_type]
+        _, seq_len, _ = hidden_states.shape
+        cos, sin = position_embeddings[self.rope_label]
 
-        q_residual = self.q_a_norm(self.q_a_proj(hidden_states))
-        q = self.q_b_proj(q_residual).reshape(batch, seq_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        q = _unweighted_rms_norm(q, self.rms_norm_eps)  # HF q_b_norm (unweighted, per head)
-        q = _apply_interleaved_rope(q, cos, sin, unsqueeze_dim=1)
-
-        kv = self.kv_norm(self.kv_proj(hidden_states))[:, None, :, :]  # [B, 1, S, head_dim]
-        kv = _apply_interleaved_rope(kv, cos, sin, unsqueeze_dim=1)[:, 0]  # [B, S, head_dim]
+        q_residual, q = self.project_query(hidden_states, cos, sin)
+        kv = self.project_kv(hidden_states, cos, sin)  # [B, S, head_dim]
 
         if cache_view is None or seq_len > 1:
             # Stateless forward and cached prefill share the exact same
@@ -2217,9 +1437,9 @@ class DeepseekV4Attention(spx.Module):
             # Default: inline dense ``_attend`` (graph unchanged). Opt in to the
             # fused differentiable full-sequence kernel via the env flag.
             if _TRAIN_KERNEL_ENABLED:
-                attn_output = self._fused_attend_full(q, kv, attn_bias)
+                attn_output = self.fused_full_attend(q, kv, attn_bias[:, 0], platform=_TRAIN_KERNEL_PLATFORM)
             else:
-                attn_output = self._attend(q, kv, attn_bias)
+                attn_output = self.sink_attend(q, kv, attn_bias)
         else:
             attn_output, cache_view = self._decode_attend(
                 q=q,
@@ -2230,13 +1450,8 @@ class DeepseekV4Attention(spx.Module):
                 cache_view=cache_view,
             )
 
-        # V == K carried RoPE: undo it on the output's rope slice with the
-        # conjugate rotation at the query positions.
-        attn_output = _apply_interleaved_rope(attn_output.transpose(0, 2, 1, 3), cos, -sin, unsqueeze_dim=2)
-
-        grouped = attn_output.reshape(batch, seq_len, self.config.o_groups, -1)
-        grouped = self.o_a_proj(grouped).reshape(batch, seq_len, -1)
-        return checkpoint_name(self.o_b_proj(grouped), "attn_output"), cache_view
+        # V == K carried RoPE: project_output undoes it at the query positions, then the grouped output projection.
+        return self.project_output(attn_output.transpose(0, 2, 1, 3), cos, sin), cache_view
 
 
 class DeepseekV4MLP(spx.Module):
@@ -2796,14 +2011,14 @@ class DeepseekV4DecoderLayer(spx.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.input_layernorm = DeepseekV4RMSNorm(
+        self.input_layernorm = RMSNorm(
             dim=config.hidden_size,
             eps=config.rms_norm_eps,
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.post_attention_layernorm = DeepseekV4RMSNorm(
+        self.post_attention_layernorm = RMSNorm(
             dim=config.hidden_size,
             eps=config.rms_norm_eps,
             dtype=dtype,
@@ -2826,7 +2041,7 @@ class DeepseekV4DecoderLayer(spx.Module):
         input_ids: Int[Array, "batch seq"] | None = None,
         output_router_logits: bool = False,
         cache_view: CompressedWindowCacheView | None = None,
-        packed_meta: DeepseekV4PackedMeta | None = None,
+        packed_meta: PackedSlotMeta | None = None,
     ) -> DecoderLayerOutput:
         """Run one V4 decoder block over the residual streams.
 
@@ -2870,56 +2085,10 @@ class DeepseekV4DecoderLayer(spx.Module):
         )
 
 
-def _raise_if_runtime_true(condition: Array | bool, message: str) -> None:
-    """Raise eagerly or through a JIT-safe host callback when ``condition`` holds."""
-
-    def _check(value):
-        if bool(value):
-            raise ValueError(message)
-
-    if isinstance(condition, jax.core.Tracer):
-        # This check has no ordering dependency on other effects. Ordered
-        # callbacks cannot be lowered across multiple devices (e.g. TP).
-        jax.debug.callback(_check, condition, ordered=False)
-    else:
-        _check(condition)
-
-
-def _reject_unsupported_packed_training(
-    mask_info: MaskInfo | None,
-    attention_mask: Array | None = None,
-) -> None:
-    """Reject actual padding/packing that fixed-rate compressors cannot represent."""
-    message = (
-        "DeepSeek-V4 packed-document training or padding-mask prefill is not yet supported: "
-        "CSA/HCA compression follows physical offsets. Use unpacked, unpadded batches."
-    )
-    conditions = []
-    if mask_info is not None:
-        segments = getattr(mask_info, "_q_segment_ids", None)
-        if segments is not None:
-            valid = segments >= 0
-            safe = jnp.where(valid, segments, 0)
-            has_padding = jnp.any(~valid)
-            has_multiple = jnp.max(safe, axis=-1) != jnp.min(jnp.where(valid, safe, jnp.iinfo(safe.dtype).max), axis=-1)
-            has_multiple = jnp.any(has_multiple & jnp.any(valid, axis=-1))
-            conditions.append(has_padding | has_multiple)
-        raw_mask = getattr(mask_info, "_attention_mask", None)
-        if raw_mask is not None and segments is None:
-            conditions.append(jnp.any(~raw_mask.astype(bool)))
-    if attention_mask is not None:
-        conditions.append(jnp.any(~attention_mask.astype(bool)))
-    if conditions:
-        condition = conditions[0]
-        for item in conditions[1:]:
-            condition = condition | item
-        _raise_if_runtime_true(condition, message)
-
-
 def _reject_nonempty_cached_prefill(past_key_values) -> None:
     """Reject multi-token continuation that would overwrite compressor state."""
     cache_position = past_key_values[0].cache_position
-    _raise_if_runtime_true(
+    raise_if_runtime_true(
         jnp.any(cache_position != 0),
         "DeepSeek-V4 cached multi-token prefill requires an empty cache; "
         "use one-token decode or reset the cache before prefill.",
@@ -3019,7 +2188,7 @@ class DeepseekV4Model(EasyDeLBaseModule):
             self.hc_head = DeepseekV4HyperHead(
                 config, dtype=dtype, param_dtype=param_dtype, precision=precision, rngs=rngs
             )
-            self.norm = DeepseekV4RMSNorm(
+            self.norm = RMSNorm(
                 dim=config.hidden_size,
                 eps=config.rms_norm_eps,
                 dtype=dtype,
@@ -3132,7 +2301,7 @@ class DeepseekV4Model(EasyDeLBaseModule):
         is_packed = cached and batch == 1 and packed_qsl is not None and packed_num_seqs is not None
         is_decode = cached and sequence_length == 1 and not is_packed
         if not is_packed and sequence_length > 1:
-            _reject_unsupported_packed_training(mask_info, attention_mask)
+            reject_packed_or_padded_batch(mask_info, attention_mask, family="DeepSeek-V4")
             if cached is None and packed_qsl is not None and packed_num_seqs is not None and batch == 1:
                 raise ValueError(
                     "DeepSeek-V4 stateless packed-document calls are not supported: pass a cache or an "
@@ -3143,7 +2312,7 @@ class DeepseekV4Model(EasyDeLBaseModule):
         if is_packed:
             if position_ids is None:
                 raise ValueError("Packed eSurge serving requires explicit position_ids for the token stream.")
-            packed_meta = _build_packed_meta(
+            packed_meta = build_packed_slot_meta(
                 query_start_loc=packed_qsl,
                 num_seqs=packed_num_seqs,
                 recurrent_state_indices=getattr(cache_metadata, "recurrent_state_indices", None),
@@ -3188,11 +2357,11 @@ class DeepseekV4Model(EasyDeLBaseModule):
             k_idx = jnp.arange(sequence_length)[None, :]
             allowed = (k_idx <= q_idx) & (k_idx > q_idx - self.config.sliding_window)
             allowed = allowed[None, None, :, :] & padding_mask[:, None, None, :]
-            token_bias = jnp.where(allowed, 0.0, _MASK_MIN).astype(jnp.float32)
+            token_bias = jnp.where(allowed, 0.0, MASK_MIN).astype(jnp.float32)
 
         position_embeddings = {
-            "main": _rope_cos_sin(self.config, "main", position_ids, inputs_embeds.dtype),
-            "compress": _rope_cos_sin(self.config, "compress", position_ids, inputs_embeds.dtype),
+            "main": labeled_rope_cos_sin(self.config, "main", position_ids, inputs_embeds.dtype),
+            "compress": labeled_rope_cos_sin(self.config, "compress", position_ids, inputs_embeds.dtype),
         }
 
         hidden_streams = jnp.broadcast_to(
@@ -3201,7 +2370,7 @@ class DeepseekV4Model(EasyDeLBaseModule):
         ).astype(inputs_embeds.dtype)
         hidden_streams = apply_logical_sharding(
             hidden_streams,
-            dynamic_axes=_HyperStreamSharding,
+            dynamic_axes=HyperStreamSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
@@ -3370,6 +2539,119 @@ class DeepseekV4Model(EasyDeLBaseModule):
         return self.embed_tokens
 
 
+# ---------------------------------------------------------------- checkpoint keys
+# DeepSeek publishes V4 (Flash and Pro) only in its own inference naming (``layers.N.attn.wq_a``,
+# ``layers.N.ffn.experts.<i>.w1``); the transformers form is the *input* of its ``inference/convert.py`` and was never
+# released. These rules are the inverse of that script's renames. Per-expert stacking and gate/up fusion stay in
+# ``reform_param``.
+
+#: Module-name renames applied to the trailing module (before ``.weight`` / ``.scale``, else the last segment).
+DEEPSEEK_V4_LEAF_ALIASES: dict[str, str] = {
+    # MLA attention projections
+    "wq_a": "q_a_proj",
+    "wq_b": "q_b_proj",
+    "wkv": "kv_proj",
+    "wo_a": "o_a_proj",
+    "wo_b": "o_b_proj",
+    "q_norm": "q_a_norm",
+    # the compressor's own sub-projections
+    "wgate": "gate_proj",
+    "norm": "kv_norm",
+    "ape": "position_bias",
+    # MoE router
+    "bias": "e_score_correction_bias",
+    # per-expert SwiGLU triple (w1 = gate, w3 = up, w2 = down)
+    "w1": "gate_proj",
+    "w3": "up_proj",
+    "w2": "down_proj",
+}
+_V4_ROOT_ALIASES = {
+    "embed.weight": "model.embed_tokens.weight",
+    "head.weight": "lm_head.weight",
+    "norm.weight": "model.norm.weight",
+    "hc_head_base": "model.hc_head.hc_base",
+    "hc_head_fn": "model.hc_head.hc_fn",
+    "hc_head_scale": "model.hc_head.hc_scale",
+}
+_V4_HC_ALIASES = {
+    f"hc_{site}_{leaf}": f"{site}_hc.{leaf}" for site in ("attn", "ffn") for leaf in ("base", "fn", "scale")
+}
+
+DEEPSEEK_V4_KEY_RULES = KeyRuleSet(
+    [
+        Map(r"(?:model\.)?mtp\..*", None),  # the DSpark stack belongs to the draft model
+        Map(r"(?:model|lm_head)\..*", KEEP),  # HF / already-normalized names
+        Map(
+            r"(?P<root>embed\.weight|head\.weight|norm\.weight|hc_head_(?:base|fn|scale))",
+            "{root}",
+            rename={"root": _V4_ROOT_ALIASES},
+        ),
+        Map(r"(?!layers\.\d+\.).*", None),
+        Map(
+            r"layers\.(?P<i>\d+)\.(?P<hc>hc_(?:attn|ffn)_(?:base|fn|scale))",
+            "model.layers.{i}.{hc}",
+            rename={"hc": _V4_HC_ALIASES},
+        ),
+        Map(r"layers\.(?P<i>\d+)\.attn\.attn_sink", "model.layers.{i}.self_attn.sinks"),
+        # The lightning indexer nests the other way round: the checkpoint puts the compressor inside the indexer
+        # (``attn.indexer.compressor.wkv``), EasyDeL the indexer inside the compressor, with scoring under ``scorer``.
+        Rewrite(r"^(?P<p>layers\.\d+\.)attn\.indexer\.compressor\.", "{p}self_attn.compressor.indexer."),
+        Rewrite(
+            r"^(?P<p>layers\.\d+\.)attn\.indexer\.weights_proj", "{p}self_attn.compressor.indexer.scorer.weights_proj"
+        ),
+        Rewrite(r"^(?P<p>layers\.\d+\.)attn\.indexer\.", "{p}self_attn.compressor.indexer."),
+        Rewrite(r"\.attn\.", ".self_attn."),
+        Rewrite(r"\.ffn\.", ".mlp."),
+        Rewrite(r"\.attn_norm\.", ".input_layernorm."),
+        Rewrite(r"\.ffn_norm\.", ".post_attention_layernorm."),
+        Map(
+            r"layers\.(?P<i>\d+)\.(?P<path>(?:.*\.)?)(?P<leaf>[^.]*)\.(?P<suffix>weight|scale)",
+            "model.layers.{i}.{path}{leaf}.{suffix}",
+            rename={"leaf": DEEPSEEK_V4_LEAF_ALIASES},
+        ),
+        Map(
+            r"layers\.(?P<i>\d+)\.(?P<path>(?:.*\.)?)(?P<leaf>[^.]*)",
+            "model.layers.{i}.{path}{leaf}",
+            rename={"leaf": DEEPSEEK_V4_LEAF_ALIASES},
+        ),
+    ],
+    name="deepseek_v4",
+)
+
+
+def mtp_stage_block_rule(block_rules: KeyRuleSet) -> Nested:
+    """``mtp.N.<block key>`` -> ``stages.N.<name>``: a DSpark stage block reuses the backbone's ``layers.N`` rules."""
+    return Nested(
+        r"mtp\.(?P<s>\d+)\.(?P<r>.+)",
+        block_rules,
+        inner_key="layers.{s}.{r}",
+        inner_result=r"model\.layers\.{s}\.(?P<tail>.*)",
+        target="stages.{s}.{tail}",
+    )
+
+
+#: Native DSpark keys (``mtp.N.*``) -> :class:`DeepseekV4DSpark` names. The tied ``mtp.N.embed`` / ``mtp.N.head``
+#: (shared with the backbone) are unowned.
+DEEPSEEK_V4_MTP_KEY_RULES = KeyRuleSet(
+    [
+        Map(r"stages\..*", KEEP),
+        Map(r"mtp\.\d+\.(?:embed|head)\..*", None),
+        Map(
+            r"mtp\.(?P<s>\d+)\.(?P<r>main_proj\.(?:weight|scale)|main_norm\.weight|norm\.weight"
+            r"|markov_head\.markov_w[12]\.weight|confidence_head\.proj\.weight)",
+            "stages.{s}.{r}",
+        ),
+        Map(
+            r"mtp\.(?P<s>\d+)\.(?P<hc>hc_head_(?:fn|base|scale))",
+            "stages.{s}.{hc}",
+            rename={"hc": {f"hc_head_{leaf}": f"hc_head.hc_{leaf}" for leaf in ("fn", "base", "scale")}},
+        ),
+        mtp_stage_block_rule(DEEPSEEK_V4_KEY_RULES),
+    ],
+    name="deepseek_v4_mtp",
+)
+
+
 @register_module(TaskType.CAUSAL_LM, config=DeepseekV4Config, model_type="deepseek_v4")
 class DeepseekV4ForCausalLM(BaseCausalLMModule[DeepseekV4Model, DeepseekV4Config]):  # type: ignore
     """DeepSeek-V4 with a causal language modeling head.
@@ -3383,10 +2665,8 @@ class DeepseekV4ForCausalLM(BaseCausalLMModule[DeepseekV4Model, DeepseekV4Config
     _model_type = "deepseek_v4"
     _config_class = DeepseekV4Config
     esurge_cache_family: tp.ClassVar[str] = "compressed_window"
-    # DeepSeek publishes V4 only in its own inference naming; the transformers
-    # form is `inference/convert.py`'s input and was never released. See
-    # `_native_checkpoint` for the inverse rewrite.
-    _checkpoint_key_normalizer = staticmethod(native_key_to_easydel)
+    # DeepSeek publishes V4 only in its own inference naming (see DEEPSEEK_V4_KEY_RULES).
+    checkpoint_key_rules: tp.ClassVar[KeyRuleSet] = DEEPSEEK_V4_KEY_RULES
 
     def __init__(
         self,

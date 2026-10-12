@@ -119,7 +119,7 @@ def test_no_unreviewed_weight_matmul_bypasses_the_rules():
         "These modules contract a parameter directly, so a quantization rule cannot reach them and they "
         "will silently train in full precision:\n"
         + "\n".join(f"  {path} :: self.{name} at line(s) {lines}" for (path, name), lines in sorted(unreviewed.items()))
-        + "\n\nEither route the contraction through spx.quantization (see DeepseekV4GroupedLinear for the "
+        + "\n\nEither route the contraction through spx.quantization (see easydel.layers.linears.GroupedLinear for the "
         "pattern) or add it to _EXEMPT with the reason it must stay full precision."
     )
 

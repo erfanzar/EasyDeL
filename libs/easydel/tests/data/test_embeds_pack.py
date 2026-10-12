@@ -82,9 +82,9 @@ VISION_END_ID = 248054
 
 
 def _qwen_pack_position_id_fn(**kwargs):
-    from easydel.modules.qwen3_5.modeling_qwen3_5 import _get_rope_index_from_mm_token_types
+    from easydel.modules._base import mrope_position_ids_from_mm_token_types
 
-    return _get_rope_index_from_mm_token_types(
+    return mrope_position_ids_from_mm_token_types(
         **kwargs,
         spatial_merge_size=SPATIAL_MERGE_SIZE,
     )
@@ -1320,7 +1320,7 @@ def test_collate_packed_embeds_contract():
     """Materializing one window's worth of rows (``packs=[rows]``): static shapes, example-order embed
     concat, placeholder<->embed parity, contiguous per-window ``segment_ids`` (pad tail = -1), masked
     tail, and per-segment-reset 3D M-RoPE positions (each segment == its standalone-example layout)."""
-    from easydel.modules.qwen3_5.modeling_qwen3_5 import _get_rope_index_from_mm_token_types
+    from easydel.modules._base import mrope_position_ids_from_mm_token_types
 
     rows = [_packable_row(text_len=6, imgs=[]), _packable_row(text_len=3, imgs=[2]), _packable_row(text_len=4, imgs=[3])]
     filled = sum(len(r["input_ids"]) for r in rows)
@@ -1366,7 +1366,7 @@ def test_collate_packed_embeds_contract():
         length = ids_e.shape[0]
         grid = np.asarray(r["image_grid_thw"], dtype=np.int32).reshape(-1, 3)
         mm = (ids_e == IMAGE_PLACEHOLDER_ID).astype(np.int32).reshape(1, -1)
-        pos_e, _ = _get_rope_index_from_mm_token_types(
+        pos_e, _ = mrope_position_ids_from_mm_token_types(
             input_ids=ids_e.reshape(1, -1),
             mm_token_type_ids=mm,
             image_grid_thw=grid if grid.shape[0] else None,

@@ -74,7 +74,7 @@ from easydel.layers import (
 )
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
 from easydel.layers.norms import LayerNorm
-from easydel.layers.rotary import rotate_half
+from easydel.layers.rotary import apply_rope_split_half
 from easydel.modules._base import BaseConditionalGenerationModule, BaseVisionLanguageModule
 
 from .qwen3_omni_moe_configuration import (
@@ -678,39 +678,6 @@ class Qwen3OmniMoeAudioEncoder(EasyDeLBaseModule):
         return self.conv2d1
 
 
-def apply_rotary_pos_emb_vision(
-    q: Array,
-    k: Array,
-    cos: Array,
-    sin: Array,
-) -> tuple[Array, Array]:
-    """Apply rotary position embeddings to vision query/key tensors.
-
-    Promotes ``q``/``k`` and the precomputed ``cos``/``sin`` tables to
-    float32 to avoid bf16 round-off in the trigonometric mixing, applies
-    the standard RoPE rotation ``x * cos + rotate_half(x) * sin``, and
-    casts the results back to the original dtypes of the inputs.
-
-    Args:
-        q: Query tensor with trailing rotated dim.
-        k: Key tensor with trailing rotated dim.
-        cos: Cosine table broadcastable to ``q``/``k`` after a heads-axis
-            expand (``..., heads_axis, dim``).
-        sin: Sine table with the same shape as ``cos``.
-
-    Returns:
-        Tuple of ``(q_rot, k_rot)`` with the same shapes/dtypes as the
-        inputs, rotated according to the supplied frequency table.
-    """
-    orig_q_dtype = q.dtype
-    orig_k_dtype = k.dtype
-    q, k = q.astype("f4"), k.astype("f4")
-    cos, sin = jnp.expand_dims(cos, -2).astype("f4"), jnp.expand_dims(sin, -2).astype("f4")
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed.astype(orig_q_dtype), k_embed.astype(orig_k_dtype)
-
-
 def create_attention_mask(cu_seqlens: Array, seq_length: int, dtype: jnp.dtype) -> Array:
     """Build a block-diagonal additive attention mask from a cu_seqlens vector.
 
@@ -1034,7 +1001,8 @@ class Qwen3OmniMoeVisionAttention(spx.Module):
 
         cos = jnp.cos(rotary_pos_emb)
         sin = jnp.sin(rotary_pos_emb)
-        q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
+        q = apply_rope_split_half(q, cos, sin)
+        k = apply_rope_split_half(k, cos, sin)
 
         # Attention ops take [batch, seq, heads, dim]; packed vision tokens form one batch row and
         # the cu_seqlens block mask is additive (same as the Qwen3-VL vision tower).

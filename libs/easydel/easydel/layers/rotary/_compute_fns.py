@@ -55,6 +55,7 @@ from ._utils import (
     _yarn_find_correction_range,
     _yarn_get_mscale,
     _yarn_linear_ramp_mask,
+    cos_sin_from_inv_frequencies,
     yarn_get_mscale,
 )
 
@@ -160,6 +161,81 @@ def compute_yarn_inv_frequencies(
     ) * extrapolation_factor
     inv_frequencies = inv_freq_interpolation * (1 - inv_frequencies_mask) + inv_freq_extrapolation * inv_frequencies_mask
     return inv_frequencies
+
+
+def compute_labeled_inv_frequencies(
+    params: dict,
+    head_dim: int,
+    max_position_embeddings: int,
+) -> tuple[jnp.ndarray, float]:
+    """Inverse frequencies and attention scaling for one entry of a label-keyed ``rope_parameters`` dict.
+
+    Some families (DeepSeek-V4 / V4.1) keep several rope configurations side by side, keyed by a label such as
+    ``"main"`` or ``"compress"``. Each entry is a transformers-style rope dict; this maps one onto
+    :func:`compute_basic_inv_frequencies` / :func:`compute_yarn_inv_frequencies` with transformers'
+    ``_compute_yarn_parameters`` defaulting: ``factor`` falls back to the max/original context ratio, ``beta_fast`` /
+    ``beta_slow`` default to 32 / 1, extrapolation is full, and the magnitude factor is ``attention_factor`` or
+    ``1 + 0.1 * ln(factor)`` (``1`` for ``factor <= 1``).
+
+    Args:
+        params: Rope dict with ``rope_theta`` and optionally ``rope_type`` (``"default"`` or ``"yarn"``),
+            ``partial_rotary_factor``, ``factor``, ``original_max_position_embeddings``, ``attention_factor``,
+            ``beta_fast``, ``beta_slow``, ``truncate``.
+        head_dim: Head dimension the partial rotary factor applies to.
+        max_position_embeddings: Model context length (YaRN fallbacks).
+
+    Returns:
+        ``(inv_freq [rotary_dim // 2] float32, attention_scaling)``.
+
+    Raises:
+        NotImplementedError: For rope types other than ``default`` and ``yarn``.
+    """
+    base = float(params["rope_theta"])
+    dim = int(head_dim * float(params.get("partial_rotary_factor", 1.0)))
+    rope_type = params.get("rope_type", params.get("type", "default"))
+    if rope_type in ("default", None):
+        return compute_basic_inv_frequencies(base, dim), 1.0
+    if rope_type != "yarn":
+        raise NotImplementedError(f"Labeled rope_type {rope_type!r} is not supported.")
+    factor = params.get("factor")
+    original_max = params.get("original_max_position_embeddings", max_position_embeddings)
+    if factor is None:
+        factor = max_position_embeddings / original_max
+    attention_factor = params.get("attention_factor")
+    if attention_factor is None:
+        attention_factor = 1.0 if factor <= 1 else 0.1 * math.log(factor) + 1.0
+    inv_freq = compute_yarn_inv_frequencies(
+        base=base,
+        rotary_dim=dim,
+        beta_fast=params.get("beta_fast") or 32,
+        beta_slow=params.get("beta_slow") or 1,
+        max_position_embeddings=original_max,
+        scaling_factor=factor,
+        extrapolation_factor=1.0,
+        truncate=params.get("truncate", True),
+    )
+    return inv_freq, float(attention_factor)
+
+
+def labeled_rope_cos_sin(config, label: str, position_ids, dtype) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Half-width ``(cos, sin)`` at ``position_ids`` for one rope label of a label-keyed config.
+
+    The config must expose ``rope_parameters_for_label(label) -> dict`` (see
+    :func:`compute_labeled_inv_frequencies`), ``head_dim`` and ``max_position_embeddings``.
+
+    Args:
+        config: Model configuration.
+        label: Rope label (e.g. ``"main"`` / ``"compress"``).
+        position_ids: Integer positions ``[batch, seq]``.
+        dtype: Output dtype.
+
+    Returns:
+        ``(cos, sin)``, each ``[batch, seq, rotary_dim // 2]``.
+    """
+    inv_freq, scaling = compute_labeled_inv_frequencies(
+        config.rope_parameters_for_label(label), int(config.head_dim), int(config.max_position_embeddings)
+    )
+    return cos_sin_from_inv_frequencies(inv_freq, position_ids, dtype, scaling)
 
 
 @jax.named_scope("easydel-rotary-compute-llama3-inv-frequencies")

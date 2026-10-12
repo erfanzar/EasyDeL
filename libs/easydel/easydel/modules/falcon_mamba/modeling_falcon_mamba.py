@@ -510,16 +510,12 @@ class FalconMambaMixer(spx.Module):
         )
 
         if use_packed_state_updates:
-            from easydel.layers.compressed_window._packed import grid_to_tokens, tokens_to_grid
+            from easydel.layers.compressed_window import grid_to_tokens, packed_row_of_token, tokens_to_grid
             from easydel.operations.kernels.ssm1 import _packed_ssm1_fwd
 
             num_slots = conv_states.shape[0]
             token_index = jnp.arange(seq_len, dtype=jnp.int32)
-            token_slots = jnp.clip(
-                jnp.searchsorted(packed_query_start_loc, token_index, side="right") - 1,
-                0,
-                num_slots - 1,
-            )
+            token_slots = packed_row_of_token(packed_query_start_loc, token_index, max_row=num_slots - 1)
             token_cols = token_index - packed_query_start_loc[token_slots]
             token_valid = token_index < packed_query_start_loc[packed_num_seqs]
             width = seq_len

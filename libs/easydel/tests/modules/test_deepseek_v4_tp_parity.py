@@ -208,12 +208,12 @@ def test_hyper_stream_spec_leaves_stream_axis_replicated():
     CPU-visible half of that failure: the ``shard_map`` itself is gated on
     ``jax.default_backend() == "tpu"``.
     """
-    from easydel.modules.deepseek_v4.modeling_deepseek_v4 import _HyperStreamSharding
+    from easydel.layers.residual import HyperStreamSharding
 
     config = _config(TP)
     hc = config.hc_mult
     spec = config.runtime_sharding_resolver.resolve(
-        dynamic_axes=_HyperStreamSharding,
+        dynamic_axes=HyperStreamSharding,
         shape=(1, SEQ, hc, HIDDEN),
     )
 

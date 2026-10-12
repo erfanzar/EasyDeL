@@ -15,7 +15,7 @@
 """Qwen-VL family mRoPE / attention-bias parity against the HF torch reference.
 
 Covers:
-* Qwen3.5 ``_get_rope_index_from_mm_token_types`` vs HF ``Qwen3_5Model.get_rope_index``
+* Qwen3.5 ``mrope_position_ids_from_mm_token_types`` vs HF ``Qwen3_5Model.get_rope_index``
   (meshgrid T/H/W ordering and per-frame video grid splitting).
 * Qwen2-VL chunked mRoPE channel layout vs HF ``apply_multimodal_rotary_pos_emb``.
 * Qwen2-VL text attention bias layout (Q/K/V biased, O bias-free) and vision head count.
@@ -29,9 +29,9 @@ import numpy as np
 import pytest
 import spectrax as spx
 import torch
+from easydel.modules._base import mrope_position_ids_from_mm_token_types
 from easydel.modules.qwen2_vl.modeling_qwen2_vl import Qwen2VLAttention, Qwen2VLVisionBlock
 from easydel.modules.qwen2_vl.qwen2_vl_configuration import Qwen2VLTextConfig, Qwen2VLVisionConfig
-from easydel.modules.qwen3_5.modeling_qwen3_5 import _get_rope_index_from_mm_token_types
 from easydel.modules.qwen3_vl.qwen3_vl_configuration import Qwen3VLConfig, Qwen3VLTextConfig
 from easydel.modules.qwen3_vl_moe.qwen3_vl_moe_configuration import Qwen3VLMoeTextConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Model
@@ -88,7 +88,7 @@ def _mixed_batch():
 def test_qwen3_5_rope_index_matches_hf():
     ids, mm, image_grid, video_grid, attn = _mixed_batch()
     hf_pos, hf_delta = _hf_qwen3_5_rope_index(ids, mm, image_grid, video_grid, attn, sms=2)
-    ed_pos, ed_delta = _get_rope_index_from_mm_token_types(
+    ed_pos, ed_delta = mrope_position_ids_from_mm_token_types(
         input_ids=ids,
         mm_token_type_ids=mm,
         image_grid_thw=image_grid,
@@ -108,7 +108,7 @@ def test_qwen3_5_rope_index_multi_frame_image_grid_matches_hf():
     mm = np.asarray([types_row], dtype=np.int64)
     image_grid = np.asarray([[2, 4, 6]], dtype=np.int64)
     hf_pos, hf_delta = _hf_qwen3_5_rope_index(ids, mm, image_grid, None, None, sms=2)
-    ed_pos, ed_delta = _get_rope_index_from_mm_token_types(
+    ed_pos, ed_delta = mrope_position_ids_from_mm_token_types(
         input_ids=ids,
         mm_token_type_ids=mm,
         image_grid_thw=image_grid,
@@ -132,8 +132,8 @@ def test_qwen3_5_rope_index_video_split_is_idempotent():
         spatial_merge_size=2,
         return_jax_arrays=False,
     )
-    a, _ = _get_rope_index_from_mm_token_types(video_grid_thw=video_grid, **kwargs)
-    b, _ = _get_rope_index_from_mm_token_types(video_grid_thw=pre_split, **kwargs)
+    a, _ = mrope_position_ids_from_mm_token_types(video_grid_thw=video_grid, **kwargs)
+    b, _ = mrope_position_ids_from_mm_token_types(video_grid_thw=pre_split, **kwargs)
     np.testing.assert_array_equal(a, b)
 
 

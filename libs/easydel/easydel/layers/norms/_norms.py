@@ -314,6 +314,8 @@ class RMSNorm(spx.Module):
         scale_offset: float = 0.0,
         with_scale: bool = True,
         group_size: int | None = None,
+        fp32_scale: bool = False,
+        output_dtype: jnp.dtype | None = None,
         kernel_init: tp.Callable | None = None,
         rngs: spx.Rngs | None = None,
     ) -> None:
@@ -357,6 +359,12 @@ class RMSNorm(spx.Module):
                 (ones). Pass ``jax.nn.initializers.zeros`` together with
                 ``scale_offset=1.0`` for the zero-centred ``(1 + w)`` convention
                 where the effective scale starts at identity.
+            fp32_scale: When ``True`` the statistics AND the ``(scale_offset + w)``
+                multiply run in float32 and the result is cast once at the end
+                (the HF Gemma / Qwen3-Next order). The default multiplies after
+                casting the normalized value to ``dtype`` (the HF Llama order).
+            output_dtype: ``fp32_scale`` only: output dtype (``None`` = the input's
+                dtype). A low-precision float target is returned as bfloat16.
             rngs: spectrax random number generators for parameter initialization.
                 If None, creates a new Rngs instance with seed 0.
 
@@ -382,7 +390,13 @@ class RMSNorm(spx.Module):
         if group_size is not None and dim % group_size != 0:
             raise ValueError(f"RMSNorm dim ({dim}) must be divisible by group_size ({group_size}).")
         self.group_size = group_size
-        init = kernel_init if kernel_init is not None else RMSNorm.kernel_init
+        self.fp32_scale = fp32_scale
+        self.output_dtype = output_dtype
+        # Parameter re-initialisation (``base_module`` / ``bridge``) reads ``module.kernel_init``, so an explicit
+        # initializer must shadow the class default; otherwise a zero-centred ``(1 + w)`` norm re-inits to ones.
+        if kernel_init is not None:
+            self.kernel_init = kernel_init
+        init = kernel_init if kernel_init is not None else type(self).kernel_init
         # ``with_scale=False`` allocates no parameter at all -- a scale-free RMS
         # norm must not add a phantom leaf to the checkpoint.
         self.weight = (
@@ -459,6 +473,15 @@ class RMSNorm(spx.Module):
             >>> assert y.shape == (2, 4)
         """
         org_dtype = x.dtype
+        if self.fp32_scale:
+            output = self._norm(x.astype(jnp.float32))
+            if self.with_scale:
+                weight = self.weight.astype(jnp.float32)
+                if self.scale_offset:
+                    weight = weight + jnp.asarray(self.scale_offset, jnp.float32)
+                output = weight * output
+            target = org_dtype if self.output_dtype is None else self.output_dtype
+            return output.astype(jnp.bfloat16 if target in lowfloats else target)
         if self.param_dtype in lowfloats or self.dtype in lowfloats:
             x = x.astype(jnp.float32)
         else:

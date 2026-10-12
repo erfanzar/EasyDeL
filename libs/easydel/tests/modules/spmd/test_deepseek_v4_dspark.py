@@ -508,7 +508,7 @@ def test_negative_control_query_head_norm_is_required():
     oracle = _oracle(PREFILL_LENS[1])
     model = _build_easydel(oracle.config, oracle.dspark)
     for stage in model.stages:
-        stage.self_attn.draft_q_head_norm_eps = None
+        stage.self_attn.q_head_norm_eps = None
     got = _run_easydel(oracle.config, model, oracle)
     gap = max(float(np.abs(g.logits - w.logits).max()) for g, w in zip(got, oracle.outputs, strict=True))
     assert gap > 1e-2, f"disabling the query head norm moved the logits by only {gap:.3e}"

@@ -665,6 +665,8 @@ class Glm5NextVisionConfig(EasyDeLBaseConfig):
     """
 
     model_type: str = "glm5_next_vision"
+    # Matches HF: the vision rotary module only accepts ``rope_type="axial"``.
+    default_rope_type = "axial"
     base_config_key: str = "vision_config"
     attribute_map: tp.ClassVar = {"num_attention_heads": "num_heads"}
 
@@ -696,6 +698,10 @@ class Glm5NextVisionConfig(EasyDeLBaseConfig):
             See the class docstring for the full parameter table.
             **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
         """
+        # Let the base class normalise rope (it fills the HF ``axial`` default); assigning the raw argument after
+        # ``super().__init__`` would overwrite that with ``None``.
+        if rope_parameters is not None:
+            kwargs["rope_parameters"] = rope_parameters
         super().__init__(**kwargs)
         self.depth = depth
         self.hidden_size = hidden_size
@@ -713,7 +719,6 @@ class Glm5NextVisionConfig(EasyDeLBaseConfig):
         self.out_hidden_size = out_hidden_size
         self.intermediate_size = intermediate_size
         self.initializer_range = initializer_range
-        self.rope_parameters = rope_parameters
         self.projection_intermediate_size = projection_intermediate_size
         self.swiglu_limit = swiglu_limit
 

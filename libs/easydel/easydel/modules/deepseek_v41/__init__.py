@@ -14,7 +14,6 @@
 
 """DeepSeek-V4.1 model family (text model and vision-language model; serving of images and MTP pending)."""
 
-from ._dspark_loader import load_deepseek_v41_dspark
 from .deepseek_v41_configuration import DeepseekV41Config
 from .modeling_deepseek_v41 import (
     DeepseekV41ForCausalLM,
@@ -51,5 +50,4 @@ __all__ = [
     "DeepseekV41ForConditionalGeneration",
     "DeepseekV41Model",
     "DeepseekV41VLModel",
-    "load_deepseek_v41_dspark",
 ]

@@ -1014,9 +1014,9 @@ class VisionLanguageTester(BaseTester):
             base_model_config = getattr(base_model, "config", None)
             model_type = getattr(base_model_config, "model_type", None)
             if supports_mm_token_type_ids and model_type in {"qwen3_5", "qwen3_5_moe"}:
-                from easydel.modules.qwen3_5.modeling_qwen3_5 import _get_rope_index_from_mm_token_types
+                from easydel.modules._base import mrope_position_ids_from_mm_token_types
 
-                position_ids, _rope_deltas = _get_rope_index_from_mm_token_types(
+                position_ids, _rope_deltas = mrope_position_ids_from_mm_token_types(
                     input_ids=input_ids,
                     mm_token_type_ids=mm_token_type_ids,
                     image_grid_thw=ed_inputs.get("image_grid_thw"),

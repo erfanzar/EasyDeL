@@ -134,7 +134,7 @@ from easydel.layers.linear_attention import (
     apply_conv_with_state,
     apply_mask_to_padding_states,
 )
-from easydel.layers.norms import lowfloats
+from easydel.layers.norms import RMSNorm, lowfloats
 from easydel.modules._base import BaseCausalLMModule
 from easydel.operations import OperationMetadata
 from easydel.operations.kernels import (
@@ -1945,18 +1945,14 @@ def _apply_qwen3_next_packed_updates(
     )
 
 
-class Qwen3NextRMSNorm(spx.Module):
-    """RMSNorm for Qwen3Next with (1 + weight) scaling formula.
+class Qwen3NextRMSNorm(RMSNorm):
+    """Qwen3-Next RMSNorm (HF ``Qwen3NextRMSNorm``): zero-centred ``(1 + w)``, float32 statistics and scale.
 
-    Qwen3Next uses a modified RMSNorm where the weight is centered at 1:
-    output = (1 + weight) * RMSNorm(x)
-
-    This allows initializing weight to zeros while having identity scaling.
-
-    Attributes:
-        hidden_size: Dimension of the input features.
-        eps: Small constant for numerical stability.
+    Zero-initialised ``weight`` of size ``hidden_size``; the output is cast back to the input dtype.
+    :class:`easydel.layers.norms.RMSNorm` with ``fp32_scale=True``.
     """
+
+    kernel_init = staticmethod(jax.nn.initializers.zeros)
 
     def __init__(
         self,
@@ -1967,52 +1963,16 @@ class Qwen3NextRMSNorm(spx.Module):
         *,
         rngs: spx.Rngs,
     ):
-        """Initialize Qwen3NextRMSNorm layer.
-
-        Args:
-            hidden_size (int): Dimension of the input features.
-            eps (float, optional): Small constant for numerical stability. Defaults to 1e-6.
-            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
-            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            rngs (spx.Rngs): Random number generator state.
-        """
-        self.hidden_size = hidden_size
-        self.eps = eps
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-
-        self.weight = spx.Parameter(jnp.zeros((hidden_size,), dtype=param_dtype))
-
-    def _norm(self, x):
-        """Compute RMS normalization.
-
-        Args:
-            x: Input tensor to normalize.
-
-        Returns:
-            RMS-normalized tensor.
-        """
-        return x * jax.lax.rsqrt(jnp.mean(x**2, axis=-1, keepdims=True) + self.eps)
-
-    def forward(self, hidden_states: Float[Array, "... hidden_size"]) -> Float[Array, "... hidden_size"]:
-        """Apply RMSNorm with (1 + weight) scaling.
-
-        Computes the normalisation in fp32 for numerical stability, then
-        scales by ``(1 + weight)`` so the learnable weight can be
-        initialised to zero and still recover an identity transform.
-
-        Args:
-            hidden_states: Input tensor with the channel dim last.
-
-        Returns:
-            Normalised and rescaled tensor cast back to the original
-            input dtype.
-        """
-        org_dtype = hidden_states.dtype
-        hidden_states = hidden_states.astype(jnp.float32)
-        output = self._norm(hidden_states)
-        output = output * (1.0 + self.weight.value.astype(jnp.float32))
-        return output.astype(org_dtype)
+        super().__init__(
+            hidden_size,
+            eps=eps,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            scale_offset=1.0,
+            fp32_scale=True,
+        )
+        # The zero init needs no key; drawing one from the shared ``rngs`` would shift every later layer's init.
+        del rngs
 
 
 class Qwen3NextMLP(spx.Module):

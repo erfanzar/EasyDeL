@@ -63,7 +63,7 @@ from easydel.infra.modeling_outputs import (
     DecoderLayerOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, blockwise_ffn
+from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
 from easydel.layers import (
     ColumnParallelLinear,
     Embed,
@@ -72,6 +72,7 @@ from easydel.layers import (
     gated_mlp_forward,
 )
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
+from easydel.layers.norms import RMSNorm
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
 
 from .gemma2_configuration import Gemma2Config
@@ -79,65 +80,26 @@ from .gemma2_configuration import Gemma2Config
 logger = get_logger(__name__)
 
 
-class Gemma2RMSNorm(spx.Module):
-    """Gemma2's RMSNorm with the ``(1 + weight)`` scaling and fp32 variance reduction.
+class Gemma2RMSNorm(RMSNorm):
+    """Gemma-2 RMSNorm (HF ``Gemma2RMSNorm``): ``(1 + w)`` scale, statistics and scale in float32, one cast.
 
-    Identical formulation to Gemma's RMSNorm (zero-init weight applied as
-    ``1 + weight`` so the layer is the identity at step 0; variance is computed
-    in float32 even when activations are bfloat16 to avoid precision loss in
-    the inverse-square-root). Gemma2 uses two of these per block — one before
-    attention and one before the MLP — plus optional post-attention and
-    post-FFN copies depending on the layer-norm placement schema.
-
-    Attributes:
-        config: Source ``Gemma2Config``; reads ``hidden_size`` and ``rms_norm_eps``.
-        epsilon: Floor under the inverse-RMS to keep the gradient well-defined.
-        dtype: Cast-back dtype for the normalised activations.
-        weight: Bound :class:`ArrayParam` of shape ``(hidden_size,)`` initialised
-            to ones (consumed as ``1 + weight``).
+    Zero-initialised ``weight`` (HF init, so the effective scale ``1 + w`` starts at 1) of size ``hidden_size`` stored
+    in ``dtype``; the output is cast to ``dtype``. The math is :class:`easydel.layers.norms.RMSNorm` with
+    ``fp32_scale=True``.
     """
 
-    kernel_init = staticmethod(jax.nn.initializers.ones)
+    kernel_init = staticmethod(jax.nn.initializers.zeros)
 
     def __init__(self, config: Gemma2Config, dtype: jnp.dtype = jnp.float32):
-        """Allocate the per-feature scale and capture epsilon from ``config``.
-
-        ``dtype`` controls the cast-back of the normalised tensor only — the
-        variance reduction itself is forced to float32 inside :meth:`forward`.
-        """
-        self.config = config
-        self.epsilon = self.config.rms_norm_eps
-        self.dtype = dtype
-        self.weight = ArrayParam.bound(
-            shape=(self.config.hidden_size,),
+        super().__init__(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
             dtype=dtype,
-            init_method="ones",
-            key=None,
+            param_dtype=dtype,
+            scale_offset=1.0,
+            fp32_scale=True,
+            output_dtype=dtype,
         )
-
-    def forward(
-        self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
-    ) -> Float[Array, "batch seq_len hidden_dim"]:
-        """Compute ``(1 + weight) * x / sqrt(mean(x**2, axis=-1) + eps)``.
-
-        The mean of squared activations is taken in float32 over the trailing
-        hidden dimension, the inverse RMS scale is then applied to the
-        original tensor, and finally the learnable scale ``(1 + weight)``
-        modulates the output. The cast back to ``self.dtype`` happens at the
-        very end so the multiplication runs at full precision.
-
-        Args:
-            hidden_states: Tensor of shape ``[batch, seq_len, hidden_dim]``.
-
-        Returns:
-            Tensor of the same shape, with each ``hidden_dim`` slice having
-            unit RMS prior to the learned ``(1 + weight)`` rescaling.
-        """
-        hidden_states = hidden_states.astype(jnp.float32)
-        variance = jnp.power(hidden_states, 2).mean(-1, keepdims=True)
-        hidden_states = hidden_states / jnp.sqrt(variance + self.epsilon)
-        # HF multiplies by ``(1 + weight)`` in float32 and casts once at the end.
-        return ((1 + self.weight.value.astype(jnp.float32)) * hidden_states).astype(self.dtype)
 
 
 class Gemma2SoftCappedAttentionModule(FlexibleAttentionModule):

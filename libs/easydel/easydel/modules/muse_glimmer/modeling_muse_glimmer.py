@@ -82,7 +82,7 @@ from easydel.infra.modeling_outputs import (
     VLMCausalLMOutput,
 )
 from easydel.infra.sequence_packing import token_attention_mask_from_mask_info
-from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, blockwise_ffn
+from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
 from easydel.layers import (
     ColumnParallelLinear,
     Embed,
@@ -94,7 +94,7 @@ from easydel.layers import (
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
 from easydel.layers.layouts import FusedColumnLayout, FusedSegment
 from easydel.layers.norms import LayerNorm, lowfloats
-from easydel.layers.rotary import rotate_half as _rotate_half
+from easydel.layers.rotary import apply_rope_split_half
 from easydel.modules._base import BaseVisionLanguageModule
 
 from .muse_glimmer_configuration import (
@@ -146,88 +146,24 @@ def _scaleless_rms_norm(hidden_states: Array, eps: float) -> Array:
     return (promoted * jax.lax.rsqrt(mean_squared)).astype(original_dtype)
 
 
-class MuseGlimmerCenteredRMSNorm(spx.Module):
-    """RMSNorm whose learnable scale is applied as ``1 + weight``.
+class MuseGlimmerCenteredRMSNorm(RMSNorm):
+    """Zero-centred ``(1 + w)`` RMSNorm, statistics and scale in float32, cast back to the input dtype.
 
-    The Gemma-style parameterization used by every norm inside a Muse-Glimmer
-    decoder layer: ``weight`` is initialized to zeros so the layer starts as a
-    plain RMS division, and both the normalization and the scaling run in
-    float32 before the result is cast back to the input dtype.
-
-    Attributes:
-        epsilon (float): Variance epsilon added inside the reciprocal sqrt.
-        param_dtype (DTypeLike): Storage dtype of ``weight``.
-        weight (ArrayParam): Per-feature offset of shape ``(dim,)``.
+    Zero-initialised ``weight`` of size ``dim`` stored in ``param_dtype`` (low-precision float inputs return
+    bfloat16). :class:`easydel.layers.norms.RMSNorm` with ``fp32_scale=True``.
     """
 
     kernel_init = staticmethod(jax.nn.initializers.zeros)
 
-    def __init__(
-        self,
-        dim: int,
-        epsilon: float = 1e-6,
-        param_dtype: jnp.dtype = jnp.float32,
-    ) -> None:
-        """Initialize the centered RMS norm.
-
-        Args:
-            dim: Size of the trailing feature axis being normalized.
-            epsilon: Variance epsilon. Defaults to 1e-6.
-            param_dtype: Storage dtype of the learnable offset. Defaults to float32.
-        """
-        self.epsilon = epsilon
-        self.param_dtype = param_dtype
-        self.weight = ArrayParam.bound(
-            shape=(dim,),
+    def __init__(self, dim: int, epsilon: float = 1e-6, param_dtype: jnp.dtype = jnp.float32) -> None:
+        super().__init__(
+            dim,
+            eps=epsilon,
             dtype=param_dtype,
-            init_method="zeros",
-            key=None,
+            param_dtype=param_dtype,
+            scale_offset=1.0,
+            fp32_scale=True,
         )
-
-    def forward(self, hidden_states: Float[Array, "... dim"]) -> Array:
-        """Normalize ``hidden_states`` and scale by ``1 + weight``.
-
-        Args:
-            hidden_states: Tensor whose last axis is normalized.
-
-        Returns:
-            Array: Normalized, scaled tensor with the input dtype (promoted to
-            bfloat16 when the input dtype is a low-precision float that cannot
-            represent the scaled result).
-        """
-        original_dtype = hidden_states.dtype
-        promoted = hidden_states.astype(jnp.float32)
-        mean_squared = jnp.mean(jnp.square(promoted), axis=-1, keepdims=True) + self.epsilon
-        normed = promoted * jax.lax.rsqrt(mean_squared)
-        out = normed * (1.0 + self.weight.value.astype(jnp.float32))
-        if original_dtype in lowfloats:
-            return out.astype(jnp.bfloat16)
-        return out.astype(original_dtype)
-
-
-def _apply_rotary_pos_emb_vision(q: Array, k: Array, cos: Array, sin: Array) -> tuple[Array, Array]:
-    """Apply the vision tower's 2-D RoPE to query/key tensors.
-
-    Promotes to float32 for the trigonometric mix (matching the reference
-    implementation, which is explicit about the upcast) and restores the
-    original dtypes afterwards.
-
-    Args:
-        q: Queries of shape ``(1, seq, heads, head_dim)``.
-        k: Keys of shape ``(1, seq, heads, head_dim)``.
-        cos: Cosine table of shape ``(seq, head_dim)``.
-        sin: Sine table of shape ``(seq, head_dim)``.
-
-    Returns:
-        tuple[Array, Array]: Rotated ``(q, k)`` with the input shapes/dtypes.
-    """
-    q_dtype, k_dtype = q.dtype, k.dtype
-    q32, k32 = q.astype(jnp.float32), k.astype(jnp.float32)
-    cos32 = jnp.expand_dims(cos, -2).astype(jnp.float32)
-    sin32 = jnp.expand_dims(sin, -2).astype(jnp.float32)
-    q_out = (q32 * cos32) + (_rotate_half(q32) * sin32)
-    k_out = (k32 * cos32) + (_rotate_half(k32) * sin32)
-    return q_out.astype(q_dtype), k_out.astype(k_dtype)
 
 
 def _block_diagonal_bias(cu_seqlens: np.ndarray, seq_length: int, dtype: jnp.dtype) -> Array:
@@ -1436,7 +1372,8 @@ class MuseGlimmerVisionAttention(UnifiedAttention):
         value_states = value_states.reshape(head_shape)
 
         cos, sin = position_embeddings
-        query_states, key_states = _apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
+        query_states = apply_rope_split_half(query_states, cos, sin)
+        key_states = apply_rope_split_half(key_states, cos, sin)
 
         # The performer expects a per-head bias; the segment mask is head-invariant.
         attention_bias = jnp.broadcast_to(attention_bias, (1, self.num_heads, seq_length, seq_length))

@@ -31,17 +31,18 @@ interface of :class:`easydel.inference.speculative.Qwen3_5MTPDrafter` (``pre_fc_
 from __future__ import annotations
 
 import copy
-import re
 import typing as tp
 
 import jax
 import jax.numpy as jnp
 import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
+from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Float, Int
 from spectrax import common_types, nn
 
 from easydel.layers import ColumnParallelLinear, RMSNorm
+from easydel.utils.checkpoint_keys import KeyRuleSet, Map
 
 from .glm5_next_configuration import DEEPSEEK_SPARSE_ATTENTION_LAYER_TYPE, Glm5NextTextConfig
 from .modeling_glm5_next import Glm5NextDSAAttention, Glm5NextTextMoE
@@ -111,16 +112,16 @@ class Glm5NextMTPLayer(spx.Module):
             False,
             frequencies,
         )
-        hidden_states = residual + attn.attention_output
+        hidden_states = residual + checkpoint_name(attn.attention_output, "attn_output")
         mlp_out, _router_logits = self.mlp(self.post_attention_layernorm(hidden_states))
-        return hidden_states + mlp_out, attn.cache_view
+        return hidden_states + checkpoint_name(mlp_out, "mlp_output"), attn.cache_view
 
 
 class Glm5NextMTPHead(spx.Module):
     """GLM-5-Next nextn head (``enorm`` / ``hnorm`` / ``eh_proj`` / block / ``shared_head.norm``).
 
     Build under ``with config.mesh:``. Parameter names follow the inline-MTP drafter contract; the checkpoint
-    mapping is :func:`native_key_to_glm5_next_mtp`.
+    mapping is :func:`glm5_next_mtp_key_rules`.
     """
 
     def __init__(
@@ -198,7 +199,6 @@ def attach_glm5_next_mtp(model: tp.Any, head: Glm5NextMTPHead) -> tp.Any:
     return model
 
 
-_NEXTN_KEY_RE = re.compile(r"^(?:model\.language_model\.|model\.)?layers\.(\d+)\.(.+)$")
 _NEXTN_OWN = {
     "enorm.weight": "pre_fc_norm_embedding.weight",
     "hnorm.weight": "pre_fc_norm_hidden.weight",
@@ -207,30 +207,30 @@ _NEXTN_OWN = {
 }
 
 
-def native_key_to_glm5_next_mtp(nextn_layer_index: int) -> tp.Callable[[str], str | None]:
-    """Key normalizer: ``*layers.{nextn_layer_index}.*`` -> :class:`Glm5NextMTPHead` names (others unowned).
+def glm5_next_mtp_key_rules(nextn_layer_index: int) -> KeyRuleSet:
+    """Key rules: ``*layers.{nextn_layer_index}.*`` -> :class:`Glm5NextMTPHead` names (everything else unowned).
 
-    ``shared_head.head`` (the shared LM head, when a checkpoint stores it) is unowned: the head uses the backbone's.
+    ``shared_head.head`` (the shared LM head, when a checkpoint stores it) and the ``hc_*`` tensors are unowned: the
+    head uses the backbone's.
     """
-    index = int(nextn_layer_index)
-
-    def normalize(key: str) -> str | None:
-        match = _NEXTN_KEY_RE.match(key)
-        if match is None or int(match.group(1)) != index:
-            return None
-        rest = match.group(2)
-        if rest in _NEXTN_OWN:
-            return _NEXTN_OWN[rest]
-        if rest.startswith("shared_head.") or rest.startswith("hc_"):
-            return None
-        return f"layers.0.{rest}"
-
-    return normalize
+    prefix = rf"(?:model\.language_model\.|model\.)?layers\.0*{int(nextn_layer_index)}\."
+    return KeyRuleSet(
+        [
+            Map(
+                prefix + r"(?P<rest>enorm\.weight|hnorm\.weight|eh_proj\.weight|shared_head\.norm\.weight)",
+                "{rest}",
+                rename={"rest": _NEXTN_OWN},
+            ),
+            Map(prefix + r"(?:shared_head\.|hc_).*", None),
+            Map(prefix + r"(?P<rest>.+)", "layers.0.{rest}"),
+        ],
+        name=f"glm5_next_mtp[{int(nextn_layer_index)}]",
+    )
 
 
 def scan_glm5_next_mtp_keys(nextn_layer_index: int) -> tp.Callable[[tp.Sequence[str]], dict[int, list[tuple[str, str]]]]:
-    """Shard scanner for :func:`easydel.modules._dspark_loader.load_dspark_model`: the nextn keys as stage 0."""
-    normalize = native_key_to_glm5_next_mtp(nextn_layer_index)
+    """Shard scanner for :func:`easydel.modules.dspark.load_dspark_model`: the nextn keys as stage 0."""
+    normalize = glm5_next_mtp_key_rules(nextn_layer_index)
 
     def scan(shard_paths: tp.Sequence[str]) -> dict[int, list[tuple[str, str]]]:
         from safetensors import safe_open
@@ -268,7 +268,7 @@ def load_glm5_next_mtp(
     Returns:
         The loaded head (also attached as ``model.mtp``).
     """
-    from easydel.modules._dspark_loader import load_dspark_model
+    from easydel.modules.dspark import load_dspark_model
 
     config = model.config
     index = int(config.num_hidden_layers)
@@ -283,7 +283,7 @@ def load_glm5_next_mtp(
             rngs=spx.Rngs(0),
             max_cache_length=max_cache_length,
         ),
-        key_normalizer=native_key_to_glm5_next_mtp(index),
+        key_normalizer=glm5_next_mtp_key_rules(index),
         quantization_config=quantization_config,
         param_dtype=param_dtype,
         stage_shards=stage_shards,
@@ -299,7 +299,7 @@ __all__ = [
     "Glm5NextMTPLayer",
     "attach_glm5_next_mtp",
     "glm5_next_mtp_config",
+    "glm5_next_mtp_key_rules",
     "load_glm5_next_mtp",
-    "native_key_to_glm5_next_mtp",
     "scan_glm5_next_mtp_keys",
 ]

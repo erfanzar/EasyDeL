@@ -91,9 +91,8 @@ from easydel.layers import (
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule, UnifiedAttention
 from easydel.layers.indexer import BlockMaxIndexer, BlockMaxIndexerConfig
 from easydel.layers.moe import moe_group_topk_select
-from easydel.layers.norms import LayerNorm
+from easydel.layers.norms import LayerNorm, RMSNorm
 from easydel.modules._base import BaseCausalLMModule, BaseVisionLanguageModule
-from easydel.modules.gemma3.modeling_gemma3 import Gemma3RMSNorm
 from easydel.modules.qwen2_vl.modeling_qwen2_vl import Qwen2VLPatchEmbed
 
 from .minimax_m3_vl_configuration import (
@@ -103,18 +102,34 @@ from .minimax_m3_vl_configuration import (
 )
 
 
-class MiniMaxM3VLRMSNorm(Gemma3RMSNorm):
-    """Gemma-style RMSNorm used throughout MiniMax M3 VL.
+class MiniMaxM3VLRMSNorm(RMSNorm):
+    """MiniMax-M3-VL RMSNorm: Gemma-style ``(1 + w)`` scale, statistics and scale in float32, one cast.
 
-    Normalizes in float32 and scales by ``(1 + weight)`` so the layer is the
-    identity at initialization — checkpoints store weights near zero. Used for
-    the decoder layer norms, the final norm, the per-head Q/K norms and the
-    Lightning-Indexer Q/K norms.
+    Zero-initialised ``weight`` (HF init, so the effective scale ``1 + w`` starts at 1) of size ``dim`` (default
+    ``hidden_size``) stored in ``param_dtype``; the output is cast to ``param_dtype`` (bfloat16 for a low-precision
+    float). :class:`easydel.layers.norms.RMSNorm` with ``fp32_scale=True``.
     """
 
+    kernel_init = staticmethod(jax.nn.initializers.zeros)
 
-# The OAI-style clamped SwiGLU is shared; this family had the only named copy.
-# Bound to the module-level name so call sites are unchanged.
+    def __init__(
+        self,
+        config: MiniMaxM3VLTextConfig,
+        param_dtype: jnp.dtype = jnp.float32,
+        dim: int | None = None,
+        epsilon: float | None = None,
+    ):
+        super().__init__(
+            config.hidden_size if dim is None else dim,
+            eps=config.rms_norm_eps if epsilon is None else epsilon,
+            dtype=param_dtype,
+            param_dtype=param_dtype,
+            scale_offset=1.0,
+            fp32_scale=True,
+            output_dtype=param_dtype,
+        )
+
+
 _swiglu_oai = swiglu_oai
 
 

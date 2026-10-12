@@ -28,7 +28,6 @@ eSurge serving are not supported — see
 ``.claude/projects/port_hyv3_dsv4_mistral4.md``.
 """
 
-from ._dspark_loader import load_deepseek_v4_dspark
 from .deepseek_v4_configuration import DeepseekV4Config
 from .modeling_deepseek_v4 import DeepseekV4ForCausalLM, DeepseekV4Model
 from .modeling_deepseek_v4_dspark import DeepseekV4DSpark, DeepseekV4DSparkDrafter
@@ -39,5 +38,4 @@ __all__ = [
     "DeepseekV4DSparkDrafter",
     "DeepseekV4ForCausalLM",
     "DeepseekV4Model",
-    "load_deepseek_v4_dspark",
 ]

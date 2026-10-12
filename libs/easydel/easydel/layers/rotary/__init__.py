@@ -70,12 +70,14 @@ from ._compute_fns import (
     compute_basic_inv_frequencies,
     compute_deepseek_frequencies,
     compute_dynamic_frequencies,
+    compute_labeled_inv_frequencies,
     compute_linear_frequencies,
     compute_llama3_frequencies,
     compute_llama3_inv_frequencies,
     compute_phi3_frequencies,
     compute_yarn_frequencies,
     compute_yarn_inv_frequencies,
+    labeled_rope_cos_sin,
 )
 from ._configs import RopeConfig
 from ._modules import (
@@ -88,8 +90,16 @@ from ._modules import (
     RotaryEmbedding,
     YaRNScalingRotaryEmbedding,
 )
-from ._rotary import get_frequencies, get_inv_frequencies, get_rope
-from ._utils import apply_rope_interleaved, gather_mla_cos_sin, rotate_half, yarn_get_mscale
+from ._rotary import get_frequencies, get_inv_frequencies, get_rope, partial_rope_frequencies
+from ._utils import (
+    apply_rope_interleaved,
+    apply_rope_interleaved_partial,
+    apply_rope_split_half,
+    cos_sin_from_inv_frequencies,
+    gather_mla_cos_sin,
+    rotate_half,
+    yarn_get_mscale,
+)
 
 __all__ = (
     "DeepseekScalingRotaryEmbedding",
@@ -104,20 +114,26 @@ __all__ = (
     "apply_basic_rope",
     "apply_phi3_rope",
     "apply_rope_interleaved",
+    "apply_rope_interleaved_partial",
+    "apply_rope_split_half",
     "compute_basic_frequencies",
     "compute_basic_inv_frequencies",
     "compute_deepseek_frequencies",
     "compute_dynamic_frequencies",
+    "compute_labeled_inv_frequencies",
     "compute_linear_frequencies",
     "compute_llama3_frequencies",
     "compute_llama3_inv_frequencies",
     "compute_phi3_frequencies",
     "compute_yarn_frequencies",
     "compute_yarn_inv_frequencies",
+    "cos_sin_from_inv_frequencies",
     "gather_mla_cos_sin",
     "get_frequencies",
     "get_inv_frequencies",
     "get_rope",
+    "labeled_rope_cos_sin",
+    "partial_rope_frequencies",
     "rotate_half",
     "yarn_get_mscale",
 )

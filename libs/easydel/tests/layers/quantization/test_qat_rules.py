@@ -289,15 +289,15 @@ def test_mixed_precision_config_applies_per_module_overrides(tmp_path):
 def test_a_weight_projection_written_as_an_einsum_still_honours_rules():
     """A projection spelled as an einsum is still a weight matmul.
 
-    ``DeepseekV4GroupedLinear`` is the one layer in the model zoo that
+    ``GroupedLinear`` (DeepSeek-V4 ``o_a_proj``) is the one layer in the model zoo that
     contracts its own parameter rather than delegating to
     :class:`ParallelLinear`. Left alone it would be stamped like every
     other module and silently ignore its plan, so it looks the rule up
     itself; this pins that it does.
     """
-    from easydel.modules.deepseek_v4.modeling_deepseek_v4 import DeepseekV4GroupedLinear
+    from easydel.layers.linears import GroupedLinear
 
-    layer = DeepseekV4GroupedLinear(16, 8, 4, dtype=jnp.float32, param_dtype=jnp.float32, rngs=spx.Rngs(0))
+    layer = GroupedLinear(16, 8, 4, dtype=jnp.float32, param_dtype=jnp.float32, rngs=spx.Rngs(0))
     x = jax.random.normal(jax.random.key(1), (2, 3, 4, 16), jnp.float32)
     baseline = layer(x)
 

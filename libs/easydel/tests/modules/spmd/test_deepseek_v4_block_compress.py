@@ -26,11 +26,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import spectrax as spx
-from easydel.modules.deepseek_v4.modeling_deepseek_v4 import (
-    DeepseekV4RMSNorm,
-    _compressor_decode_step,
-    _compressor_extend_step,
-)
+from easydel.layers import RMSNorm
+from easydel.layers.compressed_window import advance_compressor_stream
+from easydel.layers.rotary import apply_rope_interleaved_partial, labeled_rope_cos_sin
 
 HEAD_DIM = 16
 BLOCK = 7
@@ -85,7 +83,7 @@ def test_block_compress_matches_per_token_decode(rate, two_series):
     kv_all = jnp.asarray(rng.normal(size=(batch, total, feat)), jnp.float32)
     gate_all = jnp.asarray(rng.normal(size=(batch, total, feat)), jnp.float32)
     position_bias = jnp.asarray(rng.normal(size=(rate, feat)) * 0.5, jnp.float32)
-    kv_norm = DeepseekV4RMSNorm(dim=HEAD_DIM, eps=1e-6, dtype=jnp.float32, param_dtype=jnp.float32, rngs=spx.Rngs(0))
+    kv_norm = RMSNorm(dim=HEAD_DIM, eps=1e-6, dtype=jnp.float32, param_dtype=jnp.float32, rngs=spx.Rngs(0))
     rows = jnp.arange(batch)
 
     state0 = dict(
@@ -95,17 +93,23 @@ def test_block_compress_matches_per_token_decode(rate, two_series):
         overlap_kv=jnp.zeros((batch, rate, HEAD_DIM), jnp.float32) if two_series else None,
         overlap_gate=jnp.full((batch, rate, HEAD_DIM), -jnp.inf, jnp.float32) if two_series else None,
     )
-    common = dict(position_bias=position_bias, kv_norm=kv_norm, rate=rate, head_dim=HEAD_DIM, config=config)
+
+    def finalize(pooled, entry):
+        normed = kv_norm(pooled)
+        cos, sin = labeled_rope_cos_sin(config, "compress", (entry * rate).astype(jnp.int32), normed.dtype)
+        return apply_rope_interleaved_partial(normed[:, None], cos, sin, unsqueeze_dim=1)[:, 0]
+
+    common = dict(position_bias=position_bias, rate=rate, finalize=finalize)
 
     def decode(state, start, n_valid, steps):
         for col in range(steps):
             pos = jnp.asarray(start + col, jnp.int32)
             valid = jnp.asarray(col < n_valid)
             take = jnp.clip(pos, 0, total - 1)
-            out = _compressor_decode_step(
-                kv_t=kv_all[rows, take][:, None],
-                gate_t=gate_all[rows, take][:, None],
-                cache_position=pos,
+            out = advance_compressor_stream(
+                kv=kv_all[rows, take][:, None],
+                gate=gate_all[rows, take][:, None],
+                position=pos,
                 valid=valid,
                 **state,
                 **common,
@@ -117,9 +121,9 @@ def test_block_compress_matches_per_token_decode(rate, two_series):
     def extend(state, start, n_valid):
         positions = jnp.asarray(start[:, None] + np.arange(BLOCK)[None, :], jnp.int32)
         take = jnp.clip(positions, 0, total - 1)
-        out = _compressor_extend_step(
-            kv_blk=kv_all[rows[:, None], take],
-            gate_blk=gate_all[rows[:, None], take],
+        out = advance_compressor_stream(
+            kv=kv_all[rows[:, None], take],
+            gate=gate_all[rows[:, None], take],
             positions=positions,
             valid=jnp.asarray(np.arange(BLOCK)[None, :] < n_valid[:, None]),
             **state,

@@ -96,6 +96,7 @@ Example:
     >>> wd_out = wd(activated, group_sizes, sorted_experts)
 """
 
+from ._grouped import GroupedLinear
 from ._linear import ColumnParallelLinear, ParallelLinear, RowParallelLinear
 from ._linear_moe import ColumnParallelMoELinear, ParallelMoELinear, RowParallelMoELinear
 from ._linear_quantized import (
@@ -111,6 +112,7 @@ __all__ = (
     "ColumnParallelLinear",
     "ColumnParallelLinearQuantized",
     "ColumnParallelMoELinear",
+    "GroupedLinear",
     "ParallelLinear",
     "ParallelLinearQuantized",
     "ParallelMoELinear",

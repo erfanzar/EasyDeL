@@ -82,6 +82,23 @@ class ManifoldHyperConnectionConfig:
     initializer: float = 0.02
     use_fused_coefficients: bool = False
 
+    @classmethod
+    def from_model_config(cls, config: tp.Any) -> ManifoldHyperConnectionConfig:
+        """Read the standard ``hc_*`` model-config fields (DeepSeek-V4 / V4.1, GLM-5-Next).
+
+        Maps ``hidden_size``, ``hc_mult``, ``hc_eps``, ``rms_norm_eps`` (flattened-stream norm),
+        ``hc_sinkhorn_iters``, ``initializer_range`` and ``hc_use_fused_coefficients``.
+        """
+        return cls(
+            hidden_size=config.hidden_size,
+            hc_mult=config.hc_mult,
+            eps=config.hc_eps,
+            norm_eps=config.rms_norm_eps,
+            iters=config.hc_sinkhorn_iters,
+            initializer=config.initializer_range,
+            use_fused_coefficients=config.hc_use_fused_coefficients,
+        )
+
 
 def _normalized_flat_streams(x: Array, eps: float) -> Array:
     """Flatten streams and apply unweighted RMSNorm entirely in fp32."""

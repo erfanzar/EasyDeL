@@ -163,6 +163,8 @@ class Qwen3OmniMoeVisionEncoderConfig(EasyDeLBaseConfig):
     """
 
     model_type = "qwen3_omni_moe_vision_encoder"
+    # Matches HF: the vision rotary module only accepts ``rope_type="axial"``.
+    default_rope_type = "axial"
     base_config_key = "vision_config"
 
     def __init__(

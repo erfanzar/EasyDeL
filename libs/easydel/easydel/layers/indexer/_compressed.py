@@ -20,6 +20,7 @@ indices remain compressed-entry offsets; they must never be expanded to tokens.
 
 from __future__ import annotations
 
+import functools
 import typing as tp
 from dataclasses import dataclass
 
@@ -29,7 +30,7 @@ from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Float, Int
 
-from easydel.layers.compressed_window import trace_compressor_stream
+from easydel.layers.compressed_window import advance_compressor_stream, compress_windows, trace_compressor_stream
 from easydel.layers.linears import ColumnParallelLinear
 from easydel.layers.norms import RMSNorm
 
@@ -72,20 +73,16 @@ class CompressedIndexerAdapter(tp.Protocol):
     compression with generic token pooling.
     """
 
-    def compress_windows(self, owner: CompressedIndexer, kv: Array, gate: Array) -> tuple[Array, Array, Array]:
-        """Return rotated compressed keys and the Ca overlap value/gate state."""
+    def finalize_entries(self, owner: CompressedIndexer, pooled: Array, entry: Array) -> Array:
+        """Norm and rotate pooled groups ``[B, G, D]`` (``entry [B, G]``) into stored compressed keys.
+
+        Pooling and the open-group / Ca-Cb overlap state machine are the registered ``gated_pool_compress``
+        operation; only the architecture's entry norm and rotary placement live here.
+        """
         ...
 
     def rotate_queries(self, q: Array, position_ids: Array, dtype: jnp.dtype) -> Array:
         """Rotate projected queries [B,S,H,D], returning the same layout."""
-        ...
-
-    def decode_step(self, **kwargs) -> tuple[Array, Array, Array, Array, Array]:
-        """Advance cache compression; return entries, buffers and overlap state."""
-        ...
-
-    def extend_step(self, **kwargs) -> tuple[Array, Array, Array, Array, Array]:
-        """Block form of :meth:`decode_step` (``kv_blk``/``gate_blk``/``positions``/``valid``); same returns."""
         ...
 
     def entry_visibility(self, positions: Array, cache_position: Array, capacity: int, rate: int) -> Array:
@@ -276,8 +273,13 @@ class CompressedIndexer(BaseIndexer):
         return (indices, index_scores) if return_scores else indices
 
     def _compress_windows(self, kv: Array, gate: Array) -> tuple[Array, Array, Array]:
-        """Delegate window/cache-specific compression, preserving direct parameters."""
-        return self.compressor_adapter.compress_windows(self, kv, gate)
+        """Two-series compressed keys of complete windows plus the last window's Ca overlap state."""
+        out = compress_windows(
+            kv, gate, self.compress_rate, position_bias=self.position_bias.value, series_dim=self.head_dim
+        )
+        batch, groups = out.pooled.shape[:2]
+        entry = jnp.broadcast_to(jnp.arange(groups, dtype=jnp.int32)[None], (batch, groups))
+        return self.compressor_adapter.finalize_entries(self, out.pooled, entry), out.overlap_kv, out.overlap_gate
 
     def _score_queries(
         self,
@@ -389,20 +391,19 @@ class CompressedIndexer(BaseIndexer):
             head_dim=self.head_dim,
             position_bias=self.position_bias.value,
         )
-        entries, buffer_kv, buffer_gate, overlap_kv, overlap_gate = self.compressor_adapter.extend_step(
-            kv_blk=kv_blk,
-            gate_blk=gate_blk,
+        entries, buffer_kv, buffer_gate, overlap_kv, overlap_gate = advance_compressor_stream(
+            kv=kv_blk,
+            gate=gate_blk,
             buffer_kv=cache_view.indexer_buffer_kv,
             buffer_gate=cache_view.indexer_buffer_gate,
             entries=cache_view.indexer_entries,
             position_bias=self.position_bias.value,
-            kv_norm=self.kv_norm,
             positions=positions,
             valid=valid,
             rate=rate,
-            head_dim=self.head_dim,
             overlap_kv=cache_view.indexer_overlap_kv,
             overlap_gate=cache_view.indexer_overlap_gate,
+            finalize=functools.partial(self.compressor_adapter.finalize_entries, self),
         )
         cache_view = cache_view.replace(
             indexer_buffer_kv=buffer_kv,
@@ -543,20 +544,19 @@ class CompressedIndexer(BaseIndexer):
             head_dim=self.head_dim,
             position_bias=self.position_bias.value,
         )
-        entries, buffer_kv, buffer_gate, overlap_kv, overlap_gate = self.compressor_adapter.decode_step(
-            kv_t=kv,
-            gate_t=gate,
+        entries, buffer_kv, buffer_gate, overlap_kv, overlap_gate = advance_compressor_stream(
+            kv=kv,
+            gate=gate,
             buffer_kv=cache_view.indexer_buffer_kv,
             buffer_gate=cache_view.indexer_buffer_gate,
             entries=cache_view.indexer_entries,
             position_bias=self.position_bias.value,
-            kv_norm=self.kv_norm,
-            cache_position=cache_view.cache_position,
+            position=cache_view.cache_position,
             rate=rate,
-            head_dim=self.head_dim,
             overlap_kv=cache_view.indexer_overlap_kv,
             overlap_gate=cache_view.indexer_overlap_gate,
             valid=valid,
+            finalize=functools.partial(self.compressor_adapter.finalize_entries, self),
         )
         cache_view = cache_view.replace(
             indexer_buffer_kv=buffer_kv,

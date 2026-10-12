@@ -72,7 +72,7 @@ from easydel.layers import (
 )
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention, block_diagonal_bias
 from easydel.layers.norms import LayerNorm
-from easydel.layers.rotary import rotate_half
+from easydel.layers.rotary import apply_rope_split_half
 from easydel.modules._base import BaseVisionLanguageModule
 
 from .qwen3_vl_configuration import Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig
@@ -300,45 +300,6 @@ def get_rope_index(
 # is the same algorithm, so bind the module-level name to it rather than
 # restating it. Keeping the name means call sites (and importers) are unchanged.
 merge_multimodal_embeddings = BaseVisionLanguageModule.merge_multimodal_embeddings
-
-
-def apply_rotary_pos_emb_vision(q: Array, k: Array, cos: Array, sin: Array) -> tuple[Array, Array]:
-    """Apply 2-D RoPE to vision query/key tensors.
-
-    Promotes ``q``/``k``/``cos``/``sin`` to float32 before the
-    trigonometric mix to avoid bf16 round-off, applies the canonical
-    ``x * cos + rotate_half(x) * sin`` rotation, and casts the results
-    back to the input dtypes. ``cos``/``sin`` are expanded with a
-    heads-axis dimension before broadcasting.
-
-    Args:
-        q: Query tensor with rotated trailing dim.
-        k: Key tensor with rotated trailing dim.
-        cos: Cosine table broadcastable to ``q``/``k``.
-        sin: Sine table with the same shape as ``cos``.
-
-    Returns:
-        Tuple ``(q_rot, k_rot)`` with rotation applied; shapes/dtypes
-        match the inputs.
-    """
-    orig_q_dtype = q.dtype
-    orig_k_dtype = k.dtype
-    q, k = q.astype("f4"), k.astype("f4")
-    cos, sin = jnp.expand_dims(cos, -2).astype("f4"), jnp.expand_dims(sin, -2).astype("f4")
-    # Rotate only the leading ``cos.shape[-1]`` channels and pass the tail
-    # through. The tower builds its tables as ``concatenate([f, f], -1)``, so
-    # ``rot_dim == head_dim`` and the tail is empty -- this is bit-identical to
-    # rotating the whole tensor (verified 0.000e+00 on that path). Slicing
-    # explicitly is what lets the same function serve a half-width ``cos``,
-    # where multiplying the full tensor raises a broadcasting error instead.
-    rot_dim = cos.shape[-1]
-    q_rot, q_pass = q[..., :rot_dim], q[..., rot_dim:]
-    k_rot, k_pass = k[..., :rot_dim], k[..., rot_dim:]
-    q_embed = jnp.concatenate([(q_rot * cos) + (rotate_half(q_rot) * sin), q_pass], axis=-1)
-    k_embed = jnp.concatenate([(k_rot * cos) + (rotate_half(k_rot) * sin), k_pass], axis=-1)
-    q_embed = q_embed.astype(orig_q_dtype)
-    k_embed = k_embed.astype(orig_k_dtype)
-    return q_embed, k_embed
 
 
 # The packed-vision block-diagonal mask is shared infrastructure; this family
@@ -684,7 +645,8 @@ class Qwen3VLVisionAttention(UnifiedAttention):
 
         cos = jnp.cos(rotary_pos_emb)
         sin = jnp.sin(rotary_pos_emb)
-        q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
+        q = apply_rope_split_half(q, cos, sin)
+        k = apply_rope_split_half(k, cos, sin)
 
         q = jnp.expand_dims(q, 0)
         k = jnp.expand_dims(k, 0)

@@ -64,6 +64,7 @@ from easydel.inference.sampling_params import SamplingParams
 
 VOCAB = 256
 MAX_NEW_TOKENS = 8
+PALIGEMMA_IMAGE_TOKEN = VOCAB - 2
 
 TEXT_PROMPTS = (
     [3, 1, 4, 1, 5, 9, 2, 6],
@@ -84,20 +85,21 @@ def _pin_exact_serving_dtypes(cfg) -> None:
             sub.kvdtype = jnp.float32
 
 
-def _build_model(module_name: str, cfg, task=ed.TaskType.IMAGE_TEXT_TO_TEXT):
+def _build_model(module_name: str, cfg, task=ed.TaskType.IMAGE_TEXT_TO_TEXT, precision=None):
     """Construct a tiny random-init EasyDeL module for serving tests.
 
     Args:
         module_name: Registry model-type name.
         cfg: Model configuration (dtypes are pinned for exact parity).
         task: Registry task the module is registered under.
+        precision: Optional matmul precision for every projection (serving and reference share it).
 
     Returns:
         The eval-mode model instance.
     """
     _pin_exact_serving_dtypes(cfg)
     _, module_class = ed.get_modules_by_type(module_name, task)
-    model = module_class(config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
+    model = module_class(config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32, precision=precision)
     model.eval()
     return model
 
@@ -303,7 +305,9 @@ def _make_paligemma():
     cfg = ed.PaliGemmaConfig(
         vision_config=vision_config,
         text_config=text_config,
-        image_token_index=VOCAB - 1,
+        # Not VOCAB - 1: this random-init model greedily emits 255, and a generated image id would be counted as an
+        # extra placeholder by the teacher-forced reference (5 placeholders vs 4 image embeddings).
+        image_token_index=PALIGEMMA_IMAGE_TOKEN,
         projection_dim=64,
     )
     return _build_model("paligemma", cfg)
@@ -314,7 +318,7 @@ def test_paligemma_esurge_greedy_parity():
     rng = np.random.default_rng(0)
     pixel_values = rng.standard_normal((1, 3, 28, 28)).astype(np.float32)
     # (28 / 14)^2 = 4 image placeholder tokens, image-first prompt layout.
-    mm_prompt = [VOCAB - 1] * 4 + [3, 1, 4, 5, 9, 2]
+    mm_prompt = [PALIGEMMA_IMAGE_TOKEN] * 4 + [3, 1, 4, 5, 9, 2]
     _assert_family_serves(
         model,
         "paligemma",
@@ -408,7 +412,11 @@ def _make_hunyuan_vl():
         im_end_id=VOCAB - 2,
         im_newline_id=VOCAB - 4,
     )
-    return _build_model("hunyuan_vl", cfg)
+    # The multimodal greedy reference has a near-tie (top-2 logit margin ~2e-3 at the 4th token); default TPU
+    # matmul precision lets paged decode and the dense forward pick different sides of it.
+    import jax
+
+    return _build_model("hunyuan_vl", cfg, precision=jax.lax.Precision.HIGHEST)
 
 
 def test_hunyuan_vl_esurge_greedy_parity():

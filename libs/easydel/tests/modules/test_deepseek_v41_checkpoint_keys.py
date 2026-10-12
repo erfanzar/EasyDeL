@@ -29,7 +29,7 @@ from pathlib import Path
 
 import pytest
 from easydel.modules.deepseek_v41 import DeepseekV41Config
-from easydel.modules.deepseek_v41._native_checkpoint import native_key_to_easydel_v41
+from easydel.modules.deepseek_v41.modeling_deepseek_v41 import DEEPSEEK_V41_KEY_RULES
 
 pytestmark = pytest.mark.cpu_ok
 
@@ -66,7 +66,7 @@ def keys() -> list[str]:
 
 @pytest.fixture(scope="module")
 def mapping(keys: list[str]) -> dict[str, str | None]:
-    return {k: native_key_to_easydel_v41(k) for k in keys}
+    return {k: DEEPSEEK_V41_KEY_RULES(k) for k in keys}
 
 
 @pytest.fixture(scope="module")

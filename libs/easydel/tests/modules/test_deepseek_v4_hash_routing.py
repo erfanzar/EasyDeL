@@ -242,12 +242,12 @@ if __name__ == "__main__":
 
 def test_deepseek_packed_training_is_rejected_instead_of_leaking_segments():
     import pytest
-    from easydel.modules.deepseek_v4.modeling_deepseek_v4 import _reject_unsupported_packed_training
+    from easydel.layers.compressed_window import reject_packed_or_padded_batch
     from ejkernel.types import MaskInfo
 
     packed = MaskInfo.from_segments(jnp.array([[0, 0, 1, 1]], jnp.int32))
     with pytest.raises(ValueError, match="packed-document training"):
-        _reject_unsupported_packed_training(packed)
+        reject_packed_or_padded_batch(packed)
     packed_with_mask = type(
         "PackedMask",
         (),
@@ -257,8 +257,8 @@ def test_deepseek_packed_training_is_rejected_instead_of_leaking_segments():
         },
     )()
     with pytest.raises(ValueError, match="packed-document training"):
-        _reject_unsupported_packed_training(packed_with_mask)
-    _reject_unsupported_packed_training(None)
+        reject_packed_or_padded_batch(packed_with_mask)
+    reject_packed_or_padded_batch(None)
 
 
 def test_deepseek_v4_base_model_registry_targets_model_class():
@@ -271,16 +271,16 @@ def test_deepseek_v4_base_model_registry_targets_model_class():
 
 def test_deepseek_padding_mask_is_rejected_until_compressors_are_mask_aware():
     import pytest
-    from easydel.modules.deepseek_v4.modeling_deepseek_v4 import _reject_unsupported_packed_training
+    from easydel.layers.compressed_window import reject_packed_or_padded_batch
     from ejkernel.types import MaskInfo
 
     # Explicit all-valid masks are common trainer inputs and remain supported.
-    _reject_unsupported_packed_training(None, jnp.ones((1, 4), dtype=bool))
-    _reject_unsupported_packed_training(MaskInfo.from_attention_mask(jnp.ones((1, 4), dtype=bool)), None)
+    reject_packed_or_padded_batch(None, jnp.ones((1, 4), dtype=bool))
+    reject_packed_or_padded_batch(MaskInfo.from_attention_mask(jnp.ones((1, 4), dtype=bool)), None)
     with pytest.raises(ValueError, match="padding-mask"):
-        _reject_unsupported_packed_training(None, jnp.array([[0, 1, 1, 1]], dtype=bool))
+        reject_packed_or_padded_batch(None, jnp.array([[0, 1, 1, 1]], dtype=bool))
     with pytest.raises(ValueError, match="padding-mask"):
-        _reject_unsupported_packed_training(MaskInfo.from_attention_mask(jnp.array([[0, 1, 1, 1]], dtype=bool)), None)
+        reject_packed_or_padded_batch(MaskInfo.from_attention_mask(jnp.array([[0, 1, 1, 1]], dtype=bool)), None)
 
 
 def test_deepseek_nonempty_cached_multitoken_prefill_is_rejected():

@@ -30,6 +30,7 @@ from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from jaxtyping import Array, Bool, Float, Int
 
+from easydel.layers.compressed_window import MASK_MIN
 from easydel.layers.linears import ColumnParallelLinear
 from easydel.layers.norms import RMSNorm
 
@@ -43,8 +44,6 @@ __all__ = (
     "selection_bias",
     "shared_key_scores",
 )
-
-_MASK_MIN = float(jnp.finfo(jnp.float32).min)
 
 
 def select_candidate_blocks(
@@ -148,7 +147,7 @@ def selection_bias(topk: Int[Array, "batch seq k"], num_entries: int) -> Float[A
     target = jnp.where(topk >= 0, topk, num_entries)
     opened = jnp.zeros((batch, seq, num_entries), dtype=bool)
     opened = opened.at[jnp.arange(batch)[:, None, None], jnp.arange(seq)[None, :, None], target].set(True, mode="drop")
-    return jnp.where(opened, 0.0, _MASK_MIN).astype(jnp.float32)[:, None]
+    return jnp.where(opened, 0.0, MASK_MIN).astype(jnp.float32)[:, None]
 
 
 @dataclass(frozen=True)

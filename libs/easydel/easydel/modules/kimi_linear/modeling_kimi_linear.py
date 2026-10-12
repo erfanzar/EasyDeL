@@ -28,7 +28,6 @@ References:
 """
 
 import functools
-import re
 import typing
 from functools import cached_property, partial
 from typing import ClassVar
@@ -93,6 +92,7 @@ from easydel.operations.kernels import (
     fused_kda_gate_per_channel,
     kda_packed_rows_forward,
 )
+from easydel.utils.checkpoint_keys import KEEP, KeyRuleSet, Map, Rewrite
 
 from .kimi_linear_configuration import KimiLinearConfig
 
@@ -1615,20 +1615,21 @@ class KimiDecoderLayer(spx.Module):
         )
 
 
-def _kimi_checkpoint_key_normalizer(key: str) -> str | None:
-    """Rewrite Moonshot's published Kimi-Linear keys to the runtime names.
-
-    The hub checkpoint keeps MoE layers under ``block_sparse_moe`` with
-    per-expert ``w1``/``w3``/``w2`` (gate/up/down); the runtime (like
-    transformers' built-in port) names the block ``mlp``. Renamed
-    per-expert tensors are then stacked and fused by the loader.
-    Idempotent on already-converted keys.
-    """
-    key = key.replace(".block_sparse_moe.", ".mlp.")
-    match = _KIMI_EXPERT_KEY.match(key)
-    if match is not None:
-        key = f"{match.group(1)}{_KIMI_EXPERT_NAMES[match.group(2)]}{match.group(3)}"
-    return key
+#: Moonshot's published Kimi-Linear keys keep MoE layers under ``block_sparse_moe`` with per-expert ``w1``/``w3``/``w2``
+#: (gate/up/down); the runtime (like transformers' port) names the block ``mlp``. Renamed per-expert tensors are then
+#: stacked and fused by the loader. Idempotent on converted keys.
+KIMI_LINEAR_KEY_RULES = KeyRuleSet(
+    [
+        Rewrite(r"\.block_sparse_moe\.", ".mlp."),
+        Map(
+            r"(?P<path>.*\.experts\.\d+\.)(?P<w>w1|w2|w3)\.weight",
+            "{path}{w}.weight",
+            rename={"w": {"w1": "gate_proj", "w3": "up_proj", "w2": "down_proj"}},
+        ),
+    ],
+    otherwise=KEEP,
+    name="kimi_linear",
+)
 
 
 def _upgrade_legacy_kda_gate_state(self, state: dict, expected_leaves: dict) -> dict:
@@ -1695,7 +1696,7 @@ class KimiLinearModel(EasyDeLBaseModule):
     """
 
     _upgrade_legacy_native_state = _upgrade_legacy_kda_gate_state
-    _checkpoint_key_normalizer = staticmethod(_kimi_checkpoint_key_normalizer)
+    checkpoint_key_rules: ClassVar[KeyRuleSet] = KIMI_LINEAR_KEY_RULES
 
     def __init__(
         self,
@@ -1994,10 +1995,6 @@ class KimiLinearModel(EasyDeLBaseModule):
         return self.embed_tokens
 
 
-_KIMI_EXPERT_KEY = re.compile(r"^(.*\.experts\.\d+\.)(w1|w2|w3)(\.weight)$")
-_KIMI_EXPERT_NAMES = {"w1": "gate_proj", "w3": "up_proj", "w2": "down_proj"}
-
-
 @register_module(TaskType.CAUSAL_LM, config=KimiLinearConfig, model_type="kimi_linear")
 class KimiLinearForCausalLM(BaseCausalLMModule[KimiLinearModel, KimiLinearConfig]):  # type: ignore
     """Kimi Linear model with a causal language modeling head.
@@ -2022,7 +2019,7 @@ class KimiLinearForCausalLM(BaseCausalLMModule[KimiLinearModel, KimiLinearConfig
     _model_type = "kimi_linear"
     _config_class = KimiLinearConfig
 
-    _checkpoint_key_normalizer = staticmethod(_kimi_checkpoint_key_normalizer)
+    checkpoint_key_rules: ClassVar[KeyRuleSet] = KIMI_LINEAR_KEY_RULES
 
     def __init__(
         self,

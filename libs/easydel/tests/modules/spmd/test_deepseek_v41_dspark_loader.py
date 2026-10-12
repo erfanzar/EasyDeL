@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""``load_deepseek_v41_dspark``: native ``mtp.*`` shards -> DSpark draft model (computation test).
+"""``DeepseekV41DSpark.from_mtp_shards``: native ``mtp.*`` shards -> DSpark draft model (computation test).
 
 Random DSpark parameters are mapped to native ``mtp.N.*`` tensors by the reference oracle's own mapping
 (``tests/modules/_deepseek_v41_reference.py``, independent of the loader), written to a safetensors shard and loaded
@@ -29,7 +29,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import spectrax as spx
-from easydel.modules.deepseek_v41 import DeepseekV41Config, load_deepseek_v41_dspark
+from easydel.modules.deepseek_v41 import DeepseekV41Config, DeepseekV41DSpark
 
 try:
     from tests.modules import _deepseek_v41_reference as ref
@@ -87,7 +87,7 @@ def shard(tmp_path_factory) -> str:
 
 
 def _load(config: DeepseekV41Config, paths: list[str]):
-    return load_deepseek_v41_dspark(
+    return DeepseekV41DSpark.from_mtp_shards(
         config, paths, dtype=jnp.float32, param_dtype=jnp.float32, precision=jax.lax.Precision.HIGHEST
     )
 

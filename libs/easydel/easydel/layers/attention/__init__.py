@@ -35,6 +35,7 @@ patterns are tightly coupled to the attention module's outputs.
 
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 
+from ._compressed_window import CompressedWindowAttention, WindowRingDraftAttentionMixin
 from ._decoder_base import BaseDecoderLayer, blockwise_ffn
 from ._flexible import (
     AttentionMechanisms,
@@ -50,9 +51,11 @@ __all__ = (
     "AttentionMechanisms",
     "AttentionModule",
     "BaseDecoderLayer",
+    "CompressedWindowAttention",
     "FlexibleAttentionModule",
     "MaskInfo",
     "UnifiedAttention",
+    "WindowRingDraftAttentionMixin",
     "block_diagonal_bias",
     "blockwise_ffn",
     "get_optimal_config",

@@ -42,6 +42,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import spectrax as spx
+from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Float
 from spectrax import common_types, nn
 
@@ -204,7 +205,7 @@ class DeepseekV41VisionAttention(spx.Module):
             ).attention_outputs
             chunks.append(chunk_output)
         out = jnp.concatenate(chunks, axis=1).reshape(n, p, -1).astype(hidden_states.dtype)
-        return self.wo(out)
+        return checkpoint_name(self.wo(out), "attn_output")
 
 
 class DeepseekV41VisionMLP(spx.Module):
@@ -227,7 +228,7 @@ class DeepseekV41VisionMLP(spx.Module):
     def forward(self, hidden_states: Array) -> Array:
         """``w2(silu(gate) * up)`` with ``gate, up = chunk(w1(x), 2)``."""
         gate, up = jnp.split(self.w1(hidden_states), 2, axis=-1)
-        return self.w2(jax.nn.silu(gate) * up)
+        return checkpoint_name(self.w2(jax.nn.silu(gate) * up), "mlp_output")
 
 
 class DeepseekV41VisionBlock(spx.Module):

@@ -92,7 +92,7 @@ from easydel.layers import (
     gated_mlp_forward,
     get_frequencies,
 )
-from easydel.layers.rotary._compute_fns import apply_basic_rope
+from easydel.layers.rotary import apply_basic_rope, partial_rope_frequencies
 from easydel.modules.gemma4.modeling_gemma4 import Gemma4RMSNorm
 
 from .configuration_gemma4_assistant import (
@@ -439,54 +439,13 @@ class Gemma4AssistantQOnlyAttention(spx.Module):
         )
         if self.layer_type == "full_attention":
             global_params = self.config.rope_parameters.get("full_attention", {})
-            base = global_params.get("rope_theta", 1_000_000.0)
-            partial_rotary = global_params.get("partial_rotary_factor", 1.0)
-            rope_type = global_params.get("rope_type", "default")
-            head_dim = self.head_dim
-
-            if rope_type == "proportional":
-                rope_angles = int(partial_rotary * head_dim // 2)
-                inv_freq_rotated = 1.0 / (base ** (jnp.arange(0, 2 * rope_angles, 2, dtype=jnp.float32) / head_dim))
-                nope_angles = head_dim // 2 - rope_angles
-                inv_freq = (
-                    jnp.concatenate((inv_freq_rotated, jnp.zeros((nope_angles,), dtype=jnp.float32)), axis=0)
-                    if nope_angles > 0
-                    else inv_freq_rotated
-                )
-                positions = jnp.arange(max_position, dtype=jnp.float32)[:, None]
-                phase = positions * inv_freq[None, :]
-                return jnp.concatenate((jnp.cos(phase), jnp.sin(phase)), axis=-1)
-            if partial_rotary < 1.0:
-                rotated_dim = int(head_dim * partial_rotary)
-                rotated_frequencies = get_frequencies(
-                    head_size=rotated_dim,
-                    rotary_dim=rotated_dim,
-                    max_position=max_position,
-                    base=base,
-                    rope_scaling=None,
-                    partial_rotary_factor=1.0,
-                )
-                rotated_cos, rotated_sin = jnp.split(rotated_frequencies, 2, axis=-1)
-                pass_dim = head_dim // 2 - rotated_cos.shape[-1]
-                return jnp.concatenate(
-                    (
-                        jnp.concatenate(
-                            (rotated_cos, jnp.ones((rotated_cos.shape[0], pass_dim), dtype=rotated_cos.dtype)),
-                            axis=-1,
-                        ),
-                        jnp.concatenate(
-                            (rotated_sin, jnp.zeros((rotated_sin.shape[0], pass_dim), dtype=rotated_sin.dtype)),
-                            axis=-1,
-                        ),
-                    ),
-                    axis=-1,
-                )
-            return get_frequencies(
-                head_size=head_dim,
-                rotary_dim=head_dim,
+            return partial_rope_frequencies(
+                head_dim=self.head_dim,
                 max_position=max_position,
-                base=base,
-                rope_scaling=None,
+                base=global_params.get("rope_theta", 1_000_000.0),
+                partial_rotary_factor=global_params.get("partial_rotary_factor", 1.0),
+                rope_type=global_params.get("rope_type", "default"),
+                factor=global_params.get("factor", 1.0),
             )
 
         local_params = self.config.rope_parameters.get("sliding_attention", {})

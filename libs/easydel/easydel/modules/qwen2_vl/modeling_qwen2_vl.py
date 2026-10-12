@@ -75,7 +75,7 @@ from easydel.layers import (
 )
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention, block_diagonal_bias
 from easydel.layers.norms import LayerNorm
-from easydel.layers.rotary import rotate_half
+from easydel.layers.rotary import apply_rope_split_half
 from easydel.modules._base import BaseVisionLanguageModule
 
 from .qwen2_vl_configuration import Qwen2VLConfig, Qwen2VLTextConfig, Qwen2VLVisionConfig
@@ -286,39 +286,6 @@ create_attention_mask = block_diagonal_bias
 # is the same algorithm, so bind the module-level name to it rather than
 # restating it. Keeping the name means call sites (and importers) are unchanged.
 merge_multimodal_embeddings = BaseVisionLanguageModule.merge_multimodal_embeddings
-
-
-def apply_rotary_pos_emb_vision(
-    q: Array,
-    k: Array,
-    cos: Array,
-    sin: Array,
-) -> tuple[Array, Array]:
-    """Apply rotary positional embedding to vision features.
-
-    Matches HuggingFace's implementation exactly.
-
-    Args:
-        q: Query tensor of shape (seq_len, num_heads, head_dim)
-        k: Key tensor of shape (seq_len, num_heads, head_dim)
-        cos: Cosine embeddings of shape (seq_len, head_dim)
-        sin: Sine embeddings of shape (seq_len, head_dim)
-
-    Returns:
-        Tuple of (q_embed, k_embed) with same shapes as inputs.
-    """
-    orig_q_dtype = q.dtype
-    orig_k_dtype = k.dtype
-    q = q.astype("f4")
-    k = k.astype("f4")
-    # unsqueeze(-2) adds a dimension at axis -2 (before last)
-    cos = jnp.expand_dims(cos, axis=-2).astype("f4")  # (seq_len, 1, head_dim)
-    sin = jnp.expand_dims(sin, axis=-2).astype("f4")  # (seq_len, 1, head_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    q_embed = q_embed.astype(orig_q_dtype)
-    k_embed = k_embed.astype(orig_k_dtype)
-    return q_embed, k_embed
 
 
 class Qwen2VLPatchEmbed(spx.Module):
@@ -751,7 +718,8 @@ class Qwen2VLVisionAttention(UnifiedAttention):
             ),
         )
         cos, sin = position_embeddings
-        q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
+        q = apply_rope_split_half(q, cos, sin)
+        k = apply_rope_split_half(k, cos, sin)
         # Match HF: process each segment defined by cu_seqlens separately
         q = q.swapaxes(0, 1)[None, ...]  # (1, num_heads, seq, head_dim)
         k = k.swapaxes(0, 1)[None, ...]

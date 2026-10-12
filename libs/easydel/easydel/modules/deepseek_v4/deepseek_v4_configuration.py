@@ -423,8 +423,10 @@ class DeepseekV4Config(EasyDeLBaseConfig):
             for layer_idx in range(self.num_hidden_layers)
         }
 
-    def v4_rope_params(self, label: str) -> dict:
+    def rope_parameters_for_label(self, label: str) -> dict:
         """Return the rope-parameter sub-dict for a rope-type label.
+
+        This is the accessor :func:`easydel.layers.rotary.labeled_rope_cos_sin` reads.
 
         Args:
             label: Either ``"main"`` (sliding layers) or ``"compress"``
@@ -445,6 +447,8 @@ class DeepseekV4Config(EasyDeLBaseConfig):
         if isinstance(sub, dict):
             return sub
         raise KeyError(f"DeepSeek-V4 rope parameters for label {label!r} not found.")
+
+    v4_rope_params = rope_parameters_for_label
 
 
 __all__ = ["DeepseekV4Config"]

@@ -498,4 +498,37 @@ class DSparkDrafter:
         raise NotImplementedError(f"{type(self).__name__} drafts whole windows via `draft_window`.")
 
 
-__all__ = ["DSparkDrafter", "DSparkState", "pad_pow2"]
+def register_dspark_drafter(name: str, *aliases: str) -> tp.Callable[[type[DSparkDrafter]], type[DSparkDrafter]]:
+    """Class decorator registering a :class:`DSparkDrafter` subclass under ``name`` (and ``aliases``).
+
+    The registered builder takes the draft model from ``drafter_model=`` (or the ``assistant_model`` slot of
+    ``eSurgeDrafterConfig``): ``model.drafter(method=name, drafter_model=<DSpark draft model>)``.
+    """
+    from easydel.infra.spec_decode import register_drafter
+
+    def decorate(drafter_cls: type[DSparkDrafter]) -> type[DSparkDrafter]:
+        @register_drafter(name, *aliases)
+        def _build(
+            target_model: tp.Any,
+            *,
+            num_draft_tokens: int = 1,
+            assistant_model: tp.Any | None = None,
+            target_embed_module: tp.Any | None = None,
+            layer_mapping: list[int] | None = None,
+            target_config: tp.Any | None = None,
+            drafter_model: tp.Any | None = None,
+            **kwargs: tp.Any,
+        ) -> DSparkDrafter:
+            del target_embed_module, layer_mapping, target_config
+            dspark = drafter_model if drafter_model is not None else assistant_model
+            if dspark is None:
+                raise ValueError(f"method={name!r} requires drafter_model=<DSpark draft model>.")
+            return drafter_cls(target_model=target_model, dspark=dspark, num_draft_tokens=num_draft_tokens, **kwargs)
+
+        _build.__name__ = f"_build_{name}_drafter"
+        return drafter_cls
+
+    return decorate
+
+
+__all__ = ["DSparkDrafter", "DSparkState", "pad_pow2", "register_dspark_drafter"]

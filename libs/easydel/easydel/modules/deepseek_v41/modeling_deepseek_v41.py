@@ -79,24 +79,32 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import MoeCausalLMOutput, MoeModelOutput, VLMCausalLMOutput
 from easydel.infra.utils import ArrayParam, auto_remat
-from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear, clamped_swiglu
+from easydel.layers import Embed, RMSNorm, clamped_swiglu
+from easydel.layers.attention import CompressedWindowAttention
 from easydel.layers.compressed_window import (
+    DECODE_ATTEND_PLATFORM,
+    MASK_MIN,
+    TRAIN_ATTEND_PLATFORM,
     GatedPoolCompressor,
     GatedPoolCompressorConfig,
+    PackedSlotMeta,
     block_sink_attention,
     block_token_bias,
+    build_packed_slot_meta,
     gather_selected_entries,
     grid_to_tokens,
     occupied_columns,
     packed_block_size,
+    packed_row_of_token,
+    raise_if_runtime_true,
+    reject_packed_or_padded_batch,
     ring_prefill_write,
     ring_slot_positions,
     ring_visibility_bias,
     run_column_blocks,
-    sink_attention,
     tokens_to_grid,
 )
-from easydel.layers.engram import EngramModelMixin, GatedEngram
+from easydel.layers.engram import ENGRAM_TABLE_KEY_RE, EngramModelMixin, GatedEngram
 from easydel.layers.indexer import (
     IndexerScoreInputs,
     SharedKeyIndexer,
@@ -104,29 +112,23 @@ from easydel.layers.indexer import (
     select_candidate_blocks,
     selection_bias,
 )
-from easydel.layers.residual import manifold_collapse, manifold_residual_write
+from easydel.layers.residual import (
+    HyperStreamSharding,
+    ManifoldHyperConnection,
+    ManifoldHyperConnectionConfig,
+    manifold_collapse,
+    manifold_residual_write,
+)
+from easydel.layers.rotary import apply_rope_interleaved_partial, labeled_rope_cos_sin
 from easydel.modules._base import BaseCausalLMModule, BaseVisionLanguageModule
 from easydel.modules.deepseek_v4.modeling_deepseek_v4 import (
-    _DECODE_KERNEL_PLATFORM,
-    _MASK_MIN,
-    _TRAIN_KERNEL_ENABLED,
-    _TRAIN_KERNEL_PLATFORM,
-    DeepseekV4GroupedLinear,
-    DeepseekV4HyperConnection,
-    DeepseekV4PackedMeta,
-    DeepseekV4RMSNorm,
+    DEEPSEEK_V4_KEY_RULES,
+    DEEPSEEK_V4_LEAF_ALIASES,
     DeepseekV4SparseMoeBlock,
-    _apply_interleaved_rope,
-    _build_packed_meta,
-    _HyperStreamSharding,
-    _raise_if_runtime_true,
-    _reject_unsupported_packed_training,
-    _rope_cos_sin,
+    mtp_stage_block_rule,
 )
-from easydel.operations import OperationMetadata
-from easydel.operations.kernels import CompressedWindowAttn, CompressedWindowDecodeAttn
+from easydel.utils.checkpoint_keys import KEEP, KeyRuleSet, Map
 
-from ._native_checkpoint import native_key_to_easydel_v41, native_key_to_easydel_v41_vl
 from .deepseek_v41_configuration import DeepseekV41Config
 from .modeling_deepseek_v41_vision import (
     TOKEN_TYPE_IMAGE,
@@ -136,6 +138,12 @@ from .modeling_deepseek_v41_vision import (
     DeepseekV41Aligner,
     DeepseekV41VisionModel,
 )
+
+# Attend platforms (shared defaults in ``easydel.layers.compressed_window``); module globals so tests can pin a
+# backend per family.
+_DECODE_KERNEL_PLATFORM = DECODE_ATTEND_PLATFORM
+_TRAIN_KERNEL_ENABLED = True
+_TRAIN_KERNEL_PLATFORM = TRAIN_ATTEND_PLATFORM
 
 _SharedState = dict[str, Array | None]
 _SHARED_KEYS = ("compress_kv", "index_k", "topk", "candidates", "indexer_aux")
@@ -177,7 +185,7 @@ class _CedCompactPlan(tp.NamedTuple):
     """
 
     token_index: Array
-    meta: DeepseekV4PackedMeta
+    meta: PackedSlotMeta
     col_offset: Array
 
 
@@ -212,12 +220,12 @@ def _ced_compact_plan(
     qsl = query_start_loc.astype(jnp.int32).reshape(-1)
     num_rows = qsl.shape[0] - 1
     token_idx = jnp.arange(total, dtype=jnp.int32)
-    row_of_token = jnp.clip(jnp.searchsorted(qsl, token_idx, side="right") - 1, 0, num_rows - 1)
+    row_of_token = packed_row_of_token(qsl, token_idx)
     live_per_row = jax.ops.segment_sum(live.astype(jnp.int32), row_of_token, num_segments=num_rows)
     new_qsl = jnp.concatenate([jnp.zeros((1,), jnp.int32), jnp.cumsum(live_per_row).astype(jnp.int32)])
     index = jnp.flatnonzero(live, size=length, fill_value=total).astype(jnp.int32)
     positions = jnp.take(position_ids.astype(jnp.int32).reshape(-1), index, mode="clip")[None]
-    meta = _build_packed_meta(
+    meta = build_packed_slot_meta(
         query_start_loc=new_qsl,
         num_seqs=num_seqs,
         recurrent_state_indices=recurrent_state_indices,
@@ -329,7 +337,7 @@ class DeepseekV41Indexer(SharedKeyIndexer):
     def index_keys(self, latent: Array, cos: Array, sin: Array) -> Array:
         """Index keys ``[B, T, index_head_dim]`` from the KV source's pre-RoPE latent, roped at group positions."""
         return self.keys_from_latent(
-            latent, lambda keys: _apply_interleaved_rope(keys[:, None], cos, sin, unsqueeze_dim=1)[:, 0]
+            latent, lambda keys: apply_rope_interleaved_partial(keys[:, None], cos, sin, unsqueeze_dim=1)[:, 0]
         )
 
     def forward(
@@ -355,7 +363,7 @@ class DeepseekV41Indexer(SharedKeyIndexer):
             hidden_states,
             q_residual,
             index_k,
-            lambda q: _apply_interleaved_rope(q, cos, sin, unsqueeze_dim=2),
+            lambda q: apply_rope_interleaved_partial(q, cos, sin, unsqueeze_dim=2),
             candidates,
             positions,
             return_scores=return_scores,
@@ -374,7 +382,7 @@ def _window_token_bias(token_valid: Bool[Array, "batch seq"], window: int) -> Fl
     q_idx = jnp.arange(seq)[:, None]
     k_idx = jnp.arange(seq)[None, :]
     allowed = ((k_idx <= q_idx) & (k_idx > q_idx - window))[None, None] & token_valid.astype(bool)[:, None, None, :]
-    return jnp.where(allowed, 0.0, _MASK_MIN).astype(jnp.float32)
+    return jnp.where(allowed, 0.0, MASK_MIN).astype(jnp.float32)
 
 
 def indexer_distillation_loss(
@@ -469,15 +477,15 @@ def indexer_distillation_loss(
         k_pos = lo + jnp.arange(span, dtype=jnp.int32)[None, :]
         allowed = ((k_pos <= q_pos) & (k_pos > q_pos - window))[None] & key_ok[:, None, :]  # [B, tile, span]
         window_logits = jnp.einsum("bhsd,btd->bhst", q_t, k_t, precision=precision).astype(jnp.float32) * scaling
-        window_logits = jnp.where(allowed[:, None], window_logits, _MASK_MIN)
+        window_logits = jnp.where(allowed[:, None], window_logits, MASK_MIN)
         entry_logits = jnp.einsum("bhsd,btd->bhst", q_t, entries, precision=precision).astype(jnp.float32)
-        entry_logits = jnp.where(reach_t[:, None], entry_logits * scaling, _MASK_MIN)
+        entry_logits = jnp.where(reach_t[:, None], entry_logits * scaling, MASK_MIN)
         sinks_t = jnp.broadcast_to(sink, (batch, heads, tile, 1))
         combined = jnp.concatenate([window_logits, entry_logits, sinks_t], axis=-1)
         probs = jax.nn.softmax(combined - jnp.max(combined, axis=-1, keepdims=True), axis=-1)
         target = jnp.sum(probs[..., span : span + num_entries], axis=1)  # [B, tile, T], summed over heads
         target = jax.lax.stop_gradient(target / jnp.maximum(jnp.sum(target, axis=-1, keepdims=True), 1e-30))
-        log_pred = jax.nn.log_softmax(jnp.where(reach_t, scores_t, _MASK_MIN).astype(jnp.float32), axis=-1)
+        log_pred = jax.nn.log_softmax(jnp.where(reach_t, scores_t, MASK_MIN).astype(jnp.float32), axis=-1)
         positive = target > 0
         kl = jnp.sum(jnp.where(positive, target * (jnp.log(jnp.where(positive, target, 1.0)) - log_pred), 0.0), axis=-1)
         row_valid = jnp.any(reach_t, axis=-1).astype(jnp.float32)
@@ -487,7 +495,7 @@ def indexer_distillation_loss(
     return jnp.sum(kl_sums) / jnp.maximum(jnp.sum(counts), 1.0)
 
 
-class DeepseekV41Attention(spx.Module):
+class DeepseekV41Attention(CompressedWindowAttention):
     """Shared-KV MQA with sinks over a sliding window plus indexer-selected compressed entries.
 
     Query ``q_b_proj(q_a_norm(q_a_proj(x)))`` (no per-head norm), single KV head ``kv_norm(kv_proj(x))`` used as
@@ -505,34 +513,16 @@ class DeepseekV41Attention(spx.Module):
         *,
         rngs: spx.Rngs,
     ):
-        self.config = config
-        self.layer_idx = layer_idx
-        self.precision = precision
-        self.ratio = config.layer_compress_ratio(layer_idx)
-        self.rope_label = config.rope_label(layer_idx)
-        self.num_heads = config.num_attention_heads
-        self.head_dim = config.head_dim
-        self.sliding_window = config.sliding_window
-        self.scaling = self.head_dim**-0.5
-        kwargs = _linear_kwargs(config, dtype, param_dtype, precision, rngs)
-        norm_kwargs = dict(eps=config.rms_norm_eps, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
-        self.q_a_proj = ColumnParallelLinear(config.hidden_size, config.q_lora_rank, **kwargs)
-        self.q_a_norm = DeepseekV4RMSNorm(dim=config.q_lora_rank, **norm_kwargs)
-        self.q_b_proj = ColumnParallelLinear(config.q_lora_rank, self.num_heads * self.head_dim, **kwargs)
-        self.kv_proj = ColumnParallelLinear(config.hidden_size, self.head_dim, **kwargs)
-        self.kv_norm = DeepseekV4RMSNorm(dim=self.head_dim, **norm_kwargs)
-        self.o_a_proj = DeepseekV4GroupedLinear(
-            self.num_heads * self.head_dim // config.o_groups,
-            config.o_lora_rank,
-            config.o_groups,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+        super().__init__(
+            config,
+            dtype,
+            param_dtype,
+            precision,
             rngs=rngs,
+            layer_idx=layer_idx,
+            rope_label=config.rope_label(layer_idx),
         )
-        self.o_b_proj = RowParallelLinear(config.o_groups * config.o_lora_rank, config.hidden_size, **kwargs)
-        self.sinks = ArrayParam.bound(shape=(self.num_heads,), dtype=param_dtype, init_method="zeros", key=rngs.param)
+        self.ratio = config.layer_compress_ratio(layer_idx)
         layer_kwargs = dict(dtype=dtype, param_dtype=param_dtype, precision=precision, rngs=rngs)
         self.compressor = (
             DeepseekV41Compressor(config, layer_idx, **layer_kwargs) if config.is_kv_source(layer_idx) else None
@@ -540,13 +530,6 @@ class DeepseekV41Attention(spx.Module):
         self.indexer = (
             DeepseekV41Indexer(config, layer_idx, **layer_kwargs) if config.is_index_source(layer_idx) else None
         )
-        metadata = OperationMetadata(runtime_dtype=dtype, runtime_softmax_dtype=jnp.float32, base_config=config)
-        self.attn_op = CompressedWindowAttn(metadata)
-        self.decode_op = CompressedWindowDecodeAttn(metadata)
-
-    def _dense_attend(self, q: Array, kv: Array, attn_bias: Array) -> Array:
-        """Sink-augmented shared-KV attention ``[B, H, S, D]`` (shared :func:`sink_attention`)."""
-        return sink_attention(q, kv, attn_bias, self.sinks.value, scaling=self.scaling, precision=self.precision)
 
     def _attend(self, q: Array, kv: Array, token_valid: Array, entry_topk: Array | None) -> Array:
         """Full-sequence attention over ``[own token KVs | compressed entries]``.
@@ -558,7 +541,16 @@ class DeepseekV41Attention(spx.Module):
             entry_topk: Selected entry ids ``[B, S, k]`` (``-1`` padded), or ``None`` when there are no entries.
         """
         if _TRAIN_KERNEL_ENABLED:
-            return self._fused_attend(q, kv, token_valid, entry_topk)
+            # The op builds the window / causal / padding mask from token_valid and the entry selection from
+            # entry_topk, so neither a [B, S, S] nor a [B, S, T] bias (or its cotangent) is materialised.
+            return self.fused_full_attend(
+                q,
+                kv,
+                jnp.zeros((q.shape[0], q.shape[2], 0), jnp.float32),
+                platform=_TRAIN_KERNEL_PLATFORM,
+                token_valid=token_valid,
+                entry_topk=entry_topk,
+            )
         batch, _, seq, _ = q.shape
         num_entries = kv.shape[1] - seq
         token_bias = _window_token_bias(token_valid, self.sliding_window)
@@ -566,45 +558,7 @@ class DeepseekV41Attention(spx.Module):
             entry_bias = jnp.zeros((batch, 1, seq, num_entries), jnp.float32)
         else:
             entry_bias = selection_bias(entry_topk, num_entries)
-        return self._dense_attend(q, kv, jnp.concatenate([token_bias, entry_bias], axis=-1))
-
-    def _fused_attend(self, q: Array, kv: Array, token_valid: Array, entry_topk: Array | None) -> Array:
-        """Same math through the registered :class:`CompressedWindowAttn` op (Pallas on TPU, exact XLA elsewhere).
-
-        The op builds the token-region window / causal / padding mask from ``token_valid`` and the entry selection
-        from ``entry_topk``, so neither a ``[B, S, S]`` nor a ``[B, S, T]`` bias (or its cotangent) is materialised
-        here; the head-parallel ``shard_map`` is built by the adapter from the metadata.
-        """
-        batch, _, seq, _ = q.shape
-        return self.attn_op(
-            q,
-            kv,
-            jnp.zeros((batch, seq, 0), jnp.float32),
-            self.sinks.value.astype(jnp.float32),
-            softmax_scale=self.scaling,
-            window=self.sliding_window,
-            token_kv_len=seq,
-            platform=_TRAIN_KERNEL_PLATFORM,
-            token_valid=token_valid,
-            entry_topk=entry_topk,
-        ).attention_outputs
-
-    def _decode_attend(self, q: Array, keys: Array, bias: Array) -> Array:
-        """Single-query attention over ring + gathered entries via the registered :class:`CompressedWindowDecodeAttn`.
-
-        Args:
-            q: ``[B, H, 1, D]``.
-            keys: ``[B, L, D]`` (``K == V``).
-            bias: Additive fp32 bias ``[B, L]``.
-        """
-        return self.decode_op(
-            q,
-            keys,
-            bias[:, None, :],
-            self.sinks.value.astype(jnp.float32),
-            softmax_scale=self.scaling,
-            platform=_DECODE_KERNEL_PLATFORM,
-        ).attention_outputs
+        return self.sink_attend(q, kv, jnp.concatenate([token_bias, entry_bias], axis=-1))
 
     def _write_window_prefill(self, view: SharedCompressedWindowCacheView, kv: Array) -> SharedCompressedWindowCacheView:
         """Seed the ring with the last ``sliding_window`` post-RoPE token KVs of a prefill from position 0."""
@@ -670,9 +624,9 @@ class DeepseekV41Attention(spx.Module):
             )
             view = self._write_trace(view, projections, position[:, None], live[:, None])
         # A latent stands for the first token of its group: group g is roped at position g * ratio.
-        cos_g, sin_g = _rope_cos_sin(self.config, "compress", (entry * ratio)[:, None], dtype)
+        cos_g, sin_g = labeled_rope_cos_sin(self.config, "compress", (entry * ratio)[:, None], dtype)
         target = jnp.where(closed, entry, view.compressed_kv.shape[1])
-        compressed = _apply_interleaved_rope(latent[:, None], cos_g, sin_g, unsqueeze_dim=1)[:, 0, 0]
+        compressed = apply_rope_interleaved_partial(latent[:, None], cos_g, sin_g, unsqueeze_dim=1)[:, 0, 0]
         # Pin the small update rows and the buffers to the cache's slot layout around the scatter: otherwise the tp
         # sharding of the projections leaks into the cache buffers and every step all-gathers them (measured:
         # [8, 262144, 32] -> [8, 262144, 128] gathers, 16% of decode). Same fix as
@@ -773,13 +727,13 @@ class DeepseekV41Attention(spx.Module):
                 if latent is not None:
                     groups = latent.shape[1]
                     group_positions = position_ids[:, : groups * self.ratio : self.ratio]
-                    cos_g, sin_g = _rope_cos_sin(self.config, "compress", group_positions, hidden_states.dtype)
+                    cos_g, sin_g = labeled_rope_cos_sin(self.config, "compress", group_positions, hidden_states.dtype)
                     # The indexer reads the latent before RoPE, so its keys are built first.
                     if self.indexer is not None and self.indexer.owns_keys:
                         # With the auxiliary objective the latent is detached: only wk / k_norm learn from it.
                         key_latent = jax.lax.stop_gradient(latent) if aux_active else latent
                         index_k = self.indexer.index_keys(key_latent, cos_g, sin_g)
-                    compress_kv = _apply_interleaved_rope(latent[:, None], cos_g, sin_g, unsqueeze_dim=1)[:, 0]
+                    compress_kv = apply_rope_interleaved_partial(latent[:, None], cos_g, sin_g, unsqueeze_dim=1)[:, 0]
                 shared["compress_kv"] = compress_kv
                 shared["index_k"] = index_k
                 if cache_view is not None:
@@ -887,7 +841,7 @@ class DeepseekV41Attention(spx.Module):
                 gathered, gathered_bias = gather_selected_entries(entries, topk)  # [B, k, D], [B, k]
                 keys = jnp.concatenate([keys, gathered.astype(kv.dtype)], axis=1)
                 bias = jnp.concatenate([bias, gathered_bias], axis=-1)
-        attn_output = self._decode_attend(q, keys, bias)
+        attn_output = self.fused_decode_attend(q, keys, bias[:, None, :], platform=_DECODE_KERNEL_PLATFORM)
         view = view.replace(cache_position=jnp.where(live, position + 1, old_position))
         return attn_output, shared, view
 
@@ -924,9 +878,9 @@ class DeepseekV41Attention(spx.Module):
                 compressor_kv_state=self._replicate(kv_state), compressor_score_state=self._replicate(score_state)
             )
             view = self._write_trace(view, projections, positions, valid)
-        cos_g, sin_g = _rope_cos_sin(self.config, "compress", entry * ratio, dtype)
+        cos_g, sin_g = labeled_rope_cos_sin(self.config, "compress", entry * ratio, dtype)
         target = jnp.where(closed, entry, view.compressed_kv.shape[1])
-        compressed = _apply_interleaved_rope(latent[:, None], cos_g, sin_g, unsqueeze_dim=1)[:, 0]
+        compressed = apply_rope_interleaved_partial(latent[:, None], cos_g, sin_g, unsqueeze_dim=1)[:, 0]
         updates = {
             "compressed_kv": self._slot(
                 view.compressed_kv.at[rows, target].set(
@@ -1040,7 +994,7 @@ class DeepseekV41Attention(spx.Module):
         sin: Array,
         shared: _SharedState,
         view: SharedCompressedWindowCacheView,
-        meta: DeepseekV4PackedMeta,
+        meta: PackedSlotMeta,
     ) -> tuple[Array, _SharedState, SharedCompressedWindowCacheView]:
         """eSurge packed serving through the shared packed driver (``layers.compressed_window``).
 
@@ -1207,22 +1161,16 @@ class DeepseekV41Attention(spx.Module):
         token_valid: Bool[Array, "batch seq"] | None,
         shared: _SharedState,
         cache_view: SharedCompressedWindowCacheView | None = None,
-        packed_meta: DeepseekV4PackedMeta | None = None,
+        packed_meta: PackedSlotMeta | None = None,
     ) -> tuple[Array, _SharedState, SharedCompressedWindowCacheView | None]:
         """Attention; returns the output, the updated cross-layer state and the updated cache view."""
-        batch, seq, _ = hidden_states.shape
+        _, seq, _ = hidden_states.shape
         cos, sin = position_embeddings[self.rope_label]
-        q_residual = self.q_a_norm(self.q_a_proj(hidden_states))
-        q = self.q_b_proj(q_residual).reshape(batch, seq, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        q = _apply_interleaved_rope(q, cos, sin, unsqueeze_dim=1)
-        kv = self.kv_proj(hidden_states)
-        if cache_view is not None:
-            # Serving: gather the single KV head (a few KB per token) once. Left column-sharded over tp, the RoPE cut at
-            # 448/64 channels falls inside a 128-channel shard and XLA reshuffles it through two tp all-to-alls plus
-            # relayout copies per layer (~0.73 ms of a V4.1 tp=4 decode step). Layout only; the math is unchanged.
-            kv = self._replicate(kv)
-        kv = self.kv_norm(kv)[:, None]
-        kv = _apply_interleaved_rope(kv, cos, sin, unsqueeze_dim=1)[:, 0]
+        q_residual, q = self.project_query(hidden_states, cos, sin)
+        # Serving: gather the single KV head (a few KB per token) once. Left column-sharded over tp, the RoPE cut at
+        # 448/64 channels falls inside a 128-channel shard and XLA reshuffles it through two tp all-to-alls plus
+        # relayout copies per layer (~0.73 ms of a V4.1 tp=4 decode step). Layout only; the math is unchanged.
+        kv = self.project_kv(hidden_states, cos, sin, layout=self._replicate if cache_view is not None else None)
 
         if cache_view is not None and packed_meta is not None:
             attn_output, shared, cache_view = self._packed(
@@ -1239,10 +1187,8 @@ class DeepseekV41Attention(spx.Module):
         if cache_view is not None:
             # One fixed cache layout for every step shape (eSurge compiles several buckets over the same buffers).
             cache_view = cache_view.constrain_layout(getattr(self.config, "mesh", None))
-        # K == V carries RoPE: undo it on the output's rope slice at the query positions.
-        attn_output = _apply_interleaved_rope(attn_output.transpose(0, 2, 1, 3), cos, -sin, unsqueeze_dim=2)
-        grouped = self.o_a_proj(attn_output.reshape(batch, seq, self.config.o_groups, -1)).reshape(batch, seq, -1)
-        return checkpoint_name(self.o_b_proj(grouped), "attn_output"), shared, cache_view
+        # K == V carries RoPE: project_output undoes it at the query positions, then the grouped output projection.
+        return self.project_output(attn_output.transpose(0, 2, 1, 3), cos, sin), shared, cache_view
 
 
 class DeepseekV41SparseMoeBlock(DeepseekV4SparseMoeBlock):
@@ -1376,10 +1322,14 @@ class DeepseekV41DecoderLayer(spx.Module):
         norm_kwargs = dict(dim=config.hidden_size, eps=config.rms_norm_eps, dtype=dtype, param_dtype=param_dtype)
         self.self_attn = DeepseekV41Attention(config, layer_idx, **layer_kwargs)
         self.mlp = DeepseekV41SparseMoeBlock(config, layer_idx, image_router_bias=image_router_bias, **layer_kwargs)
-        self.input_layernorm = DeepseekV4RMSNorm(**norm_kwargs, rngs=rngs)
-        self.post_attention_layernorm = DeepseekV4RMSNorm(**norm_kwargs, rngs=rngs)
-        self.attn_hc = DeepseekV4HyperConnection(config, **layer_kwargs)
-        self.ffn_hc = DeepseekV4HyperConnection(config, **layer_kwargs)
+        self.input_layernorm = RMSNorm(**norm_kwargs, rngs=rngs)
+        self.post_attention_layernorm = RMSNorm(**norm_kwargs, rngs=rngs)
+        self.attn_hc = ManifoldHyperConnection(
+            ManifoldHyperConnectionConfig.from_model_config(config), **layer_kwargs, mesh_source=config
+        )
+        self.ffn_hc = ManifoldHyperConnection(
+            ManifoldHyperConnectionConfig.from_model_config(config), **layer_kwargs, mesh_source=config
+        )
         self.engram = (
             GatedEngram.from_config(config, layer_idx, **layer_kwargs) if layer_idx in config.engram_layer_ids else None
         )
@@ -1397,7 +1347,7 @@ class DeepseekV41DecoderLayer(spx.Module):
         engram_rows: Array | None = None,
         engram_scales: Array | None = None,
         cache_view: SharedCompressedWindowCacheView | None = None,
-        packed_meta: DeepseekV4PackedMeta | None = None,
+        packed_meta: PackedSlotMeta | None = None,
         image_mask: Bool[Array, "batch seq"] | None = None,
         capture_main_hidden: bool = False,
     ) -> tuple[Array, Array, _SharedState, Array | None, SharedCompressedWindowCacheView | None, Array | None]:
@@ -1531,7 +1481,7 @@ class DeepseekV41Model(EngramModelMixin, EasyDeLBaseModule):
                     )
                 )
         with self.assign_layer_stage(max(0, num_layers - 1), total_layers=num_layers):
-            self.norm = DeepseekV4RMSNorm(
+            self.norm = RMSNorm(
                 dim=config.hidden_size, eps=config.rms_norm_eps, dtype=dtype, param_dtype=param_dtype, rngs=rngs
             )
 
@@ -1632,7 +1582,7 @@ class DeepseekV41Model(EngramModelMixin, EasyDeLBaseModule):
             # eSurge packed multi-request stream against per-slot cache rows.
             if position_ids is None:
                 raise ValueError("Packed eSurge serving requires explicit position_ids for the token stream.")
-            packed_meta = _build_packed_meta(
+            packed_meta = build_packed_slot_meta(
                 query_start_loc=packed_qsl,
                 num_seqs=packed_num_seqs,
                 recurrent_state_indices=getattr(cache_metadata, "recurrent_state_indices", None),
@@ -1644,9 +1594,9 @@ class DeepseekV41Model(EngramModelMixin, EasyDeLBaseModule):
                 position_ids = views[0].cache_position.astype(jnp.int32)[:, None]
         else:
             if seq > 1:
-                _reject_unsupported_packed_training(mask_info, attention_mask)
+                reject_packed_or_padded_batch(mask_info, attention_mask, family="DeepSeek-V4.1")
             if cached:
-                _raise_if_runtime_true(
+                raise_if_runtime_true(
                     jnp.any(views[0].cache_position != 0),
                     "DeepSeek-V4.1 cached multi-token prefill requires an empty cache; decode one token at a time.",
                 )
@@ -1667,13 +1617,14 @@ class DeepseekV41Model(EngramModelMixin, EasyDeLBaseModule):
             )
 
         position_embeddings = {
-            label: _rope_cos_sin(config, label, position_ids, inputs_embeds.dtype) for label in ("main", "compress")
+            label: labeled_rope_cos_sin(config, label, position_ids, inputs_embeds.dtype)
+            for label in ("main", "compress")
         }
         hidden_streams = jnp.broadcast_to(
             inputs_embeds[:, :, None, :], (batch, seq, config.hc_mult, config.hidden_size)
         ).astype(inputs_embeds.dtype)
         hidden_streams = apply_logical_sharding(
-            hidden_streams, dynamic_axes=_HyperStreamSharding, partition_manager=config.runtime_sharding_resolver
+            hidden_streams, dynamic_axes=HyperStreamSharding, partition_manager=config.runtime_sharding_resolver
         )
         # Layer 0 collapses with a one-hot read of the first stream (reference `make_identity_pre_mix`).
         pre_mix = jnp.zeros((batch, seq, config.hc_mult), dtype=jnp.float32).at[..., 0].set(1.0)
@@ -1797,13 +1748,13 @@ class DeepseekV41Model(EngramModelMixin, EasyDeLBaseModule):
                 if c_state.get(key) is not None:
                     c_state[key] = _ced_shift_grid(c_state[key], plan.col_offset)
             c_streams = apply_logical_sharding(
-                take(streams), dynamic_axes=_HyperStreamSharding, partition_manager=config.runtime_sharding_resolver
+                take(streams), dynamic_axes=HyperStreamSharding, partition_manager=config.runtime_sharding_resolver
             )
             c_streams, c_pre, tail_views, c_caps = _run_tail(c_streams, take(pre), tail_views, c_state, inputs)
             idx = plan.token_index
             streams = streams.at[:, idx].set(c_streams.astype(streams.dtype), mode="drop")
             streams = apply_logical_sharding(
-                streams, dynamic_axes=_HyperStreamSharding, partition_manager=config.runtime_sharding_resolver
+                streams, dynamic_axes=HyperStreamSharding, partition_manager=config.runtime_sharding_resolver
             )
             pre = pre.at[:, idx].set(c_pre.astype(pre.dtype), mode="drop")
             caps = tuple(
@@ -1949,6 +1900,57 @@ class DeepseekV41Model(EngramModelMixin, EasyDeLBaseModule):
         return self.embed_tokens
 
 
+# ---------------------------------------------------------------- checkpoint keys
+# V4.1 ships in DeepSeek's inference naming like V4, so the V4 rules map attention, compressor, MoE, norm and
+# hyper-connection keys. The indexer differs: it has no compressor of its own (keys come from the KV source's latent
+# through ``wk``) and lives directly on the attention module. Vision / aligner / image delimiters and the image-token
+# router bias belong to the VL model; the DSpark ``mtp.*`` stack to the draft model; engram tables are read by
+# :mod:`easydel.layers.engram`'s own loader and never reach the converter.
+
+DEEPSEEK_V41_KEY_RULES = KeyRuleSet(
+    [
+        Map(r"(?:mtp|model\.mtp|vision|aligner)\..*|image_start|image_end|image_newline", None),
+        Map(r".*\.ffn\.gate\.bias_vl", None),
+        Map(ENGRAM_TABLE_KEY_RE.pattern, None),
+        Map(
+            r"layers\.(?P<i>\d+)\.attn\.indexer\.(?P<leaf>[A-Za-z0-9_]+)\.(?P<suffix>weight|scale)",
+            "model.layers.{i}.self_attn.indexer.{leaf}.{suffix}",
+            rename={"leaf": DEEPSEEK_V4_LEAF_ALIASES},
+        ),
+    ],
+    otherwise=DEEPSEEK_V4_KEY_RULES,
+    name="deepseek_v41",
+)
+
+#: Vision-language model: everything the text rules map, plus vision / aligner / delimiters under ``model.`` and the
+#: image-token router bias.
+DEEPSEEK_V41_VL_KEY_RULES = KeyRuleSet(
+    [
+        Map(r"(?:model\.)?mtp\..*", None),
+        Map(r"(?:vision|aligner)\..*|image_start|image_end|image_newline", "model.{0}"),
+        Map(r"layers\.(?P<i>\d+)\.ffn\.gate\.bias_vl", "model.layers.{i}.mlp.gate.bias_vl"),
+    ],
+    otherwise=DEEPSEEK_V41_KEY_RULES,
+    name="deepseek_v41_vl",
+)
+
+#: Native DSpark keys (``mtp.N.*``) -> :class:`DeepseekV41DSpark` names. The tied ``mtp.N.embed`` / ``mtp.N.head`` and
+#: ``mtp.N.ffn.gate.bias_vl`` (never read by text drafts) are unowned.
+DEEPSEEK_V41_MTP_KEY_RULES = KeyRuleSet(
+    [
+        Map(r"stages\..*", KEEP),
+        Map(r"mtp\.\d+\.(?:ffn\.gate\.bias_vl|(?:embed|head)\..*)", None),
+        Map(
+            r"mtp\.(?P<s>\d+)\.(?P<r>main_proj\.(?:weight|scale)|main_norm\.weight|norm\.weight"
+            r"|markov_head\.(?:embed|head)\.weight|confidence_head\.proj\.weight)",
+            "stages.{s}.{r}",
+        ),
+        mtp_stage_block_rule(DEEPSEEK_V4_KEY_RULES),
+    ],
+    name="deepseek_v41_mtp",
+)
+
+
 @register_module(TaskType.CAUSAL_LM, config=DeepseekV41Config, model_type="deepseek_v41")
 class DeepseekV41ForCausalLM(EngramModelMixin, BaseCausalLMModule[DeepseekV41Model, DeepseekV41Config]):  # type: ignore
     """DeepSeek-V4.1 with a causal language modeling head."""
@@ -1956,7 +1958,7 @@ class DeepseekV41ForCausalLM(EngramModelMixin, BaseCausalLMModule[DeepseekV41Mod
     _task_type = TaskType.CAUSAL_LM
     _model_type = "deepseek_v41"
     _config_class = DeepseekV41Config
-    _checkpoint_key_normalizer = staticmethod(native_key_to_easydel_v41)
+    checkpoint_key_rules: tp.ClassVar[KeyRuleSet] = DEEPSEEK_V41_KEY_RULES
     esurge_cache_family: tp.ClassVar[str] = "compressed_window"
     # Engram table management, eSurge side inputs and the trainer host-batch hook come from ``EngramModelMixin``.
 
@@ -2301,7 +2303,7 @@ class DeepseekV41ForConditionalGeneration(  # type: ignore
     _model_type = "deepseek_v41"
     _config_class = DeepseekV41Config
     _auto_register = False  # registered explicitly above
-    _checkpoint_key_normalizer = staticmethod(native_key_to_easydel_v41_vl)
+    checkpoint_key_rules: tp.ClassVar[KeyRuleSet] = DEEPSEEK_V41_VL_KEY_RULES
 
     @property
     def esurge_requires_tokens_to_end(self) -> bool:

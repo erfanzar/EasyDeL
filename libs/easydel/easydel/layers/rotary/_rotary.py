@@ -586,3 +586,62 @@ def get_inv_frequencies(
             raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
 
     return jnp.asarray(inv_frequencies)
+
+
+def partial_rope_frequencies(
+    head_dim: int,
+    max_position: int,
+    base: float,
+    partial_rotary_factor: float = 1.0,
+    rope_type: str = "default",
+    factor: float = 1.0,
+) -> jax.Array:
+    """Cos/sin cache ``[max_position, head_dim]`` for a rotary covering only part of each head (Gemma-4 style).
+
+    - ``rope_type="proportional"`` (HF ``_compute_proportional_rope_parameters``): the first
+      ``int(partial_rotary_factor * head_dim // 2)`` frequencies use exponent denominator ``head_dim`` (the FULL head),
+      the rest are zero (cos 1, sin 0), and all are divided by ``factor``.
+    - otherwise, ``partial_rotary_factor < 1``: a standard table over ``int(head_dim * partial_rotary_factor)``
+      channels, padded with cos 1 / sin 0 up to ``head_dim // 2`` pairs.
+    - otherwise: the standard full-width table.
+
+    Args:
+        head_dim: Per-head dimension.
+        max_position: Number of positions in the cache.
+        base: RoPE ``theta``.
+        partial_rotary_factor: Rotated fraction of the head.
+        rope_type: ``"proportional"`` or anything else.
+        factor: Frequency divisor of the proportional variant.
+
+    Returns:
+        ``concatenate([cos, sin], -1)`` of shape ``[max_position, head_dim]``.
+    """
+    if rope_type == "proportional":
+        rope_angles = int(partial_rotary_factor * head_dim // 2)
+        inv_freq = 1.0 / (base ** (jnp.arange(0, 2 * rope_angles, 2, dtype=jnp.float32) / head_dim))
+        nope_angles = head_dim // 2 - rope_angles
+        if nope_angles > 0:
+            inv_freq = jnp.concatenate((inv_freq, jnp.zeros((nope_angles,), dtype=jnp.float32)), axis=0)
+        inv_freq = inv_freq / factor
+        phase = jnp.arange(max_position, dtype=jnp.float32)[:, None] * inv_freq[None, :]
+        return jnp.concatenate((jnp.cos(phase), jnp.sin(phase)), axis=-1)
+    if partial_rotary_factor < 1.0:
+        rotated_dim = int(head_dim * partial_rotary_factor)
+        rotated = get_frequencies(
+            head_size=rotated_dim,
+            rotary_dim=rotated_dim,
+            max_position=max_position,
+            base=base,
+            rope_scaling=None,
+            partial_rotary_factor=1.0,
+        )
+        cos, sin = jnp.split(rotated, 2, axis=-1)
+        pass_dim = head_dim // 2 - cos.shape[-1]
+        return jnp.concatenate(
+            (
+                jnp.concatenate((cos, jnp.ones((cos.shape[0], pass_dim), dtype=cos.dtype)), axis=-1),
+                jnp.concatenate((sin, jnp.zeros((sin.shape[0], pass_dim), dtype=sin.dtype)), axis=-1),
+            ),
+            axis=-1,
+        )
+    return get_frequencies(head_size=head_dim, rotary_dim=head_dim, max_position=max_position, base=base)

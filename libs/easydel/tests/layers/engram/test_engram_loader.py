@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from easydel.layers.engram import engram_table_checkpoint_keys, read_engram_rows, scan_engram_tensors
-from easydel.modules.deepseek_v41._native_checkpoint import native_key_to_easydel_v41, native_key_to_easydel_v41_vl
+from easydel.modules.deepseek_v41.modeling_deepseek_v41 import DEEPSEEK_V41_KEY_RULES, DEEPSEEK_V41_VL_KEY_RULES
 
 pytestmark = pytest.mark.cpu_ok
 
@@ -94,12 +94,12 @@ def test_native_mapper_keeps_engram_tables_out_of_the_conversion_path() -> None:
     for layer in (1, 14):
         for leaf in ("weight", "scale"):
             key = f"layers.{layer}.engram.embed.{leaf}"
-            assert native_key_to_easydel_v41(key) is None
-            assert native_key_to_easydel_v41_vl(key) is None
-        assert native_key_to_easydel_v41(f"layers.{layer}.engram.wkv.weight") == (
+            assert DEEPSEEK_V41_KEY_RULES(key) is None
+            assert DEEPSEEK_V41_VL_KEY_RULES(key) is None
+        assert DEEPSEEK_V41_KEY_RULES(f"layers.{layer}.engram.wkv.weight") == (
             f"model.layers.{layer}.engram.kv_proj.weight"
         )
-        assert native_key_to_easydel_v41(f"layers.{layer}.engram.q_weight") == f"model.layers.{layer}.engram.q_weight"
+        assert DEEPSEEK_V41_KEY_RULES(f"layers.{layer}.engram.q_weight") == f"model.layers.{layer}.engram.q_weight"
 
 
 def test_released_index_lists_the_engram_tables_in_the_last_two_shards() -> None:

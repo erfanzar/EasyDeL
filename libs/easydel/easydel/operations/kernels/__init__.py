@@ -113,6 +113,7 @@ from .decode_attention import AutoRegressiveDecodeAttn
 from .flash_attention import FlashAttn
 from .fused_mlp import FusedMlpOp
 from .gated_delta_rule import GatedDeltaRuleOp, GatedDeltaRuleOutput
+from .gated_pool_compress import GatedPoolCompressOp, GatedPoolCompressOutput, gated_pool_compress_op
 from .gdn_compute_schedule_v2 import GDNComputeScheduleV2, GDNComputeScheduleV2Config, compute_schedule_table_v2
 from .glm_moe_dsa_indexer import GlmMoeDsaIndexerOp, GlmMoeDsaIndexerOutput
 from .inference_conv1d import (
@@ -144,6 +145,8 @@ __all__ = (
     "GDNComputeScheduleV2Config",
     "GatedDeltaRuleOp",
     "GatedDeltaRuleOutput",
+    "GatedPoolCompressOp",
+    "GatedPoolCompressOutput",
     "GlmMoeDsaIndexerOp",
     "GlmMoeDsaIndexerOutput",
     "KDAOutput",
@@ -164,6 +167,7 @@ __all__ = (
     "VanillaAttn",
     "compute_schedule_table_v2",
     "fused_kda_gate",
+    "gated_pool_compress_op",
     "kda_packed_rows_forward",
     "ragged_causal_conv1d",
     "ragged_causal_conv1d_head_sharded",

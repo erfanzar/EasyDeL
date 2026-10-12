@@ -461,8 +461,8 @@ class DeepseekV41Config(EasyDeLBaseConfig):
             for layer_idx in range(self.num_hidden_layers)
         }
 
-    def v4_rope_params(self, label: str) -> dict:
-        """Rope parameters for ``"main"`` or ``"compress"`` (same accessor name as DeepSeek-V4 for reuse)."""
+    def rope_parameters_for_label(self, label: str) -> dict:
+        """Rope parameters for ``"main"`` or ``"compress"`` (read by ``easydel.layers.rotary.labeled_rope_cos_sin``)."""
         private = getattr(self, "_v4_rope_parameters", None)
         if isinstance(private, dict) and isinstance(private.get(label), dict):
             return private[label]
@@ -470,6 +470,8 @@ class DeepseekV41Config(EasyDeLBaseConfig):
         if isinstance(sub, dict):
             return sub
         raise KeyError(f"DeepSeek-V4.1 rope parameters for label {label!r} not found.")
+
+    v4_rope_params = rope_parameters_for_label
 
 
 __all__ = ["DeepseekV41Config"]

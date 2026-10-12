@@ -54,15 +54,6 @@ def test_rms_norm_uses_the_cast_down_ordering(dtype):
     assert jnp.array_equal(rms_norm(x, eps), expected)
 
 
-@pytest.mark.parametrize("dtype", DTYPES)
-def test_rms_norm_matches_deepseek_v4_bit_exactly(dtype):
-    """The family whose ordering the shared helper adopted."""
-    from easydel.modules.deepseek_v4.modeling_deepseek_v4 import _unweighted_rms_norm
-
-    x = _x(dtype)
-    assert jnp.array_equal(rms_norm(x, 1e-6), _unweighted_rms_norm(x, 1e-6))
-
-
 def test_the_two_orderings_really_do_diverge_in_bfloat16():
     """Guards the reason families cannot be migrated unchecked.
 
@@ -123,6 +114,63 @@ def test_scale_offset_zero_is_the_default_behaviour():
     b.weight = a.weight
     x = _x(jnp.float32, shape=(4, 32))
     assert jnp.array_equal(a(x), b(x))
+
+
+def _fp32_scale_reference(x, weight, eps):
+    """Independent float64 NumPy ``(1 + w) * x / sqrt(mean(x^2) + eps)``."""
+    x64 = np.asarray(x, np.float64)
+    normed = x64 / np.sqrt(np.mean(np.square(x64), -1, keepdims=True) + eps)
+    return (1.0 + np.asarray(weight, np.float64)) * normed
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_fp32_scale_matches_float64_reference(dtype):
+    """``fp32_scale``: statistics and ``(1 + w)`` in fp32, one cast to the input dtype (HF Gemma / Qwen3-Next)."""
+    eps = 1e-6
+    norm = RMSNorm(dim=64, eps=eps, dtype=dtype, param_dtype=dtype, scale_offset=1.0, fp32_scale=True, rngs=spx.Rngs(0))
+    weight = jnp.asarray(np.random.default_rng(1).standard_normal(64) * 0.1, dtype)
+    norm.weight.value = weight
+    x = _x(dtype)
+    out = norm(x)
+    assert out.dtype == dtype
+    ref = _fp32_scale_reference(x.astype(jnp.float32), weight.astype(jnp.float32), eps)
+    tol = 1e-5 if dtype == jnp.float32 else 1e-2
+    np.testing.assert_allclose(np.asarray(out, np.float64), ref, rtol=tol, atol=tol)
+
+
+def test_fp32_scale_differs_from_default_ordering_in_bfloat16():
+    """The flag exists because multiplying before the cast is a different bf16 result than after it."""
+    weight = jnp.asarray(np.random.default_rng(2).standard_normal(64) * 0.5, jnp.bfloat16)
+    kw = dict(dim=64, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, scale_offset=1.0, rngs=spx.Rngs(0))
+    pre, post = RMSNorm(fp32_scale=True, **kw), RMSNorm(**kw)
+    pre.weight.value = weight
+    post.weight.value = weight
+    x = _x(jnp.bfloat16, shape=(64, 64))
+    assert not jnp.array_equal(pre(x), post(x))
+
+
+def test_fp32_scale_low_precision_output_becomes_bfloat16():
+    """A low-precision float ``output_dtype`` is returned as bfloat16 (the Gemma-3 rule)."""
+    norm = RMSNorm(
+        dim=32,
+        dtype=jnp.float32,
+        param_dtype=jnp.float32,
+        scale_offset=1.0,
+        fp32_scale=True,
+        output_dtype=jnp.float8_e4m3fn,
+        rngs=spx.Rngs(0),
+    )
+    assert norm(_x(jnp.float32, shape=(4, 32))).dtype == jnp.bfloat16
+
+
+def test_explicit_kernel_init_is_what_reinit_reads():
+    """Re-initialisation calls ``module.kernel_init``; an explicit zeros init must not fall back to the class ones."""
+    norm = RMSNorm(dim=16, kernel_init=jax.nn.initializers.zeros, scale_offset=1.0, rngs=spx.Rngs(0))
+    assert jnp.array_equal(norm.weight.value, jnp.zeros((16,), norm.param_dtype))
+    reinit = norm.kernel_init(key=jax.random.PRNGKey(0), shape=(16,), dtype=jnp.float32)
+    assert jnp.array_equal(reinit, jnp.zeros((16,), jnp.float32))
+    default = RMSNorm(dim=16, rngs=spx.Rngs(0))
+    assert jnp.array_equal(default.kernel_init(jax.random.PRNGKey(0), (16,), jnp.float32), jnp.ones((16,)))
 
 
 if __name__ == "__main__":

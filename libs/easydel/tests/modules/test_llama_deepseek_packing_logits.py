@@ -49,6 +49,10 @@ def _llama_model():
         max_position_embeddings=64,
         rms_norm_eps=1e-6,
         scan_layers=False,
+        # Packed batches take vanilla's segmented path (f32 logits) and unpacked ones the plain path (q/k cast to
+        # attn_dtype before QK^T); with the default bf16 attn_dtype the two round differently (~1e-3) even with a
+        # single segment. Pin f32 so the test measures document isolation, not that rounding gap.
+        attn_dtype=jnp.float32,
     )
     return LlamaForCausalLM(config=config, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32), 128
 

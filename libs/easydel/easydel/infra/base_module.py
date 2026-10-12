@@ -2776,24 +2776,19 @@ class EasyDeLBaseModule(
         return reform_param
 
     def _get_checkpoint_key_normalizer(self) -> tp.Callable[[str], str | None] | None:
-        """Return the model's checkpoint-key normalizer, if it declares one.
+        """Return the model's declared checkpoint-key rules, if any.
 
-        Most families publish weights in transformers naming, so the loader's
-        own rules are enough. A few publish only in a vendor layout instead --
-        DeepSeek-V4 ships `layers.N.attn.wq_a` and never released the
-        transformers form -- and those declare a
-        ``_checkpoint_key_normalizer`` staticmethod mapping one raw checkpoint
-        key to its EasyDeL parameter name (or ``None`` when the runtime does
-        not own that tensor).
+        Most families publish weights in transformers naming, so the loader's own rules are enough. Families that
+        publish a vendor layout (DeepSeek-V4 ``layers.N.attn.wq_a``, GLM-5-Next's composite VLM, Kimi-Linear's
+        ``block_sparse_moe``) declare ``checkpoint_key_rules``: a :class:`~easydel.utils.checkpoint_keys.KeyRuleSet`
+        mapping one raw key to its EasyDeL parameter name, or ``None`` when the runtime does not own the tensor.
 
-        Declared on the class rather than resolved by ``model_type`` so the
-        loader stays free of per-family branches, matching how
-        ``_hf_flattened_wrapper`` is handled.
+        Declared on the class rather than resolved by ``model_type`` so the loader stays free of per-family branches.
 
         Returns:
-            The declared callable, or ``None`` to leave key naming alone.
+            The declared rule set (callable on one key), or ``None`` to leave key naming alone.
         """
-        return getattr(type(self), "_checkpoint_key_normalizer", None)
+        return getattr(type(self), "checkpoint_key_rules", None)
 
     def _get_hf_flattened_wrappers(self) -> dict[str, str]:
         """Collect ``_hf_flattened_wrapper`` declarations from the module tree.
@@ -3922,7 +3917,12 @@ class EasyDeLBaseModule(
         if pop_things:
             for pops in pop_things:
                 dict_config.pop(pops)
-        tree_hash = _get_args_signature((self.graphstate, self.graphother), dict_config)
+        # Config values (strings, dtypes, tuples) are static: hash them by value, not as traceable leaves.
+        tree_hash = _get_args_signature(
+            (self.graphstate, self.graphother),
+            dict_config,
+            static_argnames=tuple(dict_config),
+        )
         bytes_in = hashlib.md5((tree_hash).encode("utf-8")).digest()
         return int.from_bytes(bytes_in, byteorder="big", signed=True)
 

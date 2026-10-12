@@ -26,11 +26,10 @@ that re-forks the tower fails here rather than silently drifting again.
 
 import numpy as np
 import pytest
+from easydel.layers.rotary import apply_rope_split_half, rotate_half
 from easydel.modules.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VisionTransformerPretrainedModel,
     Qwen3VLTextAttention,
-    apply_rotary_pos_emb_vision,
-    rotate_half,
 )
 from easydel.modules.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeTextAttention,
@@ -83,7 +82,7 @@ def test_vision_rope_matches_full_width_reference(head_dim):
     table = jnp.concatenate([half, half], axis=-1)
     cos, sin = jnp.cos(table), jnp.sin(table)
 
-    got_q, got_k = apply_rotary_pos_emb_vision(q, k, cos, sin)
+    got_q, got_k = apply_rope_split_half(q, cos, sin), apply_rope_split_half(k, cos, sin)
     want_q, want_k = _reference_full_width_rope(q, k, cos, sin)
 
     assert jnp.array_equal(got_q, want_q)
@@ -103,7 +102,8 @@ def test_vision_rope_leaves_tail_untouched_when_table_is_half_width():
     k = jnp.asarray(rng.standard_normal((seq, heads, head_dim)), jnp.float32)
     table = jnp.asarray(rng.standard_normal((seq, ro)), jnp.float32)
 
-    got_q, got_k = apply_rotary_pos_emb_vision(q, k, jnp.cos(table), jnp.sin(table))
+    got_q = apply_rope_split_half(q, jnp.cos(table), jnp.sin(table))
+    got_k = apply_rope_split_half(k, jnp.cos(table), jnp.sin(table))
 
     assert jnp.array_equal(got_q[..., ro:], q[..., ro:])
     assert jnp.array_equal(got_k[..., ro:], k[..., ro:])

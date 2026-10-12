@@ -18,7 +18,26 @@ Exports the config, block drafter, DSpark attention/layer types, and
 block-forward output schema used by DeepSpec-style DSpark training.
 """
 
+from ._drafter import DSparkDrafter, DSparkState, register_dspark_drafter
+from ._loader import StageShards, load_dspark_model, scan_mtp_keys
+from ._stage_stack import DSparkConfidenceHead, DSparkMarkovHead, DSparkStageStack, dspark_main_projection
 from .dspark_configuration import DSparkConfig
 from .modeling_dspark import DSparkAttention, DSparkDecoderLayer, DSparkForwardOutput, DSparkModel
 
-__all__ = ("DSparkAttention", "DSparkConfig", "DSparkDecoderLayer", "DSparkForwardOutput", "DSparkModel")
+__all__ = (
+    "DSparkAttention",
+    "DSparkConfidenceHead",
+    "DSparkConfig",
+    "DSparkDecoderLayer",
+    "DSparkDrafter",
+    "DSparkForwardOutput",
+    "DSparkMarkovHead",
+    "DSparkModel",
+    "DSparkStageStack",
+    "DSparkState",
+    "StageShards",
+    "dspark_main_projection",
+    "load_dspark_model",
+    "register_dspark_drafter",
+    "scan_mtp_keys",
+)

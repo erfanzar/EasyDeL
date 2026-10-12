@@ -100,13 +100,17 @@ from easydel.layers import (
     moe_down_projection_reform_param,
     split_fused_gate_up_projection,
 )
+from easydel.layers.compressed_window import packed_row_of_token
 from easydel.layers.embeddings import NGramEmbed
 from easydel.layers.indexer import BlockTopKIndexer
 from easydel.layers.indexer._block_topk import apply_partial_rope
 from easydel.layers.indexer._paged_block_topk import paged_block_topk
 from easydel.layers.norms import lowfloats
-from easydel.modules._base import BaseCausalLMModule, BaseVisionLanguageModule
-from easydel.modules.qwen3_5.modeling_qwen3_5 import _get_rope_index_from_mm_token_types
+from easydel.modules._base import (
+    BaseCausalLMModule,
+    BaseVisionLanguageModule,
+    mrope_position_ids_from_mm_token_types,
+)
 from easydel.modules.qwen3_next.modeling_qwen3_next import (
     Qwen3NextFullAttention,
     Qwen3NextLinearAttention,
@@ -327,7 +331,7 @@ def _paged_qsa_token_map(cache_metadata: RaggedPagesMetadata, total_tokens: int,
     qsl = cache_metadata.query_start_loc.astype(jnp.int32).reshape(-1)
     num_rows = qsl.shape[0] - 1
     token_idx = jnp.arange(total_tokens, dtype=jnp.int32)
-    row = jnp.clip(jnp.searchsorted(qsl, token_idx, side="right") - 1, 0, num_rows - 1)
+    row = packed_row_of_token(qsl, token_idx)
     live_rows = jnp.clip(cache_metadata.num_seqs.reshape(-1)[0].astype(jnp.int32), 0, num_rows)
     valid = token_idx < jnp.take(qsl, live_rows)
     scheduled = qsl[1:] - qsl[:-1]
@@ -1570,11 +1574,7 @@ class Qwen4ExpPLELayer(spx.Module):
             # before each chunk start from that request's recurrent context.
             starts = packed_query_start_loc[:-1].astype(jnp.int32)
             token_index = jnp.arange(seq, dtype=jnp.int32)
-            request_rows = jnp.clip(
-                jnp.searchsorted(packed_query_start_loc, token_index, side="right") - 1,
-                0,
-                starts.shape[0] - 1,
-            )
+            request_rows = packed_row_of_token(packed_query_start_loc, token_index)
             local_index = token_index - starts[request_rows]
             offsets = (
                 local_index[:, None]
@@ -1877,11 +1877,7 @@ class Qwen4ExpDecoderLayer(spx.Module):
                 token_index = jnp.arange(ple_input_ids.shape[1], dtype=jnp.int32)
                 live_rows = jnp.clip(meta.num_seqs.reshape(-1)[0].astype(jnp.int32), 0, packed_qsl.shape[0] - 1)
                 packed_valid = token_index < packed_qsl[live_rows]
-                request_rows = jnp.clip(
-                    jnp.searchsorted(packed_qsl, token_index, side="right") - 1,
-                    0,
-                    packed_qsl.shape[0] - 2,
-                )
+                request_rows = packed_row_of_token(packed_qsl, token_index)
                 packed_segments = jnp.where(packed_valid, request_rows, -1)[None, :]
             if packed_qsl is not None and mode == common_types.MODE_DECODE:
                 # Decode carries one packed token per live request. Rebatch by
@@ -3014,7 +3010,7 @@ class Qwen4ExpModel(EasyDeLBaseModule):
             mm_token_type_ids = np.zeros_like(ids)
             mm_token_type_ids[ids == self.config.image_token_id] = 1
             mm_token_type_ids[ids == self.config.video_token_id] = 2
-        return _get_rope_index_from_mm_token_types(
+        return mrope_position_ids_from_mm_token_types(
             input_ids=np.asarray(input_ids),
             mm_token_type_ids=np.asarray(mm_token_type_ids),
             image_grid_thw=np.asarray(image_grid_thw) if image_grid_thw is not None else None,

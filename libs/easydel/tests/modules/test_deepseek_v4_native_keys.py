@@ -23,7 +23,7 @@ the published ``model.safetensors.index.json`` of
 """
 
 import pytest
-from easydel.modules.deepseek_v4._native_checkpoint import native_key_to_easydel
+from easydel.modules.deepseek_v4.modeling_deepseek_v4 import DEEPSEEK_V4_KEY_RULES
 
 # (native key, expected EasyDeL parameter) -- all left-hand sides are real
 # patterns from the published index.
@@ -69,7 +69,7 @@ CASES = [
 
 @pytest.mark.parametrize(("native", "expected"), CASES)
 def test_native_key_maps_to_easydel_name(native, expected):
-    assert native_key_to_easydel(native) == expected
+    assert DEEPSEEK_V4_KEY_RULES(native) == expected
 
 
 # The nesting is INVERTED between the two layouts: the checkpoint puts the
@@ -102,13 +102,13 @@ INDEXER_CASES = [
 
 @pytest.mark.parametrize(("native", "expected"), INDEXER_CASES)
 def test_indexer_nesting_is_inverted(native, expected):
-    assert native_key_to_easydel(native) == expected
+    assert DEEPSEEK_V4_KEY_RULES(native) == expected
 
 
 def test_indexer_does_not_collide_with_the_main_compressor():
     """The two compressors must not map onto the same parameter."""
-    main = native_key_to_easydel("layers.5.attn.compressor.wkv.weight")
-    indexer = native_key_to_easydel("layers.5.attn.indexer.compressor.wkv.weight")
+    main = DEEPSEEK_V4_KEY_RULES("layers.5.attn.compressor.wkv.weight")
+    indexer = DEEPSEEK_V4_KEY_RULES("layers.5.attn.indexer.compressor.wkv.weight")
     assert main != indexer
     assert "indexer" not in main
     assert indexer.endswith("compressor.indexer.kv_proj.weight")
@@ -128,19 +128,19 @@ def test_mtp_stack_is_reported_unowned(native):
     Returning ``None`` (rather than raising, or inventing a name) keeps the
     loader's unused-key reporting truthful for the 45 ``mtp.*`` patterns.
     """
-    assert native_key_to_easydel(native) is None
-    assert native_key_to_easydel(f"model.{native}") is None
+    assert DEEPSEEK_V4_KEY_RULES(native) is None
+    assert DEEPSEEK_V4_KEY_RULES(f"model.{native}") is None
 
 
 @pytest.mark.parametrize("key", [expected for _, expected in CASES + INDEXER_CASES])
 def test_hf_and_already_normalized_keys_are_preserved(key):
     """Normalizing twice must neither drop a tensor nor reapply native aliases."""
-    assert native_key_to_easydel(key) == key
+    assert DEEPSEEK_V4_KEY_RULES(key) == key
 
 
 @pytest.mark.parametrize("key", ["optimizer.step", "unknown.weight", "model_not_a_prefix.weight"])
 def test_unknown_native_keys_remain_unowned(key):
-    assert native_key_to_easydel(key) is None
+    assert DEEPSEEK_V4_KEY_RULES(key) is None
 
 
 @pytest.mark.parametrize("checkpoint_format", ["native", "hf"])

@@ -48,6 +48,44 @@ def rotate_half(x: Array) -> Array:
     return jnp.concatenate([-x[..., half:], x[..., :half]], axis=-1)
 
 
+def apply_rope_split_half(
+    x: Array,
+    cos: Array,
+    sin: Array,
+    *,
+    unsqueeze_dim: int | None = -2,
+    compute_dtype: jnp.dtype | None = jnp.float32,
+) -> Array:
+    """NeoX split-half RoPE ``x * cos + rotate_half(x) * sin`` on the leading ``cos.shape[-1]`` channels.
+
+    Channels past ``cos.shape[-1]`` pass through unchanged (partial rotary); a full-width table takes the plain path.
+
+    Args:
+        x: Tensor to rotate, e.g. ``[seq, heads, head_dim]``.
+        cos: Cosine table, e.g. ``[seq, rot_dim]``.
+        sin: Sine table, same shape as ``cos``.
+        unsqueeze_dim: Axis inserted into ``cos`` / ``sin`` to broadcast over heads (``None`` = already broadcastable).
+        compute_dtype: Dtype the rotation runs in; the result is cast back to ``x``'s dtype. ``None`` computes in the
+            operands' own dtypes and returns their promoted dtype.
+
+    Returns:
+        The rotated tensor.
+    """
+    if unsqueeze_dim is not None:
+        cos = jnp.expand_dims(cos, unsqueeze_dim)
+        sin = jnp.expand_dims(sin, unsqueeze_dim)
+    orig_dtype = x.dtype
+    if compute_dtype is not None:
+        x, cos, sin = x.astype(compute_dtype), cos.astype(compute_dtype), sin.astype(compute_dtype)
+    rot_dim = cos.shape[-1]
+    if rot_dim == x.shape[-1]:
+        out = (x * cos) + (rotate_half(x) * sin)
+    else:
+        x_rot, x_pass = x[..., :rot_dim], x[..., rot_dim:]
+        out = jnp.concatenate([(x_rot * cos) + (rotate_half(x_rot) * sin), x_pass], axis=-1)
+    return out if compute_dtype is None else out.astype(orig_dtype)
+
+
 @jax.named_scope("easydel-rotary-yarn-find-correction-dim")
 def _yarn_find_correction_dim(
     num_rotations: int,
@@ -339,6 +377,62 @@ def apply_rope_interleaved(x, cos, sin):
     o1 = x1 * cos - x2 * sin
     o2 = x2 * cos + x1 * sin
     return jnp.stack((o1, o2), axis=-1).reshape(x.shape)
+
+
+def cos_sin_from_inv_frequencies(
+    inv_freq: Array,
+    position_ids: Array,
+    dtype: jnp.dtype,
+    attention_scaling: float = 1.0,
+) -> tuple[Array, Array]:
+    """Half-width ``(cos, sin)`` tables at ``position_ids`` (one entry per rotation pair).
+
+    Args:
+        inv_freq: Inverse frequencies ``[rotary_dim // 2]``.
+        position_ids: Integer positions ``[batch, seq]``.
+        dtype: Output dtype.
+        attention_scaling: Magnitude factor multiplied into both tables (YaRN).
+
+    Returns:
+        ``(cos, sin)``, each ``[batch, seq, rotary_dim // 2]``.
+    """
+    inv = jnp.asarray(inv_freq, dtype=jnp.float32)
+    freqs = position_ids.astype(jnp.float32)[..., None] * inv[None, None, :]
+    return (jnp.cos(freqs) * attention_scaling).astype(dtype), (jnp.sin(freqs) * attention_scaling).astype(dtype)
+
+
+def apply_rope_interleaved_partial(x: Array, cos: Array, sin: Array, unsqueeze_dim: int = 1) -> Array:
+    """Interleaved (GPT-J pair) RoPE on the *trailing* ``2 * cos.shape[-1]`` channels of ``x``, in float32.
+
+    Leading channels pass through. ``cos`` / ``sin`` are half width (one entry per pair), as produced by
+    :func:`cos_sin_from_inv_frequencies`; pass ``-sin`` for the inverse rotation. The rotation is written pair-major
+    (the rope slice reshaped to explicit ``(half, 2)`` pairs) so cos/sin are never repeat-interleaved::
+
+        out[2k]   = x1 * cos[k] - x2 * sin[k]
+        out[2k+1] = x1 * sin[k] + x2 * cos[k]
+
+    which equals :func:`apply_rope_interleaved` over the slice, computed in float32 and cast back to ``x.dtype``.
+
+    Args:
+        x: Input ``[..., seq, dim]`` with a broadcastable head axis at ``unsqueeze_dim``.
+        cos: Half-width cosines ``[batch, seq, rope_dim // 2]``.
+        sin: Half-width sines ``[batch, seq, rope_dim // 2]``.
+        unsqueeze_dim: Axis at which cos/sin gain a head axis (1 for ``[B, H, S, D]``, 2 for ``[B, S, H, D]``).
+
+    Returns:
+        Array with the shape and dtype of ``x``.
+    """
+    half = cos.shape[-1]
+    rope_dim = 2 * half
+    cos = jnp.expand_dims(cos, unsqueeze_dim).astype(jnp.float32)
+    sin = jnp.expand_dims(sin, unsqueeze_dim).astype(jnp.float32)
+    nope, rope = x[..., :-rope_dim], x[..., -rope_dim:]
+    pairs = rope.astype(jnp.float32).reshape(*rope.shape[:-1], half, 2)
+    x1 = pairs[..., 0]
+    x2 = pairs[..., 1]
+    rotated = jnp.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), axis=-1)
+    rotated = rotated.reshape(rope.shape).astype(x.dtype)
+    return jnp.concatenate([nope, rotated], axis=-1)
 
 
 def gather_mla_cos_sin(frequencies, position_ids, dtype):

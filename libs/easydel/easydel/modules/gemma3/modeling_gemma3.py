@@ -81,7 +81,7 @@ from easydel.layers import (
     gated_mlp_forward,
 )
 from easydel.layers.attention import UnifiedAttention
-from easydel.layers.norms._norms import lowfloats
+from easydel.layers.norms import RMSNorm
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule, BaseVisionLanguageModule
 from easydel.modules.auto.auto_modeling import AutoEasyDeLVisionModel
 from easydel.modules.gemma2.modeling_gemma2 import Gemma2SoftCappedAttentionModule
@@ -178,24 +178,15 @@ class Gemma3CausalLMOutputWithPast(ModelOutput):
     image_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None
 
 
-class Gemma3RMSNorm(spx.Module):
-    """Gemma3 RMSNorm with the ``(1 + weight)`` scale and Float8-safe output cast.
+class Gemma3RMSNorm(RMSNorm):
+    """Gemma-3 RMSNorm (HF ``Gemma3RMSNorm``): ``(1 + w)`` scale, statistics and scale in float32, one cast.
 
-    Identical mathematics to the earlier Gemma/Gemma2 RMSNorms (variance in
-    float32, scale applied as ``1 + weight`` so the layer is the identity at
-    initialization), with two production-time wrinkles for Gemma3:
-
-    1. **Configurable dimension** — the same module is reused for ``hidden_size``
-       normalization in the decoder and for ``head_dim`` Q/K normalization
-       inside :class:`Gemma3Attention`. The dimension and epsilon can be
-       overridden via constructor arguments to support both call sites.
-    2. **Float8 down-cast guard** — Gemma3 supports lowfloat (Float8) output
-       activations; if the post-scale dtype is in :data:`lowfloats`, the
-       normalised value is cast back to bfloat16 instead, since Float8 cannot
-       reliably represent the scaled outputs near the unit-RMS regime.
+    Zero-initialised ``weight`` (HF init, so the effective scale ``1 + w`` starts at 1) of size ``dim`` (default
+    ``hidden_size``) stored in ``param_dtype``; the output is cast to ``param_dtype`` (bfloat16 for a low-precision
+    float). :class:`easydel.layers.norms.RMSNorm` with ``fp32_scale=True``.
     """
 
-    kernel_init = staticmethod(jax.nn.initializers.ones)
+    kernel_init = staticmethod(jax.nn.initializers.zeros)
 
     def __init__(
         self,
@@ -204,56 +195,15 @@ class Gemma3RMSNorm(spx.Module):
         dim: int | None = None,
         epsilon: float | None = None,
     ):
-        """Initialize Gemma3 RMS normalization layer.
-
-        Args:
-            config (Gemma3TextConfig): Model configuration containing rms_norm_eps and hidden_size.
-            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.float32.
-            dim (int | None, optional): Dimension for the normalization kernel. If None,
-                uses config.hidden_size. Defaults to None.
-            epsilon (float | None, optional): Small constant for numerical stability. If None,
-                uses config.rms_norm_eps. Defaults to None.
-        """
-        self.config = config
-        self.epsilon = self.config.rms_norm_eps if epsilon is None else epsilon
-        self.param_dtype = param_dtype
-        dim = self.config.hidden_size if dim is None else dim
-        self.weight = ArrayParam.bound(
-            shape=(dim,),
+        super().__init__(
+            config.hidden_size if dim is None else dim,
+            eps=config.rms_norm_eps if epsilon is None else epsilon,
             dtype=param_dtype,
-            init_method="ones",
-            key=None,
+            param_dtype=param_dtype,
+            scale_offset=1.0,
+            fp32_scale=True,
+            output_dtype=param_dtype,
         )
-
-    def _norm(self, x: jax.Array) -> jax.Array:
-        """Apply RMS normalization without learnable scale.
-
-        Args:
-            x (jax.Array): Input tensor to normalize.
-
-        Returns:
-            jax.Array: Normalized tensor.
-        """
-        return x * (1 / jnp.sqrt(jnp.power(x, 2).mean(-1, keepdims=True) + self.epsilon))
-
-    def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jax.Array:
-        """Apply RMS normalization with learnable scale.
-
-        Args:
-            hidden_states (Array): Input tensor to normalize of shape
-                (batch_size, sequence_length, hidden_dim).
-
-        Returns:
-            jax.Array: Normalized and scaled hidden states. If output dtype is Float8,
-                automatically casts to bfloat16 for compatibility.
-        """
-        # HF multiplies by ``(1 + weight)`` in float32 and casts once at the end.
-        normed = self._norm(hidden_states.astype(jnp.float32))
-        out = ((1 + self.weight.value.astype(jnp.float32)) * normed).astype(self.param_dtype)
-
-        if out.dtype in lowfloats:
-            out = out.astype(jnp.bfloat16)
-        return out
 
 
 class Gemma3Attention(UnifiedAttention):

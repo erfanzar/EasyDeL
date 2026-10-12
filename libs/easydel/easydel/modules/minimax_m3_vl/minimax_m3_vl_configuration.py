@@ -345,6 +345,8 @@ class MiniMaxM3VLVisionConfig(EasyDeLBaseConfig):
     """
 
     model_type = "minimax_m3_vl_vision"
+    # HF ``MiniMaxM3VLVisionConfig.default_rope_type``: the vision rotary module only accepts ``"axial"``.
+    default_rope_type = "axial"
 
     def __init__(
         self,

@@ -30,7 +30,7 @@ This module exposes the task-specific wrappers for that stack:
   positions before invoking the LM head.
 
 Multimodal mRoPE construction reuses
-:func:`easydel.modules.qwen3_5.modeling_qwen3_5._get_rope_index_from_mm_token_types`
+:func:`easydel.modules._base.mrope_position_ids_from_mm_token_types`
 and the position-id flattening helper from the Qwen3.5 module.
 """
 
@@ -49,12 +49,15 @@ from easydel.caching import (
 )
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import MoeCausalLMOutput
-from easydel.modules._base import BaseCausalLMModule, BaseVisionLanguageModule
+from easydel.modules._base import (
+    BaseCausalLMModule,
+    BaseVisionLanguageModule,
+    flatten_mrope_position_ids_for_text,
+    mrope_position_ids_from_mm_token_types,
+)
 from easydel.modules.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5MTPHead,
     Qwen3_5MTPOutput,
-    _get_rope_index_from_mm_token_types,
-    _maybe_flatten_position_ids_for_text,
 )
 from easydel.modules.qwen3_next.modeling_qwen3_next import (
     Qwen3NextForCausalLM,
@@ -468,7 +471,7 @@ class Qwen3_5MoeModel(Qwen3VLMoeModel):
             attention_mask: Boolean attention mask ``(batch, seq_len)``.
             mask_info: Optional pre-built ``MaskInfo``.
             position_ids: 1-D or 3-D position ids; flattened by
-                :func:`_maybe_flatten_position_ids_for_text` when the
+                :func:`flatten_mrope_position_ids_for_text` when the
                 text config disables mRoPE.
             mode: Runtime mode (train/decode); auto-detected if ``None``.
             past_key_values: KV cache for autoregressive decoding.
@@ -535,7 +538,7 @@ class Qwen3_5MoeModel(Qwen3VLMoeModel):
         rope_deltas = None
         if position_ids is None:
             if mm_token_type_ids is not None:
-                position_ids, rope_deltas = _get_rope_index_from_mm_token_types(
+                position_ids, rope_deltas = mrope_position_ids_from_mm_token_types(
                     input_ids=input_ids,
                     mm_token_type_ids=mm_token_type_ids,
                     image_grid_thw=image_grid_thw,
@@ -551,7 +554,7 @@ class Qwen3_5MoeModel(Qwen3VLMoeModel):
                     attention_mask=attention_mask,
                 )
 
-        position_ids = _maybe_flatten_position_ids_for_text(self.config.text_config, position_ids)
+        position_ids = flatten_mrope_position_ids_for_text(self.config.text_config, position_ids)
 
         outputs = self.language_model(
             input_ids=None,

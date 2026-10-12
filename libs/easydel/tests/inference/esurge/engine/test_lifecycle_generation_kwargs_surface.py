@@ -630,6 +630,7 @@ def test_lifecycle_pp_async_dispatches_next_step_before_draining_previous():
 def test_runner_async_drain_handoff_gate_allows_tp_decode():
     runner = SimpleNamespace(
         async_scheduling=True,
+        model=None,
         _model_uses_vlm_inputs=lambda: False,
         _has_default_sampling_penalties=lambda: True,
     )
@@ -650,6 +651,7 @@ def test_runner_async_drain_handoff_gate_allows_tp_decode():
 def test_runner_async_drain_handoff_gate_rejects_structured_placeholders():
     runner = SimpleNamespace(
         async_scheduling=True,
+        model=None,
         _model_uses_vlm_inputs=lambda: False,
         _has_default_sampling_penalties=lambda: True,
     )

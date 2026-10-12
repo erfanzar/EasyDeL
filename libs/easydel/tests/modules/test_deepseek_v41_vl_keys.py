@@ -28,7 +28,7 @@ from pathlib import Path
 
 import pytest
 from easydel.modules.deepseek_v41 import DeepseekV41Config
-from easydel.modules.deepseek_v41._native_checkpoint import native_key_to_easydel_v41, native_key_to_easydel_v41_vl
+from easydel.modules.deepseek_v41.modeling_deepseek_v41 import DEEPSEEK_V41_KEY_RULES, DEEPSEEK_V41_VL_KEY_RULES
 
 pytestmark = pytest.mark.cpu_ok
 
@@ -129,7 +129,7 @@ def test_vl_normalizer_maps_every_vl_key_without_collisions(keys: list[str], con
     vl_keys = [k for k in keys if _is_vl_key(k)]
     # 1 + 1 patch_embed (weight, bias), 32 * 8 block tensors, final norm, 4 aligner tensors, 3 delimiters, 40 biases
     assert len(vl_keys) == 2 + 32 * 8 + 1 + 4 + 3 + 40 == 306
-    mapped = {k: native_key_to_easydel_v41_vl(k) for k in vl_keys}
+    mapped = {k: DEEPSEEK_V41_VL_KEY_RULES(k) for k in vl_keys}
     assert all(isinstance(v, str) and v for v in mapped.values()), [k for k, v in mapped.items() if not v][:10]
     owners: dict[str, list[str]] = collections.defaultdict(list)
     for key, name in mapped.items():
@@ -140,16 +140,16 @@ def test_vl_normalizer_maps_every_vl_key_without_collisions(keys: list[str], con
 
 def test_text_normalizer_still_leaves_vl_keys_unowned(keys: list[str]):
     for key in (k for k in keys if _is_vl_key(k)):
-        assert native_key_to_easydel_v41(key) is None, key
+        assert DEEPSEEK_V41_KEY_RULES(key) is None, key
 
 
 def test_vl_normalizer_agrees_with_the_text_normalizer_elsewhere(keys: list[str]):
     for key in (k for k in keys if not _is_vl_key(k) and not k.startswith("mtp.")):
-        assert native_key_to_easydel_v41_vl(key) == native_key_to_easydel_v41(key), key
+        assert DEEPSEEK_V41_VL_KEY_RULES(key) == DEEPSEEK_V41_KEY_RULES(key), key
 
 
 def test_mtp_keys_stay_unmapped(keys: list[str]):
     mtp = [k for k in keys if k.startswith("mtp.")]
     assert mtp, "the release carries an MTP stack"
     assert any(k.endswith(".ffn.gate.bias_vl") for k in mtp)  # mtp.N.ffn.gate.bias_vl must not leak into layers
-    assert all(native_key_to_easydel_v41_vl(k) is None for k in mtp)
+    assert all(DEEPSEEK_V41_VL_KEY_RULES(k) is None for k in mtp)

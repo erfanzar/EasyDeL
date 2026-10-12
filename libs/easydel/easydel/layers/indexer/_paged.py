@@ -51,6 +51,8 @@ from jax import lax
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
+from easydel.layers.compressed_window import packed_row_of_token
+
 if tp.TYPE_CHECKING:
     from ._indexer import SparseIndexer
     from ._token import TokenIndexer
@@ -127,7 +129,7 @@ def paged_token_layout(
     """
     max_seqs = int(kv_lens.shape[0])
     tok = jnp.arange(total_tokens, dtype=jnp.int32)
-    seq = jnp.clip(jnp.searchsorted(query_start_loc, tok, side="right").astype(jnp.int32) - 1, 0, max_seqs - 1)
+    seq = packed_row_of_token(query_start_loc, tok, max_row=max_seqs - 1)
     q_start = query_start_loc[seq]
     q_len = query_start_loc[seq + 1] - q_start
     kv_len = kv_lens[seq]
