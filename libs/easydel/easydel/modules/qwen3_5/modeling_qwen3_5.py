@@ -273,6 +273,9 @@ class Qwen3_5MTPHead(spx.Module):
         mtp_logits = lm_head(mtp_hidden)
     """
 
+    #: The head keeps an MTP-local KV cache; keep it out of the decoder's operation-cache discovery.
+    owns_operation_cache = True
+
     def __init__(
         self,
         config: Qwen3_5TextConfig,

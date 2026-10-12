@@ -28,6 +28,7 @@ portable reference implementation.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Literal
 
 import jax
@@ -982,11 +983,10 @@ def ragged_gated_delta_rule_v2(
     if not (flat_tp_shard and can_flat_shard) and not can_split_shard:
         run_cfg = cfg or RaggedGatedDeltaRuleV2Config(chunk_size=chunk_size, platform=platform or "auto")
         if _is_tpu_pallas_request(platform=platform, cfg=run_cfg) and _has_nontrivial_mesh_axis(mesh):
-            raise ValueError(
-                "TPU Pallas ragged GDN requires a non-replicated shard_map axis on multi-device meshes. "
-                f"No mesh axis divides n_kq={n_kq}, n_v={n_v}, d_k={d_k}, d_v={d_v}; "
-                f"mesh axes={_mesh_axis_items(mesh)}."
-            )
+            # The Pallas kernel needs a shard_map head axis; when no mesh axis divides the GDN heads (e.g. an
+            # fsdp-only mesh wider than the head count) run the XLA implementation, which GSPMD partitions itself.
+            platform = "xla"
+            run_cfg = dataclasses.replace(run_cfg, platform="xla")
         return op._run_unsharded(
             mixed_qkv,
             b,

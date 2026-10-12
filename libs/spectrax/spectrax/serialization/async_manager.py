@@ -405,9 +405,13 @@ def _missing_zarr_metadata(paths: list[str], workers: int | None) -> list[str]:
     """
     metadata_paths = [_fs.joinpath(path, ".zarray") for path in paths]
     if workers is None or int(workers) <= 1 or len(metadata_paths) <= 1:
-        return [path for path, meta_path in zip(paths, metadata_paths, strict=False) if not _fs.exists(meta_path)]
+        return [
+            path
+            for path, meta_path in zip(paths, metadata_paths, strict=False)
+            if not _fs.exists(meta_path, refresh=True)
+        ]
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, int(workers))) as executor:
-        exists = list(executor.map(_fs.exists, metadata_paths))
+        exists = list(executor.map(lambda meta_path: _fs.exists(meta_path, refresh=True), metadata_paths))
     return [path for path, ok in zip(paths, exists, strict=False) if not ok]
 
 
@@ -1060,7 +1064,8 @@ class AsyncCheckpointManager:
 
         root = str(path)
         struct_path = _structure_path(root, prefix)
-        if not _fs.exists(struct_path):
+        # Refresh: on multi-host runs another process may have just written this checkpoint (issue #292).
+        if not _fs.exists(struct_path, refresh=True):
             if not can_skip_structure:
                 raise FileNotFoundError(
                     f"Missing {os.path.basename(struct_path)} in {root}. "
@@ -1138,7 +1143,7 @@ class AsyncCheckpointManager:
         if missing:
             idx = _fs.joinpath(root, "tensorstore_index.json")
             prefixes = []
-            if _fs.exists(idx):
+            if _fs.exists(idx, refresh=True):
                 idx_data = json.loads(_fs.read_text(idx))
                 prefixes = sorted(list(idx_data.get("prefixes", {}).keys()))
             raise FileNotFoundError(
@@ -1391,7 +1396,7 @@ class AsyncCheckpointManager:
                 inconsistent, or strict template shape checks fail.
         """
         index_path = _fs.joinpath(root, "tensorstore_index.json")
-        if not _fs.exists(index_path):
+        if not _fs.exists(index_path, refresh=True):
             raise FileNotFoundError(
                 f"Missing {os.path.basename(_structure_path(root, prefix))} and tensorstore_index.json in {root}"
             )

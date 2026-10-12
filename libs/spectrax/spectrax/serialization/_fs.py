@@ -90,17 +90,41 @@ def mkdir(path: str, exist_ok: bool = True) -> None:
         Path(plain).mkdir(parents=True, exist_ok=exist_ok)
 
 
-def exists(path: str) -> bool:
+def invalidate_cache(path: str) -> None:
+    """Drop any cached remote listing for *path* and its parent directory (no-op for local paths).
+
+    fsspec reuses filesystem instances and gcsfs keeps directory listings indefinitely, so a process that listed a
+    directory before another host wrote into it would otherwise keep answering from the stale listing.
+
+    Args:
+        path: File or directory whose cached listing should be discarded.
+    """
+    fs, plain = _get_fs(path)
+    if fs is None:
+        return
+    parent = plain.rstrip("/").rsplit("/", 1)[0] if "/" in plain.rstrip("/") else plain
+    for target in (plain, parent):
+        try:
+            fs.invalidate_cache(target)
+        except Exception:
+            pass
+
+
+def exists(path: str, *, refresh: bool = False) -> bool:
     """Check whether *path* exists.
 
     Args:
         path: File or directory to check.
+        refresh: For remote paths, discard cached listings first (see :func:`invalidate_cache`). Use when the
+            path may have been written by another process since this one last listed its directory.
 
     Returns:
         ``True`` if the path exists, ``False`` otherwise.
     """
     fs, plain = _get_fs(path)
     if fs is not None:
+        if refresh:
+            invalidate_cache(path)
         return fs.exists(plain)
     return Path(plain).exists()
 

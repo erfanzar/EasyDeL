@@ -2129,6 +2129,9 @@ class Qwen4ExpMTPHead(spx.Module):
     shared LM head is applied by the caller.
     """
 
+    #: The head allocates its own cache (:meth:`init_cache`); keep it out of the decoder's operation-cache discovery.
+    owns_operation_cache = True
+
     def __init__(
         self,
         config: Qwen4ExpTextConfig,

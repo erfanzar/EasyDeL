@@ -124,6 +124,9 @@ class Glm5NextMTPHead(spx.Module):
     mapping is :func:`glm5_next_mtp_key_rules`.
     """
 
+    #: The drafter keeps an MTP-local cache; keep the head out of the backbone's operation-cache discovery.
+    owns_operation_cache = True
+
     def __init__(
         self,
         config: Glm5NextTextConfig,

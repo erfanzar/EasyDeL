@@ -699,8 +699,21 @@ class OperationCacheMixin:
         seen_op_ids: set[int] = set()
         has_separate_decode = False
 
+        # Submodules that allocate their own cache (MTP / draft heads) are not decoder layers: their
+        # ``layers.N`` paths would otherwise alias main layer N and merge into its cache view.
+        owned_prefixes = [
+            tuple(path)
+            for path, module in iter_module_search(self, spx.Module)
+            if path and path != ("",) and getattr(type(module), "owns_operation_cache", False)
+        ]
+
+        def _is_owned(path: tuple) -> bool:
+            return any(tuple(path[: len(prefix)]) == prefix for prefix in owned_prefixes)
+
         # Phase 1: Find all FlexibleAttentionModule instances
         for path, flex_attn in iter_module_search(self, FlexibleAttentionModule):
+            if _is_owned(path):
+                continue
             layer_idx = self._extract_layer_index_from_path(path)
             slot_key = tuple(path)
 
@@ -749,7 +762,7 @@ class OperationCacheMixin:
         # Phase 2: Find BaseOperation instances stored directly on modules
         # This catches cases like Qwen3NextLinearAttention which stores GatedDeltaRuleOp as gdr_op
         for path, module in iter_module_search(self, spx.Module):
-            if isinstance(module, FlexibleAttentionModule):
+            if isinstance(module, FlexibleAttentionModule) or _is_owned(path):
                 continue
 
             layer_idx = self._extract_layer_index_from_path(path)

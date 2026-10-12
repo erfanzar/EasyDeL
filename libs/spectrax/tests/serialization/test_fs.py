@@ -120,6 +120,54 @@ class TestExists:
         assert exists(path) is False
 
 
+@pytest.mark.cpu_ok
+class TestExistsRefresh:
+    """Issue #292: a remote listing cached before another host wrote the file must not hide it."""
+
+    class _StaleListingFS:
+        """Answers ``exists`` from a listing snapshot until ``invalidate_cache`` drops it (gcsfs behaviour)."""
+
+        def __init__(self):
+            self.files: set[str] = set()
+            self.snapshot: set[str] | None = None
+            self.invalidated: list[str] = []
+
+        def exists(self, path):
+            if self.snapshot is None:
+                self.snapshot = set(self.files)
+            return path in self.snapshot
+
+        def invalidate_cache(self, path=None):
+            self.invalidated.append(path)
+            self.snapshot = None
+
+    def _patch(self, monkeypatch):
+        import spectrax.serialization._fs as fs_mod
+
+        fake = self._StaleListingFS()
+        monkeypatch.setattr(fs_mod, "_get_fs", lambda path: (fake, str(path).split("://", 1)[-1]))
+        return fake
+
+    def test_plain_exists_keeps_stale_answer(self, monkeypatch):
+        fake = self._patch(monkeypatch)
+        assert exists("gs://bucket/run/index.json") is False
+        fake.files.add("bucket/run/index.json")
+        assert exists("gs://bucket/run/index.json") is False
+
+    def test_refresh_sees_file_written_after_listing(self, monkeypatch):
+        fake = self._patch(monkeypatch)
+        assert exists("gs://bucket/run/index.json") is False
+        fake.files.add("bucket/run/index.json")
+        assert exists("gs://bucket/run/index.json", refresh=True) is True
+        assert "bucket/run" in fake.invalidated
+
+    def test_refresh_is_noop_for_local_paths(self, tmp_path):
+        f = tmp_path / "x.txt"
+        assert exists(str(f), refresh=True) is False
+        f.write_text("x")
+        assert exists(str(f), refresh=True) is True
+
+
 class TestIsDir:
     """Tests for is_dir."""
 

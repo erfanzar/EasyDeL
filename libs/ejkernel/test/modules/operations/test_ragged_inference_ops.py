@@ -697,6 +697,52 @@ def test_ragged_gated_delta_rule_v2_split_wrapper_generates_initial_state_mask()
     assert_allclose(sharded_state, direct_state, atol=0.0)
 
 
+def test_ragged_gated_delta_rule_v2_falls_back_when_no_mesh_axis_divides_heads():
+    """Issue #293: a multi-device mesh whose axes divide no GDN head count runs (XLA) instead of raising.
+
+    On TPU the default (``auto``) request used to raise "requires a non-replicated shard_map axis" for an
+    fsdp-only mesh wider than the head count. The result must equal the unsharded XLA run.
+    """
+    devices = jax.devices()
+    if len(devices) < 3:
+        pytest.skip("needs >= 3 devices so the mesh axis cannot divide the heads")
+    mesh = Mesh(np.asarray(devices[:3]), ("fsdp",))
+    tokens, n_kq, n_v, d_k, d_v = 2, 1, 2, 4, 3
+    key_dim = n_kq * d_k
+    value_dim = n_v * d_v
+    mixed_qkv = jax.random.normal(jax.random.PRNGKey(3), (tokens, 2 * key_dim + value_dim), dtype=jnp.float32) * 0.05
+    b = jnp.full((tokens, n_v), 0.3, dtype=jnp.float32)
+    a = jnp.full((tokens, n_v), -0.2, dtype=jnp.float32)
+    A_log = jnp.zeros((n_v,), dtype=jnp.float32)
+    dt_bias = jnp.zeros((n_v,), dtype=jnp.float32)
+    query_start_loc = jnp.array([0, 1, 2], dtype=jnp.int32)
+    state_indices = jnp.array([0, 1], dtype=jnp.int32)
+    distribution = jnp.array([2, 2, 2], dtype=jnp.int32)
+    has_initial_state = jnp.ones((2,), dtype=jnp.bool_)
+    common = dict(n_kq=n_kq, n_v=n_v, d_k=d_k, d_v=d_v, chunk_size=2)
+    args = (mixed_qkv, b, a)
+    tail = (A_log, dt_bias, query_start_loc, state_indices, distribution, has_initial_state)
+
+    direct_state, direct_out = ragged_gated_delta_rule_v2(
+        *args,
+        jnp.zeros((2, n_v, d_k, d_v), dtype=jnp.float32),
+        *tail,
+        cfg=RaggedGatedDeltaRuleV2Config(chunk_size=2, platform="xla"),
+        **common,
+    )
+    mesh_state, mesh_out = ragged_gated_delta_rule_v2(
+        *args,
+        jnp.zeros((2, n_v, d_k, d_v), dtype=jnp.float32),
+        *tail,
+        mesh=mesh,
+        head_axis="tp",
+        **common,
+    )
+
+    assert_allclose(mesh_out, direct_out, atol=1e-5, rtol=1e-5)
+    assert_allclose(mesh_state, direct_state, atol=1e-5, rtol=1e-5)
+
+
 def test_ragged_gated_delta_rule_v2_split_head_sharded_path_matches_direct():
     """Assert the split (non-flat) head-sharded GDR v2 path matches the unsharded result.
 

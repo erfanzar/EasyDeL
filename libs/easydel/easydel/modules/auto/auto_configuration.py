@@ -33,6 +33,7 @@ from collections.abc import Callable, Mapping, Sequence
 from functools import partial
 
 import jax
+import numpy as np
 import spectrax as spx
 from eformer.loggings import get_logger
 from eformer.paths import ePath
@@ -462,6 +463,37 @@ class AutoEasyDeLConfig:
         return config
 
 
+def place_leaf_on_sharding(
+    x: tp.Any,
+    target: jax.sharding.Sharding,
+    *,
+    from_host: bool | None = None,
+) -> jax.Array:
+    """Place one checkpoint leaf on ``target``.
+
+    On multi-process runs a leaf that is local to this process (a host array, or a device array living on one local
+    device) is assembled from host memory one addressable shard at a time. ``jax.device_put`` of such a leaf onto a
+    global sharding lowers to an identity program whose temporaries can exceed HBM for vocab-sized tensors
+    (issue #290); building from host never puts the full tensor on any device.
+
+    Args:
+        x: Array-like leaf.
+        target: Destination sharding.
+        from_host: Force (``True``) or skip (``False``) the host-assembly path; ``None`` uses it exactly when the
+            run spans several processes and ``x`` is not already a global array.
+
+    Returns:
+        The leaf placed on ``target``.
+    """
+    if from_host is None:
+        is_global = isinstance(x, jax.Array) and not x.is_fully_addressable
+        from_host = jax.process_count() > 1 and not is_global
+    if not from_host:
+        return jax.device_put(x, target)
+    host = np.asarray(jax.device_get(x))
+    return jax.make_array_from_callback(host.shape, target, lambda index: host[index])
+
+
 def _shard_gather_fns_from_named_shardings(
     named_shardings: tp.Any,
     mesh: MeshLike,
@@ -519,7 +551,9 @@ def _shard_gather_fns_from_named_shardings(
                 The array placed on ``_ns``, or ``x`` unchanged if it is
                 not array-like (no ``shape`` attribute).
             """
-            return jax.device_put(x, _ns) if hasattr(x, "shape") else x
+            if not hasattr(x, "shape"):
+                return x
+            return place_leaf_on_sharding(x, _ns)
 
         return _shard
 
