@@ -1,0 +1,251 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Configuration for Mistral AI's dense decoder family (Mistral-7B, Ministral, …).
+
+Defines :class:`MistralConfig`, registered under the ``mistral`` model-type.
+Mistral keeps the LLaMA backbone but adds two key features: **grouped-query
+attention** with ``num_key_value_heads`` < ``num_attention_heads`` to shrink
+the KV cache, and **sliding-window attention** (``sliding_window``) that
+bounds each layer's effective receptive field for long-context decoding.
+The config also exports :meth:`MistralConfig.get_mask_details` so the
+attention runtime can attach an :class:`AttnMaskDetail` of type
+``AttnMaskType.SLIDING`` to every layer.
+"""
+
+from easydel.infra.base_module import EasyDeLBaseConfig
+from easydel.infra.etils import EasyDeLGradientCheckPointers
+from easydel.infra.factory import register_config
+from easydel.infra.utils import AttnMaskDetail, AttnMaskType
+
+
+@register_config("mistral")
+class MistralConfig(EasyDeLBaseConfig):
+    """Configuration for Mistral AI's dense (non-MoE) decoder family (Mistral-7B, Ministral, …).
+
+    Mistral is a LLaMA-style transformer with three notable departures
+    from the original LLaMA: **grouped-query attention** with
+    ``num_key_value_heads`` < ``num_attention_heads`` (a 4:1 ratio in
+    Mistral-7B) shrinking the KV cache; **sliding-window attention**
+    (``sliding_window``) that bounds the per-layer attention range to a
+    local window with O(L·W) cost while letting deeper layers re-mix
+    long-range information; and **a long RoPE base** (``rope_theta``,
+    typically 10000–1000000) for length extrapolation. ``head_dim`` is
+    fixed at 128 in the official checkpoints (independent of
+    ``hidden_size / num_attention_heads``) which yields slightly different
+    tensor shapes from a vanilla LLaMA conversion.
+
+    Attributes:
+        vocab_size (`int`, *optional*, defaults to 32000):
+            Vocabulary size of the Mistral model. Defines the number of different tokens that can be represented by the
+            `inputs_ids` passed to the forward method.
+        hidden_size (`int`, *optional*, defaults to 4096):
+            Dimensionality of the encoder layers and the pooler layer.
+        intermediate_size (`int`, *optional*, defaults to 14336):
+            Dimensionality of the "intermediate" (i.e., feed-forward) layer in the Transformer encoder.
+        head_dim (`int`, *optional*):
+            Dimensionality of the head for attention. Defaults to
+            ``hidden_size // num_attention_heads`` when not provided (as in HF).
+        num_hidden_layers (`int`, *optional*, defaults to 32):
+            Number of hidden layers in the Transformer encoder.
+        num_attention_heads (`int`, *optional*, defaults to 32):
+            Number of attention heads for each attention layer in the Transformer encoder.
+        num_key_value_heads (`int`, *optional*, defaults to 8):
+            Number of key and value heads for each attention layer in the Transformer encoder.
+        hidden_act (`str` or `function`, *optional*, defaults to `"silu"`):
+            The non-linear activation function (function or string) to use in the encoder and pooler. If string,
+            `"gelu"`, `"relu"`, `"swish"` and `"gelu_new"` are supported.
+        max_position_embeddings (`int`, *optional*, defaults to 4096 * 32):
+            The maximum sequence length that this model might ever be used with. Typically set this to something large
+            just in case (e.g., 2048 or 4096).
+        initializer_range (`float`, *optional*, defaults to 0.02):
+            The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
+        rms_norm_eps (`float`, *optional*, defaults to 1e-6):
+            The epsilon used by the rms normalization layers.
+        use_cache (`bool`, *optional*, defaults to `True`):
+            Whether or not the model should return the last key/values attentions (not used by all models). Only
+            relevant if `config.is_decoder=True`.
+        pad_token_id (`int`, *optional*):
+            The index of the padding token in the vocabulary.
+        bos_token_id (`int`, *optional*, defaults to 1):
+            The id of the *beginning-of-sequence* token.
+        eos_token_id (`int`, *optional*, defaults to 2):
+            The id of the *end-of-sequence* token.
+        tie_word_embeddings (`bool`, *optional*, defaults to `False`):
+            Whether to tie the weights of the input embeddings and the output embeddings.
+        rope_theta (`float`, *optional*, defaults to 10000.0):
+            The theta value to use for rotary position embeddings.
+        rope_scaling (`tp.Dict[str, tp.Union[str, float]]`, *optional*):
+            The configuration for rope scaling.
+        sliding_window (`int`, *optional*, defaults to 4096):
+            The sliding window size.
+        gradient_checkpointing (`str`, *optional*, defaults to `"nothing_saveable"`):
+            The gradient checkpointing configuration.
+        number_rep_kv (`int`, *optional*, defaults to 1):
+            Number of repetitions for the key and value vectors.
+        attention_dropout (`float`, *optional*, defaults to 0.0):
+            The dropout ratio for the attention probabilities.
+        use_scan_mlp (`bool`, *optional*, defaults to `False`):
+            Whether to use the scan implementation for the MLP.
+        scan_mlp_chunk_size (`int`, *optional*, defaults to 1024):
+            The chunk size to use when scanning the MLP.
+        bits (`int`, *optional*):
+            The number of bits to quantize the model to.
+        attention_bias (`bool`, *optional*, defaults to `False`):
+            Whether to use bias in the attention layer.
+    """
+
+    model_type: str = "mistral"
+
+    def __init__(
+        self,
+        vocab_size: int = 32000,
+        hidden_size: int = 4096,
+        intermediate_size: int = 14336,
+        head_dim: int | None = None,
+        num_hidden_layers: int = 32,
+        num_attention_heads: int = 32,
+        num_key_value_heads: int | None = 8,
+        hidden_act: str = "silu",
+        max_position_embeddings: int = 4096 * 32,
+        initializer_range: float = 0.02,
+        rms_norm_eps: float = 1e-6,
+        use_cache: bool = True,
+        pad_token_id: int | None = None,
+        bos_token_id: int = 1,
+        eos_token_id: int = 2,
+        tie_word_embeddings: bool = False,
+        rope_theta: float = 10000.0,
+        rope_scaling: dict[str, str | float] | None = None,
+        sliding_window: int | None = 4096,
+        gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
+        number_rep_kv: int = 1,
+        attention_dropout: float = 0.0,
+        use_scan_mlp: bool = False,
+        scan_mlp_chunk_size: int = 1024,
+        bits: int | None = None,
+        layer_types: list[str] | None = None,
+        attention_bias: bool = False,
+        **kwargs,
+    ):
+        """Initialize the Mistral configuration.
+
+        Args:
+            vocab_size (int, optional): Vocabulary size. Defaults to 32000.
+            hidden_size (int, optional): Hidden dimension. Defaults to 4096.
+            intermediate_size (int, optional): MLP intermediate dimension. Defaults to 14336.
+            head_dim (int | None, optional): Per-head attention dimension. ``None`` (the default)
+                resolves to ``hidden_size // num_attention_heads`` as in HF.
+            num_hidden_layers (int, optional): Number of decoder layers. Defaults to 32.
+            num_attention_heads (int, optional): Number of attention heads. Defaults to 32.
+            num_key_value_heads (int | None, optional): Number of key/value heads for
+                grouped-query attention. Defaults to 8.
+            hidden_act (str, optional): MLP activation function. Defaults to "silu".
+            max_position_embeddings (int, optional): Maximum sequence length.
+                Defaults to ``4096 * 32``.
+            initializer_range (float, optional): Initializer standard deviation.
+                Defaults to 0.02.
+            rms_norm_eps (float, optional): Epsilon for RMSNorm. Defaults to 1e-6.
+            use_cache (bool, optional): Whether to enable KV caching. Defaults to True.
+            pad_token_id (int | None, optional): Padding token id. Defaults to None.
+            bos_token_id (int, optional): Beginning-of-sequence token id. Defaults to 1.
+            eos_token_id (int, optional): End-of-sequence token id. Defaults to 2.
+            tie_word_embeddings (bool, optional): Tie input/output embeddings.
+                Defaults to False.
+            rope_theta (float, optional): RoPE base period. Defaults to 10000.0.
+            rope_scaling (dict[str, str | float] | None, optional): RoPE scaling
+                configuration. Defaults to None.
+            sliding_window (int | None, optional): Sliding-window size. Defaults to 4096.
+            gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient
+                checkpointing policy. Defaults to ``EasyDeLGradientCheckPointers.NONE``.
+            number_rep_kv (int, optional): Number of repeats for key/value heads.
+                Defaults to 1.
+            attention_dropout (float, optional): Attention dropout. Defaults to 0.0.
+            use_scan_mlp (bool, optional): Whether to use the scan implementation for
+                the MLP. Defaults to False.
+            scan_mlp_chunk_size (int, optional): Chunk size for scan MLP. Defaults to 1024.
+            bits (int | None, optional): Quantization bits. Defaults to None.
+            layer_types (list[str] | None, optional): Per-layer attention type
+                (``"sliding_attention"`` or ``"full_attention"``); auto-derived from
+                ``sliding_window`` when ``None``. Defaults to None.
+            attention_bias (bool, optional): Use bias in attention projections.
+                Defaults to False.
+            **kwargs: Additional keyword arguments forwarded to ``EasyDeLBaseConfig``.
+        """
+        self.vocab_size = vocab_size
+        self.max_position_embeddings = max_position_embeddings
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_hidden_layers = num_hidden_layers
+        self.head_dim = head_dim if head_dim is not None else hidden_size // num_attention_heads
+        self.num_attention_heads = num_attention_heads
+        self.sliding_window = sliding_window
+        self.bits = bits
+        # for backward compatibility
+        if num_key_value_heads is None:
+            num_key_value_heads = num_attention_heads
+
+        self.num_key_value_heads = num_key_value_heads
+        self.hidden_act = hidden_act
+        self.initializer_range = initializer_range
+        self.rms_norm_eps = rms_norm_eps
+        self.use_cache = use_cache
+        self.rope_theta = rope_theta
+        self.rope_scaling = rope_scaling
+        self.number_rep_kv = number_rep_kv
+        self.gradient_checkpointing = gradient_checkpointing
+        self.use_scan_mlp = use_scan_mlp
+        self.scan_mlp_chunk_size = scan_mlp_chunk_size
+        self.attention_bias = attention_bias
+        self.attention_dropout = attention_dropout
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = [
+                "sliding_attention" if self.sliding_window is not None else "full_attention"
+                for _ in range(self.num_hidden_layers)
+            ]
+        super().__init__(
+            pad_token_id=pad_token_id,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            tie_word_embeddings=tie_word_embeddings,
+            use_scan_mlp=use_scan_mlp,
+            scan_mlp_chunk_size=scan_mlp_chunk_size,
+            bits=bits,
+            **kwargs,
+        )
+
+    def get_mask_details(self) -> dict[int, AttnMaskDetail]:
+        """Retrieve attention mask details for each layer in the model.
+
+        This method generates a dictionary mapping layer indices to their corresponding attention mask details.
+        If a sliding window is defined, each layer is assigned a sliding window attention mask with the specified size.
+
+        Returns:
+            dict[int, AttnMaskDetail]: A dictionary where keys are layer indices (int) and values are AttnMaskDetail
+            objects specifying the attention mask type and size for each layer.
+
+        Notes:
+            - If `self.sliding_window` is None, an empty dictionary is returned.
+            - The method iterates over `self.num_hidden_layers` to assign mask details for each layer.
+            - The attention mask type is set to `AttnMaskType.SLIDING` when a sliding window is defined.
+        """
+        mapping = {}
+        if self.layer_types is not None:
+            for layer_idx in range(self.num_hidden_layers):
+                mapping[layer_idx] = AttnMaskDetail(
+                    mask_type=AttnMaskType.from_hf(self.layer_types[layer_idx]),
+                    size=self.sliding_window,
+                )
+        return mapping

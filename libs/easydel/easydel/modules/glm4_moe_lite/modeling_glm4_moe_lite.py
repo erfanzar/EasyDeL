@@ -1,0 +1,1440 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Spectrax implementation of GLM-4-MoE-Lite.
+
+GLM-4-MoE-Lite is a lightweight MoE variant of GLM-4 that combines
+Multi-head Latent Attention (MLA) with a hybrid dense/grouped-MoE FFN
+schedule. MLA replaces the full Q/K/V projection set with a low-rank
+compression of the KV cache, drastically reducing memory while preserving
+representational capacity.
+
+Architectural traits:
+    - Multi-head Latent Attention with separate compressed KV cache views.
+    - Grouped top-k MoE routing with shared (always-on) experts.
+    - First ``first_k_dense_replace`` layers use a dense MLP; remaining
+      layers use the MoE block.
+    - Pre-norm RMSNorm decoder layers with partial RoPE.
+
+Exports:
+    - :class:`Glm4MoeLiteModel`: Backbone returning hidden states.
+    - :class:`Glm4MoeLiteForCausalLM`: Decoder LM with optional tied LM head.
+"""
+
+import functools
+import typing
+from functools import partial
+from typing import ClassVar
+
+import jax
+import jax.numpy as jnp
+import spectrax as spx
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
+from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
+
+from easydel.caching import (
+    HybridCache,
+    MLARaggedPagesCacheView,
+    OperationsMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
+    TransformerCache,
+    TransformerCacheView,
+    TransformerMetadata,
+)
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import TaskType, register_module
+from easydel.infra.modeling_outputs import AttentionLayerOutput, DecoderLayerOutput, MoeModelOutput
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, blockwise_ffn
+from easydel.layers import (
+    BaseMoeModule,
+    ColumnParallelLinear,
+    ColumnParallelMoELinear,
+    Embed,
+    MoeFusedHooks,
+    MoeLoadBalancingStrategy,
+    MoeRoutingStrategy,
+    RMSNorm,
+    RowParallelLinear,
+    RowParallelMoELinear,
+    dense_gate_up_layout,
+    gated_mlp_forward,
+    moe_down_projection_reform_param,
+    moe_fused_gate_up_reform_param,
+    split_fused_gate_up_projection,
+)
+from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
+from easydel.layers.moe import moe_group_topk_select
+from easydel.layers.rotary import apply_rope_interleaved, yarn_get_mscale
+from easydel.modules._base import BaseCausalLMModule
+
+from .glm4_moe_lite_configuration import Glm4MoeLiteConfig
+
+
+class Glm4MoeLiteMLP(spx.Module):
+    """Dense MLP block for GLM-4-MoE-Lite layers.
+
+    Implements the standard gated feedforward network with separate gate and up
+    projections, used in dense layers of the GLM-4-MoE-Lite hybrid architecture.
+    Supports configurable hidden and intermediate sizes.
+    """
+
+    def __init__(
+        self,
+        config: Glm4MoeLiteConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        hidden_size: int | None = None,
+        intermediate_size: int | None = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize the dense GLM-4-MoE-Lite MLP block.
+
+        Args:
+            config: Model configuration.
+            dtype: Computation dtype.
+            param_dtype: Parameter dtype.
+            precision: JAX matmul precision.
+            hidden_size: Optional override for the input/output dim;
+                defaults to ``config.hidden_size``. Used by the shared
+                expert which widens the model dim by ``n_shared_experts``.
+            intermediate_size: Optional override for the inner MLP width;
+                defaults to ``config.intermediate_size``.
+            rngs: Random number generator collection.
+        """
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.hidden_size = hidden_size or config.hidden_size
+        self.intermediate_size = intermediate_size or config.intermediate_size
+        self.gate_up_proj = ColumnParallelLinear(
+            self.hidden_size,
+            (self.intermediate_size, self.intermediate_size),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            rngs=rngs,
+            layout=dense_gate_up_layout(self.intermediate_size),
+        )
+        self.down_proj = RowParallelLinear(
+            self.intermediate_size,
+            self.hidden_size,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            rngs=rngs,
+        )
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    @property
+    def reform_param(self):
+        """Checkpoint reform rules for the fused ``gate_up_proj`` projection.
+
+        Returns:
+            dict: Mapping consumed by the checkpoint loader to split the fused
+                gate/up kernel back into per-projection slices on load.
+        """
+        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
+
+    def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> Array:
+        """Run the dense gated MLP.
+
+        Delegates to :func:`easydel.layers.gated_mlp_forward`, which routes
+        supported layouts through the ejkernel fused MLP kernels and runs
+        the legacy composition otherwise.
+
+        Args:
+            hidden_states: Input residual stream
+                ``(batch, seq_len, hidden_size)``.
+
+        Returns:
+            Transformed hidden states with the same shape as the input.
+        """
+        return gated_mlp_forward(self, hidden_states)
+
+
+class Glm4MoeLiteMLPStack(spx.Module):
+    """Expert MLP stack for GLM-4-MoE-Lite using parallel MoE linear layers.
+
+    Implements the feedforward network for multiple experts using efficient
+    batched computation with ColumnParallelMoELinear and RowParallelMoELinear
+    layers. Supports expert tensor mode for optimized expert computation.
+    """
+
+    def __init__(
+        self,
+        config: Glm4MoeLiteConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize the routed-expert MLP stack.
+
+        Args:
+            config: Model configuration carrying ``n_routed_experts`` and
+                ``moe_intermediate_size``.
+            dtype: Computation dtype.
+            param_dtype: Parameter dtype.
+            precision: JAX matmul precision.
+            rngs: Random number generator collection.
+        """
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.gate_up_proj = ColumnParallelMoELinear(
+            num_experts=config.n_routed_experts,
+            in_features=config.hidden_size,
+            out_features=2 * config.moe_intermediate_size,
+            rngs=rngs,
+            kernel_init=jax.nn.initializers.normal(),
+            use_bias=False,
+            partition_manager=config.runtime_sharding_resolver,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
+            dtype=dtype,
+            param_dtype=param_dtype,
+        )
+        self.down_proj = RowParallelMoELinear(
+            num_experts=config.n_routed_experts,
+            in_features=config.moe_intermediate_size,
+            out_features=config.hidden_size,
+            rngs=rngs,
+            kernel_init=jax.nn.initializers.normal(),
+            use_bias=False,
+            partition_manager=config.runtime_sharding_resolver,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
+            dtype=dtype,
+            param_dtype=param_dtype,
+        )
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    @property
+    def reform_param(self):
+        return {
+            **moe_fused_gate_up_reform_param(config=self.config),
+            **moe_down_projection_reform_param(),
+        }
+
+    def forward(
+        self,
+        hidden_states: Array,
+        group_sizes: Array,
+        sorted_experts: Array | None = None,
+    ) -> Array:
+        """Run the routed gated MLP across all experts at once.
+
+        Args:
+            hidden_states: Token rows already permuted by expert
+                assignment.
+            group_sizes: Per-expert token counts feeding the underlying
+                grouped-matmul kernel.
+            sorted_experts: Optional sorted expert indices threaded
+                through the parallel MoE kernels.
+
+        Returns:
+            Expert outputs aligned with the permuted input rows.
+        """
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+        gate_up = checkpoint_name(self.gate_up_proj(hidden_states, group_sizes, sorted_experts), name="mlp_gate_up")
+        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        return typing.cast(
+            Array,
+            apply_logical_sharding(
+                checkpoint_name(self.down_proj(self.act_fn(gate) * up, group_sizes, sorted_experts), name="mlp_down"),
+                dynamic_axes=common_types.HiddenStateSharding,
+                partition_manager=self.config.runtime_sharding_resolver,
+            ),
+        )
+
+
+class Glm4MoeLiteTopKRouter(spx.Module):
+    """fp32 router projection feeding the grouped top-k selector in :class:`Glm4MoeLiteMoE`.
+
+    Owns only the *projection* parameters — the actual grouped top-k logic
+    lives in :func:`easydel.layers.moe.moe_group_topk_select`. The two stored
+    parameters are:
+
+    - ``weight``: ``(hidden_size, n_routed_experts)`` learned matrix used to
+      produce the per-expert pre-bias logits.
+    - ``e_score_correction_bias``: ``(n_routed_experts,)`` learnable
+      load-balancing bias that is added to the sigmoid scores at
+      *selection* time only — never to the convex combination weights, so
+      the bias can drive load balancing without distorting expert
+      contributions.
+
+    The matmul is forced into float32 (regardless of activation dtype)
+    because the relative gaps between selected and rejected experts can
+    fall below bfloat16's resolution near initialisation.
+    """
+
+    def __init__(
+        self,
+        config: Glm4MoeLiteConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize the GLM-4-MoE-Lite top-k router projection.
+
+        Args:
+            config: Model configuration carrying ``n_routed_experts``.
+            dtype: Computation dtype (router matmul is forced to fp32
+                regardless).
+            param_dtype: Parameter dtype.
+            precision: JAX matmul precision.
+            rngs: Random number generator collection.
+        """
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.n_routed_experts = config.n_routed_experts
+        self.weight = spx.Parameter(
+            jax.nn.initializers.normal(config.initializer_range)(
+                rngs.param,
+                (config.hidden_size, self.n_routed_experts),
+                param_dtype,
+            )
+        )
+        # Declared via ArrayParam.bound (as glm4_moe and hy_v3 do) rather than a
+        # bare spx.Parameter: under sequential_init the bare form stays an
+        # unmaterialised ShapeDtypeStruct, which was harmless only while nothing
+        # read it. Routing reads it now.
+        self.e_score_correction_bias = ArrayParam.bound(
+            shape=(self.n_routed_experts,),
+            dtype=jnp.float32,
+            init_method="zeros",
+            key=rngs.param,
+        )
+
+    def forward(self, hidden_states: Float[Array, "tokens hidden_dim"]) -> Array:
+        """Project hidden states to per-expert pre-bias logits.
+
+        Args:
+            hidden_states: Token activations
+                ``(batch * seq_len, hidden_size)`` (or any shape whose
+                last dim is ``hidden_size``).
+
+        Returns:
+            fp32 router logits of shape
+            ``(num_tokens, n_routed_experts)``.
+        """
+        hidden_states = hidden_states.reshape(-1, self.config.hidden_size)
+        return checkpoint_name(
+            jnp.matmul(hidden_states.astype(jnp.float32), self.weight.value.astype(jnp.float32)),
+            "moe_router_logits",
+        )
+
+
+class Glm4MoeLiteMoE(BaseMoeModule):
+    """Sparse FFN with grouped sigmoid-top-k routing plus an always-on shared expert.
+
+    Identical routing protocol to :class:`Glm4MoeMoE` (DeepSeek-style
+    grouped top-k with bias-corrected sigmoid scoring; see that class's
+    docstring for the full algorithm) but configured for the *Lite*
+    parameter regime: smaller ``n_routed_experts``, smaller
+    ``moe_intermediate_size``, and a single layer-uniform routing schedule
+    with no first-K-dense replacement at this level (the dense/sparse mix
+    is decided one level up at the decoder layer).
+
+    The convex combination is
+
+        ``out = shared(h) + sum_i w_i * routed_i(h)``
+
+    with ``shared`` widened by ``n_shared_experts`` (so the shared branch
+    matches the aggregate capacity of the selected routed branch). When
+    ``n_shared_experts == 0`` the shared expert is omitted entirely. The
+    ``moe_call`` parent dispatch sorts tokens by expert and runs all
+    routed-expert kernels through ``grouped_matmul``.
+    """
+
+    def __init__(
+        self,
+        config: Glm4MoeLiteConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize the sparse FFN block.
+
+        Args:
+            config: Model configuration carrying every routing knob
+                (``n_routed_experts``, ``num_experts_per_tok``, ``n_group``,
+                ``topk_group``, ``norm_topk_prob``, ``routed_scaling_factor``,
+                ``n_shared_experts``, ``moe_intermediate_size``).
+            dtype: Computation dtype.
+            param_dtype: Parameter dtype.
+            precision: JAX matmul precision.
+            rngs: Random number generator collection.
+        """
+        super().__init__(
+            config=config,
+            n_routed_experts=config.n_routed_experts,
+            num_experts_per_tok=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            lbl_coef=getattr(config, "router_aux_loss_coef", None),
+            rzl_coef=getattr(config, "router_z_loss_coef", None),
+            routing_strategy=MoeRoutingStrategy.TOP_K,
+            load_balancing_strategy=MoeLoadBalancingStrategy.STANDARD,
+        )
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.n_group = config.n_group
+        self.topk_group = config.topk_group
+        self.norm_topk_prob = config.norm_topk_prob
+        self.routed_scaling_factor = config.routed_scaling_factor
+        self.group_topk_k = min(2, (config.n_routed_experts or 0) // max(config.n_group, 1))
+
+        self.experts = Glm4MoeLiteMLPStack(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.gate = Glm4MoeLiteTopKRouter(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.shared_experts = (
+            Glm4MoeLiteMLP(
+                config=config,
+                intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+            )
+            if config.n_shared_experts
+            else None
+        )
+        self.moe_hooks = MoeFusedHooks(
+            normalize_gate_logits=lambda x: x,
+        )
+
+    def _select_hook(self):
+        """Bind the shared grouped top-k selector to this layer's live bias.
+
+        ``e_score_correction_bias`` is the auxiliary-loss-free load-balancing
+        term: it steers *selection* without touching the combine weights. It
+        has to be read here rather than captured in ``__init__`` -- binding the
+        parameter at construction time freezes the zero-initialised tensor, so
+        the trained bias never reaches routing. That is exactly the bug this
+        replaced: the previous hook took ``pre_bias_logits`` and dropped it.
+        """
+        return partial(
+            moe_group_topk_select,
+            n_routed_experts=self.n_routed_experts,
+            score_fn="sigmoid",
+            e_score_correction_bias=self.gate.e_score_correction_bias.value,
+            n_group=self.config.n_group,
+            topk_group=self.config.topk_group,
+            group_topk_k=self.group_topk_k,
+            group_score="topk_sum",
+            norm_topk_prob=self.config.norm_topk_prob,
+            routed_scaling_factor=self.config.routed_scaling_factor,
+        )
+
+    def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
+        """Run the sparse FFN with optional shared expert.
+
+        Args:
+            hidden_states: Pre-MoE residual ``(batch, seq_len, hidden_size)``.
+
+        Returns:
+            Tuple ``(out, router_logits)`` where ``out`` is the combined
+            shared + routed expert output and ``router_logits`` are the
+            raw fp32 logits used for auxiliary load-balancing losses.
+        """
+        hooks = self.moe_hooks.replace(select_hook=self._select_hook())
+        out, router_logits = self.moe_call(
+            hidden_state=hidden_states,
+            gate_layer=self.gate,
+            expert_layer=self.experts,
+            gate_up_kernel=self.experts.gate_up_proj.kernel_view(),
+            wd_kernel=self.experts.down_proj.kernel_view(),
+            act_fn=self.experts.act_fn,
+            hooks=hooks,
+        )
+        if self.shared_experts is not None:
+            out = out + self.shared_experts(hidden_states)
+        return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
+
+
+class Glm4MoeLiteAttention(UnifiedAttention):
+    """DeepSeek-style Multi-head Latent Attention with split-RoPE heads and YaRN mscale.
+
+    Same MLA layout used in DeepSeek-V2/V3 and the GlmMoeDsaAttention sibling
+    class, minus the dynamic-sparse indexer:
+
+    - **Query LoRA** ``hidden -> q_lora_rank -> num_heads * q_head_dim`` when
+      ``q_lora_rank`` is set (skipped, i.e., a single dense ``q_proj``, when
+      it is ``None``/0).
+    - **KV compression** ``hidden -> kv_lora_rank (+ qk_rope_head_dim) ->
+      num_kv_heads * (qk_nope + v_head_dim)`` storing only the
+      ``kv_lora_rank``-dimensional latent in the KV cache rather than the
+      full keys and values.
+    - **Split-RoPE heads**: ``q_head_dim = qk_nope_head_dim + qk_rope_head_dim``
+      with RoPE applied only to the trailing ``qk_rope_head_dim`` slice; the
+      ``qk_nope_head_dim`` slice carries content-only matching. Values use
+      a separate ``v_head_dim`` because they need no rotated component.
+    - **YaRN mscale** at ``softmax_scale`` time: when long-context RoPE
+      scaling is configured, the softmax temperature is multiplied by the
+      :func:`yarn_get_mscale` factor so the effective attention temperature
+      matches the rescaled RoPE frequencies — this avoids the classic
+      attention sharpening that otherwise plagues NTK-style RoPE scaling
+      at very long contexts.
+
+    The ``projection_mapping`` class variable rewrites the ``UnifiedAttention``
+    factory's logical names into the HF-DeepSeek attribute names so released
+    checkpoints load directly.
+    """
+
+    projection_mapping: ClassVar[dict[str, str]] = {
+        "mla_q_proj": "q_proj",
+        "mla_q_a_proj": "q_a_proj",
+        "mla_q_a_layernorm": "q_a_layernorm",
+        "mla_q_b_proj": "q_b_proj",
+        "mla_kv_a_proj_with_mqa": "kv_a_proj_with_mqa",
+        "mla_kv_a_layernorm": "kv_a_layernorm",
+        "mla_kv_b_proj": "kv_b_proj",
+        "output_projection": "o_proj",
+    }
+
+    def __init__(
+        self,
+        config: Glm4MoeLiteConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+        layer_idx: int,
+    ):
+        """Initialize the MLA attention block.
+
+        Args:
+            config: Model configuration carrying every MLA hyper-param
+                (``q_lora_rank``, ``kv_lora_rank``, ``qk_nope_head_dim``,
+                ``qk_rope_head_dim``, ``v_head_dim``, ``rope_scaling``).
+            dtype: Computation dtype.
+            param_dtype: Parameter dtype.
+            precision: JAX matmul precision.
+            rngs: Random number generator collection.
+            layer_idx: Index of this layer in the decoder stack.
+        """
+        self.config = config
+        self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+        self.qk_nope_head_dim = config.qk_nope_head_dim
+        self.qk_rope_head_dim = config.qk_rope_head_dim
+        self.v_head_dim = config.v_head_dim
+        self.kv_lora_rank = config.kv_lora_rank
+
+        super().__init__(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            layer_idx=layer_idx,
+            attention_type="mla",
+            causal=True,
+            use_mla_lora=config.q_lora_rank is not None and config.q_lora_rank > 0,
+        )
+        self.head_dim = self.v_head_dim
+
+    def define_network(
+        self,
+        config: Glm4MoeLiteConfig,
+        dtype: jnp.dtype,
+        param_dtype: jnp.dtype,
+        precision: jax.lax.Precision,
+        rngs: spx.Rngs,
+    ):
+        """Build the MLA projection stack.
+
+        The body lived here in four families with byte-identical contents; it
+        is now :meth:`UnifiedAttention._build_mla_projections`, driven by this
+        class's ``projection_mapping`` so the HF attribute names are unchanged.
+        """
+        self._build_mla_projections(config, dtype, param_dtype, precision, rngs)
+
+    def _create_attention_performer(self, config, rngs):
+        """Construct the flexible attention kernel with YaRN-aware scaling.
+
+        Multiplies the ``softmax_scale`` by the YaRN ``mscale`` factor when
+        the config sets a non-zero ``mscale_all_dim`` so the effective
+        attention temperature matches the rescaled RoPE frequencies.
+
+        Args:
+            config: Model configuration.
+            rngs: Random number generator collection.
+
+        Returns:
+            A :class:`FlexibleAttentionModule` configured for MLA.
+        """
+        softmax_scale = self.q_head_dim**-0.5
+        rope_scaling = getattr(self.config, "rope_scaling", None)
+        if rope_scaling is not None:
+            mscale_all_dim = rope_scaling.get("mscale_all_dim", 0)
+            scaling_factor = rope_scaling.get("factor", 1.0)
+            if mscale_all_dim:
+                mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
+                softmax_scale = softmax_scale * mscale * mscale
+        return FlexibleAttentionModule(
+            rngs=rngs,
+            base_config=config,
+            softmax_scale=softmax_scale,
+            dropout_prob=getattr(config, "attention_dropout", 0.0),
+        )
+
+    def forward_mla(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo | None,
+        position_ids: Int[Array, "batch seq_len"],
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool = False,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
+        alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
+    ):
+        """Run the MLA attention forward pass.
+
+        Computes Q via the optional LoRA chain, projects the compressed KV
+        latent, applies RoPE (interleaved or split) only to the
+        ``qk_rope_head_dim`` slice, and dispatches to the attention
+        performer. When the cache is an :class:`MLARaggedPagesCacheView`,
+        the kv-up projection is **absorbed** into the queries and the cache
+        stores only the layer-normed compressed latent — the kernel then
+        operates directly on the latent dim and the value up-projection is
+        re-applied on the way out.
+
+        Args:
+            hidden_states: Residual ``(batch, seq_len, hidden_size)``.
+            mask_info: Pre-computed attention mask metadata, or ``None``.
+            position_ids: Position indices for RoPE.
+            mode: Runtime mode (train/decode/etc.) propagated to the kernel.
+            cache_view: KV cache view (regular or MLA-paged).
+            cache_metadata: Cache metadata for paged attention.
+            output_attentions: If ``True``, return attention weights.
+            frequencies: Pre-computed RoPE cos/sin table (``head_dim`` =
+                ``qk_rope_head_dim``).
+            alibi: Optional ALiBi bias; unused by MLA but accepted for
+                signature compatibility.
+
+        Returns:
+            :class:`AttentionLayerOutput` with the projected attention
+            output, optional attention weights, and the (possibly updated)
+            cache view.
+        """
+        bsz, q_len, _ = hidden_states.shape
+
+        if not self.use_mla_lora:
+            q = checkpoint_name(self.mla_q_proj(hidden_states), name="attn_query")
+        else:
+            q = checkpoint_name(
+                self.mla_q_b_proj(
+                    self.mla_q_a_layernorm(checkpoint_name(self.mla_q_a_proj(hidden_states), name="attn_query_a"))
+                ),
+                name="attn_query",
+            )
+
+        q = q.reshape(bsz, q_len, self.num_heads, self.q_head_dim).transpose(0, 2, 1, 3)
+        q_nope, q_pe = q[..., : self.qk_nope_head_dim], q[..., self.qk_nope_head_dim :]
+
+        compressed_kv = self.mla_kv_a_proj_with_mqa(hidden_states)
+        k_pe = compressed_kv[..., self.kv_lora_rank :]
+        compressed_kv = compressed_kv[..., : self.kv_lora_rank]
+
+        k_pe = k_pe.reshape(bsz, q_len, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
+
+        kv = (
+            self.mla_kv_b_proj(self.mla_kv_a_layernorm(compressed_kv))
+            .reshape(bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+            .transpose(0, 2, 1, 3)
+        )
+        k_nope = kv[..., : self.qk_nope_head_dim]
+        value_states = kv[..., self.qk_nope_head_dim : self.qk_nope_head_dim + self.v_head_dim]
+
+        if frequencies is not None:
+            freq_array = frequencies.value if hasattr(frequencies, "value") else frequencies
+            freqs = freq_array[position_ids]
+            cos, sin = jnp.split(freqs, 2, -1)
+            cos = cos[:, None, :, :].astype(q_pe.dtype)
+            sin = sin[:, None, :, :].astype(q_pe.dtype)
+            if self.config.rope_interleave:
+                q_pe = apply_rope_interleaved(q_pe, cos, sin)
+                k_pe = apply_rope_interleaved(k_pe, cos, sin)
+            else:
+                q1, q2 = jnp.split(q_pe, 2, axis=-1)
+                k1, k2 = jnp.split(k_pe, 2, axis=-1)
+                q_pe = jnp.concatenate([q1 * cos - q2 * sin, q2 * cos + q1 * sin], axis=-1)
+                k_pe = jnp.concatenate([k1 * cos - k2 * sin, k2 * cos + k1 * sin], axis=-1)
+
+        query_states = jnp.zeros((bsz, self.num_heads, q_len, self.q_head_dim), q_pe.dtype)
+        query_states = query_states.at[..., : self.qk_nope_head_dim].set(q_nope)
+        query_states = query_states.at[..., self.qk_nope_head_dim :].set(q_pe)
+
+        key_states = jnp.zeros((bsz, self.num_heads, q_len, self.q_head_dim), k_pe.dtype)
+        key_states = key_states.at[..., : self.qk_nope_head_dim].set(k_nope)
+        key_states = key_states.at[..., self.qk_nope_head_dim :].set(k_pe)
+
+        query_states = query_states.transpose(0, 2, 1, 3)
+        key_states = key_states.transpose(0, 2, 1, 3)
+        value_states = value_states.transpose(0, 2, 1, 3)
+
+        causal_for_kernel = self.causal
+        if mask_info is not None and getattr(mask_info, "_causal_baked", False):
+            causal_for_kernel = False
+
+        sliding_window_for_kernel = self.sliding_window
+        if mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
+            sliding_window_for_kernel = None
+
+        (
+            key_states,
+            value_states,
+            mask_info,
+            init_attention_bias,
+            cache_view,
+            cache_metadata,
+        ) = self.concatenate(
+            query=query_states,
+            key=key_states,
+            value=value_states,
+            cache_view=cache_view,
+            cache_metadata=cache_metadata,
+            mask_info=mask_info,
+        )
+
+        softmax_aux = self._softmax_aux()
+
+        # Absorbed MLA: absorb kv_b_proj weights into queries so the kernel
+        # works directly on the compressed latent (non-head-aware path).
+        mla_kwargs: dict = {}
+        _absorbed_W_v = None
+        if isinstance(cache_view, MLARaggedPagesCacheView):
+            W = self.mla_kv_b_proj.weight.value  # [kv_lora_rank, local_heads*(nope+v)]
+            local_heads = W.shape[1] // (self.qk_nope_head_dim + self.v_head_dim)
+            W = W.reshape(self.kv_lora_rank, local_heads, self.qk_nope_head_dim + self.v_head_dim)
+            W_nope = W[:, :, : self.qk_nope_head_dim]  # [kv_lora_rank, local_heads, nope]
+            _absorbed_W_v = W[:, :, self.qk_nope_head_dim :]  # [kv_lora_rank, local_heads, v]
+
+            # q_nope: [bsz, heads, seq, nope] @ W_nope: [kv_lora_rank, heads, nope]
+            # -> q_absorbed: [bsz, heads, seq, kv_lora_rank]
+            q_absorbed = jnp.einsum("bhsd,khd->bhsk", q_nope, W_nope)
+
+            mla_kwargs["queries_nope"] = q_absorbed.transpose(0, 2, 1, 3)  # [bsz, seq, heads, kv_lora_rank]
+            mla_kwargs["queries_pe"] = q_pe.transpose(0, 2, 1, 3)  # [bsz, seq, heads, rope_dim]
+            # Store layernormed latent — kv_b_proj weights were trained against
+            # layernorm output, so the cached latent must match.
+            mla_kwargs["keys_values"] = self.mla_kv_a_layernorm(compressed_kv)  # [bsz, seq, kv_lora_rank]
+            mla_kwargs["keys_pe"] = k_pe[:, 0, :, :]  # [bsz, seq, rope_dim]
+            # Same scale as the dense path: original q_head_dim (not the absorbed
+            # dim) with any YaRN mscale**2.
+            mla_kwargs["softmax_scale"] = self.attention_performer.softmax_scale
+
+        attentions = self.attention_performer.forward(
+            query_states=query_states,
+            key_states=key_states,
+            value_states=value_states,
+            mode=mode,
+            bias=None,
+            cache_metadata=cache_metadata,
+            cache_view=cache_view,
+            init_bias=init_attention_bias,
+            mask_info=mask_info,
+            causal=causal_for_kernel,
+            sliding_window=sliding_window_for_kernel,
+            softmax_aux=softmax_aux,
+            **mla_kwargs,
+        )
+
+        attn_out = attentions.attention_outputs
+        if _absorbed_W_v is not None and attn_out.ndim == 3:
+            # Absorbed MLA output: [total_tokens, heads, kv_lora_rank]
+            # Value up-projection: recover per-head v_head_dim
+            # _absorbed_W_v: [kv_lora_rank, heads, v_head_dim]
+            attn_out = jnp.einsum("thk,khv->thv", attn_out, _absorbed_W_v)
+            # attn_out: [total_tokens, heads, v_head_dim]
+            batch_size = hidden_states.shape[0]
+            seq_len = hidden_states.shape[1]
+            attn_output = attn_out.reshape(batch_size, seq_len, -1)
+        elif isinstance(cache_view, MLARaggedPagesCacheView) and attn_out.ndim == 3:
+            batch_size = hidden_states.shape[0]
+            seq_len = hidden_states.shape[1]
+            attn_output = attn_out.reshape(batch_size, seq_len, -1)
+        else:
+            attn_output = self._merge_heads(attn_out)
+        expected_attn_dim = self.num_heads * self.v_head_dim
+        if attn_output.shape[-1] != expected_attn_dim:
+            actual_attn_dim = int(attn_output.shape[-1])
+            if actual_attn_dim % self.num_heads == 0 and expected_attn_dim % self.num_heads == 0:
+                actual_head_dim = actual_attn_dim // self.num_heads
+                expected_head_dim = expected_attn_dim // self.num_heads
+                attn_output = attn_output.reshape(*attn_output.shape[:-1], self.num_heads, actual_head_dim)
+                if actual_head_dim > expected_head_dim:
+                    attn_output = attn_output[..., :expected_head_dim]
+                elif actual_head_dim < expected_head_dim:
+                    pad_width = [(0, 0)] * attn_output.ndim
+                    pad_width[-1] = (0, expected_head_dim - actual_head_dim)
+                    attn_output = jnp.pad(attn_output, pad_width)
+                attn_output = attn_output.reshape(*attn_output.shape[:-2], expected_attn_dim)
+            elif actual_attn_dim > expected_attn_dim:
+                attn_output = attn_output[..., :expected_attn_dim]
+            else:
+                pad_width = [(0, 0)] * attn_output.ndim
+                pad_width[-1] = (0, expected_attn_dim - actual_attn_dim)
+                attn_output = jnp.pad(attn_output, pad_width)
+        attn_output = self.shard_attention_prod(attn_output)
+        attn_output = checkpoint_name(self.output_projection(attn_output), name="attn_output")
+        attn_output = self.shard_attention_prod(attn_output)
+
+        return AttentionLayerOutput(
+            attention_output=attn_output,
+            attention_weight=attentions.attention_weights if output_attentions else None,
+            cache_view=cache_view,
+        )
+
+
+class Glm4MoeLiteDecoderLayer(spx.Module):
+    """Single decoder layer for GLM-4-MoE-Lite.
+
+    Combines Multi-head Latent Attention (MLA) and either dense MLP or MoE
+    feedforward networks with RMS normalization and residual connections.
+    Uses dense MLP for layers marked as "dense" in mlp_layer_types and
+    sparse MoE for layers marked as "sparse".
+    """
+
+    def __init__(
+        self,
+        config: Glm4MoeLiteConfig,
+        layer_idx: int,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize one decoder block.
+
+        Picks ``Glm4MoeLiteMoE`` for layers marked ``"sparse"`` in
+        ``config.mlp_layer_types`` (and only when MoE is fully configured)
+        and ``Glm4MoeLiteMLP`` otherwise.
+
+        Args:
+            config: Model configuration.
+            layer_idx: Index of this layer in the decoder stack.
+            dtype: Computation dtype.
+            param_dtype: Parameter dtype.
+            precision: JAX matmul precision.
+            rngs: Random number generator collection.
+        """
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.rngs = rngs
+        self.layer_idx = layer_idx
+        self.hidden_size = config.hidden_size
+
+        mlp_moe_block = Glm4MoeLiteMoE
+
+        self.self_attn = Glm4MoeLiteAttention(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            layer_idx=layer_idx,
+        )
+
+        if (
+            config.mlp_layer_types is not None
+            and config.mlp_layer_types[layer_idx] == "sparse"
+            and config.n_routed_experts is not None
+            and config.num_experts_per_tok is not None
+        ):
+            self.mlp = mlp_moe_block(
+                config=config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+            )
+        else:
+            self.mlp = Glm4MoeLiteMLP(
+                config=config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+            )
+
+        self.input_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+
+    def forward(
+        self,
+        hidden_states: Array,
+        mask_info: MaskInfo,
+        position_ids: Array,
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool = False,
+        frequencies: tuple[Array, Array] | None = None,
+    ) -> DecoderLayerOutput:
+        """Pre-norm decoder block: ``x + attn(norm(x))`` then ``x + ffn(norm(x))``.
+
+        The feedforward branch returns a ``(out, router_logits)`` tuple
+        for sparse layers and a plain tensor for dense layers; the router
+        logits are forwarded only for sparse layers.
+
+        Args:
+            hidden_states: Residual ``(batch, seq_len, hidden_size)``.
+            mask_info: Attention mask metadata.
+            position_ids: Position indices for RoPE.
+            mode: Runtime mode propagated to attention.
+            cache_view: KV cache view, if any.
+            cache_metadata: Cache metadata, if any.
+            output_attentions: Whether to expose attention weights.
+            frequencies: Optional pre-computed RoPE table.
+
+        Returns:
+            :class:`DecoderLayerOutput` carrying hidden states, optional
+            attention weights, the (possibly updated) cache view, and
+            optional router logits for MoE layers.
+        """
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+
+        attn_outputs = self.self_attn(
+            hidden_states,
+            mask_info,
+            position_ids,
+            mode,
+            cache_view,
+            cache_metadata,
+            output_attentions,
+            frequencies,
+        )
+        hidden_states = residual + attn_outputs.attention_output
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        if self.config.use_scan_mlp and isinstance(self.mlp, Glm4MoeLiteMLP):
+            feed_forward_hidden_states = blockwise_ffn(
+                self.mlp,
+                hidden_states,
+                self.config.scan_mlp_chunk_size,
+            )
+        else:
+            feed_forward_hidden_states = self.mlp(hidden_states)
+        router_logits = None
+        if isinstance(feed_forward_hidden_states, tuple):
+            feed_forward_hidden_states, router_logits = feed_forward_hidden_states
+        hidden_states = residual + feed_forward_hidden_states
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+
+        return DecoderLayerOutput(
+            hidden_states=hidden_states,
+            attention_weight=attn_outputs.attention_weight,
+            cache_view=attn_outputs.cache_view,
+            router_logits=router_logits,
+        )
+
+
+@register_module(TaskType.BASE_MODULE, config=Glm4MoeLiteConfig, model_type="glm4_moe_lite")
+class Glm4MoeLiteModel(EasyDeLBaseModule):
+    """GLM-4-MoE-Lite base model implementation.
+
+    Implements the GLM-4-MoE-Lite architecture, a lightweight sparse mixture-of-experts
+    transformer model featuring Multi-head Latent Attention (MLA) with low-rank KV/Q
+    compression, grouped top-k MoE routing with shared experts, and a configurable
+    dense-to-sparse MLP schedule across layers.
+    """
+
+    def __init__(
+        self,
+        config: Glm4MoeLiteConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize the GLM-4-MoE-Lite backbone (embeddings, layers, final norm).
+
+        Args:
+            config: Model configuration.
+            dtype: Computation dtype.
+            param_dtype: Parameter dtype.
+            precision: JAX matmul precision.
+            rngs: Random number generator collection.
+        """
+        super().__init__(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.rngs = rngs
+
+        with self.assign_layer_stage(0, total_layers=self.config.num_hidden_layers):
+            self.embed_tokens = Embed(
+                self.config.vocab_size,
+                self.config.hidden_size,
+                embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
+        remat_layer_block = auto_remat(
+            Glm4MoeLiteDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.layers = nn.ModuleList([])
+        for i in range(self.config.num_hidden_layers):
+            with self.assign_layer_stage(i, total_layers=self.config.num_hidden_layers):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        layer_idx=i,
+                        rngs=rngs,
+                    )
+                )
+        final_layer_idx = max(0, self.config.num_hidden_layers - 1)
+        with self.assign_layer_stage(final_layer_idx, total_layers=self.config.num_hidden_layers):
+            self.norm = RMSNorm(
+                self.config.hidden_size,
+                eps=self.config.rms_norm_eps,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
+
+    @functools.cached_property
+    def frequencies(self):
+        """Cached RoPE cos/sin table sized to ``qk_rope_head_dim``.
+
+        MLA only rotates the ``qk_rope_head_dim`` slice, so the table is
+        narrower than the full attention head dim.
+        """
+        return self.config.get_basic_frequencies(
+            head_size=self.config.qk_rope_head_dim,
+            rotary_dim=self.config.qk_rope_head_dim,
+            base=self.config.rope_theta,
+        )
+
+    def forward(
+        self,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        output_router_logits: bool | None = None,
+    ) -> MoeModelOutput:
+        """Run the GLM-4-MoE-Lite backbone.
+
+        Args:
+            input_ids: Token ids ``(batch, seq_len)``. Mutually exclusive
+                with ``inputs_embeds``.
+            inputs_embeds: Pre-computed embeddings ``(batch, seq_len,
+                hidden_size)``.
+            attention_mask: Optional ``(batch, seq_len)`` boolean padding
+                mask.
+            mask_info: Optional pre-computed attention mask metadata.
+            position_ids: Optional ``(batch, seq_len)`` RoPE positions.
+            mode: Runtime mode; defaults to MODE_DECODE when seq_len==1
+                and a cache is provided, otherwise MODE_TRAIN.
+            past_key_values: Existing KV cache to update.
+            cache_metadata: Cache metadata for paged attention.
+            output_attentions: Whether to collect attention weights.
+            output_hidden_states: Whether to collect intermediate hidden
+                states.
+            output_router_logits: Whether to collect router logits from
+                MoE layers.
+
+        Returns:
+            :class:`MoeModelOutput` with the final hidden state, optional
+            collections of intermediate states/attentions/router logits,
+            and the (updated) KV cache.
+
+        Raises:
+            ValueError: If neither/both of ``input_ids``/``inputs_embeds``
+                are provided, or if the sequence exceeds
+                ``max_position_embeddings``.
+        """
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError(
+                "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+            )
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
+        sequence_length = inputs_embeds.shape[1]
+        all_attentions = () if output_attentions else None
+        all_hidden_states = () if output_hidden_states else None
+        all_router_logits = () if output_router_logits else None
+
+        if sequence_length > self.config.max_position_embeddings:
+            raise ValueError(
+                f"Maximum Position Embedding Reached: {sequence_length} > {self.config.max_position_embeddings}."
+            )
+
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=mask_info,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
+
+        if position_ids is None:
+            position_ids = mask_info.q_position_ids
+
+        hidden_states = inputs_embeds
+
+        if mode is None:
+            mode = (
+                common_types.MODE_DECODE
+                if sequence_length == 1 and past_key_values is not None
+                else common_types.MODE_TRAIN
+            )
+
+        if past_key_values is None:
+            past_key_values = TransformerCache.init_empty(len(self.layers))
+
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
+        # Router-logit aggregation grows a Python tuple per layer, which
+        # lax.scan cannot carry — collecting it forces the trace path too.
+        trace_layers = self._layer_scan_trace(
+            False,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache or bool(output_router_logits),
+        )
+        cache_views = views if trace_layers else None
+        # Hoisted out of the loop body: the caching property must not be
+        # first materialized inside the lax.scan trace (tracer leak).
+        frequencies = self.frequencies
+
+        def _layer_loop(block, carry):
+            """Run one MLA decoder layer inside ``self.layers.scan``.
+
+            Threads ``(hidden_states, cv, all_hidden_states, all_attentions,
+            all_router_logits, layer_index)`` through the scan and
+            collects optional outputs requested by the outer ``forward``.
+            """
+            hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx = carry
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
+            with self._layer_stage_context(idx, layers=self.layers):
+                layer_outputs = block(
+                    hidden_states=hidden_states,
+                    mask_info=mask_info,
+                    position_ids=position_ids,
+                    mode=mode,
+                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                    cache_metadata=cache_metadata,
+                    output_attentions=output_attentions,
+                    frequencies=frequencies,
+                )
+
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+
+            if output_attentions:
+                all_attentions += (layer_outputs.attention_weight,)
+
+            if output_router_logits and layer_outputs.router_logits is not None:
+                all_router_logits += (layer_outputs.router_logits,)
+
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                layer_outputs.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
+
+            return hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx + 1
+
+        hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
+            _layer_loop,
+            (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
+            trace=trace_layers,
+        )
+        hidden_states = self.norm(hidden_states)
+
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        return MoeModelOutput(
+            last_hidden_state=hidden_states,
+            hidden_states=all_hidden_states,
+            attentions=all_attentions,
+            router_logits=all_router_logits,
+            past_key_values=past_key_values,
+        )
+
+
+@register_module(TaskType.CAUSAL_LM, config=Glm4MoeLiteConfig, model_type="glm4_moe_lite")
+class Glm4MoeLiteForCausalLM(BaseCausalLMModule[Glm4MoeLiteModel, Glm4MoeLiteConfig]):  # type: ignore
+    """GLM-4-MoE-Lite model with a language modeling head for causal language modeling.
+
+    Combines the GLM-4-MoE-Lite base model with a linear language modeling head
+    for autoregressive text generation. Uses the sparse MoE architecture with
+    MLA attention for efficient inference and training.
+    """
+
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "glm4_moe_lite"
+    _config_class = Glm4MoeLiteConfig
+
+    def __init__(
+        self,
+        config: Glm4MoeLiteConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize the causal-LM wrapper around :class:`Glm4MoeLiteModel`.
+
+        Args:
+            config: Model configuration.
+            dtype: Computation dtype.
+            param_dtype: Parameter dtype.
+            precision: JAX matmul precision.
+            rngs: Random number generator collection.
+        """
+        super().__init__(
+            config=config,
+            base_model_class=Glm4MoeLiteModel,
+            base_model_name="model",
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            lm_head_bias=False,
+            router_aux_loss_coef=None,
+        )
+
+    def create_ragged_page_cache_config(
+        self,
+        max_length: int,
+        *,
+        page_size: int = 128,
+        hbm_utilization: float = 0.9,
+        dtype: jnp.dtype | None = None,
+        max_cache_tokens: int | None = None,
+    ):
+        """Create the paged KV-cache configuration for MLA attention.
+
+        GLM4-MoE-Lite uses MLA, where the runtime attention head width is
+        ``qk_nope_head_dim + qk_rope_head_dim`` (not ``config.head_dim``).
+        When the configured attention mechanism is MLA-paged, defers to
+        :meth:`_create_mla_ragged_page_cache_config`.
+
+        Args:
+            max_length: Maximum model context length.
+            page_size: Tokens per page.
+            hbm_utilization: Fraction of HBM the cache may consume.
+            dtype: Optional override for the cache dtype.
+
+            max_cache_tokens: Optional hard ceiling on total KV-cache tokens;
+                the page count becomes ``min(hbm-derived, cap)``. Defaults to None.
+
+        Returns:
+            A cache config object suitable for the chosen attention
+            mechanism.
+        """
+        from easydel.caching import RaggedPagesCacheConfig
+        from easydel.layers.attention import AttentionMechanisms
+
+        text_config = self.config.get_text_config()
+
+        q_head_dim = self.config.qk_nope_head_dim + self.config.qk_rope_head_dim
+        v_head_dim = self.config.v_head_dim
+
+        match text_config.attn_mechanism:
+            case AttentionMechanisms.RAGGED_PAGE_ATTENTION_V3:
+                version = "v3"
+            case AttentionMechanisms.RAGGED_PAGE_ATTENTION_V2:
+                version = "v2"
+            case _:
+                version = "v3"
+
+        attn_mechanism = getattr(text_config, "attn_mechanism", None)
+        if hasattr(attn_mechanism, "value"):
+            attn_mechanism = attn_mechanism.value
+        is_mla_ragged = str(attn_mechanism) in (
+            "multi_latent_ragged_page_attention_v1",
+            "multi_latent_ragged_page_attention_v2",
+        )
+        if is_mla_ragged:
+            return self._create_mla_ragged_page_cache_config(
+                max_length=max_length,
+                page_size=page_size,
+                max_cache_tokens=max_cache_tokens,
+                hbm_utilization=hbm_utilization,
+                dtype=dtype,
+            )
+
+        return RaggedPagesCacheConfig.create(
+            mesh=self.mesh,
+            runtime_sharding_resolver=text_config.runtime_sharding_resolver,
+            kvdtype=text_config.kvdtype if dtype is None else dtype,
+            max_model_length=max_length,
+            num_hidden_layers=self.config.num_hidden_layers,
+            num_kv_heads=self.config.num_attention_heads,
+            kv_head_dim_size=q_head_dim,
+            k_headdim=q_head_dim,
+            v_headdim=v_head_dim,
+            hbm_utilization=hbm_utilization,
+            page_size=page_size,
+            max_cache_tokens=max_cache_tokens,
+            version=version,
+        )
+
+    def _create_mla_ragged_page_cache_config(
+        self,
+        max_length: int,
+        *,
+        page_size: int = 128,
+        hbm_utilization: float = 0.9,
+        dtype: jnp.dtype | None = None,
+        num_hidden_layers_override: int | None = None,
+        max_cache_tokens: int | None = None,
+    ):
+        """Create the MLA ragged cache using GLM4-MoE-Lite's compressed KV width.
+
+        Stores only the ``kv_lora_rank``-wide compressed latent plus the
+        ``qk_rope_head_dim``-wide RoPE branch — not the full per-head
+        keys/values — exactly matching what the absorbed-MLA kernel
+        expects.
+
+        Args:
+            max_length: Maximum model context length.
+            page_size: Tokens per page.
+            hbm_utilization: Fraction of HBM the cache may consume.
+            dtype: Optional override for the cache dtype.
+            num_hidden_layers_override: Optional override for the layer
+                count, useful when fewer layers are materialised on this
+                shard than the config declares.
+            max_cache_tokens: Optional ceiling on the total page-pool token capacity.
+
+        Returns:
+            An :class:`MLARaggedPagesCacheConfig` ready to be allocated.
+        """
+        from easydel.caching import MLARaggedPagesCacheConfig
+
+        text_config = self.config.get_text_config()
+        kvdtype = text_config.kvdtype if dtype is None else dtype
+        num_hidden_layers = (
+            int(num_hidden_layers_override) if num_hidden_layers_override is not None else self.config.num_hidden_layers
+        )
+
+        # GLM4-MoE-Lite sends the absorbed MLA kernel the compressed latent
+        # ``compressed_kv`` with width ``kv_lora_rank`` plus the RoPE branch.
+        return MLARaggedPagesCacheConfig.create(
+            mesh=self.mesh,
+            runtime_sharding_resolver=text_config.runtime_sharding_resolver,
+            kvdtype=kvdtype,
+            max_model_length=max_length,
+            num_hidden_layers=num_hidden_layers,
+            num_kv_heads=self.config.num_attention_heads,
+            kv_lora_rank=self.config.kv_lora_rank,
+            qk_rope_head_dim=self.config.qk_rope_head_dim,
+            hbm_utilization=hbm_utilization,
+            page_size=page_size,
+            max_cache_tokens=max_cache_tokens,
+        )
+
+
+__all__ = ["Glm4MoeLiteForCausalLM", "Glm4MoeLiteModel"]

@@ -1,0 +1,384 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Token sampling functions for eSurge inference.
+
+This module provides efficient token sampling implementations using binary search
+for top-k, top-p, and min-p filtering. The sampling functions are pure JAX functions
+(no stateful modules) and support dtype-aware optimizations for bfloat16.
+
+Functions:
+    - apply_history_penalties: Apply presence/frequency/repetition penalties
+    - sample_tokens: Main entry point for token sampling
+    - _regular_sample: Stochastic sampling with filtering
+    - _greedy_sample: Deterministic argmax sampling
+    - _apply_min_p_mask: Min-p probability filtering
+    - _apply_penalties: Linear penalty application
+"""
+
+import jax
+from jax import lax
+from jax import numpy as jnp
+
+from .binary_search import (
+    apply_min_p_mask,
+    apply_penalties,
+    apply_topk_mask,
+    apply_topp_mask,
+)
+from .sampling_metadata import SamplingMetadata
+
+
+def _greedy_sample(logits: jax.Array) -> jax.Array:
+    """Greedy sampling: select token with highest probability.
+
+    Args:
+        logits: Input logits [batch, vocab_size].
+
+    Returns:
+        Token IDs with maximum logit value [batch].
+    """
+    return jnp.argmax(logits, axis=-1).astype(jnp.int32)
+
+
+def _regular_sample(logits: jax.Array, sampling_metadata: SamplingMetadata, rng: jax.Array) -> jax.Array:
+    """Stochastic sampling with top-k, top-p, and min-p filtering.
+
+    Applies filtering in order: top-k → top-p → temperature → min-p, then samples
+    from the resulting distribution. Uses binary search for efficient filtering
+    without sorting. Automatically selects bfloat16-optimized variants when applicable.
+
+    Args:
+        logits: Input logits [batch, vocab_size].
+        sampling_metadata: Sampling configuration (temperatures, top_k, top_p, etc.).
+        rng: JAX random key for sampling.
+
+    Returns:
+        Sampled token IDs [batch].
+
+    Performance:
+        - Dtype-aware: Uses bfloat16 variants when input is bfloat16
+        - Binary search: O(32 reductions) for top-k/p vs O(V log V) for sorting
+        - Vectorized: Per-sample parameters via vmap
+    """
+    min_val = -1e10
+
+    need_top_k = jnp.any(sampling_metadata.top_ks > 0)
+    need_top_p = jnp.any(sampling_metadata.top_ps < 1.0)
+    need_temp = jnp.any(sampling_metadata.temperatures != 1.0)
+    need_filter_math = need_top_k | need_top_p | need_temp | sampling_metadata.need_min_p_sampling
+
+    batch_size = logits.shape[0]
+
+    if sampling_metadata.sampling_seeds is None:
+        sampling_seeds = jnp.arange(batch_size, dtype=jnp.int32)
+    else:
+        sampling_seeds = sampling_metadata.sampling_seeds[:batch_size].astype(jnp.int32)
+
+    def sample_one(logits_i, seed_i):
+        """Sample a single token from a filtered logit distribution."""
+        per_sample_rng = jax.random.fold_in(rng, seed_i)
+        return jax.random.categorical(per_sample_rng, logits_i).astype(jnp.int32)
+
+    def sample_direct(legi):
+        return jax.vmap(sample_one)(legi, sampling_seeds)
+
+    def sample_filtered(legi):
+        # Convert to float32 for numerical stability in filtering operations.
+        legi = legi.astype(jnp.float32)
+
+        def apply_topk(legi):
+            """Apply top-k filtering to each sample in the batch."""
+
+            def topk_per_sample(logits_i, k_i):
+                """Apply top-k mask to a single sample if k > 0."""
+                return lax.cond(k_i > 0, lambda: apply_topk_mask(logits_i[None, :], k_i, min_val)[0], lambda: logits_i)
+
+            return jax.vmap(topk_per_sample)(legi, sampling_metadata.top_ks)
+
+        legi = lax.cond(need_top_k, apply_topk, lambda x: x, legi)
+
+        def apply_topp(legi):
+            """Apply top-p (nucleus) filtering to each sample in the batch."""
+
+            def topp_per_sample(logits_i, p_i):
+                """Apply top-p mask to a single sample if p < 1.0."""
+                return lax.cond(
+                    p_i < 1.0,
+                    lambda: apply_topp_mask(logits_i[None, :], p_i, min_val)[0],
+                    lambda: logits_i,
+                )
+
+            return jax.vmap(topp_per_sample)(legi, sampling_metadata.top_ps)
+
+        legi = lax.cond(need_top_p, apply_topp, lambda x: x, legi)
+
+        def apply_temp(legi):
+            """Scale logits by per-sample temperature values.
+
+            Greedy rows carry the reset sentinel temperature ``-1.0`` (see
+            ``SequenceBuffer``). Dividing by it would *negate* their logits, so a
+            mixed greedy+sampling batch (which does not take the all-greedy
+            short-circuit) would sample the greedy row's *lowest*-logit tokens.
+            Guard those rows with a safe temperature of ``1.0`` here — their final
+            token is overridden with the argmax below, so the scaled value is
+            discarded; the guard only keeps the shared tensor finite (also avoids
+            div-by-zero for an explicit ``temperature==0``).
+            """
+            safe_temp = jnp.where(sampling_metadata.temperatures <= 0.0, 1.0, sampling_metadata.temperatures)
+            return legi / safe_temp
+
+        legi = lax.cond(need_temp, apply_temp, lambda x: x, legi)
+
+        # Min-p filtering is applied after temperature scaling.
+        legi = lax.cond(
+            sampling_metadata.need_min_p_sampling,
+            lambda x: apply_min_p_mask(x, sampling_metadata),
+            lambda x: x,
+            legi,
+        )
+        return sample_direct(legi)
+
+    # Keep the common no-filter path in the model logits dtype. For bf16 TPU
+    # inference this avoids a full-vocab fp32 materialization before categorical
+    # sampling. Filtering paths still promote to fp32 for numerical stability.
+    sampled = lax.cond(need_filter_math, sample_filtered, sample_direct, logits)
+
+    # Per-row greedy override. An all-greedy batch short-circuits to
+    # ``_greedy_sample`` upstream (``sample_tokens``), but a MIXED batch runs this
+    # function for every row — including greedy rows (sentinel temperature <= 0),
+    # whose token must be the argmax of the (penalty-applied) logits rather than a
+    # temperature-scaled stochastic draw. Without this, greedy requests co-batched
+    # with any sampling request emit near-worst-case tokens.
+    is_greedy_row = (sampling_metadata.temperatures <= 0.0).reshape(-1)
+    greedy_tokens = jnp.argmax(logits, axis=-1).astype(jnp.int32)
+    return jnp.where(is_greedy_row, greedy_tokens, sampled)
+
+
+def build_history_token_counts(
+    *,
+    token_history: jax.Array,
+    seq_lens: jax.Array,
+    active_mask: jax.Array,
+    vocab_size: int,
+    count_dtype: jnp.dtype = jnp.uint32,
+) -> jax.Array:
+    """Build exact per-token history counts from token IDs.
+
+    Args:
+        token_history: Token IDs [batch, max_len].
+        seq_lens: Effective history lengths [batch].
+        active_mask: Active request mask [batch].
+        vocab_size: Vocabulary size for the output count matrix.
+        count_dtype: Integer dtype used to store exact counts.
+
+    Returns:
+        Dense count matrix [batch, vocab_size].
+    """
+    batch_size = token_history.shape[0]
+    history_width = token_history.shape[1]
+    positions = jnp.arange(history_width, dtype=jnp.int32)[None, :]
+    valid_positions = (positions < seq_lens[:, None]) & active_mask[:, None]
+    safe_history = jnp.where(valid_positions, token_history, 0)
+    batch_indices = jnp.broadcast_to(jnp.arange(batch_size, dtype=jnp.int32)[:, None], safe_history.shape)
+    return (
+        jnp.zeros((batch_size, vocab_size), dtype=count_dtype)
+        .at[batch_indices, safe_history]
+        .add(valid_positions.astype(count_dtype))
+    )
+
+
+def apply_history_penalties_from_counts(
+    logits: jax.Array,
+    *,
+    token_counts: jax.Array,
+    active_mask: jax.Array,
+    presence_penalties: jax.Array,
+    frequency_penalties: jax.Array,
+    repetition_penalties: jax.Array,
+) -> jax.Array:
+    """Apply history penalties from precomputed token counts.
+
+    Args:
+        logits: Next-token logits [batch, vocab_size].
+        token_counts: Exact token counts [batch, vocab_size].
+        active_mask: Active request mask [batch].
+        presence_penalties: Presence penalty per request [batch].
+        frequency_penalties: Frequency penalty per request [batch].
+        repetition_penalties: Repetition penalty per request [batch].
+
+    Returns:
+        Penalized logits [batch, vocab_size].
+    """
+    batch_size = logits.shape[0]
+    active_mask = active_mask[:batch_size].astype(jnp.bool_)
+    presence_penalties = presence_penalties[:batch_size].astype(logits.dtype)
+    frequency_penalties = frequency_penalties[:batch_size].astype(logits.dtype)
+    repetition_penalties = repetition_penalties[:batch_size].astype(logits.dtype)
+
+    need_penalties = jnp.any(
+        active_mask & ((presence_penalties != 0.0) | (frequency_penalties != 0.0) | (repetition_penalties != 1.0))
+    )
+
+    def _apply(legi: jax.Array) -> jax.Array:
+        counts = token_counts[:batch_size]
+        count_values = counts.astype(legi.dtype)
+        presence_mask = counts > 0
+
+        adjusted = legi
+        adjusted = adjusted - presence_mask.astype(legi.dtype) * presence_penalties[:, None]
+        adjusted = adjusted - count_values * frequency_penalties[:, None]
+
+        safe_repetition = repetition_penalties[:, None]
+        positive_scores = adjusted / safe_repetition
+        negative_scores = adjusted * safe_repetition
+        repeated_scores = jnp.where(adjusted > 0, positive_scores, adjusted)
+        repeated_scores = jnp.where(adjusted < 0, negative_scores, repeated_scores)
+        adjusted = jnp.where(presence_mask, repeated_scores, adjusted)
+
+        return jnp.where(active_mask[:, None], adjusted, legi)
+
+    return lax.cond(need_penalties, _apply, lambda legi: legi, logits)
+
+
+def update_token_counts(
+    token_counts: jax.Array,
+    *,
+    row_indices: jax.Array,
+    sampled_tokens: jax.Array,
+    valid_mask: jax.Array,
+) -> jax.Array:
+    """Increment exact token counts with newly sampled tokens.
+
+    Args:
+        token_counts: Existing count matrix [max_num_reqs, vocab_size].
+        row_indices: Global request-row indices for the current window [batch].
+        sampled_tokens: Sampled token IDs [batch].
+        valid_mask: True for rows that emitted a real token [batch].
+
+    Returns:
+        Updated count matrix with sampled tokens incremented in-place.
+    """
+    row_indices = row_indices.astype(jnp.int32)
+    sampled_tokens = sampled_tokens.astype(jnp.int32)
+    valid_mask = valid_mask.astype(jnp.bool_)
+    safe_rows = jnp.where(valid_mask, row_indices, 0)
+    safe_tokens = jnp.where(valid_mask, sampled_tokens, 0)
+    increments = valid_mask.astype(token_counts.dtype)
+    return token_counts.at[safe_rows, safe_tokens].add(increments)
+
+
+def apply_history_penalties(
+    logits: jax.Array,
+    *,
+    token_history: jax.Array,
+    seq_lens: jax.Array,
+    active_mask: jax.Array,
+    presence_penalties: jax.Array,
+    frequency_penalties: jax.Array,
+    repetition_penalties: jax.Array,
+) -> jax.Array:
+    """Apply history-aware penalties to logits.
+
+    This matches the host-side `SamplingParams` processor ordering used by
+    EasyDeL: presence penalty, then frequency penalty, then repetition penalty.
+
+    Args:
+        logits: Next-token logits [batch, vocab_size].
+        token_history: Token IDs generated/consumed so far [batch_or_more, max_len].
+        seq_lens: Effective history length per request [batch_or_more].
+        active_mask: Active request mask [batch].
+        presence_penalties: Presence penalty per request [batch_or_more].
+        frequency_penalties: Frequency penalty per request [batch_or_more].
+        repetition_penalties: Repetition penalty per request [batch_or_more].
+
+    Returns:
+        Penalized logits [batch, vocab_size].
+    """
+    batch_size = logits.shape[0]
+    seq_lens = seq_lens[:batch_size].astype(jnp.int32)
+    active_mask = active_mask[:batch_size].astype(jnp.bool_)
+    presence_penalties = presence_penalties[:batch_size].astype(logits.dtype)
+    frequency_penalties = frequency_penalties[:batch_size].astype(logits.dtype)
+    repetition_penalties = repetition_penalties[:batch_size].astype(logits.dtype)
+    token_counts = build_history_token_counts(
+        token_history=token_history[:batch_size],
+        seq_lens=seq_lens,
+        active_mask=active_mask,
+        vocab_size=logits.shape[1],
+    )
+    return apply_history_penalties_from_counts(
+        logits,
+        token_counts=token_counts,
+        active_mask=active_mask,
+        presence_penalties=presence_penalties,
+        frequency_penalties=frequency_penalties,
+        repetition_penalties=repetition_penalties,
+    )
+
+
+def sample_tokens(
+    logits: jax.Array,
+    sampling_metadata: SamplingMetadata,
+    rng: jax.Array,
+) -> jax.Array:
+    """Sample next tokens from logits with advanced filtering.
+
+    Main entry point for token sampling in eSurge. Supports greedy and stochastic
+    sampling with top-k, top-p, min-p filtering, temperature scaling, and penalties.
+    Automatically optimizes for bfloat16 inputs.
+
+    Args:
+        logits: Model output logits [batch, vocab_size].
+        sampling_metadata: Sampling configuration including:
+            - temperatures: Temperature values for scaling
+            - top_ks: Top-k filtering thresholds
+            - top_ps: Top-p (nucleus) filtering thresholds
+            - min_ps: Min-p filtering thresholds
+            - is_all_greedy: Whether to use greedy sampling
+            - do_penalties: Whether to apply penalties
+            - linear_penalty: Optional penalty matrix
+        rng: JAX random key for stochastic sampling.
+
+    Returns:
+        Sampled token IDs [batch].
+
+    Example:
+        >>> logits = jnp.ones((4, 32000))  # [batch=4, vocab=32000]
+        >>> metadata = SamplingMetadata(
+        ...     temperatures=jnp.array([[0.8], [0.8], [0.8], [0.8]]),
+        ...     top_ks=jnp.array([50, 50, 50, 50]),
+        ...     top_ps=jnp.array([0.9, 0.9, 0.9, 0.9]),
+        ...     min_ps=jnp.array([0.0, 0.0, 0.0, 0.0]),
+        ...     is_all_greedy=False,
+        ...     need_min_p_sampling=False,
+        ...     do_penalties=False,
+        ...     linear_penalty=None,
+        ... )
+        >>> tokens = sample_tokens(logits, metadata, rng_key)
+        >>> tokens.shape
+        (4,)
+    """
+    logits = lax.cond(
+        sampling_metadata.do_penalties,
+        lambda legi: apply_penalties(legi, sampling_metadata),
+        lambda legi: legi,
+        logits,
+    )
+
+    return lax.cond(
+        sampling_metadata.is_all_greedy,
+        lambda: _greedy_sample(logits),
+        lambda: _regular_sample(logits, sampling_metadata, rng),
+    )

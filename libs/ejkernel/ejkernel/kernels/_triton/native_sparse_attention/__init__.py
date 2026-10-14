@@ -1,0 +1,37 @@
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+"""Triton backend for Native Sparse Attention (NSA).
+
+This submodule provides GPU-optimized sparse attention using Triton kernels
+with dynamic block selection based on compressed attention scores.
+
+Key Features:
+    - Compressed global attention with mean-pooled blocks
+    - Dynamic top-k block selection per query
+    - Custom forward and backward Triton kernels
+    - Support for both prefill and decode phases
+"""
+
+from ._interface import _bwd_call as native_sparse_attention_gpu_bwd
+from ._interface import _fwd_call as native_sparse_attention_gpu_fwd
+from ._interface import apply_native_sparse_attention, native_sparse_attention
+
+__all__ = (
+    "apply_native_sparse_attention",
+    "native_sparse_attention",
+    "native_sparse_attention_gpu_bwd",
+    "native_sparse_attention_gpu_fwd",
+)

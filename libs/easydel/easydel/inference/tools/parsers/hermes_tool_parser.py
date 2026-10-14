@@ -1,0 +1,438 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Hermes model tool call parser.
+
+This module provides a tool call parser for NousResearch Hermes models and
+similar architectures that use XML-style delimiters (`<tool_call>` and
+`</tool_call>`) for function calling. The parser extracts JSON content from
+within these XML-style tags.
+
+The parser includes sophisticated handling for multi-token delimiters,
+ensuring accurate boundary detection when the start/end tags are split
+across multiple streaming tokens.
+
+Example:
+    >>> from easydel.inference.tools.parsers.hermes_tool_parser import HermesToolParser
+    >>> parser = HermesToolParser(tokenizer)
+    >>> result = parser.extract_tool_calls(
+    ...     '<tool_call>{"name": "search", "arguments": {"q": "test"}}</tool_call>',
+    ...     request
+    ... )
+    >>> result.tools_called
+    True
+
+Supported Format:
+    <tool_call>{"name": "function_name", "arguments": {...}}</tool_call>
+
+See Also:
+    - NousResearch Hermes models documentation
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from collections.abc import Sequence
+from uuid import uuid4
+
+import partial_json_parser  # pyright: ignore[reportMissingTypeStubs]
+from partial_json_parser.core.options import Allow  # pyright: ignore[reportMissingTypeStubs]
+from transformers import AutoTokenizer as AnyTokenizer
+
+from ...openai_api_modules import (
+    ChatCompletionRequest,
+    DeltaFunctionCall,
+    DeltaMessage,
+    DeltaToolCall,
+    ExtractedToolCallInformation,
+    FunctionCall,
+    ToolCall,
+)
+from ..abstract_tool import ToolParser, ToolParserManager
+
+
+@ToolParserManager.register_module("hermes")  # pyright: ignore[reportUntypedClassDecorator]
+class HermesToolParser(ToolParser):
+    """Tool call parser for NousResearch Hermes models.
+
+    Handles tool calls wrapped in ``<tool_call>`` / ``</tool_call>`` XML-style
+    tags with JSON content. Designed for Hermes-2/3 and architectures that
+    follow the same delimiter convention for function calling.
+
+    Format:
+        ``<tool_call>{"name": "function_name", "arguments": {...}}</tool_call>``
+
+    Features:
+        - XML-style token boundary detection
+        - Token-level buffering for accurate boundary detection across
+          multi-token delimiters
+        - Supports multiple tool calls in a single response
+        - Handles partial JSON parsing for streaming via ``partial_json_parser``
+        - Scratch pad support for intermediate reasoning blocks
+
+    Attributes:
+        current_tool_name_sent (bool): Whether the current function's name has
+            been emitted in the active streaming session.
+        prev_tool_call_arr (list[dict] | None): History of previously parsed
+            tool call dicts; used to diff arguments between chunks.
+        current_tool_id (int): Index of the tool currently being assembled
+            (``-1`` means none yet).
+        streamed_args_for_tool (list[str]): Per-tool buffer of argument
+            characters already sent downstream.
+        tool_call_start_token (str): Opening delimiter ``<tool_call>``.
+        tool_call_end_token (str): Closing delimiter ``</tool_call>``.
+        tool_call_regex (re.Pattern): Matches a full or trailing tool call body.
+        scratch_pad_regex (re.Pattern): Matches ``<scratch_pad>...</scratch_pad>``
+            reasoning blocks.
+        tool_call_start_token_ids (list[int]): Tokenized start delimiter.
+        tool_call_end_token_ids (list[int]): Tokenized end delimiter.
+        tool_call_start_token_array (list[str]): Per-token decoded start delimiter
+            pieces, used to recognize fragments across stream chunks.
+        tool_call_end_token_array (list[str]): Per-token decoded end delimiter
+            pieces.
+        buffered_delta_text (str): Buffer for multi-token delimiter detection.
+    """
+
+    def __init__(self, tokenizer: AnyTokenizer):
+        """Initialize the Hermes tool parser.
+
+        Args:
+            tokenizer: The model tokenizer used for encoding the tool-call
+                delimiters and for token-level operations during streaming.
+
+        Raises:
+            ValueError: If ``tokenizer`` is falsy (e.g. ``None``).
+        """
+        super().__init__(tokenizer)
+
+        self.current_tool_name_sent: bool = False
+        self.prev_tool_call_arr: list[dict] | None = []
+        self.current_tool_id: int = -1
+        self.streamed_args_for_tool: list[str] = []
+
+        self.tool_call_start_token: str = "<tool_call>"
+        self.tool_call_end_token: str = "</tool_call>"
+
+        self.tool_call_regex = re.compile(r"<tool_call>(.*?)</tool_call>|<tool_call>(.*)", re.DOTALL)
+        self.scratch_pad_regex = re.compile(r"<scratch_pad>(.*?)</scratch_pad>", re.DOTALL)
+
+        if not self.model_tokenizer:
+            raise ValueError("The model tokenizer must be passed to the ToolParser constructor during construction.")
+        self.tool_call_start_token_ids = self.model_tokenizer.encode(
+            self.tool_call_start_token, add_special_tokens=False
+        )
+        self.tool_call_end_token_ids = self.model_tokenizer.encode(self.tool_call_end_token, add_special_tokens=False)
+
+        self.tool_call_start_token_array = [
+            self.model_tokenizer.decode([token_id]) for token_id in self.tool_call_start_token_ids
+        ]
+
+        self.tool_call_end_token_array = [
+            self.model_tokenizer.decode([token_id]) for token_id in self.tool_call_end_token_ids
+        ]
+
+        self.buffered_delta_text = ""
+
+    def tool_call_delta_buffer(self, delta_text: str) -> str:
+        """Buffer delta text to handle multi-token delimiters.
+
+        Accumulates partial tokens that may form a ``<tool_call>`` or
+        ``</tool_call>`` delimiter, ensuring accurate boundary detection when a
+        delimiter is split across multiple streaming tokens.
+
+        Args:
+            delta_text: The new text delta produced by the model this step.
+
+        Returns:
+            The delta text to forward downstream. Returns an empty string when
+            the delta is being buffered as part of an incomplete delimiter, or
+            the combined buffered + current text when a delimiter completes.
+        """
+        if delta_text in self.tool_call_start_token_array or delta_text in self.tool_call_end_token_array:
+            if delta_text == self.tool_call_start_token_array[-1] or delta_text == self.tool_call_end_token_array[-1]:
+                buffered_text = self.buffered_delta_text
+                self.buffered_delta_text = ""
+                return buffered_text + delta_text
+            else:
+                self.buffered_delta_text = self.buffered_delta_text + delta_text
+                return ""
+        else:
+            if self.buffered_delta_text:
+                buffered_text = self.buffered_delta_text
+                self.buffered_delta_text = ""
+                return buffered_text + delta_text
+            else:
+                return delta_text
+
+    def extract_tool_calls(
+        self,
+        model_output: str,
+        request: ChatCompletionRequest,
+    ) -> ExtractedToolCallInformation:
+        """Extract tool calls from a complete model response.
+
+        Parses ``<tool_call>...</tool_call>`` blocks and extracts the JSON
+        function call contained in each one. Supports multiple tool calls and
+        returns any leading non-tool-call text as ``content``.
+
+        Args:
+            model_output: Complete model output that may contain tool calls.
+            request: Original chat completion request (unused, kept for
+                interface parity).
+
+        Returns:
+            ExtractedToolCallInformation: An object with:
+                - ``tools_called``: Whether at least one tool call was parsed.
+                - ``tool_calls``: Parsed ``ToolCall`` list.
+                - ``content``: Text appearing before the first tool call (or
+                  ``None`` when the response starts with one).
+        """
+        if self.tool_call_start_token not in model_output:
+            return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
+
+        else:
+            try:
+                function_call_tuples = self.tool_call_regex.findall(model_output)
+
+                raw_function_calls = [json.loads(match[0] if match[0] else match[1]) for match in function_call_tuples]
+                tool_calls = [
+                    ToolCall(
+                        type="function",
+                        function=FunctionCall(
+                            name=function_call["name"],
+                            arguments=json.dumps(function_call["arguments"], ensure_ascii=False),
+                        ),
+                    )
+                    for function_call in raw_function_calls
+                ]
+
+                content = model_output[: model_output.find(self.tool_call_start_token)]
+                return ExtractedToolCallInformation(
+                    tools_called=True, tool_calls=tool_calls, content=content if content else None
+                )
+
+            except Exception:
+                return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
+
+    def extract_tool_calls_streaming(
+        self,
+        previous_text: str,
+        current_text: str,
+        delta_text: str,
+        previous_token_ids: Sequence[int],
+        current_token_ids: Sequence[int],
+        delta_token_ids: Sequence[int],
+        request: ChatCompletionRequest,
+    ) -> DeltaMessage | None:
+        """Extract tool calls from streaming model output.
+
+        Handles incremental parsing during streaming generation. Maintains
+        state across calls to track partial tool calls and accumulate
+        argument deltas. Multi-token delimiters are reassembled via
+        :meth:`tool_call_delta_buffer`.
+
+        Args:
+            previous_text: Cumulative text produced before this delta.
+            current_text: Cumulative text including the current delta.
+            delta_text: Text newly produced in this streaming chunk.
+            previous_token_ids: Token IDs produced before this delta.
+            current_token_ids: Token IDs including this delta.
+            delta_token_ids: Token IDs produced in this delta.
+            request: Original chat completion request.
+
+        Returns:
+            DeltaMessage | None: An incremental update with either ``content``
+            (plain text before a tool call) or ``tool_calls`` (delta name /
+            argument fragments), or ``None`` when more tokens are required to
+            disambiguate.
+
+        Notes:
+            State management invariants:
+
+            - Counts of start/end delimiter tokens drive tool boundary
+              transitions.
+            - ``current_tool_id`` tracks which tool index is currently being
+              streamed across calls.
+            - Partial arguments are buffered until complete to keep the
+              emitted JSON well-formed.
+            - Plain content and tool-call regions are emitted in distinct
+              ``DeltaMessage`` shapes.
+        """
+        delta_text = self.tool_call_delta_buffer(delta_text)
+
+        if (
+            len(previous_text) >= len(self.buffered_delta_text)
+            and previous_text[-len(self.buffered_delta_text) :] == self.buffered_delta_text
+        ):
+            previous_text = previous_text[: -len(self.buffered_delta_text)]
+            current_text = previous_text + delta_text
+        if self.tool_call_start_token not in current_text:
+            return DeltaMessage(content=delta_text)
+
+        try:
+            delta: DeltaMessage | None = None
+            prev_tool_start_count = previous_text.count(self.tool_call_start_token)
+            prev_tool_end_count = previous_text.count(self.tool_call_end_token)
+            cur_tool_start_count = current_text.count(self.tool_call_start_token)
+            cur_tool_end_count = current_text.count(self.tool_call_end_token)
+            tool_call_portion = None
+            text_portion = None
+
+            if (
+                cur_tool_start_count == cur_tool_end_count
+                and prev_tool_end_count == cur_tool_end_count
+                and self.tool_call_end_token not in delta_text
+            ):
+                if self.tool_call_start_token in delta_text:
+                    content_before = delta_text[: delta_text.index(self.tool_call_start_token)]
+                    return DeltaMessage(content=content_before) if content_before else None
+                return DeltaMessage(content=delta_text)
+
+            if self.tool_call_end_token in delta_text:
+                full_text = current_text + delta_text
+                tool_call_portion = (
+                    full_text.split(self.tool_call_start_token)[-1].split(self.tool_call_end_token)[0].rstrip()
+                )
+                delta_text = delta_text.split(self.tool_call_end_token)[0].rstrip()
+                text_portion = delta_text.split(self.tool_call_end_token)[-1].lstrip()
+
+            flags = Allow.ALL if self.current_tool_name_sent else Allow.ALL & ~Allow.STR
+
+            if cur_tool_start_count > cur_tool_end_count and cur_tool_start_count > prev_tool_start_count:
+                if len(delta_token_ids) > 1:
+                    tool_call_portion = current_text.split(self.tool_call_start_token)[-1]
+                else:
+                    tool_call_portion = None
+                    delta = None
+
+                text_portion = None
+
+                self.current_tool_id += 1
+                self.current_tool_name_sent = False
+                self.streamed_args_for_tool.append("")
+
+            elif cur_tool_start_count > cur_tool_end_count and cur_tool_start_count == prev_tool_start_count:
+                tool_call_portion = current_text.split(self.tool_call_start_token)[-1]
+                text_portion = None
+
+            elif cur_tool_start_count == cur_tool_end_count and cur_tool_end_count >= prev_tool_end_count:
+                if (self.prev_tool_call_arr is None or len(self.prev_tool_call_arr) == 0) and self.current_tool_id < 0:
+                    batch = self.extract_tool_calls(current_text, request)
+                    if batch.tools_called and batch.tool_calls:
+                        tc_deltas = []
+                        for i, tc in enumerate(batch.tool_calls):
+                            tc_deltas.append(
+                                DeltaToolCall(
+                                    index=i,
+                                    type="function",
+                                    id=f"chatcmpl-tool-{uuid4()}",
+                                    function=DeltaFunctionCall(
+                                        name=tc.function.name,
+                                        arguments=tc.function.arguments,
+                                    ).model_dump(exclude_none=True),
+                                )
+                            )
+                            self.current_tool_id = i
+                            self.current_tool_name_sent = True
+                            self.streamed_args_for_tool.append(tc.function.arguments)
+                        return DeltaMessage(tool_calls=tc_deltas)
+                    return None
+
+                if self.prev_tool_call_arr is None or len(self.prev_tool_call_arr) == 0:
+                    return None
+                if self.current_tool_id < 0 or self.current_tool_id >= len(self.prev_tool_call_arr):
+                    return None
+                final_args = self.prev_tool_call_arr[self.current_tool_id].get("arguments")
+                if final_args:
+                    final_json = (
+                        json.dumps(final_args, ensure_ascii=False) if not isinstance(final_args, str) else final_args
+                    )
+                    already_streamed = self.streamed_args_for_tool[self.current_tool_id]
+                    remaining = (
+                        final_json[len(already_streamed) :] if final_json.startswith(already_streamed) else final_json
+                    )
+                    if remaining:
+                        self.streamed_args_for_tool[self.current_tool_id] += remaining
+                        return DeltaMessage(
+                            tool_calls=[
+                                DeltaToolCall(
+                                    index=self.current_tool_id,
+                                    function=DeltaFunctionCall(arguments=remaining).model_dump(exclude_none=True),
+                                )
+                            ]
+                        )
+                return None
+
+            else:
+                text = delta_text.replace(self.tool_call_start_token, "")
+                text = text.replace(self.tool_call_end_token, "")
+                delta = DeltaMessage(tool_calls=[], content=text)
+                return delta
+
+            try:
+                current_tool_call = (
+                    partial_json_parser.loads(tool_call_portion or "{}", flags) if tool_call_portion else None
+                )
+            except partial_json_parser.core.exceptions.MalformedJSON:
+                return None
+            except json.decoder.JSONDecodeError:
+                return None
+
+            if not self.current_tool_name_sent:
+                if current_tool_call is None:
+                    return None
+                function_name: str | None = current_tool_call.get("name")
+                if function_name:
+                    self.current_tool_name_sent = True
+                    return DeltaMessage(
+                        tool_calls=[
+                            DeltaToolCall(
+                                index=self.current_tool_id,
+                                type="function",
+                                id=f"chatcmpl-tool-{uuid4()}",
+                                function=DeltaFunctionCall(name=function_name).model_dump(exclude_none=True),
+                            )
+                        ]
+                    )
+                else:
+                    return None
+
+            if tool_call_portion is None:
+                delta = DeltaMessage(content=delta_text) if text_portion is not None else None
+                return delta
+
+            assert self.prev_tool_call_arr is not None
+
+            if len(self.prev_tool_call_arr) <= self.current_tool_id:
+                self.prev_tool_call_arr.append({})
+
+            self.prev_tool_call_arr[self.current_tool_id].get("arguments")
+            cur_arguments = current_tool_call.get("arguments")
+
+            if not cur_arguments:
+                delta = None
+            else:
+                json.dumps(cur_arguments, ensure_ascii=False)
+                delta = None
+
+            if self.current_tool_id == len(self.prev_tool_call_arr) - 1:
+                self.prev_tool_call_arr[self.current_tool_id] = current_tool_call
+            else:
+                self.prev_tool_call_arr.append(current_tool_call)
+
+            return delta
+
+        except Exception:
+            return None

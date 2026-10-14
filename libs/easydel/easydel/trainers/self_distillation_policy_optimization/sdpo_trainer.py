@@ -1,0 +1,1037 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Self-Distillation Policy Optimization (SDPO) trainer for EasyDeL.
+
+SDPO (arXiv:2601.20802) replaces GRPO's scalar-reward advantages with
+dense token-level advantages derived from a *self-teacher*: the current
+policy re-prompted with ``(question, feedback, original_response)``.
+
+The trainer supports two feedback modes:
+
+1. **Rich feedback** - a ``feedback_func`` callable returns a string for
+   every completion describing what went wrong (runtime errors, judge
+   evaluations, etc.).  This is the primary SDPO setting (Sections 4-5 of
+   the paper).
+
+2. **Self-feedback** (default when ``feedback_func=None``) - successful
+   rollouts from the same group are used as implicit feedback for failed
+   ones (Section 3 of the paper).  No environment feedback is needed; only
+   a binary reward signal to distinguish pass from fail.
+
+Algorithmically, SDPO is identical to GRPO except that:
+- Per-token advantages come from ``log π_θ(y_t|x,f,y<t) / π_θ(y_t|x,y<t)``
+  instead of normalised scalar rewards.
+- The loss is a distillation loss (KL or JSD) rather than a clipped PG loss.
+- No reward normalisation or clipping is needed.
+"""
+
+from __future__ import annotations
+
+import re
+import typing as tp
+from functools import partial
+
+import jax
+import numpy as np
+import spectrax as spx
+from jax import numpy as jnp
+from spectrax import with_sharding_constraint
+
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.base_state import EasyDeLState
+from easydel.infra.sharding import replicated_named_sharding
+from easydel.infra.utils import ProcessingClassType
+from easydel.utils import Registry
+from easydel.utils.helpers import capture_time, get_logger  # pyright: ignore[reportPrivateLocalImportUsage]
+
+from .._shared import polyak_update_reference_graphstate
+from ..group_relative_policy_optimization._fn import get_per_token_logps
+from ..group_relative_policy_optimization.grpo_trainer import GRPOTrainer
+from ..metrics import _host_mean_float, _host_scalar_float
+from ..prompt_utils import apply_chat_template
+from ..reward_protocol import RewardProtocol
+from ..trainer_protocol import TrainerConfigureFunctionOutput
+from ..training_configurations import MetricsType
+from ..training_utils import compile_trainer_step, resolve_straight_through_emulator
+from ._fn import sdpo_step
+from .sdpo_config import SDPOConfig
+
+if tp.TYPE_CHECKING:
+    from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
+
+    from easydel.data.core.protocols import ShardedDataSource
+
+logger = get_logger(__name__)
+
+FeedbackFunc = tp.Callable[
+    [list[str], list[str], list[float]],
+    list[str],
+]
+RewardFunc = EasyDeLBaseModule | EasyDeLState | RewardProtocol | tp.Callable[[list, list], list[float]]
+
+_FEEDBACK_CORRECT = "Your previous attempt was correct.\n"
+_FEEDBACK_TEMPLATE_SOLUTION = "Correct solution:\n{solution}\n\n"
+_FEEDBACK_TEMPLATE_ENV = "The following is feedback from your unsuccessful earlier attempt:\n{feedback}\n\n"
+_FEEDBACK_TEMPLATE_SOLVE = "Correctly solve the original question.\n"
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
+def _format_sdpo_template(template: str, **values: str) -> str:
+    """Format an SDPO prompt/feedback template with optional value keys."""
+    return template.format(
+        prompt=values.get("prompt", ""),
+        solution=values.get("solution", ""),
+        feedback=values.get("feedback", ""),
+        successful_previous_attempt=values.get("successful_previous_attempt", ""),
+        feedback_raw=values.get("feedback_raw", ""),
+    )
+
+
+def _strip_thinking_blocks(text: str) -> str:
+    """Remove XML-style thinking blocks before using generated feedback text."""
+    return _THINK_BLOCK_RE.sub("", text).strip()
+
+
+def _build_feedback_separator(
+    *,
+    is_successful: bool,
+    env_feedback: str,
+    correct_solution: str | None,
+    dont_reprompt_on_self_success: bool = False,
+    solution_template: str = _FEEDBACK_TEMPLATE_SOLUTION,
+    feedback_template: str = _FEEDBACK_TEMPLATE_ENV,
+    reprompt_template: str = "{solution}{feedback}" + _FEEDBACK_TEMPLATE_SOLVE,
+    remove_thinking_from_demonstration: bool = False,
+) -> str:
+    """Return the text block inserted between the prompt and the completion.
+
+    Args:
+        is_successful: Whether the original attempt received a positive reward.
+        env_feedback: Textual environment feedback (error message, judge note…).
+            May be empty when only a correct_solution is available.
+        correct_solution: Best completion from the same rollout group.
+            ``None`` if the group has no successful attempt yet.
+
+    Returns:
+        The separator string to be tokenised and inserted in the teacher input.
+    """
+    if is_successful and dont_reprompt_on_self_success:
+        return ""
+    if is_successful:
+        return _FEEDBACK_CORRECT
+
+    solution_text = ""
+    if correct_solution is not None:
+        if remove_thinking_from_demonstration:
+            correct_solution = _strip_thinking_blocks(correct_solution)
+        solution_text = _format_sdpo_template(
+            solution_template,
+            solution=correct_solution,
+            successful_previous_attempt=correct_solution,
+        )
+    feedback_text = ""
+    if env_feedback:
+        feedback_text = _format_sdpo_template(
+            feedback_template,
+            feedback=env_feedback,
+            feedback_raw=env_feedback,
+        )
+    return _format_sdpo_template(
+        reprompt_template,
+        solution=solution_text,
+        feedback=feedback_text,
+    )
+
+
+def _as_chat_history(prompt: str | list[dict[str, str]]) -> list[dict[str, str]]:
+    """Coerce a prompt into chat-history form.
+
+    ``TrainerOutput.completion_prompts`` may carry either decoded prompt text or
+    an already-structured message list. Reward paths that build conversations
+    need the structured form, so raw text becomes a single user turn.
+
+    Args:
+        prompt: Prompt text, or a list of chat message dicts.
+
+    Returns:
+        A list of chat message dicts.
+    """
+    if isinstance(prompt, str):
+        return [{"role": "user", "content": prompt}]
+    return list(prompt)
+
+
+@Registry.register("trainer", "sdpo")
+class SDPOTrainer(GRPOTrainer):
+    """Self-Distillation Policy Optimization trainer.
+
+    Extends :class:`GRPOTrainer` by replacing scalar-reward advantages with
+    dense per-token advantages produced by a self-teacher — the same model
+    conditioned on the original prompt, environment feedback, and the
+    student's own attempt.
+
+    The only required change compared to a GRPO setup is:
+
+    1. Replace ``GRPOConfig`` with ``SDPOConfig``.
+    2. Optionally pass a ``feedback_func`` that converts ``(prompts,
+       completions, rewards)`` into per-completion feedback strings.
+       If omitted the trainer uses successful rollouts as implicit feedback.
+
+    Attributes:
+        arguments: :class:`SDPOConfig` instance.
+        feedback_func: Optional callable returning per-completion feedback.
+        teacher_prompt_length: Static length of the teacher prefix
+            (``max_prompt_length + effective_feedback_length``).
+
+    Example:
+        >>> def my_feedback(prompts, completions, rewards):
+        ...     return [f"Error: {c}" if r == 0 else "" for c, r in zip(completions, rewards)]
+        ...
+        >>> config = SDPOConfig(
+        ...     per_device_train_batch_size=4,
+        ...     num_generations=4,
+        ...     max_prompt_length=512,
+        ...     max_completion_length=256,
+        ...     max_feedback_length=128,
+        ...     distillation_type="jsd",
+        ...     learning_rate=1e-6,
+        ... )
+        >>> trainer = SDPOTrainer(
+        ...     arguments=config,
+        ...     model=model,
+        ...     reward_funcs=my_reward_fn,
+        ...     feedback_func=my_feedback,
+        ...     train_dataset=dataset,
+        ...     processing_class=tokenizer,
+        ... )
+        >>> trainer.train()
+    """
+
+    arguments: SDPOConfig
+
+    def __init__(
+        self,
+        arguments: SDPOConfig,
+        model: EasyDeLBaseModule | EasyDeLState | None,
+        reward_funcs: RewardFunc | list[RewardFunc],
+        train_dataset: Dataset | IterableDataset | ShardedDataSource | None = None,
+        eval_dataset: Dataset | IterableDataset | ShardedDataSource | dict[str, Dataset] | None = None,
+        processing_class: ProcessingClassType = None,
+        reward_processing_classes: ProcessingClassType = None,
+        data_tokenize_fn: tp.Callable | None = None,
+        feedback_func: FeedbackFunc | None = None,
+    ):
+        """Initialize the SDPO trainer.
+
+        Args:
+            arguments (SDPOConfig): SDPO configuration. Must be an
+                :class:`SDPOConfig` instance.
+            model (EasyDeLBaseModule | EasyDeLState | None): Policy model
+                or pre-built state.
+            reward_funcs (RewardFunc | list[RewardFunc]): Reward
+                function(s) for scoring completions; rewards drive the
+                self-feedback path.
+            train_dataset (Dataset | IterableDataset | ShardedDataSource | None):
+                Training dataset of prompts.
+            eval_dataset (Dataset | IterableDataset | ShardedDataSource |
+                dict[str, Dataset] | None): Optional evaluation dataset(s).
+            processing_class (ProcessingClassType): Tokenizer / processor.
+            reward_processing_classes (ProcessingClassType): Optional
+                processor(s) for reward models.
+            data_tokenize_fn (tp.Callable | None): Optional custom
+                tokenizer.
+            feedback_func (FeedbackFunc | None): Optional callable
+                ``(prompts, completions, rewards) -> list[str]`` that
+                generates rich textual feedback. When ``None`` the
+                trainer uses the self-feedback fallback (Section 3 of
+                the paper).
+
+        Raises:
+            TypeError: If ``arguments`` is not an :class:`SDPOConfig`.
+        """
+        if not isinstance(arguments, SDPOConfig):
+            raise TypeError(f"arguments must be SDPOConfig, got {type(arguments)}")
+
+        self.feedback_func = feedback_func
+        self._effective_feedback_length = arguments.max_feedback_length
+        self.teacher_prompt_length = arguments.max_prompt_length + self._effective_feedback_length
+
+        super().__init__(
+            arguments=arguments,
+            model=model,
+            reward_funcs=reward_funcs,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            processing_class=processing_class,
+            reward_processing_classes=reward_processing_classes,
+            data_tokenize_fn=data_tokenize_fn,
+        )
+        self._configure_teacher_context()
+
+    @staticmethod
+    def _resolve_model_context_window(config: tp.Any) -> int | None:
+        """Best-effort extraction of model context window from config.
+
+        Searches a list of common attribute names (``max_position_embeddings``,
+        ``n_positions``, etc.) and returns the smallest positive value found.
+
+        Args:
+            config (tp.Any): Model configuration object.
+
+        Returns:
+            int | None: Resolved context window size, or ``None`` if no
+            suitable attribute is found.
+        """
+        candidates: list[int] = []
+        for attr in (
+            "granted_mask_max_position_embedding",
+            "granted_freq_max_position_embedding",
+            "mask_max_position_embeddings",
+            "freq_max_position_embeddings",
+            "max_position_embeddings",
+            "max_context_length",
+            "n_positions",
+        ):
+            value = getattr(config, attr, None)
+            if isinstance(value, (int, np.integer)) and int(value) > 0:
+                candidates.append(int(value))
+        return min(candidates) if candidates else None
+
+    def _configure_teacher_context(self) -> None:
+        """Cap feedback tokens so prompt+feedback+completion fits model context.
+
+        Updates ``self._effective_feedback_length`` and
+        ``self.teacher_prompt_length`` after consulting the model's
+        context window. Logs a warning when feedback tokens are
+        truncated below the requested ``max_feedback_length``.
+
+        Raises:
+            ValueError: If the model context window cannot accommodate
+                even the prompt and completion (without any feedback).
+        """
+        base_len = int(self.arguments.max_prompt_length + self.arguments.max_completion_length)
+        requested_feedback_len = min(int(self.arguments.max_feedback_length), int(self.arguments.max_reprompt_len))
+        requested_teacher_len = base_len + requested_feedback_len
+
+        model_config = getattr(self.model_state.model, "config", None)
+        model_context_window = self._resolve_model_context_window(model_config) if model_config is not None else None
+        if model_context_window is None and self.arguments.max_length is not None:
+            model_context_window = int(self.arguments.max_length)
+
+        if model_context_window is None:
+            teacher_total_len = requested_teacher_len
+        else:
+            if model_context_window < base_len:
+                raise ValueError(
+                    "SDPO requires context window >= prompt+completion "
+                    f"({base_len}), but model supports {model_context_window}."
+                )
+            teacher_total_len = min(requested_teacher_len, model_context_window)
+
+        self._effective_feedback_length = max(teacher_total_len - base_len, 0)
+        self.teacher_prompt_length = self.arguments.max_prompt_length + self._effective_feedback_length
+
+        if self._effective_feedback_length < requested_feedback_len:
+            logger.warning(
+                "Truncating SDPO feedback tokens from %d to %d to fit context window "
+                "(prompt+completion=%d, model_context=%d).",
+                requested_feedback_len,
+                self._effective_feedback_length,
+                base_len,
+                model_context_window,
+            )
+
+    def configure_functions(self) -> TrainerConfigureFunctionOutput:
+        """Compile the SDPO training/eval step plus the reference-model log-prob helper.
+
+        SDPO needs three compiled artefacts:
+
+        * **Training step** -- :func:`sdpo_step` partial-applied with the
+          group size ``num_generations``, the *teacher* prompt length
+          (``max_prompt_length + effective_feedback_length``), the
+          optional KL ``beta``, the distillation kind (``"kl"`` or
+          ``"jsd"``), and the usual sharding/scheduler/accumulation
+          knobs. State is donated and round-trips at
+          ``self.state_shardings``; batch and metrics ride on a
+          replicated sharding.
+        * **Evaluation step** -- the same :func:`sdpo_step` recompiled
+          with ``is_training=False`` so the gradient/optimiser branch is
+          short-circuited and only the loss/metrics path runs.
+        * **Reference-model log-prob helper**
+          ``self.compute_refmodel_logps`` -- only consulted when
+          ``arguments.beta != 0``. Built via
+          :func:`compile_trainer_step` over the closure
+          ``_compute_refmodel_logps`` which binds the frozen reference
+          graph definition, applies the step partition spec to the
+          prompt+completion ids, and delegates to
+          :func:`get_per_token_logps` so the per-token reference log-
+          probs are aligned with the completion positions used by
+          :func:`sdpo_step`.
+
+        Side effects:
+            Mutates ``self._train_shared_fn_static_args`` and
+            ``self._eval_shared_fn_static_args``, stamps the static
+            argnums onto the compiled step closures for downstream
+            introspection, ensures the checkpoint directory exists, and
+            constructs the streaming checkpoint manager.
+
+        Returns:
+            A :class:`TrainerConfigureFunctionOutput` bundling the
+            compiled training step, the compiled evaluation step, the
+            active mesh, and the streaming checkpoint manager.
+        """
+        mesh = self.model.mesh
+        empty_sharding = replicated_named_sharding(mesh)
+
+        straight_through_emulator = resolve_straight_through_emulator(
+            quantization_mode=self.arguments.quantization_mode,
+            quantization_group_size=self.arguments.quantization_group_size,
+            quantization_bits=self.arguments.quantization_bits,
+            tensor_straight_through=self.arguments.tensor_straight_through,
+            straight_through_emulator=self.arguments.straight_through_emulator,
+        )
+
+        shared_static = (
+            self.num_generations,
+            self.teacher_prompt_length,
+            self.arguments.beta,
+            self.arguments.distillation_type,
+            self.arguments.distillation_weight,
+            self.arguments.logprob_vocab_chunk_size,
+            self.arguments.max_loss_completion_tokens,
+            self.arguments.completion_chunk_size,
+            self.arguments.loss_config,
+            self.scheduler,
+            self.arguments.step_partition_spec,
+            self.arguments.gradient_accumulation_steps,
+        )
+        num_loss_tokens_to_skip = int(getattr(self.arguments, "num_loss_tokens_to_skip", 0) or 0)
+        full_logit_distillation = bool(self.arguments.full_logit_distillation)
+        distillation_topk = self.arguments.distillation_topk
+        distillation_is_clip = self.arguments.distillation_is_clip
+        distillation_add_tail = bool(self.arguments.distillation_add_tail)
+        static_argnames = tuple(range(2, 21))
+
+        self._train_shared_fn_static_args = (
+            *shared_static,
+            True,
+            straight_through_emulator,
+            num_loss_tokens_to_skip,
+            full_logit_distillation,
+            distillation_topk,
+            distillation_is_clip,
+            distillation_add_tail,
+        )
+
+        self._runtime_trace("train.compile_wrapper.begin")
+        sharded_training_step_function = compile_trainer_step(
+            sdpo_step,
+            in_shardings=(self.state_shardings, empty_sharding),
+            out_shardings=(self.state_shardings, empty_sharding),
+            donate_argnums=(0,),
+            static_argnums=static_argnames,
+            mesh=self.model.mesh,
+            schedule=self.arguments.mpmd_scheduler,
+            arguments=self.arguments,
+        )
+        self._runtime_trace("train.compile_wrapper.end")
+
+        self._eval_shared_fn_static_args = (
+            *shared_static,
+            False,
+            straight_through_emulator,
+            num_loss_tokens_to_skip,
+            full_logit_distillation,
+            distillation_topk,
+            distillation_is_clip,
+            distillation_add_tail,
+        )
+
+        self._runtime_trace("eval.compile_wrapper.begin")
+        sharded_evaluation_step_function = compile_trainer_step(
+            sdpo_step,
+            in_shardings=(self.state_shardings, empty_sharding),
+            out_shardings=empty_sharding,
+            static_argnums=static_argnames,
+            mesh=self.model.mesh,
+            schedule=self.arguments.mpmd_scheduler,
+            arguments=self.arguments,
+        )
+        self._runtime_trace("eval.compile_wrapper.end")
+
+        def _compute_refmodel_logps(graphtree, graphother, ids, mask, graphdef):
+            """Compute frozen reference-model per-token log probabilities.
+
+            Args:
+                graphtree: Reference-model graph state (parameters).
+                graphother: Reference-model auxiliary state.
+                ids (jax.Array): Concatenated prompt+completion token ids.
+                mask (jax.Array): Concatenated attention mask.
+                graphdef: Reference-model graph definition for binding.
+
+            Returns:
+                jax.Array: Per-token log probabilities for the completion
+                portion only.
+            """
+            graphother = jax.tree_util.tree_map(
+                lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
+                graphother,
+            )
+            apply = spx.bind(graphdef, graphtree.merge(graphother, copy=False))
+            with apply.mesh:
+                ids = with_sharding_constraint(
+                    ids,
+                    self.arguments.step_partition_spec,
+                    mesh=apply.mesh,
+                    ignore_mpmd=True,
+                )
+                mask = with_sharding_constraint(
+                    mask,
+                    self.arguments.step_partition_spec,
+                    mesh=apply.mesh,
+                    ignore_mpmd=True,
+                )
+                return get_per_token_logps(
+                    apply,
+                    ids,
+                    mask,
+                    self.arguments.max_prompt_length,
+                    logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
+                )
+
+        self.compute_refmodel_logps = compile_trainer_step(
+            partial(_compute_refmodel_logps, graphdef=self.model_state.graphdef),
+            mesh=mesh,
+            static_argnames=("graphdef",),
+            in_shardings=(
+                self.model_state.shardings.graphstate,
+                self.model_state.shardings.graphother,
+                empty_sharding,
+                empty_sharding,
+            ),
+            out_shardings=empty_sharding,
+        )
+
+        sharded_training_step_function.static_argnums_ = static_argnames
+        sharded_evaluation_step_function.static_argnums_ = static_argnames
+
+        self.arguments.ensure_checkpoint_path()
+        checkpoint_manager = self.arguments.get_streaming_checkpointer()
+
+        return TrainerConfigureFunctionOutput(
+            sharded_training_step_function=sharded_training_step_function,
+            sharded_evaluation_step_function=sharded_evaluation_step_function,
+            mesh=mesh,
+            checkpoint_manager=checkpoint_manager,
+        )
+
+    def _get_self_feedback(
+        self,
+        completions: list[str],
+        rewards: jax.Array,
+        generation_factor: int,
+    ) -> tuple[list[str], list[str]]:
+        """Derive feedback without a rich-feedback function.
+
+        For each rollout group the best-rewarded completion is used as the
+        "correct solution" for the other attempts (Section 3 of the paper).
+
+        Args:
+            completions: Decoded completion strings (length ``B*G``).
+            rewards: Per-completion scalar rewards, shape ``[B*G]``.
+            generation_factor: Number of completions per prompt (``G``).
+
+        Returns:
+            ``(feedback_texts, env_feedbacks)`` - both lists of length ``B*G``.
+            ``env_feedbacks`` is unused here (all empty strings) but kept for
+            interface consistency with the rich-feedback path.
+        """
+        rewards_np = np.asarray(jax.device_get(rewards))
+        arguments = getattr(self, "arguments", None)
+        threshold = float(getattr(arguments, "success_reward_threshold", 0.0))
+        use_successful_as_teacher = bool(getattr(arguments, "use_successful_as_teacher", True))
+        dont_reprompt_on_self_success = bool(getattr(arguments, "dont_reprompt_on_self_success", False))
+        solution_template = getattr(arguments, "solution_template", _FEEDBACK_TEMPLATE_SOLUTION)
+        feedback_template = getattr(arguments, "feedback_template", _FEEDBACK_TEMPLATE_ENV)
+        reprompt_template = getattr(arguments, "reprompt_template", "{solution}{feedback}" + _FEEDBACK_TEMPLATE_SOLVE)
+        remove_thinking = bool(getattr(arguments, "remove_thinking_from_demonstration", False))
+        n_prompts = len(completions) // generation_factor
+        feedback_texts: list[str] = []
+        env_feedbacks: list[str] = [""] * len(completions)
+
+        for i in range(n_prompts):
+            sl = slice(i * generation_factor, (i + 1) * generation_factor)
+            group_completions = completions[sl]
+            group_rewards = rewards_np[sl]
+
+            best_idx = int(np.argmax(group_rewards))
+            best_reward = group_rewards[best_idx]
+            best_completion = group_completions[best_idx]
+            correct_solution = best_completion if use_successful_as_teacher and best_reward > threshold else None
+
+            for j in range(generation_factor):
+                is_successful = bool(group_rewards[j] > threshold)
+                sep = _build_feedback_separator(
+                    is_successful=is_successful,
+                    env_feedback="",
+                    correct_solution=correct_solution if not is_successful else None,
+                    dont_reprompt_on_self_success=dont_reprompt_on_self_success,
+                    solution_template=solution_template,
+                    feedback_template=feedback_template,
+                    reprompt_template=reprompt_template,
+                    remove_thinking_from_demonstration=remove_thinking,
+                )
+                feedback_texts.append(sep)
+
+        return feedback_texts, env_feedbacks
+
+    def _get_rich_feedback(
+        self,
+        completion_prompts: list,
+        completions: list,
+        rewards: jax.Array,
+    ) -> list[str]:
+        """Get feedback strings from the user-supplied ``feedback_func``.
+
+        Args:
+            completion_prompts: Prompt texts (or conversation dicts) repeated
+                ``G`` times (one per completion).
+            completions: Decoded completion strings.
+            rewards: Per-completion scalar rewards.
+
+        Returns:
+            List of feedback separator strings, one per completion.
+        """
+        rewards_list = [float(r) for r in jax.device_get(rewards)]
+        arguments = getattr(self, "arguments", None)
+        threshold = float(getattr(arguments, "success_reward_threshold", 0.0))
+        include_environment_feedback = bool(getattr(arguments, "include_environment_feedback", True))
+        feedback_template = getattr(arguments, "feedback_template", _FEEDBACK_TEMPLATE_ENV)
+        reprompt_template = getattr(arguments, "reprompt_template", "{solution}{feedback}" + _FEEDBACK_TEMPLATE_SOLVE)
+        dont_reprompt_on_self_success = bool(getattr(arguments, "dont_reprompt_on_self_success", False))
+        raw_feedbacks = self.feedback_func(
+            prompts=(
+                completion_prompts if isinstance(completion_prompts[0], str) else [str(p) for p in completion_prompts]
+            ),
+            completions=completions if isinstance(completions[0], str) else [str(c) for c in completions],
+            rewards=rewards_list,
+        )
+        feedback_texts = []
+        for raw_fb, reward in zip(raw_feedbacks, rewards_list, strict=False):
+            is_successful = reward > threshold
+            sep = _build_feedback_separator(
+                is_successful=is_successful,
+                env_feedback=(raw_fb or "") if include_environment_feedback else "",
+                correct_solution=None,
+                dont_reprompt_on_self_success=dont_reprompt_on_self_success,
+                feedback_template=feedback_template,
+                reprompt_template=reprompt_template,
+            )
+            feedback_texts.append(sep)
+        return feedback_texts
+
+    def _tokenize_feedback_separators(
+        self,
+        feedback_texts: list[str],
+    ) -> tuple[jax.Array, jax.Array]:
+        """Tokenise feedback separator strings and pad to effective feedback length.
+
+        Args:
+            feedback_texts: List of ``B*G`` feedback separator strings.
+
+        Returns:
+            ``(feedback_ids, feedback_mask)`` both ``[B*G, effective_feedback_length]``.
+        """
+        if self._effective_feedback_length <= 0:
+            batch_size = len(feedback_texts)
+            empty = jnp.zeros((batch_size, 0), dtype=jnp.int32)
+            return empty, empty
+
+        enc = self.processing_class(
+            feedback_texts,
+            add_special_tokens=False,
+            max_length=self._effective_feedback_length,
+            truncation=True,
+            padding="max_length",
+            return_tensors="np",
+        )
+        return jnp.asarray(enc["input_ids"]), jnp.asarray(enc["attention_mask"])
+
+    def _ensure_non_empty_prompts(
+        self,
+        prompt_ids: jax.Array,
+        prompt_mask: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, int]:
+        """Ensure each prompt row has at least one visible token.
+
+        Empty prompt rows can appear with malformed / partially tokenized
+        datasets and propagate to eSurge as ``prompt_len=0`` requests. This
+        inserts a fallback token at the last prompt position for such rows.
+
+        Args:
+            prompt_ids (jax.Array): Prompt token ids of shape
+                ``[batch, prompt_len]``.
+            prompt_mask (jax.Array): Prompt attention mask of the same
+                shape.
+
+        Returns:
+            tuple[jax.Array, jax.Array, int]: ``(prompt_ids, prompt_mask,
+            num_repaired_rows)`` -- arrays with empty rows patched and a
+            count of how many rows were modified.
+        """
+        prompt_mask_np = np.asarray(jax.device_get(prompt_mask))
+        if prompt_mask_np.ndim != 2 or prompt_mask_np.shape[1] == 0:
+            return prompt_ids, prompt_mask, 0
+
+        empty_rows = np.where(prompt_mask_np.sum(axis=1) <= 0)[0]
+        if empty_rows.size == 0:
+            return prompt_ids, prompt_mask, 0
+
+        prompt_ids_np = np.asarray(jax.device_get(prompt_ids)).copy()
+        prompt_mask_np = prompt_mask_np.copy()
+        fallback_token_id = int(self._eos_token_id[0] if len(self._eos_token_id) > 0 else self._pad_token_id)
+
+        prompt_ids_np[empty_rows, -1] = fallback_token_id
+        prompt_mask_np[empty_rows, -1] = 1
+
+        return jnp.asarray(prompt_ids_np), jnp.asarray(prompt_mask_np), int(empty_rows.size)
+
+    def _preprocess_batch_input(
+        self,
+        state: EasyDeLState,
+        batch: dict[str, jax.Array],
+        is_train: bool,
+    ) -> tuple[dict[str, jax.Array], dict[str, float | int | str]]:
+        """Build the SDPO batch from raw prompts.
+
+        Steps:
+            1. Generate ``G`` completions per prompt (identical to GRPO).
+            2. Evaluate rewards from ``reward_funcs`` (for logging and
+               feedback selection).
+            3. Build feedback separator texts (rich or self-feedback).
+            4. Tokenise feedback separators into ``feedback_ids`` and
+               ``feedback_mask``.
+            5. Construct the teacher context
+               ``teacher_ids = [prompt_ids | feedback_ids | completion_ids]``.
+            6. Optionally compute reference-model log-probabilities when
+               ``beta > 0``.
+            7. Return the batch dict consumed by :func:`sdpo_step`.
+
+        Args:
+            state (EasyDeLState): Current policy state used for rollout
+                generation.
+            batch (dict[str, jax.Array]): Raw input batch.
+            is_train (bool): Whether this preprocessing is for training
+                (controls conversational handling).
+
+        Returns:
+            tuple[dict[str, jax.Array], dict[str, float | int | str]]:
+            ``(processed_batch, metrics_dict)``.
+        """
+        batch = self._apply_user_data_collator(batch)
+        reward_batch = self._extract_reward_batch_sidechannels(batch)
+        batch = self._purify_batch(batch)
+        if reward_batch:
+            reward_batch = {**batch, **reward_batch}
+        else:
+            reward_batch = batch
+
+        with capture_time() as preprocessing_time_fn:
+            prompt_ids, prompt_mask = batch["input_ids"], batch["attention_mask"]
+            prompt_ids, prompt_mask, empty_prompt_rows = self._ensure_non_empty_prompts(prompt_ids, prompt_mask)
+            if empty_prompt_rows > 0:
+                logger.warning(
+                    "Detected %d empty prompt rows in SDPO batch; inserted fallback token.",
+                    empty_prompt_rows,
+                )
+
+            with capture_time() as generation_time_fn:
+                results = self.rollout(
+                    input_ids=prompt_ids,
+                    attention_mask=prompt_mask,
+                    state=state,
+                    apply_chat_template=False,
+                    shard_inputs=False,
+                    all_gather=False,
+                    config_overrides={"num_return_sequences": int(self.num_generations)},
+                )
+                sequences = results.sequences
+                prompt_ids = results.prompt_ids
+                prompt_mask = results.prompt_mask
+                completion_ids = results.completion_ids
+                completion_prompts = results.completion_prompts
+            generation_time = generation_time_fn()
+
+            completion_mask = self._make_attn_mask(completion_ids)
+            if self.arguments.mask_truncated_completions:
+                eos_tokens = jnp.asarray(self._eos_token_id).reshape(-1)
+                has_eos = jnp.any(jnp.isin(completion_ids, eos_tokens), axis=1)
+                completion_mask = completion_mask * has_eos[:, None].astype(completion_mask.dtype)
+
+            generation_factor = completion_ids.shape[0] // max(prompt_mask.shape[0], 1)
+            generation_factor = max(generation_factor, 1)
+            ridmask = prompt_mask.repeat(generation_factor, 0)
+
+            raw_completions_text = self._coerce_generation_texts(
+                results.raw_text,
+                fallback=results.text,
+            )
+            completions_text = self._coerce_generation_texts(
+                results.text,
+                fallback=raw_completions_text,
+            )
+            if not raw_completions_text or not completions_text:
+                # HF tokenizers expect Python / NumPy token ids; JAX arrays can fail in Rust decode bindings.
+                completion_ids_for_decode = np.asarray(jax.device_get(completion_ids)).tolist()
+                completion_mask_for_decode = np.asarray(jax.device_get(completion_mask), dtype=np.int32)
+                completion_ids_array = np.asarray(completion_ids_for_decode, dtype=np.int64)
+                if not raw_completions_text:
+                    raw_completions_text = self._decode_prompt_batch(
+                        self.processing_class,
+                        completion_ids_array,
+                        skip_special_tokens=False,
+                        pad_token_id=self._pad_token_id,
+                        pop_pad_tokens=True,
+                        attention_mask=completion_mask_for_decode,
+                    )
+                if not completions_text:
+                    completions_text = self._decode_prompt_batch(
+                        self.processing_class,
+                        completion_ids_array,
+                        skip_special_tokens=True,
+                        pad_token_id=self._pad_token_id,
+                        pop_pad_tokens=True,
+                        attention_mask=completion_mask_for_decode,
+                    )
+            is_conv = self.train_is_conversational if is_train else self.eval_is_conversational
+            if is_conv:
+                raw_completions = [[{"role": "assistant", "content": c}] for c in raw_completions_text]
+                completions = [[{"role": "assistant", "content": c}] for c in completions_text]
+            else:
+                raw_completions = raw_completions_text
+                completions = completions_text
+            target_len = len(completions_text) or len(raw_completions_text) or int(completion_ids.shape[0])
+            reasoning_records = self._coerce_optional_generation_texts(
+                results.reasoning,
+                target_len=target_len,
+            )
+            tool_call_records = self._coerce_generation_metadata_list(
+                results.tool_calls,
+                target_len=target_len,
+            )
+            structured_completions = (
+                self._build_structured_assistant_messages(
+                    completions_text,
+                    tool_calls=tool_call_records,
+                )
+                if is_conv
+                else completions
+            )
+
+            rewards_per_func = jnp.full(
+                (prompt_ids.shape[0] * generation_factor, len(self.reward_funcs)),
+                jnp.nan,
+                dtype="f4",
+            )
+            with capture_time() as rewarding_time_fn:
+                for i, (reward_func, reward_processing_class) in enumerate(
+                    zip(self.reward_funcs, self.reward_processing_classes, strict=False)
+                ):
+                    if isinstance(reward_func, EasyDeLState):
+                        if is_conv:
+                            # ``completion_prompts`` is typed
+                            # ``list[str | list[dict[str, str]]]`` -- an entry is
+                            # legitimately either raw text or an already-structured
+                            # chat history. The conversational branch concatenates it
+                            # with the structured completion, so a plain string has to
+                            # be lifted into a one-message history first; otherwise
+                            # ``str + list`` raises "can only concatenate str (not
+                            # list) to str" mid-training.
+                            messages = [
+                                {"messages": _as_chat_history(p) + c}
+                                for p, c in zip(completion_prompts, structured_completions, strict=False)
+                            ]
+                            texts = [
+                                apply_chat_template(
+                                    x,
+                                    reward_processing_class,
+                                    tools=self._reward_chat_template_tools(),
+                                )["text"]
+                                for x in messages
+                            ]
+                        else:
+                            texts = [p + c for p, c in zip(completion_prompts, completions, strict=False)]
+                        rew = reward_func.apply_fn(
+                            reward_func.graphdef,
+                            reward_func.graphstate,
+                            reward_func.graphother,
+                            dict(
+                                reward_processing_class(
+                                    texts,
+                                    return_tensors="np",
+                                    padding="max_length",
+                                    padding_side="right",
+                                    add_special_tokens=False,
+                                    truncation=True,
+                                    return_attention_mask=True,
+                                    max_length=self.arguments.max_length,
+                                )
+                            ),
+                        ).logits[:, 0]
+                    else:
+                        reward_call_kwargs = self._build_reward_call_kwargs(
+                            reward_func,
+                            prompts=completion_prompts,
+                            completions=completions,
+                            raw_completions=raw_completions,
+                            completion_texts=completions_text,
+                            raw_text=raw_completions_text,
+                            reasoning=reasoning_records,
+                            tool_calls=tool_call_records,
+                            max_length=self.arguments.max_length,
+                            batch=reward_batch,
+                        )
+                        output_reward_func = reward_func(**reward_call_kwargs)
+                        rew = jnp.array(
+                            [v if v is not None else jnp.nan for v in output_reward_func],
+                            dtype="f4",
+                        )
+                    rewards_per_func = rewards_per_func.at[:, i].set(rew.reshape(-1))
+            rewarding_time = rewarding_time_fn()
+
+            rewards = jnp.nansum(rewards_per_func * self.reward_weights[None, :], axis=1)
+
+            if self.feedback_func is not None:
+                feedback_texts = self._get_rich_feedback(
+                    completion_prompts=completion_prompts,
+                    completions=completions_text,
+                    rewards=rewards,
+                )
+            else:
+                feedback_texts, _ = self._get_self_feedback(
+                    completions=completions_text,
+                    rewards=rewards,
+                    generation_factor=generation_factor,
+                )
+
+            with capture_time() as teacher_build_time_fn:
+                feedback_ids, feedback_mask = self._tokenize_feedback_separators(feedback_texts)
+
+                rids = prompt_ids.repeat(generation_factor, 0)
+
+                teacher_ids = jnp.concatenate([rids, feedback_ids, completion_ids], axis=1)
+                teacher_mask = jnp.concatenate([ridmask, feedback_mask, completion_mask], axis=1)
+            teacher_build_time = teacher_build_time_fn()
+
+            prompt_completion_ids = sequences
+            with capture_time() as token_logps_time_fn:
+                if self.arguments.beta != 0.0:
+                    ref_per_token_logps = self.compute_refmodel_logps(
+                        self.ref_state.graphstate,
+                        self.ref_state.graphother,
+                        prompt_completion_ids,
+                        jnp.concatenate([ridmask, completion_mask], -1),
+                    )
+                else:
+                    ref_per_token_logps = None
+            token_logps_time = token_logps_time_fn()
+            log_completion_length = jnp.sum(completion_mask, -1)
+
+            prompt_ids = self._all_gather(prompt_ids)
+            prompt_mask = self._all_gather(prompt_mask)
+            completion_ids = self._all_gather(completion_ids)
+            completion_mask = self._all_gather(completion_mask)
+            teacher_ids = self._all_gather(teacher_ids)
+            teacher_mask = self._all_gather(teacher_mask)
+            rewards_per_func = self._all_gather(rewards_per_func)
+            if ref_per_token_logps is not None:
+                ref_per_token_logps = self._all_gather(ref_per_token_logps)
+
+        preprocessing_time = preprocessing_time_fn()
+        completion_length = jnp.sum(completion_mask, -1)
+
+        metrics_dict: dict[str, float | int | str] = {
+            "reward_mean": _host_scalar_float(jnp.nanmean(rewards)),
+            "reward_std": _host_scalar_float(jnp.nanstd(rewards)),
+            "completion_length": _host_mean_float(completion_length),
+            "generation_time": generation_time,
+            "rewarding_time": rewarding_time,
+            "teacher_build_time": teacher_build_time,
+            "token_logps_time": token_logps_time,
+            "preprocessing_time": preprocessing_time,
+        }
+        for i, name in enumerate(self.reward_func_names):
+            metrics_dict[name] = _host_scalar_float(jnp.nanmean(rewards_per_func[:, i]))
+        self._log_training_generations_to_wandb(
+            state=state,
+            prompts=completion_prompts,
+            completions=completions_text,
+            completion_lengths=log_completion_length,
+            generation_time=generation_time,
+            reasoning=reasoning_records,
+            tool_calls=tool_call_records,
+            source="policy",
+        )
+
+        out_batch: dict[str, jax.Array] = {
+            "prompt_ids": prompt_ids,
+            "prompt_mask": prompt_mask,
+            "completion_ids": completion_ids,
+            "completion_mask": completion_mask,
+            "teacher_ids": teacher_ids,
+            "teacher_mask": teacher_mask,
+            "num_items_in_batch": jnp.sum(completion_mask),
+        }
+        if ref_per_token_logps is not None:
+            out_batch["ref_per_token_logps"] = ref_per_token_logps
+
+        return out_batch, metrics_dict
+
+    def on_step_end(
+        self,
+        state: EasyDeLState,
+        metrics: MetricsType,
+        step: int,
+    ) -> tuple[EasyDeLState, MetricsType]:
+        """Post-step hook -- syncs the reference model when requested.
+
+        When ``arguments.sync_ref_model`` is enabled and ``step`` lies on
+        a sync boundary, mixes the current policy parameters into the
+        reference model with linear coefficient
+        ``arguments.ref_model_mixup_alpha``.
+
+        Args:
+            state (EasyDeLState): Updated policy state at the end of
+                this step.
+            metrics (MetricsType): Metrics produced by the step.
+            step (int): Current global training step.
+
+        Returns:
+            tuple[EasyDeLState, MetricsType]: The (unchanged) policy
+            state and metrics; the reference model is mutated in place.
+        """
+        if (
+            self.arguments.sync_ref_model
+            and self.ref_state is not None
+            and (step % self.arguments.ref_model_sync_steps == 0)
+        ):
+            self.ref_state = self.ref_state.replace(
+                graphstate=polyak_update_reference_graphstate(
+                    self.ref_state.graphstate,
+                    state.graphstate,
+                    alpha=self.arguments.ref_model_mixup_alpha,
+                )
+            )
+        return state, metrics

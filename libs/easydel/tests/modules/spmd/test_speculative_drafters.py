@@ -1,0 +1,523 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for DeepSpec-style speculative drafter modules."""
+
+import easydel as ed
+import jax
+import jax.numpy as jnp
+import numpy as np
+import spectrax as spx
+from easydel.inference.speculative import DraftStep
+from easydel.infra.factory import TaskType, registry
+from easydel.infra.spec_decode import SpecDecodeBase
+
+
+def _input_ids(batch_size: int = 2, seq_len: int = 6, vocab_size: int = 32):
+    """Create dummy input IDs for testing speculative drafters.
+
+    Args:
+        batch_size: Number of sequences in the batch. Defaults to 2.
+        seq_len: Number of tokens per sequence. Defaults to 6.
+        vocab_size: Vocabulary size (excluding the last reserved token). Defaults to 32.
+
+    Returns:
+        jax.Array: Integer input IDs of shape (batch_size, seq_len) with values
+        in ``[0, vocab_size - 2]``.
+    """
+    values = jnp.arange(batch_size * seq_len, dtype=jnp.int32).reshape(batch_size, seq_len)
+    return values % (vocab_size - 1)
+
+
+def _target_hidden_states(num_states: int, batch_size: int = 2, seq_len: int = 6, hidden_size: int = 16):
+    """Create dummy target hidden states for testing speculative drafters.
+
+    Args:
+        num_states: Number of hidden-state tensors to generate.
+        batch_size: Number of sequences in the batch. Defaults to 2.
+        seq_len: Number of tokens per sequence. Defaults to 6.
+        hidden_size: Dimension of each hidden state. Defaults to 16.
+
+    Returns:
+        tuple[jax.Array, ...]: A tuple of ``num_states`` random normal arrays,
+        each of shape (batch_size, seq_len, hidden_size).
+    """
+    key = jax.random.PRNGKey(0)
+    return tuple(
+        jax.random.normal(jax.random.fold_in(key, idx), (batch_size, seq_len, hidden_size), dtype=jnp.float32)
+        for idx in range(num_states)
+    )
+
+
+def test_eagle3_forward_shapes_and_registry():
+    """Validate Eagle3Model forward shapes and registry entries.
+
+    Instantiates an ``Eagle3Model``, runs a forward pass, and asserts that
+    ``hidden_states``, ``draft_logits``, and ``logits`` shapes match expected
+    dimensions. Also verifies ``compute_mtp_chain`` returns the correct MTP
+    chain shape, and that the config and base module are registered under
+    ``eagle3``.
+    """
+    cfg = ed.Eagle3Config(
+        vocab_size=32,
+        hidden_size=16,
+        target_hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=4,
+        max_position_embeddings=16,
+        target_layer_ids=(0, 1, 2, 3, 4),
+    )
+    model = ed.Eagle3Model(config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
+    input_ids = _input_ids()
+    outputs = model(
+        input_ids=input_ids,
+        target_hidden_states=_target_hidden_states(6),
+        attention_mask=jnp.ones_like(input_ids, dtype=bool),
+        return_logits=True,
+    )
+
+    assert outputs.hidden_states.shape == (2, 6, 16)
+    assert outputs.draft_logits.shape == (2, 6, 32)
+    assert outputs.logits.shape == (2, 6, 32)
+    assert model.compute_mtp_chain(outputs, input_ids, 3).shape == (3, 2, 6, 32)
+    assert registry.get_config("eagle3") is ed.Eagle3Config
+    assert registry.get_module_registration(TaskType.BASE_MODULE, "eagle3").module is ed.Eagle3Model
+
+
+def test_dspark_block_forward_with_markov_and_confidence():
+    """Validate DSparkModel block forward with Markov and confidence heads.
+
+    Instantiates a ``DSparkModel`` with Markov and confidence heads enabled,
+    runs a forward pass, and asserts all output tensor shapes including
+    ``block_logits``, ``draft_logits``, ``target_ids``, ``eval_mask``,
+    ``block_keep_mask``, ``confidence_logits``, and ``aligned_target_logits``.
+    Also verifies registry entries for ``dspark``.
+    """
+    cfg = ed.DSparkConfig(
+        vocab_size=32,
+        hidden_size=16,
+        target_hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=4,
+        max_position_embeddings=16,
+        target_layer_ids=(-1, 0),
+        block_size=3,
+        num_anchors=2,
+        mask_token_id=31,
+        markov_rank=4,
+        markov_head_type="gated",
+        confidence_head_alpha=1.0,
+        confidence_head_with_markov=True,
+    )
+    model = ed.DSparkModel(config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
+    input_ids = _input_ids()
+    target_hidden_states = _target_hidden_states(2)
+    outputs = model(
+        input_ids=input_ids,
+        target_hidden_states=target_hidden_states,
+        loss_mask=jnp.ones_like(input_ids, dtype=jnp.float32),
+        target_last_hidden_states=target_hidden_states[-1],
+    )
+
+    assert outputs.block_logits.shape == (2, 2, 3, 32)
+    assert outputs.draft_logits.shape == (2, 2, 3, 32)
+    assert outputs.target_ids.shape == (2, 2, 3)
+    assert outputs.eval_mask.shape == (2, 2, 3)
+    assert outputs.block_keep_mask.shape == (2, 2)
+    assert outputs.confidence_logits.shape == (2, 2, 3)
+    assert outputs.aligned_target_logits.shape == (2, 2, 3, 32)
+    assert registry.get_config("dspark") is ed.DSparkConfig
+    assert registry.get_module_registration(TaskType.BASE_MODULE, "dspark").module is ed.DSparkModel
+
+
+def test_dspark_block_forward_uses_target_logits_for_smaller_drafter():
+    """Validate DSparkModel uses target logits when the drafter is smaller.
+
+    When the drafter ``hidden_size`` is smaller than ``target_hidden_size``,
+    the model accepts external ``target_logits`` and produces aligned logits.
+    Asserts that ``block_logits`` and ``aligned_target_logits`` shapes are
+    correct.
+    """
+    cfg = ed.DSparkConfig(
+        vocab_size=32,
+        hidden_size=8,
+        target_hidden_size=16,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        max_position_embeddings=16,
+        target_layer_ids=(-1, 0),
+        block_size=3,
+        num_anchors=2,
+        mask_token_id=31,
+        markov_rank=4,
+        markov_head_type="gated",
+        confidence_head_alpha=1.0,
+        confidence_head_with_markov=True,
+    )
+    model = ed.DSparkModel(config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
+    input_ids = _input_ids()
+    target_hidden_states = _target_hidden_states(2)
+    target_logits = jax.random.normal(jax.random.PRNGKey(1), (2, 6, 32), dtype=jnp.float32)
+    outputs = model(
+        input_ids=input_ids,
+        target_hidden_states=target_hidden_states,
+        loss_mask=jnp.ones_like(input_ids, dtype=jnp.float32),
+        target_last_hidden_states=target_hidden_states[-1],
+        target_logits=target_logits,
+    )
+
+    assert outputs.block_logits.shape == (2, 2, 3, 32)
+    assert outputs.aligned_target_logits.shape == (2, 2, 3, 32)
+
+
+def test_dspark_accepts_qwen3_6_target_layer_selection():
+    """Validate DSparkModel can project Qwen3-6 style target layer selections.
+
+    Configures ``DSparkModel`` with large ``target_layer_ids`` (e.g., 65 layers)
+    and asserts that ``project_target_hidden_states`` returns the correct
+    projected shape.
+    """
+    cfg = ed.DSparkConfig(
+        vocab_size=32,
+        hidden_size=8,
+        target_hidden_size=16,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        max_position_embeddings=16,
+        target_layer_ids=(-1, 15, 31, 47, 63),
+        block_size=3,
+        num_anchors=2,
+        mask_token_id=31,
+        markov_rank=4,
+        markov_head_type="gated",
+    )
+    model = ed.DSparkModel(config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
+
+    projected = model.project_target_hidden_states(_target_hidden_states(65))
+
+    assert projected.shape == (2, 6, 8)
+
+
+def test_dflash_accepts_qwen3_6_target_layer_selection():
+    """Validate DFlashModel can project Qwen3-6 style target layer selections.
+
+    Configures ``DFlashModel`` with large ``target_layer_ids`` and asserts that
+    ``project_target_hidden_states`` returns the correct projected shape.
+    """
+    cfg = ed.DFlashConfig(
+        vocab_size=32,
+        hidden_size=8,
+        target_hidden_size=16,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        max_position_embeddings=16,
+        target_layer_ids=(-1, 15, 31, 47, 63),
+        block_size=3,
+        num_anchors=2,
+        mask_token_id=31,
+    )
+    model = ed.DFlashModel(config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
+
+    projected = model.project_target_hidden_states(_target_hidden_states(65))
+
+    assert projected.shape == (2, 6, 8)
+
+
+def test_eagle3_accepts_qwen3_6_target_layer_selection():
+    """Validate Eagle3Model can project Qwen3-6 style target layer selections.
+
+    Configures ``Eagle3Model`` with large ``target_layer_ids`` and asserts that
+    ``project_target_hidden_states`` returns the correct projected shape.
+    """
+    cfg = ed.Eagle3Config(
+        vocab_size=32,
+        hidden_size=8,
+        target_hidden_size=16,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        max_position_embeddings=16,
+        target_layer_ids=(15, 31, 47, 55, 63),
+    )
+    model = ed.Eagle3Model(config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
+
+    projected = model.project_target_hidden_states(_target_hidden_states(65))
+
+    assert projected.shape == (2, 6, 8)
+
+
+def test_dflash_block_forward_disables_dspark_extra_heads():
+    """Validate DFlashModel disables extra heads present in DSpark.
+
+    Instantiates ``DFlashModel`` and asserts that ``markov_rank`` and
+    ``enable_confidence_head`` are disabled, the corresponding head modules are
+    ``None``, and block-forward output shapes are correct. Also verifies
+    registry entries for ``dflash``.
+    """
+    cfg = ed.DFlashConfig(
+        vocab_size=32,
+        hidden_size=16,
+        target_hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=4,
+        max_position_embeddings=16,
+        target_layer_ids=(-1, 0),
+        block_size=3,
+        num_anchors=2,
+        mask_token_id=31,
+    )
+    model = ed.DFlashModel(config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
+    input_ids = _input_ids()
+    outputs = model(
+        input_ids=input_ids,
+        target_hidden_states=_target_hidden_states(2),
+        loss_mask=jnp.ones_like(input_ids, dtype=jnp.float32),
+    )
+
+    assert cfg.markov_rank == 0
+    assert not cfg.enable_confidence_head
+    assert model.markov_head is None
+    assert model.confidence_head is None
+    assert outputs.block_logits.shape == (2, 2, 3, 32)
+    assert outputs.confidence_logits is None
+    assert registry.get_config("dflash") is ed.DFlashConfig
+    assert registry.get_module_registration(TaskType.BASE_MODULE, "dflash").module is ed.DFlashModel
+
+
+def test_model_native_drafters_compose_spec_decode_base():
+    """EAGLE3 / DSpark / DFlash compose ``EasyDeLBaseModule`` + ``SpecDecodeBase``.
+
+    A subclass with a metaclass conflict would fail to *import*, so reaching this
+    assertion at all proves the MRO composed; the ``issubclass`` checks lock it.
+    """
+    assert issubclass(ed.Eagle3Model, SpecDecodeBase)
+    assert issubclass(ed.DSparkModel, SpecDecodeBase)
+    assert issubclass(ed.DFlashModel, SpecDecodeBase)
+    # DFlash inherits the drafter surface from DSpark unchanged.
+    assert ed.DFlashModel._draft_logits is ed.DSparkModel._draft_logits
+    # EAGLE3 accepts a multi-token prefix; the DSpark family does not.
+    assert ed.Eagle3Model.supports_prefix_draft is True
+    assert ed.DSparkModel.supports_prefix_draft is False
+
+
+def _assert_valid_draftstep(step, *, batch: int, vocab: int, expect_full: bool):
+    """Assert a :class:`DraftStep` has the documented shapes/dtypes."""
+    assert isinstance(step, DraftStep)
+    assert step.token_ids.shape == (batch,)
+    assert step.token_ids.dtype == jnp.int32
+    tokens = np.asarray(step.token_ids)
+    assert tokens.min() >= 0 and tokens.max() < vocab
+    if expect_full:
+        assert step.full_log_probs is not None
+        assert step.full_log_probs.shape == (batch, vocab)
+        assert step.log_probs is not None
+        assert step.log_probs.shape == (batch,)
+    else:
+        assert step.full_log_probs is None
+        assert step.log_probs is None
+
+
+def test_eagle3_draft_returns_valid_draftstep():
+    """``Eagle3Model.draft`` yields a valid greedy + full-log-prob ``DraftStep``.
+
+    EAGLE3 is fixed at five target layers, so ``draft`` is exercised with a
+    per-layer hidden-state tuple (the trainer-shaped input) rather than a single
+    runner-seed hidden.
+    """
+    cfg = ed.Eagle3Config(
+        vocab_size=32,
+        hidden_size=16,
+        target_hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=4,
+        max_position_embeddings=16,
+        target_layer_ids=(0, 1, 2, 3, 4),
+    )
+    model = ed.Eagle3Model(config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
+    input_ids = _input_ids(batch_size=2, seq_len=6, vocab_size=32)
+    target_hidden = _target_hidden_states(6, batch_size=2, seq_len=6, hidden_size=16)
+
+    _assert_valid_draftstep(
+        model.draft(input_ids=input_ids, target_hidden_states=target_hidden),
+        batch=2,
+        vocab=32,
+        expect_full=False,
+    )
+    _assert_valid_draftstep(
+        model.draft(input_ids=input_ids, target_hidden_states=target_hidden, return_full_log_probs=True),
+        batch=2,
+        vocab=32,
+        expect_full=True,
+    )
+
+
+def test_dspark_draft_returns_valid_draftstep():
+    """``DSparkModel.draft`` (single target layer) yields a valid ``DraftStep``."""
+    cfg = ed.DSparkConfig(
+        vocab_size=32,
+        hidden_size=16,
+        target_hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=4,
+        max_position_embeddings=16,
+        target_layer_ids=(0,),
+        block_size=3,
+        num_anchors=2,
+        mask_token_id=31,
+    )
+    model = ed.DSparkModel(config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
+    input_ids = _input_ids(batch_size=2, seq_len=6, vocab_size=32)
+    hidden = _target_hidden_states(1, batch_size=2, seq_len=6, hidden_size=16)[0]
+
+    _assert_valid_draftstep(
+        model.draft(input_ids=input_ids, target_hidden_states=hidden, return_full_log_probs=True),
+        batch=2,
+        vocab=32,
+        expect_full=True,
+    )
+
+
+def test_dflash_draft_returns_valid_draftstep():
+    """``DFlashModel`` inherits DSpark's drafter surface and drafts a valid step."""
+    cfg = ed.DFlashConfig(
+        vocab_size=32,
+        hidden_size=16,
+        target_hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=4,
+        max_position_embeddings=16,
+        target_layer_ids=(0,),
+        block_size=3,
+        num_anchors=2,
+        mask_token_id=31,
+    )
+    model = ed.DFlashModel(config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
+    input_ids = _input_ids(batch_size=2, seq_len=6, vocab_size=32)
+    hidden = _target_hidden_states(1, batch_size=2, seq_len=6, hidden_size=16)[0]
+
+    _assert_valid_draftstep(
+        model.draft(input_ids=input_ids, target_hidden_states=hidden),
+        batch=2,
+        vocab=32,
+        expect_full=False,
+    )
+
+
+def test_dspark_model_drafter_registry_path():
+    """``model.drafter(method="dspark", drafter_model=...)`` resolves via the registry."""
+    cfg = ed.DSparkConfig(
+        vocab_size=32,
+        hidden_size=16,
+        target_hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=4,
+        max_position_embeddings=16,
+        target_layer_ids=(0,),
+        block_size=3,
+        num_anchors=2,
+        mask_token_id=31,
+    )
+    drafter_model = ed.DSparkModel(config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
+    target_model = ed.DSparkModel(config=cfg, rngs=spx.Rngs(1), dtype=jnp.float32, param_dtype=jnp.float32)
+
+    built = target_model.drafter(method="dspark", drafter_model=drafter_model, num_draft_tokens=3)
+    assert built is drafter_model
+    assert built.num_draft_tokens == 3
+    # Aliases/normalization route to the same builder as the model-native path.
+    from easydel.infra import DrafterRegistry
+
+    assert DrafterRegistry.resolve("dspark") is DrafterRegistry.resolve("DSpark")
+
+
+def test_dspark_draft_matches_block_training_forward():
+    """``DSparkModel.draft`` evaluates the DeepSpec block-training function.
+
+    The runner calls the drafter with the anchor (last verified token) followed
+    by the tokens drafted so far and target context that precedes the anchor.
+    Row ``j`` of that single-anchor block must equal row ``j`` of the training
+    block forward at the same anchor — including the recurrent Markov head,
+    whose state is carried across the block's rows.
+    """
+    cfg = ed.DSparkConfig(
+        vocab_size=32,
+        hidden_size=16,
+        target_hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=4,
+        max_position_embeddings=16,
+        target_layer_ids=(0,),
+        block_size=3,
+        num_anchors=1,
+        mask_token_id=31,
+        markov_rank=4,
+        markov_head_type="rnn",
+        confidence_head_alpha=0.0,
+    )
+    model = ed.DSparkModel(config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
+    input_ids = _input_ids(batch_size=2, seq_len=6, vocab_size=32)
+    hidden = _target_hidden_states(1, batch_size=2, seq_len=6, hidden_size=16)[0]
+    anchor = 2
+
+    train = model(
+        input_ids=input_ids,
+        target_hidden_states=hidden,
+        anchor_positions=jnp.full((2, 1), anchor, dtype=jnp.int32),
+        block_keep_mask=jnp.ones((2, 1), dtype=bool),
+    )
+    block_logits = np.asarray(train.block_logits[:, 0])  # (batch, block, vocab)
+
+    # Anchor + the (teacher-forced) previous tokens, context strictly before the anchor.
+    prev_tokens = input_ids[:, anchor : anchor + cfg.block_size]
+    logits, _hidden = model._draft_logits(prev_tokens, target_hidden_states=hidden[:, :anchor])
+    np.testing.assert_allclose(np.asarray(logits), block_logits, rtol=1e-4, atol=1e-5)
+
+    # The shared ``draft`` tail proposes the last row's argmax.
+    for rows in range(1, cfg.block_size + 1):
+        step = model.draft(input_ids=prev_tokens[:, :rows], target_hidden_states=hidden[:, :anchor])
+        np.testing.assert_array_equal(np.asarray(step.token_ids), block_logits[:, rows - 1].argmax(-1))

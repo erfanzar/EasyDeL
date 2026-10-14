@@ -1,0 +1,743 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Nash Mirror Descent (Nash-MD) trainer.
+
+Nash-MD -- Munos et al. (2023) -- searches for the Nash equilibrium
+of a self-play game by descending the regularised expected reward
+against a mixture between the current policy and a frozen reference,
+using a preference oracle to score head-to-head completions.  The
+trainer subclasses :class:`GRPOTrainer` for the online generation /
+reward pipeline and overrides only the loss/step.
+"""
+
+from __future__ import annotations
+
+import collections.abc
+import typing as tp
+from functools import partial
+
+import jax
+import jax.nn
+import numpy as np
+import spectrax as spx
+from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
+from eformer.loggings import get_logger
+from jax import numpy as jnp
+from spectrax import with_sharding_constraint
+
+from easydel.inference.logits_process import LogitsProcessor, LogitsProcessorList
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.base_state import EasyDeLState
+from easydel.infra.sharding import replicated_named_sharding
+from easydel.infra.utils import ProcessingClassType
+from easydel.utils import Registry
+from easydel.utils.helpers import capture_time
+
+from .._shared import drop_optimizer_state
+from ..group_relative_policy_optimization._fn import get_per_token_logps
+from ..group_relative_policy_optimization.grpo_trainer import GRPOTrainer
+from ..metrics import _host_mean_float
+from ..trainer_protocol import TrainerConfigureFunctionOutput
+from ..training_utils import compile_trainer_step, resolve_straight_through_emulator
+from ._fn import nash_md_step
+from .nash_md_config import NashMDConfig
+
+logger = get_logger(__name__)
+
+if tp.TYPE_CHECKING:
+    pass
+
+
+def _ensure_state(
+    model: EasyDeLBaseModule | EasyDeLState | None,
+    *,
+    trainable_selector: tp.Any = "parameters",
+) -> EasyDeLState | None:
+    """Convert a module to an ``EasyDeLState`` if needed.
+
+    Args:
+        model: An :class:`EasyDeLBaseModule`, an :class:`EasyDeLState`,
+            or ``None``. Already-promoted states are returned as-is.
+        trainable_selector: Selector forwarded to
+            :meth:`EasyDeLBaseModule.to_state` when promoting a raw
+            module into a state.
+
+    Returns:
+        The corresponding :class:`EasyDeLState`, or ``None`` when
+        ``model`` is ``None``.
+    """
+    if model is None:
+        return None
+    if isinstance(model, EasyDeLState):
+        return model
+    return model.to_state(trainable_selector=trainable_selector)
+
+
+class GeometricMixtureLogitsProcessor(LogitsProcessor):
+    """Replace policy logits with the policy/reference geometric-mixture logits."""
+
+    def __init__(
+        self,
+        ref_model: EasyDeLBaseModule,
+        mixture_coef: float,
+        pad_token_id: int | None,
+    ):
+        self.ref_model = ref_model
+        self.mixture_coef = float(mixture_coef)
+        self.pad_token_id = pad_token_id
+
+    def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
+        seq_positions = jnp.arange(input_ids.shape[1])[None, :]
+        attention_mask = seq_positions < cur_len
+        if self.pad_token_id is not None:
+            attention_mask = attention_mask & (input_ids != jnp.asarray(self.pad_token_id, dtype=input_ids.dtype))
+
+        ref_outputs = self.ref_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask.astype(jnp.int32),
+        )
+        ref_logits = jax.lax.dynamic_slice_in_dim(ref_outputs.logits, cur_len - 1, 1, axis=1)[:, 0, :]
+        mixed_logits = self.mixture_coef * ref_logits + (1.0 - self.mixture_coef) * scores
+        return jax.nn.log_softmax(mixed_logits, axis=-1)
+
+
+@Registry.register("trainer", ["nash-md", "nash_md"])
+class NashMDTrainer(GRPOTrainer):
+    """Trainer for Nash Mirror Descent (Nash-MD) preference optimization.
+
+    Implements the Nash-MD algorithm (Munos et al. 2024): each step
+    samples auxiliary completions from the *geometric mixture* of the
+    policy and reference logits. Following TRL, ``mixture_coef`` is the
+    reference-logit coefficient:
+    ``logits_mix = mixture_coef * logits_ref + (1 - mixture_coef) * logits_policy``,
+    treats those mixture samples as the opposing player, and updates
+    the policy via a mirror-descent step regularised by the
+    token-level KL against the reference. Both ``mixture_coef`` and
+    ``beta`` may be provided as epoch-wise schedules in the config.
+
+    Inherits the GRPO data plumbing (rollout generator, reward
+    routing, advantage construction) from :class:`GRPOTrainer`; only
+    the loss step (:func:`nash_md_step`) and the rollout post-
+    processing (mixture sampling + oracle preference scoring) differ.
+
+    See :func:`nash_md_step` for the loss form.
+
+    Attributes:
+        arguments: :class:`NashMDConfig` controlling the mirror-descent
+            schedules and the inherited ``GRPOConfig`` surface.
+        reference_state: Frozen reference :class:`EasyDeLState` used
+            to evaluate the mixture and the KL-regularisation term.
+        reward_funcs: Single oracle reward callable / module that
+            scores head-to-head ``(policy_completion,
+            mixture_completion)`` pairs.
+    """
+
+    arguments: NashMDConfig
+
+    def __init__(
+        self,
+        arguments: NashMDConfig,
+        model: EasyDeLBaseModule | EasyDeLState,
+        reward_funcs: collections.abc.Sequence[tp.Callable] | tp.Callable,
+        *,
+        reference_model: EasyDeLBaseModule | EasyDeLState | None = None,
+        train_dataset: Dataset | IterableDataset | None = None,
+        eval_dataset: Dataset | dict[str, Dataset] | IterableDataset | None = None,
+        processing_class: ProcessingClassType,
+        reward_processing_classes: ProcessingClassType | list[ProcessingClassType] | None = None,
+    ):
+        """Initialize the Nash-MD trainer.
+
+        Delegates the heavy lifting (state setup, reward routing, online
+        generation pipeline) to :class:`GRPOTrainer`, then attaches the
+        Nash-MD specific schedules (``beta``, ``mixture_coef``,
+        ``missing_eos_penalty``).
+
+        Args:
+            arguments: Nash-MD-specific training configuration.
+            model: Policy module or state.
+            reward_funcs: Single reward callable / module / state, or a
+                list with exactly one element (Nash-MD scores
+                head-to-head completions, so multi-reward isn't
+                supported).
+            reference_model: Optional reference module/state; when
+                omitted the GRPO trainer's deep-copy default is used.
+            train_dataset: Optional training dataset of prompts.
+            eval_dataset: Optional evaluation dataset.
+            processing_class: Tokenizer/processor.
+            reward_processing_classes: Optional per-reward tokenizer
+                overrides.
+
+        Raises:
+            ValueError: If ``reward_funcs`` is missing or contains more
+                than one entry.
+        """
+        if reward_funcs is None:
+            raise ValueError("NashMDTrainer requires at least one reward function.")
+        super().__init__(
+            arguments=arguments,
+            model=model,
+            reward_funcs=reward_funcs,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            processing_class=processing_class,
+            reward_processing_classes=reward_processing_classes,
+        )
+        ref_state = _ensure_state(reference_model, trainable_selector=arguments.trainable_selector)
+        if ref_state is not None:
+            self.ref_state = drop_optimizer_state(ref_state)
+
+        self._beta_schedule = arguments.beta
+        self._mixture_schedule = arguments.mixture_coef
+        self.missing_eos_penalty = arguments.missing_eos_penalty
+        self.num_generations = 1
+        if reward_funcs is not None:
+            reward_funcs_list = reward_funcs if isinstance(reward_funcs, list) else [reward_funcs]
+            if len(reward_funcs_list) != 1:
+                raise ValueError("NashMDTrainer only supports a single reward function/model.")
+
+    def _schedule_value(self, schedule: tp.Any, default: float) -> float:
+        """Resolve the current value of an epoch-wise schedule.
+
+        Scalars are returned as ``float(schedule)``. Sequences are
+        indexed by the current epoch (estimated from
+        ``state.step // steps_per_epoch``) and clamped to the last
+        entry once training overruns the schedule. Empty sequences
+        and ``None`` fall back to ``default``.
+
+        Args:
+            schedule: Either a scalar value, a non-empty sequence of
+                per-epoch values, or ``None``.
+            default: Value returned when ``schedule`` is ``None`` or
+                an empty sequence.
+
+        Returns:
+            The float-valued current schedule entry.
+        """
+        if isinstance(schedule, collections.abc.Sequence):
+            if not schedule:
+                return default
+            if self.max_training_steps is None or self.arguments.num_train_epochs <= 0:
+                return float(schedule[0])
+            steps_per_epoch = max(self.max_training_steps // self.arguments.num_train_epochs, 1)
+            current_step = int(jax.device_get(self.model_state.step)) if self.model_state is not None else 0
+            idx = min(current_step // steps_per_epoch, len(schedule) - 1)
+            return float(schedule[idx])
+        if schedule is None:
+            return default
+        return float(schedule)
+
+    def _current_beta_value(self) -> float:
+        """Get current beta value from schedule.
+
+        Returns:
+            Current beta value.
+        """
+        return self._schedule_value(self._beta_schedule, 0.1)
+
+    def _current_mixture_coef(self) -> float:
+        """Get current mixture coefficient from schedule.
+
+        Returns:
+            Current mixture coefficient.
+        """
+        return self._schedule_value(self._mixture_schedule, 0.5)
+
+    @property
+    def _train_shared_fn_extra_args(self) -> tuple[tp.Any, ...]:
+        """Return the current ``beta`` schedule value as the extra training arg."""
+        return (jnp.asarray(self._current_beta_value(), dtype=jnp.float32),)
+
+    @property
+    def _eval_shared_fn_extra_args(self) -> tuple[tp.Any, ...]:
+        """Return the current ``beta`` schedule value as the extra evaluation arg."""
+        return (jnp.asarray(self._current_beta_value(), dtype=jnp.float32),)
+
+    def configure_functions(self) -> TrainerConfigureFunctionOutput:
+        """Build the JIT-compiled Nash-MD training/evaluation step functions.
+
+        Resolves the optional QAT straight-through emulator, captures
+        the static argument tuple (``beta`` schedule, vocab chunk
+        size, partition spec, ...), and compiles
+        :func:`nash_md_step` once for training (with state donation)
+        and once for evaluation. Also installs the sharded
+        per-token-logp callable used by the rollout pipeline to score
+        the mixture and reference completions.
+
+        Returns:
+            ``TrainerConfigureFunctionOutput`` with the sharded
+            training / evaluation step callables, the model mesh,
+            and the streaming checkpoint manager.
+        """
+        mesh = self.model.mesh
+        empty_sharding = replicated_named_sharding(mesh)
+        straight_through_emulator = resolve_straight_through_emulator(
+            quantization_mode=self.arguments.quantization_mode,
+            quantization_group_size=self.arguments.quantization_group_size,
+            quantization_bits=self.arguments.quantization_bits,
+            tensor_straight_through=self.arguments.tensor_straight_through,
+            straight_through_emulator=self.arguments.straight_through_emulator,
+        )
+
+        self._train_shared_fn_static_args = (
+            self.arguments.logprob_vocab_chunk_size,
+            self.arguments.loss_config,
+            self.scheduler,
+            self.arguments.step_partition_spec,
+            self.arguments.gradient_accumulation_steps,
+            True,
+            straight_through_emulator,
+        )
+        self._eval_shared_fn_static_args = (
+            self.arguments.logprob_vocab_chunk_size,
+            self.arguments.loss_config,
+            self.scheduler,
+            self.arguments.step_partition_spec,
+            self.arguments.gradient_accumulation_steps,
+            False,
+            straight_through_emulator,
+        )
+
+        static_argnums = (3, 4, 5, 6, 7, 8, 9)
+        self._runtime_trace("train.compile_wrapper.begin")
+        sharded_training_step_function = compile_trainer_step(
+            nash_md_step,
+            in_shardings=(self.state_shardings, empty_sharding, empty_sharding),
+            out_shardings=(self.state_shardings, empty_sharding),
+            donate_argnums=(0,),
+            static_argnums=static_argnums,
+            mesh=self.model.mesh,
+            schedule=self.arguments.mpmd_scheduler,
+            arguments=self.arguments,
+        )
+        self._runtime_trace("train.compile_wrapper.end")
+        self._runtime_trace("eval.compile_wrapper.begin")
+        sharded_evaluation_step_function = compile_trainer_step(
+            nash_md_step,
+            in_shardings=(self.state_shardings, empty_sharding, empty_sharding),
+            out_shardings=empty_sharding,
+            static_argnums=static_argnums,
+            mesh=self.model.mesh,
+            schedule=self.arguments.mpmd_scheduler,
+            arguments=self.arguments,
+        )
+        self._runtime_trace("eval.compile_wrapper.end")
+
+        def _compute_model_logps(
+            graphtree: spx.State,
+            graphother: spx.State,
+            ids: jax.Array,
+            mask: jax.Array,
+            graphdef: spx.GraphDef,
+        ):
+            """Sharded model per-token log-prob forward used for both policy and reference.
+
+            Stops gradients through the frozen graphother, applies the
+            trainer's step partition spec, and dispatches to
+            :func:`get_per_token_logps` with the configured vocab chunk
+            size.
+
+            Args:
+                graphtree: Trainable graphstate.
+                graphother: Frozen graphother (stop-gradient applied).
+                ids: Token id array ``[batch, seq_len]``.
+                mask: Attention mask ``[batch, seq_len]``.
+                graphdef: Captured graphdef for the model.
+
+            Returns:
+                ``[batch, seq_len]`` log-probabilities.
+            """
+            graphother = jax.tree_util.tree_map(
+                lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
+                graphother,
+            )
+            apply = spx.bind(graphdef, graphtree.merge(graphother, copy=False))
+            with apply.mesh:
+                ids = with_sharding_constraint(
+                    ids,
+                    self.arguments.step_partition_spec,
+                    mesh=apply.mesh,
+                    ignore_mpmd=True,
+                )
+                mask = with_sharding_constraint(
+                    mask,
+                    self.arguments.step_partition_spec,
+                    mesh=apply.mesh,
+                    ignore_mpmd=True,
+                )
+                return get_per_token_logps(
+                    apply,
+                    ids,
+                    mask,
+                    self.arguments.max_prompt_length,
+                    logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
+                )
+
+        self.compute_refmodel_logps = compile_trainer_step(
+            partial(_compute_model_logps, graphdef=self.model_state.graphdef),
+            mesh=mesh,
+            static_argnames=("graphdef",),
+            in_shardings=(
+                self.ref_state.shardings.graphstate,
+                self.ref_state.shardings.graphother,
+                empty_sharding,
+                empty_sharding,
+            ),
+            out_shardings=empty_sharding,
+        )
+
+        self.arguments.ensure_checkpoint_path()
+        checkpoint_manager = self.arguments.get_streaming_checkpointer()
+
+        return TrainerConfigureFunctionOutput(
+            sharded_training_step_function=sharded_training_step_function,
+            sharded_evaluation_step_function=sharded_evaluation_step_function,
+            mesh=mesh,
+            checkpoint_manager=checkpoint_manager,
+        )
+
+    def _score_rewards(
+        self,
+        prompts: list[str],
+        completions: list[str],
+        *,
+        raw_text: list[str] | None = None,
+        reasoning: list[str | None] | None = None,
+        tool_calls: list[tp.Any | None] | None = None,
+        batch: dict[str, tp.Any] | None = None,
+    ) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
+        """Compute reward scores for prompt-completion pairs.
+
+        Iterates over each registered reward function (or
+        :class:`EasyDeLState` reward model), routes the prompt /
+        completion strings through the configured tokenizer when
+        scoring with a model, and accumulates a per-function score plus
+        a name-keyed breakdown for logging.
+
+        Args:
+            prompts: List of prompt strings.
+            completions: List of completion strings.
+            raw_text: Optional raw (pre-decoded) completion strings to
+                forward to reward functions that consume them
+                directly. Defaults to ``None``.
+            reasoning: Optional per-completion reasoning traces (one
+                per completion, ``None`` when unavailable).
+            tool_calls: Optional per-completion tool-call metadata.
+            batch: Optional original batch dict (forwarded to reward
+                functions that accept it).
+
+        Returns:
+            Tuple ``(total_rewards, reward_breakdown)`` where
+            ``total_rewards`` is a ``[batch]`` float32 array summed
+            across reward functions and ``reward_breakdown`` maps each
+            reward function's name to its ``[batch]`` score array.
+
+        Raises:
+            ValueError: If an :class:`EasyDeLState` reward model is
+                supplied without a matching
+                ``reward_processing_class``.
+        """
+        rewards = []
+        breakdown: dict[str, jnp.ndarray] = {}
+        for reward_func, reward_processing_class in zip(
+            self.reward_funcs,
+            self.reward_processing_classes,
+            strict=True,
+        ):
+            name = getattr(reward_func, "__name__", None) or reward_func.__class__.__name__
+            if isinstance(reward_func, EasyDeLState):
+                if reward_processing_class is None:
+                    raise ValueError("Reward processing class must be provided when using EasyDeL reward models.")
+                texts = [p + c for p, c in zip(prompts, completions, strict=False)]
+                tokenized = reward_processing_class(
+                    texts,
+                    return_tensors="np",
+                    padding="max_length",
+                    padding_side="right",
+                    add_special_tokens=False,
+                    truncation=True,
+                    return_attention_mask=True,
+                    max_length=self.arguments.max_length,
+                )
+                logits = reward_func.apply_fn(
+                    reward_func.graphdef,
+                    reward_func.graphstate,
+                    reward_func.graphother,
+                    dict(tokenized),
+                ).logits[:, 0]
+                values = jnp.asarray(logits, dtype=jnp.float32)
+            else:
+                reward_call_kwargs = self._build_reward_call_kwargs(
+                    reward_func,
+                    prompts=prompts,
+                    completions=completions,
+                    raw_completions=raw_text,
+                    prompt_texts=prompts,
+                    completion_texts=completions,
+                    raw_text=raw_text,
+                    reasoning=reasoning,
+                    tool_calls=tool_calls,
+                    max_length=self.arguments.max_length,
+                    batch=batch,
+                )
+                outputs = reward_func(**reward_call_kwargs)
+                values = jnp.asarray(np.asarray(outputs, dtype=np.float32))
+            rewards.append(values)
+            breakdown[name] = values
+
+        if not rewards:
+            zeros = jnp.zeros((len(prompts),), dtype=jnp.float32)
+            return zeros, {}
+
+        stacked = jnp.stack(rewards, axis=1)
+        totals = stacked.sum(axis=1)
+        return totals, breakdown
+
+    def _preprocess_batch_input(
+        self,
+        state: EasyDeLState,
+        batch: dict[str, jax.Array],
+        is_train: bool,
+    ) -> tuple[dict[str, jax.Array], dict[str, float | int | str]]:
+        """Generate policy and mixture completions, score them, and assemble the loss batch.
+
+        Runs three logical phases:
+
+        1. Generate a policy completion for each prompt, then generate
+           an opposing completion from the policy/reference geometric
+           logit mixture.
+        2. Score both the policy completion and the chosen mixture
+           completion with the oracle reward function, apply the
+           optional missing-EOS penalty, and convert the score
+           difference into a Bradley-Terry preference probability via
+           :func:`jax.nn.sigmoid`.
+        3. Compute reference per-token logps over the
+           prompt+completion sequence and package the all-gathered
+           tensors that :func:`nash_md_step` consumes.
+
+        Also logs per-source completions to W&B and records the
+        current ``beta`` / ``mixture_coef`` schedule values.
+
+        Args:
+            state: Current policy ``EasyDeLState``.
+            batch: Input batch containing ``input_ids`` and
+                ``attention_mask`` for the prompts.
+            is_train: Whether this is a training step (unused
+                directly, kept for API parity with the GRPO base).
+
+        Returns:
+            Tuple ``(processed_batch, metrics_dict)`` where
+            ``processed_batch`` is the dict fed to
+            :func:`nash_md_step` (prompts, completions, masks,
+            ``ref_token_logps``, ``probabilities``) and
+            ``metrics_dict`` carries reward/length/timing diagnostics
+            for the trainer's logger.
+        """
+        batch = self._apply_user_data_collator(batch)
+        batch = self._purify_batch(batch)
+        with capture_time() as preprocessing_time_fn:
+            prompt_ids = batch["input_ids"]
+            prompt_mask = batch["attention_mask"]
+
+            with capture_time() as generation_time_fn:
+                results = self.rollout(
+                    input_ids=prompt_ids,
+                    attention_mask=prompt_mask,
+                    state=state,
+                    apply_chat_template=False,
+                    shard_inputs=False,
+                    all_gather=False,
+                    config_overrides={"num_return_sequences": 1},
+                )
+                jax.block_until_ready(results.sequences)
+                prompt_ids = results.prompt_ids
+                prompt_mask = results.prompt_mask
+                completion_ids = results.completion_ids
+                completion_mask = results.completion_mask
+            generation_time = generation_time_fn()
+
+            # Sample mixture completions from the policy/reference geometric
+            # logit mixture, matching TRL's Nash-MD rollout semantics.
+            mixture_coef = self._current_mixture_coef()
+            if mixture_coef <= 0.0:
+                mixture_state = state
+                mixture_logits_processor = None
+            elif mixture_coef >= 1.0:
+                mixture_state = self.ref_state
+                mixture_logits_processor = None
+            else:
+                mixture_state = state
+                mixture_logits_processor = LogitsProcessorList(
+                    [
+                        GeometricMixtureLogitsProcessor(
+                            ref_model=self.ref_state.model,
+                            mixture_coef=mixture_coef,
+                            pad_token_id=self._pad_token_id,
+                        )
+                    ]
+                )
+
+            with capture_time() as _mixture_time_fn:
+                mixture_generate_kwargs = {}
+                if mixture_logits_processor is not None:
+                    mixture_generate_kwargs["logits_processor"] = mixture_logits_processor
+                mixture_results = self.rollout(
+                    input_ids=prompt_ids,
+                    attention_mask=prompt_mask,
+                    state=mixture_state,
+                    use_esurge=mixture_logits_processor is None,
+                    apply_chat_template=False,
+                    shard_inputs=False,
+                    all_gather=False,
+                    config_overrides={"num_return_sequences": 1},
+                    **mixture_generate_kwargs,
+                )
+                jax.block_until_ready(mixture_results.sequences)
+                mixture_completion_ids = mixture_results.completion_ids
+                mixture_completion_mask = mixture_results.completion_mask
+            mixture_generation_time = _mixture_time_fn()
+
+            prompt_completion_ids = jnp.concatenate([prompt_ids, completion_ids], axis=1)
+            attention_mask = jnp.concatenate([prompt_mask, completion_mask], axis=1)
+
+            with capture_time() as ref_logps_time_fn:
+                ref_token_logps = self.compute_refmodel_logps(
+                    self.ref_state.graphstate,
+                    self.ref_state.graphother,
+                    prompt_completion_ids,
+                    attention_mask,
+                )
+            ref_logps_time = ref_logps_time_fn()
+
+        preprocessing_time = preprocessing_time_fn()
+
+        host_prompt_ids = np.asarray(jax.device_get(prompt_ids))
+        prompts_text = list(self.processing_class.batch_decode(host_prompt_ids, skip_special_tokens=True))
+        model_completions_text = self._coerce_generation_texts(results.text)
+        ref_completions_text = self._coerce_generation_texts(mixture_results.text)
+        if not model_completions_text:
+            host_completion_ids = np.asarray(jax.device_get(completion_ids))
+            model_completions_text = list(
+                self.processing_class.batch_decode(host_completion_ids, skip_special_tokens=True)
+            )
+        if not ref_completions_text:
+            host_ref_completion_ids = np.asarray(jax.device_get(mixture_results.completion_ids))
+            ref_completions_text = list(
+                self.processing_class.batch_decode(host_ref_completion_ids, skip_special_tokens=True)
+            )
+        model_raw_texts = self._coerce_generation_texts(
+            results.raw_text,
+            fallback=model_completions_text,
+        )
+        ref_raw_texts = self._coerce_generation_texts(
+            mixture_results.raw_text,
+            fallback=ref_completions_text,
+        )
+        model_reasoning = self._coerce_optional_generation_texts(
+            results.reasoning,
+            target_len=len(model_completions_text),
+        )
+        model_tool_calls = self._coerce_generation_metadata_list(
+            results.tool_calls,
+            target_len=len(model_completions_text),
+        )
+        ref_reasoning = self._coerce_optional_generation_texts(
+            mixture_results.reasoning,
+            target_len=len(ref_completions_text),
+        )
+        ref_tool_calls = self._coerce_generation_metadata_list(
+            mixture_results.tool_calls,
+            target_len=len(ref_completions_text),
+        )
+
+        mixture_completions_text = ref_completions_text
+        mixture_raw_texts = ref_raw_texts
+        mixture_reasoning = ref_reasoning
+        mixture_tool_calls = ref_tool_calls
+
+        model_scores, model_breakdown = self._score_rewards(
+            prompts_text,
+            model_completions_text,
+            raw_text=model_raw_texts,
+            reasoning=model_reasoning,
+            tool_calls=model_tool_calls,
+            batch=batch,
+        )
+        mixture_scores, _ = self._score_rewards(
+            prompts_text,
+            mixture_completions_text,
+            raw_text=mixture_raw_texts,
+            reasoning=mixture_reasoning,
+            tool_calls=mixture_tool_calls,
+            batch=batch,
+        )
+
+        penalty = self.missing_eos_penalty
+        eos_token_id = getattr(self.processing_class, "eos_token_id", None)
+        if penalty is not None and eos_token_id is not None:
+            eos_ids = eos_token_id if isinstance(eos_token_id, (list, tuple)) else [eos_token_id]
+            eos_tensor = jnp.asarray(eos_ids)
+            policy_contains_eos = jnp.isin(completion_ids, eos_tensor).any(axis=1)
+            mixture_contains_eos = jnp.isin(mixture_completion_ids, eos_tensor).any(axis=1)
+            model_scores = model_scores - jnp.where(policy_contains_eos, 0.0, penalty)
+            mixture_scores = mixture_scores - jnp.where(mixture_contains_eos, 0.0, penalty)
+
+        probabilities = jax.nn.sigmoid(model_scores - mixture_scores)
+        completion_lengths = completion_mask.sum(axis=1)
+
+        metrics_dict: dict[str, float | int | str] = {
+            "rewards/chosen": _host_mean_float(model_scores),
+            "rewards/rejected": _host_mean_float(mixture_scores),
+            "rewards/margins": _host_mean_float(model_scores - mixture_scores),
+            "rewards/probabilities": _host_mean_float(probabilities),
+            "completion_length": _host_mean_float(completion_lengths),
+            "generation_time": generation_time,
+            "mixture_generation_time": mixture_generation_time,
+            "reference_logps_time": ref_logps_time,
+            "preprocessing_time": preprocessing_time,
+            "mixture_coef": float(self._current_mixture_coef()),
+            "beta": float(self._current_beta_value()),
+        }
+        for name, values in model_breakdown.items():
+            metrics_dict[f"reward/{name}"] = _host_mean_float(values)
+        self._log_training_generations_to_wandb(
+            state=state,
+            prompts=prompts_text,
+            completions=model_completions_text,
+            completion_mask=completion_mask,
+            generation_time=generation_time,
+            reasoning=model_reasoning,
+            tool_calls=model_tool_calls,
+            source="policy",
+        )
+        self._log_training_generations_to_wandb(
+            state=state,
+            prompts=prompts_text,
+            completions=mixture_completions_text,
+            completion_mask=mixture_completion_mask,
+            generation_time=generation_time,
+            reasoning=mixture_reasoning,
+            tool_calls=mixture_tool_calls,
+            source="mixture",
+        )
+
+        processed_batch = {
+            "prompt_ids": self._all_gather(prompt_ids),
+            "prompt_mask": self._all_gather(prompt_mask),
+            "completion_ids": self._all_gather(completion_ids),
+            "completion_mask": self._all_gather(completion_mask),
+            "ref_token_logps": self._all_gather(ref_token_logps),
+            "probabilities": self._all_gather(probabilities),
+        }
+        return processed_batch, metrics_dict

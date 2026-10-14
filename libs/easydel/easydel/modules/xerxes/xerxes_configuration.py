@@ -1,0 +1,206 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Configuration class for the Xerxes model family.
+
+Defines :class:`XerxesConfig`, the EasyDeL configuration object for the
+Xerxes experimental decoder-only language model. Captures hidden
+size, depth, head counts, RoPE/attention settings, and Xerxes-specific
+hyperparameters used by the modeling code.
+"""
+
+from easydel.infra.base_module import EasyDeLBaseConfig
+from easydel.infra.etils import EasyDeLGradientCheckPointers
+from easydel.infra.factory import register_config
+from easydel.infra.utils import AttnMaskDetail, AttnMaskType
+
+
+@register_config("xerxes")
+class XerxesConfig(EasyDeLBaseConfig):
+    """
+    Configuration objects inherit from [`EasyDeLBaseConfig`] and can be used to control the model outputs. Read
+    the documentation from [`EasyDeLBaseConfig`] for more information.
+
+    Args:
+        vocab_size (`int`, *optional*, defaults to 256128):
+            Vocabulary size of the xerxes model. Defines the number of different tokens that can be represented by the
+            `inputs_ids` passed to the forward method.
+        hidden_size (`int`, *optional*, defaults to 4096):
+            Dimensionality of the encoder layers and the pooler layer.
+        intermediate_size (`int`, *optional*, defaults to 16384):
+            Dimensionality of the "intermediate" (i.e., feed-forward) layer in the Transformer encoder.
+        num_hidden_layers (`int`, *optional*, defaults to 32):
+            Number of hidden layers in the Transformer encoder.
+        num_attention_heads (`int`, *optional*, defaults to 16):
+            Number of attention heads for each attention layer in the Transformer encoder.
+        num_key_value_heads (`int`, *optional*, defaults to 16):
+            Number of key and value heads for each attention layer in the Transformer encoder.
+        head_dim (`int`, *optional*, defaults to 256):
+            Dimensionality of the attention head.
+        max_position_embeddings (`int`, *optional*, defaults to 6144):
+            The maximum sequence length that this model might ever be used with. Typically set this to something large
+            just in case (e.g., 2048 or 4096).
+        initializer_range (`float`, *optional*, defaults to 0.02):
+            The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
+        rms_norm_eps (`float`, *optional*, defaults to 1e-6):
+            The epsilon used by the rms normalization layers.
+        use_cache (`bool`, *optional*, defaults to `True`):
+            Whether or not the model should return the last key/values attentions (not used by all models). Only
+            relevant if `config.is_decoder=True`.
+        pad_token_id (`int`, *optional*, defaults to 0):
+            The index of the padding token in the vocabulary.
+        eos_token_id (`int`, *optional*, defaults to 1):
+            The index of the end of sequence token in the vocabulary.
+        bos_token_id (`int`, *optional*, defaults to 2):
+            The index of the beginning of sequence token in the vocabulary.
+        tie_word_embeddings (`bool`, *optional*, defaults to `True`):
+            Whether to tie the weights of the input embeddings and the output embeddings.
+        rope_theta (`float`, *optional*, defaults to 10000.0):
+            The theta value to use for rotary position embeddings.
+        softmax_scale (`float`, *optional*, defaults to `14.9666295471`):
+            softmax scale for attention module.
+        attention_dropout (`float`, *optional*, defaults to 0.0):
+            The dropout ratio for the attention probabilities.
+        gradient_checkpointing (`str`, *optional*, defaults to `"nothing_saveable"`):
+            The gradient checkpointing configuration.
+        bits (`int`, *optional*):
+            The number of bits to quantize the model to.
+        scan_layers (`bool`, *optional*, defaults to `False`):
+            Whether to use the scan implementation of the layers.
+    """
+
+    model_type: str = "xerxes"
+
+    def __init__(
+        self,
+        vocab_size: int = 256128,
+        hidden_size: int = 4096,
+        intermediate_size: int = 16384,
+        num_hidden_layers: int = 32,
+        num_attention_heads: int = 32,
+        num_key_value_heads: int = 8,
+        head_dim: int = 144,
+        max_position_embeddings: int = 16384,
+        initializer_range: float = 0.02,
+        rms_norm_eps: float = 1e-6,
+        use_cache: bool = True,
+        swish_run: bool = False,  # shown to better based on xerxes2-3b run.
+        pad_token_id: int = 0,
+        eos_token_id: int = 1,
+        bos_token_id: int = 2,
+        num_local_experts: int = 4,
+        xe_moe: bool = True,
+        xe_kvnorm: bool = False,
+        xe_mlpnorm: bool = False,
+        num_experts_per_tok: int = 2,
+        tie_word_embeddings: bool = False,
+        rope_theta: float = 10000.0,
+        rope_scaling: dict | None = None,
+        layer_types: list[str] | None = None,
+        window_pattern: int | None = None,
+        sliding_window: int | None = None,
+        gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
+        bits: int | None = None,
+        scan_layers: bool = False,
+        **kwargs,
+    ):
+        """Initialize XerxesConfig.
+
+        See the class docstring for parameter semantics. ``xe_moe``,
+        ``num_local_experts`` and ``num_experts_per_tok`` enable the MoE
+        FFN; ``xe_kvnorm`` / ``xe_mlpnorm`` toggle Xerxes-specific
+        normalization placements; ``window_pattern`` and
+        ``sliding_window`` enable optional sliding-window attention.
+        ``**kwargs`` are forwarded to :class:`EasyDeLBaseConfig`.
+        """
+        self.gradient_checkpointing = gradient_checkpointing
+        self.bits = bits
+        self.vocab_size = vocab_size
+        self.max_position_embeddings = max_position_embeddings
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.head_dim = head_dim
+        self.num_key_value_heads = num_key_value_heads
+        self.initializer_range = initializer_range
+        self.rms_norm_eps = rms_norm_eps
+        self.use_cache = use_cache
+        self.rope_theta = rope_theta
+        self.num_local_experts = num_local_experts
+        self.num_experts_per_tok = num_experts_per_tok
+        self.swish_run = swish_run
+        self.xe_moe = xe_moe
+        self.xe_kvnorm = xe_kvnorm
+        self.xe_mlpnorm = xe_mlpnorm
+        self.window_pattern = window_pattern
+        self.sliding_window = sliding_window
+
+        self.rope_scaling = rope_scaling
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = [
+                "sliding_attention" if self.layer_sliding_window(layer_idx) is not None else "full_attention"
+                for layer_idx in range(self.num_hidden_layers)
+            ]
+
+        super().__init__(
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            tie_word_embeddings=tie_word_embeddings,
+            scan_layers=scan_layers,
+            bits=bits,
+            **kwargs,
+        )
+        self.cache_implementation = "hybrid"
+
+    def layer_sliding_window(self, layer_idx: int) -> int | None:
+        """The attention window of ``layer_idx`` (``None`` for full attention).
+
+        Without ``xe_kvnorm`` even layers use a fixed 4096-token window; a
+        ``window_pattern`` overrides that with ``sliding_window`` on every layer
+        except each pattern's last.
+        """
+        sliding_window = None
+        if not self.xe_kvnorm:
+            sliding_window = 4096 if layer_idx % 2 == 0 else None
+        if self.window_pattern is not None:
+            sliding_window = self.sliding_window if (layer_idx + 1) % self.window_pattern else None
+        return sliding_window
+
+    def get_mask_details(self) -> dict[int, AttnMaskDetail]:
+        """Retrieve attention mask details for each layer in the model.
+
+        This method generates a dictionary mapping layer indices to their corresponding attention mask details.
+        If a sliding window is defined, each layer is assigned a sliding window attention mask with the specified size.
+
+        Returns:
+            dict[int, AttnMaskDetail]: A dictionary where keys are layer indices (int) and values are AttnMaskDetail
+            objects specifying the attention mask type and size for each layer.
+
+        Notes:
+            - If `self.sliding_window` is None, an empty dictionary is returned.
+            - The method iterates over `self.num_hidden_layers` to assign mask details for each layer.
+            - The attention mask type is set to `AttnMaskType.SLIDING` when a sliding window is defined.
+        """
+
+        mapping = {}
+        if self.layer_types is not None:
+            for layer_idx in range(self.num_hidden_layers):
+                mapping[layer_idx] = AttnMaskDetail(
+                    mask_type=AttnMaskType.from_hf(self.layer_types[layer_idx]),
+                    size=self.layer_sliding_window(layer_idx),
+                )
+        return mapping

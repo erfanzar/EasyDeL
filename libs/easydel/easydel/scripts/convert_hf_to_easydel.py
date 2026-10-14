@@ -1,0 +1,624 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""CLI script to convert a HuggingFace checkpoint to an EasyDeL checkpoint.
+
+Exports a single ``main`` entry point plus the ``ConvertArgs`` dataclass
+that encodes all CLI flags. Two conversion strategies are supported:
+
+- ``sequential``: Streams shards through ``huggingface_to_easydel_sequential``
+  and writes a TensorStore checkpoint without ever loading the full
+  parameter tree.
+- ``from_pretrained``: Uses ``AutoEasyDeLModel*.from_pretrained`` and
+  ``model.save_pretrained``.
+
+Example invocation:
+
+  python scripts/convert_hf_to_easydel.py \\
+    --source lmsys/gpt-oss-120b-bf16 \\
+    --out /mnt/gcs/easydel/gpt-oss-120b \\
+    --repo-id EasyDeL/gpt-oss-120b \\
+    --convert-mode sequential \\
+    --no-push-to-hub \\
+    --torch-streaming-cache temp \\
+    --torch-streaming-tmp-dir /tmp/hf-shards \\
+    --enable-hf-transfer \\
+    --token $HF_TOKEN
+
+Push later by re-running with ``--push-to-hub`` (or omitting
+``--no-push-to-hub``).
+
+Sharding:
+    ``--sharding-axis-dims`` and ``--sharding-axis-names`` define the 6D
+    mesh as ``pp,dp,fsdp,ep,tp,sp``. Use ``-1`` to auto-infer an axis
+    from available devices. Example for a single host with auto FSDP:
+    ``--sharding-axis-dims 1,1,-1,1,1,1``.
+
+Disk usage tips:
+    - Prefer ``--torch-streaming-cache temp`` to avoid filling the HF
+      cache with full shards.
+    - If you do use the HF cache, redirect it with ``--cache-dir`` (or
+      set ``HF_HOME``/``HF_HUB_CACHE``).
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Literal
+
+import jax.numpy as jnp
+from eformer.aparser import DataClassArgumentParser
+from eformer.paths import ePath
+
+# Import the model-family registry eagerly: importing ``easydel.modules``
+# triggers every family package (including ones absent from the installed
+# transformers release) to run, and families register their config classes
+# with ``transformers.AutoConfig`` on import. Without this, an
+# ``AutoConfig.from_pretrained`` on a checkpoint whose architecture is newer
+# than the host's transformers fails before model resolution ever happens.
+import easydel.modules  # noqa: F401
+
+try:
+    from eformer.loggings import get_logger
+except ModuleNotFoundError:  # pragma: no cover
+    import logging
+
+    def get_logger(name: str):
+        """Stdlib :func:`logging.getLogger` fallback when ``eformer.loggings`` is unavailable.
+
+        ``eformer`` is the preferred logger source because it
+        ships richer formatting; this fallback keeps the script
+        usable in stripped-down environments (smoke tests,
+        ad-hoc deployments) where the optional dependency is
+        missing.
+
+        Args:
+            name: Logger namespace, typically the module name.
+
+        Returns:
+            logging.Logger: Standard library logger for ``name``.
+        """
+        return logging.getLogger(name)
+
+
+logger = get_logger("Convertor")
+
+IMAGE_TEXT_TO_TEXT_MODEL_TYPES = frozenset(
+    {
+        "gemma3",
+        "gemma4",
+        "glm4v",
+        "glm4v_moe",
+        "glm46v",
+        "hunyuan_vl",
+        "idefics",
+        "idefics2",
+        "internvl",
+        "kimi_vl",
+        "llava",
+        "llama4",
+        "minimax_m3_vl",
+        "mistral3",
+        "muse_glimmer",
+        "paligemma",
+        "qwen2_vl",
+        "qwen2_5_vl",
+        "qwen2vl",
+        "qwen2_5vl",
+        "qwen3_5",
+        "qwen3_5_moe",
+        "qwen3_vl",
+        "qwen3_vl_moe",
+    }
+)
+
+
+def _infer_task_from_hf_config(config) -> TaskType:
+    """Infer the EasyDeL task type from a HuggingFace config object.
+
+    Inspects ``config.architectures``, ``config.model_type`` and
+    ``config.is_encoder_decoder`` to choose the most specific
+    ``AutoEasyDeLModel*`` task.
+
+    Args:
+        config: Loaded HuggingFace ``PretrainedConfig`` instance.
+
+    Returns:
+        ``TaskType`` literal that matches the config's architecture.
+    """
+    architectures = [str(a) for a in (getattr(config, "architectures", None) or [])]
+    joined = " ".join(architectures).lower()
+    model_type = str(getattr(config, "model_type", "") or "").lower()
+
+    if model_type in {"clip", "siglip"}:
+        return "zero_shot_image_classification"
+    if "forspeechseq2seq" in joined or model_type in {"whisper", "speech_to_text", "speech-to-text"}:
+        return "speech_seq2seq"
+    if "forimagetexttotext" in joined or "vision2seq" in joined or model_type in IMAGE_TEXT_TO_TEXT_MODEL_TYPES:
+        return "image_text_to_text"
+    if getattr(config, "is_encoder_decoder", False) or "forseq2seqlm" in joined:
+        return "seq2seq"
+    if "forzeroshotimageclassification" in joined or "zeroshotimageclassification" in joined:
+        return "zero_shot_image_classification"
+    if "forsequenceclassification" in joined or "sequenceclassification" in joined:
+        return "sequence_classification"
+    if "fordiffusionlm" in joined or model_type.endswith("diffusion"):
+        return "diffusion_lm"
+    if "forcausallm" in joined or "causallm" in joined or "forconditionalgeneration" in joined:
+        return "causal_lm"
+    return "causal_lm"
+
+
+def _import_easydel_family(meta_source: str) -> None:
+    """Import ``easydel.modules.<model_type>`` for a local ``config.json`` so its AutoConfig registration runs.
+
+    ``import easydel`` loads model families lazily. Families that transformers does not ship (``deepseek_v41``,
+    ``glm5_next``) register their config with ``transformers.AutoConfig`` when their package is imported, so the
+    package must be imported before ``AutoConfig.from_pretrained``. Hub ids, missing files and unknown model types are
+    ignored (transformers then resolves or reports the config itself).
+
+    Args:
+        meta_source: Local directory (or hub id) holding ``config.json``.
+    """
+    import importlib
+    import json
+
+    path = Path(str(meta_source)) / "config.json"
+    try:
+        model_type = json.loads(path.read_text()).get("model_type")
+    except (OSError, ValueError):
+        return
+    if not isinstance(model_type, str) or not model_type.isidentifier():
+        return
+    try:
+        importlib.import_module(f"easydel.modules.{model_type}")
+    except ModuleNotFoundError:
+        return
+
+
+def _parse_dtype(value: str):
+    """Parse a dtype string into a JAX dtype.
+
+    Args:
+        value: Dtype name (e.g. ``bf16``, ``float32``).
+
+    Returns:
+        Corresponding ``jnp.dtype``.
+
+    Raises:
+        ValueError: If the dtype name is not recognized.
+    """
+    v = value.strip().lower()
+    mapping = {
+        "bf16": jnp.bfloat16,
+        "bfloat16": jnp.bfloat16,
+        "fp16": jnp.float16,
+        "float16": jnp.float16,
+        "f16": jnp.float16,
+        "fp32": jnp.float32,
+        "float32": jnp.float32,
+        "f32": jnp.float32,
+    }
+    if v not in mapping:
+        raise ValueError(f"Unsupported dtype {value!r}. Use one of: {', '.join(sorted(mapping))}")
+    return mapping[v]
+
+
+def _parse_int_list(value: str, *, expected_len: int | None = None) -> tuple[int, ...]:
+    """Parse a comma-separated string of integers.
+
+    Args:
+        value: Comma-separated integer string (e.g. ``"1,1,-1,1,1,1"``).
+        expected_len: If set, validate that exactly this many ints are present.
+
+    Returns:
+        Tuple of parsed integers.
+
+    Raises:
+        ValueError: If parsing fails or length does not match.
+    """
+    parts = [p.strip() for p in value.split(",") if p.strip() != ""]
+    try:
+        ints = tuple(int(p) for p in parts)
+    except ValueError as e:
+        raise ValueError(f"Expected comma-separated ints, got {value!r}") from e
+    if expected_len is not None and len(ints) != expected_len:
+        raise ValueError(f"Expected {expected_len} ints, got {len(ints)}: {value!r}")
+    return ints
+
+
+def _parse_str_list(value: str, *, expected_len: int | None = None) -> tuple[str, ...]:
+    """Parse a comma-separated string into a tuple of strings.
+
+    Args:
+        value: Comma-separated string (e.g. ``"pp,dp,fsdp,ep,tp,sp"``).
+        expected_len: If set, validate that exactly this many items are present.
+
+    Returns:
+        Tuple of parsed strings.
+
+    Raises:
+        ValueError: If length does not match ``expected_len``.
+    """
+    parts = tuple(p.strip() for p in value.split(",") if p.strip() != "")
+    if expected_len is not None and len(parts) != expected_len:
+        raise ValueError(f"Expected {expected_len} items, got {len(parts)}: {value!r}")
+    return parts
+
+
+TaskType = Literal[
+    "auto",
+    "causal_lm",
+    "seq2seq",
+    "speech_seq2seq",
+    "image_text_to_text",
+    "zero_shot_image_classification",
+    "sequence_classification",
+    "diffusion_lm",
+    "base",
+    "vision",
+    "any_to_any",
+]
+ConvertMode = Literal["sequential", "from_pretrained"]
+TorchStreamingCache = Literal["hf_cache", "temp"]
+
+
+@dataclass
+class ConvertArgs:
+    """Argument schema for the HuggingFace-to-EasyDeL conversion CLI.
+
+    Parsed by :class:`eformer.aparser.DataClassArgumentParser`; every
+    field's ``metadata["help"]`` is what shows up in ``--help``. The
+    fields cluster into source/destination control, conversion
+    strategy, shard streaming behaviour, dtype, mesh layout, and
+    Hub-side options.
+
+    Attributes:
+        source (str): HuggingFace Hub repo id (e.g.
+            ``"meta-llama/Llama-3.1-8B"``) or local path to a
+            checkpoint directory. Required.
+        out (str): Output directory written by the converter. May
+            point at a GCSFuse-mounted bucket. Required.
+        repo_id (str | None): Optional Hub repo id under which to
+            publish the converted checkpoint when
+            :attr:`push_to_hub` is on.
+        push_to_hub (bool): When ``True`` and :attr:`repo_id` is
+            set, uploads the converted folder to the Hub at the
+            end of the run.
+        task (TaskType): Selects which ``AutoEasyDeLModel*`` class
+            handles the conversion. ``"auto"`` (default) consults
+            :func:`_infer_task_from_hf_config`.
+        convert_mode (ConvertMode): ``"sequential"`` streams shards
+            without ever materialising the full param tree;
+            ``"from_pretrained"`` performs a normal load then
+            ``save_pretrained``.
+        torch_streaming_cache (TorchStreamingCache): For sequential
+            mode, ``"hf_cache"`` keeps shards in the regular HF
+            cache; ``"temp"`` downloads one shard at a time to a
+            temp directory and deletes it after consumption.
+        torch_streaming_tmp_dir (str | None): Parent directory for
+            the temp shard cache; only used when
+            ``torch_streaming_cache == "temp"``.
+        tensorstore_chunk_bytes (int): Soft cap on TensorStore
+            chunk size in bytes. Defaults to 2 GiB.
+        dtype (str): Compute dtype string passed to
+            :func:`_parse_dtype` (``bf16``/``fp16``/``fp32``).
+        param_dtype (str): Parameter dtype string passed to
+            :func:`_parse_dtype`.
+        sharding_axis_dims (str): Comma-separated 6-tuple
+            ``pp,dp,fsdp,ep,tp,sp`` parsed by
+            :func:`_parse_int_list`. Use ``-1`` to auto-infer
+            from device count.
+        sharding_axis_names (str): Comma-separated 6-tuple of
+            axis names (default ``"pp,dp,fsdp,ep,tp,sp"``).
+        auto_shard_model (bool): Toggle automatic sharding (only
+            consumed by ``from_pretrained`` mode).
+        cache_dir (str | None): HF cache directory override; useful
+            when redirecting the cache to a GCSFuse mount.
+        revision (str | None): HF revision/branch/tag/commit to load
+            from. ``None`` uses the default revision.
+        token (str | None): HF token; falls back to ``HF_TOKEN`` env
+            or ``huggingface-cli login`` credentials.
+        local_files_only (bool): Disable Hub downloads entirely.
+        force_download (bool): Force re-download even when files
+            are already cached.
+        trust_remote_code (bool): Allow loading custom code from
+            the source repo (required for some architectures).
+        enable_hf_transfer (bool): Set ``HF_HUB_ENABLE_HF_TRANSFER``
+            and import ``hf_transfer`` for accelerated downloads.
+    """
+
+    source: str = field(metadata={"help": "HF repo id (e.g. meta-llama/Llama-3.1-8B) or local path"})
+    out: str = field(metadata={"help": "Output directory (local path; GCSFuse mount works)"})
+
+    repo_id: str | None = field(
+        default=None,
+        metadata={"help": "Optional: HF repo id to push to (e.g. EasyDeL/my-easydel)"},
+    )
+    push_to_hub: bool = field(
+        default=True,
+        metadata={"help": "When --repo-id is set, push the converted folder to the HF Hub."},
+    )
+
+    task: TaskType = field(
+        default="auto",
+        metadata={"help": "Model task (controls which AutoEasyDeLModel* class is used)"},
+    )
+    convert_mode: ConvertMode = field(
+        default="sequential",
+        metadata={
+            "help": "sequential streams shards and writes a TensorStore checkpoint without loading full params; "
+            "from_pretrained loads the model then saves via model.save_pretrained()"
+        },
+    )
+
+    torch_streaming_cache: TorchStreamingCache = field(
+        default="hf_cache",
+        metadata={
+            "help": "Where to store streamed shard downloads: hf_cache keeps files in HF cache; "
+            "temp downloads one shard at a time"
+        },
+    )
+    torch_streaming_tmp_dir: str | None = field(
+        default=None,
+        metadata={
+            "help": "Optional parent directory for temp shard downloads (only used with --torch-streaming-cache temp)"
+        },
+    )
+    tensorstore_chunk_bytes: int = field(
+        default=2_147_483_648,
+        metadata={"help": "Max target chunk size when writing TensorStore chunks (default: 2GiB)"},
+    )
+    resume: bool = field(
+        default=False,
+        metadata={
+            "help": "Reuse an existing checkpoint in --out: parameters already in its "
+            "tensorstore_index.json are kept and their source tensors are never read, "
+            "so an interrupted or incomplete conversion only fetches what is missing"
+        },
+    )
+
+    dtype: str = field(default="bf16", metadata={"help": "Compute dtype (bf16|fp16|fp32)"})
+    param_dtype: str = field(default="bf16", metadata={"help": "Param dtype (bf16|fp16|fp32)"})
+
+    sharding_axis_dims: str = field(
+        default="1,1,-1,1,1,1",
+        metadata={"help": "6D mesh dims: pp,dp,fsdp,ep,tp,sp (use -1 for auto), e.g. 1,1,-1,1,1,1"},
+    )
+    sharding_axis_names: str = field(
+        default="pp,dp,fsdp,ep,tp,sp",
+        metadata={"help": "6 axis names: pp,dp,fsdp,ep,tp,sp"},
+    )
+    auto_shard_model: bool = field(default=True, metadata={"help": "Enable/disable automatic sharding"})
+
+    cache_dir: str | None = field(
+        default=None, metadata={"help": "HF cache directory (point this at your GCSFuse mount)"}
+    )
+    revision: str | None = field(default=None, metadata={"help": "HF revision/branch/tag/commit"})
+    token: str | None = field(
+        default=None,
+        metadata={"help": "HF token (or rely on HF_TOKEN env / `huggingface-cli login`)"},
+    )
+    local_files_only: bool = field(default=False, metadata={"help": "Do not try to download from HF Hub"})
+    force_download: bool = field(default=False, metadata={"help": "Force re-download from HF Hub"})
+    trust_remote_code: bool = field(default=False, metadata={"help": "Pass trust_remote_code=True to HF loaders"})
+    enable_hf_transfer: bool = field(
+        default=False,
+        metadata={"help": "Enable hf_transfer accelerated HF downloads (requires `pip install hf_transfer`)"},
+    )
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Convert a HuggingFace PyTorch checkpoint to EasyDeL format.
+
+    Supports two conversion modes:
+    - ``sequential``: Streams weight shards one at a time and writes a
+      TensorStore checkpoint without loading the full parameter tree.
+    - ``from_pretrained``: Loads the model via ``AutoEasyDeLModel*.from_pretrained``
+      then saves with ``save_pretrained``.
+
+    Optionally pushes the converted checkpoint to the HuggingFace Hub.
+
+    Args:
+        argv: Command-line arguments. Uses ``sys.argv`` when ``None``.
+    """
+    parser = DataClassArgumentParser(
+        ConvertArgs,
+        description="Download/convert a HuggingFace PyTorch checkpoint to EasyDeL and optionally push to HF Hub.",
+    )
+    (args,) = parser.parse_args_into_dataclasses(args=argv, look_for_args_file=False)
+
+    if args.enable_hf_transfer:
+        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+        try:
+            import hf_transfer  # noqa: F401  # pyright: ignore[reportMissingImports, reportUnusedImport]
+        except Exception:
+            logger.warning("`hf_transfer` is not installed. Run: pip install -U hf_transfer")
+
+    # `pathlib.Path` mangles an object-store URI instead of rejecting it:
+    # `gs://bucket/x` becomes the relative path `gs:/bucket/x`, which
+    # `.resolve()` then anchors under the CWD, so a "remote" conversion
+    # silently fills the local disk with a directory literally named `gs:`.
+    # ePath understands the scheme; keep pathlib for genuinely local paths so
+    # `~` expansion and resolution behave as before.
+    if "://" in str(args.out):
+        out_dir = ePath(str(args.out))
+    else:
+        out_dir = Path(args.out).expanduser().resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Keep this import after arg parsing so `--help` is fast.
+    from transformers import AutoConfig
+
+    import easydel as ed
+
+    dtype = _parse_dtype(args.dtype)
+    param_dtype = _parse_dtype(args.param_dtype)
+    sharding_axis_dims = _parse_int_list(args.sharding_axis_dims, expected_len=6)
+    sharding_axis_names = _parse_str_list(args.sharding_axis_names, expected_len=6)
+
+    hf_kwargs = {
+        "cache_dir": args.cache_dir,
+        "revision": args.revision,
+        "token": args.token,
+        "local_files_only": args.local_files_only,
+        "force_download": args.force_download,
+        "trust_remote_code": args.trust_remote_code,
+    }
+    hf_kwargs = {k: v for k, v in hf_kwargs.items() if v is not None}
+
+    # `args.source` may be an object-store URI, which the HF hub resolver
+    # cannot parse. Stage the small metadata files locally and read config,
+    # tokenizer and processor from there; the weight side streams shards
+    # straight from the remote root.
+    from easydel.infra.mixins.bridge import stage_remote_metadata
+
+    meta_source, _staged_meta = stage_remote_metadata(
+        args.source,
+        filenames=(
+            "config.json",
+            "generation_config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+            "preprocessor_config.json",
+            "processor_config.json",
+            "chat_template.json",
+        ),
+    )
+
+    _import_easydel_family(meta_source)
+    config = AutoConfig.from_pretrained(meta_source, **hf_kwargs)
+
+    task = _infer_task_from_hf_config(config) if args.task == "auto" else args.task
+    logger.info(f"Task: {task}")
+
+    task_to_cls = {
+        "causal_lm": ed.AutoEasyDeLModelForCausalLM,  # pyright: ignore[reportPrivateLocalImportUsage]
+        "seq2seq": ed.AutoEasyDeLModelForSeq2SeqLM,  # pyright: ignore[reportPrivateLocalImportUsage]
+        "speech_seq2seq": ed.AutoEasyDeLModelForSpeechSeq2Seq,  # pyright: ignore[reportPrivateLocalImportUsage]
+        "image_text_to_text": ed.AutoEasyDeLModelForImageTextToText,  # pyright: ignore[reportPrivateLocalImportUsage]
+        "zero_shot_image_classification": ed.AutoEasyDeLModelForZeroShotImageClassification,  # pyright: ignore[reportPrivateLocalImportUsage]
+        "sequence_classification": ed.AutoEasyDeLModelForSequenceClassification,  # pyright: ignore[reportPrivateLocalImportUsage]
+        "diffusion_lm": ed.AutoEasyDeLModelForDiffusionLM,  # pyright: ignore[reportPrivateLocalImportUsage]
+        "base": ed.AutoEasyDeLModel,  # pyright: ignore[reportPrivateLocalImportUsage]
+        "vision": ed.AutoEasyDeLVisionModel,  # pyright: ignore[reportPrivateLocalImportUsage]
+        "any_to_any": ed.AutoEasyDeLAnyToAnyModel,  # pyright: ignore[reportPrivateLocalImportUsage]
+    }
+
+    model_cls = task_to_cls[task]
+
+    # Save tokenizer/processor too so `save_pretrained(..., push_to_hub=True)` uploads a complete repo.
+    try:
+        from transformers import AutoProcessor
+
+        processor = AutoProcessor.from_pretrained(meta_source, **hf_kwargs)
+        processor.save_pretrained(str(out_dir))
+    except Exception:
+        pass
+    try:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(meta_source, **hf_kwargs)
+        tokenizer.save_pretrained(str(out_dir))
+    except Exception:
+        pass
+    try:
+        from transformers import AutoImageProcessor
+
+        image_processor = AutoImageProcessor.from_pretrained(args.source, **hf_kwargs)
+        image_processor.save_pretrained(str(out_dir))
+    except Exception:
+        pass
+    try:
+        from transformers import AutoFeatureExtractor
+
+        feature_extractor = AutoFeatureExtractor.from_pretrained(meta_source, **hf_kwargs)
+        feature_extractor.save_pretrained(str(out_dir))
+    except Exception:
+        pass
+
+    if args.convert_mode == "sequential":
+        from easydel.infra.base_module import EasyDeLBaseModule
+
+        class Base(EasyDeLBaseModule):
+            """Inline subclass that pins ``_model_task`` to the task chosen at runtime.
+
+            ``EasyDeLBaseModule.huggingface_to_easydel_sequential``
+            dispatches on the class-level ``_model_task`` to pick
+            the right Auto-class internally; we don't need a real
+            module instance here, just a class with the right
+            ``_model_task`` attribute, so we synthesise one on the
+            fly. Keeps the script short while giving the sequential
+            converter what it needs.
+            """
+
+            _model_task = model_cls.model_task
+
+        Base.huggingface_to_easydel_sequential(
+            pretrained_model_name_or_path=args.source,
+            save_directory=str(out_dir),
+            output_repo_id=args.repo_id,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            sharding_axis_dims=sharding_axis_dims,
+            sharding_axis_names=sharding_axis_names,
+            torch_streaming_cache=args.torch_streaming_cache,
+            torch_streaming_tmp_dir=args.torch_streaming_tmp_dir,
+            tensorstore_chunk_bytes=args.tensorstore_chunk_bytes,
+            resume=args.resume,
+            verbose=True,
+            **hf_kwargs,
+        )
+        if args.repo_id and args.push_to_hub:
+            from huggingface_hub import HfApi
+
+            api = HfApi(token=args.token)
+            api.create_repo(repo_id=args.repo_id, repo_type="model", exist_ok=True, token=args.token)
+            api.upload_large_folder(
+                folder_path=str(out_dir),
+                repo_id=args.repo_id,
+                repo_type="model",
+            )
+    else:
+        model = model_cls.from_pretrained(
+            args.source,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            sharding_axis_dims=sharding_axis_dims,
+            sharding_axis_names=sharding_axis_names,
+            auto_shard_model=args.auto_shard_model,
+            from_torch=True,
+            torch_streaming_cache=args.torch_streaming_cache,
+            torch_streaming_tmp_dir=args.torch_streaming_tmp_dir,
+            **hf_kwargs,
+        )
+        if args.repo_id and args.push_to_hub:
+            model.save_pretrained(
+                str(out_dir),
+                push_to_hub=True,
+                repo_id=args.repo_id,
+                token=args.token if args.token is not None else True,
+            )
+        else:
+            model.save_pretrained(str(out_dir))
+
+    logger.info(f"Done. Saved to: {out_dir}")
+    if args.repo_id and args.push_to_hub:
+        logger.info(f"Pushed to: {args.repo_id}")
+
+
+if __name__ == "__main__":
+    main()

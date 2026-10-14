@@ -1,0 +1,632 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Configuration classes for the GLM-4V-MoE multimodal model.
+
+GLM-4V-MoE pairs the GLM-4V vision tower with a GLM-4-MoE text decoder
+(grouped top-k routing with shared experts and a dense-to-sparse MLP
+schedule). This module exposes:
+
+- :class:`Glm4vMoeVisionConfig`: vision-tower hyper-params.
+- :class:`Glm4vMoeTextConfig`: text-decoder hyper-params including MoE
+  routing knobs and mRoPE.
+- :class:`Glm4vMoeConfig`: top-level VLM config that composes the two
+  sub-configs and stores image/video special-token ids.
+- :func:`_rope_scaling_from_rope_parameters`: HF-to-EasyDeL RoPE bridge
+  with the GLM-4V mRoPE preset as the default fallback.
+- :func:`_patch_hf_glm4v_moe_router_logits_output`: import-time patch
+  that backfills missing ``router_logits`` and ``num_experts(_per_tok)``
+  attributes on older HF GLM-4V-MoE releases so EasyDeL conversion code
+  can read them uniformly.
+"""
+
+import typing
+from collections.abc import Mapping
+
+from easydel.infra.base_module import EasyDeLBaseConfig
+from easydel.infra.factory import register_config
+
+
+def _patch_hf_glm4v_moe_router_logits_output() -> None:
+    """Backfill missing GLM-4V-MoE attributes on older Hugging Face releases.
+
+    Mutates the upstream :mod:`transformers.models.glm4v_moe` module so
+    EasyDeL's converter and trainer code can rely on a stable surface:
+
+    * Adds a ``router_logits`` attribute (``None`` by default) to
+      ``Glm4vMoeModelOutputWithPast`` so downstream router-loss code can
+      always read it.
+    * Adds settable ``num_experts`` / ``num_experts_per_tok`` properties
+      to ``Glm4vMoeForConditionalGeneration`` when missing, defaulting to
+      the values stored on the text sub-config.
+    * Wraps ``load_balancing_loss_func`` so it always returns a torch
+      tensor (the upstream helper sometimes returns the integer ``0``
+      which breaks downstream tensor ops).
+
+    This is invoked once at import time and is a no-op when the upstream
+    module is unavailable or already up-to-date.
+    """
+    try:
+        from transformers.utils import is_torch_available
+
+        if not is_torch_available():
+            return
+        from transformers.models.glm4v_moe import modeling_glm4v_moe as hf_glm4v_moe
+    except Exception:
+        return
+
+    output_cls = getattr(hf_glm4v_moe, "Glm4vMoeModelOutputWithPast", None)
+    if output_cls is not None and not hasattr(output_cls, "router_logits"):
+        output_cls.router_logits = None
+
+    causal_lm_cls = getattr(hf_glm4v_moe, "Glm4vMoeForConditionalGeneration", None)
+    if causal_lm_cls is not None:
+        num_experts_attr = getattr(causal_lm_cls, "num_experts", None)
+        if num_experts_attr is None or (isinstance(num_experts_attr, property) and num_experts_attr.fset is None):
+            # Newer HF versions assign these attributes during __init__. Use a
+            # settable property so legacy compatibility patching does not block assignment.
+            def _get_num_experts(self):
+                """Return the cached or text-config-derived expert count."""
+                return getattr(
+                    self,
+                    "_easydel_num_experts",
+                    getattr(self.config.text_config, "n_routed_experts", 0),
+                )
+
+            def _set_num_experts(self, value):
+                """Store an HF-injected ``num_experts`` on the EasyDeL backing field."""
+                self._easydel_num_experts = value
+
+            causal_lm_cls.num_experts = property(_get_num_experts, _set_num_experts)
+
+        num_experts_per_tok_attr = getattr(causal_lm_cls, "num_experts_per_tok", None)
+        if num_experts_per_tok_attr is None or (
+            isinstance(num_experts_per_tok_attr, property) and num_experts_per_tok_attr.fset is None
+        ):
+
+            def _get_num_experts_per_tok(self):
+                """Return the cached or text-config-derived top-k routing count."""
+                return getattr(
+                    self,
+                    "_easydel_num_experts_per_tok",
+                    getattr(self.config.text_config, "num_experts_per_tok", 0),
+                )
+
+            def _set_num_experts_per_tok(self, value):
+                """Store an HF-injected ``num_experts_per_tok`` on the backing field."""
+                self._easydel_num_experts_per_tok = value
+
+            causal_lm_cls.num_experts_per_tok = property(_get_num_experts_per_tok, _set_num_experts_per_tok)
+
+    load_balancing_loss_func = getattr(hf_glm4v_moe, "load_balancing_loss_func", None)
+    if load_balancing_loss_func is not None and not getattr(
+        load_balancing_loss_func,
+        "_easydel_returns_tensor",
+        False,
+    ):
+        import torch
+
+        def _patched_load_balancing_loss_func(*args, **kwargs):
+            """Coerce HF GLM-4V-MoE's load-balancing loss to a torch tensor.
+
+            The upstream helper occasionally returns the integer ``0`` as
+            a no-op result; downstream EasyDeL code expects a tensor it
+            can sum into the training loss, so we wrap that fall-through
+            into a 0-d tensor on the same device as ``attention_mask`` (or
+            the incoming gate logits).
+            """
+            result = load_balancing_loss_func(*args, **kwargs)
+            if isinstance(result, int):
+                attention_mask = kwargs.get("attention_mask")
+                device = getattr(attention_mask, "device", None)
+                if device is None and args:
+                    gate_logits = args[0]
+                    if isinstance(gate_logits, tuple) and gate_logits:
+                        device = getattr(gate_logits[0], "device", None)
+                result = torch.tensor(float(result), device=device)
+            return result
+
+        _patched_load_balancing_loss_func._easydel_returns_tensor = True  # type: ignore[attr-defined]
+        hf_glm4v_moe.load_balancing_loss_func = _patched_load_balancing_loss_func
+
+
+_patch_hf_glm4v_moe_router_logits_output()
+
+
+def _rope_scaling_from_rope_parameters(
+    rope_parameters: dict[str, typing.Any] | None,
+    rope_scaling: dict[str, typing.Any] | None,
+) -> dict[str, typing.Any] | None:
+    """Normalise HF ``rope_parameters`` into EasyDeL ``rope_scaling`` for GLM-4V-MoE.
+
+    Mirrors :func:`easydel.modules.glm4v.glm4v_configuration._rope_scaling_from_rope_parameters`:
+    when ``rope_scaling`` is supplied it wins (a stray ``type`` key is
+    aliased to ``rope_type``); otherwise the relevant keys are copied from
+    ``rope_parameters`` including ``mrope_section`` / ``mrope_interleaved``.
+    Falls back to the GLM-4V-MoE mRoPE preset
+    ``{"rope_type": "default", "mrope_section": [8, 12, 12]}`` when both
+    inputs are missing.
+
+    Args:
+        rope_parameters: HF-style RoPE parameters mapping or ``None``.
+        rope_scaling: EasyDeL RoPE scaling mapping or ``None``.
+
+    Returns:
+        A normalised ``rope_scaling`` mapping (never ``None``).
+    """
+    if rope_scaling is not None:
+        # HF sometimes uses "type" instead of "rope_type"
+        if "type" in rope_scaling and "rope_type" not in rope_scaling:
+            rope_scaling = dict(rope_scaling)
+            rope_scaling["rope_type"] = rope_scaling["type"]
+        return rope_scaling
+
+    if rope_parameters is None:
+        # Default mRoPE for GLM4V-family models.
+        # Matches upstream GLM4V-family configs (e.g. zai-org/GLM-4.5V).
+        return {"rope_type": "default", "mrope_section": [8, 12, 12]}
+
+    rope_scaling_out: dict[str, typing.Any] = {
+        "rope_type": rope_parameters.get("rope_type", "default"),
+    }
+    for key in (
+        "factor",
+        "original_max_position_embeddings",
+        "low_freq_factor",
+        "high_freq_factor",
+        "short_factor",
+        "long_factor",
+        "beta_fast",
+        "beta_slow",
+        "extrapolation_factor",
+        "attn_factor",
+        "mscale",
+        "mscale_all_dim",
+        "mrope_section",
+        "mrope_interleaved",
+    ):
+        if key in rope_parameters:
+            rope_scaling_out[key] = rope_parameters[key]
+    return rope_scaling_out
+
+
+@register_config("glm4v_moe_vision")
+class Glm4vMoeVisionConfig(EasyDeLBaseConfig):
+    """
+    Configuration class for the GLM4V-MoE vision encoder.
+
+    This class stores the configuration for the vision transformer component of GLM4V-MoE,
+    which processes image and video inputs.
+
+    Args:
+        depth (`int`, *optional*, defaults to 24):
+            Number of transformer layers in the vision encoder.
+        hidden_size (`int`, *optional*, defaults to 1536):
+            Dimensionality of the encoder hidden states.
+        hidden_act (`str`, *optional*, defaults to `"silu"`):
+            The activation function used in the MLP layers.
+        attention_bias (`bool`, *optional*, defaults to `False`):
+            Whether to use bias in attention layers.
+        attention_dropout (`float`, *optional*, defaults to 0.0):
+            Dropout probability for attention weights.
+        num_heads (`int`, *optional*, defaults to 12):
+            Number of attention heads in each transformer layer.
+        in_channels (`int`, *optional*, defaults to 3):
+            Number of input image channels (RGB = 3).
+        image_size (`int`, *optional*, defaults to 336):
+            Input image resolution.
+        patch_size (`int`, *optional*, defaults to 14):
+            Size of each image patch for the patch embedding.
+        rms_norm_eps (`float`, *optional*, defaults to 1e-5):
+            Epsilon for RMS normalization layers.
+        spatial_merge_size (`int`, *optional*, defaults to 2):
+            Factor for spatial downsampling of visual features.
+        temporal_patch_size (`int`, *optional*, defaults to 2):
+            Temporal patch size for video processing.
+        out_hidden_size (`int`, *optional*, defaults to 4096):
+            Output projection dimension to match the language model.
+        intermediate_size (`int`, *optional*, defaults to 13696):
+            Dimensionality of the MLP intermediate layer.
+        initializer_range (`float`, *optional*, defaults to 0.02):
+            Standard deviation for weight initialization.
+    """
+
+    model_type = "glm4v_moe_vision"
+    base_config_key = "vision_config"
+    # Matches HF: the 2-D vision rotary is axial (theta 10000, the value the GLM-4V vision tower uses).
+    default_rope_type = "axial"
+
+    def __init__(
+        self,
+        depth: int = 24,
+        hidden_size: int = 1536,
+        hidden_act: str = "silu",
+        attention_bias: bool = False,
+        attention_dropout: float = 0.0,
+        num_heads: int = 12,
+        in_channels: int = 3,
+        image_size: int = 336,
+        patch_size: int = 14,
+        rms_norm_eps: float = 1e-5,
+        spatial_merge_size: int = 2,
+        temporal_patch_size: int = 2,
+        out_hidden_size: int = 4096,
+        intermediate_size: int = 13696,
+        initializer_range: float = 0.02,
+        **kwargs,
+    ):
+        """Initialize the GLM-4V-MoE vision-encoder configuration.
+
+        Args:
+            depth: Number of vision-transformer layers.
+            hidden_size: Vision encoder model dim.
+            hidden_act: Activation used in the vision MLPs.
+            attention_bias: Whether vision attention projections carry biases.
+            attention_dropout: Vision attention dropout probability.
+            num_heads: Vision attention heads (also stored as
+                ``num_attention_heads``).
+            in_channels: Input image channel count.
+            image_size: Square input image side length.
+            patch_size: Patch side length for the patch embedder.
+            rms_norm_eps: Vision RMSNorm epsilon.
+            spatial_merge_size: Spatial downsampling factor of the merger.
+            temporal_patch_size: Temporal patch length for video inputs.
+            out_hidden_size: Width to which the merger projects vision
+                features before they enter the text decoder.
+            intermediate_size: Inner width of the patch-merger MLP (the vision
+                blocks' MLP width is ``out_hidden_size``, as in HF).
+            initializer_range: Stddev for truncated-normal init.
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
+        """
+        super().__init__(**kwargs)
+        self.depth = depth
+        self.hidden_size = hidden_size
+        self.hidden_act = hidden_act
+        self.attention_bias = attention_bias
+        self.attention_dropout = attention_dropout
+        self.num_heads = num_heads
+        self.num_attention_heads = num_heads
+        self.in_channels = in_channels
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.rms_norm_eps = rms_norm_eps
+        self.spatial_merge_size = spatial_merge_size
+        self.temporal_patch_size = temporal_patch_size
+        self.out_hidden_size = out_hidden_size
+        self.intermediate_size = intermediate_size
+        self.initializer_range = initializer_range
+
+
+@register_config("glm4v_moe_text")
+class Glm4vMoeTextConfig(EasyDeLBaseConfig):
+    """
+    Configuration class for the GLM4V-MoE text decoder with Mixture of Experts.
+
+    This class stores the configuration for the language model component of GLM4V-MoE,
+    which uses sparse Mixture of Experts (MoE) layers for efficient scaling.
+
+    Args:
+        vocab_size (`int`, *optional*, defaults to 151424):
+            Vocabulary size of the model.
+        hidden_size (`int`, *optional*, defaults to 4096):
+            Dimensionality of the hidden states.
+        intermediate_size (`int`, *optional*, defaults to 10944):
+            Dimensionality of the dense MLP intermediate layer.
+        num_hidden_layers (`int`, *optional*, defaults to 46):
+            Number of transformer layers.
+        num_attention_heads (`int`, *optional*, defaults to 96):
+            Number of attention heads for each attention layer.
+        num_key_value_heads (`int`, *optional*, defaults to 8):
+            Number of key-value heads for grouped-query attention (GQA).
+        head_dim (`int`, *optional*):
+            Dimension of each attention head. Computed from hidden_size if not set.
+        hidden_act (`str`, *optional*, defaults to `"silu"`):
+            The activation function used in the MLP layers.
+        max_position_embeddings (`int`, *optional*, defaults to 65536):
+            Maximum sequence length the model can handle.
+        initializer_range (`float`, *optional*, defaults to 0.02):
+            Standard deviation for weight initialization.
+        rms_norm_eps (`float`, *optional*, defaults to 1e-5):
+            Epsilon for RMS normalization layers.
+        use_cache (`bool`, *optional*, defaults to `True`):
+            Whether to use key-value cache for generation.
+        tie_word_embeddings (`bool`, *optional*, defaults to `False`):
+            Whether to tie input and output embeddings.
+        attention_dropout (`float`, *optional*, defaults to 0.0):
+            Dropout probability for attention weights.
+        attention_bias (`bool`, *optional*, defaults to `True`):
+            Whether to use bias in attention layers.
+        partial_rotary_factor (`float`, *optional*, defaults to 0.5):
+            Fraction of head dimension to apply rotary embeddings.
+        rope_theta (`float`, *optional*):
+            Base frequency for rotary position embeddings.
+        rope_scaling (`dict`, *optional*):
+            Configuration for RoPE scaling (e.g., for extended context).
+        rope_parameters (`dict`, *optional*):
+            Alternative RoPE configuration format (converted to rope_scaling).
+        moe_intermediate_size (`int`, *optional*, defaults to 1408):
+            Intermediate size for each expert MLP.
+        num_experts_per_tok (`int`, *optional*, defaults to 8):
+            Number of experts activated per token (top-k routing).
+        n_shared_experts (`int`, *optional*, defaults to 1):
+            Number of shared experts that are always activated.
+        n_routed_experts (`int`, *optional*, defaults to 128):
+            Total number of routed experts in each MoE layer.
+        routed_scaling_factor (`float`, *optional*, defaults to 1.0):
+            Scaling factor for routed expert outputs.
+        n_group (`int`, *optional*, defaults to 1):
+            Number of expert groups for grouped routing.
+        topk_group (`int`, *optional*, defaults to 1):
+            Number of groups to select in grouped routing.
+        first_k_dense_replace (`int`, *optional*, defaults to 1):
+            Number of initial layers to use dense MLP instead of MoE.
+        norm_topk_prob (`bool`, *optional*, defaults to `True`):
+            Whether to normalize top-k routing probabilities.
+        router_aux_loss_coef (`float`, *optional*, defaults to 0.0001):
+            Coefficient for router auxiliary load balancing loss.
+    """
+
+    model_type = "glm4v_moe_text"
+    base_config_key = "text_config"
+    keys_to_ignore_at_inference: typing.ClassVar = ["past_key_values"]
+
+    def __init__(
+        self,
+        vocab_size: int = 151424,
+        hidden_size: int = 4096,
+        intermediate_size: int = 10944,
+        num_hidden_layers: int = 46,
+        num_attention_heads: int = 96,
+        num_key_value_heads: int = 8,
+        head_dim: int | None = None,
+        hidden_act: str = "silu",
+        max_position_embeddings: int = 65536,
+        initializer_range: float = 0.02,
+        rms_norm_eps: float = 1e-5,
+        use_cache: bool = True,
+        tie_word_embeddings: bool = False,
+        attention_dropout: float = 0.0,
+        attention_bias: bool = True,
+        partial_rotary_factor: float = 0.5,
+        rope_theta: float | None = None,
+        rope_scaling: dict[str, typing.Any] | None = None,
+        rope_parameters: dict[str, typing.Any] | None = None,
+        moe_intermediate_size: int = 1408,
+        num_experts_per_tok: int = 8,
+        n_shared_experts: int = 1,
+        n_routed_experts: int = 128,
+        routed_scaling_factor: float = 1.0,
+        n_group: int = 1,
+        topk_group: int = 1,
+        first_k_dense_replace: int = 1,
+        norm_topk_prob: bool = True,
+        router_aux_loss_coef: float = 0.0001,
+        **kwargs,
+    ):
+        """Initialize the GLM-4V-MoE text-decoder configuration.
+
+        Args:
+            vocab_size: Token vocabulary size.
+            hidden_size: Decoder model dim.
+            intermediate_size: Inner width of the dense MLP used in dense
+                layers (the first ``first_k_dense_replace`` layers).
+            num_hidden_layers: Total decoder layers (dense + MoE).
+            num_attention_heads: Total query heads per attention layer.
+            num_key_value_heads: KV heads for grouped-query attention.
+            head_dim: Per-head dim; falls back to
+                ``hidden_size // num_attention_heads`` when ``None``.
+            hidden_act: Activation applied to the gate half of MLPs.
+            max_position_embeddings: Context-length bound used for RoPE
+                tables and asserts.
+            initializer_range: Stddev for truncated-normal init.
+            rms_norm_eps: Epsilon for every RMSNorm.
+            use_cache: Whether downstream code should return KV cache.
+            tie_word_embeddings: Tie input embeddings with the LM head.
+            attention_dropout: Attention probability dropout.
+            attention_bias: Whether attention projections carry biases.
+            partial_rotary_factor: Fraction of each head dim that
+                receives RoPE; remaining channels are unrotated.
+            rope_theta: RoPE base frequency. Falls back to
+                ``rope_parameters["rope_theta"]`` and then ``10000.0``.
+            rope_scaling: EasyDeL-flavoured RoPE scaling dict.
+            rope_parameters: HF-style RoPE parameters (merged via
+                :func:`_rope_scaling_from_rope_parameters`).
+            moe_intermediate_size: Inner width of each routed expert FFN.
+            num_experts_per_tok: Routed experts selected per token.
+            n_shared_experts: Shared experts always applied to every token.
+            n_routed_experts: Total routed experts.
+            routed_scaling_factor: Multiplier on routed expert outputs.
+            n_group: Expert group count for hierarchical routing.
+            topk_group: Groups kept per token before per-group top-k.
+            first_k_dense_replace: Leading dense layers before the MoE
+                schedule kicks in.
+            norm_topk_prob: Whether to renormalise top-k routing weights.
+            router_aux_loss_coef: Coefficient for the load-balancing
+                auxiliary loss.
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
+        """
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.num_key_value_heads = num_key_value_heads
+        self.head_dim = head_dim if head_dim is not None else hidden_size // num_attention_heads
+        self.hidden_act = hidden_act
+        self.max_position_embeddings = max_position_embeddings
+        self.initializer_range = initializer_range
+        self.rms_norm_eps = rms_norm_eps
+        self.use_cache = use_cache
+        self.attention_bias = attention_bias
+        self.attention_dropout = attention_dropout
+        self.partial_rotary_factor = partial_rotary_factor
+
+        if rope_theta is None and rope_parameters is not None:
+            rope_theta = rope_parameters.get("rope_theta", 10000.0)
+        self.rope_theta = 10000.0 if rope_theta is None else float(rope_theta)
+        self.rope_scaling = _rope_scaling_from_rope_parameters(rope_parameters, rope_scaling)
+
+        self.moe_intermediate_size = moe_intermediate_size
+        self.num_experts_per_tok = num_experts_per_tok
+        self.n_shared_experts = n_shared_experts
+        self.n_routed_experts = n_routed_experts
+        self.routed_scaling_factor = routed_scaling_factor
+        self.n_group = n_group
+        self.topk_group = topk_group
+        self.first_k_dense_replace = first_k_dense_replace
+        self.norm_topk_prob = norm_topk_prob
+        self.router_aux_loss_coef = router_aux_loss_coef
+        # Declared by HF ``Glm4vMoeTextConfig`` (default False); its forward reads it when the caller passes None.
+        self.output_router_logits = kwargs.pop("output_router_logits", False)
+
+        self._external_rope_config_kwargs = {"repetition_style": True}
+
+        super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
+
+
+@register_config("glm4v_moe")
+class Glm4vMoeConfig(EasyDeLBaseConfig):
+    """
+    Configuration class for the GLM4V-MoE multimodal vision-language model.
+
+    GLM4V-MoE is a multimodal model that combines a vision encoder with a Mixture of
+    Experts (MoE) language model decoder for efficient scaling in tasks like image
+    understanding, visual question answering, and image-based conversation.
+
+    Args:
+        text_config (`dict` or `Glm4vMoeTextConfig`, *optional*):
+            Configuration for the text decoder with MoE. If a dict is provided, it will
+            be converted to `Glm4vMoeTextConfig`.
+        vision_config (`dict` or `Glm4vMoeVisionConfig`, *optional*):
+            Configuration for the vision encoder. If a dict is provided, it will be
+            converted to `Glm4vMoeVisionConfig`.
+        image_token_id (`int`, *optional*, defaults to 151363):
+            Token ID used to represent image placeholders in the input.
+        video_token_id (`int`, *optional*, defaults to 151364):
+            Token ID used to represent video placeholders in the input.
+        image_start_token_id (`int`, *optional*, defaults to 151339):
+            Token ID marking the start of an image sequence.
+        image_end_token_id (`int`, *optional*, defaults to 151340):
+            Token ID marking the end of an image sequence.
+        video_start_token_id (`int`, *optional*, defaults to 151341):
+            Token ID marking the start of a video sequence.
+        video_end_token_id (`int`, *optional*, defaults to 151342):
+            Token ID marking the end of a video sequence.
+        tie_word_embeddings (`bool`, *optional*, defaults to `False`):
+            Whether to tie input and output embeddings.
+
+    Example:
+        ```python
+        from easydel.modules.glm4v_moe import Glm4vMoeConfig
+
+        # Load from pretrained
+        config = Glm4vMoeConfig.from_pretrained("zai-org/GLM-4.5V")
+
+        # Create custom config
+        config = Glm4vMoeConfig(
+            text_config={"hidden_size": 4096, "n_routed_experts": 128},
+            vision_config={"hidden_size": 1536, "depth": 24},
+        )
+        ```
+    """
+
+    model_type = "glm4v_moe"
+    sub_configs: typing.ClassVar = {
+        "vision_config": Glm4vMoeVisionConfig,
+        "text_config": Glm4vMoeTextConfig,
+    }
+    keys_to_ignore_at_inference: typing.ClassVar = ["past_key_values"]
+
+    def __init__(
+        self,
+        text_config: Mapping[str, typing.Any] | Glm4vMoeTextConfig | None = None,
+        vision_config: Mapping[str, typing.Any] | Glm4vMoeVisionConfig | None = None,
+        image_token_id: int = 151363,
+        video_token_id: int = 151364,
+        image_start_token_id: int = 151339,
+        image_end_token_id: int = 151340,
+        video_start_token_id: int = 151341,
+        video_end_token_id: int = 151342,
+        tie_word_embeddings: bool = False,
+        **kwargs,
+    ):
+        """Initialize the top-level GLM-4V-MoE configuration.
+
+        Args:
+            text_config: Mapping or :class:`Glm4vMoeTextConfig` for the
+                MoE text decoder; ``None`` materialises the default text
+                config.
+            vision_config: Mapping or :class:`Glm4vMoeVisionConfig` for the
+                vision encoder; ``None`` materialises the default vision
+                config.
+            image_token_id: Placeholder token id for image patches.
+            video_token_id: Placeholder token id for video patches.
+            image_start_token_id: Token id marking the start of an image
+                sequence in the text stream.
+            image_end_token_id: Token id marking the end of an image
+                sequence.
+            video_start_token_id: Token id marking the start of a video
+                sequence.
+            video_end_token_id: Token id marking the end of a video
+                sequence.
+            tie_word_embeddings: Whether to tie input embeddings with the
+                LM head.
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
+        """
+        if isinstance(vision_config, dict):
+            self.vision_config = self.sub_configs["vision_config"](**self._fix_parent_kws(vision_config, kwargs))
+        elif vision_config is None:
+            self.vision_config = self.sub_configs["vision_config"]()
+        else:
+            self.vision_config = vision_config
+
+        if isinstance(text_config, dict):
+            self.text_config = self.sub_configs["text_config"](**self._fix_parent_kws(text_config, kwargs))
+        elif text_config is None:
+            self.text_config = self.sub_configs["text_config"]()
+        else:
+            self.text_config = text_config
+
+        self.image_token_id = image_token_id
+        self.video_token_id = video_token_id
+        self.image_start_token_id = image_start_token_id
+        self.image_end_token_id = image_end_token_id
+        self.video_start_token_id = video_start_token_id
+        self.video_end_token_id = video_end_token_id
+
+        super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
+
+    def get_text_config(self, decoder: bool = True) -> Glm4vMoeTextConfig:
+        """Return the text decoder configuration.
+
+        Args:
+            decoder (bool, optional): Unused; kept for API compatibility with
+                upstream Hugging Face configs. Defaults to True.
+
+        Returns:
+            Glm4vMoeTextConfig: The text sub-config.
+        """
+        del decoder
+        return self.text_config  # pyright: ignore[reportReturnType]
+
+    def get_vision_config(self) -> Glm4vMoeVisionConfig:
+        """Return the vision encoder configuration.
+
+        Returns:
+            Glm4vMoeVisionConfig: The vision sub-config.
+        """
+        return self.vision_config  # type: ignore
+
+
+__all__ = ["Glm4vMoeConfig", "Glm4vMoeTextConfig", "Glm4vMoeVisionConfig"]

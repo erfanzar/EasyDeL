@@ -1,0 +1,514 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Subprocess entry points for the tokenizer / detokenizer ZMQ workers.
+
+Hosts two single-purpose ZMQ ``REP`` loops in one script, selected by
+the positional ``mode`` argument:
+
+* ``tokenizer`` (:func:`_tokenizer_worker`) — runs a HuggingFace
+  ``AutoTokenizer`` and accepts ``tokenize`` / ``drain`` / ``shutdown``
+  commands, returning the token id list for each prompt.
+* ``detokenizer`` (:func:`_detokenizer_worker`) — drives a
+  :class:`FastIncrementalDecoder` and keeps a bounded
+  ``OrderedDict`` of per-request decoding state so the API server can
+  stream ``decode`` calls and only forward token deltas after the
+  first round-trip; supports ``decode`` / ``reset`` / ``drain`` /
+  ``shutdown`` commands.
+
+Both workers translate unknown commands to ``{"status": "error",
+"message": "Unknown cmd ..."}`` and use ``recv_pyobj`` /
+``send_pyobj`` for the wire format so any Python type can be carried
+on the bus without an explicit schema.
+
+Invocation:
+    The script is invoked via ``python -m
+    easydel.workers.esurge.pipeline.worker_main`` with::
+
+        <mode>                              tokenizer|detokenizer
+        --endpoint <zmq-endpoint>           (required)
+        --tokenizer-path <path-or-id>       (required)
+        --tokenizer-kwargs <json-object>    (required, may be ``"{}"``)
+        --max-states <int>                  (detokenizer only;
+                                             default 65536)
+
+    Before importing JAX-aware modules ``main()`` forces a CPU-only
+    placement so the tokenizer / detokenizer subprocesses never
+    compete with the model workers for accelerators.
+
+Note:
+    This module is for internal use only and is not part of EasyDeL's
+    public API.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import time
+from collections import OrderedDict
+from collections.abc import Iterable
+
+import zmq
+from transformers import AutoTokenizer
+
+
+class FastIncrementalDecoder:
+    """Streaming detokenizer with UTF-8 boundary handling and token context.
+
+    Wraps a HuggingFace tokenizer to incrementally produce text deltas
+    as new token ids arrive. Two non-trivial behaviours sit on top of
+    a plain ``tokenizer.decode``:
+
+    * **Context window**: ``context_window`` extra preceding tokens are
+      prepended to every decode call and the decoded context prefix is
+      then stripped from the result. This is required for SentencePiece
+      / WordPiece-style tokenizers where the decoding of a token
+      depends on its neighbours.
+    * **UTF-8 buffering**: when the decoded delta contains the U+FFFD
+      replacement character (i.e. a split multi-byte sequence) the
+      incoming tokens are kept as ``new_buffered`` and an empty delta
+      is returned; the next call re-decodes them together with the
+      following tokens once a clean boundary is reached.
+
+    Public API matches the original ``SimpleDecoder.decode`` method
+    used by previous versions of the detokenizer worker.
+
+    Attributes:
+        tokenizer: HuggingFace tokenizer driving the decode.
+        context_window (int): Number of preceding tokens included as
+            context on each decode call; ``0`` disables context
+            stripping.
+    """
+
+    def __init__(self, tokenizer, *, context_window: int = 4):
+        """Initialize the incremental decoder.
+
+        Args:
+            tokenizer: A HuggingFace tokenizer instance used for decoding.
+            context_window: Number of preceding tokens to include as context
+                when decoding, which helps tokenizers that depend on surrounding
+                tokens (e.g. WordPiece, SentencePiece). Defaults to 4.
+        """
+        self.tokenizer = tokenizer
+        self.context_window = max(0, int(context_window))
+
+    def _decode(
+        self,
+        token_ids: Iterable[int],
+        *,
+        skip_special_tokens: bool,
+        spaces_between_special_tokens: bool,
+    ) -> str:
+        """Call ``tokenizer.decode`` portably across HuggingFace versions.
+
+        Older tokenizer implementations do not accept the
+        ``spaces_between_special_tokens`` or ``clean_up_tokenization_spaces``
+        kwargs, so this helper retries with progressively smaller kwarg sets.
+
+        Args:
+            token_ids: Token id stream to decode.
+            skip_special_tokens: Forwarded to the tokenizer.
+            spaces_between_special_tokens: Forwarded when supported.
+
+        Returns:
+            str: The decoded text.
+        """
+        try:
+            return self.tokenizer.decode(
+                list(token_ids),
+                skip_special_tokens=skip_special_tokens,
+                spaces_between_special_tokens=spaces_between_special_tokens,
+                clean_up_tokenization_spaces=False,
+            )
+        except TypeError:
+            try:
+                return self.tokenizer.decode(
+                    list(token_ids),
+                    skip_special_tokens=skip_special_tokens,
+                    clean_up_tokenization_spaces=False,
+                )
+            except TypeError:
+                return self.tokenizer.decode(
+                    list(token_ids),
+                    skip_special_tokens=skip_special_tokens,
+                )
+
+    def decode(
+        self,
+        new_tokens: Iterable[int],
+        previous_text: str,
+        buffered_tokens: list,
+        *,
+        skip_special_tokens: bool,
+        spaces_between_special_tokens: bool = True,
+        context_tokens: Iterable[int] | None = None,
+    ) -> tuple[str, list[int], bool]:
+        """Incrementally decode ``new_tokens`` with optional token context.
+
+        Decodes ``context_tokens + buffered_tokens + new_tokens`` and
+        subtracts the decoded context so tokenizers that need preceding
+        context (e.g. WordPiece) still stream correctly. If the resulting
+        delta contains the UTF-8 replacement character (``\\ufffd``) the
+        tokens are kept as ``buffered_tokens`` and an empty delta is
+        returned to avoid emitting corrupt text.
+
+        Args:
+            new_tokens: Tokens produced since the last call.
+            previous_text: Unused; kept for backwards-compatible API.
+            buffered_tokens: Tokens that were buffered from previous calls
+                because they decoded to incomplete UTF-8 sequences.
+            skip_special_tokens: Forwarded to the underlying tokenizer.
+            spaces_between_special_tokens: Forwarded when supported.
+            context_tokens: Optional tokens that come immediately before
+                ``buffered_tokens``; their decoded prefix is stripped from
+                the result.
+
+        Returns:
+            tuple[str, list[int], bool]: ``(delta_text, new_buffered,
+            has_buffer)`` where ``has_buffer`` is ``True`` whenever tokens
+            still need to be retained for the next call.
+        """
+        del previous_text
+        context = list(context_tokens) if context_tokens else []
+        buffered = list(buffered_tokens)
+        fresh = list(new_tokens)
+        candidate = context + buffered + fresh
+
+        if not candidate:
+            return "", buffered, bool(buffered)
+
+        decoded_candidate = self._decode(
+            candidate,
+            skip_special_tokens=skip_special_tokens,
+            spaces_between_special_tokens=spaces_between_special_tokens,
+        )
+        decoded_context = (
+            self._decode(
+                context,
+                skip_special_tokens=skip_special_tokens,
+                spaces_between_special_tokens=spaces_between_special_tokens,
+            )
+            if context
+            else ""
+        )
+
+        if decoded_context and not decoded_candidate.startswith(decoded_context):
+            decoded_context = ""
+            decoded_candidate = self._decode(
+                buffered + fresh,
+                skip_special_tokens=skip_special_tokens,
+                spaces_between_special_tokens=spaces_between_special_tokens,
+            )
+
+        delta = decoded_candidate[len(decoded_context) :]
+        if "�" in delta:
+            return "", buffered + fresh, True
+
+        return delta, [], False
+
+
+def _compute_suffix_delta(current_text: str, previous_text: str) -> str:
+    """Return the append-only delta from ``previous_text`` to ``current_text``.
+
+    Falls back to suffix-prefix overlap when strict prefix alignment fails
+    to avoid replaying already-streamed text in the final ``finished``
+    detokenization step.
+
+    Args:
+        current_text: The complete text after final detokenization.
+        previous_text: The text already streamed to the client.
+
+    Returns:
+        str: Substring that should be emitted next. May be empty when
+        ``current_text`` is fully contained in ``previous_text``.
+    """
+
+    if not current_text:
+        return ""
+    if not previous_text:
+        return current_text
+    if current_text.startswith(previous_text):
+        return current_text[len(previous_text) :]
+
+    max_overlap = min(len(previous_text), len(current_text))
+    for overlap in range(max_overlap, 0, -1):
+        if previous_text.endswith(current_text[:overlap]):
+            return current_text[overlap:]
+    return ""
+
+
+def _tokenizer_worker(endpoint: str, tokenizer_path: str, tokenizer_kwargs: dict) -> None:
+    """Run the tokenizer REQ/REP loop until ``shutdown`` arrives.
+
+    Loads ``tokenizer_path`` via :func:`AutoTokenizer.from_pretrained`
+    (defaulting ``trust_remote_code`` from
+    ``ESURGE_WORKER_TRUST_REMOTE_CODE``) and serves one Pyobj request
+    per iteration. Supported commands:
+
+    * ``tokenize`` — encode ``message["prompt"]`` and return the flat
+      token id list under ``tokens``.
+    * ``drain`` — acknowledgement only; included so clients can flush
+      pending traffic before shutting down.
+    * ``shutdown`` — break out of the loop after replying ``ok``.
+
+    Args:
+        endpoint: ZMQ endpoint to bind to (e.g.
+            ``ipc:///tmp/tokenizer.sock``).
+        tokenizer_path: Path or identifier passed to
+            ``AutoTokenizer.from_pretrained``.
+        tokenizer_kwargs: Extra keyword arguments for tokenizer
+            loading; mutated in place to seed ``trust_remote_code``
+            when missing.
+    """
+    if "trust_remote_code" not in tokenizer_kwargs.keys():
+        tokenizer_kwargs["trust_remote_code"] = os.getenv("ESURGE_WORKER_TRUST_REMOTE_CODE", "1") in ["1", "on", "yes"]
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, **tokenizer_kwargs)
+    ctx = zmq.Context()
+    socket = ctx.socket(zmq.REP)
+    socket.bind(endpoint)
+    try:
+        while True:
+            message = socket.recv_pyobj()
+            cmd = message.get("cmd")
+            if cmd == "tokenize":
+                prompt = message["prompt"]
+                encoded = tokenizer(prompt, return_tensors=None)
+                token_ids = encoded["input_ids"]
+                if token_ids and isinstance(token_ids[0], list):
+                    token_ids = token_ids[0]
+                socket.send_pyobj({"status": "ok", "tokens": list(token_ids)})
+            elif cmd == "drain":
+                socket.send_pyobj({"status": "ok"})
+            elif cmd == "shutdown":
+                socket.send_pyobj({"status": "ok"})
+                break
+            else:
+                socket.send_pyobj({"status": "error", "message": f"Unknown cmd {cmd}"})
+    finally:
+        socket.close(0)
+        ctx.term()
+
+
+def _detokenizer_worker(
+    endpoint: str,
+    tokenizer_path: str,
+    tokenizer_kwargs: dict,
+    max_states: int,
+) -> None:
+    """Run the detokenizer REQ/REP loop with per-request streaming state.
+
+    Each in-flight request is tracked in an :class:`OrderedDict` keyed
+    by ``request_id``; the oldest entries are evicted once the dict
+    grows past ``max_states``. State is updated incrementally so the
+    API server can send only token *deltas* (with ``tokens_delta`` and
+    ``token_offset``) after the initial round-trip, falling back to a
+    full ``tokens`` payload if the offset goes out of sync.
+
+    Supported commands:
+
+    * ``decode`` — feed new tokens into the request's
+      :class:`FastIncrementalDecoder`, returning ``accumulated_text``,
+      ``delta_text``, ``last_decoded_index`` and ``finished``. On
+      ``finished=True`` the full string is re-decoded once for
+      consistency and the per-request state is dropped.
+    * ``reset`` — drop the state for a single ``request_id``.
+    * ``drain`` — clear every state entry.
+    * ``shutdown`` — exit the loop after replying ``ok``.
+
+    Args:
+        endpoint: ZMQ endpoint to bind to.
+        tokenizer_path: Path or identifier passed to
+            ``AutoTokenizer.from_pretrained``.
+        tokenizer_kwargs: Extra tokenizer loading kwargs (mutated in
+            place to seed ``trust_remote_code``).
+        max_states: Maximum number of concurrent per-request decoder
+            states retained in memory; older entries are evicted FIFO.
+    """
+    if "trust_remote_code" not in tokenizer_kwargs.keys():
+        tokenizer_kwargs["trust_remote_code"] = os.getenv("ESURGE_WORKER_TRUST_REMOTE_CODE", "1") in ["1", "on", "yes"]
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, **tokenizer_kwargs)
+    try:
+        context_window = int(os.getenv("ESURGE_DETOKENIZER_CONTEXT_WINDOW", "4"))
+    except ValueError:
+        context_window = 4
+    decoder = FastIncrementalDecoder(tokenizer, context_window=context_window)
+
+    ctx = zmq.Context()
+    socket = ctx.socket(zmq.REP)
+    socket.bind(endpoint)
+    states: OrderedDict[str, dict] = OrderedDict()
+
+    def evict():
+        """Drop oldest decoder states until ``len(states) <= max_states``.
+
+        Used to bound memory growth when many requests stream concurrently.
+        """
+        while len(states) > max_states:
+            states.popitem(last=False)
+
+    try:
+        while True:
+            message = socket.recv_pyobj()
+            cmd = message.get("cmd")
+            if cmd == "decode":
+                rid = message["request_id"]
+                finished = message["finished"]
+                skip_special = message["skip_special_tokens"]
+                spaces_between_special = message.get("spaces_between_special_tokens", True)
+
+                state = states.setdefault(
+                    rid,
+                    {
+                        "last_index": 0,
+                        "previous_text": "",
+                        "buffered": [],
+                        "prompt_context": None,
+                        "tokens": [],
+                    },
+                )
+                if "tokens_delta" in message:
+                    token_offset = int(message.get("token_offset", 0))
+                    token_delta = list(message.get("tokens_delta") or [])
+                    state_tokens = state.setdefault("tokens", [])
+                    if token_offset != len(state_tokens):
+                        full_tokens = message.get("tokens")
+                        if full_tokens is None:
+                            raise RuntimeError(
+                                "Detokenizer delta stream lost synchronization: "
+                                f"request_id={rid!r} offset={token_offset} stored={len(state_tokens)}"
+                            )
+                        state_tokens[:] = list(full_tokens)
+                    else:
+                        state_tokens.extend(token_delta)
+                    generated_tokens = state_tokens
+                else:
+                    generated_tokens = list(message["tokens"])
+                    state["tokens"] = generated_tokens
+                # Store prompt context on first encounter so callers
+                # only need to send it once.
+                if "prompt_context" not in state or state["prompt_context"] is None:
+                    pc = message.get("prompt_context")
+                    if pc:
+                        state["prompt_context"] = pc
+
+                last_idx = min(state["last_index"], len(generated_tokens))
+                new_tokens = generated_tokens[last_idx:]
+                detokstart = time.time()
+                if new_tokens or finished:
+                    buffered = state["buffered"]
+                    emitted_index = max(0, last_idx - len(buffered))
+                    if decoder.context_window:
+                        if emitted_index == 0 and state.get("prompt_context"):
+                            pc = state["prompt_context"]
+                            if not isinstance(pc, list | tuple):
+                                pc = []
+                            context_tokens = pc[-decoder.context_window :]
+                        else:
+                            context_start = max(0, emitted_index - decoder.context_window)
+                            context_tokens = generated_tokens[context_start:emitted_index]
+                    else:
+                        context_tokens = []
+                    delta, new_buffered, _ = decoder.decode(
+                        new_tokens,
+                        state["previous_text"],
+                        buffered,
+                        skip_special_tokens=skip_special,
+                        spaces_between_special_tokens=spaces_between_special,
+                        context_tokens=context_tokens,
+                    )
+                    state["buffered"] = new_buffered
+                    accumulated = state["previous_text"] + delta
+                    state["previous_text"] = accumulated
+                    state["last_index"] = len(generated_tokens)
+
+                    if finished:
+                        try:
+                            full_decoded = tokenizer.decode(
+                                generated_tokens,
+                                skip_special_tokens=skip_special,
+                                spaces_between_special_tokens=spaces_between_special,
+                                clean_up_tokenization_spaces=False,
+                            )
+                        except TypeError:
+                            full_decoded = tokenizer.decode(generated_tokens, skip_special_tokens=skip_special)
+                        delta = _compute_suffix_delta(full_decoded, accumulated)
+                        accumulated = full_decoded
+                        states.pop(rid, None)
+                    result = {
+                        "accumulated_text": accumulated,
+                        "delta_text": delta,
+                        "last_decoded_index": state["last_index"],
+                        "finished": finished,
+                    }
+                else:
+                    result = {
+                        "accumulated_text": state["previous_text"],
+                        "delta_text": "",
+                        "last_decoded_index": state["last_index"],
+                        "finished": finished,
+                    }
+                detoktook = time.time() - detokstart
+                result["detoktook"] = detoktook
+                evict()
+                socket.send_pyobj({"status": "ok", "result": result})
+            elif cmd == "drain":
+                states.clear()
+                socket.send_pyobj({"status": "ok"})
+            elif cmd == "reset":
+                rid = message["request_id"]
+                states.pop(rid, None)
+                socket.send_pyobj({"status": "ok"})
+            elif cmd == "shutdown":
+                socket.send_pyobj({"status": "ok"})
+                break
+            else:
+                socket.send_pyobj({"status": "error", "message": f"Unknown cmd {cmd}"})
+    finally:
+        socket.close(0)
+        ctx.term()
+
+
+def main():
+    """CLI entry point: parse arguments, force CPU JAX, dispatch by ``mode``.
+
+    Parses the positional ``mode`` and the worker arguments described
+    in the module docstring, sets ``JAX_PLATFORMS=cpu`` (plus
+    ``XLA_PYTHON_CLIENT_PREALLOCATE=false`` and
+    ``ENABLE_DISTRIBUTED_INIT=0``) so the tokenizer / detokenizer
+    subprocesses never touch accelerators, then runs the matching
+    worker loop until ``shutdown`` is received.
+    """
+    parser = argparse.ArgumentParser()
+    parser.add_argument("mode", choices=["tokenizer", "detokenizer"])
+    parser.add_argument("--endpoint", required=True)
+    parser.add_argument("--tokenizer-path", required=True)
+    parser.add_argument("--tokenizer-kwargs", required=True)
+    parser.add_argument("--max-states", type=int, default=1 << 16)
+    args = parser.parse_args()
+
+    os.environ.setdefault("JAX_PLATFORMS", "cpu")
+    os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    os.environ.setdefault("ENABLE_DISTRIBUTED_INIT", "0")
+
+    tokenizer_kwargs = json.loads(args.tokenizer_kwargs) if args.tokenizer_kwargs else {}
+    if args.mode == "tokenizer":
+        _tokenizer_worker(args.endpoint, args.tokenizer_path, tokenizer_kwargs)
+    else:
+        _detokenizer_worker(args.endpoint, args.tokenizer_path, tokenizer_kwargs, args.max_states)
+
+
+if __name__ == "__main__":
+    main()

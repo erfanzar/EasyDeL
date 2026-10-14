@@ -1,0 +1,1150 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Metrics tracking and visualization for EasyDeL training.
+
+This module provides comprehensive metrics collection, aggregation, and
+visualization tools for training large language models. It includes:
+- Real-time metrics calculation (loss, accuracy, throughput, TFLOPs)
+- Progress bar implementations (tqdm, rich, JSON)
+- Weight distribution analysis and histograms
+- Performance profiling and benchmarking utilities
+"""
+
+from __future__ import annotations
+
+import abc
+import dataclasses
+import re
+import time
+import typing as tp
+from collections import defaultdict
+
+import jax
+import numpy as np
+from eformer.pytree import auto_pytree
+from rich.progress import Progress, ProgressColumn, Task, TaskID
+from rich.text import Text
+from tqdm.autonotebook import tqdm
+
+from easydel.infra.loss_utils import LossMetrics
+from easydel.utils import traversals
+from easydel.utils.compiling_utils import ejit
+from easydel.utils.traversals import flatten_dict
+
+try:
+    import wandb  # type:ignore
+except ImportError:
+    wandb = None
+
+
+from eformer.loggings import get_logger
+from jax import numpy as jnp
+
+logger = get_logger("TrainerMetrics")
+
+_ANSI_CYAN = "\033[96m"
+_ANSI_RESET = "\033[0m"
+
+
+def _host_scalar_float(value: tp.Any) -> float:
+    """Convert a scalar metric value to a Python float with one controlled host read."""
+    if isinstance(value, jax.Array):
+        value = jax.device_get(value)
+    return float(np.asarray(value).reshape(()).item())
+
+
+def _host_metric_value(value: tp.Any) -> tp.Any:
+    """Convert scalar metric leaves to plain Python values for logging."""
+    if value is None or isinstance(value, bool | int | float | str):
+        return value
+    if isinstance(value, jax.Array):
+        if value.shape != ():
+            return value
+        value = jax.device_get(value)
+    try:
+        array = np.asarray(value)
+    except (TypeError, ValueError):
+        return value
+    if array.ndim != 0:
+        return value
+    scalar = array.item()
+    if isinstance(scalar, bool | int | float | str):
+        return scalar
+    try:
+        return float(scalar)
+    except (TypeError, ValueError):
+        return scalar
+
+
+def _host_mean_float(value: tp.Any) -> float:
+    """Mean-reduce a metric on the host without invoking JAX logging work."""
+    if isinstance(value, jax.Array):
+        value = jax.device_get(value)
+    return float(np.asarray(value).mean().item())
+
+
+def _host_perplexity(loss_value: float) -> float:
+    """Mirror scalar JAX float32 perplexity semantics without calling JAX."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        return float(np.exp(np.asarray(loss_value, dtype=np.float32)).item())
+
+
+def _format_metrics_log(metrics: dict[str, tp.Any]) -> str:
+    """Return a dict-like metrics log with the performance block highlighted."""
+    items: list[str] = []
+    for key, value in metrics.items():
+        item = f"{key!r}: {value!r}"
+        if key == "performance":
+            item = f"{_ANSI_CYAN}{item}{_ANSI_RESET}"
+        items.append(item)
+    return "{" + ", ".join(items) + "}"
+
+
+class StepMetrics:
+    """Handles calculation and tracking of training metrics.
+
+    This class computes various metrics for each training/evaluation step,
+    including loss, accuracy, performance metrics (TFLOPs, throughput),
+    and gradient statistics.
+
+    Attributes:
+        arguments: Training configuration arguments.
+        start_time: Global start time for training.
+        step_start_time: Start time for current step.
+
+    Note:
+        Designed to work efficiently within JAX training loops.
+        Automatically handles metric aggregation across devices.
+    """
+
+    def __init__(self, arguments):
+        """Initialize the metrics calculator.
+
+        Args:
+            arguments: Training configuration with logging preferences.
+        """
+        self.arguments = arguments
+        self.start_time = time.time()
+        self.step_start_time = time.time()
+
+    def start_step(self):
+        """Mark the start of a training step.
+
+        Records the current time for step duration calculation.
+        Should be called at the beginning of each training/evaluation step.
+        """
+        self.step_start_time = time.time()
+
+    def calculate(
+        self,
+        metrics: LossMetrics,
+        current_step: int,
+        epoch: int,
+        epoch_progress: float | None,
+        flops_per_token: float,
+        extra_flops_per_token: float,
+        batch_size: int,
+        seq_length: int,
+        learning_rate: float,
+        mode: tp.Literal["eval", "train"] | None = None,
+        **extras,
+    ) -> dict[str, tp.Any]:
+        """Calculate comprehensive metrics for the training step.
+
+        Computes performance metrics, loss statistics, and optional detailed
+        metrics like gradient norms.
+
+        Args:
+            metrics: Loss metrics from the training step.
+            current_step: Current training/evaluation step number.
+            epoch: Current epoch number.
+            epoch_progress: Fractional epoch progress to log. When provided,
+                this replaces the integer epoch in the emitted metrics.
+            flops_per_token: FLOPs required per token for forward pass.
+            extra_flops_per_token: Additional FLOPs for backward pass.
+            batch_size: Number of samples in the batch.
+            seq_length: Sequence length of inputs.
+            learning_rate: Current learning rate value.
+            mode: 'train' or 'eval' to prefix metric names.
+            **extras: Additional metrics to include.
+
+        Returns:
+            dict: Comprehensive metrics including:
+                - Basic metrics (loss, perplexity, accuracy)
+                - Performance metrics (TFLOPs, throughput)
+                - Performance timing and throughput metrics
+                - Optional gradient norms and detailed statistics
+
+        Note:
+            In performance mode, detailed metrics are skipped for efficiency.
+        """
+
+        step_time = time.time() - self.step_start_time
+        total_time = time.time() - self.start_time
+        preprocessing_time = 0.0
+        other_metrics = getattr(metrics, "other_metrics", None)
+        if other_metrics is not None:
+            preprocessing_time = float(other_metrics.get("preprocessing_time", 0.0))
+        execution_time = max(float(metrics.execution_time) - preprocessing_time, 0.0)
+        execution_time_for_rate = execution_time if execution_time > 0.0 else 1e-12
+        flops = flops_per_token * seq_length
+        total_flops = flops * batch_size
+
+        extra_flops = extra_flops_per_token * seq_length
+        total_flops += extra_flops * batch_size
+
+        tflops = (total_flops / execution_time_for_rate) / 1e12
+        total_tokens = batch_size * seq_length
+        visited_tokens = total_tokens * current_step
+        throughput = total_tokens / execution_time_for_rate
+        if mode == "eval":
+            perf_key = "performance/eval"
+        elif mode == "train":
+            perf_key = "performance"
+        else:
+            perf_key = "performance/step"
+        step_time_key = f"{mode}_step_time" if mode is not None else "step_time"
+        performance_metrics = {
+            f"{perf_key}/execution_time": float(execution_time),
+            f"{perf_key}/flops": float(flops),
+            f"{perf_key}/flops_per_token": float(flops_per_token),
+            f"{perf_key}/extra_flops": float(extra_flops),
+            f"{perf_key}/extra_flops_per_token": float(extra_flops_per_token),
+            f"{perf_key}/preprocessing_time": float(preprocessing_time),
+            f"{perf_key}/{step_time_key}": float(step_time),
+            f"{perf_key}/tflops": float(tflops),
+            f"{perf_key}/throughput": throughput,
+            f"{perf_key}/total_flops": float(total_flops),
+            f"{perf_key}/total_time": float(total_time),
+            f"{perf_key}/total_tokens": total_tokens,
+        }
+
+        loss_value = _host_scalar_float(metrics.loss)
+        z_loss = metrics.z_loss
+        z_loss_value = _host_scalar_float(z_loss) if z_loss is not None else None
+        epoch_value = float(epoch) if epoch_progress is None else float(epoch) + float(epoch_progress)
+        logged_extras = {key: _host_metric_value(value) for key, value in extras.items()}
+
+        basic_metrics = {
+            "epoch": epoch_value,
+            "epoch_index": int(epoch),
+            "learning_rate": float(np.array(learning_rate).item()),
+            "loss": loss_value,
+            "perplexity": _host_perplexity(loss_value),
+            f"{mode}_step": int(current_step),
+            "visited_tokens": visited_tokens,
+            "z_loss": z_loss_value,
+            **logged_extras,
+        }
+
+        if metrics.accuracy is not None:
+            basic_metrics["accuracy"] = _host_scalar_float(metrics.accuracy)
+        if metrics.chosen_rewards is not None:
+            basic_metrics["chosen_rewards"] = _host_mean_float(metrics.chosen_rewards)
+        if metrics.rejected_rewards is not None:
+            basic_metrics["rejected_rewards"] = _host_mean_float(metrics.rejected_rewards)
+        if other_metrics is not None:
+            basic_metrics.update({key: _host_metric_value(value) for key, value in other_metrics.items()})
+        if not self.arguments.performance_mode and (mode == "train" or mode is None):
+            detailed_metrics = self._calculate_detailed_metrics(metrics)
+            basic_metrics.update(detailed_metrics)
+        if mode is not None:
+            basic_metrics = {f"{mode}/{k}": v for k, v in basic_metrics.items()}
+        basic_metrics.update(performance_metrics)
+
+        return basic_metrics
+
+    @staticmethod
+    def _coerce_summary_scalar(metric_value: tp.Any) -> float | None:
+        """Coerce an arbitrary metric value into a Python ``float`` scalar.
+
+        Args:
+            metric_value: Any object emitted as a metric (jnp/np scalar,
+                Python number, or non-numeric).  ``None`` and booleans are
+                treated as non-summable.
+
+        Returns:
+            A finite ``float`` value when the input is a 0-d numeric scalar,
+            otherwise ``None``.
+        """
+        if metric_value is None or isinstance(metric_value, bool):
+            return None
+        try:
+            if isinstance(metric_value, jax.Array):
+                if metric_value.shape != ():
+                    return None
+                metric_value = jax.device_get(metric_value)
+            scalar_array = np.asarray(metric_value)
+        except (TypeError, ValueError):
+            return None
+        if scalar_array.ndim != 0:
+            return None
+        scalar_value = scalar_array.item()
+        if isinstance(scalar_value, bool):
+            return None
+        try:
+            return float(scalar_value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _get_summary_metric_reduction(
+        metric_name: str,
+        mode: tp.Literal["eval", "train"] | None = None,
+    ) -> tp.Literal["ignore", "mean", "sum"]:
+        """Decide how a metric should be reduced when summarizing.
+
+        Most metrics use a "mean" reduction across steps, but a few are
+        either skipped (e.g. last-step counters that should not be averaged)
+        or summed (e.g. performance totals).
+
+        Args:
+            metric_name: The full metric name as logged.
+            mode: Either ``"train"`` or ``"eval"`` to disambiguate between
+                modes that share suffixes; ``None`` skips the
+                mode-specific overrides.
+
+        Returns:
+            One of ``"ignore"``, ``"mean"``, ``"sum"``.
+        """
+        if mode is not None and metric_name.startswith(f"{mode}/"):
+            bare_metric_name = metric_name.removeprefix(f"{mode}/")
+            if bare_metric_name in {
+                f"{mode}_step",
+                "visited_tokens",
+                "loss",
+                "accuracy",
+                "perplexity",
+                "mean_loss",
+                "mean_accuracy",
+            }:
+                return "ignore"
+        performance_prefix = "performance/eval/" if mode == "eval" else "performance/"
+        if metric_name.startswith(performance_prefix):
+            bare_metric_name = metric_name.removeprefix(performance_prefix)
+            if bare_metric_name == "total_time":
+                return "ignore"
+            if bare_metric_name in {"total_flops", "total_tokens"}:
+                return "sum"
+        return "mean"
+
+    def accumulate_summary_metric(
+        self,
+        summary_metric_sums: dict[str, float],
+        summary_metric_counts: dict[str, int],
+        metric_name: str,
+        metric_value: tp.Any,
+        mode: tp.Literal["eval", "train"] | None = None,
+    ) -> None:
+        """Accumulate a metric value into running sum / count dictionaries.
+
+        Skips metrics flagged as ``"ignore"`` and silently drops values that
+        cannot be coerced to ``float``.  Used by trainers to compute
+        per-epoch summaries from per-step metrics.
+
+        Args:
+            summary_metric_sums: Mutable mapping of metric name to running
+                sum; updated in-place.
+            summary_metric_counts: Mutable mapping of metric name to running
+                count; updated in-place.
+            metric_name: The metric name to accumulate under.
+            metric_value: The latest scalar value for this metric (any type).
+            mode: Optional ``"train"``/``"eval"`` mode used by the reduction
+                lookup; defaults to ``None``.
+        """
+        if self._get_summary_metric_reduction(metric_name, mode=mode) == "ignore":
+            return
+        scalar_value = self._coerce_summary_scalar(metric_value)
+        if scalar_value is None:
+            return
+        summary_metric_sums[metric_name] = summary_metric_sums.get(metric_name, 0.0) + scalar_value
+        summary_metric_counts[metric_name] = summary_metric_counts.get(metric_name, 0) + 1
+
+    def summarize_metrics(
+        self,
+        last_metrics: dict[str, tp.Any],
+        summary_metric_sums: dict[str, float],
+        summary_metric_counts: dict[str, int],
+        mode: tp.Literal["eval", "train"] | None = None,
+    ) -> dict[str, tp.Any]:
+        """Reduce accumulated per-step metrics into a final summary mapping.
+
+        Combines ``last_metrics`` (carrying point-in-time values like
+        ``train_step``) with mean/sum reductions over the accumulated
+        running totals.  For ``mode="eval"``, also derives performance throughput
+        and TFLOPS plus convenience aliases like ``eval/loss`` and
+        ``eval/perplexity``.
+
+        Args:
+            last_metrics: The most recent metrics dict (used as a base).
+            summary_metric_sums: Running sum dict from
+                :meth:`accumulate_summary_metric`.
+            summary_metric_counts: Running count dict from
+                :meth:`accumulate_summary_metric`.
+            mode: Optional ``"train"``/``"eval"`` mode for reduction
+                selection and post-processing.
+
+        Returns:
+            A new dict with reduced summary metrics.
+        """
+        summary_metrics = dict(last_metrics)
+        for metric_name, metric_total in summary_metric_sums.items():
+            reduction = self._get_summary_metric_reduction(metric_name, mode=mode)
+            if reduction == "ignore":
+                continue
+            if reduction == "sum":
+                summary_metrics[metric_name] = metric_total
+            else:
+                summary_metrics[metric_name] = metric_total / summary_metric_counts[metric_name]
+
+        if mode == "eval":
+            performance_prefix = "performance/eval/"
+            total_execution_time = summary_metric_sums.get(f"{performance_prefix}execution_time")
+            total_tokens = summary_metrics.get(f"{performance_prefix}total_tokens")
+            total_flops = summary_metrics.get(f"{performance_prefix}total_flops")
+            if total_execution_time is not None and total_tokens is not None and float(total_execution_time) > 0.0:
+                summary_metrics[f"{performance_prefix}throughput"] = float(total_tokens) / float(total_execution_time)
+            if total_execution_time is not None and total_flops is not None and float(total_execution_time) > 0.0:
+                summary_metrics[f"{performance_prefix}tflops"] = (
+                    float(total_flops) / float(total_execution_time)
+                ) / 1e12
+            if summary_metrics.get("eval/mean_loss") is not None:
+                summary_metrics["eval/loss"] = summary_metrics["eval/mean_loss"]
+                summary_metrics["eval/perplexity"] = _host_perplexity(float(summary_metrics["eval/mean_loss"]))
+            if summary_metrics.get("eval/mean_accuracy") is not None:
+                summary_metrics["eval/accuracy"] = summary_metrics["eval/mean_accuracy"]
+
+        return summary_metrics
+
+    def _calculate_detailed_metrics(self, metrics: LossMetrics):
+        """Calculate additional detailed metrics.
+
+        Computes gradient norms and other detailed statistics when not
+        in performance mode.
+
+        Args:
+            metrics: Loss metrics containing gradient information.
+
+        Returns:
+            dict: Detailed metrics including per-layer gradient norms.
+
+        Note:
+            Only computed when log_grad_norms is True and not in performance mode.
+        """
+        detailed_metrics = {}
+        getattr_in = lambda x: x if not hasattr(x, "value") else x.value  # noqa
+        if self.arguments.log_grad_norms:
+            if metrics.max_grad_norm is not None:
+                detailed_metrics.update({"train/max_grad_norm": getattr_in(metrics.max_grad_norm).tolist()})
+
+            if metrics.mean_grad_norm is not None:
+                detailed_metrics.update({"train/mean_grad_norm": getattr_in(metrics.mean_grad_norm).tolist()})
+
+            # Add per-layer gradient norms. ``grad_norms`` may be a plain
+            # nested dict (legacy path) or a ``spx.State`` (current path);
+            # the latter exposes ``.flatten()`` which returns a flat
+            # ``{"collection/path": leaf}`` mapping ready to format.
+            if metrics.grad_norms is not None:
+                if hasattr(metrics.grad_norms, "flatten") and not isinstance(metrics.grad_norms, dict):
+                    flat_grad_norms = metrics.grad_norms.flatten()
+                    detailed_metrics.update(
+                        {
+                            f"grad_norm/{layer_name}": getattr_in(grad_norm).tolist()
+                            for layer_name, grad_norm in flat_grad_norms.items()
+                            if getattr_in(grad_norm) is not None
+                        }
+                    )
+                else:
+                    detailed_metrics.update(
+                        {
+                            f"grad_norm/{'.'.join([str(s) for s in layer_name])}": getattr_in(grad_norm).tolist()
+                            for layer_name, grad_norm in flatten_dict(metrics.grad_norms).items()
+                            if getattr_in(grad_norm) is not None
+                        }
+                    )
+
+        return detailed_metrics
+
+
+class MetricsTracker:
+    """Tracks and aggregates training metrics over time.
+
+    Maintains running averages of loss and accuracy across training steps,
+    useful for monitoring training progress and convergence.
+
+    Attributes:
+        loss_sum: Cumulative loss sum.
+        accuracy_sum: Cumulative accuracy sum.
+        metrics_history: Historical metrics for analysis.
+        step_offset: Step number offset for averaging.
+    """
+
+    def __init__(self):
+        """Initialize the metrics tracker with empty state."""
+        self.loss_sum = None
+        self.loss_count = 0
+        self.accuracy_sum = None
+        self.accuracy_count = 0
+        self.metrics_history = defaultdict(list)
+        self.step_offset = 0
+
+    def update(self, loss, accuracy, step):
+        """Update tracked metrics with new values.
+
+        Args:
+            loss: Current step loss.
+            accuracy: Current step accuracy (can be None or inf).
+            step: Current step number.
+
+        Returns:
+            tuple | float: (mean_loss, mean_accuracy) if accuracy is valid,
+                          otherwise just mean_loss.
+
+        Note:
+            Handles missing accuracy values gracefully.
+        """
+        del step
+
+        loss_value = _host_scalar_float(loss)
+        self.loss_sum = loss_value if self.loss_sum is None else self.loss_sum + loss_value
+        self.loss_count += 1
+        mean_loss = self.loss_sum / max(self.loss_count, 1)
+
+        mean_accuracy = None
+        if accuracy is not None:
+            accuracy_value = _host_scalar_float(accuracy)
+            if np.isfinite(accuracy_value):
+                self.accuracy_sum = accuracy_value if self.accuracy_sum is None else self.accuracy_sum + accuracy_value
+                self.accuracy_count += 1
+                mean_accuracy = self.accuracy_sum / max(self.accuracy_count, 1)
+
+        return float(mean_loss), None if mean_accuracy is None else float(mean_accuracy)
+
+    def reset(self, step):
+        """Reset tracked metrics.
+
+        Args:
+            step: New step offset for averaging.
+
+        Note:
+            Typically called at the start of each epoch or evaluation phase.
+        """
+        self.loss_sum = None
+        self.loss_count = 0
+        self.accuracy_sum = None
+        self.accuracy_count = 0
+        self.step_offset = step
+
+
+class MetricsColumn(ProgressColumn):
+    """A custom Rich progress column for displaying metrics.
+
+    Formats and displays training metrics in a readable format within
+    Rich progress bars.
+
+    Attributes:
+        metrics_to_show: Optional list of metric names to display.
+                        If None, shows all metrics.
+    """
+
+    def __init__(self, metrics_to_show=None):
+        """Initialize the metrics column.
+
+        Args:
+            metrics_to_show: Optional list of metric names to filter display.
+        """
+        super().__init__()
+        self.metrics_to_show = metrics_to_show
+
+    def render(self, task: Task) -> Text:
+        """Render the metrics in an organized way.
+
+        Args:
+            task: Rich Task object containing metrics to display.
+
+        Returns:
+            Text: Formatted metrics text with styling.
+
+        Note:
+            Automatically formats floats with scientific notation for
+            very small or large values.
+        """
+        if not task.fields.get("metrics"):
+            return Text("")
+
+        metrics = task.fields["metrics"]
+        display_items = []
+
+        for key, value in metrics.items():
+            if self.metrics_to_show is None:
+                if isinstance(value, float):
+                    if abs(value) < 0.01 or abs(value) > 1000:
+                        formatted_value = f"{value:.4e}"
+                    else:
+                        formatted_value = f"{value:.4f}"
+                else:
+                    formatted_value = str(value)
+
+                display_items.append(f"{key}={formatted_value}")
+            else:
+                if any(metric in key for metric in self.metrics_to_show):
+                    if isinstance(value, float):
+                        if abs(value) < 0.01 or abs(value) > 1000:
+                            formatted_value = f"{value:.4e}"
+                        else:
+                            formatted_value = f"{value:.4f}"
+                    else:
+                        formatted_value = str(value)
+
+                    display_items.append(f"{key}={formatted_value}")
+
+        return Text(" • ".join(display_items), style="cyan")
+
+
+class BaseProgressBar(abc.ABC):
+    """Abstract base class for progress bar implementations.
+
+    Defines the interface for different progress bar backends
+    (tqdm, rich, JSON logging).
+    """
+
+    @abc.abstractmethod
+    def update(self, n: int = 1) -> None:
+        """Update the progress bar.
+
+        Args:
+            n: Number of steps to advance.
+        """
+        pass
+
+    @abc.abstractmethod
+    def set_postfix(self, **kwargs) -> None:
+        """Set postfix metrics to display.
+
+        Args:
+            **kwargs: Metric key-value pairs to display.
+        """
+        pass
+
+    @abc.abstractmethod
+    def reset(self) -> None:
+        """Reset the progress bar to initial state."""
+        pass
+
+    @abc.abstractmethod
+    def close(self) -> None:
+        """Close and cleanup the progress bar."""
+        pass
+
+
+class NullProgressBar(BaseProgressBar):
+    """Dummy progress bar that does nothing.
+
+    Useful for multiprocessing scenarios where only the main process
+    should display progress, or when progress display is disabled.
+    """
+
+    def update(self, n: int = 1) -> None:
+        """No-op update; satisfies the :class:`BaseProgressBar` contract.
+
+        Args:
+            n: Ignored.
+        """
+        pass
+
+    def set_postfix(self, **kwargs) -> None:
+        """No-op postfix setter.
+
+        Args:
+            **kwargs: Ignored metric values.
+        """
+        pass
+
+    def reset(self) -> None:
+        """No-op reset."""
+        pass
+
+    def close(self) -> None:
+        """No-op close."""
+        pass
+
+
+class TqdmProgressBar(BaseProgressBar):
+    """Wrapper for tqdm progress bar.
+
+    Adapts tqdm progress bars to the BaseProgressBar interface.
+
+    Attributes:
+        pbar: Underlying tqdm progress bar instance.
+    """
+
+    def __init__(self, pbar: tqdm):
+        """Initialize with an existing tqdm progress bar.
+
+        Args:
+            pbar: tqdm progress bar instance.
+        """
+        self.pbar = pbar
+
+    def update(self, n: int = 1) -> None:
+        """Advance the underlying tqdm bar.
+
+        Args:
+            n: Number of steps to advance.
+        """
+        self.pbar.update(n)
+
+    def set_postfix(self, **kwargs) -> None:
+        """Set tqdm's postfix, rounding floats for compact display.
+
+        ``learning_rate`` is preserved at full precision; all other floats
+        are rounded to three decimal places.
+
+        Args:
+            **kwargs: Metric key/value pairs.
+        """
+        for k in list(kwargs.keys()):
+            val = kwargs.get(k)
+            if isinstance(val, float) and k != "learning_rate":
+                kwargs[k] = round(val, 3)
+        self.pbar.set_postfix(**kwargs)
+
+    def reset(self) -> None:
+        """Reset tqdm step counter and start timestamp."""
+        self.pbar.n = 0
+        self.pbar.start_t = self.pbar._time()
+
+    def close(self) -> None:
+        """Close the underlying tqdm bar."""
+        self.pbar.close()
+
+
+class JSONProgressBar(BaseProgressBar):
+    """JSON-based progress reporting.
+
+    Outputs progress as JSON logs instead of a visual progress bar.
+    Useful for structured logging and CI/CD environments.
+
+    Attributes:
+        desc: Description text for the progress.
+    """
+
+    def __init__(self, desc=""):
+        """Initialize JSON progress reporter.
+
+        Args:
+            desc: Description text for the progress.
+        """
+        self.desc = desc
+
+    def update(self, n: int = 1) -> None:
+        """No-op; JSON output is emitted from :meth:`set_postfix` only.
+
+        Args:
+            n: Ignored.
+        """
+        ...
+
+    def set_postfix(self, **kwargs) -> None:
+        """Log the postfix metrics as a single JSON-style log record.
+
+        Single-element JAX/NumPy arrays are unboxed to scalars, and floats
+        (other than ``learning_rate``) are rounded to three decimal places
+        for compact log lines.
+
+        Args:
+            **kwargs: Metric key/value pairs to log.
+        """
+        nested_kwargs: dict[str, tp.Any] = {}
+        for k in list(kwargs.keys()):
+            val = kwargs.get(k)
+            if hasattr(val, "size") and val.size == 1:
+                val = val.item()
+            if isinstance(val, float) and k != "learning_rate":
+                val = round(val, 3)
+            if "/" not in k:
+                nested_kwargs[k] = val
+                continue
+            current = nested_kwargs
+            parts = k.split("/")
+            for part in parts[:-1]:
+                child = current.get(part)
+                if not isinstance(child, dict):
+                    child = {}
+                    current[part] = child
+                current = child
+            current[parts[-1]] = val
+        logger.info(_format_metrics_log(nested_kwargs))
+
+    def reset(self) -> None:
+        """No-op."""
+        ...
+
+    def close(self) -> None:
+        """No-op."""
+        ...
+
+
+class RichProgressBar(BaseProgressBar):
+    """Wrapper for Rich library progress bar.
+
+    Provides beautiful, customizable progress bars with support for
+    multiple columns and custom rendering.
+
+    Attributes:
+        progress: Rich Progress instance.
+        task_id: ID of the task being tracked.
+        _postfix: Current postfix metrics.
+    """
+
+    def __init__(self, progress: Progress, task_id: TaskID):
+        """Initialize RichProgressBar with an existing Progress instance.
+
+        Args:
+            progress: Rich Progress instance managing the display.
+            task_id: ID of the task to track within the Progress instance.
+        """
+        self.progress = progress
+        self.task_id = task_id
+        self._postfix = {}
+
+    def update(self, n: int = 1) -> None:
+        """Advance the Rich task by ``n`` steps.
+
+        Args:
+            n: Number of steps to advance.
+        """
+        self.progress.update(self.task_id, advance=n)
+
+    def set_postfix(self, **kwargs) -> None:
+        """Merge new metrics into the Rich task's metrics field.
+
+        Args:
+            **kwargs: Metric key/value pairs accumulated and forwarded to
+                the Rich progress display.
+        """
+        self._postfix.update(kwargs)
+        self.progress.update(self.task_id, metrics=self._postfix)
+
+    def reset(self) -> None:
+        """Reset the Rich task and clear accumulated metrics."""
+        self.progress.reset(self.task_id)
+        self._postfix = {}
+
+    def close(self) -> None:
+        """Remove the Rich task from the progress display.
+
+        Silently ignores ``KeyError`` if the task is already gone.
+        """
+        try:
+            self.progress.remove_task(self.task_id)
+        except KeyError:
+            pass
+
+
+@auto_pytree
+class MetricsHistogram:
+    """JIT-compatible histogram of a JAX array's values.
+
+    Computed via :meth:`from_array`, which in a single ``jit`` traces
+    a 64-bin histogram plus the running min / max / sum / sum_squares
+    sufficient to recover mean, variance, and stddev later via the
+    ``mean`` / ``variance`` / ``std`` properties. The pytree layout
+    is auto-registered so instances can flow through ``jax.tree_util``
+    and be returned from compiled training steps verbatim.
+
+    Used by :func:`compute_weight_stats` to log per-parameter weight
+    distributions during training without breaking out of XLA.
+
+    Attributes:
+        bin_counts: ``[64]`` int counts of values falling into each
+            bucket.
+        bin_edges: ``[65]`` float bucket edges (left-closed,
+            right-open except for the rightmost bucket which absorbs
+            the maximum value).
+        size: Total number of input elements (post flattening).
+        min: Scalar minimum of the input array.
+        max: Scalar maximum.
+        sum: Scalar sum (cached for cheap mean).
+        sum_squares: Scalar sum of squares (cached for cheap variance
+            via ``E[x^2] - E[x]^2``).
+    """
+
+    bin_counts: jax.Array
+    bin_edges: jax.Array
+
+    size: int
+
+    min: jax.Array
+    max: jax.Array
+    sum: jax.Array
+
+    sum_squares: jax.Array
+
+    @staticmethod
+    @ejit
+    def _create_histogram_bin_edges(arr: jax.Array) -> tuple[jax.Array, jax.Array]:
+        """Create histogram bins and counts.
+
+        Args:
+            arr: Input array to create histogram from
+
+        Returns:
+            Tuple of (bin_counts, bin_edges)
+        """
+        bin_edges = jnp.histogram_bin_edges(arr, 64)
+        left_edges = bin_edges[:-1, None]
+        right_edges = bin_edges[1:, None]
+        index = ((arr >= left_edges) & (arr < right_edges)).astype(arr.dtype)
+        out = index.sum(axis=1, dtype=arr.dtype)
+        out = jax.lax.cond(
+            out.size >= 1,
+            lambda o: o.at[-1].add(jnp.sum(arr == arr.max())),
+            lambda o: o,
+            out,
+        )
+        return out, bin_edges
+
+    @classmethod
+    def from_array(cls, arr: jax.Array) -> MetricsHistogram:
+        """Create a histogram from an array.
+
+        Args:
+            arr: Input array
+
+        Returns:
+            MetricsHistogram instance
+        """
+        flat_arr = arr.reshape(-1)
+        bin_counts, bin_edges = cls._create_histogram_bin_edges(flat_arr)
+        return cls(
+            bin_counts=bin_counts,
+            bin_edges=bin_edges,
+            size=flat_arr.size,
+            min=jnp.min(flat_arr),
+            max=jnp.max(flat_arr),
+            sum=jnp.sum(flat_arr),
+            sum_squares=jnp.sum(flat_arr**2),
+        )
+
+    def numpy_histogram(self) -> tuple[jax.Array, jax.Array]:
+        """Return histogram data in numpy-compatible format.
+
+        Returns:
+            Tuple of (bin_counts, bin_edges)
+        """
+        return self.bin_counts, self.bin_edges
+
+    @property
+    def mean(self) -> jax.Array:
+        """Calculate mean of the original array.
+
+        Returns:
+            Mean value
+        """
+        return self.sum / self.size
+
+    @property
+    def variance(self) -> jax.Array:
+        """Calculate variance of the original array.
+
+        Returns:
+            Variance value
+        """
+        mean = self.mean
+        mean_of_squares = self.sum_squares / self.size
+        variance = mean_of_squares - (mean**2)
+        return variance
+
+    @property
+    def std(self) -> jax.Array:
+        """Calculate standard deviation of the original array.
+
+        Returns:
+            Standard deviation value
+        """
+        return jnp.sqrt(self.variance).reshape(-1)
+
+
+def _device_set_key(value: tp.Any) -> tuple[tuple[str, int, int], ...]:
+    """Return a stable key describing the devices backing ``value``."""
+    devices = []
+    for leaf in jax.tree_util.tree_leaves(value):
+        sharding = getattr(leaf, "sharding", None)
+        device_set = getattr(sharding, "device_set", None)
+        if device_set is None:
+            leaf_devices = getattr(leaf, "devices", None)
+            if callable(leaf_devices):
+                device_set = leaf_devices()
+        if device_set is None:
+            device = getattr(leaf, "device", None)
+            if device is not None:
+                device_set = {device}
+        if device_set is None:
+            continue
+        devices.extend(device_set)
+    if not devices:
+        return ()
+    return tuple(
+        sorted(
+            {
+                (
+                    getattr(device, "platform", ""),
+                    int(getattr(device, "process_index", 0)),
+                    int(getattr(device, "id", -1)),
+                )
+                for device in devices
+            }
+        )
+    )
+
+
+@ejit  # pyright: ignore[reportUntypedFunctionDecorator]
+def _compute_weight_stats_group(params: dict[str, tp.Any]) -> dict[str, MetricsHistogram]:
+    """Compute weight stats for one homogeneous device-set group."""
+    return {f"{path}/histogram": MetricsHistogram.from_array(weight) for path, weight in params.items()}
+
+
+def compute_weight_stats(params: dict[str, tp.Any] | tp.Any, repattern: str) -> dict[str, MetricsHistogram]:
+    """Compute statistics for model weights in a JIT-compatible way.
+
+    Analyzes model parameters matching the given pattern and computes
+    histograms and statistical measures for monitoring training stability.
+
+    Args:
+        params: Model parameters as a nested dictionary, or a SpectraX
+            ``State`` object. ``State`` is unwrapped with ``raw()`` before
+            flattening.
+        repattern: Regular expression pattern to match parameter paths.
+                  Use '.*' to match all parameters.
+
+    Returns:
+        dict: Weight statistics with keys formatted as 'path/to/param/histogram'
+             containing MetricsHistogram objects.
+
+    Note:
+        The outer tree walk intentionally partitions matching parameters by
+        device set before calling a jitted group helper. This keeps MPMD
+        pipeline stages on separate device sets valid without falling back to
+        one compiled dispatch per parameter.
+        Useful for detecting gradient explosion, vanishing gradients,
+        or monitoring weight distributions during training.
+
+    Example:
+        >>> stats = compute_weight_stats(model.parameter_values(), r'.*dense.*')
+        >>> # Gets statistics for all dense layer weights
+    """
+    raw = getattr(params, "raw", None)
+    if callable(raw):
+        params = raw()
+    groups: dict[tuple[tuple[str, int, int], ...], dict[str, tp.Any]] = defaultdict(dict)
+    for path, param in traversals.flatten_dict(params).items():
+        weight = param.value if hasattr(param, "value") else param
+        pattern_search = ".".join([str(p) for p in path])
+        output_path = "/".join([str(p) for p in path])
+        if re.match(repattern, pattern_search):
+            groups[_device_set_key(weight)][output_path] = weight
+
+    stats = {}
+    for group in groups.values():
+        stats.update(_compute_weight_stats_group(group))
+    return stats
+
+
+@dataclasses.dataclass
+class LogWatcher:
+    """A user-defined per-parameter metric that is evaluated at a fixed interval.
+
+    Watchers generalise the built-in weight-distribution logging by letting
+    users register arbitrary functions that receive a single parameter array
+    and return a dictionary of named scalar (or histogram) metrics.
+
+    Attributes:
+        name: Logging group name. Results are logged under
+            ``"{name}/{param_path}/{metric_key}"``.
+        fn: Callable that takes a single ``jax.Array`` (one model parameter,
+            already flattened from the param tree) and returns a dict mapping
+            metric names to scalar floats, ``jax.Array`` scalars, or
+            ``(bin_counts, bin_edges)`` tuples for histogram logging.
+        interval: Evaluate this watcher every *interval* training steps.
+        pattern: Regex matched against the dot-joined parameter path
+            (e.g. ``"layers\\.0\\.attention\\..*"``). Only parameters whose
+            path matches are passed to *fn*. Defaults to ``".*"`` (all
+            parameters).
+
+    Example:
+        >>> import jax.numpy as jnp
+        >>> watcher = LogWatcher(
+        ...     name="norm",
+        ...     fn=lambda arr: {"l2": float(jnp.linalg.norm(arr))},
+        ...     interval=100,
+        ... )
+    """
+
+    name: str
+    fn: tp.Callable[[jax.Array], dict[str, tp.Any]]
+    interval: int = 500
+    pattern: str = ".*"
+
+
+def run_watchers(
+    watchers: list[LogWatcher],
+    params: dict[str, tp.Any],
+    step: int,
+) -> dict[str, tp.Any]:
+    """Execute all active watchers against model parameters and collect metrics.
+
+    For each watcher whose *interval* divides *step*, the function iterates
+    over the flattened parameter tree, matches paths against the watcher's
+    *pattern*, calls ``watcher.fn(param_array)`` on each match, and merges
+    the returned dicts into a single output keyed as
+    ``"{watcher.name}/{param_path}/{metric_key}"``.
+
+    Args:
+        watchers: List of ``LogWatcher`` instances to evaluate.
+        params: Model parameters (e.g. ``state.graphstate``), a nested dict
+            or PyTree that will be flattened via ``traversals.flatten_dict``.
+        step: Current training step. A watcher is skipped when
+            ``step % watcher.interval != 0``.
+
+    Returns:
+        Merged metrics dict ready for ``TrainingArguments.log_metrics``.
+        Values are whatever the watcher *fn* returns — typically floats,
+        ``jax.Array`` scalars, or ``(bin_counts, bin_edges)`` tuples.
+    """
+    if not watchers:
+        return {}
+
+    active = [w for w in watchers if w.interval > 0 and step % w.interval == 0]
+    if not active:
+        return {}
+
+    flat_params = traversals.flatten_dict(params)
+    metrics: dict[str, tp.Any] = {}
+
+    for watcher in active:
+        compiled_pattern = re.compile(watcher.pattern)
+        for path, param in flat_params.items():
+            weight = param.value if hasattr(param, "value") else param
+            pattern_search = ".".join(str(p) for p in path)
+            if not compiled_pattern.match(pattern_search):
+                continue
+            output_path = "/".join(str(p) for p in path)
+            result = watcher.fn(weight)
+            if isinstance(result, dict):
+                for key, value in result.items():
+                    metrics[f"{watcher.name}/{output_path}/{key}"] = value
+
+    return metrics

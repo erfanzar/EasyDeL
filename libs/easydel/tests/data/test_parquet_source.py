@@ -1,0 +1,469 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import os
+
+import pytest
+
+os.environ.setdefault("ENABLE_DISTRIBUTED_INIT", "0")
+
+from easydel.data.sources.base import ParquetShardedSource
+
+
+def test_parquet_source_retries_nested_projection_error_single_threaded(tmp_path, monkeypatch):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+
+    data_path = tmp_path / "train.parquet"
+    table = pa.table(
+        {
+            "messages": [["hello"], ["world"]],
+            "unused_blob": ["x" * 1024, "y" * 1024],
+        }
+    )
+    pq.write_table(table, data_path, row_group_size=1)
+
+    original_read_row_group = pq.ParquetFile.read_row_group
+    read_calls: list[tuple[int, tuple[str, ...] | None, bool]] = []
+
+    def flaky_read_row_group(self, i, columns=None, *args, **kwargs):
+        use_threads = kwargs.get("use_threads", True)
+        read_calls.append((i, tuple(columns) if columns is not None else None, use_threads))
+        if columns is not None and use_threads:
+            raise pa.ArrowNotImplementedError("Nested data conversions not implemented for chunked array outputs")
+        if args:
+            return original_read_row_group(self, i, columns, *args, **kwargs)
+        return original_read_row_group(self, i, columns=columns, **kwargs)
+
+    monkeypatch.setattr(pq.ParquetFile, "read_row_group", flaky_read_row_group)
+
+    source = ParquetShardedSource(str(data_path), columns=["messages"])
+
+    rows = list(source.open_shard(source.shard_names[0]))
+
+    assert rows == [{"messages": ["hello"]}, {"messages": ["world"]}]
+    assert read_calls == [
+        (0, ("messages",), True),
+        (0, ("messages",), False),
+        (1, ("messages",), False),
+    ]
+
+
+def test_parquet_source_falls_back_to_projected_batches(tmp_path, monkeypatch):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+
+    data_path = tmp_path / "train.parquet"
+    table = pa.table(
+        {
+            "messages": [["hello"], ["world"]],
+            "unused_blob": ["x" * 1024, "y" * 1024],
+        }
+    )
+    pq.write_table(table, data_path, row_group_size=1)
+
+    projected_calls: list[tuple[int, tuple[str, ...], bool]] = []
+    full_calls: list[int] = []
+
+    def failing_projected_read_row_group(self, i, columns=None, *args, **kwargs):
+        if columns is not None:
+            projected_calls.append((i, tuple(columns), kwargs.get("use_threads", True)))
+            raise pa.ArrowNotImplementedError("Nested data conversions not implemented for chunked array outputs")
+        full_calls.append(i)
+        raise AssertionError("projected batch fallback should not read full row groups")
+
+    monkeypatch.setattr(pq.ParquetFile, "read_row_group", failing_projected_read_row_group)
+
+    source = ParquetShardedSource(str(data_path), columns=["messages"])
+
+    rows = list(source.open_shard(source.shard_names[0]))
+
+    assert rows == [{"messages": ["hello"]}, {"messages": ["world"]}]
+    assert projected_calls == [
+        (0, ("messages",), True),
+        (0, ("messages",), False),
+        (1, ("messages",), False),
+    ]
+    assert full_calls == []
+
+
+def test_parquet_source_projection_fallback_respects_start_row(tmp_path, monkeypatch):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+
+    data_path = tmp_path / "train.parquet"
+    table = pa.table(
+        {
+            "messages": [["hello"], ["world"], ["again"]],
+            "unused_blob": ["x" * 1024, "y" * 1024, "z" * 1024],
+        }
+    )
+    pq.write_table(table, data_path, row_group_size=2)
+
+    original_read_row_group = pq.ParquetFile.read_row_group
+
+    def flaky_read_row_group(self, i, columns=None, *args, **kwargs):
+        if columns is not None:
+            raise pa.ArrowNotImplementedError("Nested data conversions not implemented for chunked array outputs")
+        if args:
+            return original_read_row_group(self, i, columns, *args, **kwargs)
+        return original_read_row_group(self, i, columns=columns, **kwargs)
+
+    monkeypatch.setattr(pq.ParquetFile, "read_row_group", flaky_read_row_group)
+
+    source = ParquetShardedSource(str(data_path), columns=["messages"])
+
+    rows = list(source.open_shard_at_row(source.shard_names[0], 1))
+
+    assert rows == [{"messages": ["world"]}, {"messages": ["again"]}]
+
+
+def test_parquet_source_never_falls_back_to_unprojected_batches(tmp_path, monkeypatch):
+    # Unprojected full-row-group decodes are the memory bomb for embed-heavy
+    # files: if even single-column projected reads fail, the error must
+    # propagate instead of silently decoding every column.
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+
+    data_path = tmp_path / "train.parquet"
+    table = pa.table(
+        {
+            "messages": [["hello"], ["world"]],
+            "unused_blob": ["x" * 1024, "y" * 1024],
+        }
+    )
+    pq.write_table(table, data_path, row_group_size=1)
+
+    unprojected_calls: list[tuple] = []
+    original_iter_batches = pq.ParquetFile.iter_batches
+
+    def failing_read_row_group(self, i, columns=None, *args, **kwargs):
+        raise pa.ArrowNotImplementedError("Nested data conversions not implemented for chunked array outputs")
+
+    def flaky_iter_batches(self, *args, **kwargs):
+        if kwargs.get("columns") is not None:
+            raise pa.ArrowNotImplementedError("Nested data conversions not implemented for chunked array outputs")
+        unprojected_calls.append((args, kwargs))
+        return original_iter_batches(self, *args, **kwargs)
+
+    monkeypatch.setattr(pq.ParquetFile, "read_row_group", failing_read_row_group)
+    monkeypatch.setattr(pq.ParquetFile, "iter_batches", flaky_iter_batches)
+
+    source = ParquetShardedSource(str(data_path), columns=["messages"])
+
+    with pytest.raises(pa.ArrowNotImplementedError):
+        list(source.open_shard(source.shard_names[0]))
+
+    assert unprojected_calls == []
+
+
+def test_parquet_source_falls_back_to_projected_column_batches(tmp_path, monkeypatch):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+
+    data_path = tmp_path / "train.parquet"
+    table = pa.table(
+        {
+            "messages": [["hello"], ["world"]],
+            "tools": [["search"], ["calc"]],
+            "unused_blob": ["x" * 1024, "y" * 1024],
+        }
+    )
+    pq.write_table(table, data_path, row_group_size=2)
+
+    original_iter_batches = pq.ParquetFile.iter_batches
+    batch_calls: list[tuple[tuple[str, ...] | None, int | None]] = []
+
+    def failing_read_row_group(self, i, columns=None, *args, **kwargs):
+        raise pa.ArrowNotImplementedError("Nested data conversions not implemented for chunked array outputs")
+
+    def flaky_iter_batches(self, *args, **kwargs):
+        columns = kwargs.get("columns")
+        batch_calls.append((tuple(columns) if columns is not None else None, kwargs.get("batch_size")))
+        if columns is None or len(columns) > 1:
+            raise pa.ArrowNotImplementedError("Nested data conversions not implemented for chunked array outputs")
+        return original_iter_batches(self, *args, **kwargs)
+
+    monkeypatch.setattr(pq.ParquetFile, "read_row_group", failing_read_row_group)
+    monkeypatch.setattr(pq.ParquetFile, "iter_batches", flaky_iter_batches)
+
+    source = ParquetShardedSource(str(data_path), columns=["messages", "tools"])
+
+    rows = list(source.open_shard(source.shard_names[0]))
+
+    assert rows == [
+        {"messages": ["hello"], "tools": ["search"]},
+        {"messages": ["world"], "tools": ["calc"]},
+    ]
+    # The byte-budgeted ladder retries the multi-column projection at
+    # descending batch sizes before resorting to per-column reads.
+    assert batch_calls == [
+        (("messages", "tools"), 256),
+        (("messages", "tools"), 64),
+        (("messages", "tools"), 16),
+        (("messages", "tools"), 4),
+        (("messages", "tools"), 1),
+        (("messages",), 256),
+        (("tools",), 256),
+    ]
+
+
+def test_open_shard_at_row_counts_guard_skipped_rows(tmp_path, monkeypatch):
+    """``open_shard_at_row`` offsets count DELIVERED rows.
+
+    The decode-memory guard drops whole row groups, so delivered rows are a
+    subset of the file's physical rows. Resume bookkeeping everywhere counts
+    delivered examples, so the seek must translate through the guard: with a
+    physical seek it would restart too early and replay already-delivered rows.
+    """
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    import easydel.data.sources.base as base
+
+    data_path = tmp_path / "guard.parquet"
+    table = pa.table({"text": ["A" * 512, "B" * 512, "C", "D", "E", "F"]})
+    pq.write_table(table, data_path, row_group_size=2)  # groups: [A,B] [C,D] [E,F]
+
+    source = ParquetShardedSource(str(data_path))
+    shard = source.shard_names[0]
+    with source._open_file(str(data_path)) as fh:
+        pf = pq.ParquetFile(fh)
+        sizes = [source._projected_row_group_bytes(pf, i)[0] for i in range(pf.num_row_groups)]
+    # Group 0 holds the heaviest rows; a threshold just below its payload skips
+    # only that group (sizes strictly decrease).
+    monkeypatch.setattr(base, "_parquet_max_safe_row_group_bytes", lambda: sizes[0] - 1)
+
+    assert source.get_shard_info(shard).num_rows == 6
+    delivered = [r["text"] for r in source.open_shard(shard)]
+    assert delivered == ["C", "D", "E", "F"]
+
+    assert [r["text"] for r in source.open_shard_at_row(shard, 0)] == delivered
+    assert [r["text"] for r in source.open_shard_at_row(shard, 2)] == ["E", "F"]
+    assert list(source.open_shard_at_row(shard, 99)) == []
+
+    assert source.delivers_all_metadata_rows is False
+    monkeypatch.setattr(base, "_parquet_max_safe_row_group_bytes", lambda: 0)
+    assert source.delivers_all_metadata_rows is True
+
+
+def test_open_shard_at_row_retries_transient_footer_read_during_translation(tmp_path, monkeypatch):
+    """A positive-offset seek must retry a one-off footer-read failure, not abort (r14 S13-1).
+
+    The delivered->physical translation reads the footer; it used to run before the retry boundary,
+    so a single transient OSError on resume killed the stream. Persistent failures still propagate.
+    """
+    import time
+
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+
+    data_path = tmp_path / "resume.parquet"
+    pq.write_table(pa.table({"text": ["A", "B", "C", "D"]}), data_path, row_group_size=2)
+    source = ParquetShardedSource(str(data_path))
+    shard = source.shard_names[0]
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+
+    original = ParquetShardedSource._physical_row_for_delivered_row
+    calls = {"n": 0}
+
+    def flaky_once(self, shard_name, row):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("transient footer read failure")
+        return original(self, shard_name, row)
+
+    monkeypatch.setattr(ParquetShardedSource, "_physical_row_for_delivered_row", flaky_once)
+    assert [r["text"] for r in source.open_shard_at_row(shard, 1)] == ["B", "C", "D"]
+    assert calls["n"] == 2
+
+    def always_fail(self, shard_name, row):
+        raise OSError("persistent failure")
+
+    monkeypatch.setattr(ParquetShardedSource, "_physical_row_for_delivered_row", always_fail)
+    with pytest.raises(OSError, match="persistent"):
+        list(source.open_shard_at_row(shard, 1))
+
+
+def _column_uncompressed_bytes(pq, path) -> dict[str, int]:
+    """Footer-reported uncompressed bytes per column for a single-row-group file."""
+    rg = pq.ParquetFile(path).metadata.row_group(0)
+    return {rg.column(i).path_in_schema: rg.column(i).total_uncompressed_size for i in range(rg.num_columns)}
+
+
+def test_delivers_all_metadata_rows_is_a_per_source_footer_fact(tmp_path, monkeypatch):
+    """The exactness flag reflects whether THIS source's row groups would be skipped.
+
+    With the guard enabled (its default) but no row group above it, iteration
+    delivers every metadata row, so the flag must be ``True`` and metadata-based
+    fast resume/limit paths stay available. It is ``False`` only when a row
+    group actually exceeds the guard for the projected columns.
+    """
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    import easydel.data.sources.base as base
+
+    data_path = tmp_path / "flag.parquet"
+    pq.write_table(
+        pa.table({"big": ["X" * 4096] * 4, "small": [1, 2, 3, 4]}),
+        data_path,
+        row_group_size=4,
+    )
+    sizes = _column_uncompressed_bytes(pq, data_path)
+    assert sizes["big"] > sizes["small"]
+    total = sizes["big"] + sizes["small"]
+
+    # Default guard (24 GiB) is far above this tiny file: exact.
+    assert ParquetShardedSource(str(data_path)).delivers_all_metadata_rows is True
+
+    # Guard above the payload: exact. Guard below it: the only row group is skipped.
+    monkeypatch.setattr(base, "_parquet_max_safe_row_group_bytes", lambda: total)
+    assert ParquetShardedSource(str(data_path)).delivers_all_metadata_rows is True
+    monkeypatch.setattr(base, "_parquet_max_safe_row_group_bytes", lambda: total - 1)
+    guarded = ParquetShardedSource(str(data_path))
+    assert guarded.delivers_all_metadata_rows is False
+    assert list(guarded.open_shard(guarded.shard_names[0])) == []
+
+    # The guard applies to the PROJECTED payload: dropping the heavy column makes it exact again.
+    projected = ParquetShardedSource(str(data_path), columns=["small"])
+    assert projected.delivers_all_metadata_rows is True
+    assert [r["small"] for r in projected.open_shard(projected.shard_names[0])] == [1, 2, 3, 4]
+
+
+def test_delivers_all_metadata_rows_false_if_any_shard_has_guarded_group(tmp_path, monkeypatch):
+    """One oversized row group in any shard makes the whole source inexact."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    import easydel.data.sources.base as base
+
+    light = tmp_path / "a_light.parquet"
+    heavy = tmp_path / "b_heavy.parquet"
+    pq.write_table(pa.table({"text": ["a", "b"]}), light, row_group_size=2)
+    pq.write_table(pa.table({"text": ["Z" * 4096, "Z" * 4096]}), heavy, row_group_size=2)
+    light_bytes = _column_uncompressed_bytes(pq, light)["text"]
+    heavy_bytes = _column_uncompressed_bytes(pq, heavy)["text"]
+    assert light_bytes < heavy_bytes
+
+    monkeypatch.setattr(base, "_parquet_max_safe_row_group_bytes", lambda: heavy_bytes)
+    assert ParquetShardedSource([str(light), str(heavy)]).delivers_all_metadata_rows is True
+    monkeypatch.setattr(base, "_parquet_max_safe_row_group_bytes", lambda: heavy_bytes - 1)
+    source = ParquetShardedSource([str(light), str(heavy)])
+    assert source.delivers_all_metadata_rows is False
+    delivered = [r["text"] for name in source.shard_names for r in source.open_shard(name)]
+    assert delivered == ["a", "b"]
+
+
+def test_null_element_inside_list_takes_python_path_not_float64_nan():
+    """A null ELEMENT inside a non-null list survives arr.null_count == 0 (which
+    only counts null lists); pyarrow's to_numpy() on the flattened child then
+    silently upcasts the ENTIRE column chunk to float64 with NaN in place of
+    the null -- every row in the batch, not just the offending one, and a
+    downstream int cast turns the NaN into a garbage token id with no error
+    anywhere. The fast path must detect element-level nulls and route that
+    column through the python materialization instead."""
+    pa = pytest.importorskip("pyarrow")
+    np = pytest.importorskip("numpy")
+
+    table = pa.table(
+        {
+            "input_ids": pa.array([[101, 202, None, 404], [11, 22, 33, 44]], type=pa.list_(pa.int64())),
+            "clean_ids": pa.array([[7, 8], [9, 10]], type=pa.list_(pa.int64())),
+            "label": pa.array([1, 0]),
+        }
+    )
+    rows = list(ParquetShardedSource._table_to_rows(table))
+    assert len(rows) == 2
+
+    # The nulled column keeps exact values with None preserved -- no float64, no NaN.
+    assert rows[0]["input_ids"] == [101, 202, None, 404]
+    assert rows[1]["input_ids"] == [11, 22, 33, 44]
+    assert all(isinstance(v, int) for v in rows[1]["input_ids"])
+
+    # Columns without nulls anywhere keep the numpy fast path.
+    assert isinstance(rows[0]["clean_ids"], np.ndarray)
+    assert rows[0]["clean_ids"].dtype == np.int64
+    np.testing.assert_array_equal(rows[0]["clean_ids"], [7, 8])
+
+
+def test_numpy_path_failure_falls_back_before_first_row_no_duplicates():
+    """All fallible numpy-path work must happen at call time, BEFORE any row is
+    yielded: a failure after k yielded rows would fall back to the python path
+    and re-yield from row 0, silently duplicating the k rows already consumed.
+    Simulated via a table whose second column raises during materialization --
+    the fallback must produce every row exactly once."""
+    pa = pytest.importorskip("pyarrow")
+
+    real = pa.table({"ok": [1, 2, 3], "bad": ["a", "b", "c"]})
+
+    class PoisonedTable:
+        num_rows = real.num_rows
+        column_names = real.column_names
+
+        @staticmethod
+        def column(name):
+            if name == "bad":
+                raise RuntimeError("materialization failure")
+            return real.column(name)
+
+        @staticmethod
+        def to_pydict():
+            return real.to_pydict()
+
+    rows = list(ParquetShardedSource._table_to_rows(PoisonedTable()))
+    assert [r["ok"] for r in rows] == [1, 2, 3], "fallback duplicated or dropped rows"
+    assert [r["bad"] for r in rows] == ["a", "b", "c"]
+
+
+def test_midstream_iteration_failure_propagates_instead_of_duplicating():
+    """The regression this guards: pre-fix, _table_to_rows wrapped the WHOLE
+    numpy-path iteration in try/except, so an exception thrown after k rows
+    were already yielded fell back to the python path and re-yielded from row
+    0 -- duplicating the k consumed rows with no error surfaced. Post-fix,
+    only call-time materialization may fall back; a mid-iteration failure
+    must propagate, never duplicate."""
+    pa = pytest.importorskip("pyarrow")
+
+    real = pa.table({"ok": [1, 2, 3]})
+
+    class BadPylist:
+        def __getitem__(self, i):
+            if i >= 1:
+                raise RuntimeError("row 1 explodes")
+            return "a"
+
+    class BadColumn:
+        type = pa.string()  # not list / not primitive -> routed to the pylist path
+
+        @staticmethod
+        def to_pylist():
+            return BadPylist()
+
+    class MidstreamPoisonedTable:
+        num_rows = real.num_rows
+        column_names = ("ok", "bad")
+
+        @staticmethod
+        def column(name):
+            return BadColumn() if name == "bad" else real.column(name)
+
+        @staticmethod
+        def to_pydict():
+            return {"ok": [1, 2, 3], "bad": ["a", "b", "c"]}
+
+    collected = []
+    with pytest.raises(RuntimeError, match="row 1 explodes"):
+        for row in ParquetShardedSource._table_to_rows(MidstreamPoisonedTable()):
+            collected.append(int(row["ok"]))
+    assert collected == [1], f"rows re-yielded after mid-stream failure: {collected}"

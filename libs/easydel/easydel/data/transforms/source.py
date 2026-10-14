@@ -1,0 +1,818 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Sharded source wrappers.
+
+This module provides:
+- TransformedShardedSource: applies transforms during iteration
+- ShuffledShardedSource: globally shuffles rows via a streaming reservoir
+- LimitedShardedSource: caps the total number of rows exposed by a source
+"""
+
+from __future__ import annotations
+
+import itertools
+import logging
+import random
+import typing as tp
+from collections.abc import Iterator, Sequence
+from dataclasses import replace
+
+from ..core.protocols import ShardedDataSource, ShardInfo
+from .base import ExpandTransform, Transform
+
+logger = logging.getLogger(__name__)
+
+#: Default row-chunk size used when a transform exposes ``map_batch``.
+#: Modest on purpose: large enough to amortize per-call tokenizer overhead
+#: (one batched encode releases the GIL across many rows instead of holding
+#: it per row), small enough that streaming latency and peak row buffering
+#: stay negligible relative to trainer batch sizes.
+DEFAULT_MAP_BATCH_SIZE = 32
+
+
+def transform_preserves_row_count(transform: tp.Any) -> bool:
+    """Report whether a transform emits exactly one output row per input row.
+
+    Only one-in/one-out transforms can reuse upstream row offsets. Batched
+    transforms must explicitly promise one output per input by defining
+    ``preserves_row_count = True`` on their own class body (the opt-in is read
+    from ``type(transform).__dict__`` and is not inherited); an arbitrary
+    ``map_batch`` may filter or expand rows.
+
+    Args:
+        transform: Transform (or arbitrary callable) applied to each row.
+
+    Returns:
+        bool: ``True`` only for non-filter, non-expand :class:`Transform`
+        instances that either have no ``map_batch`` or opted in explicitly.
+    """
+    return (
+        isinstance(transform, Transform)
+        and not transform.is_filter
+        and not transform.is_expand
+        and (
+            not callable(getattr(transform, "map_batch", None))
+            or type(transform).__dict__.get("preserves_row_count", False) is True
+        )
+    )
+
+
+class TransformedShardedSource(ShardedDataSource[dict]):
+    """:class:`ShardedDataSource` wrapper that applies a transform lazily on iteration.
+
+    Pass-through for shard discovery, metadata, and resumption — only
+    iteration is intercepted so the wrapped source's distributed/
+    checkpointable properties survive. Distinguishes the transform
+    shapes at call time: regular :class:`Transform` instances
+    have their single result forwarded (or dropped on ``None``), while
+    :class:`ExpandTransform` instances have every yielded item
+    forwarded individually so a 1-to-many transform integrates
+    transparently.
+
+    Transforms exposing a ``map_batch`` method (the trainer preprocess
+    transforms, e.g.
+    :class:`~easydel.trainers.prompt_transforms.SFTPreprocessTransform`)
+    are routed through it in small row chunks instead of per row: up to
+    ``map_batch_size`` rows are buffered and handed to ``map_batch`` in a
+    single call, so expensive per-row work such as tokenization is batched.
+    Row order and ``None``-filtering semantics are identical to the
+    per-row path.
+
+    Built by :meth:`ShardedDataSource.transform` /
+    :meth:`ShardedDataSource.filter` and friends.
+
+    Example:
+        >>> source = JsonShardedSource("data.jsonl")
+        >>> transform = RenameFields({"old": "new"}) >> FilterNonEmpty(["new"])
+        >>> transformed = TransformedShardedSource(source, transform)
+        >>> for example in transformed.iter_shards():
+        ...     process(example)
+    """
+
+    def __init__(
+        self,
+        source: ShardedDataSource[dict],
+        transform: Transform | ExpandTransform,
+        map_batch_size: int | None = None,
+    ):
+        """Capture the underlying source and the transform to apply on iteration.
+
+        Args:
+            source: Wrapped :class:`ShardedDataSource`. All
+                shard-discovery and metadata calls are forwarded to
+                it unchanged.
+            transform: Either a :class:`Transform` (one-in / one-out
+                or filter) or an :class:`ExpandTransform` (one-in /
+                many-out). The shape is detected at iteration time
+                via ``isinstance``.
+            map_batch_size: Row-chunk size used when ``transform``
+                exposes a ``map_batch`` method. Defaults to
+                :data:`DEFAULT_MAP_BATCH_SIZE`; ignored for per-row
+                transforms.
+        """
+        self._source = source
+        self._transform = transform
+        self._map_batch_size = DEFAULT_MAP_BATCH_SIZE if map_batch_size is None else max(int(map_batch_size), 1)
+        # Only one-in/one-out transforms can preserve upstream row offsets.
+        # Batched transforms must explicitly promise one output for every input;
+        # an arbitrary map_batch implementation may filter or expand rows.
+        self._preserves_row_count = transform_preserves_row_count(transform)
+
+    def _iter_transformed(self, rows: Iterator[dict]) -> Iterator[dict]:
+        """Apply the transform to a row stream, batching when supported.
+
+        :class:`ExpandTransform` instances yield per input row; transforms
+        with a ``map_batch`` method receive rows in chunks of
+        ``map_batch_size`` (order-preserving, ``None`` results dropped —
+        the same contract as the per-row path); everything else is applied
+        one row at a time.
+
+        Args:
+            rows: Underlying source row iterator.
+
+        Yields:
+            Transformed examples (filtered examples are skipped).
+        """
+        transform = self._transform
+        if isinstance(transform, ExpandTransform):
+            # ExpandTransform: yields multiple examples per input row
+            for example in rows:
+                yield from transform(example)
+            return
+
+        map_batch = getattr(transform, "map_batch", None)
+        if callable(map_batch):
+            # Batched fast path: one map_batch call per row chunk so the
+            # transform can batch tokenizer work instead of encoding per row.
+            chunk: list[dict] = []
+            for example in rows:
+                chunk.append(example)
+                if len(chunk) >= self._map_batch_size:
+                    for result in map_batch(chunk):
+                        if result is not None:
+                            yield result
+                    chunk = []
+            if chunk:
+                for result in map_batch(chunk):
+                    if result is not None:
+                        yield result
+            return
+
+        # Regular Transform: yields single example or None
+        for example in rows:
+            result = transform(example)
+            if result is not None:  # Handle filter transforms
+                yield result
+
+    @property
+    def shard_names(self) -> Sequence[str]:
+        """Return shard names from the underlying source.
+
+        Returns:
+            Pass-through of ``self._source.shard_names``.
+        """
+        return self._source.shard_names
+
+    def num_shards(self) -> int:
+        """Return the number of shards from the underlying source.
+
+        Returns:
+            Pass-through of ``self._source.num_shards()``.
+        """
+        return self._source.num_shards()
+
+    def open_shard(self, shard_name: str) -> Iterator[dict]:
+        """Open a shard and apply transforms during iteration.
+
+        Args:
+            shard_name: Name of the shard to open.
+
+        Yields:
+            Transformed examples (filtered examples are skipped).
+        """
+        return self._iter_transformed(self._source.open_shard(shard_name))
+
+    def open_shard_at_row(self, shard_name: str, row: int) -> Iterator[dict]:
+        """Open a shard at a specific row and apply transforms.
+
+        Row counting follows delivered output examples. Cardinality-changing
+        transforms replay and skip the transformed stream. One-in/one-out
+        transforms use upstream seek; batched transforms start at the original
+        batch boundary so output also matches uninterrupted iteration.
+
+        Args:
+            shard_name: Name of the shard to open.
+            row: Row number to start from.
+
+        Yields:
+            Transformed examples (filtered examples are skipped).
+        """
+        row = max(int(row), 0)
+        if not self._preserves_row_count:
+            return itertools.islice(self.open_shard(shard_name), row, None)
+        if callable(getattr(self._transform, "map_batch", None)):
+            # Even a one-to-one batch map can depend on its other inputs (e.g.
+            # longest-row padding). Keep the same chunk boundaries as a fresh
+            # open_shard so resuming never changes the contents of a row.
+            aligned_row = (row // self._map_batch_size) * self._map_batch_size
+            transformed = self._iter_transformed(self._source.open_shard_at_row(shard_name, aligned_row))
+            return itertools.islice(transformed, row - aligned_row, None)
+        return self._iter_transformed(self._source.open_shard_at_row(shard_name, row))
+
+    @property
+    def delivers_all_metadata_rows(self) -> bool:
+        """Whether both the transform and upstream preserve metadata row counts.
+
+        Returns:
+            bool: ``False`` for filtering/expanding transforms or inexact upstreams.
+        """
+        return self._preserves_row_count and self._source.delivers_all_metadata_rows
+
+    def get_shard_info(self, shard_name: str) -> tp.Any:
+        """Pass through ``ShardInfo`` from the underlying source.
+
+        Args:
+            shard_name: Shard identifier to look up.
+
+        Returns:
+            ``ShardInfo`` for the shard, or whatever the underlying
+            source returns (potentially ``None``).
+        """
+        return self._source.get_shard_info(shard_name)
+
+    def __len__(self) -> int:
+        """Return length of the underlying source.
+
+        Warning:
+            May overcount when filter transforms are applied.
+
+        Returns:
+            ``len(self._source)``.
+        """
+        return len(self._source)
+
+    def __repr__(self) -> str:
+        """Return a developer-friendly representation.
+
+        Returns:
+            ``"TransformedShardedSource(<source>, <transform>)"``.
+        """
+        return f"TransformedShardedSource({self._source!r}, {self._transform!r})"
+
+
+class ShuffledShardedSource(ShardedDataSource[dict]):
+    """:class:`ShardedDataSource` wrapper that globally shuffles rows via a streaming reservoir.
+
+    Collapses the wrapped source into a single synthetic shard whose
+    iterator chains every underlying shard (optionally visiting the
+    shards in a shuffled order) and then draws rows through a
+    fixed-size reservoir, so the emitted order is decorrelated from the
+    on-disk / mix order. This is what turns a *mixed* stream — e.g.
+    :class:`~easydel.data.transforms.mixture.MixedShardedSource`, which
+    interleaves sources block-by-block but keeps each source's rows in
+    file order — into a genuinely *shuffled* one.
+
+    Place it **before** a tokenizing transform so the reservoir holds
+    small raw rows rather than padded token arrays: memory is bounded
+    by ``buffer_size`` rows, and a larger buffer gives a stronger
+    shuffle.
+
+    The reservoir is driven by a local RNG seeded from ``seed`` and
+    re-created on every iteration, so iteration order is deterministic
+    for a given seed. Checkpoint resume that re-creates the iterator
+    and fast-forwards by N batches therefore replays the identical
+    ordering. An infinite upstream (a mix with
+    ``stop_strategy="restart"``) streams forever; a finite upstream
+    drains the reservoir once exhausted.
+
+    Example:
+        >>> mixed = MixedShardedSource(sources, weights=weights)
+        >>> shuffled = ShuffledShardedSource(mixed, buffer_size=10_000, seed=42)
+        >>> for example in shuffled.open_shard(shuffled.shard_names[0]):
+        ...     train(example)
+    """
+
+    def __init__(
+        self,
+        source: ShardedDataSource[dict],
+        buffer_size: int = 1000,
+        seed: int | None = None,
+        shuffle_shards: bool = True,
+    ):
+        """Capture the wrapped source and the reservoir configuration.
+
+        Args:
+            source: Wrapped :class:`ShardedDataSource`. Its shards are
+                chained into a single synthetic shard for shuffling.
+            buffer_size: Number of rows held in the reservoir at once.
+                Trades memory for shuffle quality; must be ``>= 1``.
+            seed: Seed for the local RNG governing shard-order and
+                reservoir randomness. ``None`` is non-deterministic.
+            shuffle_shards: When ``True`` (and the source has more than
+                one shard), visit the underlying shards in a shuffled
+                order before reservoir-shuffling their rows.
+
+        Raises:
+            ValueError: If ``buffer_size`` is less than ``1``.
+        """
+        if buffer_size < 1:
+            raise ValueError(f"buffer_size must be >= 1, got {buffer_size}")
+        self._source = source
+        self._buffer_size = int(buffer_size)
+        self._seed = seed
+        self._shuffle_shards = shuffle_shards
+
+    @property
+    def shard_names(self) -> Sequence[str]:
+        """Return the single synthetic shard name for the shuffled view.
+
+        Returns:
+            One-element list ``["shuffled_shard_0"]``.
+        """
+        return ["shuffled_shard_0"]
+
+    def num_shards(self) -> int:
+        """Return the constant shard count of one.
+
+        Returns:
+            Always ``1``.
+        """
+        return 1
+
+    def _ordered_shard_names(self, rng: random.Random) -> list[str]:
+        """Return the deterministic shard visitation order for one iteration."""
+        shard_names = list(self._source.shard_names)
+        if self._shuffle_shards and len(shard_names) > 1:
+            rng.shuffle(shard_names)
+        return shard_names
+
+    def _underlying_stream_from_order(self, shard_names: Sequence[str]) -> Iterator[dict]:
+        """Chain underlying shards in a precomputed order."""
+        for shard_name in shard_names:
+            yield from self._source.open_shard(shard_name)
+
+    def _underlying_stream_at_row(self, shard_names: Sequence[str], row: int) -> Iterator[dict]:
+        """Chain underlying shards from a global row offset."""
+        row = max(int(row), 0)
+        if row == 0:
+            yield from self._underlying_stream_from_order(shard_names)
+            return
+
+        if len(shard_names) == 1:
+            yield from self._source.open_shard_at_row(shard_names[0], row)
+            return
+
+        if not self._source.delivers_all_metadata_rows:
+            # Shard boundaries below are derived from num_rows metadata; a source
+            # whose iteration may deliver fewer rows (e.g. the parquet decode-memory
+            # guard skipping oversized row groups) would leave the seek misaligned.
+            logger.warning(
+                "Cannot seek shuffled source through %s by row metadata because its iteration may "
+                "deliver fewer rows than num_rows; falling back to sequential skip of %d rows.",
+                type(self._source).__name__,
+                row,
+            )
+            yield from itertools.islice(self._underlying_stream_from_order(shard_names), row, None)
+            return
+
+        rows_by_shard: list[tuple[str, int]] = []
+        for shard_name in shard_names:
+            try:
+                info = self._source.get_shard_info(shard_name)
+            except Exception:
+                info = None
+            if info is None or info.num_rows is None:
+                logger.warning(
+                    "Cannot seek shuffled source through %s because shard %r has no row metadata; "
+                    "falling back to sequential skip of %d rows.",
+                    type(self._source).__name__,
+                    shard_name,
+                    row,
+                )
+                yield from itertools.islice(self._underlying_stream_from_order(shard_names), row, None)
+                return
+            rows_by_shard.append((shard_name, int(info.num_rows)))
+
+        remaining = row
+        started = False
+        for shard_name, rows in rows_by_shard:
+            if not started:
+                if remaining >= rows:
+                    remaining -= rows
+                    continue
+                yield from self._source.open_shard_at_row(shard_name, remaining)
+                started = True
+                continue
+            yield from self._source.open_shard(shard_name)
+
+    def _underlying_rows_at_positions(self, shard_names: Sequence[str], positions: Sequence[int]) -> dict[int, dict]:
+        """Fetch selected underlying stream rows by absolute position."""
+        unique_positions = sorted(set(int(position) for position in positions))
+        if not unique_positions:
+            return {}
+
+        span = unique_positions[-1] - unique_positions[0] + 1
+        max_sequential_span = max(self._buffer_size * 64, 8192)
+        rows_by_position: dict[int, dict] = {}
+        if span <= max_sequential_span:
+            wanted = set(unique_positions)
+            stream = self._underlying_stream_at_row(shard_names, unique_positions[0])
+            for position in range(unique_positions[0], unique_positions[-1] + 1):
+                item = next(stream)
+                if position in wanted:
+                    rows_by_position[position] = item
+            return rows_by_position
+
+        for position in unique_positions:
+            rows_by_position[position] = next(self._underlying_stream_at_row(shard_names, position))
+        return rows_by_position
+
+    def _underlying_stream(self, rng: random.Random) -> Iterator[dict]:
+        """Chain every underlying shard into one stream, optionally shuffling shard order.
+
+        Args:
+            rng: RNG used to shuffle the shard visitation order.
+
+        Yields:
+            dict: Rows from the wrapped source in (optionally
+            shard-shuffled) concatenation order, before the reservoir
+            is applied.
+        """
+        yield from self._underlying_stream_from_order(self._ordered_shard_names(rng))
+
+    def _shuffled_iter(self, skip: int = 0) -> Iterator[dict]:
+        """Reservoir-shuffle the chained upstream, dropping the first ``skip`` emitted rows.
+
+        Fills a reservoir of ``buffer_size`` rows, then for each new
+        row evicts a random slot (yielding the evicted row). When the
+        upstream is exhausted the reservoir is shuffled and drained.
+        ``skip`` discards the first ``skip`` *emitted* rows for resume;
+        because the RNG is reseeded identically, the emitted order
+        matches :meth:`open_shard` exactly.
+
+        Args:
+            skip: Number of leading emitted rows to drop (resume offset).
+
+        Yields:
+            dict: Rows in pseudo-random order.
+        """
+        rng = random.Random(self._seed)
+        buffer: list[dict] = []
+        emitted = 0
+        for item in self._underlying_stream(rng):
+            if len(buffer) < self._buffer_size:
+                buffer.append(item)
+                continue
+            idx = rng.randrange(self._buffer_size)
+            out = buffer[idx]
+            buffer[idx] = item
+            if emitted >= skip:
+                yield out
+            emitted += 1
+        rng.shuffle(buffer)
+        for out in buffer:
+            if emitted >= skip:
+                yield out
+            emitted += 1
+
+    def _shuffled_iter_at_row(self, row: int) -> Iterator[dict]:
+        """Resume reservoir shuffle at an emitted-row offset without replaying all rows."""
+        row = max(int(row), 0)
+        if row == 0:
+            yield from self._shuffled_iter(skip=0)
+            return
+
+        rng = random.Random(self._seed)
+        shard_names = self._ordered_shard_names(rng)
+        slot_positions = list(range(self._buffer_size))
+        for emitted in range(row):
+            idx = rng.randrange(self._buffer_size)
+            slot_positions[idx] = self._buffer_size + emitted
+
+        try:
+            rows_by_position = self._underlying_rows_at_positions(shard_names, slot_positions)
+            buffer = [rows_by_position[position] for position in slot_positions]
+            upstream = self._underlying_stream_at_row(shard_names, self._buffer_size + row)
+        except (KeyError, StopIteration, IndexError) as exc:
+            logger.warning(
+                "Could not reconstruct shuffled resume state at row %d (%s); falling back to sequential skip.",
+                row,
+                type(exc).__name__,
+            )
+            yield from self._shuffled_iter(skip=row)
+            return
+
+        for item in upstream:
+            idx = rng.randrange(self._buffer_size)
+            out = buffer[idx]
+            buffer[idx] = item
+            yield out
+
+        rng.shuffle(buffer)
+        yield from buffer
+
+    def open_shard(self, _shard_name: str) -> Iterator[dict]:
+        """Open the synthetic shard and stream reservoir-shuffled rows.
+
+        Args:
+            _shard_name: Ignored — only one synthetic shard exists.
+
+        Returns:
+            Iterator[dict]: Rows in pseudo-random order.
+        """
+        return self._shuffled_iter(skip=0)
+
+    def open_shard_at_row(self, _shard_name: str, row: int) -> Iterator[dict]:
+        """Resume the synthetic shard after ``row`` already-emitted rows.
+
+        Args:
+            _shard_name: Ignored — only one synthetic shard exists.
+            row: Number of leading emitted rows to skip.
+
+        Returns:
+            Iterator[dict]: Rows in pseudo-random order, starting after
+            ``row`` items.
+        """
+        return self._shuffled_iter_at_row(row)
+
+    def get_shard_info(self, shard_name: str) -> tp.Any:
+        """Synthetic shards carry no metadata.
+
+        Args:
+            shard_name: Ignored.
+
+        Returns:
+            Always ``None``.
+        """
+        return None
+
+    def __len__(self) -> int:
+        """Return the wrapped source length when it is known.
+
+        Returns:
+            ``len(self._source)``.
+
+        Raises:
+            TypeError: If the underlying source has no length (streaming).
+        """
+        return len(self._source)
+
+    def __repr__(self) -> str:
+        """Return a developer-friendly representation.
+
+        Returns:
+            ``"ShuffledShardedSource(<source>, buffer_size=N)"``.
+        """
+        return f"ShuffledShardedSource({self._source!r}, buffer_size={self._buffer_size})"
+
+
+class LimitedShardedSource(ShardedDataSource[dict]):
+    """ShardedDataSource wrapper that exposes at most ``max_rows`` examples.
+
+    The limit is applied across shards in order. When shard metadata includes
+    row counts, those are used directly. Otherwise prior shards are counted only
+    when later shard access makes that necessary, and counting stops as soon as
+    the global row budget is exhausted.
+
+    Note: This class is **not** thread-safe. Shard resolution mutates internal
+    state and must be driven from a single thread.
+    """
+
+    def __init__(self, source: ShardedDataSource[dict], max_rows: int):
+        """Initialize a ``LimitedShardedSource`` wrapper.
+
+        Args:
+            source: Underlying data source whose iteration is bounded.
+            max_rows: Maximum total number of rows to expose across all
+                shards (clamped to ``>= 0``).
+        """
+        self._source = source
+        self._max_rows = max(int(max_rows), 0)
+        self._shard_names = tuple(source.shard_names)
+        self._shard_name_to_index = {name: idx for idx, name in enumerate(self._shard_names)}
+        self._exact_shard_sizes: dict[str, int] = {}
+        self._resolved_prefix_rows: dict[str, int] = {}
+        self._resolved_prefix_count = 0
+        self._remaining_before_index = [self._max_rows]
+
+    def _count_shard_rows_up_to(self, shard_name: str, limit: int) -> int:
+        """Count rows in ``shard_name``, stopping early once ``limit`` is exceeded.
+
+        Args:
+            shard_name: Shard whose rows are counted.
+            limit: Maximum number of rows to count exactly.
+
+        Returns:
+            Exact row count when the shard has ``<= limit`` rows,
+            or ``limit + 1`` as a sentinel meaning "at least ``limit + 1``
+            rows" (avoids iterating the entire shard when we only need
+            to know it exceeds the budget).
+        """
+        if limit <= 0:
+            return 0
+        count = 0
+        for _ in self._source.open_shard(shard_name):
+            count += 1
+            if count > limit:
+                return count
+        return count
+
+    def _get_known_shard_size(self, shard_name: str) -> int | None:
+        """Return the cached or metadata-reported row count for a shard.
+
+        Args:
+            shard_name: Shard identifier.
+
+        Returns:
+            Exact row count when known, otherwise ``None``.
+        """
+        if shard_name in self._exact_shard_sizes:
+            return self._exact_shard_sizes[shard_name]
+        if not self._source.delivers_all_metadata_rows:
+            # Physical Parquet rows (or rows before a filter) cannot debit a
+            # delivered-row limit; let _resolve_prefix_until count the stream.
+            return None
+        info = self._source.get_shard_info(shard_name)
+        if info is None or info.num_rows is None:
+            return None
+        size = int(info.num_rows)
+        self._exact_shard_sizes[shard_name] = size
+        return size
+
+    def _resolve_prefix_until(self, shard_index: int) -> None:
+        """Compute exposed row counts for shards ``[0, shard_index)``.
+
+        Walks earlier shards in order, consulting metadata or counting
+        rows when necessary, and updates ``_remaining_before_index`` so
+        later lookups can be answered cheaply.
+
+        Args:
+            shard_index: Stop after resolving the prefix up to (but not
+                including) this index.
+        """
+        target = min(max(shard_index, 0), len(self._shard_names))
+        while self._resolved_prefix_count < target:
+            shard_name = self._shard_names[self._resolved_prefix_count]
+            remaining = self._remaining_before_index[-1]
+            exposed_rows = 0
+            if remaining > 0:
+                shard_rows = self._get_known_shard_size(shard_name)
+                if shard_rows is None:
+                    counted_rows = self._count_shard_rows_up_to(shard_name, remaining)
+                    if counted_rows <= remaining:
+                        shard_rows = counted_rows
+                        self._exact_shard_sizes[shard_name] = shard_rows
+                        exposed_rows = shard_rows
+                    else:
+                        exposed_rows = remaining
+                else:
+                    exposed_rows = min(shard_rows, remaining)
+            self._resolved_prefix_rows[shard_name] = exposed_rows
+            self._resolved_prefix_count += 1
+            self._remaining_before_index.append(max(0, remaining - exposed_rows))
+
+    def _get_shard_limit(self, shard_name: str) -> int:
+        """Compute the maximum rows exposable for a single shard.
+
+        Args:
+            shard_name: Shard identifier.
+
+        Returns:
+            Number of rows allowed from this shard, accounting for the
+            global ``max_rows`` budget consumed by earlier shards.
+        """
+        shard_index = self._shard_name_to_index[shard_name]
+        self._resolve_prefix_until(shard_index)
+        remaining = self._remaining_before_index[shard_index]
+        if remaining <= 0:
+            return 0
+        if shard_name in self._resolved_prefix_rows:
+            return self._resolved_prefix_rows[shard_name]
+        shard_rows = self._get_known_shard_size(shard_name)
+        if shard_rows is None:
+            return remaining
+        return min(shard_rows, remaining)
+
+    @property
+    def shard_names(self) -> Sequence[str]:
+        """Return the underlying source's shard names verbatim.
+
+        Returns:
+            Tuple of shard identifiers captured at construction time.
+        """
+        return self._shard_names
+
+    def num_shards(self) -> int:
+        """Return the number of shards exposed by this source.
+
+        Returns:
+            Length of the captured shard-name list.
+        """
+        return len(self._shard_names)
+
+    def open_shard(self, shard_name: str) -> Iterator[dict]:
+        """Open a shard, capping iteration at this shard's row budget.
+
+        Args:
+            shard_name: Shard identifier.
+
+        Returns:
+            Iterator yielding at most ``_get_shard_limit(shard_name)``
+            rows.
+        """
+        return itertools.islice(self._source.open_shard(shard_name), self._get_shard_limit(shard_name))
+
+    def open_shard_at_row(self, shard_name: str, row: int) -> Iterator[dict]:
+        """Open a shard at ``row`` while respecting the row budget.
+
+        Args:
+            shard_name: Shard identifier.
+            row: Row offset within the shard.
+
+        Returns:
+            Iterator yielding remaining rows from ``row`` up to the
+            shard's exposed limit; an empty iterator when ``row`` is
+            already past the limit.
+        """
+        shard_limit = self._get_shard_limit(shard_name)
+        if row >= shard_limit:
+            return iter(())
+        return itertools.islice(self._source.open_shard_at_row(shard_name, row), shard_limit - row)
+
+    @property
+    def delivers_all_metadata_rows(self) -> bool:
+        """Forwarded: row budgets derive from the wrapped source's metadata.
+
+        Returns:
+            bool: The wrapped source's flag.
+        """
+        return self._source.delivers_all_metadata_rows
+
+    def get_shard_info(self, shard_name: str) -> ShardInfo | None:
+        """Return shard metadata adjusted for this source's row budget.
+
+        Args:
+            shard_name: Shard identifier.
+
+        Returns:
+            ``ShardInfo`` whose ``num_rows`` reflects the truncated
+            count, falling back to a plain ``ShardInfo`` if the
+            underlying source provides no metadata.
+        """
+        shard_index = self._shard_name_to_index[shard_name]
+        self._resolve_prefix_until(shard_index)
+        base_info = self._source.get_shard_info(shard_name)
+        remaining = self._remaining_before_index[shard_index]
+        if remaining <= 0:
+            shard_limit: int | None = 0
+        elif shard_name in self._resolved_prefix_rows:
+            shard_limit = self._resolved_prefix_rows[shard_name]
+        else:
+            shard_rows = self._get_known_shard_size(shard_name)
+            shard_limit = None if shard_rows is None else min(shard_rows, remaining)
+        if base_info is None:
+            return ShardInfo(
+                shard_id=shard_index,
+                shard_name=shard_name,
+                num_rows=shard_limit,
+            )
+        try:
+            return replace(base_info, num_rows=shard_limit)
+        except TypeError:
+            return ShardInfo(
+                shard_id=getattr(base_info, "shard_id", shard_index),
+                shard_name=getattr(base_info, "shard_name", shard_name),
+                num_rows=shard_limit,
+                byte_size=getattr(base_info, "byte_size", None),
+                url=getattr(base_info, "url", None),
+                checksum=getattr(base_info, "checksum", None),
+            )
+
+    def __len__(self) -> int:
+        """Return the actual number of rows this wrapper will yield.
+
+        Returns:
+            ``min(max_rows, total source rows)``.
+        """
+        self._resolve_prefix_until(len(self._shard_names))
+        return self._max_rows - self._remaining_before_index[-1]
+
+    def __repr__(self) -> str:
+        """Return a developer-friendly representation.
+
+        Returns:
+            ``"LimitedShardedSource(<source>, max_rows=N)"``.
+        """
+        return f"LimitedShardedSource({self._source!r}, max_rows={self._max_rows})"

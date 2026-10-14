@@ -1,0 +1,1301 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Hybrid cache implementation for models with mixed attention types.
+
+This module provides caching for hybrid transformer models that combine
+different attention mechanisms, such as Qwen3Next which uses:
+- Full attention layers: Standard multi-head attention (needs KV cache)
+- Linear attention layers: GatedDeltaNet (needs conv state + recurrent state)
+
+The hybrid cache provides a unified interface for both cache types,
+automatically routing operations to the appropriate state storage
+based on the layer's attention type.
+
+Key Features:
+- Per-layer attention type configuration
+- KV cache for full attention layers
+- Conv state + recurrent state for linear attention layers
+- Functional updates for JAX compatibility
+- Memory-efficient storage (only allocates what each layer needs)
+
+Architecture:
+    HybridCacheConfig
+    ├── Configuration for all layers
+    ├── Layer type mapping (full_attention vs linear_attention)
+    └── Dimensions for both KV and recurrent state
+
+    HybridCacheView
+    ├── KV states (for full_attention)
+    │   ├── key: [batch, seq, num_kv_heads, head_dim]
+    │   └── value: [batch, seq, num_kv_heads, head_dim]
+    └── Recurrent states (for linear_attention)
+        ├── conv_state: [batch, d_inner, d_conv]
+        └── recurrent_state: [batch, num_heads, head_dim, d_state]
+
+Example:
+    >>> # Create metadata with layer types
+    >>> layer_types = tuple(
+    ...     "full_attention" if (i + 1) % 4 == 0 else "linear_attention"
+    ...     for i in range(48)
+    ... )
+    >>> metadata = HybridCacheConfig.create(
+    ...     num_hidden_layers=48,
+    ...     partition_axis=PartitionAxis(),
+    ...     batch_size=2,
+    ...     sequence_length=2048,
+    ...     num_key_value_heads=8,
+    ...     head_dim=128,
+    ...     d_inner=2048,
+    ...     d_conv=4,
+    ...     d_state=64,
+    ...     layer_types=layer_types,
+    ... )
+    >>> cache = HybridCache.init_cache(metadata, dtype=jnp.bfloat16)
+"""
+
+from __future__ import annotations
+
+import typing as tp
+
+from eformer.jaximus import ImplicitArray
+from eformer.pytree import auto_pytree, field, xTree
+from jax import lax
+from jax import numpy as jnp
+from jax.sharding import PartitionSpec
+from jaxtyping import Array, Float, Int
+from spectrax import PartitionAxis, with_sharding_constraint
+
+from easydel.utils.helpers import check_bool_flag
+
+from .._abstracts import BaseCache, BaseCacheConfig, BaseCacheView, BaseRunTimeMetadata
+
+if tp.TYPE_CHECKING:
+
+    from ..kda.cache import KDACacheView
+    from ..ragged_page.cache import RaggedPagesCacheView
+    from ..recurrent.cache import RecurrentCacheView
+    from ..transformer.cache import TransformerCacheView
+    from ..unified_attention.cache import UnifiedAttentionCacheView
+else:
+    # AutoPytree need these informations for optimizations
+    KDACacheView, RecurrentCacheView, TransformerCacheView, RaggedPagesCacheView, UnifiedAttentionCacheView = [xTree] * 5
+HYBRID = "hybrid"
+FULL_ATTENTION = "full_attention"
+LINEAR_ATTENTION = "linear_attention"
+KDA_LINEAR_ATTENTION = "kda_linear_attention"
+PARALLEL_HYBRID = "parallel_hybrid"
+LayerType = tp.Literal["full_attention", "linear_attention", "kda_linear_attention", "parallel_hybrid", "hybrid"]
+
+
+def _linear_recurrent_state_dtype(cache_dtype: jnp.dtype) -> jnp.dtype:
+    """Return storage dtype for GDN/KDA recurrent state.
+
+    the TPU serving path stores convolution state in the cache dtype but keeps the
+    recurrent GDN matrix in fp32. EasyDeL's GDN kernels also run the recurrent
+    math in fp32; storing the row in fp32 avoids a full bf16->fp32 cast of the
+    state pool on every decode step.
+    """
+    if check_bool_flag("EASYDEL_HYBRID_RECURRENT_FLOAT32", True):
+        return jnp.float32
+    return cache_dtype
+
+
+@auto_pytree
+class HybridCacheConfig(BaseCacheConfig):
+    """Metadata for hybrid cache configuration.
+
+    Stores static configuration for hybrid attention model caching, supporting
+    both standard KV caching (for full attention layers) and recurrent state
+    caching (for linear attention layers like GatedDeltaNet).
+
+    The metadata defines dimensions for both cache types, with storage
+    allocated per-layer based on the layer_types configuration.
+
+    Attributes:
+        num_hidden_layers (int): Number of transformer layers in the model.
+        partition_axis (PartitionAxis): Configuration for tensor partitioning.
+        batch_size (int): Number of sequences in batch.
+        sequence_length (int): Maximum sequence length for KV cache.
+        num_key_value_heads (int): Number of KV heads for full attention.
+        head_dim (int): Dimension of each attention head.
+        d_inner (int): Intermediate dimension for linear attention.
+        d_conv (int): Convolution kernel size for linear attention.
+        d_state (int): Recurrent state dimension for linear attention.
+        num_attention_heads (int): Number of attention heads used to shape
+            the recurrent state for linear / KDA / parallel-hybrid layers.
+            Defaults to ``num_key_value_heads`` when not specified.
+        layer_types (tuple[str, ...]): Per-layer attention type. Each entry
+            is one of ``FULL_ATTENTION``, ``LINEAR_ATTENTION``,
+            ``KDA_LINEAR_ATTENTION``, ``PARALLEL_HYBRID``, or ``HYBRID``
+            (the latter is normalized to ``PARALLEL_HYBRID``).
+    """
+
+    num_hidden_layers: int = field(pytree_node=False)
+    partition_axis: PartitionAxis = field(pytree_node=False)
+    batch_size: int = field(pytree_node=False)
+    sequence_length: int = field(pytree_node=False)
+
+    # KV cache params (for full_attention layers)
+    num_key_value_heads: int = field(pytree_node=False)
+    head_dim: int = field(pytree_node=False)
+
+    # Recurrent state params (for linear_attention layers)
+    d_inner: int = field(pytree_node=False)
+    d_conv: int = field(pytree_node=False)
+    d_state: int = field(pytree_node=False)
+    num_attention_heads: int = field(pytree_node=False)
+
+    layer_types: tuple[str, ...] = field(pytree_node=False)
+
+    @classmethod
+    def create(
+        cls,
+        num_hidden_layers: int,
+        partition_axis: PartitionAxis,
+        batch_size: int,
+        sequence_length: int,
+        num_key_value_heads: int,
+        head_dim: int,
+        d_inner: int,
+        d_conv: int,
+        d_state: int,
+        layer_types: tuple[str, ...] | list[str],
+        num_attention_heads: int | None = None,
+    ) -> "HybridCacheConfig":
+        """Create a HybridCacheConfig instance with validation.
+
+        Args:
+            num_hidden_layers: Number of transformer layers.
+            partition_axis: Partition axis configuration.
+            batch_size: Batch size.
+            sequence_length: Maximum sequence length for KV cache.
+            num_key_value_heads: Number of KV heads for full attention.
+            head_dim: Dimension of each attention head.
+            d_inner: Intermediate dimension for linear attention.
+            d_conv: Convolution kernel size for linear attention.
+            d_state: Recurrent state dimension for linear attention.
+            layer_types: Per-layer attention type ("full_attention" or "linear_attention").
+            num_attention_heads: Number of attention heads (defaults to num_key_value_heads).
+
+        Returns:
+            HybridCacheConfig instance.
+
+        Raises:
+            ValueError: If parameters are invalid.
+        """
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if sequence_length <= 0:
+            raise ValueError("sequence_length must be positive")
+        if num_key_value_heads <= 0:
+            raise ValueError("num_key_value_heads must be positive")
+        if head_dim <= 0:
+            raise ValueError("head_dim must be positive")
+        if d_inner <= 0:
+            raise ValueError("d_inner must be positive")
+        if d_conv <= 0:
+            raise ValueError("d_conv must be positive")
+        if d_state <= 0:
+            raise ValueError("d_state must be positive")
+        if len(layer_types) != num_hidden_layers:
+            raise ValueError(
+                f"layer_types length ({len(layer_types)}) must match num_hidden_layers ({num_hidden_layers})"
+            )
+
+        normalized_layer_types = [PARALLEL_HYBRID if lt == HYBRID else lt for lt in layer_types]
+
+        valid_types = {FULL_ATTENTION, LINEAR_ATTENTION, KDA_LINEAR_ATTENTION, PARALLEL_HYBRID, HYBRID}
+        for i, lt in enumerate(layer_types):
+            if lt not in valid_types:
+                raise ValueError(f"Invalid layer_type at index {i}: {lt}. Must be one of {valid_types}")
+
+        if num_attention_heads is None:
+            num_attention_heads = num_key_value_heads
+
+        return cls(
+            num_hidden_layers=num_hidden_layers,
+            partition_axis=partition_axis,
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+            num_key_value_heads=num_key_value_heads,
+            head_dim=head_dim,
+            d_inner=d_inner,
+            d_conv=d_conv,
+            d_state=d_state,
+            num_attention_heads=num_attention_heads,
+            layer_types=tuple(normalized_layer_types),
+        )
+
+    def is_full_attention(self, layer_idx: int) -> bool:
+        """Check if a layer uses full attention.
+
+        Args:
+            layer_idx: Index of the layer to inspect.
+
+        Returns:
+            ``True`` when the layer is configured for ``FULL_ATTENTION``.
+        """
+        return self.layer_types[layer_idx] == FULL_ATTENTION
+
+    def is_linear_attention(self, layer_idx: int) -> bool:
+        """Check if a layer uses linear attention (GatedDeltaNet).
+
+        Args:
+            layer_idx: Index of the layer to inspect.
+
+        Returns:
+            ``True`` when the layer is configured for ``LINEAR_ATTENTION``.
+        """
+        return self.layer_types[layer_idx] == LINEAR_ATTENTION
+
+    def is_kda_attention(self, layer_idx: int) -> bool:
+        """Check if a layer uses KDA linear attention (Kimi Linear).
+
+        Args:
+            layer_idx: Index of the layer to inspect.
+
+        Returns:
+            ``True`` when the layer is configured for ``KDA_LINEAR_ATTENTION``.
+        """
+        return self.layer_types[layer_idx] == KDA_LINEAR_ATTENTION
+
+    def is_parallel_hybrid(self, layer_idx: int) -> bool:
+        """Check if a layer uses parallel hybrid (attention + SSM in parallel).
+
+        Args:
+            layer_idx: Index of the layer to inspect.
+
+        Returns:
+            ``True`` when the layer is configured for ``PARALLEL_HYBRID``.
+        """
+        return self.layer_types[layer_idx] == PARALLEL_HYBRID
+
+
+@auto_pytree
+class HybridCacheView(BaseCacheView):
+    """Single-layer cache view for hybrid attention models.
+
+    Manages cache state for one layer, supporting any of:
+
+    * KV cache (for ``full_attention`` layers)
+    * Combined conv + recurrent state (for ``linear_attention`` /
+      GatedDeltaNet layers)
+    * Separate Q/K/V conv + recurrent state (for ``kda_linear_attention``
+      Kimi Linear layers)
+    * Both KV cache and recurrent state in parallel (for
+      ``parallel_hybrid`` layers, e.g. FalconH1)
+
+    The view stores only the state tensors needed for its layer type, with
+    the other fields left as ``None`` to keep the per-layer memory budget
+    tight. ``concatenate_to_cache`` dispatches on ``layer_type`` so callers
+    can use one cache view regardless of the underlying attention variant.
+
+    Attributes:
+        key (Array | None): Key cache for full attention.
+            Shape: ``[batch_size, sequence_length, num_kv_heads, head_dim]``.
+            ``None`` for non-attention layer types.
+        value (Array | None): Value cache for full attention.
+            Shape: ``[batch_size, sequence_length, num_kv_heads, head_dim]``.
+            ``None`` for non-attention layer types.
+        conv_state (Array | None): Combined convolution state for linear
+            attention (GatedDeltaNet) layers.
+            Shape: ``[batch_size, d_inner, d_conv]``.
+        recurrent_state (Array | None): Recurrent state for linear, KDA,
+            and parallel-hybrid layers.
+            Shape: ``[batch_size, num_heads, head_dim, d_state]``.
+        positions (Array): Current position index per batch element.
+            Shape: ``[batch_size]``.
+        metadata (HybridCacheConfig): Static configuration metadata
+            describing dimensions and per-layer attention types.
+        q_conv_state (Array | None): KDA Q convolution state.
+            Shape: ``[batch_size, key_dim, d_conv]``. Only allocated for
+            ``kda_linear_attention`` layers.
+        k_conv_state (Array | None): KDA K convolution state.
+            Shape: ``[batch_size, key_dim, d_conv]``. Only allocated for
+            ``kda_linear_attention`` layers.
+        v_conv_state (Array | None): KDA V convolution state.
+            Shape: ``[batch_size, value_dim, d_conv]``. Only allocated for
+            ``kda_linear_attention`` layers.
+        layer_index (int | None): Index of this layer in the model, or
+            ``None`` if the view is not bound to a specific layer.
+        layer_type (str): Attention variant for this layer; one of
+            ``FULL_ATTENTION``, ``LINEAR_ATTENTION``, ``KDA_LINEAR_ATTENTION``,
+            or ``PARALLEL_HYBRID``.
+    """
+
+    # KV cache (for full_attention)
+    key: Float[Array, "batch seq num_kv_heads head_dim"] | ImplicitArray | None
+    value: Float[Array, "batch seq num_kv_heads head_dim"] | ImplicitArray | None
+
+    # Recurrent state (for linear_attention - GatedDeltaNet)
+    conv_state: Float[Array, "batch d_inner d_conv"] | ImplicitArray | None
+    recurrent_state: Float[Array, "batch num_heads head_dim d_state"] | ImplicitArray | None
+
+    # Common (no defaults - must come before fields with defaults)
+    positions: Int[Array, "batch"]  # noqa
+    metadata: HybridCacheConfig
+
+    # Separate conv states (for kda_linear_attention - Kimi Linear)
+    # These have defaults and must come after fields without defaults
+    q_conv_state: Float[Array, "batch key_dim d_conv"] | ImplicitArray | None = None
+    k_conv_state: Float[Array, "batch key_dim d_conv"] | ImplicitArray | None = None
+    v_conv_state: Float[Array, "batch value_dim d_conv"] | ImplicitArray | None = None
+
+    layer_index: int | None = field(pytree_node=False, default=None)
+    layer_type: str = field(pytree_node=False, default=FULL_ATTENTION)
+
+    @classmethod
+    def init(
+        cls,
+        config: HybridCacheConfig,
+        layer_index: int | None = None,
+        *,
+        dtype: jnp.dtype = jnp.bfloat16,
+        partition_specs: PartitionSpec | None = None,
+    ) -> HybridCacheView:
+        """Initialize a hybrid cache view for a single layer.
+
+        Creates and allocates cache tensors based on the layer's attention type:
+        - Full attention: Allocates KV cache
+        - Linear attention (GatedDeltaNet): Allocates conv state and recurrent state
+        - KDA linear attention (Kimi): Allocates separate Q/K/V conv states and recurrent state
+
+        Args:
+            config: Configuration for cache dimensions.
+            layer_index: Index of this layer in the model.
+            dtype: Data type for cache tensors.
+            partition_specs: Sharding specification for distributed execution.
+
+        Returns:
+            HybridCacheView: Initialized cache view with allocated tensors.
+        """
+        metadata = config
+        layer_type = metadata.layer_types[layer_index] if layer_index is not None else FULL_ATTENTION
+
+        paxis = metadata.partition_axis
+        if partition_specs is None:
+            partition_specs = PartitionSpec(
+                paxis.batch_axis,
+                paxis.sequence_axis,
+                paxis.head_axis,
+                None,
+            )
+
+        key = None
+        value = None
+        conv_state = None
+        recurrent_state = None
+        q_conv_state = None
+        k_conv_state = None
+        v_conv_state = None
+
+        if layer_type == FULL_ATTENTION:
+            key = with_sharding_constraint(
+                arr=jnp.zeros(
+                    shape=(
+                        metadata.batch_size,
+                        metadata.sequence_length,
+                        metadata.num_key_value_heads,
+                        metadata.head_dim,
+                    ),
+                    dtype=dtype,
+                ),
+                sharding=partition_specs,
+            )
+            value = with_sharding_constraint(
+                arr=jnp.zeros(
+                    shape=(
+                        metadata.batch_size,
+                        metadata.sequence_length,
+                        metadata.num_key_value_heads,
+                        metadata.head_dim,
+                    ),
+                    dtype=dtype,
+                ),
+                sharding=partition_specs,
+            )
+        elif layer_type == LINEAR_ATTENTION:
+            recurrent_dtype = _linear_recurrent_state_dtype(dtype)
+            conv_state = with_sharding_constraint(
+                arr=jnp.zeros(
+                    shape=(
+                        metadata.batch_size,
+                        metadata.d_inner,
+                        metadata.d_conv,
+                    ),
+                    dtype=dtype,
+                ),
+                sharding=PartitionSpec(
+                    metadata.partition_axis.batch_axis,
+                    None,
+                    None,
+                ),
+            )
+            recurrent_state = with_sharding_constraint(
+                arr=jnp.zeros(
+                    shape=(
+                        metadata.batch_size,
+                        metadata.num_attention_heads,
+                        metadata.head_dim,
+                        metadata.d_state,
+                    ),
+                    dtype=recurrent_dtype,
+                ),
+                sharding=PartitionSpec(
+                    metadata.partition_axis.batch_axis,
+                    metadata.partition_axis.head_axis,
+                    None,
+                    None,
+                ),
+            )
+        elif layer_type == KDA_LINEAR_ATTENTION:
+            # Allocate separate Q/K/V conv states + recurrent state for KDA (Kimi Linear)
+            # For KDA, d_inner is split into key_dim (Q/K) and value_dim (V)
+            # We use d_inner for key dimension and d_state for value dimension
+            recurrent_dtype = _linear_recurrent_state_dtype(dtype)
+            key_dim = metadata.num_attention_heads * metadata.head_dim
+            value_dim = metadata.d_state  # In KDA, value has different dimension
+
+            conv_sharding = PartitionSpec(
+                metadata.partition_axis.batch_axis,
+                None,
+                None,
+            )
+            q_conv_state = with_sharding_constraint(
+                arr=jnp.zeros(
+                    shape=(metadata.batch_size, key_dim, metadata.d_conv),
+                    dtype=dtype,
+                ),
+                sharding=conv_sharding,
+            )
+            k_conv_state = with_sharding_constraint(
+                arr=jnp.zeros(
+                    shape=(metadata.batch_size, key_dim, metadata.d_conv),
+                    dtype=dtype,
+                ),
+                sharding=conv_sharding,
+            )
+            v_conv_state = with_sharding_constraint(
+                arr=jnp.zeros(
+                    shape=(metadata.batch_size, value_dim, metadata.d_conv),
+                    dtype=dtype,
+                ),
+                sharding=conv_sharding,
+            )
+            recurrent_state = with_sharding_constraint(
+                arr=jnp.zeros(
+                    shape=(
+                        metadata.batch_size,
+                        metadata.num_attention_heads,
+                        metadata.head_dim,
+                        metadata.d_state,
+                    ),
+                    dtype=recurrent_dtype,
+                ),
+                sharding=PartitionSpec(
+                    metadata.partition_axis.batch_axis,
+                    metadata.partition_axis.head_axis,
+                    None,
+                    None,
+                ),
+            )
+
+        elif layer_type == PARALLEL_HYBRID:
+            # Allocate BOTH KV cache AND recurrent state for parallel hybrid layers
+            # (e.g., FalconH1 where attention and SSM run in parallel)
+            recurrent_dtype = _linear_recurrent_state_dtype(dtype)
+
+            # KV cache (same as FULL_ATTENTION)
+            key = with_sharding_constraint(
+                arr=jnp.zeros(
+                    shape=(
+                        metadata.batch_size,
+                        metadata.sequence_length,
+                        metadata.num_key_value_heads,
+                        metadata.head_dim,
+                    ),
+                    dtype=dtype,
+                ),
+                sharding=partition_specs,
+            )
+            value = with_sharding_constraint(
+                arr=jnp.zeros(
+                    shape=(
+                        metadata.batch_size,
+                        metadata.sequence_length,
+                        metadata.num_key_value_heads,
+                        metadata.head_dim,
+                    ),
+                    dtype=dtype,
+                ),
+                sharding=partition_specs,
+            )
+
+            # Recurrent state (same as LINEAR_ATTENTION)
+            conv_state = with_sharding_constraint(
+                arr=jnp.zeros(
+                    shape=(
+                        metadata.batch_size,
+                        metadata.d_inner,
+                        metadata.d_conv,
+                    ),
+                    dtype=dtype,
+                ),
+                sharding=PartitionSpec(
+                    metadata.partition_axis.batch_axis,
+                    None,
+                    None,
+                ),
+            )
+            recurrent_state = with_sharding_constraint(
+                arr=jnp.zeros(
+                    shape=(
+                        metadata.batch_size,
+                        metadata.num_attention_heads,
+                        metadata.head_dim,
+                        metadata.d_state,
+                    ),
+                    dtype=recurrent_dtype,
+                ),
+                sharding=PartitionSpec(
+                    metadata.partition_axis.batch_axis,
+                    metadata.partition_axis.head_axis,
+                    None,
+                    None,
+                ),
+            )
+
+        return cls(
+            key=key,
+            value=value,
+            conv_state=conv_state,
+            recurrent_state=recurrent_state,
+            q_conv_state=q_conv_state,
+            k_conv_state=k_conv_state,
+            v_conv_state=v_conv_state,
+            positions=jnp.zeros((metadata.batch_size,), dtype="i4"),
+            metadata=metadata,
+            layer_index=layer_index,
+            layer_type=layer_type,
+        )
+
+    def concatenate_to_cache(
+        self,
+        key_states: Float[Array, "batch seq_len num_kv_heads head_dim"] | None = None,
+        value_states: Float[Array, "batch seq_len num_kv_heads head_dim"] | None = None,
+        conv_state: Float[Array, "batch d_inner d_conv"] | None = None,
+        recurrent_state: Float[Array, "batch num_heads head_dim d_state"] | None = None,
+        q_conv_state: Float[Array, "batch key_dim d_conv"] | None = None,
+        k_conv_state: Float[Array, "batch key_dim d_conv"] | None = None,
+        v_conv_state: Float[Array, "batch value_dim d_conv"] | None = None,
+        cache_position: Int[Array, "batch"] | None = None,  # noqa
+    ) -> tuple[
+        Float[Array, "batch seq num_kv_heads head_dim"] | ImplicitArray | None,
+        Float[Array, "batch seq num_kv_heads head_dim"] | ImplicitArray | None,
+        HybridCacheView,
+    ]:
+        """Update cache state based on layer type.
+
+        This unified method handles all layer types:
+        - FULL_ATTENTION: Updates KV cache with key_states and value_states
+        - LINEAR_ATTENTION: Updates conv_state and recurrent_state
+        - KDA_LINEAR_ATTENTION: Updates q/k/v conv states and recurrent_state
+
+        Args:
+            key_states: New key states for full attention layers.
+            value_states: New value states for full attention layers.
+            conv_state: New convolution state for linear attention layers.
+            recurrent_state: New recurrent state for linear/KDA attention layers.
+            q_conv_state: New Q convolution state for KDA layers.
+            k_conv_state: New K convolution state for KDA layers.
+            v_conv_state: New V convolution state for KDA layers.
+            cache_position: Position in cache to update (for full attention).
+
+        Returns:
+            Tuple of (key_cache, value_cache, updated_view).
+            For non-full-attention layers, key_cache and value_cache are None.
+        """
+        if self.layer_type == FULL_ATTENTION:
+            if key_states is None or value_states is None:
+                return self.key, self.value, self
+
+            _batch_size, seq_len = key_states.shape[:2]
+
+            if cache_position is None:
+                cache_position = self.positions
+
+            new_key = self.key
+            new_value = self.value
+
+            # Simple update: assume cache_position is a scalar for all batches
+            start_indices = (0, int(cache_position[0]), 0, 0)
+            new_key = lax.dynamic_update_slice(new_key, key_states, start_indices)
+            new_value = lax.dynamic_update_slice(new_value, value_states, start_indices)
+
+            new_positions = cache_position + seq_len
+
+            return (
+                new_key,
+                new_value,
+                self.replace(
+                    key=new_key,
+                    value=new_value,
+                    positions=new_positions,
+                ),
+            )
+
+        elif self.layer_type == LINEAR_ATTENTION:
+            new_conv_state = conv_state if conv_state is not None else self.conv_state
+            new_recurrent_state = recurrent_state if recurrent_state is not None else self.recurrent_state
+
+            return (
+                None,
+                None,
+                self.replace(
+                    conv_state=new_conv_state,
+                    recurrent_state=new_recurrent_state,
+                ),
+            )
+
+        elif self.layer_type == KDA_LINEAR_ATTENTION:
+            new_q_conv_state = q_conv_state if q_conv_state is not None else self.q_conv_state
+            new_k_conv_state = k_conv_state if k_conv_state is not None else self.k_conv_state
+            new_v_conv_state = v_conv_state if v_conv_state is not None else self.v_conv_state
+            new_recurrent_state = recurrent_state if recurrent_state is not None else self.recurrent_state
+
+            return (
+                None,
+                None,
+                self.replace(
+                    q_conv_state=new_q_conv_state,
+                    k_conv_state=new_k_conv_state,
+                    v_conv_state=new_v_conv_state,
+                    recurrent_state=new_recurrent_state,
+                ),
+            )
+
+        elif self.layer_type == PARALLEL_HYBRID:
+            # Update BOTH KV cache AND recurrent state for parallel hybrid layers
+            # This is used by models like FalconH1 where attention and SSM run in parallel
+
+            # Update KV cache (like FULL_ATTENTION)
+            new_key = self.key
+            new_value = self.value
+            new_positions = self.positions
+
+            if key_states is not None and value_states is not None:
+                _batch_size, seq_len = key_states.shape[:2]
+
+                if cache_position is None:
+                    cache_position = self.positions
+
+                start_indices = (0, int(cache_position[0]), 0, 0)
+                new_key = lax.dynamic_update_slice(self.key, key_states, start_indices)
+                new_value = lax.dynamic_update_slice(self.value, value_states, start_indices)
+                new_positions = cache_position + seq_len
+
+            # Update recurrent state (like LINEAR_ATTENTION)
+            new_conv_state = conv_state if conv_state is not None else self.conv_state
+            new_recurrent_state = recurrent_state if recurrent_state is not None else self.recurrent_state
+
+            return (
+                new_key,
+                new_value,
+                self.replace(
+                    key=new_key,
+                    value=new_value,
+                    conv_state=new_conv_state,
+                    recurrent_state=new_recurrent_state,
+                    positions=new_positions,
+                ),
+            )
+
+        else:
+            raise ValueError(f"Unknown layer_type: {self.layer_type}")
+
+    def update_conv_state(
+        self,
+        new_hidden_state: Float[Array, "batch d_inner"],
+        cache_position: Int[Array, "..."] | None = None,
+    ) -> HybridCacheView:
+        """Update convolution state with rolling buffer.
+
+        Implements a rolling buffer for convolutional states, where
+        new states replace old ones in a circular fashion.
+
+        Args:
+            new_hidden_state: New hidden state to insert.
+            cache_position: Position index for insertion (optional).
+
+        Returns:
+            Updated HybridCacheView.
+
+        Raises:
+            ValueError: If called on a layer that doesn't support conv state.
+        """
+        if self.layer_type not in (LINEAR_ATTENTION, PARALLEL_HYBRID):
+            raise ValueError(
+                f"update_conv_state is only valid for linear_attention or parallel_hybrid layers, got {self.layer_type}"
+            )
+
+        conv_state = jnp.roll(self.conv_state, shift=-1, axis=-1)
+        conv_state = conv_state.at[:, :, -1].set(new_hidden_state)
+
+        return self.replace(conv_state=conv_state)
+
+    def update_kda_states(
+        self,
+        new_q_conv_state: Float[Array, "batch key_dim d_conv"] | None = None,
+        new_k_conv_state: Float[Array, "batch key_dim d_conv"] | None = None,
+        new_v_conv_state: Float[Array, "batch value_dim d_conv"] | None = None,
+        new_recurrent_state: Float[Array, "batch num_heads head_dim d_state"] | None = None,
+    ) -> HybridCacheView:
+        """Update KDA states for kda_linear_attention layers (Kimi Linear).
+
+        This is a convenience wrapper around concatenate_to_cache for
+        KDA linear attention layers.
+
+        Args:
+            new_q_conv_state: New Q convolution state.
+            new_k_conv_state: New K convolution state.
+            new_v_conv_state: New V convolution state.
+            new_recurrent_state: New recurrent state.
+
+        Returns:
+            Updated HybridCacheView.
+        """
+        _, _, updated_view = self.concatenate_to_cache(
+            q_conv_state=new_q_conv_state,
+            k_conv_state=new_k_conv_state,
+            v_conv_state=new_v_conv_state,
+            recurrent_state=new_recurrent_state,
+        )
+        return updated_view
+
+    def reset(self) -> HybridCacheView:
+        """Reset all cache states to zeros.
+
+        Returns:
+            Reset HybridCacheView with zeroed states.
+        """
+        if self.layer_type == FULL_ATTENTION:
+            return self.replace(
+                key=jnp.zeros_like(self.key),
+                value=jnp.zeros_like(self.value),
+                positions=jnp.zeros_like(self.positions),
+            )
+        elif self.layer_type == LINEAR_ATTENTION:
+            return self.replace(
+                conv_state=jnp.zeros_like(self.conv_state),
+                recurrent_state=jnp.zeros_like(self.recurrent_state),
+                positions=jnp.zeros_like(self.positions),
+            )
+        elif self.layer_type == KDA_LINEAR_ATTENTION:
+            return self.replace(
+                q_conv_state=jnp.zeros_like(self.q_conv_state),
+                k_conv_state=jnp.zeros_like(self.k_conv_state),
+                v_conv_state=jnp.zeros_like(self.v_conv_state),
+                recurrent_state=jnp.zeros_like(self.recurrent_state),
+                positions=jnp.zeros_like(self.positions),
+            )
+        elif self.layer_type == PARALLEL_HYBRID:
+            return self.replace(
+                key=jnp.zeros_like(self.key),
+                value=jnp.zeros_like(self.value),
+                conv_state=jnp.zeros_like(self.conv_state),
+                recurrent_state=jnp.zeros_like(self.recurrent_state),
+                positions=jnp.zeros_like(self.positions),
+            )
+        else:
+            raise ValueError(f"Unknown layer_type: {self.layer_type}")
+
+    def __repr__(self) -> str:
+        """Return a layer-type-aware ``repr`` highlighting the populated state.
+
+        Returns:
+            A string describing the relevant cache tensors for this layer.
+        """
+        if self.layer_type == FULL_ATTENTION:
+            return (
+                f"{self.__class__.__name__}(layer_type={self.layer_type}, "
+                f"key={self.key.shape if self.key is not None else None}, "
+                f"value={self.value.shape if self.value is not None else None}, "
+                f"layer_index={self.layer_index})"
+            )
+        elif self.layer_type == LINEAR_ATTENTION:
+            return (
+                f"{self.__class__.__name__}(layer_type={self.layer_type}, "
+                f"conv_state={self.conv_state.shape if self.conv_state is not None else None}, "
+                f"recurrent_state={self.recurrent_state.shape if self.recurrent_state is not None else None}, "
+                f"layer_index={self.layer_index})"
+            )
+        elif self.layer_type == KDA_LINEAR_ATTENTION:
+            return (
+                f"{self.__class__.__name__}(layer_type={self.layer_type}, "
+                f"q_conv={self.q_conv_state.shape if self.q_conv_state is not None else None}, "
+                f"k_conv={self.k_conv_state.shape if self.k_conv_state is not None else None}, "
+                f"v_conv={self.v_conv_state.shape if self.v_conv_state is not None else None}, "
+                f"recurrent={self.recurrent_state.shape if self.recurrent_state is not None else None}, "
+                f"layer_index={self.layer_index})"
+            )
+        elif self.layer_type == PARALLEL_HYBRID:
+            return (
+                f"{self.__class__.__name__}(layer_type={self.layer_type}, "
+                f"key={self.key.shape if self.key is not None else None}, "
+                f"value={self.value.shape if self.value is not None else None}, "
+                f"conv_state={self.conv_state.shape if self.conv_state is not None else None}, "
+                f"recurrent_state={self.recurrent_state.shape if self.recurrent_state is not None else None}, "
+                f"layer_index={self.layer_index})"
+            )
+        else:
+            return f"{self.__class__.__name__}(layer_type={self.layer_type}, layer_index={self.layer_index})"
+
+    __str__ = __repr__
+
+
+@auto_pytree(frozen=False)
+class ParallelHybridCacheView(BaseCacheView):
+    """Cache view for layers that need multiple caches in parallel.
+
+    Some decoder layers run more than one cache-bearing block in the same layer
+    (e.g., attention KV-cache + SSM/Mamba state in FalconH1). This view carries
+    both an attention cache view and a RecurrentCacheView while presenting a
+    single object to model code.
+
+    The ``transformer`` field can hold any attention-style cache view:
+    ``TransformerCacheView``, ``RaggedPagesCacheView``, or
+    ``UnifiedAttentionCacheView``.
+    """
+
+    transformer: TransformerCacheView | RaggedPagesCacheView | UnifiedAttentionCacheView | None
+    recurrent: RecurrentCacheView | None
+
+    # Mirror recurrent fields so dataclasses.replace(self, conv_state=...) works.
+    conv_state: Float[Array, "batch conv_dim conv_kernel_size"] | ImplicitArray | None = None
+    recurrent_state: Float[Array, "batch ..."] | ImplicitArray | None = None
+    positions: Int[Array, "batch"] | None = None  # noqa: F821
+    seqlen_offset: Int[Array, ""] | None = None
+
+    layer_index: int | None = field(pytree_node=False, default=None)
+
+    def __post_init__(self):
+        """Mirror recurrent fields onto ``self`` so ``replace`` keeps both views in sync.
+
+        When the inner ``recurrent`` view is set the parallel view exposes its
+        conv/recurrent state directly; this hook copies those handles onto
+        ``self`` and rewrites ``self.recurrent`` if the user passed overrides
+        via field defaults.
+        """
+        if self.recurrent is None:
+            return
+
+        conv_state = self.conv_state if self.conv_state is not None else getattr(self.recurrent, "conv_state", None)
+        recurrent_state = (
+            self.recurrent_state
+            if self.recurrent_state is not None
+            else getattr(self.recurrent, "recurrent_state", None)
+        )
+        positions = self.positions if self.positions is not None else getattr(self.recurrent, "positions", None)
+        seqlen_offset = (
+            self.seqlen_offset if self.seqlen_offset is not None else getattr(self.recurrent, "seqlen_offset", None)
+        )
+
+        self.conv_state = conv_state
+        self.recurrent_state = recurrent_state
+        self.positions = positions
+        self.seqlen_offset = seqlen_offset
+
+        needs_sync = (
+            getattr(self.recurrent, "conv_state", None) is not conv_state
+            or getattr(self.recurrent, "recurrent_state", None) is not recurrent_state
+            or getattr(self.recurrent, "positions", None) is not positions
+            or getattr(self.recurrent, "seqlen_offset", None) is not seqlen_offset
+        )
+        if not needs_sync:
+            return
+
+        update_dict: dict[str, tp.Any] = {
+            "conv_state": conv_state,
+            "recurrent_state": recurrent_state,
+            "positions": positions,
+        }
+        if seqlen_offset is not None:
+            update_dict["seqlen_offset"] = seqlen_offset
+        self.recurrent = self.recurrent.replace(**update_dict)
+
+    @property
+    def is_ragged(self) -> bool:
+        """Whether the attention component uses paged (ragged/unified) cache.
+
+        Returns:
+            ``True`` when ``self.transformer`` is a ragged/unified cache view.
+        """
+        from easydel.caching.ragged_page.cache import RaggedPagesCacheView as _RPC
+        from easydel.caching.unified_attention.cache import UnifiedAttentionCacheView as _UAC
+
+        return isinstance(self.transformer, (_RPC, _UAC))
+
+    def _require_transformer_attr(self, name: str):
+        """Access an attribute on the inner transformer cache view.
+
+        Args:
+            name: Attribute name to look up on ``self.transformer``.
+
+        Returns:
+            The attribute value; ``None`` for ragged caches that legitimately
+            don't expose the attribute (e.g. dense ``key`` on a paged cache).
+
+        Raises:
+            AttributeError: If the inner view is dense and lacks ``name``.
+        """
+        if self.transformer is None:
+            return None
+        val = getattr(self.transformer, name, None)
+        if val is None and not self.is_ragged:
+            raise AttributeError(
+                f"ParallelHybridCacheView.transformer ({type(self.transformer).__name__}) has no attribute '{name}'"
+            )
+        return val
+
+    @property
+    def key(self):
+        """Inner attention view's ``key`` tensor (or ``None`` for paged views)."""
+        return self._require_transformer_attr("key")
+
+    @property
+    def value(self):
+        """Inner attention view's ``value`` tensor (or ``None`` for paged views)."""
+        return self._require_transformer_attr("value")
+
+    @property
+    def indexes(self):
+        """Inner attention view's ``indexes`` tensor."""
+        return self._require_transformer_attr("indexes")
+
+    @property
+    def starts(self):
+        """Inner attention view's ``starts`` tensor."""
+        return self._require_transformer_attr("starts")
+
+    @property
+    def masking_details(self):
+        """Inner attention view's masking details, or ``None`` if unavailable."""
+        return getattr(self.transformer, "masking_details", None)
+
+    @property
+    def metadata(self):
+        """Inner attention view's static metadata, or ``None`` if unavailable."""
+        return getattr(self.transformer, "metadata", None)
+
+    @property
+    def kv_pages(self):
+        """Access ``kv_pages`` for ragged page cache views.
+
+        Returns:
+            The inner view's ``kv_pages`` tensor, or ``None`` if not a paged view.
+        """
+        return getattr(self.transformer, "kv_pages", None)
+
+    @kv_pages.setter
+    def kv_pages(self, value):
+        """Forward ``kv_pages`` write to the inner transformer cache view.
+
+        Args:
+            value: Replacement tensor to install on the inner view.
+        """
+        if self.transformer is not None:
+            self.transformer.kv_pages = value
+
+    def reset(self) -> "ParallelHybridCacheView":
+        """Reset both inner cache views and keep mirrored recurrent fields aligned."""
+        transformer = self.transformer.reset() if self.transformer is not None else None
+        recurrent = self.recurrent.reset() if self.recurrent is not None else None
+        return self.replace(
+            transformer=transformer,
+            recurrent=recurrent,
+            conv_state=getattr(recurrent, "conv_state", None),
+            recurrent_state=getattr(recurrent, "recurrent_state", None),
+            positions=getattr(recurrent, "positions", None),
+            seqlen_offset=getattr(recurrent, "seqlen_offset", None),
+        )
+
+    @classmethod
+    def init(cls, metadata: BaseCacheConfig, *args, **kwargs) -> "ParallelHybridCacheView":
+        """Initialize a ParallelHybridCacheView from transformer and recurrent views.
+
+        Args:
+            metadata: Unused (present for interface compatibility).
+            *args: Unused.
+            **kwargs: Must contain:
+                - transformer: Attention cache view (TransformerCacheView,
+                    RaggedPagesCacheView, or UnifiedAttentionCacheView).
+                - recurrent: RecurrentCacheView for SSM state.
+                - layer_index: Optional layer index.
+
+        Returns:
+            ParallelHybridCacheView: Initialized view wrapping both caches.
+
+        Raises:
+            ValueError: If transformer or recurrent kwargs are missing.
+            TypeError: If unexpected kwargs are provided.
+        """
+        del metadata, args
+        transformer = kwargs.pop("transformer", None)
+        recurrent = kwargs.pop("recurrent", None)
+        layer_index = kwargs.pop("layer_index", None)
+        if transformer is None or recurrent is None:
+            raise ValueError("ParallelHybridCacheView.init requires `transformer` and `recurrent`.")
+        if kwargs:
+            raise TypeError(f"Unexpected kwargs for ParallelHybridCacheView.init: {tuple(kwargs.keys())}")
+        return cls(transformer=transformer, recurrent=recurrent, layer_index=layer_index)
+
+    def concatenate_to_cache(self, *args, **kwargs):
+        """Update the appropriate inner cache based on the provided arguments.
+
+        Dispatches to the transformer or recurrent cache view based on
+        which keyword arguments are provided:
+        - Ragged call: key + value (without mask_info) -> updates transformer (ragged/unified)
+        - Transformer call: query or key+value+mask_info -> updates transformer KV cache
+        - Recurrent call: conv_state or recurrent_state -> updates recurrent state
+
+        Args:
+            *args: Unused.
+            **kwargs: Arguments forwarded to the inner cache view's
+                concatenate_to_cache method.
+
+        Returns:
+            Varies by call type:
+            - Ragged: updated ParallelHybridCacheView
+            - Transformer: (key_cache, value_cache, mask_info, updated_view, masking_details)
+            - Recurrent: (conv_state, recurrent_state, updated_view)
+
+        Raises:
+            TypeError: If mixed transformer + recurrent args are provided,
+                or if no recognized argument pattern is found.
+        """
+        del args
+
+        # Dispatch based on the inner cache view type when possible,
+        # falling back to kwargs inspection for ambiguous cases.
+        is_ragged_call = self.is_ragged and "key" in kwargs and "value" in kwargs
+        is_transformer_call = "query" in kwargs or ("key" in kwargs and "value" in kwargs and "mask_info" in kwargs)
+        is_recurrent_call = "conv_state" in kwargs or "recurrent_state" in kwargs
+
+        if is_ragged_call:
+            # Ragged/unified page cache: signature is (key, value, cache_metadata) -> updated_view
+            new_transformer = self.transformer.concatenate_to_cache(**kwargs)
+            return self.replace(transformer=new_transformer)
+
+        if is_transformer_call and is_recurrent_call:
+            raise TypeError("ParallelHybridCacheView.concatenate_to_cache received mixed transformer + recurrent args.")
+
+        if is_transformer_call:
+            key_cache, value_cache, mask_info, new_transformer, masking_details = self.transformer.concatenate_to_cache(
+                **kwargs
+            )
+            new_view = self.replace(transformer=new_transformer)
+            return key_cache, value_cache, mask_info, new_view, masking_details
+
+        if is_recurrent_call:
+            conv_state, recurrent_state, new_recurrent = self.recurrent.concatenate_to_cache(**kwargs)
+            new_view = self.replace(
+                recurrent=new_recurrent,
+                conv_state=conv_state,
+                recurrent_state=recurrent_state,
+                positions=getattr(new_recurrent, "positions", self.positions),
+                seqlen_offset=getattr(new_recurrent, "seqlen_offset", self.seqlen_offset),
+            )
+            return conv_state, recurrent_state, new_view
+
+        raise TypeError(
+            "ParallelHybridCacheView.concatenate_to_cache expected transformer-style args "
+            "(query/key/value/...), ragged-style args (key/value/cache_metadata), "
+            "or recurrent-style args (conv_state/recurrent_state)."
+        )
+
+
+@auto_pytree(max_print_length=int(1e6))
+class HybridCache(BaseCache):
+    """Multi-layer cache container for hybrid attention models.
+
+    Orchestrates cache views across all layers, providing a unified
+    interface for state management during inference. Each layer
+    maintains the appropriate cache type based on its attention type.
+
+    Attributes:
+        views (list[BaseCacheView | None]): Ordered list of cache views,
+            one per model layer. Views can be any cache type (TransformerCacheView,
+            RecurrentCacheView, KDACacheView).
+    """
+
+    views: list[
+        KDACacheView | RecurrentCacheView | TransformerCacheView | HybridCacheView | ParallelHybridCacheView | None
+    ]
+
+    @classmethod
+    def init_cache(
+        cls,
+        config: HybridCacheConfig,
+        dtype: jnp.dtype | None = None,
+        partition_specs: PartitionSpec | None = None,
+    ) -> HybridCache:
+        """Initialize a complete hybrid cache with views for all layers.
+
+        Creates a fully initialized cache with appropriate storage for each
+        layer based on its attention type.
+
+        Args:
+            config: Configuration defining cache dimensions and layer types.
+            dtype: Data type for cache tensors. Defaults to bfloat16.
+            partition_specs: Sharding specification for KV cache.
+
+        Returns:
+            HybridCache: Fully initialized cache ready for inference.
+        """
+        if dtype is None:
+            dtype = jnp.bfloat16
+
+        return cls(
+            views=[
+                HybridCacheView.init(
+                    config=config,
+                    layer_index=layer_idx,
+                    dtype=dtype,
+                    partition_specs=partition_specs,
+                )
+                for layer_idx in range(config.num_hidden_layers)
+            ]
+        )
+
+    @classmethod
+    def init_empty(cls, num_hidden_layers: int) -> HybridCache:
+        """Initialize an empty hybrid cache without allocated storage.
+
+        Creates a cache structure with None views that can be populated later.
+
+        Args:
+            num_hidden_layers: Number of layers to create placeholders for.
+
+        Returns:
+            HybridCache: Cache instance with None views.
+        """
+        return cls(views=[None] * num_hidden_layers)
+
+    def reset(self) -> HybridCache:
+        """Reset all cache layers to zero states.
+
+        Returns:
+            New HybridCache instance with all states zeroed.
+        """
+        new_views = [view.reset() if view is not None else None for view in self.views]
+        return self.replace(views=new_views)
+
+    def get_view(
+        self, layer_idx: int
+    ) -> KDACacheView | RecurrentCacheView | TransformerCacheView | HybridCacheView | ParallelHybridCacheView | None:
+        """Get the cache view for a specific layer.
+
+        Args:
+            layer_idx: Index of the layer.
+
+        Returns:
+            Cache view for the layer or None if not initialized.
+        """
+        return self.views[layer_idx]
+
+    def update_view(self, layer_idx: int, view: HybridCacheView) -> HybridCache:
+        """Update the cache view for a specific layer.
+
+        Args:
+            layer_idx: Index of the layer.
+            view: New HybridCacheView for this layer.
+
+        Returns:
+            New HybridCache instance with the updated view.
+        """
+        new_views = list(self.views)
+        new_views[layer_idx] = view
+        return self.replace(views=new_views)
+
+    def __repr__(self):
+        """Return a multi-line ``repr`` listing each layer view.
+
+        Returns:
+            A string with one line per layer view.
+        """
+        return f"{self.__class__.__name__}(\n  " + "\n  ".join(str(view) for view in self.views) + "\n)"
+
+    __str__ = __repr__
+
+
+@auto_pytree
+class HybridMetadata(BaseRunTimeMetadata):
+    """Runtime metadata for hybrid cache operations.
+
+    Stores dynamic information that varies during model execution
+    but isn't part of the permanent cache state. Since HybridCache
+    contains multiple view types, this metadata embeds the necessary
+    fields for TransformerCacheView layers.
+
+    Attributes:
+        postpadded: Whether sequences are post-padded.
+        starts: Starting positions for sequences.
+        indexes: Current position indices.
+    """
+
+    postpadded: bool = False
+    starts: tp.Any | None = None  # jnp.ndarray
+    indexes: tp.Any | None = None  # jnp.ndarray
+
+
+if __name__ == "__main__":
+    from spectrax import PartitionAxis
+
+    print("Testing HybridCache...")
+
+    num_layers = 8
+    layer_types = tuple("full_attention" if (i + 1) % 4 == 0 else "linear_attention" for i in range(num_layers))
+
+    print(f"Layer types: {layer_types}")
+
+    metadata = HybridCacheConfig.create(
+        num_hidden_layers=num_layers,
+        partition_axis=PartitionAxis(),
+        batch_size=2,
+        sequence_length=128,
+        num_key_value_heads=8,
+        head_dim=64,
+        d_inner=1024,
+        d_conv=4,
+        d_state=64,
+        layer_types=layer_types,
+    )
+
+    print(f"Created metadata with {metadata.num_hidden_layers} layers")
+
+    cache = HybridCache.init_cache(metadata, dtype=jnp.float32)
+    print(f"Initialized cache with {len(cache)} views")
+
+    for i, view in enumerate(cache.views):
+        print(f"  Layer {i}: {view.layer_type}")
+        if view.layer_type == FULL_ATTENTION:
+            print(f"    KV cache: key={view.key.shape}, value={view.value.shape}")
+        else:
+            print(f"    Recurrent state: conv={view.conv_state.shape}, recurrent={view.recurrent_state.shape}")
+
+    # Test KV cache update on a full attention layer (layer 3)
+    print("\nTesting KV cache update on layer 3 (full_attention)...")
+    key_states = jnp.ones((2, 10, 8, 64))
+    value_states = jnp.ones((2, 10, 8, 64))

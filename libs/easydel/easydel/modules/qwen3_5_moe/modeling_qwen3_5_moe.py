@@ -1,0 +1,834 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Qwen3.5-MoE text and multimodal model wrappers.
+
+Qwen3.5-MoE is the Mixture-of-Experts variant of Qwen3.5. It reuses
+Qwen3-Next's hybrid attention/linear-attention decoder with a sparse
+routed MoE FFN, and pairs it with the Qwen3-VL-MoE vision tower for
+multimodal inputs.
+
+This module exposes the task-specific wrappers for that stack:
+
+- :class:`Qwen3_5MoeForCausalLM` — text-only causal LM, registered under
+  the ``qwen3_5_moe`` model type. Reuses :class:`Qwen3NextModel`
+  with MoE FFN blocks and the Pallas-fused decode kernel.
+- :class:`Qwen3_5MoeVLForConditionalGeneration` — vision-language MoE
+  wrapper combining the Qwen3-VL-MoE vision tower with the Qwen3-Next
+  MoE language backbone and merging visual embeddings at placeholder
+  positions before invoking the LM head.
+
+Multimodal mRoPE construction reuses
+:func:`easydel.modules._base.mrope_position_ids_from_mm_token_types`
+and the position-id flattening helper from the Qwen3.5 module.
+"""
+
+import jax
+import jax.numpy as jnp
+import spectrax as spx
+from spectrax import common_types
+
+from easydel.caching import (
+    HybridCache,
+    OperationsMetadata,
+    RaggedPagesCache,
+    RaggedPagesMetadata,
+    TransformerCache,
+    TransformerMetadata,
+)
+from easydel.infra.factory import TaskType, register_module
+from easydel.infra.modeling_outputs import MoeCausalLMOutput
+from easydel.modules._base import (
+    BaseCausalLMModule,
+    BaseVisionLanguageModule,
+    flatten_mrope_position_ids_for_text,
+    mrope_position_ids_from_mm_token_types,
+)
+from easydel.modules.qwen3_5.modeling_qwen3_5 import (
+    Qwen3_5MTPHead,
+    Qwen3_5MTPOutput,
+)
+from easydel.modules.qwen3_next.modeling_qwen3_next import (
+    Qwen3NextForCausalLM,
+    Qwen3NextModel,
+)
+from easydel.modules.qwen3_vl_moe.modeling_qwen3_vl_moe import (
+    Qwen3VLMoeModel,
+    Qwen3VLMoeModelOutputWithPast,
+    Qwen3VLMoeVisionTransformerPretrainedModel,
+)
+from easydel.modules.qwen3_vl_moe.qwen3_vl_moe_configuration import Qwen3VLMoeConfig, Qwen3VLMoeTextConfig
+
+from .qwen3_5_moe_configuration import Qwen3_5MoeConfig, Qwen3_5MoeTextConfig
+
+
+def _mtp_mlp_is_moe(text_config) -> bool:
+    """Whether the Qwen3.5-MoE MTP block's FFN should be a sparse MoE block.
+
+    The DeepSeek-V3-style MTP block mirrors the base decoder's FFN type, so its
+    FFN is MoE iff the decoder is MoE: the config must declare routed experts and
+    the last decoder layer must route through them. This is derived from the
+    config's own ``is_moe_layer`` schedule (rather than a class check) so it stays
+    correct for both families:
+
+    - Dense Qwen3.5 (:class:`Qwen3_5TextConfig`) overrides ``is_moe_layer`` to
+      return ``False`` unconditionally -> dense MTP FFN (byte-identical 27B).
+    - Qwen3.5-MoE (:class:`Qwen3_5MoeTextConfig`) inherits the Qwen3-Next
+      ``decoder_sparse_step`` / ``mlp_only_layers`` schedule -> MoE MTP FFN,
+      matching the ``mtp.*.mlp.experts`` / ``shared_expert`` / ``gate`` tensors
+      in the Qwen3.6-35B-A3B checkpoint.
+    """
+    num_experts = int(getattr(text_config, "num_experts", 0) or 0)
+    num_layers = int(getattr(text_config, "num_hidden_layers", 0) or 0)
+    if num_experts <= 0 or num_layers <= 0:
+        return False
+    return bool(text_config.is_moe_layer(num_layers - 1))
+
+
+@register_module(TaskType.BASE_MODULE, config=Qwen3_5MoeTextConfig, model_type="qwen3_5_moe_text")
+class Qwen3_5MoeTextModel(Qwen3NextModel):
+    """Qwen3.5-MoE text-only base model (no LM head).
+
+    Thin wrapper around :class:`Qwen3NextModel` registered with the
+    ``qwen3_5_moe_text`` model type.
+    """
+
+
+class _Qwen3_5MoeMTPMixin:
+    """Shared Multi-Token-Prediction (MTP) methods for the Qwen3.5-MoE causal-LM classes.
+
+    Mirrors the qwen3_5 implementation and reuses :class:`Qwen3_5MTPHead` directly.
+    The MoE model's depth-1 MTP block is structurally identical to one decoder layer
+    (full attention + FFN); the FFN is built as a :class:`Qwen3NextSparseMoeBlock`
+    (routed experts + shared expert + gate) by passing ``use_moe_mlp=True`` to the
+    head, matching the ``mtp.*.mlp.experts`` / ``shared_expert`` / ``gate`` tensors
+    in the Qwen3.5-MoE checkpoint (see :func:`_mtp_mlp_is_moe`). Subclasses set
+    ``self.mtp`` in ``__init__`` and may override the three hooks below (text vs
+    vision-language). See ``easydel.modules.qwen3_5.modeling_qwen3_5`` for the
+    canonical docstrings.
+    """
+
+    # hooks: text and vision-language variants differ only in these three
+    def _mtp_embed(self, token_ids_i4):
+        return self.model.get_embedding()(token_ids_i4)
+
+    def _mtp_frequencies(self):
+        return getattr(self.model, "frequencies", None)
+
+    def _mtp_loss_coef(self) -> float:
+        return float(getattr(self.config, "mtp_loss_coef", 0.0))
+
+    # shared MTP API (model-agnostic; uses self.mtp + the hooks)
+    def has_mtp(self) -> bool:
+        return self.mtp is not None
+
+    def compute_mtp_outputs(
+        self,
+        outputs,
+        input_ids,
+        attention_mask=None,
+        mask_info=None,
+        position_ids=None,
+        mode=None,
+        mtp_past_key_values=None,
+        cache_metadata=None,
+    ) -> Qwen3_5MTPOutput | None:
+        if self.mtp is None:
+            return None
+        next_input_ids = jnp.concatenate(
+            [input_ids[:, 1:], jnp.zeros((input_ids.shape[0], 1), dtype=input_ids.dtype)], axis=-1
+        )
+        return self.mtp(
+            prev_hidden_states=outputs.last_hidden_state,
+            next_token_embeds=self._mtp_embed(next_input_ids.astype("i4")),
+            mask_info=mask_info,
+            position_ids=position_ids,
+            mode=mode,
+            past_key_values=mtp_past_key_values,
+            cache_metadata=cache_metadata,
+            frequencies=self._mtp_frequencies(),
+            attention_mask=attention_mask,
+        )
+
+    def compute_mtp_logits(self, mtp_output: Qwen3_5MTPOutput):
+        # prepare_lm_head_inputs lives on BaseCausalLMModule (text path); the
+        # vision-language MRO lacks it, so fall back to the raw hidden state there.
+        h = mtp_output.last_hidden_state
+        if hasattr(self, "prepare_lm_head_inputs"):
+            h = self.prepare_lm_head_inputs(h)
+        return self.compute_lm_logits(h)
+
+    def compute_mtp_chain(self, outputs, input_ids, n_steps: int, attention_mask=None):
+        """Recursively apply the depth-1 MTP head ``n_steps`` times, teacher-forced;
+        returns ``(n_steps, B, S, vocab)``. See qwen3_5's ``compute_mtp_chain``."""
+        if self.mtp is None or n_steps < 1:
+            return None
+        b = input_ids.shape[0]
+        frequencies = self._mtp_frequencies()
+        prev_hidden = outputs.last_hidden_state
+        step_logits: list = []
+        for k in range(1, n_steps + 1):
+            shifted = jnp.concatenate([input_ids[:, k:], jnp.zeros((b, k), dtype=input_ids.dtype)], axis=-1)
+            mtp_out = self.mtp(
+                prev_hidden_states=prev_hidden,
+                next_token_embeds=self._mtp_embed(shifted.astype("i4")),
+                frequencies=frequencies,
+                attention_mask=attention_mask,
+            )
+            prev_hidden = mtp_out.last_hidden_state
+            step_logits.append(self.compute_mtp_logits(mtp_out))
+        return jnp.stack(step_logits, axis=0)
+
+    def compute_mtp_loss(self, mtp_logits, labels, attention_mask=None, ignore_index: int = -100):
+        batch_size = labels.shape[0]
+        pad = jnp.full((batch_size, 2), ignore_index, dtype=labels.dtype)
+        shifted_labels = jnp.concatenate([labels[:, 2:], pad], axis=-1)
+        if attention_mask is not None:
+            mask_shifted = jnp.concatenate(
+                [attention_mask[:, 2:], jnp.zeros((batch_size, 2), dtype=attention_mask.dtype)], axis=-1
+            )
+            shifted_labels = jnp.where(mask_shifted.astype(jnp.bool_), shifted_labels, ignore_index)
+        logits = mtp_logits.astype(jnp.float32)
+        log_probs = jax.nn.log_softmax(logits, axis=-1)
+        nll = -jnp.take_along_axis(log_probs, jnp.maximum(shifted_labels, 0)[..., None], axis=-1).squeeze(-1)
+        valid = (shifted_labels != ignore_index).astype(jnp.float32)
+        return jnp.sum(nll * valid) / jnp.maximum(jnp.sum(valid), 1.0)
+
+    def _maybe_add_mtp_aux_loss(self, outputs, input_ids, attention_mask, mode):
+        if self.mtp is None or input_ids is None:
+            return outputs
+        coef = self._mtp_loss_coef()
+        if coef <= 0.0:
+            return outputs
+        if mode in (common_types.MODE_DECODE, common_types.MODE_PREFILL, common_types.MODE_INSERT):
+            return outputs
+        if getattr(outputs, "last_hidden_state", None) is None:
+            return outputs
+        mtp_output = self.compute_mtp_outputs(outputs, input_ids=input_ids, attention_mask=attention_mask, mode=mode)
+        if mtp_output is None:
+            return outputs
+        mtp_logits = self.compute_mtp_logits(mtp_output)
+        mtp_loss = self.compute_mtp_loss(mtp_logits, input_ids, attention_mask) * coef
+        existing = getattr(outputs, "aux_loss", None)
+        new_aux = mtp_loss if existing is None else existing + mtp_loss
+        return outputs.replace(aux_loss=new_aux, mtp_logits=mtp_logits)
+
+
+@register_module(TaskType.CAUSAL_LM, config=Qwen3_5MoeTextConfig, model_type="qwen3_5_moe")
+@register_module(TaskType.CAUSAL_LM, config=Qwen3_5MoeTextConfig, model_type="qwen3_5_moe_text")
+class Qwen3_5MoeForCausalLM(_Qwen3_5MoeMTPMixin, Qwen3NextForCausalLM):
+    """Qwen3.5-MoE text causal language model.
+
+    Wraps :class:`Qwen3_5MoeTextModel` with a linear LM head for next-token
+    prediction.  Supports MoE routing with auxiliary load-balancing loss.
+
+    Args:
+        config: Qwen3.5-MoE text configuration.
+        dtype: Computation dtype.
+        param_dtype: Parameter storage dtype.
+        precision: JAX matmul precision.
+        rngs: PRNG key container.
+    """
+
+    _model_type = "qwen3_5_moe"
+    _config_class = Qwen3_5MoeTextConfig
+
+    def __init__(
+        self,
+        config: Qwen3_5MoeTextConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize Qwen3.5-MoE text causal LM.
+
+        Args:
+            config: Qwen3.5-MoE text configuration.
+            dtype: Computation data type.
+            param_dtype: Parameter storage data type.
+            precision: JAX matmul precision.
+            rngs: PRNG key container.
+        """
+        BaseCausalLMModule.__init__(
+            self,
+            config=config,
+            base_model_class=Qwen3_5MoeTextModel,
+            base_model_name="model",
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            lm_head_bias=False,
+            router_aux_loss_coef=getattr(config, "router_aux_loss_coef", None),
+        )
+        if int(getattr(config, "mtp_num_hidden_layers", 0)) > 0:
+            self.mtp = Qwen3_5MTPHead(
+                config=config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                use_moe_mlp=_mtp_mlp_is_moe(config),
+                rngs=rngs,
+            )
+        else:
+            self.mtp = None
+
+    def forward(
+        self,
+        input_ids: jnp.ndarray | None = None,
+        inputs_embeds: jnp.ndarray | None = None,
+        attention_mask: jnp.ndarray | None = None,
+        mask_info=None,
+        position_ids: jnp.ndarray | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        output_router_logits: bool | None = None,
+        mode=None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        apply_lm_head: bool = True,
+    ) -> MoeCausalLMOutput:
+        """Causal-LM forward with the MTP auxiliary loss folded into ``aux_loss``."""
+        outputs = super().forward(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            mask_info=mask_info,
+            position_ids=position_ids,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            output_router_logits=output_router_logits,
+            mode=mode,
+            past_key_values=past_key_values,
+            cache_metadata=cache_metadata,
+            apply_lm_head=apply_lm_head,
+        )
+        mtp_mode = mode
+        if mtp_mode is None and (past_key_values is not None or cache_metadata is not None):
+            seq_len = (
+                input_ids.shape[1]
+                if input_ids is not None
+                else (inputs_embeds.shape[1] if inputs_embeds is not None else None)
+            )
+            mtp_mode = common_types.MODE_DECODE if seq_len == 1 else common_types.MODE_PREFILL
+        return self._maybe_add_mtp_aux_loss(outputs, input_ids, attention_mask, mtp_mode)
+
+
+@register_module(TaskType.BASE_MODULE, config=Qwen3_5MoeConfig, model_type="qwen3_5_moe")
+@register_module(TaskType.VISION_LM, config=Qwen3_5MoeConfig, model_type="qwen3_5_moe")
+class Qwen3_5MoeModel(Qwen3VLMoeModel):
+    """Qwen3.5-MoE multimodal (vision-language) base model.
+
+    Combines a :class:`Qwen3VLMoeVisionTransformerPretrainedModel` vision encoder
+    with a :class:`Qwen3_5MoeTextModel` MoE language backbone. Image and video
+    pixels are encoded into continuous embeddings, fused into the token embedding
+    stream, and processed by the language model with 3D mRoPE position ids.
+
+    Args:
+        config: Qwen3.5-MoE multimodal configuration.
+        dtype: Computation dtype.
+        param_dtype: Parameter storage dtype.
+        precision: JAX matmul precision.
+        rngs: PRNG key container.
+    """
+
+    def __init__(
+        self,
+        config: Qwen3_5MoeConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize Qwen3.5-MoE multimodal model with vision encoder and MoE text decoder.
+
+        Args:
+            config: Qwen3.5-MoE multimodal configuration.
+            dtype: Computation data type.
+            param_dtype: Parameter storage data type.
+            precision: JAX matmul precision.
+            rngs: PRNG key container.
+        """
+        bootstrap_text_config = Qwen3VLMoeTextConfig(
+            vocab_size=config.text_config.vocab_size,
+            hidden_size=config.text_config.hidden_size,
+            intermediate_size=config.text_config.intermediate_size,
+            num_hidden_layers=config.text_config.num_hidden_layers,
+            num_attention_heads=config.text_config.num_attention_heads,
+            num_key_value_heads=config.text_config.num_key_value_heads,
+            head_dim=config.text_config.head_dim,
+            hidden_act=config.text_config.hidden_act,
+            max_position_embeddings=config.text_config.max_position_embeddings,
+            initializer_range=config.text_config.initializer_range,
+            rms_norm_eps=config.text_config.rms_norm_eps,
+            use_cache=config.text_config.use_cache,
+            tie_word_embeddings=getattr(config.text_config, "tie_word_embeddings", False),
+            rope_theta=config.text_config.rope_theta,
+            attention_bias=config.text_config.attention_bias,
+            attention_dropout=config.text_config.attention_dropout,
+            rope_scaling=getattr(config.text_config, "rope_scaling", None),
+            decoder_sparse_step=getattr(config.text_config, "decoder_sparse_step", 1),
+            moe_intermediate_size=getattr(config.text_config, "moe_intermediate_size", 512),
+            num_experts_per_tok=getattr(config.text_config, "num_experts_per_tok", 4),
+            num_experts=getattr(config.text_config, "num_experts", 8),
+            norm_topk_prob=getattr(config.text_config, "norm_topk_prob", False),
+            output_router_logits=getattr(config.text_config, "output_router_logits", False),
+            router_aux_loss_coef=getattr(config.text_config, "router_aux_loss_coef", 0.001),
+            mlp_only_layers=getattr(config.text_config, "mlp_only_layers", None),
+            layer_types=getattr(config.text_config, "layer_types", None),
+        )
+        bootstrap_config = Qwen3VLMoeConfig(
+            vision_config=(
+                config.vision_config.to_dict()
+                if hasattr(config.vision_config, "to_dict")
+                else vars(config.vision_config)
+            ),
+            text_config=bootstrap_text_config.to_dict(),
+            image_token_id=config.image_token_id,
+            video_token_id=config.video_token_id,
+            vision_start_token_id=config.vision_start_token_id,
+            vision_end_token_id=config.vision_end_token_id,
+            tie_word_embeddings=getattr(config, "tie_word_embeddings", False),
+        )
+        super().__init__(
+            config=bootstrap_config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.config = config
+        # Rebuild vision tower from the final Qwen3.5-MoE vision config so
+        # deepstack settings and parameter names match HF checkpoints.
+        self.visual = Qwen3VLMoeVisionTransformerPretrainedModel(
+            config=config.vision_config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.language_model = Qwen3_5MoeTextModel(
+            config=config.text_config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+
+    def forward(
+        self,
+        input_ids: jax.Array | None = None,
+        inputs_embeds: jax.Array | None = None,
+        attention_mask: jax.Array | None = None,
+        mask_info: object | None = None,
+        position_ids: jax.Array | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        visual_pos_masks: jax.Array | None = None,  # compatibility no-op
+        deepstack_visual_embeds: list[jax.Array] | None = None,  # compatibility no-op
+        pixel_values: jax.Array | None = None,
+        pixel_values_videos: jax.Array | None = None,
+        image_grid_thw: tuple | None = None,
+        video_grid_thw: tuple | None = None,
+        image_max_grid_size: int | None = None,
+        video_max_grid_size: int | None = None,
+        cache_position: jax.Array | None = None,  # compatibility no-op
+        rope_deltas: jax.Array | None = None,  # compatibility no-op
+        mm_token_type_ids: jax.Array | None = None,
+        **kwargs,
+    ) -> Qwen3VLMoeModelOutputWithPast:
+        """Forward pass through the Qwen3.5-MoE multimodal model.
+
+        Encodes image/video inputs via the vision tower, merges them
+        into the text embedding stream at placeholder positions, builds
+        3-D mRoPE indices (from ``mm_token_type_ids`` when supplied or
+        inferred from token IDs otherwise), and runs the Qwen3-Next-based
+        MoE language decoder.
+
+        Args:
+            input_ids: Text token ids ``(batch, seq_len)``; mutually
+                exclusive with ``inputs_embeds``.
+            inputs_embeds: Pre-computed embeddings
+                ``(batch, seq_len, hidden_size)``; mutually exclusive
+                with ``input_ids``.
+            attention_mask: Boolean attention mask ``(batch, seq_len)``.
+            mask_info: Optional pre-built ``MaskInfo``.
+            position_ids: 1-D or 3-D position ids; flattened by
+                :func:`flatten_mrope_position_ids_for_text` when the
+                text config disables mRoPE.
+            mode: Runtime mode (train/decode); auto-detected if ``None``.
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Cache metadata accompanying ``past_key_values``.
+            output_attentions: Whether to return per-layer attention weights.
+            output_hidden_states: Whether to return per-layer hidden states.
+            visual_pos_masks: Compatibility no-op (Qwen3.5-MoE does not
+                use deepstack mergers).
+            deepstack_visual_embeds: Compatibility no-op.
+            pixel_values: Packed image pixel values for the vision tower.
+            pixel_values_videos: Packed video pixel values for the vision tower.
+            image_grid_thw: Per-image ``(T, H, W)`` grid dimensions.
+            video_grid_thw: Per-video ``(T, H, W)`` grid dimensions.
+            image_max_grid_size: Optional shared upper bound on image
+                grid size (static-shape compilation).
+            video_max_grid_size: Same as above for videos.
+            cache_position: Compatibility no-op.
+            rope_deltas: Compatibility no-op (overwritten internally).
+            mm_token_type_ids: Per-token modality ids
+                (0=text, 1=image, 2=video) used for mRoPE construction.
+            **kwargs: Forward-compatibility sink; ignored.
+
+        Returns:
+            Qwen3VLMoeModelOutputWithPast: Decoder outputs with optional
+            hidden states/attentions and the freshly computed
+            ``rope_deltas``. The router logits are routed through the
+            inner Qwen3-Next MoE layers and surface via the wrapping
+            causal-LM module's auxiliary loss.
+
+        Raises:
+            ValueError: If neither or both of ``input_ids`` and
+                ``inputs_embeds`` are provided.
+        """
+        del rope_deltas, kwargs
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+        if inputs_embeds is None:
+            inputs_embeds = self.compute_embedding(input_ids)
+
+        image_embeds = None
+        video_embeds = None
+        if pixel_values is not None:
+            image_embeds_tuple, _deepstack_image_embeds = self.get_image_features(
+                pixel_values,
+                image_grid_thw,
+                image_max_grid_size,
+            )
+            image_embeds = jnp.concatenate(image_embeds_tuple, axis=0).astype(inputs_embeds.dtype)
+        if pixel_values_videos is not None:
+            video_embeds_tuple, _deepstack_video_embeds = self.get_video_features(
+                pixel_values_videos,
+                video_grid_thw,
+                video_max_grid_size,
+            )
+            video_embeds = jnp.concatenate(video_embeds_tuple, axis=0).astype(inputs_embeds.dtype)
+        if image_embeds is not None or video_embeds is not None:
+            inputs_embeds = self.compute_embedding(
+                input_ids,
+                inputs_embeds=inputs_embeds,
+                image_embeds=image_embeds,
+                video_embeds=video_embeds,
+            )
+
+        rope_deltas = None
+        if position_ids is None:
+            if mm_token_type_ids is not None:
+                position_ids, rope_deltas = mrope_position_ids_from_mm_token_types(
+                    input_ids=input_ids,
+                    mm_token_type_ids=mm_token_type_ids,
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    attention_mask=attention_mask,
+                    spatial_merge_size=self.config.vision_config.spatial_merge_size,
+                )
+            else:
+                position_ids, rope_deltas = self.get_rope_index(
+                    input_ids=input_ids,
+                    image_grid_thw=image_grid_thw if pixel_values is not None else None,
+                    video_grid_thw=video_grid_thw if pixel_values_videos is not None else None,
+                    attention_mask=attention_mask,
+                )
+
+        position_ids = flatten_mrope_position_ids_for_text(self.config.text_config, position_ids)
+
+        outputs = self.language_model(
+            input_ids=None,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            mask_info=mask_info,
+            position_ids=position_ids,
+            mode=mode,
+            past_key_values=past_key_values,
+            cache_metadata=cache_metadata,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+        )
+
+        return Qwen3VLMoeModelOutputWithPast(
+            last_hidden_state=outputs.last_hidden_state,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            rope_deltas=rope_deltas,
+        )
+
+
+@register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=Qwen3_5MoeConfig, model_type="qwen3_5_moe")
+class Qwen3_5MoeForConditionalGeneration(
+    _Qwen3_5MoeMTPMixin, BaseVisionLanguageModule[Qwen3_5MoeModel, Qwen3_5MoeConfig]
+):
+    """Qwen3.5-MoE multimodal conditional generation model.
+
+    End-to-end vision-language model that wraps :class:`Qwen3_5MoeModel` and
+    adds a causal LM head for image/video-conditioned text generation.
+    Supports both image and video inputs via the underlying vision encoder
+    and uses MoE routing in the language backbone.
+
+    Args:
+        config: Qwen3.5-MoE multimodal configuration.
+        dtype: Computation dtype.
+        param_dtype: Parameter storage dtype.
+        precision: JAX matmul precision.
+        rngs: PRNG key container.
+    """
+
+    _task_type = TaskType.IMAGE_TEXT_TO_TEXT
+    _model_type = "qwen3_5_moe"
+    _config_class = Qwen3_5MoeConfig
+    _auto_register = False
+    _supports_video = True
+    _uses_mrope = True
+
+    _vision_tower_name = "visual"
+    _projector_name = "merger"
+    _language_model_name = "language_model"
+
+    loss_type = "ForCausalLM"
+
+    def __init__(
+        self,
+        config: Qwen3_5MoeConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize Qwen3.5 MoE vision-language model for conditional generation.
+
+        Sets up the MoE text backbone with vision encoder integration for
+        multimodal understanding. Uses spatial merge for image/video token merging.
+
+        Args:
+            config: Vision-language model configuration with text and vision configs.
+            dtype: Computation data type.
+            param_dtype: Parameter storage data type.
+            precision: JAX numerical precision.
+            rngs: Random number generator state.
+        """
+        super().__init__(
+            config=config,
+            base_model_class=Qwen3_5MoeModel,
+            base_model_name="model",
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            vision_feature_layer=-1,
+            vision_feature_select_strategy="default",
+            image_token_index=config.image_token_id,
+            video_token_index=config.video_token_id,
+            spatial_merge_size=config.vision_config.spatial_merge_size,
+            router_aux_loss_coef=getattr(config.text_config, "router_aux_loss_coef", 0.001),
+            tie_word_embeddings=getattr(config, "tie_word_embeddings", False),
+            lm_head_bias=False,
+        )
+        self.vocab_size = config.text_config.vocab_size
+        if int(getattr(config.text_config, "mtp_num_hidden_layers", 0)) > 0:
+            self.mtp = Qwen3_5MTPHead(
+                config=config.text_config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                use_moe_mlp=_mtp_mlp_is_moe(config.text_config),
+                rngs=rngs,
+            )
+        else:
+            self.mtp = None
+
+    # MTP hooks for the multimodal trunk (override the mixin defaults).
+    def _mtp_embed(self, token_ids_i4):
+        return self.model.get_input_embeddings()(token_ids_i4)
+
+    def _mtp_frequencies(self):
+        return getattr(self.model.language_model, "frequencies", None)
+
+    def _mtp_loss_coef(self) -> float:
+        return float(getattr(self.config.text_config, "mtp_loss_coef", 0.0))
+
+    def forward(self, *args, **kwargs):
+        """Vision-language forward with the MTP auxiliary loss folded into ``aux_loss``."""
+        outputs = super().forward(*args, **kwargs)
+        if self.mtp is None:
+            return outputs
+        input_ids = kwargs.get("input_ids")
+        if input_ids is None and args:
+            input_ids = args[0]
+        attention_mask = kwargs.get("attention_mask")
+        mode = kwargs.get("mode")
+        past_key_values = kwargs.get("past_key_values")
+        cache_metadata = kwargs.get("cache_metadata")
+        if mode is None and (past_key_values is not None or cache_metadata is not None):
+            inputs_embeds = kwargs.get("inputs_embeds")
+            seq_len = (
+                input_ids.shape[1]
+                if input_ids is not None
+                else (inputs_embeds.shape[1] if inputs_embeds is not None else None)
+            )
+            mode = common_types.MODE_DECODE if seq_len == 1 else common_types.MODE_PREFILL
+        return self._maybe_add_mtp_aux_loss(outputs, input_ids, attention_mask, mode)
+
+    def get_input_embeddings(self):
+        """Return the shared text token embedding layer.
+
+        Delegates to the wrapped multimodal :class:`Qwen3VLModel`, which
+        owns the ``Embed`` table used to project ``input_ids`` to
+        ``hidden_size`` before visual fusion.
+
+        Returns:
+            spx.Module: The text token embedding module.
+        """
+        return self.model.get_input_embeddings()
+
+    def set_input_embeddings(self, value):
+        """Replace the shared text token embedding layer.
+
+        Args:
+            value: Replacement embedding module accepting ``input_ids`` of
+                shape ``(batch, seq_len)`` and producing hidden states of
+                shape ``(batch, seq_len, hidden_size)``.
+        """
+        self.model.set_input_embeddings(value)
+
+    def set_decoder(self, decoder):
+        """Replace the underlying Qwen3-Next MoE decoder stack.
+
+        Args:
+            decoder: Replacement language-model module compatible with
+                :class:`Qwen3NextModel` (MoE-aware in this configuration).
+        """
+        self.model.set_decoder(decoder)
+
+    def get_decoder(self):
+        """Return the wrapped Qwen3-Next MoE decoder stack.
+
+        Returns:
+            spx.Module: The text decoder; same instance as
+            ``self.model.language_model``.
+        """
+        return self.model.get_decoder()
+
+    @property
+    def visual(self):
+        """Backward-compatible alias for the Qwen3-VL vision tower.
+
+        Returns:
+            spx.Module: The Qwen3-VL vision transformer used to encode
+            images and videos before merging into the text sequence.
+        """
+        return self.model.visual
+
+    @property
+    def language_model(self):
+        """Backward-compatible alias for the Qwen3-Next MoE language trunk.
+
+        Returns:
+            spx.Module: The MoE-flavored Qwen3-Next decoder; emits
+            per-layer router losses that are aggregated into
+            ``aux_loss`` by the surrounding causal-LM wrapper.
+        """
+        return self.model.language_model
+
+    def get_video_features(
+        self,
+        pixel_values_videos: jax.Array,
+        video_grid_thw: jax.Array | None = None,
+        video_max_grid_size: int | None = None,
+    ) -> tuple[tuple[jax.Array, ...], list[jax.Array]]:
+        """Encode video tensors into per-grid visual embeddings.
+
+        Args:
+            pixel_values_videos: Packed pixel values of shape
+                ``(num_video_patches, ...)`` produced by the Qwen3-VL
+                processor.
+            video_grid_thw: Per-video ``(T, H, W)`` grid dimensions used
+                to slice the packed encoder output back into per-video
+                groups.
+            video_max_grid_size: Optional shared grid-size cap for static
+                shape compilation.
+
+        Returns:
+            A tuple ``(per_video_embeddings, split_sizes)`` where the
+            first element is a tuple of ``(num_tokens_i, hidden_size)``
+            arrays (one per video) ready for placeholder substitution.
+        """
+        return self.model.get_video_features(pixel_values_videos, video_grid_thw, video_max_grid_size)
+
+    def get_image_features(
+        self,
+        pixel_values: jax.Array,
+        image_grid_thw: jax.Array | None = None,
+        image_max_grid_size: int | None = None,
+    ) -> tuple[tuple[jax.Array, ...], list[jax.Array]]:
+        """Encode image tensors into per-image visual embeddings.
+
+        Args:
+            pixel_values: Packed pixel values of shape
+                ``(num_image_patches, ...)``.
+            image_grid_thw: Per-image ``(T, H, W)`` grid dimensions
+                (``T == 1``) used to locate placeholder positions.
+            image_max_grid_size: Optional shared grid-size cap.
+
+        Returns:
+            A tuple ``(per_image_embeddings, split_sizes)`` matching the
+            convention of :meth:`get_video_features`.
+        """
+        return self.model.get_image_features(pixel_values, image_grid_thw, image_max_grid_size)
+
+    def compute_embedding(self, input_ids, *args, **kwargs):
+        """Compute the merged text + multimodal input embeddings.
+
+        Embeds ``input_ids`` with the text token table and then splices
+        in vision-tower hidden states at every position whose token id
+        equals the configured image / video placeholder. The merge is
+        done with the cumsum-based scatter from
+        :class:`MultiModalMergeFeature` so the result remains
+        differentiable and JIT-compatible.
+
+        Args:
+            input_ids: Input token ids of shape ``(batch, seq_len)``.
+            *args: Forwarded positional arguments accepted by
+                ``Qwen3VLModel.compute_embedding`` (typically image and
+                video pixel/grid tensors).
+            **kwargs: Forwarded keyword arguments.
+
+        Returns:
+            Merged input embeddings of shape
+            ``(batch, seq_len, hidden_size)``.
+        """
+        return self.model.compute_embedding(input_ids, *args, **kwargs)
+
+
+__all__ = [
+    "Qwen3_5MoeConfig",
+    "Qwen3_5MoeForCausalLM",
+    "Qwen3_5MoeForConditionalGeneration",
+    "Qwen3_5MoeModel",
+    "Qwen3_5MoeTextConfig",
+    "Qwen3_5MoeTextModel",
+]

@@ -1,0 +1,948 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Phi-3 model implementation for EasyDeL.
+
+This module implements Microsoft's Phi-3 family of small/medium-scale
+decoder-only language models. Notable architectural traits:
+
+- Fused ``qkv_proj`` and ``gate_up_proj`` linear layers for the attention
+  and MLP blocks (split internally during the forward pass).
+- RMSNorm normalization throughout (replacing Phi's LayerNorm).
+- Full rotary position embeddings (RoPE), optionally extended via
+  long-rope scaling for extended context windows.
+- Optional sliding-window attention with per-layer mask configuration.
+- Bias-free linear layers in attention/MLP.
+
+Exposes :class:`Phi3Model` (transformer trunk) and the task-specific
+wrappers :class:`Phi3ForCausalLM` and :class:`Phi3ForSequenceClassification`.
+"""
+
+import functools
+from typing import ClassVar
+
+import jax
+import spectrax as spx
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
+from jax import numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
+
+from easydel.caching import (
+    HybridCache,
+    OperationsMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
+    TransformerCache,
+    TransformerCacheView,
+    TransformerMetadata,
+)
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import TaskType, register_module
+from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, CausalLMOutput, DecoderLayerOutput
+from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
+from easydel.layers import (
+    ColumnParallelLinear,
+    Embed,
+    RowParallelLinear,
+    dense_gate_up_layout,
+    dense_qkv_layout,
+    gated_mlp_forward,
+    split_fused_qkv_projection,
+)
+from easydel.layers import RMSNorm as RMSNorm
+from easydel.layers.attention import UnifiedAttention
+from easydel.modules._base import BaseCausalLMModule
+
+from .phi3_configuration import Phi3Config
+
+
+class Phi3MLP(spx.Module):
+    """Multi-Layer Perceptron module for Phi-3 models.
+
+    Implements the gated feedforward network (GLU variant) used in Phi-3 architecture.
+    Uses a fused gate-up projection followed by SiLU activation gating and down-projection
+    for improved computational efficiency.
+    """
+
+    def __init__(
+        self,
+        config: Phi3Config,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+        layer_idx: int,
+    ):
+        """Initialize Phi-3 MLP block with gated activation.
+
+        Args:
+            config (Phi3Config): Model configuration with MLP parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Precision setting for JAX operations.
+                Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+            layer_idx (int): Index of the current layer in the model.
+        """
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.gate_up_proj = ColumnParallelLinear(
+            config.hidden_size,
+            (config.intermediate_size, config.intermediate_size),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            rngs=rngs,
+            # HF Phi-3 checkpoints store gate_up_proj pre-fused (one tensor).
+            layout=dense_gate_up_layout(config.intermediate_size, source_is_fused=True),
+        )
+        self.down_proj = RowParallelLinear(
+            config.intermediate_size,
+            config.hidden_size,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            rngs=rngs,
+        )
+        self.act_fn = ACT2FN[self.config.hidden_act]
+
+    @property
+    def reform_param(self) -> dict:
+        """Checkpoint rules for the pre-fused HF ``gate_up_proj`` tensor."""
+        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config, include_bias=False)
+
+    def forward(
+        self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
+    ) -> Float[Array, "batch seq_len hidden_dim"]:
+        """Apply gated feedforward transformation.
+
+        Delegates to :func:`easydel.layers.gated_mlp_forward`, which routes
+        supported layouts through the ejkernel fused MLP kernels and runs
+        the legacy composition otherwise.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, hidden_dim]
+
+        Returns:
+            Transformed hidden states [batch, seq_len, hidden_dim] after gated MLP
+        """
+        return gated_mlp_forward(self, hidden_states)
+
+
+class Phi3Attention(UnifiedAttention):
+    """Multi-head attention layer with fused QKV projection for Phi-3 models.
+
+    Implements attention with Phi-3 specific features including fused query/key/value
+    projections for efficiency, Grouped Query Attention (GQA), Rotary Position Embeddings
+    (RoPE), and optional sliding window attention for local context modeling.
+    """
+
+    projection_mapping: ClassVar[dict[str, str]] = {
+        "output_projection": "o_proj",
+        "query_key_value_projection": "qkv_proj",
+    }
+
+    def __init__(
+        self,
+        config: Phi3Config,
+        layer_idx: int,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize Phi-3 attention layer with fused QKV projection and sliding window.
+
+        Args:
+            config (Phi3Config): Model configuration with attention parameters.
+            layer_idx (int): Index of this layer in the model.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+
+        Raises:
+            ValueError: If `hidden_size` is not divisible by `num_heads`.
+        """
+        super().__init__(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            layer_idx=layer_idx,
+            attention_type="standard",
+            causal=True,
+            sliding_window=config.sliding_window,
+        )
+
+    def define_network(
+        self,
+        config: Phi3Config,
+        dtype: jnp.dtype,
+        param_dtype: jnp.dtype,
+        precision: jax.lax.PrecisionLike,
+        rngs: spx.Rngs,
+    ):
+        """Create fused QKV projection instead of separate Q/K/V projections.
+
+        Overrides base implementation to use a single fused linear layer for
+        query, key, and value projections, improving computational efficiency.
+
+        Args:
+            config: Model configuration with attention parameters.
+            dtype: Data type for computations.
+            param_dtype: Data type for parameters.
+            precision: JAX precision setting for matrix operations.
+            rngs: Random number generator state.
+        """
+        q_size = config.num_attention_heads * self.head_dim
+        kv_size = config.num_key_value_heads * self.head_dim
+
+        self.qkv_proj = ColumnParallelLinear(
+            config.hidden_size,
+            (q_size, kv_size, kv_size),
+            rngs=rngs,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            # HF Phi-3 checkpoints store qkv_proj pre-fused (one tensor).
+            layout=dense_qkv_layout(q_size, kv_size, source_is_fused=True),
+        )
+        self.o_proj = self._create_o_proj(config, dtype, param_dtype, precision, rngs)
+        self.attention_performer = self._create_attention_performer(config, rngs)
+        self.rotary = self._create_rotary(config, dtype)
+        if hasattr(config, "resid_pdrop") and config.resid_pdrop > 0:
+            self.resid_dropout = nn.Dropout(rate=config.resid_pdrop, rngs=rngs)
+        else:
+            self.resid_dropout = None
+
+    def _create_rotary(self, config: Phi3Config, dtype: jnp.dtype):
+        """Create rotary position embedding for Phi-3 attention.
+
+        Configures RoPE with Phi-3 specific parameters including custom base theta
+        and NeoX-style interleaving for position encoding.
+
+        Args:
+            config: Model configuration with RoPE parameters.
+            dtype: Data type for rotary embeddings.
+
+        Returns:
+            Rotary position embedding module configured for Phi-3.
+        """
+        return config.get_basic_rope(
+            dtype=dtype,
+            head_size=self.head_dim,
+            base=config.rope_theta,
+            is_neox_style=True,
+        )
+
+    def forward(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo | None,
+        position_ids: Int[Array, "batch seq_len"],
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool = False,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
+    ) -> AttentionLayerOutput:
+        """Compute attention with fused QKV projection and optional sliding window.
+
+        Applies fused query/key/value projection, rotary position embeddings,
+        and grouped query attention with optional sliding window masking.
+
+        Args:
+            hidden_states: Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info: Attention mask information including causal and padding masks.
+            position_ids: Position indices for tokens, shape (batch_size, sequence_length).
+            mode: Runtime mode (MODE_TRAIN, MODE_DECODE, MODE_INFER) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional):
+                Cache view for key/value states during generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for paged attention mechanisms. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights.
+                Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies.
+                Defaults to None.
+
+        Returns:
+            AttentionLayerOutput containing attention output, optional weights, and cache view.
+        """
+        batch_size, sequence_length = hidden_states.shape[:2]
+        qkv = checkpoint_name(self.qkv_proj(hidden_states), "attn_qkv")
+        q_size = self.config.num_attention_heads * self.head_dim
+        kv_size = self.config.num_key_value_heads * self.head_dim
+        query_states, key_states, value_states = split_fused_qkv_projection(
+            qkv,
+            q_size=q_size,
+            kv_size=kv_size,
+            config=self.config,
+        )
+
+        query_states = query_states.reshape(
+            batch_size,
+            sequence_length,
+            self.config.num_attention_heads,
+            self.head_dim,
+        )
+        key_states = key_states.reshape(
+            batch_size,
+            sequence_length,
+            self.config.num_key_value_heads,
+            self.head_dim,
+        )
+        value_states = value_states.reshape(
+            batch_size,
+            sequence_length,
+            self.config.num_key_value_heads,
+            self.head_dim,
+        )
+
+        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
+        query_states, key_states = self._apply_rotary(query_states, key_states, position_ids, frequencies)
+        (
+            key_states,
+            value_states,
+            mask_info,
+            init_attention_bias,
+            cache_view,
+            cache_metadata,
+        ) = self.concatenate(
+            query=query_states,
+            key=key_states,
+            value=value_states,
+            cache_view=cache_view,
+            cache_metadata=cache_metadata,
+            mask_info=mask_info,
+            sliding_window=self.sliding_window,
+        )
+        attentions = self.attention_performer.forward(
+            query_states=query_states,
+            key_states=key_states,
+            value_states=value_states,
+            mode=mode,
+            bias=None,
+            cache_metadata=cache_metadata,
+            cache_view=cache_view,
+            init_bias=init_attention_bias,
+            mask_info=mask_info,
+            causal=True,
+            sliding_window=self.sliding_window,
+        )
+        attn_output = self._merge_heads(attentions.attention_outputs)
+        attn_output = self.shard_attention_prod(attn_output=attn_output)
+        attn_output = checkpoint_name(self.output_projection(attn_output), "attn_output")
+        attn_output = self.shard_attention_prod(attn_output=attn_output)
+        if self.resid_dropout is not None:
+            attn_output = self.resid_dropout(attn_output)
+
+        return AttentionLayerOutput(
+            attention_output=attn_output,
+            attention_weight=attentions.attention_weights if output_attentions else None,
+            cache_view=cache_view,
+        )
+
+
+class Phi3DecoderLayer(spx.Module):
+    """Single decoder layer for Phi-3 models.
+
+    Combines multi-head attention with fused QKV projection and gated MLP
+    sublayers using pre-normalization with RMSNorm and residual connections.
+    Supports sliding window attention for efficient long-context modeling.
+    """
+
+    def __init__(
+        self,
+        config: Phi3Config,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+        layer_idx: int,
+    ):
+        """Initialize Phi-3 decoder layer.
+
+        Args:
+            config (Phi3Config): Model configuration with layer parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.self_attn = Phi3Attention(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            layer_idx=layer_idx,
+        )
+        self.mlp = Phi3MLP(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            layer_idx=layer_idx,
+        )
+        self.input_layernorm = RMSNorm(
+            dim=config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+
+        self.resid_attn_dropout = nn.Dropout(
+            self.config.resid_pdrop,
+            rngs=rngs,
+        )
+        self.resid_mlp_dropout = nn.Dropout(
+            self.config.resid_pdrop,
+            rngs=rngs,
+        )
+        self.post_attention_layernorm = RMSNorm(
+            dim=self.config.hidden_size,
+            eps=self.config.rms_norm_eps,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+
+    def forward(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo | None,
+        position_ids: Int[Array, "batch seq_len"],
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool = False,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
+    ):
+        """Forward pass through the decoder layer.
+
+        Applies pre-norm architecture: norm(x) → attention → residual →
+        norm(x) → mlp → residual with dropout on sublayer outputs.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo | None): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view.
+                Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+
+        Returns:
+            DecoderLayerOutput: Contains hidden states, attention weights, and cache view.
+        """
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+
+        attn_outputs = self.self_attn(
+            hidden_states,
+            mask_info,
+            position_ids,
+            mode,
+            cache_view,
+            cache_metadata,
+            output_attentions,
+            frequencies,
+        )
+
+        hidden_states = checkpoint_name(self.resid_attn_dropout(attn_outputs.attention_output) + residual, "residual")
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        if self.config.use_scan_mlp:
+            feed_forward_hidden_states = blockwise_ffn(
+                self.mlp,
+                hidden_states,
+                self.config.scan_mlp_chunk_size,
+            )
+        else:
+            feed_forward_hidden_states = self.mlp(hidden_states)
+
+        hidden_states = checkpoint_name(residual + self.resid_mlp_dropout(feed_forward_hidden_states), "residual")
+        hidden_states = checkpoint_name(hidden_states, "layer_output")
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+        return DecoderLayerOutput(
+            hidden_states=hidden_states,
+            attention_weight=attn_outputs.attention_weight,
+            cache_view=attn_outputs.cache_view,
+        )
+
+
+@register_module(TaskType.BASE_MODULE, config=Phi3Config, model_type="phi3")
+class Phi3Model(EasyDeLBaseModule):
+    """Phi-3 base model implementation.
+
+    Implements the core Phi-3 transformer architecture with fused QKV projections,
+    Grouped Query Attention, RoPE position embeddings, gated MLP with SiLU activation,
+    and optional sliding window attention for efficient long-context modeling.
+
+    Attributes:
+        config (Phi3Config): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
+
+    def __init__(
+        self,
+        config: Phi3Config,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize Phi-3 base model.
+
+        Args:
+            config (Phi3Config): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
+        super().__init__(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+
+        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+            self.embed_tokens = Embed(
+                config.vocab_size,
+                config.hidden_size,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
+
+        self.embed_dropout = nn.Dropout(config.embd_pdrop, rngs=rngs)
+        remat_layer_block = auto_remat(
+            Phi3DecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.layers = nn.ModuleList([])
+        for idx in range(self.config.num_hidden_layers):
+            with self.assign_layer_stage(idx, total_layers=self.config.num_hidden_layers):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        layer_idx=idx,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
+                )
+        if self.config.scan_layers and self._pipeline_stage_count() == 1:
+            self.layers = self.layers.stack()
+        final_layer_idx = max(0, self.config.num_hidden_layers - 1)
+        with self.assign_layer_stage(final_layer_idx, total_layers=self.config.num_hidden_layers):
+            self.norm = RMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                dtype=dtype,
+                param_dtype=param_dtype,
+            )
+
+    @functools.cached_property
+    def frequencies(self):
+        """Compute rotary position embedding frequencies.
+
+        Returns:
+            Precomputed frequency tensor for rotary embeddings with shape
+            determined by head dimension and RoPE theta base.
+        """
+        return self.config.get_basic_frequencies(
+            head_size=self.config.hidden_size // self.config.num_attention_heads,
+            base=self.config.rope_theta,
+        )
+
+    def forward(
+        self,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        trace: bool = False,
+    ) -> BaseModelOutput:
+        """Performs a forward pass through the Phi-3 transformer model.
+
+        Processes input tokens through embedding, multiple decoder layers with fused
+        QKV attention, RoPE, and optional sliding window, and final RMSNorm to produce
+        contextualized hidden states.
+
+        Args:
+            input_ids: Input token IDs of shape (batch_size, sequence_length). Either this
+                or `inputs_embeds` must be provided but not both.
+            inputs_embeds: Pre-computed input embeddings of shape (batch_size, sequence_length,
+                hidden_size). Use instead of `input_ids` for custom embeddings.
+            attention_mask: Boolean mask of shape (batch_size, sequence_length) where True
+                indicates tokens to attend to and False indicates padding to ignore.
+            mask_info: Pre-computed mask information object. If provided, `attention_mask`
+                is ignored.
+            position_ids: Explicit position indices of shape (batch_size, sequence_length).
+                Auto-generated from mask_info if not provided.
+            mode: Runtime mode controlling behavior (MODE_TRAIN, MODE_DECODE, MODE_INFER).
+                Auto-detected based on sequence length and cache presence if None.
+            past_key_values: Cached key/value states from previous forward passes for
+                efficient autoregressive generation. Supports TransformerCache,
+                RaggedPagesCache, or HybridCache formats.
+            cache_metadata: Metadata for paged attention mechanisms, required when using
+                RaggedPagesCache.
+            output_attentions: Whether to return attention weights from all layers.
+                Defaults to config.output_attentions.
+            output_hidden_states: Whether to return hidden states from all layers.
+                Defaults to config.output_hidden_states.
+
+        Returns:
+            BaseModelOutput containing:
+                - last_hidden_state: Final layer output of shape (batch, seq_len, hidden_size)
+                - hidden_states: Tuple of all layer outputs if output_hidden_states=True
+                - attentions: Tuple of all attention weights if output_attentions=True
+                - past_key_values: Updated cache for next generation step
+
+        Raises:
+            ValueError: If neither `input_ids` nor `inputs_embeds` is provided, or if both
+                are provided simultaneously.
+            AssertionError: If sequence length exceeds max_position_embeddings.
+        """
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError(
+                "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+            )
+        if inputs_embeds is None:
+            inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
+        sequence_length = inputs_embeds.shape[1]
+
+        all_attentions = () if output_attentions else None
+        all_hidden_states = () if output_hidden_states else None
+        assert sequence_length <= self.config.max_position_embeddings, (
+            f"Maximum Position Embedding Reached ! "
+            f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
+        )
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=mask_info,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
+        if position_ids is None:
+            position_ids = mask_info.q_position_ids
+
+        if mode is None:
+            mode = (
+                common_types.MODE_DECODE
+                if sequence_length == 1 and past_key_values is not None
+                else common_types.MODE_TRAIN
+            )
+        if past_key_values is None:
+            past_key_values = TransformerCache.init_empty(len(self.layers))
+
+        hidden_states = apply_logical_sharding(
+            inputs_embeds,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
+        frequencies = self.config.get_basic_frequencies()
+
+        trace_layers = self._layer_scan_trace(
+            trace,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache,
+        )
+        cache_views = views if trace_layers else None
+
+        def _run_layer(block, carry):
+            """Apply a single decoder layer inside the layer-stack scan.
+
+            Body of ``self.layers.scan``; runs ``block`` on the current
+            hidden states with the appropriate cache view, optionally
+            accumulating per-layer hidden states / attention weights,
+            and returns the updated carry tuple.
+            """
+            hs, cv, ah, aa, idx = carry
+            if output_hidden_states:
+                ah = (*ah, hs)
+            with self._layer_stage_context(idx, layers=self.layers):
+                layer_outputs = block(
+                    hidden_states=hs,
+                    mask_info=mask_info,
+                    position_ids=position_ids,
+                    mode=mode,
+                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                    cache_metadata=cache_metadata,
+                    output_attentions=output_attentions,
+                    frequencies=frequencies,
+                )
+            hs = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                layer_outputs.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
+            if output_attentions:
+                aa = (*aa, layer_outputs.attention_weight)
+            return hs, cv, ah, aa, idx + 1
+
+        init_carry = (hidden_states, cache_views, all_hidden_states, all_attentions, 0)
+        hidden_states, _, all_hidden_states, all_attentions, _ = self.layers.scan(
+            _run_layer,
+            init_carry,
+            trace=trace_layers,
+        )
+        hidden_states = self.norm(hidden_states)
+        hidden_states = checkpoint_name(hidden_states, "model_output")
+
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        return BaseModelOutput(
+            last_hidden_state=hidden_states,
+            hidden_states=all_hidden_states,
+            attentions=all_attentions,
+            past_key_values=past_key_values,
+        )
+
+    def get_encoder(self):
+        """
+        Returns the encoder part of the model's graph definition.
+        Decoder-Only models don't have an encoder.
+        """
+        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
+
+    def get_decoder(self):
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self
+
+    def get_lm_head(self):
+        """
+        Returns the language model head of the module.
+        Base Models don't have a Language Model Head.
+        """
+        raise NotImplementedError("The base model does not have a language model head.")
+
+    def get_embedding(self):
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.embed_tokens
+
+
+@register_module(TaskType.CAUSAL_LM, config=Phi3Config, model_type="phi3")
+class Phi3ForCausalLM(BaseCausalLMModule[Phi3Model, Phi3Config]):
+    """Phi-3 model with a language modeling head for causal language modeling tasks.
+
+    This model is a transformer-based language model with causal attention masks
+    applied to perform autoregressive language generation, featuring fused QKV
+    projections, Grouped Query Attention, and optional sliding window attention.
+
+    Attributes:
+        config (Phi3Config): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision: Precision setting for JAX operations.
+    """
+
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "phi3"
+    _config_class = Phi3Config
+
+    def __init__(
+        self,
+        config: Phi3Config,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize Phi-3 model for causal language modeling.
+
+        Args:
+            config (Phi3Config): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
+        super().__init__(
+            config=config,
+            base_model_class=Phi3Model,
+            base_model_name="model",
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            lm_head_bias=False,
+        )
+
+    def forward(
+        self,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        apply_lm_head: bool = True,
+    ) -> CausalLMOutput:
+        """Performs forward pass for causal language modeling with Phi-3.
+
+        Processes input through the base Phi-3 transformer and applies a language modeling
+        head to produce next-token prediction logits.
+
+        Args:
+            input_ids: Input token IDs of shape (batch_size, sequence_length). Either this
+                or `inputs_embeds` must be provided but not both.
+            inputs_embeds: Pre-computed input embeddings of shape (batch_size, sequence_length,
+                hidden_size). Use instead of `input_ids` for custom embeddings.
+            attention_mask: Boolean mask of shape (batch_size, sequence_length) indicating
+                which tokens to attend to (True) and which to ignore (False).
+            mask_info: Pre-computed mask information. If provided, overrides `attention_mask`.
+            position_ids: Explicit position indices of shape (batch_size, sequence_length).
+                Auto-generated if not provided.
+            output_attentions: Whether to return attention weights from all layers.
+            output_hidden_states: Whether to return hidden states from all layers.
+            mode: Runtime mode (MODE_TRAIN, MODE_DECODE, MODE_INFER). Auto-detected if None.
+            past_key_values: Cached key/value states for efficient generation.
+            cache_metadata: Metadata for paged attention caching.
+            apply_lm_head: Whether to apply the language modeling head. Set False to get
+                only hidden states without computing logits.
+
+        Returns:
+            CausalLMOutput containing:
+                - logits: Next-token prediction logits of shape (batch, seq_len, vocab_size)
+                    if apply_lm_head=True, else None
+                - hidden_states: Tuple of layer outputs if output_hidden_states=True
+                - last_hidden_state: Final layer output of shape (batch, seq_len, hidden_size)
+                - attentions: Tuple of attention weights if output_attentions=True
+                - past_key_values: Updated cache for next generation step
+        """
+
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            mask_info=mask_info,
+            position_ids=position_ids,
+            mode=mode,
+            past_key_values=past_key_values,
+            cache_metadata=cache_metadata,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            inputs_embeds=inputs_embeds,
+        )
+        hidden_states = outputs.last_hidden_state
+
+        lm_logits = None
+        if apply_lm_head:
+            lm_logits = self.compute_lm_logits(hidden_states)
+
+        return CausalLMOutput(
+            logits=lm_logits,
+            hidden_states=outputs.hidden_states,
+            last_hidden_state=outputs.last_hidden_state,
+            attentions=outputs.attentions,
+            past_key_values=outputs.past_key_values,
+        )
+
+    def get_encoder(self):
+        """
+        Returns the encoder part of the model's graph definition.
+        Decoder-Only models don't have an encoder.
+        """
+        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
+
+    def get_decoder(self):
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self.model.get_decoder()
+
+    def get_lm_head(self):
+        """
+        Returns the language model head of the module.
+        """
+        return self.lm_head
+
+    def get_embedding(self):
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.model.get_embedding()

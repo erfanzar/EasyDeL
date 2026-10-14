@@ -1,0 +1,299 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Configuration dataclass for the SDPO trainer.
+
+Defines :class:`SDPOConfig`, which extends :class:`GRPOConfig` with
+the self-distillation knobs: feedback-length budget, KL/JSD loss
+selection, and an inherited (defaulted-to-zero) ``beta`` for the
+optional reference KL penalty.
+"""
+
+from dataclasses import dataclass, field
+
+from easydel.utils import Registry
+from easydel.utils.compiling_utils import hash_fn
+
+from ..group_relative_policy_optimization.grpo_config import GRPOConfig
+
+
+@Registry.register("trainer-arguments", "sdpo")
+@dataclass
+class SDPOConfig(GRPOConfig):
+    """Configuration for Self-Distillation Policy Optimization (SDPO).
+
+    SDPO converts tokenized environment feedback into a dense learning signal
+    without any external teacher or reward model by using the current policy
+    as a self-teacher. The model is prompted with its original attempt plus
+    feedback, and the resulting next-token distribution is distilled back into
+    the student policy.
+
+    This approach removes the information bottleneck of scalar outcome rewards
+    (as in GRPO) by leveraging rich textual feedback — runtime errors, failing
+    tests, or LLM judge evaluations — to provide token-level credit assignment.
+
+    When no rich feedback function is supplied the trainer falls back to the
+    paper's "learning without rich feedback" mode (Section 3): successful
+    rollouts from the same group are used as implicit feedback for failed ones.
+
+    Reference:
+        "Reinforcement Learning via Self-Distillation" (arXiv:2601.20802)
+
+    Key hyperparameters vs GRPO:
+    - No reward-derived advantages: the self-teacher provides per-token
+      advantages = log(teacher_logp / student_logp).
+    - ``distillation_type``: loss variant used to match student to teacher.
+    - ``max_feedback_length``: maximum tokens reserved for the feedback
+      separator that is inserted between the prompt and the original
+      completion in the teacher context.
+    - ``beta``: optional KL penalty toward a frozen reference model (same as
+      GRPO; default 0 because the self-teacher already acts as a regulariser).
+
+    Attributes:
+        trainer_prefix (str | None): Default prefix for trainer logs,
+            checkpoints, and wandb runs. Defaults to ``"SDPO"``.
+        max_feedback_length (int): Maximum number of tokens reserved for the
+            feedback separator inserted between the original prompt and the
+            original completion in the teacher context. Longer feedback is
+            truncated; shorter feedback is right-padded with the tokenizer's
+            pad token. Defaults to ``256``.
+        distillation_type (str): Loss used to match the student to the
+            self-teacher. Either ``"kl"`` (forward KL approximated at the
+            sampled token) or ``"jsd"`` (symmetric JSD approximated at the
+            sampled token, bounded in ``[-log 2, 0]`` and more stable than
+            KL). Defaults to ``"jsd"``.
+        beta (float): KL-divergence penalty toward the frozen reference
+            model (inherited from :class:`GRPOConfig`). Defaults to ``0.0``
+            because the self-distillation objective already regularises the
+            policy; set ``> 0`` to additionally penalise deviation from the
+            initial model.
+    """
+
+    trainer_prefix: str | None = field(
+        default="SDPO",
+        metadata={"help": "Default prefix name for the trainer checkpoint directory."},
+    )
+
+    max_feedback_length: int = field(
+        default=256,
+        metadata={
+            "help": (
+                "Maximum number of tokens reserved for the feedback separator "
+                "that is inserted between the original prompt and the original "
+                "completion in the teacher context. Feedback strings that are "
+                "longer will be truncated; shorter ones are right-padded with "
+                "the tokenizer's pad token."
+            )
+        },
+    )
+
+    distillation_type: str = field(
+        default="jsd",
+        metadata={
+            "help": (
+                "Loss used to match the student to the self-teacher. "
+                "'kl'  - forward KL(student || teacher) approximated at the "
+                "         sampled token: loss = student_logp - teacher_logp. "
+                "'jsd' - (recommended, Section 2.3) symmetric JSD approximated "
+                "         at the sampled token using the log-sum-exp mixture: "
+                "         loss = student_logp - log((student_prob + teacher_prob)/2). "
+                "         Bounded in [-log 2, 0] per token; more stable than KL."
+            )
+        },
+    )
+
+    distillation_weight: float = field(
+        default=1.0,
+        metadata={"help": "Weight applied to the SDPO self-distillation loss term."},
+    )
+    distillation_alpha: float | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "TRL-style divergence interpolation alias. None keeps `distillation_type`; "
+                "0.5 selects JSD and 1.0 selects KL in EasyDeL's sampled-token SDPO path."
+            )
+        },
+    )
+    distillation_topk: int | None = field(
+        default=None,
+        metadata={"help": "Top-k teacher support used by full-logit SDPO distillation."},
+    )
+    full_logit_distillation: bool = field(
+        default=False,
+        metadata={"help": "Whether to compute SDPO divergence over the full vocabulary instead of sampled tokens."},
+    )
+    distillation_is_clip: float | None = field(
+        default=None,
+        metadata={"help": "Optional per-token SDPO loss/importance clip."},
+    )
+    distillation_add_tail: bool = field(
+        default=False,
+        metadata={"help": "Add a tail probability bucket when `distillation_topk` is used."},
+    )
+    sdpo_policy_loss_mode: str = field(
+        default="distillation_only",
+        metadata={"help": "How to combine SDPO and policy losses. EasyDeL currently supports `distillation_only`."},
+    )
+    teacher_regularization: str = field(
+        default="none",
+        metadata={"help": "Teacher/reference update strategy. `ema` enables reference-model EMA sync."},
+    )
+    teacher_update_rate: float | None = field(
+        default=None,
+        metadata={"help": "EMA teacher update rate used when `teacher_regularization='ema'`."},
+    )
+    ema_update_rate: float = field(
+        default=0.05,
+        metadata={"help": "Deprecated TRL alias for `teacher_update_rate`."},
+    )
+    max_reprompt_len: int = field(
+        default=10240,
+        metadata={"help": "Maximum tokenized reprompt length before appending the sampled completion."},
+    )
+    use_successful_as_teacher: bool = field(
+        default=True,
+        metadata={"help": "Use successful rollouts from the same generation group as teacher demonstrations."},
+    )
+    success_reward_threshold: float = field(
+        default=0.0,
+        metadata={"help": "Strict reward threshold above which a rollout is considered successful."},
+    )
+    dont_reprompt_on_self_success: bool = field(
+        default=False,
+        metadata={"help": "If True, successful samples are not reprompted with the success marker."},
+    )
+    reprompt_template: str = field(
+        default="{solution}{feedback}Correctly solve the original question.\n",
+        metadata={"help": "Template used to combine solution and environment feedback text."},
+    )
+    solution_template: str = field(
+        default="Correct solution:\n{successful_previous_attempt}\n\n",
+        metadata={"help": "Template used to format a successful demonstration."},
+    )
+    feedback_template: str = field(
+        default="The following is feedback from your unsuccessful earlier attempt:\n{feedback_raw}\n\n",
+        metadata={"help": "Template used to format environment feedback."},
+    )
+    include_environment_feedback: bool = field(
+        default=True,
+        metadata={"help": "Whether rich feedback strings are included in SDPO reprompts."},
+    )
+    environment_feedback_only_without_solution: bool = field(
+        default=False,
+        metadata={"help": "Use environment feedback only when no successful same-group solution is available."},
+    )
+    remove_thinking_from_demonstration: bool = field(
+        default=False,
+        metadata={"help": "Remove `<think>...</think>` blocks from successful demonstrations."},
+    )
+    diagnostics_warning_interval: int = field(
+        default=10,
+        metadata={"help": "Reserved interval for SDPO diagnostics warnings. Set 0 to disable."},
+    )
+    diagnostics_flat_tolerance: float = field(
+        default=1e-8,
+        metadata={"help": "Tolerance used by SDPO diagnostics to treat fractions as zero."},
+    )
+
+    beta: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "KL-divergence penalty toward the frozen reference model "
+                "(inherited from GRPOConfig). Defaults to 0 for SDPO because "
+                "the self-distillation objective already regularises the policy. "
+                "Set >0 to additionally penalise deviation from the initial model."
+            )
+        },
+    )
+
+    def __post_init__(
+        self,
+        max_sequence_length: int | None,
+        quantization_block: int | None,
+    ):
+        """Validate the distillation type and trim ``max_completion_length``.
+
+        The teacher context must contain ``[prompt | feedback | completion]``
+        within ``max_length``. When the requested budget exceeds it, the
+        completion budget is reduced (rather than expanding ``max_length``)
+        to keep allocation sizes stable.
+
+        Args:
+            max_sequence_length (int | None): Deprecated alias forwarded to
+                the GRPO base class.
+            quantization_block (int | None): Optional quantization block
+                size forwarded to the base class.
+
+        Raises:
+            ValueError: If ``distillation_type`` is not ``'kl'`` or ``'jsd'``.
+        """
+        if self.teacher_update_rate is None:
+            self.teacher_update_rate = self.ema_update_rate
+        if self.distillation_alpha is not None:
+            if self.distillation_alpha == 0.5:
+                self.distillation_type = "jsd"
+            elif self.distillation_alpha == 1.0:
+                self.distillation_type = "kl"
+            else:
+                raise ValueError(
+                    "EasyDeL SDPO only supports token-level `distillation_alpha` values 0.5 (JSD) and 1.0 (KL)."
+                )
+        if self.distillation_type not in ("kl", "jsd"):
+            raise ValueError(f"`distillation_type` must be 'kl' or 'jsd', got '{self.distillation_type}'.")
+        if self.distillation_weight < 0.0:
+            raise ValueError("`distillation_weight` must be non-negative.")
+        if self.distillation_topk is not None:
+            if self.distillation_topk <= 0:
+                raise ValueError("`distillation_topk` must be positive when set.")
+            self.distillation_topk = int(self.distillation_topk)
+            self.full_logit_distillation = True
+        if self.distillation_is_clip is not None:
+            if self.distillation_is_clip <= 0.0:
+                raise ValueError("`distillation_is_clip` must be positive when set.")
+            self.distillation_is_clip = float(self.distillation_is_clip)
+        if self.distillation_add_tail and self.distillation_topk is None:
+            raise ValueError(
+                "`distillation_add_tail=True` requires `distillation_topk` so the non-top-k mass has a tail bucket."
+            )
+        if self.sdpo_policy_loss_mode != "distillation_only":
+            raise ValueError("EasyDeL SDPO currently supports only `sdpo_policy_loss_mode='distillation_only'`.")
+        if self.teacher_regularization not in {"none", "ema"}:
+            raise ValueError("`teacher_regularization` must be either 'none' or 'ema'.")
+        if not (0.0 <= self.teacher_update_rate <= 1.0):
+            raise ValueError("`teacher_update_rate` must be in [0, 1].")
+        if self.teacher_regularization == "ema":
+            self.sync_ref_model = True
+            self.ref_model_mixup_alpha = float(self.teacher_update_rate)
+        if self.max_reprompt_len <= 0:
+            raise ValueError("`max_reprompt_len` must be positive.")
+        if self.diagnostics_warning_interval < 0:
+            raise ValueError("`diagnostics_warning_interval` must be non-negative.")
+        if self.diagnostics_flat_tolerance < 0:
+            raise ValueError("`diagnostics_flat_tolerance` must be non-negative.")
+        super().__post_init__(
+            max_sequence_length=max_sequence_length,
+            quantization_block=quantization_block,
+        )
+        # The teacher context is [prompt | feedback | completion] and all three
+        # must fit within max_length.  Rather than growing max_length (which
+        # would break even-sized allocations), shrink max_completion_length so
+        # that prompt + feedback + completion == max_length.
+        if self.max_prompt_length is None or self.max_feedback_length is None or self.max_completion_length is None:
+            return
+        teacher_total = self.max_prompt_length + self.max_feedback_length + self.max_completion_length
+        if self.max_length is not None and teacher_total > self.max_length:
+            self.max_completion_length = self.max_length - self.max_prompt_length - self.max_feedback_length
+
+    __hash__ = hash_fn

@@ -1,0 +1,4164 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Qwen3Next model implementation for EasyDeL.
+
+This module implements the Qwen3Next hybrid attention architecture, which combines:
+
+- Full attention layers with sigmoid output gating and partial RoPE.
+- Linear attention layers using GatedDeltaNet (a recurrent gated delta-rule
+  state-space attention).
+- Mixture-of-Experts feedforward blocks with both routed and (optionally)
+  shared experts.
+
+The hybrid layout interleaves linear-attention layers — which scale
+linearly with sequence length and carry their state in a per-head
+recurrent matrix — with periodic full-attention layers that retain the
+expressive power of standard softmax attention. This gives long-context
+prefill and decode at near-linear cost while preserving accuracy.
+
+Performance notes (decode):
+    - On TPU, single-token decode dispatches to a fused Pallas kernel
+      (``GatedDeltaRuleOp.grouped_gdr_decode`` and
+      ``GatedDeltaRuleOp.fused_conv_decode``) that performs the depthwise
+      conv shift, gated-delta-rule recurrent update, and output gather
+      inside VMEM in a single kernel launch. The fused decode path
+      avoids materializing the 5-D intermediate state ratio between
+      query/key heads and value heads (see commit 090a03b2 for the
+      gather + compute + scatter consolidation).
+    - The packed-batch ``apply_qwen3_next_packed_updates`` pipeline
+      implements a single-token "fast lane" alongside a scan-based
+      multi-token prefill path so mixed decode/prefill batches share one
+      kernel launch per linear-attention layer.
+
+Public surface:
+    - :class:`Qwen3NextRMSNorm`, :class:`Qwen3NextMLP`,
+      :class:`Qwen3NextMLPStack`, :class:`Qwen3NextSparseMoeBlock`,
+      :class:`Qwen3NextFullAttention`, :class:`Qwen3NextLinearAttention`,
+      :class:`Qwen3NextDecoderLayer` provide the per-layer building
+      blocks.
+    - :class:`Qwen3NextModel` is the transformer trunk.
+    - :class:`Qwen3NextForCausalLM` is the causal-LM task wrapper and
+      computes the routed-MoE auxiliary load-balancing loss.
+"""
+
+import math
+import typing
+from dataclasses import dataclass
+
+import jax
+import jax.numpy as jnp
+import spectrax as spx
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
+from jax.ad_checkpoint import checkpoint_name
+from jax.sharding import PartitionSpec
+from jaxtyping import Array, Bool, Float, Int
+from spectrax import (
+    PartitionAxis,
+    apply_logical_sharding,
+    common_types,
+    nn,
+    with_sharding_constraint,
+)
+
+from easydel.caching import (
+    HybridCache,
+    OperationsMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
+    RecurrentCacheView,
+    RecurrentMetadata,
+    TransformerCache,
+    TransformerCacheView,
+    TransformerMetadata,
+)
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import TaskType, register_module
+from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
+from easydel.infra.modeling_outputs import (
+    AttentionLayerOutput,
+    DecoderLayerOutput,
+    MoeCausalLMOutput,
+    MoeModelOutput,
+)
+from easydel.infra.sequence_packing import normalize_packed_segment_ids as _normalize_packed_segment_ids
+from easydel.infra.sharding import (
+    RuntimeShardingResolver,
+    coerce_runtime_sharding_resolver,
+    mesh_axis_size,
+    resolve_stage_mesh,
+)
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, blockwise_ffn
+from easydel.layers import (
+    BaseMoeModule,
+    ColumnParallelLinear,
+    ColumnParallelMoELinear,
+    Embed,
+    FusedColumnLayout,
+    FusedSegment,
+    MoeLoadBalancingStrategy,
+    MoeRoutingStrategy,
+    RMSNormGated,
+    RowParallelLinear,
+    RowParallelMoELinear,
+    build_fused_gate_up_projection,
+    gated_mlp_forward,
+    interleave_segments_last_axis,
+    interleaved_fusion_reform_param,
+    keep_interleaved_segments_last_axis,
+    moe_down_projection_reform_param,
+    moe_fused_gate_up_reform_param,
+    split_fused_gate_up_projection,
+    split_interleaved_segments_last_axis,
+    tensor_parallel_axis,
+    tensor_parallel_size,
+    torch_deinterleave_segments_for_tp,
+    torch_interleave_segments_for_tp,
+    with_tp_last_axis_sharding,
+)
+from easydel.layers._sharding import all_gather_then_dot
+from easydel.layers.attention import UnifiedAttention
+from easydel.layers.linear_attention import (
+    apply_conv_with_state,
+    apply_mask_to_padding_states,
+)
+from easydel.layers.norms import RMSNorm, lowfloats
+from easydel.modules._base import BaseCausalLMModule
+from easydel.operations import OperationMetadata
+from easydel.operations.kernels import (
+    GatedDeltaRuleOp,
+    GatedDeltaRuleOutput,
+    RaggedGatedDeltaRule,
+    ragged_causal_conv1d_head_sharded,
+    reorder_conv_features_for_sharding,
+)
+from easydel.utils import is_inference_mode
+
+from .qwen3_next_configuration import Qwen3NextConfig
+
+
+def l2norm_decode(
+    x: Array,
+    *,
+    axis: int = -1,
+    eps: float = 1e-6,
+) -> Array:
+    """Decode-time L2 normalisation that matches ejkernel's reference path.
+
+    Recomputes ``x / sqrt(sum(x**2) + eps)`` along ``axis`` using
+    :func:`jax.lax.rsqrt` so the numerics line up bit-for-bit with the
+    Pallas-fused decode kernel inside ``ejkernel.GatedDeltaRuleOp``.
+    Used outside the kernel by the python-side Q/K normalisation step
+    that runs immediately before grouped GDR dispatch — keeping a
+    single normalised representation prevents drift between the
+    fast-path kernel and the fallback math.
+
+    Args:
+        x: Input tensor with the channel dim to be normalised at
+            ``axis``.
+        axis: Axis along which to compute the L2 norm.
+        eps: Numerical-stability constant added inside the square
+            root.
+
+    Returns:
+        Tensor with the same shape and dtype as ``x``, normalised
+        along ``axis``.
+    """
+    inv_norm = jax.lax.rsqrt(jnp.sum(x * x, axis=axis, keepdims=True) + eps)
+    return x * inv_norm
+
+
+def _apply_tp_last_axis_sharding(x: Array, config: Qwen3NextConfig) -> Array:
+    """Keep projection products local on the TP axis while residuals stay replicated.
+
+    Thin wrapper around :func:`with_tp_last_axis_sharding` that consumes
+    the Qwen3-Next config object directly. Used immediately after the
+    Q/K/V matmul (and after the attention output merge) to pin the
+    trailing channel axis to the tensor-parallel mesh axis so the next
+    row-parallel projection can avoid an all-gather.
+    """
+    return with_tp_last_axis_sharding(x, config)
+
+
+def _qwen3_next_tp_size(config: Qwen3NextConfig) -> int:
+    """Return the tensor-parallel mesh size from the Qwen3-Next config."""
+    return tensor_parallel_size(config)
+
+
+def _qwen3_next_tp_sharded_column_matmul(
+    hidden_states: Array,
+    kernel: Array,
+    *,
+    config: Qwen3NextConfig,
+    precision: jax.lax.PrecisionLike,
+) -> Array | None:
+    """Column matmul over TP-feature-sharded hidden states without changing weight layout.
+
+    Gathers the feature axis inside ``shard_map`` and runs one full-K einsum
+    against the local column shard.
+
+    MEASURED (v5p-8, tp=4, bf16): explicit AG+dot beats the previous
+    K-streaming ppermute ring at every shape — decode [16,1,2048]x4096:
+    18.5 vs 22.8 us; prefill [8,1024,2048]: 237 vs 319 us — and also beats
+    the GSPMD einsum (24.8 us at decode).  Single full-K einsum also
+    accumulates in f32 on the MXU instead of the ring's bf16 outer sum.
+    """
+    tp_axis = tensor_parallel_axis(config)
+    if tp_axis is None or hidden_states.ndim != 3 or kernel.ndim != 2:
+        return None
+
+    stage_mesh = resolve_stage_mesh(config.mesh, arr=hidden_states)
+    if stage_mesh is None:
+        return None
+
+    tp_size = int(mesh_axis_size(stage_mesh, tp_axis))
+    if (
+        tp_size <= 1
+        or int(hidden_states.shape[-1]) != int(kernel.shape[0])
+        or int(hidden_states.shape[-1]) % tp_size != 0
+        or int(kernel.shape[-1]) % tp_size != 0
+    ):
+        return None
+
+    hidden_spec = config.runtime_sharding_resolver.resolve(
+        dynamic_axes=common_types.HiddenStateSharding,
+        shape=tuple(int(dim) for dim in hidden_states.shape),
+    )
+    if len(hidden_spec) != hidden_states.ndim or tuple(hidden_spec)[-1] != tp_axis:
+        return None
+
+    kernel_spec = PartitionSpec(None, tp_axis)
+    out_spec = PartitionSpec(*tuple(hidden_spec[:-1]), tp_axis)
+
+    def _gather_dot_body(x_local: Array, w_local: Array) -> Array:
+        return all_gather_then_dot(x_local, w_local, tp_axis, precision=precision)
+
+    mapped = jax.shard_map(
+        _gather_dot_body,
+        mesh=stage_mesh,
+        in_specs=(hidden_spec, kernel_spec),
+        out_specs=out_spec,
+        check_vma=False,
+    )
+    return mapped(hidden_states, kernel)
+
+
+def _qwen3_next_tp_sharded_column_linear(
+    layer: ColumnParallelLinear,
+    hidden_states: Array,
+    kernel: Array | None = None,
+    *,
+    config: Qwen3NextConfig,
+    precision: jax.lax.PrecisionLike,
+    min_output_size: int = 0,
+) -> Array | None:
+    """Run a ColumnParallelLinear over TP-feature-sharded hidden states when supported."""
+    if kernel is None and layer.bias is not None:
+        return None
+    if kernel is None:
+        kernel = layer.weight.value
+    if kernel.ndim != 2 or int(kernel.shape[-1]) < int(min_output_size):
+        return None
+    if layer.dtype is not None:
+        hidden_states = jnp.asarray(hidden_states, dtype=layer.dtype)
+        kernel = jnp.asarray(kernel, dtype=layer.dtype)
+    out_features = int(kernel.shape[-1])
+    with jax.named_scope(f"easydel/linear/{type(layer).__name__}/in{layer.in_features}/out{out_features}"):
+        y = _qwen3_next_tp_sharded_column_matmul(
+            hidden_states,
+            kernel,
+            config=config,
+            precision=precision,
+        )
+    if y is None:
+        return None
+    return layer._scale_operator(y)
+
+
+def _qwen3_next_local_head_count(heads: int, config: Qwen3NextConfig) -> int:
+    """Return the static local head count after sanitized TP head sharding."""
+    tp_size = _qwen3_next_tp_size(config)
+    if tp_size <= 1 or heads % tp_size != 0:
+        return heads
+    return heads // tp_size
+
+
+def _qwen3_next_grouped_gdr_prefill_is_local_valid(
+    *,
+    num_k_heads: int,
+    num_v_heads: int,
+    config: Qwen3NextConfig,
+) -> bool:
+    """Whether grouped-GDR prefill remains valid after local TP head sharding."""
+    local_k_heads = _qwen3_next_local_head_count(num_k_heads, config)
+    local_v_heads = _qwen3_next_local_head_count(num_v_heads, config)
+    return local_k_heads > 0 and local_v_heads % local_k_heads == 0
+
+
+def _qwen3_next_full_attention_layout(*, q_size: int, kv_size: int) -> FusedColumnLayout:
+    """Build the fused ``[Q | K | V]`` column-parallel layout for full attention.
+
+    Args:
+        q_size: Number of output channels in the Q (or Q+gate) segment.
+        kv_size: Number of output channels in each of the K and V segments.
+
+    Returns:
+        :class:`FusedColumnLayout` describing the three labelled segments
+        used by checkpoint reform and split helpers in
+        :class:`Qwen3NextFullAttention`.
+    """
+    return FusedColumnLayout(
+        segments=(
+            FusedSegment("q", q_size, "q_proj"),
+            FusedSegment("k", kv_size, "k_proj"),
+            FusedSegment("v", kv_size, "v_proj"),
+        ),
+        log_label="full-attention Q/K/V groups",
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class Qwen3NextLinearAttentionLayout:
+    """Packed Qwen3-Next linear-attention checkpoint layout.
+
+    Qwen3-Next's linear attention is not stock dense QKV: HF stores
+    ``in_proj_qkv`` plus a separate ``in_proj_z``, while the packed runtime
+    projection is ``[q | k | v | z]``. Beta/alpha are similarly packed as
+    ``[b | a]``. This layout owns that checkpoint reform contract so the
+    model body no longer carries ad-hoc fuser functions.
+    """
+
+    key_dim: int
+    value_dim: int
+    config: Qwen3NextConfig
+
+    @property
+    def qkvz_segment_sizes(self) -> tuple[int, int, int, int]:
+        """Per-segment widths of the packed ``[q | k | v | z]`` projection.
+
+        Returns:
+            Tuple ``(key_dim, key_dim, value_dim, value_dim)`` matching the
+            four channel groups in the packed runtime projection.
+        """
+        return (self.key_dim, self.key_dim, self.value_dim, self.value_dim)
+
+    def split_projected_qkvz(self, projected_qkvz: Array) -> tuple[Array, Array]:
+        """Split the packed runtime ``[q | k | v | z]`` projection.
+
+        Uses the TP-aware interleaved-segment helpers when the layout was
+        interleaved by the parallel projection (so each TP rank holds a
+        contiguous slice of every segment); falls back to a vanilla
+        :func:`jnp.split` when the helpers report a non-interleaved
+        layout.
+
+        Args:
+            projected_qkvz: Packed projection output, shape ``(..., key_dim
+                * 2 + value_dim * 2)``.
+
+        Returns:
+            Tuple ``(conv_input, z)`` where ``conv_input`` carries the
+            ``[q | k | v]`` slice fed to the depthwise conv and ``z`` is
+            the gate stream used by the gated RMSNorm.
+        """
+        conv_input = keep_interleaved_segments_last_axis(
+            projected_qkvz,
+            self.qkvz_segment_sizes,
+            (0, 1, 2),
+            config=self.config,
+        )
+        z_parts = split_interleaved_segments_last_axis(
+            projected_qkvz,
+            self.qkvz_segment_sizes,
+            config=self.config,
+        )
+        if conv_input is None or z_parts is None:
+            return tuple(jnp.split(projected_qkvz, [self.key_dim * 2 + self.value_dim], axis=-1))
+        return conv_input, z_parts[3]
+
+    def split_projected_ba(self, projected_ba: Array, num_v_heads: int) -> tuple[Array, Array]:
+        """Split the packed ``[beta | alpha]`` projection into its halves.
+
+        Args:
+            projected_ba: Packed beta/alpha projection output, shape
+                ``(..., 2 * num_v_heads)``.
+            num_v_heads: Number of value heads — half of the packed
+                channel dimension.
+
+        Returns:
+            Tuple ``(beta, alpha)`` of per-value-head gating streams.
+        """
+        ba_parts = split_interleaved_segments_last_axis(
+            projected_ba,
+            (num_v_heads, num_v_heads),
+            config=self.config,
+        )
+        if ba_parts is None:
+            return tuple(jnp.split(projected_ba, [num_v_heads], axis=-1))
+        return ba_parts
+
+    def reform_param(self) -> dict[str, typing.Any]:
+        """Build the HuggingFace -> EasyDeL checkpoint reform rules.
+
+        Produces a mapping that fuses the HF tensors ``in_proj_qkv`` and
+        ``in_proj_z`` into the runtime ``in_proj_qkvz`` projection (and
+        analogously ``in_proj_b`` / ``in_proj_a`` into ``in_proj_ba``)
+        while respecting the TP interleave imposed by the column-parallel
+        projection layout. The inverse direction (EasyDeL -> HF) is
+        provided via ``inverse_fuser`` callbacks so the same registry is
+        usable for round-trip conversion.
+
+        Returns:
+            Dictionary keyed by EasyDeL parameter-name regexes whose
+            values describe the fuser / inverse_fuser callables consumed
+            by :class:`StateDictConverter`.
+        """
+
+        def _qkvz(torch, qkv, z):
+            """Fuse HF ``in_proj_qkv`` + ``in_proj_z`` into TP-interleaved QKVZ.
+
+            Splits the HF ``in_proj_qkv`` tensor along axis 0 into its
+            Q/K/V slices and re-interleaves them with the ``in_proj_z``
+            tensor along the channel axis so each TP rank ends up with a
+            contiguous slice of every segment.
+            """
+            q, k, v = torch.split(qkv, (self.key_dim, self.key_dim, self.value_dim), dim=0)
+            return torch_interleave_segments_for_tp(
+                torch,
+                (q, k, v, z),
+                tp_size=_qwen3_next_tp_size(self.config),
+            )
+
+        def _qkvz_inverse(torch, qkvz):
+            """Inverse of :func:`_qkvz` — split TP-interleaved QKVZ back to HF.
+
+            Deinterleaves the runtime ``in_proj_qkvz`` tensor into the
+            individual Q/K/V/Z segments and re-concatenates Q/K/V to
+            reproduce HF's ``in_proj_qkv`` plus the original
+            ``in_proj_z``.
+            """
+            z_dim = int(qkvz.shape[0]) - self.key_dim - self.key_dim - self.value_dim
+            q, k, v, z = torch_deinterleave_segments_for_tp(
+                torch,
+                qkvz,
+                (self.key_dim, self.key_dim, self.value_dim, z_dim),
+                tp_size=_qwen3_next_tp_size(self.config),
+            )
+            return torch.cat((q, k, v), dim=0).contiguous(), z
+
+        def _qkvz_native(qkv, z):
+            """Fuse native EasyDeL split QKV/Z leaves into runtime QKVZ layout."""
+            q, k, v = jnp.split(qkv, [self.key_dim, self.key_dim * 2], axis=-1)
+            return interleave_segments_last_axis(
+                (q, k, v, z),
+                tp_size=_qwen3_next_tp_size(self.config),
+            )
+
+        def _ba_native(beta, alpha):
+            """Fuse native EasyDeL split beta/alpha leaves into runtime BA layout."""
+            return interleave_segments_last_axis(
+                (beta, alpha),
+                tp_size=_qwen3_next_tp_size(self.config),
+            )
+
+        reform_param = {
+            "in_proj_qkvz.weight$": {
+                "sources": ("in_proj_qkv.weight", "in_proj_z.weight"),
+                "fuser": _qkvz,
+                "inverse_fuser": _qkvz_inverse,
+                "native_fuser": _qkvz_native,
+                "log_label": "linear-attention qkv/z weight groups",
+            },
+        }
+        reform_param.update(
+            interleaved_fusion_reform_param(
+                "in_proj_ba.weight",
+                ("in_proj_b.weight", "in_proj_a.weight"),
+                config=self.config,
+                log_label="linear-attention beta/alpha weight groups",
+            )
+        )
+        reform_param["in_proj_ba.weight$"]["native_fuser"] = _ba_native
+        return reform_param
+
+
+def _build_qwen3_next_linear_attention_fusion_reform_param(
+    *,
+    key_dim: int,
+    value_dim: int,
+    config: Qwen3NextConfig,
+) -> dict[str, typing.Any]:
+    """Build the linear-attention QKVZ/BA fusion reform-param dict.
+
+    Thin shim that instantiates :class:`Qwen3NextLinearAttentionLayout`
+    with the layer's per-segment widths and forwards to its
+    :meth:`reform_param` so callers do not have to manage the layout
+    object lifetime.
+
+    Args:
+        key_dim: Total key dimension (``num_k_heads * head_k_dim``).
+        value_dim: Total value dimension (``num_v_heads * head_v_dim``).
+        config: Owning :class:`Qwen3NextConfig` carrying TP and partition
+            info needed by the layout helpers.
+
+    Returns:
+        Reform-param mapping suitable for merging into a layer's
+        ``reform_param`` registry.
+    """
+    return Qwen3NextLinearAttentionLayout(
+        key_dim=key_dim,
+        value_dim=value_dim,
+        config=config,
+    ).reform_param()
+
+
+def _build_qwen3_next_linear_attention_reform_param(
+    *,
+    key_dim: int,
+    value_dim: int,
+    config: Qwen3NextConfig,
+    include_qkvz_fusion: bool,
+) -> dict[str, typing.Any]:
+    """Build the full linear-attention checkpoint reform-param dict.
+
+    Combines the conv1d weight permutation rule (HF stores conv weights
+    as ``[conv_dim, 1, kernel_size]``; EasyDeL wants
+    ``[kernel_size, 1, conv_dim]``) with, optionally, the QKVZ/BA
+    fusion rules from
+    :func:`_build_qwen3_next_linear_attention_fusion_reform_param` when
+    the layer uses the merged-split projection variant.
+
+    Args:
+        key_dim: Total key dimension (``num_k_heads * head_k_dim``).
+        value_dim: Total value dimension (``num_v_heads * head_v_dim``).
+        config: Owning :class:`Qwen3NextConfig`.
+        include_qkvz_fusion: When ``True``, also include the QKVZ/BA
+            packing rules; used only by the merged-split projection
+            variant.
+
+    Returns:
+        Reform-param mapping consumed by :class:`StateDictConverter`.
+    """
+
+    def _conv1d_weight(tensor):
+        """Permute the HF conv1d weight ``[conv_dim, 1, k]`` into EasyDeL's ``[k, 1, conv_dim]``."""
+        tensor = tensor.permute(2, 1, 0)
+        return tensor.contiguous()
+
+    reform_param = {
+        "conv1d.weight$": {
+            "splits": [{"name": "conv1d.weight", "spliter": _conv1d_weight}],
+            "inverse_spliter": lambda torch, kernel: kernel.permute(2, 1, 0),
+        },
+    }
+    if include_qkvz_fusion:
+        reform_param.update(
+            _build_qwen3_next_linear_attention_fusion_reform_param(
+                key_dim=key_dim,
+                value_dim=value_dim,
+                config=config,
+            )
+        )
+    return reform_param
+
+
+def _preserve_array_sharding(
+    value: Array,
+    *,
+    partition_manager: RuntimeShardingResolver | None,
+    partition_axis: PartitionAxis | None,
+) -> Array:
+    """Re-impose recurrent-state sharding constraints on a freshly built array.
+
+    The grouped-decode fast path constructs new recurrent-state
+    tensors outside the fused Pallas kernel (which usually owns the
+    sharding) and therefore drops the partitioning that the rest of
+    the pipeline expects. This helper re-applies the canonical
+    recurrent-state sharding spec
+    (``[BATCH, HEAD, EMPTY, EMPTY]`` under ``MODE_PREFILL``) using
+    :func:`with_sharding_constraint`, mirroring the layout the kernel
+    would have produced.
+
+    No-ops gracefully when there is no resolver / mesh available
+    (e.g. during unit tests with a single-device default mesh) so the
+    same code path runs in both sharded and unsharded settings.
+
+    Args:
+        value: Array whose sharding should be re-imposed.
+        partition_manager: Active sharding resolver, or ``None`` to
+            skip.
+        partition_axis: Active partition axis policy, or ``None`` to
+            skip.
+
+    Returns:
+        ``value`` with the sharding constraint applied when possible,
+        otherwise the input unchanged.
+    """
+    if partition_manager is None or partition_axis is None:
+        return value
+
+    mesh = resolve_stage_mesh(getattr(partition_manager, "mesh", None))
+    if mesh is None:
+        return value
+    resolver = coerce_runtime_sharding_resolver(partition_manager, mesh=mesh)
+    spec = resolver.resolve(
+        axes=[common_types.BATCH, common_types.HEAD, common_types.EMPTY, common_types.EMPTY],
+        mode=common_types.MODE_PREFILL,
+        shape=value.shape,
+    )
+    return typing.cast(Array, with_sharding_constraint(value, spec, mesh=mesh))
+
+
+def apply_grouped_single_step_gdr(
+    query: Float[Array, "batch 1 num_k_heads head_dim"],
+    key: Float[Array, "batch 1 num_k_heads head_dim"],
+    value: Float[Array, "batch 1 num_v_heads value_dim"],
+    beta: Float[Array, "batch 1 num_v_heads"],
+    decay: Float[Array, "batch 1 num_v_heads"] | None,
+    recurrent_state: Float[Array, "batch num_v_heads head_dim value_dim"],
+    *,
+    gdr_op: GatedDeltaRuleOp | None = None,
+    use_qk_l2norm: bool = True,
+) -> tuple[
+    Float[Array, "batch 1 num_v_heads value_dim"],
+    Float[Array, "batch num_v_heads head_dim value_dim"],
+]:
+    """Decode-only GDR step for Qwen's repeated-q/k head layout.
+
+    Qwen linear attention stores one recurrent state per value head, but the
+    query/key heads are shared across groups of value heads. This helper keeps
+    the recurrent-state layout unchanged while avoiding materializing repeated
+    q/k heads during single-token decode.
+
+    On TPU, dispatches to a fused Pallas kernel that performs the entire
+    grouped state update in VMEM without materializing the 5D intermediate.
+
+    Args:
+        query: Per-step query, shape ``(batch, 1, num_k_heads, head_dim)``.
+        key: Per-step key, same shape as ``query``.
+        value: Per-step value with one entry per value head,
+            shape ``(batch, 1, num_v_heads, value_dim)``.
+        beta: Per-step beta (write-strength), shape
+            ``(batch, 1, num_v_heads)``.
+        decay: Per-step decay factor, shape ``(batch, 1, num_v_heads)``
+            or ``None`` for pure delta updates with no exponential decay.
+        recurrent_state: Carried per-value-head state, shape
+            ``(batch, num_v_heads, head_dim, value_dim)``.
+        gdr_op: Optional :class:`GatedDeltaRuleOp` providing the fused
+            Pallas decode kernel. When ``None``, falls back to the pure
+            JAX reference path (slower but device-agnostic).
+        use_qk_l2norm: When ``True`` (the default) the Q/K are
+            L2-normalised channel-wise via :func:`l2norm_decode` before
+            being handed to the kernel — matches the runtime numerics
+            elsewhere in the model.
+
+    Returns:
+        Tuple ``(output, new_recurrent_state)`` where ``output`` has
+        shape ``(batch, 1, num_v_heads, value_dim)`` in the original
+        ``query`` dtype and ``new_recurrent_state`` has the same shape
+        as the input ``recurrent_state``.
+
+    Raises:
+        ValueError: If ``num_v_heads`` is not divisible by ``num_k_heads``.
+        RuntimeError: When the underlying kernel returns ``None`` for the
+            attention output.
+    """
+    batch_size, _, num_k_heads, _head_dim = query.shape
+    num_v_heads = value.shape[2]
+    if num_v_heads % num_k_heads != 0:
+        raise ValueError(f"num_v_heads ({num_v_heads}) must be divisible by num_k_heads ({num_k_heads})")
+    expand_ratio = num_v_heads // num_k_heads
+
+    if use_qk_l2norm:
+        query = l2norm_decode(query, axis=-1, eps=1e-6)
+        key = l2norm_decode(key, axis=-1, eps=1e-6)
+
+    input_dtype = query.dtype
+    q_2d = query[:, 0, :, :]  # [batch, num_k_heads, head_dim]
+    k_2d = key[:, 0, :, :]
+    v_grouped = value[:, 0, :, :].reshape(batch_size, num_k_heads, expand_ratio, -1)
+    beta_grouped = beta[:, 0, :].reshape(batch_size, num_k_heads, expand_ratio)
+
+    decay_grouped = decay[:, 0, :].reshape(batch_size, num_k_heads, expand_ratio) if decay is not None else None
+
+    if gdr_op is not None:
+        output, new_state = gdr_op.grouped_gdr_decode(
+            query=q_2d,
+            key=k_2d,
+            value=v_grouped,
+            beta=beta_grouped,
+            decay=decay_grouped,
+            recurrent_state=recurrent_state,
+        )
+    else:
+        output, new_state = GatedDeltaRuleOp.grouped_gdr_decode_jax(
+            query=q_2d,
+            key=k_2d,
+            value=v_grouped,
+            beta=beta_grouped,
+            decay=decay_grouped,
+            recurrent_state=recurrent_state,
+        )
+
+    return (
+        output.reshape(batch_size, 1, num_v_heads, -1).astype(input_dtype),
+        new_state,
+    )
+
+
+QWEN3_NEXT_PACKED_PREFILL_BATCH_CAP = 8
+
+
+def _apply_qwen3_next_depthwise_conv_sequence(
+    inputs: Float[Array, "batch seq_len conv_dim"],
+    kernel: Float[Array, "conv_dim d_conv"],
+    *,
+    output_dtype: jnp.dtype,
+) -> Float[Array, "batch seq_len conv_dim"]:
+    """Run a causal depthwise 1-D convolution over a dense sequence batch.
+
+    Applies a per-channel (depthwise) causal convolution using
+    ``jax.lax.conv_general_dilated`` with left-padding of ``d_conv - 1`` so
+    that each output position depends only on current and prior input
+    positions. The convolution is followed by SiLU activation.
+
+    This is used during the prefill phase of packed batching, where each
+    request's tokens are laid out contiguously and can be processed as a
+    standard sequence convolution rather than the incremental shift-and-convolve
+    used in single-token decode.
+
+    Args:
+        inputs: Dense input sequences, shape ``[batch, seq_len, conv_dim]``.
+        kernel: Depthwise conv kernel, shape ``[conv_dim, d_conv]``. The kernel
+            is transposed internally to match the ``("NWC", "WIO", "NWC")``
+            layout expected by ``conv_general_dilated``.
+        output_dtype: Desired dtype for the output tensor.
+
+    Returns:
+        Convolution output with SiLU activation applied,
+        shape ``[batch, seq_len, conv_dim]``.
+    """
+    conv_kernel = kernel.T[:, None, :]
+    conv_output = jax.lax.conv_general_dilated(
+        inputs.astype(jnp.float32),
+        conv_kernel.astype(jnp.float32),
+        window_strides=(1,),
+        padding=((kernel.shape[1] - 1, 0),),
+        dimension_numbers=("NWC", "WIO", "NWC"),
+        feature_group_count=inputs.shape[-1],
+    )
+    return jax.nn.silu(conv_output).astype(output_dtype)
+
+
+def _scatter_qwen3_next_selected_updates(
+    base: Array,
+    slots: Int[Array, "selected_slots"],
+    valid: Bool[Array, "selected_slots"],
+    updates: Array,
+) -> Array:
+    """Scatter selected row updates into a base array via sequential ``dynamic_update_slice``.
+
+    Given a set of ``updates`` indexed by ``slots``, this function writes each
+    valid update row into the corresponding slot position of ``base``. Invalid
+    entries (where ``valid[i]`` is False) leave the base unchanged at that slot.
+
+    Implementation uses ``jax.lax.fori_loop`` with per-slot
+    ``dynamic_update_slice_in_dim`` calls, which translates to per-slot DMA
+    writes on TPU. This is more efficient than the alternative dense approach
+    of building a one-hot index matrix and performing a full tensordot scatter,
+    which would incur O(chunk_size * num_slots * D) HBM traffic versus the
+    O(chunk_size * D) traffic of the sequential approach.
+
+    Args:
+        base: The target array to scatter into, shape ``[num_slots, ...]``.
+        slots: Integer indices indicating which row of ``base`` each update
+            should be written to, shape ``[selected_slots]``.
+        valid: Boolean mask indicating which updates are active,
+            shape ``[selected_slots]``. When ``valid[i]`` is False, the
+            existing row in ``base`` at ``slots[i]`` is preserved.
+        updates: The update values to scatter, shape ``[selected_slots, ...]``.
+            Must have the same trailing dimensions as ``base``.
+
+    Returns:
+        A new array with the same shape and dtype as ``base``, with valid
+        updates written at the specified slot positions.
+    """
+    num_updates = slots.shape[0]
+
+    def _scatter_one(i, acc):
+        """``fori_loop`` body: write one update row into ``acc``.
+
+        For iteration ``i``: reads ``slots[i]`` to find the destination
+        row in ``acc``, ``valid[i]`` to decide whether to overwrite,
+        and ``updates[i]`` for the new row contents. When the slot is
+        not valid, the existing row at ``acc[slots[i]]`` is preserved
+        (i.e. the write is a no-op for that position) so downstream
+        code does not need a separate guard.
+
+        Compiles to a per-slot ``dynamic_update_slice_in_dim`` plus a
+        single ``where`` per row, which the XLA compiler folds into a
+        DMA-friendly write pattern on TPU.
+        """
+        slot = slots[i]
+        is_valid = valid[i]
+        update_row = jax.lax.dynamic_index_in_dim(updates, i, axis=0, keepdims=False)
+        existing_row = jax.lax.dynamic_index_in_dim(acc, slot, axis=0, keepdims=False)
+        row = jnp.where(is_valid, update_row.astype(acc.dtype), existing_row)
+        return jax.lax.dynamic_update_slice_in_dim(acc, row[None], slot, axis=0)
+
+    return jax.lax.fori_loop(0, num_updates, _scatter_one, base)
+
+
+def _finalize_qwen3_next_conv_state_from_combined(
+    combined_inputs: Float[Array, "batch total_seq_len conv_dim"],
+    total_lengths: Int[Array, "batch"],
+    *,
+    d_conv: int,
+    output_dtype: jnp.dtype,
+) -> Float[Array, "batch conv_dim d_conv"]:
+    """Extract the trailing conv-state window from combined (prefix + new tokens) sequences.
+
+    After running a full causal depthwise convolution over the concatenation of
+    the old conv state prefix and new input tokens, the conv state for
+    subsequent decode steps is the last ``d_conv`` positions of that combined
+    sequence. This function extracts that trailing window for each slot using
+    ``jax.lax.dynamic_slice``, vectorized over the batch axis via ``jax.vmap``.
+
+    The dynamic_slice approach produces contiguous DMA reads per slot on TPU,
+    which is more efficient than a ``take_along_axis`` gather that would
+    require non-contiguous index lookups.
+
+    The output is transposed from ``[d_conv, conv_dim]`` to
+    ``[conv_dim, d_conv]`` to match the conv-state layout convention used
+    throughout the codebase.
+
+    Args:
+        combined_inputs: Concatenated old-state prefix and new input tokens,
+            shape ``[batch, total_seq_len, conv_dim]``. ``total_seq_len``
+            equals ``d_conv + request_seq_len``.
+        total_lengths: The effective length of each slot's combined sequence,
+            shape ``[batch]``. Used to compute the start index of the trailing
+            window as ``clip(total_lengths - d_conv, 0, ...)``.
+        d_conv: The convolution kernel width (number of positions to retain).
+        output_dtype: Desired dtype for the output conv state.
+
+    Returns:
+        Extracted conv states, shape ``[batch, conv_dim, d_conv]``.
+    """
+    conv_dim = combined_inputs.shape[2]
+    max_seq = combined_inputs.shape[1]
+
+    def _extract_one(row, length):
+        """``vmap`` body: trailing ``d_conv`` window of one slot's combined input.
+
+        For one slot, the new conv state is the last ``d_conv``
+        positions of the (prefix + new tokens) sequence. This helper
+        computes the start index as ``clip(length - d_conv, 0,
+        max_seq - d_conv)`` so short slots stay anchored at the
+        beginning of the buffer, then uses :func:`jax.lax.dynamic_slice`
+        to read a contiguous ``[d_conv, conv_dim]`` chunk and
+        transposes it to the canonical ``[conv_dim, d_conv]`` conv-
+        state layout used by the rest of the pipeline.
+        """
+        start = jnp.clip(length - d_conv, 0, max_seq - d_conv)
+        window = jax.lax.dynamic_slice(row, (start, 0), (d_conv, conv_dim))
+        return window.T.astype(output_dtype)  # [conv_dim, d_conv]
+
+    return jax.vmap(_extract_one)(combined_inputs, total_lengths)
+
+
+def _apply_qwen3_next_packed_updates_unified(
+    *,
+    conv_states: Float[Array, "num_slots conv_dim d_conv"],
+    recurrent_states: Float[Array, "num_slots num_v_heads head_dim value_dim"],
+    conv_input: Float[Array, "batch seq_len conv_dim"],
+    beta: Float[Array, "batch seq_len num_v_heads"],
+    decay: Float[Array, "batch seq_len num_v_heads"],
+    beta_raw: Float[Array, "batch seq_len num_v_heads"] | None = None,
+    alpha_raw: Float[Array, "batch seq_len num_v_heads"] | None = None,
+    A_log: Float[Array, "num_v_heads"] | None = None,
+    dt_bias: Float[Array, "num_v_heads"] | None = None,
+    kernel: Float[Array, "conv_dim d_conv"],
+    query_start_loc: Int[Array, "num_slots_plus_1"],
+    num_requests: Int[Array, ""],
+    key_dim: int,
+    num_k_heads: int,
+    head_k_dim: int,
+    num_v_heads: int,
+    head_v_dim: int,
+    expand_ratio: int,
+    conv_output_dtype: jnp.dtype,
+    gdr_op: GatedDeltaRuleOp,
+    context_lens: Int[Array, "num_slots"] | None = None,
+    spec_recurrent_commit: Int[Array, "2 num_slots"] | None = None,
+) -> tuple[
+    Float[Array, "num_slots conv_dim d_conv"],
+    Float[Array, "num_slots num_v_heads head_dim value_dim"],
+    Float[Array, "seq_len num_v_heads head_v_dim"],
+]:
+    """Unified packed update implementation with a single-token fast lane and scan-based prefill.
+
+    This is the production implementation for packed-batch inference in
+    Qwen3Next's linear-attention layers. It handles mixed decode (single-token)
+    and prefill (multi-token) requests within a single packed batch, optimizing
+    each case separately.
+
+    **Single-token fast lane**: Slots with exactly one scheduled token are
+    detected via ``single_slot_mask`` and processed in a single batched
+    operation (no loop). The conv state is updated using
+    ``GatedDeltaRuleOp.fused_conv_decode``, and the GDR recurrent update is
+    applied in parallel across all single-token slots. This path is guarded
+    by ``jax.lax.cond`` so it is skipped entirely when there are no
+    single-token slots.
+
+    **Scan-based prefill**: Multi-token slots are grouped into chunks of
+    ``QWEN3_NEXT_PACKED_PREFILL_BATCH_CAP`` and processed via
+    ``jax.lax.scan`` (rather than ``fori_loop``), which enables XLA to
+    overlap computation and memory transfers more effectively. Each chunk:
+    - Gathers per-slot tokens and prepends the conv-state prefix.
+    - Runs a full causal depthwise convolution over the combined sequence.
+    - Applies the chunked GDR recurrent update.
+    - Collects updated conv and recurrent states as scan outputs.
+
+    After the scan, all prefill state updates are scattered back to the
+    slot arrays in a single pass using ``_scatter_qwen3_next_selected_updates``.
+
+    Unlike the legacy implementation, this function does NOT carry the full
+    state arrays through the scan body, reducing loop-carry overhead and
+    improving TPU performance.
+
+    Args:
+        conv_states: Per-slot conv state, shape ``[num_slots, conv_dim, d_conv]``.
+        recurrent_states: Per-slot recurrent state,
+            shape ``[num_slots, num_v_heads, head_dim, value_dim]``.
+        conv_input: Packed input, shape ``[batch, seq_len, conv_dim]``.
+        beta: Gating coefficients, shape ``[batch, seq_len, num_v_heads]``.
+        decay: Decay factors, shape ``[batch, seq_len, num_v_heads]``.
+        kernel: Depthwise conv kernel, shape ``[conv_dim, d_conv]``.
+        query_start_loc: Cumulative token offsets, length ``num_slots + 1``.
+        num_requests: Scalar number of active requests.
+        key_dim: Total key dimension.
+        num_k_heads: Number of key/query heads.
+        head_k_dim: Per-head key dimension.
+        num_v_heads: Number of value heads.
+        head_v_dim: Per-head value dimension.
+        expand_ratio: Value-head expansion ratio.
+        conv_output_dtype: Dtype for conv outputs.
+        gdr_op: GatedDeltaRuleOp instance.
+
+    Returns:
+        A tuple of (updated conv_states, updated recurrent_states,
+        token_outputs of shape ``[seq_len, num_v_heads, head_v_dim]``).
+    """
+    seq_len = conv_input.shape[1]
+    d_conv = kernel.shape[1]
+    num_slots = min(conv_states.shape[0], query_start_loc.shape[0] - 1)
+    prefill_chunk_size = QWEN3_NEXT_PACKED_PREFILL_BATCH_CAP
+    num_prefill_chunks = max((num_slots + prefill_chunk_size - 1) // prefill_chunk_size, 1)
+    slot_ids = jnp.arange(num_slots, dtype=jnp.int32)
+    starts = query_start_loc[:num_slots]
+    scheduled_tokens = query_start_loc[1 : num_slots + 1] - query_start_loc[:num_slots]
+    active_slots = (slot_ids < num_requests) & (scheduled_tokens > 0)
+    single_slot_mask = active_slots & (scheduled_tokens == 1)
+    multi_slot_mask = active_slots & (scheduled_tokens > 1)
+    token_outputs = jnp.zeros((seq_len, num_v_heads, head_v_dim), dtype=jnp.float32)
+
+    if num_slots == 0:
+        return conv_states, recurrent_states, token_outputs
+
+    candidate_conv_states, candidate_recurrent_states = conv_states, recurrent_states
+    extra_slots = conv_states.shape[0] - num_slots
+    candidate_count = extra_slots // num_slots if num_slots > 0 and extra_slots > 0 else 0
+    has_spec_candidates = candidate_count > 0
+    if has_spec_candidates and spec_recurrent_commit is not None:
+        commit = jnp.asarray(spec_recurrent_commit, dtype=jnp.int32)
+        raw_prefix = commit[1, :num_slots]
+        commit_active = (commit[0, :num_slots] > 0) & (raw_prefix > 0) & (raw_prefix <= int(candidate_count))
+        # Prefix-major candidate layout: base + prefix * num_slots + slot.
+        candidate_rows = num_slots + (raw_prefix - 1) * num_slots + slot_ids
+        safe_rows = jnp.clip(candidate_rows, 0, conv_states.shape[0] - 1)
+        row_valid = commit_active & (candidate_rows < conv_states.shape[0])
+        conv_states = conv_states.at[:num_slots].set(
+            jnp.where(row_valid[:, None, None], conv_states[safe_rows], conv_states[:num_slots]).astype(
+                conv_states.dtype
+            )
+        )
+        recurrent_states = recurrent_states.at[:num_slots].set(
+            jnp.where(
+                row_valid[:, None, None, None],
+                recurrent_states[safe_rows],
+                recurrent_states[:num_slots],
+            ).astype(recurrent_states.dtype)
+        )
+        candidate_conv_states, candidate_recurrent_states = conv_states, recurrent_states
+    if context_lens is None:
+        context_lens_i = scheduled_tokens
+    else:
+        context_lens_i = jnp.asarray(context_lens, dtype=jnp.int32)[:num_slots]
+    context_before = context_lens_i - scheduled_tokens
+    spec_slot_mask = jnp.zeros_like(active_slots)
+    if has_spec_candidates:
+        spec_slot_mask = (
+            active_slots & (scheduled_tokens > 1) & (scheduled_tokens <= int(candidate_count)) & (context_before > 0)
+        )
+
+    prefix_conv_states = conv_states[:num_slots]
+    prefix_recurrent_states = recurrent_states[:num_slots]
+    safe_single_indices = jnp.clip(starts, 0, seq_len - 1)
+    single_tokens = conv_input[0, safe_single_indices, :]
+
+    def _apply_single_token_fast_lane(operand):
+        """Single-token decode fast lane for the unified packed update.
+
+        Applies the fused depthwise-conv decode + grouped GDR step in
+        VMEM for the single-token slots in the packed batch, then
+        scatters the per-slot conv-state and recurrent-state updates
+        back into the bulk buffers without materializing the 5-D
+        intermediate state. See module docstring for performance notes
+        on the fused Pallas decode kernel.
+        """
+        token_outputs_i, conv_states_i, recurrent_states_i = operand
+        shifted_conv_states, conv_output = GatedDeltaRuleOp.fused_conv_decode(
+            conv_state=conv_states_i,
+            new_tokens=single_tokens,
+            kernel=kernel,
+            output_dtype=conv_output_dtype,
+        )
+        query_single = conv_output[:, :key_dim].reshape(num_slots, 1, num_k_heads, head_k_dim)
+        key_single = conv_output[:, key_dim : key_dim * 2].reshape(num_slots, 1, num_k_heads, head_k_dim)
+        value_single = conv_output[:, key_dim * 2 :].reshape(num_slots, 1, num_v_heads, head_v_dim)
+        beta_single = beta[0, safe_single_indices].reshape(num_slots, 1, num_v_heads)
+        decay_single = decay[0, safe_single_indices].reshape(num_slots, 1, num_v_heads)
+
+        single_query_mask = single_slot_mask[:, None, None, None]
+        single_token_mask = single_slot_mask[:, None, None]
+        query_single = jnp.where(single_query_mask, query_single, 0)
+        key_single = jnp.where(single_query_mask, key_single, 0)
+        value_single = jnp.where(single_query_mask, value_single, 0)
+        beta_single = jnp.where(single_token_mask, beta_single, 0)
+        decay_single = jnp.where(single_token_mask, decay_single, 0)
+
+        if expand_ratio > 1:
+            single_output, single_recurrent = apply_grouped_single_step_gdr(
+                query=query_single,
+                key=key_single,
+                value=value_single,
+                beta=beta_single,
+                decay=decay_single,
+                recurrent_state=recurrent_states_i,
+                gdr_op=gdr_op,
+            )
+        else:
+            gdr_single: GatedDeltaRuleOutput = gdr_op(
+                query=query_single,
+                key=key_single,
+                value=value_single,
+                beta=beta_single,
+                decay=decay_single,
+                recurrent_state=recurrent_states_i,
+            )
+            single_output = gdr_single.attention_outputs
+            single_recurrent = gdr_single.recurrent_state
+
+        if single_output is None:
+            raise RuntimeError("Grouped delta rule did not return attention outputs.")
+        conv_states_i = jnp.where(
+            single_slot_mask[:, None, None],
+            shifted_conv_states.astype(conv_states_i.dtype),
+            conv_states_i,
+        )
+        recurrent_states_i = jnp.where(
+            single_slot_mask[:, None, None, None],
+            single_recurrent.astype(recurrent_states_i.dtype),
+            recurrent_states_i,
+        )
+        token_outputs_i = token_outputs_i.at[safe_single_indices].add(
+            jnp.where(single_token_mask, single_output[:, 0].astype(token_outputs_i.dtype), 0)
+        )
+        return token_outputs_i, conv_states_i, recurrent_states_i
+
+    token_outputs, base_conv_states, base_recurrent_states = jax.lax.cond(
+        jnp.any(single_slot_mask),
+        _apply_single_token_fast_lane,
+        lambda operand: operand,
+        (token_outputs, prefix_conv_states, prefix_recurrent_states),
+    )
+
+    def _apply_spec_decode_windows(operand):
+        """Step the spec-decode draft window for every candidate prefix.
+
+        Conditional branch invoked when ``spec_slot_mask`` is non-empty.
+        Iterates over the ``candidate_count`` draft positions, advancing
+        a rolling ``(conv, recurrent)`` state per slot using
+        :meth:`GatedDeltaRuleOp.fused_conv_decode` plus a manual
+        single-step gated-delta-rule, stacking each intermediate state and
+        writing all candidate rows with one ``dynamic_update_slice`` in the
+        prefix-major ``base + prefix * num_slots + slot`` layout so that
+        later acceptance/rejection can rewind to any prefix length.
+        """
+        token_outputs_i, conv_states_i, recurrent_states_i, candidate_conv_i, candidate_recurrent_i = operand
+        rolling_conv = conv_states_i
+        rolling_recurrent = recurrent_states_i
+        stacked_conv: list[Array] = []
+        stacked_recurrent: list[Array] = []
+
+        for prefix_idx in range(candidate_count):
+            prefix_pos = jnp.asarray(prefix_idx, dtype=jnp.int32)
+            token_positions = starts + prefix_pos
+            safe_positions = jnp.clip(token_positions, 0, seq_len - 1)
+            prefix_valid = spec_slot_mask & (prefix_pos < scheduled_tokens)
+
+            new_tokens = conv_input[0, safe_positions, :]
+            shifted_conv_states, conv_output = GatedDeltaRuleOp.fused_conv_decode(
+                conv_state=rolling_conv,
+                new_tokens=new_tokens,
+                kernel=kernel,
+                output_dtype=conv_output_dtype,
+            )
+            query = conv_output[:, :key_dim].reshape(num_slots, 1, num_k_heads, head_k_dim)
+            key = conv_output[:, key_dim : key_dim * 2].reshape(num_slots, 1, num_k_heads, head_k_dim)
+            value = conv_output[:, key_dim * 2 :].reshape(num_slots, 1, num_v_heads, head_v_dim)
+            beta_step = beta[0, safe_positions].reshape(num_slots, 1, num_v_heads)
+            decay_step = decay[0, safe_positions].reshape(num_slots, 1, num_v_heads)
+
+            query_mask = prefix_valid[:, None, None, None]
+            token_mask = prefix_valid[:, None, None]
+            query = jnp.where(query_mask, query, 0)
+            key = jnp.where(query_mask, key, 0)
+            value = jnp.where(query_mask, value, 0)
+            beta_step = jnp.where(token_mask, beta_step, 0)
+            decay_step = jnp.where(token_mask, decay_step, 0)
+
+            # Advance the draft state with the EXACT same op the single-token
+            # decode fast lane uses (`apply_grouped_single_step_gdr` / `gdr_op`),
+            # not a hand-inlined formula. The op keeps bf16 activation inputs
+            # separate from the recurrent cache dtype (normally fp32) and delegates
+            # the grouped update to eJKernel's XLA implementation. A manual copy can
+            # still lower with different operation ordering and produce
+            # low-bit-different candidate states. Reusing the op makes each
+            # candidate row bit-identical to sequentially decoding the accepted
+            # prefix, which is what lets the cheap candidate-commit rewind be exact
+            # (no replay forward needed). See `_apply_single_token_fast_lane` above.
+            if expand_ratio > 1:
+                step_output, step_recurrent = apply_grouped_single_step_gdr(
+                    query=query,
+                    key=key,
+                    value=value,
+                    beta=beta_step,
+                    decay=decay_step,
+                    recurrent_state=rolling_recurrent,
+                    gdr_op=gdr_op,
+                )
+            else:
+                gdr_step: GatedDeltaRuleOutput = gdr_op(
+                    query=query,
+                    key=key,
+                    value=value,
+                    beta=beta_step,
+                    decay=decay_step,
+                    recurrent_state=rolling_recurrent,
+                )
+                step_output = gdr_step.attention_outputs
+                step_recurrent = gdr_step.recurrent_state
+            if step_output is None:
+                raise RuntimeError("Grouped delta rule did not return attention outputs.")
+
+            rolling_conv = jnp.where(
+                prefix_valid[:, None, None],
+                shifted_conv_states.astype(rolling_conv.dtype),
+                rolling_conv,
+            )
+            rolling_recurrent = jnp.where(
+                prefix_valid[:, None, None, None],
+                step_recurrent.astype(rolling_recurrent.dtype),
+                rolling_recurrent,
+            )
+            token_outputs_i = token_outputs_i.at[safe_positions].add(
+                jnp.where(token_mask, step_output[:, 0].astype(token_outputs_i.dtype), 0)
+            )
+            stacked_conv.append(rolling_conv.astype(candidate_conv_i.dtype))
+            stacked_recurrent.append(rolling_recurrent.astype(candidate_recurrent_i.dtype))
+
+        candidate_conv_i = jax.lax.dynamic_update_slice_in_dim(
+            candidate_conv_i, jnp.concatenate(stacked_conv, axis=0), num_slots, axis=0
+        )
+        candidate_recurrent_i = jax.lax.dynamic_update_slice_in_dim(
+            candidate_recurrent_i, jnp.concatenate(stacked_recurrent, axis=0), num_slots, axis=0
+        )
+
+        conv_states_i = jnp.where(spec_slot_mask[:, None, None], rolling_conv, conv_states_i)
+        recurrent_states_i = jnp.where(spec_slot_mask[:, None, None, None], rolling_recurrent, recurrent_states_i)
+        return token_outputs_i, conv_states_i, recurrent_states_i, candidate_conv_i, candidate_recurrent_i
+
+    # lax.cond traces both branches even when the runtime mask is all false.
+    # Without candidate rows, the window branch has no prefix states to stack.
+    if has_spec_candidates:
+        token_outputs, base_conv_states, base_recurrent_states, candidate_conv_states, candidate_recurrent_states = (
+            jax.lax.cond(
+                jnp.any(spec_slot_mask),
+                _apply_spec_decode_windows,
+                lambda operand: operand,
+                (
+                    token_outputs,
+                    base_conv_states,
+                    base_recurrent_states,
+                    candidate_conv_states,
+                    candidate_recurrent_states,
+                ),
+            )
+        )
+
+    prefill_slot_mask = multi_slot_mask & ~spec_slot_mask
+    packed_slots = jnp.where(
+        prefill_slot_mask,
+        size=num_prefill_chunks * prefill_chunk_size,
+        fill_value=0,
+    )[0].reshape(num_prefill_chunks, prefill_chunk_size)
+    packed_valid = (
+        jnp.arange(num_prefill_chunks * prefill_chunk_size, dtype=jnp.int32)
+        < jnp.sum(prefill_slot_mask.astype(jnp.int32))
+    ).reshape(num_prefill_chunks, prefill_chunk_size)
+    prefill_offsets = jnp.arange(seq_len, dtype=jnp.int32)[None, :]
+
+    empty_conv_updates = jnp.zeros(
+        (prefill_chunk_size, prefix_conv_states.shape[1], d_conv),
+        dtype=prefix_conv_states.dtype,
+    )
+    empty_recurrent_updates = jnp.zeros(
+        (prefill_chunk_size, *prefix_recurrent_states.shape[1:]),
+        dtype=prefix_recurrent_states.dtype,
+    )
+
+    def _prefill_chunk_step(
+        token_outputs_i: Float[Array, "seq_len num_v_heads head_v_dim"],
+        scan_inputs: tuple[Int[Array, "chunk"], Bool[Array, "chunk"]],
+    ) -> tuple[
+        Float[Array, "seq_len num_v_heads head_v_dim"],
+        tuple[
+            Float[Array, "chunk conv_dim d_conv"],
+            Float[Array, "chunk num_v_heads head_dim value_dim"],
+            Int[Array, "chunk"],
+            Bool[Array, "chunk"],
+        ],
+    ]:
+        """``jax.lax.scan`` body that prefills one prefill-chunk per step.
+
+        Gathers the active slots for this chunk, prepends each slot's
+        conv-state prefix to its packed token stream, runs the full
+        causal depthwise conv + chunked gated-delta-rule update, and
+        accumulates per-token outputs while emitting the updated
+        ``(conv, recurrent)`` slices for downstream scatter. Dispatches
+        between ``_apply_chunk`` and ``_skip_chunk`` based on the
+        chunk's validity mask to keep dead chunks free of work.
+        """
+        chunk_slots, chunk_valid = scan_inputs
+
+        def _apply_chunk(operand):
+            """Run the conv + GDR prefill update for a non-empty chunk.
+
+            Active branch of the chunk-validity ``lax.cond`` inside
+            ``_prefill_chunk_step``. Constructs per-slot token windows,
+            applies the depthwise conv with state-prefix concatenation,
+            runs the chunked gated-delta-rule, and accumulates the
+            resulting per-token outputs into ``token_outputs_j``.
+            """
+            token_outputs_j, chunk_slots_j, chunk_valid_j = operand
+            chunk_starts = starts[chunk_slots_j]
+            chunk_lengths = scheduled_tokens[chunk_slots_j]
+            chunk_token_mask = chunk_valid_j[:, None] & (prefill_offsets < chunk_lengths[:, None])
+
+            chunk_token_indices = chunk_starts[:, None] + prefill_offsets
+            safe_chunk_indices = jnp.clip(chunk_token_indices, 0, seq_len - 1)
+            chunk_inputs = conv_input[0, safe_chunk_indices, :]
+            chunk_inputs = jnp.where(chunk_token_mask[:, :, None], chunk_inputs, 0)
+
+            chunk_prefix = base_conv_states[chunk_slots_j].transpose(0, 2, 1)
+            combined_inputs = jnp.concatenate([chunk_prefix, chunk_inputs], axis=1)
+            conv_output = _apply_qwen3_next_depthwise_conv_sequence(
+                combined_inputs,
+                kernel,
+                output_dtype=conv_output_dtype,
+            )[:, d_conv:, :]
+
+            query_prefill = conv_output[:, :, :key_dim].reshape(
+                prefill_chunk_size,
+                seq_len,
+                num_k_heads,
+                head_k_dim,
+            )
+            key_prefill = conv_output[:, :, key_dim : key_dim * 2].reshape(
+                prefill_chunk_size,
+                seq_len,
+                num_k_heads,
+                head_k_dim,
+            )
+            value_prefill = conv_output[:, :, key_dim * 2 :].reshape(
+                prefill_chunk_size,
+                seq_len,
+                num_v_heads,
+                head_v_dim,
+            )
+
+            beta_prefill = beta[0, safe_chunk_indices]
+            decay_prefill = decay[0, safe_chunk_indices]
+
+            prefill_query_mask = chunk_token_mask[:, :, None, None]
+            prefill_beta_mask = chunk_token_mask[:, :, None]
+            if expand_ratio > 1:
+                query_prefill = jnp.repeat(query_prefill, expand_ratio, axis=2)
+                key_prefill = jnp.repeat(key_prefill, expand_ratio, axis=2)
+            query_prefill = jnp.where(prefill_query_mask, query_prefill, 0)
+            key_prefill = jnp.where(prefill_query_mask, key_prefill, 0)
+            value_prefill = jnp.where(prefill_query_mask, value_prefill, 0)
+            beta_prefill = jnp.where(prefill_beta_mask, beta_prefill, 0)
+            decay_prefill = jnp.where(prefill_beta_mask, decay_prefill, 0)
+
+            chunk_recurrent_states = base_recurrent_states[chunk_slots_j]
+            gdr_prefill: GatedDeltaRuleOutput = gdr_op(
+                query=query_prefill,
+                key=key_prefill,
+                value=value_prefill,
+                beta=beta_prefill,
+                decay=decay_prefill,
+                recurrent_state=chunk_recurrent_states,
+            )
+            prefill_outputs = jnp.where(
+                prefill_query_mask,
+                gdr_prefill.attention_outputs.astype(token_outputs_j.dtype),
+                0,
+            )
+            token_outputs_j = token_outputs_j.at[safe_chunk_indices.reshape(-1)].add(
+                prefill_outputs.reshape(-1, num_v_heads, head_v_dim)
+            )
+
+            updated_chunk_conv_states = _finalize_qwen3_next_conv_state_from_combined(
+                combined_inputs,
+                chunk_lengths + d_conv,
+                d_conv=d_conv,
+                output_dtype=base_conv_states.dtype,
+            )
+            updated_chunk_recurrent_states = gdr_prefill.recurrent_state.astype(base_recurrent_states.dtype)
+            return token_outputs_j, (
+                updated_chunk_conv_states,
+                updated_chunk_recurrent_states,
+                chunk_slots_j,
+                chunk_valid_j,
+            )
+
+        def _skip_chunk(operand):
+            """No-op branch of the chunk-validity ``lax.cond``.
+
+            Emits zeroed conv and recurrent updates and passes
+            ``token_outputs_j`` through unchanged so the scan's pytree
+            shape stays consistent with the active branch.
+            """
+            token_outputs_j, chunk_slots_j, chunk_valid_j = operand
+            return token_outputs_j, (
+                empty_conv_updates,
+                empty_recurrent_updates,
+                chunk_slots_j,
+                chunk_valid_j,
+            )
+
+        return jax.lax.cond(
+            jnp.any(chunk_valid),
+            _apply_chunk,
+            _skip_chunk,
+            (token_outputs_i, chunk_slots, chunk_valid),
+        )
+
+    def _run_prefill_scan(operand):
+        """Drive the prefill scan and scatter results back to the slot pool.
+
+        Active branch of the prefill-slot ``lax.cond``: kicks off
+        ``jax.lax.scan(_prefill_chunk_step, ...)`` over the packed
+        prefill chunks, then writes the per-chunk conv/recurrent
+        updates back into the slot-indexed buffers via
+        :func:`_scatter_qwen3_next_selected_updates`.
+        """
+        token_outputs_i, conv_states_i, recurrent_states_i = operand
+        token_outputs_i, scan_outputs = jax.lax.scan(
+            _prefill_chunk_step,
+            token_outputs_i,
+            (packed_slots, packed_valid),
+        )
+
+        chunk_conv_updates, chunk_recurrent_updates, chunk_slots, chunk_valid = scan_outputs
+        flat_slots = chunk_slots.reshape(-1)
+        flat_valid = chunk_valid.reshape(-1)
+        conv_states_i = _scatter_qwen3_next_selected_updates(
+            conv_states_i,
+            flat_slots,
+            flat_valid,
+            chunk_conv_updates.reshape(-1, *chunk_conv_updates.shape[2:]),
+        )
+        recurrent_states_i = _scatter_qwen3_next_selected_updates(
+            recurrent_states_i,
+            flat_slots,
+            flat_valid,
+            chunk_recurrent_updates.reshape(-1, *chunk_recurrent_updates.shape[2:]),
+        )
+        return token_outputs_i, conv_states_i, recurrent_states_i
+
+    token_outputs, final_prefix_conv_states, final_prefix_recurrent_states = jax.lax.cond(
+        jnp.any(prefill_slot_mask),
+        _run_prefill_scan,
+        lambda operand: operand,
+        (token_outputs, base_conv_states, base_recurrent_states),
+    )
+
+    out_conv_states = conv_states.at[:num_slots].set(final_prefix_conv_states)
+    out_recurrent_states = recurrent_states.at[:num_slots].set(final_prefix_recurrent_states)
+    if conv_states.shape[0] > num_slots:
+        out_conv_states = out_conv_states.at[num_slots:].set(candidate_conv_states[num_slots:])
+        out_recurrent_states = out_recurrent_states.at[num_slots:].set(candidate_recurrent_states[num_slots:])
+
+    return out_conv_states, out_recurrent_states, token_outputs
+
+
+def _qwen3_next_spec_window_prep(
+    *,
+    conv_states: Float[Array, "num_slots conv_dim d_conv"],
+    conv_input: Float[Array, "batch seq_len conv_dim"],
+    query_start_loc: Int[Array, "num_slots_plus_1"],
+    context_lens: Int[Array, "num_slots"] | None,
+    num_requests: Int[Array, ""],
+    split_sizes: tuple[int, ...],
+    use_head_sharded: bool,
+    mesh=None,
+    head_axis=None,
+) -> tuple[Int[Array, "base_slots num_steps"], Bool[Array, "base_slots num_steps"], int, Array] | None:
+    """Speculative-window metadata + candidate CONV block for the extra cache rows.
+
+    eSurge stores live recurrent state in rows ``[0, max_num_reqs)``. When the
+    runner allocates speculative candidate rows, they are laid out PREFIX-MAJOR:
+    ``base + prefix_index * max_num_reqs + request_row``. Prefix index 0 is
+    the state after the real decode token, index 1 after the first accepted
+    draft, and so on.
+
+    This helper computes the per-slot window token positions and validity mask
+    (consumed by the fused ragged-GDN-plus-window-states operation, which
+    produces the RECURRENT candidate blocks inside the main pass's shard_map
+    region) and the candidate CONV blocks, which are pure data movement: the
+    conv state after ``p`` window tokens is the trailing ``d_conv`` window of
+    ``[state columns .. window tokens]``. When the head-sharded conv is active
+    the persistent conv-state pool lives in the interleaved per-shard feature
+    layout, so the window token columns are reordered into that layout first.
+
+    Rows whose slot is not in this step's spec window receive copies of that
+    slot's (unchanged) window-entry state. Those rows are dead data: a
+    candidate row is only ever read by the commit gather at the top of a LATER
+    step, and a commit is only queued for a request that went through a spec
+    window in THIS step — which wrote its rows here. For the same reason the
+    blocks are computed UNconditionally whenever candidate rows exist (no
+    ``lax.cond``): a conditional would force the full state pool through the
+    cond output every step, which costs more than the block computation, and
+    non-spec windows in a speculative runner are rare.
+
+    Returns:
+        ``(safe_positions, step_valid, candidate_count, conv_block)`` — or
+        ``None`` when the cache carries no candidate rows (non-speculative
+        runners).
+    """
+    base_slots = query_start_loc.shape[0] - 1
+    if base_slots <= 0:
+        return None
+
+    extra_slots = conv_states.shape[0] - base_slots
+    if extra_slots <= 0:
+        return None
+
+    candidate_count = extra_slots // base_slots
+    if candidate_count <= 0:
+        return None
+
+    seq_len = conv_input.shape[1]
+    d_conv = conv_states.shape[-1]
+    slot_ids = jnp.arange(base_slots, dtype=jnp.int32)
+    starts = query_start_loc[:base_slots]
+    scheduled_tokens = query_start_loc[1 : base_slots + 1] - starts
+    if context_lens is None:
+        context_lens_i = scheduled_tokens
+    else:
+        context_lens_i = jnp.asarray(context_lens, dtype=jnp.int32)[:base_slots]
+    context_before = context_lens_i - scheduled_tokens
+    active_slots = (slot_ids < num_requests) & (scheduled_tokens > 0)
+    spec_slot_mask = (
+        active_slots & (scheduled_tokens > 1) & (scheduled_tokens <= (candidate_count + 1)) & (context_before > 0)
+    )
+
+    step_ids = jnp.arange(candidate_count, dtype=jnp.int32)
+    positions = starts[:, None] + step_ids[None, :]
+    safe_positions = jnp.clip(positions, 0, seq_len - 1)
+    step_valid = spec_slot_mask[:, None] & (step_ids[None, :] < scheduled_tokens[:, None])
+
+    token_cols = conv_input[0, safe_positions]
+    if use_head_sharded:
+        # The persistent conv-state pool is stored in the interleaved
+        # per-shard feature layout (see ragged_causal_conv1d_head_sharded);
+        # bring the window token columns into the same layout.
+        token_cols = reorder_conv_features_for_sharding(
+            token_cols, split_sizes, int(mesh_axis_size(mesh, head_axis)), -1
+        )
+    combined_cols = jnp.concatenate(
+        [conv_states[:base_slots], token_cols.transpose(0, 2, 1).astype(conv_states.dtype)],
+        axis=2,
+    )
+    rolling_conv = conv_states[:base_slots]
+    stacked_conv: list[Array] = []
+    for prefix_idx in range(candidate_count):
+        window_p = jax.lax.slice_in_dim(combined_cols, prefix_idx + 1, prefix_idx + 1 + d_conv, axis=2)
+        rolling_conv = jnp.where(step_valid[:, prefix_idx][:, None, None], window_p, rolling_conv)
+        stacked_conv.append(rolling_conv)
+    candidate_conv_block = jnp.concatenate(stacked_conv, axis=0).astype(conv_states.dtype)
+
+    return safe_positions, step_valid, candidate_count, candidate_conv_block
+
+
+def _apply_qwen3_next_packed_updates_ragged(
+    *,
+    conv_states: Float[Array, "num_slots conv_dim d_conv"],
+    recurrent_states: Float[Array, "num_slots num_v_heads head_dim value_dim"],
+    conv_input: Float[Array, "batch seq_len conv_dim"],
+    kernel: Float[Array, "conv_dim d_conv"],
+    query_start_loc: Int[Array, "num_slots_plus_1"],
+    num_requests: Int[Array, ""],
+    num_k_heads: int,
+    head_k_dim: int,
+    num_v_heads: int,
+    head_v_dim: int,
+    conv_output_dtype: jnp.dtype,
+    ragged_gdr_op: RaggedGatedDeltaRule,
+    alpha_raw: Float[Array, "batch seq_len num_v_heads"],
+    beta_raw: Float[Array, "batch seq_len num_v_heads"],
+    A_log: Float[Array, "num_v_heads"],
+    dt_bias: Float[Array, "num_v_heads"],
+    context_lens: Int[Array, "num_slots"] | None = None,
+    spec_recurrent_commit: Int[Array, "2 num_slots"] | None = None,
+    disable_recurrent_scan_prefill: bool = False,
+    ragged_gdr_chunk_size: int = 16,
+    force_recurrent_scan_prefill: bool = False,
+    recurrent_scan_prefill_max_seq_len: int = 64,
+) -> tuple[
+    Float[Array, "num_slots conv_dim d_conv"],
+    Float[Array, "num_slots num_v_heads head_dim value_dim"],
+    Float[Array, "seq_len num_v_heads head_v_dim"],
+]:
+    """Packed update for ragged inference: one ragged conv + one ragged GDN.
+
+    the entire per-layer linear-attention update collapses into exactly two
+    kernel calls, sharing a single ``(query_start_loc, state_indices,
+    distribution)`` triple to describe the packed batch layout. Decode
+    (single-token) requests and prefill (multi-token) requests are handled
+    uniformly — no separate fast lane, no scan over slot chunks.
+
+    Stage A — Ragged depthwise conv + SiLU
+        :func:`ragged_causal_conv1d` consumes the packed token stream
+        ``conv_input[0]`` together with the per-slot rolling state
+        ``conv_states``. It produces one conv output per token and refreshes
+        the conv state for every valid slot in a single pass.
+
+    Stage B — Ragged chunked gated delta rule
+        ``ragged_gdr_op`` (a :class:`RaggedGatedDeltaRule`) consumes the
+        post-conv stream plus the raw gating inputs (``alpha_raw`` /
+        ``beta_raw`` / ``A_log`` / ``dt_bias``) and dispatches internally to
+        either its decode-only branch (when all active slots have length 1)
+        or its chunked mixed-prefill branch.
+
+    The ``distribution`` tensor is built as
+    ``(decode_count, num_rows, num_rows)`` where ``num_rows`` is the positional
+    row prefix (``min(num_requests, num_slots)``, empty rows included — the
+    kernels skip them). The middle slot is identical to the last slot because
+    in Qwen3-Next every non-decode slot is a pure prefill — there is no
+    chunked-prefill-mixed-with-decode class that would need a separate index.
+    ``decode_count`` is ``num_rows`` when no row carries more than one token,
+    so the ragged GDN branch predicate ``distribution[0] == distribution[2]``
+    selects decode-only vs. mixed-prefill correctly.
+
+    Args:
+        conv_states: Rolling conv state pool,
+            shape ``(num_slots, conv_dim, d_conv)``.
+        recurrent_states: GDN state pool,
+            shape ``(num_slots, num_v_heads, head_k_dim, head_v_dim)``.
+        conv_input: Packed pre-conv tokens, shape ``(1, seq_len, conv_dim)``.
+            The leading batch axis is unused beyond this function and always 1.
+        kernel: Depthwise conv kernel, shape ``(conv_dim, d_conv)``.
+        query_start_loc: Cumulative token offsets per slot, length
+            ``num_slots + 1``; the trailing entry is the total number of
+            valid packed tokens.
+        num_requests: Scalar number of active requests in this batch.
+        num_k_heads: Number of key/query heads.
+        head_k_dim: Per-head key/query dimension.
+        num_v_heads: Number of value heads.
+        head_v_dim: Per-head value dimension.
+        conv_output_dtype: Dtype for the post-conv tensor handed to GDN.
+        ragged_gdr_op: Instance of :class:`RaggedGatedDeltaRule` used for
+            Stage B. Built once per ``Qwen3NextLinearAttention`` module and
+            passed in to share sharding metadata.
+        alpha_raw: Raw alpha gating inputs from the A / B projection,
+            shape ``(1, seq_len, num_v_heads)``. Consumed by the GDN op
+            directly (the GDN op applies the
+            ``-exp(A_log) * softplus(alpha + dt_bias)`` transform internally).
+        beta_raw: Raw beta gating inputs, shape ``(1, seq_len, num_v_heads)``.
+            The GDN op applies ``sigmoid`` internally.
+        A_log: Per-value-head log-decay parameter, shape ``(num_v_heads,)``.
+        dt_bias: Per-value-head delta-time bias, shape ``(num_v_heads,)``.
+
+    Returns:
+        A tuple of:
+
+        - ``updated_conv_states``: Refreshed conv-state pool, same shape and
+          dtype as ``conv_states``.
+        - ``new_recurrent_state``: Refreshed GDN-state pool, same shape and
+          dtype as ``recurrent_states``.
+        - ``token_outputs``: Per-token linear-attention output,
+          shape ``(seq_len, num_v_heads, head_v_dim)``, cast to float32 for
+          downstream projections.
+
+    Notes:
+        When ``num_slots == 0`` (no active slots in the static shape) the
+        function returns the inputs unchanged with a zeroed output tensor —
+        this guards against degenerate eSurge configurations where the
+        packed buffer is entirely padding.
+    """
+    seq_len = conv_input.shape[1]
+    d_conv = kernel.shape[1]
+    token_outputs = jnp.zeros((seq_len, num_v_heads, head_v_dim), dtype=jnp.float32)
+    num_slots = min(conv_states.shape[0], query_start_loc.shape[0] - 1)
+    slot_ids = jnp.arange(num_slots, dtype=jnp.int32)
+    scheduled_tokens = query_start_loc[1 : num_slots + 1] - query_start_loc[:num_slots]
+    active_slots = (slot_ids < num_requests) & (scheduled_tokens > 0)
+
+    if num_slots == 0:
+        return conv_states, recurrent_states, token_outputs
+
+    extra_slots = conv_states.shape[0] - num_slots
+    candidate_count = extra_slots // num_slots if num_slots > 0 and extra_slots > 0 else 0
+    if candidate_count > 0 and spec_recurrent_commit is not None:
+        commit = jnp.asarray(spec_recurrent_commit, dtype=jnp.int32)
+        raw_prefix = commit[1, :num_slots]
+        commit_active = (commit[0, :num_slots] > 0) & (raw_prefix > 0) & (raw_prefix <= int(candidate_count))
+        # Prefix-major candidate layout: base + prefix * num_slots + slot.
+        candidate_rows = num_slots + (raw_prefix - 1) * num_slots + slot_ids
+        safe_rows = jnp.clip(candidate_rows, 0, conv_states.shape[0] - 1)
+        row_valid = commit_active & (candidate_rows < conv_states.shape[0])
+        conv_states = conv_states.at[:num_slots].set(
+            jnp.where(row_valid[:, None, None], conv_states[safe_rows], conv_states[:num_slots]).astype(
+                conv_states.dtype
+            )
+        )
+        recurrent_states = recurrent_states.at[:num_slots].set(
+            jnp.where(
+                row_valid[:, None, None, None],
+                recurrent_states[safe_rows],
+                recurrent_states[:num_slots],
+            ).astype(recurrent_states.dtype)
+        )
+
+    state_indices = jnp.arange(num_slots, dtype=jnp.int32)
+    qsl = query_start_loc[: num_slots + 1]
+    if context_lens is None:
+        has_initial_state = jnp.ones((num_slots,), dtype=jnp.bool_)
+    else:
+        context_lens_i = jnp.asarray(context_lens, dtype=jnp.int32)[:num_slots]
+        has_initial_state = ((context_lens_i - scheduled_tokens) > 0) & active_slots
+    # Rows are positional: the kernels treat ``distribution[2]`` as the row
+    # prefix ``[0, num_rows)`` and skip empty (q_len == 0) rows inside it, so it
+    # must count rows, not active rows. Empty rows count as decode rows when no
+    # row carries more than one token, keeping such batches on the decode path.
+    num_rows = jnp.clip(jnp.asarray(num_requests, dtype=jnp.int32), 0, num_slots)
+    has_multi_token_row = jnp.any(active_slots & (scheduled_tokens > 1))
+    single_count = jnp.sum(active_slots & (scheduled_tokens == 1), dtype=jnp.int32)
+    decode_count = jnp.where(has_multi_token_row, single_count, num_rows)
+    distribution = jnp.stack([decode_count, num_rows, num_rows]).astype(jnp.int32)
+
+    gdr_metadata = ragged_gdr_op.get_impl_metadata()
+    gdr_mode = ragged_gdr_op.get_mode(query=jnp.expand_dims(conv_input[0], 0), BTHD=False)
+    shardings_bthd = gdr_metadata.get_shardings(gdr_mode, layout="bthd")
+    head_axis = shardings_bthd.query[2] if shardings_bthd.query is not None else None
+    mesh = gdr_metadata.mesh
+    tp_size = int(mesh_axis_size(mesh, head_axis))
+    split_sizes = (
+        int(num_k_heads * head_k_dim),
+        int(num_k_heads * head_k_dim),
+        int(num_v_heads * head_v_dim),
+    )
+    use_head_sharded_conv = (
+        mesh is not None and head_axis is not None and tp_size > 1 and all(size % tp_size == 0 for size in split_sizes)
+    )
+    # Speculative-decode verify windows (recognized statically by the presence
+    # of candidate state rows) route the multi-token main pass through the
+    # fused recurrent-scan kernel: a K+1-token window per slot is a terrible
+    # fit for the chunked path (full WY machinery on chunk-16 padding cost
+    # ~27ms/forward on the 27B at tp=4; the scan costs ~4ms). Small buckets
+    # only — chunked prefill keeps the large prompt buckets. Non-speculative
+    # runners are unaffected.
+    _has_candidate_rows = conv_states.shape[0] > (query_start_loc.shape[0] - 1)
+    use_recurrent_scan_prefill = (
+        jax.default_backend() == "tpu"
+        and not bool(disable_recurrent_scan_prefill)
+        and (
+            force_recurrent_scan_prefill
+            or (seq_len >= 128 and seq_len <= recurrent_scan_prefill_max_seq_len)
+            or (_has_candidate_rows and seq_len <= 256)
+        )
+    )
+
+    def _run_normal_ragged_path(_):
+        """Run the standard ragged conv + ragged GDR fast path.
+
+        Composes :func:`ragged_causal_conv1d_head_sharded` with the
+        chunked / decode-only branches of :class:`RaggedGatedDeltaRule`,
+        sharing one ``(query_start_loc, state_indices, distribution)``
+        triple. On speculative runners the per-prefix candidate recurrent
+        states are computed INSIDE the main pass's shard_map region
+        (:meth:`RaggedGatedDeltaRule.forward_with_window_states`) so the
+        window scan adds no extra region boundary; the candidate conv
+        windows (pure data movement) are built outside and both blocks are
+        merged into the freshly produced pools in place.
+        """
+        conv_outputs_flat, updated_conv_states = ragged_causal_conv1d_head_sharded(
+            conv_input[0],
+            conv_states,
+            kernel,
+            qsl,
+            state_indices,
+            distribution,
+            split_sizes=split_sizes,
+            mesh=mesh,
+            head_axis=head_axis,
+            d_conv=d_conv,
+            apply_silu=not use_recurrent_scan_prefill,
+            pre_sharded=False,
+        )
+        conv_outputs_flat = conv_outputs_flat.astype(conv_output_dtype)
+
+        window_prep = _qwen3_next_spec_window_prep(
+            conv_states=conv_states,
+            conv_input=conv_input,
+            query_start_loc=query_start_loc,
+            context_lens=context_lens,
+            num_requests=num_requests,
+            split_sizes=split_sizes,
+            use_head_sharded=use_head_sharded_conv,
+            mesh=mesh,
+            head_axis=head_axis,
+        )
+
+        if window_prep is not None:
+            safe_positions, step_valid, candidate_count, conv_block = window_prep
+            new_recurrent_state, token_outputs_i, stacked_states = ragged_gdr_op.forward_with_window_states(
+                mixed_qkv=conv_outputs_flat,
+                b=beta_raw[0, :seq_len],
+                a=alpha_raw[0, :seq_len],
+                recurrent_state=recurrent_states,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                query_start_loc=qsl,
+                state_indices=state_indices,
+                distribution=distribution,
+                window_positions=safe_positions,
+                window_valid=step_valid,
+                has_initial_state=has_initial_state,
+                num_base_slots=num_slots,
+                n_kq=num_k_heads,
+                n_v=num_v_heads,
+                d_k=head_k_dim,
+                d_v=head_v_dim,
+                use_qk_norm_in_gdn=True,
+                pre_sharded_mixed_qkv=use_head_sharded_conv,
+                flat_tp_shard=use_head_sharded_conv,
+                chunk_size=ragged_gdr_chunk_size,
+                apply_silu_in_gdr=use_recurrent_scan_prefill,
+                use_recurrent_scan_prefill=use_recurrent_scan_prefill,
+                mask_initial_state=context_lens is not None,
+            )
+            recurrent_block = stacked_states.reshape(candidate_count * num_slots, num_v_heads, head_k_dim, head_v_dim)
+            token_outputs_i = token_outputs_i.reshape(seq_len, num_v_heads, head_v_dim)
+            # The main-pass outputs are freshly produced, so these in-place
+            # slice updates alias instead of copying the full state pools.
+            updated_conv_states = jax.lax.dynamic_update_slice_in_dim(
+                updated_conv_states, conv_block.astype(updated_conv_states.dtype), num_slots, axis=0
+            )
+            new_recurrent_state = jax.lax.dynamic_update_slice_in_dim(
+                new_recurrent_state, recurrent_block.astype(new_recurrent_state.dtype), num_slots, axis=0
+            )
+            return updated_conv_states, new_recurrent_state, token_outputs_i.astype(jnp.float32)
+
+        new_recurrent_state, token_outputs_i = ragged_gdr_op(
+            mixed_qkv=conv_outputs_flat,
+            b=beta_raw[0, :seq_len],
+            a=alpha_raw[0, :seq_len],
+            recurrent_state=recurrent_states,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            query_start_loc=qsl,
+            state_indices=state_indices,
+            distribution=distribution,
+            has_initial_state=has_initial_state,
+            n_kq=num_k_heads,
+            n_v=num_v_heads,
+            d_k=head_k_dim,
+            d_v=head_v_dim,
+            use_qk_norm_in_gdn=True,
+            pre_sharded_mixed_qkv=use_head_sharded_conv,
+            flat_tp_shard=use_head_sharded_conv,
+            chunk_size=ragged_gdr_chunk_size,
+            apply_silu_in_gdr=use_recurrent_scan_prefill,
+            use_recurrent_scan_prefill=use_recurrent_scan_prefill,
+            mask_initial_state=context_lens is not None,
+        )
+        token_outputs_i = token_outputs_i.reshape(seq_len, num_v_heads, head_v_dim)
+        return updated_conv_states, new_recurrent_state, token_outputs_i.astype(jnp.float32)
+
+    return _run_normal_ragged_path(None)
+
+
+def _apply_qwen3_next_packed_updates(
+    *,
+    conv_states: Float[Array, "num_slots conv_dim d_conv"],
+    recurrent_states: Float[Array, "num_slots num_v_heads head_dim value_dim"],
+    conv_input: Float[Array, "batch seq_len conv_dim"],
+    beta: Float[Array, "batch seq_len num_v_heads"],
+    decay: Float[Array, "batch seq_len num_v_heads"],
+    kernel: Float[Array, "conv_dim d_conv"],
+    query_start_loc: Int[Array, "num_slots_plus_1"],
+    num_requests: Int[Array, ""],
+    key_dim: int,
+    num_k_heads: int,
+    head_k_dim: int,
+    num_v_heads: int,
+    head_v_dim: int,
+    expand_ratio: int,
+    conv_output_dtype: jnp.dtype,
+    gdr_op: GatedDeltaRuleOp,
+    ragged_gdr_op: RaggedGatedDeltaRule,
+    alpha_raw: Float[Array, "batch seq_len num_v_heads"] | None = None,
+    beta_raw: Float[Array, "batch seq_len num_v_heads"] | None = None,
+    A_log: Float[Array, "num_v_heads"] | None = None,
+    dt_bias: Float[Array, "num_v_heads"] | None = None,
+    context_lens: Int[Array, "num_slots"] | None = None,
+    spec_recurrent_commit: Int[Array, "2 num_slots"] | None = None,
+    disable_recurrent_scan_prefill: bool = False,
+    use_ragged_gdr: bool = True,
+    ragged_gdr_chunk_size: int = 16,
+    force_recurrent_scan_prefill: bool = False,
+    recurrent_scan_prefill_max_seq_len: int = 64,
+) -> tuple[
+    Float[Array, "num_slots conv_dim d_conv"],
+    Float[Array, "num_slots num_v_heads head_dim value_dim"],
+    Float[Array, "seq_len num_v_heads head_v_dim"],
+]:
+    """Dispatch function that selects the packed update implementation.
+
+    This is the public entry point called by ``Qwen3NextLinearAttention`` during
+    packed-batch (continuous batching) inference. In inference mode it uses the
+    Rank-major ragged conv + ragged GDR path by default; the older unified path
+    remains the non-inference fallback.
+
+    Args:
+        conv_states: Per-slot conv state, shape ``[num_slots, conv_dim, d_conv]``.
+        recurrent_states: Per-slot recurrent state,
+            shape ``[num_slots, num_v_heads, head_dim, value_dim]``.
+        conv_input: Packed input, shape ``[batch, seq_len, conv_dim]``.
+        beta: Gating coefficients, shape ``[batch, seq_len, num_v_heads]``.
+        decay: Decay factors, shape ``[batch, seq_len, num_v_heads]``.
+        kernel: Depthwise conv kernel, shape ``[conv_dim, d_conv]``.
+        query_start_loc: Cumulative token offsets, length ``num_slots + 1``.
+        num_requests: Scalar number of active requests.
+        key_dim: Total key dimension.
+        num_k_heads: Number of key/query heads.
+        head_k_dim: Per-head key dimension.
+        num_v_heads: Number of value heads.
+        head_v_dim: Per-head value dimension.
+        expand_ratio: Value-head expansion ratio.
+        conv_output_dtype: Dtype for conv outputs.
+        gdr_op: GatedDeltaRuleOp instance for the unified path.
+        ragged_gdr_op: RaggedGatedDeltaRule instance for the ragged fast path.
+
+    Returns:
+        A tuple of (updated conv_states, updated recurrent_states,
+        token_outputs of shape ``[seq_len, num_v_heads, head_v_dim]``).
+    """
+
+    use_ragged = is_inference_mode() and bool(use_ragged_gdr)
+    if not use_ragged:
+        return _apply_qwen3_next_packed_updates_unified(
+            conv_states=conv_states,
+            recurrent_states=recurrent_states,
+            conv_input=conv_input,
+            beta=beta,
+            decay=decay,
+            beta_raw=beta_raw,
+            alpha_raw=alpha_raw,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            kernel=kernel,
+            query_start_loc=query_start_loc,
+            num_requests=num_requests,
+            key_dim=key_dim,
+            num_k_heads=num_k_heads,
+            head_k_dim=head_k_dim,
+            num_v_heads=num_v_heads,
+            head_v_dim=head_v_dim,
+            expand_ratio=expand_ratio,
+            conv_output_dtype=conv_output_dtype,
+            gdr_op=gdr_op,
+            context_lens=context_lens,
+            spec_recurrent_commit=spec_recurrent_commit,
+        )
+
+    return _apply_qwen3_next_packed_updates_ragged(
+        conv_states=conv_states,
+        recurrent_states=recurrent_states,
+        conv_input=conv_input,
+        kernel=kernel,
+        query_start_loc=query_start_loc,
+        num_requests=num_requests,
+        num_k_heads=num_k_heads,
+        head_k_dim=head_k_dim,
+        num_v_heads=num_v_heads,
+        head_v_dim=head_v_dim,
+        conv_output_dtype=conv_output_dtype,
+        ragged_gdr_op=ragged_gdr_op,
+        alpha_raw=alpha_raw,
+        beta_raw=beta_raw,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        context_lens=context_lens,
+        spec_recurrent_commit=spec_recurrent_commit,
+        disable_recurrent_scan_prefill=disable_recurrent_scan_prefill,
+        ragged_gdr_chunk_size=ragged_gdr_chunk_size,
+        force_recurrent_scan_prefill=force_recurrent_scan_prefill,
+        recurrent_scan_prefill_max_seq_len=recurrent_scan_prefill_max_seq_len,
+    )
+
+
+class Qwen3NextRMSNorm(RMSNorm):
+    """Qwen3-Next RMSNorm (HF ``Qwen3NextRMSNorm``): zero-centred ``(1 + w)``, float32 statistics and scale.
+
+    Zero-initialised ``weight`` of size ``hidden_size``; the output is cast back to the input dtype.
+    :class:`easydel.layers.norms.RMSNorm` with ``fp32_scale=True``.
+    """
+
+    kernel_init = staticmethod(jax.nn.initializers.zeros)
+
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        *,
+        rngs: spx.Rngs,
+    ):
+        super().__init__(
+            hidden_size,
+            eps=eps,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            scale_offset=1.0,
+            fp32_scale=True,
+        )
+        # The zero init needs no key; drawing one from the shared ``rngs`` would shift every later layer's init.
+        del rngs
+
+
+class Qwen3NextMLP(spx.Module):
+    """Qwen3Next dense MLP module.
+
+    Standard gated MLP with SiLU activation, used for layers
+    that don't use MoE.
+
+    Attributes:
+        config: Model configuration.
+        dtype: Computation data type.
+        param_dtype: Parameter data type.
+        precision: JAX precision setting.
+    """
+
+    def __init__(
+        self,
+        config: Qwen3NextConfig,
+        intermediate_size: int | None = None,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize Qwen3Next MLP block.
+
+        Args:
+            config (Qwen3NextConfig): Model configuration with MLP parameters.
+            intermediate_size (int | None, optional): Override intermediate dimension.
+                Uses config.intermediate_size if None. Defaults to None.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        intermediate_size = intermediate_size if intermediate_size is not None else config.intermediate_size
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            config.hidden_size,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            rngs=rngs,
+        )
+        self.gate_up_proj = build_fused_gate_up_projection(
+            config=config,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+        )
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    @property
+    def reform_param(self):
+        """Return the checkpoint reform rule for the fused gate/up projection.
+
+        The HF Qwen3-Next checkpoint stores ``gate_proj`` and
+        ``up_proj`` as two separate tensors; EasyDeL fuses them into a
+        single ``gate_up_proj`` column-parallel projection. This
+        property exposes the corresponding fuser registered on the
+        fused projection layout.
+        """
+        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
+
+    def _separate_gate_up_projection(self, hidden_states: Array) -> tuple[Array, Array]:
+        """Project gate/up halves with two matmuls using the fused checkpoint weight."""
+        if self.gate_up_proj.bias is not None:
+            raise ValueError("separate_mlp_gate_up_proj does not support biased fused gate/up projections.")
+
+        weight_var = getattr(self.gate_up_proj, "weight", None)
+        if weight_var is None:
+            # Quantized ParallelLinear twins carry codes/scales, not a dense
+            # `weight`; splitting fused quant codes is not implemented — fail
+            # loud instead of AttributeError deep in the split helper.
+            raise NotImplementedError(
+                "separate_mlp_gate_up_proj cannot split a QUANTIZED fused gate/up projection. "
+                "Exclude qwen3_next `gate_up_proj` from the quantization pattern or disable "
+                "`separate_mlp_gate_up_proj`."
+            )
+        gate_kernel, up_kernel = split_fused_gate_up_projection(weight_var.value, config=self.config)
+        if self.gate_up_proj.dtype is not None:
+            hidden_states = jnp.asarray(hidden_states, dtype=self.gate_up_proj.dtype)
+            gate_kernel = jnp.asarray(gate_kernel, dtype=self.gate_up_proj.dtype)
+            up_kernel = jnp.asarray(up_kernel, dtype=self.gate_up_proj.dtype)
+        gate_out = int(gate_kernel.shape[-1])
+        up_out = int(up_kernel.shape[-1])
+        with jax.named_scope(f"easydel/linear/ColumnParallelLinear/in{self.gate_up_proj.in_features}/out{gate_out}"):
+            gate_raw = None
+            if self.config.use_tp_ring_mlp_column_matmul:
+                gate_raw = _qwen3_next_tp_sharded_column_linear(
+                    self.gate_up_proj,
+                    hidden_states,
+                    gate_kernel,
+                    config=self.config,
+                    precision=self.precision,
+                )
+            if gate_raw is None:
+                gate_raw = jnp.einsum(
+                    "...i,io->...o",
+                    hidden_states,
+                    gate_kernel,
+                    precision=self.precision,
+                )
+        with jax.named_scope(f"easydel/linear/ColumnParallelLinear/in{self.gate_up_proj.in_features}/out{up_out}"):
+            up = None
+            if self.config.use_tp_ring_mlp_column_matmul:
+                up = _qwen3_next_tp_sharded_column_linear(
+                    self.gate_up_proj,
+                    hidden_states,
+                    up_kernel,
+                    config=self.config,
+                    precision=self.precision,
+                )
+            if up is None:
+                up = jnp.einsum(
+                    "...i,io->...o",
+                    hidden_states,
+                    up_kernel,
+                    precision=self.precision,
+                )
+
+        assert gate_raw is not None
+        assert up is not None
+        gate_raw = self.gate_up_proj._scale_operator(gate_raw)
+        up = self.gate_up_proj._scale_operator(up)
+        return with_tp_last_axis_sharding(gate_raw, self.config), with_tp_last_axis_sharding(up, self.config)
+
+    def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jnp.ndarray:
+        """Apply SwiGLU feedforward transformation.
+
+        The standard fused path delegates to
+        :func:`easydel.layers.gated_mlp_forward` (ejkernel fused MLP where
+        supported, legacy composition otherwise). The separate-projection
+        branch (which also hosts the TP-ring column matmul) keeps its
+        specialized implementation.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, hidden_dim].
+
+        Returns:
+            Transformed hidden states [batch, seq_len, hidden_dim].
+        """
+        if self.config.separate_mlp_gate_up_proj:
+            hidden_states = apply_logical_sharding(
+                hidden_states,
+                dynamic_axes=common_types.HiddenStateSharding,
+                partition_manager=self.config.runtime_sharding_resolver,
+            )
+            gate_raw, up = self._separate_gate_up_projection(hidden_states)
+            gate_raw = checkpoint_name(gate_raw, "mlp_gate_raw")
+            up = checkpoint_name(up, "mlp_up")
+            gate = checkpoint_name(self.act_fn(gate_raw), "mlp_gate")
+            hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
+            hidden_states = apply_logical_sharding(
+                hidden_states,
+                dynamic_axes=common_types.HiddenStateSharding,
+                partition_manager=self.config.runtime_sharding_resolver,
+            )
+            return checkpoint_name(hidden_states, "mlp_output")
+        return gated_mlp_forward(self, hidden_states)
+
+
+class Qwen3NextMLPStack(spx.Module):
+    """Qwen3Next MoE MLP using parallel MoE linear layers.
+
+    Implements the expert MLPs for the Mixture of Experts architecture,
+    using column and row parallel linear layers for efficient expert computation.
+
+    Attributes:
+        config: Model configuration.
+        gate_proj: Column-parallel gate projection for all experts.
+        down_proj: Row-parallel down projection for all experts.
+        up_proj: Column-parallel up projection for all experts.
+        act_fn: Activation function (SiLU).
+    """
+
+    def __init__(
+        self,
+        config: Qwen3NextConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize Qwen3Next MoE MLP stack.
+
+        Args:
+            config (Qwen3NextConfig): Model configuration with MoE parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
+        super().__init__()
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.gate_up_proj = ColumnParallelMoELinear(
+            num_experts=config.num_experts,
+            in_features=config.hidden_size,
+            out_features=2 * config.moe_intermediate_size,
+            rngs=rngs,
+            kernel_init=jax.nn.initializers.normal(),
+            use_bias=False,
+            partition_manager=config.runtime_sharding_resolver,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
+            dtype=dtype,
+            param_dtype=param_dtype,
+        )
+        self.down_proj = RowParallelMoELinear(
+            num_experts=config.num_experts,
+            in_features=config.moe_intermediate_size,
+            out_features=config.hidden_size,
+            rngs=rngs,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(),
+            partition_manager=config.runtime_sharding_resolver,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
+            dtype=dtype,
+            param_dtype=param_dtype,
+        )
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    @property
+    def reform_param(self):
+        return {
+            **moe_fused_gate_up_reform_param(
+                config=self.config,
+                target_prefix="gate_up_proj",
+                source_prefix="gate_up_proj",
+            ),
+            **moe_down_projection_reform_param(),
+        }
+
+    def forward(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        group_sizes: Array,
+        sorted_experts: Array | None = None,
+    ) -> Array:
+        """Apply MoE MLP transformation with SwiGLU activation.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, hidden_dim].
+            group_sizes: Sizes of token groups per expert.
+            sorted_experts: Optional sorted expert indices for routing.
+
+        Returns:
+            Transformed hidden states [batch, seq_len, hidden_dim].
+        """
+        gate_up = self.gate_up_proj(hidden_states, group_sizes, sorted_experts)
+        # The fused kernel is TP-interleaved (see moe_fused_gate_up_reform_param);
+        # a contiguous split would mix gate and up columns whenever tp > 1.
+        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        return self.down_proj(self.act_fn(gate) * up, group_sizes, sorted_experts)
+
+
+class Qwen3NextSparseMoeBlock(BaseMoeModule):
+    """Sparse Mixture of Experts block for Qwen3Next.
+
+    Routes input to selected experts and combines outputs.
+    Includes optional shared expert that processes all tokens.
+
+    Attributes:
+        config: Model configuration.
+        gate: Router linear layer.
+        experts: Stack of expert MLPs.
+        shared_expert: Optional shared expert MLP.
+    """
+
+    def __init__(
+        self,
+        config: Qwen3NextConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize Qwen3Next Sparse MoE block.
+
+        Args:
+            config (Qwen3NextConfig): Model configuration with MoE parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
+        super().__init__(
+            config=config,
+            n_routed_experts=config.num_experts,
+            num_experts_per_tok=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            lbl_coef=None,
+            rzl_coef=None,
+            routing_strategy=MoeRoutingStrategy.TOP_K if config.norm_topk_prob else MoeRoutingStrategy.TOP_K_NDIV,
+            load_balancing_strategy=MoeLoadBalancingStrategy.STANDARD,
+        )
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.gate = ColumnParallelLinear(
+            config.hidden_size,
+            config.num_experts,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+        )
+
+        self.experts = Qwen3NextMLPStack(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+
+        self.shared_expert = Qwen3NextMLP(
+            config=config,
+            intermediate_size=config.shared_expert_intermediate_size,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+
+        self.shared_expert_gate = ColumnParallelLinear(
+            config.hidden_size,
+            1,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+        )
+
+    def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
+        """Route inputs through selected experts and combine outputs.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, hidden_dim].
+
+        Returns:
+            Tuple of (output tensor, router logits) where output includes
+            both routed expert outputs and shared expert contribution.
+        """
+        out, router_logits = self.moe_call(
+            hidden_state=hidden_states,
+            gate_layer=self.gate,
+            expert_layer=self.experts,
+            gate_up_kernel=self.experts.gate_up_proj.kernel_view(),
+            wd_kernel=self.experts.down_proj.kernel_view(),
+            act_fn=self.experts.act_fn,
+        )
+
+        stage_mesh = resolve_stage_mesh(self.config.mesh, arr=hidden_states)
+        with spx.use_mesh(stage_mesh):
+            shared_out = self.shared_expert(hidden_states)
+            gate_input = self.shared_expert_gate(hidden_states)
+        needs_upcast = self.dtype in lowfloats
+        if needs_upcast:
+            gate = jax.nn.sigmoid(gate_input.astype(jnp.float32))
+            shared_out = shared_out.astype(jnp.float32) * gate
+            out = (out.astype(jnp.float32) + shared_out).astype(self.dtype)
+        else:
+            gate = jax.nn.sigmoid(gate_input)
+            shared_out = shared_out * gate
+            out = out + shared_out
+        return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
+
+
+class Qwen3NextFullAttention(UnifiedAttention):
+    """Qwen3Next full attention layer with sigmoid gating and partial RoPE.
+
+    Features:
+    - q_proj outputs 2x dimension (query + gate), matching HF structure
+    - Per-head RMSNorm on Q/K
+    - Sigmoid gating applied to attention output
+
+    HuggingFace-compatible structure:
+    - q_proj: [hidden_size -> num_heads * head_dim * 2] (query + gate concatenated)
+    - k_proj, v_proj, o_proj: Standard projections
+    - q_norm, k_norm: Per-head RMSNorm
+
+    Attributes:
+        config: Model configuration.
+        layer_idx: Index of this layer.
+    """
+
+    def __init__(
+        self,
+        config: Qwen3NextConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+        layer_idx: int,
+    ):
+        """Initialize Qwen3Next full attention layer.
+
+        Args:
+            config (Qwen3NextConfig): Model configuration with attention parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
+        super().__init__(
+            config,
+            dtype,
+            param_dtype,
+            precision,
+            rngs=rngs,
+            layer_idx=layer_idx,
+            attention_type="standard",
+            causal=True,
+            sliding_window=None,
+            use_qk_norm=True,
+        )
+        self.layer_idx = layer_idx
+        self.attn_output_gate = bool(getattr(config, "attn_output_gate", True))
+        num_kv_heads = int(getattr(config, "num_key_value_heads", self.num_key_value_heads))
+        self.logical_num_key_value_heads = num_kv_heads
+
+    def _q_proj_multiplier(self) -> int:
+        """Return ``2`` when the query projection also produces an output gate.
+
+        Qwen3-Next's full-attention layers use a doubled-width query
+        projection so the second half of the matmul can serve as a
+        per-head sigmoid gate applied to the attention output. When the
+        ``attn_output_gate`` config field is disabled, the projection
+        falls back to a vanilla ``num_heads * head_dim`` output and this
+        helper returns ``1``.
+        """
+        return 2 if bool(getattr(self, "attn_output_gate", True)) else 1
+
+    def _create_q_proj(
+        self,
+        config,
+        dtype,
+        param_dtype,
+        precision,
+        rngs,
+    ):
+        """Create query projection with 2x output for query + gate.
+
+        HuggingFace Qwen3Next uses q_proj that outputs doubled dimension,
+        which is then split into query states and gate values.
+
+        Args:
+            config: Owning :class:`Qwen3NextConfig`.
+            dtype: Compute dtype for the projection.
+            param_dtype: Parameter dtype for the kernel.
+            precision: JAX precision flag forwarded to the matmul.
+            rngs: Random number generator state for initialisation.
+
+        Returns:
+            :class:`ColumnParallelLinear` with output width
+            ``num_heads * head_dim * 2``.
+        """
+        return ColumnParallelLinear(
+            config.hidden_size,
+            self.num_heads * self.head_dim * 2,  # 2x for query + gate
+            rngs=rngs,
+            use_bias=getattr(config, "attention_bias", False),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(getattr(config, "initializer_range", 0.02)),
+            precision=precision,
+        )
+
+    def _create_fused_qkv_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Create packed ``[Q(+gate) | K | V]`` projection.
+
+        Builds a single column-parallel projection whose output is
+        partitioned into Q (optionally doubled for the gate), K, and V
+        segments by a :class:`FusedColumnLayout`. This lets the runtime
+        issue one matmul per layer instead of three and lets the
+        downstream split helpers reuse the layout for both runtime
+        ``split`` and checkpoint reform.
+
+        Args:
+            config: Owning :class:`Qwen3NextConfig`.
+            dtype: Compute dtype for the projection.
+            param_dtype: Parameter dtype for the kernel.
+            precision: JAX precision flag forwarded to the matmul.
+            rngs: Random number generator state for initialisation.
+
+        Returns:
+            :class:`ColumnParallelLinear` carrying the QKV layout.
+        """
+        q_out = self.num_heads * self.head_dim * (2 if getattr(config, "attn_output_gate", True) else 1)
+        kv_out = self.num_key_value_heads * self.head_dim
+        layout = _qwen3_next_full_attention_layout(q_size=q_out, kv_size=kv_out)
+        return ColumnParallelLinear(
+            config.hidden_size,
+            layout.out_features,
+            rngs=rngs,
+            use_bias=getattr(config, "attention_bias", False),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(getattr(config, "initializer_range", 0.02)),
+            precision=precision,
+            layout=layout,
+        )
+
+    def _create_k_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Create the per-KV-head key projection.
+
+        Returns:
+            :class:`ColumnParallelLinear` with output width
+            ``num_key_value_heads * head_dim``; used only on the
+            non-fused projection code path.
+        """
+        return ColumnParallelLinear(
+            config.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            rngs=rngs,
+            use_bias=getattr(config, "attention_bias", False),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(getattr(config, "initializer_range", 0.02)),
+            precision=precision,
+        )
+
+    def _create_v_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Create the per-KV-head value projection.
+
+        Returns:
+            :class:`ColumnParallelLinear` with output width
+            ``num_key_value_heads * head_dim``; used only on the
+            non-fused projection code path.
+        """
+        return ColumnParallelLinear(
+            config.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            rngs=rngs,
+            use_bias=getattr(config, "attention_bias", False),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(getattr(config, "initializer_range", 0.02)),
+            precision=precision,
+        )
+
+    def _create_q_norm(self, config, dtype, param_dtype, rngs):
+        """Build the per-head Qwen3-Next RMSNorm for the query projection.
+
+        Qwen3-Next normalises the query per-head before attention
+        using its own ``Qwen3NextRMSNorm`` layer (the ``(1 + weight)``
+        variant). This override replaces the default RMSNorm so the
+        normalisation matches the upstream PyTorch numerics exactly.
+
+        Returns:
+            Qwen3NextRMSNorm: Per-head norm of size ``head_dim``.
+        """
+        return Qwen3NextRMSNorm(
+            self.head_dim,
+            eps=config.rms_norm_eps,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+
+    def _create_k_norm(self, config, dtype, param_dtype, rngs):
+        """Build the per-head Qwen3-Next RMSNorm for the key projection.
+
+        Mirrors :meth:`_create_q_norm` for the key projection so that
+        Q and K are normalised symmetrically before attention.
+
+        Returns:
+            Qwen3NextRMSNorm: Per-head norm of size ``head_dim``.
+        """
+        return Qwen3NextRMSNorm(
+            self.head_dim,
+            eps=config.rms_norm_eps,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+
+    def _postprocess_qkv(self, query_states, key_states, value_states):
+        """Apply Q/K normalization after computing query, key, and value projections.
+
+        Args:
+            query_states: Query tensor from projection layer.
+            key_states: Key tensor from projection layer.
+            value_states: Value tensor from projection layer.
+
+        Returns:
+            Tuple of normalized query, normalized key, and value tensors.
+        """
+        query_states = self.query_normalization(query_states)
+        key_states = self.key_normalization(key_states)
+        return query_states, key_states, value_states
+
+    def forward(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo | None,
+        position_ids: Int[Array, "batch seq_len"],
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
+        cache_view: TransformerCacheView | RaggedPagesCacheView | RecurrentCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesCacheView | OperationsMetadata | None = None,
+        output_attentions: bool = False,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
+        alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
+    ) -> AttentionLayerOutput:
+        """Forward pass for Qwen3Next full attention with gated query.
+
+        The q_proj outputs 2x dimension (query + gate), which is split and the gate
+        is applied to attention output via sigmoid activation.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_dim).
+            mask_info (MaskInfo | None): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch, seq_len).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | RecurrentCacheView | None, optional):
+                Cache view for KV caching. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesCacheView | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+            alibi (Array | None, optional): ALiBi attention biases. Defaults to None.
+
+        Returns:
+            AttentionLayerOutput: Contains attention output, optional weights, and cache view.
+        """
+        batch_size = hidden_states.shape[0]
+        sequence_length = hidden_states.shape[1]
+
+        q_multiplier = self._q_proj_multiplier()
+        qkv_output = None
+        if bool(getattr(self.config, "use_tp_ring_full_attention_qkv_matmul", False)):
+            qkv_output = _qwen3_next_tp_sharded_column_linear(
+                self.qkv_proj,
+                hidden_states,
+                config=self.config,
+                precision=self.precision,
+            )
+        if qkv_output is None:
+            qkv_output = self.qkv_proj(hidden_states)
+        qkv_output = checkpoint_name(qkv_output, "attn_qkv")
+        qkv_output = _apply_tp_last_axis_sharding(qkv_output, self.config)
+        q_proj_output, key_states, value_states = self.qkv_proj.split(qkv_output, config=self.config)
+
+        q_proj_output = q_proj_output.reshape(batch_size, sequence_length, -1, self.head_dim * q_multiplier)
+        key_states = key_states.reshape(batch_size, sequence_length, -1, self.head_dim)
+        value_states = value_states.reshape(batch_size, sequence_length, -1, self.head_dim)
+
+        if self.attn_output_gate:
+            query_states, gate = jnp.split(q_proj_output, 2, axis=-1)
+        else:
+            query_states = q_proj_output
+            gate = None
+
+        query_states, key_states, value_states = self._postprocess_qkv(query_states, key_states, value_states)
+
+        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
+
+        query_states, key_states = self._apply_rotary(query_states, key_states, position_ids, frequencies)
+
+        (
+            key_states,
+            value_states,
+            mask_info,
+            init_attention_bias,
+            cache_view,
+            cache_metadata,
+        ) = self.concatenate(
+            query=query_states,
+            key=key_states,
+            value=value_states,
+            cache_view=cache_view,
+            cache_metadata=cache_metadata,
+            mask_info=mask_info,
+            sliding_window=self.sliding_window,
+        )
+
+        softmax_aux = self._softmax_aux()
+
+        attentions: AttentionLayerOutput = self.attention_performer.forward(
+            query_states=query_states,
+            key_states=key_states,
+            value_states=value_states,
+            mode=mode,
+            bias=None,
+            cache_metadata=cache_metadata,
+            cache_view=cache_view,
+            init_bias=init_attention_bias,
+            mask_info=mask_info,
+            causal=self.causal,
+            sliding_window=self.sliding_window,
+            softmax_aux=softmax_aux,
+            precision=self.precision,
+        )
+
+        if attentions.cache_view is not None:
+            cache_view = attentions.cache_view
+
+        attn_output = attentions.attention_outputs
+
+        # Re-apply QKV sharding so attn_output matches the gate's partition
+        # (which retains "sp" on the sequence axis from HiddenStateSharding).
+        # Without this, blocksparse's shard_map strips "sp" from the sequence
+        # dimension, causing GSPMD to insert f32 all-gathers during backward.
+        attn_output = apply_logical_sharding(
+            attn_output,
+            dynamic_axes=common_types.AttnQSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+
+        if gate is not None:
+            if attn_output.dtype in lowfloats or gate.dtype in lowfloats:
+                attn_output_dtype = attn_output.dtype
+                attn_output = attn_output.astype(jnp.float32) * jax.nn.sigmoid(gate.astype(jnp.float32))
+                attn_output = attn_output.astype(attn_output_dtype)
+            else:
+                attn_output = attn_output * jax.nn.sigmoid(gate)
+
+        attn_output = self._merge_heads(attn_output)
+        if _qwen3_next_tp_size(self.config) > 1:
+            attn_output = _apply_tp_last_axis_sharding(attn_output, self.config)
+        else:
+            attn_output = self.shard_attention_prod(attn_output)
+        attn_output = self.o_proj(attn_output)
+        attn_output = self.shard_attention_prod(attn_output)
+
+        return AttentionLayerOutput(
+            attention_output=attn_output,
+            attention_weight=attentions.attention_weights if output_attentions else None,
+            cache_view=cache_view,
+        )
+
+
+class Qwen3NextLinearAttention(spx.Module):
+    """Qwen3Next linear attention layer using GatedDeltaNet.
+
+    Implements linear attention with:
+    - Causal 1D convolution for local context
+    - Gated delta rule recurrence for global context
+    - Learnable decay for state forgetting (A_log parameter)
+    - Mamba-style dt_bias for time discretization
+
+    HuggingFace-compatible parameter naming:
+    - Packed mode (Qwen3-Next): in_proj_qkvz and in_proj_ba
+    - Split mode (Qwen3.5): in_proj_qkv, in_proj_z, in_proj_b, and in_proj_a
+    - Merged-split mode: load split HF tensors into packed TP-interleaved projections
+    - A_log: Log of decay matrix A
+    - dt_bias: Time discretization bias
+    - conv1d: Causal convolution
+    - norm: Gated RMSNorm
+    - out_proj: Output projection
+
+    Attributes:
+        config: Model configuration.
+        layer_idx: Index of this layer.
+    """
+
+    def __init__(
+        self,
+        config: Qwen3NextConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+        layer_idx: int,
+    ):
+        """Initialize Qwen3Next linear attention layer.
+
+        Args:
+            config (Qwen3NextConfig): Model configuration with linear attention parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.layer_idx = layer_idx
+
+        self.num_k_heads = config.linear_num_key_heads
+        self.num_v_heads = config.linear_num_value_heads
+        self.head_k_dim = config.linear_key_head_dim
+        self.head_v_dim = config.linear_value_head_dim
+
+        self.key_dim = self.num_k_heads * self.head_k_dim
+        self.value_dim = self.num_v_heads * self.head_v_dim
+        self.conv_dim = self.key_dim * 2 + self.value_dim
+        self.linear_attention_layout = Qwen3NextLinearAttentionLayout(
+            key_dim=self.key_dim,
+            value_dim=self.value_dim,
+            config=config,
+        )
+
+        requested_split_proj = bool(config.linear_attention_separate_proj)
+        requested_merged_split_proj = bool(config.linear_attention_merged_split_proj)
+        if requested_split_proj and requested_merged_split_proj:
+            raise ValueError("linear_attention_separate_proj and linear_attention_merged_split_proj are exclusive")
+        active_tp_size = _qwen3_next_tp_size(config)
+        # The merged QKV/Z activation layout is only validated for unsharded TP.
+        # On TP>1, keep the checkpoint contract split so Q/K/V/Z order stays local.
+        self.uses_merged_split_proj = requested_merged_split_proj and active_tp_size <= 1
+        self.uses_split_proj = requested_split_proj or (requested_merged_split_proj and not self.uses_merged_split_proj)
+        if self.uses_merged_split_proj:
+            self.in_proj_qkvz = ColumnParallelLinear(
+                config.hidden_size,
+                self.key_dim * 2 + self.value_dim * 2,
+                use_bias=False,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+                kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            )
+
+            self.in_proj_ba = ColumnParallelLinear(
+                config.hidden_size,
+                self.num_v_heads * 2,
+                use_bias=False,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+                kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            )
+        elif self.uses_split_proj:
+            self.in_proj_qkv = ColumnParallelLinear(
+                config.hidden_size,
+                self.key_dim * 2 + self.value_dim,
+                use_bias=False,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+                kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            )
+            self.in_proj_z = ColumnParallelLinear(
+                config.hidden_size,
+                self.value_dim,
+                use_bias=False,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+                kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            )
+            self.in_proj_b = ColumnParallelLinear(
+                config.hidden_size,
+                self.num_v_heads,
+                use_bias=False,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+                kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            )
+            self.in_proj_a = ColumnParallelLinear(
+                config.hidden_size,
+                self.num_v_heads,
+                use_bias=False,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+                kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            )
+        else:
+            self.in_proj_qkvz = ColumnParallelLinear(
+                config.hidden_size,
+                self.key_dim * 2 + self.value_dim * 2,
+                use_bias=False,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+                kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            )
+
+            self.in_proj_ba = ColumnParallelLinear(
+                config.hidden_size,
+                self.num_v_heads * 2,
+                use_bias=False,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+                kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            )
+
+        self.out_proj = RowParallelLinear(
+            self.value_dim,
+            config.hidden_size,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+        )
+        self.norm = RMSNormGated(
+            self.head_v_dim,
+            eps=config.rms_norm_eps,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+
+        self.conv1d = nn.Conv1d(
+            in_channels=self.conv_dim,
+            out_channels=self.conv_dim,
+            kernel_size=config.linear_conv_kernel_dim,
+            groups=self.conv_dim,
+            padding=((config.linear_conv_kernel_dim - 1, 0),),
+            dtype=dtype,
+            rngs=rngs,
+            use_bias=False,
+            precision=precision,
+        )
+
+        # ``init_method`` is what ``sequential_init`` uses, since it cannot
+        # replay the log-uniform draw: the log of the draw's midpoint.
+        self.A_log = ArrayParam.bound(
+            shape=(self.num_v_heads,),
+            dtype=param_dtype,
+            init_method="constant",
+            init_kwargs={"value": math.log(8.5)},
+            value=jnp.log(
+                jax.random.uniform(
+                    rngs.parameters,
+                    (self.num_v_heads,),
+                    dtype=param_dtype,
+                    minval=1.0,
+                    maxval=16.0,
+                )
+            ),
+        )
+
+        self.dt_bias = ArrayParam.bound(
+            shape=(self.num_v_heads,),
+            dtype=param_dtype,
+            init_method="ones",
+            value=jnp.ones((self.num_v_heads,), dtype=param_dtype),
+        )
+
+        metadata = OperationMetadata(
+            runtime_dtype=self.dtype,
+            runtime_softmax_dtype=jnp.float32,
+            base_config=self.config,
+        )
+        self.gdr_op = GatedDeltaRuleOp(metadata)
+        self.ragged_gdr_op = RaggedGatedDeltaRule(metadata)
+
+    @property
+    def reform_param(self):
+        return _build_qwen3_next_linear_attention_reform_param(
+            key_dim=self.key_dim,
+            value_dim=self.value_dim,
+            config=self.config,
+            include_qkvz_fusion=self.uses_merged_split_proj,
+        )
+
+    def _stage_replicated_depthwise_conv(
+        self,
+        conv_input: Float[Array, "batch seq conv_dim"],
+    ) -> Float[Array, "batch seq conv_dim"]:
+        """Run the causal depthwise conv with a stable stage-local contract.
+
+        Qwen3-Next's linear-attention convolution has ``groups == conv_dim``.
+        On a TP-sharded stage the channel axis is split, which works for many
+        SPMD graphs but can produce invalid grouped-convolution layouts once
+        SpectraX also slices the program into PP stages. The convolution is a
+        short local mixing step, so we replicate its input and kernel on the
+        current physical PP stage, run the depthwise conv there, and let the
+        following query/key/value sharding constraints restore the normal TP
+        layout before the GDR kernel.
+
+        Args:
+            conv_input: Convolution input, shape
+                ``(batch, seq, conv_dim)``; expected to be the
+                concatenation of the Q/K/V projection streams.
+
+        Returns:
+            Convolution output with the same shape as ``conv_input``,
+            constrained to the same replicated 3-D ``PartitionSpec``.
+        """
+        stage_mesh = resolve_stage_mesh(self.config.mesh)
+        replicated_3d = PartitionSpec(None, None, None)
+        conv_input = with_sharding_constraint(conv_input, replicated_3d, mesh=stage_mesh)
+        kernel = with_sharding_constraint(self.conv1d.weight.value, replicated_3d, mesh=stage_mesh)
+        dim_numbers = jax.lax.conv_dimension_numbers(
+            conv_input.shape,
+            kernel.shape,
+            ("NHC", "HIO", "NHC"),
+        )
+        conv_output = jax.lax.conv_general_dilated(
+            lhs=conv_input,
+            rhs=kernel,
+            window_strides=self.conv1d.stride,
+            padding=self.conv1d.padding,
+            rhs_dilation=self.conv1d.dilation,
+            dimension_numbers=dim_numbers,
+            feature_group_count=self.conv1d.groups,
+            precision=self.conv1d.precision,
+        )
+        return typing.cast(Array, with_sharding_constraint(conv_output, replicated_3d, mesh=stage_mesh))
+
+    def _segment_aware_depthwise_conv(
+        self,
+        conv_input: Float[Array, "batch seq conv_dim"],
+        seg_ids: Int[Array, "batch seq"],
+    ) -> Float[Array, "batch seq conv_dim"]:
+        """Causal depthwise conv that does not mix across packed-document boundaries.
+
+        The standard causal conv computes
+        ``out[t] = sum_j w[j] * in[t - (K-1) + j]`` (left-padded by ``K-1``). For sequence
+        packing, any tap whose source position ``t - (K-1) + j`` belongs to a different
+        document than ``t`` must be dropped, otherwise the first ``K-1`` tokens of a packed
+        document leak the previous document's tail. Implemented as an explicit shifted sum
+        (``K`` is small, e.g. 4) with a per-tap same-segment mask — numerically identical to
+        the monolithic conv when there are no boundaries.
+
+        Args:
+            conv_input: ``(batch, seq, conv_dim)`` Q/K/V projection stream.
+            seg_ids: ``(batch, seq)`` per-token document id (padding may be ``-1``).
+
+        Returns:
+            Convolution output, same shape as ``conv_input`` (pre-activation).
+        """
+        kernel = self.conv1d.weight.value  # [kernel_size, 1, conv_dim] (HIO, depthwise)
+        k_size = kernel.shape[0]
+        w = kernel[:, 0, :].astype(jnp.float32)  # [K, conv_dim]
+        x = conv_input.astype(jnp.float32)  # [B, S, C]
+        b, s, _ = x.shape
+        seg = seg_ids[:, :s]
+        acc = jnp.zeros_like(x)
+        # tap j (0..K-1) reads position t - (K-1-j); j=K-1 is the current token.
+        for j in range(k_size):
+            shift = k_size - 1 - j
+            if shift == 0:
+                shifted_x = x
+                same_seg = jnp.ones((b, s), dtype=jnp.bool_)
+            else:
+                shifted_x = jnp.concatenate([jnp.zeros((b, shift, x.shape[2]), x.dtype), x[:, :-shift]], axis=1)
+                src_seg = jnp.concatenate(
+                    [jnp.full((b, shift), -2, seg.dtype), seg[:, :-shift]], axis=1
+                )  # segment id of the source token for this tap
+                same_seg = src_seg == seg
+            acc = acc + jnp.where(same_seg[..., None], shifted_x * w[j][None, None, :], 0.0)
+        return acc.astype(conv_input.dtype)
+
+    def fix_query_key_value_ordering(
+        self,
+        mixed_qkvz: Float[Array, "batch seq proj_dim"],
+        mixed_ba: Float[Array, "batch seq ba_dim"],
+    ):
+        """Unpack HF's grouped packed QKVZ/beta-alpha runtime layout.
+
+        Qwen3-Next stores ``q``, ``k``, ``v``, ``z`` per *query head*
+        (interleaved within the channel axis) and ``b``/``a`` per *value
+        head* (also interleaved). This helper splits the packed
+        projections into the four QKVZ streams plus the two BA streams
+        with the correct per-head reshapes so the downstream
+        gated-delta-rule code sees one tensor per logical role.
+
+        Args:
+            mixed_qkvz: Output of the packed ``in_proj_qkvz`` projection,
+                shape ``(batch, seq, num_k_heads * (2 * head_k_dim +
+                2 * expand_ratio * head_v_dim))``.
+            mixed_ba: Output of the packed ``in_proj_ba`` projection,
+                shape ``(batch, seq, num_k_heads * 2 * expand_ratio)``.
+
+        Returns:
+            Six-tuple ``(query, key, value, z, beta, alpha)`` with shapes
+            ``(batch, seq, num_k_heads, head_k_dim)`` for query/key,
+            ``(batch, seq, num_v_heads, head_v_dim)`` for value/z, and
+            ``(batch, seq, num_v_heads)`` for beta/alpha.
+        """
+        batch, seq, _ = mixed_qkvz.shape
+
+        expand_ratio = self.num_v_heads // self.num_k_heads
+        per_head_dim = 2 * self.head_k_dim + 2 * self.head_v_dim * expand_ratio
+        mixed_qkvz = mixed_qkvz.reshape(batch, seq, self.num_k_heads, per_head_dim)
+
+        split_sizes = [
+            self.head_k_dim,
+            self.head_k_dim,
+            expand_ratio * self.head_v_dim,
+            expand_ratio * self.head_v_dim,
+        ]
+        query, key, value, z = jnp.split(
+            mixed_qkvz,
+            [split_sizes[0], split_sizes[0] + split_sizes[1], split_sizes[0] + split_sizes[1] + split_sizes[2]],
+            axis=-1,
+        )
+
+        value = value.reshape(batch, seq, self.num_v_heads, self.head_v_dim)
+        z = z.reshape(batch, seq, self.num_v_heads, self.head_v_dim)
+
+        ba_per_head = 2 * expand_ratio
+        mixed_ba = mixed_ba.reshape(batch, seq, self.num_k_heads, ba_per_head)
+        beta, alpha = jnp.split(mixed_ba, [expand_ratio], axis=-1)
+        beta = beta.reshape(batch, seq, self.num_v_heads)
+        alpha = alpha.reshape(batch, seq, self.num_v_heads)
+
+        return query, key, value, z, beta, alpha
+
+    def forward(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo | None,
+        cache_view: RecurrentCacheView | None = None,
+        cache_metadata: RecurrentMetadata | None = None,
+    ) -> AttentionLayerOutput:
+        """Forward pass through the linear attention layer.
+
+        Uses GatedDeltaNet for efficient linear complexity attention with:
+        - Causal 1D convolution for local context
+        - Delta rule recurrence for global context
+        - Gated output normalization
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_dim).
+            mask_info (MaskInfo): Mask information for padding handling.
+            cache_view (RecurrentCacheView | None, optional): Cache view for incremental
+                decoding with conv and recurrent states. Defaults to None.
+            cache_metadata (RecurrentMetadata | None, optional): Cache metadata. Defaults to None.
+
+        Returns:
+            AttentionLayerOutput: Contains attention output and updated cache view.
+        """
+        if mask_info is not None:
+            q_mask: Array | None = typing.cast("Array | None", mask_info.q_attention_mask)
+            if q_mask is not None and q_mask.shape[1] != hidden_states.shape[1]:
+                q_mask = q_mask[:, : hidden_states.shape[1]]
+            hidden_states = apply_mask_to_padding_states(hidden_states, q_mask)
+
+        batch_size, seq_len, _ = hidden_states.shape
+        is_inference = seq_len == 1 and cache_view is not None
+        expand_ratio = self.num_v_heads // self.num_k_heads
+        if self.uses_merged_split_proj:
+            projected_qkvz = self.in_proj_qkvz(hidden_states)
+            conv_input, z_flat = self.linear_attention_layout.split_projected_qkvz(projected_qkvz)
+            z = z_flat.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
+            mixed_ba = self.in_proj_ba(hidden_states)
+            beta, alpha = self.linear_attention_layout.split_projected_ba(mixed_ba, self.num_v_heads)
+        elif self.uses_split_proj:
+            projected_qkv = self.in_proj_qkv(hidden_states)
+            z = self.in_proj_z(hidden_states).reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
+            beta = self.in_proj_b(hidden_states)
+            alpha = self.in_proj_a(hidden_states)
+            conv_input = projected_qkv
+        else:
+            projected_qkvz = self.in_proj_qkvz(hidden_states)
+            projected_ba = self.in_proj_ba(hidden_states)
+            query, key, value, z, beta, alpha = self.fix_query_key_value_ordering(projected_qkvz, projected_ba)
+            query_flat = query.reshape(batch_size, seq_len, -1)
+            key_flat = key.reshape(batch_size, seq_len, -1)
+            value_flat = value.reshape(batch_size, seq_len, -1)
+            conv_input = jnp.concatenate([query_flat, key_flat, value_flat], axis=-1)
+
+        alpha_raw = alpha
+        beta_raw = beta
+
+        A = -jnp.exp(self.A_log.value.astype(jnp.float32))
+        alpha_biased = alpha.astype(jnp.float32) + self.dt_bias.value.astype(jnp.float32)
+        decay = A[None, None, :] * jax.nn.softplus(alpha_biased)
+        beta = jax.nn.sigmoid(beta)
+
+        # Sequence packing: use stored segment ids when they are already present.
+        # Do not access ``mask_info.q_segment_ids`` here; that property can lazily
+        # materialize padding-style ids from an ordinary attention mask. Directly
+        # reading ``_q_segment_ids`` also survives earlier attention layers that may
+        # have materialized ``_attention_mask`` on the same MaskInfo object.
+        seg_ids = None
+        if mask_info is not None and seq_len > 1:
+            # seq_len == 1 is autoregressive decode: slicing packed ids to one
+            # position would keep position 0's id (-1 under left padding),
+            # mismarking the live token; the decode paths carry state via the
+            # cache and need no segment reset.
+            seg_ids = getattr(mask_info, "_q_segment_ids", None)
+        if seg_ids is not None:
+            seg_ids = _normalize_packed_segment_ids(seg_ids, seq_len)
+
+        new_conv_state = None
+
+        packed_query_start_loc = getattr(cache_metadata, "query_start_loc", None) if cache_metadata is not None else None
+        packed_num_seqs = getattr(cache_metadata, "num_seqs", None) if cache_metadata is not None else None
+        packed_context_lens = getattr(cache_metadata, "context_lens", None) if cache_metadata is not None else None
+        packed_recurrent_state_indices = (
+            getattr(cache_metadata, "recurrent_state_indices", None) if cache_metadata is not None else None
+        )
+        packed_spec_recurrent_commit = (
+            getattr(cache_metadata, "spec_recurrent_commit", None) if cache_metadata is not None else None
+        )
+        rank_major_packed = packed_query_start_loc is not None and getattr(packed_query_start_loc, "ndim", 0) == 2
+        use_packed_state_updates = (
+            cache_view is not None
+            and cache_view.conv_state is not None
+            and cache_view.recurrent_state is not None
+            and (batch_size == 1 or rank_major_packed)
+            and packed_query_start_loc is not None
+            and packed_num_seqs is not None
+        )
+
+        output: jax.Array | None = None
+        new_cache_view = None
+        if use_packed_state_updates:
+            conv_states = cache_view.conv_state
+            recurrent_states = cache_view.recurrent_state
+            # bf16 is the smallest dtype that preserves silu precision for conv outputs.
+            conv_output_dtype = jnp.bfloat16 if self.dtype in lowfloats else self.dtype
+
+            kernel = self.conv1d.weight  # [kernel_size, 1, conv_dim]
+            kernel = jnp.squeeze(kernel, axis=1).T  # [conv_dim, kernel_size]
+
+            if rank_major_packed:
+                force_dp_recurrent_scan_prefill = bool(self.config.force_dp_recurrent_scan_prefill)
+                dp_recurrent_scan_max_prefill = int(self.config.dp_recurrent_scan_prefill_max_seq_len)
+                seq_len_static = int(conv_input.shape[1])
+                use_dp_recurrent_scan_prefill = (
+                    jax.default_backend() == "tpu"
+                    and seq_len_static >= 128
+                    and (force_dp_recurrent_scan_prefill or seq_len_static <= dp_recurrent_scan_max_prefill)
+                )
+                query_start_loc_by_rank = jnp.asarray(packed_query_start_loc, dtype=jnp.int32)
+                rows_per_rank = int(query_start_loc_by_rank.shape[1] - 1)
+                dp_size = int(query_start_loc_by_rank.shape[0])
+                state_rows = dp_size * rows_per_rank
+                if conv_states.shape[0] < state_rows or recurrent_states.shape[0] < state_rows:
+                    raise ValueError("Rank-major Qwen3-Next packed updates require one recurrent row per DP-local slot.")
+
+                request_distribution = getattr(cache_metadata, "request_distribution", None)
+                if request_distribution is not None and getattr(request_distribution, "ndim", 0) == 2:
+                    num_requests_by_rank = jnp.asarray(request_distribution[:, 2], dtype=jnp.int32)
+                else:
+                    scheduled_by_rank = query_start_loc_by_rank[:, 1:] - query_start_loc_by_rank[:, :-1]
+                    num_requests_by_rank = jnp.sum(scheduled_by_rank > 0, axis=1).astype(jnp.int32)
+
+                conv_states_by_rank = conv_states[:state_rows].reshape(dp_size, rows_per_rank, *conv_states.shape[1:])
+                recurrent_states_by_rank = recurrent_states[:state_rows].reshape(
+                    dp_size,
+                    rows_per_rank,
+                    *recurrent_states.shape[1:],
+                )
+                if packed_recurrent_state_indices is None:
+                    state_indices_by_rank = jnp.broadcast_to(
+                        jnp.arange(rows_per_rank, dtype=jnp.int32)[None, :],
+                        (dp_size, rows_per_rank),
+                    )
+                else:
+                    state_indices_raw = jnp.asarray(packed_recurrent_state_indices, dtype=jnp.int32)
+                    state_indices_by_rank = state_indices_raw.reshape(dp_size, rows_per_rank)
+
+                if packed_context_lens is None:
+                    context_lens_by_rank = jnp.zeros((dp_size, rows_per_rank), dtype=jnp.int32)
+                    use_context_lens = False
+                else:
+                    context_lens_by_rank = jnp.asarray(packed_context_lens, dtype=jnp.int32)[:state_rows].reshape(
+                        dp_size,
+                        rows_per_rank,
+                    )
+                    use_context_lens = True
+
+                def _rank_update(args):
+                    (
+                        conv_state_i,
+                        recurrent_state_i,
+                        conv_input_i,
+                        qsl_i,
+                        num_requests_i,
+                        alpha_i,
+                        beta_i,
+                        ctx_i,
+                        state_idx_i,
+                    ) = args
+                    row_ids = jnp.arange(rows_per_rank, dtype=jnp.int32)
+                    active_rows = row_ids < num_requests_i
+                    safe_state_idx = jnp.clip(state_idx_i, 0, rows_per_rank - 1)
+                    selected_conv_state = conv_state_i[safe_state_idx]
+                    selected_recurrent_state = recurrent_state_i[safe_state_idx]
+                    updated_conv_state, updated_recurrent_state, token_output = _apply_qwen3_next_packed_updates(
+                        conv_states=selected_conv_state,
+                        recurrent_states=selected_recurrent_state,
+                        conv_input=conv_input_i[None, ...],
+                        beta=beta_i[None, ...],
+                        decay=None,
+                        kernel=kernel,
+                        query_start_loc=qsl_i,
+                        num_requests=num_requests_i,
+                        key_dim=self.key_dim,
+                        num_k_heads=self.num_k_heads,
+                        head_k_dim=self.head_k_dim,
+                        num_v_heads=self.num_v_heads,
+                        head_v_dim=self.head_v_dim,
+                        expand_ratio=expand_ratio,
+                        conv_output_dtype=conv_output_dtype,
+                        gdr_op=self.gdr_op,
+                        ragged_gdr_op=self.ragged_gdr_op,
+                        alpha_raw=alpha_i[None, ...],
+                        beta_raw=beta_i[None, ...],
+                        A_log=self.A_log.value,
+                        dt_bias=self.dt_bias.value,
+                        context_lens=ctx_i if use_context_lens else None,
+                        spec_recurrent_commit=None,
+                        disable_recurrent_scan_prefill=not use_dp_recurrent_scan_prefill,
+                        use_ragged_gdr=bool(self.config.use_ragged_gdr),
+                        ragged_gdr_chunk_size=int(self.config.ragged_gdr_chunk_size),
+                        force_recurrent_scan_prefill=bool(self.config.force_recurrent_scan_prefill),
+                        recurrent_scan_prefill_max_seq_len=int(self.config.recurrent_scan_prefill_max_seq_len),
+                    )
+                    scatter_idx = jnp.where(active_rows, safe_state_idx, rows_per_rank)
+                    conv_state_i = conv_state_i.at[scatter_idx].set(updated_conv_state, mode="drop")
+                    recurrent_state_i = recurrent_state_i.at[scatter_idx].set(updated_recurrent_state, mode="drop")
+                    return conv_state_i, recurrent_state_i, token_output
+
+                if use_dp_recurrent_scan_prefill:
+                    updated_conv_by_rank_list = []
+                    updated_recurrent_by_rank_list = []
+                    token_outputs_list = []
+                    for rank_idx in range(dp_size):
+                        conv_i, recurrent_i, output_i = _rank_update(
+                            (
+                                conv_states_by_rank[rank_idx],
+                                recurrent_states_by_rank[rank_idx],
+                                conv_input[rank_idx],
+                                query_start_loc_by_rank[rank_idx],
+                                num_requests_by_rank[rank_idx],
+                                alpha_raw[rank_idx],
+                                beta_raw[rank_idx],
+                                context_lens_by_rank[rank_idx],
+                                state_indices_by_rank[rank_idx],
+                            )
+                        )
+                        updated_conv_by_rank_list.append(conv_i)
+                        updated_recurrent_by_rank_list.append(recurrent_i)
+                        token_outputs_list.append(output_i)
+                    updated_conv_by_rank = jnp.stack(updated_conv_by_rank_list, axis=0)
+                    updated_recurrent_by_rank = jnp.stack(updated_recurrent_by_rank_list, axis=0)
+                    token_outputs = jnp.stack(token_outputs_list, axis=0)
+                else:
+                    updated_conv_by_rank, updated_recurrent_by_rank, token_outputs = jax.vmap(_rank_update)(
+                        (
+                            conv_states_by_rank,
+                            recurrent_states_by_rank,
+                            conv_input,
+                            query_start_loc_by_rank,
+                            num_requests_by_rank,
+                            alpha_raw,
+                            beta_raw,
+                            context_lens_by_rank,
+                            state_indices_by_rank,
+                        )
+                    )
+
+                conv_states = conv_states.at[:state_rows].set(
+                    updated_conv_by_rank.reshape(state_rows, *conv_states.shape[1:])
+                )
+                recurrent_states = recurrent_states.at[:state_rows].set(
+                    updated_recurrent_by_rank.reshape(state_rows, *recurrent_states.shape[1:])
+                )
+                output = token_outputs
+            else:
+                query_start_loc = jnp.asarray(packed_query_start_loc, dtype=jnp.int32)
+                num_seqs_arr = jnp.asarray(packed_num_seqs, dtype=jnp.int32).reshape(-1)
+                num_requests = num_seqs_arr[0]
+
+                conv_states, recurrent_states, token_outputs = _apply_qwen3_next_packed_updates(
+                    conv_states=conv_states,
+                    recurrent_states=recurrent_states,
+                    conv_input=conv_input,
+                    beta=beta,
+                    decay=decay,
+                    kernel=kernel,
+                    query_start_loc=query_start_loc,
+                    num_requests=num_requests,
+                    key_dim=self.key_dim,
+                    num_k_heads=self.num_k_heads,
+                    head_k_dim=self.head_k_dim,
+                    num_v_heads=self.num_v_heads,
+                    head_v_dim=self.head_v_dim,
+                    expand_ratio=expand_ratio,
+                    conv_output_dtype=conv_output_dtype,
+                    gdr_op=self.gdr_op,
+                    ragged_gdr_op=self.ragged_gdr_op,
+                    alpha_raw=alpha_raw,
+                    beta_raw=beta_raw,
+                    A_log=self.A_log.value,
+                    dt_bias=self.dt_bias.value,
+                    context_lens=packed_context_lens,
+                    spec_recurrent_commit=packed_spec_recurrent_commit,
+                    use_ragged_gdr=bool(self.config.use_ragged_gdr),
+                    ragged_gdr_chunk_size=int(self.config.ragged_gdr_chunk_size),
+                    force_recurrent_scan_prefill=bool(self.config.force_recurrent_scan_prefill),
+                    recurrent_scan_prefill_max_seq_len=int(self.config.recurrent_scan_prefill_max_seq_len),
+                )
+                output = token_outputs[None, ...]
+
+            new_cache_view = cache_view.replace(
+                conv_state=conv_states,
+                recurrent_state=recurrent_states,
+            )
+
+        if use_packed_state_updates:
+            if output is None or new_cache_view is None:
+                raise RuntimeError("Packed state update did not produce output/cache state.")
+            output = self.norm(output, z)
+            output = output.reshape(batch_size, seq_len, -1)
+            output = _apply_tp_last_axis_sharding(output, self.config)
+            output = self.out_proj(output)
+            output = apply_logical_sharding(
+                output,
+                dynamic_axes=common_types.HiddenStateSharding,
+                partition_manager=self.config.runtime_sharding_resolver,
+            )
+
+            return AttentionLayerOutput(attention_output=output, attention_weight=None, cache_view=new_cache_view)
+
+        if cache_view is not None:
+            conv_output_dtype = jnp.bfloat16 if self.dtype in lowfloats else self.dtype
+            conv_output, new_conv_state = apply_conv_with_state(
+                conv_input,
+                self.conv1d,
+                cache_view.conv_state,
+                is_inference=is_inference,
+                d_conv=self.config.linear_conv_kernel_dim,
+                output_dtype=conv_output_dtype,
+                reuse_partial_state=False,
+            )
+        elif seg_ids is not None:
+            # Sequence packing: the causal depthwise conv reaches back ``d_conv-1`` tokens,
+            # so the first tokens of a packed document would otherwise mix in the previous
+            # document's tail. Run a segment-aware conv that zeros any tap crossing a
+            # document boundary (exact; ``d_conv`` is small).
+            conv_output = jax.nn.silu(self._segment_aware_depthwise_conv(conv_input, seg_ids))
+        else:
+            # Training/prefill without cache: use the full convolution directly.
+            if self.uses_split_proj or self.uses_merged_split_proj:
+                conv_output = jax.nn.silu(self.conv1d(conv_input))
+            else:
+                conv_output = jax.nn.silu(self._stage_replicated_depthwise_conv(conv_input))
+
+        conv_query = conv_output[:, :, : self.key_dim]
+        conv_key = conv_output[:, :, self.key_dim : self.key_dim * 2]
+        conv_value = conv_output[:, :, self.key_dim * 2 :]
+
+        query = conv_query.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
+        key = conv_key.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
+        value = conv_value.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
+
+        query = apply_logical_sharding(
+            query,
+            dynamic_axes=common_types.AttnQSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+        key = apply_logical_sharding(
+            key,
+            dynamic_axes=common_types.AttnKVSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+        value = apply_logical_sharding(
+            value,
+            dynamic_axes=common_types.AttnKVSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+
+        recurrent_state = None
+        if cache_view is not None and cache_view.recurrent_state is not None:
+            recurrent_state = cache_view.recurrent_state
+
+        if expand_ratio > 1:
+            grouped_decode = is_inference and recurrent_state is not None
+        else:
+            grouped_decode = False
+
+        use_grouped_gdr_prefill = bool(getattr(self.config, "use_grouped_gdr_prefill", True))
+        use_grouped_gdr_prefill = use_grouped_gdr_prefill and _qwen3_next_grouped_gdr_prefill_is_local_valid(
+            num_k_heads=self.num_k_heads,
+            num_v_heads=self.num_v_heads,
+            config=self.config,
+        )
+        if expand_ratio > 1 and not grouped_decode and not use_grouped_gdr_prefill:
+            query = jnp.repeat(query, expand_ratio, axis=2)
+            key = jnp.repeat(key, expand_ratio, axis=2)
+            query = apply_logical_sharding(
+                query,
+                dynamic_axes=common_types.AttnQSharding,
+                partition_manager=self.config.runtime_sharding_resolver,
+            )
+            key = apply_logical_sharding(
+                key,
+                dynamic_axes=common_types.AttnKVSharding,
+                partition_manager=self.config.runtime_sharding_resolver,
+            )
+
+        if grouped_decode:
+            output, new_recurrent_state = apply_grouped_single_step_gdr(
+                query=query,
+                key=key,
+                value=value,
+                beta=beta,
+                decay=decay,
+                recurrent_state=recurrent_state,
+                gdr_op=self.gdr_op,
+            )
+            new_recurrent_state = _preserve_array_sharding(
+                new_recurrent_state,
+                partition_manager=self.config.runtime_sharding_resolver,
+                partition_axis=self.config.partition_axis,
+            )
+        else:
+            gdr_extra = {}
+            if seg_ids is not None:
+                gdr_extra["seg_ids"] = seg_ids  # packed training: reset recurrence per document
+            gdr_output: GatedDeltaRuleOutput = self.gdr_op(
+                query=query,
+                key=key,
+                value=value,
+                beta=beta,
+                decay=decay,
+                conv_state=None,  # conv_state is handled separately above
+                recurrent_state=recurrent_state,
+                **gdr_extra,
+            )
+            output = gdr_output.attention_outputs
+            new_recurrent_state = gdr_output.recurrent_state
+        if output is None:
+            raise RuntimeError("Grouped delta rule did not return attention outputs.")
+
+        z = apply_logical_sharding(
+            z,
+            dynamic_axes=common_types.AttnQSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+        output = self.norm(output, z)
+        output = output.reshape(batch_size, seq_len, -1)
+        output = _apply_tp_last_axis_sharding(output, self.config)
+        output = self.out_proj(output)
+        output = apply_logical_sharding(
+            output,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+
+        new_cache_view = cache_view
+        if cache_view is not None and not use_packed_state_updates:
+            new_cache_view = cache_view.replace(
+                conv_state=new_conv_state if new_conv_state is not None else cache_view.conv_state,
+                recurrent_state=new_recurrent_state,
+            )
+
+        return AttentionLayerOutput(
+            attention_output=output,
+            attention_weight=None,
+            cache_view=new_cache_view,
+        )  # pyright: ignore[reportReturnType]
+
+
+class Qwen3NextDecoderLayer(spx.Module):
+    """Qwen3Next transformer decoder layer.
+
+    Combines either full or linear attention with MoE or dense MLP,
+    based on layer configuration.
+
+    Attributes:
+        config: Model configuration.
+        layer_idx: Index of this layer.
+        is_full_attention: Whether this layer uses full attention.
+        is_moe: Whether this layer uses MoE FFN.
+    """
+
+    def __init__(
+        self,
+        config: Qwen3NextConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+        layer_idx: int,
+    ):
+        """Initialize Qwen3Next decoder layer.
+
+        Args:
+            config (Qwen3NextConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.layer_idx = layer_idx
+
+        self.is_full_attention = config.is_full_attention_layer(layer_idx)
+        self.is_moe = config.is_moe_layer(layer_idx)
+
+        if self.is_full_attention:
+            self.self_attn = Qwen3NextFullAttention(
+                config=config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+                layer_idx=layer_idx,
+            )
+        else:
+            self.linear_attn = Qwen3NextLinearAttention(
+                config=config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+                layer_idx=layer_idx,
+            )
+
+        if self.is_moe:
+            self.mlp = Qwen3NextSparseMoeBlock(
+                config=config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+            )
+        else:
+            self.mlp = Qwen3NextMLP(
+                config=config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+            )
+
+        self.input_layernorm = Qwen3NextRMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+        self.post_attention_layernorm = Qwen3NextRMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+
+    def forward(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo,
+        position_ids: Int[Array, "batch seq_len"],
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
+        cache_view: TransformerCacheView | RaggedPagesCacheView | RecurrentCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesCacheView | OperationsMetadata | None = None,
+        output_attentions: bool = False,
+        output_router_logits: bool = False,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
+    ) -> DecoderLayerOutput:
+        """Forward pass through the decoder layer.
+
+        Applies pre-normalization architecture with either full or linear attention,
+        followed by either MoE or dense MLP based on layer configuration.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_dim).
+            mask_info (MaskInfo): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch, seq_len).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | RecurrentCacheView | None, optional):
+                Cache view for KV or recurrent state caching. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesCacheView | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            output_router_logits (bool, optional): Whether to return MoE router logits. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+
+        Returns:
+            DecoderLayerOutput: Contains hidden states, optional attention weights,
+                optional router logits, and cache view.
+        """
+        normed_hidden = self.input_layernorm(hidden_states)
+
+        if self.is_full_attention:
+            attn_outputs = self.self_attn(
+                normed_hidden,
+                mask_info,
+                position_ids,
+                mode,
+                cache_view,
+                cache_metadata,
+                output_attentions,
+                frequencies,
+            )
+        else:
+            attn_outputs = self.linear_attn(
+                normed_hidden,
+                mask_info,
+                cache_view,
+                cache_metadata,
+            )
+
+        attn_output = attn_outputs.attention_output
+        attn_weight = attn_outputs.attention_weight
+        cache_view = attn_outputs.cache_view
+        hidden_states = checkpoint_name(hidden_states + attn_output, "residual")
+
+        feed_forward_input = self.post_attention_layernorm(hidden_states)
+
+        router_logits = None
+        if self.is_moe:
+            feed_forward_output = self.mlp(feed_forward_input)
+            feed_forward_output, router_logits = feed_forward_output
+        elif self.config.use_scan_mlp:
+            feed_forward_output = blockwise_ffn(
+                self.mlp,
+                feed_forward_input,
+                self.config.scan_mlp_chunk_size,
+            )
+        else:
+            feed_forward_output = self.mlp(feed_forward_input)
+
+        hidden_states = checkpoint_name(hidden_states + feed_forward_output, "residual")
+
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+
+        return DecoderLayerOutput(
+            hidden_states=checkpoint_name(hidden_states, "layer_output"),
+            attention_weight=attn_weight if output_attentions else None,
+            router_logits=router_logits if output_router_logits else None,
+            cache_view=cache_view,
+        )
+
+
+@register_module(TaskType.BASE_MODULE, config=Qwen3NextConfig, model_type="qwen3_next")
+class Qwen3NextModel(EasyDeLBaseModule):
+    """Qwen3Next base transformer model.
+
+    Implements the core transformer architecture with hybrid attention
+    (alternating between full and linear attention) and MoE FFN layers.
+
+    Attributes:
+        config: Model configuration.
+        embed_tokens: Token embedding layer.
+        layers: List of decoder layers.
+        norm: Final layer normalization.
+    """
+
+    def __init__(
+        self,
+        config: Qwen3NextConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize Qwen3Next base model.
+
+        Args:
+            config (Qwen3NextConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
+        super().__init__(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+
+        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+            self.embed_tokens = Embed(
+                config.vocab_size,
+                config.hidden_size,
+                embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
+        remat_layer_block = auto_remat(
+            Qwen3NextDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.layers = nn.ModuleList([])
+        for layer_idx in range(config.num_hidden_layers):
+            with self.assign_layer_stage(layer_idx, total_layers=config.num_hidden_layers):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        layer_idx=layer_idx,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
+                )
+        final_layer_idx = max(0, config.num_hidden_layers - 1)
+        with self.assign_layer_stage(final_layer_idx, total_layers=config.num_hidden_layers):
+            self.norm = Qwen3NextRMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
+
+    def forward(
+        self,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        output_router_logits: bool | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        trace: bool = False,
+    ) -> MoeModelOutput:
+        """Forward pass through the Qwen3Next base model.
+
+        Processes input tokens through embedding, all decoder layers with hybrid
+        attention (full and linear), optional MoE layers, and final normalization.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape (batch, seq_len).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch, seq_len, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on
+                padding tokens, shape (batch, seq_len). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention
+                operations. Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch, seq_len). Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights
+                from all layers. Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states
+                from all layers. Defaults to None.
+            output_router_logits (bool | None, optional): Whether to return MoE router
+                logits from all MoE layers. Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for
+                optimizations. Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+
+        Returns:
+            MoeModelOutput: Contains last_hidden_state, optional hidden_states, optional
+                attentions, updated past_key_values, and optional router_logits.
+
+        Raises:
+            ValueError: If both input_ids and inputs_embeds are provided or both are None.
+            AssertionError: If sequence_length exceeds max_position_embeddings.
+        """
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError(
+                "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+            )
+        if inputs_embeds is None:
+            inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
+
+        sequence_length = inputs_embeds.shape[1]
+        output_router_logits = (
+            output_router_logits if output_router_logits is not None else self.config.output_router_logits
+        )
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        all_router_logits = () if output_router_logits else None
+        all_attentions = () if output_attentions else None
+        all_hidden_states = () if output_hidden_states else None
+        assert sequence_length <= self.config.max_position_embeddings, (
+            f"Maximum Position Embedding Reached ! "
+            f"(Expected <= {self.config.max_position_embeddings} got {sequence_length})"
+        )
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=mask_info,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
+        if position_ids is None:
+            position_ids = mask_info.q_position_ids
+
+        hidden_states = inputs_embeds
+        if mode is None:
+            mode = (
+                common_types.MODE_DECODE
+                if sequence_length == 1 and past_key_values is not None
+                else common_types.MODE_TRAIN
+            )
+        if past_key_values is None:
+            past_key_values = HybridCache.init_empty(len(self.layers))
+
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
+
+        trace_layers = self._layer_scan_trace(
+            trace,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache or output_router_logits,
+        )
+        cache_views = views if trace_layers else None
+
+        frequencies = self.frequencies
+
+        def _layer_loop(block, carry):
+            """Apply a single Qwen3Next decoder layer inside the layer-stack scan.
+
+            Body of ``self.layers.scan``; runs ``block`` on the current
+            hidden states (alternating full-attention and linear-attention
+            layers), optionally accumulates per-layer hidden states,
+            attention weights, and MoE router logits, and returns the
+            updated carry tuple.
+            """
+            hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx = carry
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
+            with self._layer_stage_context(idx, layers=self.layers):
+                layer_outputs = block(
+                    hidden_states=hidden_states,
+                    mask_info=mask_info,
+                    position_ids=position_ids,
+                    mode=mode,
+                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                    cache_metadata=cache_metadata,
+                    output_attentions=output_attentions,
+                    output_router_logits=output_router_logits,
+                    frequencies=frequencies,
+                )
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+            if output_attentions:
+                all_attentions += (layer_outputs.attention_weight,)
+
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                layer_outputs.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
+            if output_router_logits and layer_outputs.router_logits is not None:
+                all_router_logits += (layer_outputs.router_logits,)
+
+            return hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx + 1
+
+        hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
+            _layer_loop,
+            (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
+            trace=trace_layers,
+        )
+        hidden_states = self.norm(hidden_states)
+        hidden_states = checkpoint_name(hidden_states, "model_output")
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        return MoeModelOutput(
+            last_hidden_state=hidden_states,
+            hidden_states=all_hidden_states,
+            attentions=all_attentions,
+            past_key_values=past_key_values,
+            router_logits=all_router_logits,
+        )
+
+    def get_encoder(self) -> None:
+        """Get the encoder component of the model.
+
+        Raises:
+            NotImplementedError: Qwen3Next is a decoder-only model.
+        """
+        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
+
+    def get_decoder(self) -> "Qwen3NextModel":
+        """Get the decoder component of the model.
+
+        Returns:
+            The model itself as Qwen3Next is a decoder-only architecture.
+        """
+        return self
+
+    def get_lm_head(self) -> None:
+        """Get the language model head.
+
+        Raises:
+            NotImplementedError: Base model does not have a language model head.
+        """
+        raise NotImplementedError("The base model does not have a language model head.")
+
+    def get_embedding(self) -> Embed:
+        """Get the embedding layer of the model.
+
+        Returns:
+            The token embedding layer.
+        """
+        return self.embed_tokens
+
+
+@register_module(TaskType.CAUSAL_LM, config=Qwen3NextConfig, model_type="qwen3_next")
+class Qwen3NextForCausalLM(BaseCausalLMModule[Qwen3NextModel, Qwen3NextConfig]):  # type: ignore
+    """Qwen3Next model with a causal language modeling head.
+
+    Extends the base Qwen3NextModel with a linear output layer for
+    next-token prediction.
+
+    Attributes:
+        model: Base Qwen3NextModel.
+        lm_head: Linear projection to vocabulary.
+    """
+
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "qwen3_next"
+    _config_class = Qwen3NextConfig
+
+    def __init__(
+        self,
+        config: Qwen3NextConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize Qwen3Next model for causal language modeling.
+
+        Args:
+            config (Qwen3NextConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
+        super().__init__(
+            config=config,
+            base_model_class=Qwen3NextModel,
+            base_model_name="model",
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            lm_head_bias=False,
+            router_aux_loss_coef=getattr(config, "router_aux_loss_coef", None),
+        )
+
+    def forward(
+        self,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        output_router_logits: bool | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        apply_lm_head: bool = True,
+    ) -> MoeCausalLMOutput:
+        """Forward pass for causal language modeling with MoE auxiliary loss.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape (batch, seq_len).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch, seq_len, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on
+                padding tokens, shape (batch, seq_len). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention
+                operations. Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch, seq_len). Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights
+                from all layers. Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states
+                from all layers. Defaults to None.
+            output_router_logits (bool | None, optional): Whether to return MoE router
+                logits from all MoE layers. Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for
+                optimizations. Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            apply_lm_head (bool, optional): Whether to apply the language model head
+                projection. Defaults to True.
+
+        Returns:
+            MoeCausalLMOutput: Contains logits, optional hidden_states, optional attentions,
+                updated past_key_values, optional router_logits, and optional aux_loss.
+        """
+        return self.forward_moe(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            mask_info=mask_info,
+            position_ids=position_ids,
+            mode=mode,
+            past_key_values=past_key_values,
+            cache_metadata=cache_metadata,
+            apply_lm_head=apply_lm_head,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            output_router_logits=output_router_logits,
+            aux_loss_fn=self._compute_aux_loss,
+        )
+
+    def _compute_aux_loss(self, outputs, attention_mask):
+        """Compute auxiliary load balancing loss from router logits.
+
+        Uses the auxiliary load balancing loss function to encourage balanced
+        token routing across experts.
+
+        Args:
+            outputs: Model outputs containing router_logits.
+            attention_mask: Attention mask for valid tokens.
+
+        Returns:
+            Auxiliary loss value or None if no router logits are available.
+        """
+        if outputs.router_logits is None or len(outputs.router_logits) == 0:
+            return None
+        aux_loss = auxiliary_load_balancing_loss_func(
+            gate_logits=outputs.router_logits,
+            num_experts=self.config.num_experts,
+            top_k=self.config.num_experts_per_tok,
+            attention_mask=attention_mask,
+        )
+        return aux_loss * self.config.router_aux_loss_coef
+
+
+__all__ = [
+    "Qwen3NextConfig",
+    "Qwen3NextForCausalLM",
+    "Qwen3NextModel",
+]
