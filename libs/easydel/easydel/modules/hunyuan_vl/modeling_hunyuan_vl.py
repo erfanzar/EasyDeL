@@ -1545,9 +1545,12 @@ class HunYuanVLModel(EasyDeLBaseModule):
             ``rope_deltas`` ``(batch, 1)``.
         """
         inputs_embeds = self.compute_embedding(input_ids, **kwargs)
+        # Serving may pass precomputed ``image_embeds`` (compiled vision path) instead of ``pixel_values``; the image
+        # spans still need their spatial mRoPE positions in that case.
+        has_image = kwargs.get("pixel_values") is not None or kwargs.get("image_embeds") is not None
         position_ids, rope_deltas = self.get_rope_index(
             input_ids=input_ids,
-            image_grid_thw=kwargs.get("image_grid_thw") if kwargs.get("pixel_values") is not None else None,
+            image_grid_thw=kwargs.get("image_grid_thw") if has_image else None,
             attention_mask=attention_mask,
         )
         return inputs_embeds, EmbeddingInfo(position_ids=position_ids, rope_deltas=rope_deltas)

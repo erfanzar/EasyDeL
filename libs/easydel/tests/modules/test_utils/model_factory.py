@@ -25,6 +25,7 @@ from typing import Any
 
 import easydel as ed
 import spectrax as spx
+import torch
 import transformers
 from easydel.infra.etils import EasyDeLGradientCheckPointers
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
@@ -376,7 +377,37 @@ def create_hf_model(
     hf_model = hf_class(config=hf_config)
     hf_model.eval()
     hf_model = hf_model.float()
+    _zero_uninitialized_router_bias(hf_model)
+    _assert_finite_reference_weights(hf_model)
     return hf_model
+
+
+def _zero_uninitialized_router_bias(hf_model: Any) -> None:
+    """Zero MoE router ``e_score_correction_bias`` tensors.
+
+    Hub remote code for DeepSeek-V3 and Kimi-VL allocates this bias with ``torch.empty`` and never initializes it,
+    so the reference model (and the EasyDeL model its weights are transferred into) would read whatever memory the
+    allocator returned: zero pages in a fresh process, garbage (NaN loss) deep into a long test session. Zero is
+    what HF's native ``_init_weights`` and the released checkpoints start from.
+    """
+    with torch.no_grad():
+        for name, tensor in [*hf_model.named_parameters(), *hf_model.named_buffers()]:
+            if name.endswith("e_score_correction_bias"):
+                tensor.zero_()
+
+
+def _assert_finite_reference_weights(hf_model: Any) -> None:
+    """Fail fast when the reference model carries non-finite (uninitialized) parameters.
+
+    Buffers are skipped: some HF models legitimately register ``-inf`` attention-mask buffers.
+    """
+    bad = [
+        name
+        for name, tensor in hf_model.named_parameters()
+        if tensor.is_floating_point() and not bool(torch.isfinite(tensor).all())
+    ]
+    if bad:
+        raise AssertionError(f"HF reference model has non-finite weights (uninitialized memory?): {bad[:8]}")
 
 
 def create_ed_model(

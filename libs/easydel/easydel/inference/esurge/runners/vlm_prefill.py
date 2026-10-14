@@ -28,6 +28,7 @@ the helper; the runner resets the cached JIT closures on weight swaps via its
 
 from __future__ import annotations
 
+import inspect
 import typing
 
 import jax
@@ -46,6 +47,55 @@ if typing.TYPE_CHECKING:
 logger = get_logger("eSurge")
 
 
+def _accepts_keyword(fn: typing.Callable, name: str) -> bool:
+    """Whether ``fn`` takes ``name`` as a keyword (explicitly or through ``**kwargs``)."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if name in params:
+        return params[name].kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def _declares_parameter(fn: typing.Callable | None, name: str) -> bool:
+    """Whether ``fn`` names ``name`` explicitly (``**kwargs`` does not count: it may silently drop the value)."""
+    if fn is None:
+        return False
+    try:
+        return name in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _call_visual_features(fn: typing.Callable, pixels: jax.Array, grid, max_grid_size, *, prefix: str):
+    """Call a family's ``get_{image,video}_features`` and normalize its result.
+
+    Families disagree on the contract: Qwen3-VL / Qwen3.5 / Qwen4-Exp take ``*_max_grid_size`` and return
+    ``(embeds_tuple, deepstack)``; most others (Qwen2-VL, GLM-4V, HunYuan-VL, MiniMax, ...) take only the grid and
+    return one merged ``(tokens, hidden)`` array. Grid and max size are passed by keyword, the max size only when the
+    method accepts it, so a two-argument signature is never handed a third positional argument.
+
+    Returns:
+        ``(merged_embeds, deepstack_tuple)``.
+    """
+    kwargs = {f"{prefix}_grid_thw": grid}
+    if max_grid_size is not None and _accepts_keyword(fn, f"{prefix}_max_grid_size"):
+        kwargs[f"{prefix}_max_grid_size"] = max_grid_size
+    result = fn(pixels, **kwargs)
+    # ``(embeds_tuple, deepstack)`` pairs are told apart from a per-image tuple of arrays (Qwen2-VL / GLM-4V split
+    # by image) by their first element, which is itself a sequence of arrays rather than an array.
+    if isinstance(result, (tuple, list)) and len(result) == 2 and isinstance(result[0], (tuple, list)):
+        embeds, deepstack = result
+    else:
+        embeds, deepstack = result, None
+    if isinstance(embeds, (tuple, list)):
+        embeds = jnp.concatenate(tuple(embeds), axis=0)
+    elif embeds.ndim > 2:
+        embeds = embeds.reshape(-1, embeds.shape[-1])
+    return embeds, () if deepstack is None else tuple(deepstack)
+
+
 def _image_features_body(
     model: typing.Any,
     pixel_values: jax.Array,
@@ -54,13 +104,9 @@ def _image_features_body(
     image_max_grid_size: int | None,
 ):
     """Traced body: vision tower -> concatenated image embeds (+ deepstack)."""
-    image_embeds_tuple, deepstack_image_embeds = model.get_image_features(
-        pixel_values,
-        image_grid_thw,
-        image_max_grid_size,
+    return _call_visual_features(
+        model.get_image_features, pixel_values, image_grid_thw, image_max_grid_size, prefix="image"
     )
-    deepstack = () if deepstack_image_embeds is None else tuple(deepstack_image_embeds)
-    return jnp.concatenate(image_embeds_tuple, axis=0), deepstack
 
 
 def _video_features_body(
@@ -71,13 +117,9 @@ def _video_features_body(
     video_max_grid_size: int | None,
 ):
     """Traced body: vision tower -> concatenated video embeds (+ deepstack)."""
-    video_embeds_tuple, deepstack_video_embeds = model.get_video_features(
-        pixel_values_videos,
-        video_grid_thw,
-        video_max_grid_size,
+    return _call_visual_features(
+        model.get_video_features, pixel_values_videos, video_grid_thw, video_max_grid_size, prefix="video"
     )
-    deepstack = () if deepstack_video_embeds is None else tuple(deepstack_video_embeds)
-    return jnp.concatenate(video_embeds_tuple, axis=0), deepstack
 
 
 class VlmPrefillHelper:
@@ -393,6 +435,19 @@ class VlmPrefillHelper:
         ):
             return None
         if int(getattr(self.metadata, "data_parallel_size", 1) or 1) > 1:
+            return None
+
+        # The compiled path hands precomputed features over as ``image_embeds`` / ``video_embeds``. A family whose
+        # ``compute_embedding`` names them differently (``image_features`` in MiniMax / LLaVA / PaliGemma / ...)
+        # would swallow the keyword through ``**kwargs`` and silently drop the images, so it stays eager.
+        model = self.model_getter()
+        embed_owner = getattr(model, "base_model", None)
+        if embed_owner is None:
+            embed_owner = model
+        embed_fn = getattr(embed_owner, "compute_embedding", None)
+        if req_state.pixel_values is not None and not _declares_parameter(embed_fn, "image_embeds"):
+            return None
+        if req_state.pixel_values_videos is not None and not _declares_parameter(embed_fn, "video_embeds"):
             return None
 
         embed_kwargs: dict[str, typing.Any] = {}

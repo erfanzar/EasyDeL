@@ -228,6 +228,15 @@ class Sandbox:
             """Apply CPU / address-space rlimits inside the forked child."""
             import resource
 
+            # Ignored and blocked signals survive fork+exec. A host process that ignores or blocks SIGXCPU (a
+            # long-lived trainer or test runner, a native runtime) would otherwise make the soft CPU limit a no-op,
+            # and the child would die by the hard limit's SIGKILL, which is not reported as a timeout.
+            try:
+                signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGXCPU})
+                signal.signal(signal.SIGXCPU, signal.SIG_DFL)
+            except (ValueError, OSError):
+                pass
+
             # Soft below hard so exhausting the CPU budget raises SIGXCPU, which is
             # attributable, rather than a bare SIGKILL that is indistinguishable
             # from an OOM kill. The hard limit still guarantees termination if the

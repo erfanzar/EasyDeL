@@ -228,7 +228,14 @@ def _greedy_teacher_forced(model, prompt_ids: list[int], n: int, **mm_kwargs) ->
     return toks
 
 
-def _assert_family_serves(model, family: str, mm_spec: dict | None, mm_ref_kwargs: dict | None) -> None:
+def _assert_family_serves(
+    model,
+    family: str,
+    mm_spec: dict | None,
+    mm_ref_kwargs: dict | None,
+    *,
+    expect_compiled_vision: bool = False,
+) -> None:
     """Run the full serving-parity protocol for one family on one engine.
 
     Phases (single compiled runner):
@@ -259,8 +266,22 @@ def _assert_family_serves(model, family: str, mm_spec: dict | None, mm_ref_kwarg
         )
 
         if mm_spec is not None:
+            compiled_handoffs = []
+            vlm = harness.runner.vlm
+            original_compiled_kwargs = vlm.compiled_vision_embed_kwargs
+
+            def _counting_compiled_kwargs(req_state):
+                result = original_compiled_kwargs(req_state)
+                if result is not None:
+                    compiled_handoffs.append(sorted(result))
+                return result
+
+            vlm.compiled_vision_embed_kwargs = _counting_compiled_kwargs
             mixed_specs = [mm_spec, {"prompt_token_ids": TEXT_PROMPTS[1]}]
-            served_mm = harness.generate_greedy(mixed_specs)
+            try:
+                served_mm = harness.generate_greedy(mixed_specs)
+            finally:
+                vlm.compiled_vision_embed_kwargs = original_compiled_kwargs
             expected_mm = [
                 _greedy_teacher_forced(model, mm_spec["prompt_token_ids"], MAX_NEW_TOKENS, **(mm_ref_kwargs or {})),
                 _greedy_teacher_forced(model, TEXT_PROMPTS[1], MAX_NEW_TOKENS),
@@ -269,6 +290,13 @@ def _assert_family_serves(model, family: str, mm_spec: dict | None, mm_ref_kwarg
                 f"{family}: multimodal eSurge greedy decode diverged from teacher-forced dense forward\n"
                 f"  esurge={served_mm}\n  dense ={expected_mm}"
             )
+            if expect_compiled_vision:
+                # The parity above also holds on the eager fallback; pin that the compiled vision encoder ran and
+                # its features were handed to the embedding pass.
+                assert not vlm.vision_jit_disabled, (
+                    f"{family}: compiled vision encoder failed and eSurge fell back to eager vision precompute"
+                )
+                assert compiled_handoffs, f"{family}: multimodal prefill never took the compiled vision path"
     finally:
         harness.close()
 
@@ -451,6 +479,7 @@ def test_hunyuan_vl_esurge_greedy_parity():
             "pixel_values": jnp.asarray(pixel_values),
             "image_grid_thw": jnp.asarray(image_grid_thw, dtype=jnp.int32),
         },
+        expect_compiled_vision=True,
     )
 
 

@@ -99,15 +99,20 @@ def test_infinite_loop_times_out():
 
 
 def test_timeout_kills_grandchildren_after_group_leader_exits(tmp_path):
+    # The rlimit preexec_fn forces a full fork() of the caller; deep into a long test session that alone can
+    # take a few hundred ms, so the budget leaves room for the child to start and print before the deadline.
     marker = tmp_path / "escaped-timeout"
-    grandchild = f"import time; time.sleep(1); open({str(marker)!r}, 'w').write('still running')"
-    res = Sandbox(timeout=0.3, use_jail="off").run_python(
-        f"import subprocess, sys; subprocess.Popen([sys.executable, '-I', '-c', {grandchild!r}]); print('spawned')"
+    grandchild = f"import time; time.sleep(4); open({str(marker)!r}, 'w').write('still running')"
+    res = Sandbox(timeout=1.5, use_jail="off").run_python(
+        "import subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, '-I', '-c', {grandchild!r}])\n"
+        "print('spawned', flush=True)\n"
+        "time.sleep(30)"
     )
     assert res.timed_out is True
     assert res.ok is False
     assert res.stdout.strip() == "spawned"
-    time.sleep(1.1)
+    time.sleep(4.2)
     assert not marker.exists()
 
 
@@ -124,6 +129,25 @@ def test_cpu_rlimit_backstop_is_reported_as_a_timeout():
 
     assert res.timed_out is True
     assert res.ok is False
+    assert res.returncode == -signal.SIGXCPU
+
+
+@pytest.mark.parametrize("disposition", ["ignored", "blocked"])
+def test_cpu_rlimit_is_reported_when_the_caller_ignores_or_blocks_sigxcpu(disposition):
+    """Ignored/blocked signals survive fork+exec; the child must still die by SIGXCPU, not the hard-limit SIGKILL."""
+    previous_handler = signal.getsignal(signal.SIGXCPU)
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+    try:
+        if disposition == "ignored":
+            signal.signal(signal.SIGXCPU, signal.SIG_IGN)
+        else:
+            signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGXCPU})
+        res = Sandbox(timeout=30.0, cpu_seconds=1, use_jail="off").run_python("while True:\n    pass")
+    finally:
+        signal.signal(signal.SIGXCPU, previous_handler)
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+    assert res.timed_out is True
     assert res.returncode == -signal.SIGXCPU
 
 
