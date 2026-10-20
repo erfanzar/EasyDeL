@@ -18,6 +18,8 @@ the class of failure:
 * :class:`SelectorError` — a :class:`~spectrax.Selector` predicate raised,
   or a selector sugar value could not be coerced.
 * :class:`PolicyError` — an invalid dtype policy was applied to a module.
+* :class:`ShardingError` — sharding or placement intent cannot be honored
+  (placement audit errors, or fallbacks refused under strict sharding).
 * :class:`GraphStructureError` — the module graph or graph-def violates a
   structural invariant (non-module child, unknown container kind, etc.).
 """
@@ -76,6 +78,16 @@ class PolicyError(SpecTraxError):
     Typically triggered when a :class:`~spectrax.Policy` is assigned to
     a module attribute and the value is not a :class:`~spectrax.Policy`
     instance or ``None``.
+    """
+
+
+class ShardingError(SpecTraxError, ValueError):
+    """Raised when sharding or placement intent cannot be honored.
+
+    Raised by :meth:`spectrax.sharding.PlacementReport.raise_for_errors`
+    and, under :func:`spectrax.sharding.strict_sharding`, by sharding helpers
+    that would otherwise fall back silently (unresolvable MPMD stage, axes
+    removed during spec sanitization, constraint with no mesh).
     """
 
 

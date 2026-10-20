@@ -13,6 +13,7 @@ work on plain JAX meshes, :class:`~spectrax.sharding.SpxMesh`, and
 sub-meshes are picked automatically).
 """
 
+from .audit import PlacementIssue, PlacementReport, audit_placement
 from .logical import current_axis_rules, logical_axis_rules
 from .manager import (
     PartitionAxis,
@@ -35,6 +36,7 @@ from .mesh import (
 )
 from .partition import (
     apply_logical_sharding,
+    explain_partition_spec_sanitization,
     extract_sharding_structure,
     extract_shardings,
     get_axes_size_in_mesh,
@@ -64,20 +66,25 @@ from .placement import (
     transpose_with_named_shardings,
     with_named_sharding,
 )
+from .strict import is_strict_sharding, set_strict_sharding, strict_sharding
 
 __all__ = [
     "DEFAULT_MESH_AXIS_DIMS",
     "DEFAULT_MESH_AXIS_NAMES",
     "PartitionAxis",
     "PartitionManager",
+    "PlacementIssue",
+    "PlacementReport",
     "SpxMesh",
     "apply_logical_sharding",
+    "audit_placement",
     "calculate_host_mesh_shape",
     "cpu_context",
     "create_cpu_mesh",
     "create_mesh",
     "current_axis_rules",
     "current_mesh",
+    "explain_partition_spec_sanitization",
     "extract_sharding_structure",
     "extract_shardings",
     "force_cpu",
@@ -89,6 +96,7 @@ __all__ = [
     "get_named_sharding",
     "get_partition_manager",
     "get_partition_spec",
+    "is_strict_sharding",
     "lax_reshard",
     "logical_axis_rules",
     "make_shard_and_gather_fns",
@@ -102,7 +110,9 @@ __all__ = [
     "place_setup_tree_with_shardings",
     "reshape_with_named_shardings",
     "sanitize_partition_spec_for_mesh_and_shape",
+    "set_strict_sharding",
     "spec_shape_mismatches",
+    "strict_sharding",
     "to_jax_mesh",
     "transpose_with_named_shardings",
     "use_mesh",
